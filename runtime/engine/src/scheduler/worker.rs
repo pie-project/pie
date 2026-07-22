@@ -23,8 +23,6 @@ use super::{ControlCompletion, RetryClassifier};
 pub(crate) enum FireClause {
     Quorum,
     ColdHold,
-    /// The wave window expired: fired narrow, demoting the absentees.
-    Straggler,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -395,13 +393,6 @@ struct LaunchBatchPreview {
     /// are scheduled, not late — the quorum treats them as at-depth, never
     /// missing (zero-straggler gate, V6 iteration 35).
     deferred: HashSet<ProcessId>,
-    /// SUBMISSION = PRESENCE (operator model, V6 iteration 38): every
-    /// pipeline with ANY work in the engine — queued launch, preparation,
-    /// pre-launch copy. The gathering wave may still wait for them (that
-    /// wait keeps waves dense), but they can never be demoted or counted
-    /// as stragglers: an inferlet that submitted is on time by definition;
-    /// engine-side prepare latency must never be punished as straggling.
-    submitted: HashSet<ProcessId>,
     structurally_full: bool,
 }
 
@@ -857,17 +848,18 @@ impl DriverLane {
         control_rx: &crossbeam::channel::Receiver<LaneRequest>,
     ) -> std::result::Result<LaneRequest, ()> {
         use crossbeam::channel::TryRecvError;
-        // Stay HOT for one wave window after going empty before parking.
+        // Stay hot briefly after going empty before parking.
         // The lane hop sits on the enqueue-ahead path: a parked lane pays a
         // thread wake (µs–ms under the box's wake-burst contention) on
         // every submit, which measurably broke run-ahead pipelining
         // (81 % → ~30 % of transitions enqueued ahead on the parked
         // variant). At wave cadence the spin window always covers the next
         // post, so the submit hop costs a cache-hot poll instead; the lane
-        // parks only after a full window of true idleness (between
-        // requests / at shutdown). The bound reuses the scheduler's own
-        // derived wave-window constant (PIE_SCHED_WAVE_WINDOW_US).
-        let mut spin_until = Instant::now() + quorum::wave_window();
+        // parks only after true idleness (between requests / at shutdown).
+        // This is a lane wake optimization, independent of quorum policy.
+        const DRIVER_LANE_HOT_US: u64 = 1_000_000;
+        let hot_window = Duration::from_micros(DRIVER_LANE_HOT_US);
+        let mut spin_until = Instant::now() + hot_window;
         loop {
             match launch_rx.try_recv() {
                 Ok(request) => return Ok(request),
@@ -897,7 +889,7 @@ impl DriverLane {
             // (and the disconnect handling above) once something is ready,
             // with a fresh spin window.
             select.ready();
-            spin_until = Instant::now() + quorum::wave_window();
+            spin_until = Instant::now() + hot_window;
         }
     }
 
@@ -2529,9 +2521,8 @@ impl BatchScheduler {
                     }
                     // No fire-admission early join: the readiness credit below
                     // creates the ordinary wait-set entry. Bind controls use
-                    // separate assembly membership, which cannot age into
-                    // demotion while the control remains pending; preparation
-                    // alone still does not create a new member.
+                    // separate assembly membership; preparation alone still
+                    // does not create a new member.
                     if !Self::request_needs_prelaunch(&launch) {
                         let qpid =
                             Self::quorum_pid(policy, launch.pipeline_id, launch.quorum_generation);
@@ -3066,35 +3057,26 @@ impl BatchScheduler {
         // at the batch-full / drain break, but queued fires beyond it are
         // SCHEDULED (composer/ordering-deferred), not missing — without
         // this sweep, budget-queued prefills past the break counted missing
-        // and demoted en masse on the prefix shape (V6 iteration 35's open
-        // bug). Preparation-barriered lanes stay awaited: their fires are
+        // on the prefix shape (V6 iteration 35's open bug).
+        // Preparation-barriered lanes stay awaited: their fires are
         // imminent and waiting ~1 ms for them keeps waves dense.
-        let mut submitted: HashSet<ProcessId> = HashSet::new();
         for item in pending.iter() {
             match item {
                 QueuedItem::Launch(next) => {
                     if let Some(pid) = next.pipeline_id {
-                        submitted.insert(pid);
                         if !pipelines.contains(&pid) && !barrier_pipelines.contains(&pid) {
                             deferred.insert(pid);
                         }
                     }
                 }
-                QueuedItem::PreLaunchCopy { pipeline_id, .. } => {
-                    if let Some(pid) = pipeline_id {
-                        submitted.insert(*pid);
-                    }
-                }
                 _ => {}
             }
         }
-        submitted.extend(pipelines.iter().copied());
         LaunchBatchPreview {
             count: grouping.count,
             logical_fire_ids,
             pipelines,
             deferred,
-            submitted,
             structurally_full,
         }
     }
@@ -3232,7 +3214,6 @@ impl BatchScheduler {
                                 candidate.count,
                                 &candidate.pipelines,
                                 &candidate.deferred,
-                                &candidate.submitted,
                                 candidate.structurally_full,
                                 decision_now,
                             )
@@ -3241,7 +3222,6 @@ impl BatchScheduler {
                                 candidate.count,
                                 &candidate.pipelines,
                                 &candidate.deferred,
-                                &candidate.submitted,
                                 candidate.structurally_full,
                                 decision_now,
                             )
@@ -3256,7 +3236,6 @@ impl BatchScheduler {
                                         candidate.count,
                                         &candidate.pipelines,
                                         &candidate.deferred,
-                                        &candidate.submitted,
                                         candidate.structurally_full,
                                         decision_now,
                                     ) {
@@ -3309,7 +3288,6 @@ impl BatchScheduler {
                                         candidate.count,
                                         &candidate.pipelines,
                                         &candidate.deferred,
-                                        &candidate.submitted,
                                         candidate.structurally_full,
                                         decision_now,
                                     ) {
@@ -3371,7 +3349,6 @@ impl BatchScheduler {
                                         candidate.count,
                                         &candidate.pipelines,
                                         &candidate.deferred,
-                                        &candidate.submitted,
                                         candidate.structurally_full,
                                         decision_now,
                                     ) {
@@ -3512,11 +3489,8 @@ impl BatchScheduler {
                     // an idle instance's close is always safe to overlap
                     // with other instances' in-flight launches; the old
                     // whole-pipe drain stalled every launch queued behind a
-                    // front close during cohort swaps, made freshly-bound
-                    // pipelines' credits ragged against the wave window,
-                    // and turned straggler demotion into a storm (V6
-                    // iteration 3: demotions track lost throughput 1:1, and
-                    // healthy inferlets should see none).
+                    // front close during cohort swaps and made freshly-bound
+                    // pipelines' credits ragged (V6 iteration 3).
                     if in_flight_control.is_some() {
                         break;
                     }
@@ -3539,11 +3513,8 @@ impl BatchScheduler {
                         progress = true;
                         // One control post per pass: the outer loop drains
                         // the scheduler channel between controls, so a
-                        // cohort-swap burst cannot let readiness credits
-                        // pile up unread while the wave window ages — the
-                        // post-burst decide then sees a dense fleet instead
-                        // of mass-demoting pipelines whose credits sat in
-                        // the mailbox (V6 iteration 5).
+                        // cohort-swap burst cannot let readiness credits pile
+                        // up unread; the post-burst decision sees a dense fleet.
                         break;
                     }
                     // Busy: rotate the close behind the queue so the fires
@@ -6269,9 +6240,7 @@ mod tests {
     /// A close needs only ITS OWN instance quiesced: instance B's close
     /// completes while instance A's launch is still in flight. The old
     /// behavior held every close hostage to a global pipe drain, which at
-    /// cohort swaps stalled all queued launches behind a front close and
-    /// turned the wave barrier's straggler demotion into a storm (V6
-    /// iteration 3).
+    /// cohort swaps stalled all queued launches behind a front close.
     #[tokio::test(flavor = "current_thread")]
     async fn close_of_idle_instance_overlaps_in_flight_launches() -> anyhow::Result<()> {
         let operation_log = Arc::new(Mutex::new(Vec::new()));

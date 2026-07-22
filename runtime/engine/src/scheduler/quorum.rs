@@ -2,12 +2,9 @@
 //! quorum rule ([`WaitAllPolicy`], overview §7.2 / thrust-2 F1–F6) — the single
 //! scheduling algorithm. Wait until every active pipeline's next pass is ready,
 //! then enqueue the dense wave behind the in-flight batch (depth-`max_in_flight`
-//! multi-inflight run-ahead, zero bubble). A gathering wave holds the barrier
-//! for at most the wave window: a pipeline that misses a full window demotes —
-//! the wave fires narrower without it and the barrier stops awaiting it until
-//! it next participates (straggler demotion, runahead plan rev 2). Pipelines
-//! still leave the wait-set only explicitly; demotion never removes membership,
-//! it only stops a straggler from holding everyone else's barrier.
+//! multi-inflight run-ahead, zero bubble). Steady-state waves never fire narrow:
+//! membership changes only through explicit bind/close/leave events. A single
+//! watchdog reports a non-responsive member but does not alter scheduling.
 //!
 //! ## Pie batching model
 //!
@@ -50,56 +47,7 @@ fn cold_hold() -> Duration {
     })
 }
 
-/// Steady-state straggler window: how long a gathering wave may hold the
-/// barrier for awaited absentees before demoting them and firing narrow.
-///
-/// The window must exceed one dense-wave cadence (dispatch-to-dispatch,
-/// ~3ms on the reference RTX 4090 decode workload), or the barrier can
-/// never re-merge phase-shifted lane groups: each group's window expires
-/// just before the other group's fires arrive, demotion locks the split
-/// in, and the fleet decoheres into parallel narrow-wave trains
-/// (measured: 915 waves instead of ~520 and −35% throughput at 2ms;
-/// dense-throughout at 6ms; over-holding regresses again by 12ms).
-const WAVE_WINDOW_US: u64 = 6_000;
-
-/// Resolves the wave window from the raw env value, flooring at the
-/// cold-hold gather window. A window below the floor would make the
-/// steady-state barrier less patient than bootstrap — and at ≈0 every
-/// wave fires with whatever happened to arrive, which is arrival-order
-/// scheduling reintroduced through a knob. Wait-all is the design, not
-/// a config option, so the knob tunes patience above the floor and
-/// cannot disable the barrier. Returns the window and whether the
-/// requested value was clamped (the caller warns loudly: a clamped
-/// config is a misconfiguration, not a tuning).
-fn resolve_wave_window(raw: Option<&str>, floor: Duration) -> (Duration, bool) {
-    let requested = Duration::from_micros(
-        raw.and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(WAVE_WINDOW_US),
-    );
-    if requested < floor {
-        (floor, true)
-    } else {
-        (requested, false)
-    }
-}
-
-pub(super) fn wave_window() -> Duration {
-    static WINDOW: OnceLock<Duration> = OnceLock::new();
-    *WINDOW.get_or_init(|| {
-        let raw = std::env::var("PIE_SCHED_WAVE_WINDOW_US").ok();
-        let floor = cold_hold();
-        let (window, clamped) = resolve_wave_window(raw.as_deref(), floor);
-        if clamped {
-            eprintln!(
-                "[pie-sched] PIE_SCHED_WAVE_WINDOW_US={} is below the cold-hold floor \
-                 ({floor:?}); clamping to the floor — a near-zero wave window would \
-                 disable the wait-all barrier (arrival-order scheduling)",
-                raw.as_deref().unwrap_or("<unset>"),
-            );
-        }
-        window
-    })
-}
+const STRICT_WATCHDOG_US: u64 = 1_000_000;
 
 /// Reads the requested run-ahead depth once. Dispatch-time preparation is the
 /// allocation-credit gate: physical pool allocation is atomic, and an
@@ -118,13 +66,11 @@ pub(super) fn configured_max_in_flight() -> usize {
     })
 }
 
-/// Bounded poll for the quorum-hold wait. The completion channel and new
-/// arrivals both preempt the `Decision::Wait` select the instant they fire, so
-/// this only bounds the worst-case re-evaluation cadence (a hang backstop).
+/// Defensive poll used outside a steady barrier (depth/admission backstops).
 pub(super) const QUORUM_POLL_US: u64 = 200;
 
-/// The wave-level fire decision. Dense quorum fires carry an empty `missing`
-/// set; a straggler demotion fires narrow and names the absentees.
+/// The wave-level fire decision. Strict quorum fires always carry an empty
+/// `missing` set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum WaveDecision {
     Fire { missing: Vec<ProcessId> },
@@ -143,31 +89,6 @@ struct PipelineWaveState {
     /// Requests this pipeline has contributed to the CURRENT wave.
     /// `> 0` ⇒ ready (its N+1 is in).
     wave_ready: usize,
-    /// The barrier stopped awaiting this pipeline: it missed a full wave
-    /// window while the fleet was ready. It still rides any wave it shows
-    /// up for, and participation re-promotes it immediately.
-    demoted: bool,
-    /// This pipeline was absent at one window expiry and got a grace
-    /// window instead of demotion. Demotion requires a SECOND consecutive
-    /// expiry with the pipeline still absent-and-idle (the anti-stall
-    /// fallback survives, one window later); any sign of life —
-    /// participation or a fresh submission — clears the flag. Universal
-    /// (not just credited backlog): the demotion forensics (V6 iteration
-    /// 42) showed absentees arriving in synchronized cohorts of 28–45 of
-    /// 64 — a host-global pause, not individual straggling — and a global
-    /// pause shorter than two windows must demote nobody, because every
-    /// healthy pipeline resumes during the grace window.
-    straggler_grace: bool,
-    /// The pipeline's last observable liveness: a readiness credit arrived
-    /// or one of its fires retired. Demotion requires a FULL wave window of
-    /// idleness measured from HERE — not from the wave's gather start. With
-    /// run-ahead pipelining a wave gathers across ~2–3 cadences, so a
-    /// pipeline whose fire settles late in the gather met an already-expired
-    /// window at its natural replenish moment and was demoted 0 ms after its
-    /// own settlement (V6 iteration 29: all 135 mid-run demotions in the
-    /// census had gap-since-last-settle = 0.0 ms with resubmission
-    /// 0.08–15 ms later).
-    last_activity: Option<Instant>,
     in_flight: usize,
     generation: u64,
 }
@@ -180,15 +101,6 @@ pub(super) struct PipelineEpoch {
 
 #[derive(Clone)]
 pub(super) struct WaitAllPolicy {
-    /// Rolling estimate (EWMA, α=1/8) of the wave retire-to-retire cadence
-    /// in µs. The straggler idleness threshold is `wave_window + cadence`:
-    /// the window constant's own rationale ("must exceed one dense-wave
-    /// cadence") calibrated it for the ~3 ms standard-shape cadence, and at
-    /// prefix-heavy cadence (~4.5 ms) the fixed 6 ms left ~1.5 ms of margin
-    /// — ordinary settle→resubmit cycles looked idle and demoted en masse
-    /// (V6 iteration 31: 200–220 demotions/run on the prefix shape).
-    cadence_ewma_us: u64,
-    last_retire_at: Option<Instant>,
     /// Structural cap — a full batch always fires immediately.
     max_forward_requests: usize,
     /// Batches enqueued but not yet retired; bounded by the configured depth.
@@ -196,6 +108,10 @@ pub(super) struct WaitAllPolicy {
     /// THE wait-set: every active pipeline and its wave participation.
     /// BTreeMap for deterministic `missing` ordering.
     active: BTreeMap<ProcessId, PipelineWaveState>,
+    /// Pipelines already dispatched in a structurally partitioned logical
+    /// round. They are not awaited again until every active member has
+    /// dispatched once and the round closes.
+    round_served: HashSet<ProcessId>,
     /// Bind controls accepted by the scheduler but not yet completed. These
     /// processes are active missing members even before their first fire, and
     /// a wave holds unconditionally while any of them is absent.
@@ -204,8 +120,8 @@ pub(super) struct WaitAllPolicy {
     /// Untracked (pipeline-less) requests in the current wave: counted so an
     /// untracked-only batch still fires, never awaited.
     untracked_ready: usize,
-    /// When the current wave started gathering.
-    wave_started: Option<Instant>,
+    /// Liveness-only deadline for the current strict wait episode.
+    strict_watchdog_deadline: Option<Instant>,
     /// Whether any wave has fired (bootstrap discriminator).
     ever_fired: bool,
     /// The bootstrap gather window deadline (armed on the first cold decide).
@@ -217,15 +133,14 @@ pub(super) struct WaitAllPolicy {
 impl WaitAllPolicy {
     pub fn new(max_forward_requests: usize, stats: Option<Arc<SchedulerStats>>) -> Self {
         Self {
-            cadence_ewma_us: 0,
-            last_retire_at: None,
             max_forward_requests,
             in_flight: 0,
             active: BTreeMap::new(),
+            round_served: HashSet::new(),
             pending_binds: BTreeMap::new(),
             generations: BTreeMap::new(),
             untracked_ready: 0,
-            wave_started: None,
+            strict_watchdog_deadline: None,
             ever_fired: false,
             cold_hold_deadline: None,
             stats,
@@ -239,20 +154,22 @@ impl WaitAllPolicy {
         let mut out = String::new();
         let _ = write!(
             out,
-            "in_flight={} pending_binds={} untracked_ready={} ever_fired={} wave_age={:?} cold_hold={:?}",
+            "in_flight={} pending_binds={} round_served={} untracked_ready={} ever_fired={} watchdog={:?} cold_hold={:?}",
             self.in_flight,
             self.pending_binds.values().sum::<usize>(),
+            self.round_served.len(),
             self.untracked_ready,
             self.ever_fired,
-            self.wave_started.map(|since| since.elapsed()),
+            self.strict_watchdog_deadline
+                .map(|deadline| deadline.saturating_duration_since(Instant::now())),
             self.cold_hold_deadline
                 .map(|deadline| deadline.saturating_duration_since(Instant::now())),
         );
         for (pid, state) in &self.active {
             let _ = write!(
                 out,
-                "\n  pipeline {pid}: wave_ready={} demoted={} in_flight={} generation={}",
-                state.wave_ready, state.demoted, state.in_flight, state.generation,
+                "\n  pipeline {pid}: wave_ready={} in_flight={} generation={}",
+                state.wave_ready, state.in_flight, state.generation,
             );
         }
         out
@@ -270,22 +187,13 @@ impl WaitAllPolicy {
         &mut self,
         pid: Option<ProcessId>,
         owner: Option<ProcessId>,
-        now: Instant,
+        _now: Instant,
     ) {
-        if self.wave_started.is_none() {
-            self.wave_started = Some(now);
-        }
-
         match (pid, owner) {
             (Some(pid), Some(owner)) => {
                 self.retire_bind_placeholder(owner, pid);
                 let state = self.active_state(pid, owner, false);
                 state.wave_ready += 1;
-                state.last_activity = Some(now);
-                // A fresh submission ends any grace episode: the pipeline
-                // is alive, so its next absence starts a new first-expiry
-                // grace instead of inheriting a stale second-strike.
-                state.straggler_grace = false;
             }
             _ => self.untracked_ready += 1,
         }
@@ -319,7 +227,7 @@ impl WaitAllPolicy {
     /// membership has no concrete pipeline scope yet, so its process-keyed
     /// placeholder ends with the last bind; the first fire joins under the
     /// actual pipeline resource identity.
-    pub fn on_bind_completed(&mut self, pid: Option<ProcessId>, now: Instant) {
+    pub fn on_bind_completed(&mut self, pid: Option<ProcessId>, _now: Instant) {
         let Some(pid) = pid else {
             return;
         };
@@ -337,9 +245,6 @@ impl WaitAllPolicy {
             {
                 self.on_pipeline_leave(pid);
             }
-        }
-        if self.pending_binds.is_empty() && self.wave_started.is_some() {
-            self.wave_started = Some(now);
         }
     }
 
@@ -403,9 +308,6 @@ impl WaitAllPolicy {
                 self.untracked_ready = self.untracked_ready.saturating_sub(1);
             }
         }
-        if self.untracked_ready == 0 && self.active.values().all(|state| state.wave_ready == 0) {
-            self.wave_started = None;
-        }
     }
 
     /// Release a pipeline from the wait-set. Readiness credits already
@@ -417,12 +319,15 @@ impl WaitAllPolicy {
         if let Some(state) = self.active.remove(&pid) {
             self.untracked_ready += state.wave_ready;
         }
+        self.round_served.remove(&pid);
+        self.close_round_if_complete();
         self.pending_binds.remove(&pid);
         *self.generations.entry(pid).or_default() += 1;
         if self.active.is_empty() {
             self.ever_fired = false;
             self.cold_hold_deadline = None;
-            self.wave_started = None;
+            self.strict_watchdog_deadline = None;
+            self.round_served.clear();
         }
     }
 
@@ -477,11 +382,13 @@ impl WaitAllPolicy {
         let mut at_depth = 0;
         let mut missing = 0;
         for (pid, state) in &self.active {
-            // `at_depth` counts everyone the wave is not waiting on
-            // (depth-capped / demoted stragglers).
+            // `at_depth` counts everyone the wave is not waiting on because
+            // it already participated in this round or exhausted run-ahead.
             if self.pending_binds.contains_key(pid) {
                 missing += 1;
-            } else if state.demoted || state.in_flight >= configured_max_in_flight() {
+            } else if self.round_served.contains(pid)
+                || state.in_flight >= configured_max_in_flight()
+            {
                 at_depth += 1;
             } else if candidate_pipelines.contains(pid) {
                 present += 1;
@@ -506,7 +413,7 @@ impl WaitAllPolicy {
     pub fn decide_wave_at(&mut self, current_batch_size: usize, now: Instant) -> WaveDecision {
         static EMPTY: OnceLock<HashSet<ProcessId>> = OnceLock::new();
         let empty = EMPTY.get_or_init(HashSet::new);
-        self.decide_wave_inner(current_batch_size, None, empty, empty, false, now)
+        self.decide_wave_inner(current_batch_size, None, empty, false, now)
     }
 
     /// Production decision using the pipelines present in the batch that the
@@ -517,7 +424,6 @@ impl WaitAllPolicy {
         current_batch_size: usize,
         candidate_pipelines: &HashSet<ProcessId>,
         deferred_pipelines: &HashSet<ProcessId>,
-        submitted_pipelines: &HashSet<ProcessId>,
         structurally_full: bool,
         now: Instant,
     ) -> WaveDecision {
@@ -525,7 +431,6 @@ impl WaitAllPolicy {
             current_batch_size,
             Some(candidate_pipelines),
             deferred_pipelines,
-            submitted_pipelines,
             structurally_full,
             now,
         )
@@ -533,15 +438,14 @@ impl WaitAllPolicy {
 
     /// Side-effect-free candidate decision used before driver admission.
     ///
-    /// A denied physical preparation must not advance grace/demotion state or
-    /// wave counters, so the scheduler evaluates against a private copy and
+    /// A denied physical preparation must not advance barrier state or wave
+    /// counters, so the scheduler evaluates against a private copy and
     /// invokes the mutating decision only after preparation succeeds.
     pub fn preview_candidate_wave_at(
         &self,
         current_batch_size: usize,
         candidate_pipelines: &HashSet<ProcessId>,
         deferred_pipelines: &HashSet<ProcessId>,
-        submitted_pipelines: &HashSet<ProcessId>,
         structurally_full: bool,
         now: Instant,
     ) -> WaveDecision {
@@ -551,7 +455,6 @@ impl WaitAllPolicy {
             current_batch_size,
             Some(candidate_pipelines),
             deferred_pipelines,
-            submitted_pipelines,
             structurally_full,
             now,
         )
@@ -562,22 +465,12 @@ impl WaitAllPolicy {
         current_batch_size: usize,
         candidate_pipelines: Option<&HashSet<ProcessId>>,
         deferred_pipelines: &HashSet<ProcessId>,
-        submitted_pipelines: &HashSet<ProcessId>,
         structurally_full: bool,
         now: Instant,
     ) -> WaveDecision {
-        // Run-ahead depth cap (R10): the pipe is full — hold; the completion
-        // channel preempts the wait the instant a batch retires. Misses are
-        // NOT counted while capped: a straggler can't be blamed for a wave
-        // that couldn't fire anyway. The wave clock pauses for the same
-        // reason — restarting it on every capped decide means the straggler
-        // window measures only time the wave could actually fire, so the
-        // first post-cap wave can't demote absentees for a hold no
-        // participation could have ended.
+        // Run-ahead depth cap: the completion channel preempts this wait the
+        // instant a batch retires.
         if self.in_flight >= configured_max_in_flight() {
-            if self.wave_started.is_some() {
-                self.wave_started = Some(now);
-            }
             return WaveDecision::Wait(Duration::from_micros(QUORUM_POLL_US));
         }
         // Structural capacity cap — a full batch fires immediately, no miss
@@ -602,20 +495,23 @@ impl WaitAllPolicy {
             .iter()
             .filter(|(pid, state)| {
                 self.pending_binds.contains_key(*pid)
-                    || (!state.demoted
-                    // Deferred BY THE COMPOSER (capacity / wave token
-                    // budget / same-instance dedup): scheduled for the next
-                    // wave, not late — never awaited, never a straggler.
-                    && !deferred_pipelines.contains(*pid)
-                    && state.in_flight < configured_max_in_flight()
-                    && candidate_pipelines
-                        .map(|pipelines| !pipelines.contains(pid))
-                        .unwrap_or(state.wave_ready == 0))
+                    || (
+                        // Deferred BY THE COMPOSER (capacity / wave token
+                        // budget / same-instance dedup): scheduled for the next
+                        // wave, not late — never awaited, never a straggler.
+                        !deferred_pipelines.contains(*pid)
+                            && !self.round_served.contains(*pid)
+                            && state.in_flight < configured_max_in_flight()
+                            && candidate_pipelines
+                                .map(|pipelines| !pipelines.contains(pid))
+                                .unwrap_or(state.wave_ready == 0)
+                    )
             })
             .map(|(&pid, _)| pid)
             .collect();
 
         if missing.is_empty() {
+            self.strict_watchdog_deadline = None;
             // Every active pipeline is in (or the batch is untracked-only).
             if self.ever_fired {
                 // Dense wave — the steady-state fire.
@@ -649,137 +545,31 @@ impl WaitAllPolicy {
             }
         }
 
-        // Assembly hold: a native bind already accepted into the scheduler is
-        // submitted work, not a straggler. Keep the wave open so the existing
-        // hold-path control drain can finish the bind cohort. Once each bind
-        // completes, ordinary readiness and demotion semantics resume.
-        if missing
-            .iter()
-            .any(|pid| self.pending_binds.contains_key(pid))
-        {
-            return WaveDecision::Wait(Duration::from_micros(QUORUM_POLL_US));
-        }
-
-        // Straggler demotion (runahead plan rev 2): the barrier holds for the
-        // wave window — new arrivals and completion notifications preempt the
-        // bounded poll — then fires the narrower wave that actually gathered
-        // and stops awaiting the absentees until they participate again.
-        let age = self
-            .wave_started
-            .map(|started| now.saturating_duration_since(started))
-            .unwrap_or_default();
-        let window = wave_window();
-        if age < window {
-            let remaining = window - age;
-            return WaveDecision::Wait(remaining.min(Duration::from_micros(QUORUM_POLL_US)));
-        }
-        let mut any_demoted = false;
-        let mut demoted_count = 0usize;
-        for pid in &missing {
-            if submitted_pipelines.contains(pid) {
-                // Submission = presence (north-star item 1): this pipeline
-                // has work IN THE ENGINE (queued behind a barrier, preparing,
-                // or pre-launch copying) — the barrier may hold for it
-                // (density), but it can never be punished. An inferlet that
-                // submitted is on time by definition; only silent guests age
-                // toward demotion. (The b61297af commit ratified this but
-                // only plumbed the parameter; this is the missing consumer.)
-                continue;
-            }
-            if let Some(state) = self.active.get_mut(pid) {
-                if !state.straggler_grace {
-                    // First expiry absent: one universal grace window — a
-                    // credited backlog's fire has arrived (composition
-                    // excluded it), and an uncredited absentee is more often
-                    // a victim of a host-global pause than a straggler
-                    // (iteration 42 forensics: demotions land in
-                    // synchronized cohorts of 28–45/64). Whoever is back
-                    // before the next expiry was never a straggler.
-                    state.straggler_grace = true;
-                } else if state.last_activity.is_some_and(|at| {
-                    now.saturating_duration_since(at)
-                        < window + Duration::from_micros(self.cadence_ewma_us)
-                }) {
-                    // Active within the window (a fire of its just retired,
-                    // or a credit just arrived and was consumed): its
-                    // natural replenish moment is NOW — the wave fires
-                    // without it, but a pipeline is a straggler only after
-                    // a FULL window of idleness measured from its own last
-                    // activity, not from the wave's gather start.
-                } else {
-                    state.demoted = true;
-                    state.straggler_grace = false;
-                    any_demoted = true;
-                    demoted_count += 1;
-                    if let Some(stats) = &self.stats {
-                        use std::sync::atomic::Ordering::Relaxed;
-                        stats.fire.quorum.straggler_demotions.fetch_add(1, Relaxed);
-                    }
-                }
-            }
-        }
-        if self.stats.is_some() && crate::scheduler::fire_timing_full() {
-            // Named absentees with their per-pid OUTCOME: "demoted" means
-            // punished (excluded until next participation); false means
-            // graced (credited backlog) or recently-active (idle-window
-            // rule) — still awaited, merely absent from THIS narrow wave.
-            let detail: Vec<serde_json::Value> = missing
-                .iter()
-                .map(|pid| {
-                    let state = self.active.get(pid);
-                    serde_json::json!({
-                        "pid": pid.to_string(),
-                        "in_flight": state.map(|s| s.in_flight),
-                        "wave_ready": state.map(|s| s.wave_ready),
-                        "demoted": state.map(|s| s.demoted),
-                        "grace": state.map(|s| s.straggler_grace),
-                    })
-                })
-                .collect();
+        let deadline = self
+            .strict_watchdog_deadline
+            .get_or_insert(now + Duration::from_micros(STRICT_WATCHDOG_US));
+        if now >= *deadline {
+            *deadline = now + Duration::from_micros(STRICT_WATCHDOG_US);
             crate::scheduler::fire_timing_write(&serde_json::json!({
                 "schema": 1,
                 "source": "scheduler",
-                "event": "straggler_demotion",
+                "event": "strict_wait_watchdog",
                 "at_us": crate::scheduler::fire_timing_now_us(),
-                "wave_age_us": age.as_micros() as u64,
-                "batch_size": current_batch_size,
-                "missing": detail,
-            }));
-        } else if self.stats.is_some() && crate::scheduler::ledger_timing_enabled() {
-            crate::scheduler::fire_timing_write(&serde_json::json!({
-                "schema": 1,
-                "source": "scheduler",
-                "event": "straggler_demotion",
-                "at_us": crate::scheduler::fire_timing_now_us(),
-                "wave_age_us": age.as_micros() as u64,
                 "batch_size": current_batch_size,
                 "missing_count": missing.len(),
-                "demoted_count": demoted_count,
+                "active_pipelines": self.active.len(),
             }));
         }
-        // A patience-expired fire that punished NOBODY (every absentee is
-        // within its own idle grace or credited backlog) is a normal quorum
-        // outcome — the barrier waited its window and moved on with everyone
-        // unharmed. Only a fire that actually demoted someone is a
-        // straggler event (zero-straggler gate: this counter must be 0 for
-        // healthy workloads because no pipeline IS a straggler).
-        self.record_clause(if any_demoted {
-            FireClause::Straggler
-        } else {
-            FireClause::Quorum
-        });
-        self.record_wave(missing.len());
-        WaveDecision::Fire { missing }
+        WaveDecision::Wait(deadline.saturating_duration_since(now))
     }
 
     /// A wave was dispatched: consume exactly one readiness credit for each
     /// submitted row and retain credits for requests already queued behind
-    /// this wave. Participation re-promotes a demoted straggler; absentees
-    /// stay demoted.
+    /// this wave.
     pub fn on_wave_dispatched(
         &mut self,
         participants: &[Option<ProcessId>],
-        now: Instant,
+        _now: Instant,
     ) -> Vec<Option<PipelineEpoch>> {
         self.in_flight += 1;
         self.ever_fired = true;
@@ -794,18 +584,8 @@ impl WaitAllPolicy {
                             "dispatched pipeline row has no readiness credit"
                         );
                         state.wave_ready = state.wave_ready.saturating_sub(1);
-                        // Participation re-promotes a demoted straggler and
-                        // ends any grace episode (the rotation that once
-                        // also lived here is DELETED — operator ruling R2,
-                        // 2026-07-17: the one-pass-per-pipeline-per-round
-                        // lockstep was a byproduct of budget splitting, and
-                        // after the W1 accounting fix it made the fleet
-                        // OSCILLATE — a thin wave barred its riders from
-                        // the next wave, alternating large/small waves
-                        // forever instead of re-gathering dense).
-                        state.demoted = false;
-                        state.straggler_grace = false;
                         state.in_flight += 1;
+                        self.round_served.insert(*pid);
                         epochs.push(Some(PipelineEpoch {
                             pid: *pid,
                             generation: state.generation,
@@ -821,11 +601,8 @@ impl WaitAllPolicy {
                 }
             }
         }
-        if self.untracked_ready == 0 && self.active.values().all(|state| state.wave_ready == 0) {
-            self.wave_started = None;
-        } else {
-            self.wave_started = Some(now);
-        }
+        self.strict_watchdog_deadline = None;
+        self.close_round_if_complete();
         epochs
     }
 
@@ -833,24 +610,11 @@ impl WaitAllPolicy {
     /// `decide_wave_at`'s depth cap admits the next wave.
     pub fn on_wave_retired(&mut self, participants: &[Option<PipelineEpoch>]) {
         self.in_flight = self.in_flight.saturating_sub(1);
-        let now = Instant::now();
-        if let Some(prev) = self.last_retire_at {
-            // Clamp samples to 100 ms: end-of-run silences must not poison
-            // the estimate.
-            let sample = (now.saturating_duration_since(prev).as_micros() as u64).min(100_000);
-            self.cadence_ewma_us = if self.cadence_ewma_us == 0 {
-                sample
-            } else {
-                (self.cadence_ewma_us * 7 + sample) / 8
-            };
-        }
-        self.last_retire_at = Some(now);
         for epoch in participants.iter().flatten() {
             if let Some(state) = self.active.get_mut(&epoch.pid)
                 && state.generation == epoch.generation
             {
                 state.in_flight = state.in_flight.saturating_sub(1);
-                state.last_activity = Some(now);
             }
         }
     }
@@ -859,20 +623,24 @@ impl WaitAllPolicy {
         if let Some(stats) = &self.stats {
             use std::sync::atomic::Ordering::Relaxed;
             match clause {
-                // Bootstrap gathers and straggler demotions are recorded
-                // separately; dense/capacity waves are the ordinary quorum
-                // path. Unconditional (like `record_wave`): stats export
-                // these counters in every build, and a default build that
-                // reports zero while actively demoting is exactly the
-                // silently-wrong stat this scheduler bans.
+                // Bootstrap gathers are recorded separately; dense/capacity
+                // waves are the ordinary quorum path.
                 FireClause::ColdHold => {
                     stats.fire.quorum.cold_hold_fires.fetch_add(1, Relaxed);
                 }
-                FireClause::Straggler => {
-                    stats.fire.quorum.straggler_fires.fetch_add(1, Relaxed);
-                }
                 _ => {}
             }
+        }
+    }
+
+    fn close_round_if_complete(&mut self) {
+        if !self.active.is_empty()
+            && self
+                .active
+                .keys()
+                .all(|pid| self.round_served.contains(pid))
+        {
+            self.round_served.clear();
         }
     }
 
@@ -909,32 +677,6 @@ mod tests {
         assert_eq!(parse_max_in_flight(Some("4")), MAX_IN_FLIGHT);
         assert_eq!(parse_max_in_flight(Some("invalid")), DEFAULT_MAX_IN_FLIGHT);
         assert!(configured_max_in_flight() >= 1);
-    }
-
-    #[test]
-    fn wave_window_floors_at_cold_hold() {
-        let floor = Duration::from_micros(COLD_HOLD_US);
-        // The greedy backdoor: a near-zero request clamps to the floor
-        // (and the production caller warns loudly).
-        assert_eq!(resolve_wave_window(Some("0"), floor), (floor, true));
-        assert_eq!(resolve_wave_window(Some("1"), floor), (floor, true));
-        assert_eq!(resolve_wave_window(Some("1999"), floor), (floor, true));
-        // At or above the floor the request passes through untouched.
-        assert_eq!(resolve_wave_window(Some("2000"), floor), (floor, false));
-        assert_eq!(
-            resolve_wave_window(Some("12000"), floor),
-            (Duration::from_micros(12_000), false)
-        );
-        // Unset or unparseable values fall back to the default, which
-        // clears any sane floor.
-        assert_eq!(
-            resolve_wave_window(None, floor),
-            (Duration::from_micros(WAVE_WINDOW_US), false)
-        );
-        assert_eq!(
-            resolve_wave_window(Some("not-a-number"), floor),
-            (Duration::from_micros(WAVE_WINDOW_US), false)
-        );
     }
 
     /// Graceful close releases the wait-set immediately without dropping the
@@ -994,12 +736,8 @@ mod tests {
         policy.on_wave_retired(&epochs_retry);
     }
 
-    /// W1 consequence regression: once the books drain, the gather clock
-    /// re-arms. A fresh fleet starting long after the drained wave must
-    /// get a full window before any narrow fire — with the leak
-    /// (`untracked_ready` stuck above zero) the `wave_started` reset never
-    /// fired and the first decide after any >window lull fired narrow
-    /// instantly, marking healthy pipelines stragglers.
+    /// W1 consequence regression: once the books drain, a fresh fleet must
+    /// enter a fresh cold assembly episode rather than inherit old readiness.
     #[test]
     fn drained_books_rearm_the_gather_clock() {
         let mut policy = WaitAllPolicy::new(64, None);
@@ -1012,7 +750,7 @@ mod tests {
         let closed_epochs = policy.on_wave_dispatched(&[None], start);
         policy.on_wave_retired(&closed_epochs);
         assert_eq!(policy.untracked_ready_count(), 0);
-        // Long after (>> wave window), a fresh fleet gathers: B is ready,
+        // Long after the prior drain, a fresh fleet gathers: B is ready,
         // C has joined but is not launch-ready yet.
         let later = start + Duration::from_millis(50);
         let ready = pid();
@@ -1025,7 +763,6 @@ mod tests {
             1,
             &candidates,
             &empty,
-            &empty,
             false,
             later + Duration::from_micros(200),
         ) {
@@ -1037,12 +774,8 @@ mod tests {
         }
     }
 
-    /// While the run-ahead depth cap holds, no participation can end the
-    /// wave — so no absentee may age toward demotion (the no-blame rule).
-    /// The wave clock restarts on every capped decide; the straggler
-    /// window then measures only time the wave could actually fire.
     #[test]
-    fn depth_cap_pauses_the_straggler_clock() {
+    fn depth_cap_and_strict_barrier_both_wait() {
         let mut policy = WaitAllPolicy::new(64, None);
         let ready = pid();
         let absent = pid();
@@ -1066,33 +799,20 @@ mod tests {
         }
 
         // A new wave gathers with only `ready` while the pipe is full.
-        // Far past the wave window, the capped decide still holds — and
-        // restarts the wave clock.
         policy.on_pipeline_request(Some(ready), now);
-        let capped_until = now + Duration::from_micros(10 * WAVE_WINDOW_US);
+        let capped_until = now + Duration::from_secs(10);
         assert_eq!(
             policy.decide_wave_at(1, capped_until),
             WaveDecision::Wait(Duration::from_micros(QUORUM_POLL_US))
         );
 
-        // Release the cap: the wave is young again, so the barrier keeps
-        // waiting for `absent` instead of demoting it for time it spent
-        // depth-capped.
+        // Releasing depth does not weaken strict membership.
         policy.on_wave_retired(&epochs[0]);
         let shortly_after = capped_until + Duration::from_micros(QUORUM_POLL_US);
         assert!(matches!(
             policy.decide_wave_at(1, shortly_after),
             WaveDecision::Wait(_)
         ));
-
-        // Demotion still works, counted from the release.
-        let past_fresh_window = capped_until + Duration::from_micros(WAVE_WINDOW_US + 100);
-        assert_eq!(
-            policy.decide_wave_at(1, past_fresh_window),
-            WaveDecision::Fire {
-                missing: vec![absent]
-            }
-        );
     }
 
     /// Drives a fresh `policy` through its bootstrap cold-hold (arm at `t0`,
@@ -1147,16 +867,10 @@ mod tests {
             1,
             &candidates,
             &HashSet::new(),
-            &HashSet::new(),
             false,
-            fired + wave_window() + Duration::from_micros(1),
+            fired + Duration::from_secs(60),
         );
-        assert_eq!(
-            decision,
-            WaveDecision::Fire {
-                missing: vec![absent]
-            }
-        );
+        assert!(matches!(decision, WaveDecision::Wait(_)));
         assert_eq!(policy.debug_summary(), before);
         assert_eq!(
             stats
@@ -1165,69 +879,6 @@ mod tests {
                 .wave_fires
                 .load(std::sync::atomic::Ordering::Relaxed,),
             waves_before,
-        );
-    }
-
-    #[test]
-    fn credited_backlog_gets_one_grace_window_before_demotion() {
-        // A fires; B is credited (its pass arrived) but batch composition
-        // excludes it from the candidate. First window expiry must NOT
-        // demote B (backlog, not a straggler); a second consecutive expiry
-        // while still credited-and-unbuilt must (anti-stall preserved).
-        let mut policy = WaitAllPolicy::new(64, None);
-        let (a, b) = (pid(), pid());
-        let start = Instant::now();
-        policy.on_pipeline_request(Some(a), start);
-        policy.on_pipeline_request(Some(b), start);
-        let t0 = bootstrap_fire(&mut policy, 2, start);
-        // Next round: both credited, only A is in the candidate.
-        policy.on_pipeline_request(Some(a), t0);
-        policy.on_pipeline_request(Some(b), t0);
-        let candidates: HashSet<ProcessId> = [a].into_iter().collect();
-        let expiry1 = t0 + Duration::from_micros(wave_window().as_micros() as u64 + 100);
-        assert_eq!(
-            policy.decide_candidate_wave_at(
-                1,
-                &candidates,
-                &HashSet::new(),
-                &HashSet::new(),
-                false,
-                expiry1
-            ),
-            WaveDecision::Fire { missing: vec![b] }
-        );
-        // B kept its credit and was NOT demoted: it still holds the barrier.
-        let epochs = policy.on_wave_dispatched(&[Some(a)], expiry1);
-        policy.on_wave_retired(&epochs);
-        policy.on_pipeline_request(Some(a), expiry1);
-        let expiry2 = expiry1 + Duration::from_micros(wave_window().as_micros() as u64 + 100);
-        assert_eq!(
-            policy.decide_candidate_wave_at(
-                1,
-                &candidates,
-                &HashSet::new(),
-                &HashSet::new(),
-                false,
-                expiry2
-            ),
-            WaveDecision::Fire { missing: vec![b] }
-        );
-        // Second expiry demoted B: it no longer blocks the wave decision.
-        let epochs = policy.on_wave_dispatched(&[Some(a)], expiry2);
-        policy.on_wave_retired(&epochs);
-        policy.on_pipeline_request(Some(a), expiry2);
-        assert_eq!(
-            policy.decide_candidate_wave_at(
-                1,
-                &candidates,
-                &HashSet::new(),
-                &HashSet::new(),
-                false,
-                expiry2
-            ),
-            WaveDecision::Fire {
-                missing: Vec::new()
-            }
         );
     }
 
@@ -1283,7 +934,7 @@ mod tests {
     }
 
     #[test]
-    fn straggler_demotes_to_a_narrower_wave_after_the_window() {
+    fn missing_pipeline_waits_until_it_submits_or_leaves() {
         let mut policy = WaitAllPolicy::new(4, None);
         let (a, b) = (pid(), pid());
         let t0 = Instant::now();
@@ -1291,175 +942,19 @@ mod tests {
         policy.on_pipeline_request(Some(b), t0);
         let past_cold_hold = bootstrap_fire(&mut policy, 2, t0);
 
-        // Wave 2: only `a` resubmits.
         policy.on_pipeline_request(Some(a), past_cold_hold);
-        // Within the wave window the barrier holds for `b`.
-        match policy.decide_wave_at(1, past_cold_hold + Duration::from_micros(250)) {
-            WaveDecision::Wait(_) => {}
-            other => panic!("expected a straggler hold, got {other:?}"),
-        }
-        // Past the window the wave fires narrow, naming `b` — but the FIRST
-        // expiry only grants the universal grace window: `b` is still
-        // awaited afterwards.
-        let expiry1 = past_cold_hold + wave_window() + Duration::from_micros(100);
-        match policy.decide_wave_at(1, expiry1) {
-            WaveDecision::Fire { missing } => assert_eq!(missing, vec![b]),
-            other => panic!("expected a narrow straggler fire, got {other:?}"),
-        }
-        let epochs = policy.on_wave_dispatched(&[Some(a)], expiry1);
-        policy.on_wave_retired(&epochs);
-
-        // Wave 3: the graced `b` still holds the barrier within the window.
-        policy.on_pipeline_request(Some(a), expiry1);
         assert!(matches!(
-            policy.decide_wave_at(1, expiry1 + Duration::from_micros(250)),
+            policy.decide_wave_at(1, past_cold_hold + Duration::from_secs(60)),
             WaveDecision::Wait(_)
         ));
-        // A second consecutive expiry with `b` still absent-and-idle demotes.
-        let expiry2 = expiry1 + wave_window() + Duration::from_micros(100);
-        match policy.decide_wave_at(1, expiry2) {
-            WaveDecision::Fire { missing } => assert_eq!(missing, vec![b]),
-            other => panic!("expected the demoting straggler fire, got {other:?}"),
-        }
-        let epochs = policy.on_wave_dispatched(&[Some(a)], expiry2);
-        policy.on_wave_retired(&epochs);
 
-        // Wave 4: the demoted `b` no longer holds the barrier at all.
-        policy.on_pipeline_request(Some(a), expiry2);
-        match policy.decide_wave_at(1, expiry2) {
-            WaveDecision::Fire { missing } => {
-                assert!(missing.is_empty(), "demoted straggler must not be awaited")
-            }
-            other => panic!("expected an immediate dense fire, got {other:?}"),
-        }
-        let epochs = policy.on_wave_dispatched(&[Some(a)], expiry2);
-        policy.on_wave_retired(&epochs);
-
-        // Wave 5: `b` shows up and rides — participation re-promotes it.
-        policy.on_pipeline_request(Some(a), expiry2);
-        policy.on_pipeline_request(Some(b), expiry2);
+        policy.on_pipeline_request(Some(b), past_cold_hold);
         assert_eq!(
-            policy.decide_wave_at(2, expiry2),
+            policy.decide_wave_at(2, past_cold_hold),
             WaveDecision::Fire {
                 missing: Vec::new()
             }
         );
-        let epochs = policy.on_wave_dispatched(&[Some(a), Some(b)], expiry2);
-        policy.on_wave_retired(&epochs);
-
-        // Wave 6: `a` alone again — the re-promoted `b` holds the barrier
-        // within the window, exactly like before its demotion.
-        policy.on_pipeline_request(Some(a), expiry2);
-        assert!(matches!(
-            policy.decide_wave_at(1, expiry2 + Duration::from_micros(250)),
-            WaveDecision::Wait(_)
-        ));
-    }
-
-    #[test]
-    fn submitted_pipeline_is_awaited_but_never_demoted() {
-        // Submission = presence: a pipeline whose work sits in the engine
-        // (preparing / queued behind a barrier / pre-launch copying) may be
-        // held for, but never punished — across ANY number of expiries.
-        let mut policy = WaitAllPolicy::new(4, None);
-        let (a, b) = (pid(), pid());
-        let t0 = Instant::now();
-        policy.on_pipeline_request(Some(a), t0);
-        policy.on_pipeline_request(Some(b), t0);
-        let past_cold_hold = bootstrap_fire(&mut policy, 2, t0);
-
-        // `b`'s next pass is submitted but stuck in preparation: it is in
-        // the SUBMITTED set, absent from the candidate, for three expiries.
-        policy.on_pipeline_request(Some(a), past_cold_hold);
-        let candidates: HashSet<ProcessId> = [a].into_iter().collect();
-        let submitted: HashSet<ProcessId> = [b].into_iter().collect();
-        let mut expiry = past_cold_hold;
-        for _ in 0..3 {
-            expiry += wave_window() + Duration::from_micros(100);
-            match policy.decide_candidate_wave_at(
-                1,
-                &candidates,
-                &HashSet::new(),
-                &submitted,
-                false,
-                expiry,
-            ) {
-                WaveDecision::Fire { missing } => assert_eq!(missing, vec![b]),
-                other => panic!("expected a narrow fire awaiting b, got {other:?}"),
-            }
-            let epochs = policy.on_wave_dispatched(&[Some(a)], expiry);
-            policy.on_wave_retired(&epochs);
-            policy.on_pipeline_request(Some(a), expiry);
-        }
-
-        // Still awaited after all of it: the barrier holds for `b` within
-        // the window — a demoted pipeline would not hold it.
-        assert!(matches!(
-            policy.decide_candidate_wave_at(
-                1,
-                &candidates,
-                &HashSet::new(),
-                &submitted,
-                false,
-                expiry + Duration::from_micros(250),
-            ),
-            WaveDecision::Wait(_)
-        ));
-    }
-
-    #[test]
-    fn pause_survivor_is_regraced_not_demoted() {
-        // A pipeline that misses one expiry (host-global pause), resumes,
-        // and later misses another expiry gets a FRESH grace window each
-        // episode: a new submission ends the episode, so no stale
-        // second-strike ever demotes a pipeline that keeps coming back.
-        let mut policy = WaitAllPolicy::new(4, None);
-        let (a, b) = (pid(), pid());
-        let t0 = Instant::now();
-        policy.on_pipeline_request(Some(a), t0);
-        policy.on_pipeline_request(Some(b), t0);
-        let past_cold_hold = bootstrap_fire(&mut policy, 2, t0);
-
-        // Episode 1: `b` misses an expiry — graced, fired around.
-        policy.on_pipeline_request(Some(a), past_cold_hold);
-        let expiry1 = past_cold_hold + wave_window() + Duration::from_micros(100);
-        assert_eq!(
-            policy.decide_wave_at(1, expiry1),
-            WaveDecision::Fire { missing: vec![b] }
-        );
-        let epochs = policy.on_wave_dispatched(&[Some(a)], expiry1);
-        policy.on_wave_retired(&epochs);
-
-        // `b` resumes and rides a dense wave — the grace episode ends.
-        policy.on_pipeline_request(Some(a), expiry1);
-        policy.on_pipeline_request(Some(b), expiry1);
-        assert_eq!(
-            policy.decide_wave_at(2, expiry1),
-            WaveDecision::Fire {
-                missing: Vec::new()
-            }
-        );
-        let epochs = policy.on_wave_dispatched(&[Some(a), Some(b)], expiry1);
-        policy.on_wave_retired(&epochs);
-
-        // Episode 2: `b` misses another expiry — a fresh grace, not the
-        // second strike of a demotion.
-        policy.on_pipeline_request(Some(a), expiry1);
-        let expiry2 = expiry1 + wave_window() + Duration::from_micros(100);
-        assert_eq!(
-            policy.decide_wave_at(1, expiry2),
-            WaveDecision::Fire { missing: vec![b] }
-        );
-        let epochs = policy.on_wave_dispatched(&[Some(a)], expiry2);
-        policy.on_wave_retired(&epochs);
-
-        // Still awaited: the barrier holds for `b` within the next window —
-        // a demoted pipeline would not hold it.
-        policy.on_pipeline_request(Some(a), expiry2);
-        assert!(matches!(
-            policy.decide_wave_at(1, expiry2 + Duration::from_micros(250)),
-            WaveDecision::Wait(_)
-        ));
     }
 
     #[test]
@@ -1474,25 +969,11 @@ mod tests {
         policy.on_pipeline_request(Some(a), t);
         policy.on_pipeline_request(Some(b), t);
         assert!(matches!(
-            policy.decide_candidate_wave_at(
-                1,
-                &HashSet::from([a]),
-                &HashSet::new(),
-                &HashSet::new(),
-                false,
-                t
-            ),
+            policy.decide_candidate_wave_at(1, &HashSet::from([a]), &HashSet::new(), false, t),
             WaveDecision::Wait(_)
         ));
         assert_eq!(
-            policy.decide_candidate_wave_at(
-                2,
-                &HashSet::from([a, b]),
-                &HashSet::new(),
-                &HashSet::new(),
-                false,
-                t
-            ),
+            policy.decide_candidate_wave_at(2, &HashSet::from([a, b]), &HashSet::new(), false, t),
             WaveDecision::Fire {
                 missing: Vec::new()
             }
@@ -1564,7 +1045,6 @@ mod tests {
         policy.on_request_dropped(Some(a));
 
         assert_eq!(policy.active[&a].wave_ready, 1);
-        assert_eq!(policy.wave_started, Some(t0));
     }
 
     #[test]
@@ -1724,17 +1204,16 @@ mod tests {
         let empty = HashSet::new();
 
         assert_eq!(policy.candidate_state_counts(&candidates), (2, 0, 2));
-        assert_eq!(
+        assert!(matches!(
             policy.decide_candidate_wave_at(
                 2,
                 &candidates,
                 &empty,
-                &empty,
                 true,
                 t + Duration::from_secs(60),
             ),
-            WaveDecision::Wait(Duration::from_micros(QUORUM_POLL_US))
-        );
+            WaveDecision::Wait(_)
+        ));
 
         for lane in &lanes[2..] {
             policy.on_bind_completed(Some(*lane), t);
@@ -1743,7 +1222,7 @@ mod tests {
         let all_candidates = lanes.into_iter().collect();
         assert_eq!(policy.candidate_state_counts(&all_candidates), (4, 0, 0));
         assert_eq!(
-            policy.decide_candidate_wave_at(4, &all_candidates, &empty, &empty, true, t,),
+            policy.decide_candidate_wave_at(4, &all_candidates, &empty, true, t,),
             WaveDecision::Fire {
                 missing: Vec::new()
             }
@@ -1759,12 +1238,10 @@ mod tests {
         policy.on_pipeline_request(Some(b), t0);
         let t = bootstrap_fire(&mut policy, 2, t0);
         policy.on_pipeline_request(Some(a), t);
-        // Way past the window the wave demotes `b` and fires narrow — but
-        // only an explicit leave removes membership; time never does.
-        match policy.decide_wave_at(1, t + Duration::from_secs(60)) {
-            WaveDecision::Fire { missing } => assert_eq!(missing, vec![b]),
-            other => panic!("expected a narrow straggler fire, got {other:?}"),
-        }
+        assert!(matches!(
+            policy.decide_wave_at(1, t + Duration::from_secs(60)),
+            WaveDecision::Wait(_)
+        ));
         assert!(policy.is_active(b));
     }
 

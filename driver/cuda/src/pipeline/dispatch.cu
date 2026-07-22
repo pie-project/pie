@@ -218,7 +218,7 @@ constexpr std::uint64_t kNoDescriptorReadyOffset =
     std::numeric_limits<std::uint64_t>::max();
 constexpr std::size_t kDescriptorCopiesPerBlock = 8;
 constexpr std::size_t kDescriptorCopyChunkBytes = 4096;
-constexpr std::size_t kFixedDecodeMaxLanes = 512;
+constexpr std::size_t kFixedDecodeInitialLanes = 512;
 constexpr std::size_t kFixedDecodePortCount = 7;
 
 struct DescriptorPackCopy {
@@ -686,9 +686,18 @@ class FixedDecodeUploadArena {
         for (HostSlot& slot : host_slots_) slot.pending = false;
 
         const std::size_t lane_capacity =
-            grown_capacity(lane_capacity_, lanes, kFixedDecodeMaxLanes);
+            grown_capacity(lane_capacity_, lanes, kFixedDecodeInitialLanes);
         const std::size_t translation_capacity =
             grown_capacity(translation_capacity_, translations, 16384);
+        if (lane_capacity >
+                std::numeric_limits<std::size_t>::max() /
+                    sizeof(FixedDecodeLane) ||
+            translation_capacity >
+                std::numeric_limits<std::size_t>::max() /
+                    sizeof(std::uint32_t)) {
+            throw std::runtime_error(
+                "fixed-decode upload capacity overflow");
+        }
         FixedDecodeLane* device_lanes = nullptr;
         std::uint32_t* device_translation = nullptr;
         CUDA_CHECK(cudaMalloc(
@@ -1055,10 +1064,10 @@ class DecodeEnvelopeUploadArena {
         }
         CUDA_CHECK(cudaStreamSynchronize(stream));
         const std::size_t capacity =
-            std::max({required, capacity_, kFixedDecodeMaxLanes});
+            std::max({required, capacity_, kFixedDecodeInitialLanes});
         const std::size_t pages_capacity = std::max(
             {required_pages, pages_capacity_,
-             kFixedDecodeMaxLanes});
+             kFixedDecodeInitialLanes});
         if (capacity >
                 std::numeric_limits<std::size_t>::max() /
                     sizeof(DecodeEnvelopeLane) ||
@@ -4645,7 +4654,6 @@ bool Dispatch::enqueue_fixed_decode(
     StagedLaunch::State& staged = *launch.state_;
     const std::size_t programs = view.ptir_program_hashes.size();
     if (programs == 0 ||
-        programs > kFixedDecodeMaxLanes ||
         view.ptir_program_instances.size() != programs ||
         staged.lanes.size() != programs ||
         !staged.active ||
@@ -5081,7 +5089,6 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
         // bucket with device-side pad rows, so the template no longer
         // requires R to sit exactly on the lattice.
         if (!allow_device_composed || staged == nullptr ||
-            n_prog > kFixedDecodeMaxLanes ||
             page_size == 0 || device_pages == 0 ||
             !view.rs_slot_ids.empty() ||
             !view.rs_fold_lens.empty() ||
