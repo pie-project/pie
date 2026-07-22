@@ -464,8 +464,8 @@ for vLLM. The direct cause is cold per-inferlet channel allocation and
 publication, not model compute.
 
 The scheduler capture records 184 waves versus roughly 134 from the workload
-geometry, and 76,308 processed fire rows versus 67,584 useful prefill/decode
-rows (+12.9%). Average active width is 454 with 29 missing pipelines. A
+geometry, and 76,308 processed fire rows versus 65,536 useful prefill/decode
+rows (+16.4%). Average active width is 454 with 29 missing pipelines. A
 prefill-only trace shows all 2,048 client launches in 88 ms, but WASM
 instantiate/admit spans 770 ms and driver bind completion spans 849 ms;
 register+bind control occupancy alone sums to 426 ms. The four 512-process
