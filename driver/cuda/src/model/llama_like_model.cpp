@@ -23,7 +23,10 @@ LlamaLikeModel::LlamaLikeModel(
     // dequant launch shape depends on the live page count, while decode
     // graph keys only bucket request count/layout — replay would leave
     // newly-active pages stale, so we gate graph_safe on native BF16.
-    caps_.graph_safe = kv_cache_.format().is_native_bf16();
+    // SSD expert streaming also needs host routing / page-ins that graphs
+    // cannot capture (Mixtral / GPT-OSS).
+    caps_.graph_safe = kv_cache_.format().is_native_bf16() &&
+                       fwd_cfg_.expert_cache == nullptr;
     caps_.supports_compact_logits = true;
     caps_.supports_tp_greedy_argmax = supports_tp_greedy_argmax;
 }

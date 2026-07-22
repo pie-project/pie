@@ -240,6 +240,168 @@ pub(crate) const MIXTRAL_STREAM_ARCH: StreamArchDesc = StreamArchDesc {
     collect_bindings: mixtral_collect_bindings,
 };
 
+/// Plain Qwen3-MoE per-expert BF16 weights — must match `qwen_moe_expert_sections.hpp`.
+pub const QWEN3_MOE_EXPERT_SECTIONS: &[&str] = &[
+    "gate_proj.weight",
+    "up_proj.weight",
+    "down_proj.weight",
+];
+
+/// Qwen3-MoE routed experts:
+/// `model.layers.{L}.mlp.experts.{E}.{gate,up,down}_proj.weight`.
+pub(crate) fn is_qwen3_moe_routed_expert_tensor(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("model.layers.") else {
+        return false;
+    };
+    let Some((_, rest)) = rest.split_once('.') else {
+        return false;
+    };
+    rest.starts_with("mlp.experts.")
+        && ends_with_any(
+            name,
+            &[
+                ".gate_proj.weight",
+                ".up_proj.weight",
+                ".down_proj.weight",
+            ],
+        )
+        // Exclude fused bank names used by Qwen3.5-MoE.
+        && !name.ends_with("mlp.experts.gate_up_proj")
+        && !name.ends_with("mlp.experts.down_proj")
+}
+
+/// Parse `model.layers.{L}.mlp.experts.{E}.{section}`.
+pub(crate) fn parse_qwen3_moe_expert_section(name: &str) -> Option<(u32, u32, usize)> {
+    let rest = name.strip_prefix("model.layers.")?;
+    let (layer_str, rest) = rest.split_once('.')?;
+    let rest = rest.strip_prefix("mlp.experts.")?;
+    let (expert_str, section) = rest.split_once('.')?;
+    // Reject fused bank names (no expert index).
+    if expert_str == "gate_up_proj" || expert_str == "down_proj" {
+        return None;
+    }
+    let layer: u32 = layer_str.parse().ok()?;
+    let expert: u32 = expert_str.parse().ok()?;
+    let section_idx = QWEN3_MOE_EXPERT_SECTIONS.iter().position(|s| *s == section)?;
+    Some((layer, expert, section_idx))
+}
+
+fn qwen3_moe_collect_bindings(
+    metadata: &CheckpointMetadata,
+    num_layers: u32,
+    num_experts: u32,
+) -> Result<Vec<StreamBinding>, CompileError> {
+    collect_bindings_from_named_tensors(
+        metadata,
+        num_layers,
+        num_experts,
+        QWEN3_MOE_EXPERT_SECTIONS.len(),
+        is_qwen3_moe_routed_expert_tensor,
+        parse_qwen3_moe_expert_section,
+    )
+}
+
+pub(crate) const QWEN3_MOE_STREAM_ARCH: StreamArchDesc = StreamArchDesc {
+    sections: QWEN3_MOE_EXPERT_SECTIONS,
+    is_streamed: is_qwen3_moe_routed_expert_tensor,
+    collect_bindings: qwen3_moe_collect_bindings,
+};
+
+/// Qwen3.5/3.6-MoE fused BF16 banks — must match `qwen_moe_expert_sections.hpp`.
+pub const QWEN35_MOE_EXPERT_SECTIONS: &[&str] = &["gate_up.weight", "down.weight"];
+
+fn qwen35_moe_layers_prefix(name: &str) -> Option<&str> {
+    name.strip_prefix("model.language_model.layers.")
+        .or_else(|| name.strip_prefix("model.layers."))
+}
+
+/// Qwen3.5-MoE fused expert packs (not shared expert / router).
+pub(crate) fn is_qwen35_moe_streamed_expert_tensor(name: &str) -> bool {
+    let Some(rest) = qwen35_moe_layers_prefix(name) else {
+        return false;
+    };
+    let Some((_, rest)) = rest.split_once('.') else {
+        return false;
+    };
+    matches!(
+        rest,
+        "mlp.experts.gate_up_proj" | "mlp.experts.down_proj"
+    )
+}
+
+fn qwen35_moe_find_tensor<'a>(
+    metadata: &'a CheckpointMetadata,
+    name: &str,
+) -> Result<&'a RawTensor, CompileError> {
+    metadata
+        .tensors
+        .iter()
+        .find(|t| t.name == name)
+        .ok_or_else(|| {
+            CompileError::InvalidInput(format!(
+                "stream_routed_experts: missing Qwen3.5-MoE expert tensor '{name}'"
+            ))
+        })
+}
+
+fn qwen35_moe_collect_bindings(
+    metadata: &CheckpointMetadata,
+    num_layers: u32,
+    num_experts: u32,
+) -> Result<Vec<StreamBinding>, CompileError> {
+    let e = num_experts as u64;
+    if e == 0 {
+        return Err(CompileError::InvalidInput(
+            "stream_routed_experts: Qwen3.5-MoE num_experts must be > 0".to_string(),
+        ));
+    }
+    // Prefer language_model prefix when present (multimodal checkpoints).
+    let prefix_root = if metadata
+        .tensors
+        .iter()
+        .any(|t| t.name.starts_with("model.language_model.layers."))
+    {
+        "model.language_model.layers."
+    } else {
+        "model.layers."
+    };
+    let mut bindings = Vec::with_capacity(
+        (num_layers as usize) * (num_experts as usize) * QWEN35_MOE_EXPERT_SECTIONS.len(),
+    );
+    for layer in 0..num_layers {
+        let prefix = format!("{prefix_root}{layer}.mlp.experts.");
+        let gate_up = qwen35_moe_find_tensor(metadata, &format!("{prefix}gate_up_proj"))?;
+        let down = qwen35_moe_find_tensor(metadata, &format!("{prefix}down_proj"))?;
+        let gu_span = gate_up.span_bytes / e;
+        let dn_span = down.span_bytes / e;
+        if gu_span * e != gate_up.span_bytes || dn_span * e != down.span_bytes {
+            return Err(CompileError::InvalidInput(format!(
+                "stream_routed_experts: Qwen3.5-MoE fused expert spans at layer \
+                 {layer} are not divisible by num_experts={num_experts}"
+            )));
+        }
+        for expert in 0..e {
+            bindings.push(StreamBinding {
+                file_id: gate_up.file_id,
+                file_offset: gate_up.file_offset + expert * gu_span,
+                span_bytes: gu_span,
+            });
+            bindings.push(StreamBinding {
+                file_id: down.file_id,
+                file_offset: down.file_offset + expert * dn_span,
+                span_bytes: dn_span,
+            });
+        }
+    }
+    Ok(bindings)
+}
+
+pub(crate) const QWEN35_MOE_STREAM_ARCH: StreamArchDesc = StreamArchDesc {
+    sections: QWEN35_MOE_EXPERT_SECTIONS,
+    is_streamed: is_qwen35_moe_streamed_expert_tensor,
+    collect_bindings: qwen35_moe_collect_bindings,
+};
+
 fn ends_with_any(value: &str, suffixes: &[&str]) -> bool {
     suffixes.iter().any(|suffix| value.ends_with(suffix))
 }
@@ -293,5 +455,44 @@ mod tests {
             "model.layers.0.block_sparse_moe.gate.weight"
         )
         .is_none());
+    }
+
+    #[test]
+    fn parse_qwen3_moe_names() {
+        assert_eq!(
+            parse_qwen3_moe_expert_section(
+                "model.layers.2.mlp.experts.5.up_proj.weight"
+            ),
+            Some((2, 5, 1))
+        );
+        assert!(is_qwen3_moe_routed_expert_tensor(
+            "model.layers.0.mlp.experts.0.gate_proj.weight"
+        ));
+        assert!(!is_qwen3_moe_routed_expert_tensor(
+            "model.layers.0.mlp.experts.gate_up_proj"
+        ));
+        assert!(parse_qwen3_moe_expert_section(
+            "model.layers.0.mlp.experts.gate_up_proj"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn qwen35_moe_fused_matcher() {
+        assert!(is_qwen35_moe_streamed_expert_tensor(
+            "model.layers.0.mlp.experts.gate_up_proj"
+        ));
+        assert!(is_qwen35_moe_streamed_expert_tensor(
+            "model.language_model.layers.1.mlp.experts.down_proj"
+        ));
+        assert!(!is_qwen35_moe_streamed_expert_tensor(
+            "model.layers.0.mlp.shared_expert.gate_proj.weight"
+        ));
+        assert!(!is_qwen35_moe_streamed_expert_tensor(
+            "model.layers.0.mlp.gate.weight"
+        ));
+        assert!(!is_qwen35_moe_streamed_expert_tensor(
+            "model.layers.0.mlp.experts.0.gate_proj.weight"
+        ));
     }
 }

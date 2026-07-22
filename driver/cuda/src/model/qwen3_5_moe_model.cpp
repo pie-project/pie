@@ -1,5 +1,7 @@
 #include "model/qwen3_5_moe_model.hpp"
 
+#include "expert_stream_cache.hpp"
+
 namespace pie_cuda_driver::model {
 
 Qwen35MoeModel::Qwen35MoeModel(
@@ -15,7 +17,8 @@ Qwen35MoeModel::Qwen35MoeModel(
     bool force_prefill_path,
     int small_prefill_naive_attention_max_tokens,
     bool graph_safe,
-    bool supports_small_prefill_graph)
+    bool supports_small_prefill_graph,
+    ExpertStreamCache* expert_cache)
     : weights_(weights),
       hf_config_(hf_config),
       la_ws_(la_ws),
@@ -29,10 +32,15 @@ Qwen35MoeModel::Qwen35MoeModel(
         small_prefill_naive_attention_max_tokens;
     fwd_cfg_.tp_size = tp_size;
     fwd_cfg_.tp_comm = tp_comm;
+    fwd_cfg_.expert_cache = expert_cache;
 
-    caps_.graph_safe                   = graph_safe;
+    // SSD expert page-ins need host routing + D2H sync; CUDA graphs cannot
+    // capture that path (cudaErrorStreamCaptureUnsupported).
+    const bool streaming = expert_cache != nullptr;
+    caps_.graph_safe                   = graph_safe && !streaming;
     caps_.supports_compact_logits      = true;
-    caps_.supports_small_prefill_graph = supports_small_prefill_graph;
+    caps_.supports_small_prefill_graph =
+        supports_small_prefill_graph && !streaming;
 }
 
 void Qwen35MoeModel::prepare(AttentionWorkspace& attn_ws,

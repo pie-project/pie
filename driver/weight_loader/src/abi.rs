@@ -557,14 +557,25 @@ const ARCH_PROFILES: &[(&[&str], ArchProfile)] = &[
         },
     ),
     (
-        // Plain Qwen3-MoE (Qwen3-30B-A3B) and Qwen3.5-MoE: their bind path reads
-        // attention q/k/v separately and never a fused qkv, so opt out of the
-        // dense projection join that would otherwise consume q_proj/k_proj/v_proj.
-        &["qwen3_moe", "qwen3_5_moe", "qwen3_5_moe_text"],
+        // Plain Qwen3-MoE (Qwen3-30B-A3B): per-expert gate/up/down; bind reads
+        // separate q/k/v. Stack to fused banks unless SSD streaming is on.
+        &["qwen3_moe"],
         ArchProfile {
             bf16_runtime_quant: true,
             skip_dense_qkv_fusion: true,
             stack_per_expert_moe: true,
+            stream: Some(crate::stream_arch::QWEN3_MOE_STREAM_ARCH),
+            ..GENERIC_ARCH
+        },
+    ),
+    (
+        // Qwen3.5/3.6-MoE: pre-fused BF16 expert banks + optional shared expert.
+        &["qwen3_5_moe", "qwen3_5_moe_text"],
+        ArchProfile {
+            bf16_runtime_quant: true,
+            skip_dense_qkv_fusion: true,
+            stack_per_expert_moe: true,
+            stream: Some(crate::stream_arch::QWEN35_MOE_STREAM_ARCH),
             ..GENERIC_ARCH
         },
     ),
@@ -633,7 +644,7 @@ impl DefaultAbiBuilder<'_> {
         let Some(arch) = self.profile().stream else {
             return Err(CompileError::InvalidInput(format!(
                 "stream_routed_experts is not supported for model_type='{}' \
-                 (supported: deepseek_v4, gpt_oss, mixtral)",
+                 (supported: deepseek_v4, gpt_oss, mixtral, qwen3_moe, qwen3_5_moe)",
                 self.cfg.model_type
             )));
         };
@@ -1241,6 +1252,11 @@ impl DefaultAbiBuilder<'_> {
         if !self.profile().stack_per_expert_moe || self.target.tp_size != 1 {
             // TP>1 per-expert sharding is not wired yet; the bind then fails
             // loudly on the missing fused tensor rather than loading silently wrong.
+            return Ok(());
+        }
+        // SSD streaming pages per-expert (or fused-bank) extents directly;
+        // stacking would also emit resident fused contracts from the same sources.
+        if self.target.stream_routed_experts {
             return Ok(());
         }
         let num_experts = self.cfg.num_experts as i64;

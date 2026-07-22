@@ -471,13 +471,16 @@ int run_impl(int argc,
         : 0;
     // SSD expert streaming: carve the bounded expert slab out of free VRAM
     // now, *before* the memory planner runs, so KV/workspace sizing adapts
-    // to the remaining budget automatically. DSv4, GPT-OSS, and Mixtral are
-    // wired; the Rust weight-loader compiler already rejected other archs.
+    // to the remaining budget automatically. DSv4, GPT-OSS, Mixtral, and
+    // Qwen3/3.5-MoE are wired; the Rust weight-loader compiler already
+    // rejected other archs.
     std::unique_ptr<pie_cuda_driver::ExpertStreamCache> expert_stream_cache;
     if (cfg.model.stream_routed_experts) {
-        if (!is_dsv4_arch && !is_gpt_oss_arch && !is_mixtral_arch) {
+        if (!is_dsv4_arch && !is_gpt_oss_arch && !is_mixtral_arch &&
+            !is_qwen3_5_moe_arch) {
             std::cerr << "[pie-driver-cuda] model.stream_routed_experts is only "
-                         "supported for deepseek_v4, gpt_oss, and mixtral (got '"
+                         "supported for deepseek_v4, gpt_oss, mixtral, and "
+                         "qwen3_moe/qwen3_5_moe (got '"
                       << engine.hf_config().model_type << "')\n";
             return 2;
         }
@@ -1257,7 +1260,8 @@ int run_impl(int argc,
             }(),
             /*supports_small_prefill_graph=*/
                 kv_cache.format().is_native_bf16() && !kv_cache.hnd_layout() &&
-                pie_cuda_driver::model::qwen35_small_spec_graph_tokens() > 0);
+                pie_cuda_driver::model::qwen35_small_spec_graph_tokens() > 0,
+            expert_stream_cache.get());
         forward_fn.attach_model(qwen3_5_moe_model.get());
         if (weights_qwen3_5_moe.mtp.has_value() && native_mtp_num_drafts > 0) {
             qwen3_5_moe_model->wire_system_drafter(
