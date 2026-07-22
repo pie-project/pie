@@ -1,134 +1,166 @@
-# PLEX JSON State-Map Design Record
+# PLEX v0.5 Design Record
 
 ## Current Decision
 
-PLEX uses the breaking, intentionally untyped `pie:plex@0.3.0` research ABI.
-One JSON string crosses the Wasm boundary in each direction. The removed v0.1
-handle/schema/column/map system and the v0.2 embedded request document are not
-retained behind compatibility adapters.
-
-## State Model
-
-Every invocation receives:
-
-- one process-local global map;
-- one map per referenced logical request;
-- transient operation context.
-
-Both persistent scopes contain exactly:
+PLEX uses:
 
 ```text
-facts
-fields
-scratch
+engine API: pie.plex.engine@1
+policy ABI: pie:plex@0.5.0
 ```
 
-`facts` is host-written and policy-read-only. `fields` is policy-writable and
-engine-interpreted. `scratch` is policy-writable and engine-opaque.
+The typed v0.1 design, embedded-request v0.2 design, complete-input v0.3
+responses, and ambient v0.4 state imports are not retained behind
+compatibility adapters.
 
-The global map is shared by every active operation owner in a
-`LifecycleHost`. Request maps survive hooks and continuations and are removed
-at terminal completion.
+## Two Different Waists
 
-## Identity and Observations
-
-Request identity moved to host facts:
+Engines use one JSON operation:
 
 ```text
-requests[id].facts.logical_request_id
-requests[id].facts.generation_id
+invoke(event) -> outcome
 ```
 
-The map key must match `logical_request_id`.
-
-Actual placement is recorded only after enactment through
-`record_enacted_placement`. Route scores and admission acceptance do not
-speculatively change `previous_target`.
-
-Host-observed service belongs in facts. Policy predictions, debt models, and
-derived accounting belong in scratch.
-
-## Mutation Rule
-
-A response may change only:
+Wasm policies keep five explicit exports:
 
 ```text
-global.fields
-global.scratch
+route admit schedule evict feedback
+```
+
+Engines never implement or consume WIT. Hook names remain explicit in WIT
+because they are the stable policy waist.
+
+## Explicit State Transaction
+
+Each hook receives a WIT record containing context JSON and state JSON. It
+returns result JSON and state-update JSON.
+
+There is no state import and no exactly-once load/stage protocol. Backend
+revisions remain host-private.
+
+The SDK still exposes mutable `State` and computes:
+
+```text
+{}                         no change
+shared                     changed shared scratch
+requests[id].fields        changed engine-visible fields
+requests[id].scratch       changed policy scratch
+```
+
+Facts and request membership cannot be returned.
+
+## Engine Outcomes
+
+Successful outcomes expose:
+
+```text
+normalized decision
+changed request fields
+ordered staged actions
+```
+
+Shared and request scratch stay internal. Ranking/fill is normalized once in
+the semantic core.
+
+Unavailable and policy failure are outcomes. Invalid engine events, backend
+failure, package failure, and runtime construction failure are API errors.
+
+## Queries and Actions
+
+Query is the only engine callback. It is synchronous, bounded, and read-only.
+Candidate-scale facts remain in hook context.
+
+Action is not a callback. PLEX validates a supported versioned method, assigns
+an invocation-local ID, buffers the descriptor, commits state, and returns the
+descriptor to the engine.
+
+The engine enacts actions and reports outcomes through feedback. PLEX cannot
+roll back a physical action and policy state must not assume success before
+feedback.
+
+## Request Events
+
+Create, continue, and fact events are authoritative and happen before policy
+state loading. Finish happens after feedback access. Event shapes and
+generation transitions preflight before mutation.
+
+Successful feedback can combine state update, deduplication, and finish in one
+backend commit. Unavailable/fallback feedback still performs cleanup.
+
+## State and Concurrency
+
+Persistent state remains:
+
+```text
+shared
+requests[id].facts
 requests[id].fields
 requests[id].scratch
 ```
 
-Facts, request-map membership, candidate/event facts, capacity, identities,
-causes, delivery IDs, capabilities, and all other transient context are
-read-only.
+The in-memory backend uses revisions and compare-and-swap. Multiple runtimes can
+share it. State conflict returns fallback and no action.
 
-Attempted read-only mutation causes fallback. The host does not silently
-restore it.
+Validated pre-hook request events are sequential in the in-memory backend.
+Backend-failure atomic batching and etcd ownership/handoff are deferred rather
+than hidden behind complex machinery.
 
-## Atomicity and Concurrency
+## SDK Style
 
-One `LifecycleHost` mutex serializes:
+Normal Rust policy code uses methods such as:
 
 ```text
-hydrate -> invoke -> validate -> commit
+kv_lookup
+cluster_capacity
+prefetch_kv
+preempt
+replicate
+set_retention
+arm_timer
 ```
 
-Global and request mutations commit atomically only after complete response
-validation. `route -> admit` holds the same gate across the sequence while
-making each successful mutation visible to the next hook.
+Raw query/action methods remain extension points. There are no one-use argument
+structs or typed hook models.
 
-This is the simplest intentional PoC tradeoff. Revisions, CAS loops,
-distributed transactions, and scalable concurrent state updates are deferred.
+## Python Boundary
 
-## Feedback
+`pie_plex.Runtime` is a standalone PyO3/Maturin package depending on the PLEX
+runtime, not `pie-worker`.
 
-Feedback deduplication is part of the state store. Mutation and delivery-ID
-commit happen atomically. Duplicates skip Wasm and return the cached result.
-The ledger survives package replacement but not process restart.
+The native seam is one JSON string method. The facade uses Python JSON
+serialization. Wasmtime runs detached from the GIL; query callbacks attach only
+for the callback. Same-runtime recursive invocation is rejected.
 
-## Continuations
+Mock vLLM/SGLang adapters are implemented and tested. They are not claims of
+live version-pinned integration.
 
-Continuation creation:
+## Retained Guarantees
 
-- preserves request fields and scratch;
-- replaces `fields.body`;
-- shallow-merges `fields.metadata`;
-- increments host-owned generation;
-- preserves durable facts such as `previous_target`;
-- clears the explicit generation-local key `current_target`.
-
-## Retained Runtime Guarantees
-
-The PoC retains package integrity, zero imports, fresh Wasm instances,
-memory/fuel/deadline/input/output bounds, aligned finite scores, budget bounds,
-native fallback, deterministic replay, and atomic package publication.
-
-## Intentional Tradeoffs
-
-- Full mutated JSON is returned instead of a patch.
-- Policies share one global namespace and coordinate key ownership by
-  convention.
-- JSON shape validation is minimal and untyped.
-- State and deduplication are process-local.
-- Stateful invocations are serialized.
-- The host does not automatically reroute after policy request mutation.
+- exact v0.5 host import and policy export;
+- no state or WASI import;
+- package integrity and atomic replacement;
+- fresh bounded Wasm instances;
+- finite aligned scores and budget bounds;
+- full-set scheduling;
+- revisioned commits;
+- feedback deduplication;
+- deterministic replay;
+- Rust/Python JSON parity;
+- native fallback.
 
 ## Deferred
 
 - typed schemas and efficient encodings;
 - generated request models;
-- field/map/event/capability handles;
-- provenance-enforced facts;
-- per-package global isolation;
-- distributed/persistent state;
+- JSON Patch;
+- etcd implementation and ownership handoff;
 - crash-durable deduplication;
-- scalable state transactions;
-- automatic mutation dependency tracking;
+- distributed authoritative-event batching;
+- automatic conflict retry;
 - candidate-local indexes;
-- shared-unit multi-owner mutation;
-- prefetch/rebalance;
-- production Pie adapters.
+- physical action rollback;
+- live PIE hook wiring;
+- version-pinned vLLM/SGLang integrations;
+- Python policy authoring.
 
-`plex_paper.md` remains unchanged. Paper reconciliation and measurements are
-separate work.
+`plex_paper.md` remains unchanged.

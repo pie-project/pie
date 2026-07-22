@@ -1,9 +1,19 @@
-package pie:plex@0.3.0;
+package pie:plex@0.5.0;
 
 interface policy {
-    route: func(input-json: string) -> result<string, string>;
-    admit: func(input-json: string) -> result<string, string>;
-    schedule: func(input-json: string) -> result<string, string>;
-    evict: func(input-json: string) -> result<string, string>;
-    feedback: func(input-json: string) -> result<string, string>;
+    record invocation {
+        context-json: string,
+        state-json: string,
+    }
+
+    record policy-output {
+        result-json: string,
+        state-update-json: string,
+    }
+
+    route: func(input: invocation) -> result<policy-output, string>;
+    admit: func(input: invocation) -> result<policy-output, string>;
+    schedule: func(input: invocation) -> result<policy-output, string>;
+    evict: func(input: invocation) -> result<policy-output, string>;
+    feedback: func(input: invocation) -> result<policy-output, string>;
 }

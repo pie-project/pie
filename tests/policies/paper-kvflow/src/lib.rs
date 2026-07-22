@@ -2,13 +2,13 @@
 //! https://arxiv.org/abs/2507.07400
 
 use plex::serde_json::json;
-use plex::{Document, Policy};
+use plex::{Document, Host, Policy, State};
 
 struct KvFlow;
 
 impl Policy for KvFlow {
-    fn schedule(input: &mut Document) -> Result<Document, String> {
-        let decisions = input["runnable"]
+    fn schedule(ctx: &Document, _state: &mut State, _host: &Host) -> Result<Document, String> {
+        let decisions = ctx["runnable"]
             .as_array()
             .ok_or("runnable must be an array")?
             .iter()
@@ -28,8 +28,8 @@ impl Policy for KvFlow {
         Ok(json!({"decisions": decisions}))
     }
 
-    fn evict(input: &mut Document) -> Result<Document, String> {
-        let scores = input["resident"]
+    fn evict(ctx: &Document, _state: &mut State, _host: &Host) -> Result<Document, String> {
+        let scores = ctx["resident"]
             .as_array()
             .ok_or("resident must be an array")?
             .iter()

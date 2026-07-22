@@ -1,0 +1,100 @@
+{
+  "events": [
+    {
+      "api_version": "pie.plex.engine@1",
+      "hook": "route",
+      "context": {
+        "request_id": "L",
+        "candidates": [
+          {
+            "id": "node-a",
+            "facts": {
+              "queue_depth": 10,
+              "cached_tokens": 100,
+              "has_request_kv": true
+            }
+          },
+          {
+            "id": "node-b",
+            "facts": {
+              "queue_depth": 20,
+              "cached_tokens": 0,
+              "has_request_kv": false
+            }
+          }
+        ],
+        "context": {}
+      },
+      "request_events": [
+        {
+          "op": "create",
+          "request_id": "L",
+          "facts": {
+            "generation_id": 0
+          },
+          "fields": {
+            "body": {
+              "prompt": "hello"
+            },
+            "metadata": {}
+          }
+        }
+      ]
+    },
+    {
+      "api_version": "pie.plex.engine@1",
+      "hook": "admit",
+      "context": {
+        "request_id": "L",
+        "target": {
+          "id": "node-a",
+          "facts": {
+            "queue_depth": 10
+          }
+        },
+        "context": {}
+      },
+      "request_events": []
+    },
+    {
+      "api_version": "pie.plex.engine@1",
+      "hook": "schedule",
+      "context": {
+        "runnable": [
+          {
+            "request_id": "L",
+            "facts": {},
+            "max_token_budget": 8
+          }
+        ],
+        "capacity": {
+          "max_selected": 1,
+          "max_total_tokens": 8,
+          "max_token_budget": 8
+        },
+        "context": {
+          "capabilities": {
+            "token_budget": true
+          }
+        }
+      },
+      "request_events": []
+    }
+  ],
+  "expected_decisions": [
+    {
+      "order": [0, 1]
+    },
+    {
+      "decision": "accept"
+    },
+    {
+      "selected": [
+        {
+          "candidate_index": 0,
+          "token_budget": 8
+        }
+      ]
+    }
+  ]
+}

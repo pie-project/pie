@@ -6,8 +6,15 @@ cd "$root"
 
 forbidden='pie-(engine|gateway|worker)|runtime/engine|gateway/|worker/'
 
-if grep -ERn "$forbidden" interface/plex runtime/policy/Cargo.toml; then
+if grep -ERn "$forbidden" \
+    interface/plex runtime/policy/Cargo.toml sdk/python-plex/Cargo.toml; then
     echo "PLEX contract or policy host depends on Pie mechanics" >&2
+    exit 1
+fi
+
+if cargo tree --locked -p pie-plex-py --depth 2 -e normal --prefix none \
+    | grep -Eq '^pie-(engine|gateway|worker)( |$)'; then
+    echo "pie-plex Python binding dependency graph reaches Pie mechanics" >&2
     exit 1
 fi
 

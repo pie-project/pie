@@ -37,10 +37,6 @@ pub struct SelectedEviction {
 
 const SCOPE_NAMESPACES: [&str; 3] = ["facts", "fields", "scratch"];
 
-pub fn validate_global_scope(global: &Value) -> Result<(), DecisionValidationError> {
-    validate_scope(global, "global").map(|_| ())
-}
-
 pub fn validate_request_scope(
     logical_request_id: &str,
     request: &Value,
@@ -54,25 +50,6 @@ pub fn validate_request_scope(
         || facts.get("generation_id").and_then(Value::as_u64).is_none()
     {
         return Err(DecisionValidationError::InvalidRequestIdentity);
-    }
-    Ok(())
-}
-
-pub fn validate_state_envelope(input: &Value) -> Result<(), DecisionValidationError> {
-    let input = input
-        .as_object()
-        .ok_or(DecisionValidationError::EnvelopeNotObject)?;
-    validate_global_scope(
-        input
-            .get("global")
-            .ok_or(DecisionValidationError::MissingField("global"))?,
-    )?;
-    let requests = input
-        .get("requests")
-        .and_then(Value::as_object)
-        .ok_or(DecisionValidationError::RequestsNotObject)?;
-    for (logical_request_id, request) in requests {
-        validate_request_scope(logical_request_id, request)?;
     }
     Ok(())
 }
@@ -312,8 +289,6 @@ fn stable_order(scores: &[f64], descending: bool) -> Vec<usize> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum DecisionValidationError {
-    #[error("operation envelope must be a JSON object")]
-    EnvelopeNotObject,
     #[error("{0} scope must be a JSON object")]
     ScopeNotObject(&'static str),
     #[error("{0} scope must contain exactly facts, fields, and scratch")]
@@ -323,8 +298,6 @@ pub enum DecisionValidationError {
         scope: &'static str,
         namespace: &'static str,
     },
-    #[error("requests must be a JSON object")]
-    RequestsNotObject,
     #[error(
         "request-map key must equal non-empty facts.logical_request_id and generation_id must be unsigned"
     )]
@@ -360,24 +333,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn validates_global_and_request_scopes() {
-        let global = json!({"facts": {}, "fields": {}, "scratch": {}});
+    fn validates_request_scopes() {
         let request = json!({
             "facts": {"logical_request_id": "L", "generation_id": 0},
             "fields": {"body": {}, "metadata": {}},
             "scratch": {}
         });
-        validate_global_scope(&global).unwrap();
         validate_request_scope("L", &request).unwrap();
-        validate_state_envelope(&json!({
-            "global": global,
-            "requests": {"L": request}
-        }))
-        .unwrap();
         assert!(validate_request_scope("M", &request).is_err());
         assert!(
-            validate_global_scope(&json!({"facts": {}, "fields": {}, "scratch": {}, "extra": {}}))
-                .is_err()
+            validate_request_scope(
+                "L",
+                &json!({"facts": {}, "fields": {}, "scratch": {}, "extra": {}})
+            )
+            .is_err()
         );
     }
 

@@ -1,12 +1,13 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use pie_plex::{Document, Operation};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    AttachmentRegistry, Invocation, InvocationFailureKind, JsonResponse, LifecycleHost,
-    PlacementOutcome, PolicyStateStore,
+    AttachmentRegistry, Invocation, InvocationFailureKind, LifecycleHost, PlacementOutcome,
+    PolicyStateBackend, PreparedPolicyResult, QueryHandler, RejectingQueryHandler,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -36,7 +37,7 @@ pub enum ReplayCommand {
     },
     Invoke {
         operation: Operation,
-        input: Document,
+        context: Document,
     },
     RouteAdmit {
         logical_request_id: String,
@@ -45,15 +46,12 @@ pub enum ReplayCommand {
         context: Document,
     },
     FeedbackRemove {
-        input: Document,
+        context: Document,
         terminal_logical_ids: Vec<String>,
     },
-    ReadGlobal,
-    ReplaceGlobalFacts {
-        facts: Document,
-    },
-    MergeGlobalFacts {
-        facts: Document,
+    ReadShared,
+    ReplaceShared {
+        shared: Document,
     },
     MergeRequestFacts {
         logical_request_id: String,
@@ -82,15 +80,15 @@ pub enum ReplayOutcome {
     AttachmentDetached {
         generation: u64,
     },
-    GlobalState {
-        global: Document,
+    SharedState {
+        shared: Document,
     },
     RequestState {
         request: Document,
     },
     Invocation {
         operation: Operation,
-        response: JsonResponse,
+        response: PreparedPolicyResult,
         selection: Option<Document>,
     },
     Placement {
@@ -119,14 +117,38 @@ pub struct ReplayRunner {
 impl ReplayRunner {
     pub fn new(
         registry: AttachmentRegistry,
-        state: PolicyStateStore,
+        backend: Arc<dyn PolicyStateBackend>,
         packages: BTreeMap<String, Vec<u8>>,
+        max_defer_retries: u32,
+    ) -> Result<Self, ReplaySetupError> {
+        Self::with_host(
+            registry,
+            backend,
+            packages,
+            Arc::new(RejectingQueryHandler),
+            BTreeSet::new(),
+            max_defer_retries,
+        )
+    }
+
+    pub fn with_host(
+        registry: AttachmentRegistry,
+        backend: Arc<dyn PolicyStateBackend>,
+        packages: BTreeMap<String, Vec<u8>>,
+        query_handler: Arc<dyn QueryHandler>,
+        supported_actions: BTreeSet<String>,
         max_defer_retries: u32,
     ) -> Result<Self, ReplaySetupError> {
         if registry.uses_realtime_epochs() {
             return Err(ReplaySetupError::RealtimeEpochs);
         }
-        let lifecycle = LifecycleHost::new(registry.clone(), state, max_defer_retries);
+        let lifecycle = LifecycleHost::with_host(
+            registry.clone(),
+            backend,
+            query_handler,
+            supported_actions,
+            max_defer_retries,
+        );
         Ok(Self {
             registry,
             lifecycle,
@@ -214,12 +236,11 @@ impl ReplayRunner {
                 .continue_request(logical_request_id, body.clone(), metadata.clone())
                 .map(|request| ReplayOutcome::RequestState { request })
                 .map_err(|error| error.to_string()),
-            ReplayCommand::Invoke { operation, input } => Ok(
-                match self.lifecycle.invoke_and_apply(*operation, input.clone()) {
+            ReplayCommand::Invoke { operation, context } => Ok(
+                match self.lifecycle.invoke_and_apply(*operation, context.clone()) {
                     Invocation::Success(response) => ReplayOutcome::Invocation {
                         operation: *operation,
-                        selection: selection(*operation, &response)
-                            .map_err(|error| error.to_string())?,
+                        selection: selection(*operation, context, &response.result)?,
                         response,
                     },
                     Invocation::Unavailable => ReplayOutcome::Unavailable {
@@ -254,12 +275,12 @@ impl ReplayRunner {
                 },
             ),
             ReplayCommand::FeedbackRemove {
-                input,
+                context,
                 terminal_logical_ids,
             } => Ok(
                 match self
                     .lifecycle
-                    .feedback_and_remove(input.clone(), terminal_logical_ids)
+                    .feedback_and_remove(context.clone(), terminal_logical_ids)
                 {
                     Invocation::Success(response) => ReplayOutcome::Invocation {
                         operation: Operation::Feedback,
@@ -275,24 +296,21 @@ impl ReplayRunner {
                     },
                 },
             ),
-            ReplayCommand::ReadGlobal => Ok(ReplayOutcome::GlobalState {
-                global: self.lifecycle.state().read_global(),
-            }),
-            ReplayCommand::ReplaceGlobalFacts { facts } => {
+            ReplayCommand::ReadShared => self
+                .lifecycle
+                .backend()
+                .read_shared()
+                .map(|shared| ReplayOutcome::SharedState { shared })
+                .map_err(|error| error.to_string()),
+            ReplayCommand::ReplaceShared { shared } => {
                 self.lifecycle
-                    .replace_global_facts(facts.clone())
+                    .replace_shared(shared.clone())
                     .map_err(|error| error.to_string())?;
-                Ok(ReplayOutcome::GlobalState {
-                    global: self.lifecycle.state().read_global(),
-                })
-            }
-            ReplayCommand::MergeGlobalFacts { facts } => {
                 self.lifecycle
-                    .merge_global_facts(facts.clone())
-                    .map_err(|error| error.to_string())?;
-                Ok(ReplayOutcome::GlobalState {
-                    global: self.lifecycle.state().read_global(),
-                })
+                    .backend()
+                    .read_shared()
+                    .map(|shared| ReplayOutcome::SharedState { shared })
+                    .map_err(|error| error.to_string())
             }
             ReplayCommand::MergeRequestFacts {
                 logical_request_id,
@@ -320,7 +338,7 @@ impl ReplayRunner {
 
     fn request_outcome(&self, logical_request_id: &str) -> Result<ReplayOutcome, String> {
         self.lifecycle
-            .state()
+            .backend()
             .read_request(logical_request_id)
             .map(|request| ReplayOutcome::RequestState { request })
             .map_err(|error| error.to_string())
@@ -334,29 +352,31 @@ impl ReplayRunner {
     }
 }
 
-fn selection(operation: Operation, response: &JsonResponse) -> Result<Option<Document>, String> {
+fn selection(
+    operation: Operation,
+    context: &Document,
+    result: &Document,
+) -> Result<Option<Document>, String> {
     let selection = match operation {
         Operation::Route => Some(serde_json::json!({
             "order": pie_plex::rank_route(
-                &response.result,
-                response.input["candidates"].as_array().expect("validated").len()
+                result,
+                context["candidates"].as_array().expect("validated").len()
             ).map_err(|error| error.to_string())?
         })),
         Operation::Admit => Some(serde_json::json!({
-            "decision": pie_plex::validate_admit(&response.result)
+            "decision": pie_plex::validate_admit(result)
                 .map_err(|error| error.to_string())?
         })),
         Operation::Schedule => Some(
             serde_json::to_value(
-                pie_plex::select_schedule(&response.input, &response.result)
-                    .map_err(|error| error.to_string())?,
+                pie_plex::select_schedule(context, result).map_err(|error| error.to_string())?,
             )
             .map_err(|error| error.to_string())?,
         ),
         Operation::Evict => Some(
             serde_json::to_value(
-                pie_plex::select_evictions(&response.input, &response.result)
-                    .map_err(|error| error.to_string())?,
+                pie_plex::select_evictions(context, result).map_err(|error| error.to_string())?,
             )
             .map_err(|error| error.to_string())?,
         ),

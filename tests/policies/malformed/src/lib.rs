@@ -1,10 +1,10 @@
 use plex::serde_json::json;
-use plex::{Document, Policy};
+use plex::{Document, Host, Policy, State};
 
 struct Malformed;
 
 impl Policy for Malformed {
-    fn route(_input: &mut Document) -> Result<Document, String> {
+    fn route(_ctx: &Document, _state: &mut State, _host: &Host) -> Result<Document, String> {
         Ok(json!({"scores": []}))
     }
 }

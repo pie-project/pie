@@ -15,6 +15,8 @@ pub struct PolicyEngineConfig {
     pub max_deadline_ms: u64,
     pub max_input_bytes: u64,
     pub max_output_bytes: u64,
+    pub max_host_calls: u32,
+    pub max_host_call_bytes: u64,
     pub max_concurrent_invocations: u32,
     pub max_feedback_deliveries: usize,
     pub epoch_tick: Option<Duration>,
@@ -31,6 +33,8 @@ impl Default for PolicyEngineConfig {
             max_deadline_ms: 100,
             max_input_bytes: 4 * 1024 * 1024,
             max_output_bytes: 4 * 1024 * 1024,
+            max_host_calls: 64,
+            max_host_call_bytes: 4 * 1024 * 1024,
             max_concurrent_invocations: 128,
             max_feedback_deliveries: 4096,
             epoch_tick: Some(Duration::from_millis(1)),
@@ -80,6 +84,16 @@ impl PolicyEngine {
         if config.max_concurrent_invocations == 0 {
             return Err(AttachmentError::EngineConfig(
                 "max_concurrent_invocations must be non-zero".into(),
+            ));
+        }
+        if config.max_host_calls == 0 {
+            return Err(AttachmentError::EngineConfig(
+                "max_host_calls must be non-zero".into(),
+            ));
+        }
+        if config.max_host_call_bytes == 0 {
+            return Err(AttachmentError::EngineConfig(
+                "max_host_call_bytes must be non-zero".into(),
             ));
         }
         if config.max_feedback_deliveries == 0 {

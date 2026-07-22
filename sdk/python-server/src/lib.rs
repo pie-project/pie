@@ -52,7 +52,7 @@ impl PyEngineHandle {
     fn shutdown(&self, py: Python<'_>) {
         let taken = self.inner.lock().unwrap().take();
         if let Some((handle, runtime)) = taken {
-            py.allow_threads(|| {
+            py.detach(|| {
                 runtime.block_on(handle.shutdown());
                 // Drop the runtime; tokio joins worker threads.
                 drop(runtime);
@@ -88,7 +88,7 @@ fn bootstrap(py: Python<'_>, toml_str: &str) -> PyResult<PyEngineHandle> {
     cfg.validate()
         .map_err(|e| PyValueError::new_err(format!("validate config: {e:#}")))?;
 
-    py.allow_threads(|| -> PyResult<PyEngineHandle> {
+    py.detach(|| -> PyResult<PyEngineHandle> {
         let runtime = engine::build_runtime(&cfg)
             .map_err(|e| PyRuntimeError::new_err(format!("build tokio runtime: {e:#}")))?;
         let runtime = Arc::new(runtime);

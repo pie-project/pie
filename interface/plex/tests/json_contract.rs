@@ -1,21 +1,19 @@
 use pie_plex::{
     AdmissionDecision, rank_route, select_evictions, select_schedule, validate_admit,
-    validate_state_envelope,
+    validate_request_scope,
 };
 use serde_json::json;
 
 #[test]
 fn all_json_operation_results_validate() {
-    validate_state_envelope(&json!({
-        "global": {"facts": {}, "fields": {}, "scratch": {}},
-        "requests": {
-            "L": {
-                "facts": {"logical_request_id": "L", "generation_id": 0},
-                "fields": {"body": {}, "metadata": {}},
-                "scratch": {}
-            }
-        }
-    }))
+    validate_request_scope(
+        "L",
+        &json!({
+            "facts": {"logical_request_id": "L", "generation_id": 0},
+            "fields": {"body": {}, "metadata": {}},
+            "scratch": {}
+        }),
+    )
     .unwrap();
     assert_eq!(
         validate_admit(&json!({"decision": "accept"})).unwrap(),

@@ -13,7 +13,7 @@ pub struct ContractVersion {
 }
 
 impl ContractVersion {
-    pub const V0_3: Self = Self { major: 0, minor: 3 };
+    pub const V0_5: Self = Self { major: 0, minor: 5 };
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,10 +38,10 @@ pub struct Manifest {
 
 impl Manifest {
     pub fn validate(&self) -> Result<(), ManifestValidationError> {
-        if self.contract != ContractVersion::V0_3 {
+        if self.contract != ContractVersion::V0_5 {
             return Err(ManifestValidationError::UnsupportedContract {
                 actual: self.contract,
-                expected: ContractVersion::V0_3,
+                expected: ContractVersion::V0_5,
             });
         }
         validate_package_name(&self.package_name)?;
@@ -121,9 +121,9 @@ mod tests {
 
     fn manifest() -> Manifest {
         Manifest {
-            contract: ContractVersion::V0_3,
+            contract: ContractVersion::V0_5,
             package_name: "json-policy".into(),
-            package_version: "0.3.0".into(),
+            package_version: "0.5.0".into(),
             operations: BTreeSet::from([Operation::Route]),
             limits: PolicyLimits {
                 memory_bytes: 1 << 20,

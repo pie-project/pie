@@ -48,6 +48,7 @@ members = [
     # Isolated operator-policy host for PLEX components.
     "runtime/policy",
     "sdk/python-server",
+    "sdk/python-plex",
     # Thin binary shells composing bootstrap + role lib(s). `bin/pie` is the
     # composition root (deps all three role libs; the standalone).
     "bin/controller",

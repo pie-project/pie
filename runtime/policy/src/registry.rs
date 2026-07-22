@@ -1,10 +1,12 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Condvar, Mutex};
 
 use pie_plex::{Document, Operation};
 use thiserror::Error;
 
-use crate::{AttachedPolicy, AttachmentError, Invocation, JsonResponse, PolicyEngine};
+use crate::host::QueryHandler;
+use crate::state_store::StateSnapshot;
+use crate::{AttachedPolicy, AttachmentError, Invocation, PolicyEngine, PreparedPolicyResult};
 
 #[derive(Clone)]
 pub struct AttachmentRegistry {
@@ -233,17 +235,18 @@ impl AttachmentSnapshot {
             .map(|policy| policy.manifest().package_name.as_str())
     }
 
-    pub fn invoke(&self, operation: Operation, input: Document) -> Invocation<JsonResponse> {
+    pub fn invoke(
+        &self,
+        operation: Operation,
+        context: Document,
+        state: StateSnapshot,
+        query_handler: Arc<dyn QueryHandler>,
+        supported_actions: Arc<BTreeSet<String>>,
+    ) -> Invocation<PreparedPolicyResult> {
         let Some(policy) = self.set.owners.get(&operation) else {
             return Invocation::Unavailable;
         };
-        match operation {
-            Operation::Route => policy.route(input),
-            Operation::Admit => policy.admit(input),
-            Operation::Schedule => policy.schedule(input),
-            Operation::Evict => policy.evict(input),
-            Operation::Feedback => policy.feedback(input),
-        }
+        policy.invoke(operation, context, state, query_handler, supported_actions)
     }
 }
 

@@ -1,19 +1,23 @@
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use pie_plex::{AdmissionDecision, Document, Operation, rank_route, validate_admit};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::protocol::referenced_request_ids;
+use crate::host::{QueryHandler, RejectingQueryHandler};
+use crate::protocol::validate_context;
+use crate::state_store::{FeedbackCommit, PolicyStateBackend, StateBackendError};
 use crate::{
-    AttachmentRegistry, Invocation, InvocationFailure, InvocationFailureKind, JsonResponse,
-    PolicyStateStore, StateStoreError,
+    AttachmentRegistry, Invocation, InvocationFailure, InvocationFailureKind, PreparedPolicyResult,
 };
 
 #[derive(Clone)]
 pub struct LifecycleHost {
     registry: AttachmentRegistry,
-    state: PolicyStateStore,
+    backend: Arc<dyn PolicyStateBackend>,
+    query_handler: Arc<dyn QueryHandler>,
+    supported_actions: Arc<BTreeSet<String>>,
     stateful_invocation: Arc<Mutex<()>>,
     max_defer_retries: u32,
 }
@@ -21,19 +25,37 @@ pub struct LifecycleHost {
 impl LifecycleHost {
     pub fn new(
         registry: AttachmentRegistry,
-        state: PolicyStateStore,
+        backend: Arc<dyn PolicyStateBackend>,
+        max_defer_retries: u32,
+    ) -> Self {
+        Self::with_host(
+            registry,
+            backend,
+            Arc::new(RejectingQueryHandler),
+            BTreeSet::new(),
+            max_defer_retries,
+        )
+    }
+
+    pub fn with_host(
+        registry: AttachmentRegistry,
+        backend: Arc<dyn PolicyStateBackend>,
+        query_handler: Arc<dyn QueryHandler>,
+        supported_actions: BTreeSet<String>,
         max_defer_retries: u32,
     ) -> Self {
         Self {
             registry,
-            state,
+            backend,
+            query_handler,
+            supported_actions: Arc::new(supported_actions),
             stateful_invocation: Arc::new(Mutex::new(())),
             max_defer_retries,
         }
     }
 
-    pub fn state(&self) -> &PolicyStateStore {
-        &self.state
+    pub fn backend(&self) -> &Arc<dyn PolicyStateBackend> {
+        &self.backend
     }
 
     pub fn create_request(
@@ -41,10 +63,10 @@ impl LifecycleHost {
         logical_request_id: impl Into<String>,
         body: Document,
         metadata: Document,
-    ) -> Result<Document, StateStoreError> {
+    ) -> Result<Document, StateBackendError> {
         let _guard = self.stateful_invocation.lock().unwrap();
-        self.state
-            .create_request(logical_request_id, body, metadata)
+        self.backend
+            .create_request(logical_request_id.into(), body, metadata)
     }
 
     pub fn continue_request(
@@ -52,91 +74,80 @@ impl LifecycleHost {
         logical_request_id: &str,
         body: Document,
         metadata: Document,
-    ) -> Result<Document, StateStoreError> {
+    ) -> Result<Document, StateBackendError> {
         let _guard = self.stateful_invocation.lock().unwrap();
-        self.state
+        self.backend
             .continue_request(logical_request_id, body, metadata)
     }
 
-    pub fn reset_global(&self) {
+    pub fn replace_shared(&self, shared: Document) -> Result<(), StateBackendError> {
         let _guard = self.stateful_invocation.lock().unwrap();
-        self.state.reset_global();
-    }
-
-    pub fn replace_global_facts(&self, facts: Document) -> Result<(), StateStoreError> {
-        let _guard = self.stateful_invocation.lock().unwrap();
-        self.state.replace_global_facts(facts)
-    }
-
-    pub fn merge_global_facts(&self, facts: Document) -> Result<(), StateStoreError> {
-        let _guard = self.stateful_invocation.lock().unwrap();
-        self.state.merge_global_facts(facts)
+        self.backend.replace_shared(shared)
     }
 
     pub fn merge_request_facts(
         &self,
         logical_request_id: &str,
         facts: Document,
-    ) -> Result<(), StateStoreError> {
+    ) -> Result<(), StateBackendError> {
         let _guard = self.stateful_invocation.lock().unwrap();
-        self.state.merge_request_facts(logical_request_id, facts)
+        self.backend.merge_request_facts(logical_request_id, facts)
     }
 
     pub fn record_enacted_placement(
         &self,
         logical_request_id: &str,
         target_id: impl Into<String>,
-    ) -> Result<(), StateStoreError> {
+    ) -> Result<(), StateBackendError> {
         let _guard = self.stateful_invocation.lock().unwrap();
-        self.state
-            .record_enacted_placement(logical_request_id, target_id)
+        self.backend
+            .record_enacted_placement(logical_request_id, target_id.into())
     }
 
     pub fn invoke_and_apply(
         &self,
         operation: Operation,
-        input: Document,
-    ) -> Invocation<JsonResponse> {
+        context: Document,
+    ) -> Invocation<PreparedPolicyResult> {
         let _guard = self.stateful_invocation.lock().unwrap();
-        self.invoke_and_apply_locked(operation, input)
+        self.invoke_and_apply_locked(operation, context)
     }
 
     fn invoke_and_apply_locked(
         &self,
         operation: Operation,
-        input: Document,
-    ) -> Invocation<JsonResponse> {
-        self.invoke_and_apply_locked_with_removals(operation, input, &[])
+        context: Document,
+    ) -> Invocation<PreparedPolicyResult> {
+        self.invoke_and_apply_locked_with_removals(operation, context, &[])
     }
 
     fn invoke_and_apply_locked_with_removals(
         &self,
         operation: Operation,
-        input: Document,
+        context: Document,
         terminal_logical_ids: &[String],
-    ) -> Invocation<JsonResponse> {
-        if input.get("global").is_some() || input.get("requests").is_some() {
-            return invalid_input(
-                "operation input must not provide global or requests state".into(),
-            );
-        }
+    ) -> Invocation<PreparedPolicyResult> {
+        let request_ids = match validate_context(operation, &context) {
+            Ok(request_ids) => request_ids,
+            Err(error) => return invalid_input(error.to_string()),
+        };
         let feedback_delivery = if operation == Operation::Feedback {
-            if let Err(error) = referenced_request_ids(operation, &input) {
-                return invalid_input(error.to_string());
-            }
-            let delivery_id = input["delivery_id"]
+            let delivery_id = context["delivery_id"]
                 .as_str()
                 .expect("feedback context was validated");
-            if let Some(result) = self.state.feedback_result(delivery_id) {
-                return Invocation::Success(JsonResponse::duplicate_feedback(input, result));
+            match self.backend.feedback_result(delivery_id) {
+                Ok(Some(result)) => {
+                    return Invocation::Success(PreparedPolicyResult::duplicate_feedback(result));
+                }
+                Ok(None) => Some(delivery_id.to_owned()),
+                Err(error) => return backend_failure(error),
             }
-            Some(delivery_id.to_owned())
         } else {
             None
         };
 
-        let hydrated = match self.state.hydrate(operation, input) {
-            Ok(input) => input,
+        let state = match self.backend.load(&request_ids) {
+            Ok(state) => state,
             Err(error) => return invalid_input(error.to_string()),
         };
         let snapshot = match self.registry.snapshot() {
@@ -148,28 +159,39 @@ impl LifecycleHost {
                 ));
             }
         };
-        match snapshot.invoke(operation, hydrated.clone()) {
-            Invocation::Success(response) => {
-                let feedback = feedback_delivery.as_deref().map(|delivery_id| {
-                    (
-                        delivery_id,
-                        &response.result,
-                        self.registry.max_feedback_deliveries(),
-                    )
-                });
-                if let Err(error) = self.state.commit_policy_mutation(
-                    &hydrated,
-                    &response.input,
-                    feedback,
-                    terminal_logical_ids,
-                ) {
-                    return commit_failure(error);
-                }
-                Invocation::Success(response)
+        let prepared = match snapshot.invoke(
+            operation,
+            context,
+            state.clone(),
+            self.query_handler.clone(),
+            self.supported_actions.clone(),
+        ) {
+            Invocation::Success(prepared) => prepared,
+            Invocation::Unavailable => return Invocation::Unavailable,
+            Invocation::FallbackRequired(failure) => {
+                return Invocation::FallbackRequired(failure);
             }
-            Invocation::Unavailable => Invocation::Unavailable,
-            Invocation::FallbackRequired(failure) => Invocation::FallbackRequired(failure),
+        };
+        let feedback = feedback_delivery.map(|delivery_id| FeedbackCommit {
+            delivery_id,
+            result: prepared.result.clone(),
+            maximum_deliveries: self.registry.max_feedback_deliveries(),
+        });
+        if let Err(error) = self.backend.commit(
+            &state,
+            &prepared.state_updates,
+            feedback.as_ref(),
+            terminal_logical_ids,
+        ) {
+            if let StateBackendError::DuplicateFeedback(delivery_id) = &error
+                && let Ok(Some(result)) = self.backend.feedback_result(delivery_id)
+            {
+                return Invocation::Success(PreparedPolicyResult::duplicate_feedback(result));
+            }
+            return backend_failure(error);
         }
+
+        Invocation::Success(prepared)
     }
 
     pub fn route_and_admit(
@@ -180,29 +202,23 @@ impl LifecycleHost {
         context: Document,
     ) -> Invocation<PlacementOutcome> {
         let _guard = self.stateful_invocation.lock().unwrap();
-        if let Err(error) = self.state.read_request(logical_request_id) {
+        if let Err(error) = self.backend.read_request(logical_request_id) {
             return invalid_input(error.to_string());
         }
-        let route_input = json!({
+        let route_context = json!({
             "cause": cause,
             "request_id": logical_request_id,
-            "candidates": candidates,
-            "context": context
+            "candidates": candidates.clone(),
+            "context": context.clone()
         });
-        let route = match self.invoke_and_apply_locked(Operation::Route, route_input) {
+        let route = match self.invoke_and_apply_locked(Operation::Route, route_context) {
             Invocation::Success(response) => response,
             Invocation::Unavailable => return Invocation::Unavailable,
             Invocation::FallbackRequired(failure) => {
                 return Invocation::FallbackRequired(failure);
             }
         };
-        let order = match rank_route(
-            &route.result,
-            route.input["candidates"]
-                .as_array()
-                .expect("validated route input")
-                .len(),
-        ) {
+        let order = match rank_route(&route.result, candidates.len()) {
             Ok(order) => order,
             Err(error) => {
                 return Invocation::FallbackRequired(InvocationFailure::new(
@@ -211,9 +227,6 @@ impl LifecycleHost {
                 ));
             }
         };
-        let candidates = route.input["candidates"]
-            .as_array()
-            .expect("validated route input");
         for index in order {
             let target = candidates[index].clone();
             let target_id = target["id"]
@@ -221,13 +234,13 @@ impl LifecycleHost {
                 .expect("validated target ID")
                 .to_owned();
             for defer_attempt in 0..=self.max_defer_retries {
-                let admit_input = json!({
+                let admit_context = json!({
                     "cause": cause,
                     "request_id": logical_request_id,
-                    "target": target,
-                    "context": route.input["context"].clone()
+                    "target": target.clone(),
+                    "context": context.clone()
                 });
-                let admit = match self.invoke_and_apply_locked(Operation::Admit, admit_input) {
+                let admit = match self.invoke_and_apply_locked(Operation::Admit, admit_context) {
                     Invocation::Success(response) => response,
                     Invocation::Unavailable => return Invocation::Unavailable,
                     Invocation::FallbackRequired(failure) => {
@@ -245,18 +258,26 @@ impl LifecycleHost {
                 };
                 match decision {
                     AdmissionDecision::Accept => {
+                        let request_map = match self.backend.read_request(logical_request_id) {
+                            Ok(request) => request,
+                            Err(error) => return backend_failure(error),
+                        };
                         return Invocation::Success(PlacementOutcome::Accepted {
                             target_id,
-                            request_map: admit.input["requests"][logical_request_id].clone(),
+                            request_map,
                             defer_attempts: defer_attempt,
                         });
                     }
                     AdmissionDecision::Reject => break,
                     AdmissionDecision::Defer if defer_attempt < self.max_defer_retries => {}
                     AdmissionDecision::Defer => {
+                        let request_map = match self.backend.read_request(logical_request_id) {
+                            Ok(request) => request,
+                            Err(error) => return backend_failure(error),
+                        };
                         return Invocation::Success(PlacementOutcome::Deferred {
                             target_id,
-                            request_map: admit.input["requests"][logical_request_id].clone(),
+                            request_map,
                             attempts: defer_attempt + 1,
                         });
                     }
@@ -268,17 +289,15 @@ impl LifecycleHost {
 
     pub fn feedback_and_remove(
         &self,
-        input: Document,
+        context: Document,
         terminal_logical_ids: &[String],
-    ) -> Invocation<JsonResponse> {
+    ) -> Invocation<PreparedPolicyResult> {
         let _guard = self.stateful_invocation.lock().unwrap();
-        if input["delivery_id"]
-            .as_str()
-            .is_some_and(|delivery_id| self.state.feedback_result(delivery_id).is_some())
-        {
-            return self.invoke_and_apply_locked(Operation::Feedback, input);
-        }
-        self.invoke_and_apply_locked_with_removals(Operation::Feedback, input, terminal_logical_ids)
+        self.invoke_and_apply_locked_with_removals(
+            Operation::Feedback,
+            context,
+            terminal_logical_ids,
+        )
     }
 }
 
@@ -305,11 +324,10 @@ fn invalid_input<T>(message: String) -> Invocation<T> {
     ))
 }
 
-fn commit_failure<T>(error: StateStoreError) -> Invocation<T> {
-    let kind = if matches!(error, StateStoreError::FeedbackLedgerFull(_)) {
-        InvocationFailureKind::HostSaturated
-    } else {
-        InvocationFailureKind::InvalidOutput
+fn backend_failure<T>(error: StateBackendError) -> Invocation<T> {
+    let kind = match error {
+        StateBackendError::RevisionConflict(_) => InvocationFailureKind::StateConflict,
+        _ => InvocationFailureKind::BackendFailure,
     };
     Invocation::FallbackRequired(InvocationFailure::new(kind, error.to_string()))
 }

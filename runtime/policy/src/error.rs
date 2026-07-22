@@ -23,11 +23,13 @@ pub enum AttachmentError {
     EngineSaturated,
     #[error("policy package is invalid")]
     Package(#[source] crate::package_format::PackageError),
-    #[error("JSON PoC policy components must not import {0}")]
+    #[error("PLEX policy component imports unsupported interface {0}")]
     UnsupportedImport(String),
+    #[error("policy component does not import required interface {0}")]
+    MissingRequiredImport(String),
     #[error("policy component exports unsupported interface {0}")]
     UnsupportedExport(String),
-    #[error("policy component does not export pie:plex/policy@0.3.0")]
+    #[error("policy component does not export pie:plex/policy@0.5.0")]
     MissingPolicyExport,
 }
 
@@ -41,6 +43,10 @@ pub enum InvocationFailureKind {
     FuelExhausted,
     DeadlineExceeded,
     HostSaturated,
+    Query,
+    ActionValidation,
+    StateConflict,
+    BackendFailure,
     InvalidOutput,
 }
 

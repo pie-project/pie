@@ -2,13 +2,13 @@
 //! https://arxiv.org/abs/2603.16104
 
 use plex::serde_json::json;
-use plex::{Document, Policy};
+use plex::{Document, Host, Policy, State};
 
 struct Helium;
 
 impl Policy for Helium {
-    fn schedule(input: &mut Document) -> Result<Document, String> {
-        let runnable = input["runnable"]
+    fn schedule(ctx: &Document, _state: &mut State, _host: &Host) -> Result<Document, String> {
+        let runnable = ctx["runnable"]
             .as_array()
             .ok_or("runnable must be an array")?;
         let any_ready = runnable

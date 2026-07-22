@@ -1,14 +1,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use pie_plex::{
     ContractVersion, Document, Manifest, Operation, PolicyLimits, rank_route, select_evictions,
     select_schedule,
 };
 use pie_policy::{
-    AttachmentRegistry, Invocation, InvocationFailureKind, LifecycleHost, PlacementOutcome,
-    PolicyEngine, PolicyEngineConfig, PolicyPackage, PolicyStateStore, ReplayCommand, ReplayRunner,
-    ReplayTrace,
+    AttachmentRegistry, DictionaryQueryHandler, ENGINE_API_VERSION, InMemoryPolicyStateBackend,
+    Invocation, InvocationFailureKind, LifecycleHost, PlacementOutcome, PlexError, PlexRuntime,
+    PolicyEngine, PolicyEngineConfig, PolicyPackage, PolicyStateBackend, QueryError, QueryHandler,
+    RejectingQueryHandler, ReplayCommand, ReplayRunner, ReplayTrace, StateBackendError,
 };
 use serde_json::json;
 
@@ -19,28 +22,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("usage: check_fixtures <component-directory>")?;
     let engine = PolicyEngine::new(PolicyEngineConfig::default())?;
 
-    check_required_lifecycle(&engine, &directory)?;
-    check_placement_retry_and_shared_global(&engine, &directory)?;
-    check_global_replacement_and_concurrency(&engine, &directory)?;
-    check_ownership_and_failure_rollback(&engine, &directory)?;
-    check_batch_identity(&engine, &directory)?;
-    check_score_budget_and_research_policies(&engine, &directory)?;
-    check_feedback_commit_atomicity(&directory)?;
+    check_explicit_lifecycle(&engine, &directory)?;
+    check_engine_api(&engine, &directory)?;
+    check_request_events_and_cleanup(&engine, &directory)?;
+    check_working_sets_and_decisions(&engine, &directory)?;
+    check_queries_actions_and_conflicts(&engine, &directory)?;
+    check_failure_rollback(&engine, &directory)?;
+    check_feedback_dedup(&directory)?;
     check_replay(&directory)?;
+    check_adapter_conformance(&engine, &directory)?;
+    check_paper_policies(&engine, &directory)?;
 
     println!("PLEX JSON policy fixtures passed");
     Ok(())
 }
 
-fn check_required_lifecycle(
+fn check_explicit_lifecycle(
     engine: &PolicyEngine,
     directory: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let state = PolicyStateStore::new(json!({
-        "config": {"locality_bonus": 1.0e12},
-        "model": "example-model"
-    }))?;
-    let (lifecycle, _, _) = lifecycle_with_policy(
+    let backend = Arc::new(InMemoryPolicyStateBackend::new(json!({
+        "tenant_service": {}
+    }))?);
+    let query = DictionaryQueryHandler::default();
+    query.insert("pie.cluster.capacity@1", json!({"route_bias": 0.0}));
+    let actions = action_set([
+        "pie.kv.prefetch@1",
+        "pie.retention.set@1",
+        "pie.timer.arm@1",
+    ]);
+    let (lifecycle, _, _) = lifecycle_with_policy_and_host(
         engine,
         directory,
         "plex_coordinated",
@@ -52,86 +63,68 @@ fn check_required_lifecycle(
             Operation::Evict,
             Operation::Feedback,
         ],
-        state.clone(),
+        backend.clone(),
+        Arc::new(query),
+        actions,
         2,
     )?;
 
-    let initial = lifecycle.create_request(
+    lifecycle.create_request(
         "L",
         json!({"prompt": "hello"}),
         json!({"user": "alice", "replace": "old"}),
     )?;
-    assert_eq!(initial["facts"]["generation_id"], 0);
-
     let placed = expect_success(lifecycle.route_and_admit(
         "L",
         "generation-arrival",
         candidates(),
-        context(true),
+        context_with_helpers(
+            true,
+            &["pie.cluster.capacity@1"],
+            &["pie.kv.prefetch@1", "pie.retention.set@1"],
+        ),
     ))?;
     let PlacementOutcome::Accepted { target_id, .. } = placed else {
         return Err("initial generation was not accepted".into());
     };
     assert_eq!(target_id, "node-a");
-    let after_admit = state.read_request("L")?;
-    assert_eq!(after_admit["fields"]["metadata"]["user"], "alice");
+    let after_admit = backend.read_request("L")?;
     assert_eq!(after_admit["fields"]["metadata"]["last_hook"], "admit");
     assert_eq!(after_admit["scratch"]["admission_count"], 1);
     assert_eq!(after_admit["fields"]["body"]["prompt"], "hello|route|admit");
-    assert!(after_admit["facts"].get("previous_target").is_none());
-    assert_eq!(state.read_global()["scratch"]["route_calls"], 1);
-    assert_eq!(state.read_global()["fields"]["last_route_request"], "L");
+    assert_eq!(backend.read_shared()?["route_calls"], 1);
 
-    let schedule = expect_success(lifecycle.invoke_and_apply(
-        Operation::Schedule,
-        schedule_input(vec![("L", json!({"waiting_ms": 1}))], true),
-    ))?;
-    assert_eq!(
-        schedule.input["requests"]["L"]["fields"]["metadata"]["last_hook"],
-        "schedule"
-    );
-    assert_eq!(state.read_request("L")?["scratch"]["schedule_calls"], 1);
+    let schedule_ctx = schedule_context(vec![("L", json!({"waiting_ms": 1}))], true);
+    let schedule =
+        expect_success(lifecycle.invoke_and_apply(Operation::Schedule, schedule_ctx.clone()))?;
+    assert_eq!(select_schedule(&schedule_ctx, &schedule.result)?.len(), 1);
+    assert_eq!(backend.read_request("L")?["scratch"]["schedule_calls"], 1);
 
-    let evict = expect_success(lifecycle.invoke_and_apply(
-        Operation::Evict,
-        eviction_input(vec![("unit", Some("L"), 1, json!({"reload_cost": 10.0}))]),
-    ))?;
+    let eviction_ctx = eviction_context(vec![("unit", Some("L"), 8, json!({"reload_cost": 10.0}))]);
+    let eviction =
+        expect_success(lifecycle.invoke_and_apply(Operation::Evict, eviction_ctx.clone()))?;
     assert_eq!(
-        evict.input["requests"]["L"]["scratch"]["eviction_checks"],
-        1
+        select_evictions(&eviction_ctx, &eviction.result)?[0].candidate_index,
+        0
     );
 
-    let feedback = feedback_input(
+    let feedback = feedback_context(
         "delivery-batch",
         vec![
             ("progress", "L", json!({"committed_tokens": 8})),
             ("tool-boundary", "L", json!({"tool_name": "search"})),
         ],
+        context(false),
     );
     expect_success(lifecycle.invoke_and_apply(Operation::Feedback, feedback.clone()))?;
-    let after_feedback = state.read_request("L")?;
+    let after_feedback = backend.read_request("L")?;
     assert_eq!(after_feedback["scratch"]["feedback_service"], 8);
     assert_eq!(after_feedback["scratch"]["tool_calls"], 1);
-    assert_eq!(state.read_global()["scratch"]["feedback_records"], 2);
-
-    let duplicate =
-        expect_success(lifecycle.invoke_and_apply(Operation::Feedback, feedback.clone()))?;
+    let duplicate = expect_success(lifecycle.invoke_and_apply(Operation::Feedback, feedback))?;
     assert!(duplicate.duplicate_feedback);
-    assert_eq!(state.read_request("L")?["scratch"]["feedback_service"], 8);
-    assert_eq!(state.read_global()["scratch"]["feedback_records"], 2);
 
-    assert!(
-        state.read_request("L")?["facts"]
-            .get("previous_target")
-            .is_none()
-    );
     lifecycle.record_enacted_placement("L", target_id)?;
     lifecycle.merge_request_facts("L", json!({"current_target": "node-a"}))?;
-    assert_eq!(
-        state.read_request("L")?["facts"]["previous_target"],
-        "node-a"
-    );
-
     let continuation = lifecycle.continue_request(
         "L",
         json!({"messages": [{"role": "user", "content": "tool result"}]}),
@@ -140,10 +133,7 @@ fn check_required_lifecycle(
     assert_eq!(continuation["facts"]["generation_id"], 1);
     assert_eq!(continuation["facts"]["previous_target"], "node-a");
     assert!(continuation["facts"].get("current_target").is_none());
-    assert_eq!(continuation["fields"]["metadata"]["user"], "alice");
-    assert_eq!(continuation["fields"]["metadata"]["replace"], "new");
     assert_eq!(continuation["scratch"]["feedback_service"], 8);
-    assert_eq!(continuation["scratch"]["tool_calls"], 1);
 
     let continuation_candidates = vec![
         json!({"id": "node-a", "facts": {
@@ -157,372 +147,474 @@ fn check_required_lifecycle(
         "L",
         "continuation",
         continuation_candidates,
-        context(true),
-    ))?;
-    let PlacementOutcome::Accepted { target_id, .. } = placed else {
-        return Err("continuation generation was not accepted".into());
-    };
-    assert_eq!(target_id, "node-b");
-    let continued = state.read_request("L")?;
-    assert_eq!(continued["scratch"]["admission_count"], 2);
-    assert_eq!(continued["scratch"]["route_count"], 2);
-    assert_eq!(continued["fields"]["metadata"]["last_hook"], "admit");
-
-    expect_success(lifecycle.invoke_and_apply(
-        Operation::Schedule,
-        schedule_input(vec![("L", json!({"waiting_ms": 2}))], true),
-    ))?;
-    assert_eq!(state.read_request("L")?["scratch"]["schedule_calls"], 2);
-
-    let before_failed_terminal_global = state.read_global();
-    let before_failed_terminal_request = state.read_request("L")?;
-    let failed_terminal = feedback_input(
-        "failed-terminal",
-        vec![("progress", "L", json!({"committed_tokens": 100}))],
-    );
-    for _ in 0..2 {
-        expect_failure(
-            lifecycle.feedback_and_remove(failed_terminal.clone(), &["missing".into()]),
-            InvocationFailureKind::InvalidOutput,
-        )?;
-        assert_eq!(state.read_global(), before_failed_terminal_global);
-        assert_eq!(state.read_request("L")?, before_failed_terminal_request);
-    }
-
-    let terminal = feedback_input("delivery-terminal", vec![("completed", "L", json!({}))]);
-    expect_success(lifecycle.feedback_and_remove(terminal.clone(), &["L".into()]))?;
-    assert!(state.is_empty());
-    let duplicate = expect_success(lifecycle.feedback_and_remove(terminal, &["L".into()]))?;
-    assert!(duplicate.duplicate_feedback);
-    assert!(state.is_empty());
-    assert_eq!(state.read_global()["scratch"]["route_calls"], 2);
-    Ok(())
-}
-
-fn check_placement_retry_and_shared_global(
-    engine: &PolicyEngine,
-    directory: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let registry = AttachmentRegistry::new(engine.clone());
-    registry.attach(&package_bytes(
-        directory,
-        "plex_least_loaded",
-        manifest("route-owner", [Operation::Route]),
-    )?)?;
-    registry.attach(&package_bytes(
-        directory,
-        "plex_rewrite_admit",
-        manifest("admit-owner", [Operation::Admit]),
-    )?)?;
-    let state = PolicyStateStore::default();
-    let lifecycle = LifecycleHost::new(registry, state.clone(), 2);
-    lifecycle.create_request("R", json!({"prompt": "retry"}), json!({}))?;
-
-    let rejected = expect_success(lifecycle.route_and_admit(
-        "R",
-        "generation-arrival",
-        vec![
-            json!({"id": "a", "facts": {"queue_depth": 100}}),
-            json!({"id": "b", "facts": {"queue_depth": 101}}),
-        ],
-        context(false),
-    ))?;
-    assert_eq!(rejected, PlacementOutcome::Rejected);
-    assert_eq!(state.read_request("R")?["scratch"]["admission_count"], 2);
-    assert_eq!(state.read_global()["scratch"]["route_owner_calls"], 1);
-    assert_eq!(state.read_global()["fields"]["route_owner_calls_seen"], 1);
-
-    let deferred = expect_success(lifecycle.route_and_admit(
-        "R",
-        "generation-arrival",
-        vec![json!({"id": "c", "facts": {"queue_depth": 90}})],
         context(false),
     ))?;
     assert!(matches!(
-        deferred,
-        PlacementOutcome::Deferred { attempts: 3, .. }
+        placed,
+        PlacementOutcome::Accepted { ref target_id, .. } if target_id == "node-b"
     ));
-    assert_eq!(state.read_request("R")?["scratch"]["admission_count"], 5);
-    assert_eq!(state.read_global()["scratch"]["route_owner_calls"], 2);
-    assert_eq!(state.read_global()["fields"]["route_owner_calls_seen"], 2);
+    assert_eq!(backend.read_request("L")?["scratch"]["admission_count"], 2);
     Ok(())
 }
 
-fn check_global_replacement_and_concurrency(
+fn check_engine_api(
     engine: &PolicyEngine,
     directory: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let state = PolicyStateStore::new(json!({"config": {"mode": "test"}}))?;
-    let operations = [
-        Operation::Route,
-        Operation::Admit,
-        Operation::Schedule,
-        Operation::Evict,
-        Operation::Feedback,
-    ];
-    let (lifecycle, registry, package) = lifecycle_with_policy(
+    let backend = Arc::new(InMemoryPolicyStateBackend::default());
+    let query = DictionaryQueryHandler::default();
+    query.insert(
+        "pie.cluster.capacity@1",
+        json!({"route_bias": 5.0, "free_slots": 4}),
+    );
+    let runtime = runtime_with_policy(
         engine,
         directory,
         "plex_coordinated",
-        "replaceable",
-        &operations,
-        state.clone(),
-        1,
+        "engine-api",
+        &[
+            Operation::Route,
+            Operation::Admit,
+            Operation::Schedule,
+            Operation::Feedback,
+        ],
+        backend.clone(),
+        Arc::new(query),
+        action_set([
+            "pie.kv.prefetch@1",
+            "pie.retention.set@1",
+            "pie.timer.arm@1",
+        ]),
     )?;
-    for id in ["A", "B", "C", "D"] {
-        lifecycle.create_request(id, json!({"prompt": id}), json!({}))?;
-    }
 
-    for id in ["A", "B"] {
-        expect_success(lifecycle.route_and_admit(
-            id,
-            "generation-arrival",
-            candidates(),
-            context(false),
-        ))?;
-    }
-    assert_eq!(state.read_global()["scratch"]["route_calls"], 2);
-
-    let left = lifecycle.clone();
-    let right = lifecycle.clone();
-    let left_thread = std::thread::spawn(move || {
-        assert!(matches!(
-            left.invoke_and_apply(
-                Operation::Route,
-                route_input("C", candidates(), context(false))
-            ),
-            Invocation::Success(_)
-        ));
-    });
-    let right_thread = std::thread::spawn(move || {
-        assert!(matches!(
-            right.invoke_and_apply(
-                Operation::Route,
-                route_input("D", candidates(), context(false))
-            ),
-            Invocation::Success(_)
-        ));
-    });
-    left_thread
-        .join()
-        .map_err(|_| "left route thread panicked")?;
-    right_thread
-        .join()
-        .map_err(|_| "right route thread panicked")?;
-    assert_eq!(state.read_global()["scratch"]["route_calls"], 4);
-
-    let before_replace = state.read_global();
-    registry.replace(&package)?;
-    assert_eq!(state.read_global(), before_replace);
-
-    let delivery = feedback_input(
-        "replacement-dedup",
-        vec![("progress", "A", json!({"committed_tokens": 1}))],
+    let route = engine_event(
+        "route",
+        json!({
+            "request_id": "L",
+            "candidates": candidates(),
+            "context": {
+                "model": "example-model",
+                "capabilities": {
+                    "queries": ["pie.cluster.capacity@1"]
+                }
+            }
+        }),
+        vec![json!({
+            "op": "create",
+            "request_id": "L",
+            "facts": {
+                "logical_request_id": "L",
+                "generation_id": 0,
+                "attained_service": 0
+            },
+            "fields": {
+                "body": {"prompt": "hello"},
+                "metadata": {"user": "alice"}
+            }
+        })],
     );
-    expect_success(lifecycle.invoke_and_apply(Operation::Feedback, delivery.clone()))?;
-    let committed = state.read_global();
-    registry.replace(&package)?;
-    let duplicate = expect_success(lifecycle.invoke_and_apply(Operation::Feedback, delivery))?;
-    assert!(duplicate.duplicate_feedback);
-    assert_eq!(state.read_global(), committed);
+    let outcome = runtime.invoke(route)?;
+    assert_eq!(outcome["status"], "success");
+    assert_eq!(outcome["decision"]["order"], json!([0, 1]));
+    assert_eq!(
+        outcome["request_fields"]["L"]["body"]["prompt"],
+        "hello|route"
+    );
+    assert_eq!(outcome["actions"][0]["id"], 0);
+    assert_eq!(outcome["actions"][0]["method"], "pie.kv.prefetch@1");
+    assert!(outcome.get("scratch").is_none());
 
-    lifecycle.reset_global();
-    let reset = state.read_global();
-    assert_eq!(reset["facts"]["config"]["mode"], "test");
-    assert_eq!(reset["fields"], json!({}));
-    assert_eq!(reset["scratch"], json!({}));
+    let admit = runtime.invoke(engine_event(
+        "admit",
+        json!({
+            "request_id": "L",
+            "target": candidates()[0],
+            "context": {}
+        }),
+        vec![],
+    ))?;
+    assert_eq!(admit["decision"]["decision"], "accept");
+    assert_eq!(admit["actions"][0]["id"], 0);
+    assert_eq!(admit["actions"][0]["method"], "pie.retention.set@1");
+    assert_eq!(
+        admit["request_fields"]["L"]["body"]["prompt"],
+        "hello|route|admit"
+    );
+
+    let schedule = runtime.invoke(engine_event(
+        "schedule",
+        json!({
+            "runnable": [{
+                "request_id": "L",
+                "facts": {"waiting_ms": 1},
+                "max_token_budget": 8
+            }],
+            "capacity": {
+                "max_selected": 1,
+                "max_total_tokens": 8,
+                "max_token_budget": 8
+            },
+            "context": {"capabilities": {"token_budget": true}}
+        }),
+        vec![],
+    ))?;
+    assert_eq!(schedule["decision"]["selected"][0]["candidate_index"], 0);
+    assert_eq!(schedule["decision"]["selected"][0]["token_budget"], 8);
+
+    let feedback = runtime.invoke(engine_event(
+        "feedback",
+        feedback_body(
+            "engine-feedback",
+            vec![("progress", "L", json!({"committed_tokens": 4}))],
+            context(false),
+        ),
+        vec![],
+    ))?;
+    assert_eq!(feedback["status"], "success");
+    assert_eq!(feedback["decision"], json!({}));
+    assert_eq!(backend.read_request("L")?["scratch"]["feedback_service"], 4);
+
+    let rust_outcome = runtime.invoke(engine_event(
+        "evict",
+        json!({
+            "bytes_needed": 1,
+            "resident": [],
+            "context": {}
+        }),
+        vec![],
+    ))?;
+    let json_outcome: Document = serde_json::from_str(
+        &runtime.invoke_json(
+            &engine_event(
+                "evict",
+                json!({
+                    "bytes_needed": 1,
+                    "resident": [],
+                    "context": {}
+                }),
+                vec![],
+            )
+            .to_string(),
+        )?,
+    )?;
+    assert_eq!(rust_outcome, json_outcome);
+    assert_eq!(rust_outcome["status"], "unavailable");
+
+    assert!(matches!(
+        runtime.invoke(json!({
+            "api_version": "wrong",
+            "hook": "route",
+            "context": {},
+            "request_events": []
+        })),
+        Err(PlexError::InvalidEvent(_))
+    ));
+    assert!(matches!(
+        runtime.invoke(json!({
+            "api_version": ENGINE_API_VERSION,
+            "hook": "route",
+            "context": {},
+            "request_events": [],
+            "extra": true
+        })),
+        Err(PlexError::InvalidEvent(_))
+    ));
+    assert!(matches!(
+        runtime.invoke(engine_event(
+            "route",
+            json!({
+                "request_id": "missing",
+                "candidates": candidates(),
+                "context": {}
+            }),
+            vec![],
+        )),
+        Err(PlexError::Backend(_))
+    ));
     Ok(())
 }
 
-fn check_ownership_and_failure_rollback(
+fn check_request_events_and_cleanup(
     engine: &PolicyEngine,
     directory: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    for (artifact, expected) in [
-        (
-            "plex_mutate_global_facts",
-            InvocationFailureKind::InvalidOutput,
-        ),
-        ("plex_mutate_identity", InvocationFailureKind::InvalidOutput),
-        (
-            "plex_mutate_candidate_facts",
-            InvocationFailureKind::InvalidOutput,
-        ),
-        (
-            "plex_mutate_candidates",
-            InvocationFailureKind::InvalidOutput,
-        ),
-        (
-            "plex_mutate_request_set",
-            InvocationFailureKind::InvalidOutput,
-        ),
-        ("plex_malformed", InvocationFailureKind::InvalidOutput),
-        ("plex_nonfinite", InvocationFailureKind::InvalidOutput),
-        ("plex_mutate_fail", InvocationFailureKind::PolicyFallback),
-        ("plex_fallback", InvocationFailureKind::PolicyFallback),
-        ("plex_trap", InvocationFailureKind::Trap),
-    ] {
-        let state = PolicyStateStore::new(json!({"stable": true}))?;
-        let (lifecycle, _, _) = lifecycle_with_policy(
-            engine,
-            directory,
-            artifact,
-            artifact,
-            &[Operation::Route],
-            state.clone(),
-            1,
-        )?;
-        lifecycle.create_request("F", json!({"prompt": "stable"}), json!({}))?;
-        let before_global = state.read_global();
-        let before_request = state.read_request("F")?;
-        expect_failure(
-            lifecycle.invoke_and_apply(
-                Operation::Route,
-                route_input("F", candidates(), context(false)),
-            ),
-            expected,
-        )?;
-        assert_eq!(state.read_global(), before_global);
-        assert_eq!(state.read_request("F")?, before_request);
-    }
-
-    let state = PolicyStateStore::default();
-    let (lifecycle, _, _) = lifecycle_with_policy(
+    let backend = Arc::new(InMemoryPolicyStateBackend::default());
+    let runtime = runtime_with_policy(
         engine,
         directory,
-        "plex_spin",
-        "spin",
+        "plex_least_loaded",
+        "request-events",
         &[Operation::Route],
-        state.clone(),
-        1,
+        backend.clone(),
+        Arc::new(RejectingQueryHandler),
+        BTreeSet::new(),
     )?;
-    lifecycle.create_request("S", json!({}), json!({}))?;
-    expect_failure_one_of(
-        lifecycle.invoke_and_apply(
-            Operation::Route,
-            route_input("S", candidates(), context(false)),
-        ),
-        &[
-            InvocationFailureKind::FuelExhausted,
-            InvocationFailureKind::DeadlineExceeded,
+    runtime.invoke(engine_event(
+        "route",
+        json!({
+            "request_id": "L",
+            "candidates": candidates(),
+            "context": {}
+        }),
+        vec![json!({
+            "op": "create",
+            "request_id": "L",
+            "facts": {"generation_id": 0},
+            "fields": {
+                "body": {"prompt": "first"},
+                "metadata": {"keep": 1}
+            }
+        })],
+    ))?;
+    runtime.invoke(engine_event(
+        "route",
+        json!({
+            "request_id": "L",
+            "candidates": candidates(),
+            "context": {}
+        }),
+        vec![
+            json!({
+                "op": "continue",
+                "request_id": "L",
+                "facts": {"generation_id": 1},
+                "fields": {
+                    "body": {"prompt": "second"},
+                    "metadata": {"step": 2}
+                }
+            }),
+            json!({
+                "op": "merge-facts",
+                "request_id": "L",
+                "facts": {"previous_target": "node-a"}
+            }),
         ],
-    )?;
-    assert_eq!(state.read_request("S")?["scratch"], json!({}));
+    ))?;
+    let request = backend.read_request("L")?;
+    assert_eq!(request["facts"]["generation_id"], 1);
+    assert_eq!(request["facts"]["previous_target"], "node-a");
+    assert_eq!(request["fields"]["metadata"], json!({"keep": 1, "step": 2}));
 
-    let state = PolicyStateStore::default();
-    let (lifecycle, _, _) = lifecycle_with_policy(
+    let duplicate_create = runtime.invoke(engine_event(
+        "route",
+        json!({
+            "request_id": "X",
+            "candidates": candidates(),
+            "context": {}
+        }),
+        vec![
+            json!({
+                "op": "create",
+                "request_id": "X",
+                "facts": {"generation_id": 0},
+                "fields": {"body": {}, "metadata": {}}
+            }),
+            json!({
+                "op": "create",
+                "request_id": "X",
+                "facts": {"generation_id": 0},
+                "fields": {"body": {}, "metadata": {}}
+            }),
+        ],
+    ));
+    assert!(matches!(duplicate_create, Err(PlexError::InvalidEvent(_))));
+    assert!(matches!(
+        backend.read_request("X"),
+        Err(StateBackendError::NotFound(_))
+    ));
+
+    let unavailable = runtime.invoke(engine_event(
+        "feedback",
+        feedback_body(
+            "cleanup-unavailable",
+            vec![("completed", "L", json!({}))],
+            context(false),
+        ),
+        vec![json!({"op": "finish", "request_id": "L"})],
+    ))?;
+    assert_eq!(unavailable["status"], "unavailable");
+    assert!(matches!(
+        backend.read_request("L"),
+        Err(StateBackendError::NotFound(_))
+    ));
+
+    let fallback_backend = Arc::new(InMemoryPolicyStateBackend::default());
+    let fallback = runtime_with_policy(
         engine,
         directory,
-        "plex_mutate_feedback_facts",
-        "mutate-feedback-facts",
+        "plex_fallback",
+        "cleanup-fallback",
         &[Operation::Feedback],
-        state.clone(),
-        1,
+        fallback_backend.clone(),
+        Arc::new(RejectingQueryHandler),
+        BTreeSet::new(),
     )?;
-    lifecycle.create_request("E", json!({}), json!({}))?;
-    let before_global = state.read_global();
-    let before_request = state.read_request("E")?;
-    let input = feedback_input(
-        "read-only-event",
-        vec![("progress", "E", json!({"committed_tokens": 4}))],
-    );
-    for _ in 0..2 {
-        expect_failure(
-            lifecycle.invoke_and_apply(Operation::Feedback, input.clone()),
-            InvocationFailureKind::InvalidOutput,
-        )?;
-        assert_eq!(state.read_global(), before_global);
-        assert_eq!(state.read_request("E")?, before_request);
-    }
+    fallback
+        .backend()
+        .create_request("F".into(), json!({}), json!({}))?;
+    let outcome = fallback.invoke(engine_event(
+        "feedback",
+        feedback_body(
+            "cleanup-fallback",
+            vec![("completed", "F", json!({}))],
+            context(false),
+        ),
+        vec![json!({"op": "finish", "request_id": "F"})],
+    ))?;
+    assert_eq!(outcome["status"], "fallback");
+    assert!(matches!(
+        fallback_backend.read_request("F"),
+        Err(StateBackendError::NotFound(_))
+    ));
 
-    let state = PolicyStateStore::default();
-    let (lifecycle, _, _) = lifecycle_with_policy(
+    let success_backend = Arc::new(InMemoryPolicyStateBackend::default());
+    let success = runtime_with_policy(
         engine,
         directory,
         "plex_feedback_accounting",
-        "feedback-facts",
+        "cleanup-success",
         &[Operation::Feedback],
-        state.clone(),
-        1,
+        success_backend.clone(),
+        Arc::new(RejectingQueryHandler),
+        BTreeSet::new(),
     )?;
-    lifecycle.create_request("E", json!({}), json!({}))?;
-    let before = state.read_request("E")?;
-    expect_failure(
-        lifecycle.invoke_and_apply(
-            Operation::Feedback,
-            feedback_input("missing", vec![("progress", "missing", json!({}))]),
+    let outcome = success.invoke(engine_event(
+        "feedback",
+        feedback_body(
+            "cleanup-success",
+            vec![("completed", "S", json!({}))],
+            context(false),
         ),
-        InvocationFailureKind::InvalidInput,
-    )?;
-    assert_eq!(state.read_request("E")?, before);
+        vec![
+            json!({
+                "op": "create",
+                "request_id": "S",
+                "facts": {"generation_id": 0},
+                "fields": {"body": {}, "metadata": {}}
+            }),
+            json!({"op": "finish", "request_id": "S"}),
+        ],
+    ))?;
+    assert_eq!(outcome["status"], "success");
+    assert!(matches!(
+        success_backend.read_request("S"),
+        Err(StateBackendError::NotFound(_))
+    ));
     Ok(())
 }
 
-fn check_batch_identity(
+fn check_working_sets_and_decisions(
     engine: &PolicyEngine,
     directory: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let state = PolicyStateStore::default();
-    let (lifecycle, _, _) = lifecycle_with_policy(
+    let backend = Arc::new(InMemoryPolicyStateBackend::default());
+    let (schedule, _, _) = lifecycle_with_policy(
         engine,
         directory,
         "plex_attained_service",
-        "batch",
+        "working-set",
         &[Operation::Schedule],
-        state.clone(),
+        backend.clone(),
         1,
     )?;
-    for id in ["L", "M", "unreferenced"] {
-        lifecycle.create_request(id, json!({}), json!({}))?;
-        lifecycle.merge_request_facts(id, json!({"attained_service": 0}))?;
+    for (id, service) in [("L", 8), ("M", 1), ("unreferenced", 0)] {
+        schedule.create_request(id, json!({}), json!({}))?;
+        schedule.merge_request_facts(id, json!({"attained_service": service}))?;
     }
-    let response = expect_success(lifecycle.invoke_and_apply(
-        Operation::Schedule,
-        schedule_input(
-            vec![
-                ("L", json!({"waiting_ms": 1})),
-                ("L", json!({"waiting_ms": 2})),
-                ("M", json!({"waiting_ms": 3})),
-            ],
-            false,
-        ),
-    ))?;
-    assert_eq!(response.input["requests"].as_object().unwrap().len(), 2);
-    assert!(response.input["requests"].get("unreferenced").is_none());
-    assert_eq!(state.read_request("L")?["scratch"]["schedule_calls"], 2);
-    assert_eq!(state.read_request("M")?["scratch"]["schedule_calls"], 1);
+    let ctx = schedule_context(
+        vec![
+            ("L", json!({"waiting_ms": 1})),
+            ("L", json!({"waiting_ms": 2})),
+            ("M", json!({"waiting_ms": 3})),
+        ],
+        false,
+    );
+    let response = expect_success(schedule.invoke_and_apply(Operation::Schedule, ctx.clone()))?;
+    assert_eq!(backend.read_shared()?["working_set_size"], 2);
+    assert_eq!(backend.read_request("L")?["scratch"]["schedule_calls"], 2);
+    assert_eq!(backend.read_request("M")?["scratch"]["schedule_calls"], 1);
+    assert_eq!(backend.read_request("unreferenced")?["scratch"], json!({}));
+    assert_eq!(
+        select_schedule(&ctx, &response.result)?[0].candidate_index,
+        2
+    );
 
-    let before = state.read_global();
-    expect_failure(
-        lifecycle.invoke_and_apply(
-            Operation::Schedule,
-            schedule_input(vec![("missing", json!({}))], false),
-        ),
-        InvocationFailureKind::InvalidInput,
+    let engine_backend = Arc::new(InMemoryPolicyStateBackend::default());
+    let engine_schedule = runtime_with_policy(
+        engine,
+        directory,
+        "plex_attained_service",
+        "scratch-only",
+        &[Operation::Schedule],
+        engine_backend.clone(),
+        Arc::new(RejectingQueryHandler),
+        BTreeSet::new(),
     )?;
-    assert_eq!(state.read_global(), before);
-    Ok(())
-}
+    let outcome = engine_schedule.invoke(engine_event(
+        "schedule",
+        json!({
+            "runnable": [{
+                "request_id": "E",
+                "facts": {},
+                "max_token_budget": 8
+            }],
+            "capacity": {
+                "max_selected": 1,
+                "max_total_tokens": 8,
+                "max_token_budget": 8
+            },
+            "context": {}
+        }),
+        vec![json!({
+            "op": "create",
+            "request_id": "E",
+            "facts": {"generation_id": 0, "attained_service": 0},
+            "fields": {"body": {}, "metadata": {}}
+        })],
+    ))?;
+    assert_eq!(outcome["request_fields"], json!({}));
+    assert_eq!(
+        engine_backend.read_request("E")?["scratch"]["schedule_calls"],
+        1
+    );
 
-fn check_score_budget_and_research_policies(
-    engine: &PolicyEngine,
-    directory: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let state = PolicyStateStore::default();
+    let backend = Arc::new(InMemoryPolicyStateBackend::default());
+    let (evict, _, _) = lifecycle_with_policy(
+        engine,
+        directory,
+        "plex_retention_score",
+        "retention",
+        &[Operation::Evict],
+        backend.clone(),
+        1,
+    )?;
+    evict.create_request("E", json!({}), json!({}))?;
+    let ctx = eviction_context(vec![
+        ("attributed", Some("E"), 4, json!({"reload_cost": 2.0})),
+        ("shared", None, 3, json!({"reload_cost": 1.0})),
+    ]);
+    let response = expect_success(evict.invoke_and_apply(Operation::Evict, ctx.clone()))?;
+    assert_eq!(backend.read_shared()?["working_set_size"], 1);
+    let selected = select_evictions(&ctx, &response.result)?;
+    assert_eq!(selected[0].candidate_index, 1);
+    assert_eq!(selected[1].candidate_index, 0);
+
+    let backend = Arc::new(InMemoryPolicyStateBackend::default());
     let (route, _, _) = lifecycle_with_policy(
         engine,
         directory,
         "plex_least_loaded",
-        "least-loaded",
+        "stable-route",
         &[Operation::Route],
-        state.clone(),
+        backend.clone(),
         1,
     )?;
     route.create_request("S", json!({}), json!({}))?;
     let response = expect_success(route.invoke_and_apply(
         Operation::Route,
-        route_input(
+        route_context(
             "S",
+            "generation-arrival",
             vec![
                 json!({"id": "a", "facts": {"queue_depth": 10}}),
                 json!({"id": "b", "facts": {"queue_depth": 10}}),
@@ -532,256 +624,468 @@ fn check_score_budget_and_research_policies(
     ))?;
     assert_eq!(rank_route(&response.result, 2)?, vec![0, 1]);
 
-    let state = PolicyStateStore::default();
-    let (evict, _, _) = lifecycle_with_policy(
-        engine,
-        directory,
-        "plex_retention_score",
-        "retention",
-        &[Operation::Evict],
-        state.clone(),
-        1,
-    )?;
-    for id in ["E1", "E2"] {
-        evict.create_request(id, json!({}), json!({}))?;
-    }
-    let response = expect_success(evict.invoke_and_apply(
-        Operation::Evict,
-        eviction_input(vec![
-            ("a", Some("E1"), 4, json!({"reload_cost": 2.0})),
-            ("b", Some("E2"), 3, json!({"reload_cost": 1.0})),
-        ]),
-    ))?;
-    let selected = select_evictions(&response.input, &response.result)?;
-    assert_eq!(selected[0].candidate_index, 1);
-    assert_eq!(selected[1].candidate_index, 0);
-
-    let state = PolicyStateStore::default();
+    let backend = Arc::new(InMemoryPolicyStateBackend::default());
     let (budget, _, _) = lifecycle_with_policy(
         engine,
         directory,
         "plex_bad_budget",
         "bad-budget",
         &[Operation::Schedule],
-        state.clone(),
+        backend,
         1,
     )?;
     budget.create_request("B", json!({}), json!({}))?;
     expect_failure(
         budget.invoke_and_apply(
             Operation::Schedule,
-            schedule_input(vec![("B", json!({}))], true),
+            schedule_context(vec![("B", json!({}))], true),
         ),
         InvocationFailureKind::InvalidOutput,
     )?;
-
-    let state = PolicyStateStore::default();
-    let (attained, _, _) = lifecycle_with_policy(
-        engine,
-        directory,
-        "plex_attained_service",
-        "attained",
-        &[Operation::Schedule],
-        state.clone(),
-        1,
-    )?;
-    for (id, service) in [("A", 8), ("B", 1)] {
-        attained.create_request(id, json!({}), json!({}))?;
-        attained.merge_request_facts(id, json!({"attained_service": service}))?;
-    }
-    let response = expect_success(attained.invoke_and_apply(
-        Operation::Schedule,
-        schedule_input(vec![("A", json!({})), ("B", json!({}))], false),
-    ))?;
-    assert_eq!(
-        select_schedule(&response.input, &response.result)?[0].candidate_index,
-        1
-    );
-
-    check_paper_policies(engine, directory)?;
     Ok(())
 }
 
-fn check_paper_policies(
+fn check_queries_actions_and_conflicts(
     engine: &PolicyEngine,
     directory: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let cases: serde_json::Value =
-        serde_json::from_slice(&std::fs::read("tests/policies/paper-cases.json")?)?;
-    assert_eq!(cases.as_array().map_or(0, Vec::len), 5);
-
-    let state = PolicyStateStore::default();
-    let (agentix, _, _) = lifecycle_with_policy(
+    let query = DictionaryQueryHandler::default();
+    query.insert("pie.cluster.capacity@1", json!({"route_bias": 100.0}));
+    let backend = Arc::new(InMemoryPolicyStateBackend::new(json!({"stable": true}))?);
+    let (query_policy, _, _) = lifecycle_with_policy_and_host(
         engine,
         directory,
-        "plex_paper_agentix",
-        "agentix",
-        &[Operation::Schedule],
-        state.clone(),
+        "plex_query_assisted",
+        "query-assisted",
+        &[Operation::Route],
+        backend.clone(),
+        Arc::new(query),
+        BTreeSet::new(),
         1,
     )?;
-    for (id, service) in [("A", 100), ("B", 1)] {
-        agentix.create_request(id, json!({}), json!({}))?;
-        agentix.merge_request_facts(id, json!({"attained_service": service}))?;
-    }
-    let response = expect_success(agentix.invoke_and_apply(
-        Operation::Schedule,
-        schedule_input(
+    query_policy.create_request("Q", json!({}), json!({}))?;
+    let before = backend.read_request("Q")?;
+    let response = expect_success(query_policy.invoke_and_apply(
+        Operation::Route,
+        route_context(
+            "Q",
+            "generation-arrival",
             vec![
-                ("A", json!({"waiting_ms": 500})),
-                ("B", json!({"waiting_ms": 1})),
+                json!({"id": "a", "facts": {"queue_depth": 10}}),
+                json!({"id": "b", "facts": {"queue_depth": 2}}),
             ],
-            false,
+            context_with_helpers(false, &["pie.cluster.capacity@1"], &[]),
         ),
     ))?;
-    assert!(
-        response.result["decisions"][0]["score"].as_f64().unwrap()
-            > response.result["decisions"][1]["score"].as_f64().unwrap()
+    assert_eq!(rank_route(&response.result, 2)?, vec![1, 0]);
+    assert_eq!(backend.read_request("Q")?, before);
+
+    let (unsupported, _, _) = lifecycle_with_policy_and_host(
+        engine,
+        directory,
+        "plex_query_assisted",
+        "unsupported-query",
+        &[Operation::Route],
+        backend.clone(),
+        Arc::new(RejectingQueryHandler),
+        BTreeSet::new(),
+        1,
+    )?;
+    expect_failure(
+        unsupported.invoke_and_apply(
+            Operation::Route,
+            route_context(
+                "Q",
+                "generation-arrival",
+                candidates(),
+                context_with_helpers(false, &["pie.cluster.capacity@1"], &[]),
+            ),
+        ),
+        InvocationFailureKind::Query,
+    )?;
+
+    let action_backend = Arc::new(InMemoryPolicyStateBackend::default());
+    let (actions, _, _) = lifecycle_with_policy_and_host(
+        engine,
+        directory,
+        "plex_stage_action",
+        "actions",
+        &[Operation::Route],
+        action_backend.clone(),
+        Arc::new(RejectingQueryHandler),
+        action_set(["pie.kv.prefetch@1", "pie.retention.set@1"]),
+        1,
+    )?;
+    actions.create_request("A", json!({}), json!({}))?;
+    let response = expect_success(actions.invoke_and_apply(
+        Operation::Route,
+        route_context("A", "generation-arrival", candidates(), context(false)),
+    ))?;
+    assert_eq!(response.actions.len(), 2);
+    assert_eq!(response.actions[0].id, 0);
+    assert_eq!(response.actions[1].id, 1);
+    assert_eq!(response.actions[0].method, "pie.kv.prefetch@1");
+    assert_eq!(response.actions[1].method, "pie.retention.set@1");
+
+    let unsupported_backend = Arc::new(InMemoryPolicyStateBackend::default());
+    let (unsupported_action, _, _) = lifecycle_with_policy(
+        engine,
+        directory,
+        "plex_stage_action",
+        "unsupported-action",
+        &[Operation::Route],
+        unsupported_backend.clone(),
+        1,
+    )?;
+    unsupported_action.create_request("U", json!({}), json!({}))?;
+    expect_failure(
+        unsupported_action.invoke_and_apply(
+            Operation::Route,
+            route_context("U", "generation-arrival", candidates(), context(false)),
+        ),
+        InvocationFailureKind::ActionValidation,
+    )?;
+    assert_eq!(unsupported_backend.read_request("U")?["scratch"], json!({}));
+
+    let malformed_backend = Arc::new(InMemoryPolicyStateBackend::default());
+    let (malformed, _, _) = lifecycle_with_policy_and_host(
+        engine,
+        directory,
+        "plex_action_bad_result",
+        "action-bad-result",
+        &[Operation::Route],
+        malformed_backend.clone(),
+        Arc::new(RejectingQueryHandler),
+        action_set(["pie.kv.prefetch@1"]),
+        1,
+    )?;
+    malformed.create_request("M", json!({}), json!({}))?;
+    expect_failure(
+        malformed.invoke_and_apply(
+            Operation::Route,
+            route_context("M", "generation-arrival", candidates(), context(false)),
+        ),
+        InvocationFailureKind::InvalidOutput,
+    )?;
+    assert_eq!(malformed_backend.read_request("M")?["scratch"], json!({}));
+
+    let fallback_backend = Arc::new(InMemoryPolicyStateBackend::default());
+    let fallback_runtime = runtime_with_policy(
+        engine,
+        directory,
+        "plex_action_bad_result",
+        "engine-action-fallback",
+        &[Operation::Route],
+        fallback_backend.clone(),
+        Arc::new(RejectingQueryHandler),
+        action_set(["pie.kv.prefetch@1"]),
+    )?;
+    let outcome = fallback_runtime.invoke(engine_event(
+        "route",
+        json!({
+            "request_id": "F",
+            "candidates": candidates(),
+            "context": {}
+        }),
+        vec![json!({
+            "op": "create",
+            "request_id": "F",
+            "facts": {"generation_id": 0},
+            "fields": {"body": {}, "metadata": {}}
+        })],
+    ))?;
+    assert_eq!(outcome["status"], "fallback");
+    assert!(outcome.get("actions").is_none());
+    assert_eq!(fallback_backend.read_request("F")?["scratch"], json!({}));
+
+    let conflict_backend = Arc::new(InMemoryPolicyStateBackend::default());
+    let conflicting_query = MutatingQueryHandler {
+        backend: conflict_backend.clone(),
+        fired: Arc::new(AtomicBool::new(false)),
+    };
+    let (conflict, _, _) = lifecycle_with_policy_and_host(
+        engine,
+        directory,
+        "plex_coordinated",
+        "conflict",
+        &[Operation::Route],
+        conflict_backend.clone(),
+        Arc::new(conflicting_query),
+        action_set(["pie.kv.prefetch@1"]),
+        1,
+    )?;
+    conflict.create_request("C", json!({"prompt": "stable"}), json!({}))?;
+    expect_failure(
+        conflict.invoke_and_apply(
+            Operation::Route,
+            route_context(
+                "C",
+                "generation-arrival",
+                candidates(),
+                context_with_helpers(false, &["pie.cluster.capacity@1"], &["pie.kv.prefetch@1"]),
+            ),
+        ),
+        InvocationFailureKind::StateConflict,
+    )?;
+    assert_eq!(conflict_backend.read_shared()?, json!({"external": true}));
+    assert_eq!(
+        conflict_backend.read_request("C")?["fields"]["body"]["prompt"],
+        "stable"
     );
 
-    let state = PolicyStateStore::default();
-    let (preble, _, _) = lifecycle_with_policy(
+    let engine_conflict_backend = Arc::new(InMemoryPolicyStateBackend::default());
+    let engine_conflict = runtime_with_policy(
         engine,
         directory,
-        "plex_paper_preble",
-        "preble",
+        "plex_coordinated",
+        "engine-conflict",
         &[Operation::Route],
-        state.clone(),
+        engine_conflict_backend.clone(),
+        Arc::new(MutatingQueryHandler {
+            backend: engine_conflict_backend.clone(),
+            fired: Arc::new(AtomicBool::new(false)),
+        }),
+        action_set(["pie.kv.prefetch@1"]),
+    )?;
+    let outcome = engine_conflict.invoke(engine_event(
+        "route",
+        json!({
+            "request_id": "EC",
+            "candidates": candidates(),
+            "context": {
+                "model": "example-model",
+                "capabilities": {"queries": ["pie.cluster.capacity@1"]}
+            }
+        }),
+        vec![json!({
+            "op": "create",
+            "request_id": "EC",
+            "facts": {"generation_id": 0},
+            "fields": {"body": {"prompt": "stable"}, "metadata": {}}
+        })],
+    ))?;
+    assert_eq!(outcome["status"], "fallback");
+    assert_eq!(outcome["failure"]["kind"], "state-conflict");
+    assert!(outcome.get("request_fields").is_none());
+    assert!(outcome.get("actions").is_none());
+
+    let helper_query = CapturingQueryHandler::default();
+    let helper_calls = helper_query.calls.clone();
+    let helper_backend = Arc::new(InMemoryPolicyStateBackend::default());
+    let (helpers, _, _) = lifecycle_with_policy_and_host(
+        engine,
+        directory,
+        "plex_helper_methods",
+        "helper-methods",
+        &[Operation::Route],
+        helper_backend.clone(),
+        Arc::new(helper_query),
+        action_set([
+            "pie.kv.prefetch@1",
+            "pie.schedule.preempt@1",
+            "pie.route.replicate@1",
+            "pie.retention.set@1",
+            "pie.timer.arm@1",
+        ]),
         1,
     )?;
-    preble.create_request("P", json!({}), json!({}))?;
-    let response = expect_success(preble.invoke_and_apply(
+    helpers.create_request("H", json!({}), json!({}))?;
+    let response = expect_success(helpers.invoke_and_apply(
         Operation::Route,
-        route_input(
-            "P",
-            vec![
-                json!({"id": "a", "facts": {
-                    "cached_tokens": 100, "uncached_tokens": 50,
-                    "load_cost": 100, "eviction_cost": 0
-                }}),
-                json!({"id": "b", "facts": {
-                    "cached_tokens": 80, "uncached_tokens": 50,
-                    "load_cost": 1, "eviction_cost": 0
-                }}),
-            ],
-            context(false),
-        ),
+        route_context("H", "generation-arrival", candidates(), context(false)),
     ))?;
-    assert_eq!(rank_route(&response.result, 2)?[0], 0);
+    assert_eq!(
+        response
+            .actions
+            .iter()
+            .map(|action| action.id)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2, 3, 4]
+    );
+    let calls = helper_calls.lock().unwrap();
+    assert_eq!(
+        calls[0],
+        (
+            "pie.kv.lookup@1".into(),
+            json!({"request_id": "H", "target": "node-a"})
+        )
+    );
+    assert_eq!(
+        calls[1],
+        (
+            "pie.cluster.capacity@1".into(),
+            json!({"model": "example-model"})
+        )
+    );
+    assert_eq!(calls[2], ("pie.model.config@1".into(), json!({})));
+    assert_eq!(calls[3], ("pie.clock.now@1".into(), json!({})));
+    drop(calls);
 
-    let state = PolicyStateStore::default();
-    let (kvflow, _, _) = lifecycle_with_policy(
+    let raw_query = CapturingQueryHandler::default();
+    let raw_backend = Arc::new(InMemoryPolicyStateBackend::default());
+    let (raw, _, _) = lifecycle_with_policy_and_host(
         engine,
         directory,
-        "plex_paper_kvflow",
-        "kvflow",
-        &[Operation::Evict],
-        state.clone(),
+        "plex_raw_helpers",
+        "raw-helpers",
+        &[Operation::Route],
+        raw_backend.clone(),
+        Arc::new(raw_query),
+        action_set(["engine.custom-action@1"]),
         1,
     )?;
-    kvflow.create_request("K", json!({}), json!({}))?;
-    expect_success(kvflow.invoke_and_apply(
-        Operation::Evict,
-        eviction_input(vec![(
-            "u",
-            Some("K"),
-            1,
-            json!({"steps_to_execution": 5, "fixed_prefix": false}),
-        )]),
+    raw.create_request("R", json!({}), json!({}))?;
+    let raw_response = expect_success(raw.invoke_and_apply(
+        Operation::Route,
+        route_context("R", "generation-arrival", candidates(), context(false)),
     ))?;
+    assert_eq!(raw_response.actions[0].method, "engine.custom-action@1");
+    assert_eq!(raw_backend.read_shared()?["raw"]["action_id"], 0);
 
-    let state = PolicyStateStore::default();
-    let (helium, _, _) = lifecycle_with_policy(
-        engine,
+    let limited_engine = PolicyEngine::new(PolicyEngineConfig {
+        max_host_calls: 1,
+        ..PolicyEngineConfig::default()
+    })?;
+    let limited_backend = Arc::new(InMemoryPolicyStateBackend::default());
+    let (limited, _, _) = lifecycle_with_policy_and_host(
+        &limited_engine,
         directory,
-        "plex_paper_helium",
-        "helium",
-        &[Operation::Schedule],
-        state.clone(),
+        "plex_stage_action",
+        "limited-actions",
+        &[Operation::Route],
+        limited_backend.clone(),
+        Arc::new(RejectingQueryHandler),
+        action_set(["pie.kv.prefetch@1", "pie.retention.set@1"]),
         1,
     )?;
-    helium.create_request("H", json!({}), json!({}))?;
-    expect_success(helium.invoke_and_apply(
-        Operation::Schedule,
-        schedule_input(
-            vec![(
-                "H",
-                json!({
-                    "ready": true,
-                    "dependency_depth": 2,
-                    "earliest_start": 0,
-                    "prefix_reuse_tokens": 10,
-                    "profiled_token_cost": 1
-                }),
-            )],
-            false,
+    limited.create_request("L", json!({}), json!({}))?;
+    expect_failure(
+        limited.invoke_and_apply(
+            Operation::Route,
+            route_context("L", "generation-arrival", candidates(), context(false)),
         ),
-    ))?;
-
-    let state = PolicyStateStore::default();
-    let (continuum, _, _) = lifecycle_with_policy(
-        engine,
-        directory,
-        "plex_paper_continuum",
-        "continuum",
-        &[Operation::Schedule, Operation::Evict, Operation::Feedback],
-        state.clone(),
-        1,
+        InvocationFailureKind::ActionValidation,
     )?;
-    continuum.create_request("C", json!({}), json!({}))?;
-    expect_success(continuum.invoke_and_apply(
-        Operation::Feedback,
-        feedback_input("ttl", vec![("tool-boundary", "C", json!({"ttl_ms": 100}))]),
-    ))?;
-    expect_success(continuum.invoke_and_apply(
-        Operation::Schedule,
-        schedule_input(
-            vec![("C", json!({"preempted": false, "program_arrival": 1}))],
-            false,
-        ),
-    ))?;
     Ok(())
 }
 
-fn check_feedback_commit_atomicity(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn check_failure_rollback(
+    engine: &PolicyEngine,
+    directory: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for (artifact, expected) in [
+        (
+            "plex_invalid_shared_update",
+            InvocationFailureKind::InvalidOutput,
+        ),
+        (
+            "plex_mutate_request_facts",
+            InvocationFailureKind::InvalidOutput,
+        ),
+        (
+            "plex_mutate_unknown_request",
+            InvocationFailureKind::InvalidOutput,
+        ),
+        (
+            "plex_malformed_state_update",
+            InvocationFailureKind::InvalidOutput,
+        ),
+        ("plex_malformed", InvocationFailureKind::InvalidOutput),
+        ("plex_nonfinite", InvocationFailureKind::InvalidOutput),
+        ("plex_mutate_fail", InvocationFailureKind::PolicyFallback),
+        ("plex_fallback", InvocationFailureKind::PolicyFallback),
+        ("plex_trap", InvocationFailureKind::Trap),
+    ] {
+        let backend = Arc::new(InMemoryPolicyStateBackend::new(json!({"stable": true}))?);
+        let (lifecycle, _, _) = lifecycle_with_policy(
+            engine,
+            directory,
+            artifact,
+            artifact,
+            &[Operation::Route],
+            backend.clone(),
+            1,
+        )?;
+        lifecycle.create_request("F", json!({"prompt": "stable"}), json!({}))?;
+        let before_shared = backend.read_shared()?;
+        let before_request = backend.read_request("F")?;
+        expect_failure(
+            lifecycle.invoke_and_apply(
+                Operation::Route,
+                route_context("F", "generation-arrival", candidates(), context(false)),
+            ),
+            expected,
+        )?;
+        assert_eq!(backend.read_shared()?, before_shared);
+        assert_eq!(backend.read_request("F")?, before_request);
+    }
+
+    let backend = Arc::new(InMemoryPolicyStateBackend::default());
+    let (spin, _, _) = lifecycle_with_policy(
+        engine,
+        directory,
+        "plex_spin",
+        "spin",
+        &[Operation::Route],
+        backend.clone(),
+        1,
+    )?;
+    spin.create_request("S", json!({}), json!({}))?;
+    expect_failure_one_of(
+        spin.invoke_and_apply(
+            Operation::Route,
+            route_context("S", "generation-arrival", candidates(), context(false)),
+        ),
+        &[
+            InvocationFailureKind::FuelExhausted,
+            InvocationFailureKind::DeadlineExceeded,
+        ],
+    )?;
+    assert_eq!(backend.read_request("S")?["scratch"], json!({}));
+    Ok(())
+}
+
+fn check_feedback_dedup(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let engine = PolicyEngine::new(PolicyEngineConfig {
-        max_feedback_deliveries: 1,
+        max_feedback_deliveries: 2,
         ..PolicyEngineConfig::default()
     })?;
-    let state = PolicyStateStore::default();
-    let (lifecycle, _, _) = lifecycle_with_policy(
+    let backend = Arc::new(InMemoryPolicyStateBackend::default());
+    let (lifecycle, _, _) = lifecycle_with_policy_and_host(
         &engine,
         directory,
-        "plex_feedback_accounting",
-        "bounded-feedback",
+        "plex_coordinated",
+        "feedback-dedup",
         &[Operation::Feedback],
-        state.clone(),
+        backend.clone(),
+        Arc::new(RejectingQueryHandler),
+        action_set(["pie.timer.arm@1"]),
         1,
     )?;
     lifecycle.create_request("L", json!({}), json!({}))?;
+    let feedback = feedback_context(
+        "dedup",
+        vec![("action-failed", "L", json!({"method": "prefetch"}))],
+        context_with_helpers(false, &[], &["pie.timer.arm@1"]),
+    );
+    let first = expect_success(lifecycle.invoke_and_apply(Operation::Feedback, feedback.clone()))?;
+    assert_eq!(first.actions.len(), 1);
+    assert_eq!(first.actions[0].id, 0);
+    let duplicate = expect_success(lifecycle.invoke_and_apply(Operation::Feedback, feedback))?;
+    assert!(duplicate.duplicate_feedback);
+    assert!(duplicate.actions.is_empty());
+    assert_eq!(backend.read_request("L")?["scratch"]["actions_failed"], 1);
 
-    expect_success(lifecycle.invoke_and_apply(
-        Operation::Feedback,
-        feedback_input(
-            "accepted",
-            vec![("progress", "L", json!({"committed_tokens": 4}))],
-        ),
-    ))?;
-    assert_eq!(state.read_request("L")?["scratch"]["attained_service"], 4);
-    let committed = state.read_global();
-
-    let rejected = feedback_input("not-committed", vec![("tool-boundary", "L", json!({}))]);
-    for _ in 0..2 {
-        expect_failure(
-            lifecycle.invoke_and_apply(Operation::Feedback, rejected.clone()),
-            InvocationFailureKind::HostSaturated,
-        )?;
-        assert_eq!(
-            state.read_request("L")?["scratch"]["tool_calls"],
-            json!(null)
-        );
-        assert_eq!(state.read_global(), committed);
-    }
+    let terminal = feedback_context(
+        "terminal",
+        vec![("completed", "L", json!({}))],
+        context(false),
+    );
+    expect_success(lifecycle.feedback_and_remove(terminal, &["L".into()]))?;
+    assert!(matches!(
+        backend.read_request("L"),
+        Err(StateBackendError::NotFound(_))
+    ));
     Ok(())
 }
 
@@ -805,16 +1109,13 @@ fn check_replay(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
             ReplayCommand::Attach {
                 package: "policy".into(),
             },
-            ReplayCommand::ReplaceGlobalFacts {
-                facts: json!({"config": {"mode": "replay"}}),
+            ReplayCommand::ReplaceShared {
+                shared: json!({"mode": "replay"}),
             },
             ReplayCommand::CreateRequest {
                 logical_request_id: "L".into(),
                 body: json!({"prompt": "hello"}),
                 metadata: json!({"user": "alice"}),
-            },
-            ReplayCommand::MergeGlobalFacts {
-                facts: json!({"replica_count": 2}),
             },
             ReplayCommand::MergeRequestFacts {
                 logical_request_id: "L".into(),
@@ -832,18 +1133,17 @@ fn check_replay(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
             },
             ReplayCommand::Invoke {
                 operation: Operation::Schedule,
-                input: schedule_input(vec![("L", json!({}))], true),
+                context: schedule_context(vec![("L", json!({}))], true),
             },
             ReplayCommand::Invoke {
                 operation: Operation::Feedback,
-                input: feedback_input("d", vec![("progress", "L", json!({"committed_tokens": 4}))]),
+                context: feedback_context(
+                    "d",
+                    vec![("progress", "L", json!({"committed_tokens": 4}))],
+                    context(false),
+                ),
             },
-            ReplayCommand::ContinueRequest {
-                logical_request_id: "L".into(),
-                body: json!({"prompt": "continue"}),
-                metadata: json!({"step": 2}),
-            },
-            ReplayCommand::ReadGlobal,
+            ReplayCommand::ReadShared,
             ReplayCommand::ReadRequest {
                 logical_request_id: "L".into(),
             },
@@ -852,19 +1152,273 @@ fn check_replay(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let packages = BTreeMap::from([("policy".into(), package)]);
     let first = ReplayRunner::new(
         AttachmentRegistry::new(engine.clone()),
-        PolicyStateStore::default(),
+        Arc::new(InMemoryPolicyStateBackend::default()),
         packages.clone(),
         2,
     )?
     .run(&trace)?;
     ReplayRunner::new(
         AttachmentRegistry::new(engine),
-        PolicyStateStore::default(),
+        Arc::new(InMemoryPolicyStateBackend::default()),
         packages,
         2,
     )?
     .verify(&trace, &first)?;
     Ok(())
+}
+
+fn check_adapter_conformance(
+    engine: &PolicyEngine,
+    directory: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cases: Document =
+        serde_json::from_slice(&std::fs::read("tests/policies/engine-cases.json")?)?;
+    let events = cases["events"]
+        .as_array()
+        .ok_or("engine cases events must be an array")?;
+    let expected = cases["expected_decisions"]
+        .as_array()
+        .ok_or("engine cases decisions must be an array")?;
+
+    let mut reports = Vec::new();
+    for adapter in ["pie", "vllm-mock", "sglang-mock"] {
+        let runtime = runtime_with_policy(
+            engine,
+            directory,
+            "plex_coordinated",
+            &format!("{adapter}-conformance"),
+            &[Operation::Route, Operation::Admit, Operation::Schedule],
+            Arc::new(InMemoryPolicyStateBackend::default()),
+            Arc::new(RejectingQueryHandler),
+            BTreeSet::new(),
+        )?;
+        reports.push(run_mock_adapter(adapter, &runtime, events)?);
+    }
+    assert_eq!(reports[0], reports[1]);
+    assert_eq!(reports[1], reports[2]);
+    assert_eq!(
+        reports[0]
+            .iter()
+            .map(|outcome| outcome["decision"].clone())
+            .collect::<Vec<_>>(),
+        expected.clone()
+    );
+    Ok(())
+}
+
+fn check_paper_policies(
+    engine: &PolicyEngine,
+    directory: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cases: Document =
+        serde_json::from_slice(&std::fs::read("tests/policies/paper-cases.json")?)?;
+    assert_eq!(cases.as_array().map_or(0, Vec::len), 5);
+
+    let backend = Arc::new(InMemoryPolicyStateBackend::default());
+    let (agentix, _, _) = lifecycle_with_policy(
+        engine,
+        directory,
+        "plex_paper_agentix",
+        "agentix",
+        &[Operation::Schedule],
+        backend.clone(),
+        1,
+    )?;
+    for (id, service) in [("A", 100), ("B", 1)] {
+        agentix.create_request(id, json!({}), json!({}))?;
+        agentix.merge_request_facts(id, json!({"attained_service": service}))?;
+    }
+    let response = expect_success(agentix.invoke_and_apply(
+        Operation::Schedule,
+        schedule_context(
+            vec![
+                ("A", json!({"waiting_ms": 500})),
+                ("B", json!({"waiting_ms": 1})),
+            ],
+            false,
+        ),
+    ))?;
+    assert!(
+        response.result["decisions"][0]["score"].as_f64().unwrap()
+            > response.result["decisions"][1]["score"].as_f64().unwrap()
+    );
+
+    for (artifact, package, operation, request_id, ctx) in [
+        (
+            "plex_paper_preble",
+            "preble",
+            Operation::Route,
+            "P",
+            route_context(
+                "P",
+                "generation-arrival",
+                vec![
+                    json!({"id": "a", "facts": {
+                        "cached_tokens": 100, "uncached_tokens": 50,
+                        "load_cost": 100, "eviction_cost": 0
+                    }}),
+                    json!({"id": "b", "facts": {
+                        "cached_tokens": 80, "uncached_tokens": 50,
+                        "load_cost": 1, "eviction_cost": 0
+                    }}),
+                ],
+                context(false),
+            ),
+        ),
+        (
+            "plex_paper_kvflow",
+            "kvflow",
+            Operation::Evict,
+            "K",
+            eviction_context(vec![(
+                "u",
+                Some("K"),
+                8,
+                json!({"steps_to_execution": 5, "fixed_prefix": false}),
+            )]),
+        ),
+        (
+            "plex_paper_helium",
+            "helium",
+            Operation::Schedule,
+            "H",
+            schedule_context(
+                vec![(
+                    "H",
+                    json!({
+                        "ready": true,
+                        "dependency_depth": 2,
+                        "earliest_start": 0,
+                        "prefix_reuse_tokens": 10,
+                        "profiled_token_cost": 1
+                    }),
+                )],
+                false,
+            ),
+        ),
+    ] {
+        let backend = Arc::new(InMemoryPolicyStateBackend::default());
+        let (policy, _, _) = lifecycle_with_policy(
+            engine,
+            directory,
+            artifact,
+            package,
+            &[operation],
+            backend,
+            1,
+        )?;
+        policy.create_request(request_id, json!({}), json!({}))?;
+        expect_success(policy.invoke_and_apply(operation, ctx))?;
+    }
+
+    let backend = Arc::new(InMemoryPolicyStateBackend::default());
+    let (continuum, _, _) = lifecycle_with_policy(
+        engine,
+        directory,
+        "plex_paper_continuum",
+        "continuum",
+        &[Operation::Schedule, Operation::Evict, Operation::Feedback],
+        backend,
+        1,
+    )?;
+    continuum.create_request("C", json!({}), json!({}))?;
+    expect_success(continuum.invoke_and_apply(
+        Operation::Feedback,
+        feedback_context(
+            "ttl",
+            vec![("tool-boundary", "C", json!({"ttl_ms": 100}))],
+            context(false),
+        ),
+    ))?;
+    expect_success(continuum.invoke_and_apply(
+        Operation::Schedule,
+        schedule_context(
+            vec![("C", json!({"preempted": false, "program_arrival": 1}))],
+            false,
+        ),
+    ))?;
+    Ok(())
+}
+
+#[derive(Clone)]
+struct MutatingQueryHandler {
+    backend: Arc<InMemoryPolicyStateBackend>,
+    fired: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Default)]
+struct CapturingQueryHandler {
+    calls: Arc<Mutex<Vec<(String, Document)>>>,
+}
+
+impl QueryHandler for CapturingQueryHandler {
+    fn query(&self, method: &str, args: &Document) -> Result<Document, QueryError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((method.to_owned(), args.clone()));
+        match method {
+            "pie.kv.lookup@1" => Ok(json!({"cached": true})),
+            "pie.cluster.capacity@1" => Ok(json!({"free_slots": 4})),
+            "pie.model.config@1" => Ok(json!({"name": "example-model"})),
+            "pie.clock.now@1" => Ok(json!(1234)),
+            "engine.custom-query@1" => Ok(json!({"value": 7})),
+            _ => Err(QueryError::Unsupported(method.into())),
+        }
+    }
+}
+
+impl QueryHandler for MutatingQueryHandler {
+    fn query(&self, method: &str, _args: &Document) -> Result<Document, QueryError> {
+        if method != "pie.cluster.capacity@1" {
+            return Err(QueryError::Unsupported(method.into()));
+        }
+        if !self.fired.swap(true, Ordering::AcqRel) {
+            self.backend
+                .replace_shared(json!({"external": true}))
+                .map_err(|error| QueryError::Handler(error.to_string()))?;
+        }
+        Ok(json!({"route_bias": 0.0}))
+    }
+}
+
+fn run_mock_adapter(
+    _name: &str,
+    runtime: &PlexRuntime,
+    events: &[Document],
+) -> Result<Vec<Document>, PlexError> {
+    events
+        .iter()
+        .cloned()
+        .map(|event| runtime.invoke(event))
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn runtime_with_policy(
+    engine: &PolicyEngine,
+    directory: &Path,
+    artifact: &str,
+    package_name: &str,
+    operations: &[Operation],
+    backend: Arc<InMemoryPolicyStateBackend>,
+    query_handler: Arc<dyn QueryHandler>,
+    supported_actions: BTreeSet<String>,
+) -> Result<PlexRuntime, Box<dyn std::error::Error>> {
+    let package = package_bytes(
+        directory,
+        artifact,
+        manifest(package_name, operations.iter().copied()),
+    )?;
+    let registry = AttachmentRegistry::new(engine.clone());
+    registry.attach(&package)?;
+    Ok(PlexRuntime::with_parts(
+        registry,
+        backend,
+        query_handler,
+        supported_actions,
+        2,
+    )?)
 }
 
 fn lifecycle_with_policy(
@@ -873,7 +1427,32 @@ fn lifecycle_with_policy(
     artifact: &str,
     package_name: &str,
     operations: &[Operation],
-    state: PolicyStateStore,
+    backend: Arc<InMemoryPolicyStateBackend>,
+    max_defer_retries: u32,
+) -> Result<(LifecycleHost, AttachmentRegistry, Vec<u8>), Box<dyn std::error::Error>> {
+    lifecycle_with_policy_and_host(
+        engine,
+        directory,
+        artifact,
+        package_name,
+        operations,
+        backend,
+        Arc::new(RejectingQueryHandler),
+        BTreeSet::new(),
+        max_defer_retries,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lifecycle_with_policy_and_host(
+    engine: &PolicyEngine,
+    directory: &Path,
+    artifact: &str,
+    package_name: &str,
+    operations: &[Operation],
+    backend: Arc<InMemoryPolicyStateBackend>,
+    query_handler: Arc<dyn QueryHandler>,
+    supported_actions: BTreeSet<String>,
     max_defer_retries: u32,
 ) -> Result<(LifecycleHost, AttachmentRegistry, Vec<u8>), Box<dyn std::error::Error>> {
     let package = package_bytes(
@@ -883,7 +1462,13 @@ fn lifecycle_with_policy(
     )?;
     let registry = AttachmentRegistry::new(engine.clone());
     registry.attach(&package)?;
-    let lifecycle = LifecycleHost::new(registry.clone(), state, max_defer_retries);
+    let lifecycle = LifecycleHost::with_host(
+        registry.clone(),
+        backend,
+        query_handler,
+        supported_actions,
+        max_defer_retries,
+    );
     Ok((lifecycle, registry, package))
 }
 
@@ -898,9 +1483,9 @@ fn package_bytes(
 
 fn manifest(name: &str, operations: impl IntoIterator<Item = Operation>) -> Manifest {
     Manifest {
-        contract: ContractVersion::V0_3,
+        contract: ContractVersion::V0_5,
         package_name: name.replace('_', "-"),
-        package_version: "0.3.0".into(),
+        package_version: "0.5.0".into(),
         operations: operations.into_iter().collect::<BTreeSet<_>>(),
         limits: PolicyLimits {
             memory_bytes: 4 << 20,
@@ -910,6 +1495,19 @@ fn manifest(name: &str, operations: impl IntoIterator<Item = Operation>) -> Mani
             output_bytes: 1 << 20,
         },
     }
+}
+
+fn action_set<const N: usize>(actions: [&str; N]) -> BTreeSet<String> {
+    actions.into_iter().map(str::to_owned).collect()
+}
+
+fn engine_event(hook: &str, context: Document, request_events: Vec<Document>) -> Document {
+    json!({
+        "api_version": ENGINE_API_VERSION,
+        "hook": hook,
+        "context": context,
+        "request_events": request_events,
+    })
 }
 
 fn candidates() -> Vec<Document> {
@@ -924,19 +1522,35 @@ fn candidates() -> Vec<Document> {
 }
 
 fn context(token_budget: bool) -> Document {
-    json!({"capabilities": {"token_budget": token_budget}})
+    context_with_helpers(token_budget, &[], &[])
 }
 
-fn route_input(request_id: &str, candidates: Vec<Document>, context: Document) -> Document {
+fn context_with_helpers(token_budget: bool, queries: &[&str], actions: &[&str]) -> Document {
     json!({
-        "cause": "generation-arrival",
+        "model": "example-model",
+        "capabilities": {
+            "token_budget": token_budget,
+            "queries": queries,
+            "actions": actions
+        }
+    })
+}
+
+fn route_context(
+    request_id: &str,
+    cause: &str,
+    candidates: Vec<Document>,
+    context: Document,
+) -> Document {
+    json!({
+        "cause": cause,
         "request_id": request_id,
         "candidates": candidates,
         "context": context
     })
 }
 
-fn schedule_input(runnable: Vec<(&str, Document)>, token_budget: bool) -> Document {
+fn schedule_context(runnable: Vec<(&str, Document)>, token_budget: bool) -> Document {
     json!({
         "cause": "service-step",
         "runnable": runnable
@@ -956,7 +1570,7 @@ fn schedule_input(runnable: Vec<(&str, Document)>, token_budget: bool) -> Docume
     })
 }
 
-fn eviction_input(resident: Vec<(&str, Option<&str>, u64, Document)>) -> Document {
+fn eviction_context(resident: Vec<(&str, Option<&str>, u64, Document)>) -> Document {
     json!({
         "cause": "allocation-deficit",
         "bytes_needed": 6,
@@ -973,7 +1587,11 @@ fn eviction_input(resident: Vec<(&str, Option<&str>, u64, Document)>) -> Documen
     })
 }
 
-fn feedback_input(delivery_id: &str, records: Vec<(&str, &str, Document)>) -> Document {
+fn feedback_body(
+    delivery_id: &str,
+    records: Vec<(&str, &str, Document)>,
+    context: Document,
+) -> Document {
     json!({
         "delivery_id": delivery_id,
         "records": records
@@ -984,8 +1602,16 @@ fn feedback_input(delivery_id: &str, records: Vec<(&str, &str, Document)>) -> Do
                 "facts": facts
             }))
             .collect::<Vec<_>>(),
-        "context": context(false)
+        "context": context
     })
+}
+
+fn feedback_context(
+    delivery_id: &str,
+    records: Vec<(&str, &str, Document)>,
+    context: Document,
+) -> Document {
+    feedback_body(delivery_id, records, context)
 }
 
 fn expect_success<T>(invocation: Invocation<T>) -> Result<T, Box<dyn std::error::Error>> {

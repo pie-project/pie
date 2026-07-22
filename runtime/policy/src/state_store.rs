@@ -1,86 +1,289 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
-use pie_plex::{Document, Operation, validate_global_scope, validate_state_envelope};
+use pie_plex::{Document, validate_request_scope};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 
-use crate::protocol::{referenced_request_ids, validate_input};
-
 const GENERATION_LOCAL_FACTS: [&str; 1] = ["current_target"];
 
+pub trait PolicyStateBackend: Send + Sync + 'static {
+    fn load(&self, request_ids: &BTreeSet<String>) -> Result<StateSnapshot, StateBackendError>;
+
+    fn commit(
+        &self,
+        snapshot: &StateSnapshot,
+        updates: &StateUpdates,
+        feedback: Option<&FeedbackCommit>,
+        terminal_requests: &[String],
+    ) -> Result<(), StateBackendError>;
+
+    fn create_request(
+        &self,
+        logical_request_id: String,
+        body: Document,
+        metadata: Document,
+    ) -> Result<Document, StateBackendError>;
+
+    fn continue_request(
+        &self,
+        logical_request_id: &str,
+        body: Document,
+        continuation_metadata: Document,
+    ) -> Result<Document, StateBackendError>;
+
+    fn read_shared(&self) -> Result<Document, StateBackendError>;
+
+    fn replace_shared(&self, shared: Document) -> Result<(), StateBackendError>;
+
+    fn read_request(&self, logical_request_id: &str) -> Result<Document, StateBackendError>;
+
+    fn remove_request(&self, logical_request_id: &str) -> Result<Document, StateBackendError>;
+
+    fn request_count(&self) -> Result<usize, StateBackendError>;
+
+    fn merge_request_facts(
+        &self,
+        logical_request_id: &str,
+        facts: Document,
+    ) -> Result<(), StateBackendError>;
+
+    fn replace_request_fields(
+        &self,
+        logical_request_id: &str,
+        fields: Document,
+    ) -> Result<(), StateBackendError>;
+
+    fn record_enacted_placement(
+        &self,
+        logical_request_id: &str,
+        target_id: String,
+    ) -> Result<(), StateBackendError>;
+
+    fn feedback_result(&self, delivery_id: &str) -> Result<Option<Document>, StateBackendError>;
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StateSnapshot {
+    pub shared: Document,
+    pub requests: BTreeMap<String, Document>,
+    pub(crate) shared_revision: u64,
+    pub(crate) request_revisions: BTreeMap<String, u64>,
+}
+
+impl StateSnapshot {
+    pub fn from_parts(
+        shared: Document,
+        requests: BTreeMap<String, Document>,
+        shared_revision: u64,
+        request_revisions: BTreeMap<String, u64>,
+    ) -> Result<Self, StateBackendError> {
+        let snapshot = Self {
+            shared,
+            requests,
+            shared_revision,
+            request_revisions,
+        };
+        validate_snapshot(&snapshot)?;
+        Ok(snapshot)
+    }
+
+    pub fn document(&self) -> Document {
+        let requests = self
+            .requests
+            .iter()
+            .map(|(id, request)| (id.clone(), request.clone()))
+            .collect::<Map<_, _>>();
+        json!({
+            "shared": self.shared,
+            "requests": requests
+        })
+    }
+
+    pub fn shared_revision(&self) -> u64 {
+        self.shared_revision
+    }
+
+    pub fn request_revisions(&self) -> &BTreeMap<String, u64> {
+        &self.request_revisions
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct StateUpdates {
+    pub shared: Option<Document>,
+    pub requests: BTreeMap<String, RequestStateUpdate>,
+}
+
+impl StateUpdates {
+    pub fn is_empty(&self) -> bool {
+        self.shared.is_none() && self.requests.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RequestStateUpdate {
+    pub fields: Document,
+    pub scratch: Document,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FeedbackCommit {
+    pub delivery_id: String,
+    pub result: Document,
+    pub maximum_deliveries: usize,
+}
+
 #[derive(Clone)]
-pub struct PolicyStateStore {
+pub struct InMemoryPolicyStateBackend {
     inner: Arc<Mutex<PolicyState>>,
 }
 
 #[derive(Clone)]
 struct PolicyState {
-    global: Document,
-    requests: BTreeMap<String, Document>,
+    shared: VersionedDocument,
+    requests: BTreeMap<String, VersionedDocument>,
     feedback_deliveries: BTreeMap<String, Document>,
 }
 
-impl Default for PolicyStateStore {
+#[derive(Clone)]
+struct VersionedDocument {
+    value: Document,
+    revision: u64,
+}
+
+impl Default for InMemoryPolicyStateBackend {
     fn default() -> Self {
-        Self::new(json!({})).expect("empty global facts are valid")
+        Self::new(json!({})).expect("empty shared state is valid")
     }
 }
 
-impl PolicyStateStore {
-    pub fn new(global_facts: Document) -> Result<Self, StateStoreError> {
-        require_object(&global_facts, "global facts")?;
-        let global = json!({
-            "facts": global_facts,
-            "fields": {},
-            "scratch": {}
-        });
-        validate_global_scope(&global)
-            .map_err(|error| StateStoreError::InvalidScope(error.to_string()))?;
+impl InMemoryPolicyStateBackend {
+    pub fn new(shared: Document) -> Result<Self, StateBackendError> {
+        require_object(&shared, "shared")?;
         Ok(Self {
             inner: Arc::new(Mutex::new(PolicyState {
-                global,
+                shared: VersionedDocument {
+                    value: shared,
+                    revision: 0,
+                },
                 requests: BTreeMap::new(),
                 feedback_deliveries: BTreeMap::new(),
             })),
         })
     }
 
-    pub fn read_global(&self) -> Document {
-        self.inner.lock().unwrap().global.clone()
+    pub fn shared_backend(self) -> Arc<dyn PolicyStateBackend> {
+        Arc::new(self)
+    }
+}
+
+impl PolicyStateBackend for InMemoryPolicyStateBackend {
+    fn load(&self, request_ids: &BTreeSet<String>) -> Result<StateSnapshot, StateBackendError> {
+        let state = self.inner.lock().unwrap();
+        let mut requests = BTreeMap::new();
+        let mut request_revisions = BTreeMap::new();
+        for logical_request_id in request_ids {
+            let request = state
+                .requests
+                .get(logical_request_id)
+                .ok_or_else(|| StateBackendError::NotFound(logical_request_id.clone()))?;
+            requests.insert(logical_request_id.clone(), request.value.clone());
+            request_revisions.insert(logical_request_id.clone(), request.revision);
+        }
+        Ok(StateSnapshot {
+            shared: state.shared.value.clone(),
+            requests,
+            shared_revision: state.shared.revision,
+            request_revisions,
+        })
     }
 
-    pub fn reset_global(&self) {
-        let mut state = self.inner.lock().unwrap();
-        state.global["fields"] = json!({});
-        state.global["scratch"] = json!({});
-    }
-
-    pub fn replace_global_facts(&self, facts: Document) -> Result<(), StateStoreError> {
-        require_object(&facts, "global facts")?;
-        self.inner.lock().unwrap().global["facts"] = facts;
-        Ok(())
-    }
-
-    pub fn merge_global_facts(&self, facts: Document) -> Result<(), StateStoreError> {
-        let facts = require_object(&facts, "global facts")?;
-        let mut state = self.inner.lock().unwrap();
-        let current = state.global["facts"]
-            .as_object_mut()
-            .expect("global facts are canonical");
-        merge(current, facts);
-        Ok(())
-    }
-
-    pub fn create_request(
+    fn commit(
         &self,
-        logical_request_id: impl Into<String>,
+        snapshot: &StateSnapshot,
+        updates: &StateUpdates,
+        feedback: Option<&FeedbackCommit>,
+        terminal_requests: &[String],
+    ) -> Result<(), StateBackendError> {
+        validate_snapshot(snapshot)?;
+        validate_updates(snapshot, updates)?;
+        let terminal = terminal_requests.iter().collect::<BTreeSet<_>>();
+        if terminal.len() != terminal_requests.len() {
+            return Err(StateBackendError::DuplicateTerminalRequest);
+        }
+        for logical_request_id in terminal_requests {
+            if !snapshot.requests.contains_key(logical_request_id) {
+                return Err(StateBackendError::UnknownRequestUpdate(
+                    logical_request_id.clone(),
+                ));
+            }
+        }
+
+        let mut state = self.inner.lock().unwrap();
+        let mut next = state.clone();
+        if next.shared.revision != snapshot.shared_revision {
+            return Err(StateBackendError::RevisionConflict("shared".into()));
+        }
+        for (logical_request_id, expected_revision) in &snapshot.request_revisions {
+            let current = next
+                .requests
+                .get(logical_request_id)
+                .ok_or_else(|| StateBackendError::RevisionConflict(logical_request_id.clone()))?;
+            if current.revision != *expected_revision {
+                return Err(StateBackendError::RevisionConflict(
+                    logical_request_id.clone(),
+                ));
+            }
+        }
+
+        if let Some(shared) = &updates.shared {
+            next.shared.value = shared.clone();
+            next.shared.revision = next_revision(next.shared.revision)?;
+        }
+        for (logical_request_id, update) in &updates.requests {
+            let request = next
+                .requests
+                .get_mut(logical_request_id)
+                .ok_or_else(|| StateBackendError::NotFound(logical_request_id.clone()))?;
+            request.value["fields"] = update.fields.clone();
+            request.value["scratch"] = update.scratch.clone();
+            request.revision = next_revision(request.revision)?;
+        }
+
+        if let Some(feedback) = feedback {
+            if feedback.delivery_id.is_empty() {
+                return Err(StateBackendError::EmptyFeedbackDeliveryId);
+            }
+            if next.feedback_deliveries.contains_key(&feedback.delivery_id) {
+                return Err(StateBackendError::DuplicateFeedback(
+                    feedback.delivery_id.clone(),
+                ));
+            }
+            if next.feedback_deliveries.len() >= feedback.maximum_deliveries {
+                return Err(StateBackendError::FeedbackLedgerFull(
+                    feedback.maximum_deliveries,
+                ));
+            }
+            next.feedback_deliveries
+                .insert(feedback.delivery_id.clone(), feedback.result.clone());
+        }
+        for logical_request_id in terminal_requests {
+            next.requests.remove(logical_request_id);
+        }
+        *state = next;
+        Ok(())
+    }
+
+    fn create_request(
+        &self,
+        logical_request_id: String,
         body: Document,
         metadata: Document,
-    ) -> Result<Document, StateStoreError> {
-        let logical_request_id = logical_request_id.into();
+    ) -> Result<Document, StateBackendError> {
         if logical_request_id.is_empty() {
-            return Err(StateStoreError::EmptyLogicalRequestId);
+            return Err(StateBackendError::EmptyLogicalRequestId);
         }
         require_object(&body, "request body")?;
         require_object(&metadata, "request metadata")?;
@@ -101,32 +304,39 @@ impl PolicyStateStore {
             .to_owned();
         let mut state = self.inner.lock().unwrap();
         if state.requests.contains_key(&id) {
-            return Err(StateStoreError::AlreadyExists(id));
+            return Err(StateBackendError::AlreadyExists(id));
         }
-        state.requests.insert(id, request.clone());
+        state.requests.insert(
+            id,
+            VersionedDocument {
+                value: request.clone(),
+                revision: 0,
+            },
+        );
         Ok(request)
     }
 
-    pub fn continue_request(
+    fn continue_request(
         &self,
         logical_request_id: &str,
         body: Document,
         continuation_metadata: Document,
-    ) -> Result<Document, StateStoreError> {
+    ) -> Result<Document, StateBackendError> {
         require_object(&body, "request body")?;
         let continuation_metadata = require_object(&continuation_metadata, "request metadata")?;
         let mut state = self.inner.lock().unwrap();
-        let previous = state
+        let stored = state
             .requests
-            .get(logical_request_id)
-            .cloned()
-            .ok_or_else(|| StateStoreError::NotFound(logical_request_id.to_owned()))?;
-        let generation = previous
+            .get_mut(logical_request_id)
+            .ok_or_else(|| StateBackendError::NotFound(logical_request_id.to_owned()))?;
+        let revision = next_revision(stored.revision)?;
+        let mut request = stored.value.clone();
+        let generation = stored
+            .value
             .pointer("/facts/generation_id")
             .and_then(Value::as_u64)
             .and_then(|generation| generation.checked_add(1))
-            .ok_or(StateStoreError::GenerationExhausted)?;
-        let mut request = previous;
+            .ok_or(StateBackendError::GenerationExhausted)?;
         let facts = request["facts"]
             .as_object_mut()
             .expect("canonical request facts");
@@ -142,178 +352,155 @@ impl PolicyStateStore {
             .entry("metadata")
             .or_insert_with(|| json!({}))
             .as_object_mut()
-            .ok_or(StateStoreError::FieldNotObject("request fields.metadata"))?;
+            .ok_or(StateBackendError::FieldNotObject("request fields.metadata"))?;
         merge(metadata, continuation_metadata);
-        state
-            .requests
-            .insert(logical_request_id.to_owned(), request.clone());
-        Ok(request)
+        stored.value = request;
+        stored.revision = revision;
+        Ok(stored.value.clone())
     }
 
-    pub fn read_request(&self, logical_request_id: &str) -> Result<Document, StateStoreError> {
+    fn read_shared(&self) -> Result<Document, StateBackendError> {
+        Ok(self.inner.lock().unwrap().shared.value.clone())
+    }
+
+    fn replace_shared(&self, shared: Document) -> Result<(), StateBackendError> {
+        require_object(&shared, "shared")?;
+        let mut state = self.inner.lock().unwrap();
+        let revision = next_revision(state.shared.revision)?;
+        state.shared.value = shared;
+        state.shared.revision = revision;
+        Ok(())
+    }
+
+    fn read_request(&self, logical_request_id: &str) -> Result<Document, StateBackendError> {
         self.inner
             .lock()
             .unwrap()
             .requests
             .get(logical_request_id)
-            .cloned()
-            .ok_or_else(|| StateStoreError::NotFound(logical_request_id.to_owned()))
+            .map(|request| request.value.clone())
+            .ok_or_else(|| StateBackendError::NotFound(logical_request_id.to_owned()))
     }
 
-    pub fn remove_request(&self, logical_request_id: &str) -> Result<Document, StateStoreError> {
+    fn remove_request(&self, logical_request_id: &str) -> Result<Document, StateBackendError> {
         self.inner
             .lock()
             .unwrap()
             .requests
             .remove(logical_request_id)
-            .ok_or_else(|| StateStoreError::NotFound(logical_request_id.to_owned()))
+            .map(|request| request.value)
+            .ok_or_else(|| StateBackendError::NotFound(logical_request_id.to_owned()))
     }
 
-    pub fn request_count(&self) -> usize {
-        self.inner.lock().unwrap().requests.len()
+    fn request_count(&self) -> Result<usize, StateBackendError> {
+        Ok(self.inner.lock().unwrap().requests.len())
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.request_count() == 0
-    }
-
-    pub fn merge_request_facts(
+    fn merge_request_facts(
         &self,
         logical_request_id: &str,
         facts: Document,
-    ) -> Result<(), StateStoreError> {
+    ) -> Result<(), StateBackendError> {
         let facts = require_object(&facts, "request facts")?;
         let mut state = self.inner.lock().unwrap();
         let request = state
             .requests
             .get_mut(logical_request_id)
-            .ok_or_else(|| StateStoreError::NotFound(logical_request_id.to_owned()))?;
-        let current = request["facts"]
+            .ok_or_else(|| StateBackendError::NotFound(logical_request_id.to_owned()))?;
+        let revision = next_revision(request.revision)?;
+        let current = request.value["facts"]
             .as_object_mut()
             .expect("canonical request facts");
         for identity in ["logical_request_id", "generation_id"] {
             if let Some(value) = facts.get(identity)
                 && current.get(identity) != Some(value)
             {
-                return Err(StateStoreError::HostIdentityMutation(identity));
+                return Err(StateBackendError::HostIdentityMutation(identity));
             }
         }
         merge(current, facts);
+        request.revision = revision;
         Ok(())
     }
 
-    pub fn record_enacted_placement(
+    fn replace_request_fields(
         &self,
         logical_request_id: &str,
-        target_id: impl Into<String>,
-    ) -> Result<(), StateStoreError> {
-        let target_id = target_id.into();
+        fields: Document,
+    ) -> Result<(), StateBackendError> {
+        require_object(&fields, "request fields")?;
+        let mut state = self.inner.lock().unwrap();
+        let request = state
+            .requests
+            .get_mut(logical_request_id)
+            .ok_or_else(|| StateBackendError::NotFound(logical_request_id.to_owned()))?;
+        let revision = next_revision(request.revision)?;
+        request.value["fields"] = fields;
+        request.revision = revision;
+        Ok(())
+    }
+
+    fn record_enacted_placement(
+        &self,
+        logical_request_id: &str,
+        target_id: String,
+    ) -> Result<(), StateBackendError> {
         if target_id.is_empty() {
-            return Err(StateStoreError::EmptyTargetId);
+            return Err(StateBackendError::EmptyTargetId);
         }
         self.merge_request_facts(logical_request_id, json!({"previous_target": target_id}))
     }
 
-    pub(crate) fn hydrate(
-        &self,
-        operation: Operation,
-        mut input: Document,
-    ) -> Result<Document, StateStoreError> {
-        let object = input
-            .as_object_mut()
-            .ok_or(StateStoreError::InputNotObject)?;
-        if object.contains_key("global") || object.contains_key("requests") {
-            return Err(StateStoreError::StateAlreadyProvided);
-        }
-        let request_ids = referenced_request_ids(operation, &Value::Object(object.clone()))
-            .map_err(|error| StateStoreError::InvalidInput(error.to_string()))?;
-        let state = self.inner.lock().unwrap();
-        let mut requests = Map::new();
-        for logical_request_id in request_ids {
-            let request = state
-                .requests
-                .get(&logical_request_id)
-                .cloned()
-                .ok_or_else(|| StateStoreError::NotFound(logical_request_id.clone()))?;
-            requests.insert(logical_request_id, request);
-        }
-        object.insert("global".into(), state.global.clone());
-        object.insert("requests".into(), Value::Object(requests));
-        drop(state);
-        validate_input(operation, &input)
-            .map_err(|error| StateStoreError::InvalidInput(error.to_string()))?;
-        Ok(input)
-    }
-
-    pub(crate) fn commit_policy_mutation(
-        &self,
-        original: &Document,
-        mutated: &Document,
-        feedback: Option<(&str, &Document, usize)>,
-        terminal_logical_ids: &[String],
-    ) -> Result<(), StateStoreError> {
-        validate_state_envelope(original)
-            .map_err(|error| StateStoreError::InvalidScope(error.to_string()))?;
-        validate_state_envelope(mutated)
-            .map_err(|error| StateStoreError::InvalidScope(error.to_string()))?;
-        let original_requests = original["requests"]
-            .as_object()
-            .expect("validated original requests");
-        let mutated_requests = mutated["requests"]
-            .as_object()
-            .expect("validated mutated requests");
-
-        let mut state = self.inner.lock().unwrap();
-        let mut next = state.clone();
-        for logical_request_id in terminal_logical_ids {
-            if !next.requests.contains_key(logical_request_id) {
-                return Err(StateStoreError::NotFound(logical_request_id.clone()));
-            }
-        }
-        if next.global != original["global"] {
-            return Err(StateStoreError::StaleState("global".into()));
-        }
-        next.global["fields"] = mutated["global"]["fields"].clone();
-        next.global["scratch"] = mutated["global"]["scratch"].clone();
-
-        for (logical_request_id, original_request) in original_requests {
-            let current = next
-                .requests
-                .get_mut(logical_request_id)
-                .ok_or_else(|| StateStoreError::NotFound(logical_request_id.clone()))?;
-            if *current != *original_request {
-                return Err(StateStoreError::StaleState(logical_request_id.clone()));
-            }
-            let mutated_request = &mutated_requests[logical_request_id];
-            current["fields"] = mutated_request["fields"].clone();
-            current["scratch"] = mutated_request["scratch"].clone();
-        }
-
-        if let Some((delivery_id, result, maximum)) = feedback {
-            if next.feedback_deliveries.contains_key(delivery_id) {
-                return Err(StateStoreError::DuplicateFeedback(delivery_id.to_owned()));
-            }
-            if next.feedback_deliveries.len() >= maximum {
-                return Err(StateStoreError::FeedbackLedgerFull(maximum));
-            }
-            next.feedback_deliveries
-                .insert(delivery_id.to_owned(), result.clone());
-        }
-        for logical_request_id in terminal_logical_ids {
-            next.requests.remove(logical_request_id);
-        }
-        *state = next;
-        Ok(())
-    }
-
-    pub(crate) fn feedback_result(&self, delivery_id: &str) -> Option<Document> {
-        self.inner
+    fn feedback_result(&self, delivery_id: &str) -> Result<Option<Document>, StateBackendError> {
+        Ok(self
+            .inner
             .lock()
             .unwrap()
             .feedback_deliveries
             .get(delivery_id)
-            .cloned()
+            .cloned())
     }
+}
+
+fn validate_snapshot(snapshot: &StateSnapshot) -> Result<(), StateBackendError> {
+    require_object(&snapshot.shared, "shared")?;
+    if snapshot.requests.keys().collect::<BTreeSet<_>>()
+        != snapshot.request_revisions.keys().collect::<BTreeSet<_>>()
+    {
+        return Err(StateBackendError::InvalidSnapshot(
+            "request revisions do not match the working set".into(),
+        ));
+    }
+    for (logical_request_id, request) in &snapshot.requests {
+        validate_request_scope(logical_request_id, request)
+            .map_err(|error| StateBackendError::InvalidSnapshot(error.to_string()))?;
+    }
+    Ok(())
+}
+
+fn validate_updates(
+    snapshot: &StateSnapshot,
+    updates: &StateUpdates,
+) -> Result<(), StateBackendError> {
+    if let Some(shared) = &updates.shared {
+        require_object(shared, "shared update")?;
+    }
+    for (logical_request_id, update) in &updates.requests {
+        if !snapshot.requests.contains_key(logical_request_id) {
+            return Err(StateBackendError::UnknownRequestUpdate(
+                logical_request_id.clone(),
+            ));
+        }
+        require_object(&update.fields, "request fields update")?;
+        require_object(&update.scratch, "request scratch update")?;
+    }
+    Ok(())
+}
+
+fn next_revision(revision: u64) -> Result<u64, StateBackendError> {
+    revision
+        .checked_add(1)
+        .ok_or(StateBackendError::RevisionExhausted)
 }
 
 fn merge(target: &mut Map<String, Value>, source: &Map<String, Value>) {
@@ -325,14 +512,14 @@ fn merge(target: &mut Map<String, Value>, source: &Map<String, Value>) {
 fn require_object<'a>(
     value: &'a Document,
     field: &'static str,
-) -> Result<&'a Map<String, Value>, StateStoreError> {
+) -> Result<&'a Map<String, Value>, StateBackendError> {
     value
         .as_object()
-        .ok_or(StateStoreError::FieldNotObject(field))
+        .ok_or(StateBackendError::FieldNotObject(field))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub enum StateStoreError {
+pub enum StateBackendError {
     #[error("logical request ID must not be empty")]
     EmptyLogicalRequestId,
     #[error("{0} must be a JSON object")]
@@ -347,16 +534,18 @@ pub enum StateStoreError {
     HostIdentityMutation(&'static str),
     #[error("target ID must not be empty")]
     EmptyTargetId,
-    #[error("operation input must be a JSON object")]
-    InputNotObject,
-    #[error("operation input must not provide global or requests state")]
-    StateAlreadyProvided,
-    #[error("operation input is invalid: {0}")]
-    InvalidInput(String),
-    #[error("state scope is invalid: {0}")]
-    InvalidScope(String),
-    #[error("canonical state changed while invoking policy for {0}")]
-    StaleState(String),
+    #[error("state snapshot is invalid: {0}")]
+    InvalidSnapshot(String),
+    #[error("state update references request {0} outside the invocation working set")]
+    UnknownRequestUpdate(String),
+    #[error("terminal request list contains a duplicate")]
+    DuplicateTerminalRequest,
+    #[error("state revision changed while invoking policy for {0}")]
+    RevisionConflict(String),
+    #[error("state revision counter exhausted")]
+    RevisionExhausted,
+    #[error("feedback delivery ID must not be empty")]
+    EmptyFeedbackDeliveryId,
     #[error("feedback delivery {0} is already committed")]
     DuplicateFeedback(String),
     #[error("feedback delivery ledger reached its limit of {0}")]
@@ -365,43 +554,48 @@ pub enum StateStoreError {
 
 #[cfg(test)]
 mod tests {
-    use pie_plex::Operation;
-    use serde_json::json;
-
     use super::*;
 
     #[test]
-    fn continuation_preserves_scopes_and_updates_host_facts() {
-        let store = PolicyStateStore::new(json!({"config": {"weight": 2}})).unwrap();
-        let mut request = store
+    fn continuation_preserves_mutable_state_and_updates_host_facts() {
+        let backend = InMemoryPolicyStateBackend::default();
+        backend
             .create_request(
-                "L",
+                "L".into(),
                 json!({"prompt": "first"}),
                 json!({"keep": 1, "replace": 1}),
             )
             .unwrap();
-        request["scratch"]["served"] = json!(8);
-        request["fields"]["custom"] = json!("preserved");
-        store
-            .commit_policy_mutation(
-                &json!({
-                    "global": store.read_global(),
-                    "requests": {"L": store.read_request("L").unwrap()}
-                }),
-                &json!({
-                    "global": store.read_global(),
-                    "requests": {"L": request}
-                }),
+        let snapshot = backend.load(&BTreeSet::from(["L".into()])).unwrap();
+        backend
+            .commit(
+                &snapshot,
+                &StateUpdates {
+                    shared: Some(json!({"tenant": {"served": 8}})),
+                    requests: BTreeMap::from([(
+                        "L".into(),
+                        RequestStateUpdate {
+                            fields: json!({
+                                "body": {"prompt": "first"},
+                                "metadata": {"keep": 1, "replace": 1},
+                                "custom": "preserved"
+                            }),
+                            scratch: json!({"served": 8}),
+                        },
+                    )]),
+                },
                 None,
                 &[],
             )
             .unwrap();
-        store.record_enacted_placement("L", "node-a").unwrap();
-        store
+        backend
+            .record_enacted_placement("L", "node-a".into())
+            .unwrap();
+        backend
             .merge_request_facts("L", json!({"current_target": "node-a"}))
             .unwrap();
 
-        let continuation = store
+        let continuation = backend
             .continue_request(
                 "L",
                 json!({"prompt": "second"}),
@@ -417,41 +611,69 @@ mod tests {
         );
         assert_eq!(continuation["fields"]["custom"], "preserved");
         assert_eq!(continuation["scratch"]["served"], 8);
+        assert_eq!(
+            backend.read_shared().unwrap(),
+            json!({"tenant": {"served": 8}})
+        );
     }
 
     #[test]
-    fn hydration_exposes_each_referenced_request_once() {
-        let store = PolicyStateStore::default();
-        store.create_request("L", json!({}), json!({})).unwrap();
-        let input = store
-            .hydrate(
-                Operation::Feedback,
-                json!({
-                    "delivery_id": "d",
-                    "records": [
-                        {"event": "progress", "request_id": "L", "facts": {}},
-                        {"event": "tool-boundary", "request_id": "L", "facts": {}}
-                    ],
-                    "context": {"capabilities": {}}
-                }),
+    fn stale_snapshot_commits_neither_state_nor_feedback() {
+        let backend = InMemoryPolicyStateBackend::default();
+        backend
+            .create_request("L".into(), json!({}), json!({}))
+            .unwrap();
+        let snapshot = backend.load(&BTreeSet::from(["L".into()])).unwrap();
+        backend.replace_shared(json!({"revision": 1})).unwrap();
+
+        let feedback = FeedbackCommit {
+            delivery_id: "d".into(),
+            result: json!({}),
+            maximum_deliveries: 8,
+        };
+        assert!(matches!(
+            backend.commit(
+                &snapshot,
+                &StateUpdates {
+                    shared: Some(json!({"lost": true})),
+                    requests: BTreeMap::new()
+                },
+                Some(&feedback),
+                &[]
+            ),
+            Err(StateBackendError::RevisionConflict(_))
+        ));
+        assert_eq!(backend.read_shared().unwrap(), json!({"revision": 1}));
+        assert_eq!(backend.feedback_result("d").unwrap(), None);
+    }
+
+    #[test]
+    fn feedback_dedup_and_terminal_removal_are_atomic() {
+        let backend = InMemoryPolicyStateBackend::default();
+        backend
+            .create_request("L".into(), json!({}), json!({}))
+            .unwrap();
+        let snapshot = backend.load(&BTreeSet::from(["L".into()])).unwrap();
+        let feedback = FeedbackCommit {
+            delivery_id: "d".into(),
+            result: json!({"ok": true}),
+            maximum_deliveries: 8,
+        };
+        backend
+            .commit(
+                &snapshot,
+                &StateUpdates::default(),
+                Some(&feedback),
+                &["L".into()],
             )
             .unwrap();
-        assert_eq!(input["requests"].as_object().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn host_reset_and_fact_ownership_are_explicit() {
-        let store = PolicyStateStore::default();
-        store.create_request("L", json!({}), json!({})).unwrap();
+        assert_eq!(
+            backend.feedback_result("d").unwrap(),
+            Some(json!({"ok": true}))
+        );
         assert!(matches!(
-            store.merge_request_facts("L", json!({"generation_id": 9})),
-            Err(StateStoreError::HostIdentityMutation("generation_id"))
+            backend.read_request("L"),
+            Err(StateBackendError::NotFound(_))
         ));
-        store.merge_global_facts(json!({"model": "m"})).unwrap();
-        assert_eq!(store.read_global()["facts"]["model"], "m");
-        store.reset_global();
-        assert_eq!(store.read_global()["fields"], json!({}));
-        assert_eq!(store.read_global()["scratch"], json!({}));
-        assert_eq!(store.read_global()["facts"]["model"], "m");
     }
 }

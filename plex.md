@@ -1,26 +1,48 @@
-# PLEX JSON State-Map PoC
+# PLEX v0.5 Engine API and Explicit Policy Transactions
 
 ## Status
 
-PLEX is an intentionally untyped policy research subsystem with a breaking
-`pie:plex@0.3.0` ABI. It validates:
+PLEX is an intentionally untyped serving-policy research subsystem. The
+implemented stack is:
 
-- five serving-policy operations;
-- `route -> admit -> schedule` for every generation;
-- one process-local global map;
-- one process-local map per logical request;
-- explicit host/policy ownership within those maps;
-- atomic JSON mutation and native fallback;
+```text
+PIE / vLLM adapter / SGLang adapter
+        |
+        | pie.plex.engine@1 JSON event -> outcome
+        v
+PlexRuntime + PolicyStateBackend
+        |
+        | pie:plex@0.5.0 explicit invocation/output
+        v
+Wasm policy
+        |
+        | query() / staged action()
+        v
+PLEX host
+```
+
+The implementation includes:
+
+- one strict engine-facing JSON operation in Rust and Python;
+- five explicit policy hooks;
+- mutable shared and request state;
+- explicit state snapshots and updates in WIT;
+- immediate read-only engine queries;
+- staged actions returned to the underlying engine;
+- normalized route, admit, schedule, evict, and feedback decisions;
+- revisioned compare-and-swap state commits;
 - feedback idempotency;
-- deterministic score and token-budget mechanics; and
-- bounded, replaceable Wasm policy execution.
+- bounded, replaceable Wasm execution;
+- a standalone PyO3/Maturin Python package; and
+- mock PIE, vLLM, and SGLang conformance paths.
 
-PLEX remains isolated from live Pie gateway, worker, scheduler, KV-reclaim,
-and inferlet mechanics. Adapters for those systems are future work.
+PLEX does not yet include etcd or version-pinned live vLLM/SGLang integration.
+The Python adapters are thin engine-neutral compatibility templates tested with
+mock schedulers.
 
-## Design Boundary
+## Stable Policy Waist
 
-The five operations are:
+The policy hooks remain:
 
 ```text
 route
@@ -30,94 +52,279 @@ evict
 feedback
 ```
 
-All five use one mutable JSON object. The ABI has no WIT records, schemas,
-handles, typed maps, host calls, or imported capabilities.
+Every generation follows:
 
-The persistent state model has two scopes:
+```text
+route -> admit -> schedule
+```
 
-1. one global map shared by all active operation owners in a `LifecycleHost`;
-2. one request map for each logical request.
+This applies to an initial generation, a tool continuation, a later generation,
+and a stage transition that performs a new placement/admission decision.
 
-Operation-specific candidates, facts, capacity, records, and causes are
-transient host-owned context.
+The engine integration API is deliberately different: it has one operation,
+`PlexRuntime::invoke`, and carries the hook name as data.
 
 ## Trust Model
 
-Operator-installed policy code is trusted to inspect request contents and to
-write policy-owned namespaces. Wasm provides:
+Operator-installed policy code is trusted to inspect and rewrite complete
+request fields, including prompts, messages, sampling parameters, tools,
+output constraints, and user metadata.
+
+Wasm provides:
 
 - a portable ABI;
 - memory isolation;
 - bounded execution;
 - trap containment; and
-- package replacement.
+- atomic package replacement.
 
-Wasm is not an authorization boundary between a policy and request data.
-Namespace ownership is nevertheless validated to catch policy bugs and protect
-host observations.
+Wasm is not an authorization boundary between a policy and request contents.
+Host-owned request facts remain immutable so policy bugs cannot forge identity
+or enacted observations.
 
-## Persistent Map Shape
+## Engine-Facing API
 
-Both persistent scopes contain exactly three object-valued namespaces:
+### Rust
 
-```json
-{
-  "facts": {},
-  "fields": {},
-  "scratch": {}
+```rust
+pub struct PlexRuntime {
+    // Registry, backend, query handler, supported actions, and invocation gate.
+}
+
+impl PlexRuntime {
+    pub fn invoke(
+        &self,
+        event: serde_json::Value,
+    ) -> Result<serde_json::Value, PlexError>;
+
+    pub fn invoke_json(
+        &self,
+        event_json: &str,
+    ) -> Result<String, PlexError>;
 }
 ```
 
-Values below those namespaces are arbitrary JSON.
+`invoke()` is canonical. `invoke_json()` parses, calls the same implementation,
+and serializes its result.
 
-### Ownership
+Engines do not implement WIT, manipulate backend revisions, or call component
+exports directly.
 
-| Namespace | Writer | Meaning |
-|---|---|---|
-| `facts` | Host only | Configuration, identity, and enacted observations |
-| `fields` | Policy | Values an adapter or engine may interpret |
-| `scratch` | Policy | State persisted by the host but opaque to the engine |
-
-Policies may change `fields` and `scratch`. Any attempted mutation of `facts`
-invalidates the whole response and triggers fallback.
-
-## Global Map
-
-There is one global map per `LifecycleHost`:
+### Event envelope
 
 ```json
 {
+  "api_version": "pie.plex.engine@1",
+  "hook": "schedule",
+  "context": {
+    "runnable": [],
+    "capacity": {},
+    "context": {}
+  },
+  "request_events": []
+}
+```
+
+The top-level key set is exact:
+
+- `api_version`: exactly `pie.plex.engine@1`;
+- `hook`: `route`, `admit`, `schedule`, `evict`, or `feedback`;
+- `context`: hook-specific transient context;
+- `request_events`: authoritative lifecycle updates.
+
+Unknown keys, versions, hooks, or malformed event shapes are API errors. They
+are not fallback-shaped outcomes.
+
+PLEX inserts a default cause when a non-feedback context omits one and
+advertises the runtime's supported action methods through
+`context.capabilities.actions`.
+
+## Request Lifecycle Events
+
+The unified API carries infrequent state-boundary events.
+
+### Create
+
+```json
+{
+  "op": "create",
+  "request_id": "L",
   "facts": {
-    "config": {},
-    "model": "example-model",
-    "replica_count": 4
+    "generation_id": 0
   },
   "fields": {
-    "scheduler": {}
-  },
-  "scratch": {
-    "acme.routing": {},
-    "acme.scheduler": {}
+    "body": {},
+    "metadata": {}
   }
 }
 ```
 
-Semantics:
+### Continue
 
-- all active PLEX packages in the host share the same map;
-- state survives invocations, request completion, and package replacement;
-- `facts` may change through explicit host methods;
-- `fields` may carry engine-interpreted policy output;
-- `scratch` is arbitrary cross-request policy state;
-- `reset_global` clears `fields` and `scratch` but preserves facts;
-- process restart clears the entire in-memory store.
+```json
+{
+  "op": "continue",
+  "request_id": "L",
+  "facts": {
+    "generation_id": 1
+  },
+  "fields": {
+    "body": {},
+    "metadata": {}
+  }
+}
+```
 
-There is no per-package isolation. Independently authored policies must
-namespace shared keys by convention.
+### Merge facts
 
-## Request Maps
+```json
+{
+  "op": "merge-facts",
+  "request_id": "L",
+  "facts": {
+    "attained_service": 128,
+    "previous_target": "node-a"
+  }
+}
+```
 
-Each logical request has:
+### Finish
+
+```json
+{
+  "op": "finish",
+  "request_id": "L"
+}
+```
+
+Rules:
+
+- all event shapes and their simulated request generations validate before
+  mutation;
+- create, continue, and fact updates apply before policy state is loaded;
+- authoritative observations remain even if the policy later falls back;
+- finish is valid only with feedback and only for a request referenced by it;
+- successful feedback commits mutation, deduplication, and removal atomically;
+- unavailable or fallback feedback still removes finished requests;
+- `previous_target` changes only after engine-confirmed placement.
+
+The in-memory backend applies validated pre-hook events sequentially. A future
+distributed backend may provide a batch transaction for backend-failure
+atomicity.
+
+## Engine Outcomes
+
+### Success
+
+```json
+{
+  "status": "success",
+  "decision": {},
+  "request_fields": {
+    "L": {}
+  },
+  "actions": [
+    {
+      "id": 0,
+      "method": "pie.kv.prefetch@1",
+      "args": {
+        "request_id": "L",
+        "target": "node-a"
+      }
+    }
+  ]
+}
+```
+
+- `decision` is normalized and engine-actionable;
+- `request_fields` contains complete fields only when fields actually changed;
+- shared and request scratch never leak to the engine;
+- actions preserve policy call order;
+- action IDs start at zero for each invocation;
+- actions appear only after result validation and state commit.
+
+The underlying engine applies request fields, enacts actions, and reports
+enacted outcomes through feedback. PLEX has no engine-side action callback.
+
+### Normalized decisions
+
+```text
+route
+  -> {"order": [candidate indexes]}
+
+admit
+  -> {"decision": "accept" | "defer" | "reject"}
+
+schedule
+  -> {"selected": [{"candidate_index": ..., "token_budget": ...}]}
+
+evict
+  -> {"selected": [{"candidate_index": ..., "size_bytes": ...}]}
+
+feedback
+  -> {}
+```
+
+Stable tie-breaking, token-capacity fill, and eviction fill happen exactly once
+inside PLEX. Engine adapters do not reimplement them.
+
+### Unavailable
+
+```json
+{"status": "unavailable"}
+```
+
+The engine uses its native policy.
+
+### Fallback
+
+```json
+{
+  "status": "fallback",
+  "failure": {
+    "kind": "invalid-output",
+    "message": "..."
+  }
+}
+```
+
+No policy state update, request-field update, or action is exposed.
+
+Invalid engine events, backend failures, invalid packages, and runtime
+construction failures are `PlexError` API errors.
+
+## Persistent State
+
+```text
+State
+├── shared
+└── requests
+    └── <logical-request-id>
+        ├── facts
+        ├── fields
+        └── scratch
+```
+
+### Shared scratch
+
+`State.shared` is one mutable JSON dictionary shared by all active operation
+owners using a backend:
+
+```json
+{
+  "tenant_service": {
+    "acme": 120
+  },
+  "learned_statistics": {
+    "decode_tokens_p50": 18
+  }
+}
+```
+
+There are no shared facts or fields. Shared observations belong in hook context
+or `query()`. Engine effects are staged through `action()`.
+
+### Request state
 
 ```json
 {
@@ -136,60 +343,42 @@ Each logical request has:
     }
   },
   "scratch": {
-    "route_count": 2,
-    "predicted_tokens": 64
+    "predicted_tokens": 64,
+    "admission_count": 2
   }
 }
 ```
 
-`facts.logical_request_id` must match the key in the invocation's `requests`
-object. `facts.generation_id` is host-owned.
+| Namespace | Writer | Meaning |
+|---|---|---|
+| `facts` | Engine/host | Identity and enacted observations |
+| `fields` | Policy | Canonical request data interpreted by the engine |
+| `scratch` | Policy | Request-local policy state opaque to the engine |
 
-`fields.body` is the mutable engine request. `fields.metadata` contains
-arbitrary user/application metadata and is also policy-mutable. `scratch`
-holds request-local policy state.
+Facts are immutable in the author-facing SDK and cannot appear in a returned
+state update. Fields and scratch must remain JSON objects.
 
-The host creates and removes request maps. A policy cannot create, delete, or
-rename them.
+## Working Sets
 
-## Uniform Invocation Envelope
+The host derives request IDs from validated hook context and loads only those
+requests.
 
-Every actual Wasm invocation receives:
+- route/admit load one request;
+- schedule loads each unique runnable request;
+- duplicate runnable entries share one mutable request object;
+- evict loads only non-null attributed requests;
+- feedback records with one ID share one mutable object;
+- unreferenced live requests are invisible;
+- missing state is a backend API error through `PlexRuntime`.
 
-```json
-{
-  "global": {
-    "facts": {},
-    "fields": {},
-    "scratch": {}
-  },
-  "requests": {
-    "L": {
-      "facts": {},
-      "fields": {},
-      "scratch": {}
-    }
-  },
-  "... operation-specific context ...": {}
-}
-```
+Schedule remains set-dependent: one invocation sees the complete feasible
+runnable set for one scheduling opportunity.
 
-`requests` contains each referenced request exactly once. Transient objects
-refer to a request with `request_id`.
+## Hook Contexts
 
-Callers of `LifecycleHost` provide only transient context and request IDs.
-`PolicyStateStore` hydrates canonical global/request maps before invoking Wasm.
-Caller-supplied `global` or `requests` state is rejected.
+Hook contexts retain the v0.4 JSON conventions.
 
-Extra canonical request maps that are not referenced are not exposed.
-Duplicate references share one object rather than receiving duplicated copies.
-
-## Operation Contracts
-
-These contracts are JSON conventions validated by the host, not typed WIT
-schemas.
-
-### `route`
+### Route
 
 ```json
 {
@@ -211,21 +400,9 @@ schemas.
 }
 ```
 
-Result:
+Return one finite score per candidate. Higher ranks first; ties are stable.
 
-```json
-{"scores": [790.0]}
-```
-
-Rules:
-
-- return exactly one finite score per candidate;
-- higher scores rank first;
-- ties retain input order;
-- candidate count, order, identity, and facts are read-only;
-- the referenced request and global map may mutate in writable namespaces.
-
-### `admit`
+### Admit
 
 ```json
 {
@@ -244,17 +421,9 @@ Rules:
 }
 ```
 
-Result:
+Return `accept`, `defer`, or `reject`.
 
-```json
-{"decision": "accept"}
-```
-
-`decision` is `accept`, `defer`, or `reject`. The target and all transient
-context are read-only. Writable global/request mutations commit even for a
-valid defer or reject decision.
-
-### `schedule`
+### Schedule
 
 ```json
 {
@@ -281,442 +450,387 @@ valid defer or reject decision.
 }
 ```
 
-Result:
+Return one aligned finite score and optional token budget per runnable entry.
+Explicit budgets require capability and may not exceed candidate/host bounds.
 
-```json
-{
-  "decisions": [
-    {
-      "score": 10.0,
-      "token_budget": 8
-    }
-  ]
-}
-```
+### Evict
 
-Rules:
+Resident units carry an ID, size, facts, and nullable request ID. Return one
+finite retention score per unit. Lower scores reclaim first with stable ties
+until the requested byte deficit is met.
 
-- return one decision per runnable entry;
-- scores are finite, descending, and stably ordered;
-- missing or null budget requests the candidate/host maximum;
-- zero budget requests no service;
-- explicit budgets require `token_budget` capability;
-- budgets may not exceed candidate or host bounds;
-- stable greedy fill enforces selected-count and total-token capacity.
+### Feedback
 
-The same request ID may occur more than once. It remains one shared request map
-while operation decisions stay aligned with runnable entries.
+Feedback carries a delivery ID and open-string event records describing enacted
+outcomes. Duplicate deliveries skip Wasm, state updates, and actions.
 
-### `evict`
+## Continuations and Placement
 
-```json
-{
-  "cause": "allocation-deficit",
-  "bytes_needed": 4096,
-  "resident": [
-    {
-      "id": "unit-1",
-      "request_id": "L",
-      "size_bytes": 4096,
-      "facts": {
-        "reload_cost": 200.0
-      }
-    },
-    {
-      "id": "shared-unit",
-      "request_id": null,
-      "size_bytes": 4096,
-      "facts": {}
-    }
-  ],
-  "context": {
-    "capabilities": {}
-  }
-}
-```
+Continuation creation:
 
-Result:
+1. preserves request scratch;
+2. preserves fields except body/metadata handling;
+3. replaces body;
+4. shallow-merges metadata;
+5. increments generation;
+6. preserves durable facts;
+7. clears generation-local `current_target`.
 
-```json
-{"scores": [200.0, 100.0]}
-```
+Route/admit proposals do not change `previous_target`. Engines merge that fact
+only after placement is enacted.
 
-Scores are retention scores. Lower scores are reclaimed first with stable ties
-until `bytes_needed` is met. `request_id: null` represents unattributed or
-shared host state. Shared-unit multi-owner mutation is not implemented.
-
-### `feedback`
-
-```json
-{
-  "delivery_id": "delivery-1",
-  "records": [
-    {
-      "event": "progress",
-      "request_id": "L",
-      "facts": {
-        "committed_tokens": 8,
-        "service_us": 1250
-      }
-    },
-    {
-      "event": "tool-boundary",
-      "request_id": "L",
-      "facts": {
-        "tool_name": "search"
-      }
-    }
-  ],
-  "context": {
-    "capabilities": {}
-  }
-}
-```
-
-Result:
-
-```json
-{}
-```
-
-Event names are open strings. Records describe enacted outcomes. Multiple
-records referencing `L` mutate the same `requests["L"]` object, so both updates
-survive without last-write-wins loss.
-
-## Per-Generation Lifecycle
-
-Every initial generation, tool continuation, later generation, and
-placement-changing stage transition follows:
-
-```text
-route -> admit -> schedule
-```
-
-Routing produces a stable descending target order. Admission then runs against
-the preferred target:
-
-- `accept`: enqueue;
-- `reject`: try the next ranked target;
-- `defer`: retry the same target up to the configured bound.
-
-A tool boundary is:
-
-```text
-feedback(tool-boundary)
--> external tool execution
--> create continuation
--> route
--> admit
--> schedule
-```
-
-The PoC does not implement a distributed retry protocol.
-
-## Continuations
-
-Creating a continuation:
-
-1. preserves request `scratch`;
-2. preserves request `fields` except for body/metadata handling;
-3. replaces `fields.body`;
-4. shallow-merges new metadata into `fields.metadata`;
-5. preserves durable host facts;
-6. increments `facts.generation_id`;
-7. clears generation-local facts.
-
-The new metadata value wins on duplicate keys.
-
-The implemented generation-local fact list currently contains only:
-
-```text
-current_target
-```
-
-`previous_target` is durable and survives continuations.
-
-## Enacted Placement
-
-Routing and admission decisions are proposals, not observations. Neither a
-route score nor `admit: accept` changes `previous_target`.
-
-After an adapter confirms placement, it calls:
-
-```text
-record_enacted_placement(logical_request_id, target_id)
-```
-
-This sets host-owned `facts.previous_target`. Continuation routing may combine
-that history with current candidate cache facts. The reference route retains
-locality only when the historical target still reports useful request KV.
-
-## Host Fact API
-
-`PolicyStateStore` and serialized `LifecycleHost` wrappers provide:
-
-```text
-replace_global_facts(facts)
-merge_global_facts(facts)
-merge_request_facts(logical_request_id, facts)
-record_enacted_placement(logical_request_id, target_id)
-```
-
-Request identity facts cannot be changed through generic fact merge. Host fact
-updates describe reality and are never rolled back by a later policy failure.
-
-## State Transaction
-
-`LifecycleHost` has one stateful-invocation mutex shared by all clones. The
-critical section is:
-
-```text
-hydrate canonical global/request state
--> invoke Wasm
--> validate the full response
--> atomically commit global/request fields and scratch
-```
-
-This deliberately serializes stateful policy invocations. It avoids revisions,
-compare-and-swap loops, and distributed transactions in the PoC.
-
-`route -> admit` holds the same gate across the sequence while committing each
-valid hook before the next hook runs.
-
-`PolicyStateStore` publishes mutations by cloning its complete in-memory state,
-updating writable namespaces, and replacing the canonical state under one
-mutex. Global and all referenced request changes therefore commit together.
-
-Scalable concurrent state transactions are deferred.
-
-## Mutation Validation
-
-A valid policy response must preserve:
-
-- the exact top-level input key set;
-- the global scope and request-map scope shapes;
-- `global.facts`;
-- every request's `facts`;
-- the exact request-map key set;
-- operation cause;
-- candidates, targets, resident units, and runnable entries;
-- candidate/event facts;
-- capacity and budgets;
-- feedback delivery ID and record order;
-- capabilities and all other transient context.
-
-The host does not silently restore attempted read-only mutations. Any mismatch
-rejects the complete response and requests native fallback.
-
-Only `global.fields`, `global.scratch`, and each referenced request's `fields`
-and `scratch` may change.
-
-## Failure and Rollback
-
-Invocation outcomes are:
-
-```text
-Success
-Unavailable
-FallbackRequired
-```
-
-Fallback classes include invalid input, instantiation failure, explicit policy
-fallback, trap, fuel exhaustion, deadline, host saturation, and invalid output.
-
-For any failure:
-
-- no global policy mutation commits;
-- no request policy mutation commits;
-- feedback delivery is not marked committed;
-- the caller uses native/default behavior.
-
-There is no patch log or general rollback protocol. Atomicity comes from
-keeping canonical state untouched until the complete cloned JSON response has
-validated.
-
-## Feedback Deduplication
-
-Deduplication belongs to `PolicyStateStore`, not a package instance.
-
-For a new delivery:
-
-1. hydrate canonical state;
-2. invoke and validate feedback;
-3. atomically commit fields/scratch and the delivery ID;
-4. cache the operation result.
-
-For a duplicate:
-
-- Wasm is not invoked;
-- no mutation is applied;
-- the cached result is returned.
-
-The ledger is bounded, process-local, and survives package replacement because
-it is part of the host state store. A failed state commit does not reserve or
-commit the delivery ID. Deduplication is not crash durable.
-
-## Wasm ABI
-
-The complete WIT is:
+## WIT v0.5
 
 ```wit
-package pie:plex@0.3.0;
+package pie:plex@0.5.0;
 
 interface policy {
-    route: func(input-json: string) -> result<string, string>;
-    admit: func(input-json: string) -> result<string, string>;
-    schedule: func(input-json: string) -> result<string, string>;
-    evict: func(input-json: string) -> result<string, string>;
-    feedback: func(input-json: string) -> result<string, string>;
+    record invocation {
+        context-json: string,
+        state-json: string,
+    }
+
+    record policy-output {
+        result-json: string,
+        state-update-json: string,
+    }
+
+    route: func(input: invocation)
+        -> result<policy-output, string>;
+    admit: func(input: invocation)
+        -> result<policy-output, string>;
+    schedule: func(input: invocation)
+        -> result<policy-output, string>;
+    evict: func(input: invocation)
+        -> result<policy-output, string>;
+    feedback: func(input: invocation)
+        -> result<policy-output, string>;
+}
+
+interface host {
+    type action-id = u64;
+
+    query: func(method: string, args-json: string)
+        -> result<string, string>;
+    action: func(method: string, args-json: string)
+        -> result<action-id, string>;
 }
 
 world plex-policy {
+    import host;
     export policy;
 }
 ```
 
-Components import nothing and export only `pie:plex/policy@0.3.0`.
+Every fixture imports exactly `pie:plex/host@0.5.0`, exports exactly
+`pie:plex/policy@0.5.0`, and imports no state interface, WASI, or other
+capability.
 
-The manifest contains only:
+### Explicit state input
 
-- contract version;
-- package name and version;
-- owned operations;
-- memory limit;
-- fuel limit;
-- deadline;
-- input byte limit;
-- output byte limit.
-
-Unknown fields and older contracts are rejected.
-
-## Guest SDK
-
-The Rust SDK remains:
-
-```rust
-pub type Document = serde_json::Value;
-
-pub trait Policy {
-    fn route(input: &mut Document) -> Result<Document, String>;
-    fn admit(input: &mut Document) -> Result<Document, String>;
-    fn schedule(input: &mut Document) -> Result<Document, String>;
-    fn evict(input: &mut Document) -> Result<Document, String>;
-    fn feedback(input: &mut Document) -> Result<Document, String>;
-}
-```
-
-Every hook defaults to `fallback-required`.
-
-`export_policy!` parses object JSON, invokes the mutable hook, and returns:
+`invocation.state-json` is:
 
 ```json
 {
-  "input": {},
-  "result": {}
+  "shared": {},
+  "requests": {
+    "L": {
+      "facts": {},
+      "fields": {},
+      "scratch": {}
+    }
+  }
 }
 ```
 
-Returning the full input is intentionally inefficient. It keeps mutation
-obvious and avoids patches, diffs, generated accessors, and typed models.
+Backend revisions never cross WIT.
 
-## Package and Runtime
+### Explicit state output
 
-The package envelope has:
+`policy-output.state-update-json` is:
 
-- magic and format version;
-- bounded manifest/component lengths;
-- BLAKE3 integrity digest;
-- manifest bytes;
-- component bytes.
+```json
+{
+  "shared": {},
+  "requests": {
+    "L": {
+      "fields": {},
+      "scratch": {}
+    }
+  }
+}
+```
 
-Attachment validates the manifest and host limits, compiles the component,
-rejects every import and unexpected export, prelinks it, probes bounded
-instantiation, and only then publishes.
+`{}` means no change. Unchanged scopes are omitted. Facts, unknown request IDs,
+and unknown namespaces are rejected. Changed fields/scratch are returned in
+full; JSON Patch is deferred.
 
-The immutable attachment registry retains one owner per operation. Replacement
-prepares first, waits for old snapshots to drain, and atomically publishes a
-new generation. Persistent state does not move between package objects because
-it already belongs to `LifecycleHost`.
+There is no ambient state import or load/stage call-order protocol.
 
-Each call receives a fresh Wasmtime store and component instance. Runtime
-protection includes:
+## Rust Guest SDK
 
-- no WASI or PLEX imports;
+```rust
+pub type Document = serde_json::Value;
+pub type Result<T> = std::result::Result<T, String>;
+pub type ActionId = u64;
+
+pub struct State {
+    pub shared: Document,
+    // request map is private
+}
+
+pub struct Request {
+    // facts is private
+    pub fields: Document,
+    pub scratch: Document,
+}
+```
+
+The five trait methods receive:
+
+```rust
+fn schedule(
+    ctx: &Document,
+    state: &mut State,
+    host: &Host,
+) -> Result<Document>;
+```
+
+Glue parses explicit context/state, clones initial mutable state, invokes the
+policy, validates facts and membership, computes a minimal update, and returns
+`PolicyOutput`.
+
+### Direct query helpers
+
+```rust
+host.kv_lookup(request_id, target)?;
+host.cluster_capacity(model)?;
+host.model_config()?;
+host.now_ms()?;
+```
+
+### Direct action helpers
+
+```rust
+host.prefetch_kv(request_id, target)?;
+host.preempt(request_id)?;
+host.replicate(request_id, targets)?;
+host.set_retention(request_id, ttl_ms)?;
+host.arm_timer(request_id, delay_ms)?;
+```
+
+### Raw extensions
+
+```rust
+host.query_raw("engine.custom-query@1", &args)?;
+host.action_raw("engine.custom-action@1", &args)?;
+```
+
+Direct methods are SDK sugar over versioned raw methods. Adding sugar or a new
+method name does not change WIT.
+
+## Query Handling
+
+The only engine callback is:
+
+```rust
+pub trait QueryHandler: Send + Sync {
+    fn query(
+        &self,
+        method: &str,
+        args: &Document,
+    ) -> Result<Document, QueryError>;
+}
+```
+
+Queries are synchronous, bounded, and side-effect-free. Unsupported methods
+return a policy-visible error. A policy may handle that error or propagate it
+as fallback.
+
+Candidate-scale queue, waiting, capacity, and cache snapshots remain bulk hook
+facts; normal paths do not query once per candidate.
+
+## Action Staging
+
+`host.action()`:
+
+1. checks a non-empty numeric-versioned method name;
+2. checks runtime support registration;
+3. parses object-valued JSON arguments;
+4. enforces call/byte limits;
+5. assigns an invocation-local monotonic ID;
+6. appends a descriptor.
+
+Invalid policy result/update or state conflict discards every descriptor.
+Successful commit returns descriptors to the engine. PLEX never enacts them.
+
+Outcome-dependent policy state changes occur from feedback, not optimistically
+when staging an action.
+
+## Backend Transaction
+
+`PlexRuntime` uses `Arc<dyn PolicyStateBackend>`. The implemented in-memory
+backend stores shared state, request state, revisions, and feedback delivery
+results.
+
+```text
+validate engine event
+-> validate/preflight request events
+-> apply authoritative pre-hook events
+-> derive working set
+-> load state + revisions
+-> invoke Wasm with explicit context/state
+-> validate result and update
+-> backend CAS commit
+-> normalize decision
+-> return changed fields and actions
+```
+
+State conflict returns fallback with no engine-visible mutation or action.
+Other backend failures are API errors.
+
+Multiple runtimes may share a backend. The current backend is process-local. A
+future etcd mapping can use:
+
+```text
+/plex/shared
+/plex/requests/<logical-request-id>
+/plex/feedback/<delivery-id>
+```
+
+Wasm must continue receiving a preloaded state snapshot; it must not perform
+an etcd call itself.
+
+## Python Binding
+
+The standalone package is:
+
+```text
+sdk/python-plex/
+├── Cargo.toml
+├── pyproject.toml
+├── src/lib.rs
+├── python/pie_plex/
+└── tests/
+```
+
+Distribution/module names:
+
+```text
+distribution: pie-plex
+package: pie_plex
+native module: pie_plex._native
+```
+
+Usage:
+
+```python
+from pie_plex import Runtime
+
+runtime = Runtime(
+    policy="policy.plexpkg",
+    query=engine_query,
+    actions=[
+        "pie.kv.prefetch@1",
+        "pie.schedule.preempt@1",
+    ],
+)
+
+outcome = runtime.invoke(event)
+```
+
+The native seam is:
+
+```text
+NativeRuntime.invoke_json(event_json: str) -> str
+```
+
+The Python facade uses `json.dumps`/`json.loads`, so Rust and Python share one
+contract and no second recursive domain conversion.
+
+The query callback is stored as `Py<PyAny>`. Wasmtime execution detaches from
+the GIL; query calls attach only while invoking Python. Exceptions and
+non-JSON results become policy-visible query errors. Recursive invocation on
+the same runtime while a query is active is rejected. Independent runtimes may
+execute concurrently.
+
+Python exceptions are:
+
+```text
+PlexError
+├── InvalidEvent
+├── BackendError
+├── PolicyPackageError
+└── QueryCallbackError
+```
+
+Policy unavailable/fallback remains a dictionary outcome, not an exception.
+
+## Engine Adapters
+
+The Rust conformance harness runs identical traces through mock PIE, vLLM, and
+SGLang adapters.
+
+The Python package includes thin vLLM/SGLang scheduler templates that:
+
+1. snapshot runnable/capacity/context/request events;
+2. call `Runtime.invoke`;
+3. select native scheduling on non-success;
+4. apply normalized decisions and changed fields;
+5. enact returned actions in order.
+
+They import no vLLM or SGLang internals. Version-specific snapshot/apply code
+and version-pinned live integration remain separate work. No live support is
+claimed by this milestone.
+
+## Runtime Protections
+
+- exact one-import/one-export component validation;
+- no WASI;
+- fresh Wasmtime store and component instance per invocation;
 - disabled Wasm threads/shared memory;
-- memory limit;
-- fuel;
+- package integrity digest;
+- memory and fuel limits;
 - epoch deadline;
-- input/output limits;
-- bounded Wasmtime invocation slots;
-- bounded feedback ledger.
+- explicit context/state and result/update byte limits;
+- host-call count and byte limits;
+- bounded concurrent invocation slots;
+- bounded feedback ledger;
+- atomic package publication.
 
-## Replay
+## Replay and Fixtures
 
-The deterministic replay runner supports:
+Low-level deterministic replay retains attach/replace/detach, request lifecycle,
+state inspection, fact updates, placement recording, hook invocation, combined
+route/admit, and terminal feedback.
 
-- attach, replace, and detach;
-- create and continue request;
-- read global/request maps;
-- replace/merge global facts;
-- merge request facts;
-- record enacted placement;
-- invoke any operation from transient context;
-- combined route/admit placement;
-- terminal feedback and removal.
-
-Replay uses no realtime epoch ticker. Identical traces on fresh stores must
-produce identical reports.
-
-## Policy Fixtures
-
-Reference policies include:
-
-- continuation-aware least-loaded/locality route;
-- rewrite-and-admit;
-- host-observed least-attained-service schedule;
-- retention-score eviction;
-- feedback accounting;
-- coordinated five-operation policy.
-
-Failure fixtures cover:
-
-- unimplemented fallback;
-- malformed result;
-- NaN/infinity;
-- invalid token budget;
-- global/request fact mutation;
-- candidate identity/fact mutation;
-- feedback fact mutation;
-- request-map insertion;
-- mutate-then-fallback;
-- trap after mutation;
-- infinite loop.
+The fixture harness additionally covers the engine JSON API, Rust/JSON parity,
+strict event validation, normalized outcomes, scratch hiding, returned actions,
+request-event preflight, fallback cleanup, query/action helpers, raw extensions,
+state conflicts, feedback deduplication, and mock adapter conformance.
 
 Research stress policies remain for Agentix, Continuum, KVFlow, Preble, and
 Helium. Their physical engine mechanisms remain out of scope.
 
-## Process Lifetime and Deferred Work
+## Intentional Limitations
 
-Global maps, request maps, and feedback deduplication are in-memory and
-process-local. This milestone does not provide:
+This milestone does not provide:
 
-- typed schemas or generated models;
+- typed schemas for every context/fact/query/action;
+- generated request models;
 - field/map/event/capability handles;
-- host map imports;
-- columnar encoding;
-- patches or diffs;
-- distributed global/request state;
-- persistent disk state;
-- crash-durable deduplication;
-- scalable concurrent transactions;
-- per-package global isolation;
-- automatic fact derivation from arbitrary event JSON;
-- automatic rerouting after downstream mutation;
-- candidate-local indexes;
-- shared-unit multi-owner mutation;
-- `prefetch` or `rebalance`;
-- live serving-engine adapters.
+- JSON Patch;
+- actual etcd integration;
+- per-scheduler-step etcd round trips;
+- arbitrary live-request scanning from policy code;
+- candidate-local scheduling;
+- an engine-side action callback;
+- rollback after an engine enacts an action;
+- sidecar/RPC scheduler hops;
+- Python policy authoring;
+- live version-pinned vLLM/SGLang plugins;
+- automatic rerouting after field mutation;
+- shared-unit multi-owner mutation.
 
-Efficient encodings, schema validation, and distributed integration remain
-future work. `plex_paper.md` is unchanged; reconciling paper claims is a
+`plex_paper.md` remains unchanged. Paper reconciliation and measurements are a
 separate task.

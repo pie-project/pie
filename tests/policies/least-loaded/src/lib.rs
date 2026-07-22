@@ -1,23 +1,19 @@
 use plex::serde_json::json;
-use plex::{Document, Policy};
+use plex::{Document, Host, Policy, State};
 
 struct LeastLoaded;
 
 impl Policy for LeastLoaded {
-    fn route(input: &mut Document) -> Result<Document, String> {
-        input["global"]["scratch"]["route_owner_calls"] = json!(
-            input["global"]["scratch"]["route_owner_calls"]
-                .as_u64()
-                .unwrap_or(0)
-                + 1
-        );
-        let request_id = input["request_id"]
+    fn route(ctx: &Document, state: &mut State, _host: &Host) -> Result<Document, String> {
+        state.shared["route_owner_calls"] =
+            json!(state.shared["route_owner_calls"].as_u64().unwrap_or(0) + 1);
+        let request_id = ctx["request_id"]
             .as_str()
             .ok_or("request_id must be a string")?;
-        let previous_target = input["requests"][request_id]["facts"]["previous_target"]
+        let previous_target = state.request(request_id)?.facts()["previous_target"]
             .as_str()
             .map(str::to_owned);
-        let candidates = input["candidates"]
+        let candidates = ctx["candidates"]
             .as_array()
             .ok_or("candidates must be an array")?;
         let scores = candidates

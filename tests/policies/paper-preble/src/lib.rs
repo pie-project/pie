@@ -2,13 +2,13 @@
 //! https://arxiv.org/abs/2407.00023
 
 use plex::serde_json::json;
-use plex::{Document, Policy};
+use plex::{Document, Host, Policy, State};
 
 struct Preble;
 
 impl Policy for Preble {
-    fn route(input: &mut Document) -> Result<Document, String> {
-        let candidates = input["candidates"]
+    fn route(ctx: &Document, _state: &mut State, _host: &Host) -> Result<Document, String> {
+        let candidates = ctx["candidates"]
             .as_array()
             .ok_or("candidates must be an array")?;
         let remaining = candidates

@@ -1,16 +1,41 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use pie_plex::{Document, Manifest, Operation};
+use serde::{Deserialize, Serialize};
 use wasmtime::Store;
-use wasmtime::component::{Component, Linker};
+use wasmtime::component::{Component, HasSelf, Linker};
 
-use crate::bindings::exports::pie::plex::policy::Guest as PolicyGuest;
+use crate::bindings::exports::pie::plex::policy::{
+    Guest as PolicyGuest, Invocation as WitInvocation,
+};
 use crate::bindings::{PlexPolicy, PlexPolicyPre};
-use crate::context::InvocationContext;
+use crate::context::{InvocationContext, InvocationContextConfig};
 use crate::engine::{PolicyEngine, PolicyEngineConfig};
 use crate::error::{AttachmentError, Invocation, InvocationFailure, InvocationFailureKind};
+use crate::host::{QueryHandler, RejectingQueryHandler, StagedAction};
 use crate::package_format::{PackageLimits, PolicyPackage};
-use crate::protocol::{JsonResponse, parse_response, validate_input};
+use crate::protocol::{parse_result, parse_state_updates, validate_context};
+use crate::state_store::{StateSnapshot, StateUpdates};
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PreparedPolicyResult {
+    pub result: Document,
+    pub state_updates: StateUpdates,
+    pub actions: Vec<StagedAction>,
+    pub duplicate_feedback: bool,
+}
+
+impl PreparedPolicyResult {
+    pub(crate) fn duplicate_feedback(result: Document) -> Self {
+        Self {
+            result,
+            state_updates: StateUpdates::default(),
+            actions: Vec::new(),
+            duplicate_feedback: true,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct AttachedPolicy {
@@ -52,7 +77,12 @@ impl AttachedPolicy {
         let component = Component::new(engine.raw(), component_bytes)
             .map_err(|error| AttachmentError::Compile(error.to_string()))?;
         verify_component_surface(engine.raw(), &component)?;
-        let linker = Linker::<InvocationContext>::new(engine.raw());
+        let mut linker = Linker::<InvocationContext>::new(engine.raw());
+        PlexPolicy::add_to_linker::<InvocationContext, HasSelf<InvocationContext>>(
+            &mut linker,
+            |context| context,
+        )
+        .map_err(|error| AttachmentError::Link(error.to_string()))?;
         let instance_pre = linker
             .instantiate_pre(&component)
             .map_err(|error| AttachmentError::Link(error.to_string()))?;
@@ -72,96 +102,86 @@ impl AttachedPolicy {
         &self.inner.manifest
     }
 
-    pub fn route(&self, input: Document) -> Invocation<JsonResponse> {
-        self.invoke(Operation::Route, input, |policy, store, input| {
-            policy.call_route(store, input)
-        })
-    }
-
-    pub fn admit(&self, input: Document) -> Invocation<JsonResponse> {
-        self.invoke(Operation::Admit, input, |policy, store, input| {
-            policy.call_admit(store, input)
-        })
-    }
-
-    pub fn schedule(&self, input: Document) -> Invocation<JsonResponse> {
-        self.invoke(Operation::Schedule, input, |policy, store, input| {
-            policy.call_schedule(store, input)
-        })
-    }
-
-    pub fn evict(&self, input: Document) -> Invocation<JsonResponse> {
-        self.invoke(Operation::Evict, input, |policy, store, input| {
-            policy.call_evict(store, input)
-        })
-    }
-
-    pub fn feedback(&self, input: Document) -> Invocation<JsonResponse> {
-        self.invoke(Operation::Feedback, input, |policy, store, input| {
-            policy.call_feedback(store, input)
-        })
-    }
-
-    fn invoke<Call>(
+    pub(crate) fn invoke(
         &self,
         operation: Operation,
-        input: Document,
-        call: Call,
-    ) -> Invocation<JsonResponse>
-    where
-        Call: Fn(
-            &PolicyGuest,
-            &mut Store<InvocationContext>,
-            &str,
-        ) -> wasmtime::Result<Result<String, String>>,
-    {
+        context: Document,
+        state: StateSnapshot,
+        query_handler: Arc<dyn QueryHandler>,
+        supported_actions: Arc<BTreeSet<String>>,
+    ) -> Invocation<PreparedPolicyResult> {
         if !self.inner.manifest.operations.contains(&operation) {
             return Invocation::Unavailable;
         }
-        if let Err(error) = validate_input(operation, &input) {
-            return Invocation::FallbackRequired(InvocationFailure::new(
-                InvocationFailureKind::InvalidInput,
-                error.to_string(),
-            ));
-        }
-        self.invoke_owned(operation, input, call)
-    }
-
-    fn invoke_owned<Call>(
-        &self,
-        operation: Operation,
-        input: Document,
-        call: Call,
-    ) -> Invocation<JsonResponse>
-    where
-        Call: Fn(
-            &PolicyGuest,
-            &mut Store<InvocationContext>,
-            &str,
-        ) -> wasmtime::Result<Result<String, String>>,
-    {
-        let input_json = match serde_json::to_string(&input) {
-            Ok(input_json) => input_json,
+        let referenced = match validate_context(operation, &context) {
+            Ok(referenced) => referenced,
             Err(error) => {
                 return Invocation::FallbackRequired(InvocationFailure::new(
                     InvocationFailureKind::InvalidInput,
-                    format!("failed to serialize policy input: {error}"),
+                    error.to_string(),
                 ));
             }
         };
-        if input_json.len() as u64 > self.inner.manifest.limits.input_bytes {
+        let exposed = state.requests.keys().cloned().collect::<BTreeSet<_>>();
+        if referenced != exposed {
             return Invocation::FallbackRequired(InvocationFailure::new(
                 InvocationFailureKind::InvalidInput,
-                "policy input exceeds the package byte limit",
+                format!(
+                    "referenced request IDs {referenced:?} do not match prepared state {exposed:?}"
+                ),
             ));
         }
-        let (mut store, policy) = match self.instantiate() {
+        self.invoke_owned(operation, context, state, query_handler, supported_actions)
+    }
+
+    fn invoke_owned(
+        &self,
+        operation: Operation,
+        context: Document,
+        state: StateSnapshot,
+        query_handler: Arc<dyn QueryHandler>,
+        supported_actions: Arc<BTreeSet<String>>,
+    ) -> Invocation<PreparedPolicyResult> {
+        let context_json = match serde_json::to_string(&context) {
+            Ok(context_json) => context_json,
+            Err(error) => {
+                return Invocation::FallbackRequired(InvocationFailure::new(
+                    InvocationFailureKind::InvalidInput,
+                    format!("failed to serialize policy context: {error}"),
+                ));
+            }
+        };
+        let state_json = match serde_json::to_string(&state.document()) {
+            Ok(state_json) => state_json,
+            Err(error) => {
+                return Invocation::FallbackRequired(InvocationFailure::new(
+                    InvocationFailureKind::InvalidInput,
+                    format!("failed to serialize policy state: {error}"),
+                ));
+            }
+        };
+        if context_json.len().saturating_add(state_json.len()) as u64
+            > self.inner.manifest.limits.input_bytes
+        {
+            return Invocation::FallbackRequired(InvocationFailure::new(
+                InvocationFailureKind::InvalidInput,
+                "policy invocation exceeds the package byte limit",
+            ));
+        }
+        let (mut store, policy) = match self.instantiate(query_handler, supported_actions) {
             Ok(value) => value,
             Err(failure) => return Invocation::FallbackRequired(failure),
         };
-        let output = match call(policy.pie_plex_policy(), &mut store, &input_json) {
+        let input = WitInvocation {
+            context_json,
+            state_json,
+        };
+        let output = match call_operation(operation, policy.pie_plex_policy(), &mut store, &input) {
             Ok(Ok(output)) => output,
             Ok(Err(error)) => {
+                if let Some(failure) = store.data_mut().take_reported_failure(&error) {
+                    return Invocation::FallbackRequired(failure);
+                }
                 return Invocation::FallbackRequired(InvocationFailure::new(
                     InvocationFailureKind::PolicyFallback,
                     error,
@@ -174,14 +194,19 @@ impl AttachedPolicy {
                 ));
             }
         };
-        if output.len() as u64 > self.inner.manifest.limits.output_bytes {
+        if output
+            .result_json
+            .len()
+            .saturating_add(output.state_update_json.len()) as u64
+            > self.inner.manifest.limits.output_bytes
+        {
             return Invocation::FallbackRequired(InvocationFailure::new(
                 InvocationFailureKind::InvalidOutput,
                 "policy output exceeds the package byte limit",
             ));
         }
-        let response = match parse_response(&output, &input, operation) {
-            Ok(response) => response,
+        let result = match parse_result(&output.result_json) {
+            Ok(result) => result,
             Err(error) => {
                 return Invocation::FallbackRequired(InvocationFailure::new(
                     InvocationFailureKind::InvalidOutput,
@@ -189,16 +214,38 @@ impl AttachedPolicy {
                 ));
             }
         };
-        if let Err(error) = validate_result(operation, &response.input, &response.result) {
+        let state_updates = match parse_state_updates(&output.state_update_json, &state) {
+            Ok(updates) => updates,
+            Err(error) => {
+                return Invocation::FallbackRequired(InvocationFailure::new(
+                    InvocationFailureKind::InvalidOutput,
+                    error.to_string(),
+                ));
+            }
+        };
+        if let Err(error) = validate_result(operation, &context, &result) {
             return Invocation::FallbackRequired(InvocationFailure::new(
                 InvocationFailureKind::InvalidOutput,
                 error,
             ));
         }
-        Invocation::Success(response)
+        let actions = match store.data_mut().finish() {
+            Ok(actions) => actions,
+            Err(failure) => return Invocation::FallbackRequired(failure),
+        };
+        Invocation::Success(PreparedPolicyResult {
+            result,
+            state_updates,
+            actions,
+            duplicate_feedback: false,
+        })
     }
 
-    fn instantiate(&self) -> Result<(Store<InvocationContext>, PlexPolicy), InvocationFailure> {
+    fn instantiate(
+        &self,
+        query_handler: Arc<dyn QueryHandler>,
+        supported_actions: Arc<BTreeSet<String>>,
+    ) -> Result<(Store<InvocationContext>, PlexPolicy), InvocationFailure> {
         let permit = self.inner.engine.try_acquire().ok_or_else(|| {
             InvocationFailure::new(
                 InvocationFailureKind::HostSaturated,
@@ -207,7 +254,17 @@ impl AttachedPolicy {
         })?;
         let memory_bytes =
             usize::try_from(self.inner.manifest.limits.memory_bytes).unwrap_or(usize::MAX);
-        let mut store = InvocationContext::store(self.inner.engine.raw(), memory_bytes, permit);
+        let mut store = InvocationContext::store(
+            self.inner.engine.raw(),
+            permit,
+            InvocationContextConfig {
+                memory_bytes,
+                query_handler,
+                supported_actions,
+                max_host_calls: self.inner.engine.config().max_host_calls,
+                max_host_call_bytes: self.inner.engine.config().max_host_call_bytes,
+            },
+        );
         store
             .set_fuel(self.inner.manifest.limits.fuel)
             .map_err(|error| {
@@ -228,23 +285,38 @@ impl AttachedPolicy {
     }
 }
 
-fn validate_result(
+fn call_operation(
     operation: Operation,
-    input: &Document,
+    policy: &PolicyGuest,
+    store: &mut Store<InvocationContext>,
+    input: &WitInvocation,
+) -> wasmtime::Result<Result<crate::bindings::exports::pie::plex::policy::PolicyOutput, String>> {
+    match operation {
+        Operation::Route => policy.call_route(store, input),
+        Operation::Admit => policy.call_admit(store, input),
+        Operation::Schedule => policy.call_schedule(store, input),
+        Operation::Evict => policy.call_evict(store, input),
+        Operation::Feedback => policy.call_feedback(store, input),
+    }
+}
+
+pub(crate) fn validate_result(
+    operation: Operation,
+    context: &Document,
     result: &Document,
 ) -> Result<(), String> {
     let validation = match operation {
         Operation::Route => pie_plex::rank_route(
             result,
-            input["candidates"]
+            context["candidates"]
                 .as_array()
-                .expect("validated input")
+                .expect("validated context")
                 .len(),
         )
         .map(|_| ()),
         Operation::Admit => pie_plex::validate_admit(result).map(|_| ()),
-        Operation::Schedule => pie_plex::select_schedule(input, result).map(|_| ()),
-        Operation::Evict => pie_plex::select_evictions(input, result).map(|_| ()),
+        Operation::Schedule => pie_plex::select_schedule(context, result).map(|_| ()),
+        Operation::Evict => pie_plex::select_evictions(context, result).map(|_| ()),
         Operation::Feedback => Ok(()),
     };
     validation.map_err(|error| error.to_string())
@@ -259,7 +331,17 @@ fn probe_instantiation(
         .try_acquire()
         .ok_or(AttachmentError::EngineSaturated)?;
     let memory_bytes = usize::try_from(manifest.limits.memory_bytes).unwrap_or(usize::MAX);
-    let mut store = InvocationContext::store(engine.raw(), memory_bytes, permit);
+    let mut store = InvocationContext::store(
+        engine.raw(),
+        permit,
+        InvocationContextConfig {
+            memory_bytes,
+            query_handler: Arc::new(RejectingQueryHandler),
+            supported_actions: Arc::new(BTreeSet::new()),
+            max_host_calls: engine.config().max_host_calls,
+            max_host_call_bytes: engine.config().max_host_call_bytes,
+        },
+    );
     store
         .set_fuel(manifest.limits.fuel)
         .map_err(|error| AttachmentError::Instantiate(error.to_string()))?;
@@ -274,20 +356,28 @@ fn verify_component_surface(
     engine: &wasmtime::Engine,
     component: &Component,
 ) -> Result<(), AttachmentError> {
-    const POLICY: &str = "pie:plex/policy@0.3.0";
+    const HOST: &str = "pie:plex/host@0.5.0";
+    const POLICY: &str = "pie:plex/policy@0.5.0";
     let component_type = component.component_type();
-    if let Some((name, _)) = component_type.imports(engine).next() {
-        return Err(AttachmentError::UnsupportedImport(name.to_owned()));
-    }
-    let mut policy_exported = false;
-    for (name, _) in component_type.exports(engine) {
-        if name == POLICY {
-            policy_exported = true;
-        } else {
-            return Err(AttachmentError::UnsupportedExport(name.to_owned()));
+    let imports = component_type
+        .imports(engine)
+        .map(|(name, _)| name.to_owned())
+        .collect::<BTreeSet<_>>();
+    let expected_imports = BTreeSet::from([HOST.to_owned()]);
+    if imports != expected_imports {
+        if let Some(unsupported) = imports.difference(&expected_imports).next() {
+            return Err(AttachmentError::UnsupportedImport(unsupported.clone()));
         }
+        return Err(AttachmentError::MissingRequiredImport(HOST.into()));
     }
-    if !policy_exported {
+    let exports = component_type
+        .exports(engine)
+        .map(|(name, _)| name.to_owned())
+        .collect::<BTreeSet<_>>();
+    if exports != BTreeSet::from([POLICY.to_owned()]) {
+        if let Some(unsupported) = exports.iter().find(|name| name.as_str() != POLICY) {
+            return Err(AttachmentError::UnsupportedExport(unsupported.clone()));
+        }
         return Err(AttachmentError::MissingPolicyExport);
     }
     Ok(())
@@ -345,7 +435,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rejects_any_component_import() {
+    fn rejects_unapproved_component_import() {
         let engine = PolicyEngine::new(PolicyEngineConfig::deterministic_replay()).unwrap();
         let component = Component::new(
             engine.raw(),
