@@ -13,6 +13,8 @@
 
 #include <cuda_runtime.h>
 
+#include "batch/persistent_inputs.hpp"
+#include "kernels/graph_pad.hpp"
 #include "kernels/pack_dense_mask.hpp"
 
 namespace {
@@ -221,15 +223,150 @@ void test_mixed_structured() {
     cudaFree(d_positions);
 }
 
+__global__ void read_packed_mask(
+    const std::uint8_t* mask,
+    const std::int32_t* indptr,
+    std::uint8_t* output) {
+    const int request = static_cast<int>(threadIdx.x);
+    if (request < 2) output[request] = mask[indptr[request]];
+}
+
+void test_persistent_mask_graph_replay() {
+    auto pi = pie_cuda_driver::PersistentInputs::allocate(
+        /*max_workspace_tokens=*/2,
+        /*max_requests=*/2,
+        /*max_kv_pages=*/2,
+        /*max_custom_mask_bytes=*/16,
+        /*max_mtp_draft_rows=*/0);
+    auto output =
+        pie_cuda_driver::DeviceBuffer<std::uint8_t>::alloc(2);
+    const auto* dense_ptr = pi.dense_mask.data();
+    const auto* packed_ptr = pi.custom_mask.data();
+    const auto* indptr_ptr = pi.custom_mask_indptr.data();
+    const std::vector<std::uint32_t> qo = {0, 1, 2};
+    const std::vector<std::uint32_t> klen = {4, 4};
+    const std::vector<std::int32_t> indptr = {0, 1, 2};
+
+    auto pack = [&](const std::vector<std::uint8_t>& dense) {
+        pi.dense_mask.copy_from_host(dense);
+        pi.structured_mask_klen.copy_from_host(klen);
+        pi.qo_indptr.copy_from_host(qo);
+        pi.custom_mask_indptr.copy_from_host(indptr);
+        CUDA_RT(cudaMemset(pi.custom_mask.data(), 0, 2));
+        pie_cuda_driver::kernels::launch_pack_dense_mask(
+            pi.dense_mask.data(),
+            pi.structured_mask_klen.data(),
+            pi.qo_indptr.data(),
+            pi.custom_mask_indptr.data(),
+            pi.custom_mask.data(),
+            2,
+            4,
+            nullptr);
+        CUDA_RT(cudaDeviceSynchronize());
+        CHECK(pi.dense_mask.data() == dense_ptr,
+              "dense staging pointer changed between fires");
+        CHECK(pi.custom_mask.data() == packed_ptr,
+              "packed mask pointer changed between fires");
+        CHECK(pi.custom_mask_indptr.data() == indptr_ptr,
+              "mask indptr pointer changed between fires");
+    };
+
+    pack({1, 0, 1, 0, 0, 1, 1, 0});
+
+    cudaStream_t stream = nullptr;
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t exec = nullptr;
+    CUDA_RT(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    CUDA_RT(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+    read_packed_mask<<<1, 2, 0, stream>>>(
+        pi.custom_mask.data(), pi.custom_mask_indptr.data(), output.data());
+    CUDA_RT(cudaGetLastError());
+    CUDA_RT(cudaStreamEndCapture(stream, &graph));
+    CUDA_RT(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+
+    CUDA_RT(cudaGraphLaunch(exec, stream));
+    CUDA_RT(cudaStreamSynchronize(stream));
+    auto first = output.to_host();
+    CHECK(first == std::vector<std::uint8_t>({0b0101, 0b0110}),
+          "first masked graph replay read stale packed data");
+
+    pack({1, 1, 1, 1, 1, 0, 0, 0});
+    CUDA_RT(cudaGraphLaunch(exec, stream));
+    CUDA_RT(cudaStreamSynchronize(stream));
+    auto second = output.to_host();
+    CHECK(second == std::vector<std::uint8_t>({0b1111, 0b0001}),
+          "repeated masked graph replay did not consume refreshed buffers");
+
+    cudaGraphExecDestroy(exec);
+    cudaGraphDestroy(graph);
+    cudaStreamDestroy(stream);
+}
+
+void test_mask_aware_graph_padding() {
+    auto pi = pie_cuda_driver::PersistentInputs::allocate(
+        /*max_workspace_tokens=*/2,
+        /*max_requests=*/2,
+        /*max_kv_pages=*/2,
+        /*max_custom_mask_bytes=*/16,
+        /*max_mtp_draft_rows=*/0);
+    const std::vector<std::uint32_t> csr = {0, 1};
+    const std::vector<std::uint32_t> page = {3};
+    const std::vector<std::uint32_t> one = {1};
+    const std::vector<std::uint32_t> token = {7};
+    const std::vector<std::uint32_t> zero = {0};
+    const std::vector<std::uint8_t> byte_one = {1};
+    const std::vector<std::int32_t> mask_csr = {0, 1};
+    pi.qo_indptr.copy_from_host(csr);
+    pi.kv_page_indptr.copy_from_host(csr);
+    pi.kv_page_indices.copy_from_host(page);
+    pi.kv_last_page_lens.copy_from_host(one);
+    pi.tokens.copy_from_host(token);
+    pi.positions.copy_from_host(zero);
+    pi.row_valid.copy_from_host(byte_one);
+    pi.custom_mask.copy_from_host(byte_one);
+    pi.custom_mask_indptr.copy_from_host(mask_csr);
+
+    pie_cuda_driver::launch_graph_pad_rows(
+        pi.qo_indptr.data(),
+        pi.kv_page_indptr.data(),
+        pi.kv_page_indices.data(),
+        pi.kv_last_page_lens.data(),
+        pi.tokens.data(),
+        pi.positions.data(),
+        pi.row_valid.data(),
+        pi.custom_mask.data(),
+        pi.custom_mask_indptr.data(),
+        /*real_mask_bytes=*/1,
+        /*real_requests=*/1,
+        /*real_tokens=*/1,
+        /*padding=*/1,
+        /*pad_page=*/9,
+        /*stream=*/nullptr);
+    CUDA_RT(cudaDeviceSynchronize());
+
+    const auto qo = pi.qo_indptr.to_host();
+    const auto kvpp = pi.kv_page_indptr.to_host();
+    const auto kvpi = pi.kv_page_indices.to_host();
+    const auto mask = pi.custom_mask.to_host();
+    const auto mindptr = pi.custom_mask_indptr.to_host();
+    CHECK(qo[2] == 2 && kvpp[2] == 2 && kvpi[1] == 9,
+          "graph pad geometry is not coherent");
+    CHECK(mask[1] == 1 && mindptr[2] == 2,
+          "graph pad did not extend custom mask data and CSR");
+}
+
 }  // namespace
 
 int main() {
     test_fork_freeze();
     test_mixed_structured();
+    test_persistent_mask_graph_replay();
+    test_mask_aware_graph_padding();
     if (g_failures) {
         std::fprintf(stderr, "pack_dense_mask: %d failure(s)\n", g_failures);
         return 1;
     }
-    std::printf("pack_dense_mask: dense and structured packing OK\n");
+    std::printf(
+        "pack_dense_mask: dense, structured, and graph persistence OK\n");
     return 0;
 }

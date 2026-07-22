@@ -12,20 +12,12 @@ interface pipeline {
     resource pipeline {
         constructor();
 
-        /// Graceful END OF STREAM: no further submissions; queued fires
-        /// drain normally. Sequenced with the submissions (same FIFO), so
-        /// calling it right after the last submit is exact: the scheduler
-        /// stops awaiting the pipeline the moment its last fire dispatches
-        /// into a wave. Later submits error. `close` stays legal after
-        /// finish and cancels whatever is still unexecuted.
-        finish: func();
-
-        /// CANCEL the pipeline (implied by drop; close and drop mean the
-        /// same thing): every queued/preparing fire is cancelled and its
-        /// books deleted; already-dispatched fires are GPU-owned and run to
-        /// settlement. Takes of cancelled fires error. End-of-stream is NOT
-        /// close's job — that is `finish`. Touched channels are unspecified
-        /// after close.
+        /// End the stream and tear down its ordering domain. The scheduler
+        /// stops awaiting this pipeline immediately; every fire already
+        /// submitted (queued, preparing, or dispatched) still runs to
+        /// settlement in submission order and its outputs remain take-able.
+        /// Later submissions fail. Work never submitted is simply absent.
+        /// Resource drop has exactly these semantics.
         close: func();
     }
 }

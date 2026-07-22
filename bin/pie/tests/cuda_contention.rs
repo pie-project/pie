@@ -60,6 +60,22 @@
 //!     cargo test -p pie-bin --features driver-cuda \
 //!     --test cuda_contention -- --ignored --nocapture
 //!
+//! Quantitative A/B (each command is a separate process because boot is
+//! process-global; the optional record file prints the ratio after both runs):
+//!   PIE_KV_CONTENTION=error PIE_CONTENTION_PROFILE_MODE=legacy \
+//!   PIE_CONTENTION_PROFILE_RECORD=/tmp/pie-contention.json \
+//!     cargo test -p pie-bin --features driver-cuda --test cuda_contention \
+//!     over_capacity_fleet_preempts_and_restores_transparently -- --ignored --exact --nocapture
+//!   PIE_KV_CONTENTION=preempt PIE_KV_PREEMPT_ACTIVE=1 \
+//!   PIE_CONTENTION_PROFILE_MODE=baseline PIE_CONTENTION_PROFILE_RECORD=/tmp/pie-contention.json \
+//!     cargo test -p pie-bin --features driver-cuda --test cuda_contention \
+//!     over_capacity_fleet_preempts_and_restores_transparently -- --ignored --exact --nocapture
+//!   PIE_KV_CONTENTION=preempt PIE_KV_PREEMPT_ACTIVE=1 \
+//!   PIE_CONTENTION_PROFILE_MODE=contended PIE_CONTENTION_TOTAL_PAGES=8 \
+//!   PIE_CONTENTION_PROFILE_RECORD=/tmp/pie-contention.json \
+//!     cargo test -p pie-bin --features driver-cuda --test cuda_contention \
+//!     over_capacity_fleet_preempts_and_restores_transparently -- --ignored --exact --nocapture
+//!
 //! COORDINATION (charlie owns the harness + boot config + GPU): the small-pool
 //! boot knob below (`SMALL_POOL_GPU_MEM_UTIL`) is a first-cut forcing mechanism —
 //! a low `gpu_mem_utilization` shrinks the KV pool so a modest fleet over-fills
@@ -72,6 +88,7 @@ mod common;
 
 use std::path::Path;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use pie_client::client::Client;
@@ -137,20 +154,166 @@ async fn run_one(addr: &str, input: &str) -> Result<Option<Vec<i64>>> {
     Ok(parse_tokens(&proc.wait_for_return().await?))
 }
 
-async fn run_fleet_concurrent(addr: &str, inputs: &[String]) -> Vec<Option<Vec<i64>>> {
+struct FleetRun {
+    outputs: Vec<Option<Vec<i64>>>,
+    lane_latencies: Vec<Duration>,
+    elapsed: Duration,
+}
+
+const BUBBLE_HIST_UPPER_US: [u64; 16] = [
+    1,
+    2,
+    4,
+    8,
+    16,
+    32,
+    64,
+    100,
+    150,
+    250,
+    500,
+    1_000,
+    2_000,
+    8_000,
+    32_000,
+    u64::MAX,
+];
+
+async fn run_fleet_concurrent(addr: &str, inputs: &[String]) -> FleetRun {
+    let fleet_started = Instant::now();
     let mut procs = Vec::new();
     for input in inputs {
         let addr = addr.to_string();
         let input = input.clone();
         procs.push(tokio::spawn(async move {
-            run_one(&addr, &input).await.ok().flatten()
+            let started = Instant::now();
+            (
+                run_one(&addr, &input).await.ok().flatten(),
+                started.elapsed(),
+            )
         }));
     }
-    let mut out = Vec::new();
+    let mut outputs = Vec::new();
+    let mut lane_latencies = Vec::new();
     for h in procs {
-        out.push(h.await.unwrap_or(None));
+        let (output, latency) = h.await.unwrap_or((None, Duration::ZERO));
+        outputs.push(output);
+        lane_latencies.push(latency);
     }
-    out
+    FleetRun {
+        outputs,
+        lane_latencies,
+        elapsed: fleet_started.elapsed(),
+    }
+}
+
+fn percentile_us(samples: &[Duration], percentile: usize) -> u128 {
+    if samples.is_empty() {
+        return 0;
+    }
+    let mut samples: Vec<_> = samples.iter().map(Duration::as_micros).collect();
+    samples.sort_unstable();
+    let index = ((samples.len() - 1) * percentile).div_ceil(100);
+    samples[index]
+}
+
+fn bubble_percentile(histogram: &[u64], percentile: u64) -> u64 {
+    let total: u64 = histogram.iter().sum();
+    if total == 0 {
+        return 0;
+    }
+    let target = (total * percentile).div_ceil(100);
+    let mut cumulative = 0;
+    for (index, count) in histogram.iter().enumerate() {
+        cumulative += count;
+        if cumulative >= target {
+            return BUBBLE_HIST_UPPER_US[index];
+        }
+    }
+    *BUBBLE_HIST_UPPER_US.last().unwrap()
+}
+
+fn write_profile_record(
+    mode: &str,
+    fleet: usize,
+    token_budget: usize,
+    total_pages: u32,
+    run: &FleetRun,
+    batch_avg: f64,
+    bubble_p50_us: u64,
+    bubble_p99_us: u64,
+) -> Result<()> {
+    let Ok(path) = std::env::var("PIE_CONTENTION_PROFILE_RECORD") else {
+        return Ok(());
+    };
+    let total_tokens: usize = run
+        .outputs
+        .iter()
+        .filter_map(Option::as_ref)
+        .map(Vec::len)
+        .sum();
+    let mut document: serde_json::Value = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    document[mode] = serde_json::json!({
+        "fleet": fleet,
+        "token_budget": token_budget,
+        "total_pages": total_pages,
+        "elapsed_us": run.elapsed.as_micros(),
+        "total_tokens": total_tokens,
+        "throughput_tok_s": total_tokens as f64 / run.elapsed.as_secs_f64().max(1e-9),
+        "lane_p50_us": percentile_us(&run.lane_latencies, 50),
+        "lane_p95_us": percentile_us(&run.lane_latencies, 95),
+        "lane_p99_us": percentile_us(&run.lane_latencies, 99),
+        "batch_avg": batch_avg,
+        "bubble_p50_us": bubble_p50_us,
+        "bubble_p99_us": bubble_p99_us,
+    });
+    if let Some(orchestrator) = pie_engine::store::reclaim::contention() {
+        let diagnostics = orchestrator.diagnostics();
+        document[mode]["contention"] = serde_json::json!({
+            "parked": diagnostics.waiters_parked_total,
+            "woken": diagnostics.waiters_woken_total,
+            "suspends": diagnostics.suspends_total,
+            "restores": diagnostics.restores_total,
+            "d2h_pages": diagnostics.d2h_pages_total,
+            "h2d_pages": diagnostics.h2d_pages_total,
+            "d2h_copy_us": diagnostics.d2h_copy_us_total,
+            "h2d_copy_us": diagnostics.h2d_copy_us_total,
+        });
+    }
+    std::fs::write(&path, serde_json::to_vec_pretty(&document)?)?;
+
+    if let (Some(baseline), Some(contended)) = (document.get("baseline"), document.get("contended"))
+        && baseline.get("fleet") == contended.get("fleet")
+        && baseline.get("token_budget") == contended.get("token_budget")
+    {
+        let baseline_throughput = baseline["throughput_tok_s"].as_f64().unwrap_or_default();
+        let contended_throughput = contended["throughput_tok_s"].as_f64().unwrap_or_default();
+        let baseline_p95 = baseline["lane_p95_us"].as_u64().unwrap_or_default() as f64;
+        let contended_p95 = contended["lane_p95_us"].as_u64().unwrap_or_default() as f64;
+        eprintln!(
+            "[contention-profile] A/B throughput={:.3}x p95-latency={:.3}x record={path}",
+            contended_throughput / baseline_throughput.max(f64::EPSILON),
+            contended_p95 / baseline_p95.max(1.0),
+        );
+    }
+    if let (Some(legacy), Some(baseline)) = (document.get("legacy"), document.get("baseline"))
+        && legacy.get("fleet") == baseline.get("fleet")
+        && legacy.get("token_budget") == baseline.get("token_budget")
+    {
+        let legacy_throughput = legacy["throughput_tok_s"].as_f64().unwrap_or_default();
+        let baseline_throughput = baseline["throughput_tok_s"].as_f64().unwrap_or_default();
+        let legacy_p95 = legacy["lane_p95_us"].as_u64().unwrap_or_default() as f64;
+        let baseline_p95 = baseline["lane_p95_us"].as_u64().unwrap_or_default() as f64;
+        eprintln!(
+            "[contention-profile] hot-path throughput={:.3}x p95-latency={:.3}x record={path}",
+            baseline_throughput / legacy_throughput.max(f64::EPSILON),
+            baseline_p95 / legacy_p95.max(1.0),
+        );
+    }
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -158,13 +321,26 @@ async fn run_fleet_concurrent(addr: &str, inputs: &[String]) -> Vec<Option<Vec<i
 async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()> {
     common::init_trace();
 
-    // Guard: this test is meaningful only in preempt mode. In legacy mode the
-    // over-capacity fleet would (correctly) surface WorkingSetError — a different
-    // contract. Fail fast with a clear message rather than a confusing mismatch.
+    let profile_mode =
+        std::env::var("PIE_CONTENTION_PROFILE_MODE").unwrap_or_else(|_| "contended".to_string());
     anyhow::ensure!(
-        std::env::var("PIE_KV_CONTENTION").as_deref() == Ok("preempt"),
-        "set PIE_KV_CONTENTION=preempt — this test validates the preempt/restore path"
+        matches!(profile_mode.as_str(), "legacy" | "baseline" | "contended"),
+        "PIE_CONTENTION_PROFILE_MODE must be legacy, baseline, or contended"
     );
+    let configured_contention = std::env::var("PIE_KV_CONTENTION").unwrap_or_default();
+    anyhow::ensure!(
+        (profile_mode == "legacy" && configured_contention != "preempt")
+            || (profile_mode != "legacy" && configured_contention == "preempt"),
+        "legacy mode requires PIE_KV_CONTENTION=error; baseline/contended require preempt"
+    );
+    let total_pages = if profile_mode != "contended" {
+        0
+    } else {
+        std::env::var("PIE_CONTENTION_TOTAL_PAGES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(8)
+    };
 
     let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
     anyhow::ensure!(
@@ -180,7 +356,7 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
 
     // Boot with a SMALL KV pool so a modest fleet over-fills it (charlie tunes the
     // exact knob — see the module COORDINATION note).
-    let pie = common::boot_4090_small_kv().await?;
+    let pie = common::boot_4090_kv_cap(total_pages).await?;
     let addr = pie.listen_addr.to_string();
     let fleet = fleet_size();
     eprintln!("[contention] booted small-pool, addr={addr}, fleet={fleet}");
@@ -206,6 +382,7 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
         );
         reference.push(r);
     }
+    let scheduler_before = pie_engine::scheduler::get_stats().await;
 
     // Over-capacity: launch the whole fleet at once. Combined demand > pool ⇒ the
     // losers OOM in prep → acquire() → wait → a finisher frees → drain → retry.
@@ -247,11 +424,76 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
     } else {
         None
     };
-    let concurrent = run_fleet_concurrent(&addr, &inputs).await;
+    let fleet_run = run_fleet_concurrent(&addr, &inputs).await;
+    let concurrent = &fleet_run.outputs;
     ctrace_stop.store(true, std::sync::atomic::Ordering::Relaxed);
     if let Some(t) = ctrace_task {
         t.abort();
     }
+    let total_output_tokens: usize = concurrent
+        .iter()
+        .filter_map(Option::as_ref)
+        .map(Vec::len)
+        .sum();
+    let scheduler_after = pie_engine::scheduler::get_stats().await;
+    let batches = scheduler_after
+        .total_batches
+        .saturating_sub(scheduler_before.total_batches);
+    let requests = scheduler_after
+        .total_requests_processed
+        .saturating_sub(scheduler_before.total_requests_processed);
+    let batch_avg = requests as f64 / batches.max(1) as f64;
+    let bubble_histogram: Vec<_> = scheduler_after
+        .bubble_us_hist
+        .iter()
+        .zip(scheduler_before.bubble_us_hist)
+        .map(|(after, before)| after.saturating_sub(before))
+        .collect();
+    let bubble_p50_us = bubble_percentile(&bubble_histogram, 50);
+    let bubble_p99_us = bubble_percentile(&bubble_histogram, 99);
+    eprintln!(
+        "[contention-profile] mode={profile_mode} pages={total_pages} fleet={fleet} \
+         elapsed={:.3}s output_tokens={} throughput={:.1}tok/s \
+         lane_p50={:.3}ms lane_p95={:.3}ms lane_p99={:.3}ms \
+         batch_avg={:.1} bubble_p50={}us bubble_p99={}us",
+        fleet_run.elapsed.as_secs_f64(),
+        total_output_tokens,
+        total_output_tokens as f64 / fleet_run.elapsed.as_secs_f64().max(1e-9),
+        percentile_us(&fleet_run.lane_latencies, 50) as f64 / 1_000.0,
+        percentile_us(&fleet_run.lane_latencies, 95) as f64 / 1_000.0,
+        percentile_us(&fleet_run.lane_latencies, 99) as f64 / 1_000.0,
+        batch_avg,
+        bubble_p50_us,
+        bubble_p99_us,
+    );
+    if let Some(orchestrator) = pie_engine::store::reclaim::contention() {
+        let diagnostics = orchestrator.diagnostics();
+        eprintln!(
+            "[contention-profile] parked={} woken={} suspends={} restores={} \
+             d2h_pages={} h2d_pages={} d2h={:.3}ms h2d={:.3}ms",
+            diagnostics.waiters_parked_total,
+            diagnostics.waiters_woken_total,
+            diagnostics.suspends_total,
+            diagnostics.restores_total,
+            diagnostics.d2h_pages_total,
+            diagnostics.h2d_pages_total,
+            diagnostics.d2h_copy_us_total as f64 / 1_000.0,
+            diagnostics.h2d_copy_us_total as f64 / 1_000.0,
+        );
+    }
+    write_profile_record(
+        &profile_mode,
+        fleet,
+        std::env::var("PIE_CONTENTION_BUDGET")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(5),
+        total_pages,
+        &fleet_run,
+        batch_avg,
+        bubble_p50_us,
+        bubble_p99_us,
+    )?;
 
     // Early engagement snapshot: print the final ContentionStats BEFORE any
     // assertion so a transparency RED still surfaces whether preempt/restore
@@ -308,12 +550,20 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
     eprintln!(
         "[contention] engagement: parked={parked} woken={woken} suspends={suspends} restores={restores}"
     );
-    assert!(
-        parked > 0 && woken > 0,
-        "preempt/restore did NOT ENGAGE (waiters_parked={parked}, waiters_woken={woken}) — the \
-         fleet never over-filled the pool, so assertions 1+2 proved nothing. Shrink the pool \
-         (PIE_CONTENTION_UTIL / a total_pages cap) or grow PIE_CONTENTION_FLEET until it contends."
-    );
+    if profile_mode == "contended" {
+        assert!(
+            parked > 0 && woken > 0,
+            "preempt/restore did NOT ENGAGE (waiters_parked={parked}, waiters_woken={woken}) — the \
+             fleet never over-filled the pool, so assertions 1+2 proved nothing. Shrink the pool \
+             (PIE_CONTENTION_UTIL / a total_pages cap) or grow PIE_CONTENTION_FLEET until it contends."
+        );
+    } else {
+        assert_eq!(
+            (parked, suspends, restores),
+            (0, 0, 0),
+            "roomy baseline unexpectedly contended"
+        );
+    }
 
     // Assertion 3: TRANSPARENCY (classified) — preempt+restore preserved KV
     // content (W1). The naive `concurrent[k] == solo_reference[k]` is confounded
@@ -399,7 +649,7 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
     // GATED on active mode: in v1 passive the backend returns `Unsupported` and
     // both stay zero-by-design, so the assertion only applies when armed.
     let preempt_active = std::env::var("PIE_KV_PREEMPT_ACTIVE").as_deref() == Ok("1");
-    if preempt_active {
+    if preempt_active && profile_mode == "contended" {
         assert!(
             suspends > 0 && restores > 0,
             "v2 active self-suspend did NOT ENGAGE (suspends={suspends}, restores={restores}) — \
@@ -412,8 +662,8 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
     }
 
     eprintln!(
-        "[contention] {fleet}/{fleet} lanes: zero WorkingSetError + transparent restore + \
-         engaged (parked={parked}, woken={woken}) ✓"
+        "[contention] mode={profile_mode} {fleet}/{fleet} lanes: zero WorkingSetError + \
+         classified transparency (parked={parked}, woken={woken})"
     );
     Ok(())
 }

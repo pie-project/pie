@@ -21,8 +21,8 @@ pub use inferlet_macros::{main, tool};
 // WIT's own `async func` annotations drive async generation: only
 // run/execute/receive become `async fn` (component-model-async); sync funcs
 // (model::encode, chat::*, …) stay sync. wit-bindgen generates the wasi:io
-// bindings itself (0.58-suffixed cabi_realloc) so it doesn't collide with
-// std's 0.57.1 copy.
+// bindings itself with versioned cabi_realloc symbols so it doesn't collide
+// with std's copy.
 wit_bindgen::generate!({
     path: "wit",
     world: "inferlet",
@@ -65,7 +65,6 @@ pub mod ptir;
 /// facade is the sugar that gets deleted. See `ptir-snapshot-keepcore-spec`.
 pub mod snapshot;
 
-
 /// Device tensor + tensor-program substrate (the WIT `tensor` interface).
 ///
 /// Exposes the generated `tensor::{Tensor, Program, Op, OpKind, Value, Input,
@@ -98,7 +97,7 @@ pub use tools::Tool;
 pub mod model {
     pub use crate::pie::inferlet::model::{
         architecture, arena_block_size, default_system_speculation, is_linear, name,
-        output_vocab_size, rs_buffer_page_size, rs_fold_granularity, rs_state_size,
+        kv_page_size, output_vocab_size, rs_buffer_page_size, rs_fold_granularity, rs_state_size,
     };
     // Tokenizer functions split into the `tokenizer` interface (§2.2); re-exported
     // here so `model::encode`/`model::decode`/… keep working for inferlet source.
@@ -182,8 +181,8 @@ pub fn parse_args(args: Vec<String>) -> Arguments {
 pub mod prelude {
     pub use crate::model;
     pub use crate::runtime;
-    pub use crate::{Result, Schema, Tool};
-    pub use crate::{main, tool};
     pub use crate::tensor;
+    pub use crate::{Result, Schema, Tool};
     pub use crate::{chat, reasoning, tools};
+    pub use crate::{main, tool};
 }

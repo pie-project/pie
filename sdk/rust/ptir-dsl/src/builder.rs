@@ -4,7 +4,7 @@
 //! it takes descriptor-port bindings ([`bind_port`](Builder::bind_port)) and
 //! stage closures ([`stage`](Builder::stage)), traces the closures once into
 //! echo's canonical [`TraceContainer`], and runs the SDK span lints. It does
-//! **not** bind (D6: the guest does not bind — `forward-pass.new` is the
+//! **not** bind (D6: the guest does not bind — `forward-pass.program` is the
 //! authoritative gate); the author-facing `ForwardPass`/`Pipeline`/`WorkingSet`
 //! lifetime objects live in `inferlet`, wrap the WIT resources, and drive this
 //! builder.
@@ -27,37 +27,19 @@ use pie_ptir::registry::{Port, Stage};
 use crate::channel::Channel;
 use crate::context::{self, ChannelRef, SinkCall};
 use crate::error::{Span, TraceError, TraceErrors};
-use crate::value::{ConstData, Tensor};
 
-/// A descriptor-port source: a live [`Channel`] (interned into the container's
-/// channel table) or a trace-known constant. Const-only ports (`EmbedIndptr`
-/// for rectangular batches, `PageIndptr`, `Readout`) fold their value into the
-/// container; channel ports reference the dense channel index.
-pub enum PortInput {
-    Channel(Channel),
-    Const(Tensor),
-}
-
-impl PortInput {
-    /// Sugar: a constant from any [`Tensor::constant`] operand.
-    pub fn constant(t: Tensor) -> PortInput {
-        PortInput::Const(t)
-    }
-}
+/// A descriptor-port source. Descriptor inputs are always channels; tensors
+/// exist only inside traced stage closures.
+pub struct PortInput(Channel);
 
 impl From<&Channel> for PortInput {
     fn from(c: &Channel) -> PortInput {
-        PortInput::Channel(c.clone())
+        PortInput(c.clone())
     }
 }
 impl From<Channel> for PortInput {
     fn from(c: Channel) -> PortInput {
-        PortInput::Channel(c)
-    }
-}
-impl From<Tensor> for PortInput {
-    fn from(t: Tensor) -> PortInput {
-        PortInput::Const(t)
+        PortInput(c)
     }
 }
 
@@ -68,34 +50,37 @@ type StageClosure<'a> = Box<dyn Fn() + 'a>;
 pub struct Builder<'a> {
     ports: Vec<(Port, PortInput)>,
     stages: Vec<(Stage, StageClosure<'a>)>,
+    vocab: u32,
+    page_size: u32,
 }
 
 impl<'a> Builder<'a> {
-    pub fn new() -> Builder<'a> {
+    /// Create a neutral builder with engine-sourced trace constants.
+    pub fn new(vocab: u32, page_size: u32) -> Builder<'a> {
         Builder {
             ports: Vec::new(),
             stages: Vec::new(),
+            vocab,
+            page_size,
         }
     }
 
-    /// Bind a descriptor [`Port`] to a channel or a constant. Records the port's
+    /// Bind a descriptor [`Port`] to a channel. Records the port's
     /// endpoint claim on the channel per its fixed consumption discipline
     /// ([`Port::consumes`]): the token-indexed family (`embed`, `positions`,
     /// `w_slot`/`w_off`) **takes**; geometry and masks **read** (§5.1). The
-    /// claim drives host-role derivation and the span lints; const ports claim
-    /// nothing.
+    /// claim drives host-role derivation and the span lints.
     #[track_caller]
     pub fn bind_port(&mut self, port: Port, source: impl Into<PortInput>) {
         let source = source.into();
-        if let PortInput::Channel(ch) = &source {
-            let span = Span::here();
-            let mut st = ch.state().borrow_mut();
-            if port.consumes() {
-                st.desc_takes.push(span);
-            } else {
-                st.desc_reads.push(span);
-            }
+        let span = Span::here();
+        let mut st = source.0.state().borrow_mut();
+        if port.consumes() {
+            st.desc_takes.push(span);
+        } else {
+            st.desc_reads.push(span);
         }
+        drop(st);
         self.ports.push((port, source));
     }
 
@@ -116,31 +101,32 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// Read-out rows for `intrinsics::logits()`: an explicit `Readout` count,
-    /// else the number of `EmbedIndptr` lanes (rectangular indptr = `numel - 1`).
+    /// Read-out rows for `intrinsics::logits()`: an explicit `Readout` channel,
+    /// else the number of `EmbedIndptr` lanes.
     fn rows(&self) -> u32 {
-        if let Some(cd) = self.const_port(Port::Readout) {
-            return (cd.shape.numel() as u32).max(1);
+        if let Some(channel) = self.channel_port(Port::Readout) {
+            return (channel.shape().numel() as u32).max(1);
         }
-        if let Some(cd) = self.const_port(Port::EmbedIndptr) {
-            return (cd.shape.numel() as u32).saturating_sub(1).max(1);
+        if let Some(channel) = self.channel_port(Port::EmbedIndptr) {
+            return (channel.shape().numel() as u32).saturating_sub(1).max(1);
         }
         1
     }
 
-    fn const_port(&self, port: Port) -> Option<ConstData> {
-        self.ports.iter().find_map(|(p, src)| match (p, src) {
-            (p, PortInput::Const(t)) if *p == port => t.as_const_data(),
-            _ => None,
-        })
+    fn channel_port(&self, port: Port) -> Option<&Channel> {
+        self.ports
+            .iter()
+            .find_map(|(bound, source)| (*bound == port).then_some(&source.0))
     }
 
     /// Trace + lint, returning the canonical [`Traced`] artifact: container
     /// bytes, dense-order channel identities, and names. Runs the SDK span
-    /// lints only; authoritative validation is `forward-pass.new`'s result (D6).
+    /// lints only; authoritative validation is `forward-pass.program`'s result (D6).
     pub fn build(&self) -> Result<Traced, TraceErrors> {
         let rows = self.rows();
-        let (result, channels) = context::with_session(|| self.record(rows));
+        let (result, channels) = crate::model::with_constants(self.vocab, self.page_size, || {
+            context::with_session(|| self.record(rows))
+        });
         let (stage_results, ports) = result;
 
         // The recorder interns channels in first-REFERENCE order (the order they
@@ -207,7 +193,12 @@ impl<'a> Builder<'a> {
                     && !has_host_put
                     && !st.seeded
                     && st.seed.is_none();
-                let host_role = if has_host_put && !has_prog_put {
+                // A seeded descriptor-only channel is replaceable through the
+                // host `set` operation after bind. It therefore needs the same
+                // device-visible Writer endpoint as an explicit host `put`,
+                // even when its initial value came from the seed table.
+                let seeded_descriptor_writer = st.seeded && has_desc_use && !has_prog_put;
+                let host_role = if (has_host_put || seeded_descriptor_writer) && !has_prog_put {
                     HostRole::Writer
                 } else if host_consumes && (!st.prog_takes.is_empty() || has_prog_put) {
                     // A host-consumed, pass-produced/loop-carried channel.
@@ -248,7 +239,7 @@ impl<'a> Builder<'a> {
         };
 
         // SDK span lints (friendly, spans). Echo's authoritative bind lives on
-        // the host at `forward-pass.new` (D6); native parity tests bind explicitly.
+        // the host at `forward-pass.program` (D6); native parity tests bind explicitly.
         let mut errs: Vec<TraceError> = Vec::new();
         crate::lint::lint(&channels, &sinks, &mut errs);
         if !errs.is_empty() {
@@ -268,7 +259,9 @@ impl<'a> Builder<'a> {
     #[doc(hidden)]
     pub fn debug_container(&self) -> TraceContainer {
         let rows = self.rows();
-        let (result, channels) = context::with_session(|| self.record(rows));
+        let (result, channels) = crate::model::with_constants(self.vocab, self.page_size, || {
+            context::with_session(|| self.record(rows))
+        });
         let (stage_results, ports) = result;
         let channel_decls: Vec<ChannelDecl> = channels
             .iter()
@@ -305,19 +298,7 @@ impl<'a> Builder<'a> {
     fn record(&self, rows: u32) -> (Vec<context::StageResult>, Vec<PortBinding>) {
         let mut ports: Vec<PortBinding> = Vec::new();
         for (port, source) in &self.ports {
-            let src = match source {
-                PortInput::Channel(ch) => PortSource::Channel(context::intern_channel(ch.state())),
-                PortInput::Const(t) => {
-                    let cd = t
-                        .as_const_data()
-                        .expect("a const port source must be a Tensor::constant");
-                    PortSource::Const {
-                        dtype: cd.dtype,
-                        shape: cd.shape,
-                        data: cd.bytes,
-                    }
-                }
-            };
+            let src = PortSource::Channel(context::intern_channel(source.0.state()));
             ports.push(PortBinding {
                 port: *port,
                 source: src,
@@ -339,12 +320,6 @@ impl<'a> Builder<'a> {
             results.push(res);
         }
         (results, ports)
-    }
-}
-
-impl<'a> Default for Builder<'a> {
-    fn default() -> Self {
-        Builder::new()
     }
 }
 

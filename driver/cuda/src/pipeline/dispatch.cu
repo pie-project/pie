@@ -218,7 +218,7 @@ constexpr std::uint64_t kNoDescriptorReadyOffset =
     std::numeric_limits<std::uint64_t>::max();
 constexpr std::size_t kDescriptorCopiesPerBlock = 8;
 constexpr std::size_t kDescriptorCopyChunkBytes = 4096;
-constexpr std::size_t kFixedDecodeMaxLanes = 512;
+constexpr std::size_t kFixedDecodeInitialLanes = 512;
 constexpr std::size_t kFixedDecodePortCount = 7;
 
 struct DescriptorPackCopy {
@@ -453,7 +453,7 @@ __global__ void compose_fixed_decode(
     if (valid) {
         const auto* commit =
             fixed_decode_pointer<std::uint32_t>(
-                descriptor->pass_commit);
+            descriptor->pass_commit);
         valid = commit != nullptr && *commit != 0;
         for (std::size_t port = 0;
              port < kFixedDecodePortCount;
@@ -686,9 +686,18 @@ class FixedDecodeUploadArena {
         for (HostSlot& slot : host_slots_) slot.pending = false;
 
         const std::size_t lane_capacity =
-            grown_capacity(lane_capacity_, lanes, kFixedDecodeMaxLanes);
+            grown_capacity(lane_capacity_, lanes, kFixedDecodeInitialLanes);
         const std::size_t translation_capacity =
             grown_capacity(translation_capacity_, translations, 16384);
+        if (lane_capacity >
+                std::numeric_limits<std::size_t>::max() /
+                    sizeof(FixedDecodeLane) ||
+            translation_capacity >
+                std::numeric_limits<std::size_t>::max() /
+                    sizeof(std::uint32_t)) {
+            throw std::runtime_error(
+                "fixed-decode upload capacity overflow");
+        }
         FixedDecodeLane* device_lanes = nullptr;
         std::uint32_t* device_translation = nullptr;
         CUDA_CHECK(cudaMalloc(
@@ -1055,10 +1064,10 @@ class DecodeEnvelopeUploadArena {
         }
         CUDA_CHECK(cudaStreamSynchronize(stream));
         const std::size_t capacity =
-            std::max({required, capacity_, kFixedDecodeMaxLanes});
+            std::max({required, capacity_, kFixedDecodeInitialLanes});
         const std::size_t pages_capacity = std::max(
             {required_pages, pages_capacity_,
-             kFixedDecodeMaxLanes});
+             kFixedDecodeInitialLanes});
         if (capacity >
                 std::numeric_limits<std::size_t>::max() /
                     sizeof(DecodeEnvelopeLane) ||
@@ -2788,7 +2797,16 @@ void Dispatch::close_instance(std::uint64_t instance_id) {
 
 int Dispatch::close_channel(std::uint64_t channel_id, std::string* err) {
     if (err) err->clear();
-    return impl_->channels.close_endpoint(channel_id, err)
+    drain_reaped_instances(*impl_);
+    const bool has_active_attachment = std::any_of(
+        impl_->instances.begin(),
+        impl_->instances.end(),
+        [channel_id](const auto& entry) {
+            const auto& ids = entry.second.channel_ids;
+            return std::find(ids.begin(), ids.end(), channel_id) != ids.end();
+        });
+    return impl_->channels.close_endpoint(
+               channel_id, err, !has_active_attachment)
         ? PIE_STATUS_OK
         : (impl_->channels.contains(channel_id)
                ? PIE_STATUS_INVALID_ARGUMENT
@@ -4442,8 +4460,7 @@ bool Dispatch::enqueue_decode_envelopes(
         const PortBinding* embed_indptr = nullptr;
         for (const PortBinding& binding :
              found->second.trace->ports) {
-            if (binding.port == kPortEmbedIndptr &&
-                       binding.is_const) {
+            if (binding.port == kPortEmbedIndptr) {
                 embed_indptr = &binding;
             } else if (!binding.is_const) {
                 if (binding.port == kPortEmbedTokens) {
@@ -4467,7 +4484,7 @@ bool Dispatch::enqueue_decode_envelopes(
         std::vector<std::uint32_t> qo_indptr;
         if (embed_indptr == nullptr) {
             qo_indptr = {0, token_shape[0]};
-        } else {
+        } else if (embed_indptr->is_const) {
             if (embed_indptr->const_data.size() % sizeof(std::uint32_t) != 0) {
                 return fail(
                     "decode envelope: const EmbedIndptr is not u32-aligned");
@@ -4478,6 +4495,11 @@ bool Dispatch::enqueue_decode_envelopes(
                 qo_indptr.data(),
                 embed_indptr->const_data.data(),
                 embed_indptr->const_data.size());
+        } else {
+            qo_indptr.resize(static_cast<std::size_t>(token_shape[0]) + 1);
+            for (std::size_t row = 0; row < qo_indptr.size(); ++row) {
+                qo_indptr[row] = static_cast<std::uint32_t>(row);
+            }
         }
         if (qo_indptr.size() < 2 ||
             qo_indptr.front() != 0 ||
@@ -4632,7 +4654,6 @@ bool Dispatch::enqueue_fixed_decode(
     StagedLaunch::State& staged = *launch.state_;
     const std::size_t programs = view.ptir_program_hashes.size();
     if (programs == 0 ||
-        programs > kFixedDecodeMaxLanes ||
         view.ptir_program_instances.size() != programs ||
         staged.lanes.size() != programs ||
         !staged.active ||
@@ -4731,12 +4752,9 @@ bool Dispatch::enqueue_fixed_decode(
             }
             program_ports.by_tag[binding.port] = &binding;
         }
-        if (program_ports.by_tag[kPortEmbedIndptr] != nullptr ||
-            program_ports.by_tag[kPortReadout] != nullptr ||
-            program_ports.by_tag[kPortAttnMask] != nullptr) {
+        if (program_ports.by_tag[kPortAttnMask] != nullptr) {
             if (err != nullptr) {
-                *err = "ptir fixed decode cannot compose embed-indptr, "
-                       "readout, or attention-mask ports";
+                *err = "ptir fixed decode cannot compose attention-mask ports";
             }
             return false;
         }
@@ -4772,7 +4790,13 @@ bool Dispatch::enqueue_fixed_decode(
             channel_dtype(kPortPageIndptr) != DType::U32 ||
             channel_dtype(kPortKvLen) != DType::U32 ||
             channel_dtype(kPortWSlot) != DType::U32 ||
-            channel_dtype(kPortWOff) != DType::U32) {
+            channel_dtype(kPortWOff) != DType::U32 ||
+            (program_ports.by_tag[kPortEmbedIndptr] != nullptr &&
+             (channel_numel(kPortEmbedIndptr) != 2 ||
+              channel_dtype(kPortEmbedIndptr) != DType::U32)) ||
+            (program_ports.by_tag[kPortReadout] != nullptr &&
+             (channel_numel(kPortReadout) != 1 ||
+              channel_dtype(kPortReadout) != DType::U32))) {
             if (err != nullptr) {
                 *err = "ptir fixed decode channel shapes or dtypes do not "
                        "match the envelope";
@@ -5065,7 +5089,6 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
         // bucket with device-side pad rows, so the template no longer
         // requires R to sit exactly on the lattice.
         if (!allow_device_composed || staged == nullptr ||
-            n_prog > kFixedDecodeMaxLanes ||
             page_size == 0 || device_pages == 0 ||
             !view.rs_slot_ids.empty() ||
             !view.rs_fold_lens.empty() ||
@@ -5080,9 +5103,9 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
         }
         ResolvedPrograms candidate;
         candidate.per_program.resize(n_prog);
-        candidate.is_device_geometry.assign(n_prog, 1);
-        candidate.device_count = n_prog;
-        candidate.device_composed = true;
+        candidate.is_device_geometry.assign(n_prog, 0);
+        candidate.device_count = 0;
+        bool all_decode_envelopes = true;
         auto constant_is = [](const PortBinding* binding,
                               std::span<const std::uint32_t> expected) {
             if (binding == nullptr) return true;
@@ -5100,6 +5123,10 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
         for (std::size_t p = 0; p < n_prog; ++p) {
             BoundInstance& instance = s.instances.at(
                 view.ptir_program_instances.data()[p]);
+            if (instance.geometry_class == PIE_GEOMETRY_CLASS_HOST) {
+                all_decode_envelopes = false;
+                continue;
+            }
             if (instance.geometry_class !=
                     PIE_GEOMETRY_CLASS_DECODE_ENVELOPE ||
                 instance.trace == nullptr) {
@@ -5116,14 +5143,14 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
                 if (slot != nullptr) return false;
                 slot = &binding;
             }
-            if (dynamic[kPortEmbedIndptr] != nullptr ||
-                dynamic[kPortReadout] != nullptr ||
-                dynamic[kPortAttnMask] != nullptr ||
+            if (dynamic[kPortAttnMask] != nullptr ||
                 constants[kPortAttnMask] != nullptr ||
-                !constant_is(
-                    constants[kPortEmbedIndptr], default_indptr) ||
-                !constant_is(
-                    constants[kPortReadout], default_readout)) {
+                (dynamic[kPortEmbedIndptr] == nullptr &&
+                 !constant_is(
+                     constants[kPortEmbedIndptr], default_indptr)) ||
+                (dynamic[kPortReadout] == nullptr &&
+                 !constant_is(
+                     constants[kPortReadout], default_readout))) {
                 return false;
             }
             constexpr std::array<std::uint8_t, 7> required{
@@ -5155,10 +5182,22 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
             const Channel* kv_len = channel(kPortKvLen);
             const Channel* w_slot = channel(kPortWSlot);
             const Channel* w_off = channel(kPortWOff);
+            const Channel* embed_indptr =
+                dynamic[kPortEmbedIndptr] != nullptr
+                    ? channel(kPortEmbedIndptr)
+                    : nullptr;
+            const Channel* readout =
+                dynamic[kPortReadout] != nullptr
+                    ? channel(kPortReadout)
+                    : nullptr;
             if (tokens == nullptr || positions == nullptr ||
                 pages == nullptr || page_indptr == nullptr ||
                 kv_len == nullptr || w_slot == nullptr ||
-                w_off == nullptr) {
+                w_off == nullptr ||
+                (dynamic[kPortEmbedIndptr] != nullptr &&
+                 embed_indptr == nullptr) ||
+                (dynamic[kPortReadout] != nullptr &&
+                 readout == nullptr)) {
                 return false;
             }
             const auto& page_dims = pages->type.shape.dims;
@@ -5178,7 +5217,14 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
                 page_indptr->type.dtype != DType::U32 ||
                 kv_len->type.dtype != DType::U32 ||
                 w_slot->type.dtype != DType::U32 ||
-                w_off->type.dtype != DType::U32) {
+                w_off->type.dtype != DType::U32 ||
+                (embed_indptr != nullptr &&
+                 (embed_indptr->type.dtype != DType::U32 ||
+                  embed_indptr->type.shape.dims !=
+                      std::vector<std::uint32_t>{2})) ||
+                (readout != nullptr &&
+                 (readout->type.dtype != DType::U32 ||
+                  readout->type.shape.numel() != 1))) {
                 return false;
             }
             const std::uint32_t translation_begin =
@@ -5204,7 +5250,11 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
             geometry.w_off = {0};
             geometry.has_kv_family = true;
             geometry.has_write_desc = true;
+            candidate.is_device_geometry[p] = 1;
+            ++candidate.device_count;
         }
+        if (candidate.device_count == 0) return false;
+        candidate.device_composed = all_decode_envelopes;
         out = std::move(candidate);
         return true;
     };
@@ -5212,6 +5262,9 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
 
     out.per_program.resize(n_prog);
     out.is_device_geometry.assign(n_prog, 0);
+    const bool resolve_device_mask =
+        view.has_user_mask && view.flattened_masks.empty();
+    bool resolved_mask = false;
     std::vector<detail::PortCellCache> cached_cells(n_prog);
     // Pull host-writer rings on the descriptor stream: the readback pack
     // below is ordered behind these copies and its `read` synchronizes the
@@ -5282,13 +5335,20 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
             view.ptir_program_instances.data()[p];
         auto it = s.instances.find(iid);
         const Trace* trace = it->second.trace;
-        if (it->second.geometry_class == PIE_GEOMETRY_CLASS_HOST) continue;
+        const bool mask_only =
+            it->second.geometry_class == PIE_GEOMETRY_CLASS_HOST &&
+            resolve_device_mask;
+        if (it->second.geometry_class == PIE_GEOMETRY_CLASS_HOST &&
+            !mask_only) {
+            continue;
+        }
         const std::unordered_set<std::uint32_t>* pending_slots =
             staged == nullptr
                 ? nullptr
                 : &staged->lanes[p]->prior_put_slots;
         for (const PortBinding& binding : trace->ports) {
             if (binding.is_const) continue;
+            if (mask_only && binding.port != kPortAttnMask) continue;
             ChannelView& channel_view = it->second.instance->view();
             const std::uint32_t slot =
                 channel_view.slot(binding.channel);
@@ -5368,8 +5428,10 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
     }
     if (staged != nullptr) {
         for (std::size_t p = 0; p < n_prog; ++p) {
-            if (s.instances.at(view.ptir_program_instances.data()[p])
-                    .geometry_class == PIE_GEOMETRY_CLASS_HOST) {
+            const auto& instance =
+                s.instances.at(view.ptir_program_instances.data()[p]);
+            if (instance.geometry_class == PIE_GEOMETRY_CLASS_HOST &&
+                !resolve_device_mask) {
                 continue;
             }
             pack_copies.push_back(DescriptorPackCopy{
@@ -5421,7 +5483,13 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
         const std::uint64_t iid = view.ptir_program_instances.data()[p];
         auto it = s.instances.find(iid);
         const Trace* trace = it->second.trace;
-        if (it->second.geometry_class == PIE_GEOMETRY_CLASS_HOST) continue;
+        const bool mask_only =
+            it->second.geometry_class == PIE_GEOMETRY_CLASS_HOST &&
+            resolve_device_mask;
+        if (it->second.geometry_class == PIE_GEOMETRY_CLASS_HOST &&
+            !mask_only) {
+            continue;
+        }
 
         const std::unordered_set<std::uint32_t>* pending_slots = nullptr;
         if (staged != nullptr) {
@@ -5434,6 +5502,16 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
         }
 
         FireGeometry& fg = out.per_program[p];
+        if (mask_only) {
+            if (!resolve_attention_mask(
+                    *trace, it->second.instance->view(), fg, err,
+                    allow_structured_masks, pending_slots,
+                    &cached_cells[p])) {
+                return false;
+            }
+            resolved_mask = true;
+            continue;
+        }
         if (!resolve_fire_geometry(
                 *trace, it->second.instance->view(), page_size, fg, err,
                 allow_structured_masks, pending_slots,
@@ -5495,7 +5573,7 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
         out.is_device_geometry[p] = 1;
         ++out.device_count;
     }
-    return out.device_count > 0;
+    return out.device_count > 0 || resolved_mask;
 }
 
 }  // namespace pie_cuda_driver::pipeline

@@ -339,6 +339,12 @@ std::string build_caps_json(const Config& cfg,
 
 class Context::Impl {
   public:
+    struct LaunchDemand {
+        std::uint32_t kv_pages = 0;
+        std::uint32_t state_slots = 0;
+        std::uint32_t token_rows = 0;
+    };
+
     // Tear the MetalExecutor (Metal device/heap/PSO objects) down ON the
     // worker thread that created + exclusively drove them (Phase 3, §7 thread-
     // affinity). `worker_.run` drains behind any still-queued jobs first (FIFO),
@@ -406,12 +412,18 @@ class Context::Impl {
             load.load_plan_bytes.ptr + load.load_plan_bytes.len);
         compiler_version_ = load.compiler_version;
         facts_ = read_model_facts(cfg_.model.hf_path);
-        caps_json_ = build_caps_json(cfg_, facts_);
         std::string error;
         if (!ensure_executor(error)) {
             std::cerr << "[pie-driver-metal] load_model: " << error << "\n";
             return PIE_STATUS_UNSUPPORTED;
         }
+        nlohmann::json capabilities =
+            nlohmann::json::parse(build_caps_json(cfg_, facts_));
+        capabilities["elastic_page_bytes"] =
+            executor_->elastic_page_bytes();
+        capabilities["elastic_budget_pages"] =
+            executor_->elastic_budget_pages();
+        caps_json_ = capabilities.dump();
         if (caps != nullptr) {
             caps->json_bytes =
                 reinterpret_cast<const std::uint8_t*>(caps_json_.data());
@@ -516,7 +528,47 @@ class Context::Impl {
     // §4.4 publication (channel words → terminals → per-channel notifies → the
     // batch notify, exactly once) off the caller thread. Non-forward
     // (channel-plane C1) members settle the same way, just without a forward.
+    static LaunchDemand launch_demand(const PieLaunchDesc& launch) {
+        LaunchDemand demand;
+        demand.kv_pages = launch.required_kv_pages;
+        auto include_pages = [&demand](PieU32Slice pages) {
+            if (pages.len == 0) return;
+            demand.kv_pages = std::max(
+                demand.kv_pages,
+                *std::max_element(pages.ptr, pages.ptr + pages.len) + 1);
+        };
+        include_pages(launch.kv_page_indices);
+        auto include_slots = [&demand](PieU32Slice slots) {
+            if (slots.len == 0) return;
+            demand.state_slots = std::max(
+                demand.state_slots,
+                *std::max_element(slots.ptr, slots.ptr + slots.len) + 1);
+        };
+        include_slots(launch.rs_slot_ids);
+        include_slots(launch.rs_buffer_slot_ids);
+        demand.token_rows = static_cast<std::uint32_t>(
+            std::min<std::size_t>(
+                std::numeric_limits<std::uint32_t>::max(),
+                std::max(launch.token_ids.len, launch.instance_ids.len)));
+        return demand;
+    }
+
+    static bool demand_covers(
+        const LaunchDemand& reserved,
+        const LaunchDemand& actual) {
+        return reserved.kv_pages >= actual.kv_pages &&
+               reserved.state_slots >= actual.state_slots &&
+               reserved.token_rows >= actual.token_rows;
+    }
+
     int launch(const PieLaunchDesc& launch, PieCompletion completion) {
+        return launch_impl(launch, completion, 0);
+    }
+
+    int launch_impl(
+        const PieLaunchDesc& launch,
+        PieCompletion completion,
+        std::uint64_t lease_id) {
         std::unique_lock<std::mutex> lock_holder(state_mutex_);
         std::vector<InstanceRecord*> members;
         members.reserve(launch.instance_ids.len);
@@ -584,6 +636,7 @@ class Context::Impl {
         // worker so a close racing the in-flight job is handled, not UAF'd.
         auto job = std::make_shared<LaunchJobData>();
         job->completion = completion;
+        job->lease_id = lease_id;
         job->launch = executor::OwnedLaunchView::capture(launch);
         job->members.resize(members.size());
         for (std::size_t m = 0; m < members.size(); ++m) {
@@ -628,6 +681,81 @@ class Context::Impl {
         return PIE_STATUS_OK;
     }
 
+    int prepare_launch(
+        const PieLaunchDesc& launch,
+        PieLaunchPrepareResult* result) {
+        if (result == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
+        *result = PieLaunchPrepareResult{};
+        const LaunchDemand demand = launch_demand(launch);
+        int status = PIE_STATUS_OK;
+        worker_.run([&] {
+            std::string error;
+            if (!ensure_executor(error)) {
+                status = PIE_STATUS_UNSUPPORTED;
+                return;
+            }
+            const std::uint64_t budget_pages =
+                executor_->elastic_budget_pages();
+            result->budget_pages = budget_pages;
+            if (demand.kv_pages > executor_->kv_pool_total_pages() ||
+                demand.state_slots > executor_->rs_slots() ||
+            demand.token_rows > cfg_.batching.max_forward_tokens) {
+                result->outcome = PIE_LAUNCH_PREPARE_IMPOSSIBLE;
+                result->required_pages = budget_pages + 1;
+                return;
+            }
+            if (!executor_->ensure_launch_storage(
+                    demand.kv_pages,
+                    demand.state_slots,
+                    demand.token_rows,
+                    &error)) {
+                result->outcome = PIE_LAUNCH_PREPARE_EXHAUSTED;
+                result->required_pages =
+                    executor_->elastic_committed_pages() + 1;
+                return;
+            }
+            result->required_pages = executor_->elastic_committed_pages();
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            std::uint64_t lease_id = next_launch_lease_id_++;
+            if (lease_id == 0) lease_id = next_launch_lease_id_++;
+            pending_launch_leases_.emplace(lease_id, demand);
+            result->outcome = PIE_LAUNCH_PREPARE_READY;
+            result->lease_id = lease_id;
+        });
+        return status;
+    }
+
+    int launch_prepared(
+        const PieLaunchDesc& launch,
+        std::uint64_t lease_id,
+        PieCompletion completion) {
+        if (lease_id == 0) return PIE_STATUS_INVALID_ARGUMENT;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            const auto found = pending_launch_leases_.find(lease_id);
+            if (found == pending_launch_leases_.end() ||
+                !demand_covers(found->second, launch_demand(launch))) {
+                return PIE_STATUS_INVALID_ARGUMENT;
+            }
+            in_flight_launch_leases_.emplace(lease_id, found->second);
+            pending_launch_leases_.erase(found);
+        }
+        const int status = launch_impl(launch, completion, lease_id);
+        if (status != PIE_STATUS_OK) {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            in_flight_launch_leases_.erase(lease_id);
+        }
+        return status;
+    }
+
+    int release_launch(std::uint64_t lease_id) {
+        if (lease_id == 0) return PIE_STATUS_INVALID_ARGUMENT;
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        return pending_launch_leases_.erase(lease_id) == 1
+            ? PIE_STATUS_OK
+            : PIE_STATUS_INVALID_ARGUMENT;
+    }
+
     // Phase 3 (review item 1): the OWNED, async settlement of one accepted
     // launch, executed on the executor worker thread. Publishes in the §4.4
     // order (channel words while settling → terminal cells → per-channel
@@ -648,6 +776,15 @@ class Context::Impl {
         const std::size_t M = job->members.size();
         std::vector<std::uint32_t> outcomes(M, PIE_TERMINAL_OUTCOME_SUCCESS);
         std::vector<std::pair<std::uint64_t, std::uint64_t>> notifications;
+        std::string kv_commit_error;
+        const bool kv_commit_failed =
+            job->launch.required_kv_pages != 0 &&
+            (executor_ == nullptr ||
+             !executor_->ensure_kv_pages(
+                 job->launch.required_kv_pages, &kv_commit_error));
+        if (kv_commit_failed && kv_commit_error.empty()) {
+            kv_commit_error = "Metal KV commit failed";
+        }
 #if defined(__APPLE__)
         struct PendingM3Group {
             std::vector<std::size_t> members;
@@ -676,6 +813,10 @@ class Context::Impl {
             job->fwd_descs.clear();
             for (std::size_t m = 0; m < M; ++m) {
                 LaunchMember& lm = job->members[m];
+                if (kv_commit_failed) {
+                    lm.build_err = kv_commit_error;
+                    continue;
+                }
                 InstanceRecord* instance = registry_.find_instance(lm.instance_id);
                 if (instance == nullptr) {
                     lm.build_err = "instance closed before execution";
@@ -1295,6 +1436,10 @@ class Context::Impl {
         }
         for (const auto& [wait_id, epoch] : notifications) notify(wait_id, epoch);
         notify(job->completion.wait_id, job->completion.target_epoch);
+        if (job->lease_id != 0) {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            in_flight_launch_leases_.erase(job->lease_id);
+        }
         if (cfg_.runtime.verbose) {
             const M0TimingSnapshot timing =
                 m0_timing_counters().snapshot() - timing_before;
@@ -1471,9 +1616,8 @@ class Context::Impl {
     }
 
     int resize_pool_impl(const PiePoolResizeDesc& resize, PieCompletion completion) {
-        if (resize.pool_id != 0) {
-            std::cerr << "[pie-driver-metal] resize_pool: UNSUPPORTED — only pool_id 0 (the "
-                         "one paged KV pool this bridge creates) exists\n";
+        if (resize.pool_id > PIE_ELASTIC_POOL_WORKSPACE) {
+            std::cerr << "[pie-driver-metal] resize_pool: unknown elastic pool id\n";
             return PIE_STATUS_UNSUPPORTED;
         }
         if (!facts_.has_linear_attn) {
@@ -1481,12 +1625,34 @@ class Context::Impl {
                          "supports the qwen3.6 (GDN-hybrid) checkpoint geometry\n";
             return PIE_STATUS_UNSUPPORTED;
         }
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            if (!pending_launch_leases_.empty() ||
+                !in_flight_launch_leases_.empty()) {
+                return PIE_STATUS_UNSUPPORTED;
+            }
+        }
         std::string err;
         if (!ensure_executor(err)) {
             std::cerr << "[pie-driver-metal] resize_pool: " << err << "\n";
             return PIE_STATUS_UNSUPPORTED;
         }
-        const std::uint32_t current_pages = executor_->kv_pool_total_pages();
+        if (resize.pool_id != PIE_ELASTIC_POOL_KV) {
+            if (!executor_->resize_elastic_pool(
+                    resize.pool_id,
+                    resize.target_pages,
+                    &err)) {
+                std::cerr << "[pie-driver-metal] resize_pool: " << err << "\n";
+                return PIE_STATUS_DRIVER_ERROR;
+            }
+            publish_terminal(
+                completion.terminal_cell,
+                PIE_TERMINAL_OUTCOME_SUCCESS);
+            notify(completion.wait_id, completion.target_epoch);
+            return PIE_STATUS_OK;
+        }
+        const std::uint32_t current_pages =
+            executor_->kv_pool_committed_pages();
         if (current_pages == 0) {
             std::cerr << "[pie-driver-metal] resize_pool: UNSUPPORTED — no paged KV pool is "
                          "allocated (config total_pages/kv_page_size produced a zero-sized "
@@ -1865,6 +2031,9 @@ class Context::Impl {
     // can never race an in-flight forward's settlement. Declared BEFORE the
     // worker + executor so it outlives them at teardown.
     std::mutex state_mutex_;
+    std::unordered_map<std::uint64_t, LaunchDemand> pending_launch_leases_;
+    std::unordered_map<std::uint64_t, LaunchDemand> in_flight_launch_leases_;
+    std::uint64_t next_launch_lease_id_ = 1;
     // Phase 3 (§7, D4): the single thread that owns every MetalExecutor /
     // RawMetalContext touch. Executor setup, forward_batch, and the copy/
     // resize control ops all run here (via `worker_.run`), giving Metal
@@ -1918,6 +2087,23 @@ int Context::bind_instance(
 
 int Context::launch(const PieLaunchDesc& launch, PieCompletion completion) {
     return impl_->launch(launch, completion);
+}
+
+int Context::prepare_launch(
+    const PieLaunchDesc& launch,
+    PieLaunchPrepareResult* result) {
+    return impl_->prepare_launch(launch, result);
+}
+
+int Context::launch_prepared(
+    const PieLaunchDesc& launch,
+    std::uint64_t lease_id,
+    PieCompletion completion) {
+    return impl_->launch_prepared(launch, lease_id, completion);
+}
+
+int Context::release_launch(std::uint64_t lease_id) {
+    return impl_->release_launch(lease_id);
 }
 
 int Context::copy_kv(const PieKvCopyDesc& copy, PieCompletion completion) {

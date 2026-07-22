@@ -8,7 +8,7 @@
 // device memory budget.
 //
 // Everything that the driver consumes from the planner — the chosen
-// `kv_page_size`, capacity limits, KV/state byte budgets — is bundled in
+// `kv_page_size`, shape limits, and object-to-byte coefficients — is bundled in
 // `CudaMemoryPlan`. The bounded `PlannedForwardLimits` substructure is
 // what the executor passes downstream so per-fire allocators know the
 // maximum shape they need to support.
@@ -46,13 +46,10 @@ struct CudaMemoryPlan {
     int max_workspace_tokens = 0;
     int max_requests = 0;
     int max_page_refs = 0;
-    int kv_pages = 0;
-    int state_slots = 0;
+    std::size_t kv_page_bytes = 0;
     std::size_t attn_float_workspace_bytes = 0;
     std::size_t runtime_quant_scratch_bytes = 0;
-    std::size_t arena_bytes = 0;
-    std::size_t kv_bytes = 0;
-    std::size_t state_bytes = 0;
+    std::size_t persistent_input_bytes = 0;
     PlannedForwardLimits capacity;
 };
 
@@ -80,6 +77,9 @@ CudaMemoryPlan plan_cuda_memory(
     int qwen3_5_linear_layers,
     bool nemotron_h_selected,
     int nemotron_h_mamba_layers,
+    bool deepseek_v4_selected,
+    bool kimi_selected,
+    bool glm5_selected,
     const KvCacheFormat& kv_format,
     const ops::RuntimeQuantScratchSpec& runtime_quant_scratch_base,
     bool verbose);

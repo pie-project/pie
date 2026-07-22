@@ -11,6 +11,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <memory>
 #include <vector>
 
 #include "kv_cache_format.hpp"
@@ -18,6 +19,8 @@
 #include "../tensor.hpp"
 
 namespace pie_cuda_driver {
+
+class CudaArenaAllocator;
 
 class KvCache {
 public:
@@ -130,6 +133,12 @@ public:
     };
     std::vector<PageBuffer> page_buffers(int layer);
 
+    void set_elastic_allocator(
+        std::shared_ptr<CudaArenaAllocator> allocator) noexcept;
+    void ensure_pages(int pages);
+    void trim_pages(int pages);
+    std::size_t committed_bytes() const noexcept;
+
 private:
     int resolve_(int layer) const noexcept {
         return kv_source_layer_.empty() ? layer : kv_source_layer_[layer];
@@ -155,6 +164,7 @@ private:
     std::vector<int> per_layer_head_dim_;
     std::vector<int> kv_source_layer_;
     std::vector<int> per_layer_num_kv_heads_;
+    std::shared_ptr<CudaArenaAllocator> elastic_allocator_;
 };
 
 struct HfConfig;

@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <stdexcept>
 
 #include <cuda_runtime.h>
 
@@ -117,7 +118,8 @@ void prepare_llama_like_decode_plan(
     const std::uint32_t* kv_last_page_lens_d,
     int total_tokens,
     int num_requests,
-    bool is_pure_decode)
+    bool is_pure_decode,
+    bool have_custom_mask)
 {
     // The prepare hook runs OUTSIDE any cuStreamCapture region. It updates
     // pinned/device buffers in `attn_ws` that the captured body reads via
@@ -127,6 +129,35 @@ void prepare_llama_like_decode_plan(
     state.xqa_max_pages_per_seq = 0;
     state.use_prefill_plan = false;
     state.use_prefill_decode_plan = false;
+    if (have_custom_mask) {
+        if (!state.prefill_plan) {
+            state.prefill_plan = ops::make_prefill_plan();
+        }
+        const int T = (fwd_cfg.tp_size > 0) ? fwd_cfg.tp_size : 1;
+        const int num_q_heads_local  = cfg.num_attention_heads / T;
+        const int num_kv_heads_local = cfg.num_key_value_heads / T;
+        ops::plan_attention_flashinfer_prefill_bf16(
+            *state.prefill_plan,
+            qo_indptr_h,
+            kv_page_indptr_h,
+            kv_last_page_lens_h,
+            total_tokens,
+            num_requests,
+            num_q_heads_local,
+            num_kv_heads_local,
+            cfg.head_dim_kernel,
+            cache.page_size(),
+            attn_ws,
+            /*stream=*/nullptr,
+            fwd_cfg.decode_plan_cuda_graph,
+            /*window_left=*/-1,
+            /*full_attention_variant=*/false,
+            cache.hnd_layout(),
+            /*causal_mask=*/false,
+            /*custom_mask=*/true);
+        state.use_prefill_plan = true;
+        return;
+    }
     if (is_pure_decode && fwd_cfg.use_xqa_decode &&
         cache.format().is_native_bf16() && !cache.hnd_layout()) {
         int max_pages = 1;
@@ -250,6 +281,9 @@ std::uint32_t llama_like_decode_graph_layout(
     }
     if (state.use_prefill_decode_plan && state.prefill_decode_plan) {
         return ops::prefill_plan_graph_layout(*state.prefill_decode_plan);
+    }
+    if (state.use_prefill_plan && state.prefill_plan) {
+        return ops::prefill_plan_graph_layout(*state.prefill_plan);
     }
     if (!state.decode_plan) return 0;
     return ops::decode_plan_graph_layout(*state.decode_plan);
@@ -649,12 +683,16 @@ void llama_like_forward_paged(
                 attn_ws, stream, layer_window_left,
                 /*logits_soft_cap=*/0.f, sm_scale_override);
         } else if (custom_mask_d) {
-            ops::launch_attention_flashinfer_prefill_custom(
+            if (!plan_state.use_prefill_plan || prefill_plan == nullptr) {
+                throw std::runtime_error(
+                    "custom attention mask has no prepared prefill plan");
+            }
+            ops::dispatch_attention_flashinfer_prefill_custom(
+                *prefill_plan,
                 attn_q, kv_view, attn_out_buf,
-                qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                custom_mask_d, custom_mask_indptr_d,
-                qo_indptr_h, kv_page_indptr_h,
-                N, R, num_q_heads_local, attn_ws, stream);
+                qo_indptr, kv_page_indices, kv_page_indptr,
+                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+                attn_ws, stream);
         } else if (plan_state.use_prefill_plan && prefill_plan != nullptr) {
             const int num_pages_in_batch = kv_page_indptr_h[R];
             kernels::launch_dequant_kv_cache_layer_to_bf16_active(

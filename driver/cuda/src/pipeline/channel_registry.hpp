@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <limits>
+#include <map>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -187,6 +188,8 @@ class DeviceChannelRegistry {
             return false;
         }
         const std::size_t old_cell_capacity = cell_capacity_[slot];
+        const std::size_t old_mirror_capacity =
+            host_mirror_capacity_[slot];
         const bool fresh_words = host_words_[slot] == nullptr;
         auto reg_mark = reg_timing ? fire_timing::Clock::now()
                                    : fire_timing::Clock::time_point{};
@@ -246,7 +249,19 @@ class DeviceChannelRegistry {
                    << R"(,"slot":)" << slot
                    << R"(,"cell_grew":)"
                    << (cell_capacity_[slot] > old_cell_capacity ? "true" : "false")
+                   << R"(,"mirror_grew":)"
+                   << (host_mirror_capacity_[slot] > old_mirror_capacity
+                           ? "true"
+                           : "false")
                    << R"(,"fresh_words":)" << (fresh_words ? "true" : "false")
+                   << R"(,"required_cell_bytes":)" << required_cell_bytes
+                   << R"(,"mirror_bytes":)" << mirror_bytes
+                   << R"(,"wire_bytes":)" << wire_bytes
+                   << R"(,"native_bytes":)" << native_bytes
+                   << R"(,"ring_capacity":)" << ring_cap1
+                   << R"(,"dtype":)" << static_cast<unsigned>(desc.dtype)
+                   << R"(,"host_role":)"
+                   << static_cast<unsigned>(desc.host_role)
                    << R"(,"alloc_us":)" << alloc_us
                    << R"(,"init_us":)" << init_us
                    << R"(,"staging_us":)" << staging_us
@@ -258,6 +273,7 @@ class DeviceChannelRegistry {
         slot_of_.emplace(desc.channel_id, slot);
         id_of_[slot] = desc.channel_id;
         refcounts_[slot] = 0;
+        pending_close_[slot] = false;
         dtype_[slot] = desc.dtype;
         host_role_[slot] = desc.host_role;
         reader_wait_ids_[slot] = desc.reader_wait_id;
@@ -296,12 +312,21 @@ class DeviceChannelRegistry {
         return true;
     }
 
-    bool close_endpoint(std::uint64_t id, std::string* err) {
+    bool close_endpoint(
+        std::uint64_t id,
+        std::string* err,
+        bool defer_if_attached = false) {
         settle_initialization();
         auto it = slot_of_.find(id);
         if (it == slot_of_.end()) return false;
         const std::uint32_t slot = it->second;
         if (refcounts_[slot] != 0) {
+            if (defer_if_attached) {
+                std::atomic_ref<std::uint64_t>(host_words_[slot][3]).store(
+                    1, std::memory_order_release);
+                pending_close_[slot] = true;
+                return true;
+            }
             if (err) *err = "ptir: channel still has instance attachments";
             return false;
         }
@@ -317,6 +342,10 @@ class DeviceChannelRegistry {
         auto it = slot_of_.find(id);
         if (it != slot_of_.end()) {
             const std::uint32_t slot = it->second;
+            if (pending_close_[slot]) {
+                if (err) *err = "ptir: channel is closing";
+                return kBadSlot;
+            }
             if (!decl_matches(slot, decl)) {
                 if (err)
                     *err = "ptir: channel " + std::to_string(id) +
@@ -387,6 +416,10 @@ class DeviceChannelRegistry {
         if (extern_dir >= 0) {
             attachment_direction_masks_[slot] &= static_cast<std::uint8_t>(
                 ~(1u << static_cast<std::uint8_t>(extern_dir)));
+        }
+        if (refcounts_[slot] == 0 && pending_close_[slot]) {
+            retire_slot(slot);
+            slot_of_.erase(it);
         }
     }
 
@@ -609,6 +642,9 @@ class DeviceChannelRegistry {
             initialization_stream_));
         std::atomic_ref<std::uint64_t>(host_words_[slot][1]).store(
             1, std::memory_order_release);
+        if (host_role_[slot] == PIE_CHANNEL_HOST_ROLE_WRITER) {
+            pulled_tail_[slot] = 1;
+        }
         initialization_pending_ = true;
     }
 
@@ -757,42 +793,21 @@ class DeviceChannelRegistry {
             enqueuer_stamped_ = true;
         }
 #endif
-        if (!free_slots_.empty()) {
-            // Size-aware recycling: the free list mixes slots whose retained
-            // rings were sized for whatever channel they last held. A LIFO
-            // pick reallocs on every size mismatch (measured: 50 % of
-            // registrations paid a cudaMalloc+cudaFree, whose device-lock
-            // stalls tail out at 2–10 ms ON THE SCHEDULER THREAD). Choose
-            // instead, in order: (1) the smallest retained ring that already
-            // fits — no allocator call at all; (2) a storage-released slot —
-            // cudaMalloc only, nothing to free; (3) the smallest ring
-            // overall — the realloc frees the least. At steady state the
-            // pool converges on the workload's shape classes and
-            // registration becomes allocation-free.
-            std::size_t best_fit = free_slots_.size();
-            std::size_t best_released = free_slots_.size();
-            std::size_t best_smallest = 0;
-            for (std::size_t i = 0; i < free_slots_.size(); ++i) {
-                const std::uint32_t s = free_slots_[i];
-                const std::size_t cap = cell_capacity_[s];
-                if (cap >= required_cell_bytes) {
-                    if (best_fit == free_slots_.size() ||
-                        cap < cell_capacity_[free_slots_[best_fit]]) {
-                        best_fit = i;
-                    }
-                } else if (cap == 0) {
-                    best_released = i;
-                } else if (cap < cell_capacity_[free_slots_[best_smallest]]) {
-                    best_smallest = i;
-                }
-            }
-            const std::size_t pick = best_fit != free_slots_.size()
-                ? best_fit
-                : (best_released != free_slots_.size() ? best_released
-                                                       : best_smallest);
-            const std::uint32_t s = free_slots_[pick];
-            free_slots_[pick] = free_slots_.back();
-            free_slots_.pop_back();
+        // Preserve the old choice exactly without scanning every inactive
+        // slot: smallest retained capacity that fits, then a storage-released
+        // slot, then the smallest retained capacity overall.
+        std::uint32_t reused = kBadSlot;
+        auto fit = free_slots_by_capacity_.lower_bound(required_cell_bytes);
+        if (fit != free_slots_by_capacity_.end()) {
+            reused = pop_free_slot(fit);
+        } else if (!released_slots_.empty()) {
+            reused = released_slots_.back();
+            released_slots_.pop_back();
+        } else if (!free_slots_by_capacity_.empty()) {
+            reused = pop_free_slot(free_slots_by_capacity_.begin());
+        }
+        if (reused != kBadSlot) {
+            const std::uint32_t s = reused;
             if (retained_storage_[s] != 0) {
                 retained_storage_[s] = 0;
                 --inactive_slots_;
@@ -955,6 +970,7 @@ class DeviceChannelRegistry {
         extern_names_[slot].clear();
         attachment_direction_masks_[slot] = 0;
         refcounts_[slot] = 0;
+        pending_close_[slot] = false;
         reader_wait_ids_[slot] = 0;
         writer_wait_ids_[slot] = 0;
         id_of_[slot] = 0;
@@ -981,7 +997,22 @@ class DeviceChannelRegistry {
             inactive_device_bytes_ += device_bytes;
             inactive_host_bytes_ += host_bytes;
         }
-        free_slots_.push_back(slot);
+        if (cell_capacity_[slot] == 0) {
+            released_slots_.push_back(slot);
+        } else {
+            free_slots_by_capacity_[cell_capacity_[slot]].push_back(slot);
+        }
+    }
+
+    std::uint32_t pop_free_slot(
+        std::map<std::size_t, std::vector<std::uint32_t>>::iterator bucket) {
+        std::vector<std::uint32_t>& slots = bucket->second;
+        const std::uint32_t slot = slots.back();
+        slots.pop_back();
+        if (slots.empty()) {
+            free_slots_by_capacity_.erase(bucket);
+        }
+        return slot;
     }
 
     void grow(std::uint32_t new_cap) {
@@ -1083,6 +1114,7 @@ class DeviceChannelRegistry {
         extern_names_.resize(new_cap);
         attachment_direction_masks_.resize(new_cap, 0);
         refcounts_.resize(new_cap, 0);
+        pending_close_.resize(new_cap, false);
         host_head_.resize(new_cap, 0);
         host_tail_.resize(new_cap, 0);
         host_cap1_.resize(new_cap, 1);
@@ -1126,9 +1158,12 @@ class DeviceChannelRegistry {
     std::vector<std::string> extern_names_;
     std::vector<std::uint8_t> attachment_direction_masks_;
     std::vector<bool> seeded_;
+    std::vector<bool> pending_close_;
     std::vector<std::uint32_t> refcounts_;
     std::vector<std::uint32_t> host_head_, host_tail_, host_cap1_;
-    std::vector<std::uint32_t> free_slots_;
+    std::map<std::size_t, std::vector<std::uint32_t>>
+        free_slots_by_capacity_;
+    std::vector<std::uint32_t> released_slots_;
     std::vector<std::uint32_t> pending_initialization_slots_;
     std::uint32_t next_slot_ = 0;
     std::uint32_t cap_slots_ = 0;

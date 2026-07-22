@@ -219,11 +219,7 @@ pub fn new_batched_forward_request_with_capacity(n_requests: usize) -> crate::dr
 
 /// Append the request's `kv_page_indices` to the batch's `kv_page_indices`,
 /// honoring the trim plan if present.
-fn emit_kv_pages(
-    batch: &mut crate::driver::LaunchPlan,
-    pages: &[u32],
-    trim: Option<&TrimPlan>,
-) {
+fn emit_kv_pages(batch: &mut crate::driver::LaunchPlan, pages: &[u32], trim: Option<&TrimPlan>) {
     match trim {
         None => batch.kv_page_indices.extend(pages),
         Some(plan) => {
@@ -292,6 +288,16 @@ pub fn append_request_with_options(
     page_size: u32,
     elide_decode_masks: bool,
 ) {
+    let translation_high_water = req
+        .kv_translation
+        .iter()
+        .copied()
+        .max()
+        .map_or(0, |page| page.saturating_add(1));
+    batch.required_kv_pages = batch
+        .required_kv_pages
+        .max(req.required_kv_pages)
+        .max(translation_high_water);
     if req.qo_indptr.len().saturating_sub(1) > 1 {
         append_multi_row_request(batch, req, last_page_len, page_size);
         return;
@@ -303,7 +309,8 @@ pub fn append_request_with_options(
     batch.token_ids.extend(&req.token_ids);
     batch.position_ids.extend(&req.position_ids);
 
-    let elide_decode_mask = req.device_resolved_geometry
+    let elide_decode_mask = ((req.device_resolved_geometry || req.has_user_mask)
+        && req.masks.is_empty())
         || (elide_decode_masks
             && req.single_token_mode
             && !req.has_user_mask

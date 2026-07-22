@@ -33,11 +33,9 @@ MlaCache MlaCache::allocate(int num_layers,
     for (int i = 0; i < num_layers; ++i) {
         auto ckv = DeviceTensor::allocate(
             dtype, {num_pages, page_size, kv_lora_rank});
-        if (ckv.data()) cudaMemset(ckv.data(), 0, ckv.nbytes());
         c.ckv_layers_.push_back(std::move(ckv));
         auto kpe = DeviceTensor::allocate(
             dtype, {num_pages, page_size, qk_rope_head_dim});
-        if (kpe.data()) cudaMemset(kpe.data(), 0, kpe.nbytes());
         c.kpe_layers_.push_back(std::move(kpe));
     }
     return c;

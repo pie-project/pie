@@ -611,8 +611,8 @@ fn instrument(component_bytes: &[u8]) -> Result<(Vec<u8>, Instrumentation)> {
                         | CanonicalFunction::BackpressureDec
                         | CanonicalFunction::TaskCancel
                         | CanonicalFunction::TaskReturn { .. }
-                        | CanonicalFunction::ContextGet(_)
-                        | CanonicalFunction::ContextSet(_)
+                        | CanonicalFunction::ContextGet { .. }
+                        | CanonicalFunction::ContextSet { .. }
                         | CanonicalFunction::ThreadYield { .. }
                         | CanonicalFunction::SubtaskDrop
                         | CanonicalFunction::WaitableSetNew

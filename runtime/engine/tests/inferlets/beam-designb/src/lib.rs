@@ -30,10 +30,7 @@ use inferlet::ptir::prelude::*;
 use inferlet::{Result, model as wit_model};
 
 const B: u32 = 2; // beams
-const PAGE_T: u32 = 16; // tokens per pool page
 const POOL_PAGES: u32 = 8; // shared pool pages (over-allocated; compaction bounds this)
-const POOL: u32 = POOL_PAGES * PAGE_T; // flat pool token positions
-const NUM_LAYERS: u32 = 28; // Qwen3-0.6B
 const BOS: i32 = 1;
 const MAX_STEPS: usize = 8;
 
@@ -41,7 +38,8 @@ const MAX_STEPS: usize = 8;
 async fn main(_input: String) -> Result<String> {
     let vocab = wit_model::output_vocab_size();
     let v = vocab;
-    model::configure(vocab, PAGE_T, NUM_LAYERS);
+    let page_t = wit_model::kv_page_size();
+    let pool_len = POOL_PAGES * page_t;
 
     // Design B owns a FIXED physical page pool: allocate POOL_PAGES real page
     // slots ONCE (bulk pool growth) and use their PHYSICAL ids for the Pages
@@ -58,10 +56,10 @@ async fn main(_input: String) -> Result<String> {
     // Shared BOS prompt at pool position 0: both beams attend it (mask), and the
     // fire-0 write descriptor lands both BOS at (page pool_ids[0], off 0) — the
     // shared prefix cell. fill = 1 (position 0 filled).
-    let init_mask: Vec<bool> = (0..B).flat_map(|_| (0..POOL).map(|p| p == 0)).collect();
+    let init_mask: Vec<bool> = (0..B).flat_map(|_| (0..pool_len).map(|p| p == 0)).collect();
 
     // Loop-carried state (guest-seeded). w_slot/pages carry PHYSICAL page ids.
-    let mask = Channel::from_shaped([B, POOL], init_mask).named("mask"); // [B, POOL] bool
+    let mask = Channel::from_shaped([B, pool_len], init_mask).named("mask");
     let scores = Channel::from(vec![0.0f32; B as usize]).named("scores");
     let toks = Channel::from(vec![BOS; B as usize]).named("toks");
     let pos = Channel::from(vec![0u32; B as usize]).named("pos");
@@ -88,22 +86,22 @@ async fn main(_input: String) -> Result<String> {
     // device-geometry-fire wire-form).
     let pidx_const: Vec<u32> = (0..=B).map(|b| b * POOL_PAGES).collect();
     let page_indptr = Channel::from_shaped([B + 1], pidx_const.clone()).named("page_indptr");
-    let lanes_b = Tensor::constant((0u32..=B).collect::<Vec<_>>());
+    let lanes_b = Channel::from((0u32..=B).collect::<Vec<_>>()).named("embed_indptr");
 
     let fwd = ForwardPass::new();
-    fwd.embed(&toks, lanes_b);
-    fwd.positions(&pos);
-    // All descriptor ports channel-bound (device-geometry fire wire-form):
-    // Pages ← pages, PageIndptr ← page_indptr, KvLen ← klen, WSlot/WOff ← the
-    // explicit write descriptor. The pool is fixed so these carry constant values.
-    fwd.port_channel(Port::KvLen, &klen);
-    fwd.attn_working_set(&ws, .., ..)?;
-    fwd.derive_dense_geometry();
-    fwd.port_channel(Port::Pages, &pages);
-    fwd.port_channel(Port::PageIndptr, &page_indptr);
-    fwd.port_channel(Port::WSlot, &w_slot);
-    fwd.port_channel(Port::WOff, &w_off);
-    fwd.attn_mask(&mask);
+    fwd.embed(&toks, &lanes_b)?;
+    fwd.attention(
+        &ws,
+        ..,
+        ..,
+        &klen,
+        &pages,
+        &page_indptr,
+        &w_slot,
+        &w_off,
+        &pos,
+        Some(&mask),
+    )?;
     fwd.epilogue(move || {
         // 1. top-B over the flattened [B,V] cand block.
         let cand = add(
@@ -121,10 +119,10 @@ async fn main(_input: String) -> Result<String> {
         let wpos = add(&base_b, &lane); // [B]
 
         // 3. mask evolution: inherit parent's ancestry, OR the new position.
-        let inherited = gather(mask.take(), &parent); // bool [B,POOL]
-        let col = broadcast(reshape(iota(POOL), [1, POOL]), [B, POOL]);
-        let wpos_b = broadcast(reshape(&wpos, [B, 1]), [B, POOL]);
-        let newpos = eq(col, wpos_b); // bool [B,POOL]
+        let inherited = gather(mask.take(), &parent);
+        let col = broadcast(reshape(iota(pool_len), [1, pool_len]), [B, pool_len]);
+        let wpos_b = broadcast(reshape(&wpos, [B, 1]), [B, pool_len]);
+        let newpos = eq(col, wpos_b);
         let new_mask = or(inherited, &newpos);
         mask.put(&new_mask);
 
@@ -132,9 +130,9 @@ async fn main(_input: String) -> Result<String> {
         // PHYSICAL page id: map the flat pool-page index (wpos / PAGE_T) through
         // the physical pool ids. pids [POOL_PAGES] is host-fed each fire.
         let pids = pool_ids_ch.take(); // [POOL_PAGES] physical page ids
-        let logical_slot = div(&wpos, PAGE_T); // [B] index into the pool
+        let logical_slot = div(&wpos, page_t);
         let w_slot_v = gather(&pids, &logical_slot); // [B] physical page id
-        let w_off_v = rem(&wpos, PAGE_T);
+        let w_off_v = rem(&wpos, page_t);
         w_slot.put(&w_slot_v);
         w_off.put(&w_off_v);
 
@@ -196,6 +194,7 @@ async fn main(_input: String) -> Result<String> {
             hyp_tokens.push(t0 as u32);
         }
     }
+    pipeline.close();
 
     let result = format!(
         "BEAM_DESIGNB B={B} steps={} tokens={hyp_tokens:?} (mask-out §6.2 beam, vocab={vocab})",

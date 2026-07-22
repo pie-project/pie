@@ -168,6 +168,21 @@ Glm5Workspace Glm5Workspace::allocate(
     return ws;
 }
 
+std::size_t glm5_workspace_bytes(
+    const HfConfig& cfg,
+    int max_tokens,
+    int max_logit_rows,
+    int max_position_embeddings,
+    int tp_size) {
+    ScopedDeviceAllocationCounter counter;
+    {
+        auto workspace = Glm5Workspace::allocate(
+            cfg, max_tokens, max_logit_rows,
+            max_position_embeddings, tp_size);
+    }
+    return counter.allocated_bytes();
+}
+
 void glm5_forward_paged(
     const Glm5Weights& w,
     const HfConfig& cfg,
@@ -190,6 +205,7 @@ void glm5_forward_paged(
     int total_tokens,
     int num_requests,
     bool is_pure_decode,
+    const std::uint8_t* row_valid_d,
     const std::int32_t* logit_row_indices_d,
     int num_logit_rows)
 {
@@ -334,7 +350,7 @@ void glm5_forward_paged(
         kernels::launch_write_mla_to_pages(
             layer_view, ws.kv_c.data(), ws.k_pe.data(),
             qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            total_tokens, num_requests, stream);
+            total_tokens, num_requests, stream, row_valid_d);
 
         // kv_b_proj_bf16 holds a BF16 copy of the (possibly FP8) kv_b
         // weight that the kimi_mla kernels require.

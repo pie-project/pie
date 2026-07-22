@@ -27,7 +27,7 @@
 #![allow(dead_code)]
 
 use crate::store::kv::hash::{self, Hash256};
-use crate::store::kv::page_table::WorkingSetId;
+use crate::store::kv::page_table::{PhysicalKvPageId, WorkingSetId};
 pub use crate::store::kv::project::PrepareError;
 use crate::store::kv::project::{KvProjection, KvWrite, project_kv};
 use crate::store::kv::write::{KvPreparedWrite, PageCommit, PreparedTarget};
@@ -208,6 +208,89 @@ pub fn realize_declaration(
     }
 
     let prepared = store.prepare_write(ws, &indexes)?;
+    let commits = prepared
+        .targets()
+        .iter()
+        .map(|target| {
+            let index = target.index();
+            Ok(PageCommit {
+                token_hashes: store.page_token_hashes(ws, index)?,
+                page_hash: store.page_hash_at(ws, index)?,
+            })
+        })
+        .collect::<Result<Vec<_>, KvStoreError>>()?;
+    let copies = prepared
+        .copy_plan()
+        .map(|(src, dst)| (src.0, dst.0))
+        .unzip();
+    let (seq, cas_intents) = store.publish_prepared(prepared, &commits)?;
+    store.opacify_suffix(ws, start)?;
+    let (mapping_version, _) = build_translation(store, ws)?;
+    Ok((
+        copies,
+        Some(KvTxn {
+            seq,
+            cas_intents,
+            mapping_version,
+        }),
+    ))
+}
+
+/// Physical-page demand for declaration realization without allocation,
+/// publication, pins, or an open transaction.
+pub fn realize_declaration_demand(
+    store: &mut KvStore,
+    ws: WorkingSetId,
+    writable: std::ops::Range<u64>,
+) -> Result<usize, KvError> {
+    let mapped = store.mapped_len(ws)?;
+    let start = writable.start.min(mapped);
+    let end = writable.end.min(mapped);
+    if start >= end {
+        return Ok(0);
+    }
+    let indexes: Vec<u64> = (start..end).collect();
+    let shared = indexes
+        .iter()
+        .copied()
+        .map(|index| store.privately_writable(ws, index))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .any(|private| !private);
+    if !shared {
+        return Ok(0);
+    }
+    Ok(store.write_demand(ws, &indexes)?)
+}
+
+/// Realize a declaration using caller-owned reserved pages. Consumes only the
+/// required prefix of `granted`; surplus remains caller-owned.
+pub fn realize_declaration_reserved(
+    store: &mut KvStore,
+    ws: WorkingSetId,
+    writable: std::ops::Range<u64>,
+    granted: &mut Vec<PhysicalKvPageId>,
+) -> Result<((Vec<u32>, Vec<u32>), Option<KvTxn>), KvError> {
+    let mapped = store.mapped_len(ws)?;
+    let start = writable.start.min(mapped);
+    let end = writable.end.min(mapped);
+    if start >= end {
+        return Ok(((Vec::new(), Vec::new()), None));
+    }
+    let indexes: Vec<u64> = (start..end).collect();
+    let shared = indexes
+        .iter()
+        .copied()
+        .map(|index| store.privately_writable(ws, index))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .any(|private| !private);
+    if !shared {
+        store.opacify_suffix(ws, start)?;
+        return Ok(((Vec::new(), Vec::new()), None));
+    }
+
+    let prepared = store.prepare_write_reserved(ws, &indexes, granted)?;
     let commits = prepared
         .targets()
         .iter()
@@ -452,6 +535,62 @@ pub fn prepare_explicit(
     // Device-geometry fires are non-canonical by construction, and the
     // device owns the token bookkeeping — commit with no hash metadata;
     // `KvStore::commit` poisons the chain state with an opaque draw.
+    let commits: Vec<PageCommit> = prepared
+        .targets()
+        .iter()
+        .map(|_| PageCommit {
+            token_hashes: Vec::new(),
+            page_hash: None,
+        })
+        .collect();
+    let (seq, cas_intents) = store.publish_prepared(prepared, &commits)?;
+    let (translation_version, translation) = match build_translation(store, ws) {
+        Ok(translation) => translation,
+        Err(error) => {
+            store.settle(cas_intents, false);
+            store.retire_through(seq);
+            return Err(error.into());
+        }
+    };
+    Ok((
+        pages,
+        copies,
+        translation,
+        KvTxn {
+            seq,
+            cas_intents,
+            mapping_version: translation_version,
+        },
+    ))
+}
+
+/// Physical-page demand for an explicit write without allocation or a
+/// prepared transaction.
+pub fn prepare_explicit_demand(
+    store: &mut KvStore,
+    ws: WorkingSetId,
+    write_indexes: &[u64],
+) -> Result<usize, KvError> {
+    Ok(store.write_demand(ws, write_indexes)?)
+}
+
+/// Prepare explicit KV using caller-owned reserved pages.
+pub fn prepare_explicit_reserved(
+    store: &mut KvStore,
+    ws: WorkingSetId,
+    write_indexes: &[u64],
+    granted: &mut Vec<PhysicalKvPageId>,
+) -> Result<(Vec<(u64, u32)>, (Vec<u32>, Vec<u32>), Vec<u32>, KvTxn), KvError> {
+    let prepared = store.prepare_write_reserved(ws, write_indexes, granted)?;
+    let pages: Vec<(u64, u32)> = prepared
+        .targets()
+        .iter()
+        .map(|target| (target.index(), target.dst().0))
+        .collect();
+    let copies = prepared
+        .copy_plan()
+        .map(|(src, dst)| (src.0, dst.0))
+        .unzip();
     let commits: Vec<PageCommit> = prepared
         .targets()
         .iter()

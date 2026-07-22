@@ -133,7 +133,7 @@ inline bool is_decode_envelope_trace(const Trace& trace) {
                 break;
             case kPortEmbedIndptr:
                 if (embed_indptr != nullptr ||
-                    !const_u32_port(binding)) {
+                    (binding.is_const && !const_u32_port(binding))) {
                     return false;
                 }
                 embed_indptr = &binding;
@@ -195,7 +195,7 @@ inline bool is_decode_envelope_trace(const Trace& trace) {
     }
     const std::uint32_t token_count = token_type.shape.dims[0];
     std::uint32_t lane_count = 1;
-    if (embed_indptr != nullptr) {
+    if (embed_indptr != nullptr && embed_indptr->is_const) {
         const std::size_t count =
             embed_indptr->const_data.size() / sizeof(std::uint32_t);
         if (count < 2 ||
@@ -219,6 +219,16 @@ inline bool is_decode_envelope_trace(const Trace& trace) {
         }
         if (prior != token_count) return false;
         lane_count = static_cast<std::uint32_t>(count - 1);
+    } else if (embed_indptr != nullptr) {
+        if (embed_indptr->channel >= trace.channels.size()) return false;
+        const auto& indptr_type =
+            trace.channels[embed_indptr->channel].type;
+        if (indptr_type.dtype != DType::U32 ||
+            indptr_type.shape.dims !=
+                std::vector<std::uint32_t>{token_count + 1}) {
+            return false;
+        }
+        lane_count = token_count;
     } else if (token_count != 1) {
         return false;
     }
@@ -253,12 +263,18 @@ inline bool is_decode_envelope_trace(const Trace& trace) {
         const TensorType* page_indptr_type = channel_type(page_indptr);
         const TensorType* w_slot_type = channel_type(w_slot);
         const TensorType* w_off_type = channel_type(w_off);
+        const bool pages_shape_valid =
+            pages_type != nullptr &&
+            ((lane_count == 1 &&
+              pages_type->shape.dims.size() == 1 &&
+              pages_type->shape.dims[0] > 0) ||
+             (pages_type->shape.dims.size() == 2 &&
+              pages_type->shape.dims[0] == lane_count &&
+              pages_type->shape.dims[1] > 0));
         if (pages_type == nullptr ||
             w_slot_type == nullptr || w_off_type == nullptr ||
             pages_type->dtype != DType::U32 ||
-            pages_type->shape.dims.size() != 2 ||
-            pages_type->shape.dims[0] != lane_count ||
-            pages_type->shape.dims[1] == 0 ||
+            !pages_shape_valid ||
             w_slot_type->dtype != DType::U32 ||
             w_slot_type->shape.dims !=
                 std::vector<std::uint32_t>{token_count} ||

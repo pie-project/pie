@@ -77,16 +77,44 @@ async fn forward_logits(
     tag: &str,
 ) -> Result<Vec<f32>> {
     let n = tokens.len() as u32;
+    let end = start + n;
+    let page_size = ws.page_size();
+    let pool_pages = ws.page_len();
     let toks_i32: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
     let toks = Channel::from(toks_i32).named("toks");
+    let embed_indptr = Channel::from(vec![0u32, n]).named("embed_indptr");
+    let positions = Channel::from((start..end).collect::<Vec<_>>()).named("positions");
+    let pages = Channel::from((0..pool_pages).collect::<Vec<_>>()).named("pages");
+    let page_indptr = Channel::from(vec![0u32, end.div_ceil(page_size)]).named("page_indptr");
+    let w_slot = Channel::from(
+        (start..end)
+            .map(|position| position / page_size)
+            .collect::<Vec<_>>(),
+    )
+    .named("w_slot");
+    let w_off = Channel::from(
+        (start..end)
+            .map(|position| position % page_size)
+            .collect::<Vec<_>>(),
+    )
+    .named("w_off");
     let logits_out = Channel::new([vocab], dtype::f32).named("logits_out");
 
     let fwd = ForwardPass::new();
-    fwd.embed(&toks, Tensor::constant(vec![0u32, n]));
-    let kv_len = Channel::from(vec![start + n]).named("kv_len");
-    fwd.port_channel(Port::KvLen, &kv_len);
-    fwd.attn_working_set(ws, .., (start / ws.page_size())..)?;
-    fwd.derive_dense_geometry();
+    fwd.embed(&toks, &embed_indptr)?;
+    let kv_len = Channel::from(vec![end]).named("kv_len");
+    fwd.attention(
+        ws,
+        ..,
+        (start / page_size)..,
+        &kv_len,
+        &pages,
+        &page_indptr,
+        &w_slot,
+        &w_off,
+        &positions,
+        None,
+    )?;
     fwd.epilogue(move || {
         // No on-device select: ship the raw logits row to the host.
         logits_out.put(&intrinsics::logits());
@@ -125,7 +153,6 @@ async fn main(input: String) -> Result<String> {
     // Root working set: reserve the whole logical envelope BEFORE any fork so
     // every CoW child shares one address space sized for prompt + decode.
     let root = WorkingSet::new();
-    model::configure(vocab, root.page_size(), 1);
     let max_pages = (n + max_tokens as u32 + 1).div_ceil(root.page_size());
     root.reserve(max_pages)
         .map_err(|e| format!("root reserve: {e}"))?;

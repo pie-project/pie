@@ -60,6 +60,9 @@ fn dummy_driver_backend(
         reject_launches_remaining: 0,
         fail_launches_after_accept: false,
         retry_launches_remaining: 0,
+        elastic_admission: false,
+        prepare_exhaustions_remaining: 0,
+        prepare_impossible_above_kv_pages: 0,
         operation_log: Some(operation_log),
         launch_observer: Some(launch_observer(behavior)),
     })
@@ -104,6 +107,8 @@ impl MockEnv {
                 rs_cache_required: false,
                 rs_cache_slots: 0,
                 rs_cache_slot_bytes: 0,
+                elastic_page_bytes: 0,
+                elastic_budget_pages: 0,
                 has_mtp_logits: true,
                 has_mtp_drafts: true,
                 has_value_head: true,

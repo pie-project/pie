@@ -142,11 +142,20 @@ pub async fn boot_4090() -> Result<pie_bin::StandaloneHandle> {
 /// cap then shrinks the KV pool to exactly N pages (`min(kv_pages, cap)`), so a
 /// modest fleet genuinely over-fills it deterministically (CI-friendly).
 pub const SMALL_POOL_GPU_MEM_UTIL: f64 = 0.3;
-pub async fn boot_4090_small_kv() -> Result<pie_bin::StandaloneHandle> {
+
+pub async fn boot_4090_kv_cap(total_pages: u32) -> Result<pie_bin::StandaloneHandle> {
     let util = std::env::var("PIE_CONTENTION_UTIL")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(SMALL_POOL_GPU_MEM_UTIL);
+    eprintln!("[contention] boot_4090_kv_cap util={util} total_pages={total_pages}");
+    let snapshot = resolve_qwen3_snapshot()?;
+    let (controller, gateway, worker) =
+        derive_standalone(&cuda_standalone_toml_capped(&snapshot, util, total_pages))?;
+    run_standalone(controller, gateway, worker, Mode::Local).await
+}
+
+pub async fn boot_4090_small_kv() -> Result<pie_bin::StandaloneHandle> {
     // charlie: explicit KV-page cap (deterministic tiny pool, independent of the
     // forward-layout budget floor). Default 8 forces genuine contention out-of-the
     // -box; `PIE_CONTENTION_TOTAL_PAGES=0` restores the derive-from-util path.
@@ -154,11 +163,7 @@ pub async fn boot_4090_small_kv() -> Result<pie_bin::StandaloneHandle> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(8);
-    eprintln!("[contention] boot_4090_small_kv util={util} total_pages={total_pages}");
-    let snapshot = resolve_qwen3_snapshot()?;
-    let (controller, gateway, worker) =
-        derive_standalone(&cuda_standalone_toml_capped(&snapshot, util, total_pages))?;
-    run_standalone(controller, gateway, worker, Mode::Local).await
+    boot_4090_kv_cap(total_pages).await
 }
 
 /// Default MTP model for the native-drafter de-risk (Qwen3.5-0.8B GDN backbone +

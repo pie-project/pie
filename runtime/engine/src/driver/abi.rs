@@ -240,7 +240,8 @@ impl<'a> LaunchDescBorrow<'a> {
             context_ids: u64_slice(&plan.context_ids),
             single_token_mode: u8::from(plan.single_token_mode),
             has_user_mask: u8::from(plan.has_user_mask),
-            reserved_flags: [0; 6],
+            reserved_flags: [0; 2],
+            required_kv_pages: plan.required_kv_pages,
             image_indptr: u32_slice(&plan.image_indptr),
             image_grids: u32_slice(&plan.image_grids),
             image_anchor_positions: u32_slice(&plan.image_anchor_positions),
@@ -386,7 +387,44 @@ impl<'a> PoolResizeDescBorrow<'a> {
             _plan: plan,
         }
     }
+
     pub fn as_raw(&self) -> &PiePoolResizeDesc {
         &self.raw
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_lowered_masks_keep_existing_launch_wire_layout() {
+        let plan = LaunchPlan {
+            qo_indptr: vec![0, 1, 2],
+            masks: vec![
+                crate::driver::command::EncodedMask::new(vec![0, 3, 1], 4),
+                crate::driver::command::EncodedMask::new(vec![1, 2, 1], 4),
+            ],
+            mask_indptr: vec![0, 1, 2],
+            has_user_mask: true,
+            ..LaunchPlan::default()
+        };
+
+        let storage = MaskWordsStorage::from_plan(&plan);
+        assert_eq!(storage.request_indptr, vec![0, 1, 2]);
+        assert_eq!(storage.word_indptr, vec![0, 1, 2]);
+        assert_eq!(storage.words, vec![0b0111, 0b0110]);
+    }
+
+    #[test]
+    fn omitted_mask_serializes_as_empty_rows() {
+        let plan = LaunchPlan {
+            qo_indptr: vec![0, 1, 2],
+            ..LaunchPlan::default()
+        };
+        let storage = MaskWordsStorage::from_plan(&plan);
+        assert_eq!(storage.request_indptr, vec![0, 0, 0]);
+        assert_eq!(storage.word_indptr, vec![0]);
+        assert!(storage.words.is_empty());
     }
 }

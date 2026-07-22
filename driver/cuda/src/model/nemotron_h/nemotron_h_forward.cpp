@@ -382,6 +382,7 @@ void attention_layer(
     const std::uint32_t* kv_page_indptr_h,
     int model_layer,
     int N, int R, bool is_pure_decode,
+    const std::uint8_t* row_valid_d,
     const std::uint8_t* custom_mask_d,
     const std::int32_t* custom_mask_indptr_d,
     const void* next_norm_w,
@@ -418,10 +419,11 @@ void attention_layer(
     kernels::launch_write_kv_to_pages(
         kv_view, ws.k.data(), ws.v.data(),
         qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-        N, R, stream);
+        N, R, stream, row_valid_d);
 
     const bool use_decode_path =
-        is_pure_decode && !fwd_cfg.force_prefill_path;
+        is_pure_decode && custom_mask_d == nullptr &&
+        !fwd_cfg.force_prefill_path;
     const auto* decode_plan = plan_state.decode_plan
         ? plan_state.decode_plan.get()
         : nullptr;
@@ -435,12 +437,15 @@ void attention_layer(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
             attn_ws, stream);
     } else if (custom_mask_d) {
-        ops::launch_attention_flashinfer_prefill_custom(
+        if (!plan_state.use_prefill_plan || prefill_plan == nullptr) {
+            throw std::runtime_error(
+                "custom attention mask has no prepared prefill plan");
+        }
+        ops::dispatch_attention_flashinfer_prefill_custom(
+            *prefill_plan,
             ws.q.data(), kv_view, ws.attn_out.data(),
             qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            custom_mask_d, custom_mask_indptr_d,
-            qo_indptr_h, kv_page_indptr_h,
-            N, R, num_q_heads_local, attn_ws, stream);
+            custom_mask_d, custom_mask_indptr_d, attn_ws, stream);
     } else if (plan_state.use_prefill_plan && prefill_plan != nullptr) {
         const int num_pages_in_batch = kv_page_indptr_h[R];
         kernels::launch_dequant_kv_cache_layer_to_bf16_active(
@@ -1388,6 +1393,7 @@ void nemotron_h_forward_paged(
     int N,
     int R,
     bool is_pure_decode,
+    const std::uint8_t* row_valid_d,
     const std::uint8_t* custom_mask_d,
     const std::int32_t* custom_mask_indptr_d,
     const std::int32_t* slot_ids_h,
@@ -1462,7 +1468,8 @@ void nemotron_h_forward_paged(
                     cublas, positions, qo_indptr, kv_page_indices, kv_page_indptr,
                     kv_last_page_lens, qo_indptr_h, kv_page_indptr_h,
                     static_cast<int>(li),
-                    N, R, is_pure_decode, custom_mask_d, custom_mask_indptr_d,
+                    N, R, is_pure_decode, row_valid_d,
+                    custom_mask_d, custom_mask_indptr_d,
                     next_norm_w, eps, stream, &produced_next_norm);
             });
         } else {

@@ -24,7 +24,7 @@ const DEPTH: usize = 2;
 async fn main(_input: String) -> Result<String> {
     let vocab = wit_model::output_vocab_size();
     let ws = WorkingSet::new();
-    model::configure(vocab, ws.page_size(), 1);
+    let page_size = ws.page_size();
 
     let prompt_tokens = wit_model::encode("hello world");
     let prompt: Vec<u32> = if prompt_tokens.is_empty() {
@@ -33,18 +33,24 @@ async fn main(_input: String) -> Result<String> {
         prompt_tokens
     };
     let n = prompt.len() as u32;
-    let max_pages = (n + MAX_TOKENS as u32 + 1).div_ceil(ws.page_size());
+    let max_pages = (n + MAX_TOKENS as u32 + 1).div_ceil(page_size);
     ws.reserve(max_pages)
         .map_err(|e| format!("ws.reserve: {e}"))?;
 
     // ──────────────── ONE PIPELINE, ONE STREAM (R4-4) ───────────────────────
     // Prefill then decode on a single pipeline: the prefill epilogue seeds
     // the decode's loop-carried `tok_in` ON-DEVICE (no g0 host round-trip)
-    // and mirrors the token to the host via `out`. The last submit carries
-    // `pipe.finish()` (F7) — the in-tree e2e regression for the
-    // leave-at-last-dispatch books (R4-3, superseding the W1 straddle).
+    // and mirrors the token to the host via `out`. `close` releases the
+    // scheduler wait-set after the fixed submission budget is enqueued.
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     let toks_p = Channel::from(prompt_i32).named("toks_p");
+    let embed_indptr_p = Channel::from(vec![0u32, n]).named("embed_indptr_p");
+    let positions_p = Channel::from((0..n).collect::<Vec<_>>()).named("positions_p");
+    let pages_p = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages_p");
+    let page_indptr_p = Channel::from(vec![0u32, n.div_ceil(page_size)]).named("page_indptr_p");
+    let w_slot_p =
+        Channel::from((0..n).map(|p| p / page_size).collect::<Vec<_>>()).named("w_slot_p");
+    let w_off_p = Channel::from((0..n).map(|p| p % page_size).collect::<Vec<_>>()).named("w_off_p");
     let rng_p = Channel::from(vec![0x9e37_u32, 0]).named("rng_p");
     // Device-carried handoff: unseeded, DEVICE-ONLY, attached to both
     // passes — the prefill's put fills it. Host copies ride separate
@@ -59,11 +65,20 @@ async fn main(_input: String) -> Result<String> {
         .named("out");
 
     let fwd_p = ForwardPass::new();
-    fwd_p.embed(&toks_p, Tensor::constant(vec![0u32, n]));
+    fwd_p.embed(&toks_p, &embed_indptr_p)?;
     let kv_len_p = Channel::from(vec![n]).named("kv_len_p");
-    fwd_p.port_channel(Port::KvLen, &kv_len_p);
-    fwd_p.attn_working_set(&ws, .., ..)?;
-    fwd_p.derive_dense_geometry();
+    fwd_p.attention(
+        &ws,
+        ..,
+        ..,
+        &kv_len_p,
+        &pages_p,
+        &page_indptr_p,
+        &w_slot_p,
+        &w_off_p,
+        &positions_p,
+        None,
+    )?;
     fwd_p.epilogue(move || {
         let r = rng_p.take(); // [2] u32 rng state (key, ctr)
         let logits = intrinsics::logits(); // [vocab] f32
@@ -80,13 +95,27 @@ async fn main(_input: String) -> Result<String> {
     // Built BEFORE the prefill submits (its eager `tok_in` claim must precede
     // the prefill's build, F8) and submitted run-ahead immediately behind it: its geometry needs
     // only KvLen (from n+1, +1/fire); the token value rides `tok_in`.
-    let lane1 = Tensor::constant(vec![0u32, 1u32]);
+    let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
+    let positions = Channel::from(vec![n]).named("positions");
+    let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
+    let page_indptr = Channel::from(vec![0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
+    let w_slot = Channel::from(vec![n / page_size]).named("w_slot");
+    let w_off = Channel::from(vec![n % page_size]).named("w_off");
     let fwd = ForwardPass::new();
-    fwd.embed(&tok_in, lane1);
+    fwd.embed(&tok_in, &lane1)?;
     let kv_len = Channel::from(vec![n + 1]).named("kv_len");
-    fwd.port_channel(Port::KvLen, &kv_len);
-    fwd.attn_working_set(&ws, .., (n / ws.page_size())..)?;
-    fwd.derive_dense_geometry();
+    fwd.attention(
+        &ws,
+        ..,
+        (n / page_size)..,
+        &kv_len,
+        &pages,
+        &page_indptr,
+        &w_slot,
+        &w_off,
+        &positions,
+        None,
+    )?;
     fwd.epilogue(move || {
         let length = kv_len.take().tensor();
         let r = rng.take(); // [2] u32 rng state
@@ -96,9 +125,16 @@ async fn main(_input: String) -> Result<String> {
         let t = reduce_argmax(add(scaled, g)); // [1] i32 categorical draw
 
         let r_next = add(&r, iota(2));
+        let next_length = add(&length, 1u32);
+        let page_count = div(add(&next_length, page_size - 1), page_size);
 
         tok_in.put(&t);
-        kv_len.put(add(&length, 1u32));
+        kv_len.put(&next_length);
+        positions.put(&length);
+        w_slot.put(div(&length, page_size));
+        w_off.put(rem(&length, page_size));
+        page_indptr.take();
+        page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
         out.put(&t);
         rng.put(&r_next);
     });
@@ -108,10 +144,6 @@ async fn main(_input: String) -> Result<String> {
     fwd_p
         .submit(&pipe)
         .map_err(|e| format!("prefill submit: {e}"))?;
-    if budget == 0 {
-        // The prefill was the stream's only submission (F7).
-        pipe.finish();
-    }
 
     // Prime + fill: up to DEPTH chain-linked fires upfront (none awaited);
     // finish() right after the last budget submit (F7); then FIFO drain +
@@ -121,9 +153,6 @@ async fn main(_input: String) -> Result<String> {
         fwd.submit(&pipe)
             .map_err(|e| format!("decode submit @{submitted}: {e}"))?;
         submitted += 1;
-    }
-    if budget > 0 && submitted == budget {
-        pipe.finish();
     }
 
     // Host drain: the g0 copy first (the decode burst is already in the
@@ -154,11 +183,9 @@ async fn main(_input: String) -> Result<String> {
             fwd.submit(&pipe)
                 .map_err(|e| format!("decode submit @{submitted}: {e}"))?;
             submitted += 1;
-            if submitted == budget {
-                pipe.finish();
-            }
         }
     }
+    pipe.close();
 
     let text = wit_model::decode(&generated);
     eprintln!(

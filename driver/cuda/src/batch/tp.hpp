@@ -31,6 +31,7 @@ struct BatchEngine;
 void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
                          int N, int R, bool is_pure_decode,
                          int kv_indices_count,
+                         int required_kv_pages,
                          int mask_bytes, int mask_indptr_count,
                          bool has_slot_ids,
                          bool has_write_desc,

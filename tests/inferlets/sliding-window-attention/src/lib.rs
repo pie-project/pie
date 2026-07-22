@@ -8,9 +8,6 @@ use inferlet::ptir::prelude::*;
 use inferlet::{Result, chat, model as wit_model};
 use serde::Deserialize;
 
-const PAGE_T: u32 = 16;
-const NUM_LAYERS: u32 = 28;
-
 #[derive(Deserialize)]
 struct Input {
     #[serde(default = "default_prompt")]
@@ -39,8 +36,7 @@ async fn main(input: Input) -> Result<String> {
         return Ok(String::new());
     }
 
-    let vocab = wit_model::output_vocab_size();
-    model::configure(vocab, PAGE_T, NUM_LAYERS);
+    let page_t = wit_model::kv_page_size();
     let window = input.window_size.max(1);
 
     let mut prompt = chat::system_user("You are a helpful assistant.", &input.prompt);
@@ -50,8 +46,8 @@ async fn main(input: Input) -> Result<String> {
     }
     let n = prompt.len() as u32;
     let stop_tokens = chat::stop_tokens();
-    let pool_pages = (n + input.max_tokens as u32 + 2).div_ceil(PAGE_T);
-    let pool_len = pool_pages * PAGE_T;
+    let pool_pages = (n + input.max_tokens as u32 + 2).div_ceil(page_t);
+    let pool_len = pool_pages * page_t;
 
     let ws = WorkingSet::new();
     let slots = ws
@@ -62,11 +58,11 @@ async fn main(input: Input) -> Result<String> {
     let prompt_tokens = Channel::from(prompt.iter().map(|&token| token as i32).collect::<Vec<_>>());
     let prefill_slots = Channel::from(
         (0..n)
-            .map(|position| pool_ids[(position / PAGE_T) as usize])
+            .map(|position| pool_ids[(position / page_t) as usize])
             .collect::<Vec<_>>(),
     );
     let prefill_offsets =
-        Channel::from((0..n).map(|position| position % PAGE_T).collect::<Vec<_>>());
+        Channel::from((0..n).map(|position| position % page_t).collect::<Vec<_>>());
     let prefill_klen = Channel::from(vec![n]);
     let prefill_pages = Channel::from(pool_ids.clone());
     let prefill_indptr = Channel::from_shaped([2], vec![0u32, pool_pages]);
@@ -76,18 +72,24 @@ async fn main(input: Input) -> Result<String> {
             .flat_map(|query| (0..pool_len).map(move |key| key <= query))
             .collect::<Vec<_>>(),
     );
+    let prefill_positions = Channel::from((0..n).collect::<Vec<_>>());
+    let prefill_embed_indptr = Channel::from(vec![0u32, n]);
     let first_out = Channel::new([1], dtype::i32).named("first_token");
 
     let prefill = ForwardPass::new();
-    prefill.embed(&prompt_tokens, Tensor::constant(vec![0u32, n]));
-    prefill.port_channel(Port::KvLen, &prefill_klen);
-    prefill.attn_working_set(&ws, .., ..)?;
-    prefill.derive_dense_geometry();
-    prefill.port_channel(Port::Pages, &prefill_pages);
-    prefill.port_channel(Port::PageIndptr, &prefill_indptr);
-    prefill.port_channel(Port::WSlot, &prefill_slots);
-    prefill.port_channel(Port::WOff, &prefill_offsets);
-    prefill.attn_mask(&causal);
+    prefill.embed(&prompt_tokens, &prefill_embed_indptr)?;
+    prefill.attention(
+        &ws,
+        ..,
+        ..,
+        &prefill_klen,
+        &prefill_pages,
+        &prefill_indptr,
+        &prefill_slots,
+        &prefill_offsets,
+        &prefill_positions,
+        Some(&causal),
+    )?;
     prefill.epilogue(move || {
         first_out.put(reshape(reduce_argmax(intrinsics::logits()), [1]));
     });
@@ -99,10 +101,8 @@ async fn main(input: Input) -> Result<String> {
     prefill
         .submit(&pipeline)
         .map_err(|e| format!("sliding-window prefill: {e}"))?;
-    // max_tokens == 1: the prefill spends the whole budget, so it was the
-    // stream's last submit — finish() right after it (F7).
     if input.max_tokens == 1 {
-        pipeline.finish();
+        pipeline.close();
     }
     let first = first_out
         .take()
@@ -124,8 +124,8 @@ async fn main(input: Input) -> Result<String> {
     let position = Channel::from(vec![n]).named("position");
     let fill = Channel::from(vec![n + 1]).named("fill");
     let klen = Channel::from(vec![n + 1]).named("klen");
-    let write_slot = Channel::from(vec![pool_ids[(n / PAGE_T) as usize]]);
-    let write_offset = Channel::from(vec![n % PAGE_T]);
+    let write_slot = Channel::from(vec![pool_ids[(n / page_t) as usize]]);
+    let write_offset = Channel::from(vec![n % page_t]);
     let mask = Channel::from_shaped(
         [1, pool_len],
         (0..pool_len)
@@ -134,28 +134,32 @@ async fn main(input: Input) -> Result<String> {
     );
     let pages = Channel::from(pool_ids.clone());
     let page_indptr = Channel::from_shaped([2], vec![0u32, pool_pages]);
+    let decode_embed_indptr = Channel::from(vec![0u32, 1]);
     let pool_ids_input = Channel::from(pool_ids.clone()).named("pool_ids");
     let token_out = Channel::new([1], dtype::i32)
         .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
         .named("token_out");
 
     let decode = ForwardPass::new();
-    decode.embed(&token_in, Tensor::constant(vec![0u32, 1]));
-    decode.positions(&position);
-    decode.port_channel(Port::KvLen, &klen);
-    decode.attn_working_set(&ws, .., ..)?;
-    decode.derive_dense_geometry();
-    decode.port_channel(Port::Pages, &pages);
-    decode.port_channel(Port::PageIndptr, &page_indptr);
-    decode.port_channel(Port::WSlot, &write_slot);
-    decode.port_channel(Port::WOff, &write_offset);
-    decode.attn_mask(&mask);
+    decode.embed(&token_in, &decode_embed_indptr)?;
+    decode.attention(
+        &ws,
+        ..,
+        ..,
+        &klen,
+        &pages,
+        &page_indptr,
+        &write_slot,
+        &write_offset,
+        &position,
+        Some(&mask),
+    )?;
     decode.epilogue(move || {
         let base = fill.take().tensor();
         let ids = pool_ids_input.take().tensor();
         let token = reshape(reduce_argmax(intrinsics::logits()), [1]);
         let next_mask = reshape(sliding_window_mask(&base, pool_len, window), [1, pool_len]);
-        let logical_slot = div(&base, PAGE_T);
+        let logical_slot = div(&base, page_t);
         let next = add(&base, 1u32);
 
         token_in.put(&token);
@@ -165,7 +169,7 @@ async fn main(input: Input) -> Result<String> {
         klen.take();
         klen.put(&next);
         write_slot.put(gather(&ids, &logical_slot));
-        write_offset.put(rem(&base, PAGE_T));
+        write_offset.put(rem(&base, page_t));
         mask.take();
         mask.put(&next_mask);
         pages.take();
@@ -185,10 +189,8 @@ async fn main(input: Input) -> Result<String> {
         submitted += 1;
         in_flight += 1;
     }
-    // Budget spent inside the burst: the last submit ends the stream —
-    // finish() right after it (F7).
     if submitted == budget {
-        pipeline.finish();
+        pipeline.close();
     }
     while in_flight > 0 {
         let token = token_out
@@ -198,6 +200,7 @@ async fn main(input: Input) -> Result<String> {
             .map_err(|e| format!("read generated token: {e}"))?[0] as u32;
         in_flight -= 1;
         if stop_tokens.contains(&token) {
+            pipeline.close();
             break;
         }
         generated.push(token);
@@ -208,7 +211,7 @@ async fn main(input: Input) -> Result<String> {
             submitted += 1;
             in_flight += 1;
             if submitted == budget {
-                pipeline.finish();
+                pipeline.close();
             }
         }
     }
@@ -220,8 +223,6 @@ async fn main(input: Input) -> Result<String> {
             .map_err(|e| format!("drain run-ahead token: {e}"))?;
         in_flight -= 1;
     }
-    // Every submitted fire was drained above, so this cancels nothing; it
-    // ends stop-path streams that never reached finish() (F7).
     pipeline.close();
     wit_model::decode(&generated)
 }

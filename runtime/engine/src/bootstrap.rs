@@ -45,10 +45,14 @@ impl Drop for ActiveRuntimeGuard {
 struct RuntimeShutdown {
     scheduler: crate::scheduler::SchedulerShutdownHandle,
     driver_ids: Vec<usize>,
+    elastic_trim_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl RuntimeShutdown {
     async fn shutdown(self) -> Result<()> {
+        if let Some(task) = self.elastic_trim_task {
+            task.abort();
+        }
         let scheduler_result = self.scheduler.shutdown().await;
         for driver_id in self.driver_ids {
             let _ = driver::backend::unregister_driver(driver_id);
@@ -147,6 +151,8 @@ pub struct DriverConfig {
     pub rs_cache_required: bool,
     pub rs_cache_slots: usize,
     pub rs_cache_slot_bytes: u64,
+    pub elastic_page_bytes: u64,
+    pub elastic_budget_pages: u64,
     pub has_mtp_logits: bool,
     pub has_mtp_drafts: bool,
     pub has_value_head: bool,
@@ -284,6 +290,18 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     let arena_kv_pages: Vec<usize> = driver_configs.iter().map(|d| d.total_pages).collect();
     let arena_cpu_pages: Vec<usize> = driver_configs.iter().map(|d| d.cpu_pages).collect();
     let arena_rs_slots: Vec<usize> = driver_configs.iter().map(|d| d.rs_cache_slots).collect();
+    let elastic_page_bytes: Vec<u64> = driver_configs
+        .iter()
+        .map(|d| d.elastic_page_bytes)
+        .collect();
+    let rs_slot_bytes: Vec<u64> = driver_configs
+        .iter()
+        .map(|d| d.rs_cache_slot_bytes)
+        .collect();
+    let elastic_trim_enabled: Vec<bool> = driver_configs
+        .iter()
+        .map(|d| d.elastic_page_bytes != 0 && d.elastic_budget_pages != 0)
+        .collect();
     let driver_count = driver_configs.len();
     let drivers: Vec<usize> = driver_configs
         .into_iter()
@@ -347,6 +365,88 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         scheduler.request_timeout_secs,
     )
     .await?;
+    let elastic_trim_task = elastic_trim_enabled
+        .iter()
+        .any(|enabled| *enabled)
+        .then(|| {
+            let driver_ids = drivers.clone();
+            let enabled_drivers = elastic_trim_enabled.clone();
+            let capacities = arena_kv_pages.clone();
+            let elastic_page_bytes = elastic_page_bytes.clone();
+            let rs_slot_bytes = rs_slot_bytes.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    for (ordinal, driver_id) in driver_ids.iter().copied().enumerate() {
+                        if !enabled_drivers.get(ordinal).copied().unwrap_or(false) {
+                            continue;
+                        }
+                        let Some(stores) =
+                            crate::store::registry::try_get(arena_model_idx, ordinal)
+                        else {
+                            continue;
+                        };
+                        let target = crate::store::registry::with_kv_lock(
+                            &stores.kv,
+                            "elastic_trim_high_water",
+                            |kv| kv.committed_high_water_pages().max(1),
+                        );
+                        let capacity = capacities[ordinal] as u32;
+                        let unmap_ranges = vec![pie_driver_abi::PiePoolRange {
+                            page_index: u64::from(target),
+                            page_count: u64::from(capacity - target),
+                        }];
+                        if let Ok(completion) = crate::scheduler::resize_pool(
+                            driver_id,
+                            pie_driver_abi::PIE_ELASTIC_POOL_KV,
+                            u64::from(target),
+                            Vec::new(),
+                            unmap_ranges,
+                        )
+                        .await
+                        {
+                            if completion.await.is_ok() {
+                                let rs_high_water =
+                                    stores.rs.lock().unwrap().committed_high_water_slots();
+                                let page_bytes =
+                                    elastic_page_bytes.get(ordinal).copied().unwrap_or(0);
+                                let slot_bytes = rs_slot_bytes.get(ordinal).copied().unwrap_or(0);
+                                if page_bytes != 0 && slot_bytes != 0 {
+                                    let state_bytes =
+                                        u64::from(rs_high_water).saturating_mul(slot_bytes);
+                                    let state_pages =
+                                        state_bytes.saturating_add(page_bytes - 1) / page_bytes;
+                                    if let Ok(state) = crate::scheduler::resize_pool(
+                                        driver_id,
+                                        pie_driver_abi::PIE_ELASTIC_POOL_STATE,
+                                        state_pages,
+                                        Vec::new(),
+                                        Vec::new(),
+                                    )
+                                    .await
+                                    {
+                                        let _ = state.await;
+                                    }
+                                }
+                                if let Ok(workspace) = crate::scheduler::resize_pool(
+                                    driver_id,
+                                    pie_driver_abi::PIE_ELASTIC_POOL_WORKSPACE,
+                                    0,
+                                    Vec::new(),
+                                    Vec::new(),
+                                )
+                                .await
+                                {
+                                    let _ = workspace.await;
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+        });
 
     // M-A1/M-A2 wait-all quorum lifecycle wiring. Both scheduler-side hooks
     // are plain-closure seams (see their doc comments) so `store`/`scheduler`
@@ -356,11 +456,19 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     //    `WaitAllPolicy` only via this installed subscription (the natural
     //    terminate path calls `scheduler::worker::notify_pipeline_leave`
     //    directly from `inferlet::process`, which needs no such hook).
-    crate::store::reclaim::set_pipeline_leave_hook(|pid| {
-        crate::scheduler::worker::notify_pipeline_leave(
-            pid,
-            crate::scheduler::worker::LeaveKind::Suspend,
-        );
+    crate::store::reclaim::set_pipeline_leave_hook(|pid, kind| {
+        let kind = match kind {
+            crate::store::reclaim::LeaveKind::Terminate => {
+                crate::scheduler::worker::LeaveKind::Terminate
+            }
+            crate::store::reclaim::LeaveKind::AllocationWait => {
+                crate::scheduler::worker::LeaveKind::Close
+            }
+            crate::store::reclaim::LeaveKind::Suspend => {
+                crate::scheduler::worker::LeaveKind::Suspend
+            }
+        };
+        crate::scheduler::worker::notify_pipeline_leave(pid, kind);
     });
     active_guard.disarm();
     Ok(BootstrapHandle {
@@ -369,6 +477,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         shutdown: Some(RuntimeShutdown {
             scheduler: scheduler_shutdown,
             driver_ids: drivers,
+            elastic_trim_task,
         }),
     })
 }
@@ -426,11 +535,6 @@ fn verify_config(config: &Config) -> Result<()> {
             "Model {:?}: active KV preemption requires CUDA (dummy is allowed for deterministic tests), got {}",
             model.name,
             driver.backend_kind
-        );
-        ensure!(
-            driver.cpu_pages > 0,
-            "Model {:?}: active KV preemption requires a non-empty host-pinned swap pool",
-            model.name
         );
         let required =
             pie_driver_abi::KV_COPY_DEVICE_TO_HOST | pie_driver_abi::KV_COPY_HOST_TO_DEVICE;

@@ -38,6 +38,7 @@ Gemma4Model::Gemma4Model(
     const bool profile_enabled =
         profile_env != nullptr && profile_env[0] != '\0' && profile_env[0] != '0';
     caps_.graph_safe = kv_cache_.format().is_native_bf16() && !profile_enabled;
+    caps_.graph_padding_kv_write_safe = true;
     caps_.supports_compact_logits = true;
     caps_.supports_small_prefill_graph =
         kv_cache_.format().is_native_bf16() && small_spec_graph_tokens > 0;
@@ -97,6 +98,7 @@ void Gemma4Model::body(Workspace& ws,
         in.qo_indptr_h, in.kv_page_indices_h, in.kv_page_indptr_h,
         in.kv_last_page_lens_h,
         in.total_tokens, in.num_requests, in.is_pure_decode,
+        in.row_valid_d,
         in.custom_mask_d, in.custom_mask_indptr_d,
         in.logit_row_indices_d, in.num_logit_rows, vision_in_ptr, audio_in_ptr,
         in.precomputed_embeddings.num_blocks > 0

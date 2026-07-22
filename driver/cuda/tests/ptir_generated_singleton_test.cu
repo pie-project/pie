@@ -2838,6 +2838,27 @@ void run_module_cache_contract(const Fixture& fixture) {
             after_remapped.compilations == after_second.compilations,
         "generated executable identity excludes program-local channel ids");
 
+    bool shape_variants_cached = true;
+    for (std::uint64_t variant = 0; variant < 129; ++variant) {
+        failure = CompileFailureKind::None;
+        error.clear();
+        shape_variants_cached =
+            cache.compile_program(
+                fixture.hash ^ (0x10000 + variant),
+                remapped_channels,
+                failure,
+                error) != nullptr &&
+            shape_variants_cached;
+    }
+    const ModuleCacheStats after_shape_variants = cache.stats();
+    expect(
+        shape_variants_cached &&
+            after_shape_variants.program_entries >= 131 &&
+            after_shape_variants.stage_entries ==
+                after_remapped.stage_entries,
+        "generated program cache retains more than 128 shape variants "
+        "without multiplying stage modules");
+
     auto different_semantics = fixture.plans;
     const auto changed = std::find_if(
         different_semantics.front().ops.begin(),

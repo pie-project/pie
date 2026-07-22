@@ -14,6 +14,8 @@
 //! deleted, allowed rather than silently masked.
 #![allow(dead_code)]
 
+use std::collections::HashSet;
+
 /// A typed physical id backed by a pool slot. Implemented by
 /// `PhysicalKvPageId` and RS-specific ids.
 pub trait PoolId: Copy {
@@ -107,5 +109,14 @@ impl<I: PoolId> Pool<I> {
 
     pub fn capacity(&self) -> u32 {
         self.capacity
+    }
+
+    pub fn highest_in_use_exclusive(&self) -> u32 {
+        let free: HashSet<u32> = self.free.iter().map(|id| id.index()).collect();
+        let end = self.base.saturating_add(self.capacity);
+        (self.base..end)
+            .rev()
+            .find(|index| !free.contains(index))
+            .map_or(0, |index| index - self.base + 1)
     }
 }

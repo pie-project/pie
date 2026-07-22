@@ -7,13 +7,15 @@ use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter, MeterProvider};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
-use opentelemetry_sdk::trace::TracerProvider;
-use opentelemetry_sdk::{Resource, runtime};
+use opentelemetry_sdk::trace::SdkTracerProvider;
 use std::sync::OnceLock;
 
 /// Global metrics holder
 static METRICS: OnceLock<Metrics> = OnceLock::new();
+static METER_PROVIDER: OnceLock<SdkMeterProvider> = OnceLock::new();
+static TRACER_PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
 
 /// All metric instruments for the Pie runtime
 #[allow(dead_code)] // scaffolded for scheduler/store call sites not yet wired to record these.
@@ -131,10 +133,9 @@ where
     eprintln!("[Telemetry] Initializing OTLP export to: {endpoint}");
 
     // Build resource with service name
-    let resource = Resource::new(vec![KeyValue::new(
-        "service.name",
-        service_name.to_string(),
-    )]);
+    let resource = Resource::builder_empty()
+        .with_attribute(KeyValue::new("service.name", service_name.to_string()))
+        .build();
 
     // === Initialize Metrics ===
     let metrics_exporter = match opentelemetry_otlp::MetricExporter::builder()
@@ -153,7 +154,7 @@ where
         }
     };
 
-    let reader = PeriodicReader::builder(metrics_exporter, runtime::Tokio).build();
+    let reader = PeriodicReader::builder(metrics_exporter).build();
 
     let meter_provider = SdkMeterProvider::builder()
         .with_resource(resource.clone())
@@ -165,6 +166,7 @@ where
     let _ = METRICS.set(Metrics::new(&meter));
 
     // Set global meter provider
+    let _ = METER_PROVIDER.set(meter_provider.clone());
     opentelemetry::global::set_meter_provider(meter_provider);
 
     // === Initialize Tracing ===
@@ -183,12 +185,13 @@ where
         }
     };
 
-    let provider = TracerProvider::builder()
+    let provider = SdkTracerProvider::builder()
         .with_resource(resource)
-        .with_batch_exporter(span_exporter, runtime::Tokio)
+        .with_batch_exporter(span_exporter)
         .build();
 
     let tracer = provider.tracer("pie-runtime");
+    let _ = TRACER_PROVIDER.set(provider.clone());
     opentelemetry::global::set_tracer_provider(provider);
 
     eprintln!("[Telemetry] OTLP tracing and metrics initialized successfully");
@@ -219,12 +222,13 @@ where
         }
     };
 
-    let provider = TracerProvider::builder()
+    let provider = SdkTracerProvider::builder()
         .with_resource(resource)
-        .with_batch_exporter(span_exporter, runtime::Tokio)
+        .with_batch_exporter(span_exporter)
         .build();
 
     let tracer = provider.tracer("pie-runtime");
+    let _ = TRACER_PROVIDER.set(provider.clone());
     opentelemetry::global::set_tracer_provider(provider);
 
     Some(tracing_opentelemetry::layer().with_tracer(tracer))
@@ -233,8 +237,10 @@ where
 /// Shutdown OpenTelemetry, flushing any pending spans and metrics.
 #[allow(dead_code)] // scaffolded for a graceful-shutdown call site not yet wired.
 pub fn shutdown() {
-    if METRICS.get().is_some() {
-        opentelemetry::global::shutdown_tracer_provider();
-        // Note: Meter provider shutdown happens automatically on drop
+    if let Some(provider) = TRACER_PROVIDER.get() {
+        let _ = provider.shutdown();
+    }
+    if let Some(provider) = METER_PROVIDER.get() {
+        let _ = provider.shutdown();
     }
 }

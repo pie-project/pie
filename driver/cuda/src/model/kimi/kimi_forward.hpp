@@ -63,6 +63,12 @@ struct KimiWorkspace {
         int tp_size);
 };
 
+std::size_t kimi_workspace_bytes(
+    const HfConfig& cfg,
+    int max_tokens,
+    int max_logit_rows,
+    int tp_size);
+
 struct KimiPlanState {
     ops::MlaPlanCachePtr mla_plan;
 };
@@ -104,6 +110,7 @@ void kimi_forward_paged(
     int total_tokens,
     int num_requests,
     bool is_pure_decode,
+    const std::uint8_t* row_valid_d = nullptr,
     const std::int32_t* logit_row_indices_d = nullptr,
     int num_logit_rows = 0);
 

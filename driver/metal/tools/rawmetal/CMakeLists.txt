@@ -9,6 +9,9 @@ add_rawmetal_tool(decoder_smoke decoder_smoke.cpp)
 add_rawmetal_tool(rawmetal_harness harness_main.cpp harness.cpp)
 add_rawmetal_tool(rawmetal_microbench bench_kernels.cpp harness.cpp)
 add_rawmetal_tool(st_probe st_probe.cpp)
+add_rawmetal_tool(sparse_probe sparse_probe.mm)
+add_rawmetal_tool(sparse_probe2 sparse_probe2.mm)
+add_rawmetal_tool(sparse_probe3 sparse_probe3.mm)
 
 add_rawmetal_tool(
   gemma4_decode_run

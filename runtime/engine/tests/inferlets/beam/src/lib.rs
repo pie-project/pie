@@ -28,7 +28,6 @@ const B: u32 = 2;
 const P: u32 = 4;
 /// Tokens per KV page (model page size; mirrored at trace time).
 const PAGE_T: u32 = 16;
-const NUM_LAYERS: u32 = 28;
 /// BOS seed on every lane's input token.
 const BOS: i32 = 1;
 /// Decode steps for the run (the pre-stage keeps it short).
@@ -38,7 +37,6 @@ const MAX_STEPS: usize = 8;
 async fn main(_input: String) -> Result<String> {
     let vocab = wit_model::output_vocab_size();
     let v = vocab;
-    model::configure(vocab, PAGE_T, NUM_LAYERS);
 
     // 16 channels (overview §6.2 / echo's beam_trace). Per-instance geometry
     // (pages/lens/kvm) is `seeded` (D2); constant initials are `from`. Channel
@@ -63,18 +61,22 @@ async fn main(_input: String) -> Result<String> {
     let ws = WorkingSet::new();
 
     let fwd = ForwardPass::new();
-    let lanes_b = Tensor::constant((0u32..=B).collect::<Vec<_>>()); // indptr: one token per lane
-    let page_rows = Tensor::constant((0u32..=B).map(|i| i * P).collect::<Vec<_>>()); // [0,P,2P]
-    fwd.embed(&toks, lanes_b);
-    fwd.positions(&pos);
-    fwd.port_channel(Port::KvLen, &klen);
-    fwd.attn_working_set(&ws, .., ..)?;
-    fwd.derive_dense_geometry();
-    fwd.port_channel(Port::Pages, &pages);
-    fwd.port_const(Port::PageIndptr, &page_rows);
-    fwd.port_channel(Port::WSlot, &w_slot);
-    fwd.port_channel(Port::WOff, &w_off);
-    fwd.attn_mask(&kvm);
+    let lanes_b = Channel::from((0u32..=B).collect::<Vec<_>>()).named("embed_indptr");
+    let page_rows =
+        Channel::from((0u32..=B).map(|i| i * P).collect::<Vec<_>>()).named("page_indptr");
+    fwd.embed(&toks, &lanes_b)?;
+    fwd.attention(
+        &ws,
+        ..,
+        ..,
+        &klen,
+        &pages,
+        &page_rows,
+        &w_slot,
+        &w_off,
+        &pos,
+        Some(&kvm),
+    )?;
     fwd.epilogue(move || {
         // cand = running scores ⊕ log_softmax(logits); (s, i) = top_k over [B*V].
         let cand = add(
@@ -159,6 +161,7 @@ async fn main(_input: String) -> Result<String> {
             hyp_tokens.push(t0 as u32);
         }
     }
+    pipeline.close();
 
     let result = format!(
         "BEAM B={B} steps={} tokens={hyp_tokens:?} (SDK-authored §6.2 beam, vocab={vocab})",

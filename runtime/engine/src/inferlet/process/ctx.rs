@@ -70,7 +70,9 @@ pub struct ProcessCtx {
     /// moment execution is admitted.
     prewarm_permit: Option<OwnedSemaphorePermit>,
     /// The real concurrency permit, acquired lazily at the first pooled
-    /// resource acquisition or fire submit (strict admission).
+    /// resource acquisition or fire submit (strict admission). Process drop
+    /// transfers it to deferred teardown so the next cohort cannot overlap
+    /// stale scheduler membership or pooled resources.
     execution_permit: Option<OwnedSemaphorePermit>,
     execution_admitted: bool,
     admission_wait_us: u64,
@@ -81,7 +83,14 @@ impl Drop for ProcessCtx {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.scratch_dir);
         let resources = std::mem::replace(&mut self.resource_table, ResourceTable::new());
-        super::preemption::defer_resource_teardown(self.id, resources, self.residency.clone());
+        let execution_permit = self.execution_permit.take();
+        self.execution_admitted = false;
+        super::preemption::defer_resource_teardown(
+            self.id,
+            resources,
+            self.residency.clone(),
+            execution_permit,
+        );
     }
 }
 
@@ -289,11 +298,6 @@ impl ProcessCtx {
         }
     }
 
-    pub(crate) fn release_execution_permit(&mut self) {
-        self.execution_permit = None;
-        self.execution_admitted = false;
-    }
-
     pub fn get_username(&self) -> String {
         self.username.clone()
     }
@@ -363,12 +367,21 @@ impl ProcessCtx {
             .remove(&(model, driver, id));
     }
 
-    pub(crate) fn register_pipeline(&self, fires: &crate::pipeline::fire::PendingFires) {
+    pub(crate) fn register_pipeline(
+        &self,
+        scope: &crate::store::PipelineScope,
+        fires: &crate::pipeline::fire::PendingFires,
+    ) {
         let mut residency = self.residency.lock().unwrap();
         residency
             .pipelines
-            .retain(|pipeline| pipeline.strong_count() > 0);
-        residency.pipelines.push(Arc::downgrade(fires));
+            .retain(|pipeline| pipeline.fires.strong_count() > 0);
+        residency
+            .pipelines
+            .push(super::residency::ResidentPipeline {
+                scope: scope.clone(),
+                fires: Arc::downgrade(fires),
+            });
     }
 
     // ========================================================================

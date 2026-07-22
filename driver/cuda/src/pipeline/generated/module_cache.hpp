@@ -77,7 +77,10 @@ struct ModuleCacheStats {
 class ModuleCache {
   public:
     static constexpr std::size_t kMaximumStageEntries = 128;
-    static constexpr std::size_t kMaximumProgramEntries = 128;
+    // Program entries only retain a hash and shared references to the bounded
+    // stage cache. Keep enough for prompt/output shape variants without
+    // multiplying loaded CUDA modules.
+    static constexpr std::size_t kMaximumProgramEntries = 4096;
     static constexpr std::size_t kMaximumNegativeEntries = 128;
 
     ModuleCache()

@@ -59,14 +59,6 @@ pub struct Pipeline {
     pub fires: PendingFires,
     pub(crate) failure: PipelineFailure,
     pub(crate) scope: crate::store::PipelineScope,
-    /// `pipeline.finish` was called (graceful EOS, F7): the ordered stream
-    /// has ended, so any LATER submit on this pipeline is a guest contract
-    /// error (rejected in `fire::submit_pass`). `close` stays legal after
-    /// finish — it cancels whatever is still unexecuted (R4-1). Arc'd so
-    /// each fire's retry classifier can observe it: after finish, a put
-    /// blocked on a full ring with no attached consumer and no host role is
-    /// a DEFINITE deadlock, surfaced loud instead of retrying out (F8).
-    pub(crate) finished: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Pipeline {
@@ -82,7 +74,6 @@ impl Pipeline {
                     .upgrade()
                     .is_none_or(|fires| fires.lock().unwrap().is_empty())
             }),
-            finished: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }

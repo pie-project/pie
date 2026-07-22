@@ -14,29 +14,53 @@ use inferlet::{Result, model as wit_model};
 
 #[inferlet::main]
 async fn main(_input: String) -> Result<String> {
-    let vocab = wit_model::output_vocab_size();
     let ws = WorkingSet::new();
-    model::configure(vocab, ws.page_size(), 1);
+    let page_size = ws.page_size();
 
     let mut prompt = wit_model::encode("hello world");
     if prompt.is_empty() {
         prompt.push(0);
     }
     let n = prompt.len() as u32;
-    let max_pages = n.div_ceil(ws.page_size()).max(1);
+    let max_pages = n.div_ceil(page_size).max(1);
     ws.reserve(max_pages)
         .map_err(|e| format!("ws.reserve: {e}"))?;
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
 
     let toks = Channel::from(prompt_i32).named("toks");
+    let embed_indptr = Channel::from(vec![0u32, n]).named("embed_indptr");
+    let positions = Channel::from((0..n).collect::<Vec<_>>()).named("positions");
+    let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
+    let page_indptr = Channel::from(vec![0u32, max_pages]).named("page_indptr");
+    let w_slot = Channel::from(
+        (0..n)
+            .map(|position| position / page_size)
+            .collect::<Vec<_>>(),
+    )
+    .named("w_slot");
+    let w_off = Channel::from(
+        (0..n)
+            .map(|position| position % page_size)
+            .collect::<Vec<_>>(),
+    )
+    .named("w_off");
     let kv_len = Channel::from(vec![n]).named("kv_len");
     let entropy_out = Channel::new([1], dtype::f32).named("entropy_out");
 
     let fwd = ForwardPass::new();
-    fwd.embed(&toks, Tensor::constant(vec![0u32, n]));
-    fwd.port_channel(Port::KvLen, &kv_len);
-    fwd.attn_working_set(&ws, .., ..)?;
-    fwd.derive_dense_geometry();
+    fwd.embed(&toks, &embed_indptr)?;
+    fwd.attention(
+        &ws,
+        ..,
+        ..,
+        &kv_len,
+        &pages,
+        &page_indptr,
+        &w_slot,
+        &w_off,
+        &positions,
+        None,
+    )?;
     fwd.epilogue(move || {
         // Shannon entropy H = -Σ p·log p of the softmax over the vocab.
         let logits = intrinsics::logits(); // [vocab] f32 (single read-out row)

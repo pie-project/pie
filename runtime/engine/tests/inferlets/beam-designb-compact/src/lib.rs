@@ -33,7 +33,6 @@ const B: u32 = 2; // beams
 const PAGE_T: u32 = 16; // tokens per pool page
 const POOL_PAGES: u32 = 8; // shared pool pages
 const POOL: u32 = POOL_PAGES * PAGE_T; // flat pool token positions
-const NUM_LAYERS: u32 = 28; // Qwen3-0.6B
 const BOS: i32 = 1;
 const MAX_STEPS: usize = 8;
 const COMPACT_AT: usize = 3; // step at which BOS is relocated
@@ -56,7 +55,6 @@ async fn main(input: String) -> Result<String> {
     let do_move = input.contains("move");
     let vocab = wit_model::output_vocab_size();
     let v = vocab;
-    model::configure(vocab, PAGE_T, NUM_LAYERS);
 
     // Fixed physical page pool (bulk growth), used for BOTH the fire descriptors
     // and the copy_into move. Flat pool position `wpos` maps to physical page
@@ -97,19 +95,22 @@ async fn main(input: String) -> Result<String> {
 
     let pidx_const: Vec<u32> = (0..=B).map(|b| b * POOL_PAGES).collect();
     let page_indptr = Channel::from_shaped([B + 1], pidx_const.clone()).named("page_indptr");
-    let lanes_b = Tensor::constant((0u32..=B).collect::<Vec<_>>());
+    let lanes_b = Channel::from((0u32..=B).collect::<Vec<_>>()).named("embed_indptr");
 
     let fwd = ForwardPass::new();
-    fwd.embed(&toks, lanes_b);
-    fwd.positions(&pos);
-    fwd.port_channel(Port::KvLen, &klen);
-    fwd.attn_working_set(&ws, .., ..)?;
-    fwd.derive_dense_geometry();
-    fwd.port_channel(Port::Pages, &pages);
-    fwd.port_channel(Port::PageIndptr, &page_indptr);
-    fwd.port_channel(Port::WSlot, &w_slot);
-    fwd.port_channel(Port::WOff, &w_off);
-    fwd.attn_mask(&mask);
+    fwd.embed(&toks, &lanes_b)?;
+    fwd.attention(
+        &ws,
+        ..,
+        ..,
+        &klen,
+        &pages,
+        &page_indptr,
+        &w_slot,
+        &w_off,
+        &pos,
+        Some(&mask),
+    )?;
     fwd.epilogue(move || {
         // 1. top-B over the flattened [B,V] cand block (identical to beam-designb).
         let cand = add(
@@ -240,6 +241,7 @@ async fn main(input: String) -> Result<String> {
             hyp_tokens.push(t0 as u32);
         }
     }
+    pipeline.close();
 
     let result = format!(
         "BEAM_DESIGNB_COMPACT B={B} steps={} do_move={do_move} compact_at={COMPACT_AT} \

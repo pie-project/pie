@@ -69,6 +69,13 @@ struct Glm5Workspace {
         int tp_size);
 };
 
+std::size_t glm5_workspace_bytes(
+    const HfConfig& cfg,
+    int max_tokens,
+    int max_logit_rows,
+    int max_position_embeddings,
+    int tp_size);
+
 void glm5_forward_paged(
     const Glm5Weights& w,
     const HfConfig& cfg,
@@ -91,6 +98,7 @@ void glm5_forward_paged(
     int total_tokens,
     int num_requests,
     bool is_pure_decode,
+    const std::uint8_t* row_valid_d = nullptr,
     const std::int32_t* logit_row_indices_d = nullptr,
     int num_logit_rows = 0);
 

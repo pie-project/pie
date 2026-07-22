@@ -7,6 +7,7 @@
 #include <utility>
 
 #include "../model/config.hpp"
+#include "elastic.hpp"
 
 namespace pie_cuda_driver {
 
@@ -319,6 +320,31 @@ std::vector<KvCache::PageBuffer> KvCache::page_buffers(int layer) {
         out.push_back({v_scale_layers_[src].data(), scale_bytes});
     }
     return out;
+}
+
+void KvCache::set_elastic_allocator(
+    std::shared_ptr<CudaArenaAllocator> allocator) noexcept {
+    elastic_allocator_ = std::move(allocator);
+}
+
+void KvCache::ensure_pages(int pages) {
+    if (elastic_allocator_ == nullptr || num_pages_ <= 0) return;
+    elastic_allocator_->ensure_fraction(
+        static_cast<std::size_t>(std::clamp(pages, 0, num_pages_)),
+        static_cast<std::size_t>(num_pages_));
+}
+
+void KvCache::trim_pages(int pages) {
+    if (elastic_allocator_ == nullptr || num_pages_ <= 0) return;
+    elastic_allocator_->trim_fraction(
+        static_cast<std::size_t>(std::clamp(pages, 0, num_pages_)),
+        static_cast<std::size_t>(num_pages_));
+}
+
+std::size_t KvCache::committed_bytes() const noexcept {
+    return elastic_allocator_ == nullptr
+        ? 0
+        : elastic_allocator_->committed_bytes();
 }
 
 std::size_t kv_cache_device_bytes_per_page(const KvCacheFormat& format,

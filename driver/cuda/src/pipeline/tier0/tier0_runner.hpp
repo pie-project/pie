@@ -159,6 +159,7 @@ class Tier0Runner {
                              i, register_err.c_str());
             }
         }
+        standalone_reg_->settle_initialization();
         std::string err;
         standalone_view_.bind(standalone_reg_.get(), trace_->channels, ids, &err);
         bind_view(&standalone_view_);

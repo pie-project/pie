@@ -8,7 +8,7 @@ license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
 [dependencies]
-thiserror = "1.0"
+thiserror = "2.0"
 # `PeerConn` (the pairing payload: peer id + exported handle + opaque connect
 # creds) crosses the control channel, so it derives serde — like the floor's
 # control-plane vocab (`cluster`/`transfer`).
@@ -33,4 +33,4 @@ nixl = ["dep:bindgen"]
 
 [build-dependencies]
 # Only pulled in under `--features nixl` (generates the NIXL C-API bindings).
-bindgen = { version = "0.71", optional = true }
+bindgen = { version = "0.72", optional = true }

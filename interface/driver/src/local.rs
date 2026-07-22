@@ -18,9 +18,9 @@ use crate::geometry::GeometryClass;
 
 /// Current direct local ABI version.
 ///
-/// v10: KV write lower bounds are exact declarations rather than clamped
-/// host-envelope hints.
-pub const PIE_DRIVER_ABI_VERSION: u32 = 10;
+/// v12: finalized launches can be prepared into a driver-owned elastic-memory
+/// lease and then launched or released exactly once.
+pub const PIE_DRIVER_ABI_VERSION: u32 = 12;
 pub const PIE_MODEL_COMPONENT_FULL: u32 = 0;
 pub const PIE_MODEL_COMPONENT_TEXT: u32 = 1;
 pub const PIE_MODEL_COMPONENT_ENCODE: u32 = 2;
@@ -37,6 +37,13 @@ pub const PIE_STATUS_UNSUPPORTED: i32 = -3;
 pub const PIE_STATUS_CLOSED: i32 = -4;
 /// The driver encountered an internal failure after accepting the call.
 pub const PIE_STATUS_DRIVER_ERROR: i32 = -5;
+
+/// The finalized launch was admitted and `lease_id` is valid.
+pub const PIE_LAUNCH_PREPARE_READY: u32 = 0;
+/// The launch may fit later after physical budget is released.
+pub const PIE_LAUNCH_PREPARE_EXHAUSTED: u32 = 1;
+/// The launch can never fit within the driver's physical budget ceiling.
+pub const PIE_LAUNCH_PREPARE_IMPOSSIBLE: u32 = 2;
 
 // Literal values so cbindgen emits plain macros; the assert pins them to the
 // Rust enum.
@@ -92,6 +99,9 @@ pub const PIE_MEMORY_DOMAIN_ROCM_DEVICE: PieMemoryDomain = 2;
 pub const PIE_MEMORY_DOMAIN_METAL_SHARED: PieMemoryDomain = 3;
 /// Metal private device memory.
 pub const PIE_MEMORY_DOMAIN_METAL_PRIVATE: PieMemoryDomain = 4;
+pub const PIE_ELASTIC_POOL_KV: u64 = 0;
+pub const PIE_ELASTIC_POOL_STATE: u64 = 1;
+pub const PIE_ELASTIC_POOL_WORKSPACE: u64 = 2;
 
 /// Opaque embedded-driver handle.
 pub type PieDriver = c_void;
@@ -547,7 +557,9 @@ pub struct PieLaunchDesc {
     /// Boolean `0`/`1`; any other value is invalid.
     pub has_user_mask: u8,
     /// Reserved; must be zero.
-    pub reserved_flags: [u8; 6],
+    pub reserved_flags: [u8; 2],
+    /// Exclusive physical KV page high-water required before this launch.
+    pub required_kv_pages: u32,
     pub image_indptr: PieU32Slice,
     pub image_grids: PieU32Slice,
     pub image_anchor_positions: PieU32Slice,
@@ -623,7 +635,8 @@ impl Default for PieLaunchDesc {
             context_ids: PieU64Slice::default(),
             single_token_mode: 0,
             has_user_mask: 0,
-            reserved_flags: [0; 6],
+            reserved_flags: [0; 2],
+            required_kv_pages: 0,
             image_indptr: PieU32Slice::default(),
             image_grids: PieU32Slice::default(),
             image_anchor_positions: PieU32Slice::default(),
@@ -656,6 +669,25 @@ impl Default for PieLaunchDesc {
             channel_ticket_indptr: PieU32Slice::default(),
         }
     }
+}
+
+/// Result of synchronously preparing one finalized launch.
+///
+/// `lease_id` is nonzero only for [`PIE_LAUNCH_PREPARE_READY`]. A ready lease
+/// is consumed by exactly one `*_launch_prepared` or `*_release_launch` call.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PieLaunchPrepareResult {
+    pub outcome: u32,
+    /// Reserved; must be zero.
+    pub reserved0: u32,
+    pub lease_id: u64,
+    /// Monotonic physical-budget generation observed by this attempt.
+    pub budget_generation: u64,
+    /// Independently rounded physical pages required by the finalized launch.
+    pub required_pages: u64,
+    /// Current physical budget in the same page units.
+    pub budget_pages: u64,
 }
 
 #[repr(C)]
@@ -1899,6 +1931,23 @@ pub fn validate_pool_resize_desc(desc: &PiePoolResizeDesc) -> PieAbiValidationRe
     )
 }
 
+/// Validates a driver-owned launch-prepare result.
+pub fn validate_launch_prepare_result(result: &PieLaunchPrepareResult) -> PieAbiValidationResult {
+    validate_reserved_zero(
+        "launch prepare result reserved0 must be zero",
+        result.reserved0,
+    )?;
+    if result.outcome > PIE_LAUNCH_PREPARE_IMPOSSIBLE {
+        return Err(invalid_argument("launch prepare result outcome is invalid"));
+    }
+    if (result.outcome == PIE_LAUNCH_PREPARE_READY) != (result.lease_id != 0) {
+        return Err(invalid_argument(
+            "launch prepare result lease_id does not match outcome",
+        ));
+    }
+    Ok(())
+}
+
 /// Validates non-null out-parameters used by the native driver entrypoints.
 pub fn validate_create_out_params(caps: *mut PieDriverCaps) -> PieAbiValidationResult {
     validate_mut_ptr(caps, "driver create caps output pointer must be non-null")
@@ -1934,6 +1983,18 @@ unsafe extern "C" {
         launch: *const PieLaunchDesc,
         completion: PieCompletion,
     ) -> i32;
+    pub fn pie_cuda_prepare_launch(
+        driver: *mut PieDriver,
+        launch: *const PieLaunchDesc,
+        result: *mut PieLaunchPrepareResult,
+    ) -> i32;
+    pub fn pie_cuda_launch_prepared(
+        driver: *mut PieDriver,
+        launch: *const PieLaunchDesc,
+        lease_id: u64,
+        completion: PieCompletion,
+    ) -> i32;
+    pub fn pie_cuda_release_launch(driver: *mut PieDriver, lease_id: u64) -> i32;
     pub fn pie_cuda_encode(
         driver: *mut PieDriver,
         encode: *const PieEncodeDesc,
@@ -1989,6 +2050,18 @@ unsafe extern "C" {
         launch: *const PieLaunchDesc,
         completion: PieCompletion,
     ) -> i32;
+    pub fn pie_metal_prepare_launch(
+        driver: *mut PieDriver,
+        launch: *const PieLaunchDesc,
+        result: *mut PieLaunchPrepareResult,
+    ) -> i32;
+    pub fn pie_metal_launch_prepared(
+        driver: *mut PieDriver,
+        launch: *const PieLaunchDesc,
+        lease_id: u64,
+        completion: PieCompletion,
+    ) -> i32;
+    pub fn pie_metal_release_launch(driver: *mut PieDriver, lease_id: u64) -> i32;
     pub fn pie_metal_encode(
         driver: *mut PieDriver,
         encode: *const PieEncodeDesc,
@@ -2115,7 +2188,7 @@ mod tests {
         assert_eq!(PieInstanceDesc::default().reserved1, 0);
         assert_eq!(PieLaunchDesc::default().reserved0, 0);
         assert_eq!(PieEncodeDesc::default().reserved0, 0);
-        assert_eq!(PieLaunchDesc::default().reserved_flags, [0; 6]);
+        assert_eq!(PieLaunchDesc::default().reserved_flags, [0; 2]);
         assert_eq!(PieKvCopyDesc::default().reserved0, 0);
         assert_eq!(PieStateCopyDesc::default().reserved0, 0);
         assert_eq!(PiePoolResizeDesc::default().reserved0, 0);
@@ -2846,7 +2919,8 @@ mod tests {
         );
         assert!(completion.contains("struct PieTerminalCell *terminal_cell;"));
         assert!(launch.contains("uint32_t reserved0;"));
-        assert!(launch.contains("uint8_t reserved_flags[6];"));
+        assert!(launch.contains("uint8_t reserved_flags[2];"));
+        assert!(launch.contains("uint32_t required_kv_pages;"));
         assert!(runtime.contains("uint32_t reserved0;"));
         assert!(runtime.contains("PieRuntimeNotifyFn notify;"));
         assert!(create.contains("uint32_t reserved0;"));

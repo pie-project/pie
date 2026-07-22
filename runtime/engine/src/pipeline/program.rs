@@ -226,7 +226,10 @@ fn price(c: &TraceContainer) -> Pricing {
             container::PortSource::Const { shape, .. } => {
                 Some((shape.numel() as u32).saturating_sub(1).max(1))
             }
-            container::PortSource::Channel(_) => None,
+            container::PortSource::Channel(channel) => c
+                .channels
+                .get(*channel as usize)
+                .map(|decl| (decl.shape.numel() as u32).saturating_sub(1).max(1)),
         })
         .unwrap_or(1);
     Pricing {
@@ -275,7 +278,7 @@ pub fn model_profile() -> ModelProfile {
     ModelProfile {
         vocab: m.vocab_size(),
         page_size: crate::store::registry::get(0, 0).kv_page_size,
-        num_layers: 1,
+        num_layers: m.num_layers(),
         activation: pie_ptir::types::DType::F32,
         has_mtp_logits: ptir.has_mtp_logits,
         has_mtp_drafts: ptir.has_mtp_drafts,
@@ -411,6 +414,45 @@ mod tests {
         assert_eq!(a.pricing.num_channels, 2);
         assert_eq!(a.pricing.channel_bytes, 16);
         assert_eq!(a.pricing.rows, 1);
+    }
+
+    #[test]
+    fn engine_profile_is_authoritative_at_program_bind() {
+        let mut registry = reg(2);
+        let engine_profile = ModelProfile {
+            vocab: VOCAB,
+            page_size: 64,
+            num_layers: 7,
+            has_mtp_logits: false,
+            has_mtp_drafts: true,
+            has_value_head: false,
+            ..ModelProfile::dummy()
+        };
+        let program = registry
+            .register(greedy(VOCAB).encode(), &engine_profile)
+            .unwrap();
+
+        assert_eq!(program.bound.profile.vocab, VOCAB);
+        assert_eq!(program.bound.profile.page_size, 64);
+        assert_eq!(program.bound.profile.num_layers, 7);
+        assert!(!program.bound.profile.has_mtp_logits);
+        assert!(program.bound.profile.has_mtp_drafts);
+        assert!(!program.bound.profile.has_value_head);
+    }
+
+    #[test]
+    fn pricing_reads_rows_from_channel_embed_indptr() {
+        let mut container = greedy(VOCAB);
+        container
+            .channels
+            .push(chan(Shape::vector(3), DType::U32, HostRole::None, true));
+        container
+            .ports
+            .iter_mut()
+            .find(|binding| binding.port == Port::EmbedIndptr)
+            .unwrap()
+            .source = PortSource::Channel(2);
+        assert_eq!(price(&container).rows, 2);
     }
 
     #[test]

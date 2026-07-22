@@ -104,11 +104,11 @@ endif()
 cpmaddpackage(
   NAME flashinfer
   GITHUB_REPOSITORY flashinfer-ai/flashinfer
-  GIT_TAG v0.6.9
+  GIT_TAG v0.6.15
   GIT_SHALLOW TRUE
   DOWNLOAD_ONLY YES)
 
-# v0.6.9 has a narrowing-conversion warning nvcc escalates to an error
+# v0.6.15 has a narrowing-conversion warning nvcc escalates to an error
 # (`state_stride_batch`, signed long, brace-initialized into a uint64_t
 # field). Patch once after fetch; a sentinel file avoids re-patching every
 # fresh build-hash dir.
@@ -117,6 +117,12 @@ set(_FI_PATCH_FILE
   "${flashinfer_SOURCE_DIR}/include/flashinfer/mamba/kernel_selective_state_update_stp.cuh")
 if(EXISTS "${_FI_PATCH_FILE}" AND NOT EXISTS "${_FI_PATCH_SENTINEL}")
   file(READ "${_FI_PATCH_FILE}" _fi_src)
+  string(FIND "${_fi_src}"
+    "DSTATE * DIM, params.state_stride_batch}" _fi_patch_offset)
+  if(_fi_patch_offset EQUAL -1)
+    message(FATAL_ERROR
+      "FlashInfer narrowing patch no longer applies to ${_FI_PATCH_FILE}")
+  endif()
   string(REPLACE
     "DSTATE * DIM, params.state_stride_batch}"
     "DSTATE * DIM, static_cast<uint64_t>(params.state_stride_batch)}"
@@ -324,6 +330,7 @@ add_library(pie_driver_cuda_lib STATIC
   # store/ -- long-lived device memory pools
   src/store/kv_cache.cpp
   src/store/kv_cache_format.cpp
+  src/store/elastic.cpp
   src/store/memory_planner.cpp
   src/store/recurrent_state_cache.cpp
   src/store/swap_pool.cpp
@@ -598,7 +605,12 @@ pie_add_cuda_target(test_gather_tokens
   SOURCES tests/test_gather_tokens.cu src/kernels/gather_tokens.cu
   LIBS CUDA::cudart)
 pie_add_cuda_target(test_pack_dense_mask
-  SOURCES tests/pack_dense_mask_test.cu src/kernels/pack_dense_mask.cu
+  SOURCES
+    tests/pack_dense_mask_test.cu
+    src/batch/persistent_inputs.cpp
+    src/kernels/graph_pad.cu
+    src/kernels/pack_dense_mask.cu
+    src/tensor.cpp
   LIBS CUDA::cudart)
 pie_add_cuda_target(test_envelope_dot
   SOURCES tests/test_envelope_dot.cu src/kernels/envelope.cu
@@ -624,6 +636,10 @@ pie_add_cuda_target(test_decode_fused_write_parity
   SOURCES tests/test_decode_fused_write_parity.cu
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/tests
   LIBS pie_driver_cuda_lib CUDA::cudart)
+pie_add_cuda_target(test_graph_padding_kv_canary
+  SOURCES tests/test_graph_padding_kv_canary.cu
+  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/tests
+  LIBS pie_driver_cuda_lib CUDA::cudart)
 pie_add_cuda_target(test_decode_cobatch_chain
   SOURCES tests/test_decode_cobatch_chain.cu
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/tests
@@ -633,22 +649,35 @@ pie_add_cuda_target(test_driver_common
   LIBS nlohmann_json::nlohmann_json)
 pie_add_cuda_target(test_kv_cache_format
   SOURCES tests/test_kv_cache_format.cpp src/store/kv_cache_format.cpp)
+pie_add_cuda_target(test_elastic
+  SOURCES tests/test_elastic.cpp src/tensor.cpp src/store/elastic.cpp
+  INCLUDE_DIRS
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+  LIBS CUDA::cudart CUDA::cuda_driver)
+pie_add_cuda_target(test_elastic_converted_pools
+  SOURCES tests/test_elastic_converted_pools.cpp
+  LIBS pie_driver_cuda_lib CUDA::cudart CUDA::cuda_driver)
 pie_add_cuda_target(test_kv_cache_quant
   SOURCES
     tests/test_kv_cache_quant.cu
     src/tensor.cpp
+    src/store/elastic.cpp
     src/store/kv_cache.cpp
     src/store/kv_cache_format.cpp
     src/kernels/kv_paged.cu
-  LIBS CUDA::cudart)
+  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+  LIBS CUDA::cudart CUDA::cuda_driver)
 pie_add_cuda_target(test_swap_pool
   SOURCES
     tests/test_swap_pool.cpp
     src/tensor.cpp
+    src/store/elastic.cpp
     src/store/kv_cache.cpp
     src/store/kv_cache_format.cpp
     src/store/swap_pool.cpp
-  LIBS CUDA::cudart)
+  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+  LIBS CUDA::cudart CUDA::cuda_driver)
 pie_add_cuda_target(test_mxfp4_marlin
   SOURCES tests/test_mxfp4_marlin.cu src/kernels/mxfp4_marlin.cu
   LIBS CUDA::cudart)
@@ -710,6 +739,9 @@ pie_add_cuda_target(test_flashinfer_decode_head_dim_guard
   SOURCES tests/test_flashinfer_decode_head_dim_guard.cpp
   LIBS pie_driver_cuda_lib)
 pie_add_cuda_target(test_graph_variant SOURCES tests/graph_variant_test.cpp)
+pie_add_cuda_target(test_decode_envelope_contract
+  SOURCES tests/decode_envelope_contract_test.cpp
+  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../common/include)
 pie_add_cuda_target(test_tp_gate
   SOURCES tests/tp_gate_test.cpp
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/src

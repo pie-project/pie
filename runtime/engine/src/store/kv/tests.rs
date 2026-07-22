@@ -818,19 +818,19 @@ fn store_index_replacement_keeps_existing_loaded_view() {
 }
 
 #[test]
-fn store_index_capacity_evicts_oldest_key() {
+fn store_index_count_does_not_evict_entries() {
     let mut store = KvStore::new(4, h(42));
-    store.max_indexes = 1;
-    let first = store.create_working_set();
-    commit_fresh(&mut store, first, 1, 1);
-    let second = store.create_working_set();
-    commit_fresh(&mut store, second, 1, 1);
+    let ws = store.create_working_set();
+    commit_fresh(&mut store, ws, 1, 1);
 
-    store.update_index(b"first".to_vec(), first).unwrap();
-    store.update_index(b"second".to_vec(), second).unwrap();
+    for index in 0..257 {
+        store
+            .update_index(format!("index-{index}").into_bytes(), ws)
+            .unwrap();
+    }
 
-    assert!(store.from_index(b"first").unwrap().is_none());
-    assert!(store.from_index(b"second").unwrap().is_some());
+    assert!(store.from_index(b"index-0").unwrap().is_some());
+    assert!(store.from_index(b"index-256").unwrap().is_some());
 }
 
 #[test]
@@ -877,6 +877,43 @@ fn ensure_backed_materializes_only_the_missing_logical_tail() {
         store.ensure_backed(ws, 4),
         Err(KvStoreError::BadWriteSet { .. })
     ));
+}
+
+#[test]
+fn demand_and_reserved_backing_consume_exactly_once() {
+    let mut store = KvStore::new(3, h(42));
+    let ws = store.create_working_set();
+    store.reserve(ws, 3).unwrap();
+    assert_eq!(store.backing_demand(ws, 2).unwrap(), 2);
+
+    let mut granted = store.reserve_device_pages(3).unwrap();
+    assert_eq!(
+        store.ensure_backed_reserved(ws, 2, &mut granted).unwrap(),
+        2
+    );
+    assert_eq!(granted.len(), 1);
+    assert_eq!(store.mapped_len(ws).unwrap(), 2);
+    store.release_device_reservation(granted);
+    assert_eq!(store.available_pages(), 1);
+}
+
+#[test]
+fn write_demand_and_reserved_prepare_leave_surplus_owned() {
+    let mut store = KvStore::new(3, h(42));
+    let ws = store.create_working_set();
+    store.reserve(ws, 2).unwrap();
+    assert_eq!(store.write_demand(ws, &[0, 1]).unwrap(), 2);
+
+    let mut granted = store.reserve_device_pages(3).unwrap();
+    let prepared = store
+        .prepare_write_reserved(ws, &[0, 1], &mut granted)
+        .unwrap();
+    assert_eq!(prepared.targets().len(), 2);
+    assert_eq!(granted.len(), 1);
+    store.cancel_prepared(prepared);
+    store.release_device_reservation(granted);
+    store.retire_idle();
+    assert_eq!(store.available_pages(), 3);
 }
 
 #[test]

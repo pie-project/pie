@@ -7,9 +7,8 @@ use crate::{
     ProgramRegistration,
 };
 
-// v7: KV write bounds are exact declarations; older peers clamp the lower
-// bound and can authorize writes the runtime now rejects.
-pub const REMOTE_WIRE_VERSION: u32 = 7;
+// v8: LaunchPlan carries the translated physical KV commit high-water.
+pub const REMOTE_WIRE_VERSION: u32 = 8;
 
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

@@ -795,6 +795,42 @@ void run_pivot_predicates(const std::string& dir) {
     cudaFree(d_logits);
 }
 
+void run_async_writer_seed_pull() {
+    std::printf("[async writer seed pull]\n");
+    DeviceChannelRegistry registry;
+    const std::uint32_t shape[] = {2};
+    PieChannelDesc desc{};
+    desc.abi_version = PIE_DRIVER_ABI_VERSION;
+    desc.channel_id = 1;
+    desc.shape = {shape, 1};
+    desc.dtype = PIE_CHANNEL_DTYPE_U32;
+    desc.host_role = PIE_CHANNEL_HOST_ROLE_WRITER;
+    desc.seeded = 1;
+    desc.capacity = 2;
+    desc.reader_wait_id = 1;
+    desc.writer_wait_id = 2;
+    PieChannelEndpointBinding binding{};
+    std::string error;
+    const bool registered =
+        registry.register_endpoint(desc, &binding, &error);
+    expect(
+        registered,
+        "async writer seed: endpoint registration (" + error + ")");
+    if (!registered) return;
+    const std::uint32_t slot = registry.slot_for(desc.channel_id);
+    const std::uint32_t seed[] = {7, 11};
+    registry.seed_cell_async(slot, seed, sizeof(seed));
+    registry.settle_seed_copies();
+    std::vector<std::vector<std::uint8_t>> staging;
+    const bool copied =
+        registry.pull_writer_ring(slot, nullptr, staging);
+    std::uint32_t observed[2]{};
+    registry.read_committed(slot, observed, sizeof(observed));
+    expect(
+        !copied && observed[0] == seed[0] && observed[1] == seed[1],
+        "async writer seed: first ring pull preserves the committed seed");
+}
+
 int main(int argc, char** argv) {
     std::string dir = argc > 1 ? argv[1] : "tests/golden-ptir";
     cudaDeviceProp p{}; cudaGetDeviceProperties(&p, 0);
@@ -829,6 +865,7 @@ int main(int argc, char** argv) {
     run_structured_masks(dir);
     run_dfa_ingraph(dir);
     run_pivot_predicates(dir);
+    run_async_writer_seed_pull();
     std::printf("\n==== golden step-exec: %d passed, %d failed ====\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

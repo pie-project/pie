@@ -11,7 +11,6 @@ use inferlet::{Result, chat, model as wit_model};
 use serde::Deserialize;
 
 const PAGE_T: u32 = 16;
-const NUM_LAYERS: u32 = 28;
 
 #[derive(Deserialize)]
 struct Input {
@@ -77,7 +76,6 @@ async fn main(input: Input) -> Result<String> {
     let max_tokens =
         u32::try_from(input.max_tokens).map_err(|_| "max_tokens exceeds the u32 range")?;
     let vocab = wit_model::output_vocab_size();
-    model::configure(vocab, PAGE_T, NUM_LAYERS);
 
     let mut prompt = chat::system_user("You are a helpful assistant.", &input.prompt);
     prompt.extend(chat::cue());
@@ -109,6 +107,10 @@ async fn main(input: Input) -> Result<String> {
 
     let prompt_i32 = prompt.iter().map(|&token| token as i32).collect::<Vec<_>>();
     let amateur_prompt = Channel::from(prompt_i32.clone()).named("amateur_prompt");
+    let amateur_prefill_embed_indptr =
+        Channel::from(vec![0u32, n]).named("amateur_prefill_embed_indptr");
+    let amateur_prefill_positions =
+        Channel::from((0..n).collect::<Vec<_>>()).named("amateur_prefill_positions");
     let amateur_prefill_slots = Channel::from(
         (0..n)
             .map(|position| amateur_ids[(position / PAGE_T) as usize])
@@ -130,33 +132,35 @@ async fn main(input: Input) -> Result<String> {
     let amateur_prefill_out = Channel::new([vocab], dtype::f32).named("amateur_prefill_logits");
 
     let amateur_prefill = ForwardPass::new();
-    amateur_prefill.embed(&amateur_prompt, Tensor::constant(vec![0u32, n]));
-    amateur_prefill.port_channel(Port::KvLen, &amateur_prefill_klen);
-    amateur_prefill.attn_working_set(&amateur_ws, .., ..)?;
-    amateur_prefill.derive_dense_geometry();
-    amateur_prefill.port_channel(Port::Pages, &amateur_prefill_pages);
-    amateur_prefill.port_channel(Port::PageIndptr, &amateur_prefill_indptr);
-    amateur_prefill.port_channel(Port::WSlot, &amateur_prefill_slots);
-    amateur_prefill.port_channel(Port::WOff, &amateur_prefill_offsets);
-    amateur_prefill.attn_mask(&amateur_prefill_mask);
+    amateur_prefill.embed(&amateur_prompt, &amateur_prefill_embed_indptr)?;
+    amateur_prefill.attention(
+        &amateur_ws,
+        ..,
+        ..,
+        &amateur_prefill_klen,
+        &amateur_prefill_pages,
+        &amateur_prefill_indptr,
+        &amateur_prefill_slots,
+        &amateur_prefill_offsets,
+        &amateur_prefill_positions,
+        Some(&amateur_prefill_mask),
+    )?;
     amateur_prefill.epilogue(move || {
         amateur_prefill_out.put(intrinsics::logits());
     });
 
-    // The amateur and expert are genuinely concurrent streams (R4-4), so each
-    // prefill keeps its own pipeline. This single fire is knowably the
-    // stream's only submission — finish() right after it ends the stream
-    // (F7), and the drained pipeline just drops (no close needed).
+    // The amateur and expert are genuinely concurrent streams, so each
+    // prefill keeps its own pipeline and closes after its output is taken.
     let amateur_prefill_pipeline = Pipeline::new();
     amateur_prefill
         .submit(&amateur_prefill_pipeline)
         .map_err(|error| format!("amateur prefill: {error}"))?;
-    amateur_prefill_pipeline.finish();
     let first_amateur_logits = amateur_prefill_out
         .take()
         .get::<f32>()
         .await
         .map_err(|error| format!("read amateur prefill logits: {error}"))?;
+    amateur_prefill_pipeline.close();
 
     // The expert keeps the complete context and consumes the amateur logits in
     // its epilogue to perform the contrastive token selection on-device.
@@ -165,17 +169,38 @@ async fn main(input: Input) -> Result<String> {
         .reserve(pool_pages)
         .map_err(|error| format!("reserve expert KV: {error}"))?;
     let expert_prompt = Channel::from(prompt_i32).named("expert_prompt");
+    let expert_prefill_embed_indptr =
+        Channel::from(vec![0u32, n]).named("expert_prefill_embed_indptr");
+    let expert_prefill_positions =
+        Channel::from((0..n).collect::<Vec<_>>()).named("expert_prefill_positions");
+    let expert_prefill_pages =
+        Channel::from((0..pool_pages).collect::<Vec<_>>()).named("expert_prefill_pages");
+    let expert_prefill_indptr =
+        Channel::from(vec![0u32, n.div_ceil(PAGE_T)]).named("expert_prefill_indptr");
+    let expert_prefill_slots =
+        Channel::from((0..n).map(|p| p / PAGE_T).collect::<Vec<_>>()).named("expert_prefill_slots");
+    let expert_prefill_offsets = Channel::from((0..n).map(|p| p % PAGE_T).collect::<Vec<_>>())
+        .named("expert_prefill_offsets");
     let expert_prefill_amateur = Channel::new([vocab], dtype::f32).named("expert_prefill_amateur");
     let first_out = Channel::new([1], dtype::i32).named("first_token");
     let lambda = input.lambda;
     let alpha = input.alpha;
 
     let expert_prefill = ForwardPass::new();
-    expert_prefill.embed(&expert_prompt, Tensor::constant(vec![0u32, n]));
+    expert_prefill.embed(&expert_prompt, &expert_prefill_embed_indptr)?;
     let expert_prefill_kv_len = Channel::from(vec![n]).named("expert_prefill_kv_len");
-    expert_prefill.port_channel(Port::KvLen, &expert_prefill_kv_len);
-    expert_prefill.attn_working_set(&expert_ws, .., ..)?;
-    expert_prefill.derive_dense_geometry();
+    expert_prefill.attention(
+        &expert_ws,
+        ..,
+        ..,
+        &expert_prefill_kv_len,
+        &expert_prefill_pages,
+        &expert_prefill_indptr,
+        &expert_prefill_slots,
+        &expert_prefill_offsets,
+        &expert_prefill_positions,
+        None,
+    )?;
     expert_prefill.epilogue(move || {
         let token = contrastive_pick(expert_prefill_amateur.take(), lambda, alpha, vocab);
         first_out.put(token);
@@ -187,8 +212,8 @@ async fn main(input: Input) -> Result<String> {
     expert_prefill
         .submit(&expert_prefill_pipeline)
         .map_err(|error| format!("expert prefill: {error}"))?;
-    expert_prefill_pipeline.finish();
     let first = read_expert_token(&first_out).await?;
+    expert_prefill_pipeline.close();
 
     let mut generated = Vec::with_capacity(input.max_tokens);
     if !stop_tokens.contains(&first) {
@@ -218,16 +243,20 @@ async fn main(input: Input) -> Result<String> {
         .named("amateur_logits");
 
     let amateur_decode = ForwardPass::new();
-    amateur_decode.embed(&amateur_token, Tensor::constant(vec![0u32, 1]));
-    amateur_decode.positions(&amateur_position);
-    amateur_decode.port_channel(Port::KvLen, &amateur_klen);
-    amateur_decode.attn_working_set(&amateur_ws, .., (n / amateur_ws.page_size())..)?;
-    amateur_decode.derive_dense_geometry();
-    amateur_decode.port_channel(Port::Pages, &amateur_pages);
-    amateur_decode.port_channel(Port::PageIndptr, &amateur_page_indptr);
-    amateur_decode.port_channel(Port::WSlot, &amateur_write_slot);
-    amateur_decode.port_channel(Port::WOff, &amateur_write_offset);
-    amateur_decode.attn_mask(&amateur_mask);
+    let amateur_embed_indptr = Channel::from(vec![0u32, 1]).named("amateur_embed_indptr");
+    amateur_decode.embed(&amateur_token, &amateur_embed_indptr)?;
+    amateur_decode.attention(
+        &amateur_ws,
+        ..,
+        (n / amateur_ws.page_size())..,
+        &amateur_klen,
+        &amateur_pages,
+        &amateur_page_indptr,
+        &amateur_write_slot,
+        &amateur_write_offset,
+        &amateur_position,
+        Some(&amateur_mask),
+    )?;
     amateur_decode.epilogue(move || {
         let base = amateur_fill.take().tensor();
         let ids = amateur_ids_input.take().tensor();
@@ -259,23 +288,46 @@ async fn main(input: Input) -> Result<String> {
     });
 
     let expert_token = Channel::from(vec![first as i32]).named("expert_token");
+    let expert_embed_indptr = Channel::from(vec![0u32, 1]).named("expert_embed_indptr");
+    let expert_position = Channel::from(vec![n]).named("expert_position");
+    let expert_pages = Channel::from((0..pool_pages).collect::<Vec<_>>()).named("expert_pages");
+    let expert_page_indptr =
+        Channel::from(vec![0u32, (n + 1).div_ceil(PAGE_T)]).named("expert_page_indptr");
+    let expert_write_slot = Channel::from(vec![n / PAGE_T]).named("expert_write_slot");
+    let expert_write_offset = Channel::from(vec![n % PAGE_T]).named("expert_write_offset");
     let expert_amateur = Channel::writer([vocab], dtype::f32).named("expert_amateur_logits");
     let expert_token_out = Channel::new([1], dtype::i32)
         .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
         .named("expert_token_out");
 
     let expert_decode = ForwardPass::new();
-    expert_decode.embed(&expert_token, Tensor::constant(vec![0u32, 1]));
+    expert_decode.embed(&expert_token, &expert_embed_indptr)?;
     let expert_kv_len = Channel::from(vec![n + 1]).named("expert_kv_len");
-    expert_decode.port_channel(Port::KvLen, &expert_kv_len);
-    expert_decode.attn_working_set(&expert_ws, .., (n / expert_ws.page_size())..)?;
-    expert_decode.derive_dense_geometry();
+    expert_decode.attention(
+        &expert_ws,
+        ..,
+        (n / expert_ws.page_size())..,
+        &expert_kv_len,
+        &expert_pages,
+        &expert_page_indptr,
+        &expert_write_slot,
+        &expert_write_offset,
+        &expert_position,
+        None,
+    )?;
     expert_decode.epilogue(move || {
         let length = expert_kv_len.take().tensor();
         let token = contrastive_pick(expert_amateur.take(), lambda, alpha, vocab);
+        let next_length = add(&length, 1u32);
+        let page_count = div(add(&next_length, PAGE_T - 1), PAGE_T);
 
         expert_token.put(&token);
-        expert_kv_len.put(add(&length, 1u32));
+        expert_kv_len.put(&next_length);
+        expert_position.put(&length);
+        expert_write_slot.put(div(&length, PAGE_T));
+        expert_write_offset.put(rem(&length, PAGE_T));
+        expert_page_indptr.take();
+        expert_page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
         expert_token_out.put(&token);
     });
 
@@ -327,9 +379,7 @@ async fn main(input: Input) -> Result<String> {
             }
         }
     }
-    // Stop-driven loop: the last submit is not knowable when made, so
-    // finish() is never called (F7) — every fire (including the run-ahead
-    // amateur) was drained above, so this close cancels nothing (R4-1).
+    // Every fire, including the run-ahead amateur, was drained above.
     pipeline.close();
 
     wit_model::decode(&generated)

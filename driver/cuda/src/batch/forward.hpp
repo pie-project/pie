@@ -82,6 +82,7 @@ struct ForwardFn {
     // satisfy that yet — left here as the explicit flip we'll set
     // alongside the graph-safe attention dispatch refactor.
     bool graph_safe = false;
+    bool graph_padding_kv_write_safe = false;
     bool supports_compact_logits = false;
     bool supports_small_prefill_graph = false;
     bool supports_runtime_window = false;
@@ -215,6 +216,7 @@ struct ForwardFn {
         int total_tokens = 0;
         int num_requests = 0;
         bool is_pure_decode = false;
+        bool have_custom_mask = false;
         int runtime_window_left = -2;
     };
 
@@ -320,6 +322,7 @@ struct BatchEngine {
                 ForwardGraphCache* graph_cache = nullptr,
                 NcclComm* tp_comm = nullptr,
                 std::string tp_cpu_gate_key = {},
+                ops::RuntimeQuantContext* runtime_quant_context = nullptr,
                 RecurrentStateCache* rs_cache = nullptr)
         : loaded_model(loaded_model),
           ws(ws),
@@ -337,6 +340,7 @@ struct BatchEngine {
           graph_cache(graph_cache),
           tp_comm(tp_comm),
           tp_cpu_gate_key(std::move(tp_cpu_gate_key)),
+          runtime_quant_context(runtime_quant_context),
           rs_cache(rs_cache) {}
 
     LoadedModel& loaded_model;
@@ -346,14 +350,16 @@ struct BatchEngine {
     ops::CublasHandle& cublas;
     int max_workspace_tokens;
     int max_forward_requests;
-    // Private physical KV page used only for CUDA-graph padding rows.
-    // This page is not reported in DriverCapabilities.total_pages, so the
-    // runtime never assigns it to a context.
+    // Invalid-row dummy page. Row-validity-safe native graph paths alias page
+    // 0; other models/formats retain a hidden sacrificial tail page.
     int graph_pad_page = -1;
     // Private recurrent-state slot used only for CUDA-graph padding rows.
     // Like graph_pad_page, it is allocated in CUDA storage but hidden from
     // runtime capabilities.
     int graph_pad_slot = -1;
+    // Physical KV prefix required by the rank-0 launch. TP followers receive
+    // this in the fire header and commit the same prefix before execution.
+    int required_kv_pages = 0;
     // Pre-allocated input buffers — refreshed per fire via memcpy
     // rather than re-allocated. See `persistent_inputs.hpp`.
     PersistentInputs& inputs;
@@ -377,6 +383,7 @@ struct BatchEngine {
     // before entering their NCCL receive. This prevents idle followers from
     // burning GPU cycles while rank 0 is between requests.
     std::string tp_cpu_gate_key;
+    ops::RuntimeQuantContext* runtime_quant_context = nullptr;
 
     // Runtime-managed rs_cache storage. Null on models without
     // recurrent-state slots.
@@ -413,6 +420,7 @@ cudaGraphExec_t capture_forward_graph_exec(
     int N,
     int R,
     bool is_pure_decode,
+    bool have_custom_mask,
     const std::int32_t* slot_ids_h,
     const std::uint8_t* is_fresh_h,
     const std::int32_t* slot_ids_d,
@@ -511,6 +519,9 @@ struct ForwardDispatchInputs {
     int num_sampling = 0;
     bool is_pure_decode = false;
     bool have_custom_mask = false;
+    // Direct non-graph prefill/mixed launches may gather the requested hidden
+    // rows before lm_head instead of materializing [N, vocab] logits.
+    bool compact_logits = false;
     int structured_window_left = -2;
     // Explicit KV-write descriptor present (device-geometry WSlot/WOff, B2).
     // When set, the forward routes the per-layer KV append through the explicit

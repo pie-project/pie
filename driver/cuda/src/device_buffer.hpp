@@ -27,6 +27,7 @@
 
 #include "cuda_check.hpp"
 #include "runahead.hpp"
+#include "tensor.hpp"
 
 namespace pie_cuda_driver {
 
@@ -37,7 +38,10 @@ public:
 
     explicit DeviceBuffer(std::size_t count) {
         if (count > 0) {
-            CUDA_CHECK(cudaMalloc(&ptr_, count * sizeof(T)));
+            const DeviceMemoryBlock block =
+                allocate_device_memory(count * sizeof(T), alignof(T));
+            ptr_ = static_cast<T*>(block.ptr);
+            arena_owned_ = block.arena_owned;
             count_ = count;
         }
     }
@@ -53,13 +57,15 @@ public:
           h_pinned_(o.h_pinned_),
           h_pinned_copy_done_(o.h_pinned_copy_done_),
           h_pinned_copy_pending_(o.h_pinned_copy_pending_),
-          next_pinned_slot_(o.next_pinned_slot_) {
+          next_pinned_slot_(o.next_pinned_slot_),
+          arena_owned_(o.arena_owned_) {
         o.ptr_ = nullptr;
         o.count_ = 0;
         o.h_pinned_.fill(nullptr);
         o.h_pinned_copy_done_.fill(nullptr);
         o.h_pinned_copy_pending_.fill(false);
         o.next_pinned_slot_ = 0;
+        o.arena_owned_ = false;
     }
 
     DeviceBuffer& operator=(DeviceBuffer&& o) noexcept {
@@ -71,12 +77,14 @@ public:
             h_pinned_copy_done_ = o.h_pinned_copy_done_;
             h_pinned_copy_pending_ = o.h_pinned_copy_pending_;
             next_pinned_slot_ = o.next_pinned_slot_;
+            arena_owned_ = o.arena_owned_;
             o.ptr_ = nullptr;
             o.count_ = 0;
             o.h_pinned_.fill(nullptr);
             o.h_pinned_copy_done_.fill(nullptr);
             o.h_pinned_copy_pending_.fill(false);
             o.next_pinned_slot_ = 0;
+            o.arena_owned_ = false;
         }
         return *this;
     }
@@ -210,11 +218,10 @@ private:
             }
         }
         if (ptr_) {
-            // Best effort — driver shutdown may have already torn the
-            // context down; we don't surface errors from a destructor.
-            cudaFree(ptr_);
+            free_device_memory({ptr_, arena_owned_});
             ptr_ = nullptr;
             count_ = 0;
+            arena_owned_ = false;
         }
         for (T*& pinned : h_pinned_) {
             if (pinned != nullptr) {
@@ -260,6 +267,7 @@ private:
     std::array<bool, kPinnedStagingSlots>
         h_pinned_copy_pending_{};
     std::size_t next_pinned_slot_ = 0;
+    bool arena_owned_ = false;
 };
 
 template <class T>

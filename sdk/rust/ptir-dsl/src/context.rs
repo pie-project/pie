@@ -272,9 +272,9 @@ pub(crate) fn record_channel_read(ch: &ChannelRef, consume: bool, span: Span) ->
 /// producer programs are context-free — an unconsumed put sits in the ring
 /// (dropped at instance teardown) or back-pressures honestly at ring-full;
 /// loop-carried descriptor updates drain EXPLICITLY (`ch.take();` before the
-/// re-put). After `pipeline.finish`, a put still blocked with no attached
-/// consumer and no host role is a definite deadlock, surfaced by the fire's
-/// retry classifier.
+/// re-put). After `pipeline.close`, an already-submitted put still blocked with
+/// no attached consumer and no host role is a definite deadlock, surfaced by
+/// the fire's retry classifier.
 pub(crate) fn record_channel_put(ch: &ChannelRef, value: u32, span: Span) {
     SESSION.with_borrow_mut(|s| {
         let sess = s.as_mut().expect("session active");

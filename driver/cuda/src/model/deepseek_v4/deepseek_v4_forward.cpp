@@ -157,6 +157,19 @@ DsV4Workspace DsV4Workspace::allocate(
     return ws;
 }
 
+std::size_t dsv4_workspace_bytes(
+    const HfConfig& cfg,
+    int max_tokens,
+    int max_logit_rows,
+    int tp_size) {
+    ScopedDeviceAllocationCounter counter;
+    {
+        auto workspace = DsV4Workspace::allocate(
+            cfg, max_tokens, max_logit_rows, tp_size);
+    }
+    return counter.allocated_bytes();
+}
+
 void dsv4_forward_paged(
     const DsV4Weights& w,
     const HfConfig& cfg,

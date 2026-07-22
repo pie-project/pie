@@ -64,10 +64,17 @@ impl PipelineScope {
         self.state.id
     }
 
-    pub(crate) fn close(&self) {
-        self.state
+    pub(crate) fn scheduler_id(&self) -> uuid::Uuid {
+        uuid::Uuid::from_u128(self.state.id.0)
+    }
+
+    /// Mark the scope closed. Returns whether this call performed the
+    /// transition, allowing lifecycle notifications to remain idempotent.
+    pub(crate) fn close(&self) -> bool {
+        !self
+            .state
             .closed
-            .store(true, std::sync::atomic::Ordering::Release);
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
     }
 
     pub(crate) fn is_closed(&self) -> bool {

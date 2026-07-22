@@ -29,8 +29,8 @@
 //!    channel-bit late input — the sampler parks on the channel word, the forward
 //!    overlaps. The C2 wait mechanism (device dirty-flag word → channel bit) is
 //!    already in place; this harness re-points the grammar slice at it.
-//! 2. **M2 3+1 (C1):** `fwd.attn_working_set(&ws, &cursor, P_MAX)` with the
-//!    descriptor's geometry contents from a device channel the host never reads.
+//! 2. **M2 3+1 (C1):** flat `fwd.attention(...)` with every geometry descriptor
+//!    supplied by device-carried channels the host never reads.
 //! 3. **M3 north star:** compose all three programs on one forward — the MTP
 //!    epilogue emits drafts, the grammar walk builds the K+1 mask rows, Quest
 //!    selects pages per layer — under the quorum scheduler. Add the accepted-

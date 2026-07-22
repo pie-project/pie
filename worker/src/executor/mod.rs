@@ -2986,6 +2986,17 @@ fn append_plan(
     destination.context_ids.extend(source.context_ids);
     destination.single_token_mode &= source.single_token_mode;
     destination.has_user_mask |= source.has_user_mask;
+    destination.required_kv_pages = destination
+        .required_kv_pages
+        .max(source.required_kv_pages)
+        .max(
+            source
+                .kv_translation
+                .iter()
+                .copied()
+                .max()
+                .map_or(0, |page| page.saturating_add(1)),
+        );
 
     destination.image_grids.extend(source.image_grids);
     destination
@@ -3070,6 +3081,14 @@ fn merge_remote_launches(launches: Vec<RemoteLaunch>) -> Result<RemoteLaunch> {
             .context("program row offset overflow")?;
         let ticket_base = u32::try_from(merged.channel_expected_head.len())
             .context("channel ticket offset overflow")?;
+        merged.plan.required_kv_pages = merged.plan.required_kv_pages.max(
+            launch
+                .kv_translation
+                .iter()
+                .copied()
+                .max()
+                .map_or(0, |page| page.saturating_add(1)),
+        );
         append_csr(
             &mut merged.kv_translation_indptr,
             &launch.kv_translation_indptr,
@@ -3962,6 +3981,8 @@ mod tests {
         first.plan.position_ids = vec![0, 1];
         first.plan.qo_indptr = vec![0, 2];
         first.plan.sampling_indices = vec![1];
+        first.kv_translation = vec![3, 16];
+        first.kv_translation_indptr = vec![0, 2];
         let mut second = launch(22);
         second.plan.token_ids = vec![2, 3];
         second.plan.position_ids = vec![4, 5];
@@ -3969,6 +3990,8 @@ mod tests {
         second.plan.sampling_indices = vec![1];
         second.plan.sampling_indptr = vec![0, 1];
         second.plan.mask_indptr = vec![0, 1];
+        second.kv_translation = vec![8, 28];
+        second.kv_translation_indptr = vec![0, 2];
         second.logical_fire_ids = vec![2];
         let merged = merge_remote_launches(vec![first, second]).unwrap();
         assert_eq!(merged.instance_ids, vec![11, 22]);
@@ -3978,6 +4001,7 @@ mod tests {
         assert_eq!(merged.plan.sampling_indices, vec![1, 1]);
         assert_eq!(merged.program_row_indptr, vec![0, 1, 2]);
         assert_eq!(merged.logical_fire_ids, vec![1, 2]);
+        assert_eq!(merged.plan.required_kv_pages, 29);
     }
 
     #[test]

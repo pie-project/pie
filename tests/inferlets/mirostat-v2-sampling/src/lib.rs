@@ -138,7 +138,7 @@ async fn main(input: Input) -> Result<Output> {
 
     let vocab = wit_model::output_vocab_size();
     let ws = WorkingSet::new();
-    model::configure(vocab, ws.page_size(), 1);
+    let page_size = ws.page_size();
 
     let mut mu = input.mu0.unwrap_or_else(|| (vocab as f32).ln() + 1.0);
     if max_tokens == 0 {
@@ -158,7 +158,7 @@ async fn main(input: Input) -> Result<Output> {
         prompt.push(0);
     }
     let n = prompt.len() as u32;
-    let max_pages = (n + max_tokens as u32 + 1).div_ceil(ws.page_size()).max(1);
+    let max_pages = (n + max_tokens as u32 + 1).div_ceil(page_size).max(1);
     ws.reserve(max_pages)
         .map_err(|e| format!("reserve KV: {e}"))?;
 
@@ -168,17 +168,33 @@ async fn main(input: Input) -> Result<Output> {
     // ── PREFILL FIRE (N-wide) — first mirostat step over the prompt. ──
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     let toks_p = Channel::from(prompt_i32).named("toks_p");
+    let embed_indptr_p = Channel::from(vec![0u32, n]).named("embed_indptr_p");
+    let positions_p = Channel::from((0..n).collect::<Vec<_>>()).named("positions_p");
+    let pages_p = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages_p");
+    let page_indptr_p = Channel::from(vec![0u32, n.div_ceil(page_size)]).named("page_indptr_p");
+    let w_slot_p =
+        Channel::from((0..n).map(|p| p / page_size).collect::<Vec<_>>()).named("w_slot_p");
+    let w_off_p = Channel::from((0..n).map(|p| p % page_size).collect::<Vec<_>>()).named("w_off_p");
     let mu_p = Channel::new([1], dtype::f32).named("mu_p");
     let rng_p = Channel::from(vec![0x9e37_u32, 0]).named("rng_p");
     let tok_out_p = Channel::new([1], dtype::i32).named("tok_out_p");
     let s_out_p = Channel::new([1], dtype::f32).named("s_out_p");
 
     let fwd_p = ForwardPass::new();
-    fwd_p.embed(&toks_p, Tensor::constant(vec![0u32, n]));
+    fwd_p.embed(&toks_p, &embed_indptr_p)?;
     let kv_len_p = Channel::from(vec![n]).named("kv_len_p");
-    fwd_p.port_channel(Port::KvLen, &kv_len_p);
-    fwd_p.attn_working_set(&ws, .., ..)?;
-    fwd_p.derive_dense_geometry();
+    fwd_p.attention(
+        &ws,
+        ..,
+        ..,
+        &kv_len_p,
+        &pages_p,
+        &page_indptr_p,
+        &w_slot_p,
+        &w_off_p,
+        &positions_p,
+        None,
+    )?;
     fwd_p.epilogue(move || {
         let mu_v = mu_p.take().tensor();
         let r = rng_p.take(); // [2] u32 rng state (key, ctr)
@@ -200,9 +216,6 @@ async fn main(input: Input) -> Result<Output> {
         .map_err(|e| format!("prefill submit: {e}"))?;
     // max_tokens == 1: the prefill spends the whole budget, so it was the
     // stream's last submit — finish() right after it (F7).
-    if max_tokens == 1 {
-        pipe.finish();
-    }
     let g0 = tok_out_p
         .take()
         .get::<i32>()
@@ -229,14 +242,29 @@ async fn main(input: Input) -> Result<Output> {
         let s_out = Channel::new([1], dtype::f32)
             .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
             .named("s_out");
-        let lane1 = Tensor::constant(vec![0u32, 1u32]);
+        let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
+        let positions = Channel::from(vec![n]).named("positions");
+        let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
+        let page_indptr =
+            Channel::from(vec![0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
+        let w_slot = Channel::from(vec![n / page_size]).named("w_slot");
+        let w_off = Channel::from(vec![n % page_size]).named("w_off");
 
         let fwd = ForwardPass::new();
-        fwd.embed(&tok_in, lane1);
+        fwd.embed(&tok_in, &lane1)?;
         let kv_len = Channel::from(vec![n + 1]).named("kv_len");
-        fwd.port_channel(Port::KvLen, &kv_len);
-        fwd.attn_working_set(&ws, .., (n / ws.page_size())..)?;
-        fwd.derive_dense_geometry();
+        fwd.attention(
+            &ws,
+            ..,
+            (n / page_size)..,
+            &kv_len,
+            &pages,
+            &page_indptr,
+            &w_slot,
+            &w_off,
+            &positions,
+            None,
+        )?;
         fwd.epilogue(move || {
             // Takes + compute first, PUTS last (value-id discipline).
             let length = kv_len.take().tensor();
@@ -247,9 +275,16 @@ async fn main(input: Input) -> Result<Output> {
 
             let r_next = add(&r, iota(2));
             let mu_next = sub(&mu_v, mul(sub(&surprise, tau), lr));
+            let next_length = add(&length, 1u32);
+            let page_count = div(add(&next_length, page_size - 1), page_size);
 
             tok_in.put(&token);
-            kv_len.put(add(&length, 1u32));
+            kv_len.put(&next_length);
+            positions.put(&length);
+            w_slot.put(div(&length, page_size));
+            w_off.put(rem(&length, page_size));
+            page_indptr.take();
+            page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
             tok_out.put(&token);
             s_out.put(&surprise);
             rng.put(&r_next);
@@ -267,9 +302,6 @@ async fn main(input: Input) -> Result<Output> {
         }
         // Fixed budget, no stop tokens: the budget-determined last submit
         // is knowable — finish() right after it ends the stream (F7).
-        if submitted == budget {
-            pipe.finish();
-        }
         while in_flight > 0 {
             let t = tok_out
                 .take()
@@ -290,15 +322,10 @@ async fn main(input: Input) -> Result<Output> {
                     .map_err(|e| format!("decode submit @{}: {e}", submitted + 1))?;
                 submitted += 1;
                 in_flight += 1;
-                if submitted == budget {
-                    pipe.finish();
-                }
             }
         }
-        // The stream already ended via finish() (F7) and every fire was
-        // drained; this close cancels nothing.
-        pipe.close();
     }
+    pipe.close();
 
     let mean_s = if surprises.is_empty() {
         0.0

@@ -391,6 +391,14 @@ class MetalExecutor {
     // reports exactly this value, never a larger, unsupported one.
     std::uint32_t rs_slots() const;
     std::uint64_t rs_slot_bytes() const;
+    std::uint64_t elastic_page_bytes() const;
+    std::uint64_t elastic_budget_pages() const;
+    std::uint64_t elastic_committed_pages() const;
+    bool ensure_launch_storage(
+        std::uint32_t kv_pages,
+        std::uint32_t state_slots,
+        std::uint32_t token_rows,
+        std::string* error);
 
     // Copies one GDN layer's-worth (every GDN layer) resident conv+
     // recurrent state from `src_slot` to `dst_slot` (whole-slot; per-token
@@ -415,7 +423,9 @@ class MetalExecutor {
     // control ops — narrow methods so context.cpp never needs to include
     // MetalExecutor/Metal types directly.
     std::uint32_t kv_pool_total_pages() const;
+    std::uint32_t kv_pool_committed_pages() const;
     std::uint32_t kv_pool_page_size() const;
+    bool ensure_kv_pages(std::uint32_t pages, std::string* error);
 
     // One per-token KV cell move (mirrors PieKvMoveCell exactly).
     struct KvMoveCell {
@@ -423,17 +433,20 @@ class MetalExecutor {
     };
 
     // Whole-page copy: `src_pages[i] -> dst_pages[i]`, every full-attention
-    // layer, K and V both. Real memcpy over the Shared-storage paged pool.
+    // layer, K and V both, through chunk alias views of the sparse pool.
     bool copy_kv_pages(const std::vector<std::uint32_t>& src_pages,
                        const std::vector<std::uint32_t>& dst_pages, std::string* err);
 
     // Per-token cell copy (PieKvMoveCell semantics), every full-attention layer.
     bool copy_kv_cells(const std::vector<KvMoveCell>& cells, std::string* err);
 
-    // Grow (always allowed, page ids stable) or logically shrink (only when
-    // `unmapped_tail_pages` attests the truncated pages are free) the paged
-    // KV pool to `new_total_pages`.
+    // Grow or trim physical backing without replacing the sparse buffer or
+    // rebinding its stable GPU address.
     bool resize_kv_pool(std::uint32_t new_total_pages, bool unmapped_tail_pages, std::string* err);
+    bool resize_elastic_pool(
+        std::uint64_t pool_id,
+        std::uint64_t target_pages,
+        std::string* err);
 
   private:
     friend struct NativeAccess;

@@ -364,6 +364,19 @@ KimiWorkspace KimiWorkspace::allocate(
     return ws;
 }
 
+std::size_t kimi_workspace_bytes(
+    const HfConfig& cfg,
+    int max_tokens,
+    int max_logit_rows,
+    int tp_size) {
+    ScopedDeviceAllocationCounter counter;
+    {
+        auto workspace = KimiWorkspace::allocate(
+            cfg, max_tokens, max_logit_rows, tp_size);
+    }
+    return counter.allocated_bytes();
+}
+
 void prepare_kimi_mla_plan(
     KimiPlanState& state,
     AttentionWorkspace& attn_ws,
@@ -434,6 +447,7 @@ void kimi_forward_paged(
     int total_tokens,
     int num_requests,
     bool is_pure_decode,
+    const std::uint8_t* row_valid_d,
     const std::int32_t* logit_row_indices_d,
     int num_logit_rows)
 {
@@ -588,7 +602,7 @@ void kimi_forward_paged(
             kernels::launch_write_mla_to_pages(
                 layer_view, kimi_ws.kv_c.data(), kimi_ws.k_pe.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                total_tokens, num_requests, stream);
+                total_tokens, num_requests, stream, row_valid_d);
 
             kernels::launch_kimi_q_nope_to_latent_bf16(
                 kimi_ws.q_nope.data(), Lw.kv_b_proj->data(),

@@ -67,6 +67,7 @@ pub type ProcessId = uuid::Uuid;
 pub(crate) enum LeaveKind {
     #[allow(dead_code)]
     Terminate,
+    AllocationWait,
     Suspend,
 }
 
@@ -78,20 +79,20 @@ pub(crate) enum LeaveKind {
 /// inert: the wait-all quorum's rejoin is implicit on a pipeline's next
 /// wave request, so a join event has nothing to do on the scheduler side
 /// either.
-pub(crate) fn notify_pipeline_leave(pid: ProcessId, _kind: LeaveKind) {
+pub(crate) fn notify_pipeline_leave(pid: ProcessId, kind: LeaveKind) {
     if let Some(hook) = PIPELINE_LEAVE_HOOK.get() {
-        hook(pid);
+        hook(pid, kind);
     }
 }
 pub(crate) fn notify_pipeline_join(_pid: ProcessId) {}
 
-type PipelineLeaveHook = Box<dyn Fn(ProcessId) + Send + Sync>;
+type PipelineLeaveHook = Box<dyn Fn(ProcessId, LeaveKind) + Send + Sync>;
 static PIPELINE_LEAVE_HOOK: OnceLock<PipelineLeaveHook> = OnceLock::new();
 
 /// Installs the scheduler's wait-all leave subscription (called once, from
 /// `bootstrap`, wiring this to `scheduler::worker::notify_pipeline_leave`).
 /// A plain closure keeps `store` below `scheduler` in the layering.
-pub(crate) fn set_pipeline_leave_hook(hook: impl Fn(ProcessId) + Send + Sync + 'static) {
+pub(crate) fn set_pipeline_leave_hook(hook: impl Fn(ProcessId, LeaveKind) + Send + Sync + 'static) {
     let _ = PIPELINE_LEAVE_HOOK.set(Box::new(hook));
 }
 
@@ -308,10 +309,11 @@ pub enum Acquired {
 
 /// A parked allocation. The entry STAYS in the FIFO until its `acquire`
 /// receives one concrete reservation-backed grant. Duplicate callers from
-/// the same process aggregate into this one process-priority slot.
+/// the same pipeline scope aggregate into one process-priority slot.
 struct Waiter {
     request_id: u64,
     pid: ProcessId,
+    quorum_id: ProcessId,
     need: u32,
     notify: Arc<Notify>,
     waiters: usize,
@@ -381,6 +383,7 @@ pub struct ContentionQueueEntry {
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ContentionDiagnostics {
+    pub processes: Vec<ContentionQueueEntry>,
     pub waiters: Vec<ContentionQueueEntry>,
     pub suspended: Vec<ContentionQueueEntry>,
     pub device_pages_free: u32,
@@ -388,6 +391,7 @@ pub struct ContentionDiagnostics {
     pub device_pages_reserved: u32,
     pub host_slots_free: u32,
     pub host_slots_total: u32,
+    pub park_requests_current: usize,
     pub waiters_parked_total: u64,
     pub waiters_woken_total: u64,
     pub suspends_total: u64,
@@ -514,6 +518,25 @@ impl ContentionOrchestrator {
         let (device_pages_free, device_pages_total) = self.backend.pool_stats();
         let (host_slots_free, host_slots_total) = self.backend.host_pool_stats();
         let inner = self.inner.lock().unwrap();
+        let mut processes: Vec<_> = inner
+            .procs
+            .iter()
+            .map(|(pid, process)| ContentionQueueEntry {
+                process_id: pid.to_string(),
+                submit_seq: process.submit_seq,
+                state: match process.state {
+                    ProcState::Running => "running",
+                    ProcState::Suspending => "suspending",
+                    ProcState::ParkRequested => "park-requested",
+                    ProcState::Quiescing => "quiescing",
+                    ProcState::Suspended => "suspended",
+                    ProcState::Restoring => "restoring",
+                },
+                pages: process.suspended_need,
+                granted: inner.restore_grants.contains_key(pid),
+            })
+            .collect();
+        processes.sort_by_key(|entry| entry.submit_seq);
         let mut waiters: Vec<_> = inner
             .waiters
             .iter()
@@ -559,6 +582,7 @@ impl ContentionOrchestrator {
             .sum();
         use std::sync::atomic::Ordering::Relaxed;
         ContentionDiagnostics {
+            processes,
             waiters,
             suspended,
             device_pages_free,
@@ -566,6 +590,7 @@ impl ContentionOrchestrator {
             device_pages_reserved,
             host_slots_free,
             host_slots_total,
+            park_requests_current: self.park_requests.load(Ordering::Acquire),
             waiters_parked_total: self.stats.waiters_parked.load(Relaxed),
             waiters_woken_total: self.stats.waiters_woken.load(Relaxed),
             suspends_total: self.stats.suspends.load(Relaxed),
@@ -815,9 +840,11 @@ impl ContentionOrchestrator {
         }
         process.state = ProcState::Quiescing;
         self.remove_park_request();
-        drop(inner);
-        notify_pipeline_leave(pid, LeaveKind::Suspend);
         true
+    }
+
+    pub fn leave_for_suspend(&self, pid: ProcessId) {
+        notify_pipeline_leave(pid, LeaveKind::Suspend);
     }
 
     /// Victim-side step 2a — DECLINE: the victim reached its host-call
@@ -926,7 +953,7 @@ impl ContentionOrchestrator {
                     },
                 }
             };
-            let poll = Duration::from_millis((self.exhaustion_ms / 4).clamp(20, 1000));
+            let poll = Duration::from_millis((self.exhaustion_ms / 4).clamp(20, 50));
             tokio::select! {
                 _ = notify.notified() => {}
                 _ = tokio::time::sleep(poll) => {}
@@ -994,8 +1021,24 @@ impl ContentionOrchestrator {
         need: u32,
         holds_reclaimable: bool,
     ) -> Result<Acquired, ContentionError> {
-        self.acquire_or_self_suspend_live(requester, need, Arc::new(move || holds_reclaimable))
+        self.acquire_or_self_suspend_for_pipeline(requester, requester, need, holds_reclaimable)
             .await
+    }
+
+    pub async fn acquire_or_self_suspend_for_pipeline(
+        &self,
+        requester: ProcessId,
+        quorum_id: ProcessId,
+        need: u32,
+        holds_reclaimable: bool,
+    ) -> Result<Acquired, ContentionError> {
+        self.acquire_or_self_suspend_live_for_pipeline(
+            requester,
+            quorum_id,
+            need,
+            Arc::new(move || holds_reclaimable),
+        )
+        .await
     }
 
     pub async fn acquire_or_self_suspend_live(
@@ -1004,12 +1047,28 @@ impl ContentionOrchestrator {
         need: u32,
         holds_reclaimable: ReclaimableProbe,
     ) -> Result<Acquired, ContentionError> {
+        self.acquire_or_self_suspend_live_for_pipeline(
+            requester,
+            requester,
+            need,
+            holds_reclaimable,
+        )
+        .await
+    }
+
+    async fn acquire_or_self_suspend_live_for_pipeline(
+        &self,
+        requester: ProcessId,
+        quorum_id: ProcessId,
+        need: u32,
+        holds_reclaimable: ReclaimableProbe,
+    ) -> Result<Acquired, ContentionError> {
         let (_, total) = self.backend.pool_stats();
         if need > total {
             return Err(ContentionError::Impossible { need, total });
         }
         let (mut request_id, mut notify) = loop {
-            match self.register_waiter(requester, need) {
+            match self.register_waiter(requester, quorum_id, need) {
                 Ok(registered) => break registered,
                 Err(ContentionError::Cancelled) if self.is_registered(requester) => {
                     self.wait_until_running(requester).await?;
@@ -1047,8 +1106,11 @@ impl ContentionOrchestrator {
             if !registered {
                 registration.disarm();
                 let registered = loop {
-                    match self.register_waiter(requester, need) {
+                    match self.register_waiter(requester, quorum_id, need) {
                         Ok(registered) => break registered,
+                        Err(ContentionError::Cancelled) if self.should_park(requester) => {
+                            return Ok(Acquired::SelfSuspendFirst);
+                        }
                         Err(ContentionError::Cancelled) if self.is_registered(requester) => {
                             self.wait_until_running(requester).await?;
                         }
@@ -1073,7 +1135,7 @@ impl ContentionOrchestrator {
                 continue;
             }
 
-            let victim = {
+            let (victim, displaced_waiters) = {
                 let mut inner = self.inner.lock().unwrap();
                 let oldest = inner
                     .procs
@@ -1088,16 +1150,26 @@ impl ContentionOrchestrator {
                             && Some(**pid) != oldest
                             && process.state == ProcState::Running
                             && !tried.contains(*pid)
-                            && !inner.waiters.iter().any(|waiter| waiter.pid == **pid)
+                            && inner.waiters.iter().any(|waiter| waiter.pid == **pid)
                     })
                     .max_by_key(|(_, process)| process.submit_seq)
                     .map(|(pid, _)| *pid);
                 if let Some(victim) = victim {
                     inner.procs.get_mut(&victim).unwrap().state = ProcState::Suspending;
+                    let displaced = inner
+                        .waiters
+                        .iter()
+                        .filter(|waiter| waiter.pid == victim)
+                        .map(|waiter| waiter.notify.clone())
+                        .collect::<Vec<_>>();
+                    let before = inner.waiters.len();
+                    inner.waiters.retain(|waiter| waiter.pid != victim);
+                    self.remove_allocation_waiters(before - inner.waiters.len());
+                    (Some(victim), displaced)
+                } else {
+                    (None, Vec::new())
                 }
-                victim
             };
-
             if let Some(victim) = victim {
                 match self.backend.suspend(victim) {
                     SuspendOutcome::Suspended { freed_now } => {
@@ -1168,6 +1240,9 @@ impl ContentionOrchestrator {
                         tried.insert(victim);
                     }
                 }
+                for notify in displaced_waiters {
+                    notify.notify_waiters();
+                }
                 continue;
             }
 
@@ -1208,7 +1283,7 @@ impl ContentionOrchestrator {
             }
 
             self.mark_waiter_parked(requester, request_id);
-            let poll = Duration::from_millis((self.exhaustion_ms / 4).clamp(20, 1000));
+            let poll = Duration::from_millis((self.exhaustion_ms / 4).clamp(20, 50));
             tokio::select! {
                 _ = notify.notified() => {}
                 _ = tokio::time::sleep(poll) => {}
@@ -1267,6 +1342,7 @@ impl ContentionOrchestrator {
     fn register_waiter(
         &self,
         pid: ProcessId,
+        quorum_id: ProcessId,
         need: u32,
     ) -> Result<(u64, Arc<Notify>), ContentionError> {
         let mut inner = self.inner.lock().unwrap();
@@ -1277,7 +1353,11 @@ impl ContentionOrchestrator {
         {
             return Err(ContentionError::Cancelled);
         }
-        if let Some(waiter) = inner.waiters.iter_mut().find(|waiter| waiter.pid == pid) {
+        if let Some(waiter) = inner
+            .waiters
+            .iter_mut()
+            .find(|waiter| waiter.pid == pid && waiter.quorum_id == quorum_id)
+        {
             if waiter.grant.is_none() {
                 waiter.need = waiter.need.max(need);
             }
@@ -1290,6 +1370,7 @@ impl ContentionOrchestrator {
         inner.waiters.push_back(Waiter {
             request_id,
             pid,
+            quorum_id,
             need,
             notify: notify.clone(),
             waiters: 1,
@@ -1301,26 +1382,26 @@ impl ContentionOrchestrator {
     }
 
     fn mark_waiter_parked(&self, pid: ProcessId, request_id: u64) {
-        let first = {
+        let quorum_id = {
             let mut inner = self.inner.lock().unwrap();
             inner
                 .waiters
                 .iter_mut()
                 .find(|waiter| waiter.pid == pid && waiter.request_id == request_id)
-                .is_some_and(|waiter| {
+                .and_then(|waiter| {
                     if waiter.parked_reported {
-                        false
+                        None
                     } else {
                         waiter.parked_reported = true;
-                        true
+                        Some(waiter.quorum_id)
                     }
                 })
         };
-        if first {
+        if let Some(quorum_id) = quorum_id {
             self.stats
                 .waiters_parked
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            notify_pipeline_leave(pid, LeaveKind::Suspend);
+            notify_pipeline_leave(quorum_id, LeaveKind::AllocationWait);
         }
     }
 
@@ -1394,105 +1475,122 @@ impl ContentionOrchestrator {
         })
     }
 
+    fn cancel_unneeded_park_requests(&self) {
+        let signals = {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.waiters.iter().any(|waiter| waiter.grant.is_none()) {
+                return;
+            }
+            let signals = inner
+                .procs
+                .values_mut()
+                .filter(|process| process.state == ProcState::ParkRequested)
+                .map(|process| {
+                    process.state = ProcState::Running;
+                    process.park_requested.clone()
+                })
+                .collect::<Vec<_>>();
+            Self::remove_count(&self.park_requests, signals.len());
+            signals
+        };
+        for signal in signals {
+            signal.notify_waiters();
+        }
+    }
+
     fn drain(&self) {
         loop {
+            self.cancel_unneeded_park_requests();
             let (free, total) = self.backend.pool_stats();
             let candidate = {
                 let mut inner = self.inner.lock().unwrap();
-                let mut candidates = Vec::new();
-                for waiter in inner.waiters.iter().filter(|waiter| waiter.grant.is_none()) {
-                    if let Some(process) = inner.procs.get(&waiter.pid) {
-                        candidates.push((
-                            process.submit_seq,
-                            GrantCandidate::Allocation {
-                                pid: waiter.pid,
-                                request_id: waiter.request_id,
-                                need: waiter.need,
-                            },
-                        ));
+                let allocation = inner
+                    .waiters
+                    .iter()
+                    .filter(|waiter| waiter.grant.is_none())
+                    .filter_map(|waiter| {
+                        inner.procs.get(&waiter.pid).map(|process| {
+                            (
+                                process.submit_seq,
+                                GrantCandidate::Allocation {
+                                    pid: waiter.pid,
+                                    request_id: waiter.request_id,
+                                    need: waiter.need,
+                                },
+                            )
+                        })
+                    })
+                    .min_by_key(|(submit_seq, _)| *submit_seq)
+                    .map(|(_, candidate)| candidate);
+                if let Some(GrantCandidate::Allocation { need, .. }) = allocation {
+                    if free < need {
+                        return;
                     }
-                }
-                for &pid in &inner.restore_queue {
-                    if let Some(process) = inner.procs.get(&pid) {
-                        candidates.push((
-                            process.submit_seq,
-                            GrantCandidate::Restore {
-                                pid,
-                                need: process.suspended_need,
-                            },
-                        ));
+                    inner.restore_exhausted_since = None;
+                    allocation
+                } else {
+                    let utilization =
+                        f64::from(total.saturating_sub(free)) / f64::from(total.max(1));
+                    let restore = inner
+                        .restore_queue
+                        .iter()
+                        .filter_map(|pid| {
+                            inner
+                                .procs
+                                .get(pid)
+                                .map(|process| (process.submit_seq, *pid, process.suspended_need))
+                        })
+                        .min_by_key(|(submit_seq, _, _)| *submit_seq);
+                    let Some((_, pid, need)) = restore else {
+                        return;
+                    };
+                    let process = inner.procs.get(&pid).expect("restore process exists");
+                    let aged = process.suspended_at.is_some_and(|since| {
+                        since.elapsed() >= Duration::from_millis(restore_aging_ms())
+                    });
+                    if utilization > self.restore_pause_at_utilization && !aged {
+                        return;
                     }
-                }
-                candidates.sort_by_key(|(submit_seq, _)| *submit_seq);
-
-                let utilization = f64::from(total.saturating_sub(free)) / f64::from(total.max(1));
-                let mut selected = None;
-                for (_, candidate) in candidates {
-                    match candidate {
-                        GrantCandidate::Restore { pid, need } => {
-                            let Some(process) = inner.procs.get(&pid) else {
-                                continue;
-                            };
-                            let aged = process.suspended_at.is_some_and(|since| {
-                                since.elapsed() >= Duration::from_millis(restore_aging_ms())
-                            });
-                            if utilization > self.restore_pause_at_utilization && !aged {
-                                continue;
-                            }
-                            if free < need {
-                                let oldest = inner
-                                    .procs
-                                    .iter()
-                                    .min_by_key(|(_, process)| process.submit_seq)
-                                    .map(|(pid, _)| *pid);
-                                if oldest == Some(pid) {
-                                    let since = match inner.restore_exhausted_since {
-                                        Some((head, since)) if head == pid => since,
-                                        _ => {
-                                            let now = Instant::now();
-                                            inner.restore_exhausted_since = Some((pid, now));
-                                            now
-                                        }
-                                    };
-                                    if since.elapsed() >= Duration::from_millis(self.exhaustion_ms)
-                                    {
-                                        let restore_waiters_before = inner.restore_queue.len();
-                                        inner.restore_queue.retain(|queued| *queued != pid);
-                                        self.remove_restore_waiters(
-                                            restore_waiters_before - inner.restore_queue.len(),
-                                        );
-                                        inner.restore_exhausted_since = None;
-                                        inner.restore_errors.insert(
-                                            pid,
-                                            ContentionError::Exhausted { need, free, total },
-                                        );
-                                        if let Some(notify) = inner.parked.get(&pid) {
-                                            notify.notify_waiters();
-                                        }
-                                        self.stats
-                                            .exhaustion_timeouts
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    }
-                                } else {
-                                    inner.restore_exhausted_since = None;
+                    if free < need {
+                        let oldest = inner
+                            .procs
+                            .iter()
+                            .min_by_key(|(_, process)| process.submit_seq)
+                            .map(|(pid, _)| *pid);
+                        if oldest == Some(pid) {
+                            let since = match inner.restore_exhausted_since {
+                                Some((head, since)) if head == pid => since,
+                                _ => {
+                                    let now = Instant::now();
+                                    inner.restore_exhausted_since = Some((pid, now));
+                                    now
                                 }
-                                return;
+                            };
+                            if since.elapsed() >= Duration::from_millis(self.exhaustion_ms) {
+                                let restore_waiters_before = inner.restore_queue.len();
+                                inner.restore_queue.retain(|queued| *queued != pid);
+                                self.remove_restore_waiters(
+                                    restore_waiters_before - inner.restore_queue.len(),
+                                );
+                                inner.restore_exhausted_since = None;
+                                inner
+                                    .restore_errors
+                                    .insert(pid, ContentionError::Exhausted { need, free, total });
+                                if let Some(notify) = inner.parked.get(&pid) {
+                                    notify.notify_waiters();
+                                }
+                                self.stats
+                                    .exhaustion_timeouts
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
+                        } else {
                             inner.restore_exhausted_since = None;
-                            selected = Some(candidate);
-                            break;
                         }
-                        GrantCandidate::Allocation { need, .. } => {
-                            if free < need {
-                                return;
-                            }
-                            inner.restore_exhausted_since = None;
-                            selected = Some(candidate);
-                            break;
-                        }
+                        return;
                     }
+                    inner.restore_exhausted_since = None;
+                    Some(GrantCandidate::Restore { pid, need })
                 }
-                selected
             };
 
             let Some(candidate) = candidate else {
@@ -2305,17 +2403,17 @@ mod tests {
     }
 
     #[test]
-    fn older_restore_outranks_younger_allocation_waiter() {
+    fn allocation_waiter_outranks_older_restore() {
         let (orch, older, free) = orch_with_free(0, 0, 10);
         let younger = ProcessId::new_v4();
         orch.register(younger);
         suspend_for_test(&orch, older, 2);
-        let (request_id, _) = orch.register_waiter(younger, 2).unwrap();
+        let (request_id, _) = orch.register_waiter(younger, younger, 2).unwrap();
 
         free.store(2, Ordering::SeqCst);
         orch.on_blocks_freed();
         let inner = orch.inner.lock().unwrap();
-        assert!(inner.restore_grants.contains_key(&older));
+        assert!(!inner.restore_grants.contains_key(&older));
         assert!(
             inner
                 .waiters
@@ -2323,8 +2421,24 @@ mod tests {
                 .find(|waiter| waiter.request_id == request_id)
                 .unwrap()
                 .grant
-                .is_none()
+                .is_some()
         );
+    }
+
+    #[test]
+    fn stale_park_request_is_cancelled_after_allocation_is_granted() {
+        let (orch, pid) = orch(1, 0, 1);
+        {
+            let mut inner = orch.inner.lock().unwrap();
+            inner.procs.get_mut(&pid).unwrap().state = ProcState::ParkRequested;
+        }
+        orch.park_requests.store(1, Ordering::Release);
+        orch.drain();
+        assert_eq!(
+            orch.inner.lock().unwrap().procs.get(&pid).unwrap().state,
+            ProcState::Running
+        );
+        assert_eq!(orch.park_requests.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -2332,8 +2446,8 @@ mod tests {
         let (orch, first, free) = orch_with_free(2, 0, 10);
         let second = ProcessId::new_v4();
         orch.register(second);
-        let (first_request, _) = orch.register_waiter(first, 2).unwrap();
-        let (second_request, _) = orch.register_waiter(second, 2).unwrap();
+        let (first_request, _) = orch.register_waiter(first, first, 2).unwrap();
+        let (second_request, _) = orch.register_waiter(second, second, 2).unwrap();
         orch.drain();
         assert_eq!(free.load(Ordering::SeqCst), 0);
         assert!(
@@ -2363,10 +2477,10 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_process_waits_share_one_priority_slot() {
+    fn duplicate_pipeline_waits_share_one_priority_slot() {
         let (orch, pid) = orch(0, 0, 10);
-        let (first, _) = orch.register_waiter(pid, 2).unwrap();
-        let (second, _) = orch.register_waiter(pid, 4).unwrap();
+        let (first, _) = orch.register_waiter(pid, pid, 2).unwrap();
+        let (second, _) = orch.register_waiter(pid, pid, 4).unwrap();
         assert_eq!(first, second);
         let inner = orch.inner.lock().unwrap();
         assert_eq!(inner.waiters.len(), 1);
@@ -2375,11 +2489,26 @@ mod tests {
     }
 
     #[test]
+    fn sibling_pipeline_waits_keep_independent_quorum_slots() {
+        let (orch, pid) = orch(0, 0, 10);
+        let first_pipeline = ProcessId::new_v4();
+        let second_pipeline = ProcessId::new_v4();
+        let (first, _) = orch.register_waiter(pid, first_pipeline, 2).unwrap();
+        let (second, _) = orch.register_waiter(pid, second_pipeline, 4).unwrap();
+
+        assert_ne!(first, second);
+        let inner = orch.inner.lock().unwrap();
+        assert_eq!(inner.waiters.len(), 2);
+        assert_eq!(inner.waiters[0].quorum_id, first_pipeline);
+        assert_eq!(inner.waiters[1].quorum_id, second_pipeline);
+    }
+
+    #[test]
     fn larger_duplicate_cannot_consume_an_issued_smaller_grant() {
         let (orch, pid, _) = orch_with_free(2, 0, 10);
-        let (request, _) = orch.register_waiter(pid, 2).unwrap();
+        let (request, _) = orch.register_waiter(pid, pid, 2).unwrap();
         orch.drain();
-        let (same_request, _) = orch.register_waiter(pid, 4).unwrap();
+        let (same_request, _) = orch.register_waiter(pid, pid, 4).unwrap();
         assert_eq!(request, same_request);
         assert!(orch.take_allocation_grant(pid, request, 4).is_none());
         assert!(orch.take_allocation_grant(pid, request, 2).is_some());

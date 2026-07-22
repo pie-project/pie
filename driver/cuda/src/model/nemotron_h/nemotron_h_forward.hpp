@@ -97,6 +97,7 @@ void nemotron_h_forward_paged(
     int total_tokens,
     int num_requests,
     bool is_pure_decode,
+    const std::uint8_t* row_valid_d,
     const std::uint8_t* custom_mask_d,
     const std::int32_t* custom_mask_indptr_d,
     const std::int32_t* slot_ids_h,

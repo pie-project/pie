@@ -5,16 +5,18 @@
 // MTL4CommandBuffer / MTL4ComputeCommandEncoder / MTL4ArgumentTable / MTLResidencySet /
 // MTL4Compiler (runtime newLibraryWithSource — no offline metallib needed on this box).
 //
-// Heap model: ONE placement MTLHeap (Shared storage, UMA) bump-sub-allocated by
-// heap_alloc; the whole heap is made resident ONCE via an MTLResidencySet (I2).
+// Static CPU-visible resources use one Shared placement heap. KV, state, and
+// scratch use Private placement-sparse VAs backed by Shared 256 MiB heap chunks.
 // Argument tables are built ONCE per (Kernel, layer) dispatch instance (I2); only IO
 // slot CONTENTS change per token (I1) so the encoded command buffer stays byte-identical.
 
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
+#import <dispatch/dispatch.h>
 
 #include "mtl4_context.hpp"
 #include "observability.hpp"
+#include "pie_driver/elastic.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -72,6 +74,7 @@ struct StepState {
 struct RawMetalContext::Impl {
     id<MTLDevice>            dev   = nil;
     id<MTL4CommandQueue>     queue = nil;
+    id<MTL4CommandQueue>     mapping_queue = nil;
     id<MTL4CommandAllocator> alloc[2] = {nil, nil};   // double-buffered
     id<MTLHeap>              heap  = nil;
     id<MTLResidencySet>      rs    = nil;
@@ -99,6 +102,35 @@ struct RawMetalContext::Impl {
     size_t standalone_count = 0;
     size_t standalone_bytes = 0;
 
+    static constexpr size_t kSparseTileBytes = 16ull * 1024;
+    static constexpr size_t kElasticChunkBytes = 256ull * 1024 * 1024;
+
+    struct ElasticChunk {
+        void* heap = nullptr;
+        void* alias = nullptr;
+        size_t size = 0;
+        size_t mapped = 0;
+    };
+    struct ElasticAllocation {
+        void* buffer = nullptr;
+        size_t virtual_bytes = 0;
+        size_t committed_bytes = 0;
+        std::vector<ElasticChunk> chunks;
+    };
+    struct PendingElasticRelease {
+        uint64_t event_value = 0;
+        std::vector<void*> objects;
+    };
+    std::unordered_map<void*, ElasticAllocation> elastic_allocations;
+    std::vector<PendingElasticRelease> pending_elastic_releases;
+    size_t elastic_budget_bytes = 0;
+    size_t elastic_pressure_floor_bytes = 0;
+    size_t elastic_reserved_bytes = 0;
+    size_t elastic_committed_bytes = 0;
+    std::shared_ptr<std::atomic<std::uint32_t>> memory_pressure_level =
+        std::make_shared<std::atomic<std::uint32_t>>(0);
+    dispatch_source_t memory_pressure_source = nullptr;
+
     struct TransientAllocation {
         size_t size_class = 0;
         bool in_use = false;
@@ -123,7 +155,77 @@ struct RawMetalContext::Impl {
     std::thread              ka_thread;
 
     id<MTL4ArgumentTable> argtable_for(int ordinal, bool create);
+    void collect_elastic_releases();
+    void drain_mapping_through(uint64_t value);
+    uint64_t schedule_mapping(
+        id<MTLBuffer> buffer,
+        id<MTLHeap> heap,
+        const MTL4UpdateSparseBufferMappingOperation& operation);
+    size_t effective_elastic_budget_bytes() const;
 };
+
+size_t RawMetalContext::Impl::effective_elastic_budget_bytes() const {
+    const std::uint32_t level =
+        memory_pressure_level->load(std::memory_order_acquire);
+    if (level == 0) return elastic_budget_bytes;
+    const size_t pressure_limit =
+        level >= 2
+            ? elastic_pressure_floor_bytes
+            : std::max(elastic_pressure_floor_bytes, elastic_budget_bytes / 2);
+    return std::min(elastic_budget_bytes, pressure_limit);
+}
+
+void RawMetalContext::Impl::collect_elastic_releases() {
+    const uint64_t signaled = event.signaledValue;
+    auto out = pending_elastic_releases.begin();
+    for (auto it = pending_elastic_releases.begin();
+         it != pending_elastic_releases.end();
+         ++it) {
+        if (it->event_value <= signaled) {
+            bool residency_changed = false;
+            for (void* object : it->objects) {
+                id value = (__bridge id)object;
+                if ([value conformsToProtocol:@protocol(MTLHeap)]) {
+                    [rs removeAllocation:value];
+                    residency_changed = true;
+                }
+                [retained removeObject:value];
+            }
+            if (residency_changed) [rs commit];
+            continue;
+        }
+        if (out != it) *out = std::move(*it);
+        ++out;
+    }
+    pending_elastic_releases.erase(out, pending_elastic_releases.end());
+}
+
+void RawMetalContext::Impl::drain_mapping_through(uint64_t value) {
+    if (value != 0 && event != nil) {
+        while (![event waitUntilSignaledValue:value timeoutMS:5000]) {
+        }
+    }
+    collect_elastic_releases();
+}
+
+uint64_t RawMetalContext::Impl::schedule_mapping(
+    id<MTLBuffer> buffer,
+    id<MTLHeap> mapping_heap,
+    const MTL4UpdateSparseBufferMappingOperation& operation) {
+    collect_elastic_releases();
+    const uint64_t wait_value = ev_val;
+    if (wait_value != 0) {
+        [mapping_queue waitForEvent:event value:wait_value];
+    }
+    [mapping_queue updateBufferMappings:buffer
+                                   heap:mapping_heap
+                             operations:&operation
+                                  count:1];
+    const uint64_t done_value = ++ev_val;
+    [mapping_queue signalEvent:event value:done_value];
+    [queue waitForEvent:event value:done_value];
+    return done_value;
+}
 
 id<MTL4ArgumentTable> RawMetalContext::Impl::argtable_for(int ordinal, bool create) {
     NSNumber* key = @(argkey(ordinal));
@@ -207,9 +309,21 @@ void StepEncoder::mark_timestamp(void* heap, uint32_t idx, bool precise) {
 
 // ── RawMetalContext ───────────────────────────────────────────────────────────
 RawMetalContext::RawMetalContext() : impl_(std::make_unique<Impl>()) {}
-RawMetalContext::~RawMetalContext() = default;
+RawMetalContext::~RawMetalContext() {
+    if (impl_ != nullptr) {
+        if (impl_->memory_pressure_source != nullptr) {
+            dispatch_source_cancel(impl_->memory_pressure_source);
+            dispatch_source_set_event_handler(
+                impl_->memory_pressure_source, nullptr);
+            impl_->memory_pressure_source = nullptr;
+        }
+        impl_->drain_mapping_through(impl_->ev_val);
+    }
+}
 
-std::unique_ptr<RawMetalContext> RawMetalContext::create(size_t heap_bytes) {
+std::unique_ptr<RawMetalContext> RawMetalContext::create(
+    size_t heap_bytes,
+    size_t elastic_budget_bytes) {
     auto ctx = std::unique_ptr<RawMetalContext>(new RawMetalContext());
     auto& I = *ctx->impl_;
 
@@ -217,9 +331,54 @@ std::unique_ptr<RawMetalContext> RawMetalContext::create(size_t heap_bytes) {
     if (I.dev == nil) { fprintf(stderr, "[pie-metal] no Metal device\n"); return nullptr; }
 
     I.queue    = [I.dev newMTL4CommandQueue];
+    I.mapping_queue = [I.dev newMTL4CommandQueue];
     I.alloc[0] = [I.dev newCommandAllocator];
     I.alloc[1] = [I.dev newCommandAllocator];
     I.event    = [I.dev newSharedEvent];
+    if (I.queue == nil || I.mapping_queue == nil ||
+        I.alloc[0] == nil || I.alloc[1] == nil || I.event == nil) {
+        fprintf(stderr, "[pie-metal] MTL4 queue/allocator/event creation failed\n");
+        return nullptr;
+    }
+    I.elastic_budget_bytes = align_up(
+        elastic_budget_bytes,
+        pie::elastic::kLogicalPageBytes);
+    if (const char* floor = std::getenv("PIE_METAL_PRESSURE_FLOOR_BYTES")) {
+        char* end = nullptr;
+        const unsigned long long parsed = std::strtoull(floor, &end, 10);
+        if (end != floor && end != nullptr && *end == '\0') {
+            const size_t requested = static_cast<size_t>(
+                std::min<unsigned long long>(
+                    parsed,
+                    I.elastic_budget_bytes));
+            I.elastic_pressure_floor_bytes = std::min(
+                I.elastic_budget_bytes,
+                align_up(
+                    requested,
+                    pie::elastic::kLogicalPageBytes));
+        }
+    }
+    I.memory_pressure_source = dispatch_source_create(
+        DISPATCH_SOURCE_TYPE_MEMORYPRESSURE,
+        0,
+        DISPATCH_MEMORYPRESSURE_NORMAL |
+            DISPATCH_MEMORYPRESSURE_WARN |
+            DISPATCH_MEMORYPRESSURE_CRITICAL,
+        dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0));
+    if (I.memory_pressure_source != nullptr) {
+        dispatch_source_t source = I.memory_pressure_source;
+        auto pressure_level = I.memory_pressure_level;
+        dispatch_source_set_event_handler(I.memory_pressure_source, ^{
+            const unsigned long pressure =
+                dispatch_source_get_data(source);
+            const std::uint32_t level =
+                (pressure & DISPATCH_MEMORYPRESSURE_CRITICAL) != 0
+                    ? 2u
+                    : ((pressure & DISPATCH_MEMORYPRESSURE_WARN) != 0 ? 1u : 0u);
+            pressure_level->store(level, std::memory_order_release);
+        });
+        dispatch_resume(I.memory_pressure_source);
+    }
 
     NSError* e = nil;
     MTL4PipelineDataSetSerializerDescriptor* serializer_descriptor =
@@ -313,6 +472,365 @@ SlotHandle RawMetalContext::create_standalone_buffer(size_t size) {
     h.offset       = 0;
     h.size         = size;
     return h;
+}
+
+SlotHandle RawMetalContext::create_elastic_buffer(
+    size_t size,
+    size_t initial_commit_bytes) {
+    auto& I = *impl_;
+    SlotHandle h;
+    if (size == 0) return h;
+    if (@available(macOS 26.0, iOS 26.0, *)) {
+        const size_t virtual_bytes = align_up(
+            size,
+            Impl::kSparseTileBytes);
+        id<MTLBuffer> buffer = [I.dev
+            newBufferWithLength:virtual_bytes
+                       options:MTLResourceStorageModePrivate
+       placementSparsePageSize:MTLSparsePageSize16];
+        if (buffer == nil) {
+            fprintf(
+                stderr,
+                "[pie-metal] placement sparse buffer creation failed (%zu bytes)\n",
+                virtual_bytes);
+            return h;
+        }
+        [I.retained addObject:buffer];
+        [I.rs addAllocation:buffer];
+        [I.rs commit];
+        if (I.resident) [I.rs requestResidency];
+        I.elastic_allocations.emplace(
+            (__bridge void*)buffer,
+            Impl::ElasticAllocation{
+                .buffer = (__bridge void*)buffer,
+                .virtual_bytes = virtual_bytes,
+            });
+
+        h.buffer = (__bridge void*)buffer;
+        h.gpu_address = buffer.gpuAddress;
+        h.size = size;
+        h.elastic = true;
+        if (initial_commit_bytes != 0 &&
+            !ensure_elastic_buffer(h, initial_commit_bytes)) {
+            release_elastic_buffer(h);
+            return {};
+        }
+    }
+    return h;
+}
+
+bool RawMetalContext::ensure_elastic_buffer(
+    const SlotHandle& h,
+    size_t bytes) {
+    auto& I = *impl_;
+    if (bytes > h.size) return false;
+    if (!h.elastic || h.buffer == nullptr) return bytes <= h.size;
+    auto found = I.elastic_allocations.find(h.buffer);
+    if (found == I.elastic_allocations.end()) return false;
+    auto& allocation = found->second;
+    const size_t target = align_up(
+        std::min(bytes, allocation.virtual_bytes),
+        Impl::kSparseTileBytes);
+    if (target <= allocation.committed_bytes) return true;
+    const size_t delta = target - allocation.committed_bytes;
+    const size_t budget = I.effective_elastic_budget_bytes();
+    if (delta > budget - std::min(budget, I.elastic_reserved_bytes)) {
+        return false;
+    }
+    I.elastic_reserved_bytes += delta;
+
+    while (allocation.committed_bytes < target) {
+        if (allocation.chunks.empty() ||
+            allocation.chunks.back().mapped ==
+                allocation.chunks.back().size) {
+            const size_t chunk_offset =
+                allocation.chunks.size() * Impl::kElasticChunkBytes;
+            const size_t chunk_bytes = std::min(
+                Impl::kElasticChunkBytes,
+                allocation.virtual_bytes - chunk_offset);
+            MTLHeapDescriptor* descriptor = [MTLHeapDescriptor new];
+            descriptor.type = MTLHeapTypePlacement;
+            descriptor.storageMode = MTLStorageModeShared;
+            descriptor.hazardTrackingMode = MTLHazardTrackingModeUntracked;
+            descriptor.size = chunk_bytes;
+            descriptor.maxCompatiblePlacementSparsePageSize =
+                MTLSparsePageSize16;
+            id<MTLHeap> heap = [I.dev newHeapWithDescriptor:descriptor];
+            if (heap == nil) {
+                I.elastic_reserved_bytes -=
+                    target - allocation.committed_bytes;
+                return false;
+            }
+            id<MTLBuffer> alias = [heap
+                newBufferWithLength:chunk_bytes
+                           options:MTLResourceStorageModeShared
+                            offset:0];
+            if (alias == nil) {
+                I.elastic_reserved_bytes -=
+                    target - allocation.committed_bytes;
+                return false;
+            }
+            [I.retained addObject:heap];
+            [I.retained addObject:alias];
+            [I.rs addAllocation:heap];
+            [I.rs commit];
+            if (I.resident) [I.rs requestResidency];
+            allocation.chunks.push_back({
+                .heap = (__bridge void*)heap,
+                .alias = (__bridge void*)alias,
+                .size = chunk_bytes,
+            });
+        }
+
+        auto& chunk = allocation.chunks.back();
+        const size_t grow = std::min(
+            target - allocation.committed_bytes,
+            chunk.size - chunk.mapped);
+        MTL4UpdateSparseBufferMappingOperation operation{};
+        operation.mode = MTLSparseTextureMappingModeMap;
+        operation.bufferRange = NSMakeRange(
+            allocation.committed_bytes / Impl::kSparseTileBytes,
+            grow / Impl::kSparseTileBytes);
+        operation.heapOffset = chunk.mapped / Impl::kSparseTileBytes;
+        I.schedule_mapping(
+            (__bridge id<MTLBuffer>)allocation.buffer,
+            (__bridge id<MTLHeap>)chunk.heap,
+            operation);
+        chunk.mapped += grow;
+        allocation.committed_bytes += grow;
+        I.elastic_committed_bytes += grow;
+    }
+    return true;
+}
+
+bool RawMetalContext::ensure_elastic_buffers_atomically(
+    const std::vector<std::pair<SlotHandle, size_t>>& targets) {
+    auto& I = *impl_;
+    std::vector<std::pair<SlotHandle, size_t>> normalized;
+    std::unordered_map<void*, std::size_t> by_buffer;
+    for (const auto& [slot, bytes] : targets) {
+        const auto [found, inserted] =
+            by_buffer.emplace(slot.buffer, normalized.size());
+        if (inserted) {
+            normalized.emplace_back(slot, bytes);
+        } else {
+            normalized[found->second].second =
+                std::max(normalized[found->second].second, bytes);
+        }
+    }
+    std::vector<std::pair<SlotHandle, size_t>> prior;
+    prior.reserve(normalized.size());
+    size_t total_delta = 0;
+    for (const auto& [slot, bytes] : normalized) {
+        if (!slot.elastic || slot.buffer == nullptr || bytes > slot.size) {
+            return false;
+        }
+        const auto found = I.elastic_allocations.find(slot.buffer);
+        if (found == I.elastic_allocations.end()) return false;
+        const size_t target = align_up(
+            std::min(bytes, found->second.virtual_bytes),
+            Impl::kSparseTileBytes);
+        prior.emplace_back(slot, found->second.committed_bytes);
+        if (target > found->second.committed_bytes) {
+            const size_t delta = target - found->second.committed_bytes;
+            if (delta > std::numeric_limits<size_t>::max() - total_delta) {
+                return false;
+            }
+            total_delta += delta;
+        }
+    }
+    const size_t budget = I.effective_elastic_budget_bytes();
+    if (total_delta > budget -
+                          std::min(budget, I.elastic_reserved_bytes)) {
+        return false;
+    }
+    for (const auto& [slot, bytes] : normalized) {
+        if (ensure_elastic_buffer(slot, bytes)) continue;
+        for (auto it = prior.rbegin(); it != prior.rend(); ++it) {
+            trim_elastic_buffer(it->first, it->second);
+        }
+        return false;
+    }
+    return true;
+}
+
+bool RawMetalContext::trim_elastic_buffer(
+    const SlotHandle& h,
+    size_t bytes) {
+    auto& I = *impl_;
+    if (!h.elastic || h.buffer == nullptr) return bytes <= h.size;
+    auto found = I.elastic_allocations.find(h.buffer);
+    if (found == I.elastic_allocations.end()) return false;
+    auto& allocation = found->second;
+    const size_t target = align_up(
+        std::min(bytes, allocation.virtual_bytes),
+        Impl::kSparseTileBytes);
+    uint64_t last_done = 0;
+    size_t released_bytes = 0;
+    while (allocation.committed_bytes > target &&
+           !allocation.chunks.empty()) {
+        auto& chunk = allocation.chunks.back();
+        const size_t shrink = std::min(
+            allocation.committed_bytes - target,
+            chunk.mapped);
+        MTL4UpdateSparseBufferMappingOperation operation{};
+        operation.mode = MTLSparseTextureMappingModeUnmap;
+        operation.bufferRange = NSMakeRange(
+            (allocation.committed_bytes - shrink) /
+                Impl::kSparseTileBytes,
+            shrink / Impl::kSparseTileBytes);
+        operation.heapOffset = 0;
+        last_done = I.schedule_mapping(
+            (__bridge id<MTLBuffer>)allocation.buffer,
+            nil,
+            operation);
+        chunk.mapped -= shrink;
+        allocation.committed_bytes -= shrink;
+        released_bytes += shrink;
+        if (chunk.mapped == 0) {
+            I.pending_elastic_releases.push_back({
+                .event_value = last_done,
+                .objects = {chunk.alias, chunk.heap},
+            });
+            allocation.chunks.pop_back();
+        }
+    }
+    I.drain_mapping_through(last_done);
+    I.elastic_committed_bytes -= std::min(
+        I.elastic_committed_bytes, released_bytes);
+    I.elastic_reserved_bytes -= std::min(
+        I.elastic_reserved_bytes, released_bytes);
+    return true;
+}
+
+void RawMetalContext::release_elastic_buffer(const SlotHandle& h) {
+    auto& I = *impl_;
+    if (!h.elastic || h.buffer == nullptr) return;
+    trim_elastic_buffer(h, 0);
+    auto found = I.elastic_allocations.find(h.buffer);
+    if (found == I.elastic_allocations.end()) return;
+    id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)h.buffer;
+    [I.rs removeAllocation:buffer];
+    [I.rs commit];
+    [I.retained removeObject:buffer];
+    I.elastic_allocations.erase(found);
+}
+
+bool RawMetalContext::zero_buffer_range(
+    const SlotHandle& h,
+    size_t offset,
+    size_t bytes) {
+    if (offset > h.size || bytes > h.size - offset) return false;
+    if (!h.elastic) {
+        if (h.contents() == nullptr) return false;
+        std::memset(static_cast<char*>(h.contents()) + offset, 0, bytes);
+        return true;
+    }
+    auto found = impl_->elastic_allocations.find(h.buffer);
+    if (found == impl_->elastic_allocations.end() ||
+        offset + bytes > found->second.committed_bytes) {
+        return false;
+    }
+    size_t cursor = offset;
+    size_t remaining = bytes;
+    while (remaining != 0) {
+        const size_t chunk_index =
+            cursor / Impl::kElasticChunkBytes;
+        const size_t chunk_offset =
+            cursor % Impl::kElasticChunkBytes;
+        const auto& chunk = found->second.chunks.at(chunk_index);
+        const size_t count = std::min(
+            remaining,
+            chunk.mapped - chunk_offset);
+        auto alias = (__bridge id<MTLBuffer>)chunk.alias;
+        std::memset(
+            static_cast<char*>(alias.contents) + chunk_offset,
+            0,
+            count);
+        cursor += count;
+        remaining -= count;
+    }
+    return true;
+}
+
+bool RawMetalContext::copy_buffer_range(
+    const SlotHandle& dst,
+    size_t dst_offset,
+    const SlotHandle& src,
+    size_t src_offset,
+    size_t bytes) {
+    if (dst_offset > dst.size || bytes > dst.size - dst_offset ||
+        src_offset > src.size || bytes > src.size - src_offset) {
+        return false;
+    }
+    auto span = [&](const SlotHandle& h, size_t offset)
+        -> std::pair<void*, size_t> {
+        if (!h.elastic) {
+            if (h.contents() == nullptr) return {nullptr, 0};
+            return {
+                static_cast<char*>(h.contents()) + offset,
+                h.size - offset,
+            };
+        }
+        const auto found = impl_->elastic_allocations.find(h.buffer);
+        if (found == impl_->elastic_allocations.end() ||
+            offset >= found->second.committed_bytes) {
+            return {nullptr, 0};
+        }
+        const size_t chunk_index =
+            offset / Impl::kElasticChunkBytes;
+        const size_t chunk_offset =
+            offset % Impl::kElasticChunkBytes;
+        const auto& chunk = found->second.chunks.at(chunk_index);
+        auto alias = (__bridge id<MTLBuffer>)chunk.alias;
+        return {
+            static_cast<char*>(alias.contents) + chunk_offset,
+            chunk.mapped - chunk_offset,
+        };
+    };
+
+    size_t remaining = bytes;
+    while (remaining != 0) {
+        auto [dst_ptr, dst_available] = span(dst, dst_offset);
+        auto [src_ptr, src_available] = span(src, src_offset);
+        if (dst_ptr == nullptr || src_ptr == nullptr) return false;
+        const size_t count = std::min(
+            remaining,
+            std::min(dst_available, src_available));
+        std::memmove(dst_ptr, src_ptr, count);
+        dst_offset += count;
+        src_offset += count;
+        remaining -= count;
+    }
+    return true;
+}
+
+size_t RawMetalContext::elastic_page_bytes() const {
+    return pie::elastic::kLogicalPageBytes;
+}
+
+size_t RawMetalContext::elastic_budget_pages() const {
+    return pie::elastic::pages_for_bytes(
+        impl_->effective_elastic_budget_bytes());
+}
+
+size_t RawMetalContext::elastic_committed_pages() const {
+    return pie::elastic::pages_for_bytes(impl_->elastic_committed_bytes);
+}
+
+void RawMetalContext::set_memory_pressure_level_for_test(
+    std::uint32_t level) {
+    impl_->memory_pressure_level->store(
+        std::min<std::uint32_t>(level, 2u),
+        std::memory_order_release);
+}
+
+void RawMetalContext::drain_elastic_mappings() {
+    impl_->drain_mapping_through(impl_->ev_val);
+}
+
+size_t RawMetalContext::pending_elastic_release_count() const {
+    return impl_->pending_elastic_releases.size();
 }
 
 SlotHandle RawMetalContext::acquire_transient_buffer(size_t size) {

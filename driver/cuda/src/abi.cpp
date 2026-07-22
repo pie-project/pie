@@ -1,4 +1,4 @@
-// The C ABI boundary for the CUDA driver: the 11 frozen `pie_cuda_*` exports
+// The C ABI boundary for the CUDA driver: the frozen `pie_cuda_*` exports
 // (see `interface/driver/include/pie_driver_abi.h`), ABI-level argument
 // validation, and the opaque `PieDriver*` handle <-> `pie::cuda::Context`
 // mapping. Everything else (composition, device state, registries, launch
@@ -120,6 +120,71 @@ extern "C" int32_t pie_cuda_launch(PieDriver* driver,
     if (driver == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
     try {
         return as_context(driver)->launch(*launch, completion);
+    } catch (...) {
+        return PIE_STATUS_DRIVER_ERROR;
+    }
+}
+
+extern "C" int32_t pie_cuda_prepare_launch(
+    PieDriver* driver,
+    const PieLaunchDesc* launch,
+    PieLaunchPrepareResult* result) {
+    const int status = pie_native::abi::validate_launch_desc(launch);
+    if (status != PIE_STATUS_OK) return status;
+    if (driver == nullptr || result == nullptr) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    try {
+        return as_context(driver)->prepare_launch(*launch, result);
+    } catch (const std::exception& e) {
+        std::cerr << "[pie-driver-cuda] prepare_launch: " << e.what() << "\n";
+        return PIE_STATUS_DRIVER_ERROR;
+    } catch (...) {
+        return PIE_STATUS_DRIVER_ERROR;
+    }
+}
+
+extern "C" int32_t pie_cuda_launch_prepared(
+    PieDriver* driver,
+    const PieLaunchDesc* launch,
+    std::uint64_t lease_id,
+    PieCompletion completion) {
+    const int status = pie_native::abi::validate_launch_desc(launch);
+    if (status != PIE_STATUS_OK) {
+        if (driver != nullptr && lease_id != 0) {
+            static_cast<void>(
+                as_context(driver)->release_launch(lease_id));
+        }
+        return status;
+    }
+    const int completion_status =
+        pie_native::abi::validate_completion(completion, false);
+    if (completion_status != PIE_STATUS_OK) {
+        if (driver != nullptr && lease_id != 0) {
+            static_cast<void>(
+                as_context(driver)->release_launch(lease_id));
+        }
+        return completion_status;
+    }
+    if (driver == nullptr || lease_id == 0) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    try {
+        return as_context(driver)->launch_prepared(
+            *launch, lease_id, completion);
+    } catch (...) {
+        return PIE_STATUS_DRIVER_ERROR;
+    }
+}
+
+extern "C" int32_t pie_cuda_release_launch(
+    PieDriver* driver,
+    std::uint64_t lease_id) {
+    if (driver == nullptr || lease_id == 0) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    try {
+        return as_context(driver)->release_launch(lease_id);
     } catch (...) {
         return PIE_STATUS_DRIVER_ERROR;
     }

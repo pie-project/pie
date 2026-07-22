@@ -54,6 +54,7 @@ struct OwnedLaunchView {
     std::vector<std::uint32_t> mask_request_indptr;
     std::vector<std::uint32_t> mask_word_indptr;
     std::vector<std::uint32_t> mask_words;
+    std::uint32_t required_kv_pages = 0;
     bool has_user_mask = false;
 
     static OwnedLaunchView capture(const PieLaunchDesc& launch);
@@ -65,6 +66,7 @@ struct LaunchJobData {
     OwnedLaunchView launch;
     std::vector<MemberForwardDesc> fwd_descs;
     PieCompletion completion{};
+    std::uint64_t lease_id = 0;
 };
 
 pie_native::LaunchView build_launch_view(const PieLaunchDesc& launch);

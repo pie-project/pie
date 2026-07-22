@@ -196,6 +196,7 @@ fn rust_layout_matches_committed_header_contract() {
         single_token_mode => 312,
         has_user_mask => 313,
         reserved_flags => 314,
+        required_kv_pages => 316,
         image_indptr => 320,
         image_grids => 336,
         image_anchor_positions => 352,

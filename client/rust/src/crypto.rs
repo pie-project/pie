@@ -228,7 +228,7 @@ impl ParsedPrivateKey {
         match curve {
             EcdsaCurve::NistP256 => {
                 use p256::pkcs8::EncodePrivateKey;
-                let secret_key = p256::SecretKey::from_bytes(private_bytes.into())
+                let secret_key = p256::SecretKey::from_slice(private_bytes)
                     .context("Failed to parse P-256 private key")?;
                 let pkcs8_der = secret_key
                     .to_pkcs8_der()
@@ -237,7 +237,7 @@ impl ParsedPrivateKey {
             }
             EcdsaCurve::NistP384 => {
                 use p384::pkcs8::EncodePrivateKey;
-                let secret_key = p384::SecretKey::from_bytes(private_bytes.into())
+                let secret_key = p384::SecretKey::from_slice(private_bytes)
                     .context("Failed to parse P-384 private key")?;
                 let pkcs8_der = secret_key
                     .to_pkcs8_der()

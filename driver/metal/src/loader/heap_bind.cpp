@@ -44,10 +44,22 @@ SlotHandle slice_slot(const SlotHandle& parent, std::uint64_t offset, std::uint6
     return out;
 }
 
-SlotHandle alloc_zeroed(RawMetalContext& ctx, size_t nbytes) {
-    SlotHandle s = ctx.heap_alloc(nbytes);
-    if (!s.valid()) throw std::runtime_error("heap_alloc failed");
-    std::memset(s.contents(), 0, nbytes);
+SlotHandle alloc_zeroed(
+    RawMetalContext& ctx,
+    size_t nbytes,
+    bool elastic = false,
+    size_t initial_commit_bytes = 0) {
+    SlotHandle s = elastic
+        ? ctx.create_elastic_buffer(nbytes, initial_commit_bytes)
+        : ctx.heap_alloc(nbytes);
+    if (!s.valid()) throw std::runtime_error("buffer allocation failed");
+    const size_t zero_bytes = elastic
+        ? std::min(nbytes, initial_commit_bytes)
+        : nbytes;
+    if (zero_bytes != 0 &&
+        !ctx.zero_buffer_range(s, 0, zero_bytes)) {
+        throw std::runtime_error("buffer zero failed");
+    }
     return s;
 }
 
@@ -248,8 +260,9 @@ BoundDecode stage_decode_storage(
     const size_t kv_one = heap_plan.kv_per_layer / 2;  // bytes for k (== v)
     for (int L = 0; L < g.n_layers; ++L) {
         if (!DecodeGeometry::is_full_attn(L)) continue;
-        b.kv[L].k_pages = alloc_zeroed(ctx, kv_one);
-        b.kv[L].v_pages = alloc_zeroed(ctx, kv_one);
+        const size_t initial = std::min(kv_one, size_t{2} << 20);
+        b.kv[L].k_pages = alloc_zeroed(ctx, kv_one, true, initial);
+        b.kv[L].v_pages = alloc_zeroed(ctx, kv_one, true, initial);
     }
 
     // ── State region: GDN conv (ping-pong) + recurrent (in-place) + zeroed conv-bias ──
@@ -262,15 +275,25 @@ BoundDecode stage_decode_storage(
     const size_t conv_bias = size_t(g.gdn_conv_dim) * 2;                       // bf16, all-zero
     for (int L = 0; L < g.n_layers; ++L) {
         if (DecodeGeometry::is_full_attn(L)) continue;
-        b.gdn[L].conv_state     = alloc_zeroed(ctx, conv_state);
-        b.gdn[L].conv_state_out = alloc_zeroed(ctx, conv_state);
-        b.gdn[L].recurrent_state = alloc_zeroed(ctx, recur_state);
+        const size_t conv_initial =
+            std::min(conv_state, size_t(g.gdn_conv_dim) * g.gdn_conv_k * 4);
+        const size_t recur_initial =
+            std::min(
+                recur_state,
+                size_t(g.gdn_v_heads) * g.gdn_v_dim * g.gdn_k_dim * 4);
+        b.gdn[L].conv_state =
+            alloc_zeroed(ctx, conv_state, true, conv_initial);
+        b.gdn[L].conv_state_out =
+            alloc_zeroed(ctx, conv_state, true, conv_initial);
+        b.gdn[L].recurrent_state =
+            alloc_zeroed(ctx, recur_state, true, recur_initial);
         b.gdn[L].conv_bias_zero = alloc_zeroed(ctx, conv_bias);  // conv1d has no ckpt bias
     }
 
     // ── Scratch pool (beta assigns X/Out per dispatch) ──
     for (int i = 0; i < SCRATCH_POOL; ++i)
-        b.scratch[i] = ctx.heap_alloc(heap_plan.scratch_slot_bytes);
+        b.scratch[i] =
+            ctx.create_elastic_buffer(heap_plan.scratch_slot_bytes);
 
     // ── IO region (I1 per-token scalars + I3 logits) ──
     // M>1: scalar slots widen to u32[max_tokens]; logits stays f32[vocab]. Byte-identical at M=1.

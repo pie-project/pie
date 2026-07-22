@@ -43,7 +43,12 @@ void ForwardFn::attach_model(model::IModel* m) {
     model = m;
     if (m == nullptr) return;
     const auto caps = m->capabilities();
+    if (caps.graph_safe && !caps.graph_padding_kv_write_safe) {
+        throw std::runtime_error(
+            "graph-safe model must gate every KV write on row_valid");
+    }
     graph_safe                   = caps.graph_safe;
+    graph_padding_kv_write_safe  = caps.graph_padding_kv_write_safe;
     supports_compact_logits      = caps.supports_compact_logits;
     supports_small_prefill_graph = caps.supports_small_prefill_graph;
     supports_runtime_window       = caps.supports_runtime_window;
@@ -226,6 +231,7 @@ cudaGraphExec_t capture_forward_graph_exec(
     int N,
     int R,
     bool is_pure_decode,
+    bool have_custom_mask,
     const std::int32_t* slot_ids_h,
     const std::uint8_t* is_fresh_h,
     const std::int32_t* slot_ids_d,
@@ -259,6 +265,12 @@ cudaGraphExec_t capture_forward_graph_exec(
         fwd_in.total_tokens        = N;
         fwd_in.num_requests        = R;
         fwd_in.is_pure_decode      = is_pure_decode;
+        fwd_in.custom_mask_d = have_custom_mask
+            ? pi.custom_mask.data()
+            : nullptr;
+        fwd_in.custom_mask_indptr_d = have_custom_mask
+            ? pi.custom_mask_indptr.data()
+            : nullptr;
         fwd_in.slot_ids_h          = slot_ids_h;
         fwd_in.is_fresh_h          = is_fresh_h;
         fwd_in.slot_ids_d          = slot_ids_d;
@@ -331,7 +343,7 @@ std::size_t capture_forward_graph_lattice(BatchEngine& engine) {
     if (buckets.empty()) return 0;
 
     auto& pi = engine.inputs;
-    const int num_pages = std::max(1, engine.kv_cache.num_pages());
+    engine.kv_cache.ensure_pages(1);
     std::size_t captured = 0;
     const bool log_rank =
         engine.verbose &&
@@ -350,16 +362,14 @@ std::size_t capture_forward_graph_lattice(BatchEngine& engine) {
         std::vector<std::uint32_t> qo(static_cast<std::size_t>(R) + 1);
         std::vector<std::uint32_t> kvpp(static_cast<std::size_t>(R) + 1);
         std::vector<std::uint32_t> kvlpl(static_cast<std::size_t>(R), 1u);
-        std::vector<std::uint32_t> kvpi(static_cast<std::size_t>(R));
+        std::vector<std::uint32_t> kvpi(static_cast<std::size_t>(R), 0u);
+        std::vector<std::uint32_t> write_page(static_cast<std::size_t>(N), 0u);
+        std::vector<std::uint32_t> write_offset(static_cast<std::size_t>(N), 0u);
         std::vector<std::int32_t> slot_ids;
 
         for (int r = 0; r <= R; ++r) {
             qo[static_cast<std::size_t>(r)] = static_cast<std::uint32_t>(r);
             kvpp[static_cast<std::size_t>(r)] = static_cast<std::uint32_t>(r);
-        }
-        for (int r = 0; r < R; ++r) {
-            kvpi[static_cast<std::size_t>(r)] =
-                static_cast<std::uint32_t>(r % num_pages);
         }
         if (engine.rs_cache != nullptr) {
             slot_ids.resize(static_cast<std::size_t>(R));
@@ -375,6 +385,8 @@ std::size_t capture_forward_graph_lattice(BatchEngine& engine) {
         pi.kv_page_indices.copy_from_host(std::span<const std::uint32_t>(kvpi));
         pi.kv_page_indptr.copy_from_host(std::span<const std::uint32_t>(kvpp));
         pi.kv_last_page_lens.copy_from_host(std::span<const std::uint32_t>(kvlpl));
+        pi.w_page.copy_from_host(std::span<const std::uint32_t>(write_page));
+        pi.w_off.copy_from_host(std::span<const std::uint32_t>(write_offset));
         CUDA_CHECK(cudaMemsetAsync(
             pi.row_valid.data(), 1,
             static_cast<std::size_t>(N), nullptr));
@@ -403,6 +415,7 @@ std::size_t capture_forward_graph_lattice(BatchEngine& engine) {
             engine.forward_fn.invoke_graph_layout();
         const std::uint32_t graph_variant =
             make_graph_variant(/*small_spec=*/false, /*rs_verify=*/false,
+                               /*custom_mask=*/false,
                                graph_layout);
         const ForwardGraphKey key{R, N, graph_variant};
         if (engine.graph_cache->get(key) != nullptr) continue;
@@ -411,6 +424,7 @@ std::size_t capture_forward_graph_lattice(BatchEngine& engine) {
         cudaGraphExec_t exec = capture_forward_graph_exec(
             engine, qo.data(), kvpi.data(), kvpp.data(), kvlpl.data(),
             N, R, /*is_pure_decode=*/true,
+            /*have_custom_mask=*/false,
             /*slot_ids_h=*/nullptr, /*is_fresh_h=*/nullptr,
             engine.rs_cache != nullptr ? pi.slot_ids.data() : nullptr,
             /*logit_row_indices_d=*/nullptr,
@@ -477,10 +491,14 @@ bool forward_graph_replay_eligible(
     int num_images,
     int num_clips,
     bool has_stage_hooks) {
+    const bool mask_pointers_stable =
+        !have_custom_mask ||
+        (engine.inputs.custom_mask.data() != nullptr &&
+         engine.inputs.custom_mask_indptr.data() != nullptr);
     return engine.graph_cache != nullptr &&
         engine.forward_fn.graph_safe &&
         is_pure_decode &&
-        !have_custom_mask &&
+        mask_pointers_stable &&
         !rs_buffer_write &&
         !rs_buffer_fold &&
         has_write_desc &&
@@ -523,6 +541,7 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
             make_graph_variant(
                 /*small_spec=*/false,
                 /*rs_verify=*/false,
+                in.have_custom_mask,
                 graph_layout);
         const ForwardGraphKey key{
             in.forward_R,
@@ -540,6 +559,7 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
                 in.forward_N,
                 in.forward_R,
                 true,
+                in.have_custom_mask,
                 in.use_slots ? in.slot_ids_h_data : nullptr,
                 in.use_slots ? in.is_fresh_h_data : nullptr,
                 in.use_slots ? pi.slot_ids.data() : nullptr,
@@ -589,11 +609,10 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
     fwd_in.rs_fold_lens_d           = in.rs_fold_lens_d;
     fwd_in.rs_buffer_write         = in.rs_buffer_write;
     fwd_in.rs_buffer_fold          = in.rs_buffer_fold;
-    // Compact/gathered logit rows are a legacy graph-variant fast path that
-    // no direct-PTIR fire uses (the sampler reads straight out of ws.logits
-    // via pi.sample_idx after this call — see batch/logits.hpp).
-    fwd_in.logit_row_indices_d = nullptr;
-    fwd_in.num_logit_rows      = 0;
+    fwd_in.logit_row_indices_d =
+        in.compact_logits ? pi.sample_idx.data() : nullptr;
+    fwd_in.num_logit_rows =
+        in.compact_logits ? in.num_sampling : 0;
     fwd_in.emit_logits         = in.num_sampling > 0;
     // Multimodal: image data for the encode+scatter (no-op if none).
     fwd_in.image_pixels_h            = in.image_pixels_h;

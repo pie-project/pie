@@ -38,9 +38,8 @@ async fn main(input: String) -> Result<String> {
     // Bare-integer input → budget; anything else (e.g. `{"lane":N}`) → default.
     let max_tokens: usize = input.trim().parse().unwrap_or(DEFAULT_MAX_TOKENS);
 
-    let vocab = wit_model::output_vocab_size();
     let ws = WorkingSet::new();
-    model::configure(vocab, ws.page_size(), 1);
+    let page_size = ws.page_size();
 
     if max_tokens == 0 {
         let result = "generated 0 tokens: []".to_string();
@@ -53,10 +52,7 @@ async fn main(input: String) -> Result<String> {
     let n = prompt.len() as u32;
     let max_pages = (n + max_tokens as u32 + 1).div_ceil(ws.page_size());
     let reserve_to_tokens = |tokens: u32| -> std::result::Result<(), String> {
-        let target = tokens
-            .div_ceil(ws.page_size())
-            .saturating_add(1)
-            .min(max_pages);
+        let target = tokens.div_ceil(page_size).saturating_add(1).min(max_pages);
         let current = ws.page_len();
         if current < target {
             ws.reserve(target - current)?;
@@ -66,40 +62,55 @@ async fn main(input: String) -> Result<String> {
     reserve_to_tokens(n.max(1)).map_err(|e| format!("ws.reserve prompt: {e}"))?;
 
     // ───────────────────────── 1. PREFILL FIRE (N-wide) ─────────────────────
-    // Seeded prompt channel → EmbedTokens (seeding, not host `.put`, is the path
-    // the runtime resolves for a host-known embed). qo_indptr = [0, N] (one
-    // lane, N query rows); positions default to [0..N]; read-out defaults to
-    // row N-1. KvLen roots the omitted dense geometry, which the host projects
-    // into KV pages (`ptir_kv`) for the harness probe.
+    // Seeded prompt and every descriptor channel are explicit. The pages
+    // channel spans the declared pool; page_indptr selects its live prefix.
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     let toks_p = Channel::from(prompt_i32).named("toks_p"); // [N] i32 (seeded)
-    let embed_indptr_p = Tensor::constant(vec![0u32, n]); // [2] qo_indptr
+    let embed_indptr_p = Channel::from(vec![0u32, n]).named("embed_indptr_p");
+    let positions_p = Channel::from((0..n).collect::<Vec<_>>()).named("positions_p");
+    let pages_p = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages_p");
+    let page_indptr_p = Channel::from(vec![0u32, n.div_ceil(page_size)]).named("page_indptr_p");
+    let w_slot_p = Channel::from(
+        (0..n)
+            .map(|position| position / page_size)
+            .collect::<Vec<_>>(),
+    )
+    .named("w_slot_p");
+    let w_off_p = Channel::from(
+        (0..n)
+            .map(|position| position % page_size)
+            .collect::<Vec<_>>(),
+    )
+    .named("w_off_p");
     let echo_p = Channel::from(vec![ECHO_TOKEN; 1]).named("echo_p"); // [1] i32 seed
     let g0_ch = Channel::new([1], dtype::i32).named("g0"); // host-read first gen token
 
     let fwd_p = ForwardPass::new();
-    fwd_p.embed(&toks_p, embed_indptr_p);
+    fwd_p.embed(&toks_p, &embed_indptr_p)?;
     let kv_len_p = Channel::from(vec![n]).named("kv_len_p");
-    fwd_p.port_channel(Port::KvLen, &kv_len_p);
-    fwd_p.attn_working_set(&ws, .., ..)?;
-    fwd_p.derive_dense_geometry_with_page_capacity(max_pages);
+    fwd_p.attention(
+        &ws,
+        ..,
+        ..,
+        &kv_len_p,
+        &pages_p,
+        &page_indptr_p,
+        &w_slot_p,
+        &w_off_p,
+        &positions_p,
+        None,
+    )?;
     fwd_p.epilogue(move || {
         // The fire's "sampled" token = the loop-carried echo constant.
         let t = echo_p.take().tensor(); // [1] i32
         g0_ch.put(&t);
     });
 
-    // ONE pipeline for the whole prefill→decode stream (R4-4): the decode
-    // fires below are submitted on this same pipeline. The stream is finished
-    // (F7) right after the prefill submit only in the degenerate case where
-    // zero decode fires follow.
+    // ONE pipeline for the whole prefill→decode stream.
     let pipe = Pipeline::new();
     fwd_p
         .submit(&pipe)
         .map_err(|e| format!("prefill submit: {e}"))?;
-    if max_tokens == 1 {
-        pipe.finish();
-    }
     let g0 = g0_ch
         .take()
         .get::<i32>()
@@ -119,34 +130,51 @@ async fn main(input: String) -> Result<String> {
         let tok_in = Channel::from(vec![g0; 1]).named("tok_in");
         let echo = Channel::from(vec![ECHO_TOKEN; 1]).named("echo");
         let out = Channel::new([1], dtype::i32).named("out");
-        let lane1 = Tensor::constant(vec![0u32, 1u32]); // embed indptr [0,1]
+        let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
+        let positions = Channel::from(vec![n]).named("positions");
+        let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
+        let page_indptr =
+            Channel::from(vec![0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
+        let w_slot = Channel::from(vec![n / page_size]).named("w_slot");
+        let w_off = Channel::from(vec![n % page_size]).named("w_off");
 
         let fwd = ForwardPass::new();
-        fwd.embed(&tok_in, lane1);
+        fwd.embed(&tok_in, &lane1)?;
         let kv_len = Channel::from(vec![n + 1]).named("kv_len");
-        fwd.port_channel(Port::KvLen, &kv_len);
-        fwd.attn_working_set(&ws, .., (n / ws.page_size())..)?;
-        fwd.derive_dense_geometry_with_page_capacity(max_pages);
+        fwd.attention(
+            &ws,
+            ..,
+            (n / page_size)..,
+            &kv_len,
+            &pages,
+            &page_indptr,
+            &w_slot,
+            &w_off,
+            &positions,
+            None,
+        )?;
         fwd.epilogue(move || {
             let length = kv_len.take().tensor();
             let t = echo.take().tensor(); // [1] i32 — the echo token
+            let next_length = add(&length, 1u32);
+            let page_count = div(add(&next_length, page_size - 1), page_size);
+            let next_page_indptr = mul(iota(2), broadcast(&page_count, [2]));
             tok_in.put(&t);
             echo.put(&t);
-            kv_len.put(add(&length, 1u32));
+            kv_len.put(&next_length);
+            positions.put(&length);
+            w_slot.put(div(&length, page_size));
+            w_off.put(rem(&length, page_size));
+            page_indptr.take();
+            page_indptr.put(&next_page_indptr);
             out.put(&t);
         });
 
         for step in 1..max_tokens {
             reserve_to_tokens(n + step as u32)
                 .map_err(|e| format!("reserve decode @{step}: {e}"))?;
-            // Fixed budget: the last submit is knowable at submit time →
-            // finish() right after it (F7: end of stream; no close needed
-            // after the drain).
             fwd.submit(&pipe)
                 .map_err(|e| format!("decode submit @{step}: {e}"))?;
-            if step + 1 == max_tokens {
-                pipe.finish();
-            }
             let t = out
                 .take()
                 .get::<i32>()
@@ -158,6 +186,7 @@ async fn main(input: String) -> Result<String> {
             generated.push(t0 as u32);
         }
     }
+    pipe.close();
 
     let result = format!("generated {} tokens: {:?}", generated.len(), generated);
     eprintln!("[GENERATE] {result}");

@@ -1,0 +1,7 @@
+{
+  "model_type": "qwen3",
+  "architectures": ["Qwen3ForCausalLM"],
+  "num_hidden_layers": 1,
+  "vocab_size": 128,
+  "max_position_embeddings": 4096
+}

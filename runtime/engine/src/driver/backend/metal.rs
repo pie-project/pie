@@ -12,6 +12,7 @@ use crate::driver::command::{
 use crate::driver::completion::{CompletionBroker, SubmissionCompletion};
 use crate::driver::instance::{BoundInstance, InstanceBindingPlan};
 use crate::driver::submission::LaunchSubmission;
+use crate::driver::{LaunchLease, LaunchPrepareOutcome};
 
 fn sync_status(status: i32, op: &str) -> Result<()> {
     if status == 0 {
@@ -22,10 +23,11 @@ fn sync_status(status: i32, op: &str) -> Result<()> {
 }
 use pie_driver_abi::{
     PieBytes, PieChannelEndpointBinding, PieDriver, PieDriverCaps, PieDriverCreateDesc,
-    PieModelLoadDesc, pie_metal_bind_instance, pie_metal_close_channel, pie_metal_close_instance,
-    pie_metal_copy_kv, pie_metal_copy_state, pie_metal_create, pie_metal_destroy, pie_metal_launch,
-    pie_metal_load_model, pie_metal_register_channel, pie_metal_register_program,
-    pie_metal_resize_pool,
+    PieLaunchPrepareResult, PieModelLoadDesc, pie_metal_bind_instance, pie_metal_close_channel,
+    pie_metal_close_instance, pie_metal_copy_kv, pie_metal_copy_state, pie_metal_create,
+    pie_metal_destroy, pie_metal_launch, pie_metal_launch_prepared, pie_metal_load_model,
+    pie_metal_prepare_launch, pie_metal_register_channel, pie_metal_register_program,
+    pie_metal_release_launch, pie_metal_resize_pool,
 };
 
 pub struct MetalDriver {
@@ -164,6 +166,68 @@ impl MetalDriver {
             "pie_metal_launch",
         )?;
         Ok(completion)
+    }
+
+    pub fn prepare_launch(&mut self, plan: &LaunchSubmission) -> Result<LaunchPrepareOutcome> {
+        let borrowed = LaunchDescBorrow::from_submission(plan);
+        let mut result = PieLaunchPrepareResult::default();
+        let status =
+            unsafe { pie_metal_prepare_launch(self.driver, borrowed.as_raw(), &mut result) };
+        if status == pie_driver_abi::PIE_STATUS_UNSUPPORTED {
+            return Ok(LaunchPrepareOutcome::Unsupported);
+        }
+        sync_status(status, "pie_metal_prepare_launch")?;
+        pie_driver_abi::validate_launch_prepare_result(&result)
+            .map_err(|error| anyhow!(error))?;
+        match result.outcome {
+            pie_driver_abi::PIE_LAUNCH_PREPARE_READY => {
+                Ok(LaunchPrepareOutcome::Prepared(LaunchLease {
+                    id: result.lease_id,
+                }))
+            }
+            pie_driver_abi::PIE_LAUNCH_PREPARE_EXHAUSTED => {
+                Ok(LaunchPrepareOutcome::Exhausted {
+                    budget_generation: result.budget_generation,
+                    required_pages: result.required_pages,
+                    budget_pages: result.budget_pages,
+                })
+            }
+            pie_driver_abi::PIE_LAUNCH_PREPARE_IMPOSSIBLE => {
+                Ok(LaunchPrepareOutcome::Impossible {
+                    required_pages: result.required_pages,
+                    budget_pages: result.budget_pages,
+                })
+            }
+            _ => unreachable!("prepare result validator checked outcome"),
+        }
+    }
+
+    pub fn launch_prepared(
+        &mut self,
+        plan: &LaunchSubmission,
+        lease: LaunchLease,
+    ) -> Result<SubmissionCompletion> {
+        let (raw, completion) = self.broker.launch_completion(1);
+        let borrowed = LaunchDescBorrow::from_submission(plan);
+        sync_status(
+            unsafe {
+                pie_metal_launch_prepared(
+                    self.driver,
+                    borrowed.as_raw(),
+                    lease.id,
+                    raw,
+                )
+            },
+            "pie_metal_launch_prepared",
+        )?;
+        Ok(completion)
+    }
+
+    pub fn release_launch(&mut self, lease: LaunchLease) -> Result<()> {
+        sync_status(
+            unsafe { pie_metal_release_launch(self.driver, lease.id) },
+            "pie_metal_release_launch",
+        )
     }
 
     pub fn encode(&mut self, _plan: &mut MediaEncodePlan) -> Result<SubmissionCompletion> {

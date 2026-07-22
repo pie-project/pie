@@ -23,6 +23,7 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -38,8 +39,8 @@ use pie_client::client::Client;
 /// compose. The worker runs the always-linked **dummy** driver against a local snapshot (no GPU, no
 /// download — R3); auth off. The dummy driver's `[..options]` are explicit (`vocab_size = 128`
 /// constrains synthetic samples to valid single-byte UTF-8 IDs from the 128-token fixture;
-/// `arch_name` required — the fixture dir has only `tokenizer.json`, no `config.json` for the
-/// standalone to auto-discover them from).
+/// `arch_name` is kept explicit while the fixture `config.json` supplies the
+/// engine-owned model profile metadata).
 fn standalone_toml(snapshot: &str) -> String {
     format!(
         "[controller]\n\
@@ -65,11 +66,33 @@ fn standalone_toml(snapshot: &str) -> String {
     )
 }
 
-/// Absolute path to the committed fixture snapshot dir (contains `tokenizer.json`).
+/// Absolute path to a minimal valid snapshot assembled from the committed
+/// tokenizer/config fixtures. The dummy load planner still requires one valid
+/// safetensors header even though it never consumes real model weights.
 fn fixture_snapshot() -> String {
-    let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("tests/fixtures/smoke-model-ascii");
-    p.to_string_lossy().into_owned()
+    static SNAPSHOT: OnceLock<tempfile::TempDir> = OnceLock::new();
+    let snapshot = SNAPSHOT.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("create smoke snapshot");
+        let fixtures =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/smoke-model-ascii");
+        std::fs::copy(
+            fixtures.join("tokenizer.json"),
+            dir.path().join("tokenizer.json"),
+        )
+        .expect("copy smoke tokenizer");
+        std::fs::copy(fixtures.join("config.json"), dir.path().join("config.json"))
+            .expect("copy smoke model config");
+
+        let header =
+            r#"{"model.embed_tokens.weight":{"dtype":"U8","shape":[4],"data_offsets":[0,4]}}"#;
+        let mut checkpoint = (header.len() as u64).to_le_bytes().to_vec();
+        checkpoint.extend_from_slice(header.as_bytes());
+        checkpoint.extend_from_slice(&[1, 2, 3, 4]);
+        std::fs::write(dir.path().join("model.safetensors"), checkpoint)
+            .expect("write smoke checkpoint");
+        dir
+    });
+    snapshot.path().to_string_lossy().into_owned()
 }
 
 async fn boot() -> Result<pie_bin::StandaloneHandle> {

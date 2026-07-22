@@ -18,7 +18,7 @@ const B: u32 = 2; // beams
 const PAGE_T: u32 = 16; // tokens per pool page
 const POOL_PAGES: u32 = 8; // shared pool pages (over-allocated; compaction bounds this)
 const POOL: u32 = POOL_PAGES * PAGE_T; // flat pool token positions
-const NUM_LAYERS: u32 = 28; // Qwen3-0.6B
+// Qwen3-0.6B
 const BOS: i32 = 1;
 
 #[derive(Deserialize)]
@@ -70,7 +70,6 @@ async fn main(input: Input) -> Result<String> {
 
     let vocab = wit_model::output_vocab_size();
     let v = vocab;
-    model::configure(vocab, PAGE_T, NUM_LAYERS);
 
     // Allocate a fixed logical page pool. Flat position `wpos` maps to
     // `pool_ids[wpos / PAGE_T]` at offset `wpos % PAGE_T`.
@@ -110,7 +109,7 @@ async fn main(input: Input) -> Result<String> {
     // device-geometry-fire wire-form).
     let pidx_const: Vec<u32> = (0..=B).map(|b| b * POOL_PAGES).collect();
     let page_indptr = Channel::from_shaped([B + 1], pidx_const.clone()).named("page_indptr");
-    let lanes_b = Tensor::constant((0u32..=B).collect::<Vec<_>>());
+    let lanes_b = Channel::from((0u32..=B).collect::<Vec<_>>()).named("embed_indptr");
 
     let pool_ids_ch = Channel::from(pool_ids.clone()).named("pool_ids");
     let out = Channel::new([B], dtype::i32)
@@ -130,21 +129,24 @@ async fn main(input: Input) -> Result<String> {
         Vec::new()
     };
     let fwd = ForwardPass::new();
-    fwd.set_rs_working_sets(&rs_working_sets)
+    fwd.rs_working_sets(&rs_working_sets)
         .map_err(|e| format!("bind initial recurrent states: {e}"))?;
-    fwd.embed(&toks, lanes_b);
-    fwd.positions(&pos);
+    fwd.embed(&toks, &lanes_b)?;
     // All descriptor ports channel-bound (device-geometry fire wire-form):
     // Pages ← pages, PageIndptr ← page_indptr, KvLen ← klen, WSlot/WOff ← the
     // explicit write descriptor. The pool is fixed so these carry constant values.
-    fwd.port_channel(Port::KvLen, &klen);
-    fwd.attn_working_set(&ws, .., ..)?;
-    fwd.derive_dense_geometry();
-    fwd.port_channel(Port::Pages, &pages);
-    fwd.port_channel(Port::PageIndptr, &page_indptr);
-    fwd.port_channel(Port::WSlot, &w_slot);
-    fwd.port_channel(Port::WOff, &w_off);
-    fwd.attn_mask(&mask);
+    fwd.attention(
+        &ws,
+        ..,
+        ..,
+        &klen,
+        &pages,
+        &page_indptr,
+        &w_slot,
+        &w_off,
+        &pos,
+        Some(&mask),
+    )?;
     fwd.epilogue(move || {
         // 1. top-B over the flattened [B,V] cand block.
         let cand = add(
@@ -282,7 +284,7 @@ async fn main(input: Input) -> Result<String> {
                 );
             }
             hypotheses = advance_hypotheses(&hypotheses, &picked, &parents)?;
-            fwd.set_rs_working_sets(&next_rs)
+            fwd.rs_working_sets(&next_rs)
                 .map_err(|e| format!("rebind recurrent states @{step}: {e}"))?;
             rs_working_sets = next_rs;
         }

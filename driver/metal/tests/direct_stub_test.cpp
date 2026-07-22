@@ -525,7 +525,7 @@ int main() {
         return 1;
     }
     bad_launch = launch;
-    bad_launch.reserved_flags[3] = 1;
+    bad_launch.reserved_flags[1] = 1;
     if (!expect(pie_metal_launch(driver, &bad_launch, launch_completion) ==
                     PIE_STATUS_INVALID_ARGUMENT,
                 "launch rejects reserved flags")) return 1;
