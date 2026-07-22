@@ -139,10 +139,6 @@ impl FramePolicy {
         }
     }
 
-    pub fn k(&self) -> usize {
-        self.k
-    }
-
     /// A stamped fire was accepted into the scheduler queue.
     pub fn on_fire_enqueued(
         &mut self,

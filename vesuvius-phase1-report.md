@@ -3,86 +3,147 @@
 Date: 2026-07-22
 Branch: `tasks/ptir-fusion/agents/golf`
 Baseline: `73e48f05` (Phase 0 measured there)
+Implementation commits: `2253892a`, `f164dac1`, `1afc992d`
 Spec: the Project Vesuvius frame-based submission design (2026-07-22)
 
 ## Phase 0 — re-baseline at the implementation baseline
 
-Measured on RTX 4090, Qwen3-0.6B, CUDA TP1, chat-templated ~34-token
-prompts, greedy, prefix caching off. The spec's Section 1 numbers predate
-recent scheduler work and moved substantially:
+RTX 4090, Qwen3-0.6B, CUDA TP1, chat-templated ~34-token prompts, greedy,
+prefix caching off, `--ignore-eos --unique-prompts`. The spec's Section 1
+numbers predate recent scheduler work and have moved substantially:
 
 | Shape | Spec §1 figure | Phase 0 re-measure | vLLM reference |
 |---|---:|---:|---:|
-| 2048×32, active 512 | 19.08k tok/s | 21.8k cold, 24.6–25.2k warm (median ~24.7k) | 32.2k (vLLM 0.16.0; spec said 30.81k) |
+| 2048×32, active 512 | 19.08k tok/s | 21.8k cold, 24.6–25.2k warm (median ~24.7k) | **32.2k** (vLLM 0.16.0, n=3; spec said 30.81k) |
 | 512×512, c256 | 18.51k | 19.13–19.48k | — |
 | 64×1536 | 7.34k | 7.20–7.33k | — |
 | 16×1900 | 3.72k | 3.57–3.58k | — |
-| 512 req × 256 tok, c256 | — | 27.17–27.30k | — |
+| 512 req × 256 tok, c256 ("c0/256" here) | — | 27.17–27.30k | — |
 
-Consequences for the plan's gates:
-- The Phase 2 "≥ 25k tok/s" gate is effectively met at baseline already;
-  the meaningful target is vLLM parity at ~32.2k (current gap ≈ −23%).
-- Every Phase 1 comparison below is against these re-measured numbers,
-  not the spec's Section 1 profile.
+Consequences:
+- The Phase 2 "≥ 25k tok/s" gate is effectively met at baseline; the real
+  target is vLLM parity at ~32.2k (current gap ≈ −23%).
+- All Phase 1 comparisons below are against these re-measured numbers.
 
-Raw logs and JSON for every run are in the session scratchpad
-(`phase0/`), not the repo.
+Raw logs/JSON for every run live in the session scratchpad, not the repo.
 
-## Phase 1 — runtime-only frames (implemented)
+## Phase 1 — runtime-only frames: what landed
 
-Landed in commits `2253892a` and `f164dac1`:
-
-- **WIT**: `model.frame-size()` (k; `PIE_FRAME_SIZE`, default 1, clamp
-  1..=64) and `model.max-embed-length()` (C; the driver's structural token
+- **WIT**: `model.frame-size()` (k; env `PIE_FRAME_SIZE`, default 1, clamp
+  1..=64 — a static deployment constant, the page-size pattern) and
+  `model.max-embed-length()` (C; the driver's structural per-launch token
   cap). `forward-pass.submit` replaced by the interface-level
-  `submit(on, slots)` frame call. Mirrors synced byte-identically.
-- **SDK**: `pass.submit(on)` remains as single-slot-frame sugar (all
-  existing inferlets compile unchanged); `submit_frame(on, slots)`,
+  `submit(on, slots)` frame call (exactly k ordered slots, slot i executes
+  in wave i, `none` = no-op). Canonical + SDK + bakery mirrors are
+  byte-identical.
+- **SDK**: `pass.submit(on)` remains as single-slot-frame sugar — every
+  existing inferlet compiles unchanged; `submit_frame(on, slots)`,
   `frame_size()`, `max_embed_length()` are the frame-aware surface.
-- **Host validation (§5, k > 1 only)**: staged / device-advanced /
-  latest-value classification per host-writer channel from
-  `channel_accesses` + declared roles; seeded-writer supply counted by
-  ring sequence; static reader-capacity overflow prevention (2k−1
-  guidance in the error). k = 1 is byte-identical to the legacy path.
-- **Scheduler**: `FramePolicy` (sealed membership epochs) replaces the
-  wait-all quorum at k > 1. Seal-at-last-wave-posted keeps the pipe full
-  across boundaries; RETRY fires become makeups that gate wave advance;
-  deterministic first-fit admission against per-wave row/token budgets;
-  auto-Idle for lanes that miss a boundary. Controls, untracked riders,
-  retries, and the k = 1 path reuse the existing machinery.
-- **Bench inferlet**: frame-aware reactive loop (first frame = prefill +
-  k−1 decode slots; then all-decode frames submitted after each
+- **Host validation (§5, enforced at k > 1)**: per-host-writer-channel
+  classification into *staged* (ring-sequence supply ≥ frame consumption),
+  *device-advanced* (program publishes an advance), or *latest-value*
+  (read-only bound, one committed cell, `set` any time); static
+  reader-capacity overflow prevention (worst-case ring occupancy ≤
+  capacity, with the 2k−1 sizing rule in the error message). k = 1 skips
+  all of it and is byte-identical to the legacy per-pass path.
+- **Scheduler** (`runtime/engine/src/scheduler/frame.rs`): `FramePolicy` —
+  sealed membership epochs replacing the wait-all quorum at k > 1.
+  Arrival-complete lanes seal at fleet boundaries (auto-Idle instead of
+  fleet stalls); deterministic first-fit admission against per-wave
+  row/token budgets; RETRY fires re-dispatch as makeups gating their
+  frame's advance; frame truncation notices keep partially-submitted
+  frames sealable; a lane rejoins only after its previous frame fully
+  completes. Controls, untracked riders, retries, and the k = 1 quorum
+  path reuse the existing machinery untouched.
+- **Bench inferlet**: frame-aware reactive loop (first frame = prefill
+  chunk + k−1 decode slots; each later all-decode frame submits after its
   predecessor's first token; out-ring capacity 2k−1).
 
-### Correctness gates
+## Correctness gates — all green
 
 | Gate | Result |
 |---|---|
-| Engine unit tests | 366/366 |
-| Dummy e2e, k=1 | 10/10 |
-| Dummy e2e, k=4 | 10/10 |
+| Engine unit tests | 367/367 |
+| Dummy e2e at k=1 and k=4 | 10/10 both |
 | Worker / canary / boot-smoke / dummy-driver suites | green |
-| CUDA serial oracle k=1 vs baseline engine (t = 1..33, 256) | exact token parity |
-| CUDA serial oracle k=16 vs baseline (t = 1..33, 256) | (see below) |
-| Three consecutive 2048-request fleets at k=16 | (see below) |
+| CUDA serial oracle, k=1 vs baseline engine, t ∈ {1,2,15,16,17,31,32,33,256} | exact token parity |
+| CUDA serial oracle, k=16 vs baseline, same t set (+ re-check on final build) | exact token parity |
+| 2048-request fleets at k=16 (≥3 consecutive) | all complete, 0 failures |
+| k=1 default-path regression (2048×32) | 24.6–25.2k — identical to Phase 0 |
 
-### Performance (Phase 1 A/B)
+## Phase 1 performance — honest result: k > 1 is correct but slower
 
-(filled below)
+| Shape | k=1 (quorum, baseline) | k=16 (frames, Phase 1) | Δ |
+|---|---:|---:|---:|
+| 2048×32 c512 | 24.6–25.2k | 13.1–13.7k | ≈ −46% |
+| c0/256 (512×256, c256) | 27.4k | 16.4–16.8k | ≈ −40% |
+| 512×512 c256 | 19.3k | 13.1k | ≈ −32% |
+| 64×1536 | 7.3k | 5.5k | ≈ −25% |
+| 16×1900 | 3.57k | 2.24k | ≈ −37% |
+
+The default deployment stays k = 1 (zero regression); k > 1 remains an
+explicit opt-in (`PIE_FRAME_SIZE`) — the Phase 2 development vehicle.
+
+### Attribution (instrumented, 2048×32 at k=16)
+
+Two structural costs, both of which are exactly what Phase 2 exists to
+remove — and neither of which is fixable on the per-wave driver path:
+
+1. **Data-dependent waves cannot overlap on the per-wave path.** At launch
+   staging the CUDA driver polls each lane's predecessor-publication
+   snapshot with a cross-stream d2h copy
+   (`dispatch.cu`: "ptir prologue or channel readiness did not commit");
+   a successor posted while its predecessor executes can only RETRY, never
+   wait. Feeding frame waves at depth 2 produced a fleet-wide retry storm
+   (~6k tok/s). With per-frame retirement gating (the landed design), a
+   frame's waves serialize with a ~0.4–1 ms host gap per wave. The k = 1
+   quorum path escapes this only because guest-paced readiness (submit
+   after take) naturally spaces successors — the measured depth-1 quorum
+   reference (20.5k) bounds what any serialized-wave scheduler can do here.
+2. **Boundary-quantized joins hold epoch width at the arrival
+   equilibrium.** Instrumented run: 562 waves for 67.5k rows (≈134 useful
+   at full width), mean width 120 vs ~490 for the quorum barrier; retries
+   residual (1.9k fires). The wait-all barrier gets its ~450-wide waves by
+   *blocking the fleet on binding/instantiating lanes* — precisely the
+   behavior Vesuvius deletes. With joins only at k-wave boundaries, epoch
+   width settles where lane-completion rate meets arrival rate.
+   Two alternative seal pacings were implemented and measured worse:
+   eager sealing (≤2 epochs whenever candidates exist) and half-phase
+   sealing both collapse into a stable fast-narrow-epoch attractor
+   (mean width 12, ~5.7k tok/s) because epoch duration itself is the
+   arrival-gather window. Boundary-paced sealing is the right cadence.
+
+### Design consequences recorded for Phase 2
+
+- Phase 2's device-side multi-step execution removes both costs at once:
+  in-frame steps advance on device (no per-wave completion round trip, no
+  cross-stream readiness poll), and narrow epochs stop mattering because
+  per-epoch host interaction is O(1) instead of O(k).
+- Phase 2 entry points identified during this work:
+  `driver/cuda/src/pipeline/dispatch.cu` (staging readiness → per-step
+  device advance + per-wave publication/doorbell),
+  `driver/cuda/src/context.cpp` (frame completion),
+  `driver/cuda/src/batch/forward_graph.hpp` (per-wave graph classes),
+  `driver/cuda/src/runahead.hpp` (staging depth constants shared with the
+  scheduler).
+- If churn workloads still under-fill epochs after Phase 2, the remaining
+  lever is deliberate fleet partitioning into phase-offset epoch groups
+  (deterministic split, e.g. by lane id); rejected for Phase 1 because it
+  halves wave density on the per-wave path.
 
 ## Notes and deviations
 
-- The staged-class rule rejects the `Channel::writer` late-put run-ahead
-  pattern at k > 1 by design (§9: per-step host inputs are staged before
-  submit). `direct-channel-e2e` now pre-stages on frame deployments and
-  keeps late-put coverage at k = 1.
+- §5 staged-class validation rejects the `Channel::writer` late-put
+  run-ahead pattern at k > 1 by design (§9: stage before submit).
+  `direct-channel-e2e` pre-stages on frame deployments and keeps late-put
+  coverage at k = 1.
 - Physical-KV admission remains at the existing layers (contention
   orchestrator at preparation + per-launch driver prepare lease); seal
-  admission is row/token arithmetic. Declarative frame-delta admission is
-  Phase 2 work, alongside per-wave publication and frame-boundary
-  settlement in the driver.
+  admission is row/token arithmetic. Declarative frame-delta admission
+  lands with Phase 2's eager frame binding.
 - The CLI `--driver dummy` bench path fails config parsing on this branch
-  independently of these changes (pre-existing; reproduced at the pristine
-  baseline).
+  independently of these changes (reproduced at the pristine baseline).
 - `sdk/python-server` uv cache-keys were missing the runtime/driver/WIT
-  trees, so engine edits could serve a stale cached wheel; fixed here.
+  trees, so engine edits could serve a stale cached wheel (and copying the
+  .so into the source tree masks the bench's mtime staleness guard); the
+  cache keys are fixed in this branch.
