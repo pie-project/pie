@@ -727,10 +727,15 @@ impl ChannelCell {
     }
 
     /// Frame validation (Vesuvius, k > 1): host-known cells a Writer channel
-    /// can still feed to future fires — pre-endpoint staging plus unclaimed
-    /// ring copies.
-    pub fn unclaimed_writer_cells(&self) -> usize {
-        self.staged.len() + self.ring_host_copies.len()
+    /// can still feed to future fires. Counted by ring sequence — the seed
+    /// plus every flushed ring write (`writer_tail`) plus pre-endpoint
+    /// staging, minus the consume tickets already reserved by submitted
+    /// fires — so a seeded descriptor Writer's committed initial cell counts
+    /// exactly once.
+    pub fn writer_available_cells(&self) -> u64 {
+        self.writer_tail
+            .saturating_add(self.staged.len() as u64)
+            .saturating_sub(self.device_reserved_head)
     }
 
     /// Frame validation (Vesuvius, k > 1): the Reader ring's reservation

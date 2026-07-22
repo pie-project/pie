@@ -1211,8 +1211,8 @@ fn validate_frame<C: FireContext>(
                     // *staged* class: each consuming fire drains one host
                     // cell; every one must exist at submit (frames execute
                     // uninterrupted — no mid-frame host put can arrive).
-                    let available = cell.unclaimed_writer_cells();
-                    if available < entry.consumes {
+                    let available = cell.writer_available_cells();
+                    if available < entry.consumes as u64 {
                         return Ok(Err(format!(
                             "pipeline: channel {}: frame consumes {} host-writer \
                              cell(s) but only {available} are staged — stage every \

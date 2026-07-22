@@ -254,10 +254,16 @@ async fn run_one(
     // decode pass is CONSTRUCTED before the prefill submits, so its eager
     // embed claim on `tok_in` is visible to the prefill's build and the
     // channel derives device-only naturally.
+    let k = frame_size();
     let tok_in = Channel::new([1], dtype::i32).named("tok_in");
     let g0_ch = Channel::new([1], dtype::i32).named("g0");
+    // Frame deployments need the take-side ring to absorb the reactive
+    // schedule's worst case: (k-1) undrained cells of the executing frame
+    // plus k new ones from the queued successor (2k-1). k = 1 keeps the
+    // classic run-ahead depth.
+    let out_capacity = if k > 1 { 2 * k - 1 } else { depth };
     let out = Channel::new([1], dtype::i32)
-        .capacity(depth as u32)
+        .capacity(out_capacity as u32)
         .named("out");
 
     let fwd_p = ForwardPass::new();
@@ -335,18 +341,35 @@ async fn run_one(
     };
 
     let pipe = Pipeline::new();
-    fwd_p
-        .submit(&pipe)
-        .map_err(|e| format!("prefill submit: {e}"))?;
-
     let mut submitted = 0usize;
-    if let Some(fwd) = &fwd_d {
-        while submitted < depth.min(budget) {
-            reserve_to_tokens(n + submitted as u32 + 1)
-                .map_err(|e| format!("reserve decode burst: {e}"))?;
-            fwd.submit(&pipe)
-                .map_err(|e| format!("decode submit: {e}"))?;
-            submitted += 1;
+    if k > 1 {
+        // ── FRAME SUBMISSION (Vesuvius): the first frame carries the prefill
+        // chunk in slot 0 and decode fires in the remaining slots; every
+        // later frame is all-decode. The reactive schedule submits frame f+1
+        // after taking frame f's FIRST token, keeping at most two decode
+        // frames accepted per lane.
+        let first_decodes = budget.min(k - 1);
+        reserve_to_tokens(n + first_decodes as u32 + 1)
+            .map_err(|e| format!("reserve first frame: {e}"))?;
+        let mut slots: Vec<Option<&ForwardPass>> = Vec::with_capacity(k);
+        slots.push(Some(&fwd_p));
+        for _ in 0..first_decodes {
+            slots.push(Some(fwd_d.as_ref().expect("decode pass exists")));
+        }
+        submit_frame(&pipe, &slots).map_err(|e| format!("first frame submit: {e}"))?;
+        submitted = first_decodes;
+    } else {
+        fwd_p
+            .submit(&pipe)
+            .map_err(|e| format!("prefill submit: {e}"))?;
+        if let Some(fwd) = &fwd_d {
+            while submitted < depth.min(budget) {
+                reserve_to_tokens(n + submitted as u32 + 1)
+                    .map_err(|e| format!("reserve decode burst: {e}"))?;
+                fwd.submit(&pipe)
+                    .map_err(|e| format!("decode submit: {e}"))?;
+                submitted += 1;
+            }
         }
     }
     step(&mut prologue_us, input.report_timing); // [4] build_submit (both passes)
@@ -381,6 +404,21 @@ async fn run_one(
         if let Some(now_ns) = first_token_monotonic_ns {
             token_monotonic_ns.push(now_ns);
         }
+    }
+
+    // Frame mode: frame f+1 submits after frame f's FIRST token (the
+    // reactive one-successor schedule). `next_trigger` is the out-take count
+    // at which the next frame may be submitted.
+    let mut next_trigger = usize::MAX;
+    if k > 1 && !stopped && submitted < budget {
+        let s = (budget - submitted).min(k);
+        reserve_to_tokens(n + (submitted + s) as u32 + 1)
+            .map_err(|e| format!("reserve decode frame: {e}"))?;
+        let fwd = fwd_d.as_ref().expect("decode pass exists while budget > 0");
+        let slots: Vec<Option<&ForwardPass>> = (0..s).map(|_| Some(fwd)).collect();
+        submit_frame(&pipe, &slots).map_err(|e| format!("decode frame submit: {e}"))?;
+        next_trigger = submitted + 1;
+        submitted += s;
     }
 
     let mut taken = 0usize;
@@ -418,7 +456,19 @@ async fn run_one(
         if input.wasm_delay_us > 0 {
             std::thread::sleep(wasm_delay);
         }
-        if submitted < budget {
+        if k > 1 {
+            if taken == next_trigger && submitted < budget {
+                let s = (budget - submitted).min(k);
+                reserve_to_tokens(n + (submitted + s) as u32 + 1)
+                    .map_err(|e| format!("reserve decode frame: {e}"))?;
+                let fwd = fwd_d.as_ref().expect("decode pass exists while budget > 0");
+                let slots: Vec<Option<&ForwardPass>> = (0..s).map(|_| Some(fwd)).collect();
+                submit_frame(&pipe, &slots)
+                    .map_err(|e| format!("decode frame submit: {e}"))?;
+                next_trigger = submitted + 1;
+                submitted += s;
+            }
+        } else if submitted < budget {
             let fwd = fwd_d.as_ref().expect("decode pass exists while budget > 0");
             reserve_to_tokens(n + submitted as u32 + 1)
                 .map_err(|e| format!("reserve decode continuation: {e}"))?;
