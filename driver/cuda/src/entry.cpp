@@ -361,6 +361,7 @@ int run_impl(int argc,
     const bool is_gemma4_arch = bound_model.is_gemma4();
     const bool is_gemma3n_arch = bound_model.is_gemma3n();
     const bool is_mixtral_arch = bound_model.is_mixtral();
+    const bool is_gpt_oss_arch = bound_model.is_gpt_oss();
     const bool is_qwen3_5_arch = bound_model.is_qwen3_5();
     const bool is_qwen3_5_moe_arch = bound_model.is_qwen3_5_moe();
     const bool is_nemotron_h_arch = bound_model.is_nemotron_h();
@@ -470,13 +471,16 @@ int run_impl(int argc,
         : 0;
     // SSD expert streaming: carve the bounded expert slab out of free VRAM
     // now, *before* the memory planner runs, so KV/workspace sizing adapts
-    // to the remaining budget automatically. Only DSv4 is wired up; the
-    // Rust weight-loader compiler already rejected other archs at load.
+    // to the remaining budget automatically. DSv4, GPT-OSS, Mixtral, and
+    // Qwen3/3.5-MoE are wired; the Rust weight-loader compiler already
+    // rejected other archs.
     std::unique_ptr<pie_cuda_driver::ExpertStreamCache> expert_stream_cache;
     if (cfg.model.stream_routed_experts) {
-        if (!is_dsv4_arch) {
+        if (!is_dsv4_arch && !is_gpt_oss_arch && !is_mixtral_arch &&
+            !is_qwen3_5_moe_arch) {
             std::cerr << "[pie-driver-cuda] model.stream_routed_experts is only "
-                         "supported for deepseek_v4 (got '"
+                         "supported for deepseek_v4, gpt_oss, mixtral, and "
+                         "qwen3_moe/qwen3_5_moe (got '"
                       << engine.hf_config().model_type << "')\n";
             return 2;
         }
@@ -954,6 +958,7 @@ int run_impl(int argc,
         fwd_cfg.tp_size = cfg.distributed.tp_size;
         fwd_cfg.tp_comm = tp_comm_ptr;
         fwd_cfg.emit_logits = (cfg.distributed.tp_rank == 0);
+        fwd_cfg.expert_cache = expert_stream_cache.get();
         {
             const int T = std::max(1, cfg.distributed.tp_size);
             const int local_q_heads = hf.num_attention_heads / T;
@@ -1199,7 +1204,7 @@ int run_impl(int argc,
         gemma2_model = std::make_unique<pie_cuda_driver::model::Gemma2Model>(
             weights_gemma, engine.hf_config(), gemma_fwd_cfg);
         forward_fn.attach_model(gemma2_model.get());
-    } else if (is_mixtral_arch) {
+    } else if (is_mixtral_arch || is_gpt_oss_arch) {
         mixtral_model = std::make_unique<pie_cuda_driver::model::MixtralModel>(
             weights_mixtral, engine.hf_config(), fwd_cfg,
             engine.hf_config().num_experts,
@@ -1255,7 +1260,8 @@ int run_impl(int argc,
             }(),
             /*supports_small_prefill_graph=*/
                 kv_cache.format().is_native_bf16() && !kv_cache.hnd_layout() &&
-                pie_cuda_driver::model::qwen35_small_spec_graph_tokens() > 0);
+                pie_cuda_driver::model::qwen35_small_spec_graph_tokens() > 0,
+            expert_stream_cache.get());
         forward_fn.attach_model(qwen3_5_moe_model.get());
         if (weights_qwen3_5_moe.mtp.has_value() && native_mtp_num_drafts > 0) {
             qwen3_5_moe_model->wire_system_drafter(

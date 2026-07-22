@@ -3,7 +3,7 @@
 // DeepSeek-V4 section-index map for streamed experts.
 //
 // Order must match `DSV4_EXPERT_SECTIONS` in
-// `driver/weight_loader/src/abi.rs`:
+// `driver/weight_loader/src/stream_arch.rs`:
 //   w1.weight, w1.scale, w2.weight, w2.scale, w3.weight, w3.scale
 
 #include <cstdint>

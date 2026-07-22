@@ -22,6 +22,7 @@ pub mod source;
 pub mod storage;
 pub mod storage_compiler;
 pub mod stream;
+pub mod stream_arch;
 pub mod typecheck;
 pub mod types;
 

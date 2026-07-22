@@ -17,6 +17,10 @@
 #include "ops/gemm.hpp"
 #include "recurrent_state_cache.hpp"
 
+namespace pie_cuda_driver {
+class ExpertStreamCache;
+}
+
 namespace pie_cuda_driver::model {
 
 // Per-linear-attention-layer extra workspace. Allocated once and
@@ -87,6 +91,10 @@ struct Qwen3_5ForwardCfg {
     // cache lookup should stay pinned to the verified source prefix while
     // draft positions advance for RoPE and history masking.
     bool mtp_global_cache_uses_prefix_position = false;
+
+    // SSD expert streaming (Qwen3-MoE / Qwen3.5-MoE): non-null when routed
+    // experts are paged on demand. Shared expert / router stay resident.
+    ExpertStreamCache* expert_cache = nullptr;
 };
 
 // Persistent decode-plan cache. Owned by main.cpp's serving setup so

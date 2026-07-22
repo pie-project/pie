@@ -817,7 +817,7 @@ pub struct CudaNativeDriverOptions {
     /// latency-regime win (helps at low batch, costs at compute saturation), so
     /// it's off unless explicitly enabled — matching vLLM/SGLang convention.
     pub enable_system_speculation: bool,
-    /// SSD expert streaming (DeepSeek-V4 only, tensor_parallel_size = 1):
+    /// SSD expert streaming (DeepSeek-V4 / GPT-OSS, tensor_parallel_size = 1):
     /// keep routed MoE expert weights on disk and page them into a bounded
     /// LRU GPU cache on demand at forward time instead of materializing
     /// them in VRAM at startup.

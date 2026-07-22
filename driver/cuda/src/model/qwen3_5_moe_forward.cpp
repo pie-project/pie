@@ -29,6 +29,8 @@
 #include "ops/attention_naive.hpp"
 #include "ops/attention_naive_paged.hpp"
 #include "ops/gemm.hpp"
+#include "expert_stream_cache.hpp"
+#include "model/qwen_moe_expert_sections.hpp"
 
 namespace pie_cuda_driver::model {
 
@@ -1129,6 +1131,7 @@ bool moe_block(
     const Qwen3_5ForwardCfg& fwd_cfg,
     Qwen3Workspace& ws,
     Qwen3_5MoeMlpWorkspace& moe_ws,
+    int layer,
     int N,
     bool is_pure_decode,
     ops::CublasHandle& cublas, cudaStream_t stream,
@@ -1148,9 +1151,14 @@ bool moe_block(
     const int Im = cfg.moe_intermediate_size / T;            // routed: sharded
     const int Is = cfg.shared_expert_intermediate_size / T;  // shared: sharded
     NcclComm* tp = (T > 1) ? fwd_cfg.tp_comm : nullptr;
+    ExpertStreamCache* const expert_cache = fwd_cfg.expert_cache;
+    const bool stream_experts =
+        expert_cache != nullptr && Lw.moe_gate_up_proj == nullptr;
+    // SSD page-ins need host routing; CUDA graphs cannot capture them.
     const bool use_decode_fast_path =
-        is_pure_decode ||
-        (N > 0 && N <= qwen35_moe_decode_fast_max_tokens());
+        !stream_experts &&
+        (is_pure_decode ||
+         (N > 0 && N <= qwen35_moe_decode_fast_max_tokens()));
     const bool add_to_residual = (T == 1) && use_decode_fast_path;
     void* moe_out = add_to_residual ? ws.y.data() : ws.norm_y.data();
 
@@ -1195,7 +1203,116 @@ bool moe_block(
     const std::size_t expert_stride_dn =
         static_cast<std::size_t>(H) * Im;       // bf16 elements per expert in down_proj
 
-    if (use_decode_fast_path) {
+    if (stream_experts) {
+        // Host-routed SSD path: page selected experts, then GEMM from
+        // cache-slot section pointers (fused 2-section or named 3-section).
+        profile_cuda_stage(profile, profile ? &profile->moe_routed_ms : nullptr,
+            stream, [&] {
+                CUDA_CHECK(cudaMemsetAsync(ws.norm_y.data(), 0,
+                    (std::size_t)N * H * sizeof(std::uint16_t), stream));
+                const auto routing = build_routing(topk_idx_h, topk_w_h, N, K, E);
+                std::vector<int> selected;
+                selected.reserve(static_cast<std::size_t>(E));
+                for (int e = 0; e < E; ++e) {
+                    if (!routing.token_idx[static_cast<std::size_t>(e)].empty()) {
+                        selected.push_back(e);
+                    }
+                }
+                const bool named_layout =
+                    expert_cache->sections_per_expert() ==
+                    kQwen3MoeExpertSectionCount;
+                const bool fused_layout =
+                    expert_cache->sections_per_expert() ==
+                    kQwen35MoeExpertSectionCount;
+                if (!named_layout && !fused_layout) {
+                    throw std::runtime_error(
+                        "qwen moe streaming: unexpected sections_per_expert=" +
+                        std::to_string(expert_cache->sections_per_expert()));
+                }
+
+                auto run_expert = [&](int e,
+                                      const void* gate_up_or_gate,
+                                      const void* up_or_null,
+                                      const void* down_w) {
+                    const auto& tok_idx =
+                        routing.token_idx[static_cast<std::size_t>(e)];
+                    const auto& wts =
+                        routing.weights[static_cast<std::size_t>(e)];
+                    const int Ne = static_cast<int>(tok_idx.size());
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        moe_ws.expert_idx.data(), tok_idx.data(),
+                        Ne * sizeof(std::int32_t), cudaMemcpyHostToDevice,
+                        stream));
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        moe_ws.expert_w.data(), wts.data(),
+                        Ne * sizeof(float), cudaMemcpyHostToDevice, stream));
+                    kernels::launch_gather_bf16_rows(
+                        static_cast<const std::uint16_t*>(ws.norm_x.data()),
+                        moe_ws.expert_idx.data(),
+                        moe_ws.expert_in.data(),
+                        Ne, H, stream);
+
+                    if (up_or_null == nullptr) {
+                        ops::gemm_act_x_wt_bf16(cublas.handle(),
+                            moe_ws.expert_in.data(), gate_up_or_gate,
+                            moe_ws.expert_gate_up.data(), Ne, 2 * Im, H);
+                        kernels::launch_chunked_swiglu_bf16(
+                            moe_ws.expert_gate_up.data(),
+                            moe_ws.expert_act.data(),
+                            Ne, Im, stream);
+                    } else {
+                        // Named gate/up: park temps in the two halves of
+                        // expert_gate_up ([Ne*Im] each), then SwiGLU.
+                        auto* gate_tmp = moe_ws.expert_gate_up.data();
+                        auto* up_tmp = moe_ws.expert_gate_up.data() +
+                            static_cast<std::size_t>(Ne) * Im;
+                        ops::gemm_act_x_wt_bf16(cublas.handle(),
+                            moe_ws.expert_in.data(), gate_up_or_gate,
+                            gate_tmp, Ne, Im, H);
+                        ops::gemm_act_x_wt_bf16(cublas.handle(),
+                            moe_ws.expert_in.data(), up_or_null,
+                            up_tmp, Ne, Im, H);
+                        kernels::launch_swiglu_bf16(
+                            gate_tmp, up_tmp, moe_ws.expert_act.data(),
+                            static_cast<std::size_t>(Ne) * Im, stream);
+                    }
+                    ops::gemm_act_x_wt_bf16(cublas.handle(),
+                        moe_ws.expert_act.data(), down_w,
+                        moe_ws.expert_out.data(), Ne, H, Im);
+                    kernels::launch_scatter_add_weighted_bf16(
+                        ws.norm_y.data(), moe_ws.expert_out.data(),
+                        moe_ws.expert_idx.data(), moe_ws.expert_w.data(),
+                        Ne, H, stream);
+                };
+
+                std::vector<ExpertSectionPointers> ptrs;
+                const std::size_t max_batch =
+                    static_cast<std::size_t>(expert_cache->num_slots());
+                for (std::size_t off = 0; off < selected.size();
+                     off += max_batch) {
+                    const std::size_t chunk =
+                        std::min(max_batch, selected.size() - off);
+                    expert_cache->ensure_resident(
+                        layer,
+                        std::span<const int>(selected.data() + off, chunk),
+                        stream, ptrs);
+                    for (std::size_t j = 0; j < chunk; ++j) {
+                        const auto& p = ptrs[j];
+                        if (fused_layout) {
+                            require_qwen35_moe_sections(p);
+                            run_expert(selected[off + j],
+                                       qwen35_moe_gate_up(p), nullptr,
+                                       qwen35_moe_down(p));
+                        } else {
+                            require_qwen3_moe_sections(p);
+                            run_expert(selected[off + j],
+                                       qwen3_moe_gate(p), qwen3_moe_up(p),
+                                       qwen3_moe_down(p));
+                        }
+                    }
+                }
+            });
+    } else if (use_decode_fast_path) {
         // Decode fast-path. Fully on-device pipeline (graph-capturable):
         //   1. Build gate_up/down cuBLAS pointer arrays for every
         //      token/expert route (N*K rows) with no D2H sync.
@@ -1763,7 +1880,7 @@ void qwen3_5_moe_forward_paged(
         });
         ++profile.moe_layers;
         const bool moe_added_to_residual = moe_block(
-            Lw, cfg, fwd_cfg, ws, moe_ws, N, is_pure_decode,
+            Lw, cfg, fwd_cfg, ws, moe_ws, static_cast<int>(L), N, is_pure_decode,
             cublas, stream, &profile);
         if (!moe_added_to_residual) {
             profile_cuda_stage(&profile, &profile.residual_ms, stream, [&] {
@@ -2150,7 +2267,7 @@ void qwen3_5_moe_mtp_forward(
     bool add_moe_residual = false;
     if (mode == MtpMoeMode::Full) {
         const bool moe_added_to_residual = moe_block(
-            Lw, cfg, fwd_cfg, ws, moe_ws, num_tokens,
+            Lw, cfg, fwd_cfg, ws, moe_ws, /*layer=*/0, num_tokens,
             /*is_pure_decode=*/true, cublas, stream, /*profile=*/nullptr);
         add_moe_residual = !moe_added_to_residual;
     } else if (mode == MtpMoeMode::SharedOnly) {

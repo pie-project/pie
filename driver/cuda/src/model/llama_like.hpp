@@ -23,6 +23,10 @@
 #include "ops/attention_flashinfer.hpp"
 #include "ops/attention_xqa.hpp"
 
+namespace pie_cuda_driver {
+class ExpertStreamCache;
+}
+
 namespace pie_cuda_driver::model {
 
 enum class RopeKind {
@@ -100,6 +104,11 @@ struct LlamaLikeForwardCfg {
     int mrope_section_t = 0;
     int mrope_section_h = 0;
     int mrope_section_w = 0;
+
+    // SSD expert streaming: non-null when routed experts are paged on demand
+    // (GPT-OSS MXFP4 RoutedDequant and Mixtral BF16). Resident Mixtral /
+    // native MXFP4 leave this null and use WeightStore tensors.
+    ExpertStreamCache* expert_cache = nullptr;
 };
 
 // Per-fire Qwen3-VL multimodal side-inputs threaded into the shared

@@ -517,7 +517,7 @@ const ARCH_PROFILES: &[(&[&str], ArchProfile)] = &[
         &["deepseek_v4"],
         ArchProfile {
             shard_axis_fn: dsv4_shard_axis,
-            stream: Some(DSV4_STREAM_ARCH),
+            stream: Some(crate::stream_arch::DSV4_STREAM_ARCH),
             ..GENERIC_ARCH
         },
     ),
@@ -528,7 +528,24 @@ const ARCH_PROFILES: &[(&[&str], ArchProfile)] = &[
     ),
     (
         &["gpt_oss", "gpt-oss", "gptoss"],
-        ArchProfile { gpt_oss_mxfp4_groups: true, ..GENERIC_ARCH },
+        ArchProfile {
+            gpt_oss_mxfp4_groups: true,
+            // bind_gpt_oss reads separate q/k/v (and biases); the generic
+            // dense QKV join would consume them into qkv_proj.fused.weight.
+            skip_dense_qkv_fusion: true,
+            stream: Some(crate::stream_arch::GPT_OSS_STREAM_ARCH),
+            ..GENERIC_ARCH
+        },
+    ),
+    (
+        // Plain Mixtral: per-expert BF16 w1/w2/w3 under block_sparse_moe.
+        // bind_mixtral reads separate q/k/v, so opt out of dense QKV fusion.
+        &["mixtral"],
+        ArchProfile {
+            skip_dense_qkv_fusion: true,
+            stream: Some(crate::stream_arch::MIXTRAL_STREAM_ARCH),
+            ..GENERIC_ARCH
+        },
     ),
     (
         &["glm_moe_dsa"],
@@ -540,14 +557,25 @@ const ARCH_PROFILES: &[(&[&str], ArchProfile)] = &[
         },
     ),
     (
-        // Plain Qwen3-MoE (Qwen3-30B-A3B) and Qwen3.5-MoE: their bind path reads
-        // attention q/k/v separately and never a fused qkv, so opt out of the
-        // dense projection join that would otherwise consume q_proj/k_proj/v_proj.
-        &["qwen3_moe", "qwen3_5_moe", "qwen3_5_moe_text"],
+        // Plain Qwen3-MoE (Qwen3-30B-A3B): per-expert gate/up/down; bind reads
+        // separate q/k/v. Stack to fused banks unless SSD streaming is on.
+        &["qwen3_moe"],
         ArchProfile {
             bf16_runtime_quant: true,
             skip_dense_qkv_fusion: true,
             stack_per_expert_moe: true,
+            stream: Some(crate::stream_arch::QWEN3_MOE_STREAM_ARCH),
+            ..GENERIC_ARCH
+        },
+    ),
+    (
+        // Qwen3.5/3.6-MoE: pre-fused BF16 expert banks + optional shared expert.
+        &["qwen3_5_moe", "qwen3_5_moe_text"],
+        ArchProfile {
+            bf16_runtime_quant: true,
+            skip_dense_qkv_fusion: true,
+            stack_per_expert_moe: true,
+            stream: Some(crate::stream_arch::QWEN35_MOE_STREAM_ARCH),
             ..GENERIC_ARCH
         },
     ),
@@ -616,7 +644,7 @@ impl DefaultAbiBuilder<'_> {
         let Some(arch) = self.profile().stream else {
             return Err(CompileError::InvalidInput(format!(
                 "stream_routed_experts is not supported for model_type='{}' \
-                 (supported: deepseek_v4)",
+                 (supported: deepseek_v4, gpt_oss, mixtral, qwen3_moe, qwen3_5_moe)",
                 self.cfg.model_type
             )));
         };
@@ -626,6 +654,22 @@ impl DefaultAbiBuilder<'_> {
                  are strided file extents, which streaming does not support yet)"
                     .to_string(),
             ));
+        }
+        // GPT-OSS streaming copies packed MXFP4 extents only (RoutedDequant).
+        // Native Marlin / eager BF16 need different stream templates.
+        if self.profile().gpt_oss_mxfp4_groups {
+            match self.target.mxfp4_moe {
+                crate::types::Mxfp4MoePolicy::NativeGemm
+                | crate::types::Mxfp4MoePolicy::EagerBf16 => {
+                    return Err(CompileError::InvalidInput(
+                        "stream_routed_experts for gpt_oss requires \
+                         mxfp4_moe=auto|routed_dequant (plain ExtentWrite of \
+                         packed MXFP4); native and eager_bf16 are unsupported"
+                            .to_string(),
+                    ));
+                }
+                crate::types::Mxfp4MoePolicy::RoutedDecode => {}
+            }
         }
         let mut skipped = 0usize;
         for raw in &self.metadata.tensors {
@@ -1210,6 +1254,11 @@ impl DefaultAbiBuilder<'_> {
             // loudly on the missing fused tensor rather than loading silently wrong.
             return Ok(());
         }
+        // SSD streaming pages per-expert (or fused-bank) extents directly;
+        // stacking would also emit resident fused contracts from the same sources.
+        if self.target.stream_routed_experts {
+            return Ok(());
+        }
         let num_experts = self.cfg.num_experts as i64;
         if num_experts <= 0 {
             return Ok(());
@@ -1607,6 +1656,12 @@ impl DefaultAbiBuilder<'_> {
             };
             if native {
                 self.add_gpt_oss_native_mxfp4_group(block, scale, bias, base)?;
+            } else if self.target.stream_routed_experts
+                && crate::stream_arch::is_gpt_oss_streamed_expert_tensor(&block.name)
+            {
+                // Packed weight/scale are deferred to the stream plan; keep
+                // the BF16 bias resident for bind-time deinterleave.
+                self.push_direct(bias, format!("{base}.bias"), None);
             } else {
                 self.push_direct(block, format!("{base}.weight"), None);
                 self.push_direct(scale, format!("{base}.weight_scale"), None);
@@ -2118,79 +2173,6 @@ fn dsv4_shard_axis(name: &str) -> Option<Axis> {
     }
     // Everything else replicated (avoids TP communication in main path).
     None
-}
-
-/// Fixed DSv4 section order — must match `dsv4_expert_sections.hpp` in the
-/// CUDA driver (`w1/w2/w3` × weight/scale).
-pub const DSV4_EXPERT_SECTIONS: &[&str] = &[
-    "w1.weight",
-    "w1.scale",
-    "w2.weight",
-    "w2.scale",
-    "w3.weight",
-    "w3.scale",
-];
-
-/// DeepSeek-V4 main-stack routed experts:
-/// `layers.{L}.ffn.experts.{E}.{w1,w2,w3}.{weight,scale}`.
-///
-/// Shared experts (`.ffn.shared_experts.`), routers (`ffn.gate.*`), and MTP
-/// modules (`mtp.*.ffn.experts.*`) are **not** streamable — only the primary
-/// layer MoE bank is paged by the expert stream cache today.
-pub(crate) fn is_dsv4_routed_expert_tensor(name: &str) -> bool {
-    // Require the main-stack prefix so MTP / other modules stay resident.
-    let Some(rest) = name.strip_prefix("layers.") else {
-        return false;
-    };
-    let Some((_, rest)) = rest.split_once('.') else {
-        return false;
-    };
-    rest.starts_with("ffn.experts.")
-        && ends_with_any(
-            name,
-            &[
-                ".w1.weight",
-                ".w1.scale",
-                ".w2.weight",
-                ".w2.scale",
-                ".w3.weight",
-                ".w3.scale",
-            ],
-        )
-}
-
-/// Parse `layers.{L}.ffn.experts.{E}.{section}` → (layer, expert, section_idx).
-pub(crate) fn parse_dsv4_expert_section(name: &str) -> Option<(u32, u32, usize)> {
-    let rest = name.strip_prefix("layers.")?;
-    let (layer_str, rest) = rest.split_once('.')?;
-    let rest = rest.strip_prefix("ffn.experts.")?;
-    let (expert_str, section) = rest.split_once('.')?;
-    let layer: u32 = layer_str.parse().ok()?;
-    let expert: u32 = expert_str.parse().ok()?;
-    let section_idx = DSV4_EXPERT_SECTIONS.iter().position(|s| *s == section)?;
-    Some((layer, expert, section_idx))
-}
-
-const DSV4_STREAM_ARCH: crate::stream::StreamArchDesc = crate::stream::StreamArchDesc {
-    sections: DSV4_EXPERT_SECTIONS,
-    is_streamed: is_dsv4_routed_expert_tensor,
-    parse: parse_dsv4_expert_section,
-};
-
-#[cfg(test)]
-mod stream_tests {
-    use super::*;
-
-    #[test]
-    fn parse_dsv4_names() {
-        assert_eq!(
-            parse_dsv4_expert_section("layers.3.ffn.experts.12.w2.scale"),
-            Some((3, 12, 3))
-        );
-        assert!(parse_dsv4_expert_section("layers.0.ffn.shared_experts.w1.weight").is_none());
-        assert!(parse_dsv4_expert_section("layers.0.ffn.gate.weight").is_none());
-        assert!(parse_dsv4_expert_section("mtp.0.ffn.experts.0.w1.scale").is_none());
-    }
 }
 
 fn ends_with_any(value: &str, suffixes: &[&str]) -> bool {
