@@ -302,7 +302,12 @@ impl QwenInstruct {
                 return None;
             }
             seen.push(name.to_string());
-            names.push(format!("\"{}\"", name));
+            // Emit the name as a JSON string literal so quotes, backslashes, and
+            // control characters are escaped into a form Pie's EBNF parser accepts
+            // (unlike raw `format!("\"{name}\"")`, which a `"`/`\` in the name would
+            // corrupt, and unlike `{name:?}`, whose `\u{..}` escapes the parser
+            // rejects). The schema `const` below keeps the original, unescaped name.
+            names.push(serde_json::to_string(name).ok()?);
             let params = func
                 .get("parameters")
                 .cloned()
@@ -969,6 +974,30 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn qwen35_xml_escapes_tool_name_into_the_grammar_literal() {
+        // A name carrying both a double-quote and a backslash must be escaped
+        // into the Qwen3.5 XML `tool-name` EBNF literal rather than corrupting or
+        // widening it. JSON parsing unescapes the declaration to the name a"b\c.
+        let tool = r#"{"function":{"name":"a\"b\\c"}}"#.to_string();
+        let source =
+            QwenInstruct::build_tool_call_grammar(ToolCallFormat::Qwen35Xml, &[tool], false)
+                .expect("grammar source");
+        let grammar =
+            Arc::new(Grammar::from_ebnf(&source, "root").expect("grammar compiles despite quote/backslash in name"));
+
+        // Accepts a call naming the exact declared tool (quote + backslash intact).
+        assert!(grammar_accepts(
+            &grammar,
+            "<tool_call>\n<function=a\"b\\c>\n</function>\n</tool_call>"
+        ));
+        // Rejects any other name — the literal is bound to a"b\c, not widened.
+        assert!(!grammar_accepts(
+            &grammar,
+            "<tool_call>\n<function=other>\n</function>\n</tool_call>"
+        ));
     }
 
     #[test]
