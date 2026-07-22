@@ -4,13 +4,16 @@ use std::sync::Arc;
 use wasmtime::{Store, StoreLimits, StoreLimitsBuilder};
 
 use crate::bindings::pie::plex::host;
-use crate::engine::InvocationPermit;
 use crate::error::{InvocationFailure, InvocationFailureKind};
 use crate::host::{QueryHandler, StagedAction};
 
+pub(crate) const MAX_CORE_INSTANCES_PER_INVOCATION: u32 = 4;
+pub(crate) const MAX_MEMORIES_PER_INVOCATION: u32 = 1;
+pub(crate) const MAX_TABLES_PER_INVOCATION: u32 = 4;
+pub(crate) const MAX_TABLE_ELEMENTS: usize = 1024;
+
 pub(crate) struct InvocationContext {
     limits: StoreLimits,
-    _permit: InvocationPermit,
     staged_actions: Vec<StagedAction>,
     query_handler: Arc<dyn QueryHandler>,
     supported_actions: Arc<BTreeSet<String>>,
@@ -31,23 +34,18 @@ pub(crate) struct InvocationContextConfig {
 }
 
 impl InvocationContext {
-    pub(crate) fn store(
-        engine: &wasmtime::Engine,
-        permit: InvocationPermit,
-        config: InvocationContextConfig,
-    ) -> Store<Self> {
+    pub(crate) fn store(engine: &wasmtime::Engine, config: InvocationContextConfig) -> Store<Self> {
         let limits = StoreLimitsBuilder::new()
             .memory_size(config.memory_bytes)
-            .table_elements(1024)
-            .instances(4)
-            .tables(4)
-            .memories(1)
+            .table_elements(MAX_TABLE_ELEMENTS)
+            .instances(MAX_CORE_INSTANCES_PER_INVOCATION as usize)
+            .tables(MAX_TABLES_PER_INVOCATION as usize)
+            .memories(MAX_MEMORIES_PER_INVOCATION as usize)
             .build();
         let mut store = Store::new(
             engine,
             Self {
                 limits,
-                _permit: permit,
                 staged_actions: Vec::new(),
                 query_handler: config.query_handler,
                 supported_actions: config.supported_actions,

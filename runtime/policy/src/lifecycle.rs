@@ -7,7 +7,7 @@ use serde_json::json;
 
 use crate::host::{QueryHandler, RejectingQueryHandler};
 use crate::protocol::validate_context;
-use crate::state_store::{FeedbackCommit, PolicyStateBackend, StateBackendError};
+use crate::state_store::{FeedbackCommit, PolicyStateBackend, StateBackendError, StateSnapshot};
 use crate::{
     AttachmentRegistry, Invocation, InvocationFailure, InvocationFailureKind, PreparedPolicyResult,
 };
@@ -20,6 +20,11 @@ pub struct LifecycleHost {
     supported_actions: Arc<BTreeSet<String>>,
     stateful_invocation: Arc<Mutex<()>>,
     max_defer_retries: u32,
+}
+
+pub(crate) struct AppliedPolicyResult {
+    pub prepared: PreparedPolicyResult,
+    pub state_snapshot: Option<StateSnapshot>,
 }
 
 impl LifecycleHost {
@@ -110,7 +115,21 @@ impl LifecycleHost {
         context: Document,
     ) -> Invocation<PreparedPolicyResult> {
         let _guard = self.stateful_invocation.lock().unwrap();
-        self.invoke_and_apply_locked(operation, context)
+        discard_state_snapshot(self.invoke_and_apply_locked_with_state_snapshot(
+            operation,
+            context,
+            &[],
+            false,
+        ))
+    }
+
+    pub(crate) fn invoke_and_apply_with_state_snapshot(
+        &self,
+        operation: Operation,
+        context: Document,
+    ) -> Invocation<AppliedPolicyResult> {
+        let _guard = self.stateful_invocation.lock().unwrap();
+        self.invoke_and_apply_locked_with_state_snapshot(operation, context, &[], true)
     }
 
     fn invoke_and_apply_locked(
@@ -118,7 +137,12 @@ impl LifecycleHost {
         operation: Operation,
         context: Document,
     ) -> Invocation<PreparedPolicyResult> {
-        self.invoke_and_apply_locked_with_removals(operation, context, &[])
+        discard_state_snapshot(self.invoke_and_apply_locked_with_state_snapshot(
+            operation,
+            context,
+            &[],
+            false,
+        ))
     }
 
     fn invoke_and_apply_locked_with_removals(
@@ -127,6 +151,21 @@ impl LifecycleHost {
         context: Document,
         terminal_logical_ids: &[String],
     ) -> Invocation<PreparedPolicyResult> {
+        discard_state_snapshot(self.invoke_and_apply_locked_with_state_snapshot(
+            operation,
+            context,
+            terminal_logical_ids,
+            false,
+        ))
+    }
+
+    fn invoke_and_apply_locked_with_state_snapshot(
+        &self,
+        operation: Operation,
+        context: Document,
+        terminal_logical_ids: &[String],
+        backend_load_errors: bool,
+    ) -> Invocation<AppliedPolicyResult> {
         let request_ids = match validate_context(operation, &context) {
             Ok(request_ids) => request_ids,
             Err(error) => return invalid_input(error.to_string()),
@@ -137,7 +176,7 @@ impl LifecycleHost {
                 .expect("feedback context was validated");
             match self.backend.feedback_result(delivery_id) {
                 Ok(Some(result)) => {
-                    return Invocation::Success(PreparedPolicyResult::duplicate_feedback(result));
+                    return duplicate_feedback(result);
                 }
                 Ok(None) => Some(delivery_id.to_owned()),
                 Err(error) => return backend_failure(error),
@@ -148,7 +187,20 @@ impl LifecycleHost {
 
         let state = match self.backend.load(&request_ids) {
             Ok(state) => state,
-            Err(error) => return invalid_input(error.to_string()),
+            Err(error) => {
+                if let Some(delivery_id) = feedback_delivery.as_deref() {
+                    match self.backend.feedback_result(delivery_id) {
+                        Ok(Some(result)) => return duplicate_feedback(result),
+                        Ok(None) => {}
+                        Err(recheck_error) => return backend_failure(recheck_error),
+                    }
+                }
+                return if backend_load_errors {
+                    backend_failure(error)
+                } else {
+                    invalid_input(error.to_string())
+                };
+            }
         };
         let snapshot = match self.registry.snapshot() {
             Ok(snapshot) => snapshot,
@@ -186,12 +238,15 @@ impl LifecycleHost {
             if let StateBackendError::DuplicateFeedback(delivery_id) = &error
                 && let Ok(Some(result)) = self.backend.feedback_result(delivery_id)
             {
-                return Invocation::Success(PreparedPolicyResult::duplicate_feedback(result));
+                return duplicate_feedback(result);
             }
             return backend_failure(error);
         }
 
-        Invocation::Success(prepared)
+        Invocation::Success(AppliedPolicyResult {
+            prepared,
+            state_snapshot: Some(state),
+        })
     }
 
     pub fn route_and_admit(
@@ -299,6 +354,20 @@ impl LifecycleHost {
             terminal_logical_ids,
         )
     }
+
+    pub(crate) fn feedback_and_remove_with_state_snapshot(
+        &self,
+        context: Document,
+        terminal_logical_ids: &[String],
+    ) -> Invocation<AppliedPolicyResult> {
+        let _guard = self.stateful_invocation.lock().unwrap();
+        self.invoke_and_apply_locked_with_state_snapshot(
+            Operation::Feedback,
+            context,
+            terminal_logical_ids,
+            true,
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -322,6 +391,23 @@ fn invalid_input<T>(message: String) -> Invocation<T> {
         InvocationFailureKind::InvalidInput,
         message,
     ))
+}
+
+fn duplicate_feedback(result: Document) -> Invocation<AppliedPolicyResult> {
+    Invocation::Success(AppliedPolicyResult {
+        prepared: PreparedPolicyResult::duplicate_feedback(result),
+        state_snapshot: None,
+    })
+}
+
+fn discard_state_snapshot(
+    invocation: Invocation<AppliedPolicyResult>,
+) -> Invocation<PreparedPolicyResult> {
+    match invocation {
+        Invocation::Success(applied) => Invocation::Success(applied.prepared),
+        Invocation::Unavailable => Invocation::Unavailable,
+        Invocation::FallbackRequired(failure) => Invocation::FallbackRequired(failure),
+    }
 }
 
 fn backend_failure<T>(error: StateBackendError) -> Invocation<T> {

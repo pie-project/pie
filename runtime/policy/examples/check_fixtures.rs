@@ -1,17 +1,19 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier, Mutex};
+use std::thread;
 
 use pie_plex::{
     ContractVersion, Document, Manifest, Operation, PolicyLimits, rank_route, select_evictions,
     select_schedule,
 };
 use pie_policy::{
-    AttachmentRegistry, DictionaryQueryHandler, ENGINE_API_VERSION, InMemoryPolicyStateBackend,
-    Invocation, InvocationFailureKind, LifecycleHost, PlacementOutcome, PlexError, PlexRuntime,
-    PolicyEngine, PolicyEngineConfig, PolicyPackage, PolicyStateBackend, QueryError, QueryHandler,
-    RejectingQueryHandler, ReplayCommand, ReplayRunner, ReplayTrace, StateBackendError,
+    AttachmentRegistry, DictionaryQueryHandler, ENGINE_API_VERSION, FeedbackCommit,
+    InMemoryPolicyStateBackend, Invocation, InvocationFailureKind, LifecycleHost, PlacementOutcome,
+    PlexError, PlexRuntime, PolicyEngine, PolicyEngineConfig, PolicyPackage, PolicyStateBackend,
+    QueryError, QueryHandler, RejectingQueryHandler, ReplayCommand, ReplayRunner, ReplayTrace,
+    StateBackendError, StateSnapshot, StateUpdates,
 };
 use serde_json::json;
 
@@ -28,12 +30,109 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     check_working_sets_and_decisions(&engine, &directory)?;
     check_queries_actions_and_conflicts(&engine, &directory)?;
     check_failure_rollback(&engine, &directory)?;
+    check_pool_contention(&directory)?;
     check_feedback_dedup(&directory)?;
     check_replay(&directory)?;
     check_adapter_conformance(&engine, &directory)?;
     check_paper_policies(&engine, &directory)?;
 
     println!("PLEX JSON policy fixtures passed");
+    Ok(())
+}
+
+fn check_pool_contention(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let engine = PolicyEngine::new(PolicyEngineConfig {
+        max_concurrent_invocations: 1,
+        epoch_tick: None,
+        ..PolicyEngineConfig::default()
+    })?;
+    let package = package_bytes(
+        directory,
+        "plex_paper_helium",
+        manifest("pool-contention", [Operation::Schedule]),
+    )?;
+    let registry = AttachmentRegistry::new(engine);
+    registry.attach(&package)?;
+    let snapshot = Arc::new(registry.snapshot()?);
+    let context = schedule_context(
+        vec![(
+            "P",
+            json!({
+                "ready": true,
+                "dependency_depth": 3,
+                "prefix_reuse_tokens": 256,
+                "earliest_start": 0,
+                "profiled_token_cost": 32
+            }),
+        )],
+        false,
+    );
+    let request = json!({
+        "facts": {
+            "logical_request_id": "P",
+            "generation_id": 0
+        },
+        "fields": {},
+        "scratch": {}
+    });
+    let state = StateSnapshot::from_parts(
+        json!({}),
+        BTreeMap::from([("P".into(), request)]),
+        0,
+        BTreeMap::from([("P".into(), 0)]),
+    )?;
+    let barrier = Arc::new(Barrier::new(5));
+    let mut workers = Vec::new();
+    for _ in 0..4 {
+        let snapshot = snapshot.clone();
+        let context = context.clone();
+        let state = state.clone();
+        let barrier = barrier.clone();
+        workers.push(thread::spawn(move || -> Result<(u64, u64), String> {
+            barrier.wait();
+            let mut successes = 0;
+            let mut saturated = 0;
+            for _ in 0..2_000 {
+                match snapshot.invoke(
+                    Operation::Schedule,
+                    context.clone(),
+                    state.clone(),
+                    Arc::new(RejectingQueryHandler),
+                    Arc::new(BTreeSet::new()),
+                ) {
+                    Invocation::Success(_) => successes += 1,
+                    Invocation::FallbackRequired(failure)
+                        if failure.kind == InvocationFailureKind::HostSaturated =>
+                    {
+                        saturated += 1;
+                    }
+                    Invocation::FallbackRequired(failure) => {
+                        return Err(format!(
+                            "unexpected pooled invocation failure {:?}: {}",
+                            failure.kind, failure.message
+                        ));
+                    }
+                    Invocation::Unavailable => {
+                        return Err("pooled schedule operation became unavailable".into());
+                    }
+                }
+            }
+            Ok((successes, saturated))
+        }));
+    }
+    barrier.wait();
+    let mut successes = 0;
+    let mut saturated = 0;
+    for worker in workers {
+        let (worker_successes, worker_saturated) = worker
+            .join()
+            .map_err(|_| "pool contention worker panicked")??;
+        successes += worker_successes;
+        saturated += worker_saturated;
+    }
+    assert!(successes > 0);
+    assert!(saturated > 0);
+    assert_eq!(successes + saturated, 8_000);
     Ok(())
 }
 
@@ -500,6 +599,29 @@ fn check_request_events_and_cleanup(
         success_backend.read_request("S"),
         Err(StateBackendError::NotFound(_))
     ));
+
+    success_backend.create_request("T".into(), json!({}), json!({}))?;
+    let terminal_retry = engine_event(
+        "feedback",
+        feedback_body(
+            "cleanup-terminal-retry",
+            vec![("completed", "T", json!({}))],
+            context(false),
+        ),
+        vec![json!({"op": "finish", "request_id": "T"})],
+    );
+    let expected = json!({
+        "status": "success",
+        "decision": {},
+        "request_fields": {},
+        "actions": []
+    });
+    assert_eq!(success.invoke(terminal_retry.clone())?, expected);
+    assert_eq!(success.invoke(terminal_retry)?, expected);
+    assert!(matches!(
+        success_backend.read_request("T"),
+        Err(StateBackendError::NotFound(_))
+    ));
     Ok(())
 }
 
@@ -726,6 +848,39 @@ fn check_queries_actions_and_conflicts(
     assert_eq!(response.actions[1].id, 1);
     assert_eq!(response.actions[0].method, "pie.kv.prefetch@1");
     assert_eq!(response.actions[1].method, "pie.retention.set@1");
+
+    let snapshot_inner = Arc::new(InMemoryPolicyStateBackend::default());
+    let snapshot_loads = Arc::new(AtomicUsize::new(0));
+    let snapshot_runtime = runtime_with_policy(
+        engine,
+        directory,
+        "plex_stage_action",
+        "snapshot-reporting",
+        &[Operation::Route],
+        Arc::new(MutatingSecondLoadBackend {
+            inner: snapshot_inner,
+            load_calls: snapshot_loads.clone(),
+        }),
+        Arc::new(RejectingQueryHandler),
+        action_set(["pie.kv.prefetch@1", "pie.retention.set@1"]),
+    )?;
+    let outcome = snapshot_runtime.invoke(engine_event(
+        "route",
+        json!({
+            "request_id": "snapshot",
+            "candidates": candidates(),
+            "context": {}
+        }),
+        vec![json!({
+            "op": "create",
+            "request_id": "snapshot",
+            "facts": {"generation_id": 0},
+            "fields": {"body": {}, "metadata": {}}
+        })],
+    ))?;
+    assert_eq!(outcome["status"], "success");
+    assert_eq!(outcome["request_fields"], json!({}));
+    assert_eq!(snapshot_loads.load(Ordering::Acquire), 1);
 
     let unsupported_backend = Arc::new(InMemoryPolicyStateBackend::default());
     let (unsupported_action, _, _) = lifecycle_with_policy(
@@ -1346,6 +1501,11 @@ struct MutatingQueryHandler {
     fired: Arc<AtomicBool>,
 }
 
+struct MutatingSecondLoadBackend {
+    inner: Arc<InMemoryPolicyStateBackend>,
+    load_calls: Arc<AtomicUsize>,
+}
+
 #[derive(Clone, Default)]
 struct CapturingQueryHandler {
     calls: Arc<Mutex<Vec<(String, Document)>>>,
@@ -1382,6 +1542,100 @@ impl QueryHandler for MutatingQueryHandler {
     }
 }
 
+impl PolicyStateBackend for MutatingSecondLoadBackend {
+    fn load(&self, request_ids: &BTreeSet<String>) -> Result<StateSnapshot, StateBackendError> {
+        if self.load_calls.fetch_add(1, Ordering::AcqRel) == 1 {
+            for request_id in request_ids {
+                let mut fields = self.inner.read_request(request_id)?["fields"].clone();
+                fields["host_only"] = json!(true);
+                self.inner.replace_request_fields(request_id, fields)?;
+            }
+        }
+        self.inner.load(request_ids)
+    }
+
+    fn commit(
+        &self,
+        snapshot: &StateSnapshot,
+        updates: &StateUpdates,
+        feedback: Option<&FeedbackCommit>,
+        terminal_requests: &[String],
+    ) -> Result<(), StateBackendError> {
+        self.inner
+            .commit(snapshot, updates, feedback, terminal_requests)
+    }
+
+    fn create_request(
+        &self,
+        logical_request_id: String,
+        body: Document,
+        metadata: Document,
+    ) -> Result<Document, StateBackendError> {
+        self.inner
+            .create_request(logical_request_id, body, metadata)
+    }
+
+    fn continue_request(
+        &self,
+        logical_request_id: &str,
+        body: Document,
+        continuation_metadata: Document,
+    ) -> Result<Document, StateBackendError> {
+        self.inner
+            .continue_request(logical_request_id, body, continuation_metadata)
+    }
+
+    fn read_shared(&self) -> Result<Document, StateBackendError> {
+        self.inner.read_shared()
+    }
+
+    fn replace_shared(&self, shared: Document) -> Result<(), StateBackendError> {
+        self.inner.replace_shared(shared)
+    }
+
+    fn read_request(&self, logical_request_id: &str) -> Result<Document, StateBackendError> {
+        self.inner.read_request(logical_request_id)
+    }
+
+    fn remove_request(&self, logical_request_id: &str) -> Result<Document, StateBackendError> {
+        self.inner.remove_request(logical_request_id)
+    }
+
+    fn request_count(&self) -> Result<usize, StateBackendError> {
+        self.inner.request_count()
+    }
+
+    fn merge_request_facts(
+        &self,
+        logical_request_id: &str,
+        facts: Document,
+    ) -> Result<(), StateBackendError> {
+        self.inner.merge_request_facts(logical_request_id, facts)
+    }
+
+    fn replace_request_fields(
+        &self,
+        logical_request_id: &str,
+        fields: Document,
+    ) -> Result<(), StateBackendError> {
+        self.inner
+            .replace_request_fields(logical_request_id, fields)
+    }
+
+    fn record_enacted_placement(
+        &self,
+        logical_request_id: &str,
+        target_id: String,
+    ) -> Result<(), StateBackendError> {
+        self.inner
+            .record_enacted_placement(logical_request_id, target_id)
+    }
+
+    fn feedback_result(&self, delivery_id: &str) -> Result<Option<Document>, StateBackendError> {
+        self.inner.feedback_result(delivery_id)
+    }
+}
+
 fn run_mock_adapter(
     _name: &str,
     runtime: &PlexRuntime,
@@ -1401,7 +1655,7 @@ fn runtime_with_policy(
     artifact: &str,
     package_name: &str,
     operations: &[Operation],
-    backend: Arc<InMemoryPolicyStateBackend>,
+    backend: Arc<dyn PolicyStateBackend>,
     query_handler: Arc<dyn QueryHandler>,
     supported_actions: BTreeSet<String>,
 ) -> Result<PlexRuntime, Box<dyn std::error::Error>> {

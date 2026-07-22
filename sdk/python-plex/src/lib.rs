@@ -1,6 +1,7 @@
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use pie_policy::{Document, PlexError as RustPlexError, PlexRuntime, QueryError, QueryHandler};
 use pyo3::create_exception;
@@ -12,6 +13,13 @@ create_exception!(_native, InvalidEvent, PlexError);
 create_exception!(_native, BackendError, PlexError);
 create_exception!(_native, PolicyPackageError, PlexError);
 create_exception!(_native, QueryCallbackError, PlexError);
+
+static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    static INVOKING_RUNTIME_IDS: RefCell<BTreeSet<u64>> =
+        const { RefCell::new(BTreeSet::new()) };
+}
 
 struct PythonQueryHandler {
     callback: Py<PyAny>,
@@ -45,8 +53,8 @@ impl QueryHandler for PythonQueryHandler {
 
 #[pyclass(name = "NativeRuntime")]
 struct NativeRuntime {
+    id: u64,
     runtime: PlexRuntime,
-    invoking: AtomicBool,
 }
 
 #[pymethods]
@@ -68,33 +76,48 @@ impl NativeRuntime {
         )
         .map_err(map_plex_error)?;
         Ok(Self {
+            id: next_runtime_id()?,
             runtime,
-            invoking: AtomicBool::new(false),
         })
     }
 
     fn invoke_json(&self, py: Python<'_>, event_json: &str) -> PyResult<String> {
-        if self
-            .invoking
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return Err(QueryCallbackError::new_err(
-                "recursive invoke on the same PLEX runtime is not allowed",
-            ));
-        }
-        let _guard = InvocationGuard(&self.invoking);
+        let _guard = InvocationGuard::enter(self.id)?;
         py.detach(|| self.runtime.invoke_json(event_json))
             .map_err(map_plex_error)
     }
 }
 
-struct InvocationGuard<'a>(&'a AtomicBool);
+struct InvocationGuard {
+    runtime_id: u64,
+}
 
-impl Drop for InvocationGuard<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+impl InvocationGuard {
+    fn enter(runtime_id: u64) -> PyResult<Self> {
+        INVOKING_RUNTIME_IDS.with(|runtime_ids| {
+            if !runtime_ids.borrow_mut().insert(runtime_id) {
+                return Err(QueryCallbackError::new_err(
+                    "recursive invoke on the same PLEX runtime is not allowed",
+                ));
+            }
+            Ok(Self { runtime_id })
+        })
     }
+}
+
+impl Drop for InvocationGuard {
+    fn drop(&mut self) {
+        INVOKING_RUNTIME_IDS.with(|runtime_ids| {
+            let removed = runtime_ids.borrow_mut().remove(&self.runtime_id);
+            debug_assert!(removed);
+        });
+    }
+}
+
+fn next_runtime_id() -> PyResult<u64> {
+    NEXT_RUNTIME_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .map_err(|_| PlexError::new_err("PLEX runtime ID space exhausted"))
 }
 
 fn map_plex_error(error: RustPlexError) -> PyErr {

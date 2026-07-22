@@ -2,6 +2,7 @@ import json
 import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 
 import pytest
 
@@ -125,6 +126,27 @@ def test_same_runtime_recursive_query_is_rejected():
     assert outcome["status"] == "fallback"
     assert outcome["failure"]["kind"] == "query"
     assert "recursive invoke" in outcome["failure"]["message"]
+
+
+def test_same_runtime_concurrent_invocations_are_serialized():
+    entered = Event()
+    release = Event()
+
+    def query(_method, _args):
+        if not entered.is_set():
+            entered.set()
+            assert release.wait(timeout=5)
+        return {"route_bias": 0.0}
+
+    runtime = Runtime(str(POLICY), query=query)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(runtime.invoke, route_event("first", query=True))
+        assert entered.wait(timeout=5)
+        second = executor.submit(runtime.invoke, route_event("second", query=True))
+        release.set()
+        outcomes = [first.result(timeout=5), second.result(timeout=5)]
+
+    assert [outcome["status"] for outcome in outcomes] == ["success", "success"]
 
 
 def test_invalid_events_raise_and_independent_runtimes_are_concurrent():

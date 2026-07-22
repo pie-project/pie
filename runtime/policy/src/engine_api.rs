@@ -97,38 +97,63 @@ impl PlexRuntime {
                 )));
             }
         }
-        validate_request_event_state(&request_events, self.backend.as_ref())?;
-
-        for request_event in request_events
-            .iter()
-            .filter(|event| !matches!(event, RequestEvent::Finish { .. }))
+        let feedback_delivery_id = (operation == Operation::Feedback).then(|| {
+            context["delivery_id"]
+                .as_str()
+                .expect("feedback context was validated")
+        });
+        let mut duplicate_feedback = self.feedback_is_committed(feedback_delivery_id)?;
+        if !duplicate_feedback
+            && let Err(error) = validate_request_event_state(&request_events, self.backend.as_ref())
         {
-            self.apply_request_event(request_event)?;
+            if self.feedback_is_committed(feedback_delivery_id)? {
+                duplicate_feedback = true;
+            } else {
+                return Err(error);
+            }
         }
 
-        let before = self.backend.load(&request_ids)?;
+        if !duplicate_feedback {
+            for request_event in request_events
+                .iter()
+                .filter(|event| !matches!(event, RequestEvent::Finish { .. }))
+            {
+                if let Err(error) = self.apply_request_event(request_event) {
+                    if self.feedback_is_committed(feedback_delivery_id)? {
+                        break;
+                    }
+                    return Err(error);
+                }
+            }
+        }
 
         let invocation = if operation == Operation::Feedback && !terminal_requests.is_empty() {
             self.lifecycle
-                .feedback_and_remove(context.clone(), &terminal_requests)
+                .feedback_and_remove_with_state_snapshot(context.clone(), &terminal_requests)
         } else {
-            self.lifecycle.invoke_and_apply(operation, context.clone())
+            self.lifecycle
+                .invoke_and_apply_with_state_snapshot(operation, context.clone())
         };
 
         match invocation {
-            Invocation::Success(prepared) => {
-                if prepared.duplicate_feedback && !terminal_requests.is_empty() {
-                    self.remove_terminal_requests(&terminal_requests)?;
-                }
-                let decision = normalize_decision(operation, &context, &prepared.result)
+            Invocation::Success(applied) => {
+                let decision = normalize_decision(operation, &context, &applied.prepared.result)
                     .map_err(PlexError::Runtime)?;
                 let request_fields =
-                    changed_request_fields(&before.requests, &prepared.state_updates.requests);
+                    applied
+                        .state_snapshot
+                        .as_ref()
+                        .map_or_else(Map::new, |snapshot| {
+                            changed_request_fields(
+                                &snapshot.requests,
+                                &applied.prepared.state_updates.requests,
+                            )
+                        });
                 Ok(json!({
                     "status": "success",
                     "decision": decision,
                     "request_fields": request_fields,
-                    "actions": prepared.actions,
+                    "actions": applied.prepared.actions,
                 }))
             }
             Invocation::Unavailable => {
@@ -160,6 +185,13 @@ impl PlexRuntime {
 
     pub fn backend(&self) -> &Arc<dyn PolicyStateBackend> {
         &self.backend
+    }
+
+    fn feedback_is_committed(&self, delivery_id: Option<&str>) -> Result<bool, PlexError> {
+        match delivery_id {
+            Some(delivery_id) => Ok(self.backend.feedback_result(delivery_id)?.is_some()),
+            None => Ok(false),
+        }
     }
 
     fn apply_request_event(&self, event: &RequestEvent) -> Result<(), PlexError> {

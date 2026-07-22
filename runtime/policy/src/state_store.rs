@@ -222,6 +222,19 @@ impl PolicyStateBackend for InMemoryPolicyStateBackend {
         }
 
         let mut state = self.inner.lock().unwrap();
+        if let Some(feedback) = feedback {
+            if feedback.delivery_id.is_empty() {
+                return Err(StateBackendError::EmptyFeedbackDeliveryId);
+            }
+            if state
+                .feedback_deliveries
+                .contains_key(&feedback.delivery_id)
+            {
+                return Err(StateBackendError::DuplicateFeedback(
+                    feedback.delivery_id.clone(),
+                ));
+            }
+        }
         let mut next = state.clone();
         if next.shared.revision != snapshot.shared_revision {
             return Err(StateBackendError::RevisionConflict("shared".into()));
@@ -253,14 +266,6 @@ impl PolicyStateBackend for InMemoryPolicyStateBackend {
         }
 
         if let Some(feedback) = feedback {
-            if feedback.delivery_id.is_empty() {
-                return Err(StateBackendError::EmptyFeedbackDeliveryId);
-            }
-            if next.feedback_deliveries.contains_key(&feedback.delivery_id) {
-                return Err(StateBackendError::DuplicateFeedback(
-                    feedback.delivery_id.clone(),
-                ));
-            }
             if next.feedback_deliveries.len() >= feedback.maximum_deliveries {
                 return Err(StateBackendError::FeedbackLedgerFull(
                     feedback.maximum_deliveries,
@@ -674,6 +679,15 @@ mod tests {
         assert!(matches!(
             backend.read_request("L"),
             Err(StateBackendError::NotFound(_))
+        ));
+        assert!(matches!(
+            backend.commit(
+                &snapshot,
+                &StateUpdates::default(),
+                Some(&feedback),
+                &["L".into()]
+            ),
+            Err(StateBackendError::DuplicateFeedback(delivery_id)) if delivery_id == "d"
         ));
     }
 }

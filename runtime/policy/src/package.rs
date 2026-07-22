@@ -168,6 +168,17 @@ impl AttachedPolicy {
                 "policy invocation exceeds the package byte limit",
             ));
         }
+        // Declared before the Store so pooled resources are returned before
+        // the invocation slot becomes available to another thread.
+        let _permit = match self.inner.engine.try_acquire() {
+            Some(permit) => permit,
+            None => {
+                return Invocation::FallbackRequired(InvocationFailure::new(
+                    InvocationFailureKind::HostSaturated,
+                    "policy engine has no free invocation slot",
+                ));
+            }
+        };
         let (mut store, policy) = match self.instantiate(query_handler, supported_actions) {
             Ok(value) => value,
             Err(failure) => return Invocation::FallbackRequired(failure),
@@ -246,17 +257,10 @@ impl AttachedPolicy {
         query_handler: Arc<dyn QueryHandler>,
         supported_actions: Arc<BTreeSet<String>>,
     ) -> Result<(Store<InvocationContext>, PlexPolicy), InvocationFailure> {
-        let permit = self.inner.engine.try_acquire().ok_or_else(|| {
-            InvocationFailure::new(
-                InvocationFailureKind::HostSaturated,
-                "policy engine has no free invocation slot",
-            )
-        })?;
         let memory_bytes =
             usize::try_from(self.inner.manifest.limits.memory_bytes).unwrap_or(usize::MAX);
         let mut store = InvocationContext::store(
             self.inner.engine.raw(),
-            permit,
             InvocationContextConfig {
                 memory_bytes,
                 query_handler,
@@ -327,13 +331,12 @@ fn probe_instantiation(
     manifest: &Manifest,
     pre: &PlexPolicyPre<InvocationContext>,
 ) -> Result<(), AttachmentError> {
-    let permit = engine
+    let _permit = engine
         .try_acquire()
         .ok_or(AttachmentError::EngineSaturated)?;
     let memory_bytes = usize::try_from(manifest.limits.memory_bytes).unwrap_or(usize::MAX);
     let mut store = InvocationContext::store(
         engine.raw(),
-        permit,
         InvocationContextConfig {
             memory_bytes,
             query_handler: Arc::new(RejectingQueryHandler),

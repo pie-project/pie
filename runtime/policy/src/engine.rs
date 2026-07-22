@@ -3,7 +3,13 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use wasmtime::PoolingAllocationConfig;
+
 use crate::AttachmentError;
+use crate::context::{
+    MAX_CORE_INSTANCES_PER_INVOCATION, MAX_MEMORIES_PER_INVOCATION, MAX_TABLE_ELEMENTS,
+    MAX_TABLES_PER_INVOCATION,
+};
 
 #[derive(Debug, Clone)]
 pub struct PolicyEngineConfig {
@@ -102,10 +108,26 @@ impl PolicyEngine {
             ));
         }
 
+        let pool_capacity = PoolCapacity::from_config(&config)?;
+        let mut pooling = PoolingAllocationConfig::new();
+        pooling
+            .total_component_instances(pool_capacity.component_instances)
+            .max_core_instances_per_component(MAX_CORE_INSTANCES_PER_INVOCATION)
+            .total_core_instances(pool_capacity.core_instances)
+            .max_memories_per_component(MAX_MEMORIES_PER_INVOCATION)
+            .total_memories(pool_capacity.memories)
+            .max_tables_per_component(MAX_TABLES_PER_INVOCATION)
+            .total_tables(pool_capacity.tables)
+            .table_elements(MAX_TABLE_ELEMENTS)
+            .max_memory_size(config.max_memory_bytes)
+            .max_unused_warm_slots(pool_capacity.component_instances);
+
         let mut wasmtime_config = wasmtime::Config::new();
         wasmtime_config.consume_fuel(true);
         wasmtime_config.epoch_interruption(true);
         wasmtime_config.wasm_threads(false);
+        wasmtime_config.memory_reservation(config.max_memory_bytes as u64);
+        wasmtime_config.allocation_strategy(pooling);
         let engine = wasmtime::Engine::new(&wasmtime_config)
             .map_err(|error| AttachmentError::Compile(error.to_string()))?;
 
@@ -177,6 +199,42 @@ impl PolicyEngine {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct PoolCapacity {
+    component_instances: u32,
+    core_instances: u32,
+    memories: u32,
+    tables: u32,
+}
+
+impl PoolCapacity {
+    fn from_config(config: &PolicyEngineConfig) -> Result<Self, AttachmentError> {
+        let invocations = config.max_concurrent_invocations;
+        Ok(Self {
+            component_instances: invocations,
+            core_instances: checked_pool_slots(
+                invocations,
+                MAX_CORE_INSTANCES_PER_INVOCATION,
+                "core instances",
+            )?,
+            memories: checked_pool_slots(invocations, MAX_MEMORIES_PER_INVOCATION, "memories")?,
+            tables: checked_pool_slots(invocations, MAX_TABLES_PER_INVOCATION, "tables")?,
+        })
+    }
+}
+
+fn checked_pool_slots(
+    invocations: u32,
+    per_invocation: u32,
+    resource: &str,
+) -> Result<u32, AttachmentError> {
+    invocations.checked_mul(per_invocation).ok_or_else(|| {
+        AttachmentError::EngineConfig(format!(
+            "max_concurrent_invocations overflows the Wasmtime {resource} pool"
+        ))
+    })
+}
+
 pub(crate) struct InvocationPermit {
     engine: Arc<EngineInner>,
 }
@@ -186,5 +244,43 @@ impl Drop for InvocationPermit {
         self.engine
             .active_invocations
             .fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sizes_pool_from_invocation_limit() {
+        let config = PolicyEngineConfig {
+            max_concurrent_invocations: 7,
+            ..PolicyEngineConfig::deterministic_replay()
+        };
+        assert_eq!(
+            PoolCapacity::from_config(&config).unwrap(),
+            PoolCapacity {
+                component_instances: 7,
+                core_instances: 28,
+                memories: 7,
+                tables: 28,
+            }
+        );
+        let engine = PolicyEngine::new(config).unwrap();
+        assert!(engine.raw().pooling_allocator_metrics().is_some());
+    }
+
+    #[test]
+    fn rejects_pool_capacity_overflow() {
+        let error = PoolCapacity::from_config(&PolicyEngineConfig {
+            max_concurrent_invocations: u32::MAX,
+            ..PolicyEngineConfig::deterministic_replay()
+        })
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("overflows the Wasmtime core instances pool")
+        );
     }
 }
