@@ -38,4 +38,10 @@ cache-keys = [
     { file = "src/**/*.rs" },
     { file = "../../worker/Cargo.toml" },
     { file = "../../worker/src/**/*.rs" },
+    # The embedded engine compiles the whole runtime + driver + WIT surface;
+    # without these keys a source edit there serves a stale cached wheel.
+    { file = "../../runtime/**/*.rs" },
+    { file = "../../driver/**/*.rs" },
+    { file = "../../interface/**/*.wit" },
+    { file = "../../interface/**/*.rs" },
 ]
