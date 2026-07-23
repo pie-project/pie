@@ -931,3 +931,67 @@ teardown->permit->admit->fire chains trickle over ~30 ms. That cascade
 (and the driver's 12 ms settle publication) is the next lever toward
 the +10% target (~35.4k needs holes <=90 ms total); after it, decode
 glue fusion (~30-60 ms) is the stretch.
+
+## Exit cascade, round 1 (directive "다음 지렛대로 진행. 10% 갭 달성해야 함")
+
+Instrumented the exit path per process (`guest_main_returned`,
+`process_drop`, `process_teardown` events, PIE_FIRE_TIMING-gated) and
+attributed the ~30-40 ms boundary release trickle exactly:
+
+- Guest unwinding is NOT the cascade: all 512 guests return, drop their
+  ctx (scratch rm ~2 us) and reach the teardown task by **+6 ms** after
+  the last decode wave completes. `finalize` is ~0.
+- The cascade WAS `notify_process_terminate`'s ack: the scheduler
+  worker's mailbox drain ran `try_recv` until EMPTY, and the next-next
+  cohort's bring-up flood (~14k items/boundary: bind + channel-register
+  + close traffic) kept it non-empty for ~47 ms. Leave acks — and with
+  them permit releases, admissions, first fires, and the seal — were
+  hostage to the flood's tail, FIFO-ordered behind it.
+
+Two landed invariant fixes (`worker.rs`, `frame.rs`):
+
+1. **Epoch drain**: a worker pass consumes only the items queued when it
+   began (`rx.len()` snapshot), then always runs retire + dispatch. The
+   flood spills to later passes and overlaps prefill execution; the
+   seal-opening events reach the policy at pass cadence. Acks fell from
+   p50 17-27 ms to 4-13 ms.
+2. **`releases_in_flight`** (+ `slotted` set): the live drain had been
+   ACCIDENTALLY load-bearing — with seal checks now exposed between
+   passes, the window between a slot holder's Terminate leave and its
+   teardown's Released broadcast read `pending_slots == 0` and the seal
+   closed on a partial cohort (ragged 464/48 split, run variance blew
+   up to ~2k, one run at 30.5k). The completed invariant: a departing
+   slot holder's release is IMMINENT — Terminate leave of a slotted pid
+   arms the counter (idempotent per pid; the exit funnel sends two
+   leaves), Released retires it, and the seal holds while
+   `releases_in_flight > 0` with a staged successor. Every big wave is
+   512-wide again. Permit lifecycle audited: set only at
+   `admit_execution`, taken only at ctx Drop -> capped teardown, so an
+   armed release always lands (suspend never touches it).
+
+Negative result, reverted after measurement (run g): making the
+teardown's terminate leave fire-and-forget. Per-producer FIFO does
+preserve every ordering (leave < Released < successor's consume/fire),
+and releases indeed all landed by +15 ms — but k1 REGRESSED ~3k tok/s
+(28.9-30.6k): the awaited ack is boundary FLOW CONTROL. Pacing each
+retirement behind a worker pass keeps the successor admissions — and
+the next-next cohort's bind/close flood their permit drops unleash —
+arriving in small epochs BEHIND the successors' first fires. Without
+it the whole flood lands at once and the first prefill slipped from
++33 ms to +117 ms behind queued bring-up controls. Documented at the
+call site; `notify_process_terminate` stays awaited.
+
+Result (suite f, 4090): oracles t=32/256 byte-EXACT, units 357/357,
+watchdog 0. k1 2048x32 32.36/32.75/33.26k (instr 33.25k), k2 32.57k,
+k3 32.46k, c0256 28.0/27.9k, 512x512 19.30k. Boundary holes (first
+prefill dispatch after last decode): 67.9 / 33.2 / 27.0 ms (v5:
+56.3/52.3/31.5) — turnovers 2 and 3 now near the floor (release tail
+~24-27 ms + 3-6 ms dispatch), boundary 0 still fat: its ack tail (p50
+26 ms vs 4 ms) sits under the heaviest bring-up flood while the tail
+half of the 2048-herd is still instantiating.
+
+Next levers toward 35.4k: (1) shrink the flood itself — the parked
+batch-register verb is now the lever with teeth (18 channel-register
+control items per process x 512 collapse ~9x; it is what the ack tail
+and boundary 0 are made of); (2) initial gather 49 ms (prewarm
+conveyor); (3) decode glue fusion (~30-60 ms, stretch).

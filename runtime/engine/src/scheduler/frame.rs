@@ -255,6 +255,19 @@ pub(super) struct FramePolicy {
     /// The seal waits for exactly these lanes (removed by first fire and
     /// by every leave path, so a joiner that dies cannot wedge the seal).
     joins_in_flight: BTreeSet<ProcessId>,
+    /// Processes that consumed an execution slot and still hold it. A
+    /// Terminate leave of a member arms `releases_in_flight`: its slot is
+    /// now certain to free (the permit's only exit is the capped teardown,
+    /// which always broadcasts the release after its terminate leave).
+    slotted: BTreeSet<ProcessId>,
+    /// Slots between their holder's terminate leave and the release
+    /// broadcast. The leave is delivered pass-granular while the release
+    /// waits on the teardown task, so at a generation boundary the policy
+    /// briefly sees a zero `pending_slots` balance with departures already
+    /// recorded — without this count the seal would close on the partial
+    /// cohort and split the fleet (the ragged 464/48 boundary). An armed
+    /// release always lands: `-1` per `on_execution_slot_released`.
+    releases_in_flight: u64,
     /// Liveness-only deadline for the current blocked-gather episode.
     strict_watchdog_deadline: Option<Instant>,
     cold_hold_deadline: Option<Instant>,
@@ -281,6 +294,8 @@ impl FramePolicy {
             staged: BTreeSet::new(),
             pending_slots: 0,
             joins_in_flight: BTreeSet::new(),
+            slotted: BTreeSet::new(),
+            releases_in_flight: 0,
             strict_watchdog_deadline: None,
             cold_hold_deadline: None,
             ever_sealed: false,
@@ -411,8 +426,10 @@ impl FramePolicy {
     /// A retiring process's deferred teardown dropped its execution permit
     /// (capped deployments only). While the freed slot stays unconsumed and
     /// a successor is staged, the seal holds — the successor's admission and
-    /// first fire are imminent.
+    /// first fire are imminent. Retires the departure that armed it (the
+    /// terminate leave always precedes its release broadcast).
     pub fn on_execution_slot_released(&mut self) {
+        self.releases_in_flight = self.releases_in_flight.saturating_sub(1);
         self.pending_slots += 1;
     }
 
@@ -425,8 +442,23 @@ impl FramePolicy {
     /// fire here.
     pub fn on_execution_slot_consumed(&mut self, pid: ProcessId) {
         self.pending_slots = self.pending_slots.saturating_sub(1);
+        self.slotted.insert(pid);
         if self.staged.contains(&pid) {
             self.joins_in_flight.insert(pid);
+        }
+    }
+
+    /// A slot holder's Terminate leave arrived: its release broadcast is now
+    /// in flight (the permit's only exit is the capped teardown, which
+    /// leaves first and releases second). The seal treats the imminent slot
+    /// like a freed one — without this, boundary passes between the leave
+    /// and the release see `pending_slots == 0` and close on a partial
+    /// cohort. Idempotent per pid: natural completion sends two Terminate
+    /// leaves (the exit funnel's fire-and-forget plus the teardown's
+    /// awaited one), and only the first may arm.
+    pub fn on_slotted_terminate(&mut self, pid: ProcessId) {
+        if self.slotted.remove(&pid) {
+            self.releases_in_flight += 1;
         }
     }
 
@@ -874,7 +906,8 @@ impl FramePolicy {
                 })
                 .count();
             let joining = !self.joins_in_flight.is_empty()
-                || (self.pending_slots > 0 && !self.staged.is_empty());
+                || ((self.pending_slots > 0 || self.releases_in_flight > 0)
+                    && !self.staged.is_empty());
             if joining || missing > 0 {
                 if !self.sealed.is_empty() {
                     // An epoch is executing: its retirements re-decide and
@@ -894,8 +927,10 @@ impl FramePolicy {
                         "missing_count": missing,
                         "pending_binds": self.pending_binds.values().sum::<usize>(),
                         "pending_slots": self.pending_slots,
+                        "releases_in_flight": self.releases_in_flight,
                         "joins_in_flight": self.joins_in_flight.len(),
                         "staged": self.staged.len(),
+                        "slotted": self.slotted.len(),
                         "awaited_lanes":
                             self.lanes.values().filter(|lane| lane.awaited).count(),
                     }));
@@ -1468,6 +1503,81 @@ mod tests {
         };
         wave0.sort_unstable();
         assert_eq!(wave0, vec![95, 96], "both lanes gathered into one epoch");
+    }
+
+    /// Regression (ragged 464/48 boundary, epoch-drain run e1): between a
+    /// slot holder's Terminate leave and its teardown's release broadcast
+    /// the balance reads zero, and a seal check in that window closed on
+    /// the partial cohort — the fleet split into 464- and 48-wide waves
+    /// for the rest of the run. The departure itself must hold: a leaving
+    /// holder's release is in flight, so its staged successor is gathered.
+    #[test]
+    fn departed_slot_holder_holds_the_seal_until_release_lands() {
+        let mut policy = FramePolicy::new(2, 64, 4096, None);
+        let lane = pid();
+        let predecessor = pid();
+        let successor = pid();
+        // Predecessor consumed its slot from the initial pool and ran.
+        policy.on_execution_slot_consumed(predecessor);
+        // The survivor's next fire is queued; the successor is staged.
+        policy.on_fire_enqueued(stamp(lane, 0, 0, 1), Some(lane), 95, 1, 1);
+        policy.on_bind_enqueued(Some(successor));
+        policy.on_bind_completed(Some(successor));
+        // Terminate leave lands pass-granular, release still in flight.
+        policy.on_slotted_terminate(predecessor);
+        policy.on_lane_leave(predecessor, true);
+        policy.on_process_leave(predecessor);
+        let queued: HashSet<u64> = [95].into_iter().collect();
+        match drive_past_cold_hold(&mut policy, &queued) {
+            FramePlan::Hold(_) => {}
+            plan => panic!("a departed slot holder's in-flight release must hold, got {plan:?}"),
+        }
+        // The release lands: the hold converts to the freed-slot form,
+        // then to the identity-paired join, then the fire seals dense.
+        policy.on_execution_slot_released();
+        match drive_past_cold_hold(&mut policy, &queued) {
+            FramePlan::Hold(_) => {}
+            plan => panic!("freed slot with staged taker must keep holding, got {plan:?}"),
+        }
+        policy.on_execution_slot_consumed(successor);
+        policy.on_fire_enqueued(stamp(successor, 0, 0, 1), Some(successor), 96, 1, 1);
+        let queued: HashSet<u64> = [95, 96].into_iter().collect();
+        let FramePlan::Dispatch(mut wave) = drive_past_cold_hold(&mut policy, &queued) else {
+            panic!("successor arrived: the seal must proceed dense");
+        };
+        wave.sort_unstable();
+        assert_eq!(wave, vec![95, 96], "cohort gathered across the departure");
+    }
+
+    /// The departure hold arms only for actual slot holders, exactly once:
+    /// a Terminate for a never-admitted pid (or a duplicate leave from the
+    /// exit funnel's two notification paths) leaves no phantom hold, and a
+    /// staged successor whose predecessor's release was already consumed
+    /// elsewhere does not re-hold the seal.
+    #[test]
+    fn terminate_arms_only_live_slot_holders() {
+        let mut policy = FramePolicy::new(2, 64, 4096, None);
+        let lane = pid();
+        let holder = pid();
+        let bystander = pid();
+        policy.on_execution_slot_consumed(holder);
+        policy.on_fire_enqueued(stamp(lane, 0, 0, 1), Some(lane), 95, 1, 1);
+        policy.on_bind_enqueued(Some(bystander));
+        // Never-admitted pid and a duplicate leave: neither may arm.
+        policy.on_slotted_terminate(bystander);
+        policy.on_slotted_terminate(holder);
+        policy.on_slotted_terminate(holder);
+        policy.on_execution_slot_released();
+        policy.on_execution_slot_consumed(bystander);
+        policy.on_fire_enqueued(stamp(bystander, 0, 0, 1), Some(bystander), 96, 1, 1);
+        let queued: HashSet<u64> = [95, 96].into_iter().collect();
+        assert!(
+            matches!(
+                drive_past_cold_hold(&mut policy, &queued),
+                FramePlan::Dispatch(_)
+            ),
+            "a retired departure must leave no phantom hold"
+        );
     }
 
     /// Preloaded free capacity gathers the initial fleet: while a free

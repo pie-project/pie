@@ -687,6 +687,15 @@ impl Process {
                     Err(format!("Call error: {call_err}"))
                 }
             };
+            if crate::scheduler::fire_timing_enabled() {
+                crate::scheduler::fire_timing_write(&serde_json::json!({
+                    "schema": 1,
+                    "source": "runtime",
+                    "event": "guest_main_returned",
+                    "process_id": process_id,
+                    "returned_us": crate::scheduler::fire_timing_now_us(),
+                }));
+            }
             admission_wait_us = store.data().admission_wait_us();
             result
         }

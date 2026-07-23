@@ -67,6 +67,9 @@ pub(crate) async fn notify_pipeline_close(pid: ProcessId) {
     notify_pipeline_leave_and_wait(pid, LeaveKind::Close).await;
 }
 
+/// Awaited on purpose: the ack paces deferred teardown behind a scheduler
+/// pass — see the capped branch of `defer_resource_teardown` for the
+/// boundary flow-control rationale (removing the await regressed k1 ~3k).
 pub(crate) async fn notify_process_terminate(pid: ProcessId) {
     notify_pipeline_leave_and_wait(pid, LeaveKind::Terminate).await;
 }
@@ -2146,7 +2149,17 @@ impl BatchScheduler {
             let probe = super::fire_timing_enabled();
             let pass_started = Instant::now();
             let mut mailbox_items: u32 = 0;
-            while let Ok(item) = rx.try_recv() {
+            // Epoch drain: a pass consumes only what was queued when it began.
+            // A sustained producer flood (the next cohort's bring-up at a
+            // generation boundary) otherwise keeps `try_recv` non-empty for
+            // tens of milliseconds and holds retire/dispatch hostage behind
+            // the live stream — the seal-opening events (leaves, slot
+            // releases, first fires) then reach the policy tail-late and the
+            // boundary wave dispatches when the mailbox finally runs dry
+            // instead of the pass after the last join lands.
+            let mailbox_epoch = rx.len();
+            for _ in 0..mailbox_epoch {
+                let Ok(item) = rx.try_recv() else { break };
                 progress = true;
                 mailbox_items += 1;
                 if let SchedulerItem::DebugDump { response } = item {
@@ -2523,6 +2536,10 @@ impl BatchScheduler {
             }
             SchedulerItem::PipelineLeave(pid, kind, response) => {
                 if kind == LeaveKind::Terminate {
+                    // A departing slot holder's release broadcast is now in
+                    // flight; the seal keeps gathering its successor (the
+                    // ragged-boundary guard — see on_slotted_terminate).
+                    frame_policy.on_slotted_terminate(pid);
                     terminated_processes.insert(pid);
                     let protected = in_flight_control
                         .as_ref()

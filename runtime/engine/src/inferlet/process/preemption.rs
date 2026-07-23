@@ -77,13 +77,33 @@ pub(crate) fn defer_resource_teardown(
         return;
     };
     runtime.spawn(async move {
+        let timing = crate::scheduler::fire_timing_enabled();
+        let task_started_us = if timing {
+            crate::scheduler::fire_timing_now_us()
+        } else {
+            0
+        };
         if capped_execution {
+            // The awaited ack is boundary FLOW CONTROL, not just ordering
+            // (run g measured the fire-and-forget variant: releases all
+            // landed by +15 ms, yet first prefill slipped to +117 ms and
+            // k1 lost ~3k tok/s). Waiting for the scheduler to process the
+            // leave paces each retirement behind a worker pass, which keeps
+            // the successor cohort's admissions — and therefore the
+            // NEXT-next cohort's bind/close flood that their permit drops
+            // unleash — arriving in small epochs BEHIND the successors'
+            // first fires instead of all at once ahead of them.
             crate::scheduler::worker::notify_process_terminate(process_id).await;
         } else {
             for pipeline_id in snapshot.departed_pipeline_ids {
                 crate::scheduler::worker::notify_pipeline_close(pipeline_id).await;
             }
         }
+        let terminate_acked_us = if timing {
+            crate::scheduler::fire_timing_now_us()
+        } else {
+            0
+        };
         for fires in snapshot.pipelines {
             let _finalize_guard = fires.finalize_guard().await;
             loop {
@@ -99,6 +119,19 @@ pub(crate) fn defer_resource_teardown(
                     );
                 }
             }
+        }
+        if timing {
+            let finalized_us = crate::scheduler::fire_timing_now_us();
+            crate::scheduler::fire_timing_write(&serde_json::json!({
+                "schema": 1,
+                "source": "runtime",
+                "event": "process_teardown",
+                "process_id": process_id,
+                "task_started_us": task_started_us,
+                "terminate_ack_us": terminate_acked_us - task_started_us,
+                "finalize_us": finalized_us - terminate_acked_us,
+                "released_us": finalized_us,
+            }));
         }
         if capped_execution {
             // Announce the slot BEFORE the permit drops (with `context`

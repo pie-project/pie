@@ -91,7 +91,18 @@ pub struct ProcessCtx {
 
 impl Drop for ProcessCtx {
     fn drop(&mut self) {
+        let timing = crate::scheduler::fire_timing_enabled();
+        let drop_entered_us = if timing {
+            crate::scheduler::fire_timing_now_us()
+        } else {
+            0
+        };
         let _ = std::fs::remove_dir_all(&self.scratch_dir);
+        let scratch_removed_us = if timing {
+            crate::scheduler::fire_timing_now_us()
+        } else {
+            0
+        };
         let resources = std::mem::replace(&mut self.resource_table, ResourceTable::new());
         let execution_permit = self.execution_permit.take();
         let bind_permit = self.bind_permit.take();
@@ -104,6 +115,16 @@ impl Drop for ProcessCtx {
             execution_permit,
             bind_permit,
         );
+        if timing {
+            crate::scheduler::fire_timing_write(&serde_json::json!({
+                "schema": 1,
+                "source": "runtime",
+                "event": "process_drop",
+                "process_id": self.id,
+                "drop_entered_us": drop_entered_us,
+                "scratch_rm_us": scratch_removed_us - drop_entered_us,
+            }));
+        }
     }
 }
 
