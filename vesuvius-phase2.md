@@ -539,3 +539,57 @@ arm and the §6.2 audit stand regardless — they gate any future
 frame-scoped settlement, and the audit's Q1 fact (stream settlement is
 {SUCCESS, RETRY} only) plus the retry-auto-flush rule are what make the
 parked machinery safe to ship dormant.
+
+## Lifecycle storm, round 1 (operator directive — landed)
+
+Target (attribution item 1): 512-lane generation boundaries stalled
+171–270 ms ×3–4 per 2048×32 run (~31% of steady wall), ending 1–3 ms
+after the LAST `register_channels_bind` control finished — 1,024
+register controls serialized on the driver lane behind and between
+~10.2k teardown controls, with `driver_bind` p50 79 ms of pure
+queueing. Four coordinated changes:
+
+1. **Close coalescing** (`QueuedItem::CloseChannels`): consecutive
+   channel closes ride one lane round trip (per-id driver calls
+   inside; bounded at 512/batch) — a cohort's ~9.2k close posts become
+   ~0.5–2.5k.
+2. **Binds overtake queued closes** (`queue_bind_control`): safe
+   because a bind and a queued close always target different
+   instances/channels (ids never reused; a close only posts after its
+   own bind committed; a cell is only planned for registration while
+   it has no endpoint).
+3. **Boundary close hold** — the decisive one: while any bind is in
+   assembly (`FramePolicy::has_pending_binds`, the same signal that
+   holds the seal), teardown closes rotate WITHOUT dispatching and
+   WITHOUT claiming progress (re-checked on the bind-completed wake);
+   they drain during the next generation's execution. Queue
+   reordering alone was insufficient — closes ARRIVE interleaved with
+   binds and each worker pass flushes its controls into the lane FIFO
+   (measured: 74.5 ms of close occupancy still inside the register
+   span). Shutdown never holds.
+4. **Driver registry sized for close-lag overlap**: slot reserve ×32 →
+   ×48 (both generations' slots briefly live at once; a mid-ramp
+   `grow()` costs a device-wide sync) and the inactive-storage byte
+   caps load-scaled (`cap_slots_ × 8 KiB` vs the fixed 64 MiB cliff
+   that fed the boundary cudaFree storm).
+
+Measured (4090, k=1 2048×32 c512): stalls 853 → 653 ms; close
+occupancy inside the register span 32–46 ms → **0.0 ms in every
+stall**; first-register delay 76–88 ms → 5–26 ms; throughput
+25.5–26.4k → **26.8–27.5k (median 27.4k, ≈85% of vLLM's 32.2k)**; k2
+2048×32 23.0–23.7 → 24.3–24.9k; c0/256 27.4k and 512×512 19.2k
+unchanged; oracles exact; zero watchdog; zero registry grows.
+
+Remaining boundary structure (~140–175 ms per stall, now almost pure
+register work): per control (p50 120–140 µs × 1,024) — ~59 µs channel
+registrations (9× ~6.6 µs: init/mirror/words), ~47 µs
+`bind_instance` (`instance_us`), ~26 µs FFI framing + entry hooks;
+plus 5–26 ms herd bring-up before the first register. Known trade
+recorded: the close hold defers slot retirement past the same
+boundary's registrations, so `cell_grew` rose 19–20k → 29.4k per run
+(~42 ms of fresh-alloc cost partially offsetting the win; steady-state
+one-cohort-lag reuse should cover most of it and only partially does —
+the registry's reuse keying is the follow-up). Candidate next levers,
+by measured size: batched/cohort register controls (framing ~27
+ms/boundary), registry reuse keying (~40 ms/run), `bind_instance`
+instance_us (~48 ms/boundary), herd bring-up window.

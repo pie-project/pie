@@ -1387,19 +1387,21 @@ impl DriverLane {
                     LaneCommit::None
                 }
             },
-            QueuedItem::CloseChannel { id } => {
-                let result = if !channels.contains(&id) {
-                    Err(anyhow!("channel {id} is unknown or stale"))
-                } else {
-                    match driver.as_mut() {
-                        Some(driver) => driver.close_channel(id).map(|()| {
-                            channels.remove(&id);
-                        }),
-                        None => Err(anyhow!("driver has no backend installed")),
+            QueuedItem::CloseChannels { ids } => {
+                for id in ids {
+                    let result = if !channels.contains(&id) {
+                        Err(anyhow!("channel {id} is unknown or stale"))
+                    } else {
+                        match driver.as_mut() {
+                            Some(driver) => driver.close_channel(id).map(|()| {
+                                channels.remove(&id);
+                            }),
+                            None => Err(anyhow!("driver has no backend installed")),
+                        }
+                    };
+                    if let Err(err) = result {
+                        tracing::warn!(channel_id = id, ?err, "scheduler close_channel failed");
                     }
-                };
-                if let Err(err) = result {
-                    tracing::warn!(channel_id = id, ?err, "scheduler close_channel failed");
                 }
                 LaneCommit::None
             }
@@ -1562,8 +1564,11 @@ enum QueuedItem {
         id: u64,
         pacing_wait_id: u64,
     },
-    CloseChannel {
-        id: u64,
+    /// A coalesced run of channel closes: one lane round trip retires the
+    /// whole batch (per-id driver calls inside), so a 512-lane cohort's
+    /// ~9.2k teardown closes cost ~512 control posts instead of ~9.2k.
+    CloseChannels {
+        ids: Vec<u64>,
     },
 }
 
@@ -2349,7 +2354,7 @@ impl BatchScheduler {
                 QueuedItem::CopyState { .. } => "CopyState".to_string(),
                 QueuedItem::ResizePool { .. } => "ResizePool".to_string(),
                 QueuedItem::CloseInstance { id, .. } => format!("CloseInstance {id}"),
-                QueuedItem::CloseChannel { id, .. } => format!("CloseChannel {id}"),
+                QueuedItem::CloseChannels { ids } => format!("CloseChannels x{}", ids.len()),
             };
             let _ = writeln!(out, "  {line}");
         }
@@ -2613,7 +2618,17 @@ impl BatchScheduler {
                 pending.push_back(QueuedItem::CloseInstance { id, pacing_wait_id });
             }
             SchedulerItem::CloseChannel { id } => {
-                pending.push_back(QueuedItem::CloseChannel { id });
+                // Coalesce teardown runs: consecutive channel closes ride one
+                // control post. Bounded so a batch's lane occupancy stays a
+                // fraction of a wave (~3-6 us per close driver-side).
+                const CLOSE_CHANNEL_BATCH_MAX: usize = 512;
+                if let Some(QueuedItem::CloseChannels { ids }) = pending.back_mut()
+                    && ids.len() < CLOSE_CHANNEL_BATCH_MAX
+                {
+                    ids.push(id);
+                } else {
+                    pending.push_back(QueuedItem::CloseChannels { ids: vec![id] });
+                }
             }
             // Handled on dequeue in the run loop (like DebugDump) before
             // enqueue_item is reached.
@@ -2764,7 +2779,7 @@ impl BatchScheduler {
                     | QueuedItem::RegisterChannels { .. }
                     | QueuedItem::BindInstance { .. }
                     | QueuedItem::RegisterChannelsBind { .. }
-                    | QueuedItem::CloseChannel { .. }
+                    | QueuedItem::CloseChannels { .. }
             )
     }
 
@@ -2795,14 +2810,31 @@ impl BatchScheduler {
                 | QueuedItem::BindInstance { .. }
                 | QueuedItem::RegisterChannelsBind { .. }
                 | QueuedItem::CloseInstance { .. }
-                | QueuedItem::CloseChannel { .. }
+                | QueuedItem::CloseChannels { .. }
         )
     }
 
     fn queue_bind_control(pending: &mut VecDeque<QueuedItem>, item: QueuedItem) {
+        // Fresh-lane bring-up outranks dead-lane teardown: a bind inserted
+        // behind a cohort's close storm serializes the wait-all seal behind
+        // thousands of teardown controls (measured p50 79 ms of pure
+        // queueing at a 512-lane boundary). A bind and a QUEUED close always
+        // target different instances/channels — ids are never reused, a
+        // close only posts after its own bind committed, and a cell is only
+        // planned for registration while it has no endpoint — so jumping
+        // closes preserves every ordering that matters; the closes drain
+        // during the next generation's execution instead. Bind-vs-bind order
+        // is preserved (insertion at the end of the leading non-close
+        // lifecycle run).
         let index = pending
             .iter()
-            .position(|queued| !Self::lifecycle_control(queued))
+            .position(|queued| {
+                !Self::lifecycle_control(queued)
+                    || matches!(
+                        queued,
+                        QueuedItem::CloseInstance { .. } | QueuedItem::CloseChannels { .. }
+                    )
+            })
             .unwrap_or(pending.len());
         pending.insert(index, item);
     }
@@ -2870,6 +2902,14 @@ impl BatchScheduler {
         // Busy-close rotations this pass: bounded so a queue of nothing but
         // busy closes breaks out instead of spinning.
         let mut close_rotations = 0usize;
+        // Cohort-boundary close hold: while any bind is in assembly (the
+        // seal is bind-held), teardown closes yield the driver lane to the
+        // fresh cohort's registrations — queue-position reordering alone
+        // cannot do this, because closes ARRIVE interleaved with binds and
+        // each worker pass flushes its controls to the lane FIFO. Held
+        // closes rotate and drain during the next generation's execution.
+        // Shutdown never holds (the drain must retire everything).
+        let hold_closes = !stopping && frame_policy.has_pending_binds();
         loop {
             let Some(item) = pending.front() else {
                 break;
@@ -2898,6 +2938,27 @@ impl BatchScheduler {
                         break;
                     }
                     let id = *id;
+                    if hold_closes {
+                        // Held for the boundary: rotate WITHOUT claiming
+                        // progress (a rotation changes nothing dispatchable;
+                        // the bind-completed lane reply that empties
+                        // `pending_binds` is the wake that re-checks).
+                        if close_rotations >= pending.len()
+                            || !pending.iter().skip(1).any(|item| {
+                                !matches!(
+                                    item,
+                                    QueuedItem::CloseInstance { .. }
+                                        | QueuedItem::CloseChannels { .. }
+                                )
+                            })
+                        {
+                            break;
+                        }
+                        close_rotations += 1;
+                        let item = pending.pop_front().expect("close front");
+                        pending.push_back(item);
+                        continue;
+                    }
                     let busy = instances
                         .get(&id)
                         .is_some_and(|tracked| tracked.in_flight != 0)
@@ -2921,10 +2982,13 @@ impl BatchScheduler {
                     // only move BACKWARD, so it never overtakes its own
                     // instance's queued work.
                     if close_rotations >= pending.len()
-                        || !pending
-                            .iter()
-                            .skip(1)
-                            .any(|item| !matches!(item, QueuedItem::CloseInstance { .. }))
+                        || !pending.iter().skip(1).any(|item| {
+                            !matches!(
+                                item,
+                                QueuedItem::CloseInstance { .. }
+                                    | QueuedItem::CloseChannels { .. }
+                            )
+                        })
                     {
                         break;
                     }
@@ -2932,6 +2996,24 @@ impl BatchScheduler {
                     let item = pending.pop_front().expect("close front");
                     pending.push_back(item);
                     progress = true;
+                }
+                QueuedItem::CloseChannels { .. } if hold_closes => {
+                    // Same bounded rotation as a held instance close; no
+                    // progress claim (see the CloseInstance hold branch).
+                    if close_rotations >= pending.len()
+                        || !pending.iter().skip(1).any(|item| {
+                            !matches!(
+                                item,
+                                QueuedItem::CloseInstance { .. }
+                                    | QueuedItem::CloseChannels { .. }
+                            )
+                        })
+                    {
+                        break;
+                    }
+                    close_rotations += 1;
+                    let item = pending.pop_front().expect("close front");
+                    pending.push_back(item);
                 }
                 // Single control slot: a settling copy/resize blocks the
                 // next control (the slot only ever holds async-completing
@@ -2975,7 +3057,7 @@ impl BatchScheduler {
             QueuedItem::CopyState { .. } => "copy_state",
             QueuedItem::ResizePool { .. } => "resize_pool",
             QueuedItem::CloseInstance { .. } => "close_instance",
-            QueuedItem::CloseChannel { .. } => "close_channel",
+            QueuedItem::CloseChannels { .. } => "close_channels",
         }
     }
 

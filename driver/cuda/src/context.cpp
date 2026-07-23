@@ -1341,12 +1341,15 @@ int Context::Impl::load_model(
     // scale with concurrent instances (measured on the c0 bench: 256
     // processes x ~18 slots ~= 4.6k vs the 1024 default), and every
     // mid-ramp grow() costs a device-wide sync on the lane thread.
-    // x32 is the audited per-request slot budget (two passes x 9 slots,
-    // sampling rng included) with headroom; the registry rounds up to
-    // its power-of-two ladder. ~8k slots is well under 1 MB of device
-    // arrays.
+    // x48 = the audited per-request slot budget (two passes x 9 slots,
+    // sampling rng included, x32) plus headroom for one cohort boundary's
+    // close-lag overlap — teardown closes now drain BEHIND the fresh
+    // cohort's binds, so both generations' slots are briefly live at
+    // once. The registry rounds up to its power-of-two ladder; ~24k
+    // slots stays under 2 MB of device arrays, and every mid-ramp grow()
+    // costs a device-wide sync on the lane thread.
     registry_->dispatch().reserve_channel_slots(static_cast<std::uint32_t>(
-        std::max(1024, mem_plan.capacity.max_forward_requests * 32)));
+        std::max(1024, mem_plan.capacity.max_forward_requests * 48)));
     const bool complete_attention_hook_coverage =
         tp_size_ == 1
 #ifndef PIE_CUDA_QWEN_ONLY

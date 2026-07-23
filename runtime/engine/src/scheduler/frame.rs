@@ -349,6 +349,13 @@ impl FramePolicy {
 
     /// A bind control completed, whether successfully or with an error. The
     /// lane itself joins the wait-set at its first stamped fire.
+    /// Whether any lane's bind is still in assembly (the seal is
+    /// bind-held): the cohort-boundary window in which the worker defers
+    /// teardown closes so fresh-lane bring-up owns the driver lane.
+    pub fn has_pending_binds(&self) -> bool {
+        !self.pending_binds.is_empty()
+    }
+
     pub fn on_bind_completed(&mut self, pid: Option<ProcessId>) {
         if let Some(pid) = pid
             && let Some(count) = self.pending_binds.get_mut(&pid)

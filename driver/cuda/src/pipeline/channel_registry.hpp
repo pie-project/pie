@@ -983,13 +983,20 @@ class DeviceChannelRegistry {
         // whose whole working set churns at once (256-process turnover
         // releases ~4.6k slots) must recycle as pure bookkeeping, not
         // fall off a fixed cliff into real frees on the lane thread.
+        // The BYTE caps scale with the same load: at a 512-lane cohort
+        // boundary ~9.2k slots retire at once, and a fixed 64 MiB cliff
+        // released the tail into a cudaFree storm whose refill then paid
+        // fresh allocations on the next cohort's registrations.
         const std::size_t max_inactive_slots =
             std::max<std::size_t>(kMaxInactiveSlots, cap_slots_);
+        const std::size_t max_inactive_bytes = std::max<std::size_t>(
+            kMaxInactiveDeviceBytes,
+            static_cast<std::size_t>(cap_slots_) * kInactiveBytesPerSlot);
         if (inactive_slots_ >= max_inactive_slots ||
-            device_bytes > kMaxInactiveDeviceBytes - std::min(
-                inactive_device_bytes_, kMaxInactiveDeviceBytes) ||
-            host_bytes > kMaxInactiveHostBytes - std::min(
-                inactive_host_bytes_, kMaxInactiveHostBytes)) {
+            device_bytes > max_inactive_bytes - std::min(
+                inactive_device_bytes_, max_inactive_bytes) ||
+            host_bytes > max_inactive_bytes - std::min(
+                inactive_host_bytes_, max_inactive_bytes)) {
             release_slot_storage(slot);
         } else {
             retained_storage_[slot] = 1;
@@ -1183,8 +1190,10 @@ class DeviceChannelRegistry {
 #endif
     static constexpr std::size_t kMaxInactiveDeviceBytes =
         64ull * 1024ull * 1024ull;
-    static constexpr std::size_t kMaxInactiveHostBytes =
-        64ull * 1024ull * 1024ull;
+    // Per-slot byte budget for the load-scaled retention cap (device and
+    // host each): 16k slots -> 128 MiB, bounded by the registry's own
+    // load sizing rather than a fleet-independent constant.
+    static constexpr std::size_t kInactiveBytesPerSlot = 8ull * 1024ull;
 
     std::uint8_t*  d_full_ = nullptr;
     std::uint32_t* d_head_ = nullptr;
