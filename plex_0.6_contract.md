@@ -674,8 +674,15 @@ The host MUST:
 6. return the recorded semantic result for a duplicate successful delivery
    without reinvoking the guest or replaying actions.
 
-If guest execution, validation, or commit fails, the delivery is not recorded
-as successful and MAY be retried with the same delivery ID.
+A cancelled request or group cleanup MUST correlate either with a successful
+PLEX cancellation action or with a matching terminal record whose
+`facts.initiator` is `host`. This separates policy-requested cancellation from
+an authenticated engine/client cancellation.
+
+Unavailable feedback and non-retryable policy fallback still commit an empty
+state update, terminal cleanup, and the returned semantic result atomically.
+State conflicts do not commit or record the delivery and MAY be retried with
+the same delivery ID.
 
 ## 13. Host imports and mechanics
 

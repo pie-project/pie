@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use pie_plex::Document;
 use pie_plex::v0_6::{
     FeedbackContext, FeedbackSubject, GroupStatus, MechanicId, Operation, OutcomeKind,
-    RequestStatus,
+    RequestStatus, StateUpdate,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -189,19 +189,77 @@ impl PlexRuntimeV0_6 {
             }
             Invocation::Unavailable => {
                 complete_non_retryable(&context, &self.opportunities, &self.cache_episodes)?;
-                Ok(json!({
+                let outcome = json!({
                     "status": "unavailable",
                     "operation": context.operation(),
                     "attachment_generation": registry.generation(),
-                }))
+                });
+                self.commit_feedback_outcome(
+                    &context,
+                    &snapshot,
+                    &event.cleanup,
+                    &action_updates,
+                    outcome,
+                )
             }
             Invocation::FallbackRequired(failure) => {
-                if failure.kind != InvocationFailureKind::StateConflict {
-                    complete_non_retryable(&context, &self.opportunities, &self.cache_episodes)?;
+                if failure.kind == InvocationFailureKind::StateConflict {
+                    return Ok(fallback_outcome(failure.kind, failure.message));
                 }
-                Ok(fallback_outcome(failure.kind, failure.message))
+                complete_non_retryable(&context, &self.opportunities, &self.cache_episodes)?;
+                self.commit_feedback_outcome(
+                    &context,
+                    &snapshot,
+                    &event.cleanup,
+                    &action_updates,
+                    fallback_outcome(failure.kind, failure.message),
+                )
             }
         }
+    }
+
+    fn commit_feedback_outcome(
+        &self,
+        context: &OperationContextV0_6,
+        snapshot: &crate::StateSnapshotV0_6,
+        cleanup: &TerminalCleanupV0_6,
+        action_updates: &[ActionFeedbackUpdateV0_6],
+        outcome: Document,
+    ) -> Result<Document, PlexErrorV0_6> {
+        let OperationContextV0_6::Feedback(feedback) = context else {
+            debug_assert!(cleanup.requests.is_empty() && cleanup.groups.is_empty());
+            return Ok(outcome);
+        };
+        let feedback_commit = FeedbackCommitV0_6 {
+            delivery_id: feedback.delivery_id.clone(),
+            result: outcome.clone(),
+            maximum_deliveries: self.registry.max_feedback_deliveries(),
+        };
+        let empty_update = StateUpdate {
+            shared: None,
+            groups: Vec::new(),
+            requests: Vec::new(),
+        };
+        match self
+            .backend
+            .commit(snapshot, &empty_update, Some(&feedback_commit), cleanup)
+        {
+            Ok(()) => {}
+            Err(StateBackendErrorV0_6::DuplicateFeedback(delivery_id)) => {
+                return self.backend.feedback_result(&delivery_id)?.ok_or_else(|| {
+                    PlexErrorV0_6::Backend("duplicate feedback has no recorded result".into())
+                });
+            }
+            Err(StateBackendErrorV0_6::RevisionConflict { .. }) => {
+                return Ok(fallback_outcome(
+                    InvocationFailureKind::StateConflict,
+                    "policy state changed during invocation",
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        }
+        self.actions.lock().unwrap().apply_feedback(action_updates);
+        Ok(outcome)
     }
 
     pub fn invoke_json(&self, event_json: &str) -> Result<String, PlexErrorV0_6> {
@@ -384,6 +442,11 @@ fn validate_cleanup_context(
             )));
         }
         if terminal.status == RequestStatus::Cancelled
+            && !has_host_initiated_feedback(
+                feedback,
+                &FeedbackSubject::Request(terminal.request_id.clone()),
+                expected,
+            )
             && !action_updates.iter().any(|update| {
                 update.outcome == ActionTerminalStatusV0_6::Succeeded
                     && update.record.method == "pie.request.cancel@1"
@@ -415,6 +478,11 @@ fn validate_cleanup_context(
             )));
         }
         if terminal.status == GroupStatus::Cancelled
+            && !has_host_initiated_feedback(
+                feedback,
+                &FeedbackSubject::WorkGroup(terminal.group_id.clone()),
+                expected,
+            )
             && !action_updates.iter().any(|update| {
                 update.outcome == ActionTerminalStatusV0_6::Succeeded
                     && update.record.method == "pie.group.cancel@1"
@@ -618,6 +686,18 @@ fn has_feedback_outcome(
         .records
         .iter()
         .any(|record| &record.subject == subject && record.outcome == outcome)
+}
+
+fn has_host_initiated_feedback(
+    feedback: &FeedbackContext,
+    subject: &FeedbackSubject,
+    outcome: OutcomeKind,
+) -> bool {
+    feedback.records.iter().any(|record| {
+        &record.subject == subject
+            && record.outcome == outcome
+            && record.facts["initiator"].as_str() == Some("host")
+    })
 }
 
 fn opportunity_id(context: &OperationContextV0_6) -> Option<&pie_plex::v0_6::OpportunityId> {

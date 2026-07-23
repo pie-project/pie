@@ -18,6 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     check_route_successes(&packages)?;
     check_admit_schedule_cache_feedback(&packages)?;
     check_negative_rollback(&packages)?;
+    check_unavailable_feedback_cleanup(&packages)?;
     check_queries_and_actions(&packages)?;
     check_existing_papers(&packages)?;
     check_wave_a(&packages)?;
@@ -27,6 +28,62 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     check_deterministic_replay(&packages)?;
 
     println!("PLEX v0.6 policy fixtures passed");
+    Ok(())
+}
+
+fn check_unavailable_feedback_cleanup(packages: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = runtime(packages, "plex_paper_helium", &[], None)?;
+    assert_success(&runtime.invoke(schedule_event("A", "G", json!({})))?);
+    let event = json!({
+        "api_version": "pie.plex.engine@2",
+        "operation": "feedback",
+        "context": {
+            "delivery_id": "helium-terminal",
+            "records": [{
+                "subject": {"kind": "request", "value": "A"},
+                "outcome": "completed",
+                "facts": {}
+            }]
+        },
+        "cleanup": {
+            "requests": [{"request_id": "A", "status": "completed"}],
+            "groups": []
+        }
+    });
+    let outcome = runtime.invoke(event.clone())?;
+    assert_eq!(outcome["status"], "unavailable");
+    assert!(
+        runtime
+            .backend()
+            .read_request(&RequestId::from("A"))
+            .is_err()
+    );
+    assert_eq!(runtime.invoke(event)?, outcome);
+
+    assert_success(&runtime.invoke(schedule_event("B", "H", json!({})))?);
+    let cancelled = runtime.invoke(json!({
+        "api_version": "pie.plex.engine@2",
+        "operation": "feedback",
+        "context": {
+            "delivery_id": "helium-cancelled",
+            "records": [{
+                "subject": {"kind": "request", "value": "B"},
+                "outcome": "cancelled",
+                "facts": {"initiator": "host"}
+            }]
+        },
+        "cleanup": {
+            "requests": [{"request_id": "B", "status": "cancelled"}],
+            "groups": []
+        }
+    }))?;
+    assert_eq!(cancelled["status"], "unavailable");
+    assert!(
+        runtime
+            .backend()
+            .read_request(&RequestId::from("B"))
+            .is_err()
+    );
     Ok(())
 }
 
