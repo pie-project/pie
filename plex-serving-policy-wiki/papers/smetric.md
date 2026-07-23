@@ -41,6 +41,17 @@ Load-balance first turns, use cache affinity for follow-ups, migrate tail outlie
 
 Named datasets/workloads identified from the primary text or manual audit.
 
+<!-- plex-v0.6-replication:start -->
+## PLEX v0.6 replication status
+
+- Component: `plex_paper_smetric`
+- Operations: `route`
+- Evidence: `policy-kernel-reproduction`
+- Validation: `passing`
+- Metadata: [`tests/policies/replications/smetric/metadata.json`](../../tests/policies/replications/smetric/metadata.json)
+- Deferred mechanics: physical migration
+<!-- plex-v0.6-replication:end -->
+
 ## Suggested citation
 
 Jiahao Wang, Kaizhan Lin, Kaixi Zhang, Jinbo Han, Xingda Wei, Sijie Shen, et al. “SMetric: Rethink LLM Scheduling for Serving Agents with Balanced Session-centric Scheduling.” arXiv preprint, 2026, 2026. https://arxiv.org/abs/2607.08565.

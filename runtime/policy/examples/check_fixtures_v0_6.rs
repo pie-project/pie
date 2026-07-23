@@ -4,7 +4,7 @@ use std::sync::Arc;
 use pie_plex::v0_6::RequestId;
 use pie_policy::{
     DictionaryQueryHandler, HostSupportV0_6, PackageLimits, PlexRuntimeV0_6, PolicyPackageV0_6,
-    QueryHandler,
+    QueryHandler, ReplayRunnerV0_6,
 };
 use serde_json::{Value, json};
 
@@ -24,8 +24,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     check_wave_c(&packages)?;
     check_wave_d(&packages)?;
     check_replication_artifacts(&packages)?;
+    check_deterministic_replay(&packages)?;
 
     println!("PLEX v0.6 policy fixtures passed");
+    Ok(())
+}
+
+fn check_deterministic_replay(packages: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let runner = ReplayRunnerV0_6::new(
+        std::fs::read(packages.join("plex_coordinated.plexpkg"))?,
+        HostSupportV0_6::default(),
+    );
+    let report = runner.verify_deterministic(&[
+        admit_event("replay", "replay-group", 0),
+        route_event("replay", "replay-group", "replay-route", json!({})),
+    ])?;
+    assert_eq!(report.outcomes.len(), 2);
+    assert_eq!(report.state_metrics.commits, 2);
     Ok(())
 }
 
@@ -46,10 +61,7 @@ fn check_wave_d(packages: &Path) -> Result<(), Box<dyn std::error::Error>> {
         let runtime = runtime(packages, package, &["request.rebalance@1"], None)?;
         let outcome = runtime.invoke(route_event("A", "G", package, facts))?;
         assert_success(&outcome);
-        assert_eq!(
-            outcome["actions"][0]["method"],
-            "pie.request.rebalance@1"
-        );
+        assert_eq!(outcome["actions"][0]["method"], "pie.request.rebalance@1");
     }
 
     let thunder = runtime(
@@ -64,30 +76,15 @@ fn check_wave_d(packages: &Path) -> Result<(), Box<dyn std::error::Error>> {
         json!({"tool_ready": true, "migrate_target": "node-a"}),
     ))?;
     assert_success(&thundered);
-    assert_eq!(
-        thundered["actions"][0]["method"],
-        "pie.request.rebalance@1"
-    );
+    assert_eq!(thundered["actions"][0]["method"], "pie.request.rebalance@1");
 
-    let pythia = runtime(
-        packages,
-        "plex_paper_pythia",
-        &["cache.prefetch@1"],
-        None,
-    )?;
+    let pythia = runtime(packages, "plex_paper_pythia", &["cache.prefetch@1"], None)?;
     let prefetched = pythia.invoke(cache_event(true, false))?;
     assert_success(&prefetched);
-    assert_eq!(
-        prefetched["actions"][0]["method"],
-        "pie.cache.prefetch@1"
-    );
+    assert_eq!(prefetched["actions"][0]["method"], "pie.cache.prefetch@1");
 
     let parrot = runtime(packages, "plex_paper_parrot", &[], None)?;
-    assert_success(&parrot.invoke(schedule_event(
-        "A",
-        "G",
-        json!({"dependency_ready": true}),
-    ))?);
+    assert_success(&parrot.invoke(schedule_event("A", "G", json!({"dependency_ready": true})))?);
 
     let conserve = runtime(packages, "plex_paper_conserve", &[], None)?;
     let placed = conserve.invoke(json!({
@@ -222,12 +219,7 @@ fn check_wave_c(packages: &Path) -> Result<(), Box<dyn std::error::Error>> {
         json!({"client_id": "client-a"}),
     ))?);
 
-    let infercept = runtime(
-        packages,
-        "plex_paper_infercept",
-        &["cache.swap@1"],
-        None,
-    )?;
+    let infercept = runtime(packages, "plex_paper_infercept", &["cache.swap@1"], None)?;
     let swapped = infercept.invoke(json!({
         "api_version": "pie.plex.engine@2",
         "operation": "cache",
@@ -284,12 +276,7 @@ fn check_wave_c(packages: &Path) -> Result<(), Box<dyn std::error::Error>> {
         assert_success(&runtime.invoke(event)?);
     }
 
-    let dynasor = runtime(
-        packages,
-        "plex_paper_dynasor",
-        &["request.cancel@1"],
-        None,
-    )?;
+    let dynasor = runtime(packages, "plex_paper_dynasor", &["request.cancel@1"], None)?;
     let stopped = dynasor.invoke(schedule_event(
         "A",
         "G",

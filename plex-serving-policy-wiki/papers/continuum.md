@@ -43,6 +43,17 @@ Existing direct replica.
 
 Named datasets/workloads identified from the primary text or manual audit.
 
+<!-- plex-v0.6-replication:start -->
+## PLEX v0.6 replication status
+
+- Component: `plex_paper_continuum`
+- Operations: `schedule`, `cache`, `feedback`
+- Evidence: `policy-kernel-reproduction`
+- Validation: `passing`
+- Metadata: [`tests/policies/replications/continuum/metadata.json`](../../tests/policies/replications/continuum/metadata.json)
+- Deferred mechanics: tool parser; offline TTL estimator; physical KV pinning
+<!-- plex-v0.6-replication:end -->
+
 ## Suggested citation
 
 Hanchen Li, Runyuan He, Qiuyang Mang, Qizheng Zhang, Huanzhi Mao, Xiaokun Chen, et al. “Continuum: Efficient and Robust Multi-Turn LLM Agent Scheduling with KV Cache Time-to-Live.” arXiv preprint / UC Berkeley technical report, revised 2026, 2026. https://arxiv.org/abs/2511.02230.

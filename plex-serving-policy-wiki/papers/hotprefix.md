@@ -41,6 +41,17 @@ Hotness tracking, selective admission, CPU/GPU promotion.
 
 No named public dataset was reliably confirmed; the workload description is categorical and the paper's evaluation section is authoritative.
 
+<!-- plex-v0.6-replication:start -->
+## PLEX v0.6 replication status
+
+- Component: `plex_paper_hotprefix`
+- Operations: `cache`, `feedback`
+- Evidence: `policy-kernel-reproduction`
+- Validation: `passing`
+- Metadata: [`tests/policies/replications/hotprefix/metadata.json`](../../tests/policies/replications/hotprefix/metadata.json)
+- Deferred mechanics: physical tier promotion
+<!-- plex-v0.6-replication:end -->
+
 ## Suggested citation
 
 Yuhang Li, Rong Gu, Chengying Huan, Zhibin Wang, Renjie Yao, Chen Tian, et al. “HotPrefix: Hotness-Aware KV Cache Scheduling for Efficient Prefix Sharing in LLM Inference Systems.” PACMMOD / SIGMOD 2026, 2026. https://doi.org/10.1145/3749168.

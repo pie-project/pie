@@ -43,6 +43,17 @@ Direct coordinated `S+E`.
 
 Named datasets/workloads identified from the primary text or manual audit.
 
+<!-- plex-v0.6-replication:start -->
+## PLEX v0.6 replication status
+
+- Component: `plex_paper_peek`
+- Operations: `schedule`, `cache`
+- Evidence: `policy-kernel-reproduction`
+- Validation: `passing`
+- Metadata: [`tests/policies/replications/peek/metadata.json`](../../tests/policies/replications/peek/metadata.json)
+- Deferred mechanics: None
+<!-- plex-v0.6-replication:end -->
+
 ## Suggested citation
 
 Bing Xie, Zhipeng Wang, Masahiro Tanaka, Zheng Zhen. “PEEK: Predictive Queue-Informed KV Cache Management for LLM Serving.” arXiv preprint, 2026. https://arxiv.org/abs/2607.02525.

@@ -2,7 +2,7 @@
 
 ## Document status
 
-- Status: implementation plan
+- Status: implemented and release-validated
 - Target contract: `pie:plex@0.6.0`
 - Normative contract: [`plex_0.6_contract.md`](plex_0.6_contract.md)
 - Migration guide: [`plex_0.5_to_0.6.md`](plex_0.5_to_0.6.md)
@@ -29,6 +29,13 @@
     parallelism regulation
   - Wave D complete: DualMap, Llumnix, SMetric, ThunderAgent, Pythia,
     GoodServe, conversation-level ConServe, Parrot, SAGA, and RouteBalance
+  - Release validation complete: Rust, SDK, Python, WIT, schemas, layering,
+    deterministic replay, all policy packages, optional mechanics, and
+    performance budgets
+  - Generated evidence:
+    [`plex_replication_report.md`](plex_replication_report.md),
+    `tests/policies/replication-report.json`, and
+    `tests/policies/performance-results.json`
 - Inputs:
   - [`plex.md`](plex.md), the implemented v0.5 contract
   - [`plex_gap.md`](plex_gap.md), the design-gap audit
@@ -990,6 +997,11 @@ Required terminology:
 | Paper and implementation semantics diverge again | Generate the replication report from committed fixture metadata and audit it as a release gate. |
 
 ## 13. Release gates
+
+All gates below are satisfied by the committed v0.6 implementation and its
+generated evidence. Physical engine mechanics and live version-pinned engine
+plugins remain the explicit non-goals listed in Section 2, not hidden release
+exceptions.
 
 PLEX 0.6 is complete only when:
 

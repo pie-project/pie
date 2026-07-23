@@ -41,6 +41,17 @@ Workflow-aware TTL, agent-level fairness, cache-local work stealing.
 
 Named datasets/workloads identified from the primary text or manual audit.
 
+<!-- plex-v0.6-replication:start -->
+## PLEX v0.6 replication status
+
+- Component: `plex_paper_saga`
+- Operations: `route`, `schedule`, `cache`
+- Evidence: `policy-kernel-reproduction`
+- Validation: `passing`
+- Metadata: [`tests/policies/replications/saga/metadata.json`](../../tests/policies/replications/saga/metadata.json)
+- Deferred mechanics: physical work stealing
+<!-- plex-v0.6-replication:end -->
+
 ## Suggested citation
 
 Dongxin Guo, Jikun Wu, Siu Ming Yiu. “SAGA: Workflow-Atomic Scheduling for AI Agent Inference on GPU Clusters.” arXiv preprint, 2026, 2026. https://arxiv.org/abs/2605.00528.

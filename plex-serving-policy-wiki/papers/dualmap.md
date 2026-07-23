@@ -42,6 +42,17 @@ Direct `R+B`.
 
 Named datasets/workloads identified from the primary text or manual audit.
 
+<!-- plex-v0.6-replication:start -->
+## PLEX v0.6 replication status
+
+- Component: `plex_paper_dualmap`
+- Operations: `route`
+- Evidence: `policy-kernel-reproduction`
+- Validation: `passing`
+- Metadata: [`tests/policies/replications/dualmap/metadata.json`](../../tests/policies/replications/dualmap/metadata.json)
+- Deferred mechanics: physical migration
+<!-- plex-v0.6-replication:end -->
+
 ## Suggested citation
 
 Ying Yuan, Pengfei Zuo, Bo Wang, Zhangyu Chen, Zhipeng Tan, Zhou Yu. “DualMap: Enabling Both Cache Affinity and Load Balancing for Distributed LLM Serving.” ICLR 2026, 2026. https://arxiv.org/abs/2602.06502.

@@ -41,6 +41,17 @@ Weighted-size queues, per-queue token quotas, bypass, adapter caching.
 
 No named public dataset was reliably confirmed; the workload description is categorical and the paper's evaluation section is authoritative.
 
+<!-- plex-v0.6-replication:start -->
+## PLEX v0.6 replication status
+
+- Component: `plex_paper_chameleon`
+- Operations: `admit`, `schedule`, `cache`
+- Evidence: `policy-kernel-reproduction`
+- Validation: `passing`
+- Metadata: [`tests/policies/replications/chameleon/metadata.json`](../../tests/policies/replications/chameleon/metadata.json)
+- Deferred mechanics: None
+<!-- plex-v0.6-replication:end -->
+
 ## Suggested citation
 
 Nikoleta Iliakopoulou, Jovan Stojkovic, Chloe Alverti, Tianyin Xu, Hubertus Franke, Josep Torrellas. “Chameleon: Adaptive Caching and Scheduling for Many-Adapter LLM Inference Environments.” MICRO 2025, 2025. https://doi.org/10.48550/arxiv.2411.17741.

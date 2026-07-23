@@ -42,6 +42,17 @@ Direct `S+F`; must-have baseline.
 
 Named datasets/workloads identified from the primary text or manual audit.
 
+<!-- plex-v0.6-replication:start -->
+## PLEX v0.6 replication status
+
+- Component: `plex_paper_vtc`
+- Operations: `schedule`, `feedback`
+- Evidence: `policy-kernel-reproduction`
+- Validation: `passing`
+- Metadata: [`tests/policies/replications/vtc/metadata.json`](../../tests/policies/replications/vtc/metadata.json)
+- Deferred mechanics: None
+<!-- plex-v0.6-replication:end -->
+
 ## Suggested citation
 
 Ying Sheng, Shiyi Cao, Dacheng Li, Banghua Zhu, Zhuohan Li, Danyang Zhuo, et al. “Fairness in Serving Large Language Models.” OSDI 2024, 2024. https://doi.org/10.48550/arxiv.2401.00588.

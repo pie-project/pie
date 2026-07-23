@@ -41,6 +41,17 @@ Semantic-variable DAG, dependency-aware placement and execution.
 
 No named public dataset was reliably confirmed; the workload description is categorical and the paper's evaluation section is authoritative.
 
+<!-- plex-v0.6-replication:start -->
+## PLEX v0.6 replication status
+
+- Component: `plex_paper_parrot`
+- Operations: `route`, `schedule`
+- Evidence: `policy-kernel-reproduction`
+- Validation: `passing`
+- Metadata: [`tests/policies/replications/parrot/metadata.json`](../../tests/policies/replications/parrot/metadata.json)
+- Deferred mechanics: general semantic-variable DAG runtime
+<!-- plex-v0.6-replication:end -->
+
 ## Suggested citation
 
 Chaofan Lin, Zhenhua Han, C. R. Zhang, Yuqing Yang, Fan Yang, Chen Chen, et al. “Parrot: Efficient Serving of LLM-based Applications with Semantic Variable.” arXiv preprint, 2024. https://doi.org/10.48550/arxiv.2405.19888.

@@ -42,6 +42,17 @@ Existing direct replica plus optional `P`.
 
 Named datasets/workloads identified from the primary text or manual audit.
 
+<!-- plex-v0.6-replication:start -->
+## PLEX v0.6 replication status
+
+- Component: `plex_paper_kvflow`
+- Operations: `schedule`, `cache`
+- Evidence: `policy-kernel-reproduction`
+- Validation: `passing`
+- Metadata: [`tests/policies/replications/kvflow/metadata.json`](../../tests/policies/replications/kvflow/metadata.json)
+- Deferred mechanics: CPU-GPU transfer overlap
+<!-- plex-v0.6-replication:end -->
+
 ## Suggested citation
 
 Zaifeng Pan, Ajjkumar Patel, Zhengding Hu, Yipeng Shen, Yue Guan, Wan-Lu Li, et al. “KVFlow: Efficient Prefix Caching for Accelerating LLM-Based Multi-Agent Workflows.” NeurIPS 2025, 2025. https://arxiv.org/abs/2507.07400.

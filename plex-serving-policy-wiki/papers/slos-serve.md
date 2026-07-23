@@ -45,6 +45,17 @@ Direct but high-effort `A+R+S`.
 
 Named datasets/workloads identified from the primary text or manual audit.
 
+<!-- plex-v0.6-replication:start -->
+## PLEX v0.6 replication status
+
+- Component: `plex_paper_slos_serve`
+- Operations: `admit`, `route`, `schedule`
+- Evidence: `policy-kernel-reproduction`
+- Validation: `passing`
+- Metadata: [`tests/policies/replications/slos-serve/metadata.json`](../../tests/policies/replications/slos-serve/metadata.json)
+- Deferred mechanics: replica provisioning
+<!-- plex-v0.6-replication:end -->
+
 ## Suggested citation
 
 Siyuan Chen, Zhipeng Jia, Samira Khan, Arvind Krishnamurthy, Phillip B. Gibbons. “SLOs-Serve: Optimized Serving of Multi-SLO LLMs.” arXiv preprint, 2025, 2025. https://arxiv.org/abs/2504.08784.

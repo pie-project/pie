@@ -2,7 +2,7 @@
 
 ## Document status
 
-- Status: normative Phase 0 contract
+- Status: normative implemented contract
 - Contract: `pie:plex@0.6.0`
 - Package format: `.plexpkg` version 6
 - Engine envelope: a future version of `pie.plex.engine@1`

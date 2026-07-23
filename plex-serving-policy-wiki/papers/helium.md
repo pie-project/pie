@@ -41,6 +41,17 @@ Existing `S`; prefetch is optional/mechanical.
 
 Named datasets/workloads identified from the primary text or manual audit.
 
+<!-- plex-v0.6-replication:start -->
+## PLEX v0.6 replication status
+
+- Component: `plex_paper_helium`
+- Operations: `schedule`
+- Evidence: `policy-kernel-reproduction`
+- Validation: `passing`
+- Metadata: [`tests/policies/replications/helium/metadata.json`](../../tests/policies/replications/helium/metadata.json)
+- Deferred mechanics: query-plan rewrite; proactive cache warming
+<!-- plex-v0.6-replication:end -->
+
 ## Suggested citation
 
 Noppanat Wadlom, Junyi Shen, Yao Lu. “Efficient LLM Serving for Agentic Workflows: A Data Systems Perspective.” arXiv preprint, 2026, 2026. https://arxiv.org/abs/2603.16104.

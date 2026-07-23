@@ -45,6 +45,17 @@ Direct `S+E+F` replica.
 
 Named datasets/workloads identified from the primary text or manual audit.
 
+<!-- plex-v0.6-replication:start -->
+## PLEX v0.6 replication status
+
+- Component: `plex_paper_infercept`
+- Operations: `schedule`, `cache`
+- Evidence: `policy-kernel-reproduction`
+- Validation: `passing`
+- Metadata: [`tests/policies/replications/infercept/metadata.json`](../../tests/policies/replications/infercept/metadata.json)
+- Deferred mechanics: physical swap implementation
+<!-- plex-v0.6-replication:end -->
+
 ## Suggested citation
 
 Reyna Abhyankar, Zijian He, Vikranth Srivatsa, Hao Zhang, Yiying Zhang. “InferCept: Efficient Intercept Support for Augmented Large Language Model Inference.” ICML 2024, 2024. https://arxiv.org/abs/2402.01869.

@@ -41,6 +41,17 @@ Existing direct replica; count once.
 
 Named datasets/workloads identified from the primary text or manual audit.
 
+<!-- plex-v0.6-replication:start -->
+## PLEX v0.6 replication status
+
+- Component: `plex_paper_agentix`
+- Operations: `schedule`, `feedback`
+- Evidence: `policy-kernel-reproduction`
+- Validation: `passing`
+- Metadata: [`tests/policies/replications/agentix/metadata.json`](../../tests/policies/replications/agentix/metadata.json)
+- Deferred mechanics: KV swap kernel; multi-step engine execution; full ATLAS DAG runtime
+<!-- plex-v0.6-replication:end -->
+
 ## Suggested citation
 
 Michael Luo, Xiaoxiang Shi, Colin Cai, Tianjun Zhang, Justin Wong, Yichuan Wang, et al. “Autellix: An Efficient Serving Engine for LLM Agents as General Programs.” NSDI 2026 (final paper: Agentix); arXiv 2025 preprint: Autellix, 2026. https://doi.org/10.48550/arxiv.2502.13965.

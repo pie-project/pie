@@ -43,6 +43,17 @@ Important boundary test: mid-lifecycle drop is not cleanly `admit`-once.
 
 Named datasets/workloads identified from the primary text or manual audit.
 
+<!-- plex-v0.6-replication:start -->
+## PLEX v0.6 replication status
+
+- Component: `plex_paper_pard`
+- Operations: `schedule`, `feedback`
+- Evidence: `policy-kernel-reproduction`
+- Validation: `passing`
+- Metadata: [`tests/policies/replications/pard/metadata.json`](../../tests/policies/replications/pard/metadata.json)
+- Deferred mechanics: latency-distribution estimator
+<!-- plex-v0.6-replication:end -->
+
 ## Suggested citation
 
 Zhixin Zhao, Yitao Hu, Simin Chen, Mingfang Ji, Wei Yang, Yuhao Zhang, et al. “PARD: Enhancing Goodput for Inference Pipeline via Proactive Request Dropping.” EuroSys 2026, 2026. https://arxiv.org/abs/2602.08747.

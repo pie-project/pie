@@ -45,6 +45,17 @@ State-aware pausing, program migration, tool-resource lifecycle.
 
 Named datasets/workloads identified from the primary text or manual audit.
 
+<!-- plex-v0.6-replication:start -->
+## PLEX v0.6 replication status
+
+- Component: `plex_paper_thunderagent`
+- Operations: `schedule`, `cache`, `feedback`
+- Evidence: `policy-kernel-reproduction`
+- Validation: `passing`
+- Metadata: [`tests/policies/replications/thunderagent/metadata.json`](../../tests/policies/replications/thunderagent/metadata.json)
+- Deferred mechanics: physical pause and migration
+<!-- plex-v0.6-replication:end -->
+
 ## Suggested citation
 
 Hao Kang, Ziyang Li, Weili Xu, Xinyu Yang, Yinfang Chen, Junxiong Wang, et al. “ThunderAgent: A Simple, Fast and Program-Aware Agentic Inference System.” arXiv preprint, 2026, 2026. https://arxiv.org/abs/2602.13692.

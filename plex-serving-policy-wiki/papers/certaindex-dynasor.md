@@ -41,6 +41,17 @@ Direct `S+F`; best bundle/task candidate.
 
 Named datasets/workloads identified from the primary text or manual audit.
 
+<!-- plex-v0.6-replication:start -->
+## PLEX v0.6 replication status
+
+- Component: `plex_paper_dynasor`
+- Operations: `schedule`, `feedback`
+- Evidence: `policy-kernel-reproduction`
+- Validation: `passing`
+- Metadata: [`tests/policies/replications/dynasor/metadata.json`](../../tests/policies/replications/dynasor/metadata.json)
+- Deferred mechanics: predictor training
+<!-- plex-v0.6-replication:end -->
+
 ## Suggested citation
 
 Yichao Fu, Junda Chen, Siqi Zhu, Zhongheng Fu, Zhongdongming Dai, Yonghao Zhuang, et al. “Efficiently Scaling LLM Reasoning with Certaindex.” arXiv preprint, 2024; later revisions in 2025, 2024. https://doi.org/10.48550/arxiv.2412.20993.

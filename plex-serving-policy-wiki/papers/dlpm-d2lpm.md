@@ -43,6 +43,17 @@ Direct `R+S+F`.
 
 Named datasets/workloads identified from the primary text or manual audit.
 
+<!-- plex-v0.6-replication:start -->
+## PLEX v0.6 replication status
+
+- Component: `plex_paper_dlpm`
+- Operations: `route`, `schedule`, `feedback`
+- Evidence: `policy-kernel-reproduction`
+- Validation: `passing`
+- Metadata: [`tests/policies/replications/dlpm/metadata.json`](../../tests/policies/replications/dlpm/metadata.json)
+- Deferred mechanics: None
+<!-- plex-v0.6-replication:end -->
+
 ## Suggested citation
 
 Shiyi Cao, Yichuan Wang, Ziming Mao, Pin-Lun Hsu, Liangsheng Yin, Tian Xia, et al. “Locality-aware Fair Scheduling in LLM Serving.” arXiv preprint, 2025, 2025. https://arxiv.org/abs/2501.14312.

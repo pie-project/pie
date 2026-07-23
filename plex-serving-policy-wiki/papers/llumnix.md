@@ -42,6 +42,17 @@ Virtual-usage-driven live rescheduling.
 
 Named datasets/workloads identified from the primary text or manual audit.
 
+<!-- plex-v0.6-replication:start -->
+## PLEX v0.6 replication status
+
+- Component: `plex_paper_llumnix`
+- Operations: `route`, `feedback`
+- Evidence: `policy-kernel-reproduction`
+- Validation: `passing`
+- Metadata: [`tests/policies/replications/llumnix/metadata.json`](../../tests/policies/replications/llumnix/metadata.json)
+- Deferred mechanics: physical migration
+<!-- plex-v0.6-replication:end -->
+
 ## Suggested citation
 
 Biao Sun, Ziming Huang, Hanyu Zhao, Wencong Xiao, Xinyi Zhang, Yong Li, et al. “Llumnix: Dynamic Scheduling for Large Language Model Serving.” OSDI 2024, 2024. https://doi.org/10.48550/arxiv.2406.03243.

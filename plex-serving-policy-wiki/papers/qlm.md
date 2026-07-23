@@ -42,6 +42,17 @@ Direct multi-hook case.
 
 Named datasets/workloads identified from the primary text or manual audit.
 
+<!-- plex-v0.6-replication:start -->
+## PLEX v0.6 replication status
+
+- Component: `plex_paper_qlm`
+- Operations: `admit`, `route`, `schedule`, `feedback`
+- Evidence: `policy-kernel-reproduction`
+- Validation: `passing`
+- Metadata: [`tests/policies/replications/qlm/metadata.json`](../../tests/policies/replications/qlm/metadata.json)
+- Deferred mechanics: None
+<!-- plex-v0.6-replication:end -->
+
 ## Suggested citation
 
 Archit Patke, Dhemath Reddy, Saurabh Jha, Haoran Qiu, Christian Pinto, Chandra Narayanaswami, et al. “Queue Management for SLO-Oriented Large Language Model Serving.” SoCC 2024, 2024. https://doi.org/10.1145/3698038.3698523.

@@ -42,6 +42,17 @@ Simple `R`; strong logical-request example.
 
 Named datasets/workloads identified from the primary text or manual audit.
 
+<!-- plex-v0.6-replication:start -->
+## PLEX v0.6 replication status
+
+- Component: `plex_paper_conserve`
+- Operations: `route`
+- Evidence: `policy-kernel-reproduction`
+- Validation: `passing`
+- Metadata: [`tests/policies/replications/conserve/metadata.json`](../../tests/policies/replications/conserve/metadata.json)
+- Deferred mechanics: None
+<!-- plex-v0.6-replication:end -->
+
 ## Suggested citation
 
 Jianru Ding, Ryien Hosseini, Pouya Mahdi Gholami, Mingyuan Xiang, Henry Hoffmann. “Observation, Not Prediction: Conversation-Level Disaggregated Scheduling for Agentic Serving.” arXiv preprint, 2026. https://arxiv.org/abs/2606.01839.

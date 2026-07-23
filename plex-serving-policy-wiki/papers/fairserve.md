@@ -41,6 +41,17 @@ Direct `A+S+F`.
 
 Named datasets/workloads identified from the primary text or manual audit.
 
+<!-- plex-v0.6-replication:start -->
+## PLEX v0.6 replication status
+
+- Component: `plex_paper_fairserve`
+- Operations: `admit`, `schedule`, `feedback`
+- Evidence: `policy-kernel-reproduction`
+- Validation: `passing`
+- Metadata: [`tests/policies/replications/fairserve/metadata.json`](../../tests/policies/replications/fairserve/metadata.json)
+- Deferred mechanics: production interference estimator
+<!-- plex-v0.6-replication:end -->
+
 ## Suggested citation
 
 Redwan Ibne Seraj Khan, Kunal Jain, Haiying Shen, Ankur Mallick, Anjaly Parayil, Anoop Kulkarni, et al. “Ensuring Fair LLM Serving Amid Diverse Applications.” arXiv preprint, 2024, 2024. https://arxiv.org/abs/2411.15997.

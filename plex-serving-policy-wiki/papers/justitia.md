@@ -41,6 +41,17 @@ Direct `S+F`.
 
 Named datasets/workloads identified from the primary text or manual audit.
 
+<!-- plex-v0.6-replication:start -->
+## PLEX v0.6 replication status
+
+- Component: `plex_paper_justitia`
+- Operations: `schedule`, `feedback`
+- Evidence: `policy-kernel-reproduction`
+- Validation: `passing`
+- Metadata: [`tests/policies/replications/justitia/metadata.json`](../../tests/policies/replications/justitia/metadata.json)
+- Deferred mechanics: simultaneous branch execution
+<!-- plex-v0.6-replication:end -->
+
 ## Suggested citation
 
 Mingyan Yang, Guanjie Wang, Manqi Luo, Yifei Liu, Chen Chen, Han Zhao, et al. “Justitia: Fair and Efficient Scheduling of Task-parallel LLM Agents with Selective Pampering.” arXiv preprint, 2025, 2025. https://arxiv.org/abs/2510.17015.

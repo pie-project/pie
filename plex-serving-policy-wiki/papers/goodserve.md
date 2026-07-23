@@ -42,6 +42,17 @@ An abstract was available through the indexed or primary-page metadata used for 
 
 Named datasets/workloads identified from the primary text or manual audit.
 
+<!-- plex-v0.6-replication:start -->
+## PLEX v0.6 replication status
+
+- Component: `plex_paper_goodserve`
+- Operations: `route`, `feedback`
+- Evidence: `policy-kernel-reproduction`
+- Validation: `passing`
+- Metadata: [`tests/policies/replications/goodserve/metadata.json`](../../tests/policies/replications/goodserve/metadata.json)
+- Deferred mechanics: predictor training; provisioning
+<!-- plex-v0.6-replication:end -->
+
 ## Suggested citation
 
 Boxiao Du, Boning Huangfu, Yizhou Luo, Chen Chen, Zijun Li, Minchen Yu, et al. “GoodServe: Towards High-Goodput Serving of Agentic LLM Inferences over Heterogeneous Resources.” arXiv preprint, 2026, 2026. https://arxiv.org/abs/2605.16867.

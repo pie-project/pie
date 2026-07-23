@@ -1,0 +1,7 @@
+{
+  "admit_singleton_ns": 1000000,
+  "admit_batch_64_ns": 5000000,
+  "route_64x8_ns": 20000000,
+  "schedule_128_ns": 5000000,
+  "cache_1024_ns": 10000000
+}

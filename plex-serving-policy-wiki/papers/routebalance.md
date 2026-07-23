@@ -41,6 +41,17 @@ Joint model routing and load balancing on heterogeneous fleets.
 
 No named public dataset was reliably confirmed; the workload description is categorical and the paper's evaluation section is authoritative.
 
+<!-- plex-v0.6-replication:start -->
+## PLEX v0.6 replication status
+
+- Component: `plex_paper_routebalance`
+- Operations: `route`
+- Evidence: `policy-kernel-reproduction`
+- Validation: `passing`
+- Metadata: [`tests/policies/replications/routebalance/metadata.json`](../../tests/policies/replications/routebalance/metadata.json)
+- Deferred mechanics: replica provisioning
+<!-- plex-v0.6-replication:end -->
+
 ## Suggested citation
 
 Wei Da, Evangelia Kalyvianaki. “RouteBalance: Fused Model Routing and Load Balancing for Heterogeneous LLM Serving.” arXiv preprint, 2026. https://arxiv.org/abs/2606.17949.

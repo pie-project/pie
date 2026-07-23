@@ -41,6 +41,17 @@ Boundary test for branch-level `A/S`.
 
 No named public dataset was reliably confirmed; the workload description is categorical and the paper's evaluation section is authoritative.
 
+<!-- plex-v0.6-replication:start -->
+## PLEX v0.6 replication status
+
+- Component: `plex_paper_branch_regulation`
+- Operations: `admit`, `schedule`
+- Evidence: `policy-kernel-reproduction`
+- Validation: `passing`
+- Metadata: [`tests/policies/replications/branch-regulation/metadata.json`](../../tests/policies/replications/branch-regulation/metadata.json)
+- Deferred mechanics: simultaneous branch execution
+<!-- plex-v0.6-replication:end -->
+
 ## Suggested citation
 
 Swapnil Gandhi, Siva Hari, William J. Dally, Christos Kozyrakis. “Regulating Branch Parallelism in LLM Serving.” arXiv preprint, 2026. https://arxiv.org/abs/2605.06914.

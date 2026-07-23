@@ -41,6 +41,17 @@ Reuse-likelihood cache admission and FLOP-per-byte eviction for hybrid models.
 
 No named public dataset was reliably confirmed; the workload description is categorical and the paper's evaluation section is authoritative.
 
+<!-- plex-v0.6-replication:start -->
+## PLEX v0.6 replication status
+
+- Component: `plex_paper_marconi`
+- Operations: `cache`, `feedback`
+- Evidence: `policy-kernel-reproduction`
+- Validation: `passing`
+- Metadata: [`tests/policies/replications/marconi/metadata.json`](../../tests/policies/replications/marconi/metadata.json)
+- Deferred mechanics: hybrid-model kernel integration
+<!-- plex-v0.6-replication:end -->
+
 ## Suggested citation
 
 Rui Pan, Zhuang Wang, Zhen Jia, Can Karakus, Luca Zancato, Tri Dao, et al. “Marconi: Prefix Caching for the Era of Hybrid LLMs.” MLSys 2025, 2025. https://arxiv.org/abs/2411.19379.

@@ -21,6 +21,7 @@ mod protocol_v0_6;
 mod registry;
 mod registry_v0_6;
 mod replay;
+mod replay_v0_6;
 mod state_store;
 mod state_store_v0_6;
 mod wire_v0_6;
@@ -68,6 +69,7 @@ pub use replay::{
     ReplayCommand, ReplayDivergence, ReplayError, ReplayOutcome, ReplayReport, ReplayRunner,
     ReplaySetupError, ReplayTrace,
 };
+pub use replay_v0_6::{ReplayErrorV0_6, ReplayReportV0_6, ReplayRunnerV0_6};
 pub use state_store::{
     FeedbackCommit, InMemoryPolicyStateBackend, PolicyStateBackend, RequestStateUpdate,
     StateBackendError, StateSnapshot, StateUpdates,

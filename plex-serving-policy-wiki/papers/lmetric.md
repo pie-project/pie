@@ -43,6 +43,17 @@ Direct `R`; strongest simple route example.
 
 Named datasets/workloads identified from the primary text or manual audit.
 
+<!-- plex-v0.6-replication:start -->
+## PLEX v0.6 replication status
+
+- Component: `plex_paper_lmetric`
+- Operations: `route`
+- Evidence: `policy-kernel-reproduction`
+- Validation: `passing`
+- Metadata: [`tests/policies/replications/lmetric/metadata.json`](../../tests/policies/replications/lmetric/metadata.json)
+- Deferred mechanics: None
+<!-- plex-v0.6-replication:end -->
+
 ## Suggested citation
 
 Dingyan Zhang, Jinbo Han, Kaixi Zhang, Xingda Wei, Sijie Shen, Chenguang Fang, et al. “Simple is Better: Multiplication May Be All You Need for LLM Request Scheduling.” OSDI 2026, 2026. https://arxiv.org/abs/2603.15202.

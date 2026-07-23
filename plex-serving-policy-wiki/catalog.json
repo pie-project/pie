@@ -42,7 +42,21 @@
     "abstract_source_available": true,
     "abstract_synopsis": "This work studies serving when one user-visible task spans multiple LLM calls, workflow nodes, or tool boundaries rather than one isolated request. The proposed policy centers on semantic-variable dag, dependency-aware placement and execution. The reported evaluation context includes Agent/workflow trace-driven evaluation; no named public dataset was reliably recovered.",
     "reputation_evidence": "recent preprint; peer-review status is not confirmed by this catalog; author affiliations include Shanghai Jiao Tong University, Microsoft Research; no official public artifact was confirmed.",
-    "suggested_citation": "Chaofan Lin, Zhenhua Han, C. R. Zhang, Yuqing Yang, Fan Yang, Chen Chen, et al. “Parrot: Efficient Serving of LLM-based Applications with Semantic Variable.” arXiv preprint, 2024. https://doi.org/10.48550/arxiv.2405.19888."
+    "suggested_citation": "Chaofan Lin, Zhenhua Han, C. R. Zhang, Yuqing Yang, Fan Yang, Chen Chen, et al. “Parrot: Efficient Serving of LLM-based Applications with Semantic Variable.” arXiv preprint, 2024. https://doi.org/10.48550/arxiv.2405.19888.",
+    "plex_v0_6_replication": {
+      "replication_id": "parrot",
+      "component": "plex_paper_parrot",
+      "operations": [
+        "route",
+        "schedule"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "validation_status": "passing",
+      "deferred_mechanics": [
+        "general semantic-variable DAG runtime"
+      ],
+      "metadata_path": "tests/policies/replications/parrot/metadata.json"
+    }
   },
   {
     "label": "InferCept",
@@ -94,7 +108,21 @@
     "abstract_source_available": true,
     "abstract_synopsis": "This work studies serving when one user-visible task spans multiple LLM calls, workflow nodes, or tool boundaries rather than one isolated request. The proposed policy centers on preserve/swap/discard intercepted kv state. The reported evaluation context includes GSM8K-XL, HotpotQA / Wikipedia QA, ALFWorld, ShareGPT, among other workloads.",
     "reputation_evidence": "strong publication signal from a selective systems/ML venue (ICML 2024); author affiliations include UC San Diego WukLab; a public implementation or artifact is linked.",
-    "suggested_citation": "Reyna Abhyankar, Zijian He, Vikranth Srivatsa, Hao Zhang, Yiying Zhang. “InferCept: Efficient Intercept Support for Augmented Large Language Model Inference.” ICML 2024, 2024. https://arxiv.org/abs/2402.01869."
+    "suggested_citation": "Reyna Abhyankar, Zijian He, Vikranth Srivatsa, Hao Zhang, Yiying Zhang. “InferCept: Efficient Intercept Support for Augmented Large Language Model Inference.” ICML 2024, 2024. https://arxiv.org/abs/2402.01869.",
+    "plex_v0_6_replication": {
+      "replication_id": "infercept",
+      "component": "plex_paper_infercept",
+      "operations": [
+        "schedule",
+        "cache"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "validation_status": "passing",
+      "deferred_mechanics": [
+        "physical swap implementation"
+      ],
+      "metadata_path": "tests/policies/replications/infercept/metadata.json"
+    }
   },
   {
     "label": "Autellix / Agentix",
@@ -145,7 +173,23 @@
     "abstract_source_available": true,
     "abstract_synopsis": "This work studies serving when one user-visible task spans multiple LLM calls, workflow nodes, or tool boundaries rather than one isolated request. The proposed policy centers on plas and atlas attained-service scheduling for programs/dags. The reported evaluation context includes Agentic program workloads including chatbot/ReAct loops, MapReduce-style programs, and MCTS-style parallel reasoning.",
     "reputation_evidence": "strong publication signal from a selective systems/ML venue (NSDI 2026 (final paper: Agentix); arXiv 2025 preprint: Autellix); author affiliations include UC Berkeley Sky Computing Lab, Google DeepMind; no official public artifact was confirmed.",
-    "suggested_citation": "Michael Luo, Xiaoxiang Shi, Colin Cai, Tianjun Zhang, Justin Wong, Yichuan Wang, et al. “Autellix: An Efficient Serving Engine for LLM Agents as General Programs.” NSDI 2026 (final paper: Agentix); arXiv 2025 preprint: Autellix, 2026. https://doi.org/10.48550/arxiv.2502.13965."
+    "suggested_citation": "Michael Luo, Xiaoxiang Shi, Colin Cai, Tianjun Zhang, Justin Wong, Yichuan Wang, et al. “Autellix: An Efficient Serving Engine for LLM Agents as General Programs.” NSDI 2026 (final paper: Agentix); arXiv 2025 preprint: Autellix, 2026. https://doi.org/10.48550/arxiv.2502.13965.",
+    "plex_v0_6_replication": {
+      "replication_id": "agentix",
+      "component": "plex_paper_agentix",
+      "operations": [
+        "schedule",
+        "feedback"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "validation_status": "passing",
+      "deferred_mechanics": [
+        "KV swap kernel",
+        "multi-step engine execution",
+        "full ATLAS DAG runtime"
+      ],
+      "metadata_path": "tests/policies/replications/agentix/metadata.json"
+    }
   },
   {
     "label": "Continuum",
@@ -198,7 +242,24 @@
     "abstract_source_available": true,
     "abstract_synopsis": "This work studies serving when one user-visible task spans multiple LLM calls, workflow nodes, or tool boundaries rather than one isolated request. The proposed policy centers on tool-duration-aware kv ttl and program fcfs. The reported evaluation context includes BFCL, mini-SWE-agent / SWE-agent workloads, TensorMesh internal agent-serving testbed.",
     "reputation_evidence": "recent preprint; peer-review status is not confirmed by this catalog; author affiliations include UC Berkeley Sky Computing Lab; a public implementation or artifact is linked.",
-    "suggested_citation": "Hanchen Li, Runyuan He, Qiuyang Mang, Qizheng Zhang, Huanzhi Mao, Xiaokun Chen, et al. “Continuum: Efficient and Robust Multi-Turn LLM Agent Scheduling with KV Cache Time-to-Live.” arXiv preprint / UC Berkeley technical report, revised 2026, 2026. https://arxiv.org/abs/2511.02230."
+    "suggested_citation": "Hanchen Li, Runyuan He, Qiuyang Mang, Qizheng Zhang, Huanzhi Mao, Xiaokun Chen, et al. “Continuum: Efficient and Robust Multi-Turn LLM Agent Scheduling with KV Cache Time-to-Live.” arXiv preprint / UC Berkeley technical report, revised 2026, 2026. https://arxiv.org/abs/2511.02230.",
+    "plex_v0_6_replication": {
+      "replication_id": "continuum",
+      "component": "plex_paper_continuum",
+      "operations": [
+        "schedule",
+        "cache",
+        "feedback"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "validation_status": "passing",
+      "deferred_mechanics": [
+        "tool parser",
+        "offline TTL estimator",
+        "physical KV pinning"
+      ],
+      "metadata_path": "tests/policies/replications/continuum/metadata.json"
+    }
   },
   {
     "label": "KVFlow",
@@ -248,7 +309,21 @@
     "abstract_source_available": true,
     "abstract_synopsis": "This work studies serving when one user-visible task spans multiple LLM calls, workflow nodes, or tool boundaries rather than one isolated request. The proposed policy centers on steps-to-execution eviction and overlapped prefetch. The reported evaluation context includes Multi-agent workflow DAGs, including PEER-style cyclic/sequential workflows, SGLang-based concurrent workflow traces.",
     "reputation_evidence": "strong publication signal from a selective systems/ML venue (NeurIPS 2025); author affiliations were not reliably resolved; a public implementation or artifact is linked.",
-    "suggested_citation": "Zaifeng Pan, Ajjkumar Patel, Zhengding Hu, Yipeng Shen, Yue Guan, Wan-Lu Li, et al. “KVFlow: Efficient Prefix Caching for Accelerating LLM-Based Multi-Agent Workflows.” NeurIPS 2025, 2025. https://arxiv.org/abs/2507.07400."
+    "suggested_citation": "Zaifeng Pan, Ajjkumar Patel, Zhengding Hu, Yipeng Shen, Yue Guan, Wan-Lu Li, et al. “KVFlow: Efficient Prefix Caching for Accelerating LLM-Based Multi-Agent Workflows.” NeurIPS 2025, 2025. https://arxiv.org/abs/2507.07400.",
+    "plex_v0_6_replication": {
+      "replication_id": "kvflow",
+      "component": "plex_paper_kvflow",
+      "operations": [
+        "schedule",
+        "cache"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "validation_status": "passing",
+      "deferred_mechanics": [
+        "CPU-GPU transfer overlap"
+      ],
+      "metadata_path": "tests/policies/replications/kvflow/metadata.json"
+    }
   },
   {
     "label": "Certaindex / Dynasor",
@@ -298,7 +373,21 @@
     "abstract_source_available": true,
     "abstract_synopsis": "This work studies serving when one user-visible task spans multiple LLM calls, workflow nodes, or tool boundaries rather than one isolated request. The proposed policy centers on progress-aware reasoning allocation and early stop. The reported evaluation context includes Mathematical and code-reasoning workloads used to evaluate self-consistency and search-style reasoning programs.",
     "reputation_evidence": "recent preprint; peer-review status is not confirmed by this catalog; author affiliations include UC San Diego Hao AI Lab; a public implementation or artifact is linked.",
-    "suggested_citation": "Yichao Fu, Junda Chen, Siqi Zhu, Zhongheng Fu, Zhongdongming Dai, Yonghao Zhuang, et al. “Efficiently Scaling LLM Reasoning with Certaindex.” arXiv preprint, 2024; later revisions in 2025, 2024. https://doi.org/10.48550/arxiv.2412.20993."
+    "suggested_citation": "Yichao Fu, Junda Chen, Siqi Zhu, Zhongheng Fu, Zhongdongming Dai, Yonghao Zhuang, et al. “Efficiently Scaling LLM Reasoning with Certaindex.” arXiv preprint, 2024; later revisions in 2025, 2024. https://doi.org/10.48550/arxiv.2412.20993.",
+    "plex_v0_6_replication": {
+      "replication_id": "dynasor",
+      "component": "plex_paper_dynasor",
+      "operations": [
+        "schedule",
+        "feedback"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "validation_status": "passing",
+      "deferred_mechanics": [
+        "predictor training"
+      ],
+      "metadata_path": "tests/policies/replications/dynasor/metadata.json"
+    }
   },
   {
     "label": "Helium",
@@ -340,7 +429,21 @@
     "abstract_source_available": true,
     "abstract_synopsis": "This work studies serving when one user-visible task spans multiple LLM calls, workflow nodes, or tool boundaries rather than one isolated request. The proposed policy centers on cache-aware critical-path operator scheduling and proactive warming. The reported evaluation context includes Agentic workflow DAGs and repeated-batch workflow executions reported by the paper.",
     "reputation_evidence": "recent preprint; peer-review status is not confirmed by this catalog; author affiliations were not reliably resolved; a public implementation or artifact is linked.",
-    "suggested_citation": "Noppanat Wadlom, Junyi Shen, Yao Lu. “Efficient LLM Serving for Agentic Workflows: A Data Systems Perspective.” arXiv preprint, 2026, 2026. https://arxiv.org/abs/2603.16104."
+    "suggested_citation": "Noppanat Wadlom, Junyi Shen, Yao Lu. “Efficient LLM Serving for Agentic Workflows: A Data Systems Perspective.” arXiv preprint, 2026, 2026. https://arxiv.org/abs/2603.16104.",
+    "plex_v0_6_replication": {
+      "replication_id": "helium",
+      "component": "plex_paper_helium",
+      "operations": [
+        "schedule"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "validation_status": "passing",
+      "deferred_mechanics": [
+        "query-plan rewrite",
+        "proactive cache warming"
+      ],
+      "metadata_path": "tests/policies/replications/helium/metadata.json"
+    }
   },
   {
     "label": "Justitia",
@@ -388,7 +491,21 @@
     "abstract_source_available": true,
     "abstract_synopsis": "This work studies serving when one user-visible task spans multiple LLM calls, workflow nodes, or tool boundaries rather than one isolated request. The proposed policy centers on fair completion order for task-parallel agents. The reported evaluation context includes Task-parallel agent workloads including summarization and parallel-search patterns.",
     "reputation_evidence": "recent preprint; peer-review status is not confirmed by this catalog; author affiliations were not reliably resolved; no official public artifact was confirmed.",
-    "suggested_citation": "Mingyan Yang, Guanjie Wang, Manqi Luo, Yifei Liu, Chen Chen, Han Zhao, et al. “Justitia: Fair and Efficient Scheduling of Task-parallel LLM Agents with Selective Pampering.” arXiv preprint, 2025, 2025. https://arxiv.org/abs/2510.17015."
+    "suggested_citation": "Mingyan Yang, Guanjie Wang, Manqi Luo, Yifei Liu, Chen Chen, Han Zhao, et al. “Justitia: Fair and Efficient Scheduling of Task-parallel LLM Agents with Selective Pampering.” arXiv preprint, 2025, 2025. https://arxiv.org/abs/2510.17015.",
+    "plex_v0_6_replication": {
+      "replication_id": "justitia",
+      "component": "plex_paper_justitia",
+      "operations": [
+        "schedule",
+        "feedback"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "validation_status": "passing",
+      "deferred_mechanics": [
+        "simultaneous branch execution"
+      ],
+      "metadata_path": "tests/policies/replications/justitia/metadata.json"
+    }
   },
   {
     "label": "ThunderAgent",
@@ -445,7 +562,22 @@
     "abstract_source_available": true,
     "abstract_synopsis": "This work studies serving when one user-visible task spans multiple LLM calls, workflow nodes, or tool boundaries rather than one isolated request. The proposed policy centers on state-aware pausing, program migration, tool-resource lifecycle. The reported evaluation context includes SWE-Bench Lite / SWE-bench, OpenHands, SWE-Agent, ToolOrchestra, among other workloads.",
     "reputation_evidence": "recent preprint; peer-review status is not confirmed by this catalog; author affiliations were not reliably resolved; a public implementation or artifact is linked.",
-    "suggested_citation": "Hao Kang, Ziyang Li, Weili Xu, Xinyu Yang, Yinfang Chen, Junxiong Wang, et al. “ThunderAgent: A Simple, Fast and Program-Aware Agentic Inference System.” arXiv preprint, 2026, 2026. https://arxiv.org/abs/2602.13692."
+    "suggested_citation": "Hao Kang, Ziyang Li, Weili Xu, Xinyu Yang, Yinfang Chen, Junxiong Wang, et al. “ThunderAgent: A Simple, Fast and Program-Aware Agentic Inference System.” arXiv preprint, 2026, 2026. https://arxiv.org/abs/2602.13692.",
+    "plex_v0_6_replication": {
+      "replication_id": "thunderagent",
+      "component": "plex_paper_thunderagent",
+      "operations": [
+        "schedule",
+        "cache",
+        "feedback"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "validation_status": "passing",
+      "deferred_mechanics": [
+        "physical pause and migration"
+      ],
+      "metadata_path": "tests/policies/replications/thunderagent/metadata.json"
+    }
   },
   {
     "label": "Pythia",
@@ -503,7 +635,23 @@
     "abstract_source_available": true,
     "abstract_synopsis": "This work studies serving when one user-visible task spans multiple LLM calls, workflow nodes, or tool boundaries rather than one isolated request. The proposed policy centers on workflow synthesis, belady-like cache policy, lookahead scheduling, proactive scaling. The reported evaluation context includes Production multi-agent coding-assistant traces, Representative multi-agent workflow applications.",
     "reputation_evidence": "recent preprint; peer-review status is not confirmed by this catalog; author affiliations were not reliably resolved; no official public artifact was confirmed.",
-    "suggested_citation": "Shan Yu, Junyi Shu, Yuanjiang Ni, Kun Qian, Xue Li, Yang Wang, et al. “Pythia: Exploiting Workflow Predictability for Efficient Agent-Native LLM Serving.” arXiv preprint, 2026, 2026. https://arxiv.org/abs/2604.25899."
+    "suggested_citation": "Shan Yu, Junyi Shu, Yuanjiang Ni, Kun Qian, Xue Li, Yang Wang, et al. “Pythia: Exploiting Workflow Predictability for Efficient Agent-Native LLM Serving.” arXiv preprint, 2026, 2026. https://arxiv.org/abs/2604.25899.",
+    "plex_v0_6_replication": {
+      "replication_id": "pythia",
+      "component": "plex_paper_pythia",
+      "operations": [
+        "route",
+        "schedule",
+        "cache",
+        "feedback"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "validation_status": "passing",
+      "deferred_mechanics": [
+        "proactive scaling"
+      ],
+      "metadata_path": "tests/policies/replications/pythia/metadata.json"
+    }
   },
   {
     "label": "HexAGenT",
@@ -598,7 +746,18 @@
     "abstract_source_available": true,
     "abstract_synopsis": "This work studies serving when one user-visible task spans multiple LLM calls, workflow nodes, or tool boundaries rather than one isolated request. The proposed policy centers on place one heavy initial prefill and pin the conversation tail. The reported evaluation context includes SWE-bench-derived agentic workloads, Qwen3-0.6B experiments on NVIDIA A40 clusters.",
     "reputation_evidence": "recent preprint; peer-review status is not confirmed by this catalog; author affiliations were not reliably resolved; no official public artifact was confirmed.",
-    "suggested_citation": "Jianru Ding, Ryien Hosseini, Pouya Mahdi Gholami, Mingyuan Xiang, Henry Hoffmann. “Observation, Not Prediction: Conversation-Level Disaggregated Scheduling for Agentic Serving.” arXiv preprint, 2026. https://arxiv.org/abs/2606.01839."
+    "suggested_citation": "Jianru Ding, Ryien Hosseini, Pouya Mahdi Gholami, Mingyuan Xiang, Henry Hoffmann. “Observation, Not Prediction: Conversation-Level Disaggregated Scheduling for Agentic Serving.” arXiv preprint, 2026. https://arxiv.org/abs/2606.01839.",
+    "plex_v0_6_replication": {
+      "replication_id": "conserve",
+      "component": "plex_paper_conserve",
+      "operations": [
+        "route"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "validation_status": "passing",
+      "deferred_mechanics": [],
+      "metadata_path": "tests/policies/replications/conserve/metadata.json"
+    }
   },
   {
     "label": "SMetric",
@@ -647,7 +806,20 @@
     "abstract_source_available": true,
     "abstract_synopsis": "This work studies serving when one user-visible task spans multiple LLM calls, workflow nodes, or tool boundaries rather than one isolated request. The proposed policy centers on load-balance first turns, use cache affinity for follow-ups, migrate tail outliers. The reported evaluation context includes Two large-scale production agentic-serving traces, including Alibaba Bailian.",
     "reputation_evidence": "recent preprint; peer-review status is not confirmed by this catalog; author affiliations were not reliably resolved; no official public artifact was confirmed.",
-    "suggested_citation": "Jiahao Wang, Kaizhan Lin, Kaixi Zhang, Jinbo Han, Xingda Wei, Sijie Shen, et al. “SMetric: Rethink LLM Scheduling for Serving Agents with Balanced Session-centric Scheduling.” arXiv preprint, 2026, 2026. https://arxiv.org/abs/2607.08565."
+    "suggested_citation": "Jiahao Wang, Kaizhan Lin, Kaixi Zhang, Jinbo Han, Xingda Wei, Sijie Shen, et al. “SMetric: Rethink LLM Scheduling for Serving Agents with Balanced Session-centric Scheduling.” arXiv preprint, 2026, 2026. https://arxiv.org/abs/2607.08565.",
+    "plex_v0_6_replication": {
+      "replication_id": "smetric",
+      "component": "plex_paper_smetric",
+      "operations": [
+        "route"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "validation_status": "passing",
+      "deferred_mechanics": [
+        "physical migration"
+      ],
+      "metadata_path": "tests/policies/replications/smetric/metadata.json"
+    }
   },
   {
     "label": "GoodServe",
@@ -696,7 +868,22 @@
     "abstract_source_available": true,
     "abstract_synopsis": "This work studies serving when one user-visible task spans multiple LLM calls, workflow nodes, or tool boundaries rather than one isolated request. The proposed policy centers on “just-enough” heterogeneous gpu selection and risk-triggered migration. The reported evaluation context includes Popular agentic LLM workloads, Heterogeneous-GPU testbed and 512-instance simulations.",
     "reputation_evidence": "recent preprint; peer-review status is not confirmed by this catalog; author affiliations were not reliably resolved; no official public artifact was confirmed.",
-    "suggested_citation": "Boxiao Du, Boning Huangfu, Yizhou Luo, Chen Chen, Zijun Li, Minchen Yu, et al. “GoodServe: Towards High-Goodput Serving of Agentic LLM Inferences over Heterogeneous Resources.” arXiv preprint, 2026, 2026. https://arxiv.org/abs/2605.16867."
+    "suggested_citation": "Boxiao Du, Boning Huangfu, Yizhou Luo, Chen Chen, Zijun Li, Minchen Yu, et al. “GoodServe: Towards High-Goodput Serving of Agentic LLM Inferences over Heterogeneous Resources.” arXiv preprint, 2026, 2026. https://arxiv.org/abs/2605.16867.",
+    "plex_v0_6_replication": {
+      "replication_id": "goodserve",
+      "component": "plex_paper_goodserve",
+      "operations": [
+        "route",
+        "feedback"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "validation_status": "passing",
+      "deferred_mechanics": [
+        "predictor training",
+        "provisioning"
+      ],
+      "metadata_path": "tests/policies/replications/goodserve/metadata.json"
+    }
   },
   {
     "label": "KAIROS",
@@ -841,7 +1028,22 @@
     "abstract_source_available": true,
     "abstract_synopsis": "This work studies serving when one user-visible task spans multiple LLM calls, workflow nodes, or tool boundaries rather than one isolated request. The proposed policy centers on workflow-aware ttl, agent-level fairness, cache-local work stealing. The reported evaluation context includes SWE-bench.",
     "reputation_evidence": "recent preprint; peer-review status is not confirmed by this catalog; author affiliations were not reliably resolved; no official public artifact was confirmed.",
-    "suggested_citation": "Dongxin Guo, Jikun Wu, Siu Ming Yiu. “SAGA: Workflow-Atomic Scheduling for AI Agent Inference on GPU Clusters.” arXiv preprint, 2026, 2026. https://arxiv.org/abs/2605.00528."
+    "suggested_citation": "Dongxin Guo, Jikun Wu, Siu Ming Yiu. “SAGA: Workflow-Atomic Scheduling for AI Agent Inference on GPU Clusters.” arXiv preprint, 2026, 2026. https://arxiv.org/abs/2605.00528.",
+    "plex_v0_6_replication": {
+      "replication_id": "saga",
+      "component": "plex_paper_saga",
+      "operations": [
+        "route",
+        "schedule",
+        "cache"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "validation_status": "passing",
+      "deferred_mechanics": [
+        "physical work stealing"
+      ],
+      "metadata_path": "tests/policies/replications/saga/metadata.json"
+    }
   },
   {
     "label": "Orca",
@@ -978,7 +1180,19 @@
     "abstract_source_available": true,
     "abstract_synopsis": "This work studies request ordering, token allocation, fairness, admission, or latency-SLO control in shared inference serving. The proposed policy centers on provable token-cost fairness. The reported evaluation context includes ShareGPT-derived request traces, Synthetic multi-client fairness traces.",
     "reputation_evidence": "strong publication signal from a selective systems/ML venue (OSDI 2024); author affiliations include UC Berkeley Sky Computing Lab; a public implementation or artifact is linked.",
-    "suggested_citation": "Ying Sheng, Shiyi Cao, Dacheng Li, Banghua Zhu, Zhuohan Li, Danyang Zhuo, et al. “Fairness in Serving Large Language Models.” OSDI 2024, 2024. https://doi.org/10.48550/arxiv.2401.00588."
+    "suggested_citation": "Ying Sheng, Shiyi Cao, Dacheng Li, Banghua Zhu, Zhuohan Li, Danyang Zhuo, et al. “Fairness in Serving Large Language Models.” OSDI 2024, 2024. https://doi.org/10.48550/arxiv.2401.00588.",
+    "plex_v0_6_replication": {
+      "replication_id": "vtc",
+      "component": "plex_paper_vtc",
+      "operations": [
+        "schedule",
+        "feedback"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "validation_status": "passing",
+      "deferred_mechanics": [],
+      "metadata_path": "tests/policies/replications/vtc/metadata.json"
+    }
   },
   {
     "label": "FairServe",
@@ -1032,7 +1246,22 @@
     "abstract_source_available": true,
     "abstract_synopsis": "This work studies request ordering, token allocation, fairness, admission, or latency-SLO control in shared inference serving. The proposed policy centers on interaction-aware throttling and weighted service. The reported evaluation context includes Microsoft Copilot production traces across 34 applications.",
     "reputation_evidence": "recent preprint; peer-review status is not confirmed by this catalog; author affiliations include Microsoft production-serving / Copilot research context; no official public artifact was confirmed.",
-    "suggested_citation": "Redwan Ibne Seraj Khan, Kunal Jain, Haiying Shen, Ankur Mallick, Anjaly Parayil, Anoop Kulkarni, et al. “Ensuring Fair LLM Serving Amid Diverse Applications.” arXiv preprint, 2024, 2024. https://arxiv.org/abs/2411.15997."
+    "suggested_citation": "Redwan Ibne Seraj Khan, Kunal Jain, Haiying Shen, Ankur Mallick, Anjaly Parayil, Anoop Kulkarni, et al. “Ensuring Fair LLM Serving Amid Diverse Applications.” arXiv preprint, 2024, 2024. https://arxiv.org/abs/2411.15997.",
+    "plex_v0_6_replication": {
+      "replication_id": "fairserve",
+      "component": "plex_paper_fairserve",
+      "operations": [
+        "admit",
+        "schedule",
+        "feedback"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "validation_status": "passing",
+      "deferred_mechanics": [
+        "production interference estimator"
+      ],
+      "metadata_path": "tests/policies/replications/fairserve/metadata.json"
+    }
   },
   {
     "label": "DLPM/D²LPM",
@@ -1089,7 +1318,20 @@
     "abstract_source_available": true,
     "abstract_synopsis": "This work studies request ordering, token allocation, fairness, admission, or latency-SLO control in shared inference serving. The proposed policy centers on prefix locality with bounded fair service. The reported evaluation context includes ShareGPT-derived workloads, Multi-turn and long-context QA traces, Synthetic dominant/victim-client fairness scenarios.",
     "reputation_evidence": "recent preprint; peer-review status is not confirmed by this catalog; author affiliations include UC Berkeley, LMSYS Org; no official public artifact was confirmed.",
-    "suggested_citation": "Shiyi Cao, Yichuan Wang, Ziming Mao, Pin-Lun Hsu, Liangsheng Yin, Tian Xia, et al. “Locality-aware Fair Scheduling in LLM Serving.” arXiv preprint, 2025, 2025. https://arxiv.org/abs/2501.14312."
+    "suggested_citation": "Shiyi Cao, Yichuan Wang, Ziming Mao, Pin-Lun Hsu, Liangsheng Yin, Tian Xia, et al. “Locality-aware Fair Scheduling in LLM Serving.” arXiv preprint, 2025, 2025. https://arxiv.org/abs/2501.14312.",
+    "plex_v0_6_replication": {
+      "replication_id": "dlpm",
+      "component": "plex_paper_dlpm",
+      "operations": [
+        "route",
+        "schedule",
+        "feedback"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "validation_status": "passing",
+      "deferred_mechanics": [],
+      "metadata_path": "tests/policies/replications/dlpm/metadata.json"
+    }
   },
   {
     "label": "Andes",
@@ -1357,7 +1599,21 @@
     "abstract_source_available": true,
     "abstract_synopsis": "This work studies request ordering, token allocation, fairness, admission, or latency-SLO control in shared inference serving. The proposed policy centers on slo virtual queues and global queue operations. The reported evaluation context includes ShareGPT, Production-derived interactive and batch SLO configurations.",
     "reputation_evidence": "strong publication signal from a selective systems/ML venue (SoCC 2024); author affiliations include University of Illinois Urbana-Champaign, IBM Research, IBM Research - Ireland; no official public artifact was confirmed.",
-    "suggested_citation": "Archit Patke, Dhemath Reddy, Saurabh Jha, Haoran Qiu, Christian Pinto, Chandra Narayanaswami, et al. “Queue Management for SLO-Oriented Large Language Model Serving.” SoCC 2024, 2024. https://doi.org/10.1145/3698038.3698523."
+    "suggested_citation": "Archit Patke, Dhemath Reddy, Saurabh Jha, Haoran Qiu, Christian Pinto, Chandra Narayanaswami, et al. “Queue Management for SLO-Oriented Large Language Model Serving.” SoCC 2024, 2024. https://doi.org/10.1145/3698038.3698523.",
+    "plex_v0_6_replication": {
+      "replication_id": "qlm",
+      "component": "plex_paper_qlm",
+      "operations": [
+        "admit",
+        "route",
+        "schedule",
+        "feedback"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "validation_status": "passing",
+      "deferred_mechanics": [],
+      "metadata_path": "tests/policies/replications/qlm/metadata.json"
+    }
   },
   {
     "label": "SOLA",
@@ -1455,7 +1711,22 @@
     "abstract_source_available": true,
     "abstract_synopsis": "This work studies request ordering, token allocation, fairness, admission, or latency-SLO control in shared inference serving. The proposed policy centers on multi-stage slo token planning, admission, routing. The reported evaluation context includes ChatBot, Summarizer, Coder, ToolLLM, among other workloads.",
     "reputation_evidence": "recent preprint; peer-review status is not confirmed by this catalog; author affiliations were not reliably resolved; no official public artifact was confirmed.",
-    "suggested_citation": "Siyuan Chen, Zhipeng Jia, Samira Khan, Arvind Krishnamurthy, Phillip B. Gibbons. “SLOs-Serve: Optimized Serving of Multi-SLO LLMs.” arXiv preprint, 2025, 2025. https://arxiv.org/abs/2504.08784."
+    "suggested_citation": "Siyuan Chen, Zhipeng Jia, Samira Khan, Arvind Krishnamurthy, Phillip B. Gibbons. “SLOs-Serve: Optimized Serving of Multi-SLO LLMs.” arXiv preprint, 2025, 2025. https://arxiv.org/abs/2504.08784.",
+    "plex_v0_6_replication": {
+      "replication_id": "slos-serve",
+      "component": "plex_paper_slos_serve",
+      "operations": [
+        "admit",
+        "route",
+        "schedule"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "validation_status": "passing",
+      "deferred_mechanics": [
+        "replica provisioning"
+      ],
+      "metadata_path": "tests/policies/replications/slos-serve/metadata.json"
+    }
   },
   {
     "label": "Apt-Serve",
@@ -1541,7 +1812,20 @@
     "abstract_source_available": true,
     "abstract_synopsis": "This work studies request ordering, token allocation, fairness, admission, or latency-SLO control in shared inference serving. The proposed policy centers on weighted-size queues, per-queue token quotas, bypass, adapter caching. The reported evaluation context includes Synthetic and trace-driven shared-serving workloads; no named public dataset was reliably recovered.",
     "reputation_evidence": "strong publication signal from a selective systems/ML venue (MICRO 2025); author affiliations include University of Illinois Urbana-Champaign, IBM Research; no official public artifact was confirmed.",
-    "suggested_citation": "Nikoleta Iliakopoulou, Jovan Stojkovic, Chloe Alverti, Tianyin Xu, Hubertus Franke, Josep Torrellas. “Chameleon: Adaptive Caching and Scheduling for Many-Adapter LLM Inference Environments.” MICRO 2025, 2025. https://doi.org/10.48550/arxiv.2411.17741."
+    "suggested_citation": "Nikoleta Iliakopoulou, Jovan Stojkovic, Chloe Alverti, Tianyin Xu, Hubertus Franke, Josep Torrellas. “Chameleon: Adaptive Caching and Scheduling for Many-Adapter LLM Inference Environments.” MICRO 2025, 2025. https://doi.org/10.48550/arxiv.2411.17741.",
+    "plex_v0_6_replication": {
+      "replication_id": "chameleon",
+      "component": "plex_paper_chameleon",
+      "operations": [
+        "admit",
+        "schedule",
+        "cache"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "validation_status": "passing",
+      "deferred_mechanics": [],
+      "metadata_path": "tests/policies/replications/chameleon/metadata.json"
+    }
   },
   {
     "label": "PEEK",
@@ -1588,7 +1872,19 @@
     "abstract_source_available": true,
     "abstract_synopsis": "This work studies request ordering, token allocation, fairness, admission, or latency-SLO control in shared inference serving. The proposed policy centers on queue-structure-aware scheduling and eviction. The reported evaluation context includes High-prefix-sharing online workloads, Long-document RAG, Mixed and no-sharing controls on SGLang and vLLM.",
     "reputation_evidence": "recent preprint; peer-review status is not confirmed by this catalog; author affiliations were not reliably resolved; a public implementation or artifact is linked.",
-    "suggested_citation": "Bing Xie, Zhipeng Wang, Masahiro Tanaka, Zheng Zhen. “PEEK: Predictive Queue-Informed KV Cache Management for LLM Serving.” arXiv preprint, 2026. https://arxiv.org/abs/2607.02525."
+    "suggested_citation": "Bing Xie, Zhipeng Wang, Masahiro Tanaka, Zheng Zhen. “PEEK: Predictive Queue-Informed KV Cache Management for LLM Serving.” arXiv preprint, 2026. https://arxiv.org/abs/2607.02525.",
+    "plex_v0_6_replication": {
+      "replication_id": "peek",
+      "component": "plex_paper_peek",
+      "operations": [
+        "schedule",
+        "cache"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "validation_status": "passing",
+      "deferred_mechanics": [],
+      "metadata_path": "tests/policies/replications/peek/metadata.json"
+    }
   },
   {
     "label": "LLM Query Scheduling with Prefix Reuse and Latency Constraints",
@@ -1879,7 +2175,21 @@
     "abstract_source_available": true,
     "abstract_synopsis": "This work studies request ordering, token allocation, fairness, admission, or latency-SLO control in shared inference serving. The proposed policy centers on admit reasoning branches against co-batched latency. The reported evaluation context includes Synthetic and trace-driven shared-serving workloads; no named public dataset was reliably recovered.",
     "reputation_evidence": "recent preprint; peer-review status is not confirmed by this catalog; author affiliations were not reliably resolved; no official public artifact was confirmed.",
-    "suggested_citation": "Swapnil Gandhi, Siva Hari, William J. Dally, Christos Kozyrakis. “Regulating Branch Parallelism in LLM Serving.” arXiv preprint, 2026. https://arxiv.org/abs/2605.06914."
+    "suggested_citation": "Swapnil Gandhi, Siva Hari, William J. Dally, Christos Kozyrakis. “Regulating Branch Parallelism in LLM Serving.” arXiv preprint, 2026. https://arxiv.org/abs/2605.06914.",
+    "plex_v0_6_replication": {
+      "replication_id": "branch-regulation",
+      "component": "plex_paper_branch_regulation",
+      "operations": [
+        "admit",
+        "schedule"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "validation_status": "passing",
+      "deferred_mechanics": [
+        "simultaneous branch execution"
+      ],
+      "metadata_path": "tests/policies/replications/branch-regulation/metadata.json"
+    }
   },
   {
     "label": "PARD",
@@ -1935,7 +2245,21 @@
     "abstract_source_available": true,
     "abstract_synopsis": "This work studies request ordering, token allocation, fairness, admission, or latency-SLO control in shared inference serving. The proposed policy centers on proactively drop work using upstream elapsed time and downstream latency distributions. The reported evaluation context includes Wiki-derived traces, Azure Functions trace, Multi-module inference-pipeline workloads.",
     "reputation_evidence": "strong publication signal from a selective systems/ML venue (EuroSys 2026); author affiliations include Tianjin University, The University of Texas at Dallas, Stevens Institute of Technology; no official public artifact was confirmed.",
-    "suggested_citation": "Zhixin Zhao, Yitao Hu, Simin Chen, Mingfang Ji, Wei Yang, Yuhao Zhang, et al. “PARD: Enhancing Goodput for Inference Pipeline via Proactive Request Dropping.” EuroSys 2026, 2026. https://arxiv.org/abs/2602.08747."
+    "suggested_citation": "Zhixin Zhao, Yitao Hu, Simin Chen, Mingfang Ji, Wei Yang, Yuhao Zhang, et al. “PARD: Enhancing Goodput for Inference Pipeline via Proactive Request Dropping.” EuroSys 2026, 2026. https://arxiv.org/abs/2602.08747.",
+    "plex_v0_6_replication": {
+      "replication_id": "pard",
+      "component": "plex_paper_pard",
+      "operations": [
+        "schedule",
+        "feedback"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "validation_status": "passing",
+      "deferred_mechanics": [
+        "latency-distribution estimator"
+      ],
+      "metadata_path": "tests/policies/replications/pard/metadata.json"
+    }
   },
   {
     "label": "Preble",
@@ -1981,7 +2305,21 @@
     "abstract_source_available": true,
     "abstract_synopsis": "This work studies how requests or state should be placed across replicas, tiers, models, or heterogeneous resources. The proposed policy centers on prefix reuse versus load/eviction-cost routing. The reported evaluation context includes Long shared-prompt and prefix-reuse workloads, Distributed prompt-serving traces used by the Preble artifact.",
     "reputation_evidence": "strong publication signal from a selective systems/ML venue (ICLR 2025); author affiliations include UC San Diego WukLab; a public implementation or artifact is linked.",
-    "suggested_citation": "Vikranth Srivatsa, Zijian He, Reyna Abhyankar, Dongming Li, Yiying Zhang. “Preble: Efficient Distributed Prompt Scheduling for LLM Serving.” ICLR 2025, 2025. https://doi.org/10.48550/arxiv.2407.00023."
+    "suggested_citation": "Vikranth Srivatsa, Zijian He, Reyna Abhyankar, Dongming Li, Yiying Zhang. “Preble: Efficient Distributed Prompt Scheduling for LLM Serving.” ICLR 2025, 2025. https://doi.org/10.48550/arxiv.2407.00023.",
+    "plex_v0_6_replication": {
+      "replication_id": "preble",
+      "component": "plex_paper_preble",
+      "operations": [
+        "route"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "validation_status": "passing",
+      "deferred_mechanics": [
+        "prefix replication",
+        "autoscaling"
+      ],
+      "metadata_path": "tests/policies/replications/preble/metadata.json"
+    }
   },
   {
     "label": "LMetric",
@@ -2034,7 +2372,18 @@
     "abstract_source_available": true,
     "abstract_synopsis": "This work studies how requests or state should be placed across replicas, tiers, models, or heterogeneous resources. The proposed policy centers on multiplicative cache/load score. The reported evaluation context includes Alibaba Bailian Qwen ChatBot, Agent, and Coder traces, Kimi ToolAgent trace, Azure LLM inference trace.",
     "reputation_evidence": "strong publication signal from a selective systems/ML venue (OSDI 2026); author affiliations include Shanghai Jiao Tong University, Alibaba Cloud; a public implementation or artifact is linked.",
-    "suggested_citation": "Dingyan Zhang, Jinbo Han, Kaixi Zhang, Xingda Wei, Sijie Shen, Chenguang Fang, et al. “Simple is Better: Multiplication May Be All You Need for LLM Request Scheduling.” OSDI 2026, 2026. https://arxiv.org/abs/2603.15202."
+    "suggested_citation": "Dingyan Zhang, Jinbo Han, Kaixi Zhang, Xingda Wei, Sijie Shen, Chenguang Fang, et al. “Simple is Better: Multiplication May Be All You Need for LLM Request Scheduling.” OSDI 2026, 2026. https://arxiv.org/abs/2603.15202.",
+    "plex_v0_6_replication": {
+      "replication_id": "lmetric",
+      "component": "plex_paper_lmetric",
+      "operations": [
+        "route"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "validation_status": "passing",
+      "deferred_mechanics": [],
+      "metadata_path": "tests/policies/replications/lmetric/metadata.json"
+    }
   },
   {
     "label": "DualMap",
@@ -2082,7 +2431,20 @@
     "abstract_source_available": true,
     "abstract_synopsis": "This work studies how requests or state should be placed across replicas, tiers, models, or heterogeneous resources. The proposed policy centers on two-choice cache-affinity routing and hotspot migration. The reported evaluation context includes Conversation and Tool/Agent shared-prefix workloads, Real-world-style vLLM request traces.",
     "reputation_evidence": "strong publication signal from a selective systems/ML venue (ICLR 2026); author affiliations include Huazhong University of Science and Technology, Huawei; a public implementation or artifact is linked.",
-    "suggested_citation": "Ying Yuan, Pengfei Zuo, Bo Wang, Zhangyu Chen, Zhipeng Tan, Zhou Yu. “DualMap: Enabling Both Cache Affinity and Load Balancing for Distributed LLM Serving.” ICLR 2026, 2026. https://arxiv.org/abs/2602.06502."
+    "suggested_citation": "Ying Yuan, Pengfei Zuo, Bo Wang, Zhangyu Chen, Zhipeng Tan, Zhou Yu. “DualMap: Enabling Both Cache Affinity and Load Balancing for Distributed LLM Serving.” ICLR 2026, 2026. https://arxiv.org/abs/2602.06502.",
+    "plex_v0_6_replication": {
+      "replication_id": "dualmap",
+      "component": "plex_paper_dualmap",
+      "operations": [
+        "route"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "validation_status": "passing",
+      "deferred_mechanics": [
+        "physical migration"
+      ],
+      "metadata_path": "tests/policies/replications/dualmap/metadata.json"
+    }
   },
   {
     "label": "Llumnix",
@@ -2131,7 +2493,21 @@
     "abstract_source_available": true,
     "abstract_synopsis": "This work studies how requests or state should be placed across replicas, tiers, models, or heterogeneous resources. The proposed policy centers on virtual-usage-driven live rescheduling. The reported evaluation context includes ShareGPT-derived heterogeneous request traces, Priority, fragmentation, load-balancing, and autoscaling scenarios.",
     "reputation_evidence": "strong publication signal from a selective systems/ML venue (OSDI 2024); author affiliations include Shanghai Jiao Tong University, Microsoft Research; a public implementation or artifact is linked.",
-    "suggested_citation": "Biao Sun, Ziming Huang, Hanyu Zhao, Wencong Xiao, Xinyi Zhang, Yong Li, et al. “Llumnix: Dynamic Scheduling for Large Language Model Serving.” OSDI 2024, 2024. https://doi.org/10.48550/arxiv.2406.03243."
+    "suggested_citation": "Biao Sun, Ziming Huang, Hanyu Zhao, Wencong Xiao, Xinyi Zhang, Yong Li, et al. “Llumnix: Dynamic Scheduling for Large Language Model Serving.” OSDI 2024, 2024. https://doi.org/10.48550/arxiv.2406.03243.",
+    "plex_v0_6_replication": {
+      "replication_id": "llumnix",
+      "component": "plex_paper_llumnix",
+      "operations": [
+        "route",
+        "feedback"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "validation_status": "passing",
+      "deferred_mechanics": [
+        "physical migration"
+      ],
+      "metadata_path": "tests/policies/replications/llumnix/metadata.json"
+    }
   },
   {
     "label": "Intelligent Router for LLM Workloads",
@@ -2265,7 +2641,20 @@
     "abstract_source_available": true,
     "abstract_synopsis": "This work studies how requests or state should be placed across replicas, tiers, models, or heterogeneous resources. The proposed policy centers on joint model routing and load balancing on heterogeneous fleets. The reported evaluation context includes Multi-replica or heterogeneous-cluster trace-driven workloads; no named public dataset was reliably recovered.",
     "reputation_evidence": "recent preprint; peer-review status is not confirmed by this catalog; author affiliations were not reliably resolved; no official public artifact was confirmed.",
-    "suggested_citation": "Wei Da, Evangelia Kalyvianaki. “RouteBalance: Fused Model Routing and Load Balancing for Heterogeneous LLM Serving.” arXiv preprint, 2026. https://arxiv.org/abs/2606.17949."
+    "suggested_citation": "Wei Da, Evangelia Kalyvianaki. “RouteBalance: Fused Model Routing and Load Balancing for Heterogeneous LLM Serving.” arXiv preprint, 2026. https://arxiv.org/abs/2606.17949.",
+    "plex_v0_6_replication": {
+      "replication_id": "routebalance",
+      "component": "plex_paper_routebalance",
+      "operations": [
+        "route"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "validation_status": "passing",
+      "deferred_mechanics": [
+        "replica provisioning"
+      ],
+      "metadata_path": "tests/policies/replications/routebalance/metadata.json"
+    }
   },
   {
     "label": "DistServe",
@@ -2991,7 +3380,18 @@
     "abstract_source_available": true,
     "abstract_synopsis": "This work studies which KV, model, or session state should remain resident, be evicted, or be prefetched. The proposed policy centers on prefix-aware gdsf score: recency + frequency × recompute cost / size. The reported evaluation context includes Retrieval-augmented generation workloads with ordered document sequences.",
     "reputation_evidence": "recent preprint; peer-review status is not confirmed by this catalog; author affiliations include Peking University; no official public artifact was confirmed.",
-    "suggested_citation": "Chao Jin, Zili Zhang, Xuanlin Jiang, Fangyue Liu, Xin Liu, Xuanzhe Liu, et al. “RAGCache: Efficient Knowledge Caching for Retrieval-Augmented Generation.” arXiv preprint, 2024, 2024. https://doi.org/10.48550/arxiv.2404.12457."
+    "suggested_citation": "Chao Jin, Zili Zhang, Xuanlin Jiang, Fangyue Liu, Xin Liu, Xuanzhe Liu, et al. “RAGCache: Efficient Knowledge Caching for Retrieval-Augmented Generation.” arXiv preprint, 2024, 2024. https://doi.org/10.48550/arxiv.2404.12457.",
+    "plex_v0_6_replication": {
+      "replication_id": "ragcache",
+      "component": "plex_paper_ragcache",
+      "operations": [
+        "cache"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "validation_status": "passing",
+      "deferred_mechanics": [],
+      "metadata_path": "tests/policies/replications/ragcache/metadata.json"
+    }
   },
   {
     "label": "Marconi",
@@ -3036,7 +3436,21 @@
     "abstract_source_available": true,
     "abstract_synopsis": "This work studies which KV, model, or session state should remain resident, be evicted, or be prefetched. The proposed policy centers on reuse-likelihood cache admission and flop-per-byte eviction for hybrid models. The reported evaluation context includes Prefix/cache-pressure and memory-tier workloads; no named public dataset was reliably recovered.",
     "reputation_evidence": "strong publication signal from a selective systems/ML venue (MLSys 2025); author affiliations were not reliably resolved; a public implementation or artifact is linked.",
-    "suggested_citation": "Rui Pan, Zhuang Wang, Zhen Jia, Can Karakus, Luca Zancato, Tri Dao, et al. “Marconi: Prefix Caching for the Era of Hybrid LLMs.” MLSys 2025, 2025. https://arxiv.org/abs/2411.19379."
+    "suggested_citation": "Rui Pan, Zhuang Wang, Zhen Jia, Can Karakus, Luca Zancato, Tri Dao, et al. “Marconi: Prefix Caching for the Era of Hybrid LLMs.” MLSys 2025, 2025. https://arxiv.org/abs/2411.19379.",
+    "plex_v0_6_replication": {
+      "replication_id": "marconi",
+      "component": "plex_paper_marconi",
+      "operations": [
+        "cache",
+        "feedback"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "validation_status": "passing",
+      "deferred_mechanics": [
+        "hybrid-model kernel integration"
+      ],
+      "metadata_path": "tests/policies/replications/marconi/metadata.json"
+    }
   },
   {
     "label": "HotPrefix",
@@ -3080,7 +3494,21 @@
     "abstract_source_available": true,
     "abstract_synopsis": "This work studies which KV, model, or session state should remain resident, be evicted, or be prefetched. The proposed policy centers on hotness tracking, selective admission, cpu/gpu promotion. The reported evaluation context includes Prefix/cache-pressure and memory-tier workloads; no named public dataset was reliably recovered.",
     "reputation_evidence": "strong publication signal from a selective systems/ML venue (PACMMOD / SIGMOD 2026); author affiliations include Nanjing University; no official public artifact was confirmed.",
-    "suggested_citation": "Yuhang Li, Rong Gu, Chengying Huan, Zhibin Wang, Renjie Yao, Chen Tian, et al. “HotPrefix: Hotness-Aware KV Cache Scheduling for Efficient Prefix Sharing in LLM Inference Systems.” PACMMOD / SIGMOD 2026, 2026. https://doi.org/10.1145/3749168."
+    "suggested_citation": "Yuhang Li, Rong Gu, Chengying Huan, Zhibin Wang, Renjie Yao, Chen Tian, et al. “HotPrefix: Hotness-Aware KV Cache Scheduling for Efficient Prefix Sharing in LLM Inference Systems.” PACMMOD / SIGMOD 2026, 2026. https://doi.org/10.1145/3749168.",
+    "plex_v0_6_replication": {
+      "replication_id": "hotprefix",
+      "component": "plex_paper_hotprefix",
+      "operations": [
+        "cache",
+        "feedback"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "validation_status": "passing",
+      "deferred_mechanics": [
+        "physical tier promotion"
+      ],
+      "metadata_path": "tests/policies/replications/hotprefix/metadata.json"
+    }
   },
   {
     "label": "UniCache",

@@ -42,6 +42,17 @@ Existing direct `R`.
 
 Named datasets/workloads identified from the primary text or manual audit.
 
+<!-- plex-v0.6-replication:start -->
+## PLEX v0.6 replication status
+
+- Component: `plex_paper_preble`
+- Operations: `route`
+- Evidence: `policy-kernel-reproduction`
+- Validation: `passing`
+- Metadata: [`tests/policies/replications/preble/metadata.json`](../../tests/policies/replications/preble/metadata.json)
+- Deferred mechanics: prefix replication; autoscaling
+<!-- plex-v0.6-replication:end -->
+
 ## Suggested citation
 
 Vikranth Srivatsa, Zijian He, Reyna Abhyankar, Dongming Li, Yiying Zhang. “Preble: Efficient Distributed Prompt Scheduling for LLM Serving.” ICLR 2025, 2025. https://doi.org/10.48550/arxiv.2407.00023.

@@ -42,6 +42,17 @@ Workflow synthesis, Belady-like cache policy, lookahead scheduling, proactive sc
 
 Named datasets/workloads identified from the primary text or manual audit.
 
+<!-- plex-v0.6-replication:start -->
+## PLEX v0.6 replication status
+
+- Component: `plex_paper_pythia`
+- Operations: `route`, `schedule`, `cache`, `feedback`
+- Evidence: `policy-kernel-reproduction`
+- Validation: `passing`
+- Metadata: [`tests/policies/replications/pythia/metadata.json`](../../tests/policies/replications/pythia/metadata.json)
+- Deferred mechanics: proactive scaling
+<!-- plex-v0.6-replication:end -->
+
 ## Suggested citation
 
 Shan Yu, Junyi Shu, Yuanjiang Ni, Kun Qian, Xue Li, Yang Wang, et al. “Pythia: Exploiting Workflow Predictability for Efficient Agent-Native LLM Serving.” arXiv preprint, 2026, 2026. https://arxiv.org/abs/2604.25899.
