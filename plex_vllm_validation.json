@@ -1,0 +1,188 @@
+{
+  "schema_version": 1,
+  "validated_at": "2026-07-23",
+  "pie": {
+    "repository": "pie-project/pie",
+    "branch": "tasks/plex/agents/alpha",
+    "commit": "eba63e00a5034695a4d2b13f33f6bfe872ac0491",
+    "fuel_removal_commit": "c95e23cb1eeaaf5e8e15e7f53c1ab03a89a96d15"
+  },
+  "vllm": {
+    "repository": "ingim/vllm",
+    "branch": "main",
+    "commit": "9540799585d27e8e8c1c732438315f22e6e96b5d"
+  },
+  "environment": {
+    "gpu": "NVIDIA A100 80GB PCIe",
+    "gpu_memory_mib": 81920,
+    "driver": "580.159.03",
+    "python": "3.12.13",
+    "pytorch": "2.11.0+cu130",
+    "cuda": "13.0",
+    "flashinfer": "0.6.15.post1",
+    "vllm": "0.1.dev19007+g910cc8543",
+    "pie_plex": "0.6.0",
+    "model": "Qwen/Qwen2.5-0.5B-Instruct"
+  },
+  "adapter": {
+    "engine_api": "pie.plex.engine@2",
+    "package_format": 6,
+    "hot_path": "cached immutable plan read with immediate native fallback",
+    "publish_interval_ms": 25,
+    "plan_ttl_ms": 250,
+    "queue_capacity": 256,
+    "schedule": "one-shot singleton selection hints with native feasibility revalidation",
+    "cache": "ordered request-level virtual reclaim decisions under KV pressure",
+    "feedback": "acknowledged and coalesced progress, enactment, preemption, completion, abort, and cleanup",
+    "actions": "not advertised",
+    "request_field_boundary": "fields.body is host-protected; other fields are policy-private"
+  },
+  "validation": {
+    "plex_release_gate": "passed",
+    "vllm_tests": {
+      "scheduler_plex": 14,
+      "openai_protocol": 3,
+      "argument_config": 1,
+      "ruff": "passed"
+    },
+    "benchmark": {
+      "batch": 16,
+      "output_tokens_per_request": 256,
+      "repeats": 5,
+      "native_tokens_per_second": [
+        6899.441993063872,
+        6898.291337427608,
+        6888.969159260995,
+        6902.706514014581,
+        6902.81528120909
+      ],
+      "plex_tokens_per_second": [
+        6872.737050404846,
+        6893.241664513352,
+        6883.770964333089,
+        6893.719277794457,
+        6891.872799355871
+      ],
+      "native_median_tokens_per_second": 6899.441993063872,
+      "plex_median_tokens_per_second": 6891.872799355871,
+      "delta_percent": -0.10970733163073731,
+      "token_outputs_equal": true,
+      "token_output_sha256": "e4366b992a6add6e5c8afa8fe7155ac70ea58c426bcd6cb34cdec31feeabc27a",
+      "worker": {
+        "submitted": 208,
+        "dropped": 0,
+        "completed": 208,
+        "success": 203,
+        "fallback": 0,
+        "unavailable": 0,
+        "rejected": 9,
+        "schedule_success": 103,
+        "feedback_success": 100,
+        "schedule_enacted": 1394,
+        "schedule_partial": 16
+      }
+    },
+    "continuation": {
+      "generations": [0, 1],
+      "output_tokens": [32, 32],
+      "fallback": 0,
+      "dropped": 0,
+      "schedule_enacted": 5,
+      "schedule_partial": 1
+    },
+    "cache_pressure": {
+      "policy": "RAGCache",
+      "requests": 8,
+      "prompt_tokens_approx": 512,
+      "output_tokens_per_request": 128,
+      "kv_cache_memory_bytes": 13631488,
+      "cache_success": 69,
+      "cache_enacted": 5,
+      "fallback": 0,
+      "dropped": 0
+    },
+    "representative_policies": [
+      {
+        "policy": "Coordinated",
+        "schedule_success": 10,
+        "feedback_success": 9,
+        "schedule_enacted": 42,
+        "schedule_partial": 8,
+        "fallback": 0,
+        "dropped": 0
+      },
+      {
+        "policy": "Agentix",
+        "success": 11,
+        "unavailable": 0,
+        "fallback": 0,
+        "dropped": 0
+      },
+      {
+        "policy": "VTC",
+        "schedule_success": 10,
+        "feedback_success": 8,
+        "schedule_enacted": 42,
+        "schedule_partial": 8,
+        "fallback": 0,
+        "dropped": 0
+      },
+      {
+        "policy": "FairServe",
+        "success": 13,
+        "unavailable": 0,
+        "fallback": 0,
+        "dropped": 0
+      },
+      {
+        "policy": "Helium",
+        "success": 9,
+        "unavailable": 8,
+        "expected_unavailable": ["feedback"],
+        "fallback": 0,
+        "dropped": 0
+      },
+      {
+        "policy": "Continuum",
+        "success": 13,
+        "unavailable": 0,
+        "fallback": 0,
+        "dropped": 0
+      },
+      {
+        "policy": "KVFlow",
+        "success": 9,
+        "unavailable": 7,
+        "expected_unavailable": ["feedback"],
+        "fallback": 0,
+        "dropped": 0
+      },
+      {
+        "policy": "PEEK",
+        "success": 8,
+        "unavailable": 6,
+        "expected_unavailable": ["feedback"],
+        "fallback": 0,
+        "dropped": 0
+      },
+      {
+        "policy": "RAGCache",
+        "cache_success": 69,
+        "cache_enacted": 5,
+        "expected_unavailable": ["schedule", "feedback"],
+        "fallback": 0,
+        "dropped": 0
+      }
+    ],
+    "gpu_memory_released_after_runs": true
+  },
+  "unsupported_or_limited": [
+    "in-engine admit",
+    "in-engine route",
+    "object/page-level cache admission",
+    "PLEX actions",
+    "multi-request atomic schedule selections",
+    "cross-process policy state",
+    "authenticated identity derivation from public request metadata"
+  ]
+}
