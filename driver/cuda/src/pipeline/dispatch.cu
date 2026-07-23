@@ -1525,6 +1525,48 @@ void CUDART_CB notify_runtime_callback(void* userdata) {
             entry.commit_host != nullptr && *(entry.commit_host) != 0;
         const bool failed = entry.poison;
         const bool retry = !failed && !committed;
+        if (retry && ctx->fire_timing_enabled) {
+            // Bounded diagnostic: dump the retried lane's endpoint state so
+            // an uncommitted pass names the gate that refused it (ring
+            // expectation vs live words; rings all matching implicates the
+            // envelope/fixed-decode kill path instead).
+            static std::atomic<int> retry_dumps{0};
+            if (retry_dumps.fetch_add(1, std::memory_order_relaxed) < 48) {
+                std::string line;
+                line.reserve(512);
+                line += "[pie-fire-timing] {\"schema\":1,\"source\":\"driver\","
+                        "\"event\":\"retry_lane\",\"endpoints\":[";
+                bool first = true;
+                auto dump = [&](const char* kind, const auto& updates) {
+                    for (const auto& update : updates) {
+                        if (update.words == nullptr) continue;
+                        if (!first) line += ",";
+                        first = false;
+                        char buf[160];
+                        std::snprintf(
+                            buf, sizeof(buf),
+                            "{\"kind\":\"%s\",\"slot\":%u,\"target\":%llu,"
+                            "\"head\":%llu,\"tail\":%llu,\"poison\":%llu}",
+                            kind, update.slot,
+                            static_cast<unsigned long long>(update.target),
+                            static_cast<unsigned long long>(
+                                std::atomic_ref<std::uint64_t>(update.words[0])
+                                    .load(std::memory_order_acquire)),
+                            static_cast<unsigned long long>(
+                                std::atomic_ref<std::uint64_t>(update.words[1])
+                                    .load(std::memory_order_acquire)),
+                            static_cast<unsigned long long>(
+                                std::atomic_ref<std::uint64_t>(update.words[2])
+                                    .load(std::memory_order_acquire)));
+                        line += buf;
+                    }
+                };
+                dump("publish", entry.published);
+                dump("consume", entry.consumed);
+                line += "]}";
+                std::fprintf(stderr, "%s\n", line.c_str());
+            }
+        }
         if (committed) {
             for (const auto& update : entry.published) {
                 const std::uint64_t actual =
@@ -5254,7 +5296,16 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
             ++candidate.device_count;
         }
         if (candidate.device_count == 0) return false;
-        candidate.device_composed = all_decode_envelopes;
+        // The placeholder geometry this template stages is consumable ONLY
+        // by the fully device-composed path (`enqueue_fixed_decode`, which
+        // re-derives every lane's real geometry from device cells). A MIXED
+        // batch (Host-class chunk lanes present) routes to
+        // `enqueue_decode_envelopes`, which trusts the host page spans —
+        // feeding it the 1-page placeholder containment-kills every
+        // envelope lane past its first page. Mixed batches must resolve
+        // real geometry through the descriptor fallback below.
+        if (!all_decode_envelopes) return false;
+        candidate.device_composed = true;
         out = std::move(candidate);
         return true;
     };

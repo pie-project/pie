@@ -4067,6 +4067,15 @@ impl BatchScheduler {
         let mut grouping = LaunchGrouping::default();
         let mut selected: Vec<PendingRequest> = Vec::new();
         let mut deferred: Vec<PendingRequest> = Vec::new();
+        // Frame waves launch geometry-homogeneous batches: wire-geometry
+        // (chunk) and device-resolved (decode) fires of one wave go out as
+        // SEPARATE launches. A mixed batch resolves through the driver's
+        // descriptor fallback, whose port readback synchronizes the compute
+        // stream and drains the whole chained pipeline once per epoch;
+        // homogeneous batches launch observation-free (wire geometry, or
+        // the device-composed template). The deferred class re-dispatches
+        // as the wave's next batch on the following plan pass.
+        let mut batch_device_geometry: Option<bool> = None;
         for request in picked {
             if request.completion.is_settled() || request.completion.cancel_requested() {
                 if !request.completion.is_settled() {
@@ -4109,6 +4118,11 @@ impl BatchScheduler {
                 .pipeline_id
                 .is_some_and(|pid| copy_barriers.contains(&pid))
             {
+                deferred.push(request);
+                continue;
+            }
+            let device_geometry = request.request.device_resolved_geometry;
+            if *batch_device_geometry.get_or_insert(device_geometry) != device_geometry {
                 deferred.push(request);
                 continue;
             }

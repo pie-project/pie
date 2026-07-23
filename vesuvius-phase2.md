@@ -114,6 +114,27 @@ hold the next seal a fixed window so the herd's binds land in the same
 epoch (the bootstrap cold hold generalized to membership-shrink
 boundaries; a static deployment constant, no runtime adaptation).
 
+## M1d — the chained-churn crater: a driver template-path unsoundness
+
+With merge+gather landed, chain=3 still cratered 2048×32 (12.7–16.9k,
+thousands of per-fire RETRYs) while chain=1 was clean. Diagnostics
+(bounded retry-lane endpoint dumps + an envelope-kill probe) showed the
+retried lanes' ring state matched their tickets exactly — the kill was
+`compose_decode_envelopes`' containment check firing with
+`source_page_count = 1`: the **placeholder geometry** from
+`try_device_composed_template`. The shortcut accepted MIXED batches
+(Host-class chunk lanes + canonical envelope decodes), returned 1-page
+placeholder spans, and set `device_composed = false` — which routes to
+`enqueue_decode_envelopes`, the variant that TRUSTS host page spans. Every
+envelope lane past its first page then containment-killed, cascading down
+its chained successors (ring never advances → ticket mismatch → RETRY),
+and the wave-ordered makeups replayed the epoch at ~half throughput.
+Chain=1 never tripped it (its mixed batches happened to resolve through
+the descriptor fallback). Fix: the template shortcut now applies only to
+fully device-composed batches (`all_decode_envelopes`); mixed batches
+always resolve real geometry through the fallback — which at wave 0 of a
+strict round observes only drained state and never retries.
+
 ## Scoped next milestones
 
 - **M2 — frame-boundary settlement**: keep per-wave publication (mirror
