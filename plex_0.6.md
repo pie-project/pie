@@ -6,6 +6,11 @@
 - Target contract: `pie:plex@0.6.0`
 - Normative contract: [`plex_0.6_contract.md`](plex_0.6_contract.md)
 - Migration guide: [`plex_0.5_to_0.6.md`](plex_0.5_to_0.6.md)
+- Implementation status:
+  - Phase 0 complete: contract, Rust semantic types, WIT, schemas, and registry
+  - Phase 1 complete: trusted group/request state, lifecycle, revisions, quotas,
+    cleanup, deduplication, and scope-conflict metrics
+  - active runtime ABI remains v0.5 until Phase 3
 - Inputs:
   - [`plex.md`](plex.md), the implemented v0.5 contract
   - [`plex_gap.md`](plex_gap.md), the design-gap audit
