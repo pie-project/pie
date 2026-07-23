@@ -15,6 +15,9 @@
     and replay-order records
   - Phase 3 complete: package format 6, typed component ABI, active Rust
     runtime/API, guest SDK, and Python binding
+  - Phase 4 complete: required/optional negotiation, standard action schemas,
+    subject authorization, idempotent staging, outcome correlation, and
+    cancellation cleanup
   - adapters and the remaining fixture corpus migrate in Phase 5
 - Inputs:
   - [`plex.md`](plex.md), the implemented v0.5 contract

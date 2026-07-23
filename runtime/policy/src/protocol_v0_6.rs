@@ -129,6 +129,7 @@ pub struct ProtocolLimitsV0_6 {
     pub max_mechanics: usize,
     pub max_tracked_opportunities: usize,
     pub max_cache_episodes: usize,
+    pub max_action_records: usize,
 }
 
 impl Default for ProtocolLimitsV0_6 {
@@ -147,6 +148,7 @@ impl Default for ProtocolLimitsV0_6 {
             max_mechanics: 64,
             max_tracked_opportunities: 4_096,
             max_cache_episodes: 1_024,
+            max_action_records: 16_384,
         }
     }
 }

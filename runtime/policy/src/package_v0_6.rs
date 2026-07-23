@@ -8,7 +8,7 @@ use wasmtime::component::{Component, HasSelf, Linker};
 
 use crate::bindings_v0_6::exports::pie::plex::policy::Guest as PolicyGuest;
 use crate::bindings_v0_6::{PlexPolicy, PlexPolicyPre};
-use crate::context::{InvocationContext, InvocationContextConfig};
+use crate::context::{InvocationAuthorizationV0_6, InvocationContext, InvocationContextConfig};
 use crate::engine::{PolicyEngine, PolicyEngineConfig};
 use crate::error::{Invocation, InvocationFailure, InvocationFailureKind};
 use crate::host::{QueryHandler, RejectingQueryHandler, StagedAction};
@@ -101,6 +101,7 @@ impl AttachedPolicyV0_6 {
         state: StateSnapshotV0_6,
         query_handler: Arc<dyn QueryHandler>,
         supported_actions: Arc<BTreeSet<String>>,
+        negotiated_mechanics: Arc<BTreeSet<pie_plex::v0_6::MechanicId>>,
         protocol_limits: ProtocolLimitsV0_6,
     ) -> Invocation<PreparedPolicyResultV0_6> {
         let operation = context.operation();
@@ -118,6 +119,7 @@ impl AttachedPolicyV0_6 {
             state,
             query_handler,
             supported_actions,
+            negotiated_mechanics,
             protocol_limits,
         )
     }
@@ -128,6 +130,7 @@ impl AttachedPolicyV0_6 {
         state: StateSnapshotV0_6,
         query_handler: Arc<dyn QueryHandler>,
         supported_actions: Arc<BTreeSet<String>>,
+        negotiated_mechanics: Arc<BTreeSet<pie_plex::v0_6::MechanicId>>,
         protocol_limits: ProtocolLimitsV0_6,
     ) -> Invocation<PreparedPolicyResultV0_6> {
         let input_bytes = match serialized_len(&(&context, &state.state)) {
@@ -155,10 +158,12 @@ impl AttachedPolicyV0_6 {
                 ));
             }
         };
-        let (mut store, policy) = match self.instantiate(query_handler, supported_actions) {
-            Ok(value) => value,
-            Err(failure) => return Invocation::FallbackRequired(failure),
-        };
+        let authorization = invocation_authorization(&context, &state.state, &negotiated_mechanics);
+        let (mut store, policy) =
+            match self.instantiate(query_handler, supported_actions, authorization) {
+                Ok(value) => value,
+                Err(failure) => return Invocation::FallbackRequired(failure),
+            };
         let guest = policy.pie_plex_policy();
         let (plan, state_update) = match call_operation(&context, &state.state, guest, &mut store) {
             Ok(Ok(output)) => output,
@@ -232,6 +237,7 @@ impl AttachedPolicyV0_6 {
         &self,
         query_handler: Arc<dyn QueryHandler>,
         supported_actions: Arc<BTreeSet<String>>,
+        authorization: InvocationAuthorizationV0_6,
     ) -> Result<(Store<InvocationContext>, PlexPolicy), InvocationFailure> {
         let memory_bytes =
             usize::try_from(self.inner.manifest.limits.memory_bytes).unwrap_or(usize::MAX);
@@ -241,6 +247,7 @@ impl AttachedPolicyV0_6 {
                 memory_bytes,
                 query_handler,
                 supported_actions,
+                authorization: Some(authorization),
                 max_host_calls: self
                     .inner
                     .manifest
@@ -386,6 +393,7 @@ fn probe_instantiation(
             memory_bytes,
             query_handler: Arc::new(RejectingQueryHandler),
             supported_actions: Arc::new(BTreeSet::new()),
+            authorization: None,
             max_host_calls: manifest
                 .limits
                 .host_calls
@@ -404,6 +412,51 @@ fn probe_instantiation(
     pre.instantiate(&mut store)
         .map_err(|error| AttachmentErrorV0_6::Instantiate(error.to_string()))?;
     Ok(())
+}
+
+fn invocation_authorization(
+    context: &OperationContextV0_6,
+    state: &pie_plex::v0_6::PolicyState,
+    negotiated_mechanics: &BTreeSet<pie_plex::v0_6::MechanicId>,
+) -> InvocationAuthorizationV0_6 {
+    let cache_object_ids = match context {
+        OperationContextV0_6::Cache(context) => context
+            .resident
+            .iter()
+            .map(|resident| resident.object.object_id.0.clone())
+            .chain(
+                context
+                    .prospective
+                    .iter()
+                    .map(|object| object.object_id.0.clone()),
+            )
+            .collect(),
+        _ => BTreeSet::new(),
+    };
+    let target_ids = match context {
+        OperationContextV0_6::Route(context) => context
+            .targets
+            .iter()
+            .map(|target| target.target_id.0.clone())
+            .collect(),
+        _ => BTreeSet::new(),
+    };
+    InvocationAuthorizationV0_6 {
+        operation: context.operation(),
+        mechanics: negotiated_mechanics.clone(),
+        request_ids: state
+            .requests
+            .iter()
+            .map(|request| request.request.request_id.0.clone())
+            .collect(),
+        group_ids: state
+            .groups
+            .iter()
+            .map(|group| group.group_id.0.clone())
+            .collect(),
+        cache_object_ids,
+        target_ids,
+    }
 }
 
 fn verify_component_surface(

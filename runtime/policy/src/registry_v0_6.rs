@@ -75,6 +75,7 @@ struct AttachmentSetV0_6 {
 struct AttachedRecordV0_6 {
     policy: AttachedPolicyV0_6,
     negotiated_mechanics: BTreeSet<MechanicId>,
+    action_methods: BTreeSet<String>,
 }
 
 impl AttachmentRegistryV0_6 {
@@ -107,8 +108,10 @@ impl AttachmentRegistryV0_6 {
 
     pub fn attach_prepared(&self, policy: AttachedPolicyV0_6) -> Result<u64, RegistryErrorV0_6> {
         validate_requirements(policy.manifest(), &self.support)?;
+        let negotiated_mechanics = negotiated_mechanics(policy.manifest(), &self.support);
         let record = AttachedRecordV0_6 {
-            negotiated_mechanics: negotiated_mechanics(policy.manifest(), &self.support),
+            action_methods: standard_mechanic_action_methods(&negotiated_mechanics)?,
+            negotiated_mechanics,
             policy,
         };
         let mut state = self.lock_stable();
@@ -131,8 +134,10 @@ impl AttachmentRegistryV0_6 {
 
     pub fn replace(&self, package: &[u8]) -> Result<u64, RegistryErrorV0_6> {
         let policy = self.prepare(package)?;
+        let negotiated_mechanics = negotiated_mechanics(policy.manifest(), &self.support);
         let replacement = AttachedRecordV0_6 {
-            negotiated_mechanics: negotiated_mechanics(policy.manifest(), &self.support),
+            action_methods: standard_mechanic_action_methods(&negotiated_mechanics)?,
+            negotiated_mechanics,
             policy,
         };
         let package_name = replacement.policy.manifest().package_name.clone();
@@ -214,7 +219,6 @@ impl AttachmentRegistryV0_6 {
             .ok_or(RegistryErrorV0_6::SnapshotCounterExhausted)?;
         Ok(AttachmentSnapshotV0_6 {
             set: state.active.clone(),
-            support: self.support.clone(),
             _lease: Arc::new(SnapshotLeaseV0_6 {
                 registry: self.inner.clone(),
             }),
@@ -313,7 +317,6 @@ impl Drop for SnapshotLeaseV0_6 {
 #[derive(Clone)]
 pub struct AttachmentSnapshotV0_6 {
     set: Arc<AttachmentSetV0_6>,
-    support: Arc<HostSupportV0_6>,
     _lease: Arc<SnapshotLeaseV0_6>,
 }
 
@@ -362,7 +365,8 @@ impl AttachmentSnapshotV0_6 {
             context,
             state,
             query_handler,
-            Arc::new(self.support.action_methods.clone()),
+            Arc::new(record.action_methods.clone()),
+            Arc::new(record.negotiated_mechanics.clone()),
             protocol_limits,
         )
     }
@@ -442,7 +446,7 @@ pub enum RegistryErrorV0_6 {
 mod tests {
     use std::collections::BTreeSet;
 
-    use pie_plex::v0_6::{ContractVersion, PolicyLimits, SchemaRequirement};
+    use pie_plex::v0_6::{ContractVersion, PolicyLimits, SchemaKind, SchemaRequirement};
 
     use super::*;
 
@@ -489,5 +493,22 @@ mod tests {
                 MechanicId::from("cache.prefetch@1")
             ])
         );
+
+        let mut schema_manifest = manifest;
+        schema_manifest.schemas.insert(SchemaRequirement {
+            kind: SchemaKind::ActionInput,
+            id: "pie.request.cancel@1".into(),
+            required: true,
+        });
+        assert!(matches!(
+            validate_requirements(&schema_manifest, &support),
+            Err(RegistryErrorV0_6::MissingRequiredSchema { .. })
+        ));
+        let mut schema_support = support;
+        schema_support.schemas.insert(SchemaKeyV0_6 {
+            kind: SchemaKind::ActionInput,
+            id: "pie.request.cancel@1".into(),
+        });
+        validate_requirements(&schema_manifest, &schema_support).unwrap();
     }
 }

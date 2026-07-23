@@ -4,9 +4,14 @@
   "title": "PLEX v0.6 standard action feedback facts",
   "type": "object",
   "additionalProperties": false,
-  "required": ["action_id", "status", "facts"],
+  "required": ["opportunity_id", "method", "idempotency_key", "status"],
   "properties": {
-    "action_id": {"type": "integer", "minimum": 0},
+    "opportunity_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "method": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9._-]*@[1-9][0-9]*$"
+    },
+    "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 128},
     "status": {
       "enum": [
         "succeeded",
@@ -16,6 +21,6 @@
         "unsupported"
       ]
     },
-    "facts": {"$ref": "../document.schema.json"}
+    "details": {"$ref": "../document.schema.json"}
   }
 }

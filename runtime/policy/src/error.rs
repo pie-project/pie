@@ -44,6 +44,7 @@ pub enum InvocationFailureKind {
     DeadlineExceeded,
     HostSaturated,
     Query,
+    UnsupportedMechanic,
     ActionValidation,
     StateConflict,
     BackendFailure,

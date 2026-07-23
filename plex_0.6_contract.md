@@ -709,7 +709,10 @@ The host MUST reject a standard action staged from an unlisted operation.
 
 Action acceptance is not action success. Standard action feedback MUST
 distinguish succeeded, failed, already-terminal, expired, and unsupported
-outcomes as defined by each action schema.
+outcomes as defined by each action schema. The typed action subject supplies
+the invocation-local action ID; feedback facts supply the originating
+opportunity ID, method, idempotency key, and terminal status for unambiguous
+correlation.
 
 ## 14. Manifest and capability negotiation
 

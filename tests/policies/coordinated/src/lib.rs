@@ -64,6 +64,22 @@ impl Policy for Coordinated {
             request.scratch["route_count"] =
                 json!(request.scratch["route_count"].as_u64().unwrap_or(0) + 1);
             request.fields["last_hook"] = json!("route");
+            if ctx.requests[request_index].facts["rebalance"].as_bool() == Some(true)
+                && let Some(target) = ctx.targets.first()
+            {
+                host.rebalance_request(
+                    ctx.requests[request_index].request.request_id.as_str(),
+                    target.target_id.as_str(),
+                    &format!("rebalance-{request_index}"),
+                )?;
+            }
+            if ctx.requests[request_index].facts["invalid_cancel"].as_bool() == Some(true) {
+                host.cancel_request(
+                    ctx.requests[request_index].request.request_id.as_str(),
+                    &format!("invalid-cancel-{request_index}"),
+                    None,
+                )?;
+            }
         }
         state.shared["route_calls"] =
             json!(state.shared["route_calls"].as_u64().unwrap_or(0) + 1);
@@ -73,7 +89,7 @@ impl Policy for Coordinated {
     fn schedule(
         ctx: &ScheduleContext,
         state: &mut State,
-        _host: &Host,
+        host: &Host,
     ) -> plex::Result<SchedulePlan> {
         let mut remaining_requests = ctx.capacity.max_requests;
         let mut remaining_tokens = ctx.capacity.max_total_tokens;
@@ -96,11 +112,28 @@ impl Policy for Coordinated {
             request.scratch["schedule_calls"] =
                 json!(request.scratch["schedule_calls"].as_u64().unwrap_or(0) + 1);
             request.fields["last_hook"] = json!("schedule");
+            if candidate.facts["cancel_request"].as_bool() == Some(true) {
+                let key = format!("cancel-{index}");
+                let first =
+                    host.cancel_request(candidate.request.request_id.as_str(), &key, None)?;
+                let duplicate =
+                    host.cancel_request(candidate.request.request_id.as_str(), &key, None)?;
+                debug_assert_eq!(first, duplicate);
+            }
+            if candidate.facts["cancel_group"].as_bool() == Some(true)
+                && let Some(group_id) = &candidate.request.group_id
+            {
+                host.cancel_group(
+                    group_id.as_str(),
+                    "live-requests",
+                    &format!("cancel-group-{index}"),
+                )?;
+            }
         }
         Ok(SchedulePlan { selections })
     }
 
-    fn cache(ctx: &CacheContext, state: &mut State, _host: &Host) -> plex::Result<CachePlan> {
+    fn cache(ctx: &CacheContext, state: &mut State, host: &Host) -> plex::Result<CachePlan> {
         let resident_bytes = ctx
             .resident
             .iter()
@@ -130,6 +163,22 @@ impl Policy for Coordinated {
                     request.scratch["cache_checks"] =
                         json!(request.scratch["cache_checks"].as_u64().unwrap_or(0) + 1);
                 }
+            }
+        }
+        for object in &ctx.prospective {
+            if object.facts["prefetch"].as_bool() == Some(true) {
+                host.prefetch_cache(
+                    object.object_id.as_str(),
+                    None,
+                    &format!("prefetch-{}", object.object_id.as_str()),
+                )?;
+            }
+            if object.facts["swap"].as_bool() == Some(true) {
+                host.swap_cache(
+                    object.object_id.as_str(),
+                    "cpu",
+                    &format!("swap-{}", object.object_id.as_str()),
+                )?;
             }
         }
         Ok(CachePlan {

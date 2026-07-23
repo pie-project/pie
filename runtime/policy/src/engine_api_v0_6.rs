@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use pie_plex::Document;
@@ -14,8 +15,8 @@ use crate::{
     InMemoryPolicyStateBackendV0_6, Invocation, InvocationFailureKind, LifecycleEventV0_6,
     LifecycleHostV0_6, NormalizedPlanV0_6, OperationContextV0_6, OpportunityTrackerV0_6,
     PolicyEngine, PolicyEngineConfig, PolicyStateBackendV0_6, ProtocolLimitsV0_6, QueryHandler,
-    RegistryErrorV0_6, RejectingQueryHandler, StateBackendErrorV0_6, StateMetricsV0_6,
-    TerminalCleanupV0_6, WorkingSetV0_6, snapshot_ref_v0_6, working_set_v0_6,
+    RegistryErrorV0_6, RejectingQueryHandler, StagedAction, StateBackendErrorV0_6,
+    StateMetricsV0_6, TerminalCleanupV0_6, WorkingSetV0_6, snapshot_ref_v0_6, working_set_v0_6,
 };
 
 pub const ENGINE_API_VERSION_V0_6: &str = "pie.plex.engine@2";
@@ -29,6 +30,7 @@ pub struct PlexRuntimeV0_6 {
     protocol_limits: ProtocolLimitsV0_6,
     opportunities: Arc<OpportunityTrackerV0_6>,
     cache_episodes: Arc<CacheEpisodeTrackerV0_6>,
+    actions: Arc<Mutex<ActionLedgerV0_6>>,
     invocation_gate: Arc<Mutex<()>>,
 }
 
@@ -52,6 +54,10 @@ impl PlexRuntimeV0_6 {
             cache_episodes: Arc::new(CacheEpisodeTrackerV0_6::new(
                 protocol_limits.max_cache_episodes,
             )?),
+            actions: Arc::new(Mutex::new(ActionLedgerV0_6 {
+                maximum: protocol_limits.max_action_records,
+                records: BTreeMap::new(),
+            })),
             invocation_gate: Arc::new(Mutex::new(())),
         })
     }
@@ -103,7 +109,8 @@ impl PlexRuntimeV0_6 {
             }
             debug_assert!(!opportunity_id.as_str().is_empty());
         }
-        validate_cleanup_context(&context, &event.cleanup)?;
+        let action_updates = self.actions.lock().unwrap().validate_feedback(&context)?;
+        validate_cleanup_context(&context, &event.cleanup, &action_updates)?;
 
         let invocation = registry.invoke(
             context.clone(),
@@ -113,6 +120,11 @@ impl PlexRuntimeV0_6 {
         );
         match invocation {
             Invocation::Success(prepared) => {
+                let correlation_id = correlation_id(&context);
+                self.actions
+                    .lock()
+                    .unwrap()
+                    .ensure_capacity(&correlation_id, &prepared.actions)?;
                 let generation = registry.generation();
                 let outcome = success_outcome(
                     generation,
@@ -161,6 +173,11 @@ impl PlexRuntimeV0_6 {
                 }
                 if let Some(opportunity_id) = opportunity_id(&context) {
                     self.opportunities.complete(opportunity_id)?;
+                }
+                {
+                    let mut actions = self.actions.lock().unwrap();
+                    actions.apply_feedback(&action_updates);
+                    actions.record(&correlation_id, &prepared.actions);
                 }
                 if event.complete_cache_episode
                     && let OperationContextV0_6::Cache(cache) = &context
@@ -333,6 +350,7 @@ fn add_cleanup_to_working_set(working_set: &mut WorkingSetV0_6, cleanup: &Termin
 fn validate_cleanup_context(
     context: &OperationContextV0_6,
     cleanup: &TerminalCleanupV0_6,
+    action_updates: &[ActionFeedbackUpdateV0_6],
 ) -> Result<(), PlexErrorV0_6> {
     if cleanup.requests.is_empty() && cleanup.groups.is_empty() {
         return Ok(());
@@ -365,6 +383,19 @@ fn validate_cleanup_context(
                 terminal.request_id
             )));
         }
+        if terminal.status == RequestStatus::Cancelled
+            && !action_updates.iter().any(|update| {
+                update.outcome == ActionTerminalStatusV0_6::Succeeded
+                    && update.record.method == "pie.request.cancel@1"
+                    && update.record.args["request_id"].as_str()
+                        == Some(terminal.request_id.as_str())
+            })
+        {
+            return Err(PlexErrorV0_6::InvalidEvent(format!(
+                "cancelled request {:?} has no successful cancellation action",
+                terminal.request_id
+            )));
+        }
     }
     for terminal in &cleanup.groups {
         let expected = match terminal.status {
@@ -383,8 +414,199 @@ fn validate_cleanup_context(
                 terminal.group_id
             )));
         }
+        if terminal.status == GroupStatus::Cancelled
+            && !action_updates.iter().any(|update| {
+                update.outcome == ActionTerminalStatusV0_6::Succeeded
+                    && update.record.method == "pie.group.cancel@1"
+                    && update.record.args["group_id"].as_str() == Some(terminal.group_id.as_str())
+            })
+        {
+            return Err(PlexErrorV0_6::InvalidEvent(format!(
+                "cancelled group {:?} has no successful cancellation action",
+                terminal.group_id
+            )));
+        }
     }
     Ok(())
+}
+
+fn correlation_id(context: &OperationContextV0_6) -> String {
+    match context {
+        OperationContextV0_6::Admit(context) => context.meta.opportunity_id.0.clone(),
+        OperationContextV0_6::Route(context) => context.meta.opportunity_id.0.clone(),
+        OperationContextV0_6::Schedule(context) => context.meta.opportunity_id.0.clone(),
+        OperationContextV0_6::Cache(context) => context.meta.opportunity_id.0.clone(),
+        OperationContextV0_6::Feedback(context) => format!(
+            "feedback:{}",
+            blake3::hash(context.delivery_id.as_str().as_bytes()).to_hex()
+        ),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActionTerminalStatusV0_6 {
+    Succeeded,
+    Failed,
+    AlreadyTerminal,
+    Expired,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ActionRecordV0_6 {
+    method: String,
+    args: Document,
+    idempotency_key: String,
+    terminal: Option<ActionTerminalStatusV0_6>,
+}
+
+#[derive(Debug, Clone)]
+struct ActionFeedbackUpdateV0_6 {
+    key: (String, u64),
+    record: ActionRecordV0_6,
+    outcome: ActionTerminalStatusV0_6,
+}
+
+struct ActionLedgerV0_6 {
+    maximum: usize,
+    records: BTreeMap<(String, u64), ActionRecordV0_6>,
+}
+
+impl ActionLedgerV0_6 {
+    fn ensure_capacity(
+        &self,
+        correlation_id: &str,
+        actions: &[StagedAction],
+    ) -> Result<(), PlexErrorV0_6> {
+        let additional = actions
+            .iter()
+            .filter(|action| {
+                !self
+                    .records
+                    .contains_key(&(correlation_id.to_owned(), action.id))
+            })
+            .count();
+        if self.records.len().saturating_add(additional) > self.maximum {
+            return Err(PlexErrorV0_6::Runtime(format!(
+                "action ledger reached its limit of {}",
+                self.maximum
+            )));
+        }
+        Ok(())
+    }
+
+    fn record(&mut self, correlation_id: &str, actions: &[StagedAction]) {
+        for action in actions {
+            let idempotency_key = action.args["idempotency_key"]
+                .as_str()
+                .unwrap_or("")
+                .to_owned();
+            let previous = self.records.insert(
+                (correlation_id.to_owned(), action.id),
+                ActionRecordV0_6 {
+                    method: action.method.clone(),
+                    args: action.args.clone(),
+                    idempotency_key,
+                    terminal: None,
+                },
+            );
+            debug_assert!(previous.is_none());
+        }
+    }
+
+    fn validate_feedback(
+        &self,
+        context: &OperationContextV0_6,
+    ) -> Result<Vec<ActionFeedbackUpdateV0_6>, PlexErrorV0_6> {
+        let OperationContextV0_6::Feedback(feedback) = context else {
+            return Ok(Vec::new());
+        };
+        let mut updates = Vec::new();
+        for record in &feedback.records {
+            let FeedbackSubject::Action(action_id) = &record.subject else {
+                continue;
+            };
+            let facts = record
+                .facts
+                .as_object()
+                .expect("feedback facts were validated");
+            if let Some(field) = facts.keys().find(|field| {
+                !matches!(
+                    field.as_str(),
+                    "opportunity_id" | "method" | "idempotency_key" | "status" | "details"
+                )
+            }) {
+                return Err(PlexErrorV0_6::InvalidEvent(format!(
+                    "action feedback contains unsupported field {field:?}"
+                )));
+            }
+            if let Some(details) = facts.get("details")
+                && !details.is_object()
+            {
+                return Err(PlexErrorV0_6::InvalidEvent(
+                    "action feedback details must be a JSON object".into(),
+                ));
+            }
+            let correlation_id = record.facts["opportunity_id"].as_str().ok_or_else(|| {
+                PlexErrorV0_6::InvalidEvent("action feedback requires facts.opportunity_id".into())
+            })?;
+            let key = (correlation_id.to_owned(), action_id.0);
+            let action = self.records.get(&key).ok_or_else(|| {
+                PlexErrorV0_6::InvalidEvent(format!(
+                    "action feedback references unknown action {correlation_id}/{}",
+                    action_id.0
+                ))
+            })?;
+            if action.terminal.is_some() {
+                return Err(PlexErrorV0_6::InvalidEvent(format!(
+                    "action {correlation_id}/{} is already terminal",
+                    action_id.0
+                )));
+            }
+            if record.facts["method"].as_str() != Some(action.method.as_str())
+                || record.facts["idempotency_key"].as_str() != Some(action.idempotency_key.as_str())
+            {
+                return Err(PlexErrorV0_6::InvalidEvent(format!(
+                    "action feedback correlation mismatch for {correlation_id}/{}",
+                    action_id.0
+                )));
+            }
+            let status = record.facts["status"].as_str().ok_or_else(|| {
+                PlexErrorV0_6::InvalidEvent("action feedback requires facts.status".into())
+            })?;
+            let outcome = match (record.outcome, status) {
+                (OutcomeKind::ActionSucceeded, "succeeded") => ActionTerminalStatusV0_6::Succeeded,
+                (OutcomeKind::ActionFailed, "failed") => ActionTerminalStatusV0_6::Failed,
+                (OutcomeKind::ActionFailed, "already-terminal") => {
+                    ActionTerminalStatusV0_6::AlreadyTerminal
+                }
+                (OutcomeKind::ActionFailed, "expired") => ActionTerminalStatusV0_6::Expired,
+                (OutcomeKind::ActionFailed, "unsupported") => ActionTerminalStatusV0_6::Unsupported,
+                _ => {
+                    return Err(PlexErrorV0_6::InvalidEvent(format!(
+                        "action feedback outcome/status mismatch: {:?}/{status}",
+                        record.outcome
+                    )));
+                }
+            };
+            updates.push(ActionFeedbackUpdateV0_6 {
+                key,
+                record: action.clone(),
+                outcome,
+            });
+        }
+        Ok(updates)
+    }
+
+    fn apply_feedback(&mut self, updates: &[ActionFeedbackUpdateV0_6]) {
+        for update in updates {
+            let action = self
+                .records
+                .get_mut(&update.key)
+                .expect("validated action feedback key");
+            action.terminal = Some(update.outcome);
+        }
+    }
 }
 
 fn has_feedback_outcome(
