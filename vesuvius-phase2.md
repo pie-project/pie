@@ -1307,3 +1307,182 @@ the lever's favor; full unification is catastrophic and the
 intermediate point is neutral-at-best. The remaining cold-bench levers
 all need either an operator decision (client spawn ramp fairness) or a
 design round (guest-wake fan-out; varlen Phase 2 shape bucketing).
+
+## Unified submission discipline — implementation plan (approved)
+
+**Directive.** Delete the inferlet-side duality between the classic
+depth-window submit path (k=1) and the frame reactive path (k>1),
+WITHOUT changing the deployment default (k=1 stays; it is the measured
+winner: 35.2k vs k2's 34.69k, and M2's measured outcome shows k>1 has
+no structural cost advantage while §6.2 keeps publication per-wave).
+The two paths are two implementations of one invariant:
+
+> Keep >= 2 fires in flight per lane (frame-quantized), so the
+> seal -> settle -> resubmit round trip is never on the token path.
+
+The unified discipline makes that invariant the code.
+
+### Facts the plan rests on (verified in-tree)
+
+1. `ForwardPass::submit(on)` IS `submit_frame(on, &[Some(self)])`
+   (sdk/rust/inferlet/src/ptir.rs:883-885). At k=1 the two submission
+   APIs are the same wire call — the k=1 equivalence proof is
+   structural, not empirical.
+2. The bench inferlet's two branches live at
+   tests/inferlets/text-completion-bench/src/lib.rs:343-374 (initial
+   submission), :409-422 (post-g0 successor), :459-478 (in-loop
+   submits). State: `submitted`/`taken` (decode fires; the prefill's
+   g0 token is counted by neither), `next_trigger` (frame path only),
+   `depth = DEFAULT_RUNAHEAD_DEPTH = 2` (classic path only),
+   `out_capacity = if k > 1 { 2k-1 } else { depth }`.
+3. Today's in-loop frame trigger (`next_trigger = old_submitted + 1`,
+   i.e. "first take of the executing frame") coincides with the window
+   rule `submitted - taken < 2` at k=1 (trace: burst 2, then +1 per
+   take) and at k=2 (trace: submits at taken = 2, 4, 6, ... — window
+   oscillates 3 -> 1 in both formulations). At k>=3 they diverge (see
+   "Behavioral deltas").
+4. Two frames staged per lane before any output is ALREADY exercised
+   at k=1 (the classic burst submits two single-slot frames before g0
+   arrives), so the engine-state class "lane with 2 accepted, unfired
+   frames" is not new. Decode geometry is token-independent (tok_in is
+   device-carried), so successor submission never needs to wait for a
+   host-visible token.
+
+### The unified loop (single discipline, all k)
+
+One helper owning reservation + submission, one call site rule:
+
+```rust
+/// Top up this lane's submission window to WINDOW_FIRES (= 2) fires,
+/// frame-quantized: each submitted frame carries min(k, remaining)
+/// decode slots. Reservation covers the fires being submitted.
+fn top_up(pipe, fwd_d, n, budget, submitted: &mut usize, taken: usize)
+    -> Result<(), String>
+{
+    const WINDOW_FIRES: usize = 2;
+    while *submitted < budget && *submitted - taken < WINDOW_FIRES {
+        let s = (budget - *submitted).min(frame_size());
+        reserve_to_tokens(n + (*submitted + s) as u32 + 1)?;
+        let slots: Vec<Option<&ForwardPass>> =
+            (0..s).map(|_| Some(fwd_d)).collect();
+        submit_frame(pipe, &slots)?;
+        *submitted += s;
+    }
+    Ok(())
+}
+```
+
+Call sites (replacing all five submission blocks):
+- After the first-frame submit (which keeps its current shape:
+  prefill in slot 0 + min(budget, k-1) decode slots; at k=1 that is
+  the bare prefill submit): `top_up(...)` — at k=1 this reproduces
+  the classic pre-g0 burst of 2; at k=2 it submits the successor
+  frame pre-g0 (delta B1 below); at k>=3 the first frame's k-1 >= 2
+  staged decodes already satisfy the window, so no extra submission.
+- In the drain loop, after each accepted take (same position as
+  today, i.e. after the `stopped` continues): `top_up(...)`.
+
+Deleted: the k=1 burst loop, the k=1 per-take submit arm, the k>1
+post-g0 block, the k>1 in-loop block, `next_trigger`, the bench's use
+of `DEFAULT_RUNAHEAD_DEPTH`, and the `out_capacity` fork —
+`out_capacity = k + 1` uniformly (max undrained cells under the
+window rule; equals today's values at k=1 (2) and k=2 (3), and is
+smaller than today's 2k-1 at k>=3).
+
+The stop-token path is unchanged by construction: top_up sits after
+the `stopped` continues, so a stopped lane never tops up, and the
+drain-to-`submitted` semantics (excess fires drain, outputs ignored)
+are untouched. Edge cases that must fall out naturally: budget = 0
+(fwd_d None, no top_up call executes a submit), budget < k (s
+truncation, exists today), budget not divisible by k (tail frame
+truncation, exists today).
+
+### Behavioral deltas to certify (exactly two, both k>1-only)
+
+- **B1 (k>=2): first successor frame submits pre-g0** instead of
+  after the prefill token's host arrival. Legal per fact 4; expected
+  neutral-to-positive (removes one guest wake from the submission
+  path at the first boundary). k=1: no delta (proof: fact 1 + trace).
+- **B2 (k>=3 only): in-loop successor submits one take later**
+  (window floor 1, max window k+1) than today's first-take trigger
+  (window floor 2, max window 2k-1) — a slightly shallower staging.
+  k=2 is trace-identical, so B2 does not exist there. If k3 regresses
+  materially (baseline 34.33k), the documented fallback is
+  WINDOW_FIRES = 2 -> a frame-aware threshold — but do not tune
+  preemptively; measure first.
+
+### Certification matrix
+
+No engine or driver code changes — guest + SDK only (wasm rebuild;
+no wheel rebuild, no staleness-guard implications).
+
+1. Build: bench inferlet wasm compiles; `cargo test --lib` from
+   runtime/engine/ stays 360/360 (untouched, run as hygiene).
+2. Oracles (k=1): t in {32, 256}, temperature 0 — token-EXACT vs the
+   stored base dumps. Wire-identical claim makes this a tautology
+   check; run it anyway.
+3. k=1 suite: 3x 2048x512x32 — must sit in the certified band
+   (35.1-35.3k). Any drop is a refactor bug, not a tradeoff.
+4. k=2 suite: 1x c0/256 + 1x 2048x32 vs baselines (27.99k/34.69k
+   band) — certifies B1.
+5. k=3: 1x 2048x32 vs 34.33k — certifies B1+B2.
+6. Guards: 512x512 (19.67k band), c0256 (27.99k band), watchdog 0
+   in an instrumented k=1 run.
+7. Oracle at k=2 (t=32, temperature 0, PIE_FRAME_SIZE=2) — output
+   exactness under the new successor timing.
+
+### Phase B (separate round, not in this change)
+
+Eleven other inferlets use `DEFAULT_RUNAHEAD_DEPTH` with plain
+per-pass submits and no frame awareness (attention-sink,
+beam-search(4), chat-completion, consensus-decoding,
+contrastive-decoding, greenlist-watermarking, json-schema-constrained-
+decoding, mirostat-v2(3), mtp-speculative-decoding(3),
+prefix-tree-kv-cache, sliding-window-attention). At k>1 they pay one
+frame per pass. The right fix is an SDK-level helper that owns the
+discipline (a decode-stream wrapper whose `take()` tops up
+internally), after which `DEFAULT_RUNAHEAD_DEPTH` disappears from the
+public surface entirely and inferlet authors write no submission
+logic. That is where the real §10 API-surface payoff lands; it should
+follow once the bench-inferlet round proves the discipline. Until
+then the constant stays (11 in-tree users).
+
+### Rollback
+
+Guest-only change; revert is a single commit revert. The k=1 wire
+equivalence means the certified engine/driver state (HEAD 6b5bd34fb
+lineage) is not at risk at the default deployment.
+
+## Unified submission discipline — LANDED (guest-only)
+
+Implemented per the plan above. The bench inferlet's two submission
+branches (classic depth-window at k=1, frame reactive at k>1) collapse
+to one `submit_ahead(submitted, drained) -> submitted` closure that
+keeps WINDOW_FIRES=2 decode fires in flight, frame-quantized (each
+frame min(k, remaining) decode slots). Called at exactly two sites:
+once pre-g0 (stage the window off the prefill-token critical path) and
+once after each accepted drain. Deleted: the k=1 burst loop, the k=1
+per-take arm, the k>1 post-g0 successor block, the k>1 in-loop block,
+`next_trigger`, the bench's `DEFAULT_RUNAHEAD_DEPTH` use, and the
+`out_capacity` fork (now `k + 1` uniformly = exact max-window ceiling).
+
+By-value/return form (not `&mut`): call sites read
+`submitted = submit_ahead(submitted, taken)?`. No engine/driver change;
+wasm-only rebuild.
+
+Certification (frame-size deployment default UNCHANGED at k=1):
+- Oracles token-EXACT: k1 t{32,256}, k2 t32 (temperature 0).
+- k=1 3x2048x32: 35.30/35.31/35.77k — in/above the certified band,
+  r3 a new single-run high. k=1 is wire-identical by construction
+  (`submit` IS a single-slot frame), so the oracle exactness plus band
+  membership is the full proof.
+- k=2: c0256 28.05k (band 27.99k), 2048x32 34.49k (baseline 34.69k,
+  within k2 run variance) — B1 (pre-g0 successor) neutral.
+- k=3: 34.32k vs 34.33k baseline — B2 (shallower staging, window
+  floor 1 / max k+1 vs old floor 2 / max 2k-1) is a non-event here.
+- Guards: c0256 28.09k, 512x512 19.32k (k=1 single-run, wire-identical
+  so within noise), instrumented k1 watchdog 0.
+
+Phase B (SDK decode-stream wrapper owning the discipline; retire
+`DEFAULT_RUNAHEAD_DEPTH` from the 11 other inferlets) remains a
+separate future round.

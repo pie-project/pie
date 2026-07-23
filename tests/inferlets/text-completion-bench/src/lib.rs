@@ -4,14 +4,15 @@
 //! final `Return` envelope, no per-token streaming, `ignore_eos` forces the
 //! full `max_tokens` budget), expressed in the current architecture: an
 //! N-wide prompt-prefill fire, then ONE decode pass whose sampled token is
-//! device loop-carried, submitted `DEFAULT_RUNAHEAD_DEPTH` fires ahead of the
-//! host drain — the sampler runs in-graph (argmax at temperature 0, otherwise
-//! temperature-scaled TopP Gumbel-max), so the host never round-trips per
-//! token.
+//! device loop-carried, kept two fires ahead of the host drain by a single
+//! frame-quantized run-ahead discipline (`top_up` — the same window rule at
+//! every frame size k) — the sampler runs in-graph (argmax at temperature 0,
+//! otherwise temperature-scaled TopP Gumbel-max), so the host never
+//! round-trips per token.
 //!
-//! With stop tokens active (`ignore_eos = false`), up to depth-1 fires past
-//! the stop are already submitted when the host observes it. They drain and
-//! their outputs are ignored; token counts remain unchanged.
+//! With stop tokens active (`ignore_eos = false`), the fires already staged
+//! ahead when the host observes the stop drain and their outputs are ignored;
+//! token counts remain unchanged.
 //!
 //! Lifecycle (R4-4 single-pipeline): prefill and decode are ONE sequential
 //! stream on ONE pipeline. The prefill epilogue hands its sampled token to
@@ -242,7 +243,6 @@ async fn run_one(
     let w_slot_p =
         Channel::from((0..n).map(|p| p / page_size).collect::<Vec<_>>()).named("w_slot_p");
     let w_off_p = Channel::from((0..n).map(|p| p % page_size).collect::<Vec<_>>()).named("w_off_p");
-    let depth = DEFAULT_RUNAHEAD_DEPTH;
     // Decode fires: the prefill sample already spends one of the
     // `max_tokens` sampler activations.
     let budget = input.max_tokens - 1;
@@ -257,11 +257,11 @@ async fn run_one(
     let k = frame_size();
     let tok_in = Channel::new([1], dtype::i32).named("tok_in");
     let g0_ch = Channel::new([1], dtype::i32).named("g0");
-    // Frame deployments need the take-side ring to absorb the reactive
-    // schedule's worst case: (k-1) undrained cells of the executing frame
-    // plus k new ones from the queued successor (2k-1). k = 1 keeps the
-    // classic run-ahead depth.
-    let out_capacity = if k > 1 { 2 * k - 1 } else { depth };
+    // Take-side ring ceiling under the unified window discipline: the window
+    // (`submitted - taken`) peaks at k + 1 — a top-up starting at window 1
+    // adds one k-slot frame — so the ring needs exactly k + 1 cells (k = 1
+    // reproduces the classic depth-2 ring).
+    let out_capacity = k + 1;
     let out = Channel::new([1], dtype::i32)
         .capacity(out_capacity as u32)
         .named("out");
@@ -341,37 +341,45 @@ async fn run_one(
     };
 
     let pipe = Pipeline::new();
-    let mut submitted = 0usize;
-    if k > 1 {
-        // ── FRAME SUBMISSION (Vesuvius): the first frame carries the prefill
-        // chunk in slot 0 and decode fires in the remaining slots; every
-        // later frame is all-decode. The reactive schedule submits frame f+1
-        // after taking frame f's FIRST token, keeping at most two decode
-        // frames accepted per lane.
-        let first_decodes = budget.min(k - 1);
-        reserve_to_tokens(n + first_decodes as u32 + 1)
-            .map_err(|e| format!("reserve first frame: {e}"))?;
-        let mut slots: Vec<Option<&ForwardPass>> = Vec::with_capacity(k);
-        slots.push(Some(&fwd_p));
-        for _ in 0..first_decodes {
-            slots.push(Some(fwd_d.as_ref().expect("decode pass exists")));
-        }
-        submit_frame(&pipe, &slots).map_err(|e| format!("first frame submit: {e}"))?;
-        submitted = first_decodes;
-    } else {
-        fwd_p
-            .submit(&pipe)
-            .map_err(|e| format!("prefill submit: {e}"))?;
-        if let Some(fwd) = &fwd_d {
-            while submitted < depth.min(budget) {
-                reserve_to_tokens(n + submitted as u32 + 1)
-                    .map_err(|e| format!("reserve decode burst: {e}"))?;
-                fwd.submit(&pipe)
-                    .map_err(|e| format!("decode submit: {e}"))?;
-                submitted += 1;
-            }
-        }
+
+    // First frame: the prefill chunk in slot 0, then up to k-1 decode slots.
+    // At k = 1 this is a bare prefill submit (`submit` IS a single-slot
+    // frame); trailing slots pad to no-ops.
+    let first_decodes = budget.min(k - 1);
+    reserve_to_tokens(n + first_decodes as u32 + 1)
+        .map_err(|e| format!("reserve first frame: {e}"))?;
+    let mut first_slots: Vec<Option<&ForwardPass>> = Vec::with_capacity(k);
+    first_slots.push(Some(&fwd_p));
+    for _ in 0..first_decodes {
+        first_slots.push(Some(fwd_d.as_ref().expect("decode pass exists")));
     }
+    submit_frame(&pipe, &first_slots).map_err(|e| format!("first frame submit: {e}"))?;
+    let mut submitted = first_decodes;
+
+    // Unified run-ahead discipline (ONE rule for every k): keep WINDOW_FIRES
+    // decode fires in flight, frame-quantized — submit frames of min(k,
+    // remaining) decode slots until the window (submitted minus drained) is
+    // full or the budget is spent, returning the new submitted count. At k = 1
+    // this is exactly the classic depth-2 window (burst two, then one per
+    // drained token); at k > 1 it stages one frame ahead. Decode geometry is
+    // device-carried (`tok_in`), so a successor never waits on a sampled token.
+    let submit_ahead = |mut submitted: usize, drained: usize| -> std::result::Result<usize, String> {
+        const WINDOW_FIRES: usize = 2;
+        while submitted < budget && submitted - drained < WINDOW_FIRES {
+            let s = (budget - submitted).min(k);
+            reserve_to_tokens(n + (submitted + s) as u32 + 1)
+                .map_err(|e| format!("reserve decode frame: {e}"))?;
+            let fwd = fwd_d.as_ref().expect("decode pass exists while budget > 0");
+            let slots: Vec<Option<&ForwardPass>> = (0..s).map(|_| Some(fwd)).collect();
+            submit_frame(&pipe, &slots).map_err(|e| format!("decode frame submit: {e}"))?;
+            submitted += s;
+        }
+        Ok(submitted)
+    };
+
+    // Stage the window before the prefill token even arrives — the decode
+    // successors ride the queue behind the prefill, off the g0 critical path.
+    submitted = submit_ahead(submitted, 0)?;
     step(&mut prologue_us, input.report_timing); // [4] build_submit (both passes)
 
     // ── HOST DRAIN (off the critical path — the decode burst is already in
@@ -404,21 +412,6 @@ async fn run_one(
         if let Some(now_ns) = first_token_monotonic_ns {
             token_monotonic_ns.push(now_ns);
         }
-    }
-
-    // Frame mode: frame f+1 submits after frame f's FIRST token (the
-    // reactive one-successor schedule). `next_trigger` is the out-take count
-    // at which the next frame may be submitted.
-    let mut next_trigger = usize::MAX;
-    if k > 1 && !stopped && submitted < budget {
-        let s = (budget - submitted).min(k);
-        reserve_to_tokens(n + (submitted + s) as u32 + 1)
-            .map_err(|e| format!("reserve decode frame: {e}"))?;
-        let fwd = fwd_d.as_ref().expect("decode pass exists while budget > 0");
-        let slots: Vec<Option<&ForwardPass>> = (0..s).map(|_| Some(fwd)).collect();
-        submit_frame(&pipe, &slots).map_err(|e| format!("decode frame submit: {e}"))?;
-        next_trigger = submitted + 1;
-        submitted += s;
     }
 
     let mut taken = 0usize;
@@ -456,26 +449,9 @@ async fn run_one(
         if input.wasm_delay_us > 0 {
             std::thread::sleep(wasm_delay);
         }
-        if k > 1 {
-            if taken == next_trigger && submitted < budget {
-                let s = (budget - submitted).min(k);
-                reserve_to_tokens(n + (submitted + s) as u32 + 1)
-                    .map_err(|e| format!("reserve decode frame: {e}"))?;
-                let fwd = fwd_d.as_ref().expect("decode pass exists while budget > 0");
-                let slots: Vec<Option<&ForwardPass>> = (0..s).map(|_| Some(fwd)).collect();
-                submit_frame(&pipe, &slots)
-                    .map_err(|e| format!("decode frame submit: {e}"))?;
-                next_trigger = submitted + 1;
-                submitted += s;
-            }
-        } else if submitted < budget {
-            let fwd = fwd_d.as_ref().expect("decode pass exists while budget > 0");
-            reserve_to_tokens(n + submitted as u32 + 1)
-                .map_err(|e| format!("reserve decode continuation: {e}"))?;
-            fwd.submit(&pipe)
-                .map_err(|e| format!("decode submit: {e}"))?;
-            submitted += 1;
-        }
+        // Refill the window after draining an accepted token. A stopped lane
+        // `continue`s above and never reaches here, so it never submits more.
+        submitted = submit_ahead(submitted, taken)?;
     }
     pipe.close();
 
