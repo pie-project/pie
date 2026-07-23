@@ -100,6 +100,16 @@ pub(crate) fn defer_resource_teardown(
                 }
             }
         }
+        if capped_execution {
+            // Announce the slot BEFORE the permit drops (with `context`
+            // below): the successor can only acquire after the drop, so its
+            // slot-consumed event always enters the scheduler mailbox after
+            // this release — the policy's slot balance never sees a consume
+            // for a release it hasn't counted. (The terminate notification
+            // above already removed this process's own lane: leave first,
+            // release second, successor's admission and fire after.)
+            crate::scheduler::worker::notify_execution_slot_released();
+        }
         drop(context);
     });
 }

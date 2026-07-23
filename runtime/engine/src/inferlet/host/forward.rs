@@ -859,7 +859,6 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
                 match crate::scheduler::register_channels_bind_classified(
                     0,
                     Some(process_id),
-                    self.execution_admitted(),
                     registration_plans,
                     program_registration,
                     instance.instance_id,

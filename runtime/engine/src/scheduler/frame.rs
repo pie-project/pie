@@ -19,11 +19,16 @@
 //!   [`FrameStamp`]);
 //! - HOLDS the next seal until every awaited lane's oldest queued frame is
 //!   arrival-complete — the infinite wait-all rule: membership changes only
-//!   through explicit bind/close/leave events, and the 1 s watchdog only
-//!   REPORTS a non-responsive lane, never evicts it;
-//! - holds unconditionally while a bind control is in assembly (a binding
-//!   process is a missing member before its first fire, exactly as in the
-//!   per-wave quorum);
+//!   through explicit close/leave/first-fire events, and the 1 s watchdog
+//!   only REPORTS a non-responsive lane, never evicts it;
+//! - holds while a JOIN is in flight: a process in bring-up (bind
+//!   accepted, no fire yet) is staged; once it acquires a contended
+//!   execution permit it is a join-in-flight the seal waits for by
+//!   identity, and while a freed slot has a staged taker the seal waits
+//!   for that handoff — so a cohort turnover gathers the incoming herd
+//!   instead of sealing narrow epochs. A bind alone holds nothing: a
+//!   live rebinder is already wait-set-held through its lane, and an
+//!   unadmitted process cannot fire;
 //! - seals from every ready lane (deterministic first-fit in lane-id order
 //!   against the per-wave token/row budgets — pure arithmetic over declared
 //!   demand, never timing). A lane deferred by capacity is served in the
@@ -49,7 +54,7 @@
 //! `on_fire_retired` (possibly cycling through the makeup set on RETRY) or
 //! `on_fire_dropped` (rejected while queued).
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -222,10 +227,34 @@ pub(super) struct FramePolicy {
     /// deterministic admission order.
     lanes: BTreeMap<ProcessId, LaneState>,
     sealed: VecDeque<SealedFrame>,
-    /// Bind controls accepted by the scheduler but not yet completed. These
-    /// processes are missing members even before their first fire, and a
-    /// seal holds unconditionally while any of them is absent.
+    /// Bind controls accepted by the scheduler but not yet completed.
+    /// Feeds [`FramePolicy::has_pending_binds`] (the worker defers teardown
+    /// closes while bring-up owns the driver lane); binds do NOT hold the
+    /// seal — a lane's own wait-set membership covers a live rebinder, and
+    /// bring-up lanes are gathered through `staged`/`pending_joins`.
     pending_binds: BTreeMap<ProcessId, usize>,
+    /// Successor pool: processes in bring-up (first bind control accepted)
+    /// whose lane has not yet submitted its first stamped fire. While a
+    /// free execution slot exists (`pending_slots > 0`), one of these is
+    /// about to take it — the seal waits so the join lands in this
+    /// boundary instead of a narrow epoch.
+    staged: BTreeSet<ProcessId>,
+    /// Released execution slots not yet re-consumed by an admission:
+    /// +1 on `on_execution_slot_released`, saturating -1 on EVERY
+    /// `on_execution_slot_consumed` (uncontended admissions notify too —
+    /// the semaphore launders released permits into the free pool, so
+    /// only drain-on-every-admission keeps the balance honest; the
+    /// saturation absorbs initial-pool consumptions, and a release is
+    /// always mailed before its consumer can acquire, so a release-paired
+    /// drain is never lost to the clamp). A positive balance with a
+    /// non-empty `staged` pool means a successor's admission is imminent:
+    /// the seal waits.
+    pending_slots: u64,
+    /// Identity-paired in-flight joins: a parked process that ACQUIRED its
+    /// execution permit but whose first stamped fire has not arrived yet.
+    /// The seal waits for exactly these lanes (removed by first fire and
+    /// by every leave path, so a joiner that dies cannot wedge the seal).
+    joins_in_flight: BTreeSet<ProcessId>,
     /// Liveness-only deadline for the current blocked-gather episode.
     strict_watchdog_deadline: Option<Instant>,
     cold_hold_deadline: Option<Instant>,
@@ -249,6 +278,9 @@ impl FramePolicy {
             lanes: BTreeMap::new(),
             sealed: VecDeque::new(),
             pending_binds: BTreeMap::new(),
+            staged: BTreeSet::new(),
+            pending_slots: 0,
+            joins_in_flight: BTreeSet::new(),
             strict_watchdog_deadline: None,
             cold_hold_deadline: None,
             ever_sealed: false,
@@ -307,6 +339,15 @@ impl FramePolicy {
     }
 
     fn record_arrival(&mut self, stamp: FrameStamp, owner: Option<ProcessId>, fire: ArrivedFire) {
+        // Staged -> live promotion: the owner's fire arrived, so its
+        // wait-set membership takes over from the join-in-flight hold.
+        // Keyed by OWNER (the process id): `staged`/`joins_in_flight`
+        // are process-scoped (bind and admission events carry process
+        // ids) while `stamp.lane` is the pipeline scope id.
+        if let Some(owner) = owner {
+            self.staged.remove(&owner);
+            self.joins_in_flight.remove(&owner);
+        }
         let lane = self.lanes.entry(stamp.lane).or_insert_with(|| LaneState {
             owner,
             awaited: true,
@@ -339,11 +380,53 @@ impl FramePolicy {
         }
     }
 
-    /// A bind control entered the scheduler. The binding process is a
-    /// missing member from this moment: no seal fires while it assembles.
+    /// A bind control entered the scheduler. A bind does not hold the seal:
+    /// a live rebinder is already wait-set-held through its lane, and a
+    /// bring-up process (no lane yet) enters the `staged` successor pool —
+    /// the seal waits for it only once a slot opens for it
+    /// ([`FramePolicy::on_execution_slot_released`]) or it acquires one
+    /// ([`FramePolicy::on_execution_slot_consumed`]).
     pub fn on_bind_enqueued(&mut self, pid: Option<ProcessId>) {
         if let Some(pid) = pid {
             *self.pending_binds.entry(pid).or_default() += 1;
+            // Process-scoped (pid is the owning process). A live rebinder
+            // gets a transient entry too — cleared by its next fire — which
+            // can at most extend a gather by the rebind window.
+            self.staged.insert(pid);
+        }
+    }
+
+    /// Bootstrap: seed the slot balance with the execution pool's initial
+    /// free capacity, so the "free slot with a staged taker" hold covers
+    /// the COLD START by the same rule as a turnover — the first seal
+    /// waits for the whole co-launched fleet's admissions and first fires.
+    /// (A ragged first epoch otherwise starts lead-less lanes that pace
+    /// every seal of the first generation at the full commit roundtrip:
+    /// measured +4.7 ms per wave, ~140 ms per run.) Thereafter the balance
+    /// stays exact: -1 per admission, +1 per release.
+    pub fn preload_free_slots(&mut self, slots: usize) {
+        self.pending_slots = slots as u64;
+    }
+
+    /// A retiring process's deferred teardown dropped its execution permit
+    /// (capped deployments only). While the freed slot stays unconsumed and
+    /// a successor is staged, the seal holds — the successor's admission and
+    /// first fire are imminent.
+    pub fn on_execution_slot_released(&mut self) {
+        self.pending_slots += 1;
+    }
+
+    /// A process acquired its execution permit (every capped admission
+    /// notifies, uncontended ones included). Its first fire is imminent:
+    /// the seal now waits for `pid` ITSELF, identity-paired, so no event
+    /// interleaving can make the policy wait for the wrong process (the
+    /// anonymous-counting predecessor deadlocked exactly that way).
+    /// Guarded on `staged`: only a process that bound on THIS driver can
+    /// fire here.
+    pub fn on_execution_slot_consumed(&mut self, pid: ProcessId) {
+        self.pending_slots = self.pending_slots.saturating_sub(1);
+        if self.staged.contains(&pid) {
+            self.joins_in_flight.insert(pid);
         }
     }
 
@@ -382,6 +465,7 @@ impl FramePolicy {
             }
         }
         self.pending_binds.remove(&lane);
+        self.forget_staged(lane);
         self.maybe_reset_episode();
     }
 
@@ -389,7 +473,15 @@ impl FramePolicy {
     pub fn on_process_leave(&mut self, owner: ProcessId) {
         self.lanes.retain(|_, lane| lane.owner != Some(owner));
         self.pending_binds.remove(&owner);
+        self.forget_staged(owner);
         self.maybe_reset_episode();
+    }
+
+    /// A staged or joining successor departed before its first fire: the
+    /// seal must never wait for a lane that cannot arrive.
+    fn forget_staged(&mut self, pid: ProcessId) {
+        self.staged.remove(&pid);
+        self.joins_in_flight.remove(&pid);
     }
 
     /// Mirror of the quorum's empty-wait-set re-arm: when the last awaited
@@ -472,7 +564,7 @@ impl FramePolicy {
     /// (partitions post in seal order and pipeline on-stream). Exactly one
     /// frame per lane per boundary keeps the fleet on one frame sequence.
     /// Called only once the wait-all gate holds (no missing awaited lane,
-    /// no bind in assembly); deterministic — no timing input beyond the
+    /// no earmarked successor assembling); deterministic — no timing input beyond the
     /// bootstrap cold hold.
     fn seal(&mut self, now: Instant) -> Option<FramePlan> {
         if !self.have_seal_candidate() {
@@ -760,11 +852,14 @@ impl FramePolicy {
             }
             // Boundary: the wait-all frame quorum. Seal only once every
             // awaited lane's next frame is fully submitted (an idle lane
-            // between frames is a missing member) and no bind is in
-            // assembly. The wait is INFINITE by principle — the watchdog
-            // below reports a stalled gather but never evicts a member and
+            // between frames is a missing member) and no join is in
+            // flight (an admitted-but-unfired successor, or a freed slot
+            // with a staged taker — either way the incoming lane's first
+            // frame lands in this boundary instead of a narrow epoch).
+            // The wait is INFINITE by principle — the watchdog below
+            // reports a stalled gather but never evicts a member and
             // never fires a narrow epoch; membership changes only through
-            // bind/close/leave events.
+            // close/leave/first-fire events.
             if !self.lanes.values().any(|lane| !lane.frames.is_empty()) {
                 // Nothing queued anywhere: no gather episode is running.
                 self.strict_watchdog_deadline = None;
@@ -778,7 +873,9 @@ impl FramePolicy {
                         && !lane.frames.front().is_some_and(PendingFrame::is_complete)
                 })
                 .count();
-            if !self.pending_binds.is_empty() || missing > 0 {
+            let joining = !self.joins_in_flight.is_empty()
+                || (self.pending_slots > 0 && !self.staged.is_empty());
+            if joining || missing > 0 {
                 if !self.sealed.is_empty() {
                     // An epoch is executing: its retirements re-decide and
                     // the gather continues in the background.
@@ -796,6 +893,9 @@ impl FramePolicy {
                         "at_us": crate::scheduler::fire_timing_now_us(),
                         "missing_count": missing,
                         "pending_binds": self.pending_binds.values().sum::<usize>(),
+                        "pending_slots": self.pending_slots,
+                        "joins_in_flight": self.joins_in_flight.len(),
+                        "staged": self.staged.len(),
                         "awaited_lanes":
                             self.lanes.values().filter(|lane| lane.awaited).count(),
                     }));
@@ -804,7 +904,7 @@ impl FramePolicy {
             }
             self.strict_watchdog_deadline = None;
             // EARLY seal: the gate held (every awaited lane's next frame is
-            // fully submitted, no bind in assembly), so seal NOW — normally
+            // fully submitted, no earmarked successor assembling), so seal NOW — normally
             // while the previous frame still executes. Sealing early is
             // what re-merges stragglers into one dense fleet epoch without
             // any drain barrier: a seal never excludes a busy lane, because
@@ -1321,26 +1421,154 @@ mod tests {
         assert_eq!(next, vec![92]);
     }
 
-    /// A bind in assembly holds the seal unconditionally — the binding
-    /// process is a missing member before its first fire, exactly as in the
-    /// per-wave quorum.
+    /// A bind alone holds nothing: an unadmitted bring-up process cannot
+    /// fire, so its bind must not gate an executing fleet's seal (staging
+    /// the next cohort's binds behind the current generation is the point).
     #[test]
-    fn pending_binds_hold_the_seal_until_assembly_completes() {
+    fn unearmarked_staged_bind_does_not_hold_the_seal() {
         let mut policy = FramePolicy::new(2, 64, 4096, None);
         let lane = pid();
         let binder = pid();
         policy.on_fire_enqueued(stamp(lane, 0, 0, 1), Some(lane), 95, 1, 1);
         policy.on_bind_enqueued(Some(binder));
         let queued: HashSet<u64> = [95].into_iter().collect();
-        match policy.plan_dispatch(&queued, Instant::now()) {
-            FramePlan::Hold(_) => {}
-            plan => panic!("a pending bind must hold the seal, got {plan:?}"),
-        }
-        policy.on_bind_completed(Some(binder));
         let FramePlan::Dispatch(wave0) = drive_past_cold_hold(&mut policy, &queued) else {
-            panic!("assembly complete: the seal must proceed");
+            panic!("a staged (unearmarked) bind must not hold the seal");
         };
         assert_eq!(wave0, vec![95]);
+    }
+
+    /// A freed slot with a staged taker holds the seal; the successor's
+    /// admission converts the hold to an identity-paired join-in-flight,
+    /// and its first fire releases it — the incoming lane lands in the
+    /// same epoch as the fleet.
+    #[test]
+    fn freed_slot_with_staged_taker_gathers_the_join() {
+        let mut policy = FramePolicy::new(2, 64, 4096, None);
+        let lane = pid();
+        let successor = pid();
+        policy.on_fire_enqueued(stamp(lane, 0, 0, 1), Some(lane), 95, 1, 1);
+        policy.on_bind_enqueued(Some(successor));
+        policy.on_bind_completed(Some(successor));
+        policy.on_execution_slot_released();
+        let queued: HashSet<u64> = [95].into_iter().collect();
+        match drive_past_cold_hold(&mut policy, &queued) {
+            FramePlan::Hold(_) => {}
+            plan => panic!("a freed slot with a staged taker must hold, got {plan:?}"),
+        }
+        policy.on_execution_slot_consumed(successor);
+        match drive_past_cold_hold(&mut policy, &queued) {
+            FramePlan::Hold(_) => {}
+            plan => panic!("an admitted-but-unfired join must hold, got {plan:?}"),
+        }
+        policy.on_fire_enqueued(stamp(successor, 0, 0, 1), Some(successor), 96, 1, 1);
+        let queued: HashSet<u64> = [95, 96].into_iter().collect();
+        let FramePlan::Dispatch(mut wave0) = drive_past_cold_hold(&mut policy, &queued) else {
+            panic!("successor arrived: the seal must proceed dense");
+        };
+        wave0.sort_unstable();
+        assert_eq!(wave0, vec![95, 96], "both lanes gathered into one epoch");
+    }
+
+    /// Preloaded free capacity gathers the initial fleet: while a free
+    /// slot has a staged taker, the first seal waits — the co-launched
+    /// herd lands in one aligned epoch instead of a ragged ramp.
+    #[test]
+    fn preloaded_free_slots_gather_the_initial_fleet() {
+        let mut policy = FramePolicy::new(1, 64, 4096, None);
+        policy.preload_free_slots(2);
+        let (a, b) = (pid(), pid());
+        policy.on_bind_enqueued(Some(a));
+        policy.on_bind_enqueued(Some(b));
+        policy.on_execution_slot_consumed(a);
+        policy.on_fire_enqueued(stamp(a, 10, 0, 1), Some(a), 10, 1, 1);
+        let queued: HashSet<u64> = [10].into_iter().collect();
+        match drive_past_cold_hold(&mut policy, &queued) {
+            FramePlan::Hold(_) => {}
+            plan => panic!("free slot with staged taker must gather, got {plan:?}"),
+        }
+        policy.on_execution_slot_consumed(b);
+        policy.on_fire_enqueued(stamp(b, 11, 0, 1), Some(b), 11, 1, 1);
+        let queued: HashSet<u64> = [10, 11].into_iter().collect();
+        let FramePlan::Dispatch(mut wave) = drive_past_cold_hold(&mut policy, &queued) else {
+            panic!("fleet complete: seal must fire dense");
+        };
+        wave.sort_unstable();
+        assert_eq!(wave, vec![10, 11]);
+    }
+
+    /// Regression (fleet-wide stall, run v3): released permits launder into
+    /// the semaphore's free pool, so a consumer may admit UNCONTENDED — if
+    /// only parked admissions notified, the balance stayed positive forever
+    /// and a staged bystander held every seal of the first generation.
+    /// Every admission notifies now: a release consumed by anyone drains
+    /// the balance, initial-pool admissions saturate at zero, and a later
+    /// bystander inherits no phantom hold.
+    #[test]
+    fn consumed_release_leaves_no_phantom_hold_for_bystander() {
+        let mut policy = FramePolicy::new(2, 64, 4096, None);
+        let executing = pid();
+        let bystander = pid();
+        // Initial-pool admission before any release: saturates, no residue.
+        policy.on_bind_enqueued(Some(executing));
+        policy.on_bind_completed(Some(executing));
+        policy.on_execution_slot_consumed(executing);
+        policy.on_fire_enqueued(stamp(executing, 0, 0, 1), Some(executing), 95, 1, 1);
+        // A retirement's release is then consumed by an uncontended
+        // admission elsewhere (its notify still arrives), while a later
+        // process binds and stages.
+        policy.on_execution_slot_released();
+        policy.on_execution_slot_consumed(executing);
+        policy.on_bind_enqueued(Some(bystander));
+        let queued: HashSet<u64> = [95].into_iter().collect();
+        assert!(
+            matches!(
+                drive_past_cold_hold(&mut policy, &queued),
+                FramePlan::Dispatch(_)
+            ),
+            "a drained release must not hold for a staged bystander"
+        );
+    }
+
+    /// Holds never outlive the successors they wait for: a joiner that
+    /// dies before firing (and a slot release with nobody staged) can
+    /// never wedge the seal.
+    #[test]
+    fn holds_never_outlive_departed_successors() {
+        let mut policy = FramePolicy::new(2, 64, 4096, None);
+        let lane = pid();
+        let successor = pid();
+        policy.on_fire_enqueued(stamp(lane, 0, 0, 1), Some(lane), 95, 1, 1);
+        let queued: HashSet<u64> = [95].into_iter().collect();
+
+        // Slot released with an empty staged pool: no earmark, no hold.
+        policy.on_execution_slot_released();
+        let FramePlan::Dispatch(wave0) = drive_past_cold_hold(&mut policy, &queued) else {
+            panic!("a slot release with nobody staged must not hold");
+        };
+        assert_eq!(wave0, vec![95]);
+        policy.on_fires_posted(&wave0);
+        policy.on_fire_retired(95, false);
+
+        // Stage a successor (freed slot pending from above), admit it,
+        // then let it die before firing: the leave releases the hold.
+        policy.on_fire_enqueued(stamp(lane, 1, 0, 1), Some(lane), 96, 1, 1);
+        policy.on_bind_enqueued(Some(successor));
+        let queued: HashSet<u64> = [96].into_iter().collect();
+        match policy.plan_dispatch(&queued, Instant::now()) {
+            FramePlan::Hold(_) | FramePlan::Park => {}
+            plan => panic!("freed slot with staged taker must hold, got {plan:?}"),
+        }
+        policy.on_execution_slot_consumed(successor);
+        match policy.plan_dispatch(&queued, Instant::now()) {
+            FramePlan::Hold(_) | FramePlan::Park => {}
+            plan => panic!("join in flight must hold, got {plan:?}"),
+        }
+        policy.on_process_leave(successor);
+        assert!(matches!(
+            policy.plan_dispatch(&queued, Instant::now()),
+            FramePlan::Dispatch(_)
+        ));
     }
 
     #[test]

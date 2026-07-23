@@ -868,3 +868,66 @@ hole only because admission pins it there.
    cuMemUnmap/graph churn (startup/shutdown only), batch register verb
    (~3 ms/boundary), prefill compute (honest), BIND_AHEAD alone
    (neutral without seal scoping).
+
+## Staged cohorts + join-gathered seals (directive "한번 해보자" — landed)
+
+The L1 lever from the re-profile, implemented WITHOUT heuristics as an
+invariant correction (operator pushback on the earmark/knob framing was
+right). One principle: **the execution cap governs execution; the seal
+waits for joins that are actually imminent.** Engine-only; driver
+untouched.
+
+Mechanics (frame.rs / worker.rs / process.rs / preemption.rs):
+- Prewarm permits release BEFORE parking on bind admission (a parked
+  holder used to clog the 64-slot conveyor, pinning the whole ladder to
+  the boundary).
+- Bind pool = 2x the execution limit — executing cohort + ONE staged
+  cohort, plain double-buffering. `PIE_BIND_AHEAD` env DELETED.
+- "Pending binds hold the seal" DELETED wholesale (a live rebinder is
+  already wait-set-held through its lane; an unadmitted process cannot
+  fire). Replaced by imminent-join tracking in FramePolicy:
+  `staged` (bind accepted, no first fire yet), `pending_slots` (free
+  execution slots, event-sourced: seeded with the pool capacity at
+  bootstrap, +1 per release — mailed BEFORE the permit drops — and
+  saturating -1 per admission; EVERY capped admission notifies), and
+  `joins_in_flight` (admitted-but-unfired, identity-paired by process
+  id). Seal holds while `joins_in_flight` is non-empty or a free slot
+  has a staged taker. holds_seal deleted from the bind RPC.
+- The retiring teardown announces the slot before dropping the permit;
+  ensure_execution_admitted notifies after acquiring. First fire (keyed
+  by OWNER process id, not stamp.lane) promotes staged->live; every
+  leave path forgets staged/joining processes, so a dead successor can
+  never wedge a seal.
+
+Three bugs found by the suite on the way (each now a unit test):
+1. Anonymous earmark counting deadlocked the 1x1 oracle (warmup B
+   consumed A's slot before the release event landed; the earmark then
+   waited on the unadmittable real request). -> identity pairing.
+2. Id-space mismatch: promotion removed `stamp.lane` (pipeline id) from
+   process-id-keyed sets -> joins never cleared. -> promote by owner.
+3. Semaphore permit laundering: released permits blend into the free
+   pool, so parked-only notification left a phantom positive balance
+   that held the FIRST generation's every seal (~all requests timed
+   out). -> every admission notifies + capacity-seeded balance.
+   Capacity seeding also restored the initial-fleet gather: without it
+   the first epoch sealed 24-wide and the lead-less lanes paced every
+   gen-1 seal at the full commit roundtrip (+4.7 ms/wave, ~140 ms).
+
+Result (suite v5, 4090): oracles t=32/256 byte-EXACT, units 355/355,
+watchdog 0, zero failed requests on every shape. k1 2048x32
+**32.58/32.80/32.63k** (median 32.63k, instr run 33.59k) vs vLLM 32.2k
+— consistently ABOVE the reference with the old 3-4k run-to-run
+variance collapsed to ~0.2k. k2 32.06k, k3 32.26k (both best-ever,
+epoch gathering intact — no ba3 crater). c0256 28.0k/27.9k, 512x512
+19.3k (unchanged; staged working sets don't disturb the KV arena).
+
+Boundary anatomy after: the register grind is GONE from the hole
+(controls now 0.8-5.7 ms per boundary, binds dispatch during the prior
+generation exactly as designed). Remaining holes ~189 ms: initial
+gather 49 ms + three turnovers 56/52/32 ms that are now
+**exit-cascade-limited**: nothing re-admits until the last wave's
+settlement publishes (~12 ms, matches finish_to_settle), then 512
+teardown->permit->admit->fire chains trickle over ~30 ms. That cascade
+(and the driver's 12 ms settle publication) is the next lever toward
+the +10% target (~35.4k needs holes <=90 ms total); after it, decode
+glue fusion (~30-60 ms) is the stretch.

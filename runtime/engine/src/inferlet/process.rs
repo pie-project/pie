@@ -94,13 +94,12 @@ static SERVICES: LazyLock<ServiceMap<ProcessId, Message>> = LazyLock::new(Servic
 
 /// Admission semaphore. `None` = unlimited concurrency (no gating).
 static ADMISSION: OnceLock<Option<Arc<Semaphore>>> = OnceLock::new();
-/// Bind-ahead admission: gates per-instance DRIVER state creation (channel
-/// registration, instance bind, working-set declaration), sized above
-/// execution admission so the next cohort's bring-up overlaps the current
-/// cohort's execution. `PIE_BIND_AHEAD` = extra permits beyond the
-/// execution limit (default: one full execution cohort; 0 restores the
-/// single-gate behavior). Unlimited execution admission leaves this
-/// unlimited too.
+/// Bind admission: gates per-instance DRIVER state creation (channel
+/// registration, instance bind, working-set declaration). Sized at twice
+/// the execution limit — the executing cohort plus ONE staged cohort —
+/// so the next generation's bring-up overlaps the current generation's
+/// execution (double-buffering, no tunable). Unlimited execution
+/// admission leaves this unlimited too.
 static BIND_ADMISSION: OnceLock<Option<Arc<Semaphore>>> = OnceLock::new();
 /// Prewarm admission: a bounded next cohort may instantiate its WASM and
 /// compile/register its (hash-deduped) program while the active cohort
@@ -108,6 +107,15 @@ static BIND_ADMISSION: OnceLock<Option<Arc<Semaphore>>> = OnceLock::new();
 /// state or claims pooled KV/RS resources waits for the execution permit
 /// ([`ensure_execution_admitted`]).
 static PREWARM_ADMISSION: OnceLock<Option<Arc<Semaphore>>> = OnceLock::new();
+/// The execution pool's configured capacity (None = unlimited): the frame
+/// policy seeds its free-slot balance with this at bootstrap, so the
+/// "free slot with a staged taker" seal hold covers the initial fleet's
+/// bring-up by the same rule as a cohort turnover.
+static EXECUTION_SLOT_CAPACITY: OnceLock<Option<usize>> = OnceLock::new();
+
+pub(crate) fn execution_slot_capacity() -> Option<usize> {
+    EXECUTION_SLOT_CAPACITY.get().copied().flatten()
+}
 const MAX_PREWARM_PROCESSES: usize = 64;
 
 static PROCESS_COMPLETED: AtomicU64 = AtomicU64::new(0);
@@ -217,20 +225,19 @@ pub fn init_admission(max_concurrent: Option<usize>) {
     let prewarm = Some(Arc::new(Semaphore::new(
         limit.map_or(MAX_PREWARM_PROCESSES, |n| n.min(MAX_PREWARM_PROCESSES)),
     )));
-    // DEFAULT 0 (bind pool == execution pool == the historical single
-    // gate): measured 2026-07-23, bind-ahead moves the driver-lane
-    // register storm off the boundary but the boundary is ALSO bound by
-    // engine-thread herd work (512 guests' submit paths + the next
-    // cohort's bring-up on one thread), so extra permits bought k2 +1.5k
-    // but cost k1 ~0.7k; see vesuvius-phase2.md. Experimental lever until
-    // the engine-side herd serialization is addressed.
-    let bind_ahead = limit.map(|n| {
-        let extra = std::env::var("PIE_BIND_AHEAD")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(0);
-        Arc::new(Semaphore::new(n.saturating_add(extra)))
-    });
+    // Double-buffered bring-up: the executing cohort plus ONE staged
+    // cohort hold bind permits (mirroring the two-wave run-ahead slots).
+    // The staged cohort instantiates and binds DURING the previous
+    // generation's execution; at the turnover it only needs execution
+    // permits and first submits, so the boundary sheds the register
+    // storm. The frame seal gathers the swap through successor earmarks
+    // (see FramePolicy::on_execution_slot_released) — the earlier
+    // PIE_BIND_AHEAD experiment showed extra permits alone are neutral:
+    // without earmarks the stall just moves into mid-generation seals.
+    let bind_ahead = limit.map(|n| Arc::new(Semaphore::new(n.saturating_mul(2))));
+    EXECUTION_SLOT_CAPACITY
+        .set(limit)
+        .expect("execution slot capacity already initialized");
     ADMISSION
         .set(sem)
         .expect("admission controller already initialized");
@@ -246,17 +253,23 @@ pub(crate) fn execution_admission_is_capped() -> bool {
     ADMISSION.get().is_some_and(Option::is_some)
 }
 
-/// Bind-ahead gate: acquire the bind permit lazily, at the first operation
+/// Bind gate: acquire the bind permit lazily, at the first operation
 /// that creates per-instance driver state (channel registration / instance
-/// bind / working-set declaration). Idempotent per process. The prewarm
-/// permit (held since spawn) is released here — the process has moved past
-/// instantiation into bring-up. With `PIE_BIND_AHEAD` extra permits, the
-/// next cohort binds while the current one executes, so a generation
-/// boundary costs only submits + the seal instead of the register storm.
+/// bind / working-set declaration). Idempotent per process. The bind pool
+/// stages one whole cohort ahead of execution, so the next generation
+/// binds while the current one executes and a generation boundary costs
+/// only execution admits + first submits + the seal instead of the
+/// register storm.
 pub(crate) async fn ensure_bind_admitted(ctx: &mut ProcessCtx) {
     if ctx.bind_admitted() {
         return;
     }
+    // The prewarm conveyor slot covers spawn -> instantiate -> guest
+    // bring-up. Release it BEFORE parking on bind admission: a parked
+    // process holding its prewarm permit clogs the conveyor, and the
+    // next cohort behind it can never instantiate ahead of the turnover
+    // (measured: the whole herd ladder ran inside the boundary hole).
+    ctx.release_prewarm_permit();
     let started = Instant::now();
     let permit = match BIND_ADMISSION.get().and_then(|value| value.as_ref()) {
         Some(semaphore) => Some(
@@ -291,12 +304,20 @@ pub(crate) async fn ensure_execution_admitted(ctx: &mut ProcessCtx) {
     }
     let started = Instant::now();
     let permit = match ADMISSION.get().and_then(|value| value.as_ref()) {
-        Some(semaphore) => Some(
-            Arc::clone(semaphore)
+        Some(semaphore) => {
+            let permit = Arc::clone(semaphore)
                 .acquire_owned()
                 .await
-                .expect("admission semaphore closed"),
-        ),
+                .expect("admission semaphore closed");
+            // EVERY capped admission notifies — uncontended ones too. The
+            // policy's slot balance must see each consumed permit whether it
+            // came from a retirement or the initial pool (the semaphore
+            // launders them together); the notification precedes the first
+            // fire on this same task, so the frame seal waits for exactly
+            // this lane's join instead of sealing a narrow boundary epoch.
+            crate::scheduler::worker::notify_execution_slot_consumed(ctx.id());
+            Some(permit)
+        }
         None => None,
     };
     ctx.admit_execution(permit, duration_us(started.elapsed()));

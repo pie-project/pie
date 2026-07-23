@@ -65,9 +65,10 @@ pub struct ProcessCtx {
     /// Counter for allocating unique host reps
     next_dynamic_rep: u32,
     residency: Arc<Mutex<ProcessResidency>>,
-    /// Held while this process is in the prewarm cohort (instantiated and
-    /// binding, not yet touching pooled device resources). Dropped the
-    /// moment execution is admitted.
+    /// Held while this process is in the prewarm cohort (spawn through
+    /// instantiation and guest bring-up). Released before the process
+    /// parks on bind admission — a parked holder would clog the conveyor
+    /// — with the admit paths clearing it again as a safety net.
     prewarm_permit: Option<OwnedSemaphorePermit>,
     /// The bind-ahead permit, acquired at the first operation that creates
     /// per-instance driver state (channel registration / instance bind /
@@ -284,6 +285,14 @@ impl ProcessCtx {
         self.prewarm_permit = permit;
     }
 
+    /// Free the prewarm conveyor slot. Called before parking on bind
+    /// admission — a parked process holding its prewarm permit would clog
+    /// the conveyor and pin the next cohort's instantiation to the
+    /// generation boundary. Idempotent.
+    pub(crate) fn release_prewarm_permit(&mut self) {
+        self.prewarm_permit = None;
+    }
+
     pub(crate) fn execution_admitted(&self) -> bool {
         self.execution_admitted
     }
@@ -295,8 +304,8 @@ impl ProcessCtx {
     pub(crate) fn admit_bind(&mut self, permit: Option<OwnedSemaphorePermit>) {
         self.bind_permit = permit;
         self.bind_admitted = true;
-        // Past instantiation and into bring-up: the prewarm conveyor slot
-        // frees for the next queued process.
+        // Safety net: normally released before the bind-admission park
+        // (`release_prewarm_permit`).
         self.prewarm_permit = None;
     }
 

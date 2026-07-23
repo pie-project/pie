@@ -71,6 +71,30 @@ pub(crate) async fn notify_process_terminate(pid: ProcessId) {
     notify_pipeline_leave_and_wait(pid, LeaveKind::Terminate).await;
 }
 
+/// A retiring process's deferred teardown dropped its capped execution
+/// permit. Broadcast to every driver's scheduler (mirrors
+/// [`notify_pipeline_leave`]): a policy with no staged successor ignores it,
+/// the policy holding the successor's staged bind earmarks the join.
+/// Fire-and-forget for the same reason as the leave broadcast.
+pub(crate) fn notify_execution_slot_released() {
+    let handles = super::handle_registry().read().unwrap();
+    for handle in handles.iter().flatten() {
+        let _ = handle.send(SchedulerItem::ExecutionSlotReleased);
+    }
+}
+
+/// A parked process acquired its execution permit: its first fire is
+/// imminent, and the frame seal waits for it by identity. Sent BEFORE the
+/// process's first fire enters the mailbox (same producer), so the policy
+/// sees consume-then-fire; a reordered arrival is harmless (the policy's
+/// staged guard skips a lane that already fired).
+pub(crate) fn notify_execution_slot_consumed(pid: ProcessId) {
+    let handles = super::handle_registry().read().unwrap();
+    for handle in handles.iter().flatten() {
+        let _ = handle.send(SchedulerItem::ExecutionSlotConsumed(pid));
+    }
+}
+
 /// No-op: wait-set rejoin is implicit on the pipeline's next scheduler
 /// submission, so a join event has
 /// nothing to do here (`store::reclaim` owns the join hook for its own
@@ -388,18 +412,6 @@ enum SchedulerItem {
     /// turnover control convoy (V6 iteration 25 attribution).
     RegisterChannelsBind {
         pipeline_id: Option<ProcessId>,
-        /// Whether this bind holds the frame seal (`on_bind_enqueued`).
-        /// True only for a process that already has EXECUTION admission —
-        /// its first fire is imminent, the original rationale for the
-        /// pending-bind hold. A bind-AHEAD process (bind-admitted only,
-        /// execution-gated at submit) fires a whole generation later:
-        /// holding the seal for its bind would stall every boundary on the
-        /// next cohort's register storm. Completions stay unconditional —
-        /// `on_bind_completed` is saturating, execution admission is
-        /// monotonic per process, and a guest's binds are sequential
-        /// awaited RPCs, so an unheld completion can never consume a held
-        /// entry.
-        holds_seal: bool,
         plans: Vec<ChannelRegistrationPlan>,
         /// Some on the program cache's first sight (the driver requires the
         /// instance's channels registered BEFORE the program — status -5
@@ -459,6 +471,17 @@ enum SchedulerItem {
         LeaveKind,
         Option<tokio::sync::oneshot::Sender<()>>,
     ),
+    /// A capped execution slot was released: a retiring process's deferred
+    /// teardown dropped its execution permit ([`notify_execution_slot_released`]'s
+    /// broadcast). While the freed slot has a staged taker the frame seal
+    /// waits, so a cohort turnover gathers the incoming herd instead of
+    /// sealing narrow epochs. Uncapped deployments never send this.
+    ExecutionSlotReleased,
+    /// A parked process acquired its execution permit
+    /// ([`notify_execution_slot_consumed`]'s broadcast): the frame seal
+    /// waits for this exact process's first fire (identity-paired with the
+    /// release above — the two race through the mailbox in either order).
+    ExecutionSlotConsumed(ProcessId),
     /// A frame submit failed mid-way host-side: only `submitted` of the
     /// declared fires exist. The frame policy adjusts the lane frame's
     /// expected count so it can still seal (frame mode only; a no-op
@@ -1891,7 +1914,6 @@ impl SchedulerHandle {
     pub async fn register_channels_bind(
         &self,
         pipeline_id: Option<ProcessId>,
-        holds_seal: bool,
         plans: Vec<ChannelRegistrationPlan>,
         program: ProgramRegistration,
         mut bind: InstanceBindingPlan,
@@ -1922,7 +1944,6 @@ impl SchedulerHandle {
         let (registered, program_id, bound) = self
             .request(|response| SchedulerItem::RegisterChannelsBind {
                 pipeline_id,
-                holds_seal,
                 plans,
                 program: program_field,
                 bind,
@@ -2103,6 +2124,9 @@ impl BatchScheduler {
             limits.max_forward_requests,
             limits.max_forward_tokens,
             Some(Arc::clone(&stats)),
+        );
+        frame_policy.preload_free_slots(
+            crate::inferlet::process::execution_slot_capacity().unwrap_or(0),
         );
         // Stall self-diagnosis: a scheduler that spins on the backstop with
         // queued or in-flight work and zero progress is deadlocked from the
@@ -2491,6 +2515,12 @@ impl BatchScheduler {
             // Immediate, not queued. Termination rejects queued work; graceful
             // pipeline close instead releases the wait-set and lets every
             // already-admitted request drain untracked.
+            SchedulerItem::ExecutionSlotReleased => {
+                frame_policy.on_execution_slot_released();
+            }
+            SchedulerItem::ExecutionSlotConsumed(pid) => {
+                frame_policy.on_execution_slot_consumed(pid);
+            }
             SchedulerItem::PipelineLeave(pid, kind, response) => {
                 if kind == LeaveKind::Terminate {
                     terminated_processes.insert(pid);
@@ -2639,7 +2669,6 @@ impl BatchScheduler {
                 );
             }
             SchedulerItem::RegisterChannelsBind {
-                holds_seal,
                 pipeline_id,
                 plans,
                 program,
@@ -2654,13 +2683,15 @@ impl BatchScheduler {
                     )));
                     return;
                 }
-                // `holds_seal` is recorded but not yet acted on: gating the
-                // pending-bind hold on execution admission fragmented k>1
-                // boundary epochs (k2 2048x32 24.9k -> 9.8-10.7k measured),
-                // and the imminent-join replacement did not restore the
-                // gathering. Every bind holds the seal until a gathering
-                // mechanism that survives measurement exists.
-                let _ = holds_seal;
+                // Binds do not hold the seal (a live rebinder is wait-set-held
+                // through its lane; a bring-up process cannot fire). The
+                // policy stages bring-up processes here, and a retiring
+                // execution slot earmarks one staged successor — that earmark
+                // is what gathers a cohort turnover into a dense epoch. The
+                // bare `holds_seal` predecessor (gating the hold on execution
+                // admission with NO successor earmarking) fragmented k>1
+                // boundaries (k2 24.9k -> 9.8-10.7k) — the earmark is the
+                // gathering mechanism that was missing.
                 frame_policy.on_bind_enqueued(pipeline_id);
                 Self::queue_bind_control(
                     pending,
