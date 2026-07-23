@@ -995,3 +995,35 @@ batch-register verb is now the lever with teeth (18 channel-register
 control items per process x 512 collapse ~9x; it is what the ack tail
 and boundary 0 are made of); (2) initial gather 49 ms (prewarm
 conveyor); (3) decode glue fusion (~30-60 ms, stretch).
+
+## Exit cascade, round 2: the leave tax (continuation of "10% 갭")
+
+The mailbox census (per-variant count+time in the epoch drain, permanent
+under PIE_FIRE_TIMING) named the surviving boundary cost precisely:
+`PipelineLeave` items at **31-37 us each** — 1,200+ per boundary (two
+Terminate leaves per exit: the process actor's fire-and-forget plus the
+teardown's awaited one) summing to 35-47 ms, dwarfing everything else
+(binds 7.6 us, closes ~0-4 us, launches 0.6 us).
+
+Two mechanical fixes in `worker.rs`:
+1. `reject_pipeline_queued` rebuilt the whole pending deque (moving
+   every ~700 queued items) on EVERY leave — a pure no-op for natural
+   completion. Now a one-field scan decides; only a real purge (external
+   terminate with queued fires) pays the rebuild.
+2. A duplicate Terminate for an already-terminated pid skips the whole
+   arm and just sends the ack the teardown awaits (first leave did all
+   the work; every step is idempotent-no-op for the second).
+
+Effect: leave items 31-37 us -> **0.8-1.3 us**; boundary mailbox sums
+35-60 ms -> 0-4 ms; releases all land by +15-18 ms; boundary holes
+(last decode complete -> first prefill dispatch) 67.9/33.2/27.0 ->
+**19.0/21.7/17.1 ms** — the exit cascade is now: guest exits by +6,
+releases by +15, seal opens and prefill dispatches by +17-22.
+
+Result (suite m, 4090): oracles t=32/256 byte-EXACT, units 357/357,
+watchdog 0, zero failed requests. k1 2048x32 **35.07/34.62/35.10k
+(median 35.07k = vLLM +8.9%)**, instr 34.67k. k2 **34.45k**, k3
+33.66k, k2-c0256 28.03k — all best-ever. c0256 28.02k, 512x512 19.31k
+unchanged. Remaining to +10% (35.42k): ~330 tok/s ≈ ~19 ms of wall —
+the cold gather (~30-49 ms at fleet bring-up) is the next and last
+boundary lever; decode glue fusion the stretch beyond it.

@@ -388,6 +388,45 @@ impl LaunchGrouping {
     }
 }
 
+/// Mailbox-census buckets (diagnostic; see the epoch-drain loop).
+const ITEM_CENSUS_KINDS: [&str; 12] = [
+    "launch",
+    "reg_chan_bind",
+    "close_instance",
+    "close_channel",
+    "lane_reply",
+    "leave",
+    "slot_released",
+    "slot_consumed",
+    "nudge",
+    "copy",
+    "register_other",
+    "other",
+];
+
+fn item_census_idx(item: &SchedulerItem) -> usize {
+    match item {
+        SchedulerItem::Launch { .. } => 0,
+        SchedulerItem::RegisterChannelsBind { .. } => 1,
+        SchedulerItem::CloseInstance { .. } => 2,
+        SchedulerItem::CloseChannel { .. } => 3,
+        SchedulerItem::Lane(_) => 4,
+        SchedulerItem::PipelineLeave(..) => 5,
+        SchedulerItem::ExecutionSlotReleased => 6,
+        SchedulerItem::ExecutionSlotConsumed(_) => 7,
+        SchedulerItem::Nudge => 8,
+        SchedulerItem::CopyKv { .. }
+        | SchedulerItem::CopyKvTracked { .. }
+        | SchedulerItem::CopyState { .. }
+        | SchedulerItem::ResizePool { .. } => 9,
+        SchedulerItem::RegisterProgram { .. }
+        | SchedulerItem::RegisterChannel { .. }
+        | SchedulerItem::RegisterChannels { .. }
+        | SchedulerItem::BindInstance { .. } => 10,
+        _ => 11,
+    }
+}
+
 enum SchedulerItem {
     Launch {
         pending: PendingRequest,
@@ -2158,45 +2197,58 @@ impl BatchScheduler {
             // boundary wave dispatches when the mailbox finally runs dry
             // instead of the pass after the last join lands.
             let mailbox_epoch = rx.len();
+            // Per-variant census (diagnostic, PIE_FIRE_TIMING): which item
+            // class the boundary epochs are made of, count and time — the
+            // flood's composition decides the next lever.
+            let mut census_n = [0u32; ITEM_CENSUS_KINDS.len()];
+            let mut census_ns = [0u64; ITEM_CENSUS_KINDS.len()];
             for _ in 0..mailbox_epoch {
                 let Ok(item) = rx.try_recv() else { break };
                 progress = true;
                 mailbox_items += 1;
-                if let SchedulerItem::DebugDump { response } = item {
-                    let _ = response.send(Self::render_debug_dump(
-                        &pending,
-                        &frozen_pipelines,
-                        &in_flight_launches,
-                        &in_flight_control,
-                        &instances,
-                        &frame_policy,
-                    ));
-                    continue;
+                let kind = if probe { item_census_idx(&item) } else { 0 };
+                let item_started = if probe { Some(Instant::now()) } else { None };
+                match item {
+                    SchedulerItem::DebugDump { response } => {
+                        let _ = response.send(Self::render_debug_dump(
+                            &pending,
+                            &frozen_pipelines,
+                            &in_flight_launches,
+                            &in_flight_control,
+                            &instances,
+                            &frame_policy,
+                        ));
+                    }
+                    SchedulerItem::Lane(reply) => {
+                        Self::apply_lane_reply(
+                            reply,
+                            &mut lane_inflight,
+                            &mut in_flight_launches,
+                            &mut in_flight_control,
+                            &mut instances,
+                            &mut frame_policy,
+                            &nudge_tx,
+                        );
+                    }
+                    item => {
+                        Self::enqueue_item(
+                            &mut pending,
+                            &mut frozen_pipelines,
+                            &mut terminated_processes,
+                            &mut in_flight_control,
+                            &instances,
+                            limits,
+                            page_size,
+                            &mut stopping,
+                            &mut frame_policy,
+                            item,
+                        );
+                    }
                 }
-                if let SchedulerItem::Lane(reply) = item {
-                    Self::apply_lane_reply(
-                        reply,
-                        &mut lane_inflight,
-                        &mut in_flight_launches,
-                        &mut in_flight_control,
-                        &mut instances,
-                        &mut frame_policy,
-                        &nudge_tx,
-                    );
-                    continue;
+                if let Some(item_started) = item_started {
+                    census_n[kind] += 1;
+                    census_ns[kind] += item_started.elapsed().as_nanos() as u64;
                 }
-                Self::enqueue_item(
-                    &mut pending,
-                    &mut frozen_pipelines,
-                    &mut terminated_processes,
-                    &mut in_flight_control,
-                    &instances,
-                    limits,
-                    page_size,
-                    &mut stopping,
-                    &mut frame_policy,
-                    item,
-                );
             }
             let mailbox_done = Instant::now();
             progress |= Self::retire_ready_launches(
@@ -2232,6 +2284,14 @@ impl BatchScheduler {
                 let retire_us =
                     retire_done.duration_since(mailbox_done).as_micros() as u64;
                 if mailbox_us + retire_us + dispatch_us > 2_000 {
+                    let census: serde_json::Map<String, serde_json::Value> = ITEM_CENSUS_KINDS
+                        .iter()
+                        .zip(census_n.iter().zip(census_ns.iter()))
+                        .filter(|(_, (n, _))| **n > 0)
+                        .map(|(name, (n, ns))| {
+                            ((*name).to_string(), serde_json::json!([n, ns / 1_000]))
+                        })
+                        .collect();
                     super::fire_timing_write(&serde_json::json!({
                         "schema": 1,
                         "source": "scheduler",
@@ -2239,6 +2299,7 @@ impl BatchScheduler {
                         "pass_started_us": super::fire_timing_now_us(),
                         "mailbox_us": mailbox_us,
                         "mailbox_items": mailbox_items,
+                        "census": census,
                         "retire_us": retire_us,
                         "dispatch_us": dispatch_us,
                         "pending_len": pending.len(),
@@ -2536,11 +2597,21 @@ impl BatchScheduler {
             }
             SchedulerItem::PipelineLeave(pid, kind, response) => {
                 if kind == LeaveKind::Terminate {
+                    if !terminated_processes.insert(pid) {
+                        // Duplicate Terminate (the exit funnel notifies once
+                        // from the process actor and once from deferred
+                        // teardown): the first leave did all the work and
+                        // every step below is a no-op for it — skip straight
+                        // to the ack the teardown may be awaiting.
+                        if let Some(response) = response {
+                            let _ = response.send(());
+                        }
+                        return;
+                    }
                     // A departing slot holder's release broadcast is now in
                     // flight; the seal keeps gathering its successor (the
                     // ragged-boundary guard — see on_slotted_terminate).
                     frame_policy.on_slotted_terminate(pid);
-                    terminated_processes.insert(pid);
                     let protected = in_flight_control
                         .as_ref()
                         .filter(|control| control.process_id == Some(pid))
@@ -2768,6 +2839,19 @@ impl BatchScheduler {
         pid: ProcessId,
         protected: Option<&WorkItemCompletion>,
     ) {
+        // Common case first: a naturally-completed process has nothing
+        // queued, and rebuilding the deque unconditionally moved every
+        // pending item per leave (~37 us x ~2 leaves x 512 exits = the
+        // largest single slice of the boundary mailbox time). One
+        // field-read scan decides; only an actual purge pays the rebuild.
+        let has_queued = pending.iter().any(|item| match item {
+            QueuedItem::Launch(request) => request.process_id == Some(pid),
+            QueuedItem::PreLaunchCopy { process_id, .. } => *process_id == Some(pid),
+            _ => false,
+        });
+        if !has_queued {
+            return;
+        }
         let mut kept = VecDeque::with_capacity(pending.len());
         while let Some(item) = pending.pop_front() {
             let reject = match &item {
