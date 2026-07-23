@@ -1,0 +1,1 @@
+{"case":"multiplicative-choice","edges":[{"target":"X","new_prefill_tokens":10,"current_batch_size":4},{"target":"Y","new_prefill_tokens":8,"current_batch_size":2}]}

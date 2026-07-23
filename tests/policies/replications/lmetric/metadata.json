@@ -1,0 +1,17 @@
+{
+  "id": "lmetric",
+  "title": "Simple is Better: Multiplication May Be All You Need for LLM Request Scheduling",
+  "paper_version": "OSDI 2026 / arXiv 2603.15202",
+  "source_url": "https://arxiv.org/abs/2603.15202",
+  "source_commit": null,
+  "source_license": "public router artifact available; implementation is independent",
+  "component": "plex_paper_lmetric",
+  "implements": ["route"],
+  "policy_kernel": ["new_prefill_tokens multiplied by current_batch_size", "hotspot exclusion"],
+  "required_facts": ["new_prefill_tokens", "current_batch_size", "hotspot"],
+  "required_mechanics": [],
+  "deferred_mechanics": [],
+  "evidence_level": "policy-kernel-reproduction",
+  "fixture_provenance": "paper metric and public router behavior",
+  "validation_status": "passing"
+}

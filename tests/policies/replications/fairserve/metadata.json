@@ -1,0 +1,17 @@
+{
+  "id": "fairserve",
+  "title": "Ensuring Fair LLM Serving Amid Diverse Applications",
+  "paper_version": "arXiv 2411.15997",
+  "source_url": "https://arxiv.org/abs/2411.15997",
+  "source_commit": null,
+  "source_license": "paper reference; no source copied",
+  "component": "plex_paper_fairserve",
+  "implements": ["admit", "schedule", "feedback"],
+  "policy_kernel": ["interaction-aware admission", "weighted service accounting"],
+  "required_facts": ["client_id", "weight", "interference_cost", "service_tokens"],
+  "required_mechanics": [],
+  "deferred_mechanics": ["production interference estimator"],
+  "evidence_level": "policy-kernel-reproduction",
+  "fixture_provenance": "independent reference model from the paper",
+  "validation_status": "passing"
+}

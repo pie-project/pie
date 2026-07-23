@@ -5,6 +5,11 @@
     "continuum",
     "kvflow",
     "preble",
-    "helium"
+    "helium",
+    "vtc",
+    "lmetric",
+    "fairserve",
+    "marconi",
+    "ragcache"
   ]
 }

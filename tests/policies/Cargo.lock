@@ -225,10 +225,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "plex-paper-common"
+version = "0.6.0"
+dependencies = [
+ "pie-plex-sdk",
+]
+
+[[package]]
 name = "plex-paper-continuum"
 version = "0.1.0"
 dependencies = [
  "pie-plex-sdk",
+]
+
+[[package]]
+name = "plex-paper-fairserve"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
 ]
 
 [[package]]
@@ -246,10 +261,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "plex-paper-lmetric"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
+name = "plex-paper-marconi"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
 name = "plex-paper-preble"
 version = "0.1.0"
 dependencies = [
  "pie-plex-sdk",
+]
+
+[[package]]
+name = "plex-paper-ragcache"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
+name = "plex-paper-vtc"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
 ]
 
 [[package]]

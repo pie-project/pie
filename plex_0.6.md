@@ -21,6 +21,9 @@
   - Phase 5 complete: vLLM/SGLang templates, generic/negative fixtures,
     unified build/replay runner, v0.5 trace archive, and the rebuilt existing
     five paper artifacts
+  - Wave A complete: VTC, LMetric, FairServe, Marconi, and RAGCache contract
+    sentinels
+  - Wave B complete: Agentix/Autellix, Continuum, KVFlow, Preble, and Helium
 - Inputs:
   - [`plex.md`](plex.md), the implemented v0.5 contract
   - [`plex_gap.md`](plex_gap.md), the design-gap audit

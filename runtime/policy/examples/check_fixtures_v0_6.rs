@@ -20,9 +20,223 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     check_negative_rollback(&packages)?;
     check_queries_and_actions(&packages)?;
     check_existing_papers(&packages)?;
+    check_wave_a(&packages)?;
     check_replication_artifacts(&packages)?;
 
     println!("PLEX v0.6 policy fixtures passed");
+    Ok(())
+}
+
+fn check_wave_a(packages: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let vtc = runtime(packages, "plex_paper_vtc", &[], None)?;
+    assert_success(&vtc.invoke(json!({
+        "api_version": "pie.plex.engine@2",
+        "operation": "feedback",
+        "context": {
+            "delivery_id": "vtc-charge",
+            "records": [{
+                "subject": {"kind": "request", "value": "A"},
+                "outcome": "progress",
+                "facts": {"client_id": "client-a", "input_tokens": 100, "output_tokens": 0}
+            }]
+        },
+        "lifecycle": lifecycle("A", "G1", true)
+    }))?);
+    let vtc_schedule = vtc.invoke(json!({
+        "api_version": "pie.plex.engine@2",
+        "operation": "schedule",
+        "context": {
+            "meta": meta("vtc-schedule"),
+            "cause": "capacity-changed",
+            "runnable": [
+                {
+                    "request": request_ref("A", "G1"),
+                    "max_token_budget": 4,
+                    "facts": {"client_id": "client-a"}
+                },
+                {
+                    "request": request_ref("B", "G2"),
+                    "max_token_budget": 4,
+                    "facts": {"client_id": "client-b"}
+                }
+            ],
+            "capacity": {
+                "max_selections": 1,
+                "max_requests": 1,
+                "max_total_tokens": 4,
+                "facts": {}
+            }
+        },
+        "lifecycle": lifecycle("B", "G2", true)
+    }))?;
+    assert_success(&vtc_schedule);
+    assert_eq!(
+        vtc_schedule["plan"]["plan"]["selections"][0]["requests"],
+        json!([1])
+    );
+
+    let fairserve = runtime(packages, "plex_paper_fairserve", &[], None)?;
+    assert_success(&fairserve.invoke(json!({
+        "api_version": "pie.plex.engine@2",
+        "operation": "feedback",
+        "context": {
+            "delivery_id": "fairserve-charge",
+            "records": [{
+                "subject": {"kind": "request", "value": "A"},
+                "outcome": "progress",
+                "facts": {"client_id": "client-a", "service_tokens": 100}
+            }]
+        },
+        "lifecycle": lifecycle("A", "G1", false)[..2].to_vec()
+    }))?);
+    let fair_admit = fairserve.invoke(json!({
+        "api_version": "pie.plex.engine@2",
+        "operation": "admit",
+        "context": {
+            "meta": meta("fairserve-admit"),
+            "cause": "arrival",
+            "candidates": [
+                {
+                    "request": request_ref("A", "G1"),
+                    "demand": [],
+                    "facts": {
+                        "client_id": "client-a",
+                        "weight": 1,
+                        "interference_cost": 0
+                    }
+                },
+                {
+                    "request": request_ref("B", "G2"),
+                    "demand": [],
+                    "facts": {
+                        "client_id": "client-b",
+                        "weight": 4,
+                        "interference_cost": 0
+                    }
+                }
+            ],
+            "capacity": {"max_accepted": 1, "limits": [], "facts": {}}
+        },
+        "lifecycle": lifecycle("B", "G2", false)[..2].to_vec()
+    }))?;
+    assert_success(&fair_admit);
+    assert_eq!(
+        fair_admit["plan"]["plan"]["decisions"],
+        json!(["defer", "accept"])
+    );
+
+    let lmetric = runtime(packages, "plex_paper_lmetric", &[], None)?;
+    let routed = lmetric.invoke(json!({
+        "api_version": "pie.plex.engine@2",
+        "operation": "route",
+        "context": {
+            "meta": meta("lmetric"),
+            "cause": "admission",
+            "requests": [{"request": request_ref("A", "G"), "facts": {}}],
+            "targets": [
+                {
+                    "target_id": "X",
+                    "max_assignments": 1,
+                    "capacity": [],
+                    "revision": 1,
+                    "facts": {"hotspot": false}
+                },
+                {
+                    "target_id": "Y",
+                    "max_assignments": 1,
+                    "capacity": [],
+                    "revision": 1,
+                    "facts": {"hotspot": false}
+                }
+            ],
+            "feasible_edges": [
+                {
+                    "request_index": 0,
+                    "target_index": 0,
+                    "demand": [],
+                    "facts": {"new_prefill_tokens": 10, "current_batch_size": 4}
+                },
+                {
+                    "request_index": 0,
+                    "target_index": 1,
+                    "demand": [],
+                    "facts": {"new_prefill_tokens": 8, "current_batch_size": 2}
+                }
+            ]
+        },
+        "lifecycle": lifecycle("A", "G", false)
+    }))?;
+    assert_success(&routed);
+    assert_eq!(routed["plan"]["plan"]["assignments"][0]["target_index"], 1);
+
+    let marconi = runtime(packages, "plex_paper_marconi", &[], None)?;
+    let cached = marconi.invoke(json!({
+        "api_version": "pie.plex.engine@2",
+        "operation": "cache",
+        "context": {
+            "meta": meta("marconi"),
+            "cause": "insertion",
+            "resident": [{
+                "object": {
+                    "object_id": "resident",
+                    "size_bytes": 4,
+                    "beneficiaries": [],
+                    "beneficiary_count": 0,
+                    "facts": {"reuse_probability_ppm": 1, "recompute_flops": 1}
+                },
+                "reclaimable": true
+            }],
+            "prospective": [{
+                "object_id": "prospective",
+                "size_bytes": 4,
+                "beneficiaries": [],
+                "beneficiary_count": 0,
+                "facts": {"reuse_probability_ppm": 1000, "recompute_flops": 1000}
+            }],
+            "capacity": {"max_bytes": 4, "fixed_bytes": 0, "facts": {}},
+            "episode": null
+        }
+    }))?;
+    assert_success(&cached);
+    assert_eq!(cached["plan"]["plan"]["admissions"], json!(["cache"]));
+    assert_eq!(cached["plan"]["plan"]["reclaim"], json!([0]));
+
+    let ragcache = runtime(packages, "plex_paper_ragcache", &[], None)?;
+    let reclaimed = ragcache.invoke(json!({
+        "api_version": "pie.plex.engine@2",
+        "operation": "cache",
+        "context": {
+            "meta": meta("ragcache"),
+            "cause": "dependency-progress",
+            "resident": [
+                {
+                    "object": {
+                        "object_id": "leaf-a",
+                        "size_bytes": 1,
+                        "beneficiaries": [],
+                        "beneficiary_count": 0,
+                        "facts": {"leaf": true, "frequency": 1, "recompute_cost": 1, "age": 0}
+                    },
+                    "reclaimable": true
+                },
+                {
+                    "object": {
+                        "object_id": "leaf-b",
+                        "size_bytes": 1,
+                        "beneficiaries": [],
+                        "beneficiary_count": 0,
+                        "facts": {"leaf": true, "frequency": 2, "recompute_cost": 10, "age": 0}
+                    },
+                    "reclaimable": true
+                }
+            ],
+            "prospective": [],
+            "capacity": {"max_bytes": 1, "fixed_bytes": 0, "facts": {}},
+            "episode": {"episode_id": "rag-episode", "iteration": 0, "max_iterations": 2}
+        }
+    }))?;
+    assert_success(&reclaimed);
+    assert_eq!(reclaimed["plan"]["plan"]["reclaim"], json!([0]));
     Ok(())
 }
 

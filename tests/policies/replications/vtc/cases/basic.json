@@ -1,0 +1,1 @@
+{"case":"lower-counter-first","clients":[{"id":"A","counter":20},{"id":"B","counter":4}],"capacity":{"max_requests":1}}

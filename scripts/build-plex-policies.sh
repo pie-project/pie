@@ -39,6 +39,11 @@ for artifact in \
     plex_paper_continuum \
     plex_paper_helium \
     plex_paper_kvflow \
+    plex_paper_vtc \
+    plex_paper_lmetric \
+    plex_paper_fairserve \
+    plex_paper_marconi \
+    plex_paper_ragcache \
     plex_paper_preble \
     plex_query_assisted \
     plex_raw_helpers \
@@ -87,6 +92,11 @@ for artifact in \
     plex_paper_continuum \
     plex_paper_helium \
     plex_paper_kvflow \
+    plex_paper_vtc \
+    plex_paper_lmetric \
+    plex_paper_fairserve \
+    plex_paper_marconi \
+    plex_paper_ragcache \
     plex_paper_preble \
     plex_query_assisted \
     plex_raw_helpers \
@@ -114,6 +124,21 @@ do
             ;;
         plex_paper_agentix)
             operations=schedule,feedback
+            ;;
+        plex_paper_vtc)
+            operations=schedule,feedback
+            ;;
+        plex_paper_lmetric)
+            operations=route
+            ;;
+        plex_paper_fairserve)
+            operations=admit,schedule,feedback
+            ;;
+        plex_paper_marconi)
+            operations=cache,feedback
+            ;;
+        plex_paper_ragcache)
+            operations=cache
             ;;
         plex_paper_continuum)
             operations=schedule,cache,feedback

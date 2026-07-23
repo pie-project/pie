@@ -1,0 +1,1 @@
+{"case":"weighted-admission","clients":[{"id":"A","service":100,"weight":1},{"id":"B","service":100,"weight":4}],"max_accepted":1}

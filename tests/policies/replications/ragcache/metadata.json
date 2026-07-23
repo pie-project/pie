@@ -1,0 +1,17 @@
+{
+  "id": "ragcache",
+  "title": "RAGCache: Efficient Knowledge Caching for Retrieval-Augmented Generation",
+  "paper_version": "arXiv 2404.12457",
+  "source_url": "https://arxiv.org/abs/2404.12457",
+  "source_commit": null,
+  "source_license": "paper reference; no source copied",
+  "component": "plex_paper_ragcache",
+  "implements": ["cache"],
+  "policy_kernel": ["leaf-only reclaim", "prefix-aware GDSF value", "bounded iterative episode"],
+  "required_facts": ["leaf", "frequency", "recompute_cost", "age"],
+  "required_mechanics": [],
+  "deferred_mechanics": [],
+  "evidence_level": "policy-kernel-reproduction",
+  "fixture_provenance": "independent reference model from the paper",
+  "validation_status": "passing"
+}
