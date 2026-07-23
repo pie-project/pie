@@ -2199,7 +2199,7 @@ mod tests {
             PIE_GEOMETRY_CLASS_HOST
         );
         assert_eq!(PieInstanceDesc::default().reserved1, 0);
-        assert_eq!(PieLaunchDesc::default().reserved0, 0);
+        assert_eq!(PieLaunchDesc::default().settle_defer, 0);
         assert_eq!(PieEncodeDesc::default().reserved0, 0);
         assert_eq!(PieLaunchDesc::default().reserved_flags, [0; 2]);
         assert_eq!(PieKvCopyDesc::default().reserved0, 0);

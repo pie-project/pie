@@ -576,6 +576,10 @@ enum LaneRequest {
     /// A control `QueuedItem` (never `Launch`/`Prepare`): the lane runs the
     /// driver half of the old `dispatch_ordered_item` arm.
     Control { token: u64, item: QueuedItem },
+    /// Drain the driver's parked frame-group settlement records (M2): a
+    /// deferred group whose tail will never post (truncation, quiescence)
+    /// must still settle. No reply; spurious flushes only settle early.
+    FlushSettle,
     /// Drain marker: the lane replies with the driver and its channel set so
     /// the worker can run shutdown teardown with everything already quiesced.
     Shutdown {
@@ -747,6 +751,7 @@ impl DriverLane {
         let _ = match &request {
             LaneRequest::Launch { .. }
             | LaneRequest::Prepare { .. }
+            | LaneRequest::FlushSettle
             | LaneRequest::Control {
                 item: QueuedItem::ResizePool { .. },
                 ..
@@ -893,6 +898,13 @@ impl DriverLane {
                         driver_started_us,
                         launch_returned_us,
                     }));
+                }
+                LaneRequest::FlushSettle => {
+                    if let Some(driver) = driver.as_mut() {
+                        if let Err(error) = driver.flush_settlement() {
+                            tracing::warn!("driver settlement flush failed: {error:#}");
+                        }
+                    }
                 }
                 LaneRequest::Prepare {
                     submission,
@@ -1578,6 +1590,9 @@ struct PendingLaunchBatch {
     started: Instant,
     batch_size: u64,
     total_tokens: usize,
+    /// The batch posted with `settle_defer = 1`: its completion resolves at
+    /// its frame group's tail (M2), and it shares the group's run-ahead slot.
+    settle_defer: bool,
     timing: Option<WaveTimingState>,
 }
 
@@ -3161,7 +3176,9 @@ impl BatchScheduler {
             if in_flight_control.is_some() {
                 break;
             }
-            if in_flight_launches.len() >= frame::configured_max_in_flight() {
+            if Self::in_flight_settle_groups(in_flight_launches)
+                >= frame::configured_max_in_flight()
+            {
                 break;
             }
             let now = Instant::now();
@@ -3214,6 +3231,7 @@ impl BatchScheduler {
                 }
             }
             let mut rider_batch = false;
+            let mut settle_defer = false;
             let candidates = if stopping {
                 // Shutdown drain: the boundary gate waits for arrivals that
                 // will never come once the host stops, so bypass it and post
@@ -3222,6 +3240,9 @@ impl BatchScheduler {
                 // A fire that bounces RETRY afterwards is rejected at
                 // retirement instead of requeued.
                 if drain_eligible.is_empty() {
+                    if in_flight_launches.back().is_some_and(|batch| batch.settle_defer) {
+                        driver_lane.post(LaneRequest::FlushSettle);
+                    }
                     break;
                 }
                 drain_eligible
@@ -3243,13 +3264,22 @@ impl BatchScheduler {
                             // control: let the queue walk dispatch it.
                             break;
                         }
+                        settle_defer = frame_policy.last_plan_defers_settlement();
                         eligible
                     }
                     FramePlan::Hold(hold) => {
                         merge_hint(&mut wait_hint, hold);
                         break;
                     }
-                    FramePlan::Park => break,
+                    FramePlan::Park => {
+                        // Quiescing with a deferred group open (its tail was
+                        // truncated away, or arrivals stopped): flush so the
+                        // parked completions resolve and retirement proceeds.
+                        if in_flight_launches.back().is_some_and(|batch| batch.settle_defer) {
+                            driver_lane.post(LaneRequest::FlushSettle);
+                        }
+                        break;
+                    }
                 }
             };
             if candidates.is_empty() {
@@ -3268,6 +3298,7 @@ impl BatchScheduler {
                 limits,
                 stats,
                 &candidates,
+                settle_defer,
             );
             progress |= batch_progress;
             if let Some(hint) = batch_hint {
@@ -3281,6 +3312,20 @@ impl BatchScheduler {
             }
         }
         (progress, wait_hint)
+    }
+
+    /// M2 group-aware run-ahead gate: a sealed frame's deferred waves and
+    /// its settle-now tail count as ONE in-flight unit, so a k-wave group can
+    /// always post its tail; settle-now batches (k=1, riders, makeups,
+    /// shutdown drain) each count alone — at k=1 this is exactly the
+    /// historical per-batch depth. A trailing deferred run with a truncated
+    /// tail counts as its own open group until it retires.
+    fn in_flight_settle_groups(in_flight: &VecDeque<PendingLaunchBatch>) -> usize {
+        in_flight
+            .iter()
+            .filter(|batch| !batch.settle_defer)
+            .count()
+            + usize::from(in_flight.back().is_some_and(|batch| batch.settle_defer))
     }
 
     /// Extract `candidates` (in order) from the queue, group them under the
@@ -3302,6 +3347,7 @@ impl BatchScheduler {
         limits: SchedulerLimits,
         stats: &Arc<SchedulerStats>,
         candidates: &[u64],
+        settle_defer: bool,
     ) -> (bool, Option<Duration>, bool) {
         let mut progress = false;
         let mut wait_hint: Option<Duration> = None;
@@ -3467,7 +3513,8 @@ impl BatchScheduler {
             .iter()
             .map(|req| req.request.token_ids.len())
             .sum::<usize>();
-        let submission = batch::build_batch_request(&requests, page_size, stats);
+        let mut submission = batch::build_batch_request(&requests, page_size, stats);
+        submission.settle_defer = settle_defer;
         let batch_built_us = timing_enabled.then(super::fire_timing_now_us);
         let membership_hash = if timing_enabled {
             fire_membership_hash(requests.iter().map(|request| &request.logical_fire_id))
@@ -3505,6 +3552,7 @@ impl BatchScheduler {
             started: Instant::now(),
             batch_size,
             total_tokens,
+            settle_defer,
             timing: wave_timing,
         });
         *lane_inflight += 1;
@@ -4236,6 +4284,7 @@ mod tests {
             channel_expected_head: Vec::new(),
             channel_expected_tail: Vec::new(),
             channel_ticket_indptr: Vec::new(),
+            settle_defer: false,
         };
         let demand = AdmissionWatermark::demand(&submission);
         assert_eq!(demand.kv_pages, 10);
@@ -6860,6 +6909,7 @@ mod tests {
             limits,
             &stats,
             &wave,
+            false,
         );
         assert!(progress, "the drop is progress");
         assert!(!posted, "nothing launches for a cancelled fire");

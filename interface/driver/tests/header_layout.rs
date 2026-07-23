@@ -175,7 +175,7 @@ fn rust_layout_matches_committed_header_contract() {
         800,
         8,
         abi_version => 0,
-        reserved0 => 4,
+        settle_defer => 4,
         instance_ids => 8,
         terminal_cells => 24,
         token_ids => 40,

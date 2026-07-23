@@ -3824,6 +3824,7 @@ mod tests {
                     channel_expected_head: wire.channel_expected_head,
                     channel_expected_tail: wire.channel_expected_tail,
                     channel_ticket_indptr: wire.channel_ticket_indptr,
+                    settle_defer: false,
                 })
                 .unwrap();
             runtime.block_on(completion).unwrap();
@@ -3946,6 +3947,7 @@ mod tests {
                     channel_expected_head: wire.channel_expected_head,
                     channel_expected_tail: wire.channel_expected_tail,
                     channel_ticket_indptr: wire.channel_ticket_indptr,
+                    settle_defer: false,
                 })
                 .unwrap();
             let _ = accepted_tx.send(());
