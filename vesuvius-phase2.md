@@ -774,3 +774,97 @@ Boundary accounting after both rounds: what was a 140–175 ms wait-all
 stall per cohort turnover is now ~30–40 ms (grind ~29 ms + bring-up).
 The remaining host gap to ideal is spread across the per-wave path
 again, not concentrated in the boundary.
+
+## Full re-profile toward +10% over vLLM (directive "다시 철저히 재프로파일"; target ≈35.4k)
+
+Instrumented k1 2048x32 (32.5k) + nsys graph-mode (31.6k under probe,
+representative) + nsys node-mode 1024x32 (32.4k, negligible probe).
+Scripts in session scratchpad `reprof/` (wave_attr / submit_fields /
+census / hole_census / boundary_anatomy / bind_micro; sqlites kept).
+
+**Wall census (timed window ~2.015 s for 65,536 output tokens):**
+- Steady decode: 124 waves x 512 fires, period p50 9.33 ms -> internal
+  ~54.9k tok/s. The forward pass is ONE CUDA graph per wave, p50
+  8.33 ms / p90 9.38 ms (155 launches, 1,127 ms total). Compute-only
+  GPU idle across the whole run is just 12.1% (352.7 ms) and 322.8 ms
+  of it is five >=1 ms holes: the four generation boundaries + startup
+  edge. Steady-state micro-idle is ~30 ms TOTAL — the control plane's
+  run-ahead (fires submitted ~2 waves ahead; dispatch starts ~4.5-5.3 ms
+  before the previous wave's native_complete; the same two wave slots
+  alternate) keeps the graph stream contiguous. Steady decode is
+  GPU-BOUND; the earlier "remaining host gap is in the per-wave path"
+  reading was wrong — the host path (driver submit host_total 2.53 ms =
+  settlement_enqueue 1.39 + finish_epilogue 0.91 + begin 0.39) is fully
+  hidden by pipelining.
+- Node-mode kernel split: decode attention (BatchDecodeWithPagedKVCache)
+  95 us/layer -> 2.7 ms/wave, near KV-bandwidth-bound; decode GEMMs
+  ~3.5 ms/wave at ~60% MFU; glue (rmsnorm 3 us x 28x2, rope/qkv, swiglu)
+  ~1 ms/wave; settlement/pull-validate/commit kernels ~14 ms per RUN
+  (negligible). Kernel-side headroom is modest (glue fusion maybe
+  5-10% of the graph), NOT the road to +10%.
+- Prefill: prompt = 37 tokens; each generation prefills as 3 waves
+  (221+221+70 fires, ~19k tokens) in ~130 ms, discrete kernel launches
+  (~395/wave, not graphed) with big 507-us GEMMs; roughly
+  compute-honest, minor upside.
+- Generation-boundary holes: 45.7 / 77.4 / 51.0 / 80.6 ms (census;
+  nsys sees the same four at 62.9-92.4 under probe) = ~255 ms, i.e.,
+  ~12.5% of wall. THE dominant recoverable loss.
+
+**Hole anatomy (hole_census + boundary_anatomy):** ALL 2048 processes
+spawn at t~0 (the bench client pre-submits everything; concurrency is
+enforced ENGINE-side by the admission chain). Ladder per boundary:
+[~11-15 ms exit cascade: last settle -> guests finish -> closes ->
+permits release] -> [prewarm admit + instantiate, instant] ->
+[guest bring-up + bind-queue lag, up to ~20 ms jitter] -> [bind grind:
+1,024 register_channels_bind controls x 27-32 us = 27-35 ms serial on
+the driver lane] -> [512 exec admits + first fires + seal]. Then the
+first prefill wave dispatches.
+
+Why nothing overlaps the previous generation (and why the BIND_AHEAD
+sweeps were neutral): MAX_PREWARM_PROCESSES=64, and the prewarm permit
+is released only AFTER the bind permit is acquired — so the 64
+next-cohort processes instantiate early, park on bind admission
+(pool = 512 execution-tied permits, freed at exit) STILL HOLDING their
+prewarm permits, and the conveyor clogs. Extra bind permits alone
+don't fix it because pending binds hold the executing round's seal
+(wait-all rule), so early binds just move the stall from the boundary
+into mid-generation seals — measured neutral, exactly as ba5 found.
+prewarm_wait mean 659 ms vs bind_admission_wait mean 45.9 ms: the
+upstream gate is prewarm, not bind.
+
+**Bind micro-profile (operator: "bind에 더 먹을 게 있다"):** per
+control occupancy is now 29.8 us mean = engine channel-set 12.1 us +
+bind RPC 14.4 us (driver: instance build 11.0 us; decode/topology/
+event ~0) + framing 3.1 us. Slab pools hold: alloc/init/staging/
+mirror/words all ~0 (sums 0-1.8 ms over 36,900 registrations).
+Per boundary: 30.5 ms occupancy total. A batch register verb would now
+save only the 3.1 us/ctl framing (~3 ms/boundary — DOWN from the
+earlier 6-8 ms estimate; stays parked). The operator's hunch is right
+but the meat is WHERE binds run, not what they cost: the entire 30 ms
+grind + 15 ms exit cascade + 20 ms bring-up jitter sits inside a GPU
+hole only because admission pins it there.
+
+**Ranked path to >=35.4k (need wall <=1.851 s, i.e., -165 ms):**
+1. L1 — overlap the cohort turnover (worth ~-200 ms; sufficient
+   alone): (a) release the prewarm permit BEFORE parking on bind
+   admission (+ possibly raise MAX_PREWARM), so the whole next cohort
+   instantiates + binds during the previous generation's decode;
+   (b) bind-ahead permits on by default (pool = limit + limit);
+   (c) seal-hold scoping: pending binds hold the executing round's
+   seal ONLY for exec-admitted processes; a parked (bind-ahead)
+   process cannot fire, so its binds must not gate anyone. The unused
+   holds_seal field on the bind RPC is the plumbing. The boundary
+   still needs a hold while exec admission floods the new cohort in
+   (else the first wave seals narrow — the M1b fragmentation trap):
+   transfer the hold from "pending bind" to "staged cohort: bound but
+   awaiting exec admission", released per process at first-fire
+   enqueue. Guards: ba3's k2 crater came from un-scoped release;
+   exec-admitted binds must keep holding. Verify k2/k3 + oracle + the
+   409-ms-hole shapes (c0256, 512x512).
+2. L2 (stretch, ~-30-60 ms): fuse decode glue (rmsnorm x56/graph,
+   rope/qkv, swiglu) into neighbors; attention and GEMMs are already
+   near their respective roofs.
+3. Non-levers, measured: settlement machinery (14 ms GPU + hidden host),
+   cuMemUnmap/graph churn (startup/shutdown only), batch register verb
+   (~3 ms/boundary), prefill compute (honest), BIND_AHEAD alone
+   (neutral without seal scoping).
