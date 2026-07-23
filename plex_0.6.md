@@ -36,6 +36,10 @@
     [`plex_replication_report.md`](plex_replication_report.md),
     `tests/policies/replication-report.json`, and
     `tests/policies/performance-results.json`
+  - Independent fidelity and north-star performance audit:
+    `tests/policies/fidelity-audit.json`,
+    [`plex_policy_performance_report.md`](plex_policy_performance_report.md),
+    and `plex_policy_performance_report.json`
 - Inputs:
   - [`plex.md`](plex.md), the implemented v0.5 contract
   - [`plex_gap.md`](plex_gap.md), the design-gap audit

@@ -23,11 +23,25 @@ def format_percent(value: float | None) -> str:
     return "-" if value is None else f"{value:+.3f}%"
 
 
+def format_live_mechanism(live: dict[str, Any] | None) -> str:
+    if live is None or live.get("worker") is None:
+        return "-"
+    worker = live["worker"]
+    return (
+        f"S{worker['schedule_success']}/C{worker['cache_success']}/"
+        f"F{worker['feedback_success']}; "
+        f"enact {worker['schedule_enacted'] + worker['cache_enacted']}; "
+        f"drop {worker['dropped']}; fallback {worker['fallback']}"
+    )
+
+
 def build_report(
     offline: dict[str, Any],
     live: dict[str, Any],
     fidelity: dict[str, Any],
     robustness: dict[str, Any],
+    pie_commit: str | None,
+    vllm_commit: str | None,
 ) -> dict[str, Any]:
     live_by_id = {
         entry["policy_id"]: entry
@@ -84,6 +98,10 @@ def build_report(
     live_entries = [entry["live"] for entry in entries if entry["live"] is not None]
     return {
         "schema_version": 1,
+        "pie_commit": pie_commit,
+        "vllm_commit": vllm_commit,
+        "offline_environment": offline.get("environment"),
+        "live_model": live.get("model"),
         "policy_count": len(entries),
         "offline_trend_reproduced_count": sum(
             entry["offline"]["trend_reproduced"] for entry in entries
@@ -145,6 +163,8 @@ def markdown(report: dict[str, Any]) -> str:
         "",
         "Proxy ratios are not presented as the original paper ratios.",
         "",
+        f"- Pie commit: `{report['pie_commit'] or 'unspecified'}`",
+        f"- vLLM commit: `{report['vllm_commit'] or 'unspecified'}`",
         f"- Policies: {report['policy_count']}",
         f"- Offline proxy trends reproduced: {report['offline_trend_reproduced_count']}",
         f"- Live vLLM policies: {report['live_policy_count']}",
@@ -159,8 +179,8 @@ def markdown(report: dict[str, Any]) -> str:
         "",
         "## Results",
         "",
-        "| Policy | Paper north star | Proxy | Win rate | Decision p50 | Live throughput | Fidelity |",
-        "|---|---|---:|---:|---:|---:|---|",
+        "| Policy | Paper north star | Proxy | Win rate | Decision p50 | Live throughput | Live mechanism | Fidelity |",
+        "|---|---|---:|---:|---:|---:|---|---|",
     ]
     for entry in report["entries"]:
         live = entry["live"]
@@ -172,6 +192,7 @@ def markdown(report: dict[str, Any]) -> str:
             f"{entry['offline']['win_rate']:.1%} | "
             f"{entry['offline']['decision_latency']['median_us']:.1f} us | "
             f"{format_percent(live['throughput_delta_percent'] if live else None)} | "
+            f"{format_live_mechanism(live)} | "
             f"{fidelity['classification'] if fidelity else 'pending'} |"
         )
     lines.extend(
@@ -203,6 +224,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--robustness-dir", type=Path)
     parser.add_argument("--output-json", type=Path, required=True)
     parser.add_argument("--output-md", type=Path, required=True)
+    parser.add_argument("--pie-commit")
+    parser.add_argument("--vllm-commit")
     return parser.parse_args()
 
 
@@ -228,6 +251,8 @@ def main() -> None:
         read_json(args.live),
         read_json(args.fidelity),
         robustness,
+        args.pie_commit,
+        args.vllm_commit,
     )
     args.output_json.write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n"

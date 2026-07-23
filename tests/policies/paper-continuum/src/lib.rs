@@ -82,10 +82,7 @@ impl Policy for Continuum {
             reclaim: reclaim_prefix(
                 ctx,
                 &admissions,
-                reclaim
-                    .into_iter()
-                    .filter(|(pinned, _, _)| !pinned)
-                    .map(|(_, _, index)| index),
+                reclaim.into_iter().map(|(_, _, index)| index),
             ),
             admissions,
         })
