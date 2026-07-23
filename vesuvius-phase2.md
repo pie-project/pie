@@ -728,3 +728,49 @@ LaneCommit plumbing), then the residual ~2k fresh allocations per
 boundary from closes whose deferred retirement lands after the next
 cohort's registrations. Next lever if the grind is attacked again: an
 engine-side/ABI batch register verb.
+
+## Bind-cheap round 2 (directive "1, 2, 3 전부 진행" — landed)
+
+The three follow-up levers from round 1, resolved:
+
+1. **Engine-side register/bind loop**: instrumented first
+   (`engine_bind_breakdown` event: set/program/bind µs, permanent under
+   PIE_FIRE_TIMING). Verdict: the "~70 µs engine residual" was a
+   mis-attribution — most of it was the GROWTH allocation cost hiding
+   inside `register_channel_set` (blocks 0/1 grow 9 slots × ~7.5 µs of
+   cudaMalloc/cudaHostAlloc per control). With pooling (below), the
+   real engine numbers are set 11.3 µs (9 channels ≈ 1.3 µs each),
+   program ≈ 0 (engine-side program-id cache), bind 13.6 µs (11.4
+   driver). A batch register verb's remaining upside is ~6–8
+   ms/boundary — parked as not worth the ABI churn now.
+2. **PIE_BIND_AHEAD re-sweep** (64/256/512 on the round-1 build):
+   neutral to −0.7k on every setting, k1 and k2 alike. With binds this
+   cheap the boundary grind is ~29 ms; pre-binding's per-wave seal
+   interference at k=1 cancels what it saves. Default stays 0; the
+   dormant machinery remains for a future where binds are expensive
+   again.
+3. **Slab-pool slot storage** (`SmallBlockPool`, the round's win): all
+   per-slot storage (cells, staging, mirrors, word blocks) now
+   recycles through registry-owned exact-size slab pools; slabs return
+   to CUDA only at teardown. Registration performs NO CUDA allocation
+   calls — including the cold ramp, which used to pay ~18.4k fresh
+   allocation trios across blocks 0/1. This also deleted the two
+   remaining settle sites on the retire path (release_slot_storage,
+   reused-slot growth): recycled blocks stay inside the
+   initialization-stream FIFO / `init_done_` ordering, so no
+   free-under-copy hazard exists.
+
+Measured (bc4): `register_channels_bind` occupancy mean 91 → **28 µs**
+(Σ462 → Σ115 ms/run); growth driver time 7.5 → 0.2 µs; the boundary
+grind ~120 → **~29 ms**. Throughput: k1 2048×32 **28.8–32.1k tok/s**
+(instrumented run **32.5k** — at the vLLM 32.2k reference); k2
+**31.5k**; k3 **31.1k**; c0/256 28.0k (was 27.4–27.6k); 512×512
+19.3k. Oracles byte-EXACT; golden step-exec 69/69; engine units
+351/351; watchdog 0. The k>1 shapes gained the most — their denser
+boundaries were the most grind-bound — and k2/k3 now sit ABOVE every
+pre-round k1 number.
+
+Boundary accounting after both rounds: what was a 140–175 ms wait-all
+stall per cohort turnover is now ~30–40 ms (grind ~29 ms + bring-up).
+The remaining host gap to ideal is spread across the per-wave path
+again, not concentrated in the boundary.
