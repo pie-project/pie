@@ -1117,3 +1117,35 @@ Ceiling estimate if BOTH land plus tails: ~36.3-36.6k = +13-14%.
 +15% additionally needs the client spawn ramp and prefill-chunk
 unification (planner capacity trade against the KV pool) to land —
 possible only if everything does.
+
+## Cold bind surgery (B) round 1: baked lists join the registry slabs
+
+Directive: (A) rejected (no WIT change), (B) approved. Measured entry
+point: `cuda_bind.instance_us` cold 21us vs steady 11us — the delta is
+the BakedBufferPool's per-instance cudaMalloc on every cold-cohort
+miss (the pool starts empty; 1,024 first-touch acquires each pay a
+lane-thread malloc), exactly the class of cost the SmallBlockPool
+slabs already removed for cell/mirror/word storage.
+
+Change: with a shared registry bound, the tier-0 baked lists now come
+from the registry's device slab pool (`acquire_device_block`); the
+runner records the owner for release. The standalone/test path keeps
+the process-wide size-keyed pool. One 1 MB slab now serves ~2k baked
+buffers where the cold ramp paid ~1k cudaMallocs.
+
+Measured: instance_us cold 21 -> 15 (p90 32 -> 20); cold hole 59.4 ->
+53.4 ms. Steady unchanged. Well under the (B) estimate of -15..25 ms:
+device init batching already exists (flush_pending_initializations),
+per-register host cost is ~1.5us with no single fat item left — the
+remaining cold rcb ~50us is genuinely distributed (instance build 15
++ 9 registers + framing/reply), so further cuts would be micro-trims
+with poor complexity/benefit under the no-hacks bar.
+
+Result (suite s, 4090): oracles EXACT, units 358/358, golden 69/69 x4
+(one anomalous partial run traced to environmental interference — 17
+of 69 executed; deterministic 69/69 on every controlled rerun),
+watchdog 0. k1 35.54/35.01/34.92 (median 35.01, band-equal with the
+r suite's 35.20 — the -6 ms cold trim is inside run noise on k1);
+k2 34.69k, k3 34.33k, k2-c0256 28.04k, 512x512 19.77k, instr-k1
+35.04k, instr-k2 34.47k — every one a new best (denser shapes see
+the cold trim more).

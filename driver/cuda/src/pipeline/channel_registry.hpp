@@ -239,6 +239,17 @@ class DeviceChannelRegistry {
         CUDA_CHECK(cudaStreamWaitEvent(stream, init_done_, 0));
     }
 
+    // Slab-pooled device blocks for lane-thread consumers beyond the channel
+    // cells (the tier-0 baked lists): a cold cohort's first-touch acquires
+    // come out of the same 1 MB slabs instead of one cudaMalloc per instance
+    // on the lane thread. Lane-thread only, like every registry mutation.
+    void* acquire_device_block(std::size_t bytes) {
+        return device_blocks_.acquire(bytes);
+    }
+    void release_device_block(void* pointer, std::size_t bytes) {
+        device_blocks_.release(pointer, bytes);
+    }
+
     // Enqueue an H2D copy on the initialization stream, ordered by the same
     // `init_done_` stamp. `source` must stay alive until the stream drains
     // (callers keep a persistent host staging buffer).

@@ -429,11 +429,17 @@ class Tier0Runner {
         stage_list(host_commit_taken_slots_, off_taken, n_commit_taken_);
         stage_list(host_commit_put_slots_, off_put, n_commit_put_);
 
-        // One pooled allocation + one upload for the whole bake.
+        // One pooled allocation + one upload for the whole bake. With a
+        // shared registry the block comes from its device slab pool — a
+        // cold cohort's first-touch acquires then cost no cudaMalloc on
+        // the lane thread (the standalone/test path keeps the size-keyed
+        // process pool).
         d_baked_bytes_ = host_baked_.size() * sizeof(std::uint32_t);
-        d_baked_ = static_cast<std::uint32_t*>(
-            BakedBufferPool::instance().acquire(d_baked_bytes_));
         DeviceChannelRegistry* reg = view_->registry();
+        baked_owner_ = reg;
+        d_baked_ = static_cast<std::uint32_t*>(
+            reg != nullptr ? reg->acquire_device_block(d_baked_bytes_)
+                           : BakedBufferPool::instance().acquire(d_baked_bytes_));
         if (reg != nullptr) {
             // `host_baked_` is a member: it outlives the async copy.
             reg->upload_initialization_bytes(
@@ -456,7 +462,12 @@ class Tier0Runner {
 
     void free_baked_lists() {
         if (d_baked_ != nullptr) {
-            BakedBufferPool::instance().release(d_baked_, d_baked_bytes_);
+            if (baked_owner_ != nullptr) {
+                baked_owner_->release_device_block(d_baked_, d_baked_bytes_);
+            } else {
+                BakedBufferPool::instance().release(d_baked_, d_baked_bytes_);
+            }
+            baked_owner_ = nullptr;
             d_baked_ = nullptr;
             d_baked_bytes_ = 0;
         }
@@ -856,6 +867,10 @@ class Tier0Runner {
     std::vector<std::uint32_t> host_baked_;     // upload staging; outlives the async copy
     std::uint32_t* d_commit_ = nullptr;         // pass-ephemeral commit flag (= d_baked_[0])
     StageChannelLists desc_lists_;
+    // Which pool owns `d_baked_`: the shared registry's slab pool when a
+    // registry view is bound (production; outlives every instance), else
+    // the process-wide size-keyed pool (standalone/test path).
+    DeviceChannelRegistry* baked_owner_ = nullptr;
     std::vector<StageChannelLists> stage_lists_;
     std::uint32_t* d_commit_taken_ = nullptr; std::uint32_t n_commit_taken_ = 0;
     std::uint32_t* d_commit_put_ = nullptr;   std::uint32_t n_commit_put_ = 0;
