@@ -1,0 +1,28 @@
+{
+  "id": "parrot",
+  "title": "Parrot: Efficient Serving of LLM-based Applications with Semantic Variable",
+  "paper_version": "OSDI 2024",
+  "source_url": "https://www.usenix.org/conference/osdi24/presentation/lin-chaofan",
+  "source_commit": null,
+  "source_license": "public artifact available; implementation is independent",
+  "component": "plex_paper_parrot",
+  "implements": [
+    "route",
+    "schedule"
+  ],
+  "policy_kernel": [
+    "trusted dependency-readiness scheduling",
+    "dependency-distance placement"
+  ],
+  "required_facts": [
+    "dependency_ready",
+    "dependency_distance"
+  ],
+  "required_mechanics": [],
+  "deferred_mechanics": [
+    "general semantic-variable DAG runtime"
+  ],
+  "evidence_level": "policy-kernel-reproduction",
+  "fixture_provenance": "paper policy and public artifact interface",
+  "validation_status": "passing"
+}

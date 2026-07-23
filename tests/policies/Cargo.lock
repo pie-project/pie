@@ -248,6 +248,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "plex-paper-conserve"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
 name = "plex-paper-continuum"
 version = "0.1.0"
 dependencies = [
@@ -256,6 +264,14 @@ dependencies = [
 
 [[package]]
 name = "plex-paper-dlpm"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
+name = "plex-paper-dualmap"
 version = "0.1.0"
 dependencies = [
  "pie-plex-sdk",
@@ -272,6 +288,14 @@ dependencies = [
 
 [[package]]
 name = "plex-paper-fairserve"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
+name = "plex-paper-goodserve"
 version = "0.1.0"
 dependencies = [
  "pie-plex-sdk",
@@ -317,6 +341,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "plex-paper-llumnix"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
 name = "plex-paper-lmetric"
 version = "0.1.0"
 dependencies = [
@@ -341,6 +373,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "plex-paper-parrot"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
 name = "plex-paper-peek"
 version = "0.1.0"
 dependencies = [
@@ -353,6 +393,14 @@ name = "plex-paper-preble"
 version = "0.1.0"
 dependencies = [
  "pie-plex-sdk",
+]
+
+[[package]]
+name = "plex-paper-pythia"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
 ]
 
 [[package]]
@@ -372,7 +420,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "plex-paper-routebalance"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
+name = "plex-paper-saga"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
 name = "plex-paper-slos-serve"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
+name = "plex-paper-smetric"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
+name = "plex-paper-thunderagent"
 version = "0.1.0"
 dependencies = [
  "pie-plex-sdk",

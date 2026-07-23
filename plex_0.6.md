@@ -27,6 +27,8 @@
   - Wave C complete: DLPM/D2LPM, InferCept, PEEK, QLM, SLOs-Serve,
     Certaindex/Dynasor, Justitia, Chameleon, HotPrefix, PARD, and branch
     parallelism regulation
+  - Wave D complete: DualMap, Llumnix, SMetric, ThunderAgent, Pythia,
+    GoodServe, conversation-level ConServe, Parrot, SAGA, and RouteBalance
 - Inputs:
   - [`plex.md`](plex.md), the implemented v0.5 contract
   - [`plex_gap.md`](plex_gap.md), the design-gap audit

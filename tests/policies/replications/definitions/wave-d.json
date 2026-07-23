@@ -1,0 +1,219 @@
+[
+  {
+    "metadata": {
+      "id": "dualmap",
+      "title": "DualMap: Enabling Both Cache Affinity and Load Balancing for Distributed LLM Serving",
+      "paper_version": "arXiv 2602.06502",
+      "source_url": "https://arxiv.org/abs/2602.06502",
+      "source_commit": null,
+      "source_license": "paper reference; no source copied",
+      "component": "plex_paper_dualmap",
+      "implements": ["route"],
+      "policy_kernel": ["two-choice prefix hashing", "SLO-aware choice", "hotspot migration intent"],
+      "required_facts": ["prefix_hit", "slo_risk", "hash_choice", "hotspot"],
+      "required_mechanics": [],
+      "optional_mechanics": ["request.rebalance@1"],
+      "deferred_mechanics": ["physical migration"],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "independent reference model from the paper",
+      "validation_status": "passing"
+    },
+    "case": {"case": "hotspot-migration", "hotspot": true},
+    "expected": {"actions": ["pie.request.rebalance@1"]}
+  },
+  {
+    "metadata": {
+      "id": "llumnix",
+      "title": "Llumnix: Dynamic Scheduling for Large Language Model Serving",
+      "paper_version": "arXiv 2406.03243",
+      "source_url": "https://arxiv.org/abs/2406.03243",
+      "source_commit": null,
+      "source_license": "public artifact available; implementation is independent",
+      "component": "plex_paper_llumnix",
+      "implements": ["route", "feedback"],
+      "policy_kernel": ["virtual usage placement", "live rescheduling intent"],
+      "required_facts": ["virtual_usage", "live_reschedule"],
+      "required_mechanics": [],
+      "optional_mechanics": ["request.rebalance@1"],
+      "deferred_mechanics": ["physical migration"],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "paper policy and public artifact interface",
+      "validation_status": "passing"
+    },
+    "case": {"case": "live-reschedule", "live_reschedule": true},
+    "expected": {"actions": ["pie.request.rebalance@1"]}
+  },
+  {
+    "metadata": {
+      "id": "smetric",
+      "title": "SMetric: Rethink LLM Scheduling for Serving Agents with Balanced Session-centric Scheduling",
+      "paper_version": "arXiv 2607.08565",
+      "source_url": "https://arxiv.org/abs/2607.08565",
+      "source_commit": null,
+      "source_license": "paper reference; no source copied",
+      "component": "plex_paper_smetric",
+      "implements": ["route"],
+      "policy_kernel": ["first-turn load balance", "follow-up cache affinity", "tail-outlier migration"],
+      "required_facts": ["generation_id", "cache_affinity", "load", "tail_outlier"],
+      "required_mechanics": [],
+      "optional_mechanics": ["request.rebalance@1"],
+      "deferred_mechanics": ["physical migration"],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "independent reference model from the paper",
+      "validation_status": "passing"
+    },
+    "case": {"case": "followup-tail-outlier", "generation_id": 1, "tail_outlier": true},
+    "expected": {"actions": ["pie.request.rebalance@1"]}
+  },
+  {
+    "metadata": {
+      "id": "thunderagent",
+      "title": "ThunderAgent: A Simple, Fast and Program-Aware Agentic Inference System",
+      "paper_version": "arXiv 2602.13692",
+      "source_url": "https://arxiv.org/abs/2602.13692",
+      "source_commit": null,
+      "source_license": "public artifact available; implementation is independent",
+      "component": "plex_paper_thunderagent",
+      "implements": ["schedule", "cache", "feedback"],
+      "policy_kernel": ["tool-state-aware scheduling", "program-state cache retention", "migration/cancel intent"],
+      "required_facts": ["tool_ready", "tool_failed", "migrate_target", "program_live"],
+      "required_mechanics": [],
+      "optional_mechanics": ["request.cancel@1", "request.rebalance@1"],
+      "deferred_mechanics": ["physical pause and migration"],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "paper policy and public artifact interface",
+      "validation_status": "passing"
+    },
+    "case": {"case": "program-migration", "tool_ready": true, "migrate_target": "node-a"},
+    "expected": {"actions": ["pie.request.rebalance@1"]}
+  },
+  {
+    "metadata": {
+      "id": "pythia",
+      "title": "Pythia: Exploiting Workflow Predictability for Efficient Agent-Native LLM Serving",
+      "paper_version": "arXiv 2604.25899",
+      "source_url": "https://arxiv.org/abs/2604.25899",
+      "source_commit": null,
+      "source_license": "paper reference; no source copied",
+      "component": "plex_paper_pythia",
+      "implements": ["route", "schedule", "cache", "feedback"],
+      "policy_kernel": ["workflow lookahead routing", "workflow-rank scheduling", "Belady-like cache choice", "prefetch intent"],
+      "required_facts": ["lookahead_cost", "workflow_rank", "next_use_step", "prefetch"],
+      "required_mechanics": [],
+      "optional_mechanics": ["cache.prefetch@1"],
+      "deferred_mechanics": ["proactive scaling"],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "independent reference model from the paper",
+      "validation_status": "passing"
+    },
+    "case": {"case": "workflow-prefetch", "prefetch": true},
+    "expected": {"actions": ["pie.cache.prefetch@1"]}
+  },
+  {
+    "metadata": {
+      "id": "goodserve",
+      "title": "GoodServe: Towards High-Goodput Serving of Agentic LLM Inferences over Heterogeneous Resources",
+      "paper_version": "arXiv 2605.16867",
+      "source_url": "https://arxiv.org/abs/2605.16867",
+      "source_commit": null,
+      "source_license": "paper reference; no source copied",
+      "component": "plex_paper_goodserve",
+      "implements": ["route", "feedback"],
+      "policy_kernel": ["just-enough heterogeneous target choice", "risk-triggered migration"],
+      "required_facts": ["quality_gap_ppm", "cost", "risk_ppm", "migration_threshold_ppm"],
+      "required_mechanics": [],
+      "optional_mechanics": ["request.rebalance@1"],
+      "deferred_mechanics": ["predictor training", "provisioning"],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "fixed predictor-output reference model",
+      "validation_status": "passing"
+    },
+    "case": {"case": "risk-migration", "risk_ppm": 900, "migration_threshold_ppm": 800},
+    "expected": {"actions": ["pie.request.rebalance@1"]}
+  },
+  {
+    "metadata": {
+      "id": "conserve",
+      "title": "Observation, Not Prediction: Conversation-Level Disaggregated Scheduling for Agentic Serving",
+      "paper_version": "arXiv 2606.01839",
+      "source_url": "https://arxiv.org/abs/2606.01839",
+      "source_commit": null,
+      "source_license": "paper reference; no source copied",
+      "component": "plex_paper_conserve",
+      "implements": ["route"],
+      "policy_kernel": ["heavy first-prefill placement", "conversation-tail affinity"],
+      "required_facts": ["prefill_capacity", "conversation_affinity", "load"],
+      "required_mechanics": [],
+      "deferred_mechanics": [],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "independent reference model from the paper",
+      "validation_status": "passing"
+    },
+    "case": {"case": "first-prefill-capacity", "targets": [{"id": "X", "capacity": 1}, {"id": "Y", "capacity": 10}]},
+    "expected": {"target_id": "Y"}
+  },
+  {
+    "metadata": {
+      "id": "parrot",
+      "title": "Parrot: Efficient Serving of LLM-based Applications with Semantic Variable",
+      "paper_version": "OSDI 2024",
+      "source_url": "https://www.usenix.org/conference/osdi24/presentation/lin-chaofan",
+      "source_commit": null,
+      "source_license": "public artifact available; implementation is independent",
+      "component": "plex_paper_parrot",
+      "implements": ["route", "schedule"],
+      "policy_kernel": ["trusted dependency-readiness scheduling", "dependency-distance placement"],
+      "required_facts": ["dependency_ready", "dependency_distance"],
+      "required_mechanics": [],
+      "deferred_mechanics": ["general semantic-variable DAG runtime"],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "paper policy and public artifact interface",
+      "validation_status": "passing"
+    },
+    "case": {"case": "dependency-ready", "dependency_ready": true},
+    "expected": {"selected": true}
+  },
+  {
+    "metadata": {
+      "id": "saga",
+      "title": "SAGA: Workflow-Atomic Scheduling for AI Agent Inference on GPU Clusters",
+      "paper_version": "arXiv 2605.00528",
+      "source_url": "https://arxiv.org/abs/2605.00528",
+      "source_commit": null,
+      "source_license": "paper reference; no source copied",
+      "component": "plex_paper_saga",
+      "implements": ["route", "schedule", "cache"],
+      "policy_kernel": ["workflow TTL", "group fairness", "cache-local work stealing"],
+      "required_facts": ["cache_locality", "load", "steal", "workflow_ttl_ms"],
+      "required_mechanics": [],
+      "optional_mechanics": ["request.rebalance@1"],
+      "deferred_mechanics": ["physical work stealing"],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "independent reference model from the paper",
+      "validation_status": "passing"
+    },
+    "case": {"case": "cache-local-steal", "steal": true},
+    "expected": {"actions": ["pie.request.rebalance@1"]}
+  },
+  {
+    "metadata": {
+      "id": "routebalance",
+      "title": "RouteBalance: Fused Model Routing and Load Balancing for Heterogeneous LLM Serving",
+      "paper_version": "arXiv 2606.17949",
+      "source_url": "https://arxiv.org/abs/2606.17949",
+      "source_commit": null,
+      "source_license": "paper reference; no source copied",
+      "component": "plex_paper_routebalance",
+      "implements": ["route"],
+      "policy_kernel": ["bounded joint request-target assignment", "fused utility and capacity"],
+      "required_facts": ["utility"],
+      "required_mechanics": [],
+      "deferred_mechanics": ["replica provisioning"],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "independent bounded reference solver",
+      "validation_status": "passing"
+    },
+    "case": {"case": "non-greedy-joint-assignment", "utility": [[10, 9], [8, 0]], "target_capacity": [1, 1]},
+    "expected": {"assignments": {"A": "Y", "B": "X"}, "total_utility": 17}
+  }
+]

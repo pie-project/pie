@@ -1,0 +1,34 @@
+{
+  "id": "goodserve",
+  "title": "GoodServe: Towards High-Goodput Serving of Agentic LLM Inferences over Heterogeneous Resources",
+  "paper_version": "arXiv 2605.16867",
+  "source_url": "https://arxiv.org/abs/2605.16867",
+  "source_commit": null,
+  "source_license": "paper reference; no source copied",
+  "component": "plex_paper_goodserve",
+  "implements": [
+    "route",
+    "feedback"
+  ],
+  "policy_kernel": [
+    "just-enough heterogeneous target choice",
+    "risk-triggered migration"
+  ],
+  "required_facts": [
+    "quality_gap_ppm",
+    "cost",
+    "risk_ppm",
+    "migration_threshold_ppm"
+  ],
+  "required_mechanics": [],
+  "optional_mechanics": [
+    "request.rebalance@1"
+  ],
+  "deferred_mechanics": [
+    "predictor training",
+    "provisioning"
+  ],
+  "evidence_level": "policy-kernel-reproduction",
+  "fixture_provenance": "fixed predictor-output reference model",
+  "validation_status": "passing"
+}

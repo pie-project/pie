@@ -1,0 +1,36 @@
+{
+  "id": "thunderagent",
+  "title": "ThunderAgent: A Simple, Fast and Program-Aware Agentic Inference System",
+  "paper_version": "arXiv 2602.13692",
+  "source_url": "https://arxiv.org/abs/2602.13692",
+  "source_commit": null,
+  "source_license": "public artifact available; implementation is independent",
+  "component": "plex_paper_thunderagent",
+  "implements": [
+    "schedule",
+    "cache",
+    "feedback"
+  ],
+  "policy_kernel": [
+    "tool-state-aware scheduling",
+    "program-state cache retention",
+    "migration/cancel intent"
+  ],
+  "required_facts": [
+    "tool_ready",
+    "tool_failed",
+    "migrate_target",
+    "program_live"
+  ],
+  "required_mechanics": [],
+  "optional_mechanics": [
+    "request.cancel@1",
+    "request.rebalance@1"
+  ],
+  "deferred_mechanics": [
+    "physical pause and migration"
+  ],
+  "evidence_level": "policy-kernel-reproduction",
+  "fixture_provenance": "paper policy and public artifact interface",
+  "validation_status": "passing"
+}

@@ -1,0 +1,37 @@
+{
+  "id": "pythia",
+  "title": "Pythia: Exploiting Workflow Predictability for Efficient Agent-Native LLM Serving",
+  "paper_version": "arXiv 2604.25899",
+  "source_url": "https://arxiv.org/abs/2604.25899",
+  "source_commit": null,
+  "source_license": "paper reference; no source copied",
+  "component": "plex_paper_pythia",
+  "implements": [
+    "route",
+    "schedule",
+    "cache",
+    "feedback"
+  ],
+  "policy_kernel": [
+    "workflow lookahead routing",
+    "workflow-rank scheduling",
+    "Belady-like cache choice",
+    "prefetch intent"
+  ],
+  "required_facts": [
+    "lookahead_cost",
+    "workflow_rank",
+    "next_use_step",
+    "prefetch"
+  ],
+  "required_mechanics": [],
+  "optional_mechanics": [
+    "cache.prefetch@1"
+  ],
+  "deferred_mechanics": [
+    "proactive scaling"
+  ],
+  "evidence_level": "policy-kernel-reproduction",
+  "fixture_provenance": "independent reference model from the paper",
+  "validation_status": "passing"
+}

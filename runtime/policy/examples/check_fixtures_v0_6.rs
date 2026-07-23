@@ -22,9 +22,194 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     check_existing_papers(&packages)?;
     check_wave_a(&packages)?;
     check_wave_c(&packages)?;
+    check_wave_d(&packages)?;
     check_replication_artifacts(&packages)?;
 
     println!("PLEX v0.6 policy fixtures passed");
+    Ok(())
+}
+
+fn check_wave_d(packages: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    for (package, facts) in [
+        ("plex_paper_dualmap", json!({"hotspot": true})),
+        ("plex_paper_llumnix", json!({"live_reschedule": true})),
+        (
+            "plex_paper_smetric",
+            json!({"generation_id": 1, "tail_outlier": true}),
+        ),
+        (
+            "plex_paper_goodserve",
+            json!({"risk_ppm": 900, "migration_threshold_ppm": 800}),
+        ),
+        ("plex_paper_saga", json!({"steal": true})),
+    ] {
+        let runtime = runtime(packages, package, &["request.rebalance@1"], None)?;
+        let outcome = runtime.invoke(route_event("A", "G", package, facts))?;
+        assert_success(&outcome);
+        assert_eq!(
+            outcome["actions"][0]["method"],
+            "pie.request.rebalance@1"
+        );
+    }
+
+    let thunder = runtime(
+        packages,
+        "plex_paper_thunderagent",
+        &["request.cancel@1", "request.rebalance@1"],
+        None,
+    )?;
+    let thundered = thunder.invoke(schedule_event(
+        "A",
+        "G",
+        json!({"tool_ready": true, "migrate_target": "node-a"}),
+    ))?;
+    assert_success(&thundered);
+    assert_eq!(
+        thundered["actions"][0]["method"],
+        "pie.request.rebalance@1"
+    );
+
+    let pythia = runtime(
+        packages,
+        "plex_paper_pythia",
+        &["cache.prefetch@1"],
+        None,
+    )?;
+    let prefetched = pythia.invoke(cache_event(true, false))?;
+    assert_success(&prefetched);
+    assert_eq!(
+        prefetched["actions"][0]["method"],
+        "pie.cache.prefetch@1"
+    );
+
+    let parrot = runtime(packages, "plex_paper_parrot", &[], None)?;
+    assert_success(&parrot.invoke(schedule_event(
+        "A",
+        "G",
+        json!({"dependency_ready": true}),
+    ))?);
+
+    let conserve = runtime(packages, "plex_paper_conserve", &[], None)?;
+    let placed = conserve.invoke(json!({
+        "api_version": "pie.plex.engine@2",
+        "operation": "route",
+        "context": {
+            "meta": meta("conserve"),
+            "cause": "admission",
+            "requests": [{"request": request_ref("A", "G"), "facts": {}}],
+            "targets": [
+                {
+                    "target_id": "X",
+                    "max_assignments": 1,
+                    "capacity": [],
+                    "revision": 1,
+                    "facts": {}
+                },
+                {
+                    "target_id": "Y",
+                    "max_assignments": 1,
+                    "capacity": [],
+                    "revision": 1,
+                    "facts": {}
+                }
+            ],
+            "feasible_edges": [
+                {
+                    "request_index": 0,
+                    "target_index": 0,
+                    "demand": [],
+                    "facts": {"prefill_capacity": 1}
+                },
+                {
+                    "request_index": 0,
+                    "target_index": 1,
+                    "demand": [],
+                    "facts": {"prefill_capacity": 10}
+                }
+            ]
+        },
+        "lifecycle": lifecycle("A", "G", false)
+    }))?;
+    assert_success(&placed);
+    assert_eq!(placed["plan"]["plan"]["assignments"][0]["target_index"], 1);
+
+    let routebalance = runtime(packages, "plex_paper_routebalance", &[], None)?;
+    let balanced = routebalance.invoke(json!({
+        "api_version": "pie.plex.engine@2",
+        "operation": "route",
+        "context": {
+            "meta": meta("routebalance"),
+            "cause": "admission",
+            "requests": [
+                {"request": request_ref("A", "GA"), "facts": {}},
+                {"request": request_ref("B", "GB"), "facts": {}}
+            ],
+            "targets": [
+                {
+                    "target_id": "X",
+                    "max_assignments": 1,
+                    "capacity": [],
+                    "revision": 1,
+                    "facts": {}
+                },
+                {
+                    "target_id": "Y",
+                    "max_assignments": 1,
+                    "capacity": [],
+                    "revision": 1,
+                    "facts": {}
+                }
+            ],
+            "feasible_edges": [
+                {"request_index": 0, "target_index": 0, "demand": [], "facts": {"utility": 10}},
+                {"request_index": 0, "target_index": 1, "demand": [], "facts": {"utility": 9}},
+                {"request_index": 1, "target_index": 0, "demand": [], "facts": {"utility": 8}},
+                {"request_index": 1, "target_index": 1, "demand": [], "facts": {"utility": 0}}
+            ]
+        },
+        "lifecycle": [
+            {
+                "event": "create-group",
+                "group_id": "GA",
+                "principal_id": "tenant",
+                "limits": {"max_members": 2, "max_scratch_bytes": 4096},
+                "facts": {}
+            },
+            {
+                "event": "create-request",
+                "request_id": "A",
+                "principal_id": "tenant",
+                "group_id": "GA",
+                "fields": {},
+                "facts": {}
+            },
+            {"event": "admit-request", "request_id": "A"},
+            {
+                "event": "create-group",
+                "group_id": "GB",
+                "principal_id": "tenant",
+                "limits": {"max_members": 2, "max_scratch_bytes": 4096},
+                "facts": {}
+            },
+            {
+                "event": "create-request",
+                "request_id": "B",
+                "principal_id": "tenant",
+                "group_id": "GB",
+                "fields": {},
+                "facts": {}
+            },
+            {"event": "admit-request", "request_id": "B"}
+        ]
+    }))?;
+    assert_success(&balanced);
+    assert_eq!(
+        balanced["plan"]["plan"]["assignments"],
+        json!([
+            {"request_index": 0, "edge_index": 1, "target_index": 1},
+            {"request_index": 1, "edge_index": 2, "target_index": 0}
+        ])
+    );
     Ok(())
 }
 

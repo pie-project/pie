@@ -1,0 +1,17 @@
+{
+  "case": "non-greedy-joint-assignment",
+  "utility": [
+    [
+      10,
+      9
+    ],
+    [
+      8,
+      0
+    ]
+  ],
+  "target_capacity": [
+    1,
+    1
+  ]
+}

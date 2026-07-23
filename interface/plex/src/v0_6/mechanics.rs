@@ -88,7 +88,7 @@ pub const STANDARD_MECHANICS: &[StandardMechanic] = &[
         method: Some("pie.request.rebalance@1"),
         request_schema: Some("../../schema/0.6/actions/request-rebalance.schema.json"),
         feedback_schema: Some("../../schema/0.6/actions/action-feedback.schema.json"),
-        operations: &[Operation::Route, Operation::Feedback],
+        operations: &[Operation::Route, Operation::Schedule, Operation::Feedback],
     },
 ];
 

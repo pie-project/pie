@@ -57,7 +57,7 @@
       "method": "pie.request.rebalance@1",
       "request_schema": "../../schema/0.6/actions/request-rebalance.schema.json",
       "feedback_schema": "../../schema/0.6/actions/action-feedback.schema.json",
-      "operations": ["route", "feedback"],
+      "operations": ["route", "schedule", "feedback"],
       "description": "Request movement of an active or paused request to a supplied target."
     }
   ]

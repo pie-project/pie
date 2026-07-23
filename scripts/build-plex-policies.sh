@@ -55,6 +55,16 @@ for artifact in \
     plex_paper_hotprefix \
     plex_paper_pard \
     plex_paper_branch_regulation \
+    plex_paper_dualmap \
+    plex_paper_llumnix \
+    plex_paper_smetric \
+    plex_paper_thunderagent \
+    plex_paper_pythia \
+    plex_paper_goodserve \
+    plex_paper_conserve \
+    plex_paper_parrot \
+    plex_paper_saga \
+    plex_paper_routebalance \
     plex_paper_preble \
     plex_query_assisted \
     plex_raw_helpers \
@@ -119,6 +129,16 @@ for artifact in \
     plex_paper_hotprefix \
     plex_paper_pard \
     plex_paper_branch_regulation \
+    plex_paper_dualmap \
+    plex_paper_llumnix \
+    plex_paper_smetric \
+    plex_paper_thunderagent \
+    plex_paper_pythia \
+    plex_paper_goodserve \
+    plex_paper_conserve \
+    plex_paper_parrot \
+    plex_paper_saga \
+    plex_paper_routebalance \
     plex_paper_preble \
     plex_query_assisted \
     plex_raw_helpers \
@@ -199,6 +219,32 @@ do
         plex_paper_branch_regulation)
             operations=admit,schedule
             optional=request.cancel@1
+            ;;
+        plex_paper_dualmap|plex_paper_smetric)
+            operations=route
+            optional=request.rebalance@1
+            ;;
+        plex_paper_llumnix|plex_paper_goodserve)
+            operations=route,feedback
+            optional=request.rebalance@1
+            ;;
+        plex_paper_thunderagent)
+            operations=schedule,cache,feedback
+            optional=request.cancel@1,request.rebalance@1
+            ;;
+        plex_paper_pythia)
+            operations=route,schedule,cache,feedback
+            optional=cache.prefetch@1
+            ;;
+        plex_paper_conserve|plex_paper_routebalance)
+            operations=route
+            ;;
+        plex_paper_parrot)
+            operations=route,schedule
+            ;;
+        plex_paper_saga)
+            operations=route,schedule,cache
+            optional=request.rebalance@1
             ;;
         plex_paper_continuum)
             operations=schedule,cache,feedback

@@ -1,0 +1,13 @@
+{
+  "case": "first-prefill-capacity",
+  "targets": [
+    {
+      "id": "X",
+      "capacity": 1
+    },
+    {
+      "id": "Y",
+      "capacity": 10
+    }
+  ]
+}

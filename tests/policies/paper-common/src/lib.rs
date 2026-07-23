@@ -841,6 +841,443 @@ impl Policy for BranchRegulation {
     }
 }
 
+pub struct DualMap;
+
+impl Policy for DualMap {
+    fn route(ctx: &RouteContext, _state: &mut State, host: &Host) -> plex::Result<RoutePlan> {
+        let mut decisions = Vec::with_capacity(ctx.requests.len());
+        for (request_index, request) in ctx.requests.iter().enumerate() {
+            let selected = ctx
+                .feasible_edges
+                .iter()
+                .enumerate()
+                .filter(|(_, edge)| edge.request_index as usize == request_index)
+                .max_by_key(|(_, edge)| {
+                    (
+                        edge.facts["prefix_hit"].as_bool().unwrap_or(false),
+                        Reverse(edge.facts["slo_risk"].as_u64().unwrap_or(u64::MAX)),
+                        edge.facts["hash_choice"].as_u64().unwrap_or(0),
+                    )
+                });
+            if let Some((index, edge)) = selected {
+                let target = &ctx.targets[edge.target_index as usize];
+                if request.facts["hotspot"].as_bool() == Some(true) {
+                    host.rebalance_request(
+                        request.request.request_id.as_str(),
+                        target.target_id.as_str(),
+                        &format!("dualmap-{request_index}"),
+                    )?;
+                }
+                decisions.push(RouteDecision::Assign(index as u32));
+            } else {
+                decisions.push(RouteDecision::Defer);
+            }
+        }
+        Ok(RoutePlan { decisions })
+    }
+}
+
+pub struct Llumnix;
+
+impl Policy for Llumnix {
+    fn route(ctx: &RouteContext, _state: &mut State, host: &Host) -> plex::Result<RoutePlan> {
+        let mut decisions = Vec::new();
+        for (request_index, request) in ctx.requests.iter().enumerate() {
+            let selected = ctx
+                .feasible_edges
+                .iter()
+                .enumerate()
+                .filter(|(_, edge)| edge.request_index as usize == request_index)
+                .min_by_key(|(_, edge)| edge.facts["virtual_usage"].as_u64().unwrap_or(u64::MAX));
+            if let Some((index, edge)) = selected {
+                if request.facts["live_reschedule"].as_bool() == Some(true) {
+                    host.rebalance_request(
+                        request.request.request_id.as_str(),
+                        ctx.targets[edge.target_index as usize].target_id.as_str(),
+                        &format!("llumnix-{request_index}"),
+                    )?;
+                }
+                decisions.push(RouteDecision::Assign(index as u32));
+            } else {
+                decisions.push(RouteDecision::Defer);
+            }
+        }
+        Ok(RoutePlan { decisions })
+    }
+
+    fn feedback(ctx: &FeedbackContext, state: &mut State, _host: &Host) -> plex::Result<()> {
+        state.shared["llumnix_feedback"] = json!(
+            state.shared["llumnix_feedback"]
+                .as_u64()
+                .unwrap_or(0)
+                .saturating_add(ctx.records.len() as u64)
+        );
+        Ok(())
+    }
+}
+
+pub struct SMetric;
+
+impl Policy for SMetric {
+    fn route(ctx: &RouteContext, _state: &mut State, host: &Host) -> plex::Result<RoutePlan> {
+        let mut decisions = Vec::new();
+        for (request_index, request) in ctx.requests.iter().enumerate() {
+            let followup = request.facts["generation_id"].as_u64().unwrap_or(0) > 0;
+            let selected = ctx
+                .feasible_edges
+                .iter()
+                .enumerate()
+                .filter(|(_, edge)| edge.request_index as usize == request_index)
+                .max_by_key(|(_, edge)| {
+                    if followup {
+                        (
+                            edge.facts["cache_affinity"].as_u64().unwrap_or(0),
+                            Reverse(edge.facts["load"].as_u64().unwrap_or(u64::MAX)),
+                        )
+                    } else {
+                        (0, Reverse(edge.facts["load"].as_u64().unwrap_or(u64::MAX)))
+                    }
+                });
+            if let Some((index, edge)) = selected {
+                if request.facts["tail_outlier"].as_bool() == Some(true) {
+                    host.rebalance_request(
+                        request.request.request_id.as_str(),
+                        ctx.targets[edge.target_index as usize].target_id.as_str(),
+                        &format!("smetric-{request_index}"),
+                    )?;
+                }
+                decisions.push(RouteDecision::Assign(index as u32));
+            } else {
+                decisions.push(RouteDecision::Defer);
+            }
+        }
+        Ok(RoutePlan { decisions })
+    }
+}
+
+pub struct ThunderAgent;
+
+impl Policy for ThunderAgent {
+    fn schedule(
+        ctx: &ScheduleContext,
+        _state: &mut State,
+        host: &Host,
+    ) -> plex::Result<SchedulePlan> {
+        let mut order = Vec::new();
+        for (index, candidate) in ctx.runnable.iter().enumerate() {
+            if candidate.facts["tool_failed"].as_bool() == Some(true) {
+                host.cancel_request(
+                    candidate.request.request_id.as_str(),
+                    &format!("thunder-cancel-{index}"),
+                    Some("tool resource failed"),
+                )?;
+                continue;
+            }
+            if let Some(target) = candidate.facts["migrate_target"].as_str() {
+                host.rebalance_request(
+                    candidate.request.request_id.as_str(),
+                    target,
+                    &format!("thunder-migrate-{index}"),
+                )?;
+            }
+            if candidate.facts["tool_ready"].as_bool().unwrap_or(true) {
+                order.push(index);
+            }
+        }
+        Ok(select_singletons(ctx, order))
+    }
+
+    fn cache(ctx: &CacheContext, _state: &mut State, _host: &Host) -> plex::Result<CachePlan> {
+        Ok(CachePlan {
+            admissions: ctx
+                .prospective
+                .iter()
+                .map(|object| {
+                    if object.facts["program_live"].as_bool().unwrap_or(false) {
+                        CacheAdmission::Cache
+                    } else {
+                        CacheAdmission::Bypass
+                    }
+                })
+                .collect(),
+            reclaim: ctx
+                .resident
+                .iter()
+                .enumerate()
+                .filter(|(_, resident)| {
+                    resident.reclaimable
+                        && !resident.object.facts["program_live"]
+                            .as_bool()
+                            .unwrap_or(false)
+                })
+                .map(|(index, _)| index as u32)
+                .collect(),
+        })
+    }
+}
+
+pub struct Pythia;
+
+impl Policy for Pythia {
+    fn route(ctx: &RouteContext, _state: &mut State, _host: &Host) -> plex::Result<RoutePlan> {
+        Ok(RoutePlan {
+            decisions: min_edge_by(ctx, |edge| {
+                edge.facts["lookahead_cost"].as_u64().unwrap_or(u64::MAX)
+            }),
+        })
+    }
+
+    fn schedule(
+        ctx: &ScheduleContext,
+        _state: &mut State,
+        _host: &Host,
+    ) -> plex::Result<SchedulePlan> {
+        let mut order = (0..ctx.runnable.len()).collect::<Vec<_>>();
+        order.sort_by_key(|&index| {
+            (
+                ctx.runnable[index].facts["workflow_rank"]
+                    .as_u64()
+                    .unwrap_or(u64::MAX),
+                index,
+            )
+        });
+        Ok(select_singletons(ctx, order))
+    }
+
+    fn cache(ctx: &CacheContext, _state: &mut State, host: &Host) -> plex::Result<CachePlan> {
+        let mut reclaim = ctx
+            .resident
+            .iter()
+            .enumerate()
+            .filter(|(_, resident)| resident.reclaimable)
+            .map(|(index, resident)| {
+                (
+                    Reverse(
+                        resident.object.facts["next_use_step"]
+                            .as_u64()
+                            .unwrap_or(u64::MAX),
+                    ),
+                    index as u32,
+                )
+            })
+            .collect::<Vec<_>>();
+        reclaim.sort_by_key(|entry| *entry);
+        for object in &ctx.prospective {
+            if object.facts["prefetch"].as_bool() == Some(true) {
+                host.prefetch_cache(
+                    object.object_id.as_str(),
+                    None,
+                    &format!("pythia-{}", object.object_id.as_str()),
+                )?;
+            }
+        }
+        Ok(CachePlan {
+            admissions: vec![CacheAdmission::Cache; ctx.prospective.len()],
+            reclaim: reclaim.into_iter().map(|(_, index)| index).collect(),
+        })
+    }
+}
+
+pub struct GoodServe;
+
+impl Policy for GoodServe {
+    fn route(ctx: &RouteContext, _state: &mut State, host: &Host) -> plex::Result<RoutePlan> {
+        let mut decisions = Vec::new();
+        for (request_index, request) in ctx.requests.iter().enumerate() {
+            let selected = ctx
+                .feasible_edges
+                .iter()
+                .enumerate()
+                .filter(|(_, edge)| edge.request_index as usize == request_index)
+                .min_by_key(|(_, edge)| {
+                    (
+                        edge.facts["quality_gap_ppm"].as_u64().unwrap_or(u64::MAX),
+                        edge.facts["cost"].as_u64().unwrap_or(u64::MAX),
+                    )
+                });
+            if let Some((index, edge)) = selected {
+                if request.facts["risk_ppm"].as_u64().unwrap_or(0)
+                    > request.facts["migration_threshold_ppm"]
+                        .as_u64()
+                        .unwrap_or(u64::MAX)
+                {
+                    host.rebalance_request(
+                        request.request.request_id.as_str(),
+                        ctx.targets[edge.target_index as usize].target_id.as_str(),
+                        &format!("goodserve-{request_index}"),
+                    )?;
+                }
+                decisions.push(RouteDecision::Assign(index as u32));
+            } else {
+                decisions.push(RouteDecision::Defer);
+            }
+        }
+        Ok(RoutePlan { decisions })
+    }
+}
+
+pub struct ConServe;
+
+impl Policy for ConServe {
+    fn route(ctx: &RouteContext, _state: &mut State, _host: &Host) -> plex::Result<RoutePlan> {
+        let decisions = ctx
+            .requests
+            .iter()
+            .enumerate()
+            .map(|(request_index, request)| {
+                let followup = request.request.generation_id > 0;
+                ctx.feasible_edges
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, edge)| edge.request_index as usize == request_index)
+                    .max_by_key(|(_, edge)| {
+                        if followup {
+                            (1, edge.facts["conversation_affinity"].as_u64().unwrap_or(0))
+                        } else {
+                            (0, edge.facts["prefill_capacity"].as_u64().unwrap_or(0))
+                        }
+                    })
+                    .map_or(RouteDecision::Defer, |(index, _)| {
+                        RouteDecision::Assign(index as u32)
+                    })
+            })
+            .collect();
+        Ok(RoutePlan { decisions })
+    }
+}
+
+pub struct Parrot;
+
+impl Policy for Parrot {
+    fn route(ctx: &RouteContext, _state: &mut State, _host: &Host) -> plex::Result<RoutePlan> {
+        Ok(RoutePlan {
+            decisions: min_edge_by(ctx, |edge| {
+                edge.facts["dependency_distance"]
+                    .as_u64()
+                    .unwrap_or(u64::MAX)
+            }),
+        })
+    }
+
+    fn schedule(
+        ctx: &ScheduleContext,
+        _state: &mut State,
+        _host: &Host,
+    ) -> plex::Result<SchedulePlan> {
+        let order = ctx
+            .runnable
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| {
+                candidate.facts["dependency_ready"]
+                    .as_bool()
+                    .unwrap_or(false)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        Ok(select_singletons(ctx, order))
+    }
+}
+
+pub struct Saga;
+
+impl Policy for Saga {
+    fn route(ctx: &RouteContext, _state: &mut State, host: &Host) -> plex::Result<RoutePlan> {
+        let mut decisions = Vec::new();
+        for (request_index, request) in ctx.requests.iter().enumerate() {
+            let selected = ctx
+                .feasible_edges
+                .iter()
+                .enumerate()
+                .filter(|(_, edge)| edge.request_index as usize == request_index)
+                .max_by_key(|(_, edge)| {
+                    (
+                        edge.facts["cache_locality"].as_u64().unwrap_or(0),
+                        Reverse(edge.facts["load"].as_u64().unwrap_or(u64::MAX)),
+                    )
+                });
+            if let Some((index, edge)) = selected {
+                if request.facts["steal"].as_bool() == Some(true) {
+                    host.rebalance_request(
+                        request.request.request_id.as_str(),
+                        ctx.targets[edge.target_index as usize].target_id.as_str(),
+                        &format!("saga-{request_index}"),
+                    )?;
+                }
+                decisions.push(RouteDecision::Assign(index as u32));
+            } else {
+                decisions.push(RouteDecision::Defer);
+            }
+        }
+        Ok(RoutePlan { decisions })
+    }
+
+    fn schedule(
+        ctx: &ScheduleContext,
+        state: &mut State,
+        _host: &Host,
+    ) -> plex::Result<SchedulePlan> {
+        let mut order = (0..ctx.runnable.len()).collect::<Vec<_>>();
+        order.sort_by_key(|&index| {
+            ctx.runnable[index]
+                .request
+                .group_id
+                .as_ref()
+                .and_then(|group_id| state.group(group_id.as_str()).ok())
+                .and_then(|group| group.scratch["service"].as_u64())
+                .unwrap_or(0)
+        });
+        Ok(select_singletons(ctx, order))
+    }
+
+    fn cache(ctx: &CacheContext, _state: &mut State, _host: &Host) -> plex::Result<CachePlan> {
+        Ok(CachePlan {
+            admissions: ctx
+                .prospective
+                .iter()
+                .map(|object| {
+                    if object.facts["workflow_ttl_ms"].as_u64().unwrap_or(0) > 0 {
+                        CacheAdmission::Cache
+                    } else {
+                        CacheAdmission::Bypass
+                    }
+                })
+                .collect(),
+            reclaim: ctx
+                .resident
+                .iter()
+                .enumerate()
+                .filter(|(_, resident)| {
+                    resident.reclaimable
+                        && resident.object.facts["workflow_ttl_ms"]
+                            .as_u64()
+                            .unwrap_or(0)
+                            == 0
+                })
+                .map(|(index, _)| index as u32)
+                .collect(),
+        })
+    }
+}
+
+pub struct RouteBalance;
+
+impl Policy for RouteBalance {
+    fn route(ctx: &RouteContext, _state: &mut State, _host: &Host) -> plex::Result<RoutePlan> {
+        if ctx.requests.len() > 12 {
+            return Err(plex::policy_error(
+                "route-batch-too-large",
+                "RouteBalance reference search is bounded to 12 requests",
+            ));
+        }
+        let mut best = (i64::MIN, vec![RouteDecision::Defer; ctx.requests.len()]);
+        let mut current = vec![RouteDecision::Defer; ctx.requests.len()];
+        let mut target_counts = vec![0u32; ctx.targets.len()];
+        search_assignments(ctx, 0, 0, &mut current, &mut target_counts, &mut best);
+        Ok(RoutePlan { decisions: best.1 })
+    }
+}
+
 fn select_singletons(ctx: &ScheduleContext, order: Vec<usize>) -> SchedulePlan {
     let mut remaining_requests = ctx.capacity.max_requests;
     let mut remaining_tokens = ctx.capacity.max_total_tokens;
@@ -881,4 +1318,50 @@ fn min_edge_by(ctx: &RouteContext, metric: impl Fn(&plex::RouteEdge) -> u64) -> 
                 })
         })
         .collect()
+}
+
+fn search_assignments(
+    ctx: &RouteContext,
+    request_index: usize,
+    utility: i64,
+    current: &mut [RouteDecision],
+    target_counts: &mut [u32],
+    best: &mut (i64, Vec<RouteDecision>),
+) {
+    if request_index == ctx.requests.len() {
+        if utility > best.0 {
+            best.0 = utility;
+            best.1.clone_from_slice(current);
+        }
+        return;
+    }
+    current[request_index] = RouteDecision::Defer;
+    search_assignments(
+        ctx,
+        request_index + 1,
+        utility,
+        current,
+        target_counts,
+        best,
+    );
+    for (edge_index, edge) in ctx.feasible_edges.iter().enumerate() {
+        if edge.request_index as usize != request_index {
+            continue;
+        }
+        let target_index = edge.target_index as usize;
+        if target_counts[target_index] >= ctx.targets[target_index].max_assignments {
+            continue;
+        }
+        target_counts[target_index] += 1;
+        current[request_index] = RouteDecision::Assign(edge_index as u32);
+        search_assignments(
+            ctx,
+            request_index + 1,
+            utility.saturating_add(edge.facts["utility"].as_i64().unwrap_or(0)),
+            current,
+            target_counts,
+            best,
+        );
+        target_counts[target_index] -= 1;
+    }
 }

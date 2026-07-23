@@ -1,0 +1,31 @@
+{
+  "id": "llumnix",
+  "title": "Llumnix: Dynamic Scheduling for Large Language Model Serving",
+  "paper_version": "arXiv 2406.03243",
+  "source_url": "https://arxiv.org/abs/2406.03243",
+  "source_commit": null,
+  "source_license": "public artifact available; implementation is independent",
+  "component": "plex_paper_llumnix",
+  "implements": [
+    "route",
+    "feedback"
+  ],
+  "policy_kernel": [
+    "virtual usage placement",
+    "live rescheduling intent"
+  ],
+  "required_facts": [
+    "virtual_usage",
+    "live_reschedule"
+  ],
+  "required_mechanics": [],
+  "optional_mechanics": [
+    "request.rebalance@1"
+  ],
+  "deferred_mechanics": [
+    "physical migration"
+  ],
+  "evidence_level": "policy-kernel-reproduction",
+  "fixture_provenance": "paper policy and public artifact interface",
+  "validation_status": "passing"
+}
