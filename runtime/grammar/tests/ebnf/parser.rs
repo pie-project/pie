@@ -1,4 +1,4 @@
-//! EBNF parser output and error cases.
+//! EBNF parsing, printing, round-trip, and error behavior.
 //!
 //! Item 1: Round-trip tests (EBNF → Grammar → Display → verify).
 //! Item 2: Error case tests (malformed EBNF → Err with message).
@@ -162,10 +162,8 @@ fn test_output_unicode_char_class() {
 }
 
 #[test]
-fn test_output_lookahead() {
-    let g = parse_and_display(r#"root ::= "a" (="b")"#);
-    assert!(g.contains("(="), "should contain lookahead, got: {}", g);
-    assert!(g.contains("\"b\""));
+fn test_error_unsupported_lookahead() {
+    assert!(Grammar::from_ebnf(r#"root ::= "a" (="b")"#, "root").is_err());
 }
 
 #[test]

@@ -1,34 +1,9 @@
-//! Regex grammar matching behavior.
+//! Regex matcher acceptance behavior, ported from xgrammar.
 //!
 //! Tests regex-based grammar acceptance/rejection.
 
-use std::sync::Arc;
-
-use pie_grammar::matcher::GrammarMatcher;
+use crate::common::regex_accepts as is_regex_accept_string;
 use pie_grammar::regex::regex_to_grammar;
-use pie_tokenizer::Tokenizer;
-
-fn is_regex_accept_string(pattern: &str, input: &str) -> bool {
-    let grammar = match regex_to_grammar(pattern) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("regex_to_grammar failed for {:?}: {}", pattern, e);
-            return false;
-        }
-    };
-    let vocab: Vec<String> = vec!["dummy".into()];
-    let tok = Arc::new(Tokenizer::from_vocab(&vocab));
-    let mut m = GrammarMatcher::new(Arc::new(grammar), tok, vec![], 10);
-
-    if input.is_empty() {
-        return m.can_terminate();
-    }
-
-    if !m.accept_string(input) {
-        return false;
-    }
-    m.can_terminate()
-}
 
 // ---------------------------------------------------------------------------
 // Basic patterns (from test_basic_regex)

@@ -6,7 +6,6 @@
 //! - Rule references
 //! - Sequences, choices (|), grouping with parentheses
 //! - Quantifiers: *, +, ?, {n}, {n,m}, {n,}
-//! - Lookahead assertions: (= ...)
 //! - Comments: # to end of line
 
 use anyhow::{Result, bail};
@@ -799,28 +798,32 @@ impl Parser {
         }
     }
 
-    fn parse_repetition_range(&mut self) -> Result<(i64, i64)> {
+    fn parse_repetition_range(&mut self) -> Result<(u32, Option<u32>)> {
         self.expect(&TokenType::LBrace, "expected {")?;
         let lower = self.parse_integer()?;
         if lower < 0 {
             return Err(self.parse_error("lower bound cannot be negative"));
         }
+        let lower =
+            u32::try_from(lower).map_err(|_| self.parse_error("lower bound exceeds u32::MAX"))?;
 
         if self.peek().ty == TokenType::Comma {
             self.consume();
             if self.peek().ty == TokenType::RBrace {
                 self.consume();
-                return Ok((lower, -1)); // unbounded
+                return Ok((lower, None));
             }
             let upper = self.parse_integer()?;
-            if upper < lower {
+            if upper < i64::from(lower) {
                 return Err(self.parse_error("lower bound is larger than upper bound"));
             }
+            let upper = u32::try_from(upper)
+                .map_err(|_| self.parse_error("upper bound exceeds u32::MAX"))?;
             self.expect(&TokenType::RBrace, "expected }")?;
-            Ok((lower, upper))
+            Ok((lower, Some(upper)))
         } else if self.peek().ty == TokenType::RBrace {
             self.consume();
-            Ok((lower, lower)) // exact
+            Ok((lower, Some(lower)))
         } else {
             Err(self.parse_error("expected ',' or '}' in repetition range"))
         }
@@ -861,17 +864,9 @@ impl Parser {
         self.builder.add_repeat(rule_id, 0, Some(1))
     }
 
-    fn handle_repetition(&mut self, expr_id: ExprId, lower: i64, upper: i64) -> ExprId {
+    fn handle_repetition(&mut self, expr_id: ExprId, lower: u32, upper: Option<u32>) -> ExprId {
         let rule_id = self.wrap_in_rule(expr_id);
-        let lower = lower as u32;
-
-        if upper == -1 {
-            // {n,}: n mandatory, then unbounded
-            self.builder.add_repeat(rule_id, lower, None)
-        } else {
-            // {n} or {n,m}
-            self.builder.add_repeat(rule_id, lower, Some(upper as u32))
-        }
+        self.builder.add_repeat(rule_id, lower, upper)
     }
 
     fn parse_element_with_quantifier(&mut self) -> Result<ExprId> {
@@ -942,12 +937,8 @@ impl Parser {
         let rule_id = self.builder.find_rule(&name).unwrap();
         self.builder.set_rule_body(rule_id, body);
 
-        // Optional lookahead assertion
         if self.peek().ty == TokenType::LookaheadLParen {
-            self.consume();
-            let la_expr = self.parse_choices()?;
-            self.expect(&TokenType::RParen, "expected )")?;
-            self.builder.set_rule_lookahead(rule_id, la_expr, false);
+            return Err(self.parse_error("lookahead assertions are not supported"));
         }
 
         Ok(())
@@ -1111,15 +1102,8 @@ mod tests {
     }
 
     #[test]
-    fn test_lookahead_assertion() {
-        let g = parse_and_display("root ::= \"a\" (=\"b\")");
-        assert_eq!(g, "root ::= ((\"a\")) (= ((\"b\")))");
-    }
-
-    #[test]
-    fn test_complex_lookahead() {
-        let g = parse_and_display("root ::= \"a\" (=\"b\" \"c\" [0-9])");
-        assert_eq!(g, "root ::= ((\"a\")) (= ((\"b\" \"c\" [0-9])))");
+    fn test_lookahead_is_rejected() {
+        assert!(Grammar::from_ebnf("root ::= \"a\" (=\"b\")", "root").is_err());
     }
 
     #[test]

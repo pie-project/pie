@@ -4,8 +4,8 @@
 //! (EBNF, JSON Schema, regex), enabling structured generation with guaranteed
 //! syntactic correctness.
 //!
-//! The large portion of this code is a port of the xgrammar library to Rust.
-//! (@ingim: add credit to xgrammar in the README)
+//! This implementation is a Rust rewrite derived in part from the
+//! [XGrammar](https://github.com/mlc-ai/xgrammar) project.
 //!
 //! # Usage
 //!
@@ -91,8 +91,8 @@
 //! let compiled = Arc::new(CompiledGrammar::new(&grammar, &tokenizer));
 //!
 //! // Create multiple matchers cheaply
-//! let mut m1 = GrammarMatcher::with_compiled(compiled.clone(), tokenizer.clone(), vec![], 10);
-//! let mut m2 = GrammarMatcher::with_compiled(compiled.clone(), tokenizer.clone(), vec![], 10);
+//! let mut m1 = GrammarMatcher::with_compiled(compiled.clone(), vec![], 10);
+//! let mut m2 = GrammarMatcher::with_compiled(compiled.clone(), vec![], 10);
 //!
 //! m1.accept_string("hello");
 //! m2.accept_string("world");
@@ -103,6 +103,7 @@
 //! - [`grammar`] -- Core grammar types and construction (EBNF, builder)
 //! - [`json_schema`] -- JSON Schema to grammar conversion
 //! - [`regex`] -- Regex to grammar conversion
+//! - [`compiler`] -- Tokenizer-bound compilation and typed caching
 //! - [`compiled_grammar`] -- Pre-compiled grammar with DFAs and token masks
 //! - [`matcher`] -- Runtime matcher (accept tokens, generate bitmasks, rollback)
 //! - [`bitmask`] -- Token bitmask utilities
@@ -110,6 +111,8 @@
 pub mod bitmask;
 pub mod brle;
 pub mod compiled_grammar;
+pub mod compiler;
+mod frontend;
 pub(crate) mod fsm;
 pub mod grammar;
 pub mod json_schema;

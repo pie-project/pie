@@ -1,58 +1,15 @@
-//! Real-world grammar scenarios.
+//! Real-world JSON and schema stress scenarios.
 //!
 //! Covers deep nesting, all escape types, large collections, function-calling schemas,
 //! comprehensive negative cases, bitmask verification, and mixed-operation edge cases.
 
-use std::sync::Arc;
-
+use crate::common::{
+    ebnf_accepts as is_grammar_accept_string, grammar_accepts as is_grammar_accept_string_g,
+    matcher_from_ebnf as make_matcher, schema_accepts,
+};
 use pie_grammar::bitmask;
 use pie_grammar::grammar::Grammar;
 use pie_grammar::json_schema::{JsonSchemaOptions, json_schema_to_grammar};
-use pie_grammar::matcher::GrammarMatcher;
-use pie_tokenizer::Tokenizer;
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn is_grammar_accept_string(grammar_ebnf: &str, input: &str) -> bool {
-    let grammar = match Grammar::from_ebnf(grammar_ebnf, "root") {
-        Ok(g) => g,
-        Err(_) => return false,
-    };
-    is_grammar_accept_string_g(&grammar, input)
-}
-
-fn is_grammar_accept_string_g(grammar: &Grammar, input: &str) -> bool {
-    let vocab: Vec<String> = vec!["dummy".into()];
-    let tok = Arc::new(Tokenizer::from_vocab(&vocab));
-    let mut m = GrammarMatcher::new(Arc::new(grammar.clone()), tok, vec![], 10);
-
-    if input.is_empty() {
-        return m.can_terminate();
-    }
-
-    if !m.accept_string(input) {
-        return false;
-    }
-    m.can_terminate()
-}
-
-fn schema_accepts(schema: &str, input: &str) -> bool {
-    let opts = JsonSchemaOptions {
-        any_whitespace: false,
-        ..JsonSchemaOptions::default()
-    };
-    let g = json_schema_to_grammar(schema, &opts).unwrap();
-    is_grammar_accept_string_g(&g, input)
-}
-
-fn make_matcher(ebnf: &str, root: &str, vocab: &[&str]) -> GrammarMatcher {
-    let grammar = Arc::new(Grammar::from_ebnf(ebnf, root).unwrap());
-    let encoded: Vec<String> = vocab.iter().map(|s| s.to_string()).collect();
-    let tokenizer = Arc::new(Tokenizer::from_vocab(&encoded));
-    GrammarMatcher::new(grammar, tokenizer, vec![], 10)
-}
 
 const JSON_GRAMMAR: &str = r#"
 root ::= value
@@ -598,7 +555,6 @@ fn test_json_schema_optional_fields() {
     let opts = JsonSchemaOptions {
         any_whitespace: false,
         strict_mode: false,
-        ..JsonSchemaOptions::default()
     };
     let g = json_schema_to_grammar(schema, &opts).unwrap();
 

@@ -1,35 +1,12 @@
-//! Basic grammar matcher behavior.
+//! Stateful matcher operations, ported from xgrammar.
 //!
 //! Tests basic matcher operations: token acceptance, bitmask, rollback,
 //! jump-forward, reset, termination.
 
-use std::sync::Arc;
-
+use crate::common::{
+    matcher_from_ebnf as make_matcher, matcher_with_stop as make_matcher_with_stop,
+};
 use pie_grammar::bitmask;
-use pie_grammar::grammar::Grammar;
-use pie_grammar::matcher::GrammarMatcher;
-use pie_tokenizer::Tokenizer;
-
-/// Build a matcher with a given vocabulary.
-fn make_matcher(ebnf: &str, root: &str, vocab: &[&str]) -> GrammarMatcher {
-    let grammar = Arc::new(Grammar::from_ebnf(ebnf, root).unwrap());
-    let encoded: Vec<String> = vocab.iter().map(|s| s.to_string()).collect();
-    let tokenizer = Arc::new(Tokenizer::from_vocab(&encoded));
-    GrammarMatcher::new(grammar, tokenizer, vec![], 10)
-}
-
-/// Build a matcher with explicit stop tokens.
-fn make_matcher_with_stop(
-    ebnf: &str,
-    root: &str,
-    vocab: &[&str],
-    stop_ids: Vec<u32>,
-) -> GrammarMatcher {
-    let grammar = Arc::new(Grammar::from_ebnf(ebnf, root).unwrap());
-    let encoded: Vec<String> = vocab.iter().map(|s| s.to_string()).collect();
-    let tokenizer = Arc::new(Tokenizer::from_vocab(&encoded));
-    GrammarMatcher::new(grammar, tokenizer, stop_ids, 10)
-}
 
 // ---------------------------------------------------------------------------
 // Control char exclusion in JSON-style char classes

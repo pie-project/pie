@@ -3,64 +3,25 @@
 //! `CompiledGrammar` pre-computes per-DFA-state token masks at construction time,
 //! enabling O(states × V/32) `fill_next_token_bitmask` instead of O(V × bytes × states).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
-use std::sync::{Arc, LazyLock, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
+use anyhow::{Result, bail};
 use lru::LruCache;
 use rustc_hash::FxHasher;
 
 use crate::bitmask;
+use crate::compiler::GrammarLimits;
 use crate::fsm::{Automaton, DfaTable, FsmEdge, StateId, build_rule_fsms};
 use crate::grammar::Grammar;
 use crate::grammar::normalize::normalize_grammar;
 use pie_tokenizer::Tokenizer;
 
-// ---------------------------------------------------------------------------
-// Compilation cache
-// ---------------------------------------------------------------------------
-
-/// Cache key: (grammar source string, tokenizer pointer identity).
-#[derive(Hash, Eq, PartialEq)]
-struct CacheKey {
-    grammar_source: String,
-    tokenizer_ptr: usize,
-}
-
-/// Maximum number of compiled grammars to keep in cache.
-const CACHE_CAPACITY: usize = 64;
-
-/// Global LRU cache of compiled grammars, keyed by (source, tokenizer).
-static CACHE: LazyLock<Mutex<LruCache<CacheKey, Arc<CompiledGrammar>>>> =
-    LazyLock::new(|| Mutex::new(LruCache::new(NonZeroUsize::new(CACHE_CAPACITY).unwrap())));
-
-impl CompiledGrammar {
-    /// Get a previously compiled grammar from cache, or compile and cache a new one.
-    ///
-    /// The cache is keyed by the original grammar source string and the
-    /// tokenizer's `Arc` pointer identity. Two identical source strings
-    /// compiled against the same tokenizer will share the same `Arc<CompiledGrammar>`.
-    pub fn get_or_compile(
-        source: &str,
-        grammar: &Grammar,
-        tokenizer: &Arc<Tokenizer>,
-    ) -> Arc<Self> {
-        let key = CacheKey {
-            grammar_source: source.to_owned(),
-            tokenizer_ptr: Arc::as_ptr(tokenizer) as usize,
-        };
-
-        let mut cache = CACHE.lock().unwrap();
-        if let Some(compiled) = cache.get(&key) {
-            return compiled.clone();
-        }
-
-        let compiled = Arc::new(CompiledGrammar::new(grammar, tokenizer));
-        cache.put(key, compiled.clone());
-        compiled
-    }
-}
+const BITMASK_CACHE_BUDGET_BYTES: usize = 1024 * 1024;
+const BITMASK_CACHE_MAX_ENTRIES: usize = 256;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -105,6 +66,7 @@ pub(crate) struct StateAction {
 }
 
 /// Pre-computed token mask for a specific (rule_id, dfa_state) pair.
+#[derive(Clone)]
 pub(crate) struct AdaptiveTokenMask {
     /// Bitmask of tokens that are definitely accepted from this DFA state
     /// (all bytes consumed via CharRange edges only, no rule boundaries crossed).
@@ -112,12 +74,6 @@ pub(crate) struct AdaptiveTokenMask {
     /// Token IDs that need runtime Earley checking (cross rule boundaries
     /// or encounter other non-deterministic situations).
     pub(crate) uncertain_tokens: Vec<u32>,
-    /// Whether this DFA state has RuleRef edges. When true, the uncertain
-    /// tokens include tokens that would be consumed by the referenced rules.
-    /// At runtime, the Earley predict phase already expands these into
-    /// leaf-level states, so the uncertain tokens from RuleRef states can
-    /// be skipped (they're covered by the leaf states' masks).
-    pub(crate) has_rule_ref: bool,
 }
 
 /// Token classification during pre-computation.
@@ -132,6 +88,8 @@ enum TokenClass {
 /// Created once per (grammar, tokenizer) pair. Shared across GrammarMatcher
 /// instances via `Arc`.
 pub struct CompiledGrammar {
+    /// Tokenizer used to build masks and decode accepted token IDs.
+    pub(crate) tokenizer: Arc<Tokenizer>,
     /// The normalized grammar.
     pub(crate) grammar: Arc<Grammar>,
     /// Per-rule DFAs (indexed by RuleId).
@@ -148,12 +106,16 @@ pub struct CompiledGrammar {
     pub(crate) is_single_dfa: bool,
     /// Pre-computed token masks, keyed by (rule_id, dfa_state_id).
     pub(crate) token_masks: HashMap<(u32, u32), AdaptiveTokenMask>,
-    /// Runtime bitmask cache: maps a hash of the parser state set to the
-    /// fully resolved bitmask. Populated lazily during `fill_next_token_bitmask`.
-    bitmask_cache: RwLock<HashMap<u64, Vec<u32>>>,
+    /// Bounded runtime cache keyed by the complete parser state.
+    bitmask_cache: Mutex<LruCache<Vec<u64>, Vec<u32>>>,
 }
 
 impl CompiledGrammar {
+    /// The normalized grammar used by the matcher.
+    pub fn grammar(&self) -> &Grammar {
+        &self.grammar
+    }
+
     /// Look up the pre-computed action for a (rule_id, dfa_state) pair.
     #[inline(always)]
     pub(crate) fn action(&self, rule_id: u16, dfa_state: u16) -> &StateAction {
@@ -174,15 +136,78 @@ impl CompiledGrammar {
     /// 2. Per-rule NFA→DFA conversion
     /// 3. DFA state info pre-computation
     /// 4. Adaptive token mask pre-computation
-    pub fn new(grammar: &Grammar, tokenizer_info: &Tokenizer) -> Self {
+    pub fn new(grammar: &Grammar, tokenizer_info: &Arc<Tokenizer>) -> Self {
+        Self::try_new(
+            grammar,
+            tokenizer_info,
+            &GrammarLimits::default(),
+            Instant::now(),
+        )
+        .expect("grammar exceeds default compilation limits")
+    }
+
+    pub(crate) fn try_new(
+        grammar: &Grammar,
+        tokenizer_info: &Arc<Tokenizer>,
+        limits: &GrammarLimits,
+        started: Instant,
+    ) -> Result<Self> {
+        let deadline = started.checked_add(limits.max_compile_duration);
+        check_deadline(deadline)?;
+        let vocab_size = tokenizer_info.vocab_size();
         let normalized = Arc::new(normalize_grammar(grammar));
 
         // Build per-rule NFAs and convert to DFAs
         let nfa_fsms = build_rule_fsms(&normalized);
-        let rule_dfas: Vec<_> = nfa_fsms
+        for nfa in &nfa_fsms {
+            if nfa.fsm.num_states() > limits.max_nfa_states_per_rule {
+                bail!(
+                    "NFA has {} states; per-rule limit is {}",
+                    nfa.fsm.num_states(),
+                    limits.max_nfa_states_per_rule
+                );
+            }
+        }
+        check_deadline(deadline)?;
+
+        let mut rule_dfas = Vec::with_capacity(nfa_fsms.len());
+        let mut total_dfa_states = 0usize;
+        for nfa in &nfa_fsms {
+            let dfa = nfa
+                .to_dfa_limited(limits.max_dfa_states_per_rule)?
+                .to_compact();
+            check_deadline(deadline)?;
+            total_dfa_states = total_dfa_states
+                .checked_add(dfa.fsm.num_states())
+                .ok_or_else(|| anyhow::anyhow!("total DFA state count overflow"))?;
+            if total_dfa_states > limits.max_total_dfa_states {
+                bail!(
+                    "grammar has {} total DFA states; limit is {}",
+                    total_dfa_states,
+                    limits.max_total_dfa_states
+                );
+            }
+            rule_dfas.push(dfa);
+        }
+        let runtime_rules = find_runtime_rules(&normalized, &rule_dfas);
+        let runtime_state_count: usize = rule_dfas
             .iter()
-            .map(|nfa| nfa.to_dfa().to_compact())
-            .collect();
+            .enumerate()
+            .filter(|(index, _)| runtime_rules[*index])
+            .map(|(_, dfa)| dfa.fsm.num_states())
+            .sum();
+        let mask_bytes = runtime_state_count
+            .checked_mul(bitmask::bitmask_size(vocab_size))
+            .and_then(|words| words.checked_mul(size_of::<u32>()))
+            .ok_or_else(|| anyhow::anyhow!("token-mask memory estimate overflow"))?;
+        if mask_bytes > limits.max_token_mask_bytes {
+            bail!(
+                "token masks require at least {} bytes; limit is {}",
+                mask_bytes,
+                limits.max_token_mask_bytes
+            );
+        }
+        check_deadline(deadline)?;
 
         // Pre-compute state actions (replaces old dfa_state_info)
         let (state_actions, state_action_offsets, has_self_ref_chains) =
@@ -194,7 +219,9 @@ impl CompiledGrammar {
             tokenizer_info,
             &state_actions,
             &state_action_offsets,
-        );
+            &runtime_rules,
+            deadline,
+        )?;
 
         // Detect single-DFA: root rule has no RuleRef edges at any state
         let is_single_dfa = {
@@ -209,7 +236,8 @@ impl CompiledGrammar {
                 .all(|a| !a.flags.has_rule_ref())
         };
 
-        CompiledGrammar {
+        Ok(CompiledGrammar {
+            tokenizer: tokenizer_info.clone(),
             grammar: normalized,
             rule_dfas,
             state_actions,
@@ -217,15 +245,18 @@ impl CompiledGrammar {
             has_self_ref_chains,
             is_single_dfa,
             token_masks,
-            bitmask_cache: RwLock::new(HashMap::new()),
-        }
+            bitmask_cache: Mutex::new(LruCache::new(bitmask_cache_capacity(vocab_size))),
+        })
     }
 
-    /// Look up a cached bitmask by state hash. Copies directly into the output
+    /// Look up a cached bitmask by complete parser state. Copies into the output
     /// slice if found. Returns true on cache hit.
-    pub(crate) fn get_cached_bitmask(&self, key: u64, bitmask: &mut [u32]) -> bool {
-        let cache = self.bitmask_cache.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(cached) = cache.get(&key) {
+    pub(crate) fn get_cached_bitmask(&self, key: &[u64], bitmask: &mut [u32]) -> bool {
+        let mut cache = self
+            .bitmask_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(cached) = cache.get(key) {
             bitmask.copy_from_slice(cached);
             true
         } else {
@@ -234,13 +265,28 @@ impl CompiledGrammar {
     }
 
     /// Store a computed bitmask in the cache.
-    pub(crate) fn cache_bitmask(&self, key: u64, bitmask: &[u32]) {
+    pub(crate) fn cache_bitmask(&self, key: &[u64], bitmask: &[u32]) {
         let mut cache = self
             .bitmask_cache
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
-        cache.insert(key, bitmask.to_vec());
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.put(key.to_vec(), bitmask.to_vec());
     }
+}
+
+fn bitmask_cache_capacity(vocab_size: usize) -> NonZeroUsize {
+    let mask_bytes = bitmask::bitmask_size(vocab_size)
+        .saturating_mul(size_of::<u32>())
+        .max(1);
+    let entries = (BITMASK_CACHE_BUDGET_BYTES / mask_bytes).clamp(1, BITMASK_CACHE_MAX_ENTRIES);
+    NonZeroUsize::new(entries).unwrap()
+}
+
+fn check_deadline(deadline: Option<Instant>) -> Result<()> {
+    if deadline.is_some_and(|deadline| Instant::now() > deadline) {
+        bail!("grammar compilation deadline exceeded");
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -319,6 +365,30 @@ fn compute_state_actions(rule_dfas: &[Automaton<DfaTable>]) -> (Vec<StateAction>
 // Adaptive token mask pre-computation
 // ---------------------------------------------------------------------------
 
+fn find_runtime_rules(grammar: &Grammar, rule_dfas: &[Automaton<DfaTable>]) -> Vec<bool> {
+    let mut runtime_rules = vec![false; rule_dfas.len()];
+    let root = grammar.root_rule().0 as usize;
+    runtime_rules[root] = true;
+    let mut queue = VecDeque::from([root]);
+
+    while let Some(rule_index) = queue.pop_front() {
+        let dfa = &rule_dfas[rule_index];
+        for state_index in 0..dfa.fsm.num_states() {
+            for edge in dfa.fsm.edges(StateId(state_index as u32)) {
+                if let FsmEdge::RuleRef { rule, .. } = edge {
+                    let referenced = rule.0 as usize;
+                    if !runtime_rules[referenced] {
+                        runtime_rules[referenced] = true;
+                        queue.push_back(referenced);
+                    }
+                }
+            }
+        }
+    }
+
+    runtime_rules
+}
+
 /// Classify a token against a DFA state.
 ///
 /// - `Accepted`: all bytes consumed via CharRange edges, staying within this rule
@@ -377,26 +447,37 @@ fn classify_token(
     TokenClass::Accepted
 }
 
-/// Hash a DFA structure for deduplication.
+/// Hash the DFA fields that affect token classification.
 ///
-/// Two DFAs with the same hash produce identical token masks.
-/// Includes byte_table (all CharRange transitions), ends (accepting states),
-/// and RuleRef edges (which affect uncertain token classification).
+/// Hash collisions are resolved with `dfa_mask_equivalent`.
 fn hash_dfa(dfa: &Automaton<DfaTable>) -> u64 {
     let mut hasher = FxHasher::default();
     dfa.start.0.hash(&mut hasher);
     dfa.ends.hash(&mut hasher);
     dfa.fsm.byte_table().hash(&mut hasher);
-    // Include RuleRef edges (not captured in byte_table)
     for si in 0..dfa.fsm.num_states() {
-        for edge in dfa.fsm.edges(StateId(si as u32)) {
-            if let FsmEdge::RuleRef { rule, target } = edge {
-                rule.0.hash(&mut hasher);
-                target.0.hash(&mut hasher);
-            }
-        }
+        dfa.fsm
+            .edges(StateId(si as u32))
+            .iter()
+            .any(|edge| matches!(edge, FsmEdge::RuleRef { .. }))
+            .hash(&mut hasher);
     }
     hasher.finish()
+}
+
+fn dfa_mask_equivalent(left: &Automaton<DfaTable>, right: &Automaton<DfaTable>) -> bool {
+    left.start == right.start
+        && left.ends == right.ends
+        && left.fsm.byte_table() == right.fsm.byte_table()
+        && (0..left.fsm.num_states()).all(|state| {
+            let has_rule_ref = |dfa: &Automaton<DfaTable>| {
+                dfa.fsm
+                    .edges(StateId(state as u32))
+                    .iter()
+                    .any(|edge| matches!(edge, FsmEdge::RuleRef { .. }))
+            };
+            has_rule_ref(left) == has_rule_ref(right)
+        })
 }
 
 /// Pre-compute adaptive token masks for all (rule_id, dfa_state) pairs.
@@ -409,28 +490,31 @@ fn precompute_token_masks(
     tokenizer_info: &Tokenizer,
     state_actions: &[StateAction],
     state_action_offsets: &[u32],
-) -> HashMap<(u32, u32), AdaptiveTokenMask> {
+    runtime_rules: &[bool],
+    deadline: Option<Instant>,
+) -> Result<HashMap<(u32, u32), AdaptiveTokenMask>> {
     let mut masks = HashMap::new();
     let vocab_size = tokenizer_info.vocab_size();
-    let bitmask_words = (vocab_size + 31) / 32;
+    let bitmask_words = vocab_size.div_ceil(32);
 
-    // Cache: DFA hash → per-state masks (keyed by state index within the DFA)
-    let mut dfa_cache: HashMap<u64, Vec<AdaptiveTokenMask>> = HashMap::new();
+    // Cache: DFA hash → collision bucket of source rule and per-state masks.
+    let mut dfa_cache: HashMap<u64, Vec<(usize, Vec<AdaptiveTokenMask>)>> = HashMap::new();
 
     for (rule_idx, dfa) in rule_dfas.iter().enumerate() {
+        check_deadline(deadline)?;
+        if !runtime_rules[rule_idx] {
+            continue;
+        }
         let dfa_hash = hash_dfa(dfa);
 
         // Check if we already computed masks for an identical DFA
-        if let Some(cached) = dfa_cache.get(&dfa_hash) {
+        if let Some((_, cached)) = dfa_cache.get(&dfa_hash).and_then(|bucket| {
+            bucket
+                .iter()
+                .find(|(source_rule, _)| dfa_mask_equivalent(&rule_dfas[*source_rule], dfa))
+        }) {
             for (state_idx, mask) in cached.iter().enumerate() {
-                masks.insert(
-                    (rule_idx as u32, state_idx as u32),
-                    AdaptiveTokenMask {
-                        accepted_mask: mask.accepted_mask.clone(),
-                        uncertain_tokens: mask.uncertain_tokens.clone(),
-                        has_rule_ref: mask.has_rule_ref,
-                    },
-                );
+                masks.insert((rule_idx as u32, state_idx as u32), mask.clone());
             }
             continue;
         }
@@ -447,7 +531,6 @@ fn precompute_token_masks(
                 rule_masks.push(AdaptiveTokenMask {
                     accepted_mask: vec![0u32; bitmask_words],
                     uncertain_tokens: Vec::new(),
-                    has_rule_ref: false,
                 });
                 continue;
             }
@@ -484,8 +567,7 @@ fn precompute_token_masks(
                         i += 1;
                     }
                     TokenClass::Rejected => {
-                        if bytes.len() >= 1
-                            && dfa.fsm.next_state(dfa_state, bytes[0]).is_none()
+                        if dfa.fsm.next_state(dfa_state, bytes[0]).is_none()
                             && !flags.has_rule_ref()
                         {
                             i = trie_end[i];
@@ -503,23 +585,18 @@ fn precompute_token_masks(
             rule_masks.push(AdaptiveTokenMask {
                 accepted_mask: accepted,
                 uncertain_tokens: uncertain,
-                has_rule_ref: state_has_rule_ref,
             });
         }
 
         // Insert into result map and cache
         for (state_idx, mask) in rule_masks.iter().enumerate() {
-            masks.insert(
-                (rule_idx as u32, state_idx as u32),
-                AdaptiveTokenMask {
-                    accepted_mask: mask.accepted_mask.clone(),
-                    uncertain_tokens: mask.uncertain_tokens.clone(),
-                    has_rule_ref: mask.has_rule_ref,
-                },
-            );
+            masks.insert((rule_idx as u32, state_idx as u32), mask.clone());
         }
-        dfa_cache.insert(dfa_hash, rule_masks);
+        dfa_cache
+            .entry(dfa_hash)
+            .or_default()
+            .push((rule_idx, rule_masks));
     }
 
-    masks
+    Ok(masks)
 }

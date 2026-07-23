@@ -8,11 +8,10 @@ use crate::inferlet::ProcessCtx;
 use crate::inferlet::host::pie;
 use anyhow::Result;
 use pie_grammar::compiled_grammar::CompiledGrammar;
-use pie_grammar::grammar::Grammar as InternalGrammar;
-use pie_grammar::json_schema::{JsonSchemaOptions, builtin_json_grammar, json_schema_to_grammar};
+use pie_grammar::compiler::GrammarCompiler;
+use pie_grammar::json_schema::JsonSchemaOptions;
 use pie_grammar::matcher::GrammarMatcher;
-use pie_grammar::regex::regex_to_grammar;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 
@@ -33,12 +32,19 @@ impl pie::inferlet::working_set::Host for ProcessCtx {}
 /// arena/WS lock is dropped before the `.await` park (guru's invariant: hold NO
 /// lock across a park). A restore-race `OutOfBlocks` re-reports the SAME
 /// `freed_now` and re-parks (bounded — fail loud rather than hang).
-#[derive(Debug)]
 pub struct Grammar {
-    /// The original source string (for compiled grammar cache keying).
-    pub source: String,
-    /// The parsed grammar AST.
-    pub inner: Arc<InternalGrammar>,
+    pub(crate) compiled: Arc<CompiledGrammar>,
+}
+
+impl std::fmt::Debug for Grammar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Grammar").finish()
+    }
+}
+
+pub(crate) fn grammar_compiler() -> &'static GrammarCompiler {
+    static COMPILER: OnceLock<GrammarCompiler> = OnceLock::new();
+    COMPILER.get_or_init(|| GrammarCompiler::new(pie_model::model().tokenizer().clone()))
 }
 
 impl pie::inferlet::grammar::HostGrammar for ProcessCtx {
@@ -46,12 +52,9 @@ impl pie::inferlet::grammar::HostGrammar for ProcessCtx {
         &mut self,
         schema: String,
     ) -> Result<Result<Resource<Grammar>, String>> {
-        match json_schema_to_grammar(&schema, &JsonSchemaOptions::default()) {
-            Ok(g) => {
-                let grammar = Grammar {
-                    source: schema,
-                    inner: Arc::new(g),
-                };
+        match grammar_compiler().compile_json_schema(&schema, &JsonSchemaOptions::default()) {
+            Ok(compiled) => {
+                let grammar = Grammar { compiled };
                 Ok(Ok(self.ctx().table.push(grammar)?))
             }
             Err(e) => Ok(Err(e.to_string())),
@@ -59,21 +62,16 @@ impl pie::inferlet::grammar::HostGrammar for ProcessCtx {
     }
 
     async fn json(&mut self) -> Result<Resource<Grammar>> {
-        let g = builtin_json_grammar()?;
         let grammar = Grammar {
-            source: "__builtin_json__".into(),
-            inner: Arc::new(g),
+            compiled: grammar_compiler().compile_builtin_json()?,
         };
         Ok(self.ctx().table.push(grammar)?)
     }
 
     async fn from_regex(&mut self, pattern: String) -> Result<Result<Resource<Grammar>, String>> {
-        match regex_to_grammar(&pattern) {
-            Ok(g) => {
-                let grammar = Grammar {
-                    source: pattern,
-                    inner: Arc::new(g),
-                };
+        match grammar_compiler().compile_regex(&pattern) {
+            Ok(compiled) => {
+                let grammar = Grammar { compiled };
                 Ok(Ok(self.ctx().table.push(grammar)?))
             }
             Err(e) => Ok(Err(e.to_string())),
@@ -81,12 +79,9 @@ impl pie::inferlet::grammar::HostGrammar for ProcessCtx {
     }
 
     async fn from_ebnf(&mut self, ebnf: String) -> Result<Result<Resource<Grammar>, String>> {
-        match InternalGrammar::from_ebnf(&ebnf, "root") {
-            Ok(g) => {
-                let grammar = Grammar {
-                    source: ebnf,
-                    inner: Arc::new(g),
-                };
+        match grammar_compiler().compile_ebnf(&ebnf, "root") {
+            Ok(compiled) => {
+                let grammar = Grammar { compiled };
                 Ok(Ok(self.ctx().table.push(grammar)?))
             }
             Err(e) => Ok(Err(e.to_string())),
@@ -95,7 +90,7 @@ impl pie::inferlet::grammar::HostGrammar for ProcessCtx {
 
     async fn to_string(&mut self, this: Resource<Grammar>) -> Result<String> {
         let g = self.ctx().table.get(&this)?;
-        Ok(g.inner.to_string())
+        Ok(g.compiled.grammar().to_string())
     }
 
     async fn drop(&mut self, this: Resource<Grammar>) -> Result<()> {
@@ -121,17 +116,10 @@ impl std::fmt::Debug for Matcher {
 
 impl pie::inferlet::grammar::HostMatcher for ProcessCtx {
     async fn new(&mut self, grammar: Resource<Grammar>) -> Result<Resource<Matcher>> {
-        let grammar_res = self.ctx().table.get(&grammar)?;
-        let source = grammar_res.source.clone();
-        let grammar_inner = grammar_res.inner.clone();
-
-        // Single-model: the tokenizer comes from the global bound model.
         let model = pie_model::model();
-        let tok = model.tokenizer().clone();
         let stop_tokens = model.instruct().seal();
-
-        let compiled = CompiledGrammar::get_or_compile(&source, &grammar_inner, &tok);
-        let inner = GrammarMatcher::with_compiled(compiled, tok, stop_tokens, 10);
+        let compiled = self.ctx().table.get(&grammar)?.compiled.clone();
+        let inner = GrammarMatcher::with_compiled(compiled, stop_tokens, 10);
 
         let matcher = Matcher { inner };
         Ok(self.ctx().table.push(matcher)?)
@@ -161,7 +149,7 @@ impl pie::inferlet::grammar::HostMatcher for ProcessCtx {
 
     async fn is_terminated(&mut self, this: Resource<Matcher>) -> Result<bool> {
         let matcher = self.ctx().table.get(&this)?;
-        Ok(matcher.inner.is_terminated())
+        Ok(matcher.inner.can_terminate())
     }
 
     async fn reset(&mut self, this: Resource<Matcher>) -> Result<()> {

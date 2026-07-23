@@ -20,7 +20,7 @@ use crate::pie::inferlet::grammar::Matcher;
 /// compose by word-wise bitwise-AND of their masks.
 pub trait Constrain: Send {
     /// Advance internal state with the tokens accepted last step.
-    fn advance(&mut self, accepted: &[u32]);
+    fn advance(&mut self, accepted: &[u32]) -> Result<()>;
 
     /// The packed allowed-token bitmask for the next position: a
     /// `[ceil(vocab/32)]` u32 array where bit `j` is 1 iff token `j` is
@@ -158,14 +158,16 @@ impl GrammarConstraint {
 }
 
 impl Constrain for GrammarConstraint {
-    fn advance(&mut self, accepted: &[u32]) {
-        if !accepted.is_empty() {
-            let _ = self.matcher.accept_tokens(accepted);
+    fn advance(&mut self, accepted: &[u32]) -> Result<()> {
+        if accepted.is_empty() {
+            return Ok(());
         }
+        self.matcher
+            .accept_tokens(accepted)
+            .map_err(|error| format!("grammar rejected accepted tokens: {error}"))
     }
 
     fn mask(&self) -> Vec<u32> {
         self.matcher.mask()
     }
 }
-

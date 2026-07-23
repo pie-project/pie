@@ -3,15 +3,12 @@
 //! Each model architecture provides its own implementation. The API layer
 //! delegates to the model's `Instruct` impl for all instruct operations.
 
-use pie_grammar::grammar::Grammar;
 use pie_tokenizer::Tokenizer;
 use std::sync::Arc;
 
-/// A model-provided tool-call grammar: the EBNF source (used as a stable
-/// cache key when compiling for a tokenizer) paired with the parsed AST.
+/// A model-provided tool-call grammar in EBNF form.
 pub struct ToolGrammar {
     pub source: String,
-    pub grammar: Arc<Grammar>,
 }
 
 // Shared decoders

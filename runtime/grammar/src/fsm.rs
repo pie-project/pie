@@ -7,11 +7,11 @@
 //! - `CharRange { min, max }`: byte range transition `[min, max]`
 //! - `Epsilon`: free transition (NFA only)
 //! - `RuleRef(RuleId)`: reference to another grammar rule
-//! - `Eos`: end-of-sequence marker
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use crate::grammar::{Expr, ExprId, Grammar, RuleId};
+use anyhow::{Result, bail};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -31,8 +31,6 @@ pub enum FsmEdge {
     /// Reference to another grammar rule.  After that rule matches,
     /// transition to `target`.
     RuleRef { rule: RuleId, target: StateId },
-    /// End-of-sequence marker; transition to `target`.
-    Eos(StateId),
 }
 
 // ---------------------------------------------------------------------------
@@ -83,11 +81,6 @@ impl NfaGraph {
     /// Shorthand: add a rule-ref edge.
     pub fn add_rule_ref(&mut self, from: StateId, rule: RuleId, target: StateId) {
         self.add_edge(from, FsmEdge::RuleRef { rule, target });
-    }
-
-    /// Shorthand: add an EOS edge.
-    pub fn add_eos(&mut self, from: StateId, target: StateId) {
-        self.add_edge(from, FsmEdge::Eos(target));
     }
 
     /// Get all edges from a state.
@@ -243,7 +236,6 @@ pub struct Automaton<F> {
     pub start: StateId,
     /// `ends[i]` is true if state `i` is an accepting state.
     pub ends: Vec<bool>,
-    pub is_dfa: bool,
 }
 
 impl Automaton<NfaGraph> {
@@ -280,7 +272,13 @@ impl Automaton<NfaGraph> {
     }
 
     /// Convert NFA to DFA via subset construction.
+    #[cfg(test)]
     pub fn to_dfa(&self) -> Automaton<NfaGraph> {
+        self.to_dfa_limited(usize::MAX)
+            .expect("unlimited DFA conversion")
+    }
+
+    pub(crate) fn to_dfa_limited(&self, max_states: usize) -> Result<Automaton<NfaGraph>> {
         let mut dfa = NfaGraph::new();
         let mut dfa_ends = Vec::new();
 
@@ -295,15 +293,18 @@ impl Automaton<NfaGraph> {
                              dfa_ends: &mut Vec<bool>,
                              state_map: &mut HashMap<BTreeSet<StateId>, StateId>,
                              worklist: &mut VecDeque<BTreeSet<StateId>>|
-         -> StateId {
+         -> Result<StateId> {
             if let Some(&existing) = state_map.get(&target_set) {
-                existing
+                Ok(existing)
             } else {
+                if dfa.num_states() >= max_states {
+                    bail!("DFA state limit {} exceeded", max_states);
+                }
                 let new_id = dfa.add_state();
                 dfa_ends.push(target_set.iter().any(|s| ends[s.0 as usize]));
                 state_map.insert(target_set.clone(), new_id);
                 worklist.push_back(target_set);
-                new_id
+                Ok(new_id)
             }
         };
 
@@ -338,20 +339,23 @@ impl Automaton<NfaGraph> {
                     &mut dfa_ends,
                     &mut state_map,
                     &mut worklist,
-                );
+                )?;
                 dfa.add_char_edge(dfa_state, min, max, dfa_target);
             }
 
-            // Handle rule-ref and EOS edges
+            // Handle rule-reference edges.
             for &nfa_state in &nfa_states {
                 for edge in self.fsm.edges(nfa_state) {
-                    let target_nfa = match edge {
-                        FsmEdge::RuleRef { target, .. } | FsmEdge::Eos(target) => *target,
-                        _ => continue,
+                    let FsmEdge::RuleRef {
+                        rule,
+                        target: target_nfa,
+                    } = edge
+                    else {
+                        continue;
                     };
                     let target_set = {
                         let mut s = BTreeSet::new();
-                        s.insert(target_nfa);
+                        s.insert(*target_nfa);
                         self.fsm.epsilon_closure(&s)
                     };
                     if target_set.is_empty() {
@@ -364,24 +368,17 @@ impl Automaton<NfaGraph> {
                         &mut dfa_ends,
                         &mut state_map,
                         &mut worklist,
-                    );
-                    match edge {
-                        FsmEdge::RuleRef { rule, .. } => {
-                            dfa.add_rule_ref(dfa_state, *rule, dfa_target)
-                        }
-                        FsmEdge::Eos(_) => dfa.add_eos(dfa_state, dfa_target),
-                        _ => unreachable!(),
-                    }
+                    )?;
+                    dfa.add_rule_ref(dfa_state, *rule, dfa_target);
                 }
             }
         }
 
-        Automaton {
+        Ok(Automaton {
             fsm: dfa,
             start: dfa_start,
             ends: dfa_ends,
-            is_dfa: true,
-        }
+        })
     }
 
     /// Collect distinct byte intervals and their target NFA states from a set of NFA states.
@@ -459,7 +456,6 @@ impl Automaton<NfaGraph> {
             fsm: self.fsm.to_compact(),
             start: self.start,
             ends: self.ends.clone(),
-            is_dfa: self.is_dfa,
         }
     }
 }
@@ -468,7 +464,6 @@ impl Automaton<DfaTable> {
     /// Test whether the compact DFA accepts a byte string.
     #[cfg(test)]
     pub fn accepts(&self, input: &[u8]) -> bool {
-        assert!(self.is_dfa, "DfaTable accepts() requires DFA");
         let mut state = self.start;
         for &byte in input {
             match self.fsm.next_state(state, byte) {
@@ -649,7 +644,7 @@ fn add_utf8_byte_range(
     }
 
     // Part 2: intermediate bytes with full continuation range
-    if lo[depth] + 1 <= hi[depth].saturating_sub(1) {
+    if lo[depth] < hi[depth].saturating_sub(1) {
         let s = fsm.add_state();
         fsm.add_char_edge(start, lo[depth] + 1, hi[depth] - 1, s);
         let mut lo_min = lo.to_vec();
@@ -805,6 +800,11 @@ fn build_expr_nfa_inlining(
             let max = *max;
             let rule = *rule;
 
+            if min == 0 && max == Some(0) {
+                fsm.add_epsilon(start, end);
+                return;
+            }
+
             if inlineable.contains(&rule) {
                 // Inline the repeated rule's body directly
                 let body = grammar.get_rule(rule).body;
@@ -898,12 +898,7 @@ pub fn build_rule_fsms(grammar: &Grammar) -> Vec<Automaton<NfaGraph>> {
         let mut ends = vec![false; fsm.num_states()];
         ends[end.0 as usize] = true;
 
-        result.push(Automaton {
-            fsm,
-            start,
-            ends,
-            is_dfa: false,
-        });
+        result.push(Automaton { fsm, start, ends });
     }
 
     result
@@ -971,7 +966,6 @@ mod tests {
             fsm,
             start: s0,
             ends: vec![false, false, true],
-            is_dfa: false,
         };
 
         assert!(nfa.accepts(b"ab"));
@@ -999,7 +993,6 @@ mod tests {
             fsm,
             start,
             ends: vec![false, false, false, true],
-            is_dfa: false,
         };
 
         assert!(nfa.accepts(b"a"));
@@ -1029,11 +1022,9 @@ mod tests {
             fsm,
             start,
             ends: vec![false, false, false, true, false, true],
-            is_dfa: false,
         };
 
         let dfa = nfa.to_dfa();
-        assert!(dfa.is_dfa);
         assert!(dfa.accepts(b"a"));
         assert!(dfa.accepts(b"ab"));
         assert!(!dfa.accepts(b"b"));
@@ -1073,7 +1064,6 @@ mod tests {
             fsm,
             start: s0,
             ends: vec![false, false, true],
-            is_dfa: true,
         };
 
         let compact = fse.to_compact();
@@ -1193,7 +1183,6 @@ mod tests {
             fsm,
             start,
             ends: vec![false, true],
-            is_dfa: false,
         };
 
         let dfa = nfa.to_dfa();
@@ -1220,7 +1209,6 @@ mod tests {
             fsm,
             start: s0,
             ends: vec![false, true, true],
-            is_dfa: false,
         };
 
         let mut states = BTreeSet::new();

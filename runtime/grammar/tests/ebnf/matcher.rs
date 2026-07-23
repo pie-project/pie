@@ -1,37 +1,11 @@
-//! EBNF grammar matching behavior.
+//! EBNF matcher acceptance behavior, ported from xgrammar.
 //!
 //! Tests EBNF grammar acceptance/rejection via the GrammarMatcher.
 
-use std::sync::Arc;
-
+use crate::common::{
+    ebnf_accepts as is_grammar_accept_string, grammar_accepts as is_grammar_accept_string_g,
+};
 use pie_grammar::grammar::Grammar;
-use pie_grammar::matcher::GrammarMatcher;
-use pie_tokenizer::Tokenizer;
-
-/// Helper: does the grammar accept the given string?
-/// Mirrors xgrammar's `_is_grammar_accept_string`.
-fn is_grammar_accept_string(grammar_ebnf: &str, input: &str) -> bool {
-    let grammar = match Grammar::from_ebnf(grammar_ebnf, "root") {
-        Ok(g) => g,
-        Err(_) => return false,
-    };
-    is_grammar_accept_string_g(&grammar, input)
-}
-
-fn is_grammar_accept_string_g(grammar: &Grammar, input: &str) -> bool {
-    let vocab: Vec<String> = vec!["dummy".into()];
-    let tok = Arc::new(Tokenizer::from_vocab(&vocab));
-    let mut m = GrammarMatcher::new(Arc::new(grammar.clone()), tok, vec![], 10);
-
-    if input.is_empty() {
-        return m.can_terminate();
-    }
-
-    if !m.accept_string(input) {
-        return false;
-    }
-    m.can_terminate()
-}
 
 // ---------------------------------------------------------------------------
 // JSON acceptance (from test_json_pressure / test_json_grammar)

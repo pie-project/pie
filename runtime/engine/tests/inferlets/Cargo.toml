@@ -11,6 +11,7 @@ members = [
     "generate-gdn-n1",
     "grammar",
     "grammar-late",
+    "grammar-wit-bench",
     "mirostat",
     "entropycheck",
     "tempgen",

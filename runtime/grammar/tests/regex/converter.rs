@@ -1,4 +1,4 @@
-//! Regex-to-grammar conversion behavior.
+//! Regex-to-EBNF conversion and validation behavior.
 //!
 //! Tests regex → EBNF conversion correctness.
 
@@ -80,8 +80,8 @@ fn test_repetition_range_conversion() {
 fn test_repetition_unbounded_conversion() {
     let body = ebnf_body("a{1,}");
     assert!(
-        body.contains("{1,}"),
-        "body should contain {{1,}}: {}",
+        body.contains("{1,}") || body.contains('+'),
+        "body should contain an unbounded repetition: {}",
         body
     );
 }
@@ -150,7 +150,10 @@ fn test_digit_shorthand() {
 #[test]
 fn test_word_shorthand() {
     let body = ebnf_body(r"\w");
-    assert!(body.contains("[a-zA-Z0-9_]"), "body: {}", body);
+    assert!(body.contains("0-9"), "body: {}", body);
+    assert!(body.contains("A-Z"), "body: {}", body);
+    assert!(body.contains("a-z"), "body: {}", body);
+    assert!(body.contains('_'), "body: {}", body);
 }
 
 #[test]

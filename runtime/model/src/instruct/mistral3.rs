@@ -13,7 +13,6 @@ use crate::instruct::decoders::{GenericChatDecoder, NoopReasoningDecoder};
 use crate::instruct::{
     ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent, ToolGrammar,
 };
-use pie_grammar::grammar::Grammar;
 use pie_tokenizer::{Tokenizer, TokenizerDecoder};
 use std::sync::Arc;
 
@@ -286,11 +285,7 @@ json-array ::= "[" (json-value ("," json-value)*)? "]"
 "#,
             name_alt = name_alt
         );
-        let parsed = Grammar::from_ebnf(&grammar, "root").ok()?;
-        Some(ToolGrammar {
-            source: grammar,
-            grammar: Arc::new(parsed),
-        })
+        Some(ToolGrammar { source: grammar })
     }
 }
 

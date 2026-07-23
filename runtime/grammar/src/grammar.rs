@@ -1,31 +1,22 @@
-pub mod builder;
-pub mod ebnf;
+pub(crate) mod builder;
+mod ebnf;
 pub(crate) mod normalize;
-pub(crate) mod optimizer;
 
 use std::fmt;
 
 /// Index into the grammar's rule list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct RuleId(pub u32);
+pub(crate) struct RuleId(pub u32);
 
 /// Index into the grammar's expression arena.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ExprId(pub u32);
+pub(crate) struct ExprId(pub u32);
 
 /// A grammar rule: a named production with a body expression.
 #[derive(Debug, Clone)]
-pub struct Rule {
-    pub name: String,
-    pub body: ExprId,
-    pub lookahead: Option<Lookahead>,
-}
-
-/// A lookahead assertion attached to a rule.
-#[derive(Debug, Clone)]
-pub struct Lookahead {
-    pub expr: ExprId,
-    pub is_exact: bool,
+pub(crate) struct Rule {
+    pub(crate) name: String,
+    pub(crate) body: ExprId,
 }
 
 /// A grammar expression node.
@@ -34,7 +25,7 @@ pub struct Lookahead {
 /// This gives cache-friendly access without lifetime issues, while being fully
 /// type-safe unlike the C++ CSR-encoded flat array.
 #[derive(Debug, Clone)]
-pub enum Expr {
+pub(crate) enum Expr {
     /// The empty string `""`.
     EmptyString,
 
@@ -76,7 +67,7 @@ pub enum Expr {
 
 /// An immutable context-free grammar.
 ///
-/// Constructed via `GrammarBuilder` or `Grammar::from_ebnf()`.
+/// Constructed via `Grammar::from_ebnf()` or [`GrammarCompiler`](crate::compiler::GrammarCompiler).
 /// Expressions are stored in a flat arena for cache efficiency.
 #[derive(Debug, Clone)]
 pub struct Grammar {
@@ -87,17 +78,17 @@ pub struct Grammar {
 
 impl Grammar {
     /// Get the root rule id.
-    pub fn root_rule(&self) -> RuleId {
+    pub(crate) fn root_rule(&self) -> RuleId {
         self.root_rule
     }
 
     /// Get a rule by id.
-    pub fn get_rule(&self, id: RuleId) -> &Rule {
+    pub(crate) fn get_rule(&self, id: RuleId) -> &Rule {
         &self.rules[id.0 as usize]
     }
 
     /// Get an expression by id.
-    pub fn get_expr(&self, id: ExprId) -> &Expr {
+    pub(crate) fn get_expr(&self, id: ExprId) -> &Expr {
         &self.exprs[id.0 as usize]
     }
 
@@ -106,18 +97,14 @@ impl Grammar {
         self.rules.len()
     }
 
-    /// Number of expressions in the grammar.
-    pub fn num_exprs(&self) -> usize {
-        self.exprs.len()
-    }
-
     /// Iterate over all rules.
-    pub fn rules(&self) -> &[Rule] {
+    pub(crate) fn rules(&self) -> &[Rule] {
         &self.rules
     }
 
     /// Get the root rule.
-    pub fn root(&self) -> &Rule {
+    #[cfg(test)]
+    pub(crate) fn root(&self) -> &Rule {
         self.get_rule(self.root_rule)
     }
 }
@@ -130,11 +117,6 @@ impl fmt::Display for Grammar {
             }
             write!(f, "{} ::= ", rule.name)?;
             self.fmt_expr(f, rule.body)?;
-            if let Some(ref la) = rule.lookahead {
-                write!(f, " (= ")?;
-                self.fmt_expr(f, la.expr)?;
-                write!(f, ")")?;
-            }
         }
         Ok(())
     }
@@ -233,7 +215,7 @@ impl Grammar {
             0x09 => write!(f, "\\t"),
             0x0a => write!(f, "\\n"),
             0x0d => write!(f, "\\r"),
-            cp if cp >= 0x20 && cp <= 0x7e => {
+            cp if (0x20..=0x7e).contains(&cp) => {
                 if let Some(c) = char::from_u32(cp) {
                     write!(f, "{}", c)
                 } else {

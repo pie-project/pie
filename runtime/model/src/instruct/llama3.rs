@@ -7,7 +7,6 @@ use crate::instruct::decoders::{GenericChatDecoder, ThinkingDecoder};
 use crate::instruct::{
     ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent, ToolGrammar,
 };
-use pie_grammar::grammar::Grammar;
 use pie_tokenizer::{Tokenizer, TokenizerDecoder};
 use std::sync::Arc;
 
@@ -254,11 +253,7 @@ ws ::= [ \t\n]*
 "#,
             name_alt = name_alt
         );
-        let parsed = Grammar::from_ebnf(&grammar, "root").ok()?;
-        Some(ToolGrammar {
-            source: grammar,
-            grammar: Arc::new(parsed),
-        })
+        Some(ToolGrammar { source: grammar })
     }
 
     fn chat_decoder(&self) -> Box<dyn ChatDecoder> {

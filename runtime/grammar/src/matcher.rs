@@ -12,8 +12,7 @@ mod stack_parser;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use crate::bitmask::{self, set_bit};
-use crate::brle::RunMask;
+use crate::bitmask::{self, clear_bit, set_bit};
 use crate::compiled_grammar::CompiledGrammar;
 use crate::fsm::{FsmEdge, StateId};
 use crate::grammar::Grammar;
@@ -56,8 +55,10 @@ pub struct GrammarMatcher {
     max_rollback_tokens: usize,
     /// Reusable scratch buffers for trie walk (avoids per-call heap allocations).
     trie_scratch: TrieWalkScratch,
-    /// Scratch bitmask for `fill_next_token_brle`.
+    /// Reusable source buffer for owned masks returned to the WIT boundary.
     bitmask_scratch: Vec<u32>,
+    /// Reused full-state key for the bounded runtime mask cache.
+    bitmask_cache_key: Vec<u64>,
 }
 
 /// Reusable scratch buffers for the trie walk in `fill_next_token_bitmask`.
@@ -104,21 +105,16 @@ impl GrammarMatcher {
         max_rollback_tokens: usize,
     ) -> Self {
         let compiled = Arc::new(CompiledGrammar::new(&grammar, &tokenizer_info));
-        Self::with_compiled(
-            compiled,
-            tokenizer_info,
-            stop_token_ids,
-            max_rollback_tokens,
-        )
+        Self::with_compiled(compiled, stop_token_ids, max_rollback_tokens)
     }
 
     /// Create a grammar matcher from a pre-compiled grammar.
     pub fn with_compiled(
         compiled: Arc<CompiledGrammar>,
-        tokenizer_info: Arc<Tokenizer>,
         stop_token_ids: Vec<u32>,
         max_rollback_tokens: usize,
     ) -> Self {
+        let tokenizer_info = compiled.tokenizer.clone();
         let parser = StackParser::new(compiled.clone());
         let engine = if compiled.is_single_dfa
             && parser.current_states().len() == 1
@@ -141,6 +137,7 @@ impl GrammarMatcher {
             max_rollback_tokens,
             trie_scratch: TrieWalkScratch::new(),
             bitmask_scratch: vec![0u32; bitmask::bitmask_size(vocab_size)],
+            bitmask_cache_key: Vec::new(),
         }
     }
 
@@ -225,17 +222,6 @@ impl GrammarMatcher {
             return;
         }
 
-        let vocab_size = self.tokenizer.vocab_size();
-
-        // Allow stop tokens if grammar can terminate here
-        if self.can_terminate() {
-            for &stop_id in &self.stop_token_ids {
-                if (stop_id as usize) < vocab_size {
-                    set_bit(bitmask, stop_id as usize);
-                }
-            }
-        }
-
         match &self.engine {
             ParserEngine::SingleDfa(e) => {
                 e.fill_bitmask(
@@ -244,27 +230,32 @@ impl GrammarMatcher {
                     bitmask,
                     &mut self.trie_scratch.dfa_stack,
                     &mut self.trie_scratch.dfa_active_prefix,
+                    &mut self.bitmask_cache_key,
                 );
             }
             ParserEngine::Stack(_) => {
                 self.fill_bitmask_stack(bitmask);
             }
         }
-    }
 
-    /// Fill the next-token bitmask and return it as a [`RunMask`].
-    pub fn fill_next_token_brle(&mut self) -> RunMask {
-        let mut scratch = std::mem::take(&mut self.bitmask_scratch);
-        self.fill_next_token_bitmask(&mut scratch);
-        let brle = RunMask::from_bitmask(&scratch, self.tokenizer.vocab_size());
-        self.bitmask_scratch = scratch;
-        brle
+        if !self.stop_token_ids.is_empty() {
+            let can_terminate = self.can_terminate();
+            let vocab_size = self.tokenizer.vocab_size();
+            for &stop_id in &self.stop_token_ids {
+                if (stop_id as usize) < vocab_size {
+                    if can_terminate {
+                        set_bit(bitmask, stop_id as usize);
+                    } else {
+                        clear_bit(bitmask, stop_id as usize);
+                    }
+                }
+            }
+        }
     }
 
     /// Fill the next-token bitmask and return it as a packed `[ceil(vocab/32)]`
     /// `u32` allowed-token bitmask (bit `i` set ⇒ token `i` allowed) — the
-    /// de-hardwired `mask-apply` (`0x65`) mask operand. Exposes the packed bits
-    /// directly, without the `RunMask` round-trip the old wire shape needed.
+    /// de-hardwired `mask-apply` (`0x65`) mask operand used by the WIT boundary.
     pub fn fill_next_token_mask(&mut self) -> Vec<u32> {
         let mut scratch = std::mem::take(&mut self.bitmask_scratch);
         self.fill_next_token_bitmask(&mut scratch);
@@ -281,8 +272,11 @@ impl GrammarMatcher {
         };
 
         // Check runtime bitmask cache
-        let state_hash = parser.state_hash();
-        if self.compiled.get_cached_bitmask(state_hash, bitmask) {
+        parser.write_cache_key(&mut self.bitmask_cache_key);
+        if self
+            .compiled
+            .get_cached_bitmask(&self.bitmask_cache_key, bitmask)
+        {
             return;
         }
 
@@ -316,14 +310,16 @@ impl GrammarMatcher {
         }
 
         if !need_trie_walk {
-            self.compiled.cache_bitmask(state_hash, bitmask);
+            self.compiled
+                .cache_bitmask(&self.bitmask_cache_key, bitmask);
             return;
         }
 
         // Batch trie walk for remaining tokens
         self.fill_bitmask_trie_walk(bitmask);
 
-        self.compiled.cache_bitmask(state_hash, bitmask);
+        self.compiled
+            .cache_bitmask(&self.bitmask_cache_key, bitmask);
     }
 
     /// Batch trie walk: process sorted vocabulary tokens with shared prefix optimization.
@@ -431,9 +427,16 @@ impl GrammarMatcher {
     }
 
     /// Rollback the last `num_tokens` accepted tokens.
-    pub fn rollback(&mut self, num_tokens: usize) {
+    pub fn rollback(&mut self, mut num_tokens: usize) {
+        if num_tokens == 0 {
+            return;
+        }
         if self.terminated {
             self.terminated = false;
+            num_tokens -= 1;
+            if num_tokens == 0 {
+                return;
+            }
         }
 
         match &mut self.engine {

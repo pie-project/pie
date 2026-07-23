@@ -87,6 +87,12 @@ Questions and bug reports are welcome on
 [GitHub Issues](https://github.com/pie-project/pie/issues) and
 [GitHub Discussions](https://github.com/pie-project/pie/discussions).
 
+## Acknowledgements
+
+The constrained-decoding engine in `runtime/grammar` is a Rust rewrite derived
+in part from [XGrammar](https://github.com/mlc-ai/xgrammar), licensed under
+Apache License 2.0. See [NOTICE](NOTICE) for attribution.
+
 ## License
 
 [Apache License 2.0](LICENSE)

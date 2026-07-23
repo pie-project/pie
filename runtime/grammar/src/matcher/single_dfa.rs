@@ -49,11 +49,6 @@ impl SingleDfaEngine {
         compiled.rule_dfas[self.rule_idx].ends[self.state as usize]
     }
 
-    /// Hash of current state for bitmask caching.
-    pub(super) fn state_hash(&self) -> u64 {
-        self.state as u64
-    }
-
     /// Rollback num_tokens tokens by popping from history.
     pub(super) fn rollback(&mut self, num_tokens: usize) -> usize {
         let n = num_tokens.min(self.history.len());
@@ -106,9 +101,11 @@ impl SingleDfaEngine {
         bitmask: &mut [u32],
         scratch_stack: &mut Vec<u16>,
         scratch_prefix: &mut Vec<u8>,
+        cache_key: &mut Vec<u64>,
     ) {
-        let hash = self.state_hash();
-        if compiled.get_cached_bitmask(hash, bitmask) {
+        cache_key.clear();
+        cache_key.extend([0, self.rule_idx as u64, self.state as u64]);
+        if compiled.get_cached_bitmask(cache_key, bitmask) {
             return;
         }
 
@@ -136,7 +133,7 @@ impl SingleDfaEngine {
             );
         }
 
-        compiled.cache_bitmask(hash, bitmask);
+        compiled.cache_bitmask(cache_key, bitmask);
     }
 
     /// Trie walk for uncertain tokens using raw byte_table lookups.

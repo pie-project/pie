@@ -9,7 +9,7 @@ use std::cell::Cell;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use rustc_hash::{FxHashSet, FxHasher};
+use rustc_hash::FxHashSet;
 
 use crate::compiled_grammar::CompiledGrammar;
 use crate::fsm::{FsmEdge, StateId};
@@ -39,11 +39,14 @@ pub(super) struct StackState {
 impl Hash for StackState {
     #[inline(always)]
     fn hash<H: Hasher>(&self, state: &mut H) {
-        // StackState is exactly 8 bytes (repr(C): u16+u16+u32) — hash as u64.
-        let bits = (self.rule_id as u64)
-            | ((self.dfa_state as u64) << 16)
-            | ((self.return_level as u64) << 32);
-        bits.hash(state);
+        self.packed().hash(state);
+    }
+}
+
+impl StackState {
+    #[inline(always)]
+    fn packed(self) -> u64 {
+        (self.rule_id as u64) | ((self.dfa_state as u64) << 16) | ((self.return_level as u64) << 32)
     }
 }
 
@@ -89,7 +92,7 @@ impl<T: Eq + Hash + Copy> SmallDedup<T> {
         }
 
         // Linear scan for small sets
-        if self.vec.iter().any(|x| *x == item) {
+        if self.vec.contains(&item) {
             return false;
         }
         self.vec.push(item);
@@ -471,9 +474,7 @@ impl StackParser {
     ) {
         let current_level = self.state_offsets.len() as u32;
         // Track rule_ids that completed at current_level (for nullable dedup handling).
-        // Inline array avoids heap allocation for the common case (0-8 completions).
-        let mut completed_at_level = [0u16; 8];
-        let mut completed_count = 0usize;
+        let mut completed_at_level = Vec::with_capacity(8);
 
         let mut idx = 0;
         while idx < queue.len() {
@@ -522,7 +523,7 @@ impl StackParser {
                 if !self.expand_rule(RuleId(rule_id as u32), current_level, queue, visited) {
                     // Rule already expanded at this level. If it has already
                     // completed (nullable), advance the parent immediately.
-                    if completed_at_level[..completed_count].contains(&rule_id) {
+                    if completed_at_level.contains(&rule_id) {
                         if visited.insert(parent_after) {
                             queue.push(parent_after);
                         }
@@ -534,11 +535,8 @@ impl StackParser {
             if action.flags.is_accepting() {
                 // Track completion for nullable dedup handling
                 if state.return_level == current_level {
-                    if !completed_at_level[..completed_count].contains(&state.rule_id) {
-                        if completed_count < completed_at_level.len() {
-                            completed_at_level[completed_count] = state.rule_id;
-                            completed_count += 1;
-                        }
+                    if !completed_at_level.contains(&state.rule_id) {
+                        completed_at_level.push(state.rule_id);
                     }
                 }
                 self.complete(&state, queue, visited, returns, accept_stop, extra_returns);
@@ -809,18 +807,20 @@ impl StackParser {
         self.is_completed.last().copied().unwrap_or(false)
     }
 
-    /// Hash of the current parser state for bitmask caching.
-    pub(super) fn state_hash(&self) -> u64 {
-        let mut hasher = FxHasher::default();
-        for state in self.current_states() {
-            state.hash(&mut hasher);
+    /// Write an equality-safe key for the current parser state.
+    pub(super) fn write_cache_key(&self, key: &mut Vec<u64>) {
+        let states = self.current_states();
+        let returns = self.current_returns();
+        key.clear();
+        key.reserve(4 + states.len() + returns.len() * 2);
+        key.extend([1, states.len() as u64]);
+        key.extend(states.iter().map(|state| state.packed()));
+        key.push(returns.len() as u64);
+        for &(expected_rule, state) in returns {
+            key.push(expected_rule as u64);
+            key.push(state.packed());
         }
-        for &(rid, ref state) in self.current_returns() {
-            rid.hash(&mut hasher);
-            state.hash(&mut hasher);
-        }
-        self.is_completed().hash(&mut hasher);
-        hasher.finish()
+        key.push(self.is_completed() as u64);
     }
 
     /// Get the current scanable states.
@@ -851,6 +851,7 @@ impl StackParser {
         if count == 0 {
             return;
         }
+        self.chain_terminal.set(None);
         // First consume lazy steady-state bytes
         if self.steady.count > 0 {
             let from_lazy = count.min(self.steady.count);
@@ -963,7 +964,7 @@ impl StackParser {
             .collect();
 
         // Safety: reject deltas outside {0, 1} to avoid recursive-grammar pitfalls
-        if state_deltas.iter().any(|&d| d < 0 || d > 1) {
+        if state_deltas.iter().any(|&d| !(0..=1).contains(&d)) {
             return;
         }
 
@@ -980,7 +981,7 @@ impl StackParser {
             })
             .collect();
 
-        if return_deltas.iter().any(|&d| d < 0 || d > 1) {
+        if return_deltas.iter().any(|&d| !(0..=1).contains(&d)) {
             return;
         }
 
@@ -1046,39 +1047,6 @@ impl StackParser {
         }
 
         if found_direct { winner } else { None }
-    }
-}
-
-impl Clone for StackParser {
-    fn clone(&self) -> Self {
-        // Flush lazy state into the clone so it starts fresh
-        let mut cloned = Self {
-            compiled: Arc::clone(&self.compiled),
-            state_arena: self.state_arena.clone(),
-            state_offsets: self.state_offsets.clone(),
-            return_arena: self.return_arena.clone(),
-            return_offsets: self.return_offsets.clone(),
-            is_completed: self.is_completed.clone(),
-            buf_queue: Vec::new(),
-            buf_visited: SmallDedup::new(),
-            buf_scanable: Vec::new(),
-            buf_return: Vec::new(),
-            steady: SteadyState::new(),
-            chain_terminal: Cell::new(None),
-        };
-        // If the original has lazy steady bytes, commit one level in the clone
-        if self.steady.count > 0 {
-            let prev_start = *cloned.state_offsets.last().unwrap();
-            let new_start = cloned.state_arena.len();
-            cloned.state_arena.extend_from_within(prev_start..);
-            cloned.state_offsets.push(new_start);
-            let prev_rstart = *cloned.return_offsets.last().unwrap();
-            let new_rstart = cloned.return_arena.len();
-            cloned.return_arena.extend_from_within(prev_rstart..);
-            cloned.return_offsets.push(new_rstart);
-            cloned.is_completed.push(self.steady.is_completed);
-        }
-        cloned
     }
 }
 

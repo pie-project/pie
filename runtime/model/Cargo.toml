@@ -3,7 +3,7 @@ name = "pie-model"
 version = "0.4.0"
 edition = "2024"
 authors = ["In Gim <in.gim@yale.edu>"]
-description = "Model metadata, instruct chat templates, and multimodal (image/audio) host-side decode for Pie. Depends on pie-tokenizer + pie-grammar."
+description = "Model metadata, instruct chat templates, and multimodal (image/audio) host-side decode for Pie."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
@@ -13,7 +13,6 @@ path = "src/lib.rs"
 
 [dependencies]
 pie-tokenizer = { path = "../tokenizer" }
-pie-grammar = { path = "../grammar" }
 anyhow = "1.0"
 serde_json = { version = "1.0", features = ["preserve_order"] }
 # Host-side media decode for the model-agnostic multimodal API.

@@ -6,7 +6,6 @@
 use crate::inferlet::ProcessCtx;
 use crate::inferlet::host::pie;
 use anyhow::Result;
-use pie_grammar::compiled_grammar::CompiledGrammar;
 use pie_grammar::matcher::GrammarMatcher;
 use pie_model::instruct::{ToolDecoder, ToolEvent};
 use wasmtime::component::Resource;
@@ -49,10 +48,9 @@ impl pie::inferlet::tools::Host for ProcessCtx {
         let Some(tg) = pie_model::model().instruct().tool_call_grammar(&tools) else {
             return Ok(None);
         };
-        let grammar = crate::inferlet::host::grammar::Grammar {
-            source: tg.source,
-            inner: tg.grammar,
-        };
+        let compiled =
+            crate::inferlet::host::grammar::grammar_compiler().compile_ebnf(&tg.source, "root")?;
+        let grammar = crate::inferlet::host::grammar::Grammar { compiled };
         Ok(Some(self.ctx().table.push(grammar)?))
     }
 
@@ -62,15 +60,15 @@ impl pie::inferlet::tools::Host for ProcessCtx {
     ) -> Result<Resource<crate::inferlet::host::grammar::Matcher>> {
         let model = pie_model::model();
         let instruct = model.instruct();
-        let tok = model.tokenizer().clone();
         let stop_tokens = instruct.seal();
 
         let tg = instruct.tool_call_grammar(&tools).ok_or_else(|| {
             anyhow::anyhow!("model does not support constrained tool-call generation")
         })?;
 
-        let compiled = CompiledGrammar::get_or_compile(&tg.source, &tg.grammar, &tok);
-        let inner = GrammarMatcher::with_compiled(compiled, tok, stop_tokens, 10);
+        let compiled =
+            crate::inferlet::host::grammar::grammar_compiler().compile_ebnf(&tg.source, "root")?;
+        let inner = GrammarMatcher::with_compiled(compiled, stop_tokens, 10);
 
         let matcher = crate::inferlet::host::grammar::Matcher { inner };
         Ok(self.ctx().table.push(matcher)?)

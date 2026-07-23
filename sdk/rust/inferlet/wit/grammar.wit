@@ -24,8 +24,8 @@ interface grammar {
 
     /// Stateful matcher that walks the grammar automaton as tokens are
     /// accepted, producing a bitmask of valid next tokens at each step.
-    /// The host compiles the grammar on construction and may cache the
-    /// compiled result internally.
+    /// The host compiles and may cache the grammar when its resource is
+    /// constructed; matcher construction reuses that compiled result.
     resource matcher {
         /// Create a new matcher from a grammar.
         constructor(grammar: borrow<grammar>);

@@ -9,7 +9,6 @@ use crate::instruct::decoders::{GenericChatDecoder, NoopReasoningDecoder, Thinki
 use crate::instruct::{
     ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent, ToolGrammar,
 };
-use pie_grammar::grammar::Grammar;
 use pie_tokenizer::{Tokenizer, TokenizerDecoder};
 use std::sync::Arc;
 
@@ -372,11 +371,7 @@ impl Instruct for QwenInstruct {
             return None;
         }
         let source = Self::build_tool_call_grammar(tools)?;
-        let grammar = Grammar::from_ebnf(&source, "root").ok()?;
-        Some(ToolGrammar {
-            source,
-            grammar: Arc::new(grammar),
-        })
+        Some(ToolGrammar { source })
     }
 }
 
