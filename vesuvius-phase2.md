@@ -1149,3 +1149,29 @@ r suite's 35.20 — the -6 ms cold trim is inside run noise on k1);
 k2 34.69k, k3 34.33k, k2-c0256 28.04k, 512x512 19.77k, instr-k1
 35.04k, instr-k2 34.47k — every one a new best (denser shapes see
 the cold trim more).
+
+## (A') slot-follows-open-pipelines: implemented, measured, HELD BACK
+
+Operator approved (A') — release the execution slot when a process's
+last pipeline closes (the inferlet already calls `pipe.close()` after
+its final take), using only existing API. Implemented cleanly:
+`FireContext::on_pipeline_closed` hook -> `ProcessCtx::
+maybe_release_execution_slot` (release broadcast before permit drop;
+policy clears `slotted` on any release so the later Terminate arms
+nothing; teardown's trivial-exit path gains the ProcessQuiesced
+broadcast). Units 359/359 with a new regression test; oracles EXACT;
+watchdog 0; every shape completed.
+
+Measured, though, it does NOT deliver the projected -20 ms: the
+boundary is no longer release-limited but guest-wake-fanout-limited
+(512 wasm tasks resume at settle and run their epilogue through the
+awaited close ack — the same pass-quantized ack path the release now
+rides). Admission tails improved ~1.5 ms and the cold hole improved
+(37 vs 53 ms, warmup slots freed early), but suite k1 medians read
+34.86 vs 35.04 for the base across 3v6 runs (~ -0.2k, ~1.5 sigma) and
+instrumented runs are dead equal. Verdict: neutral at best, weakly
+negative at worst, and it did not buy the boundary time it was
+approved for. The work is preserved in stash "earlyrel-ab" (design,
+tests, and the policy hygiene line); not landed. The boundary floor's
+next honest owner is the guest-wake fan-out itself, which is
+process-teardown compute, not scheduling.
