@@ -1203,6 +1203,28 @@ struct Dispatch::Impl {
     bool reaper_stop = false;
     std::vector<std::unique_ptr<NotifyContext>> settlement_arenas;
     std::mutex settlement_mutex;
+    // M2 frame-group settlement: settle_defer waves park their completion
+    // notify / cuda_settled / instance-close fences here; the group's next
+    // settle-now settlement (or an explicit flush, or a latched RETRY)
+    // drains them. Records are order-free: engine retirement is FIFO on its
+    // own queue and checks each batch's completion individually.
+    struct DeferredSettle {
+        PieRuntimeCallbacks runtime{};
+        PieCompletion completion{};
+        bool fire_timing_enabled = false;
+        std::uint64_t finish_to_settle_us = 0;
+        std::uint64_t settled_monotonic_ns = 0;
+        std::size_t fire_count = 0;
+        std::uint64_t membership_hash = 0;
+        std::vector<std::shared_ptr<CallbackFence>> fences;
+    };
+    std::mutex deferred_settle_mutex;
+    std::vector<DeferredSettle> deferred_settles;
+    // settle_defer waves finish-enqueued whose callback has not yet run.
+    int deferred_settle_pending = 0;
+    // A settle-now/flush ran while deferred callbacks were still in flight:
+    // the last straggler to arrive drains the accumulator itself.
+    bool deferred_drain_armed = false;
     std::atomic<bool> shutting_down{false};
     std::atomic<std::uint32_t> force_retry_launches_remaining{
         std::getenv("PIE_CUDA_FORCE_RETRY_ONCE") != nullptr ? 1u : 0u
@@ -1428,6 +1450,8 @@ struct NotifyContext {
     cudaEvent_t copy_done = nullptr;
     cudaEvent_t callback_done = nullptr;
     bool callback_pending = false;
+    // Frame-group settlement marker for this wave (LaunchView::settle_defer).
+    bool settle_defer = false;
     bool fire_timing_enabled = false;
     fire_timing::Clock::time_point fire_timing_started{};
     std::size_t fire_count = 0;
@@ -1464,6 +1488,7 @@ struct NotifyContext {
         notifications.clear();
         callback_fences.clear();
         callback_pending = false;
+        settle_defer = false;
         fire_timing_enabled = false;
         fire_timing_started = {};
         fire_count = 0;
@@ -1511,6 +1536,40 @@ void release_callback_fences(NotifyContext& context) noexcept {
     context.callback_fences.clear();
 }
 
+// Settle one parked (or settle-now) wave record: batch completion notify,
+// `cuda_settled` emission, instance-close fence release. Publication
+// (endpoint wakes, terminal cells, doorbells) happened in the wave's own
+// callback and never rides these records.
+void settle_group_record(
+    Dispatch::Impl* impl,
+    Dispatch::Impl::DeferredSettle& record) noexcept {
+    const bool notify =
+        record.runtime.notify != nullptr &&
+        (impl == nullptr ||
+         !impl->shutting_down.load(std::memory_order_acquire));
+    if (notify && record.completion.wait_id != 0) {
+        record.runtime.notify(
+            record.runtime.ctx,
+            record.completion.wait_id,
+            record.completion.target_epoch);
+    }
+    if (record.fire_timing_enabled) {
+        fire_timing::enqueue_settled({
+            .wave_id = record.completion.wait_id,
+            .fire_count = record.fire_count,
+            .membership_hash = record.membership_hash,
+            .finish_to_settle_us = record.finish_to_settle_us,
+            .settled_monotonic_ns = record.settled_monotonic_ns,
+        });
+    }
+    for (const auto& fence : record.fences) {
+        if (fence->pending.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            fence->pending.notify_all();
+        }
+    }
+    record.fences.clear();
+}
+
 void CUDART_CB notify_runtime_callback(void* userdata) {
     auto* ctx = static_cast<NotifyContext*>(userdata);
     if (ctx == nullptr) return;
@@ -1519,12 +1578,14 @@ void CUDART_CB notify_runtime_callback(void* userdata) {
         (ctx->impl == nullptr ||
          !ctx->impl->shutting_down.load(std::memory_order_acquire));
     ctx->notifications.clear();
+    bool any_retry = false;
     for (std::size_t index = 0; index < ctx->entry_count; ++index) {
         const auto& entry = ctx->entries[index];
         const bool committed =
             entry.commit_host != nullptr && *(entry.commit_host) != 0;
         const bool failed = entry.poison;
         const bool retry = !failed && !committed;
+        if (retry) any_retry = true;
         if (retry && ctx->fire_timing_enabled) {
             // Bounded diagnostic: dump the retried lane's endpoint state so
             // an uncommitted pass names the gate that refused it (ring
@@ -1611,25 +1672,49 @@ void CUDART_CB notify_runtime_callback(void* userdata) {
             }
         }
     }
-    // No native instance/channel state is touched after the batch wake: a woken
+    // Frame-group settlement (M2): a settle_defer wave parks its heavy tail
+    // — the batch completion notify, cuda_settled, instance-close fences —
+    // for the group's next settle-now wave; any latched RETRY escalates to
+    // settle-now so makeup replay never waits on a deferred tail. Everything
+    // is captured into locals before the arena releases: once `in_use`
+    // clears, `ctx` may be reset by the next wave on the lane thread. No
+    // native instance/channel state is touched after a batch wake: a woken
     // runtime thread may immediately close the instance.
-    if (notify && ctx->completion.wait_id != 0) {
-        ctx->runtime.notify(
-            ctx->runtime.ctx, ctx->completion.wait_id, ctx->completion.target_epoch);
-    }
-    if (ctx->fire_timing_enabled) {
-        fire_timing::enqueue_settled({
-            .wave_id = ctx->completion.wait_id,
-            .fire_count = ctx->fire_count,
-            .membership_hash = ctx->membership_hash,
-            .finish_to_settle_us = finish_to_settle_us,
-            .settled_monotonic_ns = settled_monotonic_ns,
-        });
-    }
-    release_callback_fences(*ctx);
+    Dispatch::Impl* impl = ctx->impl;
+    Dispatch::Impl::DeferredSettle self{};
+    self.runtime = ctx->runtime;
+    self.completion = ctx->completion;
+    self.fire_timing_enabled = ctx->fire_timing_enabled;
+    self.finish_to_settle_us = finish_to_settle_us;
+    self.settled_monotonic_ns = settled_monotonic_ns;
+    self.fire_count = ctx->fire_count;
+    self.membership_hash = ctx->membership_hash;
+    self.fences = std::move(ctx->callback_fences);
+    ctx->callback_fences.clear();
+    const bool was_deferred_wave = ctx->settle_defer;
     ctx->commit_lanes.clear();
     ctx->settlement_lanes.clear();
     ctx->in_use.store(false, std::memory_order_release);
+
+    if (impl == nullptr) {
+        settle_group_record(nullptr, self);
+        return;
+    }
+    std::vector<Dispatch::Impl::DeferredSettle> drained;
+    {
+        std::lock_guard<std::mutex> lock(impl->deferred_settle_mutex);
+        if (was_deferred_wave) impl->deferred_settle_pending -= 1;
+        if (was_deferred_wave && !any_retry) {
+            impl->deferred_settles.push_back(std::move(self));
+            if (!impl->deferred_drain_armed) return;  // parked for the tail
+            drained.swap(impl->deferred_settles);
+        } else {
+            drained.swap(impl->deferred_settles);
+            drained.push_back(std::move(self));
+        }
+        impl->deferred_drain_armed = impl->deferred_settle_pending > 0;
+    }
+    for (auto& record : drained) settle_group_record(impl, record);
 }
 
 namespace {
@@ -4047,6 +4132,11 @@ bool Dispatch::finish(
     if (runtime != nullptr) notify->runtime = *runtime;
     notify->completion = completion;
     notify->impl = impl_.get();
+    notify->settle_defer = view.settle_defer;
+    if (view.settle_defer) {
+        std::lock_guard<std::mutex> lock(impl_->deferred_settle_mutex);
+        impl_->deferred_settle_pending += 1;
+    }
     notify->fire_timing_enabled = trace_fire_timing;
     notify->fire_timing_started = fire_timing_started;
     if (trace_fire_timing) {
@@ -4269,6 +4359,16 @@ bool Dispatch::finish(
     notify_lease.release();
     state.active = false;
     return true;
+}
+
+void Dispatch::flush_deferred_settlement() noexcept {
+    std::vector<Impl::DeferredSettle> drained;
+    {
+        std::lock_guard<std::mutex> lock(impl_->deferred_settle_mutex);
+        drained.swap(impl_->deferred_settles);
+        impl_->deferred_drain_armed = impl_->deferred_settle_pending > 0;
+    }
+    for (auto& record : drained) settle_group_record(impl_.get(), record);
 }
 
 void Dispatch::abort(

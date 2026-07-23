@@ -376,9 +376,108 @@ admission. Three flagged constraints feed M2/M3's design:
    frame-tail retirement, RETRY discovery + budget clocks stretch ≤ k×;
    decide: keep commit-mirror-based per-wave retry visibility (the mirror
    already rides the kept publication copies) or rescale budgets.
+   → resolved by the retry-auto-flush rule in the M2 design below.
 2. **Device-only ring capacity has no §5 arm** — enforced only by the
    device publish-capacity gate as a mid-frame RETRY loop; prove vacuous
    from ticket pre-reservation or add a fourth `validate_frame` arm
-   before M2 lands.
+   before M2 lands. → CLOSED: `validate_frame` now walks device-only
+   unseeded rings in slot order and rejects a frame whose reserved
+   backlog (`device_ring_backlog`) plus in-order net growth exceeds the
+   declared capacity, mirroring the device gate
+   (`tail-head < cap1-1 + same_fire_consume`, cap1 = capacity+1).
+   Consumes not yet reserved by any accepted fire grant no relief
+   (static, timing-independent — the S5 "2k-1" philosophy); seeded
+   descriptor channels exempt.
 3. **Per-wave prepare is a mid-frame admission point** — exactly the gap
    M3 closes (one lease per sealed frame at first dispatch).
+
+## M2+M3 design (directive: M2+M3 first, lifecycle storm after)
+
+Ground truth from driver/engine reconnaissance (paths:
+`driver/cuda/src/pipeline/dispatch.cu`, `context.cpp`,
+`pipeline/channels.hpp`, `runahead.hpp`; engine `scheduler/worker.rs`,
+`scheduler/frame.rs`, `driver/completion.rs`, `driver/abi.rs`,
+`interface/driver/src/local.rs`): `Dispatch::finish` enqueues per wave —
+epilogue kernels, commit-bump batch, per-lane publish assembly, D2H
+mirror copies (payload cells + doorbell words + the 4-byte `commit_host`
+mirror), settle kernel, `publications_done` event (next wave's `begin`
+waits it), `cudaLaunchHostFunc(notify_runtime_callback)`. The callback
+latches per-lane `committed = *commit_host != 0` → SUCCESS/RETRY, wakes
+endpoint waiters, writes terminal cells, fires the batch completion
+notify, emits `cuda_settled`, releases instance-close fences, returns
+the settlement arena (pool of 8; acquire can block the lane).
+`PieLaunchDesc` is generated from `interface/driver/src/local.rs`
+(`PIE_DRIVER_ABI_VERSION = 12`) via pie-driver-abi-cbindgen; `reserved0`
+is validated must-be-zero. The remote path re-builds submissions from
+`RemoteLaunch` (no desc field crosses the wire) → stays per-wave
+automatically. Leases (`prepare_launch`/`launch_prepared`) are keyed by
+id, validated `target_bytes[i] <=` component-wise, consumed by erasure
+at the first `launch_prepared`, retired at a post-enqueue stream point;
+lease floors guard elastic-pool trim. Depth gate today:
+`in_flight_launches.len() >= configured_max_in_flight()` (2..=3);
+driver `kSchedulerMaxInFlight=3`, `kUploadStagingDepth=4`.
+
+**M2 — group-deferred settlement (what actually moves).** Per-wave
+publication is untouched: epilogue, commit-bump, D2H copies, doorbells,
+settle kernel, `publications_done`, endpoint wakes, AND the per-wave
+outcome latch + terminal-cell writes (commit words are per-wave-volatile
+— the next wave's `k_pull_validate` rewrites the same instance snapshot,
+so outcomes MUST latch per wave; terminals are cheap host writes and
+keep engine-visible truth fresh). Deferred to the group tail, per wave a
+small record {completion (wait_id, epoch), `cuda_settled` payload,
+instance-close fences}: the batch completion notify, `cuda_settled`
+emission, fence release. Arenas return per-wave (unchanged pressure).
+
+Drain protocol (stream- and order-agnostic, monotonic counters under a
+tiny accumulator mutex touched only by host-func callbacks, the lane's
+synchronous settle paths, and FlushSettle): every `finish` assigns a
+wave seq and increments `expected`; every callback appends its record
+and increments `arrived`; a defer=0 callback, ANY latched RETRY, a
+synchronous settle (L1 whole-batch RETRY / L2 whole-batch FAILED /
+launch reject), or an engine FlushSettle **arms** the drain with
+`drain_up_to = expected`; whoever brings `arrived >= drain_up_to`
+drains all records with seq <= drain_up_to in seq order. Rules:
+- **retry-auto-flush**: a wave whose latched outcomes include any RETRY
+  arms an immediate drain — RETRY discovery latency stays exactly
+  today's, and the makeup gate can never deadlock against a deferred
+  tail (audit §5.1 resolved).
+- k=1, riders, makeups, shutdown-drain batches always post defer=0; a
+  defer=0 callback with an empty accumulator takes today's settle path
+  byte-for-byte (k=1 unchanged).
+- Engine flush points (spurious flushes are harmless — they only settle
+  early): stopping; frame truncate; lane leave/terminate; prepare
+  IMPOSSIBLE/Err rejects; drops that empty a planned wave; plan Park
+  while a deferred group is open.
+
+Engine: `PieLaunchDesc.reserved0` → `settle_defer: u32` (0|1), ABI
+version 12→13, validator relaxed, header + C++ regenerated from the one
+tree. FramePolicy's dispatch plan gains the defer decision (wave j of a
+sealed frame defers iff a later non-empty wave of that frame remains);
+the worker tracks `deferred_open` and posts `LaneRequest::FlushSettle`
+at the flush points. Depth gate becomes group-aware: count distinct
+settle groups (defer=0 batches each count alone) so a k-wave group can
+always post its tail (R1); staging beyond `kUploadStagingDepth` merely
+re-serializes uploads. `retire_ready_launches` then pops the whole
+group in one pass (one retire→plan→dispatch round trip per frame
+instead of per wave — the measured 0.4–1 ms × (k−1) cadence line).
+
+**M3 — frame-level prepare.** At the first dispatch of a sealed frame
+the worker computes the frame-union demand (component-wise max of
+`AdmissionWatermark::demand` over ALL the frame's queued fires — the
+fields are high-water marks, so union = max) and runs ONE
+`driver_lane.prepare`; the lease is held: a `launch_prepared` whose desc
+says `settle_defer=1` validates against the lease WITHOUT consuming it;
+the tail (defer=0) consumes it and schedules today's stream-point
+retirement, so lease floors protect the elastic pool for the whole
+frame (R14). FlushSettle also retires a held lease (truncation).
+Later waves skip prepare entirely — no per-wave demand scan, no
+per-wave lease-less `commit_cuda_arena_targets_atomically`. Frame-union
+EXHAUSTED/IMPOSSIBLE now surfaces before wave 0 posts — §6.1's
+"reservation covers all k steps" made literal, closing audit §5.2.
+TP>1: prepare stays UNSUPPORTED → unchanged. Watermark `covers()` keeps
+skipping redundant prepares across frames.
+
+Gates for the pair: engine units green; k=1 oracles byte-exact vs
+current dumps; k∈{2,3} oracles exact; 3 consecutive 2048-fleets; zero
+watchdog; `PIE_FIRE_FORCE_RETRY` battery exercising retry-auto-flush;
+then the decisive k=2/3 vs k=1 re-measurement (k>1 must now win).

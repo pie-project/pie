@@ -17,7 +17,8 @@ use pie_driver_abi::{
     PieBytes, PieChannelEndpointBinding, PieDriver, PieDriverCaps, PieDriverCreateDesc,
     PieLaunchPrepareResult, PieModelLoadDesc, pie_cuda_bind_instance, pie_cuda_close_channel,
     pie_cuda_close_instance, pie_cuda_copy_kv, pie_cuda_copy_state, pie_cuda_create,
-    pie_cuda_destroy, pie_cuda_encode, pie_cuda_launch, pie_cuda_launch_prepared,
+    pie_cuda_destroy, pie_cuda_encode, pie_cuda_flush_settlement, pie_cuda_launch,
+    pie_cuda_launch_prepared,
     pie_cuda_load_model, pie_cuda_prepare_launch, pie_cuda_register_channel,
     pie_cuda_register_program, pie_cuda_release_launch, pie_cuda_resize_pool,
 };
@@ -201,6 +202,13 @@ impl CudaDriverHandle {
         sync_status(
             unsafe { pie_cuda_release_launch(self.driver, lease.id) },
             "pie_cuda_release_launch",
+        )
+    }
+
+    fn flush_settlement(&mut self) -> Result<()> {
+        sync_status(
+            unsafe { pie_cuda_flush_settlement(self.driver) },
+            "pie_cuda_flush_settlement",
         )
     }
 
@@ -459,6 +467,10 @@ impl CudaDriver {
             ));
         }
         self.leader.release_launch(lease)
+    }
+
+    pub fn flush_settlement(&mut self) -> Result<()> {
+        self.leader.flush_settlement()
     }
 
     pub fn encode(&mut self, plan: &mut MediaEncodePlan) -> Result<SubmissionCompletion> {

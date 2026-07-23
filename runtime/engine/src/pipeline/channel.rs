@@ -752,6 +752,17 @@ impl ChannelCell {
         (self.device_reserved_tail, consumed)
     }
 
+    /// Frame validation (Vesuvius, k > 1): a device-only ring's structural
+    /// backlog — publish tickets reserved by accepted unsettled fires minus
+    /// consume tickets likewise reserved. The worst-case occupancy the ring
+    /// reaches once every reserved fire settles, before anything not yet
+    /// submitted consumes — deterministic at submit time, never a function
+    /// of drain timing.
+    pub fn device_ring_backlog(&self) -> u64 {
+        self.device_reserved_tail
+            .saturating_sub(self.device_reserved_head)
+    }
+
     /// Frame validation (Vesuvius, k > 1): whether the host side knows a
     /// committed value exists for a latest-value (read-only-bound) channel.
     pub fn has_committed_front(&self) -> bool {

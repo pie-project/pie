@@ -131,6 +131,7 @@ pub(crate) fn build_batch_request(
             channel_expected_head,
             channel_expected_tail,
             channel_ticket_indptr: vec![0, channel_ticket_len],
+            settle_defer: false,
         };
     }
     let elide_decode_masks = requests.iter().all(|req| {
@@ -204,6 +205,7 @@ pub(crate) fn build_batch_request(
             channel_expected_head,
             channel_expected_tail,
             channel_ticket_indptr,
+            settle_defer: false,
         }
     })
 }

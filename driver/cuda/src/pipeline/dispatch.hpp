@@ -235,6 +235,12 @@ class Dispatch {
 
     void abort(StagedLaunch& launch, cudaStream_t stream) noexcept;
 
+    /// Drain every parked settle_defer record (frame-group settlement) and
+    /// arm the last in-flight callback to self-drain if some have not yet
+    /// arrived. Called by the synchronous settle paths and the engine's
+    /// truncation flush; spurious calls only settle early, never wrongly.
+    void flush_deferred_settlement() noexcept;
+
     bool launch_has_attention_stages(
         const pie_native::LaunchView& view) const;
 

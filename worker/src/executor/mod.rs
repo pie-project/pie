@@ -1775,6 +1775,9 @@ impl ExecutorActor {
             channel_expected_head: merged.channel_expected_head,
             channel_expected_tail: merged.channel_expected_tail,
             channel_ticket_indptr: merged.channel_ticket_indptr,
+            // The remote wire carries no frame-group marker: remote launches
+            // always settle per-wave.
+            settle_defer: false,
         };
         let completion = match self.backend.launch(&submission) {
             Ok(completion) => completion,

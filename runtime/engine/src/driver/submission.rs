@@ -25,4 +25,9 @@ pub struct LaunchSubmission {
     pub channel_expected_head: Vec<u64>,
     pub channel_expected_tail: Vec<u64>,
     pub channel_ticket_indptr: Vec<u32>,
+    /// Frame-group settlement marker (`PieLaunchDesc.settle_defer`): `true`
+    /// on every non-tail wave of a sealed frame; the tail (and every k=1 /
+    /// rider / makeup / shutdown-drain launch) posts `false` and drains the
+    /// group's deferred settlement.
+    pub settle_defer: bool,
 }

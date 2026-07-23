@@ -53,8 +53,13 @@
  *
  * v12: finalized launches can be prepared into a driver-owned elastic-memory
  * lease and then launched or released exactly once.
+ *
+ * v13: `PieLaunchDesc.settle_defer` (was `reserved0`) marks a launch whose
+ * heavy settlement (batch completion notify, `cuda_settled`, instance-close
+ * fences) may be deferred and drained by the next settle-now launch of its
+ * frame group; a held lease is consumed only by a settle-now launch.
  */
-#define PIE_DRIVER_ABI_VERSION 12
+#define PIE_DRIVER_ABI_VERSION 13
 
 #define PIE_MODEL_COMPONENT_FULL 0
 
@@ -487,9 +492,14 @@ typedef struct PieMaskWordsDesc {
 typedef struct PieLaunchDesc {
   uint32_t abi_version;
   /**
-   * Reserved; must be zero.
+   * `1` = the driver may defer this launch's heavy settlement (batch
+   * completion notify, `cuda_settled`, instance-close fences) until the
+   * frame group's next settle-now launch drains it; per-wave publication
+   * (mirror copies, doorbells, waiter wakes, terminal cells) is never
+   * deferred. `0` = settle now, draining any deferred predecessors.
+   * Values above `1` are invalid.
    */
-  uint32_t reserved0;
+  uint32_t settle_defer;
   /**
    * Bound instance ids, one per fire/program in scheduler order.
    */

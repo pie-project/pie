@@ -244,6 +244,17 @@ impl DriverBackend {
         }
     }
 
+    /// Drain the driver's parked frame-group settlement records (M2). A
+    /// no-op everywhere but CUDA: `settle_defer` is advisory, and every
+    /// other backend settles per-wave already.
+    pub fn flush_settlement(&mut self) -> Result<()> {
+        match self {
+            #[cfg(feature = "driver-cuda")]
+            Self::Cuda(driver) => driver.flush_settlement(),
+            _ => Ok(()),
+        }
+    }
+
     pub fn encode(&mut self, plan: &mut MediaEncodePlan) -> Result<SubmissionCompletion> {
         match self {
             Self::Dummy(driver) => driver.encode(plan),

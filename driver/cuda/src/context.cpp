@@ -186,6 +186,7 @@ struct LaunchScratch {
         view.channel_expected_tail = pie_native::slice_from_u64(launch.channel_expected_tail.ptr, launch.channel_expected_tail.len);
         view.channel_ticket_indptr = pie_native::slice_from_u32(launch.channel_ticket_indptr.ptr, launch.channel_ticket_indptr.len);
         view.has_user_mask = launch.has_user_mask != 0;
+        view.settle_defer = launch.settle_defer != 0;
         view.image_grids = pie_native::slice_from_u32(launch.image_grids.ptr, launch.image_grids.len);
         view.image_pixels = pie_native::slice_from_u8(launch.image_pixels.ptr, launch.image_pixels.len);
         view.image_pixel_indptr = pie_native::slice_from_u32(launch.image_pixel_indptr.ptr, launch.image_pixel_indptr.len);
@@ -336,6 +337,7 @@ class Context::Impl {
         std::uint64_t lease_id,
         PieCompletion completion);
     int release_launch(std::uint64_t lease_id);
+    int flush_settlement();
     int encode(const PieEncodeDesc& encode, PieCompletion completion);
     int copy_kv(const PieKvCopyDesc& copy, PieCompletion completion);
     int copy_state(const PieStateCopyDesc& copy, PieCompletion completion);
@@ -1811,6 +1813,11 @@ int Context::Impl::release_launch(std::uint64_t lease_id) {
         : PIE_STATUS_INVALID_ARGUMENT;
 }
 
+int Context::Impl::flush_settlement() {
+    registry_->dispatch().flush_deferred_settlement();
+    return PIE_STATUS_OK;
+}
+
 int Context::Impl::register_program(const PieProgramDesc& program, std::uint64_t* program_id) {
     if (registry_ == nullptr) return PIE_STATUS_CLOSED;
     if (is_tp_follower()) return PIE_STATUS_UNSUPPORTED;
@@ -1862,6 +1869,7 @@ int Context::Impl::launch_impl(
     const PieLaunchDesc& launch,
     PieCompletion completion,
     std::optional<std::uint64_t> lease_id) {
+    const bool hold_lease = launch.settle_defer != 0;
     std::optional<LaunchLease> lease;
     if (lease_id.has_value()) {
         std::lock_guard lock(lease_mutex_);
@@ -1870,7 +1878,10 @@ int Context::Impl::launch_impl(
             return PIE_STATUS_INVALID_ARGUMENT;
         }
         lease = found->second;
-        launch_leases_.erase(found);
+        // A settle_defer wave validates against its frame's held lease
+        // without consuming it (M3 frame-level prepare); the frame tail
+        // (settle-now) consumes it exactly as a lone launch does today.
+        if (!hold_lease) launch_leases_.erase(found);
     }
     pie_cuda_driver::ops::ScopedRuntimeQuantContext quant_scope(
         runtime_quant_context_);
@@ -1906,11 +1917,13 @@ int Context::Impl::launch_impl(
                         "prepared launch mappings were trimmed below lease floor");
                 }
             }
-            {
-                std::lock_guard lock(lease_mutex_);
-                in_flight_leases_.emplace(*lease_id, *lease);
+            if (!hold_lease) {
+                {
+                    std::lock_guard lock(lease_mutex_);
+                    in_flight_leases_.emplace(*lease_id, *lease);
+                }
+                lease_in_flight = true;
             }
-            lease_in_flight = true;
         } else {
             const auto commit =
                 pie_cuda_driver::commit_cuda_arena_targets_atomically(
@@ -1975,6 +1988,10 @@ int Context::Impl::launch_impl(
             runtime_.notify(
                 runtime_.ctx, completion.wait_id, completion.target_epoch);
         }
+        // A synchronous settle is a settle-now event for the whole group:
+        // drain (or arm) any deferred predecessors so their completions
+        // cannot outlive a makeup replay decision.
+        registry_->dispatch().flush_deferred_settlement();
         return PIE_STATUS_OK;
     } catch (const std::exception& e) {
         std::cerr << "[pie-driver-cuda] launch: " << e.what() << "\n";
@@ -2008,6 +2025,7 @@ int Context::Impl::launch_impl(
             runtime_.notify(
                 runtime_.ctx, completion.wait_id, completion.target_epoch);
         }
+        registry_->dispatch().flush_deferred_settlement();
         return PIE_STATUS_OK;
     }
 }
@@ -2408,6 +2426,10 @@ int Context::launch_prepared(
 
 int Context::release_launch(std::uint64_t lease_id) {
     return impl_->release_launch(lease_id);
+}
+
+int Context::flush_settlement() {
+    return impl_->flush_settlement();
 }
 
 int Context::encode(const PieEncodeDesc& encode, PieCompletion completion) {

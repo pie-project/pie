@@ -177,6 +177,15 @@ extern "C" int32_t pie_cuda_launch_prepared(
     }
 }
 
+extern "C" int32_t pie_cuda_flush_settlement(PieDriver* driver) {
+    if (driver == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
+    try {
+        return as_context(driver)->flush_settlement();
+    } catch (...) {
+        return PIE_STATUS_DRIVER_ERROR;
+    }
+}
+
 extern "C" int32_t pie_cuda_release_launch(
     PieDriver* driver,
     std::uint64_t lease_id) {

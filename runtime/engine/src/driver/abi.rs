@@ -217,7 +217,7 @@ impl<'a> LaunchDescBorrow<'a> {
         let masks = MaskWordsStorage::from_plan(plan);
         let raw = pie_driver_abi::PieLaunchDesc {
             abi_version: PIE_DRIVER_ABI_VERSION,
-            reserved0: 0,
+            settle_defer: u32::from(submission.settle_defer),
             instance_ids: u64_slice(&submission.instance_ids),
             terminal_cells: PieTerminalCellPtrSlice {
                 ptr: submission.terminal_cells.as_ptr(),

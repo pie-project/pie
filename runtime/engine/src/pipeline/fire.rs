@@ -1183,7 +1183,14 @@ fn validate_frame<C: FireContext>(
         consumes: usize,
         publishes: usize,
     }
+    struct DeviceRingUse {
+        global_id: u64,
+        capacity: u64,
+        pressure: u64,
+    }
     let mut uses: std::collections::HashMap<usize, ChannelUse> = std::collections::HashMap::new();
+    let mut device_rings: std::collections::HashMap<usize, DeviceRingUse> =
+        std::collections::HashMap::new();
     for &(_, rep) in fired {
         let fwd: Resource<ForwardPass> = Resource::new_borrow(rep);
         let pass = ctx.resources().get(&fwd)?;
@@ -1201,6 +1208,38 @@ fn validate_frame<C: FireContext>(
             });
             entry.consumes += usize::from(consume);
             entry.publishes += usize::from(publish);
+
+            // *device-only ring* occupancy, walked in slot order: the device
+            // publish gate admits a publish only while occupancy stays below
+            // capacity (+1 when the same fire also consumes) — an accepted
+            // frame that structurally exceeds it would jam into the makeup
+            // path until retry-budget exhaustion. Enforce the static mirror
+            // at submit: reserved backlog plus this frame's in-order net
+            // growth must fit the declared capacity. Consumes not yet
+            // reserved by any accepted fire grant no relief. Seeded
+            // descriptor channels are exempt (their occupancy is the seed
+            // protocol's, not the reserved-ticket ledger's).
+            if consume || publish {
+                let guard = cell.lock().unwrap();
+                if guard.role == Some(HostRole::None) && !guard.seeded {
+                    let ring = device_rings.entry(key).or_insert_with(|| DeviceRingUse {
+                        global_id: guard.global_id,
+                        capacity: u64::from(guard.capacity),
+                        pressure: guard.device_ring_backlog(),
+                    });
+                    if publish && ring.pressure >= ring.capacity + u64::from(consume) {
+                        return Ok(Err(format!(
+                            "pipeline: channel {}: frame would raise device-ring \
+                             occupancy past capacity {} (reserved backlog plus \
+                             in-frame publishes) — size device-only rings so every \
+                             frame's publish backlog fits",
+                            ring.global_id, ring.capacity,
+                        )));
+                    }
+                    ring.pressure += u64::from(publish);
+                    ring.pressure = ring.pressure.saturating_sub(u64::from(consume));
+                }
+            }
         }
     }
     for entry in uses.values() {
@@ -1258,9 +1297,9 @@ fn validate_frame<C: FireContext>(
                 }
             }
             _ => {
-                // Device-only / seeded descriptor channels: device-advanced
-                // or seeded by construction; remaining per-lane error classes
-                // surface at prepare, before the frame is accepted.
+                // Device-only rings are checked in the slot-order occupancy
+                // walk above; seeded descriptor channels are governed by the
+                // seed protocol (`SeedAlreadyStaged` guards mutation).
             }
         }
     }

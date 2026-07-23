@@ -308,7 +308,7 @@ inline int validate_launch_desc(const PieLaunchDesc* desc) noexcept {
     if (desc == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
     int status = validate_version(desc->abi_version);
     if (status != PIE_STATUS_OK) return status;
-    if (desc->reserved0 != 0 || desc->single_token_mode > 1 ||
+    if (desc->settle_defer > 1 || desc->single_token_mode > 1 ||
         desc->has_user_mask > 1) {
         return PIE_STATUS_INVALID_ARGUMENT;
     }

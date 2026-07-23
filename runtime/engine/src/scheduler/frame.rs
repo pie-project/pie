@@ -197,6 +197,11 @@ pub(super) enum FramePlan {
 
 pub(super) struct FramePolicy {
     k: usize,
+    /// Whether the wave returned by the LAST `plan_dispatch` call belongs to
+    /// a sealed frame with a later still-queued wave — i.e. its launches may
+    /// carry `settle_defer = 1` (M2 frame-group settlement). Makeup replays,
+    /// 1-slot frames, and riders never defer.
+    last_plan_defers: bool,
     max_wave_tokens: usize,
     max_wave_rows: usize,
     /// THE wait-set plus each lane's queued frames. BTreeMap for
@@ -226,6 +231,7 @@ impl FramePolicy {
             k,
             max_wave_tokens,
             max_wave_rows,
+            last_plan_defers: false,
             lanes: BTreeMap::new(),
             sealed: VecDeque::new(),
             pending_binds: BTreeMap::new(),
@@ -239,6 +245,12 @@ impl FramePolicy {
     /// Whether this deployment runs 1-slot frames (`PIE_FRAME_SIZE=1`, the
     /// default): a frame is a wave, and the worker synthesizes a per-fire
     /// stamp at admission instead of the guest submitting frames.
+    /// See [`FramePolicy::last_plan_defers`]: whether the most recent
+    /// `plan_dispatch` wave may post with `settle_defer = 1`.
+    pub fn last_plan_defers_settlement(&self) -> bool {
+        self.last_plan_defers
+    }
+
     pub fn single_slot(&self) -> bool {
         self.k == 1
     }
@@ -544,6 +556,9 @@ impl FramePolicy {
         }
         self.lanes
             .retain(|_, lane| lane.awaited || !lane.frames.is_empty());
+        if sealed_any {
+            self.last_plan_defers = false;
+        }
         sealed_any.then(|| FramePlan::Dispatch(Vec::new()))
     }
 
@@ -690,6 +705,7 @@ impl FramePolicy {
                         .copied()
                         .collect();
                     makeups.sort_unstable();
+                    self.last_plan_defers = false;
                     return FramePlan::Dispatch(makeups);
                 }
                 if !frame.open_remaining.is_empty() {
@@ -699,6 +715,13 @@ impl FramePolicy {
                         .filter(|fire_id| frame.open_remaining.contains(fire_id))
                         .copied()
                         .collect();
+                    // The wave defers settlement only while a later wave of
+                    // this frame still has queued fires to become the tail.
+                    let defers = frame.waves[wave + 1..]
+                        .iter()
+                        .flatten()
+                        .any(|fire_id| still_queued.contains(fire_id));
+                    self.last_plan_defers = defers;
                     return FramePlan::Dispatch(ordered);
                 }
                 if frame.next_wave < frame.waves.len() {

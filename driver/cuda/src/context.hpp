@@ -40,6 +40,7 @@ class Context {
         std::uint64_t lease_id,
         PieCompletion completion);
     int release_launch(std::uint64_t lease_id);
+    int flush_settlement();
     int encode(const PieEncodeDesc& encode, PieCompletion completion);
     int copy_kv(const PieKvCopyDesc& copy, PieCompletion completion);
     int copy_state(const PieStateCopyDesc& copy, PieCompletion completion);

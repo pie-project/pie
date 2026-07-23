@@ -20,7 +20,12 @@ use crate::geometry::GeometryClass;
 ///
 /// v12: finalized launches can be prepared into a driver-owned elastic-memory
 /// lease and then launched or released exactly once.
-pub const PIE_DRIVER_ABI_VERSION: u32 = 12;
+///
+/// v13: `PieLaunchDesc.settle_defer` (was `reserved0`) marks a launch whose
+/// heavy settlement (batch completion notify, `cuda_settled`, instance-close
+/// fences) may be deferred and drained by the next settle-now launch of its
+/// frame group; a held lease is consumed only by a settle-now launch.
+pub const PIE_DRIVER_ABI_VERSION: u32 = 13;
 pub const PIE_MODEL_COMPONENT_FULL: u32 = 0;
 pub const PIE_MODEL_COMPONENT_TEXT: u32 = 1;
 pub const PIE_MODEL_COMPONENT_ENCODE: u32 = 2;
@@ -526,8 +531,13 @@ pub struct PieInstanceBinding {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PieLaunchDesc {
     pub abi_version: u32,
-    /// Reserved; must be zero.
-    pub reserved0: u32,
+    /// `1` = the driver may defer this launch's heavy settlement (batch
+    /// completion notify, `cuda_settled`, instance-close fences) until the
+    /// frame group's next settle-now launch drains it; per-wave publication
+    /// (mirror copies, doorbells, waiter wakes, terminal cells) is never
+    /// deferred. `0` = settle now, draining any deferred predecessors.
+    /// Values above `1` are invalid.
+    pub settle_defer: u32,
     /// Bound instance ids, one per fire/program in scheduler order.
     pub instance_ids: PieU64Slice,
     /// Stable terminal control cell addresses, one per `instance_ids` member.
@@ -615,7 +625,7 @@ impl Default for PieLaunchDesc {
     fn default() -> Self {
         Self {
             abi_version: PIE_DRIVER_ABI_VERSION,
-            reserved0: 0,
+            settle_defer: 0,
             instance_ids: PieU64Slice::default(),
             terminal_cells: PieTerminalCellPtrSlice::default(),
             token_ids: PieU32Slice::default(),
@@ -1338,7 +1348,9 @@ pub fn validate_completion(
 /// for the declared element count.
 pub unsafe fn validate_launch_desc(desc: &PieLaunchDesc) -> PieAbiValidationResult {
     validate_pie_abi_version(desc.abi_version)?;
-    validate_reserved_zero("launch reserved0 must be zero", desc.reserved0)?;
+    if desc.settle_defer > 1 {
+        return Err(invalid_argument("launch settle_defer must be 0 or 1"));
+    }
     validate_u64_slice(desc.instance_ids, "launch instance_ids ptr/len mismatch")?;
     validate_terminal_cell_ptr_slice(
         desc.terminal_cells,
@@ -1995,6 +2007,7 @@ unsafe extern "C" {
         completion: PieCompletion,
     ) -> i32;
     pub fn pie_cuda_release_launch(driver: *mut PieDriver, lease_id: u64) -> i32;
+    pub fn pie_cuda_flush_settlement(driver: *mut PieDriver) -> i32;
     pub fn pie_cuda_encode(
         driver: *mut PieDriver,
         encode: *const PieEncodeDesc,
