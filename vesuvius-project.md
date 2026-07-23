@@ -68,10 +68,13 @@ size:
 - queried by the guest via `model.frame-size()` and adapted to, the same way
   guests adapt to `kv-page-size()`.
 
-Slow models (large, TP) may deploy k = 1; fast models on fast hardware may
-deploy k = 16 or 32. Guest programs must be *output-correct* for any k: k
-determines submission granularity and resource sizing, never token-level
-behavior.
+Keep k MINIMAL (amended by operator directive, 2026-07-22): with frames
+overlapping on-stream (Section 7) there is no boundary bubble to amortize,
+so k buys only host-cadence slack — enlarge it only when the host cannot
+keep up with the per-frame submit deadline. Typical deployments are k = 2
+or 3; slow models (large, TP) deploy k = 1. Guest programs must be
+*output-correct* for any k: k determines submission granularity and
+resource sizing, never token-level behavior.
 
 **Why this fixes the laggard problem.** The guest's response deadline
 stretches from "before the next wave" to "before the current frame drains".
@@ -380,14 +383,25 @@ Three consequences are load-bearing:
 
 - **The runtime must compose incrementally.** Frame f + 1 is assembled as
   submissions arrive during frame f's execution, or earlier if already
-  queued, and sealed at f's settlement, so composition cost overlaps GPU
+  queued, and sealed the moment the wait-all gate holds — during f's
+  execution, not at its settlement — so composition cost overlaps GPU
   execution. Waiting for the boundary to start composing would put today's
   compose cost on every boundary's critical path as a serial GPU gap.
-- **Launch-time trust replaces readiness observation.** Frame f + 1 launches
-  only after f completes, so every cross-frame channel input is published by
-  launch. The successor-readiness observation problem (the measured retry
-  waves, missing pipelines, and readiness inflation of Section 1) is deleted
-  by construction, and the driver's staging-depth constants simplify.
+- **Stream-order trust replaces readiness observation — and the launch-time
+  barrier.** (Amended by operator directive, 2026-07-22; supersedes the
+  original "frame f + 1 launches only after f completes.") Frame f + 1
+  launches BEHIND f on-stream: the device readiness gate orders dependent
+  fires by stream order and does not know about frame boundaries — the
+  f-last-wave → f+1-wave-0 dependency is structurally identical to an
+  intra-frame one, so frames overlap with no observation, no barrier, and
+  no boundary bubble. f + 1 seals the moment the wait-all gate holds
+  (normally during f's execution) and posts at the run-ahead depth;
+  admission stays conservative (it never counts resources an unsettled f
+  will free — the Section 5 cumulative-reservation pattern), and f's
+  settlement gates only resource reclamation, never a launch. The
+  successor-readiness observation problem (the measured retry waves,
+  missing pipelines, and readiness inflation of Section 1) remains deleted
+  by construction.
 - **Wave-1 publication latency is the schedule's hidden constant.** The
   interleave slack starts when frame f's first token becomes host-visible
   (Section 3.2); the doorbell/waker path must be fast relative to one step.
@@ -400,8 +414,11 @@ every awaited lane's oldest queued frame is arrival-complete; pending
 binds hold the seal; membership changes only through explicit events
 (bind, graceful close, terminate), never through arrival timing — which
 is what keeps admission's "no timing input" rule (Section 8) honest end
-to end. The sealed frame is immutable, and the seal happens at the prior
-frame's settlement. The laggard problem is solved by the k-times-looser
+to end. The sealed frame is immutable, and the seal happens EARLY — the moment
+the gate holds, normally while the prior frame executes (amended
+2026-07-22; the boundary seals atomically: every ready lane's front
+frame, partitioned only by the per-wave budgets, one frame per lane per
+boundary). The laggard problem is solved by the k-times-looser
 deadline of Section 2, not by refusing to wait: with a (k − 1)-step
 budget, healthy guests never make the seal wait (measured: zero watchdog
 reports across full 2,048-request fleets). A wedged — not merely slow —
