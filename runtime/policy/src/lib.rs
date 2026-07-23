@@ -13,6 +13,7 @@ mod lifecycle_v0_6;
 mod package;
 mod package_format;
 mod protocol;
+mod protocol_v0_6;
 mod registry;
 mod replay;
 mod state_store;
@@ -30,6 +31,13 @@ pub use package::{AttachedPolicy, PreparedPolicyResult};
 pub use package_format::{PackageError, PackageLimits, PolicyPackage};
 pub use pie_plex::Document;
 pub use protocol::ProtocolError;
+pub use protocol_v0_6::{
+    CacheEpisodeTrackerV0_6, NormalizedPlanV0_6, NormalizedRouteAssignmentV0_6,
+    NormalizedRoutePlanV0_6, OperationContextV0_6, OperationPlanV0_6, OpportunityTrackerV0_6,
+    ProtocolErrorV0_6, ProtocolLimitsV0_6, ReplayRecordV0_6, TraceOrderV0_6, normalized_plan_v0_6,
+    replay_record_v0_6, snapshot_ref_v0_6, validate_context_v0_6, validate_output_v0_6,
+    validate_snapshot_context_v0_6, working_set_v0_6,
+};
 pub use registry::{AttachmentRegistry, AttachmentSnapshot, RegistryError};
 pub use replay::{
     ReplayCommand, ReplayDivergence, ReplayError, ReplayOutcome, ReplayReport, ReplayRunner,

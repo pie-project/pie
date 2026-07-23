@@ -10,6 +10,9 @@
   - Phase 0 complete: contract, Rust semantic types, WIT, schemas, and registry
   - Phase 1 complete: trusted group/request state, lifecycle, revisions, quotas,
     cleanup, deduplication, and scope-conflict metrics
+  - Phase 2 complete: typed working sets, hard protocol bounds, direct plan
+    validation, snapshot binding, opportunity retry tracking, cache episodes,
+    and replay-order records
   - active runtime ABI remains v0.5 until Phase 3
 - Inputs:
   - [`plex.md`](plex.md), the implemented v0.5 contract
