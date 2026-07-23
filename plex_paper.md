@@ -165,9 +165,9 @@ This paper makes four contributions:
   adapters provide bounded execution, conditional policy-state commit, replacement, and
   engine-default fallback (\S\ref{sec:system}).
 \item \textbf{Evidence from policies and engines.} We map 87 papers to the
-  surface, implement 31 evidence-classified policy kernels, run one typed
-  fixture suite through the host and two adapter templates, and measure
-  validator and runtime overhead (\S\ref{sec:eval}).
+  surface, implement and independently audit 31 inspired policy adaptations,
+  run typed fixtures through the host, validate a live asynchronous vLLM
+  attachment, and measure validator and runtime overhead (\S\ref{sec:eval}).
 \end{itemize}
 
 \begin{figure}[t]
@@ -855,15 +855,15 @@ increment from negotiated standard mechanics, and (iv) residuals that change
 mechanics. A merge/split sensitivity analysis tests whether another operation
 boundary yields the same coverage with less authority.
 
-\paragraph{Reproducing policy kernels.}
-We implement all 31 candidates in the committed matrix. Each has pinned paper
-metadata, a component, a deterministic case, an expected result, named
-deferred mechanics, and one of the four evidence levels. Current results are
-classified conservatively as policy-kernel reproductions unless source-level
-differential evidence exists; the artifact does not infer parity from LOC.
-The existing five specifically cover group fairness, TTL-aware scheduling and
-cache policy, workflow-aware cache loading, E2 routing, and Helium's
-cache-aware critical-path scheduling with forced progress.
+\paragraph{Auditing policy adaptations.}
+We implement all 31 candidates in the committed matrix. Each has source-linked
+paper metadata, a component, a deterministic smoke case, an expected result,
+and named deferred mechanics. Four independent fidelity reviews found no
+faithful or faithful-with-deferred-mechanics reproduction: 17 have material
+semantic gaps and 14 implement a different core algorithm. We therefore label
+all 31 as inspired adaptations until pinned paper/artifact differential traces
+pass. The executable performance harness reports only paper-anchored proxy
+trends and never equates those ratios with the papers' end-to-end results.
 
 \paragraph{Coordinated policy.}
 A single package implements admission, routing, scheduling, cache policy, and
@@ -1006,10 +1006,11 @@ declaration.
 
 \paragraph{Contract versus implementation.}
 The typed contract, scoped state, package replacement, standard action
-validation, deterministic replay, and 31 policy kernels are implemented.
-Physical swap/migration/prefetch, live version-pinned engine integrations,
-control-plane provisioning, predictor training, and live workload results
-remain outside the current evidence and are named as deferred mechanics.
+validation, deterministic replay, 31 inspired policy adaptations, and a
+version-pinned asynchronous vLLM integration are implemented. Physical
+swap/migration/prefetch enactment, cluster routing/admission, control-plane
+provisioning, predictor training, and original paper-scale workloads remain
+outside the current evidence and are named explicitly.
 
 \section{Related Work}
 \label{sec:related}

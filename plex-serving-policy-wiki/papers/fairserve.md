@@ -46,10 +46,10 @@ Named datasets/workloads identified from the primary text or manual audit.
 
 - Component: `plex_paper_fairserve`
 - Operations: `admit`, `schedule`, `feedback`
-- Evidence: `policy-kernel-reproduction`
+- Evidence: `inspired-adaptation`
 - Validation: `passing`
 - Metadata: [`tests/policies/replications/fairserve/metadata.json`](../../tests/policies/replications/fairserve/metadata.json)
-- Deferred mechanics: production interference estimator
+- Deferred mechanics: production interaction and RPM estimator
 <!-- plex-v0.6-replication:end -->
 
 ## Suggested citation

@@ -46,7 +46,7 @@ No named public dataset was reliably confirmed; the workload description is cate
 
 - Component: `plex_paper_branch_regulation`
 - Operations: `admit`, `schedule`
-- Evidence: `policy-kernel-reproduction`
+- Evidence: `inspired-adaptation`
 - Validation: `passing`
 - Metadata: [`tests/policies/replications/branch-regulation/metadata.json`](../../tests/policies/replications/branch-regulation/metadata.json)
 - Deferred mechanics: simultaneous branch execution

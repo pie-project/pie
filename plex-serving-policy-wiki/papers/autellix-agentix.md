@@ -46,7 +46,7 @@ Named datasets/workloads identified from the primary text or manual audit.
 
 - Component: `plex_paper_agentix`
 - Operations: `schedule`, `feedback`
-- Evidence: `policy-kernel-reproduction`
+- Evidence: `inspired-adaptation`
 - Validation: `passing`
 - Metadata: [`tests/policies/replications/agentix/metadata.json`](../../tests/policies/replications/agentix/metadata.json)
 - Deferred mechanics: KV swap kernel; multi-step engine execution; full ATLAS DAG runtime

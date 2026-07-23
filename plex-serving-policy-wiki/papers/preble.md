@@ -47,7 +47,7 @@ Named datasets/workloads identified from the primary text or manual audit.
 
 - Component: `plex_paper_preble`
 - Operations: `route`
-- Evidence: `policy-kernel-reproduction`
+- Evidence: `inspired-adaptation`
 - Validation: `passing`
 - Metadata: [`tests/policies/replications/preble/metadata.json`](../../tests/policies/replications/preble/metadata.json)
 - Deferred mechanics: prefix replication; autoscaling

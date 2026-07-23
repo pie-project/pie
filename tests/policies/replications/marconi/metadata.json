@@ -3,7 +3,7 @@
   "title": "Marconi: Prefix Caching for the Era of Hybrid LLMs",
   "paper_version": "MLSys 2025 / arXiv 2411.19379",
   "source_url": "https://arxiv.org/abs/2411.19379",
-  "source_commit": null,
+  "source_commit": "08016617b1524e6bf6ac29b680641cc945bda7f0",
   "source_license": "public artifact available; implementation is independent",
   "component": "plex_paper_marconi",
   "implements": ["cache", "feedback"],
@@ -11,7 +11,7 @@
   "required_facts": ["reuse_probability_ppm", "recompute_flops"],
   "required_mechanics": [],
   "deferred_mechanics": ["hybrid-model kernel integration"],
-  "evidence_level": "policy-kernel-reproduction",
+  "evidence_level": "inspired-adaptation",
   "fixture_provenance": "paper formula and public artifact interface",
   "validation_status": "passing"
 }

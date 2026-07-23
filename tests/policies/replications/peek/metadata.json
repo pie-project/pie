@@ -3,7 +3,7 @@
   "title": "PEEK: Predictive Queue-Informed KV Cache Management for LLM Serving",
   "paper_version": "arXiv 2607.02525",
   "source_url": "https://arxiv.org/abs/2607.02525",
-  "source_commit": null,
+  "source_commit": "e8ca1173abc103c25c1e29e011df94b938d5305d",
   "source_license": "paper reference; no source copied",
   "component": "plex_paper_peek",
   "implements": [
@@ -23,7 +23,7 @@
   ],
   "required_mechanics": [],
   "deferred_mechanics": [],
-  "evidence_level": "policy-kernel-reproduction",
+  "evidence_level": "inspired-adaptation",
   "fixture_provenance": "independent reference model from the paper",
   "validation_status": "passing"
 }

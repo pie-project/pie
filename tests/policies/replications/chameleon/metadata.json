@@ -24,7 +24,7 @@
   ],
   "required_mechanics": [],
   "deferred_mechanics": [],
-  "evidence_level": "policy-kernel-reproduction",
+  "evidence_level": "inspired-adaptation",
   "fixture_provenance": "independent reference model from the paper",
   "validation_status": "passing"
 }

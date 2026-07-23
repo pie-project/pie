@@ -46,10 +46,10 @@ Named datasets/workloads identified from the primary text or manual audit.
 
 - Component: `plex_paper_smetric`
 - Operations: `route`
-- Evidence: `policy-kernel-reproduction`
+- Evidence: `inspired-adaptation`
 - Validation: `passing`
 - Metadata: [`tests/policies/replications/smetric/metadata.json`](../../tests/policies/replications/smetric/metadata.json)
-- Deferred mechanics: physical migration
+- Deferred mechanics: global-tier KV fetch
 <!-- plex-v0.6-replication:end -->
 
 ## Suggested citation

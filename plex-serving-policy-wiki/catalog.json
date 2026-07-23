@@ -11,7 +11,7 @@
     "lookup_title": "Parrot: Efficient Serving of LLM-based Applications with Semantic Variable",
     "year": 2024,
     "publication_date": "2024-05-30",
-    "venue": "arXiv preprint",
+    "venue": "OSDI 2024",
     "authors": [
       "Chaofan Lin",
       "Zhenhua Han",
@@ -33,7 +33,7 @@
     "openalex_url": "https://openalex.org/W4399252473",
     "metadata_source": "OpenAlex",
     "metadata_record_url": "https://openalex.org/W4399252473",
-    "artifact_url": null,
+    "artifact_url": "https://github.com/microsoft/ParrotServe",
     "datasets": [],
     "evaluation_workloads": [
       "Agent/workflow trace-driven evaluation; no named public dataset was reliably recovered"
@@ -41,7 +41,7 @@
     "dataset_note": "No named public dataset was reliably confirmed; the workload description is categorical and the paper's evaluation section is authoritative.",
     "abstract_source_available": true,
     "abstract_synopsis": "This work studies serving when one user-visible task spans multiple LLM calls, workflow nodes, or tool boundaries rather than one isolated request. The proposed policy centers on semantic-variable dag, dependency-aware placement and execution. The reported evaluation context includes Agent/workflow trace-driven evaluation; no named public dataset was reliably recovered.",
-    "reputation_evidence": "recent preprint; peer-review status is not confirmed by this catalog; author affiliations include Shanghai Jiao Tong University, Microsoft Research; no official public artifact was confirmed.",
+    "reputation_evidence": "peer-reviewed at OSDI 2024; author affiliations include Shanghai Jiao Tong University and Microsoft Research; a public implementation is available.",
     "suggested_citation": "Chaofan Lin, Zhenhua Han, C. R. Zhang, Yuqing Yang, Fan Yang, Chen Chen, et al. “Parrot: Efficient Serving of LLM-based Applications with Semantic Variable.” arXiv preprint, 2024. https://doi.org/10.48550/arxiv.2405.19888.",
     "plex_v0_6_replication": {
       "replication_id": "parrot",
@@ -50,7 +50,7 @@
         "route",
         "schedule"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "validation_status": "passing",
       "deferred_mechanics": [
         "general semantic-variable DAG runtime"
@@ -116,7 +116,7 @@
         "schedule",
         "cache"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "validation_status": "passing",
       "deferred_mechanics": [
         "physical swap implementation"
@@ -181,7 +181,7 @@
         "schedule",
         "feedback"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "validation_status": "passing",
       "deferred_mechanics": [
         "KV swap kernel",
@@ -251,7 +251,7 @@
         "cache",
         "feedback"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "validation_status": "passing",
       "deferred_mechanics": [
         "tool parser",
@@ -317,7 +317,7 @@
         "schedule",
         "cache"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "validation_status": "passing",
       "deferred_mechanics": [
         "CPU-GPU transfer overlap"
@@ -381,7 +381,7 @@
         "schedule",
         "feedback"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "validation_status": "passing",
       "deferred_mechanics": [
         "predictor training"
@@ -436,7 +436,7 @@
       "operations": [
         "schedule"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "validation_status": "passing",
       "deferred_mechanics": [
         "query-plan rewrite",
@@ -499,7 +499,7 @@
         "schedule",
         "feedback"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "validation_status": "passing",
       "deferred_mechanics": [
         "simultaneous branch execution"
@@ -571,7 +571,7 @@
         "cache",
         "feedback"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "validation_status": "passing",
       "deferred_mechanics": [
         "physical pause and migration"
@@ -645,7 +645,7 @@
         "cache",
         "feedback"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "validation_status": "passing",
       "deferred_mechanics": [
         "proactive scaling"
@@ -753,7 +753,7 @@
       "operations": [
         "route"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "validation_status": "passing",
       "deferred_mechanics": [],
       "metadata_path": "tests/policies/replications/conserve/metadata.json"
@@ -813,10 +813,10 @@
       "operations": [
         "route"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "validation_status": "passing",
       "deferred_mechanics": [
-        "physical migration"
+        "global-tier KV fetch"
       ],
       "metadata_path": "tests/policies/replications/smetric/metadata.json"
     }
@@ -876,7 +876,7 @@
         "route",
         "feedback"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "validation_status": "passing",
       "deferred_mechanics": [
         "predictor training",
@@ -1037,7 +1037,7 @@
         "schedule",
         "cache"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "validation_status": "passing",
       "deferred_mechanics": [
         "physical work stealing"
@@ -1188,7 +1188,7 @@
         "schedule",
         "feedback"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "validation_status": "passing",
       "deferred_mechanics": [],
       "metadata_path": "tests/policies/replications/vtc/metadata.json"
@@ -1255,10 +1255,10 @@
         "schedule",
         "feedback"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "validation_status": "passing",
       "deferred_mechanics": [
-        "production interference estimator"
+        "production interaction and RPM estimator"
       ],
       "metadata_path": "tests/policies/replications/fairserve/metadata.json"
     }
@@ -1327,7 +1327,7 @@
         "schedule",
         "feedback"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "validation_status": "passing",
       "deferred_mechanics": [],
       "metadata_path": "tests/policies/replications/dlpm/metadata.json"
@@ -1609,7 +1609,7 @@
         "schedule",
         "feedback"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "validation_status": "passing",
       "deferred_mechanics": [],
       "metadata_path": "tests/policies/replications/qlm/metadata.json"
@@ -1720,7 +1720,7 @@
         "route",
         "schedule"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "validation_status": "passing",
       "deferred_mechanics": [
         "replica provisioning"
@@ -1821,7 +1821,7 @@
         "schedule",
         "cache"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "validation_status": "passing",
       "deferred_mechanics": [],
       "metadata_path": "tests/policies/replications/chameleon/metadata.json"
@@ -1880,7 +1880,7 @@
         "schedule",
         "cache"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "validation_status": "passing",
       "deferred_mechanics": [],
       "metadata_path": "tests/policies/replications/peek/metadata.json"
@@ -2183,7 +2183,7 @@
         "admit",
         "schedule"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "validation_status": "passing",
       "deferred_mechanics": [
         "simultaneous branch execution"
@@ -2253,7 +2253,7 @@
         "schedule",
         "feedback"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "validation_status": "passing",
       "deferred_mechanics": [
         "latency-distribution estimator"
@@ -2312,7 +2312,7 @@
       "operations": [
         "route"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "validation_status": "passing",
       "deferred_mechanics": [
         "prefix replication",
@@ -2360,17 +2360,15 @@
     "artifact_url": "https://github.com/blitz-serving/blitz-router",
     "datasets": [
       "Alibaba Bailian Qwen ChatBot, Agent, and Coder traces",
-      "Kimi ToolAgent trace",
-      "Azure LLM inference trace"
+      "Kimi ToolAgent trace"
     ],
     "evaluation_workloads": [
       "Alibaba Bailian Qwen ChatBot, Agent, and Coder traces",
-      "Kimi ToolAgent trace",
-      "Azure LLM inference trace"
+      "Kimi ToolAgent trace"
     ],
     "dataset_note": "Named datasets/workloads identified from the primary text or manual audit.",
     "abstract_source_available": true,
-    "abstract_synopsis": "This work studies how requests or state should be placed across replicas, tiers, models, or heterogeneous resources. The proposed policy centers on multiplicative cache/load score. The reported evaluation context includes Alibaba Bailian Qwen ChatBot, Agent, and Coder traces, Kimi ToolAgent trace, Azure LLM inference trace.",
+    "abstract_synopsis": "This work studies how requests or state should be placed across replicas, tiers, models, or heterogeneous resources. The proposed policy centers on multiplicative cache/load score. The reported evaluation context includes Alibaba Bailian Qwen ChatBot, Agent, and Coder traces and the Kimi ToolAgent trace.",
     "reputation_evidence": "strong publication signal from a selective systems/ML venue (OSDI 2026); author affiliations include Shanghai Jiao Tong University, Alibaba Cloud; a public implementation or artifact is linked.",
     "suggested_citation": "Dingyan Zhang, Jinbo Han, Kaixi Zhang, Xingda Wei, Sijie Shen, Chenguang Fang, et al. “Simple is Better: Multiplication May Be All You Need for LLM Request Scheduling.” OSDI 2026, 2026. https://arxiv.org/abs/2603.15202.",
     "plex_v0_6_replication": {
@@ -2379,9 +2377,11 @@
       "operations": [
         "route"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "validation_status": "passing",
-      "deferred_mechanics": [],
+      "deferred_mechanics": [
+        "two-phase hotspot detector"
+      ],
       "metadata_path": "tests/policies/replications/lmetric/metadata.json"
     }
   },
@@ -2438,7 +2438,7 @@
       "operations": [
         "route"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "validation_status": "passing",
       "deferred_mechanics": [
         "physical migration"
@@ -2501,7 +2501,7 @@
         "route",
         "feedback"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "validation_status": "passing",
       "deferred_mechanics": [
         "physical migration"
@@ -2632,15 +2632,29 @@
     "openalex_url": "https://openalex.org/W7165219013",
     "metadata_source": "OpenAlex",
     "metadata_record_url": "https://openalex.org/W7165219013",
-    "artifact_url": null,
-    "datasets": [],
-    "evaluation_workloads": [
-      "Multi-replica or heterogeneous-cluster trace-driven workloads; no named public dataset was reliably recovered"
+    "artifact_url": "https://github.com/AKafakA/route-balance",
+    "datasets": [
+      "RewardBench",
+      "CodeUltraFeedback",
+      "BeaverTails",
+      "LLM-Blender",
+      "LMSYS-Chat-1M",
+      "GSM8K",
+      "SQuAD"
     ],
-    "dataset_note": "No named public dataset was reliably confirmed; the workload description is categorical and the paper's evaluation section is authoritative.",
+    "evaluation_workloads": [
+      "RewardBench",
+      "CodeUltraFeedback",
+      "BeaverTails",
+      "LLM-Blender",
+      "LMSYS-Chat-1M",
+      "GSM8K",
+      "SQuAD"
+    ],
+    "dataset_note": "Named datasets are listed in the paper evaluation and public artifact.",
     "abstract_source_available": true,
-    "abstract_synopsis": "This work studies how requests or state should be placed across replicas, tiers, models, or heterogeneous resources. The proposed policy centers on joint model routing and load balancing on heterogeneous fleets. The reported evaluation context includes Multi-replica or heterogeneous-cluster trace-driven workloads; no named public dataset was reliably recovered.",
-    "reputation_evidence": "recent preprint; peer-review status is not confirmed by this catalog; author affiliations were not reliably resolved; no official public artifact was confirmed.",
+    "abstract_synopsis": "This work studies how requests or state should be placed across replicas, tiers, models, or heterogeneous resources. The proposed policy centers on joint model routing and load balancing on heterogeneous fleets. The evaluation uses RewardBench, CodeUltraFeedback, BeaverTails, LLM-Blender, LMSYS-Chat-1M, GSM8K, and SQuAD.",
+    "reputation_evidence": "recent preprint; peer-review status is not confirmed by this catalog; a public implementation is available.",
     "suggested_citation": "Wei Da, Evangelia Kalyvianaki. “RouteBalance: Fused Model Routing and Load Balancing for Heterogeneous LLM Serving.” arXiv preprint, 2026. https://arxiv.org/abs/2606.17949.",
     "plex_v0_6_replication": {
       "replication_id": "routebalance",
@@ -2648,7 +2662,7 @@
       "operations": [
         "route"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "validation_status": "passing",
       "deferred_mechanics": [
         "replica provisioning"
@@ -3387,7 +3401,7 @@
       "operations": [
         "cache"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "validation_status": "passing",
       "deferred_mechanics": [],
       "metadata_path": "tests/policies/replications/ragcache/metadata.json"
@@ -3444,7 +3458,7 @@
         "cache",
         "feedback"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "validation_status": "passing",
       "deferred_mechanics": [
         "hybrid-model kernel integration"
@@ -3502,7 +3516,7 @@
         "cache",
         "feedback"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "validation_status": "passing",
       "deferred_mechanics": [
         "physical tier promotion"

@@ -3,15 +3,25 @@
   "title": "Fairness in Serving Large Language Models",
   "paper_version": "OSDI 2024 / arXiv 2401.00588",
   "source_url": "https://arxiv.org/abs/2401.00588",
-  "source_commit": null,
+  "source_commit": "192c2e",
   "source_license": "public artifact available; implementation is independent",
   "component": "plex_paper_vtc",
   "implements": ["schedule", "feedback"],
-  "policy_kernel": ["per-client virtual-token counters", "observed input/output-token charging"],
-  "required_facts": ["client_id", "input_tokens", "output_tokens"],
+  "policy_kernel": [
+    "per-client virtual-token counters",
+    "returning-client counter lift",
+    "dispatch input and decode output charging"
+  ],
+  "required_facts": [
+    "client_id",
+    "dispatch_input_tokens",
+    "input_weight",
+    "output_tokens",
+    "output_weight"
+  ],
   "required_mechanics": [],
   "deferred_mechanics": [],
-  "evidence_level": "policy-kernel-reproduction",
+  "evidence_level": "inspired-adaptation",
   "fixture_provenance": "paper formula and public artifact interface",
   "validation_status": "passing"
 }

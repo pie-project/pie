@@ -1,0 +1,603 @@
+{
+  "schema_version": 1,
+  "reviewed_at": "2026-07-23",
+  "reviewers": [
+    "workflow-fidelity",
+    "fairness-fidelity",
+    "cache-fidelity",
+    "routing-fidelity"
+  ],
+  "summary": {
+    "faithful": 0,
+    "faithful-with-deferred-mechanics": 0,
+    "material-semantic-gap": 17,
+    "incorrect": 14
+  },
+  "entries": [
+    {
+      "id": "agentix",
+      "classification": "material-semantic-gap",
+      "confidence": "high",
+      "summary": "Group attained-service ordering is recognizable, but PLAS queue bands, quanta, demotion, starvation reset, and ATLAS critical-path state are absent.",
+      "high_confidence_fixes": [
+        "Normalize waiting and service units.",
+        "Implement PLAS queues, quanta, demotion and starvation promotion.",
+        "Add an explicit ATLAS critical-path mode."
+      ],
+      "benchmark_corrections": [
+        "Use sequential and fork/join program traces.",
+        "Measure program JCT, throughput and p95/p99 starvation versus FCFS and MLFQ."
+      ],
+      "citations": [
+        "arXiv:2502.13965v1 section 4.2 Algorithm 1",
+        "tests/policies/paper-agentix/src/lib.rs"
+      ]
+    },
+    {
+      "id": "continuum",
+      "classification": "material-semantic-gap",
+      "confidence": "high",
+      "summary": "The preempted, pinned, arrival ordering is present, but optimized TTL is reduced to a Boolean and expiry lacks time, history, pressure and same-program queue semantics.",
+      "high_confidence_fixes": [
+        "Store expiration timestamps, tool histories and pressure.",
+        "Implement the empirical-CDF TTL utility search.",
+        "Reclaim only enough unpinned objects."
+      ],
+      "benchmark_corrections": [
+        "Replay multi-turn tool-duration traces under memory pressure.",
+        "Compare LRU, fixed-2s, optimized and oracle TTL."
+      ],
+      "citations": [
+        "arXiv:2511.02230v6 section 4",
+        "tests/policies/paper-continuum/src/lib.rs"
+      ]
+    },
+    {
+      "id": "kvflow",
+      "classification": "material-semantic-gap",
+      "confidence": "high",
+      "summary": "The eviction tuple and prefetch intent resemble KVFlow, but Agent Step Graph aggregation and transfer states are absent.",
+      "high_confidence_fixes": [
+        "Hard-filter non-ready/loading work and honor max selections.",
+        "Represent shared-node STE plus GPU, CPU, loading and offloading states.",
+        "Reclaim only the required byte prefix."
+      ],
+      "benchmark_corrections": [
+        "Exercise AND/OR DAGs with shared radix nodes and transfer overlap.",
+        "Measure workflow makespan and cache-stall time."
+      ],
+      "citations": [
+        "arXiv:2507.07400v1 section 3",
+        "tests/policies/paper-kvflow/src/lib.rs"
+      ]
+    },
+    {
+      "id": "preble",
+      "classification": "material-semantic-gap",
+      "confidence": "high",
+      "summary": "The exploit/explore threshold is present, but exploration omits per-target profiled cost and exploitation omits least-load tie-breaking and post-placement behavior.",
+      "high_confidence_fixes": [
+        "Compute per-target L_i plus M_i plus P_i.",
+        "Break equal prefix hits by load.",
+        "Model future-request redirection."
+      ],
+      "benchmark_corrections": [
+        "Use the five paper workloads and Azure arrivals.",
+        "Measure RPS and mean/P99 E2E against distributed SGLang and vLLM."
+      ],
+      "citations": [
+        "arXiv:2407.00023v2 section 3.2",
+        "tests/policies/paper-preble/src/lib.rs"
+      ]
+    },
+    {
+      "id": "helium",
+      "classification": "material-semantic-gap",
+      "confidence": "high",
+      "summary": "One local ready/depth/reuse choice does not reproduce Helium's whole-DAG TRT planner, multi-worker assignment, nested sequences or capacity timeline.",
+      "high_confidence_fixes": [
+        "Run a whole-DAG reference planner.",
+        "Represent TRT sharing, profiled outputs, precedence delays and worker capacities."
+      ],
+      "benchmark_corrections": [
+        "Execute complete batched DAGs on multiple workers.",
+        "Compare query-wise, op-wise, random and LSPF using makespan and token steps."
+      ],
+      "citations": [
+        "arXiv:2603.16104v1 section 5 Algorithm 1",
+        "tests/policies/paper-helium/src/lib.rs"
+      ]
+    },
+    {
+      "id": "vtc",
+      "classification": "material-semantic-gap",
+      "confidence": "high",
+      "summary": "Minimum-counter ordering is recognizable, but the original implementation lacked counter lift, weighted costs, dispatch charging and iterative batch accounting.",
+      "high_confidence_fixes": [
+        "Implement Algorithm 2 counter lift and per-client FIFO state.",
+        "Charge weighted input at dispatch and output deltas during decode.",
+        "Filter feedback by request/progress semantics."
+      ],
+      "benchmark_corrections": [
+        "Replay ON/OFF, heterogeneous-length, Poisson and distribution-shift traces.",
+        "Measure service disparity versus the theorem bound, TTFT, throughput and utilization."
+      ],
+      "citations": [
+        "arXiv:2401.00588v2 section 4.1 Algorithm 2",
+        "Ying1123/VTC-artifact commit 192c2e"
+      ]
+    },
+    {
+      "id": "lmetric",
+      "classification": "material-semantic-gap",
+      "confidence": "high",
+      "summary": "The P-token times batch-size core exists, but idle-replica semantics and the stateful two-phase hotspot detector are absent.",
+      "high_confidence_fixes": [
+        "Implement artifact-equivalent batch-size plus one behavior.",
+        "Add popularity/cache-coverage history, confirmation and load-only fallback."
+      ],
+      "benchmark_corrections": [
+        "Use Qwen ChatBot, Qwen Agent, Bailian Coder and Kimi ToolAgent.",
+        "Test idle replicas and multi-decision hotspot sequences."
+      ],
+      "citations": [
+        "arXiv:2603.15202v3 section 5",
+        "blitz-router commit a005ceb"
+      ]
+    },
+    {
+      "id": "fairserve",
+      "classification": "incorrect",
+      "confidence": "high",
+      "summary": "The original kernel confused interaction-aware throttling with an invented interference score and omitted OIT and application-stage WSC normalization.",
+      "high_confidence_fixes": [
+        "Implement overload-gated user/application RPM throttling.",
+        "Preserve in-progress interactions.",
+        "Implement equations 2-3 with application-stage token accounting."
+      ],
+      "benchmark_corrections": [
+        "Use abusive users, overload intervals and multi-call applications.",
+        "Measure wasted tokens, queue delay, TTFT and prompt/decode throughput versus VTC and RPM."
+      ],
+      "citations": [
+        "arXiv:2411.15997v1 sections 4.2-4.3",
+        "tests/policies/paper-common/src/lib.rs"
+      ]
+    },
+    {
+      "id": "marconi",
+      "classification": "incorrect",
+      "confidence": "high",
+      "summary": "A reuse-times-FLOPs-per-byte knapsack replaces Marconi's separate speculative admission and recency-plus-FLOP-efficiency eviction.",
+      "high_confidence_fixes": [
+        "Implement speculative radix-tree admission.",
+        "Use normalized recency plus alpha times FLOP efficiency.",
+        "Support one-child eligibility, SSM-only reclaim and KV merging."
+      ],
+      "benchmark_corrections": [
+        "Use hybrid-model LMSys, ShareGPT and SWE-bench traces.",
+        "Compare timestamped LRU and artifact decision traces."
+      ],
+      "citations": [
+        "arXiv:2411.19379v3 sections 4.1-4.3",
+        "ruipeterpan/marconi commit 08016617"
+      ]
+    },
+    {
+      "id": "ragcache",
+      "classification": "material-semantic-gap",
+      "confidence": "high",
+      "summary": "A static lowest-score leaf resembles PGDSF, but clocks, updates, iterative frontier evolution and GPU-host hierarchy are missing.",
+      "high_confidence_fixes": [
+        "Maintain GPU/host clocks, frequency and profiled average cost.",
+        "Iterate leaf eviction and expose newly eligible parents.",
+        "Represent GPU, host and free tiers."
+      ],
+      "benchmark_corrections": [
+        "Use timestamped LRU and parent-child episodes.",
+        "Compare vLLM+Faiss and SGLang using TTFT and throughput."
+      ],
+      "citations": [
+        "RAGCache section 5.1 Algorithm 1",
+        "tests/policies/paper-common/src/lib.rs"
+      ]
+    },
+    {
+      "id": "dlpm",
+      "classification": "material-semantic-gap",
+      "confidence": "high",
+      "summary": "Deficit and locality signals are present, but the original implementation reversed locality-first ordering and omitted refill cycles, extend accounting and per-worker deficits.",
+      "high_confidence_fixes": [
+        "Implement LPM-first positive-deficit scanning and quantum refill.",
+        "Charge uncached extend and decode output tokens.",
+        "Maintain per-worker deficits and longest-prefix worker sets."
+      ],
+      "benchmark_corrections": [
+        "Use stateful multi-client radix-tree traces.",
+        "Measure hit rate, recomputation, Jain fairness, throughput and victim latency versus VTC, LPM and Preble."
+      ],
+      "citations": [
+        "arXiv:2501.14312v1 algorithms 1-2",
+        "tests/policies/paper-common/src/lib.rs"
+      ]
+    },
+    {
+      "id": "infercept",
+      "classification": "incorrect",
+      "confidence": "high",
+      "summary": "The kernel conflates interception swap priority with resume scheduling and substitutes a non-paper reuse-versus-recompute predicate for preserve/swap/discard waste.",
+      "high_confidence_fixes": [
+        "Implement preserve and chunk-discard waste equations.",
+        "Allocate swap budget in descending minimum-waste order.",
+        "Separate FCFS resume queues and explicit preserve/swap/discard states."
+      ],
+      "benchmark_corrections": [
+        "Run the mixed augmentation workload against vLLM, discard, preserve and swap.",
+        "Measure normalized latency, throughput, TTFT and memory waste."
+      ],
+      "citations": [
+        "InferCept sections 3.2-4.4",
+        "WukLab/InferCept commit 3a1a4dac"
+      ]
+    },
+    {
+      "id": "peek",
+      "classification": "material-semantic-gap",
+      "confidence": "high",
+      "summary": "Only the demand-and-fairness idea remains; pending trie, cLPM sections, stride lanes, dynamic fairness and ancestor-demand eviction are absent.",
+      "high_confidence_fixes": [
+        "Maintain pending-prefix state and exact cLPM facts.",
+        "Implement warm/pioneer/sibling ordering and stride lane interleaving.",
+        "Return only the capacity-required victim set."
+      ],
+      "benchmark_corrections": [
+        "Use SGLang LPM+LRU and vLLM FCFS+APC+LRU.",
+        "Run W1-W5 and report cache hit, TTFT, E2E and throughput."
+      ],
+      "citations": [
+        "PEEK section 3 algorithms 1-2",
+        "xiexbing/peek commit e8ca1173"
+      ]
+    },
+    {
+      "id": "qlm",
+      "classification": "incorrect",
+      "confidence": "high",
+      "summary": "Independent SLO gates and scalar wait ordering do not implement request grouping, RWT estimation, virtual queues or the global LP.",
+      "high_confidence_fixes": [
+        "Implement grouped virtual queues and equations 1-5 RWT estimation.",
+        "Implement equations 6-13 global assignment and ordering.",
+        "Model pulling, eviction, swapping and load balancing."
+      ],
+      "benchmark_corrections": [
+        "Run event-driven multi-model virtual queues.",
+        "Measure actual TTFT-SLO attainment, throughput, utilization, swaps and evictions versus EDF, FCFS and SHEPHERD."
+      ],
+      "citations": [
+        "arXiv:2407.00047v2 sections 4-7",
+        "QLM artifact commit eea5b6"
+      ]
+    },
+    {
+      "id": "slos-serve",
+      "classification": "incorrect",
+      "confidence": "high",
+      "summary": "Independent feasibility gates and least-slack order omit the defining joint DP, performance model, mixed token batches, speculation and best-effort fallback.",
+      "high_confidence_fixes": [
+        "Implement joint value-maximizing admission under memory and stage SLOs.",
+        "Generate mixed prefill/decode batches from a profiled performance model.",
+        "Add speculation and best-effort or replica fallback."
+      ],
+      "benchmark_corrections": [
+        "Replay multi-stage burst workloads.",
+        "Measure requests/GPU/s below 10% stage-SLO violations versus vLLM, Sarathi and DistServe."
+      ],
+      "citations": [
+        "arXiv:2504.08784v1 algorithms 1-2",
+        "tests/policies/paper-common/src/lib.rs"
+      ]
+    },
+    {
+      "id": "dynasor",
+      "classification": "material-semantic-gap",
+      "confidence": "high",
+      "summary": "Thresholded termination remains, but Certaindex computation, stable-answer preservation, program-level knobs, gang scheduling and SJF are absent.",
+      "high_confidence_fixes": [
+        "Compute Certaindex from answer, entropy or reward histories.",
+        "Return the stable answer instead of cancelling it.",
+        "Represent reasoning programs and gang/SJF scheduling."
+      ],
+      "benchmark_corrections": [
+        "Replay real intermediate answers and uncertainty.",
+        "Measure tokens-to-accuracy, equal-quality savings, throughput and probe overhead."
+      ],
+      "citations": [
+        "arXiv:2412.20993v2 section 3",
+        "Dynasor artifact commit 0d2f1b"
+      ]
+    },
+    {
+      "id": "justitia",
+      "classification": "incorrect",
+      "confidence": "high",
+      "summary": "Fewest-completed-branches is not Justitia's predicted KV token-time cost and GPS virtual-finish scheduling.",
+      "high_confidence_fixes": [
+        "Maintain GPS virtual time and immutable finish tags.",
+        "Select the minimum-tag agent and bundle all fitting ready requests."
+      ],
+      "benchmark_corrections": [
+        "Use heterogeneous agent arrivals and finite KV capacity.",
+        "Measure average/P90 JCT and finish-time fairness versus VTC, Parrot, FCFS and SRJF."
+      ],
+      "citations": [
+        "arXiv:2510.17015v2 section 4",
+        "tests/policies/paper-common/src/lib.rs"
+      ]
+    },
+    {
+      "id": "chameleon",
+      "classification": "material-semantic-gap",
+      "confidence": "high",
+      "summary": "Queue hints exist, but token quotas, two-phase redistribution, head-of-line bypass and the cost-aware adapter cache are absent.",
+      "high_confidence_fixes": [
+        "Track per-queue token quotas and spare redistribution.",
+        "Implement real head-of-line adapter bypass.",
+        "Use dynamic cache sizing, reference counts and the paper cache score."
+      ],
+      "benchmark_corrections": [
+        "Use S-LoRA and report P99/P50 TTFT plus SLO throughput.",
+        "Exercise quota phases, bypass and cache pressure."
+      ],
+      "citations": [
+        "Chameleon v2 sections 4.2-4.3",
+        "tests/policies/paper-common/src/lib.rs"
+      ]
+    },
+    {
+      "id": "hotprefix",
+      "classification": "incorrect",
+      "confidence": "high",
+      "summary": "A cumulative-count threshold at primary admission does not implement clocked GPU leaf eviction, host admission or host-to-GPU promotion.",
+      "high_confidence_fixes": [
+        "Track frequency, clock, length, tier and parent-child state.",
+        "Implement GPU leaf priority and host hotness comparison.",
+        "Implement constrained post-prefill promotion."
+      ],
+      "benchmark_corrections": [
+        "Use MMLU, Hellaswag, BBH and CEVAL.",
+        "Compare LRU, LFU, FIFO and 2Q using hit rate, latency, throughput and offload time."
+      ],
+      "citations": [
+        "HotPrefix sections 3.2-3.4",
+        "tests/policies/paper-common/src/lib.rs"
+      ]
+    },
+    {
+      "id": "pard",
+      "classification": "incorrect",
+      "confidence": "high",
+      "summary": "The original two-term P95 gate omitted PARD's queue, execution, batch-wait quantile, pipeline state and adaptive HBF/LBF ordering.",
+      "high_confidence_fixes": [
+        "Implement equation 3 with queue, execution and F^-1(0.1) terms.",
+        "Maintain sliding windows and DAG-path latency.",
+        "Add load-driven HBF/LBF with hysteresis."
+      ],
+      "benchmark_corrections": [
+        "Replay bursty multi-module and DAG pipelines.",
+        "Measure SLO goodput, drops, invalid GPU time and drop location versus Nexus, Clipper and naive."
+      ],
+      "citations": [
+        "arXiv:2602.08747v1 sections 4.2-4.3",
+        "tests/policies/paper-common/src/lib.rs"
+      ]
+    },
+    {
+      "id": "branch-regulation",
+      "classification": "incorrect",
+      "confidence": "high",
+      "summary": "A static group cap does not implement TAPER's protected token, slack-budgeted widening and marginal utility planner; cancellation contradicts reversible deferral.",
+      "high_confidence_fixes": [
+        "Grant protected progress each decode step.",
+        "Compute T(S), slack and rho-scaled budget.",
+        "Defer excess branches without cancelling the request."
+      ],
+      "benchmark_corrections": [
+        "Replay serial/parallel phases under low, moderate and high load.",
+        "Compare IRP-Off, C2, C5 and Eager using SLO token goodput and P99 TPOT."
+      ],
+      "citations": [
+        "arXiv:2605.06914v1 algorithm 1",
+        "tests/policies/paper-common/src/lib.rs"
+      ]
+    },
+    {
+      "id": "dualmap",
+      "classification": "material-semantic-gap",
+      "confidence": "high",
+      "summary": "Cache-hit and risk vocabulary is present, but two-choice hashing, SLO switching and benefit-ranked queued rebalancing are absent.",
+      "high_confidence_fixes": [
+        "Generate exactly two adaptive-prefix hash candidates.",
+        "Implement the TTFT-SLO switch.",
+        "Rebalance queued requests to alternate candidates by benefit."
+      ],
+      "benchmark_corrections": [
+        "Use Cache Affinity, Least Loaded, Min TTFT and Preble.",
+        "Measure effective request capacity, goodput, TTFT/E2E, hit rate and load CV."
+      ],
+      "citations": [
+        "arXiv:2602.06502v1 sections 3.2-3.4",
+        "tests/policies/paper-common/src/lib.rs"
+      ]
+    },
+    {
+      "id": "llumnix",
+      "classification": "material-semantic-gap",
+      "confidence": "high",
+      "summary": "One virtual-usage scalar omits Llumnix freeness, usage rules, pairing, victim selection and migration coordination.",
+      "high_confidence_fixes": [
+        "Implement HOL demand, priority headroom and physical usage.",
+        "Dispatch by freeness and pair source/destination instances.",
+        "Model migration handshake and rollback."
+      ],
+      "benchmark_corrections": [
+        "Use evolving ShareGPT/BurstGPT queues versus round-robin, INFaaS and Llumnix-base.",
+        "Measure mean/P99 E2E, prefill, decode, fragmentation and downtime."
+      ],
+      "citations": [
+        "arXiv:2406.03243v1 sections 4.2-4.4",
+        "Llumnix artifact commit 3fb6c03"
+      ]
+    },
+    {
+      "id": "smetric",
+      "classification": "material-semantic-gap",
+      "confidence": "high",
+      "summary": "The first/follow-up split exists, but overload and eviction guards are absent and active migration differs from global-tier fallback routing.",
+      "high_confidence_fixes": [
+        "Implement overload and likely-eviction guards.",
+        "Fallback to load balancing when either guard fails.",
+        "Represent global-tier fetch instead of active migration."
+      ],
+      "benchmark_corrections": [
+        "Replay multi-request sessions with local/global KV capacity.",
+        "Measure TPS under TTFT/TPOT SLO, hit location and load imbalance."
+      ],
+      "citations": [
+        "arXiv:2607.08565 figure 13 section 4.2",
+        "tests/policies/paper-common/src/lib.rs"
+      ]
+    },
+    {
+      "id": "thunderagent",
+      "classification": "incorrect",
+      "confidence": "high",
+      "summary": "Tool-ready filtering and caller-supplied migration do not implement reasoning/acting lifecycle, thrashing detection, pause/restore or tool-resource management.",
+      "high_confidence_fixes": [
+        "Add reasoning/acting and active/paused/terminated states.",
+        "Implement periodic victim selection and capacity-aware restore.",
+        "Require enacted migration feedback."
+      ],
+      "benchmark_corrections": [
+        "Use multi-backend programs with context growth and tool intervals.",
+        "Measure throughput, recomputation, hit rate, imbalance and tool resources."
+      ],
+      "citations": [
+        "arXiv:2602.13692v3 section 4",
+        "ThunderAgent artifact commit 7ddc8610"
+      ]
+    },
+    {
+      "id": "pythia",
+      "classification": "incorrect",
+      "confidence": "high",
+      "summary": "Generic lookahead, rank and next-use scalars do not implement lineage-aware caching, OOM-safe headroom routing or dynamic graph priority.",
+      "high_confidence_fixes": [
+        "Implement future lineage keep/drop and exact prompt staging.",
+        "Implement union-bound OOM admission and headroom routing.",
+        "Implement expected-distance, downstream-idle and aging priority."
+      ],
+      "benchmark_corrections": [
+        "Use workflow regexes, output distributions and constrained replicas.",
+        "Measure average/P95 JCT, throughput, TTFT and OOM rate."
+      ],
+      "citations": [
+        "arXiv:2604.25899v2 algorithms 1-3",
+        "tests/policies/paper-common/src/lib.rs"
+      ]
+    },
+    {
+      "id": "goodserve",
+      "classification": "incorrect",
+      "confidence": "high",
+      "summary": "Quality-gap/cost ordering is not GoodServe's E2E-SLO goodput objective or just-enough GPU selection.",
+      "high_confidence_fixes": [
+        "Implement q+p(Lin-H)+dLout latency prediction.",
+        "Choose the least capable GPU meeting the SLO.",
+        "Add periodic stronger just-enough rerouting."
+      ],
+      "benchmark_corrections": [
+        "Use BIRD, SWE-bench and LiveCodeBench with Mooncake arrivals.",
+        "Measure E2E-SLO goodput and violation ratio versus random, load, Preble and Llumnix."
+      ],
+      "citations": [
+        "arXiv:2605.16867 equations 1-2",
+        "tests/policies/paper-common/src/lib.rs"
+      ]
+    },
+    {
+      "id": "conserve",
+      "classification": "material-semantic-gap",
+      "confidence": "high",
+      "summary": "Only first-turn versus follow-up routing remains; prefiller role, one-time KV transfer, lowest-KV decoder binding and capacity equations are absent.",
+      "high_confidence_fixes": [
+        "Route first turns to a prefiller and bind follow-ups to the lowest-KV decoder.",
+        "Persist decoder binding across generations.",
+        "Implement exactly-once transfer and capacity provisioning."
+      ],
+      "benchmark_corrections": [
+        "Use persistent SWE-bench conversations.",
+        "Measure TTFET, last-turn TBT, E2E, SLO violations and energy versus collocated, disaggregated and AMPD."
+      ],
+      "citations": [
+        "arXiv:2606.01839 section 4",
+        "tests/policies/paper-common/src/lib.rs"
+      ]
+    },
+    {
+      "id": "parrot",
+      "classification": "material-semantic-gap",
+      "confidence": "high",
+      "summary": "Dependency readiness is only a prerequisite; criteria propagation, task groups, prefix/context grouping, capacity checks and interference-aware placement are absent.",
+      "high_confidence_fixes": [
+        "Produce trusted DAG depth, criteria, task-group and prefix facts.",
+        "Schedule groups atomically and place them capacity-aware with context affinity."
+      ],
+      "benchmark_corrections": [
+        "Run chain, map-reduce and multi-agent Semantic Variable DAGs.",
+        "Measure makespan and sustainable throughput against FCFS and least queue."
+      ],
+      "citations": [
+        "arXiv:2405.19888v1 section 5",
+        "ParrotServe artifact commit 2e1825ee"
+      ]
+    },
+    {
+      "id": "saga",
+      "classification": "incorrect",
+      "confidence": "high",
+      "summary": "Always-locality routing, generic group service and Boolean TTL omit WA-LRU, adaptive TTL, guarded stealing, KV migration and deadline-based AFS.",
+      "high_confidence_fixes": [
+        "Implement AEG-derived reuse, WA-LRU and pressure-scaled TTL.",
+        "Implement the affinity threshold and guarded steal victim selection.",
+        "Implement AFS deadline feedback and affinity updates."
+      ],
+      "benchmark_corrections": [
+        "Use multi-step sessions with tool durations, pressure and deadlines.",
+        "Measure TCT, memory utilization, regeneration and SLO attainment versus vLLM+APC."
+      ],
+      "citations": [
+        "arXiv:2605.00528v2 sections 4-6",
+        "tests/policies/paper-common/src/lib.rs"
+      ]
+    },
+    {
+      "id": "routebalance",
+      "classification": "incorrect",
+      "confidence": "high",
+      "summary": "Exhaustive static utility matching is the opposite of RouteBalance's normalized quality/latency/cost score and LPT greedy dead-reckoning.",
+      "high_confidence_fixes": [
+        "Implement normalized three-weight scoring and cost budgets.",
+        "Sort by predicted output length and update instance state after each assignment.",
+        "Remove the exponential 12-request bound."
+      ],
+      "benchmark_corrections": [
+        "Use the seven named datasets and official artifact decision traces.",
+        "Measure quality, completed requests/s, E2E latency and realized cost."
+      ],
+      "citations": [
+        "arXiv:2606.17949 section 4.1",
+        "route-balance artifact commit 671db9f"
+      ]
+    }
+  ]
+}

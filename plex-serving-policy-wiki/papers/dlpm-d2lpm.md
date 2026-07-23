@@ -48,7 +48,7 @@ Named datasets/workloads identified from the primary text or manual audit.
 
 - Component: `plex_paper_dlpm`
 - Operations: `route`, `schedule`, `feedback`
-- Evidence: `policy-kernel-reproduction`
+- Evidence: `inspired-adaptation`
 - Validation: `passing`
 - Metadata: [`tests/policies/replications/dlpm/metadata.json`](../../tests/policies/replications/dlpm/metadata.json)
 - Deferred mechanics: None

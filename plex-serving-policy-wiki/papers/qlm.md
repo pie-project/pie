@@ -47,7 +47,7 @@ Named datasets/workloads identified from the primary text or manual audit.
 
 - Component: `plex_paper_qlm`
 - Operations: `admit`, `route`, `schedule`, `feedback`
-- Evidence: `policy-kernel-reproduction`
+- Evidence: `inspired-adaptation`
 - Validation: `passing`
 - Metadata: [`tests/policies/replications/qlm/metadata.json`](../../tests/policies/replications/qlm/metadata.json)
 - Deferred mechanics: None

@@ -3,24 +3,34 @@
   "title": "RouteBalance: Fused Model Routing and Load Balancing for Heterogeneous LLM Serving",
   "paper_version": "arXiv 2606.17949",
   "source_url": "https://arxiv.org/abs/2606.17949",
-  "source_commit": null,
+  "source_commit": "671db9facc2b443c6cdd1c309d13fc4fcaa43cb4",
   "source_license": "paper reference; no source copied",
   "component": "plex_paper_routebalance",
   "implements": [
     "route"
   ],
   "policy_kernel": [
-    "bounded joint request-target assignment",
-    "fused utility and capacity"
+    "normalized quality-latency-cost score",
+    "cost-budget filtering",
+    "LPT greedy assignment with dead-reckoned load"
   ],
   "required_facts": [
-    "utility"
+    "predicted_output_tokens",
+    "cost_budget",
+    "quality_weight_ppm",
+    "cost_weight_ppm",
+    "latency_weight_ppm",
+    "quality_ppm",
+    "cost",
+    "latency_ms",
+    "decode_ms_per_token",
+    "queued_tokens"
   ],
   "required_mechanics": [],
   "deferred_mechanics": [
     "replica provisioning"
   ],
-  "evidence_level": "policy-kernel-reproduction",
-  "fixture_provenance": "independent bounded reference solver",
+  "evidence_level": "inspired-adaptation",
+  "fixture_provenance": "paper equations and public artifact decision flow",
   "validation_status": "passing"
 }

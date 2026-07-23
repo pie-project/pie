@@ -12,6 +12,12 @@ scripts/build-plex-policies.sh
 cargo run --quiet --release --locked -p pie-policy --example bench_v0_6 -- \
     --check tests/policies/performance-budgets.json >/tmp/plex-v0.6-benchmark.json
 python3 -m json.tool /tmp/plex-v0.6-benchmark.json >/dev/null
+python3 -m json.tool tests/policies/performance-targets.json >/dev/null
+python3 -m py_compile \
+    scripts/benchmark-plex-policy-performance.py \
+    scripts/benchmark-vllm-plex-policy.py \
+    scripts/run-vllm-plex-performance-matrix.py \
+    scripts/generate-plex-policy-performance-report.py
 
 python3 scripts/generate-plex-replication-report.py
 python3 scripts/update-plex-paper-replication-status.py
@@ -24,6 +30,19 @@ git --no-pager diff --exit-code -- \
 if [[ -n "${PLEX_PYTHON:-}" ]]; then
     PLEX_TEST_POLICY="$root/tests/policies/target/packages/plex_coordinated.plexpkg" \
         "$PLEX_PYTHON" -m pytest -q sdk/python-plex/tests
+    "$PLEX_PYTHON" scripts/benchmark-plex-policy-performance.py \
+        --trials 4 \
+        --output /tmp/plex-policy-performance-smoke.json >/dev/null
+    "$PLEX_PYTHON" - <<'PY'
+import json
+
+with open("/tmp/plex-policy-performance-smoke.json") as handle:
+    report = json.load(handle)
+if report["policy_count"] != 31:
+    raise SystemExit("performance smoke did not cover all 31 policies")
+if report["trend_reproduced_count"] != 31:
+    raise SystemExit("performance smoke did not reproduce all 31 kernel trends")
+PY
 else
     echo "PLEX_PYTHON is unset; Python tests require an environment with pie-plex and pytest" >&2
 fi

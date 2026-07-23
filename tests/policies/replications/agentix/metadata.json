@@ -15,7 +15,7 @@
   "required_facts": ["waiting_ms", "service_us"],
   "required_mechanics": [],
   "deferred_mechanics": ["KV swap kernel", "multi-step engine execution", "full ATLAS DAG runtime"],
-  "evidence_level": "policy-kernel-reproduction",
+  "evidence_level": "inspired-adaptation",
   "fixture_provenance": "independent implementation from the paper algorithm",
   "validation_status": "passing"
 }

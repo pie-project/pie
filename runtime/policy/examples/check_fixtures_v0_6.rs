@@ -42,7 +42,7 @@ fn check_unavailable_feedback_cleanup(packages: &Path) -> Result<(), Box<dyn std
             "records": [{
                 "subject": {"kind": "request", "value": "A"},
                 "outcome": "completed",
-                "facts": {}
+                "facts": {"prefiller": false}
             }]
         },
         "cleanup": {
@@ -106,10 +106,6 @@ fn check_wave_d(packages: &Path) -> Result<(), Box<dyn std::error::Error>> {
         ("plex_paper_dualmap", json!({"hotspot": true})),
         ("plex_paper_llumnix", json!({"live_reschedule": true})),
         (
-            "plex_paper_smetric",
-            json!({"generation_id": 1, "tail_outlier": true}),
-        ),
-        (
             "plex_paper_goodserve",
             json!({"risk_ppm": 900, "migration_threshold_ppm": 800}),
         ),
@@ -120,6 +116,16 @@ fn check_wave_d(packages: &Path) -> Result<(), Box<dyn std::error::Error>> {
         assert_success(&outcome);
         assert_eq!(outcome["actions"][0]["method"], "pie.request.rebalance@1");
     }
+
+    let smetric = runtime(packages, "plex_paper_smetric", &[], None)?;
+    let outcome = smetric.invoke(route_event(
+        "S",
+        "GS",
+        "smetric-load-route",
+        json!({"overload_ppm": 1_500_000, "hit_ratio_ppm": 500_000}),
+    ))?;
+    assert_success(&outcome);
+    assert!(outcome["actions"].as_array().is_some_and(Vec::is_empty));
 
     let thunder = runtime(
         packages,
@@ -157,14 +163,14 @@ fn check_wave_d(packages: &Path) -> Result<(), Box<dyn std::error::Error>> {
                     "max_assignments": 1,
                     "capacity": [],
                     "revision": 1,
-                    "facts": {}
+                    "facts": {"prefiller": false}
                 },
                 {
                     "target_id": "Y",
                     "max_assignments": 1,
                     "capacity": [],
                     "revision": 1,
-                    "facts": {}
+                    "facts": {"prefiller": true}
                 }
             ],
             "feasible_edges": [
@@ -172,13 +178,13 @@ fn check_wave_d(packages: &Path) -> Result<(), Box<dyn std::error::Error>> {
                     "request_index": 0,
                     "target_index": 0,
                     "demand": [],
-                    "facts": {"prefill_capacity": 1}
+                    "facts": {"active_kv_bytes": 10}
                 },
                 {
                     "request_index": 0,
                     "target_index": 1,
                     "demand": [],
-                    "facts": {"prefill_capacity": 10}
+                    "facts": {"active_kv_bytes": 1}
                 }
             ]
         },
@@ -195,8 +201,26 @@ fn check_wave_d(packages: &Path) -> Result<(), Box<dyn std::error::Error>> {
             "meta": meta("routebalance"),
             "cause": "admission",
             "requests": [
-                {"request": request_ref("A", "GA"), "facts": {}},
-                {"request": request_ref("B", "GB"), "facts": {}}
+                {
+                    "request": request_ref("A", "GA"),
+                    "facts": {
+                        "predicted_output_tokens": 10,
+                        "cost_budget": 100,
+                        "quality_weight_ppm": 1000000,
+                        "cost_weight_ppm": 0,
+                        "latency_weight_ppm": 0
+                    }
+                },
+                {
+                    "request": request_ref("B", "GB"),
+                    "facts": {
+                        "predicted_output_tokens": 100,
+                        "cost_budget": 100,
+                        "quality_weight_ppm": 1000000,
+                        "cost_weight_ppm": 0,
+                        "latency_weight_ppm": 0
+                    }
+                }
             ],
             "targets": [
                 {
@@ -204,21 +228,61 @@ fn check_wave_d(packages: &Path) -> Result<(), Box<dyn std::error::Error>> {
                     "max_assignments": 1,
                     "capacity": [],
                     "revision": 1,
-                    "facts": {}
+                    "facts": {"queued_tokens": 0}
                 },
                 {
                     "target_id": "Y",
                     "max_assignments": 1,
                     "capacity": [],
                     "revision": 1,
-                    "facts": {}
+                    "facts": {"queued_tokens": 0}
                 }
             ],
             "feasible_edges": [
-                {"request_index": 0, "target_index": 0, "demand": [], "facts": {"utility": 10}},
-                {"request_index": 0, "target_index": 1, "demand": [], "facts": {"utility": 9}},
-                {"request_index": 1, "target_index": 0, "demand": [], "facts": {"utility": 8}},
-                {"request_index": 1, "target_index": 1, "demand": [], "facts": {"utility": 0}}
+                {
+                    "request_index": 0,
+                    "target_index": 0,
+                    "demand": [],
+                    "facts": {
+                        "quality_ppm": 1000,
+                        "cost": 1,
+                        "latency_ms": 1,
+                        "decode_ms_per_token": 1
+                    }
+                },
+                {
+                    "request_index": 0,
+                    "target_index": 1,
+                    "demand": [],
+                    "facts": {
+                        "quality_ppm": 900,
+                        "cost": 1,
+                        "latency_ms": 1,
+                        "decode_ms_per_token": 1
+                    }
+                },
+                {
+                    "request_index": 1,
+                    "target_index": 0,
+                    "demand": [],
+                    "facts": {
+                        "quality_ppm": 1000,
+                        "cost": 1,
+                        "latency_ms": 1,
+                        "decode_ms_per_token": 1
+                    }
+                },
+                {
+                    "request_index": 1,
+                    "target_index": 1,
+                    "demand": [],
+                    "facts": {
+                        "quality_ppm": 0,
+                        "cost": 1,
+                        "latency_ms": 1,
+                        "decode_ms_per_token": 1
+                    }
+                }
             ]
         },
         "lifecycle": [
@@ -398,7 +462,11 @@ fn check_wave_c(packages: &Path) -> Result<(), Box<dyn std::error::Error>> {
         "G",
         json!({
             "upstream_elapsed_ms": 80,
-            "downstream_p95_ms": 40,
+            "current_queue_ms": 10,
+            "current_execution_ms": 10,
+            "downstream_queue_ms": 10,
+            "downstream_execution_ms": 10,
+            "downstream_batch_wait_p10_ms": 10,
             "deadline_ms": 100
         }),
     ))?;
@@ -483,7 +551,12 @@ fn check_wave_a(packages: &Path) -> Result<(), Box<dyn std::error::Error>> {
             "records": [{
                 "subject": {"kind": "request", "value": "A"},
                 "outcome": "progress",
-                "facts": {"client_id": "client-a", "input_tokens": 100, "output_tokens": 0}
+                "facts": {
+                    "client_id": "client-a",
+                    "input_tokens": 0,
+                    "output_tokens": 100,
+                    "output_weight": 1
+                }
             }]
         },
         "lifecycle": lifecycle("A", "G1", true)
@@ -518,7 +591,7 @@ fn check_wave_a(packages: &Path) -> Result<(), Box<dyn std::error::Error>> {
     assert_success(&vtc_schedule);
     assert_eq!(
         vtc_schedule["plan"]["plan"]["selections"][0]["requests"],
-        json!([1])
+        json!([0])
     );
 
     let fairserve = runtime(packages, "plex_paper_fairserve", &[], None)?;
@@ -709,6 +782,7 @@ fn check_replication_artifacts(packages: &Path) -> Result<(), Box<dyn std::error
             metadata["evidence_level"].as_str(),
             Some("decision-trace-parity-with-deferred-mechanics")
                 | Some("policy-kernel-reproduction")
+                | Some("inspired-adaptation")
         ));
         let component = metadata["component"]
             .as_str()

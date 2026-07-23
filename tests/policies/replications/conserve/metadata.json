@@ -10,17 +10,17 @@
     "route"
   ],
   "policy_kernel": [
-    "heavy first-prefill placement",
-    "conversation-tail affinity"
+    "dedicated first-turn prefiller",
+    "persistent decoder binding by active KV occupancy"
   ],
   "required_facts": [
-    "prefill_capacity",
-    "conversation_affinity",
-    "load"
+    "prefiller",
+    "bound_target_id",
+    "active_kv_bytes"
   ],
   "required_mechanics": [],
   "deferred_mechanics": [],
-  "evidence_level": "policy-kernel-reproduction",
+  "evidence_level": "inspired-adaptation",
   "fixture_provenance": "independent reference model from the paper",
   "validation_status": "passing"
 }

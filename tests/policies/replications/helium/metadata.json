@@ -3,7 +3,7 @@
   "title": "Efficient LLM Serving for Agentic Workflows: A Data Systems Perspective",
   "paper_version": "arXiv 2603.16104",
   "source_url": "https://arxiv.org/abs/2603.16104",
-  "source_commit": null,
+  "source_commit": "f688bf8a",
   "source_license": "paper reference; no source copied",
   "component": "plex_paper_helium",
   "implements": ["schedule"],
@@ -23,7 +23,7 @@
   ],
   "required_mechanics": [],
   "deferred_mechanics": ["query-plan rewrite", "proactive cache warming"],
-  "evidence_level": "policy-kernel-reproduction",
+  "evidence_level": "inspired-adaptation",
   "fixture_provenance": "independent implementation from the paper algorithm",
   "validation_status": "passing"
 }

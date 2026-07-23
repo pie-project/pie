@@ -11,19 +11,19 @@
 | Year | 2026 |
 | Authors | Wei Da, Evangelia Kalyvianaki |
 | Institutions / group context | Not reliably resolved; venue and artifact evidence used instead |
-| Reputation evidence | recent preprint; peer-review status is not confirmed by this catalog; author affiliations were not reliably resolved; no official public artifact was confirmed. |
+| Reputation evidence | recent preprint; peer-review status is not confirmed by this catalog; a public implementation is available. |
 | Citation count | 0 via OpenAlex (retrieved 2026-07-23; preprint and proceedings records may split citations) |
 | Metadata provenance | OpenAlex |
 | DOI | Not resolved |
 | arXiv | 2606.17949 |
-| Artifact | No official public artifact confirmed |
+| Artifact | [Public implementation](https://github.com/AKafakA/route-balance) |
 | Corpus category | Routing, placement, and rebalancing |
 
 ## Abstract synopsis
 
 _Editorial paraphrase, not the paper's verbatim abstract._
 
-This work studies how requests or state should be placed across replicas, tiers, models, or heterogeneous resources. The proposed policy centers on joint model routing and load balancing on heterogeneous fleets. The reported evaluation context includes Multi-replica or heterogeneous-cluster trace-driven workloads; no named public dataset was reliably recovered.
+This work studies how requests or state should be placed across replicas, tiers, models, or heterogeneous resources. The proposed policy centers on joint model routing and load balancing on heterogeneous fleets. The evaluation uses RewardBench, CodeUltraFeedback, BeaverTails, LLM-Blender, LMSYS-Chat-1M, GSM8K, and SQuAD.
 
 An abstract was available through the indexed or primary-page metadata used for this catalog. Follow the primary-paper link for the authoritative abstract and version history.
 
@@ -37,16 +37,22 @@ Joint model routing and load balancing on heterogeneous fleets.
 
 ## Datasets and evaluation workloads
 
-- Multi-replica or heterogeneous-cluster trace-driven workloads; no named public dataset was reliably recovered
+- RewardBench
+- CodeUltraFeedback
+- BeaverTails
+- LLM-Blender
+- LMSYS-Chat-1M
+- GSM8K
+- SQuAD
 
-No named public dataset was reliably confirmed; the workload description is categorical and the paper's evaluation section is authoritative.
+Named datasets are listed in the paper evaluation and public artifact.
 
 <!-- plex-v0.6-replication:start -->
 ## PLEX v0.6 replication status
 
 - Component: `plex_paper_routebalance`
 - Operations: `route`
-- Evidence: `policy-kernel-reproduction`
+- Evidence: `inspired-adaptation`
 - Validation: `passing`
 - Metadata: [`tests/policies/replications/routebalance/metadata.json`](../../tests/policies/replications/routebalance/metadata.json)
 - Deferred mechanics: replica provisioning
@@ -59,4 +65,5 @@ Wei Da, Evangelia Kalyvianaki. “RouteBalance: Fused Model Routing and Load Bal
 ## Sources
 
 - [Primary paper](https://arxiv.org/abs/2606.17949)
+- [Public artifact](https://github.com/AKafakA/route-balance)
 - [OpenAlex record](https://openalex.org/W7165219013)

@@ -47,7 +47,7 @@ Named datasets/workloads identified from the primary text or manual audit.
 
 - Component: `plex_paper_llumnix`
 - Operations: `route`, `feedback`
-- Evidence: `policy-kernel-reproduction`
+- Evidence: `inspired-adaptation`
 - Validation: `passing`
 - Metadata: [`tests/policies/replications/llumnix/metadata.json`](../../tests/policies/replications/llumnix/metadata.json)
 - Deferred mechanics: physical migration

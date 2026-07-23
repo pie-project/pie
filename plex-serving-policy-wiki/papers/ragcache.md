@@ -46,7 +46,7 @@ Named datasets/workloads identified from the primary text or manual audit.
 
 - Component: `plex_paper_ragcache`
 - Operations: `cache`
-- Evidence: `policy-kernel-reproduction`
+- Evidence: `inspired-adaptation`
 - Validation: `passing`
 - Metadata: [`tests/policies/replications/ragcache/metadata.json`](../../tests/policies/replications/ragcache/metadata.json)
 - Deferred mechanics: None

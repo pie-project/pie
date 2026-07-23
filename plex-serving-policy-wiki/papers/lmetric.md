@@ -23,7 +23,7 @@
 
 _Editorial paraphrase, not the paper's verbatim abstract._
 
-This work studies how requests or state should be placed across replicas, tiers, models, or heterogeneous resources. The proposed policy centers on multiplicative cache/load score. The reported evaluation context includes Alibaba Bailian Qwen ChatBot, Agent, and Coder traces, Kimi ToolAgent trace, Azure LLM inference trace.
+This work studies how requests or state should be placed across replicas, tiers, models, or heterogeneous resources. The proposed policy centers on multiplicative cache/load score. The reported evaluation context includes Alibaba Bailian Qwen ChatBot, Agent, and Coder traces and the Kimi ToolAgent trace.
 
 An abstract was available through the indexed or primary-page metadata used for this catalog. Follow the primary-paper link for the authoritative abstract and version history.
 
@@ -39,7 +39,6 @@ Direct `R`; strongest simple route example.
 
 - Alibaba Bailian Qwen ChatBot, Agent, and Coder traces
 - Kimi ToolAgent trace
-- Azure LLM inference trace
 
 Named datasets/workloads identified from the primary text or manual audit.
 
@@ -48,10 +47,10 @@ Named datasets/workloads identified from the primary text or manual audit.
 
 - Component: `plex_paper_lmetric`
 - Operations: `route`
-- Evidence: `policy-kernel-reproduction`
+- Evidence: `inspired-adaptation`
 - Validation: `passing`
 - Metadata: [`tests/policies/replications/lmetric/metadata.json`](../../tests/policies/replications/lmetric/metadata.json)
-- Deferred mechanics: None
+- Deferred mechanics: two-phase hotspot detector
 <!-- plex-v0.6-replication:end -->
 
 ## Suggested citation

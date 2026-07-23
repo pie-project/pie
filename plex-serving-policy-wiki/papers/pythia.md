@@ -47,7 +47,7 @@ Named datasets/workloads identified from the primary text or manual audit.
 
 - Component: `plex_paper_pythia`
 - Operations: `route`, `schedule`, `cache`, `feedback`
-- Evidence: `policy-kernel-reproduction`
+- Evidence: `inspired-adaptation`
 - Validation: `passing`
 - Metadata: [`tests/policies/replications/pythia/metadata.json`](../../tests/policies/replications/pythia/metadata.json)
 - Deferred mechanics: proactive scaling

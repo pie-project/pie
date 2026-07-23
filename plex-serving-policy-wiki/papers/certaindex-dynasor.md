@@ -46,7 +46,7 @@ Named datasets/workloads identified from the primary text or manual audit.
 
 - Component: `plex_paper_dynasor`
 - Operations: `schedule`, `feedback`
-- Evidence: `policy-kernel-reproduction`
+- Evidence: `inspired-adaptation`
 - Validation: `passing`
 - Metadata: [`tests/policies/replications/dynasor/metadata.json`](../../tests/policies/replications/dynasor/metadata.json)
 - Deferred mechanics: predictor training

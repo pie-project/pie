@@ -77,13 +77,17 @@ impl Policy for Continuum {
             })
             .collect::<Vec<_>>();
         reclaim.sort_by_key(|entry| *entry);
+        let admissions = vec![CacheAdmission::Cache; ctx.prospective.len()];
         Ok(CachePlan {
-            admissions: vec![CacheAdmission::Cache; ctx.prospective.len()],
-            reclaim: reclaim
-                .into_iter()
-                .filter(|(pinned, _, _)| !pinned)
-                .map(|(_, _, index)| index)
-                .collect(),
+            reclaim: reclaim_prefix(
+                ctx,
+                &admissions,
+                reclaim
+                    .into_iter()
+                    .filter(|(pinned, _, _)| !pinned)
+                    .map(|(_, _, index)| index),
+            ),
+            admissions,
         })
     }
 
@@ -105,6 +109,40 @@ impl Policy for Continuum {
         }
         Ok(())
     }
+}
+
+fn reclaim_prefix(
+    ctx: &CacheContext,
+    admissions: &[CacheAdmission],
+    ordered: impl IntoIterator<Item = u32>,
+) -> Vec<u32> {
+    let used = ctx
+        .resident
+        .iter()
+        .fold(ctx.capacity.fixed_bytes, |total, resident| {
+            total.saturating_add(resident.object.size_bytes)
+        })
+        .saturating_add(
+            ctx.prospective
+                .iter()
+                .zip(admissions)
+                .filter(|(_, admission)| **admission == CacheAdmission::Cache)
+                .fold(0u64, |total, (object, _)| {
+                    total.saturating_add(object.size_bytes)
+                }),
+        );
+    let required = used.saturating_sub(ctx.capacity.max_bytes);
+    let mut freed = 0u64;
+    let mut reclaim = Vec::new();
+    for index in ordered {
+        if freed >= required {
+            break;
+        }
+        let resident = &ctx.resident[index as usize];
+        freed = freed.saturating_add(resident.object.size_bytes);
+        reclaim.push(index);
+    }
+    reclaim
 }
 
 plex::export_policy!(Continuum);

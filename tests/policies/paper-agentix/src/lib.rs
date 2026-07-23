@@ -24,8 +24,11 @@ impl Policy for Agentix {
                 .and_then(|group_id| state.group(group_id.as_str()).ok())
                 .and_then(|group| group.scratch["observed_service_us"].as_u64())
                 .unwrap_or(0);
-            let waiting = candidate.facts["waiting_ms"].as_u64().unwrap_or(0);
-            let starved = waiting >= service.max(1).saturating_mul(4);
+            let waiting_us = candidate.facts["waiting_ms"]
+                .as_u64()
+                .unwrap_or(0)
+                .saturating_mul(1000);
+            let starved = waiting_us >= service.max(1).saturating_mul(4);
             (!starved, service, index)
         });
         let mut remaining_selections = ctx.capacity.max_selections;

@@ -11,23 +11,21 @@
   ],
   "policy_kernel": [
     "first-turn load balance",
-    "follow-up cache affinity",
-    "tail-outlier migration"
+    "guarded follow-up cache affinity",
+    "overload and likely-eviction fallback"
   ],
   "required_facts": [
-    "generation_id",
     "cache_affinity",
     "load",
-    "tail_outlier"
+    "estimated_history_hit",
+    "overload_ppm",
+    "hit_ratio_ppm"
   ],
   "required_mechanics": [],
-  "optional_mechanics": [
-    "request.rebalance@1"
-  ],
   "deferred_mechanics": [
-    "physical migration"
+    "global-tier KV fetch"
   ],
-  "evidence_level": "policy-kernel-reproduction",
+  "evidence_level": "inspired-adaptation",
   "fixture_provenance": "independent reference model from the paper",
   "validation_status": "passing"
 }

@@ -50,7 +50,7 @@ Named datasets/workloads identified from the primary text or manual audit.
 
 - Component: `plex_paper_infercept`
 - Operations: `schedule`, `cache`
-- Evidence: `policy-kernel-reproduction`
+- Evidence: `inspired-adaptation`
 - Validation: `passing`
 - Metadata: [`tests/policies/replications/infercept/metadata.json`](../../tests/policies/replications/infercept/metadata.json)
 - Deferred mechanics: physical swap implementation

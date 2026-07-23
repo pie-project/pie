@@ -50,7 +50,7 @@ Named datasets/workloads identified from the primary text or manual audit.
 
 - Component: `plex_paper_thunderagent`
 - Operations: `schedule`, `cache`, `feedback`
-- Evidence: `policy-kernel-reproduction`
+- Evidence: `inspired-adaptation`
 - Validation: `passing`
 - Metadata: [`tests/policies/replications/thunderagent/metadata.json`](../../tests/policies/replications/thunderagent/metadata.json)
 - Deferred mechanics: physical pause and migration

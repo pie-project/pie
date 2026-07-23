@@ -4,9 +4,13 @@
     "minor": 6
   },
   "candidate_count": 31,
-  "passing_count": 31,
+  "smoke_passing_count": 31,
   "evidence_counts": {
-    "policy-kernel-reproduction": 31
+    "inspired-adaptation": 31
+  },
+  "fidelity_counts": {
+    "incorrect": 14,
+    "material-semantic-gap": 17
   },
   "operation_counts": {
     "admit": 5,
@@ -43,9 +47,14 @@
         "multi-step engine execution",
         "full ATLAS DAG runtime"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "fixture_provenance": "independent implementation from the paper algorithm",
       "validation_status": "passing",
+      "fidelity": {
+        "classification": "material-semantic-gap",
+        "confidence": "high",
+        "summary": "Group attained-service ordering is recognizable, but PLAS queue bands, quanta, demotion, starvation reset, and ATLAS critical-path state are absent."
+      },
       "case": "tests/policies/replications/agentix/cases/basic.json",
       "expected": "tests/policies/replications/agentix/expected/basic.json"
     },
@@ -54,7 +63,7 @@
       "title": "Continuum: Efficient and Robust Multi-Turn LLM Agent Scheduling with KV Cache Time-to-Live",
       "paper_version": "arXiv 2511.02230",
       "source_url": "https://arxiv.org/abs/2511.02230",
-      "source_commit": null,
+      "source_commit": "316a5879",
       "source_license": "paper reference; no source copied",
       "component": "plex_paper_continuum",
       "implements": [
@@ -81,9 +90,14 @@
         "offline TTL estimator",
         "physical KV pinning"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "fixture_provenance": "independent implementation from the paper algorithm",
       "validation_status": "passing",
+      "fidelity": {
+        "classification": "material-semantic-gap",
+        "confidence": "high",
+        "summary": "The preempted, pinned, arrival ordering is present, but optimized TTL is reduced to a Boolean and expiry lacks time, history, pressure and same-program queue semantics."
+      },
       "case": "tests/policies/replications/continuum/cases/basic.json",
       "expected": "tests/policies/replications/continuum/expected/basic.json"
     },
@@ -92,7 +106,7 @@
       "title": "KVFlow: Efficient Prefix Caching for Accelerating LLM-Based Multi-Agent Workflows",
       "paper_version": "arXiv 2507.07400",
       "source_url": "https://arxiv.org/abs/2507.07400",
-      "source_commit": null,
+      "source_commit": "7ef897ea",
       "source_license": "paper reference; no source copied",
       "component": "plex_paper_kvflow",
       "implements": [
@@ -109,6 +123,8 @@
         "cache_ready",
         "fixed_prefix",
         "steps_to_execution",
+        "loading",
+        "offloading",
         "prefetch"
       ],
       "required_mechanics": [],
@@ -118,9 +134,14 @@
       "deferred_mechanics": [
         "CPU-GPU transfer overlap"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "fixture_provenance": "independent implementation from the paper algorithm",
       "validation_status": "passing",
+      "fidelity": {
+        "classification": "material-semantic-gap",
+        "confidence": "high",
+        "summary": "The eviction tuple and prefetch intent resemble KVFlow, but Agent Step Graph aggregation and transfer states are absent."
+      },
       "case": "tests/policies/replications/kvflow/cases/basic.json",
       "expected": "tests/policies/replications/kvflow/expected/basic.json"
     },
@@ -129,7 +150,7 @@
       "title": "Preble: Efficient Distributed Prompt Scheduling for LLM Serving",
       "paper_version": "arXiv 2407.00023",
       "source_url": "https://arxiv.org/abs/2407.00023",
-      "source_commit": null,
+      "source_commit": "bdc9135",
       "source_license": "paper reference; no source copied",
       "component": "plex_paper_preble",
       "implements": [
@@ -144,16 +165,22 @@
         "uncached_tokens",
         "cached_tokens",
         "load_cost",
-        "eviction_cost"
+        "eviction_cost",
+        "miss_prefill_cost"
       ],
       "required_mechanics": [],
       "deferred_mechanics": [
         "prefix replication",
         "autoscaling"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "fixture_provenance": "independent implementation from the paper algorithm",
       "validation_status": "passing",
+      "fidelity": {
+        "classification": "material-semantic-gap",
+        "confidence": "high",
+        "summary": "The exploit/explore threshold is present, but exploration omits per-target profiled cost and exploitation omits least-load tie-breaking and post-placement behavior."
+      },
       "case": "tests/policies/replications/preble/cases/basic.json",
       "expected": "tests/policies/replications/preble/expected/basic.json"
     },
@@ -162,7 +189,7 @@
       "title": "Efficient LLM Serving for Agentic Workflows: A Data Systems Perspective",
       "paper_version": "arXiv 2603.16104",
       "source_url": "https://arxiv.org/abs/2603.16104",
-      "source_commit": null,
+      "source_commit": "f688bf8a",
       "source_license": "paper reference; no source copied",
       "component": "plex_paper_helium",
       "implements": [
@@ -187,9 +214,14 @@
         "query-plan rewrite",
         "proactive cache warming"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "fixture_provenance": "independent implementation from the paper algorithm",
       "validation_status": "passing",
+      "fidelity": {
+        "classification": "material-semantic-gap",
+        "confidence": "high",
+        "summary": "One local ready/depth/reuse choice does not reproduce Helium's whole-DAG TRT planner, multi-worker assignment, nested sequences or capacity timeline."
+      },
       "case": "tests/policies/replications/helium/cases/basic.json",
       "expected": "tests/policies/replications/helium/expected/basic.json"
     },
@@ -198,7 +230,7 @@
       "title": "Fairness in Serving Large Language Models",
       "paper_version": "OSDI 2024 / arXiv 2401.00588",
       "source_url": "https://arxiv.org/abs/2401.00588",
-      "source_commit": null,
+      "source_commit": "192c2e",
       "source_license": "public artifact available; implementation is independent",
       "component": "plex_paper_vtc",
       "implements": [
@@ -207,18 +239,26 @@
       ],
       "policy_kernel": [
         "per-client virtual-token counters",
-        "observed input/output-token charging"
+        "returning-client counter lift",
+        "dispatch input and decode output charging"
       ],
       "required_facts": [
         "client_id",
-        "input_tokens",
-        "output_tokens"
+        "dispatch_input_tokens",
+        "input_weight",
+        "output_tokens",
+        "output_weight"
       ],
       "required_mechanics": [],
       "deferred_mechanics": [],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "fixture_provenance": "paper formula and public artifact interface",
       "validation_status": "passing",
+      "fidelity": {
+        "classification": "material-semantic-gap",
+        "confidence": "high",
+        "summary": "Minimum-counter ordering is recognizable, but the original implementation lacked counter lift, weighted costs, dispatch charging and iterative batch accounting."
+      },
       "case": "tests/policies/replications/vtc/cases/basic.json",
       "expected": "tests/policies/replications/vtc/expected/basic.json"
     },
@@ -227,26 +267,33 @@
       "title": "Simple is Better: Multiplication May Be All You Need for LLM Request Scheduling",
       "paper_version": "OSDI 2026 / arXiv 2603.15202",
       "source_url": "https://arxiv.org/abs/2603.15202",
-      "source_commit": null,
+      "source_commit": "a005ceb3a6689d30514bd27e45ede0db933d0fea",
       "source_license": "public router artifact available; implementation is independent",
       "component": "plex_paper_lmetric",
       "implements": [
         "route"
       ],
       "policy_kernel": [
-        "new_prefill_tokens multiplied by current_batch_size",
-        "hotspot exclusion"
+        "new_prefill_tokens multiplied by batch_size_plus_one",
+        "confirmed-hotspot load fallback"
       ],
       "required_facts": [
         "new_prefill_tokens",
         "current_batch_size",
-        "hotspot"
+        "hotspot_confirmed"
       ],
       "required_mechanics": [],
-      "deferred_mechanics": [],
-      "evidence_level": "policy-kernel-reproduction",
+      "deferred_mechanics": [
+        "two-phase hotspot detector"
+      ],
+      "evidence_level": "inspired-adaptation",
       "fixture_provenance": "paper metric and public router behavior",
       "validation_status": "passing",
+      "fidelity": {
+        "classification": "material-semantic-gap",
+        "confidence": "high",
+        "summary": "The P-token times batch-size core exists, but idle-replica semantics and the stateful two-phase hotspot detector are absent."
+      },
       "case": "tests/policies/replications/lmetric/cases/basic.json",
       "expected": "tests/policies/replications/lmetric/expected/basic.json"
     },
@@ -264,22 +311,33 @@
         "feedback"
       ],
       "policy_kernel": [
-        "interaction-aware admission",
-        "weighted service accounting"
+        "overload-aware interaction throttling",
+        "application-stage weighted service accounting"
       ],
       "required_facts": [
         "client_id",
+        "application_id",
         "weight",
-        "interference_cost",
-        "service_tokens"
+        "kv_overloaded",
+        "interaction_in_progress",
+        "user_rpm_remaining",
+        "app_rpm_remaining",
+        "input_tokens",
+        "system_tokens",
+        "output_tokens"
       ],
       "required_mechanics": [],
       "deferred_mechanics": [
-        "production interference estimator"
+        "production interaction and RPM estimator"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "fixture_provenance": "independent reference model from the paper",
       "validation_status": "passing",
+      "fidelity": {
+        "classification": "incorrect",
+        "confidence": "high",
+        "summary": "The original kernel confused interaction-aware throttling with an invented interference score and omitted OIT and application-stage WSC normalization."
+      },
       "case": "tests/policies/replications/fairserve/cases/basic.json",
       "expected": "tests/policies/replications/fairserve/expected/basic.json"
     },
@@ -288,7 +346,7 @@
       "title": "Marconi: Prefix Caching for the Era of Hybrid LLMs",
       "paper_version": "MLSys 2025 / arXiv 2411.19379",
       "source_url": "https://arxiv.org/abs/2411.19379",
-      "source_commit": null,
+      "source_commit": "08016617b1524e6bf6ac29b680641cc945bda7f0",
       "source_license": "public artifact available; implementation is independent",
       "component": "plex_paper_marconi",
       "implements": [
@@ -307,9 +365,14 @@
       "deferred_mechanics": [
         "hybrid-model kernel integration"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "fixture_provenance": "paper formula and public artifact interface",
       "validation_status": "passing",
+      "fidelity": {
+        "classification": "incorrect",
+        "confidence": "high",
+        "summary": "A reuse-times-FLOPs-per-byte knapsack replaces Marconi's separate speculative admission and recency-plus-FLOP-efficiency eviction."
+      },
       "case": "tests/policies/replications/marconi/cases/basic.json",
       "expected": "tests/policies/replications/marconi/expected/basic.json"
     },
@@ -337,9 +400,14 @@
       ],
       "required_mechanics": [],
       "deferred_mechanics": [],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "fixture_provenance": "independent reference model from the paper",
       "validation_status": "passing",
+      "fidelity": {
+        "classification": "material-semantic-gap",
+        "confidence": "high",
+        "summary": "A static lowest-score leaf resembles PGDSF, but clocks, updates, iterative frontier evolution and GPU-host hierarchy are missing."
+      },
       "case": "tests/policies/replications/ragcache/cases/basic.json",
       "expected": "tests/policies/replications/ragcache/expected/basic.json"
     },
@@ -365,13 +433,20 @@
         "cached_tokens",
         "load",
         "quantum",
-        "service_tokens"
+        "extend_tokens",
+        "worker_deficit",
+        "output_tokens"
       ],
       "required_mechanics": [],
       "deferred_mechanics": [],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "fixture_provenance": "independent reference model from the paper",
       "validation_status": "passing",
+      "fidelity": {
+        "classification": "material-semantic-gap",
+        "confidence": "high",
+        "summary": "Deficit and locality signals are present, but the original implementation reversed locality-first ordering and omitted refill cycles, extend accounting and per-worker deficits."
+      },
       "case": "tests/policies/replications/dlpm/cases/basic.json",
       "expected": "tests/policies/replications/dlpm/expected/basic.json"
     },
@@ -380,7 +455,7 @@
       "title": "InferCept: Efficient Intercept Support for Augmented Large Language Model Inference",
       "paper_version": "arXiv 2402.01869",
       "source_url": "https://arxiv.org/abs/2402.01869",
-      "source_commit": null,
+      "source_commit": "3a1a4dac37cb569e767bc4a95ef8ed0995a13b99",
       "source_license": "paper reference; no source copied",
       "component": "plex_paper_infercept",
       "implements": [
@@ -404,9 +479,14 @@
       "deferred_mechanics": [
         "physical swap implementation"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "fixture_provenance": "independent reference model from the paper",
       "validation_status": "passing",
+      "fidelity": {
+        "classification": "incorrect",
+        "confidence": "high",
+        "summary": "The kernel conflates interception swap priority with resume scheduling and substitutes a non-paper reuse-versus-recompute predicate for preserve/swap/discard waste."
+      },
       "case": "tests/policies/replications/infercept/cases/basic.json",
       "expected": "tests/policies/replications/infercept/expected/basic.json"
     },
@@ -415,7 +495,7 @@
       "title": "PEEK: Predictive Queue-Informed KV Cache Management for LLM Serving",
       "paper_version": "arXiv 2607.02525",
       "source_url": "https://arxiv.org/abs/2607.02525",
-      "source_commit": null,
+      "source_commit": "e8ca1173abc103c25c1e29e011df94b938d5305d",
       "source_license": "paper reference; no source copied",
       "component": "plex_paper_peek",
       "implements": [
@@ -435,9 +515,14 @@
       ],
       "required_mechanics": [],
       "deferred_mechanics": [],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "fixture_provenance": "independent reference model from the paper",
       "validation_status": "passing",
+      "fidelity": {
+        "classification": "material-semantic-gap",
+        "confidence": "high",
+        "summary": "Only the demand-and-fairness idea remains; pending trie, cLPM sections, stride lanes, dynamic fairness and ancestor-demand eviction are absent."
+      },
       "case": "tests/policies/replications/peek/cases/basic.json",
       "expected": "tests/policies/replications/peek/expected/basic.json"
     },
@@ -446,7 +531,7 @@
       "title": "Queue Management for SLO-Oriented Large Language Model Serving",
       "paper_version": "arXiv 2407.00047",
       "source_url": "https://arxiv.org/abs/2407.00047",
-      "source_commit": null,
+      "source_commit": "eea5b6",
       "source_license": "paper reference; no source copied",
       "component": "plex_paper_qlm",
       "implements": [
@@ -467,9 +552,14 @@
       ],
       "required_mechanics": [],
       "deferred_mechanics": [],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "fixture_provenance": "independent reference model from the paper",
       "validation_status": "passing",
+      "fidelity": {
+        "classification": "incorrect",
+        "confidence": "high",
+        "summary": "Independent SLO gates and scalar wait ordering do not implement request grouping, RWT estimation, virtual queues or the global LP."
+      },
       "case": "tests/policies/replications/qlm/cases/basic.json",
       "expected": "tests/policies/replications/qlm/expected/basic.json"
     },
@@ -501,9 +591,14 @@
       "deferred_mechanics": [
         "replica provisioning"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "fixture_provenance": "independent reference model from the paper",
       "validation_status": "passing",
+      "fidelity": {
+        "classification": "incorrect",
+        "confidence": "high",
+        "summary": "Independent feasibility gates and least-slack order omit the defining joint DP, performance model, mixed token batches, speculation and best-effort fallback."
+      },
       "case": "tests/policies/replications/slos-serve/cases/basic.json",
       "expected": "tests/policies/replications/slos-serve/expected/basic.json"
     },
@@ -512,7 +607,7 @@
       "title": "Efficiently Scaling LLM Reasoning with Certaindex",
       "paper_version": "arXiv 2412.20993",
       "source_url": "https://arxiv.org/abs/2412.20993",
-      "source_commit": null,
+      "source_commit": "0d2f1b",
       "source_license": "public artifact available; implementation is independent",
       "component": "plex_paper_dynasor",
       "implements": [
@@ -535,9 +630,14 @@
       "deferred_mechanics": [
         "predictor training"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "fixture_provenance": "paper formula and public artifact interface",
       "validation_status": "passing",
+      "fidelity": {
+        "classification": "material-semantic-gap",
+        "confidence": "high",
+        "summary": "Thresholded termination remains, but Certaindex computation, stable-answer preservation, program-level knobs, gang scheduling and SJF are absent."
+      },
       "case": "tests/policies/replications/dynasor/cases/basic.json",
       "expected": "tests/policies/replications/dynasor/expected/basic.json"
     },
@@ -564,9 +664,14 @@
       "deferred_mechanics": [
         "simultaneous branch execution"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "fixture_provenance": "independent reference model from the paper",
       "validation_status": "passing",
+      "fidelity": {
+        "classification": "incorrect",
+        "confidence": "high",
+        "summary": "Fewest-completed-branches is not Justitia's predicted KV token-time cost and GPS virtual-finish scheduling."
+      },
       "case": "tests/policies/replications/justitia/cases/basic.json",
       "expected": "tests/policies/replications/justitia/expected/basic.json"
     },
@@ -596,9 +701,14 @@
       ],
       "required_mechanics": [],
       "deferred_mechanics": [],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "fixture_provenance": "independent reference model from the paper",
       "validation_status": "passing",
+      "fidelity": {
+        "classification": "material-semantic-gap",
+        "confidence": "high",
+        "summary": "Queue hints exist, but token quotas, two-phase redistribution, head-of-line bypass and the cost-aware adapter cache are absent."
+      },
       "case": "tests/policies/replications/chameleon/cases/basic.json",
       "expected": "tests/policies/replications/chameleon/expected/basic.json"
     },
@@ -630,9 +740,14 @@
       "deferred_mechanics": [
         "physical tier promotion"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "fixture_provenance": "independent reference model from the paper",
       "validation_status": "passing",
+      "fidelity": {
+        "classification": "incorrect",
+        "confidence": "high",
+        "summary": "A cumulative-count threshold at primary admission does not implement clocked GPU leaf eviction, host admission or host-to-GPU promotion."
+      },
       "case": "tests/policies/replications/hotprefix/cases/basic.json",
       "expected": "tests/policies/replications/hotprefix/expected/basic.json"
     },
@@ -654,7 +769,11 @@
       ],
       "required_facts": [
         "upstream_elapsed_ms",
-        "downstream_p95_ms",
+        "current_queue_ms",
+        "current_execution_ms",
+        "downstream_queue_ms",
+        "downstream_execution_ms",
+        "downstream_batch_wait_p10_ms",
         "deadline_ms"
       ],
       "required_mechanics": [],
@@ -664,9 +783,14 @@
       "deferred_mechanics": [
         "latency-distribution estimator"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "fixture_provenance": "independent reference model from the paper",
       "validation_status": "passing",
+      "fidelity": {
+        "classification": "incorrect",
+        "confidence": "high",
+        "summary": "The original two-term P95 gate omitted PARD's queue, execution, batch-wait quantile, pipeline state and adaptive HBF/LBF ordering."
+      },
       "case": "tests/policies/replications/pard/cases/basic.json",
       "expected": "tests/policies/replications/pard/expected/basic.json"
     },
@@ -700,9 +824,14 @@
       "deferred_mechanics": [
         "simultaneous branch execution"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "fixture_provenance": "independent reference model from the paper",
       "validation_status": "passing",
+      "fidelity": {
+        "classification": "incorrect",
+        "confidence": "high",
+        "summary": "A static group cap does not implement TAPER's protected token, slack-budgeted widening and marginal utility planner; cancellation contradicts reversible deferral."
+      },
       "case": "tests/policies/replications/branch-regulation/cases/basic.json",
       "expected": "tests/policies/replications/branch-regulation/expected/basic.json"
     },
@@ -711,7 +840,7 @@
       "title": "DualMap: Enabling Both Cache Affinity and Load Balancing for Distributed LLM Serving",
       "paper_version": "arXiv 2602.06502",
       "source_url": "https://arxiv.org/abs/2602.06502",
-      "source_commit": null,
+      "source_commit": "24816acc",
       "source_license": "paper reference; no source copied",
       "component": "plex_paper_dualmap",
       "implements": [
@@ -723,9 +852,11 @@
         "hotspot migration intent"
       ],
       "required_facts": [
-        "prefix_hit",
-        "slo_risk",
+        "slo_ms",
+        "hash_candidate",
         "hash_choice",
+        "prefix_hit_tokens",
+        "predicted_ttft_ms",
         "hotspot"
       ],
       "required_mechanics": [],
@@ -735,9 +866,14 @@
       "deferred_mechanics": [
         "physical migration"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "fixture_provenance": "independent reference model from the paper",
       "validation_status": "passing",
+      "fidelity": {
+        "classification": "material-semantic-gap",
+        "confidence": "high",
+        "summary": "Cache-hit and risk vocabulary is present, but two-choice hashing, SLO switching and benefit-ranked queued rebalancing are absent."
+      },
       "case": "tests/policies/replications/dualmap/cases/basic.json",
       "expected": "tests/policies/replications/dualmap/expected/basic.json"
     },
@@ -746,7 +882,7 @@
       "title": "Llumnix: Dynamic Scheduling for Large Language Model Serving",
       "paper_version": "arXiv 2406.03243",
       "source_url": "https://arxiv.org/abs/2406.03243",
-      "source_commit": null,
+      "source_commit": "3fb6c03",
       "source_license": "public artifact available; implementation is independent",
       "component": "plex_paper_llumnix",
       "implements": [
@@ -759,6 +895,8 @@
       ],
       "required_facts": [
         "virtual_usage",
+        "memory_capacity",
+        "batch_size",
         "live_reschedule"
       ],
       "required_mechanics": [],
@@ -768,9 +906,14 @@
       "deferred_mechanics": [
         "physical migration"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "fixture_provenance": "paper policy and public artifact interface",
       "validation_status": "passing",
+      "fidelity": {
+        "classification": "material-semantic-gap",
+        "confidence": "high",
+        "summary": "One virtual-usage scalar omits Llumnix freeness, usage rules, pairing, victim selection and migration coordination."
+      },
       "case": "tests/policies/replications/llumnix/cases/basic.json",
       "expected": "tests/policies/replications/llumnix/expected/basic.json"
     },
@@ -787,25 +930,28 @@
       ],
       "policy_kernel": [
         "first-turn load balance",
-        "follow-up cache affinity",
-        "tail-outlier migration"
+        "guarded follow-up cache affinity",
+        "overload and likely-eviction fallback"
       ],
       "required_facts": [
-        "generation_id",
         "cache_affinity",
         "load",
-        "tail_outlier"
+        "estimated_history_hit",
+        "overload_ppm",
+        "hit_ratio_ppm"
       ],
       "required_mechanics": [],
-      "optional_mechanics": [
-        "request.rebalance@1"
-      ],
       "deferred_mechanics": [
-        "physical migration"
+        "global-tier KV fetch"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "fixture_provenance": "independent reference model from the paper",
       "validation_status": "passing",
+      "fidelity": {
+        "classification": "material-semantic-gap",
+        "confidence": "high",
+        "summary": "The first/follow-up split exists, but overload and eviction guards are absent and active migration differs from global-tier fallback routing."
+      },
       "case": "tests/policies/replications/smetric/cases/basic.json",
       "expected": "tests/policies/replications/smetric/expected/basic.json"
     },
@@ -814,7 +960,7 @@
       "title": "ThunderAgent: A Simple, Fast and Program-Aware Agentic Inference System",
       "paper_version": "arXiv 2602.13692",
       "source_url": "https://arxiv.org/abs/2602.13692",
-      "source_commit": null,
+      "source_commit": "7ddc8610",
       "source_license": "public artifact available; implementation is independent",
       "component": "plex_paper_thunderagent",
       "implements": [
@@ -841,9 +987,14 @@
       "deferred_mechanics": [
         "physical pause and migration"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "fixture_provenance": "paper policy and public artifact interface",
       "validation_status": "passing",
+      "fidelity": {
+        "classification": "incorrect",
+        "confidence": "high",
+        "summary": "Tool-ready filtering and caller-supplied migration do not implement reasoning/acting lifecycle, thrashing detection, pause/restore or tool-resource management."
+      },
       "case": "tests/policies/replications/thunderagent/cases/basic.json",
       "expected": "tests/policies/replications/thunderagent/expected/basic.json"
     },
@@ -880,9 +1031,14 @@
       "deferred_mechanics": [
         "proactive scaling"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "fixture_provenance": "independent reference model from the paper",
       "validation_status": "passing",
+      "fidelity": {
+        "classification": "incorrect",
+        "confidence": "high",
+        "summary": "Generic lookahead, rank and next-use scalars do not implement lineage-aware caching, OOM-safe headroom routing or dynamic graph priority."
+      },
       "case": "tests/policies/replications/pythia/cases/basic.json",
       "expected": "tests/policies/replications/pythia/expected/basic.json"
     },
@@ -899,11 +1055,18 @@
         "feedback"
       ],
       "policy_kernel": [
-        "just-enough heterogeneous target choice",
+        "just-enough E2E-SLO target choice",
         "risk-triggered migration"
       ],
       "required_facts": [
-        "quality_gap_ppm",
+        "deadline_ms",
+        "input_tokens",
+        "predicted_output_tokens",
+        "queue_ms",
+        "cached_tokens",
+        "prefill_ms_per_token",
+        "decode_ms_per_token",
+        "capability_rank",
         "cost",
         "risk_ppm",
         "migration_threshold_ppm"
@@ -916,9 +1079,14 @@
         "predictor training",
         "provisioning"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "fixture_provenance": "fixed predictor-output reference model",
       "validation_status": "passing",
+      "fidelity": {
+        "classification": "incorrect",
+        "confidence": "high",
+        "summary": "Quality-gap/cost ordering is not GoodServe's E2E-SLO goodput objective or just-enough GPU selection."
+      },
       "case": "tests/policies/replications/goodserve/cases/basic.json",
       "expected": "tests/policies/replications/goodserve/expected/basic.json"
     },
@@ -934,19 +1102,24 @@
         "route"
       ],
       "policy_kernel": [
-        "heavy first-prefill placement",
-        "conversation-tail affinity"
+        "dedicated first-turn prefiller",
+        "persistent decoder binding by active KV occupancy"
       ],
       "required_facts": [
-        "prefill_capacity",
-        "conversation_affinity",
-        "load"
+        "prefiller",
+        "bound_target_id",
+        "active_kv_bytes"
       ],
       "required_mechanics": [],
       "deferred_mechanics": [],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "fixture_provenance": "independent reference model from the paper",
       "validation_status": "passing",
+      "fidelity": {
+        "classification": "material-semantic-gap",
+        "confidence": "high",
+        "summary": "Only first-turn versus follow-up routing remains; prefiller role, one-time KV transfer, lowest-KV decoder binding and capacity equations are absent."
+      },
       "case": "tests/policies/replications/conserve/cases/basic.json",
       "expected": "tests/policies/replications/conserve/expected/basic.json"
     },
@@ -955,7 +1128,7 @@
       "title": "Parrot: Efficient Serving of LLM-based Applications with Semantic Variable",
       "paper_version": "OSDI 2024",
       "source_url": "https://www.usenix.org/conference/osdi24/presentation/lin-chaofan",
-      "source_commit": null,
+      "source_commit": "2e1825ee",
       "source_license": "public artifact available; implementation is independent",
       "component": "plex_paper_parrot",
       "implements": [
@@ -974,9 +1147,14 @@
       "deferred_mechanics": [
         "general semantic-variable DAG runtime"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "fixture_provenance": "paper policy and public artifact interface",
       "validation_status": "passing",
+      "fidelity": {
+        "classification": "material-semantic-gap",
+        "confidence": "high",
+        "summary": "Dependency readiness is only a prerequisite; criteria propagation, task groups, prefix/context grouping, capacity checks and interference-aware placement are absent."
+      },
       "case": "tests/policies/replications/parrot/cases/basic.json",
       "expected": "tests/policies/replications/parrot/expected/basic.json"
     },
@@ -1000,6 +1178,7 @@
       ],
       "required_facts": [
         "cache_locality",
+        "group_service",
         "load",
         "steal",
         "workflow_ttl_ms"
@@ -1011,9 +1190,14 @@
       "deferred_mechanics": [
         "physical work stealing"
       ],
-      "evidence_level": "policy-kernel-reproduction",
+      "evidence_level": "inspired-adaptation",
       "fixture_provenance": "independent reference model from the paper",
       "validation_status": "passing",
+      "fidelity": {
+        "classification": "incorrect",
+        "confidence": "high",
+        "summary": "Always-locality routing, generic group service and Boolean TTL omit WA-LRU, adaptive TTL, guarded stealing, KV migration and deadline-based AFS."
+      },
       "case": "tests/policies/replications/saga/cases/basic.json",
       "expected": "tests/policies/replications/saga/expected/basic.json"
     },
@@ -1022,26 +1206,41 @@
       "title": "RouteBalance: Fused Model Routing and Load Balancing for Heterogeneous LLM Serving",
       "paper_version": "arXiv 2606.17949",
       "source_url": "https://arxiv.org/abs/2606.17949",
-      "source_commit": null,
+      "source_commit": "671db9facc2b443c6cdd1c309d13fc4fcaa43cb4",
       "source_license": "paper reference; no source copied",
       "component": "plex_paper_routebalance",
       "implements": [
         "route"
       ],
       "policy_kernel": [
-        "bounded joint request-target assignment",
-        "fused utility and capacity"
+        "normalized quality-latency-cost score",
+        "cost-budget filtering",
+        "LPT greedy assignment with dead-reckoned load"
       ],
       "required_facts": [
-        "utility"
+        "predicted_output_tokens",
+        "cost_budget",
+        "quality_weight_ppm",
+        "cost_weight_ppm",
+        "latency_weight_ppm",
+        "quality_ppm",
+        "cost",
+        "latency_ms",
+        "decode_ms_per_token",
+        "queued_tokens"
       ],
       "required_mechanics": [],
       "deferred_mechanics": [
         "replica provisioning"
       ],
-      "evidence_level": "policy-kernel-reproduction",
-      "fixture_provenance": "independent bounded reference solver",
+      "evidence_level": "inspired-adaptation",
+      "fixture_provenance": "paper equations and public artifact decision flow",
       "validation_status": "passing",
+      "fidelity": {
+        "classification": "incorrect",
+        "confidence": "high",
+        "summary": "Exhaustive static utility matching is the opposite of RouteBalance's normalized quality/latency/cost score and LPT greedy dead-reckoning."
+      },
       "case": "tests/policies/replications/routebalance/cases/basic.json",
       "expected": "tests/policies/replications/routebalance/expected/basic.json"
     }

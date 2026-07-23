@@ -3,7 +3,7 @@
   "title": "Queue Management for SLO-Oriented Large Language Model Serving",
   "paper_version": "arXiv 2407.00047",
   "source_url": "https://arxiv.org/abs/2407.00047",
-  "source_commit": null,
+  "source_commit": "eea5b6",
   "source_license": "paper reference; no source copied",
   "component": "plex_paper_qlm",
   "implements": [
@@ -24,7 +24,7 @@
   ],
   "required_mechanics": [],
   "deferred_mechanics": [],
-  "evidence_level": "policy-kernel-reproduction",
+  "evidence_level": "inspired-adaptation",
   "fixture_provenance": "independent reference model from the paper",
   "validation_status": "passing"
 }

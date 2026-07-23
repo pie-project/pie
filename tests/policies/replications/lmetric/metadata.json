@@ -3,15 +3,22 @@
   "title": "Simple is Better: Multiplication May Be All You Need for LLM Request Scheduling",
   "paper_version": "OSDI 2026 / arXiv 2603.15202",
   "source_url": "https://arxiv.org/abs/2603.15202",
-  "source_commit": null,
+  "source_commit": "a005ceb3a6689d30514bd27e45ede0db933d0fea",
   "source_license": "public router artifact available; implementation is independent",
   "component": "plex_paper_lmetric",
   "implements": ["route"],
-  "policy_kernel": ["new_prefill_tokens multiplied by current_batch_size", "hotspot exclusion"],
-  "required_facts": ["new_prefill_tokens", "current_batch_size", "hotspot"],
+  "policy_kernel": [
+    "new_prefill_tokens multiplied by batch_size_plus_one",
+    "confirmed-hotspot load fallback"
+  ],
+  "required_facts": [
+    "new_prefill_tokens",
+    "current_batch_size",
+    "hotspot_confirmed"
+  ],
   "required_mechanics": [],
-  "deferred_mechanics": [],
-  "evidence_level": "policy-kernel-reproduction",
+  "deferred_mechanics": ["two-phase hotspot detector"],
+  "evidence_level": "inspired-adaptation",
   "fixture_provenance": "paper metric and public router behavior",
   "validation_status": "passing"
 }

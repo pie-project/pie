@@ -46,7 +46,7 @@ No named public dataset was reliably confirmed; the workload description is cate
 
 - Component: `plex_paper_chameleon`
 - Operations: `admit`, `schedule`, `cache`
-- Evidence: `policy-kernel-reproduction`
+- Evidence: `inspired-adaptation`
 - Validation: `passing`
 - Metadata: [`tests/policies/replications/chameleon/metadata.json`](../../tests/policies/replications/chameleon/metadata.json)
 - Deferred mechanics: None

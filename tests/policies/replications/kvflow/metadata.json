@@ -3,7 +3,7 @@
   "title": "KVFlow: Efficient Prefix Caching for Accelerating LLM-Based Multi-Agent Workflows",
   "paper_version": "arXiv 2507.07400",
   "source_url": "https://arxiv.org/abs/2507.07400",
-  "source_commit": null,
+  "source_commit": "7ef897ea",
   "source_license": "paper reference; no source copied",
   "component": "plex_paper_kvflow",
   "implements": ["schedule", "cache"],
@@ -13,11 +13,13 @@
     "steps-to-execution fixed-prefix ordering",
     "prefetch intent"
   ],
-  "required_facts": ["cache_ready", "fixed_prefix", "steps_to_execution", "prefetch"],
+  "required_facts": ["cache_ready", "fixed_prefix",   "steps_to_execution",
+  "loading",
+  "offloading", "prefetch"],
   "required_mechanics": [],
   "optional_mechanics": ["cache.prefetch@1"],
   "deferred_mechanics": ["CPU-GPU transfer overlap"],
-  "evidence_level": "policy-kernel-reproduction",
+  "evidence_level": "inspired-adaptation",
   "fixture_provenance": "independent implementation from the paper algorithm",
   "validation_status": "passing"
 }

@@ -11,11 +11,18 @@
     "feedback"
   ],
   "policy_kernel": [
-    "just-enough heterogeneous target choice",
+    "just-enough E2E-SLO target choice",
     "risk-triggered migration"
   ],
   "required_facts": [
-    "quality_gap_ppm",
+    "deadline_ms",
+    "input_tokens",
+    "predicted_output_tokens",
+    "queue_ms",
+    "cached_tokens",
+    "prefill_ms_per_token",
+    "decode_ms_per_token",
+    "capability_rank",
     "cost",
     "risk_ppm",
     "migration_threshold_ppm"
@@ -28,7 +35,7 @@
     "predictor training",
     "provisioning"
   ],
-  "evidence_level": "policy-kernel-reproduction",
+  "evidence_level": "inspired-adaptation",
   "fixture_provenance": "fixed predictor-output reference model",
   "validation_status": "passing"
 }

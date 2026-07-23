@@ -47,7 +47,7 @@ Named datasets/workloads identified from the primary text or manual audit.
 
 - Component: `plex_paper_kvflow`
 - Operations: `schedule`, `cache`
-- Evidence: `policy-kernel-reproduction`
+- Evidence: `inspired-adaptation`
 - Validation: `passing`
 - Metadata: [`tests/policies/replications/kvflow/metadata.json`](../../tests/policies/replications/kvflow/metadata.json)
 - Deferred mechanics: CPU-GPU transfer overlap

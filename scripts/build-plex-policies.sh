@@ -220,9 +220,12 @@ do
             operations=admit,schedule
             optional=request.cancel@1
             ;;
-        plex_paper_dualmap|plex_paper_smetric)
+        plex_paper_dualmap)
             operations=route
             optional=request.rebalance@1
+            ;;
+        plex_paper_smetric)
+            operations=route
             ;;
         plex_paper_llumnix|plex_paper_goodserve)
             operations=route,feedback

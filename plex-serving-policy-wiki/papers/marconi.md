@@ -46,7 +46,7 @@ No named public dataset was reliably confirmed; the workload description is cate
 
 - Component: `plex_paper_marconi`
 - Operations: `cache`, `feedback`
-- Evidence: `policy-kernel-reproduction`
+- Evidence: `inspired-adaptation`
 - Validation: `passing`
 - Metadata: [`tests/policies/replications/marconi/metadata.json`](../../tests/policies/replications/marconi/metadata.json)
 - Deferred mechanics: hybrid-model kernel integration

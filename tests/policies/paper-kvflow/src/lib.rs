@@ -13,20 +13,19 @@ impl Policy for KvFlow {
         _state: &mut State,
         _host: &Host,
     ) -> plex::Result<SchedulePlan> {
-        let mut order = (0..ctx.runnable.len()).collect::<Vec<_>>();
-        order.sort_by_key(|&index| {
-            (
-                !ctx.runnable[index].facts["cache_ready"]
+        let order = (0..ctx.runnable.len())
+            .filter(|&index| {
+                ctx.runnable[index].facts["cache_ready"]
                     .as_bool()
-                    .unwrap_or(false),
-                index,
-            )
-        });
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+        let mut remaining_selections = ctx.capacity.max_selections;
         let mut remaining_requests = ctx.capacity.max_requests;
         let mut remaining_tokens = ctx.capacity.max_total_tokens;
         let mut selections = Vec::new();
         for index in order {
-            if remaining_requests == 0 || remaining_tokens == 0 {
+            if remaining_selections == 0 || remaining_requests == 0 || remaining_tokens == 0 {
                 break;
             }
             let budget =
@@ -35,6 +34,7 @@ impl Policy for KvFlow {
                 requests: vec![index as u32],
                 token_budgets: vec![budget],
             });
+            remaining_selections -= 1;
             remaining_requests -= 1;
             remaining_tokens -= u64::from(budget);
         }
@@ -46,7 +46,13 @@ impl Policy for KvFlow {
             .resident
             .iter()
             .enumerate()
-            .filter(|(_, resident)| resident.reclaimable)
+            .filter(|(_, resident)| {
+                resident.reclaimable
+                    && !resident.object.facts["loading"].as_bool().unwrap_or(false)
+                    && !resident.object.facts["offloading"]
+                        .as_bool()
+                        .unwrap_or(false)
+            })
             .map(|(index, resident)| {
                 (
                     resident.object.facts["fixed_prefix"]
@@ -71,11 +77,50 @@ impl Policy for KvFlow {
                 )?;
             }
         }
+        let admissions = vec![CacheAdmission::Cache; ctx.prospective.len()];
         Ok(CachePlan {
-            admissions: vec![CacheAdmission::Cache; ctx.prospective.len()],
-            reclaim: reclaim.into_iter().map(|(_, _, index)| index).collect(),
+            reclaim: reclaim_prefix(
+                ctx,
+                &admissions,
+                reclaim.into_iter().map(|(_, _, index)| index),
+            ),
+            admissions,
         })
     }
+}
+
+fn reclaim_prefix(
+    ctx: &CacheContext,
+    admissions: &[CacheAdmission],
+    ordered: impl IntoIterator<Item = u32>,
+) -> Vec<u32> {
+    let used = ctx
+        .resident
+        .iter()
+        .fold(ctx.capacity.fixed_bytes, |total, resident| {
+            total.saturating_add(resident.object.size_bytes)
+        })
+        .saturating_add(
+            ctx.prospective
+                .iter()
+                .zip(admissions)
+                .filter(|(_, admission)| **admission == CacheAdmission::Cache)
+                .fold(0u64, |total, (object, _)| {
+                    total.saturating_add(object.size_bytes)
+                }),
+        );
+    let required = used.saturating_sub(ctx.capacity.max_bytes);
+    let mut freed = 0u64;
+    let mut reclaim = Vec::new();
+    for index in ordered {
+        if freed >= required {
+            break;
+        }
+        let resident = &ctx.resident[index as usize];
+        freed = freed.saturating_add(resident.object.size_bytes);
+        reclaim.push(index);
+    }
+    reclaim
 }
 
 plex::export_policy!(KvFlow);

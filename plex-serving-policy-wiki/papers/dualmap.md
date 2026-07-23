@@ -47,7 +47,7 @@ Named datasets/workloads identified from the primary text or manual audit.
 
 - Component: `plex_paper_dualmap`
 - Operations: `route`
-- Evidence: `policy-kernel-reproduction`
+- Evidence: `inspired-adaptation`
 - Validation: `passing`
 - Metadata: [`tests/policies/replications/dualmap/metadata.json`](../../tests/policies/replications/dualmap/metadata.json)
 - Deferred mechanics: physical migration

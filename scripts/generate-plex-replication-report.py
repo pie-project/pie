@@ -7,6 +7,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 REPLICATIONS = ROOT / "tests" / "policies" / "replications"
+FIDELITY = ROOT / "tests" / "policies" / "fidelity-audit.json"
 REPORT_JSON = ROOT / "tests" / "policies" / "replication-report.json"
 REPORT_MD = ROOT / "plex_replication_report.md"
 REQUIRED = {
@@ -35,6 +36,9 @@ EVIDENCE = {
 
 def main() -> None:
     index = read_json(REPLICATIONS / "index.json")
+    fidelity = {
+        entry["id"]: entry for entry in read_json(FIDELITY)["entries"]
+    }
     entries = []
     for slug in index["replications"]:
         metadata = read_json(REPLICATIONS / slug / "metadata.json")
@@ -47,9 +51,17 @@ def main() -> None:
             raise SystemExit(f"{slug}: unknown evidence level")
         if metadata["validation_status"] != "passing":
             raise SystemExit(f"{slug}: validation is not passing")
+        if slug not in fidelity:
+            raise SystemExit(f"{slug}: missing independent fidelity audit")
+        read_json(REPLICATIONS / slug / "cases" / "basic.json")
+        read_json(REPLICATIONS / slug / "expected" / "basic.json")
         entries.append(
             {
                 **metadata,
+                "fidelity": {
+                    key: fidelity[slug][key]
+                    for key in ("classification", "confidence", "summary")
+                },
                 "case": f"tests/policies/replications/{slug}/cases/basic.json",
                 "expected": f"tests/policies/replications/{slug}/expected/basic.json",
             }
@@ -62,10 +74,18 @@ def main() -> None:
     report = {
         "contract": index["contract"],
         "candidate_count": len(entries),
-        "passing_count": sum(
+        "smoke_passing_count": sum(
             entry["validation_status"] == "passing" for entry in entries
         ),
         "evidence_counts": dict(sorted(evidence.items())),
+        "fidelity_counts": dict(
+            sorted(
+                Counter(
+                    entry["fidelity"]["classification"]
+                    for entry in entries
+                ).items()
+            )
+        ),
         "operation_counts": dict(sorted(operations.items())),
         "entries": entries,
     }
@@ -75,13 +95,13 @@ def main() -> None:
 
 def markdown(report: dict) -> str:
     lines = [
-        "# PLEX v0.6 Replication Report",
+        "# PLEX v0.6 Replication and Fidelity Report",
         "",
         "This report is generated from committed replication metadata by",
         "`scripts/generate-plex-replication-report.py`.",
         "",
         f"- Candidates: {report['candidate_count']}",
-        f"- Passing: {report['passing_count']}",
+        f"- Runtime smoke passing: {report['smoke_passing_count']}",
         f"- Contract: `{report['contract']['major']}.{report['contract']['minor']}`",
         "",
         "## Evidence",
@@ -92,10 +112,19 @@ def markdown(report: dict) -> str:
     lines.extend(
         [
             "",
+            "## Independent fidelity",
+            "",
+        ]
+    )
+    for classification, count in report["fidelity_counts"].items():
+        lines.append(f"- `{classification}`: {count}")
+    lines.extend(
+        [
+            "",
             "## Candidates",
             "",
-            "| ID | Title | Operations | Evidence | Deferred mechanics |",
-            "|---|---|---|---|---:|",
+            "| ID | Title | Operations | Evidence | Fidelity | Deferred mechanics |",
+            "|---|---|---|---|---|---:|",
         ]
     )
     for entry in report["entries"]:
@@ -103,14 +132,18 @@ def markdown(report: dict) -> str:
         operations = ", ".join(f"`{operation}`" for operation in entry["implements"])
         lines.append(
             f"| `{entry['id']}` | {title} | {operations} | "
-            f"`{entry['evidence_level']}` | {len(entry['deferred_mechanics'])} |"
+            f"`{entry['evidence_level']}` | "
+            f"`{entry['fidelity']['classification']}` | "
+            f"{len(entry['deferred_mechanics'])} |"
         )
     lines.extend(
         [
             "",
-            "Evidence levels follow `plex_0.6.md`. Physical movement, provisioning,",
-            "predictor training, and other deferred mechanics are not counted as",
-            "replicated behavior.",
+            "Runtime smoke means the package loads and its committed fixture path is",
+            "covered by the release suite. It is not a claim of paper fidelity.",
+            "Independent reviewers found no faithful or faithful-with-deferred-mechanics",
+            "implementation; all entries are therefore classified as inspired",
+            "adaptations until paper/artifact differential traces pass.",
             "",
         ]
     )

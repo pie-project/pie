@@ -7,16 +7,16 @@
 | Field | Value |
 |---|---|
 | Primary paper | [https://www.usenix.org/conference/osdi24/presentation/lin-chaofan](https://www.usenix.org/conference/osdi24/presentation/lin-chaofan) |
-| Venue / status | arXiv preprint |
+| Venue / status | OSDI 2024 |
 | Year | 2024 |
 | Authors | Chaofan Lin, Zhenhua Han, C. R. Zhang, Yuqing Yang, Fan Yang, Chen Chen, Lili Qiu |
 | Institutions / group context | Shanghai Jiao Tong University, Microsoft Research |
-| Reputation evidence | recent preprint; peer-review status is not confirmed by this catalog; author affiliations include Shanghai Jiao Tong University, Microsoft Research; no official public artifact was confirmed. |
+| Reputation evidence | peer-reviewed at OSDI 2024; author affiliations include Shanghai Jiao Tong University and Microsoft Research; a public implementation is available. |
 | Citation count | 5 via OpenAlex (retrieved 2026-07-23; preprint and proceedings records may split citations) |
 | Metadata provenance | OpenAlex |
 | DOI | https://doi.org/10.48550/arxiv.2405.19888 |
 | arXiv | 2405.19888 |
-| Artifact | No official public artifact confirmed |
+| Artifact | [Public implementation](https://github.com/microsoft/ParrotServe) |
 | Corpus category | Agent, workflow, and multi-turn serving |
 
 ## Abstract synopsis
@@ -46,7 +46,7 @@ No named public dataset was reliably confirmed; the workload description is cate
 
 - Component: `plex_paper_parrot`
 - Operations: `route`, `schedule`
-- Evidence: `policy-kernel-reproduction`
+- Evidence: `inspired-adaptation`
 - Validation: `passing`
 - Metadata: [`tests/policies/replications/parrot/metadata.json`](../../tests/policies/replications/parrot/metadata.json)
 - Deferred mechanics: general semantic-variable DAG runtime
@@ -59,4 +59,5 @@ Chaofan Lin, Zhenhua Han, C. R. Zhang, Yuqing Yang, Fan Yang, Chen Chen, et al. 
 ## Sources
 
 - [Primary paper](https://www.usenix.org/conference/osdi24/presentation/lin-chaofan)
+- [Public artifact](https://github.com/microsoft/ParrotServe)
 - [OpenAlex record](https://openalex.org/W4399252473)

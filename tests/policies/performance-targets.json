@@ -1,0 +1,295 @@
+{
+  "schema_version": 1,
+  "methodology": {
+    "claim_classes": [
+      "paper-end-to-end",
+      "policy-kernel-trend",
+      "live-engine-mechanism"
+    ],
+    "required_baselines": 1,
+    "default_trials": 128,
+    "default_seed": 20260723,
+    "minimum_live_repeats": 3
+  },
+  "policies": [
+    {
+      "id": "agentix",
+      "benchmark_family": "workflow-fair-schedule",
+      "primary_metric": "workflow_mean_completion_time",
+      "baseline": "fcfs_and_mlfq",
+      "paper_claim": "4-15x program throughput improvement at equal latency",
+      "reproduction_goal": "lower group-normalized completion time while bounding starvation",
+      "live_vllm": true
+    },
+    {
+      "id": "continuum",
+      "benchmark_family": "ttl-cache-schedule",
+      "primary_metric": "mean_response_time",
+      "baseline": "fcfs_lru",
+      "paper_claim": "1.12-3.66x response-time and 1.10-3.22x throughput improvement",
+      "reproduction_goal": "prioritize resumed TTL-pinned work and avoid high reload cost",
+      "live_vllm": true
+    },
+    {
+      "id": "kvflow",
+      "benchmark_family": "workflow-cache",
+      "primary_metric": "workflow_makespan",
+      "baseline": "fcfs_lru",
+      "paper_claim": "up to 1.83x single-workflow and 2.19x concurrent-workflow speedup",
+      "reproduction_goal": "run cache-ready work first and reclaim distant varying suffixes",
+      "live_vllm": true
+    },
+    {
+      "id": "preble",
+      "benchmark_family": "prefix-route",
+      "primary_metric": "request_latency_cost",
+      "baseline": "distributed_round_robin_sglang_and_vllm",
+      "paper_claim": "1.5-14.5x average-latency and 2-10x p99-latency improvement",
+      "reproduction_goal": "switch between prefix exploitation and load-aware exploration",
+      "live_vllm": false
+    },
+    {
+      "id": "helium",
+      "benchmark_family": "critical-path-schedule",
+      "primary_metric": "workflow_makespan",
+      "baseline": "query_wise_op_wise_random_and_lspf",
+      "paper_claim": "up to 1.56x end-to-end speedup and much larger gains over naive execution",
+      "reproduction_goal": "prioritize ready critical-path work with prefix reuse and forced progress",
+      "live_vllm": true
+    },
+    {
+      "id": "vtc",
+      "benchmark_family": "token-fair-schedule",
+      "primary_metric": "normalized_service_disparity",
+      "baseline": "fcfs_rpm_and_lcf",
+      "paper_claim": "max-min token fairness across clients without sacrificing work conservation",
+      "reproduction_goal": "reduce normalized service disparity and improve Jain fairness",
+      "live_vllm": true
+    },
+    {
+      "id": "lmetric",
+      "benchmark_family": "prefill-batch-route",
+      "primary_metric": "predicted_prefill_cost",
+      "baseline": "least_load",
+      "paper_claim": "92%/24% lower mean TTFT/TPOT versus vLLM on ChatBot and 39%/51% lower means in production",
+      "reproduction_goal": "minimize new-prefill-tokens times current-batch-size",
+      "live_vllm": false
+    },
+    {
+      "id": "fairserve",
+      "benchmark_family": "weighted-fair-schedule",
+      "primary_metric": "weighted_service_disparity",
+      "baseline": "vtc_and_rpm",
+      "paper_claim": "1.03-1.75x overall throughput, with queue-delay gains measured separately versus VTC and RPM",
+      "reproduction_goal": "preserve in-progress interactions under overload and normalize weighted application-stage service",
+      "live_vllm": true
+    },
+    {
+      "id": "marconi",
+      "benchmark_family": "value-cache",
+      "primary_metric": "retained_recompute_value",
+      "baseline": "lru",
+      "paper_claim": "up to 34.4x token-hit-rate and 71.1% P95 TTFT improvement",
+      "reproduction_goal": "retain high reuse-probability times recompute-FLOP value per byte",
+      "live_vllm": true
+    },
+    {
+      "id": "ragcache",
+      "benchmark_family": "gdsf-cache",
+      "primary_metric": "saved_recompute_cost",
+      "baseline": "lru",
+      "paper_claim": "1.2-4x TTFT and up to 2.1x throughput improvement",
+      "reproduction_goal": "evict the lowest age plus frequency-weighted recompute value leaf",
+      "live_vllm": true
+    },
+    {
+      "id": "dlpm",
+      "benchmark_family": "locality-fair-route-schedule",
+      "primary_metric": "fairness_locality_score",
+      "baseline": "locality_only",
+      "paper_claim": "up to 2.87x throughput and 2.90-4.06x lower latency",
+      "reproduction_goal": "combine deficit fairness with cache locality",
+      "live_vllm": true
+    },
+    {
+      "id": "infercept",
+      "benchmark_family": "intercept-cache-schedule",
+      "primary_metric": "resume_recompute_cost",
+      "baseline": "discard_recompute",
+      "paper_claim": "1.3-12x lower normalized latency and 1.6-2x higher throughput",
+      "reproduction_goal": "prioritize cheap resumption and retain state when reuse beats recompute",
+      "live_vllm": true
+    },
+    {
+      "id": "peek",
+      "benchmark_family": "queue-informed-cache",
+      "primary_metric": "cache_miss_penalty",
+      "baseline": "lru",
+      "paper_claim": "up to 3x cache hit, 7.9x TTFT, 6.7x E2E, and 4.5x throughput improvement",
+      "reproduction_goal": "retain objects with near-term queued demand while preserving a fairness lane",
+      "live_vllm": true
+    },
+    {
+      "id": "qlm",
+      "benchmark_family": "slo-admit-route-schedule",
+      "primary_metric": "slo_goodput",
+      "baseline": "edf_vllm_fcfs_and_shepherd",
+      "paper_claim": "40-90% higher SLO attainment and 20-400% higher throughput",
+      "reproduction_goal": "defer predicted misses and route/schedule by virtual wait",
+      "live_vllm": true
+    },
+    {
+      "id": "slos-serve",
+      "benchmark_family": "multi-slo-control",
+      "primary_metric": "slo_capacity",
+      "baseline": "vllm_sarathi_and_distserve",
+      "paper_claim": "about 2.2x average serving-capacity improvement",
+      "reproduction_goal": "admit feasible SLOs, choose low-latency stages, and schedule least slack",
+      "live_vllm": true
+    },
+    {
+      "id": "dynasor",
+      "benchmark_family": "reasoning-early-stop",
+      "primary_metric": "useful_work_per_token",
+      "baseline": "uniform_length_sglang_and_parrot",
+      "paper_claim": "9-52% token reduction and up to 3.3x more queries at equal quality",
+      "reproduction_goal": "cancel high-confidence completed reasoning and prioritize high progress",
+      "live_vllm": true
+    },
+    {
+      "id": "justitia",
+      "benchmark_family": "branch-fair-schedule",
+      "primary_metric": "agent_job_completion_time",
+      "baseline": "vtc_parrot_fcfs_and_srjf",
+      "paper_claim": "57.5% lower average agent completion time",
+      "reproduction_goal": "pamper groups with fewer completed branches",
+      "live_vllm": true
+    },
+    {
+      "id": "chameleon",
+      "benchmark_family": "adapter-admit-schedule-cache",
+      "primary_metric": "adapter_goodput",
+      "baseline": "s_lora",
+      "paper_claim": "1.5x throughput, 80.7% lower P99 TTFT, and 48.1% lower P50 TTFT versus S-LoRA",
+      "reproduction_goal": "respect queue quotas, prioritize waiting classes, and retain hot adapters",
+      "live_vllm": true
+    },
+    {
+      "id": "hotprefix",
+      "benchmark_family": "hotness-cache",
+      "primary_metric": "prefix_cache_hit_rate",
+      "baseline": "vllm_sglang_lru_lfu_fifo_and_2q",
+      "paper_claim": "up to 2.25x/2x latency and 1.91x/1.64x throughput improvement over vLLM/SGLang",
+      "reproduction_goal": "admit and retain prefixes whose observed hotness crosses the threshold",
+      "live_vllm": true
+    },
+    {
+      "id": "pard",
+      "benchmark_family": "proactive-drop",
+      "primary_metric": "deadline_goodput",
+      "baseline": "nexus_clipper_and_naive",
+      "paper_claim": "16-176% higher goodput with materially lower drop rates",
+      "reproduction_goal": "cancel requests whose upstream plus downstream-P95 projection misses deadline",
+      "live_vllm": true
+    },
+    {
+      "id": "branch-regulation",
+      "benchmark_family": "branch-admission",
+      "primary_metric": "slo_goodput",
+      "baseline": "irp_off_c2_c5_and_eager",
+      "paper_claim": "1.77x goodput over regulation-off and 1.48x over eager, above 95% SLO attainment",
+      "reproduction_goal": "bound per-group branch concurrency and batch interference",
+      "live_vllm": true
+    },
+    {
+      "id": "dualmap",
+      "benchmark_family": "affinity-load-route",
+      "primary_metric": "ttft_cost",
+      "baseline": "cache_affinity_least_loaded_min_ttft_and_preble",
+      "paper_claim": "40.6-80% higher effective request capacity and 14.3-40% higher goodput",
+      "reproduction_goal": "combine prefix affinity, SLO risk, and load balancing",
+      "live_vllm": false
+    },
+    {
+      "id": "llumnix",
+      "benchmark_family": "dynamic-load-route",
+      "primary_metric": "tail_latency_cost",
+      "baseline": "round_robin_infaas_and_llumnix_base",
+      "paper_claim": "up to 15x prefill-latency, 2.9x end-to-end-latency, and 1.5x high-priority latency acceleration",
+      "reproduction_goal": "route to least virtual usage and trigger live rescheduling on imbalance",
+      "live_vllm": false
+    },
+    {
+      "id": "smetric",
+      "benchmark_family": "session-affinity-route",
+      "primary_metric": "session_tail_latency",
+      "baseline": "bailian_lmetric_and_dynamo",
+      "paper_claim": "24-37% lower median TTFT and up to 34% lower P99 TPOT",
+      "reproduction_goal": "preserve follow-up affinity unless load/tail risk dominates",
+      "live_vllm": false
+    },
+    {
+      "id": "thunderagent",
+      "benchmark_family": "tool-aware-workflow",
+      "primary_metric": "workflow_completion_time",
+      "baseline": "vllm_and_agent_serving_baselines",
+      "paper_claim": "1.5-3.6x serving throughput and 1.8-3.9x rollout improvement",
+      "reproduction_goal": "run tool-ready work, cancel failures, migrate when requested, and retain live programs",
+      "live_vllm": true
+    },
+    {
+      "id": "pythia",
+      "benchmark_family": "lookahead-workflow",
+      "primary_metric": "workflow_job_completion_time",
+      "baseline": "reactive_and_component_ablations",
+      "paper_claim": "up to 2.9x JCT reduction and 1.12-1.96x throughput improvement",
+      "reproduction_goal": "route by lookahead cost, rank workflow steps, and retain/prefetch near-future state",
+      "live_vllm": true
+    },
+    {
+      "id": "goodserve",
+      "benchmark_family": "quality-cost-route",
+      "primary_metric": "e2e_slo_goodput",
+      "baseline": "random_load_preble_and_llumnix",
+      "paper_claim": "up to 27.4% higher goodput",
+      "reproduction_goal": "select the least-capable GPU predicted to meet E2E SLO and rebalance high-risk requests",
+      "live_vllm": false
+    },
+    {
+      "id": "conserve",
+      "benchmark_family": "conversation-route",
+      "primary_metric": "followup_ttft_cost",
+      "baseline": "collocated_disaggregated_and_ampd",
+      "paper_claim": "51.08% lower P95 time-to-first-effective-token and 7.51% higher energy efficiency",
+      "reproduction_goal": "route first turns by prefill capacity and follow-ups by conversation affinity",
+      "live_vllm": false
+    },
+    {
+      "id": "parrot",
+      "benchmark_family": "dependency-workflow",
+      "primary_metric": "workflow_makespan",
+      "baseline": "request_fcfs_and_least_queue",
+      "paper_claim": "up to 11.7x speedup and 1.8-2.4x batch speedup",
+      "reproduction_goal": "route near dependencies and schedule only dependency-ready nodes",
+      "live_vllm": true
+    },
+    {
+      "id": "saga",
+      "benchmark_family": "workflow-atomic-locality",
+      "primary_metric": "task_completion_time",
+      "baseline": "vllm_apc_and_component_ablations",
+      "paper_claim": "1.73x/1.55x TCT speedup and about 1.21x/1.22x memory-utilization improvement",
+      "reproduction_goal": "combine workflow cache locality, group service, and TTL retention",
+      "live_vllm": true
+    },
+    {
+      "id": "routebalance",
+      "benchmark_family": "global-utility-route",
+      "primary_metric": "total_assignment_utility",
+      "baseline": "avengers_best_route_and_semantic_router",
+      "paper_claim": "2.6-4.1x lower E2E latency than enhanced BEST-Route at high load while preserving quality/cost tradeoffs",
+      "reproduction_goal": "maximize global assignment utility under target capacities",
+      "live_vllm": false
+    }
+  ]
+}

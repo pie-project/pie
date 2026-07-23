@@ -1040,5 +1040,6 @@ portable policy ABI.
 
 The release succeeds when the programming model is simpler for ordinary
 single-request policies, strictly more expressive for grouped and set-dependent
-policies, and validated by the complete replication matrix rather than by
-surface-level examples alone.
+policies, and validated by executable adaptation traces plus an independent
+fidelity matrix rather than by surface-level examples or self-declared
+replication labels.
