@@ -23,6 +23,7 @@
 #include <cstring>
 #include <algorithm>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -36,6 +37,56 @@
 #include "pie_native/ptir/trace.hpp"
 
 namespace pie_cuda_driver::pipeline {
+
+// Size-keyed free list for the per-instance baked-list device buffers. A cohort
+// boundary grinds ~1k binds of the SAME trace back-to-back, so every acquire
+// after the first cohort is an exact-size pool hit — zero cudaMalloc on the
+// lane thread where each malloc/free pair costs ~10 µs against the boundary
+// seal. Buffers are a few hundred bytes; the cap is a safety valve, not a
+// working limit. Pooled memory is intentionally never freed at process exit
+// (CUDA teardown order makes static-destructor cudaFree unsafe).
+class BakedBufferPool {
+  public:
+    static BakedBufferPool& instance() {
+        static BakedBufferPool* pool = new BakedBufferPool();
+        return *pool;
+    }
+
+    void* acquire(std::size_t bytes) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto it = free_.find(bytes);
+            if (it != free_.end() && !it->second.empty()) {
+                void* p = it->second.back();
+                it->second.pop_back();
+                pooled_bytes_ -= bytes;
+                return p;
+            }
+        }
+        void* p = nullptr;
+        CUDA_CHECK(cudaMalloc(&p, bytes));
+        return p;
+    }
+
+    void release(void* p, std::size_t bytes) {
+        if (p == nullptr) return;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (pooled_bytes_ + bytes <= kMaxPooledBytes) {
+                free_[bytes].push_back(p);
+                pooled_bytes_ += bytes;
+                return;
+            }
+        }
+        static_cast<void>(cudaFree(p));
+    }
+
+  private:
+    static constexpr std::size_t kMaxPooledBytes = 64u << 20;
+    std::mutex mutex_;
+    std::unordered_map<std::size_t, std::vector<void*>> free_;
+    std::size_t pooled_bytes_ = 0;
+};
 
 // Shared pure-host PTIR decode model (trace/op-table/container/bound/
 // fire-geometry) now lives in pie_native::ptir (driver/common); bring it into
@@ -71,11 +122,10 @@ struct PassResult {
 
 class Tier0Runner {
   public:
-    explicit Tier0Runner(const Trace& trace) : trace_(&trace) {
-        cudaMalloc(&d_commit_, sizeof(std::uint32_t));
-    }
+    // The pass-commit word and every baked slot list live in ONE pooled device
+    // buffer allocated at bind (`bake_static_lists`); nothing to allocate here.
+    explicit Tier0Runner(const Trace& trace) : trace_(&trace) {}
     ~Tier0Runner() {
-        if (d_commit_) cudaFree(d_commit_);
         free_baked_lists();
     }
     Tier0Runner(const Tier0Runner&) = delete;
@@ -171,6 +221,13 @@ class Tier0Runner {
         PassResult res;
         cudaStream_t s = in.stream;
         ensure_channels();   // lazily binds the view + bakes the static lists
+        // Bind-time device work (ring init, seeds, the baked-list upload) rides
+        // the registry's initialization stream without a host sync; order this
+        // pass after it. (The production staged path gets the same edge in
+        // Dispatch::begin.)
+        if (DeviceChannelRegistry* reg = view_->registry()) {
+            reg->order_after_initialization(s);
+        }
 
         // pass_commit := 1 (structural predicate seed; stages AND into it).
         std::uint32_t one = 1;
@@ -226,6 +283,9 @@ class Tier0Runner {
         PassResult res;
         cudaStream_t s = in.stream;
         ensure_channels();
+        if (DeviceChannelRegistry* reg = view_->registry()) {
+            reg->order_after_initialization(s);
+        }
 
         if (reset) reset_commit(s);
         launch_pass_body(in, scratch, res);
@@ -306,8 +366,25 @@ class Tier0Runner {
     // and the (now-bound) dense→slot view — never on per-fire `FireInputs` — so
     // they are remapped to registry slots + uploaded to persistent device arrays
     // here, removing the per-pass malloc/upload/free churn from `run_pass`.
+    //
+    // Everything (the pass-commit word + all lists) is packed into ONE pooled
+    // device buffer with ONE upload: the piecewise version paid ~8 cudaMalloc +
+    // sync-cudaMemcpy pairs per instance on the lane thread, and 1k binds of a
+    // cohort boundary ground those against the frame seal. The upload rides the
+    // registry's initialization stream; waves order after it via
+    // `order_after_initialization` (Dispatch::begin + the run_pass entries), so
+    // no host sync remains on the bind path.
     void bake_static_lists() {
         free_baked_lists();
+
+        host_baked_.clear();
+        host_baked_.push_back(0);  // [0] = pass-commit word (re-seeded per pass)
+        auto stage_list = [&](const std::vector<std::uint32_t>& slots,
+                              std::uint32_t& offset_out, std::uint32_t& n_out) {
+            offset_out = (std::uint32_t)host_baked_.size();
+            n_out = (std::uint32_t)slots.size();
+            host_baked_.insert(host_baked_.end(), slots.begin(), slots.end());
+        };
 
         // Descriptor phase: non-const ports need their channel full; consuming
         // (token-family) ports also advance its head at commit (§5.1).
@@ -317,17 +394,22 @@ class Tier0Runner {
             desc_full.push_back(pb.channel);
             if (port_consumes(pb.port)) desc_taken.push_back(pb.channel);
         }
-        upload_slots(view_->to_slots(desc_full), desc_lists_.d_full, desc_lists_.n_full);
+        std::uint32_t off_desc_full = 0;
+        stage_list(view_->to_slots(desc_full), off_desc_full, desc_lists_.n_full);
 
         // Per-stage readiness + the pass-wide commit taken/put accumulation.
         std::vector<std::uint32_t> pass_taken = desc_taken, pass_put;
         stage_lists_.assign(trace_->stages.size(), StageChannelLists{});
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> stage_offsets(
+            trace_->stages.size(), {0, 0});
         for (std::size_t i = 0; i < trace_->stages.size(); ++i) {
             const Stage& st = trace_->stages[i];
             std::vector<std::uint32_t> need_full, need_empty, taken;
             collect_stage_channels(st, desc_taken, need_full, need_empty, taken);
-            upload_slots(view_->to_slots(need_full), stage_lists_[i].d_full, stage_lists_[i].n_full);
-            upload_slots(view_->to_slots(need_empty), stage_lists_[i].d_empty, stage_lists_[i].n_empty);
+            stage_list(view_->to_slots(need_full),
+                       stage_offsets[i].first, stage_lists_[i].n_full);
+            stage_list(view_->to_slots(need_empty),
+                       stage_offsets[i].second, stage_lists_[i].n_empty);
             for (auto c : taken) pass_taken.push_back(c);
             for (const ChannelPut& p : st.puts) pass_put.push_back(p.channel);
         }
@@ -343,30 +425,46 @@ class Tier0Runner {
         dedup(pass_put);
         host_commit_taken_slots_ = view_->to_slots(pass_taken);
         host_commit_put_slots_ = view_->to_slots(pass_put);
-        upload_slots(host_commit_taken_slots_, d_commit_taken_, n_commit_taken_);
-        upload_slots(host_commit_put_slots_, d_commit_put_, n_commit_put_);
-    }
+        std::uint32_t off_taken = 0, off_put = 0;
+        stage_list(host_commit_taken_slots_, off_taken, n_commit_taken_);
+        stage_list(host_commit_put_slots_, off_put, n_commit_put_);
 
-    // Upload a host slot list into a persistent device array (freeing any prior).
-    static void upload_slots(const std::vector<std::uint32_t>& slots,
-                             std::uint32_t*& d, std::uint32_t& n) {
-        if (d) { cudaFree(d); d = nullptr; }
-        n = (std::uint32_t)slots.size();
-        if (n) {
-            cudaMalloc(&d, (std::size_t)n * sizeof(std::uint32_t));
-            cudaMemcpy(d, slots.data(), (std::size_t)n * sizeof(std::uint32_t),
-                       cudaMemcpyHostToDevice);
+        // One pooled allocation + one upload for the whole bake.
+        d_baked_bytes_ = host_baked_.size() * sizeof(std::uint32_t);
+        d_baked_ = static_cast<std::uint32_t*>(
+            BakedBufferPool::instance().acquire(d_baked_bytes_));
+        DeviceChannelRegistry* reg = view_->registry();
+        if (reg != nullptr) {
+            // `host_baked_` is a member: it outlives the async copy.
+            reg->upload_initialization_bytes(
+                d_baked_, host_baked_.data(), d_baked_bytes_);
+        } else {
+            CUDA_CHECK(cudaMemcpy(
+                d_baked_, host_baked_.data(), d_baked_bytes_,
+                cudaMemcpyHostToDevice));
         }
+
+        d_commit_ = d_baked_;
+        desc_lists_.d_full = d_baked_ + off_desc_full;
+        for (std::size_t i = 0; i < stage_lists_.size(); ++i) {
+            stage_lists_[i].d_full = d_baked_ + stage_offsets[i].first;
+            stage_lists_[i].d_empty = d_baked_ + stage_offsets[i].second;
+        }
+        d_commit_taken_ = d_baked_ + off_taken;
+        d_commit_put_ = d_baked_ + off_put;
     }
 
     void free_baked_lists() {
-        auto f = [](std::uint32_t*& d) { if (d) { cudaFree(d); d = nullptr; } };
-        f(desc_lists_.d_full); f(desc_lists_.d_empty);
-        desc_lists_.n_full = desc_lists_.n_empty = 0;
-        for (StageChannelLists& l : stage_lists_) { f(l.d_full); f(l.d_empty); }
+        if (d_baked_ != nullptr) {
+            BakedBufferPool::instance().release(d_baked_, d_baked_bytes_);
+            d_baked_ = nullptr;
+            d_baked_bytes_ = 0;
+        }
+        d_commit_ = nullptr;
+        desc_lists_ = StageChannelLists{};
         stage_lists_.clear();
-        f(d_commit_taken_); n_commit_taken_ = 0;
-        f(d_commit_put_);   n_commit_put_ = 0;
+        d_commit_taken_ = nullptr; n_commit_taken_ = 0;
+        d_commit_put_ = nullptr;   n_commit_put_ = 0;
     }
 
     bool run_stage(const Stage& st, const FireInputs& in, std::vector<void*>& scratch, std::string& err) {
@@ -748,10 +846,15 @@ class Tier0Runner {
     ChannelView* view_ = nullptr;               // dense→global-slot view (W0.1); not owned
     std::unique_ptr<DeviceChannelRegistry> standalone_reg_;  // owned only in standalone mode
     ChannelView standalone_view_;               // owned only in standalone mode
-    std::uint32_t* d_commit_ = nullptr;         // pass-ephemeral commit flag
-    // Baked-at-bind static slot lists (see bake_static_lists): descriptor-phase +
-    // per-stage readiness arrays and the deduped commit-bump taken/put arrays,
-    // resident on device so run_pass launches the ring kernels with no malloc.
+    // Baked-at-bind static slot lists (see bake_static_lists): the pass-commit
+    // word, descriptor-phase + per-stage readiness arrays and the deduped
+    // commit-bump taken/put arrays — ALL offsets into the single pooled
+    // `d_baked_` buffer, resident on device so run_pass launches the ring
+    // kernels with no malloc.
+    std::uint32_t* d_baked_ = nullptr;
+    std::size_t d_baked_bytes_ = 0;
+    std::vector<std::uint32_t> host_baked_;     // upload staging; outlives the async copy
+    std::uint32_t* d_commit_ = nullptr;         // pass-ephemeral commit flag (= d_baked_[0])
     StageChannelLists desc_lists_;
     std::vector<StageChannelLists> stage_lists_;
     std::uint32_t* d_commit_taken_ = nullptr; std::uint32_t n_commit_taken_ = 0;

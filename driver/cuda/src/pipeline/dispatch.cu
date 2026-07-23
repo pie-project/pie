@@ -2925,15 +2925,18 @@ void Dispatch::close_instance(std::uint64_t instance_id) {
 int Dispatch::close_channel(std::uint64_t channel_id, std::string* err) {
     if (err) err->clear();
     drain_reaped_instances(*impl_);
-    const bool has_active_attachment = std::any_of(
-        impl_->instances.begin(),
-        impl_->instances.end(),
-        [channel_id](const auto& entry) {
-            const auto& ids = entry.second.channel_ids;
-            return std::find(ids.begin(), ids.end(), channel_id) != ids.end();
-        });
+    // Always defer-if-attached: the registry's per-slot refcount already
+    // tracks live instance attachments exactly (bound at view bind, released
+    // at instance destruction), and `release()` retires a pending-close slot
+    // at refcount zero. The previous any_of scan over every live instance's
+    // channel list was O(instances × channels) per close — a cohort teardown
+    // paid ~9k comparisons × 36.9k closes — and it passed the flag INVERTED
+    // (attached → defer=false), so a close racing an instance's teardown
+    // hard-failed, the engine dropped it, and the slot leaked permanently:
+    // ~15k zombie slots per 2048-fleet run starved the retained-storage pool
+    // and turned steady-state registrations back into fresh allocations.
     return impl_->channels.close_endpoint(
-               channel_id, err, !has_active_attachment)
+               channel_id, err, /*defer_if_attached=*/true)
         ? PIE_STATUS_OK
         : (impl_->channels.contains(channel_id)
                ? PIE_STATUS_INVALID_ARGUMENT
@@ -3603,6 +3606,11 @@ std::unique_ptr<StagedLaunch> Dispatch::begin(
     const pie_native::LaunchView& view,
     cudaStream_t stream) {
     drain_reaped_instances(*impl_);
+    // Order this wave after any pending bind-time initialization work (ring
+    // metadata, seed uploads, baked-list uploads) still riding the registry's
+    // initialization stream — binds no longer host-sync it (RV-28: fires must
+    // never observe a slot whose ring metadata or seeds are still in flight).
+    impl_->channels.order_after_initialization(stream);
     const bool prologue_timing = fire_timing::full();
     const auto prologue_mark = prologue_timing
         ? fire_timing::Clock::now()

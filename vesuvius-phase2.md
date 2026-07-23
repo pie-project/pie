@@ -658,3 +658,73 @@ the registry's reuse keying is the follow-up). Candidate next levers,
 by measured size: batched/cohort register controls (framing ~27
 ms/boundary), registry reuse keying (~40 ms/run), `bind_instance`
 instance_us (~48 ms/boundary), herd bring-up window.
+
+## Bind-cheap round 1 (operator directive "bind 최적화" — landed)
+
+Directive: attack remedy (1) — make the 1,024-bind boundary grind
+cheaper. Instrumented profiling (ls1 log) named the payers per
+`register_channels_bind` control (occupancy p50 104 µs / mean 113 µs,
+Σ462 ms/run): `bind_instance` driver time 57 µs — dominated by
+per-instance device allocations — plus ~48 µs engine-side loop, with
+the 9 per-channel registrations' driver time ≈ 0 when slot storage is
+reused.
+
+Three driver-side changes landed (no engine changes, no ABI change):
+
+1. **Consolidated baked-list buffer + pool** (`tier0_runner.hpp`).
+   `Tier0Runner` used to pay ~8 cudaMalloc + synchronous-cudaMemcpy
+   pairs per instance (`d_commit_` in the ctor; desc/per-stage/commit
+   slot lists in `bake_static_lists` via `upload_slots`). All of it now
+   packs into ONE device buffer per instance — commit word at offset 0,
+   every list an offset — acquired from a size-keyed global
+   `BakedBufferPool` (a cohort re-binds the same trace, so every
+   acquire after the first cohort is an exact-size hit; pooled memory
+   is deliberately never freed at exit). Upload is a single
+   `cudaMemcpyAsync` on the registry's initialization stream from a
+   persistent host staging member.
+2. **No host sync on the bind path** (`channel_registry.hpp`,
+   `program_runtime.hpp`, `dispatch.cu`). The `PtirInstance` ctor's
+   `settle_seed_copies()` — flush + `cudaStreamSynchronize` per bind —
+   is gone. The registry now stamps an `init_done_` event
+   (`publish_initialization`), and every wave orders after it via
+   `order_after_initialization(stream)` in `Dispatch::begin` (all
+   production composition funnels there; `run_pass`/
+   `launch_pass_async` carry the same edge for the standalone paths).
+   Settling survives only where a FREE could race in-flight
+   initialization-stream work: `release_slot_storage` and reused-slot
+   growth in `init_slot`.
+3. **Close-path fix — the O(N²) scan and the zombie-slot leak**
+   (`dispatch.cu::close_channel`). Every close ran
+   `any_of(instances)` × `find(channel_ids)` — ~9k comparisons per
+   close at cohort teardown (36.9k closes/run) — and passed
+   `defer_if_attached` INVERTED: a close racing its instance's teardown
+   hard-failed ("still has instance attachments", 8–15k per run), the
+   engine dropped it, and the slot NEVER retired. The leaked zombies
+   starved the retained-storage pool, which is why steady-state
+   registrations kept growing (`cell_grew` 19k, worsening to 31.7k once
+   binds got faster). Now closes always defer-if-attached: the
+   registry's per-slot refcount is exact and `release()` retires
+   pending-close slots at zero. Errors 15k→0; close batches Σ362 ms →
+   Σ5.8 ms; `cell_grew` steady-state blocks 9.2k/7.5k → ~2k.
+
+Measured (bc3, RTX 4090, same battery): `cuda_bind` total 57 µs →
+**12 µs**; control occupancy mean 113 → 91 µs. Throughput: k1 2048×32
+**28.5–29.1k tok/s (median 28.8k, ≈89% of vLLM 32.2k;** round-1 band
+was 26.8–27.5k**)**; k2 2048×32 **28.2k** (was 24.3–24.9k — k2's
+denser boundaries benefit MORE); k3 27.6k; c0/256 k1 27.5k / k2 27.6k;
+512×512 19.5k. Oracles t=32/t=256 byte-EXACT; watchdog 0.
+
+Bench-harness note for the record: the 512×512 shape runs at
+concurrency 256 (`--num-requests 512 --concurrency 256`). At c512 the
+workload does not physically fit — its tail needs Σ ≈ 11.5k KV pages
+against the 10,756-page elastic budget and prepare correctly reports
+Impossible; an early bc1 suite ran that wrong shape and the "failure"
+was the suite's, not the build's.
+
+Remaining boundary cost after this round, by size: the engine-side
+register/bind loop (~70–78 µs/control — 9 separate per-channel FFI
+calls with per-call marshalling/validation, HashSet bookkeeping, and
+LaneCommit plumbing), then the residual ~2k fresh allocations per
+boundary from closes whose deferred retirement lands after the next
+cohort's registrations. Next lever if the grind is attacked again: an
+engine-side/ABI batch register verb.

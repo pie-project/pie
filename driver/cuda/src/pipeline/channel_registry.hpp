@@ -98,8 +98,15 @@ class DeviceChannelRegistry {
         CUDA_CHECK(cudaStreamCreateWithFlags(
             &initialization_stream_, cudaStreamNonBlocking));
         try {
+            CUDA_CHECK(cudaEventCreateWithFlags(
+                &init_done_, cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventRecord(init_done_, initialization_stream_));
             grow(kInitialChannelSlots);
         } catch (...) {
+            if (init_done_ != nullptr) {
+                cudaEventDestroy(init_done_);
+                init_done_ = nullptr;
+            }
             cudaStreamDestroy(initialization_stream_);
             initialization_stream_ = nullptr;
             throw;
@@ -124,6 +131,9 @@ class DeviceChannelRegistry {
     }
     ~DeviceChannelRegistry() {
         free_all();
+        if (init_done_ != nullptr) {
+            static_cast<void>(cudaEventDestroy(init_done_));
+        }
         if (initialization_stream_ != nullptr) {
             static_cast<void>(cudaStreamDestroy(initialization_stream_));
         }
@@ -136,6 +146,38 @@ class DeviceChannelRegistry {
         flush_pending_initializations();
         CUDA_CHECK(cudaStreamSynchronize(initialization_stream_));
         initialization_pending_ = false;
+    }
+
+    // Flush pending initializations onto the initialization stream and stamp
+    // `init_done_` — WITHOUT a host sync. `order_after_initialization` makes
+    // an execution stream wait for the stamp instead, so bind-time work
+    // (ring-metadata init, seed uploads, baked-list uploads) never blocks the
+    // lane thread; the wave that first touches the slots pays a stream-order
+    // edge, not a host stall.
+    void publish_initialization() {
+        if (!initialization_pending_) return;
+        flush_pending_initializations();
+        CUDA_CHECK(cudaEventRecord(init_done_, initialization_stream_));
+        initialization_pending_ = false;
+    }
+
+    void order_after_initialization(cudaStream_t stream) {
+        publish_initialization();
+        CUDA_CHECK(cudaStreamWaitEvent(stream, init_done_, 0));
+    }
+
+    // Enqueue an H2D copy on the initialization stream, ordered by the same
+    // `init_done_` stamp. `source` must stay alive until the stream drains
+    // (callers keep a persistent host staging buffer).
+    void upload_initialization_bytes(
+        void* destination, const void* source, std::size_t bytes) {
+        CUDA_CHECK(cudaMemcpyAsync(
+            destination,
+            source,
+            bytes,
+            cudaMemcpyHostToDevice,
+            initialization_stream_));
+        initialization_pending_ = true;
     }
 
     bool register_endpoint(const PieChannelDesc& desc,
@@ -316,7 +358,12 @@ class DeviceChannelRegistry {
         std::uint64_t id,
         std::string* err,
         bool defer_if_attached = false) {
-        settle_initialization();
+        // No settle here: a retire that RETAINS storage is safe against
+        // in-flight initialization-stream work (slot reuse re-registers on the
+        // same stream, FIFO; fires order after `init_done_`). Only a retire
+        // that RELEASES storage must drain the stream first — that settle
+        // lives in `release_slot_storage`. Settling unconditionally made every
+        // post-bind close batch pay a stream sync on the lane thread.
         auto it = slot_of_.find(id);
         if (it == slot_of_.end()) return false;
         const std::uint32_t slot = it->second;
@@ -839,6 +886,13 @@ class DeviceChannelRegistry {
             numel * (desc.dtype == PIE_CHANNEL_DTYPE_BOOL ? 1 : 4));
         cell_bytes_[slot] = cb;
         host_cap1_[slot] = cap1;
+        // Growing a REUSED slot frees its previous ring while a prior owner's
+        // seed copy may still be pending on the initialization stream (binds
+        // no longer settle); drain first. Fresh slots (null base) skip this.
+        if (initialization_pending_ && cell_base_[slot] != nullptr &&
+            cb * cap1 > cell_capacity_[slot]) {
+            settle_initialization();
+        }
         ensure_device_capacity(
             cell_base_[slot], cell_capacity_[slot], cb * cap1);
         host_head_[slot] = 0;
@@ -939,6 +993,12 @@ class DeviceChannelRegistry {
     }
 
     void release_slot_storage(std::uint32_t slot) {
+        // In-flight initialization-stream work (seed copies, metadata inits,
+        // baked-list uploads) may still target this slot's storage; freeing
+        // under it would let the allocator hand the memory to a new owner
+        // while the copy lands. Rare in steady state: retires overwhelmingly
+        // retain storage under the load-scaled caps.
+        settle_initialization();
         if (cell_base_[slot] != nullptr) {
             CUDA_CHECK(cudaFree(cell_base_[slot]));
             cell_base_[slot] = nullptr;
@@ -1179,6 +1239,7 @@ class DeviceChannelRegistry {
     std::size_t inactive_host_bytes_ = 0;
     bool initialization_pending_ = false;
     cudaStream_t initialization_stream_ = nullptr;
+    cudaEvent_t init_done_ = nullptr;
 
     static constexpr std::size_t kHostWordBytes =
         4 * sizeof(std::uint64_t);
