@@ -130,6 +130,9 @@ struct LlamaLikePlanState {
     bool use_prefill_plan = false;
     bool use_prefill_decode_plan = false;
     bool use_xqa_decode = false;
+    /// This fire's prefill plan ran in graph mode on the capture-safe FA2
+    /// causal path (see IModel::prefill_graph_ready).
+    bool prefill_graph_capturable = false;
     int xqa_max_pages_per_seq = 0;
     std::vector<std::uint32_t> prefill_decode_qo_indptr_h;
 };
@@ -154,7 +157,8 @@ void prepare_llama_like_decode_plan(
     int total_tokens,
     int num_requests,
     bool is_pure_decode,
-    bool have_custom_mask);
+    bool have_custom_mask,
+    bool graphs_enabled);
 
 std::uint32_t llama_like_decode_graph_layout(
     const LlamaLikePlanState& state);

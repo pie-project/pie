@@ -74,6 +74,10 @@ std::uint32_t ForwardFn::invoke_graph_layout() {
     return model ? model->graph_layout() : 0u;
 }
 
+bool ForwardFn::invoke_prefill_graph_ready() const {
+    return model != nullptr && model->prefill_graph_ready();
+}
+
 namespace {
 
 // #24 graph-variant bitfield helper: `make_graph_variant()` + the named flag
@@ -477,9 +481,18 @@ ForwardInputViews make_forward_input_views(
     };
 }
 
+bool prefill_graph_capture_enabled() {
+    static const bool enabled = []() {
+        const char* v = std::getenv("PIE_PREFILL_GRAPH_CAPTURE");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
 bool forward_graph_replay_eligible(
     const BatchEngine& engine,
     bool is_pure_decode,
+    bool prefill_graph_ready,
     bool have_custom_mask,
     bool rs_buffer_write,
     bool rs_buffer_fold,
@@ -497,12 +510,19 @@ bool forward_graph_replay_eligible(
          engine.inputs.custom_mask_indptr.data() != nullptr);
     return engine.graph_cache != nullptr &&
         engine.forward_fn.graph_safe &&
-        is_pure_decode &&
+        (is_pure_decode || prefill_graph_ready) &&
         mask_pointers_stable &&
         !rs_buffer_write &&
         !rs_buffer_fold &&
-        has_write_desc &&
         structured_window_left == -2 &&
+        // Pure-decode captures record the explicit w_page/w_off KV-write
+        // path, so a decode fire without write descriptors must stay eager.
+        // A prefill fire writes KV through the CSR path (device buffers +
+        // key scalars only) and is captured with its real has_write_desc,
+        // so the requirement does not apply to it. Structural: a prefill
+        // fire can never resolve device geometry, so has_write_desc is
+        // constant (false) across every fire of a prefill key.
+        (has_write_desc || prefill_graph_ready) &&
         graph_replay_has_no_host_resets(
             use_slots,
             is_fresh_h_data,
@@ -520,9 +540,34 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
     auto& pi = engine.inputs;
     auto& forward_fn = engine.forward_fn;
 
+    // A capturable prefill fire must also pin its logits shape to the graph
+    // key: the body is captured with the compact-logits row list (a stable
+    // device buffer), so every fire replaying the key needs exactly R
+    // sampled rows. Chunk-completing prefill waves sample one row per lane;
+    // partial/mixed waves that sample fewer fall back to eager.
+    const bool prefill_graph_ready = !in.is_pure_decode &&
+        engine.forward_fn.invoke_prefill_graph_ready() &&
+        in.compact_logits &&
+        in.num_sampling == in.forward_R;
+    // Diagnostic for the dormant prefill-capture path (see
+    // prefill_graph_capture_enabled): attributes per-fire eligibility, the
+    // first thing the enablement work needs. Free when the env is unset.
+    if (!in.is_pure_decode && std::getenv("PIE_PREFILL_GRAPH_DEBUG") != nullptr) {
+        std::fprintf(stderr,
+            "[prefill-graph] R=%d N=%d ready=%d model_ready=%d compact=%d "
+            "num_sampling=%d custom_mask=%d window=%d stage_hooks=%d "
+            "images=%d has_write_desc=%d\n",
+            in.forward_R, in.forward_N, prefill_graph_ready ? 1 : 0,
+            engine.forward_fn.invoke_prefill_graph_ready() ? 1 : 0,
+            in.compact_logits ? 1 : 0, in.num_sampling,
+            in.have_custom_mask ? 1 : 0, in.structured_window_left,
+            in.stage_hooks != nullptr ? 1 : 0, in.num_images,
+            in.has_write_desc ? 1 : 0);
+    }
     const bool graph_eligible = forward_graph_replay_eligible(
         engine,
         in.is_pure_decode,
+        prefill_graph_ready,
         in.have_custom_mask,
         in.rs_buffer_write,
         in.rs_buffer_fold,
@@ -558,16 +603,19 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
                 in.h_kvlpl_forward,
                 in.forward_N,
                 in.forward_R,
-                true,
+                in.is_pure_decode,
                 in.have_custom_mask,
                 in.use_slots ? in.slot_ids_h_data : nullptr,
                 in.use_slots ? in.is_fresh_h_data : nullptr,
                 in.use_slots ? pi.slot_ids.data() : nullptr,
-                nullptr,
-                0,
+                // Pure decode captures full-N logits (N == R); a prefill
+                // capture records the compact row list instead — its count
+                // is pinned to R by the eligibility gate above.
+                in.compact_logits ? pi.sample_idx.data() : nullptr,
+                in.compact_logits ? in.num_sampling : 0,
                 pi.w_page.data(),
                 pi.w_off.data(),
-                /*has_write_desc=*/true,
+                in.has_write_desc,
                 in.structured_window_left);
             engine.graph_cache->put(key, exec);
         }

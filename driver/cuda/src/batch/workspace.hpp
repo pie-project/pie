@@ -27,10 +27,17 @@ bool has_non_full_attention_layers(const HfConfig& hf);
 
 // Byte budget for FlashInfer's per-fire float scratch on the active arch
 // and TP layout. Returns a conservative base when the fast-path budget
-// doesn't apply.
+// doesn't apply. With `cuda_graphs`, additionally covers the graph-mode
+// prefill plan's forced split-KV carve for shapes up to
+// (max_forward_tokens, max_requests) — graph-mode planning always carves
+// (its work split must be content-independent), so capturable prefill
+// coverage is bounded by this budget (the plan demotes to a non-graph
+// plan when its carve would not fit).
 std::size_t attention_float_workspace_bytes(const HfConfig& hf,
                                             const Config& cfg,
                                             const cudaDeviceProp& prop,
-                                            int max_requests);
+                                            int max_requests,
+                                            int max_forward_tokens,
+                                            bool cuda_graphs);
 
 }  // namespace pie_cuda_driver

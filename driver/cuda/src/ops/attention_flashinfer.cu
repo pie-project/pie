@@ -222,9 +222,19 @@ struct PrefillPlanCache {
     bool use_sm90 = false;
     bool enable_pdl = false;
     bool valid = false;
+    /// The plan ran in graph mode (content-independent launch geometry) on
+    /// the FA2 causal path — the executor may capture/replay the dispatch.
+    /// False when graph mode was requested but demoted (SM90 route, split
+    /// disabled for the head dim, or the graph carve exceeding the float
+    /// workspace grant).
+    bool graph_capturable = false;
     std::vector<IdType> qo_h_buf;
     std::vector<IdType> kv_h_buf;
 };
+
+bool prefill_plan_graph_capturable(const PrefillPlanCache& cache) {
+    return cache.valid && cache.graph_capturable;
+}
 
 void DecodePlanCacheDeleter::operator()(DecodePlanCache* p) const noexcept {
     delete p;
@@ -570,6 +580,7 @@ void plan_attention_flashinfer_prefill_bf16(
     }
     cache.use_sm90 = false;
     cache.sm90_plan.valid = false;
+    cache.graph_capturable = false;
     if (!custom_mask && !hnd_layout &&
         kv_last_page_lens_h != nullptr &&
         hopper_prefill_supported(
@@ -618,6 +629,54 @@ void plan_attention_flashinfer_prefill_bf16(
     const bool disable_split_kv =
         !head_dim_supports_split;
 
+    // Graph-mode planning fixes the launch geometry as a pure function of
+    // (total_tokens, num_requests) but in exchange always splits KV, so the
+    // plan always carves its float partials — sized by the padded (not
+    // actual) work-item count. Demote to a content-shaped plan when the
+    // carve would overflow the float workspace grant: the wave then runs
+    // eager (uncapturable) instead of failing the plan. Graph mode with
+    // split disabled is not demote-exempt either — flashinfer only writes
+    // `block_valid_mask` on the split path, so an unsplit padded grid would
+    // read uninitialized work assignments.
+    if (enable_cuda_graph && !disable_split_kv) {
+        const std::uint64_t gqa_group =
+            static_cast<std::uint64_t>(num_q_heads) /
+            std::max(1, num_kv_heads);
+        const std::uint64_t max_qo_len =
+            static_cast<std::uint64_t>(
+                std::max(1, total_tokens - num_requests + 1)) *
+            std::max<std::uint64_t>(1, gqa_group);
+        const std::uint64_t cta_tile_q = ::flashinfer::FA2DetermineCtaTileQ(
+            static_cast<std::int64_t>(max_qo_len),
+            static_cast<std::uint32_t>(head_dim));
+        int num_sm = 0;
+        int dev_id = 0;
+        CUDA_CHECK(cudaGetDevice(&dev_id));
+        CUDA_CHECK(cudaDeviceGetAttribute(
+            &num_sm, cudaDevAttrMultiProcessorCount, dev_id));
+        const std::uint64_t max_batch_size_if_split =
+            static_cast<std::uint64_t>(2 * num_sm) /
+            std::max(1, num_kv_heads);
+        const std::uint64_t total_tiles =
+            (static_cast<std::uint64_t>(total_tokens) *
+                 std::max<std::uint64_t>(1, gqa_group) +
+             cta_tile_q - 1) /
+                cta_tile_q +
+            static_cast<std::uint64_t>(std::max(0, num_requests - 1));
+        const std::uint64_t padded_batch =
+            std::max(max_batch_size_if_split, total_tiles);
+        const std::uint64_t carve_bytes =
+            static_cast<std::uint64_t>(num_q_heads) * padded_batch *
+                cta_tile_q * (static_cast<std::uint64_t>(head_dim) + 1) *
+                sizeof(float) +
+            2 * 16;  // two 16-byte-aligned allocations
+        if (carve_bytes > workspace.float_bytes()) {
+            enable_cuda_graph = false;
+        }
+    } else {
+        enable_cuda_graph = enable_cuda_graph && !disable_split_kv;
+    }
+
     auto status = ::flashinfer::PrefillPlan<IdType>(
         workspace.float_buffer(), workspace.float_bytes(),
         workspace.int_buffer(), workspace.page_locked_int(),
@@ -650,6 +709,10 @@ void plan_attention_flashinfer_prefill_bf16(
     cache.full_attention_variant = full_attention_variant;
     cache.causal_mask = causal_mask;
     cache.hnd_layout = hnd_layout;
+    // Only the causal FA2 prefill dispatch is captured (Phase 1): the
+    // custom-mask variant stays eager, and the decode-shaped plans are
+    // admitted through the pure-decode rules instead.
+    cache.graph_capturable = enable_cuda_graph && causal_mask && !custom_mask;
     cache.enable_pdl = current_device_supports_pdl();
     cache.valid = true;
 }

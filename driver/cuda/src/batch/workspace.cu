@@ -30,7 +30,9 @@ bool has_non_full_attention_layers(const HfConfig& hf) {
 std::size_t attention_float_workspace_bytes(const HfConfig& hf,
                                             const Config& cfg,
                                             const cudaDeviceProp& prop,
-                                            int /*max_requests*/) {
+                                            int max_requests,
+                                            int max_forward_tokens,
+                                            bool cuda_graphs) {
     const bool qwen_hybrid =
         hf.model_type == "qwen3_5" ||
         hf.model_type == "qwen3_5_text" ||
@@ -95,10 +97,35 @@ std::size_t attention_float_workspace_bytes(const HfConfig& hf,
     const std::size_t padded_batch =
         std::max<std::size_t>(1, (num_blocks_per_sm * num_sm) / kv_heads);
 
+    // Graph-mode prefill planning (`enable_cuda_graph`) sizes the carve by
+    //
+    //   padded_batch_size = max(max_batch_size_if_split, total_num_tiles_q)
+    //   total_num_tiles_q = ceil(total_num_rows * gqa / cta_tile_q)
+    //                       + batch_size - 1
+    //
+    // (PrefillSplitQOKVIndptr) and forces split_kv, so the carve always
+    // happens and scales with the token budget, not the CTA budget.
+    // Budgeting it for the full (max_forward_tokens, max_requests)
+    // envelope buys the graphed-prefill coverage; a wave whose plan would
+    // not fit the granted buffer plans non-graph instead and runs eager.
+    std::size_t graph_padded_batch = 0;
+    if (cuda_graphs && max_forward_tokens > 0 && max_requests > 0) {
+        auto ceil_div = [](std::size_t n, std::size_t d) {
+            return (n + d - 1) / d;
+        };
+        const std::size_t gqa = ceil_div(qo_heads, kv_heads);
+        const std::size_t total_tiles =
+            ceil_div(static_cast<std::size_t>(max_forward_tokens) * gqa,
+                     cta_tile_q) +
+            static_cast<std::size_t>(max_requests) - 1;
+        graph_padded_batch = std::max(padded_batch, total_tiles);
+    }
+    const std::size_t sized_batch = std::max(padded_batch, graph_padded_batch);
+
     const std::size_t tmp_v =
-        qo_heads * padded_batch * cta_tile_q * head_dim * sizeof(float);
+        qo_heads * sized_batch * cta_tile_q * head_dim * sizeof(float);
     const std::size_t tmp_s =
-        qo_heads * padded_batch * cta_tile_q * sizeof(float);
+        qo_heads * sized_batch * cta_tile_q * sizeof(float);
     // Slack covers the plan's 16-byte allocation alignment and the decode
     // plan's (much smaller) tmp buffers, which share this buffer but never
     // coexist with a prefill.

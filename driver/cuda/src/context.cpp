@@ -791,7 +791,11 @@ int Context::Impl::load_model(
         family == model::Family::DeepSeekV4,
         family == model::Family::Kimi,
         family == model::Family::Glm5,
-        kv_format, runtime_quant_scratch_base, verbose);
+        kv_format, runtime_quant_scratch_base,
+        // The graph-prefill carve is budgeted only when prefill capture is
+        // actually on (opt-in): decode graphs never need it, and the carve
+        // trades real KV pool space.
+        use_cuda_graphs && prefill_graph_capture_enabled(), verbose);
     std::size_t free_device_bytes = 0;
     std::size_t total_device_bytes = 0;
     CUDA_CHECK(cudaMemGetInfo(&free_device_bytes, &total_device_bytes));

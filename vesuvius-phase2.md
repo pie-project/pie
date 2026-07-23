@@ -1175,3 +1175,114 @@ approved for. The work is preserved in stash "earlyrel-ab" (design,
 tests, and the policy hygiene line); not landed. The boundary floor's
 next honest owner is the guest-wake fan-out itself, which is
 process-teardown compute, not scheduling.
+
+## Three-lever round: batched closes, workspace derivation, varlen capture
+
+Operator direction: proceed on all three remaining levers — (1) boundary
+lifecycle event batching, (2) replacing the hand-mirrored flashinfer
+workspace formula, (3) prefill/varlen CUDA-graph capture (M4 reopened:
+graph capture is host orchestration, not kernel work, so it is
+compatible with the runtime-only constraint).
+
+### Lever 1 — batched teardown channel closes (LANDED, +0.5%)
+
+A departing process posted one `CloseChannel` mailbox item per guest
+channel; a 512-process boundary herd meant ~9.2k items inflating the
+epoch a worker pass drains, which is what quantized the terminate-ack
+and release items into later passes. Teardown now takes over each
+endpoint's close notification (`ChannelEndpoint::
+detach_close_notification`) before the resource-table drop and posts
+one batched `CloseChannels` item per driver after it. Per-producer
+FIFO keeps every instance close (posted during the drop) ahead of the
+batch, so the driver's instance-before-channel invariant is untouched;
+endpoints the table walk cannot reach still notify one-by-one from
+their own drop. Units 360/360 (2 new); k1 35,230/35,447/35,251 vs
+base 34,965/35,063/35,177 — median +0.5%, all three runs above all
+three baseline runs, 35,447 a new best single run. vLLM gap +9.5%.
+
+### Lever 2 — flashinfer-derived workspace bound (LANDED, neutral)
+
+`attention_float_workspace_bytes` re-derived PrefillPlan's split-KV
+carve by hand (the pie#414 drift class). `workspace.cpp` is now
+`workspace.cu`: it compiles against `flashinfer/attention/
+scheduler.cuh` (signature drift now breaks the build), takes
+`cta_tile_q` from flashinfer's own `FA2DetermineCtaTileQ`, and matches
+PrefillPlan's floor-division CTA budget exactly (provable bound for
+non-graph split plans). The one remaining mirrored literal is
+PrefillPlan's `num_blocks_per_sm = 2`. Produced sizes unchanged
+wherever the 80/128MB floor dominates (all current configs).
+
+### Lever 3 — prefill/varlen graph capture, Route A (IN PROGRESS)
+
+Investigation (vendored v0.6.15 + pie graph machinery) found the
+cheapest sound route is NOT the persistent/holistic kernel (drops
+sliding window + custom mask; new instantiation) but Route A: plan
+prefill with `enable_cuda_graph=true`, which makes flashinfer fix
+`padded_batch_size = max(CTA budget, tile bound(N, R))` —
+content-independent given the graph key — with per-wave truth flowing
+through device buffers the prepare hook already refreshes. Facts that
+shaped the design:
+
+- Graph-mode PrefillPlan FORCES split_kv and always carves tmp_v/tmp_s
+  sized by the padded batch (~365MB for the k1 prefill wave shape;
+  ~675MB for the full (8192, 512) envelope). `disable_split_kv +
+  enable_cuda_graph` is unsound in v0.6.15 (block_valid_mask is only
+  written on the split path). So the planner now budgets the graph
+  carve into the float workspace when graphs are on (workspace.cu
+  graph term, exact and shape-derived, no tuning knob), and the plan
+  demotes to a content-shaped (eager) plan when its carve would not
+  fit the granted buffer.
+- The graph cache/key machinery was already general: key is
+  (R, N, variant), `prefill_plan_graph_layout` already encodes
+  padded/split/tile, capture already takes real ragged host arrays and
+  an is_pure_decode parameter (one literal `true` at the lazy-capture
+  call site was the only decode hardcode).
+- Prefill waves sample compact logits (R rows of N); the capture call
+  passed (nullptr, 0), which would have captured a full-N lm_head GEMM
+  — wrong output layout and ~25ms of waste. Capture now records the
+  compact row list, and eligibility pins num_sampling == R for
+  non-pure-decode fires (chunk-completing waves qualify; partial waves
+  stay eager).
+- Scope gates (capability, not workload): llama_like family only
+  (IModel::prefill_graph_ready default false), FA2 causal pre-planned
+  path only (SM90/hopper, custom-mask, per-layer-window, non-bf16-
+  native KV all stay eager), TP additionally pins logit_rows == R.
+
+### Lever 3 outcome: certified substrate, capture default-OFF (opt-in)
+
+The full Route A substrate landed and certified: with capture forced on,
+single-lane oracles are EXACT with prefill graphs genuinely replaying.
+But the capture ECONOMICS are upside-down in the cold-run regime, in two
+stages discovered by measurement:
+
+1. First cert round: k1 34.64/34.84/34.67 (−1.7% vs the batched-close
+   state). nsys showed 155 graph launches / 2 distinct graphs — ZERO
+   prefill captures. The rejecting eligibility leg was `has_write_desc`
+   (prefill fires write KV through the CSR path, not explicit
+   descriptors; the capture call hardcoded has_write_desc=true). So
+   every prefill wave paid the graph-mode plan's forced split-KV
+   (partial-write + merge) with no graph to show for it.
+2. After fixing the leg (capture takes the fire's real has_write_desc;
+   decode keeps requiring it): captures fire and oracles stay EXACT,
+   but throughput collapsed — k1 32.2/27.1/34.9 with wild variance,
+   c0256 −25%, and 512×512 fell to 437 tok/s with the second cohort
+   starved into client timeouts. Mechanism: capture+instantiate is a
+   ~10ms stream-synced stall per (R, N) key, a replay saves only ~1ms,
+   and continuous batching produces mostly one-off mixed-wave shapes —
+   a capture storm with no amortization. Even the frame-mode k1 run,
+   whose 3 chunk shapes DO recur, only replays ~12 waves per cold run:
+   30ms of capture cannot pay for ~12ms of savings inside one run.
+
+Resolution (same pattern as the frame settle-defer substrate): capture
+is gated behind PIE_PREFILL_GRAPH_CAPTURE=1, default OFF, which also
+gates the planner's graph-carve grant — default behavior is
+bit-identical to the pre-lever state. The gate comment documents the
+two prerequisites for flipping the default: shape recurrence (bucketed
+prefill keys with row_valid padding — the machinery the decode lattice
+already uses) or recurrence-gated capture admission, plus a warm
+serving regime where a 10ms capture amortizes over hundreds of
+replays. What survives active by default: nothing behavioral; what
+survives structurally: generalized eligibility (prefill_graph_ready
+lane), capture with real write-desc/compact-logits shapes, the
+planner's exact carve term, the plan-level demotion guard, and the
+per-fire eligibility diagnostic (PIE_PREFILL_GRAPH_DEBUG=1).
