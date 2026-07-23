@@ -77,6 +77,8 @@ def build_report(
                     "losses": measurement["losses"],
                     "trend_reproduced": measurement["trend_reproduced"],
                     "decision_latency": offline_entry["decision_latency"],
+                    "operation_counts": offline_entry["operation_counts"],
+                    "package_sha256": offline_entry["package_sha256"],
                     "robustness": robustness.get(policy_id),
                 },
                 "live": live_entry,

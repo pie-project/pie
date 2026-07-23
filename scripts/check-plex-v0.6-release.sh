@@ -13,6 +13,8 @@ cargo run --quiet --release --locked -p pie-policy --example bench_v0_6 -- \
     --check tests/policies/performance-budgets.json >/tmp/plex-v0.6-benchmark.json
 python3 -m json.tool /tmp/plex-v0.6-benchmark.json >/dev/null
 python3 -m json.tool tests/policies/performance-targets.json >/dev/null
+python3 -m json.tool tests/policies/fidelity-audit.json >/dev/null
+python3 -m json.tool plex_policy_performance_report.json >/dev/null
 python3 -m py_compile \
     scripts/benchmark-plex-policy-performance.py \
     scripts/benchmark-vllm-plex-policy.py \
