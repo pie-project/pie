@@ -3176,8 +3176,17 @@ impl BatchScheduler {
             if in_flight_control.is_some() {
                 break;
             }
-            if Self::in_flight_settle_groups(in_flight_launches)
-                >= frame::configured_max_in_flight()
+            // M2 run-ahead gate: base depth is the historical per-batch cap
+            // (deeper pipelines stall the lane thread on upload-staging
+            // slots and the prior wave's publications_done wait). The one
+            // exception keeps a frame group's tail postable (R1): exceed
+            // the cap only while EVERY in-flight batch belongs to the open
+            // deferred group — if any settle-now batch is in flight, it
+            // settles independently and retirement frees a slot, so
+            // breaking here can never deadlock. At k=1 every batch is
+            // settle-now and this is exactly the historical gate.
+            if in_flight_launches.len() >= frame::configured_max_in_flight()
+                && !in_flight_launches.iter().all(|batch| batch.settle_defer)
             {
                 break;
             }
@@ -3312,20 +3321,6 @@ impl BatchScheduler {
             }
         }
         (progress, wait_hint)
-    }
-
-    /// M2 group-aware run-ahead gate: a sealed frame's deferred waves and
-    /// its settle-now tail count as ONE in-flight unit, so a k-wave group can
-    /// always post its tail; settle-now batches (k=1, riders, makeups,
-    /// shutdown drain) each count alone — at k=1 this is exactly the
-    /// historical per-batch depth. A trailing deferred run with a truncated
-    /// tail counts as its own open group until it retires.
-    fn in_flight_settle_groups(in_flight: &VecDeque<PendingLaunchBatch>) -> usize {
-        in_flight
-            .iter()
-            .filter(|batch| !batch.settle_defer)
-            .count()
-            + usize::from(in_flight.back().is_some_and(|batch| batch.settle_defer))
     }
 
     /// Extract `candidates` (in order) from the queue, group them under the
