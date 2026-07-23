@@ -1869,7 +1869,6 @@ int Context::Impl::launch_impl(
     const PieLaunchDesc& launch,
     PieCompletion completion,
     std::optional<std::uint64_t> lease_id) {
-    const bool hold_lease = launch.settle_defer != 0;
     std::optional<LaunchLease> lease;
     if (lease_id.has_value()) {
         std::lock_guard lock(lease_mutex_);
@@ -1878,10 +1877,7 @@ int Context::Impl::launch_impl(
             return PIE_STATUS_INVALID_ARGUMENT;
         }
         lease = found->second;
-        // A settle_defer wave validates against its frame's held lease
-        // without consuming it (M3 frame-level prepare); the frame tail
-        // (settle-now) consumes it exactly as a lone launch does today.
-        if (!hold_lease) launch_leases_.erase(found);
+        launch_leases_.erase(found);
     }
     pie_cuda_driver::ops::ScopedRuntimeQuantContext quant_scope(
         runtime_quant_context_);
@@ -1917,13 +1913,11 @@ int Context::Impl::launch_impl(
                         "prepared launch mappings were trimmed below lease floor");
                 }
             }
-            if (!hold_lease) {
-                {
-                    std::lock_guard lock(lease_mutex_);
-                    in_flight_leases_.emplace(*lease_id, *lease);
-                }
-                lease_in_flight = true;
+            {
+                std::lock_guard lock(lease_mutex_);
+                in_flight_leases_.emplace(*lease_id, *lease);
             }
+            lease_in_flight = true;
         } else {
             const auto commit =
                 pie_cuda_driver::commit_cuda_arena_targets_atomically(
