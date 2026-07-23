@@ -94,6 +94,14 @@ static SERVICES: LazyLock<ServiceMap<ProcessId, Message>> = LazyLock::new(Servic
 
 /// Admission semaphore. `None` = unlimited concurrency (no gating).
 static ADMISSION: OnceLock<Option<Arc<Semaphore>>> = OnceLock::new();
+/// Bind-ahead admission: gates per-instance DRIVER state creation (channel
+/// registration, instance bind, working-set declaration), sized above
+/// execution admission so the next cohort's bring-up overlaps the current
+/// cohort's execution. `PIE_BIND_AHEAD` = extra permits beyond the
+/// execution limit (default: one full execution cohort; 0 restores the
+/// single-gate behavior). Unlimited execution admission leaves this
+/// unlimited too.
+static BIND_ADMISSION: OnceLock<Option<Arc<Semaphore>>> = OnceLock::new();
 /// Prewarm admission: a bounded next cohort may instantiate its WASM and
 /// compile/register its (hash-deduped) program while the active cohort
 /// executes. Strict admission: everything that creates per-instance driver
@@ -209,9 +217,26 @@ pub fn init_admission(max_concurrent: Option<usize>) {
     let prewarm = Some(Arc::new(Semaphore::new(
         limit.map_or(MAX_PREWARM_PROCESSES, |n| n.min(MAX_PREWARM_PROCESSES)),
     )));
+    // DEFAULT 0 (bind pool == execution pool == the historical single
+    // gate): measured 2026-07-23, bind-ahead moves the driver-lane
+    // register storm off the boundary but the boundary is ALSO bound by
+    // engine-thread herd work (512 guests' submit paths + the next
+    // cohort's bring-up on one thread), so extra permits bought k2 +1.5k
+    // but cost k1 ~0.7k; see vesuvius-phase2.md. Experimental lever until
+    // the engine-side herd serialization is addressed.
+    let bind_ahead = limit.map(|n| {
+        let extra = std::env::var("PIE_BIND_AHEAD")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        Arc::new(Semaphore::new(n.saturating_add(extra)))
+    });
     ADMISSION
         .set(sem)
         .expect("admission controller already initialized");
+    BIND_ADMISSION
+        .set(bind_ahead)
+        .expect("bind admission controller already initialized");
     PREWARM_ADMISSION
         .set(prewarm)
         .expect("prewarm admission controller already initialized");
@@ -221,11 +246,46 @@ pub(crate) fn execution_admission_is_capped() -> bool {
     ADMISSION.get().is_some_and(Option::is_some)
 }
 
-/// Strict-admission gate: acquire the execution permit lazily, at the first
-/// operation that creates per-instance driver state or claims pooled KV/RS
-/// resources. Idempotent per process. The prewarm permit (held since spawn)
-/// is released the moment execution is admitted.
+/// Bind-ahead gate: acquire the bind permit lazily, at the first operation
+/// that creates per-instance driver state (channel registration / instance
+/// bind / working-set declaration). Idempotent per process. The prewarm
+/// permit (held since spawn) is released here — the process has moved past
+/// instantiation into bring-up. With `PIE_BIND_AHEAD` extra permits, the
+/// next cohort binds while the current one executes, so a generation
+/// boundary costs only submits + the seal instead of the register storm.
+pub(crate) async fn ensure_bind_admitted(ctx: &mut ProcessCtx) {
+    if ctx.bind_admitted() {
+        return;
+    }
+    let started = Instant::now();
+    let permit = match BIND_ADMISSION.get().and_then(|value| value.as_ref()) {
+        Some(semaphore) => Some(
+            Arc::clone(semaphore)
+                .acquire_owned()
+                .await
+                .expect("bind admission semaphore closed"),
+        ),
+        None => None,
+    };
+    ctx.admit_bind(permit);
+    if crate::scheduler::fire_timing_enabled() {
+        crate::scheduler::fire_timing_write(&serde_json::json!({
+            "schema": 1,
+            "source": "runtime",
+            "event": "process_bind_admitted",
+            "process_id": ctx.id(),
+            "bind_admitted_us": crate::scheduler::fire_timing_now_us(),
+            "bind_admission_wait_us": duration_us(started.elapsed()),
+        }));
+    }
+}
+
+/// Strict-admission gate: acquire the execution permit lazily at fire
+/// submit. Idempotent per process. Bind admission is ensured first (the
+/// same order everywhere: bind, then execution — permits are only ever
+/// acquired in that order, so the two gates cannot deadlock).
 pub(crate) async fn ensure_execution_admitted(ctx: &mut ProcessCtx) {
+    ensure_bind_admitted(ctx).await;
     if ctx.execution_admitted() {
         return;
     }

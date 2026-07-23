@@ -388,6 +388,18 @@ enum SchedulerItem {
     /// turnover control convoy (V6 iteration 25 attribution).
     RegisterChannelsBind {
         pipeline_id: Option<ProcessId>,
+        /// Whether this bind holds the frame seal (`on_bind_enqueued`).
+        /// True only for a process that already has EXECUTION admission —
+        /// its first fire is imminent, the original rationale for the
+        /// pending-bind hold. A bind-AHEAD process (bind-admitted only,
+        /// execution-gated at submit) fires a whole generation later:
+        /// holding the seal for its bind would stall every boundary on the
+        /// next cohort's register storm. Completions stay unconditional —
+        /// `on_bind_completed` is saturating, execution admission is
+        /// monotonic per process, and a guest's binds are sequential
+        /// awaited RPCs, so an unheld completion can never consume a held
+        /// entry.
+        holds_seal: bool,
         plans: Vec<ChannelRegistrationPlan>,
         /// Some on the program cache's first sight (the driver requires the
         /// instance's channels registered BEFORE the program — status -5
@@ -1856,6 +1868,7 @@ impl SchedulerHandle {
     pub async fn register_channels_bind(
         &self,
         pipeline_id: Option<ProcessId>,
+        holds_seal: bool,
         plans: Vec<ChannelRegistrationPlan>,
         program: ProgramRegistration,
         mut bind: InstanceBindingPlan,
@@ -1886,6 +1899,7 @@ impl SchedulerHandle {
         let (registered, program_id, bound) = self
             .request(|response| SchedulerItem::RegisterChannelsBind {
                 pipeline_id,
+                holds_seal,
                 plans,
                 program: program_field,
                 bind,
@@ -2576,6 +2590,7 @@ impl BatchScheduler {
                 );
             }
             SchedulerItem::RegisterChannelsBind {
+                holds_seal,
                 pipeline_id,
                 plans,
                 program,
@@ -2590,6 +2605,13 @@ impl BatchScheduler {
                     )));
                     return;
                 }
+                // `holds_seal` is recorded but not yet acted on: gating the
+                // pending-bind hold on execution admission fragmented k>1
+                // boundary epochs (k2 2048x32 24.9k -> 9.8-10.7k measured),
+                // and the imminent-join replacement did not restore the
+                // gathering. Every bind holds the seal until a gathering
+                // mechanism that survives measurement exists.
+                let _ = holds_seal;
                 frame_policy.on_bind_enqueued(pipeline_id);
                 Self::queue_bind_control(
                     pending,

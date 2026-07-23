@@ -580,6 +580,46 @@ stall**; first-register delay 76–88 ms → 5–26 ms; throughput
 2048×32 23.0–23.7 → 24.3–24.9k; c0/256 27.4k and 512×512 19.2k
 unchanged; oracles exact; zero watchdog; zero registry grows.
 
+### Round 2 attempt: bind-ahead (two-stage admission) — machinery landed dormant
+
+Directive: fundamental redesign, layer 1 — split admission into BIND
+(driver bring-up: `ensure_bind_admitted` at `forward-pass.program` /
+working-set creation, pool = execution limit + `PIE_BIND_AHEAD`) and
+EXECUTION (the existing gate at submit), so the next cohort binds while
+the current one executes. Three measured rounds:
+
+- bind-ahead + binds still holding the seal: k2 2048×32 **25.8k (best
+  ever)**, k1 26.1–26.5 (below round 1's 26.8–27.5);
+- gating the pending-bind seal hold on execution admission (a
+  bind-ahead process fires a generation later): k2 CRATERED to
+  9.8–10.7k — the bind hold was doing boundary GATHERING work, and
+  removing it fragments k>1 epochs (the M1b pathology);
+- replacing it with an imminent-join hold (registered at
+  exec-admission, cleared on first arrival): did NOT restore k2
+  (10.7k) — and the timeline instrumentation showed why nothing helps
+  k1 either: **exec admission completes at +5–28 ms into the boundary
+  (prebinding works, admission waits p50 530 ms measured), yet waves
+  start only at ~+170 ms — the boundary is bound by ENGINE-THREAD herd
+  serialization**: 512 guests' submit paths plus the next cohort's 512
+  bring-ups contend on the engine's task execution, ~150 ms per cohort
+  regardless of where the driver-lane register storm sits.
+
+Disposition: seal-hold gating and the imminent-join hold REVERTED
+(every bind holds the seal again); the two-stage admission machinery
+stays with `PIE_BIND_AHEAD=0` default (bind pool == execution pool ==
+historical behavior; restoration verified — k1 26.2–27.1, k2 24.9,
+c0/256 27.3–27.4, oracles exact). `holds_seal` still rides the bind
+RPC for a future gathering mechanism that survives measurement.
+
+**The real next lever (measured, not yet directed): engine-side herd
+serialization** — profile the engine thread(s) across a boundary
+(where do 512 submit paths + 512 bring-ups spend ~150 ms: wasm resume,
+channel/plan construction, KV realize, mailbox round trips,
+single-thread tokio vs lock convoys) and parallelize or amortize that.
+Driver-lane levers (register cohort batching, reuse keying, bind
+instance_us) only pay AFTER the engine thread stops being the
+boundary's critical path.
+
 Remaining boundary structure (~140–175 ms per stall, now almost pure
 register work): per control (p50 120–140 µs × 1,024) — ~59 µs channel
 registrations (9× ~6.6 µs: init/mirror/words), ~47 µs

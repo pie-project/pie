@@ -114,6 +114,7 @@ pub(crate) async fn register_channels(
 pub(crate) async fn register_channels_bind_classified(
     driver_idx: DriverId,
     pipeline_id: Option<ProcessId>,
+    holds_seal: bool,
     mut plans: Vec<crate::driver::ChannelRegistrationPlan>,
     program: ProgramRegistration,
     requested_instance_id: InstanceId,
@@ -148,7 +149,7 @@ pub(crate) async fn register_channels_bind_classified(
         geometry_class,
     };
     match handle
-        .register_channels_bind(pipeline_id, plans, program, bind)
+        .register_channels_bind(pipeline_id, holds_seal, plans, program, bind)
         .await
     {
         Ok((channels, bound)) => {

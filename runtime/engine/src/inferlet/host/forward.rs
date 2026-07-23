@@ -530,7 +530,7 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
             // prewarm, but everything from here on creates per-instance
             // driver state (channel registration, instance bind) or claims
             // pooled KV (device-geometry seed pages) — execution first.
-            crate::inferlet::process::ensure_execution_admitted(self).await;
+            crate::inferlet::process::ensure_bind_admitted(self).await;
 
             // Validate every handle against its dense declaration BEFORE
             // stamping any of them, so a failed `program` attachment binds nothing.
@@ -859,6 +859,7 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
                 match crate::scheduler::register_channels_bind_classified(
                     0,
                     Some(process_id),
+                    self.execution_admitted(),
                     registration_plans,
                     program_registration,
                     instance.instance_id,

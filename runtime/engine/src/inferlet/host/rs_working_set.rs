@@ -63,7 +63,7 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
         n: u32,
     ) -> Result<Result<WitRange, String>> {
         // Strict admission: RS buffer slots are scarce pooled resources.
-        crate::inferlet::process::ensure_execution_admitted(self).await;
+        crate::inferlet::process::ensure_bind_admitted(self).await;
         crate::inferlet::process::preemption::honor(self).await?;
         let ws = self.ctx().table.get(&this)?.clone();
         let stores = store_registry::get(ws.model, ws.driver as usize);

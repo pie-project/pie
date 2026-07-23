@@ -356,6 +356,7 @@ impl FramePolicy {
         !self.pending_binds.is_empty()
     }
 
+
     pub fn on_bind_completed(&mut self, pid: Option<ProcessId>) {
         if let Some(pid) = pid
             && let Some(count) = self.pending_binds.get_mut(&pid)

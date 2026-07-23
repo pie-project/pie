@@ -21,6 +21,7 @@ struct TeardownFireContext {
     // Dropped after `resources` (field declaration order), so strict
     // admission advances only after pooled resources are released.
     _execution_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    _bind_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl crate::pipeline::fire::FireContext for TeardownFireContext {
@@ -46,6 +47,7 @@ pub(crate) fn defer_resource_teardown(
     resources: wasmtime::component::ResourceTable,
     residency: Arc<Mutex<crate::inferlet::process::ProcessResidency>>,
     execution_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    bind_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) {
     let capped_execution = execution_permit.is_some();
     let snapshot = residency.lock().unwrap().teardown_snapshot();
@@ -53,6 +55,7 @@ pub(crate) fn defer_resource_teardown(
         process_id,
         resources,
         _execution_permit: execution_permit,
+        _bind_permit: bind_permit,
     };
     if !capped_execution
         && snapshot.departed_pipeline_ids.is_empty()
