@@ -611,14 +611,39 @@ historical behavior; restoration verified — k1 26.2–27.1, k2 24.9,
 c0/256 27.3–27.4, oracles exact). `holds_seal` still rides the bind
 RPC for a future gathering mechanism that survives measurement.
 
-**The real next lever (measured, not yet directed): engine-side herd
-serialization** — profile the engine thread(s) across a boundary
-(where do 512 submit paths + 512 bring-ups spend ~150 ms: wasm resume,
-channel/plan construction, KV realize, mailbox round trips,
-single-thread tokio vs lock convoys) and parallelize or amortize that.
-Driver-lane levers (register cohort batching, reuse keying, bind
-instance_us) only pay AFTER the engine thread stops being the
-boundary's critical path.
+**Round 3: worker-pass probe — the engine-thread hypothesis REFUTED,
+the boundary named precisely.** A `worker_pass` fire-timing probe
+(mailbox/retire/dispatch timing per pass, emitted >2 ms) shows: inside
+a 146–199 ms boundary stall the worker's slow passes cover only
+13–57 ms — the scheduler thread is mostly IDLE, not compute-bound. The
+mailbox flood (10–12k items: closes + the herd's submits) drains at
+~4 µs/item by +17–54 ms; every fire is queued by then. What the
+scheduler waits on for the remaining ~120 ms is the SEAL: the NEXT
+cohort's 1,024 binds sit in `pending` (`pending_len ≈ 1022`), each
+holding the seal (`pending_binds`, the unconditional hold restored
+after ba2/ba3), and they complete only as fast as the driver lane
+grinds their register controls; the first wave posts 1–3 ms after the
+last bind completes (dispatch pass at +156–202 ms observed directly).
+The tokio runtime is multi-threaded (min(cores,64), same
+`build_runtime` for the embedded engine) — guest-side herd work was
+never the limiter; the earlier ~150 ms inference conflated ba3's
+still-unexplained residual with engine work. (ba3's own +28→+170 ms
+block with the hold gated remains UNRESOLVED — its k2 crater and this
+residual should be re-diagnosed together if that path is revisited.)
+
+Two candidate remedies, in order of confidence:
+1. **Make the binds cheaper** (directly shortens the seal hold):
+   register cohort batching (framing ~26 µs/control), a driver batch
+   verb, registry reuse keying under close-lag (`cell_grew` 29.4k),
+   `bind_instance` instance_us (~47 µs). Every µs off the 1,024-control
+   grind is a µs off the boundary.
+2. **Buffer next-generation binds across the boundary** (the precise
+   fix): a `holds_seal=false` bind (process not exec-admitted) gets
+   BUFFERED worker-side — neither seal-holding nor lane-occupying —
+   until the boundary's first seal fires, then enqueued to grind during
+   execution. Semantically the ba2/ba3 intent done without enqueueing;
+   requires first explaining ba3's k2 crater and residual, so it lands
+   only behind fresh instrumentation.
 
 Remaining boundary structure (~140–175 ms per stall, now almost pure
 register work): per control (p50 120–140 µs × 1,024) — ~59 µs channel

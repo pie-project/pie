@@ -2091,14 +2091,17 @@ impl BatchScheduler {
 
         loop {
             let mut progress = false;
-            // Drain the scheduler channel FIRST: lane replies upgrade posted
-            // waves to Accepted and posted controls to Ready, and readiness
-            // credits land in `pending` — retiring and dispatching against a
-            // fresh view saves one full pass of latency per wave, which at
-            // decode cadence is the difference between an enqueued-ahead
-            // launch and a GPU gap (the retire path breaks on a Posted head).
+            // Worker-pass timing probe (PIE_FIRE_TIMING): the generation
+            // boundary showed fires arriving within ~28 ms while waves
+            // started at ~+170 ms — this names which pass phase eats the
+            // difference (mailbox drain vs retire vs dispatch) and how the
+            // pending queue length scales it.
+            let probe = super::fire_timing_enabled();
+            let pass_started = Instant::now();
+            let mut mailbox_items: u32 = 0;
             while let Ok(item) = rx.try_recv() {
                 progress = true;
+                mailbox_items += 1;
                 if let SchedulerItem::DebugDump { response } = item {
                     let _ = response.send(Self::render_debug_dump(
                         &pending,
@@ -2135,6 +2138,7 @@ impl BatchScheduler {
                     item,
                 );
             }
+            let mailbox_done = Instant::now();
             progress |= Self::retire_ready_launches(
                 &mut in_flight_launches,
                 &mut instances,
@@ -2144,6 +2148,7 @@ impl BatchScheduler {
                 stopping,
             );
             progress |= Self::retire_ready_control(&mut in_flight_control);
+            let retire_done = Instant::now();
             let (dispatched, wait_hint) = Self::dispatch_ready_items(
                 &lane,
                 &mut lane_inflight,
@@ -2160,6 +2165,27 @@ impl BatchScheduler {
                 stopping,
             );
             progress |= dispatched;
+            if probe {
+                let dispatch_us = retire_done.elapsed().as_micros() as u64;
+                let mailbox_us =
+                    mailbox_done.duration_since(pass_started).as_micros() as u64;
+                let retire_us =
+                    retire_done.duration_since(mailbox_done).as_micros() as u64;
+                if mailbox_us + retire_us + dispatch_us > 2_000 {
+                    super::fire_timing_write(&serde_json::json!({
+                        "schema": 1,
+                        "source": "scheduler",
+                        "event": "worker_pass",
+                        "pass_started_us": super::fire_timing_now_us(),
+                        "mailbox_us": mailbox_us,
+                        "mailbox_items": mailbox_items,
+                        "retire_us": retire_us,
+                        "dispatch_us": dispatch_us,
+                        "pending_len": pending.len(),
+                        "progress": progress,
+                    }));
+                }
+            }
             if stopping
                 && pending.is_empty()
                 && in_flight_launches.is_empty()
