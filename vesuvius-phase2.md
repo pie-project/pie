@@ -215,3 +215,23 @@ PIE_FRAME_GATHER_US=20000` — 2048×32 21.4–22.0k (+29–32% over Phase 1's
   documented fallback if it still binds after M2/M3.
 - One host gap per frame boundary (launch-time trust: frame f+1 launches
   after f completes) — by design; amortized k×.
+
+## Overlap rework (operator directive — landed, commit 05d155b2)
+
+The launch-time barrier is gone: FramePolicy seals early (the moment the
+wait-all gate holds, during the prior frame's execution), consumes every
+ready lane's front frame atomically (one frame per lane per boundary),
+posts all waves in global seal×slot order at the run-ahead depth, and
+replays RETRYs globally wave-ordered. Busy-lane exclusion, strict rounds,
+`PIE_FRAME_CHAIN`, and `PIE_FRAME_GATHER_US` are deleted; k is the only
+frame constant (keep it minimal — 2–3 typical). Every M1b/M1c/M1d width
+pathology this document chronicles is subsumed: early wait-all sealing
+re-merges stragglers by construction (a seal never excludes a busy lane).
+
+Gates: units 372/372; oracles exact 18/18 (k∈{2,3} × t∈{1..256}); 3
+consecutive 2048-fleets; zero retried fires; zero watchdog reports;
+median wave width 512. Results (vs same-session k=1): 2048×32 k2
+22.7–24.8k / k3 23.7k ≈ k1 23.7k (Phase 1's −33% erased); c0/256
+27.34–27.36k > k1 27.20k; 512×512 19.4–19.6k, 64×1536 7.36k, 16×1900
+3.70k — all ≥ k1 bands. Next (directed): unify the scheduler paths —
+route k=1 through FramePolicy and delete WaitAllPolicy.
