@@ -15,7 +15,9 @@ python3 -m json.tool /tmp/plex-v0.6-benchmark.json >/dev/null
 
 python3 scripts/generate-plex-replication-report.py
 python3 scripts/update-plex-paper-replication-status.py
+python3 scripts/generate-plex-policy-mapping-report.py
 git --no-pager diff --exit-code -- \
+    plex_policy_mapping_report.html \
     plex_replication_report.md \
     tests/policies/replication-report.json \
     plex-serving-policy-wiki/catalog.json \

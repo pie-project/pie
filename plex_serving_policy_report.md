@@ -16,6 +16,7 @@ and `tests/policies/replication-report.json`.
 
 - **Per-paper wiki:** [`plex-serving-policy-wiki/README.md`](plex-serving-policy-wiki/README.md)
 - **Machine-readable catalog:** [`plex-serving-policy-wiki/catalog.json`](plex-serving-policy-wiki/catalog.json)
+- **Presentation matrix:** [`plex_policy_mapping_report.html`](plex_policy_mapping_report.html)
 - **Methodology and limitations:** [`plex-serving-policy-wiki/methodology.md`](plex-serving-policy-wiki/methodology.md)
 
 The corpus contains **87 unique papers**:

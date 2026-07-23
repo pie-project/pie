@@ -1,0 +1,352 @@
+{
+  "contract": {
+    "major": 0,
+    "minor": 6
+  },
+  "operations": {
+    "admit": {
+      "label": "Admit",
+      "authority": "Which proposed requests may enter serving"
+    },
+    "route": {
+      "label": "Route",
+      "authority": "Where admitted requests should execute"
+    },
+    "schedule": {
+      "label": "Schedule",
+      "authority": "Which runnable requests receive service and how much"
+    },
+    "cache": {
+      "label": "Cache",
+      "authority": "Which resident or prospective objects remain cached"
+    },
+    "feedback": {
+      "label": "Feedback",
+      "authority": "How enacted outcomes update policy state"
+    }
+  },
+  "policies": {
+    "agentix": {
+      "schedule": {
+        "kind": "decision",
+        "summary": "Rank work groups by least attained service, with an anti-starvation boost."
+      },
+      "feedback": {
+        "kind": "state",
+        "summary": "Charge enacted service to request or work-group policy state."
+      }
+    },
+    "continuum": {
+      "schedule": {
+        "kind": "decision",
+        "summary": "Prioritize preempted and TTL-pinned work, then apply group-level FCFS."
+      },
+      "cache": {
+        "kind": "decision",
+        "summary": "Keep TTL-active beneficiaries resident and reclaim unpinned state."
+      },
+      "feedback": {
+        "kind": "state",
+        "summary": "Activate or expire per-request TTL state from enacted outcomes."
+      }
+    },
+    "kvflow": {
+      "schedule": {
+        "kind": "decision",
+        "summary": "Prioritize requests whose required cache state is already loaded."
+      },
+      "cache": {
+        "kind": "decision",
+        "summary": "Reclaim varying suffixes first and stage prefetch for marked objects."
+      }
+    },
+    "preble": {
+      "route": {
+        "kind": "decision",
+        "summary": "Exploit the longest reusable prefix or explore by load and eviction cost."
+      }
+    },
+    "helium": {
+      "schedule": {
+        "kind": "decision",
+        "summary": "Choose ready critical-path work using cache reuse, cost, and forced progress."
+      }
+    },
+    "vtc": {
+      "schedule": {
+        "kind": "decision",
+        "summary": "Serve the client with the smallest virtual-token counter."
+      },
+      "feedback": {
+        "kind": "state",
+        "summary": "Charge observed input and output tokens to each client counter."
+      }
+    },
+    "lmetric": {
+      "route": {
+        "kind": "decision",
+        "summary": "Minimize new-prefill-tokens times batch-size while excluding hotspots."
+      }
+    },
+    "fairserve": {
+      "admit": {
+        "kind": "decision",
+        "summary": "Throttle by weighted prior service plus predicted interference cost."
+      },
+      "schedule": {
+        "kind": "decision",
+        "summary": "Order admitted requests by weighted attained service."
+      },
+      "feedback": {
+        "kind": "state",
+        "summary": "Accumulate enacted service tokens in per-client policy state."
+      }
+    },
+    "marconi": {
+      "cache": {
+        "kind": "decision",
+        "summary": "Admit and retain the highest reuse-probability times recompute-FLOPs per byte."
+      },
+      "feedback": {
+        "kind": "state",
+        "summary": "Maintain enacted cache-feedback accounting for subsequent decisions."
+      }
+    },
+    "ragcache": {
+      "cache": {
+        "kind": "decision",
+        "summary": "Reclaim a legal leaf with the lowest prefix-aware GDSF value."
+      }
+    },
+    "dlpm": {
+      "route": {
+        "kind": "decision",
+        "summary": "Trade prefix hits against replica load using the client's deficit credit."
+      },
+      "schedule": {
+        "kind": "decision",
+        "summary": "Order by deficit credit, then by cached-token locality."
+      },
+      "feedback": {
+        "kind": "state",
+        "summary": "Add fairness quantum and subtract enacted service per client."
+      }
+    },
+    "infercept": {
+      "schedule": {
+        "kind": "decision",
+        "summary": "Resume interrupted work first and minimize expected wasted tokens."
+      },
+      "cache": {
+        "kind": "decision",
+        "summary": "Cache when reuse beats recompute, order reclaim, and optionally stage swap."
+      }
+    },
+    "peek": {
+      "schedule": {
+        "kind": "decision",
+        "summary": "Serve the fairness lane first, then the deepest pending demand."
+      },
+      "cache": {
+        "kind": "decision",
+        "summary": "Reclaim by demand depth shared with the scheduler's pending-state view."
+      }
+    },
+    "qlm": {
+      "admit": {
+        "kind": "decision",
+        "summary": "Accept requests whose estimated queue wait fits their SLO."
+      },
+      "route": {
+        "kind": "decision",
+        "summary": "Choose the feasible edge with the smallest estimated wait."
+      },
+      "schedule": {
+        "kind": "decision",
+        "summary": "Order work groups by their virtual-queue wait."
+      },
+      "feedback": {
+        "kind": "declared",
+        "summary": "Own the feedback boundary for virtual-queue accounting; the current kernel has no custom reducer."
+      }
+    },
+    "slos-serve": {
+      "admit": {
+        "kind": "decision",
+        "summary": "Accept only requests predicted to complete within their end-to-end SLO."
+      },
+      "route": {
+        "kind": "decision",
+        "summary": "Choose the target with the smallest predicted stage latency."
+      },
+      "schedule": {
+        "kind": "decision",
+        "summary": "Serve the request with the least remaining latency slack first."
+      }
+    },
+    "dynasor": {
+      "schedule": {
+        "kind": "decision",
+        "summary": "Rank by reasoning progress and stage cancellation above the confidence threshold."
+      },
+      "feedback": {
+        "kind": "declared",
+        "summary": "Receive cancellation and progress outcomes; the current kernel has no custom reducer."
+      }
+    },
+    "justitia": {
+      "schedule": {
+        "kind": "decision",
+        "summary": "Prioritize work groups with fewer completed branches."
+      },
+      "feedback": {
+        "kind": "state",
+        "summary": "Increment enacted branch-completion counts in work-group state."
+      }
+    },
+    "chameleon": {
+      "admit": {
+        "kind": "decision",
+        "summary": "Gate weighted request size against per-queue admission quotas."
+      },
+      "schedule": {
+        "kind": "decision",
+        "summary": "Order by queue class and age requests within each class."
+      },
+      "cache": {
+        "kind": "decision",
+        "summary": "Cache hot adapters, bypass cold ones, and reclaim legal residents."
+      }
+    },
+    "hotprefix": {
+      "cache": {
+        "kind": "decision",
+        "summary": "Admit and prefetch hot prefixes while reclaiming below-threshold residents."
+      },
+      "feedback": {
+        "kind": "state",
+        "summary": "Accumulate observed prefix reuse counts in shared policy state."
+      }
+    },
+    "pard": {
+      "schedule": {
+        "kind": "decision",
+        "summary": "Stage cancellation for projected deadline misses and schedule the remainder."
+      },
+      "feedback": {
+        "kind": "declared",
+        "summary": "Receive cancellation outcomes; the current kernel has no custom reducer."
+      }
+    },
+    "branch-regulation": {
+      "admit": {
+        "kind": "decision",
+        "summary": "Bound admitted branches per work group and by an interference budget."
+      },
+      "schedule": {
+        "kind": "decision",
+        "summary": "Stage cancellation for excess branches and schedule the legal remainder."
+      }
+    },
+    "dualmap": {
+      "route": {
+        "kind": "decision",
+        "summary": "Use two-choice prefix affinity with SLO risk and optional hotspot rebalance."
+      }
+    },
+    "llumnix": {
+      "route": {
+        "kind": "decision",
+        "summary": "Choose minimum virtual usage and optionally stage live rebalancing."
+      },
+      "feedback": {
+        "kind": "state",
+        "summary": "Record enacted placement and rebalancing feedback volume."
+      }
+    },
+    "smetric": {
+      "route": {
+        "kind": "decision",
+        "summary": "Load-balance first turns, preserve follow-up affinity, and migrate tail outliers."
+      }
+    },
+    "thunderagent": {
+      "schedule": {
+        "kind": "decision",
+        "summary": "Run tool-ready work while staging cancellation or migration when needed."
+      },
+      "cache": {
+        "kind": "decision",
+        "summary": "Retain live program state and bypass or reclaim dead state."
+      },
+      "feedback": {
+        "kind": "declared",
+        "summary": "Receive cancellation and rebalance outcomes; the current kernel has no custom reducer."
+      }
+    },
+    "pythia": {
+      "route": {
+        "kind": "decision",
+        "summary": "Choose the target with the smallest workflow lookahead cost."
+      },
+      "schedule": {
+        "kind": "decision",
+        "summary": "Order runnable requests by workflow rank."
+      },
+      "cache": {
+        "kind": "decision",
+        "summary": "Use Belady-like next-use reclaim and stage prefetch for marked objects."
+      },
+      "feedback": {
+        "kind": "declared",
+        "summary": "Receive prefetch and enactment outcomes; the current kernel has no custom reducer."
+      }
+    },
+    "goodserve": {
+      "route": {
+        "kind": "decision",
+        "summary": "Choose just-enough quality at minimum cost and rebalance high-risk work."
+      },
+      "feedback": {
+        "kind": "declared",
+        "summary": "Receive migration outcomes; the current kernel has no custom reducer."
+      }
+    },
+    "conserve": {
+      "route": {
+        "kind": "decision",
+        "summary": "Place the heavy first prefill by capacity and preserve follow-up affinity."
+      }
+    },
+    "parrot": {
+      "route": {
+        "kind": "decision",
+        "summary": "Place requests on the target with the smallest dependency distance."
+      },
+      "schedule": {
+        "kind": "decision",
+        "summary": "Allocate service only to requests whose dependencies are ready."
+      }
+    },
+    "saga": {
+      "route": {
+        "kind": "decision",
+        "summary": "Prefer cache locality, then load, with optional work-stealing rebalance."
+      },
+      "schedule": {
+        "kind": "decision",
+        "summary": "Fair-share service by work-group attained service."
+      },
+      "cache": {
+        "kind": "decision",
+        "summary": "Retain live workflow-TTL state and reclaim expired objects."
+      }
+    },
+    "routebalance": {
+      "route": {
+        "kind": "decision",
+        "summary": "Jointly optimize bounded request-target assignment under target capacity."
+      }
+    }
+  }
+}

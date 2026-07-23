@@ -34,6 +34,7 @@
     performance budgets
   - Generated evidence:
     [`plex_replication_report.md`](plex_replication_report.md),
+    [`plex_policy_mapping_report.html`](plex_policy_mapping_report.html),
     `tests/policies/replication-report.json`, and
     `tests/policies/performance-results.json`
 - Inputs:
