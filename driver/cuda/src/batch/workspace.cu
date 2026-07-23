@@ -1,8 +1,19 @@
 #include "batch/workspace.hpp"
 
 #include <algorithm>
+#include <cstdint>
+#include <limits>
 
 #include <cuda_runtime.h>
+
+// The float section sized here is carved by flashinfer's `PrefillPlan`
+// (split-KV partial outputs); including the scheduler couples this bound to
+// the same header that consumes the buffer, so an upstream signature change
+// breaks this translation unit instead of silently invalidating the bound
+// (pie-project/pie#414 was exactly that drift, against a hand-copied
+// formula). `FA2DetermineCtaTileQ` (utils.cuh) is called directly below.
+#include <flashinfer/attention/scheduler.cuh>
+#include <flashinfer/utils.cuh>
 
 #include "config.hpp"
 #include "model/config.hpp"
@@ -28,26 +39,31 @@ std::size_t attention_float_workspace_bytes(const HfConfig& hf,
     const std::size_t base =
         qwen_hybrid ? 128ull * 1024 * 1024 : 80ull * 1024 * 1024;
 
-    // FlashInfer's `PrefillPlan` (scheduler.cuh) carves the split-KV partial
-    // outputs out of this float buffer:
+    // FlashInfer's `PrefillPlan` (attention/scheduler.cuh) carves the
+    // split-KV partial outputs out of this float buffer:
     //
     //   tmp_v = num_qo_heads * padded_batch_size * cta_tile_q * head_dim * 4
     //   tmp_s = num_qo_heads * padded_batch_size * cta_tile_q     * 4
     //
-    // `padded_batch_size` is the number of (q_tile, kv_chunk) work items.
-    // PrefillBinarySearchKVChunkSize bounds it by `max_batch_size_if_split`,
-    // and PrefillPlan hardcodes `num_blocks_per_sm = 2`, so per rank
+    // Outside CUDA-graph planning (how pie plans prefill today),
+    // `PrefillBinarySearchKVChunkSize` only reports `split_kv` — and hence
+    // a carve — when the chunked work-item count fits
+    // `max_batch_size_if_split`, so that value also ceils the carve's
+    // `padded_batch_size`. `PrefillPlan` computes it as
     //
-    //   max_batch_size_if_split = ceil(2 * num_sm / num_kv_heads_local).
+    //   max_batch_size_if_split = (num_blocks_per_sm * num_sm) / num_kv_heads
     //
-    // `cta_tile_q` (FA2DetermineCtaTileQ) tops out at 128 for head_dim < 256
-    // (64 otherwise). This term scales with SM count and the model's head
-    // config — both of which a flat default can't track — and is what
-    // overflows the buffer on larger GPUs / low-KV-head models
-    // (pie-project/pie#414). It is needed for *every* arch that hits the
-    // prefill kernel, including GQA ratios outside the decode fast-path
-    // (force_prefill_path) and sliding-window layouts, so it is sized
-    // unconditionally rather than gated on the decode fast-path.
+    // with `num_blocks_per_sm = 2` a literal in its body — the one number
+    // this bound still mirrors by hand. `cta_tile_q` comes from
+    // flashinfer's own `FA2DetermineCtaTileQ` (worst case over qo lengths)
+    // so an upstream tile-policy change reaches this bound by
+    // recompilation. The term scales with SM count and the model's head
+    // config — what a flat default can't track, and what overflowed the
+    // buffer on larger GPUs / low-KV-head models. It is needed for *every*
+    // arch that hits the prefill kernel, including GQA ratios outside the
+    // decode fast-path (force_prefill_path) and sliding-window layouts, so
+    // it is sized unconditionally rather than gated on the decode
+    // fast-path.
     const bool supported_head_dim =
         hf.head_dim_kernel == 64 || hf.head_dim_kernel == 128 ||
         hf.head_dim_kernel == 256 || hf.head_dim_kernel == 512;
@@ -58,9 +74,6 @@ std::size_t attention_float_workspace_bytes(const HfConfig& hf,
 
     auto align_up = [](std::size_t n, std::size_t a) {
         return (n + (a - 1)) & ~(a - 1);
-    };
-    auto ceil_div = [](std::size_t n, std::size_t d) {
-        return (n + d - 1) / d;
     };
 
     const int tp_size = std::max(1, cfg.distributed.tp_size);
@@ -74,15 +87,21 @@ std::size_t attention_float_workspace_bytes(const HfConfig& hf,
     const std::size_t head_dim = static_cast<std::size_t>(hf.head_dim_kernel);
     const std::size_t num_sm =
         static_cast<std::size_t>(prop.multiProcessorCount);
-    const std::size_t cta_tile_q = (head_dim < 256) ? 128 : 64;
-    const std::size_t padded_batch = ceil_div(2 * num_sm, kv_heads);
+    // Worst case over a batch's qo lengths (a long-prompt prefill).
+    const std::size_t cta_tile_q = ::flashinfer::FA2DetermineCtaTileQ(
+        std::numeric_limits<std::int64_t>::max(),
+        static_cast<std::uint32_t>(head_dim));
+    constexpr std::size_t num_blocks_per_sm = 2;  // literal in PrefillPlan
+    const std::size_t padded_batch =
+        std::max<std::size_t>(1, (num_blocks_per_sm * num_sm) / kv_heads);
 
     const std::size_t tmp_v =
         qo_heads * padded_batch * cta_tile_q * head_dim * sizeof(float);
     const std::size_t tmp_s =
         qo_heads * padded_batch * cta_tile_q * sizeof(float);
-    // Slack covers alignment padding and the decode plan's (much smaller)
-    // tmp buffers, which share this buffer but never coexist with a prefill.
+    // Slack covers the plan's 16-byte allocation alignment and the decode
+    // plan's (much smaller) tmp buffers, which share this buffer but never
+    // coexist with a prefill.
     const std::size_t planned = tmp_v + tmp_s + 16ull * 1024 * 1024;
     return std::max(base, align_up(planned, 16ull * 1024 * 1024));
 }

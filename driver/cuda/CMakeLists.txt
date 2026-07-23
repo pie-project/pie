@@ -319,7 +319,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/batch/forward.cpp
   src/batch/persistent_inputs.cpp
   src/batch/tp.cpp
-  src/batch/workspace.cpp
+  src/batch/workspace.cu
   # pipeline/ -- guest programs (PTIR dispatch, tier0, frame carrier)
   src/pipeline/dispatch.cu
   src/pipeline/frame_carrier.cpp
