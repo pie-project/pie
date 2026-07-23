@@ -24,6 +24,9 @@
   - Wave A complete: VTC, LMetric, FairServe, Marconi, and RAGCache contract
     sentinels
   - Wave B complete: Agentix/Autellix, Continuum, KVFlow, Preble, and Helium
+  - Wave C complete: DLPM/D2LPM, InferCept, PEEK, QLM, SLOs-Serve,
+    Certaindex/Dynasor, Justitia, Chameleon, HotPrefix, PARD, and branch
+    parallelism regulation
 - Inputs:
   - [`plex.md`](plex.md), the implemented v0.5 contract
   - [`plex_gap.md`](plex_gap.md), the design-gap audit

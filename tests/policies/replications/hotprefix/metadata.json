@@ -1,0 +1,32 @@
+{
+  "id": "hotprefix",
+  "title": "HotPrefix: Hotness-Aware KV Cache Scheduling for Efficient Prefix Sharing in LLM Inference Systems",
+  "paper_version": "ACM DOI 10.1145/3749168",
+  "source_url": "https://doi.org/10.1145/3749168",
+  "source_commit": null,
+  "source_license": "paper reference; no source copied",
+  "component": "plex_paper_hotprefix",
+  "implements": [
+    "cache",
+    "feedback"
+  ],
+  "policy_kernel": [
+    "feedback-maintained prefix hotness",
+    "selective admission",
+    "prefetch intent"
+  ],
+  "required_facts": [
+    "reuse_count",
+    "hot_threshold"
+  ],
+  "required_mechanics": [],
+  "optional_mechanics": [
+    "cache.prefetch@1"
+  ],
+  "deferred_mechanics": [
+    "physical tier promotion"
+  ],
+  "evidence_level": "policy-kernel-reproduction",
+  "fixture_provenance": "independent reference model from the paper",
+  "validation_status": "passing"
+}

@@ -1,0 +1,6 @@
+{
+  "invariants": [
+    "schedule writes pending state",
+    "cache reads the same state"
+  ]
+}

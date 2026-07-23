@@ -1,0 +1,6 @@
+{
+  "case": "projected-deadline-miss",
+  "upstream_elapsed_ms": 80,
+  "downstream_p95_ms": 40,
+  "deadline_ms": 100
+}

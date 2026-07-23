@@ -1,0 +1,13 @@
+{
+  "case": "completion-order-fairness",
+  "groups": [
+    {
+      "id": "G1",
+      "completed": 0
+    },
+    {
+      "id": "G2",
+      "completed": 2
+    }
+  ]
+}

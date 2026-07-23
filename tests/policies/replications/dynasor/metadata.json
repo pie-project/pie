@@ -1,0 +1,32 @@
+{
+  "id": "dynasor",
+  "title": "Efficiently Scaling LLM Reasoning with Certaindex",
+  "paper_version": "arXiv 2412.20993",
+  "source_url": "https://arxiv.org/abs/2412.20993",
+  "source_commit": null,
+  "source_license": "public artifact available; implementation is independent",
+  "component": "plex_paper_dynasor",
+  "implements": [
+    "schedule",
+    "feedback"
+  ],
+  "policy_kernel": [
+    "progress-aware reasoning allocation",
+    "confidence-triggered early stop"
+  ],
+  "required_facts": [
+    "confidence_ppm",
+    "stop_threshold_ppm",
+    "progress_ppm"
+  ],
+  "required_mechanics": [],
+  "optional_mechanics": [
+    "request.cancel@1"
+  ],
+  "deferred_mechanics": [
+    "predictor training"
+  ],
+  "evidence_level": "policy-kernel-reproduction",
+  "fixture_provenance": "paper formula and public artifact interface",
+  "validation_status": "passing"
+}

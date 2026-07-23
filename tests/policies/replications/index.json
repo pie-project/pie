@@ -1,5 +1,8 @@
 {
-  "contract": {"major": 0, "minor": 6},
+  "contract": {
+    "major": 0,
+    "minor": 6
+  },
   "replications": [
     "agentix",
     "continuum",
@@ -10,6 +13,17 @@
     "lmetric",
     "fairserve",
     "marconi",
-    "ragcache"
+    "ragcache",
+    "dlpm",
+    "infercept",
+    "peek",
+    "qlm",
+    "slos-serve",
+    "dynasor",
+    "justitia",
+    "chameleon",
+    "hotprefix",
+    "pard",
+    "branch-regulation"
   ]
 }

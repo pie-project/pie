@@ -1,0 +1,34 @@
+{
+  "id": "branch-regulation",
+  "title": "Regulating Branch Parallelism in LLM Serving",
+  "paper_version": "arXiv 2605.06914",
+  "source_url": "https://arxiv.org/abs/2605.06914",
+  "source_commit": null,
+  "source_license": "paper reference; no source copied",
+  "component": "plex_paper_branch_regulation",
+  "implements": [
+    "admit",
+    "schedule"
+  ],
+  "policy_kernel": [
+    "joint branch admission",
+    "interference limit",
+    "excess-branch cancellation"
+  ],
+  "required_facts": [
+    "branch_limit",
+    "batch_interference",
+    "interference_limit",
+    "excess_branch"
+  ],
+  "required_mechanics": [],
+  "optional_mechanics": [
+    "request.cancel@1"
+  ],
+  "deferred_mechanics": [
+    "simultaneous branch execution"
+  ],
+  "evidence_level": "policy-kernel-reproduction",
+  "fixture_provenance": "independent reference model from the paper",
+  "validation_status": "passing"
+}

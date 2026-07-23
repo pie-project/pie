@@ -44,6 +44,17 @@ for artifact in \
     plex_paper_fairserve \
     plex_paper_marconi \
     plex_paper_ragcache \
+    plex_paper_dlpm \
+    plex_paper_infercept \
+    plex_paper_peek \
+    plex_paper_qlm \
+    plex_paper_slos_serve \
+    plex_paper_dynasor \
+    plex_paper_justitia \
+    plex_paper_chameleon \
+    plex_paper_hotprefix \
+    plex_paper_pard \
+    plex_paper_branch_regulation \
     plex_paper_preble \
     plex_query_assisted \
     plex_raw_helpers \
@@ -97,6 +108,17 @@ for artifact in \
     plex_paper_fairserve \
     plex_paper_marconi \
     plex_paper_ragcache \
+    plex_paper_dlpm \
+    plex_paper_infercept \
+    plex_paper_peek \
+    plex_paper_qlm \
+    plex_paper_slos_serve \
+    plex_paper_dynasor \
+    plex_paper_justitia \
+    plex_paper_chameleon \
+    plex_paper_hotprefix \
+    plex_paper_pard \
+    plex_paper_branch_regulation \
     plex_paper_preble \
     plex_query_assisted \
     plex_raw_helpers \
@@ -139,6 +161,44 @@ do
             ;;
         plex_paper_ragcache)
             operations=cache
+            ;;
+        plex_paper_dlpm)
+            operations=route,schedule,feedback
+            ;;
+        plex_paper_infercept)
+            operations=schedule,cache
+            optional=cache.swap@1
+            ;;
+        plex_paper_peek)
+            operations=schedule,cache
+            ;;
+        plex_paper_qlm)
+            operations=admit,route,schedule,feedback
+            ;;
+        plex_paper_slos_serve)
+            operations=admit,route,schedule
+            ;;
+        plex_paper_dynasor)
+            operations=schedule,feedback
+            optional=request.cancel@1
+            ;;
+        plex_paper_justitia)
+            operations=schedule,feedback
+            ;;
+        plex_paper_chameleon)
+            operations=admit,schedule,cache
+            ;;
+        plex_paper_hotprefix)
+            operations=cache,feedback
+            optional=cache.prefetch@1
+            ;;
+        plex_paper_pard)
+            operations=schedule,feedback
+            optional=request.cancel@1
+            ;;
+        plex_paper_branch_regulation)
+            operations=admit,schedule
+            optional=request.cancel@1
             ;;
         plex_paper_continuum)
             operations=schedule,cache,feedback

@@ -1,0 +1,5 @@
+{
+  "case": "early-stop",
+  "confidence_ppm": 900,
+  "stop_threshold_ppm": 800
+}

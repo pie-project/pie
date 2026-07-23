@@ -21,9 +21,226 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     check_queries_and_actions(&packages)?;
     check_existing_papers(&packages)?;
     check_wave_a(&packages)?;
+    check_wave_c(&packages)?;
     check_replication_artifacts(&packages)?;
 
     println!("PLEX v0.6 policy fixtures passed");
+    Ok(())
+}
+
+fn check_wave_c(packages: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let dlpm = runtime(packages, "plex_paper_dlpm", &[], None)?;
+    assert_success(&dlpm.invoke(route_event(
+        "A",
+        "G",
+        "dlpm-route",
+        json!({"client_id": "client-a"}),
+    ))?);
+
+    let infercept = runtime(
+        packages,
+        "plex_paper_infercept",
+        &["cache.swap@1"],
+        None,
+    )?;
+    let swapped = infercept.invoke(json!({
+        "api_version": "pie.plex.engine@2",
+        "operation": "cache",
+        "context": {
+            "meta": meta("infercept-cache"),
+            "cause": "pressure",
+            "resident": [{
+                "object": {
+                    "object_id": "paused-kv",
+                    "size_bytes": 1,
+                    "beneficiaries": [],
+                    "beneficiary_count": 0,
+                    "facts": {"expected_reuse_ms": 100, "swap": true}
+                },
+                "reclaimable": true
+            }],
+            "prospective": [],
+            "capacity": {"max_bytes": 0, "fixed_bytes": 0, "facts": {}},
+            "episode": null
+        }
+    }))?;
+    assert_success(&swapped);
+    assert_eq!(swapped["actions"][0]["method"], "pie.cache.swap@1");
+
+    let peek = runtime(packages, "plex_paper_peek", &[], None)?;
+    assert_success(&peek.invoke(schedule_event(
+        "A",
+        "G",
+        json!({
+            "waiting_ms": 100,
+            "fairness_threshold_ms": 50,
+            "demand_depth": 3
+        }),
+    ))?);
+    assert_success(&peek.invoke(cache_event(false, false))?);
+
+    for (package, facts) in [
+        (
+            "plex_paper_qlm",
+            json!({"estimated_wait_ms": 10, "slo_ms": 100}),
+        ),
+        (
+            "plex_paper_slos_serve",
+            json!({"predicted_total_ms": 10, "slo_ms": 100}),
+        ),
+        (
+            "plex_paper_chameleon",
+            json!({"weighted_size": 1, "queue_quota": 4}),
+        ),
+    ] {
+        let runtime = runtime(packages, package, &[], None)?;
+        let mut event = admit_event("A", "G", 0);
+        event["context"]["candidates"][0]["facts"] = facts;
+        assert_success(&runtime.invoke(event)?);
+    }
+
+    let dynasor = runtime(
+        packages,
+        "plex_paper_dynasor",
+        &["request.cancel@1"],
+        None,
+    )?;
+    let stopped = dynasor.invoke(schedule_event(
+        "A",
+        "G",
+        json!({
+            "confidence_ppm": 900,
+            "stop_threshold_ppm": 800,
+            "progress_ppm": 900
+        }),
+    ))?;
+    assert_success(&stopped);
+    assert_eq!(stopped["actions"][0]["method"], "pie.request.cancel@1");
+
+    let justitia = runtime(packages, "plex_paper_justitia", &[], None)?;
+    assert_success(&justitia.invoke(schedule_event("A", "G", json!({})))?);
+
+    let hotprefix = runtime(
+        packages,
+        "plex_paper_hotprefix",
+        &["cache.prefetch@1"],
+        None,
+    )?;
+    assert_success(&hotprefix.invoke(json!({
+        "api_version": "pie.plex.engine@2",
+        "operation": "feedback",
+        "context": {
+            "delivery_id": "hotprefix-feedback",
+            "records": [{
+                "subject": {"kind": "cache-object", "value": "object"},
+                "outcome": "progress",
+                "facts": {"reuse_count": 4}
+            }]
+        }
+    }))?);
+    let hot = hotprefix.invoke(json!({
+        "api_version": "pie.plex.engine@2",
+        "operation": "cache",
+        "context": {
+            "meta": meta("hotprefix-cache"),
+            "cause": "insertion",
+            "resident": [],
+            "prospective": [{
+                "object_id": "object",
+                "size_bytes": 1,
+                "beneficiaries": [],
+                "beneficiary_count": 0,
+                "facts": {}
+            }],
+            "capacity": {
+                "max_bytes": 1,
+                "fixed_bytes": 0,
+                "facts": {"hot_threshold": 2}
+            },
+            "episode": null
+        }
+    }))?;
+    assert_success(&hot);
+    assert_eq!(hot["actions"][0]["method"], "pie.cache.prefetch@1");
+
+    let pard = runtime(packages, "plex_paper_pard", &["request.cancel@1"], None)?;
+    let dropped = pard.invoke(schedule_event(
+        "A",
+        "G",
+        json!({
+            "upstream_elapsed_ms": 80,
+            "downstream_p95_ms": 40,
+            "deadline_ms": 100
+        }),
+    ))?;
+    assert_success(&dropped);
+    assert_eq!(dropped["actions"][0]["method"], "pie.request.cancel@1");
+
+    let branches = runtime(
+        packages,
+        "plex_paper_branch_regulation",
+        &["request.cancel@1"],
+        None,
+    )?;
+    let admitted = branches.invoke(json!({
+        "api_version": "pie.plex.engine@2",
+        "operation": "admit",
+        "context": {
+            "meta": meta("branch-admit"),
+            "cause": "arrival",
+            "candidates": [
+                {
+                    "request": request_ref("A", "G"),
+                    "demand": [],
+                    "facts": {
+                        "branch_limit": 1,
+                        "batch_interference": 1,
+                        "interference_limit": 2
+                    }
+                },
+                {
+                    "request": request_ref("B", "G"),
+                    "demand": [],
+                    "facts": {
+                        "branch_limit": 1,
+                        "batch_interference": 1,
+                        "interference_limit": 2
+                    }
+                }
+            ],
+            "capacity": {"max_accepted": 2, "limits": [], "facts": {}}
+        },
+        "lifecycle": [
+            {
+                "event": "create-group",
+                "group_id": "G",
+                "principal_id": "tenant",
+                "limits": {"max_members": 4, "max_scratch_bytes": 4096},
+                "facts": {}
+            },
+            {
+                "event": "create-request",
+                "request_id": "A",
+                "principal_id": "tenant",
+                "group_id": "G",
+                "fields": {},
+                "facts": {}
+            },
+            {
+                "event": "create-request",
+                "request_id": "B",
+                "principal_id": "tenant",
+                "group_id": "G",
+                "fields": {},
+                "facts": {}
+            }
+        ]
+    }))?;
+    assert_success(&admitted);
+    assert_eq!(
+        admitted["plan"]["plan"]["decisions"],
+        json!(["accept", "defer"])
+    );
     Ok(())
 }
 

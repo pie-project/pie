@@ -1,0 +1,32 @@
+{
+  "id": "pard",
+  "title": "PARD: Enhancing Goodput for Inference Pipeline via Proactive Request Dropping",
+  "paper_version": "arXiv 2602.08747",
+  "source_url": "https://arxiv.org/abs/2602.08747",
+  "source_commit": null,
+  "source_license": "paper reference; no source copied",
+  "component": "plex_paper_pard",
+  "implements": [
+    "schedule",
+    "feedback"
+  ],
+  "policy_kernel": [
+    "upstream elapsed plus downstream tail prediction",
+    "mid-lifecycle drop intent"
+  ],
+  "required_facts": [
+    "upstream_elapsed_ms",
+    "downstream_p95_ms",
+    "deadline_ms"
+  ],
+  "required_mechanics": [],
+  "optional_mechanics": [
+    "request.cancel@1"
+  ],
+  "deferred_mechanics": [
+    "latency-distribution estimator"
+  ],
+  "evidence_level": "policy-kernel-reproduction",
+  "fixture_provenance": "independent reference model from the paper",
+  "validation_status": "passing"
+}

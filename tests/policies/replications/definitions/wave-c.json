@@ -1,0 +1,238 @@
+[
+  {
+    "metadata": {
+      "id": "dlpm",
+      "title": "Locality-aware Fair Scheduling in LLM Serving",
+      "paper_version": "arXiv 2501.14312",
+      "source_url": "https://arxiv.org/abs/2501.14312",
+      "source_commit": null,
+      "source_license": "paper reference; no source copied",
+      "component": "plex_paper_dlpm",
+      "implements": ["route", "schedule", "feedback"],
+      "policy_kernel": ["deficit-credit fairness", "prefix-local routing and scheduling"],
+      "required_facts": ["client_id", "cached_tokens", "load", "quantum", "service_tokens"],
+      "required_mechanics": [],
+      "deferred_mechanics": [],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "independent reference model from the paper",
+      "validation_status": "passing"
+    },
+    "case": {"case": "credit-gated-locality", "clients": [{"id": "A", "deficit": 4}, {"id": "B", "deficit": -2}]},
+    "expected": {"invariants": ["positive deficit permits locality preference", "negative deficit cannot dominate fairness"]}
+  },
+  {
+    "metadata": {
+      "id": "infercept",
+      "title": "InferCept: Efficient Intercept Support for Augmented Large Language Model Inference",
+      "paper_version": "arXiv 2402.01869",
+      "source_url": "https://arxiv.org/abs/2402.01869",
+      "source_commit": null,
+      "source_license": "paper reference; no source copied",
+      "component": "plex_paper_infercept",
+      "implements": ["schedule", "cache"],
+      "policy_kernel": ["resume-aware scheduling", "preserve/swap/discard from expected waste"],
+      "required_facts": ["resuming", "expected_waste_tokens", "expected_reuse_ms", "recompute_ms"],
+      "required_mechanics": [],
+      "optional_mechanics": ["cache.swap@1"],
+      "deferred_mechanics": ["physical swap implementation"],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "independent reference model from the paper",
+      "validation_status": "passing"
+    },
+    "case": {"case": "swap-paused-state", "object_id": "paused-kv", "expected_reuse_ms": 100},
+    "expected": {"actions": ["pie.cache.swap@1"], "reclaim": ["paused-kv"]}
+  },
+  {
+    "metadata": {
+      "id": "peek",
+      "title": "PEEK: Predictive Queue-Informed KV Cache Management for LLM Serving",
+      "paper_version": "arXiv 2607.02525",
+      "source_url": "https://arxiv.org/abs/2607.02525",
+      "source_commit": null,
+      "source_license": "paper reference; no source copied",
+      "component": "plex_paper_peek",
+      "implements": ["schedule", "cache"],
+      "policy_kernel": ["shared pending-demand state", "cluster-aware demand depth", "fairness lane"],
+      "required_facts": ["waiting_ms", "fairness_threshold_ms", "demand_depth", "pending_demand_depth"],
+      "required_mechanics": [],
+      "deferred_mechanics": [],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "independent reference model from the paper",
+      "validation_status": "passing"
+    },
+    "case": {"case": "shared-schedule-cache-state", "pending_requests": 3},
+    "expected": {"invariants": ["schedule writes pending state", "cache reads the same state"]}
+  },
+  {
+    "metadata": {
+      "id": "qlm",
+      "title": "Queue Management for SLO-Oriented Large Language Model Serving",
+      "paper_version": "arXiv 2407.00047",
+      "source_url": "https://arxiv.org/abs/2407.00047",
+      "source_commit": null,
+      "source_license": "paper reference; no source copied",
+      "component": "plex_paper_qlm",
+      "implements": ["admit", "route", "schedule", "feedback"],
+      "policy_kernel": ["wait estimation", "virtual queues", "group-aware scheduling"],
+      "required_facts": ["estimated_wait_ms", "slo_ms", "virtual_wait"],
+      "required_mechanics": [],
+      "deferred_mechanics": [],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "independent reference model from the paper",
+      "validation_status": "passing"
+    },
+    "case": {"case": "slo-feasible-admission", "estimated_wait_ms": 10, "slo_ms": 100},
+    "expected": {"decision": "accept"}
+  },
+  {
+    "metadata": {
+      "id": "slos-serve",
+      "title": "SLOs-Serve: Optimized Serving of Multi-SLO LLMs",
+      "paper_version": "arXiv 2504.08784",
+      "source_url": "https://arxiv.org/abs/2504.08784",
+      "source_commit": null,
+      "source_license": "paper reference; no source copied",
+      "component": "plex_paper_slos_serve",
+      "implements": ["admit", "route", "schedule"],
+      "policy_kernel": ["multi-stage SLO admission", "latency-aware routing", "slack scheduling"],
+      "required_facts": ["predicted_total_ms", "slo_ms", "stage_latency_ms", "slack_ms"],
+      "required_mechanics": [],
+      "deferred_mechanics": ["replica provisioning"],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "independent reference model from the paper",
+      "validation_status": "passing"
+    },
+    "case": {"case": "multi-stage-slack", "predicted_total_ms": 10, "slo_ms": 100},
+    "expected": {"decision": "accept"}
+  },
+  {
+    "metadata": {
+      "id": "dynasor",
+      "title": "Efficiently Scaling LLM Reasoning with Certaindex",
+      "paper_version": "arXiv 2412.20993",
+      "source_url": "https://arxiv.org/abs/2412.20993",
+      "source_commit": null,
+      "source_license": "public artifact available; implementation is independent",
+      "component": "plex_paper_dynasor",
+      "implements": ["schedule", "feedback"],
+      "policy_kernel": ["progress-aware reasoning allocation", "confidence-triggered early stop"],
+      "required_facts": ["confidence_ppm", "stop_threshold_ppm", "progress_ppm"],
+      "required_mechanics": [],
+      "optional_mechanics": ["request.cancel@1"],
+      "deferred_mechanics": ["predictor training"],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "paper formula and public artifact interface",
+      "validation_status": "passing"
+    },
+    "case": {"case": "early-stop", "confidence_ppm": 900, "stop_threshold_ppm": 800},
+    "expected": {"actions": ["pie.request.cancel@1"]}
+  },
+  {
+    "metadata": {
+      "id": "justitia",
+      "title": "Justitia: Fair and Efficient Scheduling of Task-parallel LLM Agents with Selective Pampering",
+      "paper_version": "arXiv 2510.17015",
+      "source_url": "https://arxiv.org/abs/2510.17015",
+      "source_commit": null,
+      "source_license": "paper reference; no source copied",
+      "component": "plex_paper_justitia",
+      "implements": ["schedule", "feedback"],
+      "policy_kernel": ["group completion-order fairness", "feedback-maintained branch completion"],
+      "required_facts": ["completed_branches"],
+      "required_mechanics": [],
+      "deferred_mechanics": ["simultaneous branch execution"],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "independent reference model from the paper",
+      "validation_status": "passing"
+    },
+    "case": {"case": "completion-order-fairness", "groups": [{"id": "G1", "completed": 0}, {"id": "G2", "completed": 2}]},
+    "expected": {"selected_group_ids": ["G1"]}
+  },
+  {
+    "metadata": {
+      "id": "chameleon",
+      "title": "Chameleon: Adaptive Caching and Scheduling for Many-Adapter LLM Inference Environments",
+      "paper_version": "arXiv 2411.17741",
+      "source_url": "https://arxiv.org/abs/2411.17741",
+      "source_commit": null,
+      "source_license": "paper reference; no source copied",
+      "component": "plex_paper_chameleon",
+      "implements": ["admit", "schedule", "cache"],
+      "policy_kernel": ["weighted-size admission", "queue quotas", "adapter cache bypass"],
+      "required_facts": ["weighted_size", "queue_quota", "queue_class", "adapter_hot"],
+      "required_mechanics": [],
+      "deferred_mechanics": [],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "independent reference model from the paper",
+      "validation_status": "passing"
+    },
+    "case": {"case": "adapter-bypass", "adapter_hot": false},
+    "expected": {"cache_admission": "bypass"}
+  },
+  {
+    "metadata": {
+      "id": "hotprefix",
+      "title": "HotPrefix: Hotness-Aware KV Cache Scheduling for Efficient Prefix Sharing in LLM Inference Systems",
+      "paper_version": "ACM DOI 10.1145/3749168",
+      "source_url": "https://doi.org/10.1145/3749168",
+      "source_commit": null,
+      "source_license": "paper reference; no source copied",
+      "component": "plex_paper_hotprefix",
+      "implements": ["cache", "feedback"],
+      "policy_kernel": ["feedback-maintained prefix hotness", "selective admission", "prefetch intent"],
+      "required_facts": ["reuse_count", "hot_threshold"],
+      "required_mechanics": [],
+      "optional_mechanics": ["cache.prefetch@1"],
+      "deferred_mechanics": ["physical tier promotion"],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "independent reference model from the paper",
+      "validation_status": "passing"
+    },
+    "case": {"case": "hot-prefix-admission", "reuse_count": 4, "hot_threshold": 2},
+    "expected": {"cache_admission": "cache", "actions": ["pie.cache.prefetch@1"]}
+  },
+  {
+    "metadata": {
+      "id": "pard",
+      "title": "PARD: Enhancing Goodput for Inference Pipeline via Proactive Request Dropping",
+      "paper_version": "arXiv 2602.08747",
+      "source_url": "https://arxiv.org/abs/2602.08747",
+      "source_commit": null,
+      "source_license": "paper reference; no source copied",
+      "component": "plex_paper_pard",
+      "implements": ["schedule", "feedback"],
+      "policy_kernel": ["upstream elapsed plus downstream tail prediction", "mid-lifecycle drop intent"],
+      "required_facts": ["upstream_elapsed_ms", "downstream_p95_ms", "deadline_ms"],
+      "required_mechanics": [],
+      "optional_mechanics": ["request.cancel@1"],
+      "deferred_mechanics": ["latency-distribution estimator"],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "independent reference model from the paper",
+      "validation_status": "passing"
+    },
+    "case": {"case": "projected-deadline-miss", "upstream_elapsed_ms": 80, "downstream_p95_ms": 40, "deadline_ms": 100},
+    "expected": {"actions": ["pie.request.cancel@1"], "claim": "not initial admission"}
+  },
+  {
+    "metadata": {
+      "id": "branch-regulation",
+      "title": "Regulating Branch Parallelism in LLM Serving",
+      "paper_version": "arXiv 2605.06914",
+      "source_url": "https://arxiv.org/abs/2605.06914",
+      "source_commit": null,
+      "source_license": "paper reference; no source copied",
+      "component": "plex_paper_branch_regulation",
+      "implements": ["admit", "schedule"],
+      "policy_kernel": ["joint branch admission", "interference limit", "excess-branch cancellation"],
+      "required_facts": ["branch_limit", "batch_interference", "interference_limit", "excess_branch"],
+      "required_mechanics": [],
+      "optional_mechanics": ["request.cancel@1"],
+      "deferred_mechanics": ["simultaneous branch execution"],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "independent reference model from the paper",
+      "validation_status": "passing"
+    },
+    "case": {"case": "branch-limit", "branches": 2, "branch_limit": 1},
+    "expected": {"decisions": ["accept", "defer"]}
+  }
+]

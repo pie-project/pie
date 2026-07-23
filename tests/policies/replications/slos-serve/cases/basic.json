@@ -1,0 +1,5 @@
+{
+  "case": "multi-stage-slack",
+  "predicted_total_ms": 10,
+  "slo_ms": 100
+}

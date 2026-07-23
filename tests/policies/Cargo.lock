@@ -225,6 +225,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "plex-paper-branch-regulation"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
+name = "plex-paper-chameleon"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
 name = "plex-paper-common"
 version = "0.6.0"
 dependencies = [
@@ -236,6 +252,22 @@ name = "plex-paper-continuum"
 version = "0.1.0"
 dependencies = [
  "pie-plex-sdk",
+]
+
+[[package]]
+name = "plex-paper-dlpm"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
+name = "plex-paper-dynasor"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
 ]
 
 [[package]]
@@ -251,6 +283,30 @@ name = "plex-paper-helium"
 version = "0.1.0"
 dependencies = [
  "pie-plex-sdk",
+]
+
+[[package]]
+name = "plex-paper-hotprefix"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
+name = "plex-paper-infercept"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
+name = "plex-paper-justitia"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
 ]
 
 [[package]]
@@ -277,6 +333,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "plex-paper-pard"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
+name = "plex-paper-peek"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
 name = "plex-paper-preble"
 version = "0.1.0"
 dependencies = [
@@ -284,7 +356,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "plex-paper-qlm"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
 name = "plex-paper-ragcache"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
+name = "plex-paper-slos-serve"
 version = "0.1.0"
 dependencies = [
  "pie-plex-sdk",
