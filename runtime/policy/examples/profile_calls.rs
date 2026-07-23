@@ -28,7 +28,6 @@ use bindings::pie::plex::host;
 use bindings::{PlexPolicy, PlexPolicyPre};
 
 const MEMORY_BYTES: usize = 4 * 1024 * 1024;
-const FUEL: u64 = 2_000_000;
 
 #[derive(Clone, Copy)]
 enum Allocation {
@@ -203,7 +202,6 @@ impl RawSetup {
         pool_capacity: u32,
     ) -> Result<Self, Box<dyn Error>> {
         let mut config = Config::new();
-        config.consume_fuel(true);
         config.epoch_interruption(true);
         config.wasm_threads(false);
         if matches!(allocation, Allocation::Pooling) {
@@ -271,7 +269,7 @@ impl PlexSetup {
             operations: BTreeSet::from([Operation::Schedule]),
             limits: PolicyLimits {
                 memory_bytes: MEMORY_BYTES as u64,
-                fuel: FUEL,
+                fuel: 1,
                 deadline_ms: 100,
                 input_bytes: 1 << 20,
                 output_bytes: 1 << 20,
@@ -365,7 +363,6 @@ fn invocation_documents() -> (pie_plex::Document, StateSnapshot) {
 }
 
 fn reset_store(store: &mut Store<RawHost>) -> Result<(), wasmtime::Error> {
-    store.set_fuel(FUEL)?;
     store.set_epoch_deadline(u64::MAX);
     store.epoch_deadline_trap();
     Ok(())

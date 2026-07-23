@@ -153,7 +153,7 @@ SDK authors must:
 | none | `optional` | Optional mechanic IDs negotiated into contexts |
 | none | `schemas` | Required/optional fact and action schema requirements |
 | `limits.memory_bytes` | same | Non-zero and host-bounded |
-| `limits.fuel` | same | Non-zero and host-bounded |
+| `limits.fuel` | removed | Retained only as an ignored v0.5 format-5 compatibility field |
 | `limits.deadline_ms` | same | Non-zero and host-bounded |
 | `limits.input_bytes` | same | Non-zero and host-bounded |
 | `limits.output_bytes` | same | Non-zero and host-bounded |

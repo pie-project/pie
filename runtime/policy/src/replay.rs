@@ -140,8 +140,8 @@ impl ReplayRunner {
         supported_actions: BTreeSet<String>,
         max_defer_retries: u32,
     ) -> Result<Self, ReplaySetupError> {
-        if registry.uses_realtime_epochs() {
-            return Err(ReplaySetupError::RealtimeEpochs);
+        if !registry.uses_realtime_epochs() {
+            return Err(ReplaySetupError::DeadlinesDisabled);
         }
         let lifecycle = LifecycleHost::with_host(
             registry.clone(),
@@ -399,8 +399,8 @@ fn command_operation(command: &ReplayCommand) -> Option<Operation> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ReplaySetupError {
-    #[error("replay requires PolicyEngineConfig::deterministic_replay()")]
-    RealtimeEpochs,
+    #[error("replay requires active epoch deadlines")]
+    DeadlinesDisabled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]

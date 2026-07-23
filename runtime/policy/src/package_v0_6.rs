@@ -262,11 +262,6 @@ impl AttachedPolicyV0_6 {
                     .min(self.inner.engine.config().max_host_call_bytes),
             },
         );
-        store
-            .set_fuel(self.inner.manifest.limits.fuel)
-            .map_err(|error| {
-                InvocationFailure::new(InvocationFailureKind::Instantiation, error.to_string())
-            })?;
         store.set_epoch_deadline(
             self.inner
                 .engine
@@ -404,9 +399,6 @@ fn probe_instantiation(
                 .min(engine.config().max_host_call_bytes),
         },
     );
-    store
-        .set_fuel(manifest.limits.fuel)
-        .map_err(|error| AttachmentErrorV0_6::Instantiate(error.to_string()))?;
     store.set_epoch_deadline(engine.deadline_ticks(manifest.limits.deadline_ms));
     store.epoch_deadline_trap();
     pre.instantiate(&mut store)
@@ -500,7 +492,6 @@ fn validate_host_limits(
             manifest.limits.memory_bytes,
             host.max_memory_bytes as u64,
         ),
-        ("fuel", manifest.limits.fuel, host.max_fuel),
         (
             "deadline_ms",
             manifest.limits.deadline_ms,
@@ -546,7 +537,6 @@ fn serialized_len(value: &impl Serialize) -> Result<u64, String> {
 
 fn classify_wasmtime(default: InvocationFailureKind, error: wasmtime::Error) -> InvocationFailure {
     let kind = match error.downcast_ref::<wasmtime::Trap>() {
-        Some(wasmtime::Trap::OutOfFuel) => InvocationFailureKind::FuelExhausted,
         Some(wasmtime::Trap::Interrupt) => InvocationFailureKind::DeadlineExceeded,
         _ => default,
     };

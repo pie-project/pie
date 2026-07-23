@@ -20,6 +20,8 @@ impl ContractVersion {
 #[serde(deny_unknown_fields)]
 pub struct PolicyLimits {
     pub memory_bytes: u64,
+    /// Retained only to decode and encode v0.5 format-5 manifests.
+    /// Current hosts do not enable or charge Wasmtime fuel.
     pub fuel: u64,
     pub deadline_ms: u64,
     pub input_bytes: u64,
@@ -51,7 +53,6 @@ impl Manifest {
         }
         for (name, value) in [
             ("memory_bytes", self.limits.memory_bytes),
-            ("fuel", self.limits.fuel),
             ("deadline_ms", self.limits.deadline_ms),
             ("input_bytes", self.limits.input_bytes),
             ("output_bytes", self.limits.output_bytes),
@@ -138,6 +139,13 @@ mod tests {
     #[test]
     fn accepts_minimal_json_manifest() {
         manifest().validate().unwrap();
+    }
+
+    #[test]
+    fn accepts_zero_legacy_fuel_placeholder() {
+        let mut manifest = manifest();
+        manifest.limits.fuel = 0;
+        manifest.validate().unwrap();
     }
 
     #[test]

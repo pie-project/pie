@@ -761,7 +761,7 @@ fn check_negative_rollback(packages: &Path) -> Result<(), Box<dyn std::error::Er
     let spin = runtime(packages, "plex_spin", &[], None)?;
     let outcome = spin.invoke(route_event("A", "G", "spin", json!({})))?;
     assert_eq!(outcome["status"], "fallback");
-    assert_eq!(outcome["failure"]["kind"], "fuel-exhausted");
+    assert_eq!(outcome["failure"]["kind"], "deadline-exceeded");
 
     let action_bad = runtime(
         packages,

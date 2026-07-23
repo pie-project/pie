@@ -74,7 +74,6 @@
       "additionalProperties": false,
       "required": [
         "memory_bytes",
-        "fuel",
         "deadline_ms",
         "input_bytes",
         "output_bytes",
@@ -83,7 +82,6 @@
       ],
       "properties": {
         "memory_bytes": {"type": "integer", "minimum": 1},
-        "fuel": {"type": "integer", "minimum": 1},
         "deadline_ms": {"type": "integer", "minimum": 1},
         "input_bytes": {"type": "integer", "minimum": 1},
         "output_bytes": {"type": "integer", "minimum": 1},

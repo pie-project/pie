@@ -753,8 +753,8 @@ staged actions are validated before any of them become visible to the adapter.
 
 Three guarantees must not be conflated. \emph{Mechanical isolation} comes
 from Wasm memory isolation and a typed host surface: policy code cannot mutate
-engine objects or request contents. \emph{Availability} comes from fuel,
-deadlines, bounded allocation, state quotas, and engine-default fallback. A
+engine objects or request contents. \emph{Availability} comes from deadlines,
+bounded allocation, state quotas, and engine-default fallback. A
 trap, timeout, invalid plan, or invalid state update discards the invocation's
 state changes and staged actions and applies the native heuristic.
 

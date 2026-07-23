@@ -17,7 +17,6 @@ pub struct PolicyEngineConfig {
     pub max_manifest_bytes: usize,
     pub max_component_bytes: usize,
     pub max_memory_bytes: usize,
-    pub max_fuel: u64,
     pub max_deadline_ms: u64,
     pub max_input_bytes: u64,
     pub max_output_bytes: u64,
@@ -35,7 +34,6 @@ impl Default for PolicyEngineConfig {
             max_manifest_bytes: 64 * 1024,
             max_component_bytes: 4 * 1024 * 1024,
             max_memory_bytes: 16 * 1024 * 1024,
-            max_fuel: 10_000_000,
             max_deadline_ms: 100,
             max_input_bytes: 4 * 1024 * 1024,
             max_output_bytes: 4 * 1024 * 1024,
@@ -50,10 +48,7 @@ impl Default for PolicyEngineConfig {
 
 impl PolicyEngineConfig {
     pub fn deterministic_replay() -> Self {
-        Self {
-            epoch_tick: None,
-            ..Self::default()
-        }
+        Self::default()
     }
 }
 
@@ -121,9 +116,7 @@ impl PolicyEngine {
             .table_elements(MAX_TABLE_ELEMENTS)
             .max_memory_size(config.max_memory_bytes)
             .max_unused_warm_slots(pool_capacity.component_instances);
-
         let mut wasmtime_config = wasmtime::Config::new();
-        wasmtime_config.consume_fuel(true);
         wasmtime_config.epoch_interruption(true);
         wasmtime_config.wasm_threads(false);
         wasmtime_config.memory_reservation(config.max_memory_bytes as u64);

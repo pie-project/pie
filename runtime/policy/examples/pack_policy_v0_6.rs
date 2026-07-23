@@ -29,7 +29,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             schemas: BTreeSet::new(),
             limits: PolicyLimits {
                 memory_bytes: 4 * 1024 * 1024,
-                fuel: 2_000_000,
                 deadline_ms: 100,
                 input_bytes: 1024 * 1024,
                 output_bytes: 1024 * 1024,

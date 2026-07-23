@@ -610,7 +610,7 @@ second option is more general but moves combinatorial work into the policy and
 increases validation cost.
 
 For a policy-research interface, a bounded direct assignment is more honest.
-PLEX can control cost through batch-size, edge-count, memory, fuel, and deadline
+PLEX can control cost through batch-size, edge-count, memory, and deadline
 limits.
 
 ### 6.7 Boundary between route and the control plane

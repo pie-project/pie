@@ -1195,10 +1195,7 @@ fn check_failure_rollback(
             Operation::Route,
             route_context("S", "generation-arrival", candidates(), context(false)),
         ),
-        &[
-            InvocationFailureKind::FuelExhausted,
-            InvocationFailureKind::DeadlineExceeded,
-        ],
+        &[InvocationFailureKind::DeadlineExceeded],
     )?;
     assert_eq!(backend.read_request("S")?["scratch"], json!({}));
     Ok(())

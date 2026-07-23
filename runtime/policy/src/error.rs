@@ -40,7 +40,6 @@ pub enum InvocationFailureKind {
     Instantiation,
     PolicyFallback,
     Trap,
-    FuelExhausted,
     DeadlineExceeded,
     HostSaturated,
     Query,

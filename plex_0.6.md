@@ -557,7 +557,7 @@ The accepted component continues to:
 - import only the PLEX host interface;
 - use explicit input state and output updates;
 - have no ambient state-loading API; and
-- run with bounded memory, fuel, deadline, input, output, and host calls.
+- run with bounded memory, deadline, input, output, and host calls.
 
 ### 5.2 Host imports
 
@@ -952,12 +952,12 @@ Benchmark:
 - group pre-join and state-commit cost;
 - same-group conflict rate under concurrent feedback;
 - JSON extension-field serialization;
-- Wasm crossing, fuel, and memory; and
+- Wasm crossing, deadline interruption, and memory; and
 - full adapter decision latency.
 
 Before implementation, record the v0.5 singleton baseline and approve explicit
 0.6 regression budgets. Batch size, edge count, context bytes, output bytes,
-fuel, iteration count, and deadlines all require hard host limits.
+iteration count, and deadlines all require hard host limits.
 
 ## 11. Documentation and claim updates
 
@@ -986,7 +986,7 @@ Required terminology:
 | Risk | Mitigation |
 |---|---|
 | Batch windows add latency or adapter-dependent behavior | Make opportunity boundaries explicit, bounded, deterministic, and trace-visible. |
-| Joint route graphs grow as requests times targets | Require sparse feasible edges and hard request, target, edge, byte, fuel, and deadline limits. |
+| Joint route graphs grow as requests times targets | Require sparse feasible edges and hard request, target, edge, byte, and deadline limits. |
 | Work-group revisions become contention hotspots | Avoid unnecessary group writes, batch feedback, measure conflicts, and keep siblings out of the implicit working set. |
 | Direct plans move more work into guest policies | Keep host feasibility validation complete and provide SDK combinators for common ranking, matching, and fill strategies. |
 | `WorkGroup` expands into a workflow runtime | Keep DAG, bundle, and physical execution semantics separate and fact/action based. |

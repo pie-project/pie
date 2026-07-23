@@ -161,7 +161,7 @@ PLEX borrows the structural ideas that make eBPF a durable extension model:
 | Helpers | Versioned `query` and `action` methods |
 | Verifier and loader | Package, manifest, ABI, and result validation |
 | Kernel-enforced mechanism | Host-normalized decisions and engine enactment |
-| Bounded execution | Wasm isolation, fuel, deadlines, memory, and call limits |
+| Bounded execution | Wasm isolation, deadlines, memory, and call limits |
 
 PLEX is not an eBPF ISA, verifier, map API, or compatibility layer. It uses the
 WebAssembly component model and JSON transactions because serving policy is
@@ -1312,7 +1312,6 @@ invalid-input
 instantiation
 policy-fallback
 trap
-fuel-exhausted
 deadline-exceeded
 host-saturated
 query
@@ -1699,8 +1698,12 @@ Manifest rules:
   alphanumeric;
 - package version is at most 32 bytes and exactly three numeric components;
 - at least one operation is declared;
-- every limit is non-zero; and
-- every requested limit must fit within the host maximum.
+- every active limit is non-zero; and
+- every requested active limit must fit within the host maximum.
+
+The `fuel` member remains in v0.5 format-5 manifests only for wire
+compatibility. Current hosts ignore its value and do not enable Wasmtime fuel;
+deadline interruption is the execution-time bound.
 
 ### 18.2 `.plexpkg` format
 
@@ -1937,7 +1940,6 @@ version-specific snapshot and apply logic from the PLEX contract.
 | Manifest bytes | 64 KiB |
 | Component bytes | 4 MiB |
 | Wasm memory | 16 MiB |
-| Fuel | 10,000,000 |
 | Deadline | 100 ms |
 | Context + state input | 4 MiB |
 | Result + update output | 4 MiB |
@@ -1946,8 +1948,8 @@ version-specific snapshot and apply logic from the PLEX contract.
 | Concurrent Wasm invocations | 128 |
 | Successful feedback ledger entries | 4,096 |
 
-Package manifests request per-policy memory, fuel, deadline, input, and output
-limits at or below the host maxima.
+Package manifests request per-policy memory, deadline, input, and output limits
+at or below the host maxima.
 
 ### 22.2 Wasmtime protections
 
@@ -1955,7 +1957,6 @@ Each invocation uses:
 
 - a fresh store and component instance returned to a Wasmtime allocation pool
   after the call;
-- fuel accounting;
 - epoch interruption;
 - a memory limit;
 - bounded table, instance, and memory counts;
@@ -1975,8 +1976,7 @@ as an explicitly labeled profiler upper bound. The global invocation permit
 outlives the Store, ensuring a pooled slot is fully returned before another
 thread can acquire the corresponding concurrency slot.
 
-Trap classification distinguishes fuel exhaustion, deadline expiration, and
-ordinary traps.
+Trap classification distinguishes deadline expiration from ordinary traps.
 
 ### 22.3 Host-call protections
 
@@ -1994,9 +1994,10 @@ implementation must bound its own work.
 
 ### 22.4 Deterministic replay mode
 
-Deterministic replay disables the real-time epoch ticker. Fuel and all other
-validation remain active. The epoch deadline is effectively disabled in this
-mode, removing wall-clock timing as a replay source of nondeterminism.
+Replay keeps epoch deadlines active so a non-terminating guest cannot hang the
+runner. Inputs, host responses, and state remain deterministic; traces whose
+semantic result depends on crossing a wall-clock deadline are rejected when
+the repeated executions diverge.
 
 ## 23. Replay and Validation
 

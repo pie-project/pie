@@ -149,8 +149,7 @@
             "state-conflict",
             "unsupported-mechanic",
             "resource-limit",
-            "fuel-exhausted",
-            "deadline-expired",
+            "deadline-exceeded",
             "host-saturated",
             "trap",
             "enactment-failed"

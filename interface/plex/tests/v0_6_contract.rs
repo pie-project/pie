@@ -63,7 +63,6 @@ fn validates_v0_6_manifest_and_mechanic_negotiation() {
         }]),
         limits: PolicyLimits {
             memory_bytes: 1 << 20,
-            fuel: 100_000,
             deadline_ms: 20,
             input_bytes: 1 << 16,
             output_bytes: 1 << 16,

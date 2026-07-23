@@ -21,7 +21,6 @@ impl ContractVersion {
 #[serde(deny_unknown_fields)]
 pub struct PolicyLimits {
     pub memory_bytes: u64,
-    pub fuel: u64,
     pub deadline_ms: u64,
     pub input_bytes: u64,
     pub output_bytes: u64,
@@ -93,7 +92,6 @@ impl Manifest {
         }
         for (name, value) in [
             ("memory_bytes", self.limits.memory_bytes),
-            ("fuel", self.limits.fuel),
             ("deadline_ms", self.limits.deadline_ms),
             ("input_bytes", self.limits.input_bytes),
             ("output_bytes", self.limits.output_bytes),

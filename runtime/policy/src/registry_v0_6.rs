@@ -461,7 +461,6 @@ mod tests {
             schemas: BTreeSet::<SchemaRequirement>::new(),
             limits: PolicyLimits {
                 memory_bytes: 1,
-                fuel: 1,
                 deadline_ms: 1,
                 input_bytes: 1,
                 output_bytes: 1,

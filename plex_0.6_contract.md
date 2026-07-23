@@ -735,7 +735,6 @@ A v0.6 manifest contains:
   ],
   "limits": {
     "memory_bytes": 4194304,
-    "fuel": 2000000,
     "deadline_ms": 100,
     "input_bytes": 1048576,
     "output_bytes": 1048576,
@@ -804,8 +803,7 @@ invalid-output
 state-conflict
 unsupported-mechanic
 resource-limit
-fuel-exhausted
-deadline-expired
+deadline-exceeded
 host-saturated
 trap
 enactment-failed
@@ -834,7 +832,6 @@ PLEX does not require automatic retry. If the host retries:
 The v0.6 execution model retains:
 
 - a fresh bounded Wasmtime store and component instance per invocation;
-- fuel accounting;
 - epoch deadline interruption;
 - memory, table, instance, and input/output byte bounds;
 - host-call count and byte bounds;
@@ -844,11 +841,13 @@ The v0.6 execution model retains:
 - a host-wide concurrent invocation limit.
 
 Batch size, target count, edge count, selection count, cache-object count,
-beneficiary count, context bytes, output bytes, fuel, episode iterations, and
+beneficiary count, context bytes, output bytes, episode iterations, and
 deadline MUST have hard host bounds.
 
-Deterministic replay MAY disable wall-clock epoch ticking, but all structural,
-fuel, byte, count, and semantic validation remains active.
+Replay MUST retain an active epoch deadline so a non-terminating guest cannot
+hang the runner. Structural, byte, count, and semantic validation remains
+active. A trace whose semantic result depends on crossing the wall-clock
+deadline is not deterministic replay evidence.
 
 ## 18. Replay contract
 
