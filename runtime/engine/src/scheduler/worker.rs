@@ -67,9 +67,13 @@ pub(crate) async fn notify_pipeline_close(pid: ProcessId) {
     notify_pipeline_leave_and_wait(pid, LeaveKind::Close).await;
 }
 
-/// Awaited on purpose: the ack paces deferred teardown behind a scheduler
-/// pass — see the capped branch of `defer_resource_teardown` for the
-/// boundary flow-control rationale (removing the await regressed k1 ~3k).
+/// Deferred teardown's reference fence: resolves only after every driver's
+/// scheduler has PROCESSED the pid's Terminate leave — purged its queued
+/// work and cancelled its protected in-flight control — so the teardown
+/// that runs after this await can finalize pending operations and drop
+/// pooled resources with no scheduler-side reference left to them. (The
+/// mailbox alone orders the counter events; the await exists for the
+/// cancellation fence, not the accounting.)
 pub(crate) async fn notify_process_terminate(pid: ProcessId) {
     notify_pipeline_leave_and_wait(pid, LeaveKind::Terminate).await;
 }
@@ -78,11 +82,37 @@ pub(crate) async fn notify_process_terminate(pid: ProcessId) {
 /// permit. Broadcast to every driver's scheduler (mirrors
 /// [`notify_pipeline_leave`]): a policy with no staged successor ignores it,
 /// the policy holding the successor's staged bind earmarks the join.
-/// Fire-and-forget for the same reason as the leave broadcast.
-pub(crate) fn notify_execution_slot_released() {
+/// Carries the retiree's identity so the policy resolves exactly that
+/// holder's departure. Fire-and-forget: the sending teardown task already
+/// delivered the holder's Terminate leave (the awaited fence above), so
+/// every driver sees leave-then-release.
+pub(crate) fn notify_execution_slot_released(pid: ProcessId) {
     let handles = super::handle_registry().read().unwrap();
     for handle in handles.iter().flatten() {
-        let _ = handle.send(SchedulerItem::ExecutionSlotReleased);
+        let _ = handle.send(SchedulerItem::ExecutionSlotReleased(pid));
+    }
+}
+
+/// The no-runtime teardown error path leaked the holder's permit: the slot
+/// is destroyed, not freed. The policy resolves the departure without
+/// crediting its balance (see `FramePolicy::on_execution_slot_forfeited`).
+pub(crate) fn notify_execution_slot_forfeited(pid: ProcessId) {
+    let handles = super::handle_registry().read().unwrap();
+    for handle in handles.iter().flatten() {
+        let _ = handle.send(SchedulerItem::ExecutionSlotForfeited(pid));
+    }
+}
+
+/// The deferred teardown finished: every event the process can ever
+/// produce is already in each driver's mailbox ahead of this one (the
+/// teardown task is the process's last producer and sends this after its
+/// final drop). The worker retires the pid's terminate tombstone on
+/// receipt, bounding `terminated_processes` by live-plus-draining
+/// processes instead of every process that ever ran.
+pub(crate) fn notify_process_quiesced(pid: ProcessId) {
+    let handles = super::handle_registry().read().unwrap();
+    for handle in handles.iter().flatten() {
+        let _ = handle.send(SchedulerItem::ProcessQuiesced(pid));
     }
 }
 
@@ -412,7 +442,9 @@ fn item_census_idx(item: &SchedulerItem) -> usize {
         SchedulerItem::CloseChannel { .. } => 3,
         SchedulerItem::Lane(_) => 4,
         SchedulerItem::PipelineLeave(..) => 5,
-        SchedulerItem::ExecutionSlotReleased => 6,
+        SchedulerItem::ExecutionSlotReleased(_)
+        | SchedulerItem::ExecutionSlotForfeited(_)
+        | SchedulerItem::ProcessQuiesced(_) => 6,
         SchedulerItem::ExecutionSlotConsumed(_) => 7,
         SchedulerItem::Nudge => 8,
         SchedulerItem::CopyKv { .. }
@@ -513,12 +545,18 @@ enum SchedulerItem {
         LeaveKind,
         Option<tokio::sync::oneshot::Sender<()>>,
     ),
-    /// A capped execution slot was released: a retiring process's deferred
+    /// A capped execution slot was released: the named retiree's deferred
     /// teardown dropped its execution permit ([`notify_execution_slot_released`]'s
     /// broadcast). While the freed slot has a staged taker the frame seal
     /// waits, so a cohort turnover gathers the incoming herd instead of
     /// sealing narrow epochs. Uncapped deployments never send this.
-    ExecutionSlotReleased,
+    ExecutionSlotReleased(ProcessId),
+    /// The named retiree's permit was leaked on the no-runtime teardown
+    /// error path: resolve its departure without freeing a slot.
+    ExecutionSlotForfeited(ProcessId),
+    /// The named process's deferred teardown finished; no event from it can
+    /// follow. Retires its terminate tombstone.
+    ProcessQuiesced(ProcessId),
     /// A parked process acquired its execution permit
     /// ([`notify_execution_slot_consumed`]'s broadcast): the frame seal
     /// waits for this exact process's first fire (identity-paired with the
@@ -2589,8 +2627,14 @@ impl BatchScheduler {
             // Immediate, not queued. Termination rejects queued work; graceful
             // pipeline close instead releases the wait-set and lets every
             // already-admitted request drain untracked.
-            SchedulerItem::ExecutionSlotReleased => {
-                frame_policy.on_execution_slot_released();
+            SchedulerItem::ExecutionSlotReleased(pid) => {
+                frame_policy.on_execution_slot_released(pid);
+            }
+            SchedulerItem::ExecutionSlotForfeited(pid) => {
+                frame_policy.on_execution_slot_forfeited(pid);
+            }
+            SchedulerItem::ProcessQuiesced(pid) => {
+                terminated_processes.remove(&pid);
             }
             SchedulerItem::ExecutionSlotConsumed(pid) => {
                 frame_policy.on_execution_slot_consumed(pid);
@@ -2598,11 +2642,11 @@ impl BatchScheduler {
             SchedulerItem::PipelineLeave(pid, kind, response) => {
                 if kind == LeaveKind::Terminate {
                     if !terminated_processes.insert(pid) {
-                        // Duplicate Terminate (the exit funnel notifies once
-                        // from the process actor and once from deferred
+                        // Duplicate Terminate (the exit funnel notifies from
+                        // the terminate entry point and again from deferred
                         // teardown): the first leave did all the work and
                         // every step below is a no-op for it — skip straight
-                        // to the ack the teardown may be awaiting.
+                        // to the ack a waiting sender may hold.
                         if let Some(response) = response {
                             let _ = response.send(());
                         }
@@ -2778,7 +2822,7 @@ impl BatchScheduler {
                 // is what gathers a cohort turnover into a dense epoch. The
                 // bare `holds_seal` predecessor (gating the hold on execution
                 // admission with NO successor earmarking) fragmented k>1
-                // boundaries (k2 24.9k -> 9.8-10.7k) — the earmark is the
+                // boundaries into narrow epochs — the earmark is the
                 // gathering mechanism that was missing.
                 frame_policy.on_bind_enqueued(pipeline_id);
                 Self::queue_bind_control(
@@ -3018,25 +3062,25 @@ impl BatchScheduler {
     }
 
     fn queue_bind_control(pending: &mut VecDeque<QueuedItem>, item: QueuedItem) {
-        // Fresh-lane bring-up outranks dead-lane teardown: a bind inserted
-        // behind a cohort's close storm serializes the wait-all seal behind
-        // thousands of teardown controls (measured p50 79 ms of pure
-        // queueing at a 512-lane boundary). A bind and a QUEUED close always
-        // target different instances/channels — ids are never reused, a
-        // close only posts after its own bind committed, and a cell is only
-        // planned for registration while it has no endpoint — so jumping
-        // closes preserves every ordering that matters; the closes drain
-        // during the next generation's execution instead. Bind-vs-bind order
-        // is preserved (insertion at the end of the leading non-close
-        // lifecycle run).
+        // Queue-priority invariant: execution outranks bring-up outranks
+        // teardown. A queued LAUNCH never depends on a queued bind — a fire
+        // exists only after its own lane's bind control completed and the
+        // bind RPC returned to the guest — so a bind may never delay one:
+        // with staged admission the binds arriving at a turnover belong to
+        // a cohort BEHIND the queued launches, and inserting them ahead
+        // starves the sealed wave behind the whole bring-up stream. A bind
+        // and a QUEUED close always target different instances/channels
+        // (ids are never reused, a close only posts after its own bind
+        // committed), so binds still jump the close tail and closes drain
+        // during the next generation's execution. Bind-vs-bind order is
+        // preserved (insertion before the trailing close run).
         let index = pending
             .iter()
             .position(|queued| {
-                !Self::lifecycle_control(queued)
-                    || matches!(
-                        queued,
-                        QueuedItem::CloseInstance { .. } | QueuedItem::CloseChannels { .. }
-                    )
+                matches!(
+                    queued,
+                    QueuedItem::CloseInstance { .. } | QueuedItem::CloseChannels { .. }
+                )
             })
             .unwrap_or(pending.len());
         pending.insert(index, item);

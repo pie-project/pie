@@ -248,7 +248,11 @@ pub(super) struct FramePolicy {
     /// always mailed before its consumer can acquire, so a release-paired
     /// drain is never lost to the clamp). A positive balance with a
     /// non-empty `staged` pool means a successor's admission is imminent:
-    /// the seal waits.
+    /// the seal waits. Multi-driver note: consume/release broadcasts reach
+    /// every driver's policy, and it is the GLOBAL admission semaphore
+    /// (one pool across drivers) that bounds outstanding consumes to
+    /// capacity — that is what keeps each policy's balance from going
+    /// negative under foreign-pid traffic.
     pending_slots: u64,
     /// Identity-paired in-flight joins: a parked process that ACQUIRED its
     /// execution permit but whose first stamped fire has not arrived yet.
@@ -256,18 +260,22 @@ pub(super) struct FramePolicy {
     /// by every leave path, so a joiner that dies cannot wedge the seal).
     joins_in_flight: BTreeSet<ProcessId>,
     /// Processes that consumed an execution slot and still hold it. A
-    /// Terminate leave of a member arms `releases_in_flight`: its slot is
-    /// now certain to free (the permit's only exit is the capped teardown,
-    /// which always broadcasts the release after its terminate leave).
+    /// Terminate leave of a member moves it to `departing`: its slot is
+    /// now certain to resolve (the permit's only exit is the capped
+    /// teardown, which broadcasts the release — or, on the no-runtime
+    /// error path, an explicit forfeit — after its terminate leave).
     slotted: BTreeSet<ProcessId>,
-    /// Slots between their holder's terminate leave and the release
-    /// broadcast. The leave is delivered pass-granular while the release
-    /// waits on the teardown task, so at a generation boundary the policy
-    /// briefly sees a zero `pending_slots` balance with departures already
-    /// recorded — without this count the seal would close on the partial
-    /// cohort and split the fleet (the ragged 464/48 boundary). An armed
-    /// release always lands: `-1` per `on_execution_slot_released`.
-    releases_in_flight: u64,
+    /// Slot holders between their Terminate leave and their teardown's
+    /// release (or forfeit) broadcast, identity-paired. The leave is
+    /// delivered pass-granular while the release waits on the teardown
+    /// task, so a seal check in that window sees a zero `pending_slots`
+    /// balance with departures already recorded — without this set the
+    /// seal would close on the partial cohort and split the fleet, and
+    /// the split persists for the rest of the run (run-ahead lead is
+    /// hysteretic). Every entry resolves: the same teardown that owns the
+    /// permit sends the disarm after its leave (same-producer FIFO), and
+    /// the leaked-permit error path disarms via forfeit.
+    departing: BTreeSet<ProcessId>,
     /// Liveness-only deadline for the current blocked-gather episode.
     strict_watchdog_deadline: Option<Instant>,
     cold_hold_deadline: Option<Instant>,
@@ -295,7 +303,7 @@ impl FramePolicy {
             pending_slots: 0,
             joins_in_flight: BTreeSet::new(),
             slotted: BTreeSet::new(),
-            releases_in_flight: 0,
+            departing: BTreeSet::new(),
             strict_watchdog_deadline: None,
             cold_hold_deadline: None,
             ever_sealed: false,
@@ -415,10 +423,10 @@ impl FramePolicy {
     /// free capacity, so the "free slot with a staged taker" hold covers
     /// the COLD START by the same rule as a turnover — the first seal
     /// waits for the whole co-launched fleet's admissions and first fires.
-    /// (A ragged first epoch otherwise starts lead-less lanes that pace
-    /// every seal of the first generation at the full commit roundtrip:
-    /// measured +4.7 ms per wave, ~140 ms per run.) Thereafter the balance
-    /// stays exact: -1 per admission, +1 per release.
+    /// (A ragged first epoch otherwise starts lead-less lanes, and lead is
+    /// hysteretic: they pace every seal of the first generation at the
+    /// full commit roundtrip.) Thereafter the balance stays exact: -1 per
+    /// admission, +1 per release.
     pub fn preload_free_slots(&mut self, slots: usize) {
         self.pending_slots = slots as u64;
     }
@@ -426,11 +434,21 @@ impl FramePolicy {
     /// A retiring process's deferred teardown dropped its execution permit
     /// (capped deployments only). While the freed slot stays unconsumed and
     /// a successor is staged, the seal holds — the successor's admission and
-    /// first fire are imminent. Retires the departure that armed it (the
-    /// terminate leave always precedes its release broadcast).
-    pub fn on_execution_slot_released(&mut self) {
-        self.releases_in_flight = self.releases_in_flight.saturating_sub(1);
+    /// first fire are imminent. Resolves the holder's departure by identity
+    /// (its terminate leave always precedes this broadcast: both are sent
+    /// by the teardown task, in that order).
+    pub fn on_execution_slot_released(&mut self, pid: ProcessId) {
+        self.departing.remove(&pid);
         self.pending_slots += 1;
+    }
+
+    /// The no-runtime teardown error path leaked the holder's permit
+    /// (`std::mem::forget`): the slot is destroyed, not freed. Resolves the
+    /// departure WITHOUT crediting `pending_slots` — the semaphore capacity
+    /// shrank by one and the balance must agree, and a departure entry that
+    /// never resolves would hold every seal with a staged successor.
+    pub fn on_execution_slot_forfeited(&mut self, pid: ProcessId) {
+        self.departing.remove(&pid);
     }
 
     /// A process acquired its execution permit (every capped admission
@@ -448,17 +466,18 @@ impl FramePolicy {
         }
     }
 
-    /// A slot holder's Terminate leave arrived: its release broadcast is now
-    /// in flight (the permit's only exit is the capped teardown, which
-    /// leaves first and releases second). The seal treats the imminent slot
-    /// like a freed one — without this, boundary passes between the leave
-    /// and the release see `pending_slots == 0` and close on a partial
-    /// cohort. Idempotent per pid: natural completion sends two Terminate
-    /// leaves (the exit funnel's fire-and-forget plus the teardown's
-    /// awaited one), and only the first may arm.
+    /// A slot holder's Terminate leave arrived: its release (or forfeit)
+    /// broadcast is now in flight (the permit's only exit is the capped
+    /// teardown, which leaves first and resolves second). The seal treats
+    /// the imminent slot like a freed one — without this, a seal check
+    /// between the leave and the resolution sees `pending_slots == 0` and
+    /// closes on a partial cohort. Guarded on `slotted` so only an actual
+    /// holder's first Terminate arms; the exit funnel emits more than one
+    /// leave per process, and the worker's tombstone dedup normally stops
+    /// duplicates before they reach here (this guard is defense in depth).
     pub fn on_slotted_terminate(&mut self, pid: ProcessId) {
         if self.slotted.remove(&pid) {
-            self.releases_in_flight += 1;
+            self.departing.insert(pid);
         }
     }
 
@@ -906,7 +925,7 @@ impl FramePolicy {
                 })
                 .count();
             let joining = !self.joins_in_flight.is_empty()
-                || ((self.pending_slots > 0 || self.releases_in_flight > 0)
+                || ((self.pending_slots > 0 || !self.departing.is_empty())
                     && !self.staged.is_empty());
             if joining || missing > 0 {
                 if !self.sealed.is_empty() {
@@ -927,7 +946,7 @@ impl FramePolicy {
                         "missing_count": missing,
                         "pending_binds": self.pending_binds.values().sum::<usize>(),
                         "pending_slots": self.pending_slots,
-                        "releases_in_flight": self.releases_in_flight,
+                        "departing": self.departing.len(),
                         "joins_in_flight": self.joins_in_flight.len(),
                         "staged": self.staged.len(),
                         "slotted": self.slotted.len(),
@@ -1485,7 +1504,7 @@ mod tests {
         policy.on_fire_enqueued(stamp(lane, 0, 0, 1), Some(lane), 95, 1, 1);
         policy.on_bind_enqueued(Some(successor));
         policy.on_bind_completed(Some(successor));
-        policy.on_execution_slot_released();
+        policy.on_execution_slot_released(pid());
         let queued: HashSet<u64> = [95].into_iter().collect();
         match drive_past_cold_hold(&mut policy, &queued) {
             FramePlan::Hold(_) => {}
@@ -1505,12 +1524,12 @@ mod tests {
         assert_eq!(wave0, vec![95, 96], "both lanes gathered into one epoch");
     }
 
-    /// Regression (ragged 464/48 boundary, epoch-drain run e1): between a
-    /// slot holder's Terminate leave and its teardown's release broadcast
-    /// the balance reads zero, and a seal check in that window closed on
-    /// the partial cohort — the fleet split into 464- and 48-wide waves
-    /// for the rest of the run. The departure itself must hold: a leaving
-    /// holder's release is in flight, so its staged successor is gathered.
+    /// Regression: between a slot holder's Terminate leave and its
+    /// teardown's release broadcast the balance reads zero, and a seal
+    /// check in that window closed on the partial cohort — splitting the
+    /// fleet into two sub-cohorts that never re-merge (run-ahead lead is
+    /// hysteretic). The departure itself must hold: a leaving holder's
+    /// release is in flight, so its staged successor is gathered.
     #[test]
     fn departed_slot_holder_holds_the_seal_until_release_lands() {
         let mut policy = FramePolicy::new(2, 64, 4096, None);
@@ -1532,9 +1551,10 @@ mod tests {
             FramePlan::Hold(_) => {}
             plan => panic!("a departed slot holder's in-flight release must hold, got {plan:?}"),
         }
-        // The release lands: the hold converts to the freed-slot form,
-        // then to the identity-paired join, then the fire seals dense.
-        policy.on_execution_slot_released();
+        // The release lands (paired by the holder's identity): the hold
+        // converts to the freed-slot form, then to the identity-paired
+        // join, then the fire seals dense.
+        policy.on_execution_slot_released(predecessor);
         match drive_past_cold_hold(&mut policy, &queued) {
             FramePlan::Hold(_) => {}
             plan => panic!("freed slot with staged taker must keep holding, got {plan:?}"),
@@ -1567,7 +1587,7 @@ mod tests {
         policy.on_slotted_terminate(bystander);
         policy.on_slotted_terminate(holder);
         policy.on_slotted_terminate(holder);
-        policy.on_execution_slot_released();
+        policy.on_execution_slot_released(holder);
         policy.on_execution_slot_consumed(bystander);
         policy.on_fire_enqueued(stamp(bystander, 0, 0, 1), Some(bystander), 96, 1, 1);
         let queued: HashSet<u64> = [95, 96].into_iter().collect();
@@ -1577,6 +1597,36 @@ mod tests {
                 FramePlan::Dispatch(_)
             ),
             "a retired departure must leave no phantom hold"
+        );
+    }
+
+    /// A forfeited slot (the leaked-permit teardown error path) resolves
+    /// its holder's departure WITHOUT crediting the balance: the seal
+    /// stops waiting, and no phantom free slot earmarks a staged
+    /// successor that can never admit.
+    #[test]
+    fn forfeit_resolves_departure_without_freeing_a_slot() {
+        let mut policy = FramePolicy::new(2, 64, 4096, None);
+        let lane = pid();
+        let holder = pid();
+        let successor = pid();
+        policy.on_execution_slot_consumed(holder);
+        policy.on_fire_enqueued(stamp(lane, 0, 0, 1), Some(lane), 95, 1, 1);
+        policy.on_bind_enqueued(Some(successor));
+        policy.on_bind_completed(Some(successor));
+        policy.on_slotted_terminate(holder);
+        let queued: HashSet<u64> = [95].into_iter().collect();
+        match drive_past_cold_hold(&mut policy, &queued) {
+            FramePlan::Hold(_) => {}
+            plan => panic!("an unresolved departure must hold, got {plan:?}"),
+        }
+        policy.on_execution_slot_forfeited(holder);
+        assert!(
+            matches!(
+                drive_past_cold_hold(&mut policy, &queued),
+                FramePlan::Dispatch(_)
+            ),
+            "a forfeited slot must neither hold nor earmark"
         );
     }
 
@@ -1607,7 +1657,7 @@ mod tests {
         assert_eq!(wave, vec![10, 11]);
     }
 
-    /// Regression (fleet-wide stall, run v3): released permits launder into
+    /// Regression (fleet-wide stall): released permits launder into
     /// the semaphore's free pool, so a consumer may admit UNCONTENDED — if
     /// only parked admissions notified, the balance stayed positive forever
     /// and a staged bystander held every seal of the first generation.
@@ -1627,7 +1677,7 @@ mod tests {
         // A retirement's release is then consumed by an uncontended
         // admission elsewhere (its notify still arrives), while a later
         // process binds and stages.
-        policy.on_execution_slot_released();
+        policy.on_execution_slot_released(pid());
         policy.on_execution_slot_consumed(executing);
         policy.on_bind_enqueued(Some(bystander));
         let queued: HashSet<u64> = [95].into_iter().collect();
@@ -1652,7 +1702,7 @@ mod tests {
         let queued: HashSet<u64> = [95].into_iter().collect();
 
         // Slot released with an empty staged pool: no earmark, no hold.
-        policy.on_execution_slot_released();
+        policy.on_execution_slot_released(pid());
         let FramePlan::Dispatch(wave0) = drive_past_cold_hold(&mut policy, &queued) else {
             panic!("a slot release with nobody staged must not hold");
         };

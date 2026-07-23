@@ -1027,3 +1027,52 @@ watchdog 0, zero failed requests. k1 2048x32 **35.07/34.62/35.10k
 unchanged. Remaining to +10% (35.42k): ~330 tok/s ≈ ~19 ms of wall —
 the cold gather (~30-49 ms at fleet bring-up) is the next and last
 boundary lever; decode glue fusion the stretch beyond it.
+
+## Review round (operator directive: "hack/heuristic 금지, opus 리뷰")
+
+An Opus reviewer audited ddfeae3b/e5808b8f/b0359aa4 against the
+"invariants, not heuristics" bar. Verdict: the staged/departing scheme,
+epoch drain, and leave-tax fixes are sound (explicitly verified,
+including the fast-scan superset claim and multi-driver balance); three
+findings required work, all landed:
+
+1. The awaited terminate ack had been documented as "boundary flow
+   control" — a timing claim. Investigation showed BOTH prior stories
+   were wrong (launches dispatch by id, not queue position, so the
+   run-g "flood ahead of launches" mechanism cannot be it). The ack's
+   real structural role: a REFERENCE FENCE — after it resolves, every
+   scheduler has purged the pid's queued work and cancelled its
+   protected in-flight control, so teardown finalization and the
+   resource drop run with no scheduler-side reference to the recycled
+   pages. Reframed in code; measured numbers and run letters removed
+   from load-bearing comments. The bind queue-insertion rule was also
+   rewritten as a priority invariant (execution > bring-up > teardown;
+   a queued launch never depends on a queued bind, since a fire exists
+   only after its own bind completed).
+2. "An armed release always lands" was false on the no-runtime
+   `mem::forget` path. `releases_in_flight` (a counter) became
+   `departing` (a ProcessId set, fully identity-paired):
+   `ExecutionSlotReleased(pid)` resolves its own holder,
+   `ExecutionSlotForfeited(pid)` resolves a departure whose permit
+   leaked WITHOUT crediting the balance (the pool shrank; the
+   accounting agrees). New regression test.
+3. `terminated_processes` grew unbounded. The teardown now broadcasts
+   `ProcessQuiesced(pid)` strictly last (it is the process's final
+   producer), which retires the tombstone. Terminate-leave sources cut
+   from three to two (the actor's duplicate deleted; the free-fn's
+   early leave is guarded on registry delivery so a terminate aimed at
+   a quiesced pid cannot mint an unretired tombstone).
+
+Also: STAGED_COHORTS named constant replaces the bare 2x bind-pool
+multiplier; host_reader scan note taken for the bind round.
+
+Result (suite r, 4090): oracles EXACT, units 358/358, watchdog 0.
+k1 2048x32 35.20/35.26/35.16k (median 35.20k = vLLM +9.3%), instr
+34.92k; k2 34.44k, k3 34.14k, c0256 28.09k, 512x512 19.68k — every
+shape at or above its previous best. Target re-set by the operator:
++15% (37.03k), runtime-only (kernels off-limits). Re-profile ledger:
+GPU-idle pool ~144 ms = cold ~67 (bind grind ~50: 1,024+ rcb at 47.7us
+cold vs 24 steady, instance build 20us) + boundaries 19.0/21.7/17.1 +
+post-prefill tails ~8-10 + stream-dry 8.9. Next levers: template/clone
+bind (driver host), boundary teardown/admission overlap, run-ahead
+depth, prefill chunk unification.

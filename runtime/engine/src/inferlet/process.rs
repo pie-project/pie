@@ -225,16 +225,19 @@ pub fn init_admission(max_concurrent: Option<usize>) {
     let prewarm = Some(Arc::new(Semaphore::new(
         limit.map_or(MAX_PREWARM_PROCESSES, |n| n.min(MAX_PREWARM_PROCESSES)),
     )));
-    // Double-buffered bring-up: the executing cohort plus ONE staged
-    // cohort hold bind permits (mirroring the two-wave run-ahead slots).
-    // The staged cohort instantiates and binds DURING the previous
-    // generation's execution; at the turnover it only needs execution
-    // permits and first submits, so the boundary sheds the register
-    // storm. The frame seal gathers the swap through successor earmarks
-    // (see FramePolicy::on_execution_slot_released) — the earlier
-    // PIE_BIND_AHEAD experiment showed extra permits alone are neutral:
-    // without earmarks the stall just moves into mid-generation seals.
-    let bind_ahead = limit.map(|n| Arc::new(Semaphore::new(n.saturating_mul(2))));
+    // Double-buffered bring-up: the executing cohort plus STAGED_COHORTS
+    // whole successor cohorts hold bind permits. A staged cohort
+    // instantiates and binds DURING the previous generation's execution;
+    // at the turnover it only needs execution permits and first submits,
+    // so the boundary sheds the register storm. One staged cohort is the
+    // structural depth: a turnover consumes exactly one cohort, and the
+    // frame seal gathers exactly one swap through successor earmarks
+    // (see FramePolicy::on_execution_slot_released) — extra permits
+    // beyond that are neutral because without an earmarked taker the
+    // stall just moves into mid-generation seals.
+    const STAGED_COHORTS: usize = 1;
+    let bind_ahead =
+        limit.map(|n| Arc::new(Semaphore::new(n.saturating_mul(1 + STAGED_COHORTS))));
     EXECUTION_SLOT_CAPACITY
         .set(limit)
         .expect("execution slot capacity already initialized");
@@ -395,14 +398,20 @@ pub fn detach(process_id: ProcessId) {
 
 /// Terminate a process (fire-and-forget).
 pub fn terminate(process_id: ProcessId, result: Result<String, String>) {
-    // M-A1 Stage 2: broadcast a wait-for-all pipeline `Leave` so the scheduler
-    // drops this pid from its wave wait-set immediately (rather than after the
-    // miss-counter backstop). No-op unless a waitall scheduler is registered.
-    crate::scheduler::worker::notify_pipeline_leave(
-        process_id,
-        crate::scheduler::worker::LeaveKind::Terminate,
-    );
-    let _ = SERVICES.send(&process_id, Message::Terminate { result });
+    // Early wait-set drop for a LIVE process: the scheduler stops holding
+    // waves for this pid immediately instead of at the teardown's own
+    // leave. Guarded on registry delivery so a terminate aimed at an
+    // already-quiesced pid cannot mint a fresh tombstone after
+    // ProcessQuiesced retired it.
+    if SERVICES
+        .send(&process_id, Message::Terminate { result })
+        .is_ok()
+    {
+        crate::scheduler::worker::notify_pipeline_leave(
+            process_id,
+            crate::scheduler::worker::LeaveKind::Terminate,
+        );
+    }
 }
 
 /// Send stdout output from a WASM instance to its process (fire-and-forget).
@@ -740,15 +749,11 @@ impl Process {
         let _ = server::inbox::clear(self.process_id.to_string());
         SERVICES.remove(&self.process_id);
 
-        // M-A1 wait-for-all: drop this pid from the scheduler's wave wait-set as
-        // an explicit step of the SINGLE exit funnel — so NATURAL completion (not
-        // only the external-terminate free fn) promptly stops holding the wave.
-        // Idempotent with the free fn's early `Leave{Terminate}`; no-op unless a
-        // waitall scheduler is registered.
-        crate::scheduler::worker::notify_pipeline_leave(
-            self.process_id,
-            crate::scheduler::worker::LeaveKind::Terminate,
-        );
+        // (No leave broadcast here: natural completion's run loop already
+        // sent the early leave via the free `terminate` fn above, and the
+        // deferred teardown sends the fenced one — a third copy from this
+        // actor could land after the teardown's ProcessQuiesced and mint a
+        // tombstone nothing retires.)
 
         // Task-B contention: unregister from the preempt/restore orchestrator
         // (purges its waiters/restore-queue entries, wakes a parked task for

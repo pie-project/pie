@@ -74,6 +74,15 @@ pub(crate) fn defer_resource_teardown(
              ResourceTable to avoid recycling pages under native work"
         );
         std::mem::forget(context);
+        // The leaked permit shrank the execution pool by one; tell the
+        // policy the departure resolves as a FORFEIT so its seal neither
+        // waits forever for a release that cannot come nor credits a free
+        // slot the semaphore no longer has. (Sync send — no runtime
+        // needed.) The terminate tombstone stays: with the pending fires
+        // forgotten, late items for this pid remain possible.
+        if capped_execution {
+            crate::scheduler::worker::notify_execution_slot_forfeited(process_id);
+        }
         return;
     };
     runtime.spawn(async move {
@@ -84,15 +93,13 @@ pub(crate) fn defer_resource_teardown(
             0
         };
         if capped_execution {
-            // The awaited ack is boundary FLOW CONTROL, not just ordering
-            // (run g measured the fire-and-forget variant: releases all
-            // landed by +15 ms, yet first prefill slipped to +117 ms and
-            // k1 lost ~3k tok/s). Waiting for the scheduler to process the
-            // leave paces each retirement behind a worker pass, which keeps
-            // the successor cohort's admissions — and therefore the
-            // NEXT-next cohort's bind/close flood that their permit drops
-            // unleash — arriving in small epochs BEHIND the successors'
-            // first fires instead of all at once ahead of them.
+            // Reference fence, awaited on purpose: after this resolves,
+            // every driver's scheduler has purged the pid's queued work and
+            // cancelled its protected in-flight control, so the finalize
+            // loop below and the resource drop at the end run with no
+            // scheduler-side reference to the pages they recycle. (The
+            // fence also serializes each retirement behind a scheduler
+            // pass; that pacing is a side effect, not the contract.)
             crate::scheduler::worker::notify_process_terminate(process_id).await;
         } else {
             for pipeline_id in snapshot.departed_pipeline_ids {
@@ -141,9 +148,14 @@ pub(crate) fn defer_resource_teardown(
             // for a release it hasn't counted. (The terminate notification
             // above already removed this process's own lane: leave first,
             // release second, successor's admission and fire after.)
-            crate::scheduler::worker::notify_execution_slot_released();
+            crate::scheduler::worker::notify_execution_slot_released(process_id);
         }
         drop(context);
+        // Strictly the process's last event on every mailbox (this task is
+        // its final producer, and the resource drop above already posted
+        // its close controls): the tombstone that deduped its Terminate
+        // leaves can now retire.
+        crate::scheduler::worker::notify_process_quiesced(process_id);
     });
 }
 
