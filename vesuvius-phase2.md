@@ -481,3 +481,61 @@ Gates for the pair: engine units green; k=1 oracles byte-exact vs
 current dumps; k∈{2,3} oracles exact; 3 consecutive 2048-fleets; zero
 watchdog; `PIE_FIRE_FORCE_RETRY` battery exercising retry-auto-flush;
 then the decisive k=2/3 vs k=1 re-measurement (k>1 must now win).
+
+## M2+M3 measured outcome (landed as substrate; deferral OFF by default)
+
+Commits: d32c574f (attribution + audit + cleanup), 01ad4ba0 (ABI v13 +
+driver protocol + §5 device-ring arm), 31965f0a (engine wiring),
+c95f7e96 (lease-hold reverted pending frame leases), 9a3a6394 (gate
+v3), then the `PIE_FRAME_SETTLE_DEFER` lever (default 0).
+
+**Correctness: everything green with deferral ON.** Oracles 11/11
+token-exact (k=1 byte-exact vs pre-M2 dumps at t∈{1,2,16,32,256};
+k∈{2,3} exact at t∈{16,32,256}); 2048-fleets complete at k∈{1,2,3};
+forced-RETRY battery (`PIE_CUDA_FORCE_RETRY_ONCE=1`) completes 64/64 at
+every k with retried waves replaying through the auto-flush — no hangs;
+settled-conservation holds (cuda_submit == cuda_settled: 168/168 k1,
+188/188 k2, 200/200 k3); zero watchdog; zero organic retries.
+
+**Performance: deferral is a net k>1 LOSS on this driver — the M2
+premise did not survive measurement.** With deferral on, k2 c0/256
+dropped 27.4k → 22.4–22.5k and k2 2048×32 23.0k → 20.2–20.9k under BOTH
+gate variants tried:
+
+- deep posting (group-counted gate, 6–9 batches in flight): the lane
+  thread serializes on upload-staging slots (`kUploadStagingDepth = 4`;
+  `h2d_prepare` Σ74→320 ms) and on the prior wave's `publications_done`
+  wait inside `begin` (`begin_pull_validate` Σ5→180 ms) — the driver's
+  own backpressure caps useful run-ahead at ~3 batches regardless;
+- shallow posting (historical cap + open-group exception, gate v3):
+  completion resolution is frame-granular, so the posting window
+  advances in k-wave steps and the stream drains at every frame tail.
+
+The root cause is structural, not a tuning miss: §6.2 forces per-wave
+publication to stay, and the audit showed publication IS almost all of
+`settlement_enqueue` — what deferral can legally move (terminal cells,
+completion notify, `cuda_settled`, fences) is microseconds per wave,
+while coupling retirement to the frame quantum costs the pipeline
+percent-level throughput. The same holds for M3's target (`h2d_prepare`
+Σ74 ms ≈ 3% at k2 before any regression). Post-unification, per-wave
+settle/prepare host lines are simply no longer where k>1's deficit
+lives; the attribution's item 1 (generation-boundary lifecycle storms,
+~31% of wall — operator-queued AFTER M2/M3) and item 2's GPU shadow are.
+
+**Disposition**: the full M2 machinery lands and stays correct — ABI
+v13 `settle_defer`, the driver's park/drain/arm protocol with
+retry-auto-flush, `pie_cuda_flush_settlement`, engine defer marking,
+group-tail-safe gate — behind `PIE_FRAME_SETTLE_DEFER=1` (default 0 =
+byte-identical pre-M2 behavior everywhere; the bit is advisory, so
+non-CUDA and remote drivers are unaffected either way). It becomes
+worth re-enabling only after the driver decouples its staging/
+publication backpressure from the lane thread. M3's engine half
+(frame-union lease) is NOT wired: with per-wave prepare already
+watermark-elided and the commit cost at ~3%, it cannot pay before the
+lifecycle storm is addressed; the driver-side hold semantics are
+designed (held lease consumed by the tail, `release_launch` on
+truncation) and documented above for when it is. The §5 device-ring
+arm and the §6.2 audit stand regardless — they gate any future
+frame-scoped settlement, and the audit's Q1 fact (stream settlement is
+{SUCCESS, RETRY} only) plus the retry-auto-flush rule are what make the
+parked machinery safe to ship dormant.

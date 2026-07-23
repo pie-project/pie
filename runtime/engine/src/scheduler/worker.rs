@@ -3273,7 +3273,8 @@ impl BatchScheduler {
                             // control: let the queue walk dispatch it.
                             break;
                         }
-                        settle_defer = frame_policy.last_plan_defers_settlement();
+                        settle_defer = frame::settle_defer_enabled()
+                            && frame_policy.last_plan_defers_settlement();
                         eligible
                     }
                     FramePlan::Hold(hold) => {

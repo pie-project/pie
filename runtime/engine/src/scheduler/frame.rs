@@ -101,6 +101,20 @@ pub struct FrameStamp {
 /// narrow head frame.
 const COLD_HOLD_US: u64 = 2_000;
 
+/// Deploy lever for M2 frame-group settlement deferral (`settle_defer` on
+/// non-tail waves). DEFAULT OFF: with per-wave publication kept (spec §6.2),
+/// the deferrable bookkeeping is microseconds while frame-granular
+/// completion resolution couples the posting window to frame-sized
+/// retirement — measured a net k>1 loss on the CUDA driver (see
+/// vesuvius-phase2.md "M2+M3 measured outcome"). The driver machinery is
+/// live either way; this only gates whether the engine marks waves.
+pub(super) fn settle_defer_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("PIE_FRAME_SETTLE_DEFER").is_ok_and(|value| value == "1")
+    })
+}
+
 fn cold_hold() -> Duration {
     static HOLD: OnceLock<Duration> = OnceLock::new();
     *HOLD.get_or_init(|| {
