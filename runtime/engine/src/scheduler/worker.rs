@@ -439,7 +439,7 @@ fn item_census_idx(item: &SchedulerItem) -> usize {
         SchedulerItem::Launch { .. } => 0,
         SchedulerItem::RegisterChannelsBind { .. } => 1,
         SchedulerItem::CloseInstance { .. } => 2,
-        SchedulerItem::CloseChannel { .. } => 3,
+        SchedulerItem::CloseChannel { .. } | SchedulerItem::CloseChannels { .. } => 3,
         SchedulerItem::Lane(_) => 4,
         SchedulerItem::PipelineLeave(..) => 5,
         SchedulerItem::ExecutionSlotReleased(_)
@@ -525,6 +525,13 @@ enum SchedulerItem {
     },
     CloseChannel {
         id: u64,
+    },
+    /// A whole cohort of channel closes in one mailbox item — posted by
+    /// process teardown, which owns every id it retires. One item per
+    /// departing process instead of one per channel keeps a teardown herd
+    /// from inflating the epoch a worker pass has to drain.
+    CloseChannels {
+        ids: Vec<u64>,
     },
     FreezePipeline {
         pid: ProcessId,
@@ -2090,6 +2097,15 @@ impl SchedulerHandle {
     pub fn close_channel(&self, id: u64) -> Result<()> {
         self.send(SchedulerItem::CloseChannel { id })
     }
+
+    /// Batched form of [`Self::close_channel`] for callers that retire a
+    /// whole cohort of channels at once (process teardown).
+    pub fn close_channels(&self, ids: Vec<u64>) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        self.send(SchedulerItem::CloseChannels { ids })
+    }
 }
 
 pub struct BatchScheduler {
@@ -2851,17 +2867,10 @@ impl BatchScheduler {
             SchedulerItem::CloseInstance { id, pacing_wait_id } => {
                 pending.push_back(QueuedItem::CloseInstance { id, pacing_wait_id });
             }
-            SchedulerItem::CloseChannel { id } => {
-                // Coalesce teardown runs: consecutive channel closes ride one
-                // control post. Bounded so a batch's lane occupancy stays a
-                // fraction of a wave (~3-6 us per close driver-side).
-                const CLOSE_CHANNEL_BATCH_MAX: usize = 512;
-                if let Some(QueuedItem::CloseChannels { ids }) = pending.back_mut()
-                    && ids.len() < CLOSE_CHANNEL_BATCH_MAX
-                {
-                    ids.push(id);
-                } else {
-                    pending.push_back(QueuedItem::CloseChannels { ids: vec![id] });
+            SchedulerItem::CloseChannel { id } => Self::queue_close_channel(pending, id),
+            SchedulerItem::CloseChannels { ids } => {
+                for id in ids {
+                    Self::queue_close_channel(pending, id);
                 }
             }
             // Handled on dequeue in the run loop (like DebugDump) before
@@ -3059,6 +3068,20 @@ impl BatchScheduler {
                 | QueuedItem::CloseInstance { .. }
                 | QueuedItem::CloseChannels { .. }
         )
+    }
+
+    fn queue_close_channel(pending: &mut VecDeque<QueuedItem>, id: u64) {
+        // Coalesce teardown runs: consecutive channel closes ride one
+        // control post. Bounded so a batch's lane occupancy stays a
+        // fraction of a wave (~3-6 us per close driver-side).
+        const CLOSE_CHANNEL_BATCH_MAX: usize = 512;
+        if let Some(QueuedItem::CloseChannels { ids }) = pending.back_mut()
+            && ids.len() < CLOSE_CHANNEL_BATCH_MAX
+        {
+            ids.push(id);
+        } else {
+            pending.push_back(QueuedItem::CloseChannels { ids: vec![id] });
+        }
     }
 
     fn queue_bind_control(pending: &mut VecDeque<QueuedItem>, item: QueuedItem) {

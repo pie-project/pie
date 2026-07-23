@@ -982,6 +982,39 @@ pub struct Channel {
     pub fires: Option<crate::pipeline::fire::PendingFires>,
 }
 
+/// Process-teardown close batching: walks the process's resource table,
+/// takes over the driver close notification from every guest channel
+/// endpoint still holding one, and returns the channel ids grouped by
+/// owning driver. The caller posts one batched close per driver AFTER
+/// dropping the table (whose pass drops post the instance closes) — the
+/// scheduler mailbox's per-producer FIFO then delivers every instance
+/// close before the channel batch, preserving the driver's
+/// instance-before-channel close order. Endpoints this walk cannot reach
+/// (a cell kept alive only by a pass after the guest dropped its channel
+/// handle) keep notifying one-by-one from their own drop.
+pub fn detach_channel_close_notifications(
+    resources: &mut wasmtime::component::ResourceTable,
+) -> Vec<(usize, Vec<u64>)> {
+    let mut by_driver: std::collections::BTreeMap<usize, Vec<u64>> =
+        std::collections::BTreeMap::new();
+    for entry in resources.iter_mut() {
+        let Some(channel) = entry.downcast_ref::<Channel>() else {
+            continue;
+        };
+        let Some(endpoint) = channel.cell.lock().unwrap().endpoint() else {
+            continue;
+        };
+        let Some(channel_id) = endpoint.detach_close_notification() else {
+            continue;
+        };
+        by_driver
+            .entry(endpoint.registered().driver_id)
+            .or_default()
+            .push(channel_id);
+    }
+    by_driver.into_iter().collect()
+}
+
 /// The next host-known Writer value on `cell` — the native value the driver
 /// will pull for the next submitted fire (`None`: not a Writer channel, or
 /// nothing pending). Pre-endpoint values sit in `staged`; post-bind puts go

@@ -227,6 +227,12 @@ pub(crate) fn close_instance(bound: &BoundInstance) -> Result<()> {
     scheduler_handle(bound.driver_id)?.close_instance(bound.instance_id, bound.pacing_wait_id)
 }
 
+/// Batched channel close for a teardown cohort — one mailbox item for the
+/// whole id set (see `SchedulerItem::CloseChannels`).
+pub(crate) fn close_channels(driver_idx: DriverId, ids: Vec<u64>) -> Result<()> {
+    scheduler_handle(driver_idx)?.close_channels(ids)
+}
+
 pub(crate) async fn copy_d2h(
     driver_idx: DriverId,
     gpu_phys_ids: &[u32],

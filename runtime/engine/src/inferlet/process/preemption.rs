@@ -140,6 +140,16 @@ pub(crate) fn defer_resource_teardown(
                 "released_us": finalized_us,
             }));
         }
+        // Take over the guest channels' close notifications before the
+        // table drops, so a departing process posts one batched close per
+        // driver instead of one mailbox item per channel (a teardown herd
+        // otherwise inflates the epoch a worker pass has to drain). The
+        // batch is posted only after `drop(context)` below: the drop's pass
+        // teardowns post the instance closes first, and per-producer FIFO
+        // then keeps the driver's instance-before-channel close order.
+        let channel_close_batches = crate::pipeline::channel::detach_channel_close_notifications(
+            &mut context.resources,
+        );
         if capped_execution {
             // Announce the slot BEFORE the permit drops (with `context`
             // below): the successor can only acquire after the drop, so its
@@ -151,10 +161,19 @@ pub(crate) fn defer_resource_teardown(
             crate::scheduler::worker::notify_execution_slot_released(process_id);
         }
         drop(context);
+        for (driver_id, ids) in channel_close_batches {
+            if let Err(error) = crate::scheduler::close_channels(driver_id, ids) {
+                // Same failure mode as the per-endpoint closer (the
+                // scheduler is gone at shutdown); driver shutdown closes
+                // any channels this batch could not reach.
+                tracing::warn!(pid = %process_id, driver_id, %error,
+                    "process teardown failed to post its batched channel close");
+            }
+        }
         // Strictly the process's last event on every mailbox (this task is
-        // its final producer, and the resource drop above already posted
-        // its close controls): the tombstone that deduped its Terminate
-        // leaves can now retire.
+        // its final producer, and the drop + batched close above already
+        // posted its close controls): the tombstone that deduped its
+        // Terminate leaves can now retire.
         crate::scheduler::worker::notify_process_quiesced(process_id);
     });
 }

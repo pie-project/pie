@@ -42,9 +42,10 @@ use anyhow::{Result, anyhow};
 // into the current mock-driver fire path vs. reserved/unit-test-only).
 #[allow(unused_imports)]
 pub(crate) use dispatch::{
-    bind_instance, bind_instance_classified, close_instance, copy_d2d, copy_d2h, copy_d2h_tracked,
-    copy_h2d, copy_h2d_tracked, copy_h2h, copy_kv_cells, copy_rs_d2d, register_channel,
-    register_channels, register_channels_bind_classified, register_program, resize_pool,
+    bind_instance, bind_instance_classified, close_channels, close_instance, copy_d2d, copy_d2h,
+    copy_d2h_tracked, copy_h2d, copy_h2d_tracked, copy_h2h, copy_kv_cells, copy_rs_d2d,
+    register_channel, register_channels, register_channels_bind_classified, register_program,
+    resize_pool,
 };
 pub use stats::AggregateStats;
 pub use worker::BatchScheduler;
