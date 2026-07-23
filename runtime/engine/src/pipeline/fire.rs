@@ -1092,8 +1092,8 @@ pub async fn submit_pass_stamped<C: FireContext>(
 /// The body behind the interface-level `forward.submit(on, slots)` —
 /// Vesuvius frame submission. Exactly `model.frame-size()` ordered slots;
 /// slot i executes in wave i; `none` is a no-op. At k = 1 a single-slot frame
-/// IS today's per-pass submit (identical semantics, per-wave wait-all path
-/// untouched). At k > 1 the frame validates structurally (Section 5 of the
+/// IS today's per-pass submit (identical semantics — a 1-slot frame runs the
+/// same unified FramePolicy path). At k > 1 the frame validates structurally (Section 5 of the
 /// design: staged / device-advanced / latest-value host-writer classes,
 /// static reader-capacity overflow prevention), then prepares and enqueues
 /// each slot in order under one frame stamp.

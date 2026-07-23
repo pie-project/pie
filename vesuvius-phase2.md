@@ -288,3 +288,97 @@ charlie build and 32.7k on this build same-day — zero cumulative
 regression across Phase 1 + Phase 2 + overlap + unification. (The
 34.27k in charlie's elastic-memory report does not reproduce on today's
 environment with either build; its delta is environmental.)
+
+## Attribution re-profile (post-unification, 2026-07-22)
+
+Question (operator fork): is the remaining −20% on 2048×32 c512 (k=1
+25.7k vs vLLM 32.2k) the host starving the GPU (→ M2/M3 first) or the
+GPU busy but trapped in launch gaps (→ M4 first)?
+
+Method: nsys 2026.1.3, `-t cuda -s none --cuda-graph-trace=graph`,
+capture window = the measured section via the bench's
+`--cuda-profiler-capture` (cudaProfilerApi range), on k=1 and k=2
+2048×32; plus PIE_FIRE_TIMING aggregation of the unify-suite instr logs
+(unprofiled, representative). Probe effect: profiled k=1 ran 23.2k
+(−10%, structure valid); profiled k=2 collapsed to 8.5k — nsys's per-API
+overhead cascades in the boundary machinery (251 gaps ≥ 1 ms vs k=1's
+17), itself evidence of the k>1 path's host-latency sensitivity; k=2
+conclusions below use the unprofiled instr log. Raw artifacts:
+session scratchpad `attr/` (nsys-rep, sqlite, analysis scripts).
+
+**Verdict: host-starved — GPU compute is busy only 61.7%** of the
+measured window (graph replays 124 × p50 8.6 ms = 1,066 ms + individual
+kernels Σ662 ms of a 2.80 s window; all-engine-activity 63.7%). M4 is
+ruled out as the next move: the launch fan-out it targets is negligible
+today — cudaLaunchKernel Σ31 ms host across 15.3k calls, sub-100 µs
+compute gaps ≈ 80 ms ≈ 3.5% of wall. The idle decomposes three ways:
+
+1. **Generation-boundary lifecycle storms — the #1 cost, ~31% of steady
+   wall, outside every scoped milestone.** Three no-wave-in-flight
+   windows of 171–270 ms (engine view; GPU fully silent 75–109 ms in
+   each). All 2048 wasm processes spawn+instantiate up front (53.6 ms
+   total, ~5-way parallel, NOT part of the stalls); the stall is the
+   c512 admission cohort turning over: per boundary, 512 dying lanes
+   post 9,216 `close_channel` + 1,024 `close_instance` controls
+   (~60 ms of driver-lane occupancy) plus a ~3,000-call cudaFree storm
+   (8–16 ms), and 512 fresh lanes post 1,024 `register_channels_bind`
+   controls (94–133 ms occupancy). Controls execute one-at-a-time on
+   the driver lane, launches FIFO-barrier behind queued controls, and
+   the wait-all seal holds until the whole herd's first submissions
+   land — `driver_bind` p50 is 79 ms of QUEUEING (the work itself is
+   ~0.13 ms/control). Control occupancy alone accounts for 65–91% of
+   each stall; run total 666 ms ≈ 29% of wall. Cross-check that this
+   is the whole vLLM gap: charlie-canonical c0 (256 req, unlimited
+   concurrency — no cohort turnover) runs 32.7k ≈ vLLM's 32.2k on the
+   same hardware; the 2048×32 deficit is churn-boundary-shaped, and
+   vLLM pays no per-request lifecycle.
+2. **Per-wave submit/settle host lines — ~15% of wall, exactly M2+M3's
+   target.** `driver_submit` Σ360 ms (p50 2.85 ms/wave), of which
+   `settlement_enqueue` Σ222 ms = 65% of driver-lane host time
+   (`finish_settle_prep` 121 ms and `finish_epilogue` 101 ms inside
+   it); engine `retire_settle` Σ167 ms (7.3%). The lane thread is not
+   saturated (duty 14.8%) — the cost lands as boundary cadence: the
+   100 µs–1 ms compute-gap class (n≈4.0k, Σ659 ms ≈ 24% of wall,
+   partially covered by upload staging copies) is these lines' GPU
+   shadow.
+3. **k=2 today changes nothing**: unprofiled coverage 74.0%, the same
+   boundary stalls (n=20, Σ643 ms), `settlement_enqueue` Σ217 ms — NOT
+   ÷k (188 waves vs k=1's 168, settlement still per-wave). Confirms
+   M2+M3 is precisely the missing ÷k; until they land, k>1 has no
+   mechanism by which to beat k=1.
+
+Decision per the fork: **M2+M3 next** (host-starved side); M4 deferred
+until chunk-wave launch overhead surfaces after M2/M3. Escalated to the
+operator (observed, NOT directed): the lifecycle storm (item 1) is
+twice M2+M3's direct target and no scoped milestone touches it.
+Candidate mitigations to weigh: drain dead-lane `close_*` storms
+asynchronously off the boundary path (they need not precede the next
+seal), batch the 2-posts-per-bind registration into cohort-sized posts,
+and/or relax the launch-vs-control FIFO barrier for controls belonging
+to lanes outside the executing wait-set.
+**Operator ruling (2026-07-22): M2+M3 first; the lifecycle storm is
+addressed AFTER M2+M3 land.**
+
+## M2 entry gate — §6.2 validation-completeness audit (passed)
+
+Full report with the exhaustive per-class evidence table:
+`vesuvius-m2-entry-audit.md`. Verdict: **§6.2 requirement 1 holds at
+8184a5f1 — no strict GATE-BLOCKER.** Load-bearing facts M2's design rests
+on: driver stream settlement (`notify_runtime_callback`) can only produce
+per-lane SUCCESS or RETRY (`entry.poison` is never set anywhere — per-lane
+FAILED at settlement is unreachable); every FAILED terminal is batch-scoped
+and written synchronously in `launch_impl`'s catch blocks at post time;
+every guest-recoverable per-lane class (geometry, staged cells, channel
+capacity, page binding, RS, masks) is caught at guest submit or engine
+admission. Three flagged constraints feed M2/M3's design:
+
+1. **Makeup/RETRY handling is per-wave-retirement-driven** — under
+   frame-tail retirement, RETRY discovery + budget clocks stretch ≤ k×;
+   decide: keep commit-mirror-based per-wave retry visibility (the mirror
+   already rides the kept publication copies) or rescale budgets.
+2. **Device-only ring capacity has no §5 arm** — enforced only by the
+   device publish-capacity gate as a mid-frame RETRY loop; prove vacuous
+   from ticket pre-reservation or add a fourth `validate_frame` arm
+   before M2 lands.
+3. **Per-wave prepare is a mid-frame admission point** — exactly the gap
+   M3 closes (one lease per sealed frame at first dispatch).

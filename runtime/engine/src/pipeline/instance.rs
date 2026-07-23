@@ -17,13 +17,18 @@
 //! than deleted, allowed rather than silently masked.
 #![allow(dead_code)]
 
+#[cfg(test)]
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use pie_ptir::container::{self, HostRole};
+#[cfg(test)]
+use pie_ptir::container;
+use pie_ptir::container::HostRole;
 
-use super::program::{RegisteredProgram, lookup};
+use super::program::RegisteredProgram;
+#[cfg(test)]
+use super::program::lookup;
 
 /// Process-wide monotonic source of instance identities (0 reserved as a null /
 /// "no instance" sentinel). Each `instantiate` mints a fresh id: the driver
@@ -485,6 +490,7 @@ impl Drop for BoundForwardPass {
 }
 
 /// An instantiation failure.
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InstantiateError {
     /// No program with this identity hash is registered.
@@ -505,6 +511,7 @@ pub enum InstantiateError {
     },
 }
 
+#[cfg(test)]
 impl fmt::Display for InstantiateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         use InstantiateError::*;
@@ -530,6 +537,7 @@ impl fmt::Display for InstantiateError {
         }
     }
 }
+#[cfg(test)]
 impl std::error::Error for InstantiateError {}
 
 /// Instantiate a registered program with per-channel seeds (looks the program up
@@ -537,10 +545,12 @@ impl std::error::Error for InstantiateError {}
 /// are seeded, each with the right byte length. Seeds are per-instance data (D2)
 /// — never part of the program identity.
 ///
-/// The live WIT `forward-pass.program` bind path (`inferlet::host::forward`) does
-/// its own inline validation (dense channel decls, staged puts, extern
-/// bindings) alongside seed checking, so it does not call this pure
-/// entry point; kept + unit-tested as the minimal instantiate contract.
+/// Test-only: the live WIT `forward-pass.program` bind path
+/// (`inferlet::host::forward`) does its own inline validation (dense channel
+/// decls, staged puts, extern bindings) alongside seed checking, so no
+/// production code calls this pure entry point; it exists as the unit-tested
+/// minimal instantiate contract.
+#[cfg(test)]
 pub fn instantiate(program: u64, seeds: Vec<ChannelSeed>) -> Result<Instance, InstantiateError> {
     let prog = lookup(program).ok_or(InstantiateError::UnknownProgram(program))?;
     let validated = validate_seeds(&prog, seeds)?;
@@ -552,6 +562,7 @@ pub fn instantiate(program: u64, seeds: Vec<ChannelSeed>) -> Result<Instance, In
 }
 
 /// Validate + order the seeds against a program's channel declarations.
+#[cfg(test)]
 pub fn validate_seeds(
     prog: &RegisteredProgram,
     seeds: Vec<ChannelSeed>,

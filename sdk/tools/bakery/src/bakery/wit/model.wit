@@ -63,8 +63,8 @@ interface model {
     // Tokens per buffered RS page. 0 if the model has no recurrent state.
     rs-buffer-page-size: func() -> u32;
 
-    // Fold granularity in tokens: `forward-pass.fold-buffered(n)` requires `n`
-    // to be a positive multiple of this value. 1 (or 0) means unconstrained;
+    // Fold granularity in tokens: an RS fold of `n` tokens requires `n` to
+    // be a positive multiple of this value. 1 (or 0) means unconstrained;
     // 0 also implies the model has no recurrent state. (Token-causal RS models
     // — Qwen3.5 GDN, Nemotron-H Mamba2 — report 1.)
     rs-fold-granularity: func() -> u32;

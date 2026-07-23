@@ -73,7 +73,7 @@ impl pie::inferlet::model::Host for ProcessCtx {
     }
 
     /// Fold granularity in tokens. 1 = unconstrained (token-causal: Qwen3.5 GDN,
-    /// Nemotron-H Mamba2). `forward-pass.fold-buffered(n)` requires `n` to be a
+    /// Nemotron-H Mamba2). An RS fold of `n` tokens requires `n` to be a
     /// positive multiple of this.
     async fn rs_fold_granularity(&mut self) -> Result<u32> {
         Ok(model::model().rs_caps().fold_granularity)
