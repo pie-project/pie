@@ -1076,3 +1076,44 @@ cold vs 24 steady, instance build 20us) + boundaries 19.0/21.7/17.1 +
 post-prefill tails ~8-10 + stream-dry 8.9. Next levers: template/clone
 bind (driver host), boundary teardown/admission overlap, run-ahead
 depth, prefill chunk unification.
+
+## +15% runtime-only round 1: three measured negatives + the honest pool
+
+Directive: target +15% (37.03k), runtime-only, kernels off-limits.
+
+Measured this round (each one bench-verified, none landed):
+- **Tier0 bake template** (trace-pure bake image computed at program
+  registration, bind only remaps dense->slot): built, golden 69/69,
+  instrumented run — instance_us cold UNCHANGED at ~21us. The bind
+  cost is channel-VIEW registry binding (per-channel slot wiring),
+  not the trace traversal. Reverted (dual path for a within-noise
+  win fails the maintainability bar). Knowledge kept here.
+- **Run-ahead depth 3** (PIE_SCHED_MAX_IN_FLIGHT=3): 34.81k vs 35.30k
+  at depth 2, same build, same session — N9's depth-2 conclusion
+  holds in the 35k regime. Default stays 2.
+- **Steady-state epilogue**: GRAPH_TRACE decomposition — inter-graph
+  gap p50 0.64 ms/wave, 73% of it REAL epilogue kernels (fused
+  sampling 250us + settle 84us + pull_validate 55us + commit/
+  readiness); true micro-idle ~23 ms/run. Steady is closed under the
+  kernels-off-limits constraint.
+
+Honest runtime-only pool at 35.2k (wall 1.862s): cold ~59 ms (bind
+grind ~35-40: rcb 1024+ x 47-57us serialized on the lane; client
+spawn ramp ~17: spawn #512 lands +17.5ms) + boundaries 3x17.5 = 52 ms
+(current floor: guest exit +6, releases +9, seal+dispatch +3) +
+post-prefill tails ~10 + stream-dry 9 (the price of depth 2 winning).
+Two design rounds remain, both awaiting direction:
+1. **Settlement-coupled slot release** ("final fire"): the guest
+   declares its last submission (WIT addition); at that fire's
+   settlement the engine releases the execution slot and drops the
+   lane from the wait-set — the successor admits while the
+   predecessor's guest unwinds. Boundaries 17.5 -> ~7-9 ms (-27 ms).
+   KV pages still free at teardown; a tight-shape successor parks in
+   the existing prepare-retry (allocation-credit) path, so overlap is
+   safe-by-retry. Requires a WIT/API surface change.
+2. **Cold bind surgery** (driver host): bulk channel-view binding /
+   registry wiring for the 1k-bind cohort (-15 to -25 ms).
+Ceiling estimate if BOTH land plus tails: ~36.3-36.6k = +13-14%.
++15% additionally needs the client spawn ramp and prefill-chunk
+unification (planner capacity trade against the KV pool) to land —
+possible only if everything does.
