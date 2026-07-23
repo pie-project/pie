@@ -18,7 +18,9 @@
   - Phase 4 complete: required/optional negotiation, standard action schemas,
     subject authorization, idempotent staging, outcome correlation, and
     cancellation cleanup
-  - adapters and the remaining fixture corpus migrate in Phase 5
+  - Phase 5 complete: vLLM/SGLang templates, generic/negative fixtures,
+    unified build/replay runner, v0.5 trace archive, and the rebuilt existing
+    five paper artifacts
 - Inputs:
   - [`plex.md`](plex.md), the implemented v0.5 contract
   - [`plex_gap.md`](plex_gap.md), the design-gap audit

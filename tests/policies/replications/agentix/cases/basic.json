@@ -1,0 +1,9 @@
+{
+  "case": "group-service-order",
+  "operation": "schedule",
+  "requests": [
+    {"request_id": "A", "group_id": "G1", "waiting_ms": 10, "group_service_us": 100},
+    {"request_id": "B", "group_id": "G2", "waiting_ms": 500, "group_service_us": 10}
+  ],
+  "capacity": {"max_requests": 1, "max_total_tokens": 4}
+}

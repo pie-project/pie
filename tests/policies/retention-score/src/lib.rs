@@ -1,36 +1,35 @@
 use plex::serde_json::json;
-use plex::{Document, Host, Policy, State};
+use plex::{CacheAdmission, CacheContext, CachePlan, Host, Policy, State};
 
 struct RetentionScore;
 
 impl Policy for RetentionScore {
-    fn evict(ctx: &Document, state: &mut State, _host: &Host) -> Result<Document, String> {
+    fn cache(ctx: &CacheContext, state: &mut State, _host: &Host) -> plex::Result<CachePlan> {
         state.shared["working_set_size"] = json!(state.request_ids().count());
-        let units = ctx["resident"]
-            .as_array()
-            .ok_or("resident must be an array")?
+        let mut reclaim = ctx
+            .resident
             .iter()
-            .map(|unit| {
-                (
-                    unit["request_id"].as_str().map(str::to_owned),
-                    unit["facts"]["reload_cost"].as_f64().unwrap_or(0.0),
-                )
+            .enumerate()
+            .filter(|(_, resident)| resident.reclaimable)
+            .map(|(index, resident)| {
+                let mut score = resident.object.facts["reload_cost"].as_i64().unwrap_or(0);
+                for beneficiary in &resident.object.beneficiaries {
+                    if let plex::Beneficiary::Request(request_id) = beneficiary
+                        && let Ok(request) = state.request_mut(request_id.as_str())
+                    {
+                        score += request.scratch["retention_bonus"].as_i64().unwrap_or(0);
+                        request.scratch["cache_checks"] =
+                            json!(request.scratch["cache_checks"].as_u64().unwrap_or(0) + 1);
+                    }
+                }
+                (score, index as u32)
             })
             .collect::<Vec<_>>();
-        let mut scores = Vec::with_capacity(units.len());
-        for (request_id, reload) in units {
-            let retention = if let Some(request_id) = request_id {
-                let request = state.request_mut(&request_id)?;
-                let retention = request.scratch["retention_bonus"].as_f64().unwrap_or(0.0);
-                request.scratch["eviction_checks"] =
-                    json!(request.scratch["eviction_checks"].as_u64().unwrap_or(0) + 1);
-                retention
-            } else {
-                0.0
-            };
-            scores.push(reload + retention);
-        }
-        Ok(json!({"scores": scores}))
+        reclaim.sort_by_key(|(score, index)| (*score, *index));
+        Ok(CachePlan {
+            admissions: vec![CacheAdmission::Bypass; ctx.prospective.len()],
+            reclaim: reclaim.into_iter().map(|(_, index)| index).collect(),
+        })
     }
 }
 

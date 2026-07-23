@@ -1,0 +1,21 @@
+{
+  "id": "agentix",
+  "title": "Agentix: An Efficient Serving Engine for LLM Agents as General Programs",
+  "paper_version": "NSDI 2026 author PDF",
+  "source_url": "https://www.usenix.org/system/files/nsdi26-luo.pdf",
+  "source_commit": null,
+  "source_license": "paper reference; no source copied",
+  "component": "plex_paper_agentix",
+  "implements": ["schedule", "feedback"],
+  "policy_kernel": [
+    "group-level least attained service",
+    "waiting-to-service anti-starvation",
+    "feedback-maintained group service"
+  ],
+  "required_facts": ["waiting_ms", "service_us"],
+  "required_mechanics": [],
+  "deferred_mechanics": ["KV swap kernel", "multi-step engine execution", "full ATLAS DAG runtime"],
+  "evidence_level": "policy-kernel-reproduction",
+  "fixture_provenance": "independent implementation from the paper algorithm",
+  "validation_status": "passing"
+}

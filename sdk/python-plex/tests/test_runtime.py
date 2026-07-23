@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[3]
 POLICY = Path(
     os.environ.get(
         "PLEX_TEST_POLICY",
-        ROOT / "tests/policies/target/packages/plex_coordinated_v0_6.plexpkg",
+        ROOT / "tests/policies/target/packages/plex_coordinated.plexpkg",
     )
 )
 

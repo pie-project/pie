@@ -1,0 +1,9 @@
+{
+  "case": "preempted-and-ttl-priority",
+  "operation": "schedule",
+  "requests": [
+    {"request_id": "A", "preempted": false, "ttl_active": false, "program_arrival": 1},
+    {"request_id": "B", "preempted": true, "ttl_active": true, "program_arrival": 2}
+  ],
+  "capacity": {"max_requests": 1, "max_total_tokens": 4}
+}

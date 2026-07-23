@@ -1,34 +1,45 @@
-use plex::exports::pie::plex::policy::{Guest, Invocation, PolicyOutput};
-
-macro_rules! fallback_hooks {
-    () => {
-        fn admit(_: Invocation) -> Result<PolicyOutput, String> {
-            Err("fallback-required".into())
-        }
-        fn schedule(_: Invocation) -> Result<PolicyOutput, String> {
-            Err("fallback-required".into())
-        }
-        fn evict(_: Invocation) -> Result<PolicyOutput, String> {
-            Err("fallback-required".into())
-        }
-        fn feedback(_: Invocation) -> Result<PolicyOutput, String> {
-            Err("fallback-required".into())
-        }
-    };
-}
+use plex::exports::pie::plex::policy::*;
 
 struct InvalidSharedUpdate;
 
 impl Guest for InvalidSharedUpdate {
-    fn route(_: Invocation) -> Result<PolicyOutput, String> {
+    fn admit(_: AdmitInvocation) -> Result<AdmitOutput, PolicyError> {
+        Err(fallback())
+    }
+
+    fn route(input: RouteInvocation) -> Result<RouteOutput, PolicyError> {
         plex::link_host_interface();
-        Ok(PolicyOutput {
-            result_json: r#"{"scores":[0.0]}"#.into(),
-            state_update_json: r#"{"shared":[]}"#.into(),
+        Ok(RouteOutput {
+            plan: RoutePlan {
+                decisions: vec![RouteDecision::Defer; input.context.requests.len()],
+            },
+            state_update: StateUpdate {
+                shared: Some("[]".into()),
+                groups: Vec::new(),
+                requests: Vec::new(),
+            },
         })
     }
 
-    fallback_hooks!();
+    fn schedule(_: ScheduleInvocation) -> Result<ScheduleOutput, PolicyError> {
+        Err(fallback())
+    }
+
+    fn cache(_: CacheInvocation) -> Result<CacheOutput, PolicyError> {
+        Err(fallback())
+    }
+
+    fn feedback(_: FeedbackInvocation) -> Result<FeedbackOutput, PolicyError> {
+        Err(fallback())
+    }
+}
+
+fn fallback() -> PolicyError {
+    PolicyError {
+        code: "fallback-required".into(),
+        message: "operation is not implemented".into(),
+        details: "{}".into(),
+    }
 }
 
 plex::export!(InvalidSharedUpdate with_types_in plex);

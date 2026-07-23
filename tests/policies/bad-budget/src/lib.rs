@@ -1,16 +1,22 @@
-use plex::serde_json::json;
-use plex::{Document, Host, Policy, State};
+use plex::{Host, Policy, ScheduleContext, SchedulePlan, ScheduleSelection, State};
 
 struct BadBudget;
 
 impl Policy for BadBudget {
-    fn schedule(ctx: &Document, _state: &mut State, _host: &Host) -> Result<Document, String> {
-        let count = ctx["runnable"].as_array().map_or(0, Vec::len);
-        Ok(json!({
-            "decisions": (0..count)
-                .map(|_| json!({"score": 0.0, "token_budget": 999999}))
-                .collect::<Vec<_>>()
-        }))
+    fn schedule(
+        ctx: &ScheduleContext,
+        _state: &mut State,
+        _host: &Host,
+    ) -> plex::Result<SchedulePlan> {
+        Ok(SchedulePlan {
+            selections: (!ctx.runnable.is_empty())
+                .then(|| ScheduleSelection {
+                    requests: vec![0],
+                    token_budgets: vec![u32::MAX],
+                })
+                .into_iter()
+                .collect(),
+        })
     }
 }
 

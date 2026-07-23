@@ -1,35 +1,13 @@
-use plex::exports::pie::plex::policy::{Guest, Invocation, PolicyOutput};
+use plex::{Host, Policy, RouteContext, RouteDecision, RoutePlan, State};
 
-struct NonFinite;
+struct InvalidIndex;
 
-impl Guest for NonFinite {
-    fn route(_: Invocation) -> Result<PolicyOutput, String> {
-        output(r#"{"scores":[NaN]}"#)
-    }
-
-    fn admit(_: Invocation) -> Result<PolicyOutput, String> {
-        Err("fallback-required".into())
-    }
-
-    fn schedule(_: Invocation) -> Result<PolicyOutput, String> {
-        Err("fallback-required".into())
-    }
-
-    fn evict(_: Invocation) -> Result<PolicyOutput, String> {
-        output(r#"{"scores":[Infinity]}"#)
-    }
-
-    fn feedback(_: Invocation) -> Result<PolicyOutput, String> {
-        Err("fallback-required".into())
+impl Policy for InvalidIndex {
+    fn route(ctx: &RouteContext, _state: &mut State, _host: &Host) -> plex::Result<RoutePlan> {
+        Ok(RoutePlan {
+            decisions: vec![RouteDecision::Assign(u32::MAX); ctx.requests.len()],
+        })
     }
 }
 
-fn output(result_json: &str) -> Result<PolicyOutput, String> {
-    plex::link_host_interface();
-    Ok(PolicyOutput {
-        result_json: result_json.into(),
-        state_update_json: "{}".into(),
-    })
-}
-
-plex::export!(NonFinite with_types_in plex);
+plex::export_policy!(InvalidIndex);

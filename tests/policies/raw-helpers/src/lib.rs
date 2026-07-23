@@ -1,18 +1,35 @@
 use plex::serde_json::json;
-use plex::{Document, Host, Policy, State};
+use plex::{Host, Policy, RouteContext, RouteDecision, RoutePlan, State};
 
 struct RawHelpers;
 
 impl Policy for RawHelpers {
-    fn route(ctx: &Document, state: &mut State, host: &Host) -> Result<Document, String> {
+    fn route(ctx: &RouteContext, state: &mut State, host: &Host) -> plex::Result<RoutePlan> {
         let query = host.query_raw("engine.custom-query@1", &json!({"value": 7}))?;
-        let action_id = host.action_raw(
-            "engine.custom-action@1",
-            &json!({"request_id": ctx["request_id"]}),
-        )?;
-        state.shared["raw"] = json!({"query": query, "action_id": action_id});
-        let count = ctx["candidates"].as_array().map_or(0, Vec::len);
-        Ok(json!({"scores": vec![0.0; count]}))
+        let mut decisions = Vec::with_capacity(ctx.requests.len());
+        for (request_index, request) in ctx.requests.iter().enumerate() {
+            let edge = ctx
+                .feasible_edges
+                .iter()
+                .enumerate()
+                .find(|(_, edge)| edge.request_index as usize == request_index);
+            if let Some((index, edge)) = edge {
+                let target = &ctx.targets[edge.target_index as usize];
+                let action_id = host.action_raw(
+                    "pie.request.rebalance@1",
+                    &json!({
+                        "request_id": request.request.request_id.as_str(),
+                        "target_id": target.target_id.as_str(),
+                        "idempotency_key": format!("raw-{request_index}")
+                    }),
+                )?;
+                state.shared["raw"] = json!({"query": query, "action_id": action_id.0});
+                decisions.push(RouteDecision::Assign(index as u32));
+            } else {
+                decisions.push(RouteDecision::Defer);
+            }
+        }
+        Ok(RoutePlan { decisions })
     }
 }
 

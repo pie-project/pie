@@ -1,0 +1,22 @@
+{
+  "id": "continuum",
+  "title": "Continuum: Efficient and Robust Multi-Turn LLM Agent Scheduling with KV Cache Time-to-Live",
+  "paper_version": "arXiv 2511.02230",
+  "source_url": "https://arxiv.org/abs/2511.02230",
+  "source_commit": null,
+  "source_license": "paper reference; no source copied",
+  "component": "plex_paper_continuum",
+  "implements": ["schedule", "cache", "feedback"],
+  "policy_kernel": [
+    "preempted-first priority",
+    "TTL-pinned priority",
+    "group-level FCFS",
+    "TTL-aware cache retention"
+  ],
+  "required_facts": ["preempted", "program_arrival", "ttl_ms", "ttl_expired", "reload_cost"],
+  "required_mechanics": [],
+  "deferred_mechanics": ["tool parser", "offline TTL estimator", "physical KV pinning"],
+  "evidence_level": "policy-kernel-reproduction",
+  "fixture_provenance": "independent implementation from the paper algorithm",
+  "validation_status": "passing"
+}

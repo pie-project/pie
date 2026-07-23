@@ -1,0 +1,4 @@
+{
+  "reclaim_order": ["suffix", "fixed"],
+  "invariants": ["varying suffix precedes fixed prefix"]
+}

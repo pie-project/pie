@@ -1,35 +1,28 @@
 use plex::serde_json::json;
-use plex::{Document, Host, Policy, State};
+use plex::{Host, Policy, RouteContext, RouteDecision, RoutePlan, State};
 
 struct LeastLoaded;
 
 impl Policy for LeastLoaded {
-    fn route(ctx: &Document, state: &mut State, _host: &Host) -> Result<Document, String> {
+    fn route(ctx: &RouteContext, state: &mut State, _host: &Host) -> plex::Result<RoutePlan> {
         state.shared["route_owner_calls"] =
             json!(state.shared["route_owner_calls"].as_u64().unwrap_or(0) + 1);
-        let request_id = ctx["request_id"]
-            .as_str()
-            .ok_or("request_id must be a string")?;
-        let previous_target = state.request(request_id)?.facts()["previous_target"]
-            .as_str()
-            .map(str::to_owned);
-        let candidates = ctx["candidates"]
-            .as_array()
-            .ok_or("candidates must be an array")?;
-        let scores = candidates
+        let decisions = ctx
+            .requests
             .iter()
-            .map(|candidate| {
-                let queue = candidate["facts"]["queue_depth"].as_u64().unwrap_or(0) as f64;
-                let cached = candidate["facts"]["cached_tokens"].as_u64().unwrap_or(0) as f64;
-                let retained = previous_target.as_deref() == candidate["id"].as_str()
-                    && candidate["facts"]["has_request_kv"]
-                        .as_bool()
-                        .unwrap_or(false);
-                let locality = if retained { 1.0e12 } else { 0.0 };
-                locality + cached - queue
+            .enumerate()
+            .map(|(request_index, _)| {
+                ctx.feasible_edges
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, edge)| edge.request_index as usize == request_index)
+                    .min_by_key(|(_, edge)| edge.facts["queue_depth"].as_u64().unwrap_or(u64::MAX))
+                    .map_or(RouteDecision::Defer, |(index, _)| {
+                        RouteDecision::Assign(index as u32)
+                    })
             })
-            .collect::<Vec<_>>();
-        Ok(json!({"scores": scores}))
+            .collect();
+        Ok(RoutePlan { decisions })
     }
 }
 

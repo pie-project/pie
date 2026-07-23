@@ -1,0 +1,29 @@
+{
+  "id": "helium",
+  "title": "Efficient LLM Serving for Agentic Workflows: A Data Systems Perspective",
+  "paper_version": "arXiv 2603.16104",
+  "source_url": "https://arxiv.org/abs/2603.16104",
+  "source_commit": null,
+  "source_license": "paper reference; no source copied",
+  "component": "plex_paper_helium",
+  "implements": ["schedule"],
+  "policy_kernel": [
+    "ready-operator filtering",
+    "critical-path depth priority",
+    "cache-reuse benefit",
+    "earliest-start forced progress",
+    "profiled token-cost penalty"
+  ],
+  "required_facts": [
+    "ready",
+    "dependency_depth",
+    "prefix_reuse_tokens",
+    "earliest_start",
+    "profiled_token_cost"
+  ],
+  "required_mechanics": [],
+  "deferred_mechanics": ["query-plan rewrite", "proactive cache warming"],
+  "evidence_level": "policy-kernel-reproduction",
+  "fixture_provenance": "independent implementation from the paper algorithm",
+  "validation_status": "passing"
+}

@@ -1,31 +1,51 @@
 use plex::serde_json::json;
-use plex::{Document, Host, Policy, State};
+use plex::{Host, Policy, ScheduleContext, SchedulePlan, ScheduleSelection, State};
 
 struct AttainedService;
 
 impl Policy for AttainedService {
-    fn schedule(ctx: &Document, state: &mut State, _host: &Host) -> Result<Document, String> {
+    fn schedule(
+        ctx: &ScheduleContext,
+        state: &mut State,
+        _host: &Host,
+    ) -> plex::Result<SchedulePlan> {
         state.shared["working_set_size"] = json!(state.request_ids().count());
-        let request_ids = ctx["runnable"]
-            .as_array()
-            .ok_or("runnable must be an array")?
-            .iter()
-            .map(|candidate| {
-                candidate["request_id"]
-                    .as_str()
-                    .ok_or("runnable request_id must be a string")
-                    .map(str::to_owned)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut decisions = Vec::with_capacity(request_ids.len());
-        for request_id in request_ids {
-            let request = state.request_mut(&request_id)?;
-            let attained = request.facts()["attained_service"].as_u64().unwrap_or(0);
-            request.scratch["schedule_calls"] =
-                json!(request.scratch["schedule_calls"].as_u64().unwrap_or(0) + 1);
-            decisions.push(json!({"score": -(attained as f64)}));
+        let mut order = (0..ctx.runnable.len()).collect::<Vec<_>>();
+        order.sort_by_key(|&index| {
+            let request_id = ctx.runnable[index].request.request_id.as_str();
+            state
+                .request(request_id)
+                .ok()
+                .and_then(|request| request.facts()["attained_service"].as_u64())
+                .unwrap_or(0)
+        });
+        let mut remaining_requests = ctx.capacity.max_requests;
+        let mut remaining_tokens = ctx.capacity.max_total_tokens;
+        let mut selections = Vec::new();
+        for index in order {
+            if remaining_requests == 0 || remaining_tokens == 0 {
+                break;
+            }
+            let candidate = &ctx.runnable[index];
+            let budget = u64::from(candidate.max_token_budget).min(remaining_tokens) as u32;
+            state
+                .request_mut(candidate.request.request_id.as_str())?
+                .scratch["schedule_calls"] = json!(
+                state
+                    .request(candidate.request.request_id.as_str())?
+                    .scratch["schedule_calls"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    + 1
+            );
+            selections.push(ScheduleSelection {
+                requests: vec![index as u32],
+                token_budgets: vec![budget],
+            });
+            remaining_requests -= 1;
+            remaining_tokens -= u64::from(budget);
         }
-        Ok(json!({"decisions": decisions}))
+        Ok(SchedulePlan { selections })
     }
 }
 

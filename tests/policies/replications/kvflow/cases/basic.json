@@ -1,0 +1,8 @@
+{
+  "case": "varying-suffix-first",
+  "operation": "cache",
+  "resident": [
+    {"object_id": "fixed", "fixed_prefix": true, "steps_to_execution": 2},
+    {"object_id": "suffix", "fixed_prefix": false, "steps_to_execution": 0}
+  ]
+}

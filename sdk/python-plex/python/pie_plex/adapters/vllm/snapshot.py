@@ -1,11 +1,17 @@
 def schedule_event(scheduler):
     return {
-        "api_version": "pie.plex.engine@1",
-        "hook": "schedule",
+        "api_version": "pie.plex.engine@2",
+        "operation": "schedule",
         "context": {
+            "meta": {
+                "opportunity_id": scheduler.plex_opportunity_id(),
+                "snapshot": {"id": "host-filled", "revision": 0},
+                "attempt": scheduler.plex_attempt(),
+                "mechanics": [],
+            },
+            "cause": scheduler.plex_schedule_cause(),
             "runnable": scheduler.plex_runnable(),
             "capacity": scheduler.plex_capacity(),
-            "context": scheduler.plex_context(),
         },
-        "request_events": scheduler.plex_request_events(),
+        "lifecycle": scheduler.plex_lifecycle_events(),
     }

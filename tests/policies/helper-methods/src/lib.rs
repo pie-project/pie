@@ -1,36 +1,35 @@
 use plex::serde_json::json;
-use plex::{Document, Host, Policy, State};
+use plex::{Host, Policy, RouteContext, RouteDecision, RoutePlan, State};
 
 struct HelperMethods;
 
 impl Policy for HelperMethods {
-    fn route(ctx: &Document, state: &mut State, host: &Host) -> Result<Document, String> {
-        let request_id = ctx["request_id"]
-            .as_str()
-            .ok_or("request_id must be a string")?;
-        let target = ctx["candidates"][0]["id"]
-            .as_str()
-            .ok_or("candidate ID must be a string")?;
-        let lookup = host.kv_lookup(request_id, target)?;
-        let capacity = host.cluster_capacity("example-model")?;
-        let config = host.model_config()?;
-        let now_ms = host.now_ms()?;
-        let action_ids = [
-            host.prefetch_kv(request_id, target)?,
-            host.preempt(request_id)?,
-            host.replicate(request_id, &[target, "node-b"])?,
-            host.set_retention(request_id, 5000)?,
-            host.arm_timer(request_id, 10)?,
-        ];
-        state.shared["helpers"] = json!({
-            "lookup": lookup,
-            "capacity": capacity,
-            "config": config,
-            "now_ms": now_ms,
-            "action_ids": action_ids,
-        });
-        let count = ctx["candidates"].as_array().map_or(0, Vec::len);
-        Ok(json!({"scores": vec![0.0; count]}))
+    fn route(ctx: &RouteContext, state: &mut State, host: &Host) -> plex::Result<RoutePlan> {
+        let observation = host.query_raw(
+            "pie.cluster.capacity@1",
+            &json!({"model": "example-model"}),
+        )?;
+        let mut decisions = Vec::with_capacity(ctx.requests.len());
+        for (request_index, request) in ctx.requests.iter().enumerate() {
+            let edge = ctx
+                .feasible_edges
+                .iter()
+                .enumerate()
+                .find(|(_, edge)| edge.request_index as usize == request_index);
+            decisions.push(edge.map_or(RouteDecision::Defer, |(index, _)| {
+                RouteDecision::Assign(index as u32)
+            }));
+            if let Some(target) = edge.map(|(_, edge)| &ctx.targets[edge.target_index as usize]) {
+                let action = host.rebalance_request(
+                    request.request.request_id.as_str(),
+                    target.target_id.as_str(),
+                    &format!("helper-{request_index}"),
+                )?;
+                state.shared["helper_action"] = json!(action.0);
+            }
+        }
+        state.shared["helper_query"] = observation;
+        Ok(RoutePlan { decisions })
     }
 }
 

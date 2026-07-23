@@ -1,0 +1,10 @@
+{
+  "contract": {"major": 0, "minor": 6},
+  "replications": [
+    "agentix",
+    "continuum",
+    "kvflow",
+    "preble",
+    "helium"
+  ]
+}

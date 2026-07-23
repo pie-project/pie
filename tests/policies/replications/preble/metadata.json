@@ -1,0 +1,21 @@
+{
+  "id": "preble",
+  "title": "Preble: Efficient Distributed Prompt Scheduling for LLM Serving",
+  "paper_version": "arXiv 2407.00023",
+  "source_url": "https://arxiv.org/abs/2407.00023",
+  "source_commit": null,
+  "source_license": "paper reference; no source copied",
+  "component": "plex_paper_preble",
+  "implements": ["route"],
+  "policy_kernel": [
+    "E2 exploit when reusable prefix exceeds uncached prompt",
+    "longest-prefix exploitation",
+    "prompt-aware load and eviction-cost exploration"
+  ],
+  "required_facts": ["uncached_tokens", "cached_tokens", "load_cost", "eviction_cost"],
+  "required_mechanics": [],
+  "deferred_mechanics": ["prefix replication", "autoscaling"],
+  "evidence_level": "policy-kernel-reproduction",
+  "fixture_provenance": "independent implementation from the paper algorithm",
+  "validation_status": "passing"
+}
