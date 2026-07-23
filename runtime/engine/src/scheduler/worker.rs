@@ -1207,6 +1207,12 @@ impl DriverLane {
                     }
                     return LaneCommit::BindFinished { pipeline_id };
                 };
+                // Section timing (diagnostic, PIE_FIRE_TIMING): the boundary
+                // grinds ~1k of these controls against the frame seal; this
+                // breakdown names the engine-side payer next to the driver's
+                // own `cuda_bind` record.
+                let bind_probe = super::fire_timing_full();
+                let probe_t0 = bind_probe.then(Instant::now);
                 let registered = match Self::register_channel_set(driver, channels, &plans) {
                     Ok(registered) => registered,
                     Err(error) => {
@@ -1229,6 +1235,7 @@ impl DriverLane {
                     Self::release_wait_slots([bind.pacing_wait_id]);
                     return LaneCommit::BindFinished { pipeline_id };
                 }
+                let probe_t1 = bind_probe.then(Instant::now);
                 let program_registered = program.is_some();
                 if let Some(plan) = &program {
                     match driver.register_program(plan) {
@@ -1268,17 +1275,33 @@ impl DriverLane {
                     }
                     return LaneCommit::BindFinished { pipeline_id };
                 }
+                let probe_t2 = bind_probe.then(Instant::now);
                 match driver.bind_instance(&bind) {
-                    Ok(bound) => LaneCommit::BindInstance {
-                        pipeline_id,
-                        bound,
-                        respond: BindRespond::ChannelsBind {
-                            registered,
-                            program_id: bind.program_id,
-                            program_registered,
-                            response,
-                        },
-                    },
+                    Ok(bound) => {
+                        if let (Some(t0), Some(t1), Some(t2)) =
+                            (probe_t0, probe_t1, probe_t2)
+                        {
+                            super::fire_timing_write(&serde_json::json!({
+                                "schema": 1,
+                                "source": "scheduler",
+                                "event": "engine_bind_breakdown",
+                                "channels": plans.len(),
+                                "set_us": t1.duration_since(t0).as_micros() as u64,
+                                "program_us": t2.duration_since(t1).as_micros() as u64,
+                                "bind_us": t2.elapsed().as_micros() as u64,
+                            }));
+                        }
+                        LaneCommit::BindInstance {
+                            pipeline_id,
+                            bound,
+                            respond: BindRespond::ChannelsBind {
+                                registered,
+                                program_id: bind.program_id,
+                                program_registered,
+                                response,
+                            },
+                        }
+                    }
                     Err(error) => {
                         Self::rollback_channel_set(
                             driver,
