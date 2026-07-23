@@ -14,7 +14,11 @@ references point at code on the baseline branch.
 Pie's programming model assumes the host is much faster than a GPU forward
 pass: every wave, the host (scheduler plus guest inferlets) composes and
 submits the next batch. The current scheduler is a strict wait-all barrier
-(`runtime/engine/src/scheduler/quorum.rs`, `WaitAllPolicy`): a wave fires
+(`runtime/engine/src/scheduler/quorum.rs`, `WaitAllPolicy`; folded into
+`scheduler/frame.rs`'s `FramePolicy` by operator directive 2026-07-22 —
+every deployment including the default `PIE_FRAME_SIZE=1` now runs the
+frame policy, where a 1-slot frame is exactly this per-wave rule): a wave
+fires
 only when every active pipeline's next pass is submitted and ready, so when
 any CPU-side actor slows down — thousands of short inferlets, WASM
 instantiate pressure, a convoyed control lane — the whole fleet stalls on

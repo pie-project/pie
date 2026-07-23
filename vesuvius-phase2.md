@@ -235,3 +235,56 @@ median wave width 512. Results (vs same-session k=1): 2048×32 k2
 27.34–27.36k > k1 27.20k; 512×512 19.4–19.6k, 64×1536 7.36k, 16×1900
 3.70k — all ≥ k1 bands. Next (directed): unify the scheduler paths —
 route k=1 through FramePolicy and delete WaitAllPolicy.
+
+## Scheduler-path unification (operator directive — landed)
+
+The k==1 → legacy `WaitAllPolicy` fork is gone: every deployment,
+including the default `PIE_FRAME_SIZE=1`, runs `FramePolicy`
+(scheduler/quorum.rs deleted). A 1-slot frame IS a wave: at k=1 the
+worker synthesizes a per-fire stamp at admission (lane = the pipeline
+scope, seq = the globally monotonic fire id) — synthesis happens only on
+the accept path, so stamp coverage is exactly the old wait-set membership
+and rejected fires never touch the policy. Untracked/prebuilt fires stay
+unstamped riders. Folded into frame.rs: `configured_max_in_flight`
+(PIE_SCHED_MAX_IN_FLIGHT), the PIE_SCHED_COLD_HOLD_US lever, the
+structurally-full cold-hold bypass, and the quorum wave/cold-hold stats
+counters (rider batches count too). Deleted outright: readiness credits,
+`credit_published`, `quorum_generation`/`quorum_pid` (RV-20/W1 identity
+generations), `PipelineEpoch`/`WaveDecision`, `departed_pipelines`, the
+RETRY credit re-arm, the PreLaunchCopy retire-time credit handoff, the
+preview/decide two-phase, and the lane `Release` path — frames key
+everything by fire id plus explicit leave events, so the whole
+credit-accounting class has no successor.
+
+Three semantics were deliberately ported/repaired in the process:
+
+- **Async-control launch barrier**: frame dispatch picks launches by id,
+  so a fire enqueued behind a queued standalone copy / pool resize could
+  overtake it (caught by `launch_then_control_then_launch_preserves_
+  fifo_order` the first time the k=1 tests ran the frame path; latent at
+  k>1 too). The dispatch scan now stops candidate eligibility at the
+  first queued async control — quorum's composer rule.
+- **Shutdown drain**: the frame path used to reject queued fires at
+  stopping; quorum drained them. Stopping now bypasses the wait-all gate
+  and posts every accepted fire in queue order (per-lane ticket order is
+  queue order); only retrying fires reject at retirement.
+- **Post-terminate ghost lanes**: a stamped straggler rejected after its
+  process terminated no longer records a rejected-arrival — the record
+  would resurrect the purged lane as a permanently-missing member (fixes
+  a latent k>1 infinite hold).
+
+Gates: units 351/351 (24 quorum tests superseded by frame analogs; the
+WaitAllPolicy-specific credit tests rewritten as frame drop tests);
+oracles 15/15 token-exact (k=1 vs pre-unification k=1 dumps at t∈{1,2,
+15,16,17,31,32,33,256}; k=2/3 spot checks at t∈{16,32,256}); 3
+consecutive k=1 2048-fleets; zero retried fires (k1 168 waves, k2 188
+waves), zero watchdog. Perf (4090): k=1 2048×32 24.8–26.4k (median
+25.7k) vs pre-unification 23.7k — the geometry-split batching now
+applying at k=1 recovers the template-fix −3% and beats the historical
+24.5k band; k=1 c0/256 27.5k (was 27.2k), 512×512 19.6k; k=2 sanity
+23.0k / 27.4k in band. Cross-check vs pre-Vesuvius: charlie's canonical
+c0 shape (256 req, unlimited concurrency, 128 tok) measures 32.6k on the
+charlie build and 32.7k on this build same-day — zero cumulative
+regression across Phase 1 + Phase 2 + overlap + unification. (The
+34.27k in charlie's elastic-memory report does not reproduce on today's
+environment with either build; its delta is environmental.)

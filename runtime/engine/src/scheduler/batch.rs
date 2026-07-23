@@ -228,8 +228,6 @@ mod tests {
             prelaunch_copy: None,
             prelaunch_state_copy: None,
             retry_classifier: None,
-            credit_published: false,
-            quorum_generation: 0,
             frame: None,
             timing: None,
         }

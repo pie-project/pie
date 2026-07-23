@@ -1,7 +1,15 @@
-//! Vesuvius frame scheduling (k > 1): the **wait-for-all-active-lanes**
-//! quorum rule ([`super::quorum`]) lifted to frame granularity. Wait until
-//! every awaited lane's next FRAME is fully submitted, then seal the dense
-//! epoch and dispatch its k waves in slot order.
+//! Vesuvius frame scheduling — THE scheduler policy: the
+//! **wait-for-all-active-lanes** quorum rule at frame granularity. Wait
+//! until every awaited lane's next FRAME is fully submitted, then seal the
+//! dense epoch and dispatch its k waves in slot order.
+//!
+//! Every deployment routes here, including the default `PIE_FRAME_SIZE=1`:
+//! a 1-slot frame IS a wave, so k = 1 reproduces the per-wave wait-all
+//! barrier (each tracked fire arrives as its own single-fire frame; a seal
+//! boundary is a wave boundary). The former per-wave `WaitAllPolicy`
+//! (scheduler/quorum.rs) was this policy specialized to k = 1 and is folded
+//! in — its run-ahead depth lever, cold hold, and watchdog constants live
+//! here now.
 //!
 //! A *frame* is k consecutive waves submitted as one unit per lane: the guest
 //! supplies exactly k ordered slots (`forward.submit`), slot i executes in
@@ -42,9 +50,40 @@
 //! `on_fire_dropped` (rejected while queued).
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use super::stats::SchedulerStats;
 use crate::scheduler::ProcessId;
+
+/// Default run-ahead depth: one batch computing plus one prefetched.
+/// The N9 depth dose-response superseded the older depth-3 default:
+/// depth 2 reduced missing/deferred enough to win steady throughput in
+/// all three paired production-shape runs while retaining pre-enqueue.
+/// `PIE_SCHED_MAX_IN_FLIGHT` may reduce this; depth above three is
+/// intentionally capped because the CUDA driver sizes its pinned staging
+/// pools from this value (`kSchedulerMaxInFlight` in
+/// driver/cuda/src/runahead.hpp — staging depth must EXCEED run-ahead,
+/// so raising this without raising that re-serializes every submit).
+const DEFAULT_MAX_IN_FLIGHT: usize = 2;
+const MAX_IN_FLIGHT: usize = 3;
+
+/// Reads the requested run-ahead depth once. Dispatch-time preparation is the
+/// allocation-credit gate: physical pool allocation is atomic, and an
+/// exhausted request remains a retrying preparation rather than overcommitting.
+fn parse_max_in_flight(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MAX_IN_FLIGHT)
+        .clamp(1, MAX_IN_FLIGHT)
+}
+
+pub(super) fn configured_max_in_flight() -> usize {
+    static CONFIGURED: OnceLock<usize> = OnceLock::new();
+    *CONFIGURED.get_or_init(|| {
+        parse_max_in_flight(std::env::var("PIE_SCHED_MAX_IN_FLIGHT").ok().as_deref())
+    })
+}
 
 /// The frame identity one fire carries from `forward.submit`: which lane
 /// (pipeline scope), which frame of that lane, which wave slot, and how many
@@ -59,8 +98,21 @@ pub struct FrameStamp {
 
 /// Bootstrap gather window before the FIRST seal of an assembly episode, so
 /// a co-launched fleet's first frames land in one sealed epoch instead of a
-/// narrow head frame. Same constant/lever as the quorum cold hold.
+/// narrow head frame.
 const COLD_HOLD_US: u64 = 2_000;
+
+fn cold_hold() -> Duration {
+    static HOLD: OnceLock<Duration> = OnceLock::new();
+    *HOLD.get_or_init(|| {
+        Duration::from_micros(
+            std::env::var("PIE_SCHED_COLD_HOLD_US")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(COLD_HOLD_US)
+                .max(1),
+        )
+    })
+}
 
 /// Liveness watchdog for a blocked gather. Report-only, exactly as in the
 /// per-wave quorum: it never removes a member and never fires a narrow
@@ -159,10 +211,17 @@ pub(super) struct FramePolicy {
     strict_watchdog_deadline: Option<Instant>,
     cold_hold_deadline: Option<Instant>,
     ever_sealed: bool,
+    /// Probe sink (`profile-fire` wave counters); `None` in unit tests.
+    stats: Option<Arc<SchedulerStats>>,
 }
 
 impl FramePolicy {
-    pub fn new(k: usize, max_wave_rows: usize, max_wave_tokens: usize) -> Self {
+    pub fn new(
+        k: usize,
+        max_wave_rows: usize,
+        max_wave_tokens: usize,
+        stats: Option<Arc<SchedulerStats>>,
+    ) -> Self {
         Self {
             k,
             max_wave_tokens,
@@ -173,7 +232,15 @@ impl FramePolicy {
             strict_watchdog_deadline: None,
             cold_hold_deadline: None,
             ever_sealed: false,
+            stats,
         }
+    }
+
+    /// Whether this deployment runs 1-slot frames (`PIE_FRAME_SIZE=1`, the
+    /// default): a frame is a wave, and the worker synthesizes a per-fire
+    /// stamp at admission instead of the guest submitting frames.
+    pub fn single_slot(&self) -> bool {
+        self.k == 1
     }
 
     /// A stamped fire was accepted into the scheduler queue.
@@ -378,21 +445,26 @@ impl FramePolicy {
             self.cold_hold_deadline = None;
             return None;
         }
-        if !self.ever_sealed {
+        let mut cold_hold_fired = false;
+        if !self.ever_sealed && !self.structurally_full() {
             // Bootstrap gather: membership is still forming (the wait-set
             // has only the lanes that already submitted), so "all ready" is
             // trivially true. Hold the first seal briefly so a co-launched
-            // fleet lands in one epoch.
+            // fleet lands in one epoch. A structurally full wave fires
+            // immediately even cold — it didn't run out of patience, it ran
+            // out of room.
             match self.cold_hold_deadline {
                 None => {
-                    let hold = Duration::from_micros(COLD_HOLD_US);
+                    let hold = cold_hold();
                     self.cold_hold_deadline = Some(now + hold);
                     return Some(FramePlan::Hold(hold));
                 }
                 Some(deadline) if now < deadline => {
                     return Some(FramePlan::Hold(deadline - now));
                 }
-                Some(_) => {}
+                Some(_) => {
+                    cold_hold_fired = true;
+                }
             }
         }
         self.cold_hold_deadline = None;
@@ -454,6 +526,11 @@ impl FramePolicy {
             sealed_any = true;
             self.ever_sealed = true;
             served.extend(members.iter().copied());
+            self.record_sealed_waves(
+                waves.iter().filter(|wave| !wave.is_empty()).count(),
+                cold_hold_fired,
+            );
+            cold_hold_fired = false;
             let wave_count = waves.len();
             self.sealed.push_back(SealedFrame {
                 waves,
@@ -468,6 +545,63 @@ impl FramePolicy {
         self.lanes
             .retain(|_, lane| lane.awaited || !lane.frames.is_empty());
         sealed_any.then(|| FramePlan::Dispatch(Vec::new()))
+    }
+
+    /// Structural capacity: a wave of the ready front frames already
+    /// saturates a per-wave budget, so gathering longer cannot widen it —
+    /// the bootstrap cold hold is bypassed (the wave didn't run out of
+    /// patience; it ran out of room).
+    fn structurally_full(&self) -> bool {
+        let mut wave_rows = vec![0usize; self.k];
+        let mut wave_tokens = vec![0usize; self.k];
+        for lane in self.lanes.values() {
+            let Some(front) = lane.frames.front() else {
+                continue;
+            };
+            if !front.is_complete() {
+                continue;
+            }
+            for fire in front.fires.iter().filter(|fire| fire.fire_id.is_some()) {
+                let wave = (fire.slot as usize).min(self.k - 1);
+                wave_rows[wave] += fire.rows.max(1);
+                wave_tokens[wave] += fire.tokens;
+                if wave_rows[wave] >= self.max_wave_rows
+                    || wave_tokens[wave] >= self.max_wave_tokens
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// An unstamped rider batch posted outside the sealed waves: it is
+    /// still one wave fire for the density counters (the per-wave quorum
+    /// counted untracked-only batches the same way).
+    pub fn record_rider_wave(&self) {
+        self.record_sealed_waves(1, false);
+    }
+
+    /// Wave-density probe counters (the former quorum `record_wave`/
+    /// `record_clause`): `avg_active = wave_active_sum / wave_fires`
+    /// discriminates a persistent wait-set from one that empties between
+    /// fires. A seal never fires with a missing awaited lane (the wait-all
+    /// gate held), so `wave_missing_sum` stays 0 by construction.
+    fn record_sealed_waves(&self, wave_count: usize, cold_hold_fired: bool) {
+        if let Some(stats) = &self.stats {
+            use std::sync::atomic::Ordering::Relaxed;
+            let awaited = self.lanes.values().filter(|lane| lane.awaited).count() as u64;
+            let waves = wave_count as u64;
+            stats.fire.quorum.wave_fires.fetch_add(waves, Relaxed);
+            stats
+                .fire
+                .quorum
+                .wave_active_sum
+                .fetch_add(awaited * waves, Relaxed);
+            if cold_hold_fired {
+                stats.fire.quorum.cold_hold_fires.fetch_add(1, Relaxed);
+            }
+        }
     }
 
     /// Advance one sealed frame's open wave past empty/fully-resolved waves.
@@ -655,9 +789,6 @@ impl FramePolicy {
                 .map(|deadline| deadline.saturating_duration_since(Instant::now())),
         );
         for (pid, lane) in &self.lanes {
-            if lane.frames.is_empty() {
-                continue;
-            }
             let front_complete = lane
                 .frames
                 .front()
@@ -710,8 +841,75 @@ mod tests {
     }
 
     #[test]
+    fn max_in_flight_configuration_is_truthful_and_safely_capped() {
+        assert_eq!(parse_max_in_flight(None), DEFAULT_MAX_IN_FLIGHT);
+        assert_eq!(parse_max_in_flight(Some("0")), 1);
+        assert_eq!(parse_max_in_flight(Some("4")), MAX_IN_FLIGHT);
+        assert_eq!(parse_max_in_flight(Some("invalid")), DEFAULT_MAX_IN_FLIGHT);
+        assert!(configured_max_in_flight() >= 1);
+    }
+
+    /// A structurally full wave bypasses the bootstrap cold hold — the
+    /// reason every pre-existing worker.rs unit test (which all run at row
+    /// budget 1) observes no gather delay on the unified k = 1 path.
+    #[test]
+    fn structural_cap_seals_immediately_even_cold() {
+        let mut policy = FramePolicy::new(1, 1, 4096, None);
+        let lane = pid();
+        policy.on_fire_enqueued(stamp(lane, 0, 0, 1), Some(lane), 7, 1, 1);
+        let queued: HashSet<u64> = [7].into_iter().collect();
+        assert_eq!(
+            policy.plan_dispatch(&queued, Instant::now()),
+            FramePlan::Dispatch(vec![7]),
+            "a full wave must seal with no cold-hold delay"
+        );
+    }
+
+    /// The bootstrap gather at k = 1: two lanes' first single-slot frames
+    /// hold through the cold window, then seal as ONE dense wave (the former
+    /// per-wave quorum's `cold_hold_gathers_two_pipelines_then_fires_dense`).
+    #[test]
+    fn bootstrap_cold_hold_gathers_single_slot_lanes_then_seals_dense() {
+        let mut policy = FramePolicy::new(1, 64, 4096, None);
+        let (a, b) = (pid(), pid());
+        // Single-slot stamps as the worker synthesizes them at k = 1:
+        // seq = the fire id, slot 0, one fire per frame.
+        policy.on_fire_enqueued(stamp(a, 10, 0, 1), Some(a), 10, 1, 1);
+        policy.on_fire_enqueued(stamp(b, 11, 0, 1), Some(b), 11, 1, 1);
+        let queued: HashSet<u64> = [10, 11].into_iter().collect();
+        let t0 = Instant::now();
+        let FramePlan::Hold(hold) = policy.plan_dispatch(&queued, t0) else {
+            panic!("bootstrap membership is forming: the cold hold must arm");
+        };
+        let FramePlan::Dispatch(wave) =
+            policy.plan_dispatch(&queued, t0 + hold + Duration::from_micros(1))
+        else {
+            panic!("past the window the epoch must seal");
+        };
+        assert_eq!(wave.len(), 2, "dense: both lanes' fires in one wave");
+        policy.on_fires_posted(&wave);
+        policy.on_fire_retired(10, false);
+        policy.on_fire_retired(11, false);
+
+        // Steady state: `a` resubmits, `b` does not — the wave holds.
+        policy.on_fire_enqueued(stamp(a, 12, 0, 1), Some(a), 12, 1, 1);
+        let queued: HashSet<u64> = [12].into_iter().collect();
+        match policy.plan_dispatch(&queued, Instant::now()) {
+            FramePlan::Hold(_) => {}
+            plan => panic!("wait-all must hold for the idle lane, got {plan:?}"),
+        }
+        // `b`'s next fire arrives: the wave seals dense, no cold hold.
+        policy.on_fire_enqueued(stamp(b, 13, 0, 1), Some(b), 13, 1, 1);
+        let queued: HashSet<u64> = [12, 13].into_iter().collect();
+        let FramePlan::Dispatch(next) = policy.plan_dispatch(&queued, Instant::now()) else {
+            panic!("all lanes ready: the steady-state wave must seal");
+        };
+        assert_eq!(next.len(), 2);
+    }
+
+    #[test]
     fn seals_complete_lanes_and_orders_waves_by_slot() {
-        let mut policy = FramePolicy::new(4, 64, 4096);
+        let mut policy = FramePolicy::new(4, 64, 4096, None);
         let (a, b) = (pid(), pid());
         // Lane a: full decode frame (4 fires). Lane b: chunk in slot 0 only.
         for slot in 0..4 {
@@ -743,7 +941,7 @@ mod tests {
     /// DENSE with every lane in.
     #[test]
     fn incomplete_lane_holds_the_seal_until_it_completes() {
-        let mut policy = FramePolicy::new(2, 64, 4096);
+        let mut policy = FramePolicy::new(2, 64, 4096, None);
         let (fast, slow) = (pid(), pid());
         policy.on_fire_enqueued(stamp(fast, 0, 0, 2), Some(fast), 1, 1, 1);
         policy.on_fire_enqueued(stamp(fast, 0, 1, 2), Some(fast), 2, 1, 1);
@@ -776,7 +974,7 @@ mod tests {
 
     #[test]
     fn retry_becomes_makeup_and_gates_wave_advance() {
-        let mut policy = FramePolicy::new(2, 64, 4096);
+        let mut policy = FramePolicy::new(2, 64, 4096, None);
         let lane = pid();
         policy.on_fire_enqueued(stamp(lane, 0, 0, 2), Some(lane), 10, 1, 1);
         policy.on_fire_enqueued(stamp(lane, 0, 1, 2), Some(lane), 11, 1, 1);
@@ -808,7 +1006,7 @@ mod tests {
     /// wave-ordered.
     #[test]
     fn frames_overlap_across_the_boundary() {
-        let mut policy = FramePolicy::new(2, 64, 4096);
+        let mut policy = FramePolicy::new(2, 64, 4096, None);
         let (a, b) = (pid(), pid());
         policy.on_fire_enqueued(stamp(a, 0, 0, 2), Some(a), 50, 1, 1);
         policy.on_fire_enqueued(stamp(a, 0, 1, 2), Some(a), 51, 1, 1);
@@ -854,7 +1052,7 @@ mod tests {
 
     #[test]
     fn frame_waves_post_back_to_back_without_retirement() {
-        let mut policy = FramePolicy::new(3, 64, 4096);
+        let mut policy = FramePolicy::new(3, 64, 4096, None);
         let lane = pid();
         for slot in 0..3 {
             policy.on_fire_enqueued(stamp(lane, 0, slot, 3), Some(lane), 30 + slot as u64, 1, 1);
@@ -884,7 +1082,7 @@ mod tests {
 
     #[test]
     fn retry_replays_wave_ordered_makeups() {
-        let mut policy = FramePolicy::new(2, 64, 4096);
+        let mut policy = FramePolicy::new(2, 64, 4096, None);
         let lane = pid();
         policy.on_fire_enqueued(stamp(lane, 0, 0, 2), Some(lane), 40, 1, 1);
         policy.on_fire_enqueued(stamp(lane, 0, 1, 2), Some(lane), 41, 1, 1);
@@ -928,7 +1126,7 @@ mod tests {
 
     #[test]
     fn dropped_fires_resolve_and_leave_rearms_the_gather() {
-        let mut policy = FramePolicy::new(2, 64, 4096);
+        let mut policy = FramePolicy::new(2, 64, 4096, None);
         let lane = pid();
         policy.on_fire_enqueued(stamp(lane, 0, 0, 2), Some(lane), 20, 1, 1);
         policy.on_fire_enqueued(stamp(lane, 0, 1, 2), Some(lane), 21, 1, 1);
@@ -954,7 +1152,7 @@ mod tests {
 
     #[test]
     fn truncated_frame_seals_with_submitted_fires_only() {
-        let mut policy = FramePolicy::new(4, 64, 4096);
+        let mut policy = FramePolicy::new(4, 64, 4096, None);
         let lane = pid();
         policy.on_fire_enqueued(stamp(lane, 0, 0, 4), Some(lane), 30, 1, 1);
         policy.on_fire_enqueued(stamp(lane, 0, 1, 4), Some(lane), 31, 1, 1);
@@ -974,7 +1172,7 @@ mod tests {
     fn over_budget_lane_is_served_in_the_same_round() {
         // Wave budget of 40 tokens: lane a's 37-token chunk fits, lane b's
         // additional 37 does not.
-        let mut policy = FramePolicy::new(2, 64, 40);
+        let mut policy = FramePolicy::new(2, 64, 40, None);
         let (a, b) = {
             let (x, y) = (pid(), pid());
             if x < y { (x, y) } else { (y, x) }
@@ -1007,7 +1205,7 @@ mod tests {
     /// an executed lane is still thinking.
     #[test]
     fn next_epoch_waits_for_every_awaited_lane() {
-        let mut policy = FramePolicy::new(2, 64, 4096);
+        let mut policy = FramePolicy::new(2, 64, 4096, None);
         let (a, b) = (pid(), pid());
         policy.on_fire_enqueued(stamp(a, 0, 0, 2), Some(a), 60, 1, 1);
         policy.on_fire_enqueued(stamp(a, 0, 1, 2), Some(a), 61, 1, 1);
@@ -1050,7 +1248,7 @@ mod tests {
     /// lane leaves the wait-set immediately and the fleet seals without it.
     #[test]
     fn graceful_close_releases_the_wait() {
-        let mut policy = FramePolicy::new(2, 64, 4096);
+        let mut policy = FramePolicy::new(2, 64, 4096, None);
         let (a, b) = (pid(), pid());
         policy.on_fire_enqueued(stamp(a, 0, 0, 1), Some(a), 90, 1, 1);
         policy.on_fire_enqueued(stamp(b, 0, 0, 1), Some(b), 91, 1, 1);
@@ -1083,7 +1281,7 @@ mod tests {
     /// per-wave quorum.
     #[test]
     fn pending_binds_hold_the_seal_until_assembly_completes() {
-        let mut policy = FramePolicy::new(2, 64, 4096);
+        let mut policy = FramePolicy::new(2, 64, 4096, None);
         let lane = pid();
         let binder = pid();
         policy.on_fire_enqueued(stamp(lane, 0, 0, 1), Some(lane), 95, 1, 1);
@@ -1102,7 +1300,7 @@ mod tests {
 
     #[test]
     fn terminate_purges_queued_frames_close_keeps_them() {
-        let mut policy = FramePolicy::new(2, 64, 4096);
+        let mut policy = FramePolicy::new(2, 64, 4096, None);
         let (closed, terminated) = (pid(), pid());
         let owner = pid();
         policy.on_fire_enqueued(stamp(closed, 0, 0, 1), Some(owner), 50, 1, 1);

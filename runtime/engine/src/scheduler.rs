@@ -3,7 +3,7 @@
 //! - [`worker`]: `BatchScheduler` — the per-driver run loop (accumulate,
 //!   decide, dispatch, retire). The only public submodule (external crates
 //!   construct `worker::BatchScheduler` directly for host-driver test
-//!   harnesses); `batch`/`dispatch`/`probe`/`quorum`/`stats`/`wire` are
+//!   harnesses); `batch`/`dispatch`/`frame`/`probe`/`stats`/`wire` are
 //!   internal.
 //! - `batch`: capacity accounting + the dense-batch accumulator.
 //! - `dispatch`: the driver ABI's per-`driver_id` verbs (`register_program`,
@@ -11,7 +11,8 @@
 //!   module's root since they call [`scheduler_handle`], which is
 //!   scheduler-owned state.
 //! - `wire`: owned `LaunchPlan`s -> the batched wire request, page-trim.
-//! - `quorum`: the wait-all-active-pipelines fire rule.
+//! - `frame`: the wait-all-active-lanes frame fire rule (every k,
+//!   including the default single-slot k = 1).
 //! - `stats`: `SchedulerStats` (per-driver, lock-free) + [`AggregateStats`]
 //!   (cross-driver, this module's `get_stats`).
 //! - `probe`: per-fire lifecycle probes (`profile-fire` feature).
@@ -25,7 +26,6 @@ pub(crate) mod batch;
 pub(crate) mod dispatch;
 pub(crate) mod frame;
 pub(crate) mod probe;
-pub(crate) mod quorum;
 pub(crate) mod stats;
 pub(crate) mod wire;
 pub mod worker;
@@ -52,7 +52,7 @@ use worker::SchedulerHandle;
 
 use crate::driver::DriverId;
 
-/// Process identity the scheduler and quorum rule track (co-batch
+/// Process identity the scheduler and wait-all fire rule track (co-batch
 /// membership, wait-set keys). Kept as the leaf `uuid::Uuid` representation
 /// so the scheduler stays below the guest runtime in the layering.
 pub type ProcessId = uuid::Uuid;
@@ -175,7 +175,7 @@ pub fn configured_frame_size() -> usize {
 // =============================================================================
 
 /// Whether the scheduler fire trace is enabled. Read once (cached, like
-/// `quorum::max_in_flight`'s env lever) — MUST be set before the first fire
+/// `frame::configured_max_in_flight`'s env lever) — MUST be set before the first fire
 /// (before boot), since later env mutations are never re-observed. `worker`
 /// checks this before doing any per-fire trace bookkeeping (e.g. the
 /// distinct-program count), so tracing off costs nothing on the hot path.
