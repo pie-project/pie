@@ -175,6 +175,7 @@ logs
 # Locally archived Markdown documents.
 /docs/
 # No MCP files
+/.mcp.json
 .memory-bank
 # raw eval data
 cuda-protocol-tests*
