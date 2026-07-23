@@ -135,6 +135,25 @@ fully device-composed batches (`all_decode_envelopes`); mixed batches
 always resolve real geometry through the fallback — which at wave 0 of a
 strict round observes only drained state and never retries.
 
+## M1e — geometry-homogeneous frame batches; where chaining stands
+
+After the template fix, chained churn runs are correctness-clean (zero
+retries, exact parity) but still slow: the mixed wave-0's descriptor
+fallback synchronizes the compute stream. The frame dispatch path now
+splits each wave's launches by geometry class (wire chunks vs
+device-resolved decodes), so no frame batch ever takes the fallback —
+yet chain=3 on 2048×32 stays ~14.5k vs chain=1's 21.4k with identical
+width and zero retries. The remaining chain>1 × churn interaction
+(round-partitioned epochs + deep chaining slow the stream even when
+nothing bounces) is unexplained and parked as an M2 diagnosis item.
+
+**Resulting deployment guidance (static constants, the page-size
+pattern):** stable decode fleets deploy `PIE_FRAME_CHAIN=3` — c0/256
+26.5k (−3% vs k=1), 512×512 19.3k (parity), 64×1536 7.3k (parity),
+16×1900 3.69k (+3%). Churny short-output fleets deploy `PIE_FRAME_CHAIN=1
+PIE_FRAME_GATHER_US=20000` — 2048×32 21.4–22.0k (+29–32% over Phase 1's
+16.6k, −12% vs k=1's 24.5k).
+
 ## Scoped next milestones
 
 - **M2 — frame-boundary settlement**: keep per-wave publication (mirror
@@ -158,6 +177,35 @@ strict round observes only drained state and never retries.
   `cudaGraphExecKernelNodeSetParams` per `forward.hpp:78-83`). Independent
   of M1–M3; only worth it if chunk-wave launch overhead shows up after
   they land.
+
+## Validation of record (final battery, k=16 chain=3 gather=20 ms)
+
+- Engine unit tests 373/373 (three new frame tests: chain depth, wave-
+  ordered makeups, straggler re-merge; plus the gather-hold test).
+- CUDA greedy oracles t ∈ {31, 32, 33, 256}: exact token parity vs the
+  stored k=1 baseline dumps, 4/4.
+- 2048-request fleets: 3 consecutive completions at chain=3 and 3+ at
+  chain=1+gather (every probe/instr run completed; zero failures).
+- Zero retried fires in the instrumented post-fix runs on both shapes;
+  zero `frame_wait_watchdog` reports.
+- k=1 quorum path: c0/256 27.3k (band 27.2–27.3k ✓). 2048×32 moved
+  24.5k → 23.7–23.9k (−3%) — and the instrumented run shows why this is
+  the fix, not a regression: k=1's habitual **3,588 retried fires per
+  run dropped to 0** (172 → 165 waves). The template bug was silently
+  containment-killing lanes in k=1's mixed waves all along, masked as
+  "normal" retries; post-fix those waves take the descriptor fallback,
+  whose compute-stream sync costs slightly more than the retry waste
+  did. Porting the frame path's geometry-homogeneous batching to the
+  quorum path (removing the sync) is the follow-up that should put k=1
+  above its old band.
+
+| Shape (k=16) | Phase 1 (wait-all) | Phase 2 best | config | k=1 |
+|---|---:|---:|---|---:|
+| 2048×32 c512 | 16.1–17.0k | **21.4–22.0k** | chain1+gather20 | 24.5k |
+| c0/256 | 22.1k | **26.4–26.7k** | chain3 | 27.3k |
+| 512×512 | 16.8k | **19.3k** | chain3 | 19.3k |
+| 64×1536 | 6.9k | **7.3k** | chain3 | 7.3k |
+| 16×1900 | 3.51k | **3.69k** | chain3 | 3.57k |
 
 ## Known-inherent residuals (not Phase 2 targets)
 
