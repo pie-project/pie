@@ -31,11 +31,12 @@ impl Policy for Continuum {
                 index,
             )
         });
+        let mut remaining_selections = ctx.capacity.max_selections;
         let mut remaining_requests = ctx.capacity.max_requests;
         let mut remaining_tokens = ctx.capacity.max_total_tokens;
         let mut selections = Vec::new();
         for index in order {
-            if remaining_requests == 0 || remaining_tokens == 0 {
+            if remaining_selections == 0 || remaining_requests == 0 || remaining_tokens == 0 {
                 break;
             }
             let budget =
@@ -44,6 +45,7 @@ impl Policy for Continuum {
                 requests: vec![index as u32],
                 token_budgets: vec![budget],
             });
+            remaining_selections -= 1;
             remaining_requests -= 1;
             remaining_tokens -= u64::from(budget);
         }
@@ -85,11 +87,7 @@ impl Policy for Continuum {
         })
     }
 
-    fn feedback(
-        ctx: &FeedbackContext,
-        state: &mut State,
-        _host: &Host,
-    ) -> plex::Result<()> {
+    fn feedback(ctx: &FeedbackContext, state: &mut State, _host: &Host) -> plex::Result<()> {
         for record in &ctx.records {
             let FeedbackSubject::Request(request_id) = &record.subject else {
                 continue;

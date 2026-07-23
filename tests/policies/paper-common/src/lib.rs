@@ -243,8 +243,9 @@ impl Policy for RagCache {
                     .unwrap_or(0);
                 let age = resident.object.facts["age"].as_u64().unwrap_or(0);
                 (
-                    age.saturating_add(cost.saturating_mul(frequency))
-                        / resident.object.size_bytes.max(1),
+                    age.saturating_add(
+                        cost.saturating_mul(frequency) / resident.object.size_bytes.max(1),
+                    ),
                     *index,
                 )
             })
@@ -922,7 +923,7 @@ impl Policy for SMetric {
     fn route(ctx: &RouteContext, _state: &mut State, host: &Host) -> plex::Result<RoutePlan> {
         let mut decisions = Vec::new();
         for (request_index, request) in ctx.requests.iter().enumerate() {
-            let followup = request.facts["generation_id"].as_u64().unwrap_or(0) > 0;
+            let followup = request.request.generation_id > 0;
             let selected = ctx
                 .feasible_edges
                 .iter()
@@ -1279,11 +1280,12 @@ impl Policy for RouteBalance {
 }
 
 fn select_singletons(ctx: &ScheduleContext, order: Vec<usize>) -> SchedulePlan {
+    let mut remaining_selections = ctx.capacity.max_selections;
     let mut remaining_requests = ctx.capacity.max_requests;
     let mut remaining_tokens = ctx.capacity.max_total_tokens;
     let mut selections = Vec::new();
     for index in order {
-        if remaining_requests == 0 || remaining_tokens == 0 {
+        if remaining_selections == 0 || remaining_requests == 0 || remaining_tokens == 0 {
             break;
         }
         let budget = u64::from(ctx.runnable[index].max_token_budget).min(remaining_tokens) as u32;
@@ -1291,6 +1293,7 @@ fn select_singletons(ctx: &ScheduleContext, order: Vec<usize>) -> SchedulePlan {
             requests: vec![index as u32],
             token_budgets: vec![budget],
         });
+        remaining_selections -= 1;
         remaining_requests -= 1;
         remaining_tokens -= u64::from(budget);
     }

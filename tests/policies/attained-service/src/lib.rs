@@ -19,11 +19,12 @@ impl Policy for AttainedService {
                 .and_then(|request| request.facts()["attained_service"].as_u64())
                 .unwrap_or(0)
         });
+        let mut remaining_selections = ctx.capacity.max_selections;
         let mut remaining_requests = ctx.capacity.max_requests;
         let mut remaining_tokens = ctx.capacity.max_total_tokens;
         let mut selections = Vec::new();
         for index in order {
-            if remaining_requests == 0 || remaining_tokens == 0 {
+            if remaining_selections == 0 || remaining_requests == 0 || remaining_tokens == 0 {
                 break;
             }
             let candidate = &ctx.runnable[index];
@@ -42,6 +43,7 @@ impl Policy for AttainedService {
                 requests: vec![index as u32],
                 token_budgets: vec![budget],
             });
+            remaining_selections -= 1;
             remaining_requests -= 1;
             remaining_tokens -= u64::from(budget);
         }

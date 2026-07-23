@@ -1,8 +1,8 @@
 use plex::serde_json::json;
 use plex::{
-    AdmitContext, AdmitPlan, AdmissionDecision, CacheAdmission, CacheContext, CachePlan,
-    FeedbackContext, FeedbackSubject, Host, Policy, RouteContext, RouteDecision, RoutePlan,
-    OutcomeKind, ScheduleContext, SchedulePlan, ScheduleSelection, State,
+    AdmissionDecision, AdmitContext, AdmitPlan, CacheAdmission, CacheContext, CachePlan,
+    FeedbackContext, FeedbackSubject, Host, OutcomeKind, Policy, RouteContext, RouteDecision,
+    RoutePlan, ScheduleContext, SchedulePlan, ScheduleSelection, State,
 };
 
 struct Coordinated;
@@ -25,8 +25,7 @@ impl Policy for Coordinated {
             request.fields["last_hook"] = json!("admit");
             decisions.push(decision);
         }
-        state.shared["admit_calls"] =
-            json!(state.shared["admit_calls"].as_u64().unwrap_or(0) + 1);
+        state.shared["admit_calls"] = json!(state.shared["admit_calls"].as_u64().unwrap_or(0) + 1);
         Ok(AdmitPlan { decisions })
     }
 
@@ -81,8 +80,7 @@ impl Policy for Coordinated {
                 )?;
             }
         }
-        state.shared["route_calls"] =
-            json!(state.shared["route_calls"].as_u64().unwrap_or(0) + 1);
+        state.shared["route_calls"] = json!(state.shared["route_calls"].as_u64().unwrap_or(0) + 1);
         Ok(RoutePlan { decisions })
     }
 
@@ -91,11 +89,12 @@ impl Policy for Coordinated {
         state: &mut State,
         host: &Host,
     ) -> plex::Result<SchedulePlan> {
+        let mut remaining_selections = ctx.capacity.max_selections;
         let mut remaining_requests = ctx.capacity.max_requests;
         let mut remaining_tokens = ctx.capacity.max_total_tokens;
         let mut selections = Vec::new();
         for (index, candidate) in ctx.runnable.iter().enumerate() {
-            if remaining_requests == 0 || remaining_tokens == 0 {
+            if remaining_selections == 0 || remaining_requests == 0 || remaining_tokens == 0 {
                 break;
             }
             let budget = u64::from(candidate.max_token_budget).min(remaining_tokens) as u32;
@@ -106,6 +105,7 @@ impl Policy for Coordinated {
                 requests: vec![index as u32],
                 token_budgets: vec![budget],
             });
+            remaining_selections -= 1;
             remaining_requests -= 1;
             remaining_tokens -= u64::from(budget);
             let request = state.request_mut(candidate.request.request_id.as_str())?;
@@ -145,8 +145,7 @@ impl Policy for Coordinated {
             .prospective
             .iter()
             .map(|object| {
-                if object.size_bytes <= remaining
-                    && object.facts["cache"].as_bool().unwrap_or(true)
+                if object.size_bytes <= remaining && object.facts["cache"].as_bool().unwrap_or(true)
                 {
                     remaining -= object.size_bytes;
                     CacheAdmission::Cache
@@ -187,11 +186,7 @@ impl Policy for Coordinated {
         })
     }
 
-    fn feedback(
-        ctx: &FeedbackContext,
-        state: &mut State,
-        _host: &Host,
-    ) -> plex::Result<()> {
+    fn feedback(ctx: &FeedbackContext, state: &mut State, _host: &Host) -> plex::Result<()> {
         for record in &ctx.records {
             match &record.subject {
                 FeedbackSubject::Request(request_id) => {

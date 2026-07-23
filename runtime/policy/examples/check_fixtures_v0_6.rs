@@ -601,10 +601,10 @@ fn check_wave_a(packages: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 {
                     "object": {
                         "object_id": "leaf-a",
-                        "size_bytes": 1,
+                        "size_bytes": 100,
                         "beneficiaries": [],
                         "beneficiary_count": 0,
-                        "facts": {"leaf": true, "frequency": 1, "recompute_cost": 1, "age": 0}
+                        "facts": {"leaf": true, "frequency": 1, "recompute_cost": 0, "age": 100}
                     },
                     "reclaimable": true
                 },
@@ -614,18 +614,18 @@ fn check_wave_a(packages: &Path) -> Result<(), Box<dyn std::error::Error>> {
                         "size_bytes": 1,
                         "beneficiaries": [],
                         "beneficiary_count": 0,
-                        "facts": {"leaf": true, "frequency": 2, "recompute_cost": 10, "age": 0}
+                        "facts": {"leaf": true, "frequency": 1, "recompute_cost": 50, "age": 0}
                     },
                     "reclaimable": true
                 }
             ],
             "prospective": [],
-            "capacity": {"max_bytes": 1, "fixed_bytes": 0, "facts": {}},
+            "capacity": {"max_bytes": 100, "fixed_bytes": 0, "facts": {}},
             "episode": {"episode_id": "rag-episode", "iteration": 0, "max_iterations": 2}
         }
     }))?;
     assert_success(&reclaimed);
-    assert_eq!(reclaimed["plan"]["plan"]["reclaim"], json!([0]));
+    assert_eq!(reclaimed["plan"]["plan"]["reclaim"], json!([1]));
     Ok(())
 }
 
