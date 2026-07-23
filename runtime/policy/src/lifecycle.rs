@@ -1,7 +1,8 @@
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
-use pie_plex::{AdmissionDecision, Document, Operation, rank_route, validate_admit};
+use pie_plex::Document;
+use pie_plex::v0_5::{AdmissionDecision, Operation, rank_route, validate_admit};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 

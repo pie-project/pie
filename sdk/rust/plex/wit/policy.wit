@@ -1,19 +1,393 @@
-package pie:plex@0.5.0;
+package pie:plex@0.6.0;
 
 interface policy {
-    record invocation {
-        context-json: string,
-        state-json: string,
+    type document = string;
+    type opportunity-id = string;
+    type snapshot-id = string;
+    type request-id = string;
+    type group-id = string;
+    type principal-id = string;
+    type target-id = string;
+    type cache-object-id = string;
+    type delivery-id = string;
+    type episode-id = string;
+    type mechanic-id = string;
+    type action-id = u64;
+
+    enum operation {
+        admit,
+        route,
+        schedule,
+        cache,
+        feedback,
     }
 
-    record policy-output {
-        result-json: string,
-        state-update-json: string,
+    enum group-status {
+        open,
+        closed,
+        cancelled,
+        expired,
     }
 
-    route: func(input: invocation) -> result<policy-output, string>;
-    admit: func(input: invocation) -> result<policy-output, string>;
-    schedule: func(input: invocation) -> result<policy-output, string>;
-    evict: func(input: invocation) -> result<policy-output, string>;
-    feedback: func(input: invocation) -> result<policy-output, string>;
+    enum request-status {
+        pending,
+        admitted,
+        active,
+        paused,
+        completed,
+        failed,
+        cancelled,
+        expired,
+        rejected,
+    }
+
+    record snapshot-ref {
+        id: snapshot-id,
+        revision: u64,
+    }
+
+    record decision-meta {
+        opportunity-id: opportunity-id,
+        snapshot: snapshot-ref,
+        attempt: u32,
+        mechanics: list<mechanic-id>,
+    }
+
+    record request-ref {
+        request-id: request-id,
+        generation-id: u64,
+        group-id: option<group-id>,
+        principal-id: principal-id,
+    }
+
+    record group-limits {
+        max-members: u32,
+        max-scratch-bytes: u64,
+    }
+
+    record group-state {
+        group-id: group-id,
+        principal-id: principal-id,
+        status: group-status,
+        limits: group-limits,
+        member-count: u32,
+        facts: document,
+        scratch: document,
+    }
+
+    record request-state {
+        request: request-ref,
+        status: request-status,
+        facts: document,
+        fields: document,
+        scratch: document,
+    }
+
+    record policy-state {
+        shared: document,
+        groups: list<group-state>,
+        requests: list<request-state>,
+    }
+
+    record group-state-update {
+        group-id: group-id,
+        scratch: document,
+    }
+
+    record request-state-update {
+        request-id: request-id,
+        fields: option<document>,
+        scratch: option<document>,
+    }
+
+    record state-update {
+        shared: option<document>,
+        groups: list<group-state-update>,
+        requests: list<request-state-update>,
+    }
+
+    record resource-amount {
+        name: string,
+        unit: string,
+        amount: u64,
+    }
+
+    record resource-limit {
+        name: string,
+        unit: string,
+        maximum: u64,
+    }
+
+    enum admit-cause {
+        arrival,
+        retry,
+        capacity-changed,
+    }
+
+    record admission-candidate {
+        request: request-ref,
+        demand: list<resource-amount>,
+        facts: document,
+    }
+
+    record admission-capacity {
+        max-accepted: u32,
+        limits: list<resource-limit>,
+        facts: document,
+    }
+
+    record admit-context {
+        meta: decision-meta,
+        cause: admit-cause,
+        candidates: list<admission-candidate>,
+        capacity: admission-capacity,
+    }
+
+    enum admission-decision {
+        accept,
+        defer,
+        reject,
+    }
+
+    record admit-plan {
+        decisions: list<admission-decision>,
+    }
+
+    enum route-cause {
+        admission,
+        retry,
+        rebalance,
+        target-changed,
+    }
+
+    record route-request {
+        request: request-ref,
+        facts: document,
+    }
+
+    record route-target {
+        target-id: target-id,
+        max-assignments: u32,
+        capacity: list<resource-limit>,
+        revision: u64,
+        facts: document,
+    }
+
+    record route-edge {
+        request-index: u32,
+        target-index: u32,
+        demand: list<resource-amount>,
+        facts: document,
+    }
+
+    record route-context {
+        meta: decision-meta,
+        cause: route-cause,
+        requests: list<route-request>,
+        targets: list<route-target>,
+        feasible-edges: list<route-edge>,
+    }
+
+    variant route-decision {
+        assign(u32),
+        defer,
+    }
+
+    record route-plan {
+        decisions: list<route-decision>,
+    }
+
+    enum schedule-cause {
+        arrival,
+        completion,
+        capacity-changed,
+        timer,
+        feedback,
+    }
+
+    record schedule-candidate {
+        request: request-ref,
+        max-token-budget: u32,
+        facts: document,
+    }
+
+    record schedule-capacity {
+        max-selections: u32,
+        max-requests: u32,
+        max-total-tokens: u64,
+        facts: document,
+    }
+
+    record schedule-context {
+        meta: decision-meta,
+        cause: schedule-cause,
+        runnable: list<schedule-candidate>,
+        capacity: schedule-capacity,
+    }
+
+    record schedule-selection {
+        requests: list<u32>,
+        token-budgets: list<u32>,
+    }
+
+    record schedule-plan {
+        selections: list<schedule-selection>,
+    }
+
+    enum cache-cause {
+        insertion,
+        pressure,
+        expiry,
+        dependency-progress,
+    }
+
+    variant beneficiary {
+        request(request-id),
+        group(group-id),
+    }
+
+    record cache-object {
+        object-id: cache-object-id,
+        size-bytes: u64,
+        beneficiaries: list<beneficiary>,
+        beneficiary-count: u32,
+        facts: document,
+    }
+
+    record resident-cache-object {
+        object: cache-object,
+        reclaimable: bool,
+    }
+
+    record cache-capacity {
+        max-bytes: u64,
+        fixed-bytes: u64,
+        facts: document,
+    }
+
+    record cache-episode {
+        episode-id: episode-id,
+        iteration: u32,
+        max-iterations: u32,
+    }
+
+    record cache-context {
+        meta: decision-meta,
+        cause: cache-cause,
+        resident: list<resident-cache-object>,
+        prospective: list<cache-object>,
+        capacity: cache-capacity,
+        episode: option<cache-episode>,
+    }
+
+    enum cache-admission {
+        cache,
+        bypass,
+    }
+
+    record cache-plan {
+        admissions: list<cache-admission>,
+        reclaim: list<u32>,
+    }
+
+    record route-assignment-subject {
+        opportunity-id: opportunity-id,
+        request-index: u32,
+    }
+
+    record schedule-selection-subject {
+        opportunity-id: opportunity-id,
+        selection-index: u32,
+    }
+
+    variant feedback-subject {
+        request(request-id),
+        work-group(group-id),
+        cache-object(cache-object-id),
+        route-assignment(route-assignment-subject),
+        schedule-selection(schedule-selection-subject),
+        action(action-id),
+    }
+
+    enum outcome-kind {
+        progress,
+        completed,
+        failed,
+        cancelled,
+        expired,
+        action-succeeded,
+        action-failed,
+    }
+
+    record feedback-record {
+        subject: feedback-subject,
+        outcome: outcome-kind,
+        facts: document,
+    }
+
+    record feedback-context {
+        delivery-id: delivery-id,
+        records: list<feedback-record>,
+    }
+
+    record policy-error {
+        code: string,
+        message: string,
+        details: document,
+    }
+
+    record admit-invocation {
+        context: admit-context,
+        state: policy-state,
+    }
+
+    record admit-output {
+        plan: admit-plan,
+        state-update: state-update,
+    }
+
+    record route-invocation {
+        context: route-context,
+        state: policy-state,
+    }
+
+    record route-output {
+        plan: route-plan,
+        state-update: state-update,
+    }
+
+    record schedule-invocation {
+        context: schedule-context,
+        state: policy-state,
+    }
+
+    record schedule-output {
+        plan: schedule-plan,
+        state-update: state-update,
+    }
+
+    record cache-invocation {
+        context: cache-context,
+        state: policy-state,
+    }
+
+    record cache-output {
+        plan: cache-plan,
+        state-update: state-update,
+    }
+
+    record feedback-invocation {
+        context: feedback-context,
+        state: policy-state,
+    }
+
+    record feedback-output {
+        state-update: state-update,
+    }
+
+    admit: func(input: admit-invocation) -> result<admit-output, policy-error>;
+    route: func(input: route-invocation) -> result<route-output, policy-error>;
+    schedule: func(input: schedule-invocation) -> result<schedule-output, policy-error>;
+    cache: func(input: cache-invocation) -> result<cache-output, policy-error>;
+    feedback: func(input: feedback-invocation) -> result<feedback-output, policy-error>;
 }

@@ -9,6 +9,7 @@ use pie_plex::v0_6::{
     validate_policy_state, validate_request_continuation, validate_request_transition,
     validate_state_update,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 
@@ -77,19 +78,22 @@ pub struct FeedbackCommitV0_6 {
     pub maximum_deliveries: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TerminalRequestV0_6 {
     pub request_id: RequestId,
     pub status: RequestStatus,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TerminalGroupV0_6 {
     pub group_id: GroupId,
     pub status: GroupStatus,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TerminalCleanupV0_6 {
     pub requests: Vec<TerminalRequestV0_6>,
     pub groups: Vec<TerminalGroupV0_6>,

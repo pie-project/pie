@@ -1,212 +1,176 @@
 use plex::serde_json::json;
-use plex::{Document, Host, Policy, Request, State};
+use plex::{
+    AdmitContext, AdmitPlan, AdmissionDecision, CacheAdmission, CacheContext, CachePlan,
+    FeedbackContext, FeedbackSubject, Host, Policy, RouteContext, RouteDecision, RoutePlan,
+    OutcomeKind, ScheduleContext, SchedulePlan, ScheduleSelection, State,
+};
 
 struct Coordinated;
 
 impl Policy for Coordinated {
-    fn route(ctx: &Document, state: &mut State, host: &Host) -> Result<Document, String> {
-        let request_id = request_id(ctx)?;
-        let previous_target = state.request(&request_id)?.facts()["previous_target"]
-            .as_str()
-            .map(str::to_owned);
+    fn admit(ctx: &AdmitContext, state: &mut State, _host: &Host) -> plex::Result<AdmitPlan> {
+        let mut decisions = Vec::with_capacity(ctx.candidates.len());
+        for candidate in &ctx.candidates {
+            let queue_depth = candidate.facts["queue_depth"].as_u64().unwrap_or(0);
+            let decision = if queue_depth < 80 {
+                AdmissionDecision::Accept
+            } else if queue_depth < 100 {
+                AdmissionDecision::Defer
+            } else {
+                AdmissionDecision::Reject
+            };
+            let request = state.request_mut(candidate.request.request_id.as_str())?;
+            request.scratch["admission_count"] =
+                json!(request.scratch["admission_count"].as_u64().unwrap_or(0) + 1);
+            request.fields["last_hook"] = json!("admit");
+            decisions.push(decision);
+        }
+        state.shared["admit_calls"] =
+            json!(state.shared["admit_calls"].as_u64().unwrap_or(0) + 1);
+        Ok(AdmitPlan { decisions })
+    }
+
+    fn route(ctx: &RouteContext, state: &mut State, host: &Host) -> plex::Result<RoutePlan> {
+        let query_bias = if ctx
+            .requests
+            .first()
+            .is_some_and(|request| request.facts["query"].as_bool() == Some(true))
         {
-            let request = state.request_mut(&request_id)?;
+            host.query_raw(
+                "pie.cluster.capacity@1",
+                &json!({"model": "example-model"}),
+            )?["queue_bias"]
+                .as_u64()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let mut decisions = Vec::with_capacity(ctx.requests.len());
+        for (request_index, request) in ctx.requests.iter().enumerate() {
+            let edge = ctx
+                .feasible_edges
+                .iter()
+                .enumerate()
+                .filter(|(_, edge)| edge.request_index as usize == request_index)
+                .min_by_key(|(_, edge)| {
+                    edge.facts["queue_depth"]
+                        .as_u64()
+                        .unwrap_or(0)
+                        .saturating_add(query_bias)
+                })
+                .map(|(index, _)| index as u32);
+            decisions.push(edge.map_or(RouteDecision::Defer, RouteDecision::Assign));
+            let request = state.request_mut(request.request.request_id.as_str())?;
             request.scratch["route_count"] =
                 json!(request.scratch["route_count"].as_u64().unwrap_or(0) + 1);
-            request.fields["metadata"]["last_hook"] = json!("route");
-            append_prompt(request, "|route");
+            request.fields["last_hook"] = json!("route");
         }
-        state.shared["route_calls"] = json!(state.shared["route_calls"].as_u64().unwrap_or(0) + 1);
-        state.shared["last_route_request"] = json!(request_id);
-
-        let capacity_bias = if supports(ctx, "queries", "pie.cluster.capacity@1") {
-            host.cluster_capacity(ctx["context"]["model"].as_str().unwrap_or(""))?["route_bias"]
-                .as_f64()
-                .unwrap_or(0.0)
-        } else {
-            0.0
-        };
-        let candidates = ctx["candidates"]
-            .as_array()
-            .ok_or("candidates must be an array")?;
-        let scores = candidates
-            .iter()
-            .map(|candidate| {
-                let cached = candidate["facts"]["cached_tokens"].as_f64().unwrap_or(0.0);
-                let queue = candidate["facts"]["queue_depth"].as_f64().unwrap_or(0.0);
-                let retained = previous_target.as_deref() == candidate["id"].as_str()
-                    && candidate["facts"]["has_request_kv"]
-                        .as_bool()
-                        .unwrap_or(false);
-                let locality = if retained { 1.0e12 } else { 0.0 };
-                locality + cached - queue + capacity_bias
-            })
-            .collect::<Vec<_>>();
-
-        if supports(ctx, "actions", "pie.kv.prefetch@1")
-            && let Some(target) = candidates
-                .first()
-                .and_then(|candidate| candidate["id"].as_str())
-        {
-            host.prefetch_kv(&request_id, target)?;
-        }
-        Ok(json!({"scores": scores}))
+        state.shared["route_calls"] =
+            json!(state.shared["route_calls"].as_u64().unwrap_or(0) + 1);
+        Ok(RoutePlan { decisions })
     }
 
-    fn admit(ctx: &Document, state: &mut State, host: &Host) -> Result<Document, String> {
-        let request_id = request_id(ctx)?;
-        let request = state.request_mut(&request_id)?;
-        if request.fields["metadata"]["last_hook"] != "route" {
-            return Err("admit did not observe route mutation".into());
-        }
-        request.scratch["admission_count"] =
-            json!(request.scratch["admission_count"].as_u64().unwrap_or(0) + 1);
-        request.fields["metadata"]["last_hook"] = json!("admit");
-        append_prompt(request, "|admit");
-
-        if supports(ctx, "actions", "pie.retention.set@1") {
-            host.set_retention(&request_id, 5000)?;
-        }
-        let queue = ctx["target"]["facts"]["queue_depth"].as_u64().unwrap_or(0);
-        let decision = if queue < 80 {
-            "accept"
-        } else if queue < 100 {
-            "defer"
-        } else {
-            "reject"
-        };
-        Ok(json!({"decision": decision}))
-    }
-
-    fn schedule(ctx: &Document, state: &mut State, _host: &Host) -> Result<Document, String> {
-        let request_ids = ctx["runnable"]
-            .as_array()
-            .ok_or("runnable must be an array")?
-            .iter()
-            .map(|candidate| {
-                candidate["request_id"]
-                    .as_str()
-                    .ok_or("runnable request_id must be a string")
-                    .map(str::to_owned)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        for request_id in &request_ids {
-            if state.request(request_id)?.fields["metadata"]["last_hook"] != "admit" {
-                return Err("schedule did not observe admit mutation".into());
+    fn schedule(
+        ctx: &ScheduleContext,
+        state: &mut State,
+        _host: &Host,
+    ) -> plex::Result<SchedulePlan> {
+        let mut remaining_requests = ctx.capacity.max_requests;
+        let mut remaining_tokens = ctx.capacity.max_total_tokens;
+        let mut selections = Vec::new();
+        for (index, candidate) in ctx.runnable.iter().enumerate() {
+            if remaining_requests == 0 || remaining_tokens == 0 {
+                break;
             }
-        }
-
-        let mut decisions = Vec::with_capacity(request_ids.len());
-        for request_id in &request_ids {
-            let request = state.request_mut(request_id)?;
+            let budget = u64::from(candidate.max_token_budget).min(remaining_tokens) as u32;
+            if budget == 0 {
+                continue;
+            }
+            selections.push(ScheduleSelection {
+                requests: vec![index as u32],
+                token_budgets: vec![budget],
+            });
+            remaining_requests -= 1;
+            remaining_tokens -= u64::from(budget);
+            let request = state.request_mut(candidate.request.request_id.as_str())?;
             request.scratch["schedule_calls"] =
                 json!(request.scratch["schedule_calls"].as_u64().unwrap_or(0) + 1);
-            let enacted = request.facts()["attained_service"].as_u64().unwrap_or(0);
-            let feedback = request.scratch["feedback_service"].as_u64().unwrap_or(0);
-            decisions.push(json!({"score": -((enacted + feedback) as f64)}));
-            request.fields["metadata"]["last_hook"] = json!("schedule");
+            request.fields["last_hook"] = json!("schedule");
         }
-        Ok(json!({"decisions": decisions}))
+        Ok(SchedulePlan { selections })
     }
 
-    fn evict(ctx: &Document, state: &mut State, _host: &Host) -> Result<Document, String> {
-        let units = ctx["resident"]
-            .as_array()
-            .ok_or("resident must be an array")?
+    fn cache(ctx: &CacheContext, state: &mut State, _host: &Host) -> plex::Result<CachePlan> {
+        let resident_bytes = ctx
+            .resident
             .iter()
-            .map(|unit| {
-                (
-                    unit["request_id"].as_str().map(str::to_owned),
-                    unit["facts"]["reload_cost"].as_f64().unwrap_or(0.0),
-                )
-            })
-            .collect::<Vec<_>>();
-        let mut scores = Vec::with_capacity(units.len());
-        for (request_id, reload_cost) in units {
-            if let Some(request_id) = request_id {
-                let request = state.request_mut(&request_id)?;
-                request.scratch["eviction_checks"] =
-                    json!(request.scratch["eviction_checks"].as_u64().unwrap_or(0) + 1);
-            }
-            scores.push(reload_cost);
-        }
-        Ok(json!({"scores": scores}))
-    }
-
-    fn feedback(ctx: &Document, state: &mut State, host: &Host) -> Result<Document, String> {
-        let records = ctx["records"]
-            .as_array()
-            .ok_or("records must be an array")?
+            .map(|resident| resident.object.size_bytes)
+            .sum::<u64>()
+            .saturating_add(ctx.capacity.fixed_bytes);
+        let mut remaining = ctx.capacity.max_bytes.saturating_sub(resident_bytes);
+        let admissions = ctx
+            .prospective
             .iter()
-            .map(|record| {
-                Ok((
-                    record["event"].as_str().unwrap_or("").to_owned(),
-                    record["request_id"]
-                        .as_str()
-                        .ok_or("record request_id must be a string")?
-                        .to_owned(),
-                    record["facts"].clone(),
-                ))
+            .map(|object| {
+                if object.size_bytes <= remaining
+                    && object.facts["cache"].as_bool().unwrap_or(true)
+                {
+                    remaining -= object.size_bytes;
+                    CacheAdmission::Cache
+                } else {
+                    CacheAdmission::Bypass
+                }
             })
-            .collect::<Result<Vec<_>, String>>()?;
-        if supports(ctx, "actions", "pie.timer.arm@1")
-            && let Some(request_id) = records.first().map(|(_, request_id, _)| request_id)
-        {
-            host.arm_timer(request_id, 1)?;
-        }
-        for (event, request_id, facts) in records {
-            {
-                let request = state.request_mut(&request_id)?;
-                match event.as_str() {
-                    "progress" => {
-                        let delta = facts["committed_tokens"].as_u64().unwrap_or(0);
-                        request.scratch["feedback_service"] = json!(
-                            request.scratch["feedback_service"].as_u64().unwrap_or(0) + delta
-                        );
-                    }
-                    "tool-boundary" => {
-                        request.scratch["tool_calls"] =
-                            json!(request.scratch["tool_calls"].as_u64().unwrap_or(0) + 1);
-                        request.fields["metadata"]["last_hook"] = json!("tool-boundary");
-                    }
-                    "action-succeeded" => {
-                        request.scratch["actions_succeeded"] =
-                            json!(request.scratch["actions_succeeded"].as_u64().unwrap_or(0) + 1);
-                    }
-                    "action-failed" => {
-                        request.scratch["actions_failed"] =
-                            json!(request.scratch["actions_failed"].as_u64().unwrap_or(0) + 1);
-                    }
-                    _ => {}
+            .collect();
+        for resident in &ctx.resident {
+            for beneficiary in &resident.object.beneficiaries {
+                if let plex::Beneficiary::Request(request_id) = beneficiary
+                    && let Ok(request) = state.request_mut(request_id.as_str())
+                {
+                    request.scratch["cache_checks"] =
+                        json!(request.scratch["cache_checks"].as_u64().unwrap_or(0) + 1);
                 }
             }
-            state.shared["feedback_records"] =
-                json!(state.shared["feedback_records"].as_u64().unwrap_or(0) + 1);
         }
-        state.shared["last_feedback_delivery"] = ctx["delivery_id"].clone();
-        Ok(json!({}))
+        Ok(CachePlan {
+            admissions,
+            reclaim: Vec::new(),
+        })
     }
-}
 
-fn request_id(ctx: &Document) -> Result<String, String> {
-    ctx["request_id"]
-        .as_str()
-        .map(str::to_owned)
-        .ok_or_else(|| "request_id must be a string".into())
-}
-
-fn supports(ctx: &Document, kind: &str, method: &str) -> bool {
-    ctx["context"]["capabilities"][kind]
-        .as_array()
-        .is_some_and(|methods| methods.iter().any(|candidate| candidate == method))
-}
-
-fn append_prompt(request: &mut Request, suffix: &str) {
-    let prompt = request.fields["body"]["prompt"]
-        .as_str()
-        .unwrap_or("")
-        .to_owned();
-    request.fields["body"]["prompt"] = json!(format!("{prompt}{suffix}"));
+    fn feedback(
+        ctx: &FeedbackContext,
+        state: &mut State,
+        _host: &Host,
+    ) -> plex::Result<()> {
+        for record in &ctx.records {
+            match &record.subject {
+                FeedbackSubject::Request(request_id) => {
+                    if !matches!(
+                        record.outcome,
+                        OutcomeKind::Completed
+                            | OutcomeKind::Failed
+                            | OutcomeKind::Cancelled
+                            | OutcomeKind::Expired
+                    ) {
+                        let request = state.request_mut(request_id.as_str())?;
+                        request.scratch["feedback_records"] =
+                            json!(request.scratch["feedback_records"].as_u64().unwrap_or(0) + 1);
+                    }
+                }
+                FeedbackSubject::WorkGroup(group_id) => {
+                    let group = state.group_mut(group_id.as_str())?;
+                    group.scratch["feedback_records"] =
+                        json!(group.scratch["feedback_records"].as_u64().unwrap_or(0) + 1);
+                }
+                _ => {}
+            }
+        }
+        state.shared["feedback_records"] = json!(
+            state.shared["feedback_records"].as_u64().unwrap_or(0) + ctx.records.len() as u64
+        );
+        Ok(())
+    }
 }
 
 plex::export_policy!(Coordinated);

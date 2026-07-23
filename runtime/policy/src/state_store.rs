@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
-use pie_plex::{Document, validate_request_scope};
+use pie_plex::Document;
+use pie_plex::v0_5::validate_request_scope;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use thiserror::Error;

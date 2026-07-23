@@ -13,10 +13,10 @@
 This document uses the key words **MUST**, **MUST NOT**, **REQUIRED**,
 **SHOULD**, **SHOULD NOT**, and **MAY** as normative requirements.
 
-Phase 0 freezes the contract without switching the active v0.5 runtime. The
-canonical v0.6 Rust types live under `pie_plex::v0_6`, and the canonical WIT
-files live under `interface/plex/wit-0.6/`. Runtime and SDK adoption occurs in
-later phases.
+Phase 0 originally froze the contract beside v0.5. The active interface crate,
+package loader, runtime, Rust SDK, and Python binding now use v0.6. The
+canonical Rust types remain under `pie_plex::v0_6`, and the canonical WIT files
+live under `interface/plex/wit-0.6/`.
 
 ## 1. Stable waist and scope
 

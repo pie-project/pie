@@ -17,9 +17,9 @@ is implemented and tested unless a section explicitly says otherwise. Older
 planning documents describe intermediate designs and are not normative for
 v0.5.
 
-The breaking v0.6 contract is frozen separately in
-[`plex_0.6_contract.md`](plex_0.6_contract.md). The active runtime remains v0.5
-until the migration gates in [`plex_0.5_to_0.6.md`](plex_0.5_to_0.6.md) pass.
+The breaking v0.6 contract is defined in
+[`plex_0.6_contract.md`](plex_0.6_contract.md). The active runtime has migrated
+to v0.6; this document remains the historical v0.5 reference.
 
 PLEX v0.5 is intentionally JSON-oriented. "Untyped" in this document means
 that application-specific values are JSON rather than generated schema types.

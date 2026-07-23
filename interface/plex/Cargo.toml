@@ -1,9 +1,9 @@
 [package]
 name = "pie-plex"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 authors = ["In Gim <in.gim@yale.edu>"]
-description = "JSON proof-of-concept contract for the PLEX policy kernel"
+description = "Typed contract and validation model for PLEX policies"
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 

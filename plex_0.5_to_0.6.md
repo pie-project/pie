@@ -6,6 +6,10 @@ This is the normative migration table for
 [`pie:plex@0.6.0`](plex_0.6_contract.md). v0.6 is intentionally breaking. A
 v0.5 component or `.plexpkg` is never reinterpreted as v0.6.
 
+The interface crate, package format, core runtime, Rust guest SDK, engine API,
+and Python binding have migrated. Adapter and full fixture-corpus migration is
+tracked by Phase 5 of [`plex_0.6.md`](plex_0.6.md).
+
 ## 1. Version dispatch
 
 | Surface | v0.5 | v0.6 | Migration |

@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use pie_plex::{Document, Operation};
+use pie_plex::Document;
+use pie_plex::v0_5::Operation;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -359,24 +360,26 @@ fn selection(
 ) -> Result<Option<Document>, String> {
     let selection = match operation {
         Operation::Route => Some(serde_json::json!({
-            "order": pie_plex::rank_route(
+            "order": pie_plex::v0_5::rank_route(
                 result,
                 context["candidates"].as_array().expect("validated").len()
             ).map_err(|error| error.to_string())?
         })),
         Operation::Admit => Some(serde_json::json!({
-            "decision": pie_plex::validate_admit(result)
+            "decision": pie_plex::v0_5::validate_admit(result)
                 .map_err(|error| error.to_string())?
         })),
         Operation::Schedule => Some(
             serde_json::to_value(
-                pie_plex::select_schedule(context, result).map_err(|error| error.to_string())?,
+                pie_plex::v0_5::select_schedule(context, result)
+                    .map_err(|error| error.to_string())?,
             )
             .map_err(|error| error.to_string())?,
         ),
         Operation::Evict => Some(
             serde_json::to_value(
-                pie_plex::select_evictions(context, result).map_err(|error| error.to_string())?,
+                pie_plex::v0_5::select_evictions(context, result)
+                    .map_err(|error| error.to_string())?,
             )
             .map_err(|error| error.to_string())?,
         ),

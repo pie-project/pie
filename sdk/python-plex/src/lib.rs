@@ -3,7 +3,9 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use pie_policy::{Document, PlexError as RustPlexError, PlexRuntime, QueryError, QueryHandler};
+use pie_policy::{
+    Document, HostSupportV0_6, PlexError as RustPlexError, PlexRuntime, QueryError, QueryHandler,
+};
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
@@ -60,21 +62,20 @@ struct NativeRuntime {
 #[pymethods]
 impl NativeRuntime {
     #[new]
-    #[pyo3(signature = (policy, query=None, actions=None))]
-    fn new(policy: &str, query: Option<Py<PyAny>>, actions: Option<Vec<String>>) -> PyResult<Self> {
+    #[pyo3(signature = (policy, query=None, mechanics=None))]
+    fn new(
+        policy: &str,
+        query: Option<Py<PyAny>>,
+        mechanics: Option<Vec<String>>,
+    ) -> PyResult<Self> {
         let package = std::fs::read(policy)
             .map_err(|error| PolicyPackageError::new_err(error.to_string()))?;
         let query_handler = query
             .map(|callback| Arc::new(PythonQueryHandler { callback }) as Arc<dyn QueryHandler>);
-        let runtime = PlexRuntime::from_package_bytes(
-            &package,
-            query_handler,
-            actions
-                .unwrap_or_default()
-                .into_iter()
-                .collect::<BTreeSet<_>>(),
-        )
-        .map_err(map_plex_error)?;
+        let support = HostSupportV0_6::with_standard_ids(mechanics.unwrap_or_default())
+            .map_err(|error| PolicyPackageError::new_err(error.to_string()))?;
+        let runtime = PlexRuntime::from_package_bytes(&package, query_handler, support)
+            .map_err(map_plex_error)?;
         Ok(Self {
             id: next_runtime_id()?,
             runtime,

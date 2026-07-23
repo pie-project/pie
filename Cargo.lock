@@ -3896,7 +3896,7 @@ dependencies = [
 
 [[package]]
 name = "pie-plex"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3905,7 +3905,7 @@ dependencies = [
 
 [[package]]
 name = "pie-plex-py"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "pie-policy",
  "pyo3",
@@ -3914,7 +3914,7 @@ dependencies = [
 
 [[package]]
 name = "pie-policy"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "blake3",
  "pie-plex",

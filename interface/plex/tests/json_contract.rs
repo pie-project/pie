@@ -1,4 +1,4 @@
-use pie_plex::{
+use pie_plex::v0_5::{
     AdmissionDecision, rank_route, select_evictions, select_schedule, validate_admit,
     validate_request_scope,
 };

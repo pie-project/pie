@@ -1,8 +1,9 @@
-package pie:plex@0.5.0;
+package pie:plex@0.6.0;
 
 interface host {
+    type document = string;
     type action-id = u64;
 
-    query: func(method: string, args-json: string) -> result<string, string>;
-    action: func(method: string, args-json: string) -> result<action-id, string>;
+    query: func(method: string, args: document) -> result<document, string>;
+    action: func(method: string, args: document) -> result<action-id, string>;
 }

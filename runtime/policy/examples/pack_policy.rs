@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use pie_plex::{ContractVersion, Manifest, Operation, PolicyLimits};
-use pie_policy::PolicyPackage;
+use pie_plex::v0_5::{ContractVersion, Manifest, Operation, PolicyLimits};
+use pie_policy::PolicyPackageV0_5;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
@@ -27,7 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("pack_policy received unexpected arguments".into());
     }
 
-    let package = PolicyPackage::new(
+    let package = PolicyPackageV0_5::new(
         Manifest {
             contract: ContractVersion::V0_5,
             package_name,

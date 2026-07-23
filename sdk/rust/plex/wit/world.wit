@@ -1,4 +1,4 @@
-package pie:plex@0.5.0;
+package pie:plex@0.6.0;
 
 world plex-policy {
     import host;

@@ -13,7 +13,9 @@
   - Phase 2 complete: typed working sets, hard protocol bounds, direct plan
     validation, snapshot binding, opportunity retry tracking, cache episodes,
     and replay-order records
-  - active runtime ABI remains v0.5 until Phase 3
+  - Phase 3 complete: package format 6, typed component ABI, active Rust
+    runtime/API, guest SDK, and Python binding
+  - adapters and the remaining fixture corpus migrate in Phase 5
 - Inputs:
   - [`plex.md`](plex.md), the implemented v0.5 contract
   - [`plex_gap.md`](plex_gap.md), the design-gap audit

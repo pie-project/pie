@@ -4,6 +4,7 @@ use std::sync::Arc;
 use wasmtime::{Store, StoreLimits, StoreLimitsBuilder};
 
 use crate::bindings::pie::plex::host;
+use crate::bindings_v0_6::pie::plex::host as host_v0_6;
 use crate::error::{InvocationFailure, InvocationFailureKind};
 use crate::host::{QueryHandler, StagedAction};
 
@@ -151,6 +152,7 @@ impl host::Host for InvocationContext {
                 format!("query method {method:?} must be a non-empty versioned name"),
             );
         }
+
         let args: pie_plex::Document = match serde_json::from_str(&args_json) {
             Ok(args) => args,
             Err(error) => {
@@ -232,6 +234,16 @@ impl host::Host for InvocationContext {
         )?;
         self.staged_actions.push(StagedAction { id, method, args });
         Ok(id)
+    }
+}
+
+impl host_v0_6::Host for InvocationContext {
+    fn query(&mut self, method: String, args: String) -> Result<String, String> {
+        <Self as host::Host>::query(self, method, args)
+    }
+
+    fn action(&mut self, method: String, args: String) -> Result<u64, String> {
+        <Self as host::Host>::action(self, method, args)
     }
 }
 
