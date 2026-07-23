@@ -158,18 +158,22 @@ impl GrammarMatcher {
             return false;
         }
 
-        if self.tokenizer.special_token_ids().contains(&token_id) {
+        if self
+            .tokenizer
+            .special_token_ids()
+            .binary_search(&token_id)
+            .is_ok()
+        {
             return false;
         }
 
-        let decoded = match self.tokenizer.decoded_vocab().get(token_id as usize) {
-            Some(s) if !s.is_empty() => s,
-            _ => return false,
+        let Some(decoded) = self.tokenizer.decoded_token_bytes(token_id) else {
+            return false;
         };
 
         let ok = match &mut self.engine {
-            ParserEngine::SingleDfa(e) => e.advance_bytes(&self.compiled, decoded.as_bytes()),
-            ParserEngine::Stack(p) => p.advance_bytes(decoded.as_bytes()),
+            ParserEngine::SingleDfa(e) => e.advance_bytes(&self.compiled, decoded),
+            ParserEngine::Stack(p) => p.advance_bytes(decoded),
         };
         if !ok {
             return false;
@@ -332,7 +336,7 @@ impl GrammarMatcher {
             _ => unreachable!(),
         };
 
-        let sorted = self.tokenizer.sorted_vocab();
+        let sorted = self.tokenizer.sorted_token_ids();
         let trie_end = self.tokenizer.trie_subtree_end();
 
         // Reuse scratch buffers (clear but keep allocated capacity)
@@ -351,13 +355,11 @@ impl GrammarMatcher {
 
         let mut i = 0;
         while i < sorted.len() {
-            let (token_id, ref token_str) = sorted[i];
-            let bytes = token_str.as_bytes();
-
-            if bytes.is_empty() {
-                i += 1;
-                continue;
-            }
+            let token_id = sorted[i];
+            let bytes = self
+                .tokenizer
+                .decoded_token_bytes(token_id)
+                .expect("sorted token IDs have decoded bytes");
 
             // Skip tokens already accepted by DFA mask
             if bitmask::get_bit(bitmask, token_id as usize) {

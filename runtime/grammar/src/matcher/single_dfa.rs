@@ -148,7 +148,7 @@ impl SingleDfaEngine {
         stack: &mut Vec<u16>,
         active_prefix: &mut Vec<u8>,
     ) {
-        let sorted = tokenizer_info.sorted_vocab();
+        let sorted = tokenizer_info.sorted_token_ids();
         let trie_end = tokenizer_info.trie_subtree_end();
         let bt = compiled.rule_dfas[self.rule_idx].fsm.byte_table();
 
@@ -158,10 +158,12 @@ impl SingleDfaEngine {
 
         let mut i = 0;
         while i < sorted.len() {
-            let (token_id, ref token_str) = sorted[i];
-            let bytes = token_str.as_bytes();
+            let token_id = sorted[i];
+            let bytes = tokenizer_info
+                .decoded_token_bytes(token_id)
+                .expect("sorted token IDs have decoded bytes");
 
-            if bytes.is_empty() || bitmask::get_bit(bitmask, token_id as usize) {
+            if bitmask::get_bit(bitmask, token_id as usize) {
                 i += 1;
                 continue;
             }

@@ -462,18 +462,15 @@ fn precompute_token_masks(
             let mut uncertain = Vec::new();
 
             // Use sorted vocab with trie skip for efficiency
-            let sorted = tokenizer_info.sorted_vocab();
+            let sorted = tokenizer_info.sorted_token_ids();
             let trie_end = tokenizer_info.trie_subtree_end();
             let mut i = 0;
 
             while i < sorted.len() {
-                let (token_id, ref token_str) = sorted[i];
-                let bytes = token_str.as_bytes();
-
-                if bytes.is_empty() {
-                    i += 1;
-                    continue;
-                }
+                let token_id = sorted[i];
+                let bytes = tokenizer_info
+                    .decoded_token_bytes(token_id)
+                    .expect("sorted token IDs have decoded bytes");
 
                 if only_rule_ref {
                     uncertain.push(token_id);

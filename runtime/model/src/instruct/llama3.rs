@@ -8,7 +8,7 @@ use crate::instruct::{
     ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent, ToolGrammar,
 };
 use pie_grammar::grammar::Grammar;
-use pie_tokenizer::Tokenizer;
+use pie_tokenizer::{Tokenizer, TokenizerDecoder};
 use std::sync::Arc;
 
 static TEMPLATE: &str = r#"
@@ -278,7 +278,7 @@ ws ::= [ \t\n]*
 
     fn tool_decoder(&self) -> Box<dyn ToolDecoder> {
         Box::new(LlamaToolDecoder {
-            tokenizer: self.tokenizer.clone(),
+            decoder: self.tokenizer.decoder(false),
             accumulated: String::new(),
         })
     }
@@ -287,13 +287,13 @@ ws ::= [ \t\n]*
 // ─── Decoders ───────────────────────────────────────────────
 
 struct LlamaToolDecoder {
-    tokenizer: Arc<Tokenizer>,
+    decoder: TokenizerDecoder,
     accumulated: String,
 }
 
 impl ToolDecoder for LlamaToolDecoder {
     fn feed(&mut self, tokens: &[u32]) -> ToolEvent {
-        let text = self.tokenizer.decode(tokens, false);
+        let text = self.decoder.feed(tokens);
         self.accumulated.push_str(&text);
         let trimmed = self.accumulated.trim();
         if trimmed.starts_with('{') && trimmed.ends_with('}') {
@@ -308,6 +308,7 @@ impl ToolDecoder for LlamaToolDecoder {
     }
 
     fn reset(&mut self) {
+        self.decoder.reset();
         self.accumulated.clear();
     }
 }

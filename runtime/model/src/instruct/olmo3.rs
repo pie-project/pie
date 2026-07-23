@@ -9,7 +9,7 @@
 
 use crate::instruct::decoders::{GenericChatDecoder, ThinkingDecoder};
 use crate::instruct::{ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent};
-use pie_tokenizer::Tokenizer;
+use pie_tokenizer::{Tokenizer, TokenizerDecoder};
 use std::sync::Arc;
 
 static TEMPLATE: &str = r#"
@@ -161,7 +161,7 @@ impl Instruct for OlmoInstruct {
 
     fn tool_decoder(&self) -> Box<dyn ToolDecoder> {
         Box::new(OlmoToolDecoder {
-            tokenizer: self.tokenizer.clone(),
+            decoder: self.tokenizer.decoder(false),
             accumulated: String::new(),
             state: ToolState::Outside,
             current_tag: String::new(),
@@ -172,7 +172,7 @@ impl Instruct for OlmoInstruct {
 // ─── Decoders ───────────────────────────────────────────────
 
 struct OlmoToolDecoder {
-    tokenizer: Arc<Tokenizer>,
+    decoder: TokenizerDecoder,
     accumulated: String,
     state: ToolState,
     current_tag: String,
@@ -186,7 +186,7 @@ enum ToolState {
 
 impl ToolDecoder for OlmoToolDecoder {
     fn feed(&mut self, tokens: &[u32]) -> ToolEvent {
-        let text = self.tokenizer.decode(tokens, false);
+        let text = self.decoder.feed(tokens);
         self.accumulated.push_str(&text);
 
         loop {
@@ -237,6 +237,7 @@ impl ToolDecoder for OlmoToolDecoder {
     }
 
     fn reset(&mut self) {
+        self.decoder.reset();
         self.accumulated.clear();
         self.state = ToolState::Outside;
     }

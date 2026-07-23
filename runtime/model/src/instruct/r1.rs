@@ -8,7 +8,7 @@ use crate::instruct::{
     ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent, ToolGrammar,
 };
 use pie_grammar::grammar::Grammar;
-use pie_tokenizer::Tokenizer;
+use pie_tokenizer::{Tokenizer, TokenizerDecoder};
 use std::sync::Arc;
 
 static TEMPLATE: &str = r#"
@@ -266,7 +266,7 @@ impl Instruct for R1Instruct {
 
     fn tool_decoder(&self) -> Box<dyn ToolDecoder> {
         Box::new(R1ToolDecoder {
-            tokenizer: self.tokenizer.clone(),
+            decoder: self.tokenizer.decoder(false),
             tool_call_begin: self.tool_call_begin.clone(),
             tool_call_end: self.tool_call_end.clone(),
             accumulated: String::new(),
@@ -328,7 +328,7 @@ json-array ::= "[" (json-value ("," json-value)*)? "]"
 // ─── Decoders ───────────────────────────────────────────────
 
 struct R1ToolDecoder {
-    tokenizer: Arc<Tokenizer>,
+    decoder: TokenizerDecoder,
     tool_call_begin: Vec<u32>,
     tool_call_end: Vec<u32>,
     accumulated: String,
@@ -338,7 +338,7 @@ struct R1ToolDecoder {
 
 impl ToolDecoder for R1ToolDecoder {
     fn feed(&mut self, tokens: &[u32]) -> ToolEvent {
-        let text = self.tokenizer.decode(tokens, false);
+        let text = self.decoder.feed(tokens);
         self.accumulated.push_str(&text);
 
         if !self.inside {
@@ -394,6 +394,7 @@ impl ToolDecoder for R1ToolDecoder {
     }
 
     fn reset(&mut self) {
+        self.decoder.reset();
         self.accumulated.clear();
         self.inside = false;
         self.match_pos = 0;
