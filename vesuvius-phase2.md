@@ -1286,3 +1286,24 @@ survives structurally: generalized eligibility (prefill_graph_ready
 lane), capture with real write-desc/compact-logits shapes, the
 planner's exact carve term, the plan-level demotion guard, and the
 per-fire eligibility diagnostic (PIE_PREFILL_GRAPH_DEBUG=1).
+
+### Prefill chunk unification: measured dead on this GPU (env-knob A/B)
+
+The planner already exposes the experiment (`PIE_CUDA_PREFILL_TOKENS`
+forces an N candidate; `--max-forward-tokens` lifts the engine budget),
+so the lever was measured without code changes against the fin-* runs
+as same-build control (k1 35,300/35,226/35,131):
+
+- N=18944 (one wave per generation): the candidate's activation arena
+  crowds R out of the budget on this 24GB part — the planner drops to
+  R=256. k1 collapses to 32.5k/31.5k (decode cohorts split into two
+  waves), 512×512 completes 0/512, c0256 unaffected (fits R=256).
+- N=12800 (3 waves -> 2 per generation): R=512 survives, k1 35,021 —
+  at/below the control band's low end. The seam saving does not beat
+  the larger waves' own costs.
+
+Verdict: on this hardware the workspace<->KV<->R trade never clears in
+the lever's favor; full unification is catastrophic and the
+intermediate point is neutral-at-best. The remaining cold-bench levers
+all need either an operator decision (client spawn ramp fairness) or a
+design round (guest-wake fan-out; varlen Phase 2 shape bucketing).
