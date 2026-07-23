@@ -1,0 +1,64 @@
+{
+  "$schema": "../../schema/0.6/mechanics-registry.schema.json",
+  "registry_version": 1,
+  "contract": {
+    "major": 0,
+    "minor": 6
+  },
+  "mechanics": [
+    {
+      "id": "schedule.atomic-enqueue@1",
+      "kind": "guarantee",
+      "method": null,
+      "request_schema": null,
+      "feedback_schema": null,
+      "operations": ["schedule"],
+      "description": "The adapter accepts every member of a normalized schedule selection or rejects all members."
+    },
+    {
+      "id": "request.cancel@1",
+      "kind": "action",
+      "method": "pie.request.cancel@1",
+      "request_schema": "../../schema/0.6/actions/request-cancel.schema.json",
+      "feedback_schema": "../../schema/0.6/actions/action-feedback.schema.json",
+      "operations": ["schedule", "feedback"],
+      "description": "Request idempotent cancellation without marking the request terminal before enacted feedback."
+    },
+    {
+      "id": "group.cancel@1",
+      "kind": "action",
+      "method": "pie.group.cancel@1",
+      "request_schema": "../../schema/0.6/actions/group-cancel.schema.json",
+      "feedback_schema": "../../schema/0.6/actions/action-feedback.schema.json",
+      "operations": ["schedule", "feedback"],
+      "description": "Work-group cancellation with an explicit child propagation scope."
+    },
+    {
+      "id": "cache.prefetch@1",
+      "kind": "action",
+      "method": "pie.cache.prefetch@1",
+      "request_schema": "../../schema/0.6/actions/cache-prefetch.schema.json",
+      "feedback_schema": "../../schema/0.6/actions/action-feedback.schema.json",
+      "operations": ["cache", "schedule"],
+      "description": "Request proactive movement or preparation of a stable cache object."
+    },
+    {
+      "id": "cache.swap@1",
+      "kind": "action",
+      "method": "pie.cache.swap@1",
+      "request_schema": "../../schema/0.6/actions/cache-swap.schema.json",
+      "feedback_schema": "../../schema/0.6/actions/action-feedback.schema.json",
+      "operations": ["cache"],
+      "description": "Request movement of a cache object to a named storage tier."
+    },
+    {
+      "id": "request.rebalance@1",
+      "kind": "action",
+      "method": "pie.request.rebalance@1",
+      "request_schema": "../../schema/0.6/actions/request-rebalance.schema.json",
+      "feedback_schema": "../../schema/0.6/actions/action-feedback.schema.json",
+      "operations": ["route", "schedule", "feedback"],
+      "description": "Request movement of an active or paused request to a supplied target."
+    }
+  ]
+}

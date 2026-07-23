@@ -1,0 +1,5 @@
+{
+  "case": "branch-limit",
+  "branches": 2,
+  "branch_limit": 1
+}

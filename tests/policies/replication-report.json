@@ -1,0 +1,1049 @@
+{
+  "contract": {
+    "major": 0,
+    "minor": 6
+  },
+  "candidate_count": 31,
+  "passing_count": 31,
+  "evidence_counts": {
+    "policy-kernel-reproduction": 31
+  },
+  "operation_counts": {
+    "admit": 5,
+    "cache": 11,
+    "feedback": 15,
+    "route": 14,
+    "schedule": 20
+  },
+  "entries": [
+    {
+      "id": "agentix",
+      "title": "Agentix: An Efficient Serving Engine for LLM Agents as General Programs",
+      "paper_version": "NSDI 2026 author PDF",
+      "source_url": "https://www.usenix.org/system/files/nsdi26-luo.pdf",
+      "source_commit": null,
+      "source_license": "paper reference; no source copied",
+      "component": "plex_paper_agentix",
+      "implements": [
+        "schedule",
+        "feedback"
+      ],
+      "policy_kernel": [
+        "group-level least attained service",
+        "waiting-to-service anti-starvation",
+        "feedback-maintained group service"
+      ],
+      "required_facts": [
+        "waiting_ms",
+        "service_us"
+      ],
+      "required_mechanics": [],
+      "deferred_mechanics": [
+        "KV swap kernel",
+        "multi-step engine execution",
+        "full ATLAS DAG runtime"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "independent implementation from the paper algorithm",
+      "validation_status": "passing",
+      "case": "tests/policies/replications/agentix/cases/basic.json",
+      "expected": "tests/policies/replications/agentix/expected/basic.json"
+    },
+    {
+      "id": "continuum",
+      "title": "Continuum: Efficient and Robust Multi-Turn LLM Agent Scheduling with KV Cache Time-to-Live",
+      "paper_version": "arXiv 2511.02230",
+      "source_url": "https://arxiv.org/abs/2511.02230",
+      "source_commit": null,
+      "source_license": "paper reference; no source copied",
+      "component": "plex_paper_continuum",
+      "implements": [
+        "schedule",
+        "cache",
+        "feedback"
+      ],
+      "policy_kernel": [
+        "preempted-first priority",
+        "TTL-pinned priority",
+        "group-level FCFS",
+        "TTL-aware cache retention"
+      ],
+      "required_facts": [
+        "preempted",
+        "program_arrival",
+        "ttl_ms",
+        "ttl_expired",
+        "reload_cost"
+      ],
+      "required_mechanics": [],
+      "deferred_mechanics": [
+        "tool parser",
+        "offline TTL estimator",
+        "physical KV pinning"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "independent implementation from the paper algorithm",
+      "validation_status": "passing",
+      "case": "tests/policies/replications/continuum/cases/basic.json",
+      "expected": "tests/policies/replications/continuum/expected/basic.json"
+    },
+    {
+      "id": "kvflow",
+      "title": "KVFlow: Efficient Prefix Caching for Accelerating LLM-Based Multi-Agent Workflows",
+      "paper_version": "arXiv 2507.07400",
+      "source_url": "https://arxiv.org/abs/2507.07400",
+      "source_commit": null,
+      "source_license": "paper reference; no source copied",
+      "component": "plex_paper_kvflow",
+      "implements": [
+        "schedule",
+        "cache"
+      ],
+      "policy_kernel": [
+        "cache-loading-aware scheduling",
+        "varying-suffix-first reclaim",
+        "steps-to-execution fixed-prefix ordering",
+        "prefetch intent"
+      ],
+      "required_facts": [
+        "cache_ready",
+        "fixed_prefix",
+        "steps_to_execution",
+        "prefetch"
+      ],
+      "required_mechanics": [],
+      "optional_mechanics": [
+        "cache.prefetch@1"
+      ],
+      "deferred_mechanics": [
+        "CPU-GPU transfer overlap"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "independent implementation from the paper algorithm",
+      "validation_status": "passing",
+      "case": "tests/policies/replications/kvflow/cases/basic.json",
+      "expected": "tests/policies/replications/kvflow/expected/basic.json"
+    },
+    {
+      "id": "preble",
+      "title": "Preble: Efficient Distributed Prompt Scheduling for LLM Serving",
+      "paper_version": "arXiv 2407.00023",
+      "source_url": "https://arxiv.org/abs/2407.00023",
+      "source_commit": null,
+      "source_license": "paper reference; no source copied",
+      "component": "plex_paper_preble",
+      "implements": [
+        "route"
+      ],
+      "policy_kernel": [
+        "E2 exploit when reusable prefix exceeds uncached prompt",
+        "longest-prefix exploitation",
+        "prompt-aware load and eviction-cost exploration"
+      ],
+      "required_facts": [
+        "uncached_tokens",
+        "cached_tokens",
+        "load_cost",
+        "eviction_cost"
+      ],
+      "required_mechanics": [],
+      "deferred_mechanics": [
+        "prefix replication",
+        "autoscaling"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "independent implementation from the paper algorithm",
+      "validation_status": "passing",
+      "case": "tests/policies/replications/preble/cases/basic.json",
+      "expected": "tests/policies/replications/preble/expected/basic.json"
+    },
+    {
+      "id": "helium",
+      "title": "Efficient LLM Serving for Agentic Workflows: A Data Systems Perspective",
+      "paper_version": "arXiv 2603.16104",
+      "source_url": "https://arxiv.org/abs/2603.16104",
+      "source_commit": null,
+      "source_license": "paper reference; no source copied",
+      "component": "plex_paper_helium",
+      "implements": [
+        "schedule"
+      ],
+      "policy_kernel": [
+        "ready-operator filtering",
+        "critical-path depth priority",
+        "cache-reuse benefit",
+        "earliest-start forced progress",
+        "profiled token-cost penalty"
+      ],
+      "required_facts": [
+        "ready",
+        "dependency_depth",
+        "prefix_reuse_tokens",
+        "earliest_start",
+        "profiled_token_cost"
+      ],
+      "required_mechanics": [],
+      "deferred_mechanics": [
+        "query-plan rewrite",
+        "proactive cache warming"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "independent implementation from the paper algorithm",
+      "validation_status": "passing",
+      "case": "tests/policies/replications/helium/cases/basic.json",
+      "expected": "tests/policies/replications/helium/expected/basic.json"
+    },
+    {
+      "id": "vtc",
+      "title": "Fairness in Serving Large Language Models",
+      "paper_version": "OSDI 2024 / arXiv 2401.00588",
+      "source_url": "https://arxiv.org/abs/2401.00588",
+      "source_commit": null,
+      "source_license": "public artifact available; implementation is independent",
+      "component": "plex_paper_vtc",
+      "implements": [
+        "schedule",
+        "feedback"
+      ],
+      "policy_kernel": [
+        "per-client virtual-token counters",
+        "observed input/output-token charging"
+      ],
+      "required_facts": [
+        "client_id",
+        "input_tokens",
+        "output_tokens"
+      ],
+      "required_mechanics": [],
+      "deferred_mechanics": [],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "paper formula and public artifact interface",
+      "validation_status": "passing",
+      "case": "tests/policies/replications/vtc/cases/basic.json",
+      "expected": "tests/policies/replications/vtc/expected/basic.json"
+    },
+    {
+      "id": "lmetric",
+      "title": "Simple is Better: Multiplication May Be All You Need for LLM Request Scheduling",
+      "paper_version": "OSDI 2026 / arXiv 2603.15202",
+      "source_url": "https://arxiv.org/abs/2603.15202",
+      "source_commit": null,
+      "source_license": "public router artifact available; implementation is independent",
+      "component": "plex_paper_lmetric",
+      "implements": [
+        "route"
+      ],
+      "policy_kernel": [
+        "new_prefill_tokens multiplied by current_batch_size",
+        "hotspot exclusion"
+      ],
+      "required_facts": [
+        "new_prefill_tokens",
+        "current_batch_size",
+        "hotspot"
+      ],
+      "required_mechanics": [],
+      "deferred_mechanics": [],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "paper metric and public router behavior",
+      "validation_status": "passing",
+      "case": "tests/policies/replications/lmetric/cases/basic.json",
+      "expected": "tests/policies/replications/lmetric/expected/basic.json"
+    },
+    {
+      "id": "fairserve",
+      "title": "Ensuring Fair LLM Serving Amid Diverse Applications",
+      "paper_version": "arXiv 2411.15997",
+      "source_url": "https://arxiv.org/abs/2411.15997",
+      "source_commit": null,
+      "source_license": "paper reference; no source copied",
+      "component": "plex_paper_fairserve",
+      "implements": [
+        "admit",
+        "schedule",
+        "feedback"
+      ],
+      "policy_kernel": [
+        "interaction-aware admission",
+        "weighted service accounting"
+      ],
+      "required_facts": [
+        "client_id",
+        "weight",
+        "interference_cost",
+        "service_tokens"
+      ],
+      "required_mechanics": [],
+      "deferred_mechanics": [
+        "production interference estimator"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "independent reference model from the paper",
+      "validation_status": "passing",
+      "case": "tests/policies/replications/fairserve/cases/basic.json",
+      "expected": "tests/policies/replications/fairserve/expected/basic.json"
+    },
+    {
+      "id": "marconi",
+      "title": "Marconi: Prefix Caching for the Era of Hybrid LLMs",
+      "paper_version": "MLSys 2025 / arXiv 2411.19379",
+      "source_url": "https://arxiv.org/abs/2411.19379",
+      "source_commit": null,
+      "source_license": "public artifact available; implementation is independent",
+      "component": "plex_paper_marconi",
+      "implements": [
+        "cache",
+        "feedback"
+      ],
+      "policy_kernel": [
+        "prospective admission",
+        "reuse likelihood times recompute FLOPs per byte"
+      ],
+      "required_facts": [
+        "reuse_probability_ppm",
+        "recompute_flops"
+      ],
+      "required_mechanics": [],
+      "deferred_mechanics": [
+        "hybrid-model kernel integration"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "paper formula and public artifact interface",
+      "validation_status": "passing",
+      "case": "tests/policies/replications/marconi/cases/basic.json",
+      "expected": "tests/policies/replications/marconi/expected/basic.json"
+    },
+    {
+      "id": "ragcache",
+      "title": "RAGCache: Efficient Knowledge Caching for Retrieval-Augmented Generation",
+      "paper_version": "arXiv 2404.12457",
+      "source_url": "https://arxiv.org/abs/2404.12457",
+      "source_commit": null,
+      "source_license": "paper reference; no source copied",
+      "component": "plex_paper_ragcache",
+      "implements": [
+        "cache"
+      ],
+      "policy_kernel": [
+        "leaf-only reclaim",
+        "prefix-aware GDSF value",
+        "bounded iterative episode"
+      ],
+      "required_facts": [
+        "leaf",
+        "frequency",
+        "recompute_cost",
+        "age"
+      ],
+      "required_mechanics": [],
+      "deferred_mechanics": [],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "independent reference model from the paper",
+      "validation_status": "passing",
+      "case": "tests/policies/replications/ragcache/cases/basic.json",
+      "expected": "tests/policies/replications/ragcache/expected/basic.json"
+    },
+    {
+      "id": "dlpm",
+      "title": "Locality-aware Fair Scheduling in LLM Serving",
+      "paper_version": "arXiv 2501.14312",
+      "source_url": "https://arxiv.org/abs/2501.14312",
+      "source_commit": null,
+      "source_license": "paper reference; no source copied",
+      "component": "plex_paper_dlpm",
+      "implements": [
+        "route",
+        "schedule",
+        "feedback"
+      ],
+      "policy_kernel": [
+        "deficit-credit fairness",
+        "prefix-local routing and scheduling"
+      ],
+      "required_facts": [
+        "client_id",
+        "cached_tokens",
+        "load",
+        "quantum",
+        "service_tokens"
+      ],
+      "required_mechanics": [],
+      "deferred_mechanics": [],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "independent reference model from the paper",
+      "validation_status": "passing",
+      "case": "tests/policies/replications/dlpm/cases/basic.json",
+      "expected": "tests/policies/replications/dlpm/expected/basic.json"
+    },
+    {
+      "id": "infercept",
+      "title": "InferCept: Efficient Intercept Support for Augmented Large Language Model Inference",
+      "paper_version": "arXiv 2402.01869",
+      "source_url": "https://arxiv.org/abs/2402.01869",
+      "source_commit": null,
+      "source_license": "paper reference; no source copied",
+      "component": "plex_paper_infercept",
+      "implements": [
+        "schedule",
+        "cache"
+      ],
+      "policy_kernel": [
+        "resume-aware scheduling",
+        "preserve/swap/discard from expected waste"
+      ],
+      "required_facts": [
+        "resuming",
+        "expected_waste_tokens",
+        "expected_reuse_ms",
+        "recompute_ms"
+      ],
+      "required_mechanics": [],
+      "optional_mechanics": [
+        "cache.swap@1"
+      ],
+      "deferred_mechanics": [
+        "physical swap implementation"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "independent reference model from the paper",
+      "validation_status": "passing",
+      "case": "tests/policies/replications/infercept/cases/basic.json",
+      "expected": "tests/policies/replications/infercept/expected/basic.json"
+    },
+    {
+      "id": "peek",
+      "title": "PEEK: Predictive Queue-Informed KV Cache Management for LLM Serving",
+      "paper_version": "arXiv 2607.02525",
+      "source_url": "https://arxiv.org/abs/2607.02525",
+      "source_commit": null,
+      "source_license": "paper reference; no source copied",
+      "component": "plex_paper_peek",
+      "implements": [
+        "schedule",
+        "cache"
+      ],
+      "policy_kernel": [
+        "shared pending-demand state",
+        "cluster-aware demand depth",
+        "fairness lane"
+      ],
+      "required_facts": [
+        "waiting_ms",
+        "fairness_threshold_ms",
+        "demand_depth",
+        "pending_demand_depth"
+      ],
+      "required_mechanics": [],
+      "deferred_mechanics": [],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "independent reference model from the paper",
+      "validation_status": "passing",
+      "case": "tests/policies/replications/peek/cases/basic.json",
+      "expected": "tests/policies/replications/peek/expected/basic.json"
+    },
+    {
+      "id": "qlm",
+      "title": "Queue Management for SLO-Oriented Large Language Model Serving",
+      "paper_version": "arXiv 2407.00047",
+      "source_url": "https://arxiv.org/abs/2407.00047",
+      "source_commit": null,
+      "source_license": "paper reference; no source copied",
+      "component": "plex_paper_qlm",
+      "implements": [
+        "admit",
+        "route",
+        "schedule",
+        "feedback"
+      ],
+      "policy_kernel": [
+        "wait estimation",
+        "virtual queues",
+        "group-aware scheduling"
+      ],
+      "required_facts": [
+        "estimated_wait_ms",
+        "slo_ms",
+        "virtual_wait"
+      ],
+      "required_mechanics": [],
+      "deferred_mechanics": [],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "independent reference model from the paper",
+      "validation_status": "passing",
+      "case": "tests/policies/replications/qlm/cases/basic.json",
+      "expected": "tests/policies/replications/qlm/expected/basic.json"
+    },
+    {
+      "id": "slos-serve",
+      "title": "SLOs-Serve: Optimized Serving of Multi-SLO LLMs",
+      "paper_version": "arXiv 2504.08784",
+      "source_url": "https://arxiv.org/abs/2504.08784",
+      "source_commit": null,
+      "source_license": "paper reference; no source copied",
+      "component": "plex_paper_slos_serve",
+      "implements": [
+        "admit",
+        "route",
+        "schedule"
+      ],
+      "policy_kernel": [
+        "multi-stage SLO admission",
+        "latency-aware routing",
+        "slack scheduling"
+      ],
+      "required_facts": [
+        "predicted_total_ms",
+        "slo_ms",
+        "stage_latency_ms",
+        "slack_ms"
+      ],
+      "required_mechanics": [],
+      "deferred_mechanics": [
+        "replica provisioning"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "independent reference model from the paper",
+      "validation_status": "passing",
+      "case": "tests/policies/replications/slos-serve/cases/basic.json",
+      "expected": "tests/policies/replications/slos-serve/expected/basic.json"
+    },
+    {
+      "id": "dynasor",
+      "title": "Efficiently Scaling LLM Reasoning with Certaindex",
+      "paper_version": "arXiv 2412.20993",
+      "source_url": "https://arxiv.org/abs/2412.20993",
+      "source_commit": null,
+      "source_license": "public artifact available; implementation is independent",
+      "component": "plex_paper_dynasor",
+      "implements": [
+        "schedule",
+        "feedback"
+      ],
+      "policy_kernel": [
+        "progress-aware reasoning allocation",
+        "confidence-triggered early stop"
+      ],
+      "required_facts": [
+        "confidence_ppm",
+        "stop_threshold_ppm",
+        "progress_ppm"
+      ],
+      "required_mechanics": [],
+      "optional_mechanics": [
+        "request.cancel@1"
+      ],
+      "deferred_mechanics": [
+        "predictor training"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "paper formula and public artifact interface",
+      "validation_status": "passing",
+      "case": "tests/policies/replications/dynasor/cases/basic.json",
+      "expected": "tests/policies/replications/dynasor/expected/basic.json"
+    },
+    {
+      "id": "justitia",
+      "title": "Justitia: Fair and Efficient Scheduling of Task-parallel LLM Agents with Selective Pampering",
+      "paper_version": "arXiv 2510.17015",
+      "source_url": "https://arxiv.org/abs/2510.17015",
+      "source_commit": null,
+      "source_license": "paper reference; no source copied",
+      "component": "plex_paper_justitia",
+      "implements": [
+        "schedule",
+        "feedback"
+      ],
+      "policy_kernel": [
+        "group completion-order fairness",
+        "feedback-maintained branch completion"
+      ],
+      "required_facts": [
+        "completed_branches"
+      ],
+      "required_mechanics": [],
+      "deferred_mechanics": [
+        "simultaneous branch execution"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "independent reference model from the paper",
+      "validation_status": "passing",
+      "case": "tests/policies/replications/justitia/cases/basic.json",
+      "expected": "tests/policies/replications/justitia/expected/basic.json"
+    },
+    {
+      "id": "chameleon",
+      "title": "Chameleon: Adaptive Caching and Scheduling for Many-Adapter LLM Inference Environments",
+      "paper_version": "arXiv 2411.17741",
+      "source_url": "https://arxiv.org/abs/2411.17741",
+      "source_commit": null,
+      "source_license": "paper reference; no source copied",
+      "component": "plex_paper_chameleon",
+      "implements": [
+        "admit",
+        "schedule",
+        "cache"
+      ],
+      "policy_kernel": [
+        "weighted-size admission",
+        "queue quotas",
+        "adapter cache bypass"
+      ],
+      "required_facts": [
+        "weighted_size",
+        "queue_quota",
+        "queue_class",
+        "adapter_hot"
+      ],
+      "required_mechanics": [],
+      "deferred_mechanics": [],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "independent reference model from the paper",
+      "validation_status": "passing",
+      "case": "tests/policies/replications/chameleon/cases/basic.json",
+      "expected": "tests/policies/replications/chameleon/expected/basic.json"
+    },
+    {
+      "id": "hotprefix",
+      "title": "HotPrefix: Hotness-Aware KV Cache Scheduling for Efficient Prefix Sharing in LLM Inference Systems",
+      "paper_version": "ACM DOI 10.1145/3749168",
+      "source_url": "https://doi.org/10.1145/3749168",
+      "source_commit": null,
+      "source_license": "paper reference; no source copied",
+      "component": "plex_paper_hotprefix",
+      "implements": [
+        "cache",
+        "feedback"
+      ],
+      "policy_kernel": [
+        "feedback-maintained prefix hotness",
+        "selective admission",
+        "prefetch intent"
+      ],
+      "required_facts": [
+        "reuse_count",
+        "hot_threshold"
+      ],
+      "required_mechanics": [],
+      "optional_mechanics": [
+        "cache.prefetch@1"
+      ],
+      "deferred_mechanics": [
+        "physical tier promotion"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "independent reference model from the paper",
+      "validation_status": "passing",
+      "case": "tests/policies/replications/hotprefix/cases/basic.json",
+      "expected": "tests/policies/replications/hotprefix/expected/basic.json"
+    },
+    {
+      "id": "pard",
+      "title": "PARD: Enhancing Goodput for Inference Pipeline via Proactive Request Dropping",
+      "paper_version": "arXiv 2602.08747",
+      "source_url": "https://arxiv.org/abs/2602.08747",
+      "source_commit": null,
+      "source_license": "paper reference; no source copied",
+      "component": "plex_paper_pard",
+      "implements": [
+        "schedule",
+        "feedback"
+      ],
+      "policy_kernel": [
+        "upstream elapsed plus downstream tail prediction",
+        "mid-lifecycle drop intent"
+      ],
+      "required_facts": [
+        "upstream_elapsed_ms",
+        "downstream_p95_ms",
+        "deadline_ms"
+      ],
+      "required_mechanics": [],
+      "optional_mechanics": [
+        "request.cancel@1"
+      ],
+      "deferred_mechanics": [
+        "latency-distribution estimator"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "independent reference model from the paper",
+      "validation_status": "passing",
+      "case": "tests/policies/replications/pard/cases/basic.json",
+      "expected": "tests/policies/replications/pard/expected/basic.json"
+    },
+    {
+      "id": "branch-regulation",
+      "title": "Regulating Branch Parallelism in LLM Serving",
+      "paper_version": "arXiv 2605.06914",
+      "source_url": "https://arxiv.org/abs/2605.06914",
+      "source_commit": null,
+      "source_license": "paper reference; no source copied",
+      "component": "plex_paper_branch_regulation",
+      "implements": [
+        "admit",
+        "schedule"
+      ],
+      "policy_kernel": [
+        "joint branch admission",
+        "interference limit",
+        "excess-branch cancellation"
+      ],
+      "required_facts": [
+        "branch_limit",
+        "batch_interference",
+        "interference_limit",
+        "excess_branch"
+      ],
+      "required_mechanics": [],
+      "optional_mechanics": [
+        "request.cancel@1"
+      ],
+      "deferred_mechanics": [
+        "simultaneous branch execution"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "independent reference model from the paper",
+      "validation_status": "passing",
+      "case": "tests/policies/replications/branch-regulation/cases/basic.json",
+      "expected": "tests/policies/replications/branch-regulation/expected/basic.json"
+    },
+    {
+      "id": "dualmap",
+      "title": "DualMap: Enabling Both Cache Affinity and Load Balancing for Distributed LLM Serving",
+      "paper_version": "arXiv 2602.06502",
+      "source_url": "https://arxiv.org/abs/2602.06502",
+      "source_commit": null,
+      "source_license": "paper reference; no source copied",
+      "component": "plex_paper_dualmap",
+      "implements": [
+        "route"
+      ],
+      "policy_kernel": [
+        "two-choice prefix hashing",
+        "SLO-aware choice",
+        "hotspot migration intent"
+      ],
+      "required_facts": [
+        "prefix_hit",
+        "slo_risk",
+        "hash_choice",
+        "hotspot"
+      ],
+      "required_mechanics": [],
+      "optional_mechanics": [
+        "request.rebalance@1"
+      ],
+      "deferred_mechanics": [
+        "physical migration"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "independent reference model from the paper",
+      "validation_status": "passing",
+      "case": "tests/policies/replications/dualmap/cases/basic.json",
+      "expected": "tests/policies/replications/dualmap/expected/basic.json"
+    },
+    {
+      "id": "llumnix",
+      "title": "Llumnix: Dynamic Scheduling for Large Language Model Serving",
+      "paper_version": "arXiv 2406.03243",
+      "source_url": "https://arxiv.org/abs/2406.03243",
+      "source_commit": null,
+      "source_license": "public artifact available; implementation is independent",
+      "component": "plex_paper_llumnix",
+      "implements": [
+        "route",
+        "feedback"
+      ],
+      "policy_kernel": [
+        "virtual usage placement",
+        "live rescheduling intent"
+      ],
+      "required_facts": [
+        "virtual_usage",
+        "live_reschedule"
+      ],
+      "required_mechanics": [],
+      "optional_mechanics": [
+        "request.rebalance@1"
+      ],
+      "deferred_mechanics": [
+        "physical migration"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "paper policy and public artifact interface",
+      "validation_status": "passing",
+      "case": "tests/policies/replications/llumnix/cases/basic.json",
+      "expected": "tests/policies/replications/llumnix/expected/basic.json"
+    },
+    {
+      "id": "smetric",
+      "title": "SMetric: Rethink LLM Scheduling for Serving Agents with Balanced Session-centric Scheduling",
+      "paper_version": "arXiv 2607.08565",
+      "source_url": "https://arxiv.org/abs/2607.08565",
+      "source_commit": null,
+      "source_license": "paper reference; no source copied",
+      "component": "plex_paper_smetric",
+      "implements": [
+        "route"
+      ],
+      "policy_kernel": [
+        "first-turn load balance",
+        "follow-up cache affinity",
+        "tail-outlier migration"
+      ],
+      "required_facts": [
+        "generation_id",
+        "cache_affinity",
+        "load",
+        "tail_outlier"
+      ],
+      "required_mechanics": [],
+      "optional_mechanics": [
+        "request.rebalance@1"
+      ],
+      "deferred_mechanics": [
+        "physical migration"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "independent reference model from the paper",
+      "validation_status": "passing",
+      "case": "tests/policies/replications/smetric/cases/basic.json",
+      "expected": "tests/policies/replications/smetric/expected/basic.json"
+    },
+    {
+      "id": "thunderagent",
+      "title": "ThunderAgent: A Simple, Fast and Program-Aware Agentic Inference System",
+      "paper_version": "arXiv 2602.13692",
+      "source_url": "https://arxiv.org/abs/2602.13692",
+      "source_commit": null,
+      "source_license": "public artifact available; implementation is independent",
+      "component": "plex_paper_thunderagent",
+      "implements": [
+        "schedule",
+        "cache",
+        "feedback"
+      ],
+      "policy_kernel": [
+        "tool-state-aware scheduling",
+        "program-state cache retention",
+        "migration/cancel intent"
+      ],
+      "required_facts": [
+        "tool_ready",
+        "tool_failed",
+        "migrate_target",
+        "program_live"
+      ],
+      "required_mechanics": [],
+      "optional_mechanics": [
+        "request.cancel@1",
+        "request.rebalance@1"
+      ],
+      "deferred_mechanics": [
+        "physical pause and migration"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "paper policy and public artifact interface",
+      "validation_status": "passing",
+      "case": "tests/policies/replications/thunderagent/cases/basic.json",
+      "expected": "tests/policies/replications/thunderagent/expected/basic.json"
+    },
+    {
+      "id": "pythia",
+      "title": "Pythia: Exploiting Workflow Predictability for Efficient Agent-Native LLM Serving",
+      "paper_version": "arXiv 2604.25899",
+      "source_url": "https://arxiv.org/abs/2604.25899",
+      "source_commit": null,
+      "source_license": "paper reference; no source copied",
+      "component": "plex_paper_pythia",
+      "implements": [
+        "route",
+        "schedule",
+        "cache",
+        "feedback"
+      ],
+      "policy_kernel": [
+        "workflow lookahead routing",
+        "workflow-rank scheduling",
+        "Belady-like cache choice",
+        "prefetch intent"
+      ],
+      "required_facts": [
+        "lookahead_cost",
+        "workflow_rank",
+        "next_use_step",
+        "prefetch"
+      ],
+      "required_mechanics": [],
+      "optional_mechanics": [
+        "cache.prefetch@1"
+      ],
+      "deferred_mechanics": [
+        "proactive scaling"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "independent reference model from the paper",
+      "validation_status": "passing",
+      "case": "tests/policies/replications/pythia/cases/basic.json",
+      "expected": "tests/policies/replications/pythia/expected/basic.json"
+    },
+    {
+      "id": "goodserve",
+      "title": "GoodServe: Towards High-Goodput Serving of Agentic LLM Inferences over Heterogeneous Resources",
+      "paper_version": "arXiv 2605.16867",
+      "source_url": "https://arxiv.org/abs/2605.16867",
+      "source_commit": null,
+      "source_license": "paper reference; no source copied",
+      "component": "plex_paper_goodserve",
+      "implements": [
+        "route",
+        "feedback"
+      ],
+      "policy_kernel": [
+        "just-enough heterogeneous target choice",
+        "risk-triggered migration"
+      ],
+      "required_facts": [
+        "quality_gap_ppm",
+        "cost",
+        "risk_ppm",
+        "migration_threshold_ppm"
+      ],
+      "required_mechanics": [],
+      "optional_mechanics": [
+        "request.rebalance@1"
+      ],
+      "deferred_mechanics": [
+        "predictor training",
+        "provisioning"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "fixed predictor-output reference model",
+      "validation_status": "passing",
+      "case": "tests/policies/replications/goodserve/cases/basic.json",
+      "expected": "tests/policies/replications/goodserve/expected/basic.json"
+    },
+    {
+      "id": "conserve",
+      "title": "Observation, Not Prediction: Conversation-Level Disaggregated Scheduling for Agentic Serving",
+      "paper_version": "arXiv 2606.01839",
+      "source_url": "https://arxiv.org/abs/2606.01839",
+      "source_commit": null,
+      "source_license": "paper reference; no source copied",
+      "component": "plex_paper_conserve",
+      "implements": [
+        "route"
+      ],
+      "policy_kernel": [
+        "heavy first-prefill placement",
+        "conversation-tail affinity"
+      ],
+      "required_facts": [
+        "prefill_capacity",
+        "conversation_affinity",
+        "load"
+      ],
+      "required_mechanics": [],
+      "deferred_mechanics": [],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "independent reference model from the paper",
+      "validation_status": "passing",
+      "case": "tests/policies/replications/conserve/cases/basic.json",
+      "expected": "tests/policies/replications/conserve/expected/basic.json"
+    },
+    {
+      "id": "parrot",
+      "title": "Parrot: Efficient Serving of LLM-based Applications with Semantic Variable",
+      "paper_version": "OSDI 2024",
+      "source_url": "https://www.usenix.org/conference/osdi24/presentation/lin-chaofan",
+      "source_commit": null,
+      "source_license": "public artifact available; implementation is independent",
+      "component": "plex_paper_parrot",
+      "implements": [
+        "route",
+        "schedule"
+      ],
+      "policy_kernel": [
+        "trusted dependency-readiness scheduling",
+        "dependency-distance placement"
+      ],
+      "required_facts": [
+        "dependency_ready",
+        "dependency_distance"
+      ],
+      "required_mechanics": [],
+      "deferred_mechanics": [
+        "general semantic-variable DAG runtime"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "paper policy and public artifact interface",
+      "validation_status": "passing",
+      "case": "tests/policies/replications/parrot/cases/basic.json",
+      "expected": "tests/policies/replications/parrot/expected/basic.json"
+    },
+    {
+      "id": "saga",
+      "title": "SAGA: Workflow-Atomic Scheduling for AI Agent Inference on GPU Clusters",
+      "paper_version": "arXiv 2605.00528",
+      "source_url": "https://arxiv.org/abs/2605.00528",
+      "source_commit": null,
+      "source_license": "paper reference; no source copied",
+      "component": "plex_paper_saga",
+      "implements": [
+        "route",
+        "schedule",
+        "cache"
+      ],
+      "policy_kernel": [
+        "workflow TTL",
+        "group fairness",
+        "cache-local work stealing"
+      ],
+      "required_facts": [
+        "cache_locality",
+        "load",
+        "steal",
+        "workflow_ttl_ms"
+      ],
+      "required_mechanics": [],
+      "optional_mechanics": [
+        "request.rebalance@1"
+      ],
+      "deferred_mechanics": [
+        "physical work stealing"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "independent reference model from the paper",
+      "validation_status": "passing",
+      "case": "tests/policies/replications/saga/cases/basic.json",
+      "expected": "tests/policies/replications/saga/expected/basic.json"
+    },
+    {
+      "id": "routebalance",
+      "title": "RouteBalance: Fused Model Routing and Load Balancing for Heterogeneous LLM Serving",
+      "paper_version": "arXiv 2606.17949",
+      "source_url": "https://arxiv.org/abs/2606.17949",
+      "source_commit": null,
+      "source_license": "paper reference; no source copied",
+      "component": "plex_paper_routebalance",
+      "implements": [
+        "route"
+      ],
+      "policy_kernel": [
+        "bounded joint request-target assignment",
+        "fused utility and capacity"
+      ],
+      "required_facts": [
+        "utility"
+      ],
+      "required_mechanics": [],
+      "deferred_mechanics": [
+        "replica provisioning"
+      ],
+      "evidence_level": "policy-kernel-reproduction",
+      "fixture_provenance": "independent bounded reference solver",
+      "validation_status": "passing",
+      "case": "tests/policies/replications/routebalance/cases/basic.json",
+      "expected": "tests/policies/replications/routebalance/expected/basic.json"
+    }
+  ]
+}

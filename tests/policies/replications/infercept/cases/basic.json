@@ -1,0 +1,5 @@
+{
+  "case": "swap-paused-state",
+  "object_id": "paused-kv",
+  "expected_reuse_ms": 100
+}

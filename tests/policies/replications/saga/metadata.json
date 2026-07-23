@@ -1,0 +1,35 @@
+{
+  "id": "saga",
+  "title": "SAGA: Workflow-Atomic Scheduling for AI Agent Inference on GPU Clusters",
+  "paper_version": "arXiv 2605.00528",
+  "source_url": "https://arxiv.org/abs/2605.00528",
+  "source_commit": null,
+  "source_license": "paper reference; no source copied",
+  "component": "plex_paper_saga",
+  "implements": [
+    "route",
+    "schedule",
+    "cache"
+  ],
+  "policy_kernel": [
+    "workflow TTL",
+    "group fairness",
+    "cache-local work stealing"
+  ],
+  "required_facts": [
+    "cache_locality",
+    "load",
+    "steal",
+    "workflow_ttl_ms"
+  ],
+  "required_mechanics": [],
+  "optional_mechanics": [
+    "request.rebalance@1"
+  ],
+  "deferred_mechanics": [
+    "physical work stealing"
+  ],
+  "evidence_level": "policy-kernel-reproduction",
+  "fixture_provenance": "independent reference model from the paper",
+  "validation_status": "passing"
+}

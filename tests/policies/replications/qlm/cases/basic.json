@@ -1,0 +1,5 @@
+{
+  "case": "slo-feasible-admission",
+  "estimated_wait_ms": 10,
+  "slo_ms": 100
+}

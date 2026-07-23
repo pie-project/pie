@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pie-project.org/schema/plex/0.6/actions/group-cancel.schema.json",
+  "title": "PLEX group.cancel@1 action",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["group_id", "propagation", "idempotency_key"],
+  "properties": {
+    "group_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "propagation": {"enum": ["group-only", "live-requests"]},
+    "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 128},
+    "reason": {"type": "string", "maxLength": 256},
+    "expires_at_ms": {"type": "integer", "minimum": 0}
+  }
+}

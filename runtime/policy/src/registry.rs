@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Condvar, Mutex};
 
-use pie_plex::{Document, Operation};
+use pie_plex::Document;
+use pie_plex::v0_5::Operation;
 use thiserror::Error;
 
 use crate::host::QueryHandler;

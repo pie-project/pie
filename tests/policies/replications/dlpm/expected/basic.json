@@ -1,0 +1,6 @@
+{
+  "invariants": [
+    "positive deficit permits locality preference",
+    "negative deficit cannot dominate fairness"
+  ]
+}

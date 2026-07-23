@@ -1,0 +1,17 @@
+{
+  "architecture": "x86_64",
+  "contract": {
+    "major": 0,
+    "minor": 6
+  },
+  "median_ns": {
+    "admit_batch_64_ns": 28563,
+    "admit_singleton_ns": 821,
+    "cache_1024_ns": 158817,
+    "route_64x8_ns": 43521,
+    "schedule_128_ns": 54141
+  },
+  "operating_system": "linux",
+  "profile": "release",
+  "samples": 31
+}

@@ -1,0 +1,30 @@
+{
+  "id": "chameleon",
+  "title": "Chameleon: Adaptive Caching and Scheduling for Many-Adapter LLM Inference Environments",
+  "paper_version": "arXiv 2411.17741",
+  "source_url": "https://arxiv.org/abs/2411.17741",
+  "source_commit": null,
+  "source_license": "paper reference; no source copied",
+  "component": "plex_paper_chameleon",
+  "implements": [
+    "admit",
+    "schedule",
+    "cache"
+  ],
+  "policy_kernel": [
+    "weighted-size admission",
+    "queue quotas",
+    "adapter cache bypass"
+  ],
+  "required_facts": [
+    "weighted_size",
+    "queue_quota",
+    "queue_class",
+    "adapter_hot"
+  ],
+  "required_mechanics": [],
+  "deferred_mechanics": [],
+  "evidence_level": "policy-kernel-reproduction",
+  "fixture_provenance": "independent reference model from the paper",
+  "validation_status": "passing"
+}

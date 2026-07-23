@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use pie_plex::{Document, Operation};
+use pie_plex::Document;
+use pie_plex::v0_5::Operation;
 use serde_json::{Map, Value};
 use thiserror::Error;
 

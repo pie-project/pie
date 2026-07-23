@@ -48,10 +48,7 @@ impl Default for PolicyEngineConfig {
 
 impl PolicyEngineConfig {
     pub fn deterministic_replay() -> Self {
-        Self {
-            epoch_tick: None,
-            ..Self::default()
-        }
+        Self::default()
     }
 }
 
@@ -119,7 +116,6 @@ impl PolicyEngine {
             .table_elements(MAX_TABLE_ELEMENTS)
             .max_memory_size(config.max_memory_bytes)
             .max_unused_warm_slots(pool_capacity.component_instances);
-
         let mut wasmtime_config = wasmtime::Config::new();
         wasmtime_config.epoch_interruption(true);
         wasmtime_config.wasm_threads(false);

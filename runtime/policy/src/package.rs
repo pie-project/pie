@@ -1,7 +1,8 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use pie_plex::{Document, Manifest, Operation};
+use pie_plex::Document;
+use pie_plex::v0_5::{Manifest, Operation};
 use serde::{Deserialize, Serialize};
 use wasmtime::Store;
 use wasmtime::component::{Component, HasSelf, Linker};
@@ -265,6 +266,7 @@ impl AttachedPolicy {
                 memory_bytes,
                 query_handler,
                 supported_actions,
+                authorization: None,
                 max_host_calls: self.inner.engine.config().max_host_calls,
                 max_host_call_bytes: self.inner.engine.config().max_host_call_bytes,
             },
@@ -305,7 +307,7 @@ pub(crate) fn validate_result(
     result: &Document,
 ) -> Result<(), String> {
     let validation = match operation {
-        Operation::Route => pie_plex::rank_route(
+        Operation::Route => pie_plex::v0_5::rank_route(
             result,
             context["candidates"]
                 .as_array()
@@ -313,9 +315,9 @@ pub(crate) fn validate_result(
                 .len(),
         )
         .map(|_| ()),
-        Operation::Admit => pie_plex::validate_admit(result).map(|_| ()),
-        Operation::Schedule => pie_plex::select_schedule(context, result).map(|_| ()),
-        Operation::Evict => pie_plex::select_evictions(context, result).map(|_| ()),
+        Operation::Admit => pie_plex::v0_5::validate_admit(result).map(|_| ()),
+        Operation::Schedule => pie_plex::v0_5::select_schedule(context, result).map(|_| ()),
+        Operation::Evict => pie_plex::v0_5::select_evictions(context, result).map(|_| ()),
         Operation::Feedback => Ok(()),
     };
     validation.map_err(|error| error.to_string())
@@ -336,6 +338,7 @@ fn probe_instantiation(
             memory_bytes,
             query_handler: Arc::new(RejectingQueryHandler),
             supported_actions: Arc::new(BTreeSet::new()),
+            authorization: None,
             max_host_calls: engine.config().max_host_calls,
             max_host_call_bytes: engine.config().max_host_call_bytes,
         },

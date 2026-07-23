@@ -6,7 +6,7 @@ pub enum AttachmentError {
     #[error("invalid policy engine configuration: {0}")]
     EngineConfig(String),
     #[error(transparent)]
-    Manifest(#[from] pie_plex::ManifestValidationError),
+    Manifest(#[from] pie_plex::v0_5::ManifestValidationError),
     #[error("manifest limit {field} requests {requested}; host maximum is {maximum}")]
     HostLimit {
         field: &'static str,
@@ -43,6 +43,7 @@ pub enum InvocationFailureKind {
     DeadlineExceeded,
     HostSaturated,
     Query,
+    UnsupportedMechanic,
     ActionValidation,
     StateConflict,
     BackendFailure,

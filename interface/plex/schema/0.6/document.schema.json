@@ -1,0 +1,6 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pie-project.org/schema/plex/0.6/document.schema.json",
+  "title": "PLEX v0.6 extensible document",
+  "type": "object"
+}

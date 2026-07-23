@@ -1,55 +1,66 @@
-//! JSON adaptation of Helium cache-aware critical-path scheduling.
-//! https://arxiv.org/abs/2603.16104
+//! Helium cache-aware critical-path scheduling with forced progress.
 
-use plex::serde_json::json;
-use plex::{Document, Host, Policy, State};
+use plex::{Host, Policy, ScheduleContext, SchedulePlan, ScheduleSelection, State};
 
 struct Helium;
 
 impl Policy for Helium {
-    fn schedule(ctx: &Document, _state: &mut State, _host: &Host) -> Result<Document, String> {
-        let runnable = ctx["runnable"]
-            .as_array()
-            .ok_or("runnable must be an array")?;
-        let any_ready = runnable
+    fn schedule(
+        ctx: &ScheduleContext,
+        _state: &mut State,
+        _host: &Host,
+    ) -> plex::Result<SchedulePlan> {
+        let any_ready = ctx
+            .runnable
             .iter()
-            .any(|candidate| candidate["facts"]["ready"].as_bool().unwrap_or(false));
-        let forced = runnable
+            .any(|candidate| candidate.facts["ready"].as_bool().unwrap_or(false));
+        let forced = ctx
+            .runnable
             .iter()
             .enumerate()
             .min_by_key(|(_, candidate)| {
-                candidate["facts"]["earliest_start"]
+                candidate.facts["earliest_start"]
                     .as_u64()
                     .unwrap_or(u64::MAX)
             })
-            .map(|(index, _)| index)
-            .unwrap_or(0);
-        let decisions = runnable
-            .iter()
-            .enumerate()
-            .map(|(index, candidate)| {
-                let ready = candidate["facts"]["ready"].as_bool().unwrap_or(false);
-                let eligible = if any_ready { ready } else { index == forced };
-                let score = if eligible {
-                    candidate["facts"]["dependency_depth"]
-                        .as_f64()
-                        .unwrap_or(0.0)
-                        * 1.0e12
-                        + candidate["facts"]["prefix_reuse_tokens"]
-                            .as_f64()
-                            .unwrap_or(0.0)
-                            * 1.0e6
-                        - candidate["facts"]["earliest_start"].as_f64().unwrap_or(0.0) * 1.0e3
-                        - candidate["facts"]["profiled_token_cost"]
-                            .as_f64()
-                            .unwrap_or(0.0)
-                } else {
-                    -1.0e18
-                };
-                json!({"score": score})
-            })
-            .collect::<Vec<_>>();
-        Ok(json!({"decisions": decisions}))
+            .map(|(index, _)| index);
+        let selected =
+            (ctx.capacity.max_selections > 0
+                && ctx.capacity.max_requests > 0
+                && ctx.capacity.max_total_tokens > 0)
+                .then(|| {
+                    ctx.runnable
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, candidate)| {
+                            if any_ready {
+                                candidate.facts["ready"].as_bool().unwrap_or(false)
+                            } else {
+                                Some(*index) == forced
+                            }
+                        })
+                        .max_by_key(|(_, candidate)| {
+                            (
+                                candidate.facts["dependency_depth"].as_u64().unwrap_or(0),
+                                candidate.facts["prefix_reuse_tokens"].as_u64().unwrap_or(0),
+                                std::cmp::Reverse(
+                                    candidate.facts["profiled_token_cost"]
+                                        .as_u64()
+                                        .unwrap_or(u64::MAX),
+                                ),
+                            )
+                        })
+                        .map(|(index, candidate)| ScheduleSelection {
+                            requests: vec![index as u32],
+                            token_budgets: vec![candidate.max_token_budget.min(
+                                u32::try_from(ctx.capacity.max_total_tokens).unwrap_or(u32::MAX),
+                            )],
+                        })
+                })
+                .flatten();
+        Ok(SchedulePlan {
+            selections: selected.into_iter().collect(),
+        })
     }
 }
 

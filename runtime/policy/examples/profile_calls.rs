@@ -6,7 +6,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use pie_plex::{ContractVersion, Manifest, Operation, PolicyLimits};
+use pie_plex::v0_5::{ContractVersion, Manifest, Operation, PolicyLimits};
 use pie_policy::{
     AttachedPolicy, AttachmentRegistry, Invocation, InvocationFailureKind, PolicyEngine,
     PolicyEngineConfig, RejectingQueryHandler, StateSnapshot,
@@ -269,6 +269,7 @@ impl PlexSetup {
             operations: BTreeSet::from([Operation::Schedule]),
             limits: PolicyLimits {
                 memory_bytes: MEMORY_BYTES as u64,
+                fuel: 1,
                 deadline_ms: 100,
                 input_bytes: 1 << 20,
                 output_bytes: 1 << 20,

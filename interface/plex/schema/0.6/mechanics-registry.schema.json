@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pie-project.org/schema/plex/0.6/mechanics-registry.schema.json",
+  "title": "PLEX v0.6 standard mechanics registry",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["registry_version", "contract", "mechanics"],
+  "properties": {
+    "$schema": {"type": "string", "minLength": 1},
+    "registry_version": {"const": 1},
+    "contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["major", "minor"],
+      "properties": {
+        "major": {"const": 0},
+        "minor": {"const": 6}
+      }
+    },
+    "mechanics": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/mechanic"
+      }
+    }
+  },
+  "$defs": {
+    "versioned-name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9._-]*@[1-9][0-9]*$"
+    },
+    "schema-path": {
+      "oneOf": [
+        {"type": "string", "minLength": 1},
+        {"type": "null"}
+      ]
+    },
+    "mechanic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "method",
+        "request_schema",
+        "feedback_schema",
+        "operations",
+        "description"
+      ],
+      "properties": {
+        "id": {"$ref": "#/$defs/versioned-name"},
+        "kind": {"enum": ["guarantee", "action"]},
+        "method": {
+          "oneOf": [
+            {"$ref": "#/$defs/versioned-name"},
+            {"type": "null"}
+          ]
+        },
+        "request_schema": {"$ref": "#/$defs/schema-path"},
+        "feedback_schema": {"$ref": "#/$defs/schema-path"},
+        "operations": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": ["admit", "route", "schedule", "cache", "feedback"]
+          }
+        },
+        "description": {"type": "string", "minLength": 1}
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {"kind": {"const": "guarantee"}}
+          },
+          "then": {
+            "properties": {
+              "method": {"type": "null"},
+              "request_schema": {"type": "null"},
+              "feedback_schema": {"type": "null"}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {"kind": {"const": "action"}}
+          },
+          "then": {
+            "properties": {
+              "method": {"type": "string"},
+              "request_schema": {"type": "string"},
+              "feedback_schema": {"type": "string"}
+            }
+          }
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "case": "hot-prefix-admission",
+  "reuse_count": 4,
+  "hot_threshold": 2
+}

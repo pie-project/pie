@@ -1,0 +1,33 @@
+{
+  "id": "infercept",
+  "title": "InferCept: Efficient Intercept Support for Augmented Large Language Model Inference",
+  "paper_version": "arXiv 2402.01869",
+  "source_url": "https://arxiv.org/abs/2402.01869",
+  "source_commit": null,
+  "source_license": "paper reference; no source copied",
+  "component": "plex_paper_infercept",
+  "implements": [
+    "schedule",
+    "cache"
+  ],
+  "policy_kernel": [
+    "resume-aware scheduling",
+    "preserve/swap/discard from expected waste"
+  ],
+  "required_facts": [
+    "resuming",
+    "expected_waste_tokens",
+    "expected_reuse_ms",
+    "recompute_ms"
+  ],
+  "required_mechanics": [],
+  "optional_mechanics": [
+    "cache.swap@1"
+  ],
+  "deferred_mechanics": [
+    "physical swap implementation"
+  ],
+  "evidence_level": "policy-kernel-reproduction",
+  "fixture_provenance": "independent reference model from the paper",
+  "validation_status": "passing"
+}

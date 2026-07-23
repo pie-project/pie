@@ -1,0 +1,30 @@
+{
+  "id": "dlpm",
+  "title": "Locality-aware Fair Scheduling in LLM Serving",
+  "paper_version": "arXiv 2501.14312",
+  "source_url": "https://arxiv.org/abs/2501.14312",
+  "source_commit": null,
+  "source_license": "paper reference; no source copied",
+  "component": "plex_paper_dlpm",
+  "implements": [
+    "route",
+    "schedule",
+    "feedback"
+  ],
+  "policy_kernel": [
+    "deficit-credit fairness",
+    "prefix-local routing and scheduling"
+  ],
+  "required_facts": [
+    "client_id",
+    "cached_tokens",
+    "load",
+    "quantum",
+    "service_tokens"
+  ],
+  "required_mechanics": [],
+  "deferred_mechanics": [],
+  "evidence_level": "policy-kernel-reproduction",
+  "fixture_provenance": "independent reference model from the paper",
+  "validation_status": "passing"
+}

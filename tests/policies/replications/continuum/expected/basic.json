@@ -1,0 +1,4 @@
+{
+  "selected_request_ids": ["B"],
+  "invariants": ["preempted work precedes ordinary FCFS work", "TTL state is feedback-owned"]
+}

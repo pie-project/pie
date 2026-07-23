@@ -1,0 +1,5 @@
+{
+  "case": "risk-migration",
+  "risk_ppm": 900,
+  "migration_threshold_ppm": 800
+}

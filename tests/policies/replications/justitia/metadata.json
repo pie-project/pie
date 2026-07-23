@@ -1,0 +1,27 @@
+{
+  "id": "justitia",
+  "title": "Justitia: Fair and Efficient Scheduling of Task-parallel LLM Agents with Selective Pampering",
+  "paper_version": "arXiv 2510.17015",
+  "source_url": "https://arxiv.org/abs/2510.17015",
+  "source_commit": null,
+  "source_license": "paper reference; no source copied",
+  "component": "plex_paper_justitia",
+  "implements": [
+    "schedule",
+    "feedback"
+  ],
+  "policy_kernel": [
+    "group completion-order fairness",
+    "feedback-maintained branch completion"
+  ],
+  "required_facts": [
+    "completed_branches"
+  ],
+  "required_mechanics": [],
+  "deferred_mechanics": [
+    "simultaneous branch execution"
+  ],
+  "evidence_level": "policy-kernel-reproduction",
+  "fixture_provenance": "independent reference model from the paper",
+  "validation_status": "passing"
+}

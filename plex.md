@@ -10,13 +10,16 @@ v0.5 codebase. It is the design reference for:
 - the `pie-policy` host runtime;
 - the Rust guest SDK;
 - the Python host binding; and
-- the mock conformance paths and live version-pinned vLLM and SGLang
-  integrations.
+- the mock PIE, vLLM, and SGLang integration paths.
 
 The implementation is a research prototype, but the behavior documented here
 is implemented and tested unless a section explicitly says otherwise. Older
 planning documents describe intermediate designs and are not normative for
 v0.5.
+
+The breaking v0.6 contract is defined in
+[`plex_0.6_contract.md`](plex_0.6_contract.md). The active runtime has migrated
+to v0.6; this document remains the historical v0.5 reference.
 
 PLEX v0.5 is intentionally JSON-oriented. "Untyped" in this document means
 that application-specific values are JSON rather than generated schema types.
@@ -201,7 +204,7 @@ PLEX v0.5 does not attempt to provide:
 - Python policy authoring;
 - a production distributed state backend;
 - signed policy packages; or
-- a cluster-router implementation for the `route` hook.
+- version-pinned live vLLM and SGLang plugins.
 
 ## 4. Core Concepts
 
@@ -1679,6 +1682,7 @@ A package manifest contains:
   ],
   "limits": {
     "memory_bytes": 4194304,
+    "fuel": 2000000,
     "deadline_ms": 100,
     "input_bytes": 1048576,
     "output_bytes": 1048576
@@ -1694,8 +1698,12 @@ Manifest rules:
   alphanumeric;
 - package version is at most 32 bytes and exactly three numeric components;
 - at least one operation is declared;
-- every limit is non-zero; and
-- every requested limit must fit within the host maximum.
+- every active limit is non-zero; and
+- every requested active limit must fit within the host maximum.
+
+The `fuel` member remains in v0.5 format-5 manifests only for wire
+compatibility. Current hosts ignore its value and do not enable Wasmtime fuel;
+deadline interruption is the execution-time bound.
 
 ### 18.2 `.plexpkg` format
 
@@ -1837,21 +1845,6 @@ runtime = Runtime(
 outcome = runtime.invoke(event)
 ```
 
-The Python package also provides an asynchronous worker seam:
-
-```python
-from pie_plex import AsyncRuntime
-
-runtime = AsyncRuntime("policy.plexpkg", queue_capacity=256)
-runtime.try_submit("schedule", epoch, event)
-latest = runtime.latest("schedule", after_epoch)
-```
-
-`try_submit` never waits for policy execution. A Rust-owned worker serially
-executes PLEX transactions and atomically publishes the latest outcome for each
-hook channel. Submission uses a bounded queue and returns `False` rather than
-blocking when the worker cannot accept more work.
-
 The native seam is:
 
 ```text
@@ -1937,23 +1930,6 @@ These adapters do not import vLLM or SGLang internals and do not claim live,
 version-pinned compatibility. They are conformance templates that isolate
 version-specific snapshot and apply logic from the PLEX contract.
 
-The live version-pinned integrations are implemented in the `ingim/vllm` and
-`ingim/sglang` forks. Both load `pie-plex` only when a policy path is configured
-and run Wasm/state processing on a Rust-owned asynchronous worker. Engine hot
-paths consume only immutable cached plans and immediately use native behavior
-when a plan is missing, stale, unavailable, or failed. Admission is optimistic
-and handled outside the engine adapter; feedback is coalesced at completion,
-abort, and preemption boundaries. vLLM caches standing runnable and
-request-retention plans. SGLang
-caches prefill-admission and decode-retraction plans because an already-resident
-decode batch executes as one native unit.
-
-Snapshot publication occurs when request membership or residency changes, not
-on every decode token. Consequently, policy facts and decisions can be stale
-for a bounded lifecycle interval. This is an intentional production tradeoff:
-fresh same-step set-dependent decisions require blocking and are available only
-through the synchronous `Runtime` API used by tests and offline experiments.
-
 ## 22. Runtime Isolation and Limits
 
 ### 22.1 Default host limits
@@ -1972,8 +1948,8 @@ through the synchronous `Runtime` API used by tests and offline experiments.
 | Concurrent Wasm invocations | 128 |
 | Successful feedback ledger entries | 4,096 |
 
-Package manifests request per-policy memory, deadline, input, and output
-limits at or below the host maxima.
+Package manifests request per-policy memory, deadline, input, and output limits
+at or below the host maxima.
 
 ### 22.2 Wasmtime protections
 
@@ -2018,10 +1994,10 @@ implementation must bound its own work.
 
 ### 22.4 Deterministic replay mode
 
-Deterministic replay disables the real-time epoch ticker. Structural, memory,
-and host-call validation remain active. The epoch deadline is effectively
-disabled in this mode, removing wall-clock timing as a replay source of
-nondeterminism.
+Replay keeps epoch deadlines active so a non-terminating guest cannot hang the
+runner. Inputs, host responses, and state remain deterministic; traces whose
+semantic result depends on crossing a wall-clock deadline are rejected when
+the repeated executions diverge.
 
 ## 23. Replay and Validation
 
@@ -2091,7 +2067,7 @@ PLEX has four independent version axes:
 |---|---|---|
 | Engine JSON API | `pie.plex.engine@1` | Engine/runtime envelope |
 | WIT contract | `pie:plex@0.5.0` | Guest/host ABI |
-| Package format | `6` | Binary `.plexpkg` layout |
+| Package format | `5` | Binary `.plexpkg` layout |
 | Helper method | e.g. `pie.kv.prefetch@1` | Query/action semantics |
 
 This separation is intentional:
@@ -2122,9 +2098,8 @@ The current implementation provides:
 - bounded Wasmtime execution;
 - package integrity and atomic publication;
 - deterministic replay;
-- Python binding and concurrency handling;
-- mock engine adapter conformance; and
-- live version-pinned vLLM and SGLang integrations.
+- Python binding and concurrency handling; and
+- mock engine adapter conformance.
 
 ### 25.2 Known limitations
 
@@ -2143,12 +2118,8 @@ The current milestone does not provide:
 - an independent timeout around host query callbacks;
 - shared physical units with multiple mutable request owners;
 - automatic route invalidation after field mutation;
-- Python guest policy authoring;
-- a live cluster-router `route` integration;
-- cross-process policy state without a distributed backend;
-- PLEX actions in the current vLLM/SGLang adapters;
-- SGLang PLEX support in disaggregated serving modes; or
-- exact same-step policy decisions in the asynchronous engine adapters.
+- Python guest policy authoring; or
+- live version-pinned vLLM/SGLang integrations.
 
 The architecture keeps these mechanisms outside the v0.5 stable waist so they
 can evolve without expanding the policy ABI prematurely.
@@ -2169,8 +2140,6 @@ can evolve without expanding the policy ABI prematurely.
 | Deterministic replay | `runtime/policy/src/replay.rs` |
 | Rust guest SDK | `sdk/rust/plex/` |
 | Python host binding | `sdk/python-plex/` |
-| Live vLLM adapter | `ingim/vllm:vllm/v1/core/sched/async_plex.py` |
-| Live SGLang adapter | `ingim/sglang:python/sglang/srt/managers/async_plex.py` |
 | Policy fixtures | `tests/policies/` |
 | Fixture build pipeline | `scripts/build-plex-policies.sh` |
 

@@ -1,0 +1,11 @@
+[package]
+name = "plex-paper-common"
+version = "0.6.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+plex = { package = "pie-plex-sdk", path = "../../../sdk/rust/plex" }

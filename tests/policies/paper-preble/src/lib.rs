@@ -1,40 +1,47 @@
-//! JSON adaptation of Preble E2 routing.
-//! https://arxiv.org/abs/2407.00023
+//! Preble E2 exploit/explore routing over a sparse feasible graph.
 
-use plex::serde_json::json;
-use plex::{Document, Host, Policy, State};
+use plex::{Host, Policy, RouteContext, RouteDecision, RoutePlan, State};
 
 struct Preble;
 
 impl Policy for Preble {
-    fn route(ctx: &Document, _state: &mut State, _host: &Host) -> Result<Document, String> {
-        let candidates = ctx["candidates"]
-            .as_array()
-            .ok_or("candidates must be an array")?;
-        let remaining = candidates
-            .first()
-            .and_then(|candidate| candidate["facts"]["uncached_tokens"].as_u64())
-            .unwrap_or(0);
-        let longest = candidates
+    fn route(ctx: &RouteContext, _state: &mut State, _host: &Host) -> plex::Result<RoutePlan> {
+        let decisions = ctx
+            .requests
             .iter()
-            .filter_map(|candidate| candidate["facts"]["cached_tokens"].as_u64())
-            .max()
-            .unwrap_or(0);
-        let exploit = longest > remaining;
-        let scores = candidates
-            .iter()
-            .map(|candidate| {
-                let cached = candidate["facts"]["cached_tokens"].as_u64().unwrap_or(0);
-                let load = candidate["facts"]["load_cost"].as_u64().unwrap_or(0);
-                let eviction = candidate["facts"]["eviction_cost"].as_u64().unwrap_or(0);
-                if exploit {
-                    cached as f64
-                } else {
-                    -(load.saturating_add(eviction).saturating_add(remaining) as f64)
-                }
+            .enumerate()
+            .map(|(request_index, request)| {
+                let edges = ctx
+                    .feasible_edges
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, edge)| edge.request_index as usize == request_index)
+                    .collect::<Vec<_>>();
+                let remaining = request.facts["uncached_tokens"].as_u64().unwrap_or(0);
+                let longest = edges
+                    .iter()
+                    .map(|(_, edge)| edge.facts["cached_tokens"].as_u64().unwrap_or(0))
+                    .max()
+                    .unwrap_or(0);
+                let exploit = longest > remaining;
+                edges
+                    .into_iter()
+                    .max_by_key(|(_, edge)| {
+                        if exploit {
+                            edge.facts["cached_tokens"].as_i64().unwrap_or(0)
+                        } else {
+                            -((edge.facts["load_cost"].as_i64().unwrap_or(0)
+                                + edge.facts["eviction_cost"].as_i64().unwrap_or(0)
+                                + remaining as i64)
+                                .max(0))
+                        }
+                    })
+                    .map_or(RouteDecision::Defer, |(index, _)| {
+                        RouteDecision::Assign(index as u32)
+                    })
             })
-            .collect::<Vec<_>>();
-        Ok(json!({"scores": scores}))
+            .collect();
+        Ok(RoutePlan { decisions })
     }
 }
 

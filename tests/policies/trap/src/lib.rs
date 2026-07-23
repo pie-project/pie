@@ -1,14 +1,17 @@
 use plex::serde_json::json;
-use plex::{Document, Host, Policy, State};
+use plex::{Host, Policy, RouteContext, RoutePlan, State};
 
 struct Trap;
 
 impl Policy for Trap {
-    fn route(ctx: &Document, state: &mut State, _host: &Host) -> Result<Document, String> {
-        let request_id = ctx["request_id"].as_str().unwrap_or("");
-        state.request_mut(request_id)?.scratch["should_not_commit"] = json!(true);
+    fn route(ctx: &RouteContext, state: &mut State, _host: &Host) -> plex::Result<RoutePlan> {
+        if let Some(request) = ctx.requests.first() {
+            state
+                .request_mut(request.request.request_id.as_str())?
+                .scratch["should_not_commit"] = json!(true);
+        }
         state.shared["should_not_commit"] = json!(true);
-        panic!("injected JSON PLEX trap")
+        panic!("injected typed PLEX trap")
     }
 }
 

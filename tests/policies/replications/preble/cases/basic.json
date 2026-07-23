@@ -1,0 +1,9 @@
+{
+  "case": "exploit-longest-prefix",
+  "operation": "route",
+  "request": {"uncached_tokens": 4},
+  "edges": [
+    {"target_id": "X", "cached_tokens": 8, "load_cost": 10, "eviction_cost": 1},
+    {"target_id": "Y", "cached_tokens": 2, "load_cost": 1, "eviction_cost": 1}
+  ]
+}

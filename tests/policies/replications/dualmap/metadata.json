@@ -1,0 +1,33 @@
+{
+  "id": "dualmap",
+  "title": "DualMap: Enabling Both Cache Affinity and Load Balancing for Distributed LLM Serving",
+  "paper_version": "arXiv 2602.06502",
+  "source_url": "https://arxiv.org/abs/2602.06502",
+  "source_commit": null,
+  "source_license": "paper reference; no source copied",
+  "component": "plex_paper_dualmap",
+  "implements": [
+    "route"
+  ],
+  "policy_kernel": [
+    "two-choice prefix hashing",
+    "SLO-aware choice",
+    "hotspot migration intent"
+  ],
+  "required_facts": [
+    "prefix_hit",
+    "slo_risk",
+    "hash_choice",
+    "hotspot"
+  ],
+  "required_mechanics": [],
+  "optional_mechanics": [
+    "request.rebalance@1"
+  ],
+  "deferred_mechanics": [
+    "physical migration"
+  ],
+  "evidence_level": "policy-kernel-reproduction",
+  "fixture_provenance": "independent reference model from the paper",
+  "validation_status": "passing"
+}

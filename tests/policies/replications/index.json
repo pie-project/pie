@@ -1,0 +1,39 @@
+{
+  "contract": {
+    "major": 0,
+    "minor": 6
+  },
+  "replications": [
+    "agentix",
+    "continuum",
+    "kvflow",
+    "preble",
+    "helium",
+    "vtc",
+    "lmetric",
+    "fairserve",
+    "marconi",
+    "ragcache",
+    "dlpm",
+    "infercept",
+    "peek",
+    "qlm",
+    "slos-serve",
+    "dynasor",
+    "justitia",
+    "chameleon",
+    "hotprefix",
+    "pard",
+    "branch-regulation",
+    "dualmap",
+    "llumnix",
+    "smetric",
+    "thunderagent",
+    "pythia",
+    "goodserve",
+    "conserve",
+    "parrot",
+    "saga",
+    "routebalance"
+  ]
+}

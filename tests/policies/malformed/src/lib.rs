@@ -1,11 +1,12 @@
-use plex::serde_json::json;
-use plex::{Document, Host, Policy, State};
+use plex::{Host, Policy, RouteContext, RoutePlan, State};
 
 struct Malformed;
 
 impl Policy for Malformed {
-    fn route(_ctx: &Document, _state: &mut State, _host: &Host) -> Result<Document, String> {
-        Ok(json!({"scores": []}))
+    fn route(ctx: &RouteContext, _state: &mut State, _host: &Host) -> plex::Result<RoutePlan> {
+        Ok(RoutePlan {
+            decisions: Vec::with_capacity(ctx.requests.len()),
+        })
     }
 }
 

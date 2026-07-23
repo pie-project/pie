@@ -1,0 +1,162 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pie-project.org/schema/plex/0.6/replay-fixture.schema.json",
+  "title": "PLEX v0.6 deterministic replay fixture",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "fixture_version",
+    "name",
+    "contract",
+    "package",
+    "attachment_generation",
+    "operation",
+    "invocation",
+    "host_calls",
+    "expected"
+  ],
+  "properties": {
+    "$schema": {"type": "string", "minLength": 1},
+    "fixture_version": {"const": 1},
+    "name": {"type": "string", "minLength": 1, "maxLength": 128},
+    "contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["major", "minor"],
+      "properties": {
+        "major": {"const": 0},
+        "minor": {"const": 6}
+      }
+    },
+    "package": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1, "maxLength": 64},
+        "version": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+        }
+      }
+    },
+    "attachment_generation": {"type": "integer", "minimum": 0},
+    "operation": {
+      "enum": ["admit", "route", "schedule", "cache", "feedback"]
+    },
+    "invocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["context", "state"],
+      "properties": {
+        "context": {"type": "object"},
+        "state": {"$ref": "policy-state.schema.json"}
+      }
+    },
+    "host_calls": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/host-call"
+      }
+    },
+    "expected": {
+      "oneOf": [
+        {"$ref": "#/$defs/success"},
+        {"$ref": "#/$defs/failure"}
+      ]
+    }
+  },
+  "$defs": {
+    "host-call": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "method", "args", "result"],
+      "properties": {
+        "kind": {"enum": ["query", "action"]},
+        "method": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9._-]*@[1-9][0-9]*$"
+        },
+        "args": {"$ref": "document.schema.json"},
+        "result": {
+          "oneOf": [
+            {"$ref": "document.schema.json"},
+            {"type": "integer", "minimum": 0},
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["error"],
+              "properties": {
+                "error": {"type": "string"}
+              }
+            }
+          ]
+        }
+      }
+    },
+    "staged-action": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["action_id", "method", "args"],
+      "properties": {
+        "action_id": {"type": "integer", "minimum": 0},
+        "method": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9._-]*@[1-9][0-9]*$"
+        },
+        "args": {"$ref": "document.schema.json"}
+      }
+    },
+    "success": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "raw_guest_output",
+        "normalized_plan",
+        "state_update",
+        "commit",
+        "actions"
+      ],
+      "properties": {
+        "status": {"const": "success"},
+        "raw_guest_output": {"type": "object"},
+        "normalized_plan": {
+          "oneOf": [
+            {"type": "object"},
+            {"type": "null"}
+          ]
+        },
+        "state_update": {"$ref": "state-update.schema.json"},
+        "commit": {"enum": ["committed", "duplicate-feedback"]},
+        "actions": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/staged-action"}
+        }
+      }
+    },
+    "failure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "kind", "message"],
+      "properties": {
+        "status": {"const": "failure"},
+        "kind": {
+          "enum": [
+            "policy-error",
+            "invalid-context",
+            "invalid-output",
+            "state-conflict",
+            "unsupported-mechanic",
+            "resource-limit",
+            "deadline-exceeded",
+            "host-saturated",
+            "trap",
+            "enactment-failed"
+          ]
+        },
+        "message": {"type": "string"}
+      }
+    }
+  }
+}

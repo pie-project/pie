@@ -1,0 +1,32 @@
+{
+  "id": "slos-serve",
+  "title": "SLOs-Serve: Optimized Serving of Multi-SLO LLMs",
+  "paper_version": "arXiv 2504.08784",
+  "source_url": "https://arxiv.org/abs/2504.08784",
+  "source_commit": null,
+  "source_license": "paper reference; no source copied",
+  "component": "plex_paper_slos_serve",
+  "implements": [
+    "admit",
+    "route",
+    "schedule"
+  ],
+  "policy_kernel": [
+    "multi-stage SLO admission",
+    "latency-aware routing",
+    "slack scheduling"
+  ],
+  "required_facts": [
+    "predicted_total_ms",
+    "slo_ms",
+    "stage_latency_ms",
+    "slack_ms"
+  ],
+  "required_mechanics": [],
+  "deferred_mechanics": [
+    "replica provisioning"
+  ],
+  "evidence_level": "policy-kernel-reproduction",
+  "fixture_provenance": "independent reference model from the paper",
+  "validation_status": "passing"
+}

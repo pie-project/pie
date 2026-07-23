@@ -95,9 +95,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
-name = "pie-plex-sdk"
-version = "0.5.0"
+name = "pie-plex"
+version = "0.6.0"
 dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "pie-plex-sdk"
+version = "0.6.0"
+dependencies = [
+ "pie-plex",
  "serde_json",
  "wit-bindgen",
 ]
@@ -215,10 +225,81 @@ dependencies = [
 ]
 
 [[package]]
+name = "plex-paper-branch-regulation"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
+name = "plex-paper-chameleon"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
+name = "plex-paper-common"
+version = "0.6.0"
+dependencies = [
+ "pie-plex-sdk",
+]
+
+[[package]]
+name = "plex-paper-conserve"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
 name = "plex-paper-continuum"
 version = "0.1.0"
 dependencies = [
  "pie-plex-sdk",
+]
+
+[[package]]
+name = "plex-paper-dlpm"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
+name = "plex-paper-dualmap"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
+name = "plex-paper-dynasor"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
+name = "plex-paper-fairserve"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
+name = "plex-paper-goodserve"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
 ]
 
 [[package]]
@@ -229,6 +310,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "plex-paper-hotprefix"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
+name = "plex-paper-infercept"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
+name = "plex-paper-justitia"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
 name = "plex-paper-kvflow"
 version = "0.1.0"
 dependencies = [
@@ -236,10 +341,130 @@ dependencies = [
 ]
 
 [[package]]
+name = "plex-paper-llumnix"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
+name = "plex-paper-lmetric"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
+name = "plex-paper-marconi"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
+name = "plex-paper-pard"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
+name = "plex-paper-parrot"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
+name = "plex-paper-peek"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
 name = "plex-paper-preble"
 version = "0.1.0"
 dependencies = [
  "pie-plex-sdk",
+]
+
+[[package]]
+name = "plex-paper-pythia"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
+name = "plex-paper-qlm"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
+name = "plex-paper-ragcache"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
+name = "plex-paper-routebalance"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
+name = "plex-paper-saga"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
+name = "plex-paper-slos-serve"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
+name = "plex-paper-smetric"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
+name = "plex-paper-thunderagent"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
+]
+
+[[package]]
+name = "plex-paper-vtc"
+version = "0.1.0"
+dependencies = [
+ "pie-plex-sdk",
+ "plex-paper-common",
 ]
 
 [[package]]
@@ -332,6 +557,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
 dependencies = [
  "serde_core",
+ "serde_derive",
 ]
 
 [[package]]
@@ -387,6 +613,26 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "thiserror"
+version = "2.0.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09a43598840e33d5b0331f38c5e30d13bb11c11210a4b58f0d9b18a5a5eefcd9"
+dependencies = [
+ "thiserror-impl",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "2.0.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "43cbfe0cf76104d42a574802844187e84a305e531ed54455f11fbde0f10541cd"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.2",
 ]
 
 [[package]]

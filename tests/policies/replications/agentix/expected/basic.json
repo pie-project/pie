@@ -1,0 +1,4 @@
+{
+  "selected_request_ids": ["B"],
+  "invariants": ["one request selected", "starved lower-service group wins"]
+}

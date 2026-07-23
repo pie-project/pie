@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pie-project.org/schema/plex/0.6/policy-state.schema.json",
+  "title": "PLEX v0.6 policy state",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["shared", "groups", "requests"],
+  "properties": {
+    "shared": {
+      "$ref": "document.schema.json"
+    },
+    "groups": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/group-state"
+      }
+    },
+    "requests": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/request-state"
+      }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "request-ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["request_id", "generation_id", "group_id", "principal_id"],
+      "properties": {
+        "request_id": {"$ref": "#/$defs/id"},
+        "generation_id": {"type": "integer", "minimum": 0},
+        "group_id": {
+          "oneOf": [
+            {"$ref": "#/$defs/id"},
+            {"type": "null"}
+          ]
+        },
+        "principal_id": {"$ref": "#/$defs/id"}
+      }
+    },
+    "group-limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_members", "max_scratch_bytes"],
+      "properties": {
+        "max_members": {"type": "integer", "minimum": 1, "maximum": 4294967295},
+        "max_scratch_bytes": {"type": "integer", "minimum": 1}
+      }
+    },
+    "group-state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "group_id",
+        "principal_id",
+        "status",
+        "limits",
+        "member_count",
+        "facts",
+        "scratch"
+      ],
+      "properties": {
+        "group_id": {"$ref": "#/$defs/id"},
+        "principal_id": {"$ref": "#/$defs/id"},
+        "status": {
+          "enum": ["open", "closed", "cancelled", "expired"]
+        },
+        "limits": {"$ref": "#/$defs/group-limits"},
+        "member_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "facts": {"$ref": "document.schema.json"},
+        "scratch": {"$ref": "document.schema.json"}
+      }
+    },
+    "request-state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["request", "status", "facts", "fields", "scratch"],
+      "properties": {
+        "request": {"$ref": "#/$defs/request-ref"},
+        "status": {
+          "enum": [
+            "pending",
+            "admitted",
+            "active",
+            "paused",
+            "completed",
+            "failed",
+            "cancelled",
+            "expired",
+            "rejected"
+          ]
+        },
+        "facts": {"$ref": "document.schema.json"},
+        "fields": {"$ref": "document.schema.json"},
+        "scratch": {"$ref": "document.schema.json"}
+      }
+    }
+  }
+}

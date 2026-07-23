@@ -1,0 +1,30 @@
+{
+  "id": "qlm",
+  "title": "Queue Management for SLO-Oriented Large Language Model Serving",
+  "paper_version": "arXiv 2407.00047",
+  "source_url": "https://arxiv.org/abs/2407.00047",
+  "source_commit": null,
+  "source_license": "paper reference; no source copied",
+  "component": "plex_paper_qlm",
+  "implements": [
+    "admit",
+    "route",
+    "schedule",
+    "feedback"
+  ],
+  "policy_kernel": [
+    "wait estimation",
+    "virtual queues",
+    "group-aware scheduling"
+  ],
+  "required_facts": [
+    "estimated_wait_ms",
+    "slo_ms",
+    "virtual_wait"
+  ],
+  "required_mechanics": [],
+  "deferred_mechanics": [],
+  "evidence_level": "policy-kernel-reproduction",
+  "fixture_provenance": "independent reference model from the paper",
+  "validation_status": "passing"
+}

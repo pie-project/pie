@@ -48,21 +48,21 @@ metadata is insufficient when the policy that acts on it remains fixed, and
 today testing a new policy commonly requires an engine fork.
 
 \textbf{PLEX} makes the request lifecycle programmable. We define a
-\emph{logical request} as one admitted unit of serving work and derive a
+\emph{request} as one admitted unit of serving work and derive a
 five-operation policy waist: \texttt{admit}, \texttt{route},
-\texttt{schedule}, \texttt{evict}, and \texttt{feedback}. The first four
+\texttt{schedule}, \texttt{cache}, and \texttt{feedback}. The first four
 control lifecycle entry and the three recurring resource arbitrations; the
 last closes the loop with enacted outcomes. Policies receive typed
 host-observed facts and untrusted request metadata, and share state through
-typed maps. Thin adapters retain engine mechanics and feasible-action
+explicit shared, work-group, and request scopes. Thin adapters retain engine
+mechanics and feasible-action
 enforcement, while a WebAssembly host verifies, meters, and atomically replaces
 operator-installed policy packages. The fourteen trigger/resource
 combinations observed in a corpus of {[$K$]} prior artifacts collapse into the
-five core operations and two explicitly optional operations without
-{[measured loss of coverage]}. Our prototype reproduces five serving-policy
-forks in 20--89 lines each, runs unchanged across {[$N$]} engines, and adds
-{[measured overhead]}, while enabling coordinated policies that improve
-{[workflow metric]} by {[$X$\%]} over independently loaded policies.
+five core operations plus explicitly negotiated engine mechanics without
+{[measured loss of coverage]}. The artifact implements and classifies 31
+policy kernels, exercises equivalent vLLM and SGLang adapter templates, and
+records validator and runtime overhead against committed regression budgets.
 \end{abstract}
 ]
 
@@ -106,7 +106,7 @@ The first wave of agent-aware serving systems demonstrates the value of such
 information: program-level fairness, workflow-aware eviction, tool-call
 continuation, cache-locality routing, and task-level accounting report
 substantial gains~\cite{sheng2024fairness,abhyankar2024infercept,
-luo2025autellix,fu2024efficient}. Almost every result, however, is delivered
+luo2025autellix}. Almost every result, however, is delivered
 as a fork of one engine at one version. The policy hypothesis is tens of
 lines; the surrounding surgery is thousands, must be repeated across engines,
 and decays as internals change.
@@ -121,24 +121,25 @@ workload. \emph{What has to cross the engine boundary is not context alone but
 the policy that acts on it.}
 
 PLEX is the narrow contract for that crossing. We first name the policy's
-persistent subject: a \emph{logical request} is one admitted unit of serving
+persistent subject: a \emph{request} is one admitted unit of serving
 work, possibly realized as several generations linked by trusted
 continuations. We then separate control from mechanics and identify three
 recurring resource arbitrations: where work runs (placement), who runs and for
 how long (service), and what state remains resident (residency). These yield
 three policy operations---\texttt{route}, \texttt{schedule}, and
-\texttt{evict}---bracketed by \texttt{admit} at lifecycle entry and
-\texttt{feedback} after execution. Two mechanics-heavy operations,
-\texttt{prefetch} and \texttt{rebalance}, are explicit optional extensions.
+\texttt{cache}---bracketed by \texttt{admit} at lifecycle entry and
+\texttt{feedback} after execution. Prefetch, cancellation, swap, migration,
+and atomic enqueue remain versioned optional engine mechanics and actions
+rather than additional core operations.
 
 PLEX policies are operator-installed WebAssembly components. A hook receives
-typed host facts and typed, untrusted request metadata. Durable configuration,
-learned state, and coordination use one typed-map abstraction. The host
-resolves symbolic fields and maps to compact handles at attachment, verifies
-required capabilities, supplies only feasible candidates, and stages map
-writes until a hook succeeds. Adapters translate each engine's internals into
-the contract but leave batch construction, allocation, transfer, and kernels
-inside the engine.
+typed structural records plus bounded JSON documents for extensible facts,
+fields, and scratch. Durable policy state is explicit at the component
+boundary: shared state, trusted work-group state, and the exact referenced
+request set. The host verifies required mechanics and schemas, supplies only
+feasible candidates, and conditionally commits sparse state replacements.
+Adapters translate each engine's internals into the contract but leave batch
+construction, allocation, transfer, and kernels inside the engine.
 
 The design follows a lesson from extensible systems: stabilize kinds of
 authority, not every event that may ever occur. A continuation and a fresh
@@ -152,21 +153,21 @@ five-operation waist rather than fourteen ABI callbacks.
 This paper makes four contributions:
 
 \begin{itemize}
-\item \textbf{A programmable subject and stable waist.} We define the logical
-  request and derive five core operations from lifecycle entry, three resource
-  arbitrations, and closed-loop feedback
+\item \textbf{Programmable subjects and a stable waist.} We define
+  \texttt{Request} and trusted \texttt{WorkGroup}, then derive five core
+  operations from lifecycle entry, three resource arbitrations, and closed-loop feedback
   (\S\ref{sec:waist}).
-\item \textbf{A small extensible contract.} Policies use typed fields and maps;
-  attachment links symbolic extensions, checks capabilities, and preserves
+\item \textbf{A small extensible contract.} Policies use typed structure and
+  explicit scoped state; attachment checks schemas and mechanics and preserves
   provenance without exposing engine mechanics
   (\S\ref{sec:programming}).
 \item \textbf{A portable implementation.} A generic Wasm host and thin
-  adapters provide bounded execution, transactional state, replacement, and
+  adapters provide bounded execution, conditional policy-state commit, replacement, and
   engine-default fallback (\S\ref{sec:system}).
-\item \textbf{Evidence from policies and engines.} We map the first-wave
-  corpus to the new surface, reproduce five forks in 20--89 lines, compare
-  identical binaries across [$N$] engines, and measure composition,
-  extensibility, and overhead (\S\ref{sec:eval}).
+\item \textbf{Evidence from policies and engines.} We map 87 papers to the
+  surface, implement 31 evidence-classified policy kernels, run one typed
+  fixture suite through the host and two adapter templates, and measure
+  validator and runtime overhead (\S\ref{sec:eval}).
 \end{itemize}
 
 \begin{figure}[t]
@@ -174,11 +175,11 @@ This paper makes four contributions:
 \framebox[\columnwidth]{\parbox[c][5.0cm][c]{0.92\columnwidth}{\centering
 \emph{Placeholder --- Figure 1.}\\[2pt]
 \footnotesize Left: one engine generation, from prompt to stop. Right: one
-logical request spanning generations $G_0,G_1,G_2$, with tool pauses,
+request spanning generations $G_0,G_1,G_2$, with tool pauses,
 single-use continuation capabilities, persistent accounting, and KV state
-that may outlive each generation. Optional workflow edges relate this logical
-request to siblings without merging their identities.}}
-\caption{The policy subject has outgrown one generation. A logical request is
+that may outlive each generation. A trusted WorkGroup may relate this request
+to independently routed and scheduled siblings without merging identities.}}
+\caption{The policy subject has outgrown one generation. A request is
 admitted once, may pause and continue across generations, and reaches one
 terminal outcome.}
 \label{fig:lifecycle}
@@ -254,7 +255,7 @@ entry.}
 \midrule
 Program fairness & vLLM [v0.x] & [$\sim$x{,}xxx] & [32] &
 \texttt{scheduling.step} & program ID, attained service & [No] \\
-Workflow eviction & vLLM [v0.x] & [$\sim$x{,}xxx] & [30] &
+Workflow cache policy & vLLM [v0.x] & [$\sim$x{,}xxx] & [30] &
 \texttt{caching.pressure} & steps to execution & [No] \\
 Tool continuation & SGLang [vx.x] & [$\sim$x{,}xxx] & [24] &
 \shortstack[l]{\texttt{caching.boundary}\\
@@ -262,8 +263,8 @@ Tool continuation & SGLang [vx.x] & [$\sim$x{,}xxx] & [24] &
 stop reason, resume hint & [No] \\
 Locality routing & [router, vx.x] & [$\sim$xxx] & [28] &
 \texttt{routing.arrive} & workflow ID, cache reuse & [Partial] \\
-Bundle fairness & vLLM [v0.x] & [$\sim$x{,}xxx] & [55] &
-\texttt{scheduling.step} & bundle ID & [No] \\
+Critical-path scheduling & [workflow engine] & [$\sim$x{,}xxx] & [55] &
+\texttt{scheduling.step} & trusted readiness, dependency depth, cache reuse & [No] \\
 \bottomrule
 \end{tabular}
 \end{table*}
@@ -285,12 +286,12 @@ adding one ABI entry per new workload event.
 \label{sec:model}
 \label{sec:derivation}
 
-\subsection{The subject: logical requests}
+\subsection{The subject: requests}
 \label{sec:subject}
 
 An engine's natural work unit is a \emph{generation}: a prompt arrives,
 tokens stream, and the sequence stops. Policy often needs a larger but still
-bounded subject. We call a \emph{logical request} one admitted unit of serving
+bounded subject. We call a \emph{request} one admitted unit of serving
 work, possibly realized as a sequence of generations linked by trusted
 continuations, and ending in exactly one terminal outcome: completion,
 cancellation, or expiry.
@@ -298,9 +299,17 @@ cancellation, or expiry.
 Identity is established by capability rather than caller declaration. At a
 pausing boundary, the host may issue a single-use, expiring continuation
 capability. Presenting it links the follow-up generation to the existing
-logical request. A caller cannot forge continuity across principals, and
-expiry or cancellation terminates the logical request. A standalone call is
-simply a one-generation logical request.
+request. A caller cannot forge continuity across principals, and
+expiry or cancellation terminates the request. A standalone call is
+simply a one-generation request.
+
+Parallel agent calls require a second, orthogonal subject. A
+\emph{WorkGroup} is a host-issued coordination scope whose principal,
+lifecycle, quotas, facts, and scratch can outlive any one member request.
+Membership is immutable and authenticated; copying a group identifier into
+metadata does not establish membership. A work group is not itself schedulable
+and does not imply a DAG runtime, co-location, atomic enqueue, or simultaneous
+execution.
 
 The distinction is behavioral, not an engine implementation requirement.
 Some engines keep one internal request open during a tool call; others end it
@@ -308,16 +317,17 @@ and later create another. The adapter binds either representation to the same
 host identity. Likewise, preemption and restart remain in one generation,
 while prefill-to-decode handoff changes execution stage but not identity.
 
-What persists is the reason to name the subject. While blocked, a logical
-request occupies no running batch slot, yet it leaves a \emph{physical
+What persists is the reason to name the subject. While blocked, a request
+occupies no running batch slot, yet it leaves a \emph{physical
 shadow}---KV or other state resident in the fleet---and an \emph{accounting
 shadow}---arrival time, attained service, SLO debt, metadata, and placement
 history. Retention, locality, and fairness decisions act on this continuity
 \cite{abhyankar2024infercept,sheng2024fairness,luo2025autellix}.
 
-Logical request does not mean ``candidate everywhere.'' Scheduling ranks
-runnable generations; eviction ranks resident units, including shared units
-that may benefit several requests. Logical identity is the durable
+Request does not mean ``candidate everywhere.'' Scheduling selects
+runnable requests; cache policy evaluates resident and prospective objects,
+including shared objects that may benefit several requests or groups. Request
+identity is the durable
 attribution and accounting key connecting those objects.
 
 \subsection{Control, mechanics, and three arbitrations}
@@ -333,7 +343,7 @@ control and leaves mechanics to engines.
 
 Model the fleet as a nondeterministic machine
 $M=(S,\Sigma,\rightarrow)$. A state includes queues, running generations,
-resident units, replica capacity, and the logical-request table. A transition
+resident units, replica capacity, and the request/work-group tables. A transition
 is labeled by a feasible control action followed by engine mechanics. An
 execution is a serving schedule, and a policy resolves $M$'s nondeterminism at
 states with more than one feasible successor. This framing has two useful
@@ -368,8 +378,8 @@ closed-loop outcome. Table~\ref{tab:hooks} gives the complete core.
 \begin{table*}[t]
 \centering
 \caption{PLEX's policy surface. Core operations name stable kinds of authority;
-causes and events explain why they run. Auxiliary operations require mechanics
-that are not portable across all engines.}
+causes and events explain why they run. Non-portable mechanics remain
+versioned capabilities and actions outside the five-operation waist.}
 \label{tab:hooks}
 \footnotesize
 \setlength{\tabcolsep}{5pt}
@@ -378,53 +388,54 @@ that are not portable across all engines.}
 \textbf{Operation} & \textbf{Class} & \textbf{Direct subject} &
 \textbf{Example invocation} & \textbf{Policy result or effect} \\
 \midrule
-\texttt{admit} & core & new logical request & initial submission &
-accept, defer, or reject \\
-\texttt{route} & core & feasible placements & generation arrival; P/D stage
-transition & dense placement scores \\
-\texttt{schedule} & core & runnable generations & enqueue or engine service
-step & dense service scores and token budgets \\
-\texttt{evict} & core & resident units & allocation deficit or memory
-watermark & dense retention scores \\
+\texttt{admit} & core & pending requests & bounded admission opportunity &
+dense accept, defer, or reject decisions \\
+\texttt{route} & core & request--target feasible graph & admitted work;
+retry; rebalance & dense direct edge assignments or defer \\
+\texttt{schedule} & core & runnable requests & service opportunity &
+non-overlapping selections and token budgets \\
+\texttt{cache} & core & resident and prospective objects & insertion,
+pressure, expiry, or dependency progress & dense admission plus legal reclaim
+order \\
 \texttt{feedback} & core & enacted outcome records & committed progress;
-boundary; preemption; terminal outcome & staged typed-map updates \\
-\midrule
-\texttt{prefetch} & auxiliary & loadable state & anticipated continuation or
-reuse & dense prefetch value \\
-\texttt{rebalance} & auxiliary & migration options & drain, imbalance, or
-hotspot & dense migration value \\
+boundary; preemption; terminal outcome & sparse policy-state updates \\
 \bottomrule
 \end{tabular}
 \end{table*}
 
 \paragraph{Admission.}
-\texttt{admit} is called once for a new logical request. A continuation is
-not admitted again. The host owns deferred submissions and defines a bounded
-reconsideration rule.
+\texttt{admit} receives every pending request in one bounded opportunity.
+The result is dense and request-aligned; accepted requests collectively obey
+the supplied count and resource limits. A continuation of the same request is
+not admitted again. Deferred identities remain pending for a later opportunity
+with a new opportunity ID.
 
 \paragraph{Placement.}
-\texttt{route} is one operation regardless of cause. At generation arrival it
-ranks replicas, pools, or an early-bound multi-stage plan. A late-binding P/D
-system invokes the same operation after prefill with decode placements; a
-static pipeline does not. A continuation is represented by facts such as KV
-residency and elapsed pause, not a separate \texttt{resume} function.
+\texttt{route} receives a bounded request set, targets, and a sparse feasible
+edge graph. It returns a direct joint assignment, so a non-greedy matching is
+expressible without a host-defined score solver. A late-binding P/D system can
+invoke the same operation with stage-specific targets. A continuation is
+represented by facts such as KV residency and elapsed pause, not a separate
+\texttt{resume} function.
 
 \paragraph{Service.}
-\texttt{schedule} ranks runnable generations and may assign token budgets.
-The engine forms the batch. A changed service set may cause the host to
-preempt, but omission from one step is not itself preemption; only an enacted
-revocation later appears as feedback.
+\texttt{schedule} returns explicit non-overlapping selections and aligned
+token budgets. A multi-request selection is all-or-none in the normalized
+plan. Atomic adapter enqueue is a negotiated mechanic; simultaneous GPU start
+is not a core guarantee. Omission from one step is not itself preemption; only
+an enacted revocation later appears as feedback.
 
 \paragraph{Residency.}
-\texttt{evict} ranks only units the adapter can legally reclaim. The host
-frees low-retention candidates until the deficit is met. A radix cache may
-expose leaves while a paged cache exposes pages; the policy contract fixes
-behavioral fields, not engine data structures.
+\texttt{cache} evaluates resident and prospective objects in one snapshot.
+It can bypass a prospective object even with free capacity, admit a valuable
+object while reclaiming a lower-value resident, and return an explicit legal
+reclaim order. Dependency-constrained caches expose a bounded iterative
+episode whose eligible frontier changes after enacted steps.
 
 \paragraph{Feedback.}
 \texttt{feedback} receives batched facts about what actually happened:
 committed prompt and output tokens, service time, boundaries, continuations,
-preemptions, and terminal outcomes. It updates learned or host-consumed maps
+preemptions, and terminal outcomes. It updates learned or host-consumed state
 for later calls. It is step-batched rather than token-callback based, and raw
 tokens, logits, and log-probabilities are outside the core.
 
@@ -436,13 +447,11 @@ operation unless it creates a genuinely different arbitration.
 
 \subsection{Auxiliary operations}
 
-\texttt{prefetch} chooses state to load within a byte or bandwidth budget.
-The adapter still resolves source, transfer, allocation, and failure.
-\texttt{rebalance} ranks live migration options under a migration budget.
-It is meaningful only where the deployment can transfer scheduler and KV
-state, reserve destination capacity, and recover from failure
-\cite{sun2024llumnix}. Engines lacking those mechanics expose neither
-operation. Explicitly separating this tier prevents a portability claim from
+\texttt{cache.prefetch@1} requests proactive state loading, while
+\texttt{request.rebalance@1} requests live movement. The adapter still resolves
+source, transfer, allocation, destination capacity, and failure
+\cite{sun2024llumnix}. Engines lacking those mechanics omit them during
+negotiation. Explicitly separating this tier prevents a portability claim from
 silently depending on emulation.
 
 \subsection{Validation against the first wave}
@@ -457,15 +466,15 @@ preemptions often reported facts rather than making immediate choices.
 We remap each historical point to the new surface. Arrival placement and P/D
 handoff become causes of \texttt{route}; resume becomes request state;
 scheduling arrival becomes \texttt{admit}; step and pressure arbitration
-become \texttt{schedule}; cache pressure becomes \texttt{evict}; progress,
+become \texttt{schedule}; cache pressure becomes \texttt{cache}; progress,
 boundary, resume, preemption, and finish become \texttt{feedback}. Active
-cache loading maps to optional \texttt{prefetch}, and routing under sustained
-imbalance maps to optional \texttt{rebalance}. Idle maintenance remains a
+cache loading maps to optional prefetch action requests, and routing under
+sustained imbalance may stage a rebalance action. Idle maintenance remains a
 host mechanism. The artifact contains the full fourteen-row crosswalk.
 
 Across [$K$] artifacts, the historical labels cover [96\%] of observed policy
 changes, and the remapping preserves [all/$\cdot$\%] of those policies using
-five core and two auxiliary operations. Residual artifacts either modify
+five core operations plus negotiated mechanics. Residual artifacts either modify
 mechanics such as kernels and parallelism or identify [describe any unmatched
 subject]. As a temporal check, a surface frozen on artifacts before [date]
 covers [$\cdot$\%] of [$M$] later artifacts. These measurements test both
@@ -476,10 +485,11 @@ rename triggers.
 \centering
 \framebox[\columnwidth]{\parbox[c][4.5cm][c]{0.92\columnwidth}{\centering
 \emph{Placeholder --- Figure 2.}\\[2pt]
-\footnotesize A logical request enters through \texttt{admit}; placement,
+\footnotesize A request enters through \texttt{admit}; placement,
 service, and residency form the three middle control loops; enacted outcomes
-flow through \texttt{feedback} into typed maps read by later decisions.
-\texttt{prefetch} and \texttt{rebalance} appear outside the core ring.}}
+flow through \texttt{feedback} into shared, group, and request policy state
+read by later decisions. Prefetch, cancellation, swap, and rebalance appear as
+negotiated actions outside the core ring.}}
 \caption{The five-operation stable waist: three resource decisions bracketed
 by admission and feedback. Triggers select an operation; they do not create
 new program types.}
@@ -497,24 +507,23 @@ new program types.}
 A PLEX policy is an operator-installed Wasm component plus a manifest. The
 component may implement any subset of the five core operations; the host
 default owns an unimplemented operation. A package can implement several
-operations and share typed maps across them. At most one package owns a given
+operations and share explicit policy state across them. At most one package owns a given
 operation in a deployment; automatically composing two independently written
 rankers is outside the contract.
 
-Authority is split among four actors. The \emph{application} supplies typed
-but untrusted request metadata. The \emph{policy author} declares hook,
-metadata, map, and capability requirements. The \emph{operator} attaches the
-package to principals or workloads and binds external maps. The
-\emph{adapter and host} authenticate principals, supply authoritative facts
-and feasible candidates, validate results, and enact them through engine
-mechanics.
+Authority is split among four actors. The \emph{application} supplies bounded
+but untrusted request fields. The \emph{policy author} declares implemented
+operations, required and optional mechanics, schema requirements, and resource
+limits. The \emph{operator} attaches the package to principals or workloads and
+chooses supported mechanics and schemas. The \emph{adapter and host}
+authenticate principals, supply authoritative facts and feasible candidates,
+validate results, and enact them through engine mechanics.
 
-Attachment is the approval and linking boundary. Installing a package
-normally approves the metadata schema it declares; administrators need not
-maintain a second per-field allowlist. They may still restrict tenants,
-namespaces, aggregate metadata bytes, or map capacity. External
-maps are bound at attachment, so a request can provide a lookup key but cannot
-choose an arbitrary table for policy code to read.
+Attachment is the approval and linking boundary. The host exact-matches the
+contract and package version, checks requested limits, verifies the component
+surface, and fails if any required mechanic or schema is unavailable. Optional
+mechanics are intersected with host support and supplied in decision metadata;
+missing support is never silently emulated.
 
 \subsection{Typed operations}
 \label{sec:invocation}
@@ -524,141 +533,130 @@ The conceptual SDK presents ordinary typed functions:
 \begin{figure*}[t]
 \begin{small}
 \begin{verbatim}
-admit(request, ctx) -> Accept | Defer | Reject
+admit(candidates[], capacity, meta)
+    -> decisions[Accept | Defer | Reject]
 
-route(cause, request, placements, ctx) -> [Score]
+route(requests[], targets[], feasible_edges[], meta)
+    -> decisions[Assign(edge) | Defer]
 
-schedule(runnable, capacity, ctx)
-    -> [ServiceDecision { score, token_budget }]
+schedule(runnable[], capacity, meta)
+    -> selections[{ requests[], token_budgets[] }]
 
-evict(pressure, resident_units, ctx) -> [RetentionScore]
+cache(resident[], prospective[], capacity, episode?, meta)
+    -> { admissions[Cache | Bypass], reclaim[] }
 
-feedback(records, mutable_ctx) -> ()
+feedback(delivery_id, records[]) -> state_update
 \end{verbatim}
 \end{small}
-\caption{The five core signatures. Candidate-returning operations use dense
-arrays aligned with their inputs.}
+\caption{The five core signatures. Admission and routing are dense and
+input-aligned; scheduling and cache reclaim use explicit validated sets.}
 \label{fig:signatures}
 \end{figure*}
 
-Dense outputs avoid candidate identifiers crossing the wire twice. Their
-length must equal the candidate count; a wrong length, NaN, trap, or deadline
-miss invalidates the call and selects the engine default. Ties retain input
-order. The adapter supplies only feasible candidates, and the host applies
-scores through a fixed fill rule: descending score within capacity. For
-\texttt{schedule}, a zero budget means no service in that opportunity, while
-host-enforced progress floors prevent permanent starvation. Whether an
-adapter can enact per-request token budgets is a required capability rather
-than a silent approximation.
+Dense admission and route results avoid repeating identifiers. The host
+validates route edges, target count/resource capacity, schedule overlap and
+token budgets, prospective cache admission, reclaim eligibility, and retained
+bytes. A wrong length, stale reference, trap, deadline miss, or invalid state
+update discards the invocation and exposes no staged actions. Input order,
+opportunity ID, retry attempt, and snapshot reference are replay-visible.
 
-Candidate-local and set-dependent policies are distinct. A candidate-local
-score can be refreshed on enqueue and consumed by a native priority index.
-A set-dependent policy must see the batch at each selection point. Similarly,
-an eviction policy may maintain per-unit values or rank a full pressure set.
-The package declares its dependence mode; the host cannot change invocation
-mode as a transparent performance optimization.
+Every decision operation is set-oriented. A singleton uses an array of length
+one; no separate singleton ABI or batch capability exists. The adapter chooses
+bounded opportunity boundaries and must preserve membership and order across a
+state-conflict retry.
 
-\subsection{Fields and maps}
+\subsection{Documents and explicit policy state}
 \label{sec:signals}
 
-PLEX has two data mechanisms. \emph{Invocation fields} travel with hook
-inputs. \texttt{facts()} exposes host-observed values such as authenticated
-principal, queue depth, attained service, and KV residency.
-\texttt{metadata()} exposes application-declared values such as workflow ID,
-expected output length, and preferred region. The accessor preserves
-provenance and absence:
+Structural safety fields---identities, lifecycle status, indices, lists,
+variants, capacities, and plans---are typed in WIT. Engine-specific
+\emph{facts}, mutable request \emph{fields}, and policy \emph{scratch} remain
+bounded JSON objects. Facts are host-owned; fields and scratch preserve their
+writer and provenance:
 
 \begin{verbatim}
-let served = r.facts()
-              .attained_service();
-let hint = r.metadata()
-            .get(EXPECTED_TOKENS);
+let served = state.request("R")?
+                  .facts()["attained_service"];
+state.request_mut("R")?
+     .scratch["debt"] = next_debt;
 \end{verbatim}
 
-The policy package declares metadata names, scalar types, scope
-(logical-request or generation), and size limits. A request may then carry:
+The guest-visible state has three scopes:
 
 \begin{verbatim}
-"plex": { "metadata": {
-  "acme.workflow-id@1": "wf-123",
-  "acme.expected-output-tokens@1": 192
-}}
+PolicyState {
+  shared,
+  groups[GroupId] {
+    principal, status, limits, member_count,
+    facts, scratch
+  },
+  requests[RequestId] {
+    request_ref, status,
+    facts, fields, scratch
+  }
+}
 \end{verbatim}
 
-The gateway validates this object against the attached schema and materializes
-typed fields. Request-scoped values persist across trusted continuations;
-generation-scoped values do not. Host identities and accounting fields occupy
-reserved namespaces and cannot be overwritten. Well-typed metadata remains a
-claim by the caller, not an observed fact.
-
-\emph{Typed maps} hold all durable keyed data. The same API covers external
-operator or tenant configuration, policy-owned learned state, and bounded
-host-consumed intent:
+Request-to-group membership, principal, lifecycle status, quotas, facts, and
+working-set membership are immutable to the guest. The SDK exposes group and
+request facts read-only and computes a sparse update containing only changed
+shared state, group scratch, request fields, and request scratch. Each listed
+document is a complete namespace replacement; v0.6 does not define JSON Patch
+or ambient state calls.
 
 \begin{verbatim}
-ctx.map(TENANT_CONFIG)
-   .get(principal);
-ctx.map(ACCOUNTING)
-   .add(request_id, delta);
-ctx.map(RETENTION)
-   .upsert(request_id, intent);
+StateUpdate {
+  shared?,
+  groups[{ group_id, scratch }],
+  requests[{ request_id, fields?, scratch? }]
+}
 \end{verbatim}
 
-A map declaration fixes key and value schemas, writer, access, capacity, and
-persistence. External maps are policy read-only. Policy maps stage
-	exttt{upsert}, \texttt{add}, and \texttt{delete} operations. Host-consumed
-maps use standard schemas for effects such as a
-bounded service reservation or retention intent; their values carry TTLs and
-count against per-policy quotas. This retains one map mechanism without
-letting an arbitrary private map acquire side effects by naming convention.
+The host derives the exact working set from the validated context. It includes
+shared state, every referenced request, and each referenced request's trusted
+work group exactly once. It does not implicitly load siblings. Shared, group,
+and request scopes have host-private revisions; group scratch and member count
+are quota-bounded.
 
-The following abbreviated scheduler uses all four provenance classes:
+The following abbreviated scheduler uses typed structure and extensible facts:
 
 \begin{figure}[t]
 \begin{small}
 \begin{verbatim}
 fn schedule(cands, cap, ctx) {
-  cands.map(|r| {
-    let served = r.facts()
-                  .attained_service();
-    let hint = r.metadata()
-                .get(EXPECTED_TOKENS);
-    let cfg = ctx.map(TENANT_CONFIG)
-                 .get(
-                   r.facts().principal())
-                 .unwrap_or(DEFAULT);
-    let id = r.facts().logical_id();
-    let state = ctx.map(ACCOUNTING)
-                   .get(id)
-                   .unwrap_or_default();
-    Service {
-      score: cfg.weight /
-             (1.0 + served + state.debt),
-      budget: state.predicted.or(hint)
-              .unwrap_or(cap.default),
-    }
-  })
+  let i = argmin(cands, |r| {
+    state.group(r.group_id)
+         .scratch["service"]
+  });
+  SchedulePlan {
+    selections: [{
+      requests: [i],
+      token_budgets: [
+        min(cands[i].max_budget,
+            cap.remaining_tokens)
+      ]
+    }]
+  }
 }
 \end{verbatim}
 \end{small}
-\caption{A policy reads host facts, request metadata, operator configuration,
-and policy-owned state without losing provenance.}
+\caption{A policy reads trusted group state and returns an explicit selection.}
 \label{lst:policy}
 \end{figure}
 
-Map writes are transactional with the hook. The SDK appears imperative, but
-the host stages operations while recording the revisions read by the policy.
-For a decision hook, the host validates and prepares the transaction, the
-adapter revalidates and enacts the decision, and only successful enactment
-commits the effects. A conflict, failed decision, or failed enactment discards
-them. Outcome-dependent updates for operations without synchronous enactment
-acknowledgement must arrive through \texttt{feedback}. A feedback delivery ID,
-its map updates, and acknowledgement commit together, so replay cannot double
-count service within the durability scope of the map backend.
+PLEX provides conditional \emph{policy-state commit}, not an external engine
+transaction. The host loads one coherent working set, invokes the component,
+validates the plan and update, compares revisions, commits policy state, and
+only then exposes the plan and staged actions to the adapter. The adapter
+revalidates and enacts separately. Enactment failure does not roll back policy
+state, so decision hooks may record intent or attempt state only;
+success-dependent accounting belongs in \texttt{feedback}. A feedback delivery
+ID, its state update, terminal cleanup, and deduplication record commit
+together.
 
 \begin{proposition}[Observed substitution is strategyproof]
 \label{prop:sp}
-Consider a scheduler that orders logical requests only by cumulative
+Consider a scheduler that orders requests only by cumulative
 host-observed attained service and serves the least-served first. If tenants
 can choose metadata but cannot alter observed service, allocation is
 independent of every declaration. Truthful declaration or omission is
@@ -667,60 +665,54 @@ therefore weakly dominant.
 
 Provenance does not impose this policy; it makes such defenses expressible.
 A mixed policy may compare predicted with realized length in
-\texttt{feedback}, store credibility in a principal-scoped map, and discount
+\texttt{feedback}, store credibility in principal-scoped state, and discount
 repeated misdeclaration.
 
 \subsection{An ABI that can grow}
 \label{sec:portability}
 
-The conceptual SDK is typed, but the wire representation cannot assume that
-WIT records and variants grow in place: adding a case or field creates a new
-component type. PLEX therefore distinguishes closed actions from open
-vocabularies. Host-interpreted actions such as \texttt{Admission} remain
-closed WIT variants. Symbolic metadata, event, capability, and map names in
-the manifest resolve to compact local handles at attachment. Stable hot-path
-fields live in versioned core records; long-tail values use homogeneous typed
-columns selected by those handles.
+The structural WIT surface is closed and exact-versioned: changing a record or
+variant advances the component contract. Extensible facts, fields, scratch,
+query arguments, and action arguments remain bounded JSON documents governed
+by independently versioned schemas and method names. Package format, WIT
+contract, engine JSON API, and helper methods have separate version axes.
 
 Required and optional dependencies have only two outcomes. A missing required
-hook capability, event, field, or map rejects attachment. A missing optional
-item is absent or not delivered. PLEX does not silently coerce an action to a
-``nearby'' mechanic, because that makes behavioral portability impossible to
-measure.
+mechanic or schema rejects attachment. A missing optional mechanic is absent
+from negotiated decision metadata, and an attempted call returns an explicit
+unsupported-mechanic failure. PLEX does not silently coerce an action to a
+``nearby'' mechanic.
 
-Linking avoids one host call per field: the host materializes required facts
-and metadata into candidate columns before crossing the sandbox. Maps remain
-host-backed, and SDK accessors may look up keys computed during the invocation
-through attachment-linked handles. Calls and returned bytes are metered and
-bounded. A manifest may request pre-joined values for common key-source fields
-as a hot-path optimization, but this does not change lookup semantics. Policy
-code neither parses JSON nor performs network I/O in a hook.
+The host materializes the complete typed context and policy-state working set
+before crossing the sandbox, so field access requires no host calls. The only
+imports are immediate read-only \texttt{query} and staged \texttt{action};
+their counts and aggregate bytes are metered and bounded.
 
-\subsection{One logical request end to end}
+\subsection{One request end to end}
 \label{sec:worked}
 
-Consider a tool-calling logical request in a ten-step workflow. Its first
+Consider a tool-calling request in a ten-step workflow. Its first
 generation arrives with a workflow ID and expected output length as metadata.
 \texttt{admit} accepts it against host load and operator limits.
 \texttt{route(Arrival)} combines a preferred-region hint with observed prefix
 overlap and queueing, then selects a feasible replica. \texttt{schedule}
-combines the tenant's operator weight, logical-request attained service, and
+combines the tenant's operator weight, request or work-group attained service, and
 learned length state to assign service and a token budget.
 
 After each engine step, one batched \texttt{feedback(Progress)} adds committed
-tokens and service time to the accounting map. The model emits a tool call.
+tokens and service time to request or work-group state. The model emits a tool call.
 \texttt{feedback(Boundary)} records a bounded retention intent keyed by the
-logical request; if the policy reserves future service, it writes a standard
-service-reservation map with a host-enforced TTL. While the tool runs,
-\texttt{evict} sees resident units annotated with enacted host facts and
+request; if the policy reserves future service, it writes a standard
+action or bounded scratch record with a host-enforced TTL. While the tool runs,
+\texttt{cache} sees resident units annotated with enacted host facts and
 retention value and reclaims lower-value state.
 
 The follow-up presents the continuation capability, creating a new generation
-under the same logical request. It is not admitted again.
+under the same request. It is not admitted again.
 \texttt{route(Arrival)} now sees where its KV remains resident, and
 \texttt{schedule} sees accumulated service rather than resetting fairness.
 On completion, \texttt{feedback(Finished)} performs terminal accounting and
-removes outstanding intent entries. The hooks coordinate through typed maps,
+removes outstanding intent entries. The hooks coordinate through scoped state,
 but every physical action remains an engine transition.
 
 \section{The System}
@@ -733,11 +725,11 @@ adapters (Figure~\ref{fig:arch}).
 \centering
 \framebox[\columnwidth]{\parbox[c][4.8cm][c]{0.92\columnwidth}{\centering
 \emph{Placeholder --- Figure 3.}\\[2pt]
-\footnotesize Application metadata and operator/tenant maps enter a PLEX host.
-At attachment the host links schemas and capabilities to a Wasm policy
-package. Router and engine adapters provide facts and feasible candidates;
-typed dense decisions return to native mechanics. A staged map store connects
-hooks and survives replacement when pinned.}}
+\footnotesize Application fields and operator-selected schemas/mechanics enter
+a PLEX host. Router and engine adapters provide trusted identities, scoped
+state, facts, and feasible sets; typed direct plans return to native mechanics.
+Conditional state commit connects hooks, while enacted outcomes return through
+feedback.}}
 \caption{PLEX architecture. The contract carries policy and typed data;
 adapters retain engine-specific mechanics.}
 \label{fig:arch}
@@ -745,19 +737,16 @@ adapters retain engine-specific mechanics.}
 
 \subsection{Host and hot path}
 
-The host instantiates a Wasm component with only PLEX imports: typed map
-operations, a monotonic clock, bounded entropy, and telemetry. It exposes no
-filesystem, socket, arbitrary memory, or engine object. At attachment it
-validates the manifest, binds external maps, creates policy maps, resolves
-symbolic names, and rejects unsatisfied required capabilities.
+The host instantiates a Wasm component with one PLEX import interface:
+versioned, synchronous read-only \texttt{query} and staged \texttt{action}.
+It exposes no WASI, filesystem, socket, arbitrary engine object, or ambient
+state-loading API. At attachment it validates package format 6, the exact
+\texttt{pie:plex@0.6.0} surface, limits, schemas, and required mechanics.
 
-For each invocation, the adapter produces core candidate records and typed
-extension columns. The host joins declared metadata and bound-map values,
-charges the resulting bytes against policy quotas, and enters Wasm once with
-the batch. Dense results are validated before the adapter sees them. A
-candidate-local enqueue or standing-index mode avoids a sandbox crossing on
-every scheduler or allocator action; set-dependent policies opt into batched
-synchronous calls and their measured cost.
+For each invocation, the adapter produces one bounded typed context. The host
+derives and loads the exact state working set, charges input bytes against
+policy limits, and enters Wasm once. The direct plan, sparse state update, and
+staged actions are validated before any of them become visible to the adapter.
 
 \subsection{Isolation, availability, and policy quality}
 \label{sec:safety}
@@ -765,9 +754,9 @@ synchronous calls and their measured cost.
 Three guarantees must not be conflated. \emph{Mechanical isolation} comes
 from Wasm memory isolation and a typed host surface: policy code cannot mutate
 engine objects or request contents. \emph{Availability} comes from deadlines,
-bounded allocation, map quotas, and engine-default fallback. A
-trap, timeout, malformed dense result, or invalid map update discards the
-transaction and applies the native heuristic for that invocation.
+bounded allocation, state quotas, and engine-default fallback. A
+trap, timeout, invalid plan, or invalid state update discards the invocation's
+state changes and staged actions and applies the native heuristic.
 
 \emph{Policy quality} is not guaranteed by sandboxing. A valid ranker may make
 poor decisions or favor one tenant. The host bounds effects it owns:
@@ -776,36 +765,34 @@ progress watchdog may detach a package whose workloads stop advancing.
 Beyond those bounds, operators remain responsible for the policy they attach.
 
 Telemetry follows a separate lossy path. Policies may emit bounded metrics or
-debug records to a ring buffer, but no decision or map commit depends on
+debug records to a ring buffer, but no decision or policy-state commit depends on
 telemetry delivery.
 
-\subsection{Transactional maps and replacement}
+\subsection{Conditional state commit and replacement}
 
-Each invocation receives immutable facts and a stable map snapshot. Host-backed
-reads record entry revisions, and policy-map updates remain staged. Prepare
-checks that every observed revision is current and briefly fences the write set
-through native enactment. A conflict aborts the decision and its effects; the
-adapter may retry from a fresh snapshot within the operation deadline and must
-otherwise invoke its native fallback. Successful enactment, feedback
-deduplication where applicable, and prepared writes then commit together. This
-is process-local atomicity, not crash-atomic coordination with external engine
-state. External configuration is published as immutable, monotonically
-increasing revisions so one candidate batch never mixes versions.
+Each invocation receives immutable facts and one coherent shared/group/request
+snapshot. The host validates sparse replacements and compares every scope
+revision in the working set. A conflict commits neither state, actions,
+feedback deduplication, nor cleanup; the adapter may retry the same opportunity
+with an incremented attempt and a fresh snapshot. On success, policy state
+commits before the normalized plan and staged actions are exposed. The adapter
+then revalidates and enacts separately, and later feedback records actual
+outcomes. PLEX therefore provides process-local policy-state atomicity, not
+two-phase or crash-atomic coordination with external engine state.
 
-Attachment creates a link between one package export and each operation it
+Attachment creates a link between one package manifest owner and each operation it
 owns. Replacing a link is atomic: new calls enter the new component while
-in-flight calls finish under the old one. Attachment-scoped maps disappear
-with the package; pinned maps transfer only when schemas match. A failed
-activation rolls back to the prior link, and detach always restores the engine
-default.
+in-flight calls finish under the old one. A failed activation leaves the prior
+link intact, and detach restores the engine default.
 
 \subsection{Adapters and attachability}
 \label{sec:impl}
 
 Adapters translate semantic views rather than expose engine structures.
 Routing usually attaches at a cluster router. Admission and scheduling attach
-where an engine accepts and selects work. Eviction attaches at the engine's
-legal reclaim unit. Feedback taps committed execution and lifecycle changes.
+where an engine accepts and selects work. Cache policy attaches where the
+engine can present prospective objects and legal reclaim units. Feedback taps
+committed execution and lifecycle changes.
 An adapter manifest records native and amortized invocation modes, deadlines,
 candidate semantics, fields, and auxiliary mechanics.
 
@@ -824,8 +811,8 @@ be confirmed by prototypes.}
 \begin{tabular}{@{}l c c c c c c c r@{}}
 \toprule
 \textbf{Target} & \textbf{route} & \textbf{admit} & \textbf{schedule} &
-\textbf{evict} & \textbf{feedback} & \textbf{prefetch} &
-\textbf{rebalance} & \textbf{Adapter LOC} \\
+\textbf{cache} & \textbf{feedback} & \textbf{prefetch action} &
+\textbf{rebalance action} & \textbf{Adapter LOC} \\
 \midrule
 vLLM & router & [N] & [N/A] & [N/A] & [N] & [N] & [--] & [418] \\
 SGLang & router & [N] & [N/A] & [N/A] & [N] & [N] & [--] & [$\sim$250] \\
@@ -836,52 +823,53 @@ Pie & router & [N] & [N] & [N] & [N] & [N] & [--] & [$\sim$xxx] \\
 \end{tabular}
 \end{table*}
 
-The current artifact contains a generic host of [$\sim$1{,}373] Rust lines, a
-PyO3 path of [$\sim$296] lines for Python engines, [32] reference policies,
-the labeled derivation corpus, and a replay harness. The harness drives
-recorded candidate batches through any adapter and compares policy decisions,
-fallbacks, and map transitions.
+The current artifact contains the typed interface and validators, a Wasmtime
+host, Rust and Python SDKs, vLLM and SGLang adapter templates, 31
+evidence-classified policy kernels, negative fixtures, deterministic replay,
+and a generated replication report. The harness drives recorded opportunities
+through the host and compares normalized plans, fallbacks, scoped state
+updates, actions, and feedback effects.
 
 \section{Evaluation}
 \label{sec:eval}
 
 We evaluate whether the stable waist captures real policies, transfers across
 engines, grows without ABI proliferation, and is practical on serving hot
-paths. All bracketed quantities below are pending the corresponding artifact
-run.
+paths. All bracketed live-workload quantities below remain pending their
+engine run; conformance, replication, replay, and validator benchmarks reported
+by the repository are complete.
 
 \paragraph{Setup.}
-[Models, GPUs, engines and versions, trace sources, policy packages, map
-configuration, and workload-generation parameters.]
+[Models, GPUs, engines and versions, trace sources, policy packages, policy
+state configuration, and workload-generation parameters.]
 
 \subsection{E1: Expressiveness}
 \label{sec:eval-expressiveness}
 \label{sec:eval-q3}
 
 \paragraph{Corpus remapping.}
-We first apply the fixed fourteen-to-5+2 protocol of
+We first apply the fixed fourteen-to-five protocol of
 \S\ref{sec:elbow} to all [$K$] artifacts. Report (i) historical-grid
 coverage, (ii) the fraction preserved by the five core operations, (iii) the
-increment from the two auxiliary operations, and (iv) residuals that change
+increment from negotiated standard mechanics, and (iv) residuals that change
 mechanics. A merge/split sensitivity analysis tests whether another operation
 boundary yields the same coverage with less authority.
 
-\paragraph{Reproducing fork hypotheses.}
-We reimplement the five policies in Table~\ref{tab:autopsy}. Cache-aware
-scheduling raises prefix-cache hit rate from [0\%] to [91\%] in [22] lines.
-Bundle fairness changes the measured fairness metric from [1.65] to [0.66] in
-[55] lines. Workflow-aware eviction raises workflow hit rate from [88.7\%] to
-[96.0\%] in [30] lines. Program-level fairness changes light- and heavy-tenant
-service by [1.11$\times$] and [1.78$\times$] in [32] lines. Tool continuation
-and locality routing report [results]. For each, we compare the PLEX decision
-trace and workload outcome with the source implementation, rather than
-claiming parity from LOC alone.
+\paragraph{Reproducing policy kernels.}
+We implement all 31 candidates in the committed matrix. Each has pinned paper
+metadata, a component, a deterministic case, an expected result, named
+deferred mechanics, and one of the four evidence levels. Current results are
+classified conservatively as policy-kernel reproductions unless source-level
+differential evidence exists; the artifact does not infer parity from LOC.
+The existing five specifically cover group fairness, TTL-aware scheduling and
+cache policy, workflow-aware cache loading, E2 routing, and Helium's
+cache-aware critical-path scheduling with forced progress.
 
 \paragraph{Coordinated policy.}
-A single [80]-line package implements routing, scheduling, eviction, and
-feedback around a workflow. Routing records enacted locality in a map;
+A single package implements admission, routing, scheduling, cache policy, and
+feedback around a workflow. Routing records enacted locality in policy state;
 feedback records progress and bounded continuation intent; later schedule and
-evict calls consume that state. We compare engine defaults, the best
+cache calls consume that state. We compare engine defaults, the best
 single-operation policy, all operations without shared state, and the
 coordinated package. Coordination improves [workflow metric] by [$X$\%] over
 independent operation policies and changes [recomputed prefill/cache hit/SLO
@@ -906,8 +894,9 @@ Report field/capability gaps, default-call rate, and whether an operation is
 native or amortized. We do not hide a missing capability behind coercion.
 
 \paragraph{Behavioral portability.}
-The replay harness feeds canonical batches and map revisions to each adapter
-and compares dense results, chosen candidates, and committed map transitions.
+The replay harness feeds canonical opportunities and scope revisions to each
+adapter and compares direct plans, state updates, actions, feedback effects,
+and classified failures.
 Core packages produce [bit-identical/equivalent] traces on [$N$] engines;
 live runs report how different engine mechanics affect workload outcomes
 despite identical policy decisions. Across an engine scheduler rewrite,
@@ -923,15 +912,13 @@ We test the design claim that vocabulary grows without multiplying program
 types:
 
 \begin{enumerate}
-\item add a namespaced metadata field and run an old binary unchanged;
-\item add an optional feedback event and verify that an unsubscribed package
-  receives no call;
-\item add a resident-unit kind through extension columns;
-\item omit a required token-budget capability and verify attach-time rejection;
-\item replace a package atomically while preserving a schema-compatible pinned
-  accounting map; and
-\item share accounting and intent maps across \texttt{feedback},
-  \texttt{schedule}, and \texttt{evict}.
+\item add a namespaced fact schema and run an old binary unchanged;
+\item add an optional action schema and verify explicit absence when unsupported;
+\item add a cache-object kind through extensible facts;
+\item omit a required mechanic and verify attach-time rejection;
+\item replace a package atomically while preserving backend policy state; and
+\item share group/request accounting across \texttt{feedback},
+  \texttt{schedule}, and \texttt{cache}.
 \end{enumerate}
 
 For each case, report binary changes, attachment result, decision-trace
@@ -950,18 +937,21 @@ no-universal-policy premise of \S\ref{sec:no-winner}.
 \label{sec:eval-q5}
 
 \paragraph{Hot-path cost.}
-Measure candidate materialization, map pre-join, sandbox crossing, policy
+Measure candidate materialization, group auto-join, sandbox crossing, policy
 execution, result validation, and commit separately. Report per-hook latency
-versus candidate count for candidate-local and set-dependent modes; batched
-\texttt{feedback} cost versus records per call; map read, staged add, and
-commit cost; and end-to-end throughput, TTFT, and token latency. The full
-package costs [$\cdot\mu$s / $\cdot$\%] per [invocation] and [$<x\%$]
-throughput at [load].
+versus candidate count; batched \texttt{feedback} cost versus records per call;
+state load/update/conflict cost; and end-to-end throughput, TTFT, and token
+latency. On the development x86-64 host, committed release-profile validator
+medians are 0.8\,$\mu$s for singleton admission, 28.6\,$\mu$s for 64-request
+admission, 43.5\,$\mu$s for 64-by-8 routing, 54.1\,$\mu$s for 128-request
+scheduling, and 158.8\,$\mu$s for 1,024 cache objects. Live-engine overhead
+remains a separate evaluation.
 
 \paragraph{Failure behavior.}
-Inject traps, infinite loops, malformed dense arrays, NaNs, allocation
-attempts, and invalid map updates. Verify default fallback, transaction
-rollback, and continued progress; report detection latency and fallback rate.
+Inject traps, infinite loops, dense-length errors, out-of-range indices,
+oversized token budgets, unauthorized actions, malformed documents, and
+unknown state scopes. Verify native fallback, policy-state/action rollback, and
+continued progress; report detection latency and fallback rate.
 Separately test poor but valid policies (permanent deferral, starvation, and
 over-reservation) to measure the limits of host caps and watchdog ejection.
 
@@ -1015,18 +1005,20 @@ repeated abuse but cannot retroactively prevent the first misleading
 declaration.
 
 \paragraph{Contract versus implementation.}
-The typed-map intent design, atomic replacement, and some auxiliary
-capabilities remain subject to gates in the prototype. We mark unimplemented
-features and unmeasured results rather than treating a WIT sketch as evidence.
+The typed contract, scoped state, package replacement, standard action
+validation, deterministic replay, and 31 policy kernels are implemented.
+Physical swap/migration/prefetch, live version-pinned engine integrations,
+control-plane provisioning, predictor training, and live workload results
+remain outside the current evidence and are named as deferred mechanics.
 
 \section{Related Work}
 \label{sec:related}
 
 \paragraph{Context-aware serving.}
-Program fairness, workflow-aware eviction, tool continuation, affinity
-routing, and bundle fairness motivate PLEX
-\cite{sheng2024fairness,abhyankar2024infercept,luo2025autellix,
-fu2024efficient}. Parrot carries application structure through semantic
+Program fairness, workflow-aware cache policy, tool continuation, affinity
+routing, and critical-path scheduling motivate PLEX
+\cite{sheng2024fairness,abhyankar2024infercept,luo2025autellix}.
+Parrot carries application structure through semantic
 variables~\cite{lin2024parrot}; Preble and MemServe build fixed prefix-aware
 policies~\cite{srivatsa2025preble,hu2024memserve}. PLEX contributes neither a
 new point policy nor a universal winner, but a shared authority and data
@@ -1073,18 +1065,18 @@ substitution, policing, or learned credibility.
 \section{Conclusion}
 \label{sec:conclusion}
 
-Agentic applications changed a serving request from one isolated generation
-into a logical unit that can pause, continue, and carry physical and
-accounting state across calls. The information needed to govern that unit
-lives above engines, while the authority to place, schedule, and retain it
-lives inside them. Metadata alone cannot bridge the gap when policy remains
-fixed, and forks do not provide a stable research or deployment interface.
+Agentic applications changed serving from isolated generations into requests
+that pause and continue and work groups containing independently executing
+siblings. The information needed to govern those subjects lives above engines,
+while the authority to admit, place, schedule, and retain state lives inside
+them. Metadata alone cannot bridge the gap when policy remains fixed, and
+forks do not provide a stable research or deployment interface.
 
 PLEX programs the request lifecycle through a five-operation closed loop:
-admission, three resource arbitrations, and feedback. Typed fields preserve
-the boundary between observed facts and caller declarations; typed maps carry
-configuration, learned state, and bounded host intent; adapters retain
-feasibility and mechanics. The result is intended to do for serving policy
+admission, three resource arbitrations, and feedback. Typed structure preserves
+identity and feasibility; explicit shared/group/request state carries learned
+state and bounded intent; negotiated actions preserve the mechanism boundary;
+adapters retain feasibility and mechanics. The result is intended to do for serving policy
 what successful extensible substrates do elsewhere: keep the authority waist
 small while allowing events, data, policies, and implementations to evolve
 around it.

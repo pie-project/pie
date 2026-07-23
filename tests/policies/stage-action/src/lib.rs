@@ -1,26 +1,42 @@
 use plex::serde_json::json;
-use plex::{Document, Host, Policy, State};
+use plex::{Host, Policy, RouteContext, RouteDecision, RoutePlan, State, policy_error};
 
 struct StageAction;
 
 impl Policy for StageAction {
-    fn route(ctx: &Document, state: &mut State, host: &Host) -> Result<Document, String> {
-        let request_id = ctx["request_id"]
-            .as_str()
-            .ok_or("request_id must be a string")?;
-        let attempts = state.request(request_id)?.scratch["action_attempts"]
-            .as_u64()
-            .unwrap_or(0);
-        state.request_mut(request_id)?.scratch["action_attempts"] = json!(attempts + 2);
-        host.prefetch_kv(request_id, "node-a")?;
-        host.set_retention(request_id, 5000)?;
-        match ctx["cause"].as_str() {
-            Some("action-fallback") => return Err("fallback-required".into()),
-            Some("action-trap") => panic!("trap after staging actions"),
+    fn route(ctx: &RouteContext, state: &mut State, host: &Host) -> plex::Result<RoutePlan> {
+        let mut decisions = Vec::with_capacity(ctx.requests.len());
+        for (request_index, request) in ctx.requests.iter().enumerate() {
+            let edge = ctx
+                .feasible_edges
+                .iter()
+                .enumerate()
+                .find(|(_, edge)| edge.request_index as usize == request_index);
+            if let Some((index, edge)) = edge {
+                let target = &ctx.targets[edge.target_index as usize];
+                state
+                    .request_mut(request.request.request_id.as_str())?
+                    .scratch["action_attempts"] = json!(1);
+                host.rebalance_request(
+                    request.request.request_id.as_str(),
+                    target.target_id.as_str(),
+                    &format!("stage-{request_index}"),
+                )?;
+                decisions.push(RouteDecision::Assign(index as u32));
+            } else {
+                decisions.push(RouteDecision::Defer);
+            }
+        }
+        match ctx
+            .requests
+            .first()
+            .and_then(|request| request.facts["mode"].as_str())
+        {
+            Some("fallback") => return Err(policy_error("fallback-required", "injected")),
+            Some("trap") => panic!("trap after staging actions"),
             _ => {}
         }
-        let count = ctx["candidates"].as_array().map_or(0, Vec::len);
-        Ok(json!({"scores": vec![0.0; count]}))
+        Ok(RoutePlan { decisions })
     }
 }
 

@@ -1,0 +1,13 @@
+{
+  "case": "credit-gated-locality",
+  "clients": [
+    {
+      "id": "A",
+      "deficit": 4
+    },
+    {
+      "id": "B",
+      "deficit": -2
+    }
+  ]
+}

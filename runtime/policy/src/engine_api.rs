@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
-use pie_plex::{AdmissionDecision, Document, Operation};
+use pie_plex::Document;
+use pie_plex::v0_5::{AdmissionDecision, Operation};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 
@@ -559,7 +560,7 @@ fn normalize_decision(
 ) -> Result<Document, String> {
     match operation {
         Operation::Route => Ok(json!({
-            "order": pie_plex::rank_route(
+            "order": pie_plex::v0_5::rank_route(
                 result,
                 context["candidates"]
                     .as_array()
@@ -569,7 +570,8 @@ fn normalize_decision(
             .map_err(|error| error.to_string())?
         })),
         Operation::Admit => {
-            let decision = pie_plex::validate_admit(result).map_err(|error| error.to_string())?;
+            let decision =
+                pie_plex::v0_5::validate_admit(result).map_err(|error| error.to_string())?;
             Ok(json!({
                 "decision": match decision {
                     AdmissionDecision::Accept => "accept",
@@ -579,11 +581,11 @@ fn normalize_decision(
             }))
         }
         Operation::Schedule => Ok(json!({
-            "selected": pie_plex::select_schedule(context, result)
+            "selected": pie_plex::v0_5::select_schedule(context, result)
                 .map_err(|error| error.to_string())?
         })),
         Operation::Evict => Ok(json!({
-            "selected": pie_plex::select_evictions(context, result)
+            "selected": pie_plex::v0_5::select_evictions(context, result)
                 .map_err(|error| error.to_string())?
         })),
         Operation::Feedback => Ok(json!({})),

@@ -1,0 +1,26 @@
+{
+  "id": "routebalance",
+  "title": "RouteBalance: Fused Model Routing and Load Balancing for Heterogeneous LLM Serving",
+  "paper_version": "arXiv 2606.17949",
+  "source_url": "https://arxiv.org/abs/2606.17949",
+  "source_commit": null,
+  "source_license": "paper reference; no source copied",
+  "component": "plex_paper_routebalance",
+  "implements": [
+    "route"
+  ],
+  "policy_kernel": [
+    "bounded joint request-target assignment",
+    "fused utility and capacity"
+  ],
+  "required_facts": [
+    "utility"
+  ],
+  "required_mechanics": [],
+  "deferred_mechanics": [
+    "replica provisioning"
+  ],
+  "evidence_level": "policy-kernel-reproduction",
+  "fixture_provenance": "independent bounded reference solver",
+  "validation_status": "passing"
+}

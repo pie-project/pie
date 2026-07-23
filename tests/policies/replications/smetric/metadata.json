@@ -1,0 +1,33 @@
+{
+  "id": "smetric",
+  "title": "SMetric: Rethink LLM Scheduling for Serving Agents with Balanced Session-centric Scheduling",
+  "paper_version": "arXiv 2607.08565",
+  "source_url": "https://arxiv.org/abs/2607.08565",
+  "source_commit": null,
+  "source_license": "paper reference; no source copied",
+  "component": "plex_paper_smetric",
+  "implements": [
+    "route"
+  ],
+  "policy_kernel": [
+    "first-turn load balance",
+    "follow-up cache affinity",
+    "tail-outlier migration"
+  ],
+  "required_facts": [
+    "generation_id",
+    "cache_affinity",
+    "load",
+    "tail_outlier"
+  ],
+  "required_mechanics": [],
+  "optional_mechanics": [
+    "request.rebalance@1"
+  ],
+  "deferred_mechanics": [
+    "physical migration"
+  ],
+  "evidence_level": "policy-kernel-reproduction",
+  "fixture_provenance": "independent reference model from the paper",
+  "validation_status": "passing"
+}

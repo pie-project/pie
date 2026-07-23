@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::Operation;
+use crate::operation::Operation;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -20,6 +20,9 @@ impl ContractVersion {
 #[serde(deny_unknown_fields)]
 pub struct PolicyLimits {
     pub memory_bytes: u64,
+    /// Retained only to decode and encode v0.5 format-5 manifests.
+    /// Current hosts do not enable or charge Wasmtime fuel.
+    pub fuel: u64,
     pub deadline_ms: u64,
     pub input_bytes: u64,
     pub output_bytes: u64,
@@ -125,6 +128,7 @@ mod tests {
             operations: BTreeSet::from([Operation::Route]),
             limits: PolicyLimits {
                 memory_bytes: 1 << 20,
+                fuel: 100_000,
                 deadline_ms: 20,
                 input_bytes: 1 << 16,
                 output_bytes: 1 << 16,
@@ -135,6 +139,13 @@ mod tests {
     #[test]
     fn accepts_minimal_json_manifest() {
         manifest().validate().unwrap();
+    }
+
+    #[test]
+    fn accepts_zero_legacy_fuel_placeholder() {
+        let mut manifest = manifest();
+        manifest.limits.fuel = 0;
+        manifest.validate().unwrap();
     }
 
     #[test]

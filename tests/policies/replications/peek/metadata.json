@@ -1,0 +1,29 @@
+{
+  "id": "peek",
+  "title": "PEEK: Predictive Queue-Informed KV Cache Management for LLM Serving",
+  "paper_version": "arXiv 2607.02525",
+  "source_url": "https://arxiv.org/abs/2607.02525",
+  "source_commit": null,
+  "source_license": "paper reference; no source copied",
+  "component": "plex_paper_peek",
+  "implements": [
+    "schedule",
+    "cache"
+  ],
+  "policy_kernel": [
+    "shared pending-demand state",
+    "cluster-aware demand depth",
+    "fairness lane"
+  ],
+  "required_facts": [
+    "waiting_ms",
+    "fairness_threshold_ms",
+    "demand_depth",
+    "pending_demand_depth"
+  ],
+  "required_mechanics": [],
+  "deferred_mechanics": [],
+  "evidence_level": "policy-kernel-reproduction",
+  "fixture_provenance": "independent reference model from the paper",
+  "validation_status": "passing"
+}

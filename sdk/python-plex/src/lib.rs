@@ -6,7 +6,9 @@ use std::thread::JoinHandle;
 
 use arc_swap::ArcSwapOption;
 use crossbeam_channel::{Sender, TrySendError, bounded};
-use pie_policy::{Document, PlexError as RustPlexError, PlexRuntime, QueryError, QueryHandler};
+use pie_policy::{
+    Document, HostSupportV0_6, PlexError as RustPlexError, PlexRuntime, QueryError, QueryHandler,
+};
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
@@ -65,7 +67,7 @@ enum AsyncChannel {
     Route,
     Admit,
     Schedule,
-    Evict,
+    Cache,
     Feedback,
 }
 
@@ -75,7 +77,7 @@ impl AsyncChannel {
             "route" => Ok(Self::Route),
             "admit" => Ok(Self::Admit),
             "schedule" => Ok(Self::Schedule),
-            "evict" => Ok(Self::Evict),
+            "cache" => Ok(Self::Cache),
             "feedback" => Ok(Self::Feedback),
             _ => Err(PlexError::new_err(format!(
                 "unknown async PLEX channel {value:?}"
@@ -94,7 +96,7 @@ struct AsyncSlots {
     route: ArcSwapOption<AsyncOutcome>,
     admit: ArcSwapOption<AsyncOutcome>,
     schedule: ArcSwapOption<AsyncOutcome>,
-    evict: ArcSwapOption<AsyncOutcome>,
+    cache: ArcSwapOption<AsyncOutcome>,
     feedback: ArcSwapOption<AsyncOutcome>,
 }
 
@@ -104,7 +106,7 @@ impl AsyncSlots {
             AsyncChannel::Route => &self.route,
             AsyncChannel::Admit => &self.admit,
             AsyncChannel::Schedule => &self.schedule,
-            AsyncChannel::Evict => &self.evict,
+            AsyncChannel::Cache => &self.cache,
             AsyncChannel::Feedback => &self.feedback,
         }
     }
@@ -134,21 +136,20 @@ struct NativeAsyncRuntime {
 #[pymethods]
 impl NativeRuntime {
     #[new]
-    #[pyo3(signature = (policy, query=None, actions=None))]
-    fn new(policy: &str, query: Option<Py<PyAny>>, actions: Option<Vec<String>>) -> PyResult<Self> {
+    #[pyo3(signature = (policy, query=None, mechanics=None))]
+    fn new(
+        policy: &str,
+        query: Option<Py<PyAny>>,
+        mechanics: Option<Vec<String>>,
+    ) -> PyResult<Self> {
         let package = std::fs::read(policy)
             .map_err(|error| PolicyPackageError::new_err(error.to_string()))?;
         let query_handler = query
             .map(|callback| Arc::new(PythonQueryHandler { callback }) as Arc<dyn QueryHandler>);
-        let runtime = PlexRuntime::from_package_bytes(
-            &package,
-            query_handler,
-            actions
-                .unwrap_or_default()
-                .into_iter()
-                .collect::<BTreeSet<_>>(),
-        )
-        .map_err(map_plex_error)?;
+        let support = HostSupportV0_6::with_standard_ids(mechanics.unwrap_or_default())
+            .map_err(|error| PolicyPackageError::new_err(error.to_string()))?;
+        let runtime = PlexRuntime::from_package_bytes(&package, query_handler, support)
+            .map_err(map_plex_error)?;
         Ok(Self {
             id: next_runtime_id()?,
             runtime,
@@ -165,11 +166,11 @@ impl NativeRuntime {
 #[pymethods]
 impl NativeAsyncRuntime {
     #[new]
-    #[pyo3(signature = (policy, query=None, actions=None, queue_capacity=64))]
+    #[pyo3(signature = (policy, query=None, mechanics=None, queue_capacity=64))]
     fn new(
         policy: &str,
         query: Option<Py<PyAny>>,
-        actions: Option<Vec<String>>,
+        mechanics: Option<Vec<String>>,
         queue_capacity: usize,
     ) -> PyResult<Self> {
         if queue_capacity == 0 {
@@ -181,15 +182,10 @@ impl NativeAsyncRuntime {
             .map_err(|error| PolicyPackageError::new_err(error.to_string()))?;
         let query_handler = query
             .map(|callback| Arc::new(PythonQueryHandler { callback }) as Arc<dyn QueryHandler>);
-        let runtime = PlexRuntime::from_package_bytes(
-            &package,
-            query_handler,
-            actions
-                .unwrap_or_default()
-                .into_iter()
-                .collect::<BTreeSet<_>>(),
-        )
-        .map_err(map_plex_error)?;
+        let support = HostSupportV0_6::with_standard_ids(mechanics.unwrap_or_default())
+            .map_err(|error| PolicyPackageError::new_err(error.to_string()))?;
+        let runtime = PlexRuntime::from_package_bytes(&package, query_handler, support)
+            .map_err(map_plex_error)?;
 
         let (sender, receiver) = bounded::<AsyncCommand>(queue_capacity);
         let slots = Arc::new(AsyncSlots::default());

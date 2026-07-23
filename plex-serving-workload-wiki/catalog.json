@@ -1,0 +1,2999 @@
+[
+  {
+    "id": "azure-llm-2023",
+    "name": "Azure LLM Inference Trace 2023",
+    "status": "existing",
+    "kind": "Production request trace",
+    "official_url": "https://github.com/Azure/AzurePublicDataset/blob/master/AzureLLMInferenceDataset2023.md",
+    "paper_url": "https://www.microsoft.com/en-us/research/publication/splitwise-efficient-generative-llm-inference-using-phase-splitting/",
+    "license": "CC-BY",
+    "access": "Direct CSV download",
+    "scale": "One-day sample from multiple Azure LLM services; separate code and conversation traces",
+    "format": "CSV",
+    "fields": [
+      "TIMESTAMP",
+      "ContextTokens",
+      "GeneratedTokens"
+    ],
+    "coverage": {
+      "arrivals": "yes",
+      "token_lengths": "yes",
+      "content": "no",
+      "session": "no",
+      "tenant": "no",
+      "prefix": "no",
+      "tools": "no",
+      "dag": "no",
+      "slo": "no",
+      "failure": "no",
+      "multimodal": "no",
+      "model": "no",
+      "hardware": "no"
+    },
+    "used_by": [
+      "Splitwise",
+      "Vidur examples"
+    ],
+    "plex_operations": [
+      "route",
+      "admit",
+      "schedule"
+    ],
+    "strengths": [
+      "Real production arrival and joint input/output length distributions",
+      "Simple, portable replay format"
+    ],
+    "limitations": [
+      "No prompt content, sessions, tenants, prefix hashes, SLOs, failures, or tool events"
+    ],
+    "tier": "core"
+  },
+  {
+    "id": "azure-llm-2024",
+    "name": "Azure LLM Inference Trace 2024",
+    "status": "existing",
+    "kind": "Production request trace",
+    "official_url": "https://github.com/Azure/AzurePublicDataset/blob/master/AzureLLMInferenceDataset2024.md",
+    "paper_url": "https://arxiv.org/abs/2408.00741",
+    "license": "CC-BY",
+    "access": "Direct one-week CSV downloads",
+    "scale": "May 10-19, 2024 sample; code and conversation services",
+    "format": "CSV",
+    "fields": [
+      "TIMESTAMP",
+      "ContextTokens",
+      "GeneratedTokens"
+    ],
+    "coverage": {
+      "arrivals": "yes",
+      "token_lengths": "yes",
+      "content": "no",
+      "session": "no",
+      "tenant": "no",
+      "prefix": "no",
+      "tools": "no",
+      "dag": "no",
+      "slo": "no",
+      "failure": "no",
+      "multimodal": "no",
+      "model": "no",
+      "hardware": "no"
+    },
+    "used_by": [
+      "DynamoLLM",
+      "LMetric comparison",
+      "multiple serving simulators"
+    ],
+    "plex_operations": [
+      "route",
+      "admit",
+      "schedule",
+      "rebalance"
+    ],
+    "strengths": [
+      "Longer production window than the 2023 trace",
+      "Good for burst, diurnal, energy, and capacity studies"
+    ],
+    "limitations": [
+      "No content, session identity, prefix reuse, tenant, SLO, or outcome fields"
+    ],
+    "tier": "core"
+  },
+  {
+    "id": "burstgpt-v2",
+    "name": "BurstGPT v2",
+    "status": "existing",
+    "kind": "Production request/session trace",
+    "official_url": "https://github.com/HPMLL/BurstGPT",
+    "paper_url": "https://doi.org/10.1145/3711896.3737413",
+    "license": "CC-BY-4.0",
+    "access": "GitHub release CSVs",
+    "scale": "Three releases spanning 110-121 days; roughly 5.3M records per major trace",
+    "format": "CSV",
+    "fields": [
+      "Timestamp",
+      "Session ID",
+      "Elapsed time",
+      "Model",
+      "Request tokens",
+      "Response tokens",
+      "Total tokens",
+      "Log Type"
+    ],
+    "coverage": {
+      "arrivals": "yes",
+      "token_lengths": "yes",
+      "content": "no",
+      "session": "yes",
+      "tenant": "no",
+      "prefix": "no",
+      "tools": "no",
+      "dag": "no",
+      "slo": "no",
+      "failure": "partial",
+      "multimodal": "no",
+      "model": "yes",
+      "hardware": "no"
+    },
+    "used_by": [
+      "BurstGPT workload study; suitable replacement for Poisson arrivals in serving papers"
+    ],
+    "plex_operations": [
+      "admit",
+      "route",
+      "schedule",
+      "feedback",
+      "rebalance"
+    ],
+    "strengths": [
+      "Long duration, daily/weekly periodicity, burstiness, session IDs, end-to-end latency, and zero-token failures"
+    ],
+    "limitations": [
+      "No raw content, prefix hashes, tenant IDs, TTFT/TPOT, explicit cancellation cause, tools, or SLOs"
+    ],
+    "tier": "core"
+  },
+  {
+    "id": "qwen-bailian",
+    "name": "Qwen-Bailian Anonymous Usage Traces",
+    "status": "existing",
+    "kind": "Production session and KV-prefix trace",
+    "official_url": "https://github.com/alibaba-edu/qwen-bailian-usagetraces-anon",
+    "paper_url": "https://www.usenix.org/conference/atc25/presentation/wang-jiahao",
+    "license": "Apache-2.0",
+    "access": "Direct JSONL files and official Rust replayer",
+    "scale": "Two-hour samples for To-C, To-B, thinking, and coder workloads",
+    "format": "JSONL",
+    "fields": [
+      "chat_id",
+      "parent_chat_id",
+      "timestamp",
+      "input_length",
+      "output_length",
+      "type",
+      "turn",
+      "hash_ids"
+    ],
+    "coverage": {
+      "arrivals": "yes",
+      "token_lengths": "yes",
+      "content": "no",
+      "session": "yes",
+      "tenant": "no",
+      "prefix": "yes",
+      "tools": "no",
+      "dag": "no",
+      "slo": "no",
+      "failure": "no",
+      "multimodal": "partial",
+      "model": "no",
+      "hardware": "no"
+    },
+    "used_by": [
+      "KVCache Cache in the Wild",
+      "LMetric",
+      "SMetric"
+    ],
+    "plex_operations": [
+      "route",
+      "schedule",
+      "evict",
+      "feedback",
+      "rebalance"
+    ],
+    "strengths": [
+      "Best public combination of real timestamps, session lineage, turn number, workload type, and prefix-block hashes",
+      "High-fidelity official replayer"
+    ],
+    "limitations": [
+      "No tenant identity, SLO, tool timing/outcome, workflow DAG, cancellation, or raw content"
+    ],
+    "tier": "core"
+  },
+  {
+    "id": "mooncake-fast25",
+    "name": "Mooncake FAST'25 Traces",
+    "status": "existing",
+    "kind": "Production and synthetic KV-prefix traces",
+    "official_url": "https://github.com/kvcache-ai/Mooncake/tree/main/FAST25-release",
+    "paper_url": "https://www.usenix.org/conference/fast25/presentation/qin",
+    "license": "Apache-2.0 repository",
+    "access": "Direct JSONL files",
+    "scale": "12,031 conversation, 23,608 tool/agent, and 3,993 synthetic requests",
+    "format": "JSONL",
+    "fields": [
+      "timestamp",
+      "input_length",
+      "output_length",
+      "hash_ids"
+    ],
+    "coverage": {
+      "arrivals": "yes",
+      "token_lengths": "yes",
+      "content": "no",
+      "session": "no",
+      "tenant": "no",
+      "prefix": "yes",
+      "tools": "derived",
+      "dag": "no",
+      "slo": "no",
+      "failure": "no",
+      "multimodal": "no",
+      "model": "no",
+      "hardware": "no"
+    },
+    "used_by": [
+      "Mooncake",
+      "LMetric ToolAgent workload"
+    ],
+    "plex_operations": [
+      "route",
+      "schedule",
+      "evict",
+      "prefetch"
+    ],
+    "strengths": [
+      "Real one-hour conversation and tool/agent arrival patterns",
+      "512-token prefix hashes expose reusable KV"
+    ],
+    "limitations": [
+      "Tool boundaries and sessions are not explicit; no SLO, tenant, failures, or raw content"
+    ],
+    "tier": "core"
+  },
+  {
+    "id": "servegen",
+    "name": "ServeGen",
+    "status": "existing",
+    "kind": "Production-fitted workload generator",
+    "official_url": "https://github.com/alibaba/ServeGen",
+    "paper_url": "https://www.usenix.org/conference/nsdi26/presentation/xiang-servegen",
+    "license": "Apache-2.0",
+    "access": "Open-source generator plus fitted distributions and hashed conversations",
+    "scale": "Models billions of requests across 12 production models",
+    "format": "JSON distributions, CSV rate traces, hashed conversation JSON",
+    "fields": [
+      "client rate/CV distributions",
+      "input/output length CDFs over time",
+      "language/reasoning/multimodal categories",
+      "hashed conversations"
+    ],
+    "coverage": {
+      "arrivals": "generated",
+      "token_lengths": "generated",
+      "content": "no",
+      "session": "partial",
+      "tenant": "no",
+      "prefix": "partial",
+      "tools": "no",
+      "dag": "no",
+      "slo": "no",
+      "failure": "no",
+      "multimodal": "yes",
+      "model": "yes",
+      "hardware": "no"
+    },
+    "used_by": [
+      "ServeGen; temporal holdout beyond most surveyed policies"
+    ],
+    "plex_operations": [
+      "admit",
+      "route",
+      "schedule",
+      "feedback",
+      "rebalance"
+    ],
+    "strengths": [
+      "Captures non-Poisson burstiness, shifting distributions, multimodal composition, and bimodal reasoning lengths",
+      "Controllable and scalable"
+    ],
+    "limitations": [
+      "No tool DAG, SLO, tenant fairness, cancellation, or explicit cache-residency events"
+    ],
+    "tier": "core"
+  },
+  {
+    "id": "lmsys-chat-1m",
+    "name": "LMSYS-Chat-1M",
+    "status": "existing",
+    "kind": "Real conversation content corpus",
+    "official_url": "https://huggingface.co/datasets/lmsys/lmsys-chat-1m",
+    "paper_url": "https://arxiv.org/abs/2309.11998",
+    "license": "Custom LMSYS dataset agreement",
+    "access": "Gated agreement; redistribution restricted",
+    "scale": "1M conversations, 25 models, 210K IPs, 154 languages; average 2 turns",
+    "format": "OpenAI-style conversation JSON",
+    "fields": [
+      "conversation_id",
+      "model",
+      "conversation",
+      "language",
+      "moderation",
+      "redacted"
+    ],
+    "coverage": {
+      "arrivals": "no",
+      "token_lengths": "no",
+      "content": "yes",
+      "session": "yes",
+      "tenant": "partial",
+      "prefix": "no",
+      "tools": "no",
+      "dag": "no",
+      "slo": "no",
+      "failure": "no",
+      "multimodal": "no",
+      "model": "yes",
+      "hardware": "no"
+    },
+    "used_by": [
+      "Common content source for ShareGPT-like serving workloads and model routing"
+    ],
+    "plex_operations": [
+      "route",
+      "schedule",
+      "evict"
+    ],
+    "strengths": [
+      "Real prompts/responses, model identity, multilingual and moderation metadata"
+    ],
+    "limitations": [
+      "No request-level arrival timing, token timing, prefix hashes, SLO, tool events, or system outcomes"
+    ],
+    "tier": "supporting"
+  },
+  {
+    "id": "wildchat-1m",
+    "name": "WildChat-1M",
+    "status": "existing",
+    "kind": "Timestamped real conversation corpus",
+    "official_url": "https://huggingface.co/datasets/allenai/WildChat-1M",
+    "paper_url": "https://arxiv.org/abs/2405.01470",
+    "license": "ODC-BY",
+    "access": "Hugging Face download; toxic full version is gated",
+    "scale": "837,989 released conversations; GPT-3.5/GPT-4; 68 languages",
+    "format": "Parquet / Hugging Face dataset",
+    "fields": [
+      "conversation_hash",
+      "model",
+      "timestamp",
+      "per-turn timestamps",
+      "content",
+      "hashed_ip",
+      "country/state",
+      "turn_identifier",
+      "moderation"
+    ],
+    "coverage": {
+      "arrivals": "partial",
+      "token_lengths": "no",
+      "content": "yes",
+      "session": "yes",
+      "tenant": "partial",
+      "prefix": "no",
+      "tools": "no",
+      "dag": "no",
+      "slo": "no",
+      "failure": "partial",
+      "multimodal": "no",
+      "model": "yes",
+      "hardware": "no"
+    },
+    "used_by": [
+      "Not a common legacy serving trace; recommended content/session overlay"
+    ],
+    "plex_operations": [
+      "route",
+      "admit",
+      "schedule",
+      "feedback"
+    ],
+    "strengths": [
+      "Per-turn timestamps, user linkage, model identity, content, geography, and multi-turn structure"
+    ],
+    "limitations": [
+      "No token lengths, TTFT/TPOT, prefix hashes, SLO, tool/DAG metadata, or infrastructure state"
+    ],
+    "tier": "extension"
+  },
+  {
+    "id": "sharegpt",
+    "name": "ShareGPT / Vicuna Conversation Corpus",
+    "status": "existing",
+    "kind": "Community conversation content corpus",
+    "official_url": "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered",
+    "paper_url": "https://lmsys.org/blog/2023-03-30-vicuna/",
+    "license": "Provenance and redistribution terms require care",
+    "access": "Community mirrors; original release is unstable",
+    "scale": "Tens of thousands of multi-turn shared ChatGPT conversations",
+    "format": "Conversation JSON",
+    "fields": [
+      "conversation id",
+      "user/assistant turns",
+      "text"
+    ],
+    "coverage": {
+      "arrivals": "no",
+      "token_lengths": "no",
+      "content": "yes",
+      "session": "yes",
+      "tenant": "no",
+      "prefix": "no",
+      "tools": "no",
+      "dag": "no",
+      "slo": "no",
+      "failure": "no",
+      "multimodal": "no",
+      "model": "no",
+      "hardware": "no"
+    },
+    "used_by": [
+      "InferCept",
+      "VTC-derived traces",
+      "QLM",
+      "DLPM",
+      "Llumnix",
+      "CachedAttention",
+      "many serving baselines"
+    ],
+    "plex_operations": [
+      "schedule",
+      "evict",
+      "feedback"
+    ],
+    "strengths": [
+      "Historically dominant source for realistic length and multi-turn content"
+    ],
+    "limitations": [
+      "No reliable arrivals, tenant, model, SLO, prefix hashes, tools, failures; licensing/provenance is weaker than newer corpora"
+    ],
+    "tier": "supporting"
+  },
+  {
+    "id": "azure-functions-2019",
+    "name": "Azure Functions Trace 2019",
+    "status": "existing",
+    "kind": "Legacy production serverless trace",
+    "official_url": "https://github.com/Azure/AzurePublicDataset/blob/master/AzureFunctionsDataset2019.md",
+    "paper_url": "https://www.usenix.org/conference/atc20/presentation/shahrad",
+    "license": "CC-BY",
+    "access": "Direct compressed CSV release",
+    "scale": "14 days of sampled applications/functions; per-minute counts plus duration and memory distributions",
+    "format": "CSV",
+    "fields": [
+      "HashOwner",
+      "HashApp",
+      "HashFunction",
+      "Trigger",
+      "per-minute invocations",
+      "duration percentiles",
+      "memory percentiles"
+    ],
+    "coverage": {
+      "arrivals": "aggregated",
+      "token_lengths": "no",
+      "content": "no",
+      "session": "no",
+      "tenant": "yes",
+      "prefix": "no",
+      "tools": "no",
+      "dag": "no",
+      "slo": "no",
+      "failure": "partial",
+      "multimodal": "no",
+      "model": "no",
+      "hardware": "partial"
+    },
+    "used_by": [
+      "PARD uses an Azure Functions trace; useful legacy baseline for burst and cold-start policies"
+    ],
+    "plex_operations": [
+      "admit",
+      "route",
+      "rebalance",
+      "feedback"
+    ],
+    "strengths": [
+      "Long-lived owner/app/function identities, burst patterns, orchestration triggers, memory and duration distributions"
+    ],
+    "limitations": [
+      "Minute aggregation; no per-request tokens/content/session/cache/SLO; not an LLM trace"
+    ],
+    "tier": "supporting"
+  },
+  {
+    "id": "swe-bench-verified",
+    "name": "SWE-bench Verified",
+    "status": "existing",
+    "kind": "Agent task benchmark",
+    "official_url": "https://huggingface.co/datasets/SWE-bench/SWE-bench_Verified",
+    "paper_url": "https://arxiv.org/abs/2310.06770",
+    "license": "MIT",
+    "access": "Hugging Face plus Docker evaluation harness",
+    "scale": "500 human-validated GitHub issue/PR instances",
+    "format": "Dataset rows plus repository snapshots and tests",
+    "fields": [
+      "instance_id",
+      "repo",
+      "base_commit",
+      "problem_statement",
+      "patch",
+      "test_patch",
+      "FAIL_TO_PASS",
+      "PASS_TO_PASS"
+    ],
+    "coverage": {
+      "arrivals": "no",
+      "token_lengths": "no",
+      "content": "yes",
+      "session": "derived",
+      "tenant": "no",
+      "prefix": "no",
+      "tools": "generated",
+      "dag": "derived",
+      "slo": "no",
+      "failure": "generated",
+      "multimodal": "no",
+      "model": "no",
+      "hardware": "no"
+    },
+    "used_by": [
+      "Continuum",
+      "ThunderAgent",
+      "ConServe",
+      "KAIROS",
+      "Dyserve",
+      "SAGA"
+    ],
+    "plex_operations": [
+      "schedule",
+      "evict",
+      "feedback",
+      "prefetch"
+    ],
+    "strengths": [
+      "Real software tasks, reproducible environment, objective completion tests, long agent trajectories"
+    ],
+    "limitations": [
+      "Dataset itself has no LLM calls, arrivals, tokens, tool latencies, SLOs, or cancellations; requires an instrumented agent run"
+    ],
+    "tier": "core"
+  },
+  {
+    "id": "mini-swe-agent",
+    "name": "mini-SWE-agent Trajectories",
+    "status": "existing",
+    "kind": "Agent trajectory generator",
+    "official_url": "https://github.com/SWE-agent/mini-swe-agent",
+    "paper_url": "https://mini-swe-agent.com/",
+    "license": "MIT",
+    "access": "Open-source agent and trajectory browser",
+    "scale": "Runs SWE-bench and related coding benchmarks with a linear message history",
+    "format": "Message/trajectory logs",
+    "fields": [
+      "linear message history",
+      "bash actions",
+      "tool outputs",
+      "model calls",
+      "task result"
+    ],
+    "coverage": {
+      "arrivals": "no",
+      "token_lengths": "no",
+      "content": "yes",
+      "session": "yes",
+      "tenant": "no",
+      "prefix": "no",
+      "tools": "yes",
+      "dag": "chain",
+      "slo": "no",
+      "failure": "yes",
+      "multimodal": "no",
+      "model": "yes",
+      "hardware": "no"
+    },
+    "used_by": [
+      "Continuum and KAIROS use mini-SWE-agent-style workloads"
+    ],
+    "plex_operations": [
+      "schedule",
+      "evict",
+      "feedback",
+      "prefetch"
+    ],
+    "strengths": [
+      "Simple one-to-one relation between message history and trajectory; easy to instrument for serving events"
+    ],
+    "limitations": [
+      "Single bash tool and linear control flow do not cover parallel DAG agents or rich tool ecosystems"
+    ],
+    "tier": "core"
+  },
+  {
+    "id": "openhands",
+    "name": "OpenHands Evaluation Trajectories",
+    "status": "existing",
+    "kind": "Agent execution framework / trajectory generator",
+    "official_url": "https://github.com/All-Hands-AI/OpenHands",
+    "paper_url": "https://arxiv.org/abs/2407.16741",
+    "license": "Repository-specific terms",
+    "access": "Open source; benchmark outputs generated locally",
+    "scale": "Supports SWE-bench, ScienceAgentBench, and other agent benchmarks",
+    "format": "JSONL/event logs and sandbox actions",
+    "fields": [
+      "model messages",
+      "actions",
+      "observations",
+      "tool/sandbox events",
+      "task result"
+    ],
+    "coverage": {
+      "arrivals": "no",
+      "token_lengths": "no",
+      "content": "yes",
+      "session": "yes",
+      "tenant": "no",
+      "prefix": "no",
+      "tools": "yes",
+      "dag": "partial",
+      "slo": "no",
+      "failure": "yes",
+      "multimodal": "no",
+      "model": "yes",
+      "hardware": "no"
+    },
+    "used_by": [
+      "ThunderAgent",
+      "ScienceAgentBench integrations"
+    ],
+    "plex_operations": [
+      "schedule",
+      "evict",
+      "feedback",
+      "prefetch"
+    ],
+    "strengths": [
+      "Rich executable trajectories and multiple benchmark adapters"
+    ],
+    "limitations": [
+      "No standardized public serving trace; arrival concurrency and latency instrumentation must be added"
+    ],
+    "tier": "extension"
+  },
+  {
+    "id": "bfcl-v4",
+    "name": "Berkeley Function Calling Leaderboard V4",
+    "status": "existing",
+    "kind": "Tool/function-calling benchmark",
+    "official_url": "https://gorilla.cs.berkeley.edu/leaderboard.html",
+    "paper_url": "https://gorilla.cs.berkeley.edu/blogs/15_bfcl_v4_web_search.html",
+    "license": "Apache-2.0 code; dataset terms in Gorilla repository",
+    "access": "Public code, data, and model responses",
+    "scale": "Real-world function data with single-turn, multi-turn, and web-search categories",
+    "format": "JSON function schemas, prompts, expected calls, model responses",
+    "fields": [
+      "functions/tools",
+      "multi-turn state",
+      "expected calls",
+      "latency/cost leaderboard outputs"
+    ],
+    "coverage": {
+      "arrivals": "no",
+      "token_lengths": "no",
+      "content": "yes",
+      "session": "yes",
+      "tenant": "no",
+      "prefix": "no",
+      "tools": "yes",
+      "dag": "no",
+      "slo": "no",
+      "failure": "partial",
+      "multimodal": "no",
+      "model": "yes",
+      "hardware": "no"
+    },
+    "used_by": [
+      "Continuum"
+    ],
+    "plex_operations": [
+      "schedule",
+      "evict",
+      "feedback"
+    ],
+    "strengths": [
+      "Canonical multi-turn tool benchmark; released model responses and measured cost/latency"
+    ],
+    "limitations": [
+      "No production arrivals, true external tool durations, tenant/SLO, prefix hashes, or infrastructure state"
+    ],
+    "tier": "core"
+  },
+  {
+    "id": "tau3-bench",
+    "name": "tau3-bench",
+    "status": "existing",
+    "kind": "Stateful tool-agent-user benchmark",
+    "official_url": "https://github.com/sierra-research/tau2-bench",
+    "paper_url": "https://arxiv.org/abs/2406.12045",
+    "license": "MIT",
+    "access": "Open-source tasks, environments, simulators, and historical trajectories",
+    "scale": "Airline, retail, telecom, banking knowledge/RAG, mock, and full-duplex voice modes",
+    "format": "Task/config files and trajectory result files",
+    "fields": [
+      "domain state",
+      "agent tools",
+      "user tools",
+      "tasks",
+      "policy rules",
+      "multi-turn trajectories",
+      "voice/audio events"
+    ],
+    "coverage": {
+      "arrivals": "no",
+      "token_lengths": "no",
+      "content": "yes",
+      "session": "yes",
+      "tenant": "no",
+      "prefix": "no",
+      "tools": "yes",
+      "dag": "partial",
+      "slo": "no",
+      "failure": "yes",
+      "multimodal": "audio",
+      "model": "yes",
+      "hardware": "no"
+    },
+    "used_by": [
+      "Recommended new workload; not broadly used in first-wave serving papers"
+    ],
+    "plex_operations": [
+      "admit",
+      "schedule",
+      "evict",
+      "feedback",
+      "prefetch"
+    ],
+    "strengths": [
+      "Best public source for stateful tool/user interaction, policy constraints, RAG, and full-duplex voice"
+    ],
+    "limitations": [
+      "Generated user behavior and tool timing; no production arrival process, tenant/SLO, or cache lineage"
+    ],
+    "tier": "core"
+  },
+  {
+    "id": "toolbench",
+    "name": "ToolBench / StableToolBench",
+    "status": "existing",
+    "kind": "Large-scale tool-use trajectory corpus",
+    "official_url": "https://github.com/OpenBMB/ToolBench",
+    "paper_url": "https://arxiv.org/abs/2307.16789",
+    "license": "Apache-2.0",
+    "access": "Public dataset; stable local API simulator available separately",
+    "scale": "3,451 tools, 16,464 APIs, 126K instructions, 469K API calls",
+    "format": "JSON instructions, API schemas/environments, DFS reasoning/tool trajectories",
+    "fields": [
+      "single/multi-tool instructions",
+      "API definitions",
+      "reasoning tree",
+      "tool execution and results"
+    ],
+    "coverage": {
+      "arrivals": "no",
+      "token_lengths": "no",
+      "content": "yes",
+      "session": "partial",
+      "tenant": "no",
+      "prefix": "no",
+      "tools": "yes",
+      "dag": "tree",
+      "slo": "no",
+      "failure": "partial",
+      "multimodal": "no",
+      "model": "no",
+      "hardware": "no"
+    },
+    "used_by": [
+      "ToolLLM-style workloads in SLOs-Serve and agent papers"
+    ],
+    "plex_operations": [
+      "schedule",
+      "feedback",
+      "prefetch"
+    ],
+    "strengths": [
+      "Large and diverse multi-tool decision trees with released execution results"
+    ],
+    "limitations": [
+      "Automatically generated; live RapidAPI timing is unstable; no serving arrival/SLO/tenant/cache metadata"
+    ],
+    "tier": "extension"
+  },
+  {
+    "id": "terminal-bench-2",
+    "name": "Terminal-Bench 2.0",
+    "status": "existing",
+    "kind": "Executable agent task benchmark",
+    "official_url": "https://github.com/laude-institute/terminal-bench",
+    "paper_url": "https://arxiv.org/abs/2601.11868",
+    "license": "Apache-2.0",
+    "access": "Public tasks and Harbor execution harness",
+    "scale": "Approximately 100 hard terminal tasks in the original core; evolving registry in 2.0",
+    "format": "Task directories, Docker environments, test scripts, agent trajectories",
+    "fields": [
+      "instruction",
+      "environment",
+      "test oracle",
+      "terminal actions/output",
+      "task result"
+    ],
+    "coverage": {
+      "arrivals": "no",
+      "token_lengths": "no",
+      "content": "yes",
+      "session": "yes",
+      "tenant": "no",
+      "prefix": "no",
+      "tools": "terminal",
+      "dag": "no",
+      "slo": "no",
+      "failure": "yes",
+      "multimodal": "no",
+      "model": "yes",
+      "hardware": "no"
+    },
+    "used_by": [
+      "KAIROS"
+    ],
+    "plex_operations": [
+      "schedule",
+      "evict",
+      "feedback"
+    ],
+    "strengths": [
+      "Long-horizon executable tasks with objective validation and realistic tool intervals"
+    ],
+    "limitations": [
+      "No native concurrent arrivals, prefix lineage, SLO, tenant, or standardized model-call timing"
+    ],
+    "tier": "core"
+  },
+  {
+    "id": "agentbench",
+    "name": "AgentBench",
+    "status": "existing",
+    "kind": "Multi-environment agent benchmark",
+    "official_url": "https://github.com/THUDM/AgentBench",
+    "paper_url": "https://arxiv.org/abs/2308.03688",
+    "license": "Apache-2.0",
+    "access": "Public tasks and containerized environments",
+    "scale": "Eight environments including OS, DB, KG, card game, lateral thinking, WebShop, Mind2Web, and web browsing",
+    "format": "Task splits and environment interaction logs",
+    "fields": [
+      "task",
+      "environment state",
+      "actions/observations",
+      "multi-turn interaction",
+      "result"
+    ],
+    "coverage": {
+      "arrivals": "no",
+      "token_lengths": "no",
+      "content": "yes",
+      "session": "yes",
+      "tenant": "no",
+      "prefix": "no",
+      "tools": "yes",
+      "dag": "partial",
+      "slo": "no",
+      "failure": "yes",
+      "multimodal": "no",
+      "model": "no",
+      "hardware": "no"
+    },
+    "used_by": [
+      "Recommended breadth workload"
+    ],
+    "plex_operations": [
+      "schedule",
+      "feedback"
+    ],
+    "strengths": [
+      "Broad environment diversity and multi-turn behavior"
+    ],
+    "limitations": [
+      "Old tool/function interfaces; no production arrivals, tokens, SLO, prefix, or hardware fields"
+    ],
+    "tier": "extension"
+  },
+  {
+    "id": "osworld-verified",
+    "name": "OSWorld-Verified",
+    "status": "existing",
+    "kind": "Multimodal computer-use benchmark",
+    "official_url": "https://github.com/xlang-ai/OSWorld",
+    "paper_url": "https://arxiv.org/abs/2404.07972",
+    "license": "Apache-2.0",
+    "access": "Public benchmark, VM images, examples, screenshots and videos",
+    "scale": "Open-ended tasks across Ubuntu/Windows applications; verified revision available",
+    "format": "JSON task metadata plus screenshots, actions, videos, and result logs",
+    "fields": [
+      "task",
+      "OS/application",
+      "screenshots",
+      "actions",
+      "video",
+      "result"
+    ],
+    "coverage": {
+      "arrivals": "no",
+      "token_lengths": "no",
+      "content": "yes",
+      "session": "yes",
+      "tenant": "no",
+      "prefix": "no",
+      "tools": "GUI",
+      "dag": "no",
+      "slo": "no",
+      "failure": "yes",
+      "multimodal": "yes",
+      "model": "yes",
+      "hardware": "no"
+    },
+    "used_by": [
+      "Recommended multimodal agent workload"
+    ],
+    "plex_operations": [
+      "schedule",
+      "feedback",
+      "evict"
+    ],
+    "strengths": [
+      "Real GUI state, multimodal payloads, long trajectories, cloud-parallel harness"
+    ],
+    "limitations": [
+      "No production arrival/session population, token/cache lineage, SLO, or external tool timing"
+    ],
+    "tier": "extension"
+  },
+  {
+    "id": "webarena",
+    "name": "WebArena / BrowserGym",
+    "status": "existing",
+    "kind": "Web-agent benchmark and trajectory corpus",
+    "official_url": "https://github.com/web-arena-x/webarena",
+    "paper_url": "https://arxiv.org/abs/2307.13854",
+    "license": "Apache-2.0",
+    "access": "Self-hosted websites, 812 tasks, execution and human trajectories",
+    "scale": "812 benchmark examples; about 170 released human trajectories",
+    "format": "JSON task configs and HTML/action trajectories",
+    "fields": [
+      "instruction",
+      "website state",
+      "actions/observations",
+      "human/agent trajectory",
+      "success"
+    ],
+    "coverage": {
+      "arrivals": "no",
+      "token_lengths": "no",
+      "content": "yes",
+      "session": "yes",
+      "tenant": "no",
+      "prefix": "no",
+      "tools": "web",
+      "dag": "partial",
+      "slo": "no",
+      "failure": "yes",
+      "multimodal": "no",
+      "model": "no",
+      "hardware": "no"
+    },
+    "used_by": [
+      "Recommended browser-agent workload"
+    ],
+    "plex_operations": [
+      "schedule",
+      "feedback",
+      "prefetch"
+    ],
+    "strengths": [
+      "Reproducible web environment and real trajectory structure"
+    ],
+    "limitations": [
+      "No serving timing, token/cache lineage, SLO, tenant, or concurrent workflow arrivals"
+    ],
+    "tier": "extension"
+  },
+  {
+    "id": "gaia",
+    "name": "GAIA",
+    "status": "existing",
+    "kind": "General assistant benchmark",
+    "official_url": "https://huggingface.co/datasets/gaia-benchmark/GAIA",
+    "paper_url": "https://arxiv.org/abs/2311.12983",
+    "license": "Gated dataset; no redistribution",
+    "access": "Public dev; gated validation/test",
+    "scale": "More than 450 questions across three difficulty levels, often with attachments",
+    "format": "Parquet metadata plus PDFs/media/attachments",
+    "fields": [
+      "task_id",
+      "Question",
+      "Level",
+      "Final answer",
+      "file_path",
+      "annotator metadata"
+    ],
+    "coverage": {
+      "arrivals": "no",
+      "token_lengths": "no",
+      "content": "yes",
+      "session": "no",
+      "tenant": "no",
+      "prefix": "no",
+      "tools": "derived",
+      "dag": "derived",
+      "slo": "no",
+      "failure": "no",
+      "multimodal": "partial",
+      "model": "no",
+      "hardware": "no"
+    },
+    "used_by": [
+      "Dyserve"
+    ],
+    "plex_operations": [
+      "route",
+      "schedule",
+      "feedback"
+    ],
+    "strengths": [
+      "Diverse tool/search/file workloads and clear task-level quality target"
+    ],
+    "limitations": [
+      "Content benchmark only; no trajectories, arrivals, token timing, session, cache, or SLO"
+    ],
+    "tier": "extension"
+  },
+  {
+    "id": "scienceagentbench",
+    "name": "ScienceAgentBench",
+    "status": "existing",
+    "kind": "Scientific coding-agent benchmark",
+    "official_url": "https://github.com/OSU-NLP-Group/ScienceAgentBench",
+    "paper_url": "https://arxiv.org/abs/2410.05080",
+    "license": "Mostly CC-BY-4.0 data; MIT code; task-specific exceptions",
+    "access": "Public annotation and passworded full benchmark artifacts",
+    "scale": "102 tasks from 44 peer-reviewed papers across four disciplines",
+    "format": "Task annotations, scientific datasets, generated program and JSONL evaluation logs",
+    "fields": [
+      "task input",
+      "data files",
+      "generated code",
+      "execution result",
+      "cost",
+      "trajectory logs"
+    ],
+    "coverage": {
+      "arrivals": "no",
+      "token_lengths": "no",
+      "content": "yes",
+      "session": "yes",
+      "tenant": "no",
+      "prefix": "no",
+      "tools": "code",
+      "dag": "no",
+      "slo": "no",
+      "failure": "yes",
+      "multimodal": "no",
+      "model": "yes",
+      "hardware": "no"
+    },
+    "used_by": [
+      "ThunderAgent",
+      "OpenHands integration"
+    ],
+    "plex_operations": [
+      "schedule",
+      "feedback",
+      "prefetch"
+    ],
+    "strengths": [
+      "Authentic long-running scientific tasks and executable outcomes"
+    ],
+    "limitations": [
+      "No production arrival model, prefix/cache state, SLO, or standardized tool duration"
+    ],
+    "tier": "extension"
+  },
+  {
+    "id": "theagentcompany",
+    "name": "TheAgentCompany",
+    "status": "existing",
+    "kind": "Enterprise workflow-agent benchmark",
+    "official_url": "https://github.com/TheAgentCompany/TheAgentCompany",
+    "paper_url": "https://arxiv.org/abs/2412.14161",
+    "license": "MIT",
+    "access": "Public Dockerized company environment and result trajectories",
+    "scale": "Professional tasks spanning web, code, programs, and coworker communication",
+    "format": "Docker task images and trajectory files",
+    "fields": [
+      "task",
+      "company applications",
+      "web/code actions",
+      "coworker messages",
+      "subcheckpoints",
+      "result"
+    ],
+    "coverage": {
+      "arrivals": "no",
+      "token_lengths": "no",
+      "content": "yes",
+      "session": "yes",
+      "tenant": "no",
+      "prefix": "no",
+      "tools": "yes",
+      "dag": "partial",
+      "slo": "no",
+      "failure": "yes",
+      "multimodal": "no",
+      "model": "no",
+      "hardware": "no"
+    },
+    "used_by": [
+      "Recommended new enterprise workflow workload"
+    ],
+    "plex_operations": [
+      "route",
+      "schedule",
+      "feedback"
+    ],
+    "strengths": [
+      "Multi-application workflows and communication resembling compound enterprise agents"
+    ],
+    "limitations": [
+      "No production arrival/token/cache/SLO fields; environment setup is heavyweight"
+    ],
+    "tier": "extension"
+  },
+  {
+    "id": "longmemeval",
+    "name": "LongMemEval",
+    "status": "existing",
+    "kind": "Timestamped long-term conversation benchmark",
+    "official_url": "https://github.com/xiaowu0162/LongMemEval",
+    "paper_url": "https://arxiv.org/abs/2410.10813",
+    "license": "MIT",
+    "access": "Public cleaned JSON datasets and construction pipeline",
+    "scale": "500 questions; 40-session/115K-token and 500-session variants",
+    "format": "JSON histories with timestamped sessions and turns",
+    "fields": [
+      "question_type",
+      "question",
+      "answer",
+      "haystack_session_ids",
+      "haystack_dates",
+      "haystack_sessions",
+      "answer_session_ids"
+    ],
+    "coverage": {
+      "arrivals": "no",
+      "token_lengths": "no",
+      "content": "yes",
+      "session": "yes",
+      "tenant": "no",
+      "prefix": "derived",
+      "tools": "no",
+      "dag": "chain",
+      "slo": "no",
+      "failure": "no",
+      "multimodal": "no",
+      "model": "no",
+      "hardware": "no"
+    },
+    "used_by": [
+      "Recommended logical-request and long-session workload"
+    ],
+    "plex_operations": [
+      "route",
+      "schedule",
+      "evict",
+      "feedback"
+    ],
+    "strengths": [
+      "Explicit timestamps, hundreds of sessions, knowledge updates, temporal reasoning, controllable history length"
+    ],
+    "limitations": [
+      "Synthetic session construction; no concurrent arrivals, tenant/SLO, tool events, or serving outcomes"
+    ],
+    "tier": "extension"
+  },
+  {
+    "id": "dynasor-math500",
+    "name": "Dynasor / Math500 Reasoning Workload",
+    "status": "existing",
+    "kind": "Reasoning trajectory benchmark",
+    "official_url": "https://github.com/hao-ai-lab/Dynasor",
+    "paper_url": "https://arxiv.org/abs/2412.20993",
+    "license": "Repository-specific open-source terms",
+    "access": "Public implementation and Math500 benchmark scripts",
+    "scale": "Math500 questions; configurable parallel solution sampling and token deprivation",
+    "format": "Prompt plus multiple reasoning trajectories and progress/certainty signals",
+    "fields": [
+      "problem",
+      "sample/branch",
+      "generated tokens",
+      "candidate answers",
+      "Certaindex/progress",
+      "stop decision"
+    ],
+    "coverage": {
+      "arrivals": "no",
+      "token_lengths": "no",
+      "content": "yes",
+      "session": "yes",
+      "tenant": "no",
+      "prefix": "no",
+      "tools": "no",
+      "dag": "branches",
+      "slo": "no",
+      "failure": "partial",
+      "multimodal": "no",
+      "model": "yes",
+      "hardware": "no"
+    },
+    "used_by": [
+      "Certaindex / Dynasor"
+    ],
+    "plex_operations": [
+      "admit",
+      "schedule",
+      "feedback"
+    ],
+    "strengths": [
+      "Directly exercises dynamic compute allocation, early termination, and branch-level utility"
+    ],
+    "limitations": [
+      "No production arrival or tenant/SLO/cache/hardware trace"
+    ],
+    "tier": "core"
+  },
+  {
+    "id": "livecodebench",
+    "name": "LiveCodeBench",
+    "status": "existing",
+    "kind": "Temporal code-reasoning benchmark",
+    "official_url": "https://github.com/LiveCodeBench/LiveCodeBench",
+    "paper_url": "https://arxiv.org/abs/2403.07974",
+    "license": "MIT",
+    "access": "Public continuously updated dataset and evaluator",
+    "scale": "400 problems in v1, 1,055 by v6; dated contest problems from LeetCode, AtCoder, Codeforces",
+    "format": "Hugging Face datasets and generated solution files",
+    "fields": [
+      "problem",
+      "release date",
+      "tests",
+      "scenario",
+      "generated solutions",
+      "execution result"
+    ],
+    "coverage": {
+      "arrivals": "no",
+      "token_lengths": "no",
+      "content": "yes",
+      "session": "no",
+      "tenant": "no",
+      "prefix": "no",
+      "tools": "no",
+      "dag": "no",
+      "slo": "no",
+      "failure": "yes",
+      "multimodal": "no",
+      "model": "yes",
+      "hardware": "no"
+    },
+    "used_by": [
+      "Dyserve"
+    ],
+    "plex_operations": [
+      "route",
+      "schedule",
+      "feedback"
+    ],
+    "strengths": [
+      "Temporal holdout, executable quality, variable difficulty, self-repair and execution scenarios"
+    ],
+    "limitations": [
+      "No serving arrivals, sessions, prefix/cache, SLO, or branch trajectories unless generated"
+    ],
+    "tier": "extension"
+  },
+  {
+    "id": "math-reasoning-suite",
+    "name": "GSM8K / MATH / AIME / Math500 Suite",
+    "status": "existing",
+    "kind": "Reasoning content suite",
+    "official_url": "https://huggingface.co/datasets/HuggingFaceH4/MATH-500",
+    "paper_url": "https://arxiv.org/abs/2412.20993",
+    "license": "Dataset-specific",
+    "access": "Public benchmark datasets",
+    "scale": "Thousands of grade-school through competition-level math questions",
+    "format": "Question/answer records",
+    "fields": [
+      "problem",
+      "answer",
+      "difficulty/category"
+    ],
+    "coverage": {
+      "arrivals": "no",
+      "token_lengths": "no",
+      "content": "yes",
+      "session": "no",
+      "tenant": "no",
+      "prefix": "no",
+      "tools": "no",
+      "dag": "no",
+      "slo": "no",
+      "failure": "no",
+      "multimodal": "no",
+      "model": "no",
+      "hardware": "no"
+    },
+    "used_by": [
+      "InferCept GSM8K-XL",
+      "Certaindex",
+      "many reasoning schedulers"
+    ],
+    "plex_operations": [
+      "admit",
+      "schedule",
+      "feedback"
+    ],
+    "strengths": [
+      "Easy to generate Best-of-N, self-consistency, long-reasoning, and branch-parallel workloads"
+    ],
+    "limitations": [
+      "Content-only; no arrivals, real tool waits, session identity, cache, SLO, or production failures"
+    ],
+    "tier": "supporting"
+  },
+  {
+    "id": "code-reasoning-suite",
+    "name": "HumanEval / MBPP / APPS Code Suite",
+    "status": "existing",
+    "kind": "Code-generation content suite",
+    "official_url": "https://github.com/openai/human-eval",
+    "paper_url": "https://arxiv.org/abs/2107.03374",
+    "license": "Dataset-specific",
+    "access": "Public datasets and test harnesses",
+    "scale": "Hundreds to thousands of code problems with executable tests",
+    "format": "Problem text, function signatures, tests, generated code",
+    "fields": [
+      "problem",
+      "tests",
+      "solution",
+      "execution result"
+    ],
+    "coverage": {
+      "arrivals": "no",
+      "token_lengths": "no",
+      "content": "yes",
+      "session": "no",
+      "tenant": "no",
+      "prefix": "no",
+      "tools": "no",
+      "dag": "no",
+      "slo": "no",
+      "failure": "yes",
+      "multimodal": "no",
+      "model": "no",
+      "hardware": "no"
+    },
+    "used_by": [
+      "RouterBench includes MBPP; common serving and routing benchmarks"
+    ],
+    "plex_operations": [
+      "route",
+      "schedule",
+      "feedback"
+    ],
+    "strengths": [
+      "Objective quality and variable output lengths; supports sampling/repair workloads"
+    ],
+    "limitations": [
+      "No request timing, session, cache, SLO, tenant, or tool environment"
+    ],
+    "tier": "supporting"
+  },
+  {
+    "id": "longbench-v2",
+    "name": "LongBench v2",
+    "status": "existing",
+    "kind": "Long-context content benchmark",
+    "official_url": "https://github.com/THUDM/LongBench",
+    "paper_url": "https://arxiv.org/abs/2412.15204",
+    "license": "MIT",
+    "access": "Public Hugging Face dataset",
+    "scale": "503 questions with 8K to 2M-word contexts across six task categories",
+    "format": "JSON/Hugging Face rows",
+    "fields": [
+      "id",
+      "instruction",
+      "input",
+      "context",
+      "answer",
+      "length",
+      "domain",
+      "sub_domain"
+    ],
+    "coverage": {
+      "arrivals": "no",
+      "token_lengths": "no",
+      "content": "yes",
+      "session": "no",
+      "tenant": "no",
+      "prefix": "derived",
+      "tools": "no",
+      "dag": "no",
+      "slo": "no",
+      "failure": "no",
+      "multimodal": "no",
+      "model": "no",
+      "hardware": "no"
+    },
+    "used_by": [
+      "Recommended new long-context workload"
+    ],
+    "plex_operations": [
+      "admit",
+      "schedule",
+      "evict",
+      "prefetch"
+    ],
+    "strengths": [
+      "Realistic long documents, code repositories, dialogues, structured data, and controllable length"
+    ],
+    "limitations": [
+      "No arrivals/session population, prefix hashes, SLO, tool boundaries, or infrastructure state"
+    ],
+    "tier": "extension"
+  },
+  {
+    "id": "infinitebench",
+    "name": "InfiniteBench",
+    "status": "existing",
+    "kind": "100K+ long-context benchmark",
+    "official_url": "https://github.com/OpenBMB/InfiniteBench",
+    "paper_url": "https://arxiv.org/abs/2402.13718",
+    "license": "MIT",
+    "access": "Public Hugging Face data and JSONL files",
+    "scale": "12 tasks; many inputs 75K-200K tokens, with some Chinese book QA above 2M tokens",
+    "format": "JSONL",
+    "fields": [
+      "task",
+      "context",
+      "question/input",
+      "answer/output"
+    ],
+    "coverage": {
+      "arrivals": "no",
+      "token_lengths": "no",
+      "content": "yes",
+      "session": "no",
+      "tenant": "no",
+      "prefix": "derived",
+      "tools": "no",
+      "dag": "no",
+      "slo": "no",
+      "failure": "no",
+      "multimodal": "no",
+      "model": "no",
+      "hardware": "no"
+    },
+    "used_by": [
+      "Recommended extreme long-context workload"
+    ],
+    "plex_operations": [
+      "admit",
+      "schedule",
+      "evict",
+      "prefetch"
+    ],
+    "strengths": [
+      "Extreme context pressure, long dialogue, code, retrieval, and synthetic stress tasks"
+    ],
+    "limitations": [
+      "Content-only; no arrival/session/cache/SLO/tenant/hardware events"
+    ],
+    "tier": "extension"
+  },
+  {
+    "id": "beir",
+    "name": "BEIR",
+    "status": "existing",
+    "kind": "Retrieval benchmark suite",
+    "official_url": "https://github.com/beir-cellar/beir",
+    "paper_url": "https://arxiv.org/abs/2104.08663",
+    "license": "Apache-2.0 code; component dataset licenses vary",
+    "access": "Public datasets and loader",
+    "scale": "17-18 retrieval datasets; corpora from thousands to millions of documents",
+    "format": "corpus/queries/qrels",
+    "fields": [
+      "document id/text",
+      "query id/text",
+      "relevance labels"
+    ],
+    "coverage": {
+      "arrivals": "no",
+      "token_lengths": "no",
+      "content": "yes",
+      "session": "no",
+      "tenant": "no",
+      "prefix": "derived",
+      "tools": "no",
+      "dag": "no",
+      "slo": "no",
+      "failure": "no",
+      "multimodal": "no",
+      "model": "no",
+      "hardware": "no"
+    },
+    "used_by": [
+      "RAG and prefix-cache papers; HotpotQA used by InferCept"
+    ],
+    "plex_operations": [
+      "route",
+      "schedule",
+      "evict",
+      "prefetch"
+    ],
+    "strengths": [
+      "Diverse domain and corpus sizes; easy to synthesize document-overlap and retrieval fanout"
+    ],
+    "limitations": [
+      "No generator-side answer tokens, arrivals, sessions, SLO, or cache lineage without a RAG pipeline"
+    ],
+    "tier": "supporting"
+  },
+  {
+    "id": "ragbench",
+    "name": "RAGBench",
+    "status": "existing",
+    "kind": "RAG evaluation corpus",
+    "official_url": "https://huggingface.co/datasets/galileo-ai/ragbench",
+    "paper_url": "https://arxiv.org/abs/2407.11005",
+    "license": "See dataset card",
+    "access": "Public Hugging Face dataset",
+    "scale": "Component datasets include HotpotQA, MSMARCO, HAGRID, and ExpertQA",
+    "format": "Question, retrieved context, response, and RAG quality labels",
+    "fields": [
+      "question",
+      "documents/context",
+      "response",
+      "relevance/faithfulness/utilization labels"
+    ],
+    "coverage": {
+      "arrivals": "no",
+      "token_lengths": "no",
+      "content": "yes",
+      "session": "no",
+      "tenant": "no",
+      "prefix": "derived",
+      "tools": "no",
+      "dag": "no",
+      "slo": "no",
+      "failure": "quality",
+      "multimodal": "no",
+      "model": "no",
+      "hardware": "no"
+    },
+    "used_by": [
+      "Recommended RAG policy workload"
+    ],
+    "plex_operations": [
+      "route",
+      "schedule",
+      "evict",
+      "prefetch",
+      "feedback"
+    ],
+    "strengths": [
+      "Can couple cache/resource policy to answer quality and context utilization"
+    ],
+    "limitations": [
+      "No serving arrivals/session/SLO/tenant/tool timing; generated responses may be model-specific"
+    ],
+    "tier": "extension"
+  },
+  {
+    "id": "hotpotqa",
+    "name": "HotpotQA",
+    "status": "existing",
+    "kind": "Multi-hop QA content benchmark",
+    "official_url": "https://hotpotqa.github.io/",
+    "paper_url": "https://arxiv.org/abs/1809.09600",
+    "license": "See official dataset terms",
+    "access": "Public dataset",
+    "scale": "About 113K multi-hop questions with supporting facts and distractors",
+    "format": "JSON",
+    "fields": [
+      "question",
+      "answer",
+      "context paragraphs",
+      "supporting facts",
+      "type/level"
+    ],
+    "coverage": {
+      "arrivals": "no",
+      "token_lengths": "no",
+      "content": "yes",
+      "session": "no",
+      "tenant": "no",
+      "prefix": "derived",
+      "tools": "no",
+      "dag": "derived",
+      "slo": "no",
+      "failure": "no",
+      "multimodal": "no",
+      "model": "no",
+      "hardware": "no"
+    },
+    "used_by": [
+      "InferCept",
+      "BEIR/RAG workloads"
+    ],
+    "plex_operations": [
+      "route",
+      "schedule",
+      "evict",
+      "prefetch"
+    ],
+    "strengths": [
+      "Multi-document dependencies and reusable corpus/document prefixes"
+    ],
+    "limitations": [
+      "No arrivals, sessions, token timing, SLO, tool duration, or cache events"
+    ],
+    "tier": "supporting"
+  },
+  {
+    "id": "mmmu",
+    "name": "MMMU / MMMU-Pro",
+    "status": "existing",
+    "kind": "Multimodal reasoning benchmark",
+    "official_url": "https://github.com/MMMU-Benchmark/MMMU",
+    "paper_url": "https://arxiv.org/abs/2311.16502",
+    "license": "Apache-2.0 code; dataset terms apply",
+    "access": "Public Hugging Face datasets",
+    "scale": "11.5K questions across 30 subjects, 183 subfields, and 32 image types",
+    "format": "Hugging Face rows with text/images/answers",
+    "fields": [
+      "question",
+      "images",
+      "options/answer",
+      "subject/subfield",
+      "explanation"
+    ],
+    "coverage": {
+      "arrivals": "no",
+      "token_lengths": "no",
+      "content": "yes",
+      "session": "no",
+      "tenant": "no",
+      "prefix": "no",
+      "tools": "no",
+      "dag": "no",
+      "slo": "no",
+      "failure": "no",
+      "multimodal": "image",
+      "model": "no",
+      "hardware": "no"
+    },
+    "used_by": [
+      "Recommended multimodal serving extension"
+    ],
+    "plex_operations": [
+      "admit",
+      "route",
+      "schedule",
+      "evict",
+      "feedback"
+    ],
+    "strengths": [
+      "Heterogeneous encoder workloads, image counts/types, and reasoning lengths"
+    ],
+    "limitations": [
+      "No arrival/session/cache/SLO/tenant/tool fields"
+    ],
+    "tier": "extension"
+  },
+  {
+    "id": "video-mme",
+    "name": "Video-MME",
+    "status": "existing",
+    "kind": "Long multimodal/video benchmark",
+    "official_url": "https://github.com/MME-Benchmarks/Video-MME",
+    "paper_url": "https://arxiv.org/abs/2405.21075",
+    "license": "Video copyrights remain with owners; annotation terms apply",
+    "access": "Public Hugging Face data/annotations",
+    "scale": "900 videos, 254 hours, 2,700 QA pairs; 11 seconds to 1 hour; subtitles/audio",
+    "format": "Video/audio/subtitle assets plus JSON answers",
+    "fields": [
+      "video",
+      "duration class",
+      "subtitle",
+      "audio",
+      "question/answer",
+      "domain/task type"
+    ],
+    "coverage": {
+      "arrivals": "no",
+      "token_lengths": "no",
+      "content": "yes",
+      "session": "no",
+      "tenant": "no",
+      "prefix": "no",
+      "tools": "no",
+      "dag": "no",
+      "slo": "no",
+      "failure": "no",
+      "multimodal": "video/audio",
+      "model": "no",
+      "hardware": "no"
+    },
+    "used_by": [
+      "Recommended encoder-residency and long-prefill workload"
+    ],
+    "plex_operations": [
+      "admit",
+      "route",
+      "schedule",
+      "evict",
+      "prefetch"
+    ],
+    "strengths": [
+      "Wide payload size and modality mix; long encoder outputs and context"
+    ],
+    "limitations": [
+      "No serving arrivals, session, SLO, cache lineage, failure, or tenant fields"
+    ],
+    "tier": "extension"
+  },
+  {
+    "id": "routerbench",
+    "name": "RouterBench",
+    "status": "existing",
+    "kind": "Multi-model routing outcome dataset",
+    "official_url": "https://huggingface.co/datasets/withmartian/routerbench",
+    "paper_url": "https://arxiv.org/abs/2403.12031",
+    "license": "See dataset card",
+    "access": "Public Hugging Face data",
+    "scale": "Over 30K prompts, responses from 11 LLMs, zero-shot and five-shot variants",
+    "format": "Dataset rows",
+    "fields": [
+      "prompt",
+      "model",
+      "response",
+      "estimated cost",
+      "correctness/performance score",
+      "source benchmark"
+    ],
+    "coverage": {
+      "arrivals": "no",
+      "token_lengths": "no",
+      "content": "yes",
+      "session": "no",
+      "tenant": "no",
+      "prefix": "no",
+      "tools": "no",
+      "dag": "no",
+      "slo": "no",
+      "failure": "quality",
+      "multimodal": "no",
+      "model": "yes",
+      "hardware": "no"
+    },
+    "used_by": [
+      "Model-routing related work"
+    ],
+    "plex_operations": [
+      "route",
+      "feedback"
+    ],
+    "strengths": [
+      "Counterfactual quality/cost outcomes across many models for the same prompt"
+    ],
+    "limitations": [
+      "No queue/load/hardware/cache/arrival/SLO/session data; model routing is not replica placement"
+    ],
+    "tier": "extension"
+  },
+  {
+    "id": "routellm-arena",
+    "name": "RouteLLM / Chatbot Arena Preference Data",
+    "status": "existing",
+    "kind": "Preference-based model-routing workload",
+    "official_url": "https://github.com/lm-sys/RouteLLM",
+    "paper_url": "https://arxiv.org/abs/2406.18665",
+    "license": "Apache-2.0 code; LMSYS data agreement applies",
+    "access": "Public code, routers, cached benchmark outputs, gated preference data",
+    "scale": "55K Arena preferences plus MMLU, GSM8K, and MT-Bench evaluations",
+    "format": "Preference pairs and precomputed model outcomes",
+    "fields": [
+      "prompt",
+      "strong/weak model responses",
+      "preference/win",
+      "cost threshold",
+      "benchmark"
+    ],
+    "coverage": {
+      "arrivals": "no",
+      "token_lengths": "no",
+      "content": "yes",
+      "session": "no",
+      "tenant": "no",
+      "prefix": "no",
+      "tools": "no",
+      "dag": "no",
+      "slo": "no",
+      "failure": "quality",
+      "multimodal": "no",
+      "model": "yes",
+      "hardware": "no"
+    },
+    "used_by": [
+      "Router-tier control papers"
+    ],
+    "plex_operations": [
+      "route",
+      "feedback"
+    ],
+    "strengths": [
+      "Direct cost-quality routing objective and calibration shift experiments"
+    ],
+    "limitations": [
+      "No serving load, cache, session, hardware, SLO latency, or resource contention"
+    ],
+    "tier": "supporting"
+  },
+  {
+    "id": "slora-synthetic",
+    "name": "S-LoRA Synthetic Adapter Workload",
+    "status": "existing",
+    "kind": "Synthetic multi-adapter workload",
+    "official_url": "https://github.com/S-LoRA/S-LoRA",
+    "paper_url": "https://arxiv.org/abs/2311.03285",
+    "license": "Apache-2.0",
+    "access": "Artifact scripts; workload details in paper",
+    "scale": "Thousands of concurrent LoRA adapters under synthetic request/popularity patterns",
+    "format": "Artifact-defined synthetic generator",
+    "fields": [
+      "adapter id/rank",
+      "request arrival",
+      "input/output lengths",
+      "batching configuration"
+    ],
+    "coverage": {
+      "arrivals": "generated",
+      "token_lengths": "generated",
+      "content": "no",
+      "session": "no",
+      "tenant": "no",
+      "prefix": "no",
+      "tools": "no",
+      "dag": "no",
+      "slo": "no",
+      "failure": "no",
+      "multimodal": "no",
+      "model": "adapter",
+      "hardware": "no"
+    },
+    "used_by": [
+      "S-LoRA",
+      "basis for Punica/dLoRA/CaraServe/Chameleon comparisons"
+    ],
+    "plex_operations": [
+      "admit",
+      "route",
+      "schedule",
+      "evict",
+      "prefetch"
+    ],
+    "strengths": [
+      "Exercises adapter memory, heterogeneous ranks, batching, and popularity"
+    ],
+    "limitations": [
+      "No public production adapter-request trace; popularity and arrivals are synthetic"
+    ],
+    "tier": "extension"
+  },
+  {
+    "id": "vidur",
+    "name": "Vidur",
+    "status": "existing",
+    "kind": "High-fidelity serving simulator and workload generator",
+    "official_url": "https://github.com/microsoft/vidur",
+    "paper_url": "https://arxiv.org/abs/2405.05465",
+    "license": "MIT",
+    "access": "Open-source simulator with processed traces and synthetic generators",
+    "scale": "Supports Azure traces, synthetic/Poisson arrivals, multiple models and TP/PP configurations",
+    "format": "YAML config, CSV traces, simulator output/chrome traces",
+    "fields": [
+      "arrival generator",
+      "length generator",
+      "model/device profile",
+      "scheduler config",
+      "TTFT/TPOT/E2E/batch metrics"
+    ],
+    "coverage": {
+      "arrivals": "yes",
+      "token_lengths": "yes",
+      "content": "no",
+      "session": "no",
+      "tenant": "no",
+      "prefix": "no",
+      "tools": "no",
+      "dag": "no",
+      "slo": "config",
+      "failure": "no",
+      "multimodal": "no",
+      "model": "yes",
+      "hardware": "yes"
+    },
+    "used_by": [
+      "Used broadly for scheduling and capacity studies"
+    ],
+    "plex_operations": [
+      "route",
+      "admit",
+      "schedule",
+      "feedback"
+    ],
+    "strengths": [
+      "Fast counterfactual policy and deployment exploration with calibrated execution models"
+    ],
+    "limitations": [
+      "Mainline has limited semantic session/tool/DAG/failure support; prefix caching is canary/experimental"
+    ],
+    "tier": "core"
+  },
+  {
+    "id": "llmservingsim",
+    "name": "LLMServingSim 2.0",
+    "status": "existing",
+    "kind": "Cycle-level heterogeneous/disaggregated simulator",
+    "official_url": "https://github.com/casys-kaist/LLMServingSim",
+    "paper_url": "https://doi.org/10.1109/ISPASS69572.2026.00012",
+    "license": "MIT",
+    "access": "Open-source Dockerized simulator",
+    "scale": "Models heterogeneous accelerators, CPU/CXL/PIM memory, MoE routing, TP/PP/EP/DP",
+    "format": "Config files, Chakra/ASTRA-Sim traces, profiler data",
+    "fields": [
+      "request workload",
+      "hardware topology",
+      "parallelism",
+      "memory tiers",
+      "network",
+      "scheduler"
+    ],
+    "coverage": {
+      "arrivals": "generated",
+      "token_lengths": "generated",
+      "content": "no",
+      "session": "no",
+      "tenant": "no",
+      "prefix": "no",
+      "tools": "no",
+      "dag": "no",
+      "slo": "no",
+      "failure": "no",
+      "multimodal": "no",
+      "model": "yes",
+      "hardware": "yes"
+    },
+    "used_by": [
+      "Recommended infrastructure stress backend"
+    ],
+    "plex_operations": [
+      "route",
+      "schedule",
+      "evict",
+      "prefetch",
+      "rebalance"
+    ],
+    "strengths": [
+      "Strong hardware, network, disaggregation, and memory-tier modeling"
+    ],
+    "limitations": [
+      "No native agent semantics, tenant/SLO honesty, tool lifecycle, or workflow DAG trace"
+    ],
+    "tier": "extension"
+  },
+  {
+    "id": "vllm-bench-serve",
+    "name": "vLLM Bench Serve",
+    "status": "existing",
+    "kind": "Serving benchmark harness",
+    "official_url": "https://docs.vllm.ai/en/latest/cli/bench/serve.html",
+    "paper_url": "https://github.com/vllm-project/vllm",
+    "license": "Apache-2.0",
+    "access": "Included with vLLM",
+    "scale": "Configurable request count/rate using random, ShareGPT, sonnet, and other dataset adapters",
+    "format": "CLI and JSON result records",
+    "fields": [
+      "dataset adapter",
+      "request rate",
+      "input/output lengths",
+      "TTFT/TPOT/E2E/throughput"
+    ],
+    "coverage": {
+      "arrivals": "generated",
+      "token_lengths": "yes",
+      "content": "partial",
+      "session": "no",
+      "tenant": "no",
+      "prefix": "no",
+      "tools": "no",
+      "dag": "no",
+      "slo": "no",
+      "failure": "no",
+      "multimodal": "no",
+      "model": "yes",
+      "hardware": "measured"
+    },
+    "used_by": [
+      "Common evaluation harness in serving artifacts"
+    ],
+    "plex_operations": [
+      "admit",
+      "schedule",
+      "feedback"
+    ],
+    "strengths": [
+      "Low-friction real-engine measurement and standardized latency outputs"
+    ],
+    "limitations": [
+      "Weak session/tool/DAG/tenant/SLO/cache event semantics unless extended"
+    ],
+    "tier": "supporting"
+  },
+  {
+    "id": "sglang-bench-serve",
+    "name": "SGLang Serving Benchmarks",
+    "status": "existing",
+    "kind": "Serving benchmark harness",
+    "official_url": "https://docs.sglang.ai/",
+    "paper_url": "https://github.com/sgl-project/sglang",
+    "license": "Apache-2.0",
+    "access": "Included with SGLang",
+    "scale": "ShareGPT, random, GSM8K, multi-turn, prefix-sharing, and structured-program benchmarks",
+    "format": "CLI, JSON/JSONL inputs and result logs",
+    "fields": [
+      "request rate",
+      "prompts",
+      "lengths",
+      "prefix-sharing setup",
+      "latencies",
+      "throughput"
+    ],
+    "coverage": {
+      "arrivals": "generated",
+      "token_lengths": "yes",
+      "content": "yes",
+      "session": "partial",
+      "tenant": "no",
+      "prefix": "yes",
+      "tools": "no",
+      "dag": "no",
+      "slo": "no",
+      "failure": "no",
+      "multimodal": "no",
+      "model": "yes",
+      "hardware": "measured"
+    },
+    "used_by": [
+      "SGLang/RadixAttention",
+      "KVFlow",
+      "PEEK",
+      "many prefix-cache papers"
+    ],
+    "plex_operations": [
+      "schedule",
+      "evict",
+      "feedback"
+    ],
+    "strengths": [
+      "Useful real-engine prefix/cache and structured-generation controls"
+    ],
+    "limitations": [
+      "No standard tenant/SLO/tool-duration/failure/DAG-lifecycle schema across benchmarks"
+    ],
+    "tier": "supporting"
+  },
+  {
+    "id": "logical-continuation-mix",
+    "name": "Logical Continuation Mix",
+    "status": "proposed",
+    "kind": "PLEX synthetic/reconstructed workload",
+    "seed_sources": [
+      "Qwen-Bailian",
+      "BurstGPT",
+      "LongMemEval",
+      "mini-SWE-agent"
+    ],
+    "generator_factors": [
+      "fraction of one-shot/chat/tool/agent requests",
+      "turn count",
+      "pause duration",
+      "context growth",
+      "continuation expiry"
+    ],
+    "required_events": [
+      "create",
+      "boundary",
+      "tool-start",
+      "tool-finish",
+      "continue",
+      "progress",
+      "finish"
+    ],
+    "plex_operations": [
+      "admit",
+      "route",
+      "schedule",
+      "evict",
+      "feedback"
+    ],
+    "metrics": [
+      "logical-request completion latency",
+      "resume queueing",
+      "recompute tokens",
+      "KV residency time",
+      "throughput"
+    ],
+    "novelty": "No public trace combines real arrivals with explicit logical-request continuation and physical/accounting shadows.",
+    "tier": "core"
+  },
+  {
+    "id": "continuation-storm",
+    "name": "Continuation Storm",
+    "status": "proposed",
+    "kind": "PLEX synthetic/reconstructed workload",
+    "seed_sources": [
+      "Mooncake ToolAgent",
+      "tau3-bench",
+      "BurstGPT burst model"
+    ],
+    "generator_factors": [
+      "synchronized tool completions",
+      "storm width",
+      "resident-KV fraction",
+      "resume priority",
+      "memory pressure"
+    ],
+    "required_events": [
+      "tool-finish bursts",
+      "continuation enqueue",
+      "cache hit/miss",
+      "preemption"
+    ],
+    "plex_operations": [
+      "route",
+      "schedule",
+      "evict",
+      "feedback"
+    ],
+    "metrics": [
+      "resume p99",
+      "SLO goodput",
+      "cache hit",
+      "preemption count",
+      "fairness"
+    ],
+    "novelty": "Prior work studies individual tool pauses but rarely correlated resumptions after an external service recovers.",
+    "tier": "core"
+  },
+  {
+    "id": "tool-heavy-tail-failure",
+    "name": "Heavy-Tailed Tool Latency and Failure",
+    "status": "proposed",
+    "kind": "PLEX synthetic/reconstructed workload",
+    "seed_sources": [
+      "tau3-bench",
+      "InferCept API classes",
+      "Continuum"
+    ],
+    "generator_factors": [
+      "lognormal/Pareto tool delay",
+      "bimodal tools",
+      "timeouts",
+      "partial failure",
+      "retry/backoff",
+      "prediction error"
+    ],
+    "required_events": [
+      "tool-start",
+      "tool-result",
+      "tool-timeout",
+      "retry",
+      "cancel",
+      "continue"
+    ],
+    "plex_operations": [
+      "schedule",
+      "evict",
+      "feedback",
+      "prefetch"
+    ],
+    "metrics": [
+      "JCT",
+      "wasted KV-byte-ms",
+      "retry amplification",
+      "queueing after miss",
+      "deadlock/progress"
+    ],
+    "novelty": "Public agent benchmarks expose tool semantics but not realistic tool-duration and outage distributions.",
+    "tier": "core"
+  },
+  {
+    "id": "dynamic-agent-dag",
+    "name": "Online-Revealed Agent DAG",
+    "status": "proposed",
+    "kind": "PLEX synthetic/reconstructed workload",
+    "seed_sources": [
+      "AgentBench",
+      "TheAgentCompany",
+      "Autellix",
+      "Helium"
+    ],
+    "generator_factors": [
+      "chain/fanout/join/loop",
+      "online node revelation",
+      "critical path",
+      "dynamic branch probability",
+      "node model/tool type"
+    ],
+    "required_events": [
+      "node-ready",
+      "dependency-resolved",
+      "fork",
+      "join",
+      "node-finish"
+    ],
+    "plex_operations": [
+      "route",
+      "admit",
+      "schedule",
+      "feedback"
+    ],
+    "metrics": [
+      "workflow makespan",
+      "critical-path stall",
+      "parallelism",
+      "fairness",
+      "SLO goodput"
+    ],
+    "novelty": "Most serving evaluations either know a static DAG or ignore graph structure; dynamic revelation remains weakly covered.",
+    "tier": "core"
+  },
+  {
+    "id": "speculative-fanout-cancel",
+    "name": "Speculative Fanout with Cancellation",
+    "status": "proposed",
+    "kind": "PLEX synthetic/reconstructed workload",
+    "seed_sources": [
+      "Math500",
+      "LiveCodeBench",
+      "MCTS/Best-of-N agents"
+    ],
+    "generator_factors": [
+      "branch count",
+      "quality distribution",
+      "early winner detection",
+      "cancel latency",
+      "shared-prefix depth"
+    ],
+    "required_events": [
+      "fork",
+      "branch-progress",
+      "winner",
+      "cancel",
+      "terminal"
+    ],
+    "plex_operations": [
+      "admit",
+      "schedule",
+      "evict",
+      "feedback"
+    ],
+    "metrics": [
+      "time-to-correct-answer",
+      "wasted tokens",
+      "cancel response time",
+      "cache reuse",
+      "goodput"
+    ],
+    "novelty": "Current request traces almost never include branch utility or cancellation, despite rising test-time compute workloads.",
+    "tier": "core"
+  },
+  {
+    "id": "prefix-hotspot-shift",
+    "name": "Prefix Hotspot and Popularity Shift",
+    "status": "proposed",
+    "kind": "PLEX synthetic/reconstructed workload",
+    "seed_sources": [
+      "Qwen-Bailian block hashes",
+      "Mooncake hashes",
+      "ServeGen rate shifts"
+    ],
+    "generator_factors": [
+      "Zipf skew",
+      "hot-prefix coverage",
+      "phase shift",
+      "new application launch",
+      "cache replication"
+    ],
+    "required_events": [
+      "arrival",
+      "prefix map",
+      "cache insert/evict",
+      "route",
+      "scale event"
+    ],
+    "plex_operations": [
+      "route",
+      "evict",
+      "prefetch",
+      "rebalance"
+    ],
+    "metrics": [
+      "TTFT",
+      "load imbalance",
+      "hit rate",
+      "migration",
+      "recovery time after shift"
+    ],
+    "novelty": "Static prefix distributions favor cache-aware policies and miss their failure mode under rapid popularity inversion.",
+    "tier": "core"
+  },
+  {
+    "id": "fair-locality-conflict",
+    "name": "Fairness versus Locality Conflict",
+    "status": "proposed",
+    "kind": "PLEX synthetic/reconstructed workload",
+    "seed_sources": [
+      "VTC synthetic clients",
+      "DLPM",
+      "Qwen-Bailian prefixes"
+    ],
+    "generator_factors": [
+      "tenant demand skew",
+      "prefix overlap per tenant",
+      "weights",
+      "honest/malicious hot prefixes",
+      "quantum"
+    ],
+    "required_events": [
+      "tenant arrival",
+      "service charge",
+      "cache hit",
+      "deadline"
+    ],
+    "plex_operations": [
+      "route",
+      "admit",
+      "schedule",
+      "feedback"
+    ],
+    "metrics": [
+      "service gap",
+      "Jain fairness",
+      "throughput",
+      "victim p99",
+      "cache hit"
+    ],
+    "novelty": "Existing fairness and locality papers use different workloads; one factorial trace is needed for direct policy comparison.",
+    "tier": "core"
+  },
+  {
+    "id": "dishonest-policy-hints",
+    "name": "Dishonest Metadata and Learned Credibility",
+    "status": "proposed",
+    "kind": "PLEX synthetic/reconstructed workload",
+    "seed_sources": [
+      "BurstGPT sessions",
+      "Qwen-Bailian lengths",
+      "PLEX declared/observed fields"
+    ],
+    "generator_factors": [
+      "inflated predicted length",
+      "urgency",
+      "reuse probability",
+      "tool TTL",
+      "tenant attack fraction",
+      "credibility learning"
+    ],
+    "required_events": [
+      "declare",
+      "observed-progress",
+      "outcome",
+      "credibility-update"
+    ],
+    "plex_operations": [
+      "admit",
+      "route",
+      "schedule",
+      "evict",
+      "feedback"
+    ],
+    "metrics": [
+      "honest-tenant share/p99",
+      "attacker gain",
+      "recovery samples",
+      "SLO goodput"
+    ],
+    "novelty": "No standard serving dataset contains both caller-declared and host-observed values, so trust-boundary policies remain unvalidated.",
+    "tier": "core"
+  },
+  {
+    "id": "mixed-service-classes",
+    "name": "Mixed Human, Agent, Batch, and Reasoning Service Classes",
+    "status": "proposed",
+    "kind": "PLEX synthetic/reconstructed workload",
+    "seed_sources": [
+      "Azure code/conversation",
+      "BurstGPT",
+      "Bailian thinking/coder",
+      "ServeGen categories"
+    ],
+    "generator_factors": [
+      "TTFT/TPOT/JCT SLO tiers",
+      "human reading rate",
+      "agent full-response dependency",
+      "batch deadlines",
+      "price weights"
+    ],
+    "required_events": [
+      "arrival",
+      "SLO declaration",
+      "progress",
+      "deadline miss",
+      "finish"
+    ],
+    "plex_operations": [
+      "admit",
+      "route",
+      "schedule",
+      "feedback"
+    ],
+    "metrics": [
+      "per-class goodput",
+      "revenue/cost",
+      "starvation",
+      "GPU utilization",
+      "QoE"
+    ],
+    "novelty": "Prior systems usually optimize one objective at a time; production fleets mix incompatible latency semantics.",
+    "tier": "core"
+  },
+  {
+    "id": "session-abandonment-retry",
+    "name": "Session Abandonment, Retry, and Duplicate Delivery",
+    "status": "proposed",
+    "kind": "PLEX synthetic/reconstructed workload",
+    "seed_sources": [
+      "BurstGPT failures",
+      "WildChat timestamps",
+      "agent task harnesses"
+    ],
+    "generator_factors": [
+      "client timeout",
+      "cancel delay",
+      "automatic retry",
+      "duplicate request",
+      "idempotency",
+      "late completion"
+    ],
+    "required_events": [
+      "cancel",
+      "timeout",
+      "retry",
+      "duplicate",
+      "finish"
+    ],
+    "plex_operations": [
+      "admit",
+      "schedule",
+      "evict",
+      "feedback"
+    ],
+    "metrics": [
+      "wasted tokens",
+      "duplicate work",
+      "cleanup latency",
+      "successful retry latency",
+      "state leaks"
+    ],
+    "novelty": "Public traces rarely expose cancellation/retry semantics even though they determine wasted compute and cleanup correctness.",
+    "tier": "core"
+  },
+  {
+    "id": "pd-append-prefill-imbalance",
+    "name": "Prefill/Decode/Append-Prefill Imbalance",
+    "status": "proposed",
+    "kind": "PLEX synthetic/reconstructed workload",
+    "seed_sources": [
+      "Azure lengths",
+      "Mooncake agent trace",
+      "ConServe",
+      "DistServe"
+    ],
+    "generator_factors": [
+      "initial prefill",
+      "append-prefill per turn",
+      "decode length",
+      "P/D pool ratio",
+      "KV transfer cost",
+      "conversation pinning"
+    ],
+    "required_events": [
+      "route-stage",
+      "transfer",
+      "append-prefill",
+      "decode",
+      "continue"
+    ],
+    "plex_operations": [
+      "route",
+      "schedule",
+      "feedback",
+      "rebalance"
+    ],
+    "metrics": [
+      "TTFT",
+      "tail TBT",
+      "conversation completion",
+      "transfer bytes",
+      "pool imbalance"
+    ],
+    "novelty": "Standard P/D traces treat turns independently and underrepresent agent conversations with one heavy prefill and a long tail.",
+    "tier": "core"
+  },
+  {
+    "id": "memory-tier-degradation",
+    "name": "Memory-Tier Bandwidth Degradation",
+    "status": "proposed",
+    "kind": "PLEX synthetic/reconstructed workload",
+    "seed_sources": [
+      "LLMServingSim",
+      "SuperInfer",
+      "Mooncake"
+    ],
+    "generator_factors": [
+      "HBM/DRAM/CXL/SSD capacity",
+      "bandwidth jitter",
+      "tier outage",
+      "prefetch lead time",
+      "recompute-vs-load"
+    ],
+    "required_events": [
+      "memory pressure",
+      "offload",
+      "prefetch",
+      "load complete/fail",
+      "evict"
+    ],
+    "plex_operations": [
+      "schedule",
+      "evict",
+      "prefetch",
+      "feedback"
+    ],
+    "metrics": [
+      "SLO goodput",
+      "stall time",
+      "bytes moved",
+      "wasted prefetch",
+      "recompute"
+    ],
+    "novelty": "Most cache policies assume stable transfer cost; real shared tiers and networks experience congestion and failure.",
+    "tier": "extension"
+  },
+  {
+    "id": "adapter-churn",
+    "name": "Adapter Popularity Churn",
+    "status": "proposed",
+    "kind": "PLEX synthetic/reconstructed workload",
+    "seed_sources": [
+      "S-LoRA synthetic workload",
+      "Chameleon",
+      "dLoRA"
+    ],
+    "generator_factors": [
+      "adapter Zipf skew",
+      "rank/size",
+      "tenant affinity",
+      "phase change",
+      "load/unload time",
+      "base-model mix"
+    ],
+    "required_events": [
+      "adapter request",
+      "load",
+      "evict",
+      "merge/unmerge",
+      "migration"
+    ],
+    "plex_operations": [
+      "admit",
+      "route",
+      "schedule",
+      "evict",
+      "prefetch",
+      "rebalance"
+    ],
+    "metrics": [
+      "cold-start TTFT",
+      "adapter hit rate",
+      "fairness",
+      "memory utilization",
+      "migration cost"
+    ],
+    "novelty": "No public production multi-LoRA request trace exists; all major systems rely on synthetic popularity assumptions.",
+    "tier": "extension"
+  },
+  {
+    "id": "multimodal-encoder-residency",
+    "name": "Multimodal Encoder-State Residency",
+    "status": "proposed",
+    "kind": "PLEX synthetic/reconstructed workload",
+    "seed_sources": [
+      "MMMU",
+      "Video-MME",
+      "ServeGen multimodal"
+    ],
+    "generator_factors": [
+      "image/video/audio size",
+      "encoder cost",
+      "reuse across turns",
+      "encoder-output size",
+      "modality-specific SLO"
+    ],
+    "required_events": [
+      "upload",
+      "encode",
+      "resident-state",
+      "reuse",
+      "evict"
+    ],
+    "plex_operations": [
+      "admit",
+      "route",
+      "schedule",
+      "evict",
+      "prefetch",
+      "feedback"
+    ],
+    "metrics": [
+      "TTFT",
+      "encoder reuse",
+      "resident bytes",
+      "modality fairness",
+      "energy"
+    ],
+    "novelty": "KV-centric workloads omit reusable image/audio encoder state and heterogeneous preprocessing bottlenecks.",
+    "tier": "extension"
+  },
+  {
+    "id": "multi-region-failover-carbon",
+    "name": "Multi-Region Failover, Cost, and Carbon",
+    "status": "proposed",
+    "kind": "PLEX synthetic/reconstructed workload",
+    "seed_sources": [
+      "BurstGPT periodicity",
+      "SkyWalker",
+      "Azure Functions",
+      "ServeGen"
+    ],
+    "generator_factors": [
+      "regional demand",
+      "RTT/bandwidth",
+      "energy/carbon price",
+      "spot loss",
+      "outage",
+      "data residency"
+    ],
+    "required_events": [
+      "route",
+      "region failure",
+      "drain",
+      "migration",
+      "recover"
+    ],
+    "plex_operations": [
+      "route",
+      "admit",
+      "rebalance",
+      "feedback"
+    ],
+    "metrics": [
+      "SLO goodput",
+      "cost",
+      "carbon",
+      "failover recovery",
+      "state-transfer bytes"
+    ],
+    "novelty": "Existing routing evaluations rarely combine locality, live state, failure, and time-varying energy/cost.",
+    "tier": "extension"
+  },
+  {
+    "id": "autoscaling-coldstart",
+    "name": "Autoscaling with Stateful Cold Start",
+    "status": "proposed",
+    "kind": "PLEX synthetic/reconstructed workload",
+    "seed_sources": [
+      "BurstGPT",
+      "ServeGen",
+      "Azure Functions",
+      "ServerlessLLM"
+    ],
+    "generator_factors": [
+      "forecast error",
+      "model load time",
+      "KV warmup",
+      "scale unit",
+      "drain policy",
+      "burst duration"
+    ],
+    "required_events": [
+      "scale request",
+      "instance ready",
+      "warm cache",
+      "drain",
+      "terminate"
+    ],
+    "plex_operations": [
+      "admit",
+      "route",
+      "rebalance",
+      "feedback"
+    ],
+    "metrics": [
+      "burst goodput",
+      "cold-start misses",
+      "overprovisioning cost",
+      "drain time",
+      "cache loss"
+    ],
+    "novelty": "Serverless traces model cold starts, while LLM traces model tokens; their interaction is rarely evaluated together.",
+    "tier": "extension"
+  },
+  {
+    "id": "rag-document-churn",
+    "name": "RAG Document Churn and Shared Retrieval",
+    "status": "proposed",
+    "kind": "PLEX synthetic/reconstructed workload",
+    "seed_sources": [
+      "BEIR",
+      "RAGBench",
+      "HotpotQA",
+      "LongBench"
+    ],
+    "generator_factors": [
+      "document popularity",
+      "top-k overlap",
+      "corpus update",
+      "position/order",
+      "retrieval fanout",
+      "quality sensitivity"
+    ],
+    "required_events": [
+      "retrieve",
+      "document set",
+      "prefetch",
+      "generation",
+      "quality feedback"
+    ],
+    "plex_operations": [
+      "route",
+      "schedule",
+      "evict",
+      "prefetch",
+      "feedback"
+    ],
+    "metrics": [
+      "TTFT",
+      "document/KV hit rate",
+      "quality",
+      "stale-hit rate",
+      "memory"
+    ],
+    "novelty": "Static RAG benchmarks do not model changing document popularity or cache-invalidating corpus updates.",
+    "tier": "extension"
+  },
+  {
+    "id": "reasoning-progress-utility",
+    "name": "Reasoning Progress and Marginal Utility",
+    "status": "proposed",
+    "kind": "PLEX synthetic/reconstructed workload",
+    "seed_sources": [
+      "Math500",
+      "LiveCodeBench",
+      "Dynasor"
+    ],
+    "generator_factors": [
+      "token budget",
+      "confidence trajectory",
+      "answer diversity",
+      "difficulty",
+      "early stop",
+      "utility calibration"
+    ],
+    "required_events": [
+      "branch progress",
+      "candidate answer",
+      "confidence",
+      "stop",
+      "verdict"
+    ],
+    "plex_operations": [
+      "admit",
+      "schedule",
+      "feedback"
+    ],
+    "metrics": [
+      "accuracy-goodput",
+      "tokens per solved task",
+      "tail JCT",
+      "fairness",
+      "premature-stop rate"
+    ],
+    "novelty": "Request length alone cannot validate reasoning schedulers; policies need online marginal-utility signals and final correctness.",
+    "tier": "extension"
+  },
+  {
+    "id": "full-duplex-voice",
+    "name": "Full-Duplex Voice and Interruption",
+    "status": "proposed",
+    "kind": "PLEX synthetic/reconstructed workload",
+    "seed_sources": [
+      "tau3-bench voice",
+      "Video-MME audio",
+      "Andes QoE"
+    ],
+    "generator_factors": [
+      "audio chunk rate",
+      "barge-in",
+      "partial transcript",
+      "simultaneous user/agent speech",
+      "codec/model mix",
+      "deadline"
+    ],
+    "required_events": [
+      "audio-in",
+      "partial-decode",
+      "interrupt",
+      "cancel",
+      "resume",
+      "audio-out"
+    ],
+    "plex_operations": [
+      "admit",
+      "route",
+      "schedule",
+      "feedback"
+    ],
+    "metrics": [
+      "response onset",
+      "interruption latency",
+      "wasted audio/tokens",
+      "QoE",
+      "goodput"
+    ],
+    "novelty": "Turn-based text traces cannot validate preemption and responsiveness for realtime full-duplex agents.",
+    "tier": "extension"
+  },
+  {
+    "id": "correlated-session-bursts",
+    "name": "Correlated Session and Workflow Bursts",
+    "status": "proposed",
+    "kind": "PLEX synthetic/reconstructed workload",
+    "seed_sources": [
+      "BurstGPT sessions",
+      "Bailian parent links",
+      "ServeGen client pools"
+    ],
+    "generator_factors": [
+      "session fanout",
+      "shared external trigger",
+      "tenant correlation",
+      "burst scale",
+      "workflow synchronization"
+    ],
+    "required_events": [
+      "session start",
+      "fanout",
+      "join",
+      "burst",
+      "finish"
+    ],
+    "plex_operations": [
+      "admit",
+      "route",
+      "schedule",
+      "feedback",
+      "rebalance"
+    ],
+    "metrics": [
+      "queue growth",
+      "tail JCT",
+      "fairness",
+      "autoscaling reaction",
+      "cache locality"
+    ],
+    "novelty": "Independent Poisson replay misses correlation among requests from the same session, tenant, or workflow.",
+    "tier": "core"
+  },
+  {
+    "id": "tool-resource-lifecycle",
+    "name": "Tool Resource Lifecycle and Cross-Resource Scheduling",
+    "status": "proposed",
+    "kind": "PLEX synthetic/reconstructed workload",
+    "seed_sources": [
+      "ThunderAgent",
+      "Terminal-Bench",
+      "TheAgentCompany",
+      "tau3-bench"
+    ],
+    "generator_factors": [
+      "sandbox startup",
+      "port/disk limits",
+      "environment reuse",
+      "garbage collection",
+      "LLM/tool overlap"
+    ],
+    "required_events": [
+      "tool-resource-create",
+      "ready",
+      "use",
+      "idle",
+      "release",
+      "leak"
+    ],
+    "plex_operations": [
+      "admit",
+      "schedule",
+      "feedback",
+      "prefetch"
+    ],
+    "metrics": [
+      "workflow throughput",
+      "startup overlap",
+      "resource leaks",
+      "port/disk exhaustion",
+      "JCT"
+    ],
+    "novelty": "Serving papers usually schedule GPU/KV only, while sustained agent throughput is limited by tool environments too.",
+    "tier": "extension"
+  }
+]

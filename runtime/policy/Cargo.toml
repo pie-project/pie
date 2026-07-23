@@ -1,9 +1,9 @@
 [package]
 name = "pie-policy"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 authors = ["In Gim <in.gim@yale.edu>"]
-description = "Isolated JSON proof-of-concept host for PLEX policies"
+description = "Isolated typed host runtime for PLEX policies"
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 

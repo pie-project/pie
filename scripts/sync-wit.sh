@@ -14,4 +14,4 @@ sync_tree() {
 
 sync_tree "$root/interface/inferlet" "$root/sdk/rust/inferlet/wit"
 sync_tree "$root/interface/inferlet" "$root/sdk/tools/bakery/src/bakery/wit"
-sync_tree "$root/interface/plex/wit" "$root/sdk/rust/plex/wit"
+sync_tree "$root/interface/plex/wit-0.6" "$root/sdk/rust/plex/wit"

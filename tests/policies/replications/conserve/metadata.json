@@ -1,0 +1,26 @@
+{
+  "id": "conserve",
+  "title": "Observation, Not Prediction: Conversation-Level Disaggregated Scheduling for Agentic Serving",
+  "paper_version": "arXiv 2606.01839",
+  "source_url": "https://arxiv.org/abs/2606.01839",
+  "source_commit": null,
+  "source_license": "paper reference; no source copied",
+  "component": "plex_paper_conserve",
+  "implements": [
+    "route"
+  ],
+  "policy_kernel": [
+    "heavy first-prefill placement",
+    "conversation-tail affinity"
+  ],
+  "required_facts": [
+    "prefill_capacity",
+    "conversation_affinity",
+    "load"
+  ],
+  "required_mechanics": [],
+  "deferred_mechanics": [],
+  "evidence_level": "policy-kernel-reproduction",
+  "fixture_provenance": "independent reference model from the paper",
+  "validation_status": "passing"
+}

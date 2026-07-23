@@ -1,8 +1,8 @@
-use pie_plex::Manifest;
+use pie_plex::v0_5::Manifest;
 use thiserror::Error;
 
 const MAGIC: &[u8; 8] = b"PLEXPKG\0";
-const FORMAT_VERSION: u16 = 6;
+const FORMAT_VERSION: u16 = 5;
 const HEADER_BYTES: usize = 56;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,14 +172,14 @@ pub enum PackageError {
     #[error("failed to decode package manifest")]
     DecodeManifest(#[source] serde_json::Error),
     #[error("package manifest is invalid")]
-    Manifest(#[source] pie_plex::ManifestValidationError),
+    Manifest(#[source] pie_plex::v0_5::ManifestValidationError),
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
 
-    use pie_plex::{ContractVersion, Operation, PolicyLimits};
+    use pie_plex::v0_5::{ContractVersion, Operation, PolicyLimits};
 
     use super::*;
 
@@ -191,6 +191,7 @@ mod tests {
             operations: BTreeSet::from([Operation::Route]),
             limits: PolicyLimits {
                 memory_bytes: 1,
+                fuel: 1,
                 deadline_ms: 1,
                 input_bytes: 1,
                 output_bytes: 1,

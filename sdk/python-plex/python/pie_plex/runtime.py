@@ -10,9 +10,9 @@ class Runtime:
         self,
         policy: str,
         query: Callable[[str, dict[str, Any]], Any] | None = None,
-        actions: Iterable[str] = (),
+        mechanics: Iterable[str] = (),
     ) -> None:
-        self._native = NativeRuntime(policy, query, list(actions))
+        self._native = NativeRuntime(policy, query, list(mechanics))
 
     def invoke(self, event: dict[str, Any]) -> dict[str, Any]:
         return json.loads(self.invoke_json(json.dumps(event)))
@@ -26,13 +26,13 @@ class AsyncRuntime:
         self,
         policy: str,
         query: Callable[[str, dict[str, Any]], Any] | None = None,
-        actions: Iterable[str] = (),
+        mechanics: Iterable[str] = (),
         queue_capacity: int = 64,
     ) -> None:
         self._native = NativeAsyncRuntime(
             policy,
             query,
-            list(actions),
+            list(mechanics),
             queue_capacity,
         )
 

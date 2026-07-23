@@ -1,0 +1,8 @@
+{
+  "actions": [
+    "pie.cache.swap@1"
+  ],
+  "reclaim": [
+    "paused-kv"
+  ]
+}

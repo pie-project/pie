@@ -1,0 +1,5 @@
+{
+  "case": "program-migration",
+  "tool_ready": true,
+  "migrate_target": "node-a"
+}

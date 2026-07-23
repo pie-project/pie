@@ -4,16 +4,17 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 
-use pie_plex::{
-    ContractVersion, Document, Manifest, Operation, PolicyLimits, rank_route, select_evictions,
+use pie_plex::Document;
+use pie_plex::v0_5::{
+    ContractVersion, Manifest, Operation, PolicyLimits, rank_route, select_evictions,
     select_schedule,
 };
 use pie_policy::{
-    AttachmentRegistry, DictionaryQueryHandler, ENGINE_API_VERSION, FeedbackCommit,
+    AttachmentRegistry, DictionaryQueryHandler, ENGINE_API_VERSION_V0_5, FeedbackCommit,
     InMemoryPolicyStateBackend, Invocation, InvocationFailureKind, LifecycleHost, PlacementOutcome,
-    PlexError, PlexRuntime, PolicyEngine, PolicyEngineConfig, PolicyPackage, PolicyStateBackend,
-    QueryError, QueryHandler, RejectingQueryHandler, ReplayCommand, ReplayRunner, ReplayTrace,
-    StateBackendError, StateSnapshot, StateUpdates,
+    PlexErrorV0_5, PlexRuntimeV0_5, PolicyEngine, PolicyEngineConfig, PolicyPackageV0_5,
+    PolicyStateBackend, QueryError, QueryHandler, RejectingQueryHandler, ReplayCommand,
+    ReplayRunner, ReplayTrace, StateBackendError, StateSnapshot, StateUpdates,
 };
 use serde_json::json;
 
@@ -406,17 +407,17 @@ fn check_engine_api(
             "context": {},
             "request_events": []
         })),
-        Err(PlexError::InvalidEvent(_))
+        Err(PlexErrorV0_5::InvalidEvent(_))
     ));
     assert!(matches!(
         runtime.invoke(json!({
-            "api_version": ENGINE_API_VERSION,
+            "api_version": ENGINE_API_VERSION_V0_5,
             "hook": "route",
             "context": {},
             "request_events": [],
             "extra": true
         })),
-        Err(PlexError::InvalidEvent(_))
+        Err(PlexErrorV0_5::InvalidEvent(_))
     ));
     assert!(matches!(
         runtime.invoke(engine_event(
@@ -428,7 +429,7 @@ fn check_engine_api(
             }),
             vec![],
         )),
-        Err(PlexError::Backend(_))
+        Err(PlexErrorV0_5::Backend(_))
     ));
     Ok(())
 }
@@ -516,7 +517,10 @@ fn check_request_events_and_cleanup(
             }),
         ],
     ));
-    assert!(matches!(duplicate_create, Err(PlexError::InvalidEvent(_))));
+    assert!(matches!(
+        duplicate_create,
+        Err(PlexErrorV0_5::InvalidEvent(_))
+    ));
     assert!(matches!(
         backend.read_request("X"),
         Err(StateBackendError::NotFound(_))
@@ -1635,9 +1639,9 @@ impl PolicyStateBackend for MutatingSecondLoadBackend {
 
 fn run_mock_adapter(
     _name: &str,
-    runtime: &PlexRuntime,
+    runtime: &PlexRuntimeV0_5,
     events: &[Document],
-) -> Result<Vec<Document>, PlexError> {
+) -> Result<Vec<Document>, PlexErrorV0_5> {
     events
         .iter()
         .cloned()
@@ -1655,7 +1659,7 @@ fn runtime_with_policy(
     backend: Arc<dyn PolicyStateBackend>,
     query_handler: Arc<dyn QueryHandler>,
     supported_actions: BTreeSet<String>,
-) -> Result<PlexRuntime, Box<dyn std::error::Error>> {
+) -> Result<PlexRuntimeV0_5, Box<dyn std::error::Error>> {
     let package = package_bytes(
         directory,
         artifact,
@@ -1663,7 +1667,7 @@ fn runtime_with_policy(
     )?;
     let registry = AttachmentRegistry::new(engine.clone());
     registry.attach(&package)?;
-    Ok(PlexRuntime::with_parts(
+    Ok(PlexRuntimeV0_5::with_parts(
         registry,
         backend,
         query_handler,
@@ -1729,7 +1733,7 @@ fn package_bytes(
     manifest: Manifest,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let component = std::fs::read(directory.join(format!("{artifact}.component.wasm")))?;
-    Ok(PolicyPackage::new(manifest, component)?.encode()?)
+    Ok(PolicyPackageV0_5::new(manifest, component)?.encode()?)
 }
 
 fn manifest(name: &str, operations: impl IntoIterator<Item = Operation>) -> Manifest {
@@ -1740,6 +1744,7 @@ fn manifest(name: &str, operations: impl IntoIterator<Item = Operation>) -> Mani
         operations: operations.into_iter().collect::<BTreeSet<_>>(),
         limits: PolicyLimits {
             memory_bytes: 4 << 20,
+            fuel: 2_000_000,
             deadline_ms: 100,
             input_bytes: 1 << 20,
             output_bytes: 1 << 20,
@@ -1753,7 +1758,7 @@ fn action_set<const N: usize>(actions: [&str; N]) -> BTreeSet<String> {
 
 fn engine_event(hook: &str, context: Document, request_events: Vec<Document>) -> Document {
     json!({
-        "api_version": ENGINE_API_VERSION,
+        "api_version": ENGINE_API_VERSION_V0_5,
         "hook": hook,
         "context": context,
         "request_events": request_events,
