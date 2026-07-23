@@ -1,0 +1,73 @@
+package pie:plex@0.6.0;
+
+interface policy {
+    use types.{
+        admit-context,
+        admit-plan,
+        cache-context,
+        cache-plan,
+        feedback-context,
+        policy-error,
+        policy-state,
+        route-context,
+        route-plan,
+        schedule-context,
+        schedule-plan,
+        state-update,
+    };
+
+    record admit-invocation {
+        context: admit-context,
+        state: policy-state,
+    }
+
+    record admit-output {
+        plan: admit-plan,
+        state-update: state-update,
+    }
+
+    record route-invocation {
+        context: route-context,
+        state: policy-state,
+    }
+
+    record route-output {
+        plan: route-plan,
+        state-update: state-update,
+    }
+
+    record schedule-invocation {
+        context: schedule-context,
+        state: policy-state,
+    }
+
+    record schedule-output {
+        plan: schedule-plan,
+        state-update: state-update,
+    }
+
+    record cache-invocation {
+        context: cache-context,
+        state: policy-state,
+    }
+
+    record cache-output {
+        plan: cache-plan,
+        state-update: state-update,
+    }
+
+    record feedback-invocation {
+        context: feedback-context,
+        state: policy-state,
+    }
+
+    record feedback-output {
+        state-update: state-update,
+    }
+
+    admit: func(input: admit-invocation) -> result<admit-output, policy-error>;
+    route: func(input: route-invocation) -> result<route-output, policy-error>;
+    schedule: func(input: schedule-invocation) -> result<schedule-output, policy-error>;
+    cache: func(input: cache-invocation) -> result<cache-output, policy-error>;
+    feedback: func(input: feedback-invocation) -> result<feedback-output, policy-error>;
+}

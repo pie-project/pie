@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pie-project.org/schema/plex/0.6/actions/cache-prefetch.schema.json",
+  "title": "PLEX cache.prefetch@1 action",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["object_id", "idempotency_key"],
+  "properties": {
+    "object_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "target_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "urgency": {"type": "integer", "minimum": 0, "maximum": 1000},
+    "expires_at_ms": {"type": "integer", "minimum": 0},
+    "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 128}
+  }
+}

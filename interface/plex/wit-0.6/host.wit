@@ -1,0 +1,8 @@
+package pie:plex@0.6.0;
+
+interface host {
+    use types.{action-id, document};
+
+    query: func(method: string, args: document) -> result<document, string>;
+    action: func(method: string, args: document) -> result<action-id, string>;
+}

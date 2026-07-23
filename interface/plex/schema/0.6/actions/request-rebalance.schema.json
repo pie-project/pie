@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pie-project.org/schema/plex/0.6/actions/request-rebalance.schema.json",
+  "title": "PLEX request.rebalance@1 action",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["request_id", "target_id", "idempotency_key"],
+  "properties": {
+    "request_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "target_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 128},
+    "reason": {"type": "string", "maxLength": 256}
+  }
+}

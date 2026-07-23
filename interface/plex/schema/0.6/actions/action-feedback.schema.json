@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pie-project.org/schema/plex/0.6/actions/action-feedback.schema.json",
+  "title": "PLEX v0.6 standard action feedback facts",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["action_id", "status", "facts"],
+  "properties": {
+    "action_id": {"type": "integer", "minimum": 0},
+    "status": {
+      "enum": [
+        "succeeded",
+        "failed",
+        "already-terminal",
+        "expired",
+        "unsupported"
+      ]
+    },
+    "facts": {"$ref": "../document.schema.json"}
+  }
+}

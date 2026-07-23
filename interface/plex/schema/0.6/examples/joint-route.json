@@ -1,0 +1,93 @@
+{
+  "$schema": "../replay-fixture.schema.json",
+  "fixture_version": 1,
+  "name": "joint-route-non-greedy",
+  "contract": {
+    "major": 0,
+    "minor": 6
+  },
+  "package": {
+    "name": "route-reference",
+    "version": "0.6.0"
+  },
+  "attachment_generation": 1,
+  "operation": "route",
+  "invocation": {
+    "context": {
+      "meta": {
+        "opportunity_id": "route-1",
+        "snapshot": {
+          "id": "snapshot-1",
+          "revision": 1
+        },
+        "attempt": 0,
+        "mechanics": []
+      },
+      "cause": "admission",
+      "requests": [
+        {"request": {"request_id": "A", "generation_id": 0, "group_id": null, "principal_id": "tenant-a"}, "facts": {}},
+        {"request": {"request_id": "B", "generation_id": 0, "group_id": null, "principal_id": "tenant-a"}, "facts": {}}
+      ],
+      "targets": [
+        {"target_id": "X", "max_assignments": 1, "capacity": [], "revision": 1, "facts": {}},
+        {"target_id": "Y", "max_assignments": 1, "capacity": [], "revision": 1, "facts": {}}
+      ],
+      "feasible_edges": [
+        {"request_index": 0, "target_index": 0, "demand": [], "facts": {"utility": 10}},
+        {"request_index": 0, "target_index": 1, "demand": [], "facts": {"utility": 9}},
+        {"request_index": 1, "target_index": 0, "demand": [], "facts": {"utility": 8}},
+        {"request_index": 1, "target_index": 1, "demand": [], "facts": {"utility": 0}}
+      ]
+    },
+    "state": {
+      "shared": {},
+      "groups": [],
+      "requests": [
+        {
+          "request": {"request_id": "A", "generation_id": 0, "group_id": null, "principal_id": "tenant-a"},
+          "status": "admitted",
+          "facts": {"request_id": "A", "generation_id": 0, "group_id": null, "principal_id": "tenant-a"},
+          "fields": {},
+          "scratch": {}
+        },
+        {
+          "request": {"request_id": "B", "generation_id": 0, "group_id": null, "principal_id": "tenant-a"},
+          "status": "admitted",
+          "facts": {"request_id": "B", "generation_id": 0, "group_id": null, "principal_id": "tenant-a"},
+          "fields": {},
+          "scratch": {}
+        }
+      ]
+    }
+  },
+  "host_calls": [],
+  "expected": {
+    "status": "success",
+    "raw_guest_output": {
+      "plan": {
+        "decisions": [
+          {"decision": "assign", "edge_index": 1},
+          {"decision": "assign", "edge_index": 2}
+        ]
+      },
+      "state_update": {
+        "shared": null,
+        "groups": [],
+        "requests": []
+      }
+    },
+    "normalized_plan": {
+      "decisions": [
+        {"decision": "assign", "edge_index": 1},
+        {"decision": "assign", "edge_index": 2}
+      ]
+    },
+    "state_update": {
+      "shared": null,
+      "groups": [],
+      "requests": []
+    },
+    "commit": "committed",
+    "actions": []
+  }
+}

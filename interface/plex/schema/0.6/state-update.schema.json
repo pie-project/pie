@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pie-project.org/schema/plex/0.6/state-update.schema.json",
+  "title": "PLEX v0.6 sparse state update",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["shared", "groups", "requests"],
+  "properties": {
+    "shared": {
+      "oneOf": [
+        {"$ref": "document.schema.json"},
+        {"type": "null"}
+      ]
+    },
+    "groups": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["group_id", "scratch"],
+        "properties": {
+          "group_id": {"$ref": "#/$defs/id"},
+          "scratch": {"$ref": "document.schema.json"}
+        }
+      }
+    },
+    "requests": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["request_id", "fields", "scratch"],
+        "properties": {
+          "request_id": {"$ref": "#/$defs/id"},
+          "fields": {
+            "oneOf": [
+              {"$ref": "document.schema.json"},
+              {"type": "null"}
+            ]
+          },
+          "scratch": {
+            "oneOf": [
+              {"$ref": "document.schema.json"},
+              {"type": "null"}
+            ]
+          }
+        },
+        "anyOf": [
+          {
+            "properties": {
+              "fields": {"type": "object"}
+            }
+          },
+          {
+            "properties": {
+              "scratch": {"type": "object"}
+            }
+          }
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    }
+  }
+}

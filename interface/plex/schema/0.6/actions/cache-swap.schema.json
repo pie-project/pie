@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pie-project.org/schema/plex/0.6/actions/cache-swap.schema.json",
+  "title": "PLEX cache.swap@1 action",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["object_id", "tier", "idempotency_key"],
+  "properties": {
+    "object_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "tier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z][a-z0-9._-]*$"
+    },
+    "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 128}
+  }
+}

@@ -9,6 +9,7 @@
 
 mod manifest;
 mod operation;
+pub mod v0_6;
 
 pub type Document = serde_json::Value;
 
