@@ -2,7 +2,7 @@ use pie_plex::Manifest;
 use thiserror::Error;
 
 const MAGIC: &[u8; 8] = b"PLEXPKG\0";
-const FORMAT_VERSION: u16 = 5;
+const FORMAT_VERSION: u16 = 6;
 const HEADER_BYTES: usize = 56;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,7 +191,6 @@ mod tests {
             operations: BTreeSet::from([Operation::Route]),
             limits: PolicyLimits {
                 memory_bytes: 1,
-                fuel: 1,
                 deadline_ms: 1,
                 input_bytes: 1,
                 output_bytes: 1,

@@ -1,12 +1,13 @@
 import json
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Event
 
 import pytest
 
-from pie_plex import InvalidEvent, PolicyPackageError, Runtime
+from pie_plex import AsyncRuntime, InvalidEvent, PolicyPackageError, Runtime
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -83,6 +84,30 @@ def test_dictionary_round_trip_and_action_return():
         "request_fields": {},
         "actions": [],
     }
+
+
+def test_async_runtime_publishes_latest_outcome():
+    runtime = AsyncRuntime(str(POLICY), queue_capacity=2)
+    try:
+        assert runtime.try_submit("route", 7, route_event())
+        deadline = time.monotonic() + 5
+        result = None
+        while result is None and time.monotonic() < deadline:
+            result = runtime.latest("route")
+            if result is None:
+                time.sleep(0.001)
+
+        assert result is not None
+        epoch, outcome = result
+        assert epoch == 7
+        assert outcome["status"] == "success"
+        assert runtime.latest("route", after_epoch=7) is None
+        submitted, dropped, completed = runtime.stats()
+        assert submitted == 1
+        assert dropped == 0
+        assert completed == 1
+    finally:
+        runtime.shutdown()
 
 
 def test_query_callback_and_policy_visible_errors():

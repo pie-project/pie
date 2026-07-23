@@ -35,7 +35,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             operations,
             limits: PolicyLimits {
                 memory_bytes: 4 << 20,
-                fuel: 2_000_000,
                 deadline_ms: 100,
                 input_bytes: 1 << 20,
                 output_bytes: 1 << 20,

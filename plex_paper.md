@@ -512,7 +512,7 @@ mechanics.
 Attachment is the approval and linking boundary. Installing a package
 normally approves the metadata schema it declares; administrators need not
 maintain a second per-field allowlist. They may still restrict tenants,
-namespaces, aggregate metadata bytes, map capacity, or policy fuel. External
+namespaces, aggregate metadata bytes, or map capacity. External
 maps are bound at attachment, so a request can provide a lookup key but cannot
 choose an arbitrary table for policy code to read.
 
@@ -764,8 +764,8 @@ synchronous calls and their measured cost.
 
 Three guarantees must not be conflated. \emph{Mechanical isolation} comes
 from Wasm memory isolation and a typed host surface: policy code cannot mutate
-engine objects or request contents. \emph{Availability} comes from fuel,
-deadlines, bounded allocation, map quotas, and engine-default fallback. A
+engine objects or request contents. \emph{Availability} comes from deadlines,
+bounded allocation, map quotas, and engine-default fallback. A
 trap, timeout, malformed dense result, or invalid map update discards the
 transaction and applies the native heuristic for that invocation.
 

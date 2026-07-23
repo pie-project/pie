@@ -5,7 +5,7 @@ from ._native import (
     PolicyPackageError,
     QueryCallbackError,
 )
-from .runtime import Runtime
+from .runtime import AsyncRuntime, Runtime
 
 __all__ = [
     "BackendError",
@@ -13,5 +13,6 @@ __all__ = [
     "PlexError",
     "PolicyPackageError",
     "QueryCallbackError",
+    "AsyncRuntime",
     "Runtime",
 ]

@@ -1191,10 +1191,7 @@ fn check_failure_rollback(
             Operation::Route,
             route_context("S", "generation-arrival", candidates(), context(false)),
         ),
-        &[
-            InvocationFailureKind::FuelExhausted,
-            InvocationFailureKind::DeadlineExceeded,
-        ],
+        &[InvocationFailureKind::DeadlineExceeded],
     )?;
     assert_eq!(backend.read_request("S")?["scratch"], json!({}));
     Ok(())
@@ -1743,7 +1740,6 @@ fn manifest(name: &str, operations: impl IntoIterator<Item = Operation>) -> Mani
         operations: operations.into_iter().collect::<BTreeSet<_>>(),
         limits: PolicyLimits {
             memory_bytes: 4 << 20,
-            fuel: 2_000_000,
             deadline_ms: 100,
             input_bytes: 1 << 20,
             output_bytes: 1 << 20,

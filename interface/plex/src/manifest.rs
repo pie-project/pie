@@ -20,7 +20,6 @@ impl ContractVersion {
 #[serde(deny_unknown_fields)]
 pub struct PolicyLimits {
     pub memory_bytes: u64,
-    pub fuel: u64,
     pub deadline_ms: u64,
     pub input_bytes: u64,
     pub output_bytes: u64,
@@ -51,7 +50,6 @@ impl Manifest {
         }
         for (name, value) in [
             ("memory_bytes", self.limits.memory_bytes),
-            ("fuel", self.limits.fuel),
             ("deadline_ms", self.limits.deadline_ms),
             ("input_bytes", self.limits.input_bytes),
             ("output_bytes", self.limits.output_bytes),
@@ -127,7 +125,6 @@ mod tests {
             operations: BTreeSet::from([Operation::Route]),
             limits: PolicyLimits {
                 memory_bytes: 1 << 20,
-                fuel: 100_000,
                 deadline_ms: 20,
                 input_bytes: 1 << 16,
                 output_bytes: 1 << 16,
