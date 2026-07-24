@@ -116,20 +116,42 @@ interface forward {
             channels: list<borrow<channel>>,
         ) -> result<_, error>;
 
-        /// Submit this pass on `on`, RUN-AHEAD. Pure-attention passes prepare
-        /// and enqueue immediately; an RS-bound pass first awaits/finalizes
-        /// prior FIFO operations so its folded state cannot be prepared from
-        /// a stale commit. The first submit binds seeds (one staged `put` per
-        /// `seeded` channel — missing seeds error here);
-        /// steady-state submits carry the identity hash + instance only.
-        /// Staged host-writer puts are coalesced into the fire.
-        ///
-        /// The result covers preparation/enqueue only. A fire that fails
-        /// AFTER submit poisons the pass's host-reader channels (surfaced at
-        /// `take`/`read` with the fire's error) and fails the pass — further
-        /// submits of it error with the root cause. End-of-stream is a
-        /// PIPELINE event, not a fire attribute: call `pipeline.close`
-        /// after the last submit.
-        submit: func(on: borrow<pipeline>) -> result<_, error>;
     }
+
+    /// Submit ONE FRAME on `on`: exactly `model.frame-size()` ordered slots.
+    /// Slot i executes in wave i of the frame; the composer never moves a
+    /// slot to another wave. `none` is a no-op for that wave. The slot list
+    /// may repeat the same handle (a plain decode frame is the same pass in
+    /// every slot) and may be heterogeneous (prefill chunks in the earliest
+    /// slots, decode in the rest). A frame is one call, not a resource.
+    ///
+    /// Submission validation (deterministic, structural — never timing):
+    /// - `slots` must hold exactly `frame-size()` entries with at least one
+    ///   non-no-op slot.
+    /// - Every host-writer channel bound by the frame's non-no-op slots must
+    ///   be *staged* (it holds at least as many staged cells as the frame's
+    ///   fires will consume), *device-advanced* (the program contains an
+    ///   advance rule for it), or *latest-value* (the program only reads it —
+    ///   a control word; one committed cell suffices and host `set` may
+    ///   replace it at any time).
+    /// - Per host-reader channel, occupancy plus cells reserved by accepted
+    ///   unsettled frames plus the cells this frame will write must fit the
+    ///   capacity — overflow is prevented here, never by back-pressure.
+    ///
+    /// Each non-no-op slot prepares and enqueues RUN-AHEAD in slot order
+    /// (RS-bound passes first finalize prior FIFO operations). The first
+    /// submit of a pass binds seeds; steady-state resubmits carry the
+    /// identity hash + instance only. Staged host-writer puts coalesce into
+    /// the slot fires in order.
+    ///
+    /// The result covers validation/preparation/enqueue only. A fire that
+    /// fails AFTER submit poisons the pass's host-reader channels (surfaced
+    /// at `take`/`read` with the fire's error) and fails the pass — further
+    /// submits of it error with the root cause. End-of-stream is a PIPELINE
+    /// event, not a fire attribute: call `pipeline.close` after the last
+    /// submit.
+    submit: func(
+        on: borrow<pipeline>,
+        slots: list<option<borrow<forward-pass>>>,
+    ) -> result<_, error>;
 }

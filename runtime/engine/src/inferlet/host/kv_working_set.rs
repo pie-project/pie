@@ -82,7 +82,7 @@ impl pie::inferlet::working_set::HostKvWorkingSet for ProcessCtx {
     ) -> Result<Result<WitRange, String>> {
         // Strict admission: even a logical page claim counts as pooled
         // demand the contention orchestrator reasons about.
-        crate::inferlet::process::ensure_execution_admitted(self).await;
+        crate::inferlet::process::ensure_bind_admitted(self).await;
         crate::inferlet::process::preemption::honor(self).await?;
         let ws = self.ctx().table.get(&this)?.clone();
         let stores = store_registry::get(ws.model, ws.driver as usize);

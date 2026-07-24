@@ -12,6 +12,11 @@ namespace {
 
 int failures = 0;
 
+// v14: step members reference the frame roster by index; validator tests use
+// identity rows under a fixed roster size.
+constexpr std::size_t kTestRosterLen = 16;
+const std::uint32_t kRosterRows[] = {0, 1, 2, 3, 4, 5, 6, 7};
+
 void expect(bool condition, const char* message) {
     if (condition) return;
     ++failures;
@@ -29,9 +34,8 @@ int main() {
     const std::uint32_t fold_lens[] = {0, 0};
     const std::uint32_t buffer_slots[] = {7, 8};
     const std::uint32_t buffer_indptr[] = {0, 1, 2};
-    PieLaunchDesc launch{};
-    launch.abi_version = PIE_DRIVER_ABI_VERSION;
-    launch.instance_ids = {.ptr = &instance, .len = 1};
+    PieStepDesc launch{};
+    launch.roster_rows = {.ptr = kRosterRows, .len = 1};
     launch.terminal_cells = {.ptr = terminals, .len = 1};
     launch.rs_slot_ids = {.ptr = folded_slots, .len = 2};
     launch.rs_slot_flags = {.ptr = folded_flags, .len = 2};
@@ -41,13 +45,13 @@ int main() {
     const std::uint32_t empty_qo[] = {0};
     launch.qo_indptr = {.ptr = empty_qo, .len = 1};
     expect(
-        pie_native::abi::validate_launch_desc(&launch) == PIE_STATUS_OK,
+        pie_native::abi::validate_step_desc(&launch, kTestRosterLen) == PIE_STATUS_OK,
         "empty wire geometry accepts a self-consistent deferred B=2 RS CSR");
 
     const std::uint32_t non_monotonic[] = {0, 2, 1};
     launch.rs_buffer_slot_indptr = {.ptr = non_monotonic, .len = 3};
     expect(
-        pie_native::abi::validate_launch_desc(&launch) ==
+        pie_native::abi::validate_step_desc(&launch, kTestRosterLen) ==
             PIE_STATUS_INVALID_ARGUMENT,
         "deferred RS CSR still validates monotonicity");
 
@@ -67,10 +71,8 @@ int main() {
     const std::uint32_t mixed_fold_lens[] = {1, 2, 0};
     const std::uint32_t mixed_buffer_slots[] = {20, 21, 22};
     const std::uint32_t mixed_buffer_ptr[] = {0, 1, 2, 3};
-    PieLaunchDesc mixed_launch{};
-    mixed_launch.abi_version = PIE_DRIVER_ABI_VERSION;
-    mixed_launch.instance_ids = {
-        .ptr = mixed_instances, .len = 2};
+    PieStepDesc mixed_launch{};
+    mixed_launch.roster_rows = {.ptr = kRosterRows, .len = 2};
     mixed_launch.terminal_cells = {
         .ptr = mixed_terminals, .len = 2};
     mixed_launch.qo_indptr = {.ptr = mixed_qo, .len = 2};
@@ -91,12 +93,12 @@ int main() {
     mixed_launch.rs_buffer_slot_indptr = {
         .ptr = mixed_buffer_ptr, .len = 4};
     expect(
-        pie_native::abi::validate_launch_desc(&mixed_launch) ==
+        pie_native::abi::validate_step_desc(&mixed_launch, kTestRosterLen) ==
             PIE_STATUS_OK,
         "mixed wire+descriptor launch defers RS outer cardinality");
     mixed_launch.ptir_program_row_indptr = {};
     expect(
-        pie_native::abi::validate_launch_desc(&mixed_launch) ==
+        pie_native::abi::validate_step_desc(&mixed_launch, kTestRosterLen) ==
             PIE_STATUS_INVALID_ARGUMENT,
         "wire-only launch still enforces exact RS outer cardinality");
     mixed_launch.ptir_program_row_indptr = {
@@ -106,7 +108,7 @@ int main() {
     mixed_launch.rs_slot_flags = {
         .ptr = inconsistent_fold_flags, .len = 3};
     expect(
-        pie_native::abi::validate_launch_desc(&mixed_launch) ==
+        pie_native::abi::validate_step_desc(&mixed_launch, kTestRosterLen) ==
             PIE_STATUS_INVALID_ARGUMENT,
         "shared ABI rejects RS fold flags/lens disagreement");
     mixed_launch.rs_slot_flags = {.ptr = mixed_flags, .len = 3};

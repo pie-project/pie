@@ -40,6 +40,10 @@ pub type ChannelCloser = Arc<dyn Fn(u64) -> anyhow::Result<()> + Send + Sync>;
 pub struct ChannelEndpoint {
     registered: RegisteredChannel,
     closed: AtomicBool,
+    /// Whether the driver close notification has been handed to an external
+    /// batcher (see [`Self::detach_close_notification`]); when set, `close`
+    /// still sweeps/frees the waker slots but no longer invokes the closer.
+    notify_detached: AtomicBool,
     closer: Option<ChannelCloser>,
 }
 
@@ -79,6 +83,7 @@ impl ChannelEndpoint {
         Self {
             registered,
             closed: AtomicBool::new(false),
+            notify_detached: AtomicBool::new(false),
             closer: None,
         }
     }
@@ -140,6 +145,24 @@ impl ChannelEndpoint {
         .await
     }
 
+    /// Takes over this endpoint's driver close notification: returns the
+    /// channel id the caller is now responsible for closing (via a batched
+    /// scheduler post), or `None` if the endpoint already closed (the closer
+    /// already notified) or the notification was already taken. Wait/poison
+    /// bookkeeping is untouched — the endpoint's own drop still sweeps and
+    /// frees its waker slots. Callers must outlive-order the endpoint's drop
+    /// (e.g. hold it through a resource table they drop themselves) — this
+    /// method does not synchronize against a concurrent drop.
+    pub fn detach_close_notification(&self) -> Option<u64> {
+        if self.closed.load(Ordering::Acquire) {
+            return None;
+        }
+        if self.notify_detached.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        Some(self.registered.binding.channel_id)
+    }
+
     fn close(&self) {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
@@ -149,14 +172,15 @@ impl ChannelEndpoint {
             self.registered.reader_wait_id,
             self.registered.writer_wait_id,
         ];
-        if let Some(closer) = self.closer.as_ref() {
-            if let Err(error) = closer(self.registered.binding.channel_id) {
-                tracing::warn!(
-                    channel_id = self.registered.binding.channel_id,
-                    ?error,
-                    "ordered channel close failed"
-                );
-            }
+        if !self.notify_detached.load(Ordering::Acquire)
+            && let Some(closer) = self.closer.as_ref()
+            && let Err(error) = closer(self.registered.binding.channel_id)
+        {
+            tracing::warn!(
+                channel_id = self.registered.binding.channel_id,
+                ?error,
+                "ordered channel close failed"
+            );
         }
         table.sweep(&wait_ids);
         for wait_id in wait_ids {
@@ -226,6 +250,52 @@ mod tests {
         };
         let (result, ()) = tokio::join!(writer, publish_writer);
         result.unwrap();
+    }
+
+    #[test]
+    fn detach_close_notification_takes_over_the_driver_close_once() {
+        let (endpoint, _mirror, _words, _reader, _writer) = test_endpoint();
+        let closes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&closes);
+        let endpoint = endpoint.with_closer(Arc::new(move |_id| {
+            counter.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }));
+
+        assert_eq!(
+            endpoint.detach_close_notification(),
+            Some(1),
+            "first detach hands the caller the channel id"
+        );
+        assert_eq!(
+            endpoint.detach_close_notification(),
+            None,
+            "a second detach finds the notification already taken"
+        );
+        drop(endpoint);
+        assert_eq!(
+            closes.load(Ordering::Acquire),
+            0,
+            "drop after detach must not double-notify through the closer"
+        );
+    }
+
+    #[test]
+    fn detach_close_notification_after_close_yields_nothing() {
+        let (endpoint, _mirror, _words, _reader, _writer) = test_endpoint();
+        let closes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&closes);
+        let endpoint = endpoint.with_closer(Arc::new(move |_id| {
+            counter.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }));
+        endpoint.close();
+        assert_eq!(closes.load(Ordering::Acquire), 1, "close notified once");
+        assert_eq!(
+            endpoint.detach_close_notification(),
+            None,
+            "the closer already notified; nothing left to hand off"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

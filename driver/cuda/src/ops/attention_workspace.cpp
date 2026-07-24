@@ -9,6 +9,16 @@
 
 namespace pie_cuda_driver {
 
+void AttentionWorkspace::ensure_plan_slot(PlanStaging& slot) {
+    if (slot.host == nullptr && staging_bytes_ > 0) {
+        CUDA_CHECK(cudaMallocHost(&slot.host, staging_bytes_));
+    }
+    if (slot.upload_done == nullptr) {
+        CUDA_CHECK(cudaEventCreateWithFlags(
+            &slot.upload_done, cudaEventDisableTiming));
+    }
+}
+
 AttentionWorkspace AttentionWorkspace::allocate(
     std::size_t float_workspace_bytes,
     std::size_t int_workspace_bytes)
@@ -18,13 +28,9 @@ AttentionWorkspace AttentionWorkspace::allocate(
         DType::UINT8, {static_cast<std::int64_t>(float_workspace_bytes)});
     ws.int_buf_ = DeviceTensor::allocate(
         DType::UINT8, {static_cast<std::int64_t>(int_workspace_bytes)});
+    ws.staging_bytes_ = int_workspace_bytes;
     try {
-        for (auto& staging : ws.plan_staging_) {
-            CUDA_CHECK(cudaMallocHost(
-                &staging.host, int_workspace_bytes));
-            CUDA_CHECK(cudaEventCreateWithFlags(
-                &staging.upload_done, cudaEventDisableTiming));
-        }
+        ws.ensure_plan_slot(ws.plan_staging_[0]);
     } catch (...) {
         for (auto& staging : ws.plan_staging_) {
             if (staging.upload_done != nullptr) {
@@ -44,11 +50,13 @@ AttentionWorkspace AttentionWorkspace::allocate(
 AttentionWorkspace::AttentionWorkspace(AttentionWorkspace&& other) noexcept
     : float_buf_(std::move(other.float_buf_)),
       int_buf_(std::move(other.int_buf_)),
+      staging_bytes_(other.staging_bytes_),
       plan_staging_(other.plan_staging_),
       active_plan_slot_(other.active_plan_slot_),
       next_plan_slot_(other.next_plan_slot_)
 {
     other.plan_staging_ = {};
+    other.staging_bytes_ = 0;
     other.active_plan_slot_ = 0;
     other.next_plan_slot_ = 0;
 }
@@ -68,10 +76,12 @@ AttentionWorkspace& AttentionWorkspace::operator=(AttentionWorkspace&& other) no
         }
         float_buf_ = std::move(other.float_buf_);
         int_buf_ = std::move(other.int_buf_);
+        staging_bytes_ = other.staging_bytes_;
         plan_staging_ = other.plan_staging_;
         active_plan_slot_ = other.active_plan_slot_;
         next_plan_slot_ = other.next_plan_slot_;
         other.plan_staging_ = {};
+        other.staging_bytes_ = 0;
         other.active_plan_slot_ = 0;
         other.next_plan_slot_ = 0;
     }
@@ -100,6 +110,7 @@ void AttentionWorkspace::begin_plan_update() {
     next_plan_slot_ =
         (next_plan_slot_ + 1) % kPlanStagingSlots;
     auto& staging = plan_staging_[active_plan_slot_];
+    ensure_plan_slot(staging);
     if (!staging.upload_pending) return;
     CUDA_CHECK(cudaEventSynchronize(staging.upload_done));
     staging.upload_pending = false;

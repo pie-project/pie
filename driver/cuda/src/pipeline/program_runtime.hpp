@@ -399,7 +399,11 @@ class PtirInstance {
                     dense, s.bytes.data(), s.bytes.size());
             }
         }
-        view_.settle_seed_copies();
+        // Seed copies (and the runner's baked-list upload) stay pending on the
+        // registry's initialization stream — no host sync here. Fires order
+        // after them via `order_after_initialization` (Dispatch::begin and the
+        // tier-0 run entries); the old per-bind settle cost a stream sync on
+        // every bind of a 1k-bind cohort boundary.
         for (const Channel& ch : trace.channels) {
             if (!ch.host_reader) continue;
             bool produced = false;

@@ -197,7 +197,7 @@ void prepare_llama_like_decode_plan(
                 cache.page_size(),
                 attn_ws,
                 /*stream=*/nullptr,
-                /*enable_cuda_graph=*/false,
+                /*graph_mode_plan=*/false,
                 fwd_cfg.sliding_window,
                 /*full_attention_variant=*/false,
                 cache.hnd_layout(),

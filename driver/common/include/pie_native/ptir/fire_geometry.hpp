@@ -64,6 +64,12 @@ struct ResolvedPrograms {
     std::vector<std::uint8_t>  is_device_geometry;
     std::size_t                device_count = 0;
     bool                       device_composed = false;
+    // Mixed [wire][envelope] step: the device-geometry entries are
+    // envelope-class shape templates sized to their FULL envelope width
+    // (the composed CSRs reserve device-write capacity); the executor
+    // routes them through the offset fixed-decode compose after the
+    // ordinary wire refill — never the readback fallback.
+    bool                       mixed_envelope = false;
 };
 
 inline bool validate_fire_geometry(const FireGeometry& geometry,

@@ -89,6 +89,79 @@ struct PreparedHostPublish {
     std::size_t bytes = 0;
 };
 
+// Slab-backed small-block pool for per-slot channel storage (device cells /
+// wire staging, or pinned-host mirrors / word blocks). Blocks recycle through
+// exact-size free lists and slabs return to CUDA only at registry teardown, so
+// steady-state (and cold-ramp) channel registration performs NO CUDA
+// allocation calls: a 2048-fleet run used to pay ~22k cudaMalloc +
+// 2×cudaHostAlloc trios (~7.5 µs each) on the lane thread for cells that are
+// 8–300 bytes. Recycling a block to a new slot needs no settle: the new
+// owner's initialization rides the same initialization stream FIFO behind any
+// in-flight ops of the old owner, and its waves order after `init_done_`.
+class SmallBlockPool {
+  public:
+    enum class Kind { Device, PinnedHost };
+    explicit SmallBlockPool(Kind kind) : kind_(kind) {}
+    ~SmallBlockPool() {
+        for (void* slab : slabs_) {
+            if (kind_ == Kind::Device) {
+                static_cast<void>(cudaFree(slab));
+            } else {
+                static_cast<void>(cudaFreeHost(slab));
+            }
+        }
+    }
+    SmallBlockPool(const SmallBlockPool&) = delete;
+    SmallBlockPool& operator=(const SmallBlockPool&) = delete;
+
+    void* acquire(std::size_t bytes) {
+        const std::size_t size = aligned(bytes);
+        auto it = free_.find(size);
+        if (it != free_.end() && !it->second.empty()) {
+            void* p = it->second.back();
+            it->second.pop_back();
+            return p;
+        }
+        if (slab_remaining_ < size) {
+            const std::size_t slab_bytes =
+                std::max<std::size_t>(size, kSlabBytes);
+            void* slab = nullptr;
+            if (kind_ == Kind::Device) {
+                CUDA_CHECK(cudaMalloc(&slab, slab_bytes));
+            } else {
+                CUDA_CHECK(cudaHostAlloc(
+                    &slab, slab_bytes, cudaHostAllocPortable));
+            }
+            slabs_.push_back(slab);
+            slab_cursor_ = static_cast<std::uint8_t*>(slab);
+            slab_remaining_ = slab_bytes;
+        }
+        void* p = slab_cursor_;
+        slab_cursor_ += size;
+        slab_remaining_ -= size;
+        return p;
+    }
+
+    // `bytes` must be the size the block was acquired with (callers pass the
+    // recorded capacity), so the free-list key round-trips exactly.
+    void release(void* p, std::size_t bytes) {
+        if (p == nullptr) return;
+        free_[aligned(bytes)].push_back(p);
+    }
+
+  private:
+    static constexpr std::size_t kAlign = 256;
+    static constexpr std::size_t kSlabBytes = 1ull << 20;
+    static std::size_t aligned(std::size_t bytes) {
+        return (std::max<std::size_t>(bytes, 1) + kAlign - 1) / kAlign * kAlign;
+    }
+    Kind kind_;
+    std::vector<void*> slabs_;
+    std::uint8_t* slab_cursor_ = nullptr;
+    std::size_t slab_remaining_ = 0;
+    std::unordered_map<std::size_t, std::vector<void*>> free_;
+};
+
 // The shared, global device channel table. One per driver (owned by
 // `Dispatch::Impl`). Slots are compact indices into the shared device
 // arrays; `slot_of_` maps a global channel id → slot. Freed slots are recycled.
@@ -98,8 +171,15 @@ class DeviceChannelRegistry {
         CUDA_CHECK(cudaStreamCreateWithFlags(
             &initialization_stream_, cudaStreamNonBlocking));
         try {
+            CUDA_CHECK(cudaEventCreateWithFlags(
+                &init_done_, cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventRecord(init_done_, initialization_stream_));
             grow(kInitialChannelSlots);
         } catch (...) {
+            if (init_done_ != nullptr) {
+                cudaEventDestroy(init_done_);
+                init_done_ = nullptr;
+            }
             cudaStreamDestroy(initialization_stream_);
             initialization_stream_ = nullptr;
             throw;
@@ -124,6 +204,9 @@ class DeviceChannelRegistry {
     }
     ~DeviceChannelRegistry() {
         free_all();
+        if (init_done_ != nullptr) {
+            static_cast<void>(cudaEventDestroy(init_done_));
+        }
         if (initialization_stream_ != nullptr) {
             static_cast<void>(cudaStreamDestroy(initialization_stream_));
         }
@@ -136,6 +219,49 @@ class DeviceChannelRegistry {
         flush_pending_initializations();
         CUDA_CHECK(cudaStreamSynchronize(initialization_stream_));
         initialization_pending_ = false;
+    }
+
+    // Flush pending initializations onto the initialization stream and stamp
+    // `init_done_` — WITHOUT a host sync. `order_after_initialization` makes
+    // an execution stream wait for the stamp instead, so bind-time work
+    // (ring-metadata init, seed uploads, baked-list uploads) never blocks the
+    // lane thread; the wave that first touches the slots pays a stream-order
+    // edge, not a host stall.
+    void publish_initialization() {
+        if (!initialization_pending_) return;
+        flush_pending_initializations();
+        CUDA_CHECK(cudaEventRecord(init_done_, initialization_stream_));
+        initialization_pending_ = false;
+    }
+
+    void order_after_initialization(cudaStream_t stream) {
+        publish_initialization();
+        CUDA_CHECK(cudaStreamWaitEvent(stream, init_done_, 0));
+    }
+
+    // Slab-pooled device blocks for lane-thread consumers beyond the channel
+    // cells (the tier-0 baked lists): a cold cohort's first-touch acquires
+    // come out of the same 1 MB slabs instead of one cudaMalloc per instance
+    // on the lane thread. Lane-thread only, like every registry mutation.
+    void* acquire_device_block(std::size_t bytes) {
+        return device_blocks_.acquire(bytes);
+    }
+    void release_device_block(void* pointer, std::size_t bytes) {
+        device_blocks_.release(pointer, bytes);
+    }
+
+    // Enqueue an H2D copy on the initialization stream, ordered by the same
+    // `init_done_` stamp. `source` must stay alive until the stream drains
+    // (callers keep a persistent host staging buffer).
+    void upload_initialization_bytes(
+        void* destination, const void* source, std::size_t bytes) {
+        CUDA_CHECK(cudaMemcpyAsync(
+            destination,
+            source,
+            bytes,
+            cudaMemcpyHostToDevice,
+            initialization_stream_));
+        initialization_pending_ = true;
     }
 
     bool register_endpoint(const PieChannelDesc& desc,
@@ -230,10 +356,8 @@ class DeviceChannelRegistry {
                 reg_mark = now;
             }
             if (host_words_[slot] == nullptr) {
-                CUDA_CHECK(cudaHostAlloc(
-                    reinterpret_cast<void**>(&host_words_[slot]),
-                    kHostWordBytes,
-                    cudaHostAllocPortable));
+                host_words_[slot] = static_cast<std::uint64_t*>(
+                    pinned_blocks_.acquire(kHostWordBytes));
             }
             if (reg_timing) {
                 const auto now = fire_timing::Clock::now();
@@ -316,7 +440,12 @@ class DeviceChannelRegistry {
         std::uint64_t id,
         std::string* err,
         bool defer_if_attached = false) {
-        settle_initialization();
+        // No settle here: a retire that RETAINS storage is safe against
+        // in-flight initialization-stream work (slot reuse re-registers on the
+        // same stream, FIFO; fires order after `init_done_`). Only a retire
+        // that RELEASES storage must drain the stream first — that settle
+        // lives in `release_slot_storage`. Settling unconditionally made every
+        // post-bind close batch pay a stream sync on the lane thread.
         auto it = slot_of_.find(id);
         if (it == slot_of_.end()) return false;
         const std::uint32_t slot = it->second;
@@ -899,40 +1028,30 @@ class DeviceChannelRegistry {
         pending_initialization_slots_.clear();
     }
 
-    static void ensure_device_capacity(
+    // Pool-backed growth: no CUDA allocation calls on the lane thread once the
+    // pools warm up, and no free-under-in-flight-copy hazard — recycled blocks
+    // stay inside the same initialization-stream FIFO / `init_done_` ordering.
+    void ensure_device_capacity(
         void*& pointer,
         std::size_t& capacity,
         std::size_t required) {
         if (required <= capacity) return;
-        void* replacement = nullptr;
-        CUDA_CHECK(cudaMalloc(&replacement, required));
-        void* previous = pointer;
-        if (previous != nullptr) {
-            const cudaError_t status = cudaFree(previous);
-            if (status != cudaSuccess) {
-                cudaFree(replacement);
-                CUDA_CHECK(status);
-            }
+        void* replacement = device_blocks_.acquire(required);
+        if (pointer != nullptr) {
+            device_blocks_.release(pointer, capacity);
         }
         pointer = replacement;
         capacity = required;
     }
 
-    static void ensure_host_capacity(
+    void ensure_host_capacity(
         void*& pointer,
         std::size_t& capacity,
         std::size_t required) {
         if (required <= capacity) return;
-        void* replacement = nullptr;
-        CUDA_CHECK(cudaHostAlloc(
-            &replacement, required, cudaHostAllocPortable));
-        void* previous = pointer;
-        if (previous != nullptr) {
-            const cudaError_t status = cudaFreeHost(previous);
-            if (status != cudaSuccess) {
-                cudaFreeHost(replacement);
-                CUDA_CHECK(status);
-            }
+        void* replacement = pinned_blocks_.acquire(required);
+        if (pointer != nullptr) {
+            pinned_blocks_.release(pointer, capacity);
         }
         pointer = replacement;
         capacity = required;
@@ -940,19 +1059,21 @@ class DeviceChannelRegistry {
 
     void release_slot_storage(std::uint32_t slot) {
         if (cell_base_[slot] != nullptr) {
-            CUDA_CHECK(cudaFree(cell_base_[slot]));
+            device_blocks_.release(cell_base_[slot], cell_capacity_[slot]);
             cell_base_[slot] = nullptr;
         }
         if (wire_staging_[slot] != nullptr) {
-            CUDA_CHECK(cudaFree(wire_staging_[slot]));
+            device_blocks_.release(
+                wire_staging_[slot], wire_staging_capacity_[slot]);
             wire_staging_[slot] = nullptr;
         }
         if (host_mirror_[slot] != nullptr) {
-            CUDA_CHECK(cudaFreeHost(host_mirror_[slot]));
+            pinned_blocks_.release(
+                host_mirror_[slot], host_mirror_capacity_[slot]);
             host_mirror_[slot] = nullptr;
         }
         if (host_words_[slot] != nullptr) {
-            CUDA_CHECK(cudaFreeHost(host_words_[slot]));
+            pinned_blocks_.release(host_words_[slot], kHostWordBytes);
             host_words_[slot] = nullptr;
         }
         cell_capacity_[slot] = 0;
@@ -983,13 +1104,20 @@ class DeviceChannelRegistry {
         // whose whole working set churns at once (256-process turnover
         // releases ~4.6k slots) must recycle as pure bookkeeping, not
         // fall off a fixed cliff into real frees on the lane thread.
+        // The BYTE caps scale with the same load: at a 512-lane cohort
+        // boundary ~9.2k slots retire at once, and a fixed 64 MiB cliff
+        // released the tail into a cudaFree storm whose refill then paid
+        // fresh allocations on the next cohort's registrations.
         const std::size_t max_inactive_slots =
             std::max<std::size_t>(kMaxInactiveSlots, cap_slots_);
+        const std::size_t max_inactive_bytes = std::max<std::size_t>(
+            kMaxInactiveDeviceBytes,
+            static_cast<std::size_t>(cap_slots_) * kInactiveBytesPerSlot);
         if (inactive_slots_ >= max_inactive_slots ||
-            device_bytes > kMaxInactiveDeviceBytes - std::min(
-                inactive_device_bytes_, kMaxInactiveDeviceBytes) ||
-            host_bytes > kMaxInactiveHostBytes - std::min(
-                inactive_host_bytes_, kMaxInactiveHostBytes)) {
+            device_bytes > max_inactive_bytes - std::min(
+                inactive_device_bytes_, max_inactive_bytes) ||
+            host_bytes > max_inactive_bytes - std::min(
+                inactive_host_bytes_, max_inactive_bytes)) {
             release_slot_storage(slot);
         } else {
             retained_storage_[slot] = 1;
@@ -1127,16 +1255,20 @@ class DeviceChannelRegistry {
                 cudaStreamSynchronize(initialization_stream_));
             initialization_pending_ = false;
         }
-        for (void* p : cell_base_) if (p) cudaFree(p);
-        for (void* p : wire_staging_) if (p) cudaFree(p);
-        for (void* p : host_mirror_) if (p) cudaFreeHost(p);
-        for (std::uint64_t* p : host_words_) if (p) cudaFreeHost(p);
+        // Per-slot storage lives in the slab pools; their dtors (which run
+        // after this) return the slabs to CUDA in one pass.
         if (d_full_) cudaFree(d_full_);
         if (d_head_) cudaFree(d_head_);
         if (d_tail_) cudaFree(d_tail_);
         if (d_cap1_) cudaFree(d_cap1_);
         d_full_ = nullptr; d_head_ = d_tail_ = d_cap1_ = nullptr;
     }
+
+    // Declared first so they are destroyed LAST: `free_all()` runs in the
+    // registry dtor body and hands every slot's storage back to these pools
+    // before their dtors return the slabs to CUDA.
+    SmallBlockPool device_blocks_{SmallBlockPool::Kind::Device};
+    SmallBlockPool pinned_blocks_{SmallBlockPool::Kind::PinnedHost};
 
     std::unordered_map<std::uint64_t, std::uint32_t> slot_of_;
     std::vector<std::uint64_t> id_of_;
@@ -1172,6 +1304,7 @@ class DeviceChannelRegistry {
     std::size_t inactive_host_bytes_ = 0;
     bool initialization_pending_ = false;
     cudaStream_t initialization_stream_ = nullptr;
+    cudaEvent_t init_done_ = nullptr;
 
     static constexpr std::size_t kHostWordBytes =
         4 * sizeof(std::uint64_t);
@@ -1183,8 +1316,10 @@ class DeviceChannelRegistry {
 #endif
     static constexpr std::size_t kMaxInactiveDeviceBytes =
         64ull * 1024ull * 1024ull;
-    static constexpr std::size_t kMaxInactiveHostBytes =
-        64ull * 1024ull * 1024ull;
+    // Per-slot byte budget for the load-scaled retention cap (device and
+    // host each): 16k slots -> 128 MiB, bounded by the registry's own
+    // load sizing rather than a fleet-independent constant.
+    static constexpr std::size_t kInactiveBytesPerSlot = 8ull * 1024ull;
 
     std::uint8_t*  d_full_ = nullptr;
     std::uint32_t* d_head_ = nullptr;

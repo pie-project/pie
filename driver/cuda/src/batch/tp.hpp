@@ -2,12 +2,12 @@
 
 // Tensor-parallel fan-out for direct/PTIR fires.
 //
-// Rank 0 (`batch/compose.cpp`) broadcasts the per-fire persistent-input
+// Rank 0 (`batch/frame.cpp`) broadcasts the per-fire persistent-input
 // payload to every TP follower via `tp_broadcast_inputs`, gated by
 // `tp_cpu_gate_notify` so idle followers aren't spinning on NCCL between
 // fires. Followers run `tp_follower_serve`, a loop that blocks on the
 // matching broadcasts and then runs the same forward kernels (mirroring
-// `handle_fire_batch` minus PTIR publication, which is rank-0-only) so the
+// the frame step pipeline minus PTIR publication, which is rank-0-only) so the
 // all-reduces inside `forward_fn.body` complete against rank 0.
 
 #include <atomic>
@@ -55,7 +55,7 @@ void tp_broadcast_mtp_step(
 void tp_cpu_gate_notify(const std::string& key);
 
 // TP-follower service loop. Called only on TP ranks > 0. Mirrors
-// `handle_fire_batch` minus PTIR publication: the loop blocks on
+// the frame step pipeline minus PTIR publication: the loop blocks on
 // `ncclBroadcast(root=0)` for each fire's header + inputs, runs the same
 // `forward_fn.body` so the all-reduces inside complete against rank 0, then
 // loops. `stop` is checked between fires; rank 0 also sends an explicit
