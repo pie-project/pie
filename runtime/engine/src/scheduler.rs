@@ -610,7 +610,6 @@ pub fn submit_prebuilt_tracked_async_with_kv_and_rs_copy(
         rs_copy_src,
         rs_copy_dst,
         None,
-        None,
         fire_timing_request_enabled(Some(pipeline_id)),
     )
 }
@@ -628,7 +627,6 @@ pub(crate) fn submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
     copy_dst: Vec<u32>,
     rs_copy_src: Vec<u32>,
     rs_copy_dst: Vec<u32>,
-    retry_classifier: Option<RetryClassifier>,
     frame: Option<FrameStamp>,
     timing_enabled: bool,
 ) -> Result<()> {
@@ -650,7 +648,6 @@ pub(crate) fn submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
         pipeline_id,
         prelaunch_copy,
         rs_state_copy_plan(rs_copy_src, rs_copy_dst)?,
-        retry_classifier,
         frame,
         timing_enabled,
     )

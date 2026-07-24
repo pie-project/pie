@@ -42,6 +42,13 @@ cache-keys = [
     # without these keys a source edit there serves a stale cached wheel.
     { file = "../../runtime/**/*.rs" },
     { file = "../../driver/**/*.rs" },
+    { file = "../../driver/**/*.cpp" },
+    { file = "../../driver/**/*.cu" },
+    { file = "../../driver/**/*.cuh" },
+    { file = "../../driver/**/*.hpp" },
+    { file = "../../driver/**/*.h" },
+    { file = "../../driver/**/CMakeLists.txt" },
     { file = "../../interface/**/*.wit" },
     { file = "../../interface/**/*.rs" },
+    { file = "../../interface/**/*.h" },
 ]

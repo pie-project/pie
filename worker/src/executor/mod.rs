@@ -17,7 +17,8 @@ use pie_driver_abi::{
     RemoteTransferKind, ScratchGrant, TerminalCellState,
 };
 use pie_engine::driver::{
-    BoundInstance, ChannelValue, DriverBackend, InstanceBindingPlan, LaunchSubmission,
+    BoundInstance, ChannelValue, DriverBackend, FrameLaunchOutcome, FrameSubmission,
+    InstanceBindingPlan, StepSubmission,
 };
 use tarpc::serde_transport::tcp;
 use tarpc::server::{BaseChannel, Channel};
@@ -1764,23 +1765,41 @@ impl ExecutorActor {
             .iter_mut()
             .map(|cell| cell.as_mut() as *mut PieTerminalCell)
             .collect();
-        let submission = LaunchSubmission {
-            plan: merged.plan,
-            instance_ids: merged.instance_ids,
+        // The remote wire is per-step: each merged launch posts as a
+        // single-step frame (the engine-side edge adapter decomposed the
+        // frame; this re-wraps for the local v14 driver).
+        let submission = single_step_frame(
+            merged.plan,
+            merged.instance_ids,
             terminal_cells,
-            kv_translation: merged.kv_translation,
-            kv_translation_indptr: merged.kv_translation_indptr,
-            program_row_indptr: merged.program_row_indptr,
-            logical_fire_ids: merged.logical_fire_ids,
-            channel_expected_head: merged.channel_expected_head,
-            channel_expected_tail: merged.channel_expected_tail,
-            channel_ticket_indptr: merged.channel_ticket_indptr,
-            // The remote wire carries no frame-group marker: remote launches
-            // always settle per-wave.
-            settle_defer: false,
-        };
+            merged.kv_translation,
+            merged.kv_translation_indptr,
+            merged.program_row_indptr,
+            merged.logical_fire_ids,
+            merged.channel_expected_head,
+            merged.channel_expected_tail,
+            merged.channel_ticket_indptr,
+        );
         let completion = match self.backend.launch(&submission) {
-            Ok(completion) => completion,
+            Ok(FrameLaunchOutcome::Launched(completion)) => completion,
+            Ok(FrameLaunchOutcome::Exhausted) => {
+                let error = driver_error(anyhow::anyhow!(
+                    "frame admission exhausted"
+                ));
+                for (_, _, reply) in metadata {
+                    let _ = reply.send(Err(error.clone()));
+                }
+                return;
+            }
+            Ok(FrameLaunchOutcome::Impossible) => {
+                let error = driver_error(anyhow::anyhow!(
+                    "frame exceeds the driver's physical budget ceiling"
+                ));
+                for (_, _, reply) in metadata {
+                    let _ = reply.send(Err(error.clone()));
+                }
+                return;
+            }
             Err(error) => {
                 let error = driver_error(error);
                 for (_, _, reply) in metadata {
@@ -3048,6 +3067,54 @@ fn append_plan(
     Ok(())
 }
 
+/// Wrap one merged wire launch as a single-step v14 frame: identity roster,
+/// one sub-batch spanning the batch.
+#[allow(clippy::too_many_arguments)]
+fn single_step_frame(
+    plan: pie_engine::driver::LaunchPlan,
+    instance_ids: Vec<u64>,
+    terminal_cells: Vec<*mut PieTerminalCell>,
+    kv_translation: Vec<u32>,
+    kv_translation_indptr: Vec<u32>,
+    program_row_indptr: Vec<u32>,
+    logical_fire_ids: Vec<u64>,
+    channel_expected_head: Vec<u64>,
+    channel_expected_tail: Vec<u64>,
+    channel_ticket_indptr: Vec<u32>,
+) -> FrameSubmission {
+    let members = instance_ids.len() as u32;
+    let required_kv_pages = plan.required_kv_pages.max(
+        plan.kv_page_indices
+            .iter()
+            .copied()
+            .max()
+            .map_or(0, |page| page.saturating_add(1)),
+    );
+    let device_resolved = plan.device_resolved_geometry;
+    FrameSubmission {
+        instance_ids,
+        kv_translation,
+        kv_translation_indptr,
+        required_kv_pages,
+        steps: vec![StepSubmission {
+            plan,
+            roster_rows: (0..members).collect(),
+            sub_batch_indptr: vec![0, members],
+            sub_batch_class: vec![if device_resolved {
+                pie_driver_abi::PIE_GEOMETRY_CLASS_DECODE_ENVELOPE
+            } else {
+                pie_driver_abi::PIE_GEOMETRY_CLASS_HOST
+            }],
+            terminal_cells,
+            program_row_indptr,
+            logical_fire_ids,
+            channel_expected_head,
+            channel_expected_tail,
+            channel_ticket_indptr,
+        }],
+    }
+}
+
 fn merge_remote_launches(launches: Vec<RemoteLaunch>) -> Result<RemoteLaunch> {
     anyhow::ensure!(!launches.is_empty(), "cannot merge an empty launch set");
     let mut merged = RemoteLaunch {
@@ -3812,21 +3879,23 @@ mod tests {
                 reserved0: 0,
             });
             let wire = launch(bound.instance_id);
-            let completion = remote
-                .launch(&LaunchSubmission {
-                    plan: wire.plan,
-                    instance_ids: wire.instance_ids,
-                    terminal_cells: vec![terminal.as_mut()],
-                    kv_translation: wire.kv_translation,
-                    kv_translation_indptr: wire.kv_translation_indptr,
-                    program_row_indptr: wire.program_row_indptr,
-                    logical_fire_ids: wire.logical_fire_ids,
-                    channel_expected_head: wire.channel_expected_head,
-                    channel_expected_tail: wire.channel_expected_tail,
-                    channel_ticket_indptr: wire.channel_ticket_indptr,
-                    settle_defer: false,
-                })
-                .unwrap();
+            let FrameLaunchOutcome::Launched(completion) = remote
+                .launch(&single_step_frame(
+                    wire.plan,
+                    wire.instance_ids,
+                    vec![terminal.as_mut()],
+                    wire.kv_translation,
+                    wire.kv_translation_indptr,
+                    wire.program_row_indptr,
+                    wire.logical_fire_ids,
+                    wire.channel_expected_head,
+                    wire.channel_expected_tail,
+                    wire.channel_ticket_indptr,
+                ))
+                .unwrap()
+            else {
+                panic!("remote frame post must launch");
+            };
             runtime.block_on(completion).unwrap();
             let outcome = read_terminal(&terminal).outcome;
             remote.close_instance(bound.instance_id).unwrap();
@@ -3935,21 +4004,23 @@ mod tests {
                 reserved0: 0,
             });
             let wire = launch(bound.instance_id);
-            let completion = remote
-                .launch(&LaunchSubmission {
-                    plan: wire.plan,
-                    instance_ids: wire.instance_ids,
-                    terminal_cells: vec![terminal.as_mut()],
-                    kv_translation: wire.kv_translation,
-                    kv_translation_indptr: wire.kv_translation_indptr,
-                    program_row_indptr: wire.program_row_indptr,
-                    logical_fire_ids: wire.logical_fire_ids,
-                    channel_expected_head: wire.channel_expected_head,
-                    channel_expected_tail: wire.channel_expected_tail,
-                    channel_ticket_indptr: wire.channel_ticket_indptr,
-                    settle_defer: false,
-                })
-                .unwrap();
+            let FrameLaunchOutcome::Launched(completion) = remote
+                .launch(&single_step_frame(
+                    wire.plan,
+                    wire.instance_ids,
+                    vec![terminal.as_mut()],
+                    wire.kv_translation,
+                    wire.kv_translation_indptr,
+                    wire.program_row_indptr,
+                    wire.logical_fire_ids,
+                    wire.channel_expected_head,
+                    wire.channel_expected_tail,
+                    wire.channel_ticket_indptr,
+                ))
+                .unwrap()
+            else {
+                panic!("remote frame post must launch");
+            };
             let _ = accepted_tx.send(());
             let result = runtime
                 .block_on(completion)

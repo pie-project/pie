@@ -28,7 +28,7 @@ use crate::driver::command::{
 };
 use crate::driver::completion::SubmissionCompletion;
 use crate::driver::instance::{BoundInstance, InstanceBindingPlan};
-use crate::driver::submission::LaunchSubmission;
+use crate::driver::submission::FrameSubmission;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SchedulerLimits {
@@ -50,24 +50,16 @@ impl DriverSpec {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LaunchLease {
-    pub id: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LaunchPrepareOutcome {
-    Prepared(LaunchLease),
-    Exhausted {
-        budget_generation: u64,
-        required_pages: u64,
-        budget_pages: u64,
-    },
-    Impossible {
-        required_pages: u64,
-        budget_pages: u64,
-    },
-    Unsupported,
+/// Outcome of a frame launch post: admission is folded into the launch call
+/// (ABI v14), so a post either enters the driver with one completion, or
+/// reports why it cannot right now.
+pub enum FrameLaunchOutcome {
+    /// The frame was admitted and posted; one completion settles it.
+    Launched(SubmissionCompletion),
+    /// Admission is full right now; the engine re-posts later.
+    Exhausted,
+    /// The frame can never fit within the driver's physical budget ceiling.
+    Impossible,
 }
 
 pub enum DriverBackend {
@@ -185,7 +177,11 @@ impl DriverBackend {
         }
     }
 
-    pub fn launch(&mut self, desc: &LaunchSubmission) -> Result<SubmissionCompletion> {
+    /// Post one sealed frame. Admission is folded into the call: the driver
+    /// evaluates the frame-union demand and either admits (one completion
+    /// settles the whole frame) or reports Exhausted/Impossible without side
+    /// effects.
+    pub fn launch(&mut self, desc: &FrameSubmission) -> Result<FrameLaunchOutcome> {
         match self {
             Self::Dummy(driver) => driver.launch(desc),
             #[cfg(feature = "driver-cuda")]
@@ -193,65 +189,6 @@ impl DriverBackend {
             #[cfg(feature = "driver-metal")]
             Self::Metal(driver) => driver.launch(desc),
             Self::Remote(driver) => driver.launch(desc),
-        }
-    }
-
-    pub fn supports_elastic_admission(&self) -> bool {
-        match self {
-            Self::Dummy(driver) => driver.supports_elastic_admission(),
-            #[cfg(feature = "driver-cuda")]
-            Self::Cuda(driver) => driver.supports_elastic_admission(),
-            #[cfg(feature = "driver-metal")]
-            Self::Metal(_) => true,
-            Self::Remote(_) => false,
-        }
-    }
-
-    pub fn prepare_launch(&mut self, desc: &LaunchSubmission) -> Result<LaunchPrepareOutcome> {
-        match self {
-            Self::Dummy(driver) => driver.prepare_launch(desc),
-            #[cfg(feature = "driver-cuda")]
-            Self::Cuda(driver) => driver.prepare_launch(desc),
-            #[cfg(feature = "driver-metal")]
-            Self::Metal(driver) => driver.prepare_launch(desc),
-            Self::Remote(_) => Ok(LaunchPrepareOutcome::Unsupported),
-        }
-    }
-
-    pub fn launch_prepared(
-        &mut self,
-        desc: &LaunchSubmission,
-        lease: LaunchLease,
-    ) -> Result<SubmissionCompletion> {
-        match self {
-            Self::Dummy(driver) => driver.launch_prepared(desc, lease),
-            #[cfg(feature = "driver-cuda")]
-            Self::Cuda(driver) => driver.launch_prepared(desc, lease),
-            #[cfg(feature = "driver-metal")]
-            Self::Metal(driver) => driver.launch_prepared(desc, lease),
-            Self::Remote(_) => Err(anyhow!("remote launch preparation is unsupported")),
-        }
-    }
-
-    pub fn release_launch(&mut self, lease: LaunchLease) -> Result<()> {
-        match self {
-            Self::Dummy(driver) => driver.release_launch(lease),
-            #[cfg(feature = "driver-cuda")]
-            Self::Cuda(driver) => driver.release_launch(lease),
-            #[cfg(feature = "driver-metal")]
-            Self::Metal(driver) => driver.release_launch(lease),
-            Self::Remote(_) => Err(anyhow!("remote launch preparation is unsupported")),
-        }
-    }
-
-    /// Drain the driver's parked frame-group settlement records (M2). A
-    /// no-op everywhere but CUDA: `settle_defer` is advisory, and every
-    /// other backend settles per-wave already.
-    pub fn flush_settlement(&mut self) -> Result<()> {
-        match self {
-            #[cfg(feature = "driver-cuda")]
-            Self::Cuda(driver) => driver.flush_settlement(),
-            _ => Ok(()),
         }
     }
 

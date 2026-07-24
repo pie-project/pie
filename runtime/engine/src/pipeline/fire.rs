@@ -997,32 +997,6 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // launch-ready work.
         let ticket_reservation = TicketReservation::new(&cells, &accesses);
         ticket_reservation.apply_to(&mut req);
-        let retry_cells = cells.clone();
-        let retry_accesses = accesses.clone();
-        let closed_scope = pipeline_scope.clone();
-        let retry_classifier: crate::scheduler::RetryClassifier = Box::new(move || {
-            retry_cells
-                .iter()
-                .zip(&retry_accesses)
-                .find_map(|(cell, &(consume, publish))| {
-                    let cell = cell.lock().unwrap();
-                    cell.permanent_retry_cause(consume || publish).or_else(|| {
-                        // Close is the decidability point: a put
-                        // still blocked on a full ring with no attached
-                        // consumer and no host role can never commit.
-                        (publish && closed_scope.is_closed() && cell.is_consumerless_device_ring())
-                            .then(|| {
-                                format!(
-                                    "channel {} put can never commit: the pipeline \
-                                 closed with no consumer attached \
-                                 (device-only ring, single pass) — a definite \
-                                 deadlock",
-                                    cell.global_id
-                                )
-                            })
-                    })
-                })
-        });
         let submit_error = crate::scheduler::submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
             &scheduler,
             req,
@@ -1035,7 +1009,6 @@ pub async fn submit_pass_stamped<C: FireContext>(
             copy_dst,
             rs_copy_src,
             rs_copy_dst,
-            Some(retry_classifier),
             frame,
             timing_enabled,
         )
@@ -2047,7 +2020,6 @@ async fn fire_device_geometry<C: FireContext>(
         copy_dst,
         rs_copy_src,
         rs_copy_dst,
-        None,
         frame,
         timing_enabled,
     )

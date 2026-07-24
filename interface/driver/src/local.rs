@@ -18,14 +18,14 @@ use crate::geometry::GeometryClass;
 
 /// Current direct local ABI version.
 ///
-/// v12: finalized launches can be prepared into a driver-owned elastic-memory
-/// lease and then launched or released exactly once.
-///
-/// v13: `PieLaunchDesc.settle_defer` (was `reserved0`) marks a launch whose
-/// heavy settlement (batch completion notify, `cuda_settled`, instance-close
-/// fences) may be deferred and drained by the next settle-now launch of its
-/// frame group; a held lease is consumed only by a settle-now launch.
-pub const PIE_DRIVER_ABI_VERSION: u32 = 13;
+/// v14 (Project Venus): the launch unit is the sealed **frame** — one
+/// [`PieFrameDesc`] carries k forward steps that the driver executes as one
+/// closed system with a single completion. Frame-invariant tables (lane
+/// roster, WorkingSet page translation, frame-union KV admission demand) are
+/// hoisted out of the per-step sections. Admission is folded into the launch
+/// call itself ([`PIE_STATUS_EXHAUSTED`] / [`PIE_STATUS_IMPOSSIBLE`]); the
+/// v12 prepare/lease surface and the v13 `settle_defer` lever are deleted.
+pub const PIE_DRIVER_ABI_VERSION: u32 = 14;
 pub const PIE_MODEL_COMPONENT_FULL: u32 = 0;
 pub const PIE_MODEL_COMPONENT_TEXT: u32 = 1;
 pub const PIE_MODEL_COMPONENT_ENCODE: u32 = 2;
@@ -42,13 +42,11 @@ pub const PIE_STATUS_UNSUPPORTED: i32 = -3;
 pub const PIE_STATUS_CLOSED: i32 = -4;
 /// The driver encountered an internal failure after accepting the call.
 pub const PIE_STATUS_DRIVER_ERROR: i32 = -5;
-
-/// The finalized launch was admitted and `lease_id` is valid.
-pub const PIE_LAUNCH_PREPARE_READY: u32 = 0;
-/// The launch may fit later after physical budget is released.
-pub const PIE_LAUNCH_PREPARE_EXHAUSTED: u32 = 1;
-/// The launch can never fit within the driver's physical budget ceiling.
-pub const PIE_LAUNCH_PREPARE_IMPOSSIBLE: u32 = 2;
+/// Frame admission is full right now; the frame may fit after physical
+/// budget is released. The engine re-posts later.
+pub const PIE_STATUS_EXHAUSTED: i32 = -6;
+/// The frame can never fit within the driver's physical budget ceiling.
+pub const PIE_STATUS_IMPOSSIBLE: i32 = -7;
 
 // Literal values so cbindgen emits plain macros; the assert pins them to the
 // Rust enum.
@@ -391,8 +389,8 @@ impl Default for PieRuntimeCallbacks {
 pub struct PieCompletion {
     pub wait_id: u64,
     pub target_epoch: u64,
-    /// Stable terminal control cell for value-less operations. Launch batches
-    /// use the per-member `PieLaunchDesc::terminal_cells` instead.
+    /// Stable terminal control cell for value-less operations. Frame launches
+    /// use the per-member `PieStepDesc::terminal_cells` instead.
     pub terminal_cell: *mut PieTerminalCell,
 }
 
@@ -526,21 +524,27 @@ pub struct PieInstanceBinding {
     pub reserved0: u32,
 }
 
-/// One batched launch descriptor.
+/// One forward step of a frame: the per-step section of [`PieFrameDesc`].
+///
+/// A step's batch members reference the frame's lane roster through
+/// `roster_rows` and are partitioned into ordered geometry-homogeneous
+/// sub-batches; sub-batch order resolves producer→consumer dependencies
+/// within the step. Device-resolved (decode-envelope) sub-batches elide
+/// their wire geometry exactly as in v13, so decode steps are naturally
+/// small. Frame-invariant tables (roster ids, WorkingSet page translation,
+/// KV admission demand) live on the frame, not the step.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PieLaunchDesc {
-    pub abi_version: u32,
-    /// `1` = the driver may defer this launch's heavy settlement (batch
-    /// completion notify, `cuda_settled`, instance-close fences) until the
-    /// frame group's next settle-now launch drains it; per-wave publication
-    /// (mirror copies, doorbells, waiter wakes, terminal cells) is never
-    /// deferred. `0` = settle now, draining any deferred predecessors.
-    /// Values above `1` are invalid.
-    pub settle_defer: u32,
-    /// Bound instance ids, one per fire/program in scheduler order.
-    pub instance_ids: PieU64Slice,
-    /// Stable terminal control cell addresses, one per `instance_ids` member.
+pub struct PieStepDesc {
+    /// Indices into the frame roster (`PieFrameDesc::instance_ids`), one per
+    /// batch member, in sub-batch order.
+    pub roster_rows: PieU32Slice,
+    /// CSR over `roster_rows`: sub-batch `b` spans members
+    /// `[sub_batch_indptr[b], sub_batch_indptr[b+1])`.
+    pub sub_batch_indptr: PieU32Slice,
+    /// `PIE_GEOMETRY_CLASS_*` per sub-batch, parallel to the CSR segments.
+    pub sub_batch_class: PieU32Slice,
+    /// Stable terminal control cell addresses, one per `roster_rows` member.
     pub terminal_cells: PieTerminalCellPtrSlice,
     pub token_ids: PieU32Slice,
     pub position_ids: PieU32Slice,
@@ -568,8 +572,8 @@ pub struct PieLaunchDesc {
     pub has_user_mask: u8,
     /// Reserved; must be zero.
     pub reserved_flags: [u8; 2],
-    /// Exclusive physical KV page high-water required before this launch.
-    pub required_kv_pages: u32,
+    /// Reserved; must be zero.
+    pub reserved0: u32,
     pub image_indptr: PieU32Slice,
     pub image_grids: PieU32Slice,
     pub image_anchor_positions: PieU32Slice,
@@ -591,42 +595,30 @@ pub struct PieLaunchDesc {
     pub embed_block_indptr: PieU32Slice,
     pub kv_len: PieU32Slice,
     pub kv_len_device: PieU64Slice,
-    /// Per-instance WorkingSet page translation, flattened across the batch:
-    /// entry `i` of an instance's segment is the PHYSICAL KV page id backing
-    /// WorkingSet-relative page index `i` for THIS fire (committed mapping
-    /// overlaid with the fire's prepared write targets). The driver maps any
-    /// WorkingSet-relative page reference it resolves from device channels
-    /// (`Pages` / `WSlot` descriptor ports) through this table; guests never
-    /// see physical ids (kv_refact.md, flattened-table model). An empty
-    /// segment means the instance's channel geometry is already physical
-    /// (legacy) or absent.
-    pub kv_translation: PieU32Slice,
-    /// CSR partition of `kv_translation`, one segment per `instance_ids`
-    /// entry (`len == instance_ids.len + 1` when present, else empty).
-    pub kv_translation_indptr: PieU32Slice,
-    /// Program → wire-request attribution CSR (`len == instance_ids.len + 1`
-    /// when present, else empty): program `p` owns the wire request rows
+    /// Program → wire-request attribution CSR (`len == roster_rows.len + 1`
+    /// when present, else empty): step member `p` owns the wire request rows
     /// `[row_indptr[p], row_indptr[p+1])` of `qo_indptr`/`kv_page_indptr`/
-    /// `sampling_indptr`. A device-geometry program's span is its empty
+    /// `sampling_indptr`. A device-geometry member's span is its empty
     /// wire placeholder row; the driver substitutes its channel-resolved
     /// geometry for that span when composing the forward batch.
     pub ptir_program_row_indptr: PieU32Slice,
     pub ptir_kv_write_lower_bounds: PieU64Slice,
     pub ptir_kv_write_upper_bounds: PieU64Slice,
-    /// Immutable logical-fire ids, one per instance.
+    /// Immutable logical-fire ids, one per `roster_rows` member.
     pub logical_fire_ids: PieU64Slice,
-    /// Dense-channel sequence tickets, CSR-partitioned per instance.
+    /// Dense-channel sequence tickets, CSR-partitioned per `roster_rows`
+    /// member.
     pub channel_expected_head: PieU64Slice,
     pub channel_expected_tail: PieU64Slice,
     pub channel_ticket_indptr: PieU32Slice,
 }
 
-impl Default for PieLaunchDesc {
+impl Default for PieStepDesc {
     fn default() -> Self {
         Self {
-            abi_version: PIE_DRIVER_ABI_VERSION,
-            settle_defer: 0,
-            instance_ids: PieU64Slice::default(),
+            roster_rows: PieU32Slice::default(),
+            sub_batch_indptr: PieU32Slice::default(),
+            sub_batch_class: PieU32Slice::default(),
             terminal_cells: PieTerminalCellPtrSlice::default(),
             token_ids: PieU32Slice::default(),
             position_ids: PieU32Slice::default(),
@@ -646,7 +638,7 @@ impl Default for PieLaunchDesc {
             single_token_mode: 0,
             has_user_mask: 0,
             reserved_flags: [0; 2],
-            required_kv_pages: 0,
+            reserved0: 0,
             image_indptr: PieU32Slice::default(),
             image_grids: PieU32Slice::default(),
             image_anchor_positions: PieU32Slice::default(),
@@ -668,8 +660,6 @@ impl Default for PieLaunchDesc {
             embed_block_indptr: PieU32Slice::default(),
             kv_len: PieU32Slice::default(),
             kv_len_device: PieU64Slice::default(),
-            kv_translation: PieU32Slice::default(),
-            kv_translation_indptr: PieU32Slice::default(),
             ptir_program_row_indptr: PieU32Slice::default(),
             ptir_kv_write_lower_bounds: PieU64Slice::default(),
             ptir_kv_write_upper_bounds: PieU64Slice::default(),
@@ -681,23 +671,70 @@ impl Default for PieLaunchDesc {
     }
 }
 
-/// Result of synchronously preparing one finalized launch.
+/// Borrowed slice of per-step sections.
 ///
-/// `lease_id` is nonzero only for [`PIE_LAUNCH_PREPARE_READY`]. A ready lease
-/// is consumed by exactly one `*_launch_prepared` or `*_release_launch` call.
+/// `ptr` may be null only when `len == 0`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct PieLaunchPrepareResult {
-    pub outcome: u32,
+pub struct PieStepDescSlice {
+    pub ptr: *const PieStepDesc,
+    pub len: usize,
+}
+
+/// One sealed frame: the v14 launch unit.
+///
+/// The driver executes the frame's steps as one closed system — steps chain
+/// on-stream (device-resolved token feedback), data publication stays
+/// per-step on-stream, and control settlement happens once at the frame
+/// tail through the single launch completion. Admission is evaluated
+/// against the frame-union demand at the launch call ([`PIE_STATUS_EXHAUSTED`]
+/// / [`PIE_STATUS_IMPOSSIBLE`]); a frame that admits cannot fail per-lane
+/// mid-frame (stream work is SUCCESS-only; deterministic compose kills latch
+/// per-lane FAILED at the tail).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PieFrameDesc {
+    pub abi_version: u32,
     /// Reserved; must be zero.
     pub reserved0: u32,
-    pub lease_id: u64,
-    /// Monotonic physical-budget generation observed by this attempt.
-    pub budget_generation: u64,
-    /// Independently rounded physical pages required by the finalized launch.
-    pub required_pages: u64,
-    /// Current physical budget in the same page units.
-    pub budget_pages: u64,
+    /// Lane roster: every bound instance participating in any step, in
+    /// scheduler order. No duplicates. Step sections reference these entries
+    /// by index (`PieStepDesc::roster_rows`).
+    pub instance_ids: PieU64Slice,
+    /// Frame-union WorkingSet page translation, flattened across the roster:
+    /// entry `i` of a lane's segment is the PHYSICAL KV page id backing
+    /// WorkingSet-relative page index `i` for this FRAME (committed mapping
+    /// overlaid with ALL steps' prepared write targets). The driver maps any
+    /// WorkingSet-relative page reference it resolves from device channels
+    /// (`Pages` / `WSlot` descriptor ports) through this table; guests never
+    /// see physical ids. An empty segment means the lane's channel geometry
+    /// is already physical (legacy) or absent.
+    pub kv_translation: PieU32Slice,
+    /// CSR partition of `kv_translation`, one segment per `instance_ids`
+    /// entry (`len == instance_ids.len + 1` when present, else empty).
+    pub kv_translation_indptr: PieU32Slice,
+    /// Exclusive physical KV page high-water required after the LAST step —
+    /// the frame-union admission demand.
+    pub required_kv_pages: u32,
+    /// Reserved; must be zero.
+    pub reserved1: u32,
+    /// The frame's steps in execution order. Never empty.
+    pub steps: PieStepDescSlice,
+}
+
+impl Default for PieFrameDesc {
+    fn default() -> Self {
+        Self {
+            abi_version: PIE_DRIVER_ABI_VERSION,
+            reserved0: 0,
+            instance_ids: PieU64Slice::default(),
+            kv_translation: PieU32Slice::default(),
+            kv_translation_indptr: PieU32Slice::default(),
+            required_kv_pages: 0,
+            reserved1: 0,
+            steps: PieStepDescSlice::default(),
+        }
+    }
 }
 
 #[repr(C)]
@@ -1339,19 +1376,40 @@ pub fn validate_completion(
     Ok(())
 }
 
-/// Validates a launch descriptor.
+/// Validates one per-step section against the frame roster size.
 ///
 /// # Safety
 ///
 /// This walks foreign `indptr` slices and nested channel-value descriptors, so
 /// every non-null pointer/length pair in `desc` must reference readable memory
 /// for the declared element count.
-pub unsafe fn validate_launch_desc(desc: &PieLaunchDesc) -> PieAbiValidationResult {
-    validate_pie_abi_version(desc.abi_version)?;
-    if desc.settle_defer > 1 {
-        return Err(invalid_argument("launch settle_defer must be 0 or 1"));
+pub unsafe fn validate_step_desc(desc: &PieStepDesc, roster_len: usize) -> PieAbiValidationResult {
+    validate_u32_slice(desc.roster_rows, "step roster_rows ptr/len mismatch")?;
+    validate_u32_slice(
+        desc.sub_batch_indptr,
+        "step sub_batch_indptr ptr/len mismatch",
+    )?;
+    validate_u32_slice(desc.sub_batch_class, "step sub_batch_class ptr/len mismatch")?;
+    unsafe {
+        validate_csr(
+            desc.sub_batch_indptr,
+            "step sub_batch_indptr malformed",
+            desc.roster_rows.len,
+            desc.sub_batch_class.len,
+            true,
+        )?;
     }
-    validate_u64_slice(desc.instance_ids, "launch instance_ids ptr/len mismatch")?;
+    if desc.sub_batch_class.len != 0 {
+        let classes = unsafe {
+            std::slice::from_raw_parts(desc.sub_batch_class.ptr, desc.sub_batch_class.len)
+        };
+        if classes
+            .iter()
+            .any(|&class| GeometryClass::try_from(class).is_err())
+        {
+            return Err(invalid_argument("step sub_batch_class is invalid"));
+        }
+    }
     validate_terminal_cell_ptr_slice(
         desc.terminal_cells,
         "launch terminal_cells ptr/len mismatch",
@@ -1384,6 +1442,7 @@ pub unsafe fn validate_launch_desc(desc: &PieLaunchDesc) -> PieAbiValidationResu
     )?;
     validate_bool_field("launch has_user_mask must be 0 or 1", desc.has_user_mask)?;
     validate_reserved_bytes_zero("launch reserved_flags must be zero", &desc.reserved_flags)?;
+    validate_reserved_zero("step reserved0 must be zero", desc.reserved0)?;
     validate_u32_slice(desc.image_grids, "launch image_grids ptr/len mismatch")?;
     validate_u32_slice(
         desc.image_anchor_positions,
@@ -1425,14 +1484,6 @@ pub unsafe fn validate_launch_desc(desc: &PieLaunchDesc) -> PieAbiValidationResu
     validate_u32_slice(desc.kv_len, "launch kv_len ptr/len mismatch")?;
     validate_u64_slice(desc.kv_len_device, "launch kv_len_device ptr/len mismatch")?;
     validate_u32_slice(
-        desc.kv_translation,
-        "launch kv_translation ptr/len mismatch",
-    )?;
-    validate_u32_slice(
-        desc.kv_translation_indptr,
-        "launch kv_translation_indptr ptr/len mismatch",
-    )?;
-    validate_u32_slice(
         desc.ptir_program_row_indptr,
         "launch ptir_program_row_indptr ptr/len mismatch",
     )?;
@@ -1461,13 +1512,8 @@ pub unsafe fn validate_launch_desc(desc: &PieLaunchDesc) -> PieAbiValidationResu
         "launch channel_ticket_indptr ptr/len mismatch",
     )?;
 
-    let request_count = desc.instance_ids.len;
+    let request_count = desc.roster_rows.len;
     let wire_row_count = desc.qo_indptr.len.saturating_sub(1);
-    if desc.kv_translation.len != 0 && desc.kv_translation_indptr.len == 0 {
-        return Err(invalid_argument(
-            "launch kv_translation_indptr is required when translation values are present",
-        ));
-    }
     if desc.channel_expected_head.len != 0 && desc.channel_ticket_indptr.len == 0 {
         return Err(invalid_argument(
             "launch channel_ticket_indptr is required when ticket values are present",
@@ -1480,14 +1526,19 @@ pub unsafe fn validate_launch_desc(desc: &PieLaunchDesc) -> PieAbiValidationResu
         false,
     )?;
     if request_count != 0 {
-        let instance_ids =
-            unsafe { std::slice::from_raw_parts(desc.instance_ids.ptr, desc.instance_ids.len) };
+        let roster_rows =
+            unsafe { std::slice::from_raw_parts(desc.roster_rows.ptr, desc.roster_rows.len) };
         let terminal_cells =
             unsafe { std::slice::from_raw_parts(desc.terminal_cells.ptr, desc.terminal_cells.len) };
         for index in 0..request_count {
-            if instance_ids[..index].contains(&instance_ids[index]) {
+            if roster_rows[index] as usize >= roster_len {
                 return Err(invalid_argument(
-                    "launch instance_ids must not contain duplicates",
+                    "step roster_rows index exceeds the frame roster",
+                ));
+            }
+            if roster_rows[..index].contains(&roster_rows[index]) {
+                return Err(invalid_argument(
+                    "step roster_rows must not contain duplicates",
                 ));
             }
             if terminal_cells[..index].contains(&terminal_cells[index]) {
@@ -1557,13 +1608,6 @@ pub unsafe fn validate_launch_desc(desc: &PieLaunchDesc) -> PieAbiValidationResu
             "launch embed_indptr malformed",
             desc.embed_rows.len,
             desc.embed_dtypes.len,
-            true,
-        )?;
-        validate_csr(
-            desc.kv_translation_indptr,
-            "launch kv_translation_indptr malformed",
-            desc.kv_translation.len,
-            request_count,
             true,
         )?;
         validate_csr(
@@ -1783,6 +1827,81 @@ pub unsafe fn validate_launch_desc(desc: &PieLaunchDesc) -> PieAbiValidationResu
     Ok(())
 }
 
+/// Validates a frame descriptor: header, roster, frame-union translation
+/// table, then every step section against the roster (including the global
+/// distinct-terminal-cell invariant across steps).
+///
+/// # Safety
+///
+/// This walks foreign `indptr` slices across the frame and all step
+/// sections, so every non-null pointer/length pair must reference readable
+/// memory for the declared element count.
+pub unsafe fn validate_frame_desc(desc: &PieFrameDesc) -> PieAbiValidationResult {
+    validate_pie_abi_version(desc.abi_version)?;
+    validate_reserved_zero("frame reserved0 must be zero", desc.reserved0)?;
+    validate_reserved_zero("frame reserved1 must be zero", desc.reserved1)?;
+    validate_u64_slice(desc.instance_ids, "frame instance_ids ptr/len mismatch")?;
+    validate_u32_slice(
+        desc.kv_translation,
+        "frame kv_translation ptr/len mismatch",
+    )?;
+    validate_u32_slice(
+        desc.kv_translation_indptr,
+        "frame kv_translation_indptr ptr/len mismatch",
+    )?;
+    if desc.steps.ptr.is_null() != (desc.steps.len == 0) && desc.steps.len != 0 {
+        return Err(invalid_argument("frame steps ptr/len mismatch"));
+    }
+    if desc.steps.len == 0 || desc.steps.ptr.is_null() {
+        return Err(invalid_argument("frame must carry at least one step"));
+    }
+    let roster_len = desc.instance_ids.len;
+    if roster_len != 0 {
+        let instance_ids =
+            unsafe { std::slice::from_raw_parts(desc.instance_ids.ptr, desc.instance_ids.len) };
+        for index in 0..roster_len {
+            if instance_ids[..index].contains(&instance_ids[index]) {
+                return Err(invalid_argument(
+                    "frame instance_ids must not contain duplicates",
+                ));
+            }
+        }
+    }
+    if desc.kv_translation.len != 0 && desc.kv_translation_indptr.len == 0 {
+        return Err(invalid_argument(
+            "frame kv_translation_indptr is required when translation values are present",
+        ));
+    }
+    unsafe {
+        validate_csr(
+            desc.kv_translation_indptr,
+            "frame kv_translation_indptr malformed",
+            desc.kv_translation.len,
+            roster_len,
+            true,
+        )?;
+    }
+    let steps = unsafe { std::slice::from_raw_parts(desc.steps.ptr, desc.steps.len) };
+    let mut seen_terminals: Vec<*mut PieTerminalCell> = Vec::new();
+    for step in steps {
+        unsafe { validate_step_desc(step, roster_len)? };
+        if step.terminal_cells.len != 0 {
+            let cells = unsafe {
+                std::slice::from_raw_parts(step.terminal_cells.ptr, step.terminal_cells.len)
+            };
+            for &cell in cells {
+                if seen_terminals.contains(&cell) {
+                    return Err(invalid_argument(
+                        "frame terminal_cells must be distinct across steps",
+                    ));
+                }
+                seen_terminals.push(cell);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// # Safety
 /// All descriptor pointers must remain readable/writable for the declared lengths.
 pub unsafe fn validate_encode_desc(desc: &PieEncodeDesc) -> PieAbiValidationResult {
@@ -1943,23 +2062,6 @@ pub fn validate_pool_resize_desc(desc: &PiePoolResizeDesc) -> PieAbiValidationRe
     )
 }
 
-/// Validates a driver-owned launch-prepare result.
-pub fn validate_launch_prepare_result(result: &PieLaunchPrepareResult) -> PieAbiValidationResult {
-    validate_reserved_zero(
-        "launch prepare result reserved0 must be zero",
-        result.reserved0,
-    )?;
-    if result.outcome > PIE_LAUNCH_PREPARE_IMPOSSIBLE {
-        return Err(invalid_argument("launch prepare result outcome is invalid"));
-    }
-    if (result.outcome == PIE_LAUNCH_PREPARE_READY) != (result.lease_id != 0) {
-        return Err(invalid_argument(
-            "launch prepare result lease_id does not match outcome",
-        ));
-    }
-    Ok(())
-}
-
 /// Validates non-null out-parameters used by the native driver entrypoints.
 pub fn validate_create_out_params(caps: *mut PieDriverCaps) -> PieAbiValidationResult {
     validate_mut_ptr(caps, "driver create caps output pointer must be non-null")
@@ -1992,22 +2094,9 @@ unsafe extern "C" {
     ) -> i32;
     pub fn pie_cuda_launch(
         driver: *mut PieDriver,
-        launch: *const PieLaunchDesc,
+        frame: *const PieFrameDesc,
         completion: PieCompletion,
     ) -> i32;
-    pub fn pie_cuda_prepare_launch(
-        driver: *mut PieDriver,
-        launch: *const PieLaunchDesc,
-        result: *mut PieLaunchPrepareResult,
-    ) -> i32;
-    pub fn pie_cuda_launch_prepared(
-        driver: *mut PieDriver,
-        launch: *const PieLaunchDesc,
-        lease_id: u64,
-        completion: PieCompletion,
-    ) -> i32;
-    pub fn pie_cuda_release_launch(driver: *mut PieDriver, lease_id: u64) -> i32;
-    pub fn pie_cuda_flush_settlement(driver: *mut PieDriver) -> i32;
     pub fn pie_cuda_encode(
         driver: *mut PieDriver,
         encode: *const PieEncodeDesc,
@@ -2060,21 +2149,9 @@ unsafe extern "C" {
     ) -> i32;
     pub fn pie_metal_launch(
         driver: *mut PieDriver,
-        launch: *const PieLaunchDesc,
+        frame: *const PieFrameDesc,
         completion: PieCompletion,
     ) -> i32;
-    pub fn pie_metal_prepare_launch(
-        driver: *mut PieDriver,
-        launch: *const PieLaunchDesc,
-        result: *mut PieLaunchPrepareResult,
-    ) -> i32;
-    pub fn pie_metal_launch_prepared(
-        driver: *mut PieDriver,
-        launch: *const PieLaunchDesc,
-        lease_id: u64,
-        completion: PieCompletion,
-    ) -> i32;
-    pub fn pie_metal_release_launch(driver: *mut PieDriver, lease_id: u64) -> i32;
     pub fn pie_metal_encode(
         driver: *mut PieDriver,
         encode: *const PieEncodeDesc,
@@ -2103,6 +2180,10 @@ unsafe extern "C" {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Roster size used by step-validator tests: roster row indices in the
+    /// fixtures stay below this bound.
+    const ROSTER: usize = 128;
     use std::ptr::NonNull;
 
     fn committed_header() -> String {
@@ -2175,7 +2256,7 @@ mod tests {
             PieInstanceDesc::default().abi_version,
             PIE_DRIVER_ABI_VERSION
         );
-        assert_eq!(PieLaunchDesc::default().abi_version, PIE_DRIVER_ABI_VERSION);
+        assert_eq!(PieFrameDesc::default().abi_version, PIE_DRIVER_ABI_VERSION);
         assert_eq!(PieEncodeDesc::default().abi_version, PIE_DRIVER_ABI_VERSION);
         assert_eq!(PieKvCopyDesc::default().abi_version, PIE_DRIVER_ABI_VERSION);
         assert_eq!(
@@ -2199,9 +2280,11 @@ mod tests {
             PIE_GEOMETRY_CLASS_HOST
         );
         assert_eq!(PieInstanceDesc::default().reserved1, 0);
-        assert_eq!(PieLaunchDesc::default().settle_defer, 0);
         assert_eq!(PieEncodeDesc::default().reserved0, 0);
-        assert_eq!(PieLaunchDesc::default().reserved_flags, [0; 2]);
+        assert_eq!(PieStepDesc::default().reserved_flags, [0; 2]);
+        assert_eq!(PieStepDesc::default().reserved0, 0);
+        assert_eq!(PieFrameDesc::default().reserved0, 0);
+        assert_eq!(PieFrameDesc::default().reserved1, 0);
         assert_eq!(PieKvCopyDesc::default().reserved0, 0);
         assert_eq!(PieStateCopyDesc::default().reserved0, 0);
         assert_eq!(PiePoolResizeDesc::default().reserved0, 0);
@@ -2209,9 +2292,9 @@ mod tests {
 
     #[test]
     fn batch_launch_defaults_are_empty_borrowed_views() {
-        let launch = PieLaunchDesc::default();
-        assert!(launch.instance_ids.ptr.is_null());
-        assert_eq!(launch.instance_ids.len, 0);
+        let launch = PieStepDesc::default();
+        assert!(launch.roster_rows.ptr.is_null());
+        assert_eq!(launch.roster_rows.len, 0);
         assert!(launch.image_pixels.ptr.is_null());
         assert_eq!(launch.image_pixels.len, 0);
         assert_eq!(launch.single_token_mode, 0);
@@ -2338,7 +2421,7 @@ mod tests {
 
     #[test]
     fn launch_validator_rejects_duplicate_members_and_terminal_cells() {
-        let instance_ids = [7u64, 7];
+        let roster_rows = [7u32, 7];
         let mut terminal_cells = [
             PieTerminalCell {
                 outcome: PIE_TERMINAL_OUTCOME_PENDING,
@@ -2352,34 +2435,34 @@ mod tests {
         let terminal_ptrs = terminal_cells
             .each_mut()
             .map(|cell| cell as *mut PieTerminalCell);
-        let launch = PieLaunchDesc {
-            instance_ids: PieU64Slice {
-                ptr: instance_ids.as_ptr(),
-                len: instance_ids.len(),
+        let launch = PieStepDesc {
+            roster_rows: PieU32Slice {
+                ptr: roster_rows.as_ptr(),
+                len: roster_rows.len(),
             },
             terminal_cells: PieTerminalCellPtrSlice {
                 ptr: terminal_ptrs.as_ptr(),
                 len: terminal_ptrs.len(),
             },
-            ..PieLaunchDesc::default()
+            ..PieStepDesc::default()
         };
-        let err = unsafe { validate_launch_desc(&launch) }.unwrap_err();
-        assert!(err.message().contains("instance_ids"));
+        let err = unsafe { validate_step_desc(&launch, ROSTER) }.unwrap_err();
+        assert!(err.message().contains("roster_rows"));
 
-        let distinct_instance_ids = [7u64, 8];
+        let distinct_roster_rows = [7u32, 8];
         let duplicate_terminal_ptrs = [terminal_ptrs[0], terminal_ptrs[0]];
-        let launch = PieLaunchDesc {
-            instance_ids: PieU64Slice {
-                ptr: distinct_instance_ids.as_ptr(),
-                len: distinct_instance_ids.len(),
+        let launch = PieStepDesc {
+            roster_rows: PieU32Slice {
+                ptr: distinct_roster_rows.as_ptr(),
+                len: distinct_roster_rows.len(),
             },
             terminal_cells: PieTerminalCellPtrSlice {
                 ptr: duplicate_terminal_ptrs.as_ptr(),
                 len: duplicate_terminal_ptrs.len(),
             },
-            ..PieLaunchDesc::default()
+            ..PieStepDesc::default()
         };
-        let err = unsafe { validate_launch_desc(&launch) }.unwrap_err();
+        let err = unsafe { validate_step_desc(&launch, ROSTER) }.unwrap_err();
         assert!(err.message().contains("distinct"));
     }
 
@@ -2566,7 +2649,7 @@ mod tests {
 
     #[test]
     fn launch_validator_rejects_malformed_qo_indptr() {
-        let instance_ids = [11u64, 12];
+        let roster_rows = [11u32, 12];
         let mut terminal_cells = [PieTerminalCell::default(), PieTerminalCell::default()];
         let terminal_ptrs = terminal_cells
             .each_mut()
@@ -2574,10 +2657,10 @@ mod tests {
         let tokens = [1u32, 2, 3];
         let positions = [4u32, 5, 6];
         let qo_indptr = [0u32, 4];
-        let launch = PieLaunchDesc {
-            instance_ids: PieU64Slice {
-                ptr: instance_ids.as_ptr(),
-                len: instance_ids.len(),
+        let launch = PieStepDesc {
+            roster_rows: PieU32Slice {
+                ptr: roster_rows.as_ptr(),
+                len: roster_rows.len(),
             },
             terminal_cells: PieTerminalCellPtrSlice {
                 ptr: terminal_ptrs.as_ptr(),
@@ -2595,16 +2678,16 @@ mod tests {
                 ptr: qo_indptr.as_ptr(),
                 len: qo_indptr.len(),
             },
-            ..PieLaunchDesc::default()
+            ..PieStepDesc::default()
         };
-        let err = unsafe { validate_launch_desc(&launch) }.unwrap_err();
+        let err = unsafe { validate_step_desc(&launch, ROSTER) }.unwrap_err();
         assert_eq!(err.status(), PIE_STATUS_INVALID_ARGUMENT);
         assert!(err.message().contains("qo_indptr"));
     }
 
     #[test]
     fn launch_validator_rejects_malformed_mask_relationships() {
-        let instance_ids = [41u64];
+        let roster_rows = [41u32];
         let mut terminal_cells = [PieTerminalCell::default()];
         let terminal_ptrs = terminal_cells
             .each_mut()
@@ -2614,10 +2697,10 @@ mod tests {
         let qo_indptr = [0u32, 1];
         let mask_request_indptr = [1u32, 1];
         let mask_word_indptr = [0u32];
-        let launch = PieLaunchDesc {
-            instance_ids: PieU64Slice {
-                ptr: instance_ids.as_ptr(),
-                len: instance_ids.len(),
+        let launch = PieStepDesc {
+            roster_rows: PieU32Slice {
+                ptr: roster_rows.as_ptr(),
+                len: roster_rows.len(),
             },
             terminal_cells: PieTerminalCellPtrSlice {
                 ptr: terminal_ptrs.as_ptr(),
@@ -2646,16 +2729,16 @@ mod tests {
                 },
                 words: PieU32Slice::default(),
             },
-            ..PieLaunchDesc::default()
+            ..PieStepDesc::default()
         };
-        let err = unsafe { validate_launch_desc(&launch) }.unwrap_err();
+        let err = unsafe { validate_step_desc(&launch, ROSTER) }.unwrap_err();
         assert_eq!(err.status(), PIE_STATUS_INVALID_ARGUMENT);
         assert!(err.message().contains("masks.request_indptr"));
     }
 
     #[test]
     fn launch_validator_rejects_image_count_mismatches() {
-        let instance_ids = [51u64];
+        let roster_rows = [51u32];
         let mut terminal_cells = [PieTerminalCell::default()];
         let terminal_ptrs = terminal_cells
             .each_mut()
@@ -2666,10 +2749,10 @@ mod tests {
         let image_indptr = [0u32, 1];
         let image_grids = [1u32, 2, 3];
         let image_anchor_positions = [7u32];
-        let launch = PieLaunchDesc {
-            instance_ids: PieU64Slice {
-                ptr: instance_ids.as_ptr(),
-                len: instance_ids.len(),
+        let launch = PieStepDesc {
+            roster_rows: PieU32Slice {
+                ptr: roster_rows.as_ptr(),
+                len: roster_rows.len(),
             },
             terminal_cells: PieTerminalCellPtrSlice {
                 ptr: terminal_ptrs.as_ptr(),
@@ -2699,27 +2782,27 @@ mod tests {
                 ptr: image_anchor_positions.as_ptr(),
                 len: image_anchor_positions.len(),
             },
-            ..PieLaunchDesc::default()
+            ..PieStepDesc::default()
         };
-        let err = unsafe { validate_launch_desc(&launch) }.unwrap_err();
+        let err = unsafe { validate_step_desc(&launch, ROSTER) }.unwrap_err();
         assert_eq!(err.status(), PIE_STATUS_INVALID_ARGUMENT);
         assert!(err.message().contains("image_anchor_rows"));
     }
 
     #[test]
     fn launch_validator_rejects_invalid_boolean_flags() {
-        let launch = PieLaunchDesc {
+        let launch = PieStepDesc {
             single_token_mode: 2,
-            ..PieLaunchDesc::default()
+            ..PieStepDesc::default()
         };
-        let err = unsafe { validate_launch_desc(&launch) }.unwrap_err();
+        let err = unsafe { validate_step_desc(&launch, ROSTER) }.unwrap_err();
         assert_eq!(err.status(), PIE_STATUS_INVALID_ARGUMENT);
         assert!(err.message().contains("single_token_mode"));
     }
 
     #[test]
     fn launch_validator_accepts_resolved_request_rs_vectors() {
-        let instance_ids = [71u64];
+        let roster_rows = [71u32];
         let mut terminal = PieTerminalCell::default();
         let terminal_cells = [&mut terminal as *mut PieTerminalCell];
         let token_ids = [10u32, 11];
@@ -2728,10 +2811,10 @@ mod tests {
         let program_row_indptr = [0u32, 2];
         let rs_slot_ids = [3u32, 4];
         let rs_slot_flags = [PIE_RS_FLAG_RESET, 0];
-        let launch = PieLaunchDesc {
-            instance_ids: PieU64Slice {
-                ptr: instance_ids.as_ptr(),
-                len: instance_ids.len(),
+        let launch = PieStepDesc {
+            roster_rows: PieU32Slice {
+                ptr: roster_rows.as_ptr(),
+                len: roster_rows.len(),
             },
             terminal_cells: PieTerminalCellPtrSlice {
                 ptr: terminal_cells.as_ptr(),
@@ -2761,11 +2844,11 @@ mod tests {
                 ptr: rs_slot_flags.as_ptr(),
                 len: rs_slot_flags.len(),
             },
-            ..PieLaunchDesc::default()
+            ..PieStepDesc::default()
         };
-        unsafe { validate_launch_desc(&launch) }.unwrap();
+        unsafe { validate_step_desc(&launch, ROSTER) }.unwrap();
 
-        let mismatched_flags = PieLaunchDesc {
+        let mismatched_flags = PieStepDesc {
             rs_slot_flags: PieU8Slice {
                 ptr: rs_slot_flags.as_ptr(),
                 len: 1,
@@ -2773,14 +2856,14 @@ mod tests {
             ..launch
         };
         assert!(
-            unsafe { validate_launch_desc(&mismatched_flags) }
+            unsafe { validate_step_desc(&mismatched_flags, ROSTER) }
                 .unwrap_err()
                 .message()
                 .contains("lengths must match")
         );
 
         let fold_lens = [0u32, 0, 0];
-        let mismatched_fold = PieLaunchDesc {
+        let mismatched_fold = PieStepDesc {
             rs_fold_lens: PieU32Slice {
                 ptr: fold_lens.as_ptr(),
                 len: fold_lens.len(),
@@ -2788,7 +2871,7 @@ mod tests {
             ..launch
         };
         assert!(
-            unsafe { validate_launch_desc(&mismatched_fold) }
+            unsafe { validate_step_desc(&mismatched_fold, ROSTER) }
                 .unwrap_err()
                 .message()
                 .contains("rs_fold_lens")
@@ -2796,7 +2879,7 @@ mod tests {
 
         let one_slot = [3u32];
         let one_flag = [0u8];
-        let wrong_resolved_count = PieLaunchDesc {
+        let wrong_resolved_count = PieStepDesc {
             rs_slot_ids: PieU32Slice {
                 ptr: one_slot.as_ptr(),
                 len: one_slot.len(),
@@ -2808,7 +2891,7 @@ mod tests {
             ..launch
         };
         assert!(
-            unsafe { validate_launch_desc(&wrong_resolved_count) }
+            unsafe { validate_step_desc(&wrong_resolved_count, ROSTER) }
                 .unwrap_err()
                 .message()
                 .contains("resolved qo rows")
@@ -2816,21 +2899,67 @@ mod tests {
     }
 
     #[test]
-    fn launch_validator_rejects_malformed_ticket_and_translation_csr() {
+    fn frame_validator_rejects_missing_steps_dup_roster_and_translation_csr() {
+        let step = PieStepDesc::default();
+        let steps = PieStepDescSlice {
+            ptr: &step,
+            len: 1,
+        };
+
+        let empty = PieFrameDesc::default();
+        let err = unsafe { validate_frame_desc(&empty) }.unwrap_err();
+        assert!(err.message().contains("at least one step"));
+
+        let dup_ids = [7u64, 7];
+        let dup_roster = PieFrameDesc {
+            instance_ids: PieU64Slice {
+                ptr: dup_ids.as_ptr(),
+                len: dup_ids.len(),
+            },
+            steps,
+            ..PieFrameDesc::default()
+        };
+        let err = unsafe { validate_frame_desc(&dup_roster) }.unwrap_err();
+        assert!(err.message().contains("duplicates"));
+
         let translation = [7u32];
-        let launch = PieLaunchDesc {
+        let frame = PieFrameDesc {
             kv_translation: PieU32Slice {
                 ptr: translation.as_ptr(),
                 len: translation.len(),
             },
-            ..PieLaunchDesc::default()
+            steps,
+            ..PieFrameDesc::default()
         };
-        let err = unsafe { validate_launch_desc(&launch) }.unwrap_err();
+        let err = unsafe { validate_frame_desc(&frame) }.unwrap_err();
         assert!(err.message().contains("kv_translation_indptr"));
 
+        let ids = [7u64];
+        let indptr = [0u32, 1];
+        let ok = PieFrameDesc {
+            instance_ids: PieU64Slice {
+                ptr: ids.as_ptr(),
+                len: ids.len(),
+            },
+            kv_translation: PieU32Slice {
+                ptr: translation.as_ptr(),
+                len: translation.len(),
+            },
+            kv_translation_indptr: PieU32Slice {
+                ptr: indptr.as_ptr(),
+                len: indptr.len(),
+            },
+            steps,
+            ..PieFrameDesc::default()
+        };
+        unsafe { validate_frame_desc(&ok) }.unwrap();
+    }
+
+    #[test]
+    fn launch_validator_rejects_malformed_ticket_csr() {
         let heads = [0u64];
         let ticket_indptr = [0u32, 1];
-        let launch = PieLaunchDesc {
+        let launch = PieStepDesc {
             channel_expected_head: PieU64Slice {
                 ptr: heads.as_ptr(),
                 len: heads.len(),
@@ -2839,23 +2968,23 @@ mod tests {
                 ptr: ticket_indptr.as_ptr(),
                 len: ticket_indptr.len(),
             },
-            ..PieLaunchDesc::default()
+            ..PieStepDesc::default()
         };
-        let err = unsafe { validate_launch_desc(&launch) }.unwrap_err();
+        let err = unsafe { validate_step_desc(&launch, ROSTER) }.unwrap_err();
         assert!(
             err.message().contains("channel_ticket_indptr") || err.message().contains("head/tail")
         );
 
-        let instance_ids = [1u64];
+        let roster_rows = [1u32];
         let mut terminal = PieTerminalCell::default();
         let terminal_cells = [&mut terminal as *mut PieTerminalCell];
         let heads = [0u64, 1];
         let tails = [0u64, 1];
         let undercovered = [0u32, 1];
-        let launch = PieLaunchDesc {
-            instance_ids: PieU64Slice {
-                ptr: instance_ids.as_ptr(),
-                len: instance_ids.len(),
+        let launch = PieStepDesc {
+            roster_rows: PieU32Slice {
+                ptr: roster_rows.as_ptr(),
+                len: roster_rows.len(),
             },
             terminal_cells: PieTerminalCellPtrSlice {
                 ptr: terminal_cells.as_ptr(),
@@ -2873,9 +3002,9 @@ mod tests {
                 ptr: undercovered.as_ptr(),
                 len: undercovered.len(),
             },
-            ..PieLaunchDesc::default()
+            ..PieStepDesc::default()
         };
-        let err = unsafe { validate_launch_desc(&launch) }.unwrap_err();
+        let err = unsafe { validate_step_desc(&launch, ROSTER) }.unwrap_err();
         assert!(err.message().contains("cover every ticket"));
     }
 
@@ -2913,7 +3042,8 @@ mod tests {
         let binding = header_block(&header, "PieInstanceBinding");
         let terminal_cell = header_block(&header, "PieTerminalCell");
         let terminal_cell_ptr_slice = header_block(&header, "PieTerminalCellPtrSlice");
-        let launch = header_block(&header, "PieLaunchDesc");
+        let launch = header_block(&header, "PieStepDesc");
+        let frame = header_block(&header, "PieFrameDesc");
         let encode = header_block(&header, "PieEncodeDesc");
         let completion = header_block(&header, "PieCompletion");
         let kv_copy = header_block(&header, "PieKvCopyDesc");
@@ -2924,7 +3054,9 @@ mod tests {
         assert!(terminal_cell.contains("PieTerminalOutcome outcome;"));
         assert!(terminal_cell.contains("uint32_t reserved0;"));
         assert!(terminal_cell_ptr_slice.contains("struct PieTerminalCell *const *ptr;"));
-        assert!(launch.contains("struct PieU64Slice instance_ids;"));
+        assert!(launch.contains("struct PieU32Slice roster_rows;"));
+        assert!(launch.contains("struct PieU32Slice sub_batch_indptr;"));
+        assert!(launch.contains("struct PieU32Slice sub_batch_class;"));
         assert!(launch.contains("struct PieTerminalCellPtrSlice terminal_cells;"));
         assert!(
             !launch.contains("host_put"),
@@ -2933,7 +3065,10 @@ mod tests {
         assert!(completion.contains("struct PieTerminalCell *terminal_cell;"));
         assert!(launch.contains("uint32_t reserved0;"));
         assert!(launch.contains("uint8_t reserved_flags[2];"));
-        assert!(launch.contains("uint32_t required_kv_pages;"));
+        assert!(frame.contains("struct PieU64Slice instance_ids;"));
+        assert!(frame.contains("struct PieU32Slice kv_translation;"));
+        assert!(frame.contains("uint32_t required_kv_pages;"));
+        assert!(frame.contains("struct PieStepDescSlice steps;"));
         assert!(runtime.contains("uint32_t reserved0;"));
         assert!(runtime.contains("PieRuntimeNotifyFn notify;"));
         assert!(create.contains("uint32_t reserved0;"));

@@ -304,17 +304,17 @@ inline int validate_masks(const PieMaskWordsDesc& masks,
     return validate_csr(masks.word_indptr, masks.words.len, row_count);
 }
 
-inline int validate_launch_desc(const PieLaunchDesc* desc) noexcept {
+inline int validate_step_desc(const PieStepDesc* desc,
+                              std::size_t roster_len) noexcept {
     if (desc == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
-    int status = validate_version(desc->abi_version);
-    if (status != PIE_STATUS_OK) return status;
-    if (desc->settle_defer > 1 || desc->single_token_mode > 1 ||
-        desc->has_user_mask > 1) {
+    int status = PIE_STATUS_OK;
+    if (desc->single_token_mode > 1 || desc->has_user_mask > 1) {
         return PIE_STATUS_INVALID_ARGUMENT;
     }
     for (std::uint8_t value : desc->reserved_flags) {
         if (value != 0) return PIE_STATUS_INVALID_ARGUMENT;
     }
+    if (desc->reserved0 != 0) return PIE_STATUS_INVALID_ARGUMENT;
 
 #define PIE_VALIDATE_SLICE(field)                                              \
     do {                                                                       \
@@ -322,7 +322,14 @@ inline int validate_launch_desc(const PieLaunchDesc* desc) noexcept {
         if (status != PIE_STATUS_OK) return status;                            \
     } while (false)
 
-    PIE_VALIDATE_SLICE(instance_ids);
+    PIE_VALIDATE_SLICE(roster_rows);
+    PIE_VALIDATE_SLICE(sub_batch_indptr);
+    PIE_VALIDATE_SLICE(sub_batch_class);
+    for (std::size_t i = 0; i < desc->roster_rows.len; ++i) {
+        if (static_cast<std::size_t>(desc->roster_rows.ptr[i]) >= roster_len) {
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
+    }
     status = validate_terminal_cells(desc->terminal_cells);
     if (status != PIE_STATUS_OK) return status;
     PIE_VALIDATE_SLICE(token_ids);
@@ -357,8 +364,6 @@ inline int validate_launch_desc(const PieLaunchDesc* desc) noexcept {
     PIE_VALIDATE_SLICE(embed_block_indptr);
     PIE_VALIDATE_SLICE(kv_len);
     PIE_VALIDATE_SLICE(kv_len_device);
-    PIE_VALIDATE_SLICE(kv_translation);
-    PIE_VALIDATE_SLICE(kv_translation_indptr);
     PIE_VALIDATE_SLICE(ptir_program_row_indptr);
     PIE_VALIDATE_SLICE(ptir_kv_write_lower_bounds);
     PIE_VALIDATE_SLICE(ptir_kv_write_upper_bounds);
@@ -374,7 +379,7 @@ inline int validate_launch_desc(const PieLaunchDesc* desc) noexcept {
     if (status != PIE_STATUS_OK) return status;
     status = validate_bytes(desc->embed_rows);
     if (status != PIE_STATUS_OK) return status;
-    const std::size_t instance_count = desc->instance_ids.len;
+    const std::size_t instance_count = desc->roster_rows.len;
     const std::size_t wire_row_count =
         desc->qo_indptr.len == 0 ? 0 : desc->qo_indptr.len - 1;
     status = validate_masks(desc->masks, wire_row_count);
@@ -382,7 +387,7 @@ inline int validate_launch_desc(const PieLaunchDesc* desc) noexcept {
     const std::size_t max_int =
         static_cast<std::size_t>(std::numeric_limits<int>::max());
     for (std::size_t len : {
-             desc->instance_ids.len,
+             desc->roster_rows.len,
              desc->token_ids.len,
              desc->position_ids.len,
              desc->kv_page_indices.len,
@@ -421,8 +426,6 @@ inline int validate_launch_desc(const PieLaunchDesc* desc) noexcept {
              desc->embed_block_indptr.len,
              desc->kv_len.len,
              desc->kv_len_device.len,
-            desc->kv_translation.len,
-            desc->kv_translation_indptr.len,
             desc->ptir_program_row_indptr.len,
             desc->ptir_kv_write_lower_bounds.len,
             desc->ptir_kv_write_upper_bounds.len,
@@ -455,11 +458,6 @@ inline int validate_launch_desc(const PieLaunchDesc* desc) noexcept {
     if (status != PIE_STATUS_OK) return status;
     status = validate_csr(
         desc->embed_block_indptr, desc->embed_dtypes.len, wire_row_count);
-    if (status != PIE_STATUS_OK) return status;
-    status = validate_csr(
-        desc->kv_translation_indptr,
-        desc->kv_translation.len,
-        instance_count);
     if (status != PIE_STATUS_OK) return status;
     status = validate_csr(
         desc->channel_ticket_indptr,
@@ -496,7 +494,7 @@ inline int validate_launch_desc(const PieLaunchDesc* desc) noexcept {
     }
     for (std::size_t i = 0; i < instance_count; ++i) {
         for (std::size_t j = 0; j < i; ++j) {
-            if (desc->instance_ids.ptr[i] == desc->instance_ids.ptr[j]) {
+            if (desc->roster_rows.ptr[i] == desc->roster_rows.ptr[j]) {
                 return PIE_STATUS_INVALID_ARGUMENT;
             }
         }
@@ -656,6 +654,47 @@ inline int validate_launch_desc(const PieLaunchDesc* desc) noexcept {
         desc->audio_features.len,
         audio_count);
     if (status != PIE_STATUS_OK) return status;
+    return PIE_STATUS_OK;
+}
+
+inline int validate_frame_desc(const PieFrameDesc* desc) noexcept {
+    if (desc == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
+    int status = validate_version(desc->abi_version);
+    if (status != PIE_STATUS_OK) return status;
+    if (desc->reserved0 != 0 || desc->reserved1 != 0) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    status = validate_slice(desc->instance_ids.ptr, desc->instance_ids.len);
+    if (status != PIE_STATUS_OK) return status;
+    status = validate_slice(desc->kv_translation.ptr, desc->kv_translation.len);
+    if (status != PIE_STATUS_OK) return status;
+    status = validate_slice(
+        desc->kv_translation_indptr.ptr, desc->kv_translation_indptr.len);
+    if (status != PIE_STATUS_OK) return status;
+    status = validate_slice(desc->steps.ptr, desc->steps.len);
+    if (status != PIE_STATUS_OK) return status;
+    if (desc->steps.len == 0 || desc->steps.ptr == nullptr) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    const std::size_t roster_len = desc->instance_ids.len;
+    for (std::size_t i = 0; i < roster_len; ++i) {
+        for (std::size_t j = 0; j < i; ++j) {
+            if (desc->instance_ids.ptr[i] == desc->instance_ids.ptr[j]) {
+                return PIE_STATUS_INVALID_ARGUMENT;
+            }
+        }
+    }
+    if (desc->kv_translation.len != 0 &&
+        desc->kv_translation_indptr.len == 0) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    status = validate_csr(
+        desc->kv_translation_indptr, desc->kv_translation.len, roster_len);
+    if (status != PIE_STATUS_OK) return status;
+    for (std::size_t i = 0; i < desc->steps.len; ++i) {
+        status = validate_step_desc(&desc->steps.ptr[i], roster_len);
+        if (status != PIE_STATUS_OK) return status;
+    }
     return PIE_STATUS_OK;
 }
 

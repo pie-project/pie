@@ -15,7 +15,7 @@
 using pie_create_fn = PieDriver *(*)(const PieDriverCreateDesc *, PieDriverCaps *);
 using pie_register_program_fn = int32_t (*)(PieDriver *, const PieProgramDesc *, uint64_t *);
 using pie_bind_instance_fn = int32_t (*)(PieDriver *, const PieInstanceDesc *, PieInstanceBinding *);
-using pie_launch_fn = int32_t (*)(PieDriver *, const PieLaunchDesc *, PieCompletion);
+using pie_launch_fn = int32_t (*)(PieDriver *, const PieFrameDesc *, PieCompletion);
 using pie_copy_kv_fn = int32_t (*)(PieDriver *, const PieKvCopyDesc *, PieCompletion);
 using pie_copy_state_fn = int32_t (*)(PieDriver *, const PieStateCopyDesc *, PieCompletion);
 using pie_resize_pool_fn = int32_t (*)(PieDriver *, const PiePoolResizeDesc *, PieCompletion);

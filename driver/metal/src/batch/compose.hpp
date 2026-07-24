@@ -6,6 +6,7 @@
 #include <vector>
 
 #include <pie_driver_abi.h>
+#include <pie_native/step_launch.hpp>
 
 #include "batch/forward.hpp"
 #include "pie_native/launch_view.hpp"
@@ -57,7 +58,7 @@ struct OwnedLaunchView {
     std::uint32_t required_kv_pages = 0;
     bool has_user_mask = false;
 
-    static OwnedLaunchView capture(const PieLaunchDesc& launch);
+    static OwnedLaunchView capture(const pie_native::StepLaunch& launch);
     pie_native::LaunchView view() const;
 };
 
@@ -69,7 +70,7 @@ struct LaunchJobData {
     std::uint64_t lease_id = 0;
 };
 
-pie_native::LaunchView build_launch_view(const PieLaunchDesc& launch);
+pie_native::LaunchView build_launch_view(const pie_native::StepLaunch& launch);
 
 bool build_member_forward_desc(
     const pie_native::LaunchView& view,

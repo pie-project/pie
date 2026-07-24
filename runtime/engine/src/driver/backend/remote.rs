@@ -17,7 +17,8 @@ use crate::driver::command::{
 };
 use crate::driver::completion::{CompletionBroker, SubmissionCompletion};
 use crate::driver::instance::{BoundInstance, InstanceBindingPlan};
-use crate::driver::submission::LaunchSubmission;
+use crate::driver::FrameLaunchOutcome;
+use crate::driver::submission::FrameSubmission;
 
 const RPC_DEADLINE: Duration = Duration::from_secs(300);
 
@@ -403,37 +404,60 @@ impl RemoteDriver {
         ))
     }
 
-    pub fn launch(&mut self, desc: &LaunchSubmission) -> Result<SubmissionCompletion> {
+    /// Edge adapter (single scheduler path, ABI v14): decompose the sealed
+    /// frame into one `RemoteLaunch` per step — the executor serializes
+    /// launches that share instances, exactly like today's run-ahead waves —
+    /// and fold the per-step RPC completions into the frame's single
+    /// completion. Each step ships the frame-union page translation (a
+    /// superset of the step's frontier; write bounds still guard writes).
+    pub fn launch(&mut self, frame: &FrameSubmission) -> Result<FrameLaunchOutcome> {
         self.ensure_connected()?;
-        let remote_instances = self.translate_instances(&desc.instance_ids)?;
-        let terminal_count = u32::try_from(desc.terminal_cells.len())
-            .context("remote launch terminal count exceeds u32")?;
-        ensure!(
-            desc.terminal_cells.iter().all(|cell| !cell.is_null()),
-            "remote launch contains a null terminal cell"
-        );
-        let request = ExecutorRequest::Launch(RemoteLaunch {
-            plan: desc.plan.clone(),
-            instance_ids: remote_instances,
-            terminal_count,
-            kv_translation: desc.kv_translation.clone(),
-            kv_translation_indptr: desc.kv_translation_indptr.clone(),
-            program_row_indptr: desc.program_row_indptr.clone(),
-            logical_fire_ids: desc.logical_fire_ids.clone(),
-            channel_expected_head: desc.channel_expected_head.clone(),
-            channel_expected_tail: desc.channel_expected_tail.clone(),
-            channel_ticket_indptr: desc.channel_ticket_indptr.clone(),
-        });
-        let completion = self.broker.launch_completion(1).1;
-        self.spawn_launch_rpc(
-            request,
-            desc.terminal_cells
+        let mut step_completions = Vec::with_capacity(frame.steps.len());
+        for step in &frame.steps {
+            let step_instance_ids: Vec<u64> = step
+                .roster_rows
                 .iter()
-                .map(|cell| *cell as usize)
-                .collect(),
-            completion.clone(),
-        );
-        Ok(completion)
+                .map(|&row| {
+                    frame
+                        .instance_ids
+                        .get(row as usize)
+                        .copied()
+                        .ok_or_else(|| anyhow!("step roster row {row} exceeds the frame roster"))
+                })
+                .collect::<Result<_>>()?;
+            let remote_instances = self.translate_instances(&step_instance_ids)?;
+            let terminal_count = u32::try_from(step.terminal_cells.len())
+                .context("remote launch terminal count exceeds u32")?;
+            ensure!(
+                step.terminal_cells.iter().all(|cell| !cell.is_null()),
+                "remote launch contains a null terminal cell"
+            );
+            let request = ExecutorRequest::Launch(RemoteLaunch {
+                plan: step.plan.clone(),
+                instance_ids: remote_instances,
+                terminal_count,
+                kv_translation: frame.kv_translation.clone(),
+                kv_translation_indptr: frame.kv_translation_indptr.clone(),
+                program_row_indptr: step.program_row_indptr.clone(),
+                logical_fire_ids: step.logical_fire_ids.clone(),
+                channel_expected_head: step.channel_expected_head.clone(),
+                channel_expected_tail: step.channel_expected_tail.clone(),
+                channel_ticket_indptr: step.channel_ticket_indptr.clone(),
+            });
+            let completion = self.broker.launch_completion(1).1;
+            self.spawn_launch_rpc(
+                request,
+                step.terminal_cells
+                    .iter()
+                    .map(|cell| *cell as usize)
+                    .collect(),
+                completion.clone(),
+            );
+            step_completions.push(completion);
+        }
+        Ok(FrameLaunchOutcome::Launched(SubmissionCompletion::all(
+            step_completions,
+        )))
     }
 
     pub fn encode(&mut self, _plan: &mut MediaEncodePlan) -> Result<SubmissionCompletion> {

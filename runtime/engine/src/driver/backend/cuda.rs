@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 
 use crate::driver::abi::{
-    ChannelDescBorrow, EncodeDescBorrow, InstanceDescBorrow, KvCopyDescBorrow, LaunchDescBorrow,
+    ChannelDescBorrow, EncodeDescBorrow, FrameDescBorrow, InstanceDescBorrow, KvCopyDescBorrow,
     PoolResizeDescBorrow, ProgramDescBorrow, StateCopyDescBorrow,
 };
 use crate::driver::channel::RegisteredChannel;
@@ -11,16 +11,15 @@ use crate::driver::command::{
 };
 use crate::driver::completion::{CompletionBroker, SubmissionCompletion};
 use crate::driver::instance::{BoundInstance, InstanceBindingPlan};
-use crate::driver::submission::LaunchSubmission;
-use crate::driver::{LaunchLease, LaunchPrepareOutcome};
+use crate::driver::submission::FrameSubmission;
+use crate::driver::FrameLaunchOutcome;
 use pie_driver_abi::{
     PieBytes, PieChannelEndpointBinding, PieDriver, PieDriverCaps, PieDriverCreateDesc,
-    PieLaunchPrepareResult, PieModelLoadDesc, pie_cuda_bind_instance, pie_cuda_close_channel,
+    PieModelLoadDesc, pie_cuda_bind_instance, pie_cuda_close_channel,
     pie_cuda_close_instance, pie_cuda_copy_kv, pie_cuda_copy_state, pie_cuda_create,
-    pie_cuda_destroy, pie_cuda_encode, pie_cuda_flush_settlement, pie_cuda_launch,
-    pie_cuda_launch_prepared,
-    pie_cuda_load_model, pie_cuda_prepare_launch, pie_cuda_register_channel,
-    pie_cuda_register_program, pie_cuda_release_launch, pie_cuda_resize_pool,
+    pie_cuda_destroy, pie_cuda_encode, pie_cuda_launch,
+    pie_cuda_load_model, pie_cuda_register_channel,
+    pie_cuda_register_program, pie_cuda_resize_pool,
 };
 
 struct CudaDriverHandle {
@@ -144,72 +143,19 @@ impl CudaDriverHandle {
         ))
     }
 
-    fn launch(&mut self, plan: &LaunchSubmission) -> Result<SubmissionCompletion> {
+    fn launch(&mut self, frame: &FrameSubmission) -> Result<FrameLaunchOutcome> {
         let target_epoch = 1;
         let (raw, completion) = self.broker.launch_completion(target_epoch);
-        let borrowed = LaunchDescBorrow::from_submission(plan);
-        sync_status(
-            unsafe { pie_cuda_launch(self.driver, borrowed.as_raw(), raw) },
-            "pie_cuda_launch",
-        )?;
-        Ok(completion)
-    }
-
-    fn prepare_launch(&mut self, plan: &LaunchSubmission) -> Result<LaunchPrepareOutcome> {
-        let borrowed = LaunchDescBorrow::from_submission(plan);
-        let mut result = PieLaunchPrepareResult::default();
-        let status =
-            unsafe { pie_cuda_prepare_launch(self.driver, borrowed.as_raw(), &mut result) };
-        if status == pie_driver_abi::PIE_STATUS_UNSUPPORTED {
-            return Ok(LaunchPrepareOutcome::Unsupported);
-        }
-        sync_status(status, "pie_cuda_prepare_launch")?;
-        pie_driver_abi::validate_launch_prepare_result(&result).map_err(|error| anyhow!(error))?;
-        match result.outcome {
-            pie_driver_abi::PIE_LAUNCH_PREPARE_READY => {
-                Ok(LaunchPrepareOutcome::Prepared(LaunchLease {
-                    id: result.lease_id,
-                }))
+        let borrowed = FrameDescBorrow::from_submission(frame);
+        let status = unsafe { pie_cuda_launch(self.driver, borrowed.as_raw(), raw) };
+        match status {
+            pie_driver_abi::PIE_STATUS_EXHAUSTED => Ok(FrameLaunchOutcome::Exhausted),
+            pie_driver_abi::PIE_STATUS_IMPOSSIBLE => Ok(FrameLaunchOutcome::Impossible),
+            status => {
+                sync_status(status, "pie_cuda_launch")?;
+                Ok(FrameLaunchOutcome::Launched(completion))
             }
-            pie_driver_abi::PIE_LAUNCH_PREPARE_EXHAUSTED => Ok(LaunchPrepareOutcome::Exhausted {
-                budget_generation: result.budget_generation,
-                required_pages: result.required_pages,
-                budget_pages: result.budget_pages,
-            }),
-            pie_driver_abi::PIE_LAUNCH_PREPARE_IMPOSSIBLE => Ok(LaunchPrepareOutcome::Impossible {
-                required_pages: result.required_pages,
-                budget_pages: result.budget_pages,
-            }),
-            _ => unreachable!("prepare result validator checked outcome"),
         }
-    }
-
-    fn launch_prepared(
-        &mut self,
-        plan: &LaunchSubmission,
-        lease: LaunchLease,
-    ) -> Result<SubmissionCompletion> {
-        let (raw, completion) = self.broker.launch_completion(1);
-        let borrowed = LaunchDescBorrow::from_submission(plan);
-        sync_status(
-            unsafe { pie_cuda_launch_prepared(self.driver, borrowed.as_raw(), lease.id, raw) },
-            "pie_cuda_launch_prepared",
-        )?;
-        Ok(completion)
-    }
-
-    fn release_launch(&mut self, lease: LaunchLease) -> Result<()> {
-        sync_status(
-            unsafe { pie_cuda_release_launch(self.driver, lease.id) },
-            "pie_cuda_release_launch",
-        )
-    }
-
-    fn flush_settlement(&mut self) -> Result<()> {
-        sync_status(
-            unsafe { pie_cuda_flush_settlement(self.driver) },
-            "pie_cuda_flush_settlement",
-        )
     }
 
     fn encode(&mut self, plan: &mut MediaEncodePlan) -> Result<SubmissionCompletion> {
@@ -428,49 +374,8 @@ impl CudaDriver {
         self.leader.bind_instance(plan)
     }
 
-    pub fn launch(&mut self, plan: &LaunchSubmission) -> Result<SubmissionCompletion> {
-        self.leader.launch(plan)
-    }
-
-    pub fn supports_elastic_admission(&self) -> bool {
-        self.followers.is_empty()
-            && match std::env::var("PIE_CUDA_DISABLE_UPFRONT_GRAPHS") {
-                Ok(value) => value.is_empty() || value == "0",
-                Err(_) => true,
-            }
-    }
-
-    pub fn prepare_launch(&mut self, plan: &LaunchSubmission) -> Result<LaunchPrepareOutcome> {
-        if !self.supports_elastic_admission() {
-            return Ok(LaunchPrepareOutcome::Unsupported);
-        }
-        self.leader.prepare_launch(plan)
-    }
-
-    pub fn launch_prepared(
-        &mut self,
-        plan: &LaunchSubmission,
-        lease: LaunchLease,
-    ) -> Result<SubmissionCompletion> {
-        if !self.supports_elastic_admission() {
-            return Err(anyhow!(
-                "elastic launch admission is unsupported for tensor-parallel CUDA"
-            ));
-        }
-        self.leader.launch_prepared(plan, lease)
-    }
-
-    pub fn release_launch(&mut self, lease: LaunchLease) -> Result<()> {
-        if !self.supports_elastic_admission() {
-            return Err(anyhow!(
-                "elastic launch admission is unsupported for tensor-parallel CUDA"
-            ));
-        }
-        self.leader.release_launch(lease)
-    }
-
-    pub fn flush_settlement(&mut self) -> Result<()> {
-        self.leader.flush_settlement()
+    pub fn launch(&mut self, frame: &FrameSubmission) -> Result<FrameLaunchOutcome> {
+        self.leader.launch(frame)
     }
 
     pub fn encode(&mut self, plan: &mut MediaEncodePlan) -> Result<SubmissionCompletion> {

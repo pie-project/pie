@@ -20,6 +20,23 @@ bool expect(bool condition, const char* message) {
     return condition;
 }
 
+// v14: the launch entry takes a sealed frame; validator tests wrap one step
+// in a fixed-roster frame.
+constexpr std::size_t kTestRosterLen = 16;
+const std::uint32_t kRosterRows[] = {0, 1, 2, 3, 4, 5, 6, 7};
+const std::uint64_t kRosterIds[] = {
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+
+int launch_step(PieDriver* driver,
+                const PieStepDesc& step,
+                PieCompletion completion) {
+    PieFrameDesc frame{};
+    frame.abi_version = PIE_DRIVER_ABI_VERSION;
+    frame.instance_ids = {.ptr = kRosterIds, .len = kTestRosterLen};
+    frame.steps = {.ptr = &step, .len = 1};
+    return pie_cuda_launch(driver, &frame, completion);
+}
+
 }  // namespace
 
 int main() {
@@ -103,16 +120,14 @@ int main() {
                 "bind rejects nested seed bytes")) return 1;
 
     const PieCompletion completion{.wait_id = 9, .target_epoch = 2};
-    PieLaunchDesc launch{};
-    launch.abi_version = PIE_DRIVER_ABI_VERSION;
+    PieStepDesc launch{};
     launch.single_token_mode = 2;
-    if (!expect(pie_cuda_launch(driver, &launch, completion) ==
+    if (!expect(launch_step(driver, launch, completion) ==
                     PIE_STATUS_INVALID_ARGUMENT,
                 "launch rejects invalid bool")) return 1;
     launch = {};
-    launch.abi_version = PIE_DRIVER_ABI_VERSION;
     launch.reserved_flags[0] = 1;
-    if (!expect(pie_cuda_launch(driver, &launch, completion) ==
+    if (!expect(launch_step(driver, launch, completion) ==
                     PIE_STATUS_INVALID_ARGUMENT,
                 "launch rejects reserved flags")) return 1;
     const std::uint64_t instance_id = 1;
@@ -120,44 +135,40 @@ int main() {
     const std::uint32_t position = 0;
     const std::uint32_t bad_qo_indptr[] = {0, 0};
     launch = {};
-    launch.abi_version = PIE_DRIVER_ABI_VERSION;
-    launch.instance_ids = {.ptr = &instance_id, .len = 1};
+    launch.roster_rows = {.ptr = kRosterRows, .len = 1};
     launch.token_ids = {.ptr = &token, .len = 1};
     launch.position_ids = {.ptr = &position, .len = 1};
     launch.qo_indptr = {.ptr = bad_qo_indptr, .len = 2};
-    if (!expect(pie_cuda_launch(driver, &launch, completion) ==
+    if (!expect(launch_step(driver, launch, completion) ==
                     PIE_STATUS_INVALID_ARGUMENT,
                 "launch rejects malformed CSR")) return 1;
     const std::uint32_t qo_indptr[] = {0, 1};
     launch.qo_indptr = {.ptr = qo_indptr, .len = 2};
-    if (!expect(pie_cuda_launch(driver, &launch, completion) ==
+    if (!expect(launch_step(driver, launch, completion) ==
                     PIE_STATUS_INVALID_ARGUMENT,
                 "model launch requires KV and sampling CSRs")) return 1;
     const std::uint32_t sampling_index = 0;
     const std::uint32_t sampling_indptr[] = {0, 1};
     launch = {};
-    launch.abi_version = PIE_DRIVER_ABI_VERSION;
-    launch.instance_ids = {.ptr = &instance_id, .len = 1};
+    launch.roster_rows = {.ptr = kRosterRows, .len = 1};
     launch.sampling_indices = {.ptr = &sampling_index, .len = 1};
     launch.sampling_indptr = {.ptr = sampling_indptr, .len = 2};
-    if (!expect(pie_cuda_launch(driver, &launch, completion) ==
+    if (!expect(launch_step(driver, launch, completion) ==
                     PIE_STATUS_INVALID_ARGUMENT,
                 "launch rejects sampling rows without query geometry")) return 1;
     const std::uint32_t empty_kv_indptr[] = {0, 0};
     launch = {};
-    launch.abi_version = PIE_DRIVER_ABI_VERSION;
-    launch.instance_ids = {.ptr = &instance_id, .len = 1};
+    launch.roster_rows = {.ptr = kRosterRows, .len = 1};
     launch.kv_page_indptr = {.ptr = empty_kv_indptr, .len = 2};
-    if (!expect(pie_cuda_launch(driver, &launch, completion) ==
+    if (!expect(launch_step(driver, launch, completion) ==
                     PIE_STATUS_INVALID_ARGUMENT,
                 "launch rejects KV CSR without last-page lengths")) return 1;
     launch = {};
-    launch.abi_version = PIE_DRIVER_ABI_VERSION;
-    launch.instance_ids = {
-        .ptr = reinterpret_cast<const std::uint64_t*>(alignof(std::uint64_t)),
+    launch.roster_rows = {
+        .ptr = reinterpret_cast<const std::uint32_t*>(alignof(std::uint32_t)),
         .len = std::numeric_limits<std::size_t>::max(),
     };
-    if (!expect(pie_cuda_launch(driver, &launch, completion) ==
+    if (!expect(launch_step(driver, launch, completion) ==
                     PIE_STATUS_INVALID_ARGUMENT,
                 "launch rejects count overflow")) return 1;
     const std::uint32_t resolved_rs_slots[] = {2, 3};
@@ -168,12 +179,8 @@ int main() {
     const std::uint32_t resolved_buffer_indptr[] = {0, 1, 2};
     PieTerminalCell resolved_terminal{};
     PieTerminalCell* resolved_terminals[] = {&resolved_terminal};
-    PieLaunchDesc device_geometry_rs{};
-    device_geometry_rs.abi_version = PIE_DRIVER_ABI_VERSION;
-    device_geometry_rs.instance_ids = {
-        .ptr = &instance_id,
-        .len = 1,
-    };
+    PieStepDesc device_geometry_rs{};
+    device_geometry_rs.roster_rows = {.ptr = kRosterRows, .len = 1};
     device_geometry_rs.terminal_cells = {
         .ptr = resolved_terminals,
         .len = 1,
@@ -199,7 +206,7 @@ int main() {
         .len = 3,
     };
     if (!expect(
-            pie_native::abi::validate_launch_desc(&device_geometry_rs) ==
+            pie_native::abi::validate_step_desc(&device_geometry_rs, kTestRosterLen) ==
                     PIE_STATUS_OK &&
                 pie_cuda_driver::abi::validate_launch_resources(
                     device_geometry_rs, 4, 16, 8, 8,
@@ -214,7 +221,7 @@ int main() {
         .len = 3,
     };
     if (!expect(
-            pie_native::abi::validate_launch_desc(&device_geometry_rs) ==
+            pie_native::abi::validate_step_desc(&device_geometry_rs, kTestRosterLen) ==
                 PIE_STATUS_INVALID_ARGUMENT,
             "deferred buffered RS CSR still rejects non-monotonic input")) {
         return 1;
@@ -225,7 +232,7 @@ int main() {
     };
     device_geometry_rs.rs_slot_flags.len = 1;
     if (!expect(
-            pie_native::abi::validate_launch_desc(&device_geometry_rs) ==
+            pie_native::abi::validate_step_desc(&device_geometry_rs, kTestRosterLen) ==
                 PIE_STATUS_INVALID_ARGUMENT,
             "resolved folded RS rejects mismatched ids/flags")) {
         return 1;
@@ -233,7 +240,7 @@ int main() {
     device_geometry_rs.rs_slot_flags.len = 2;
     device_geometry_rs.rs_fold_lens.len = 1;
     if (!expect(
-            pie_native::abi::validate_launch_desc(&device_geometry_rs) ==
+            pie_native::abi::validate_step_desc(&device_geometry_rs, kTestRosterLen) ==
                 PIE_STATUS_INVALID_ARGUMENT,
             "resolved folded RS rejects mismatched fold lengths")) {
         return 1;
@@ -292,8 +299,8 @@ int main() {
     const std::uint32_t page_indptr[] = {0, 1};
     const std::uint32_t last_page_len[] = {1};
     const pie_cuda_driver::abi::MultimodalLimits no_multimodal{};
-    PieLaunchDesc resource_launch{};
-    resource_launch.instance_ids = {.ptr = &instance_id, .len = 1};
+    PieStepDesc resource_launch{};
+    resource_launch.roster_rows = {.ptr = kRosterRows, .len = 1};
     resource_launch.kv_page_indices = {.ptr = page_id, .len = 1};
     resource_launch.kv_page_indptr = {.ptr = page_indptr, .len = 2};
     resource_launch.kv_last_page_lens = {
@@ -353,7 +360,7 @@ int main() {
     const std::uint32_t image_grid[] = {1, 1, 1};
     const std::uint32_t image_anchor_row[] = {0};
     const std::uint32_t image_pixel_indptr[] = {0, 3072};
-    PieLaunchDesc image_launch{};
+    PieStepDesc image_launch{};
     image_launch.token_ids = {.ptr = &token, .len = 1};
     image_launch.image_grids = {.ptr = image_grid, .len = 3};
     image_launch.image_anchor_rows = {
@@ -381,8 +388,8 @@ int main() {
     const std::uint32_t empty_page_indptr[] = {0, 0};
     const std::uint32_t zero_last_page_len[] = {0};
     const std::uint32_t one_program_row_indptr[] = {0, 1};
-    PieLaunchDesc deferred_launch{};
-    deferred_launch.instance_ids = {.ptr = &instance_id, .len = 1};
+    PieStepDesc deferred_launch{};
+    deferred_launch.roster_rows = {.ptr = kRosterRows, .len = 1};
     deferred_launch.ptir_program_row_indptr = {
         .ptr = one_program_row_indptr,
         .len = 2,

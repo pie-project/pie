@@ -16,7 +16,7 @@ use super::command::{
     StateCopyPlan,
 };
 use super::instance::InstanceBindingPlan;
-use super::submission::LaunchSubmission;
+use super::submission::{FrameSubmission, StepSubmission};
 
 fn bytes_slice(bytes: &[u8]) -> PieBytes {
     PieBytes {
@@ -206,80 +206,109 @@ impl<'a> InstanceDescBorrow<'a> {
     }
 }
 
-pub struct LaunchDescBorrow<'a> {
-    _masks: MaskWordsStorage,
-    raw: pie_driver_abi::PieLaunchDesc,
-    _plan: &'a LaunchPlan,
+fn step_desc<'a>(step: &'a StepSubmission, masks: &'a MaskWordsStorage) -> pie_driver_abi::PieStepDesc {
+    let plan = &step.plan;
+    pie_driver_abi::PieStepDesc {
+        roster_rows: u32_slice(&step.roster_rows),
+        sub_batch_indptr: u32_slice(&step.sub_batch_indptr),
+        sub_batch_class: u32_slice(&step.sub_batch_class),
+        terminal_cells: PieTerminalCellPtrSlice {
+            ptr: step.terminal_cells.as_ptr(),
+            len: step.terminal_cells.len(),
+        },
+        token_ids: u32_slice(&plan.token_ids),
+        position_ids: u32_slice(&plan.position_ids),
+        kv_page_indices: u32_slice(&plan.kv_page_indices),
+        kv_page_indptr: u32_slice(&plan.kv_page_indptr),
+        kv_last_page_lens: u32_slice(&plan.kv_last_page_lens),
+        qo_indptr: u32_slice(&plan.qo_indptr),
+        rs_slot_ids: u32_slice(&plan.rs_slot_ids),
+        rs_slot_flags: u8_slice(&plan.rs_slot_flags),
+        rs_fold_lens: u32_slice(&plan.rs_fold_lens),
+        rs_buffer_slot_ids: u32_slice(&plan.rs_buffer_slot_ids),
+        rs_buffer_slot_indptr: u32_slice(&plan.rs_buffer_slot_indptr),
+        masks: masks.as_desc(),
+        sampling_indices: u32_slice(&plan.sampling_indices),
+        sampling_indptr: u32_slice(&plan.sampling_indptr),
+        context_ids: u64_slice(&plan.context_ids),
+        single_token_mode: u8::from(plan.single_token_mode),
+        has_user_mask: u8::from(plan.has_user_mask),
+        reserved_flags: [0; 2],
+        reserved0: 0,
+        image_indptr: u32_slice(&plan.image_indptr),
+        image_grids: u32_slice(&plan.image_grids),
+        image_anchor_positions: u32_slice(&plan.image_anchor_positions),
+        image_pixels: bytes_slice(&plan.image_pixels),
+        image_pixel_indptr: u32_slice(&plan.image_pixel_indptr),
+        image_mrope_positions: u32_slice(&plan.image_mrope_positions),
+        image_mrope_indptr: u32_slice(&plan.image_mrope_indptr),
+        image_patch_positions: u32_slice(&plan.image_patch_positions),
+        image_anchor_rows: u32_slice(&plan.image_anchor_rows),
+        audio_features: bytes_slice(&plan.audio_features),
+        audio_feature_indptr: u32_slice(&plan.audio_feature_indptr),
+        audio_anchor_rows: u32_slice(&plan.audio_anchor_rows),
+        audio_indptr: u32_slice(&plan.audio_indptr),
+        embed_rows: bytes_slice(&plan.embed_rows),
+        embed_indptr: u32_slice(&plan.embed_indptr),
+        embed_shapes: u32_slice(&plan.embed_shapes),
+        embed_dtypes: u8_slice(&plan.embed_dtypes),
+        embed_anchor_rows: u32_slice(&plan.embed_anchor_rows),
+        embed_block_indptr: u32_slice(&plan.embed_block_indptr),
+        kv_len: u32_slice(&plan.kv_len),
+        kv_len_device: u64_slice(&plan.kv_len_device),
+        ptir_program_row_indptr: u32_slice(&step.program_row_indptr),
+        ptir_kv_write_lower_bounds: u64_slice(&plan.kv_write_lower_bounds),
+        ptir_kv_write_upper_bounds: u64_slice(&plan.kv_write_upper_bounds),
+        logical_fire_ids: u64_slice(&step.logical_fire_ids),
+        channel_expected_head: u64_slice(&step.channel_expected_head),
+        channel_expected_tail: u64_slice(&step.channel_expected_tail),
+        channel_ticket_indptr: u32_slice(&step.channel_ticket_indptr),
+    }
 }
-impl<'a> LaunchDescBorrow<'a> {
-    pub fn from_submission(submission: &'a LaunchSubmission) -> Self {
-        let plan = &submission.plan;
-        let masks = MaskWordsStorage::from_plan(plan);
-        let raw = pie_driver_abi::PieLaunchDesc {
+
+/// Borrowed v14 frame descriptor: owns the packed mask words and the
+/// per-step descriptor array; every other field borrows the submission for
+/// the lifetime of the backend call.
+pub struct FrameDescBorrow<'a> {
+    _masks: Vec<MaskWordsStorage>,
+    _steps: Vec<pie_driver_abi::PieStepDesc>,
+    raw: pie_driver_abi::PieFrameDesc,
+    _submission: &'a FrameSubmission,
+}
+impl<'a> FrameDescBorrow<'a> {
+    pub fn from_submission(submission: &'a FrameSubmission) -> Self {
+        let masks: Vec<MaskWordsStorage> = submission
+            .steps
+            .iter()
+            .map(|step| MaskWordsStorage::from_plan(&step.plan))
+            .collect();
+        let steps: Vec<pie_driver_abi::PieStepDesc> = submission
+            .steps
+            .iter()
+            .zip(&masks)
+            .map(|(step, masks)| step_desc(step, masks))
+            .collect();
+        let raw = pie_driver_abi::PieFrameDesc {
             abi_version: PIE_DRIVER_ABI_VERSION,
-            settle_defer: u32::from(submission.settle_defer),
+            reserved0: 0,
             instance_ids: u64_slice(&submission.instance_ids),
-            terminal_cells: PieTerminalCellPtrSlice {
-                ptr: submission.terminal_cells.as_ptr(),
-                len: submission.terminal_cells.len(),
-            },
-            token_ids: u32_slice(&plan.token_ids),
-            position_ids: u32_slice(&plan.position_ids),
-            kv_page_indices: u32_slice(&plan.kv_page_indices),
-            kv_page_indptr: u32_slice(&plan.kv_page_indptr),
-            kv_last_page_lens: u32_slice(&plan.kv_last_page_lens),
-            qo_indptr: u32_slice(&plan.qo_indptr),
-            rs_slot_ids: u32_slice(&plan.rs_slot_ids),
-            rs_slot_flags: u8_slice(&plan.rs_slot_flags),
-            rs_fold_lens: u32_slice(&plan.rs_fold_lens),
-            rs_buffer_slot_ids: u32_slice(&plan.rs_buffer_slot_ids),
-            rs_buffer_slot_indptr: u32_slice(&plan.rs_buffer_slot_indptr),
-            masks: masks.as_desc(),
-            sampling_indices: u32_slice(&plan.sampling_indices),
-            sampling_indptr: u32_slice(&plan.sampling_indptr),
-            context_ids: u64_slice(&plan.context_ids),
-            single_token_mode: u8::from(plan.single_token_mode),
-            has_user_mask: u8::from(plan.has_user_mask),
-            reserved_flags: [0; 2],
-            required_kv_pages: plan.required_kv_pages,
-            image_indptr: u32_slice(&plan.image_indptr),
-            image_grids: u32_slice(&plan.image_grids),
-            image_anchor_positions: u32_slice(&plan.image_anchor_positions),
-            image_pixels: bytes_slice(&plan.image_pixels),
-            image_pixel_indptr: u32_slice(&plan.image_pixel_indptr),
-            image_mrope_positions: u32_slice(&plan.image_mrope_positions),
-            image_mrope_indptr: u32_slice(&plan.image_mrope_indptr),
-            image_patch_positions: u32_slice(&plan.image_patch_positions),
-            image_anchor_rows: u32_slice(&plan.image_anchor_rows),
-            audio_features: bytes_slice(&plan.audio_features),
-            audio_feature_indptr: u32_slice(&plan.audio_feature_indptr),
-            audio_anchor_rows: u32_slice(&plan.audio_anchor_rows),
-            audio_indptr: u32_slice(&plan.audio_indptr),
-            embed_rows: bytes_slice(&plan.embed_rows),
-            embed_indptr: u32_slice(&plan.embed_indptr),
-            embed_shapes: u32_slice(&plan.embed_shapes),
-            embed_dtypes: u8_slice(&plan.embed_dtypes),
-            embed_anchor_rows: u32_slice(&plan.embed_anchor_rows),
-            embed_block_indptr: u32_slice(&plan.embed_block_indptr),
-            kv_len: u32_slice(&plan.kv_len),
-            kv_len_device: u64_slice(&plan.kv_len_device),
             kv_translation: u32_slice(&submission.kv_translation),
             kv_translation_indptr: u32_slice(&submission.kv_translation_indptr),
-            ptir_program_row_indptr: u32_slice(&submission.program_row_indptr),
-            ptir_kv_write_lower_bounds: u64_slice(&plan.kv_write_lower_bounds),
-            ptir_kv_write_upper_bounds: u64_slice(&plan.kv_write_upper_bounds),
-            logical_fire_ids: u64_slice(&submission.logical_fire_ids),
-            channel_expected_head: u64_slice(&submission.channel_expected_head),
-            channel_expected_tail: u64_slice(&submission.channel_expected_tail),
-            channel_ticket_indptr: u32_slice(&submission.channel_ticket_indptr),
+            required_kv_pages: submission.required_kv_pages,
+            reserved1: 0,
+            steps: pie_driver_abi::PieStepDescSlice {
+                ptr: steps.as_ptr(),
+                len: steps.len(),
+            },
         };
         Self {
             _masks: masks,
+            _steps: steps,
             raw,
-            _plan: plan,
+            _submission: submission,
         }
     }
-    pub fn as_raw(&self) -> &pie_driver_abi::PieLaunchDesc {
+    pub fn as_raw(&self) -> &pie_driver_abi::PieFrameDesc {
         &self.raw
     }
 }

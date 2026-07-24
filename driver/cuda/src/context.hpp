@@ -5,6 +5,7 @@
 #include <string>
 
 #include <pie_driver_abi.h>
+#include <pie_native/step_launch.hpp>
 
 namespace pie::cuda {
 
@@ -31,16 +32,7 @@ class Context {
     int register_program(const PieProgramDesc& program, std::uint64_t* program_id);
     int register_channel(const PieChannelDesc& channel, PieChannelEndpointBinding* binding);
     int bind_instance(const PieInstanceDesc& instance, PieInstanceBinding* binding);
-    int launch(const PieLaunchDesc& launch, PieCompletion completion);
-    int prepare_launch(
-        const PieLaunchDesc& launch,
-        PieLaunchPrepareResult* result);
-    int launch_prepared(
-        const PieLaunchDesc& launch,
-        std::uint64_t lease_id,
-        PieCompletion completion);
-    int release_launch(std::uint64_t lease_id);
-    int flush_settlement();
+    int launch(const PieFrameDesc& frame, PieCompletion completion);
     int encode(const PieEncodeDesc& encode, PieCompletion completion);
     int copy_kv(const PieKvCopyDesc& copy, PieCompletion completion);
     int copy_state(const PieStateCopyDesc& copy, PieCompletion completion);

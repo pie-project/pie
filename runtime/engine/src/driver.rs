@@ -21,9 +21,9 @@ pub mod submission;
 pub use pie_waker as waker;
 
 pub use backend::{
-    DriverBackend, DriverSpec, DummyDriver, LaunchLease, LaunchPrepareOutcome,
-    RemoteDisconnectHandle, RemoteDriver, SchedulerLimits, get_spec, register_driver,
-    register_driver_backend, take_driver_backend, unregister_driver,
+    DriverBackend, DriverSpec, DummyDriver, FrameLaunchOutcome, RemoteDisconnectHandle,
+    RemoteDriver, SchedulerLimits, get_spec, register_driver, register_driver_backend,
+    take_driver_backend, unregister_driver,
 };
 pub use channel::{ChannelCloser, ChannelEndpoint, ChannelValue, RegisteredChannel};
 pub use command::{
@@ -33,7 +33,7 @@ pub use command::{
 pub(crate) use completion::WorkItemAttemptOutcome;
 pub use completion::{CompletionBroker, SubmissionCompletion, WorkItemCompletion};
 pub use instance::{BoundInstance, InstanceBindingPlan, InstanceId, ProgramId};
-pub use submission::LaunchSubmission;
+pub use submission::{FrameSubmission, StepSubmission};
 
 pub type DriverId = usize;
 

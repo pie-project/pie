@@ -112,13 +112,6 @@ const COLD_HOLD_US: u64 = 2_000;
 /// completion resolution couples the posting window to frame-sized
 /// retirement — measured a net k>1 loss on the CUDA driver (see
 /// vesuvius-phase2.md "M2+M3 measured outcome"). The driver machinery is
-/// live either way; this only gates whether the engine marks waves.
-pub(super) fn settle_defer_enabled() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("PIE_FRAME_SETTLE_DEFER").is_ok_and(|value| value == "1")
-    })
-}
 
 fn cold_hold() -> Duration {
     static HOLD: OnceLock<Duration> = OnceLock::new();
@@ -171,42 +164,23 @@ struct LaneState {
     frames: VecDeque<PendingFrame>,
 }
 
-/// One sealed (immutable) frame: per-wave fire-id lists in admission order.
+/// One sealed (immutable) frame, dispatched WHOLE: per-wave fire-id lists in
+/// slot order. Venus: the frame is the launch unit — it leaves this queue the
+/// moment the worker posts it, and the policy tracks nothing after dispatch
+/// (settlement is the worker's frame retirement).
 struct SealedFrame {
     waves: Vec<Vec<u64>>,
-    fire_waves: HashMap<u64, usize>,
-    /// Next wave index to open (waves below it are fully posted/resolved).
-    next_wave: usize,
-    /// Fire ids of the OPEN wave not yet posted or dropped.
-    open_remaining: HashSet<u64>,
-    /// Fires that came back RETRY after posting: they re-dispatch before
-    /// anything else opens, GLOBALLY wave-ordered — the oldest frame's
-    /// oldest makeup wave first, and only once every earlier wave (of this
-    /// frame and every frame sealed before it) has drained. Per-lane slot
-    /// order is enforced by channel tickets; the makeup gate keeps the pipe
-    /// from racing ahead of a known-uncommitted step.
-    makeup: HashSet<u64>,
-    /// Posted fires not yet retired.
-    outstanding: usize,
-    /// Posted-unretired fires per wave index — the chaining depth gate and
-    /// the makeup ordering guard both read this.
-    wave_outstanding: Vec<usize>,
-}
-
-impl SealedFrame {
-    fn is_complete(&self) -> bool {
-        self.next_wave >= self.waves.len()
-            && self.open_remaining.is_empty()
-            && self.outstanding == 0
-            && self.makeup.is_empty()
-    }
+    /// Member lanes — read by the dispatch gate to hold a frame whose lane
+    /// has a pre-launch copy barrier queued.
+    members: BTreeSet<ProcessId>,
 }
 
 /// What the worker should do next for frame-managed launches.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum FramePlan {
-    /// Dispatch (a subset of) these fire ids now, in the given order.
-    Dispatch(Vec<u64>),
+    /// Post this WHOLE sealed frame now: per-wave fire ids in slot order.
+    /// The frame has left the policy — the worker owns it from here.
+    Dispatch(Vec<Vec<u64>>),
     /// Nothing dispatchable yet; re-decide after the bootstrap hold or at
     /// the blocked-gather watchdog deadline.
     Hold(Duration),
@@ -216,11 +190,6 @@ pub(super) enum FramePlan {
 
 pub(super) struct FramePolicy {
     k: usize,
-    /// Whether the wave returned by the LAST `plan_dispatch` call belongs to
-    /// a sealed frame with a later still-queued wave — i.e. its launches may
-    /// carry `settle_defer = 1` (M2 frame-group settlement). Makeup replays,
-    /// 1-slot frames, and riders never defer.
-    last_plan_defers: bool,
     max_wave_tokens: usize,
     max_wave_rows: usize,
     /// THE wait-set plus each lane's queued frames. BTreeMap for
@@ -295,7 +264,6 @@ impl FramePolicy {
             k,
             max_wave_tokens,
             max_wave_rows,
-            last_plan_defers: false,
             lanes: BTreeMap::new(),
             sealed: VecDeque::new(),
             pending_binds: BTreeMap::new(),
@@ -311,15 +279,9 @@ impl FramePolicy {
         }
     }
 
-    /// Whether this deployment runs 1-slot frames (`PIE_FRAME_SIZE=1`, the
-    /// default): a frame is a wave, and the worker synthesizes a per-fire
-    /// stamp at admission instead of the guest submitting frames.
-    /// See [`FramePolicy::last_plan_defers`]: whether the most recent
-    /// `plan_dispatch` wave may post with `settle_defer = 1`.
-    pub fn last_plan_defers_settlement(&self) -> bool {
-        self.last_plan_defers
-    }
-
+    /// Whether this deployment runs 1-slot frames (`PIE_FRAME_SIZE=1`):
+    /// a frame is a wave, and the worker synthesizes a per-fire stamp at
+    /// admission instead of the guest submitting frames.
     pub fn single_slot(&self) -> bool {
         self.k == 1
     }
@@ -546,63 +508,6 @@ impl FramePolicy {
         self.strict_watchdog_deadline = None;
     }
 
-    /// A queued fire was dropped without dispatch (cancelled / stale /
-    /// rejected). Resolves it out of whichever sealed wave holds it.
-    pub fn on_fire_dropped(&mut self, fire_id: u64) {
-        for frame in &mut self.sealed {
-            if frame.fire_waves.contains_key(&fire_id) {
-                frame.open_remaining.remove(&fire_id);
-                frame.makeup.remove(&fire_id);
-                break;
-            }
-        }
-        self.pop_complete();
-    }
-
-    /// Fires were posted to the driver lane in a launch batch.
-    pub fn on_fires_posted(&mut self, fire_ids: &[u64]) {
-        for fire_id in fire_ids {
-            for frame in &mut self.sealed {
-                if let Some(&wave) = frame.fire_waves.get(fire_id) {
-                    let in_open = frame.open_remaining.remove(fire_id);
-                    let in_makeup = frame.makeup.remove(fire_id);
-                    if in_open || in_makeup {
-                        frame.outstanding += 1;
-                        frame.wave_outstanding[wave] += 1;
-                    }
-                    break;
-                }
-            }
-        }
-    }
-
-    /// A posted fire's launch retired. `will_retry` iff the worker requeued
-    /// it (RETRY outcome within budget) — it becomes a makeup fire.
-    pub fn on_fire_retired(&mut self, fire_id: u64, will_retry: bool) {
-        for frame in &mut self.sealed {
-            if let Some(&wave) = frame.fire_waves.get(&fire_id) {
-                frame.outstanding = frame.outstanding.saturating_sub(1);
-                let count = &mut frame.wave_outstanding[wave];
-                *count = count.saturating_sub(1);
-                if will_retry {
-                    frame.makeup.insert(fire_id);
-                }
-                break;
-            }
-        }
-        self.pop_complete();
-    }
-
-    fn pop_complete(&mut self) {
-        while self
-            .sealed
-            .front()
-            .is_some_and(SealedFrame::is_complete)
-        {
-            self.sealed.pop_front();
-        }
-    }
-
     fn have_seal_candidate(&self) -> bool {
         self.lanes
             .values()
@@ -708,22 +613,14 @@ impl FramePolicy {
                 cold_hold_fired,
             );
             cold_hold_fired = false;
-            let wave_count = waves.len();
+            let _ = &fire_waves;
             self.sealed.push_back(SealedFrame {
                 waves,
-                fire_waves,
-                next_wave: 0,
-                open_remaining: HashSet::new(),
-                makeup: HashSet::new(),
-                outstanding: 0,
-                wave_outstanding: vec![0; wave_count],
+                members: members.iter().copied().collect(),
             });
         }
         self.lanes
             .retain(|_, lane| lane.awaited || !lane.frames.is_empty());
-        if sealed_any {
-            self.last_plan_defers = false;
-        }
         sealed_any.then(|| FramePlan::Dispatch(Vec::new()))
     }
 
@@ -784,122 +681,57 @@ impl FramePolicy {
         }
     }
 
-    /// Advance one sealed frame's open wave past empty/fully-resolved waves.
-    /// A fire that left the queue before its wave opened (cancelled /
-    /// rejected) resolves here: only ids in `still_queued` enter the open set.
-    fn advance_open_wave(&mut self, index: usize, still_queued: Option<&HashSet<u64>>) {
-        let Some(frame) = self.sealed.get_mut(index) else {
-            return;
-        };
-        while frame.open_remaining.is_empty() && frame.next_wave < frame.waves.len() {
-            let wave = frame.next_wave;
-            frame.open_remaining = frame.waves[wave]
-                .iter()
-                .filter(|fire_id| still_queued.is_none_or(|queued| queued.contains(fire_id)))
-                .copied()
-                .collect();
-            frame.next_wave += 1;
-            if !frame.open_remaining.is_empty() {
-                break;
-            }
-        }
-    }
-
-    /// The fire ids the worker should try to dispatch now, in order: makeup
-    /// fires of the oldest frame first, then the open wave.
-    /// `still_queued` tells the policy which ids remain in the worker queue;
-    /// open-wave ids that vanished (rejected/cancelled) resolve here.
-    pub fn plan_dispatch(&mut self, still_queued: &HashSet<u64>, now: Instant) -> FramePlan {
-        // Resolve open-wave ids that left the queue without posting.
-        for frame in &mut self.sealed {
-            frame
-                .open_remaining
-                .retain(|fire_id| still_queued.contains(fire_id));
-            frame
-                .makeup
-                .retain(|fire_id| still_queued.contains(fire_id));
-        }
-        self.pop_complete();
-
-        // Frames OVERLAP on-stream — there is no launch-time barrier. All
-        // dispatch is globally ordered: frames in seal order, waves in slot
-        // order within a frame, every wave posted at the worker's run-ahead
-        // depth without waiting for retirement. The driver's device-side
-        // readiness gate (`pass_commit` channel tickets) orders dependent
-        // fires by stream order, and a frame-boundary dependency (f's last
-        // wave → f+1's wave 0 of the same lane) is structurally identical
-        // to an intra-frame one. A fire whose predecessor did not commit
-        // comes back RETRY into the globally wave-ordered makeup set;
-        // settlement of a fully posted frame proceeds asynchronously and
-        // never gates the next frame's launch.
+    /// The next sealed frame the worker should POST WHOLE, if any.
+    ///
+    /// `still_queued` tells the policy which ids remain in the worker queue —
+    /// sealed ids that vanished (rejected/cancelled) resolve here.
+    /// `blocked_lanes` holds lanes with a queued pre-launch copy barrier: a
+    /// frame containing such a lane's fire holds until the copy retires
+    /// (frames are atomic — nothing partial posts).
+    /// `executing` is the worker's in-flight signal (frames posted, not yet
+    /// retired) — while true, a blocked gather parks instead of holding.
+    ///
+    /// Frames OVERLAP on-stream — there is no launch-time barrier. Posting
+    /// is globally ordered (frames in seal order; waves in slot order inside
+    /// the driver), and the device-side readiness gate (`pass_commit`
+    /// channel tickets) orders dependent fires by stream order — a
+    /// frame-boundary dependency (f's last wave → f+1's wave 0 of the same
+    /// lane) is structurally identical to an intra-frame one. Settlement of
+    /// a posted frame proceeds asynchronously and never gates the next
+    /// frame's post.
+    pub fn plan_dispatch(
+        &mut self,
+        still_queued: &HashSet<u64>,
+        blocked_lanes: &HashSet<ProcessId>,
+        executing: bool,
+        now: Instant,
+    ) -> FramePlan {
         loop {
-            let mut advanced = false;
-            for index in 0..self.sealed.len() {
-                let frame = &self.sealed[index];
-                if !frame.makeup.is_empty() {
-                    // Replay the oldest makeup wave first, and only once
-                    // every earlier wave — across ALL earlier frames — has
-                    // drained: the rings must be at the state the makeup's
-                    // channel tickets expect. Nothing later posts while a
-                    // known-uncommitted step replays.
-                    if self
-                        .sealed
-                        .iter()
-                        .take(index)
-                        .any(|earlier| earlier.outstanding > 0)
-                    {
-                        return FramePlan::Park;
-                    }
-                    let min_wave = frame
-                        .makeup
-                        .iter()
-                        .filter_map(|fire_id| frame.fire_waves.get(fire_id))
-                        .copied()
-                        .min()
-                        .unwrap_or(0);
-                    let earlier_draining = frame.wave_outstanding[..min_wave]
-                        .iter()
-                        .any(|count| *count > 0);
-                    if earlier_draining {
-                        return FramePlan::Park;
-                    }
-                    let mut makeups: Vec<u64> = frame
-                        .makeup
-                        .iter()
-                        .filter(|fire_id| frame.fire_waves.get(*fire_id) == Some(&min_wave))
-                        .copied()
-                        .collect();
-                    makeups.sort_unstable();
-                    self.last_plan_defers = false;
-                    return FramePlan::Dispatch(makeups);
+            // Resolve sealed ids that left the queue without posting.
+            for frame in &mut self.sealed {
+                for wave in &mut frame.waves {
+                    wave.retain(|fire_id| still_queued.contains(fire_id));
                 }
-                if !frame.open_remaining.is_empty() {
-                    let wave = frame.next_wave - 1;
-                    let ordered: Vec<u64> = frame.waves[wave]
-                        .iter()
-                        .filter(|fire_id| frame.open_remaining.contains(fire_id))
-                        .copied()
-                        .collect();
-                    // The wave defers settlement only while a later wave of
-                    // this frame still has queued fires to become the tail.
-                    let defers = frame.waves[wave + 1..]
-                        .iter()
-                        .flatten()
-                        .any(|fire_id| still_queued.contains(fire_id));
-                    self.last_plan_defers = defers;
-                    return FramePlan::Dispatch(ordered);
-                }
-                if frame.next_wave < frame.waves.len() {
-                    self.advance_open_wave(index, Some(still_queued));
-                    self.pop_complete();
-                    advanced = true;
-                    break;
-                }
-                // Fully posted: it retires asynchronously while the next
-                // frame posts behind it.
             }
-            if advanced {
-                continue;
+            while self
+                .sealed
+                .front()
+                .is_some_and(|frame| frame.waves.iter().all(Vec::is_empty))
+            {
+                self.sealed.pop_front();
+            }
+            if let Some(front) = self.sealed.front() {
+                if front
+                    .members
+                    .iter()
+                    .any(|member| blocked_lanes.contains(member))
+                {
+                    // The copy's retirement re-decides through the scheduler
+                    // channel; the hold is only a liveness backstop.
+                    return FramePlan::Hold(Duration::from_micros(500));
+                }
+                let frame = self.sealed.pop_front().expect("front frame exists");
+                return FramePlan::Dispatch(frame.waves);
             }
             // Boundary: the wait-all frame quorum. Seal only once every
             // awaited lane's next frame is fully submitted (an idle lane
@@ -928,7 +760,7 @@ impl FramePolicy {
                 || ((self.pending_slots > 0 || !self.departing.is_empty())
                     && !self.staged.is_empty());
             if joining || missing > 0 {
-                if !self.sealed.is_empty() {
+                if executing {
                     // An epoch is executing: its retirements re-decide and
                     // the gather continues in the background.
                     return FramePlan::Park;
@@ -1002,12 +834,10 @@ impl FramePolicy {
         for (index, frame) in self.sealed.iter().enumerate() {
             let _ = write!(
                 out,
-                "\n  sealed[{index}]: waves={} next_wave={} open={} makeup={} outstanding={}",
+                "\n  sealed[{index}]: waves={} fires={} members={}",
                 frame.waves.len(),
-                frame.next_wave,
-                frame.open_remaining.len(),
-                frame.makeup.len(),
-                frame.outstanding,
+                frame.waves.iter().map(Vec::len).sum::<usize>(),
+                frame.members.len(),
             );
         }
         out
@@ -1031,11 +861,26 @@ mod tests {
         }
     }
 
+    fn plan(policy: &mut FramePolicy, queued: &HashSet<u64>, now: Instant) -> FramePlan {
+        policy.plan_dispatch(queued, &HashSet::new(), false, now)
+    }
+
     fn drive_past_cold_hold(policy: &mut FramePolicy, queued: &HashSet<u64>) -> FramePlan {
         let now = Instant::now();
-        match policy.plan_dispatch(queued, now) {
-            FramePlan::Hold(hold) => policy.plan_dispatch(queued, now + hold + Duration::from_micros(1)),
+        match plan(policy, queued, now) {
+            FramePlan::Hold(hold) => {
+                plan(policy, queued, now + hold + Duration::from_micros(1))
+            }
             plan => plan,
+        }
+    }
+
+    /// Flatten a whole-frame dispatch for order-insensitive membership
+    /// asserts.
+    fn fires(plan: &FramePlan) -> Vec<u64> {
+        match plan {
+            FramePlan::Dispatch(waves) => waves.iter().flatten().copied().collect(),
+            plan => panic!("expected a frame dispatch, got {plan:?}"),
         }
     }
 
@@ -1058,8 +903,8 @@ mod tests {
         policy.on_fire_enqueued(stamp(lane, 0, 0, 1), Some(lane), 7, 1, 1);
         let queued: HashSet<u64> = [7].into_iter().collect();
         assert_eq!(
-            policy.plan_dispatch(&queued, Instant::now()),
-            FramePlan::Dispatch(vec![7]),
+            plan(&mut policy, &queued, Instant::now()),
+            FramePlan::Dispatch(vec![vec![7]]),
             "a full wave must seal with no cold-hold delay"
         );
     }
@@ -1077,33 +922,28 @@ mod tests {
         policy.on_fire_enqueued(stamp(b, 11, 0, 1), Some(b), 11, 1, 1);
         let queued: HashSet<u64> = [10, 11].into_iter().collect();
         let t0 = Instant::now();
-        let FramePlan::Hold(hold) = policy.plan_dispatch(&queued, t0) else {
+        let FramePlan::Hold(hold) = plan(&mut policy, &queued, t0) else {
             panic!("bootstrap membership is forming: the cold hold must arm");
         };
-        let FramePlan::Dispatch(wave) =
-            policy.plan_dispatch(&queued, t0 + hold + Duration::from_micros(1))
-        else {
-            panic!("past the window the epoch must seal");
-        };
-        assert_eq!(wave.len(), 2, "dense: both lanes' fires in one wave");
-        policy.on_fires_posted(&wave);
-        policy.on_fire_retired(10, false);
-        policy.on_fire_retired(11, false);
+        let sealed = plan(&mut policy, &queued, t0 + hold + Duration::from_micros(1));
+        assert_eq!(
+            fires(&sealed).len(),
+            2,
+            "dense: both lanes' fires in one wave"
+        );
 
         // Steady state: `a` resubmits, `b` does not — the wave holds.
         policy.on_fire_enqueued(stamp(a, 12, 0, 1), Some(a), 12, 1, 1);
         let queued: HashSet<u64> = [12].into_iter().collect();
-        match policy.plan_dispatch(&queued, Instant::now()) {
+        match plan(&mut policy, &queued, Instant::now()) {
             FramePlan::Hold(_) => {}
             plan => panic!("wait-all must hold for the idle lane, got {plan:?}"),
         }
         // `b`'s next fire arrives: the wave seals dense, no cold hold.
         policy.on_fire_enqueued(stamp(b, 13, 0, 1), Some(b), 13, 1, 1);
         let queued: HashSet<u64> = [12, 13].into_iter().collect();
-        let FramePlan::Dispatch(next) = policy.plan_dispatch(&queued, Instant::now()) else {
-            panic!("all lanes ready: the steady-state wave must seal");
-        };
-        assert_eq!(next.len(), 2);
+        let next = plan(&mut policy, &queued, Instant::now());
+        assert_eq!(fires(&next).len(), 2);
     }
 
     #[test]
@@ -1117,21 +957,18 @@ mod tests {
         policy.on_fire_enqueued(stamp(b, 0, 0, 1), Some(b), 200, 37, 1);
 
         let queued: HashSet<u64> = [100, 101, 102, 103, 200].into_iter().collect();
-        let plan = drive_past_cold_hold(&mut policy, &queued);
-        // Wave 0 = both lanes' slot-0 fires, lane-id order preserved.
-        let FramePlan::Dispatch(wave0) = plan else {
-            panic!("expected wave-0 dispatch, got {plan:?}");
+        let sealed = drive_past_cold_hold(&mut policy, &queued);
+        // One whole frame: wave 0 = both lanes' slot-0 fires (lane-id order
+        // preserved), later slots in slot order.
+        let FramePlan::Dispatch(waves) = sealed else {
+            panic!("expected a whole-frame dispatch");
         };
-        assert_eq!(wave0.len(), 2);
-        assert!(wave0.contains(&100) && wave0.contains(&200));
-
-        policy.on_fires_posted(&wave0);
-        // Overlap: wave 1 posts immediately behind the in-flight wave 0 —
-        // there is no retirement barrier.
-        let FramePlan::Dispatch(wave1) = policy.plan_dispatch(&queued, Instant::now()) else {
-            panic!("expected wave-1 dispatch");
-        };
-        assert_eq!(wave1, vec![101]);
+        assert_eq!(waves.len(), 4);
+        assert_eq!(waves[0].len(), 2);
+        assert!(waves[0].contains(&100) && waves[0].contains(&200));
+        assert_eq!(waves[1], vec![101]);
+        assert_eq!(waves[2], vec![102]);
+        assert_eq!(waves[3], vec![103]);
     }
 
     /// THE wait-all regression test: an incomplete lane BLOCKS the seal.
@@ -1149,14 +986,14 @@ mod tests {
 
         let queued: HashSet<u64> = [1, 2, 3].into_iter().collect();
         let t0 = Instant::now();
-        match policy.plan_dispatch(&queued, t0) {
+        match plan(&mut policy, &queued, t0) {
             FramePlan::Hold(hold) => {
                 assert_eq!(hold, Duration::from_micros(STRICT_WATCHDOG_US));
             }
             plan => panic!("wait-all must hold for the incomplete lane, got {plan:?}"),
         }
         // Long past the watchdog: it re-arms and reports; it never fires.
-        match policy.plan_dispatch(&queued, t0 + Duration::from_secs(60)) {
+        match plan(&mut policy, &queued, t0 + Duration::from_secs(60)) {
             FramePlan::Hold(_) => {}
             plan => panic!("the watchdog reports, it must not fire: got {plan:?}"),
         }
@@ -1164,163 +1001,73 @@ mod tests {
         // The straggler completes: one dense epoch, both lanes' slot-0.
         policy.on_fire_enqueued(stamp(slow, 0, 1, 2), Some(slow), 4, 1, 1);
         let queued: HashSet<u64> = [1, 2, 3, 4].into_iter().collect();
-        let FramePlan::Dispatch(wave0) = drive_past_cold_hold(&mut policy, &queued) else {
+        let FramePlan::Dispatch(waves) = drive_past_cold_hold(&mut policy, &queued) else {
             panic!("all lanes ready: the epoch must seal");
         };
-        assert_eq!(wave0.len(), 2, "dense wave 0 holds BOTH lanes");
-        assert!(wave0.contains(&1) && wave0.contains(&3));
+        assert_eq!(waves[0].len(), 2, "dense wave 0 holds BOTH lanes");
+        assert!(waves[0].contains(&1) && waves[0].contains(&3));
     }
 
+    /// Venus: a sealed frame dispatches WHOLE — every wave in slot order in
+    /// one plan — and the policy tracks nothing afterwards (the worker owns
+    /// posting and retirement; overlap is the worker's run-ahead depth).
     #[test]
-    fn retry_becomes_makeup_and_gates_wave_advance() {
-        let mut policy = FramePolicy::new(2, 64, 4096, None);
-        let lane = pid();
-        policy.on_fire_enqueued(stamp(lane, 0, 0, 2), Some(lane), 10, 1, 1);
-        policy.on_fire_enqueued(stamp(lane, 0, 1, 2), Some(lane), 11, 1, 1);
-        let queued: HashSet<u64> = [10, 11].into_iter().collect();
-        let FramePlan::Dispatch(wave0) = drive_past_cold_hold(&mut policy, &queued) else {
-            panic!("expected wave 0");
-        };
-        policy.on_fires_posted(&wave0);
-        // Wave 0's fire comes back RETRY and is requeued.
-        policy.on_fire_retired(10, true);
-        let plan = policy.plan_dispatch(&queued, Instant::now());
-        assert_eq!(
-            plan,
-            FramePlan::Dispatch(vec![10]),
-            "makeup fire re-dispatches before wave 1 opens"
-        );
-        policy.on_fires_posted(&[10]);
-        policy.on_fire_retired(10, false);
-        let FramePlan::Dispatch(wave1) = policy.plan_dispatch(&queued, Instant::now()) else {
-            panic!("expected wave 1 after makeup commits");
-        };
-        assert_eq!(wave1, vec![11]);
-    }
-
-    /// Overlap: the next frame seals the moment the wait-all gate holds —
-    /// during the current frame's execution — and its waves post behind
-    /// the in-flight tail with zero retirements. A late joiner rides the
-    /// same early seal, and a cross-frame RETRY replays globally
-    /// wave-ordered.
-    #[test]
-    fn frames_overlap_across_the_boundary() {
+    fn sealed_frame_dispatches_whole_and_frames_overlap() {
         let mut policy = FramePolicy::new(2, 64, 4096, None);
         let (a, b) = (pid(), pid());
         policy.on_fire_enqueued(stamp(a, 0, 0, 2), Some(a), 50, 1, 1);
         policy.on_fire_enqueued(stamp(a, 0, 1, 2), Some(a), 51, 1, 1);
         let queued: HashSet<u64> = [50, 51].into_iter().collect();
-        let FramePlan::Dispatch(wave0) = drive_past_cold_hold(&mut policy, &queued) else {
-            panic!("expected lane a's wave 0");
+        let FramePlan::Dispatch(frame0) = drive_past_cold_hold(&mut policy, &queued) else {
+            panic!("expected lane a's whole frame");
         };
-        assert_eq!(wave0, vec![50]);
-        policy.on_fires_posted(&wave0);
-        // Mid-execution, a straggler submits its first frame and lane a its
-        // next: the wait-all gate holds, so f+1 seals NOW.
+        assert_eq!(frame0, vec![vec![50], vec![51]]);
+        // Mid-execution (worker in flight), a straggler submits its first
+        // frame and lane a its next: the wait-all gate holds, so f+1 seals
+        // NOW and dispatches whole behind the executing frame.
         policy.on_fire_enqueued(stamp(b, 0, 0, 2), Some(b), 60, 1, 1);
         policy.on_fire_enqueued(stamp(b, 0, 1, 2), Some(b), 61, 1, 1);
         policy.on_fire_enqueued(stamp(a, 1, 0, 2), Some(a), 52, 1, 1);
         policy.on_fire_enqueued(stamp(a, 1, 1, 2), Some(a), 53, 1, 1);
-        let queued: HashSet<u64> = [50, 51, 52, 53, 60, 61].into_iter().collect();
-        // Global order: f's remaining wave posts first...
-        let FramePlan::Dispatch(wave1) = policy.plan_dispatch(&queued, Instant::now()) else {
-            panic!("expected lane a's wave 1");
+        let queued: HashSet<u64> = [52, 53, 60, 61].into_iter().collect();
+        let FramePlan::Dispatch(merged) =
+            policy.plan_dispatch(&queued, &HashSet::new(), true, Instant::now())
+        else {
+            panic!("the overlapped next frame must seal and dispatch whole");
         };
-        assert_eq!(wave1, vec![51]);
-        policy.on_fires_posted(&wave1);
-        // ...then f+1's dense wave 0 — both lanes, zero retirements so far.
-        let FramePlan::Dispatch(merged) = policy.plan_dispatch(&queued, Instant::now()) else {
-            panic!("the overlapped next frame must seal and post");
-        };
-        assert_eq!(merged.len(), 2, "wave 0 must hold BOTH lanes: {merged:?}");
-        assert!(merged.contains(&52) && merged.contains(&60));
-        policy.on_fires_posted(&merged);
-        // Cross-frame RETRY replay: f's wave-1 fire bounces; its makeup
-        // holds until wave 0 drains, and nothing later posts meanwhile.
-        policy.on_fire_retired(51, true);
-        assert_eq!(
-            policy.plan_dispatch(&queued, Instant::now()),
-            FramePlan::Park
-        );
-        policy.on_fire_retired(50, false);
-        assert_eq!(
-            policy.plan_dispatch(&queued, Instant::now()),
-            FramePlan::Dispatch(vec![51])
-        );
+        assert_eq!(merged[0].len(), 2, "wave 0 must hold BOTH lanes");
+        assert!(merged[0].contains(&52) && merged[0].contains(&60));
+        assert_eq!(merged[1].len(), 2);
+        assert!(merged[1].contains(&53) && merged[1].contains(&61));
     }
 
+    /// A frame whose lane has a queued pre-launch copy barrier holds WHOLE
+    /// (frames are atomic); it dispatches once the barrier clears.
     #[test]
-    fn frame_waves_post_back_to_back_without_retirement() {
-        let mut policy = FramePolicy::new(3, 64, 4096, None);
+    fn blocked_lane_holds_the_whole_frame() {
+        let mut policy = FramePolicy::new(1, 64, 4096, None);
         let lane = pid();
-        for slot in 0..3 {
-            policy.on_fire_enqueued(stamp(lane, 0, slot, 3), Some(lane), 30 + slot as u64, 1, 1);
-        }
-        let queued: HashSet<u64> = [30, 31, 32].into_iter().collect();
-        let FramePlan::Dispatch(wave0) = drive_past_cold_hold(&mut policy, &queued) else {
-            panic!("expected wave 0");
+        policy.on_fire_enqueued(stamp(lane, 0, 0, 1), Some(lane), 70, 1, 1);
+        let queued: HashSet<u64> = [70].into_iter().collect();
+        let blocked: HashSet<ProcessId> = [lane].into_iter().collect();
+        // Seal happens; dispatch holds on the blocked lane.
+        let now = Instant::now();
+        let held = match policy.plan_dispatch(&queued, &blocked, false, now) {
+            FramePlan::Hold(hold) => {
+                policy.plan_dispatch(&queued, &blocked, false, now + hold + Duration::from_micros(1))
+            }
+            plan => plan,
         };
-        assert_eq!(wave0, vec![30]);
-        policy.on_fires_posted(&wave0);
-        let FramePlan::Dispatch(wave1) = policy.plan_dispatch(&queued, Instant::now()) else {
-            panic!("wave 1 must post behind the in-flight wave 0");
+        assert!(
+            matches!(held, FramePlan::Hold(_)),
+            "a blocked member must hold the whole frame, got {held:?}"
+        );
+        let FramePlan::Dispatch(waves) =
+            policy.plan_dispatch(&queued, &HashSet::new(), false, Instant::now())
+        else {
+            panic!("the frame must dispatch once the barrier clears");
         };
-        assert_eq!(wave1, vec![31]);
-        policy.on_fires_posted(&wave1);
-        let FramePlan::Dispatch(wave2) = policy.plan_dispatch(&queued, Instant::now()) else {
-            panic!("wave 2 must post behind waves 0-1");
-        };
-        assert_eq!(wave2, vec![32]);
-        policy.on_fires_posted(&wave2);
-        assert_eq!(
-            policy.plan_dispatch(&queued, Instant::now()),
-            FramePlan::Park,
-            "fully posted: retirement is asynchronous"
-        );
-    }
-
-    #[test]
-    fn retry_replays_wave_ordered_makeups() {
-        let mut policy = FramePolicy::new(2, 64, 4096, None);
-        let lane = pid();
-        policy.on_fire_enqueued(stamp(lane, 0, 0, 2), Some(lane), 40, 1, 1);
-        policy.on_fire_enqueued(stamp(lane, 0, 1, 2), Some(lane), 41, 1, 1);
-        let queued: HashSet<u64> = [40, 41].into_iter().collect();
-        let FramePlan::Dispatch(wave0) = drive_past_cold_hold(&mut policy, &queued) else {
-            panic!("expected wave 0");
-        };
-        policy.on_fires_posted(&wave0);
-        let FramePlan::Dispatch(wave1) = policy.plan_dispatch(&queued, Instant::now()) else {
-            panic!("expected chained wave 1");
-        };
-        policy.on_fires_posted(&wave1);
-        // The predecessor fails to commit and requeues; its chained
-        // successor is still in flight and will bounce on the stale rings.
-        policy.on_fire_retired(40, true);
-        assert_eq!(
-            policy.plan_dispatch(&queued, Instant::now()),
-            FramePlan::Dispatch(vec![40]),
-            "the oldest wave's makeup replays first"
-        );
-        policy.on_fires_posted(&[40]);
-        policy.on_fire_retired(41, true);
-        assert_eq!(
-            policy.plan_dispatch(&queued, Instant::now()),
-            FramePlan::Park,
-            "a later wave's makeup holds while the earlier wave is in flight"
-        );
-        policy.on_fire_retired(40, false);
-        assert_eq!(
-            policy.plan_dispatch(&queued, Instant::now()),
-            FramePlan::Dispatch(vec![41]),
-            "the successor's makeup replays once the predecessor drained"
-        );
-        policy.on_fires_posted(&[41]);
-        policy.on_fire_retired(41, false);
-        assert_eq!(
-            policy.plan_dispatch(&queued, Instant::now()),
-            FramePlan::Park
-        );
+        assert_eq!(waves, vec![vec![70]]);
     }
 
     #[test]
@@ -1330,15 +1077,13 @@ mod tests {
         policy.on_fire_enqueued(stamp(lane, 0, 0, 2), Some(lane), 20, 1, 1);
         policy.on_fire_enqueued(stamp(lane, 0, 1, 2), Some(lane), 21, 1, 1);
         let queued: HashSet<u64> = [20, 21].into_iter().collect();
-        let FramePlan::Dispatch(wave0) = drive_past_cold_hold(&mut policy, &queued) else {
-            panic!("expected wave 0");
+        let FramePlan::Dispatch(waves) = drive_past_cold_hold(&mut policy, &queued) else {
+            panic!("expected the whole frame");
         };
-        policy.on_fires_posted(&wave0);
-        policy.on_fire_retired(20, false);
-        // Fire 21 is cancelled while queued: the wave resolves without it.
+        assert_eq!(waves, vec![vec![20], vec![21]]);
         let queued: HashSet<u64> = HashSet::new();
-        assert_eq!(policy.plan_dispatch(&queued, Instant::now()), FramePlan::Park);
-        assert_eq!(policy.sealed.len(), 0, "frame completed and popped");
+        assert_eq!(plan(&mut policy, &queued, Instant::now()), FramePlan::Park);
+        assert_eq!(policy.sealed.len(), 0, "frame popped at dispatch");
         assert!(
             policy.ever_sealed,
             "the wait-set persists while the lane is awaited — drained \
@@ -1358,10 +1103,12 @@ mod tests {
         // Host submit failed at slot 2: only 2 fires exist.
         policy.on_frame_truncated(lane, 0, 2);
         let queued: HashSet<u64> = [30, 31].into_iter().collect();
-        let FramePlan::Dispatch(wave0) = drive_past_cold_hold(&mut policy, &queued) else {
+        let FramePlan::Dispatch(waves) = drive_past_cold_hold(&mut policy, &queued) else {
             panic!("truncated frame must still seal");
         };
-        assert_eq!(wave0, vec![30]);
+        assert_eq!(waves[0], vec![30]);
+        assert_eq!(waves[1], vec![31]);
+        assert!(waves[2].is_empty() && waves[3].is_empty());
     }
 
     /// Capacity partitioning is the quorum's round rule: the deferred lane
@@ -1379,24 +1126,19 @@ mod tests {
         policy.on_fire_enqueued(stamp(a, 0, 0, 1), Some(a), 40, 37, 1);
         policy.on_fire_enqueued(stamp(b, 0, 0, 1), Some(b), 41, 37, 1);
         let queued: HashSet<u64> = [40, 41].into_iter().collect();
-        let FramePlan::Dispatch(wave0) = drive_past_cold_hold(&mut policy, &queued) else {
+        let FramePlan::Dispatch(frame_a) = drive_past_cold_hold(&mut policy, &queued) else {
             panic!("expected a seal");
         };
-        assert_eq!(wave0, vec![40], "first-fit admits lane a only");
-        policy.on_fires_posted(&[40]);
+        assert_eq!(frame_a[0], vec![40], "first-fit admits lane a only");
         // Lane a is served (round rule) — b seals NOW, while a's partition
         // is still in flight, because their lane sets are disjoint.
-        let FramePlan::Dispatch(partition) = policy.plan_dispatch(&queued, Instant::now())
-        else {
+        let FramePlan::Dispatch(frame_b) = plan(&mut policy, &queued, Instant::now()) else {
             panic!("the deferred lane must seal within the round");
         };
-        assert_eq!(partition, vec![41]);
-        policy.on_fires_posted(&[41]);
-        policy.on_fire_retired(40, false);
-        policy.on_fire_retired(41, false);
+        assert_eq!(frame_b[0], vec![41]);
         // Round closed at b's seal: the next epoch awaits BOTH lanes again.
         let queued: HashSet<u64> = HashSet::new();
-        assert_eq!(policy.plan_dispatch(&queued, Instant::now()), FramePlan::Park);
+        assert_eq!(plan(&mut policy, &queued, Instant::now()), FramePlan::Park);
     }
 
     /// After an epoch, every awaited lane must resubmit before the next
@@ -1409,25 +1151,17 @@ mod tests {
         policy.on_fire_enqueued(stamp(a, 0, 0, 2), Some(a), 60, 1, 1);
         policy.on_fire_enqueued(stamp(a, 0, 1, 2), Some(a), 61, 1, 1);
         let queued: HashSet<u64> = [60, 61].into_iter().collect();
-        let FramePlan::Dispatch(wave0) = drive_past_cold_hold(&mut policy, &queued) else {
-            panic!("expected lane a's wave 0");
+        let FramePlan::Dispatch(frame_a) = drive_past_cold_hold(&mut policy, &queued) else {
+            panic!("expected lane a's whole frame");
         };
-        assert_eq!(wave0, vec![60]);
-        policy.on_fires_posted(&[60]);
-        policy.on_fire_retired(60, false);
-        let FramePlan::Dispatch(wave1) = policy.plan_dispatch(&queued, Instant::now()) else {
-            panic!("expected lane a's wave 1");
-        };
-        assert_eq!(wave1, vec![61]);
-        policy.on_fires_posted(&[61]);
-        policy.on_fire_retired(61, false);
+        assert_eq!(frame_a, vec![vec![60], vec![61]]);
 
         // b arrives with a complete frame; a has NOT resubmitted. Wait-all:
         // no seal until a's next frame is in (or a leaves).
         policy.on_fire_enqueued(stamp(b, 0, 0, 2), Some(b), 70, 1, 1);
         policy.on_fire_enqueued(stamp(b, 0, 1, 2), Some(b), 71, 1, 1);
         let queued: HashSet<u64> = [70, 71].into_iter().collect();
-        match policy.plan_dispatch(&queued, Instant::now()) {
+        match plan(&mut policy, &queued, Instant::now()) {
             FramePlan::Hold(_) => {}
             plan => panic!("the epoch must wait for lane a to resubmit, got {plan:?}"),
         }
@@ -1436,11 +1170,11 @@ mod tests {
         policy.on_fire_enqueued(stamp(a, 1, 0, 2), Some(a), 80, 1, 1);
         policy.on_fire_enqueued(stamp(a, 1, 1, 2), Some(a), 81, 1, 1);
         let queued: HashSet<u64> = [70, 71, 80, 81].into_iter().collect();
-        let FramePlan::Dispatch(dense) = policy.plan_dispatch(&queued, Instant::now()) else {
+        let FramePlan::Dispatch(dense) = plan(&mut policy, &queued, Instant::now()) else {
             panic!("all lanes ready: the epoch must seal");
         };
-        assert_eq!(dense.len(), 2, "dense wave 0 holds both lanes");
-        assert!(dense.contains(&70) && dense.contains(&80));
+        assert_eq!(dense[0].len(), 2, "dense wave 0 holds both lanes");
+        assert!(dense[0].contains(&70) && dense[0].contains(&80));
     }
 
     /// Graceful close is the ONLY way a straggler stops being awaited: the
@@ -1452,27 +1186,20 @@ mod tests {
         policy.on_fire_enqueued(stamp(a, 0, 0, 1), Some(a), 90, 1, 1);
         policy.on_fire_enqueued(stamp(b, 0, 0, 1), Some(b), 91, 1, 1);
         let queued: HashSet<u64> = [90, 91].into_iter().collect();
-        let FramePlan::Dispatch(wave0) = drive_past_cold_hold(&mut policy, &queued) else {
-            panic!("expected the bootstrap epoch");
-        };
-        assert_eq!(wave0.len(), 2);
-        policy.on_fires_posted(&wave0);
-        policy.on_fire_retired(90, false);
-        policy.on_fire_retired(91, false);
+        let bootstrap = drive_past_cold_hold(&mut policy, &queued);
+        assert_eq!(fires(&bootstrap).len(), 2);
 
         // b resubmits; a does not — the gather blocks on a.
         policy.on_fire_enqueued(stamp(b, 1, 0, 1), Some(b), 92, 1, 1);
         let queued: HashSet<u64> = [92].into_iter().collect();
-        match policy.plan_dispatch(&queued, Instant::now()) {
+        match plan(&mut policy, &queued, Instant::now()) {
             FramePlan::Hold(_) => {}
             plan => panic!("the gather must block on lane a, got {plan:?}"),
         }
         // a closes gracefully: released from the wait-set, b seals.
         policy.on_lane_leave(a, false);
-        let FramePlan::Dispatch(next) = policy.plan_dispatch(&queued, Instant::now()) else {
-            panic!("the close must release the wait");
-        };
-        assert_eq!(next, vec![92]);
+        let next = plan(&mut policy, &queued, Instant::now());
+        assert_eq!(fires(&next), vec![92]);
     }
 
     /// A bind alone holds nothing: an unadmitted bring-up process cannot
@@ -1486,10 +1213,8 @@ mod tests {
         policy.on_fire_enqueued(stamp(lane, 0, 0, 1), Some(lane), 95, 1, 1);
         policy.on_bind_enqueued(Some(binder));
         let queued: HashSet<u64> = [95].into_iter().collect();
-        let FramePlan::Dispatch(wave0) = drive_past_cold_hold(&mut policy, &queued) else {
-            panic!("a staged (unearmarked) bind must not hold the seal");
-        };
-        assert_eq!(wave0, vec![95]);
+        let sealed = drive_past_cold_hold(&mut policy, &queued);
+        assert_eq!(fires(&sealed), vec![95]);
     }
 
     /// A freed slot with a staged taker holds the seal; the successor's
@@ -1517,9 +1242,8 @@ mod tests {
         }
         policy.on_fire_enqueued(stamp(successor, 0, 0, 1), Some(successor), 96, 1, 1);
         let queued: HashSet<u64> = [95, 96].into_iter().collect();
-        let FramePlan::Dispatch(mut wave0) = drive_past_cold_hold(&mut policy, &queued) else {
-            panic!("successor arrived: the seal must proceed dense");
-        };
+        let sealed = drive_past_cold_hold(&mut policy, &queued);
+        let mut wave0 = fires(&sealed);
         wave0.sort_unstable();
         assert_eq!(wave0, vec![95, 96], "both lanes gathered into one epoch");
     }
@@ -1562,9 +1286,8 @@ mod tests {
         policy.on_execution_slot_consumed(successor);
         policy.on_fire_enqueued(stamp(successor, 0, 0, 1), Some(successor), 96, 1, 1);
         let queued: HashSet<u64> = [95, 96].into_iter().collect();
-        let FramePlan::Dispatch(mut wave) = drive_past_cold_hold(&mut policy, &queued) else {
-            panic!("successor arrived: the seal must proceed dense");
-        };
+        let sealed = drive_past_cold_hold(&mut policy, &queued);
+        let mut wave = fires(&sealed);
         wave.sort_unstable();
         assert_eq!(wave, vec![95, 96], "cohort gathered across the departure");
     }
@@ -1650,9 +1373,8 @@ mod tests {
         policy.on_execution_slot_consumed(b);
         policy.on_fire_enqueued(stamp(b, 11, 0, 1), Some(b), 11, 1, 1);
         let queued: HashSet<u64> = [10, 11].into_iter().collect();
-        let FramePlan::Dispatch(mut wave) = drive_past_cold_hold(&mut policy, &queued) else {
-            panic!("fleet complete: seal must fire dense");
-        };
+        let sealed = drive_past_cold_hold(&mut policy, &queued);
+        let mut wave = fires(&sealed);
         wave.sort_unstable();
         assert_eq!(wave, vec![10, 11]);
     }
@@ -1703,30 +1425,26 @@ mod tests {
 
         // Slot released with an empty staged pool: no earmark, no hold.
         policy.on_execution_slot_released(pid());
-        let FramePlan::Dispatch(wave0) = drive_past_cold_hold(&mut policy, &queued) else {
-            panic!("a slot release with nobody staged must not hold");
-        };
-        assert_eq!(wave0, vec![95]);
-        policy.on_fires_posted(&wave0);
-        policy.on_fire_retired(95, false);
+        let sealed = drive_past_cold_hold(&mut policy, &queued);
+        assert_eq!(fires(&sealed), vec![95]);
 
         // Stage a successor (freed slot pending from above), admit it,
         // then let it die before firing: the leave releases the hold.
         policy.on_fire_enqueued(stamp(lane, 1, 0, 1), Some(lane), 96, 1, 1);
         policy.on_bind_enqueued(Some(successor));
         let queued: HashSet<u64> = [96].into_iter().collect();
-        match policy.plan_dispatch(&queued, Instant::now()) {
+        match plan(&mut policy, &queued, Instant::now()) {
             FramePlan::Hold(_) | FramePlan::Park => {}
             plan => panic!("freed slot with staged taker must hold, got {plan:?}"),
         }
         policy.on_execution_slot_consumed(successor);
-        match policy.plan_dispatch(&queued, Instant::now()) {
+        match plan(&mut policy, &queued, Instant::now()) {
             FramePlan::Hold(_) | FramePlan::Park => {}
             plan => panic!("join in flight must hold, got {plan:?}"),
         }
         policy.on_process_leave(successor);
         assert!(matches!(
-            policy.plan_dispatch(&queued, Instant::now()),
+            plan(&mut policy, &queued, Instant::now()),
             FramePlan::Dispatch(_)
         ));
     }
@@ -1742,9 +1460,7 @@ mod tests {
         policy.on_lane_leave(closed, false);
         policy.on_lane_leave(terminated, true);
         let queued: HashSet<u64> = [50].into_iter().collect();
-        let FramePlan::Dispatch(wave0) = drive_past_cold_hold(&mut policy, &queued) else {
-            panic!("closed lane's accepted frame still seals");
-        };
-        assert_eq!(wave0, vec![50]);
+        let sealed = drive_past_cold_hold(&mut policy, &queued);
+        assert_eq!(fires(&sealed), vec![50]);
     }
 }

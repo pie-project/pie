@@ -1,3 +1,4 @@
+#include <pie_native/step_launch.hpp>
 #include "context.hpp"
 
 #include <algorithm>
@@ -528,7 +529,7 @@ class Context::Impl {
     // §4.4 publication (channel words → terminals → per-channel notifies → the
     // batch notify, exactly once) off the caller thread. Non-forward
     // (channel-plane C1) members settle the same way, just without a forward.
-    static LaunchDemand launch_demand(const PieLaunchDesc& launch) {
+    static LaunchDemand launch_demand(const pie_native::StepLaunch& launch) {
         LaunchDemand demand;
         demand.kv_pages = launch.required_kv_pages;
         auto include_pages = [&demand](PieU32Slice pages) {
@@ -561,14 +562,120 @@ class Context::Impl {
                reserved.token_rows >= actual.token_rows;
     }
 
-    int launch(const PieLaunchDesc& launch, PieCompletion completion) {
-        return launch_impl(launch, completion, 0);
+    // Post one sealed frame (ABI v14): expand each step to the internal
+    // batch shape (roster → instance ids, frame translation → per-step
+    // slices) and run the per-batch path per step. The tail step carries
+    // the frame completion; the executor worker is a FIFO, so the tail's
+    // settlement implies every step settled.
+    int launch(const PieFrameDesc& frame, PieCompletion completion) {
+        const PieStepDesc* steps = frame.steps.ptr;
+        const std::size_t step_count = frame.steps.len;
+        if (steps == nullptr || step_count == 0) {
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
+        for (std::size_t i = 0; i < step_count; ++i) {
+            StepExpansion expansion;
+            expand_step(frame, steps[i], &expansion);
+            const bool tail = i + 1 == step_count;
+            const PieCompletion step_completion =
+                tail ? completion : PieCompletion{0, 0, nullptr};
+            const int status =
+                launch_impl(expansion.launch, step_completion);
+            if (status != PIE_STATUS_OK) return status;
+        }
+        return PIE_STATUS_OK;
+    }
+
+    struct StepExpansion {
+        std::vector<std::uint64_t> instance_ids;
+        std::vector<std::uint32_t> kv_translation;
+        std::vector<std::uint32_t> kv_translation_indptr;
+        pie_native::StepLaunch launch{};
+    };
+
+    static void expand_step(
+        const PieFrameDesc& frame,
+        const PieStepDesc& step,
+        StepExpansion* out) {
+        out->instance_ids.reserve(step.roster_rows.len);
+        out->kv_translation_indptr.reserve(step.roster_rows.len + 1);
+        out->kv_translation_indptr.push_back(0);
+        const bool have_translation = frame.kv_translation_indptr.len != 0;
+        for (std::size_t i = 0; i < step.roster_rows.len; ++i) {
+            const std::uint32_t row = step.roster_rows.ptr[i];
+            out->instance_ids.push_back(frame.instance_ids.ptr[row]);
+            if (have_translation) {
+                const std::uint32_t begin = frame.kv_translation_indptr.ptr[row];
+                const std::uint32_t end =
+                    frame.kv_translation_indptr.ptr[row + 1];
+                out->kv_translation.insert(
+                    out->kv_translation.end(),
+                    frame.kv_translation.ptr + begin,
+                    frame.kv_translation.ptr + end);
+            }
+            out->kv_translation_indptr.push_back(
+                static_cast<std::uint32_t>(out->kv_translation.size()));
+        }
+        pie_native::StepLaunch& launch = out->launch;
+        launch.instance_ids = {
+            out->instance_ids.data(), out->instance_ids.size()};
+        launch.terminal_cells = step.terminal_cells;
+        launch.token_ids = step.token_ids;
+        launch.position_ids = step.position_ids;
+        launch.kv_page_indices = step.kv_page_indices;
+        launch.kv_page_indptr = step.kv_page_indptr;
+        launch.kv_last_page_lens = step.kv_last_page_lens;
+        launch.qo_indptr = step.qo_indptr;
+        launch.rs_slot_ids = step.rs_slot_ids;
+        launch.rs_slot_flags = step.rs_slot_flags;
+        launch.rs_fold_lens = step.rs_fold_lens;
+        launch.rs_buffer_slot_ids = step.rs_buffer_slot_ids;
+        launch.rs_buffer_slot_indptr = step.rs_buffer_slot_indptr;
+        launch.masks = step.masks;
+        launch.sampling_indices = step.sampling_indices;
+        launch.sampling_indptr = step.sampling_indptr;
+        launch.context_ids = step.context_ids;
+        launch.single_token_mode = step.single_token_mode;
+        launch.has_user_mask = step.has_user_mask;
+        launch.required_kv_pages = frame.required_kv_pages;
+        launch.image_indptr = step.image_indptr;
+        launch.image_grids = step.image_grids;
+        launch.image_anchor_positions = step.image_anchor_positions;
+        launch.image_pixels = step.image_pixels;
+        launch.image_pixel_indptr = step.image_pixel_indptr;
+        launch.image_mrope_positions = step.image_mrope_positions;
+        launch.image_mrope_indptr = step.image_mrope_indptr;
+        launch.image_patch_positions = step.image_patch_positions;
+        launch.image_anchor_rows = step.image_anchor_rows;
+        launch.audio_features = step.audio_features;
+        launch.audio_feature_indptr = step.audio_feature_indptr;
+        launch.audio_anchor_rows = step.audio_anchor_rows;
+        launch.audio_indptr = step.audio_indptr;
+        launch.embed_rows = step.embed_rows;
+        launch.embed_indptr = step.embed_indptr;
+        launch.embed_shapes = step.embed_shapes;
+        launch.embed_dtypes = step.embed_dtypes;
+        launch.embed_anchor_rows = step.embed_anchor_rows;
+        launch.embed_block_indptr = step.embed_block_indptr;
+        launch.kv_len = step.kv_len;
+        launch.kv_len_device = step.kv_len_device;
+        launch.kv_translation = {
+            out->kv_translation.data(), out->kv_translation.size()};
+        launch.kv_translation_indptr = {
+            out->kv_translation_indptr.data(),
+            out->kv_translation_indptr.size()};
+        launch.ptir_program_row_indptr = step.ptir_program_row_indptr;
+        launch.ptir_kv_write_lower_bounds = step.ptir_kv_write_lower_bounds;
+        launch.ptir_kv_write_upper_bounds = step.ptir_kv_write_upper_bounds;
+        launch.logical_fire_ids = step.logical_fire_ids;
+        launch.channel_expected_head = step.channel_expected_head;
+        launch.channel_expected_tail = step.channel_expected_tail;
+        launch.channel_ticket_indptr = step.channel_ticket_indptr;
     }
 
     int launch_impl(
-        const PieLaunchDesc& launch,
-        PieCompletion completion,
-        std::uint64_t lease_id) {
+        const pie_native::StepLaunch& launch,
+        PieCompletion completion) {
         std::unique_lock<std::mutex> lock_holder(state_mutex_);
         std::vector<InstanceRecord*> members;
         members.reserve(launch.instance_ids.len);
@@ -636,7 +743,6 @@ class Context::Impl {
         // worker so a close racing the in-flight job is handled, not UAF'd.
         auto job = std::make_shared<LaunchJobData>();
         job->completion = completion;
-        job->lease_id = lease_id;
         job->launch = executor::OwnedLaunchView::capture(launch);
         job->members.resize(members.size());
         for (std::size_t m = 0; m < members.size(); ++m) {
@@ -679,81 +785,6 @@ class Context::Impl {
         lock_holder.unlock();  // never hold state_mutex_ across the worker post/return
         worker_.post([this, job] { run_launch_job(job); });
         return PIE_STATUS_OK;
-    }
-
-    int prepare_launch(
-        const PieLaunchDesc& launch,
-        PieLaunchPrepareResult* result) {
-        if (result == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
-        *result = PieLaunchPrepareResult{};
-        const LaunchDemand demand = launch_demand(launch);
-        int status = PIE_STATUS_OK;
-        worker_.run([&] {
-            std::string error;
-            if (!ensure_executor(error)) {
-                status = PIE_STATUS_UNSUPPORTED;
-                return;
-            }
-            const std::uint64_t budget_pages =
-                executor_->elastic_budget_pages();
-            result->budget_pages = budget_pages;
-            if (demand.kv_pages > executor_->kv_pool_total_pages() ||
-                demand.state_slots > executor_->rs_slots() ||
-            demand.token_rows > cfg_.batching.max_forward_tokens) {
-                result->outcome = PIE_LAUNCH_PREPARE_IMPOSSIBLE;
-                result->required_pages = budget_pages + 1;
-                return;
-            }
-            if (!executor_->ensure_launch_storage(
-                    demand.kv_pages,
-                    demand.state_slots,
-                    demand.token_rows,
-                    &error)) {
-                result->outcome = PIE_LAUNCH_PREPARE_EXHAUSTED;
-                result->required_pages =
-                    executor_->elastic_committed_pages() + 1;
-                return;
-            }
-            result->required_pages = executor_->elastic_committed_pages();
-            std::lock_guard<std::mutex> lock(state_mutex_);
-            std::uint64_t lease_id = next_launch_lease_id_++;
-            if (lease_id == 0) lease_id = next_launch_lease_id_++;
-            pending_launch_leases_.emplace(lease_id, demand);
-            result->outcome = PIE_LAUNCH_PREPARE_READY;
-            result->lease_id = lease_id;
-        });
-        return status;
-    }
-
-    int launch_prepared(
-        const PieLaunchDesc& launch,
-        std::uint64_t lease_id,
-        PieCompletion completion) {
-        if (lease_id == 0) return PIE_STATUS_INVALID_ARGUMENT;
-        {
-            std::lock_guard<std::mutex> lock(state_mutex_);
-            const auto found = pending_launch_leases_.find(lease_id);
-            if (found == pending_launch_leases_.end() ||
-                !demand_covers(found->second, launch_demand(launch))) {
-                return PIE_STATUS_INVALID_ARGUMENT;
-            }
-            in_flight_launch_leases_.emplace(lease_id, found->second);
-            pending_launch_leases_.erase(found);
-        }
-        const int status = launch_impl(launch, completion, lease_id);
-        if (status != PIE_STATUS_OK) {
-            std::lock_guard<std::mutex> lock(state_mutex_);
-            in_flight_launch_leases_.erase(lease_id);
-        }
-        return status;
-    }
-
-    int release_launch(std::uint64_t lease_id) {
-        if (lease_id == 0) return PIE_STATUS_INVALID_ARGUMENT;
-        std::lock_guard<std::mutex> lock(state_mutex_);
-        return pending_launch_leases_.erase(lease_id) == 1
-            ? PIE_STATUS_OK
-            : PIE_STATUS_INVALID_ARGUMENT;
     }
 
     // Phase 3 (review item 1): the OWNED, async settlement of one accepted
@@ -1436,10 +1467,6 @@ class Context::Impl {
         }
         for (const auto& [wait_id, epoch] : notifications) notify(wait_id, epoch);
         notify(job->completion.wait_id, job->completion.target_epoch);
-        if (job->lease_id != 0) {
-            std::lock_guard<std::mutex> lock(state_mutex_);
-            in_flight_launch_leases_.erase(job->lease_id);
-        }
         if (cfg_.runtime.verbose) {
             const M0TimingSnapshot timing =
                 m0_timing_counters().snapshot() - timing_before;
@@ -1627,8 +1654,7 @@ class Context::Impl {
         }
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
-            if (!pending_launch_leases_.empty() ||
-                !in_flight_launch_leases_.empty()) {
+            if (false) {
                 return PIE_STATUS_UNSUPPORTED;
             }
         }
@@ -2031,9 +2057,6 @@ class Context::Impl {
     // can never race an in-flight forward's settlement. Declared BEFORE the
     // worker + executor so it outlives them at teardown.
     std::mutex state_mutex_;
-    std::unordered_map<std::uint64_t, LaunchDemand> pending_launch_leases_;
-    std::unordered_map<std::uint64_t, LaunchDemand> in_flight_launch_leases_;
-    std::uint64_t next_launch_lease_id_ = 1;
     // Phase 3 (§7, D4): the single thread that owns every MetalExecutor /
     // RawMetalContext touch. Executor setup, forward_batch, and the copy/
     // resize control ops all run here (via `worker_.run`), giving Metal
@@ -2085,26 +2108,10 @@ int Context::bind_instance(
     return impl_->bind_instance(instance, binding);
 }
 
-int Context::launch(const PieLaunchDesc& launch, PieCompletion completion) {
-    return impl_->launch(launch, completion);
+int Context::launch(const PieFrameDesc& frame, PieCompletion completion) {
+    return impl_->launch(frame, completion);
 }
 
-int Context::prepare_launch(
-    const PieLaunchDesc& launch,
-    PieLaunchPrepareResult* result) {
-    return impl_->prepare_launch(launch, result);
-}
-
-int Context::launch_prepared(
-    const PieLaunchDesc& launch,
-    std::uint64_t lease_id,
-    PieCompletion completion) {
-    return impl_->launch_prepared(launch, lease_id, completion);
-}
-
-int Context::release_launch(std::uint64_t lease_id) {
-    return impl_->release_launch(lease_id);
-}
 
 int Context::copy_kv(const PieKvCopyDesc& copy, PieCompletion completion) {
     return impl_->copy_kv(copy, completion);

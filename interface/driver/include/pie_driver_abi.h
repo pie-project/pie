@@ -51,15 +51,15 @@
 /**
  * Current direct local ABI version.
  *
- * v12: finalized launches can be prepared into a driver-owned elastic-memory
- * lease and then launched or released exactly once.
- *
- * v13: `PieLaunchDesc.settle_defer` (was `reserved0`) marks a launch whose
- * heavy settlement (batch completion notify, `cuda_settled`, instance-close
- * fences) may be deferred and drained by the next settle-now launch of its
- * frame group; a held lease is consumed only by a settle-now launch.
+ * v14 (Project Venus): the launch unit is the sealed **frame** — one
+ * [`PieFrameDesc`] carries k forward steps that the driver executes as one
+ * closed system with a single completion. Frame-invariant tables (lane
+ * roster, WorkingSet page translation, frame-union KV admission demand) are
+ * hoisted out of the per-step sections. Admission is folded into the launch
+ * call itself ([`PIE_STATUS_EXHAUSTED`] / [`PIE_STATUS_IMPOSSIBLE`]); the
+ * v12 prepare/lease surface and the v13 `settle_defer` lever are deleted.
  */
-#define PIE_DRIVER_ABI_VERSION 13
+#define PIE_DRIVER_ABI_VERSION 14
 
 #define PIE_MODEL_COMPONENT_FULL 0
 
@@ -98,19 +98,15 @@
 #define PIE_STATUS_DRIVER_ERROR -5
 
 /**
- * The finalized launch was admitted and `lease_id` is valid.
+ * Frame admission is full right now; the frame may fit after physical
+ * budget is released. The engine re-posts later.
  */
-#define PIE_LAUNCH_PREPARE_READY 0
+#define PIE_STATUS_EXHAUSTED -6
 
 /**
- * The launch may fit later after physical budget is released.
+ * The frame can never fit within the driver's physical budget ceiling.
  */
-#define PIE_LAUNCH_PREPARE_EXHAUSTED 1
-
-/**
- * The launch can never fit within the driver's physical budget ceiling.
- */
-#define PIE_LAUNCH_PREPARE_IMPOSSIBLE 2
+#define PIE_STATUS_IMPOSSIBLE -7
 
 #define PIE_GEOMETRY_CLASS_HOST 0
 
@@ -487,25 +483,33 @@ typedef struct PieMaskWordsDesc {
 } PieMaskWordsDesc;
 
 /**
- * One batched launch descriptor.
+ * One forward step of a frame: the per-step section of [`PieFrameDesc`].
+ *
+ * A step's batch members reference the frame's lane roster through
+ * `roster_rows` and are partitioned into ordered geometry-homogeneous
+ * sub-batches; sub-batch order resolves producer→consumer dependencies
+ * within the step. Device-resolved (decode-envelope) sub-batches elide
+ * their wire geometry exactly as in v13, so decode steps are naturally
+ * small. Frame-invariant tables (roster ids, WorkingSet page translation,
+ * KV admission demand) live on the frame, not the step.
  */
-typedef struct PieLaunchDesc {
-  uint32_t abi_version;
+typedef struct PieStepDesc {
   /**
-   * `1` = the driver may defer this launch's heavy settlement (batch
-   * completion notify, `cuda_settled`, instance-close fences) until the
-   * frame group's next settle-now launch drains it; per-wave publication
-   * (mirror copies, doorbells, waiter wakes, terminal cells) is never
-   * deferred. `0` = settle now, draining any deferred predecessors.
-   * Values above `1` are invalid.
+   * Indices into the frame roster (`PieFrameDesc::instance_ids`), one per
+   * batch member, in sub-batch order.
    */
-  uint32_t settle_defer;
+  struct PieU32Slice roster_rows;
   /**
-   * Bound instance ids, one per fire/program in scheduler order.
+   * CSR over `roster_rows`: sub-batch `b` spans members
+   * `[sub_batch_indptr[b], sub_batch_indptr[b+1])`.
    */
-  struct PieU64Slice instance_ids;
+  struct PieU32Slice sub_batch_indptr;
   /**
-   * Stable terminal control cell addresses, one per `instance_ids` member.
+   * `PIE_GEOMETRY_CLASS_*` per sub-batch, parallel to the CSR segments.
+   */
+  struct PieU32Slice sub_batch_class;
+  /**
+   * Stable terminal control cell addresses, one per `roster_rows` member.
    */
   struct PieTerminalCellPtrSlice terminal_cells;
   struct PieU32Slice token_ids;
@@ -549,9 +553,9 @@ typedef struct PieLaunchDesc {
    */
   uint8_t reserved_flags[2];
   /**
-   * Exclusive physical KV page high-water required before this launch.
+   * Reserved; must be zero.
    */
-  uint32_t required_kv_pages;
+  uint32_t reserved0;
   struct PieU32Slice image_indptr;
   struct PieU32Slice image_grids;
   struct PieU32Slice image_anchor_positions;
@@ -574,15 +578,72 @@ typedef struct PieLaunchDesc {
   struct PieU32Slice kv_len;
   struct PieU64Slice kv_len_device;
   /**
-   * Per-instance WorkingSet page translation, flattened across the batch:
-   * entry `i` of an instance's segment is the PHYSICAL KV page id backing
-   * WorkingSet-relative page index `i` for THIS fire (committed mapping
-   * overlaid with the fire's prepared write targets). The driver maps any
+   * Program → wire-request attribution CSR (`len == roster_rows.len + 1`
+   * when present, else empty): step member `p` owns the wire request rows
+   * `[row_indptr[p], row_indptr[p+1])` of `qo_indptr`/`kv_page_indptr`/
+   * `sampling_indptr`. A device-geometry member's span is its empty
+   * wire placeholder row; the driver substitutes its channel-resolved
+   * geometry for that span when composing the forward batch.
+   */
+  struct PieU32Slice ptir_program_row_indptr;
+  struct PieU64Slice ptir_kv_write_lower_bounds;
+  struct PieU64Slice ptir_kv_write_upper_bounds;
+  /**
+   * Immutable logical-fire ids, one per `roster_rows` member.
+   */
+  struct PieU64Slice logical_fire_ids;
+  /**
+   * Dense-channel sequence tickets, CSR-partitioned per `roster_rows`
+   * member.
+   */
+  struct PieU64Slice channel_expected_head;
+  struct PieU64Slice channel_expected_tail;
+  struct PieU32Slice channel_ticket_indptr;
+} PieStepDesc;
+
+/**
+ * Borrowed slice of per-step sections.
+ *
+ * `ptr` may be null only when `len == 0`.
+ */
+typedef struct PieStepDescSlice {
+  const struct PieStepDesc *ptr;
+  size_t len;
+} PieStepDescSlice;
+
+/**
+ * One sealed frame: the v14 launch unit.
+ *
+ * The driver executes the frame's steps as one closed system — steps chain
+ * on-stream (device-resolved token feedback), data publication stays
+ * per-step on-stream, and control settlement happens once at the frame
+ * tail through the single launch completion. Admission is evaluated
+ * against the frame-union demand at the launch call ([`PIE_STATUS_EXHAUSTED`]
+ * / [`PIE_STATUS_IMPOSSIBLE`]); a frame that admits cannot fail per-lane
+ * mid-frame (stream work is SUCCESS-only; deterministic compose kills latch
+ * per-lane FAILED at the tail).
+ */
+typedef struct PieFrameDesc {
+  uint32_t abi_version;
+  /**
+   * Reserved; must be zero.
+   */
+  uint32_t reserved0;
+  /**
+   * Lane roster: every bound instance participating in any step, in
+   * scheduler order. No duplicates. Step sections reference these entries
+   * by index (`PieStepDesc::roster_rows`).
+   */
+  struct PieU64Slice instance_ids;
+  /**
+   * Frame-union WorkingSet page translation, flattened across the roster:
+   * entry `i` of a lane's segment is the PHYSICAL KV page id backing
+   * WorkingSet-relative page index `i` for this FRAME (committed mapping
+   * overlaid with ALL steps' prepared write targets). The driver maps any
    * WorkingSet-relative page reference it resolves from device channels
    * (`Pages` / `WSlot` descriptor ports) through this table; guests never
-   * see physical ids (kv_refact.md, flattened-table model). An empty
-   * segment means the instance's channel geometry is already physical
-   * (legacy) or absent.
+   * see physical ids. An empty segment means the lane's channel geometry
+   * is already physical (legacy) or absent.
    */
   struct PieU32Slice kv_translation;
   /**
@@ -591,27 +652,19 @@ typedef struct PieLaunchDesc {
    */
   struct PieU32Slice kv_translation_indptr;
   /**
-   * Program → wire-request attribution CSR (`len == instance_ids.len + 1`
-   * when present, else empty): program `p` owns the wire request rows
-   * `[row_indptr[p], row_indptr[p+1])` of `qo_indptr`/`kv_page_indptr`/
-   * `sampling_indptr`. A device-geometry program's span is its empty
-   * wire placeholder row; the driver substitutes its channel-resolved
-   * geometry for that span when composing the forward batch.
+   * Exclusive physical KV page high-water required after the LAST step —
+   * the frame-union admission demand.
    */
-  struct PieU32Slice ptir_program_row_indptr;
-  struct PieU64Slice ptir_kv_write_lower_bounds;
-  struct PieU64Slice ptir_kv_write_upper_bounds;
+  uint32_t required_kv_pages;
   /**
-   * Immutable logical-fire ids, one per instance.
+   * Reserved; must be zero.
    */
-  struct PieU64Slice logical_fire_ids;
+  uint32_t reserved1;
   /**
-   * Dense-channel sequence tickets, CSR-partitioned per instance.
+   * The frame's steps in execution order. Never empty.
    */
-  struct PieU64Slice channel_expected_head;
-  struct PieU64Slice channel_expected_tail;
-  struct PieU32Slice channel_ticket_indptr;
-} PieLaunchDesc;
+  struct PieStepDescSlice steps;
+} PieFrameDesc;
 
 /**
  * Payload-free asynchronous completion target.
@@ -620,38 +673,11 @@ typedef struct PieCompletion {
   uint64_t wait_id;
   uint64_t target_epoch;
   /**
-   * Stable terminal control cell for value-less operations. Launch batches
-   * use the per-member `PieLaunchDesc::terminal_cells` instead.
+   * Stable terminal control cell for value-less operations. Frame launches
+   * use the per-member `PieStepDesc::terminal_cells` instead.
    */
   struct PieTerminalCell *terminal_cell;
 } PieCompletion;
-
-/**
- * Result of synchronously preparing one finalized launch.
- *
- * `lease_id` is nonzero only for [`PIE_LAUNCH_PREPARE_READY`]. A ready lease
- * is consumed by exactly one `*_launch_prepared` or `*_release_launch` call.
- */
-typedef struct PieLaunchPrepareResult {
-  uint32_t outcome;
-  /**
-   * Reserved; must be zero.
-   */
-  uint32_t reserved0;
-  uint64_t lease_id;
-  /**
-   * Monotonic physical-budget generation observed by this attempt.
-   */
-  uint64_t budget_generation;
-  /**
-   * Independently rounded physical pages required by the finalized launch.
-   */
-  uint64_t required_pages;
-  /**
-   * Current physical budget in the same page units.
-   */
-  uint64_t budget_pages;
-} PieLaunchPrepareResult;
 
 typedef struct PieMutBytes {
   uint8_t *ptr;
@@ -859,19 +885,8 @@ extern int32_t pie_cuda_bind_instance(PieDriver *driver,
                                       struct PieInstanceBinding *binding);
 
 extern int32_t pie_cuda_launch(PieDriver *driver,
-                               const struct PieLaunchDesc *launch,
+                               const struct PieFrameDesc *frame,
                                struct PieCompletion completion);
-
-extern int32_t pie_cuda_prepare_launch(PieDriver *driver,
-                                       const struct PieLaunchDesc *launch,
-                                       struct PieLaunchPrepareResult *result);
-
-extern int32_t pie_cuda_launch_prepared(PieDriver *driver,
-                                        const struct PieLaunchDesc *launch,
-                                        uint64_t lease_id,
-                                        struct PieCompletion completion);
-
-extern int32_t pie_cuda_release_launch(PieDriver *driver, uint64_t lease_id);
 
 extern int32_t pie_cuda_encode(PieDriver *driver,
                                const struct PieEncodeDesc *encode,
@@ -915,19 +930,8 @@ extern int32_t pie_metal_bind_instance(PieDriver *driver,
                                        struct PieInstanceBinding *binding);
 
 extern int32_t pie_metal_launch(PieDriver *driver,
-                                const struct PieLaunchDesc *launch,
+                                const struct PieFrameDesc *frame,
                                 struct PieCompletion completion);
-
-extern int32_t pie_metal_prepare_launch(PieDriver *driver,
-                                        const struct PieLaunchDesc *launch,
-                                        struct PieLaunchPrepareResult *result);
-
-extern int32_t pie_metal_launch_prepared(PieDriver *driver,
-                                         const struct PieLaunchDesc *launch,
-                                         uint64_t lease_id,
-                                         struct PieCompletion completion);
-
-extern int32_t pie_metal_release_launch(PieDriver *driver, uint64_t lease_id);
 
 extern int32_t pie_metal_encode(PieDriver *driver,
                                 const struct PieEncodeDesc *encode,
