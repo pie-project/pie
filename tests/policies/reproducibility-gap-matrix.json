@@ -1,0 +1,2640 @@
+{
+  "entries": [
+    {
+      "best_achievable_evidence_with_current_model": "faithful",
+      "citations": [
+        "https://arxiv.org/html/2502.13965v1#S4.SS2",
+        "pie-project/pie@9e837d8dd:tests/policies/paper-agentix/src/lib.rs:17-73",
+        "pie-project/pie@9e837d8dd:tests/policies/replications/agentix/metadata.json:9-20",
+        "pie-project/pie@9e837d8dd:scripts/benchmark-plex-policy-performance.py:431-474",
+        "pie-project/pie@9e837d8dd:interface/plex/src/v0_6/types.rs:127-177"
+      ],
+      "current_model_improvements": [
+        {
+          "change": "waiting_ms is converted to microseconds before starvation comparison; the benchmark oracle matches.",
+          "files": [
+            "tests/policies/paper-agentix/src/lib.rs",
+            "scripts/benchmark-plex-policy-performance.py"
+          ],
+          "gap": "Waiting and service used different units.",
+          "why_expressible_now": "Typed schedule facts and WorkGroup scratch already carry wait and aggregate service, so no new authority was needed."
+        },
+        {
+          "change": "Metadata now labels the kernel inspired-adaptation and targets only the verified 4-15x equal-latency claim.",
+          "files": [
+            "tests/policies/replications/agentix/metadata.json",
+            "tests/policies/performance-targets.json"
+          ],
+          "gap": "Replication evidence and headline claim were overstated.",
+          "why_expressible_now": "Evidence boundaries now distinguish an implementable reduced kernel from full PLAS/ATLAS parity."
+        }
+      ],
+      "id": "agentix",
+      "implementation_gaps": [
+        {
+          "files": [
+            "tests/policies/paper-agentix/src/lib.rs"
+          ],
+          "fix": "Implement explicit PLAS and ATLAS modes using group/request scratch, trusted parent/thread facts, timer opportunities, and feedback-driven service accounting.",
+          "gap": "Continuous least-service sorting still omits PLAS queue bands, quanta, demotion, and ATLAS critical-path state.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "tests/policies/paper-agentix/src/lib.rs"
+          ],
+          "fix": "Resolve the request's trusted group and charge enacted service to the group exactly once.",
+          "gap": "Request-scoped service feedback is written only to request scratch while scheduling reads only group scratch.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "tests/policies/paper-agentix/src/lib.rs"
+          ],
+          "fix": "Maintain queue index, remaining quantum, cumulative wait, current-call service, promotion, and reset state.",
+          "gap": "Anti-starvation lacks aggregate program-plus-call wait, promotion state, and reset semantics.",
+          "severity": "P1"
+        },
+        {
+          "files": [
+            "scripts/benchmark-plex-policy-performance.py"
+          ],
+          "fix": "Replay sequential and fork/join programs across multiple scheduling quanta and compare program JCT, throughput, and tail starvation with FCFS and MLFQ.",
+          "gap": "The benchmark remains a one-shot tuple oracle.",
+          "severity": "P2"
+        }
+      ],
+      "new_primitives_required": [],
+      "recommended_sequence": [
+        "Define versioned PLAS/ATLAS fact schemas and an independent reference model.",
+        "Fix request-to-group feedback charging.",
+        "Implement queue, quantum, demotion, starvation, and ATLAS transitions.",
+        "Add stateful differential and metamorphic traces.",
+        "Replace the synthetic benchmark before promoting evidence."
+      ]
+    },
+    {
+      "best_achievable_evidence_with_current_model": "faithful",
+      "citations": [
+        "https://arxiv.org/html/2511.02230v6#S4",
+        "pie-project/pie@9e837d8dd:tests/policies/paper-continuum/src/lib.rs:17-143",
+        "pie-project/pie@9e837d8dd:tests/policies/replications/continuum/metadata.json:9-21",
+        "pie-project/pie@9e837d8dd:scripts/benchmark-plex-policy-performance.py:477-537",
+        "pie-project/pie@9e837d8dd:interface/plex/src/v0_6/types.rs:350-422"
+      ],
+      "current_model_improvements": [
+        {
+          "change": "A capacity-aware reclaim_prefix now stops after enough bytes are freed.",
+          "files": [
+            "tests/policies/paper-continuum/src/lib.rs"
+          ],
+          "gap": "Cache plans reclaimed every unpinned resident rather than the required capacity.",
+          "why_expressible_now": "CacheContext already exposes resident/prospective sizes and capacity in one coherent snapshot."
+        },
+        {
+          "change": "Metadata pins artifact commit 316a5879 and labels the implementation inspired-adaptation.",
+          "files": [
+            "tests/policies/replications/continuum/metadata.json"
+          ],
+          "gap": "Artifact provenance and evidence were unpinned and overstated.",
+          "why_expressible_now": "The estimator-free artifact can now be separated from the paper's TTL optimizer claim."
+        }
+      ],
+      "id": "continuum",
+      "implementation_gaps": [
+        {
+          "files": [
+            "tests/policies/paper-continuum/src/lib.rs"
+          ],
+          "fix": "Maintain tool-duration histories, tool identity, memory pressure, reload time, ordering correlation, and evaluate candidate TTLs including zero.",
+          "gap": "The paper's empirical-CDF utility optimizer is still replaced by host-supplied ttl_ms and a Boolean.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "tests/policies/paper-continuum/src/lib.rs"
+          ],
+          "fix": "Store expires_at_ms in group/request scratch, consume trusted now_ms and queue facts, and clear the pin only under the paper's expiry condition.",
+          "gap": "Active TTL is not timestamped and expiry does not check whether another request from the same program is queued.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "tests/policies/paper-continuum/src/lib.rs"
+          ],
+          "fix": "Exclude active pins unless an explicitly modeled paper fallback applies; remove unsupported reload-cost ordering.",
+          "gap": "Pinned residents are sorted last but can still be reclaimed without an explicit expiry or pin-break rule; reload_cost ordering is not the paper policy.",
+          "severity": "P1"
+        },
+        {
+          "files": [
+            "scripts/benchmark-plex-policy-performance.py"
+          ],
+          "fix": "Use multi-turn tool traces under pressure and compare LRU, fixed-2s, optimized-TTL, and oracle-TTL baselines.",
+          "gap": "The benchmark conflates preempted and pinned priority and uses a strawman cache victim.",
+          "severity": "P2"
+        }
+      ],
+      "new_primitives_required": [],
+      "recommended_sequence": [
+        "Define trusted time, tool-history, pressure, and same-program queue facts.",
+        "Implement the TTL reference optimizer and timestamped state transitions.",
+        "Correct pin-preservation and pressure fallback semantics.",
+        "Differentially replay the pinned artifact for its supported subset and a paper oracle for estimation.",
+        "Replace the benchmark with response-time, throughput, and miss-cost traces."
+      ]
+    },
+    {
+      "best_achievable_evidence_with_current_model": "faithful",
+      "citations": [
+        "https://arxiv.org/html/2507.07400v1#S3",
+        "pie-project/pie@9e837d8dd:tests/policies/paper-kvflow/src/lib.rs:16-124",
+        "pie-project/pie@9e837d8dd:tests/policies/replications/kvflow/metadata.json:9-24",
+        "pie-project/pie@9e837d8dd:interface/plex/src/v0_6/mechanics.rs:69-83",
+        "pie-project/pie@9e837d8dd:scripts/benchmark-plex-policy-performance.py:540-587"
+      ],
+      "current_model_improvements": [
+        {
+          "change": "Scheduling now hard-filters cache_ready, honors all capacities, excludes loading/offloading objects, and reclaims only the required byte prefix.",
+          "files": [
+            "tests/policies/paper-kvflow/src/lib.rs"
+          ],
+          "gap": "Non-ready work could run, max_selections was ignored, transfer-active nodes were evictable, and all residents were reclaimed.",
+          "why_expressible_now": "Runnable facts, cache-object facts, bounded schedule capacity, and the existing cache operation already express these decisions."
+        },
+        {
+          "change": "Metadata now declares loading/offloading facts, pins the artifact SHA, marks prefetch optional, and downgrades evidence.",
+          "files": [
+            "tests/policies/replications/kvflow/metadata.json",
+            "interface/plex/src/v0_6/mechanics.rs"
+          ],
+          "gap": "Transfer mechanics were conflated with the policy kernel.",
+          "why_expressible_now": "cache.prefetch@1 and action feedback separate policy intent from adapter transfer overlap."
+        }
+      ],
+      "id": "kvflow",
+      "implementation_gaps": [
+        {
+          "files": [
+            "tests/policies/paper-kvflow/src/lib.rs",
+            "tests/policies/replications/kvflow/metadata.json"
+          ],
+          "fix": "Add a bounded trusted fact producer or policy-side reference module and validate its outputs against the artifact.",
+          "gap": "No implementation or validated producer constructs the Agent Step Graph, AND/OR STE recurrence, or minimum aggregation for shared radix nodes.",
+          "severity": "P1"
+        },
+        {
+          "files": [
+            "tests/policies/paper-kvflow/src/lib.rs"
+          ],
+          "fix": "Implement feedback, correlate action IDs, and transition explicit cache-tier states only after enacted outcomes.",
+          "gap": "Prefetch action IDs and completion/failure do not update loading, CPU-backup, or GPU-resident state.",
+          "severity": "P1"
+        },
+        {
+          "files": [
+            "tests/policies/paper-kvflow/src/lib.rs",
+            "tests/policies/replications/kvflow/cases/basic.json"
+          ],
+          "fix": "Apply the paper's node-level admission/state rules and add shared-beneficiary cases.",
+          "gap": "Prospective objects are unconditionally admitted and shared-node beneficiary semantics are not tested.",
+          "severity": "P1"
+        },
+        {
+          "files": [
+            "scripts/benchmark-plex-policy-performance.py"
+          ],
+          "fix": "Use AND/OR DAGs, shared radix nodes, four cache states, constrained capacity, and workflow makespan/cache-stall metrics.",
+          "gap": "The benchmark still uses independent objects and never exercises prefetch or transfer overlap.",
+          "severity": "P2"
+        }
+      ],
+      "new_primitives_required": [],
+      "recommended_sequence": [
+        "Implement and validate the Agent Step Graph fact producer.",
+        "Add explicit tier/action state transitions through feedback.",
+        "Add artifact-derived shared-node and transfer-state traces.",
+        "Test prefetch success, failure, expiry, and unsupported mechanics.",
+        "Run end-to-end workflow-stall and makespan benchmarks."
+      ]
+    },
+    {
+      "best_achievable_evidence_with_current_model": "decision-trace-parity",
+      "citations": [
+        "arXiv:2407.00023v2 \u00a73.2-3.3",
+        "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-preble/src/lib.rs:9-54",
+        "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/preble/metadata.json:6-26",
+        "/home/ingim/.patissier/work/plex-alpha/scripts/benchmark-plex-policy-performance.py:590-640"
+      ],
+      "current_model_improvements": [
+        {
+          "change": "Exploit now breaks ties by load; exploration consumes per-edge miss_prefill_cost; assignments track max_assignments.",
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-preble/src/lib.rs",
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/preble/metadata.json"
+          ],
+          "gap": "Exploit ties ignored load and exploration reused one target-invariant miss cost.",
+          "why_expressible_now": "Sparse route edges carry target-specific cache/load/eviction facts, and set-oriented targets expose assignment capacity."
+        },
+        {
+          "change": "The public release commit is pinned and evidence is labeled inspired-adaptation.",
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/preble/metadata.json"
+          ],
+          "gap": "Artifact provenance and evidence were overstated.",
+          "why_expressible_now": "Replication metadata can separate decision fidelity from deferred mechanics without changing the ABI."
+        }
+      ],
+      "id": "preble",
+      "implementation_gaps": [
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-preble/src/lib.rs",
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/preble/metadata.json"
+          ],
+          "fix": "Use policy state for rolling load and redirect decisions; add schedule/cache behavior and stage cache.prefetch@1 for explicit prefix replication.",
+          "gap": "Post-assignment load redirection, prefix replication, prefill/decode mixing, and local priority scheduling remain absent.",
+          "severity": "P1"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/scripts/benchmark-plex-policy-performance.py",
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/preble/metadata.json"
+          ],
+          "fix": "Define units in fact schemas and replay paper-derived per-target L_i, M_i, and P_i values.",
+          "gap": "The producer and benchmark do not guarantee that load_cost, eviction_cost, and miss_prefill_cost are consistently profiled GPU-time quantities.",
+          "severity": "P1"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-preble/src/lib.rs",
+            "/home/ingim/.patissier/work/plex-alpha/interface/plex/src/v0_6/types.rs"
+          ],
+          "fix": "Add a shared capacity-accounting helper over edge demands and target limits.",
+          "gap": "Only max_assignments is tracked; aggregate ResourceLimit consumption is not decremented during multi-request routing.",
+          "severity": "P1"
+        }
+      ],
+      "new_primitives_required": [],
+      "recommended_sequence": [
+        "Specify fact units and correct the benchmark miss-cost producer.",
+        "Add aggregate capacity accounting.",
+        "Implement rolling-load redirection and local scheduling decisions.",
+        "Add artifact differential traces, then test optional prefix-prefetch outcomes."
+      ]
+    },
+    {
+      "best_achievable_evidence_with_current_model": "faithful",
+      "citations": [
+        "https://arxiv.org/html/2603.16104v1#S5",
+        "pie-project/pie@9e837d8dd:tests/policies/paper-helium/src/lib.rs:13-63",
+        "pie-project/pie@9e837d8dd:tests/policies/replications/helium/metadata.json:9-28",
+        "pie-project/pie@9e837d8dd:plex_0.6_contract.md:497-530",
+        "pie-project/pie@9e837d8dd:scripts/benchmark-plex-policy-performance.py:644-687"
+      ],
+      "current_model_improvements": [
+        {
+          "change": "Metadata now explicitly classifies query-plan rewrite and proactive warming as deferred and labels the local kernel inspired-adaptation.",
+          "files": [
+            "tests/policies/replications/helium/metadata.json",
+            "interface/plex/src/v0_6/types.rs",
+            "interface/plex/src/v0_6/mechanics.rs"
+          ],
+          "gap": "Whole-DAG planning was previously conflated with a local scheduler hook.",
+          "why_expressible_now": "A bounded host planner can provide trusted DAG/TRT facts; WorkGroup scratch, route, repeated schedule opportunities, multi-request selections, and cache.prefetch@1 can enact the resulting plan."
+        }
+      ],
+      "id": "helium",
+      "implementation_gaps": [
+        {
+          "files": [
+            "tests/policies/paper-helium/src/lib.rs"
+          ],
+          "fix": "Port the whole-DAG reference planner or consume a validated host-produced plan with worker, sequence-path, start-step, and dependency facts.",
+          "gap": "The implementation remains a one-request lexicographic heuristic rather than Algorithm 1's partitioning, scheduling tree, critical-path recursion, capacity timeline, and nested sequences.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "tests/policies/paper-helium/src/lib.rs",
+            "tests/policies/replications/helium/metadata.json"
+          ],
+          "fix": "Add route and cache operations using worker-capacity facts and cache.prefetch@1, with action feedback.",
+          "gap": "The package implements neither worker assignment nor proactive warming.",
+          "severity": "P1"
+        },
+        {
+          "files": [
+            "tests/policies/paper-helium/src/lib.rs"
+          ],
+          "fix": "Persist the bounded scheduling-tree cursor and emit exact plan segments across opportunities.",
+          "gap": "No scoped state tracks emitted nested-sequence segments or forced-progress transitions.",
+          "severity": "P1"
+        },
+        {
+          "files": [
+            "scripts/benchmark-plex-policy-performance.py"
+          ],
+          "fix": "Execute complete batched DAGs on multiple workers and compare query-wise, op-wise, random, and LSPF using makespan, token steps, and cache hit rate.",
+          "gap": "The benchmark remains a tautological random tuple test.",
+          "severity": "P2"
+        }
+      ],
+      "new_primitives_required": [],
+      "recommended_sequence": [
+        "Build an artifact-backed whole-DAG planner and plan schema.",
+        "Add route/cache surfaces and scoped execution-plan state.",
+        "Replay Algorithm 1 decisions, including forced progress and nested sequences.",
+        "Validate prefetch outcomes separately from schedule parity.",
+        "Replace the benchmark with the paper's multi-worker workflows."
+      ]
+    },
+    {
+      "best_achievable_evidence_with_current_model": "faithful",
+      "citations": [
+        "HEAD 9e837d8dd",
+        "arXiv:2401.00588v2 section 4.1 Algorithm 2",
+        "tests/policies/paper-common/src/lib.rs:15-125",
+        "tests/policies/replications/vtc/metadata.json:9-25",
+        "scripts/benchmark-plex-policy-performance.py:690-740",
+        "plex_0.6.md:283-315",
+        "plex_0.6.md:820-820"
+      ],
+      "current_model_improvements": [
+        {
+          "change": "Added active-client tracking, returning-client lift, iterative minimum-counter selection, weighted dispatch-input charging, and zero-budget filtering.",
+          "files": [
+            "tests/policies/paper-common/src/lib.rs",
+            "tests/policies/replications/vtc/metadata.json"
+          ],
+          "gap": "Counter lift and batch-local accounting were absent.",
+          "why_expressible_now": "Set-oriented schedule inputs, shared scoped state, deterministic request order, and per-request token budgets already provide the required authority."
+        },
+        {
+          "change": "Feedback now accepts only request progress records and applies weighted output-token deltas.",
+          "files": [
+            "tests/policies/paper-common/src/lib.rs",
+            "interface/plex/src/v0_6/types.rs"
+          ],
+          "gap": "Feedback previously charged every record indiscriminately.",
+          "why_expressible_now": "Typed feedback subjects/outcomes and idempotent feedback commits distinguish observed progress from terminal or unrelated records."
+        }
+      ],
+      "id": "vtc",
+      "implementation_gaps": [
+        {
+          "files": [
+            "tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Use tentative local counters only while constructing the plan and persist input charges from enacted schedule-selection or request-progress feedback.",
+          "gap": "Dispatch-input charge is persisted during schedule before engine enactment; a rejected or failed plan can overcharge service.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "tests/policies/paper-common/src/lib.rs",
+            "tests/policies/replications/vtc/metadata.json"
+          ],
+          "fix": "Consume explicit queue-membership/arrival facts or feedback, track the last exiting client's counter, and lift only on the first queued request for a previously inactive client.",
+          "gap": "Counter lift infers queue entry/exit from successive runnable sets and does not preserve the paper's last-client-to-leave behavior when the queue becomes empty.",
+          "severity": "P1"
+        },
+        {
+          "files": [
+            "tests/policies/replications/vtc/cases/basic.json",
+            "scripts/benchmark-plex-policy-performance.py"
+          ],
+          "fix": "Add executable ON/OFF, heterogeneous prompt/output, Poisson, multi-selection, and distribution-shift traces with theorem-bound disparity checks.",
+          "gap": "The fixture and benchmark still test only homogeneous, permanently backlogged unit-token clients.",
+          "severity": "P1"
+        }
+      ],
+      "new_primitives_required": [],
+      "recommended_sequence": [
+        "Move enacted input charging to feedback while retaining tentative batch-local counters.",
+        "Add exact queue-entry, queue-exit, and idle-system counter-lift state.",
+        "Create artifact-differential multi-step traces.",
+        "Replace the Jain-only benchmark with service-bound, TTFT, and work-conservation metrics."
+      ]
+    },
+    {
+      "best_achievable_evidence_with_current_model": "faithful",
+      "citations": [
+        "arXiv:2603.15202v3 \u00a75 and Eqs. 1-2",
+        "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs:128-163",
+        "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/lmetric/metadata.json:6-23",
+        "/home/ingim/.patissier/work/plex-alpha/scripts/benchmark-plex-policy-performance.py:743-785"
+      ],
+      "current_model_improvements": [
+        {
+          "change": "The score now uses batch_size+1 and filters only hotspot_confirmed targets.",
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs",
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/lmetric/metadata.json"
+          ],
+          "gap": "Idle replicas collapsed to score zero and hotspot status was ambiguous.",
+          "why_expressible_now": "Per-edge P-token/batch facts and target facts directly encode the artifact score and detector output."
+        },
+        {
+          "change": "The exact artifact commit is pinned and the two-phase detector is explicitly deferred.",
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/lmetric/metadata.json"
+          ],
+          "gap": "Artifact revision and deferred detector were unrecorded.",
+          "why_expressible_now": "State can retain request-class history across route calls, so the detector is an implementation task rather than an ABI gap."
+        }
+      ],
+      "id": "lmetric",
+      "implementation_gaps": [
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs",
+            "/home/ingim/.patissier/work/plex-alpha/interface/plex/src/v0_6/validate.rs"
+          ],
+          "fix": "Use shared target-count and ResourceLimit accounting before selecting each edge.",
+          "gap": "Multi-request routing still ignores max_assignments and aggregate resource capacity.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs",
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/lmetric/metadata.json"
+          ],
+          "fix": "Track per-class arrivals and cache coverage in shared state, confirm over consecutive requests, and derive hotspot_confirmed internally.",
+          "gap": "The paper's popularity/cache-coverage alarm, 2|M| confirmation sequence, and load-only fallback are not implemented.",
+          "severity": "P1"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/scripts/benchmark-plex-policy-performance.py"
+          ],
+          "fix": "Add idle-replica boundaries and multi-invocation detector traces covering alarm, confirmation, clearing, and fallback.",
+          "gap": "The benchmark excludes batch size zero and supplies independent random hotspot booleans.",
+          "severity": "P2"
+        }
+      ],
+      "new_primitives_required": [],
+      "recommended_sequence": [
+        "Fix set-capacity accounting.",
+        "Implement the detector in policy state.",
+        "Add exhaustive product boundaries and stateful hotspot traces.",
+        "Run differential parity against a005ceb3."
+      ]
+    },
+    {
+      "best_achievable_evidence_with_current_model": "faithful",
+      "citations": [
+        "HEAD 9e837d8dd",
+        "arXiv:2411.15997v1 sections 4.2-4.3 equations 2-3 Algorithm 1",
+        "tests/policies/paper-common/src/lib.rs:167-296",
+        "tests/policies/replications/fairserve/metadata.json:9-29",
+        "scripts/benchmark-plex-policy-performance.py:788-850",
+        "plex_0.6.md:190-198",
+        "plex_0.6.md:821-821"
+      ],
+      "current_model_improvements": [
+        {
+          "change": "Admission now gates user/application RPM only under KV overload, preserves in-progress interactions, and respects max_accepted.",
+          "files": [
+            "tests/policies/paper-common/src/lib.rs",
+            "tests/policies/replications/fairserve/metadata.json"
+          ],
+          "gap": "The prior implementation confused interaction handling with interference scoring.",
+          "why_expressible_now": "Admit receives a candidate set with host-provided overload, interaction, and quota facts; no new authority is needed."
+        },
+        {
+          "change": "Admission and scheduling prioritize in-progress interactions; feedback separately accounts input, system, and output tokens and filters for request progress.",
+          "files": [
+            "tests/policies/paper-common/src/lib.rs",
+            "interface/plex/src/v0_6/types.rs"
+          ],
+          "gap": "Interaction priority and token-category accounting were absent.",
+          "why_expressible_now": "WorkGroup/request facts, shared state, schedule ordering, and typed feedback can represent interaction lifecycle and observed service."
+        }
+      ],
+      "id": "fairserve",
+      "implementation_gaps": [
+        {
+          "files": [
+            "tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Key WSC state by user, retain application and stage as normalization dimensions, and use WorkGroup for each interaction.",
+          "gap": "Service counters are keyed by application rather than user, collapsing all users of an application into one counter.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "tests/policies/paper-common/src/lib.rs",
+            "tests/policies/replications/fairserve/metadata.json"
+          ],
+          "fix": "Add application_id, stage_id, expected input/system/output counts, and user priority facts; compute fixed-point normalized service at feedback time.",
+          "gap": "The implementation does not calculate paper equations 2-3: it stores raw weighted tokens and divides by a generic request weight, omitting stage-specific expected token counts and user priority E_i.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "tests/policies/replications/fairserve/cases/basic.json",
+            "scripts/benchmark-plex-policy-performance.py"
+          ],
+          "fix": "Define fact provenance and delta semantics or maintain bounded per-user/application windows in scoped state; add overload and multi-call traces.",
+          "gap": "RPM and interaction state are entirely trusted as instantaneous facts, and the benchmark does not verify abusive windows, interaction completion, or token waste.",
+          "severity": "P1"
+        }
+      ],
+      "new_primitives_required": [],
+      "recommended_sequence": [
+        "Correct state identity from application to user plus application-stage dimensions.",
+        "Implement equations 2-3 with fixed-point normalized service.",
+        "Model interactions as WorkGroups and validate overload/RPM transitions.",
+        "Benchmark token waste, served users, queue delay, TTFT, and stage throughput against VTC and RPM."
+      ]
+    },
+    {
+      "best_achievable_evidence_with_current_model": "decision-trace-parity",
+      "citations": [
+        "pie-project/pie:tests/policies/paper-common/src/lib.rs:299-383,1856-1908",
+        "pie-project/pie:tests/policies/replications/marconi/metadata.json:2-16",
+        "pie-project/pie:tests/policies/fidelity-audit.json:168-184",
+        "pie-project/pie:plex_replication_report.md:31-31,55-59",
+        "Marconi arXiv:2411.19379v3 sections 4.1-4.3"
+      ],
+      "current_model_improvements": [
+        {
+          "change": "The artifact commit is pinned, evidence is downgraded to inspired-adaptation, and independent fidelity is reported separately from runtime smoke success.",
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/marconi/metadata.json",
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/fidelity-audit.json",
+            "/home/ingim/.patissier/work/plex-alpha/scripts/generate-plex-replication-report.py"
+          ],
+          "gap": "Mutable provenance and overstated evidence",
+          "why_expressible_now": "Metadata and report schemas already support source commits and separate evidence/fidelity fields; no runtime primitive was needed."
+        },
+        {
+          "change": "The performance report now labels synthetic trends as adaptation proxies and records paper_end_to_end_ratio_reproduced=false.",
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/scripts/generate-plex-policy-performance-report.py",
+            "/home/ingim/.patissier/work/plex-alpha/plex_policy_performance_report.md"
+          ],
+          "gap": "Paper ratios were conflated with proxy results",
+          "why_expressible_now": "The reporting model now explicitly separates proxy, live-mechanism, and paper end-to-end claims."
+        },
+        {
+          "change": "Current Marconi evaluates resident and prospective objects in one cache opportunity and returns a capacity-valid retained set.",
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs",
+            "/home/ingim/.patissier/work/plex-alpha/interface/plex/wit-0.6/policy.wit"
+          ],
+          "gap": "Prospective admission must be compared with resident state under byte capacity",
+          "why_expressible_now": "CacheContext already exposes resident and prospective objects, sizes, reclaimability, fixed bytes, and maximum bytes."
+        }
+      ],
+      "id": "marconi",
+      "implementation_gaps": [
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs",
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/marconi/metadata.json"
+          ],
+          "fix": "Implement radix-tree speculative admission and the exact normalized eviction score over eligible nodes.",
+          "gap": "The kernel still uses reuse_probability times recompute_flops per byte instead of separate speculative admission and normalized recency-plus-alpha-FLOP-efficiency eviction.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs",
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/marconi/cases/basic.json"
+          ],
+          "fix": "Represent radix nodes and SSM/KV portions as separate cache objects/facts, persist timestamps and alpha in policy state, and use episodes for dependent reclaim.",
+          "gap": "One-child eligibility, hit-node timestamp updates, alpha bootstrap/tuning, SSM-only intermediate reclaim, and logical KV merging are absent.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/marconi/metadata.json",
+            "/home/ingim/.patissier/work/plex-alpha/runtime"
+          ],
+          "fix": "Implement them as adapter enactment of admitted/reclaimed logical objects; this is an engine mechanic, not a new policy operation.",
+          "gap": "Physical hybrid-state checkpointing and KV metadata merging are not implemented by the engine adapter.",
+          "severity": "P1"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/marconi",
+            "/home/ingim/.patissier/work/plex-alpha/scripts/benchmark-plex-policy-performance.py"
+          ],
+          "fix": "Add differential traces for speculative branches, one-child eviction, alpha=0 LRU, timestamp updates, and hybrid LMSys/ShareGPT/SWE-bench traces.",
+          "gap": "Fixtures and benchmarks remain synthetic and do not compare decisions with the pinned artifact.",
+          "severity": "P2"
+        }
+      ],
+      "new_primitives_required": [],
+      "recommended_sequence": [
+        "Implement a pure stateful Marconi reference kernel using existing cache facts and state.",
+        "Add artifact-derived differential traces before adding physical hybrid kernels.",
+        "Model SSM and KV portions as separate logical objects and validate dependent episodes.",
+        "Implement adapter checkpoint/merge mechanics and feedback.",
+        "Replace the synthetic benchmark with hybrid trace replay."
+      ]
+    },
+    {
+      "best_achievable_evidence_with_current_model": "decision-trace-parity",
+      "citations": [
+        "pie-project/pie:tests/policies/paper-common/src/lib.rs:385-424,1871-1908",
+        "pie-project/pie:tests/policies/replications/ragcache/metadata.json:2-16",
+        "pie-project/pie:interface/plex/wit-0.6/policy.wit:249-290",
+        "pie-project/pie:plex_0.6_contract.md:582-619,706-712",
+        "RAGCache section 5.1 equations 1-3 and Algorithm 1"
+      ],
+      "current_model_improvements": [
+        {
+          "change": "Victims are now ordered by the static PGDSF score and reclaim_prefix selects enough victims to satisfy byte capacity.",
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs"
+          ],
+          "gap": "A single victim could leave the plan over capacity",
+          "why_expressible_now": "Resident sizes, prospective admissions, fixed bytes, maximum bytes, and reclaimability are all present in CacheContext."
+        },
+        {
+          "change": "RAGCache is now labeled inspired-adaptation with an independent material-semantic-gap finding.",
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/ragcache/metadata.json",
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/fidelity-audit.json",
+            "/home/ingim/.patissier/work/plex-alpha/plex_replication_report.md"
+          ],
+          "gap": "The replication report overstated fidelity",
+          "why_expressible_now": "Evidence and fidelity are represented independently from smoke validation."
+        },
+        {
+          "change": "The generated performance report explicitly says the proxy is not the paper ratio and records zero exact end-to-end reproductions.",
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/scripts/generate-plex-policy-performance-report.py",
+            "/home/ingim/.patissier/work/plex-alpha/plex_policy_performance_report.md"
+          ],
+          "gap": "Proxy performance was presented without a claim boundary",
+          "why_expressible_now": "The report schema has separate proxy, live, fidelity, and paper-ratio fields."
+        }
+      ],
+      "id": "ragcache",
+      "implementation_gaps": [
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs",
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/ragcache/metadata.json"
+          ],
+          "fix": "Persist both clocks and node statistics in State; update them through cache opportunities and feedback using fixed-point arithmetic.",
+          "gap": "GPU and host logical clocks, retrieval-frequency updates, profiled average recomputation cost, and priority updates are absent.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs",
+            "/home/ingim/.patissier/work/plex-alpha/plex_0.6_contract.md"
+          ],
+          "fix": "Use CacheEpisode iteration and parent/child facts to select one legal frontier step, update the clock, then re-invoke with newly eligible leaves.",
+          "gap": "The ordered list is computed once, so newly exposed parents cannot join the leaf frontier as eviction progresses.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs",
+            "/home/ingim/.patissier/work/plex-alpha/sdk/rust/plex/src/lib.rs"
+          ],
+          "fix": "Encode tier and host-copy-exists in object facts/state and sequence copy-before-reclaim through cache.swap@1, feedback, and episodes.",
+          "gap": "GPU/host/free placement and swap-out-only-once state are not modeled.",
+          "severity": "P1"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/ragcache/metadata.json",
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-ragcache/src/lib.rs"
+          ],
+          "fix": "Add schedule with cached-length/computation-length priority and starvation window, or narrow the claim explicitly to PGDSF cache replacement.",
+          "gap": "The declared surface omits RAGCache cache-aware request reordering.",
+          "severity": "P1"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/ragcache",
+            "/home/ingim/.patissier/work/plex-alpha/scripts/benchmark-plex-policy-performance.py"
+          ],
+          "fix": "Add multi-iteration parent exposure, separate-tier clocks, swap-once, and timestamped-LRU traces.",
+          "gap": "The fixture tests only an abstract iteration-zero leaf choice and the benchmark uses array index zero as LRU.",
+          "severity": "P2"
+        }
+      ],
+      "new_primitives_required": [],
+      "recommended_sequence": [
+        "Implement stateful PGDSF updates and fixed-point score vectors.",
+        "Convert reclaim to bounded one-frontier-step episodes.",
+        "Add tier and host-copy state using existing swap actions.",
+        "Add cache-aware scheduling or narrow the replicated claim.",
+        "Validate against an independent paper oracle and then run vLLM+Faiss/SGLang workloads."
+      ]
+    },
+    {
+      "best_achievable_evidence_with_current_model": "faithful",
+      "citations": [
+        "HEAD 9e837d8dd",
+        "arXiv:2501.14312v1 sections 4-5 Algorithms 1-2",
+        "tests/policies/paper-common/src/lib.rs:428-575",
+        "tests/policies/replications/dlpm/metadata.json:9-30",
+        "scripts/benchmark-plex-policy-performance.py:948-1024",
+        "tests/policies/paper-common/src/lib.rs:1910-1932",
+        "plex_0.6.md:822-822"
+      ],
+      "current_model_improvements": [
+        {
+          "change": "Scheduling now sorts by cached-prefix length, gates on positive deficit, performs a refill when no active client is positive, and charges extend and output tokens.",
+          "files": [
+            "tests/policies/paper-common/src/lib.rs",
+            "tests/policies/replications/dlpm/metadata.json"
+          ],
+          "gap": "Local scheduling previously prioritized deficit before locality and lacked refill and extend accounting.",
+          "why_expressible_now": "The schedule set, shared state, token budgets, host prefix facts, and progress feedback are sufficient for local DLPM decisions."
+        },
+        {
+          "change": "Routing now enforces target max_assignments and filters by host-provided worker_deficit before selecting locality/load.",
+          "files": [
+            "tests/policies/paper-common/src/lib.rs",
+            "interface/plex/src/v0_6/types.rs"
+          ],
+          "gap": "Routing ignored target capacity and per-worker credit observations.",
+          "why_expressible_now": "Route already exposes the full feasible edge graph, target capacities, and extensible per-edge facts."
+        }
+      ],
+      "id": "dlpm",
+      "implementation_gaps": [
+        {
+          "files": [
+            "tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Maintain a shared client-by-target deficit map, refill all worker credits until one is positive, debit input/extend service at assignment feedback, and debit output service at completion/progress feedback.",
+          "gap": "D\u00b2LPM does not own or update q_i,w; it trusts worker_deficit facts, never deducts selected-worker service, and skips the paper's worker-quantum refill loop when no worker is positive.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Deduplicate client IDs before refill and use one configured Q_u per client per round.",
+          "gap": "Local refill iterates requests rather than distinct active clients, so a client with multiple runnable requests receives quantum multiple times.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Use tentative deficit locally, commit enacted extend/output deltas through feedback, and apply w_e and w_q or require preweighted delta facts.",
+          "gap": "Extend service is persisted optimistically during schedule and input/output weights are omitted.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "tests/policies/replications/dlpm/cases/basic.json",
+            "scripts/benchmark-plex-policy-performance.py"
+          ],
+          "fix": "Add multi-client local and multi-worker traces with longest-match sets, cache insertion/eviction, refill rounds, and adversarial locality.",
+          "gap": "The fixture and benchmark remain mostly single-client and cannot establish bounded fairness or radix-tree behavior.",
+          "severity": "P1"
+        }
+      ],
+      "new_primitives_required": [],
+      "recommended_sequence": [
+        "Fix distinct-client local refill and feedback-only service commits.",
+        "Implement persistent per-client/per-worker D\u00b2LPM deficits and refill.",
+        "Require exact longest-prefix-set and weighted-service facts.",
+        "Add reference traces and locality/fairness/latency benchmarks."
+      ]
+    },
+    {
+      "best_achievable_evidence_with_current_model": "decision-trace-parity",
+      "citations": [
+        "pie-project/pie:tests/policies/paper-common/src/lib.rs:578-650,1871-1908",
+        "pie-project/pie:tests/policies/replications/infercept/metadata.json:2-32",
+        "pie-project/pie:sdk/rust/plex/src/lib.rs:318-345",
+        "pie-project/pie:plex_0.6_contract.md:706-712",
+        "InferCept sections 3.2-4.4 equations 1-5"
+      ],
+      "current_model_improvements": [
+        {
+          "change": "InferCept now truncates its ordered reclaim list once admitted and retained bytes fit capacity.",
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs"
+          ],
+          "gap": "The old plan reclaimed every reclaimable resident",
+          "why_expressible_now": "The cache snapshot already contains all object sizes, admissions, reclaimability, and byte limits."
+        },
+        {
+          "change": "The InferCept source commit is pinned and evidence is downgraded to inspired-adaptation with an independent incorrect finding.",
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/infercept/metadata.json",
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/fidelity-audit.json",
+            "/home/ingim/.patissier/work/plex-alpha/plex_replication_report.md"
+          ],
+          "gap": "Artifact provenance and evidence were overstated",
+          "why_expressible_now": "Metadata and reports distinguish source provenance, runtime smoke, evidence strength, and fidelity."
+        },
+        {
+          "change": "The performance report now labels the result an inspired-adaptation proxy and records no paper end-to-end reproduction.",
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/scripts/generate-plex-policy-performance-report.py",
+            "/home/ingim/.patissier/work/plex-alpha/plex_policy_performance_report.md"
+          ],
+          "gap": "Synthetic ratios were conflated with paper performance",
+          "why_expressible_now": "Proxy and paper claims are separate report fields."
+        }
+      ],
+      "id": "infercept",
+      "implementation_gaps": [
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs",
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/infercept/metadata.json"
+          ],
+          "fix": "Compute paper waste from context length, KV bytes per token, interception duration, running-context memory, chunk count, and profiled forward cost.",
+          "gap": "Preserve and chunk-discard waste equations are replaced by expected_reuse_ms < recompute_ms.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Allocate swap-out budget to intercepted requests in descending minimum-waste order, then maintain separate original-arrival FCFS swap and waiting queues.",
+          "gap": "Ascending expected-waste resume ordering conflates interception-time swap allocation with resumed-request scheduling.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs",
+            "/home/ingim/.patissier/work/plex-alpha/interface/plex/wit-0.6/policy.wit"
+          ],
+          "fix": "Persist per-request mode/progress in State and expose trusted profile and original-arrival facts; schedule token chunks using existing token budgets.",
+          "gap": "Explicit preserve, swap, discard, recompute-remaining, and swap-remaining state transitions are absent.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/sdk/rust/plex/src/lib.rs",
+            "/home/ingim/.patissier/work/plex-alpha/runtime"
+          ],
+          "fix": "First reach exact decision traces with swap mechanics deferred, then implement cache.transfer-batch@1 in the adapter.",
+          "gap": "The existing swap action is whole-object and does not enact the paper's layer/page pipeline.",
+          "severity": "P1"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/infercept",
+            "/home/ingim/.patissier/work/plex-alpha/scripts/benchmark-plex-policy-performance.py"
+          ],
+          "fix": "Add equation-boundary vectors, descending-budget traces, FCFS resume traces, chunk progress, and the six-augmentation mixed workload.",
+          "gap": "Fixtures and benchmarks never exercise all three modes or swap budgets.",
+          "severity": "P2"
+        }
+      ],
+      "new_primitives_required": [
+        {
+          "affected_claim": "InferCept swap chunking, layer-pipelined transfer, and near-zero swap waste.",
+          "minimal_contract": "Input ordered transfers with object_id, byte-or-token range, source tier, destination tier, per-iteration byte/time budget, and idempotency key; reserve capacity before transfer and return per-range completion/failure feedback.",
+          "primitive": "cache.move@1",
+          "why_required": "Whole-object cache.swap@1 cannot guarantee a budgeted ordered set of layer/page-range swaps with shared per-iteration bandwidth, capacity reservation, and partial-completion reporting. This is needed only for physical swap-pipeline fidelity, not preserve/discard decision parity."
+        }
+      ],
+      "recommended_sequence": [
+        "Implement exact waste calculations and explicit request modes.",
+        "Implement descending swap allocation and separate FCFS resume queues.",
+        "Add stateful differential traces against the pinned artifact.",
+        "Validate chunked recomputation using existing schedule token budgets.",
+        "Add cache.transfer-batch@1 only for physical swap-pipeline fidelity.",
+        "Run the paper's mixed workload and baselines."
+      ]
+    },
+    {
+      "best_achievable_evidence_with_current_model": "faithful",
+      "citations": [
+        "pie-project/pie:tests/policies/paper-common/src/lib.rs:652-710,1871-1908",
+        "pie-project/pie:tests/policies/replications/peek/metadata.json:2-28",
+        "pie-project/pie:interface/plex/wit-0.6/policy.wit:86-107,208-235,249-290",
+        "pie-project/pie:interface/plex/wit-0.6/host.wit:3-9",
+        "PEEK arXiv:2607.02525v1 section 3 and Algorithms 1-2"
+      ],
+      "current_model_improvements": [
+        {
+          "change": "PEEK now reclaims only the ordered prefix required to satisfy byte capacity.",
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs"
+          ],
+          "gap": "The old plan treated the full ordered list as the victim set",
+          "why_expressible_now": "Resident/prospective sizes and byte capacity are already first-class cache inputs."
+        },
+        {
+          "change": "The PEEK artifact commit is pinned and the package is explicitly classified as inspired-adaptation/material-semantic-gap.",
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/peek/metadata.json",
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/fidelity-audit.json",
+            "/home/ingim/.patissier/work/plex-alpha/plex_replication_report.md"
+          ],
+          "gap": "Mutable source and replication overclaim",
+          "why_expressible_now": "The evidence/report model separates smoke success from fidelity."
+        },
+        {
+          "change": "Current reporting labels the synthetic ratio as a proxy, includes live-mechanism counters, and states that no paper end-to-end ratio was reproduced.",
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/scripts/generate-plex-policy-performance-report.py",
+            "/home/ingim/.patissier/work/plex-alpha/plex_policy_performance_report.md"
+          ],
+          "gap": "Proxy and paper performance were conflated",
+          "why_expressible_now": "The report schema separately records offline proxy, live mechanism, fidelity, and paper reproduction."
+        }
+      ],
+      "id": "peek",
+      "implementation_gaps": [
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs",
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/peek/metadata.json"
+          ],
+          "fix": "Rebuild or incrementally synchronize the pending trie from runnable token facts and State, and compute the exact cLPM signals.",
+          "gap": "No incremental pending trie, main-cache hit, warm/pioneer/sibling section, request score, or cluster size is maintained.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Implement exact Lane A and Lane B keys, stride interleaving, group-major mode, singleton pressure, age pressure, and EMA state.",
+          "gap": "A hard overdue-first gate replaces the two-lane stride scheduler and dynamic EMA fairness share.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Store path/ancestor facts per cache object and rank by the exact ancestor-demand score, with the selected cluster/recency mode pinned to the artifact.",
+          "gap": "Eviction adds one global pending count to every object instead of computing maximum ancestor pending_count times depth.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/interface/plex/wit-0.6/host.wit",
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Use candidate facts or host query results for cache hits and bypass cLPM when no root child has pending_count >= 2; no new WIT primitive is required.",
+          "gap": "No-sharing fallback and engine-specific LPM probing are absent.",
+          "severity": "P1"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/peek",
+            "/home/ingim/.patissier/work/plex-alpha/scripts/benchmark-plex-policy-performance.py"
+          ],
+          "fix": "Add exact cold-cluster, warm-section, stride, EMA, no-sharing, group-major, and ancestor-demand differential traces plus W1-W5 workloads.",
+          "gap": "The fixture checks only shared scalar state and the benchmark inspects only a synthetic first-victim utility.",
+          "severity": "P2"
+        }
+      ],
+      "new_primitives_required": [],
+      "recommended_sequence": [
+        "Implement a deterministic pending-trie reference model in State.",
+        "Add exact cLPM section and score vectors.",
+        "Implement stride lanes, dynamic fairness, group-major, and no-sharing fallback.",
+        "Implement exact ancestor-demand reclaim ordering.",
+        "Differentially replay against the pinned artifact on both SGLang-style radix and vLLM-style hash inputs.",
+        "Run W1-W5 with the paper baselines."
+      ]
+    },
+    {
+      "best_achievable_evidence_with_current_model": "decision-trace-parity",
+      "citations": [
+        "HEAD 9e837d8dd",
+        "arXiv:2407.00047v2 sections 4-7 equations 1-13",
+        "tests/policies/paper-common/src/lib.rs:714-788",
+        "tests/policies/paper-common/src/lib.rs:1910-1932",
+        "tests/policies/replications/qlm/metadata.json:9-29",
+        "interface/plex/src/v0_6/types.rs:65-84",
+        "interface/plex/src/v0_6/mechanics.rs:44-93",
+        "plex_0.6.md:283-315",
+        "plex_0.6.md:827-827"
+      ],
+      "current_model_improvements": [
+        {
+          "change": "Admission now enforces max_accepted and shared routing enforces target max_assignments.",
+          "files": [
+            "tests/policies/paper-common/src/lib.rs"
+          ],
+          "gap": "Admission and routing could emit contract-invalid over-capacity plans.",
+          "why_expressible_now": "Set-oriented admit/route inputs already carry bounded capacities and allow joint decisions."
+        },
+        {
+          "change": "Feedback now writes virtual-wait observations into WorkGroup or Request scratch and records deliveries.",
+          "files": [
+            "tests/policies/paper-common/src/lib.rs",
+            "sdk/rust/plex/src/lib.rs"
+          ],
+          "gap": "The declared feedback operation was missing.",
+          "why_expressible_now": "Scoped group/request state and typed feedback subjects provide the needed queue-accounting scope."
+        },
+        {
+          "change": "The policy is now labeled inspired-adaptation and lists EDF, vLLM-FCFS, and SHEPHERD baselines.",
+          "files": [
+            "tests/policies/replications/qlm/metadata.json",
+            "tests/policies/performance-targets.json",
+            "tests/policies/fidelity-audit.json"
+          ],
+          "gap": "Evidence and baseline metadata overstated the old kernel.",
+          "why_expressible_now": "The report can carry an independent fidelity classification separately from compilation status."
+        }
+      ],
+      "id": "qlm",
+      "implementation_gaps": [
+        {
+          "files": [
+            "tests/policies/paper-common/src/lib.rs",
+            "tests/policies/replications/qlm/metadata.json"
+          ],
+          "fix": "Represent each request group in WorkGroup state, ingest profiled token/model/device facts, compute RWT distributions, and persist an optimized bounded virtual-queue order.",
+          "gap": "There is still no request-group construction, RWT equations 1-5, virtual-queue representation, or global equations 6-13 optimizer.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Solve the complete set-oriented assignment with swap and completion costs, then emit current route and schedule decisions from the persisted plan.",
+          "gap": "Route and schedule remain independent scalar greedy choices rather than one global model-aware assignment/order.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Read request scratch as a fallback or remove request-scoped writes and make WorkGroup the canonical queue state.",
+          "gap": "Request-scoped virtual_wait written by feedback is never read by schedule; only candidate and group values are consulted.",
+          "severity": "P1"
+        },
+        {
+          "files": [
+            "tests/policies/replications/qlm/cases/basic.json",
+            "scripts/benchmark-plex-policy-performance.py"
+          ],
+          "fix": "Create multi-step virtual-queue traces and separate decision parity from unavailable pause/model mechanics.",
+          "gap": "The case and performance score still validate a scalar inequality rather than queue evolution or LSOs.",
+          "severity": "P1"
+        }
+      ],
+      "new_primitives_required": [
+        {
+          "affected_claim": "Request eviction's approximately 80% single-model SLO-attainment contribution and mixed interactive/batch serving.",
+          "minimal_contract": "Idempotent pause/resume action over request generation with KV policy or cache-object references; enacted feedback reports status transition, transferred bytes, latency, and failure.",
+          "primitive": "request.pause-resume@1",
+          "why_required": "QLM request eviction must suspend an active request, preserve or swap its KV state, and later resume it; Paused exists as lifecycle state but no policy action requests this transition."
+        },
+        {
+          "affected_claim": "Up to 300% model-swapping throughput contribution and the 20-400% aggregate throughput claim.",
+          "minimal_contract": "Idempotent target-scoped model activation or tier-move action carrying model ID and desired residency tier; feedback reports residency revision, duration, capacity use, and failure.",
+          "primitive": "target.provision@1",
+          "why_required": "QLM's multi-model virtual queues actively warm and swap model weights among storage, CPU, and GPU; no current mechanic controls model residency."
+        }
+      ],
+      "recommended_sequence": [
+        "Implement grouped RWT and global optimizer with deterministic reference traces.",
+        "Make WorkGroup scratch the canonical virtual-queue state.",
+        "Validate optimizer decisions without claiming physical LSOs.",
+        "Add request pause/resume and model activation mechanics.",
+        "Run adapter-backed eviction, swap, throughput, and SLO experiments."
+      ]
+    },
+    {
+      "best_achievable_evidence_with_current_model": "decision-trace-parity",
+      "citations": [
+        "HEAD 9e837d8dd",
+        "arXiv:2504.08784v1 sections 3-4 Algorithms 1-2",
+        "tests/policies/paper-common/src/lib.rs:793-840",
+        "tests/policies/replications/slos-serve/metadata.json:9-31",
+        "scripts/benchmark-plex-policy-performance.py:1203-1265",
+        "plex_0.6.md:445-459",
+        "plex_0.6.md:834-834"
+      ],
+      "current_model_improvements": [
+        {
+          "change": "Admission now bounds accepts by max_accepted and shared routing respects per-target max_assignments.",
+          "files": [
+            "tests/policies/paper-common/src/lib.rs"
+          ],
+          "gap": "Admission and route could violate count capacities.",
+          "why_expressible_now": "Joint set inputs and capacity-bearing targets are existing core semantics."
+        },
+        {
+          "change": "Targets now name vLLM, Sarathi, and DistServe, and metadata labels the implementation inspired-adaptation with provisioning explicitly deferred.",
+          "files": [
+            "tests/policies/performance-targets.json",
+            "tests/policies/replications/slos-serve/metadata.json",
+            "tests/policies/fidelity-audit.json"
+          ],
+          "gap": "Baseline and evidence metadata were inaccurate.",
+          "why_expressible_now": "Evidence classification is independent of the five-operation ABI and can honestly separate decision logic from deployment mechanics."
+        }
+      ],
+      "id": "slos-serve",
+      "implementation_gaps": [
+        {
+          "files": [
+            "tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Persist the paper DP over bounded host-provided stage, memory, deadline, and profiled batch facts; reconstruct admitted requests and planned batches.",
+          "gap": "No joint DP state, request value objective, memory dimension, prefill deadlines, TPOT tiers, or performance model is implemented.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Store the planned batch sequence in scoped state and emit its current per-request budgets at each scheduling epoch.",
+          "gap": "Schedule still emits least-slack singleton ordering instead of the current planned mixed prefill/decode token allocation.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Route only after evaluating each replica's joint plan and carry bounded retry count and fallback state in request scratch.",
+          "gap": "Routing minimizes scalar stage latency rather than retrying declined requests according to replica-level SLO attainability.",
+          "severity": "P1"
+        },
+        {
+          "files": [
+            "tests/policies/replications/slos-serve/cases/basic.json",
+            "scripts/benchmark-plex-policy-performance.py"
+          ],
+          "fix": "Add multi-stage DP traces now, then gate end-to-end claims on the new exact-batch/speculation mechanics.",
+          "gap": "The fixture and benchmark remain independent-feasibility tests with no stage or burst execution.",
+          "severity": "P1"
+        }
+      ],
+      "new_primitives_required": [
+        {
+          "affected_claim": "Dynamic batch-size tuning, multi-stage SLO guarantees, and the approximately 2.2x serving-capacity claim.",
+          "minimal_contract": "A negotiated guarantee that one selection's exact members and per-request token budgets form the next forward pass with no substitution; atomic failure if any member cannot fit; feedback reports realized composition and latency.",
+          "primitive": "schedule.co-execute@1",
+          "why_required": "SLOs-Serve predicts and optimizes one concrete mixed-token forward batch; current multi-request selections are all-or-none but explicitly do not guarantee simultaneous execution or exact next-step composition."
+        },
+        {
+          "affected_claim": "SLO-adaptive speculative decoding and its reported serving-capacity contribution.",
+          "minimal_contract": "Idempotent decode action or schedule extension specifying request IDs, drafter/base model, speculation length, and verification budget; feedback reports accepted tokens, verification latency, and failures.",
+          "primitive": "decode.speculate@1",
+          "why_required": "SchedulePlan cannot request a drafter model, per-tier speculation lengths, or a base-model verification pass."
+        },
+        {
+          "affected_claim": "Burst resilience and best-effort fallback under temporary overload.",
+          "minimal_contract": "Pause/resume action over a request generation with generated-output preservation and explicit KV policy; enacted feedback supplies lifecycle and recomputation outcome.",
+          "primitive": "request.pause-resume@1",
+          "why_required": "Burst-resilient best-effort service preempts declined work while preserving generated tokens and applying a specified KV discard/retain policy; no current action controls paused lifecycle."
+        }
+      ],
+      "recommended_sequence": [
+        "Implement the pure DP and performance-model reference logic using typed facts and scoped state.",
+        "Generate admission, routing, and planned-batch decision traces.",
+        "Add exact-forward-batch and speculative-decode mechanics.",
+        "Add pause/resume best-effort handling.",
+        "Run burst and multi-replica capacity experiments."
+      ]
+    },
+    {
+      "best_achievable_evidence_with_current_model": "decision-trace-parity",
+      "citations": [
+        "HEAD 9e837d8dd",
+        "arXiv:2412.20993v2 sections 2.1 and 3 Appendix D",
+        "tests/policies/paper-common/src/lib.rs:845-883",
+        "tests/policies/replications/dynasor/metadata.json:9-30",
+        "scripts/benchmark-plex-policy-performance.py:1268-1314",
+        "interface/plex/src/v0_6/mechanics.rs:53-60",
+        "plex_0.6.md:445-459",
+        "plex_0.6.md:835-835"
+      ],
+      "current_model_improvements": [
+        {
+          "change": "A feedback hook now exists and commits bounded feedback accounting.",
+          "files": [
+            "tests/policies/paper-common/src/lib.rs"
+          ],
+          "gap": "The declared feedback operation was absent.",
+          "why_expressible_now": "Typed feedback and scoped state support program-progress histories and future Certaindex updates without a new operation."
+        },
+        {
+          "change": "Metadata now labels it inspired-adaptation and names uniform, length, SGLang, and Parrot baselines.",
+          "files": [
+            "tests/policies/replications/dynasor/metadata.json",
+            "tests/policies/performance-targets.json",
+            "tests/policies/fidelity-audit.json"
+          ],
+          "gap": "Evidence and baseline metadata overstated the old threshold kernel.",
+          "why_expressible_now": "Evidence classification and benchmark provenance are report concerns, not programming-model limitations."
+        }
+      ],
+      "id": "dynasor",
+      "implementation_gaps": [
+        {
+          "files": [
+            "tests/policies/paper-common/src/lib.rs",
+            "tests/policies/replications/dynasor/metadata.json"
+          ],
+          "fix": "Define typed Certaindex provenance facts or compute them from bounded feedback histories; retain answer/reward windows in request or WorkGroup scratch.",
+          "gap": "Confidence and progress remain opaque scalar inputs; no answer-consistency, semantic-entropy, reward aggregation, uncertainty-word filtering, or calibrated policy state is implemented.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Until early-complete exists, classify cancellation as intent-only decision parity and do not claim equal-quality completion.",
+          "gap": "High-confidence work is cancelled rather than successfully completed with the stable answer.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "tests/policies/replications/dynasor/metadata.json",
+            "tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Either require the mechanic or branch on negotiated mechanics and return a non-action fallback plan.",
+          "gap": "request.cancel@1 is declared optional but invoked unconditionally when the threshold fires.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Represent each reasoning program as a WorkGroup and schedule branches/iterations from group Certaindex, estimated remaining work, and wait-age state.",
+          "gap": "No program-level resource knob, WorkGroup accounting, gang priority, SJF estimate, or starvation escalation exists.",
+          "severity": "P1"
+        },
+        {
+          "files": [
+            "scripts/benchmark-plex-policy-performance.py",
+            "tests/policies/replications/dynasor/cases/basic.json"
+          ],
+          "fix": "Replay real probe/reward histories and measure tokens-to-accuracy, final-answer equivalence, program SLOs, and probe cost.",
+          "gap": "The benchmark still defines usefulness from the same random threshold that triggers cancellation.",
+          "severity": "P1"
+        }
+      ],
+      "new_primitives_required": [
+        {
+          "affected_claim": "Equal-quality early exit, token savings, and accuracy-preserving completion.",
+          "minimal_contract": "Idempotent action carrying request generation and a final-output reference or validated fields revision; terminal Completed occurs only after enacted feedback, which reports delivered output and failure.",
+          "primitive": "request.complete-with-output@1",
+          "why_required": "The paper stops reasoning and returns the stable probed or aggregated answer; request.cancel@1 yields cancellation and cannot enact successful completion with a final payload."
+        },
+        {
+          "affected_claim": "The reported 1.6-3.3x online sustainable-rate improvement from gang scheduling.",
+          "minimal_contract": "Guarantee that selected program members and token budgets execute in the same next forward pass; feedback reports realized batch and latency.",
+          "primitive": "schedule.co-execute@1",
+          "why_required": "Dynasor's online gang scheduler derives throughput from co-batching requests of one reasoning program; an all-or-none selection does not guarantee one physical forward batch."
+        }
+      ],
+      "recommended_sequence": [
+        "Define Certaindex fact and feedback schemas and program WorkGroup state.",
+        "Implement adaptive branch/iteration allocation, gang priority, SJF, and starvation prevention.",
+        "Produce artifact-differential stop/continue traces while labeling cancellation as intent.",
+        "Add successful early-complete authority.",
+        "Add exact gang-batch guarantee and run equal-quality online/offline evaluations."
+      ]
+    },
+    {
+      "best_achievable_evidence_with_current_model": "faithful",
+      "citations": [
+        "https://arxiv.org/html/2510.17015v2#S4",
+        "pie-project/pie@9e837d8dd:tests/policies/paper-common/src/lib.rs:886-926",
+        "pie-project/pie@9e837d8dd:tests/policies/paper-common/src/lib.rs:1835-1854",
+        "pie-project/pie@9e837d8dd:plex_0.6_contract.md:508-530",
+        "pie-project/pie@9e837d8dd:scripts/benchmark-plex-policy-performance.py:1317-1357"
+      ],
+      "current_model_improvements": [
+        {
+          "change": "The current model has trusted WorkGroups, group-private state, multi-request ScheduleSelection units, and schedule.atomic-enqueue@1.",
+          "files": [
+            "interface/plex/src/v0_6/types.rs",
+            "interface/plex/src/v0_6/mechanics.rs",
+            "plex_0.6_contract.md"
+          ],
+          "gap": "Task-parallel agent identity and all-or-none scheduling were previously treated as absent.",
+          "why_expressible_now": "GPS accounting can be group-scoped and all fitting branches of the selected agent can be emitted as one normalized selection without a new operation."
+        },
+        {
+          "change": "Metadata labels the completed-branch heuristic inspired-adaptation.",
+          "files": [
+            "tests/policies/replications/justitia/metadata.json"
+          ],
+          "gap": "Evidence no longer claims reproduction of the paper scheduler.",
+          "why_expressible_now": "The remaining discrepancy is correctly classified as missing implementation rather than a WorkGroup-model limitation."
+        }
+      ],
+      "id": "justitia",
+      "implementation_gaps": [
+        {
+          "files": [
+            "tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Replace it with memory-centric predicted cost, active-set virtual-time updates, immutable finish tags, and minimum-tag ordering.",
+          "gap": "Fewest-completed-branches ordering is unrelated to GPS virtual time and predicted virtual finish tags.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "tests/policies/paper-common/src/lib.rs",
+            "tests/policies/replications/justitia/metadata.json"
+          ],
+          "fix": "Construct one multi-request selection from the selected WorkGroup and negotiate schedule.atomic-enqueue@1 where atomic adapter enqueue is required.",
+          "gap": "The singleton helper cannot pamper all fitting ready branches of the chosen agent.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Update GPS state from trusted timestamps and enacted completion/progress feedback.",
+          "gap": "Feedback tracks branch count rather than arrivals, completions, active-agent count, virtual time, and consumed cost.",
+          "severity": "P1"
+        },
+        {
+          "files": [
+            "scripts/benchmark-plex-policy-performance.py"
+          ],
+          "fix": "Replay heterogeneous agents with finite KV capacity and measure average/P90 JCT and finish-time fairness against VTC, Parrot, FCFS, and SRJF.",
+          "gap": "The benchmark defines remaining branches as the objective.",
+          "severity": "P2"
+        }
+      ],
+      "new_primitives_required": [],
+      "recommended_sequence": [
+        "Define predicted-cost and trusted-time schemas plus a GPS reference oracle.",
+        "Implement group-scoped virtual time and finish-tag transitions.",
+        "Emit grouped pampering selections and negotiate atomic enqueue.",
+        "Add starvation, fairness, and conservation traces.",
+        "Replace the completed-branch benchmark."
+      ]
+    },
+    {
+      "best_achievable_evidence_with_current_model": "decision-trace-parity",
+      "citations": [
+        "pie-project/pie:tests/policies/paper-common/src/lib.rs:929-999,1871-1908",
+        "pie-project/pie:tests/policies/performance-targets.json:169-175",
+        "pie-project/pie:tests/policies/replications/chameleon/metadata.json:2-29",
+        "pie-project/pie:interface/plex/wit-0.6/policy.wit:127-154,208-235,249-290",
+        "Chameleon arXiv:2411.17741v2 sections 4.2-4.3"
+      ],
+      "current_model_improvements": [
+        {
+          "change": "Chameleon now truncates reclaim to the bytes required after prospective admissions.",
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs"
+          ],
+          "gap": "Cache policy over-reclaimed every resident",
+          "why_expressible_now": "CacheContext exposes object sizes, admissions, reclaimability, fixed bytes, and maximum bytes."
+        },
+        {
+          "change": "The target now names S-LoRA and the accepted v2 results: 1.5x throughput, 80.7% lower P99 TTFT, and 48.1% lower P50 TTFT.",
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/performance-targets.json",
+            "/home/ingim/.patissier/work/plex-alpha/plex_policy_performance_report.md"
+          ],
+          "gap": "The benchmark target used incorrect paper numbers and baseline",
+          "why_expressible_now": "Benchmark metadata can accurately name external baselines and north-star metrics independently of the synthetic proxy."
+        },
+        {
+          "change": "Metadata and generated reports now classify Chameleon as inspired-adaptation with a material semantic gap.",
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/chameleon/metadata.json",
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/fidelity-audit.json",
+            "/home/ingim/.patissier/work/plex-alpha/plex_replication_report.md"
+          ],
+          "gap": "Replication status overstated fidelity",
+          "why_expressible_now": "Smoke validation and fidelity classification are separate report dimensions."
+        }
+      ],
+      "id": "chameleon",
+      "implementation_gaps": [
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Persist per-queue quotas, debit each request's token-equivalent resource demand, scan every queue in phase one, then redistribute leftovers small-to-large.",
+          "gap": "Admission decrements a global request count rather than per-queue token quotas and does not perform two-phase spare redistribution.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs",
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/chameleon/metadata.json"
+          ],
+          "fix": "Use resident facts/beneficiaries for frequency, recency, size, active references and queued demand; rank only eligible adapters and reclaim the required byte prefix.",
+          "gap": "The adapter cache uses adapter_hot admission and lacks dynamic sizing, the 0.45/0.10/0.45 score, active reference counts, and queued-adapter protection.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Construct schedule selections from all queues according to quota phases rather than globally sorting by class and wait.",
+          "gap": "Queue-class sorting is not the paper's quota-driven batch construction.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/chameleon/cases/basic.json",
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/chameleon/expected/basic.json"
+          ],
+          "fix": "Add loaded/fits/predicted-duration/head-release facts and decision traces; defer only misprediction squash enactment until request.preempt-requeue@1 exists.",
+          "gap": "The adapter-bypass fixture tests cache bypass, not head-of-line request bypass or squash.",
+          "severity": "P1"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/chameleon/metadata.json",
+            "/home/ingim/.patissier/work/plex-alpha/scripts/benchmark-plex-policy-performance.py"
+          ],
+          "fix": "Pin the accepted version and add Figure 10 quota vectors, cache-score ties, bypass traces, and S-LoRA P50/P99/SLO-throughput workloads.",
+          "gap": "The paper version is not pinned to v2/DOI and benchmarks ignore quota/cache-pressure outcomes.",
+          "severity": "P2"
+        }
+      ],
+      "new_primitives_required": [
+        {
+          "affected_claim": "Faithful opportunistic adapter bypass with squash and re-execution after prediction error.",
+          "minimal_contract": "Input request_id, preserve-or-discard execution state, target queue/class and ordering key, reason, and idempotency key; atomically transition active to paused/pending without terminal cancellation and report completion/failure.",
+          "primitive": "request.pause-resume@1",
+          "why_required": "Chameleon's misprediction recovery squashes a younger bypassed request and later re-executes it. Existing request.cancel@1 is terminal and schedule plans cannot request a nonterminal atomic preempt-and-requeue transition."
+        }
+      ],
+      "recommended_sequence": [
+        "Pin Chameleon v2 and define exact fact units.",
+        "Implement per-queue quota state and the two scheduling phases.",
+        "Implement the adapter-cache score, eligibility, and dynamic capacity behavior.",
+        "Implement correct bypass decisions and differential traces.",
+        "Add request.preempt-requeue@1 only for misprediction squash enactment.",
+        "Run S-LoRA comparative workloads."
+      ]
+    },
+    {
+      "best_achievable_evidence_with_current_model": "decision-trace-parity",
+      "citations": [
+        "pie-project/pie:tests/policies/paper-common/src/lib.rs:1001-1055,1871-1908",
+        "pie-project/pie:tests/policies/performance-targets.json:178-184",
+        "pie-project/pie:tests/policies/replications/hotprefix/metadata.json:2-31",
+        "pie-project/pie:sdk/rust/plex/src/lib.rs:318-345",
+        "HotPrefix sections 3.2-3.4 equations 5-6 and Algorithms 1-2"
+      ],
+      "current_model_improvements": [
+        {
+          "change": "HotPrefix now reclaims only enough threshold-eligible residents to restore byte capacity.",
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs"
+          ],
+          "gap": "The old plan reclaimed every cold resident",
+          "why_expressible_now": "The existing cache snapshot provides all sizes, admissions, reclaimability, and capacity needed to truncate the victim order."
+        },
+        {
+          "change": "Performance metadata now records vLLM/SGLang latency maxima, the lower throughput maxima, and LRU/LFU/FIFO/2Q baselines.",
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/performance-targets.json",
+            "/home/ingim/.patissier/work/plex-alpha/plex_policy_performance_report.md"
+          ],
+          "gap": "The target conflated latency and throughput maxima and omitted paper baselines",
+          "why_expressible_now": "North-star claims and baselines are metadata, independent of whether the current proxy reproduces them."
+        },
+        {
+          "change": "HotPrefix is now explicitly inspired-adaptation/incorrect, while smoke and live-mechanism results are reported separately.",
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/hotprefix/metadata.json",
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/fidelity-audit.json",
+            "/home/ingim/.patissier/work/plex-alpha/plex_replication_report.md"
+          ],
+          "gap": "Replication evidence overstated fidelity",
+          "why_expressible_now": "The reporting schema separates evidence, fidelity, proxy trends, and live mechanics."
+        }
+      ],
+      "id": "hotprefix",
+      "implementation_gaps": [
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs",
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/hotprefix/metadata.json"
+          ],
+          "fix": "Persist per-prefix frequency, clock, length, depth, parent, and tier state; implement periodic clock decay and GPU leaf priority (frequency + clock) / length.",
+          "gap": "Cumulative reuse_count lacks max-age clock initialization, access reset, periodic aging, node length, depth, and leaf eligibility.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Separate GPU insertion/eviction from host admission; after the frequency threshold, compare frequency * clock with the coldest host entry under host capacity.",
+          "gap": "The threshold is applied to prospective primary-cache admission rather than to GPU-evicted objects being considered for host admission.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs",
+            "/home/ingim/.patissier/work/plex-alpha/sdk/rust/plex/src/lib.rs"
+          ],
+          "fix": "Generate the exact promotion plan using host roots descending by hotness, GPU leaves ascending by hotness, token-fit packing, and parent constraints; emit action intents and defer atomic enactment.",
+          "gap": "Prefetch is issued for every hot prospective object rather than from an ordered host-root/GPU-leaf promotion plan.",
+          "severity": "P1"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/hotprefix",
+            "/home/ingim/.patissier/work/plex-alpha/scripts/benchmark-plex-policy-performance.py"
+          ],
+          "fix": "Add Figure 4 aging, Eq. 5 eviction, Eq. 6 host admission, Algorithm 2 promotion, and MMLU/Hellaswag/BBH/CEVAL traces.",
+          "gap": "Fixtures cover only threshold admission and benchmarks have no resident tiers, eviction, promotion, or equal-capacity baseline.",
+          "severity": "P2"
+        }
+      ],
+      "new_primitives_required": [
+        {
+          "affected_claim": "Faithful Hotness Promotion, including safe multi-victim replacement and pipelined host-to-GPU promotion.",
+          "minimal_contract": "Input incoming objects/ranges and source tiers, victim objects/ranges and destination/discard disposition, target-tier byte budget, dependency constraints, and idempotency key; atomically reserve capacity and report per-object transfer/enactment results.",
+          "primitive": "cache.move@1",
+          "why_required": "Hotness promotion replaces one or more GPU victims with one or more host-resident prefixes under a fixed GPU budget. Independent prefetch actions plus reclaim indices cannot guarantee all-or-none tier exchange, source retention, or capacity reservation while transfers overlap decoding."
+        }
+      ],
+      "recommended_sequence": [
+        "Implement exact hotness state and aging.",
+        "Implement GPU leaf eviction and host admission as separate cache phases.",
+        "Implement the promotion-plan reference algorithm using tier and parent facts.",
+        "Add differential vectors for equations 5-6 and Algorithm 2.",
+        "Add cache.atomic-tier-exchange@1 only for physical all-or-none promotion.",
+        "Run the paper workloads and baselines."
+      ]
+    },
+    {
+      "best_achievable_evidence_with_current_model": "faithful",
+      "citations": [
+        "HEAD 9e837d8dd",
+        "arXiv:2602.08747v1 sections 4.2-4.3 equation 3",
+        "tests/policies/paper-common/src/lib.rs:1059-1103",
+        "tests/policies/replications/pard/metadata.json:9-34",
+        "tests/policies/replications/pard/cases/basic.json:1-6",
+        "scripts/benchmark-plex-policy-performance.py:1494-1540",
+        "interface/plex/src/v0_6/mechanics.rs:53-60",
+        "plex_0.6.md:859-859"
+      ],
+      "current_model_improvements": [
+        {
+          "change": "Projection now sums upstream elapsed, current queue and execution, downstream queue and execution, and downstream batch-wait P10.",
+          "files": [
+            "tests/policies/paper-common/src/lib.rs",
+            "tests/policies/replications/pard/metadata.json"
+          ],
+          "gap": "The previous two-term downstream-P95 gate did not implement PARD equation 3.",
+          "why_expressible_now": "Host-provided latency-distribution facts and set-oriented scheduling can express the Request Broker decision without a new operation."
+        },
+        {
+          "change": "Feedback now exists as a state-update point for future estimator and outcome accounting.",
+          "files": [
+            "tests/policies/paper-common/src/lib.rs",
+            "interface/plex/src/v0_6/types.rs"
+          ],
+          "gap": "The declared feedback operation was absent.",
+          "why_expressible_now": "Typed progress/action feedback and idempotent scoped state are already available."
+        },
+        {
+          "change": "Targets now identify Nexus, Clipper, and naive baselines.",
+          "files": [
+            "tests/policies/performance-targets.json"
+          ],
+          "gap": "Baseline metadata was too vague.",
+          "why_expressible_now": "Baseline fidelity is report metadata rather than a policy-surface capability."
+        }
+      ],
+      "id": "pard",
+      "implementation_gaps": [
+        {
+          "files": [
+            "tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Compute remaining budgets and load factor from facts/state, sort HBF above the high threshold and LBF below the low threshold, and persist hysteresis mode.",
+          "gap": "Adaptive request selection is absent: survivors retain input order and there is no remaining-budget DEPQ, load factor, HBF/LBF switch, or hysteresis.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "tests/policies/replications/pard/metadata.json",
+            "tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Declare cancellation required for this package or guard against missing negotiation and expose only drop intent.",
+          "gap": "request.cancel@1 is optional in metadata but is unconditionally required by every projected miss.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "tests/policies/replications/pard/cases/basic.json",
+            "tests/policies/replications/pard/expected/basic.json"
+          ],
+          "fix": "Replace it with all six equation-3 components and add boundary cases for equality, P10, and DAG maximum path.",
+          "gap": "The committed basic case still supplies downstream_p95_ms, which the current implementation ignores, while expected output still requires cancellation.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "tests/policies/paper-common/src/lib.rs",
+            "tests/policies/replications/pard/metadata.json"
+          ],
+          "fix": "Either implement bounded estimator state in feedback or define these values as trusted adapter facts with explicit provenance and replay fixtures.",
+          "gap": "No sliding queue window, sampled batch-wait distribution, load smoothing, DAG-path maximum, or estimator update occurs in feedback.",
+          "severity": "P1"
+        },
+        {
+          "files": [
+            "scripts/benchmark-plex-policy-performance.py"
+          ],
+          "fix": "Replay bursty multi-module traces and report goodput, drop rate, invalid GPU time, queue delay, and module-of-drop.",
+          "gap": "The performance scenario remains a one-step tautological feasibility filter.",
+          "severity": "P1"
+        }
+      ],
+      "new_primitives_required": [],
+      "recommended_sequence": [
+        "Repair the stale fixture and cancellation capability declaration.",
+        "Implement remaining-budget DEPQ and adaptive HBF/LBF hysteresis.",
+        "Implement or formally source the estimator facts through feedback.",
+        "Add linear and DAG pipeline decision traces.",
+        "Run Nexus/Clipper/naive goodput and invalid-compute comparisons."
+      ]
+    },
+    {
+      "best_achievable_evidence_with_current_model": "decision-trace-parity",
+      "citations": [
+        "HEAD 9e837d8dd",
+        "arXiv:2605.06914v1 sections 3.2-3.5 Algorithm 1 Appendix C",
+        "tests/policies/paper-common/src/lib.rs:1108-1157",
+        "tests/policies/replications/branch-regulation/metadata.json:9-32",
+        "scripts/benchmark-plex-policy-performance.py:1543-1600",
+        "plex_0.6.md:445-459",
+        "plex_0.6.md:317-348",
+        "plex_0.6.md:860-860"
+      ],
+      "current_model_improvements": [
+        {
+          "change": "Scheduling now defers excess candidates by omission, matching TAPER's reversible-control direction.",
+          "files": [
+            "tests/policies/paper-common/src/lib.rs"
+          ],
+          "gap": "The old scheduler cancelled excess branches or their parent requests.",
+          "why_expressible_now": "Schedule already has authority to select a subset of runnable branch requests without cancelling them."
+        },
+        {
+          "change": "Admission now enforces both per-group branch limits and max_accepted.",
+          "files": [
+            "tests/policies/paper-common/src/lib.rs",
+            "interface/plex/src/v0_6/types.rs"
+          ],
+          "gap": "Admission could exceed global capacity.",
+          "why_expressible_now": "Set-oriented admission and trusted WorkGroup identity provide joint branch-count authority."
+        },
+        {
+          "change": "Metadata now labels inspired-adaptation and targets list IRP-Off, C2, C5, and Eager.",
+          "files": [
+            "tests/policies/replications/branch-regulation/metadata.json",
+            "tests/policies/performance-targets.json",
+            "tests/policies/fidelity-audit.json"
+          ],
+          "gap": "Evidence and baselines were overstated.",
+          "why_expressible_now": "Evidence classification can separate policy decisions from absent physical branch mechanics."
+        }
+      ],
+      "id": "branch-regulation",
+      "implementation_gaps": [
+        {
+          "files": [
+            "tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Move the core decision to per-step schedule: select one protected branch per active parent, then greedily add ready branches by marginal utility per predicted latency while within the slack budget.",
+          "gap": "Admission still applies static branch_limit and scalar interference_limit rather than protected baseline composition, predicted T(S), minimum deadline slack, rho budget, and marginal utility.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "tests/policies/paper-common/src/lib.rs",
+            "tests/policies/replications/branch-regulation/metadata.json"
+          ],
+          "fix": "Require branch role, parent/group, readiness, context length, deadline, and utility facts; compute excess status within the policy and never filter the sole protected branch.",
+          "gap": "excess_branch is a host verdict rather than a result computed from current batch composition and deadlines; protected progress is not guaranteed.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "tests/policies/replications/branch-regulation/metadata.json"
+          ],
+          "fix": "Replace cancellation language with reversible branch deferral and remove the unused optional mechanic.",
+          "gap": "Metadata still claims excess-branch cancellation and declares request.cancel@1 although current code no longer cancels.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Persist predictor calibration and prior grants in WorkGroup/shared state and update them from step feedback.",
+          "gap": "No per-step state, realized-latency feedback, predictor refresh, or utility allocation exists.",
+          "severity": "P1"
+        },
+        {
+          "files": [
+            "tests/policies/replications/branch-regulation/cases/basic.json",
+            "scripts/benchmark-plex-policy-performance.py"
+          ],
+          "fix": "Replay serial/parallel phases over low, moderate, and high load and separate decision parity from exact-batch/KV-mechanic evidence.",
+          "gap": "The fixture and benchmark remain static branch-cap tests with an artificial score.",
+          "severity": "P1"
+        }
+      ],
+      "new_primitives_required": [
+        {
+          "affected_claim": "The 1.77x versus IRP-Off, 1.48x versus IRP-Eager, and greater-than-95% SLO claims.",
+          "minimal_contract": "Enact exactly the selected branch requests and token budgets in the next forward pass with no substitution; fail atomically if composition cannot fit; feedback reports realized step latency and members.",
+          "primitive": "schedule.co-execute@1",
+          "why_required": "TAPER's predictor and slack bound apply to the exact next decode-step composition; current selections are not a simultaneous-execution guarantee."
+        },
+        {
+          "affected_claim": "The claim that branch-level regulation decouples compute from memory and can replan every step at low overhead.",
+          "minimal_contract": "For typed branch requests in one WorkGroup, omission from a step preserves shared-prefix and branch-local KV until reconsideration; whole-parent preemption remains legal but must be reported through feedback.",
+          "primitive": "branch.defer-retain@1",
+          "why_required": "TAPER's cheap per-step replanning assumes deferring a branch leaves shared-prefix and branch-local KV resident and resumable without restoration; current schedule omission carries no such physical guarantee."
+        }
+      ],
+      "recommended_sequence": [
+        "Correct stale cancellation metadata and branch fact schema.",
+        "Implement protected progress, slack budgeting, predictor evaluation, and greedy utility in schedule.",
+        "Add per-step decision-trace fixtures across load transitions.",
+        "Add exact-forward-batch and branch-KV-retention guarantees.",
+        "Run adapter-backed IRP-Off/C2/C5/Eager goodput and TPOT experiments."
+      ]
+    },
+    {
+      "best_achievable_evidence_with_current_model": "decision-trace-parity",
+      "citations": [
+        "arXiv:2602.06502v1 \u00a73.2-3.4 and Eqs. 5-6",
+        "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs:1160-1213",
+        "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/dualmap/metadata.json:6-34",
+        "/home/ingim/.patissier/work/plex-alpha/interface/plex/src/v0_6/types.rs:243-285",
+        "/home/ingim/.patissier/work/plex-alpha/scripts/benchmark-plex-policy-performance.py:1603-1650"
+      ],
+      "current_model_improvements": [
+        {
+          "change": "The kernel now limits routing to two ordered hash candidates, uses prefix-hit token counts, applies an SLO test, and tracks target assignment counts.",
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs",
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/dualmap/metadata.json"
+          ],
+          "gap": "Routing considered arbitrary edges and cache affinity always dominated SLO risk.",
+          "why_expressible_now": "Sparse edges represent the two candidate mappings and carry candidate-specific hit and TTFT facts; direct assignments express the selected mapping."
+        },
+        {
+          "change": "Metadata now pins the public artifact and classifies the implementation as inspired-adaptation with physical migration deferred.",
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/dualmap/metadata.json",
+            "/home/ingim/.patissier/work/plex-alpha/interface/plex/src/v0_6/types.rs"
+          ],
+          "gap": "Evidence previously implied kernel reproduction.",
+          "why_expressible_now": "RouteCause::Rebalance and set-oriented requests can express queued-request reassignment separately from enactment."
+        }
+      ],
+      "id": "dualmap",
+      "implementation_gaps": [
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "On RouteCause::Rebalance, accept the overloaded queue as the request set, compute B(i\u2192j), and directly reassign positive-benefit requests in descending order until SLO-safe.",
+          "gap": "Hotspot handling still emits one rebalance action for the current request; it does not rank queued requests by TTFT benefit or restrict movement to each request's alternate candidate.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs",
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/dualmap/metadata.json"
+          ],
+          "fix": "Expose pending_prefill_tokens and select by that metric after the affinity candidate exceeds the SLO threshold.",
+          "gap": "The SLO fallback minimizes predicted TTFT rather than explicitly selecting the less-loaded candidate using pending prefill tokens.",
+          "severity": "P1"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Maintain sliding-window prefix ratios in state and test the 2/n hot and 1/n cold transitions, or validate parity of a pinned host-side candidate producer.",
+          "gap": "Adaptive prefix hotness and hash-key refinement are delegated to unvalidated input facts.",
+          "severity": "P1"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/scripts/benchmark-plex-policy-performance.py"
+          ],
+          "fix": "Use exactly two artifact-derived candidates and add equal-hit, SLO-switch, alternate-candidate, and queued-rebalance traces.",
+          "gap": "The benchmark supplies four candidates, truncates them indirectly, and disables hotspot behavior.",
+          "severity": "P2"
+        }
+      ],
+      "new_primitives_required": [
+        {
+          "affected_claim": "Lightweight dual-hash-ring scaling with localized remapping.",
+          "minimal_contract": "Action containing operation add|drain|remove, target or deployment specification, expected membership revision, idempotency key, and terminal feedback with resulting revision.",
+          "primitive": "target.provision@1",
+          "why_required": "TargetChanged lets a policy react to membership changes but cannot request add, drain, or remove operations needed for DualMap's elastic dual-hash-ring claim."
+        }
+      ],
+      "recommended_sequence": [
+        "Implement exact load-aware SLO fallback.",
+        "Implement set-oriented queued rebalancing without relying on physical movement.",
+        "Add adaptive-prefix candidate parity tests.",
+        "Specify target membership control only if claiming elasticity enactment."
+      ]
+    },
+    {
+      "best_achievable_evidence_with_current_model": "decision-trace-parity",
+      "citations": [
+        "arXiv:2406.03243v1 \u00a74.2-4.4 and Algorithm 1",
+        "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs:1216-1265",
+        "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/llumnix/metadata.json:6-32",
+        "/home/ingim/.patissier/work/plex-alpha/interface/plex/schema/0.6/actions/request-rebalance.schema.json:4-13",
+        "/home/ingim/.patissier/work/plex-alpha/scripts/benchmark-plex-policy-performance.py:1653-1701"
+      ],
+      "current_model_improvements": [
+        {
+          "change": "The kernel now computes freeness from memory capacity, virtual usage, and batch size, selects maximum freeness, and tracks assignment counts.",
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs",
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/llumnix/metadata.json"
+          ],
+          "gap": "Routing minimized a raw virtual-usage scalar.",
+          "why_expressible_now": "Target facts encode instance memory and batch state; edge facts encode aggregate virtual usage; set-oriented routing provides candidate instances and capacities."
+        },
+        {
+          "change": "The artifact commit is pinned and the result is labeled inspired-adaptation with physical migration deferred.",
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/llumnix/metadata.json",
+            "/home/ingim/.patissier/work/plex-alpha/interface/plex/src/v0_6/types.rs"
+          ],
+          "gap": "Artifact provenance and physical migration scope were unclear.",
+          "why_expressible_now": "The generic rebalance action and action feedback separate migration intent from engine enactment."
+        }
+      ],
+      "id": "llumnix",
+      "implementation_gaps": [
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Compute signed freeness using i128 or an ordered signed rational and preserve negative values.",
+          "gap": "saturating_sub clamps negative freeness to zero, although negative freeness is semantically important for queued, priority, and draining cases.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Implement the virtual-usage rules in policy/state or differential-test a pinned fact producer.",
+          "gap": "HOL demand, priority headroom, fake-infinity draining usage, and per-priority division are not computed or validated.",
+          "severity": "P1"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Use RouteCause::Rebalance with a set of running requests, pair extreme-freeness instances, and select victims by priority and length before staging actions.",
+          "gap": "Migration remains a request Boolean routed to the freest target; source/destination threshold pairing and low-priority/short-sequence victim selection are absent.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs",
+            "/home/ingim/.patissier/work/plex-alpha/interface/plex/src/v0_6/types.rs"
+          ],
+          "fix": "Consume Action feedback and update request/instance migration scratch state.",
+          "gap": "Feedback only counts records and does not reconcile migration success/failure or load state.",
+          "severity": "P1"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/scripts/benchmark-plex-policy-performance.py"
+          ],
+          "fix": "Add artifact-derived multi-epoch dispatch and pairing traces; keep downtime and cost claims separate until lifecycle enactment exists.",
+          "gap": "The benchmark has no negative freeness, migration round, fragmentation, priority, or evolving queue.",
+          "severity": "P2"
+        }
+      ],
+      "new_primitives_required": [
+        {
+          "affected_claim": "Near-zero constant downtime live migration with correctness under completion, preemption, and failure.",
+          "minimal_contract": "Typed migration action with request, source, destination, transfer mode, generation, expected source/destination revisions, idempotency key, and progress/terminal feedback for preallocated, copying, committed, aborted, bytes, rounds, and downtime.",
+          "primitive": "request.migrate@1",
+          "why_required": "request.rebalance@1 exposes only request and destination and cannot represent preallocation, incremental KV-copy rounds, abort conditions, commit, or measured downtime."
+        },
+        {
+          "affected_claim": "Autoscaling cost savings and rapid saturation/draining of instances.",
+          "minimal_contract": "Idempotent add|drain|remove action over deployment and target IDs with expected membership revision and terminal feedback.",
+          "primitive": "target.provision@1",
+          "why_required": "The policy can observe targets but cannot create, drain, or terminate instances."
+        }
+      ],
+      "recommended_sequence": [
+        "Fix signed freeness.",
+        "Implement all virtual-usage rules.",
+        "Implement set-oriented source/destination pairing and victim selection.",
+        "Reconcile rebalance outcomes in feedback.",
+        "Add migration and membership primitives only for physical/cost claims."
+      ]
+    },
+    {
+      "best_achievable_evidence_with_current_model": "decision-trace-parity",
+      "citations": [
+        "arXiv:2607.08565 Fig. 13 and \u00a74.2",
+        "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs:1268-1337",
+        "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/smetric/metadata.json:12-29",
+        "/home/ingim/.patissier/work/plex-alpha/scripts/benchmark-plex-policy-performance.py:1704-1754"
+      ],
+      "current_model_improvements": [
+        {
+          "change": "The kernel now implements first-turn load balancing, overload and likely-eviction guards, and load-only fallback without an active rebalance action.",
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs",
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/smetric/metadata.json"
+          ],
+          "gap": "Follow-ups always selected cache affinity and staged active migration.",
+          "why_expressible_now": "Trusted generation_id identifies turns; sparse edges carry hit, history-hit, and load facts; direct assignments express fallback placement."
+        },
+        {
+          "change": "Metadata now defers global-tier KV fetch and calls the kernel an inspired adaptation.",
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/smetric/metadata.json"
+          ],
+          "gap": "Global-tier behavior was mislabeled as physical migration.",
+          "why_expressible_now": "The route decision itself is fully representable; cache movement can remain a separately negotiated mechanic."
+        }
+      ],
+      "id": "smetric",
+      "implementation_gaps": [
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/runtime/policy/examples/check_fixtures_v0_6.rs",
+            "/home/ingim/.patissier/work/plex-alpha/scripts/benchmark-plex-policy-performance.py"
+          ],
+          "fix": "Add first-turn, sticky follow-up, overload fallback, likely-eviction fallback, and post-fallback session traces.",
+          "gap": "The route kernel is close to the paper pseudocode, but no test proves overload and eviction guards independently or across a persistent session.",
+          "severity": "P1"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs",
+            "/home/ingim/.patissier/work/plex-alpha/interface/plex/schema/0.6/actions/cache-prefetch.schema.json"
+          ],
+          "fix": "Expose global-hit availability and expected fetch cost on edges; optionally stage existing cache.prefetch@1 when a concrete cache object is known.",
+          "gap": "Global-tier availability, capacity, and fetch latency are assumed rather than represented in benchmark facts or cache actions.",
+          "severity": "P1"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Use shared ResourceLimit accounting while constructing assignments.",
+          "gap": "Only max_assignments is tracked; aggregate resource demand is not accounted across the request set.",
+          "severity": "P1"
+        }
+      ],
+      "new_primitives_required": [],
+      "recommended_sequence": [
+        "Add guard-specific persistent-session fixtures.",
+        "Add aggregate capacity accounting.",
+        "Model global-fetch availability/cost in edge facts.",
+        "Run trace parity, then separately validate cache-transfer mechanics."
+      ]
+    },
+    {
+      "best_achievable_evidence_with_current_model": "inspired-only",
+      "citations": [
+        "https://arxiv.org/html/2602.13692v3#S4",
+        "pie-project/pie@9e837d8dd:tests/policies/paper-common/src/lib.rs:1340-1406",
+        "pie-project/pie@9e837d8dd:interface/plex/src/v0_6/types.rs:63-93",
+        "pie-project/pie@9e837d8dd:plex_0.6_contract.md:127-173",
+        "pie-project/pie@9e837d8dd:interface/plex/src/v0_6/mechanics.rs:44-93",
+        "pie-project/pie@9e837d8dd:scripts/benchmark-plex-policy-performance.py:1757-1806"
+      ],
+      "current_model_improvements": [
+        {
+          "change": "Cache reclaim now stops after the required capacity is freed.",
+          "files": [
+            "tests/policies/paper-common/src/lib.rs"
+          ],
+          "gap": "Dead-program cache plans previously reclaimed every eligible object.",
+          "why_expressible_now": "CacheContext supplies complete byte accounting in one snapshot."
+        },
+        {
+          "change": "The current model has RequestStatus::Paused, request.rebalance@1, request.cancel@1, action IDs, and enacted action feedback.",
+          "files": [
+            "interface/plex/src/v0_6/types.rs",
+            "interface/plex/src/v0_6/mechanics.rs",
+            "tests/policies/replications/thunderagent/metadata.json"
+          ],
+          "gap": "Migration/cancellation outcomes and paused identity were previously underspecified.",
+          "why_expressible_now": "Migration and cancellation intent can be correlated safely; only policy-requested pause/resume and tool-environment authority remain absent."
+        }
+      ],
+      "id": "thunderagent",
+      "implementation_gaps": [
+        {
+          "files": [
+            "tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "After adding lifecycle mechanics, implement reasoning/acting state, decay, periodic capacity checks, shortest-context victim selection, and restore scoring.",
+          "gap": "The scheduler still filters caller-labelled tool states instead of detecting thrashing and scoring pause/restore candidates from phase, context, and capacity.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Use WorkGroup/request scratch and action feedback to update transitions only after enactment.",
+          "gap": "No policy state machine records active, paused, restored, or terminated transitions.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Make migration mutually exclusive with service and correlate each action result before updating assignment state.",
+          "gap": "Migration may be staged while the same request is also scheduled, and feedback merely counts records.",
+          "severity": "P1"
+        },
+        {
+          "files": [
+            "tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Drive cache decisions from enacted program phase/lifecycle and context-recomputation cost.",
+          "gap": "program_live does not distinguish active retention from pause-time KV release.",
+          "severity": "P1"
+        },
+        {
+          "files": [
+            "scripts/benchmark-plex-policy-performance.py"
+          ],
+          "fix": "Use multi-backend reasoning/acting traces and measure throughput, recomputation, hit rate, imbalance, and tool resources.",
+          "gap": "The benchmark never sets migrate_target or creates pressure and lifecycle transitions.",
+          "severity": "P2"
+        }
+      ],
+      "new_primitives_required": [
+        {
+          "affected_claim": "Program-aware thrashing avoidance and context-cost pause policy.",
+          "minimal_contract": "Action with request_id, release_kv, reason, expires_at_ms, and idempotency_key; feedback reports resulting paused status, prior target, released bytes, and terminal status.",
+          "primitive": "request.pause-resume@1",
+          "why_required": "Omitting a request from SchedulePlan does not transition active to paused or release its backend/KV resources."
+        },
+        {
+          "affected_claim": "Asynchronous tool preparation and tool-resource lifecycle/disk-memory savings.",
+          "minimal_contract": "Action with group_id or request_id, tool_spec_key, desired_state prepare|release, ready_by_ms, resource limits, and idempotency_key; feedback reports handle, resource usage, and status.",
+          "primitive": "tool.resource@1",
+          "why_required": "Facts can report tool readiness, but no existing authority can request asynchronous environment preparation or release sandboxes, disk, and ports."
+        }
+      ],
+      "recommended_sequence": [
+        "Standardize pause, resume, and tool-environment mechanics with adapter tests.",
+        "Implement artifact-equivalent program and backend state machines.",
+        "Implement periodic pause/restore and migration decisions.",
+        "Add action-success/failure, duplicate-feedback, and restart traces.",
+        "Run the paper's multi-backend and tool-resource benchmarks."
+      ]
+    },
+    {
+      "best_achievable_evidence_with_current_model": "decision-trace-parity",
+      "citations": [
+        "https://arxiv.org/html/2604.25899v2#S4.SS2",
+        "pie-project/pie@9e837d8dd:tests/policies/paper-common/src/lib.rs:1409-1478",
+        "pie-project/pie@9e837d8dd:tests/policies/paper-common/src/lib.rs:1871-1931",
+        "pie-project/pie@9e837d8dd:interface/plex/src/v0_6/validate.rs:414-470",
+        "pie-project/pie@9e837d8dd:plex_0.6.md:73-88",
+        "pie-project/pie@9e837d8dd:scripts/benchmark-plex-policy-performance.py:1809-1872"
+      ],
+      "current_model_improvements": [
+        {
+          "change": "Pythia now uses capacity-bounded reclaim and the shared route helper reserves max_assignments.",
+          "files": [
+            "tests/policies/paper-common/src/lib.rs"
+          ],
+          "gap": "Cache plans over-reclaimed and independent routing ignored target assignment counts.",
+          "why_expressible_now": "RouteTarget capacities, edge demands, resident/prospective cache objects, and CachePlan already provide the required bounded decision surfaces."
+        },
+        {
+          "change": "cache.prefetch@1 is an existing negotiated action with target, urgency, expiry, idempotency, and action feedback.",
+          "files": [
+            "interface/plex/schema/0.6/actions/cache-prefetch.schema.json",
+            "interface/plex/src/v0_6/mechanics.rs",
+            "tests/policies/replications/pythia/metadata.json"
+          ],
+          "gap": "Prefetch was treated as absent physical behavior.",
+          "why_expressible_now": "Algorithms 1-3 can use host facts plus existing route, schedule, cache, feedback, and prefetch mechanics; only autoscaling authority is absent."
+        }
+      ],
+      "id": "pythia",
+      "implementation_gaps": [
+        {
+          "files": [
+            "tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Implement Algorithm 2 using trusted distribution bounds, edge demands, target resource vectors, and aggregate per-target reservations.",
+          "gap": "lookahead_cost routing does not implement union-bound OOM safety, output bounds, maximum headroom, or cache-affinity tie-breaking.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Implement Algorithm 3 and maintain queue/aging state through timer and feedback opportunities.",
+          "gap": "workflow_rank ordering does not implement expected remaining distance, downstream-idle risk, weighted priority, local aging, or lowest-priority preemption.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Represent future lineages, exact prompt composition, cache tiers, dead-token reclamation, host staging, and idle-only background prefill.",
+          "gap": "next_use_step eviction is not Algorithm 1's future-lineage keep/drop and tiered staging policy.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Track target resource totals while selecting edges or implement a Pythia-specific capacity-safe assignment.",
+          "gap": "The route helper reserves counts but not aggregate named resource demands, so multi-request outputs can still fail validation.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Correlate action, request, route, and schedule outcomes into scoped state.",
+          "gap": "Feedback is an unused counter and cannot drive cache/prefetch/priority transitions.",
+          "severity": "P1"
+        },
+        {
+          "files": [
+            "scripts/benchmark-plex-policy-performance.py"
+          ],
+          "fix": "Use workflow regexes, output distributions, multiple model queues/cache tiers, and JCT, throughput, TTFT, and OOM metrics.",
+          "gap": "The benchmark independently minimizes the same random scalars and ignores cache results.",
+          "severity": "P2"
+        }
+      ],
+      "new_primitives_required": [
+        {
+          "affected_claim": "Full Pythia phase-adaptive autoscaling and its queue-delay/JCT contribution.",
+          "minimal_contract": "Action with model_or_pool_id, desired_replicas or delta, placement/resource constraints, ready_by_ms, and idempotency_key; feedback reports resulting target IDs/revisions, readiness, and failure.",
+          "primitive": "target.provision@1",
+          "why_required": "Pythia's phase-adaptive autoscaler chooses future replica counts, while PLEX explicitly lacks provisioning, replica creation, and model-loading authority."
+        }
+      ],
+      "recommended_sequence": [
+        "Implement a paper-reference fact producer for workflow regexes and output bounds.",
+        "Replace route, schedule, and cache kernels with Algorithms 1-3.",
+        "Add action/outcome state transitions and resource-safe multi-request routing.",
+        "Establish differential and stateful decision-trace parity.",
+        "Add model.scale@1 only before claiming the full-system autoscaling results."
+      ]
+    },
+    {
+      "best_achievable_evidence_with_current_model": "decision-trace-parity",
+      "citations": [
+        "arXiv:2605.16867 Eqs. 1-2 and \u00a73.4",
+        "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs:1481-1564",
+        "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/goodserve/metadata.json:13-40",
+        "/home/ingim/.patissier/work/plex-alpha/scripts/benchmark-plex-policy-performance.py:1875-1947",
+        "/home/ingim/.patissier/work/plex-alpha/interface/plex/schema/0.6/actions/request-rebalance.schema.json:4-13"
+      ],
+      "current_model_improvements": [
+        {
+          "change": "It now evaluates q+p(Lin-H)+dLout, selects the least-capable feasible GPU, falls back to the most capable GPU, tracks assignment capacity, and implements feedback.",
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs",
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/goodserve/metadata.json"
+          ],
+          "gap": "The prior kernel optimized unrelated quality-gap and cost fields.",
+          "why_expressible_now": "Requests and sparse edges carry fixed predictor outputs and concrete heterogeneous targets; state/feedback can retain monitor results; rebalance stages corrective intent."
+        },
+        {
+          "change": "It now generates deadline, queue, cache, prefill/decode, capability, and output-length facts and reports an E2E-SLO proxy.",
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/scripts/benchmark-plex-policy-performance.py",
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/performance-targets.json"
+          ],
+          "gap": "The benchmark used quality-adjusted cost.",
+          "why_expressible_now": "The policy model accepts prediction facts without embedding predictor training or deployment in the ABI."
+        }
+      ],
+      "id": "goodserve",
+      "implementation_gaps": [
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "On RouteCause::Rebalance, include current target/capability and remaining deadline, then restrict candidates to stronger GPUs and apply just-enough selection to refreshed predictions.",
+          "gap": "A high-risk request is sent to the ordinary selected target; the code does not require a target stronger than the current GPU or use refreshed remaining-time estimates.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Have the host trigger periodic feedback/rebalance opportunities and update per-target q/p/d and per-request output predictions in state.",
+          "gap": "The 50-iteration reevaluation loop and EMA/request predictor state are absent; feedback only counts records.",
+          "severity": "P1"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/goodserve/metadata.json"
+          ],
+          "fix": "Define lower rank as less capable, reject inconsistent ranks, and add feasible/no-feasible boundary tests.",
+          "gap": "capability_rank ordering is implicit and lacks schema validation.",
+          "severity": "P1"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/scripts/benchmark-plex-policy-performance.py"
+          ],
+          "fix": "Add random, least-request, round-robin, lowest-TPM, Preble, and Llumnix proxies plus refreshed-risk migration traces.",
+          "gap": "The benchmark still compares only with a cost-only baseline and never triggers migration.",
+          "severity": "P2"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Apply common demand accounting in addition to max_assignments.",
+          "gap": "Aggregate ResourceLimit usage is not tracked across the request set.",
+          "severity": "P1"
+        }
+      ],
+      "new_primitives_required": [
+        {
+          "affected_claim": "Risk-triggered lightweight token-ID migration and its 7.1-15.3\u00d7 migration-latency advantage.",
+          "minimal_contract": "Migration action with request, source, destination, transfer_mode=token-ids, generation/RNG continuation data or preservation guarantee, expected revisions, idempotency key, and progress/terminal feedback including recompute and transfer latency.",
+          "primitive": "request.migrate@1",
+          "why_required": "Generic rebalance cannot require GoodServe's token-ID transfer and destination recomputation semantics or verify that corrective migration preserves generation state."
+        }
+      ],
+      "recommended_sequence": [
+        "Constrain corrective routes to stronger just-enough targets.",
+        "Implement periodic monitor state through feedback.",
+        "Add capacity and rank validation.",
+        "Expand decision baselines and migration traces.",
+        "Add token-ID migration lifecycle only before claiming migration latency."
+      ]
+    },
+    {
+      "best_achievable_evidence_with_current_model": "decision-trace-parity",
+      "citations": [
+        "arXiv:2606.01839 \u00a74 and Eqs. 1-2",
+        "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs:1567-1610",
+        "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/conserve/metadata.json:12-24",
+        "/home/ingim/.patissier/work/plex-alpha/sdk/rust/plex/src/lib.rs:92-125",
+        "/home/ingim/.patissier/work/plex-alpha/scripts/benchmark-plex-policy-performance.py:1950-2011"
+      ],
+      "current_model_improvements": [
+        {
+          "change": "Initial requests now require a prefiller target; follow-ups require a decoder, honor bound_target_id, and otherwise minimize active KV occupancy; assignments track max_assignments.",
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs",
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/conserve/metadata.json",
+            "/home/ingim/.patissier/work/plex-alpha/sdk/rust/plex/src/lib.rs"
+          ],
+          "gap": "Initial routing used arbitrary capacity and follow-ups merely preferred affinity.",
+          "why_expressible_now": "Target role facts, trusted generations, request facts, sparse edges, and mutable request/group scratch can represent phase-aware placement and persistent decoder identity."
+        }
+      ],
+      "id": "conserve",
+      "implementation_gaps": [
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Distinguish first-prefill from first-decode using a trusted phase fact/cause; after prefill completion select and bind a decoder.",
+          "gap": "Generation 0 is always routed to the prefiller, so first-turn decode is never assigned to the decoder with lowest active KV occupancy.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs",
+            "/home/ingim/.patissier/work/plex-alpha/sdk/rust/plex/src/lib.rs"
+          ],
+          "fix": "Write the chosen decoder to request or group scratch and define fallback/rebinding on TargetChanged.",
+          "gap": "bound_target_id is supplied externally rather than persisted by the policy, so restart, missing-target, and stale-binding behavior is unproven.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/conserve/metadata.json"
+          ],
+          "fix": "Declare phase handoff/KV transfer deferred until the new lifecycle action and adapter exist.",
+          "gap": "Exactly-once KV transfer is absent but metadata lists no deferred mechanics.",
+          "severity": "P1"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/conserve/metadata.json"
+          ],
+          "fix": "Validate deployment facts offline or expose them in admission/control-plane tooling; do not fold replica creation into route.",
+          "gap": "N\u00b7Td\u2265R\u00b7Ld and N\u00b7B\u2265R\u00b7W provisioning checks are absent.",
+          "severity": "P1"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/scripts/benchmark-plex-policy-performance.py"
+          ],
+          "fix": "Replay one conversation across prefill completion and multiple generations, including restart and unavailable decoder.",
+          "gap": "The benchmark alternates independent requests with a preselected binding and does not test first-decode binding persistence.",
+          "severity": "P2"
+        }
+      ],
+      "new_primitives_required": [
+        {
+          "affected_claim": "Exactly one KV transfer followed by persistent decoder pinning for the entire conversation tail.",
+          "minimal_contract": "Typed action containing request, generation, from_target, to_target, phase prefill-to-decode, KV object/reference, exactly-once idempotency key, expected revisions, and success/failure feedback including transferred bytes and committed binding.",
+          "primitive": "request.phase-handoff@1",
+          "why_required": "Direct route assignments and generic cache prefetch do not specify the exactly-once transition from first-turn prefill to first-turn decode, bind that decoder for the conversation, or correlate KV transfer with phase completion."
+        }
+      ],
+      "recommended_sequence": [
+        "Add trusted phase-specific route opportunities.",
+        "Persist decoder binding and test TargetChanged recovery.",
+        "Add first-prefill/first-decode/multi-generation traces.",
+        "Declare transfer deferred.",
+        "Introduce phase-handoff lifecycle before claiming exactly-once movement."
+      ]
+    },
+    {
+      "best_achievable_evidence_with_current_model": "decision-trace-parity",
+      "citations": [
+        "https://arxiv.org/html/2405.19888v1#S5",
+        "pie-project/pie@9e837d8dd:tests/policies/paper-common/src/lib.rs:1613-1643",
+        "pie-project/pie@9e837d8dd:tests/policies/paper-common/src/lib.rs:1910-1931",
+        "pie-project/pie@9e837d8dd:tests/policies/replications/parrot/metadata.json:3-27",
+        "pie-project/pie@9e837d8dd:plex_0.6_contract.md:63-76",
+        "pie-project/pie@9e837d8dd:scripts/benchmark-plex-policy-performance.py:2014-2070"
+      ],
+      "current_model_improvements": [
+        {
+          "change": "The shared route helper now reserves max_assignments; metadata identifies OSDI 2024, pins ParrotServe commit 2e1825ee, and labels evidence inspired-adaptation.",
+          "files": [
+            "tests/policies/paper-common/src/lib.rs",
+            "tests/policies/replications/parrot/metadata.json"
+          ],
+          "gap": "Batch routing could exceed target assignment counts and artifact metadata was wrong.",
+          "why_expressible_now": "Set-oriented route/schedule, target capacities, WorkGroups, multi-request selections, and host-provided DAG facts can express Parrot's scheduler and placement decisions."
+        }
+      ],
+      "id": "parrot",
+      "implementation_gaps": [
+        {
+          "files": [
+            "tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Use propagated criteria, task/token capacities, resident context/prefix affinity, and interference cost.",
+          "gap": "dependency_distance placement is not Parrot's context-aware, criteria-aware, capacity-constrained engine selection.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Order by trusted graph depth/criteria, construct whole task-group selections, then apply shared-prefix and resident-context grouping.",
+          "gap": "Scheduling only filters dependency_ready and otherwise preserves input order.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Reserve each selected edge's resources while assigning or use a Parrot-specific capacity-aware placement loop.",
+          "gap": "The route helper still ignores aggregate named resource demand.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "tests/policies/replications/parrot/metadata.json"
+          ],
+          "fix": "Integrate a bounded ParrotServe-equivalent graph traversal in the host adapter and version its output schema.",
+          "gap": "No artifact-backed fact producer performs backward criteria/depth/task-group propagation.",
+          "severity": "P1"
+        },
+        {
+          "files": [
+            "scripts/benchmark-plex-policy-performance.py"
+          ],
+          "fix": "Run chain, map-reduce, and multi-agent DAGs with multiple engines, prefixes, and capacities; measure application makespan and sustainable throughput.",
+          "gap": "The benchmark scores readiness only and discards route outcomes.",
+          "severity": "P2"
+        }
+      ],
+      "new_primitives_required": [
+        {
+          "affected_claim": "Full Semantic Variable runtime, dependent-request execution without client round trips, and associated end-to-end gains.",
+          "minimal_contract": "Negotiated guarantee for a bounded WorkGroup-scoped DAG with host-issued node/request IDs, versioned edges, automatic readiness activation, terminal propagation, and trusted depth/criteria facts.",
+          "primitive": "workflow.graph@1",
+          "why_required": "Trusted DAG facts can describe readiness, but the current lifecycle does not portably guarantee server-side activation of successor requests, dependency-failure propagation, or Semantic Variable submit/get execution."
+        }
+      ],
+      "recommended_sequence": [
+        "Implement and validate the artifact-backed DAG fact producer.",
+        "Replace scheduling with depth, criteria, task-group, and prefix-aware logic.",
+        "Replace placement with resource- and interference-aware assignment.",
+        "Establish differential decision-trace parity against ParrotServe.",
+        "Add workflow.dependency-runtime@1 before claiming the complete Semantic Variable runtime."
+      ]
+    },
+    {
+      "best_achievable_evidence_with_current_model": "faithful",
+      "citations": [
+        "https://arxiv.org/html/2605.00528v2#S4",
+        "https://arxiv.org/html/2605.00528v2#S6",
+        "pie-project/pie@9e837d8dd:tests/policies/paper-common/src/lib.rs:1646-1738",
+        "pie-project/pie@9e837d8dd:tests/policies/replications/saga/metadata.json:9-35",
+        "pie-project/pie@9e837d8dd:interface/plex/src/v0_6/mechanics.rs:85-92",
+        "pie-project/pie@9e837d8dd:scripts/benchmark-plex-policy-performance.py:2073-2151"
+      ],
+      "current_model_improvements": [
+        {
+          "change": "SAGA now reserves target max_assignments and uses capacity-bounded reclaim.",
+          "files": [
+            "tests/policies/paper-common/src/lib.rs"
+          ],
+          "gap": "Routing could overfill targets and cache plans reclaimed every expired object.",
+          "why_expressible_now": "Route, schedule, cache, WorkGroup state, target facts, and cache-object facts already expose the coordinated decision inputs."
+        },
+        {
+          "change": "Metadata now correctly treats request.rebalance@1 as the optional movement intent and physical enactment as adapter evidence.",
+          "files": [
+            "tests/policies/replications/saga/metadata.json",
+            "interface/plex/src/v0_6/mechanics.rs"
+          ],
+          "gap": "Physical stealing was previously treated as a missing core operation.",
+          "why_expressible_now": "WorkGroup identity can represent the session, route can select the target, request.rebalance@1 can stage movement, and feedback can update affinity after success."
+        },
+        {
+          "change": "Performance metadata now reports TCT speedups and separate approximate memory-utilization ratios.",
+          "files": [
+            "tests/policies/performance-targets.json"
+          ],
+          "gap": "Headline metrics were imprecise.",
+          "why_expressible_now": "Claim scope is separated from the currently implemented reduced kernel."
+        }
+      ],
+      "id": "saga",
+      "implementation_gaps": [
+        {
+          "files": [
+            "tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Implement thresholded affinity routing and stateful work-steal selection from trusted worker/session facts; stage rebalance only for the chosen victim.",
+          "gap": "Routing always maximizes locality and caller-supplied steal replaces the paper's 0.8 affinity gate, idle/load-ratio guards, victim selection, and oldest-session choice.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Implement the exact weighted eviction score, transition-probability overlap, per-tool duration state, timestamped TTL, and pressure rules.",
+          "gap": "Cache admission implements only positive-TTL retention; WA-LRU, AEG reuse probability, adaptive tool TTL, pressure scaling, and expiry are absent.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "tests/policies/paper-common/src/lib.rs",
+            "tests/policies/paper-saga/src/lib.rs"
+          ],
+          "fix": "Implement AFS scores, proportional token allocation, timer-driven epochs, and feedback-maintained group progress/deadline state.",
+          "gap": "Least group_service is not AFS and there is no feedback implementation for remaining work, deadlines, allocation epochs, or blocking preemption.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Track named target-resource totals during assignment.",
+          "gap": "Route assignment reserves only counts, not aggregate resource demands.",
+          "severity": "P1"
+        },
+        {
+          "files": [
+            "tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Add feedback, correlate action IDs, and update affinity only after successful enactment; verify adapter KV migration separately.",
+          "gap": "Rebalance action outcomes do not update session affinity or migrated-cache state.",
+          "severity": "P1"
+        },
+        {
+          "files": [
+            "scripts/benchmark-plex-policy-performance.py"
+          ],
+          "fix": "Use multi-step sessions under pressure and deadlines; compare vLLM+APC and component ablations using TCT, memory utilization, regeneration, and SLO attainment.",
+          "gap": "The benchmark disables stealing, ignores cache output, and hardcodes the implementation's locality-dominant utility.",
+          "severity": "P2"
+        }
+      ],
+      "new_primitives_required": [],
+      "recommended_sequence": [
+        "Define trusted AEG, tool-duration, worker-load, deadline, and session-queue schemas.",
+        "Implement WA-LRU and adaptive timestamped TTL.",
+        "Implement affinity routing, guarded work stealing, and action-feedback affinity updates.",
+        "Implement AFS epochs and feedback accounting.",
+        "Validate coordinated traces, then run vLLM+APC and ablation benchmarks."
+      ]
+    },
+    {
+      "best_achievable_evidence_with_current_model": "faithful",
+      "citations": [
+        "arXiv:2606.17949 \u00a74.1-4.2, Eqs. 1-2, Algorithm 1",
+        "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs:1740-1832",
+        "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs:1934-1944",
+        "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/routebalance/metadata.json:6-35",
+        "/home/ingim/.patissier/work/plex-alpha/scripts/benchmark-plex-policy-performance.py:2154-2262"
+      ],
+      "current_model_improvements": [
+        {
+          "change": "It now performs LPT ordering, cost-budget filtering, normalized quality/cost/latency scoring, per-assignment dead-reckoned load updates, and capacity-aware direct assignments.",
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs",
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/routebalance/metadata.json"
+          ],
+          "gap": "The previous implementation used exponential static global matching with a 12-request bound.",
+          "why_expressible_now": "A set-oriented route invocation exposes the whole waiting batch, concrete model instances as targets, sparse request-instance edges, target state, capacities, and direct assignments; no model-selection primitive is needed."
+        },
+        {
+          "change": "The official artifact commit is pinned and metadata names the paper equations and decision flow.",
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/routebalance/metadata.json",
+            "/home/ingim/.patissier/work/plex-alpha/plex-serving-policy-wiki/papers/routebalance.md"
+          ],
+          "gap": "Artifact and dataset provenance were missing.",
+          "why_expressible_now": "Model identity, predicted quality, cost, and latency are ordinary target/edge facts over concrete deployed instances."
+        }
+      ],
+      "id": "routebalance",
+      "implementation_gaps": [
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Implement Eq. 1 exactly, preserving raw quality in [0,1] and maximum-only normalization for cost and latency.",
+          "gap": "The paper uses raw quality plus 1\u2212cost/max(cost) and 1\u2212latency/max(latency); the kernel min-max normalizes all three signals.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs",
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/replications/routebalance/metadata.json"
+          ],
+          "fix": "Expose pending decode tokens and decode batch size per target, compute d/b iterations plus predicted output length, and update d after each dispatch.",
+          "gap": "Dead-reckoned latency is dimensionally different from T=tpot\u00b7(d/b+L): it adds latency_ms to tpot\u00d7queued_tokens and lacks decode batch size.",
+          "severity": "P0"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Require the three ppm weights to sum to 1,000,000 or normalize deterministically.",
+          "gap": "Weights are not validated or normalized to the three-simplex.",
+          "severity": "P2"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/tests/policies/paper-common/src/lib.rs"
+          ],
+          "fix": "Apply shared target resource accounting during the LPT pass.",
+          "gap": "Only max_assignments is enforced; aggregate ResourceLimit demand is ignored.",
+          "severity": "P1"
+        },
+        {
+          "files": [
+            "/home/ingim/.patissier/work/plex-alpha/scripts/benchmark-plex-policy-performance.py"
+          ],
+          "fix": "Replay the official artifact's per-step state updates and add Avengers-Pro, BEST-Route, passthrough, and Semantic-Router decision traces.",
+          "gap": "The benchmark scores realized assignments using initial queue state, omitting the policy's sequential dead-reckoning, and uses only a shortest-queue proxy baseline.",
+          "severity": "P2"
+        }
+      ],
+      "new_primitives_required": [],
+      "recommended_sequence": [
+        "Correct Eq. 1 normalization.",
+        "Correct the d/b+L latency model and update rule.",
+        "Validate weights and aggregate capacities.",
+        "Add artifact differential traces and paper baselines.",
+        "Upgrade evidence only after exact assignment parity."
+      ]
+    }
+  ],
+  "evidence_ceiling_counts": {
+    "decision-trace-parity": 17,
+    "faithful": 13,
+    "inspired-only": 1
+  },
+  "policy_count": 31,
+  "schema_version": 1
+}

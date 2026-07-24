@@ -14,12 +14,17 @@ cargo run --quiet --release --locked -p pie-policy --example bench_v0_6 -- \
 python3 -m json.tool /tmp/plex-v0.6-benchmark.json >/dev/null
 python3 -m json.tool tests/policies/performance-targets.json >/dev/null
 python3 -m json.tool tests/policies/fidelity-audit.json >/dev/null
+python3 -m json.tool tests/policies/reproducibility-gap-taxonomy.json >/dev/null
+python3 -m json.tool tests/policies/reproducibility-gap-matrix.json >/dev/null
 python3 -m json.tool plex_policy_performance_report.json >/dev/null
+python3 -m json.tool plex_policy_reproducibility_roadmap.json >/dev/null
 python3 -m py_compile \
     scripts/benchmark-plex-policy-performance.py \
     scripts/benchmark-vllm-plex-policy.py \
     scripts/run-vllm-plex-performance-matrix.py \
-    scripts/generate-plex-policy-performance-report.py
+    scripts/generate-plex-policy-performance-report.py \
+    scripts/merge-plex-reproducibility-gaps.py \
+    scripts/generate-plex-reproducibility-roadmap.py
 
 python3 scripts/generate-plex-replication-report.py
 python3 scripts/update-plex-paper-replication-status.py

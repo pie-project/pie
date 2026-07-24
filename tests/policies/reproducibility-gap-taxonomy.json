@@ -1,0 +1,151 @@
+{
+  "schema_version": 1,
+  "axes": {
+    "current_model_improvement": {
+      "definition": "The paper algorithm can be implemented using the existing admit, route, schedule, cache and feedback operations; bounded host facts; shared/group/request state; direct plans; and already standardized mechanics.",
+      "examples": [
+        "exact scoring, optimization or queue algorithm inside Wasm",
+        "host-side predictor or profiler output supplied as facts",
+        "per-client, per-group, per-target or cache-object accounting in existing state",
+        "stateful multi-opportunity control using feedback",
+        "global bounded assignment using set-oriented route or schedule plans",
+        "distributed CAS state backend without changing the policy contract"
+      ]
+    },
+    "new_primitive_required": {
+      "definition": "Faithful behavior requires authority, atomicity, lifecycle, or enacted mechanism that cannot be represented or safely validated by the current operations and standard mechanics.",
+      "examples": [
+        "autonomous timers and lease expiry callbacks",
+        "multi-phase migration with reserve, copy, commit and rollback",
+        "partial cache-object transformation or typed cache hierarchy",
+        "pause, resume and preserve/discard lifecycle requested by policy",
+        "returning a stable intermediate answer while terminating reasoning",
+        "simultaneous co-scheduling rather than atomic queue insertion",
+        "model loading, replica provisioning and autoscaling control"
+      ]
+    },
+    "implementation_gap": {
+      "definition": "The current programming model is sufficient, but the committed policy, adapter, state loop, benchmark, or host facts do not implement the paper algorithm faithfully.",
+      "examples": [
+        "wrong equation, ordering, threshold, statistic or baseline",
+        "missing state transition or feedback accounting",
+        "capacity-invalid or over-reclaiming plans",
+        "caller-supplied oracle facts replacing a required estimator",
+        "paper operation declared but trait method falling back",
+        "synthetic benchmark rewarding the implementation by construction"
+      ]
+    }
+  },
+  "current_capabilities": [
+    "dense batch admission with resource limits",
+    "capacity-safe set routing over sparse feasible edges",
+    "multi-request schedule selections and token budgets",
+    "resident/prospective cache objects, byte capacity and reclaim episodes",
+    "deduplicated feedback with request, group, cache, assignment, selection and action subjects",
+    "shared, group and request-scoped persistent policy state",
+    "schedule.atomic-enqueue@1",
+    "request.cancel@1",
+    "group.cancel@1",
+    "cache.prefetch@1",
+    "cache.swap@1",
+    "request.rebalance@1"
+  ],
+  "candidate_primitives": [
+    {
+      "id": "timer.lease@1",
+      "kind": "action-and-callback",
+      "minimal_contract": "arm, refresh and cancel a typed timer or lease; emit deduplicated expiry feedback carrying timer ID and subject",
+      "why": "TTL, clock aging, periodic re-evaluation and hysteresis otherwise depend on external polling facts"
+    },
+    {
+      "id": "request.pause-resume@1",
+      "kind": "action-and-lifecycle",
+      "minimal_contract": "request pause, preserve, resume or discard with enacted status and preserved-state identity",
+      "why": "intercept, agent thrashing and staged reasoning policies require more than omission or cancellation"
+    },
+    {
+      "id": "request.migrate@1",
+      "kind": "multi-phase-action",
+      "minimal_contract": "prepare destination, reserve resources, copy incremental state, commit or abort, and report downtime/bytes",
+      "why": "request.rebalance@1 is only an intent and cannot prove live-migration semantics"
+    },
+    {
+      "id": "cache.move@1",
+      "kind": "multi-phase-action",
+      "minimal_contract": "reserve destination tier, transfer object or range, commit placement, release source, and report actual bytes/latency",
+      "why": "prefetch and swap intents do not establish tier placement, copy-once or rollback"
+    },
+    {
+      "id": "cache.transform@1",
+      "kind": "action",
+      "minimal_contract": "replace, merge, split or partially reclaim a cache object while preserving typed lineage and beneficiary ownership",
+      "why": "Marconi-style SSM-only reclaim and KV merging cannot be expressed as whole-object reclaim"
+    },
+    {
+      "id": "cache.graph@1",
+      "kind": "typed-context-guarantee",
+      "minimal_contract": "validated parent/child lineage, leaf eligibility, tier and range identity for cache objects",
+      "why": "RAGCache, PEEK, HotPrefix, Marconi and Pythia depend on evolving trees rather than independent objects"
+    },
+    {
+      "id": "schedule.co-execute@1",
+      "kind": "guarantee",
+      "minimal_contract": "all requests in a selection begin the same execution step or the selection is not enacted",
+      "why": "atomic enqueue does not guarantee simultaneous branch or gang execution"
+    },
+    {
+      "id": "request.complete-with-output@1",
+      "kind": "action",
+      "minimal_contract": "terminate a reasoning request while committing a validated stable answer or aggregate result",
+      "why": "Dynasor-style early completion is not equivalent to cancellation"
+    },
+    {
+      "id": "target.provision@1",
+      "kind": "control-plane-action",
+      "minimal_contract": "load or unload a model, create or remove a replica, resize capacity and report readiness/failure",
+      "why": "QLM, SLOs-Serve, GoodServe and routing systems include provisioning beyond choosing existing targets"
+    },
+    {
+      "id": "workflow.graph@1",
+      "kind": "typed-context-guarantee",
+      "minimal_contract": "validated nodes, edges, AND/OR semantics, readiness, task groups and lineage revisions",
+      "why": "JSON facts can carry a DAG, but the host cannot validate graph identity, atomic groups or evolution"
+    },
+    {
+      "id": "operation.bundle@1",
+      "kind": "atomic-plan-guarantee",
+      "minimal_contract": "evaluate and commit a bounded combination of admit, route, schedule and cache subplans against one snapshot or enact none",
+      "why": "whole-workflow planners can otherwise observe or enact inconsistent cross-operation state"
+    },
+    {
+      "id": "decode.speculate@1",
+      "kind": "guarantee-and-action",
+      "minimal_contract": "select speculative token budget or mode, verify engine support, and report accepted/rejected tokens and latency",
+      "why": "SLO-aware speculation is not expressible through ordinary schedule token budgets alone"
+    },
+    {
+      "id": "tool.resource@1",
+      "kind": "action-and-lifecycle",
+      "minimal_contract": "prepare, acquire, release and fail a named tool/runtime resource with request or group ownership",
+      "why": "agent serving papers coordinate external environments whose readiness and teardown affect scheduling"
+    },
+    {
+      "id": "cache.pin@1",
+      "kind": "lease-guarantee",
+      "minimal_contract": "guarantee object residency until lease expiry or explicit revocation and report violations",
+      "why": "omitting an object from one reclaim plan does not guarantee TTL or workflow residency across later native pressure"
+    },
+    {
+      "id": "branch.defer-retain@1",
+      "kind": "schedule-lifecycle-guarantee",
+      "minimal_contract": "defer a branch without terminating its parent, retain its execution and KV state, and reconsider it at a later step",
+      "why": "ordinary request cancellation or omission does not prove reversible branch-width regulation"
+    },
+    {
+      "id": "request.phase-handoff@1",
+      "kind": "multi-phase-action",
+      "minimal_contract": "atomically transfer request ownership and state between prefill and decode roles, then persist the selected destination binding",
+      "why": "disaggregated conversation serving requires exactly-once KV handoff plus durable decoder affinity"
+    }
+  ]
+}
