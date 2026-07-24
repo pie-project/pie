@@ -580,6 +580,14 @@ Metal driver: step-loop internally (same C ABI).
     (baseline 5b9f30ff5: 2/10 runs fail; with ⑤: 1/10 — statistically
     identical; solo: 0/3). "driver published RETRY at frame settle" from
     the dummy driver's 25ms callback race. Not chased this round.
+  - CLEANUP (post-certification, operator-directed): PIE_SCHED_NO_MIX
+    DELETED per the dormant-lever discipline — sched_no_mix(), the
+    accepts() gate, and the lead_device_geometry field (its only reader
+    was the gate). Mixing is now the only path. Engine lib 350/351 with
+    the known pre-existing flake, solo-green. Branch then consolidated:
+    the full golf history vs dev squashed into ONE commit on origin/dev
+    (same convention as the Vesuvius squash 3c83ad114) and pushed to
+    github.
   Earlier checkpoint: steps 1–3 IMPLEMENTED (offset fixed-decode
   compose + FixedDecodeScope; mixed template acceptance with full-width
   reserves + mixed_envelope flag + unavailable extents for envelope

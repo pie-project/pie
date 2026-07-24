@@ -293,24 +293,10 @@ pub(crate) struct LaunchGrouping {
     has_solo_submission: bool,
     has_user_mask: bool,
     has_device_geometry: bool,
-    /// Wave batches are geometry-class homogeneous: wire-geometry (chunk)
-    /// and device-resolved (decode) fires launch as separate steps (the
-    /// mixed descriptor-fallback path is deleted with the wave protocol).
-    lead_device_geometry: bool,
 }
 
 fn has_dense_device_mask(request: &crate::driver::LaunchPlan) -> bool {
     request.has_user_mask && request.masks.is_empty()
-}
-
-/// `PIE_SCHED_NO_MIX`: restore geometry-class-homogeneous wave batches
-/// (pre-sub-batch behavior). Read once; A/B control for attributing
-/// batch-composition token drift vs mixed-step defects.
-fn sched_no_mix() -> bool {
-    static NO_MIX: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *NO_MIX.get_or_init(|| {
-        std::env::var("PIE_SCHED_NO_MIX").is_ok_and(|v| v != "0" && !v.is_empty())
-    })
 }
 
 impl LaunchGrouping {
@@ -329,14 +315,7 @@ impl LaunchGrouping {
         // wire-first and the driver composes the envelope suffix on device
         // via the offset fixed-decode compose. The mask/solo exclusions
         // below still keep dense-masked and wire-masked device-geometry
-        // fires out of shared batches. `PIE_SCHED_NO_MIX` restores the
-        // per-class split (A/B control lever for drift attribution).
-        if self.count != 0
-            && request.request.device_resolved_geometry != self.lead_device_geometry
-            && sched_no_mix()
-        {
-            return false;
-        }
+        // fires out of shared batches.
         if request
             .pipeline_id
             .is_some_and(|pid| self.pipelines.contains(&pid))
@@ -383,9 +362,6 @@ impl LaunchGrouping {
         page_size: u32,
     ) -> bool {
         let usage = batch::request_capacity_usage(request, page_size);
-        if self.count == 0 {
-            self.lead_device_geometry = request.request.device_resolved_geometry;
-        }
         self.instances.insert(request.instance_id);
         if let Some(pid) = request.pipeline_id {
             self.pipelines.insert(pid);
