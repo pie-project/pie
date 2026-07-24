@@ -178,11 +178,25 @@ private:
                 throw std::runtime_error(
                     "rust storage executor: Cast source byte size mismatch");
             }
+#if PIE_CUDA_TRANSCODE_ENGINE_HAS_CUDA
+            // Stream-0 H2D, ordered before the cast kernel (also stream 0) below.
+            // Like the repack source, this `scratch` is transient and consumed
+            // immediately, so it must not use the deferred queue() (which executes
+            // only at the next flush, after the cast reads it and after scratch is
+            // freed). Mirrors the encode/fp8/repack materialize paths.
+            copy_engine_.queue_on_stream(
+                instr.source.file_id,
+                instr.source.file_offset,
+                instr.source.span_bytes,
+                scratch.data(),
+                /*stream=*/0);
+#else
             copy_engine_.queue(
                 instr.source.file_id,
                 instr.source.file_offset,
                 instr.source.span_bytes,
                 scratch.data());
+#endif
             cast_tensor_to_ptr(scratch, dst, out.dtype());
             return;
         }
@@ -906,11 +920,30 @@ private:
                     scratch.data(),
                     wl_cpp::extent_shape(instr.source.stride));
             } else {
+#if PIE_CUDA_TRANSCODE_ENGINE_HAS_CUDA
+                // Stream-0 H2D so the repack kernel that reads this scratch (also
+                // stream 0, launched immediately below) sees the fully uploaded
+                // source via implicit stream ordering — exactly as the encode/fp8
+                // materialize paths do. The plain copy_engine_.queue() defers the
+                // copy to the next copy_engine_.flush(), which runs only AFTER the
+                // repack kernel has launched AND after this `scratch` DeviceTensor
+                // is freed on return: the kernel would read uninitialized device
+                // memory and the deferred reader-lane copy would later write to
+                // freed memory. queue_on_stream(0) issues the copy synchronously on
+                // stream 0 so both hazards are ordered away.
+                copy_engine_.queue_on_stream(
+                    instr.source.file_id,
+                    instr.source.file_offset + instr.source.stride.base_offset,
+                    instr.source.span_bytes,
+                    scratch.data(),
+                    /*stream=*/0);
+#else
                 copy_engine_.queue(
                     instr.source.file_id,
                     instr.source.file_offset + instr.source.stride.base_offset,
                     instr.source.span_bytes,
                     scratch.data());
+#endif
             }
             return scratch;
         }
