@@ -260,11 +260,13 @@ async fn run_one(
     // Take-side ring ceiling under the two-frame window discipline: the
     // window (`submitted - taken`) peaks at 3k - 1 — a top-up starting at
     // window 2k - 1 adds one k-slot frame — and every outstanding fire can
-    // settle before the host takes, so the ring needs exactly 3k - 1 cells
-    // (k = 1 reproduces the classic depth-2 ring). Exact peak, no slack:
-    // the discipline bounds unconsumed puts, and a full publish ring is a
-    // terminal FAILURE under v14.
-    let out_capacity = 3 * k - 1;
+    // settle before the host takes. The ring needs ONE MORE cell than that
+    // peak: 3k. Measured, not theoretical — at k=2 a 3k-1 ring throttled the
+    // pipeline back to one frame in flight (28.0k vs 34.3k; the engine's
+    // conservative ticket staging needs publish room for the next frame
+    // before the host's takes are observable), while k=1 reproduces the
+    // classic depth-2 ring either way.
+    let out_capacity = 3 * k;
     let out = Channel::new([1], dtype::i32)
         .capacity(out_capacity as u32)
         .named("out");

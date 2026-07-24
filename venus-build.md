@@ -290,14 +290,61 @@ Metal driver: step-loop internally (same C ABI).
   full publish ring is a terminal FAILURE under v14, so slack one).
   The venus-project.md arrival contract must say "guest window ≥ 2
   FRAMES", not "≥ 2".
-- TODO next: (a) if round-3 cert shows k≥2 ≥ k=1, the compose-split /
+- ROUND-3 RESULT (two-frame window, commit 7d80778f8): k=2 28.1 →
+  34.34/34.36k ×2, k=3 28.5 → 33.6k, oracles token-EXACT k∈{1,2,3} —
+  the guest window WAS the k>1 bottleneck. The compose-split /
   frame-prepare-hoisting driver refactor is NOT needed for the perf
-  goal — drop it from the plan and record why; (b) M2 apparatus
-  deletion in dispatch.cu (engine callers already gone), S3 kill-bit
-  reclassification (kills → FAILED at settle), prefill-capture lever
-  deletion, elastic map↔unmap oscillation cleanup, venus-diag removal
-  from worker.rs, final cert (all k, fleets, long-tail, oracle sweep),
-  docs (arrival contract wording), final commit.
+  goal (the per-step submit path is already non-blocking after the
+  staging rings; the residual k gap is not host legs).
+- k=1 REGRESSION HUNT (bimodal ~32.5k vs 35.3k band, mostly slow):
+  - out-ring capacity NOT causal (3k → 3k-1 = old size still slow).
+  - CONTROL (15c121786 driver+inferlet rebuilt and run same day):
+    35.30/35.33/35.08 — machine fine, regression IS in the round-2/3
+    changes.
+  - BISECT A (plan-ring only + new inferlet): 35.36/35.60/35.27 —
+    plan ring AND inferlet window both innocent (35.6 is a new high).
+  - CULPRIT: the PinnedUploadRing BLOB — fusing tickets+lanes into one
+    settlement-freed allocation moved the per-step lane table from the
+    "freeAsync on the same stream right after enqueue" fast path to the
+    cross-stream (settlement-stream) free path; the stream-ordered pool
+    then re-serves the next step's mallocAsync from a colder path and
+    k=1 drops to a slower steady mode. LESSON (measured, general):
+    with cudaMallocAsync, ALLOCATION LIFETIME IS PART OF THE FAST PATH
+    — free transient device tables on the allocating stream immediately
+    after the consuming enqueue; only genuinely settlement-lived data
+    (the ticket array) may cross streams.
+  - FIX: keep the pinned host slot ([tickets][lanes] in one slot — the
+    non-blocking part), restore the device side to two allocations with
+    the original lifetimes (lanes freed post-enqueue on-stream, tickets
+    settlement-freed). Round-4 cert = this + plan ring + two-frame
+    window.
+- ROUND-4 (split-alloc pinned pull upload + 3k-1 ring): k=1 STILL mixed
+  (35.40/32.96/32.63) AND k=2 collapsed to 28.0×2. Two confounds — so
+  round-5 separated them.
+- ROUND-5 (VERDICT, the state that ships): pull-upload staging fully
+  REVERTED to the v13 pageable form (PinnedUploadRing deleted in both
+  variants); plan-staging ring kept; out ring 3k. Result: k=1
+  35.24/35.42/35.32 (band, stable), k=2 34.06/34.55, k=3 33.83,
+  oracles token-EXACT k∈{1,2,3}. Attribution nailed by A/B:
+  - k=1 slow mode ⇔ PinnedUploadRing present (blob OR split form —
+    even with original device lifetimes). ~10µs/step of extra host
+    work cannot explain 8%; mechanism unproven (suspect: pool/stream
+    interaction of the extra per-step event record on the compute
+    stream). LESSON: begin_pull_validate was NEVER the k
+    differentiator (equal per-step at both k) — the change had no
+    measured upside and a measured downside; reverted on principle.
+  - round-4's k=2 collapse ⇔ the 3k-1 out ring (throttles to ~one
+    frame in flight, no failures — engine ticket staging needs publish
+    room one frame beyond the window peak before takes are observed).
+    Ring restored to 3k.
+- TODO next: (a) optional probe — window 3 frames (3k fires, ring 4k)
+  at k=2 to see if the residual k gap (34.4 vs 35.3) closes; (b) M2
+  apparatus deletion in dispatch.cu (engine callers already gone), S3
+  kill-bit reclassification (kills → FAILED at settle), prefill-capture
+  lever deletion, elastic map↔unmap oscillation cleanup, venus-diag
+  removal from worker.rs, final cert (all k, fleets, long-tail, oracle
+  sweep), docs (arrival contract wording DONE in venus-project.md),
+  final commit.
 
 ## Done so far
 

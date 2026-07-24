@@ -25,11 +25,9 @@
 // readiness check into the kernel prologue and the bump into the last kernel's
 // epilogue.
 
-#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <span>
 #include <vector>
 
@@ -38,7 +36,6 @@
 
 #include "cuda_check.hpp"
 #include "pie_native/ptir/trace.hpp"
-#include "runahead.hpp"
 
 namespace pie_cuda_driver::pipeline {
 
@@ -374,125 +371,55 @@ inline constexpr std::uint32_t kTicketRequireInput = 1u << 4;
         CUDA_CHECK(cudaFreeAsync(device, stream));
     }
 
-    // Pinned host staging ring for per-step transient uploads (the ticket +
-    // pull-lane tables above). `cudaMemcpyAsync` from PAGEABLE memory
-    // silently blocks the submitting thread on CUDA's internal staging once
-    // the GPU runs deep behind the enqueue front; a pinned source makes the
-    // enqueue truly asynchronous. Depth is single-sourced from runahead.hpp:
-    // one slot per in-flight STEP, and a slot is reused only after its
-    // recorded copy event retires.
-    class PinnedUploadRing {
-      public:
-        PinnedUploadRing() = default;
-        ~PinnedUploadRing() noexcept {
-            for (Slot& slot : slots_) {
-                if (slot.pending) {
-                    static_cast<void>(cudaEventSynchronize(slot.copy_done));
-                }
-                if (slot.copy_done != nullptr) {
-                    cudaEventDestroy(slot.copy_done);
-                }
-                if (slot.host != nullptr) cudaFreeHost(slot.host);
-            }
-        }
-        PinnedUploadRing(const PinnedUploadRing&) = delete;
-        PinnedUploadRing& operator=(const PinnedUploadRing&) = delete;
-
-        // Claim the next slot with at least `bytes` of pinned capacity.
-        // Waits only when the slot's previous upload has not yet retired —
-        // never, while in-flight steps stay below the ring depth.
-        void* acquire(std::size_t bytes) {
-            Slot& slot = slots_[next_];
-            active_ = next_;
-            next_ = (next_ + 1) % slots_.size();
-            if (slot.pending) {
-                CUDA_CHECK(cudaEventSynchronize(slot.copy_done));
-                slot.pending = false;
-            }
-            if (slot.capacity < bytes) {
-                if (slot.host != nullptr) {
-                    CUDA_CHECK(cudaFreeHost(slot.host));
-                    slot.host = nullptr;
-                    slot.capacity = 0;
-                }
-                CUDA_CHECK(cudaMallocHost(&slot.host, bytes));
-                slot.capacity = bytes;
-            }
-            if (slot.copy_done == nullptr) {
-                CUDA_CHECK(cudaEventCreateWithFlags(
-                    &slot.copy_done, cudaEventDisableTiming));
-            }
-            return slot.host;
-        }
-
-        // Record the slot's reuse fence after the H2D enqueue(s) that read it.
-        void record(cudaStream_t stream) {
-            Slot& slot = slots_[active_];
-            CUDA_CHECK(cudaEventRecord(slot.copy_done, stream));
-            slot.pending = true;
-        }
-
-      private:
-        struct Slot {
-            void* host = nullptr;
-            std::size_t capacity = 0;
-            cudaEvent_t copy_done = nullptr;
-            bool pending = false;
-        };
-        std::array<Slot, kUploadStagingDepth> slots_{};
-        std::size_t next_ = 0;
-        std::size_t active_ = 0;
-    };
-
     inline DeviceHostChannelTicket* launch_pull_validate_host_channels_batch(
         const std::vector<DeviceHostChannelTicket>& tickets,
         const std::vector<PullValidateHostChannelLane>& lanes,
-        PinnedUploadRing& staging,
         cudaStream_t stream) {
         if (lanes.empty()) return nullptr;
-        // One blob, one copy: [tickets][lanes] with the lane table aligned.
-        // When tickets exist the blob doubles as the launch's device ticket
-        // array (settlement reads it and frees the whole blob); otherwise it
-        // is transient and freed right after the kernel enqueue.
-        const std::size_t ticket_bytes =
-            tickets.size() * sizeof(DeviceHostChannelTicket);
-        const std::size_t lane_offset =
-            (ticket_bytes + 63) & ~std::size_t{63};
-        const std::size_t lane_bytes =
-            lanes.size() * sizeof(PullValidateHostChannelLane);
-        const std::size_t total_bytes = lane_offset + lane_bytes;
-        auto* host = static_cast<std::uint8_t*>(staging.acquire(total_bytes));
-        if (!tickets.empty()) {
-            std::memcpy(host, tickets.data(), ticket_bytes);
-        }
-        std::memcpy(host + lane_offset, lanes.data(), lane_bytes);
-        std::uint8_t* blob = nullptr;
-        CUDA_CHECK(cudaMallocAsync(
-            reinterpret_cast<void**>(&blob), total_bytes, stream));
+        DeviceHostChannelTicket* device_tickets = nullptr;
+        PullValidateHostChannelLane* device_lanes = nullptr;
         try {
+            if (!tickets.empty()) {
+                CUDA_CHECK(cudaMallocAsync(
+                    reinterpret_cast<void**>(&device_tickets),
+                    tickets.size() * sizeof(DeviceHostChannelTicket),
+                    stream));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    device_tickets,
+                    tickets.data(),
+                    tickets.size() * sizeof(DeviceHostChannelTicket),
+                    cudaMemcpyHostToDevice,
+                    stream));
+            }
+            CUDA_CHECK(cudaMallocAsync(
+                reinterpret_cast<void**>(&device_lanes),
+                lanes.size() * sizeof(PullValidateHostChannelLane),
+                stream));
             CUDA_CHECK(cudaMemcpyAsync(
-                blob, host, total_bytes, cudaMemcpyHostToDevice, stream));
-            staging.record(stream);
+                device_lanes,
+                lanes.data(),
+                lanes.size() * sizeof(PullValidateHostChannelLane),
+                cudaMemcpyHostToDevice,
+                stream));
             k_pull_validate_host_channels_batch<<<lanes.size(), 256, 0, stream>>>(
-                tickets.empty()
-                    ? nullptr
-                    : reinterpret_cast<DeviceHostChannelTicket*>(blob),
-                reinterpret_cast<PullValidateHostChannelLane*>(
-                    blob + lane_offset),
+                device_tickets,
+                device_lanes,
                 static_cast<std::uint32_t>(lanes.size()));
             CUDA_CHECK(cudaGetLastError());
-            if (tickets.empty()) {
-                CUDA_CHECK(cudaFreeAsync(blob, stream));
-                return nullptr;
-            }
+            CUDA_CHECK(cudaFreeAsync(device_lanes, stream));
         } catch (...) {
-            if (cudaFreeAsync(blob, stream) != cudaSuccess) {
-                cudaStreamSynchronize(stream);
-                cudaFree(blob);
-            }
+            auto release = [stream](void* allocation) {
+                if (allocation == nullptr) return;
+                if (cudaFreeAsync(allocation, stream) != cudaSuccess) {
+                    cudaStreamSynchronize(stream);
+                    cudaFree(allocation);
+                }
+            };
+            release(device_lanes);
+            release(device_tickets);
             throw;
         }
-        return reinterpret_cast<DeviceHostChannelTicket*>(blob);
+        return device_tickets;
     }
 
 // ──────────────────────────── host-side arena ────────────────────────────

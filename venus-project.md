@@ -92,8 +92,11 @@ relative to hosts. This inequality is the design's load-bearing invariant.
 The standing assumption — *frame n+1 has always arrived while frame n runs* —
 is a three-party contract, not something the runtime can prove:
 
-- **Guest**: keeps a run-ahead window ≥ 2 frames in flight per lane
-  (`submit_ahead`, WINDOW_FIRES = 2).
+- **Guest**: keeps a run-ahead window ≥ 2 FRAMES (= 2k fires) in flight per
+  lane (`submit_ahead`, window = 2k). The unit is frames, not fires: frames
+  settle atomically, so results arrive only at frame boundaries — a 2-fire
+  window at k ≥ 2 is a single frame and drains the pipe every boundary
+  (measured: k=2 28k → 34.4k when the window became two frames).
 - **Engine**: seals early (while the current frame executes) and posts the
   sealed frame immediately — posting is decoupled from retirement.
 - **Driver**: prepare + enqueue fits inside k·T_gpu (the inequality).
