@@ -560,6 +560,15 @@ target_compile_options(test_transcode_fused PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
 target_link_libraries(test_transcode_fused PRIVATE CUDA::cudart)
 
+add_executable(test_awq_repack_source_ordering
+  tests/test_awq_repack_source_ordering.cu
+  src/kernels/dtype_cast.cu)
+target_include_directories(test_awq_repack_source_ordering PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_options(test_awq_repack_source_ordering PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
+target_link_libraries(test_awq_repack_source_ordering PRIVATE CUDA::cudart)
+
 enable_testing()
 add_test(NAME brle COMMAND test_brle)
 add_test(NAME masked_distribution COMMAND test_masked_distribution)
@@ -570,6 +579,7 @@ add_test(NAME kv_cache_quant COMMAND test_kv_cache_quant)
 add_test(NAME swap_pool COMMAND test_swap_pool)
 add_test(NAME mxfp4_marlin COMMAND test_mxfp4_marlin)
 add_test(NAME transcode_fused COMMAND test_transcode_fused)
+add_test(NAME awq_repack_source_ordering COMMAND test_awq_repack_source_ordering)
 
 target_link_libraries(pie_driver_cuda_lib PUBLIC
   CLI11::CLI11
