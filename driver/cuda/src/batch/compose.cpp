@@ -1268,10 +1268,6 @@ void handle_fire_batch(
             const bool eligible = forward_graph_replay_eligible(
                 engine,
                 is_pure_decode,
-                // The composer runs before this fire's prepare, so it can
-                // never admit a prefill fire here — and must not: padding
-                // is decode-only (prefill graphs key on exact shapes).
-                /*prefill_graph_ready=*/false,
                 have_custom_mask,
                 rs_is_write,
                 rs_is_fold,
@@ -1669,9 +1665,6 @@ void handle_fire_batch(
                     .is_pure_decode = is_pure_decode,
                     .have_custom_mask = have_custom_mask,
                     .runtime_window_left = structured_window_left,
-                    .graphs_enabled = engine.graph_cache != nullptr &&
-                        engine.forward_fn.graph_safe &&
-                        prefill_graph_capture_enabled(),
                 });
             attn_ws.end_plan_update(cublas.stream());
         }

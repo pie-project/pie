@@ -389,8 +389,6 @@ pub async fn spawn(
     Ok(SchedulerShutdownHandle { schedulers })
 }
 
-pub type RetryClassifier = Box<dyn Fn() -> Option<String> + Send + Sync>;
-
 fn rs_state_copy_plan(
     src_slots: Vec<u32>,
     dst_slots: Vec<u32>,

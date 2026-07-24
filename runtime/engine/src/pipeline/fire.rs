@@ -15,7 +15,7 @@
 //! fills. A failed fire **poisons** the pass's host-reader channels and fails
 //! the pass for further submits.
 //!
-//! **Layering.** The orchestration functions below (`submit_pass`,
+//! **Layering.** The orchestration functions below (`submit_pass_stamped`,
 //! `finalize_fire`, `drain_settled`, `wire_channels_to_pipeline`,
 //! `fire_device_geometry`, `pipeline_close`/`pipeline_drop`, `copy_into_inner`)
 //! need to get/get_mut/delete/push `Resource<Channel>`/`Resource<ForwardPass>`/
@@ -678,15 +678,6 @@ pub(crate) async fn await_channel_progress(
 }
 
 type Anyhow<T> = anyhow::Result<T>;
-
-/// One pass submission without a frame stamp (k = 1, or internal callers).
-pub async fn submit_pass<C: FireContext>(
-    ctx: &mut C,
-    this: Resource<Pipeline>,
-    fwd: Resource<ForwardPass>,
-) -> Anyhow<Result<(), String>> {
-    submit_pass_stamped(ctx, this, fwd, None).await
-}
 
 /// The body behind one non-no-op slot of `forward.submit(on, slots)`.
 pub async fn submit_pass_stamped<C: FireContext>(

@@ -33,7 +33,6 @@ public:
 
     ModelCapabilities capabilities() const override { return caps_; }
     std::uint32_t graph_layout() override;
-    bool prefill_graph_ready() const override;
 
 private:
     Qwen3Weights weights_;

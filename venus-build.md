@@ -337,14 +337,38 @@ Metal driver: step-loop internally (same C ABI).
     frame in flight, no failures — engine ticket staging needs publish
     room one frame beyond the window peak before takes are observed).
     Ring restored to 3k.
-- TODO next: (a) optional probe — window 3 frames (3k fires, ring 4k)
-  at k=2 to see if the residual k gap (34.4 vs 35.3) closes; (b) M2
-  apparatus deletion in dispatch.cu (engine callers already gone), S3
-  kill-bit reclassification (kills → FAILED at settle), prefill-capture
-  lever deletion, elastic map↔unmap oscillation cleanup, venus-diag
-  removal from worker.rs, final cert (all k, fleets, long-tail, oracle
-  sweep), docs (arrival contract wording DONE in venus-project.md),
-  final commit.
+- PROBE (3-frame window, 4k ring): k=2 34.40/34.22 — identical to the
+  2-frame window; k=1 35.48 unharmed. Window depth is NOT the residual
+  k gap (34.3 vs 35.3, ~3%); reverted to the committed 2-frame
+  discipline. The residual gap is a boundary/burst effect (results
+  arrive k-at-a-time; drain+resubmit bursts) — accept for now; frames'
+  value case is host-cost slack (the inequality), not peak c512 tput.
+- ROUND-6 (cleanup deletions, certified): M2 settle_defer apparatus
+  deleted end-to-end (dispatch.cu accumulator/park/drain/arm +
+  flush_deferred_settlement + NotifyContext marker + LaunchView field +
+  context.cpp assignment; DeferredSettle → SettleRecord, settle path is
+  one unconditional settle_wave_record per wave). venus-diag deleted
+  from worker.rs. Prefill-capture lever deleted end-to-end
+  (PIE_PREFILL_GRAPH_* env + prefill_graph_ready chain through
+  ForwardFn/IModel/llama_like plan state/tp follower mirror +
+  prefill_plan_graph_capturable ops helper + the memory planner's
+  cuda_graphs carve param — replay predicate is now decode-only by
+  construction; decode graphs untouched). RETRY-era engine leftovers
+  deleted (RetryClassifier type, QueueEnd::Front requeue,
+  BatchAccumulator slimmed to AdmissionLimits (admission shape gate),
+  unused submit_pass wrapper). KEPT deliberately: the two
+  admission-IMPOSSIBLE stderr lines in context.cpp (terminal-failure
+  operator output, once per failing frame — not debug cruft).
+  Engine tests 351/351; wheel compiles; settle_defer symbol absent;
+  oracles token-EXACT k∈{1,2}; k=1 35.67k (new high), k=2 34.37k.
+- TODO next: (b') S3 kill-bit reclassification — compose chain-kills
+  currently zero pass_commit (indistinguishable from a ticket miss →
+  surfaces as the generic RETRY-contract-violation failure); add a
+  per-lane kill word next to the ringed commit snapshot so settlement
+  reports per-lane FAILED with the real cause. Then: (c) elastic
+  map↔unmap oscillation cleanup (369× cuMemUnmap ≈220ms/run at both k),
+  (d) final cert (all k, fleets, long-tail, oracle sweep), docs
+  (arrival contract wording DONE in venus-project.md), final commit.
 
 ## Done so far
 

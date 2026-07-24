@@ -218,11 +218,6 @@ struct ForwardFn {
         bool is_pure_decode = false;
         bool have_custom_mask = false;
         int runtime_window_left = -2;
-        /// Forward graphs are on for this engine: a prefill/mixed fire's
-        /// plan may run in graph mode (content-independent geometry) so the
-        /// executor can capture/replay the body. Costs plan padding and the
-        /// split-KV carve, so it is only requested when graphs can pay.
-        bool graphs_enabled = false;
     };
 
     // The arch implementation. context.cpp sets this once at construction;
@@ -244,7 +239,6 @@ struct ForwardFn {
                      ops::CublasHandle& cublas,
                      const ForwardInputs& in);
     std::uint32_t invoke_graph_layout();
-    bool invoke_prefill_graph_ready() const;
 };
 
 struct NativeSystemCommitInputs {
@@ -570,30 +564,17 @@ struct ForwardDispatchInputs {
     const model::StageHooks* stage_hooks = nullptr;
 };
 
-// Opt-in gate (PIE_PREFILL_GRAPH_CAPTURE=1) for prefill/mixed-fire graph
-// capture, read once. Default OFF: the substrate is certified (oracle-exact
-// with captures replaying) but lazy per-exact-shape capture is uneconomical
-// until shapes recur — capture+instantiate costs ~10ms while a replay saves
-// ~1ms, and continuous batching produces mostly one-off (R, N) shapes (a
-// c256 run starved its second cohort into client timeouts). Flipping the
-// default is gated on shape-recurrence work (request/token bucketing for
-// prefill keys, or recurrence-gated capture admission). Same
-// dormant-substrate pattern as the frame settle-defer opt-in.
-bool prefill_graph_capture_enabled();
-
 // Whether a dispatch with these properties replays/captures a forward CUDA
 // graph. ONE predicate shared by the dispatcher (which keys the graph cache)
 // and the composer (which pads eligible waves to the request lattice) — if
 // the two drift, padded waves stop matching cached graphs. `forward_R` and
-// `is_fresh_h_data` describe the REAL (pre-padding) rows.
-// `prefill_graph_ready` admits a non-pure-decode fire whose freshly
-// prepared plan is capture-safe (see IModel::prefill_graph_ready); it must
-// come from THIS fire's prepare, so the composer — which runs before
-// prepare — always passes false and keeps its padding decode-only.
+// `is_fresh_h_data` describe the REAL (pre-padding) rows. Graph replay is
+// decode-only: prefill capture (the v13 PIE_PREFILL_GRAPH_CAPTURE lever)
+// was deleted as a dormant path — per-exact-shape prefill capture never
+// paid for itself (capture ~10ms vs replay saving ~1ms on one-off shapes).
 bool forward_graph_replay_eligible(
     const BatchEngine& engine,
     bool is_pure_decode,
-    bool prefill_graph_ready,
     bool have_custom_mask,
     bool rs_buffer_write,
     bool rs_buffer_fold,

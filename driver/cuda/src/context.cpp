@@ -187,7 +187,6 @@ struct LaunchScratch {
         view.channel_expected_tail = pie_native::slice_from_u64(launch.channel_expected_tail.ptr, launch.channel_expected_tail.len);
         view.channel_ticket_indptr = pie_native::slice_from_u32(launch.channel_ticket_indptr.ptr, launch.channel_ticket_indptr.len);
         view.has_user_mask = launch.has_user_mask != 0;
-        view.settle_defer = false;
         view.image_grids = pie_native::slice_from_u32(launch.image_grids.ptr, launch.image_grids.len);
         view.image_pixels = pie_native::slice_from_u8(launch.image_pixels.ptr, launch.image_pixels.len);
         view.image_pixel_indptr = pie_native::slice_from_u32(launch.image_pixel_indptr.ptr, launch.image_pixel_indptr.len);
@@ -864,11 +863,7 @@ int Context::Impl::load_model(
         family == model::Family::DeepSeekV4,
         family == model::Family::Kimi,
         family == model::Family::Glm5,
-        kv_format, runtime_quant_scratch_base,
-        // The graph-prefill carve is budgeted only when prefill capture is
-        // actually on (opt-in): decode graphs never need it, and the carve
-        // trades real KV pool space.
-        use_cuda_graphs && prefill_graph_capture_enabled(), verbose);
+        kv_format, runtime_quant_scratch_base, verbose);
     std::size_t free_device_bytes = 0;
     std::size_t total_device_bytes = 0;
     CUDA_CHECK(cudaMemGetInfo(&free_device_bytes, &total_device_bytes));

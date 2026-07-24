@@ -55,10 +55,7 @@ void Qwen3VLModel::prepare(AttentionWorkspace& attn_ws,
         in.total_tokens,
         in.num_requests,
         in.is_pure_decode,
-        in.have_custom_mask,
-        // Prefill capture is not certified for this family (multimodal
-        // encode stages in the body); never pay for a graph-shaped plan.
-        /*graphs_enabled=*/false);
+        in.have_custom_mask);
 }
 
 void Qwen3VLModel::body(Workspace& ws,

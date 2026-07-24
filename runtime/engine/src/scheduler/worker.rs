@@ -14,10 +14,10 @@ use crate::driver::{
 use crate::scheduler::ProcessId;
 use anyhow::{Result, anyhow};
 
-use super::batch::{self, BatchAccumulator};
+use super::batch::{self, AdmissionLimits};
 use super::frame::{self, FramePlan, FramePolicy, FrameStamp};
 use super::stats::{self, SchedulerStats};
-use super::{ControlCompletion, RetryClassifier};
+use super::ControlCompletion;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LeaveKind {
@@ -1580,12 +1580,6 @@ enum QueuedItem {
     },
 }
 
-#[derive(Clone, Copy)]
-enum QueueEnd {
-    Front,
-    Back,
-}
-
 /// A posted launch's lane lifecycle: the batch enters `in_flight_launches`
 /// (and the run-ahead depth) at POST; the driver's verdict arrives as a
 /// `LaneReply::LaunchDone` and upgrades the state. Retirement only ever
@@ -2272,24 +2266,9 @@ impl BatchScheduler {
                 // completion nudge in between.
                 let backstop = Duration::from_millis(250);
                 let recv_wait = wait_hint.map(|hold| hold.min(backstop)).unwrap_or(backstop);
-                if venus_diag_enabled() {
-                    venus_diag_worker_idle(
-                        wait_hint,
-                        in_flight_launches.len(),
-                        in_flight_launches.front().map(|front| match &front.state {
-                            LaunchState::Posted { .. } => "posted",
-                            LaunchState::Accepted(_) => "accepted",
-                            LaunchState::Failed(_) => "failed",
-                        }),
-                        pending.len(),
-                    );
-                }
                 match rx.recv_timeout(recv_wait) {
                     Ok(item) => Some(item),
                     Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
-                        if venus_diag_enabled() {
-                            venus_diag_worker_timeout();
-                        }
                         // A settled completion discovered by the backstop
                         // means a wake was lost somewhere — the steady-state
                         // count stays zero (plan §16.2). Shutdown races are
@@ -2560,7 +2539,7 @@ impl BatchScheduler {
                 if let Some(timing) = launch.timing.as_mut() {
                     timing.enqueued_us = Some(super::fire_timing_now_us());
                 }
-                let validation = BatchAccumulator::new(limits, page_size);
+                let validation = AdmissionLimits::new(limits, page_size);
                 let rejection = if launch.completion.cancel_requested() {
                     Some("logical fire cancelled before scheduler admission".to_string())
                 } else if launch
@@ -2633,7 +2612,7 @@ impl BatchScheduler {
                     if let Some(timing) = launch.timing.as_mut() {
                         timing.ready_us = Some(super::fire_timing_now_us());
                     }
-                    Self::queue_attempt(pending, launch, QueueEnd::Back);
+                    Self::queue_attempt(pending, launch);
                 }
             }
 
@@ -2799,7 +2778,7 @@ impl BatchScheduler {
         *pending = kept;
     }
 
-    fn queue_attempt(pending: &mut VecDeque<QueuedItem>, request: PendingRequest, end: QueueEnd) {
+    fn queue_attempt(pending: &mut VecDeque<QueuedItem>, request: PendingRequest) {
         let mut copies = Vec::with_capacity(2);
         if let Some(plan) = request.prelaunch_copy.clone() {
             copies.push(QueuedItem::PreLaunchCopy {
@@ -2817,21 +2796,10 @@ impl BatchScheduler {
                 pipeline_id: request.pipeline_id,
             });
         }
-        match end {
-            QueueEnd::Front => {
-                pending.push_front(QueuedItem::Launch(request));
-                for copy in copies.into_iter().rev() {
-                    pending.push_front(copy);
-                }
-            }
-
-            QueueEnd::Back => {
-                for copy in copies {
-                    pending.push_back(copy);
-                }
-                pending.push_back(QueuedItem::Launch(request));
-            }
+        for copy in copies {
+            pending.push_back(copy);
         }
+        pending.push_back(QueuedItem::Launch(request));
     }
 
     /// Whether any queued fire still targets `instance_id` (a queued
@@ -3457,26 +3425,12 @@ impl BatchScheduler {
                     !in_flight_launches.is_empty(),
                     now,
                 ) {
-                    FramePlan::Dispatch(waves) => {
-                        if venus_diag_enabled() {
-                            venus_diag_plan("dispatch");
-                        }
-                        waves
-                    }
+                    FramePlan::Dispatch(waves) => waves,
                     FramePlan::Hold(hold) => {
-                        if venus_diag_enabled() {
-                            venus_diag_plan("hold");
-                            venus_diag_hold_state(pending, &blocked_lanes);
-                        }
                         merge_hint(&mut wait_hint, hold);
                         break;
                     }
-                    FramePlan::Park => {
-                        if venus_diag_enabled() {
-                            venus_diag_plan("park");
-                        }
-                        break;
-                    }
+                    FramePlan::Park => break,
                 }
             };
             #[allow(clippy::let_and_return)]
@@ -4251,136 +4205,6 @@ impl TrackedInstance {
     fn close_wait_slots(self) {
         self.wait_slots.close();
     }
-}
-
-// =============================================================================
-// Venus temporary diagnostics (PIE_VENUS_DIAG=1): 2-second coarse summaries.
-// DELETE before landing.
-// =============================================================================
-
-fn venus_diag_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("PIE_VENUS_DIAG").is_ok_and(|v| v == "1"))
-}
-
-#[derive(Default)]
-struct VenusDiag {
-    idle_entries: u64,
-    timeouts: u64,
-    plan_dispatch: u64,
-    plan_hold: u64,
-    plan_park: u64,
-    front_posted: u64,
-    front_accepted: u64,
-    front_none: u64,
-    hint_some: u64,
-    pending_max: usize,
-    inflight_max: usize,
-}
-
-fn venus_diag() -> &'static Mutex<(VenusDiag, Option<Instant>)> {
-    static DIAG: std::sync::OnceLock<Mutex<(VenusDiag, Option<Instant>)>> =
-        std::sync::OnceLock::new();
-    DIAG.get_or_init(|| Mutex::new((VenusDiag::default(), None)))
-}
-
-fn venus_diag_flush(state: &mut (VenusDiag, Option<Instant>)) {
-    let now = Instant::now();
-    if !state
-        .1
-        .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(2))
-    {
-        return;
-    }
-    state.1 = Some(now);
-    let d = std::mem::take(&mut state.0);
-    eprintln!(
-        "[venus-diag] idle={} timeout={} plan(d/h/p)={}/{}/{} front(p/a/n)={}/{}/{} \
-hint_some={} pending_max={} inflight_max={}",
-        d.idle_entries,
-        d.timeouts,
-        d.plan_dispatch,
-        d.plan_hold,
-        d.plan_park,
-        d.front_posted,
-        d.front_accepted,
-        d.front_none,
-        d.hint_some,
-        d.pending_max,
-        d.inflight_max,
-    );
-}
-
-fn venus_diag_worker_idle(
-    hint: Option<Duration>,
-    inflight: usize,
-    front: Option<&'static str>,
-    pending: usize,
-) {
-    let mut state = venus_diag().lock().unwrap();
-    state.0.idle_entries += 1;
-    if hint.is_some() {
-        state.0.hint_some += 1;
-    }
-    match front {
-        Some("posted") => state.0.front_posted += 1,
-        Some("accepted") => state.0.front_accepted += 1,
-        Some(_) => {}
-        None => state.0.front_none += 1,
-    }
-    state.0.pending_max = state.0.pending_max.max(pending);
-    state.0.inflight_max = state.0.inflight_max.max(inflight);
-    venus_diag_flush(&mut state);
-}
-
-fn venus_diag_worker_timeout() {
-    let mut state = venus_diag().lock().unwrap();
-    state.0.timeouts += 1;
-    venus_diag_flush(&mut state);
-}
-
-fn venus_diag_hold_state(pending: &VecDeque<QueuedItem>, blocked: &HashSet<ProcessId>) {
-    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
-    let mut last = LAST.lock().unwrap();
-    let now = Instant::now();
-    if last.is_some_and(|t| now.duration_since(t) < Duration::from_secs(2)) {
-        return;
-    }
-    *last = Some(now);
-    let kinds: Vec<&'static str> = pending
-        .iter()
-        .take(6)
-        .map(|item| match item {
-            QueuedItem::Launch(_) => "launch",
-            QueuedItem::PreLaunchCopy { .. } => "prelaunch_copy",
-            QueuedItem::CopyKv { .. } => "copy_kv",
-            QueuedItem::CopyKvTracked { .. } => "copy_kv_tracked",
-            QueuedItem::CopyState { .. } => "copy_state",
-            QueuedItem::ResizePool { .. } => "resize_pool",
-            QueuedItem::CloseInstance { .. } => "close_instance",
-            QueuedItem::CloseChannels { .. } => "close_channels",
-            _ => "other",
-        })
-        .collect();
-    let copies = pending
-        .iter()
-        .filter(|item| matches!(item, QueuedItem::PreLaunchCopy { .. }))
-        .count();
-    eprintln!(
-        "[venus-diag-hold] front_kinds={kinds:?} blocked_lanes={} prelaunch_copies={copies} len={}",
-        blocked.len(),
-        pending.len(),
-    );
-}
-
-fn venus_diag_plan(kind: &'static str) {
-    let mut state = venus_diag().lock().unwrap();
-    match kind {
-        "dispatch" => state.0.plan_dispatch += 1,
-        "hold" => state.0.plan_hold += 1,
-        _ => state.0.plan_park += 1,
-    }
-    venus_diag_flush(&mut state);
 }
 
 #[cfg(test)]
@@ -5213,7 +5037,7 @@ mod tests {
             false,
         );
         let mut pending = VecDeque::new();
-        BatchScheduler::queue_attempt(&mut pending, request, QueueEnd::Back);
+        BatchScheduler::queue_attempt(&mut pending, request);
 
         let QueuedItem::PreLaunchCopy {
             plan: PreLaunchCopy::State(plan),

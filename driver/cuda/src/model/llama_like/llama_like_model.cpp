@@ -51,15 +51,7 @@ void LlamaLikeModel::prepare(AttentionWorkspace& attn_ws,
         in.total_tokens,
         in.num_requests,
         in.is_pure_decode,
-        in.have_custom_mask,
-        // A runtime window is a per-fire scalar the replay-eligibility
-        // check already rejects (structured_window_left must be -2), so
-        // don't pay for a graph-shaped plan on those fires.
-        in.graphs_enabled && in.runtime_window_left < -1);
-}
-
-bool LlamaLikeModel::prefill_graph_ready() const {
-    return plan_.prefill_graph_capturable;
+        in.have_custom_mask);
 }
 
 void LlamaLikeModel::body(Workspace& ws,

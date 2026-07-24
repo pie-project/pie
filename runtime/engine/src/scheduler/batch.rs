@@ -49,23 +49,16 @@ pub(crate) fn request_capacity_usage(req: &PendingRequest, page_size: u32) -> Re
     }
 }
 
-pub(crate) struct BatchAccumulator {
-    requests: Vec<PendingRequest>,
+/// Admission-time shape gate: rejects a single fire whose resolved shape
+/// exceeds the driver's launch limits before it can enter the queue.
+pub(crate) struct AdmissionLimits {
     page_size: u32,
     limits: SchedulerLimits,
 }
 
-impl BatchAccumulator {
+impl AdmissionLimits {
     pub(crate) fn new(limits: SchedulerLimits, page_size: u32) -> Self {
-        Self {
-            requests: Vec::new(),
-            page_size,
-            limits,
-        }
-    }
-
-    pub(crate) fn push(&mut self, req: PendingRequest) {
-        self.requests.push(req);
+        Self { page_size, limits }
     }
 
     pub(crate) fn single_request_limit_error(&self, req: &PendingRequest) -> Option<String> {
@@ -110,9 +103,6 @@ impl BatchAccumulator {
         None
     }
 
-    pub(crate) fn take(&mut self) -> Vec<PendingRequest> {
-        std::mem::take(&mut self.requests)
-    }
 }
 
 pub(crate) fn build_batch_request(
@@ -499,7 +489,7 @@ mod tests {
     /// would take down the scheduler thread (RV-20).
     #[test]
     fn multi_row_masks_without_a_row_csr_reject_at_admission() {
-        let accumulator = BatchAccumulator::new(
+        let accumulator = AdmissionLimits::new(
             SchedulerLimits {
                 max_forward_requests: 64,
                 max_forward_tokens: 64,

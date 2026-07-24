@@ -232,10 +232,6 @@ struct PrefillPlanCache {
     std::vector<IdType> kv_h_buf;
 };
 
-bool prefill_plan_graph_capturable(const PrefillPlanCache& cache) {
-    return cache.valid && cache.graph_capturable;
-}
-
 void DecodePlanCacheDeleter::operator()(DecodePlanCache* p) const noexcept {
     delete p;
 }

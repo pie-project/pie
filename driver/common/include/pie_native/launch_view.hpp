@@ -107,10 +107,6 @@ struct LaunchView {
     // causal BRLE rows, which accompany every wire prefill and are safely
     // dropped when a composed batch runs the standard causal path).
     bool has_user_mask = false;
-    // Frame-group settlement marker (`v13 settle_defer, now constant false`): the
-    // launch's completion notify / cuda_settled / instance-close fences may
-    // defer to the group's next settle-now launch. Publication never defers.
-    bool settle_defer = false;
     Slice<std::uint32_t> image_grids;
     Slice<std::uint8_t> image_pixels;
     Slice<std::uint32_t> image_pixel_indptr;

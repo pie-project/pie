@@ -45,11 +45,6 @@ PrefillPlanCachePtr make_prefill_plan();
 std::uint32_t decode_plan_graph_layout(const DecodePlanCache& cache);
 std::uint32_t prefill_plan_graph_layout(const PrefillPlanCache& cache);
 
-// True when the most recent prefill plan ran in graph mode on the FA2
-// causal path — its dispatch geometry is a pure function of
-// (total_tokens, num_requests, graph layout) and may be captured/replayed.
-bool prefill_plan_graph_capturable(const PrefillPlanCache& cache);
-
 // Compute decode plan once per fire. Stores results in `cache` and the
 // workspace's int/float buffers (so per-layer dispatch can read them).
 void plan_attention_flashinfer_decode_bf16(

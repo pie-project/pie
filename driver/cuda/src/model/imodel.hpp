@@ -82,14 +82,6 @@ public:
                       ops::CublasHandle& cublas,
                       const ForwardFn::ForwardInputs& in) = 0;
 
-    // Whether the plan `prepare` just produced makes THIS prefill/mixed
-    // fire's body capture-safe: every launch geometry in the body is a pure
-    // function of the forward graph key (R, N, graph_layout), with per-fire
-    // truth flowing through device buffers the prepare hook refreshes.
-    // Consulted by the executor's replay-eligibility check after `prepare`;
-    // pure-decode fires are admitted by their own rules instead.
-    virtual bool prefill_graph_ready() const { return false; }
-
     // Optional: per-arch scratch-buffer byte budget for the persistent
     // forward-workspace arena, consulted by the memory planner while it
     // sweeps candidate (max_tokens, output_rows) shapes ahead of model

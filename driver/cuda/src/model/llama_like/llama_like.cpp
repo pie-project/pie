@@ -119,8 +119,7 @@ void prepare_llama_like_decode_plan(
     int total_tokens,
     int num_requests,
     bool is_pure_decode,
-    bool have_custom_mask,
-    bool graphs_enabled)
+    bool have_custom_mask)
 {
     // The prepare hook runs OUTSIDE any cuStreamCapture region. It updates
     // pinned/device buffers in `attn_ws` that the captured body reads via
@@ -130,7 +129,6 @@ void prepare_llama_like_decode_plan(
     state.xqa_max_pages_per_seq = 0;
     state.use_prefill_plan = false;
     state.use_prefill_decode_plan = false;
-    state.prefill_graph_capturable = false;
     if (have_custom_mask) {
         if (!state.prefill_plan) {
             state.prefill_plan = ops::make_prefill_plan();
@@ -186,15 +184,6 @@ void prepare_llama_like_decode_plan(
             const int T = (fwd_cfg.tp_size > 0) ? fwd_cfg.tp_size : 1;
             const int num_q_heads_local  = cfg.num_attention_heads / T;
             const int num_kv_heads_local = cfg.num_key_value_heads / T;
-            // Graph-mode planning (content-independent geometry, so the
-            // body can be captured/replayed) is requested only when the
-            // fire could actually be graphed: a non-bf16-native cache adds
-            // a content-shaped dequant launch to the body, which capture
-            // cannot represent. The plan itself may still demote (SM90
-            // route, carve overflow) — `prefill_graph_capturable` reports
-            // the outcome.
-            const bool graph_mode_plan =
-                graphs_enabled && cache.format().is_native_bf16();
             ops::plan_attention_flashinfer_prefill_bf16(
                 *state.prefill_plan,
                 qo_indptr_h,
@@ -208,14 +197,12 @@ void prepare_llama_like_decode_plan(
                 cache.page_size(),
                 attn_ws,
                 /*stream=*/nullptr,
-                graph_mode_plan,
+                /*graph_mode_plan=*/false,
                 fwd_cfg.sliding_window,
                 /*full_attention_variant=*/false,
                 cache.hnd_layout(),
                 /*causal_mask=*/true);
             state.use_prefill_plan = true;
-            state.prefill_graph_capturable =
-                ops::prefill_plan_graph_capturable(*state.prefill_plan);
         }
         return;
     }

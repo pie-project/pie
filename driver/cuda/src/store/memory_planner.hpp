@@ -82,7 +82,6 @@ CudaMemoryPlan plan_cuda_memory(
     bool glm5_selected,
     const KvCacheFormat& kv_format,
     const ops::RuntimeQuantScratchSpec& runtime_quant_scratch_base,
-    bool cuda_graphs,
     bool verbose);
 
 }  // namespace pie_cuda_driver

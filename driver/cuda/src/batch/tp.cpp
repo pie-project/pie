@@ -700,9 +700,6 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
                     .is_pure_decode = is_pure_decode,
                     .have_custom_mask = have_custom_mask,
                     .runtime_window_left = structured_window_left,
-                    .graphs_enabled = engine.graph_cache != nullptr &&
-                        engine.forward_fn.graph_safe &&
-                        prefill_graph_capture_enabled(),
                 });
         }
         // Mirror rank 0's graph capture/replay decision so NCCL ops
@@ -714,13 +711,6 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
         const bool try_graphs = forward_graph_replay_eligible(
             engine,
             is_pure_decode,
-            // TP captures record the logits rows into the graph (unlike the
-            // single-GPU path, whose logits epilogue runs outside), so a
-            // prefill fire is only admitted when its sampled-row count is
-            // pinned by the key's R.
-            !is_pure_decode &&
-                engine.forward_fn.invoke_prefill_graph_ready() &&
-                logit_rows == R,
             have_custom_mask,
             rs_mode == RsExecutionMode::BufferWrite,
             rs_mode == RsExecutionMode::BufferFold,
