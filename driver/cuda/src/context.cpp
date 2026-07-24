@@ -1932,7 +1932,9 @@ int Context::Impl::launch(const PieFrameDesc& frame, PieCompletion completion) {
     // wave freezes its channel-cursor window into its tickets.
     for (std::size_t i = 0; i < step_count; ++i) {
         try {
-            pie_cuda_driver::prepare_step(*executor_, views[i], prepared[i]);
+            pie_cuda_driver::prepare_step(
+                *executor_, views[i], prepared[i],
+                i == 0 ? nullptr : &prepared[i - 1]);
         } catch (const std::exception& e) {
             return fail_frame(i, "prepare", e, 0, 0);
         }

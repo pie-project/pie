@@ -598,6 +598,11 @@ struct PreparedStep::Impl {
     const std::uint32_t* h_kvpp_forward = nullptr;
     const std::uint32_t* h_kvlpl_forward = nullptr;
     const std::uint32_t* h_kvpp_wire = nullptr;
+    std::size_t kvpi_len = 0;
+    // Plan-once-per-frame: every attention-plan input is content-
+    // identical to the SAME frame's previous step, whose plan (host
+    // compute + workspace upload) therefore already covers this step.
+    bool skip_plan = false;
     std::vector<std::uint32_t> plan_page_counts;
     std::vector<std::uint32_t> plan_kv_page_indptr;
     std::vector<std::uint32_t> plan_kv_last_lens;
@@ -646,10 +651,45 @@ PreparedStep::~PreparedStep() = default;
 PreparedStep::PreparedStep(PreparedStep&&) noexcept = default;
 PreparedStep& PreparedStep::operator=(PreparedStep&&) noexcept = default;
 
+namespace {
+
+// Content identity of every host-consumed attention-plan input between
+// two prepared steps of ONE frame (the device-pointer inputs are the
+// stable persistent buffers, identical by construction). Structural
+// comparison only — any difference whatsoever plans normally.
+bool plan_inputs_identical(
+    const PreparedStep::Impl& a,
+    const PreparedStep::Impl& b) {
+    if (a.empty_step || b.empty_step || a.rs_is_fold || b.rs_is_fold) {
+        return false;
+    }
+    if (a.forward_R != b.forward_R || a.forward_N != b.forward_N ||
+        a.is_pure_decode != b.is_pure_decode ||
+        a.have_custom_mask != b.have_custom_mask ||
+        a.structured_window_left != b.structured_window_left ||
+        a.kvpi_len != b.kvpi_len) {
+        return false;
+    }
+    const auto same = [](const std::uint32_t* x,
+                         const std::uint32_t* y,
+                         std::size_t count) {
+        return x == y ||
+               std::memcmp(x, y, count * sizeof(std::uint32_t)) == 0;
+    };
+    const auto requests = static_cast<std::size_t>(a.forward_R);
+    return same(a.h_qo_forward, b.h_qo_forward, requests + 1) &&
+           same(a.h_kvpp_forward, b.h_kvpp_forward, requests + 1) &&
+           same(a.h_kvlpl_forward, b.h_kvlpl_forward, requests) &&
+           same(a.h_kvpi_forward, b.h_kvpi_forward, a.kvpi_len);
+}
+
+}  // namespace
+
 void prepare_step(
     BatchEngine& engine,
     const pie_native::LaunchView& view,
-    PreparedStep& step) {
+    PreparedStep& step,
+    const PreparedStep* previous) {
     PreparedStep::Impl& s = *step.impl();
     s.view = &view;
     const bool dbg_fire = fire_timing::full();
@@ -1042,6 +1082,7 @@ void prepare_step(
     s.forward_R = s.fR_real;
     s.h_qo_forward = s.forward_inputs.qo_indptr.data();
     s.h_kvpi_forward = s.forward_inputs.kv_page_indices.data();
+    s.kvpi_len = s.forward_inputs.kv_page_indices.size();
     s.h_kvpp_forward = s.forward_inputs.kv_page_indptr.data();
     s.h_kvlpl_forward = s.forward_inputs.kv_last_page_lens.data();
     s.h_kvpp_wire = s.h_kvpp_forward;
@@ -1592,6 +1633,7 @@ void prepare_step(
         }
         s.h_qo_forward = s.pad_qo_indptr.data();
         s.h_kvpi_forward = s.pad_kv_page_indices.data();
+        s.kvpi_len = s.pad_kv_page_indices.size();
         s.h_kvpp_forward = s.pad_kv_page_indptr.data();
         s.h_kvlpl_forward = s.pad_kv_last_page_lens.data();
         s.forward_R = s.fR_real + s.graph_pad_requests;
@@ -1612,6 +1654,12 @@ void prepare_step(
         s.direct_logit_rows = s.compact_logit_rows.data();
     }
     s.settle_plain = s.rs_is_fold;
+    // Plan-once-per-frame: if every plan input is content-identical to
+    // the frame's previous step, the workspace plan that step uploads
+    // already covers this one — mark the hook skippable.
+    if (previous != nullptr) {
+        s.skip_plan = plan_inputs_identical(s, *previous->impl());
+    }
     if (dbg_fire) s.timing.prepare_end = fire_timing::Clock::now();
 }
 
@@ -1760,11 +1808,11 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
     // Runs at enqueue, not prepare: the plan's device commit targets the
     // single stable attention int workspace (a graph-replay invariant),
     // so it is inherently ordered between this step's neighbours on the
-    // stream. Its host half is slot-ring staged and non-blocking. Hoisting
-    // the host half needs a per-step plan snapshot through the model
-    // layer — recorded follow-up; intra-frame decode plans are step-
-    // invariant, so the end state is plan-once-per-frame.
-    if (!s.rs_is_fold) {
+    // stream. Its host half is slot-ring staged and non-blocking.
+    // Plan-once-per-frame: a step whose every plan input is content-
+    // identical to the frame's previous step skips the hook — the
+    // workspace already holds the identical plan.
+    if (!s.rs_is_fold && !s.skip_plan) {
         engine.attn_ws.begin_plan_update();
         engine.forward_fn.invoke_prepare(
             engine.attn_ws,

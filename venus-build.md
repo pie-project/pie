@@ -506,6 +506,23 @@ Metal driver: step-loop internally (same C ABI).
   relation (engine depth = measured policy; driver staging derives from
   it via runahead.hpp) is already the correct one.
 
+- SECOND LANDING round 2: plan-once-per-frame LANDED (operator-approved
+  as a pure upgrade; ④ delta-form geometry DEFERRED by operator decision
+  — guest-surface exposure not wanted, no current backend needs it).
+  Mechanism: prepare_step(i) content-compares EVERY host-consumed
+  attention-plan input (R, N, decode/mask/window flags, qo/kvpp/kvlpl/
+  kvpi arrays byte-exact) against the SAME frame's previous step; on
+  identity, enqueue_step skips the plan hook — the workspace already
+  holds the identical plan (intra-frame chained decode steps share R and
+  plan from frame-constant envelope bounds). No heuristic: any
+  difference whatsoever plans normally; frame head always plans.
+  Certified: oracles k∈{1,2,3,4} token-EXACT; 2048×32 k=1 35.2k, k=2
+  34.1/34.4k, k=3 33.4k, k=4 33.3/33.2k (one 13.6k reading was a
+  non-reproducible anomaly — n=3 confirms the band), c0-256 k=2 27.9k.
+  No tput change at today's T_gpu (expected); the win is structural —
+  chained StepEnqueue is now literally kernel-launch/copy-commit only,
+  completing ①'s contract.
+
 - SECOND LANDING round 1 CERTIFIED (frame-prepare hoisting landed).
   Oracles k∈{1,2,3} t=32 + k=1 t=256: token-EXACT vs pre-Venus dumps.
   2048×32 c512: k=1 35.58/35.36k (fast band 35.3–35.5 HELD — the

@@ -260,7 +260,11 @@ are independent.
    Intra-frame decode steps have IDENTICAL static plans (same R, length-
    independent schedule), so the end state is **plan-once-per-frame**, a
    strictly better form than plan-per-step hoisting; it is the follow-up
-   item here.
+   item here. APPROVED conditional on being a side-effect-free pure
+   upgrade: the skip predicate is structural identity of every plan
+   input (verified by content comparison at prepare, within one frame
+   only), never a heuristic; certification gate is token-exact oracles +
+   band parity.
 2. **Depth gate = staging capacity** (completes P5(2)). Backpressure
    becomes "is there a free prepare slot", severing the last
    completion-count coupling from the enqueue track; horizon depth scales
@@ -285,11 +289,30 @@ are independent.
    a backend without DecodeEnvelope-style device composition still gets
    k-step frames from host arithmetic — device resolution becomes an
    optimization, not a requirement. Shrinks the wire as a side effect.
+   SCOPE CLARIFICATION (second landing): this applies ONLY to the
+   arithmetic-advance class (standard append-only decode, whose write
+   targets the admission-leased envelope — data-independent). Data-
+   dependent geometry (beam fork/freeze WSlot/WOff, device masks) is
+   exactly what device composition exists for and is NOT host-derivable;
+   on a backend without device composition such programs run k=1 frames.
+   **DEFERRED by operator decision**: the guest-facing surface exposure
+   is not wanted now, and no current backend needs the arithmetic path —
+   revisit with the first TPU-class backend.
 5. **True ordered sub-batches** (completes decision 3). The engine today
    emits the degenerate one-sub-batch-per-step form; packing mixed
    geometry classes as ordered sub-batches within one step restores
    "step = the model's forward step" and fixes step count at k for
-   heterogeneous fleets.
+   heterogeneous fleets. PRECISE CURRENT CONSTRAINT (verified): kernel
+   selection already has the right shape — the ragged (prefill) kernel
+   is the default and the decode kernel is a pure-decode/no-custom-mask
+   optimization; wire batches mix prefill+decode freely. What does NOT
+   mix is geometry CLASS at step formation: "wave batches are geometry-
+   class homogeneous" (worker.rs) — wire-geometry and device-resolved
+   fires launch as separate steps, so at k>1 a prefilling lane cannot
+   share a step with chained-decode lanes. The driver's envelope compose
+   already supports mixed steps (passthrough lanes); the fixed/graph
+   path stays all-envelope (a mixed step is not pure decode, so it was
+   never graph-eligible). **APPROVED — in progress** (second landing).
 6. **Elastic reclaimable-donor pool.** A resize returns logical budget
    immediately but keeps pages mapped; the pool physically reclaims donor
    pages only under allocation pressure. Kills the gen-boundary

@@ -56,10 +56,16 @@ class PreparedStep {
 
 // FramePrepare for one step. `view` must outlive the PreparedStep (the
 // frame driver owns the expanded step views for the whole frame).
+// `previous` is the SAME FRAME's preceding prepared step (nullptr for the
+// frame head): when every attention-plan input is content-identical to
+// it, the step marks its plan skippable — the workspace already holds
+// the identical plan (plan-once-per-frame; intra-frame chained decode
+// steps share R and plan from frame-constant envelope bounds).
 void prepare_step(
     BatchEngine& engine,
     const pie_native::LaunchView& view,
-    PreparedStep& step);
+    PreparedStep& step,
+    const PreparedStep* previous = nullptr);
 
 // StepEnqueue: the step's device work, kernel-launch/copy-enqueue only.
 void enqueue_step(BatchEngine& engine, PreparedStep& step);
