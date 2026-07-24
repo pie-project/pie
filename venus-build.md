@@ -236,15 +236,32 @@ Metal driver: step-loop internally (same C ABI).
 - Wheel-build trap #2: pyproject cache-keys covered only driver `*.rs` —
   C++/CUDA edits did NOT invalidate the wheel. FIXED: added cpp/cu/cuh/
   hpp/h/CMakeLists keys to sdk/python-server/pyproject.toml.
-- TODO (next): driver-internal Venus core — sever the intra-frame host
-  reads in StagedLaunch begin (pull staging readback → per-step device
-  buffers / defer host validation to frame settle; S3 kill bit rides the
-  ringed commit snapshot, kills → FAILED), then M2 apparatus deletion in
-  dispatch.cu (settle_defer accumulator/park/drain/arm, retry-auto-flush;
-  engine callers already gone), prefill-capture lever deletion (decision
-  #6), compose.cpp split. This is where k>1 must beat k=1. Then
-  venus-diag removal, final cert (all k, fleets, long-tail), docs,
-  commit.
+- CHECKPOINT COMMIT: e12ca83d1 "venus: frame-native launch unit end to
+  end (ABI v14, checkpoint)" — everything above committed on the golf
+  branch (vesuvius-project.md operator edit left untouched, NOT pushed).
+- k=2 hunt continued (inconclusive at the API level, attribution stands):
+  c0-256 (zero churn): k1 28.1k vs k2 23.1k → the gap IS steady-state
+  intra-frame coupling (pre-Venus k2 c0256 was 26.5–27.4k). Probes that
+  did NOT move k=2 (all kept, all principled): staging depth 4→13
+  (runahead.hpp), default mempool release-threshold retention
+  (context.cpp initialize), PIE_SCHED_MAX_IN_FLIGHT=1 (27.5k → not pool
+  exhaustion). nsys (venus-k{1,2}.sqlite in the scratchpad): BOTH k show
+  369× cuMemUnmap/SetAccess/Release ≈220ms (elastic pool map↔unmap
+  oscillation — a separate cleanup target, not the k differentiator);
+  lane-thread steady-window API sums do not show a 2.8ms/step block →
+  the fire-timing h2d/pull stalls are likely non-API host waits (pinned
+  slot event syncs measured under cudaEventSynchronize at k=1 too) —
+  STOP microhunting; the fix is structural (below).
+- TODO (the ONE remaining performance work item): compose split / frame
+  prepare hoisting for decode steps — at frame entry, stage ALL steps'
+  lane tables/tickets/fixed-decode params before step 1 enqueues (there
+  is nothing to wait on then), making per-step enqueue kernel-launch-only.
+  By construction removes whatever step i+1's begin currently waits on.
+  Then: M2 apparatus deletion in dispatch.cu (engine callers already
+  gone), S3 kill-bit reclassification (kills → FAILED at settle),
+  prefill-capture lever deletion, elastic map↔unmap oscillation cleanup,
+  venus-diag removal from worker.rs, final cert (all k, fleets,
+  long-tail, oracle sweep), docs, final commit.
 
 ## Done so far
 
