@@ -27,6 +27,21 @@ def arithmetic_grammar(name: str = "arithmetic") -> Grammar:
     )
 
 
+def byte_arithmetic_grammar(name: str = "byte-arithmetic") -> Grammar:
+    digits = tuple(str(value) for value in range(10))
+    return Grammar.from_rules(
+        name,
+        "E",
+        {
+            "E": [("E", "+", "T"), ("T",)],
+            "T": [("T", "*", "F"), ("F",)],
+            "F": [("(", "E", ")"), ("N",)],
+            "N": [("N", "D"), ("D",)],
+            "D": [(digit,) for digit in digits],
+        },
+    )
+
+
 def balanced_grammar(name: str = "balanced") -> Grammar:
     return Grammar.from_rules(
         name,

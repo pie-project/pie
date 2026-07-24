@@ -36,12 +36,13 @@ Only the third meaning is called **GPU-native grammar execution** here.
   abstract reports a 1.38x geometric-mean and 1.85x maximum throughput
   improvement under schema-diverse continuous batching. The declared code URL
   was not publicly reachable at this snapshot.
-- gpu-lr1 now has two distinct backends. The JSON Schema backend compiles a
+- gpu-lr1 now has three execution modes. The JSON Schema backend compiles a
   canonical, acyclic subset into a tokenizer-aware byte DFA. The LR backend
   compiles arbitrary deterministic canonical LR(1) grammars into sparse
-  ACTION/GOTO tables and executes stack-dependent reductions on GPU, but it
-  currently consumes already-segmented grammar terminals rather than real LLM
-  tokenizer tokens.
+  ACTION/GOTO tables and executes stack-dependent reductions on GPU over grammar
+  terminals. A bounded compiler additionally expands reachable LR stacks into
+  finite configurations and supports real tokenizer bytes for byte-terminal
+  grammars; it exposes state-explosion rather than solving unbounded recursion.
 - The defensible project contribution is therefore not "the first
   grammar-constrained decoder" or "the first GPU-aware structured-output
   system." It is a measured design for **GPU-resident automaton/parser stepping

@@ -14,13 +14,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-tokenizers = ["tiktoken>=0.9"]
+tokenizers = ["tiktoken>=0.9", "transformers>=4.45"]
 baselines = ["xgrammar>=0.1.29"]
 
 [project.scripts]
 gpu-lr1-bench = "gpu_lr1.benchmark:main"
 gpu-lr1-density-bench = "gpu_lr1.density_benchmark:main"
 gpu-lr1-lr-bench = "gpu_lr1.lr1_benchmark:main"
+gpu-lr1-lr-token-bench = "gpu_lr1.lr1_token_benchmark:main"
 gpu-lr1-stack-bench = "gpu_lr1.stack_benchmark:main"
 gpu-lr1-xgrammar-bench = "gpu_lr1.xgrammar_benchmark:main"
 

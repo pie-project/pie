@@ -142,6 +142,67 @@ class Vocabulary:
             name=f"tiktoken-{encoding_name}-{target_size}",
         )
 
+    @classmethod
+    def huggingface(
+        cls,
+        model_name: str,
+        *,
+        size: int | None = None,
+        trust_remote_code: bool = False,
+    ) -> "Vocabulary":
+        try:
+            from transformers import AutoTokenizer
+        except ImportError as exc:
+            raise RuntimeError(
+                "install gpu-lr1[tokenizers] to use a Hugging Face tokenizer"
+            ) from exc
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            trust_remote_code=trust_remote_code,
+        )
+        decoder = getattr(tokenizer, "decoder", None)
+        if decoder is None and hasattr(tokenizer, "_tokenizer"):
+            decoder = tokenizer._tokenizer.decoder
+        if decoder is None or "ByteLevel" not in type(decoder).__name__:
+            raise ValueError(
+                "Hugging Face vocabulary extraction currently requires a "
+                "byte-level tokenizer decoder"
+            )
+        total_size = len(tokenizer)
+        target_size = size or total_size
+        if target_size > total_size:
+            raise ValueError(
+                f"tokenizer {model_name} only supplies {total_size} token IDs"
+            )
+        eos_token_id = tokenizer.eos_token_id
+        if eos_token_id is None or eos_token_id >= target_size:
+            raise ValueError(
+                "requested vocabulary must include the tokenizer EOS token"
+            )
+
+        byte_decoder = {
+            character: byte for byte, character in _bytes_to_unicode().items()
+        }
+        tokens: list[bytes] = []
+        for token_id in range(target_size):
+            if token_id == eos_token_id:
+                tokens.append(b"")
+                continue
+            token = tokenizer.convert_ids_to_tokens(token_id)
+            if token is None:
+                tokens.append(f"<invalid-token-{token_id}>".encode("ascii"))
+                continue
+            try:
+                tokens.append(bytes(byte_decoder[character] for character in token))
+            except KeyError:
+                tokens.append(token.encode("utf-8"))
+        return cls(
+            tuple(tokens),
+            eos_token_id=eos_token_id,
+            name=f"huggingface-{model_name.replace('/', '-')}-{target_size}",
+        )
+
 
 def _collect_schema_literals(
     schemas: Iterable[Mapping[str, Any]],
@@ -184,3 +245,18 @@ def _collect_schema_literals(
         visit(schema)
     return literals
 
+
+def _bytes_to_unicode() -> dict[int, str]:
+    byte_values = (
+        list(range(ord("!"), ord("~") + 1))
+        + list(range(ord("¡"), ord("¬") + 1))
+        + list(range(ord("®"), ord("ÿ") + 1))
+    )
+    unicode_values = byte_values.copy()
+    extra = 0
+    for byte in range(256):
+        if byte not in byte_values:
+            byte_values.append(byte)
+            unicode_values.append(256 + extra)
+            extra += 1
+    return dict(zip(byte_values, map(chr, unicode_values)))

@@ -5,13 +5,17 @@ constrained decoding.
 
 ## Result
 
-The central idea is practical in two stages:
+The central idea is practical in three stages:
 
 1. Precompiled, non-recursive JSON Schemas with canonical JSON serialization
    can be compiled into a tokenizer-aware byte DFA.
 2. Arbitrary deterministic LR(1) grammars can be compiled into sparse
    ACTION/GOTO tables and executed on GPU over an already-segmented grammar
    terminal stream.
+3. For a configured stack-depth bound, reachable LR stack configurations can be
+   expanded into finite token states. A terminal trie then compiles tokenizer
+   tokens spanning several grammar terminals into sparse
+   `(token, next_configuration)` rows.
 
 For the typically sparse token rows in the DFA backend, the best measured layout
 is not a dense `M_next[Q, V]` table but a packed CSR edge table:
@@ -40,9 +44,14 @@ On an NVIDIA L40S with a 32,768-token GPT-2 vocabulary:
   states and 20.3 KiB of ACTION/GOTO/production tables. Its fused
   select+reduce+shift kernel takes about **63-65 us** through batch 512 and
   **64.7 us** for a mixed batch of 2,048 sequences on the same L40S.
+- With the full Qwen3 151,669-token vocabulary, bounded byte-terminal arithmetic
+  and recursive balanced grammars compile into 675 configurations and 4,465
+  token edges. The runtime tables use **40.8 KiB**, compile in **0.094 s**, and
+  the fused CSR token step takes about **28 us** through batch 2,048.
 
-This is evidence for GPU-native high-batch execution. Full tokenizer-aware LR(1)
-constrained decoding and arbitrary JSON Schema semantics are not yet solved.
+This is evidence for GPU-native high-batch execution. General lexer integration,
+unbounded tokenizer-aware LR(1), and arbitrary JSON Schema semantics are not yet
+solved.
 
 ## What is implemented
 
@@ -71,6 +80,12 @@ constrained decoding and arbitrary JSON Schema semantics are not yet solved.
    - bounded ragged stack segments with different capacities per sequence;
    - a CPU reference parser;
    - fused and split fast/slow Triton shift-reduce kernels.
+7. A bounded tokenizer-aware LR(1) compiler implements:
+   - explicit token-to-terminal sequences and a real tokenizer-byte adapter;
+   - a terminal trie that shares work across token prefixes;
+   - exact reachable LR stack configurations up to a configured depth;
+   - heterogeneous global packing into sparse token/next-state CSR rows;
+   - the existing fused CSR GPU sampler with no runtime parser stack.
 
 ## Important finding about the original LR/PDA hypothesis
 
@@ -87,11 +102,13 @@ GOTO[state, nonterminal] -> state
 PRODUCTION[id] -> (lhs, rhs_length)
 ```
 
-This currently consumes one grammar terminal per step. It does not yet bridge a
-real LLM tokenizer token, which may contain several terminals or end inside a
-lexer token, to the LR stack. The existing JSON Schema frontend remains the
-acyclic byte-DFA path until a tokenizer/lexer-to-LR transition classifier is
-implemented.
+The direct LR kernel consumes one grammar terminal per step. The bounded token
+compiler now bridges real tokenizer byte strings when grammar terminals are
+bytes, or any explicit token-to-terminal sequence supplied by a lexer adapter.
+It is exact for reachable stacks within `max_stack_depth`, but converts those
+full stacks into finite configuration IDs. General regex/lexer states and
+unbounded recursion still need a compact stack classifier or transition-program
+representation.
 
 ## Related work
 
@@ -106,8 +123,8 @@ continuous batching. [Pre3](https://aclanthology.org/2025.acl-long.551/) and
 [PSC](https://conf.researchr.org/details/issta-2026/issta-2026-research-papers/81/Efficient-Grammar-Constrained-Decoding-via-Parser-Stack-Classification)
 are the closest stack-aware LR/parser predecessors. The defensible gpu-lr1
 contribution is the public, measured combination of flat heterogeneous state
-packing, CSR/bitset representations, and fused Triton token selection plus state
-update for an explicitly restricted schema subset.
+packing, direct sparse LR execution, bounded stack-configuration expansion,
+CSR/bitset representations, and fused Triton token selection plus state update.
 
 ## Benchmark results
 
@@ -118,6 +135,7 @@ Hardware and software:
 - Triton 3.4.0
 - XGrammar 0.2.3
 - GPT-2 token bytes truncated to a 32,768-token vocabulary
+- Qwen/Qwen3-0.6B tokenizer with all 151,669 token IDs
 
 ### End-to-end constraint step vs XGrammar
 
@@ -216,6 +234,52 @@ already resident on the host. It excludes real serving costs such as device
 logits, tokenizer alignment, mask transfer, and model sampling, so it is a
 correctness and scaling reference rather than a production CPU baseline.
 
+### Bounded tokenizer-aware LR(1) backend
+
+The bounded compiler turns each reachable LR state stack into a finite
+configuration and walks a trie of tokenizer-terminal sequences from every
+configuration. This makes the online step identical to the fast DFA path:
+
+```text
+configuration -> CSR [(token_id, next_configuration), ...]
+```
+
+The full stress table uses a 1,024-token BPE-like arithmetic alphabet and four
+heterogeneous grammar/depth combinations:
+
+| Metric | Result |
+|---|---:|
+| Configurations | 554 |
+| Token edges | 190,886 |
+| Compile time | 3.77 s |
+| Runtime token+next tables | 1.46 MiB |
+| Direct ACTION/GOTO tables for the same four grammar/depth entries | 9.14 KiB |
+| Memory expansion versus direct LR tables | 164x |
+| GPU fused step, typical CUDA time | 28-29 us |
+
+The actual Qwen3 full-vocabulary probe is smaller because only
+grammar-compatible byte
+tokens are representable:
+
+| Grammar | Depth bound | Representable Qwen3 tokens | Configurations | Edges | Compile |
+|---|---:|---:|---:|---:|---:|
+| Byte arithmetic | 4 | 87 | 81 | 783 | 0.034 s |
+| Balanced parentheses | 16 | 20 | 594 | 3,682 | 0.060 s |
+
+Packed together, these tables use 41,819 runtime bytes. The heterogeneous GPU
+step remains about 28 us from batch 1 through 2,048.
+
+The failure mode is state explosion. With a synthetic 4,096-token grammar
+alphabet, arithmetic depth 4 compiles to 81 configurations and 100,641 edges in
+2.10 s, while depth 6 and 8 exceed the explicit 10-second compile limit.
+Across the 18 compile-scaling cases, three time out. Balanced parentheses remain
+small because their branching structure is much simpler.
+
+The conclusion is a hybrid architecture: bounded configuration expansion is an
+excellent GPU-only fast path for shallow or low-branching grammars, but direct
+stack execution or Pre3/PSC-style stack classifiers are required when
+configuration expansion grows too large.
+
 Full machine-readable results are in [`results/`](results/).
 
 ## Supported schema subset
@@ -280,6 +344,10 @@ python3 -m venv --system-site-packages .venv
   --profile full \
   --logit-columns 32768 \
   --output results/l40s-lr1-full.json
+
+.venv/bin/gpu-lr1-lr-token-bench \
+  --profile full \
+  --output results/l40s-lr1-token-full.json
 ```
 
 The 64-schema scaling run is:
@@ -299,8 +367,11 @@ The 64-schema scaling run is:
 
 ## What remains before serving integration
 
-- Connect real tokenizer byte strings and lexer states to stack-aware LR(1)
-  token-transition programs or parser-stack classifiers.
+- Add a general regex/lexer frontend; the current tokenizer bridge is exact for
+  byte-terminal grammars or explicitly supplied terminal sequences.
+- Add an adaptive compiler that chooses bounded configuration expansion,
+  direct stack execution, or a Pre3/PSC-style stack classifier from measured
+  state-growth estimates.
 - Compile recursive JSON Schema structure into the LR(1) backend and add side
   state for schema semantics that are not context-free.
 - Implement categorical/temperature/top-k/top-p sampling directly over sparse

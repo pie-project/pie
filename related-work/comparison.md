@@ -19,6 +19,7 @@ GPU kernel; it does not imply that the parser or automaton executes on GPU.
 | Gram2Token | Deterministic byte grammar -> token categories | Token trie groups equal transition outcomes | Preprocessed grammar state | **GPU claimed** | Category lookup, mask, state update | Not fully specified in public abstract | Schema-diverse continuous batching | Abstract; declared repo unavailable |
 | gpu-lr1 DFA | Canonical acyclic JSON Schema -> byte DFA | Explicit DFA/tokenizer cross-product | Flat global DFA state ID | **GPU Triton** | CSR/bitset selection and next-state write | No | One global state namespace across schemas | Public prototype |
 | gpu-lr1 LR(1) | Canonical LR(1) ACTION/GOTO tables | Already-segmented grammar terminals; no LLM-token bridge yet | Bounded ragged LR state stacks | **GPU Triton** | Sparse terminal selection plus reduce/goto/shift closure | Yes, at terminal level | Global state/production IDs plus per-sequence ragged stacks | Public prototype |
+| gpu-lr1 bounded tokens | Bounded canonical LR(1) configurations | Token terminal trie; real bytes for byte-terminal grammars | Full LR stacks encoded as finite configuration IDs | Offline CPU expansion; **GPU runtime** | CSR token selection plus next-configuration write | Yes up to configured depth | Global configuration IDs across grammars | Public prototype |
 
 ## Device-placement evidence
 
@@ -73,7 +74,8 @@ high-batch sampling.
 
 ### 2. State-to-token indexes
 
-Examples: Outlines, SynCode, the regular subset of gpu-lr1.
+Examples: Outlines, SynCode, the regular subset of gpu-lr1, and gpu-lr1's
+bounded LR configuration expansion.
 
 Expensive tokenizer/grammar alignment is compiled ahead of inference. Online
 execution becomes a lookup keyed by automaton or parser state. The main design
@@ -147,6 +149,8 @@ Publicly demonstrated gpu-lr1 details not available in the Gram2Token abstract:
 - memory scaling for 14 and 64 heterogeneous schemas;
 - fused Triton token selection and state update;
 - direct XGrammar wall-clock baseline.
+- bounded exact stack-configuration expansion with measured state/memory growth;
+- full Qwen3 151,669-token byte results and explicit compile timeouts.
 
 Potential Gram2Token differences that remain unknown:
 
@@ -166,8 +170,11 @@ parsing.
 - PSC compiles the acceptance conditions of all vocabulary tokens into one
   parser-stack classifier.
 - gpu-lr1's DFA backend eliminates the stack for acyclic canonical JSON.
-- gpu-lr1's LR backend executes the stack directly, but only after input has
-  already been segmented into grammar terminals.
+- gpu-lr1's direct LR backend executes the stack after input has been segmented
+  into grammar terminals.
+- gpu-lr1's bounded token backend handles multi-terminal tokenizer tokens by
+  enumerating full stack configurations, which is exact within a depth bound but
+  can grow exponentially.
 
 A tokenizer-aware recursive gpu-lr1 backend should therefore be framed as a GPU
 table/kernel realization of stack-aware prior art, not as a new discovery that
@@ -208,9 +215,10 @@ silently ignores schema keywords is not a valid replacement.
 
 - "gpu-lr1 is the first GPU-native grammar-constrained decoder."
   Gram2Token is direct prior art at the claim level.
-- "gpu-lr1 provides tokenizer-aware LR(1) constrained decoding."
-  The LR backend currently consumes grammar terminal IDs; it does not yet map
-  arbitrary LLM tokens through lexer and stack transitions.
+- "gpu-lr1 provides unbounded, general-lexer LR(1) constrained decoding."
+  Tokenizer bytes are currently supported for byte-terminal grammars, or through
+  explicit terminal sequences, and bounded configuration expansion can time out
+  on branching grammars.
 - "All production engines synchronize GPU to CPU every token."
   The common direction is CPU-to-GPU mask staging and scheduling dependence;
   implementations may overlap work and avoid an explicit blocking device read.
