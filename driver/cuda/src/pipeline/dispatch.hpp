@@ -320,13 +320,28 @@ class Dispatch {
     // Fixed-capacity single-token decode lowering directly into stable
     // model input buffers. `stage` returns false with an empty error when
     // the launched programs require general host composition.
+    //
+    // `scope` selects the ordered ENVELOPE sub-batch of a mixed
+    // [wire][envelope] step: a contiguous program suffix and the wire
+    // sub-batch's row/request/page totals (the compose kernel writes the
+    // envelope rows in place after the ordinary wire refill). The
+    // default all-zero scope is the whole-step all-envelope form.
+    struct FixedDecodeScope {
+        std::uint32_t program_begin = 0;
+        std::uint32_t program_count = 0;  // 0 = every program
+        std::uint32_t row_base = 0;
+        std::uint32_t request_base = 0;
+        std::uint32_t page_base = 0;
+    };
+
     bool stage_fixed_decode(
         const pie_native::LaunchView& view,
         std::uint32_t page_size,
         std::uint32_t device_pages,
         const FixedDecodeDeviceBuffers& buffers,
         std::string* err,
-        StagedLaunch& launch);
+        StagedLaunch& launch,
+        const FixedDecodeScope& scope);
 
     bool enqueue_fixed_decode(
         const FixedDecodeDeviceBuffers& buffers,

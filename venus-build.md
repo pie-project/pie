@@ -531,24 +531,48 @@ Metal driver: step-loop internally (same C ABI).
     against the span. Chained fires today carry EMPTY wire geometry
     (deferred_geometry, wire.rs:421) so the envelope path cannot serve
     them; chained k>1 works only through the fixed/graph path.
-  Implementation order:
-  1. ENGINE wire: chained (device_resolved) fires emit their envelope
-     LEASE as wire template geometry (ordered physical page list from
-     the lane's translation overlay + kv bounds; last-page-lens
-     template) instead of empty arrays. This alone also makes the
-     envelope path sound for chained lanes on non-graph-safe archs.
-  2. DRIVER resolve: accept the device-composed template for MIXED
-     batches by giving envelope lanes their WIRE-template geometry (not
-     1-page placeholders) in the per-program candidate, keeping
-     device_composed=false so routing goes to stage_decode_envelopes
-     (passthrough for wire lanes, envelope lanes device-resolved) — and
-     never the readback fallback for envelope-class programs.
+  Implementation order (REVISED after reading compose_decode_envelopes:
+  the envelope kernel takes geometry from readback-resolved host state —
+  values-only device resolution — so it can never serve chained lanes;
+  the fixed-decode compose kernel already derives FULL geometry on
+  device via the translation table and is the right mechanism for the
+  envelope sub-batch of a mixed step):
+  1. DRIVER compose: teach stage/enqueue_fixed_decode + the
+     compose_fixed_decode kernel BASE OFFSETS (row/request/page bases =
+     the wire sub-batch's totals, host-known) and subset operation
+     (envelope-class programs only). Wire rows come from the ordinary
+     wire refill; the kernel overwrites the envelope rows in place.
+     Ordered sub-batches = [wire][envelope], envelope LAST.
+  2. DRIVER resolve: mixed template acceptance — envelope programs get
+     placeholder geometry sized to their FULL envelope width
+     (translation_len pages, so composed CSRs reserve device-write
+     capacity), host programs resolve as wire; never the readback
+     fallback for envelope-class programs. Routing: mixed → wire refill
+     + offset fixed-compose (not the envelope path, not graphs).
   3. ENGINE grouping: drop ONLY the lead_device_geometry mismatch
      rejection in LaunchGrouping (all mask/solo/budget exclusions stay),
-     order group members wire-first, emit true sub_batch arrays.
+     order group members wire-first/envelope-last, emit true sub_batch
+     arrays.
   4. Certify: oracles unchanged (solo lanes never mix); c0-256 ramp at
      k∈{1,2} (arrival-heavy → mixed boundaries), 2048×32 sweep parity;
      compare step counts (sched trace) to confirm mixing engages.
+  ROUND STATUS (checkpoint): steps 1–3 IMPLEMENTED (offset fixed-decode
+  compose + FixedDecodeScope; mixed template acceptance with full-width
+  reserves + mixed_envelope flag + unavailable extents for envelope
+  lanes; engine grouping gate removed, wire-first sort, true sub_batch
+  arrays). Engine lib tests 351/351 green. Full sweep GREEN at parity
+  (oracles k∈{1..3}+t256 token-exact; k=1 35.47k, k=2 34.1/34.2k, k=3
+  33.9k, k=4 33.6k, c0-256 k2 28.0k, zero failures) — BUT wave-composition
+  tracing (TEMP DIAG eprintlns in worker.rs post_frame + batch.rs, sched-
+  trace-gated, still in tree) shows every wave is CLASS-PURE on the
+  canonical shapes: uniform request lengths make whole cohorts finish the
+  same frame and replace together, so a joiner's prefill never coincides
+  with in-flight decode frames. The sweep therefore certifies pure-path
+  NON-REGRESSION only; the mixed path has not yet executed. NEXT: a
+  length-variance workload (per-request max-tokens jitter in
+  benches/pie_bench.py or a dedicated ramp inferlet) to force overlapping
+  boundaries, confirm [sched] MIXED step engagement, then re-certify and
+  remove the temp traces.
 
 - SECOND LANDING round 2: plan-once-per-frame LANDED (operator-approved
   as a pure upgrade; ④ delta-form geometry DEFERRED by operator decision

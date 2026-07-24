@@ -313,11 +313,13 @@ impl LaunchGrouping {
         if self.instances.contains(&request.instance_id) {
             return false;
         }
-        if self.count != 0
-            && request.request.device_resolved_geometry != self.lead_device_geometry
-        {
-            return false;
-        }
+        // Wire-geometry (chunk) and device-resolved (chained decode) fires
+        // CO-BATCH as ordered sub-batches of one step (true sub-batches,
+        // Venus second landing): `build_frame_submission` orders the group
+        // wire-first and the driver composes the envelope suffix on device
+        // via the offset fixed-decode compose. The mask/solo exclusions
+        // below still keep dense-masked and wire-masked device-geometry
+        // fires out of shared batches.
         if request
             .pipeline_id
             .is_some_and(|pid| self.pipelines.contains(&pid))
@@ -3544,6 +3546,22 @@ impl BatchScheduler {
                 {
                     timing.ready_us = Some(now_us);
                 }
+            }
+        }
+        // TEMP DIAG (remove before landing).
+        if super::sched_trace_enabled() {
+            for (index, wave) in survivors.iter().enumerate() {
+                if wave.is_empty() {
+                    continue;
+                }
+                let envelope = wave
+                    .iter()
+                    .filter(|r| r.request.device_resolved_geometry)
+                    .count();
+                eprintln!(
+                    "[sched] frame wave{index}: wire={} envelope={envelope}",
+                    wave.len() - envelope
+                );
             }
         }
         let (submission, requests) =

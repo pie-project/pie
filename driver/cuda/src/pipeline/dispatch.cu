@@ -434,6 +434,14 @@ struct FixedDecodeOutputs {
     std::uint32_t dummy_page = 0;
     std::uint32_t page_size = 0;
     std::uint32_t device_pages = 0;
+    // Ordered sub-batch offsets (mixed [wire][envelope] steps): the wire
+    // sub-batch's totals. Lane i composes request `request_base + i` at
+    // token row `row_base + i`, its pages landing at CSR base
+    // `page_base`. Zero for the all-envelope whole-step form, whose lane
+    // 0 also writes the CSR heads.
+    std::uint32_t row_base = 0;
+    std::uint32_t request_base = 0;
+    std::uint32_t page_base = 0;
 };
 
 static_assert(std::is_standard_layout_v<FixedDecodeLane>);
@@ -582,46 +590,52 @@ __global__ void compose_fixed_decode(
     __syncthreads();
 
     if (lane == 0) {
-        std::uint32_t page_cursor = 0;
-        output.qo_indptr[0] = 0;
-        output.kv_page_indptr[0] = 0;
+        std::uint32_t page_cursor = output.page_base;
+        if (output.request_base == 0) {
+            output.qo_indptr[0] = 0;
+            output.kv_page_indptr[0] = 0;
+        }
         for (std::uint32_t index = 0;
              index < lane_count;
              ++index) {
             const std::uint32_t count = page_offsets[index];
             page_offsets[index] = page_cursor;
             page_cursor += count;
-            output.qo_indptr[index + 1] = index + 1;
-            output.kv_page_indptr[index + 1] = page_cursor;
+            output.qo_indptr[output.request_base + index + 1] =
+                output.row_base + index + 1;
+            output.kv_page_indptr[output.request_base + index + 1] =
+                page_cursor;
         }
     }
     __syncthreads();
 
     if (lane >= lane_count) return;
     const bool active = valid && !sentinel;
-    output.row_valid[lane] = static_cast<std::uint8_t>(active);
-    output.token_ids[lane] = active ? token : 0;
+    const std::uint32_t row = output.row_base + lane;
+    const std::uint32_t request = output.request_base + lane;
+    output.row_valid[row] = static_cast<std::uint8_t>(active);
+    output.token_ids[row] = active ? token : 0;
     const auto* position =
         fixed_decode_pointer<std::uint32_t>(descriptor->position);
-    output.position_ids[lane] =
+    output.position_ids[row] =
         active && position != nullptr ? *position : 0;
-    output.kv_last_page_lens[lane] =
+    output.kv_last_page_lens[request] =
         active
             ? ((kv_len - 1) % output.page_size) + 1
             : 1;
-    output.w_page[lane] = write_page;
-    output.w_off[lane] = write_offset;
+    output.w_page[row] = write_page;
+    output.w_off[row] = write_offset;
     if (!active && output.rs_slot_ids != nullptr) {
-        output.rs_slot_ids[lane] = -1;
+        output.rs_slot_ids[request] = -1;
     }
     if (output.sample_indices != nullptr) {
-        output.sample_indices[lane] =
-            static_cast<std::int32_t>(lane);
+        output.sample_indices[request] =
+            static_cast<std::int32_t>(row);
     }
 
-    const std::uint32_t page_base = page_offsets[lane];
+    const std::uint32_t page_cursor_base = page_offsets[lane];
     if (!active) {
-        output.kv_page_indices[page_base] = output.dummy_page;
+        output.kv_page_indices[page_cursor_base] = output.dummy_page;
         return;
     }
     const auto* pages =
@@ -633,7 +647,7 @@ __global__ void compose_fixed_decode(
     for (std::uint32_t page = 0;
          page < page_count;
          ++page) {
-        output.kv_page_indices[page_base + page] =
+        output.kv_page_indices[page_cursor_base + page] =
             translation[pages[page]];
     }
 }
@@ -1323,6 +1337,7 @@ struct StagedLaunch::State {
     std::vector<std::size_t> fixed_decode_position_offset;
     std::uint32_t fixed_decode_page_size = 0;
     std::uint32_t fixed_decode_device_pages = 0;
+    Dispatch::FixedDecodeScope fixed_decode_scope{};
     bool decode_envelopes_staged = false;
     std::vector<DecodeEnvelopeLane> decode_envelope_lanes;
     std::size_t decode_envelope_lane_count = 0;
@@ -4915,14 +4930,19 @@ bool Dispatch::stage_fixed_decode(
     std::uint32_t device_pages,
     const FixedDecodeDeviceBuffers& buffers,
     std::string* err,
-    StagedLaunch& launch) {
+    StagedLaunch& launch,
+    const FixedDecodeScope& scope) {
     if (err != nullptr) err->clear();
     Impl& state = *impl_;
     StagedLaunch::State& staged = *launch.state_;
-    const std::size_t programs = view.ptir_program_hashes.size();
-    if (programs == 0 ||
-        view.ptir_program_instances.size() != programs ||
-        staged.lanes.size() != programs ||
+    const std::size_t total_programs = view.ptir_program_hashes.size();
+    const std::size_t program_begin = scope.program_begin;
+    const std::size_t programs = scope.program_count == 0
+        ? total_programs
+        : scope.program_count;
+    if (programs == 0 || program_begin + programs > total_programs ||
+        view.ptir_program_instances.size() != total_programs ||
+        staged.lanes.size() != total_programs ||
         !staged.active ||
         page_size == 0 ||
         device_pages == 0 ||
@@ -4949,9 +4969,9 @@ bool Dispatch::stage_fixed_decode(
         }
         return false;
     }
-    if (view.kv_translation_indptr.size() != programs + 1 ||
+    if (view.kv_translation_indptr.size() != total_programs + 1 ||
         view.kv_translation_indptr.data()[0] != 0 ||
-        view.kv_translation_indptr.data()[programs] !=
+        view.kv_translation_indptr.data()[total_programs] !=
             view.kv_translation.size()) {
         if (err != nullptr) {
             *err = "ptir fixed decode translation table is malformed";
@@ -4959,8 +4979,8 @@ bool Dispatch::stage_fixed_decode(
         return false;
     }
     const bool has_write_bounds =
-        view.ptir_kv_write_lower_bounds.size() == programs &&
-        view.ptir_kv_write_upper_bounds.size() == programs;
+        view.ptir_kv_write_lower_bounds.size() == total_programs &&
+        view.ptir_kv_write_upper_bounds.size() == total_programs;
     if ((!view.ptir_kv_write_lower_bounds.empty() ||
          !view.ptir_kv_write_upper_bounds.empty()) &&
         !has_write_bounds) {
@@ -4989,7 +5009,9 @@ bool Dispatch::stage_fixed_decode(
     };
     std::vector<ProgramPorts> ports(programs);
     std::size_t maximum_pages = 0;
-    for (std::size_t program = 0; program < programs; ++program) {
+    for (std::size_t lane_index = 0; lane_index < programs; ++lane_index) {
+        const std::size_t program = program_begin + lane_index;
+        ProgramPorts& program_ports = ports[lane_index];
         const std::uint64_t instance_id =
             view.ptir_program_instances.data()[program];
         auto found = state.instances.find(instance_id);
@@ -5005,7 +5027,6 @@ bool Dispatch::stage_fixed_decode(
             return false;
         }
         const Trace& trace = *found->second.trace;
-        ProgramPorts& program_ports = ports[program];
         program_ports.instance = &found->second;
         for (const PortBinding& binding : trace.ports) {
             if (binding.is_const) continue;
@@ -5146,8 +5167,8 @@ bool Dispatch::stage_fixed_decode(
     // Host-writer input availability is a stage-time (admission) check;
     // the ring PULL itself is stream work and runs in the enqueue half at
     // the step's stream position.
-    for (std::size_t program = 0; program < programs; ++program) {
-        BoundInstance& instance = *ports[program].instance;
+    for (std::size_t lane_index = 0; lane_index < programs; ++lane_index) {
+        BoundInstance& instance = *ports[lane_index].instance;
         std::string value_error;
         if (!instance.instance->writer_inputs_available(
                 &value_error)) {
@@ -5158,21 +5179,23 @@ bool Dispatch::stage_fixed_decode(
     std::vector<std::uint32_t> upload_values(
         view.kv_translation.data(),
         view.kv_translation.data() + view.kv_translation.size());
-    for (std::size_t program = 0; program < programs; ++program) {
-        if (ports[program].by_tag[kPortPositions] != nullptr) continue;
-        ports[program].wire_position_offset = upload_values.size();
-        upload_values.push_back(view.position_ids.data()[program]);
+    for (std::size_t lane_index = 0; lane_index < programs; ++lane_index) {
+        if (ports[lane_index].by_tag[kPortPositions] != nullptr) continue;
+        ports[lane_index].wire_position_offset = upload_values.size();
+        upload_values.push_back(
+            view.position_ids.data()[program_begin + lane_index]);
     }
     std::vector<FixedDecodeLane> lanes(programs);
-    for (std::size_t program = 0; program < programs; ++program) {
-        ProgramPorts& program_ports = ports[program];
+    for (std::size_t lane_index = 0; lane_index < programs; ++lane_index) {
+        const std::size_t program = program_begin + lane_index;
+        ProgramPorts& program_ports = ports[lane_index];
         ChannelView& channel_view =
             program_ports.instance->instance->view();
         // FramePrepare-time consumer: the Prologue has not executed yet;
         // its statically-known put effects stand in for the live set.
         const auto& pending_slots =
             staged.lanes[program]->prologue_put_slots;
-        FixedDecodeLane& lane = lanes[program];
+        FixedDecodeLane& lane = lanes[lane_index];
         const std::uint8_t ports_in_lane[] = {
             kPortEmbedTokens,
             kPortPositions,
@@ -5237,16 +5260,17 @@ bool Dispatch::stage_fixed_decode(
     // are patched at enqueue, after the upload-arena claim.
     staged.fixed_decode_translation_begin.resize(programs);
     staged.fixed_decode_position_offset.resize(programs);
-    for (std::size_t program = 0; program < programs; ++program) {
-        staged.fixed_decode_translation_begin[program] =
-            ports[program].translation_begin;
-        staged.fixed_decode_position_offset[program] =
-            ports[program].wire_position_offset;
+    for (std::size_t lane_index = 0; lane_index < programs; ++lane_index) {
+        staged.fixed_decode_translation_begin[lane_index] =
+            ports[lane_index].translation_begin;
+        staged.fixed_decode_position_offset[lane_index] =
+            ports[lane_index].wire_position_offset;
     }
     staged.fixed_decode_lanes = std::move(lanes);
     staged.fixed_decode_upload_values = std::move(upload_values);
     staged.fixed_decode_page_size = page_size;
     staged.fixed_decode_device_pages = device_pages;
+    staged.fixed_decode_scope = scope;
     staged.fixed_decode_staged = true;
     return true;
 }
@@ -5265,13 +5289,15 @@ bool Dispatch::enqueue_fixed_decode(
         return false;
     }
     const std::size_t programs = staged.fixed_decode_lanes.size();
+    const Dispatch::FixedDecodeScope& scope = staged.fixed_decode_scope;
     // Pull host-writer rings on the LAUNCH stream: the compose kernel and
     // every stage kernel are ordered behind these copies, and the staging
     // rides the launch state past their completion — no whole-device
     // synchronize on the fire path.
-    for (const auto& lane : staged.lanes) {
-        lane->bound->instance->pull_writer_inputs(
-            staged.stream, staged.writer_staging);
+    for (std::size_t lane_index = 0; lane_index < programs; ++lane_index) {
+        staged.lanes[scope.program_begin + lane_index]
+            ->bound->instance->pull_writer_inputs(
+                staged.stream, staged.writer_staging);
     }
     state.fixed_decode_upload.reserve(
         programs, staged.fixed_decode_upload_values.size(), staged.stream);
@@ -5329,6 +5355,9 @@ bool Dispatch::enqueue_fixed_decode(
         .dummy_page = buffers.dummy_page,
         .page_size = staged.fixed_decode_page_size,
         .device_pages = staged.fixed_decode_device_pages,
+        .row_base = scope.row_base,
+        .request_base = scope.request_base,
+        .page_base = scope.page_base,
     };
     std::uint32_t threads = 32;
     while (threads < programs) threads *= 2;
@@ -5406,7 +5435,7 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
         // (frame.cpp) takes the composed batch from R to its request
         // bucket with device-side pad rows, so the template no longer
         // requires R to sit exactly on the lattice.
-        if (!allow_device_composed || staged == nullptr ||
+        if (staged == nullptr ||
             page_size == 0 || device_pages == 0 ||
             !view.rs_slot_ids.empty() ||
             !view.rs_fold_lens.empty() ||
@@ -5559,8 +5588,19 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
             geometry.token_ids = {0};
             geometry.position_ids = {0};
             geometry.qo_indptr = {0, 1};
-            geometry.kv_page_indices = {0};
-            geometry.kv_page_indptr = {0, 1};
+            // Mixed steps reserve the FULL envelope width in the composed
+            // CSRs (the offset fixed-decode compose writes actual counts
+            // in place on device); the all-envelope whole-step form keeps
+            // the 1-page placeholder (enqueue_fixed_decode rewrites every
+            // CSR from lane 0).
+            const std::uint32_t envelope_width =
+                static_cast<std::uint32_t>(std::max<std::size_t>(
+                    1,
+                    std::min<std::size_t>(
+                        pages->type.shape.numel(),
+                        translation_end - translation_begin)));
+            geometry.kv_page_indices.assign(envelope_width, 0);
+            geometry.kv_page_indptr = {0, envelope_width};
             geometry.kv_last_page_lens = {1};
             geometry.sampling_indices = {0};
             geometry.sampling_indptr = {0, 1};
@@ -5572,15 +5612,21 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
             ++candidate.device_count;
         }
         if (candidate.device_count == 0) return false;
-        // The placeholder geometry this template stages is consumable ONLY
-        // by the fully device-composed path (`enqueue_fixed_decode`, which
-        // re-derives every lane's real geometry from device cells). A MIXED
-        // batch (Host-class chunk lanes present) routes to
-        // `enqueue_decode_envelopes`, which trusts the host page spans —
-        // feeding it the 1-page placeholder containment-kills every
-        // envelope lane past its first page. Mixed batches must resolve
-        // real geometry through the descriptor fallback below.
-        if (!all_decode_envelopes) return false;
+        if (!all_decode_envelopes) {
+            // Mixed [wire][envelope] step: the envelope lanes' shape
+            // templates (full-width reserves above) route through the
+            // OFFSET fixed-decode compose after the ordinary wire refill
+            // — never `enqueue_decode_envelopes` (which trusts host page
+            // spans) and never the synchronizing readback fallback below
+            // (chained values do not exist host-side).
+            candidate.mixed_envelope = true;
+            out = std::move(candidate);
+            return true;
+        }
+        // The whole-step 1-page placeholder form is consumable ONLY by
+        // `enqueue_fixed_decode`, whose graph-bucket planning the
+        // `allow_device_composed` gate guards.
+        if (!allow_device_composed) return false;
         candidate.device_composed = true;
         out = std::move(candidate);
         return true;

@@ -281,13 +281,32 @@ pub(crate) fn build_frame_submission(
     let mut flattened: Vec<PendingRequest> = Vec::new();
 
     for group in step_groups {
-        let device_resolved = group[0].request.device_resolved_geometry;
-        let sub_batch_indptr: Vec<u32> = vec![0, group.len() as u32];
-        let sub_batch_class: Vec<u32> = vec![if device_resolved {
-            pie_driver_abi::PIE_GEOMETRY_CLASS_DECODE_ENVELOPE
-        } else {
-            pie_driver_abi::PIE_GEOMETRY_CLASS_HOST
-        }];
+        // Ordered sub-batches: wire (Host-class) members first, the
+        // device-resolved envelope suffix last — the driver's offset
+        // fixed-decode compose requires the envelope lanes to be a
+        // contiguous program suffix. Stable sort keeps arrival order
+        // within each class.
+        let mut group = group;
+        group.sort_by_key(|req| req.request.device_resolved_geometry);
+        let wire_count = group
+            .iter()
+            .take_while(|req| !req.request.device_resolved_geometry)
+            .count();
+        let envelope_count = group.len() - wire_count;
+        // TEMP DIAG (remove before landing).
+        if super::sched_trace_enabled() && envelope_count > 0 && wire_count > 0 {
+            eprintln!("[sched] MIXED step wire={wire_count} envelope={envelope_count}");
+        }
+        let mut sub_batch_indptr: Vec<u32> = vec![0];
+        let mut sub_batch_class: Vec<u32> = Vec::new();
+        if wire_count > 0 {
+            sub_batch_indptr.push(wire_count as u32);
+            sub_batch_class.push(pie_driver_abi::PIE_GEOMETRY_CLASS_HOST);
+        }
+        if envelope_count > 0 {
+            sub_batch_indptr.push(group.len() as u32);
+            sub_batch_class.push(pie_driver_abi::PIE_GEOMETRY_CLASS_DECODE_ENVELOPE);
+        }
         let build = build_batch_request(&group, page_size, stats);
         let mut roster_rows: Vec<u32> = Vec::with_capacity(build.instance_ids.len());
         for (member_index, (member, req)) in

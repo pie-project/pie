@@ -829,6 +829,21 @@ void prepare_step(
                 s.composed.prog_key_lens.begin(),
                 s.composed.prog_key_lens.end(),
                 unavailable);
+        } else if (s.rpg.mixed_envelope) {
+            // Mixed step: the envelope sub-batch's KV extents resolve on
+            // device — its lanes' extents are unavailable to the grouped
+            // epilogue exactly as on the all-envelope path; wire lanes
+            // keep their real extents.
+            constexpr std::uint32_t unavailable =
+                std::numeric_limits<std::uint32_t>::max();
+            for (std::size_t p = 0;
+                 p < s.rpg.is_device_geometry.size();
+                 ++p) {
+                if (s.rpg.is_device_geometry[p] == 0) continue;
+                s.composed.prog_kv_lens[p] = unavailable;
+                s.composed.prog_page_counts[p] = unavailable;
+                s.composed.prog_key_lens[p] = unavailable;
+            }
         }
     }
     if (dbg_fire &&
@@ -1503,7 +1518,72 @@ void prepare_step(
     // the compose kernel at the step's stream position.
     if (s.has_decode_envelopes) {
         bool staged_ok = false;
-        if (engine.graph_pad_page >= 0 && s.rpg.device_composed) {
+        if (engine.graph_pad_page >= 0 && s.rpg.mixed_envelope) {
+            // Mixed [wire][envelope] step: the envelope sub-batch must be
+            // a contiguous program SUFFIX (the engine orders sub-batches
+            // wire-first); its rows are composed on device by the offset
+            // fixed-decode compose after the ordinary wire refill.
+            const std::size_t n_prog = s.rpg.is_device_geometry.size();
+            std::size_t envelope_begin = n_prog;
+            for (std::size_t p = 0; p < n_prog; ++p) {
+                if (s.rpg.is_device_geometry[p] != 0) {
+                    envelope_begin = p;
+                    break;
+                }
+            }
+            for (std::size_t p = envelope_begin; p < n_prog; ++p) {
+                if (s.rpg.is_device_geometry[p] == 0) {
+                    throw std::runtime_error(
+                        "mixed step requires the envelope sub-batch to be "
+                        "an ordered program suffix");
+                }
+            }
+            const std::uint32_t request_base =
+                s.composed.prog_request_starts[envelope_begin];
+            s.use_fixed_decode = true;
+            s.fixed_buffers = pipeline::FixedDecodeDeviceBuffers{
+                .token_ids = pi.tokens.data(),
+                .position_ids = pi.positions.data(),
+                .qo_indptr = pi.qo_indptr.data(),
+                .kv_page_indices = pi.kv_page_indices.data(),
+                .kv_page_indptr = pi.kv_page_indptr.data(),
+                .kv_last_page_lens = pi.kv_last_page_lens.data(),
+                .w_page = pi.w_page.data(),
+                .w_off = pi.w_off.data(),
+                .row_valid = pi.row_valid.data(),
+                .rs_slot_ids =
+                    s.use_slots ? pi.slot_ids.data() : nullptr,
+                // The wire path uploads the whole step's sampling rows;
+                // the kernel must not rewrite them.
+                .sample_indices = nullptr,
+                .token_capacity = pi.tokens.size(),
+                .request_capacity = pi.kv_last_page_lens.size(),
+                .page_capacity = pi.kv_page_indices.size(),
+                .dummy_page = static_cast<std::uint32_t>(
+                    engine.graph_pad_page),
+            };
+            std::string mixed_error;
+            staged_ok = engine.dispatch->stage_fixed_decode(
+                s.dispatch_view,
+                static_cast<std::uint32_t>(kv_cache.page_size()),
+                static_cast<std::uint32_t>(kv_cache.num_pages()),
+                s.fixed_buffers,
+                &mixed_error,
+                *s.staged,
+                pipeline::Dispatch::FixedDecodeScope{
+                    .program_begin =
+                        static_cast<std::uint32_t>(envelope_begin),
+                    .program_count = static_cast<std::uint32_t>(
+                        n_prog - envelope_begin),
+                    .row_base = s.composed.qo_indptr[request_base],
+                    .request_base = request_base,
+                    .page_base =
+                        s.composed.kv_page_indptr[request_base],
+                });
+            if (!staged_ok && !mixed_error.empty()) {
+                throw std::runtime_error(mixed_error);
+            }
+        } else if (engine.graph_pad_page >= 0 && s.rpg.device_composed) {
             s.use_fixed_decode = true;
             s.fixed_buffers = pipeline::FixedDecodeDeviceBuffers{
                 .token_ids = pi.tokens.data(),
@@ -1531,7 +1611,8 @@ void prepare_step(
                 static_cast<std::uint32_t>(kv_cache.num_pages()),
                 s.fixed_buffers,
                 &fixed_error,
-                *s.staged);
+                *s.staged,
+                pipeline::Dispatch::FixedDecodeScope{});
             if (!staged_ok && !fixed_error.empty()) {
                 throw std::runtime_error(fixed_error);
             }
