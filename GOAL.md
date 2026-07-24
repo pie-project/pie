@@ -46,6 +46,55 @@ A serving engine should be able to swap XGrammar for gpugrammar and get:
 - **Full sampler integration:** temperature/top-k/top-p, plus rollback and fork
   for speculative decoding.
 
+## Killer examples (measured, A100 80GB, Qwen3 151,669-token vocabulary)
+
+Two workloads where a GPU-resident engine is not incrementally better but
+categorically better. Both use XGrammar's own builtin JSON grammar, XGrammar
+0.2.3 for the baseline, and FlashInfer 0.6.15 `top_k_top_p_sampling_from_logits`
+as the sampler — the sampler vLLM/SGLang actually use.
+
+### Example 1: fused constrained sampling is cheaper than *unconstrained* sampling
+
+At a JSON number/structural position the grammar allows 396 of 151,669 tokens.
+Sampling over the allowed set instead of the vocabulary (median wall, µs):
+
+| batch | FlashInfer, **no constraint** | XGrammar mask (on GPU) + FlashInfer | XGrammar full path + FlashInfer | **gather + FlashInfer** |
+|---:|---:|---:|---:|---:|
+| 1 | 275.5 | 331.0 | 1,014.7 | **191.1** |
+| 128 | 1,070.9 | 1,130.6 | 5,867.6 | **201.6** |
+| 512 | 3,456.7 | 3,775.4 | 8,968.0 | **198.0** |
+| 2,048 | 13,007.2 | 14,526.0 | 29,737.3 | **408.6** |
+
+Constraining the grammar makes sampling **17.5× faster at batch 512 and 31.8×
+faster at batch 2,048 than sampling with no constraint at all**, and 45×/73×
+faster than the deployed XGrammar path. Nobody exploits this today because every
+existing system hands back a full-vocabulary mask and lets the engine sample
+over the whole vocabulary.
+
+In the opposite regime — a JSON string body, 147,144 allowed tokens, 4,525
+exceptions — fusion still does not lose: 3,063.8 µs versus 3,435.1 µs
+unconstrained and 3,980.9 µs for XGrammar at batch 512. The constraint is
+effectively free at both ends of the density spectrum.
+
+Context: a 7B decode step at batch 512 is ~8.5 ms (weight streaming lower bound,
+measured 1,648 GB/s). Today's constrained path adds 8.97 ms — it more than
+doubles the step. The fused path adds 0.198 ms, or 2.3%.
+
+### Example 2: speculative decoding breaks CPU grammar execution
+
+A CPU matcher must fill a mask and accept a token serially for each draft
+position, then roll back. Grammar cost per outer step (median wall, µs):
+
+| batch | k | XGrammar | gpugrammar | ratio |
+|---:|---:|---:|---:|---:|
+| 512 | 1 | 4,155.6 | 13.3 | 312× |
+| 512 | 4 | 16,500.7 | 31.9 | 518× |
+| 512 | 8 | **33,366.7** | 56.2 | **594×** |
+
+At batch 512 with 8 draft tokens XGrammar spends 33 ms of CPU per outer step —
+about 4× a 7B decode step. Constrained speculative decoding at scale is not
+slow today; it is infeasible.
+
 ## Grammar class decision
 
 Canonical LR(1) — what the prototype implements today — is verifiably correct
@@ -175,6 +224,23 @@ Masks must compose with temperature/top-k/top-p sampling, and support rollback
 and fork for speculative decoding and beam search — all batched on device. The
 prototype does argmax only, which is not a usable serving interface.
 
+### C10. Ragged fused sampling across a heterogeneous batch
+
+**[measured]** The sampler-fusion win (Example 1) depends on processing only the
+allowed set. But sequences in one batch sit in states of wildly different width
+— 396 tokens at a number position, 147,144 inside a string — and 51.4% of the
+tokens in a realistic JSON document are emitted from wide string states. A dense
+gather buffer is sized by the widest row in the batch, so a single wide sequence
+erases the advantage for all 512.
+
+*Why hard:* the sampler must consume **ragged** rows — per-sequence widths, not a
+padded rectangle — while keeping top-k/top-p semantics exact and staying inside
+one CUDA graph. Candidates: width bucketing with per-bucket launches, a
+per-row persistent kernel, or a two-tier design that routes narrow rows to a
+gathered sampler and wide rows to a complement-masked full-width sampler. This
+is the concrete engineering-and-algorithms problem that makes Example 1 real
+instead of anecdotal.
+
 ## Non-goals
 
 - Beating XGrammar on a grammar with ~15 allowed tokens per state. That is the
@@ -187,10 +253,15 @@ prototype does argmax only, which is not a usable serving interface.
 ## Evaluation plan (paper-grade)
 
 - **Baselines:** XGrammar, llguidance, Outlines, plus the closest parser-aware
-  systems (Pre3, PSC) and Gram2Token where reproducible.
+  systems (Pre3, PSC) and Gram2Token where reproducible. The sampler baseline is
+  FlashInfer (`top_k_top_p_sampling_from_logits`), not a `torch.sort` reference
+  implementation — a sorted-softmax sampler is 5× slower and would be a strawman.
 - **Grammars:** JSON Schema suite, a tool-call/function-call grammar, a
   programming-language grammar, and a recursive stress grammar — chosen so that
   wide-row states (C3) and deep stacks (C2, C6) are actually exercised.
+- **Headline experiments:** the two killer examples above, extended to
+  heterogeneous batches with realistic narrow/wide state mixtures (C10) and to
+  end-to-end serving with a real model in the loop.
 - **Metrics:** end-to-end tokens/s inside a real serving engine (not an isolated
   microbenchmark), constraint-step device time, dispatch overhead, table memory,
   compile latency, and mask exactness rate.
