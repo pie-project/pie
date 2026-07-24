@@ -1,0 +1,1572 @@
+{
+  "metadata": {
+    "timestamp_utc": "2026-07-24T03:04:24Z",
+    "platform": "Linux-6.8.0-52-generic-x86_64-with-glibc2.39",
+    "python": "3.12.3",
+    "torch": "2.8.0+cu129",
+    "cuda_runtime": "12.9",
+    "gpu": "NVIDIA L40S",
+    "gpu_memory_bytes": 47676129280,
+    "compute_capability": "8.9"
+  },
+  "config": {
+    "profile": "quick",
+    "batch_sizes": [
+      64,
+      512
+    ],
+    "mixes": [
+      "mixed_all",
+      "mixed_sparse",
+      "mixed_dense"
+    ],
+    "warmup": 5,
+    "iterations": 20,
+    "schemas": 64,
+    "vocab_size": 32768,
+    "vocab": "gpt2",
+    "seed": 0,
+    "device": "cuda:0",
+    "output": "results/l40s-gpt2-64schemas.json",
+    "profile_details": {
+      "batch_sizes": [
+        64,
+        512
+      ],
+      "mixes": [
+        "mixed_all",
+        "mixed_sparse",
+        "mixed_dense"
+      ],
+      "warmup": 5,
+      "iterations": 20
+    },
+    "vocabulary_name": "tiktoken-gpt2-32768",
+    "max_token_bytes": 65,
+    "logits_buffering": "rotating buffers across timed iterations"
+  },
+  "schemas": [
+    {
+      "name": "small-tool-0",
+      "family": "small",
+      "states": 104
+    },
+    {
+      "name": "nested-tool-1",
+      "family": "nested",
+      "states": 163
+    },
+    {
+      "name": "enum-heavy-2",
+      "family": "enum",
+      "states": 339
+    },
+    {
+      "name": "array-heavy-3",
+      "family": "array",
+      "states": 152
+    },
+    {
+      "name": "string-heavy-4",
+      "family": "string",
+      "states": 218
+    },
+    {
+      "name": "wide-object-5",
+      "family": "wide",
+      "states": 510
+    },
+    {
+      "name": "deep-object-6",
+      "family": "deep",
+      "states": 252
+    },
+    {
+      "name": "small-tool-7",
+      "family": "small",
+      "states": 111
+    },
+    {
+      "name": "nested-tool-8",
+      "family": "nested",
+      "states": 163
+    },
+    {
+      "name": "enum-heavy-9",
+      "family": "enum",
+      "states": 415
+    },
+    {
+      "name": "array-heavy-10",
+      "family": "array",
+      "states": 221
+    },
+    {
+      "name": "string-heavy-11",
+      "family": "string",
+      "states": 234
+    },
+    {
+      "name": "wide-object-12",
+      "family": "wide",
+      "states": 427
+    },
+    {
+      "name": "deep-object-13",
+      "family": "deep",
+      "states": 224
+    },
+    {
+      "name": "small-tool-14",
+      "family": "small",
+      "states": 122
+    },
+    {
+      "name": "nested-tool-15",
+      "family": "nested",
+      "states": 164
+    },
+    {
+      "name": "enum-heavy-16",
+      "family": "enum",
+      "states": 315
+    },
+    {
+      "name": "array-heavy-17",
+      "family": "array",
+      "states": 289
+    },
+    {
+      "name": "string-heavy-18",
+      "family": "string",
+      "states": 204
+    },
+    {
+      "name": "wide-object-19",
+      "family": "wide",
+      "states": 747
+    },
+    {
+      "name": "deep-object-20",
+      "family": "deep",
+      "states": 189
+    },
+    {
+      "name": "small-tool-21",
+      "family": "small",
+      "states": 129
+    },
+    {
+      "name": "nested-tool-22",
+      "family": "nested",
+      "states": 164
+    },
+    {
+      "name": "enum-heavy-23",
+      "family": "enum",
+      "states": 387
+    },
+    {
+      "name": "array-heavy-24",
+      "family": "array",
+      "states": 153
+    },
+    {
+      "name": "string-heavy-25",
+      "family": "string",
+      "states": 219
+    },
+    {
+      "name": "wide-object-26",
+      "family": "wide",
+      "states": 643
+    },
+    {
+      "name": "deep-object-27",
+      "family": "deep",
+      "states": 294
+    },
+    {
+      "name": "small-tool-28",
+      "family": "small",
+      "states": 136
+    },
+    {
+      "name": "nested-tool-29",
+      "family": "nested",
+      "states": 164
+    },
+    {
+      "name": "enum-heavy-30",
+      "family": "enum",
+      "states": 283
+    },
+    {
+      "name": "array-heavy-31",
+      "family": "array",
+      "states": 221
+    },
+    {
+      "name": "string-heavy-32",
+      "family": "string",
+      "states": 234
+    },
+    {
+      "name": "wide-object-33",
+      "family": "wide",
+      "states": 530
+    },
+    {
+      "name": "deep-object-34",
+      "family": "deep",
+      "states": 259
+    },
+    {
+      "name": "small-tool-35",
+      "family": "small",
+      "states": 143
+    },
+    {
+      "name": "nested-tool-36",
+      "family": "nested",
+      "states": 164
+    },
+    {
+      "name": "enum-heavy-37",
+      "family": "enum",
+      "states": 349
+    },
+    {
+      "name": "array-heavy-38",
+      "family": "array",
+      "states": 289
+    },
+    {
+      "name": "string-heavy-39",
+      "family": "string",
+      "states": 204
+    },
+    {
+      "name": "wide-object-40",
+      "family": "wide",
+      "states": 427
+    },
+    {
+      "name": "deep-object-41",
+      "family": "deep",
+      "states": 224
+    },
+    {
+      "name": "small-tool-42",
+      "family": "small",
+      "states": 150
+    },
+    {
+      "name": "nested-tool-43",
+      "family": "nested",
+      "states": 164
+    },
+    {
+      "name": "enum-heavy-44",
+      "family": "enum",
+      "states": 427
+    },
+    {
+      "name": "array-heavy-45",
+      "family": "array",
+      "states": 153
+    },
+    {
+      "name": "string-heavy-46",
+      "family": "string",
+      "states": 219
+    },
+    {
+      "name": "wide-object-47",
+      "family": "wide",
+      "states": 747
+    },
+    {
+      "name": "deep-object-48",
+      "family": "deep",
+      "states": 189
+    },
+    {
+      "name": "small-tool-49",
+      "family": "small",
+      "states": 157
+    },
+    {
+      "name": "nested-tool-50",
+      "family": "nested",
+      "states": 164
+    },
+    {
+      "name": "enum-heavy-51",
+      "family": "enum",
+      "states": 315
+    },
+    {
+      "name": "array-heavy-52",
+      "family": "array",
+      "states": 221
+    },
+    {
+      "name": "string-heavy-53",
+      "family": "string",
+      "states": 234
+    },
+    {
+      "name": "wide-object-54",
+      "family": "wide",
+      "states": 643
+    },
+    {
+      "name": "deep-object-55",
+      "family": "deep",
+      "states": 294
+    },
+    {
+      "name": "small-tool-56",
+      "family": "small",
+      "states": 164
+    },
+    {
+      "name": "nested-tool-57",
+      "family": "nested",
+      "states": 164
+    },
+    {
+      "name": "enum-heavy-58",
+      "family": "enum",
+      "states": 387
+    },
+    {
+      "name": "array-heavy-59",
+      "family": "array",
+      "states": 289
+    },
+    {
+      "name": "string-heavy-60",
+      "family": "string",
+      "states": 204
+    },
+    {
+      "name": "wide-object-61",
+      "family": "wide",
+      "states": 530
+    },
+    {
+      "name": "deep-object-62",
+      "family": "deep",
+      "states": 259
+    },
+    {
+      "name": "small-tool-63",
+      "family": "small",
+      "states": 171
+    }
+  ],
+  "tables": {
+    "schemas": 64,
+    "states": 17424,
+    "vocab_size": 32768,
+    "compile_seconds": 6.199099522083998,
+    "allowed_tokens": {
+      "min": 0,
+      "median": 2.0,
+      "p95": 1222.0,
+      "max": 32147,
+      "mean_density": 0.023430262934296803
+    },
+    "memory_bytes": {
+      "byte_transitions": 17842176,
+      "token_bytes_and_lengths": 2260992,
+      "dense_mask": 570949632,
+      "bitset_mask": 71368704,
+      "csr_token_ids": 53579700,
+      "csr_next_state": 53510000,
+      "dense_next_state": 2283798528
+    },
+    "runtime_strategy_bytes": {
+      "bitset_plus_byte_dfa": 91471872,
+      "csr_plus_byte_dfa": 73682868,
+      "csr_token_and_next": 107089700,
+      "bitset_plus_dense_next": 2355167232,
+      "dense_mask_plus_dense_next": 2854748160
+    },
+    "memory_total_bytes": 3053309732
+  },
+  "benchmarks": [
+    {
+      "mix": "mixed_all",
+      "batch_size": 64,
+      "unique_schemas": 64,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 32144,
+      "allowed_density_mean": 0.02522420883178711,
+      "strategy": "mask_torch_dense",
+      "wall_p50_us": 57.8815,
+      "wall_p95_us": 73.961,
+      "wall_mean_us": 60.651149999999994,
+      "cuda_mean_us": 43.45439970493317,
+      "sequences_per_second": 1472808.2871832743
+    },
+    {
+      "mix": "mixed_all",
+      "batch_size": 64,
+      "unique_schemas": 64,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 32144,
+      "allowed_density_mean": 0.02522420883178711,
+      "strategy": "mask_triton_dense",
+      "wall_p50_us": 37.481,
+      "wall_p95_us": 48.803,
+      "wall_mean_us": 39.06675,
+      "cuda_mean_us": 23.27519953250885,
+      "sequences_per_second": 2749707.8987705414
+    },
+    {
+      "mix": "mixed_all",
+      "batch_size": 64,
+      "unique_schemas": 64,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 32144,
+      "allowed_density_mean": 0.02522420883178711,
+      "strategy": "mask_triton_bitset",
+      "wall_p50_us": 36.4195,
+      "wall_p95_us": 38.768,
+      "wall_mean_us": 36.9864,
+      "cuda_mean_us": 24.01919960975647,
+      "sequences_per_second": 2664535.0819268576
+    },
+    {
+      "mix": "mixed_all",
+      "batch_size": 64,
+      "unique_schemas": 64,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 32144,
+      "allowed_density_mean": 0.02522420883178711,
+      "strategy": "select_torch_dense",
+      "wall_p50_us": 77.356,
+      "wall_p95_us": 89.624,
+      "wall_mean_us": 79.12935,
+      "cuda_mean_us": 61.004799604415894,
+      "sequences_per_second": 1049097.7827155637
+    },
+    {
+      "mix": "mixed_all",
+      "batch_size": 64,
+      "unique_schemas": 64,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 32144,
+      "allowed_density_mean": 0.02522420883178711,
+      "strategy": "select_triton_dense_2stage",
+      "wall_p50_us": 50.956,
+      "wall_p95_us": 58.217,
+      "wall_mean_us": 51.86495,
+      "cuda_mean_us": 41.72320067882538,
+      "sequences_per_second": 1533918.7540442015
+    },
+    {
+      "mix": "mixed_all",
+      "batch_size": 64,
+      "unique_schemas": 64,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 32144,
+      "allowed_density_mean": 0.02522420883178711,
+      "strategy": "select_triton_bitset_2stage",
+      "wall_p50_us": 50.6755,
+      "wall_p95_us": 54.381,
+      "wall_mean_us": 51.7248,
+      "cuda_mean_us": 43.63040030002594,
+      "sequences_per_second": 1466867.1284219676
+    },
+    {
+      "mix": "mixed_all",
+      "batch_size": 64,
+      "unique_schemas": 64,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 32144,
+      "allowed_density_mean": 0.02522420883178711,
+      "strategy": "select_triton_csr_1program",
+      "wall_p50_us": 37.325500000000005,
+      "wall_p95_us": 41.522,
+      "wall_mean_us": 38.3703,
+      "cuda_mean_us": 25.516799092292786,
+      "sequences_per_second": 2508151.5815724265
+    },
+    {
+      "mix": "mixed_all",
+      "batch_size": 64,
+      "unique_schemas": 64,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 32144,
+      "allowed_density_mean": 0.02522420883178711,
+      "strategy": "step_csr_fused",
+      "wall_p50_us": 36.605000000000004,
+      "wall_p95_us": 40.491,
+      "wall_mean_us": 37.413,
+      "cuda_mean_us": 27.806401252746582,
+      "sequences_per_second": 2301628.298400477
+    },
+    {
+      "mix": "mixed_all",
+      "batch_size": 64,
+      "unique_schemas": 64,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 32144,
+      "allowed_density_mean": 0.02522420883178711,
+      "strategy": "advance_triton_dense_next",
+      "wall_p50_us": 26.114,
+      "wall_p95_us": 28.162,
+      "wall_mean_us": 26.524,
+      "cuda_mean_us": 21.07360064983368,
+      "sequences_per_second": 3036975.079078625
+    },
+    {
+      "mix": "mixed_all",
+      "batch_size": 64,
+      "unique_schemas": 64,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 32144,
+      "allowed_density_mean": 0.02522420883178711,
+      "strategy": "advance_triton_byte_dfa",
+      "wall_p50_us": 35.7635,
+      "wall_p95_us": 37.426,
+      "wall_mean_us": 35.9447,
+      "cuda_mean_us": 23.291200399398804,
+      "sequences_per_second": 2747818.871613504
+    },
+    {
+      "mix": "mixed_all",
+      "batch_size": 64,
+      "unique_schemas": 64,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 32144,
+      "allowed_density_mean": 0.02522420883178711,
+      "strategy": "step_bitset_dense_next",
+      "wall_p50_us": 72.32849999999999,
+      "wall_p95_us": 82.293,
+      "wall_mean_us": 73.6361,
+      "cuda_mean_us": 64.09760117530823,
+      "sequences_per_second": 998477.3037755144
+    },
+    {
+      "mix": "mixed_all",
+      "batch_size": 64,
+      "unique_schemas": 64,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 32144,
+      "allowed_density_mean": 0.02522420883178711,
+      "strategy": "step_bitset_byte_dfa",
+      "wall_p50_us": 82.51849999999999,
+      "wall_p95_us": 87.621,
+      "wall_mean_us": 83.68925,
+      "cuda_mean_us": 67.59359836578369,
+      "sequences_per_second": 946835.2262245769
+    },
+    {
+      "mix": "mixed_all",
+      "batch_size": 64,
+      "unique_schemas": 64,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 32144,
+      "allowed_density_mean": 0.02522420883178711,
+      "strategy": "cpu_sync_bitset_baseline",
+      "wall_p50_us": 150.2595,
+      "wall_p95_us": 168.973,
+      "wall_mean_us": 151.17895000000001,
+      "cuda_mean_us": null,
+      "sequences_per_second": 423339.36040698783
+    },
+    {
+      "mix": "mixed_all",
+      "batch_size": 512,
+      "unique_schemas": 64,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 32147,
+      "allowed_density_mean": 0.029029130935668945,
+      "strategy": "mask_torch_dense",
+      "wall_p50_us": 169.804,
+      "wall_p95_us": 174.51,
+      "wall_mean_us": 170.77960000000002,
+      "cuda_mean_us": 148.1328010559082,
+      "sequences_per_second": 3456358.0540596223
+    },
+    {
+      "mix": "mixed_all",
+      "batch_size": 512,
+      "unique_schemas": 64,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 32147,
+      "allowed_density_mean": 0.029029130935668945,
+      "strategy": "mask_triton_dense",
+      "wall_p50_us": 89.3435,
+      "wall_p95_us": 93.539,
+      "wall_mean_us": 89.96979999999999,
+      "cuda_mean_us": 61.128002405166626,
+      "sequences_per_second": 8375866.703550665
+    },
+    {
+      "mix": "mixed_all",
+      "batch_size": 512,
+      "unique_schemas": 64,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 32147,
+      "allowed_density_mean": 0.029029130935668945,
+      "strategy": "mask_triton_bitset",
+      "wall_p50_us": 75.95349999999999,
+      "wall_p95_us": 81.011,
+      "wall_mean_us": 76.7568,
+      "cuda_mean_us": 48.32159876823425,
+      "sequences_per_second": 10595675.909973815
+    },
+    {
+      "mix": "mixed_all",
+      "batch_size": 512,
+      "unique_schemas": 64,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 32147,
+      "allowed_density_mean": 0.029029130935668945,
+      "strategy": "select_torch_dense",
+      "wall_p50_us": 190.184,
+      "wall_p95_us": 196.393,
+      "wall_mean_us": 190.62035,
+      "cuda_mean_us": 165.830397605896,
+      "sequences_per_second": 3087491.8434242248
+    },
+    {
+      "mix": "mixed_all",
+      "batch_size": 512,
+      "unique_schemas": 64,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 32147,
+      "allowed_density_mean": 0.029029130935668945,
+      "strategy": "select_triton_dense_2stage",
+      "wall_p50_us": 79.22399999999999,
+      "wall_p95_us": 83.364,
+      "wall_mean_us": 79.70565,
+      "cuda_mean_us": 50.222402811050415,
+      "sequences_per_second": 10194653.607599692
+    },
+    {
+      "mix": "mixed_all",
+      "batch_size": 512,
+      "unique_schemas": 64,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 32147,
+      "allowed_density_mean": 0.029029130935668945,
+      "strategy": "select_triton_bitset_2stage",
+      "wall_p50_us": 78.803,
+      "wall_p95_us": 80.44,
+      "wall_mean_us": 79.29915,
+      "cuda_mean_us": 50.12959837913513,
+      "sequences_per_second": 10213526.869449325
+    },
+    {
+      "mix": "mixed_all",
+      "batch_size": 512,
+      "unique_schemas": 64,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 32147,
+      "allowed_density_mean": 0.029029130935668945,
+      "strategy": "select_triton_csr_1program",
+      "wall_p50_us": 42.9745,
+      "wall_p95_us": 44.055,
+      "wall_mean_us": 43.5,
+      "cuda_mean_us": 25.31839907169342,
+      "sequences_per_second": 20222447.657538835
+    },
+    {
+      "mix": "mixed_all",
+      "batch_size": 512,
+      "unique_schemas": 64,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 32147,
+      "allowed_density_mean": 0.029029130935668945,
+      "strategy": "step_csr_fused",
+      "wall_p50_us": 45.4825,
+      "wall_p95_us": 47.06,
+      "wall_mean_us": 46.11685,
+      "cuda_mean_us": 28.004801273345947,
+      "sequences_per_second": 18282579.297832932
+    },
+    {
+      "mix": "mixed_all",
+      "batch_size": 512,
+      "unique_schemas": 64,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 32147,
+      "allowed_density_mean": 0.029029130935668945,
+      "strategy": "advance_triton_dense_next",
+      "wall_p50_us": 26.165,
+      "wall_p95_us": 27.451,
+      "wall_mean_us": 26.3384,
+      "cuda_mean_us": 20.206399261951447,
+      "sequences_per_second": 25338507.53726784
+    },
+    {
+      "mix": "mixed_all",
+      "batch_size": 512,
+      "unique_schemas": 64,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 32147,
+      "allowed_density_mean": 0.029029130935668945,
+      "strategy": "advance_triton_byte_dfa",
+      "wall_p50_us": 39.870000000000005,
+      "wall_p95_us": 44.957,
+      "wall_mean_us": 41.00925,
+      "cuda_mean_us": 22.702400386333466,
+      "sequences_per_second": 22552681.27101736
+    },
+    {
+      "mix": "mixed_all",
+      "batch_size": 512,
+      "unique_schemas": 64,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 32147,
+      "allowed_density_mean": 0.029029130935668945,
+      "strategy": "step_bitset_dense_next",
+      "wall_p50_us": 81.622,
+      "wall_p95_us": 83.044,
+      "wall_mean_us": 82.0865,
+      "cuda_mean_us": 65.72800278663635,
+      "sequences_per_second": 7789678.345499622
+    },
+    {
+      "mix": "mixed_all",
+      "batch_size": 512,
+      "unique_schemas": 64,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 32147,
+      "allowed_density_mean": 0.029029130935668945,
+      "strategy": "step_bitset_byte_dfa",
+      "wall_p50_us": 95.673,
+      "wall_p95_us": 99.429,
+      "wall_mean_us": 96.4947,
+      "cuda_mean_us": 67.61599779129028,
+      "sequences_per_second": 7572172.514267793
+    },
+    {
+      "mix": "mixed_all",
+      "batch_size": 512,
+      "unique_schemas": 64,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 32147,
+      "allowed_density_mean": 0.029029130935668945,
+      "strategy": "cpu_sync_bitset_baseline",
+      "wall_p50_us": 363.278,
+      "wall_p95_us": 381.961,
+      "wall_mean_us": 382.99455,
+      "cuda_mean_us": null,
+      "sequences_per_second": 1336833.644238541
+    },
+    {
+      "mix": "mixed_sparse",
+      "batch_size": 64,
+      "unique_schemas": 38,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 6,
+      "allowed_density_mean": 6.961822509765625e-05,
+      "strategy": "mask_torch_dense",
+      "wall_p50_us": 66.5945,
+      "wall_p95_us": 82.584,
+      "wall_mean_us": 69.11765,
+      "cuda_mean_us": 52.54560112953186,
+      "sequences_per_second": 1217989.6818047916
+    },
+    {
+      "mix": "mixed_sparse",
+      "batch_size": 64,
+      "unique_schemas": 38,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 6,
+      "allowed_density_mean": 6.961822509765625e-05,
+      "strategy": "mask_triton_dense",
+      "wall_p50_us": 39.8245,
+      "wall_p95_us": 42.213,
+      "wall_mean_us": 40.7963,
+      "cuda_mean_us": 28.590399026870728,
+      "sequences_per_second": 2238513.7031438253
+    },
+    {
+      "mix": "mixed_sparse",
+      "batch_size": 64,
+      "unique_schemas": 38,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 6,
+      "allowed_density_mean": 6.961822509765625e-05,
+      "strategy": "mask_triton_bitset",
+      "wall_p50_us": 35.168,
+      "wall_p95_us": 36.664,
+      "wall_mean_us": 35.265699999999995,
+      "cuda_mean_us": 23.902399837970734,
+      "sequences_per_second": 2677555.410077747
+    },
+    {
+      "mix": "mixed_sparse",
+      "batch_size": 64,
+      "unique_schemas": 38,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 6,
+      "allowed_density_mean": 6.961822509765625e-05,
+      "strategy": "select_torch_dense",
+      "wall_p50_us": 76.965,
+      "wall_p95_us": 82.153,
+      "wall_mean_us": 78.09645,
+      "cuda_mean_us": 59.7104012966156,
+      "sequences_per_second": 1071840.058184763
+    },
+    {
+      "mix": "mixed_sparse",
+      "batch_size": 64,
+      "unique_schemas": 38,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 6,
+      "allowed_density_mean": 6.961822509765625e-05,
+      "strategy": "select_triton_dense_2stage",
+      "wall_p50_us": 50.019999999999996,
+      "wall_p95_us": 53.149,
+      "wall_mean_us": 50.7458,
+      "cuda_mean_us": 42.03999936580658,
+      "sequences_per_second": 1522359.680434598
+    },
+    {
+      "mix": "mixed_sparse",
+      "batch_size": 64,
+      "unique_schemas": 38,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 6,
+      "allowed_density_mean": 6.961822509765625e-05,
+      "strategy": "select_triton_bitset_2stage",
+      "wall_p50_us": 50.155,
+      "wall_p95_us": 52.859,
+      "wall_mean_us": 50.599000000000004,
+      "cuda_mean_us": 42.86560118198395,
+      "sequences_per_second": 1493038.6658591568
+    },
+    {
+      "mix": "mixed_sparse",
+      "batch_size": 64,
+      "unique_schemas": 38,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 6,
+      "allowed_density_mean": 6.961822509765625e-05,
+      "strategy": "select_triton_csr_1program",
+      "wall_p50_us": 32.714,
+      "wall_p95_us": 37.847,
+      "wall_mean_us": 33.68785,
+      "cuda_mean_us": 24.958400428295135,
+      "sequences_per_second": 2564266.89618473
+    },
+    {
+      "mix": "mixed_sparse",
+      "batch_size": 64,
+      "unique_schemas": 38,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 6,
+      "allowed_density_mean": 6.961822509765625e-05,
+      "strategy": "step_csr_fused",
+      "wall_p50_us": 35.3675,
+      "wall_p95_us": 37.536,
+      "wall_mean_us": 36.19605,
+      "cuda_mean_us": 27.52000093460083,
+      "sequences_per_second": 2325581.316370268
+    },
+    {
+      "mix": "mixed_sparse",
+      "batch_size": 64,
+      "unique_schemas": 38,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 6,
+      "allowed_density_mean": 6.961822509765625e-05,
+      "strategy": "advance_triton_dense_next",
+      "wall_p50_us": 25.9735,
+      "wall_p95_us": 27.15,
+      "wall_mean_us": 26.160649999999997,
+      "cuda_mean_us": 19.281600415706635,
+      "sequences_per_second": 3319226.548635772
+    },
+    {
+      "mix": "mixed_sparse",
+      "batch_size": 64,
+      "unique_schemas": 38,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 6,
+      "allowed_density_mean": 6.961822509765625e-05,
+      "strategy": "advance_triton_byte_dfa",
+      "wall_p50_us": 35.8535,
+      "wall_p95_us": 38.648,
+      "wall_mean_us": 36.2624,
+      "cuda_mean_us": 22.31999933719635,
+      "sequences_per_second": 2867383.597693204
+    },
+    {
+      "mix": "mixed_sparse",
+      "batch_size": 64,
+      "unique_schemas": 38,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 6,
+      "allowed_density_mean": 6.961822509765625e-05,
+      "strategy": "step_bitset_dense_next",
+      "wall_p50_us": 71.001,
+      "wall_p95_us": 75.343,
+      "wall_mean_us": 71.3792,
+      "cuda_mean_us": 62.71839737892151,
+      "sequences_per_second": 1020434.2373950584
+    },
+    {
+      "mix": "mixed_sparse",
+      "batch_size": 64,
+      "unique_schemas": 38,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 6,
+      "allowed_density_mean": 6.961822509765625e-05,
+      "strategy": "step_bitset_byte_dfa",
+      "wall_p50_us": 78.7425,
+      "wall_p95_us": 81.772,
+      "wall_mean_us": 79.30499999999999,
+      "cuda_mean_us": 65.99199771881104,
+      "sequences_per_second": 969814.5564967005
+    },
+    {
+      "mix": "mixed_sparse",
+      "batch_size": 64,
+      "unique_schemas": 38,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 6,
+      "allowed_density_mean": 6.961822509765625e-05,
+      "strategy": "cpu_sync_bitset_baseline",
+      "wall_p50_us": 144.6815,
+      "wall_p95_us": 158.387,
+      "wall_mean_us": 146.45305000000002,
+      "cuda_mean_us": null,
+      "sequences_per_second": 437000.1171023751
+    },
+    {
+      "mix": "mixed_sparse",
+      "batch_size": 512,
+      "unique_schemas": 63,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 8,
+      "allowed_density_mean": 6.538629531860352e-05,
+      "strategy": "mask_torch_dense",
+      "wall_p50_us": 172.823,
+      "wall_p95_us": 177.635,
+      "wall_mean_us": 173.29649999999998,
+      "cuda_mean_us": 148.3791947364807,
+      "sequences_per_second": 3450618.5379244345
+    },
+    {
+      "mix": "mixed_sparse",
+      "batch_size": 512,
+      "unique_schemas": 63,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 8,
+      "allowed_density_mean": 6.538629531860352e-05,
+      "strategy": "mask_triton_dense",
+      "wall_p50_us": 87.661,
+      "wall_p95_us": 90.585,
+      "wall_mean_us": 88.10805,
+      "cuda_mean_us": 60.097599029541016,
+      "sequences_per_second": 8519475.124926805
+    },
+    {
+      "mix": "mixed_sparse",
+      "batch_size": 512,
+      "unique_schemas": 63,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 8,
+      "allowed_density_mean": 6.538629531860352e-05,
+      "strategy": "mask_triton_bitset",
+      "wall_p50_us": 75.5875,
+      "wall_p95_us": 79.629,
+      "wall_mean_us": 76.09400000000001,
+      "cuda_mean_us": 48.17759990692139,
+      "sequences_per_second": 10627345.508891655
+    },
+    {
+      "mix": "mixed_sparse",
+      "batch_size": 512,
+      "unique_schemas": 63,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 8,
+      "allowed_density_mean": 6.538629531860352e-05,
+      "strategy": "select_torch_dense",
+      "wall_p50_us": 190.7705,
+      "wall_p95_us": 202.953,
+      "wall_mean_us": 192.26085,
+      "cuda_mean_us": 166.23040437698364,
+      "sequences_per_second": 3080062.2901624357
+    },
+    {
+      "mix": "mixed_sparse",
+      "batch_size": 512,
+      "unique_schemas": 63,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 8,
+      "allowed_density_mean": 6.538629531860352e-05,
+      "strategy": "select_triton_dense_2stage",
+      "wall_p50_us": 78.482,
+      "wall_p95_us": 81.342,
+      "wall_mean_us": 79.17975,
+      "cuda_mean_us": 50.0976026058197,
+      "sequences_per_second": 10220049.929904677
+    },
+    {
+      "mix": "mixed_sparse",
+      "batch_size": 512,
+      "unique_schemas": 63,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 8,
+      "allowed_density_mean": 6.538629531860352e-05,
+      "strategy": "select_triton_bitset_2stage",
+      "wall_p50_us": 78.973,
+      "wall_p95_us": 80.29,
+      "wall_mean_us": 79.40299999999999,
+      "cuda_mean_us": 50.1695990562439,
+      "sequences_per_second": 10205383.531688374
+    },
+    {
+      "mix": "mixed_sparse",
+      "batch_size": 512,
+      "unique_schemas": 63,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 8,
+      "allowed_density_mean": 6.538629531860352e-05,
+      "strategy": "select_triton_csr_1program",
+      "wall_p50_us": 38.317499999999995,
+      "wall_p95_us": 41.291,
+      "wall_mean_us": 39.148250000000004,
+      "cuda_mean_us": 25.18880069255829,
+      "sequences_per_second": 20326493.756062943
+    },
+    {
+      "mix": "mixed_sparse",
+      "batch_size": 512,
+      "unique_schemas": 63,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 8,
+      "allowed_density_mean": 6.538629531860352e-05,
+      "strategy": "step_csr_fused",
+      "wall_p50_us": 41.337,
+      "wall_p95_us": 44.487,
+      "wall_mean_us": 42.27275,
+      "cuda_mean_us": 27.78399884700775,
+      "sequences_per_second": 18427872.92136462
+    },
+    {
+      "mix": "mixed_sparse",
+      "batch_size": 512,
+      "unique_schemas": 63,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 8,
+      "allowed_density_mean": 6.538629531860352e-05,
+      "strategy": "advance_triton_dense_next",
+      "wall_p50_us": 25.929000000000002,
+      "wall_p95_us": 27.08,
+      "wall_mean_us": 26.135550000000002,
+      "cuda_mean_us": 20.049600303173065,
+      "sequences_per_second": 25536668.674585525
+    },
+    {
+      "mix": "mixed_sparse",
+      "batch_size": 512,
+      "unique_schemas": 63,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 8,
+      "allowed_density_mean": 6.538629531860352e-05,
+      "strategy": "advance_triton_byte_dfa",
+      "wall_p50_us": 39.604,
+      "wall_p95_us": 45.948,
+      "wall_mean_us": 40.6071,
+      "cuda_mean_us": 22.10240066051483,
+      "sequences_per_second": 23164904.47640243
+    },
+    {
+      "mix": "mixed_sparse",
+      "batch_size": 512,
+      "unique_schemas": 63,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 8,
+      "allowed_density_mean": 6.538629531860352e-05,
+      "strategy": "step_bitset_dense_next",
+      "wall_p50_us": 80.72550000000001,
+      "wall_p95_us": 82.423,
+      "wall_mean_us": 81.4047,
+      "cuda_mean_us": 63.56319785118103,
+      "sequences_per_second": 8054975.478086128
+    },
+    {
+      "mix": "mixed_sparse",
+      "batch_size": 512,
+      "unique_schemas": 63,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 8,
+      "allowed_density_mean": 6.538629531860352e-05,
+      "strategy": "step_bitset_byte_dfa",
+      "wall_p50_us": 94.1405,
+      "wall_p95_us": 96.093,
+      "wall_mean_us": 94.87015,
+      "cuda_mean_us": 66.05439782142639,
+      "sequences_per_second": 7751187.156139967
+    },
+    {
+      "mix": "mixed_sparse",
+      "batch_size": 512,
+      "unique_schemas": 63,
+      "allowed_min": 1,
+      "allowed_median": 2.0,
+      "allowed_max": 8,
+      "allowed_density_mean": 6.538629531860352e-05,
+      "strategy": "cpu_sync_bitset_baseline",
+      "wall_p50_us": 365.932,
+      "wall_p95_us": 374.79,
+      "wall_mean_us": 366.44715,
+      "cuda_mean_us": null,
+      "sequences_per_second": 1397200.11466865
+    },
+    {
+      "mix": "mixed_dense",
+      "batch_size": 64,
+      "unique_schemas": 27,
+      "allowed_min": 6,
+      "allowed_median": 1035.5,
+      "allowed_max": 32147,
+      "allowed_density_mean": 0.20519495010375977,
+      "strategy": "mask_torch_dense",
+      "wall_p50_us": 66.47399999999999,
+      "wall_p95_us": 74.471,
+      "wall_mean_us": 68.67755,
+      "cuda_mean_us": 52.956801652908325,
+      "sequences_per_second": 1208532.199876259
+    },
+    {
+      "mix": "mixed_dense",
+      "batch_size": 64,
+      "unique_schemas": 27,
+      "allowed_min": 6,
+      "allowed_median": 1035.5,
+      "allowed_max": 32147,
+      "allowed_density_mean": 0.20519495010375977,
+      "strategy": "mask_triton_dense",
+      "wall_p50_us": 40.1,
+      "wall_p95_us": 43.085,
+      "wall_mean_us": 40.50105,
+      "cuda_mean_us": 29.771199822425842,
+      "sequences_per_second": 2149728.609586992
+    },
+    {
+      "mix": "mixed_dense",
+      "batch_size": 64,
+      "unique_schemas": 27,
+      "allowed_min": 6,
+      "allowed_median": 1035.5,
+      "allowed_max": 32147,
+      "allowed_density_mean": 0.20519495010375977,
+      "strategy": "mask_triton_bitset",
+      "wall_p50_us": 35.8135,
+      "wall_p95_us": 42.594,
+      "wall_mean_us": 38.23175,
+      "cuda_mean_us": 23.916800320148468,
+      "sequences_per_second": 2675943.2341827033
+    },
+    {
+      "mix": "mixed_dense",
+      "batch_size": 64,
+      "unique_schemas": 27,
+      "allowed_min": 6,
+      "allowed_median": 1035.5,
+      "allowed_max": 32147,
+      "allowed_density_mean": 0.20519495010375977,
+      "strategy": "select_torch_dense",
+      "wall_p50_us": 77.79599999999999,
+      "wall_p95_us": 92.649,
+      "wall_mean_us": 79.56685,
+      "cuda_mean_us": 59.359997510910034,
+      "sequences_per_second": 1078167.1611127874
+    },
+    {
+      "mix": "mixed_dense",
+      "batch_size": 64,
+      "unique_schemas": 27,
+      "allowed_min": 6,
+      "allowed_median": 1035.5,
+      "allowed_max": 32147,
+      "allowed_density_mean": 0.20519495010375977,
+      "strategy": "select_triton_dense_2stage",
+      "wall_p50_us": 49.474000000000004,
+      "wall_p95_us": 53.761,
+      "wall_mean_us": 50.681850000000004,
+      "cuda_mean_us": 41.860800981521606,
+      "sequences_per_second": 1528876.6220276384
+    },
+    {
+      "mix": "mixed_dense",
+      "batch_size": 64,
+      "unique_schemas": 27,
+      "allowed_min": 6,
+      "allowed_median": 1035.5,
+      "allowed_max": 32147,
+      "allowed_density_mean": 0.20519495010375977,
+      "strategy": "select_triton_bitset_2stage",
+      "wall_p50_us": 51.1815,
+      "wall_p95_us": 61.252,
+      "wall_mean_us": 52.089800000000004,
+      "cuda_mean_us": 43.79839897155762,
+      "sequences_per_second": 1461240.6275754776
+    },
+    {
+      "mix": "mixed_dense",
+      "batch_size": 64,
+      "unique_schemas": 27,
+      "allowed_min": 6,
+      "allowed_median": 1035.5,
+      "allowed_max": 32147,
+      "allowed_density_mean": 0.20519495010375977,
+      "strategy": "select_triton_csr_1program",
+      "wall_p50_us": 38.097,
+      "wall_p95_us": 39.018,
+      "wall_mean_us": 38.44195,
+      "cuda_mean_us": 24.88960027694702,
+      "sequences_per_second": 2571355.0755283684
+    },
+    {
+      "mix": "mixed_dense",
+      "batch_size": 64,
+      "unique_schemas": 27,
+      "allowed_min": 6,
+      "allowed_median": 1035.5,
+      "allowed_max": 32147,
+      "allowed_density_mean": 0.20519495010375977,
+      "strategy": "step_csr_fused",
+      "wall_p50_us": 40.656000000000006,
+      "wall_p95_us": 42.543,
+      "wall_mean_us": 41.336400000000005,
+      "cuda_mean_us": 28.040000796318054,
+      "sequences_per_second": 2282453.5728402645
+    },
+    {
+      "mix": "mixed_dense",
+      "batch_size": 64,
+      "unique_schemas": 27,
+      "allowed_min": 6,
+      "allowed_median": 1035.5,
+      "allowed_max": 32147,
+      "allowed_density_mean": 0.20519495010375977,
+      "strategy": "advance_triton_dense_next",
+      "wall_p50_us": 26.064,
+      "wall_p95_us": 27.852,
+      "wall_mean_us": 26.8491,
+      "cuda_mean_us": 19.16159987449646,
+      "sequences_per_second": 3340013.3819296667
+    },
+    {
+      "mix": "mixed_dense",
+      "batch_size": 64,
+      "unique_schemas": 27,
+      "allowed_min": 6,
+      "allowed_median": 1035.5,
+      "allowed_max": 32147,
+      "allowed_density_mean": 0.20519495010375977,
+      "strategy": "advance_triton_byte_dfa",
+      "wall_p50_us": 36.219,
+      "wall_p95_us": 37.076,
+      "wall_mean_us": 36.331450000000004,
+      "cuda_mean_us": 22.71520048379898,
+      "sequences_per_second": 2817496.5942143593
+    },
+    {
+      "mix": "mixed_dense",
+      "batch_size": 64,
+      "unique_schemas": 27,
+      "allowed_min": 6,
+      "allowed_median": 1035.5,
+      "allowed_max": 32147,
+      "allowed_density_mean": 0.20519495010375977,
+      "strategy": "step_bitset_dense_next",
+      "wall_p50_us": 71.2615,
+      "wall_p95_us": 77.255,
+      "wall_mean_us": 72.4247,
+      "cuda_mean_us": 62.95679807662964,
+      "sequences_per_second": 1016570.1235647434
+    },
+    {
+      "mix": "mixed_dense",
+      "batch_size": 64,
+      "unique_schemas": 27,
+      "allowed_min": 6,
+      "allowed_median": 1035.5,
+      "allowed_max": 32147,
+      "allowed_density_mean": 0.20519495010375977,
+      "strategy": "step_bitset_byte_dfa",
+      "wall_p50_us": 86.995,
+      "wall_p95_us": 91.888,
+      "wall_mean_us": 88.03614999999999,
+      "cuda_mean_us": 66.1296010017395,
+      "sequences_per_second": 967796.5545008584
+    },
+    {
+      "mix": "mixed_dense",
+      "batch_size": 64,
+      "unique_schemas": 27,
+      "allowed_min": 6,
+      "allowed_median": 1035.5,
+      "allowed_max": 32147,
+      "allowed_density_mean": 0.20519495010375977,
+      "strategy": "cpu_sync_bitset_baseline",
+      "wall_p50_us": 151.1905,
+      "wall_p95_us": 172.999,
+      "wall_mean_us": 154.65325,
+      "cuda_mean_us": null,
+      "sequences_per_second": 413829.0013303955
+    },
+    {
+      "mix": "mixed_dense",
+      "batch_size": 512,
+      "unique_schemas": 55,
+      "allowed_min": 6,
+      "allowed_median": 965.0,
+      "allowed_max": 32147,
+      "allowed_density_mean": 0.22285330295562744,
+      "strategy": "mask_torch_dense",
+      "wall_p50_us": 169.398,
+      "wall_p95_us": 174.16,
+      "wall_mean_us": 169.5715,
+      "cuda_mean_us": 145.20000219345093,
+      "sequences_per_second": 3526170.745630286
+    },
+    {
+      "mix": "mixed_dense",
+      "batch_size": 512,
+      "unique_schemas": 55,
+      "allowed_min": 6,
+      "allowed_median": 965.0,
+      "allowed_max": 32147,
+      "allowed_density_mean": 0.22285330295562744,
+      "strategy": "mask_triton_dense",
+      "wall_p50_us": 83.3745,
+      "wall_p95_us": 86.85,
+      "wall_mean_us": 83.9173,
+      "cuda_mean_us": 56.1568021774292,
+      "sequences_per_second": 9117328.269197376
+    },
+    {
+      "mix": "mixed_dense",
+      "batch_size": 512,
+      "unique_schemas": 55,
+      "allowed_min": 6,
+      "allowed_median": 965.0,
+      "allowed_max": 32147,
+      "allowed_density_mean": 0.22285330295562744,
+      "strategy": "mask_triton_bitset",
+      "wall_p50_us": 76.07900000000001,
+      "wall_p95_us": 79.348,
+      "wall_mean_us": 76.58194999999999,
+      "cuda_mean_us": 48.22719991207123,
+      "sequences_per_second": 10616415.652028074
+    },
+    {
+      "mix": "mixed_dense",
+      "batch_size": 512,
+      "unique_schemas": 55,
+      "allowed_min": 6,
+      "allowed_median": 965.0,
+      "allowed_max": 32147,
+      "allowed_density_mean": 0.22285330295562744,
+      "strategy": "select_torch_dense",
+      "wall_p50_us": 185.973,
+      "wall_p95_us": 197.065,
+      "wall_mean_us": 187.8967,
+      "cuda_mean_us": 162.47040033340454,
+      "sequences_per_second": 3151343.25359775
+    },
+    {
+      "mix": "mixed_dense",
+      "batch_size": 512,
+      "unique_schemas": 55,
+      "allowed_min": 6,
+      "allowed_median": 965.0,
+      "allowed_max": 32147,
+      "allowed_density_mean": 0.22285330295562744,
+      "strategy": "select_triton_dense_2stage",
+      "wall_p50_us": 78.7425,
+      "wall_p95_us": 80.581,
+      "wall_mean_us": 79.16175000000001,
+      "cuda_mean_us": 50.095999240875244,
+      "sequences_per_second": 10220377.031270783
+    },
+    {
+      "mix": "mixed_dense",
+      "batch_size": 512,
+      "unique_schemas": 55,
+      "allowed_min": 6,
+      "allowed_median": 965.0,
+      "allowed_max": 32147,
+      "allowed_density_mean": 0.22285330295562744,
+      "strategy": "select_triton_bitset_2stage",
+      "wall_p50_us": 79.1035,
+      "wall_p95_us": 87.981,
+      "wall_mean_us": 80.513,
+      "cuda_mean_us": 50.065600872039795,
+      "sequences_per_second": 10226582.545340775
+    },
+    {
+      "mix": "mixed_dense",
+      "batch_size": 512,
+      "unique_schemas": 55,
+      "allowed_min": 6,
+      "allowed_median": 965.0,
+      "allowed_max": 32147,
+      "allowed_density_mean": 0.22285330295562744,
+      "strategy": "select_triton_csr_1program",
+      "wall_p50_us": 55.903,
+      "wall_p95_us": 57.937,
+      "wall_mean_us": 56.0191,
+      "cuda_mean_us": 27.747198939323425,
+      "sequences_per_second": 18452313.01075194
+    },
+    {
+      "mix": "mixed_dense",
+      "batch_size": 512,
+      "unique_schemas": 55,
+      "allowed_min": 6,
+      "allowed_median": 965.0,
+      "allowed_max": 32147,
+      "allowed_density_mean": 0.22285330295562744,
+      "strategy": "step_csr_fused",
+      "wall_p50_us": 58.832499999999996,
+      "wall_p95_us": 59.8,
+      "wall_mean_us": 58.7462,
+      "cuda_mean_us": 29.481598734855652,
+      "sequences_per_second": 17366765.099976417
+    },
+    {
+      "mix": "mixed_dense",
+      "batch_size": 512,
+      "unique_schemas": 55,
+      "allowed_min": 6,
+      "allowed_median": 965.0,
+      "allowed_max": 32147,
+      "allowed_density_mean": 0.22285330295562744,
+      "strategy": "advance_triton_dense_next",
+      "wall_p50_us": 26.0785,
+      "wall_p95_us": 29.564,
+      "wall_mean_us": 27.15865,
+      "cuda_mean_us": 19.564799964427948,
+      "sequences_per_second": 26169447.218008924
+    },
+    {
+      "mix": "mixed_dense",
+      "batch_size": 512,
+      "unique_schemas": 55,
+      "allowed_min": 6,
+      "allowed_median": 965.0,
+      "allowed_max": 32147,
+      "allowed_density_mean": 0.22285330295562744,
+      "strategy": "advance_triton_byte_dfa",
+      "wall_p50_us": 40.641,
+      "wall_p95_us": 41.602,
+      "wall_mean_us": 40.72885,
+      "cuda_mean_us": 22.90080040693283,
+      "sequences_per_second": 22357297.16438211
+    },
+    {
+      "mix": "mixed_dense",
+      "batch_size": 512,
+      "unique_schemas": 55,
+      "allowed_min": 6,
+      "allowed_median": 965.0,
+      "allowed_max": 32147,
+      "allowed_density_mean": 0.22285330295562744,
+      "strategy": "step_bitset_dense_next",
+      "wall_p50_us": 80.761,
+      "wall_p95_us": 83.175,
+      "wall_mean_us": 81.59595,
+      "cuda_mean_us": 63.547199964523315,
+      "sequences_per_second": 8057003.302833733
+    },
+    {
+      "mix": "mixed_dense",
+      "batch_size": 512,
+      "unique_schemas": 55,
+      "allowed_min": 6,
+      "allowed_median": 965.0,
+      "allowed_max": 32147,
+      "allowed_density_mean": 0.22285330295562744,
+      "strategy": "step_bitset_byte_dfa",
+      "wall_p50_us": 100.1795,
+      "wall_p95_us": 114.03,
+      "wall_mean_us": 101.7916,
+      "cuda_mean_us": 70.60800194740295,
+      "sequences_per_second": 7251302.7685076995
+    },
+    {
+      "mix": "mixed_dense",
+      "batch_size": 512,
+      "unique_schemas": 55,
+      "allowed_min": 6,
+      "allowed_median": 965.0,
+      "allowed_max": 32147,
+      "allowed_density_mean": 0.22285330295562744,
+      "strategy": "cpu_sync_bitset_baseline",
+      "wall_p50_us": 407.7645,
+      "wall_p95_us": 418.235,
+      "wall_mean_us": 407.1756,
+      "cuda_mean_us": null,
+      "sequences_per_second": 1257442.734780768
+    }
+  ]
+}

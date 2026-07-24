@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gpu-lr1"
+version = "0.1.0"
+description = "GPU feasibility prototype for heterogeneous LR(1) and JSON Schema constrained decoding"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.26",
+  "torch>=2.4",
+  "triton>=3.0",
+]
+
+[project.optional-dependencies]
+tokenizers = ["tiktoken>=0.9"]
+baselines = ["xgrammar>=0.1.29"]
+
+[project.scripts]
+gpu-lr1-bench = "gpu_lr1.benchmark:main"
+gpu-lr1-density-bench = "gpu_lr1.density_benchmark:main"
+gpu-lr1-lr-bench = "gpu_lr1.lr1_benchmark:main"
+gpu-lr1-stack-bench = "gpu_lr1.stack_benchmark:main"
+gpu-lr1-xgrammar-bench = "gpu_lr1.xgrammar_benchmark:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

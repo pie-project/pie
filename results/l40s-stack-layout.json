@@ -1,0 +1,328 @@
+{
+  "metadata": {
+    "timestamp_utc": "2026-07-24T02:46:24Z",
+    "platform": "Linux-6.8.0-52-generic-x86_64-with-glibc2.39",
+    "python": "3.12.3",
+    "torch": "2.8.0+cu129",
+    "cuda_runtime": "12.9",
+    "gpu": "NVIDIA L40S",
+    "gpu_memory_bytes": 47676129280,
+    "compute_capability": "8.9"
+  },
+  "config": {
+    "batch_sizes": [
+      32,
+      128,
+      512,
+      2048,
+      8192
+    ],
+    "max_depth": 1024,
+    "warmup": 20,
+    "iterations": 300,
+    "device": "cuda:0",
+    "output": "results/l40s-stack-layout.json"
+  },
+  "benchmarks": [
+    {
+      "batch_size": 32,
+      "max_depth": 1024,
+      "distribution": "same",
+      "layout": "row",
+      "wall_p50_us": 28.813,
+      "wall_p95_us": 36.084,
+      "cuda_mean_us": 22.30463981628418,
+      "updates_per_second": 1434679.0741107343
+    },
+    {
+      "batch_size": 32,
+      "max_depth": 1024,
+      "distribution": "same",
+      "layout": "depth",
+      "wall_p50_us": 29.524,
+      "wall_p95_us": 33.329,
+      "cuda_mean_us": 22.72981325785319,
+      "updates_per_second": 1407842.6266411997
+    },
+    {
+      "batch_size": 32,
+      "max_depth": 1024,
+      "distribution": "narrow",
+      "layout": "row",
+      "wall_p50_us": 29.174,
+      "wall_p95_us": 32.178,
+      "cuda_mean_us": 22.45034694671631,
+      "updates_per_second": 1425367.7270978866
+    },
+    {
+      "batch_size": 32,
+      "max_depth": 1024,
+      "distribution": "narrow",
+      "layout": "depth",
+      "wall_p50_us": 29.254,
+      "wall_p95_us": 31.457,
+      "cuda_mean_us": 22.45301405588786,
+      "updates_per_second": 1425198.413021464
+    },
+    {
+      "batch_size": 32,
+      "max_depth": 1024,
+      "distribution": "wide",
+      "layout": "row",
+      "wall_p50_us": 29.2335,
+      "wall_p95_us": 31.938,
+      "cuda_mean_us": 22.476266225179035,
+      "updates_per_second": 1423724.0153416586
+    },
+    {
+      "batch_size": 32,
+      "max_depth": 1024,
+      "distribution": "wide",
+      "layout": "depth",
+      "wall_p50_us": 29.3735,
+      "wall_p95_us": 31.578,
+      "cuda_mean_us": 22.38378683725993,
+      "updates_per_second": 1429606.1802524396
+    },
+    {
+      "batch_size": 128,
+      "max_depth": 1024,
+      "distribution": "same",
+      "layout": "row",
+      "wall_p50_us": 29.3335,
+      "wall_p95_us": 31.868,
+      "cuda_mean_us": 22.700479825337727,
+      "updates_per_second": 5638647.331900425
+    },
+    {
+      "batch_size": 128,
+      "max_depth": 1024,
+      "distribution": "same",
+      "layout": "depth",
+      "wall_p50_us": 29.2735,
+      "wall_p95_us": 30.966,
+      "cuda_mean_us": 22.40437348683675,
+      "updates_per_second": 5713170.246657596
+    },
+    {
+      "batch_size": 128,
+      "max_depth": 1024,
+      "distribution": "narrow",
+      "layout": "row",
+      "wall_p50_us": 29.048000000000002,
+      "wall_p95_us": 31.317,
+      "cuda_mean_us": 22.345813115437824,
+      "updates_per_second": 5728142.419287037
+    },
+    {
+      "batch_size": 128,
+      "max_depth": 1024,
+      "distribution": "narrow",
+      "layout": "depth",
+      "wall_p50_us": 29.1435,
+      "wall_p95_us": 31.838,
+      "cuda_mean_us": 22.277973492940266,
+      "updates_per_second": 5745585.433996603
+    },
+    {
+      "batch_size": 128,
+      "max_depth": 1024,
+      "distribution": "wide",
+      "layout": "row",
+      "wall_p50_us": 29.383499999999998,
+      "wall_p95_us": 31.317,
+      "cuda_mean_us": 22.38357384999593,
+      "updates_per_second": 5718479.133752061
+    },
+    {
+      "batch_size": 128,
+      "max_depth": 1024,
+      "distribution": "wide",
+      "layout": "depth",
+      "wall_p50_us": 29.404,
+      "wall_p95_us": 32.098,
+      "cuda_mean_us": 22.487999598185223,
+      "updates_per_second": 5691924.683702395
+    },
+    {
+      "batch_size": 512,
+      "max_depth": 1024,
+      "distribution": "same",
+      "layout": "row",
+      "wall_p50_us": 28.643,
+      "wall_p95_us": 37.376,
+      "cuda_mean_us": 22.041279474894207,
+      "updates_per_second": 23229141.51073607
+    },
+    {
+      "batch_size": 512,
+      "max_depth": 1024,
+      "distribution": "same",
+      "layout": "depth",
+      "wall_p50_us": 28.983,
+      "wall_p95_us": 39.879,
+      "cuda_mean_us": 22.448852856953938,
+      "updates_per_second": 22807401.48561305
+    },
+    {
+      "batch_size": 512,
+      "max_depth": 1024,
+      "distribution": "narrow",
+      "layout": "row",
+      "wall_p50_us": 28.933,
+      "wall_p95_us": 31.387,
+      "cuda_mean_us": 22.384533882141113,
+      "updates_per_second": 22872935.514126793
+    },
+    {
+      "batch_size": 512,
+      "max_depth": 1024,
+      "distribution": "narrow",
+      "layout": "depth",
+      "wall_p50_us": 29.094,
+      "wall_p95_us": 34.932,
+      "cuda_mean_us": 23.704959551493328,
+      "updates_per_second": 21598855.669329576
+    },
+    {
+      "batch_size": 512,
+      "max_depth": 1024,
+      "distribution": "wide",
+      "layout": "row",
+      "wall_p50_us": 28.858,
+      "wall_p95_us": 31.387,
+      "cuda_mean_us": 26.573012669881184,
+      "updates_per_second": 19267668.531250857
+    },
+    {
+      "batch_size": 512,
+      "max_depth": 1024,
+      "distribution": "wide",
+      "layout": "depth",
+      "wall_p50_us": 28.913,
+      "wall_p95_us": 32.449,
+      "cuda_mean_us": 22.335999806722004,
+      "updates_per_second": 22922636.301506143
+    },
+    {
+      "batch_size": 2048,
+      "max_depth": 1024,
+      "distribution": "same",
+      "layout": "row",
+      "wall_p50_us": 29.094,
+      "wall_p95_us": 31.097,
+      "cuda_mean_us": 22.40063985188802,
+      "updates_per_second": 91425959.86281106
+    },
+    {
+      "batch_size": 2048,
+      "max_depth": 1024,
+      "distribution": "same",
+      "layout": "depth",
+      "wall_p50_us": 28.9485,
+      "wall_p95_us": 31.316,
+      "cuda_mean_us": 22.5819730758667,
+      "updates_per_second": 90691809.4853586
+    },
+    {
+      "batch_size": 2048,
+      "max_depth": 1024,
+      "distribution": "narrow",
+      "layout": "row",
+      "wall_p50_us": 28.793,
+      "wall_p95_us": 30.716,
+      "cuda_mean_us": 22.28607972462972,
+      "updates_per_second": 91895928.99717706
+    },
+    {
+      "batch_size": 2048,
+      "max_depth": 1024,
+      "distribution": "narrow",
+      "layout": "depth",
+      "wall_p50_us": 29.184,
+      "wall_p95_us": 39.209,
+      "cuda_mean_us": 22.257919311523438,
+      "updates_per_second": 92012194.46148784
+    },
+    {
+      "batch_size": 2048,
+      "max_depth": 1024,
+      "distribution": "wide",
+      "layout": "row",
+      "wall_p50_us": 28.823,
+      "wall_p95_us": 31.216,
+      "cuda_mean_us": 22.490986188252766,
+      "updates_per_second": 91058701.59974079
+    },
+    {
+      "batch_size": 2048,
+      "max_depth": 1024,
+      "distribution": "wide",
+      "layout": "depth",
+      "wall_p50_us": 29.1035,
+      "wall_p95_us": 30.936,
+      "cuda_mean_us": 22.343039512634277,
+      "updates_per_second": 91661655.91937128
+    },
+    {
+      "batch_size": 8192,
+      "max_depth": 1024,
+      "distribution": "same",
+      "layout": "row",
+      "wall_p50_us": 28.778,
+      "wall_p95_us": 30.917,
+      "cuda_mean_us": 22.173226674397785,
+      "updates_per_second": 369454573.3147109
+    },
+    {
+      "batch_size": 8192,
+      "max_depth": 1024,
+      "distribution": "same",
+      "layout": "depth",
+      "wall_p50_us": 28.924,
+      "wall_p95_us": 30.536,
+      "cuda_mean_us": 22.052799860636394,
+      "updates_per_second": 371472105.66321254
+    },
+    {
+      "batch_size": 8192,
+      "max_depth": 1024,
+      "distribution": "narrow",
+      "layout": "row",
+      "wall_p50_us": 29.003,
+      "wall_p95_us": 32.208,
+      "cuda_mean_us": 22.477439244588215,
+      "updates_per_second": 364454327.3305632
+    },
+    {
+      "batch_size": 8192,
+      "max_depth": 1024,
+      "distribution": "narrow",
+      "layout": "depth",
+      "wall_p50_us": 29.069000000000003,
+      "wall_p95_us": 31.317,
+      "cuda_mean_us": 22.262293497721355,
+      "updates_per_second": 367976462.1214112
+    },
+    {
+      "batch_size": 8192,
+      "max_depth": 1024,
+      "distribution": "wide",
+      "layout": "row",
+      "wall_p50_us": 29.1185,
+      "wall_p95_us": 42.804,
+      "cuda_mean_us": 23.832640647888184,
+      "updates_per_second": 343730269.8023056
+    },
+    {
+      "batch_size": 8192,
+      "max_depth": 1024,
+      "distribution": "wide",
+      "layout": "depth",
+      "wall_p50_us": 28.778,
+      "wall_p95_us": 30.746,
+      "cuda_mean_us": 22.341119448343914,
+      "updates_per_second": 366678134.41225076
+    }
+  ]
+}

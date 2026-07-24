@@ -1,0 +1,198 @@
+{
+  "metadata": {
+    "timestamp_utc": "2026-07-24T03:04:48Z",
+    "platform": "Linux-6.8.0-52-generic-x86_64-with-glibc2.39",
+    "python": "3.12.3",
+    "torch": "2.8.0+cu129",
+    "cuda_runtime": "12.9",
+    "gpu": "NVIDIA L40S",
+    "gpu_memory_bytes": 47676129280,
+    "compute_capability": "8.9"
+  },
+  "config": {
+    "schemas": 14,
+    "vocab_size": 32768,
+    "batch_sizes": [
+      1,
+      8,
+      32,
+      128,
+      512
+    ],
+    "warmup": 8,
+    "iterations": 30,
+    "threads": 1,
+    "device": "cuda:0",
+    "output": "results/l40s-xgrammar-full.json",
+    "vocabulary_name": "tiktoken-gpt2-32768",
+    "logits_buffering": "rotating buffers across timed iterations"
+  },
+  "compile_seconds": 0.07168079167604446,
+  "benchmarks": [
+    {
+      "mix": "homogeneous",
+      "batch_size": 1,
+      "unique_schemas": 1,
+      "prefix_bytes_median": 0.0,
+      "fill_wall_p50_us": 1.382,
+      "fill_wall_p95_us": 1.993,
+      "full_wall_p50_us": 81.5265,
+      "full_wall_p95_us": 116.514,
+      "sequences_per_second": 11439.344022256388
+    },
+    {
+      "mix": "homogeneous",
+      "batch_size": 8,
+      "unique_schemas": 1,
+      "prefix_bytes_median": 20.5,
+      "fill_wall_p50_us": 3.941,
+      "fill_wall_p95_us": 4.777,
+      "full_wall_p50_us": 89.9195,
+      "full_wall_p95_us": 99.77,
+      "sequences_per_second": 87399.24960460943
+    },
+    {
+      "mix": "homogeneous",
+      "batch_size": 32,
+      "unique_schemas": 1,
+      "prefix_bytes_median": 21.5,
+      "fill_wall_p50_us": 12.719,
+      "fill_wall_p95_us": 15.303,
+      "full_wall_p50_us": 108.7025,
+      "full_wall_p95_us": 130.124,
+      "sequences_per_second": 291359.9041425915
+    },
+    {
+      "mix": "homogeneous",
+      "batch_size": 128,
+      "unique_schemas": 1,
+      "prefix_bytes_median": 21.5,
+      "fill_wall_p50_us": 56.429500000000004,
+      "fill_wall_p95_us": 59.469,
+      "full_wall_p50_us": 191.336,
+      "full_wall_p95_us": 206.81,
+      "sequences_per_second": 663237.7505255382
+    },
+    {
+      "mix": "homogeneous",
+      "batch_size": 512,
+      "unique_schemas": 1,
+      "prefix_bytes_median": 21.0,
+      "fill_wall_p50_us": 220.13400000000001,
+      "fill_wall_p95_us": 234.29,
+      "full_wall_p50_us": 513.823,
+      "full_wall_p95_us": 634.028,
+      "sequences_per_second": 958695.3354853216
+    },
+    {
+      "mix": "mixed4",
+      "batch_size": 1,
+      "unique_schemas": 1,
+      "prefix_bytes_median": 0.0,
+      "fill_wall_p50_us": 1.392,
+      "fill_wall_p95_us": 1.482,
+      "full_wall_p50_us": 79.3885,
+      "full_wall_p95_us": 95.934,
+      "sequences_per_second": 12324.033343904615
+    },
+    {
+      "mix": "mixed4",
+      "batch_size": 8,
+      "unique_schemas": 4,
+      "prefix_bytes_median": 30.0,
+      "fill_wall_p50_us": 3.981,
+      "fill_wall_p95_us": 4.697,
+      "full_wall_p50_us": 86.134,
+      "full_wall_p95_us": 100.08,
+      "sequences_per_second": 91093.1058839694
+    },
+    {
+      "mix": "mixed4",
+      "batch_size": 32,
+      "unique_schemas": 4,
+      "prefix_bytes_median": 32.0,
+      "fill_wall_p50_us": 17.676499999999997,
+      "fill_wall_p95_us": 18.127,
+      "full_wall_p50_us": 111.97200000000001,
+      "full_wall_p95_us": 131.807,
+      "sequences_per_second": 278838.99574973853
+    },
+    {
+      "mix": "mixed4",
+      "batch_size": 128,
+      "unique_schemas": 4,
+      "prefix_bytes_median": 36.0,
+      "fill_wall_p50_us": 75.6235,
+      "fill_wall_p95_us": 87.271,
+      "full_wall_p50_us": 199.518,
+      "full_wall_p95_us": 212.047,
+      "sequences_per_second": 635393.3978654754
+    },
+    {
+      "mix": "mixed4",
+      "batch_size": 512,
+      "unique_schemas": 4,
+      "prefix_bytes_median": 36.0,
+      "fill_wall_p50_us": 288.226,
+      "fill_wall_p95_us": 303.614,
+      "full_wall_p50_us": 600.523,
+      "full_wall_p95_us": 734.288,
+      "sequences_per_second": 788796.460933212
+    },
+    {
+      "mix": "mixed_all",
+      "batch_size": 1,
+      "unique_schemas": 1,
+      "prefix_bytes_median": 0.0,
+      "fill_wall_p50_us": 1.3725,
+      "fill_wall_p95_us": 1.512,
+      "full_wall_p50_us": 78.3075,
+      "full_wall_p95_us": 91.977,
+      "sequences_per_second": 12380.052763784879
+    },
+    {
+      "mix": "mixed_all",
+      "batch_size": 8,
+      "unique_schemas": 8,
+      "prefix_bytes_median": 30.0,
+      "fill_wall_p50_us": 4.161,
+      "fill_wall_p95_us": 4.397,
+      "full_wall_p50_us": 86.023,
+      "full_wall_p95_us": 104.096,
+      "sequences_per_second": 90854.19983002695
+    },
+    {
+      "mix": "mixed_all",
+      "batch_size": 32,
+      "unique_schemas": 14,
+      "prefix_bytes_median": 45.0,
+      "fill_wall_p50_us": 13.594999999999999,
+      "fill_wall_p95_us": 14.993,
+      "full_wall_p50_us": 106.7945,
+      "full_wall_p95_us": 125.748,
+      "sequences_per_second": 294047.2883173481
+    },
+    {
+      "mix": "mixed_all",
+      "batch_size": 128,
+      "unique_schemas": 14,
+      "prefix_bytes_median": 42.0,
+      "fill_wall_p50_us": 63.244,
+      "fill_wall_p95_us": 76.234,
+      "full_wall_p50_us": 185.4525,
+      "full_wall_p95_us": 204.876,
+      "sequences_per_second": 680938.1128332185
+    },
+    {
+      "mix": "mixed_all",
+      "batch_size": 512,
+      "unique_schemas": 14,
+      "prefix_bytes_median": 42.5,
+      "fill_wall_p50_us": 360.6095,
+      "fill_wall_p95_us": 382.932,
+      "full_wall_p50_us": 789.4195,
+      "full_wall_p95_us": 811.533,
+      "sequences_per_second": 648346.9811217062
+    }
+  ]
+}
