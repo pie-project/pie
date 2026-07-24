@@ -303,6 +303,16 @@ fn has_dense_device_mask(request: &crate::driver::LaunchPlan) -> bool {
     request.has_user_mask && request.masks.is_empty()
 }
 
+/// `PIE_SCHED_NO_MIX`: restore geometry-class-homogeneous wave batches
+/// (pre-sub-batch behavior). Read once; A/B control for attributing
+/// batch-composition token drift vs mixed-step defects.
+fn sched_no_mix() -> bool {
+    static NO_MIX: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *NO_MIX.get_or_init(|| {
+        std::env::var("PIE_SCHED_NO_MIX").is_ok_and(|v| v != "0" && !v.is_empty())
+    })
+}
+
 impl LaunchGrouping {
     pub(crate) fn accepts(
         &self,
@@ -319,7 +329,14 @@ impl LaunchGrouping {
         // wire-first and the driver composes the envelope suffix on device
         // via the offset fixed-decode compose. The mask/solo exclusions
         // below still keep dense-masked and wire-masked device-geometry
-        // fires out of shared batches.
+        // fires out of shared batches. `PIE_SCHED_NO_MIX` restores the
+        // per-class split (A/B control lever for drift attribution).
+        if self.count != 0
+            && request.request.device_resolved_geometry != self.lead_device_geometry
+            && sched_no_mix()
+        {
+            return false;
+        }
         if request
             .pipeline_id
             .is_some_and(|pid| self.pipelines.contains(&pid))
@@ -3546,22 +3563,6 @@ impl BatchScheduler {
                 {
                     timing.ready_us = Some(now_us);
                 }
-            }
-        }
-        // TEMP DIAG (remove before landing).
-        if super::sched_trace_enabled() {
-            for (index, wave) in survivors.iter().enumerate() {
-                if wave.is_empty() {
-                    continue;
-                }
-                let envelope = wave
-                    .iter()
-                    .filter(|r| r.request.device_resolved_geometry)
-                    .count();
-                eprintln!(
-                    "[sched] frame wave{index}: wire={} envelope={envelope}",
-                    wave.len() - envelope
-                );
             }
         }
         let (submission, requests) =

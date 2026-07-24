@@ -556,7 +556,31 @@ Metal driver: step-loop internally (same C ABI).
   4. Certify: oracles unchanged (solo lanes never mix); c0-256 ramp at
      k∈{1,2} (arrival-heavy → mixed boundaries), 2048×32 sweep parity;
      compare step counts (sched trace) to confirm mixing engages.
-  ROUND STATUS (checkpoint): steps 1–3 IMPLEMENTED (offset fixed-decode
+  ROUND 3 COMPLETE — engagement + correctness + perf:
+  - Engagement PROVEN with --mixed-phase (staggered lengths; uniform
+    canonical shapes NEVER mix — whole cohorts replace together): 64 req
+    c16 k=2 → 9 mixed steps ([sched] MIXED step wire=3..8
+    envelope=8..13), ZERO compose kills, 64/64 completed.
+  - Correctness gates: token mismatches k1-vs-k2 (15/64) are BATCH-
+    COMPOSITION TIE-BREAK DRIFT, not corruption — the PIE_SCHED_NO_MIX
+    control (mixing disabled, same build) shows the same profile (11/64,
+    overlapping indices), divergence pairs FLIP SYMMETRICALLY across
+    requests (311↔1380 both directions), and solo oracles stay exact.
+    This is why certification uses solo oracles: fleet token equality
+    across different step compositions was never a valid gate.
+  - Perf: mixed vs split at k=2 --mixed-phase 512×96 c128:
+    12.64/12.47k vs 12.62/12.51k — parity (value is structural: step
+    count fixed at k, fewer launches, futureproof for smaller T_gpu).
+  - PIE_SCHED_NO_MIX retained ONE round as the drift-attribution A/B
+    lever — delete after the next certification cycle (dormant-lever
+    discipline). The [sched] MIXED step trace line stays (gated, the
+    only engagement signal).
+  - NOTE: scheduler test `pipeline_close_drains_the_already_submitted_
+    run_ahead_tail` is PRE-EXISTING flaky under the parallel full suite
+    (baseline 5b9f30ff5: 2/10 runs fail; with ⑤: 1/10 — statistically
+    identical; solo: 0/3). "driver published RETRY at frame settle" from
+    the dummy driver's 25ms callback race. Not chased this round.
+  Earlier checkpoint: steps 1–3 IMPLEMENTED (offset fixed-decode
   compose + FixedDecodeScope; mixed template acceptance with full-width
   reserves + mixed_envelope flag + unavailable extents for envelope
   lanes; engine grouping gate removed, wire-first sort, true sub_batch
