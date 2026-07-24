@@ -646,7 +646,7 @@ async fn suspend_restore(pid: uuid::Uuid, working_sets: HashSet<WorkingSetId>) -
         // so an error below returns every unconsumed page through its Drop.
         let prepared =
             crate::store::registry::with_kv_lock(&stores.kv, "preemption-restore", |kv| {
-                kv.prepare_restore(&working_sets, grant.lend())
+                kv.prepare_restore(&working_sets, grant.lend_kv())
             });
         drop(grant);
         let txn = match prepared {

@@ -70,6 +70,24 @@ pub fn prepare_many(
     store: &mut RsStore,
     working_sets: &[RsWorkingSetId],
 ) -> Result<(Vec<u32>, Vec<u8>, (Vec<u32>, Vec<u32>), Vec<RsTxn>), String> {
+    prepare_many_impl(store, working_sets, None)
+}
+
+/// [`prepare_many`] from caller-owned reserved slots (the acquisition
+/// grant), consuming exactly the required prefix of `granted`.
+pub fn prepare_many_reserved(
+    store: &mut RsStore,
+    working_sets: &[RsWorkingSetId],
+    granted: &mut Vec<crate::store::rs::RsSlotId>,
+) -> Result<(Vec<u32>, Vec<u8>, (Vec<u32>, Vec<u32>), Vec<RsTxn>), String> {
+    prepare_many_impl(store, working_sets, Some(granted))
+}
+
+fn prepare_many_impl(
+    store: &mut RsStore,
+    working_sets: &[RsWorkingSetId],
+    mut granted: Option<&mut Vec<crate::store::rs::RsSlotId>>,
+) -> Result<(Vec<u32>, Vec<u8>, (Vec<u32>, Vec<u32>), Vec<RsTxn>), String> {
     for (index, ws) in working_sets.iter().enumerate() {
         if working_sets[..index].contains(ws) {
             return Err(format!(
@@ -84,7 +102,11 @@ pub fn prepare_many(
     let mut copy_dst = Vec::new();
     let mut txns = Vec::with_capacity(working_sets.len());
     for &ws in working_sets {
-        let prepared = match store.prepare_write(ws, true, None) {
+        let prepared = match granted.as_deref_mut() {
+            Some(granted) => store.prepare_write_reserved(ws, true, None, granted),
+            None => store.prepare_write(ws, true, None),
+        };
+        let prepared = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
                 abandon_many(store, txns);

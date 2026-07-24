@@ -344,27 +344,21 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     // FCFS preempt/restore, never an inferlet error; there is no legacy
     // mode. `max_concurrent_processes` stays a physical safety cap only.
     // The suspend rung arms by CAPABILITY, not policy: a driver that
-    // advertises D2H+H2D KV copies gets the active self-suspend backend;
-    // one that cannot move KV bytes (no host swap transport) degrades to
-    // pool-only orchestration — waiters ride idle reclaim and natural
-    // frees. The existing `scheduler.restore_pause_at_utilization` config
-    // gates the restore anti-thrash pause.
-    let backend: Box<dyn crate::store::reclaim::ReclaimBackend> = if kv_swap_capable {
-        Box::new(crate::store::reclaim::SelfSuspendBackend::new(
-            arena_model_idx,
-            0,
-        ))
-    } else {
-        Box::new(crate::store::reclaim::KvPoolBackend::new(
-            arena_model_idx,
-            0,
-        ))
-    };
-    crate::store::reclaim::init_contention(crate::store::reclaim::ContentionOrchestrator::new(
-        backend,
-        scheduler.restore_pause_at_utilization,
-        contention_config,
-    ));
+    // advertises D2H+H2D KV copies gets active self-suspend; one that
+    // cannot move KV bytes (no host swap transport) degrades to pool-only
+    // orchestration — waiters ride idle reclaim and natural frees.
+    crate::store::reclaim::init_contention(
+        arena_model_idx,
+        0,
+        crate::store::reclaim::ContentionOrchestrator::new(
+            std::sync::Arc::new(crate::store::reclaim::RegistryPool::new(
+                arena_model_idx,
+                0,
+                kv_swap_capable,
+            )),
+            contention_config,
+        ),
+    );
 
     // (Context actor `context::spawn` removed — Phase 5. The unified arena
     // registry above is the per-model/driver physical home now.)
@@ -527,19 +521,10 @@ fn verify_config(config: &Config) -> Result<()> {
             model.name
         );
     }
-    // `restore_pause_at_utilization` is a GPU-utilization fraction in (0.0, 1.0]:
-    // the restore loop pauses while any driver's page utilization exceeds it.
-    // A value <= 0.0 makes the check `utilization > threshold` true even on an
-    // empty GPU (utilization == 0.0), so restore is paused forever and any
-    // suspended context's deferred page op deadlocks. Reject it fast here rather
-    // than hang at runtime.
-    ensure!(
-        model.scheduler.restore_pause_at_utilization > 0.0
-            && model.scheduler.restore_pause_at_utilization <= 1.0,
-        "Model {:?}: scheduler.restore_pause_at_utilization must be in (0.0, 1.0], got {}",
-        model.name,
-        model.scheduler.restore_pause_at_utilization
-    );
+    // (`scheduler.restore_pause_at_utilization` is accepted for config
+    // compatibility but no longer consulted: head-first-claim subsumed the
+    // restore utilization pause — a restore proceeds exactly when it is the
+    // queue head or fits in the surplus beyond the head's accumulation.)
 
     Ok(())
 }
