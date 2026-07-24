@@ -14,137 +14,137 @@
     {
       "profile": "narrow",
       "batch_size": 1,
-      "gpugrammar_ragged_us": 86.3765,
-      "flashinfer_unconstrained_us": 282.202,
-      "xgrammar_gpu_mask_us": 334.245,
-      "xgrammar_full_path_us": 963.23,
-      "speedup_vs_unconstrained": 3.2671154770105297
+      "gpugrammar_ragged_us": 83.2855,
+      "flashinfer_unconstrained_us": 295.03150000000005,
+      "xgrammar_gpu_mask_us": 336.83,
+      "xgrammar_full_path_us": 1043.992,
+      "speedup_vs_unconstrained": 3.5424113441115206
     },
     {
       "profile": "narrow",
       "batch_size": 32,
-      "gpugrammar_ragged_us": 87.2735,
-      "flashinfer_unconstrained_us": 565.9525,
-      "xgrammar_gpu_mask_us": 577.0985000000001,
-      "xgrammar_full_path_us": 5969.946,
-      "speedup_vs_unconstrained": 6.484814978200713
+      "gpugrammar_ragged_us": 90.61500000000001,
+      "flashinfer_unconstrained_us": 522.5464999999999,
+      "xgrammar_gpu_mask_us": 563.2735,
+      "xgrammar_full_path_us": 7994.538,
+      "speedup_vs_unconstrained": 5.766666666666665
     },
     {
       "profile": "narrow",
       "batch_size": 128,
-      "gpugrammar_ragged_us": 85.4745,
-      "flashinfer_unconstrained_us": 1071.813,
-      "xgrammar_gpu_mask_us": 1117.578,
-      "xgrammar_full_path_us": 6018.718,
-      "speedup_vs_unconstrained": 12.539564431497114
+      "gpugrammar_ragged_us": 90.6095,
+      "flashinfer_unconstrained_us": 1065.277,
+      "xgrammar_gpu_mask_us": 1116.067,
+      "xgrammar_full_path_us": 9224.108,
+      "speedup_vs_unconstrained": 11.756791506409373
     },
     {
       "profile": "narrow",
       "batch_size": 512,
-      "gpugrammar_ragged_us": 86.0005,
-      "flashinfer_unconstrained_us": 3433.902,
-      "xgrammar_gpu_mask_us": 3775.3755,
-      "xgrammar_full_path_us": 10030.019,
-      "speedup_vs_unconstrained": 39.928860878715824
+      "gpugrammar_ragged_us": 90.4785,
+      "flashinfer_unconstrained_us": 3456.849,
+      "xgrammar_gpu_mask_us": 3764.5640000000003,
+      "xgrammar_full_path_us": 10312.704,
+      "speedup_vs_unconstrained": 38.206303154893156
     },
     {
       "profile": "narrow",
       "batch_size": 2048,
-      "gpugrammar_ragged_us": 155.3555,
-      "flashinfer_unconstrained_us": 13004.823,
-      "xgrammar_gpu_mask_us": 14529.884,
-      "xgrammar_full_path_us": 29480.604,
-      "speedup_vs_unconstrained": 83.71009072739619
+      "gpugrammar_ragged_us": 165.34949999999998,
+      "flashinfer_unconstrained_us": 13017.716,
+      "xgrammar_gpu_mask_us": 14539.772,
+      "xgrammar_full_path_us": 29287.784,
+      "speedup_vs_unconstrained": 78.72848723461517
     },
     {
       "profile": "wide",
       "batch_size": 1,
-      "gpugrammar_ragged_us": 6191.411,
-      "flashinfer_unconstrained_us": 271.868,
-      "xgrammar_gpu_mask_us": 385.0895,
-      "xgrammar_full_path_us": 1041.948,
-      "speedup_vs_unconstrained": 0.04391050763711212
+      "gpugrammar_ragged_us": 1430.6644999999999,
+      "flashinfer_unconstrained_us": 303.4475,
+      "xgrammar_gpu_mask_us": 399.85749999999996,
+      "xgrammar_full_path_us": 1034.945,
+      "speedup_vs_unconstrained": 0.21210248803964873
     },
     {
       "profile": "wide",
       "batch_size": 32,
-      "gpugrammar_ragged_us": 6531.210999999999,
-      "flashinfer_unconstrained_us": 539.0419999999999,
-      "xgrammar_gpu_mask_us": 639.5655,
-      "xgrammar_full_path_us": 3918.954,
-      "speedup_vs_unconstrained": 0.0825332392415434
+      "gpugrammar_ragged_us": 1539.654,
+      "flashinfer_unconstrained_us": 557.2515000000001,
+      "xgrammar_gpu_mask_us": 650.842,
+      "xgrammar_full_path_us": 5919.629,
+      "speedup_vs_unconstrained": 0.36193294077760335
     },
     {
       "profile": "wide",
       "batch_size": 128,
-      "gpugrammar_ragged_us": 10097.3095,
-      "flashinfer_unconstrained_us": 1082.2179999999998,
-      "xgrammar_gpu_mask_us": 1223.1055000000001,
-      "xgrammar_full_path_us": 4952.445,
-      "speedup_vs_unconstrained": 0.10717884798915987
+      "gpugrammar_ragged_us": 2298.593,
+      "flashinfer_unconstrained_us": 1080.46,
+      "xgrammar_gpu_mask_us": 1220.0565000000001,
+      "xgrammar_full_path_us": 6027.19,
+      "speedup_vs_unconstrained": 0.47005276706228555
     },
     {
       "profile": "wide",
       "batch_size": 512,
-      "gpugrammar_ragged_us": 11601.7065,
-      "flashinfer_unconstrained_us": 3453.5985,
-      "xgrammar_gpu_mask_us": 3962.6555,
-      "xgrammar_full_path_us": 10360.151,
-      "speedup_vs_unconstrained": 0.29768021626818436
+      "gpugrammar_ragged_us": 5878.5015,
+      "flashinfer_unconstrained_us": 3442.4065,
+      "xgrammar_gpu_mask_us": 3971.5065,
+      "xgrammar_full_path_us": 10962.718,
+      "speedup_vs_unconstrained": 0.5855925187737044
     },
     {
       "profile": "wide",
       "batch_size": 2048,
-      "gpugrammar_ragged_us": 46696.1765,
-      "flashinfer_unconstrained_us": 13017.4875,
-      "xgrammar_gpu_mask_us": 15163.011999999999,
-      "xgrammar_full_path_us": 25237.535,
-      "speedup_vs_unconstrained": 0.2787698795853232
+      "gpugrammar_ragged_us": 20512.9215,
+      "flashinfer_unconstrained_us": 13018.6575,
+      "xgrammar_gpu_mask_us": 15169.6345,
+      "xgrammar_full_path_us": 25972.113,
+      "speedup_vs_unconstrained": 0.6346564286320697
     },
     {
       "profile": "mixed",
       "batch_size": 1,
-      "gpugrammar_ragged_us": 6194.1205,
-      "flashinfer_unconstrained_us": 309.7285,
-      "xgrammar_gpu_mask_us": 408.318,
-      "xgrammar_full_path_us": 1066.213,
-      "speedup_vs_unconstrained": 0.05000362844087389
+      "gpugrammar_ragged_us": 1426.002,
+      "flashinfer_unconstrained_us": 280.34950000000003,
+      "xgrammar_gpu_mask_us": 391.837,
+      "xgrammar_full_path_us": 1063.388,
+      "speedup_vs_unconstrained": 0.1965982516153554
     },
     {
       "profile": "mixed",
       "batch_size": 32,
-      "gpugrammar_ragged_us": 6539.9425,
-      "flashinfer_unconstrained_us": 519.04,
-      "xgrammar_gpu_mask_us": 625.9,
-      "xgrammar_full_path_us": 3031.756,
-      "speedup_vs_unconstrained": 0.07936461215064199
+      "gpugrammar_ragged_us": 1538.0655000000002,
+      "flashinfer_unconstrained_us": 575.0455,
+      "xgrammar_gpu_mask_us": 647.0455,
+      "xgrammar_full_path_us": 3095.949,
+      "speedup_vs_unconstrained": 0.37387581998295905
     },
     {
       "profile": "mixed",
       "batch_size": 128,
-      "gpugrammar_ragged_us": 9960.012999999999,
-      "flashinfer_unconstrained_us": 1081.9325,
-      "xgrammar_gpu_mask_us": 1188.6664999999998,
-      "xgrammar_full_path_us": 4854.232,
-      "speedup_vs_unconstrained": 0.10862761926113952
+      "gpugrammar_ragged_us": 2258.538,
+      "flashinfer_unconstrained_us": 1071.478,
+      "xgrammar_gpu_mask_us": 1188.1765,
+      "xgrammar_full_path_us": 5271.474,
+      "speedup_vs_unconstrained": 0.47441220825153263
     },
     {
       "profile": "mixed",
       "batch_size": 512,
-      "gpugrammar_ragged_us": 10802.6185,
-      "flashinfer_unconstrained_us": 3450.2585,
-      "xgrammar_gpu_mask_us": 3910.768,
-      "xgrammar_full_path_us": 9857.111,
-      "speedup_vs_unconstrained": 0.31939094211278496
+      "gpugrammar_ragged_us": 3636.8085,
+      "flashinfer_unconstrained_us": 3436.8495000000003,
+      "xgrammar_gpu_mask_us": 3900.1854999999996,
+      "xgrammar_full_path_us": 10078.631,
+      "speedup_vs_unconstrained": 0.9450180013602586
     },
     {
       "profile": "mixed",
       "batch_size": 2048,
-      "gpugrammar_ragged_us": 23769.1155,
-      "flashinfer_unconstrained_us": 13066.4585,
-      "xgrammar_gpu_mask_us": 14925.724,
-      "xgrammar_full_path_us": 27983.307,
-      "speedup_vs_unconstrained": 0.5497242209117963
+      "gpugrammar_ragged_us": 10994.4825,
+      "flashinfer_unconstrained_us": 12993.163,
+      "xgrammar_gpu_mask_us": 14942.497,
+      "xgrammar_full_path_us": 30829.351,
+      "speedup_vs_unconstrained": 1.1817894111887486
     }
   ]
 }

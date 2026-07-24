@@ -154,12 +154,20 @@ JSON *string* state over Qwen3 allows **146,924 of 151,669 tokens**, needing
 `BLOCK_SIZE` 262,144 — the kernel raises rather than runs. The density sweep
 already shows CSR losing to dense/bitset beyond ~8,192 allowed tokens.
 
-**Status.** The 32,768 cap is now removed: `ragged_sampler.py` streams a row in
-tiles, so rows of any width are correct (verified at 147,144). But streaming is
-**not** a solution — measured, a wide row costs 6.2 ms at batch 1 and 46.7 ms at
-batch 2,048 against 0.27 ms / 13.0 ms for unconstrained FlashInfer, because each
-of the 32 bisection probes re-gathers the row through its index list. Correct
-and unusably slow.
+**Status.** The 32,768 cap is removed and the complement path is implemented.
+Streaming the allowed list was correct but unusably slow (6.2 ms at batch 1,
+46.7 ms at batch 2,048, against 0.27 / 13.0 ms for unconstrained FlashInfer)
+because every bisection probe re-gathered the row through its index list. The
+wide kernel now reads logits **contiguously** and tests membership against an
+18.5 KiB per-state bitset, and each sweep evaluates 8 candidate thresholds at
+once so the search costs 8 passes instead of 32. Wide rows dropped to 1.43 ms
+at batch 1 and 20.5 ms at batch 2,048 — a 4.3x improvement, and now 1.6x of
+unconstrained sampling rather than 3.6x.
+
+The remaining wide-row gap is **parallelism, not algorithm**: one program per
+sequence means batch 1 occupies a single SM while sweeping 151,669 logits
+eleven times. Splitting a wide row across several CTAs with a two-level
+reduction is the next step and should mostly close the small-batch gap.
 
 *Why hard, and why it is the most promising contribution:* real grammar states
 are bimodal — either a handful of allowed tokens (structural positions: 396–759
@@ -266,9 +274,20 @@ Measured on A100 with Qwen3 and XGrammar's builtin JSON grammar (median wall,
 | 512 | 86.0 µs | 3,433.9 µs | 10,030.0 µs | 39.9× |
 | 2,048 | 155.4 µs | 13,004.8 µs | 29,480.6 µs | **83.7×** |
 
-The remaining gap is the wide bucket: mixed batches still run at 0.1–0.5× of
-unconstrained because the streaming path dominates. C10 is therefore only half
-retired, and the wide half is now the critical path (see C3).
+With the complement path added for the wide bucket (see C3), a realistic mixed
+batch — 51.4% string-body sequences, matching the measured composition of a JSON
+document — now crosses over:
+
+| batch | mixed: gpugrammar | FlashInfer unconstrained | XGrammar full path |
+|---:|---:|---:|---:|
+| 128 | 2,258.5 µs | 1,071.5 µs | 5,271.5 µs |
+| 512 | 3,636.8 µs | 3,436.8 µs | 10,078.6 µs |
+| 2,048 | **10,994.5 µs** | 12,993.2 µs | 30,829.4 µs |
+
+At batch 2,048 constrained sampling is 1.2x faster than sampling with no
+constraint at all and 2.8x faster than the deployed XGrammar path. Below batch
+512 the wide bucket's single-CTA-per-sequence layout still dominates, so C10 is
+retired for narrow rows and for large batches, and open for small batches.
 
 ## Decision 1: API surface for release
 

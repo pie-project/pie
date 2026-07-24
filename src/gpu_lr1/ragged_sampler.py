@@ -32,6 +32,9 @@ import triton.language as tl
 
 DEFAULT_BISECT_STEPS = 32
 MAX_SINGLE_TILE = 8192
+WIDE_BLOCK = 4096
+WIDE_PROBES = 8
+WIDE_ROUNDS = 8
 
 
 @triton.jit
@@ -131,7 +134,11 @@ def _ragged_sample_single_tile_kernel(
     target = uniform * kept_mass
     reached = (cumulative >= target) & (kept > 0.0)
     chosen = tl.min(tl.where(reached, offsets, BLOCK), axis=0)
-    chosen = tl.where(chosen < BLOCK, chosen, 0)
+    # A tree reduction and a scan need not agree to the last bit, so a uniform
+    # near 1 can overshoot the scan. The intended draw is then the final
+    # surviving token, never the first one.
+    last_kept = tl.max(tl.where(kept > 0.0, offsets, 0), axis=0)
+    chosen = tl.where(chosen < BLOCK, chosen, last_kept)
 
     picked = tl.sum(tl.where(offsets == chosen, tokens, 0), axis=0)
     token = tl.where(length > 0, picked, -1)
@@ -263,6 +270,7 @@ def _ragged_sample_tiled_kernel(
     target = uniform * kept_mass
     running = 0.0
     chosen = -1
+    last_kept = 0
     for base in range(0, length, BLOCK):
         valid = base + offsets < length
         tokens = tl.load(
@@ -280,9 +288,12 @@ def _ragged_sample_tiled_kernel(
         reached = (cumulative >= target) & (kept > 0.0)
         local = tl.min(tl.where(reached, base + offsets, length), axis=0)
         chosen = tl.where((chosen < 0) & (local < length), local, chosen)
+        last_kept = tl.max(
+            tl.where(kept > 0.0, base + offsets, last_kept), axis=0
+        )
         running += tl.sum(kept, axis=0)
 
-    chosen = tl.where(chosen < 0, 0, chosen)
+    chosen = tl.where(chosen < 0, last_kept, chosen)
     token = tl.load(
         csr_indices_ptr + start + chosen, mask=length > 0, other=-1
     )
@@ -317,12 +328,43 @@ class RaggedSamplerTables:
         ):
             raise ValueError("token and next-state arrays must match")
 
+        self.bitset = None
+        self.row_slot = None
+        self.bitset_words = 0
+        self.vocab_size = 0
         widths = (self.csr_indptr[1:] - self.csr_indptr[:-1]).cpu().numpy()
         self._widths = widths
         self.max_row_nnz = int(widths.max()) if widths.size else 0
         narrow = widths[widths <= MAX_SINGLE_TILE]
         self.narrow_max_nnz = int(narrow.max()) if narrow.size else 0
         self.has_wide_rows = bool((widths > MAX_SINGLE_TILE).any())
+
+    def build_wide_bitsets(self, vocab_size: int) -> "RaggedSamplerTables":
+        """Attach a complement bitset for every row wider than one tile."""
+        if not self.has_wide_rows:
+            return self
+        indptr = self.csr_indptr.cpu().numpy()
+        indices = self.csr_indices.cpu().numpy()
+        words = (vocab_size + 31) // 32
+        wide_rows = np.flatnonzero(self._widths > MAX_SINGLE_TILE)
+        slots = np.full(self._widths.size, -1, dtype=np.int32)
+        packed = np.zeros((wide_rows.size, words), dtype=np.uint32)
+        for slot, row in enumerate(wide_rows):
+            slots[row] = slot
+            tokens = indices[indptr[row] : indptr[row + 1]].astype(np.int64)
+            if tokens.size and np.any(np.diff(tokens) <= 0):
+                raise ValueError("wide CSR rows must hold sorted token ids")
+            np.bitwise_or.at(
+                packed[slot],
+                tokens >> 5,
+                (np.uint32(1) << (tokens & 31).astype(np.uint32)),
+            )
+        device = self.csr_indices.device
+        self.bitset = torch.from_numpy(packed.view(np.int32)).to(device)
+        self.row_slot = torch.from_numpy(slots).to(device)
+        self.bitset_words = words
+        self.vocab_size = vocab_size
+        return self
 
     @property
     def num_rows(self) -> int:
@@ -348,6 +390,8 @@ def ragged_sample(
     force_tiled: bool = False,
     bucket: bool = True,
     seq_index: torch.Tensor | None = None,
+    wide_probes: int = WIDE_PROBES,
+    wide_rounds: int = WIDE_ROUNDS,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Sample one token per sequence from its grammar row only.
 
@@ -432,8 +476,58 @@ def ragged_sample(
             bucket=1,
             **common,
         )
-    _launch(tiled=True, block=1024, bucket=2, **common)
+    if tables.bitset is not None:
+        _launch_wide(
+            probes=wide_probes,
+            rounds=wide_rounds,
+            **common,
+        )
+    else:
+        _launch(tiled=True, block=1024, bucket=2, **common)
     return result
+
+
+def _launch_wide(
+    *,
+    logits,
+    tables,
+    rows,
+    seq_index,
+    temperature,
+    top_k,
+    top_p,
+    uniform,
+    out_tokens,
+    out_states,
+    bisect_steps,
+    write_state,
+    probes,
+    rounds,
+):
+    del bisect_steps
+    _wide_sample_kernel[(seq_index.numel(),)](
+        logits,
+        tables.bitset,
+        tables.row_slot,
+        tables.csr_indptr,
+        tables.csr_indices,
+        tables.csr_next_state if write_state else tables.csr_indices,
+        rows,
+        seq_index,
+        temperature,
+        top_k,
+        top_p,
+        uniform,
+        out_tokens,
+        out_states if write_state else out_tokens,
+        vocab_size=logits.shape[1],
+        bitset_words=tables.bitset_words,
+        BLOCK=WIDE_BLOCK,
+        PROBES=probes,
+        ROUNDS=rounds,
+        WRITE_STATE=write_state,
+        num_warps=8,
+    )
 
 
 def _all_sequences(batch: int, device: torch.device) -> torch.Tensor:
@@ -542,3 +636,175 @@ def _num_warps(block: int) -> int:
     if block <= 1024:
         return 4
     return 8
+
+
+# ---------------------------------------------------------------------------
+# Wide rows: complement representation
+#
+# A JSON string state allows 147,144 of 151,669 tokens. Listing the allowed
+# tokens is the wrong way round: the row is better described by the 4,525
+# tokens it forbids. The kernel below therefore reads logits contiguously and
+# tests membership against a per-state bitset (18.5 KiB, about 6% of the logit
+# traffic it already pays), instead of gathering through an index list.
+#
+# The threshold search also changes shape. Bisecting one candidate per pass
+# costs one full sweep per bit; here each sweep evaluates PROBES candidates at
+# once, so a sweep yields log2(PROBES + 1) bits and the whole search fits in a
+# handful of contiguous passes.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _wide_sample_kernel(
+    logits_ptr,
+    bitset_ptr,
+    slot_ptr,
+    csr_indptr_ptr,
+    csr_indices_ptr,
+    csr_next_state_ptr,
+    rows_ptr,
+    seq_index_ptr,
+    temperature_ptr,
+    top_k_ptr,
+    top_p_ptr,
+    uniform_ptr,
+    out_tokens_ptr,
+    out_states_ptr,
+    vocab_size: tl.constexpr,
+    bitset_words: tl.constexpr,
+    BLOCK: tl.constexpr,
+    PROBES: tl.constexpr,
+    ROUNDS: tl.constexpr,
+    WRITE_STATE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    seq = tl.load(seq_index_ptr + pid)
+    row = tl.load(rows_ptr + seq)
+    slot = tl.load(slot_ptr + row)
+    if slot < 0:
+        return
+
+    base = slot.to(tl.int64) * bitset_words
+    logit_base = seq.to(tl.int64) * vocab_size
+    temperature = tl.load(temperature_ptr + seq)
+    lane = tl.arange(0, BLOCK)
+    probe = tl.arange(0, PROBES)
+
+    maximum = -1e30
+    total = 0.0
+    for start in range(0, vocab_size, BLOCK):
+        offsets = start + lane
+        inside = offsets < vocab_size
+        word = tl.load(bitset_ptr + base + (offsets >> 5), mask=inside, other=0)
+        allowed = inside & (((word >> (offsets & 31)) & 1) == 1)
+        values = tl.load(
+            logits_ptr + logit_base + offsets, mask=allowed, other=0.0
+        ).to(tl.float32) / temperature
+        values = tl.where(allowed, values, -1e30)
+        updated = tl.maximum(maximum, tl.max(values, axis=0))
+        total = total * tl.exp(maximum - updated) + tl.sum(
+            tl.where(allowed, tl.exp(values - updated), 0.0), axis=0
+        )
+        maximum = updated
+
+    top_k = tl.load(top_k_ptr + seq)
+    top_p = tl.load(top_p_ptr + seq)
+    peak = 1.0 / total
+    low_k = 0.0
+    high_k = peak
+    low_p = 0.0
+    high_p = peak
+
+    for _ in range(ROUNDS):
+        step_k = (high_k - low_k) / (PROBES + 1)
+        step_p = (high_p - low_p) / (PROBES + 1)
+        probes_k = low_k + (probe + 1).to(tl.float32) * step_k
+        probes_p = low_p + (probe + 1).to(tl.float32) * step_p
+        counts = tl.zeros([PROBES], dtype=tl.float32)
+        masses = tl.zeros([PROBES], dtype=tl.float32)
+        for start in range(0, vocab_size, BLOCK):
+            offsets = start + lane
+            inside = offsets < vocab_size
+            word = tl.load(
+                bitset_ptr + base + (offsets >> 5), mask=inside, other=0
+            )
+            allowed = inside & (((word >> (offsets & 31)) & 1) == 1)
+            values = tl.load(
+                logits_ptr + logit_base + offsets, mask=allowed, other=0.0
+            ).to(tl.float32) / temperature
+            probs = tl.where(
+                allowed, tl.exp(values - maximum) / total, 0.0
+            )
+            wide = probs[:, None]
+            counts += tl.sum(
+                tl.where(wide >= probes_k[None, :], 1.0, 0.0), axis=0
+            )
+            masses += tl.sum(
+                tl.where(wide >= probes_p[None, :], wide, 0.0), axis=0
+            )
+        fits_k = counts <= top_k.to(tl.float32)
+        next_high_k = tl.min(tl.where(fits_k, probes_k, high_k), axis=0)
+        low_k = tl.max(tl.where(fits_k, low_k, probes_k), axis=0)
+        high_k = next_high_k
+
+        fits_p = masses >= top_p
+        next_low_p = tl.max(tl.where(fits_p, probes_p, low_p), axis=0)
+        high_p = tl.min(tl.where(fits_p, high_p, probes_p), axis=0)
+        low_p = next_low_p
+
+    threshold = tl.maximum(high_k, low_p)
+
+    # The retained mass must be accumulated in exactly the tile order the
+    # sampling sweep uses, otherwise a uniform near 1 overshoots a mass that
+    # was summed in a different order.
+    kept_mass = 0.0
+    for start in range(0, vocab_size, BLOCK):
+        offsets = start + lane
+        inside = offsets < vocab_size
+        word = tl.load(bitset_ptr + base + (offsets >> 5), mask=inside, other=0)
+        allowed = inside & (((word >> (offsets & 31)) & 1) == 1)
+        values = tl.load(
+            logits_ptr + logit_base + offsets, mask=allowed, other=0.0
+        ).to(tl.float32) / temperature
+        probs = tl.where(allowed, tl.exp(values - maximum) / total, 0.0)
+        kept_mass += tl.sum(tl.where(probs >= threshold, probs, 0.0), axis=0)
+
+    target = tl.load(uniform_ptr + seq) * kept_mass
+    running = 0.0
+    chosen = -1
+    last_kept = 0
+    for start in range(0, vocab_size, BLOCK):
+        offsets = start + lane
+        inside = offsets < vocab_size
+        word = tl.load(bitset_ptr + base + (offsets >> 5), mask=inside, other=0)
+        allowed = inside & (((word >> (offsets & 31)) & 1) == 1)
+        values = tl.load(
+            logits_ptr + logit_base + offsets, mask=allowed, other=0.0
+        ).to(tl.float32) / temperature
+        probs = tl.where(allowed, tl.exp(values - maximum) / total, 0.0)
+        kept = tl.where(probs >= threshold, probs, 0.0)
+        cumulative = running + tl.cumsum(kept, axis=0)
+        reached = (cumulative >= target) & (kept > 0.0)
+        local = tl.min(tl.where(reached, offsets, vocab_size), axis=0)
+        chosen = tl.where((chosen < 0) & (local < vocab_size), local, chosen)
+        last_kept = tl.max(tl.where(kept > 0.0, offsets, last_kept), axis=0)
+        running += tl.sum(kept, axis=0)
+
+    chosen = tl.where(chosen < 0, last_kept, chosen)
+    tl.store(out_tokens_ptr + seq, chosen)
+
+    if WRITE_STATE:
+        # The row is sorted, so recover the CSR position of the sampled token
+        # with a binary search rather than carrying an inverse table.
+        left = tl.load(csr_indptr_ptr + row)
+        right = tl.load(csr_indptr_ptr + row + 1)
+        for _ in range(32):
+            middle = (left + right) // 2
+            probe_token = tl.load(
+                csr_indices_ptr + middle, mask=middle < right, other=2147483647
+            )
+            go_right = (probe_token < chosen) & (left < right)
+            left = tl.where(go_right, middle + 1, left)
+            right = tl.where(go_right, right, middle)
+        next_state = tl.load(csr_next_state_ptr + left, mask=left >= 0, other=0)
+        tl.store(out_states_ptr + seq, next_state)

@@ -102,6 +102,7 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=50)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--no-wide-bitsets", action="store_true")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
         "--output", type=Path, default=Path("results/ragged-sampler.json")
@@ -121,6 +122,13 @@ def main() -> None:
         torch.from_numpy(rows.indices).to(device),
         torch.from_numpy(rows.next_state).to(device),
     )
+    if not args.no_wide_bitsets:
+        tables.build_wide_bitsets(vocab_size)
+        if tables.bitset is not None:
+            print(
+                f"wide complement bitsets: {tuple(tables.bitset.shape)} "
+                f"({tables.bitset.numel() * 4 / 1024:.1f} KiB total)"
+            )
 
     sampling = _load_flashinfer()
     xgr = _load_xgrammar()
