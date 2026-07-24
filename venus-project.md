@@ -148,8 +148,10 @@ horizon's committed targets (trim at horizon-empty points only).
 7. **Cancel resolves at frame boundaries** (posted frames are atomic; today's
    semantics already never cancel posted fires). Watchdog budgets re-scope ×k.
    Fire-timing schema becomes frame-scoped events + the bubble counter.
-8. **k stays config-constant** (default 2); dynamic k waits for production
-   instrumentation of the inequality.
+8. **k stays config-constant** (default 1 until earned). The default flips
+   to 2 only when k>1 meets or beats k=1 on the canonical shapes — gated on
+   the second landing's prepare hoisting. Dynamic k additionally waits for
+   the bubble counter (production instrumentation of the inequality).
 
 ## What gets deleted
 
@@ -187,7 +189,12 @@ and Venus disposition:
 
 Consequence: the per-lane RETRY class, makeup replay, retry budgets, and the
 force-retry battery all delete; the settle callback classifies
-committed → SUCCESS, killed → FAILED, else → whole-frame RETRY (backstop).
+committed → SUCCESS, killed → FAILED (S3 kill word). The S2 whole-frame
+re-post backstop was NOT built — the landed form is stricter: a surviving
+RETRY terminal is a host staging-contract violation and fails loudly. Zero
+organic retries across every certification says re-post is dead weight;
+reviving it would be elegance in reverse. This supersedes the backstop
+clause above.
 
 ## Build strategy — north star, no interim milestones
 
@@ -207,3 +214,64 @@ streams EXACT vs today's oracle dumps at k∈{1,2,3}** (semantics are unchanged
 deliberately re-baselined once, since v14 changes the wire by design);
 2048-fleet certs at every k; zero watchdog; bubble counter reported. Then the
 refine phase: profile, close bubbles, tune horizon depth.
+
+## First landing — what actually carried the weight (measured)
+
+The first landing (2026-07-24, certified) delivered the ABI, the single
+path, frame atomicity, the deletions, and S3 — but NOT the prepare-once
+enqueue track. It didn't need to: the measured per-step host blocks were
+two pool-depth defects (a 2-slot plan-staging ring; pageable transient
+uploads), fixed by sizing every per-step staging pool from the run-ahead
+depth, and the real k>1 bottleneck was the GUEST window measured in fires
+instead of frames (arrival contract, above). Consequence: per-step submit
+is non-blocking today, k∈{2..4} sits 3–6% under k=1 (boundary
+quantization), and prepare hoisting moved from perf-critical to
+future-proofing — which is what the second landing is for.
+
+## Second landing — future-proofing (committed design)
+
+The first landing satisfies the inequality because T_gpu (~5–7 ms) dwarfs
+per-step host prep. Next-generation GPUs and TPU-class backends shrink
+T_gpu and may lack device-side geometry composition entirely; the second
+landing makes the frame abstraction carry that future. Dependency spine:
+(1) → (2) → (3) → default k=2; (4) is a parallel backend track; (5)–(8)
+are independent.
+
+1. **Frame-prepare hoisting** (the deferred core of the two-track model).
+   Split the `handle_fire_batch` monolith into `FramePrepare` (all k
+   steps' host work — validation, compose, plan, parameter blocks written
+   into a per-step pinned staging ring at frame entry, when nothing of
+   this frame is enqueued and there is nothing to wait on) /
+   `StepEnqueue` (kernel-launch-only) / `FrameSettle`. This amortizes
+   T_prepare once per frame — the only structural lever left when T_gpu
+   shrinks — and reduces the backend contract to "consume a prepared
+   per-step parameter block": Metal/TPU ports swap the execute half only.
+2. **Depth gate = staging capacity** (completes P5(2)). Backpressure
+   becomes "is there a free prepare slot", severing the last
+   completion-count coupling from the enqueue track; horizon depth scales
+   without retuning.
+3. **Bubble counter + frame-scoped fire-timing** (completes decision 7).
+   One counter — "enqueue horizon caught by execution" — is the
+   production instrumentation of the inequality and the prerequisite for
+   dynamic k.
+4. **Arithmetic delta-form step geometry.** Derive per-step
+   indptr/last-page arrays arithmetically at frame prepare (the ABI
+   clause above, unexercised in the first landing). This is the TPU path:
+   a backend without DecodeEnvelope-style device composition still gets
+   k-step frames from host arithmetic — device resolution becomes an
+   optimization, not a requirement. Shrinks the wire as a side effect.
+5. **True ordered sub-batches** (completes decision 3). The engine today
+   emits the degenerate one-sub-batch-per-step form; packing mixed
+   geometry classes as ordered sub-batches within one step restores
+   "step = the model's forward step" and fixes step count at k for
+   heterogeneous fleets.
+6. **Elastic reclaimable-donor pool.** A resize returns logical budget
+   immediately but keeps pages mapped; the pool physically reclaims donor
+   pages only under allocation pressure. Kills the gen-boundary
+   map↔unmap oscillation; capacity ops become pure bookkeeping at steady
+   state.
+7. **Native frame wire form for remote.** The edge adapter currently
+   decomposes frames into per-step posts; carrying the frame across the
+   wire lets remote drivers do frame-union admission — the
+   disaggregated-serving shape of the same thesis.
+8. **Watchdog budgets re-scope ×k** (decision 7 hygiene).
