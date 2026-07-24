@@ -376,10 +376,39 @@ Metal driver: step-loop internally (same C ABI).
   needs a fault-injection run (not in the hot cert); logic is
   compile-verified + settle-order reviewed (callback is stream-ordered
   after the settle kernel on both paths).
-- TODO next: (c) elastic map↔unmap oscillation cleanup (369×
-  cuMemUnmap ≈220ms/run at both k), (d) final cert (all k, fleets,
-  long-tail, oracle sweep), final commit. macOS metal compile
-  verification deferred (metal has no compose kill path to port).
+- Elastic map↔unmap oscillation: DEFERRED with a design sketch, not
+  done in this pass. Cause: gen-boundary ResizePool controls trim the
+  workspace/state arenas (`trim_bytes` → cuMemUnmap per map unit) and
+  the next frames' folded admission regrows them — 369× unmap
+  ≈220ms/run at both k (~0.4%). The correct fix is a reclaimable-donor
+  design: a resize returns LOGICAL budget immediately (so KV can grow —
+  the 512×512 shape depends on it) but keeps pages mapped, and the pool
+  physically reclaims donor pages (unmap) only when try_reserve would
+  otherwise fail. That touches the pool's budget accounting — a real
+  subsystem with oversubscription edge cases — for 0.4%; poor ROI at
+  the tail of this build, so recorded as the next standalone item.
+  NOT acceptable as a quick hack: skipping the trim outright breaks
+  oversubscribed shapes, and a persistence/decay heuristic would be a
+  tuned magic constant (venus rules: no heuristics).
+- FINAL CERTIFICATION (2026-07-24, all green, the landed state):
+  - Oracles token-EXACT: k∈{1,2,3} t=32 and k=1 t=256 vs the pre-Venus
+    dumps.
+  - 2048×32 c512: k=1 35.68/35.13k (band 35.3–35.5 held), k=2
+    34.05/34.09k, k=3 34.00k, k=4 33.43k — k>1 sits 3–6% under k=1
+    (was 20%+ before the two-frame window), zero failures at every k.
+  - c0-256 (512×256 c256): k=1 28.09k (band ✓), k=2 27.93k (pre-Venus
+    k=2 was 26.5–27.4k → EXCEEDS).
+  - 512×512 c256: 19.79k (band 19.2–19.8 ✓). 64×1536: 7.38k
+    (pre-Venus 7.31k ✓).
+  - Residual k gap (~3–6%) is boundary/burst quantization, not window
+    depth (3-frame probe flat) and not driver host legs (measured
+    collapsed); frames' value case is host-cost slack (the
+    inequality), and the gap shrinks as models get larger (GPU step
+    time grows, boundary cost fixed).
+  macOS metal compile verification deferred (metal has no compose
+  kill path to port). Elastic map↔unmap reclaimable-donor design
+  recorded above as the next standalone item.
+  PROJECT VENUS BUILD: COMPLETE on this branch (nothing pushed).
 
 ## Done so far
 
