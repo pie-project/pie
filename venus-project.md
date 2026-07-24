@@ -246,10 +246,35 @@ are independent.
    T_prepare once per frame — the only structural lever left when T_gpu
    shrinks — and reduces the backend contract to "consume a prepared
    per-step parameter block": Metal/TPU ports swap the execute half only.
+   **LANDED** (second landing round 1, certified at full parity: k=1 fast
+   band held, k∈{2..4} bands held, oracles token-exact). Two facts the
+   landing surfaced, now part of the design: (a) **the window law** —
+   registry sequence applies are the enqueue track's clock and must run
+   at each wave's enqueue position in wave order; FramePrepare-time
+   consumers read the wave's window from its TICKETS (flag-free tickets
+   carry positions for read-only channels), never from live mirrors.
+   (b) The attention-plan hook stays at StepEnqueue for now: FlashInfer
+   fuses plan compute with the H2D commit into the single stable int
+   workspace (a graph-replay invariant), and plan_info is one mutable
+   host struct — the clean lift is a model-layer per-step plan snapshot.
+   Intra-frame decode steps have IDENTICAL static plans (same R, length-
+   independent schedule), so the end state is **plan-once-per-frame**, a
+   strictly better form than plan-per-step hoisting; it is the follow-up
+   item here.
 2. **Depth gate = staging capacity** (completes P5(2)). Backpressure
    becomes "is there a free prepare slot", severing the last
    completion-count coupling from the enqueue track; horizon depth scales
-   without retuning.
+   without retuning. **CLOSED BY MEASUREMENT** (second landing): the
+   depth dose-response re-run on the hoisted build reproduces N9 —
+   depth 2 beats depth 3 at BOTH k=1 (35.5 vs 35.2) and k=2 (34.4 vs
+   34.0). The gate is not capacity-limited (staging never starves it);
+   it is staleness-limited — shallower horizons form fresher batches.
+   A capacity-derived gate would push the horizon toward 3 frames and
+   regress a measured optimum. The correct standing relation is the one
+   already in place: the engine's admission depth is the measured
+   policy, and driver staging capacity derives FROM it (runahead.hpp
+   single-sourcing). Re-open only if a future backend's bubble evidence
+   shows the enqueue horizon starving.
 3. **Bubble counter + frame-scoped fire-timing** (completes decision 7).
    One counter — "enqueue horizon caught by execution" — is the
    production instrumentation of the inequality and the prerequisite for

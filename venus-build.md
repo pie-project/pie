@@ -496,6 +496,16 @@ Metal driver: step-loop internally (same C ABI).
   After the fix: k=2/k=3 oracles token-EXACT vs the pre-Venus base, zero
   kills. All temp diagnostics removed before certification.
 
+- SECOND LANDING item ② closed by measurement (no code). Depth
+  dose-response re-run on the hoisted build (2048×32 c512,
+  PIE_SCHED_MAX_IN_FLIGHT ∈ {1,2,3}): k=1 → 26.7 / 35.5 / 35.2k; k=2 →
+  28.6 / 34.4 / 34.0k. Depth 2 remains the optimum at both k — the N9
+  result survives hoisting, so the admission gate is staleness-limited,
+  not capacity-limited, and a capacity-derived gate would regress a
+  measured optimum. Recorded in venus-project.md item 2; the standing
+  relation (engine depth = measured policy; driver staging derives from
+  it via runahead.hpp) is already the correct one.
+
 - SECOND LANDING round 1 CERTIFIED (frame-prepare hoisting landed).
   Oracles k∈{1,2,3} t=32 + k=1 t=256: token-EXACT vs pre-Venus dumps.
   2048×32 c512: k=1 35.58/35.36k (fast band 35.3–35.5 HELD — the
