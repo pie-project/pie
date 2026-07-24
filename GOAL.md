@@ -366,6 +366,61 @@ narrow toy grammars; that GPU-native execution helps a 70B model at batch 1;
 that IELR(1) is broader coverage than XGrammar's general CFG. Each of those is
 either measured to be marginal or simply false.
 
+## Decision 3: benchmarks
+
+### What the incumbents actually run — and the scope limits of their claims
+
+Verified from the sources, not from summaries.
+
+| System | Workload | Baselines | Metrics | Scope limit to exploit |
+|---|---|---|---|---|
+| XGrammar (MLSys'25) | Llama-3.1-8B-Instruct, prompts from `NousResearch/json-mode-eval`; two grammars: the dataset's JSON Schema and the full ECMA-404 JSON CFG | Outlines v1.0, llama.cpp b3998; end-to-end vs vLLM v0.6.3+Outlines | per-token mask time (<40 µs), TTFT, TPOT | **Batch 1 and 16 only.** "Near-zero overhead" (TPOT 6.2→6.3 at B=1, 9.0→9.2 at B=16) is never tested past 16, and never with speculative decoding. |
+| llguidance / MaskBench | MaskBench inside JSON Schema Bench: 10k schemas, 2.5M tokens | XGrammar, Outlines, llama.cpp | mask time p50 and tail; <50 µs mean, <1% over 1 ms, 0.001% over 10 ms | Claims "16 cores and a 10 ms forward pass handle batch 3200". Assumes 16 **dedicated** cores, excludes the H2D mask copy, excludes speculative decoding, and ignores that the sampler stays O(V). |
+| JSONSchemaBench (arXiv 2501.10868) | ~10k real schemas: Github trivial/easy/medium/hard/ultra, Glaive function signatures, JsonSchemaStore, Kubernetes, Snowplow, WashingtonPost | Guidance, Outlines, llama.cpp, XGrammar, OpenAI, Gemini | declared/empirical coverage, compliance, efficiency, quality | Coverage collapses on hard/ultra (OpenAI 9%, Guidance ~41% on Github_hard). This is the coverage bar, not a speed bar. |
+| vLLM harness | `benchmarks/benchmark_serving_structured_output.py`, datasets `json`, `json-unique`, `grammar` (SQL EBNF), `regex`, `choice`, `xgrammar_bench` | any registered backend | TTFT, TPOT, throughput | De-facto industry harness. `json-unique` appends a UUID field per request to defeat schema caching — already the heterogeneous-batch stress test. |
+
+### What gpugrammar runs
+
+**Tier A — mask/step microbenchmark.** MaskBench protocol on the full JSON
+Schema Bench corpus, reporting p50/p99/p99.9 plus device time and dispatch time
+separately. Adds the axis MaskBench lacks: a batch dimension.
+
+**Tier B — coverage.** JSONSchemaBench declared/empirical coverage and
+compliance per split, plus the official JSON Schema Test Suite. Github_hard and
+Github_ultra are the bar an IELR(1) engine must clear to prove it is not
+narrower than a general-CFG engine.
+
+**Tier C — end-to-end serving.** The vLLM harness across all six datasets with
+gpugrammar, XGrammar, llguidance, and Outlines, plus SGLang via
+`register_grammar_backend`.
+
+**Tier D — the axes nobody has measured.** This is where the paper's
+contribution lives:
+
+1. batch sweep 32 → 2,048, since XGrammar stops at 16;
+2. speculative decoding crossed with grammars, k = 1…8 — no prior work reports it;
+3. sampler-inclusive accounting: report top-k/top-p cost, not mask cost alone;
+4. `json-unique` at scale, so schema caching cannot hide per-request compilation;
+5. p99.9 under cold-schema arrivals into a warm continuous batch.
+
+### Workloads beyond JSON
+
+JSON alone does not need LR power, so a JSON-only evaluation invites the
+reviewer question "why a parser at all?". Required non-JSON workloads:
+
+- **Spider / BIRD text-to-SQL** — the natural showcase for an LR engine and a
+  direct comparison point with GRID's LALR(1) SQL work;
+- **BFCL** and the Glaive split for tool/function calling;
+- **HumanEval / MBPP with a Python grammar**, the SynCode setting;
+- Kubernetes and JsonSchemaStore configs for deep nesting and `$ref` recursion.
+
+### Reporting rule for competitive claims
+
+Every comparison table must first **reproduce the incumbent's own claim on the
+incumbent's own axis**, then extend that axis. A number that only exists outside
+the regime the baseline was tuned for is not evidence; a number that matches
+inside their regime and diverges outside it is.
+
 ## Non-goals
 
 - Beating XGrammar on a grammar with ~15 allowed tokens per state. That is the
@@ -375,18 +430,15 @@ either measured to be marginal or simply false.
 - Any claim of general unbounded tokenizer-aware LR(1) support until C1–C3 are
   actually solved.
 
-## Evaluation plan (paper-grade)
+## Reporting rules
+
+Decision 3 fixes the workloads; these rules govern how any number derived from
+them is reported.
 
 - **Baselines:** XGrammar, llguidance, Outlines, plus the closest parser-aware
   systems (Pre3, PSC) and Gram2Token where reproducible. The sampler baseline is
   FlashInfer (`top_k_top_p_sampling_from_logits`), not a `torch.sort` reference
   implementation — a sorted-softmax sampler is 5× slower and would be a strawman.
-- **Grammars:** JSON Schema suite, a tool-call/function-call grammar, a
-  programming-language grammar, and a recursive stress grammar — chosen so that
-  wide-row states (C3) and deep stacks (C2, C6) are actually exercised.
-- **Headline experiments:** the two killer examples above, extended to
-  heterogeneous batches with realistic narrow/wide state mixtures (C10) and to
-  end-to-end serving with a real model in the loop.
 - **Metrics:** end-to-end tokens/s inside a real serving engine (not an isolated
   microbenchmark), constraint-step device time, dispatch overhead, table memory,
   compile latency, and mask exactness rate.
