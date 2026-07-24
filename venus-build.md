@@ -506,6 +506,50 @@ Metal driver: step-loop internally (same C ABI).
   relation (engine depth = measured policy; driver staging derives from
   it via runahead.hpp) is already the correct one.
 
+- SECOND LANDING round 3 (⑤ true ordered sub-batches, operator-approved)
+  — INVESTIGATION COMPLETE, implementation plan:
+  Facts established (code-verified):
+  - §5 validate_frame is lane-internal (channel classes within one
+    pipeline's frame) — does NOT constrain cross-lane step mixing; no
+    change needed.
+  - The ABI already carries sub_batch_indptr/sub_batch_class per step;
+    the engine emits the degenerate [0,n]/single-class form
+    (build_frame_submission, batch.rs); the driver only structurally
+    validates them and derives classes from bound instances.
+  - The blocker chain: LaunchGrouping::accepts rejects wire↔device-
+    resolved mixing → a mixed wave splits into per-class steps. If the
+    gate were simply removed, a mixed batch hits resolve_descriptors'
+    device-composed-template rejection (dispatch.cu ~5583: template
+    placeholders are only sound for enqueue_fixed_decode) and falls to
+    the SYNCHRONIZING descriptor readback — which under the frame split
+    reads chained values at prepare time that the previous step has not
+    even enqueued → dead. So mixing needs the ENVELOPE path.
+  - compose_decode_envelopes' page spans come from the WIRE TEMPLATE
+    (template_kv_page_indptr + the refilled kv_page_indices snapshot):
+    host-known real page ids; the kernel only compacts spans, resolves
+    token/position from device cells, and containment-checks position
+    against the span. Chained fires today carry EMPTY wire geometry
+    (deferred_geometry, wire.rs:421) so the envelope path cannot serve
+    them; chained k>1 works only through the fixed/graph path.
+  Implementation order:
+  1. ENGINE wire: chained (device_resolved) fires emit their envelope
+     LEASE as wire template geometry (ordered physical page list from
+     the lane's translation overlay + kv bounds; last-page-lens
+     template) instead of empty arrays. This alone also makes the
+     envelope path sound for chained lanes on non-graph-safe archs.
+  2. DRIVER resolve: accept the device-composed template for MIXED
+     batches by giving envelope lanes their WIRE-template geometry (not
+     1-page placeholders) in the per-program candidate, keeping
+     device_composed=false so routing goes to stage_decode_envelopes
+     (passthrough for wire lanes, envelope lanes device-resolved) — and
+     never the readback fallback for envelope-class programs.
+  3. ENGINE grouping: drop ONLY the lead_device_geometry mismatch
+     rejection in LaunchGrouping (all mask/solo/budget exclusions stay),
+     order group members wire-first, emit true sub_batch arrays.
+  4. Certify: oracles unchanged (solo lanes never mix); c0-256 ramp at
+     k∈{1,2} (arrival-heavy → mixed boundaries), 2048×32 sweep parity;
+     compare step counts (sched trace) to confirm mixing engages.
+
 - SECOND LANDING round 2: plan-once-per-frame LANDED (operator-approved
   as a pure upgrade; ④ delta-form geometry DEFERRED by operator decision
   — guest-surface exposure not wanted, no current backend needs it).
