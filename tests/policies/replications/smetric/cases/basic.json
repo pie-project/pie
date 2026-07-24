@@ -1,5 +1,28 @@
 {
-  "case": "followup-tail-outlier",
-  "generation_id": 1,
-  "tail_outlier": true
+  "schema": "plex-paper-oracle@1",
+  "cases": [
+    {
+      "id": "first-turn-round-robin",
+      "session_turn": 0,
+      "equal_min_load_targets": ["instance-a", "instance-b"]
+    },
+    {
+      "id": "sticky-follow-up",
+      "session_turn": 1,
+      "best_local_hit": 100,
+      "estimated_history_hit": 100
+    },
+    {
+      "id": "overload-fallback",
+      "best_hit_load": 10,
+      "mean_load": 6,
+      "overload_ppm": 1500000
+    },
+    {
+      "id": "eviction-fallback",
+      "best_local_hit": 50,
+      "estimated_history_hit": 100,
+      "hit_ratio_ppm": 900000
+    }
+  ]
 }

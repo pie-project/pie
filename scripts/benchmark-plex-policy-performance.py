@@ -795,46 +795,72 @@ def scenario_preble(
     policy_costs = []
     baseline_costs = []
     for trial in range(trials):
-        remaining = rng.randint(128, 2048)
-        cached = [rng.randint(0, 4096) for _ in range(3)]
-        load = [rng.randint(10, 300) for _ in range(3)]
-        eviction = [rng.randint(0, 300) for _ in range(3)]
+        exploit = trial % 2 == 0
+        if exploit:
+            remaining = 200
+            cached = [800, 800, 0]
+            rolling_load = [100, 120, 10]
+            decoder_ratio = [900_000, 1_000_000, 800_000]
+            total_cost = [
+                100 + rng.randint(0, 10),
+                80 + rng.randint(0, 10),
+                1000 + rng.randint(0, 20),
+            ]
+        else:
+            remaining = 500
+            cached = [50, 50, 50]
+            rolling_load = [100, 50, 10]
+            decoder_ratio = [2_000_000, 1_000_000, 800_000]
+            total_cost = [
+                100 + rng.randint(0, 10),
+                120 + rng.randint(0, 10),
+                150 + rng.randint(0, 10),
+            ]
         refs, lifecycle = bootstrap_requests(
             bench,
             f"preble-{trial}",
             [{"uncached_tokens": remaining}],
             status="admitted",
         )
-        assignments, _ = invoke_route(
+        assignments, route_outcome = invoke_route(
             bench,
             refs,
-            [{"uncached_tokens": remaining}],
-            [{}, {}, {}],
+            [
+                {
+                    "uncached_tokens": remaining,
+                    "decoder_imbalance_threshold_ppm": 1_500_000,
+                    "balance_threshold_ppm": 10_000_000,
+                }
+            ],
+            [
+                {
+                    "rolling_load_us": rolling_load[index],
+                    "decoder_ratio_ppm": decoder_ratio[index],
+                }
+                for index in range(3)
+            ],
             [
                 [
                     {
                         "cached_tokens": cached[index],
-                        "load_cost": load[index],
-                        "eviction_cost": eviction[index],
-                        "miss_prefill_cost": max(
-                            remaining - cached[index], 0
+                        "load_cost": total_cost[index] // 2,
+                        "eviction_cost": total_cost[index] // 4,
+                        "miss_prefill_cost": (
+                            total_cost[index]
+                            - total_cost[index] // 2
+                            - total_cost[index] // 4
                         ),
+                        "assignment_load_us": total_cost[index],
                     }
                     for index in range(3)
                 ]
             ],
             lifecycle,
         )
-        exploit = max(cached) > remaining
-        costs = [
-            max(remaining - cached[index], 0) + 1
-            if exploit
-            else remaining + load[index] + eviction[index]
-            for index in range(3)
-        ]
-        policy_costs.append(costs[assignments[0]])
-        baseline_index = min(range(3), key=load.__getitem__)
-        baseline_costs.append(costs[baseline_index])
+        enact_route(bench, route_outcome)
+        policy_costs.append(total_cost[assignments[0]])
+        baseline_index = min(range(3), key=rolling_load.__getitem__)
+        baseline_costs.append(total_cost[baseline_index])
     return result(
         policy_costs,
         baseline_costs,
@@ -984,37 +1010,47 @@ def scenario_lmetric(
     policy_costs = []
     baseline_costs = []
     for trial in range(trials):
-        new_tokens = [rng.randint(1, 4096) for _ in range(4)]
-        batch_sizes = [rng.randint(1, 64) for _ in range(4)]
-        hotspot = [rng.random() < 0.15 for _ in range(4)]
-        hotspot[rng.randrange(4)] = False
+        facts = [{"request_class": "hot", "window_id": f"window-{trial}"}] * 2
         refs, lifecycle = bootstrap_requests(
-            bench, f"lmetric-{trial}", [{}], status="admitted"
+            bench, f"lmetric-{trial}", facts, status="admitted"
+        )
+        edge_facts = [
+            {
+                "cache_hit": True,
+                "new_prefill_tokens": 1,
+                "current_batch_size": rng.randint(0, 2),
+            },
+            {
+                "cache_hit": False,
+                "new_prefill_tokens": 10,
+                "current_batch_size": rng.randint(0, 2),
+            },
+        ]
+        invoke_route(
+            bench,
+            [refs[0]],
+            [facts[0]],
+            [{}, {}],
+            [[edge_facts[0], edge_facts[1]]],
+            lifecycle,
         )
         assignments, _ = invoke_route(
             bench,
-            refs,
-            [{}],
-            [{"hotspot_confirmed": value} for value in hotspot],
-            [
-                [
-                    {
-                        "new_prefill_tokens": new_tokens[index],
-                        "current_batch_size": batch_sizes[index],
-                    }
-                    for index in range(4)
-                ]
-            ],
-            lifecycle,
+            [refs[1]],
+            [facts[1]],
+            [{}, {}],
+            [[edge_facts[0], edge_facts[1]]],
+            [],
         )
-        costs = [
-            new_tokens[index] * (batch_sizes[index] + 1)
-            + (10**9 if hotspot[index] else 0)
-            for index in range(4)
+        realized = [
+            1000
+            + edge_facts[0]["new_prefill_tokens"]
+            * (edge_facts[0]["current_batch_size"] + 1),
+            edge_facts[1]["new_prefill_tokens"]
+            * (edge_facts[1]["current_batch_size"] + 1),
         ]
-        policy_costs.append(costs[assignments[0]])
-        baseline_index = min(range(4), key=batch_sizes.__getitem__)
-        baseline_costs.append(costs[baseline_index])
+        policy_costs.append(realized[assignments[0]])
+        baseline_costs.append(realized[0])
     return result(
         policy_costs,
         baseline_costs,
@@ -2027,27 +2063,60 @@ def scenario_smetric(
     policy_costs = []
     baseline_costs = []
     for trial in range(trials):
-        followup = trial % 2 == 1
-        affinity = [rng.randint(0, 100) for _ in range(4)]
-        load = [rng.randint(1, 100) for _ in range(4)]
+        mode = trial % 4
+        if mode == 0:
+            turn = 0
+            affinity = [100, 10, 10, 10]
+            load = [20, 2, 3, 4]
+            estimated = [100] * 4
+            overload = 2_000_000
+        elif mode == 1:
+            turn = 1
+            affinity = [100, 20, 10, 5]
+            load = [4, 2, 3, 5]
+            estimated = [100] * 4
+            overload = 2_000_000
+        elif mode == 2:
+            turn = 2
+            affinity = [100, 20, 10, 5]
+            load = [20, 2, 3, 4]
+            estimated = [100] * 4
+            overload = 1_500_000
+        else:
+            turn = 3
+            affinity = [50, 20, 10, 5]
+            load = [4, 2, 3, 5]
+            estimated = [100] * 4
+            overload = 10_000_000
         refs, lifecycle = bootstrap_requests(
             bench,
             f"smetric-{trial}",
-            [{"overload_ppm": 1_500_000, "hit_ratio_ppm": 500_000}],
+            [
+                {
+                    "session_turn": turn,
+                    "overload_ppm": overload,
+                    "hit_ratio_ppm": 900_000,
+                }
+            ],
             status="admitted",
-            generations=[1 if followup else 0],
         )
         assignments, _ = invoke_route(
             bench,
             refs,
-            [{"overload_ppm": 1_500_000, "hit_ratio_ppm": 500_000}],
+            [
+                {
+                    "session_turn": turn,
+                    "overload_ppm": overload,
+                    "hit_ratio_ppm": 900_000,
+                }
+            ],
             [{}, {}, {}, {}],
             [
                 [
                     {
                         "cache_affinity": affinity[index],
                         "load": load[index],
-                        "estimated_history_hit": 50,
+                        "estimated_history_hit": estimated[index],
                     }
                     for index in range(4)
                 ]
@@ -2057,14 +2126,16 @@ def scenario_smetric(
         costs = [
             load[index]
             + (
-                (max(affinity) - affinity[index]) * 200
-                if followup
+                (max(affinity) - affinity[index]) * 2
+                if turn > 0 and mode == 1
                 else 0
             )
             for index in range(4)
         ]
+        if mode in {2, 3}:
+            costs[0] += 100
         policy_costs.append(costs[assignments[0]])
-        baseline_index = min(range(4), key=load.__getitem__)
+        baseline_index = max(range(4), key=affinity.__getitem__)
         baseline_costs.append(costs[baseline_index])
     return result(
         policy_costs,
@@ -2477,7 +2548,7 @@ def scenario_routebalance(
     policy_values = []
     baseline_values = []
     for trial in range(trials):
-        outputs = [rng.randint(16, 512) for _ in range(6)]
+        outputs = [rng.randint(16, 256) for _ in range(6)]
         quality = [
             [rng.randint(100_000, 1_000_000) for _ in range(3)]
             for _ in range(6)
@@ -2485,13 +2556,9 @@ def scenario_routebalance(
         costs = [
             [rng.randint(1, 100) for _ in range(3)] for _ in range(6)
         ]
-        latency = [
-            [rng.randint(1, 100) for _ in range(3)] for _ in range(6)
-        ]
-        decode = [
-            [rng.randint(1, 5) for _ in range(3)] for _ in range(6)
-        ]
-        queued = [rng.randint(0, 200) for _ in range(3)]
+        tpot = [rng.randint(500, 3000) for _ in range(3)]
+        pending = [rng.randint(0, 200) for _ in range(3)]
+        batch_size = [rng.randint(1, 16) for _ in range(3)]
         request_facts = [
             {
                 "predicted_output_tokens": output,
@@ -2512,14 +2579,20 @@ def scenario_routebalance(
             bench,
             refs,
             request_facts,
-            [{"queued_tokens": value} for value in queued],
+            [
+                {
+                    "pending_decode_tokens": pending[index],
+                    "decode_batch_size": batch_size[index],
+                    "tpot_us": tpot[index],
+                }
+                for index in range(3)
+            ],
             [
                 [
                     {
                         "quality_ppm": quality[request_index][target_index],
                         "cost": costs[request_index][target_index],
-                        "latency_ms": latency[request_index][target_index],
-                        "decode_ms_per_token": decode[request_index][target_index],
+                        "predicted_output_tokens": outputs[request_index],
                     }
                     for target_index in range(3)
                 ]
@@ -2528,52 +2601,52 @@ def scenario_routebalance(
             lifecycle,
             target_capacity=2,
         )
-        utilities = []
-        for request_index in range(6):
-            q_row = quality[request_index]
-            c_row = costs[request_index]
-            t_row = [
-                latency[request_index][target]
-                + decode[request_index][target] * queued[target]
-                for target in range(3)
-            ]
-            q_min, q_max = min(q_row), max(q_row)
-            c_min, c_max = min(c_row), max(c_row)
-            t_min, t_max = min(t_row), max(t_row)
-            utilities.append(
-                [
-                    (
-                        (q_row[target] - q_min)
-                        / max(q_max - q_min, 1)
-                        + (c_max - c_row[target])
-                        / max(c_max - c_min, 1)
-                        + (t_max - t_row[target])
-                        / max(t_max - t_min, 1)
-                    )
-                    for target in range(3)
+        order = sorted(range(6), key=outputs.__getitem__, reverse=True)
+
+        def score_batch(chosen: list[int | None]) -> float:
+            dead = pending.copy()
+            total = 0.0
+            for request_index in order:
+                target = chosen[request_index]
+                if target is None:
+                    continue
+                latency = [
+                    tpot[index]
+                    * (dead[index] / batch_size[index] + outputs[request_index])
+                    for index in range(3)
                 ]
-            )
-        policy_values.append(
-            sum(
-                utilities[index][target]
-                for index, target in enumerate(assignments)
-                if target is not None
-            )
-        )
+                max_cost = max(costs[request_index])
+                max_latency = max(latency)
+                total += (
+                    quality[request_index][target] / 1_000_000
+                    + 1
+                    - costs[request_index][target] / max(max_cost, 1)
+                    + 1
+                    - latency[target] / max(max_latency, 1)
+                ) / 3
+                dead[target] += outputs[request_index]
+            return total
+
+        policy_values.append(score_batch(assignments))
         remaining = [2, 2, 2]
-        baseline = 0.0
-        for request_index in range(6):
+        baseline_assignments: list[int | None] = [None] * 6
+        baseline_dead = pending.copy()
+        for request_index in order:
             target = min(
                 (
                     target
                     for target, slots in enumerate(remaining)
                     if slots > 0
                 ),
-                key=lambda target: queued[target],
+                key=lambda target: (
+                    baseline_dead[target] / batch_size[target],
+                    target,
+                ),
             )
             remaining[target] -= 1
-            baseline += utilities[request_index][target]
-        baseline_values.append(baseline)
+            baseline_assignments[request_index] = target
+            baseline_dead[target] += outputs[request_index]
+        baseline_values.append(score_batch(baseline_assignments))
     return result(
         policy_values,
         baseline_values,

@@ -1,9 +1,30 @@
 {
-  "case": "exploit-longest-prefix",
-  "operation": "route",
-  "request": {"uncached_tokens": 4},
-  "edges": [
-    {"target_id": "X", "cached_tokens": 8, "load_cost": 10, "eviction_cost": 1},
-    {"target_id": "Y", "cached_tokens": 2, "load_cost": 1, "eviction_cost": 1}
+  "schema": "plex-paper-oracle@1",
+  "cases": [
+    {
+      "id": "e2-exploit",
+      "uncached_tokens": 20,
+      "targets": [
+        {"target": "gpu-a", "cached_tokens": 80, "load_cost": 80},
+        {"target": "gpu-b", "cached_tokens": 80, "load_cost": 35}
+      ]
+    },
+    {
+      "id": "e2-explore-decoder-ratio",
+      "uncached_tokens": 100,
+      "decoder_imbalance_threshold_ppm": 1500000,
+      "decoder_ratio_ppm": {"gpu-a": 2000000, "gpu-b": 1000000}
+    },
+    {
+      "id": "post-assignment-redirect-and-replication",
+      "rolling_load_us": {"gpu-a": 300, "gpu-b": 100},
+      "balance_threshold_ppm": 2000000,
+      "prefix_queue_time_doubled": true
+    },
+    {
+      "id": "local-weighted-priority",
+      "priority_groups": 3,
+      "queue_counts": {"priority-3": 3, "priority-2": 2, "priority-1": 1}
+    }
   ]
 }

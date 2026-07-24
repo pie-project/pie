@@ -1,17 +1,21 @@
 {
-  "case": "non-greedy-joint-assignment",
-  "utility": [
-    [
-      10,
-      9
-    ],
-    [
-      8,
-      0
-    ]
-  ],
-  "target_capacity": [
-    1,
-    1
+  "schema": "plex-paper-oracle@1",
+  "cases": [
+    {
+      "id": "equation-1-raw-quality",
+      "weights_ppm": {"quality": 500000, "cost": 250000, "latency": 250000},
+      "candidates": [
+        {"target": "quality", "quality_ppm": 900000, "cost": 100},
+        {"target": "efficient", "quality_ppm": 500000, "cost": 0}
+      ]
+    },
+    {
+      "id": "lpt-dead-reckoning",
+      "requests": [
+        {"request": "short", "predicted_output_tokens": 10},
+        {"request": "long", "predicted_output_tokens": 100}
+      ],
+      "targets": ["instance-a", "instance-b"]
+    }
   ]
 }

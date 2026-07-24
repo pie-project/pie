@@ -9,16 +9,23 @@
   "implements": ["route"],
   "policy_kernel": [
     "new_prefill_tokens multiplied by batch_size_plus_one",
-    "confirmed-hotspot load fallback"
+    "class-popularity versus cache-coverage alarm",
+    "2|M| consecutive-request hotspot confirmation",
+    "confirmed-hotspot target filtering"
   ],
   "required_facts": [
+    "request_class",
+    "window_id",
+    "now_ms",
+    "window_ms",
+    "cache_hit",
+    "prompt_tokens",
     "new_prefill_tokens",
-    "current_batch_size",
-    "hotspot_confirmed"
+    "current_batch_size"
   ],
   "required_mechanics": [],
-  "deferred_mechanics": ["two-phase hotspot detector"],
+  "deferred_mechanics": [],
   "evidence_level": "inspired-adaptation",
-  "fixture_provenance": "paper metric and public router behavior",
+  "fixture_provenance": "OSDI 2026 multiplicative score, Equations 1-2, and two-phase detector",
   "validation_status": "passing"
 }

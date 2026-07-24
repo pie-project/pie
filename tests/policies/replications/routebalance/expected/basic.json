@@ -1,7 +1,13 @@
 {
-  "assignments": {
-    "A": "Y",
-    "B": "X"
-  },
-  "total_utility": 17
+  "schema": "plex-paper-oracle@1",
+  "expectations": [
+    {
+      "case_id": "equation-1-raw-quality",
+      "selected_target": "efficient"
+    },
+    {
+      "case_id": "lpt-dead-reckoning",
+      "assignments": {"long": "instance-a", "short": "instance-b"}
+    }
+  ]
 }

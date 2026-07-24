@@ -50,7 +50,7 @@ Named datasets/workloads identified from the primary text or manual audit.
 - Evidence: `inspired-adaptation`
 - Validation: `passing`
 - Metadata: [`tests/policies/replications/lmetric/metadata.json`](../../tests/policies/replications/lmetric/metadata.json)
-- Deferred mechanics: two-phase hotspot detector
+- Deferred mechanics: None
 <!-- plex-v0.6-replication:end -->
 
 ## Suggested citation

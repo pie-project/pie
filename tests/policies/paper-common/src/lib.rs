@@ -452,38 +452,170 @@ fn trim_vtc_pending(state: &mut State) {
 pub struct LMetric;
 
 impl Policy for LMetric {
-    fn route(ctx: &RouteContext, _state: &mut State, _host: &Host) -> plex::Result<RoutePlan> {
-        let decisions = ctx
-            .requests
-            .iter()
-            .enumerate()
-            .map(|(request_index, _)| {
-                ctx.feasible_edges
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, edge)| edge.request_index as usize == request_index)
-                    .filter(|edge| {
-                        let target = &ctx.targets[edge.1.target_index as usize];
-                        !target.facts["hotspot_confirmed"].as_bool().unwrap_or(false)
-                    })
-                    .min_by_key(|(_, edge)| {
-                        edge.facts["new_prefill_tokens"]
+    fn route(ctx: &RouteContext, state: &mut State, _host: &Host) -> plex::Result<RoutePlan> {
+        let mut capacity = RouteCapacity::new(ctx);
+        let mut decisions = Vec::with_capacity(ctx.requests.len());
+        for (request_index, request) in ctx.requests.iter().enumerate() {
+            let class = request.facts["request_class"]
+                .as_str()
+                .or_else(|| request.facts["prefix_class"].as_str())
+                .unwrap_or("default");
+            let window = lmetric_window(&request.facts);
+            if state.shared["lmetric_window"].as_str() != Some(window.as_str()) {
+                state.shared["lmetric_window"] = json!(window);
+                state.shared["lmetric_total_arrivals"] = json!(0);
+                state.shared["lmetric_class_arrivals"] = json!({});
+                state.shared["lmetric_detector"] = json!({});
+            }
+            let counted = state
+                .request(request.request.request_id.as_str())?
+                .scratch["lmetric_counted_window"]
+                .as_str()
+                == state.shared["lmetric_window"].as_str();
+            if !counted {
+                state.shared["lmetric_total_arrivals"] = json!(
+                    state.shared["lmetric_total_arrivals"]
+                        .as_u64()
+                        .unwrap_or(0)
+                        .saturating_add(1)
+                );
+                state.shared["lmetric_class_arrivals"][class] = json!(
+                    state.shared["lmetric_class_arrivals"][class]
+                        .as_u64()
+                        .unwrap_or(0)
+                        .saturating_add(1)
+                );
+                state
+                    .request_mut(request.request.request_id.as_str())?
+                    .scratch["lmetric_counted_window"] = state.shared["lmetric_window"].clone();
+            }
+
+            let edges = ctx
+                .feasible_edges
+                .iter()
+                .enumerate()
+                .filter(|(_, edge)| {
+                    edge.request_index as usize == request_index && capacity.can_assign(ctx, edge)
+                })
+                .collect::<Vec<_>>();
+            if edges.is_empty() {
+                decisions.push(RouteDecision::Defer);
+                continue;
+            }
+            let hit_targets = edges
+                .iter()
+                .filter(|(_, edge)| lmetric_cache_hit(edge))
+                .map(|(_, edge)| edge.target_index)
+                .collect::<BTreeSet<_>>();
+            let hit_count = hit_targets.len() as u64;
+            let miss_count = ctx.targets.len().saturating_sub(hit_targets.len()) as u64;
+            let class_count = state.shared["lmetric_class_arrivals"][class]
+                .as_u64()
+                .unwrap_or(0);
+            let total_count = state.shared["lmetric_total_arrivals"].as_u64().unwrap_or(0);
+            let other_count = total_count.saturating_sub(class_count);
+            let alarm = miss_count > 0
+                && (other_count == 0
+                    || u128::from(class_count).saturating_mul(u128::from(miss_count))
+                        > u128::from(other_count).saturating_mul(u128::from(hit_count)));
+            let best_hit = edges
+                .iter()
+                .filter(|(_, edge)| lmetric_cache_hit(edge))
+                .map(|(_, edge)| lmetric_score(edge, capacity.assigned(edge.target_index as usize)))
+                .min();
+            let best_miss = edges
+                .iter()
+                .filter(|(_, edge)| !lmetric_cache_hit(edge))
+                .map(|(_, edge)| lmetric_score(edge, capacity.assigned(edge.target_index as usize)))
+                .min();
+            let consecutive = if alarm
+                && best_hit
+                    .zip(best_miss)
+                    .is_some_and(|(hit, miss)| hit <= miss)
+            {
+                state.shared["lmetric_detector"][class]["consecutive"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    .saturating_add(1)
+            } else {
+                0
+            };
+            let confirmed = alarm && hit_count > 0 && consecutive >= hit_count.saturating_mul(2);
+            state.shared["lmetric_detector"][class] = json!({
+                "alarm": alarm,
+                "consecutive": consecutive,
+                "confirmed": confirmed,
+                "hit_targets": hit_targets,
+                "class_arrivals": class_count,
+                "other_arrivals": other_count
+            });
+
+            let filtered = edges
+                .iter()
+                .copied()
+                .filter(|(_, edge)| !confirmed || !lmetric_cache_hit(edge))
+                .collect::<Vec<_>>();
+            let selected = if filtered.is_empty() {
+                edges.iter().copied().min_by_key(|(edge_index, edge)| {
+                    (
+                        edge.facts["current_batch_size"]
                             .as_u64()
                             .unwrap_or(u64::MAX)
-                            .saturating_mul(
-                                edge.facts["current_batch_size"]
-                                    .as_u64()
-                                    .unwrap_or(u64::MAX)
-                                    .saturating_add(1),
-                            )
-                    })
-                    .map_or(RouteDecision::Defer, |(index, _)| {
-                        RouteDecision::Assign(index as u32)
-                    })
-            })
-            .collect();
+                            .saturating_add(capacity.assigned(edge.target_index as usize) as u64),
+                        *edge_index,
+                    )
+                })
+            } else {
+                filtered.into_iter().min_by_key(|(edge_index, edge)| {
+                    (
+                        lmetric_score(edge, capacity.assigned(edge.target_index as usize)),
+                        *edge_index,
+                    )
+                })
+            };
+            if let Some((edge_index, edge)) = selected {
+                capacity.assign(ctx, edge);
+                decisions.push(RouteDecision::Assign(edge_index as u32));
+            } else {
+                decisions.push(RouteDecision::Defer);
+            }
+        }
         Ok(RoutePlan { decisions })
     }
+}
+
+fn lmetric_window(facts: &plex::Document) -> String {
+    if let Some(window) = facts["window_id"].as_str() {
+        return window.to_owned();
+    }
+    let window_ms = facts["window_ms"].as_u64().unwrap_or(60_000).max(1);
+    let now_ms = facts["now_ms"].as_u64().unwrap_or(0);
+    format!("{}", now_ms / window_ms)
+}
+
+fn lmetric_cache_hit(edge: &plex::RouteEdge) -> bool {
+    edge.facts["cache_hit"].as_bool().unwrap_or_else(|| {
+        edge.facts["cached_tokens"].as_u64().unwrap_or(0) > 0
+            || edge.facts["new_prefill_tokens"]
+                .as_u64()
+                .zip(edge.facts["prompt_tokens"].as_u64())
+                .is_some_and(|(new, prompt)| new < prompt)
+    })
+}
+
+fn lmetric_score(edge: &plex::RouteEdge, assigned: u32) -> u128 {
+    u128::from(
+        edge.facts["new_prefill_tokens"]
+            .as_u64()
+            .unwrap_or(u64::MAX),
+    )
+    .saturating_mul(u128::from(
+        edge.facts["current_batch_size"]
+            .as_u64()
+            .unwrap_or(u64::MAX)
+            .saturating_add(u64::from(assigned))
+            .saturating_add(1),
+    ))
 }
 
 pub struct FairServe;
@@ -2424,66 +2556,80 @@ impl Policy for Llumnix {
 pub struct SMetric;
 
 impl Policy for SMetric {
-    fn route(ctx: &RouteContext, _state: &mut State, _host: &Host) -> plex::Result<RoutePlan> {
+    fn route(ctx: &RouteContext, state: &mut State, _host: &Host) -> plex::Result<RoutePlan> {
         let mut decisions = Vec::new();
-        let mut target_counts = vec![0u32; ctx.targets.len()];
+        let mut capacity = RouteCapacity::new(ctx);
         for (request_index, request) in ctx.requests.iter().enumerate() {
-            let followup = request.request.generation_id > 0;
+            let turn = request.facts["session_turn"]
+                .as_u64()
+                .unwrap_or(request.request.generation_id);
+            let followup = turn > 0;
             let candidates = ctx
                 .feasible_edges
                 .iter()
                 .enumerate()
                 .filter(|(_, edge)| {
-                    edge.request_index as usize == request_index
-                        && target_counts[edge.target_index as usize]
-                            < ctx.targets[edge.target_index as usize].max_assignments
+                    edge.request_index as usize == request_index && capacity.can_assign(ctx, edge)
                 })
                 .collect::<Vec<_>>();
-            let selected = if followup {
-                let affinity = candidates.iter().copied().max_by_key(|(_, edge)| {
-                    (
-                        edge.facts["cache_affinity"].as_u64().unwrap_or(0),
-                        Reverse(edge.facts["load"].as_u64().unwrap_or(u64::MAX)),
-                    )
-                });
-                let mean_load = if candidates.is_empty() {
-                    0
-                } else {
-                    candidates
-                        .iter()
-                        .map(|(_, edge)| edge.facts["load"].as_u64().unwrap_or(0))
-                        .sum::<u64>()
-                        / candidates.len() as u64
-                };
-                affinity
-                    .filter(|(_, edge)| {
-                        let overload_ppm =
-                            request.facts["overload_ppm"].as_u64().unwrap_or(1_000_000);
-                        let hit_ratio_ppm =
-                            request.facts["hit_ratio_ppm"].as_u64().unwrap_or(1_000_000);
-                        edge.facts["load"].as_u64().unwrap_or(u64::MAX)
-                            <= mean_load.saturating_mul(overload_ppm) / 1_000_000
-                            && edge.facts["cache_affinity"].as_u64().unwrap_or(0)
-                                > edge.facts["estimated_history_hit"]
-                                    .as_u64()
-                                    .unwrap_or(0)
-                                    .saturating_mul(hit_ratio_ppm)
-                                    / 1_000_000
-                    })
-                    .or_else(|| {
-                        candidates
-                            .iter()
-                            .copied()
-                            .min_by_key(|(_, edge)| edge.facts["load"].as_u64().unwrap_or(u64::MAX))
-                    })
+            if candidates.is_empty() {
+                decisions.push(RouteDecision::Defer);
+                continue;
+            }
+            let affinity = candidates.iter().copied().max_by_key(|(edge_index, edge)| {
+                (
+                    edge.facts["cache_affinity"].as_u64().unwrap_or(0),
+                    Reverse(edge.facts["load"].as_u64().unwrap_or(u64::MAX)),
+                    Reverse(*edge_index),
+                )
+            });
+            let load_sum = candidates
+                .iter()
+                .map(|(_, edge)| edge.facts["load"].as_u64().unwrap_or(0))
+                .fold(0u128, |sum, load| sum.saturating_add(u128::from(load)));
+            let candidate_count = candidates.len() as u128;
+            let sticky = if followup {
+                affinity.filter(|(_, edge)| {
+                    let overload_ppm = request.facts["overload_ppm"].as_u64().unwrap_or(2_000_000);
+                    let hit_ratio_ppm = request.facts["hit_ratio_ppm"].as_u64().unwrap_or(900_000);
+                    u128::from(edge.facts["load"].as_u64().unwrap_or(u64::MAX))
+                        .saturating_mul(candidate_count)
+                        .saturating_mul(1_000_000)
+                        <= load_sum.saturating_mul(u128::from(overload_ppm))
+                        && u128::from(edge.facts["cache_affinity"].as_u64().unwrap_or(0))
+                            .saturating_mul(1_000_000)
+                            >= u128::from(edge.facts["estimated_history_hit"].as_u64().unwrap_or(0))
+                                .saturating_mul(u128::from(hit_ratio_ppm))
+                })
             } else {
-                candidates
+                None
+            };
+            let selected = sticky.or_else(|| {
+                let min_load = candidates
+                    .iter()
+                    .map(|(_, edge)| edge.facts["load"].as_u64().unwrap_or(u64::MAX))
+                    .min()
+                    .unwrap_or(u64::MAX);
+                let ties = candidates
                     .iter()
                     .copied()
-                    .min_by_key(|(_, edge)| edge.facts["load"].as_u64().unwrap_or(u64::MAX))
-            };
+                    .filter(|(_, edge)| edge.facts["load"].as_u64().unwrap_or(u64::MAX) == min_load)
+                    .collect::<Vec<_>>();
+                let cursor = state.shared["smetric_rr_cursor"].as_u64().unwrap_or(0);
+                let selected = ties.get((cursor as usize) % ties.len()).copied();
+                state.shared["smetric_rr_cursor"] = json!(cursor.saturating_add(1));
+                selected
+            });
             if let Some((index, edge)) = selected {
-                target_counts[edge.target_index as usize] += 1;
+                capacity.assign(ctx, edge);
+                if followup && sticky.is_none() {
+                    state.shared["smetric_fallbacks"] = json!(
+                        state.shared["smetric_fallbacks"]
+                            .as_u64()
+                            .unwrap_or(0)
+                            .saturating_add(1)
+                    );
+                }
                 decisions.push(RouteDecision::Assign(index as u32));
             } else {
                 decisions.push(RouteDecision::Defer);
@@ -2900,23 +3046,29 @@ impl Policy for RouteBalance {
         let mut request_order = (0..ctx.requests.len()).collect::<Vec<_>>();
         request_order.sort_by_key(|&index| {
             Reverse(
-                ctx.requests[index].facts["predicted_output_tokens"]
-                    .as_u64()
+                ctx.feasible_edges
+                    .iter()
+                    .filter(|edge| edge.request_index as usize == index)
+                    .filter_map(|edge| edge.facts["predicted_output_tokens"].as_u64())
+                    .max()
+                    .or_else(|| ctx.requests[index].facts["predicted_output_tokens"].as_u64())
                     .unwrap_or(0),
             )
         });
         let mut decisions = vec![RouteDecision::Defer; ctx.requests.len()];
-        let mut target_counts = vec![0u32; ctx.targets.len()];
-        let mut target_load = ctx
+        let mut capacity = RouteCapacity::new(ctx);
+        let mut pending_decode = ctx
             .targets
             .iter()
-            .map(|target| target.facts["queued_tokens"].as_u64().unwrap_or(0))
+            .map(|target| {
+                target.facts["pending_decode_tokens"]
+                    .as_u64()
+                    .or_else(|| target.facts["queued_tokens"].as_u64())
+                    .unwrap_or(0)
+            })
             .collect::<Vec<_>>();
         for request_index in request_order {
             let request = &ctx.requests[request_index];
-            let output_tokens = request.facts["predicted_output_tokens"]
-                .as_u64()
-                .unwrap_or(0);
             let cost_budget = request.facts["cost_budget"].as_u64().unwrap_or(u64::MAX);
             let candidates = ctx
                 .feasible_edges
@@ -2924,21 +3076,21 @@ impl Policy for RouteBalance {
                 .enumerate()
                 .filter(|(_, edge)| {
                     edge.request_index as usize == request_index
-                        && target_counts[edge.target_index as usize]
-                            < ctx.targets[edge.target_index as usize].max_assignments
+                        && capacity.can_assign(ctx, edge)
                         && edge.facts["cost"].as_u64().unwrap_or(u64::MAX) <= cost_budget
                 })
                 .map(|(edge_index, edge)| {
                     let target_index = edge.target_index as usize;
-                    let latency = edge.facts["latency_ms"]
+                    let output_tokens = edge.facts["predicted_output_tokens"]
                         .as_u64()
-                        .unwrap_or(0)
-                        .saturating_add(
-                            edge.facts["decode_ms_per_token"]
-                                .as_u64()
-                                .unwrap_or(0)
-                                .saturating_mul(target_load[target_index]),
-                        );
+                        .or_else(|| request.facts["predicted_output_tokens"].as_u64())
+                        .unwrap_or(0);
+                    let latency = routebalance_latency(
+                        &ctx.targets[target_index],
+                        edge,
+                        pending_decode[target_index],
+                        output_tokens,
+                    );
                     (
                         edge_index,
                         edge,
@@ -2951,40 +3103,173 @@ impl Policy for RouteBalance {
             if candidates.is_empty() {
                 continue;
             }
-            let quality_min = candidates.iter().map(|entry| entry.2).min().unwrap_or(0);
-            let quality_max = candidates.iter().map(|entry| entry.2).max().unwrap_or(0);
-            let cost_min = candidates.iter().map(|entry| entry.3).min().unwrap_or(0);
             let cost_max = candidates.iter().map(|entry| entry.3).max().unwrap_or(0);
-            let latency_min = candidates.iter().map(|entry| entry.4).min().unwrap_or(0);
             let latency_max = candidates.iter().map(|entry| entry.4).max().unwrap_or(0);
-            let quality_weight = request.facts["quality_weight_ppm"]
-                .as_u64()
-                .unwrap_or(333_334);
-            let cost_weight = request.facts["cost_weight_ppm"].as_u64().unwrap_or(333_333);
-            let latency_weight = request.facts["latency_weight_ppm"]
-                .as_u64()
-                .unwrap_or(333_333);
-            let selected = candidates.into_iter().max_by_key(|entry| {
-                quality_weight
-                    .saturating_mul(normalize(entry.2, quality_min, quality_max, true))
-                    .saturating_add(
-                        cost_weight.saturating_mul(normalize(entry.3, cost_min, cost_max, false)),
-                    )
-                    .saturating_add(latency_weight.saturating_mul(normalize(
-                        entry.4,
-                        latency_min,
-                        latency_max,
-                        false,
-                    )))
+            let (quality_weight, cost_weight, latency_weight) =
+                routebalance_weights(&request.facts);
+            let selected = candidates.into_iter().max_by(|left, right| {
+                let score = |entry: &(usize, &plex::RouteEdge, u64, u64, u64)| {
+                    u128::from(quality_weight)
+                        .saturating_mul(u128::from(entry.2.min(1_000_000)))
+                        .saturating_add(
+                            u128::from(cost_weight)
+                                .saturating_mul(u128::from(inverse_max(entry.3, cost_max))),
+                        )
+                        .saturating_add(
+                            u128::from(latency_weight)
+                                .saturating_mul(u128::from(inverse_max(entry.4, latency_max))),
+                        )
+                };
+                score(left)
+                    .cmp(&score(right))
+                    .then_with(|| right.0.cmp(&left.0))
             });
             if let Some((edge_index, edge, _, _, _)) = selected {
                 let target_index = edge.target_index as usize;
-                target_counts[target_index] += 1;
-                target_load[target_index] = target_load[target_index].saturating_add(output_tokens);
+                let output_tokens = edge.facts["predicted_output_tokens"]
+                    .as_u64()
+                    .or_else(|| request.facts["predicted_output_tokens"].as_u64())
+                    .unwrap_or(0);
+                capacity.assign(ctx, edge);
+                pending_decode[target_index] =
+                    pending_decode[target_index].saturating_add(output_tokens);
                 decisions[request_index] = RouteDecision::Assign(edge_index as u32);
             }
         }
         Ok(RoutePlan { decisions })
+    }
+}
+
+fn routebalance_latency(
+    target: &plex::RouteTarget,
+    edge: &plex::RouteEdge,
+    pending_decode_tokens: u64,
+    predicted_output_tokens: u64,
+) -> u64 {
+    let tpot_us = edge.facts["tpot_us"]
+        .as_u64()
+        .or_else(|| target.facts["tpot_us"].as_u64())
+        .or_else(|| {
+            edge.facts["decode_ms_per_token"]
+                .as_u64()
+                .map(|value| value.saturating_mul(1000))
+        })
+        .unwrap_or(0);
+    let batch_size = target.facts["decode_batch_size"]
+        .as_u64()
+        .or_else(|| edge.facts["decode_batch_size"].as_u64())
+        .unwrap_or(1)
+        .max(1);
+    let waiting_tokens = if target.facts["free_decode_slots"].as_u64().unwrap_or(0) > 0 {
+        0
+    } else {
+        pending_decode_tokens
+    };
+    let iterations_fp =
+        u128::from(waiting_tokens).saturating_mul(1_000_000) / u128::from(batch_size);
+    let total_steps_fp =
+        iterations_fp.saturating_add(u128::from(predicted_output_tokens).saturating_mul(1_000_000));
+    u128::from(tpot_us)
+        .saturating_mul(total_steps_fp)
+        .checked_div(1_000_000)
+        .unwrap_or(0)
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn routebalance_weights(facts: &plex::Document) -> (u64, u64, u64) {
+    let raw = [
+        facts["quality_weight_ppm"].as_u64().unwrap_or(333_334),
+        facts["cost_weight_ppm"].as_u64().unwrap_or(333_333),
+        facts["latency_weight_ppm"].as_u64().unwrap_or(333_333),
+    ];
+    let total = raw
+        .iter()
+        .copied()
+        .fold(0u128, |sum, value| sum.saturating_add(u128::from(value)));
+    if total == 0 {
+        return (333_334, 333_333, 333_333);
+    }
+    let quality = u128::from(raw[0]).saturating_mul(1_000_000) / total;
+    let cost = u128::from(raw[1]).saturating_mul(1_000_000) / total;
+    let quality = quality as u64;
+    let cost = cost as u64;
+    (quality, cost, 1_000_000 - quality - cost)
+}
+
+fn inverse_max(value: u64, maximum: u64) -> u64 {
+    if maximum == 0 {
+        1_000_000
+    } else {
+        u128::from(maximum.saturating_sub(value))
+            .saturating_mul(1_000_000)
+            .checked_div(u128::from(maximum))
+            .unwrap_or(0) as u64
+    }
+}
+
+struct RouteCapacity {
+    assignments: Vec<u32>,
+    remaining: Vec<BTreeMap<(String, String), u64>>,
+}
+
+impl RouteCapacity {
+    fn new(ctx: &RouteContext) -> Self {
+        Self {
+            assignments: vec![0; ctx.targets.len()],
+            remaining: ctx
+                .targets
+                .iter()
+                .map(|target| {
+                    target
+                        .capacity
+                        .iter()
+                        .map(|limit| ((limit.name.clone(), limit.unit.clone()), limit.maximum))
+                        .collect()
+                })
+                .collect(),
+        }
+    }
+
+    fn assigned(&self, target_index: usize) -> u32 {
+        self.assignments[target_index]
+    }
+
+    fn can_assign(&self, ctx: &RouteContext, edge: &plex::RouteEdge) -> bool {
+        let target_index = edge.target_index as usize;
+        if self.assignments[target_index] >= ctx.targets[target_index].max_assignments {
+            return false;
+        }
+        if self.remaining[target_index].is_empty() {
+            return true;
+        }
+        let mut demand = BTreeMap::<(String, String), u64>::new();
+        for amount in &edge.demand {
+            let key = (amount.name.clone(), amount.unit.clone());
+            demand
+                .entry(key)
+                .and_modify(|value| *value = value.saturating_add(amount.amount))
+                .or_insert(amount.amount);
+        }
+        demand.into_iter().all(|(key, amount)| {
+            self.remaining[target_index]
+                .get(&key)
+                .is_some_and(|remaining| amount <= *remaining)
+        })
+    }
+
+    fn assign(&mut self, ctx: &RouteContext, edge: &plex::RouteEdge) {
+        let target_index = edge.target_index as usize;
+        self.assignments[target_index] = self.assignments[target_index].saturating_add(1);
+        if self.remaining[target_index].is_empty() {
+            return;
+        }
+        for amount in &edge.demand {
+            let key = (amount.name.clone(), amount.unit.clone());
+            if let Some(remaining) = self.remaining[target_index].get_mut(&key) {
+                *remaining = remaining.saturating_sub(amount.amount);
+            }
+        }
+        debug_assert!(self.assignments[target_index] <= ctx.targets[target_index].max_assignments);
     }
 }
 
@@ -3085,16 +3370,4 @@ fn min_edge_by(ctx: &RouteContext, metric: impl Fn(&plex::RouteEdge) -> u64) -> 
         }
     }
     decisions
-}
-
-fn normalize(value: u64, minimum: u64, maximum: u64, higher_is_better: bool) -> u64 {
-    if maximum == minimum {
-        return 1_000_000;
-    }
-    let numerator = if higher_is_better {
-        value.saturating_sub(minimum)
-    } else {
-        maximum.saturating_sub(value)
-    };
-    numerator.saturating_mul(1_000_000) / maximum.saturating_sub(minimum)
 }

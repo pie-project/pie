@@ -1,5 +1,12 @@
 {
-  "actions": [
-    "pie.request.rebalance@1"
+  "schema": "plex-paper-oracle@1",
+  "expectations": [
+    {
+      "case_id": "first-turn-round-robin",
+      "assignments": ["instance-a", "instance-b"]
+    },
+    {"case_id": "sticky-follow-up", "selected_target": "instance-a"},
+    {"case_id": "overload-fallback", "selected_target": "instance-b"},
+    {"case_id": "eviction-fallback", "selected_target": "instance-b"}
   ]
 }

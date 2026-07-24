@@ -6,22 +6,35 @@
   "source_commit": "bdc9135",
   "source_license": "paper reference; no source copied",
   "component": "plex_paper_preble",
-  "implements": ["route"],
+  "implements": ["route", "schedule", "cache", "feedback"],
   "policy_kernel": [
     "E2 exploit when reusable prefix exceeds uncached prompt",
-    "longest-prefix exploitation",
-    "prompt-aware load and eviction-cost exploration"
+    "longest-prefix exploitation with rolling-load redirection",
+    "prompt-aware load and eviction-cost exploration",
+    "decoder-ratio prefill/decode balancing",
+    "cache-hit weighted local queue scheduling"
   ],
   "required_facts": [
     "uncached_tokens",
+    "prompt_tokens",
     "cached_tokens",
     "load_cost",
     "eviction_cost",
-    "miss_prefill_cost"
+    "miss_prefill_cost",
+    "rolling_load_us",
+    "assignment_load_us",
+    "decoder_ratio_ppm",
+    "decoder_imbalance_threshold_ppm",
+    "balance_threshold_ppm",
+    "prefix_hit_ratio_ppm",
+    "priority_groups",
+    "prefix_queue_time_doubled",
+    "prefix_object_id",
+    "replica_target_id"
   ],
-  "required_mechanics": [],
-  "deferred_mechanics": ["prefix replication", "autoscaling"],
+  "required_mechanics": ["cache.prefetch@1"],
+  "deferred_mechanics": ["physical prefix autoscaling"],
   "evidence_level": "inspired-adaptation",
-  "fixture_provenance": "independent implementation from the paper algorithm",
+  "fixture_provenance": "arXiv 2407.00023v2 Algorithms 1-3",
   "validation_status": "passing"
 }

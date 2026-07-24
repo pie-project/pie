@@ -10,9 +10,9 @@
     "route"
   ],
   "policy_kernel": [
-    "normalized quality-latency-cost score",
+    "raw-quality and maximum-normalized cost/latency score",
     "cost-budget filtering",
-    "LPT greedy assignment with dead-reckoned load"
+    "LPT greedy assignment with pending-decode dead reckoning"
   ],
   "required_facts": [
     "predicted_output_tokens",
@@ -22,15 +22,17 @@
     "latency_weight_ppm",
     "quality_ppm",
     "cost",
-    "latency_ms",
+    "tpot_us",
     "decode_ms_per_token",
-    "queued_tokens"
+    "pending_decode_tokens",
+    "decode_batch_size",
+    "free_decode_slots"
   ],
   "required_mechanics": [],
   "deferred_mechanics": [
     "replica provisioning"
   ],
   "evidence_level": "inspired-adaptation",
-  "fixture_provenance": "paper equations and public artifact decision flow",
+  "fixture_provenance": "arXiv 2606.17949 Equations 1-2 and Algorithm 1",
   "validation_status": "passing"
 }

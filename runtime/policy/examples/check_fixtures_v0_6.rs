@@ -24,6 +24,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     check_existing_papers(&packages)?;
     check_wave_a(&packages)?;
     check_fairness_state_machines(&packages)?;
+    check_routing_state_machines(&packages)?;
     check_wave_c(&packages)?;
     check_wave_d(&packages)?;
     check_replication_artifacts(&packages)?;
@@ -1280,6 +1281,573 @@ fn check_justitia_state_machine(packages: &Path) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
+fn check_routing_state_machines(packages: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    check_preble_state_machine(packages)?;
+    check_lmetric_state_machine(packages)?;
+    check_smetric_state_machine(packages)?;
+    check_routebalance_state_machine(packages)?;
+    Ok(())
+}
+
+fn check_preble_state_machine(packages: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let preble = runtime(packages, "plex_paper_preble", &["cache.prefetch@1"], None)?;
+    let lifecycle = active_lifecycle(&[("P1", "GP1"), ("P2", "GP2"), ("P3", "GP3")]);
+    let routed = preble.invoke(route_many(
+        "preble-exploit",
+        vec![route_candidate(
+            "P1",
+            "GP1",
+            json!({
+                "uncached_tokens": 20,
+                "balance_threshold_ppm": 10000000
+            }),
+        )],
+        vec![
+            route_target("gpu-a", 1, json!({"rolling_load_us": 10})),
+            route_target("gpu-b", 1, json!({"rolling_load_us": 10})),
+        ],
+        vec![
+            route_edge(
+                0,
+                0,
+                json!({
+                    "cached_tokens": 80,
+                    "load_cost": 50,
+                    "eviction_cost": 20,
+                    "miss_prefill_cost": 10,
+                    "assignment_load_us": 80
+                }),
+            ),
+            route_edge(
+                0,
+                1,
+                json!({
+                    "cached_tokens": 80,
+                    "load_cost": 20,
+                    "eviction_cost": 10,
+                    "miss_prefill_cost": 5,
+                    "assignment_load_us": 35
+                }),
+            ),
+        ],
+        lifecycle,
+    ))?;
+    assert_eq!(routed["plan"]["plan"]["assignments"][0]["target_index"], 1);
+    assert_success(&preble.invoke(feedback_records(
+        "preble-exploit-feedback",
+        vec![route_progress("preble-exploit", 0, "enacted")],
+        Vec::new(),
+    ))?);
+    assert_eq!(
+        preble.backend().read_shared()?["preble_load_us"]["gpu-b"],
+        45
+    );
+
+    let routed = preble.invoke(route_many(
+        "preble-explore-ratio",
+        vec![route_candidate(
+            "P2",
+            "GP2",
+            json!({
+                "uncached_tokens": 100,
+                "decoder_imbalance_threshold_ppm": 1500000
+            }),
+        )],
+        vec![
+            route_target("gpu-a", 1, json!({"decoder_ratio_ppm": 2000000})),
+            route_target("gpu-b", 1, json!({"decoder_ratio_ppm": 1000000})),
+        ],
+        vec![
+            route_edge(
+                0,
+                0,
+                json!({
+                    "cached_tokens": 10,
+                    "load_cost": 100,
+                    "eviction_cost": 100,
+                    "miss_prefill_cost": 100
+                }),
+            ),
+            route_edge(
+                0,
+                1,
+                json!({
+                    "cached_tokens": 10,
+                    "load_cost": 1,
+                    "eviction_cost": 1,
+                    "miss_prefill_cost": 1
+                }),
+            ),
+        ],
+        Vec::new(),
+    ))?;
+    assert_eq!(routed["plan"]["plan"]["assignments"][0]["target_index"], 0);
+
+    let routed = preble.invoke(route_many(
+        "preble-redirect",
+        vec![route_candidate(
+            "P3",
+            "GP3",
+            json!({
+                "uncached_tokens": 10,
+                "balance_threshold_ppm": 2000000,
+                "prefix_queue_time_doubled": true,
+                "prefix_object_id": "prefix-a",
+                "replica_target_id": "gpu-b"
+            }),
+        )],
+        vec![
+            route_target("gpu-a", 1, json!({"rolling_load_us": 300})),
+            route_target("gpu-b", 1, json!({"rolling_load_us": 100})),
+        ],
+        vec![
+            route_edge(
+                0,
+                0,
+                json!({
+                    "cached_tokens": 90,
+                    "load_cost": 1,
+                    "eviction_cost": 0,
+                    "miss_prefill_cost": 1
+                }),
+            ),
+            route_edge(
+                0,
+                1,
+                json!({
+                    "cached_tokens": 20,
+                    "load_cost": 10,
+                    "eviction_cost": 0,
+                    "miss_prefill_cost": 10
+                }),
+            ),
+        ],
+        Vec::new(),
+    ))?;
+    assert_success(&routed);
+    assert_eq!(routed["plan"]["plan"]["assignments"][0]["target_index"], 1);
+    let replicated = preble.invoke(json!({
+        "api_version": "pie.plex.engine@2",
+        "operation": "cache",
+        "context": {
+            "meta": meta("preble-replicate"),
+            "cause": "insertion",
+            "resident": [],
+            "prospective": [{
+                "object_id": "prefix-a",
+                "size_bytes": 1,
+                "beneficiaries": [],
+                "beneficiary_count": 0,
+                "facts": {}
+            }],
+            "capacity": {"max_bytes": 1, "fixed_bytes": 0, "facts": {}},
+            "episode": null
+        }
+    }))?;
+    assert_success(&replicated);
+    assert_eq!(replicated["actions"][0]["method"], "pie.cache.prefetch@1");
+
+    let local = runtime(packages, "plex_paper_preble", &["cache.prefetch@1"], None)?;
+    let request_specs = [
+        ("H1", "GH1", 1_000_000),
+        ("H2", "GH2", 1_000_000),
+        ("H3", "GH3", 1_000_000),
+        ("M1", "GM1", 700_000),
+        ("M2", "GM2", 700_000),
+        ("L1", "GL1", 340_000),
+    ];
+    let scheduled = local.invoke(schedule_many(
+        "preble-local",
+        request_specs
+            .iter()
+            .map(|(request_id, group_id, hit)| {
+                schedule_candidate(
+                    request_id,
+                    group_id,
+                    1,
+                    json!({
+                        "queue_member": true,
+                        "prefix_hit_ratio_ppm": hit,
+                        "priority_groups": 3
+                    }),
+                )
+            })
+            .collect(),
+        6,
+        6,
+        active_lifecycle(
+            &request_specs
+                .iter()
+                .map(|(request_id, group_id, _)| (*request_id, *group_id))
+                .collect::<Vec<_>>(),
+        ),
+    ))?;
+    assert_eq!(
+        scheduled["plan"]["plan"]["selections"],
+        json!([
+            {"requests": [0], "token_budgets": [1]},
+            {"requests": [1], "token_budgets": [1]},
+            {"requests": [2], "token_budgets": [1]},
+            {"requests": [3], "token_budgets": [1]},
+            {"requests": [4], "token_budgets": [1]},
+            {"requests": [5], "token_budgets": [1]}
+        ])
+    );
+    Ok(())
+}
+
+fn check_lmetric_state_machine(packages: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let lmetric = runtime(packages, "plex_paper_lmetric", &[], None)?;
+    let lifecycle = active_lifecycle(&[("L1", "GL1"), ("L2", "GL2"), ("L3", "GL3")]);
+    let event = |opportunity: &str, request_id: &str, window_id: &str, lifecycle| {
+        route_many(
+            opportunity,
+            vec![route_candidate(
+                request_id,
+                &format!("G{request_id}"),
+                json!({
+                    "request_class": "class-a",
+                    "window_id": window_id
+                }),
+            )],
+            vec![
+                route_target("hit", 1, json!({})),
+                route_target("miss", 1, json!({})),
+            ],
+            vec![
+                route_edge(
+                    0,
+                    0,
+                    json!({
+                        "cache_hit": true,
+                        "new_prefill_tokens": 1,
+                        "current_batch_size": 0
+                    }),
+                ),
+                route_edge(
+                    0,
+                    1,
+                    json!({
+                        "cache_hit": false,
+                        "new_prefill_tokens": 10,
+                        "current_batch_size": 0
+                    }),
+                ),
+            ],
+            lifecycle,
+        )
+    };
+    let first = lmetric.invoke(event("lmetric-alarm-1", "L1", "window-1", lifecycle))?;
+    assert_eq!(first["plan"]["plan"]["assignments"][0]["target_index"], 0);
+    let second = lmetric.invoke(event("lmetric-alarm-2", "L2", "window-1", Vec::new()))?;
+    assert_eq!(second["plan"]["plan"]["assignments"][0]["target_index"], 1);
+    let shared = lmetric.backend().read_shared()?;
+    assert_eq!(shared["lmetric_detector"]["class-a"]["confirmed"], true);
+    assert_eq!(shared["lmetric_detector"]["class-a"]["consecutive"], 2);
+    let reset = lmetric.invoke(event("lmetric-reset", "L3", "window-2", Vec::new()))?;
+    assert_eq!(reset["plan"]["plan"]["assignments"][0]["target_index"], 0);
+
+    let capacity = runtime(packages, "plex_paper_lmetric", &[], None)?;
+    let routed = capacity.invoke(route_many(
+        "lmetric-capacity",
+        vec![
+            route_candidate("C1", "GC1", json!({"request_class": "c1"})),
+            route_candidate("C2", "GC2", json!({"request_class": "c2"})),
+        ],
+        vec![
+            route_target_with_capacity(
+                "target-a",
+                2,
+                vec![json!({"name": "slots", "unit": "request", "maximum": 1})],
+                json!({}),
+            ),
+            route_target_with_capacity(
+                "target-b",
+                2,
+                vec![json!({"name": "slots", "unit": "request", "maximum": 2})],
+                json!({}),
+            ),
+        ],
+        vec![
+            route_edge_with_demand(
+                0,
+                0,
+                vec![json!({"name": "slots", "unit": "request", "amount": 1})],
+                json!({"new_prefill_tokens": 1, "current_batch_size": 0}),
+            ),
+            route_edge_with_demand(
+                0,
+                1,
+                vec![json!({"name": "slots", "unit": "request", "amount": 1})],
+                json!({"new_prefill_tokens": 10, "current_batch_size": 0}),
+            ),
+            route_edge_with_demand(
+                1,
+                0,
+                vec![json!({"name": "slots", "unit": "request", "amount": 1})],
+                json!({"new_prefill_tokens": 1, "current_batch_size": 0}),
+            ),
+            route_edge_with_demand(
+                1,
+                1,
+                vec![json!({"name": "slots", "unit": "request", "amount": 1})],
+                json!({"new_prefill_tokens": 10, "current_batch_size": 0}),
+            ),
+        ],
+        active_lifecycle(&[("C1", "GC1"), ("C2", "GC2")]),
+    ))?;
+    assert_eq!(
+        routed["plan"]["plan"]["assignments"],
+        json!([
+            {"request_index": 0, "edge_index": 0, "target_index": 0},
+            {"request_index": 1, "edge_index": 3, "target_index": 1}
+        ])
+    );
+    Ok(())
+}
+
+fn check_smetric_state_machine(packages: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let smetric = runtime(packages, "plex_paper_smetric", &[], None)?;
+    let first_turns = smetric.invoke(route_many(
+        "smetric-first-turns",
+        vec![
+            route_candidate("S1", "GS1", json!({"session_turn": 0})),
+            route_candidate("S2", "GS2", json!({"session_turn": 0})),
+        ],
+        vec![
+            route_target("instance-a", 2, json!({})),
+            route_target("instance-b", 2, json!({})),
+        ],
+        vec![
+            route_edge(0, 0, json!({"load": 1, "cache_affinity": 0})),
+            route_edge(0, 1, json!({"load": 1, "cache_affinity": 0})),
+            route_edge(1, 0, json!({"load": 1, "cache_affinity": 0})),
+            route_edge(1, 1, json!({"load": 1, "cache_affinity": 0})),
+        ],
+        active_lifecycle(&[
+            ("S1", "GS1"),
+            ("S2", "GS2"),
+            ("S3", "GS3"),
+            ("S4", "GS4"),
+            ("S5", "GS5"),
+            ("S6", "GS6"),
+        ]),
+    ))?;
+    assert_eq!(
+        first_turns["plan"]["plan"]["assignments"],
+        json!([
+            {"request_index": 0, "edge_index": 0, "target_index": 0},
+            {"request_index": 1, "edge_index": 3, "target_index": 1}
+        ])
+    );
+    let route_one =
+        |opportunity: &str, request_id: &str, facts: Value, a_facts: Value, b_facts: Value| {
+            route_many(
+                opportunity,
+                vec![route_candidate(
+                    request_id,
+                    &format!("G{request_id}"),
+                    facts,
+                )],
+                vec![
+                    route_target("instance-a", 1, json!({})),
+                    route_target("instance-b", 1, json!({})),
+                ],
+                vec![route_edge(0, 0, a_facts), route_edge(0, 1, b_facts)],
+                Vec::new(),
+            )
+        };
+    let sticky = smetric.invoke(route_one(
+        "smetric-sticky",
+        "S3",
+        json!({
+            "session_turn": 1,
+            "overload_ppm": 2000000,
+            "hit_ratio_ppm": 900000
+        }),
+        json!({"load": 2, "cache_affinity": 100, "estimated_history_hit": 100}),
+        json!({"load": 1, "cache_affinity": 10, "estimated_history_hit": 100}),
+    ))?;
+    assert_eq!(sticky["plan"]["plan"]["assignments"][0]["target_index"], 0);
+    let overloaded = smetric.invoke(route_one(
+        "smetric-overloaded",
+        "S4",
+        json!({
+            "session_turn": 1,
+            "overload_ppm": 1500000,
+            "hit_ratio_ppm": 900000
+        }),
+        json!({"load": 10, "cache_affinity": 100, "estimated_history_hit": 100}),
+        json!({"load": 2, "cache_affinity": 10, "estimated_history_hit": 100}),
+    ))?;
+    assert_eq!(
+        overloaded["plan"]["plan"]["assignments"][0]["target_index"],
+        1
+    );
+    let evicted = smetric.invoke(route_one(
+        "smetric-evicted",
+        "S5",
+        json!({
+            "session_turn": 2,
+            "overload_ppm": 10000000,
+            "hit_ratio_ppm": 900000
+        }),
+        json!({"load": 2, "cache_affinity": 50, "estimated_history_hit": 100}),
+        json!({"load": 1, "cache_affinity": 10, "estimated_history_hit": 100}),
+    ))?;
+    assert_eq!(evicted["plan"]["plan"]["assignments"][0]["target_index"], 1);
+    let post_fallback = smetric.invoke(route_one(
+        "smetric-post-fallback",
+        "S6",
+        json!({
+            "session_turn": 3,
+            "overload_ppm": 2000000,
+            "hit_ratio_ppm": 900000
+        }),
+        json!({"load": 2, "cache_affinity": 10, "estimated_history_hit": 100}),
+        json!({"load": 1, "cache_affinity": 100, "estimated_history_hit": 100}),
+    ))?;
+    assert_eq!(
+        post_fallback["plan"]["plan"]["assignments"][0]["target_index"],
+        1
+    );
+    Ok(())
+}
+
+fn check_routebalance_state_machine(packages: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let routebalance = runtime(packages, "plex_paper_routebalance", &[], None)?;
+    let scored = routebalance.invoke(route_many(
+        "routebalance-score",
+        vec![route_candidate(
+            "R1",
+            "GR1",
+            json!({
+                "quality_weight_ppm": 500000,
+                "cost_weight_ppm": 250000,
+                "latency_weight_ppm": 250000,
+                "cost_budget": 1000
+            }),
+        )],
+        vec![
+            route_target(
+                "quality",
+                1,
+                json!({
+                    "pending_decode_tokens": 90,
+                    "decode_batch_size": 10,
+                    "tpot_us": 10000
+                }),
+            ),
+            route_target(
+                "efficient",
+                1,
+                json!({
+                    "pending_decode_tokens": 0,
+                    "decode_batch_size": 1,
+                    "tpot_us": 1000
+                }),
+            ),
+        ],
+        vec![
+            route_edge(
+                0,
+                0,
+                json!({
+                    "quality_ppm": 900000,
+                    "cost": 100,
+                    "predicted_output_tokens": 10
+                }),
+            ),
+            route_edge(
+                0,
+                1,
+                json!({
+                    "quality_ppm": 500000,
+                    "cost": 0,
+                    "predicted_output_tokens": 10
+                }),
+            ),
+        ],
+        active_lifecycle(&[("R1", "GR1")]),
+    ))?;
+    assert_eq!(scored["plan"]["plan"]["assignments"][0]["target_index"], 1);
+
+    let lpt = routebalance.invoke(route_many(
+        "routebalance-lpt",
+        vec![
+            route_candidate(
+                "R2",
+                "GR2",
+                json!({
+                    "quality_weight_ppm": 0,
+                    "cost_weight_ppm": 0,
+                    "latency_weight_ppm": 1000000
+                }),
+            ),
+            route_candidate(
+                "R3",
+                "GR3",
+                json!({
+                    "quality_weight_ppm": 0,
+                    "cost_weight_ppm": 0,
+                    "latency_weight_ppm": 1000000
+                }),
+            ),
+        ],
+        vec![
+            route_target(
+                "instance-a",
+                2,
+                json!({
+                    "pending_decode_tokens": 0,
+                    "decode_batch_size": 1,
+                    "tpot_us": 1000
+                }),
+            ),
+            route_target(
+                "instance-b",
+                2,
+                json!({
+                    "pending_decode_tokens": 0,
+                    "decode_batch_size": 1,
+                    "tpot_us": 1000
+                }),
+            ),
+        ],
+        vec![
+            route_edge(
+                0,
+                0,
+                json!({"quality_ppm": 0, "cost": 0, "predicted_output_tokens": 10}),
+            ),
+            route_edge(
+                0,
+                1,
+                json!({"quality_ppm": 0, "cost": 0, "predicted_output_tokens": 10}),
+            ),
+            route_edge(
+                1,
+                0,
+                json!({"quality_ppm": 0, "cost": 0, "predicted_output_tokens": 100}),
+            ),
+            route_edge(
+                1,
+                1,
+                json!({"quality_ppm": 0, "cost": 0, "predicted_output_tokens": 100}),
+            ),
+        ],
+        active_lifecycle(&[("R2", "GR2"), ("R3", "GR3")]),
+    ))?;
+    assert_eq!(
+        lpt["plan"]["plan"]["assignments"],
+        json!([
+            {"request_index": 0, "edge_index": 1, "target_index": 1},
+            {"request_index": 1, "edge_index": 2, "target_index": 0}
+        ])
+    );
+    Ok(())
+}
+
 fn check_unavailable_feedback_cleanup(packages: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let runtime = runtime(packages, "plex_paper_helium", &[], None)?;
     assert_success(&runtime.invoke(schedule_event("A", "G", json!({})))?);
@@ -2414,20 +2982,38 @@ fn route_candidate(request_id: &str, group_id: &str, facts: Value) -> Value {
 }
 
 fn route_target(target_id: &str, max_assignments: u32, facts: Value) -> Value {
+    route_target_with_capacity(target_id, max_assignments, Vec::new(), facts)
+}
+
+fn route_target_with_capacity(
+    target_id: &str,
+    max_assignments: u32,
+    capacity: Vec<Value>,
+    facts: Value,
+) -> Value {
     json!({
         "target_id": target_id,
         "max_assignments": max_assignments,
-        "capacity": [],
+        "capacity": capacity,
         "revision": 1,
         "facts": facts
     })
 }
 
 fn route_edge(request_index: u32, target_index: u32, facts: Value) -> Value {
+    route_edge_with_demand(request_index, target_index, Vec::new(), facts)
+}
+
+fn route_edge_with_demand(
+    request_index: u32,
+    target_index: u32,
+    demand: Vec<Value>,
+    facts: Value,
+) -> Value {
     json!({
         "request_index": request_index,
         "target_index": target_index,
-        "demand": [],
+        "demand": demand,
         "facts": facts
     })
 }

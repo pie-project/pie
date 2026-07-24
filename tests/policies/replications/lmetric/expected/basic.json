@@ -1,1 +1,20 @@
-{"target_id":"Y","metric":16}
+{
+  "schema": "plex-paper-oracle@1",
+  "expectations": [
+    {
+      "case_id": "two-phase-hotspot-confirmation",
+      "first_target": "hit",
+      "second_target": "miss",
+      "confirmed": true
+    },
+    {
+      "case_id": "window-reset",
+      "confirmed": false,
+      "selected_target": "hit"
+    },
+    {
+      "case_id": "aggregate-capacity",
+      "assignments": ["target-a", "target-b"]
+    }
+  ]
+}

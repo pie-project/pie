@@ -10,11 +10,12 @@
     "route"
   ],
   "policy_kernel": [
-    "first-turn load balance",
-    "guarded follow-up cache affinity",
-    "overload and likely-eviction fallback"
+    "round-robin minimum-load first-turn placement",
+    "guarded follow-up session affinity",
+    "overload and likely-eviction load-only fallback"
   ],
   "required_facts": [
+    "session_turn",
     "cache_affinity",
     "load",
     "estimated_history_hit",
@@ -26,6 +27,6 @@
     "global-tier KV fetch"
   ],
   "evidence_level": "inspired-adaptation",
-  "fixture_provenance": "independent reference model from the paper",
+  "fixture_provenance": "arXiv 2607.08565 Figure 13 pseudocode",
   "validation_status": "passing"
 }

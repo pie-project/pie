@@ -23,10 +23,10 @@ This report is generated from committed replication metadata by
 | `agentix` | Agentix: An Efficient Serving Engine for LLM Agents as General Programs | `schedule`, `feedback` | `inspired-adaptation` | `material-semantic-gap` | 2 |
 | `continuum` | Continuum: Efficient and Robust Multi-Turn LLM Agent Scheduling with KV Cache Time-to-Live | `schedule`, `cache`, `feedback` | `inspired-adaptation` | `material-semantic-gap` | 3 |
 | `kvflow` | KVFlow: Efficient Prefix Caching for Accelerating LLM-Based Multi-Agent Workflows | `schedule`, `cache` | `inspired-adaptation` | `material-semantic-gap` | 1 |
-| `preble` | Preble: Efficient Distributed Prompt Scheduling for LLM Serving | `route` | `inspired-adaptation` | `material-semantic-gap` | 2 |
+| `preble` | Preble: Efficient Distributed Prompt Scheduling for LLM Serving | `route`, `schedule`, `cache`, `feedback` | `inspired-adaptation` | `material-semantic-gap` | 1 |
 | `helium` | Efficient LLM Serving for Agentic Workflows: A Data Systems Perspective | `schedule` | `inspired-adaptation` | `material-semantic-gap` | 2 |
 | `vtc` | Fairness in Serving Large Language Models | `schedule`, `feedback` | `inspired-adaptation` | `material-semantic-gap` | 0 |
-| `lmetric` | Simple is Better: Multiplication May Be All You Need for LLM Request Scheduling | `route` | `inspired-adaptation` | `material-semantic-gap` | 1 |
+| `lmetric` | Simple is Better: Multiplication May Be All You Need for LLM Request Scheduling | `route` | `inspired-adaptation` | `material-semantic-gap` | 0 |
 | `fairserve` | Ensuring Fair LLM Serving Amid Diverse Applications | `admit`, `schedule`, `feedback` | `inspired-adaptation` | `incorrect` | 1 |
 | `marconi` | Marconi: Prefix Caching for the Era of Hybrid LLMs | `cache`, `feedback` | `inspired-adaptation` | `incorrect` | 1 |
 | `ragcache` | RAGCache: Efficient Knowledge Caching for Retrieval-Augmented Generation | `cache` | `inspired-adaptation` | `material-semantic-gap` | 0 |

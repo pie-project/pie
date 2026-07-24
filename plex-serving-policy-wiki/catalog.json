@@ -2309,13 +2309,15 @@
       "replication_id": "preble",
       "component": "plex_paper_preble",
       "operations": [
-        "route"
+        "route",
+        "schedule",
+        "cache",
+        "feedback"
       ],
       "evidence_level": "inspired-adaptation",
       "validation_status": "passing",
       "deferred_mechanics": [
-        "prefix replication",
-        "autoscaling"
+        "physical prefix autoscaling"
       ],
       "metadata_path": "tests/policies/replications/preble/metadata.json"
     }
@@ -2378,9 +2380,7 @@
       ],
       "evidence_level": "inspired-adaptation",
       "validation_status": "passing",
-      "deferred_mechanics": [
-        "two-phase hotspot detector"
-      ],
+      "deferred_mechanics": [],
       "metadata_path": "tests/policies/replications/lmetric/metadata.json"
     }
   },

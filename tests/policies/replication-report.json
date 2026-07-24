@@ -14,10 +14,10 @@
   },
   "operation_counts": {
     "admit": 5,
-    "cache": 11,
-    "feedback": 15,
+    "cache": 12,
+    "feedback": 16,
     "route": 14,
-    "schedule": 20
+    "schedule": 21
   },
   "entries": [
     {
@@ -163,27 +163,44 @@
       "source_license": "paper reference; no source copied",
       "component": "plex_paper_preble",
       "implements": [
-        "route"
+        "route",
+        "schedule",
+        "cache",
+        "feedback"
       ],
       "policy_kernel": [
         "E2 exploit when reusable prefix exceeds uncached prompt",
-        "longest-prefix exploitation",
-        "prompt-aware load and eviction-cost exploration"
+        "longest-prefix exploitation with rolling-load redirection",
+        "prompt-aware load and eviction-cost exploration",
+        "decoder-ratio prefill/decode balancing",
+        "cache-hit weighted local queue scheduling"
       ],
       "required_facts": [
         "uncached_tokens",
+        "prompt_tokens",
         "cached_tokens",
         "load_cost",
         "eviction_cost",
-        "miss_prefill_cost"
+        "miss_prefill_cost",
+        "rolling_load_us",
+        "assignment_load_us",
+        "decoder_ratio_ppm",
+        "decoder_imbalance_threshold_ppm",
+        "balance_threshold_ppm",
+        "prefix_hit_ratio_ppm",
+        "priority_groups",
+        "prefix_queue_time_doubled",
+        "prefix_object_id",
+        "replica_target_id"
       ],
-      "required_mechanics": [],
+      "required_mechanics": [
+        "cache.prefetch@1"
+      ],
       "deferred_mechanics": [
-        "prefix replication",
-        "autoscaling"
+        "physical prefix autoscaling"
       ],
       "evidence_level": "inspired-adaptation",
-      "fixture_provenance": "independent implementation from the paper algorithm",
+      "fixture_provenance": "arXiv 2407.00023v2 Algorithms 1-3",
       "validation_status": "passing",
       "fidelity": {
         "classification": "material-semantic-gap",
@@ -290,19 +307,24 @@
       ],
       "policy_kernel": [
         "new_prefill_tokens multiplied by batch_size_plus_one",
-        "confirmed-hotspot load fallback"
+        "class-popularity versus cache-coverage alarm",
+        "2|M| consecutive-request hotspot confirmation",
+        "confirmed-hotspot target filtering"
       ],
       "required_facts": [
+        "request_class",
+        "window_id",
+        "now_ms",
+        "window_ms",
+        "cache_hit",
+        "prompt_tokens",
         "new_prefill_tokens",
-        "current_batch_size",
-        "hotspot_confirmed"
+        "current_batch_size"
       ],
       "required_mechanics": [],
-      "deferred_mechanics": [
-        "two-phase hotspot detector"
-      ],
+      "deferred_mechanics": [],
       "evidence_level": "inspired-adaptation",
-      "fixture_provenance": "paper metric and public router behavior",
+      "fixture_provenance": "OSDI 2026 multiplicative score, Equations 1-2, and two-phase detector",
       "validation_status": "passing",
       "fidelity": {
         "classification": "material-semantic-gap",
@@ -975,11 +997,12 @@
         "route"
       ],
       "policy_kernel": [
-        "first-turn load balance",
-        "guarded follow-up cache affinity",
-        "overload and likely-eviction fallback"
+        "round-robin minimum-load first-turn placement",
+        "guarded follow-up session affinity",
+        "overload and likely-eviction load-only fallback"
       ],
       "required_facts": [
+        "session_turn",
         "cache_affinity",
         "load",
         "estimated_history_hit",
@@ -991,7 +1014,7 @@
         "global-tier KV fetch"
       ],
       "evidence_level": "inspired-adaptation",
-      "fixture_provenance": "independent reference model from the paper",
+      "fixture_provenance": "arXiv 2607.08565 Figure 13 pseudocode",
       "validation_status": "passing",
       "fidelity": {
         "classification": "material-semantic-gap",
@@ -1259,9 +1282,9 @@
         "route"
       ],
       "policy_kernel": [
-        "normalized quality-latency-cost score",
+        "raw-quality and maximum-normalized cost/latency score",
         "cost-budget filtering",
-        "LPT greedy assignment with dead-reckoned load"
+        "LPT greedy assignment with pending-decode dead reckoning"
       ],
       "required_facts": [
         "predicted_output_tokens",
@@ -1271,16 +1294,18 @@
         "latency_weight_ppm",
         "quality_ppm",
         "cost",
-        "latency_ms",
+        "tpot_us",
         "decode_ms_per_token",
-        "queued_tokens"
+        "pending_decode_tokens",
+        "decode_batch_size",
+        "free_decode_slots"
       ],
       "required_mechanics": [],
       "deferred_mechanics": [
         "replica provisioning"
       ],
       "evidence_level": "inspired-adaptation",
-      "fixture_provenance": "paper equations and public artifact decision flow",
+      "fixture_provenance": "arXiv 2606.17949 Equations 1-2 and Algorithm 1",
       "validation_status": "passing",
       "fidelity": {
         "classification": "incorrect",

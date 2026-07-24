@@ -243,6 +243,10 @@ do
         plex_paper_conserve|plex_paper_routebalance)
             operations=route
             ;;
+        plex_paper_preble)
+            operations=route,schedule,cache,feedback
+            optional=cache.prefetch@1
+            ;;
         plex_paper_parrot)
             operations=route,schedule
             ;;

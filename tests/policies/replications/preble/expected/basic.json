@@ -1,4 +1,16 @@
 {
-  "target_id": "X",
-  "branch": "exploit"
+  "schema": "plex-paper-oracle@1",
+  "expectations": [
+    {"case_id": "e2-exploit", "selected_target": "gpu-b"},
+    {"case_id": "e2-explore-decoder-ratio", "selected_target": "gpu-a"},
+    {
+      "case_id": "post-assignment-redirect-and-replication",
+      "selected_target": "gpu-b",
+      "action": "pie.cache.prefetch@1"
+    },
+    {
+      "case_id": "local-weighted-priority",
+      "selection_counts": {"priority-3": 3, "priority-2": 2, "priority-1": 1}
+    }
+  ]
 }

@@ -1,1 +1,23 @@
-{"case":"multiplicative-choice","edges":[{"target":"X","new_prefill_tokens":10,"current_batch_size":4},{"target":"Y","new_prefill_tokens":8,"current_batch_size":2}]}
+{
+  "schema": "plex-paper-oracle@1",
+  "cases": [
+    {
+      "id": "two-phase-hotspot-confirmation",
+      "request_class": "class-a",
+      "window_id": "window-1",
+      "hit_targets": 1,
+      "miss_targets": 1,
+      "consecutive_requests": 2,
+      "scores": {"hit": 1, "miss": 10}
+    },
+    {
+      "id": "window-reset",
+      "next_window_id": "window-2"
+    },
+    {
+      "id": "aggregate-capacity",
+      "target_capacity": {"slots": 1},
+      "request_count": 2
+    }
+  ]
+}
