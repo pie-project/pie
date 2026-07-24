@@ -410,6 +410,107 @@ Metal driver: step-loop internally (same C ABI).
   recorded above as the next standalone item.
   PROJECT VENUS BUILD: COMPLETE on this branch (nothing pushed).
 
+- SECOND LANDING round 1 (frame-prepare hoisting, item ① of the committed
+  roadmap; operator: "구현 시작. backward compatibility 필요 없음").
+  The `handle_fire_batch` monolith (batch/compose.cpp, deleted) dissolved
+  into `batch/frame.{hpp,cpp}`: `prepare_step` (FramePrepare — begin_host
+  wave admission, descriptor resolve, compose, mask decode, RS/sampling/
+  pad planning, and the step parameter block STAGED into per-buffer pinned
+  slots) / `enqueue_step` (StepEnqueue — begin_enqueue pull-validate +
+  Prologue, staged-upload commits in the original per-fire order, pack/
+  pad/envelope kernels, attention-plan hook, forward body, MTP) /
+  `settle_step` (FrameSettle — Dispatch::finish; tail carries the frame
+  completion). context.cpp's frame loop: prepare ALL k steps at frame
+  entry, then enqueue+settle per step in order. Supporting splits:
+  - `Dispatch::begin` → `begin_host` (passes A/B/C, sequence applies —
+    host-only) + `begin_enqueue` (ordering waits, mallocAsync,
+    pull-validate upload+launch, Prologue). `begin` remains the fused
+    wrapper for `run()`.
+  - `DeviceBuffer::copy_from_host` → `stage_from_host` (host memcpy into
+    the existing 13-slot pinned ring; prepare-time) + `commit_staged`
+    (async H2D; enqueue-time). Ring depth already covers 3 frames × 4
+    steps + 1, so staging a whole frame ahead never re-claims a live slot.
+  - Frame failure policy: prepare fault → nothing enqueued, abort every
+    staged wave, ALL steps' terminals FAILED; enqueue fault at step i →
+    steps <i live (settle normally), abort/FAIL i..k-1. Both paths keep
+    today's settle_failed_launch + completion notify shape.
+  - rank-0 path no longer stages RS metadata through the shared
+    pi.*_host mirrors (frame steps own their spans; ForwardDispatchInputs
+    gained rs_slot_flags_h). Mirrors stay for the TP-follower receive
+    path.
+  DELIBERATELY NOT hoisted (recorded): the attention-plan hook stays at
+  StepEnqueue. FlashInfer plans fuse host compute with the H2D commit
+  into the SINGLE stable int workspace (graph-replay hardcodes that
+  address), and `DecodePlanCache.plan_info` is one mutable host struct the
+  body reads at launch — planning k steps ahead corrupts step i's plan
+  with step i+1's. The clean fix is a per-step plan snapshot through the
+  model layer (own landing). Better fact found on the way: intra-frame
+  decode steps have IDENTICAL static-nonsplit plans (same R; the schedule
+  is KV-length-independent), so the end state is plan-ONCE-PER-FRAME, not
+  plan-per-step-hoisted.
+  Fire-timing legs re-scoped to the split (prepare legs vs
+  h2d/forward/settle enqueue legs; host_total = sum of the two exclusive
+  phase spans).
+
+- SECOND LANDING round 1 debug: the k>1 chain kills, and THE WINDOW LAW.
+  First hoisted build: k=1 green (35.4k), EVERY k≥2 run dead — the
+  fixed-decode compose kernel fail-stopped whole chains, single-lane k=2
+  oracle included. Root cause chain (device printf bisect: pv seeds →
+  phase probes → settle probe; then a loop-fusion control run that went
+  green and proved the phase SPLIT sound and the CROSS-STEP hoist at
+  fault):
+  1. `apply_lane_sequence_tickets` (begin pass C) is not just wave
+     admission — it maintains the host mirror cursors (`host_head_/
+     host_tail_`) that EXECUTION-TIME metadata builders read (the fused
+     stage build's unticketed fallback, settlement prep). Hoisting all
+     applies to frame entry let step X's applies move the mirrors before
+     step W's Prologue/Epilogue metadata was built → W's epilogue bound
+     another wave's cells → its generated readiness AND'ed pass_commit
+     to 0 (silently — generated stages don't use k_stage_readiness) → W
+     dummy-ran → no publishes → every successor's pull-validate found
+     tail short by one → chain kill. THE LAW: host mirrors must advance
+     at each wave's ENQUEUE position, in wave order — they are the
+     enqueue track's clock, not admission bookkeeping. Applies now live
+     at the head of `begin_enqueue`.
+  2. FramePrepare-time consumers therefore must NOT read mirrors at all:
+     the wave's window comes from its TICKETS. Flag-free tickets
+     (read-only channels) are now kept in the lane ticket list (device
+     side is entirely flag-gated — they are inert there) purely to carry
+     positions; `lane_ticket_window` resolves prepare-time cell/cursor
+     lookups (stage_fixed_decode / stage_decode_envelopes tables,
+     resolve_descriptors' readback pack) from expected_head/tail, falling
+     back to live mirrors only for engine-unsequenced channels (apply-
+     invariant by definition).
+  3. The composition table build itself moved to FramePrepare
+     (`stage_fixed_decode`/`stage_decode_envelopes`; arena claim + compose
+     kernel stay in the enqueue halves) — at enqueue time the tables read
+     post-ALL-applies state, which is exactly the fleet-kill mechanism
+     of the very first broken run.
+  4. `prior_put_slots`/`prior_take_slots` fill at phase EXECUTION, and
+     the Prologue's own metadata build must not see its own effects —
+     prepare-time consumers get a separate `prologue_put_slots`
+     (statically derived from the prologue stage plans at begin_host).
+  5. Prologue order restored: it historically executed against the
+     pre-resolution wave state; `update_launch_geometry` now runs at
+     enqueue AFTER the Prologue (its old position relative to it).
+  After the fix: k=2/k=3 oracles token-EXACT vs the pre-Venus base, zero
+  kills. All temp diagnostics removed before certification.
+
+- SECOND LANDING round 1 CERTIFIED (frame-prepare hoisting landed).
+  Oracles k∈{1,2,3} t=32 + k=1 t=256: token-EXACT vs pre-Venus dumps.
+  2048×32 c512: k=1 35.58/35.36k (fast band 35.3–35.5 HELD — the
+  restructure costs k=1 nothing), k=2 34.06/34.21k (first-landing band
+  34.05–34.09 held), k=3 33.65k (band ✓), k=4 33.16k (−0.8% vs 33.43,
+  run noise). c0-256: k=1 28.18k ✓, k=2 28.00k (≥ first landing's
+  27.93k). 512×512: 19.82k (top of band). 64×1536: 7.39k ✓. Zero
+  failures at every shape and k. Engine untouched this round (driver
+  C++ only). Net state: per-step host compute (admission passes,
+  resolve, compose, masks, RS/sampling planning, pad decision,
+  parameter-block staging, composition tables) runs once per frame at
+  entry; StepEnqueue is applies + pull-validate + prologue + staged
+  commits + kernels + the attention-plan hook (recorded follow-up:
+  plan-once-per-frame via a model-layer plan snapshot).
+
 ## Done so far
 
 - venus-project.md: decisions 1–8 closed (single path, one ABI jump,

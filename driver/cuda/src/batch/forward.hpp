@@ -435,8 +435,8 @@ cudaGraphExec_t capture_forward_graph_exec(
     int runtime_window_left);
 
 // Env-gated (`PIE_STEP_PROFILE`) forward-body wall-clock timer. Declared here
-// (not private to batch/forward.cpp) because `handle_fire_batch` in
-// batch/compose.cpp times the `run_forward_dispatch` call it makes. Backed
+// (not private to batch/forward.cpp) because `enqueue_step` in
+// batch/frame.cpp times the `run_forward_dispatch` call it makes. Backed
 // by `step_profile_take()` (batch/forward.cpp) so the sampling budget
 // (`PIE_STEP_PROFILE_LIMIT`) is shared across every construction site.
 bool step_profile_take();
@@ -481,8 +481,8 @@ struct StepProfileTimer {
     }
 };
 
-// Wire-shaped forward input spans for one fire, resolved in
-// `batch/compose.cpp` (straight from the wire, composed device geometry, or a
+// Wire-shaped forward input spans for one step, resolved in
+// `batch/frame.cpp` (straight from the wire, composed device geometry, or a
 // graph-padded decode bucket) and handed to `run_forward_dispatch`.
 struct ForwardInputViews {
     std::span<const std::uint32_t> tokens;
@@ -496,7 +496,7 @@ struct ForwardInputViews {
 };
 
 // Wraps already-resolved spans into `ForwardInputViews`. The adapter itself is
-// allocation-free; `batch/compose.cpp` owns any graph-padding storage.
+// allocation-free; `batch/frame.cpp`'s PreparedStep owns any graph-padding storage.
 ForwardInputViews make_forward_input_views(
     std::span<const std::uint32_t> tokens,
     std::span<const std::uint32_t> positions,
@@ -534,6 +534,9 @@ struct ForwardDispatchInputs {
     const std::uint32_t* h_kvlpl_forward = nullptr;
     const std::int32_t*  slot_ids_h_data = nullptr;
     const std::uint8_t*  is_fresh_h_data = nullptr;
+    // Host view of the per-request RS slot flags (frame-owned; the frame
+    // path passes its composed/wire span rather than a shared mirror).
+    const std::uint8_t*  rs_slot_flags_h = nullptr;
     // Ph7 RS rs-output (W10): when rs_buffer_write, the linear layers scatter
     // their in-proj [mixed_qkv|a|b] page-major into the buffered-activation pool
     // at these per-request CSR slabs (write_state forced false). FOLD passes use

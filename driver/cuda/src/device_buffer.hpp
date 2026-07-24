@@ -132,57 +132,57 @@ public:
         return result;
     }
 
-    // Copy from a host span into the existing device allocation (no
-    // alloc). Throws if `src.size() > size()`. Used by the persistent-
-    // buffer path that pre-allocates capacity at startup and refills
-    // contents per fire — gives kernels stable device pointers across
-    // fires (a prerequisite for CUDA-graph capture).
+    // Two-phase refill of the existing device allocation (no alloc),
+    // staged through a lazily-allocated pinned slot ring:
     //
-    // Issues against the default stream; the kernel queue is
-    // in-order, so subsequent kernel launches see the new contents.
+    //   * `stage_from_host` — host work only. Claims the next pinned slot
+    //     (waiting for its previous committed copy to retire) and memcpys
+    //     `src` into it. Nothing reaches the stream, so the frame pipeline
+    //     can stage every step's parameter block at frame entry.
+    //   * `commit_staged`  — enqueue only. Issues the async H2D from the
+    //     staged slot against the default stream; the kernel queue is
+    //     in-order, so subsequent kernel launches see the new contents.
     //
-    // Stages through a lazily-allocated pinned host buffer so the
-    // `cudaMemcpyAsync` from `src` is truly async. Without the staging,
-    // `cudaMemcpyAsync` on pageable host memory blocks the host until
-    // CUDA's internal staging completes — adding ~1-2 ms per call. With
-    // 13+ per-fire copies of this kind, that dominates the wall time at
-    // small per-fire GPU work (~5× HtoD-vs-vllm gap shown in nsys
-    // profiles). Two pinned slots let the configured depth-2 runahead enqueue
-    // the next fire without overwriting the previous fire's DMA source.
-    void copy_from_host(std::span<const T> src) {
-        if (src.size() > count_) {
-            throw std::runtime_error(
-                "DeviceBuffer::copy_from_host: src size " +
-                std::to_string(src.size()) + " > capacity " +
-                std::to_string(count_));
-        }
-        if (src.empty()) return;
-        const std::size_t slot = acquire_pinned_staging();
-        std::memcpy(h_pinned_[slot], src.data(), src.size() * sizeof(T));
-        CUDA_CHECK(cudaMemcpyAsync(ptr_, h_pinned_[slot],
-                                   src.size() * sizeof(T),
-                                   cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaEventRecord(h_pinned_copy_done_[slot], nullptr));
-        h_pinned_copy_pending_[slot] = true;
+    // The pinned staging is what makes the `cudaMemcpyAsync` truly async:
+    // on pageable host memory it blocks the host until CUDA's internal
+    // staging completes (~1-2 ms per call; with 13+ per-fire copies that
+    // dominated wall time at small per-fire GPU work). Slot count covers
+    // the full run-ahead step depth (see runahead.hpp), so a slot claimed
+    // at stage time is never re-claimed before its commit runs.
+    struct StagedUpload {
+        std::size_t slot = 0;
+        std::size_t bytes = 0;
+    };
+
+    StagedUpload stage_from_host(std::span<const T> src) {
+        return stage_bytes(src.data(), src.size() * sizeof(T), src.size());
     }
 
-    // Same as `copy_from_host(span<const T>)` but takes a raw byte view —
-    // the wire-format case where the source bytes alias `T`.
-    // Length must be a multiple of `sizeof(T)`.
-    void copy_from_bytes(std::span<const std::uint8_t> bytes) {
-        if (bytes.size() / sizeof(T) > count_) {
-            throw std::runtime_error(
-                "DeviceBuffer::copy_from_bytes: src elements " +
-                std::to_string(bytes.size() / sizeof(T)) +
-                " > capacity " + std::to_string(count_));
-        }
-        if (bytes.empty()) return;
-        const std::size_t slot = acquire_pinned_staging();
-        std::memcpy(h_pinned_[slot], bytes.data(), bytes.size());
-        CUDA_CHECK(cudaMemcpyAsync(ptr_, h_pinned_[slot], bytes.size(),
+    // Raw-byte variant for the wire-format case where the source bytes
+    // alias `T`. Length must be a multiple of `sizeof(T)`.
+    StagedUpload stage_from_bytes(std::span<const std::uint8_t> bytes) {
+        return stage_bytes(bytes.data(), bytes.size(),
+                           bytes.size() / sizeof(T));
+    }
+
+    void commit_staged(const StagedUpload& staged) {
+        if (staged.bytes == 0) return;
+        CUDA_CHECK(cudaMemcpyAsync(ptr_, h_pinned_[staged.slot],
+                                   staged.bytes,
                                    cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaEventRecord(h_pinned_copy_done_[slot], nullptr));
-        h_pinned_copy_pending_[slot] = true;
+        CUDA_CHECK(cudaEventRecord(
+            h_pinned_copy_done_[staged.slot], nullptr));
+        h_pinned_copy_pending_[staged.slot] = true;
+    }
+
+    // One-phase convenience: stage + commit in place (the pre-frame call
+    // shape, kept for callers outside the step pipeline).
+    void copy_from_host(std::span<const T> src) {
+        commit_staged(stage_from_host(src));
+    }
+
+    void copy_from_bytes(std::span<const std::uint8_t> bytes) {
+        commit_staged(stage_from_bytes(bytes));
     }
 
     T*       data()       noexcept { return ptr_; }
@@ -257,6 +257,21 @@ private:
             h_pinned_copy_pending_[slot] = false;
         }
         return slot;
+    }
+
+    StagedUpload stage_bytes(const void* src,
+                             std::size_t bytes,
+                             std::size_t elements) {
+        if (elements > count_) {
+            throw std::runtime_error(
+                "DeviceBuffer::stage_from_host: src elements " +
+                std::to_string(elements) + " > capacity " +
+                std::to_string(count_));
+        }
+        if (bytes == 0) return {};
+        const std::size_t slot = acquire_pinned_staging();
+        std::memcpy(h_pinned_[slot], src, bytes);
+        return {slot, bytes};
     }
 
     T* ptr_ = nullptr;

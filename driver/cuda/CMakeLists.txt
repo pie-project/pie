@@ -315,7 +315,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/distributed.cpp
   # batch/ -- one submitted batch -> device work
   src/batch/brle.cpp
-  src/batch/compose.cpp
+  src/batch/frame.cpp
   src/batch/forward.cpp
   src/batch/persistent_inputs.cpp
   src/batch/tp.cpp

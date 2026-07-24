@@ -171,10 +171,33 @@ class Dispatch {
 
     int validate_launch(const pie_native::LaunchView& view, std::string* err);
 
-    // Declared-phase execution. `begin` validates/pulls one logical fire and
-    // executes Prologue before descriptor resolution. Model hook points invoke
-    // `execute_attention_phase` for each layer. `finish` executes Epilogue and
-    // performs the sole atomic channel publication.
+    // Declared-phase execution, split along the frame pipeline's two
+    // tracks (venus decision: FramePrepare is host-only, StepEnqueue is
+    // enqueue-only):
+    //
+    //   * `begin_host` — every host-side pass of wave admission: instance
+    //     lookups, commit-snapshot claims, channel ticket builds, and the
+    //     registry sequence applies (which MUST run in wave order — the
+    //     frame driver calls begin_host for its steps in step order).
+    //     Nothing reaches the stream. `stream` is recorded for the later
+    //     enqueue half and for descriptor readbacks.
+    //   * `begin_enqueue` — the stream half, in the original order:
+    //     initialization/publication ordering waits, the pull-validate
+    //     ticket upload + kernel, and the Prologue phase. Must be called
+    //     once, after `begin_host`, at the step's position in the frame's
+    //     enqueue sequence (step i+1's pull-validate reads ring state
+    //     step i's settlement publishes — stream order carries that).
+    //
+    // `begin` is the fused convenience form (host + enqueue back to back)
+    // for single-step callers like `run`. Model hook points invoke
+    // `execute_attention_phase` for each layer. `finish` executes Epilogue
+    // and performs the sole atomic channel publication.
+    std::unique_ptr<StagedLaunch> begin_host(
+        const pie_native::LaunchView& view,
+        cudaStream_t stream);
+
+    void begin_enqueue(StagedLaunch& launch);
+
     std::unique_ptr<StagedLaunch> begin(
         const pie_native::LaunchView& view,
         cudaStream_t stream);
@@ -286,10 +309,18 @@ class Dispatch {
                              StagedLaunch* launch = nullptr,
                              bool allow_device_composed = false);
 
-    // Enqueue the fixed-capacity single-token decode lowering directly into
-    // stable model input buffers. Returns false with an empty error when the
-    // launched programs require general host composition.
-    bool enqueue_fixed_decode(
+    // Device-composition lowering, split along the frame pipeline: the
+    // `stage_*` half (FramePrepare) validates and builds the lane tables —
+    // which read the live registry ring cursors and the wave's channel-
+    // effect sets, valid only at this wave's position in `begin_host`
+    // order — and pulls host-writer rings; the `enqueue_*` half
+    // (StepEnqueue) claims the upload arena and launches the compose
+    // kernel at the step's stream position.
+
+    // Fixed-capacity single-token decode lowering directly into stable
+    // model input buffers. `stage` returns false with an empty error when
+    // the launched programs require general host composition.
+    bool stage_fixed_decode(
         const pie_native::LaunchView& view,
         std::uint32_t page_size,
         std::uint32_t device_pages,
@@ -297,12 +328,22 @@ class Dispatch {
         std::string* err,
         StagedLaunch& launch);
 
+    bool enqueue_fixed_decode(
+        const FixedDecodeDeviceBuffers& buffers,
+        std::string* err,
+        StagedLaunch& launch);
+
     // Resolve device-carried decode values into a host-owned shape template.
-    bool enqueue_decode_envelopes(
+    bool stage_decode_envelopes(
         const pie_native::LaunchView& view,
         std::span<const std::uint32_t> program_token_starts,
         std::span<const std::uint32_t> program_request_starts,
         std::span<const std::uint32_t> template_kv_page_indptr,
+        const DecodeEnvelopeDeviceBuffers& buffers,
+        std::string* err,
+        StagedLaunch& launch);
+
+    bool enqueue_decode_envelopes(
         const DecodeEnvelopeDeviceBuffers& buffers,
         std::string* err,
         StagedLaunch& launch);

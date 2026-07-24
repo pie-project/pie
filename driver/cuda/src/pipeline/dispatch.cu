@@ -1272,6 +1272,14 @@ struct StagedLane {
     std::uint32_t device_ticket_count = 0;
     std::unordered_set<std::uint32_t> prior_put_slots;
     std::unordered_set<std::uint32_t> prior_take_slots;
+    // The Prologue's statically-known put effects, computed at begin_host
+    // for FramePrepare-time consumers (descriptor resolution, the stage_*
+    // composition tables): they historically ran post-begin — after the
+    // Prologue executed and recorded into `prior_put_slots` — but under
+    // the frame split they run before the Prologue is enqueued. The live
+    // sets above still fill at execution time only (the Prologue's own
+    // stage-metadata build must NOT see its own effects).
+    std::unordered_set<std::uint32_t> prologue_put_slots;
     std::uint32_t row_offset = 0;
     std::uint32_t sampled_rows = 0;
     std::uint32_t token_start = 0;
@@ -1302,6 +1310,23 @@ struct StagedLaunch::State {
     // lets the pull skip the old whole-device synchronize on the fire path.
     std::vector<std::vector<std::uint8_t>> writer_staging;
     DeviceHostChannelTicket* device_tickets = nullptr;
+    // Frame split: device-composition lane tables staged at FramePrepare
+    // (`stage_fixed_decode` / `stage_decode_envelopes` — the tables read
+    // live registry ring cursors and the wave's channel-effect sets, valid
+    // only at this wave's position in begin_host order). StepEnqueue's
+    // `enqueue_*` halves claim the upload arena, patch the arena-relative
+    // pointers, and launch the compose kernel.
+    bool fixed_decode_staged = false;
+    std::vector<FixedDecodeLane> fixed_decode_lanes;
+    std::vector<std::uint32_t> fixed_decode_upload_values;
+    std::vector<std::uint32_t> fixed_decode_translation_begin;
+    std::vector<std::size_t> fixed_decode_position_offset;
+    std::uint32_t fixed_decode_page_size = 0;
+    std::uint32_t fixed_decode_device_pages = 0;
+    bool decode_envelopes_staged = false;
+    std::vector<DecodeEnvelopeLane> decode_envelope_lanes;
+    std::size_t decode_envelope_lane_count = 0;
+    std::uint32_t decode_envelope_template_pages = 0;
     std::uint32_t* device_layer = nullptr;
     cudaEvent_t source_ready = nullptr;
     cudaEvent_t phase_done[2] = {nullptr, nullptr};
@@ -1960,9 +1985,14 @@ std::vector<DeviceHostChannelTicket> build_channel_tickets(
         // Sequence-ticket APPLY hoisted to apply_lane_sequence_tickets
         // (W6): this builder runs in parallel across lanes and must not
         // mutate registry state; the applies run afterward in lane order.
-        if ((flags & (kTicketConsume | kTicketPublish | kTicketRequireInput)) == 0) {
-            continue;
-        }
+        //
+        // Flag-free tickets (read-only channels) are KEPT: every device-
+        // side consumer (pull-validate, settle, publish lookup) is
+        // flag-gated, so they are inert there — but they carry the wave's
+        // channel-cursor positions to the stage-metadata builders, which
+        // under the frame split may run after LATER steps' sequence
+        // applies have moved the registry mirrors (a live-mirror fallback
+        // there binds another wave's cells).
         tickets.push_back(DeviceHostChannelTicket{
             .slot = slot,
             .flags = flags,
@@ -2132,6 +2162,40 @@ void record_stage_channel_effects(
             lane.prior_put_slots.insert(slot);
         }
     }
+}
+
+// FramePrepare-time channel-cursor resolution: the wave's window comes
+// from its TICKETS (engine-sequenced expected positions), never from the
+// live registry mirrors — under the frame split the mirrors advance at
+// each wave's enqueue position, which has not happened yet at prepare
+// time. Channels the engine left unsequenced (kNoChannelTicket) are
+// apply-invariant, so their live mirror IS their window.
+struct PreparedCursor {
+    std::uint32_t head_index = 0;
+    std::uint32_t tail_index = 0;
+};
+
+PreparedCursor lane_ticket_window(
+    const StagedLane& lane,
+    std::uint32_t slot,
+    const DeviceChannelRegistry& channels) {
+    PreparedCursor cursor{
+        channels.host_head(slot),
+        channels.host_tail(slot),
+    };
+    for (const DeviceHostChannelTicket& ticket : lane.tickets) {
+        if (ticket.slot != slot) continue;
+        if (ticket.expected_head != kNoChannelTicket) {
+            cursor.head_index = static_cast<std::uint32_t>(
+                ticket.expected_head % ticket.cap1);
+        }
+        if (ticket.expected_tail != kNoChannelTicket) {
+            cursor.tail_index = static_cast<std::uint32_t>(
+                ticket.expected_tail % ticket.cap1);
+        }
+        break;
+    }
+    return cursor;
 }
 
 __global__ void cast_query_bf16_to_f32(
@@ -3587,15 +3651,10 @@ void execute_declared_phase(
 
 }  // namespace
 
-std::unique_ptr<StagedLaunch> Dispatch::begin(
+std::unique_ptr<StagedLaunch> Dispatch::begin_host(
     const pie_native::LaunchView& view,
     cudaStream_t stream) {
     drain_reaped_instances(*impl_);
-    // Order this wave after any pending bind-time initialization work (ring
-    // metadata, seed uploads, baked-list uploads) still riding the registry's
-    // initialization stream — binds no longer host-sync it (RV-28: fires must
-    // never observe a slot whose ring metadata or seeds are still in flight).
-    impl_->channels.order_after_initialization(stream);
     const bool prologue_timing = fire_timing::full();
     const auto prologue_mark = prologue_timing
         ? fire_timing::Clock::now()
@@ -3617,10 +3676,6 @@ std::unique_ptr<StagedLaunch> Dispatch::begin(
     state.owner = impl_.get();
     state.view = view;
     state.stream = stream;
-    CUDA_CHECK(cudaMallocAsync(
-        reinterpret_cast<void**>(&state.device_layer),
-        sizeof(std::uint32_t),
-        stream));
     state.source_ready = acquire_launch_event(*impl_);
     for (cudaEvent_t& event : state.phase_done) {
         event = acquire_launch_event(*impl_);
@@ -3630,15 +3685,9 @@ std::unique_ptr<StagedLaunch> Dispatch::begin(
     state.lanes.reserve(count);
     state.ticket_staging.reserve(view.channel_expected_head.size());
     state.pull_staging.reserve(count);
-    // ONE publication-ordering wait for the whole wave (see
-    // `Impl::publications_done`): the previous wave's publications all rode
-    // the callback stream, so this single wait replaces the per-instance
-    // event waits that used to cost ~2 host API calls per lane per wave.
-    if (impl_->publications_recorded) {
-        CUDA_CHECK(cudaStreamWaitEvent(stream, impl_->publications_done, 0));
-    }
     // Pass A (serial): everything ordering- or allocation-sensitive — map
-    // lookups, snapshot allocation, CUDA event waits.
+    // lookups, snapshot allocation. (The CUDA event waits that used to
+    // interleave here are stream work and live in `begin_enqueue`.)
     const bool begin_timing = prologue_timing;
     auto begin_mark = begin_timing ? fire_timing::Clock::now()
                                    : fire_timing::Clock::time_point{};
@@ -3694,12 +3743,21 @@ std::unique_ptr<StagedLaunch> Dispatch::begin(
             throw std::runtime_error("PTIR launch has no compiler region plans");
         }
         lane->phase_plans = &bound.phase_plans;
-        // Per-instance ordering survives only for the bind-time seed
-        // upload (recorded on the seed copy stream); after the instance's
-        // first completed wave the event is retired and the shared
-        // `publications_done` wait above carries the ordering.
-        if (bound.publish_done != nullptr) {
-            CUDA_CHECK(cudaStreamWaitEvent(stream, bound.publish_done, 0));
+        // Prologue put effects for FramePrepare-time consumers (see the
+        // field's comment) — the LIVE effect sets stay empty until the
+        // phases execute.
+        for (const plan::StagePlan* stage :
+             (*lane->phase_plans)[PTIR_STAGE_PROLOGUE]) {
+            for (const auto& normalized : stage->ops) {
+                const auto& op = normalized.op;
+                if (op.chan < 0 || op.tag != PTIR_OP_CHAN_PUT) continue;
+                const std::uint32_t local =
+                    static_cast<std::uint32_t>(op.chan);
+                if (local >= stage->channel_bindings.size()) continue;
+                lane->prologue_put_slots.insert(
+                    bound.instance->view().slot(
+                        stage->channel_bindings[local]));
+            }
         }
         pending_initial_commit[program] =
             instance_occurrence == 0 ? 1u : 0u;
@@ -3731,13 +3789,14 @@ std::unique_ptr<StagedLaunch> Dispatch::begin(
             fire_timing::duration_us(begin_mark, now);
         begin_mark = now;
     }
-    // Pass C (serial): registry sequence applies in lane order, diagnostic
-    // retry forcing, and the staging appends.
+    // Pass C (serial): diagnostic retry forcing and the staging appends.
+    // The registry sequence APPLIES moved to `begin_enqueue`: host mirrors
+    // must advance at each wave's ENQUEUE position (the pre-frame-split
+    // timeline every execution-time mirror reader was written against),
+    // not at frame entry. FramePrepare-time consumers read the wave's
+    // window from its tickets instead.
     for (std::size_t program = 0; program < count; ++program) {
         std::unique_ptr<StagedLane> lane = std::move(pending_lanes[program]);
-        BoundInstance& bound = *lane->bound;
-        apply_lane_sequence_tickets(
-            view, program, bound, impl_->channels);
         const std::uint32_t initial_commit = pending_initial_commit[program];
         if (impl_->force_retry_launches_remaining.exchange(
                 0, std::memory_order_relaxed) != 0) {
@@ -3776,7 +3835,7 @@ std::unique_ptr<StagedLaunch> Dispatch::begin(
             lane->tickets.begin(),
             lane->tickets.end());
         state.pull_staging.push_back(PullValidateHostChannelLane{
-            .full = bound.instance->view().d_full(),
+            .full = lane->bound->instance->view().d_full(),
             .pass_commit = lane->snapshot->device,
             .ticket_offset = lane->device_ticket_offset,
             .ticket_count = lane->device_ticket_count,
@@ -3790,14 +3849,64 @@ std::unique_ptr<StagedLaunch> Dispatch::begin(
         const auto now = fire_timing::Clock::now();
         launch->begin_breakdown_.pass_c_us =
             fire_timing::duration_us(begin_mark, now);
-        begin_mark = now;
+    }
+    return launch;
+}
+
+void Dispatch::begin_enqueue(StagedLaunch& launch) {
+    StagedLaunch::State& state = *launch.state_;
+    if (!state.active || state.device_layer != nullptr) {
+        throw std::runtime_error(
+            "staged PTIR launch enqueued twice or after abort");
+    }
+    cudaStream_t stream = state.stream;
+    const pie_native::LaunchView& view = state.view;
+    const bool begin_timing = fire_timing::full();
+    auto begin_mark = begin_timing ? fire_timing::Clock::now()
+                                   : fire_timing::Clock::time_point{};
+    // Registry sequence applies, in lane order, at the wave's ENQUEUE
+    // position: every execution-time mirror reader (stage-metadata
+    // builders, settlement prep) was written against the pre-frame-split
+    // timeline where mirrors reflect exactly the waves enqueued so far.
+    // FramePrepare-time consumers never read the mirrors — they use the
+    // wave's tickets.
+    for (const auto& lane : state.lanes) {
+        apply_lane_sequence_tickets(
+            view, lane->program, *lane->bound, impl_->channels);
+    }
+    // Order this wave after any pending bind-time initialization work (ring
+    // metadata, seed uploads, baked-list uploads) still riding the registry's
+    // initialization stream — binds no longer host-sync it (RV-28: fires must
+    // never observe a slot whose ring metadata or seeds are still in flight).
+    impl_->channels.order_after_initialization(stream);
+    CUDA_CHECK(cudaMallocAsync(
+        reinterpret_cast<void**>(&state.device_layer),
+        sizeof(std::uint32_t),
+        stream));
+    // ONE publication-ordering wait for the whole wave (see
+    // `Impl::publications_done`): the previous wave's publications all rode
+    // the callback stream, so this single wait replaces the per-instance
+    // event waits that used to cost ~2 host API calls per lane per wave.
+    if (impl_->publications_recorded) {
+        CUDA_CHECK(cudaStreamWaitEvent(stream, impl_->publications_done, 0));
+    }
+    // Per-instance ordering survives only for the bind-time seed upload
+    // (recorded on the seed copy stream); after the instance's first
+    // completed wave the event is retired and the shared
+    // `publications_done` wait above carries the ordering.
+    for (const auto& lane : state.lanes) {
+        if (lane->bound != nullptr &&
+            lane->bound->publish_done != nullptr) {
+            CUDA_CHECK(cudaStreamWaitEvent(
+                stream, lane->bound->publish_done, 0));
+        }
     }
     state.device_tickets = launch_pull_validate_host_channels_batch(
         state.ticket_staging,
         state.pull_staging,
         stream);
     if (begin_timing) {
-        launch->begin_breakdown_.pull_validate_us = fire_timing::duration_us(
+        launch.begin_breakdown_.pull_validate_us = fire_timing::duration_us(
             begin_mark, fire_timing::Clock::now());
     }
     if (state.device_tickets != nullptr) {
@@ -3842,9 +3951,16 @@ std::unique_ptr<StagedLaunch> Dispatch::begin(
             nullptr, 0, nullptr, 0, 0, 0, stream);
         if (stateful_rs) settle_readiness("prologue");
     } catch (...) {
-        abort(*launch, stream);
+        abort(launch, stream);
         throw;
     }
+}
+
+std::unique_ptr<StagedLaunch> Dispatch::begin(
+    const pie_native::LaunchView& view,
+    cudaStream_t stream) {
+    auto launch = begin_host(view, stream);
+    begin_enqueue(*launch);
     return launch;
 }
 
@@ -4506,7 +4622,7 @@ Dispatch::settle_failed_launch(
     return notifications;
 }
 
-bool Dispatch::enqueue_decode_envelopes(
+bool Dispatch::stage_decode_envelopes(
     const pie_native::LaunchView& view,
     std::span<const std::uint32_t> program_token_starts,
     std::span<const std::uint32_t> program_request_starts,
@@ -4631,8 +4747,10 @@ bool Dispatch::enqueue_decode_envelopes(
         }
         ChannelView& channel_view =
             found->second.instance->view();
+        // FramePrepare-time consumer: the Prologue has not executed yet;
+        // its statically-known put effects stand in for the live set.
         const auto& pending_slots =
-            staged.lanes[program]->prior_put_slots;
+            staged.lanes[program]->prologue_put_slots;
         DecodeEnvelopeLane base{};
         base.pass_commit = reinterpret_cast<std::uintptr_t>(
             staged.lanes[program]->snapshot->device);
@@ -4646,10 +4764,14 @@ bool Dispatch::enqueue_decode_envelopes(
             const std::uint32_t slot =
                 channel_view.slot(binding.channel);
             const bool pending = pending_slots.contains(slot);
+            const PreparedCursor cursor = lane_ticket_window(
+                *staged.lanes[program], slot, state.channels);
+            DeviceChannelRegistry& registry = *channel_view.registry();
             source = reinterpret_cast<std::uintptr_t>(
-                pending
-                    ? channel_view.pending_cell(binding.channel)
-                    : channel_view.committed_cell(binding.channel));
+                static_cast<std::uint8_t*>(registry.cell_base(slot)) +
+                static_cast<std::size_t>(
+                    pending ? cursor.tail_index : cursor.head_index) *
+                    registry.cell_bytes(slot));
         };
         bind_source(
             *token, base.token_source);
@@ -4703,6 +4825,27 @@ bool Dispatch::enqueue_decode_envelopes(
     if (envelope_lanes == 0) {
         return fail("decode envelope: no envelope lanes in the batch");
     }
+    staged.decode_envelope_lanes = std::move(lanes);
+    staged.decode_envelope_lane_count = envelope_lanes;
+    staged.decode_envelope_template_pages =
+        template_kv_page_indptr[staged.decode_envelope_lanes.size()];
+    staged.decode_envelopes_staged = true;
+    return true;
+}
+
+bool Dispatch::enqueue_decode_envelopes(
+    const DecodeEnvelopeDeviceBuffers& buffers,
+    std::string* err,
+    StagedLaunch& launch) {
+    if (err != nullptr) err->clear();
+    Impl& state = *impl_;
+    StagedLaunch::State& staged = *launch.state_;
+    if (!staged.decode_envelopes_staged || !staged.active) {
+        if (err != nullptr) {
+            *err = "ptir decode envelopes were not staged for this launch";
+        }
+        return false;
+    }
 
     if (state.d_envelope_kills == nullptr) {
         CUDA_CHECK(cudaMalloc(&state.d_envelope_kills, sizeof(std::uint32_t)));
@@ -4723,8 +4866,8 @@ bool Dispatch::enqueue_decode_envelopes(
 
     const DecodeEnvelopeUploadArena::Staged uploaded =
         state.decode_envelope_upload.upload(
-            lanes, buffers.kv_page_indices,
-            template_kv_page_indptr[lanes.size()], staged.stream);
+            staged.decode_envelope_lanes, buffers.kv_page_indices,
+            staged.decode_envelope_template_pages, staged.stream);
     const DecodeEnvelopeOutputs outputs{
         .token_ids = buffers.token_ids,
         .position_ids = buffers.position_ids,
@@ -4738,15 +4881,16 @@ bool Dispatch::enqueue_decode_envelopes(
         .dummy_page = buffers.dummy_page,
         .page_size = buffers.page_size,
     };
+    const std::size_t lane_count = staged.decode_envelope_lanes.size();
     std::uint32_t threads = 32;
-    while (threads < lanes.size()) threads *= 2;
+    while (threads < lane_count) threads *= 2;
     compose_decode_envelopes<<<
         1,
         threads,
-        lanes.size() * sizeof(std::uint32_t),
+        lane_count * sizeof(std::uint32_t),
         staged.stream>>>(
         uploaded.lanes,
-        static_cast<std::uint32_t>(lanes.size()),
+        static_cast<std::uint32_t>(lane_count),
         outputs);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaMemcpyAsync(
@@ -4759,12 +4903,13 @@ bool Dispatch::enqueue_decode_envelopes(
     {
         std::lock_guard<std::mutex> lock(state.stats_mutex);
         ++state.stats.decode_envelope_batches;
-        state.stats.decode_envelope_lanes += envelope_lanes;
+        state.stats.decode_envelope_lanes +=
+            staged.decode_envelope_lane_count;
     }
     return true;
 }
 
-bool Dispatch::enqueue_fixed_decode(
+bool Dispatch::stage_fixed_decode(
     const pie_native::LaunchView& view,
     std::uint32_t page_size,
     std::uint32_t device_pages,
@@ -4998,10 +5143,9 @@ bool Dispatch::enqueue_fixed_decode(
         return false;
     }
 
-    // Pull host-writer rings on the LAUNCH stream: the compose kernel and
-    // every stage kernel are ordered behind these copies, and the staging
-    // rides the launch state past their completion — no whole-device
-    // synchronize on the fire path.
+    // Host-writer input availability is a stage-time (admission) check;
+    // the ring PULL itself is stream work and runs in the enqueue half at
+    // the step's stream position.
     for (std::size_t program = 0; program < programs; ++program) {
         BoundInstance& instance = *ports[program].instance;
         std::string value_error;
@@ -5009,8 +5153,6 @@ bool Dispatch::enqueue_fixed_decode(
                 &value_error)) {
             throw RetryableLaunchError(value_error);
         }
-        instance.instance->pull_writer_inputs(
-            staged.stream, staged.writer_staging);
     }
 
     std::vector<std::uint32_t> upload_values(
@@ -5021,15 +5163,15 @@ bool Dispatch::enqueue_fixed_decode(
         ports[program].wire_position_offset = upload_values.size();
         upload_values.push_back(view.position_ids.data()[program]);
     }
-    state.fixed_decode_upload.reserve(
-        programs, upload_values.size(), staged.stream);
     std::vector<FixedDecodeLane> lanes(programs);
     for (std::size_t program = 0; program < programs; ++program) {
         ProgramPorts& program_ports = ports[program];
         ChannelView& channel_view =
             program_ports.instance->instance->view();
+        // FramePrepare-time consumer: the Prologue has not executed yet;
+        // its statically-known put effects stand in for the live set.
         const auto& pending_slots =
-            staged.lanes[program]->prior_put_slots;
+            staged.lanes[program]->prologue_put_slots;
         FixedDecodeLane& lane = lanes[program];
         const std::uint8_t ports_in_lane[] = {
             kPortEmbedTokens,
@@ -5062,28 +5204,26 @@ bool Dispatch::enqueue_fixed_decode(
             const std::uint32_t slot =
                 channel_view.slot(binding->channel);
             const bool pending = pending_slots.contains(slot);
+            const PreparedCursor cursor = lane_ticket_window(
+                *staged.lanes[program], slot, state.channels);
+            DeviceChannelRegistry& registry = *channel_view.registry();
+            auto* cell_base =
+                static_cast<std::uint8_t*>(registry.cell_base(slot));
+            const std::size_t cell_bytes = registry.cell_bytes(slot);
             *sources[index] = reinterpret_cast<std::uintptr_t>(
-                pending
-                    ? channel_view.pending_cell(binding->channel)
-                    : channel_view.committed_cell(binding->channel));
+                cell_base +
+                static_cast<std::size_t>(
+                    pending ? cursor.tail_index : cursor.head_index) *
+                    cell_bytes);
             lane.ready[index] = pending
                 ? 0
                 : reinterpret_cast<std::uintptr_t>(
                       channel_view.d_full() +
                       static_cast<std::size_t>(slot) * kMaxRing +
-                      channel_view.registry()->host_head(slot));
+                      cursor.head_index);
         }
         lane.pass_commit = reinterpret_cast<std::uintptr_t>(
             staged.lanes[program]->snapshot->device);
-        if (program_ports.wire_position_offset !=
-            std::numeric_limits<std::size_t>::max()) {
-            lane.position = reinterpret_cast<std::uintptr_t>(
-                state.fixed_decode_upload.translation_at(
-                    program_ports.wire_position_offset));
-        }
-        lane.translation = reinterpret_cast<std::uintptr_t>(
-            state.fixed_decode_upload.translation_at(
-                program_ports.translation_begin));
         if (has_write_bounds) {
             lane.write_lower_bound =
                 view.ptir_kv_write_lower_bounds.data()[program];
@@ -5092,6 +5232,60 @@ bool Dispatch::enqueue_fixed_decode(
         }
         lane.translation_len = program_ports.translation_len;
         lane.pages_capacity = program_ports.pages_capacity;
+    }
+    // Arena-relative pointers (lane.translation / wire-position source)
+    // are patched at enqueue, after the upload-arena claim.
+    staged.fixed_decode_translation_begin.resize(programs);
+    staged.fixed_decode_position_offset.resize(programs);
+    for (std::size_t program = 0; program < programs; ++program) {
+        staged.fixed_decode_translation_begin[program] =
+            ports[program].translation_begin;
+        staged.fixed_decode_position_offset[program] =
+            ports[program].wire_position_offset;
+    }
+    staged.fixed_decode_lanes = std::move(lanes);
+    staged.fixed_decode_upload_values = std::move(upload_values);
+    staged.fixed_decode_page_size = page_size;
+    staged.fixed_decode_device_pages = device_pages;
+    staged.fixed_decode_staged = true;
+    return true;
+}
+
+bool Dispatch::enqueue_fixed_decode(
+    const FixedDecodeDeviceBuffers& buffers,
+    std::string* err,
+    StagedLaunch& launch) {
+    if (err != nullptr) err->clear();
+    Impl& state = *impl_;
+    StagedLaunch::State& staged = *launch.state_;
+    if (!staged.fixed_decode_staged || !staged.active) {
+        if (err != nullptr) {
+            *err = "ptir fixed decode was not staged for this launch";
+        }
+        return false;
+    }
+    const std::size_t programs = staged.fixed_decode_lanes.size();
+    // Pull host-writer rings on the LAUNCH stream: the compose kernel and
+    // every stage kernel are ordered behind these copies, and the staging
+    // rides the launch state past their completion — no whole-device
+    // synchronize on the fire path.
+    for (const auto& lane : staged.lanes) {
+        lane->bound->instance->pull_writer_inputs(
+            staged.stream, staged.writer_staging);
+    }
+    state.fixed_decode_upload.reserve(
+        programs, staged.fixed_decode_upload_values.size(), staged.stream);
+    for (std::size_t program = 0; program < programs; ++program) {
+        FixedDecodeLane& lane = staged.fixed_decode_lanes[program];
+        if (staged.fixed_decode_position_offset[program] !=
+            std::numeric_limits<std::size_t>::max()) {
+            lane.position = reinterpret_cast<std::uintptr_t>(
+                state.fixed_decode_upload.translation_at(
+                    staged.fixed_decode_position_offset[program]));
+        }
+        lane.translation = reinterpret_cast<std::uintptr_t>(
+            state.fixed_decode_upload.translation_at(
+                staged.fixed_decode_translation_begin[program]));
     }
 
     // Chain-kill diagnostic plumbing: report growth from earlier batches
@@ -5116,7 +5310,9 @@ bool Dispatch::enqueue_fixed_decode(
 
     const FixedDecodeLane* device_lanes =
         state.fixed_decode_upload.upload(
-            lanes, upload_values, staged.stream);
+            staged.fixed_decode_lanes,
+            staged.fixed_decode_upload_values,
+            staged.stream);
     const FixedDecodeOutputs outputs{
         .token_ids = buffers.token_ids,
         .position_ids = buffers.position_ids,
@@ -5131,8 +5327,8 @@ bool Dispatch::enqueue_fixed_decode(
         .sample_indices = buffers.sample_indices,
         .chain_kills = state.d_fixed_decode_kills,
         .dummy_page = buffers.dummy_page,
-        .page_size = page_size,
-        .device_pages = device_pages,
+        .page_size = staged.fixed_decode_page_size,
+        .device_pages = staged.fixed_decode_device_pages,
     };
     std::uint32_t threads = 32;
     while (threads < programs) threads *= 2;
@@ -5207,7 +5403,7 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
 
     auto try_device_composed_template = [&]() {
         // Any all-decode lane count qualifies: graph-lattice padding
-        // (compose.cpp) takes the composed batch from R to its request
+        // (frame.cpp) takes the composed batch from R to its request
         // bucket with device-side pad rows, so the template no longer
         // requires R to sit exactly on the lattice.
         if (!allow_device_composed || staged == nullptr ||
@@ -5476,7 +5672,7 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
         const std::unordered_set<std::uint32_t>* pending_slots =
             staged == nullptr
                 ? nullptr
-                : &staged->lanes[p]->prior_put_slots;
+                : &staged->lanes[p]->prologue_put_slots;
         for (const PortBinding& binding : trace->ports) {
             if (binding.is_const) continue;
             if (mask_only && binding.port != kPortAttnMask) continue;
@@ -5497,17 +5693,30 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
                 pending_slots != nullptr &&
                 pending_slots->contains(slot);
             cell->second.ready = pending ? 1 : 0;
+            // FramePrepare-time read: cursor positions from the wave's
+            // tickets (live mirrors advance only at enqueue); the rare
+            // staged-less probe keeps the live read.
+            const PreparedCursor cursor = staged != nullptr
+                ? lane_ticket_window(
+                      *staged->lanes[p], slot, s.channels)
+                : PreparedCursor{
+                      s.channels.host_head(slot),
+                      s.channels.host_tail(slot),
+                  };
+            DeviceChannelRegistry& registry = *channel_view.registry();
             port_copies.push_back(PortCopy{
                 .program = p,
                 .slot = slot,
-                .source = pending
-                    ? channel_view.pending_cell(binding.channel)
-                    : channel_view.committed_cell(binding.channel),
+                .source =
+                    static_cast<std::uint8_t*>(registry.cell_base(slot)) +
+                    static_cast<std::size_t>(
+                        pending ? cursor.tail_index : cursor.head_index) *
+                        registry.cell_bytes(slot),
                 .ready_source = pending
                     ? nullptr
                     : channel_view.d_full() +
                           static_cast<std::size_t>(slot) * kMaxRing +
-                          channel_view.registry()->host_head(slot),
+                          cursor.head_index,
                 .payload_offset = payload_offset,
                 .ready_offset = ready_offset,
             });
@@ -5629,7 +5838,7 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
                 throw RetryableLaunchError(
                     "ptir prologue or channel readiness did not commit");
             }
-            pending_slots = &lane.prior_put_slots;
+            pending_slots = &lane.prologue_put_slots;
         }
 
         FireGeometry& fg = out.per_program[p];

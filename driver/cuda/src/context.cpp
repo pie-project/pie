@@ -36,7 +36,7 @@
 #include "cuda_check.hpp"
 #include "store/memory_planner.hpp"
 #include "device_buffer.hpp"
-#include "batch/compose.hpp"
+#include "batch/frame.hpp"
 #include "batch/fire_timing.hpp"
 #include "batch/forward.hpp"
 #include "batch/tp.hpp"
@@ -1876,51 +1876,81 @@ int Context::Impl::launch(const PieFrameDesc& frame, PieCompletion completion) {
             return PIE_STATUS_DRIVER_ERROR;
         }
     }
+    // Stream work is SUCCESS-only for admitted frames (P4): any exception
+    // past this point is a driver fault. Latch FAILED on the affected
+    // steps' fires (every step for a prepare fault — nothing was enqueued;
+    // this and later steps for an enqueue fault — earlier steps are live
+    // on the stream and settle normally), resolve the frame completion,
+    // and report the frame as settled-synchronously.
+    std::vector<pie_cuda_driver::PreparedStep> prepared(step_count);
+    const auto fail_frame = [&](std::size_t failed_step,
+                                const char* phase,
+                                const std::exception& e,
+                                std::size_t abort_from,
+                                std::size_t fail_from) -> int {
+        std::cerr << "[pie-driver-cuda] frame step " << failed_step
+                  << " " << phase << ": " << e.what() << "\n";
+        for (std::size_t j = abort_from; j < step_count; ++j) {
+            pie_cuda_driver::abort_step(*executor_, prepared[j]);
+        }
+        std::vector<std::pair<std::uint64_t, std::uint64_t>>
+            channel_notifications;
+        try {
+            channel_notifications =
+                registry_->dispatch().settle_failed_launch(
+                    views[failed_step], executor_->cublas.stream());
+        } catch (const std::exception& settle_error) {
+            std::cerr << "[pie-driver-cuda] frame failure settlement: "
+                      << settle_error.what() << "\n";
+        }
+        for (std::size_t j = fail_from; j < step_count; ++j) {
+            for (std::size_t cell = 0;
+                 cell < steps[j].terminal_cells.len;
+                 ++cell) {
+                publish_terminal(
+                    steps[j].terminal_cells.ptr[cell],
+                    PIE_TERMINAL_OUTCOME_FAILED);
+            }
+        }
+        if (runtime_.notify != nullptr) {
+            for (const auto& [wait_id, epoch] : channel_notifications) {
+                if (wait_id != 0 && epoch != 0) {
+                    runtime_.notify(runtime_.ctx, wait_id, epoch);
+                }
+            }
+        }
+        if (runtime_.notify != nullptr && completion.wait_id != 0) {
+            runtime_.notify(
+                runtime_.ctx, completion.wait_id, completion.target_epoch);
+        }
+        return PIE_STATUS_OK;
+    };
+    // FramePrepare: every step's host work runs at frame entry, before
+    // anything of this frame reaches the stream (the two-track model —
+    // T_prepare amortizes once per frame). Step order matters: wave
+    // admission applies channel sequence tickets in wave order, and each
+    // wave freezes its channel-cursor window into its tickets.
+    for (std::size_t i = 0; i < step_count; ++i) {
+        try {
+            pie_cuda_driver::prepare_step(*executor_, views[i], prepared[i]);
+        } catch (const std::exception& e) {
+            return fail_frame(i, "prepare", e, 0, 0);
+        }
+    }
+    // StepEnqueue + FrameSettle, in step order: each step's settlement
+    // rides the stream before the next step's pull-validate, which is what
+    // lets step i+1 consume step i's device-published channel state. The
+    // tail step carries the frame completion.
     for (std::size_t i = 0; i < step_count; ++i) {
         const bool tail = i + 1 == step_count;
         const PieCompletion step_completion =
             tail ? completion : PieCompletion{0, 0, nullptr};
         try {
-            pie_cuda_driver::handle_fire_batch(
-                0, views[i], *executor_, runtime_, step_completion);
+            pie_cuda_driver::enqueue_step(*executor_, prepared[i]);
+            pie_cuda_driver::settle_step(
+                *executor_, runtime_, step_completion, prepared[i]);
         } catch (const std::exception& e) {
-            // Stream work is SUCCESS-only for admitted frames (P4): any
-            // exception here is a driver fault. Latch FAILED on this and
-            // every remaining step's fires, resolve the frame completion,
-            // and report the frame as settled-synchronously.
-            std::cerr << "[pie-driver-cuda] frame step " << i
-                      << " launch: " << e.what() << "\n";
-            std::vector<std::pair<std::uint64_t, std::uint64_t>>
-                channel_notifications;
-            try {
-                channel_notifications =
-                    registry_->dispatch().settle_failed_launch(
-                        views[i], executor_->cublas.stream());
-            } catch (const std::exception& settle_error) {
-                std::cerr << "[pie-driver-cuda] frame failure settlement: "
-                          << settle_error.what() << "\n";
-            }
-            for (std::size_t j = i; j < step_count; ++j) {
-                for (std::size_t cell = 0;
-                     cell < steps[j].terminal_cells.len;
-                     ++cell) {
-                    publish_terminal(
-                        steps[j].terminal_cells.ptr[cell],
-                        PIE_TERMINAL_OUTCOME_FAILED);
-                }
-            }
-            if (runtime_.notify != nullptr) {
-                for (const auto& [wait_id, epoch] : channel_notifications) {
-                    if (wait_id != 0 && epoch != 0) {
-                        runtime_.notify(runtime_.ctx, wait_id, epoch);
-                    }
-                }
-            }
-            if (runtime_.notify != nullptr && completion.wait_id != 0) {
-                runtime_.notify(
-                    runtime_.ctx, completion.wait_id, completion.target_epoch);
-            }
-            return PIE_STATUS_OK;
+            return fail_frame(i, "launch", e, i, i);
         }
     }
     return PIE_STATUS_OK;

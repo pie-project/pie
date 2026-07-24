@@ -606,7 +606,7 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
     fwd_in.slot_ids_d          = in.use_slots ? pi.slot_ids.data() : nullptr;
     fwd_in.is_fresh_d          = in.use_slots ? pi.is_fresh.data() : nullptr;
     fwd_in.rs_slot_flags_h     = in.use_slots
-        ? pi.rs_slot_flags_host.data()
+        ? in.rs_slot_flags_h
         : nullptr;
     fwd_in.rs_buffer_slot_ids_h    = in.rs_buffer_slot_ids_h;
     fwd_in.rs_buffer_slot_indptr_h = in.rs_buffer_slot_indptr_h;
