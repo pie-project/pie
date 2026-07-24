@@ -190,7 +190,15 @@ class LaneWorkPool {
 };
 
 struct BoundInstance {
+    // Two adjacent u32 words per fire occurrence (ringed):
+    //   [0] pass_commit — seeded by the pull-validate kernel, ANDed by the
+    //       readiness/ticket checks, zeroed by fail-stops.
+    //   [1] kill — set ONLY by a compose fail-stop (fixed-decode/envelope
+    //       chain kill). Settlement reads it to classify the lane FAILED
+    //       (deterministic fault, channels poisoned) instead of RETRY
+    //       (which v14 reserves for host staging-contract violations).
     struct CommitSnapshot {
+        static constexpr std::size_t kWords = 2;
         std::uint32_t* device = nullptr;
         std::uint32_t* host = nullptr;
         std::uint32_t* host_device = nullptr;
@@ -544,12 +552,16 @@ __global__ void compose_fixed_decode(
     }
 
     if (!valid && lane < lane_count) {
-        // Fail-stop: kill the chain (successors dummy-run) AND count the
-        // kill so the host reports it loudly — never a silent poison.
+        // Fail-stop: kill the chain (successors dummy-run), mark the lane's
+        // kill word so settlement classifies it FAILED, and count the kill
+        // so the host reports it loudly — never a silent poison.
         auto* commit = const_cast<std::uint32_t*>(
             fixed_decode_pointer<std::uint32_t>(
                 descriptor->pass_commit));
-        if (commit != nullptr) *commit = 0;
+        if (commit != nullptr) {
+            commit[0] = 0;
+            commit[1] = 1;
+        }
         if (output.chain_kills != nullptr) {
             atomicAdd(output.chain_kills, 1u);
         }
@@ -972,7 +984,10 @@ __global__ void compose_decode_envelopes(
     if (killed) {
         auto* commit = const_cast<std::uint32_t*>(
             fixed_decode_pointer<std::uint32_t>(lane.pass_commit));
-        if (commit != nullptr) *commit = 0;
+        if (commit != nullptr) {
+            commit[0] = 0;
+            commit[1] = 1;
+        }
         if (output.chain_kills != nullptr) {
             atomicAdd(output.chain_kills, 1u);
         }
@@ -1569,8 +1584,13 @@ void CUDART_CB notify_runtime_callback(void* userdata) {
     for (std::size_t index = 0; index < ctx->entry_count; ++index) {
         const auto& entry = ctx->entries[index];
         const bool committed =
-            entry.commit_host != nullptr && *(entry.commit_host) != 0;
-        const bool failed = entry.poison;
+            entry.commit_host != nullptr && entry.commit_host[0] != 0;
+        // Word [1] of the snapshot: a compose fail-stop (chain kill) is a
+        // deterministic per-lane fault — FAILED with poisoned channels,
+        // never RETRY (v14 reserves RETRY for host staging violations).
+        const bool killed =
+            entry.commit_host != nullptr && entry.commit_host[1] != 0;
+        const bool failed = entry.poison || killed;
         const bool retry = !failed && !committed;
         if (retry && ctx->fire_timing_enabled) {
             // Bounded diagnostic: dump the retried lane's endpoint state so
@@ -2354,7 +2374,8 @@ BoundInstance::CommitSnapshot& commit_snapshot(
             if (snapshot.device == nullptr) {
                 CUDA_CHECK(cudaMalloc(
                     reinterpret_cast<void**>(&snapshot.device),
-                    sizeof(std::uint32_t)));
+                    BoundInstance::CommitSnapshot::kWords *
+                        sizeof(std::uint32_t)));
             }
             if (snapshot.host == nullptr) {
                 int device = 0;
@@ -2369,7 +2390,8 @@ BoundInstance::CommitSnapshot& commit_snapshot(
                 if (try_mapping) {
                     const cudaError_t host_status = cudaHostAlloc(
                         reinterpret_cast<void**>(&snapshot.host),
-                        sizeof(std::uint32_t),
+                        BoundInstance::CommitSnapshot::kWords *
+                            sizeof(std::uint32_t),
                         cudaHostAllocMapped | cudaHostAllocPortable);
                     if (host_status != cudaSuccess &&
                         host_status != cudaErrorNotSupported) {
@@ -2400,7 +2422,8 @@ BoundInstance::CommitSnapshot& commit_snapshot(
                 if (snapshot.host == nullptr) {
                     CUDA_CHECK(cudaMallocHost(
                         reinterpret_cast<void**>(&snapshot.host),
-                        sizeof(std::uint32_t)));
+                        BoundInstance::CommitSnapshot::kWords *
+                            sizeof(std::uint32_t)));
                 }
             }
             bound.commit_snapshots.push_back(snapshot);
@@ -4202,7 +4225,8 @@ bool Dispatch::finish(
             notify->copy_sources.push_back(
                 lane.snapshot->device);
             notify->copy_sizes.push_back(
-                sizeof(std::uint32_t));
+                BoundInstance::CommitSnapshot::kWords *
+                    sizeof(std::uint32_t));
         }
         for (std::size_t channel = 0;
              channel < bound.trace->channels.size();
@@ -4331,14 +4355,15 @@ void Dispatch::abort(
     cudaStream_t stream) noexcept {
     if (!launch.state_ || !launch.state_->active) return;
     StagedLaunch::State& state = *launch.state_;
-    const std::uint32_t zero = 0;
+    static constexpr std::uint32_t kZeroWords
+        [BoundInstance::CommitSnapshot::kWords] = {};
     for (auto& lane : state.lanes) {
         if (lane->snapshot != nullptr &&
             lane->snapshot->device != nullptr) {
             cudaMemcpyAsync(
                 lane->snapshot->device,
-                &zero,
-                sizeof(zero),
+                kZeroWords,
+                sizeof(kZeroWords),
                 cudaMemcpyHostToDevice,
                 stream);
         }

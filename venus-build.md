@@ -361,14 +361,25 @@ Metal driver: step-loop internally (same C ABI).
   operator output, once per failing frame — not debug cruft).
   Engine tests 351/351; wheel compiles; settle_defer symbol absent;
   oracles token-EXACT k∈{1,2}; k=1 35.67k (new high), k=2 34.37k.
-- TODO next: (b') S3 kill-bit reclassification — compose chain-kills
-  currently zero pass_commit (indistinguishable from a ticket miss →
-  surfaces as the generic RETRY-contract-violation failure); add a
-  per-lane kill word next to the ringed commit snapshot so settlement
-  reports per-lane FAILED with the real cause. Then: (c) elastic
-  map↔unmap oscillation cleanup (369× cuMemUnmap ≈220ms/run at both k),
-  (d) final cert (all k, fleets, long-tail, oracle sweep), docs
-  (arrival contract wording DONE in venus-project.md), final commit.
+- S3 kill-bit reclassification (round-7, implementation): the ringed
+  commit snapshot widens to TWO adjacent u32 words [pass_commit, kill].
+  Pull-validate seeds both (kill=0 — ring slots carry stale kills
+  otherwise); the fixed-decode and envelope compose fail-stops now set
+  kill=1 alongside zeroing commit (chain-kill counters unchanged);
+  settlement mirrors both words (mapped path: settle kernel
+  store_system_release on word 1; unmapped: the existing D2H pair
+  widens to 8 bytes); abort() zeroes both. The completion callback
+  classifies killed lanes FAILED (poison path: channels poisoned,
+  FAILED terminal) — RETRY is now reserved for host staging-contract
+  violations, exactly what worker.rs's retire arm already asserted
+  ("deterministic compose kills latch FAILED"). Kill-path exercise
+  needs a fault-injection run (not in the hot cert); logic is
+  compile-verified + settle-order reviewed (callback is stream-ordered
+  after the settle kernel on both paths).
+- TODO next: (c) elastic map↔unmap oscillation cleanup (369×
+  cuMemUnmap ≈220ms/run at both k), (d) final cert (all k, fleets,
+  long-tail, oracle sweep), final commit. macOS metal compile
+  verification deferred (metal has no compose kill path to port).
 
 ## Done so far
 

@@ -227,7 +227,11 @@ inline constexpr std::uint32_t kTicketRequireInput = 1u << 4;
         const PullValidateHostChannelLane lane = lanes[lane_index];
         __shared__ std::uint32_t valid;
         if (threadIdx.x == 0) {
-            *lane.pass_commit = lane.initial_commit;
+            // Snapshot words: [0] pass_commit seed, [1] kill — reset both;
+            // the ringed snapshot may carry a stale kill from a previous
+            // occurrence of this ring slot.
+            lane.pass_commit[0] = lane.initial_commit;
+            lane.pass_commit[1] = 0;
         }
         __syncthreads();
 
@@ -318,6 +322,10 @@ inline constexpr std::uint32_t kTicketRequireInput = 1u << 4;
         const std::uint32_t committed = *lane.commit;
         if (threadIdx.x == 0) {
             if (lane.host_commit != nullptr) {
+                // Mapped snapshot: mirror both words ([0] commit, [1] kill)
+                // so the completion callback classifies the lane without a
+                // D2H copy.
+                store_system_release(lane.host_commit + 1, lane.commit[1]);
                 store_system_release(lane.host_commit, committed);
             }
             if (committed != 0) {
