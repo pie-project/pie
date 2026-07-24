@@ -46,7 +46,7 @@ Named datasets/workloads identified from the primary text or manual audit.
 
 - Component: `plex_paper_justitia`
 - Operations: `schedule`, `feedback`
-- Evidence: `inspired-adaptation`
+- Evidence: `policy-kernel-reproduction`
 - Validation: `passing`
 - Metadata: [`tests/policies/replications/justitia/metadata.json`](../../tests/policies/replications/justitia/metadata.json)
 - Deferred mechanics: simultaneous branch execution

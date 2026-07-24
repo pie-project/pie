@@ -54,6 +54,13 @@ def build_report(
         "current_model_only_count": sum(
             not entry["new_primitives_required"] for entry in entries
         ),
+        "current_model_closed_count": sum(
+            entry.get("closure_status") in {
+                "faithful",
+                "decision-trace-parity",
+            }
+            for entry in entries
+        ),
         "new_primitive_count": len(primitive_catalog),
         "evidence_ceiling_counts": dict(sorted(evidence.items())),
         "taxonomy": taxonomy["axes"],
@@ -79,6 +86,8 @@ def markdown(report: dict[str, Any]) -> str:
         f"- Policies: {report['policy_count']}",
         f"- Policies needing no new primitive for their best current-model evidence: "
         f"{report['current_model_only_count']}",
+        f"- Current-model policies implemented and validated: "
+        f"{report['current_model_closed_count']}",
         f"- Deduplicated proposed primitives: {report['new_primitive_count']}",
         "",
         "## Evidence ceiling with the current programming model",
@@ -106,8 +115,8 @@ def markdown(report: dict[str, Any]) -> str:
             "",
             "## Per-policy summary",
             "",
-            "| Policy | Current-model improvements | New primitives | P0 gaps | Current-model ceiling |",
-            "|---|---:|---|---:|---|",
+            "| Policy | Status | Current-model improvements | New primitives | Open P0 gaps | Current-model ceiling |",
+            "|---|---|---:|---|---:|---|",
         ]
     )
     for entry in report["entries"]:
@@ -116,11 +125,12 @@ def markdown(report: dict[str, Any]) -> str:
             for primitive in entry["new_primitives_required"]
         ) or "-"
         p0 = sum(
-            gap["severity"] == "P0"
+            gap["severity"] == "P0" and gap.get("status") != "resolved"
             for gap in entry["implementation_gaps"]
         )
         lines.append(
-            f"| `{entry['id']}` | {len(entry['current_model_improvements'])} | "
+            f"| `{entry['id']}` | `{entry.get('closure_status', 'open')}` | "
+            f"{len(entry['current_model_improvements'])} | "
             f"{primitives} | {p0} | "
             f"`{entry['best_achievable_evidence_with_current_model']}` |"
         )
@@ -153,16 +163,22 @@ def markdown(report: dict[str, Any]) -> str:
             lines.append("- No new primitive is required for the stated evidence ceiling.")
         lines.extend(["", "### Implementation gaps", ""])
         for gap in entry["implementation_gaps"]:
-            lines.append(
-                f"- **{gap['severity']} — {gap['gap']}**: {gap['fix']}"
-            )
+            prefix = "✅ Resolved" if gap.get("status") == "resolved" else "Open"
+            lines.append(f"- **{prefix} · {gap['severity']} — {gap['gap']}**: {gap['fix']}")
         lines.extend(
             [
                 "",
                 f"**Best evidence without new primitives:** "
                 f"`{entry['best_achievable_evidence_with_current_model']}`",
                 "",
-                "**Recommended sequence:**",
+                (
+                    "**Completed sequence:**"
+                    if entry.get("closure_status") in {
+                        "faithful",
+                        "decision-trace-parity",
+                    }
+                    else "**Recommended sequence:**"
+                ),
             ]
         )
         for step in entry["recommended_sequence"]:

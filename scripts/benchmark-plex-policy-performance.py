@@ -1165,7 +1165,7 @@ def scenario_fairserve(
     bench: PolicyBench, _rng: random.Random, trials: int
 ) -> dict[str, Any]:
     weights = [1, 2, 4, 8]
-    requests_per_user = max(trials, 16)
+    requests_per_user = min(max(trials, 16), 64)
     facts = []
     group_keys = []
     user_indices = []

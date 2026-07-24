@@ -46,7 +46,7 @@ Named datasets/workloads identified from the primary text or manual audit.
 
 - Component: `plex_paper_smetric`
 - Operations: `route`
-- Evidence: `inspired-adaptation`
+- Evidence: `decision-trace-parity-with-deferred-mechanics`
 - Validation: `passing`
 - Metadata: [`tests/policies/replications/smetric/metadata.json`](../../tests/policies/replications/smetric/metadata.json)
 - Deferred mechanics: global-tier KV fetch

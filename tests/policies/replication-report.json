@@ -6,11 +6,15 @@
   "candidate_count": 31,
   "smoke_passing_count": 31,
   "evidence_counts": {
-    "inspired-adaptation": 31
+    "decision-trace-parity-with-deferred-mechanics": 4,
+    "inspired-adaptation": 14,
+    "policy-kernel-reproduction": 13
   },
   "fidelity_counts": {
-    "incorrect": 14,
-    "material-semantic-gap": 17
+    "faithful": 6,
+    "faithful-with-deferred-mechanics": 11,
+    "incorrect": 8,
+    "material-semantic-gap": 6
   },
   "operation_counts": {
     "admit": 5,
@@ -56,13 +60,13 @@
         "KV swap kernel",
         "multi-step engine execution"
       ],
-      "evidence_level": "inspired-adaptation",
+      "evidence_level": "policy-kernel-reproduction",
       "fixture_provenance": "NSDI 2026 Algorithm 1, Equations 1-2, and anti-starvation rule",
       "validation_status": "passing",
       "fidelity": {
-        "classification": "material-semantic-gap",
+        "classification": "faithful-with-deferred-mechanics",
         "confidence": "high",
-        "summary": "Group attained-service ordering is recognizable, but PLAS queue bands, quanta, demotion, starvation reset, and ATLAS critical-path state are absent."
+        "summary": "PLAS/ATLAS queue bands, per-call quanta, demotion, anti-starvation reset, request-to-group accounting, and critical-path updates now match Algorithm 1; KV swap and multi-step execution remain adapter mechanics."
       },
       "case": "tests/policies/replications/agentix/cases/basic.json",
       "expected": "tests/policies/replications/agentix/expected/basic.json"
@@ -108,13 +112,13 @@
         "tool parser",
         "physical KV pinning"
       ],
-      "evidence_level": "inspired-adaptation",
+      "evidence_level": "policy-kernel-reproduction",
       "fixture_provenance": "arXiv 2511.02230 Algorithm 1 and Equations 1-2",
       "validation_status": "passing",
       "fidelity": {
-        "classification": "material-semantic-gap",
+        "classification": "faithful-with-deferred-mechanics",
         "confidence": "high",
-        "summary": "The preempted, pinned, arrival ordering is present, but optimized TTL is reduced to a Boolean and expiry lacks time, history, pressure and same-program queue semantics."
+        "summary": "Continuum now implements the empirical-CDF TTL optimizer, timestamped pins, same-program queue protection, TTL-aware FCFS priority, and deadlock pin breaking; physical pinning remains adapter work."
       },
       "case": "tests/policies/replications/continuum/cases/basic.json",
       "expected": "tests/policies/replications/continuum/expected/basic.json"
@@ -158,13 +162,13 @@
       "deferred_mechanics": [
         "CPU-GPU transfer overlap"
       ],
-      "evidence_level": "inspired-adaptation",
+      "evidence_level": "policy-kernel-reproduction",
       "fixture_provenance": "arXiv 2507.07400 Section 3 Agent Step Graph and four-state transfer model",
       "validation_status": "passing",
       "fidelity": {
-        "classification": "material-semantic-gap",
+        "classification": "faithful-with-deferred-mechanics",
         "confidence": "high",
-        "summary": "The eviction tuple and prefetch intent resemble KVFlow, but Agent Step Graph aggregation and transfer states are absent."
+        "summary": "KVFlow now consumes validated Agent Step Graph STE facts, applies node-level minimum aggregation, varying-suffix-first reclaim, four transfer states, status-aware scheduling, and enacted prefetch feedback; transfer overlap is adapter evidence."
       },
       "case": "tests/policies/replications/kvflow/cases/basic.json",
       "expected": "tests/policies/replications/kvflow/expected/basic.json"
@@ -214,13 +218,13 @@
       "deferred_mechanics": [
         "physical prefix autoscaling"
       ],
-      "evidence_level": "inspired-adaptation",
+      "evidence_level": "decision-trace-parity-with-deferred-mechanics",
       "fixture_provenance": "arXiv 2407.00023v2 Algorithms 1-3",
       "validation_status": "passing",
       "fidelity": {
-        "classification": "material-semantic-gap",
+        "classification": "faithful-with-deferred-mechanics",
         "confidence": "high",
-        "summary": "The exploit/explore threshold is present, but exploration omits per-target profiled cost and exploitation omits least-load tie-breaking and post-placement behavior."
+        "summary": "Preble now reproduces E2 Algorithms 1-3, decoder-ratio balancing, rolling-load redirection, weighted local queues, capacity accounting, and prefix-replication intent; physical autoscaling remains deferred."
       },
       "case": "tests/policies/replications/preble/cases/basic.json",
       "expected": "tests/policies/replications/preble/expected/basic.json"
@@ -267,13 +271,13 @@
       "deferred_mechanics": [
         "query-plan rewrite fact producer"
       ],
-      "evidence_level": "inspired-adaptation",
+      "evidence_level": "policy-kernel-reproduction",
       "fixture_provenance": "arXiv 2603.16104 Algorithm 1 and token-step cost model",
       "validation_status": "passing",
       "fidelity": {
-        "classification": "material-semantic-gap",
+        "classification": "faithful-with-deferred-mechanics",
         "confidence": "high",
-        "summary": "One local ready/depth/reuse choice does not reproduce Helium's whole-DAG TRT planner, multi-worker assignment, nested sequences or capacity timeline."
+        "summary": "Helium now executes validated whole-DAG/TRT plans with worker assignment, nested sequence cursors, dependency and precedence readiness, critical-path traversal, forced progress, and proactive warming; logical-plan rewrite is a host fact producer."
       },
       "case": "tests/policies/replications/helium/cases/basic.json",
       "expected": "tests/policies/replications/helium/expected/basic.json"
@@ -310,13 +314,13 @@
       ],
       "required_mechanics": [],
       "deferred_mechanics": [],
-      "evidence_level": "inspired-adaptation",
+      "evidence_level": "policy-kernel-reproduction",
       "fixture_provenance": "OSDI 2024 Algorithm 2 and VTC artifact commit 192c2e",
       "validation_status": "passing",
       "fidelity": {
-        "classification": "material-semantic-gap",
+        "classification": "faithful",
         "confidence": "high",
-        "summary": "Minimum-counter ordering is recognizable, but the original implementation lacked counter lift, weighted costs, dispatch charging and iterative batch accounting."
+        "summary": "VTC now implements Algorithm 2 queue entry and idle lifts, per-client FIFO, batch-local tentative counters, enactment-safe input charging, weighted decode charging, and heterogeneous ON/OFF traces."
       },
       "case": "tests/policies/replications/vtc/cases/basic.json",
       "expected": "tests/policies/replications/vtc/expected/basic.json"
@@ -350,13 +354,13 @@
       ],
       "required_mechanics": [],
       "deferred_mechanics": [],
-      "evidence_level": "inspired-adaptation",
+      "evidence_level": "policy-kernel-reproduction",
       "fixture_provenance": "OSDI 2026 multiplicative score, Equations 1-2, and two-phase detector",
       "validation_status": "passing",
       "fidelity": {
-        "classification": "material-semantic-gap",
+        "classification": "faithful",
         "confidence": "high",
-        "summary": "The P-token times batch-size core exists, but idle-replica semantics and the stateful two-phase hotspot detector are absent."
+        "summary": "LMetric now implements the exact P-token times (batch size plus one) score, idle boundaries, class-popularity/cache-coverage alarm, 2|M| confirmation, target filtering, and shared capacity accounting."
       },
       "case": "tests/policies/replications/lmetric/cases/basic.json",
       "expected": "tests/policies/replications/lmetric/expected/basic.json"
@@ -407,13 +411,13 @@
       "deferred_mechanics": [
         "production interaction and RPM estimator"
       ],
-      "evidence_level": "inspired-adaptation",
+      "evidence_level": "policy-kernel-reproduction",
       "fixture_provenance": "arXiv 2411.15997 Algorithm 1 and Equations 2-3",
       "validation_status": "passing",
       "fidelity": {
-        "classification": "incorrect",
+        "classification": "faithful",
         "confidence": "high",
-        "summary": "The original kernel confused interaction-aware throttling with an invented interference score and omitted OIT and application-stage WSC normalization."
+        "summary": "FairServe now implements windowed OIT, interaction preservation, user-scoped counter lifts, and Equations 2-3 application-stage WSC normalization with fixed-point accounting."
       },
       "case": "tests/policies/replications/fairserve/cases/basic.json",
       "expected": "tests/policies/replications/fairserve/expected/basic.json"
@@ -449,13 +453,13 @@
       "deferred_mechanics": [
         "hybrid-model kernel integration"
       ],
-      "evidence_level": "inspired-adaptation",
+      "evidence_level": "decision-trace-parity-with-deferred-mechanics",
       "fixture_provenance": "MLSys 2025 Sections 4.1-4.3 and artifact commit 08016617",
       "validation_status": "passing",
       "fidelity": {
-        "classification": "incorrect",
+        "classification": "faithful-with-deferred-mechanics",
         "confidence": "high",
-        "summary": "A reuse-times-FLOPs-per-byte knapsack replaces Marconi's separate speculative admission and recency-plus-FLOP-efficiency eviction."
+        "summary": "Marconi now reproduces speculative radix admission, last-decoded checkpointing, one-child eligibility, accessed-node timestamps, and normalized recency plus alpha FLOP-efficiency eviction; hybrid checkpoint/merge enactment remains deferred."
       },
       "case": "tests/policies/replications/marconi/cases/basic.json",
       "expected": "tests/policies/replications/marconi/expected/basic.json"
@@ -496,13 +500,13 @@
         "cache.swap@1"
       ],
       "deferred_mechanics": [],
-      "evidence_level": "inspired-adaptation",
+      "evidence_level": "decision-trace-parity-with-deferred-mechanics",
       "fixture_provenance": "arXiv 2404.12457 Equations 1-3 and Algorithm 1",
       "validation_status": "passing",
       "fidelity": {
-        "classification": "material-semantic-gap",
+        "classification": "faithful-with-deferred-mechanics",
         "confidence": "high",
-        "summary": "A static lowest-score leaf resembles PGDSF, but clocks, updates, iterative frontier evolution and GPU-host hierarchy are missing."
+        "summary": "RAGCache now implements two-tier PGDSF clocks, stateful frequency/cost updates, evolving leaf frontiers, swap-once feedback, and cache-aware request ordering; physical hierarchy movement remains adapter evidence."
       },
       "case": "tests/policies/replications/ragcache/cases/basic.json",
       "expected": "tests/policies/replications/ragcache/expected/basic.json"
@@ -543,13 +547,13 @@
       ],
       "required_mechanics": [],
       "deferred_mechanics": [],
-      "evidence_level": "inspired-adaptation",
+      "evidence_level": "policy-kernel-reproduction",
       "fixture_provenance": "arXiv 2501.14312 Algorithms 1-2",
       "validation_status": "passing",
       "fidelity": {
-        "classification": "material-semantic-gap",
+        "classification": "faithful",
         "confidence": "high",
-        "summary": "Deficit and locality signals are present, but the original implementation reversed locality-first ordering and omitted refill cycles, extend accounting and per-worker deficits."
+        "summary": "DLPM now implements distinct-client refill, locality-first scheduling, feedback-only extend/output debit, persistent per-client and per-worker deficits, longest-prefix worker sets, and capacity accounting."
       },
       "case": "tests/policies/replications/dlpm/cases/basic.json",
       "expected": "tests/policies/replications/dlpm/expected/basic.json"
@@ -627,13 +631,13 @@
       ],
       "required_mechanics": [],
       "deferred_mechanics": [],
-      "evidence_level": "inspired-adaptation",
+      "evidence_level": "policy-kernel-reproduction",
       "fixture_provenance": "arXiv 2607.02525 Equations 1-2 and Algorithm 2",
       "validation_status": "passing",
       "fidelity": {
-        "classification": "material-semantic-gap",
+        "classification": "faithful",
         "confidence": "high",
-        "summary": "Only the demand-and-fairness idea remains; pending trie, cLPM sections, stride lanes, dynamic fairness and ancestor-demand eviction are absent."
+        "summary": "PEEK now implements Eq. 1 cLPM sections and keys, optional group-major order, EMA dynamic fairness, stride interleaving, no-sharing FCFS fallback, and Eq. 2 ancestor-demand eviction from validated pending-tree facts."
       },
       "case": "tests/policies/replications/peek/cases/basic.json",
       "expected": "tests/policies/replications/peek/expected/basic.json"
@@ -786,13 +790,13 @@
       "deferred_mechanics": [
         "simultaneous branch execution"
       ],
-      "evidence_level": "inspired-adaptation",
+      "evidence_level": "policy-kernel-reproduction",
       "fixture_provenance": "arXiv 2510.17015v2 Equations 1-3",
       "validation_status": "passing",
       "fidelity": {
-        "classification": "incorrect",
+        "classification": "faithful-with-deferred-mechanics",
         "confidence": "high",
-        "summary": "Fewest-completed-branches is not Justitia's predicted KV token-time cost and GPS virtual-finish scheduling."
+        "summary": "Justitia now implements memory-centric KV token-time cost, active-set GPS virtual time, immutable finish tags, grouped ready-branch pampering, and consumed-cost feedback; physical co-execution remains deferred."
       },
       "case": "tests/policies/replications/justitia/cases/basic.json",
       "expected": "tests/policies/replications/justitia/expected/basic.json"
@@ -915,13 +919,13 @@
       "deferred_mechanics": [
         "latency-distribution estimator"
       ],
-      "evidence_level": "inspired-adaptation",
+      "evidence_level": "policy-kernel-reproduction",
       "fixture_provenance": "EuroSys 2026 Equations 1-3 and Section 4.3 DEPQ hysteresis",
       "validation_status": "passing",
       "fidelity": {
-        "classification": "incorrect",
+        "classification": "faithful-with-deferred-mechanics",
         "confidence": "high",
-        "summary": "The original two-term P95 gate omitted PARD's queue, execution, batch-wait quantile, pipeline state and adaptive HBF/LBF ordering."
+        "summary": "PARD now implements Equation 3 for linear and DAG pipelines, capability-guarded proactive drops, remaining-budget DEPQ, load-factor HBF/LBF hysteresis, and feedback-smoothed estimator state."
       },
       "case": "tests/policies/replications/pard/cases/basic.json",
       "expected": "tests/policies/replications/pard/expected/basic.json"
@@ -1077,13 +1081,13 @@
       "deferred_mechanics": [
         "global-tier KV fetch"
       ],
-      "evidence_level": "inspired-adaptation",
+      "evidence_level": "decision-trace-parity-with-deferred-mechanics",
       "fixture_provenance": "arXiv 2607.08565 Figure 13 pseudocode",
       "validation_status": "passing",
       "fidelity": {
-        "classification": "material-semantic-gap",
+        "classification": "faithful-with-deferred-mechanics",
         "confidence": "high",
-        "summary": "The first/follow-up split exists, but overload and eviction guards are absent and active migration differs from global-tier fallback routing."
+        "summary": "SMetric now matches Figure 13 first-turn round-robin load balancing, guarded follow-up stickiness, overload and likely-eviction fallback, post-fallback sessions, and aggregate capacity; global-tier transfer remains deferred."
       },
       "case": "tests/policies/replications/smetric/cases/basic.json",
       "expected": "tests/policies/replications/smetric/expected/basic.json"
@@ -1340,13 +1344,13 @@
       "deferred_mechanics": [
         "physical work stealing"
       ],
-      "evidence_level": "inspired-adaptation",
+      "evidence_level": "policy-kernel-reproduction",
       "fixture_provenance": "arXiv 2605.00528v2 Equations 1, 6-9 and Algorithm 1",
       "validation_status": "passing",
       "fidelity": {
-        "classification": "incorrect",
+        "classification": "faithful-with-deferred-mechanics",
         "confidence": "high",
-        "summary": "Always-locality routing, generic group service and Boolean TTL omit WA-LRU, adaptive TTL, guarded stealing, KV migration and deadline-based AFS."
+        "summary": "SAGA now implements Eq. 7 affinity routing and guarded oldest-session stealing, Eq. 1 WA-LRU, pressure-scaled tool TTL, Eq. 8 AFS allocation, capacity accounting, and enacted affinity updates; physical migration remains deferred."
       },
       "case": "tests/policies/replications/saga/cases/basic.json",
       "expected": "tests/policies/replications/saga/expected/basic.json"
@@ -1385,13 +1389,13 @@
       "deferred_mechanics": [
         "replica provisioning"
       ],
-      "evidence_level": "inspired-adaptation",
+      "evidence_level": "policy-kernel-reproduction",
       "fixture_provenance": "arXiv 2606.17949 Equations 1-2 and Algorithm 1",
       "validation_status": "passing",
       "fidelity": {
-        "classification": "incorrect",
+        "classification": "faithful",
         "confidence": "high",
-        "summary": "Exhaustive static utility matching is the opposite of RouteBalance's normalized quality/latency/cost score and LPT greedy dead-reckoning."
+        "summary": "RouteBalance now implements raw quality plus maximum-normalized cost and latency, budget filtering, weight normalization, exact d/b+L latency, LPT order, dead-reckoned pending decode, and shared capacity accounting."
       },
       "case": "tests/policies/replications/routebalance/cases/basic.json",
       "expected": "tests/policies/replications/routebalance/expected/basic.json"

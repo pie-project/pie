@@ -32,7 +32,7 @@
   ],
   "required_mechanics": [],
   "deferred_mechanics": ["tool parser", "physical KV pinning"],
-  "evidence_level": "inspired-adaptation",
+  "evidence_level": "policy-kernel-reproduction",
   "fixture_provenance": "arXiv 2511.02230 Algorithm 1 and Equations 1-2",
   "validation_status": "passing"
 }

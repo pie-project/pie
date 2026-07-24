@@ -31,7 +31,7 @@
   "deferred_mechanics": [
     "simultaneous branch execution"
   ],
-  "evidence_level": "inspired-adaptation",
+  "evidence_level": "policy-kernel-reproduction",
   "fixture_provenance": "arXiv 2510.17015v2 Equations 1-3",
   "validation_status": "passing"
 }

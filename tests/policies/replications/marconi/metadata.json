@@ -24,7 +24,7 @@
   ],
   "required_mechanics": [],
   "deferred_mechanics": ["hybrid-model kernel integration"],
-  "evidence_level": "inspired-adaptation",
+  "evidence_level": "decision-trace-parity-with-deferred-mechanics",
   "fixture_provenance": "MLSys 2025 Sections 4.1-4.3 and artifact commit 08016617",
   "validation_status": "passing"
 }

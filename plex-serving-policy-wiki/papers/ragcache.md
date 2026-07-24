@@ -46,7 +46,7 @@ Named datasets/workloads identified from the primary text or manual audit.
 
 - Component: `plex_paper_ragcache`
 - Operations: `schedule`, `cache`, `feedback`
-- Evidence: `inspired-adaptation`
+- Evidence: `decision-trace-parity-with-deferred-mechanics`
 - Validation: `passing`
 - Metadata: [`tests/policies/replications/ragcache/metadata.json`](../../tests/policies/replications/ragcache/metadata.json)
 - Deferred mechanics: None

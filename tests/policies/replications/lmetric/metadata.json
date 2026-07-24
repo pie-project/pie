@@ -25,7 +25,7 @@
   ],
   "required_mechanics": [],
   "deferred_mechanics": [],
-  "evidence_level": "inspired-adaptation",
+  "evidence_level": "policy-kernel-reproduction",
   "fixture_provenance": "OSDI 2026 multiplicative score, Equations 1-2, and two-phase detector",
   "validation_status": "passing"
 }

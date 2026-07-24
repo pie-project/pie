@@ -52,7 +52,7 @@ Named datasets are listed in the paper evaluation and public artifact.
 
 - Component: `plex_paper_routebalance`
 - Operations: `route`
-- Evidence: `inspired-adaptation`
+- Evidence: `policy-kernel-reproduction`
 - Validation: `passing`
 - Metadata: [`tests/policies/replications/routebalance/metadata.json`](../../tests/policies/replications/routebalance/metadata.json)
 - Deferred mechanics: replica provisioning

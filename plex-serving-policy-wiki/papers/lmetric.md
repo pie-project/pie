@@ -47,7 +47,7 @@ Named datasets/workloads identified from the primary text or manual audit.
 
 - Component: `plex_paper_lmetric`
 - Operations: `route`
-- Evidence: `inspired-adaptation`
+- Evidence: `policy-kernel-reproduction`
 - Validation: `passing`
 - Metadata: [`tests/policies/replications/lmetric/metadata.json`](../../tests/policies/replications/lmetric/metadata.json)
 - Deferred mechanics: None

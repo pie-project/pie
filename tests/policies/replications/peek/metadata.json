@@ -31,7 +31,7 @@
   ],
   "required_mechanics": [],
   "deferred_mechanics": [],
-  "evidence_level": "inspired-adaptation",
+  "evidence_level": "policy-kernel-reproduction",
   "fixture_provenance": "arXiv 2607.02525 Equations 1-2 and Algorithm 2",
   "validation_status": "passing"
 }

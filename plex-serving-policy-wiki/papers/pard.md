@@ -48,7 +48,7 @@ Named datasets/workloads identified from the primary text or manual audit.
 
 - Component: `plex_paper_pard`
 - Operations: `schedule`, `feedback`
-- Evidence: `inspired-adaptation`
+- Evidence: `policy-kernel-reproduction`
 - Validation: `passing`
 - Metadata: [`tests/policies/replications/pard/metadata.json`](../../tests/policies/replications/pard/metadata.json)
 - Deferred mechanics: latency-distribution estimator

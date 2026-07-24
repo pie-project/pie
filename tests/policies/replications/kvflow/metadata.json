@@ -29,7 +29,7 @@
   "required_mechanics": [],
   "optional_mechanics": ["cache.prefetch@1"],
   "deferred_mechanics": ["CPU-GPU transfer overlap"],
-  "evidence_level": "inspired-adaptation",
+  "evidence_level": "policy-kernel-reproduction",
   "fixture_provenance": "arXiv 2507.07400 Section 3 Agent Step Graph and four-state transfer model",
   "validation_status": "passing"
 }

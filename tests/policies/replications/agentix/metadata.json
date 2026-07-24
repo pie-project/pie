@@ -28,7 +28,7 @@
   ],
   "required_mechanics": [],
   "deferred_mechanics": ["KV swap kernel", "multi-step engine execution"],
-  "evidence_level": "inspired-adaptation",
+  "evidence_level": "policy-kernel-reproduction",
   "fixture_provenance": "NSDI 2026 Algorithm 1, Equations 1-2, and anti-starvation rule",
   "validation_status": "passing"
 }

@@ -141,9 +141,10 @@ def markdown(report: dict) -> str:
             "",
             "Runtime smoke means the package loads and its committed fixture path is",
             "covered by the release suite. It is not a claim of paper fidelity.",
-            "Independent reviewers found no faithful or faithful-with-deferred-mechanics",
-            "implementation; all entries are therefore classified as inspired",
-            "adaptations until paper/artifact differential traces pass.",
+            "The 17 current-model policies were re-audited after their paper/artifact",
+            "state machines and executable differential traces passed. The remaining",
+            "14 entries retain their original inspired-adaptation classifications",
+            "until their required new primitives and physical mechanisms are closed.",
             "",
         ]
     )

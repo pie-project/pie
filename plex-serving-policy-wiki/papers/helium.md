@@ -46,7 +46,7 @@ Named datasets/workloads identified from the primary text or manual audit.
 
 - Component: `plex_paper_helium`
 - Operations: `route`, `schedule`, `cache`, `feedback`
-- Evidence: `inspired-adaptation`
+- Evidence: `policy-kernel-reproduction`
 - Validation: `passing`
 - Metadata: [`tests/policies/replications/helium/metadata.json`](../../tests/policies/replications/helium/metadata.json)
 - Deferred mechanics: query-plan rewrite fact producer

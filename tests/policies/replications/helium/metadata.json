@@ -31,7 +31,7 @@
   ],
   "required_mechanics": ["cache.prefetch@1"],
   "deferred_mechanics": ["query-plan rewrite fact producer"],
-  "evidence_level": "inspired-adaptation",
+  "evidence_level": "policy-kernel-reproduction",
   "fixture_provenance": "arXiv 2603.16104 Algorithm 1 and token-step cost model",
   "validation_status": "passing"
 }

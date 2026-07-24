@@ -1,24 +1,26 @@
 {
   "schema_version": 1,
-  "reviewed_at": "2026-07-23",
+  "reviewed_at": "2026-07-24",
   "reviewers": [
     "workflow-fidelity",
     "fairness-fidelity",
     "cache-fidelity",
-    "routing-fidelity"
+    "routing-fidelity",
+    "current-model-closure"
   ],
+  "note": "For the 17 current-model closure policies, classification and summary reflect the 2026-07-24 re-audit; high_confidence_fixes and benchmark_corrections preserve the original audit checklist.",
   "summary": {
-    "faithful": 0,
-    "faithful-with-deferred-mechanics": 0,
-    "material-semantic-gap": 17,
-    "incorrect": 14
+    "faithful": 6,
+    "faithful-with-deferred-mechanics": 11,
+    "material-semantic-gap": 6,
+    "incorrect": 8
   },
   "entries": [
     {
       "id": "agentix",
-      "classification": "material-semantic-gap",
+      "classification": "faithful-with-deferred-mechanics",
       "confidence": "high",
-      "summary": "Group attained-service ordering is recognizable, but PLAS queue bands, quanta, demotion, starvation reset, and ATLAS critical-path state are absent.",
+      "summary": "PLAS/ATLAS queue bands, per-call quanta, demotion, anti-starvation reset, request-to-group accounting, and critical-path updates now match Algorithm 1; KV swap and multi-step execution remain adapter mechanics.",
       "high_confidence_fixes": [
         "Normalize waiting and service units.",
         "Implement PLAS queues, quanta, demotion and starvation promotion.",
@@ -35,9 +37,9 @@
     },
     {
       "id": "continuum",
-      "classification": "material-semantic-gap",
+      "classification": "faithful-with-deferred-mechanics",
       "confidence": "high",
-      "summary": "The preempted, pinned, arrival ordering is present, but optimized TTL is reduced to a Boolean and expiry lacks time, history, pressure and same-program queue semantics.",
+      "summary": "Continuum now implements the empirical-CDF TTL optimizer, timestamped pins, same-program queue protection, TTL-aware FCFS priority, and deadlock pin breaking; physical pinning remains adapter work.",
       "high_confidence_fixes": [
         "Store expiration timestamps, tool histories and pressure.",
         "Implement the empirical-CDF TTL utility search.",
@@ -54,9 +56,9 @@
     },
     {
       "id": "kvflow",
-      "classification": "material-semantic-gap",
+      "classification": "faithful-with-deferred-mechanics",
       "confidence": "high",
-      "summary": "The eviction tuple and prefetch intent resemble KVFlow, but Agent Step Graph aggregation and transfer states are absent.",
+      "summary": "KVFlow now consumes validated Agent Step Graph STE facts, applies node-level minimum aggregation, varying-suffix-first reclaim, four transfer states, status-aware scheduling, and enacted prefetch feedback; transfer overlap is adapter evidence.",
       "high_confidence_fixes": [
         "Hard-filter non-ready/loading work and honor max selections.",
         "Represent shared-node STE plus GPU, CPU, loading and offloading states.",
@@ -73,9 +75,9 @@
     },
     {
       "id": "preble",
-      "classification": "material-semantic-gap",
+      "classification": "faithful-with-deferred-mechanics",
       "confidence": "high",
-      "summary": "The exploit/explore threshold is present, but exploration omits per-target profiled cost and exploitation omits least-load tie-breaking and post-placement behavior.",
+      "summary": "Preble now reproduces E2 Algorithms 1-3, decoder-ratio balancing, rolling-load redirection, weighted local queues, capacity accounting, and prefix-replication intent; physical autoscaling remains deferred.",
       "high_confidence_fixes": [
         "Compute per-target L_i plus M_i plus P_i.",
         "Break equal prefix hits by load.",
@@ -92,9 +94,9 @@
     },
     {
       "id": "helium",
-      "classification": "material-semantic-gap",
+      "classification": "faithful-with-deferred-mechanics",
       "confidence": "high",
-      "summary": "One local ready/depth/reuse choice does not reproduce Helium's whole-DAG TRT planner, multi-worker assignment, nested sequences or capacity timeline.",
+      "summary": "Helium now executes validated whole-DAG/TRT plans with worker assignment, nested sequence cursors, dependency and precedence readiness, critical-path traversal, forced progress, and proactive warming; logical-plan rewrite is a host fact producer.",
       "high_confidence_fixes": [
         "Run a whole-DAG reference planner.",
         "Represent TRT sharing, profiled outputs, precedence delays and worker capacities."
@@ -110,9 +112,9 @@
     },
     {
       "id": "vtc",
-      "classification": "material-semantic-gap",
+      "classification": "faithful",
       "confidence": "high",
-      "summary": "Minimum-counter ordering is recognizable, but the original implementation lacked counter lift, weighted costs, dispatch charging and iterative batch accounting.",
+      "summary": "VTC now implements Algorithm 2 queue entry and idle lifts, per-client FIFO, batch-local tentative counters, enactment-safe input charging, weighted decode charging, and heterogeneous ON/OFF traces.",
       "high_confidence_fixes": [
         "Implement Algorithm 2 counter lift and per-client FIFO state.",
         "Charge weighted input at dispatch and output deltas during decode.",
@@ -129,9 +131,9 @@
     },
     {
       "id": "lmetric",
-      "classification": "material-semantic-gap",
+      "classification": "faithful",
       "confidence": "high",
-      "summary": "The P-token times batch-size core exists, but idle-replica semantics and the stateful two-phase hotspot detector are absent.",
+      "summary": "LMetric now implements the exact P-token times (batch size plus one) score, idle boundaries, class-popularity/cache-coverage alarm, 2|M| confirmation, target filtering, and shared capacity accounting.",
       "high_confidence_fixes": [
         "Implement artifact-equivalent batch-size plus one behavior.",
         "Add popularity/cache-coverage history, confirmation and load-only fallback."
@@ -147,9 +149,9 @@
     },
     {
       "id": "fairserve",
-      "classification": "incorrect",
+      "classification": "faithful",
       "confidence": "high",
-      "summary": "The original kernel confused interaction-aware throttling with an invented interference score and omitted OIT and application-stage WSC normalization.",
+      "summary": "FairServe now implements windowed OIT, interaction preservation, user-scoped counter lifts, and Equations 2-3 application-stage WSC normalization with fixed-point accounting.",
       "high_confidence_fixes": [
         "Implement overload-gated user/application RPM throttling.",
         "Preserve in-progress interactions.",
@@ -166,9 +168,9 @@
     },
     {
       "id": "marconi",
-      "classification": "incorrect",
+      "classification": "faithful-with-deferred-mechanics",
       "confidence": "high",
-      "summary": "A reuse-times-FLOPs-per-byte knapsack replaces Marconi's separate speculative admission and recency-plus-FLOP-efficiency eviction.",
+      "summary": "Marconi now reproduces speculative radix admission, last-decoded checkpointing, one-child eligibility, accessed-node timestamps, and normalized recency plus alpha FLOP-efficiency eviction; hybrid checkpoint/merge enactment remains deferred.",
       "high_confidence_fixes": [
         "Implement speculative radix-tree admission.",
         "Use normalized recency plus alpha times FLOP efficiency.",
@@ -185,9 +187,9 @@
     },
     {
       "id": "ragcache",
-      "classification": "material-semantic-gap",
+      "classification": "faithful-with-deferred-mechanics",
       "confidence": "high",
-      "summary": "A static lowest-score leaf resembles PGDSF, but clocks, updates, iterative frontier evolution and GPU-host hierarchy are missing.",
+      "summary": "RAGCache now implements two-tier PGDSF clocks, stateful frequency/cost updates, evolving leaf frontiers, swap-once feedback, and cache-aware request ordering; physical hierarchy movement remains adapter evidence.",
       "high_confidence_fixes": [
         "Maintain GPU/host clocks, frequency and profiled average cost.",
         "Iterate leaf eviction and expose newly eligible parents.",
@@ -204,9 +206,9 @@
     },
     {
       "id": "dlpm",
-      "classification": "material-semantic-gap",
+      "classification": "faithful",
       "confidence": "high",
-      "summary": "Deficit and locality signals are present, but the original implementation reversed locality-first ordering and omitted refill cycles, extend accounting and per-worker deficits.",
+      "summary": "DLPM now implements distinct-client refill, locality-first scheduling, feedback-only extend/output debit, persistent per-client and per-worker deficits, longest-prefix worker sets, and capacity accounting.",
       "high_confidence_fixes": [
         "Implement LPM-first positive-deficit scanning and quantum refill.",
         "Charge uncached extend and decode output tokens.",
@@ -242,9 +244,9 @@
     },
     {
       "id": "peek",
-      "classification": "material-semantic-gap",
+      "classification": "faithful",
       "confidence": "high",
-      "summary": "Only the demand-and-fairness idea remains; pending trie, cLPM sections, stride lanes, dynamic fairness and ancestor-demand eviction are absent.",
+      "summary": "PEEK now implements Eq. 1 cLPM sections and keys, optional group-major order, EMA dynamic fairness, stride interleaving, no-sharing FCFS fallback, and Eq. 2 ancestor-demand eviction from validated pending-tree facts.",
       "high_confidence_fixes": [
         "Maintain pending-prefix state and exact cLPM facts.",
         "Implement warm/pioneer/sibling ordering and stride lane interleaving.",
@@ -318,9 +320,9 @@
     },
     {
       "id": "justitia",
-      "classification": "incorrect",
+      "classification": "faithful-with-deferred-mechanics",
       "confidence": "high",
-      "summary": "Fewest-completed-branches is not Justitia's predicted KV token-time cost and GPS virtual-finish scheduling.",
+      "summary": "Justitia now implements memory-centric KV token-time cost, active-set GPS virtual time, immutable finish tags, grouped ready-branch pampering, and consumed-cost feedback; physical co-execution remains deferred.",
       "high_confidence_fixes": [
         "Maintain GPS virtual time and immutable finish tags.",
         "Select the minimum-tag agent and bundle all fitting ready requests."
@@ -374,9 +376,9 @@
     },
     {
       "id": "pard",
-      "classification": "incorrect",
+      "classification": "faithful-with-deferred-mechanics",
       "confidence": "high",
-      "summary": "The original two-term P95 gate omitted PARD's queue, execution, batch-wait quantile, pipeline state and adaptive HBF/LBF ordering.",
+      "summary": "PARD now implements Equation 3 for linear and DAG pipelines, capability-guarded proactive drops, remaining-budget DEPQ, load-factor HBF/LBF hysteresis, and feedback-smoothed estimator state.",
       "high_confidence_fixes": [
         "Implement equation 3 with queue, execution and F^-1(0.1) terms.",
         "Maintain sliding windows and DAG-path latency.",
@@ -450,9 +452,9 @@
     },
     {
       "id": "smetric",
-      "classification": "material-semantic-gap",
+      "classification": "faithful-with-deferred-mechanics",
       "confidence": "high",
-      "summary": "The first/follow-up split exists, but overload and eviction guards are absent and active migration differs from global-tier fallback routing.",
+      "summary": "SMetric now matches Figure 13 first-turn round-robin load balancing, guarded follow-up stickiness, overload and likely-eviction fallback, post-fallback sessions, and aggregate capacity; global-tier transfer remains deferred.",
       "high_confidence_fixes": [
         "Implement overload and likely-eviction guards.",
         "Fallback to load balancing when either guard fails.",
@@ -563,9 +565,9 @@
     },
     {
       "id": "saga",
-      "classification": "incorrect",
+      "classification": "faithful-with-deferred-mechanics",
       "confidence": "high",
-      "summary": "Always-locality routing, generic group service and Boolean TTL omit WA-LRU, adaptive TTL, guarded stealing, KV migration and deadline-based AFS.",
+      "summary": "SAGA now implements Eq. 7 affinity routing and guarded oldest-session stealing, Eq. 1 WA-LRU, pressure-scaled tool TTL, Eq. 8 AFS allocation, capacity accounting, and enacted affinity updates; physical migration remains deferred.",
       "high_confidence_fixes": [
         "Implement AEG-derived reuse, WA-LRU and pressure-scaled TTL.",
         "Implement the affinity threshold and guarded steal victim selection.",
@@ -582,9 +584,9 @@
     },
     {
       "id": "routebalance",
-      "classification": "incorrect",
+      "classification": "faithful",
       "confidence": "high",
-      "summary": "Exhaustive static utility matching is the opposite of RouteBalance's normalized quality/latency/cost score and LPT greedy dead-reckoning.",
+      "summary": "RouteBalance now implements raw quality plus maximum-normalized cost and latency, budget filtering, weight normalization, exact d/b+L latency, LPT order, dead-reckoned pending decode, and shared capacity accounting.",
       "high_confidence_fixes": [
         "Implement normalized three-weight scoring and cost budgets.",
         "Sort by predicted output length and update instance state after each assignment.",

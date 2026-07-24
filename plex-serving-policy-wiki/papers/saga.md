@@ -46,7 +46,7 @@ Named datasets/workloads identified from the primary text or manual audit.
 
 - Component: `plex_paper_saga`
 - Operations: `route`, `schedule`, `cache`, `feedback`
-- Evidence: `inspired-adaptation`
+- Evidence: `policy-kernel-reproduction`
 - Validation: `passing`
 - Metadata: [`tests/policies/replications/saga/metadata.json`](../../tests/policies/replications/saga/metadata.json)
 - Deferred mechanics: physical work stealing

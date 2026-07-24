@@ -47,7 +47,7 @@ Named datasets/workloads identified from the primary text or manual audit.
 
 - Component: `plex_paper_vtc`
 - Operations: `schedule`, `feedback`
-- Evidence: `inspired-adaptation`
+- Evidence: `policy-kernel-reproduction`
 - Validation: `passing`
 - Metadata: [`tests/policies/replications/vtc/metadata.json`](../../tests/policies/replications/vtc/metadata.json)
 - Deferred mechanics: None

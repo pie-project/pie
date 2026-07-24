@@ -27,7 +27,7 @@
   ],
   "required_mechanics": [],
   "deferred_mechanics": [],
-  "evidence_level": "inspired-adaptation",
+  "evidence_level": "policy-kernel-reproduction",
   "fixture_provenance": "OSDI 2024 Algorithm 2 and VTC artifact commit 192c2e",
   "validation_status": "passing"
 }

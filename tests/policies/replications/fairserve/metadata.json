@@ -38,7 +38,7 @@
   ],
   "required_mechanics": [],
   "deferred_mechanics": ["production interaction and RPM estimator"],
-  "evidence_level": "inspired-adaptation",
+  "evidence_level": "policy-kernel-reproduction",
   "fixture_provenance": "arXiv 2411.15997 Algorithm 1 and Equations 2-3",
   "validation_status": "passing"
 }

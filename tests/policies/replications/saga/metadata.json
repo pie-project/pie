@@ -47,7 +47,7 @@
   "deferred_mechanics": [
     "physical work stealing"
   ],
-  "evidence_level": "inspired-adaptation",
+  "evidence_level": "policy-kernel-reproduction",
   "fixture_provenance": "arXiv 2605.00528v2 Equations 1, 6-9 and Algorithm 1",
   "validation_status": "passing"
 }

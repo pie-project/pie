@@ -48,7 +48,7 @@ Named datasets/workloads identified from the primary text or manual audit.
 
 - Component: `plex_paper_continuum`
 - Operations: `schedule`, `cache`, `feedback`
-- Evidence: `inspired-adaptation`
+- Evidence: `policy-kernel-reproduction`
 - Validation: `passing`
 - Metadata: [`tests/policies/replications/continuum/metadata.json`](../../tests/policies/replications/continuum/metadata.json)
 - Deferred mechanics: tool parser; physical KV pinning

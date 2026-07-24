@@ -34,7 +34,7 @@
   ],
   "required_mechanics": ["cache.prefetch@1"],
   "deferred_mechanics": ["physical prefix autoscaling"],
-  "evidence_level": "inspired-adaptation",
+  "evidence_level": "decision-trace-parity-with-deferred-mechanics",
   "fixture_provenance": "arXiv 2407.00023v2 Algorithms 1-3",
   "validation_status": "passing"
 }

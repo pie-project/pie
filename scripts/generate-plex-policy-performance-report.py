@@ -39,6 +39,7 @@ def build_report(
     offline: dict[str, Any],
     live: dict[str, Any],
     fidelity: dict[str, Any],
+    replication: dict[str, Any],
     robustness: dict[str, Any],
     pie_commit: str | None,
     vllm_commit: str | None,
@@ -51,12 +52,19 @@ def build_report(
         entry["id"]: entry
         for entry in fidelity.get("entries", [])
     }
+    replication_by_id = {
+        entry["id"]: entry
+        for entry in replication.get("entries", [])
+    }
     entries = []
     for offline_entry in offline["results"]:
         policy_id = offline_entry["id"]
         measurement = offline_entry["measurement"]
         live_entry = live_by_id.get(policy_id)
         fidelity_entry = fidelity_by_id.get(policy_id)
+        evidence_level = replication_by_id.get(policy_id, {}).get(
+            "evidence_level", "inspired-adaptation"
+        )
         entries.append(
             {
                 "id": policy_id,
@@ -84,9 +92,9 @@ def build_report(
                 "live": live_entry,
                 "fidelity": fidelity_entry,
                 "evidence": (
-                    "inspired-adaptation-proxy+live-mechanism"
+                    f"{evidence_level}-proxy+live-mechanism"
                     if live_entry is not None
-                    else "inspired-adaptation-proxy"
+                    else f"{evidence_level}-proxy"
                 ),
                 "paper_end_to_end_ratio_reproduced": False,
             }
@@ -151,11 +159,11 @@ def build_report(
 
 def markdown(report: dict[str, Any]) -> str:
     lines = [
-        "# PLEX 31-policy performance reproduction audit",
+        "# PLEX 31-policy performance reproduction evidence",
         "",
         "This report separates three claims:",
         "",
-        "1. **Adaptation proxy trend**: the compiled `.plexpkg` beats the declared",
+        "1. **Policy-kernel proxy trend**: the compiled `.plexpkg` beats the declared",
         "   baseline on a deterministic paper-anchored synthetic workload.",
         "2. **Live-engine mechanism**: the policy executes on A100 vLLM without",
         "   queue drops or unexpected fallback and preserves output tokens.",
@@ -223,6 +231,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--offline", type=Path, required=True)
     parser.add_argument("--live", type=Path)
     parser.add_argument("--fidelity", type=Path)
+    parser.add_argument("--replication", type=Path)
     parser.add_argument("--robustness-dir", type=Path)
     parser.add_argument("--output-json", type=Path, required=True)
     parser.add_argument("--output-md", type=Path, required=True)
@@ -252,6 +261,7 @@ def main() -> None:
         read_json(args.offline),
         read_json(args.live),
         read_json(args.fidelity),
+        read_json(args.replication),
         robustness,
         args.pie_commit,
         args.vllm_commit,

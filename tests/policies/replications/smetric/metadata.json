@@ -26,7 +26,7 @@
   "deferred_mechanics": [
     "global-tier KV fetch"
   ],
-  "evidence_level": "inspired-adaptation",
+  "evidence_level": "decision-trace-parity-with-deferred-mechanics",
   "fixture_provenance": "arXiv 2607.08565 Figure 13 pseudocode",
   "validation_status": "passing"
 }

@@ -47,7 +47,7 @@ Named datasets/workloads identified from the primary text or manual audit.
 
 - Component: `plex_paper_preble`
 - Operations: `route`, `schedule`, `cache`, `feedback`
-- Evidence: `inspired-adaptation`
+- Evidence: `decision-trace-parity-with-deferred-mechanics`
 - Validation: `passing`
 - Metadata: [`tests/policies/replications/preble/metadata.json`](../../tests/policies/replications/preble/metadata.json)
 - Deferred mechanics: physical prefix autoscaling

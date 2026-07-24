@@ -32,7 +32,7 @@
   "deferred_mechanics": [
     "replica provisioning"
   ],
-  "evidence_level": "inspired-adaptation",
+  "evidence_level": "policy-kernel-reproduction",
   "fixture_provenance": "arXiv 2606.17949 Equations 1-2 and Algorithm 1",
   "validation_status": "passing"
 }

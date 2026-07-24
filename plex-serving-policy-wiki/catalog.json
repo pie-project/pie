@@ -181,7 +181,7 @@
         "schedule",
         "feedback"
       ],
-      "evidence_level": "inspired-adaptation",
+      "evidence_level": "policy-kernel-reproduction",
       "validation_status": "passing",
       "deferred_mechanics": [
         "KV swap kernel",
@@ -250,7 +250,7 @@
         "cache",
         "feedback"
       ],
-      "evidence_level": "inspired-adaptation",
+      "evidence_level": "policy-kernel-reproduction",
       "validation_status": "passing",
       "deferred_mechanics": [
         "tool parser",
@@ -316,7 +316,7 @@
         "cache",
         "feedback"
       ],
-      "evidence_level": "inspired-adaptation",
+      "evidence_level": "policy-kernel-reproduction",
       "validation_status": "passing",
       "deferred_mechanics": [
         "CPU-GPU transfer overlap"
@@ -438,7 +438,7 @@
         "cache",
         "feedback"
       ],
-      "evidence_level": "inspired-adaptation",
+      "evidence_level": "policy-kernel-reproduction",
       "validation_status": "passing",
       "deferred_mechanics": [
         "query-plan rewrite fact producer"
@@ -500,7 +500,7 @@
         "schedule",
         "feedback"
       ],
-      "evidence_level": "inspired-adaptation",
+      "evidence_level": "policy-kernel-reproduction",
       "validation_status": "passing",
       "deferred_mechanics": [
         "simultaneous branch execution"
@@ -814,7 +814,7 @@
       "operations": [
         "route"
       ],
-      "evidence_level": "inspired-adaptation",
+      "evidence_level": "decision-trace-parity-with-deferred-mechanics",
       "validation_status": "passing",
       "deferred_mechanics": [
         "global-tier KV fetch"
@@ -1039,7 +1039,7 @@
         "cache",
         "feedback"
       ],
-      "evidence_level": "inspired-adaptation",
+      "evidence_level": "policy-kernel-reproduction",
       "validation_status": "passing",
       "deferred_mechanics": [
         "physical work stealing"
@@ -1190,7 +1190,7 @@
         "schedule",
         "feedback"
       ],
-      "evidence_level": "inspired-adaptation",
+      "evidence_level": "policy-kernel-reproduction",
       "validation_status": "passing",
       "deferred_mechanics": [],
       "metadata_path": "tests/policies/replications/vtc/metadata.json"
@@ -1257,7 +1257,7 @@
         "schedule",
         "feedback"
       ],
-      "evidence_level": "inspired-adaptation",
+      "evidence_level": "policy-kernel-reproduction",
       "validation_status": "passing",
       "deferred_mechanics": [
         "production interaction and RPM estimator"
@@ -1329,7 +1329,7 @@
         "schedule",
         "feedback"
       ],
-      "evidence_level": "inspired-adaptation",
+      "evidence_level": "policy-kernel-reproduction",
       "validation_status": "passing",
       "deferred_mechanics": [],
       "metadata_path": "tests/policies/replications/dlpm/metadata.json"
@@ -1882,7 +1882,7 @@
         "schedule",
         "cache"
       ],
-      "evidence_level": "inspired-adaptation",
+      "evidence_level": "policy-kernel-reproduction",
       "validation_status": "passing",
       "deferred_mechanics": [],
       "metadata_path": "tests/policies/replications/peek/metadata.json"
@@ -2255,7 +2255,7 @@
         "schedule",
         "feedback"
       ],
-      "evidence_level": "inspired-adaptation",
+      "evidence_level": "policy-kernel-reproduction",
       "validation_status": "passing",
       "deferred_mechanics": [
         "latency-distribution estimator"
@@ -2317,7 +2317,7 @@
         "cache",
         "feedback"
       ],
-      "evidence_level": "inspired-adaptation",
+      "evidence_level": "decision-trace-parity-with-deferred-mechanics",
       "validation_status": "passing",
       "deferred_mechanics": [
         "physical prefix autoscaling"
@@ -2381,7 +2381,7 @@
       "operations": [
         "route"
       ],
-      "evidence_level": "inspired-adaptation",
+      "evidence_level": "policy-kernel-reproduction",
       "validation_status": "passing",
       "deferred_mechanics": [],
       "metadata_path": "tests/policies/replications/lmetric/metadata.json"
@@ -2664,7 +2664,7 @@
       "operations": [
         "route"
       ],
-      "evidence_level": "inspired-adaptation",
+      "evidence_level": "policy-kernel-reproduction",
       "validation_status": "passing",
       "deferred_mechanics": [
         "replica provisioning"
@@ -3405,7 +3405,7 @@
         "cache",
         "feedback"
       ],
-      "evidence_level": "inspired-adaptation",
+      "evidence_level": "decision-trace-parity-with-deferred-mechanics",
       "validation_status": "passing",
       "deferred_mechanics": [],
       "metadata_path": "tests/policies/replications/ragcache/metadata.json"
@@ -3462,7 +3462,7 @@
         "cache",
         "feedback"
       ],
-      "evidence_level": "inspired-adaptation",
+      "evidence_level": "decision-trace-parity-with-deferred-mechanics",
       "validation_status": "passing",
       "deferred_mechanics": [
         "hybrid-model kernel integration"

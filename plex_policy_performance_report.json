@@ -3,7 +3,7 @@
     {
       "baseline": "fcfs_and_mlfq",
       "benchmark_family": "workflow-fair-schedule",
-      "evidence": "inspired-adaptation-proxy+live-mechanism",
+      "evidence": "policy-kernel-reproduction-proxy+live-mechanism",
       "fidelity": {
         "benchmark_corrections": [
           "Use sequential and fork/join program traces.",
@@ -13,7 +13,7 @@
           "arXiv:2502.13965v1 section 4.2 Algorithm 1",
           "tests/policies/paper-agentix/src/lib.rs"
         ],
-        "classification": "material-semantic-gap",
+        "classification": "faithful-with-deferred-mechanics",
         "confidence": "high",
         "high_confidence_fixes": [
           "Normalize waiting and service units.",
@@ -21,63 +21,63 @@
           "Add an explicit ATLAS critical-path mode."
         ],
         "id": "agentix",
-        "summary": "Group attained-service ordering is recognizable, but PLAS queue bands, quanta, demotion, starvation reset, and ATLAS critical-path state are absent."
+        "summary": "PLAS/ATLAS queue bands, per-call quanta, demotion, anti-starvation reset, request-to-group accounting, and critical-path updates now match Algorithm 1; KV swap and multi-step execution remain adapter mechanics."
       },
       "id": "agentix",
       "live": {
-        "favored_queue_s": 0.01900735666276887,
-        "favored_ttft_improvement_ratio": 0.9676280036908396,
-        "favored_ttft_s": 0.045263146806973964,
+        "favored_queue_s": 0.018231222580652684,
+        "favored_ttft_improvement_ratio": 1.032816554976464,
+        "favored_ttft_s": 0.04261270951246843,
         "mode": "schedule",
-        "native_favored_queue_s": 0.018114482751116157,
-        "native_favored_ttft_s": 0.043797888385597616,
-        "native_throughput_tokens_per_second": 1548.0997557955602,
+        "native_favored_queue_s": 0.01745348866097629,
+        "native_favored_ttft_s": 0.044011111836880445,
+        "native_throughput_tokens_per_second": 1506.56003875987,
         "policy_id": "agentix",
         "repeats": 3,
-        "throughput_delta_percent": -6.83281627690957,
-        "throughput_tokens_per_second": 1442.3209436987638,
+        "throughput_delta_percent": 1.0766866288144827,
+        "throughput_tokens_per_second": 1522.7809692522599,
         "token_outputs_equal": true,
         "worker": {
           "cache_enacted": 0,
           "cache_success": 0,
-          "completed": 133,
+          "completed": 106,
           "dropped": 0,
           "fallback": 0,
-          "feedback_success": 63,
+          "feedback_success": 49,
           "rejected": 9,
-          "schedule_enacted": 606,
-          "schedule_partial": 22,
-          "schedule_success": 65,
-          "submitted": 133,
-          "success": 128,
+          "schedule_enacted": 442,
+          "schedule_partial": 17,
+          "schedule_success": 52,
+          "submitted": 106,
+          "success": 101,
           "unavailable": 0
         }
       },
       "offline": {
-        "baseline_value": 1000246.859375,
+        "baseline_value": 11.71484375,
         "decision_latency": {
-          "invocations": 256,
-          "max_us": 28918.696,
-          "median_us": 2528.8975,
-          "p95_us": 26693.527
+          "invocations": 3808,
+          "max_us": 518866.545,
+          "median_us": 8159.718,
+          "p95_us": 21950.222
         },
         "losses": 0,
         "operation_counts": {
-          "feedback": 128,
-          "schedule": 128
+          "feedback": 1904,
+          "schedule": 1904
         },
-        "package_sha256": "3b8298c810b2a11ac9fd413cb20a6baa215262cb67668d819d1d22f2c8ce84b8",
-        "policy_value": 1000393.34375,
-        "proxy_improvement_ratio": 1.0001464482228832,
+        "package_sha256": "982c68e109f1b904fb4111f93b9106068ee54dba911ac2ebec711fbf949d2cae",
+        "policy_value": 9.37890625,
+        "proxy_improvement_ratio": 1.2490628904623073,
         "robustness": {
           "seed_count": 4,
           "trend_stable": true
         },
-        "ties": 36,
+        "ties": 0,
         "trend_reproduced": true,
-        "unit": "starvation_adjusted_priority",
-        "win_rate": 0.71875,
-        "wins": 92
+        "unit": "mean_program_jct_steps",
+        "win_rate": 1.0,
+        "wins": 128
       },
       "paper_claim": "4-15x program throughput improvement at equal latency",
       "paper_end_to_end_ratio_reproduced": false,
@@ -86,7 +86,7 @@
     {
       "baseline": "fcfs_lru",
       "benchmark_family": "ttl-cache-schedule",
-      "evidence": "inspired-adaptation-proxy+live-mechanism",
+      "evidence": "policy-kernel-reproduction-proxy+live-mechanism",
       "fidelity": {
         "benchmark_corrections": [
           "Replay multi-turn tool-duration traces under memory pressure.",
@@ -96,7 +96,7 @@
           "arXiv:2511.02230v6 section 4",
           "tests/policies/paper-continuum/src/lib.rs"
         ],
-        "classification": "material-semantic-gap",
+        "classification": "faithful-with-deferred-mechanics",
         "confidence": "high",
         "high_confidence_fixes": [
           "Store expiration timestamps, tool histories and pressure.",
@@ -104,64 +104,64 @@
           "Reclaim only enough unpinned objects."
         ],
         "id": "continuum",
-        "summary": "The preempted, pinned, arrival ordering is present, but optimized TTL is reduced to a Boolean and expiry lacks time, history, pressure and same-program queue semantics."
+        "summary": "Continuum now implements the empirical-CDF TTL optimizer, timestamped pins, same-program queue protection, TTL-aware FCFS priority, and deadlock pin breaking; physical pinning remains adapter work."
       },
       "id": "continuum",
       "live": {
-        "favored_queue_s": 1.0563735357136466,
-        "favored_ttft_improvement_ratio": 1.0006113109706591,
-        "favored_ttft_s": 1.076161019213032,
+        "favored_queue_s": 1.158017881854903,
+        "favored_ttft_improvement_ratio": 0.9017561221723287,
+        "favored_ttft_s": 1.186909290845506,
         "mode": "cache-pressure",
-        "native_favored_queue_s": 1.056988200696651,
-        "native_favored_ttft_s": 1.0768188882502727,
-        "native_throughput_tokens_per_second": 540.0664465977623,
+        "native_favored_queue_s": 1.0516474752803333,
+        "native_favored_ttft_s": 1.070302719483152,
+        "native_throughput_tokens_per_second": 544.2243247223541,
         "policy_id": "continuum",
         "repeats": 3,
-        "throughput_delta_percent": 0.3579101643083282,
-        "throughput_tokens_per_second": 541.9993993041544,
+        "throughput_delta_percent": -3.419315110475163,
+        "throughput_tokens_per_second": 525.6155801522413,
         "token_outputs_equal": true,
         "worker": {
-          "cache_enacted": 16,
-          "cache_success": 213,
-          "completed": 739,
+          "cache_enacted": 17,
+          "cache_success": 216,
+          "completed": 728,
           "dropped": 0,
           "fallback": 0,
-          "feedback_success": 260,
-          "rejected": 19,
-          "schedule_enacted": 227,
-          "schedule_partial": 41,
-          "schedule_success": 245,
-          "submitted": 739,
-          "success": 718,
+          "feedback_success": 253,
+          "rejected": 22,
+          "schedule_enacted": 232,
+          "schedule_partial": 42,
+          "schedule_success": 250,
+          "submitted": 728,
+          "success": 719,
           "unavailable": 0
         }
       },
       "offline": {
-        "baseline_value": 10483.7265625,
+        "baseline_value": 10567.78125,
         "decision_latency": {
-          "invocations": 384,
-          "max_us": 19538.757,
-          "median_us": 1214.1745,
-          "p95_us": 14013.134
+          "invocations": 512,
+          "max_us": 47444.832,
+          "median_us": 2723.991,
+          "p95_us": 35502.91
         },
         "losses": 0,
         "operation_counts": {
           "cache": 128,
-          "feedback": 128,
+          "feedback": 256,
           "schedule": 128
         },
-        "package_sha256": "cee26ba44a033fb4ff3cd6189c2b6f64f9873abb78abf5f35c49079d0fbd1fe4",
-        "policy_value": 245.0234375,
-        "proxy_improvement_ratio": 42.78662755476198,
+        "package_sha256": "a5eda5d33adaf5f4915425596d5f2e59ba0abfbccecb5c6f988da34c99355682",
+        "policy_value": 10027.484375,
+        "proxy_improvement_ratio": 1.0538815972974278,
         "robustness": {
           "seed_count": 4,
           "trend_stable": true
         },
-        "ties": 0,
+        "ties": 121,
         "trend_reproduced": true,
         "unit": "response_and_reload_cost",
-        "win_rate": 1.0,
-        "wins": 128
+        "win_rate": 0.0546875,
+        "wins": 7
       },
       "paper_claim": "1.12-3.66x response-time and 1.10-3.22x throughput improvement",
       "paper_end_to_end_ratio_reproduced": false,
@@ -170,7 +170,7 @@
     {
       "baseline": "fcfs_lru",
       "benchmark_family": "workflow-cache",
-      "evidence": "inspired-adaptation-proxy+live-mechanism",
+      "evidence": "policy-kernel-reproduction-proxy+live-mechanism",
       "fidelity": {
         "benchmark_corrections": [
           "Exercise AND/OR DAGs with shared radix nodes and transfer overlap.",
@@ -180,7 +180,7 @@
           "arXiv:2507.07400v1 section 3",
           "tests/policies/paper-kvflow/src/lib.rs"
         ],
-        "classification": "material-semantic-gap",
+        "classification": "faithful-with-deferred-mechanics",
         "confidence": "high",
         "high_confidence_fixes": [
           "Hard-filter non-ready/loading work and honor max selections.",
@@ -188,63 +188,64 @@
           "Reclaim only the required byte prefix."
         ],
         "id": "kvflow",
-        "summary": "The eviction tuple and prefetch intent resemble KVFlow, but Agent Step Graph aggregation and transfer states are absent."
+        "summary": "KVFlow now consumes validated Agent Step Graph STE facts, applies node-level minimum aggregation, varying-suffix-first reclaim, four transfer states, status-aware scheduling, and enacted prefetch feedback; transfer overlap is adapter evidence."
       },
       "id": "kvflow",
       "live": {
-        "favored_queue_s": 1.1665988361928612,
-        "favored_ttft_improvement_ratio": 0.9045781217225859,
-        "favored_ttft_s": 1.1904100512620062,
+        "favored_queue_s": 1.1629964977619238,
+        "favored_ttft_improvement_ratio": 0.9022201635717872,
+        "favored_ttft_s": 1.1862988244974986,
         "mode": "cache-pressure",
-        "native_favored_queue_s": 1.056988200696651,
-        "native_favored_ttft_s": 1.0768188882502727,
-        "native_throughput_tokens_per_second": 540.0664465977623,
+        "native_favored_queue_s": 1.0516474752803333,
+        "native_favored_ttft_s": 1.070302719483152,
+        "native_throughput_tokens_per_second": 544.2243247223541,
         "policy_id": "kvflow",
         "repeats": 3,
-        "throughput_delta_percent": -3.906397297135633,
-        "throughput_tokens_per_second": 518.9693055251308,
+        "throughput_delta_percent": -3.990123896911213,
+        "throughput_tokens_per_second": 522.5090998888038,
         "token_outputs_equal": true,
         "worker": {
-          "cache_enacted": 18,
-          "cache_success": 212,
-          "completed": 750,
+          "cache_enacted": 17,
+          "cache_success": 219,
+          "completed": 731,
           "dropped": 0,
           "fallback": 0,
-          "feedback_success": 0,
-          "rejected": 8,
-          "schedule_enacted": 243,
-          "schedule_partial": 0,
-          "schedule_success": 249,
-          "submitted": 750,
-          "success": 461,
-          "unavailable": 266
+          "feedback_success": 253,
+          "rejected": 21,
+          "schedule_enacted": 240,
+          "schedule_partial": 3,
+          "schedule_success": 253,
+          "submitted": 731,
+          "success": 725,
+          "unavailable": 0
         }
       },
       "offline": {
-        "baseline_value": 571.9686731571769,
+        "baseline_value": 501,
         "decision_latency": {
-          "invocations": 256,
-          "max_us": 20532.309,
-          "median_us": 1528.116,
-          "p95_us": 17309.701
+          "invocations": 384,
+          "max_us": 43311.22,
+          "median_us": 3646.2255,
+          "p95_us": 29710.624
         },
         "losses": 0,
         "operation_counts": {
           "cache": 128,
+          "feedback": 128,
           "schedule": 128
         },
-        "package_sha256": "627dde9f7af4b7bb26254e4b41769644be8909cde548bc9ad20c5e1b88263705",
-        "policy_value": 7.005303076347243,
-        "proxy_improvement_ratio": 81.64795540229747,
+        "package_sha256": "9ca157f15c262b03de2872cad4886ffc83bcadbae2e14c881b62a12af968866d",
+        "policy_value": 1,
+        "proxy_improvement_ratio": 501.0,
         "robustness": {
           "seed_count": 4,
           "trend_stable": true
         },
-        "ties": 22,
+        "ties": 0,
         "trend_reproduced": true,
         "unit": "workflow_stall_cost",
-        "win_rate": 0.828125,
-        "wins": 106
+        "win_rate": 1.0,
+        "wins": 128
       },
       "paper_claim": "up to 1.83x single-workflow and 2.19x concurrent-workflow speedup",
       "paper_end_to_end_ratio_reproduced": false,
@@ -253,7 +254,7 @@
     {
       "baseline": "distributed_round_robin_sglang_and_vllm",
       "benchmark_family": "prefix-route",
-      "evidence": "inspired-adaptation-proxy",
+      "evidence": "decision-trace-parity-with-deferred-mechanics-proxy",
       "fidelity": {
         "benchmark_corrections": [
           "Use the five paper workloads and Azure arrivals.",
@@ -263,7 +264,7 @@
           "arXiv:2407.00023v2 section 3.2",
           "tests/policies/paper-preble/src/lib.rs"
         ],
-        "classification": "material-semantic-gap",
+        "classification": "faithful-with-deferred-mechanics",
         "confidence": "high",
         "high_confidence_fixes": [
           "Compute per-target L_i plus M_i plus P_i.",
@@ -271,34 +272,34 @@
           "Model future-request redirection."
         ],
         "id": "preble",
-        "summary": "The exploit/explore threshold is present, but exploration omits per-target profiled cost and exploitation omits least-load tie-breaking and post-placement behavior."
+        "summary": "Preble now reproduces E2 Algorithms 1-3, decoder-ratio balancing, rolling-load redirection, weighted local queues, capacity accounting, and prefix-replication intent; physical autoscaling remains deferred."
       },
       "id": "preble",
       "live": null,
       "offline": {
-        "baseline_value": 240.1015625,
+        "baseline_value": 582.1171875,
         "decision_latency": {
           "invocations": 128,
-          "max_us": 1032.84,
-          "median_us": 661.1855,
-          "p95_us": 1005.71
+          "max_us": 1745.212,
+          "median_us": 1374.399,
+          "p95_us": 1703.835
         },
-        "losses": 1,
+        "losses": 0,
         "operation_counts": {
           "route": 128
         },
-        "package_sha256": "60e98c9c8ff71aca443183a8b4d6cc8e5ca9ba3f4041040c610860e27ed2c282",
-        "policy_value": 97.8359375,
-        "proxy_improvement_ratio": 2.454124411083606,
+        "package_sha256": "9a455eecf4c474f7e00b4bb8817effe0da546978af28a521bbb3c5ad44abc177",
+        "policy_value": 557.171875,
+        "proxy_improvement_ratio": 1.0447713059816597,
         "robustness": {
           "seed_count": 4,
           "trend_stable": true
         },
-        "ties": 99,
+        "ties": 64,
         "trend_reproduced": true,
         "unit": "prefix_route_cost",
-        "win_rate": 0.21875,
-        "wins": 28
+        "win_rate": 0.5,
+        "wins": 64
       },
       "paper_claim": "1.5-14.5x average-latency and 2-10x p99-latency improvement",
       "paper_end_to_end_ratio_reproduced": false,
@@ -307,7 +308,7 @@
     {
       "baseline": "query_wise_op_wise_random_and_lspf",
       "benchmark_family": "critical-path-schedule",
-      "evidence": "inspired-adaptation-proxy+live-mechanism",
+      "evidence": "policy-kernel-reproduction-proxy+live-mechanism",
       "fidelity": {
         "benchmark_corrections": [
           "Execute complete batched DAGs on multiple workers.",
@@ -317,69 +318,70 @@
           "arXiv:2603.16104v1 section 5 Algorithm 1",
           "tests/policies/paper-helium/src/lib.rs"
         ],
-        "classification": "material-semantic-gap",
+        "classification": "faithful-with-deferred-mechanics",
         "confidence": "high",
         "high_confidence_fixes": [
           "Run a whole-DAG reference planner.",
           "Represent TRT sharing, profiled outputs, precedence delays and worker capacities."
         ],
         "id": "helium",
-        "summary": "One local ready/depth/reuse choice does not reproduce Helium's whole-DAG TRT planner, multi-worker assignment, nested sequences or capacity timeline."
+        "summary": "Helium now executes validated whole-DAG/TRT plans with worker assignment, nested sequence cursors, dependency and precedence readiness, critical-path traversal, forced progress, and proactive warming; logical-plan rewrite is a host fact producer."
       },
       "id": "helium",
       "live": {
-        "favored_queue_s": 0.019070066045969725,
-        "favored_ttft_improvement_ratio": 0.9731528489381591,
-        "favored_ttft_s": 0.04500617599114776,
+        "favored_queue_s": 0.019834117381833494,
+        "favored_ttft_improvement_ratio": 0.955560977932979,
+        "favored_ttft_s": 0.046057878935243934,
         "mode": "schedule",
-        "native_favored_queue_s": 0.018114482751116157,
-        "native_favored_ttft_s": 0.043797888385597616,
-        "native_throughput_tokens_per_second": 1548.0997557955602,
+        "native_favored_queue_s": 0.01745348866097629,
+        "native_favored_ttft_s": 0.044011111836880445,
+        "native_throughput_tokens_per_second": 1506.56003875987,
         "policy_id": "helium",
         "repeats": 3,
-        "throughput_delta_percent": -9.6165629531352,
-        "throughput_tokens_per_second": 1399.225768202148,
+        "throughput_delta_percent": 2.011390669918156,
+        "throughput_tokens_per_second": 1536.8628468162012,
         "token_outputs_equal": true,
         "worker": {
           "cache_enacted": 0,
           "cache_success": 0,
-          "completed": 140,
+          "completed": 110,
           "dropped": 0,
           "fallback": 0,
-          "feedback_success": 0,
-          "rejected": 14,
-          "schedule_enacted": 47,
-          "schedule_partial": 3,
-          "schedule_success": 67,
-          "submitted": 140,
-          "success": 67,
-          "unavailable": 66
+          "feedback_success": 51,
+          "rejected": 11,
+          "schedule_enacted": 138,
+          "schedule_partial": 12,
+          "schedule_success": 53,
+          "submitted": 110,
+          "success": 104,
+          "unavailable": 0
         }
       },
       "offline": {
-        "baseline_value": 3620370.546875,
+        "baseline_value": 1.0,
         "decision_latency": {
-          "invocations": 128,
-          "max_us": 36673.817,
-          "median_us": 16834.548000000003,
-          "p95_us": 29958.742
+          "invocations": 256,
+          "max_us": 38457.147,
+          "median_us": 12691.8295,
+          "p95_us": 33550.014
         },
         "losses": 0,
         "operation_counts": {
+          "route": 128,
           "schedule": 128
         },
-        "package_sha256": "6d5bdc64790db1f30f4a0a0425018f40b6be67b2b31d7c9a6b688567fa4fd743",
-        "policy_value": 8562996.1328125,
-        "proxy_improvement_ratio": 2.365226437996473,
+        "package_sha256": "f4289fc1c80ce1c90d0e5b1b7b44d73773066e0fd6771f6b0ca0dbf778c6941d",
+        "policy_value": 1.7413091867618626,
+        "proxy_improvement_ratio": 1.7413091867618626,
         "robustness": {
           "seed_count": 4,
           "trend_stable": true
         },
-        "ties": 26,
+        "ties": 0,
         "trend_reproduced": true,
-        "unit": "critical_path_priority",
-        "win_rate": 0.796875,
-        "wins": 102
+        "unit": "worker_parallelism_speedup",
+        "win_rate": 1.0,
+        "wins": 128
       },
       "paper_claim": "up to 1.56x end-to-end speedup and much larger gains over naive execution",
       "paper_end_to_end_ratio_reproduced": false,
@@ -388,7 +390,7 @@
     {
       "baseline": "fcfs_rpm_and_lcf",
       "benchmark_family": "token-fair-schedule",
-      "evidence": "inspired-adaptation-proxy+live-mechanism",
+      "evidence": "policy-kernel-reproduction-proxy+live-mechanism",
       "fidelity": {
         "benchmark_corrections": [
           "Replay ON/OFF, heterogeneous-length, Poisson and distribution-shift traces.",
@@ -398,7 +400,7 @@
           "arXiv:2401.00588v2 section 4.1 Algorithm 2",
           "Ying1123/VTC-artifact commit 192c2e"
         ],
-        "classification": "material-semantic-gap",
+        "classification": "faithful",
         "confidence": "high",
         "high_confidence_fixes": [
           "Implement Algorithm 2 counter lift and per-client FIFO state.",
@@ -406,61 +408,61 @@
           "Filter feedback by request/progress semantics."
         ],
         "id": "vtc",
-        "summary": "Minimum-counter ordering is recognizable, but the original implementation lacked counter lift, weighted costs, dispatch charging and iterative batch accounting."
+        "summary": "VTC now implements Algorithm 2 queue entry and idle lifts, per-client FIFO, batch-local tentative counters, enactment-safe input charging, weighted decode charging, and heterogeneous ON/OFF traces."
       },
       "id": "vtc",
       "live": {
-        "favored_queue_s": 0.019078709767200053,
-        "favored_ttft_improvement_ratio": 0.967094415619703,
-        "favored_ttft_s": 0.04528812045464292,
+        "favored_queue_s": 0.018878381757531315,
+        "favored_ttft_improvement_ratio": 0.9732872517758037,
+        "favored_ttft_s": 0.04521903657587245,
         "mode": "schedule",
-        "native_favored_queue_s": 0.018114482751116157,
-        "native_favored_ttft_s": 0.043797888385597616,
-        "native_throughput_tokens_per_second": 1548.0997557955602,
+        "native_favored_queue_s": 0.01745348866097629,
+        "native_favored_ttft_s": 0.044011111836880445,
+        "native_throughput_tokens_per_second": 1506.56003875987,
         "policy_id": "vtc",
         "repeats": 3,
-        "throughput_delta_percent": -6.42225722577593,
-        "throughput_tokens_per_second": 1448.6768073667604,
+        "throughput_delta_percent": -2.2615158074632546,
+        "throughput_tokens_per_second": 1472.488945334391,
         "token_outputs_equal": true,
         "worker": {
           "cache_enacted": 0,
           "cache_success": 0,
-          "completed": 152,
+          "completed": 105,
           "dropped": 0,
           "fallback": 0,
-          "feedback_success": 72,
-          "rejected": 11,
-          "schedule_enacted": 690,
+          "feedback_success": 49,
+          "rejected": 8,
+          "schedule_enacted": 449,
           "schedule_partial": 22,
-          "schedule_success": 74,
-          "submitted": 152,
-          "success": 146,
+          "schedule_success": 52,
+          "submitted": 105,
+          "success": 101,
           "unavailable": 0
         }
       },
       "offline": {
-        "baseline_value": 0.25,
+        "baseline_value": 512.0,
         "decision_latency": {
-          "invocations": 1024,
-          "max_us": 1960.544,
-          "median_us": 752.341,
-          "p95_us": 1281.986
+          "invocations": 1536,
+          "max_us": 4179.152,
+          "median_us": 1863.1019999999999,
+          "p95_us": 3279.69
         },
         "losses": 0,
         "operation_counts": {
-          "feedback": 512,
+          "feedback": 1024,
           "schedule": 512
         },
-        "package_sha256": "34db668fa494b2c3a110c80f2d52739e1825c53d1e13dfc20adf24350a47d470",
+        "package_sha256": "d3beebc77f99e7c8d4fe21436aab020b1ab4bac7196bf223d59ff6790bbaff83",
         "policy_value": 1.0,
-        "proxy_improvement_ratio": 4.0,
+        "proxy_improvement_ratio": 512.0,
         "robustness": {
           "seed_count": 4,
           "trend_stable": true
         },
         "ties": 0,
         "trend_reproduced": true,
-        "unit": "jain_fairness",
+        "unit": "max_backlogged_service_span",
         "win_rate": 1.0,
         "wins": 1
       },
@@ -471,7 +473,7 @@
     {
       "baseline": "least_load",
       "benchmark_family": "prefill-batch-route",
-      "evidence": "inspired-adaptation-proxy",
+      "evidence": "policy-kernel-reproduction-proxy",
       "fidelity": {
         "benchmark_corrections": [
           "Use Qwen ChatBot, Qwen Agent, Bailian Coder and Kimi ToolAgent.",
@@ -481,41 +483,41 @@
           "arXiv:2603.15202v3 section 5",
           "blitz-router commit a005ceb"
         ],
-        "classification": "material-semantic-gap",
+        "classification": "faithful",
         "confidence": "high",
         "high_confidence_fixes": [
           "Implement artifact-equivalent batch-size plus one behavior.",
           "Add popularity/cache-coverage history, confirmation and load-only fallback."
         ],
         "id": "lmetric",
-        "summary": "The P-token times batch-size core exists, but idle-replica semantics and the stateful two-phase hotspot detector are absent."
+        "summary": "LMetric now implements the exact P-token times (batch size plus one) score, idle boundaries, class-popularity/cache-coverage alarm, 2|M| confirmation, target filtering, and shared capacity accounting."
       },
       "id": "lmetric",
       "live": null,
       "offline": {
-        "baseline_value": 109399905.46875,
+        "baseline_value": 1001.9765625,
         "decision_latency": {
-          "invocations": 128,
-          "max_us": 1017.181,
-          "median_us": 650.8565000000001,
-          "p95_us": 981.744
+          "invocations": 256,
+          "max_us": 3518.997,
+          "median_us": 880.22,
+          "p95_us": 3214.939
         },
         "losses": 0,
         "operation_counts": {
-          "route": 128
+          "route": 256
         },
-        "package_sha256": "f7c4c3a8b84cd02893d0f92cf52c597d71496473484e8ad98e072bd03c64ec8a",
-        "policy_value": 18004.4296875,
-        "proxy_improvement_ratio": 6076.277192201398,
+        "package_sha256": "219d63d015335a664dd8f060525eed8df0dea2e5bef2f32514a187820b6fb4c2",
+        "policy_value": 20.625,
+        "proxy_improvement_ratio": 48.580681818181816,
         "robustness": {
           "seed_count": 4,
           "trend_stable": true
         },
-        "ties": 70,
+        "ties": 0,
         "trend_reproduced": true,
         "unit": "prefill_batch_product",
-        "win_rate": 0.453125,
-        "wins": 58
+        "win_rate": 1.0,
+        "wins": 128
       },
       "paper_claim": "92%/24% lower mean TTFT/TPOT versus vLLM on ChatBot and 39%/51% lower means in production",
       "paper_end_to_end_ratio_reproduced": false,
@@ -524,7 +526,7 @@
     {
       "baseline": "vtc_and_rpm",
       "benchmark_family": "weighted-fair-schedule",
-      "evidence": "inspired-adaptation-proxy+live-mechanism",
+      "evidence": "policy-kernel-reproduction-proxy+live-mechanism",
       "fidelity": {
         "benchmark_corrections": [
           "Use abusive users, overload intervals and multi-call applications.",
@@ -534,7 +536,7 @@
           "arXiv:2411.15997v1 sections 4.2-4.3",
           "tests/policies/paper-common/src/lib.rs"
         ],
-        "classification": "incorrect",
+        "classification": "faithful",
         "confidence": "high",
         "high_confidence_fixes": [
           "Implement overload-gated user/application RPM throttling.",
@@ -542,55 +544,55 @@
           "Implement equations 2-3 with application-stage token accounting."
         ],
         "id": "fairserve",
-        "summary": "The original kernel confused interaction-aware throttling with an invented interference score and omitted OIT and application-stage WSC normalization."
+        "summary": "FairServe now implements windowed OIT, interaction preservation, user-scoped counter lifts, and Equations 2-3 application-stage WSC normalization with fixed-point accounting."
       },
       "id": "fairserve",
       "live": {
-        "favored_queue_s": 0.0195885561988689,
-        "favored_ttft_improvement_ratio": 0.9369718941490298,
-        "favored_ttft_s": 0.046744079154450446,
+        "favored_queue_s": 0.01883523032302037,
+        "favored_ttft_improvement_ratio": 0.9769335414696261,
+        "favored_ttft_s": 0.04505026183323935,
         "mode": "schedule",
-        "native_favored_queue_s": 0.018114482751116157,
-        "native_favored_ttft_s": 0.043797888385597616,
-        "native_throughput_tokens_per_second": 1548.0997557955602,
+        "native_favored_queue_s": 0.01745348866097629,
+        "native_favored_ttft_s": 0.044011111836880445,
+        "native_throughput_tokens_per_second": 1506.56003875987,
         "policy_id": "fairserve",
         "repeats": 3,
-        "throughput_delta_percent": -9.152417250317368,
-        "throughput_tokens_per_second": 1406.4112066940063,
+        "throughput_delta_percent": -3.4467471213099787,
+        "throughput_tokens_per_second": 1454.6327239931077,
         "token_outputs_equal": true,
         "worker": {
           "cache_enacted": 0,
           "cache_success": 0,
-          "completed": 154,
+          "completed": 104,
           "dropped": 0,
           "fallback": 0,
-          "feedback_success": 73,
-          "rejected": 10,
-          "schedule_enacted": 714,
-          "schedule_partial": 22,
-          "schedule_success": 75,
-          "submitted": 154,
-          "success": 148,
+          "feedback_success": 47,
+          "rejected": 8,
+          "schedule_enacted": 430,
+          "schedule_partial": 17,
+          "schedule_success": 51,
+          "submitted": 104,
+          "success": 98,
           "unavailable": 0
         }
       },
       "offline": {
         "baseline_value": 0.6617647058823529,
         "decision_latency": {
-          "invocations": 1025,
-          "max_us": 1251.368,
-          "median_us": 697.374,
-          "p95_us": 1129.952
+          "invocations": 257,
+          "max_us": 528225.305,
+          "median_us": 2909.91,
+          "p95_us": 16208.085
         },
         "losses": 0,
         "operation_counts": {
           "admit": 1,
-          "feedback": 512,
-          "schedule": 512
+          "feedback": 128,
+          "schedule": 128
         },
-        "package_sha256": "52b5264c16e4b0f78221d2d39730b5d56fed1c0495c2b6bbf5101178a723a822",
-        "policy_value": 0.9998545666084933,
-        "proxy_improvement_ratio": 1.5108913450972787,
+        "package_sha256": "04453c7b063ccf2c7b3e386ab902660584fb8e5108eed07ce863493b81af91d8",
+        "policy_value": 0.9938650306748467,
+        "proxy_improvement_ratio": 1.501840490797546,
         "robustness": {
           "seed_count": 4,
           "trend_stable": true
@@ -608,7 +610,7 @@
     {
       "baseline": "lru",
       "benchmark_family": "value-cache",
-      "evidence": "inspired-adaptation-proxy+live-mechanism",
+      "evidence": "decision-trace-parity-with-deferred-mechanics-proxy+live-mechanism",
       "fidelity": {
         "benchmark_corrections": [
           "Use hybrid-model LMSys, ShareGPT and SWE-bench traces.",
@@ -618,7 +620,7 @@
           "arXiv:2411.19379v3 sections 4.1-4.3",
           "ruipeterpan/marconi commit 08016617"
         ],
-        "classification": "incorrect",
+        "classification": "faithful-with-deferred-mechanics",
         "confidence": "high",
         "high_confidence_fixes": [
           "Implement speculative radix-tree admission.",
@@ -626,63 +628,63 @@
           "Support one-child eligibility, SSM-only reclaim and KV merging."
         ],
         "id": "marconi",
-        "summary": "A reuse-times-FLOPs-per-byte knapsack replaces Marconi's separate speculative admission and recency-plus-FLOP-efficiency eviction."
+        "summary": "Marconi now reproduces speculative radix admission, last-decoded checkpointing, one-child eligibility, accessed-node timestamps, and normalized recency plus alpha FLOP-efficiency eviction; hybrid checkpoint/merge enactment remains deferred."
       },
       "id": "marconi",
       "live": {
-        "favored_queue_s": 1.1399688772507943,
-        "favored_ttft_improvement_ratio": 0.9285029551563071,
-        "favored_ttft_s": 1.15973663009936,
+        "favored_queue_s": 1.15844194003148,
+        "favored_ttft_improvement_ratio": 0.901370714826501,
+        "favored_ttft_s": 1.1874167885398492,
         "mode": "cache-pressure",
-        "native_favored_queue_s": 1.056988200696651,
-        "native_favored_ttft_s": 1.0768188882502727,
-        "native_throughput_tokens_per_second": 540.0664465977623,
+        "native_favored_queue_s": 1.0516474752803333,
+        "native_favored_ttft_s": 1.070302719483152,
+        "native_throughput_tokens_per_second": 544.2243247223541,
         "policy_id": "marconi",
         "repeats": 3,
-        "throughput_delta_percent": -1.9977401339284606,
-        "throughput_tokens_per_second": 529.2773224441975,
+        "throughput_delta_percent": -3.561847204597579,
+        "throughput_tokens_per_second": 524.8398858254909,
         "token_outputs_equal": true,
         "worker": {
-          "cache_enacted": 16,
-          "cache_success": 211,
-          "completed": 743,
+          "cache_enacted": 18,
+          "cache_success": 217,
+          "completed": 727,
           "dropped": 0,
           "fallback": 0,
-          "feedback_success": 263,
-          "rejected": 3,
+          "feedback_success": 252,
+          "rejected": 5,
           "schedule_enacted": 0,
           "schedule_partial": 0,
           "schedule_success": 0,
-          "submitted": 743,
-          "success": 474,
-          "unavailable": 250
+          "submitted": 727,
+          "success": 469,
+          "unavailable": 255
         }
       },
       "offline": {
-        "baseline_value": 19649.3828125,
+        "baseline_value": 5.055429867299068,
         "decision_latency": {
           "invocations": 129,
-          "max_us": 375.842,
-          "median_us": 253.153,
-          "p95_us": 287.437
+          "max_us": 405.698,
+          "median_us": 267.34,
+          "p95_us": 302.074
         },
         "losses": 0,
         "operation_counts": {
           "cache": 128,
           "feedback": 1
         },
-        "package_sha256": "ebd242e1cb1ce6fa0ef39399b14dafb395931af1d2500b4e77ec3ae0f77836e8",
-        "policy_value": 28935.40625,
-        "proxy_improvement_ratio": 1.472586010772444,
+        "package_sha256": "6a95cf37f53b8f809b5b9bb38079c3ae2616c8d26f4f3d8d008a30d4cadb5868",
+        "policy_value": 5.471641224033559,
+        "proxy_improvement_ratio": 1.082329567941738,
         "robustness": {
           "seed_count": 4,
           "trend_stable": true
         },
-        "ties": 2,
+        "ties": 12,
         "trend_reproduced": true,
         "unit": "retained_recompute_value",
-        "win_rate": 0.984375,
-        "wins": 126
+        "win_rate": 0.90625,
+        "wins": 116
       },
       "paper_claim": "up to 34.4x token-hit-rate and 71.1% P95 TTFT improvement",
       "paper_end_to_end_ratio_reproduced": false,
@@ -691,7 +693,7 @@
     {
       "baseline": "lru",
       "benchmark_family": "gdsf-cache",
-      "evidence": "inspired-adaptation-proxy+live-mechanism",
+      "evidence": "decision-trace-parity-with-deferred-mechanics-proxy+live-mechanism",
       "fidelity": {
         "benchmark_corrections": [
           "Use timestamped LRU and parent-child episodes.",
@@ -701,7 +703,7 @@
           "RAGCache section 5.1 Algorithm 1",
           "tests/policies/paper-common/src/lib.rs"
         ],
-        "classification": "material-semantic-gap",
+        "classification": "faithful-with-deferred-mechanics",
         "confidence": "high",
         "high_confidence_fixes": [
           "Maintain GPU/host clocks, frequency and profiled average cost.",
@@ -709,62 +711,62 @@
           "Represent GPU, host and free tiers."
         ],
         "id": "ragcache",
-        "summary": "A static lowest-score leaf resembles PGDSF, but clocks, updates, iterative frontier evolution and GPU-host hierarchy are missing."
+        "summary": "RAGCache now implements two-tier PGDSF clocks, stateful frequency/cost updates, evolving leaf frontiers, swap-once feedback, and cache-aware request ordering; physical hierarchy movement remains adapter evidence."
       },
       "id": "ragcache",
       "live": {
-        "favored_queue_s": 1.1549075500806794,
-        "favored_ttft_improvement_ratio": 0.911162922634596,
-        "favored_ttft_s": 1.1818071845336817,
+        "favored_queue_s": 1.1573746847570874,
+        "favored_ttft_improvement_ratio": 0.9019694183967577,
+        "favored_ttft_s": 1.186628612515051,
         "mode": "cache-pressure",
-        "native_favored_queue_s": 1.056988200696651,
-        "native_favored_ttft_s": 1.0768188882502727,
-        "native_throughput_tokens_per_second": 540.0664465977623,
+        "native_favored_queue_s": 1.0516474752803333,
+        "native_favored_ttft_s": 1.070302719483152,
+        "native_throughput_tokens_per_second": 544.2243247223541,
         "policy_id": "ragcache",
         "repeats": 3,
-        "throughput_delta_percent": -2.3260887864595903,
-        "throughput_tokens_per_second": 527.5040215440209,
+        "throughput_delta_percent": -3.40867668849254,
+        "throughput_tokens_per_second": 525.6734770324373,
         "token_outputs_equal": true,
         "worker": {
           "cache_enacted": 17,
-          "cache_success": 210,
-          "completed": 742,
+          "cache_success": 219,
+          "completed": 733,
           "dropped": 0,
           "fallback": 0,
-          "feedback_success": 0,
-          "rejected": 2,
-          "schedule_enacted": 0,
-          "schedule_partial": 0,
-          "schedule_success": 0,
-          "submitted": 742,
-          "success": 210,
-          "unavailable": 514
+          "feedback_success": 254,
+          "rejected": 22,
+          "schedule_enacted": 234,
+          "schedule_partial": 42,
+          "schedule_success": 251,
+          "submitted": 733,
+          "success": 724,
+          "unavailable": 0
         }
       },
       "offline": {
-        "baseline_value": 1805.7511439732143,
+        "baseline_value": 1861.8515625,
         "decision_latency": {
           "invocations": 128,
-          "max_us": 351.367,
-          "median_us": 239.713,
-          "p95_us": 270.666
+          "max_us": 5833.243,
+          "median_us": 3076.691,
+          "p95_us": 5198.577
         },
         "losses": 0,
         "operation_counts": {
           "cache": 128
         },
-        "package_sha256": "c85db4fd7d254107c0592722b960be935f949b5e7250510d336838fe2622e86f",
-        "policy_value": 288.6200985863095,
-        "proxy_improvement_ratio": 6.2564982578066,
+        "package_sha256": "a552d40474faf2786ba4c9430536c773c047ce9942b16668d71a86004adba3d3",
+        "policy_value": 228.390625,
+        "proxy_improvement_ratio": 8.152048984059656,
         "robustness": {
           "seed_count": 4,
           "trend_stable": true
         },
-        "ties": 25,
+        "ties": 19,
         "trend_reproduced": true,
         "unit": "evicted_gdsf_value",
-        "win_rate": 0.8046875,
-        "wins": 103
+        "win_rate": 0.8515625,
+        "wins": 109
       },
       "paper_claim": "1.2-4x TTFT and up to 2.1x throughput improvement",
       "paper_end_to_end_ratio_reproduced": false,
@@ -773,7 +775,7 @@
     {
       "baseline": "locality_only",
       "benchmark_family": "locality-fair-route-schedule",
-      "evidence": "inspired-adaptation-proxy+live-mechanism",
+      "evidence": "policy-kernel-reproduction-proxy+live-mechanism",
       "fidelity": {
         "benchmark_corrections": [
           "Use stateful multi-client radix-tree traces.",
@@ -783,7 +785,7 @@
           "arXiv:2501.14312v1 algorithms 1-2",
           "tests/policies/paper-common/src/lib.rs"
         ],
-        "classification": "material-semantic-gap",
+        "classification": "faithful",
         "confidence": "high",
         "high_confidence_fixes": [
           "Implement LPM-first positive-deficit scanning and quantum refill.",
@@ -791,64 +793,64 @@
           "Maintain per-worker deficits and longest-prefix worker sets."
         ],
         "id": "dlpm",
-        "summary": "Deficit and locality signals are present, but the original implementation reversed locality-first ordering and omitted refill cycles, extend accounting and per-worker deficits."
+        "summary": "DLPM now implements distinct-client refill, locality-first scheduling, feedback-only extend/output debit, persistent per-client and per-worker deficits, longest-prefix worker sets, and capacity accounting."
       },
       "id": "dlpm",
       "live": {
-        "favored_queue_s": 0.01930217945482582,
-        "favored_ttft_improvement_ratio": 0.9462998826219747,
-        "favored_ttft_s": 0.04628330742707476,
+        "favored_queue_s": 0.019472495885565877,
+        "favored_ttft_improvement_ratio": 0.9562752690953706,
+        "favored_ttft_s": 0.0460234759375453,
         "mode": "schedule",
-        "native_favored_queue_s": 0.018114482751116157,
-        "native_favored_ttft_s": 0.043797888385597616,
-        "native_throughput_tokens_per_second": 1548.0997557955602,
+        "native_favored_queue_s": 0.01745348866097629,
+        "native_favored_ttft_s": 0.044011111836880445,
+        "native_throughput_tokens_per_second": 1506.56003875987,
         "policy_id": "dlpm",
         "repeats": 3,
-        "throughput_delta_percent": 2.1785610771384523,
-        "throughput_tokens_per_second": 1581.8260545105977,
+        "throughput_delta_percent": -6.140982681383933,
+        "throughput_tokens_per_second": 1414.0424476949752,
         "token_outputs_equal": true,
         "worker": {
           "cache_enacted": 0,
           "cache_success": 0,
-          "completed": 166,
+          "completed": 113,
           "dropped": 0,
           "fallback": 0,
-          "feedback_success": 79,
-          "rejected": 16,
-          "schedule_enacted": 217,
-          "schedule_partial": 19,
-          "schedule_success": 83,
-          "submitted": 166,
-          "success": 162,
+          "feedback_success": 53,
+          "rejected": 8,
+          "schedule_enacted": 485,
+          "schedule_partial": 15,
+          "schedule_success": 55,
+          "submitted": 113,
+          "success": 108,
           "unavailable": 0
         }
       },
       "offline": {
-        "baseline_value": 49.0234375,
+        "baseline_value": 48.625,
         "decision_latency": {
-          "invocations": 384,
-          "max_us": 3362.434,
-          "median_us": 987.3445,
-          "p95_us": 2713.491
+          "invocations": 512,
+          "max_us": 61743.497,
+          "median_us": 8979.644,
+          "p95_us": 41555.049
         },
         "losses": 0,
         "operation_counts": {
-          "feedback": 128,
+          "feedback": 256,
           "route": 128,
           "schedule": 128
         },
-        "package_sha256": "dd748554e4fda9c2d4fc750d229c08bd60ac3b462097ff43a4f4b17e2f5ed047",
-        "policy_value": 34.859375,
-        "proxy_improvement_ratio": 1.4063200358583594,
+        "package_sha256": "7a36a4d9148f9e9880682ad86edaecf93589b1e85b38e97eaba10fa1671fc7ef",
+        "policy_value": 32.8125,
+        "proxy_improvement_ratio": 1.4819047619047618,
         "robustness": {
           "seed_count": 4,
           "trend_stable": true
         },
-        "ties": 82,
+        "ties": 64,
         "trend_reproduced": true,
         "unit": "deficit_locality_cost",
-        "win_rate": 0.359375,
-        "wins": 46
+        "win_rate": 0.5,
+        "wins": 64
       },
       "paper_claim": "up to 2.87x throughput and 2.90-4.06x lower latency",
       "paper_end_to_end_ratio_reproduced": false,
@@ -908,30 +910,30 @@
         }
       },
       "offline": {
-        "baseline_value": 5132.765625,
+        "baseline_value": 5505.03125,
         "decision_latency": {
           "invocations": 256,
-          "max_us": 19137.117,
-          "median_us": 1480.5515,
-          "p95_us": 18080.221
+          "max_us": 19119.331,
+          "median_us": 1439.2040000000002,
+          "p95_us": 18110.517
         },
         "losses": 0,
         "operation_counts": {
           "cache": 128,
           "schedule": 128
         },
-        "package_sha256": "598571e6dbadd990cb7fbbc9a43a5a4094fce86501ecd3cc5fff38a7225058ad",
-        "policy_value": 11567.75,
-        "proxy_improvement_ratio": 2.2537070353762743,
+        "package_sha256": "12f45b9188a01f2d21569b984a8cb58fd4e4399f31ab5a955b6c138ad30b55a9",
+        "policy_value": 11791.9296875,
+        "proxy_improvement_ratio": 2.1420277473447586,
         "robustness": {
           "seed_count": 4,
           "trend_stable": true
         },
-        "ties": 1,
+        "ties": 0,
         "trend_reproduced": true,
         "unit": "resume_and_recompute_value",
-        "win_rate": 0.9921875,
-        "wins": 127
+        "win_rate": 1.0,
+        "wins": 128
       },
       "paper_claim": "1.3-12x lower normalized latency and 1.6-2x higher throughput",
       "paper_end_to_end_ratio_reproduced": false,
@@ -940,7 +942,7 @@
     {
       "baseline": "lru",
       "benchmark_family": "queue-informed-cache",
-      "evidence": "inspired-adaptation-proxy+live-mechanism",
+      "evidence": "policy-kernel-reproduction-proxy+live-mechanism",
       "fidelity": {
         "benchmark_corrections": [
           "Use SGLang LPM+LRU and vLLM FCFS+APC+LRU.",
@@ -950,7 +952,7 @@
           "PEEK section 3 algorithms 1-2",
           "xiexbing/peek commit e8ca1173"
         ],
-        "classification": "material-semantic-gap",
+        "classification": "faithful",
         "confidence": "high",
         "high_confidence_fixes": [
           "Maintain pending-prefix state and exact cLPM facts.",
@@ -958,54 +960,54 @@
           "Return only the capacity-required victim set."
         ],
         "id": "peek",
-        "summary": "Only the demand-and-fairness idea remains; pending trie, cLPM sections, stride lanes, dynamic fairness and ancestor-demand eviction are absent."
+        "summary": "PEEK now implements Eq. 1 cLPM sections and keys, optional group-major order, EMA dynamic fairness, stride interleaving, no-sharing FCFS fallback, and Eq. 2 ancestor-demand eviction from validated pending-tree facts."
       },
       "id": "peek",
       "live": {
-        "favored_queue_s": 0.3204188823001459,
-        "favored_ttft_improvement_ratio": 3.083851994521687,
-        "favored_ttft_s": 0.3491798212635331,
+        "favored_queue_s": 0.32691556226927787,
+        "favored_ttft_improvement_ratio": 3.0042270695965705,
+        "favored_ttft_s": 0.35626558668445796,
         "mode": "cache-pressure",
-        "native_favored_queue_s": 1.056988200696651,
-        "native_favored_ttft_s": 1.0768188882502727,
-        "native_throughput_tokens_per_second": 540.0664465977623,
+        "native_favored_queue_s": 1.0516474752803333,
+        "native_favored_ttft_s": 1.070302719483152,
+        "native_throughput_tokens_per_second": 544.2243247223541,
         "policy_id": "peek",
         "repeats": 3,
-        "throughput_delta_percent": -8.078196961363881,
-        "throughput_tokens_per_second": 496.4388153193559,
+        "throughput_delta_percent": -10.806597538929886,
+        "throughput_tokens_per_second": 485.4121922406504,
         "token_outputs_equal": true,
         "worker": {
-          "cache_enacted": 20,
-          "cache_success": 221,
-          "completed": 775,
+          "cache_enacted": 21,
+          "cache_success": 219,
+          "completed": 771,
           "dropped": 0,
           "fallback": 0,
           "feedback_success": 0,
-          "rejected": 13,
-          "schedule_enacted": 232,
-          "schedule_partial": 33,
+          "rejected": 12,
+          "schedule_enacted": 234,
+          "schedule_partial": 35,
           "schedule_success": 259,
-          "submitted": 775,
-          "success": 480,
-          "unavailable": 274
+          "submitted": 771,
+          "success": 478,
+          "unavailable": 273
         }
       },
       "offline": {
-        "baseline_value": 5165.7890625,
+        "baseline_value": 10,
         "decision_latency": {
           "invocations": 256,
-          "max_us": 28655.042,
-          "median_us": 1915.6554999999998,
-          "p95_us": 26524.62
+          "max_us": 23089.799,
+          "median_us": 1989.3415,
+          "p95_us": 20154.234
         },
         "losses": 0,
         "operation_counts": {
           "cache": 128,
           "schedule": 128
         },
-        "package_sha256": "66a58ec76f0b76a6e647e4ce249542cbc57d2584fb79b5a03be46fc192b46bf9",
-        "policy_value": 9973.765625,
-        "proxy_improvement_ratio": 1.9307342023317469,
+        "package_sha256": "09b9107a0429793d9fc622f46935afdb22bfccbbdcf3b1428f33926b038a1a62",
+        "policy_value": 268,
+        "proxy_improvement_ratio": 26.8,
         "robustness": {
           "seed_count": 4,
           "trend_stable": true
@@ -1074,12 +1076,12 @@
         }
       },
       "offline": {
-        "baseline_value": 7.59375,
+        "baseline_value": 7.71875,
         "decision_latency": {
           "invocations": 131,
-          "max_us": 19995.37,
-          "median_us": 8494.599,
-          "p95_us": 17052.81
+          "max_us": 18517.822,
+          "median_us": 9082.71,
+          "p95_us": 17478.205
         },
         "losses": 0,
         "operation_counts": {
@@ -1088,18 +1090,18 @@
           "route": 1,
           "schedule": 1
         },
-        "package_sha256": "4d536e0ab095bdaf9590d91c23ab04493c29344e8826af87f4b3784f0256d31b",
-        "policy_value": 11.609375,
-        "proxy_improvement_ratio": 1.52880658436214,
+        "package_sha256": "af97e745911adce39c2dfa45be707a764d54c711e3f93223ed60491b3d13c7fc",
+        "policy_value": 11.75,
+        "proxy_improvement_ratio": 1.5222672064777327,
         "robustness": {
           "seed_count": 4,
           "trend_stable": true
         },
-        "ties": 1,
+        "ties": 0,
         "trend_reproduced": true,
         "unit": "slo_goodput",
-        "win_rate": 0.9921875,
-        "wins": 127
+        "win_rate": 1.0,
+        "wins": 128
       },
       "paper_claim": "40-90% higher SLO attainment and 20-400% higher throughput",
       "paper_end_to_end_ratio_reproduced": false,
@@ -1159,12 +1161,12 @@
         }
       },
       "offline": {
-        "baseline_value": 7.578125,
+        "baseline_value": 7.546875,
         "decision_latency": {
           "invocations": 130,
-          "max_us": 19764.234,
-          "median_us": 9679.112000000001,
-          "p95_us": 17801.685
+          "max_us": 20826.137,
+          "median_us": 9921.834,
+          "p95_us": 17853.915
         },
         "losses": 0,
         "operation_counts": {
@@ -1172,18 +1174,18 @@
           "route": 1,
           "schedule": 1
         },
-        "package_sha256": "5736f15606f4ec1fe95be98784334079338c7a22f488aa5498057f9512e88908",
-        "policy_value": 11.5,
-        "proxy_improvement_ratio": 1.5175257731958762,
+        "package_sha256": "505cd7e3632c87cb3fb52cbcd259fe1f169498f7a50d80cd865ffdd0c84d7442",
+        "policy_value": 11.5625,
+        "proxy_improvement_ratio": 1.5320910973084887,
         "robustness": {
           "seed_count": 4,
           "trend_stable": true
         },
-        "ties": 0,
+        "ties": 3,
         "trend_reproduced": true,
         "unit": "multi_slo_goodput",
-        "win_rate": 1.0,
-        "wins": 128
+        "win_rate": 0.9765625,
+        "wins": 125
       },
       "paper_claim": "about 2.2x average serving-capacity improvement",
       "paper_end_to_end_ratio_reproduced": false,
@@ -1243,30 +1245,30 @@
         }
       },
       "offline": {
-        "baseline_value": 0.79296875,
+        "baseline_value": 0.751953125,
         "decision_latency": {
           "invocations": 129,
-          "max_us": 58498.551,
-          "median_us": 25751.836,
-          "p95_us": 52835.73
+          "max_us": 54492.754,
+          "median_us": 25915.331,
+          "p95_us": 50656.01
         },
         "losses": 0,
         "operation_counts": {
           "feedback": 1,
           "schedule": 128
         },
-        "package_sha256": "1ebd876b362240fb5dba538bcd534487e0bcf033970d8b38f03ef009722fb2f3",
+        "package_sha256": "403da3889f3d0c9c7997f562c5b21efa5896111edfb8f3a1c1fb54795f1d1b2e",
         "policy_value": 1.0,
-        "proxy_improvement_ratio": 1.2610837438423645,
+        "proxy_improvement_ratio": 1.3298701298701299,
         "robustness": {
           "seed_count": 4,
           "trend_stable": true
         },
-        "ties": 46,
+        "ties": 37,
         "trend_reproduced": true,
         "unit": "useful_work_fraction",
-        "win_rate": 0.640625,
-        "wins": 82
+        "win_rate": 0.7109375,
+        "wins": 91
       },
       "paper_claim": "9-52% token reduction and up to 3.3x more queries at equal quality",
       "paper_end_to_end_ratio_reproduced": false,
@@ -1275,7 +1277,7 @@
     {
       "baseline": "vtc_parrot_fcfs_and_srjf",
       "benchmark_family": "branch-fair-schedule",
-      "evidence": "inspired-adaptation-proxy+live-mechanism",
+      "evidence": "policy-kernel-reproduction-proxy+live-mechanism",
       "fidelity": {
         "benchmark_corrections": [
           "Use heterogeneous agent arrivals and finite KV capacity.",
@@ -1285,70 +1287,70 @@
           "arXiv:2510.17015v2 section 4",
           "tests/policies/paper-common/src/lib.rs"
         ],
-        "classification": "incorrect",
+        "classification": "faithful-with-deferred-mechanics",
         "confidence": "high",
         "high_confidence_fixes": [
           "Maintain GPS virtual time and immutable finish tags.",
           "Select the minimum-tag agent and bundle all fitting ready requests."
         ],
         "id": "justitia",
-        "summary": "Fewest-completed-branches is not Justitia's predicted KV token-time cost and GPS virtual-finish scheduling."
+        "summary": "Justitia now implements memory-centric KV token-time cost, active-set GPS virtual time, immutable finish tags, grouped ready-branch pampering, and consumed-cost feedback; physical co-execution remains deferred."
       },
       "id": "justitia",
       "live": {
-        "favored_queue_s": 0.018809594097547233,
-        "favored_ttft_improvement_ratio": 0.9678465503450526,
-        "favored_ttft_s": 0.04525292606558651,
+        "favored_queue_s": 0.019460989977233112,
+        "favored_ttft_improvement_ratio": 0.9627379160234271,
+        "favored_ttft_s": 0.04571453051175922,
         "mode": "schedule",
-        "native_favored_queue_s": 0.018114482751116157,
-        "native_favored_ttft_s": 0.043797888385597616,
-        "native_throughput_tokens_per_second": 1548.0997557955602,
+        "native_favored_queue_s": 0.01745348866097629,
+        "native_favored_ttft_s": 0.044011111836880445,
+        "native_throughput_tokens_per_second": 1506.56003875987,
         "policy_id": "justitia",
         "repeats": 3,
-        "throughput_delta_percent": -5.494248104819299,
-        "throughput_tokens_per_second": 1463.0433143020505,
+        "throughput_delta_percent": -9.056987468814926,
+        "throughput_tokens_per_second": 1370.1110848392152,
         "token_outputs_equal": true,
         "worker": {
           "cache_enacted": 0,
           "cache_success": 0,
-          "completed": 160,
+          "completed": 120,
           "dropped": 0,
           "fallback": 0,
-          "feedback_success": 76,
-          "rejected": 10,
-          "schedule_enacted": 749,
-          "schedule_partial": 22,
-          "schedule_success": 78,
-          "submitted": 160,
-          "success": 154,
+          "feedback_success": 56,
+          "rejected": 13,
+          "schedule_enacted": 37,
+          "schedule_partial": 3,
+          "schedule_success": 60,
+          "submitted": 120,
+          "success": 116,
           "unavailable": 0
         }
       },
       "offline": {
-        "baseline_value": 3.8125,
+        "baseline_value": 281.3671875,
         "decision_latency": {
-          "invocations": 256,
-          "max_us": 29705.397,
-          "median_us": 2537.218,
-          "p95_us": 24993.287
+          "invocations": 384,
+          "max_us": 117039.279,
+          "median_us": 3658.418,
+          "p95_us": 95824.175
         },
         "losses": 0,
         "operation_counts": {
-          "feedback": 128,
+          "feedback": 256,
           "schedule": 128
         },
-        "package_sha256": "209dcfac90d070c126ba3957213d54337c8ac32f7ae36c2bc0a93af5046b683e",
-        "policy_value": 6.4609375,
-        "proxy_improvement_ratio": 1.694672131147541,
+        "package_sha256": "a6687751a631265ddfe7aa66e6da8fad69b42e76d4906aef8caf049d09626135",
+        "policy_value": 140.5234375,
+        "proxy_improvement_ratio": 2.002279424028465,
         "robustness": {
           "seed_count": 4,
           "trend_stable": true
         },
-        "ties": 37,
+        "ties": 30,
         "trend_reproduced": true,
-        "unit": "remaining_branch_criticality",
-        "win_rate": 0.7109375,
-        "wins": 91
+        "unit": "predicted_kv_token_time",
+        "win_rate": 0.765625,
+        "wins": 98
       },
       "paper_claim": "57.5% lower average agent completion time",
       "paper_end_to_end_ratio_reproduced": false,
@@ -1408,12 +1410,12 @@
         }
       },
       "offline": {
-        "baseline_value": 17.390625,
+        "baseline_value": 17.0625,
         "decision_latency": {
           "invocations": 384,
-          "max_us": 55456.838,
-          "median_us": 10063.929,
-          "p95_us": 41780.378
+          "max_us": 48229.257,
+          "median_us": 9376.407,
+          "p95_us": 37994.54
         },
         "losses": 0,
         "operation_counts": {
@@ -1421,9 +1423,9 @@
           "cache": 128,
           "schedule": 128
         },
-        "package_sha256": "930813fda84c4734f7a81ff77f4575b5b063b1f2b99a881afe7acbd80bdc92b9",
-        "policy_value": 23.796875,
-        "proxy_improvement_ratio": 1.3683737646001797,
+        "package_sha256": "352d3b935dd9fb2066e6a9d0787201541128e6bfe68fc6d5dc78263a8b5681a8",
+        "policy_value": 23.734375,
+        "proxy_improvement_ratio": 1.391025641025641,
         "robustness": {
           "seed_count": 4,
           "trend_stable": true
@@ -1492,30 +1494,30 @@
         }
       },
       "offline": {
-        "baseline_value": 25.3984375,
+        "baseline_value": 23.5,
         "decision_latency": {
           "invocations": 256,
-          "max_us": 98830.912,
-          "median_us": 5104.581,
-          "p95_us": 79645.308
+          "max_us": 94869.634,
+          "median_us": 5118.5685,
+          "p95_us": 76233.437
         },
         "losses": 0,
         "operation_counts": {
           "cache": 128,
           "feedback": 128
         },
-        "package_sha256": "ffc2d78a9d429f7a63eb3faee48a7d6866347d0b9e3f2f08d2d7d5d8d983f6dc",
-        "policy_value": 48.3984375,
-        "proxy_improvement_ratio": 1.9055675176868656,
+        "package_sha256": "203e6324c39fbe7fd94c933be11d2ca061ac6018ce0159213d7fd14231a53abc",
+        "policy_value": 47.8125,
+        "proxy_improvement_ratio": 2.0345744680851063,
         "robustness": {
           "seed_count": 4,
           "trend_stable": true
         },
-        "ties": 16,
+        "ties": 17,
         "trend_reproduced": true,
         "unit": "retained_hotness",
-        "win_rate": 0.875,
-        "wins": 112
+        "win_rate": 0.8671875,
+        "wins": 111
       },
       "paper_claim": "up to 2.25x/2x latency and 1.91x/1.64x throughput improvement over vLLM/SGLang",
       "paper_end_to_end_ratio_reproduced": false,
@@ -1524,7 +1526,7 @@
     {
       "baseline": "nexus_clipper_and_naive",
       "benchmark_family": "proactive-drop",
-      "evidence": "inspired-adaptation-proxy+live-mechanism",
+      "evidence": "policy-kernel-reproduction-proxy+live-mechanism",
       "fidelity": {
         "benchmark_corrections": [
           "Replay bursty multi-module and DAG pipelines.",
@@ -1534,7 +1536,7 @@
           "arXiv:2602.08747v1 sections 4.2-4.3",
           "tests/policies/paper-common/src/lib.rs"
         ],
-        "classification": "incorrect",
+        "classification": "faithful-with-deferred-mechanics",
         "confidence": "high",
         "high_confidence_fixes": [
           "Implement equation 3 with queue, execution and F^-1(0.1) terms.",
@@ -1542,63 +1544,63 @@
           "Add load-driven HBF/LBF with hysteresis."
         ],
         "id": "pard",
-        "summary": "The original two-term P95 gate omitted PARD's queue, execution, batch-wait quantile, pipeline state and adaptive HBF/LBF ordering."
+        "summary": "PARD now implements Equation 3 for linear and DAG pipelines, capability-guarded proactive drops, remaining-budget DEPQ, load-factor HBF/LBF hysteresis, and feedback-smoothed estimator state."
       },
       "id": "pard",
       "live": {
-        "favored_queue_s": 0.01830973324831575,
-        "favored_ttft_improvement_ratio": 0.9811220742051755,
-        "favored_ttft_s": 0.044640610518399626,
+        "favored_queue_s": 0.020586557628121227,
+        "favored_ttft_improvement_ratio": 0.9401724352551163,
+        "favored_ttft_s": 0.046811744512524456,
         "mode": "schedule",
-        "native_favored_queue_s": 0.018114482751116157,
-        "native_favored_ttft_s": 0.043797888385597616,
-        "native_throughput_tokens_per_second": 1548.0997557955602,
+        "native_favored_queue_s": 0.01745348866097629,
+        "native_favored_ttft_s": 0.044011111836880445,
+        "native_throughput_tokens_per_second": 1506.56003875987,
         "policy_id": "pard",
         "repeats": 3,
-        "throughput_delta_percent": -6.897875802494669,
-        "throughput_tokens_per_second": 1441.3137573420593,
+        "throughput_delta_percent": -5.246433833163122,
+        "throughput_tokens_per_second": 1427.5193631694567,
         "token_outputs_equal": true,
         "worker": {
           "cache_enacted": 0,
           "cache_success": 0,
-          "completed": 162,
+          "completed": 122,
           "dropped": 0,
           "fallback": 0,
-          "feedback_success": 77,
-          "rejected": 10,
-          "schedule_enacted": 773,
-          "schedule_partial": 22,
-          "schedule_success": 80,
-          "submitted": 162,
-          "success": 157,
+          "feedback_success": 57,
+          "rejected": 8,
+          "schedule_enacted": 538,
+          "schedule_partial": 17,
+          "schedule_success": 59,
+          "submitted": 122,
+          "success": 116,
           "unavailable": 0
         }
       },
       "offline": {
-        "baseline_value": 0.671875,
+        "baseline_value": 6,
         "decision_latency": {
           "invocations": 129,
-          "max_us": 74422.851,
-          "median_us": 35215.026,
-          "p95_us": 69232.359
+          "max_us": 88469.878,
+          "median_us": 37208.646,
+          "p95_us": 82846.579
         },
         "losses": 0,
         "operation_counts": {
           "feedback": 1,
           "schedule": 128
         },
-        "package_sha256": "8b0b2076cb3b4edade2d78a323acf86e806175e84ebe1d535c3571796377ce6c",
-        "policy_value": 1.265625,
-        "proxy_improvement_ratio": 1.8837209302325582,
+        "package_sha256": "b43ff14b4941788b139d687df96dc270f2fdfa9b0f7f6ccd2322eba479d13b3c",
+        "policy_value": 8,
+        "proxy_improvement_ratio": 1.3333333333333333,
         "robustness": {
           "seed_count": 4,
           "trend_stable": true
         },
-        "ties": 69,
+        "ties": 0,
         "trend_reproduced": true,
         "unit": "deadline_goodput",
-        "win_rate": 0.4609375,
-        "wins": 59
+        "win_rate": 1.0,
+        "wins": 128
       },
       "paper_claim": "16-176% higher goodput with materially lower drop rates",
       "paper_end_to_end_ratio_reproduced": false,
@@ -1658,30 +1660,30 @@
         }
       },
       "offline": {
-        "baseline_value": 8.3984375,
+        "baseline_value": 8.25,
         "decision_latency": {
           "invocations": 256,
-          "max_us": 30686.093,
-          "median_us": 13039.365,
-          "p95_us": 28881.309
+          "max_us": 30939.352,
+          "median_us": 13425.075,
+          "p95_us": 28007.402
         },
         "losses": 0,
         "operation_counts": {
           "admit": 128,
           "schedule": 128
         },
-        "package_sha256": "7e50e15c18eefd0002148fcf7a6b6fec0b2f0b91d7aa3c855163c065bd59d92d",
-        "policy_value": 11.5078125,
-        "proxy_improvement_ratio": 1.370232558139535,
+        "package_sha256": "c59267ee1eae2c30a3cadc8ac22805ba9142213859c1c1c4f41de44495dacb61",
+        "policy_value": 11.328125,
+        "proxy_improvement_ratio": 1.3731060606060606,
         "robustness": {
           "seed_count": 4,
           "trend_stable": true
         },
-        "ties": 0,
+        "ties": 1,
         "trend_reproduced": true,
         "unit": "regulated_goodput",
-        "win_rate": 1.0,
-        "wins": 128
+        "win_rate": 0.9921875,
+        "wins": 127
       },
       "paper_claim": "1.77x goodput over regulation-off and 1.48x over eager, above 95% SLO attainment",
       "paper_end_to_end_ratio_reproduced": false,
@@ -1713,20 +1715,20 @@
       "id": "dualmap",
       "live": null,
       "offline": {
-        "baseline_value": 15143.359375,
+        "baseline_value": 14818.9609375,
         "decision_latency": {
           "invocations": 128,
-          "max_us": 1127.417,
-          "median_us": 721.0635,
-          "p95_us": 1091.34
+          "max_us": 1532.694,
+          "median_us": 717.2355,
+          "p95_us": 1101.047
         },
-        "losses": 59,
+        "losses": 58,
         "operation_counts": {
           "route": 128
         },
-        "package_sha256": "e0a25b45bdd86ce26b77bf02694b40a5a4a81f6da4596892e0ee8632034f3fe9",
-        "policy_value": 13084.640625,
-        "proxy_improvement_ratio": 1.157338578032211,
+        "package_sha256": "9c2d0a424404ca9c2589957a80ebabf28d205ec17924aacc949237538761049d",
+        "policy_value": 12504.9765625,
+        "proxy_improvement_ratio": 1.1850450789279519,
         "robustness": {
           "seed_count": 4,
           "trend_stable": true
@@ -1734,8 +1736,8 @@
         "ties": 0,
         "trend_reproduced": true,
         "unit": "affinity_slo_cost",
-        "win_rate": 0.5390625,
-        "wins": 69
+        "win_rate": 0.546875,
+        "wins": 70
       },
       "paper_claim": "40.6-80% higher effective request capacity and 14.3-40% higher goodput",
       "paper_end_to_end_ratio_reproduced": false,
@@ -1767,26 +1769,26 @@
       "id": "llumnix",
       "live": null,
       "offline": {
-        "baseline_value": 288.9410376082251,
+        "baseline_value": 335.24306483447106,
         "decision_latency": {
           "invocations": 129,
-          "max_us": 1244.006,
-          "median_us": 678.799,
-          "p95_us": 1015.349
+          "max_us": 1220.301,
+          "median_us": 679.981,
+          "p95_us": 1004.998
         },
-        "losses": 0,
+        "losses": 1,
         "operation_counts": {
           "feedback": 1,
           "route": 128
         },
-        "package_sha256": "ad6df4cb574b5abb96eb8459bde46301cb5e0ea9d3797b0c053c8c17ead16ec7",
-        "policy_value": 1.0,
-        "proxy_improvement_ratio": 288.9410376082251,
+        "package_sha256": "e55b56674fc17653ba0cc6955c8bb2908a858e0317dcc6baa538547c75670f81",
+        "policy_value": 1.0006510416666665,
+        "proxy_improvement_ratio": 335.02494963288717,
         "robustness": {
           "seed_count": 4,
           "trend_stable": true
         },
-        "ties": 25,
+        "ties": 24,
         "trend_reproduced": true,
         "unit": "virtual_usage",
         "win_rate": 0.8046875,
@@ -1799,7 +1801,7 @@
     {
       "baseline": "bailian_lmetric_and_dynamo",
       "benchmark_family": "session-affinity-route",
-      "evidence": "inspired-adaptation-proxy",
+      "evidence": "decision-trace-parity-with-deferred-mechanics-proxy",
       "fidelity": {
         "benchmark_corrections": [
           "Replay multi-request sessions with local/global KV capacity.",
@@ -1809,7 +1811,7 @@
           "arXiv:2607.08565 figure 13 section 4.2",
           "tests/policies/paper-common/src/lib.rs"
         ],
-        "classification": "material-semantic-gap",
+        "classification": "faithful-with-deferred-mechanics",
         "confidence": "high",
         "high_confidence_fixes": [
           "Implement overload and likely-eviction guards.",
@@ -1817,34 +1819,34 @@
           "Represent global-tier fetch instead of active migration."
         ],
         "id": "smetric",
-        "summary": "The first/follow-up split exists, but overload and eviction guards are absent and active migration differs from global-tier fallback routing."
+        "summary": "SMetric now matches Figure 13 first-turn round-robin load balancing, guarded follow-up stickiness, overload and likely-eviction fallback, post-fallback sessions, and aggregate capacity; global-tier transfer remains deferred."
       },
       "id": "smetric",
       "live": null,
       "offline": {
-        "baseline_value": 2523.0859375,
+        "baseline_value": 62,
         "decision_latency": {
           "invocations": 128,
-          "max_us": 1361.555,
-          "median_us": 768.6524999999999,
-          "p95_us": 1261.879
+          "max_us": 1142.715,
+          "median_us": 735.174,
+          "p95_us": 1108.121
         },
         "losses": 0,
         "operation_counts": {
           "route": 128
         },
-        "package_sha256": "0ecc1de881f89d938993aa432a5fd9e2f13afad7b5933a75f796606d00acd315",
-        "policy_value": 424.375,
-        "proxy_improvement_ratio": 5.945416053019146,
+        "package_sha256": "5a13e431eb0cdb2566373823a4ae644e910928d3c342c39e0ceb6ef9737380ea",
+        "policy_value": 2.5,
+        "proxy_improvement_ratio": 24.8,
         "robustness": {
           "seed_count": 4,
           "trend_stable": true
         },
-        "ties": 94,
+        "ties": 32,
         "trend_reproduced": true,
         "unit": "session_affinity_load_cost",
-        "win_rate": 0.265625,
-        "wins": 34
+        "win_rate": 0.75,
+        "wins": 96
       },
       "paper_claim": "24-37% lower median TTFT and up to 34% lower P99 TPOT",
       "paper_end_to_end_ratio_reproduced": false,
@@ -1904,12 +1906,12 @@
         }
       },
       "offline": {
-        "baseline_value": 2.1484375,
+        "baseline_value": 2.2265625,
         "decision_latency": {
           "invocations": 257,
-          "max_us": 53637.236,
-          "median_us": 2447.756,
-          "p95_us": 46390.97
+          "max_us": 55316.069,
+          "median_us": 2396.78,
+          "p95_us": 48014.21
         },
         "losses": 0,
         "operation_counts": {
@@ -1917,18 +1919,18 @@
           "feedback": 1,
           "schedule": 128
         },
-        "package_sha256": "8932f308a52973bad027a00a0084513f4968a090fdc048b9e4bd846df1e32094",
-        "policy_value": 3.625,
-        "proxy_improvement_ratio": 1.6872727272727273,
+        "package_sha256": "55ea4d6da3167230da6a2d6c5845d4f977d2dafff6de24849176e24b1adfa091",
+        "policy_value": 3.6796875,
+        "proxy_improvement_ratio": 1.6526315789473685,
         "robustness": {
           "seed_count": 4,
           "trend_stable": true
         },
-        "ties": 18,
+        "ties": 17,
         "trend_reproduced": true,
         "unit": "tool_ready_goodput",
-        "win_rate": 0.859375,
-        "wins": 110
+        "win_rate": 0.8671875,
+        "wins": 111
       },
       "paper_claim": "1.5-3.6x serving throughput and 1.8-3.9x rollout improvement",
       "paper_end_to_end_ratio_reproduced": false,
@@ -1988,12 +1990,12 @@
         }
       },
       "offline": {
-        "baseline_value": 483.7890625,
+        "baseline_value": 523.125,
         "decision_latency": {
           "invocations": 385,
-          "max_us": 9018.529,
-          "median_us": 1791.709,
-          "p95_us": 7099.341
+          "max_us": 9003.4,
+          "median_us": 1864.055,
+          "p95_us": 7617.098
         },
         "losses": 0,
         "operation_counts": {
@@ -2002,18 +2004,18 @@
           "route": 128,
           "schedule": 128
         },
-        "package_sha256": "342eebc8d5426559fa699ce49dd962eb62241081883cad4957cd1bcc2b8d5ca5",
-        "policy_value": 209.953125,
-        "proxy_improvement_ratio": 2.3042717868571856,
+        "package_sha256": "8368f4a310bfb4842bf5cd35eb1481e52e5d62ea584007d5e8800e40348a629b",
+        "policy_value": 208.4765625,
+        "proxy_improvement_ratio": 2.509274873524452,
         "robustness": {
           "seed_count": 4,
           "trend_stable": true
         },
-        "ties": 10,
+        "ties": 11,
         "trend_reproduced": true,
         "unit": "lookahead_workflow_cost",
-        "win_rate": 0.921875,
-        "wins": 118
+        "win_rate": 0.9140625,
+        "wins": 117
       },
       "paper_claim": "up to 2.9x JCT reduction and 1.12-1.96x throughput improvement",
       "paper_end_to_end_ratio_reproduced": false,
@@ -2045,30 +2047,30 @@
       "id": "goodserve",
       "live": null,
       "offline": {
-        "baseline_value": 92435.328125,
+        "baseline_value": 93872.3203125,
         "decision_latency": {
           "invocations": 129,
-          "max_us": 1551.791,
-          "median_us": 861.59,
-          "p95_us": 1240.749
+          "max_us": 1533.417,
+          "median_us": 818.22,
+          "p95_us": 1259.935
         },
-        "losses": 0,
+        "losses": 1,
         "operation_counts": {
           "feedback": 1,
           "route": 128
         },
-        "package_sha256": "f10a656d6cefb09e5841f65c1cd48099912b5dcfd6167e308be38a9c32388acb",
-        "policy_value": 25450.3515625,
-        "proxy_improvement_ratio": 3.631986296849411,
+        "package_sha256": "d7bd8352abce68afbc3ac8e75b443eebc6ea1e8a4c03e5720151367ef979ef19",
+        "policy_value": 18288.765625,
+        "proxy_improvement_ratio": 5.132786008487109,
         "robustness": {
           "seed_count": 4,
           "trend_stable": true
         },
-        "ties": 15,
+        "ties": 13,
         "trend_reproduced": true,
         "unit": "e2e_slo_cost",
-        "win_rate": 0.8828125,
-        "wins": 113
+        "win_rate": 0.890625,
+        "wins": 114
       },
       "paper_claim": "up to 27.4% higher goodput",
       "paper_end_to_end_ratio_reproduced": false,
@@ -2100,29 +2102,29 @@
       "id": "conserve",
       "live": null,
       "offline": {
-        "baseline_value": 75005.359375,
+        "baseline_value": 71881.4140625,
         "decision_latency": {
           "invocations": 128,
-          "max_us": 1368.718,
-          "median_us": 754.1695,
-          "p95_us": 1260.265
+          "max_us": 1350.775,
+          "median_us": 756.1385,
+          "p95_us": 1261.308
         },
         "losses": 0,
         "operation_counts": {
           "route": 128
         },
-        "package_sha256": "1b70e96fcb6c451c49c4292778951faf7f3c02df246652446a09b7ed0da50cc3",
-        "policy_value": 27.28125,
-        "proxy_improvement_ratio": 2749.3373424971364,
+        "package_sha256": "49d0a14a8fe068947f9b8baad636f8466bf122ee0c964b13d62e00c4aa0c6330",
+        "policy_value": 26.8515625,
+        "proxy_improvement_ratio": 2676.9918533604887,
         "robustness": {
           "seed_count": 4,
           "trend_stable": true
         },
-        "ties": 32,
+        "ties": 36,
         "trend_reproduced": true,
         "unit": "conversation_route_cost",
-        "win_rate": 0.75,
-        "wins": 96
+        "win_rate": 0.71875,
+        "wins": 92
       },
       "paper_claim": "51.08% lower P95 time-to-first-effective-token and 7.51% higher energy efficiency",
       "paper_end_to_end_ratio_reproduced": false,
@@ -2181,30 +2183,30 @@
         }
       },
       "offline": {
-        "baseline_value": 1631.6015625,
+        "baseline_value": 1763.3515625,
         "decision_latency": {
           "invocations": 256,
-          "max_us": 32098.713,
-          "median_us": 4821.884,
-          "p95_us": 29377.657
+          "max_us": 34248.859,
+          "median_us": 4504.8505000000005,
+          "p95_us": 27092.032
         },
         "losses": 0,
         "operation_counts": {
           "route": 128,
           "schedule": 128
         },
-        "package_sha256": "fd9119f4ec66ae630a0b158218d2908013fba1f298c63d76f72b79725679ee48",
-        "policy_value": 2776.296875,
-        "proxy_improvement_ratio": 1.701577725107137,
+        "package_sha256": "13319c696f92bbcc02595960ac1f06fea4272d45bfda6f3a7009fab311479504",
+        "policy_value": 2784.5625,
+        "proxy_improvement_ratio": 1.5791306505278921,
         "robustness": {
           "seed_count": 4,
           "trend_stable": true
         },
-        "ties": 27,
+        "ties": 32,
         "trend_reproduced": true,
         "unit": "dependency_ready_work",
-        "win_rate": 0.7890625,
-        "wins": 101
+        "win_rate": 0.75,
+        "wins": 96
       },
       "paper_claim": "up to 11.7x speedup and 1.8-2.4x batch speedup",
       "paper_end_to_end_ratio_reproduced": false,
@@ -2213,7 +2215,7 @@
     {
       "baseline": "vllm_apc_and_component_ablations",
       "benchmark_family": "workflow-atomic-locality",
-      "evidence": "inspired-adaptation-proxy+live-mechanism",
+      "evidence": "policy-kernel-reproduction-proxy+live-mechanism",
       "fidelity": {
         "benchmark_corrections": [
           "Use multi-step sessions with tool durations, pressure and deadlines.",
@@ -2223,7 +2225,7 @@
           "arXiv:2605.00528v2 sections 4-6",
           "tests/policies/paper-common/src/lib.rs"
         ],
-        "classification": "incorrect",
+        "classification": "faithful-with-deferred-mechanics",
         "confidence": "high",
         "high_confidence_fixes": [
           "Implement AEG-derived reuse, WA-LRU and pressure-scaled TTL.",
@@ -2231,45 +2233,45 @@
           "Implement AFS deadline feedback and affinity updates."
         ],
         "id": "saga",
-        "summary": "Always-locality routing, generic group service and Boolean TTL omit WA-LRU, adaptive TTL, guarded stealing, KV migration and deadline-based AFS."
+        "summary": "SAGA now implements Eq. 7 affinity routing and guarded oldest-session stealing, Eq. 1 WA-LRU, pressure-scaled tool TTL, Eq. 8 AFS allocation, capacity accounting, and enacted affinity updates; physical migration remains deferred."
       },
       "id": "saga",
       "live": {
-        "favored_queue_s": 0.018222602491732687,
-        "favored_ttft_improvement_ratio": 0.9859151587975852,
-        "favored_ttft_s": 0.04442358756205067,
+        "favored_queue_s": 0.01846061210380867,
+        "favored_ttft_improvement_ratio": 1.002738856257689,
+        "favored_ttft_s": 0.043890900968108326,
         "mode": "schedule",
-        "native_favored_queue_s": 0.018114482751116157,
-        "native_favored_ttft_s": 0.043797888385597616,
-        "native_throughput_tokens_per_second": 1548.0997557955602,
+        "native_favored_queue_s": 0.01745348866097629,
+        "native_favored_ttft_s": 0.044011111836880445,
+        "native_throughput_tokens_per_second": 1506.56003875987,
         "policy_id": "saga",
         "repeats": 3,
-        "throughput_delta_percent": -5.007238757024368,
-        "throughput_tokens_per_second": 1470.5827048259653,
+        "throughput_delta_percent": -2.08229928832111,
+        "throughput_tokens_per_second": 1475.188949794643,
         "token_outputs_equal": true,
         "worker": {
           "cache_enacted": 0,
           "cache_success": 0,
-          "completed": 162,
+          "completed": 117,
           "dropped": 0,
           "fallback": 0,
-          "feedback_success": 0,
-          "rejected": 10,
-          "schedule_enacted": 750,
+          "feedback_success": 55,
+          "rejected": 8,
+          "schedule_enacted": 521,
           "schedule_partial": 22,
-          "schedule_success": 78,
-          "submitted": 162,
-          "success": 78,
-          "unavailable": 77
+          "schedule_success": 58,
+          "submitted": 117,
+          "success": 113,
+          "unavailable": 0
         }
       },
       "offline": {
-        "baseline_value": 29173.5546875,
+        "baseline_value": 601.484375,
         "decision_latency": {
           "invocations": 384,
-          "max_us": 17071.052,
-          "median_us": 3326.734,
-          "p95_us": 14441.435
+          "max_us": 6798.738,
+          "median_us": 2170.993,
+          "p95_us": 5946.766
         },
         "losses": 0,
         "operation_counts": {
@@ -2277,18 +2279,18 @@
           "route": 128,
           "schedule": 128
         },
-        "package_sha256": "527a917985493a61247209f04bd042fbe6fb101cc08570398ad693cc78bbee45",
-        "policy_value": 254.8671875,
-        "proxy_improvement_ratio": 114.46571437329492,
+        "package_sha256": "6c9810db9bec733c91e5cc388fe825ca3a714fe498faec3bd6c01ad75c7ab34b",
+        "policy_value": 105.9921875,
+        "proxy_improvement_ratio": 5.674799144984153,
         "robustness": {
           "seed_count": 4,
           "trend_stable": true
         },
-        "ties": 12,
+        "ties": 0,
         "trend_reproduced": true,
         "unit": "workflow_locality_load_cost",
-        "win_rate": 0.90625,
-        "wins": 116
+        "win_rate": 1.0,
+        "wins": 128
       },
       "paper_claim": "1.73x/1.55x TCT speedup and about 1.21x/1.22x memory-utilization improvement",
       "paper_end_to_end_ratio_reproduced": false,
@@ -2297,7 +2299,7 @@
     {
       "baseline": "avengers_best_route_and_semantic_router",
       "benchmark_family": "global-utility-route",
-      "evidence": "inspired-adaptation-proxy",
+      "evidence": "policy-kernel-reproduction-proxy",
       "fidelity": {
         "benchmark_corrections": [
           "Use the seven named datasets and official artifact decision traces.",
@@ -2307,7 +2309,7 @@
           "arXiv:2606.17949 section 4.1",
           "route-balance artifact commit 671db9f"
         ],
-        "classification": "incorrect",
+        "classification": "faithful",
         "confidence": "high",
         "high_confidence_fixes": [
           "Implement normalized three-weight scoring and cost budgets.",
@@ -2315,34 +2317,34 @@
           "Remove the exponential 12-request bound."
         ],
         "id": "routebalance",
-        "summary": "Exhaustive static utility matching is the opposite of RouteBalance's normalized quality/latency/cost score and LPT greedy dead-reckoning."
+        "summary": "RouteBalance now implements raw quality plus maximum-normalized cost and latency, budget filtering, weight normalization, exact d/b+L latency, LPT order, dead-reckoned pending decode, and shared capacity accounting."
       },
       "id": "routebalance",
       "live": null,
       "offline": {
-        "baseline_value": 8.706274389175288,
+        "baseline_value": 2.3405975445621268,
         "decision_latency": {
           "invocations": 128,
-          "max_us": 23382.57,
-          "median_us": 11530.994999999999,
-          "p95_us": 22248.731
+          "max_us": 23451.491,
+          "median_us": 12285.947499999998,
+          "p95_us": 22460.148
         },
-        "losses": 6,
+        "losses": 16,
         "operation_counts": {
           "route": 128
         },
-        "package_sha256": "1d462abc73b2e00c2ffbf8e0100f7d15bad7fb2823a205d6c1448ef9f86fc347",
-        "policy_value": 11.731125473261537,
-        "proxy_improvement_ratio": 1.347433465667831,
+        "package_sha256": "6e1df1fb29bc1507c18b8ce2b4150b1606212ba5d638235eff53f0b0253f28fe",
+        "policy_value": 2.816074523470057,
+        "proxy_improvement_ratio": 1.2031434152413765,
         "robustness": {
           "seed_count": 4,
           "trend_stable": true
         },
-        "ties": 0,
+        "ties": 5,
         "trend_reproduced": true,
         "unit": "normalized_quality_latency_cost",
-        "win_rate": 0.953125,
-        "wins": 122
+        "win_rate": 0.8359375,
+        "wins": 107
       },
       "paper_claim": "2.6-4.1x lower E2E latency than enhanced BEST-Route at high load while preserving quality/cost tradeoffs",
       "paper_end_to_end_ratio_reproduced": false,
@@ -2350,10 +2352,12 @@
     }
   ],
   "fidelity_counts": {
-    "incorrect": 14,
-    "material-semantic-gap": 17
+    "faithful": 6,
+    "faithful-with-deferred-mechanics": 11,
+    "incorrect": 8,
+    "material-semantic-gap": 6
   },
-  "live_median_throughput_delta_percent": -5.494248104819299,
+  "live_median_throughput_delta_percent": -3.561847204597579,
   "live_model": "Qwen/Qwen2.5-0.5B-Instruct",
   "live_output_equal_count": 23,
   "live_policy_count": 23,
@@ -2366,10 +2370,10 @@
   },
   "offline_trend_reproduced_count": 31,
   "paper_end_to_end_ratio_reproduced_count": 0,
-  "pie_commit": "5f279f28ae017a923664579e556424294e1e75a7",
+  "pie_commit": "8f448e37f",
   "policy_count": 31,
   "robust_seed_count": 4,
   "robust_trend_count": 31,
   "schema_version": 1,
-  "vllm_commit": "cf29e62d1ed511c305402f1aa7ed8fc253889071"
+  "vllm_commit": "e14fbf5f0"
 }
