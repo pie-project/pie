@@ -5413,7 +5413,12 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn launch_then_control_then_launch_preserves_fifo_order() -> anyhow::Result<()> {
+    async fn queued_resize_does_not_gate_launches_and_dispatches_at_drain() -> anyhow::Result<()> {
+        // Venus: ResizePool is a pure capacity operation — the driver's
+        // quiescence gate holds correctness, so fires never wait for a
+        // queued resize (the old FIFO barrier paced gen-boundary teardown
+        // to one frame per resize cycle). The resize itself dispatches
+        // once the launch pipe drains.
         let operation_log = Arc::new(Mutex::new(Vec::new()));
         let (driver_id, _scheduler, bound_a, _endpoints) =
             setup_scheduler_with_options(DummyDriverOptions {
@@ -5461,89 +5466,37 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(10)).await;
         let second = bound_b.reserve_completion();
-        let second_for_submit = second.clone();
-        let second_driver_id = bound_b.driver_id;
-        let second_instance_id = bound_b.instance_id;
-        let second_submit = std::thread::spawn(move || {
-            crate::scheduler::submit_prebuilt_async(
-                dummy_launch(),
-                second_driver_id,
-                second_instance_id,
-                0,
-                second_for_submit,
-            )
-        });
+        crate::scheduler::submit_prebuilt_async(
+            dummy_launch(),
+            driver_id,
+            bound_b.instance_id,
+            0,
+            second.clone(),
+        )?;
 
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        assert_eq!(
-            operation_log
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|entry| entry.as_str() == "launch")
-                .count(),
-            1,
-            "queued control should prevent later launches from bypassing the FIFO"
-        );
-        assert!(
-            second_submit.is_finished(),
-            "queue acceptance must not wait for the earlier native callback"
-        );
-
+        // Both launches complete without waiting for the queued resize.
         timeout(Duration::from_secs(5), first).await??;
+        timeout(Duration::from_secs(5), second).await??;
+        // The resize dispatches once the pipe drains, and completes.
         let resize = resize_join.await??;
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        let during_control = operation_log.lock().unwrap().clone();
-        assert_eq!(
-            during_control
-                .iter()
-                .filter(|entry| entry.as_str() == "launch")
-                .count(),
-            1,
-            "second launch must wait until the control callback retires"
-        );
-        assert!(
-            during_control.iter().any(|entry| entry == "resize_pool"),
-            "resize should dispatch after launch 1 retires"
-        );
         timeout(Duration::from_secs(5), resize).await??;
-        timeout(Duration::from_secs(5), async {
-            loop {
-                if operation_log
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .filter(|entry| entry.as_str() == "launch")
-                    .count()
-                    >= 2
-                {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
-        .await?;
+
         let log = operation_log.lock().unwrap().clone();
-        let resize_idx = log
-            .iter()
-            .position(|entry| entry == "resize_pool")
-            .expect("resize should dispatch after launch 1 retires");
-        let second_launch_idx = log
+        let launches: Vec<usize> = log
             .iter()
             .enumerate()
             .filter(|(_, entry)| entry.as_str() == "launch")
-            .nth(1)
             .map(|(index, _)| index)
-            .expect("second launch should dispatch");
+            .collect();
+        let resize_idx = log
+            .iter()
+            .position(|entry| entry == "resize_pool")
+            .expect("resize dispatched");
+        assert_eq!(launches.len(), 2, "{log:?}");
         assert!(
-            resize_idx < second_launch_idx,
-            "second launch must remain behind the queued control effect: {log:?}"
+            launches.iter().all(|&launch| launch < resize_idx),
+            "the resize dispatches only at pipe drain, after both launches: {log:?}"
         );
-
-        second_submit.join().unwrap()?;
-        timeout(Duration::from_secs(5), second).await??;
-        crate::scheduler::close_instance(&bound_a)?;
-        crate::scheduler::close_instance(&bound_b)?;
         Ok(())
     }
 
