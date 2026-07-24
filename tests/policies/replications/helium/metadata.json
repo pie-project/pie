@@ -6,24 +6,32 @@
   "source_commit": "f688bf8a",
   "source_license": "paper reference; no source copied",
   "component": "plex_paper_helium",
-  "implements": ["schedule"],
+  "implements": ["route", "schedule", "cache", "feedback"],
   "policy_kernel": [
-    "ready-operator filtering",
-    "critical-path depth priority",
-    "cache-reuse benefit",
+    "validated whole-DAG worker assignment",
+    "nested TRT sequence cursor",
+    "critical-path ready traversal",
     "earliest-start forced progress",
-    "profiled token-cost penalty"
+    "proactive static-prefix warming"
   ],
   "required_facts": [
-    "ready",
-    "dependency_depth",
-    "prefix_reuse_tokens",
+    "workflow_id",
+    "planned_worker_id",
+    "planned_rank",
+    "estimated_token_steps",
+    "worker_id",
+    "segment_index",
+    "sequence_path",
+    "dependency_ready",
+    "precedence_ready_at",
+    "now_token_step",
+    "critical_path_depth",
     "earliest_start",
-    "profiled_token_cost"
+    "proactive_warm"
   ],
-  "required_mechanics": [],
-  "deferred_mechanics": ["query-plan rewrite", "proactive cache warming"],
+  "required_mechanics": ["cache.prefetch@1"],
+  "deferred_mechanics": ["query-plan rewrite fact producer"],
   "evidence_level": "inspired-adaptation",
-  "fixture_provenance": "independent implementation from the paper algorithm",
+  "fixture_provenance": "arXiv 2603.16104 Algorithm 1 and token-step cost model",
   "validation_status": "passing"
 }

@@ -1,6 +1,1 @@
-{
-  "actions": [
-    "pie.request.cancel@1"
-  ],
-  "claim": "not initial admission"
-}
+{"schema":"plex-paper-oracle@1","expectations":[{"case_id":"equation-3-dag-max","drop":true},{"case_id":"deadline-equality","drop":false},{"case_id":"depq-hysteresis","modes":["lbf","hbf"]},{"case_id":"cancel-capability","action":"pie.request.cancel@1"}]}

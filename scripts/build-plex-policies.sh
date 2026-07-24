@@ -155,8 +155,12 @@ do
             operations=route
             optional=request.rebalance@1
             ;;
-        plex_attained_service|plex_bad_budget|plex_paper_helium)
+        plex_attained_service|plex_bad_budget)
             operations=schedule
+            ;;
+        plex_paper_helium)
+            operations=route,schedule,cache,feedback
+            optional=cache.prefetch@1
             ;;
         plex_coordinated)
             operations=admit,route,schedule,cache,feedback

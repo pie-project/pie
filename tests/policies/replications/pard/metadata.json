@@ -11,8 +11,10 @@
     "feedback"
   ],
   "policy_kernel": [
-    "upstream elapsed plus downstream tail prediction",
-    "mid-lifecycle drop intent"
+    "Equation-3 linear and DAG latency projection",
+    "remaining-budget DEPQ",
+    "load-factor HBF/LBF hysteresis",
+    "capability-guarded proactive drop intent"
   ],
   "required_facts": [
     "upstream_elapsed_ms",
@@ -21,7 +23,15 @@
     "downstream_queue_ms",
     "downstream_execution_ms",
     "downstream_batch_wait_p10_ms",
-    "deadline_ms"
+    "downstream_paths_ms",
+    "deadline_ms",
+    "load_factor_ppm",
+    "input_work",
+    "module_throughput",
+    "hysteresis_epsilon_ppm",
+    "input_deviation_sum",
+    "input_sum",
+    "cancel_supported"
   ],
   "required_mechanics": [],
   "optional_mechanics": [
@@ -31,6 +41,6 @@
     "latency-distribution estimator"
   ],
   "evidence_level": "inspired-adaptation",
-  "fixture_provenance": "independent reference model from the paper",
+  "fixture_provenance": "EuroSys 2026 Equations 1-3 and Section 4.3 DEPQ hysteresis",
   "validation_status": "passing"
 }

@@ -1,9 +1,1 @@
-{
-  "case": "ready-critical-path",
-  "operation": "schedule",
-  "requests": [
-    {"request_id": "A", "ready": true, "dependency_depth": 3, "prefix_reuse_tokens": 0},
-    {"request_id": "B", "ready": true, "dependency_depth": 1, "prefix_reuse_tokens": 100}
-  ],
-  "capacity": {"max_requests": 1, "max_total_tokens": 4}
-}
+{"schema":"plex-paper-oracle@1","cases":[{"id":"planned-worker-assignment","planned_worker":"worker-b"},{"id":"nested-segment-cursor","segments":[0,1]},{"id":"forced-progress","dependency_ready":false,"earliest_start":5},{"id":"proactive-warm","object_id":"static-prefix"}]}

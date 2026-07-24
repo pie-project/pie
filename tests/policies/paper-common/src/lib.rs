@@ -2799,11 +2799,77 @@ pub struct Pard;
 impl Policy for Pard {
     fn schedule(
         ctx: &ScheduleContext,
-        _state: &mut State,
+        state: &mut State,
         host: &Host,
     ) -> plex::Result<SchedulePlan> {
-        let mut order = Vec::new();
+        let load_factor_ppm = ctx.capacity.facts["load_factor_ppm"]
+            .as_u64()
+            .or_else(|| {
+                ctx.capacity.facts["input_work"]
+                    .as_u64()
+                    .zip(ctx.capacity.facts["module_throughput"].as_u64())
+                    .map(|(input, throughput)| {
+                        u128::from(input)
+                            .saturating_mul(1_000_000)
+                            .checked_div(u128::from(throughput.max(1)))
+                            .unwrap_or(0)
+                            .min(u128::from(u64::MAX)) as u64
+                    })
+            })
+            .or_else(|| state.shared["pard_load_factor_ppm"].as_u64())
+            .unwrap_or(1_000_000);
+        let epsilon = ctx.capacity.facts["hysteresis_epsilon_ppm"]
+            .as_u64()
+            .or_else(|| {
+                ctx.capacity.facts["input_deviation_sum"]
+                    .as_u64()
+                    .zip(ctx.capacity.facts["input_sum"].as_u64())
+                    .map(|(deviation, total)| {
+                        u128::from(deviation)
+                            .saturating_mul(1_000_000)
+                            .checked_div(u128::from(total.max(1)))
+                            .unwrap_or(0)
+                            .min(1_000_000) as u64
+                    })
+            })
+            .unwrap_or(0);
+        let previous = state.shared["pard_priority_mode"]
+            .as_str()
+            .unwrap_or("lbf")
+            .to_owned();
+        let mode = if load_factor_ppm > 1_000_000u64.saturating_add(epsilon) {
+            "hbf".to_owned()
+        } else if load_factor_ppm < 1_000_000u64.saturating_sub(epsilon) {
+            "lbf".to_owned()
+        } else {
+            previous
+        };
+        let hbf = mode == "hbf";
+        state.shared["pard_priority_mode"] = json!(mode);
+        state.shared["pard_load_factor_ppm"] = json!(load_factor_ppm);
+        let mut survivors = Vec::new();
         for (index, candidate) in ctx.runnable.iter().enumerate() {
+            let downstream = candidate.facts["downstream_paths_ms"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|path| path.as_u64())
+                .max()
+                .unwrap_or_else(|| {
+                    candidate.facts["downstream_queue_ms"]
+                        .as_u64()
+                        .unwrap_or(0)
+                        .saturating_add(
+                            candidate.facts["downstream_execution_ms"]
+                                .as_u64()
+                                .unwrap_or(0),
+                        )
+                        .saturating_add(
+                            candidate.facts["downstream_batch_wait_p10_ms"]
+                                .as_u64()
+                                .unwrap_or(0),
+                        )
+                });
             let projected = candidate.facts["upstream_elapsed_ms"]
                 .as_u64()
                 .unwrap_or(0)
@@ -2813,32 +2879,76 @@ impl Policy for Pard {
                         .as_u64()
                         .unwrap_or(0),
                 )
-                .saturating_add(candidate.facts["downstream_queue_ms"].as_u64().unwrap_or(0))
-                .saturating_add(
-                    candidate.facts["downstream_execution_ms"]
-                        .as_u64()
-                        .unwrap_or(0),
-                )
-                .saturating_add(
-                    candidate.facts["downstream_batch_wait_p10_ms"]
-                        .as_u64()
-                        .unwrap_or(0),
-                );
-            if projected > candidate.facts["deadline_ms"].as_u64().unwrap_or(u64::MAX) {
-                host.cancel_request(
-                    candidate.request.request_id.as_str(),
-                    &format!("pard-{index}"),
-                    Some("projected deadline miss"),
-                )?;
+                .saturating_add(downstream);
+            let deadline = candidate.facts["deadline_ms"].as_u64().unwrap_or(u64::MAX);
+            if projected > deadline {
+                if candidate.facts["cancel_supported"]
+                    .as_bool()
+                    .unwrap_or(false)
+                {
+                    host.cancel_request(
+                        candidate.request.request_id.as_str(),
+                        &format!("pard-{}-{index}", ctx.meta.opportunity_id.as_str()),
+                        Some("projected deadline miss"),
+                    )?;
+                } else {
+                    state.shared["pard_unsupported_drop_intents"] = json!(
+                        state.shared["pard_unsupported_drop_intents"]
+                            .as_u64()
+                            .unwrap_or(0)
+                            .saturating_add(1)
+                    );
+                }
             } else {
-                order.push(index);
+                survivors.push((index, deadline.saturating_sub(projected)));
             }
         }
+        survivors.sort_by_key(|(index, remaining)| {
+            (
+                if hbf {
+                    Reverse(*remaining)
+                } else {
+                    Reverse(u64::MAX.saturating_sub(*remaining))
+                },
+                *index,
+            )
+        });
+        let order = survivors.into_iter().map(|(index, _)| index).collect();
         Ok(select_singletons(ctx, order))
     }
 
     fn feedback(ctx: &FeedbackContext, state: &mut State, _host: &Host) -> plex::Result<()> {
-        count_feedback(state, "pard_feedback_records", ctx.records.len());
+        for record in &ctx.records {
+            if let Some(input) = record.facts["input_work"].as_u64()
+                && let Some(throughput) = record.facts["module_throughput"].as_u64()
+            {
+                let observed = u128::from(input)
+                    .saturating_mul(1_000_000)
+                    .checked_div(u128::from(throughput.max(1)))
+                    .unwrap_or(0)
+                    .min(u128::from(u64::MAX)) as u64;
+                let previous = state.shared["pard_load_factor_ppm"]
+                    .as_u64()
+                    .unwrap_or(observed);
+                state.shared["pard_load_factor_ppm"] =
+                    json!(previous.saturating_mul(7) / 10 + observed.saturating_mul(3) / 10);
+            }
+            if record.outcome == OutcomeKind::ActionSucceeded {
+                state.shared["pard_drops_enacted"] = json!(
+                    state.shared["pard_drops_enacted"]
+                        .as_u64()
+                        .unwrap_or(0)
+                        .saturating_add(1)
+                );
+            } else if record.outcome == OutcomeKind::ActionFailed {
+                state.shared["pard_drops_failed"] = json!(
+                    state.shared["pard_drops_failed"]
+                        .as_u64()
+                        .unwrap_or(0)
+                        .saturating_add(1)
+                );
+            }
+        }
         Ok(())
     }
 }

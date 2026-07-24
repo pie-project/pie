@@ -1,4 +1,1 @@
-{
-  "selected_request_ids": ["A"],
-  "claim": "critical-path scheduling, not bundle fairness"
-}
+{"schema":"plex-paper-oracle@1","expectations":[{"case_id":"planned-worker-assignment","selected_worker":"worker-b"},{"case_id":"nested-segment-cursor","execution_order":[0,1]},{"case_id":"forced-progress","selected":true},{"case_id":"proactive-warm","action":"pie.cache.prefetch@1"}]}

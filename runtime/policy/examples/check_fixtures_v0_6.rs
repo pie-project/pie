@@ -26,6 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     check_fairness_state_machines(&packages)?;
     check_routing_state_machines(&packages)?;
     check_cache_state_machines(&packages)?;
+    check_pipeline_state_machines(&packages)?;
     check_wave_c(&packages)?;
     check_wave_d(&packages)?;
     check_replication_artifacts(&packages)?;
@@ -2546,6 +2547,301 @@ fn check_saga_state_machine(packages: &Path) -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
+fn check_pipeline_state_machines(packages: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    check_helium_state_machine(packages)?;
+    check_pard_state_machine(packages)?;
+    Ok(())
+}
+
+fn check_helium_state_machine(packages: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let helium = runtime(packages, "plex_paper_helium", &["cache.prefetch@1"], None)?;
+    let lifecycle = active_lifecycle(&[("H0", "GH"), ("H1", "GH"), ("HF", "GF")]);
+    let routed = helium.invoke(route_many(
+        "helium-route",
+        vec![route_candidate(
+            "H0",
+            "GH",
+            json!({"planned_worker_id": "worker-b"}),
+        )],
+        vec![
+            route_target("worker-a", 1, json!({})),
+            route_target("worker-b", 1, json!({})),
+        ],
+        vec![
+            route_edge(0, 0, json!({"planned_rank": 0, "estimated_token_steps": 1})),
+            route_edge(
+                0,
+                1,
+                json!({"planned_rank": 1, "estimated_token_steps": 10}),
+            ),
+        ],
+        lifecycle,
+    ))?;
+    assert_eq!(routed["plan"]["plan"]["assignments"][0]["target_index"], 1);
+    let first = helium.invoke(schedule_many(
+        "helium-segment-0",
+        vec![
+            schedule_candidate(
+                "H0",
+                "GH",
+                1,
+                json!({
+                    "workflow_id": "workflow",
+                    "worker_id": "worker-b",
+                    "segment_index": 0,
+                    "sequence_path": "0/0",
+                    "dependency_ready": true,
+                    "precedence_ready_at": 0,
+                    "now_token_step": 0,
+                    "critical_path_depth": 2,
+                    "earliest_start": 0
+                }),
+            ),
+            schedule_candidate(
+                "H1",
+                "GH",
+                1,
+                json!({
+                    "workflow_id": "workflow",
+                    "worker_id": "worker-b",
+                    "segment_index": 1,
+                    "sequence_path": "0/1",
+                    "dependency_ready": true,
+                    "precedence_ready_at": 0,
+                    "now_token_step": 0,
+                    "critical_path_depth": 1,
+                    "earliest_start": 1
+                }),
+            ),
+        ],
+        1,
+        1,
+        Vec::new(),
+    ))?;
+    assert_eq!(
+        first["plan"]["plan"]["selections"][0]["requests"],
+        json!([0])
+    );
+    assert_success(&helium.invoke(feedback_records(
+        "helium-segment-complete",
+        vec![request_completed(
+            "H0",
+            json!({
+                "workflow_id": "workflow",
+                "worker_id": "worker-b",
+                "segment_index": 0
+            }),
+        )],
+        Vec::new(),
+    ))?);
+    let second = helium.invoke(schedule_many(
+        "helium-segment-1",
+        vec![schedule_candidate(
+            "H1",
+            "GH",
+            1,
+            json!({
+                "workflow_id": "workflow",
+                "worker_id": "worker-b",
+                "segment_index": 1,
+                "sequence_path": "0/1",
+                "dependency_ready": true,
+                "precedence_ready_at": 0,
+                "now_token_step": 1,
+                "critical_path_depth": 1,
+                "earliest_start": 1
+            }),
+        )],
+        1,
+        1,
+        Vec::new(),
+    ))?;
+    assert_eq!(
+        second["plan"]["plan"]["selections"][0]["requests"],
+        json!([0])
+    );
+    let forced = helium.invoke(schedule_many(
+        "helium-forced",
+        vec![schedule_candidate(
+            "HF",
+            "GF",
+            1,
+            json!({
+                "workflow_id": "forced",
+                "worker_id": "worker-a",
+                "segment_index": 0,
+                "sequence_path": "0",
+                "dependency_ready": false,
+                "precedence_ready_at": 100,
+                "now_token_step": 0,
+                "earliest_start": 5
+            }),
+        )],
+        1,
+        1,
+        Vec::new(),
+    ))?;
+    assert_eq!(
+        forced["plan"]["plan"]["selections"][0]["requests"],
+        json!([0])
+    );
+    let warmed = helium.invoke(cache_many(
+        "helium-warm",
+        "insertion",
+        vec![],
+        vec![cache_object_fixture(
+            "static-prefix",
+            1,
+            json!({"proactive_warm": true, "worker_id": "worker-b"}),
+        )],
+        1,
+        json!({}),
+        None,
+    ))?;
+    assert_eq!(warmed["actions"][0]["method"], "pie.cache.prefetch@1");
+    assert_success(&helium.invoke(feedback_records(
+        "helium-warm-feedback",
+        vec![action_terminal(
+            &warmed["actions"][0],
+            "helium-warm",
+            "action-succeeded",
+        )],
+        Vec::new(),
+    ))?);
+    assert_eq!(
+        helium.backend().read_shared()?["helium_warm"]["static-prefix"],
+        true
+    );
+    Ok(())
+}
+
+fn check_pard_state_machine(packages: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let pard = runtime(packages, "plex_paper_pard", &["request.cancel@1"], None)?;
+    let lifecycle = active_lifecycle(&[("D", "GD"), ("E", "GE"), ("L", "GL"), ("H", "GH")]);
+    let scheduled = pard.invoke(schedule_many_limits(
+        "pard-hbf",
+        vec![
+            schedule_candidate(
+                "D",
+                "GD",
+                1,
+                json!({
+                    "upstream_elapsed_ms": 100,
+                    "current_queue_ms": 100,
+                    "current_execution_ms": 100,
+                    "downstream_paths_ms": [300, 500],
+                    "deadline_ms": 700,
+                    "cancel_supported": true
+                }),
+            ),
+            schedule_candidate(
+                "E",
+                "GE",
+                1,
+                json!({
+                    "upstream_elapsed_ms": 100,
+                    "current_queue_ms": 100,
+                    "current_execution_ms": 100,
+                    "downstream_queue_ms": 100,
+                    "downstream_execution_ms": 100,
+                    "downstream_batch_wait_p10_ms": 100,
+                    "deadline_ms": 600,
+                    "cancel_supported": true
+                }),
+            ),
+            schedule_candidate(
+                "L",
+                "GL",
+                1,
+                json!({
+                    "upstream_elapsed_ms": 100,
+                    "current_queue_ms": 50,
+                    "current_execution_ms": 50,
+                    "downstream_queue_ms": 50,
+                    "downstream_execution_ms": 50,
+                    "downstream_batch_wait_p10_ms": 0,
+                    "deadline_ms": 400,
+                    "cancel_supported": true
+                }),
+            ),
+            schedule_candidate(
+                "H",
+                "GH",
+                1,
+                json!({
+                    "upstream_elapsed_ms": 0,
+                    "current_queue_ms": 0,
+                    "current_execution_ms": 50,
+                    "downstream_queue_ms": 0,
+                    "downstream_execution_ms": 50,
+                    "downstream_batch_wait_p10_ms": 0,
+                    "deadline_ms": 1000,
+                    "cancel_supported": true
+                }),
+            ),
+        ],
+        2,
+        2,
+        2,
+        lifecycle,
+    ))?;
+    assert_eq!(scheduled["actions"][0]["method"], "pie.request.cancel@1");
+    assert_eq!(
+        scheduled["plan"]["plan"]["selections"][0]["requests"],
+        json!([1])
+    );
+    assert_eq!(
+        scheduled["plan"]["plan"]["selections"][1]["requests"],
+        json!([2])
+    );
+    assert_eq!(pard.backend().read_shared()?["pard_priority_mode"], "lbf");
+    assert_success(&pard.invoke(feedback_records(
+        "pard-load-feedback",
+        vec![request_progress(
+            "H",
+            json!({"input_work": 200, "module_throughput": 100}),
+        )],
+        Vec::new(),
+    ))?);
+    let hbf = pard.invoke(schedule_many_limits(
+        "pard-switch-hbf",
+        vec![
+            schedule_candidate(
+                "L",
+                "GL",
+                1,
+                json!({
+                    "upstream_elapsed_ms": 100,
+                    "current_execution_ms": 100,
+                    "deadline_ms": 300,
+                    "cancel_supported": true
+                }),
+            ),
+            schedule_candidate(
+                "H",
+                "GH",
+                1,
+                json!({
+                    "upstream_elapsed_ms": 100,
+                    "current_execution_ms": 100,
+                    "deadline_ms": 1000,
+                    "cancel_supported": true
+                }),
+            ),
+        ],
+        1,
+        1,
+        1,
+        Vec::new(),
+    ))?;
+    assert_eq!(hbf["plan"]["plan"]["selections"][0]["requests"], json!([1]));
+    assert_eq!(
+        pard.backend().read_shared()?["pard_load_factor_ppm"],
+        1300000
+    );
+    Ok(())
+}
+
 fn check_unavailable_feedback_cleanup(packages: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let runtime = runtime(packages, "plex_paper_helium", &[], None)?;
     assert_success(&runtime.invoke(schedule_event("A", "G", json!({})))?);
@@ -2566,14 +2862,16 @@ fn check_unavailable_feedback_cleanup(packages: &Path) -> Result<(), Box<dyn std
         }
     });
     let outcome = runtime.invoke(event.clone())?;
-    assert_eq!(outcome["status"], "unavailable");
+    assert_success(&outcome);
     assert!(
         runtime
             .backend()
             .read_request(&RequestId::from("A"))
             .is_err()
     );
-    assert_eq!(runtime.invoke(event)?, outcome);
+    let duplicate = runtime.invoke(event)?;
+    assert_success(&duplicate);
+    assert_eq!(duplicate["duplicate_feedback"], true);
 
     assert_success(&runtime.invoke(schedule_event("B", "H", json!({})))?);
     let cancelled = runtime.invoke(json!({
@@ -2592,7 +2890,7 @@ fn check_unavailable_feedback_cleanup(packages: &Path) -> Result<(), Box<dyn std
             "groups": []
         }
     }))?;
-    assert_eq!(cancelled["status"], "unavailable");
+    assert_success(&cancelled);
     assert!(
         runtime
             .backend()
@@ -2981,7 +3279,8 @@ fn check_wave_c(packages: &Path) -> Result<(), Box<dyn std::error::Error>> {
             "downstream_queue_ms": 10,
             "downstream_execution_ms": 10,
             "downstream_batch_wait_p10_ms": 10,
-            "deadline_ms": 100
+            "deadline_ms": 100,
+            "cancel_supported": true
         }),
     ))?;
     assert_success(&dropped);

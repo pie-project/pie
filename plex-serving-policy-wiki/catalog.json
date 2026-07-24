@@ -433,13 +433,15 @@
       "replication_id": "helium",
       "component": "plex_paper_helium",
       "operations": [
-        "schedule"
+        "route",
+        "schedule",
+        "cache",
+        "feedback"
       ],
       "evidence_level": "inspired-adaptation",
       "validation_status": "passing",
       "deferred_mechanics": [
-        "query-plan rewrite",
-        "proactive cache warming"
+        "query-plan rewrite fact producer"
       ],
       "metadata_path": "tests/policies/replications/helium/metadata.json"
     }

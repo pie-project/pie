@@ -14,9 +14,9 @@
   },
   "operation_counts": {
     "admit": 5,
-    "cache": 12,
-    "feedback": 19,
-    "route": 14,
+    "cache": 13,
+    "feedback": 20,
+    "route": 15,
     "schedule": 22
   },
   "entries": [
@@ -234,29 +234,41 @@
       "source_license": "paper reference; no source copied",
       "component": "plex_paper_helium",
       "implements": [
-        "schedule"
+        "route",
+        "schedule",
+        "cache",
+        "feedback"
       ],
       "policy_kernel": [
-        "ready-operator filtering",
-        "critical-path depth priority",
-        "cache-reuse benefit",
+        "validated whole-DAG worker assignment",
+        "nested TRT sequence cursor",
+        "critical-path ready traversal",
         "earliest-start forced progress",
-        "profiled token-cost penalty"
+        "proactive static-prefix warming"
       ],
       "required_facts": [
-        "ready",
-        "dependency_depth",
-        "prefix_reuse_tokens",
+        "workflow_id",
+        "planned_worker_id",
+        "planned_rank",
+        "estimated_token_steps",
+        "worker_id",
+        "segment_index",
+        "sequence_path",
+        "dependency_ready",
+        "precedence_ready_at",
+        "now_token_step",
+        "critical_path_depth",
         "earliest_start",
-        "profiled_token_cost"
+        "proactive_warm"
       ],
-      "required_mechanics": [],
+      "required_mechanics": [
+        "cache.prefetch@1"
+      ],
       "deferred_mechanics": [
-        "query-plan rewrite",
-        "proactive cache warming"
+        "query-plan rewrite fact producer"
       ],
       "evidence_level": "inspired-adaptation",
-      "fixture_provenance": "independent implementation from the paper algorithm",
+      "fixture_provenance": "arXiv 2603.16104 Algorithm 1 and token-step cost model",
       "validation_status": "passing",
       "fidelity": {
         "classification": "material-semantic-gap",
@@ -874,8 +886,10 @@
         "feedback"
       ],
       "policy_kernel": [
-        "upstream elapsed plus downstream tail prediction",
-        "mid-lifecycle drop intent"
+        "Equation-3 linear and DAG latency projection",
+        "remaining-budget DEPQ",
+        "load-factor HBF/LBF hysteresis",
+        "capability-guarded proactive drop intent"
       ],
       "required_facts": [
         "upstream_elapsed_ms",
@@ -884,7 +898,15 @@
         "downstream_queue_ms",
         "downstream_execution_ms",
         "downstream_batch_wait_p10_ms",
-        "deadline_ms"
+        "downstream_paths_ms",
+        "deadline_ms",
+        "load_factor_ppm",
+        "input_work",
+        "module_throughput",
+        "hysteresis_epsilon_ppm",
+        "input_deviation_sum",
+        "input_sum",
+        "cancel_supported"
       ],
       "required_mechanics": [],
       "optional_mechanics": [
@@ -894,7 +916,7 @@
         "latency-distribution estimator"
       ],
       "evidence_level": "inspired-adaptation",
-      "fixture_provenance": "independent reference model from the paper",
+      "fixture_provenance": "EuroSys 2026 Equations 1-3 and Section 4.3 DEPQ hysteresis",
       "validation_status": "passing",
       "fidelity": {
         "classification": "incorrect",

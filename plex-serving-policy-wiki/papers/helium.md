@@ -45,11 +45,11 @@ Named datasets/workloads identified from the primary text or manual audit.
 ## PLEX v0.6 replication status
 
 - Component: `plex_paper_helium`
-- Operations: `schedule`
+- Operations: `route`, `schedule`, `cache`, `feedback`
 - Evidence: `inspired-adaptation`
 - Validation: `passing`
 - Metadata: [`tests/policies/replications/helium/metadata.json`](../../tests/policies/replications/helium/metadata.json)
-- Deferred mechanics: query-plan rewrite; proactive cache warming
+- Deferred mechanics: query-plan rewrite fact producer
 <!-- plex-v0.6-replication:end -->
 
 ## Suggested citation

@@ -203,6 +203,7 @@ def invoke_schedule(
     max_selections: int = 1,
     max_requests: int | None = None,
     token_budget: int = 1,
+    capacity_facts: dict[str, Any] | None = None,
 ) -> tuple[list[int], dict[str, Any]]:
     request_limit = max_requests or max_selections
     meta = bench.meta("schedule")
@@ -223,7 +224,7 @@ def invoke_schedule(
                 "max_selections": max_selections,
                 "max_requests": request_limit,
                 "max_total_tokens": request_limit * token_budget,
-                "facts": {},
+                "facts": capacity_facts or {},
             },
         },
         lifecycle,
@@ -943,43 +944,76 @@ def scenario_helium(
     policy_values = []
     baseline_values = []
     for trial in range(trials):
+        costs = [rng.randint(10, 100) for _ in range(6)]
+        workers = [index % 2 for index in range(6)]
+        segments = [index // 2 for index in range(6)]
         facts = [
             {
-                "ready": rng.random() < 0.7,
-                "dependency_depth": rng.randint(0, 10),
-                "prefix_reuse_tokens": rng.randint(0, 4096),
-                "earliest_start": rng.randint(0, 1000),
-                "profiled_token_cost": rng.randint(1, 1000),
+                "workflow_id": f"helium-{trial}",
+                "planned_worker_id": f"target-{workers[index]}",
+                "worker_id": f"target-{workers[index]}",
+                "segment_index": segments[index],
+                "sequence_path": f"{workers[index]}/{segments[index]}",
+                "dependency_ready": segments[index] == 0,
+                "precedence_ready_at": segments[index],
+                "now_token_step": 0,
+                "critical_path_depth": 3 - segments[index],
+                "earliest_start": segments[index],
             }
-            for _ in range(6)
+            for index in range(6)
         ]
-        if not any(item["ready"] for item in facts) and rng.random() < 0.8:
-            facts[rng.randrange(len(facts))]["ready"] = True
         refs, lifecycle = bootstrap_requests(
-            bench, f"helium-{trial}", facts, status="active"
+            bench, f"helium-{trial}", facts, status="admitted"
         )
-        selected, _ = invoke_schedule(bench, refs, facts, lifecycle)
-        if any(item["ready"] for item in facts):
-            utilities = [
-                (
-                    item["dependency_depth"] * 1_000_000
-                    + item["prefix_reuse_tokens"] * 100
-                    + 1001
-                    - item["profiled_token_cost"]
-                    if item["ready"]
-                    else 1
-                )
-                for item in facts
-            ]
-        else:
-            utilities = [-item["earliest_start"] for item in facts]
-        policy_values.append(utilities[selected[0]])
-        baseline_values.append(utilities[0])
+        assignments, _ = invoke_route(
+            bench,
+            refs,
+            [
+                {
+                    "planned_worker_id": f"target-{workers[index]}"
+                }
+                for index in range(6)
+            ],
+            [{}, {}],
+            [
+                [
+                    {
+                        "planned_rank": (
+                            0 if target == workers[index] else 1
+                        ),
+                        "estimated_token_steps": costs[index],
+                    }
+                    for target in range(2)
+                ]
+                for index in range(6)
+            ],
+            lifecycle,
+            target_capacity=3,
+        )
+        worker_load = [0, 0]
+        for index, target in enumerate(assignments):
+            worker_load[target] += costs[index]
+        policy_values.append(sum(costs) / max(worker_load))
+        baseline_values.append(1.0)
+        invoke_schedule(
+            bench,
+            refs,
+            facts,
+            [
+                {
+                    "event": "activate-request",
+                    "request_id": ref["request_id"],
+                }
+                for ref in refs
+            ],
+            max_selections=2,
+            max_requests=2,
+        )
     return result(
         policy_values,
         baseline_values,
         direction="higher",
-        unit="critical_path_priority",
+        unit="worker_parallelism_speedup",
     )
 
 
@@ -1979,17 +2013,34 @@ def scenario_pard(
     policy_values = []
     baseline_values = []
     for trial in range(trials):
+        high_load = trial % 2 == 0
+        budgets = [10, 20, 100, 200, 300, 400]
+        if not high_load:
+            budgets.reverse()
         facts = [
             {
-                "upstream_elapsed_ms": rng.randint(0, 500),
-                "current_queue_ms": rng.randint(0, 200),
-                "current_execution_ms": rng.randint(10, 200),
-                "downstream_queue_ms": rng.randint(0, 200),
-                "downstream_execution_ms": rng.randint(10, 200),
-                "downstream_batch_wait_p10_ms": rng.randint(0, 100),
-                "deadline_ms": rng.randint(250, 700),
+                "upstream_elapsed_ms": 100,
+                "current_queue_ms": 0,
+                "current_execution_ms": 0,
+                "downstream_queue_ms": 0,
+                "downstream_execution_ms": 0,
+                "downstream_batch_wait_p10_ms": 0,
+                "deadline_ms": 100 + budget,
+                "cancel_supported": True,
             }
-            for _ in range(8)
+            for budget in budgets
+        ] + [
+            {
+                "upstream_elapsed_ms": 100,
+                "current_queue_ms": 0,
+                "current_execution_ms": 0,
+                "downstream_queue_ms": 0,
+                "downstream_execution_ms": 0,
+                "downstream_batch_wait_p10_ms": 0,
+                "deadline_ms": 50,
+                "cancel_supported": True,
+            }
+            for _ in range(2)
         ]
         refs, lifecycle = bootstrap_requests(
             bench, f"pard-{trial}", facts, status="active"
@@ -2000,6 +2051,12 @@ def scenario_pard(
             facts,
             lifecycle,
             max_selections=4,
+            capacity_facts={
+                "load_factor_ppm": (
+                    1_300_000 if high_load else 700_000
+                ),
+                "hysteresis_epsilon_ppm": 100_000,
+            },
         )
         feasible = [
             item["upstream_elapsed_ms"]
@@ -2011,8 +2068,33 @@ def scenario_pard(
             <= item["deadline_ms"]
             for item in facts
         ]
-        policy_values.append(sum(feasible[index] for index in selected))
-        baseline_values.append(sum(feasible[:4]))
+        remaining = [
+            max(
+                item["deadline_ms"]
+                - (
+                    item["upstream_elapsed_ms"]
+                    + item["current_queue_ms"]
+                    + item["current_execution_ms"]
+                    + item["downstream_queue_ms"]
+                    + item["downstream_execution_ms"]
+                    + item["downstream_batch_wait_p10_ms"]
+                ),
+                0,
+            )
+            for item in facts
+        ]
+        desired = sorted(
+            (index for index in range(len(facts)) if feasible[index]),
+            key=remaining.__getitem__,
+            reverse=high_load,
+        )[:4]
+        policy_values.append(
+            sum(feasible[index] for index in selected)
+            + sum(index in desired for index in selected)
+        )
+        baseline_values.append(
+            sum(feasible[:4]) + sum(index in desired for index in range(4))
+        )
     exercise_feedback(bench, "pard-feedback")
     return result(
         policy_values,

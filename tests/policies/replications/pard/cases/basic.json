@@ -1,6 +1,1 @@
-{
-  "case": "projected-deadline-miss",
-  "upstream_elapsed_ms": 80,
-  "downstream_p95_ms": 40,
-  "deadline_ms": 100
-}
+{"schema":"plex-paper-oracle@1","cases":[{"id":"equation-3-dag-max","downstream_paths_ms":[300,500],"deadline_ms":700},{"id":"deadline-equality","projected_ms":600,"deadline_ms":600},{"id":"depq-hysteresis","load_factor_ppm":[1000000,1300000],"epsilon_ppm":0},{"id":"cancel-capability","cancel_supported":true}]}
