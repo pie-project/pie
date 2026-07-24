@@ -1410,31 +1410,24 @@ impl KvStore {
         Ok(self.table.swapped_pages(working_sets)?.len())
     }
 
+    /// Prepare a restore from caller-owned reserved pages, consuming exactly
+    /// the required prefix of `granted` (lend semantics: failure consumes
+    /// nothing, and surplus stays caller-owned — the caller's grant guard is
+    /// the single return path).
     pub fn prepare_restore(
         &mut self,
         working_sets: &HashSet<WorkingSetId>,
-        gpu_pages: Vec<PhysicalKvPageId>,
+        granted: &mut Vec<PhysicalKvPageId>,
     ) -> Result<KvRestoreTxn, KvStoreError> {
-        let swapped = match self.table.swapped_pages(working_sets) {
-            Ok(swapped) => swapped,
-            Err(error) => {
-                self.pool.release_reserved(gpu_pages);
-                return Err(error.into());
-            }
-        };
-        if swapped.len() != gpu_pages.len() {
-            let required = swapped.len();
-            let granted = gpu_pages.len();
-            self.pool.release_reserved(gpu_pages);
-            return Err(KvStoreError::GrantMismatch { required, granted });
+        let swapped = self.table.swapped_pages(working_sets)?;
+        if granted.len() < swapped.len() {
+            return Err(KvStoreError::GrantMismatch {
+                required: swapped.len(),
+                granted: granted.len(),
+            });
         }
-        let pinned = match self.table.pin_working_sets(working_sets) {
-            Ok(pinned) => pinned,
-            Err(error) => {
-                self.pool.release_reserved(gpu_pages);
-                return Err(error.into());
-            }
-        };
+        let pinned = self.table.pin_working_sets(working_sets)?;
+        let gpu_pages: Vec<PhysicalKvPageId> = granted.drain(..swapped.len()).collect();
         let pages: Vec<RestorePage> = swapped
             .into_iter()
             .zip(gpu_pages)

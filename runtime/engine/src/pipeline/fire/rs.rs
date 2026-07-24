@@ -50,6 +50,17 @@ pub fn validate_count(
     Ok(request_count)
 }
 
+/// Phase-A demand for [`prepare_many`] over these working sets: how many
+/// folded slots the prepare would allocate, with no allocation or open
+/// transaction. The acquisition seam sizes its RS ask from this.
+pub fn demand(store: &RsStore, working_sets: &[RsWorkingSetId]) -> Result<usize, String> {
+    let mut total = 0;
+    for &ws in working_sets {
+        total += store.write_state_demand(ws).map_err(|e| e.to_string())?;
+    }
+    Ok(total)
+}
+
 /// Prepare the in-forward folded-state write. Returns
 /// `(rs_slot_ids, rs_slot_flags, (copy_src, copy_dst), txns)`: thread the ids
 /// and flags into the launch in request order, issue one aggregated state-copy

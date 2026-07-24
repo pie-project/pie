@@ -638,14 +638,18 @@ async fn suspend_restore(pid: uuid::Uuid, working_sets: HashSet<WorkingSetId>) -
 
     let max_restore_attempts = orchestrator.config().restore_retries.max(1);
     for attempt in 1..=max_restore_attempts {
-        let grant = orchestrator
+        let mut grant = orchestrator
             .park_until_restore_granted(pid)
             .await
             .context("wait for KV restore grant")?;
-        let txn =
-            match crate::store::registry::with_kv_lock(&stores.kv, "preemption-restore", |kv| {
-                kv.prepare_restore(&working_sets, grant.into_pages())
-            }) {
+        // Lend the grant's pages to the store; the grant guard stays armed,
+        // so an error below returns every unconsumed page through its Drop.
+        let prepared =
+            crate::store::registry::with_kv_lock(&stores.kv, "preemption-restore", |kv| {
+                kv.prepare_restore(&working_sets, grant.lend())
+            });
+        drop(grant);
+        let txn = match prepared {
                 Ok(txn) => txn,
                 Err(error) => {
                     orchestrator.record_restore_rollback();

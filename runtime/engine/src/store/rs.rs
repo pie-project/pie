@@ -344,6 +344,17 @@ impl RsStore {
         self.prepare(ws, write_state, None, buffer_tokens)
     }
 
+    /// Phase-A demand: slots a folded-state write for `ws` would allocate
+    /// (1 for a fresh or CoW folded target, 0 for an in-place write). Pure —
+    /// no allocation, transaction, or refcount change.
+    pub fn write_state_demand(&self, ws: RsWorkingSetId) -> Result<usize, RsError> {
+        Ok(match self.entry(ws)?.folded {
+            None => 1,
+            Some(id) if self.ref_count(id) > 1 => 1,
+            Some(_) => 0,
+        })
+    }
+
     /// Prepare an explicit `fold(tokens)`: validated against the fold
     /// granularity before any driver dispatch. A committed fold advances the
     /// folded boundary (dropping fully covered head buffer pages).

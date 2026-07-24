@@ -217,9 +217,12 @@ impl DevicePageReservation {
         }
     }
 
-    fn take(mut self) -> Vec<crate::store::kv::page_table::PhysicalKvPageId> {
-        self.returner = None;
-        self.pages.take().unwrap_or_default()
+    /// A reservation holding nothing (zero-demand grants). Drop is a no-op.
+    fn empty() -> Self {
+        Self {
+            pages: Some(Vec::new()),
+            returner: None,
+        }
     }
 }
 
@@ -240,8 +243,30 @@ pub struct AllocationGrant {
 }
 
 impl AllocationGrant {
-    pub fn into_pages(self) -> Vec<crate::store::kv::page_table::PhysicalKvPageId> {
-        self.reservation.take()
+    /// A grant carrying zero pages, for zero-demand fires: the build path is
+    /// uniform (everything goes through prefix lending) and disposal is free.
+    pub fn empty(process_id: ProcessId) -> Self {
+        Self {
+            process_id,
+            request_id: 0,
+            pages: 0,
+            reservation: DevicePageReservation::empty(),
+        }
+    }
+
+    /// Reserved page ids not yet consumed by a store preparation.
+    pub fn remaining(&self) -> usize {
+        self.reservation.pages.as_ref().map_or(0, Vec::len)
+    }
+
+    /// Prefix lending: store preparation functions drain exactly the pages
+    /// they consume from this Vec while the grant's Drop guard STAYS ARMED —
+    /// whatever remains at disposal returns to the pool through the
+    /// reservation's returner. There is no way to disarm the guard; consumed
+    /// pages leave through a store transaction, surplus through Drop, and
+    /// nothing is ever hand-released.
+    pub fn lend(&mut self) -> &mut Vec<crate::store::kv::page_table::PhysicalKvPageId> {
+        self.reservation.pages.get_or_insert_default()
     }
 }
 
