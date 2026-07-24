@@ -235,7 +235,7 @@ async fn acquire_kv_pages<C: FireContext>(
         .map_err(|_| "pipeline: KV demand exceeds the contention ABI".to_string())?;
     loop {
         match orchestrator
-            .acquire_or_self_suspend_for_pipeline(ctx.process_id(), pipeline_id, demand, false)
+            .acquire_or_self_suspend_for_pipeline(ctx.process_id(), pipeline_id, demand)
             .await
             .map_err(|error| format!("pipeline: KV contention: {error}"))?
         {

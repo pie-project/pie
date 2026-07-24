@@ -458,9 +458,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     //    directly from `inferlet::process`, which needs no such hook).
     crate::store::reclaim::set_pipeline_leave_hook(|pid, kind| {
         let kind = match kind {
-            crate::store::reclaim::LeaveKind::Terminate => {
-                crate::scheduler::worker::LeaveKind::Terminate
-            }
             crate::store::reclaim::LeaveKind::AllocationWait => {
                 crate::scheduler::worker::LeaveKind::Close
             }

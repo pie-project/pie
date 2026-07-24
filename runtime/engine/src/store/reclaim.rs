@@ -65,26 +65,21 @@ pub type ProcessId = uuid::Uuid;
 /// scheduler installs on `store/`, not a call `store/` makes upward.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LeaveKind {
-    #[allow(dead_code)]
-    Terminate,
     AllocationWait,
     Suspend,
 }
 
-/// Pipeline-leave/join hooks. `notify_pipeline_leave` forwards to the
+/// Pipeline-leave hook. `notify_pipeline_leave` forwards to the
 /// subscription the scheduler installs via [`set_pipeline_leave_hook`] (a
 /// plain closure, so this module never names `crate::scheduler` and stays
 /// below it in the layering — see [`LeaveKind`]'s doc for the A×B coupling
-/// this seam serves); a no-op until installed. `notify_pipeline_join` stays
-/// inert: the wait-all quorum's rejoin is implicit on a pipeline's next
-/// wave request, so a join event has nothing to do on the scheduler side
-/// either.
+/// this seam serves); a no-op until installed. Rejoin is implicit on a
+/// pipeline's next wave request, so no join event exists.
 pub(crate) fn notify_pipeline_leave(pid: ProcessId, kind: LeaveKind) {
     if let Some(hook) = PIPELINE_LEAVE_HOOK.get() {
         hook(pid, kind);
     }
 }
-pub(crate) fn notify_pipeline_join(_pid: ProcessId) {}
 
 type PipelineLeaveHook = Box<dyn Fn(ProcessId, LeaveKind) + Send + Sync>;
 static PIPELINE_LEAVE_HOOK: OnceLock<PipelineLeaveHook> = OnceLock::new();
@@ -195,10 +190,6 @@ impl DevicePageReservation {
         }
     }
 
-    pub fn len(&self) -> usize {
-        self.pages.as_ref().map_or(0, Vec::len)
-    }
-
     fn take(mut self) -> Vec<crate::store::kv::page_table::PhysicalKvPageId> {
         self.returner = None;
         self.pages.take().unwrap_or_default()
@@ -220,8 +211,6 @@ pub struct AllocationGrant {
     pub pages: u32,
     reservation: DevicePageReservation,
 }
-
-pub type ReclaimableProbe = Arc<dyn Fn() -> bool + Send + Sync>;
 
 impl AllocationGrant {
     pub fn into_pages(self) -> Vec<crate::store::kv::page_table::PhysicalKvPageId> {
@@ -692,18 +681,6 @@ impl ContentionOrchestrator {
         self.allocation_waiters.load(Ordering::Acquire) != 0
     }
 
-    /// Is `pid` the FCFS-oldest registered process? The oldest is the
-    /// completion keystone: never a victim (victim pick) and never a
-    /// self-yielder (step-6 gate) — it parks and FCFS hands it the next freed
-    /// blocks, guaranteeing fleet-wide progress one completion at a time.
-    fn is_fcfs_oldest(&self, pid: ProcessId) -> bool {
-        let inner = self.inner.lock().unwrap();
-        let Some(p) = inner.procs.get(&pid) else {
-            return false;
-        };
-        inner.procs.values().all(|q| q.submit_seq >= p.submit_seq)
-    }
-
     /// Register a process at spawn — its registration order is the FCFS clock.
     pub fn register(&self, pid: ProcessId) {
         let mut inner = self.inner.lock().unwrap();
@@ -761,17 +738,6 @@ impl ContentionOrchestrator {
             notify.notify_one();
         }
         self.drain();
-    }
-
-    /// Whether `pid` is currently suspended (probe/test accessor; the
-    /// scheduler wait-set Leave/rejoin coupling reads process state events,
-    /// not this, but tests assert through it).
-    pub fn is_suspended(&self, pid: ProcessId) -> bool {
-        let inner = self.inner.lock().unwrap();
-        matches!(
-            inner.procs.get(&pid).map(|p| p.state),
-            Some(ProcState::Suspended) | Some(ProcState::Restoring)
-        )
     }
 
     /// Blocks freed somewhere (forward txn abort/commit released pages, a
@@ -985,7 +951,6 @@ impl ContentionOrchestrator {
             u64::from(restored_pages),
             std::sync::atomic::Ordering::Relaxed,
         );
-        notify_pipeline_join(pid);
         self.drain();
     }
 
@@ -1004,64 +969,11 @@ impl ContentionOrchestrator {
         self.drain();
     }
 
-    pub async fn acquire(
-        &self,
-        requester: ProcessId,
-        need: u32,
-    ) -> Result<AllocationGrant, ContentionError> {
-        match self.acquire_or_self_suspend(requester, need, false).await? {
-            Acquired::Granted(grant) => Ok(grant),
-            Acquired::SelfSuspendFirst => unreachable!("self suspend disabled"),
-        }
-    }
-
-    pub async fn acquire_or_self_suspend(
-        &self,
-        requester: ProcessId,
-        need: u32,
-        holds_reclaimable: bool,
-    ) -> Result<Acquired, ContentionError> {
-        self.acquire_or_self_suspend_for_pipeline(requester, requester, need, holds_reclaimable)
-            .await
-    }
-
     pub async fn acquire_or_self_suspend_for_pipeline(
         &self,
         requester: ProcessId,
         quorum_id: ProcessId,
         need: u32,
-        holds_reclaimable: bool,
-    ) -> Result<Acquired, ContentionError> {
-        self.acquire_or_self_suspend_live_for_pipeline(
-            requester,
-            quorum_id,
-            need,
-            Arc::new(move || holds_reclaimable),
-        )
-        .await
-    }
-
-    pub async fn acquire_or_self_suspend_live(
-        &self,
-        requester: ProcessId,
-        need: u32,
-        holds_reclaimable: ReclaimableProbe,
-    ) -> Result<Acquired, ContentionError> {
-        self.acquire_or_self_suspend_live_for_pipeline(
-            requester,
-            requester,
-            need,
-            holds_reclaimable,
-        )
-        .await
-    }
-
-    async fn acquire_or_self_suspend_live_for_pipeline(
-        &self,
-        requester: ProcessId,
-        quorum_id: ProcessId,
-        need: u32,
-        holds_reclaimable: ReclaimableProbe,
     ) -> Result<Acquired, ContentionError> {
         let (_, total) = self.backend.pool_stats();
         if need > total {
@@ -1089,7 +1001,6 @@ impl ContentionOrchestrator {
             self.drain();
             if let Some(grant) = self.take_allocation_grant(requester, request_id, need) {
                 registration.disarm();
-                notify_pipeline_join(requester);
                 return Ok(Acquired::Granted(grant));
             }
             if !self.inner.lock().unwrap().procs.contains_key(&requester) {
@@ -1246,27 +1157,6 @@ impl ContentionOrchestrator {
                 continue;
             }
 
-            if holds_reclaimable() && !self.is_fcfs_oldest(requester) {
-                registration.disarm();
-                self.cancel_waiter(requester, request_id, false);
-                let signal = {
-                    let mut inner = self.inner.lock().unwrap();
-                    let signal = inner.procs.get_mut(&requester).map(|process| {
-                        process.state = ProcState::ParkRequested;
-                        process.park_requested.clone()
-                    });
-                    if signal.is_some() {
-                        self.park_requests.fetch_add(1, Ordering::Release);
-                    }
-                    signal
-                };
-                if let Some(signal) = signal {
-                    signal.notify_waiters();
-                }
-                notify_pipeline_join(requester);
-                return Ok(Acquired::SelfSuspendFirst);
-            }
-
             let (free, total) = self.backend.pool_stats();
             if self.is_oldest_requester(requester) {
                 let since = *exhausted_since.get_or_insert_with(Instant::now);
@@ -1290,21 +1180,6 @@ impl ContentionOrchestrator {
             }
             tried.clear();
         }
-    }
-
-    /// Any queued entitlement forces new allocations through the grant path;
-    /// callers may not race a direct pool allocation around an older entry.
-    pub fn allocation_requires_grant(&self) -> bool {
-        true
-    }
-
-    pub fn is_running(&self, pid: ProcessId) -> bool {
-        self.inner
-            .lock()
-            .unwrap()
-            .procs
-            .get(&pid)
-            .is_some_and(|process| process.state == ProcState::Running)
     }
 
     pub fn is_registered(&self, pid: ProcessId) -> bool {
@@ -1457,7 +1332,6 @@ impl ContentionOrchestrator {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         if removed {
-            notify_pipeline_join(pid);
             self.drain();
         }
     }
@@ -1692,391 +1566,6 @@ impl ContentionOrchestrator {
         }
     }
 
-    /// Wait until `need` free blocks are plausibly available, FCFS-preempting
-    /// younger processes as needed. Returns when the caller should RETRY its
-    /// allocation (the retry re-enters here on a lost race — progress is
-    /// guaranteed because the oldest process is never a victim and waiters
-    /// wake FIFO). The caller must hold NO arena/WS locks and no staged txn.
-    #[cfg(any())]
-    pub async fn acquire_legacy(
-        &self,
-        requester: ProcessId,
-        need: u32,
-    ) -> Result<(), ContentionError> {
-        self.acquire_or_self_suspend(requester, need, false)
-            .await
-            .map(|_| ())
-    }
-
-    /// The full v2 acquire: like [`acquire`](Self::acquire), but when NO
-    /// victim can yield and the requester itself holds reclaimable pages
-    /// (`holds_reclaimable`), returns [`Acquired::SelfSuspendFirst`] INSTEAD
-    /// of parking — the prior design's step 6 (requester self-suspends),
-    /// restoring the invariant that every parked page-holder has freed its
-    /// pages (the fleet=24/8 deadlock-breaker). Callers that pass
-    /// `holds_reclaimable=false` get the v1 park behavior unchanged.
-    #[cfg(any())]
-    pub async fn acquire_or_self_suspend_legacy(
-        &self,
-        requester: ProcessId,
-        need: u32,
-        holds_reclaimable: bool,
-    ) -> Result<Acquired, ContentionError> {
-        let (_, total) = self.backend.pool_stats();
-        if need > total {
-            return Err(ContentionError::Impossible { need, total });
-        }
-        // Victims this request already tried that yielded nothing NOW
-        // (grace-deferred or unsupported) — skipped until the world changes.
-        let mut tried: HashSet<ProcessId> = HashSet::new();
-        // This call's parked FIFO entry, if any: (token, notify). The entry
-        // keeps its queue slot across lost wake races and is removed on exit.
-        let mut parked: Option<(u64, Arc<Notify>)> = None;
-        // #19: first instant this call became CONTINUOUSLY unsatisfiable as the
-        // FCFS-oldest keystone (no victim, `free < need`). Reset whenever the
-        // condition clears; on `exhaustion_ms` of continuous quiet ⇒ fail loud.
-        let mut exhausted_since: Option<Instant> = None;
-
-        let result = loop {
-            let (free, _) = self.backend.pool_stats();
-            if free >= need {
-                break Ok(Acquired::Retry);
-            }
-
-            // Ladder rung 1: reclaim idle cache leases (no work lost) before
-            // any preemption. If it yielded, re-check the pool — the freed
-            // blocks may already satisfy us (and parked waiters).
-            if self.backend.reclaim_idle() > 0 {
-                self.wake_waiters();
-                continue;
-            }
-
-            // Pick the youngest running peer as victim (FCFS), reserving it
-            // as `Suspending` under the lock so concurrent acquires don't
-            // double-suspend it. The backend call happens OUTSIDE the lock.
-            let victim = {
-                let mut inner = self.inner.lock().unwrap();
-                // FIX (fleet=24/8 deadlock, alpha's mechanism): a lane parked
-                // inside `acquire` stays `Running` but is stuck PAST its
-                // execute-entry prologue — it can NEVER comply with a park
-                // request. Picking it poisons it (`ParkRequested`, excluded
-                // from re-pick, pages stranded). Exclude any pid with an
-                // active waiter entry from the victim pick.
-                let victim = inner
-                    .procs
-                    .iter()
-                    .filter(|(p, s)| {
-                        **p != requester
-                            && s.state == ProcState::Running
-                            && !tried.contains(*p)
-                            && !inner.waiters.iter().any(|w| w.pid == **p)
-                    })
-                    .max_by_key(|(_, s)| s.spawn_seq)
-                    .map(|(p, _)| *p);
-                if let Some(v) = victim {
-                    inner.procs.get_mut(&v).unwrap().state = ProcState::Suspending;
-                }
-                victim
-            };
-
-            match victim {
-                Some(v) => {
-                    // A victim appeared ⇒ the exhaustion condition is not met;
-                    // reset the keystone deadline (reset-on-change, Q3).
-                    exhausted_since = None;
-                    match self.backend.suspend(v) {
-                        SuspendOutcome::Suspended { freed_now } => {
-                            {
-                                let mut inner = self.inner.lock().unwrap();
-                                if let Some(p) = inner.procs.get_mut(&v) {
-                                    p.state = ProcState::Suspended;
-                                    p.suspended_need = freed_now;
-                                    p.suspended_at = Some(Instant::now());
-                                    inner.restore_queue.push_back(v);
-                                    self.stats
-                                        .suspends
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                }
-                            }
-                            // The victim's blocks may also satisfy PARKED waiters,
-                            // not just this requester — wake the FIFO prefix (a
-                            // synchronous-suspend backend has no report_suspended
-                            // drain to do it for us).
-                            self.wake_waiters();
-                            // Loop: re-check free (another requester may race the
-                            // freed blocks; we then evict further or park).
-                        }
-                        SuspendOutcome::Requested => {
-                            // Self-suspend protocol: the victim saves its own
-                            // state at its next host-call boundary; its blocks
-                            // arrive via `report_suspended` → drain. Skip it for
-                            // this pass.
-                            let mut inner = self.inner.lock().unwrap();
-                            if let Some(p) = inner.procs.get_mut(&v) {
-                                p.state = ProcState::ParkRequested;
-                            }
-                            tried.insert(v);
-                        }
-                        SuspendOutcome::DeferredByGrace | SuspendOutcome::Unsupported => {
-                            let mut inner = self.inner.lock().unwrap();
-                            if let Some(p) = inner.procs.get_mut(&v) {
-                                p.state = ProcState::Running;
-                            }
-                            tried.insert(v);
-                        }
-                    }
-                }
-                None => {
-                    // Step 6 (prior design): no victim can yield — if the
-                    // requester itself holds reclaimable pages, tell the
-                    // caller to SELF-SUSPEND instead of parking; a parked
-                    // page-holder can neither comply with a park request
-                    // (it's past its prologue) nor free its pages.
-                    //
-                    // FCFS COMPLETION KEYSTONE (alpha's livelock find): the
-                    // OLDEST registered process must NEVER self-yield — the
-                    // victim-pick already protects it as a victim, but an
-                    // unguarded SelfSuspendFirst let it yield its own pages,
-                    // breaking "the oldest first-comer's progress is
-                    // protected" — with everyone yield-restoring and nobody
-                    // finishing (the ~8-cycles/lane churn). The oldest PARKS
-                    // instead; every younger peer still self-yields, so frees
-                    // flow to the oldest (FIFO prefix), it completes, and the
-                    // next-oldest inherits the protection — a completion
-                    // chain instead of a livelock.
-                    if holds_reclaimable && !self.is_fcfs_oldest(requester) {
-                        return Ok(Acquired::SelfSuspendFirst);
-                    }
-                    // #19 EXHAUSTION endgame: we reach here as either (a) a
-                    // page-less waiter, or (b) the FCFS-oldest keystone (which
-                    // never SelfSuspendFirsts). For the keystone with no victim
-                    // and `free < need`, NO orchestrator action can satisfy it —
-                    // there is nothing to suspend, and restoring a suspended peer
-                    // only CONSUMES `free`. If that persists for `exhaustion_ms`
-                    // of continuous quiet, the guest has grown its context past
-                    // the pool: fail LOUD (one self-triaging log) rather than
-                    // wedge silently. Non-keystone waiters clear the clock — the
-                    // keystone's eventual yield/failure cascades to satisfy them.
-                    if self.is_fcfs_oldest(requester) {
-                        let since = *exhausted_since.get_or_insert_with(Instant::now);
-                        if since.elapsed() >= Duration::from_millis(self.exhaustion_ms) {
-                            tracing::error!(
-                                pid = %requester,
-                                need,
-                                free,
-                                total,
-                                resident = total.saturating_sub(free),
-                                "KV pool exhausted (#19): FCFS-oldest lane's request \
-                                 unsatisfiable for {}ms — a non-terminating guest grew \
-                                 its context past the pool; failing loud, not wedging",
-                                self.exhaustion_ms,
-                            );
-                            break Err(ContentionError::Exhausted { need, free, total });
-                        }
-                    } else {
-                        exhausted_since = None;
-                    }
-                    // No victim: the requester is the youngest (or peers are
-                    // pinned/suspended). Park FIFO (keeping any existing slot)
-                    // and wait for a free event. Clear any stale park request
-                    // on OURSELVES first — we cannot comply while parked, and
-                    // a stranded `ParkRequested` would poison the state
-                    // machine (self-heals otherwise only at the next execute
-                    // entry).
-                    let notify = {
-                        let mut inner = self.inner.lock().unwrap();
-                        if let Some(p) = inner.procs.get_mut(&requester) {
-                            if p.state == ProcState::ParkRequested {
-                                p.state = ProcState::Running;
-                            }
-                        }
-                        match &parked {
-                            Some((_, n)) => n.clone(),
-                            None => {
-                                let token = inner.next_token;
-                                inner.next_token += 1;
-                                let notify = Arc::new(Notify::new());
-                                inner.waiters.push_back(Waiter {
-                                    token,
-                                    pid: requester,
-                                    need,
-                                    notify: notify.clone(),
-                                });
-                                parked = Some((token, notify.clone()));
-                                self.stats
-                                    .waiters_parked
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                drop(inner);
-                                // A×B: a plain parked waiter must also leave
-                                // the wave (first park only), otherwise pure
-                                // wait-all blocks the fleet indefinitely.
-                                // Join is emitted on acquire exit.
-                                notify_pipeline_leave(requester, LeaveKind::Suspend);
-                                notify
-                            }
-                        }
-                    };
-                    // Poll-tick the park: the keystone must re-check its
-                    // exhaustion deadline even when NO free event ever comes (the
-                    // wedge has none). A real `notify` wins the race normally.
-                    let poll = Duration::from_millis((self.exhaustion_ms / 4).clamp(20, 1000));
-                    tokio::select! {
-                        _ = notify.notified() => {}
-                        _ = tokio::time::sleep(poll) => {}
-                    }
-                    // The world changed; previously-deferred victims may have
-                    // drained their grace period.
-                    tried.clear();
-                }
-            }
-        };
-
-        // Leave the FIFO (satisfied) and pass the wake along: waiters behind
-        // us may also fit. Restores are NOT evaluated here — our blocks are
-        // about to be consumed by the caller's retry; only a real free event
-        // (`on_blocks_freed`) feeds the restore phase.
-        if let Some((token, _)) = parked {
-            let mut inner = self.inner.lock().unwrap();
-            inner.waiters.retain(|w| w.token != token);
-            drop(inner);
-            if result.is_ok() {
-                self.stats
-                    .waiters_woken
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            // A×B rejoin for the plain-park Leave above. On the
-            // `SelfSuspendFirst` exit the caller immediately re-Leaves via
-            // `report_suspended` — a benign Join/Leave pair; on an Err exit
-            // the lane fails loud and terminate re-tombstones it.
-            notify_pipeline_join(requester);
-            self.wake_waiters();
-        }
-        result
-    }
-
-    /// Phase 1 — waiters. Notify the FIFO prefix whose cumulative need fits
-    /// the free pool. Entries KEEP their queue slot: a woken waiter that wins
-    /// its re-check removes itself (and passes the wake along); one that
-    /// loses a race stays parked in position. While ANY waiter is parked,
-    /// the restore phase is skipped — alloc waiters have strict priority over
-    /// restores, and their pending blocks are never given to a restore.
-    #[cfg(any())]
-    fn wake_waiters_legacy(&self) {
-        let (free, _total) = self.backend.pool_stats();
-        let inner = self.inner.lock().unwrap();
-        let mut budget = free;
-        for w in &inner.waiters {
-            if w.need <= budget {
-                budget -= w.need;
-                w.notify.notify_one();
-            } else {
-                break;
-            }
-        }
-    }
-
-    /// Central drain (prior `drain_queues`): phase 1 wakes FIFO waiters whose
-    /// needs prefix-fit the free pool (strict priority); phase 2 restores the
-    /// oldest-suspended processes while no waiter is parked, utilization is
-    /// at/below the pause threshold, and the restore fits without evicting.
-    #[cfg(any())]
-    fn drain_legacy(&self) {
-        self.wake_waiters();
-
-        // Phase 2 — restores (only when no waiter is parked).
-        loop {
-            let (free, total_now) = self.backend.pool_stats();
-            let pid = {
-                let mut inner = self.inner.lock().unwrap();
-                if !inner.waiters.is_empty() {
-                    return;
-                }
-                let total_f = total_now.max(1) as f64;
-                let utilization = (total_now.saturating_sub(free)) as f64 / total_f;
-                let Some(&pid) = inner.restore_queue.front() else {
-                    return;
-                };
-                if utilization > self.restore_pause_at_utilization {
-                    // Anti-thrash pause — WITH AGING: on a small pool the
-                    // utilization can sit permanently above the threshold
-                    // (e.g. 7/8 = 0.875 > 0.85), which would starve the
-                    // FIFO-head restore forever. Once the head has waited
-                    // past `PIE_KV_RESTORE_AGING_MS`, it proceeds anyway if
-                    // it fits (still never evicts).
-                    let aged = inner
-                        .procs
-                        .get(&pid)
-                        .and_then(|p| p.suspended_at)
-                        .is_some_and(|t| t.elapsed() >= Duration::from_millis(restore_aging_ms()));
-                    if !aged {
-                        return; // wait for utilization to drop (or the head to age)
-                    }
-                }
-                let need = match inner.procs.get(&pid) {
-                    Some(p) => p.suspended_need,
-                    None => {
-                        // Stale entry (unregistered) — lazy delete.
-                        inner.restore_queue.pop_front();
-                        continue;
-                    }
-                };
-                if free < need {
-                    return; // restore NEVER evicts (prior can_restore)
-                }
-                inner.restore_queue.pop_front();
-                // Self-suspended (parked) process: release it directly — the
-                // victim's own task re-materializes its state on wake (and
-                // re-reports + re-parks if that hits contention). No backend
-                // call; the wake IS the restore hand-off.
-                if let Some(notify) = inner.parked.get(&pid).cloned() {
-                    inner.procs.get_mut(&pid).unwrap().state = ProcState::Running;
-                    inner.procs.get_mut(&pid).unwrap().suspended_need = 0;
-                    drop(inner);
-                    self.stats
-                        .restores
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    // A×B rejoin (Leave's other half): decay the scheduler
-                    // tombstone BEFORE the victim wakes, so its next request
-                    // re-enters the wait-set tracked (the sustained-f24
-                    // balanced-freeze was this Join missing — every suspended
-                    // lane stayed untracked forever and the wave set decayed
-                    // to empty).
-                    notify_pipeline_join(pid);
-                    notify.notify_one();
-                    continue;
-                }
-                inner.procs.get_mut(&pid).unwrap().state = ProcState::Restoring;
-                pid
-            };
-
-            match self.backend.restore(pid) {
-                Ok(()) => {
-                    {
-                        let mut inner = self.inner.lock().unwrap();
-                        if let Some(p) = inner.procs.get_mut(&pid) {
-                            p.state = ProcState::Running;
-                            p.suspended_need = 0;
-                        }
-                    }
-                    self.stats
-                        .restores
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    // A×B rejoin — see the parked-release path above.
-                    notify_pipeline_join(pid);
-                    // Loop: more restores may fit.
-                }
-                Err(e) => {
-                    tracing::warn!(pid = %pid, "restore failed, re-queued: {e:#}");
-                    let mut inner = self.inner.lock().unwrap();
-                    if let Some(p) = inner.procs.get_mut(&pid) {
-                        p.state = ProcState::Suspended;
-                        inner.restore_queue.push_back(pid);
-                    }
-                    return; // don't hot-loop a failing restore; next event retries
-                }
-            }
-        }
-    }
 }
 
 // =============================================================================
@@ -2332,6 +1821,22 @@ mod tests {
         (orch, pid, free)
     }
 
+    /// Test-side entry: a plain acquire (no pipeline aggregation), panicking
+    /// on the self-suspend exit no mock backend can trigger.
+    async fn acquire(
+        orch: &ContentionOrchestrator,
+        pid: ProcessId,
+        need: u32,
+    ) -> Result<AllocationGrant, ContentionError> {
+        match orch
+            .acquire_or_self_suspend_for_pipeline(pid, pid, need)
+            .await?
+        {
+            Acquired::Granted(grant) => Ok(grant),
+            Acquired::SelfSuspendFirst => panic!("unexpected self-suspend in mock test"),
+        }
+    }
+
     fn suspend_for_test(orch: &ContentionOrchestrator, pid: ProcessId, pages: u32) {
         orch.inner
             .lock()
@@ -2350,7 +1855,7 @@ mod tests {
         // 2 free + 6 idle-reclaimable, need 5: rung 1 must satisfy the
         // request without the requester ever parking.
         let (orch, pid) = orch(2, 6, 16);
-        let got = orch.acquire(pid, 5).await;
+        let got = acquire(&orch, pid, 5).await;
         assert!(got.is_ok());
         assert_eq!(orch.stats().waiters_parked.load(Ordering::Relaxed), 0);
         assert_eq!(orch.backend.pool_stats().0, 3); // five pages are grant-reserved
@@ -2367,7 +1872,7 @@ mod tests {
         let orch = std::sync::Arc::new(orch);
         let waiter = {
             let orch = orch.clone();
-            tokio::spawn(async move { orch.acquire(pid, 4).await })
+            tokio::spawn(async move { acquire(&orch, pid, 4).await })
         };
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(orch.contended());
@@ -2534,25 +2039,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn younger_requester_self_suspends_while_older_peer_is_suspended() {
-        let (orch, older, _) = orch_with_free(0, 0, 10);
-        let younger = ProcessId::new_v4();
-        orch.register(younger);
-        suspend_for_test(&orch, older, 2);
-        let acquired = orch
-            .acquire_or_self_suspend(younger, 2, true)
-            .await
-            .unwrap();
-        assert!(matches!(acquired, Acquired::SelfSuspendFirst));
-        assert!(orch.should_park(younger));
-    }
-
-    #[tokio::test]
     async fn permanently_unsupported_victim_does_not_reset_exhaustion_clock() {
         let (orch, oldest, _) = orch_with_free(0, 0, 10);
         orch.register(ProcessId::new_v4());
         let orch = Arc::new(orch.with_exhaustion_ms(40));
-        let result = tokio::time::timeout(Duration::from_secs(1), orch.acquire(oldest, 2))
+        let result = tokio::time::timeout(Duration::from_secs(1), acquire(&orch, oldest, 2))
             .await
             .expect("unsupported victim retries must still hit exhaustion");
         assert!(matches!(
@@ -2571,7 +2062,7 @@ mod tests {
         let orch = Arc::new(orch.with_exhaustion_ms(5_000));
         let task = {
             let orch = orch.clone();
-            tokio::spawn(async move { orch.acquire(pid, 2).await })
+            tokio::spawn(async move { acquire(&orch, pid, 2).await })
         };
         tokio::time::timeout(Duration::from_secs(1), async {
             while orch.inner.lock().unwrap().waiters.is_empty() {
