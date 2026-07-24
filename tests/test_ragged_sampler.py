@@ -146,6 +146,57 @@ class RaggedSamplerTest(unittest.TestCase):
             )
             self.assertEqual(int(states[index]), int(case["next_state"][offset]))
 
+    def test_wide_complement_bitset_matches_reference(self) -> None:
+        """The wide bucket reads logits contiguously against a bitset."""
+        case = build_batch([396, 147_144], 48, 151_669, seed=37)
+        tables, args = to_cuda(case)
+        tables.build_wide_bitsets(151_669)
+        self.assertIsNotNone(tables.bitset)
+        self.assertEqual(tables.bitset.shape[1], (151_669 + 31) // 32)
+        tokens, states = ragged_sample(
+            torch.from_numpy(case["logits"]).cuda(),
+            tables,
+            args["rows"],
+            **_params(args),
+        )
+        expected = ragged_sample_reference(
+            case["logits"],
+            case["indptr"],
+            case["indices"],
+            case["rows"],
+            temperature=case["temperature"],
+            top_k=case["top_k"],
+            top_p=case["top_p"],
+            uniform=case["uniform"],
+        )
+        np.testing.assert_array_equal(tokens.cpu().numpy(), expected)
+
+        chosen = tokens.cpu().numpy()
+        produced = states.cpu().numpy()
+        for index, row in enumerate(case["rows"]):
+            start = int(case["indptr"][row])
+            end = int(case["indptr"][row + 1])
+            offset = start + int(
+                np.flatnonzero(case["indices"][start:end] == chosen[index])[0]
+            )
+            self.assertEqual(
+                int(produced[index]), int(case["next_state"][offset])
+            )
+
+    def test_wide_complement_never_violates_the_constraint(self) -> None:
+        case = build_batch([147_144], 32, 151_669, seed=41)
+        tables, args = to_cuda(case)
+        tables.build_wide_bitsets(151_669)
+        tokens, _ = ragged_sample(
+            torch.from_numpy(case["logits"]).cuda(),
+            tables,
+            args["rows"],
+            **_params(args),
+        )
+        allowed = set(case["indices"].tolist())
+        for token in tokens.cpu().numpy():
+            self.assertIn(int(token), allowed)
+
     def test_top_k_one_selects_argmax(self) -> None:
         case = build_batch([9, 129, 1024], 32, 4096, seed=11)
         case["top_k"] = np.ones_like(case["top_k"])
