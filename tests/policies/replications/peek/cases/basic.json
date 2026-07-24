@@ -1,4 +1,1 @@
-{
-  "case": "shared-schedule-cache-state",
-  "pending_requests": 3
-}
+{"schema":"plex-paper-oracle@1","cases":[{"id":"clpm-dynamic-lane","singleton_frac_ppm":250000,"age_pressure_ppm":1000000},{"id":"no-sharing-guard","root_child_pending_count":1},{"id":"ancestor-demand-eviction","scores":[0,8]}]}

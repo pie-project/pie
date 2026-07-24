@@ -1,9 +1,1 @@
-{
-  "case": "preempted-and-ttl-priority",
-  "operation": "schedule",
-  "requests": [
-    {"request_id": "A", "preempted": false, "ttl_active": false, "program_arrival": 1},
-    {"request_id": "B", "preempted": true, "ttl_active": true, "program_arrival": 2}
-  ],
-  "capacity": {"max_requests": 1, "max_total_tokens": 4}
-}
+{"schema":"plex-paper-oracle@1","cases":[{"id":"empirical-cdf-ttl","samples_ms":[100,200,300],"average_wait_ms":400,"memoryfulness_ppm":1000000,"prefill_reload_ms":100},{"id":"pin-priority-and-expiry","finish_ms":1000,"next_request_ms":1100,"expiry_check_ms":1400}]}

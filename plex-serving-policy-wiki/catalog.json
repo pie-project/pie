@@ -254,7 +254,6 @@
       "validation_status": "passing",
       "deferred_mechanics": [
         "tool parser",
-        "offline TTL estimator",
         "physical KV pinning"
       ],
       "metadata_path": "tests/policies/replications/continuum/metadata.json"
@@ -314,7 +313,8 @@
       "component": "plex_paper_kvflow",
       "operations": [
         "schedule",
-        "cache"
+        "cache",
+        "feedback"
       ],
       "evidence_level": "inspired-adaptation",
       "validation_status": "passing",
@@ -1034,7 +1034,8 @@
       "operations": [
         "route",
         "schedule",
-        "cache"
+        "cache",
+        "feedback"
       ],
       "evidence_level": "inspired-adaptation",
       "validation_status": "passing",
@@ -3398,7 +3399,9 @@
       "replication_id": "ragcache",
       "component": "plex_paper_ragcache",
       "operations": [
-        "cache"
+        "schedule",
+        "cache",
+        "feedback"
       ],
       "evidence_level": "inspired-adaptation",
       "validation_status": "passing",

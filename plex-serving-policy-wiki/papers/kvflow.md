@@ -46,7 +46,7 @@ Named datasets/workloads identified from the primary text or manual audit.
 ## PLEX v0.6 replication status
 
 - Component: `plex_paper_kvflow`
-- Operations: `schedule`, `cache`
+- Operations: `schedule`, `cache`, `feedback`
 - Evidence: `inspired-adaptation`
 - Validation: `passing`
 - Metadata: [`tests/policies/replications/kvflow/metadata.json`](../../tests/policies/replications/kvflow/metadata.json)

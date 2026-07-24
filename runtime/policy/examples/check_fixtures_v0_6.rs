@@ -25,6 +25,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     check_wave_a(&packages)?;
     check_fairness_state_machines(&packages)?;
     check_routing_state_machines(&packages)?;
+    check_cache_state_machines(&packages)?;
     check_wave_c(&packages)?;
     check_wave_d(&packages)?;
     check_replication_artifacts(&packages)?;
@@ -1848,6 +1849,703 @@ fn check_routebalance_state_machine(packages: &Path) -> Result<(), Box<dyn std::
     Ok(())
 }
 
+fn check_cache_state_machines(packages: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    check_continuum_state_machine(packages)?;
+    check_kvflow_state_machine(packages)?;
+    check_marconi_state_machine(packages)?;
+    check_ragcache_state_machine(packages)?;
+    check_peek_state_machine(packages)?;
+    check_saga_state_machine(packages)?;
+    Ok(())
+}
+
+fn check_continuum_state_machine(packages: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let continuum = runtime(packages, "plex_paper_continuum", &[], None)?;
+    let lifecycle = active_lifecycle(&[("A1", "GA"), ("A2", "GA"), ("C1", "GC")]);
+    assert_success(&continuum.invoke(feedback_records(
+        "continuum-history",
+        vec![
+            request_progress("A1", json!({"tool_id": "shell", "tool_duration_ms": 100})),
+            request_progress("A1", json!({"tool_id": "shell", "tool_duration_ms": 200})),
+            request_progress("A1", json!({"tool_id": "shell", "tool_duration_ms": 300})),
+        ],
+        lifecycle,
+    ))?);
+    assert_success(&continuum.invoke(feedback_records(
+        "continuum-pin",
+        vec![request_completed(
+            "A1",
+            json!({
+                "next_tool_id": "shell",
+                "now_ms": 1000,
+                "average_wait_ms": 400,
+                "memoryfulness_ppm": 1000000,
+                "prefill_reload_ms": 100,
+                "history_threshold": 1,
+                "program_arrival": 10,
+                "program_finished": false
+            }),
+        )],
+        Vec::new(),
+    ))?);
+    let shared = continuum.backend().read_shared()?;
+    assert_eq!(shared["continuum_pins"]["GA"]["ttl_ms"], 300);
+    assert_eq!(shared["continuum_pins"]["GA"]["expires_at_ms"], 1300);
+    let scheduled = continuum.invoke(schedule_many_limits(
+        "continuum-priority",
+        vec![
+            schedule_candidate(
+                "A2",
+                "GA",
+                1,
+                json!({"now_ms": 1100, "program_arrival": 10}),
+            ),
+            schedule_candidate("C1", "GC", 1, json!({"now_ms": 1100, "program_arrival": 0})),
+        ],
+        1,
+        1,
+        1,
+        Vec::new(),
+    ))?;
+    assert_eq!(
+        scheduled["plan"]["plan"]["selections"][0]["requests"],
+        json!([0])
+    );
+    assert_success(&continuum.invoke(schedule_many(
+        "continuum-expire",
+        vec![schedule_candidate(
+            "C1",
+            "GC",
+            1,
+            json!({"now_ms": 1400, "program_arrival": 0}),
+        )],
+        1,
+        1,
+        Vec::new(),
+    ))?);
+    assert!(continuum.backend().read_shared()?["continuum_pins"]["GA"].is_null());
+    Ok(())
+}
+
+fn check_kvflow_state_machine(packages: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let kvflow = runtime(packages, "plex_paper_kvflow", &["cache.prefetch@1"], None)?;
+    let cached = kvflow.invoke(cache_many(
+        "kvflow-cache",
+        "pressure",
+        vec![
+            resident_fixture(
+                "varying",
+                1,
+                true,
+                json!({
+                    "fixed_prefix": false,
+                    "steps_to_execution": 0,
+                    "cache_state": "gpu"
+                }),
+            ),
+            resident_fixture(
+                "shared",
+                1,
+                true,
+                json!({
+                    "fixed_prefix": true,
+                    "beneficiary_steps": [5, 2],
+                    "cache_state": "gpu"
+                }),
+            ),
+            resident_fixture(
+                "loading",
+                1,
+                true,
+                json!({
+                    "fixed_prefix": true,
+                    "steps_to_execution": 100,
+                    "cache_state": "loading"
+                }),
+            ),
+        ],
+        vec![cache_object_fixture(
+            "cpu-next",
+            1,
+            json!({
+                "fixed_prefix": true,
+                "steps_to_execution": 1,
+                "cache_state": "cpu",
+                "prefetch": true
+            }),
+        )],
+        3,
+        json!({
+            "prefetch_horizon_steps": 1,
+            "max_concurrent_prefetches": 1
+        }),
+        None,
+    ))?;
+    assert_success(&cached);
+    assert_eq!(cached["plan"]["plan"]["reclaim"], json!([0]));
+    assert_eq!(cached["actions"][0]["method"], "pie.cache.prefetch@1");
+    let lifecycle = active_lifecycle(&[("K1", "GK1")]);
+    let blocked = kvflow.invoke(schedule_many(
+        "kvflow-blocked",
+        vec![schedule_candidate(
+            "K1",
+            "GK1",
+            1,
+            json!({"required_objects": ["cpu-next"]}),
+        )],
+        1,
+        1,
+        lifecycle,
+    ))?;
+    assert!(
+        blocked["plan"]["plan"]["selections"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+    );
+    assert_success(&kvflow.invoke(feedback_records(
+        "kvflow-action-feedback",
+        vec![action_terminal(
+            &cached["actions"][0],
+            "kvflow-cache",
+            "action-succeeded",
+        )],
+        Vec::new(),
+    ))?);
+    let ready = kvflow.invoke(schedule_many(
+        "kvflow-ready",
+        vec![schedule_candidate(
+            "K1",
+            "GK1",
+            1,
+            json!({"required_objects": ["cpu-next"]}),
+        )],
+        1,
+        1,
+        Vec::new(),
+    ))?;
+    assert_eq!(
+        ready["plan"]["plan"]["selections"][0]["requests"],
+        json!([0])
+    );
+    Ok(())
+}
+
+fn check_marconi_state_machine(packages: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let marconi = runtime(packages, "plex_paper_marconi", &[], None)?;
+    let cached = marconi.invoke(cache_many(
+        "marconi-admission",
+        "insertion",
+        vec![
+            resident_fixture(
+                "old-high-flop",
+                1,
+                true,
+                json!({
+                    "child_count": 0,
+                    "last_access_us": 10,
+                    "recompute_flops": 1000
+                }),
+            ),
+            resident_fixture(
+                "new-low-flop",
+                1,
+                true,
+                json!({
+                    "child_count": 0,
+                    "last_access_us": 20,
+                    "recompute_flops": 10
+                }),
+            ),
+            resident_fixture(
+                "branch",
+                1,
+                true,
+                json!({
+                    "child_count": 2,
+                    "last_access_us": 0,
+                    "recompute_flops": 0
+                }),
+            ),
+        ],
+        vec![
+            cache_object_fixture(
+                "pure-input-miss",
+                1,
+                json!({
+                    "state_kind": "ssm",
+                    "reuse_class": "pure-input",
+                    "speculative_branch_created": false
+                }),
+            ),
+            cache_object_fixture(
+                "pure-input-hit",
+                1,
+                json!({
+                    "state_kind": "ssm",
+                    "reuse_class": "pure-input",
+                    "speculative_branch_created": true
+                }),
+            ),
+            cache_object_fixture(
+                "conversation",
+                1,
+                json!({
+                    "state_kind": "ssm",
+                    "reuse_class": "input-output",
+                    "last_decoded_state": true
+                }),
+            ),
+        ],
+        4,
+        json!({"alpha_ppm": 0}),
+        None,
+    ))?;
+    assert_eq!(
+        cached["plan"]["plan"]["admissions"],
+        json!(["bypass", "cache", "cache"])
+    );
+    assert_eq!(cached["plan"]["plan"]["reclaim"], json!([0]));
+    assert_success(&marconi.invoke(feedback_records(
+        "marconi-alpha",
+        vec![json!({
+            "subject": {"kind": "cache-object", "value": "old-high-flop"},
+            "outcome": "progress",
+            "facts": {"accessed": true, "now_us": 30, "selected_alpha_ppm": 1000000}
+        })],
+        Vec::new(),
+    ))?);
+    let rescored = marconi.invoke(cache_many(
+        "marconi-flop",
+        "pressure",
+        vec![
+            resident_fixture(
+                "old-high-flop",
+                1,
+                true,
+                json!({"child_count": 0, "last_access_us": 10, "recompute_flops": 1000}),
+            ),
+            resident_fixture(
+                "new-low-flop",
+                1,
+                true,
+                json!({"child_count": 0, "last_access_us": 20, "recompute_flops": 10}),
+            ),
+        ],
+        vec![],
+        1,
+        json!({}),
+        None,
+    ))?;
+    assert_eq!(rescored["plan"]["plan"]["reclaim"], json!([1]));
+    Ok(())
+}
+
+fn check_ragcache_state_machine(packages: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let ragcache = runtime(packages, "plex_paper_ragcache", &["cache.swap@1"], None)?;
+    let cached = ragcache.invoke(cache_many(
+        "ragcache-frontier",
+        "pressure",
+        vec![
+            resident_fixture(
+                "leaf",
+                1,
+                true,
+                json!({
+                    "tier": "gpu",
+                    "parent_object_id": "parent",
+                    "tier_child_count": 0,
+                    "frequency": 1,
+                    "average_cost_per_new_token_fp": 1,
+                    "host_copy_exists": false
+                }),
+            ),
+            resident_fixture(
+                "parent",
+                1,
+                true,
+                json!({
+                    "tier": "gpu",
+                    "tier_child_count": 1,
+                    "frequency": 2,
+                    "average_cost_per_new_token_fp": 10,
+                    "host_copy_exists": true
+                }),
+            ),
+        ],
+        vec![],
+        0,
+        json!({}),
+        Some(json!({"episode_id": "rag-frontier", "iteration": 0, "max_iterations": 2})),
+    ))?;
+    assert_success(&cached);
+    assert_eq!(cached["plan"]["plan"]["reclaim"], json!([0, 1]));
+    assert_eq!(cached["actions"][0]["method"], "pie.cache.swap@1");
+    assert_success(&ragcache.invoke(feedback_records(
+        "ragcache-swap-feedback",
+        vec![action_terminal(
+            &cached["actions"][0],
+            "ragcache-frontier",
+            "action-succeeded",
+        )],
+        Vec::new(),
+    ))?);
+    let lifecycle = active_lifecycle(&[("R1", "GR1"), ("R2", "GR2"), ("R3", "GR3")]);
+    let scheduled = ragcache.invoke(schedule_many(
+        "ragcache-order",
+        vec![
+            schedule_candidate(
+                "R1",
+                "GR1",
+                1,
+                json!({
+                    "cached_length": 10,
+                    "computation_length": 10,
+                    "waiting_ms": 0,
+                    "starvation_window_ms": 1000,
+                    "arrival_seq": 1
+                }),
+            ),
+            schedule_candidate(
+                "R2",
+                "GR2",
+                1,
+                json!({
+                    "cached_length": 20,
+                    "computation_length": 10,
+                    "waiting_ms": 0,
+                    "starvation_window_ms": 1000,
+                    "arrival_seq": 2
+                }),
+            ),
+            schedule_candidate(
+                "R3",
+                "GR3",
+                1,
+                json!({
+                    "cached_length": 1,
+                    "computation_length": 100,
+                    "waiting_ms": 1000,
+                    "starvation_window_ms": 1000,
+                    "arrival_seq": 0
+                }),
+            ),
+        ],
+        1,
+        1,
+        lifecycle,
+    ))?;
+    assert_eq!(
+        scheduled["plan"]["plan"]["selections"][0]["requests"],
+        json!([2])
+    );
+    Ok(())
+}
+
+fn check_peek_state_machine(packages: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let peek = runtime(packages, "plex_paper_peek", &[], None)?;
+    let lifecycle = active_lifecycle(&[("W", "GW"), ("P", "GP"), ("S", "GS"), ("O", "GO")]);
+    let scheduled = peek.invoke(schedule_many(
+        "peek-clpm",
+        vec![
+            schedule_candidate(
+                "W",
+                "GW",
+                1,
+                json!({
+                    "lpm_hit_tokens": 100,
+                    "warm_threshold_tokens": 32,
+                    "cluster_id": "warm",
+                    "cluster_size": 2,
+                    "ancestor_score": 100,
+                    "root_child_pending_count": 2,
+                    "arrival_seq": 0,
+                    "waiting_ms": 0
+                }),
+            ),
+            schedule_candidate(
+                "P",
+                "GP",
+                1,
+                json!({
+                    "lpm_hit_tokens": 0,
+                    "warm_threshold_tokens": 32,
+                    "deprio_prefix_id": "cold",
+                    "cluster_id": "cold",
+                    "cluster_size": 2,
+                    "ancestor_score": 80,
+                    "root_child_pending_count": 2,
+                    "arrival_seq": 1,
+                    "waiting_ms": 0
+                }),
+            ),
+            schedule_candidate(
+                "S",
+                "GS",
+                1,
+                json!({
+                    "lpm_hit_tokens": 0,
+                    "warm_threshold_tokens": 32,
+                    "deprio_prefix_id": "cold",
+                    "cluster_id": "cold",
+                    "cluster_size": 2,
+                    "ancestor_score": 80,
+                    "root_child_pending_count": 2,
+                    "arrival_seq": 2,
+                    "waiting_ms": 0
+                }),
+            ),
+            schedule_candidate(
+                "O",
+                "GO",
+                1,
+                json!({
+                    "lpm_hit_tokens": 0,
+                    "warm_threshold_tokens": 32,
+                    "deprio_prefix_id": "old",
+                    "cluster_id": "old",
+                    "cluster_size": 1,
+                    "ancestor_score": 0,
+                    "root_child_pending_count": 1,
+                    "arrival_seq": 3,
+                    "waiting_ms": 2000
+                }),
+            ),
+        ],
+        4,
+        4,
+        lifecycle,
+    ))?;
+    assert_eq!(
+        scheduled["plan"]["plan"]["selections"][0]["requests"],
+        json!([0])
+    );
+    assert_eq!(
+        peek.backend().read_shared()?["peek_fairness_share_ppm"],
+        382500
+    );
+    let no_sharing = runtime(packages, "plex_paper_peek", &[], None)?;
+    let scheduled = no_sharing.invoke(schedule_many(
+        "peek-fcfs",
+        vec![
+            schedule_candidate(
+                "F1",
+                "GF1",
+                1,
+                json!({"root_child_pending_count": 1, "arrival_seq": 2}),
+            ),
+            schedule_candidate(
+                "F2",
+                "GF2",
+                1,
+                json!({"root_child_pending_count": 1, "arrival_seq": 1}),
+            ),
+        ],
+        1,
+        1,
+        active_lifecycle(&[("F1", "GF1"), ("F2", "GF2")]),
+    ))?;
+    assert_eq!(
+        scheduled["plan"]["plan"]["selections"][0]["requests"],
+        json!([1])
+    );
+    let reclaimed = peek.invoke(cache_many(
+        "peek-eviction",
+        "pressure",
+        vec![
+            resident_fixture(
+                "zero",
+                1,
+                true,
+                json!({"ancestor_demands": [{"pending_count": 0, "depth": 10}]}),
+            ),
+            resident_fixture(
+                "demanded",
+                1,
+                true,
+                json!({"ancestor_demands": [{"pending_count": 2, "depth": 4}]}),
+            ),
+        ],
+        vec![],
+        1,
+        json!({}),
+        None,
+    ))?;
+    assert_eq!(reclaimed["plan"]["plan"]["reclaim"], json!([0]));
+    Ok(())
+}
+
+fn check_saga_state_machine(packages: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let saga = runtime(packages, "plex_paper_saga", &["request.rebalance@1"], None)?;
+    let lifecycle = active_lifecycle(&[("SA", "GSA"), ("SB", "GSB")]);
+    let affinity = saga.invoke(route_many(
+        "saga-affinity",
+        vec![route_candidate(
+            "SA",
+            "GSA",
+            json!({
+                "session_id": "session-a",
+                "affinity_target_id": "worker-a",
+                "affinity_load_threshold_ppm": 800000
+            }),
+        )],
+        vec![
+            route_target("worker-a", 1, json!({"load": 5})),
+            route_target("worker-b", 1, json!({"load": 1})),
+        ],
+        vec![
+            route_edge(0, 0, json!({"cached": true, "load": 5, "load_ppm": 500000})),
+            route_edge(
+                0,
+                1,
+                json!({"cached": false, "load": 1, "load_ppm": 100000}),
+            ),
+        ],
+        lifecycle,
+    ))?;
+    assert_eq!(
+        affinity["plan"]["plan"]["assignments"][0]["target_index"],
+        0
+    );
+    assert_success(&saga.invoke(feedback_records(
+        "saga-affinity-feedback",
+        vec![route_progress("saga-affinity", 0, "enacted")],
+        Vec::new(),
+    ))?);
+    assert_eq!(
+        saga.backend().read_shared()?["saga_affinity"]["session-a"],
+        "worker-a"
+    );
+    let stolen = saga.invoke(route_many(
+        "saga-steal",
+        vec![route_candidate(
+            "SB",
+            "GSB",
+            json!({
+                "session_id": "session-b",
+                "source_target_index": 1,
+                "session_queue_age_ms": 1000,
+                "stealable": true,
+                "steal_idle_ms": 100,
+                "steal_load_ratio_ppm": 2000000
+            }),
+        )],
+        vec![
+            route_target("worker-a", 1, json!({"load": 0, "idle_ms": 200})),
+            route_target("worker-b", 1, json!({"load": 10, "idle_ms": 0})),
+        ],
+        vec![
+            route_edge(0, 0, json!({"cached": false, "load": 0, "load_ppm": 0})),
+            route_edge(
+                0,
+                1,
+                json!({"cached": true, "load": 10, "load_ppm": 1000000}),
+            ),
+        ],
+        Vec::new(),
+    ))?;
+    assert_eq!(stolen["actions"][0]["method"], "pie.request.rebalance@1");
+    assert_success(&saga.invoke(feedback_records(
+        "saga-steal-feedback",
+        vec![action_terminal(
+            &stolen["actions"][0],
+            "saga-steal",
+            "action-succeeded",
+        )],
+        Vec::new(),
+    ))?);
+    assert_eq!(
+        saga.backend().read_shared()?["saga_affinity"]["session-b"],
+        "worker-a"
+    );
+    let scheduled = saga.invoke(schedule_many_limits(
+        "saga-afs",
+        vec![
+            schedule_candidate(
+                "SA",
+                "GSA",
+                8,
+                json!({
+                    "tenant_id": "tenant-a",
+                    "remaining_work_ms": 100,
+                    "deadline_ms": 1000,
+                    "now_ms": 0,
+                    "arrival_seq": 0
+                }),
+            ),
+            schedule_candidate(
+                "SB",
+                "GSB",
+                8,
+                json!({
+                    "tenant_id": "tenant-b",
+                    "remaining_work_ms": 100,
+                    "deadline_ms": 200,
+                    "now_ms": 0,
+                    "arrival_seq": 1
+                }),
+            ),
+        ],
+        2,
+        2,
+        8,
+        Vec::new(),
+    ))?;
+    assert_eq!(
+        scheduled["plan"]["plan"]["selections"][0]["requests"],
+        json!([1])
+    );
+    assert!(
+        scheduled["plan"]["plan"]["selections"][0]["token_budgets"][0]
+            .as_u64()
+            .unwrap()
+            > scheduled["plan"]["plan"]["selections"][1]["token_budgets"][0]
+                .as_u64()
+                .unwrap()
+    );
+    let cached = saga.invoke(cache_many(
+        "saga-cache",
+        "pressure",
+        vec![
+            resident_fixture(
+                "stale",
+                1,
+                true,
+                json!({
+                    "last_access_ms": 0,
+                    "reuse_probability_ppm": 0
+                }),
+            ),
+            resident_fixture(
+                "valuable",
+                1,
+                true,
+                json!({
+                    "last_access_ms": 900,
+                    "reuse_probability_ppm": 1000000
+                }),
+            ),
+        ],
+        vec![cache_object_fixture(
+            "tool-cache",
+            1,
+            json!({
+                "tool_latency_samples_ms": [1000],
+                "ttl_percentile_ppm": 950000
+            }),
+        )],
+        2,
+        json!({"now_ms": 1000, "used_kv_ppm": 900000}),
+        None,
+    ))?;
+    assert_eq!(cached["plan"]["plan"]["admissions"], json!(["cache"]));
+    assert_eq!(cached["plan"]["plan"]["reclaim"], json!([0]));
+    assert_eq!(
+        saga.backend().read_shared()?["saga_ttl"]["tool-cache"]["ttl_ms"],
+        500
+    );
+    Ok(())
+}
+
 fn check_unavailable_feedback_cleanup(packages: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let runtime = runtime(packages, "plex_paper_helium", &[], None)?;
     assert_success(&runtime.invoke(schedule_event("A", "G", json!({})))?);
@@ -1926,7 +2624,6 @@ fn check_wave_d(packages: &Path) -> Result<(), Box<dyn std::error::Error>> {
             "plex_paper_goodserve",
             json!({"risk_ppm": 900, "migration_threshold_ppm": 800}),
         ),
-        ("plex_paper_saga", json!({"steal": true})),
     ] {
         let runtime = runtime(packages, package, &["request.rebalance@1"], None)?;
         let outcome = runtime.invoke(route_event("A", "G", package, facts))?;
@@ -2547,7 +3244,7 @@ fn check_wave_a(packages: &Path) -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(cached["plan"]["plan"]["admissions"], json!(["cache"]));
     assert_eq!(cached["plan"]["plan"]["reclaim"], json!([0]));
 
-    let ragcache = runtime(packages, "plex_paper_ragcache", &[], None)?;
+    let ragcache = runtime(packages, "plex_paper_ragcache", &["cache.swap@1"], None)?;
     let reclaimed = ragcache.invoke(json!({
         "api_version": "pie.plex.engine@2",
         "operation": "cache",
@@ -2582,7 +3279,7 @@ fn check_wave_a(packages: &Path) -> Result<(), Box<dyn std::error::Error>> {
         }
     }))?;
     assert_success(&reclaimed);
-    assert_eq!(reclaimed["plan"]["plan"]["reclaim"], json!([1]));
+    assert_eq!(reclaimed["plan"]["plan"]["reclaim"], json!([0]));
     Ok(())
 }
 
@@ -3042,6 +3739,50 @@ fn route_many(
     event
 }
 
+fn cache_object_fixture(object_id: &str, size_bytes: u64, facts: Value) -> Value {
+    json!({
+        "object_id": object_id,
+        "size_bytes": size_bytes,
+        "beneficiaries": [],
+        "beneficiary_count": 0,
+        "facts": facts
+    })
+}
+
+fn resident_fixture(object_id: &str, size_bytes: u64, reclaimable: bool, facts: Value) -> Value {
+    json!({
+        "object": cache_object_fixture(object_id, size_bytes, facts),
+        "reclaimable": reclaimable
+    })
+}
+
+fn cache_many(
+    opportunity_id: &str,
+    cause: &str,
+    resident: Vec<Value>,
+    prospective: Vec<Value>,
+    max_bytes: u64,
+    capacity_facts: Value,
+    episode: Option<Value>,
+) -> Value {
+    json!({
+        "api_version": "pie.plex.engine@2",
+        "operation": "cache",
+        "context": {
+            "meta": meta(opportunity_id),
+            "cause": cause,
+            "resident": resident,
+            "prospective": prospective,
+            "capacity": {
+                "max_bytes": max_bytes,
+                "fixed_bytes": 0,
+                "facts": capacity_facts
+            },
+            "episode": episode
+        }
+    })
+}
+
 fn schedule_candidate(
     request_id: &str,
     group_id: &str,
@@ -3165,6 +3906,20 @@ fn route_progress(opportunity_id: &str, request_index: u32, status: &str) -> Val
         },
         "outcome": "progress",
         "facts": {"status": status}
+    })
+}
+
+fn action_terminal(action: &Value, opportunity_id: &str, outcome: &str) -> Value {
+    json!({
+        "subject": {"kind": "action", "value": action["id"]},
+        "outcome": outcome,
+        "facts": {
+            "opportunity_id": opportunity_id,
+            "method": action["method"],
+            "idempotency_key": action["args"]["idempotency_key"],
+            "status": if outcome == "action-succeeded" {"succeeded"} else {"failed"},
+            "details": {}
+        }
     })
 }
 

@@ -1,8 +1,1 @@
-{
-  "case": "varying-suffix-first",
-  "operation": "cache",
-  "resident": [
-    {"object_id": "fixed", "fixed_prefix": true, "steps_to_execution": 2},
-    {"object_id": "suffix", "fixed_prefix": false, "steps_to_execution": 0}
-  ]
-}
+{"schema":"plex-paper-oracle@1","cases":[{"id":"node-min-ste","beneficiary_steps":[5,2]},{"id":"varying-suffix-first","fixed_prefix":[false,true]},{"id":"prefetch-state-machine","initial_state":"cpu","states":["loading","gpu"]}]}

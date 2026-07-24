@@ -11,19 +11,27 @@
     "cache"
   ],
   "policy_kernel": [
-    "shared pending-demand state",
-    "cluster-aware demand depth",
-    "fairness lane"
+    "Eq.1 cluster-LPM lane",
+    "EMA dynamic fairness lane with stride interleaving",
+    "Eq.2 ancestor-demand eviction",
+    "no-sharing FCFS guard"
   ],
   "required_facts": [
+    "lpm_hit_tokens",
+    "warm_threshold_tokens",
+    "deprio_prefix_id",
+    "cluster_id",
+    "cluster_size",
+    "ancestor_score",
+    "root_child_pending_count",
+    "arrival_seq",
     "waiting_ms",
-    "fairness_threshold_ms",
-    "demand_depth",
-    "pending_demand_depth"
+    "group_major",
+    "ancestor_demands"
   ],
   "required_mechanics": [],
   "deferred_mechanics": [],
   "evidence_level": "inspired-adaptation",
-  "fixture_provenance": "independent reference model from the paper",
+  "fixture_provenance": "arXiv 2607.02525 Equations 1-2 and Algorithm 2",
   "validation_status": "passing"
 }

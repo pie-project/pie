@@ -6,20 +6,30 @@
   "source_commit": "7ef897ea",
   "source_license": "paper reference; no source copied",
   "component": "plex_paper_kvflow",
-  "implements": ["schedule", "cache"],
+  "implements": ["schedule", "cache", "feedback"],
   "policy_kernel": [
     "cache-loading-aware scheduling",
     "varying-suffix-first reclaim",
     "steps-to-execution fixed-prefix ordering",
-    "prefetch intent"
+    "prefetch intent with action-feedback transfer state"
   ],
-  "required_facts": ["cache_ready", "fixed_prefix",   "steps_to_execution",
-  "loading",
-  "offloading", "prefetch"],
+  "required_facts": [
+    "required_objects",
+    "cache_state",
+    "fixed_prefix",
+    "beneficiary_steps",
+    "steps_to_execution",
+    "loading",
+    "offloading",
+    "cpu_backup",
+    "prefetch",
+    "prefetch_horizon_steps",
+    "max_concurrent_prefetches"
+  ],
   "required_mechanics": [],
   "optional_mechanics": ["cache.prefetch@1"],
   "deferred_mechanics": ["CPU-GPU transfer overlap"],
   "evidence_level": "inspired-adaptation",
-  "fixture_provenance": "independent implementation from the paper algorithm",
+  "fixture_provenance": "arXiv 2507.07400 Section 3 Agent Step Graph and four-state transfer model",
   "validation_status": "passing"
 }

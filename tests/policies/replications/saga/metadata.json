@@ -9,19 +9,36 @@
   "implements": [
     "route",
     "schedule",
-    "cache"
+    "cache",
+    "feedback"
   ],
   "policy_kernel": [
-    "workflow TTL",
-    "group fairness",
-    "cache-local work stealing"
+    "Eq.7 session affinity and guarded work stealing",
+    "Eq.1 WA-LRU with pressure-scaled tool TTL",
+    "Eq.8 Agent Fair Share scheduling",
+    "action-feedback affinity commit"
   ],
   "required_facts": [
+    "session_id",
+    "cached",
     "cache_locality",
-    "group_service",
     "load",
-    "steal",
-    "workflow_ttl_ms"
+    "load_ppm",
+    "affinity_load_threshold_ppm",
+    "idle_ms",
+    "steal_idle_ms",
+    "steal_load_ratio_ppm",
+    "source_target_index",
+    "session_queue_age_ms",
+    "stealable",
+    "remaining_work_ms",
+    "deadline_ms",
+    "tenant_id",
+    "tool_latency_samples_ms",
+    "used_kv_ppm",
+    "reuse_probability_ppm",
+    "transitions",
+    "last_access_ms"
   ],
   "required_mechanics": [],
   "optional_mechanics": [
@@ -31,6 +48,6 @@
     "physical work stealing"
   ],
   "evidence_level": "inspired-adaptation",
-  "fixture_provenance": "independent reference model from the paper",
+  "fixture_provenance": "arXiv 2605.00528v2 Equations 1, 6-9 and Algorithm 1",
   "validation_status": "passing"
 }

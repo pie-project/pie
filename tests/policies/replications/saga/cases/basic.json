@@ -1,4 +1,1 @@
-{
-  "case": "cache-local-steal",
-  "steal": true
-}
+{"schema":"plex-paper-oracle@1","cases":[{"id":"affinity-and-steal","affinity_threshold_ppm":800000,"idle_ms":200,"load_ratio_ppm":2000000},{"id":"afs","tenants":[{"deadline_ms":1000},{"deadline_ms":200}]},{"id":"pressure-ttl","samples_ms":[1000],"used_kv_ppm":900000}]}

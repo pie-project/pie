@@ -1,6 +1,1 @@
-{
-  "invariants": [
-    "schedule writes pending state",
-    "cache reads the same state"
-  ]
-}
+{"schema":"plex-paper-oracle@1","expectations":[{"case_id":"clpm-dynamic-lane","first_section":"warm","fairness_share_ppm":382500},{"case_id":"no-sharing-guard","fallback":"fcfs"},{"case_id":"ancestor-demand-eviction","victim_score":0}]}

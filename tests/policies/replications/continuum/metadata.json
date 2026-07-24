@@ -11,12 +11,28 @@
     "preempted-first priority",
     "TTL-pinned priority",
     "group-level FCFS",
-    "TTL-aware cache retention"
+    "empirical-CDF TTL optimization",
+    "timestamped pin retention and deadlock pin breaking"
   ],
-  "required_facts": ["preempted", "program_arrival", "ttl_ms", "ttl_expired", "reload_cost"],
+  "required_facts": [
+    "preempted",
+    "program_id",
+    "program_arrival",
+    "now_ms",
+    "next_tool_id",
+    "tool_id",
+    "tool_duration_ms",
+    "average_wait_ms",
+    "memoryfulness_ppm",
+    "prefill_reload_ms",
+    "history_threshold",
+    "default_ttl_ms",
+    "program_resumed",
+    "program_finished"
+  ],
   "required_mechanics": [],
-  "deferred_mechanics": ["tool parser", "offline TTL estimator", "physical KV pinning"],
+  "deferred_mechanics": ["tool parser", "physical KV pinning"],
   "evidence_level": "inspired-adaptation",
-  "fixture_provenance": "independent implementation from the paper algorithm",
+  "fixture_provenance": "arXiv 2511.02230 Algorithm 1 and Equations 1-2",
   "validation_status": "passing"
 }

@@ -45,7 +45,7 @@ Named datasets/workloads identified from the primary text or manual audit.
 ## PLEX v0.6 replication status
 
 - Component: `plex_paper_ragcache`
-- Operations: `cache`
+- Operations: `schedule`, `cache`, `feedback`
 - Evidence: `inspired-adaptation`
 - Validation: `passing`
 - Metadata: [`tests/policies/replications/ragcache/metadata.json`](../../tests/policies/replications/ragcache/metadata.json)

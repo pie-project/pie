@@ -51,7 +51,7 @@ Named datasets/workloads identified from the primary text or manual audit.
 - Evidence: `inspired-adaptation`
 - Validation: `passing`
 - Metadata: [`tests/policies/replications/continuum/metadata.json`](../../tests/policies/replications/continuum/metadata.json)
-- Deferred mechanics: tool parser; offline TTL estimator; physical KV pinning
+- Deferred mechanics: tool parser; physical KV pinning
 <!-- plex-v0.6-replication:end -->
 
 ## Suggested citation

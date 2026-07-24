@@ -180,7 +180,8 @@ do
             operations=cache,feedback
             ;;
         plex_paper_ragcache)
-            operations=cache
+            operations=schedule,cache,feedback
+            optional=cache.swap@1
             ;;
         plex_paper_dlpm)
             operations=route,schedule,feedback
@@ -251,14 +252,14 @@ do
             operations=route,schedule
             ;;
         plex_paper_saga)
-            operations=route,schedule,cache
+            operations=route,schedule,cache,feedback
             optional=request.rebalance@1
             ;;
         plex_paper_continuum)
             operations=schedule,cache,feedback
             ;;
         plex_paper_kvflow)
-            operations=schedule,cache
+            operations=schedule,cache,feedback
             optional=cache.prefetch@1
             ;;
         plex_retention_score)

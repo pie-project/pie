@@ -1,1 +1,1 @@
-{"reclaimed":["A"],"invariants":["only eligible leaves are selected","one episode step is emitted"]}
+{"schema":"plex-paper-oracle@1","expectations":[{"case_id":"frontier-eviction","reclaim":["leaf","parent"]},{"case_id":"swap-once","action":"pie.cache.swap@1"},{"case_id":"cache-aware-order","selected_index":2}]}

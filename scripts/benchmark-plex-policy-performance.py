@@ -413,10 +413,11 @@ def invoke_cache(
     max_bytes: int,
     capacity_facts: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    meta = bench.meta("cache")
     outcome = bench.invoke(
         "cache",
         {
-            "meta": bench.meta("cache"),
+            "meta": meta,
             "cause": "pressure",
             "resident": [
                 {"object": item, "reclaimable": True} for item in residents
@@ -431,7 +432,27 @@ def invoke_cache(
         },
         lifecycle,
     )
+    outcome["_benchmark_opportunity_id"] = meta["opportunity_id"]
     return outcome["plan"]["plan"], outcome
+
+
+def complete_actions(bench: PolicyBench, outcome: dict[str, Any]) -> None:
+    records = [
+        {
+            "subject": {"kind": "action", "value": action["id"]},
+            "outcome": "action-succeeded",
+            "facts": {
+                "opportunity_id": outcome["_benchmark_opportunity_id"],
+                "method": action["method"],
+                "idempotency_key": action["args"]["idempotency_key"],
+                "status": "succeeded",
+                "details": {},
+            },
+        }
+        for action in outcome.get("actions", [])
+    ]
+    if records:
+        bench.feedback(records)
 
 
 def exercise_feedback(
@@ -682,55 +703,86 @@ def scenario_continuum(
     policy_costs = []
     baseline_costs = []
     for trial in range(trials):
-        pinned_index = rng.randrange(4)
-        facts = [
-            {
-                "preempted": index == pinned_index,
-                "program_arrival": rng.randint(0, 1000),
-            }
-            for index in range(4)
-        ]
+        history = sorted(rng.randint(100, 800) for _ in range(5))
+        facts = [{"program_arrival": index} for index in range(4)]
         refs, lifecycle = bootstrap_requests(
-            bench, f"continuum-{trial}", facts, status="active"
+            bench,
+            f"continuum-{trial}",
+            facts,
+            status="active",
+            group_keys=["a", "a", "b", "c"],
         )
         bench.feedback(
             [
                 {
                     "subject": {
                         "kind": "request",
-                        "value": refs[pinned_index]["request_id"],
+                        "value": refs[0]["request_id"],
                     },
                     "outcome": "progress",
-                    "facts": {"ttl_ms": 5000},
+                    "facts": {
+                        "tool_id": "shell",
+                        "tool_duration_ms": duration,
+                    },
                 }
+                for duration in history
             ],
             lifecycle,
         )
-        selected, _ = invoke_schedule(bench, refs, facts, None)
-        reload_costs = [rng.randint(10, 1000) for _ in refs]
+        bench.feedback(
+            [
+                {
+                    "subject": {
+                        "kind": "request",
+                        "value": refs[0]["request_id"],
+                    },
+                    "outcome": "completed",
+                    "facts": {
+                        "next_tool_id": "shell",
+                        "now_ms": 1000,
+                        "average_wait_ms": 500,
+                        "memoryfulness_ppm": 1_000_000,
+                        "prefill_reload_ms": 200,
+                        "history_threshold": 1,
+                        "program_arrival": 0,
+                        "program_finished": False,
+                    },
+                }
+            ]
+        )
+        schedule_facts = [
+            {"now_ms": 1100, "program_arrival": 0},
+            {"now_ms": 1100, "program_arrival": 1},
+            {"now_ms": 1100, "program_arrival": 2},
+        ]
+        selected, _ = invoke_schedule(
+            bench, refs[1:], schedule_facts, None
+        )
+        reload_costs = [rng.randint(100, 1000) for _ in range(3)]
         residents = [
             cache_object(
                 f"continuum-{trial}-{index}",
-                {"reload_cost": reload_cost},
-                beneficiary=ref["request_id"],
+                {},
+                beneficiary=refs[index]["request_id"],
             )
-            for index, (ref, reload_cost) in enumerate(
-                zip(refs, reload_costs)
-            )
+            for index in range(3)
         ]
         plan, _ = invoke_cache(
-            bench, residents, [], None, max_bytes=len(residents) - 1
+            bench,
+            residents,
+            [],
+            None,
+            max_bytes=len(residents) - 1,
+            capacity_facts={"now_ms": 1100},
         )
         policy_victim = plan["reclaim"][0]
-        schedule_penalty = 0 if selected[0] == pinned_index else 5000
+        schedule_penalty = 0 if selected[0] == 0 else 5000
         policy_costs.append(
             schedule_penalty
             + reload_costs[policy_victim]
-            + (10000 if policy_victim == pinned_index else 0)
+            + (10000 if policy_victim == 0 else 0)
         )
-        baseline_costs.append(
-            reload_costs[pinned_index] + 10000
-        )
+        baseline_costs.append(reload_costs[0] + 10000)
     return result(
         policy_costs,
         baseline_costs,
@@ -745,42 +797,58 @@ def scenario_kvflow(
     policy_costs = []
     baseline_costs = []
     for trial in range(trials):
-        ready = [rng.random() < 0.5 for _ in range(5)]
-        ready[rng.randrange(5)] = True
-        facts = [{"cache_ready": value} for value in ready]
+        facts = [{"required_objects": ["next"]}, {"cache_ready": True}]
         refs, lifecycle = bootstrap_requests(
             bench, f"kvflow-{trial}", facts, status="active"
         )
-        selected, _ = invoke_schedule(bench, refs, facts, lifecycle)
-        steps = [rng.randint(1, 20) for _ in refs]
-        fixed = [rng.random() < 0.4 for _ in refs]
         residents = [
             cache_object(
-                f"kvflow-{trial}-{index}",
+                f"kvflow-{trial}-varying",
                 {
-                    "fixed_prefix": fixed_prefix,
-                    "steps_to_execution": distance,
-                    "loading": False,
-                    "offloading": False,
+                    "fixed_prefix": False,
+                    "steps_to_execution": 0,
+                    "cache_state": "gpu",
                 },
-                beneficiary=ref["request_id"],
-            )
-            for index, (ref, fixed_prefix, distance) in enumerate(
-                zip(refs, fixed, steps)
+                beneficiary=refs[0]["request_id"],
+            ),
+            cache_object(
+                f"kvflow-{trial}-fixed",
+                {
+                    "fixed_prefix": True,
+                    "beneficiary_steps": [2, 5],
+                    "cache_state": "gpu",
+                },
+                beneficiary=refs[1]["request_id"],
+            ),
+        ]
+        prospective = [
+            cache_object(
+                "next",
+                {
+                    "fixed_prefix": True,
+                    "steps_to_execution": 1,
+                    "cache_state": "cpu",
+                    "prefetch": True,
+                },
             )
         ]
-        plan, _ = invoke_cache(
-            bench, residents, [], None, max_bytes=len(residents) - 1
+        plan, cache_outcome = invoke_cache(
+            bench,
+            residents,
+            prospective,
+            lifecycle,
+            max_bytes=2,
+            capacity_facts={
+                "prefetch_horizon_steps": 1,
+                "max_concurrent_prefetches": 1,
+            },
         )
+        complete_actions(bench, cache_outcome)
+        selected, _ = invoke_schedule(bench, refs, facts, None)
         victim = plan["reclaim"][0]
-        harm = [
-            (1000 if fixed_prefix else 0) + 100 / (distance + 1)
-            for fixed_prefix, distance in zip(fixed, steps)
-        ]
-        policy_costs.append(
-            (0 if ready[selected[0]] else 500) + harm[victim]
-        )
-        baseline_costs.append((0 if ready[0] else 500) + harm[0])
+        harm = [1, 1000]
+        policy_costs.append((0 if selected[0] == 0 else 500) + harm[victim])
+        baseline_costs.append(500 + harm[0])
     return result(
         policy_costs,
         baseline_costs,
@@ -822,7 +890,7 @@ def scenario_preble(
             [{"uncached_tokens": remaining}],
             status="admitted",
         )
-        assignments, route_outcome = invoke_route(
+        assignments, _ = invoke_route(
             bench,
             refs,
             [
@@ -857,7 +925,7 @@ def scenario_preble(
             ],
             lifecycle,
         )
-        enact_route(bench, route_outcome)
+
         policy_costs.append(total_cost[assignments[0]])
         baseline_index = min(range(3), key=rolling_load.__getitem__)
         baseline_costs.append(total_cost[baseline_index])
@@ -1199,25 +1267,41 @@ def scenario_marconi(
     policy_values = []
     baseline_values = []
     for trial in range(trials):
-        values = [rng.randint(1, 10000) for _ in range(8)]
+        timestamps = rng.sample(range(1, 1000), 8)
+        flops = [rng.randint(1, 10000) for _ in range(8)]
+        alpha = 1_000_000
         residents = [
             cache_object(
                 f"marconi-{trial}-{index}",
                 {
-                    "reuse_probability_ppm": value,
-                    "recompute_flops": 1000,
+                    "child_count": 0,
+                    "last_access_us": timestamps[index],
+                    "recompute_flops": flops[index],
                 },
             )
-            for index, value in enumerate(values)
+            for index in range(8)
         ]
         plan, _ = invoke_cache(
-            bench, residents, [], None, max_bytes=4
+            bench,
+            residents,
+            [],
+            None,
+            max_bytes=4,
+            capacity_facts={"alpha_ppm": alpha},
         )
         reclaimed = set(plan["reclaim"])
+        t_min, t_max = min(timestamps), max(timestamps)
+        f_min, f_max = min(flops), max(flops)
+        values = [
+            (timestamps[index] - t_min) / max(t_max - t_min, 1)
+            + (flops[index] - f_min) / max(f_max - f_min, 1)
+            for index in range(8)
+        ]
         policy_values.append(
             sum(value for index, value in enumerate(values) if index not in reclaimed)
         )
-        baseline_values.append(sum(values[-4:]))
+        lru_retained = sorted(range(8), key=timestamps.__getitem__)[-4:]
+        baseline_values.append(sum(values[index] for index in lru_retained))
     exercise_feedback(bench, "marconi-feedback")
     return result(
         policy_values,
@@ -1238,17 +1322,18 @@ def scenario_ragcache(
         for index in range(6):
             frequency = rng.randint(1, 20)
             recompute = rng.randint(10, 1000)
-            age = rng.randint(0, 100)
             size = rng.randint(1, 8)
-            scores.append(age + recompute * frequency / size)
+            unit_cost = max(recompute // size, 1)
+            scores.append(unit_cost * frequency)
             residents.append(
                 cache_object(
                     f"ragcache-{trial}-{index}",
                     {
-                        "leaf": True,
+                        "tier": "gpu",
+                        "tier_child_count": 0,
                         "frequency": frequency,
-                        "recompute_cost": recompute,
-                        "age": age,
+                        "average_cost_per_new_token_fp": unit_cost,
+                        "host_copy_exists": True,
                     },
                     size_bytes=size,
                 )
@@ -1288,7 +1373,7 @@ def scenario_dlpm(
             cached[index] = 4096
         load = [rng.randint(1, 100) for _ in range(4)]
         longest = max(cached)
-        assignments, route_outcome = invoke_route(
+        assignments, _ = invoke_route(
             bench,
             refs,
             [
@@ -1312,7 +1397,6 @@ def scenario_dlpm(
             ],
             lifecycle,
         )
-        enact_route(bench, route_outcome)
         costs = [
             (longest - cached[index]) * 10 + load[index]
             for index in range(4)
@@ -1429,26 +1513,68 @@ def scenario_peek(
     for trial in range(trials):
         facts = [
             {
-                "waiting_ms": rng.randint(0, 2000),
-                "fairness_threshold_ms": 1000,
-                "demand_depth": rng.randint(0, 20),
-            }
-            for _ in range(6)
+                "lpm_hit_tokens": 0,
+                "warm_threshold_tokens": 32,
+                "deprio_prefix_id": "singleton",
+                "cluster_id": "singleton",
+                "cluster_size": 1,
+                "ancestor_score": 0,
+                "root_child_pending_count": 1,
+                "arrival_seq": 0,
+                "waiting_ms": 2000,
+            },
+            {
+                "lpm_hit_tokens": 128,
+                "warm_threshold_tokens": 32,
+                "cluster_id": "warm",
+                "cluster_size": 3,
+                "ancestor_score": 100,
+                "root_child_pending_count": 3,
+                "arrival_seq": 1,
+                "waiting_ms": 0,
+            },
+            {
+                "lpm_hit_tokens": 0,
+                "warm_threshold_tokens": 32,
+                "deprio_prefix_id": "cold-a",
+                "cluster_id": "cold-a",
+                "cluster_size": 2,
+                "ancestor_score": 80,
+                "root_child_pending_count": 2,
+                "arrival_seq": 2,
+                "waiting_ms": 0,
+            },
+            {
+                "lpm_hit_tokens": 0,
+                "warm_threshold_tokens": 32,
+                "deprio_prefix_id": "cold-a",
+                "cluster_id": "cold-a",
+                "cluster_size": 2,
+                "ancestor_score": 80,
+                "root_child_pending_count": 2,
+                "arrival_seq": 3,
+                "waiting_ms": 0,
+            },
         ]
         refs, lifecycle = bootstrap_requests(
             bench, f"peek-{trial}", facts, status="active"
         )
         selected, _ = invoke_schedule(bench, refs, facts, lifecycle)
         utilities = [
-            (10000 if item["waiting_ms"] >= item["fairness_threshold_ms"] else 0)
-            + item["demand_depth"]
+            item["lpm_hit_tokens"]
+            + item["ancestor_score"]
+            + item["cluster_size"] * 10
             for item in facts
         ]
-        pending_depth = [rng.randint(0, 50) for _ in refs]
+        pending_depth = [10, 0, 8, 8]
         residents = [
             cache_object(
                 f"peek-{trial}-{index}",
-                {"pending_demand_depth": depth},
+                {
+                    "ancestor_demands": [
+                        {"pending_count": depth, "depth": 1}
+                    ]
+                },
                 beneficiary=ref["request_id"],
             )
             for index, (ref, depth) in enumerate(zip(refs, pending_depth))
@@ -2467,34 +2593,40 @@ def scenario_saga(
     policy_costs = []
     baseline_costs = []
     for trial in range(trials):
-        locality = [rng.randint(0, 100) for _ in range(4)]
-        load = [rng.randint(1, 100) for _ in range(4)]
-        group_service = [rng.randint(0, 1000) for _ in range(4)]
+        load = [5 + rng.randint(0, 2), 1 + rng.randint(0, 1)]
         refs, lifecycle = bootstrap_requests(
             bench,
             f"saga-{trial}",
             [
                 {
-                    "steal": False,
-                    "group_service": service,
-                }
-                for service in group_service
+                    "session_id": "session-a",
+                    "affinity_target_id": "target-0",
+                },
+                {},
             ],
             status="admitted",
-            group_keys=[str(index) for index in range(4)],
+            group_keys=["a", "b"],
         )
         assignments, _ = invoke_route(
             bench,
             refs[:1],
-            [{"steal": False}],
-            [{}, {}, {}, {}],
+            [
+                {
+                    "session_id": "session-a",
+                    "affinity_target_id": "target-0",
+                    "affinity_load_threshold_ppm": 800_000,
+                }
+            ],
+            [{}, {}],
             [
                 [
                     {
-                        "cache_locality": locality[index],
+                        "cached": index == 0,
+                        "cache_locality": 100 if index == 0 else 0,
                         "load": load[index],
+                        "load_ppm": 500_000 if index == 0 else 100_000,
                     }
-                    for index in range(4)
+                    for index in range(2)
                 ]
             ],
             lifecycle,
@@ -2502,7 +2634,20 @@ def scenario_saga(
         selected, _ = invoke_schedule(
             bench,
             refs,
-            [{"group_service": service} for service in group_service],
+            [
+                {
+                    "tenant_id": "tenant-a",
+                    "remaining_work_ms": 100,
+                    "deadline_ms": 1000,
+                    "now_ms": 0,
+                },
+                {
+                    "tenant_id": "tenant-b",
+                    "remaining_work_ms": 100,
+                    "deadline_ms": 200,
+                    "now_ms": 0,
+                },
+            ],
             [
                 {
                     "event": "activate-request",
@@ -2510,29 +2655,28 @@ def scenario_saga(
                 }
                 for ref in refs
             ],
+            max_selections=2,
+            max_requests=2,
+            token_budget=8,
         )
-        costs = [
-            (max(locality) - locality[index]) * 1000 + load[index]
-            for index in range(4)
-        ]
-        policy_costs.append(
-            costs[assignments[0]] + group_service[selected[0]]
-        )
-        baseline_index = min(range(4), key=load.__getitem__)
-        baseline_costs.append(costs[baseline_index] + group_service[0])
+        costs = [load[0], load[1] + 100]
+        urgency_penalty = [500, 100]
+        policy_costs.append(costs[assignments[0]] + urgency_penalty[selected[0]])
+        baseline_index = min(range(2), key=load.__getitem__)
+        baseline_costs.append(costs[baseline_index] + urgency_penalty[0])
         prospective = [
             cache_object(
-                f"saga-{trial}-{index}",
-                {"workflow_ttl_ms": 1000 if index >= 2 else 0},
+                f"saga-{trial}",
+                {"tool_latency_samples_ms": [1000]},
             )
-            for index in range(4)
         ]
         invoke_cache(
             bench,
             [],
             prospective,
             None,
-            max_bytes=len(prospective),
+            max_bytes=1,
+            capacity_facts={"now_ms": 0, "used_kv_ppm": 900_000},
         )
     return result(
         policy_costs,

@@ -6,12 +6,29 @@
   "source_commit": null,
   "source_license": "paper reference; no source copied",
   "component": "plex_paper_ragcache",
-  "implements": ["cache"],
-  "policy_kernel": ["leaf-only reclaim", "prefix-aware GDSF value", "bounded iterative episode"],
-  "required_facts": ["leaf", "frequency", "recompute_cost", "age"],
-  "required_mechanics": [],
+  "implements": ["schedule", "cache", "feedback"],
+  "policy_kernel": [
+    "two-tier PGDSF logical clocks",
+    "iterative leaf-frontier reclaim",
+    "swap-out-only-once",
+    "cache-aware request reordering"
+  ],
+  "required_facts": [
+    "tier",
+    "parent_object_id",
+    "tier_child_count",
+    "frequency",
+    "total_cost_fp",
+    "num_computed",
+    "average_cost_per_new_token_fp",
+    "host_copy_exists",
+    "cached_length",
+    "computation_length",
+    "starvation_window_ms"
+  ],
+  "required_mechanics": ["cache.swap@1"],
   "deferred_mechanics": [],
   "evidence_level": "inspired-adaptation",
-  "fixture_provenance": "independent reference model from the paper",
+  "fixture_provenance": "arXiv 2404.12457 Equations 1-3 and Algorithm 1",
   "validation_status": "passing"
 }

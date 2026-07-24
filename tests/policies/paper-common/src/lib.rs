@@ -980,128 +980,439 @@ fn fairserve_fact_str<'a>(
 pub struct Marconi;
 
 impl Policy for Marconi {
-    fn cache(ctx: &CacheContext, _state: &mut State, _host: &Host) -> plex::Result<CachePlan> {
-        #[derive(Clone, Copy)]
-        enum Kind {
-            Resident(u32),
-            Prospective(u32),
+    fn cache(ctx: &CacheContext, state: &mut State, _host: &Host) -> plex::Result<CachePlan> {
+        if let Some(alpha) = ctx.capacity.facts["alpha_ppm"].as_u64() {
+            state.shared["marconi_alpha_ppm"] = json!(alpha.min(1_000_000));
         }
-
-        let mut fixed_bytes = ctx.capacity.fixed_bytes;
-        let mut candidates = Vec::new();
-        for (index, resident) in ctx.resident.iter().enumerate() {
-            if resident.reclaimable {
-                candidates.push((
-                    value(&resident.object),
-                    resident.object.size_bytes,
-                    Kind::Resident(index as u32),
-                ));
-            } else {
-                fixed_bytes = fixed_bytes.saturating_add(resident.object.size_bytes);
-            }
-        }
-        for (index, object) in ctx.prospective.iter().enumerate() {
-            candidates.push((
-                value(object),
-                object.size_bytes,
-                Kind::Prospective(index as u32),
-            ));
-        }
-        candidates.sort_by_key(|(value, size, kind)| {
-            let tie = match kind {
-                Kind::Resident(index) | Kind::Prospective(index) => *index,
-            };
-            (Reverse(*value), *size, tie)
-        });
-        let mut remaining = ctx.capacity.max_bytes.saturating_sub(fixed_bytes);
-        let mut retained_residents = BTreeSet::new();
-        let mut admitted = BTreeSet::new();
-        for (_, size, kind) in candidates {
-            if size > remaining {
-                continue;
-            }
-            remaining -= size;
-            match kind {
-                Kind::Resident(index) => {
-                    retained_residents.insert(index);
+        let alpha = state.shared["marconi_alpha_ppm"].as_u64().unwrap_or(0);
+        let admissions = ctx
+            .prospective
+            .iter()
+            .map(|object| {
+                let state_kind = object.facts["state_kind"].as_str().unwrap_or("kv");
+                let reuse_class = object.facts["reuse_class"].as_str().unwrap_or("kv");
+                let admit = state_kind != "ssm"
+                    || reuse_class == "pure-input"
+                        && object.facts["speculative_branch_created"]
+                            .as_bool()
+                            .unwrap_or(false)
+                    || reuse_class == "input-output"
+                        && object.facts["last_decoded_state"]
+                            .as_bool()
+                            .unwrap_or(false);
+                if admit {
+                    CacheAdmission::Cache
+                } else {
+                    CacheAdmission::Bypass
                 }
-                Kind::Prospective(index) => {
-                    admitted.insert(index);
-                }
-            }
-        }
-        Ok(CachePlan {
-            admissions: (0..ctx.prospective.len())
-                .map(|index| {
-                    if admitted.contains(&(index as u32)) {
-                        CacheAdmission::Cache
-                    } else {
-                        CacheAdmission::Bypass
-                    }
-                })
-                .collect(),
-            reclaim: ctx
-                .resident
-                .iter()
-                .enumerate()
-                .filter(|(index, resident)| {
-                    resident.reclaimable && !retained_residents.contains(&(*index as u32))
-                })
-                .map(|(index, _)| index as u32)
-                .collect(),
-        })
-    }
-
-    fn feedback(ctx: &FeedbackContext, state: &mut State, _host: &Host) -> plex::Result<()> {
-        state.shared["marconi_feedback_records"] = json!(
-            state.shared["marconi_feedback_records"]
-                .as_u64()
-                .unwrap_or(0)
-                .saturating_add(ctx.records.len() as u64)
-        );
-        Ok(())
-    }
-}
-
-pub struct RagCache;
-
-impl Policy for RagCache {
-    fn cache(ctx: &CacheContext, _state: &mut State, _host: &Host) -> plex::Result<CachePlan> {
-        let mut ordered = ctx
+            })
+            .collect::<Vec<_>>();
+        let eligible = ctx
             .resident
             .iter()
             .enumerate()
             .filter(|(_, resident)| {
-                resident.reclaimable && resident.object.facts["leaf"].as_bool().unwrap_or(false)
-            })
-            .map(|(index, resident)| {
-                let frequency = resident.object.facts["frequency"].as_u64().unwrap_or(1);
-                let cost = resident.object.facts["recompute_cost"]
-                    .as_u64()
-                    .unwrap_or(0);
-                let age = resident.object.facts["age"].as_u64().unwrap_or(0);
-                (
-                    (
-                        age.saturating_add(
-                            cost.saturating_mul(frequency) / resident.object.size_bytes.max(1),
-                        ),
-                        index,
-                    ),
-                    index as u32,
-                )
+                resident.reclaimable
+                    && resident.object.facts["child_count"].as_u64().unwrap_or(0) <= 1
             })
             .collect::<Vec<_>>();
-        ordered.sort_by_key(|entry| entry.0);
-        let admissions = vec![CacheAdmission::Cache; ctx.prospective.len()];
+        let recency_min = eligible
+            .iter()
+            .map(|(_, resident)| marconi_timestamp(state, &resident.object))
+            .min()
+            .unwrap_or(0);
+        let recency_max = eligible
+            .iter()
+            .map(|(_, resident)| marconi_timestamp(state, &resident.object))
+            .max()
+            .unwrap_or(recency_min);
+        let flop_min = eligible
+            .iter()
+            .map(|(_, resident)| marconi_flop_efficiency(&resident.object))
+            .min()
+            .unwrap_or(0);
+        let flop_max = eligible
+            .iter()
+            .map(|(_, resident)| marconi_flop_efficiency(&resident.object))
+            .max()
+            .unwrap_or(flop_min);
+        let mut ordered = eligible
+            .into_iter()
+            .map(|(index, resident)| {
+                let recency = normalize_range(
+                    marconi_timestamp(state, &resident.object),
+                    recency_min,
+                    recency_max,
+                );
+                let flop = normalize_range(
+                    marconi_flop_efficiency(&resident.object),
+                    flop_min,
+                    flop_max,
+                );
+                let score = u128::from(recency)
+                    .saturating_mul(1_000_000)
+                    .saturating_add(u128::from(alpha).saturating_mul(u128::from(flop)));
+                (score, index as u32)
+            })
+            .collect::<Vec<_>>();
+        ordered.sort_by_key(|entry| *entry);
+        let required = cache_required(ctx, &admissions);
+        if required > 0 && state.shared["marconi_first_eviction"].is_null() {
+            state.shared["marconi_first_eviction"] = json!(true);
+            state.shared["marconi_bootstrap_requests"] = json!(0);
+        }
         Ok(CachePlan {
-            reclaim: reclaim_prefix(
+            reclaim: reclaim_by_required(
                 ctx,
-                &admissions,
+                required,
                 ordered.into_iter().map(|(_, index)| index),
             ),
             admissions,
         })
     }
+
+    fn feedback(ctx: &FeedbackContext, state: &mut State, _host: &Host) -> plex::Result<()> {
+        for record in &ctx.records {
+            if let Some(alpha) = record.facts["selected_alpha_ppm"].as_u64() {
+                state.shared["marconi_alpha_ppm"] = json!(alpha.min(1_000_000));
+            }
+            let FeedbackSubject::CacheObject(object_id) = &record.subject else {
+                continue;
+            };
+            if record.outcome == OutcomeKind::Progress
+                && record.facts["accessed"].as_bool().unwrap_or(false)
+                && let Some(now_us) = record.facts["now_us"].as_u64()
+            {
+                state.shared["marconi_timestamps"][object_id.as_str()] = json!(now_us);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn marconi_timestamp(state: &State, object: &plex::CacheObject) -> u64 {
+    state.shared["marconi_timestamps"][object.object_id.as_str()]
+        .as_u64()
+        .or_else(|| object.facts["last_access_us"].as_u64())
+        .unwrap_or(0)
+}
+
+fn marconi_flop_efficiency(object: &plex::CacheObject) -> u64 {
+    object.facts["recompute_flops"]
+        .as_u64()
+        .unwrap_or(0)
+        .saturating_mul(1_000_000)
+        / object.size_bytes.max(1)
+}
+
+fn normalize_range(value: u64, minimum: u64, maximum: u64) -> u64 {
+    if maximum == minimum {
+        1_000_000
+    } else {
+        value.saturating_sub(minimum).saturating_mul(1_000_000) / maximum.saturating_sub(minimum)
+    }
+}
+
+fn cache_required(ctx: &CacheContext, admissions: &[CacheAdmission]) -> u64 {
+    ctx.resident
+        .iter()
+        .fold(ctx.capacity.fixed_bytes, |total, resident| {
+            total.saturating_add(resident.object.size_bytes)
+        })
+        .saturating_add(
+            ctx.prospective
+                .iter()
+                .zip(admissions)
+                .filter(|(_, admission)| **admission == CacheAdmission::Cache)
+                .fold(0u64, |total, (object, _)| {
+                    total.saturating_add(object.size_bytes)
+                }),
+        )
+        .saturating_sub(ctx.capacity.max_bytes)
+}
+
+fn reclaim_by_required(
+    ctx: &CacheContext,
+    required: u64,
+    ordered: impl IntoIterator<Item = u32>,
+) -> Vec<u32> {
+    let mut freed = 0u64;
+    let mut reclaim = Vec::new();
+    for index in ordered {
+        if freed >= required {
+            break;
+        }
+        freed = freed.saturating_add(ctx.resident[index as usize].object.size_bytes);
+        reclaim.push(index);
+    }
+    reclaim
+}
+
+pub struct RagCache;
+
+impl Policy for RagCache {
+    fn schedule(
+        ctx: &ScheduleContext,
+        _state: &mut State,
+        _host: &Host,
+    ) -> plex::Result<SchedulePlan> {
+        let mut order = (0..ctx.runnable.len()).collect::<Vec<_>>();
+        order.sort_by(|left_index, right_index| {
+            let left_index = *left_index;
+            let right_index = *right_index;
+            let left = &ctx.runnable[left_index];
+            let right = &ctx.runnable[right_index];
+            let left_overdue = left.facts["waiting_ms"].as_u64().unwrap_or(0)
+                >= left.facts["starvation_window_ms"]
+                    .as_u64()
+                    .unwrap_or(u64::MAX);
+            let right_overdue = right.facts["waiting_ms"].as_u64().unwrap_or(0)
+                >= right.facts["starvation_window_ms"]
+                    .as_u64()
+                    .unwrap_or(u64::MAX);
+            (!left_overdue)
+                .cmp(&(!right_overdue))
+                .then_with(|| {
+                    let left_cached = left.facts["cached_length"].as_u64().unwrap_or(0);
+                    let left_compute = left.facts["computation_length"]
+                        .as_u64()
+                        .unwrap_or(1)
+                        .max(1);
+                    let right_cached = right.facts["cached_length"].as_u64().unwrap_or(0);
+                    let right_compute = right.facts["computation_length"]
+                        .as_u64()
+                        .unwrap_or(1)
+                        .max(1);
+                    u128::from(right_cached)
+                        .saturating_mul(u128::from(left_compute))
+                        .cmp(&u128::from(left_cached).saturating_mul(u128::from(right_compute)))
+                })
+                .then_with(|| {
+                    left.facts["arrival_seq"]
+                        .as_u64()
+                        .unwrap_or(left_index as u64)
+                        .cmp(
+                            &right.facts["arrival_seq"]
+                                .as_u64()
+                                .unwrap_or(right_index as u64),
+                        )
+                })
+        });
+        Ok(select_singletons(ctx, order))
+    }
+
+    fn cache(ctx: &CacheContext, state: &mut State, host: &Host) -> plex::Result<CachePlan> {
+        for resident in &ctx.resident {
+            sync_ragcache_node(state, &resident.object);
+        }
+        for prospective in &ctx.prospective {
+            sync_ragcache_node(state, prospective);
+        }
+        let admissions = vec![CacheAdmission::Cache; ctx.prospective.len()];
+        let required = cache_required(ctx, &admissions);
+        let mut selected = BTreeSet::<usize>::new();
+        let mut child_counts = ctx
+            .resident
+            .iter()
+            .map(|resident| {
+                resident.object.facts["tier_child_count"]
+                    .as_u64()
+                    .or_else(|| resident.object.facts["child_count"].as_u64())
+                    .unwrap_or(0)
+            })
+            .collect::<Vec<_>>();
+        let indices = ctx
+            .resident
+            .iter()
+            .enumerate()
+            .map(|(index, resident)| (resident.object.object_id.as_str().to_owned(), index))
+            .collect::<BTreeMap<_, _>>();
+        let mut frontier = ctx
+            .resident
+            .iter()
+            .enumerate()
+            .filter(|(index, resident)| resident.reclaimable && child_counts[*index] == 0)
+            .map(|(index, _)| index)
+            .collect::<BTreeSet<_>>();
+        let mut freed = 0u64;
+        while freed < required && !frontier.is_empty() {
+            let victim = *frontier
+                .iter()
+                .min_by_key(|index| {
+                    (
+                        ragcache_priority(state, &ctx.resident[**index].object),
+                        **index,
+                    )
+                })
+                .expect("frontier is non-empty");
+            frontier.remove(&victim);
+            selected.insert(victim);
+            freed = freed.saturating_add(ctx.resident[victim].object.size_bytes);
+            let object = &ctx.resident[victim].object;
+            let tier = object.facts["tier"].as_str().unwrap_or("gpu");
+            let priority = ragcache_priority(state, object);
+            let clock_field = if tier == "host" {
+                "ragcache_clock_host_fp"
+            } else {
+                "ragcache_clock_gpu_fp"
+            };
+            state.shared[clock_field] = json!(
+                state.shared[clock_field]
+                    .as_u64()
+                    .unwrap_or(0)
+                    .max(priority)
+            );
+            if let Some(parent_id) = object.facts["parent_object_id"].as_str()
+                && let Some(parent_index) = indices.get(parent_id).copied()
+            {
+                child_counts[parent_index] = child_counts[parent_index].saturating_sub(1);
+                if child_counts[parent_index] == 0
+                    && ctx.resident[parent_index].reclaimable
+                    && !selected.contains(&parent_index)
+                {
+                    frontier.insert(parent_index);
+                }
+            }
+        }
+        if freed < required {
+            let mut remaining = ctx
+                .resident
+                .iter()
+                .enumerate()
+                .filter(|(index, resident)| resident.reclaimable && !selected.contains(index))
+                .map(|(index, resident)| (ragcache_priority(state, &resident.object), index))
+                .collect::<Vec<_>>();
+            remaining.sort_by_key(|entry| *entry);
+            for (_, index) in remaining {
+                if freed >= required {
+                    break;
+                }
+                freed = freed.saturating_add(ctx.resident[index].object.size_bytes);
+                selected.insert(index);
+            }
+        }
+        for index in &selected {
+            let object = &ctx.resident[*index].object;
+            if object.facts["tier"].as_str().unwrap_or("gpu") == "gpu"
+                && !ragcache_host_copy(state, object)
+            {
+                let action = host.swap_cache(
+                    object.object_id.as_str(),
+                    "host",
+                    &format!(
+                        "ragcache-swap-{}-{}",
+                        ctx.meta.opportunity_id.as_str(),
+                        object.object_id.as_str()
+                    ),
+                )?;
+                state.shared["ragcache_actions"][&action.0.to_string()] = json!({
+                    "object_id": object.object_id.as_str()
+                });
+            }
+        }
+        Ok(CachePlan {
+            reclaim: selected.into_iter().map(|index| index as u32).collect(),
+            admissions,
+        })
+    }
+
+    fn feedback(ctx: &FeedbackContext, state: &mut State, _host: &Host) -> plex::Result<()> {
+        for record in &ctx.records {
+            match &record.subject {
+                FeedbackSubject::CacheObject(object_id) => {
+                    let node = &mut state.shared["ragcache_nodes"][object_id.as_str()];
+                    if let Some(delta) = record.facts["frequency_delta"].as_u64() {
+                        node["frequency"] = json!(
+                            node["frequency"]
+                                .as_u64()
+                                .unwrap_or(0)
+                                .saturating_add(delta)
+                        );
+                    }
+                    if let Some(cost) = record.facts["cost_per_new_token_fp"].as_u64() {
+                        node["total_cost_fp"] = json!(
+                            node["total_cost_fp"]
+                                .as_u64()
+                                .unwrap_or(0)
+                                .saturating_add(cost)
+                        );
+                        node["num_computed"] =
+                            json!(node["num_computed"].as_u64().unwrap_or(0).saturating_add(1));
+                    }
+                }
+                FeedbackSubject::Action(action_id)
+                    if matches!(
+                        record.outcome,
+                        OutcomeKind::ActionSucceeded | OutcomeKind::ActionFailed
+                    ) =>
+                {
+                    let key = action_id.0.to_string();
+                    let action = state.shared["ragcache_actions"][&key].clone();
+                    if let Some(object_id) = action["object_id"].as_str()
+                        && record.outcome == OutcomeKind::ActionSucceeded
+                    {
+                        state.shared["ragcache_nodes"][object_id]["host_copy_exists"] = json!(true);
+                    }
+                    if let Some(actions) = state.shared["ragcache_actions"].as_object_mut() {
+                        actions.remove(&key);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+fn sync_ragcache_node(state: &mut State, object: &plex::CacheObject) {
+    let node = &mut state.shared["ragcache_nodes"][object.object_id.as_str()];
+    for field in [
+        "frequency",
+        "total_cost_fp",
+        "num_computed",
+        "host_copy_exists",
+    ] {
+        if !object.facts[field].is_null() {
+            node[field] = object.facts[field].clone();
+        }
+    }
+    if let Some(cost) = object.facts["average_cost_per_new_token_fp"].as_u64() {
+        node["average_cost_per_new_token_fp"] = json!(cost);
+    }
+}
+
+fn ragcache_priority(state: &State, object: &plex::CacheObject) -> u64 {
+    let node = &state.shared["ragcache_nodes"][object.object_id.as_str()];
+    let tier = object.facts["tier"].as_str().unwrap_or("gpu");
+    let clock = state.shared[if tier == "host" {
+        "ragcache_clock_host_fp"
+    } else {
+        "ragcache_clock_gpu_fp"
+    }]
+    .as_u64()
+    .unwrap_or(0);
+    let frequency = node["frequency"]
+        .as_u64()
+        .or_else(|| object.facts["frequency"].as_u64())
+        .unwrap_or(1);
+    let average_cost = node["average_cost_per_new_token_fp"]
+        .as_u64()
+        .or_else(|| {
+            node["total_cost_fp"]
+                .as_u64()
+                .zip(node["num_computed"].as_u64())
+                .map(|(total, count)| total / count.max(1))
+        })
+        .or_else(|| object.facts["recompute_cost"].as_u64())
+        .unwrap_or(0);
+    clock.saturating_add(frequency.saturating_mul(average_cost))
+}
+
+fn ragcache_host_copy(state: &State, object: &plex::CacheObject) -> bool {
+    state.shared["ragcache_nodes"][object.object_id.as_str()]["host_copy_exists"]
+        .as_bool()
+        .or_else(|| object.facts["host_copy_exists"].as_bool())
+        .unwrap_or(false)
 }
 
 pub struct Dlpm;
@@ -1734,44 +2045,131 @@ impl Policy for Peek {
         state: &mut State,
         _host: &Host,
     ) -> plex::Result<SchedulePlan> {
-        state.shared["peek_pending"] = json!(ctx.runnable.len());
-        let mut order = (0..ctx.runnable.len()).collect::<Vec<_>>();
-        order.sort_by_key(|&index| {
-            let fairness_lane = ctx.runnable[index].facts["waiting_ms"]
+        let has_sharing = ctx.runnable.iter().any(|candidate| {
+            candidate.facts["root_child_pending_count"]
                 .as_u64()
-                .unwrap_or(0)
-                >= ctx.runnable[index].facts["fairness_threshold_ms"]
+                .or_else(|| candidate.facts["cluster_size"].as_u64())
+                .unwrap_or(1)
+                >= 2
+        });
+        if !has_sharing {
+            let mut order = (0..ctx.runnable.len()).collect::<Vec<_>>();
+            order.sort_by_key(|index| {
+                ctx.runnable[*index].facts["arrival_seq"]
                     .as_u64()
-                    .unwrap_or(u64::MAX);
+                    .unwrap_or(*index as u64)
+            });
+            return Ok(select_singletons(ctx, order));
+        }
+        let mut seen_prefixes = BTreeSet::new();
+        let mut section = vec![0u64; ctx.runnable.len()];
+        for (index, candidate) in ctx.runnable.iter().enumerate() {
+            let hit = candidate.facts["lpm_hit_tokens"].as_u64().unwrap_or(0);
+            let warm_threshold = candidate.facts["warm_threshold_tokens"]
+                .as_u64()
+                .unwrap_or(0);
+            if hit > warm_threshold {
+                section[index] = 0;
+                continue;
+            }
+            let prefix = candidate.facts["deprio_prefix_id"]
+                .as_str()
+                .unwrap_or(candidate.request.request_id.as_str());
+            if seen_prefixes.insert(prefix.to_owned()) {
+                section[index] = 1;
+            } else {
+                section[index] = 2;
+            }
+        }
+        let mut lane_a = (0..ctx.runnable.len()).collect::<Vec<_>>();
+        lane_a.sort_by_key(|&index| {
+            let candidate = &ctx.runnable[index];
             (
-                !fairness_lane,
-                Reverse(
-                    ctx.runnable[index].facts["demand_depth"]
-                        .as_u64()
-                        .unwrap_or(0),
-                ),
-                index,
+                section[index],
+                Reverse(candidate.facts["lpm_hit_tokens"].as_u64().unwrap_or(0)),
+                Reverse(candidate.facts["ancestor_score"].as_u64().unwrap_or(0)),
+                Reverse(candidate.facts["cluster_size"].as_u64().unwrap_or(1)),
+                candidate.facts["arrival_seq"]
+                    .as_u64()
+                    .unwrap_or(index as u64),
             )
         });
+        if ctx
+            .runnable
+            .iter()
+            .any(|candidate| candidate.facts["group_major"].as_bool().unwrap_or(false))
+        {
+            let mut grouped = Vec::new();
+            let mut emitted = BTreeSet::new();
+            for index in &lane_a {
+                let cluster = ctx.runnable[*index].facts["cluster_id"]
+                    .as_str()
+                    .unwrap_or(ctx.runnable[*index].request.request_id.as_str());
+                if !emitted.insert(cluster.to_owned()) {
+                    continue;
+                }
+                grouped.extend(lane_a.iter().copied().filter(|candidate| {
+                    ctx.runnable[*candidate].facts["cluster_id"]
+                        .as_str()
+                        .unwrap_or(ctx.runnable[*candidate].request.request_id.as_str())
+                        == cluster
+                }));
+            }
+            lane_a = grouped;
+        }
+        let mut lane_b = (0..ctx.runnable.len()).collect::<Vec<_>>();
+        lane_b.sort_by_key(|&index| {
+            let candidate = &ctx.runnable[index];
+            (
+                section[index],
+                candidate.facts["arrival_seq"]
+                    .as_u64()
+                    .unwrap_or(index as u64),
+                Reverse(candidate.facts["lpm_hit_tokens"].as_u64().unwrap_or(0)),
+            )
+        });
+        let singleton_count = ctx
+            .runnable
+            .iter()
+            .filter(|candidate| candidate.facts["cluster_size"].as_u64().unwrap_or(1) <= 1)
+            .count() as u64;
+        let singleton_frac =
+            singleton_count.saturating_mul(1_000_000) / (ctx.runnable.len() as u64).max(1);
+        let oldest_singleton_wait = ctx
+            .runnable
+            .iter()
+            .filter(|candidate| candidate.facts["cluster_size"].as_u64().unwrap_or(1) <= 1)
+            .filter_map(|candidate| candidate.facts["waiting_ms"].as_u64())
+            .max()
+            .unwrap_or(0);
+        let age_pressure = oldest_singleton_wait
+            .saturating_mul(1_000_000)
+            .checked_div(2000)
+            .unwrap_or(0)
+            .min(1_000_000);
+        let target_fairness = 150_000u64
+            .saturating_add(singleton_frac.saturating_mul(500_000) / 1_000_000)
+            .saturating_add(age_pressure.saturating_mul(300_000) / 1_000_000)
+            .clamp(100_000, 600_000);
+        let previous_fairness = state.shared["peek_fairness_share_ppm"]
+            .as_u64()
+            .unwrap_or(300_000);
+        let fairness_share = target_fairness
+            .saturating_mul(300_000)
+            .saturating_add(previous_fairness.saturating_mul(700_000))
+            / 1_000_000;
+        state.shared["peek_fairness_share_ppm"] = json!(fairness_share);
+        let order = peek_stride(lane_a, lane_b, 1_000_000 - fairness_share);
         Ok(select_singletons(ctx, order))
     }
 
-    fn cache(ctx: &CacheContext, state: &mut State, _host: &Host) -> plex::Result<CachePlan> {
-        let pending = state.shared["peek_pending"].as_u64().unwrap_or(0);
+    fn cache(ctx: &CacheContext, _state: &mut State, _host: &Host) -> plex::Result<CachePlan> {
         let mut reclaim = ctx
             .resident
             .iter()
             .enumerate()
             .filter(|(_, resident)| resident.reclaimable)
-            .map(|(index, resident)| {
-                (
-                    resident.object.facts["pending_demand_depth"]
-                        .as_u64()
-                        .unwrap_or(0)
-                        .saturating_add(pending),
-                    index as u32,
-                )
-            })
+            .map(|(index, resident)| (peek_evict_score(&resident.object.facts), index as u32))
             .collect::<Vec<_>>();
         reclaim.sort_by_key(|entry| *entry);
         let admissions = vec![CacheAdmission::Cache; ctx.prospective.len()];
@@ -1784,6 +2182,60 @@ impl Policy for Peek {
             admissions,
         })
     }
+}
+
+fn peek_stride(lane_a: Vec<usize>, lane_b: Vec<usize>, alpha_ppm: u64) -> Vec<usize> {
+    let total = lane_a.len().max(lane_b.len());
+    let mut lane_a = VecDeque::from(lane_a);
+    let mut lane_b = VecDeque::from(lane_b);
+    let mut selected = BTreeSet::new();
+    let mut order = Vec::new();
+    let mut credit_a = 0u64;
+    let mut credit_b = 0u64;
+    while order.len() < total {
+        while lane_a.front().is_some_and(|index| selected.contains(index)) {
+            lane_a.pop_front();
+        }
+        while lane_b.front().is_some_and(|index| selected.contains(index)) {
+            lane_b.pop_front();
+        }
+        if lane_a.is_empty() && lane_b.is_empty() {
+            break;
+        }
+        credit_a = credit_a.saturating_add(alpha_ppm);
+        credit_b = credit_b.saturating_add(1_000_000 - alpha_ppm);
+        let choose_a = !lane_a.is_empty() && (lane_b.is_empty() || credit_a >= credit_b);
+        let index = if choose_a {
+            credit_a = credit_a.saturating_sub(1_000_000);
+            lane_a.pop_front()
+        } else {
+            credit_b = credit_b.saturating_sub(1_000_000);
+            lane_b.pop_front()
+        };
+        if let Some(index) = index
+            && selected.insert(index)
+        {
+            order.push(index);
+        }
+    }
+    order
+}
+
+fn peek_evict_score(facts: &plex::Document) -> u64 {
+    facts["ancestor_demands"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            Some(
+                entry["pending_count"]
+                    .as_u64()?
+                    .saturating_mul(entry["depth"].as_u64()?),
+            )
+        })
+        .max()
+        .or_else(|| facts["pending_demand_depth"].as_u64())
+        .unwrap_or(0)
 }
 
 pub struct Qlm;
@@ -2948,39 +3400,125 @@ impl Policy for Parrot {
 pub struct Saga;
 
 impl Policy for Saga {
-    fn route(ctx: &RouteContext, _state: &mut State, host: &Host) -> plex::Result<RoutePlan> {
+    fn route(ctx: &RouteContext, state: &mut State, host: &Host) -> plex::Result<RoutePlan> {
+        let mut capacity = RouteCapacity::new(ctx);
         let mut decisions = Vec::new();
-        let mut target_counts = vec![0u32; ctx.targets.len()];
+        let mut pending_assignments = Vec::new();
+        let idle_threshold = ctx
+            .requests
+            .first()
+            .and_then(|request| request.facts["steal_idle_ms"].as_u64())
+            .unwrap_or(100);
+        let load_ratio_ppm = ctx
+            .requests
+            .first()
+            .and_then(|request| request.facts["steal_load_ratio_ppm"].as_u64())
+            .unwrap_or(2_000_000);
+        let idle_target = ctx
+            .targets
+            .iter()
+            .enumerate()
+            .filter(|(_, target)| target.facts["idle_ms"].as_u64().unwrap_or(0) >= idle_threshold)
+            .min_by_key(|(_, target)| target.facts["load"].as_u64().unwrap_or(u64::MAX))
+            .map(|(index, _)| index);
+        let max_load = ctx
+            .targets
+            .iter()
+            .map(|target| target.facts["load"].as_u64().unwrap_or(0))
+            .max()
+            .unwrap_or(0);
+        let min_load = ctx
+            .targets
+            .iter()
+            .map(|target| target.facts["load"].as_u64().unwrap_or(0))
+            .min()
+            .unwrap_or(0);
+        let steal_source = if min_load == 0
+            || u128::from(max_load).saturating_mul(1_000_000)
+                >= u128::from(min_load).saturating_mul(u128::from(load_ratio_ppm))
+        {
+            ctx.targets
+                .iter()
+                .enumerate()
+                .filter(|(_, target)| target.facts["load"].as_u64().unwrap_or(0) == max_load)
+                .map(|(index, _)| index)
+                .next()
+        } else {
+            None
+        };
+        if let (Some(destination), Some(source)) = (idle_target, steal_source) {
+            let victim = ctx
+                .requests
+                .iter()
+                .enumerate()
+                .filter(|(_, request)| {
+                    request.facts["source_target_index"].as_u64() == Some(source as u64)
+                        && request.facts["stealable"].as_bool().unwrap_or(false)
+                })
+                .max_by_key(|(_, request)| {
+                    request.facts["session_queue_age_ms"].as_u64().unwrap_or(0)
+                });
+            if let Some((request_index, request)) = victim {
+                let target = ctx.targets[destination].target_id.as_str();
+                let action = host.rebalance_request(
+                    request.request.request_id.as_str(),
+                    target,
+                    &format!(
+                        "saga-steal-{}-{request_index}",
+                        ctx.meta.opportunity_id.as_str()
+                    ),
+                )?;
+                state.shared["saga_actions"][&action.0.to_string()] = json!({
+                    "session_id": saga_session(&request.request, &request.facts),
+                    "target_id": target
+                });
+            }
+        }
         for (request_index, request) in ctx.requests.iter().enumerate() {
-            let selected = ctx
+            let candidates = ctx
                 .feasible_edges
                 .iter()
                 .enumerate()
                 .filter(|(_, edge)| {
-                    edge.request_index as usize == request_index
-                        && target_counts[edge.target_index as usize]
-                            < ctx.targets[edge.target_index as usize].max_assignments
+                    edge.request_index as usize == request_index && capacity.can_assign(ctx, edge)
                 })
-                .max_by_key(|(_, edge)| {
-                    (
-                        edge.facts["cache_locality"].as_u64().unwrap_or(0),
-                        Reverse(edge.facts["load"].as_u64().unwrap_or(u64::MAX)),
-                    )
-                });
+                .collect::<Vec<_>>();
+            let session = saga_session(&request.request, &request.facts);
+            let affinity_target = state.shared["saga_affinity"][&session]
+                .as_str()
+                .or_else(|| request.facts["affinity_target_id"].as_str());
+            let affinity = affinity_target.and_then(|target_id| {
+                candidates.iter().copied().find(|(_, edge)| {
+                    ctx.targets[edge.target_index as usize].target_id.as_str() == target_id
+                        && edge.facts["cached"].as_bool().unwrap_or_else(|| {
+                            edge.facts["cache_locality"].as_u64().unwrap_or(0) > 0
+                        })
+                        && edge.facts["load_ppm"].as_u64().unwrap_or(u64::MAX)
+                            < request.facts["affinity_load_threshold_ppm"]
+                                .as_u64()
+                                .unwrap_or(800_000)
+                })
+            });
+            let selected = affinity.or_else(|| {
+                candidates.iter().copied().min_by_key(|(edge_index, edge)| {
+                    (edge.facts["load"].as_u64().unwrap_or(u64::MAX), *edge_index)
+                })
+            });
             if let Some((index, edge)) = selected {
-                target_counts[edge.target_index as usize] += 1;
-                if request.facts["steal"].as_bool() == Some(true) {
-                    host.rebalance_request(
-                        request.request.request_id.as_str(),
-                        ctx.targets[edge.target_index as usize].target_id.as_str(),
-                        &format!("saga-{request_index}"),
-                    )?;
-                }
+                capacity.assign(ctx, edge);
+                pending_assignments.push(json!({
+                    "request_index": request_index,
+                    "session_id": session,
+                    "target_id": ctx.targets[edge.target_index as usize].target_id.as_str()
+                }));
                 decisions.push(RouteDecision::Assign(index as u32));
             } else {
                 decisions.push(RouteDecision::Defer);
             }
         }
+        state.shared["saga_route_pending"][ctx.meta.opportunity_id.as_str()] =
+            json!(pending_assignments);
+        trim_dlpm_pending(state, "saga_route_pending");
         Ok(RoutePlan { decisions })
     }
 
@@ -2989,54 +3527,350 @@ impl Policy for Saga {
         state: &mut State,
         _host: &Host,
     ) -> plex::Result<SchedulePlan> {
-        let mut order = (0..ctx.runnable.len()).collect::<Vec<_>>();
-        order.sort_by_key(|&index| {
-            let candidate = &ctx.runnable[index];
+        let mut tenant_afs = BTreeMap::<String, u64>::new();
+        for candidate in &ctx.runnable {
+            let tenant = candidate.facts["tenant_id"]
+                .as_str()
+                .unwrap_or(candidate.request.principal_id.as_str());
             let group = candidate
                 .request
                 .group_id
                 .as_ref()
                 .and_then(|group_id| state.group(group_id.as_str()).ok());
-            candidate.facts["group_service"]
+            let remaining = candidate.facts["remaining_work_ms"]
                 .as_u64()
-                .or_else(|| group.and_then(|group| group.facts()["service"].as_u64()))
-                .or_else(|| group.and_then(|group| group.scratch["service"].as_u64()))
+                .or_else(|| group.and_then(|group| group.scratch["remaining_work_ms"].as_u64()))
+                .unwrap_or(0);
+            let now = candidate.facts["now_ms"].as_u64().unwrap_or(0);
+            let slack = candidate.facts["deadline_ms"]
+                .as_u64()
+                .unwrap_or(u64::MAX)
+                .saturating_sub(now)
+                .max(1);
+            let urgency = u128::from(remaining)
+                .saturating_mul(1_000_000)
+                .checked_div(u128::from(slack))
                 .unwrap_or(0)
+                .min(u128::from(u64::MAX)) as u64;
+            tenant_afs
+                .entry(tenant.to_owned())
+                .and_modify(|score| *score = score.saturating_add(urgency))
+                .or_insert(urgency);
+        }
+        let mut order = (0..ctx.runnable.len()).collect::<Vec<_>>();
+        order.sort_by_key(|index| {
+            let candidate = &ctx.runnable[*index];
+            let tenant = candidate.facts["tenant_id"]
+                .as_str()
+                .unwrap_or(candidate.request.principal_id.as_str());
+            (
+                Reverse(tenant_afs[tenant]),
+                candidate.facts["arrival_seq"]
+                    .as_u64()
+                    .unwrap_or(*index as u64),
+            )
         });
-        Ok(select_singletons(ctx, order))
+        let total_afs = tenant_afs
+            .values()
+            .copied()
+            .fold(0u64, u64::saturating_add)
+            .max(1);
+        let mut remaining_selections = ctx.capacity.max_selections;
+        let mut remaining_requests = ctx.capacity.max_requests;
+        let mut remaining_tokens = ctx.capacity.max_total_tokens;
+        let mut selections = Vec::new();
+        for index in order {
+            if remaining_selections == 0 || remaining_requests == 0 || remaining_tokens == 0 {
+                break;
+            }
+            let candidate = &ctx.runnable[index];
+            let tenant = candidate.facts["tenant_id"]
+                .as_str()
+                .unwrap_or(candidate.request.principal_id.as_str());
+            let proportional = u128::from(ctx.capacity.max_total_tokens)
+                .saturating_mul(u128::from(tenant_afs[tenant]))
+                .checked_div(u128::from(total_afs))
+                .unwrap_or(0)
+                .max(1)
+                .min(u128::from(u32::MAX)) as u32;
+            let budget = u64::from(candidate.max_token_budget)
+                .min(u64::from(proportional))
+                .min(remaining_tokens) as u32;
+            if budget == 0 {
+                continue;
+            }
+            selections.push(ScheduleSelection {
+                requests: vec![index as u32],
+                token_budgets: vec![budget],
+            });
+            remaining_selections -= 1;
+            remaining_requests -= 1;
+            remaining_tokens -= u64::from(budget);
+        }
+        Ok(SchedulePlan { selections })
     }
 
-    fn cache(ctx: &CacheContext, _state: &mut State, _host: &Host) -> plex::Result<CachePlan> {
+    fn cache(ctx: &CacheContext, state: &mut State, _host: &Host) -> plex::Result<CachePlan> {
+        let now_ms = ctx.capacity.facts["now_ms"].as_u64().unwrap_or(0);
+        let pressure_ppm = saga_pressure(&ctx.capacity.facts);
         let admissions = ctx
             .prospective
             .iter()
             .map(|object| {
-                if object.facts["workflow_ttl_ms"].as_u64().unwrap_or(0) > 0 {
+                let ttl = saga_ttl(object, pressure_ppm);
+                state.shared["saga_ttl"][object.object_id.as_str()] = json!({
+                    "ttl_ms": ttl,
+                    "expires_at_ms": now_ms.saturating_add(ttl)
+                });
+                if ttl > 0 {
                     CacheAdmission::Cache
                 } else {
                     CacheAdmission::Bypass
                 }
             })
             .collect::<Vec<_>>();
+        let required = cache_required(ctx, &admissions);
+        let max_idle = ctx
+            .resident
+            .iter()
+            .filter_map(|resident| {
+                resident.object.facts["last_access_ms"]
+                    .as_u64()
+                    .map(|last| now_ms.saturating_sub(last))
+            })
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let max_size = ctx
+            .resident
+            .iter()
+            .map(|resident| resident.object.size_bytes)
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let mut ordered = ctx
+            .resident
+            .iter()
+            .enumerate()
+            .filter(|(_, resident)| resident.reclaimable)
+            .map(|(index, resident)| {
+                let expired =
+                    state.shared["saga_ttl"][resident.object.object_id.as_str()]["expires_at_ms"]
+                        .as_u64()
+                        .or_else(|| resident.object.facts["expires_at_ms"].as_u64())
+                        .is_some_and(|expires| expires < now_ms);
+                (
+                    !expired,
+                    Reverse(saga_evict_score(
+                        &resident.object,
+                        now_ms,
+                        max_idle,
+                        max_size,
+                    )),
+                    index as u32,
+                )
+            })
+            .collect::<Vec<_>>();
+        ordered.sort_by_key(|entry| *entry);
         Ok(CachePlan {
-            reclaim: reclaim_prefix(
+            reclaim: reclaim_by_required(
                 ctx,
-                &admissions,
-                ctx.resident
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, resident)| {
-                        resident.reclaimable
-                            && resident.object.facts["workflow_ttl_ms"]
-                                .as_u64()
-                                .unwrap_or(0)
-                                == 0
-                    })
-                    .map(|(index, _)| index as u32),
+                required,
+                ordered.into_iter().map(|(_, _, index)| index),
             ),
             admissions,
         })
     }
+
+    fn feedback(ctx: &FeedbackContext, state: &mut State, _host: &Host) -> plex::Result<()> {
+        for record in &ctx.records {
+            match &record.subject {
+                FeedbackSubject::Action(action_id)
+                    if matches!(
+                        record.outcome,
+                        OutcomeKind::ActionSucceeded | OutcomeKind::ActionFailed
+                    ) =>
+                {
+                    let key = action_id.0.to_string();
+                    let action = state.shared["saga_actions"][&key].clone();
+                    if record.outcome == OutcomeKind::ActionSucceeded
+                        && let (Some(session), Some(target)) =
+                            (action["session_id"].as_str(), action["target_id"].as_str())
+                    {
+                        state.shared["saga_affinity"][session] = json!(target);
+                    }
+                    if let Some(actions) = state.shared["saga_actions"].as_object_mut() {
+                        actions.remove(&key);
+                    }
+                }
+                FeedbackSubject::RouteAssignment(subject)
+                    if record.outcome == OutcomeKind::Progress =>
+                {
+                    let opportunity = subject.opportunity_id.as_str();
+                    let request_index = u64::from(subject.request_index);
+                    let assignment = state.shared["saga_route_pending"][opportunity]
+                        .as_array()
+                        .and_then(|entries| {
+                            entries.iter().find(|entry| {
+                                entry["request_index"].as_u64() == Some(request_index)
+                            })
+                        })
+                        .cloned();
+                    if record.facts["status"].as_str() != Some("not-enacted")
+                        && let Some(assignment) = assignment
+                        && let (Some(session), Some(target)) = (
+                            assignment["session_id"].as_str(),
+                            assignment["target_id"].as_str(),
+                        )
+                    {
+                        state.shared["saga_affinity"][session] = json!(target);
+                    }
+                    remove_dlpm_pending(
+                        state,
+                        "saga_route_pending",
+                        opportunity,
+                        "request_index",
+                        request_index,
+                    );
+                }
+                FeedbackSubject::Request(request_id) if record.outcome == OutcomeKind::Progress => {
+                    if let Some(completed) = record.facts["work_completed_ms"].as_u64() {
+                        let group_id = state
+                            .request(request_id.as_str())?
+                            .reference()
+                            .group_id
+                            .clone();
+                        if let Some(group_id) = group_id {
+                            let group = state.group_mut(group_id.as_str())?;
+                            group.scratch["remaining_work_ms"] = json!(
+                                group.scratch["remaining_work_ms"]
+                                    .as_u64()
+                                    .unwrap_or(0)
+                                    .saturating_sub(completed)
+                            );
+                        }
+                    }
+                }
+                FeedbackSubject::CacheObject(object_id) => {
+                    if let (Some(tool), Some(duration)) = (
+                        record.facts["tool_id"].as_str(),
+                        record.facts["tool_duration_ms"].as_u64(),
+                    ) {
+                        append_saga_history(state, tool, duration);
+                    }
+                    if let Some(expires) = record.facts["expires_at_ms"].as_u64() {
+                        state.shared["saga_ttl"][object_id.as_str()]["expires_at_ms"] =
+                            json!(expires);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+fn saga_session(request: &plex::RequestRef, facts: &plex::Document) -> String {
+    facts["session_id"]
+        .as_str()
+        .map(str::to_owned)
+        .or_else(|| {
+            request
+                .group_id
+                .as_ref()
+                .map(|group| group.as_str().to_owned())
+        })
+        .unwrap_or_else(|| request.request_id.as_str().to_owned())
+}
+
+fn saga_pressure(facts: &plex::Document) -> u64 {
+    let used = facts["used_kv_ppm"].as_u64().unwrap_or(0);
+    if used <= 700_000 {
+        0
+    } else {
+        used.saturating_sub(700_000)
+            .saturating_mul(1_000_000)
+            .checked_div(200_000)
+            .unwrap_or(0)
+            .min(1_000_000)
+    }
+}
+
+fn saga_ttl(object: &plex::CacheObject, pressure_ppm: u64) -> u64 {
+    let mut samples = object.facts["tool_latency_samples_ms"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|sample| sample.as_u64())
+        .collect::<Vec<_>>();
+    let base = if samples.is_empty() {
+        object.facts["workflow_ttl_ms"].as_u64().unwrap_or(0)
+    } else {
+        samples.sort_unstable();
+        let percentile = object.facts["ttl_percentile_ppm"]
+            .as_u64()
+            .unwrap_or(950_000)
+            .min(1_000_000);
+        let index = ((samples.len() - 1) as u128)
+            .saturating_mul(u128::from(percentile))
+            .checked_div(1_000_000)
+            .unwrap_or(0) as usize;
+        samples[index]
+    };
+    let factor = 1_000_000u64.saturating_sub(pressure_ppm / 2);
+    base.saturating_mul(factor)
+        .checked_div(1_000_000)
+        .unwrap_or(0)
+        .min(300_000)
+}
+
+fn saga_evict_score(object: &plex::CacheObject, now_ms: u64, max_idle: u64, max_size: u64) -> u64 {
+    let recency = now_ms
+        .saturating_sub(object.facts["last_access_ms"].as_u64().unwrap_or(now_ms))
+        .saturating_mul(1_000_000)
+        / max_idle;
+    let reuse = object.facts["reuse_probability_ppm"]
+        .as_u64()
+        .or_else(|| {
+            object.facts["transitions"].as_array().map(|transitions| {
+                transitions.iter().fold(0u64, |sum, transition| {
+                    sum.saturating_add(
+                        transition["probability_ppm"]
+                            .as_u64()
+                            .unwrap_or(0)
+                            .saturating_mul(transition["overlap_ppm"].as_u64().unwrap_or(0))
+                            / 1_000_000,
+                    )
+                })
+            })
+        })
+        .unwrap_or(0)
+        .min(1_000_000);
+    let size = object.size_bytes.saturating_mul(1_000_000) / max_size;
+    let alpha = object.facts["recency_weight_ppm"]
+        .as_u64()
+        .unwrap_or(300_000);
+    let beta = object.facts["reuse_weight_ppm"].as_u64().unwrap_or(500_000);
+    let gamma = object.facts["size_weight_ppm"].as_u64().unwrap_or(200_000);
+    alpha
+        .saturating_mul(recency)
+        .saturating_add(beta.saturating_mul(1_000_000 - reuse))
+        .saturating_add(gamma.saturating_mul(size))
+        / 1_000_000
+}
+
+fn append_saga_history(state: &mut State, tool: &str, duration: u64) {
+    let mut samples = state.shared["saga_tool_history"][tool]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|sample| sample.as_u64())
+        .collect::<Vec<_>>();
+    samples.push(duration);
+    if samples.len() > 512 {
+        samples.drain(..samples.len() - 512);
+    }
+    state.shared["saga_tool_history"][tool] = json!(samples);
 }
 
 pub struct RouteBalance;
@@ -3292,12 +4126,6 @@ fn select_singletons(ctx: &ScheduleContext, order: Vec<usize>) -> SchedulePlan {
         remaining_tokens -= u64::from(budget);
     }
     SchedulePlan { selections }
-}
-
-fn value(object: &plex::CacheObject) -> u64 {
-    let reuse = object.facts["reuse_probability_ppm"].as_u64().unwrap_or(0);
-    let flops = object.facts["recompute_flops"].as_u64().unwrap_or(0);
-    reuse.saturating_mul(flops) / object.size_bytes.max(1)
 }
 
 fn count_feedback(state: &mut State, key: &str, records: usize) {

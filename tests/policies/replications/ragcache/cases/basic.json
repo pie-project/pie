@@ -1,1 +1,1 @@
-{"case":"legal-leaf-victim","eligible":[{"id":"A","gdsf":1},{"id":"B","gdsf":20}],"episode":{"iteration":0,"max_iterations":2}}
+{"schema":"plex-paper-oracle@1","cases":[{"id":"frontier-eviction","tree":{"parent":"parent","leaf":"leaf"},"required_nodes":2},{"id":"swap-once","host_copy_exists":false},{"id":"cache-aware-order","ratios":[1,2,0.01],"overdue_index":2}]}

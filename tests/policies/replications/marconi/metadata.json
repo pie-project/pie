@@ -7,11 +7,24 @@
   "source_license": "public artifact available; implementation is independent",
   "component": "plex_paper_marconi",
   "implements": ["cache", "feedback"],
-  "policy_kernel": ["prospective admission", "reuse likelihood times recompute FLOPs per byte"],
-  "required_facts": ["reuse_probability_ppm", "recompute_flops"],
+  "policy_kernel": [
+    "speculative radix admission",
+    "normalized recency plus alpha FLOP-efficiency eviction",
+    "one-child SSM-state reclaim"
+  ],
+  "required_facts": [
+    "state_kind",
+    "reuse_class",
+    "speculative_branch_created",
+    "last_decoded_state",
+    "child_count",
+    "last_access_us",
+    "recompute_flops",
+    "alpha_ppm"
+  ],
   "required_mechanics": [],
   "deferred_mechanics": ["hybrid-model kernel integration"],
   "evidence_level": "inspired-adaptation",
-  "fixture_provenance": "paper formula and public artifact interface",
+  "fixture_provenance": "MLSys 2025 Sections 4.1-4.3 and artifact commit 08016617",
   "validation_status": "passing"
 }

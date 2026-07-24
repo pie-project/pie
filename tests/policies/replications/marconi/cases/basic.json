@@ -1,1 +1,1 @@
-{"case":"prospective-replaces-resident","resident":[{"id":"R","value":1,"bytes":4}],"prospective":[{"id":"P","value":1000,"bytes":4}],"capacity_bytes":4}
+{"schema":"plex-paper-oracle@1","cases":[{"id":"speculative-admission","pure_input_branch":[false,true],"last_decoded_state":true},{"id":"alpha-zero-lru","alpha_ppm":0},{"id":"flop-aware-rescore","alpha_ppm":1000000,"accessed_node_timestamp":30}]}

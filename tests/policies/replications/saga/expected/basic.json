@@ -1,5 +1,1 @@
-{
-  "actions": [
-    "pie.request.rebalance@1"
-  ]
-}
+{"schema":"plex-paper-oracle@1","expectations":[{"case_id":"affinity-and-steal","affinity_target":"worker-a","action":"pie.request.rebalance@1"},{"case_id":"afs","urgent_tenant_first":true},{"case_id":"pressure-ttl","ttl_ms":500}]}

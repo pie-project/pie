@@ -1,4 +1,1 @@
-{
-  "reclaim_order": ["suffix", "fixed"],
-  "invariants": ["varying suffix precedes fixed prefix"]
-}
+{"schema":"plex-paper-oracle@1","expectations":[{"case_id":"node-min-ste","steps_to_execution":2},{"case_id":"varying-suffix-first","victim":"varying"},{"case_id":"prefetch-state-machine","blocked_while_loading":true,"ready_after_action_success":true}]}

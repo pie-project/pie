@@ -15,9 +15,9 @@
   "operation_counts": {
     "admit": 5,
     "cache": 12,
-    "feedback": 16,
+    "feedback": 19,
     "route": 14,
-    "schedule": 21
+    "schedule": 22
   },
   "entries": [
     {
@@ -84,23 +84,32 @@
         "preempted-first priority",
         "TTL-pinned priority",
         "group-level FCFS",
-        "TTL-aware cache retention"
+        "empirical-CDF TTL optimization",
+        "timestamped pin retention and deadlock pin breaking"
       ],
       "required_facts": [
         "preempted",
+        "program_id",
         "program_arrival",
-        "ttl_ms",
-        "ttl_expired",
-        "reload_cost"
+        "now_ms",
+        "next_tool_id",
+        "tool_id",
+        "tool_duration_ms",
+        "average_wait_ms",
+        "memoryfulness_ppm",
+        "prefill_reload_ms",
+        "history_threshold",
+        "default_ttl_ms",
+        "program_resumed",
+        "program_finished"
       ],
       "required_mechanics": [],
       "deferred_mechanics": [
         "tool parser",
-        "offline TTL estimator",
         "physical KV pinning"
       ],
       "evidence_level": "inspired-adaptation",
-      "fixture_provenance": "independent implementation from the paper algorithm",
+      "fixture_provenance": "arXiv 2511.02230 Algorithm 1 and Equations 1-2",
       "validation_status": "passing",
       "fidelity": {
         "classification": "material-semantic-gap",
@@ -120,21 +129,27 @@
       "component": "plex_paper_kvflow",
       "implements": [
         "schedule",
-        "cache"
+        "cache",
+        "feedback"
       ],
       "policy_kernel": [
         "cache-loading-aware scheduling",
         "varying-suffix-first reclaim",
         "steps-to-execution fixed-prefix ordering",
-        "prefetch intent"
+        "prefetch intent with action-feedback transfer state"
       ],
       "required_facts": [
-        "cache_ready",
+        "required_objects",
+        "cache_state",
         "fixed_prefix",
+        "beneficiary_steps",
         "steps_to_execution",
         "loading",
         "offloading",
-        "prefetch"
+        "cpu_backup",
+        "prefetch",
+        "prefetch_horizon_steps",
+        "max_concurrent_prefetches"
       ],
       "required_mechanics": [],
       "optional_mechanics": [
@@ -144,7 +159,7 @@
         "CPU-GPU transfer overlap"
       ],
       "evidence_level": "inspired-adaptation",
-      "fixture_provenance": "independent implementation from the paper algorithm",
+      "fixture_provenance": "arXiv 2507.07400 Section 3 Agent Step Graph and four-state transfer model",
       "validation_status": "passing",
       "fidelity": {
         "classification": "material-semantic-gap",
@@ -404,19 +419,26 @@
         "feedback"
       ],
       "policy_kernel": [
-        "prospective admission",
-        "reuse likelihood times recompute FLOPs per byte"
+        "speculative radix admission",
+        "normalized recency plus alpha FLOP-efficiency eviction",
+        "one-child SSM-state reclaim"
       ],
       "required_facts": [
-        "reuse_probability_ppm",
-        "recompute_flops"
+        "state_kind",
+        "reuse_class",
+        "speculative_branch_created",
+        "last_decoded_state",
+        "child_count",
+        "last_access_us",
+        "recompute_flops",
+        "alpha_ppm"
       ],
       "required_mechanics": [],
       "deferred_mechanics": [
         "hybrid-model kernel integration"
       ],
       "evidence_level": "inspired-adaptation",
-      "fixture_provenance": "paper formula and public artifact interface",
+      "fixture_provenance": "MLSys 2025 Sections 4.1-4.3 and artifact commit 08016617",
       "validation_status": "passing",
       "fidelity": {
         "classification": "incorrect",
@@ -435,23 +457,35 @@
       "source_license": "paper reference; no source copied",
       "component": "plex_paper_ragcache",
       "implements": [
-        "cache"
+        "schedule",
+        "cache",
+        "feedback"
       ],
       "policy_kernel": [
-        "leaf-only reclaim",
-        "prefix-aware GDSF value",
-        "bounded iterative episode"
+        "two-tier PGDSF logical clocks",
+        "iterative leaf-frontier reclaim",
+        "swap-out-only-once",
+        "cache-aware request reordering"
       ],
       "required_facts": [
-        "leaf",
+        "tier",
+        "parent_object_id",
+        "tier_child_count",
         "frequency",
-        "recompute_cost",
-        "age"
+        "total_cost_fp",
+        "num_computed",
+        "average_cost_per_new_token_fp",
+        "host_copy_exists",
+        "cached_length",
+        "computation_length",
+        "starvation_window_ms"
       ],
-      "required_mechanics": [],
+      "required_mechanics": [
+        "cache.swap@1"
+      ],
       "deferred_mechanics": [],
       "evidence_level": "inspired-adaptation",
-      "fixture_provenance": "independent reference model from the paper",
+      "fixture_provenance": "arXiv 2404.12457 Equations 1-3 and Algorithm 1",
       "validation_status": "passing",
       "fidelity": {
         "classification": "material-semantic-gap",
@@ -561,20 +595,28 @@
         "cache"
       ],
       "policy_kernel": [
-        "shared pending-demand state",
-        "cluster-aware demand depth",
-        "fairness lane"
+        "Eq.1 cluster-LPM lane",
+        "EMA dynamic fairness lane with stride interleaving",
+        "Eq.2 ancestor-demand eviction",
+        "no-sharing FCFS guard"
       ],
       "required_facts": [
+        "lpm_hit_tokens",
+        "warm_threshold_tokens",
+        "deprio_prefix_id",
+        "cluster_id",
+        "cluster_size",
+        "ancestor_score",
+        "root_child_pending_count",
+        "arrival_seq",
         "waiting_ms",
-        "fairness_threshold_ms",
-        "demand_depth",
-        "pending_demand_depth"
+        "group_major",
+        "ancestor_demands"
       ],
       "required_mechanics": [],
       "deferred_mechanics": [],
       "evidence_level": "inspired-adaptation",
-      "fixture_provenance": "independent reference model from the paper",
+      "fixture_provenance": "arXiv 2607.02525 Equations 1-2 and Algorithm 2",
       "validation_status": "passing",
       "fidelity": {
         "classification": "material-semantic-gap",
@@ -1238,19 +1280,36 @@
       "implements": [
         "route",
         "schedule",
-        "cache"
+        "cache",
+        "feedback"
       ],
       "policy_kernel": [
-        "workflow TTL",
-        "group fairness",
-        "cache-local work stealing"
+        "Eq.7 session affinity and guarded work stealing",
+        "Eq.1 WA-LRU with pressure-scaled tool TTL",
+        "Eq.8 Agent Fair Share scheduling",
+        "action-feedback affinity commit"
       ],
       "required_facts": [
+        "session_id",
+        "cached",
         "cache_locality",
-        "group_service",
         "load",
-        "steal",
-        "workflow_ttl_ms"
+        "load_ppm",
+        "affinity_load_threshold_ppm",
+        "idle_ms",
+        "steal_idle_ms",
+        "steal_load_ratio_ppm",
+        "source_target_index",
+        "session_queue_age_ms",
+        "stealable",
+        "remaining_work_ms",
+        "deadline_ms",
+        "tenant_id",
+        "tool_latency_samples_ms",
+        "used_kv_ppm",
+        "reuse_probability_ppm",
+        "transitions",
+        "last_access_ms"
       ],
       "required_mechanics": [],
       "optional_mechanics": [
@@ -1260,7 +1319,7 @@
         "physical work stealing"
       ],
       "evidence_level": "inspired-adaptation",
-      "fixture_provenance": "independent reference model from the paper",
+      "fixture_provenance": "arXiv 2605.00528v2 Equations 1, 6-9 and Algorithm 1",
       "validation_status": "passing",
       "fidelity": {
         "classification": "incorrect",
