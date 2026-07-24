@@ -257,11 +257,14 @@ async fn run_one(
     let k = frame_size();
     let tok_in = Channel::new([1], dtype::i32).named("tok_in");
     let g0_ch = Channel::new([1], dtype::i32).named("g0");
-    // Take-side ring ceiling under the unified window discipline: the window
-    // (`submitted - taken`) peaks at k + 1 — a top-up starting at window 1
-    // adds one k-slot frame — so the ring needs exactly k + 1 cells (k = 1
-    // reproduces the classic depth-2 ring).
-    let out_capacity = k + 1;
+    // Take-side ring ceiling under the two-frame window discipline: the
+    // window (`submitted - taken`) peaks at 3k - 1 — a top-up starting at
+    // window 2k - 1 adds one k-slot frame — and every outstanding fire can
+    // settle before the host takes, so the ring needs exactly 3k - 1 cells
+    // (k = 1 reproduces the classic depth-2 ring). Exact peak, no slack:
+    // the discipline bounds unconsumed puts, and a full publish ring is a
+    // terminal FAILURE under v14.
+    let out_capacity = 3 * k - 1;
     let out = Channel::new([1], dtype::i32)
         .capacity(out_capacity as u32)
         .named("out");
@@ -356,16 +359,20 @@ async fn run_one(
     submit_frame(&pipe, &first_slots).map_err(|e| format!("first frame submit: {e}"))?;
     let mut submitted = first_decodes;
 
-    // Unified run-ahead discipline (ONE rule for every k): keep WINDOW_FIRES
-    // decode fires in flight, frame-quantized — submit frames of min(k,
+    // Unified run-ahead discipline (ONE rule for every k): keep TWO FRAMES
+    // of decode fires in flight (2k fires) — submit frames of min(k,
     // remaining) decode slots until the window (submitted minus drained) is
-    // full or the budget is spent, returning the new submitted count. At k = 1
-    // this is exactly the classic depth-2 window (burst two, then one per
-    // drained token); at k > 1 it stages one frame ahead. Decode geometry is
-    // device-carried (`tok_in`), so a successor never waits on a sampled token.
+    // full or the budget is spent, returning the new submitted count. At
+    // k = 1 this is exactly the classic depth-2 window (burst two, then one
+    // per drained token). The window is measured in FRAMES because frames
+    // settle atomically: results arrive only at frame boundaries, so a
+    // fire-count window of 2 would leave ZERO queued frames while a k ≥ 2
+    // frame runs — the pipe drains to a full host round trip per frame.
+    // Decode geometry is device-carried (`tok_in`), so a successor never
+    // waits on a sampled token.
     let submit_ahead = |mut submitted: usize, drained: usize| -> std::result::Result<usize, String> {
-        const WINDOW_FIRES: usize = 2;
-        while submitted < budget && submitted - drained < WINDOW_FIRES {
+        let window_fires = 2 * k;
+        while submitted < budget && submitted - drained < window_fires {
             let s = (budget - submitted).min(k);
             reserve_to_tokens(n + (submitted + s) as u32 + 1)
                 .map_err(|e| format!("reserve decode frame: {e}"))?;

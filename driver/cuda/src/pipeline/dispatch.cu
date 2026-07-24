@@ -1167,6 +1167,9 @@ struct Dispatch::Impl {
     DescriptorReadbackArena descriptor_readback;
     FixedDecodeUploadArena fixed_decode_upload;
     DecodeEnvelopeUploadArena decode_envelope_upload;
+    // Pinned staging for the per-step ticket/pull-lane upload in `begin`
+    // (one claim per step; see PinnedUploadRing).
+    PinnedUploadRing pull_upload_staging;
     std::vector<cudaEvent_t> available_publish_events;
     // W6: per-wave launch events (source_ready, phase_done, signature_*)
     // are acquired here and returned at StagedLaunch teardown — event
@@ -3810,6 +3813,7 @@ std::unique_ptr<StagedLaunch> Dispatch::begin(
     state.device_tickets = launch_pull_validate_host_channels_batch(
         state.ticket_staging,
         state.pull_staging,
+        impl_->pull_upload_staging,
         stream);
     if (begin_timing) {
         launch->begin_breakdown_.pull_validate_us = fire_timing::duration_us(

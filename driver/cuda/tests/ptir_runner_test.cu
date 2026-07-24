@@ -305,6 +305,7 @@ void test_lazy_packed_bool_pull() {
         .wire_bytes = 1,
         .native_bytes = 8,
     };
+    PinnedUploadRing upload_staging;
     auto launch_validation =
         [&](std::vector<DeviceHostChannelTicket> tickets) {
             const std::vector<PullValidateHostChannelLane> lanes{{
@@ -316,7 +317,7 @@ void test_lazy_packed_bool_pull() {
                 .initial_commit = 1,
             }};
             return launch_pull_validate_host_channels_batch(
-                tickets, lanes, nullptr);
+                tickets, lanes, upload_staging, nullptr);
         };
     DeviceHostChannelTicket* uploaded =
         launch_validation({ticket});

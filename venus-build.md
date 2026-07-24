@@ -252,16 +252,52 @@ Metal driver: step-loop internally (same C ABI).
   the fire-timing h2d/pull stalls are likely non-API host waits (pinned
   slot event syncs measured under cudaEventSynchronize at k=1 too) —
   STOP microhunting; the fix is structural (below).
-- TODO (the ONE remaining performance work item): compose split / frame
-  prepare hoisting for decode steps — at frame entry, stage ALL steps'
-  lane tables/tickets/fixed-decode params before step 1 enqueues (there
-  is nothing to wait on then), making per-step enqueue kernel-launch-only.
-  By construction removes whatever step i+1's begin currently waits on.
-  Then: M2 apparatus deletion in dispatch.cu (engine callers already
-  gone), S3 kill-bit reclassification (kills → FAILED at settle),
-  prefill-capture lever deletion, elastic map↔unmap oscillation cleanup,
-  venus-diag removal from worker.rs, final cert (all k, fleets,
-  long-tail, oracle sweep), docs, final commit.
+- k>1 ROUND 2 (staging-ring fixes; oracle k∈{1,2,3} token-EXACT after):
+  code-level trace of the per-step submit path found two structural
+  host-block candidates and fixed both on principle (every per-step
+  staging pool sizes from runahead.hpp):
+  - AttentionWorkspace plan staging had TWO slots (attention_workspace)
+    — at k=2 with 6 steps in flight, `begin_plan_update`'s
+    cudaEventSynchronize waits ~4 GPU steps EVERY step. Ringed to
+    kUploadStagingDepth (slot 0 eager for non-rotating users like the
+    VL vision adapter; the rest pin lazily on first rotation).
+    MEASURED: k=2 `h2d_prepare` Σ316ms → Σ32ms (= k=1's 36ms). CONFIRMED
+    as that leg's cause.
+  - `begin`'s ticket/pull-lane upload was cudaMemcpyAsync from PAGEABLE
+    std::vectors + 2×cudaMallocAsync per step → new PinnedUploadRing
+    (channels.hpp, 13 pinned slots) + ONE [tickets][lanes] blob and one
+    H2D per step (blob doubles as the launch's device ticket array;
+    settle frees it). NOTE: `begin_pull_validate` still reads ~0.8-1.1ms
+    per submit at BOTH k after this (was Σ40ms k1 / Σ180ms k2, now
+    Σ141/Σ188 over ~170 submits with ft on) — no longer a k
+    differentiator; possible ft-perturbation artifact, worth a clean
+    look during final cleanup.
+  - Throughput did NOT move: k=1 35.07k, k=2 28.1-28.3k, k=3 28.5k. So
+    the host legs were real but not the k bottleneck.
+- k>1 ROOT CAUSE FOUND (guest-side, not driver): the bench inferlet's
+  unified run-ahead window was `WINDOW_FIRES = 2` FIRES. Venus frames
+  settle ATOMICALLY (P4), so results arrive only at frame boundaries:
+  at k=2 the guest's 2-fire window is exactly one frame — ZERO queued
+  frames while a frame runs; every frame pays a full settle→take→
+  submit→seal→post round trip. Quantitatively consistent: k=2 28k ≈
+  k=1@depth-1 26.7k (both are pipeline-less), and the old
+  PIE_SCHED_MAX_IN_FLIGHT=1 probe (27.5k ≈ default 28k) is explained —
+  k=2 was ALREADY effectively depth-1. Pre-Venus k=2 (34.7k) survived
+  because per-wave settlement returned results mid-frame.
+  FIX (inferlet): window measured in FRAMES — keep TWO FRAMES in
+  flight, `window_fires = 2k` (k=1 reproduces the classic depth-2
+  exactly); `out` ring capacity k+1 → 3k (window peaks at 3k-1 and a
+  full publish ring is a terminal FAILURE under v14, so slack one).
+  The venus-project.md arrival contract must say "guest window ≥ 2
+  FRAMES", not "≥ 2".
+- TODO next: (a) if round-3 cert shows k≥2 ≥ k=1, the compose-split /
+  frame-prepare-hoisting driver refactor is NOT needed for the perf
+  goal — drop it from the plan and record why; (b) M2 apparatus
+  deletion in dispatch.cu (engine callers already gone), S3 kill-bit
+  reclassification (kills → FAILED at settle), prefill-capture lever
+  deletion, elastic map↔unmap oscillation cleanup, venus-diag removal
+  from worker.rs, final cert (all k, fleets, long-tail, oracle sweep),
+  docs (arrival contract wording), final commit.
 
 ## Done so far
 
