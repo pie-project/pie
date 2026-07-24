@@ -154,14 +154,21 @@ JSON *string* state over Qwen3 allows **146,924 of 151,669 tokens**, needing
 `BLOCK_SIZE` 262,144 — the kernel raises rather than runs. The density sweep
 already shows CSR losing to dense/bitset beyond ~8,192 allowed tokens.
 
+**Status.** The 32,768 cap is now removed: `ragged_sampler.py` streams a row in
+tiles, so rows of any width are correct (verified at 147,144). But streaming is
+**not** a solution — measured, a wide row costs 6.2 ms at batch 1 and 46.7 ms at
+batch 2,048 against 0.27 ms / 13.0 ms for unconstrained FlashInfer, because each
+of the 32 bisection probes re-gathers the row through its index list. Correct
+and unusably slow.
+
 *Why hard, and why it is the most promising contribution:* real grammar states
-are bimodal — either a handful of allowed tokens (structural positions: 731
-tokens) or almost the entire vocabulary (string bodies: 146,924). A single
-representation cannot serve both. The elegant answer is a **mask algebra** whose
-cost is O(exceptions) rather than O(allowed) — complement/negative sets,
-interval or run-length encoding over sorted token IDs, hierarchical bitsets —
-with per-state representation selection and automatic kernel routing, proven
-equivalent across representations.
+are bimodal — either a handful of allowed tokens (structural positions: 396–759
+tokens) or almost the entire vocabulary (string bodies: 147,144). A single
+representation cannot serve both. The narrow half is now solved by gathering the
+row; the wide half needs the dual: a **per-state complement** (4,525 exceptions,
+18.5 KiB as a bitset) consumed by one contiguous O(V) pass, with the threshold
+found from a single-pass histogram instead of repeated global probes. Cost then
+becomes the unconstrained sampler's cost plus about 6% of extra traffic.
 
 ### C4. Table memory under heterogeneous continuous batching
 
@@ -240,6 +247,28 @@ per-row persistent kernel, or a two-tier design that routes narrow rows to a
 gathered sampler and wide rows to a complement-masked full-width sampler. This
 is the concrete engineering-and-algorithms problem that makes Example 1 real
 instead of anecdotal.
+
+**Status.** Implemented in `src/gpu_lr1/ragged_sampler.py` and verified by
+`tests/test_ragged_sampler.py` (11 tests, exact against a sorted reference).
+Bucketing is sync-free: both bucket kernels launch over the same grid and each
+program returns immediately if its row belongs to the other bucket, so the hot
+path has no host round trip and stays CUDA-graph capturable. Removing the two
+`.item()` syncs that the first version hid in the dispatcher cut narrow-row
+sampling from 355 µs to **86 µs**, flat from batch 1 through 512.
+
+Measured on A100 with Qwen3 and XGrammar's builtin JSON grammar (median wall,
+`results/a100-ragged-sampler.json`):
+
+| batch | narrow: gpugrammar | FlashInfer unconstrained | XGrammar full path | speedup vs unconstrained |
+|---:|---:|---:|---:|---:|
+| 1 | 86.4 µs | 282.2 µs | 963.2 µs | 3.3× |
+| 128 | 85.5 µs | 1,071.8 µs | 6,018.7 µs | 12.5× |
+| 512 | 86.0 µs | 3,433.9 µs | 10,030.0 µs | 39.9× |
+| 2,048 | 155.4 µs | 13,004.8 µs | 29,480.6 µs | **83.7×** |
+
+The remaining gap is the wide bucket: mixed batches still run at 0.1–0.5× of
+unconstrained because the streaming path dominates. C10 is therefore only half
+retired, and the wide half is now the critical path (see C3).
 
 ## Decision 1: API surface for release
 
