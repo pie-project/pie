@@ -8,14 +8,27 @@
   "component": "plex_paper_agentix",
   "implements": ["schedule", "feedback"],
   "policy_kernel": [
-    "group-level least attained service",
-    "waiting-to-service anti-starvation",
-    "feedback-maintained group service"
+    "PLAS queue-band scheduling",
+    "ATLAS critical-path priority",
+    "quantum demotion and starvation promotion"
   ],
-  "required_facts": ["waiting_ms", "service_us"],
+  "required_facts": [
+    "agentix_mode",
+    "waiting_ms",
+    "program_wait_us",
+    "program_wait_ms",
+    "call_wait_us",
+    "call_wait_ms",
+    "call_arrival",
+    "critical_path_service_us",
+    "queue_bounds_us",
+    "queue_quanta_us",
+    "starvation_ratio_ppm",
+    "service_us"
+  ],
   "required_mechanics": [],
-  "deferred_mechanics": ["KV swap kernel", "multi-step engine execution", "full ATLAS DAG runtime"],
+  "deferred_mechanics": ["KV swap kernel", "multi-step engine execution"],
   "evidence_level": "inspired-adaptation",
-  "fixture_provenance": "independent implementation from the paper algorithm",
+  "fixture_provenance": "NSDI 2026 Algorithm 1, Equations 1-2, and anti-starvation rule",
   "validation_status": "passing"
 }

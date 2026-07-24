@@ -204,6 +204,7 @@ do
             ;;
         plex_paper_justitia)
             operations=schedule,feedback
+            optional=schedule.atomic-enqueue@1
             ;;
         plex_paper_chameleon)
             operations=admit,schedule,cache

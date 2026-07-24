@@ -1,1 +1,21 @@
-{"accepted_client_ids":["B"],"invariants":["weighted service controls admission"]}
+{
+  "schema": "plex-paper-oracle@1",
+  "expectations": [
+    {
+      "case_id": "oit-window-and-interaction",
+      "decisions": ["accept", "accept", "defer", "accept"]
+    },
+    {
+      "case_id": "wsc-user-isolation",
+      "selected_user_id": "user-b"
+    },
+    {
+      "case_id": "wsc-stage-normalization",
+      "normalized_service": {
+        "user-c": 500000,
+        "user-d": 1000000
+      },
+      "selected_user_id": "user-c"
+    }
+  ]
+}

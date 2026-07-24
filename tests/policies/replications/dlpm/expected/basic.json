@@ -1,6 +1,19 @@
 {
-  "invariants": [
-    "positive deficit permits locality preference",
-    "negative deficit cannot dominate fairness"
+  "schema": "plex-paper-oracle@1",
+  "expectations": [
+    {
+      "case_id": "distinct-client-refill",
+      "deficit_after_refill": {"client-a": 4, "client-b": 4},
+      "selected_request_ids": ["A1", "A2", "B1"]
+    },
+    {
+      "case_id": "feedback-only-service",
+      "deficit_after_feedback": {"client-a": 1, "client-b": 2}
+    },
+    {
+      "case_id": "d2lpm-longest-prefix-set",
+      "first_worker": "worker-y",
+      "fallback_worker_when_longest_matches_have_no_credit": "worker-z"
+    }
   ]
 }

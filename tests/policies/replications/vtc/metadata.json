@@ -10,18 +10,24 @@
   "policy_kernel": [
     "per-client virtual-token counters",
     "returning-client counter lift",
-    "dispatch input and decode output charging"
+    "per-client FIFO admission",
+    "enactment-safe dispatch input and decode output charging"
   ],
   "required_facts": [
     "client_id",
+    "client_became_active",
+    "queue_member",
     "dispatch_input_tokens",
     "input_weight",
+    "input_price",
     "output_tokens",
-    "output_weight"
+    "output_weight",
+    "output_price",
+    "fair_weight_ppm"
   ],
   "required_mechanics": [],
   "deferred_mechanics": [],
   "evidence_level": "inspired-adaptation",
-  "fixture_provenance": "paper formula and public artifact interface",
+  "fixture_provenance": "OSDI 2024 Algorithm 2 and VTC artifact commit 192c2e",
   "validation_status": "passing"
 }

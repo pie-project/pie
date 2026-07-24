@@ -11,17 +11,27 @@
     "feedback"
   ],
   "policy_kernel": [
-    "group completion-order fairness",
-    "feedback-maintained branch completion"
+    "memory-centric KV token-time cost",
+    "GPS virtual-time and immutable finish tags",
+    "selected-agent ready-branch pampering"
   ],
   "required_facts": [
-    "completed_branches"
+    "ready",
+    "now_us",
+    "total_kv_tokens",
+    "predicted_agent_kv_token_time",
+    "predicted_input_tokens",
+    "predicted_output_tokens",
+    "kv_token_time_delta",
+    "agent_completed"
   ],
-  "required_mechanics": [],
+  "required_mechanics": [
+    "schedule.atomic-enqueue@1"
+  ],
   "deferred_mechanics": [
     "simultaneous branch execution"
   ],
   "evidence_level": "inspired-adaptation",
-  "fixture_provenance": "independent reference model from the paper",
+  "fixture_provenance": "arXiv 2510.17015v2 Equations 1-3",
   "validation_status": "passing"
 }

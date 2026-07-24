@@ -1,4 +1,26 @@
 {
-  "selected_request_ids": ["B"],
-  "invariants": ["one request selected", "starved lower-service group wins"]
+  "schema": "plex-paper-oracle@1",
+  "expectations": [
+    {
+      "case_id": "quantum-demotion",
+      "queue_level": 1,
+      "remaining_quantum_us": 1500
+    },
+    {
+      "case_id": "starvation-promotion",
+      "queue_level": 0,
+      "remaining_quantum_us": 1000,
+      "model_time_us": 0,
+      "wait_reset_us": 10000
+    },
+    {
+      "case_id": "plas-sequential",
+      "program_service_us": 1000
+    },
+    {
+      "case_id": "atlas-fork-join",
+      "observed_critical_path_us": 300,
+      "selected_join_group": "forked-program"
+    }
+  ]
 }

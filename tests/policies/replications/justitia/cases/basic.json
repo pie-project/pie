@@ -1,13 +1,32 @@
 {
-  "case": "completion-order-fairness",
-  "groups": [
+  "schema": "plex-paper-oracle@1",
+  "cases": [
     {
-      "id": "G1",
-      "completed": 0
+      "id": "gps-finish-order",
+      "now_us": 0,
+      "total_kv_tokens": 100,
+      "agents": [
+        {"group_id": "GA", "predicted_kv_token_time": 100, "ready_branches": 1},
+        {"group_id": "GB", "predicted_kv_token_time": 50, "ready_branches": 2}
+      ]
     },
     {
-      "id": "G2",
-      "completed": 2
+      "id": "immutable-finish-tag",
+      "initial_cost": 50,
+      "later_prediction": 1000
+    },
+    {
+      "id": "active-set-virtual-time",
+      "intervals": [
+        {"start_us": 0, "end_us": 10, "active_agents": 2},
+        {"start_us": 10, "end_us": 20, "active_agents": 1}
+      ],
+      "total_kv_tokens": 100
+    },
+    {
+      "id": "memory-cost-equation",
+      "predicted_input_tokens": 10,
+      "predicted_output_tokens": 4
     }
   ]
 }

@@ -1,9 +1,28 @@
 {
-  "case": "group-service-order",
-  "operation": "schedule",
-  "requests": [
-    {"request_id": "A", "group_id": "G1", "waiting_ms": 10, "group_service_us": 100},
-    {"request_id": "B", "group_id": "G2", "waiting_ms": 500, "group_service_us": 10}
-  ],
-  "capacity": {"max_requests": 1, "max_total_tokens": 4}
+  "schema": "plex-paper-oracle@1",
+  "cases": [
+    {
+      "id": "quantum-demotion",
+      "queue_bounds_us": [1000, 3000],
+      "queue_quanta_us": [1000, 2000, 4000],
+      "service_us": 1500
+    },
+    {
+      "id": "starvation-promotion",
+      "program_service_us": 0,
+      "call_model_time_us": 1500,
+      "call_wait_us": 10000,
+      "starvation_ratio_ppm": 4000000
+    },
+    {
+      "id": "plas-sequential",
+      "completed_call_service_us": [800, 200]
+    },
+    {
+      "id": "atlas-fork-join",
+      "fork_service_us": [300, 100],
+      "competing_critical_path_us": 500,
+      "queue_bounds_us": [400]
+    }
+  ]
 }

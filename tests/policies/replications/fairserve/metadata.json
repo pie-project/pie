@@ -8,24 +8,37 @@
   "component": "plex_paper_fairserve",
   "implements": ["admit", "schedule", "feedback"],
   "policy_kernel": [
-    "overload-aware interaction throttling",
-    "application-stage weighted service accounting"
+    "windowed overload-aware interaction throttling",
+    "user-scoped application-stage weighted service accounting",
+    "in-progress interaction preservation"
   ],
   "required_facts": [
+    "user_id",
     "client_id",
     "application_id",
-    "weight",
+    "stage_id",
     "kv_overloaded",
     "interaction_in_progress",
+    "now_ms",
+    "rpm_window_ms",
+    "user_rpm_limit",
+    "app_rpm_limit",
     "user_rpm_remaining",
     "app_rpm_remaining",
     "input_tokens",
     "system_tokens",
-    "output_tokens"
+    "output_tokens",
+    "expected_input_tokens",
+    "expected_system_tokens",
+    "expected_output_tokens",
+    "input_weight",
+    "system_weight",
+    "output_weight",
+    "user_priority_ppm"
   ],
   "required_mechanics": [],
   "deferred_mechanics": ["production interaction and RPM estimator"],
   "evidence_level": "inspired-adaptation",
-  "fixture_provenance": "independent reference model from the paper",
+  "fixture_provenance": "arXiv 2411.15997 Algorithm 1 and Equations 2-3",
   "validation_status": "passing"
 }

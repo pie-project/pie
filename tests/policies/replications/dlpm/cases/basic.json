@@ -1,13 +1,28 @@
 {
-  "case": "credit-gated-locality",
-  "clients": [
+  "schema": "plex-paper-oracle@1",
+  "cases": [
     {
-      "id": "A",
-      "deficit": 4
+      "id": "distinct-client-refill",
+      "client_quantum": 4,
+      "requests": [
+        {"request_id": "A1", "client_id": "client-a", "extend_tokens": 3},
+        {"request_id": "A2", "client_id": "client-a", "extend_tokens": 3},
+        {"request_id": "B1", "client_id": "client-b", "extend_tokens": 3}
+      ]
     },
     {
-      "id": "B",
-      "deficit": -2
+      "id": "feedback-only-service",
+      "selection_status": ["enacted", "not-enacted", "partially-enacted"],
+      "scheduled_tokens": [3, 0, 2]
+    },
+    {
+      "id": "d2lpm-longest-prefix-set",
+      "worker_quantum": 10,
+      "workers": [
+        {"worker": "worker-x", "longest_match": true, "queue_size": 5},
+        {"worker": "worker-y", "longest_match": true, "queue_size": 1},
+        {"worker": "worker-z", "longest_match": false, "queue_size": 0}
+      ]
     }
   ]
 }

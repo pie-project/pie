@@ -1,1 +1,42 @@
-{"case":"lower-counter-first","clients":[{"id":"A","counter":20},{"id":"B","counter":4}],"capacity":{"max_requests":1}}
+{
+  "schema": "plex-paper-oracle@1",
+  "cases": [
+    {
+      "id": "returning-client-lift-and-fifo",
+      "initial_counters": {
+        "client-a": 10000000,
+        "client-c": 30000000
+      },
+      "queue": [
+        {"request_id": "A1", "client_id": "client-a", "input_tokens": 1},
+        {"request_id": "A2", "client_id": "client-a", "input_tokens": 0},
+        {
+          "request_id": "B1",
+          "client_id": "client-b",
+          "input_tokens": 3,
+          "client_became_active": true
+        },
+        {"request_id": "C1", "client_id": "client-c", "input_tokens": 0}
+      ],
+      "capacity": {"max_selections": 3, "max_total_tokens": 3}
+    },
+    {
+      "id": "enactment-safe-input-charge",
+      "request": {
+        "request_id": "R",
+        "client_id": "client-r",
+        "input_tokens": 5
+      },
+      "attempts": [
+        {"status": "not-enacted", "scheduled_tokens": 0},
+        {"status": "partially-enacted", "scheduled_tokens": 1}
+      ]
+    },
+    {
+      "id": "idle-system-lift",
+      "last_client": "client-a",
+      "last_counter": 10000000,
+      "arriving_client": "client-b"
+    }
+  ]
+}

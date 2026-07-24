@@ -1,5 +1,23 @@
 {
-  "selected_group_ids": [
-    "G1"
+  "schema": "plex-paper-oracle@1",
+  "expectations": [
+    {
+      "case_id": "gps-finish-order",
+      "selected_group_id": "GB",
+      "selected_branch_count": 2,
+      "finish_tags_fp": {"GA": 100000000, "GB": 50000000}
+    },
+    {
+      "case_id": "immutable-finish-tag",
+      "finish_tag_fp": 50000000
+    },
+    {
+      "case_id": "active-set-virtual-time",
+      "virtual_time_fp": 1500000000
+    },
+    {
+      "case_id": "memory-cost-equation",
+      "predicted_kv_token_time": 50
+    }
   ]
 }

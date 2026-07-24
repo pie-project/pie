@@ -12,21 +12,29 @@
     "feedback"
   ],
   "policy_kernel": [
-    "deficit-credit fairness",
-    "prefix-local routing and scheduling"
+    "feedback-committed client deficit fairness",
+    "per-client per-worker D2LPM credit",
+    "longest-prefix-set routing with queue-size fallback"
   ],
   "required_facts": [
     "client_id",
+    "input_tokens",
+    "input_weight",
     "cached_tokens",
+    "longest_prefix_match",
+    "queue_size",
     "load",
-    "quantum",
+    "client_quantum",
+    "worker_quantum",
     "extend_tokens",
-    "worker_deficit",
-    "output_tokens"
+    "extend_weight",
+    "output_tokens",
+    "output_weight",
+    "target_id"
   ],
   "required_mechanics": [],
   "deferred_mechanics": [],
   "evidence_level": "inspired-adaptation",
-  "fixture_provenance": "independent reference model from the paper",
+  "fixture_provenance": "arXiv 2501.14312 Algorithms 1-2",
   "validation_status": "passing"
 }

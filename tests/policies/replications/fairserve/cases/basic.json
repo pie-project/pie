@@ -1,1 +1,28 @@
-{"case":"weighted-admission","clients":[{"id":"A","service":100,"weight":1},{"id":"B","service":100,"weight":4}],"max_accepted":1}
+{
+  "schema": "plex-paper-oracle@1",
+  "cases": [
+    {
+      "id": "oit-window-and-interaction",
+      "overloaded": true,
+      "user_rpm_limit": 2,
+      "app_rpm_limit": 10,
+      "arrivals_ms": [0, 1, 2, 3],
+      "interaction_in_progress": [false, false, false, true]
+    },
+    {
+      "id": "wsc-user-isolation",
+      "application_id": "shared-app",
+      "users": [
+        {"user_id": "user-a", "normalized_service": 1000000},
+        {"user_id": "user-b", "normalized_service": 0}
+      ]
+    },
+    {
+      "id": "wsc-stage-normalization",
+      "users": [
+        {"user_id": "user-c", "actual_input": 10, "expected_input": 20},
+        {"user_id": "user-d", "actual_input": 10, "expected_input": 10}
+      ]
+    }
+  ]
+}

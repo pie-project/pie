@@ -1,1 +1,28 @@
-{"selected_client_ids":["B"],"invariants":["token charges are conserved","lower virtual counter wins"]}
+{
+  "schema": "plex-paper-oracle@1",
+  "expectations": [
+    {
+      "case_id": "returning-client-lift-and-fifo",
+      "selected_request_ids": ["A1", "B1", "A2"],
+      "counter_before_feedback": {
+        "client-a": 10000000,
+        "client-b": 10000000,
+        "client-c": 30000000
+      },
+      "counter_after_feedback": {
+        "client-a": 11000000,
+        "client-b": 13000000,
+        "client-c": 30000000
+      }
+    },
+    {
+      "case_id": "enactment-safe-input-charge",
+      "counter_after_not_enacted": 0,
+      "counter_after_partial_enactment": 5000000
+    },
+    {
+      "case_id": "idle-system-lift",
+      "arriving_counter": 10000000
+    }
+  ]
+}

@@ -185,8 +185,7 @@
       "validation_status": "passing",
       "deferred_mechanics": [
         "KV swap kernel",
-        "multi-step engine execution",
-        "full ATLAS DAG runtime"
+        "multi-step engine execution"
       ],
       "metadata_path": "tests/policies/replications/agentix/metadata.json"
     }

@@ -201,12 +201,15 @@ def invoke_schedule(
     lifecycle: list[dict[str, Any]] | None,
     *,
     max_selections: int = 1,
+    max_requests: int | None = None,
     token_budget: int = 1,
 ) -> tuple[list[int], dict[str, Any]]:
+    request_limit = max_requests or max_selections
+    meta = bench.meta("schedule")
     outcome = bench.invoke(
         "schedule",
         {
-            "meta": bench.meta("schedule"),
+            "meta": meta,
             "cause": "capacity-changed",
             "runnable": [
                 {
@@ -218,13 +221,14 @@ def invoke_schedule(
             ],
             "capacity": {
                 "max_selections": max_selections,
-                "max_requests": max_selections,
-                "max_total_tokens": max_selections * token_budget,
+                "max_requests": request_limit,
+                "max_total_tokens": request_limit * token_budget,
                 "facts": {},
             },
         },
         lifecycle,
     )
+    outcome["_benchmark_opportunity_id"] = meta["opportunity_id"]
     selections = outcome["plan"]["plan"]["selections"]
     selected = [
         request_index
@@ -232,6 +236,48 @@ def invoke_schedule(
         for request_index in selection["requests"]
     ]
     return selected, outcome
+
+
+def enact_schedule(
+    bench: PolicyBench,
+    outcome: dict[str, Any],
+    *,
+    scheduled_tokens: int | None = None,
+) -> None:
+    opportunity_id = outcome["_benchmark_opportunity_id"]
+    records = []
+    for selection_index, selection in enumerate(
+        outcome["plan"]["plan"]["selections"]
+    ):
+        requested = sum(selection["token_budgets"])
+        enacted = requested if scheduled_tokens is None else min(
+            requested, scheduled_tokens
+        )
+        records.append(
+            {
+                "subject": {
+                    "kind": "schedule-selection",
+                    "value": {
+                        "opportunity_id": opportunity_id,
+                        "selection_index": selection_index,
+                    },
+                },
+                "outcome": "progress",
+                "facts": {
+                    "status": (
+                        "enacted"
+                        if enacted == requested
+                        else "partially-enacted"
+                        if enacted > 0
+                        else "not-enacted"
+                    ),
+                    "requested_tokens": requested,
+                    "scheduled_tokens": enacted,
+                },
+            }
+        )
+    if records:
+        bench.feedback(records)
 
 
 def invoke_admit(
@@ -272,6 +318,7 @@ def invoke_route(
     *,
     target_capacity: int | None = None,
 ) -> tuple[list[int | None], dict[str, Any]]:
+    meta = bench.meta("route")
     targets = [
         {
             "target_id": f"target-{index}",
@@ -295,7 +342,7 @@ def invoke_route(
     outcome = bench.invoke(
         "route",
         {
-            "meta": bench.meta("route"),
+            "meta": meta,
             "cause": "admission",
             "requests": [
                 {"request": ref, "facts": facts}
@@ -306,10 +353,34 @@ def invoke_route(
         },
         lifecycle,
     )
+    outcome["_benchmark_opportunity_id"] = meta["opportunity_id"]
     assignments: list[int | None] = [None] * len(refs)
     for assignment in outcome["plan"]["plan"]["assignments"]:
         assignments[assignment["request_index"]] = assignment["target_index"]
     return assignments, outcome
+
+
+def enact_route(bench: PolicyBench, outcome: dict[str, Any]) -> None:
+    opportunity_id = outcome["_benchmark_opportunity_id"]
+    records = [
+        {
+            "subject": {
+                "kind": "route-assignment",
+                "value": {
+                    "opportunity_id": opportunity_id,
+                    "request_index": assignment["request_index"],
+                },
+            },
+            "outcome": "progress",
+            "facts": {
+                "status": "enacted",
+                "target_index": assignment["target_index"],
+            },
+        }
+        for assignment in outcome["plan"]["plan"]["assignments"]
+    ]
+    if records:
+        bench.feedback(records)
 
 
 def cache_object(
@@ -431,46 +502,177 @@ def result(
 def scenario_agentix(
     bench: PolicyBench, rng: random.Random, trials: int
 ) -> dict[str, Any]:
-    policy_values = []
-    baseline_values = []
+    policy_jct = []
+    baseline_jct = []
     for trial in range(trials):
-        services = [rng.randint(10, 500) for _ in range(4)]
-        waiting = [rng.randint(0, 2500) for _ in range(4)]
-        facts = [{"waiting_ms": value} for value in waiting]
+        programs = [
+            [rng.randint(5, 7), rng.randint(3, 5), rng.randint(2, 4)],
+            [rng.randint(5, 8), rng.randint(3, 5)],
+            [rng.randint(1, 2)],
+            [rng.randint(1, 2), rng.randint(1, 2)],
+        ]
+        flat_calls = [
+            (program_index, call_index)
+            for program_index, calls in enumerate(programs)
+            for call_index in range(len(calls))
+        ]
+        base_facts = [
+            {
+                "agentix_mode": "plas",
+                "call_arrival": index,
+                "call_wait_us": 0,
+                "queue_bounds_us": [1000, 3000, 7000],
+                "queue_quanta_us": [1000, 2000, 4000, 8000],
+                "starvation_ratio_ppm": 100_000_000,
+            }
+            for index in range(len(flat_calls))
+        ]
         refs, lifecycle = bootstrap_requests(
             bench,
             f"agentix-{trial}",
-            facts,
+            base_facts,
             status="active",
-            group_keys=[str(index) for index in range(4)],
+            group_keys=[str(program_index) for program_index, _ in flat_calls],
         )
-        bench.feedback(
-            [
-                {
-                    "subject": {
-                        "kind": "work-group",
-                        "value": ref["group_id"],
-                    },
-                    "outcome": "progress",
-                    "facts": {"service_us": service},
-                }
-                for ref, service in zip(refs, services)
-            ],
-            lifecycle,
-        )
-        selected, _ = invoke_schedule(bench, refs, facts, None)
-        utilities = [
-            (1_000_000 if wait * 1000 >= max(service, 1) * 4 else 0)
-            + (500 - service)
-            for wait, service in zip(waiting, services)
-        ]
-        policy_values.append(utilities[selected[0]])
-        baseline_values.append(utilities[0])
+        ref_index = {
+            call: index for index, call in enumerate(flat_calls)
+        }
+        remaining = [calls.copy() for calls in programs]
+        current_call = [0] * len(programs)
+        ready_at = [0] * len(programs)
+        completed_at = [0] * len(programs)
+        step = 0
+        first_invocation = True
+        while any(
+            current_call[index] < len(programs[index])
+            for index in range(len(programs))
+        ):
+            ready = [
+                (program_index, current_call[program_index])
+                for program_index in range(len(programs))
+                if current_call[program_index] < len(programs[program_index])
+                and ready_at[program_index] <= step
+            ]
+            selected_positions, _ = invoke_schedule(
+                bench,
+                [refs[ref_index[call]] for call in ready],
+                [
+                    {
+                        "agentix_mode": "plas",
+                        "call_arrival": (
+                            ready_at[program_index] * 100
+                            + ref_index[(program_index, call_index)]
+                        ),
+                        "call_wait_us": (
+                            step - ready_at[program_index]
+                        )
+                        * 1000,
+                        "queue_bounds_us": [1000, 3000, 7000],
+                        "queue_quanta_us": [1000, 2000, 4000, 8000],
+                        "starvation_ratio_ppm": 100_000_000,
+                    }
+                    for program_index, call_index in ready
+                ],
+                lifecycle if first_invocation else None,
+                max_selections=2,
+                token_budget=1,
+            )
+            first_invocation = False
+            if not selected_positions:
+                raise RuntimeError("Agentix produced an empty runnable batch")
+            records = []
+            completed_calls = []
+            for position in selected_positions:
+                program_index, call_index = ready[position]
+                remaining[program_index][call_index] -= 1
+                request_id = refs[
+                    ref_index[(program_index, call_index)]
+                ]["request_id"]
+                records.append(
+                    {
+                        "subject": {
+                            "kind": "request",
+                            "value": request_id,
+                        },
+                        "outcome": "progress",
+                        "facts": {
+                            "service_us": 1000,
+                            "queue_bounds_us": [1000, 3000, 7000],
+                            "queue_quanta_us": [1000, 2000, 4000, 8000],
+                        },
+                    }
+                )
+                if remaining[program_index][call_index] == 0:
+                    completed_calls.append((program_index, request_id))
+                    records.append(
+                        {
+                            "subject": {
+                                "kind": "request",
+                                "value": request_id,
+                            },
+                            "outcome": "completed",
+                            "facts": {
+                                "call_wait_us": (
+                                    step - ready_at[program_index]
+                                )
+                                * 1000
+                            },
+                        }
+                    )
+            bench.feedback(records)
+            for program_index, _ in completed_calls:
+                current_call[program_index] += 1
+                if current_call[program_index] == len(programs[program_index]):
+                    completed_at[program_index] = step + 1
+                else:
+                    ready_at[program_index] = step + 1
+            step += 1
+            if step > 1000:
+                raise RuntimeError("Agentix trace did not converge")
+        policy_jct.append(statistics.mean(completed_at))
+
+        remaining = [calls.copy() for calls in programs]
+        current_call = [0] * len(programs)
+        ready_at = [0] * len(programs)
+        completed_at = [0] * len(programs)
+        running: list[tuple[int, int]] = []
+        queued: list[tuple[int, int]] = []
+        step = 0
+        while any(
+            current_call[index] < len(programs[index])
+            for index in range(len(programs))
+        ):
+            for program_index in range(len(programs)):
+                call = (program_index, current_call[program_index])
+                if (
+                    call[1] < len(programs[program_index])
+                    and ready_at[program_index] <= step
+                    and call not in running
+                    and call not in queued
+                ):
+                    queued.append(call)
+            while queued and len(running) < 2:
+                running.append(queued.pop(0))
+            finished = []
+            for program_index, call_index in running:
+                remaining[program_index][call_index] -= 1
+                if remaining[program_index][call_index] == 0:
+                    finished.append((program_index, call_index))
+            for call in finished:
+                running.remove(call)
+                program_index, _ = call
+                current_call[program_index] += 1
+                if current_call[program_index] == len(programs[program_index]):
+                    completed_at[program_index] = step + 1
+                else:
+                    ready_at[program_index] = step + 1
+            step += 1
+        baseline_jct.append(statistics.mean(completed_at))
     return result(
-        policy_values,
-        baseline_values,
-        direction="higher",
-        unit="starvation_adjusted_priority",
+        policy_jct,
+        baseline_jct,
+        direction="lower",
+        unit="mean_program_jct_steps",
     )
 
 
@@ -691,51 +893,87 @@ def scenario_vtc(
     bench: PolicyBench, _rng: random.Random, trials: int
 ) -> dict[str, Any]:
     clients = 4
-    facts = [
+    output_tokens = [1, 2, 4, 8]
+    fair_weights = [1_000_000, 2_000_000, 4_000_000, 8_000_000]
+    base_facts = [
         {
             "client_id": f"client-{index}",
+            "queue_member": True,
             "dispatch_input_tokens": 0,
             "input_weight": 1,
+            "input_price": 1,
+            "fair_weight_ppm": fair_weights[index],
         }
         for index in range(clients)
     ]
     refs, lifecycle = bootstrap_requests(
-        bench, "vtc", facts, status="active"
+        bench, "vtc", base_facts, status="active"
     )
     policy_service = [0.0] * clients
     baseline_service = [0.0] * clients
-    for step in range(max(trials, 16) * clients):
-        selected, _ = invoke_schedule(
-            bench, refs, facts, lifecycle if step == 0 else None
+    policy_spans = []
+    baseline_spans = []
+    previous_active: set[int] = set()
+    horizon = max(trials, 16) * clients
+    for step in range(horizon):
+        active = [0, 1]
+        if step % 8 < 4:
+            active.append(2)
+        if step >= horizon // 2 and step % 6 < 3:
+            active.append(3)
+        facts = [
+            {
+                **base_facts[index],
+                "client_became_active": index not in previous_active,
+            }
+            for index in active
+        ]
+        selected, schedule_outcome = invoke_schedule(
+            bench,
+            [refs[index] for index in active],
+            facts,
+            lifecycle if step == 0 else None,
         )
-        index = selected[0]
-        policy_service[index] += 1
-        baseline_service[0] += 1
+        if len(selected) != 1:
+            raise RuntimeError("VTC did not remain work-conserving")
+        selected_client = active[selected[0]]
+        enact_schedule(bench, schedule_outcome)
+        policy_service[selected_client] += 1
+        baseline_service[active[0]] += 1
         bench.feedback(
             [
                 {
                     "subject": {
                         "kind": "request",
-                        "value": refs[index]["request_id"],
+                        "value": refs[selected_client]["request_id"],
                     },
                     "outcome": "progress",
                     "facts": {
-                        "client_id": facts[index]["client_id"],
+                        "client_id": f"client-{selected_client}",
                         "input_tokens": 0,
-                        "output_tokens": 1,
+                        "output_tokens": output_tokens[selected_client],
                         "output_weight": 1,
+                        "output_price": 2,
+                        "fair_weight_ppm": fair_weights[selected_client],
                     },
                 }
             ]
         )
+        policy_spans.append(abs(policy_service[0] - policy_service[1]))
+        baseline_spans.append(abs(baseline_service[0] - baseline_service[1]))
+        previous_active = set(active)
     return result(
-        [jain(policy_service)],
-        [jain(baseline_service)],
-        direction="higher",
-        unit="jain_fairness",
+        [max(policy_spans)],
+        [max(baseline_spans)],
+        direction="lower",
+        unit="max_backlogged_service_span",
         details={
             "policy_service": policy_service,
             "baseline_service": baseline_service,
+            "policy_jain": jain(policy_service[:2]),
+            "baseline_jain": jain(baseline_service[:2]),
+            "on_off_client": 2,
+            "distribution_shift_client": 3,
         },
     )
 
@@ -788,28 +1026,56 @@ def scenario_lmetric(
 def scenario_fairserve(
     bench: PolicyBench, _rng: random.Random, trials: int
 ) -> dict[str, Any]:
-    weights = [1.0, 2.0, 4.0, 8.0]
-    facts = [
-        {
-            "client_id": f"client-{index}",
-            "application_id": f"application-{index}",
-            "weight": int(weight),
-            "kv_overloaded": True,
-            "interaction_in_progress": False,
-            "user_rpm_remaining": 1,
-            "app_rpm_remaining": 1,
-        }
-        for index, weight in enumerate(weights)
-    ]
+    weights = [1, 2, 4, 8]
+    requests_per_user = max(trials, 16)
+    facts = []
+    group_keys = []
+    user_indices = []
+    for user_index, weight in enumerate(weights):
+        for request_index in range(requests_per_user):
+            facts.append(
+                {
+                    "user_id": f"client-{user_index}",
+                    "client_id": f"client-{user_index}",
+                    "application_id": f"application-{user_index}",
+                    "stage_id": "stage-1",
+                    "expected_input_tokens": 0,
+                    "expected_system_tokens": 0,
+                    "expected_output_tokens": weight,
+                    "input_weight": 1,
+                    "system_weight": 2,
+                    "output_weight": 1,
+                    "user_priority_ppm": 1_000_000,
+                    "kv_overloaded": True,
+                    "interaction_in_progress": False,
+                    "user_rpm_remaining": 1,
+                    "app_rpm_remaining": 1,
+                    "arrival_seq": request_index,
+                }
+            )
+            group_keys.append(str(user_index))
+            user_indices.append(user_index)
     refs, lifecycle = bootstrap_requests(
-        bench, "fairserve", facts, status="active"
+        bench,
+        "fairserve",
+        facts,
+        status="active",
+        group_keys=group_keys,
     )
     admit_facts = [
         {
-            **item,
+            "user_id": f"admit-user-{index}",
+            "client_id": f"admit-user-{index}",
+            "application_id": "admit-app",
+            "stage_id": "stage-1",
+            "now_ms": index,
+            "rpm_window_ms": 60_000,
+            "user_rpm_limit": 1,
+            "app_rpm_limit": len(weights),
+            "kv_overloaded": True,
             "interaction_in_progress": index >= 2,
         }
-        for index, item in enumerate(facts)
+        for index in range(len(weights))
     ]
     admit_refs, admit_lifecycle = bootstrap_requests(
         bench, "fairserve-admit", admit_facts, status="pending"
@@ -823,30 +1089,53 @@ def scenario_fairserve(
     )
     policy_service = [0.0] * len(weights)
     baseline_service = [0.0] * len(weights)
-    steps = max(trials, 16) * len(weights)
+    steps = requests_per_user * 2
     for step in range(steps):
         selected, _ = invoke_schedule(
             bench, refs, facts, lifecycle if step == 0 else None
         )
-        index = selected[0]
-        policy_service[index] += 1
+        selected_index = selected[0]
+        user_index = user_indices[selected_index]
+        policy_service[user_index] += 1
         baseline_service[step % len(weights)] += 1
         bench.feedback(
             [
                 {
                     "subject": {
                         "kind": "request",
-                        "value": refs[index]["request_id"],
+                        "value": refs[selected_index]["request_id"],
                     },
                     "outcome": "progress",
-                    "facts": {
-                        "client_id": facts[index]["client_id"],
-                        "application_id": facts[index]["application_id"],
-                        "service_tokens": 1,
+                    "facts": {"output_tokens": 1},
+                },
+                {
+                    "subject": {
+                        "kind": "request",
+                        "value": refs[selected_index]["request_id"],
                     },
-                }
+                    "outcome": "completed",
+                    "facts": {
+                        key: facts[selected_index][key]
+                        for key in (
+                            "user_id",
+                            "client_id",
+                            "application_id",
+                            "stage_id",
+                            "expected_input_tokens",
+                            "expected_system_tokens",
+                            "expected_output_tokens",
+                            "input_weight",
+                            "system_weight",
+                            "output_weight",
+                            "user_priority_ppm",
+                        )
+                    },
+                },
             ]
         )
+        del refs[selected_index]
+        del facts[selected_index]
+        del user_indices[selected_index]
     policy_normalized = [
         service / weight
         for service, weight in zip(policy_service, weights)
@@ -952,13 +1241,70 @@ def scenario_dlpm(
     baseline_costs = []
     for trial in range(trials):
         client = f"client-{trial}"
-        positive_deficit = trial % 2 == 0
         refs, lifecycle = bootstrap_requests(
             bench,
             f"dlpm-{trial}",
             [{"client_id": client}],
             status="admitted",
         )
+        cached = [rng.randint(0, 4095) for _ in range(4)]
+        for index in rng.sample(range(4), 2):
+            cached[index] = 4096
+        load = [rng.randint(1, 100) for _ in range(4)]
+        longest = max(cached)
+        assignments, route_outcome = invoke_route(
+            bench,
+            refs,
+            [
+                {
+                    "client_id": client,
+                    "input_tokens": 1,
+                    "input_weight": 1,
+                }
+            ],
+            [{"worker_quantum": 100} for _ in range(4)],
+            [
+                [
+                    {
+                        "cached_tokens": cached[index],
+                        "load": load[index],
+                        "queue_size": load[index],
+                        "longest_prefix_match": cached[index] == longest,
+                    }
+                    for index in range(4)
+                ]
+            ],
+            lifecycle,
+        )
+        enact_route(bench, route_outcome)
+        costs = [
+            (longest - cached[index]) * 10 + load[index]
+            for index in range(4)
+        ]
+        policy_costs.append(costs[assignments[0]])
+        baseline_index = max(range(4), key=cached.__getitem__)
+        baseline_costs.append(costs[baseline_index])
+        _, schedule_outcome = invoke_schedule(
+            bench,
+            refs,
+            [
+                {
+                    "client_id": client,
+                    "queue_member": True,
+                    "cached_tokens": longest,
+                    "client_quantum": 100,
+                    "extend_tokens": 1,
+                    "extend_weight": 1,
+                }
+            ],
+            [
+                {
+                    "event": "activate-request",
+                    "request_id": refs[0]["request_id"],
+                }
+            ],
+        )
+        enact_schedule(bench, schedule_outcome)
         bench.feedback(
             [
                 {
@@ -969,58 +1315,11 @@ def scenario_dlpm(
                     "outcome": "progress",
                     "facts": {
                         "client_id": client,
-                        "output_tokens": 0 if positive_deficit else 100,
+                        "output_tokens": 1,
+                        "output_weight": 1,
                     },
                 }
-            ],
-            lifecycle,
-        )
-        cached = [rng.randint(0, 4096) for _ in range(4)]
-        load = [rng.randint(1, 100) for _ in range(4)]
-        assignments, _ = invoke_route(
-            bench,
-            refs,
-            [{"client_id": client}],
-            [{}, {}, {}, {}],
-            [
-                [
-                    {
-                        "cached_tokens": cached[index],
-                        "load": load[index],
-                        "worker_deficit": 100 if positive_deficit else -100,
-                    }
-                    for index in range(4)
-                ]
-            ],
-            [],
-        )
-        max_cached = max(cached)
-        costs = [
-            (max_cached - cached[index]) * 10 + load[index]
-            if positive_deficit
-            else load[index]
-            for index in range(4)
-        ]
-        policy_costs.append(costs[assignments[0]])
-        baseline_index = max(range(4), key=cached.__getitem__)
-        baseline_costs.append(costs[baseline_index])
-        invoke_schedule(
-            bench,
-            refs,
-            [
-                {
-                    "client_id": client,
-                    "cached_tokens": max(cached),
-                    "quantum": 100,
-                    "extend_tokens": 1,
-                }
-            ],
-            [
-                {
-                    "event": "activate-request",
-                    "request_id": refs[0]["request_id"],
-                }
-            ],
+            ]
         )
     return result(
         policy_costs,
@@ -1317,43 +1616,64 @@ def scenario_dynasor(
 def scenario_justitia(
     bench: PolicyBench, rng: random.Random, trials: int
 ) -> dict[str, Any]:
-    policy_values = []
-    baseline_values = []
+    policy_costs = []
+    baseline_costs = []
     for trial in range(trials):
-        completed = [rng.randint(0, 8) for _ in range(4)]
-        facts = [{} for _ in completed]
+        costs = [rng.randint(50, 500) for _ in range(4)]
+        now_us = trial * 1000
+        facts = [
+            {
+                "ready": True,
+                "now_us": now_us,
+                "total_kv_tokens": 1000,
+                "predicted_agent_kv_token_time": costs[group_index],
+            }
+            for group_index in range(4)
+            for _ in range(2)
+        ]
+        group_keys = [
+            str(group_index) for group_index in range(4) for _ in range(2)
+        ]
         refs, lifecycle = bootstrap_requests(
             bench,
             f"justitia-{trial}",
             facts,
             status="active",
-            group_keys=[str(index) for index in range(4)],
+            group_keys=group_keys,
         )
-        records = []
-        for ref, count in zip(refs, completed):
-            records.extend(
+        selected, schedule_outcome = invoke_schedule(
+            bench,
+            refs,
+            facts,
+            lifecycle,
+            max_selections=1,
+            max_requests=2,
+        )
+        selected_group = selected[0] // 2
+        if any(index // 2 != selected_group for index in selected):
+            raise RuntimeError("Justitia selected branches from multiple agents")
+        policy_costs.append(costs[selected_group])
+        baseline_costs.append(costs[0])
+        enact_schedule(bench, schedule_outcome)
+        group_ids = list(dict.fromkeys(ref["group_id"] for ref in refs))
+        bench.feedback(
+            [
                 {
-                    "subject": {
-                        "kind": "work-group",
-                        "value": ref["group_id"],
-                    },
+                    "subject": {"kind": "work-group", "value": group_id},
                     "outcome": "completed",
-                    "facts": {},
+                    "facts": {
+                        "now_us": now_us + 1,
+                        "total_kv_tokens": 1000,
+                    },
                 }
-                for _ in range(count)
-            )
-        if records:
-            bench.feedback(records, lifecycle)
-            lifecycle = None
-        selected, _ = invoke_schedule(bench, refs, facts, lifecycle)
-        remaining = [8 - value for value in completed]
-        policy_values.append(remaining[selected[0]])
-        baseline_values.append(remaining[0])
+                for group_id in group_ids
+            ]
+        )
     return result(
-        policy_values,
-        baseline_values,
-        direction="higher",
-        unit="remaining_branch_criticality",
+        policy_costs,
+        baseline_costs,
+        direction="lower",
+        unit="predicted_kv_token_time",
     )
 
 

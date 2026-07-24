@@ -33,22 +33,31 @@
         "feedback"
       ],
       "policy_kernel": [
-        "group-level least attained service",
-        "waiting-to-service anti-starvation",
-        "feedback-maintained group service"
+        "PLAS queue-band scheduling",
+        "ATLAS critical-path priority",
+        "quantum demotion and starvation promotion"
       ],
       "required_facts": [
+        "agentix_mode",
         "waiting_ms",
+        "program_wait_us",
+        "program_wait_ms",
+        "call_wait_us",
+        "call_wait_ms",
+        "call_arrival",
+        "critical_path_service_us",
+        "queue_bounds_us",
+        "queue_quanta_us",
+        "starvation_ratio_ppm",
         "service_us"
       ],
       "required_mechanics": [],
       "deferred_mechanics": [
         "KV swap kernel",
-        "multi-step engine execution",
-        "full ATLAS DAG runtime"
+        "multi-step engine execution"
       ],
       "evidence_level": "inspired-adaptation",
-      "fixture_provenance": "independent implementation from the paper algorithm",
+      "fixture_provenance": "NSDI 2026 Algorithm 1, Equations 1-2, and anti-starvation rule",
       "validation_status": "passing",
       "fidelity": {
         "classification": "material-semantic-gap",
@@ -240,19 +249,25 @@
       "policy_kernel": [
         "per-client virtual-token counters",
         "returning-client counter lift",
-        "dispatch input and decode output charging"
+        "per-client FIFO admission",
+        "enactment-safe dispatch input and decode output charging"
       ],
       "required_facts": [
         "client_id",
+        "client_became_active",
+        "queue_member",
         "dispatch_input_tokens",
         "input_weight",
+        "input_price",
         "output_tokens",
-        "output_weight"
+        "output_weight",
+        "output_price",
+        "fair_weight_ppm"
       ],
       "required_mechanics": [],
       "deferred_mechanics": [],
       "evidence_level": "inspired-adaptation",
-      "fixture_provenance": "paper formula and public artifact interface",
+      "fixture_provenance": "OSDI 2024 Algorithm 2 and VTC artifact commit 192c2e",
       "validation_status": "passing",
       "fidelity": {
         "classification": "material-semantic-gap",
@@ -311,27 +326,40 @@
         "feedback"
       ],
       "policy_kernel": [
-        "overload-aware interaction throttling",
-        "application-stage weighted service accounting"
+        "windowed overload-aware interaction throttling",
+        "user-scoped application-stage weighted service accounting",
+        "in-progress interaction preservation"
       ],
       "required_facts": [
+        "user_id",
         "client_id",
         "application_id",
-        "weight",
+        "stage_id",
         "kv_overloaded",
         "interaction_in_progress",
+        "now_ms",
+        "rpm_window_ms",
+        "user_rpm_limit",
+        "app_rpm_limit",
         "user_rpm_remaining",
         "app_rpm_remaining",
         "input_tokens",
         "system_tokens",
-        "output_tokens"
+        "output_tokens",
+        "expected_input_tokens",
+        "expected_system_tokens",
+        "expected_output_tokens",
+        "input_weight",
+        "system_weight",
+        "output_weight",
+        "user_priority_ppm"
       ],
       "required_mechanics": [],
       "deferred_mechanics": [
         "production interaction and RPM estimator"
       ],
       "evidence_level": "inspired-adaptation",
-      "fixture_provenance": "independent reference model from the paper",
+      "fixture_provenance": "arXiv 2411.15997 Algorithm 1 and Equations 2-3",
       "validation_status": "passing",
       "fidelity": {
         "classification": "incorrect",
@@ -425,22 +453,30 @@
         "feedback"
       ],
       "policy_kernel": [
-        "deficit-credit fairness",
-        "prefix-local routing and scheduling"
+        "feedback-committed client deficit fairness",
+        "per-client per-worker D2LPM credit",
+        "longest-prefix-set routing with queue-size fallback"
       ],
       "required_facts": [
         "client_id",
+        "input_tokens",
+        "input_weight",
         "cached_tokens",
+        "longest_prefix_match",
+        "queue_size",
         "load",
-        "quantum",
+        "client_quantum",
+        "worker_quantum",
         "extend_tokens",
-        "worker_deficit",
-        "output_tokens"
+        "extend_weight",
+        "output_tokens",
+        "output_weight",
+        "target_id"
       ],
       "required_mechanics": [],
       "deferred_mechanics": [],
       "evidence_level": "inspired-adaptation",
-      "fixture_provenance": "independent reference model from the paper",
+      "fixture_provenance": "arXiv 2501.14312 Algorithms 1-2",
       "validation_status": "passing",
       "fidelity": {
         "classification": "material-semantic-gap",
@@ -654,18 +690,28 @@
         "feedback"
       ],
       "policy_kernel": [
-        "group completion-order fairness",
-        "feedback-maintained branch completion"
+        "memory-centric KV token-time cost",
+        "GPS virtual-time and immutable finish tags",
+        "selected-agent ready-branch pampering"
       ],
       "required_facts": [
-        "completed_branches"
+        "ready",
+        "now_us",
+        "total_kv_tokens",
+        "predicted_agent_kv_token_time",
+        "predicted_input_tokens",
+        "predicted_output_tokens",
+        "kv_token_time_delta",
+        "agent_completed"
       ],
-      "required_mechanics": [],
+      "required_mechanics": [
+        "schedule.atomic-enqueue@1"
+      ],
       "deferred_mechanics": [
         "simultaneous branch execution"
       ],
       "evidence_level": "inspired-adaptation",
-      "fixture_provenance": "independent reference model from the paper",
+      "fixture_provenance": "arXiv 2510.17015v2 Equations 1-3",
       "validation_status": "passing",
       "fidelity": {
         "classification": "incorrect",

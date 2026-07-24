@@ -20,7 +20,7 @@ This report is generated from committed replication metadata by
 
 | ID | Title | Operations | Evidence | Fidelity | Deferred mechanics |
 |---|---|---|---|---|---:|
-| `agentix` | Agentix: An Efficient Serving Engine for LLM Agents as General Programs | `schedule`, `feedback` | `inspired-adaptation` | `material-semantic-gap` | 3 |
+| `agentix` | Agentix: An Efficient Serving Engine for LLM Agents as General Programs | `schedule`, `feedback` | `inspired-adaptation` | `material-semantic-gap` | 2 |
 | `continuum` | Continuum: Efficient and Robust Multi-Turn LLM Agent Scheduling with KV Cache Time-to-Live | `schedule`, `cache`, `feedback` | `inspired-adaptation` | `material-semantic-gap` | 3 |
 | `kvflow` | KVFlow: Efficient Prefix Caching for Accelerating LLM-Based Multi-Agent Workflows | `schedule`, `cache` | `inspired-adaptation` | `material-semantic-gap` | 1 |
 | `preble` | Preble: Efficient Distributed Prompt Scheduling for LLM Serving | `route` | `inspired-adaptation` | `material-semantic-gap` | 2 |
