@@ -241,6 +241,131 @@ gathered sampler and wide rows to a complement-masked full-width sampler. This
 is the concrete engineering-and-algorithms problem that makes Example 1 real
 instead of anecdotal.
 
+## Decision 1: API surface for release
+
+Verified against the actual integration points: vLLM's
+`v1/structured_output/backend_types.py` (`StructuredOutputBackend` /
+`StructuredOutputGrammar`) and SGLang's `constrained/base_grammar_backend.py`
+(`BaseGrammarBackend` / `BaseGrammarObject`). SGLang exposes a public
+`register_grammar_backend(name, init_func)` registry, so a third-party backend
+needs **no upstream patch**; vLLM currently selects backends by name and needs
+either a plugin hook or a small upstream registration.
+
+Four layers, shipped in this order.
+
+### Layer 0 — engine-agnostic core (`gpugrammar`)
+
+```text
+Compiler(tokenizer_info, cache) -> CompiledGrammar     # IELR(1) tables + token alignment
+GrammarPool(compiled, max_seqs, device)                # GPU-resident state arena
+  .create(seq_idx) / .clone(seq_idx) / .free(seq_idx)
+  .accept(seq_idx, tokens) -> bool                     # batched
+  .validate(seq_idx, tokens) -> int                    # prefix length, no advance
+  .rollback(seq_idx, k)
+  .is_terminated(seq_idx)
+  .forced_string(seq_idx) -> bytes | None              # jump-forward
+  .fill_bitmask(bitmask, indices)                      # batched, device-resident
+  .sample(logits, sampling_params) -> tokens           # fused fast path
+```
+
+State is one `int32` configuration ID per sequence, so `clone` is a copy of one
+integer and `rollback(k)` is an index into a per-sequence ring buffer of the
+last 200 configuration IDs (800 B/sequence). Both are O(1); XGrammar must
+rebuild a matcher or replay tokens.
+
+### Layer 1 — vLLM adapter
+
+Implement exactly: `compile_grammar(request_type, grammar_spec)`,
+`allocate_token_bitmask(max_num_seqs)`, `destroy()`, and on the grammar object
+`accept_tokens`, `validate_tokens`, `rollback`, `fill_bitmask(bitmask, idx)`,
+`is_terminated`, `reset`.
+
+`validate_tokens` is vLLM's speculative-decoding hook and is implemented today
+as serial accept-then-rollback — this is precisely where Example 2 applies.
+
+### Layer 2 — SGLang adapter
+
+Implement `accept_token`, `rollback(k)`, `is_terminated`, `copy`,
+`allocate_vocab_mask(vocab_size, batch_size, device)`, `fill_vocab_mask(mask, idx)`,
+`move_vocab_mask(mask, device)`, `apply_vocab_mask(logits, mask)`,
+`try_jump_forward`, `jump_forward_str_state`, `jump_and_retokenize`, plus
+`is_support_token_filter` / `set_token_filter`. Register with
+`register_grammar_backend("gpugrammar", ...)`.
+
+**Key adapter design rule.** Both engines call `fill_*_bitmask(mask, idx)` once
+per sequence in a Python loop, then apply the mask. gpugrammar must make that
+loop free: `fill` only records `(state_id, idx)`, and the single batched kernel
+runs at `apply_vocab_mask(logits, mask)` time. SGLang's
+`allocate_vocab_mask` already receives `device`, so the mask can be allocated on
+GPU and `move_vocab_mask` becomes a no-op — CPU fill and the H2D copy both
+disappear **without any upstream change**.
+
+### Layer 3 — fused sampling (upstream proposal)
+
+Neither engine exposes a "select the token" hook, so Example 1 cannot be
+delivered through the current interfaces. Propose an optional capability —
+`supports_fused_sampling` plus `sample_constrained(logits, sampling_params)` —
+and contribute it upstream. The paper evaluates both layers so the result stands
+even if the extension is not merged.
+
+### Drop-in requirements that are not negotiable
+
+To be selectable as a backend the library must accept every spec type the
+engines dispatch: JSON Schema, bare JSON object, EBNF (including Lark
+conversion), regex, choice, and structural tags. It must handle byte-fallback
+and tekken tokenizers, honor model EOS/stop-token overrides, support
+`rollback` up to 200 tokens, and expose jump-forward strings. IELR(1) is the
+execution engine underneath, not the user-facing contract.
+
+## Decision 2: paper contributions
+
+**Motivation.** The CPU-to-GPU capability gap widens every generation, so any
+stage left on the host becomes the serialization point of the decode loop.
+Constrained decoding is the last major CPU-resident stage, and it is not a
+niche: structured output is now the default interface for tool calling and
+agents. Yet it is the stage most hostile to GPU execution — parsing is
+stack-dependent sequential control flow, batches are heterogeneous, and the
+allowed set is bimodal. That difficulty, not indifference, is why every
+deployed system still parses on the CPU.
+
+Claimed contributions, in the order they should appear:
+
+1. **A characterization that reframes the problem.** The cost of constrained
+   decoding is not mask *generation*; it is that a full-vocabulary mask forces
+   the sampler to stay O(V). Measured on an A100 with Qwen3: allowed-set size
+   is bimodal (396 versus 147,144 tokens), the deployed path more than doubles
+   a 7B decode step at batch 512, and under speculative decoding it exceeds the
+   model step by 4x. Prior work optimizes the wrong term.
+
+2. **GPU-executable IELR(1).** Turning stack-dependent reduce/goto closure into
+   a form indexable by a single device lookup, with a soundness and
+   completeness argument, plus lexer state folded into the configuration key
+   (C1, C2). This is the "hard on GPU" core.
+
+3. **Bimodal allowed-set algebra and a ragged fused sampler.** Representation
+   selection per state and a variable-width sampler that keeps top-k/top-p
+   exact across a heterogeneous batch (C3, C10). This is what turns constrained
+   sampling into something *cheaper* than unconstrained sampling.
+
+4. **A graph-resident constraint step with O(1) clone and rollback**, which
+   makes constrained speculative decoding practical for the first time (C5, C6),
+   and makes jump-forward a compile-time table lookup rather than a runtime
+   search.
+
+5. **Drop-in integration and an honest crossover evaluation.** Real vLLM and
+   SGLang backends, end-to-end serving numbers, and an explicit statement of
+   the regimes where a GPU-native engine does *not* matter.
+
+**The elegance claim.** One artifact — a GPU-resident map from parser
+configuration to allowed-set representation — simultaneously serves masking,
+sampling, speculative validation, rollback, and jump-forward. The five features
+that are five separate mechanisms in existing systems collapse into one table.
+
+**What the paper must not claim.** That it beats XGrammar on mask generation for
+narrow toy grammars; that GPU-native execution helps a 70B model at batch 1;
+that IELR(1) is broader coverage than XGrammar's general CFG. Each of those is
+either measured to be marginal or simply false.
+
 ## Non-goals
 
 - Beating XGrammar on a grammar with ~15 allowed tokens per state. That is the
