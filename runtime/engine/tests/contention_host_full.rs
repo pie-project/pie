@@ -15,8 +15,6 @@ use pie_engine::inferlet::program::ProgramName;
 #[test]
 fn host_swap_exhaustion_kills_a_victim_without_wedging_the_fleet() {
     unsafe {
-        std::env::set_var("PIE_KV_CONTENTION", "preempt");
-        std::env::set_var("PIE_KV_PREEMPT_ACTIVE", "1");
         std::env::set_var("PIE_KV_EXHAUSTION_MS", "2000");
         std::env::set_var("PIE_KV_CACHE_ROOTS_MAX", "0");
     }

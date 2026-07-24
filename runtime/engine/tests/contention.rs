@@ -12,8 +12,6 @@ use pie_engine::inferlet::program::ProgramName;
 #[test]
 fn active_preemption_swaps_and_restores_an_over_capacity_fleet() {
     unsafe {
-        std::env::set_var("PIE_KV_CONTENTION", "preempt");
-        std::env::set_var("PIE_KV_PREEMPT_ACTIVE", "1");
         std::env::set_var("PIE_KV_EXHAUSTION_MS", "5000");
     }
     inferlets::build_inferlets();

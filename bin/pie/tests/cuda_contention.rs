@@ -4,7 +4,7 @@
 //! The rework's headline claim (In Gim): KV contention is **preempt/restore, not
 //! admission**. When a fleet's combined KV demand EXCEEDS the physical pool, an
 //! alloc-fail must NOT surface a `WorkingSetError` to the inferlet — instead it
-//! routes to the contention orchestrator (`PIE_KV_CONTENTION=preempt`):
+//! routes to the contention orchestrator (always on):
 //!   OOM in prep → `acquire()` (FCFS wait / preempt a younger process) → a
 //!   completing/terminating process frees its pages (the WS-drop drain hook) →
 //!   `on_blocks_freed` wakes the FIFO waiter → the prep retries → succeeds.
@@ -44,11 +44,10 @@
 //!      corruption) AND no `restore_attributable` divergence (first divergence at
 //!      KV position >= page_size = a sealed/restored page). The [1, page_size)
 //!      band is logged non-gating (non-batch-invariance; see the composite above).
-//!   4. **v2 active self-suspend** (only when `PIE_KV_PREEMPT_ACTIVE=1`) —
-//!      `suspends > 0 && restores > 0`: the `SelfSuspendBackend` had victims
-//!      SAVE their own KV state (D2H offload) and RESTORE it (H2D). Gated on
-//!      active mode: in v1 passive these are zero-by-design, so it only fires
-//!      when the active backend is armed.
+//!   4. **Active self-suspend** — `suspends > 0 && restores > 0`: victims
+//!      SAVE their own KV state (D2H offload) and RESTORE it (H2D). Preempt
+//!      is always on and always the active tier; this fires on every
+//!      contended profile run.
 //!
 //! Construction-based contention proof: the fleet is sized so its combined KV
 //! demand provably exceeds the (small) pool — so if all complete with zero
@@ -56,21 +55,17 @@
 //! have errored the over-capacity lanes).
 //!
 //! `#[ignore]` (needs the 4090 + cuda + qwen3-0.6b). Run:
-//!   PIE_KV_CONTENTION=preempt PIE_COMPILER_LAUNCHER=env \
+//!   PIE_COMPILER_LAUNCHER=env \
 //!     cargo test -p pie-bin --features driver-cuda \
 //!     --test cuda_contention -- --ignored --nocapture
 //!
 //! Quantitative A/B (each command is a separate process because boot is
-//! process-global; the optional record file prints the ratio after both runs):
-//!   PIE_KV_CONTENTION=error PIE_CONTENTION_PROFILE_MODE=legacy \
-//!   PIE_CONTENTION_PROFILE_RECORD=/tmp/pie-contention.json \
-//!     cargo test -p pie-bin --features driver-cuda --test cuda_contention \
-//!     over_capacity_fleet_preempts_and_restores_transparently -- --ignored --exact --nocapture
-//!   PIE_KV_CONTENTION=preempt PIE_KV_PREEMPT_ACTIVE=1 \
+//! process-global; the optional record file prints the ratio after both
+//! runs). The pre-rewrite/legacy side of an A/B is measured by checking out
+//! the baseline git ref — the runtime no longer has an error-path mode:
 //!   PIE_CONTENTION_PROFILE_MODE=baseline PIE_CONTENTION_PROFILE_RECORD=/tmp/pie-contention.json \
 //!     cargo test -p pie-bin --features driver-cuda --test cuda_contention \
 //!     over_capacity_fleet_preempts_and_restores_transparently -- --ignored --exact --nocapture
-//!   PIE_KV_CONTENTION=preempt PIE_KV_PREEMPT_ACTIVE=1 \
 //!   PIE_CONTENTION_PROFILE_MODE=contended PIE_CONTENTION_TOTAL_PAGES=8 \
 //!   PIE_CONTENTION_PROFILE_RECORD=/tmp/pie-contention.json \
 //!     cargo test -p pie-bin --features driver-cuda --test cuda_contention \
@@ -317,21 +312,17 @@ fn write_profile_record(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "Task-B contention over-capacity e2e: needs the 4090 + cuda + qwen3-0.6b + PIE_KV_CONTENTION=preempt"]
+#[ignore = "contention over-capacity e2e: needs the 4090 + cuda + qwen3-0.6b"]
 async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()> {
     common::init_trace();
 
     let profile_mode =
         std::env::var("PIE_CONTENTION_PROFILE_MODE").unwrap_or_else(|_| "contended".to_string());
     anyhow::ensure!(
-        matches!(profile_mode.as_str(), "legacy" | "baseline" | "contended"),
-        "PIE_CONTENTION_PROFILE_MODE must be legacy, baseline, or contended"
-    );
-    let configured_contention = std::env::var("PIE_KV_CONTENTION").unwrap_or_default();
-    anyhow::ensure!(
-        (profile_mode == "legacy" && configured_contention != "preempt")
-            || (profile_mode != "legacy" && configured_contention == "preempt"),
-        "legacy mode requires PIE_KV_CONTENTION=error; baseline/contended require preempt"
+        matches!(profile_mode.as_str(), "baseline" | "contended"),
+        "PIE_CONTENTION_PROFILE_MODE must be baseline or contended (the legacy \
+         error-path profile is gone with the mode knob; measure the pre-rewrite \
+         ref via git for A/B)"
     );
     let total_pages = if profile_mode != "contended" {
         0
@@ -642,19 +633,16 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
          corruption of a sealed page, not a pre-seal near-tie flip."
     );
 
-    // Assertion 4 (v2 active self-suspend): when the active `SelfSuspendBackend`
-    // is armed (`PIE_KV_PREEMPT_ACTIVE=1`), a victim doesn't just park on the pool
-    // — at its own execute_impl entry it SAVES its KV state (D2H offload) and
-    // RESTORES it (H2D) on release, so `suspends`/`restores` MUST fire. This is
-    // GATED on active mode: in v1 passive the backend returns `Unsupported` and
-    // both stay zero-by-design, so the assertion only applies when armed.
-    let preempt_active = std::env::var("PIE_KV_PREEMPT_ACTIVE").as_deref() == Ok("1");
-    if preempt_active && profile_mode == "contended" {
+    // Assertion 4 (active self-suspend): a victim doesn't just park on the
+    // pool — at its own execute_impl entry it SAVES its KV state (D2H
+    // offload) and RESTORES it (H2D) on release, so `suspends`/`restores`
+    // MUST fire. Preempt is always on and always the active tier.
+    if profile_mode == "contended" {
         assert!(
             suspends > 0 && restores > 0,
-            "v2 active self-suspend did NOT ENGAGE (suspends={suspends}, restores={restores}) — \
-             PIE_KV_PREEMPT_ACTIVE=1 arms the SelfSuspendBackend, so victims must actively save \
-             (suspend) and restore their KV state. Zero means the active path never ran."
+            "active self-suspend did NOT ENGAGE (suspends={suspends}, restores={restores}) — \
+             victims must actively save (suspend) and restore their KV state. \
+             Zero means the active path never ran."
         );
         eprintln!(
             "[contention] v2 active self-suspend engaged: suspends={suspends} restores={restores} ✓"

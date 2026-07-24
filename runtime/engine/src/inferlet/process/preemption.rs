@@ -636,11 +636,7 @@ async fn suspend_restore(pid: uuid::Uuid, working_sets: HashSet<WorkingSetId>) -
     };
     orchestrator.report_suspended(pid, freed as u32);
 
-    let max_restore_attempts = std::env::var("PIE_KV_RESTORE_RETRIES")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-        .unwrap_or(3)
-        .max(1);
+    let max_restore_attempts = orchestrator.config().restore_retries.max(1);
     for attempt in 1..=max_restore_attempts {
         let grant = orchestrator
             .park_until_restore_granted(pid)

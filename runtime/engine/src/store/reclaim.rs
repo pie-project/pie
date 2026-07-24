@@ -5,11 +5,10 @@
 //! contract.
 //!
 //! In Gim's directive: KV-cache contention is handled by PREEMPT/RESTORE, not
-//! admission. `max_concurrent_processes` is a large physical safety cap only;
-//! when a forward's page allocation hits an exhausted pool
-//! ([`KvStoreError::OutOfPages`](crate::store::kv::KvStoreError) — typed, and
-//! raised only at forward preparation because `reserve` is logical), the fire
-//! path's prepare seam routes here instead of surfacing an inferlet error:
+//! admission — and there is NO off switch. `max_concurrent_processes` is a
+//! large physical safety cap only; every fire's page demand routes through
+//! the orchestrator's grant path (the legacy surface-`OutOfPages` mode is
+//! gone):
 //!
 //! 0. **Idle-lease rung** — the ladder's first step (kv_refact.md Scheduler):
 //!    drop cache-root leases nothing live reaches
@@ -91,29 +90,57 @@ pub(crate) fn set_pipeline_leave_hook(hook: impl Fn(ProcessId, LeaveKind) + Send
     let _ = PIPELINE_LEAVE_HOOK.set(Box::new(hook));
 }
 
-/// How the runtime reacts to a KV pool exhaustion at the prep seam.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ContentionMode {
-    /// Legacy: surface `OutOfPages` to the inferlet as a forward error.
-    Error,
-    /// Task-B: route to the orchestrator (preempt/restore) and retry.
-    Preempt,
+/// The contention subsystem's whole configuration, parsed from the
+/// environment exactly once at the bootstrap edge ([`Self::from_env`]) and
+/// injected explicitly everywhere else — no read-once statics, no knobs
+/// consulted mid-drain. Tests construct it directly. Contention handling
+/// has no off switch: preempt/restore IS the allocation path.
+#[derive(Clone, Copy, Debug)]
+pub struct ContentionConfig {
+    /// Restore-pause aging window: a FIFO-head restore older than this
+    /// proceeds even above the utilization pause (if it fits) —
+    /// starvation-proofing on small pools where utilization never drops
+    /// below the threshold.
+    pub restore_aging: Duration,
+    /// Exhaustion deadline: how long the FCFS-oldest keystone may stay
+    /// continuously unsatisfiable before failing LOUD instead of wedging.
+    pub exhaustion: Duration,
+    /// Restore attempts per grant before the failure surfaces.
+    pub restore_retries: u32,
 }
 
-/// The contention mode, read once from `PIE_KV_CONTENTION`
-/// (`preempt` ⇒ [`ContentionMode::Preempt`]; default/anything else ⇒ `Error`,
-/// byte-for-byte legacy behavior).
-pub fn contention_mode() -> ContentionMode {
-    static MODE: OnceLock<ContentionMode> = OnceLock::new();
-    *MODE.get_or_init(|| {
-        match std::env::var("PIE_KV_CONTENTION")
-            .map(|v| v.eq_ignore_ascii_case("preempt"))
-            .unwrap_or(false)
-        {
-            true => ContentionMode::Preempt,
-            false => ContentionMode::Error,
+impl Default for ContentionConfig {
+    fn default() -> Self {
+        Self {
+            restore_aging: Duration::from_millis(250),
+            exhaustion: Duration::from_secs(10),
+            restore_retries: 3,
         }
-    })
+    }
+}
+
+impl ContentionConfig {
+    /// Parse the operator-facing environment (`PIE_KV_RESTORE_AGING_MS`,
+    /// `PIE_KV_EXHAUSTION_MS`, `PIE_KV_RESTORE_RETRIES`). Called once, from
+    /// bootstrap.
+    pub fn from_env() -> Self {
+        let defaults = Self::default();
+        let ms = |name: &str, fallback: Duration| {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .map_or(fallback, Duration::from_millis)
+        };
+        Self {
+            restore_aging: ms("PIE_KV_RESTORE_AGING_MS", defaults.restore_aging),
+            exhaustion: ms("PIE_KV_EXHAUSTION_MS", defaults.exhaustion),
+            restore_retries: std::env::var("PIE_KV_RESTORE_RETRIES")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(defaults.restore_retries)
+                .max(1),
+        }
+    }
 }
 
 /// Outcome of a suspend attempt on a victim process.
@@ -414,12 +441,9 @@ pub struct ContentionOrchestrator {
     /// existing `scheduler.restore_pause_at_utilization` config feeds it).
     restore_pause_at_utilization: f64,
     stats: ContentionStats,
-    /// #19 exhaustion deadline (ms): how long the FCFS-oldest keystone may stay
-    /// CONTINUOUSLY unsatisfiable (no victim, `free < need`) before `acquire`
-    /// fails LOUD with [`ContentionError::Exhausted`] instead of wedging. Read
-    /// from `PIE_KV_EXHAUSTION_MS` (default 10000) at construction; the clock
-    /// resets whenever the condition clears (reset-on-change kills transients).
-    exhaustion_ms: u64,
+    /// Injected once at construction ([`ContentionConfig::from_env`] in
+    /// production, explicit literals in tests); never re-read mid-flight.
+    config: ContentionConfig,
 }
 
 struct WaitRegistration<'a> {
@@ -458,7 +482,11 @@ impl Drop for WaitRegistration<'_> {
 }
 
 impl ContentionOrchestrator {
-    pub fn new(backend: Box<dyn ReclaimBackend>, restore_pause_at_utilization: f64) -> Self {
+    pub fn new(
+        backend: Box<dyn ReclaimBackend>,
+        restore_pause_at_utilization: f64,
+        config: ContentionConfig,
+    ) -> Self {
         Self {
             inner: Mutex::new(Inner::default()),
             allocation_waiters: AtomicUsize::new(0),
@@ -467,15 +495,13 @@ impl ContentionOrchestrator {
             backend,
             restore_pause_at_utilization,
             stats: ContentionStats::default(),
-            exhaustion_ms: exhaustion_ms_from_env(),
+            config,
         }
     }
 
-    /// Override the #19 exhaustion deadline (tests; production uses the env
-    /// default). Builder-style so `Arc::new(orch(..).with_exhaustion_ms(ms))`.
-    pub fn with_exhaustion_ms(mut self, ms: u64) -> Self {
-        self.exhaustion_ms = ms;
-        self
+    /// The injected configuration (read-only; parsed once at bootstrap).
+    pub fn config(&self) -> ContentionConfig {
+        self.config
     }
 
     fn remove_count(counter: &AtomicUsize, count: usize) {
@@ -919,7 +945,8 @@ impl ContentionOrchestrator {
                     },
                 }
             };
-            let poll = Duration::from_millis((self.exhaustion_ms / 4).clamp(20, 50));
+            let poll = (self.config.exhaustion / 4)
+                .clamp(Duration::from_millis(20), Duration::from_millis(50));
             tokio::select! {
                 _ = notify.notified() => {}
                 _ = tokio::time::sleep(poll) => {}
@@ -1160,7 +1187,7 @@ impl ContentionOrchestrator {
             let (free, total) = self.backend.pool_stats();
             if self.is_oldest_requester(requester) {
                 let since = *exhausted_since.get_or_insert_with(Instant::now);
-                if since.elapsed() >= Duration::from_millis(self.exhaustion_ms) {
+                if since.elapsed() >= self.config.exhaustion {
                     registration.disarm();
                     self.cancel_waiter(requester, request_id, false);
                     self.stats
@@ -1173,7 +1200,8 @@ impl ContentionOrchestrator {
             }
 
             self.mark_waiter_parked(requester, request_id);
-            let poll = Duration::from_millis((self.exhaustion_ms / 4).clamp(20, 50));
+            let poll = (self.config.exhaustion / 4)
+                .clamp(Duration::from_millis(20), Duration::from_millis(50));
             tokio::select! {
                 _ = notify.notified() => {}
                 _ = tokio::time::sleep(poll) => {}
@@ -1419,9 +1447,9 @@ impl ContentionOrchestrator {
                         return;
                     };
                     let process = inner.procs.get(&pid).expect("restore process exists");
-                    let aged = process.suspended_at.is_some_and(|since| {
-                        since.elapsed() >= Duration::from_millis(restore_aging_ms())
-                    });
+                    let aged = process
+                        .suspended_at
+                        .is_some_and(|since| since.elapsed() >= self.config.restore_aging);
                     if utilization > self.restore_pause_at_utilization && !aged {
                         return;
                     }
@@ -1440,7 +1468,7 @@ impl ContentionOrchestrator {
                                     now
                                 }
                             };
-                            if since.elapsed() >= Duration::from_millis(self.exhaustion_ms) {
+                            if since.elapsed() >= self.config.exhaustion {
                                 let restore_waiters_before = inner.restore_queue.len();
                                 inner.restore_queue.retain(|queued| *queued != pid);
                                 self.remove_restore_waiters(
@@ -1653,10 +1681,10 @@ impl ReclaimBackend for KvPoolBackend {
 /// preparation, drains its fires, and commits D2H before `report_suspended`.
 /// Restore runs H2D after `park_until_restore_granted` and calls
 /// `report_restored` only after mapping publication. `restore()` remains only
-/// for synchronous backend compatibility. Selected by
-/// `PIE_KV_PREEMPT_ACTIVE=1` on top of `PIE_KV_CONTENTION=preempt`;
-/// engagement shows as `stats().suspends/restores > 0` (the pre-wired v2
-/// e2e assertion). Passive (`KvPoolBackend`) remains the default.
+/// for synchronous backend compatibility. Selected whenever the driver can
+/// physically move KV bytes to/from host swap (D2H+H2D copy capability);
+/// engagement shows as `stats().suspends/restores > 0`. `KvPoolBackend` is
+/// the copy-incapable degradation, not a mode.
 pub struct SelfSuspendBackend {
     pool: KvPoolBackend,
 }
@@ -1699,53 +1727,19 @@ impl ReclaimBackend for SelfSuspendBackend {
     }
 }
 
-/// Restore-pause aging window (ms): 250. A FIFO-head restore older than this
-/// proceeds even above the utilization pause (if it fits) — starvation-proofing
-/// on small pools where utilization never drops below the threshold.
-pub fn restore_aging_ms() -> u64 {
-    static AGING_MS: OnceLock<u64> = OnceLock::new();
-    *AGING_MS.get_or_init(|| {
-        std::env::var("PIE_KV_RESTORE_AGING_MS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(250)
-    })
-}
-
-/// #19 exhaustion deadline (ms): 10000 = 10s. Bounds how long the FCFS-oldest
-/// keystone may stay continuously unsatisfiable before `acquire` fails LOUD
-/// instead of wedging — turning a ~300s silent hang into a 10s named error.
-/// Tests override via [`ContentionOrchestrator::with_exhaustion_ms`].
-fn exhaustion_ms_from_env() -> u64 {
-    std::env::var("PIE_KV_EXHAUSTION_MS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(10_000)
-}
-
-/// Whether the ACTIVE self-suspend backend is selected (v2), read once from
-/// `PIE_KV_PREEMPT_ACTIVE` (default off ⇒ the proven passive v1 backend).
-pub fn preempt_active() -> bool {
-    static ACTIVE: OnceLock<bool> = OnceLock::new();
-    *ACTIVE.get_or_init(|| {
-        std::env::var("PIE_KV_PREEMPT_ACTIVE")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
-}
-
 // =============================================================================
-// Global instance (wired by bootstrap when PIE_KV_CONTENTION=preempt)
+// Global instance (wired unconditionally by bootstrap)
 // =============================================================================
 
 static CONTENTION: OnceLock<ContentionOrchestrator> = OnceLock::new();
 
-/// Install the global orchestrator (bootstrap, once, only in preempt mode).
+/// Install the global orchestrator (bootstrap, once).
 pub fn init_contention(orchestrator: ContentionOrchestrator) {
     let _ = CONTENTION.set(orchestrator);
 }
 
-/// The global orchestrator, if preempt mode is wired.
+/// The global orchestrator. `None` only before bootstrap has run (unit
+/// tests of other modules); after bootstrap it is always installed.
 pub fn contention() -> Option<&'static ContentionOrchestrator> {
     CONTENTION.get()
 }
@@ -1814,8 +1808,11 @@ mod tests {
                 total,
             }),
             0.85,
-        )
-        .with_exhaustion_ms(200);
+            ContentionConfig {
+                exhaustion: Duration::from_millis(200),
+                ..ContentionConfig::default()
+            },
+        );
         let pid = ProcessId::new_v4();
         orch.register(pid);
         (orch, pid, free)
@@ -2021,8 +2018,9 @@ mod tests {
 
     #[tokio::test]
     async fn unsatisfiable_suspended_keystone_times_out_without_an_allocator() {
-        let (orch, pid, _) = orch_with_free(0, 0, 10);
-        let orch = Arc::new(orch.with_exhaustion_ms(40));
+        let (mut orch, pid, _) = orch_with_free(0, 0, 10);
+        orch.config.exhaustion = Duration::from_millis(40);
+        let orch = Arc::new(orch);
         suspend_for_test(&orch, pid, 2);
         let result =
             tokio::time::timeout(Duration::from_secs(1), orch.park_until_restore_granted(pid))
@@ -2040,9 +2038,10 @@ mod tests {
 
     #[tokio::test]
     async fn permanently_unsupported_victim_does_not_reset_exhaustion_clock() {
-        let (orch, oldest, _) = orch_with_free(0, 0, 10);
+        let (mut orch, oldest, _) = orch_with_free(0, 0, 10);
+        orch.config.exhaustion = Duration::from_millis(40);
         orch.register(ProcessId::new_v4());
-        let orch = Arc::new(orch.with_exhaustion_ms(40));
+        let orch = Arc::new(orch);
         let result = tokio::time::timeout(Duration::from_secs(1), acquire(&orch, oldest, 2))
             .await
             .expect("unsupported victim retries must still hit exhaustion");
@@ -2058,8 +2057,9 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_an_acquisition_future_removes_its_waiter() {
-        let (orch, pid, _) = orch_with_free(0, 0, 10);
-        let orch = Arc::new(orch.with_exhaustion_ms(5_000));
+        let (mut orch, pid, _) = orch_with_free(0, 0, 10);
+        orch.config.exhaustion = Duration::from_secs(5);
+        let orch = Arc::new(orch);
         let task = {
             let orch = orch.clone();
             tokio::spawn(async move { acquire(&orch, pid, 2).await })
