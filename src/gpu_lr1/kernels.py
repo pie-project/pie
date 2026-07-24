@@ -252,6 +252,127 @@ def _csr_argmax_advance_kernel(
 
 
 @triton.jit
+def _csr_argmax_advance_packed_kernel(
+    logits_ptr,
+    csr_indptr_ptr,
+    csr_indices_ptr,
+    csr_next_state_ptr,
+    rows_ptr,
+    output_tokens_ptr,
+    output_states_ptr,
+    batch_size,
+    vocab_size: tl.constexpr,
+    ROWS_PER_PROGRAM: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    batch_offsets = (
+        tl.program_id(0) * ROWS_PER_PROGRAM
+        + tl.arange(0, ROWS_PER_PROGRAM)
+    )
+    lane_offsets = tl.arange(0, BLOCK_SIZE)
+    batch_valid = batch_offsets < batch_size
+    rows = tl.load(
+        rows_ptr + batch_offsets,
+        mask=batch_valid,
+        other=0,
+    )
+    starts = tl.load(
+        csr_indptr_ptr + rows,
+        mask=batch_valid,
+        other=0,
+    )
+    ends = tl.load(
+        csr_indptr_ptr + rows + 1,
+        mask=batch_valid,
+        other=0,
+    )
+    lengths = ends - starts
+    entry_offsets = starts[:, None] + lane_offsets[None, :]
+    valid = batch_valid[:, None] & (lane_offsets[None, :] < lengths[:, None])
+    tokens = tl.load(
+        csr_indices_ptr + entry_offsets,
+        mask=valid,
+        other=0,
+    )
+    values = tl.load(
+        logits_ptr
+        + batch_offsets[:, None] * vocab_size
+        + tokens,
+        mask=valid,
+        other=-float("inf"),
+    ).to(tl.float32)
+    selected_lanes = tl.argmax(values, axis=1)
+    selected = valid & (
+        lane_offsets[None, :] == selected_lanes[:, None]
+    )
+    selected_tokens = tl.sum(tl.where(selected, tokens, 0), axis=1)
+    selected_states = tl.sum(
+        tl.load(
+            csr_next_state_ptr + entry_offsets,
+            mask=selected,
+            other=0,
+        ),
+        axis=1,
+    )
+    has_values = batch_valid & (lengths > 0)
+    tl.store(
+        output_tokens_ptr + batch_offsets,
+        tl.where(has_values, selected_tokens, -1),
+        mask=batch_valid,
+    )
+    tl.store(
+        output_states_ptr + batch_offsets,
+        selected_states,
+        mask=batch_valid,
+    )
+
+
+@triton.jit
+def _ell_argmax_advance_kernel(
+    logits_ptr,
+    row_lengths_ptr,
+    token_table_ptr,
+    next_state_table_ptr,
+    rows_ptr,
+    output_tokens_ptr,
+    output_states_ptr,
+    vocab_size: tl.constexpr,
+    row_width: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    batch_id = tl.program_id(0)
+    row = tl.load(rows_ptr + batch_id)
+    length = tl.load(row_lengths_ptr + row)
+    offsets = tl.arange(0, BLOCK_SIZE)
+    valid = offsets < length
+    table_offsets = row * row_width + offsets
+    tokens = tl.load(
+        token_table_ptr + table_offsets,
+        mask=valid,
+        other=0,
+    )
+    values = tl.load(
+        logits_ptr + batch_id * vocab_size + tokens,
+        mask=valid,
+        other=-float("inf"),
+    ).to(tl.float32)
+    selected_lane = tl.argmax(values, axis=0)
+    selected_offset = row * row_width + selected_lane
+    selected_token = tl.load(
+        token_table_ptr + selected_offset,
+        mask=length > 0,
+        other=-1,
+    )
+    selected_state = tl.load(
+        next_state_table_ptr + selected_offset,
+        mask=length > 0,
+        other=0,
+    )
+    tl.store(output_tokens_ptr + batch_id, selected_token)
+    tl.store(output_states_ptr + batch_id, selected_state)
+
+
+@triton.jit
 def _dense_advance_kernel(
     states_ptr,
     token_ids_ptr,
@@ -760,6 +881,168 @@ class LR1StepWorkspace:
     reductions: torch.Tensor
 
 
+@dataclass
+class CSRArgmaxAdvancePlan:
+    csr_indptr: torch.Tensor
+    csr_indices: torch.Tensor
+    csr_next_state: torch.Tensor
+    rows: torch.Tensor
+    output_tokens: torch.Tensor
+    output_states: torch.Tensor
+    batch_size: int
+    vocab_size: int
+    block_size: int
+    num_warps: int
+    rows_per_program: int = 1
+    packed: bool = False
+    autotune_cuda_us: float | None = None
+
+    @property
+    def strategy(self) -> str:
+        if self.packed:
+            return (
+                f"packed_r{self.rows_per_program}_w{self.num_warps}"
+            )
+        return f"single_w{self.num_warps}"
+
+    def __call__(
+        self,
+        logits: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.packed:
+            grid = (triton.cdiv(self.batch_size, self.rows_per_program),)
+            _csr_argmax_advance_packed_kernel[grid](
+                logits,
+                self.csr_indptr,
+                self.csr_indices,
+                self.csr_next_state,
+                self.rows,
+                self.output_tokens,
+                self.output_states,
+                self.batch_size,
+                vocab_size=self.vocab_size,
+                ROWS_PER_PROGRAM=self.rows_per_program,
+                BLOCK_SIZE=self.block_size,
+                num_warps=self.num_warps,
+            )
+        else:
+            _csr_argmax_advance_kernel[(self.batch_size,)](
+                logits,
+                self.csr_indptr,
+                self.csr_indices,
+                self.csr_next_state,
+                self.rows,
+                self.output_tokens,
+                self.output_states,
+                vocab_size=self.vocab_size,
+                BLOCK_SIZE=self.block_size,
+                num_warps=self.num_warps,
+            )
+        return self.output_tokens, self.output_states
+
+    def capture(
+        self,
+        logits: torch.Tensor,
+    ) -> "CSRArgmaxAdvanceGraph":
+        inplace_states = (
+            self.output_states.data_ptr() == self.rows.data_ptr()
+        )
+        saved_states = self.rows.clone() if inplace_states else None
+        self(logits)
+        torch.cuda.synchronize(logits.device)
+        if saved_states is not None:
+            self.rows.copy_(saved_states)
+            torch.cuda.synchronize(logits.device)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            self(logits)
+        if saved_states is not None:
+            self.rows.copy_(saved_states)
+            torch.cuda.synchronize(logits.device)
+        return CSRArgmaxAdvanceGraph(
+            graph=graph,
+            output_tokens=self.output_tokens,
+            output_states=self.output_states,
+            strategy=self.strategy,
+        )
+
+
+@dataclass(frozen=True)
+class CSRArgmaxAdvanceGraph:
+    graph: torch.cuda.CUDAGraph
+    output_tokens: torch.Tensor
+    output_states: torch.Tensor
+    strategy: str
+
+    def replay(self) -> tuple[torch.Tensor, torch.Tensor]:
+        self.graph.replay()
+        return self.output_tokens, self.output_states
+
+
+@dataclass
+class ELLArgmaxAdvancePlan:
+    row_lengths: torch.Tensor
+    token_table: torch.Tensor
+    next_state_table: torch.Tensor
+    rows: torch.Tensor
+    output_tokens: torch.Tensor
+    output_states: torch.Tensor
+    batch_size: int
+    vocab_size: int
+    row_width: int
+    block_size: int
+    num_warps: int
+
+    @property
+    def strategy(self) -> str:
+        return f"ell_w{self.num_warps}"
+
+    def __call__(
+        self,
+        logits: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        _ell_argmax_advance_kernel[(self.batch_size,)](
+            logits,
+            self.row_lengths,
+            self.token_table,
+            self.next_state_table,
+            self.rows,
+            self.output_tokens,
+            self.output_states,
+            vocab_size=self.vocab_size,
+            row_width=self.row_width,
+            BLOCK_SIZE=self.block_size,
+            num_warps=self.num_warps,
+        )
+        return self.output_tokens, self.output_states
+
+    def capture(
+        self,
+        logits: torch.Tensor,
+    ) -> CSRArgmaxAdvanceGraph:
+        inplace_states = (
+            self.output_states.data_ptr() == self.rows.data_ptr()
+        )
+        saved_states = self.rows.clone() if inplace_states else None
+        self(logits)
+        torch.cuda.synchronize(logits.device)
+        if saved_states is not None:
+            self.rows.copy_(saved_states)
+            torch.cuda.synchronize(logits.device)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            self(logits)
+        if saved_states is not None:
+            self.rows.copy_(saved_states)
+            torch.cuda.synchronize(logits.device)
+        return CSRArgmaxAdvanceGraph(
+            graph=graph,
+            output_tokens=self.output_tokens,
+            output_states=self.output_states,
+            strategy=self.strategy,
+        )
+
+
 def torch_dense_mask_logits(
     logits: torch.Tensor,
     dense_mask: torch.Tensor,
@@ -969,7 +1252,7 @@ def triton_csr_argmax(
         output,
         vocab_size=logits.shape[1],
         BLOCK_SIZE=block_size,
-        num_warps=_num_warps(block_size),
+        num_warps=_csr_num_warps(block_size),
     )
     return output
 
@@ -1012,7 +1295,255 @@ def triton_csr_argmax_advance(
         output_states,
         vocab_size=logits.shape[1],
         BLOCK_SIZE=block_size,
-        num_warps=_num_warps(block_size),
+        num_warps=_csr_num_warps(block_size),
+    )
+    return output_tokens, output_states
+
+
+def make_csr_argmax_advance_plan(
+    logits: torch.Tensor,
+    csr_indptr: torch.Tensor,
+    csr_indices: torch.Tensor,
+    csr_next_state: torch.Tensor,
+    rows: torch.Tensor,
+    *,
+    max_row_nnz: int,
+    output_tokens: torch.Tensor | None = None,
+    output_states: torch.Tensor | None = None,
+    autotune: bool = False,
+    autotune_warmup: int = 5,
+    autotune_iterations: int = 50,
+) -> CSRArgmaxAdvancePlan:
+    """Validate once and bind a low-overhead CSR selection launch plan."""
+    _validate_logits(logits, rows)
+    for name, tensor in (
+        ("csr_indptr", csr_indptr),
+        ("csr_indices", csr_indices),
+        ("csr_next_state", csr_next_state),
+    ):
+        if not tensor.is_cuda or tensor.dtype != torch.int32:
+            raise ValueError(f"{name} must be a CUDA int32 tensor")
+    if csr_indices.shape != csr_next_state.shape:
+        raise ValueError("CSR token and next-state arrays must match")
+    if max_row_nnz <= 0:
+        raise ValueError("CSR argmax requires at least one allowed token per row")
+    block_size = triton.next_power_of_2(max_row_nnz)
+    if block_size > 32768:
+        raise ValueError("CSR row is too dense for the single-program kernel")
+    if autotune_warmup < 0 or autotune_iterations <= 0:
+        raise ValueError("invalid CSR autotune iteration counts")
+    output_tokens = (
+        output_tokens
+        if output_tokens is not None
+        else torch.empty(logits.shape[0], dtype=torch.int32, device=logits.device)
+    )
+    output_states = (
+        output_states
+        if output_states is not None
+        else torch.empty_like(rows)
+    )
+    if output_tokens.shape != rows.shape or output_tokens.dtype != torch.int32:
+        raise ValueError("CSR output tokens must match rows and use int32")
+    if output_states.shape != rows.shape or output_states.dtype != torch.int32:
+        raise ValueError("CSR output states must match rows and use int32")
+    if not output_tokens.is_cuda or not output_states.is_cuda:
+        raise ValueError("CSR outputs must be CUDA tensors")
+
+    candidates = [
+        CSRArgmaxAdvancePlan(
+            csr_indptr=csr_indptr,
+            csr_indices=csr_indices,
+            csr_next_state=csr_next_state,
+            rows=rows,
+            output_tokens=output_tokens,
+            output_states=output_states,
+            batch_size=logits.shape[0],
+            vocab_size=logits.shape[1],
+            block_size=block_size,
+            num_warps=_csr_num_warps(block_size),
+        )
+    ]
+    if autotune:
+        existing = {(False, 1, candidates[0].num_warps)}
+        for num_warps in (1, 2, 4, 8):
+            key = (False, 1, num_warps)
+            if key not in existing:
+                candidates.append(
+                    CSRArgmaxAdvancePlan(
+                        csr_indptr=csr_indptr,
+                        csr_indices=csr_indices,
+                        csr_next_state=csr_next_state,
+                        rows=rows,
+                        output_tokens=output_tokens,
+                        output_states=output_states,
+                        batch_size=logits.shape[0],
+                        vocab_size=logits.shape[1],
+                        block_size=block_size,
+                        num_warps=num_warps,
+                    )
+                )
+                existing.add(key)
+        if block_size <= 64 and logits.shape[0] >= 2:
+            for rows_per_program in (2, 4, 8, 16):
+                active_lanes = rows_per_program * block_size
+                recommended_warps = min(
+                    8,
+                    max(1, triton.next_power_of_2(max(1, active_lanes // 32))),
+                )
+                for num_warps in {
+                    recommended_warps,
+                    max(1, recommended_warps // 2),
+                }:
+                    key = (True, rows_per_program, num_warps)
+                    if key in existing:
+                        continue
+                    candidates.append(
+                        CSRArgmaxAdvancePlan(
+                            csr_indptr=csr_indptr,
+                            csr_indices=csr_indices,
+                            csr_next_state=csr_next_state,
+                            rows=rows,
+                            output_tokens=output_tokens,
+                            output_states=output_states,
+                            batch_size=logits.shape[0],
+                            vocab_size=logits.shape[1],
+                            block_size=block_size,
+                            num_warps=num_warps,
+                            rows_per_program=rows_per_program,
+                            packed=True,
+                        )
+                    )
+                    existing.add(key)
+
+        best_plan = candidates[0]
+        best_us = float("inf")
+        for candidate in candidates:
+            elapsed_us = float(
+                triton.testing.do_bench(
+                    lambda candidate=candidate: candidate(logits),
+                    warmup=autotune_warmup,
+                    rep=autotune_iterations,
+                )
+                * 1_000
+            )
+            if elapsed_us < best_us:
+                best_us = elapsed_us
+                best_plan = candidate
+        best_plan.autotune_cuda_us = float(best_us)
+        return best_plan
+    return candidates[0]
+
+
+def make_ell_argmax_advance_plan(
+    logits: torch.Tensor,
+    row_lengths: torch.Tensor,
+    token_table: torch.Tensor,
+    next_state_table: torch.Tensor,
+    rows: torch.Tensor,
+    *,
+    output_tokens: torch.Tensor | None = None,
+    output_states: torch.Tensor | None = None,
+) -> ELLArgmaxAdvancePlan:
+    _validate_logits(logits, rows)
+    for name, tensor in (
+        ("row_lengths", row_lengths),
+        ("token_table", token_table),
+        ("next_state_table", next_state_table),
+    ):
+        if not tensor.is_cuda:
+            raise ValueError(f"{name} must be a CUDA tensor")
+    if row_lengths.ndim != 1 or row_lengths.dtype != torch.int32:
+        raise ValueError("ELL row lengths must be one-dimensional int32")
+    if (
+        token_table.ndim != 2
+        or next_state_table.shape != token_table.shape
+        or token_table.dtype != torch.int32
+        or next_state_table.dtype != torch.int32
+    ):
+        raise ValueError("ELL token and next-state tables must match int32")
+    if token_table.shape[0] != row_lengths.shape[0]:
+        raise ValueError("ELL tables require one length per row")
+    row_width = token_table.shape[1]
+    if row_width <= 0:
+        raise ValueError("ELL row width must be positive")
+    block_size = triton.next_power_of_2(row_width)
+    if block_size > 32768:
+        raise ValueError("ELL row is too wide for one Triton program")
+    output_tokens = (
+        output_tokens
+        if output_tokens is not None
+        else torch.empty(logits.shape[0], dtype=torch.int32, device=logits.device)
+    )
+    output_states = (
+        output_states
+        if output_states is not None
+        else torch.empty_like(rows)
+    )
+    if not output_tokens.is_cuda or not output_states.is_cuda:
+        raise ValueError("ELL outputs must be CUDA tensors")
+    return ELLArgmaxAdvancePlan(
+        row_lengths=row_lengths,
+        token_table=token_table,
+        next_state_table=next_state_table,
+        rows=rows,
+        output_tokens=output_tokens,
+        output_states=output_states,
+        batch_size=logits.shape[0],
+        vocab_size=logits.shape[1],
+        row_width=row_width,
+        block_size=block_size,
+        num_warps=_csr_num_warps(block_size),
+    )
+
+
+def triton_csr_argmax_advance_packed(
+    logits: torch.Tensor,
+    csr_indptr: torch.Tensor,
+    csr_indices: torch.Tensor,
+    csr_next_state: torch.Tensor,
+    rows: torch.Tensor,
+    *,
+    max_row_nnz: int,
+    rows_per_program: int,
+    num_warps: int,
+    output_tokens: torch.Tensor | None = None,
+    output_states: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select and advance several tiny CSR rows in each Triton program."""
+    _validate_logits(logits, rows)
+    if max_row_nnz <= 0:
+        raise ValueError("CSR argmax requires at least one allowed token per row")
+    if rows_per_program not in (1, 2, 4, 8, 16):
+        raise ValueError("rows_per_program must be a power of two from 1 to 16")
+    if num_warps not in (1, 2, 4, 8):
+        raise ValueError("num_warps must be 1, 2, 4, or 8")
+    block_size = triton.next_power_of_2(max_row_nnz)
+    if block_size > 64:
+        raise ValueError("packed CSR kernel only supports rows up to 64 entries")
+    output_tokens = (
+        output_tokens
+        if output_tokens is not None
+        else torch.empty(logits.shape[0], dtype=torch.int32, device=logits.device)
+    )
+    output_states = (
+        output_states
+        if output_states is not None
+        else torch.empty_like(rows)
+    )
+    grid = (triton.cdiv(logits.shape[0], rows_per_program),)
+    _csr_argmax_advance_packed_kernel[grid](
+        logits,
+        csr_indptr,
+        csr_indices,
+        csr_next_state,
+        rows,
+        output_tokens,
+        output_states,
+        logits.shape[0],
+        vocab_size=logits.shape[1],
+        ROWS_PER_PROGRAM=rows_per_program,
+        BLOCK_SIZE=block_size,
+        num_warps=num_warps,
     )
     return output_tokens, output_states
 
@@ -1361,4 +1892,12 @@ def _num_warps(block_size: int) -> int:
         return 4
     if block_size <= 2048:
         return 8
+    return 8
+
+
+def _csr_num_warps(block_size: int) -> int:
+    if block_size <= 64:
+        return 4
+    if block_size <= 512:
+        return 2
     return 8

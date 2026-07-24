@@ -21,6 +21,7 @@ from gpu_lr1.lr1_tokens import (
     LR1TokenVocabulary,
     PackedLR1TokenTables,
     compile_bounded_lr1_token_automaton,
+    make_bounded_lr1_step_plan,
     pack_bounded_lr1_token_automata,
     select_and_advance_bounded_lr1_cpu,
     triton_bounded_lr1_step,
@@ -52,6 +53,20 @@ class CyclingLogits:
         value = self.values[self.index % self.values.shape[0]]
         self.index += 1
         return value
+
+
+class CyclingGraphs:
+    def __init__(self, graphs) -> None:
+        self.graphs = graphs
+        self.index = 0
+
+    def reset(self) -> None:
+        self.index = 0
+
+    def next(self) -> torch.Tensor:
+        graph = self.graphs[self.index % len(self.graphs)]
+        self.index += 1
+        return graph.replay()[1]
 
 
 PROFILES = {
@@ -189,7 +204,7 @@ def main() -> None:
             batch_size=batch_size,
             seed=args.seed,
         )
-        qwen_runtime_records.append(
+        qwen_runtime_records.extend(
             benchmark_large_vocab_runtime(
                 qwen_tables,
                 qwen_tensors,
@@ -414,7 +429,7 @@ def benchmark_large_vocab_runtime(
     warmup: int,
     iterations: int,
     device: torch.device,
-) -> dict[str, object]:
+) -> list[dict[str, object]]:
     batch_size = states_np.size
     states = torch.from_numpy(states_np).to(device)
     logits = torch.randn(
@@ -437,7 +452,7 @@ def benchmark_large_vocab_runtime(
     )
     output_states = torch.empty_like(states)
 
-    def function() -> torch.Tensor:
+    def validated_function() -> torch.Tensor:
         return triton_bounded_lr1_step(
             source.next(),
             tensors,
@@ -447,7 +462,7 @@ def benchmark_large_vocab_runtime(
         )[1]
 
     source.reset()
-    function()
+    validated_function()
     torch.cuda.synchronize()
     np.testing.assert_array_equal(output_tokens.cpu().numpy(), desired)
     np.testing.assert_array_equal(
@@ -455,15 +470,62 @@ def benchmark_large_vocab_runtime(
         expected_states,
     )
     source.reset()
-    timing = measure(
-        function,
+    validated_timing = measure(
+        validated_function,
+        warmup=warmup,
+        iterations=iterations,
+        measure_cuda=True,
+    )
+    default_plan = make_bounded_lr1_step_plan(
+        logits[0],
+        tensors,
+        states,
+        output_tokens=output_tokens,
+        output_states=output_states,
+    )
+    source.reset()
+    default_timing = measure(
+        lambda: default_plan(source.next())[1],
+        warmup=warmup,
+        iterations=iterations,
+        measure_cuda=True,
+    )
+    tuned_plan = make_bounded_lr1_step_plan(
+        logits[0],
+        tensors,
+        states,
+        output_tokens=output_tokens,
+        output_states=output_states,
+        autotune=True,
+    )
+    source.reset()
+    tuned_timing = measure(
+        lambda: tuned_plan(source.next())[1],
+        warmup=warmup,
+        iterations=iterations,
+        measure_cuda=True,
+    )
+    graph_source = CyclingGraphs(
+        [tuned_plan.capture(logits[index]) for index in range(buffer_count)]
+    )
+    graph_source.reset()
+    graph_source.next()
+    torch.cuda.synchronize()
+    np.testing.assert_array_equal(output_tokens.cpu().numpy(), desired)
+    np.testing.assert_array_equal(
+        output_states.cpu().numpy(),
+        expected_states,
+    )
+    graph_source.reset()
+    graph_timing = measure(
+        graph_source.next,
         warmup=warmup,
         iterations=iterations,
         measure_cuda=True,
     )
     row_nnz = tables.row_nnz[states_np]
     depths = tables.config_depths[states_np]
-    return {
+    common = {
         "mix": mix,
         "batch_size": batch_size,
         "unique_grammars": int(
@@ -484,13 +546,48 @@ def benchmark_large_vocab_runtime(
         "config_depth_min": int(depths.min()),
         "config_depth_mean": float(depths.mean()),
         "config_depth_max": int(depths.max()),
-        "strategy": "bounded_lr1_qwen3_csr_fused",
         "logits_buffer_count": buffer_count,
-        **asdict(timing),
-        "sequences_per_second": float(
-            batch_size / (timing.cuda_mean_us * 1e-6)
-        ),
     }
+    return [
+        {
+            **common,
+            "strategy": "bounded_lr1_qwen3_validated",
+            "launch_strategy": "validated_wrapper",
+            **asdict(validated_timing),
+            "sequences_per_second": float(
+                batch_size / (validated_timing.cuda_mean_us * 1e-6)
+            ),
+        },
+        {
+            **common,
+            "strategy": "bounded_lr1_qwen3_plan",
+            "launch_strategy": default_plan.strategy,
+            **asdict(default_timing),
+            "sequences_per_second": float(
+                batch_size / (default_timing.cuda_mean_us * 1e-6)
+            ),
+        },
+        {
+            **common,
+            "strategy": "bounded_lr1_qwen3_autotuned_plan",
+            "launch_strategy": tuned_plan.strategy,
+            "autotune_cuda_us": tuned_plan.autotune_cuda_us,
+            **asdict(tuned_timing),
+            "sequences_per_second": float(
+                batch_size / (tuned_timing.cuda_mean_us * 1e-6)
+            ),
+        },
+        {
+            **common,
+            "strategy": "bounded_lr1_qwen3_cuda_graph",
+            "launch_strategy": tuned_plan.strategy,
+            "autotune_cuda_us": tuned_plan.autotune_cuda_us,
+            **asdict(graph_timing),
+            "sequences_per_second": float(
+                batch_size / (graph_timing.cuda_mean_us * 1e-6)
+            ),
+        },
+    ]
 
 
 def benchmark_runtime(

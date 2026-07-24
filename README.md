@@ -47,7 +47,9 @@ On an NVIDIA L40S with a 32,768-token GPT-2 vocabulary:
 - With the full Qwen3 151,669-token vocabulary, bounded byte-terminal arithmetic
   and recursive balanced grammars compile into 675 configurations and 4,465
   token edges. The runtime tables use **40.8 KiB**, compile in **0.094 s**, and
-  the fused CSR token step takes about **28 us** through batch 2,048.
+  a prevalidated launch plan takes about **26 us CUDA / 34 us wall**. Capturing
+  the same kernel in a CUDA Graph reduces it to about **4.7-5.2 us CUDA /
+  11.5 us wall** through batch 2,048.
 
 This is evidence for GPU-native high-batch execution. General lexer integration,
 unbounded tokenizer-aware LR(1), and arbitrary JSON Schema semantics are not yet
@@ -85,7 +87,9 @@ solved.
    - a terminal trie that shares work across token prefixes;
    - exact reachable LR stack configurations up to a configured depth;
    - heterogeneous global packing into sparse token/next-state CSR rows;
-   - the existing fused CSR GPU sampler with no runtime parser stack.
+   - the existing fused CSR GPU sampler with no runtime parser stack;
+   - prevalidated launch plans, launch-shape autotuning, in-place state updates,
+     and CUDA Graph capture.
 
 ## Important finding about the original LR/PDA hypothesis
 
@@ -255,7 +259,9 @@ heterogeneous grammar/depth combinations:
 | Runtime token+next tables | 1.46 MiB |
 | Direct ACTION/GOTO tables for the same four grammar/depth entries | 9.14 KiB |
 | Memory expansion versus direct LR tables | 164x |
-| GPU fused step, typical CUDA time | 28-29 us |
+| Validated wrapper, typical CUDA time | 28-29 us |
+| Prevalidated plan, typical CUDA time | 25-27 us |
+| CUDA Graph, typical CUDA time | 4.7-5.2 us |
 
 The actual Qwen3 full-vocabulary probe is smaller because only
 grammar-compatible byte
@@ -266,8 +272,9 @@ tokens are representable:
 | Byte arithmetic | 4 | 87 | 81 | 783 | 0.034 s |
 | Balanced parentheses | 16 | 20 | 594 | 3,682 | 0.060 s |
 
-Packed together, these tables use 41,819 runtime bytes. The heterogeneous GPU
-step remains about 28 us from batch 1 through 2,048.
+Packed together, these tables use 41,819 runtime bytes. Across batch 1 through
+2,048, the prevalidated plan takes 25-27 us CUDA and the four-buffer CUDA Graph
+path takes 4.7-5.2 us CUDA with about 11.5 us wall latency.
 
 The failure mode is state explosion. With a synthetic 4,096-token grammar
 alphabet, arithmetic depth 4 compiles to 81 configurations and 100,641 edges in
@@ -279,6 +286,79 @@ The conclusion is a hybrid architecture: bounded configuration expansion is an
 excellent GPU-only fast path for shallow or low-branching grammars, but direct
 stack execution or Pre3/PSC-style stack classifiers are required when
 configuration expansion grows too large.
+
+### CSR kernel optimization
+
+The optimization sweep covers row lengths 1 through 8,192 and batch sizes 1
+through 2,048. It evaluates 1/2/4/8-warps, multi-row packed CTAs, ELLPACK, a
+prevalidated launch plan, launch-shape autotuning, and CUDA Graph replay.
+
+Key findings:
+
+- The raw Qwen3 CSR kernel itself takes roughly 5-11 us; most of the original
+  28 us CUDA-event result was launch gaps and Python validation/dispatch.
+- Moving validation and launch-shape selection out of the hot path saves roughly
+  8-12% on the normal launch path.
+- CUDA Graph replay is the dominant optimization: approximately 5.5x lower CUDA
+  time and 3.2x lower wall latency than the validated wrapper.
+- Packing several tiny rows into one CTA helps isolated narrow-row cases by up
+  to roughly 20%, but is not consistently faster for the real heterogeneous
+  Qwen3 rows. It remains an autotune candidate rather than the default.
+- ELLPACK uses 105,300 bytes versus 41,819 CSR runtime bytes for the Qwen3
+  tables and provides no consistent latency improvement. CSR remains the
+  default.
+- Wide rows still require more warps: 8,192-entry rows reach about 72 us at
+  batch 2,048, while Qwen3's 19-entry maximum remains near 5 us of device work.
+
+Machine-readable sweep results:
+[`results/l40s-csr-optimization.json`](results/l40s-csr-optimization.json).
+
+### Fair Qwen3 comparison with XGrammar
+
+The fair benchmark uses:
+
+- the same full 151,669-token Qwen3 vocabulary and token IDs;
+- the same finite-depth arithmetic and balanced-parentheses languages;
+- the same concrete prefix/configuration distribution;
+- identical full-width FP16 logits and selected winner;
+- bit-for-bit comparison of every packed next-token mask before timing;
+- XGrammar thread counts 1/2/4/8/auto, selecting the fastest per batch;
+- both XGrammar's native apply+argmax path and a stronger fused-bitset argmax
+  path built with gpu-lr1's kernel;
+- equivalent CUDA Graph optimization on both GPU paths.
+
+All masks match exactly. The strongest optimistic XGrammar path includes CPU
+mask generation, pinned H2D copy, and graphed fused bitset argmax, but excludes
+`accept_token`. The stateful path additionally copies selected tokens to CPU,
+accepts them, and rolls back so each timing iteration starts at the same prefix.
+
+| Batch | gpu-lr1 plan | gpu-lr1 graph | XGrammar optimistic | XGrammar stateful | Graph speedup optimistic | Graph speedup stateful |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 33.4 us | 11.7 us | 23.9 us | 45.1 us | 2.0x | 3.9x |
+| 8 | 36.9 us | 11.8 us | 75.5 us | 115.2 us | 6.4x | 9.7x |
+| 32 | 35.2 us | 11.7 us | 273.1 us | 350.7 us | 23.3x | 29.9x |
+| 128 | 33.8 us | 11.7 us | 953.9 us | 1,183.0 us | 81.4x | 101.0x |
+| 512 | 33.9 us | 11.8 us | 2,664.6 us | 3,764.1 us | 225.2x | 318.1x |
+| 2,048 | 36.1 us | 11.8 us | 10,222.4 us | 17,388.9 us | 863.5x | 1,468.9x |
+
+Important counterweights:
+
+- Without CUDA Graphs, gpu-lr1 is slower at batch 1: 33.4 us versus XGrammar's
+  23.9 us optimized path. The normal plan wins from batch 8 onward.
+- gpu-lr1 compilation takes 0.856 s versus 0.0032 s for XGrammar in this
+  workload, about 266x slower.
+- gpu-lr1's runtime tables use about 292 KiB without diagnostic reduction
+  counts, versus 53 KiB reported by XGrammar's compiler cache.
+- Per-batch-shape autotuning takes about 0.6 s and capturing four benchmark
+  graphs about 0.5 s. These must be cached and amortized.
+- Model execution is excluded. XGrammar can overlap CPU mask work with model
+  execution, so these are isolated constraint-step results, not end-to-end TPOT
+  speedups.
+- The languages are deliberately sparse, which matches structured decoding but
+  favors gather-based sampling over full-vocabulary scans.
+
+Machine-readable comparison:
+[`results/l40s-fair-xgrammar-qwen3.json`](results/l40s-fair-xgrammar-qwen3.json).
 
 Full machine-readable results are in [`results/`](results/).
 
@@ -348,6 +428,12 @@ python3 -m venv --system-site-packages .venv
 .venv/bin/gpu-lr1-lr-token-bench \
   --profile full \
   --output results/l40s-lr1-token-full.json
+
+.venv/bin/gpu-lr1-csr-opt-bench \
+  --output results/l40s-csr-optimization.json
+
+.venv/bin/gpu-lr1-fair-xgrammar-bench \
+  --output results/l40s-fair-xgrammar-qwen3.json
 ```
 
 The 64-schema scaling run is:

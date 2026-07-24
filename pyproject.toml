@@ -19,7 +19,9 @@ baselines = ["xgrammar>=0.1.29"]
 
 [project.scripts]
 gpu-lr1-bench = "gpu_lr1.benchmark:main"
+gpu-lr1-csr-opt-bench = "gpu_lr1.csr_optimization_benchmark:main"
 gpu-lr1-density-bench = "gpu_lr1.density_benchmark:main"
+gpu-lr1-fair-xgrammar-bench = "gpu_lr1.fair_xgrammar_benchmark:main"
 gpu-lr1-lr-bench = "gpu_lr1.lr1_benchmark:main"
 gpu-lr1-lr-token-bench = "gpu_lr1.lr1_token_benchmark:main"
 gpu-lr1-stack-bench = "gpu_lr1.stack_benchmark:main"

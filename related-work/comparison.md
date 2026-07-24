@@ -195,6 +195,27 @@ narrower execution regime:
 Any comparison must report both coverage and speed. A faster engine that
 silently ignores schema keywords is not a valid replacement.
 
+The repository now includes a controlled Qwen3 comparison with XGrammar:
+
+- identical 151,669 token IDs and full-width logits;
+- two finite-depth grammars compiled independently by both engines;
+- identical concrete prefixes/configurations;
+- every timed mask checked bit-for-bit for equality;
+- fastest XGrammar thread count selected per batch;
+- a stronger-than-native XGrammar baseline using fused bitset argmax and a
+  captured pinned-H2D-copy CUDA Graph.
+
+Under that isolated constraint-step boundary, gpu-lr1's graphed path is 2.0x
+faster at batch 1 and 863.5x at batch 2,048 than the optimistic XGrammar path.
+Including XGrammar token acceptance and rollback changes the range to 3.9x
+through 1,468.9x. The non-graphed gpu-lr1 plan is slower at batch 1 and wins
+from batch 8 onward.
+
+The trade-off reverses at compilation: gpu-lr1 takes 0.856 s versus 0.0032 s for
+XGrammar and uses about 292 KiB of runtime tables versus about 52 KiB of
+XGrammar compiler cache. Model execution is excluded, and XGrammar can overlap
+CPU matching with the model, so these numbers are not end-to-end TPOT speedups.
+
 ## Defensible claims
 
 - gpu-lr1 demonstrates that a useful acyclic JSON Schema subset can execute

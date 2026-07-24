@@ -9,6 +9,7 @@ from gpu_lr1.lr1_tokens import (
     LR1TokenVocabulary,
     LR1TokenCompileTimeoutError,
     compile_bounded_lr1_token_automaton,
+    make_bounded_lr1_step_plan,
     pack_bounded_lr1_token_automata,
     select_and_advance_bounded_lr1_cpu,
     triton_bounded_lr1_step,
@@ -75,6 +76,10 @@ class BoundedLR1TokenCompilerTest(unittest.TestCase):
         state = automaton.next_state(state, 3)
         self.assertGreaterEqual(state, 0)
         self.assertTrue(automaton.accepting[state])
+        replayed = automaton.start_state
+        for token in automaton.config_witness_tokens[state]:
+            replayed = automaton.next_state(replayed, token)
+        self.assertEqual(replayed, state)
         self.assertEqual(automaton.next_state(state, 0), state)
         self.assertEqual(automaton.next_state(state, 6), -1)
 
@@ -245,6 +250,66 @@ class BoundedLR1TokenKernelTest(unittest.TestCase):
             next_states.cpu().numpy(),
             expected_states,
         )
+
+        device_logits = torch.from_numpy(logits).cuda()
+        device_states = torch.from_numpy(states).cuda()
+        plan = make_bounded_lr1_step_plan(
+            device_logits,
+            tensors,
+            device_states,
+            autotune=True,
+        )
+        planned_tokens, planned_states = plan(device_logits)
+        torch.cuda.synchronize()
+        np.testing.assert_array_equal(
+            planned_tokens.cpu().numpy(),
+            expected_tokens,
+        )
+        np.testing.assert_array_equal(
+            planned_states.cpu().numpy(),
+            expected_states,
+        )
+
+        inplace_states = torch.from_numpy(states).cuda()
+        inplace_plan = make_bounded_lr1_step_plan(
+            device_logits,
+            tensors,
+            inplace_states,
+            output_states=inplace_states,
+        )
+        inplace_graph = inplace_plan.capture(device_logits)
+        np.testing.assert_array_equal(
+            inplace_states.cpu().numpy(),
+            states,
+        )
+        inplace_graph.replay()
+        torch.cuda.synchronize()
+        np.testing.assert_array_equal(
+            inplace_states.cpu().numpy(),
+            expected_states,
+        )
+
+        graph = plan.capture(device_logits)
+        logits.fill(-20.0)
+        logits[0, 1] = 20.0
+        logits[1, 1] = 20.0
+        device_logits.copy_(torch.from_numpy(logits).cuda())
+        expected_tokens, expected_states = select_and_advance_bounded_lr1_cpu(
+            logits,
+            tables,
+            states,
+        )
+        graph_tokens, graph_states = graph.replay()
+        torch.cuda.synchronize()
+        np.testing.assert_array_equal(
+            graph_tokens.cpu().numpy(),
+            expected_tokens,
+        )
+        np.testing.assert_array_equal(
+            graph_states.cpu().numpy(),
+            expected_states,
+        )
+
         with self.assertRaisesRegex(ValueError, "vocabulary"):
             triton_bounded_lr1_step(
                 torch.from_numpy(logits[:, :-1]).cuda(),

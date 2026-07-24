@@ -4,11 +4,13 @@ import numpy as np
 import torch
 
 from gpu_lr1.kernels import (
+    make_ell_argmax_advance_plan,
     triton_bitset_argmax,
     triton_bitset_mask_logits,
     triton_byte_dfa_advance,
     triton_csr_argmax,
     triton_csr_argmax_advance,
+    triton_csr_argmax_advance_packed,
     triton_dense_advance,
     triton_dense_argmax,
     triton_dense_mask_logits,
@@ -134,6 +136,132 @@ class TritonKernelTest(unittest.TestCase):
         )
         self.assertTrue(torch.equal(dense, expected))
         self.assertTrue(torch.equal(byte_dfa, expected))
+
+    def test_packed_csr_handles_empty_rows_and_ties(self) -> None:
+        indptr = torch.tensor(
+            [0, 0, 2, 5],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        indices = torch.tensor(
+            [1, 3, 0, 2, 4],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        next_states = torch.tensor(
+            [11, 13, 20, 22, 24],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        rows = torch.tensor(
+            [0, 1, 2, 1, 2],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        logits = torch.zeros(
+            (rows.numel(), 8),
+            dtype=torch.float32,
+            device="cuda",
+        )
+        logits[1, 3] = 4
+        logits[2, 2] = 5
+        logits[3, 1] = 7
+        logits[4, 0] = 9
+
+        for rows_per_program in (1, 2, 4, 8, 16):
+            tokens, states = triton_csr_argmax_advance_packed(
+                logits,
+                indptr,
+                indices,
+                next_states,
+                rows,
+                max_row_nnz=3,
+                rows_per_program=rows_per_program,
+                num_warps=4,
+            )
+            torch.cuda.synchronize()
+            self.assertTrue(
+                torch.equal(
+                    tokens,
+                    torch.tensor(
+                        [-1, 3, 2, 1, 0],
+                        dtype=torch.int32,
+                        device="cuda",
+                    ),
+                )
+            )
+            self.assertTrue(
+                torch.equal(
+                    states,
+                    torch.tensor(
+                        [0, 13, 22, 11, 20],
+                        dtype=torch.int32,
+                        device="cuda",
+                    ),
+                )
+            )
+
+    def test_ell_argmax_advance_matches_csr(self) -> None:
+        lengths = torch.tensor(
+            [0, 2, 3],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        tokens = torch.tensor(
+            [[0, 0, 0], [1, 3, 0], [0, 2, 4]],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        next_states = torch.tensor(
+            [[0, 0, 0], [11, 13, 0], [20, 22, 24]],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        rows = torch.tensor(
+            [0, 1, 2, 1, 2],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        logits = torch.zeros(
+            (rows.numel(), 8),
+            dtype=torch.float32,
+            device="cuda",
+        )
+        logits[1, 3] = 4
+        logits[2, 2] = 5
+        logits[3, 1] = 7
+        logits[4, 0] = 9
+        plan = make_ell_argmax_advance_plan(
+            logits,
+            lengths,
+            tokens,
+            next_states,
+            rows,
+        )
+
+        selected_tokens, selected_states = plan(logits)
+        torch.cuda.synchronize()
+
+        self.assertTrue(
+            torch.equal(
+                selected_tokens,
+                torch.tensor(
+                    [-1, 3, 2, 1, 0],
+                    dtype=torch.int32,
+                    device="cuda",
+                ),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                selected_states,
+                torch.tensor(
+                    [0, 13, 22, 11, 20],
+                    dtype=torch.int32,
+                    device="cuda",
+                ),
+            )
+        )
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ from gpu_lr1.lr1_tokens import (
     LR1TokenCompileTimeoutError,
     LR1TokenVocabulary,
     compile_bounded_lr1_token_automaton,
+    make_bounded_lr1_step_plan,
     pack_bounded_lr1_token_automata,
 )
 from gpu_lr1.schema import CanonicalJSONSchemaCompiler, UnsupportedSchemaError
@@ -32,5 +33,6 @@ __all__ = [
     "UnsupportedSchemaError",
     "Vocabulary",
     "compile_bounded_lr1_token_automaton",
+    "make_bounded_lr1_step_plan",
     "pack_bounded_lr1_token_automata",
 ]

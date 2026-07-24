@@ -42,6 +42,34 @@ def byte_arithmetic_grammar(name: str = "byte-arithmetic") -> Grammar:
     )
 
 
+def bounded_byte_arithmetic_grammar(
+    max_parenthesis_depth: int,
+    name: str = "bounded-byte-arithmetic",
+) -> Grammar:
+    if max_parenthesis_depth < 0:
+        raise ValueError("maximum parenthesis depth must be non-negative")
+    rules: dict[str, list[tuple[str, ...]]] = {
+        "N": [("N", "D"), ("D",)],
+        "D": [(str(value),) for value in range(10)],
+    }
+    for depth in range(max_parenthesis_depth + 1):
+        expression = f"E{depth}"
+        term = f"T{depth}"
+        factor = f"F{depth}"
+        rules[expression] = [
+            (expression, "+", term),
+            (term,),
+        ]
+        rules[term] = [
+            (term, "*", factor),
+            (factor,),
+        ]
+        rules[factor] = [("N",)]
+        if depth < max_parenthesis_depth:
+            rules[factor].append(("(", f"E{depth + 1}", ")"))
+    return Grammar.from_rules(name, "E0", rules)
+
+
 def balanced_grammar(name: str = "balanced") -> Grammar:
     return Grammar.from_rules(
         name,
@@ -50,6 +78,51 @@ def balanced_grammar(name: str = "balanced") -> Grammar:
             "S": [("(", "S", ")", "S"), ()],
         },
     )
+
+
+def bounded_balanced_grammar(
+    max_nesting_depth: int,
+    name: str = "bounded-balanced",
+) -> Grammar:
+    if max_nesting_depth < 0:
+        raise ValueError("maximum nesting depth must be non-negative")
+    rules: dict[str, list[tuple[str, ...]]] = {}
+    for depth in range(max_nesting_depth + 1):
+        sequence = f"S{depth}"
+        rules[sequence] = [(sequence, f"I{depth}"), ()]
+        if depth < max_nesting_depth:
+            rules[f"I{depth}"] = [("(", f"S{depth + 1}", ")")]
+        else:
+            rules[f"I{depth}"] = [("(", ")")]
+    return Grammar.from_rules(name, "S0", rules)
+
+
+def bounded_arithmetic_ebnf(max_parenthesis_depth: int) -> str:
+    if max_parenthesis_depth < 0:
+        raise ValueError("maximum parenthesis depth must be non-negative")
+    rules = ["root ::= E0"]
+    for depth in range(max_parenthesis_depth + 1):
+        rules.append(f'E{depth} ::= T{depth} ("+" T{depth})*')
+        rules.append(f'T{depth} ::= F{depth} ("*" F{depth})*')
+        factor = "[0-9]+"
+        if depth < max_parenthesis_depth:
+            factor += f' | "(" E{depth + 1} ")"'
+        rules.append(f"F{depth} ::= {factor}")
+    return "\n".join(rules)
+
+
+def bounded_balanced_ebnf(max_nesting_depth: int) -> str:
+    if max_nesting_depth < 0:
+        raise ValueError("maximum nesting depth must be non-negative")
+    rules = ["root ::= S0"]
+    for depth in range(max_nesting_depth + 1):
+        item = (
+            f'"(" S{depth + 1} ")"'
+            if depth < max_nesting_depth
+            else '"(" ")"'
+        )
+        rules.append(f"S{depth} ::= ({item})*")
+    return "\n".join(rules)
 
 
 def json_structure_grammar(name: str = "json-structure") -> Grammar:

@@ -8,7 +8,11 @@ from typing import Iterable, Mapping, Sequence
 import numpy as np
 import torch
 
-from gpu_lr1.kernels import triton_csr_argmax_advance
+from gpu_lr1.kernels import (
+    CSRArgmaxAdvancePlan,
+    make_csr_argmax_advance_plan,
+    triton_csr_argmax_advance,
+)
 from gpu_lr1.lr1 import (
     ACTION_ACCEPT,
     ACTION_ERROR,
@@ -164,6 +168,7 @@ class BoundedLR1TokenAutomaton:
     token_vocabulary: LR1TokenVocabulary
     max_stack_depth: int
     config_stacks: tuple[tuple[int, ...], ...]
+    config_witness_tokens: tuple[tuple[int, ...], ...]
     accepting: np.ndarray
     csr_indptr: np.ndarray
     csr_indices: np.ndarray
@@ -227,6 +232,7 @@ def compile_bounded_lr1_token_automaton(
     trie = _TerminalTrie(token_vocabulary)
     start_stack = (compiled.start_state,)
     configs = [start_stack]
+    witnesses: list[tuple[int, ...]] = [()]
     config_ids = {start_stack: 0}
     queue = deque([0])
     rows: list[dict[int, int]] = []
@@ -288,6 +294,7 @@ def compile_bounded_lr1_token_automaton(
                             )
                         next_state = len(configs)
                         configs.append(next_stack)
+                        witnesses.append(witnesses[state] + (token_id,))
                         config_ids[next_stack] = next_state
                         queue.append(next_state)
                     row[token_id] = next_state
@@ -306,6 +313,7 @@ def compile_bounded_lr1_token_automaton(
         token_vocabulary=token_vocabulary,
         max_stack_depth=max_stack_depth,
         config_stacks=tuple(configs),
+        config_witness_tokens=tuple(witnesses),
         accepting=np.asarray(accepting, dtype=np.bool_),
         csr_indptr=csr_indptr,
         csr_indices=csr_indices,
@@ -365,6 +373,26 @@ class PackedLR1TokenTables:
                 + self.config_depths.nbytes
             ),
         }
+
+    def ell_tables(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        row_lengths = self.row_nnz.astype(np.int32, copy=False)
+        width = self.max_row_nnz
+        if width <= 0:
+            raise ValueError("cannot build ELL tables with no token edges")
+        token_table = np.zeros(
+            (self.num_states, width),
+            dtype=np.int32,
+        )
+        next_state_table = np.zeros_like(token_table)
+        for state in range(self.num_states):
+            start = int(self.csr_indptr[state])
+            end = int(self.csr_indptr[state + 1])
+            length = end - start
+            token_table[state, :length] = self.csr_indices[start:end]
+            next_state_table[state, :length] = self.csr_next_state[start:end]
+        return row_lengths, token_table, next_state_table
 
     def torch_tensors(
         self,
@@ -524,6 +552,30 @@ def triton_bounded_lr1_step(
         max_row_nnz=tables.max_row_nnz,
         output_tokens=output_tokens,
         output_states=output_states,
+    )
+
+
+def make_bounded_lr1_step_plan(
+    logits: torch.Tensor,
+    tables: TorchPackedLR1TokenTables,
+    states: torch.Tensor,
+    *,
+    output_tokens: torch.Tensor | None = None,
+    output_states: torch.Tensor | None = None,
+    autotune: bool = False,
+) -> CSRArgmaxAdvancePlan:
+    if logits.shape[1] < tables.vocab_size:
+        raise ValueError("logits do not cover the bounded LR token vocabulary")
+    return make_csr_argmax_advance_plan(
+        logits,
+        tables.csr_indptr,
+        tables.csr_indices,
+        tables.csr_next_state,
+        states,
+        max_row_nnz=tables.max_row_nnz,
+        output_tokens=output_tokens,
+        output_states=output_states,
+        autotune=autotune,
     )
 
 
