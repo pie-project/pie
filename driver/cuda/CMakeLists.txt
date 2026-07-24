@@ -62,18 +62,6 @@ find_package(Threads REQUIRED)
 # are vendored (third_party/flashinfer_generated) and flashinfer itself is
 # fetched DOWNLOAD_ONLY for headers.
 
-# CUDA 13+ ships libcudacxx/CUB/Thrust under a `cccl/` prefix; CUTLASS and
-# vendored Marlin still `#include <cuda/std/...>` etc. without that prefix.
-# Add the CCCL dir when the non-prefixed headers don't exist.
-foreach(_cuda_inc IN LISTS CUDAToolkit_INCLUDE_DIRS)
-  if(EXISTS "${_cuda_inc}/cccl" AND NOT EXISTS "${_cuda_inc}/cuda/std")
-    list(APPEND PIE_CCCL_INCLUDE_DIRS "${_cuda_inc}/cccl")
-  endif()
-endforeach()
-if(PIE_CCCL_INCLUDE_DIRS)
-  message(STATUS "Adding CCCL include dirs for CUDA 13+: ${PIE_CCCL_INCLUDE_DIRS}")
-endif()
-
 if(NOT PIE_DRIVER_ABI_INCLUDE_DIR)
   set(PIE_DRIVER_ABI_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../interface/driver/include")
 endif()
@@ -107,6 +95,22 @@ cpmaddpackage(
   GIT_TAG v0.6.15
   GIT_SHALLOW TRUE
   DOWNLOAD_ONLY YES)
+
+# FlashInfer v0.6.15 uses APIs introduced by its vendored CCCL 3.3.2.
+# Keep these ahead of the toolkit-bundled CCCL, which may be older even on
+# CUDA 13 installations.
+set(_FI_CCCL_ROOT "${flashinfer_SOURCE_DIR}/3rdparty/cccl")
+set(PIE_CCCL_INCLUDE_DIRS
+  "${_FI_CCCL_ROOT}/cub"
+  "${_FI_CCCL_ROOT}/libcudacxx/include"
+  "${_FI_CCCL_ROOT}/thrust")
+foreach(_fi_cccl_include IN LISTS PIE_CCCL_INCLUDE_DIRS)
+  if(NOT EXISTS "${_fi_cccl_include}")
+    message(FATAL_ERROR
+      "FlashInfer vendored CCCL headers are missing: ${_fi_cccl_include}")
+  endif()
+endforeach()
+message(STATUS "Using FlashInfer vendored CCCL: ${_FI_CCCL_ROOT}")
 
 # v0.6.15 has a narrowing-conversion warning nvcc escalates to an error
 # (`state_stride_batch`, signed long, brace-initialized into a uint64_t
@@ -457,8 +461,8 @@ add_library(pie_flashinfer_cutlass_moe OBJECT
   ${PIE_FLASHINFER_MOE_GENERATED_SOURCES})
 target_include_directories(pie_flashinfer_cutlass_moe PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
-  ${CUDAToolkit_INCLUDE_DIRS}
   ${PIE_CCCL_INCLUDE_DIRS}
+  ${CUDAToolkit_INCLUDE_DIRS}
   ${flashinfer_SOURCE_DIR}/include
   ${flashinfer_SOURCE_DIR}/csrc
   ${flashinfer_SOURCE_DIR}/csrc/fused_moe/cutlass_backend
@@ -534,6 +538,13 @@ if(PIE_CUDA_FLASHINFER_MAMBA_SM90)
   target_compile_definitions(pie_driver_cuda_lib PRIVATE
     FLASHINFER_MAMBA_ENABLE_SM90=1)
 endif()
+
+# nvcc cannot parse toml++ 3.4.0's bool-returning for_each detection. The
+# library-provided fallback preserves ordinary traversal in CUDA translation
+# units; host C++ builds retain early-exit support.
+target_compile_definitions(pie_driver_cuda_lib PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:TOML_RETURN_BOOL_FROM_FOR_EACH_BROKEN=1>
+  $<$<COMPILE_LANGUAGE:CUDA>:TOML_RETURN_BOOL_FROM_FOR_EACH_BROKEN_ACKNOWLEDGED=1>)
 
 target_link_libraries(pie_driver_cuda_lib PUBLIC
   CLI11::CLI11

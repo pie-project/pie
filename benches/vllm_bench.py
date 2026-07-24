@@ -198,6 +198,17 @@ def run(args: argparse.Namespace):
         max_tokens=args.max_tokens,
         ignore_eos=args.ignore_eos,
     )
+
+    def sampling_for(i: int) -> "SamplingParams":
+        if not getattr(args, "mixed_phase", False):
+            return sampling
+        return SamplingParams(
+            temperature=args.temperature,
+            top_p=args.top_p,
+            max_tokens=request_max_tokens(args, i),
+            ignore_eos=args.ignore_eos,
+        )
+
     if args.warmup:
         warmup_sampling = sampling
         if args.warmup_max_tokens is not None:
@@ -217,9 +228,12 @@ def run(args: argparse.Namespace):
     start = time.perf_counter()
     try:
         if args.mode == "latency":
-            for p, prompt_count in zip(run_prompts, run_prompt_counts):
+            for i, (p, prompt_count) in enumerate(
+                zip(run_prompts, run_prompt_counts),
+                start=args.warmup,
+            ):
                 req_start = time.perf_counter()
-                outputs = llm.generate([p], sampling)
+                outputs = llm.generate([p], sampling_for(i))
                 req_wall = time.perf_counter() - req_start
                 for out in outputs:
                     results.append(
@@ -231,7 +245,15 @@ def run(args: argparse.Namespace):
                         )
                     )
         else:
-            outputs = llm.generate(run_prompts, sampling)
+            measured_sampling = (
+                [
+                    sampling_for(args.warmup + i)
+                    for i in range(len(run_prompts))
+                ]
+                if getattr(args, "mixed_phase", False)
+                else sampling
+            )
+            outputs = llm.generate(run_prompts, measured_sampling)
             for out, prompt_count in zip(outputs, run_prompt_counts):
                 results.append(
                     RequestResult(True, 0.0, len(out.outputs[0].token_ids), prompt_count)
@@ -319,7 +341,7 @@ def run_streaming(args: argparse.Namespace):
         return SamplingParams(
             temperature=args.temperature,
             top_p=args.top_p,
-            max_tokens=request_max_tokens(args, i),
+            max_tokens=request_max_tokens(args, args.warmup + i),
             ignore_eos=args.ignore_eos,
         )
 

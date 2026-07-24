@@ -481,6 +481,22 @@ def finish(summary: BenchSummary, results: list[RequestResult], json_out: str | 
 
 def _load_cudart():
     candidates = []
+    if override := os.environ.get("CUDART_LIBRARY"):
+        candidates.append(override)
+    for env_name in ("CUDA_HOME", "CUDA_PATH"):
+        if cuda_root := os.environ.get(env_name):
+            candidates.extend(
+                (
+                    str(Path(cuda_root) / "lib64" / "libcudart.so"),
+                    str(
+                        Path(cuda_root)
+                        / "targets"
+                        / "x86_64-linux"
+                        / "lib"
+                        / "libcudart.so"
+                    ),
+                )
+            )
     found = ctypes.util.find_library("cudart")
     if found:
         candidates.append(found)
