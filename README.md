@@ -64,6 +64,7 @@ pie run text-completion -- --prompt "The capital of France is"
 | `tests/inferlets/` | Curated inferlet E2E fixtures |
 | `sdk/` | Inferlet SDKs (Rust · Python · JavaScript) |
 | `client/` | Client libraries (Rust · Python · JavaScript) |
+| `plex/` | PLEX contracts, reports, presentation, and policy/workload wikis |
 | `website/` | [pie-project.org](https://pie-project.org) docs site |
 
 ## Building inferlets

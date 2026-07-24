@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 
 import json
+import os
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+PLEX = ROOT / "plex"
 REPLICATIONS = ROOT / "tests" / "policies" / "replications"
-PAPERS = ROOT / "plex-serving-policy-wiki" / "papers"
-CATALOG = ROOT / "plex-serving-policy-wiki" / "catalog.json"
+PAPERS = PLEX / "plex-serving-policy-wiki" / "papers"
+CATALOG = PLEX / "plex-serving-policy-wiki" / "catalog.json"
 START = "<!-- plex-v0.6-replication:start -->"
 END = "<!-- plex-v0.6-replication:end -->"
 SLUGS = {
@@ -68,6 +70,9 @@ def main() -> None:
 
 def update_page(path: Path, status: dict) -> None:
     text = path.read_text()
+    metadata_link = Path(
+        os.path.relpath(ROOT / status["metadata_path"], path.parent)
+    ).as_posix()
     block = "\n".join(
         [
             START,
@@ -77,7 +82,7 @@ def update_page(path: Path, status: dict) -> None:
             f"- Operations: {', '.join(f'`{op}`' for op in status['operations'])}",
             f"- Evidence: `{status['evidence_level']}`",
             f"- Validation: `{status['validation_status']}`",
-            f"- Metadata: [`{status['metadata_path']}`](../../{status['metadata_path']})",
+            f"- Metadata: [`{status['metadata_path']}`]({metadata_link})",
             "- Deferred mechanics: "
             + (
                 "; ".join(status["deferred_mechanics"])

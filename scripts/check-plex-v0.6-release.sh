@@ -16,8 +16,8 @@ python3 -m json.tool tests/policies/performance-targets.json >/dev/null
 python3 -m json.tool tests/policies/fidelity-audit.json >/dev/null
 python3 -m json.tool tests/policies/reproducibility-gap-taxonomy.json >/dev/null
 python3 -m json.tool tests/policies/reproducibility-gap-matrix.json >/dev/null
-python3 -m json.tool plex_policy_performance_report.json >/dev/null
-python3 -m json.tool plex_policy_reproducibility_roadmap.json >/dev/null
+python3 -m json.tool plex/plex_policy_performance_report.json >/dev/null
+python3 -m json.tool plex/plex_policy_reproducibility_roadmap.json >/dev/null
 python3 -m py_compile \
     scripts/benchmark-plex-policy-performance.py \
     scripts/benchmark-vllm-plex-policy.py \
@@ -32,15 +32,15 @@ python3 scripts/update-plex-paper-replication-status.py
 python3 scripts/generate-plex-reproducibility-roadmap.py \
     --taxonomy tests/policies/reproducibility-gap-taxonomy.json \
     --matrix tests/policies/reproducibility-gap-matrix.json \
-    --output-json plex_policy_reproducibility_roadmap.json \
-    --output-md plex_policy_reproducibility_roadmap.md
+    --output-json plex/plex_policy_reproducibility_roadmap.json \
+    --output-md plex/plex_policy_reproducibility_roadmap.md
 python3 scripts/generate-plex-current-model-presentation.py >/dev/null
 python3 - <<'PY'
 import json
 
 with open("tests/policies/replication-report.json") as handle:
     replication = json.load(handle)
-with open("plex_policy_reproducibility_roadmap.json") as handle:
+with open("plex/plex_policy_reproducibility_roadmap.json") as handle:
     roadmap = json.load(handle)
 if replication["evidence_counts"].get("policy-kernel-reproduction") != 13:
     raise SystemExit("expected 13 policy-kernel reproductions")
@@ -52,13 +52,13 @@ if roadmap.get("current_model_closed_count") != 17:
     raise SystemExit("expected all 17 current-model policies to be closed")
 PY
 git --no-pager diff --exit-code -- \
-    plex_replication_report.md \
+    plex/plex_replication_report.md \
     tests/policies/replication-report.json \
-    plex-serving-policy-wiki/catalog.json \
-    plex-serving-policy-wiki/papers \
-    plex_policy_reproducibility_roadmap.json \
-    plex_policy_reproducibility_roadmap.md \
-    plex_current_model_presentation.html
+    plex/plex-serving-policy-wiki/catalog.json \
+    plex/plex-serving-policy-wiki/papers \
+    plex/plex_policy_reproducibility_roadmap.json \
+    plex/plex_policy_reproducibility_roadmap.md \
+    plex/plex_current_model_presentation.html
 
 if [[ -n "${PLEX_PYTHON:-}" ]]; then
     PLEX_TEST_POLICY="$root/tests/policies/target/packages/plex_coordinated.plexpkg" \

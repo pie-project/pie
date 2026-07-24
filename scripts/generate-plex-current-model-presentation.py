@@ -9,10 +9,11 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
+PLEX = ROOT / "plex"
 REPLICATION = ROOT / "tests/policies/replication-report.json"
-ROADMAP = ROOT / "plex_policy_reproducibility_roadmap.json"
-PERFORMANCE = ROOT / "plex_policy_performance_report.json"
-OUTPUT = ROOT / "plex_current_model_presentation.html"
+ROADMAP = PLEX / "plex_policy_reproducibility_roadmap.json"
+PERFORMANCE = PLEX / "plex_policy_performance_report.json"
+OUTPUT = PLEX / "plex_current_model_presentation.html"
 
 GROUPS = {
     "Fairness & workflow": ["agentix", "vtc", "fairserve", "dlpm", "justitia"],

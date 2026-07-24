@@ -1,5 +1,20 @@
 {
+  "current_capabilities": [
+    "dense batch admission with resource limits",
+    "capacity-safe set routing over sparse feasible edges",
+    "multi-request schedule selections and token budgets",
+    "resident/prospective cache objects, byte capacity and reclaim episodes",
+    "deduplicated feedback with request, group, cache, assignment, selection and action subjects",
+    "shared, group and request-scoped persistent policy state",
+    "schedule.atomic-enqueue@1",
+    "request.cancel@1",
+    "group.cancel@1",
+    "cache.prefetch@1",
+    "cache.swap@1",
+    "request.rebalance@1"
+  ],
   "current_model_closed_count": 17,
+  "current_model_only_count": 17,
   "entries": [
     {
       "best_achievable_evidence_with_current_model": "faithful",
@@ -2841,6 +2856,165 @@
     "faithful": 13,
     "inspired-only": 1
   },
+  "new_primitive_count": 11,
   "policy_count": 31,
-  "schema_version": 1
+  "primitive_catalog": [
+    {
+      "id": "request.pause-resume@1",
+      "kind": "action-and-lifecycle",
+      "minimal_contract": "request pause, preserve, resume or discard with enacted status and preserved-state identity",
+      "policies": [
+        "chameleon",
+        "qlm",
+        "slos-serve",
+        "thunderagent"
+      ],
+      "policy_count": 4,
+      "why": "intercept, agent thrashing and staged reasoning policies require more than omission or cancellation"
+    },
+    {
+      "id": "target.provision@1",
+      "kind": "control-plane-action",
+      "minimal_contract": "load or unload a model, create or remove a replica, resize capacity and report readiness/failure",
+      "policies": [
+        "dualmap",
+        "llumnix",
+        "pythia",
+        "qlm"
+      ],
+      "policy_count": 4,
+      "why": "QLM, SLOs-Serve, GoodServe and routing systems include provisioning beyond choosing existing targets"
+    },
+    {
+      "id": "schedule.co-execute@1",
+      "kind": "guarantee",
+      "minimal_contract": "all requests in a selection begin the same execution step or the selection is not enacted",
+      "policies": [
+        "branch-regulation",
+        "dynasor",
+        "slos-serve"
+      ],
+      "policy_count": 3,
+      "why": "atomic enqueue does not guarantee simultaneous branch or gang execution"
+    },
+    {
+      "id": "cache.move@1",
+      "kind": "multi-phase-action",
+      "minimal_contract": "reserve destination tier, transfer object or range, commit placement, release source, and report actual bytes/latency",
+      "policies": [
+        "hotprefix",
+        "infercept"
+      ],
+      "policy_count": 2,
+      "why": "prefetch and swap intents do not establish tier placement, copy-once or rollback"
+    },
+    {
+      "id": "request.migrate@1",
+      "kind": "multi-phase-action",
+      "minimal_contract": "prepare destination, reserve resources, copy incremental state, commit or abort, and report downtime/bytes",
+      "policies": [
+        "goodserve",
+        "llumnix"
+      ],
+      "policy_count": 2,
+      "why": "request.rebalance@1 is only an intent and cannot prove live-migration semantics"
+    },
+    {
+      "id": "branch.defer-retain@1",
+      "kind": "schedule-lifecycle-guarantee",
+      "minimal_contract": "defer a branch without terminating its parent, retain its execution and KV state, and reconsider it at a later step",
+      "policies": [
+        "branch-regulation"
+      ],
+      "policy_count": 1,
+      "why": "ordinary request cancellation or omission does not prove reversible branch-width regulation"
+    },
+    {
+      "id": "decode.speculate@1",
+      "kind": "guarantee-and-action",
+      "minimal_contract": "select speculative token budget or mode, verify engine support, and report accepted/rejected tokens and latency",
+      "policies": [
+        "slos-serve"
+      ],
+      "policy_count": 1,
+      "why": "SLO-aware speculation is not expressible through ordinary schedule token budgets alone"
+    },
+    {
+      "id": "request.complete-with-output@1",
+      "kind": "action",
+      "minimal_contract": "terminate a reasoning request while committing a validated stable answer or aggregate result",
+      "policies": [
+        "dynasor"
+      ],
+      "policy_count": 1,
+      "why": "Dynasor-style early completion is not equivalent to cancellation"
+    },
+    {
+      "id": "request.phase-handoff@1",
+      "kind": "multi-phase-action",
+      "minimal_contract": "atomically transfer request ownership and state between prefill and decode roles, then persist the selected destination binding",
+      "policies": [
+        "conserve"
+      ],
+      "policy_count": 1,
+      "why": "disaggregated conversation serving requires exactly-once KV handoff plus durable decoder affinity"
+    },
+    {
+      "id": "tool.resource@1",
+      "kind": "action-and-lifecycle",
+      "minimal_contract": "prepare, acquire, release and fail a named tool/runtime resource with request or group ownership",
+      "policies": [
+        "thunderagent"
+      ],
+      "policy_count": 1,
+      "why": "agent serving papers coordinate external environments whose readiness and teardown affect scheduling"
+    },
+    {
+      "id": "workflow.graph@1",
+      "kind": "typed-context-guarantee",
+      "minimal_contract": "validated nodes, edges, AND/OR semantics, readiness, task groups and lineage revisions",
+      "policies": [
+        "parrot"
+      ],
+      "policy_count": 1,
+      "why": "JSON facts can carry a DAG, but the host cannot validate graph identity, atomic groups or evolution"
+    }
+  ],
+  "schema_version": 1,
+  "taxonomy": {
+    "current_model_improvement": {
+      "definition": "The paper algorithm can be implemented using the existing admit, route, schedule, cache and feedback operations; bounded host facts; shared/group/request state; direct plans; and already standardized mechanics.",
+      "examples": [
+        "exact scoring, optimization or queue algorithm inside Wasm",
+        "host-side predictor or profiler output supplied as facts",
+        "per-client, per-group, per-target or cache-object accounting in existing state",
+        "stateful multi-opportunity control using feedback",
+        "global bounded assignment using set-oriented route or schedule plans",
+        "distributed CAS state backend without changing the policy contract"
+      ]
+    },
+    "implementation_gap": {
+      "definition": "The current programming model is sufficient, but the committed policy, adapter, state loop, benchmark, or host facts do not implement the paper algorithm faithfully.",
+      "examples": [
+        "wrong equation, ordering, threshold, statistic or baseline",
+        "missing state transition or feedback accounting",
+        "capacity-invalid or over-reclaiming plans",
+        "caller-supplied oracle facts replacing a required estimator",
+        "paper operation declared but trait method falling back",
+        "synthetic benchmark rewarding the implementation by construction"
+      ]
+    },
+    "new_primitive_required": {
+      "definition": "Faithful behavior requires authority, atomicity, lifecycle, or enacted mechanism that cannot be represented or safely validated by the current operations and standard mechanics.",
+      "examples": [
+        "autonomous timers and lease expiry callbacks",
+        "multi-phase migration with reserve, copy, commit and rollback",
+        "partial cache-object transformation or typed cache hierarchy",
+        "pause, resume and preserve/discard lifecycle requested by policy",
+        "returning a stable intermediate answer while terminating reasoning",
+        "simultaneous co-scheduling rather than atomic queue insertion",
+        "model loading, replica provisioning and autoscaling control"
+      ]
+    }
+  }
 }

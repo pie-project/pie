@@ -6,10 +6,11 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+PLEX = ROOT / "plex"
 REPLICATIONS = ROOT / "tests" / "policies" / "replications"
 FIDELITY = ROOT / "tests" / "policies" / "fidelity-audit.json"
 REPORT_JSON = ROOT / "tests" / "policies" / "replication-report.json"
-REPORT_MD = ROOT / "plex_replication_report.md"
+REPORT_MD = PLEX / "plex_replication_report.md"
 REQUIRED = {
     "id",
     "title",
