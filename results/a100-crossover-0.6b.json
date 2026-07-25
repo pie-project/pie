@@ -1,0 +1,42 @@
+{
+  "model": "Qwen/Qwen3-0.6B",
+  "context": 256,
+  "vocab_size": 151936,
+  "measurements": [
+    {
+      "batch_size": 1,
+      "decode_us": 2199.9218261044007,
+      "xgrammar_fill_us": 2.828286960721016,
+      "xgrammar_threads": 1,
+      "fill_share_percent": 0.12856306652174626
+    },
+    {
+      "batch_size": 8,
+      "decode_us": 2800.5923923046794,
+      "xgrammar_fill_us": 10.00871416181326,
+      "xgrammar_threads": 1,
+      "fill_share_percent": 0.35737846711698135
+    },
+    {
+      "batch_size": 32,
+      "decode_us": 2895.7769827684388,
+      "xgrammar_fill_us": 42.26900637149811,
+      "xgrammar_threads": 1,
+      "fill_share_percent": 1.4596775450258546
+    },
+    {
+      "batch_size": 128,
+      "decode_us": 4690.1912210159935,
+      "xgrammar_fill_us": 164.22381158918142,
+      "xgrammar_threads": 1,
+      "fill_share_percent": 3.5014310472741688
+    },
+    {
+      "batch_size": 512,
+      "decode_us": 14082.40965611185,
+      "xgrammar_fill_us": 654.4038886204362,
+      "xgrammar_threads": 1,
+      "fill_share_percent": 4.646959608481643
+    }
+  ]
+}

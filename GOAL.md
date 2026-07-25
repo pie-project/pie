@@ -2,8 +2,9 @@
 
 ## Ultimate goal
 
-Build **gpugrammar**: a GPU-native constrained-decoding library that *replaces*
-XGrammar as the default grammar backend in LLM serving engines.
+Build **gpugrammar**: a constrained-decoding engine whose parser state lives on
+the device, so that a grammar is something a decode step *contains* rather than
+something a decode step *waits for*.
 
 Two hard requirements set it apart from the current `gpu-lr1` prototype:
 
@@ -13,6 +14,53 @@ Two hard requirements set it apart from the current `gpu-lr1` prototype:
    paper first; the open-source release follows. The paper must present a set of
    clearly identified technical challenges solved in a way that is *elegant*,
    not merely engineered.
+
+### The thesis, and what it is not
+
+**[framing decision, 2026-07-25]** This project is *not* an attempt to build a
+faster mask generator. That framing was tried and it does not survive contact
+with measurement.
+
+XGrammar's mask fill is 4.6% of a vLLM decode step at batch 512 on a 0.6B model,
+and it overlaps the forward pass, so the ceiling on beating it is small and
+conditional — it needs a large batch, a small model, and a starved CPU. Every
+honest re-measurement of the "10x faster" claim moved it the wrong way: 17.3x on
+synthetic schemas with a truncated vocabulary and a single-threaded baseline,
+4.5–14.3x once the workload was real and the baseline was given its best thread
+count, and **−19% end to end** once our own compiler was actually in the loop.
+A claim that erodes under scrutiny is not the claim to build a paper on.
+
+The durable claim is about **where the state lives**, and it is not conditional
+on batch size:
+
+> A CUDA graph is a fixed sequence of kernels. Anything the host has to produce
+> mid-step cannot be inside it. Today's engines therefore build the mask outside
+> the graph and hand it in, which makes the grammar a second-class participant
+> in the decode loop.
+
+Three consequences follow, and none of them are latency arguments:
+
+- **Speculative decoding breaks.** Verifying `k` drafts is `k` times the grammar
+  work, and it lands *after* the draft, on the critical path, with nothing to
+  overlap. Measured at batch 512, k=8: XGrammar 33,367 µs against 56 µs. That
+  ratio does not shrink as CPUs get faster; it grows as `k` does.
+- **Sampler fusion becomes possible.** If the allowed set is on device, sampling
+  reads 400 candidates instead of 151,669. Measured at batch 512: unconstrained
+  FlashInfer 3,457 µs, fused constrained sampling 198 µs. *Constraining makes
+  sampling cheaper* — but only if the constraint is already there.
+- **The decode loop can be captured whole.** A host-dependent component cannot
+  join a fully graph-resident or megakernel decode loop at all.
+
+On all three, the comparison is not "we are faster" but "the other design cannot
+participate". That is what makes the claim worth a paper.
+
+**What we owe in exchange** is the cost of residency: table memory. XGrammar
+keeps kilobytes because it recomputes on the host every step. We keep the
+translation from tokens to terminals resident, and the honest number today is
+31 MB for a schema that started at 440 MB. Bringing that to the same order of
+magnitude as XGrammar's cache is the central engineering problem, and the
+measurements say it is reachable: a mask is a pure function of the lexer state,
+and a real document visits 1–4% of the states its grammar can reach.
 
 ## Sequencing
 
@@ -28,23 +76,34 @@ Everything in this repository is a feasibility prototype feeding that paper.
 Work that does not either (a) retire a named challenge below or (b) produce a
 figure/table in the paper is out of scope.
 
-## What "replaces XGrammar" must mean concretely
+## What "device-resident" must mean concretely
 
 A serving engine should be able to swap XGrammar for gpugrammar and get:
 
+- **A decode step that never touches the host.** No mask handed in from
+  outside, no synchronisation per token. This is the requirement everything
+  else is in service of; a design that violates it is not this project.
 - **Equal or greater grammar coverage.** Full LALR(1)/IELR(1), plus a regex
   lexer layer, plus JSON Schema as a front-end — with no silent language
   truncation.
 - **Bit-exact masks.** Differentially verified against a reference parser on
-  every benchmark configuration, not just spot-checked.
-- **Lower per-step cost at serving batch sizes**, with the constraint step
-  resident inside the model's CUDA graph — no host round trip per token.
+  every benchmark configuration, not just spot-checked. Approximation is not
+  available here: one wrong bit either leaks an illegal token or blocks a legal
+  one, so learned or lossy mask representations are out of scope by definition.
+- **Speculative decoding at full draft length**, with rollback and fork on
+  device, since this is where a host-side matcher stops being viable rather
+  than merely costing something.
+- **Sampler fusion**: the allowed set feeds the sampler directly instead of
+  being materialised as a vocabulary-wide mask first.
+- **Bounded memory** under heterogeneous continuous batching, within an order
+  of magnitude of XGrammar's kilobyte-scale compiler cache. This is the price
+  of residency and the number we are most obliged to report honestly.
 - **Serving-grade compile times.** New schemas arrive per request; compilation
   must be incremental and cached, not a per-grammar batch job.
-- **Bounded memory** under heterogeneous continuous batching, competitive with
-  XGrammar's kilobyte-scale compiler cache.
-- **Full sampler integration:** temperature/top-k/top-p, plus rollback and fork
-  for speculative decoding.
+
+**Parity, not victory, is the bar for per-step mask cost.** If the constraint
+step is resident and its cost is comparable, the argument is already won,
+because the alternative cannot be resident at all.
 
 ## Killer examples (measured, A100 80GB, Qwen3 151,669-token vocabulary)
 
@@ -443,6 +502,13 @@ them is reported.
 - **Reporting rule:** every reported speedup states batch size, allowed-token
   distribution, and whether model execution is included. Isolated-microbenchmark
   speedups are never headlined.
+- **Headline rule:** mask-fill throughput is never the headline claim. It is
+  reported for parity, not for victory. The headline claims are the ones a
+  host-side matcher cannot make at all: speculative decoding at depth, sampler
+  fusion, and whole-loop graph capture.
+- **Residency cost is reported beside every residency benefit.** Any figure
+  showing what device residency buys carries the table memory it costs, on the
+  same page.
 
 ## Working agreement
 

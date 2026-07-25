@@ -3,6 +3,22 @@
 GPU feasibility prototype for heterogeneous batched LR(1) and JSON Schema
 constrained decoding.
 
+## Framing
+
+**[2026-07-25]** The benchmarks below were run against an earlier thesis — that
+this engine generates masks faster than XGrammar — and they are kept as a record
+of that measurement, not as a current claim. They used synthetic schemas, a
+vocabulary truncated to 32,768 tokens, and a single-threaded XGrammar baseline
+that later measurement showed to be 2.4–2.9x off its own best. Rerunning them
+honestly moved the headline from 17.3x to 4.5–14.3x, and running our own
+compiler end to end inside vLLM produced −19%.
+
+The project's claim is now about **where the parser state lives**, not how fast
+a mask is built. See `GOAL.md`. Numbers in this file that compare mask-fill
+throughput should be read as parity checks; the claims that carry the work are
+speculative decoding at depth, sampler fusion, and whole-loop graph capture,
+none of which a host-side matcher can do at all.
+
 ## Result
 
 The central idea is practical in three stages:
