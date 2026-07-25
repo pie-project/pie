@@ -98,12 +98,50 @@ async def test_prefix_tree_kv_cache(client, args):
 
 
 async def test_cacheback_speculative_decoding(client, args):
-    await _nonempty(
-        client,
-        args,
-        "cacheback-speculative-decoding",
-        {"max_tokens": 4, "draft_length": 2, "max_ngram": 4},
-    )
+    """Speculation must change the number of forward passes and nothing else.
+
+    Verification is greedy, so a draft token survives only when it equals what
+    the target model would have produced anyway. `draft_length=0` short-circuits
+    the drafter and decodes sequentially through the identical prompt, stop
+    tokens and `verify()` call, which makes it an exact control rather than an
+    approximate one. A divergence here is a real bug -- most likely rejected
+    draft KV leaking into the next window.
+
+    Rejection is the path under test, so the test asserts that rejections
+    actually happened. A run with a perfect acceptance rate would pass while
+    never exercising the code that discards draft state. Both a repetitive and
+    a prose prompt are used because they reject at different points.
+    """
+    for label, prompt in (
+        ("repetitive", "Repeat exactly: red green blue, red green blue, red green"),
+        ("prose", "Explain in detail why the sky appears blue during the day."),
+    ):
+        base = {"prompt": prompt, "max_tokens": 24, "max_ngram": 4}
+        sequential = await _report(
+            client, args, "cacheback-speculative-decoding", {**base, "draft_length": 0}
+        )
+        speculative = await _report(
+            client, args, "cacheback-speculative-decoding", {**base, "draft_length": 4}
+        )
+
+        # With no draft, every generated token costs exactly one forward pass.
+        assert sequential["drafted"] == 0, (label, sequential)
+        assert sequential["verification_steps"] == sequential["count"], (label, sequential)
+
+        # The comparison is only meaningful if speculation fired *and* was
+        # rejected at least once.
+        rejected = speculative["drafted"] - speculative["accepted"]
+        assert speculative["accepted"] > 0, (label, "no draft token was ever accepted")
+        assert rejected > 0, (label, "no draft was ever rejected; the isolation path is untested")
+        assert speculative["verification_steps"] < sequential["verification_steps"], (
+            label, "speculation ran no fewer forward passes than sequential decoding"
+        )
+
+        assert speculative["tokens"] == sequential["tokens"], (
+            f"[{label}] speculative decoding changed the output:\n"
+            f"  sequential  = {sequential['tokens']}\n"
+            f"  speculative = {speculative['tokens']}"
+        )
 
 
 async def test_mirostat_v2_sampling(client, args):
