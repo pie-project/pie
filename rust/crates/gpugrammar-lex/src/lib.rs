@@ -18,6 +18,7 @@
 //! into roughly 50-165 groups, and the count does not grow with vocabulary
 //! size. Per-step parser work becomes one ACTION lookup per group.
 
+pub mod lexicon;
 pub mod regular;
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
