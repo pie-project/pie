@@ -64,24 +64,43 @@ class Rows:
 
 
 def build_real_rows(path: Path) -> tuple[Rows, int, np.ndarray]:
-    """Replay rows recorded from a real model under a real JSONSchemaBench schema."""
+    """Rebuild rows recorded by replaying a real model's output through a tokenizer.
+
+    Rows arrive in whichever form was smaller, so wide ones are stored as the
+    tokens they forbid and are expanded here.
+    """
     data = np.load(path)
-    indptr = data["indptr"].astype(np.int32)
-    indices = data["indices"].astype(np.int32)
-    widths = data["widths"]
+    indptr = data["indptr"].astype(np.int64)
+    payload = data["payload"].astype(np.int32)
+    kinds = data["kinds"]
     vocab_size = int(data["vocab_size"][0])
+    sidecar = json.loads(path.with_suffix(".json").read_text(encoding="utf-8"))
     _XGRAMMAR_CACHE["row_schema"] = data["row_schema"]
     _XGRAMMAR_CACHE["row_step"] = data["row_step"]
-    sidecar = json.loads(path.with_suffix(".json").read_text(encoding="utf-8"))
     _XGRAMMAR_CACHE["real_schemas"] = sidecar["schemas"]
     _XGRAMMAR_CACHE["real_tokens"] = sidecar["tokens"]
+    _XGRAMMAR_CACHE["real_tokenizer"] = sidecar["tokenizer"]
+
+    rows_list: list[np.ndarray] = []
+    for index in range(kinds.size):
+        stored = payload[int(indptr[index]) : int(indptr[index + 1])]
+        if kinds[index] == 0:
+            rows_list.append(stored)
+        else:
+            allowed = np.ones(vocab_size, dtype=bool)
+            allowed[stored.astype(np.int64)] = False
+            rows_list.append(np.flatnonzero(allowed).astype(np.int32))
+    row_widths = np.asarray([row.size for row in rows_list], dtype=np.int64)
+    new_indptr = np.zeros(len(rows_list) + 1, dtype=np.int32)
+    for index, row in enumerate(rows_list):
+        new_indptr[index + 1] = new_indptr[index] + row.size
     rows = Rows(
-        indptr,
-        indices,
-        np.zeros(indices.size, dtype=np.int32),
-        widths.tolist(),
+        new_indptr,
+        np.concatenate(rows_list).astype(np.int32),
+        np.zeros(int(new_indptr[-1]), dtype=np.int32),
+        row_widths.tolist(),
     )
-    return rows, vocab_size, widths
+    return rows, vocab_size, data["widths"], row_widths
 
 
 def build_schema_rows(model: str) -> tuple[Rows, int, np.ndarray]:
@@ -172,6 +191,13 @@ def select_rows(
 
 
 def measure(function, *, warmup: int, iterations: int) -> float:
+    return measure_distribution(
+        function, warmup=warmup, iterations=iterations
+    )["p50"]
+
+
+def measure_distribution(function, *, warmup: int, iterations: int) -> dict:
+    """Percentiles, because a median hides the tail that MaskBench targets."""
     for _ in range(warmup):
         function()
     torch.cuda.synchronize()
@@ -181,7 +207,14 @@ def measure(function, *, warmup: int, iterations: int) -> float:
         function()
         torch.cuda.synchronize()
         samples.append((time.perf_counter_ns() - started) / 1_000)
-    return float(statistics.median(samples))
+    ordered = np.sort(np.asarray(samples))
+    return {
+        "p50": float(np.percentile(ordered, 50)),
+        "p90": float(np.percentile(ordered, 90)),
+        "p99": float(np.percentile(ordered, 99)),
+        "mean": float(ordered.mean()),
+        "iterations": len(ordered),
+    }
 
 
 def main() -> None:
@@ -220,12 +253,14 @@ def main() -> None:
     device = torch.device(args.device)
     torch.cuda.set_device(device)
     if args.profiles == ["real"]:
-        rows, vocab_size, widths = build_real_rows(args.real_rows)
+        rows, vocab_size, widths, row_widths = build_real_rows(args.real_rows)
         print(
-            f"JSONSchemaBench replay: {len(widths)} recorded steps, "
+            f"replay of {_XGRAMMAR_CACHE['real_tokenizer']}: "
+            f"{len(widths)} recorded steps, vocab {vocab_size}, "
             f"median width {int(np.median(widths))}, "
             f"{(widths > 8192).mean() * 100:.1f}% wide, "
-            f"{(widths == 1).mean() * 100:.1f}% forced"
+            f"{(widths == 1).mean() * 100:.1f}% forced; "
+            f"{len(row_widths)} rows replayed"
         )
     elif args.profiles == ["schema"]:
         rows, vocab_size, widths = build_schema_rows(args.qwen_model)
@@ -251,9 +286,23 @@ def main() -> None:
     if not args.no_wide_bitsets:
         tables.build_wide_bitsets(vocab_size)
         if tables.bitset is not None:
+            tables.drop_wide_token_lists()
+            usage = tables.memory_bytes()
+            resident = sum(
+                value
+                for key, value in usage.items()
+                if key != "csr_only_equivalent"
+            )
             print(
-                f"wide complement bitsets: {tuple(tables.bitset.shape)} "
-                f"({tables.bitset.numel() * 4 / 1024:.1f} KiB total)"
+                "table memory: "
+                f"{resident / 2**20:.1f} MiB resident vs "
+                f"{usage['csr_only_equivalent'] / 2**20:.1f} MiB as plain CSR "
+                f"({usage['csr_only_equivalent'] / max(resident, 1):.1f}x smaller); "
+                + ", ".join(
+                    f"{key}={value / 2**20:.1f}MiB"
+                    for key, value in usage.items()
+                    if key != "csr_only_equivalent"
+                )
             )
 
     sampling = _load_flashinfer()
@@ -365,11 +414,20 @@ def main() -> None:
                             work, fi_k, fi_p
                         )
 
+                    masked_graph = _capture(masked, device)
                     xgrammar_gpu = measure(
-                        masked,
+                        masked_graph or masked,
                         warmup=args.warmup,
                         iterations=args.iterations,
                     )
+
+                    # Both engines must pay for advancing their state: our
+                    # next-state write is inside the fused kernel, so XGrammar
+                    # is charged accept_token plus the rollback that restores
+                    # the batch for the next iteration.
+                    advance_tokens = [
+                        int(t) for t in _first_allowed(mask, vocab_size)
+                    ]
 
                     def full_path() -> None:
                         batch_matcher.batch_fill_next_token_bitmask(
@@ -382,6 +440,10 @@ def main() -> None:
                         sampling.top_k_top_p_sampling_from_logits(
                             work, fi_k, fi_p
                         )
+                        batch_matcher.batch_accept_token(
+                            matchers, advance_tokens
+                        )
+                        batch_matcher.batch_rollback(matchers, 1)
 
                     xgrammar_full = measure(
                         full_path,
@@ -458,7 +520,9 @@ def _xgrammar_state(
         if compiler is None:
             from transformers import AutoTokenizer
 
-            tokenizer = AutoTokenizer.from_pretrained(model)
+            tokenizer = AutoTokenizer.from_pretrained(
+                _XGRAMMAR_CACHE["real_tokenizer"]
+            )
             compiler = xgr.GrammarCompiler(
                 xgr.TokenizerInfo.from_huggingface(tokenizer),
                 cache_enabled=True,
@@ -527,6 +591,27 @@ def _xgrammar_state(
     _XGRAMMAR_CACHE["threads"] = threads
     _XGRAMMAR_CACHE["fill_us"] = fill_us
     return mask, matchers, batch_matcher
+
+
+def _first_allowed(mask, vocab_size: int) -> np.ndarray:
+    """One legal token per sequence, used only to advance XGrammar's state."""
+    bits = np.unpackbits(mask.numpy().view(np.uint8), axis=-1, bitorder="little")
+    return bits[:, :vocab_size].argmax(axis=-1)
+
+
+def _capture(function, device):
+    """Capture device work in a CUDA graph, or return None if not capturable."""
+    try:
+        for _ in range(3):
+            function()
+        torch.cuda.synchronize(device)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            function()
+        torch.cuda.synchronize(device)
+        return graph.replay
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _load_flashinfer():

@@ -354,9 +354,10 @@ def _wide_draw_kernel(
 def _wide_finalize_kernel(
     chosen_ptr,
     last_ptr,
-    csr_indptr_ptr,
-    csr_indices_ptr,
-    csr_next_state_ptr,
+    override_indptr_ptr,
+    override_tokens_ptr,
+    override_states_ptr,
+    default_state_ptr,
     rows_ptr,
     slot_ptr,
     out_tokens_ptr,
@@ -365,24 +366,42 @@ def _wide_finalize_kernel(
 ):
     seq = tl.program_id(0)
     row = tl.load(rows_ptr + seq)
-    if tl.load(slot_ptr + row) < 0:
+    slot = tl.load(slot_ptr + row)
+    if slot < 0:
         return
     chosen = tl.load(chosen_ptr + seq)
     chosen = tl.where(chosen == UNSET, tl.load(last_ptr + seq), chosen)
     chosen = tl.where(chosen < 0, 0, chosen)
     tl.store(out_tokens_ptr + seq, chosen)
     if WRITE_STATE:
-        left = tl.load(csr_indptr_ptr + row)
-        right = tl.load(csr_indptr_ptr + row + 1)
-        for _ in range(32):
+        # A wide row keeps no token list, so its successor is the row's
+        # default state unless the token appears in a small override list.
+        left = tl.load(override_indptr_ptr + slot)
+        right = tl.load(override_indptr_ptr + slot + 1)
+        state = tl.load(default_state_ptr + slot)
+        for _ in range(24):
             middle = (left + right) // 2
             token = tl.load(
-                csr_indices_ptr + middle, mask=middle < right, other=UNSET
+                override_tokens_ptr + middle, mask=middle < right, other=UNSET
             )
             go_right = (token < chosen) & (left < right)
             left = tl.where(go_right, middle + 1, left)
             right = tl.where(go_right, right, middle)
-        tl.store(out_states_ptr + seq, tl.load(csr_next_state_ptr + left))
+        found = tl.load(
+            override_tokens_ptr + left,
+            mask=left < tl.load(override_indptr_ptr + slot + 1),
+            other=UNSET,
+        )
+        state = tl.where(
+            found == chosen,
+            tl.load(
+                override_states_ptr + left,
+                mask=left < tl.load(override_indptr_ptr + slot + 1),
+                other=0,
+            ),
+            state,
+        )
+        tl.store(out_states_ptr + seq, state)
 
 
 @dataclass
@@ -552,9 +571,10 @@ def wide_sample_split(
     _wide_finalize_kernel[(batch,)](
         workspace.chosen,
         workspace.last,
-        tables.csr_indptr,
-        tables.csr_indices,
-        tables.csr_next_state if write_state else tables.csr_indices,
+        tables.override_indptr,
+        tables.override_tokens,
+        tables.override_states,
+        tables.default_state,
         rows,
         tables.row_slot,
         out_tokens,

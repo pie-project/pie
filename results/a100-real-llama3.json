@@ -1,0 +1,51 @@
+{
+  "metadata": {
+    "gpu": "NVIDIA A100 80GB PCIe",
+    "torch": "2.13.0+cu130",
+    "vocab_size": 128256,
+    "narrow_row_nnz": 371,
+    "wide_row_nnz": 371,
+    "wide_share": 0.514,
+    "temperature": 0.8,
+    "top_k": 50,
+    "top_p": 0.95
+  },
+  "benchmarks": [
+    {
+      "profile": "real",
+      "batch_size": 32,
+      "gpugrammar_eager_us": 461.0865,
+      "gpugrammar_ragged_us": 222.4205,
+      "flashinfer_unconstrained_us": 299.67600000000004,
+      "xgrammar_gpu_mask_us": 287.24699999999996,
+      "xgrammar_full_path_us": 1954.834,
+      "xgrammar_threads": 4,
+      "xgrammar_fill_us": 350.886,
+      "speedup_vs_unconstrained": 1.3473398360313011
+    },
+    {
+      "profile": "real",
+      "batch_size": 128,
+      "gpugrammar_eager_us": 489.21950000000004,
+      "gpugrammar_ragged_us": 416.0075,
+      "flashinfer_unconstrained_us": 628.274,
+      "xgrammar_gpu_mask_us": 760.0605,
+      "xgrammar_full_path_us": 5963.488,
+      "xgrammar_threads": 4,
+      "xgrammar_fill_us": 1172.162,
+      "speedup_vs_unconstrained": 1.5102468104541384
+    },
+    {
+      "profile": "real",
+      "batch_size": 512,
+      "gpugrammar_eager_us": 1540.615,
+      "gpugrammar_ragged_us": 1464.2424999999998,
+      "flashinfer_unconstrained_us": 1984.9155,
+      "xgrammar_gpu_mask_us": 2493.6769999999997,
+      "xgrammar_full_path_us": 13981.378,
+      "xgrammar_threads": 8,
+      "xgrammar_fill_us": 2937.561,
+      "speedup_vs_unconstrained": 1.3555920552777292
+    }
+  ]
+}

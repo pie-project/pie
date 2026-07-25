@@ -10,3 +10,6 @@ results/smoke.json
 # recorded trajectories are large; regenerate with gpu-lr1-collect-real-rows
 results/jsonschemabench-rows.npz
 results/jsonschemabench-rows.json
+results/rows-*.npz
+results/rows-*.json
+results/jsonschemabench-instances.json

@@ -351,6 +351,10 @@ class RaggedSamplerTables:
 
         self.bitset = None
         self.row_slot = None
+        self.default_state = None
+        self.override_indptr = None
+        self.override_tokens = None
+        self.override_states = None
         self._wide_workspaces = {}
         self._sequence_index = {}
         self.bitset_words = 0
@@ -387,7 +391,106 @@ class RaggedSamplerTables:
         self.row_slot = torch.from_numpy(slots).to(device)
         self.bitset_words = words
         self.vocab_size = vocab_size
+
+        # A wide row's successors are almost all the same state, so keep the
+        # majority as a default and store only the tokens that disagree. The
+        # token list itself is then redundant and is dropped, which is the
+        # whole point of the complement representation.
+        next_state = self.csr_next_state
+        default = np.zeros(wide_rows.size, dtype=np.int32)
+        override_tokens: list[np.ndarray] = []
+        override_states: list[np.ndarray] = []
+        override_indptr = np.zeros(wide_rows.size + 1, dtype=np.int32)
+        for slot, row in enumerate(wide_rows):
+            start, stop = int(indptr[row]), int(indptr[row + 1])
+            if next_state is None:
+                override_indptr[slot + 1] = override_indptr[slot]
+                continue
+            states = next_state.cpu().numpy()[start:stop]
+            values, counts = np.unique(states, return_counts=True)
+            majority = int(values[int(np.argmax(counts))])
+            default[slot] = majority
+            differing = np.flatnonzero(states != majority)
+            override_tokens.append(indices[start:stop][differing])
+            override_states.append(states[differing])
+            override_indptr[slot + 1] = override_indptr[slot] + differing.size
+        self.default_state = torch.from_numpy(default).to(device)
+        self.override_indptr = torch.from_numpy(override_indptr).to(device)
+        self.override_tokens = torch.from_numpy(
+            np.concatenate(override_tokens).astype(np.int32)
+            if override_tokens
+            else np.zeros(0, dtype=np.int32)
+        ).to(device)
+        self.override_states = torch.from_numpy(
+            np.concatenate(override_states).astype(np.int32)
+            if override_states
+            else np.zeros(0, dtype=np.int32)
+        ).to(device)
+        self._wide_rows = wide_rows
         return self
+
+    def drop_wide_token_lists(self) -> "RaggedSamplerTables":
+        """Free the CSR token list of every wide row.
+
+        After `build_wide_bitsets` the wide rows are described by a bitset plus
+        a default successor, so their token lists are dead weight: measured on
+        real JSONSchemaBench rows they are 98% of the table.
+        """
+        if self.bitset is None:
+            return self
+        indptr = self.csr_indptr.cpu().numpy()
+        indices = self.csr_indices.cpu().numpy()
+        states = (
+            self.csr_next_state.cpu().numpy()
+            if self.csr_next_state is not None
+            else None
+        )
+        keep_tokens: list[np.ndarray] = []
+        keep_states: list[np.ndarray] = []
+        new_indptr = np.zeros_like(indptr)
+        for row in range(self._widths.size):
+            start, stop = int(indptr[row]), int(indptr[row + 1])
+            if self._widths[row] > MAX_SINGLE_TILE:
+                new_indptr[row + 1] = new_indptr[row]
+                continue
+            keep_tokens.append(indices[start:stop])
+            if states is not None:
+                keep_states.append(states[start:stop])
+            new_indptr[row + 1] = new_indptr[row] + (stop - start)
+        device = self.csr_indices.device
+        self.csr_indptr = torch.from_numpy(new_indptr).to(device)
+        self.csr_indices = torch.from_numpy(
+            np.concatenate(keep_tokens).astype(np.int32)
+            if keep_tokens
+            else np.zeros(0, dtype=np.int32)
+        ).to(device)
+        if states is not None:
+            self.csr_next_state = torch.from_numpy(
+                np.concatenate(keep_states).astype(np.int32)
+                if keep_states
+                else np.zeros(0, dtype=np.int32)
+            ).to(device)
+        return self
+
+    def memory_bytes(self) -> dict[str, int]:
+        """Runtime table bytes, split so the representation choice is visible."""
+        def size(tensor) -> int:
+            return 0 if tensor is None else tensor.numel() * tensor.element_size()
+
+        narrow = self._widths[self._widths <= MAX_SINGLE_TILE].sum()
+        wide = self._widths[self._widths > MAX_SINGLE_TILE].sum()
+        return {
+            "csr_only_equivalent": int((narrow + wide) * 8 + self._widths.size * 4),
+            "narrow_csr": size(self.csr_indices) + size(self.csr_next_state),
+            "row_pointers": size(self.csr_indptr) + size(self.row_slot),
+            "wide_bitsets": size(self.bitset),
+            "wide_transitions": (
+                size(getattr(self, "default_state", None))
+                + size(getattr(self, "override_indptr", None))
+                + size(getattr(self, "override_tokens", None))
+                + size(getattr(self, "override_states", None))
+            ),
+        }
 
     def sequence_index(self, batch: int, device: torch.device) -> torch.Tensor:
         cached = self._sequence_index.get(batch)

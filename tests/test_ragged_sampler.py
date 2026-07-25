@@ -183,6 +183,31 @@ class RaggedSamplerTest(unittest.TestCase):
                 int(produced[index]), int(case["next_state"][offset])
             )
 
+    def test_dropping_wide_token_lists_preserves_output(self) -> None:
+        """A wide row needs no token list once it has a bitset."""
+        case = build_batch([396, 147_144], 48, 151_669, seed=43)
+        tables, args = to_cuda(case)
+        tables.build_wide_bitsets(151_669)
+        logits = torch.from_numpy(case["logits"]).cuda()
+        before_tokens, before_states = ragged_sample(
+            logits, tables, args["rows"], **_params(args)
+        )
+        before = (
+            before_tokens.cpu().numpy().copy(),
+            before_states.cpu().numpy().copy(),
+        )
+        full = tables.memory_bytes()
+        tables.drop_wide_token_lists()
+        compact = tables.memory_bytes()
+        after_tokens, after_states = ragged_sample(
+            logits, tables, args["rows"], **_params(args)
+        )
+        np.testing.assert_array_equal(after_tokens.cpu().numpy(), before[0])
+        np.testing.assert_array_equal(after_states.cpu().numpy(), before[1])
+        self.assertLess(compact["narrow_csr"], full["narrow_csr"])
+        total = sum(v for k, v in compact.items() if k != "csr_only_equivalent")
+        self.assertLess(total, compact["csr_only_equivalent"])
+
     def test_wide_complement_never_violates_the_constraint(self) -> None:
         case = build_batch([147_144], 32, 151_669, seed=41)
         tables, args = to_cuda(case)

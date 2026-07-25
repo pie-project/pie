@@ -294,42 +294,72 @@ path at batch 2,048. C10 is retired.
 
 ### Measured on the real workload
 
-Two earlier profiles were both synthetic: XGrammar's free-form JSON grammar is
-the worst case a width-sensitive engine can face, and a hand-written typed
-schema is not a workload at all. The honest measurement replays real states.
+Earlier profiles were synthetic in both directions and the comparison charged
+each engine differently. The measurement below fixes both.
 
-`gpu_lr1.collect_real_rows` runs Qwen3-0.6B under an actual XGrammar
-constraint over schemas drawn from **every JSONSchemaBench config** —
-Github trivial through ultra, Glaive, JsonSchemaStore, Kubernetes, Snowplow,
-WashingtonPost — and records the allowed-token set at every decoding step:
+**Workload.** `gpu_lr1.generate_instances` has Llama-3-8B-Instruct produce 533
+JSON values under a real XGrammar constraint — 50 schemas from each of the 11
+JSONSchemaBench configs, sampled at temperature 0.8 / top-p 0.95, up to 256 new
+tokens, mean 125 tokens. `gpu_lr1.replay_tokenizer` then replays that text
+through each tokenizer's grammar, which is faithful because the state a matcher
+reaches is determined by the bytes consumed. Content and tokenization are
+separated so vocabulary effects are isolated from schema effects.
 
-| statistic | value |
-|---|---:|
-| schemas declared / compiled | 66 / 65 (98.5%) |
-| decoding steps recorded | 3,265 |
-| median allowed tokens | **376** |
-| p75 / p90 allowed tokens | 147,071 / 147,138 |
-| steps wider than 8,192 | **31.0%** |
-| steps with exactly one allowed token | 2.6% |
+**Cost model.** Both engines are charged for everything they must do per step.
+XGrammar pays mask fill, pinned H2D, mask apply, FlashInfer sampling **and**
+`batch_accept_token` plus rollback — the advance alone is 4.6–22.2% of its CPU
+work and was previously omitted. Its thread count is swept over 1/2/4/8/16/auto
+and the fastest is reported, and its device work is CUDA-graphed, as ours is.
 
-The distribution really is bimodal: half the steps allow a few hundred tokens,
-a third allow essentially the whole vocabulary, and 2.6% are forced.
+**Width is set by the schema, not the vocabulary.** Across three tokenizer
+families the median step allows a few hundred tokens no matter how large the
+vocabulary is, so the O(V)-versus-O(allowed) ratio grows with vocabulary size:
 
-Replaying those rows, with every XGrammar matcher rebuilt at the exact schema
-and step its row came from and its thread count swept to the fastest setting:
+| tokenizer | vocab | steps | median allowed | wide (>8,192) | forced |
+|---|---:|---:|---:|---:|---:|
+| Llama 3 | 128,256 | 55,406 | 396 | 32.9% | 0.8% |
+| Qwen 3.6 | 248,077 | 66,557 | 378 | 32.0% | 0.7% |
+| Gemma 4 (SentencePiece) | 262,144 | 69,313 | **107** | 32.3% | 0.0% |
 
-| batch | gpugrammar | FlashInfer unconstrained | XGrammar full path | gap vs XGrammar |
-|---:|---:|---:|---:|---:|
-| 1 | 73.7 µs | 275.2 µs | 356.6 µs | 4.8× |
-| 32 | 242.8 µs | 517.2 µs | 8,451.0 µs | **34.8×** |
-| 128 | 607.8 µs | 1,087.4 µs | 13,031.6 µs | **21.4×** |
-| 512 | 1,905.1 µs | 3,433.4 µs | 23,986.4 µs | **12.6×** |
-| 2,048 | 5,801.5 µs | 13,017.0 µs | 38,969.1 µs | 6.7× |
+Per split the spread is wide: Glaive function calls are only 11–12% wide, while
+WashingtonPost is 46–54%.
 
-The gap is largest exactly in the batch range serving engines run at. It comes
-from a structural difference, not tuning: **XGrammar fills a full-vocabulary
-bitmask whatever the grammar, so its per-step cost is O(V), while gathering the
-row costs O(allowed)** — and the real median row is 376 tokens out of 151,669.
+**Result** (A100, graph-replayed, median wall):
+
+| tokenizer | batch | gpugrammar | FlashInfer unconstrained | XGrammar full path | gap |
+|---|---:|---:|---:|---:|---:|
+| Llama 3 | 32 | 222.4 µs | 299.7 µs | 1,954.8 µs | 8.8× |
+| Llama 3 | 128 | 416.0 µs | 628.3 µs | 5,963.5 µs | **14.3×** |
+| Llama 3 | 512 | 1,464.2 µs | 1,984.9 µs | 13,981.4 µs | 9.5× |
+| Qwen 3.6 | 32 | 291.2 µs | 917.2 µs | 3,011.7 µs | 10.3× |
+| Qwen 3.6 | 128 | 771.8 µs | 1,755.3 µs | 6,039.5 µs | 7.8× |
+| Qwen 3.6 | 512 | 2,234.1 µs | 5,697.8 µs | 13,896.6 µs | 6.2× |
+| Gemma 4 | 32 | 310.8 µs | 607.4 µs | 2,969.7 µs | 9.6× |
+| Gemma 4 | 128 | 874.1 µs | 1,200.8 µs | 7,826.4 µs | 9.0× |
+| Gemma 4 | 512 | 2,439.1 µs | 4,025.2 µs | 10,937.2 µs | 4.5× |
+
+The honest range is **4.5–14.3×**, not the 12–35× an unfair thread setting and a
+hand-written schema produced.
+
+**Table memory is now reportable.** Wide rows keep only a bitset plus a default
+successor and a small override list; their token lists are dropped outright,
+which `tests/test_ragged_sampler.py` checks does not change a single sampled
+token:
+
+| tokenizer | resident tables | as plain CSR | reduction |
+|---|---:|---:|---:|
+| Llama 3 | 24.5 MiB | 935.0 MiB | 38.2× |
+| Qwen 3.6 | 36.6 MiB | 1,807.7 MiB | 49.4× |
+| Gemma 4 | 34.7 MiB | 1,952.6 MiB | 56.3× |
+
+Tens of MiB is defensible next to a KiB-scale compiler cache only because it
+buys a GPU-resident step; the paper must report it, not hide it.
+
+**Threats that remain.** Table construction is still excluded — rows are
+replayed, while XGrammar computes masks online from a compact automaton, so
+compile time and incremental admission (C7) must be measured before any
+end-to-end claim. There is one GPU, one generating model, and no serving
+integration, so these are isolated-step numbers and cannot be headlined.
 
 **What is left.** Pure-wide batches above 128 still run at 0.8× of
 unconstrained because the search costs ten sweeps of the vocabulary. Replacing
