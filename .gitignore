@@ -6,3 +6,7 @@ __pycache__/
 .cache/
 results/smoke.json
 
+
+# recorded trajectories are large; regenerate with gpu-lr1-collect-real-rows
+results/jsonschemabench-rows.npz
+results/jsonschemabench-rows.json

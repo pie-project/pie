@@ -292,35 +292,44 @@ A realistic mixed batch is now faster than sampling with no constraint at all
 at every batch size, by 1.4–3.2×, and 3.2× faster than the deployed XGrammar
 path at batch 2,048. C10 is retired.
 
-### Workload note: the free-form JSON grammar is the worst case
+### Measured on the real workload
 
-The numbers above use XGrammar's builtin JSON grammar, where a string body
-allows 147,144 tokens and 51.4% of a document's tokens come from one. A real
-**typed** JSON Schema behaves very differently — measured over every step of a
-schema-guided generation with Qwen3:
+Two earlier profiles were both synthetic: XGrammar's free-form JSON grammar is
+the worst case a width-sensitive engine can face, and a hand-written typed
+schema is not a workload at all. The honest measurement replays real states.
 
-| workload | steps | median allowed | steps wider than 8,192 |
-|---|---:|---:|---:|
-| typed schema | 33 | **12** | 15.2% |
-| tool call | 17 | **9** | 23.5% |
-| free-form string field | 10 | 147,071 | 70.0% |
+`gpu_lr1.collect_real_rows` runs Qwen3-0.6B under an actual XGrammar
+constraint over schemas drawn from **every JSONSchemaBench config** —
+Github trivial through ultra, Glaive, JsonSchemaStore, Kubernetes, Snowplow,
+WashingtonPost — and records the allowed-token set at every decoding step:
 
-This matters because **XGrammar's per-step cost is O(V) whatever the grammar** —
-it fills a full-vocabulary bitmask every step — while gpugrammar's is
-O(allowed). The tighter the schema, the wider the gap. With every XGrammar
-matcher driven to the same schema position so its adaptive mask cache gets the
-same opportunity, and its thread count swept to the fastest setting:
+| statistic | value |
+|---|---:|
+| schemas declared / compiled | 66 / 65 (98.5%) |
+| decoding steps recorded | 3,265 |
+| median allowed tokens | **376** |
+| p75 / p90 allowed tokens | 147,071 / 147,138 |
+| steps wider than 8,192 | **31.0%** |
+| steps with exactly one allowed token | 2.6% |
 
-| batch | gpugrammar | XGrammar full path | gap |
-|---:|---:|---:|---:|
-| 1 | 58.0 µs | 342.9 µs | 5.9× |
-| 32 | 182.2 µs | 5,987.1 µs | 32.9× |
-| 128 | 336.2 µs | 14,432.3 µs | **42.9×** |
-| 512 | 889.5 µs | 27,937.6 µs | 31.4× |
-| 2,048 | 2,881.7 µs | 45,125.3 µs | **15.7×** |
+The distribution really is bimodal: half the steps allow a few hundred tokens,
+a third allow essentially the whole vocabulary, and 2.6% are forced.
 
-Both profiles belong in the paper: the typed schema is the workload people
-actually run, and the free-form grammar is the honest worst case.
+Replaying those rows, with every XGrammar matcher rebuilt at the exact schema
+and step its row came from and its thread count swept to the fastest setting:
+
+| batch | gpugrammar | FlashInfer unconstrained | XGrammar full path | gap vs XGrammar |
+|---:|---:|---:|---:|---:|
+| 1 | 73.7 µs | 275.2 µs | 356.6 µs | 4.8× |
+| 32 | 242.8 µs | 517.2 µs | 8,451.0 µs | **34.8×** |
+| 128 | 607.8 µs | 1,087.4 µs | 13,031.6 µs | **21.4×** |
+| 512 | 1,905.1 µs | 3,433.4 µs | 23,986.4 µs | **12.6×** |
+| 2,048 | 5,801.5 µs | 13,017.0 µs | 38,969.1 µs | 6.7× |
+
+The gap is largest exactly in the batch range serving engines run at. It comes
+from a structural difference, not tuning: **XGrammar fills a full-vocabulary
+bitmask whatever the grammar, so its per-step cost is O(V), while gathering the
+row costs O(allowed)** — and the real median row is 376 tokens out of 151,669.
 
 **What is left.** Pure-wide batches above 128 still run at 0.8× of
 unconstrained because the search costs ten sweeps of the vocabulary. Replacing

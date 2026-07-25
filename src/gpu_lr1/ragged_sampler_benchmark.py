@@ -63,6 +63,27 @@ class Rows:
     widths: list[int] = field(default_factory=list)
 
 
+def build_real_rows(path: Path) -> tuple[Rows, int, np.ndarray]:
+    """Replay rows recorded from a real model under a real JSONSchemaBench schema."""
+    data = np.load(path)
+    indptr = data["indptr"].astype(np.int32)
+    indices = data["indices"].astype(np.int32)
+    widths = data["widths"]
+    vocab_size = int(data["vocab_size"][0])
+    _XGRAMMAR_CACHE["row_schema"] = data["row_schema"]
+    _XGRAMMAR_CACHE["row_step"] = data["row_step"]
+    sidecar = json.loads(path.with_suffix(".json").read_text(encoding="utf-8"))
+    _XGRAMMAR_CACHE["real_schemas"] = sidecar["schemas"]
+    _XGRAMMAR_CACHE["real_tokens"] = sidecar["tokens"]
+    rows = Rows(
+        indptr,
+        indices,
+        np.zeros(indices.size, dtype=np.int32),
+        widths.tolist(),
+    )
+    return rows, vocab_size, widths
+
+
 def build_schema_rows(model: str) -> tuple[Rows, int, np.ndarray]:
     """Rows taken from every step of a real schema-guided generation.
 
@@ -139,7 +160,7 @@ def build_rows(model: str) -> tuple[Rows, int]:
 def select_rows(
     profile: str, batch: int, seed: int, num_rows: int = 2
 ) -> np.ndarray:
-    if profile == "schema":
+    if profile in ("schema", "real"):
         rng = np.random.default_rng(seed)
         return rng.integers(0, num_rows, size=batch).astype(np.int32)
     if profile == "narrow":
@@ -175,7 +196,13 @@ def main() -> None:
         "--profiles",
         nargs="+",
         default=["narrow", "wide", "mixed"],
-        choices=("narrow", "wide", "mixed", "schema"),
+        choices=("narrow", "wide", "mixed", "schema", "real"),
+    )
+    parser.add_argument(
+        "--real-rows",
+        type=Path,
+        default=Path("results/jsonschemabench-rows.npz"),
+        help="rows recorded by gpu_lr1.collect_real_rows",
     )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=30)
@@ -192,7 +219,15 @@ def main() -> None:
 
     device = torch.device(args.device)
     torch.cuda.set_device(device)
-    if args.profiles == ["schema"]:
+    if args.profiles == ["real"]:
+        rows, vocab_size, widths = build_real_rows(args.real_rows)
+        print(
+            f"JSONSchemaBench replay: {len(widths)} recorded steps, "
+            f"median width {int(np.median(widths))}, "
+            f"{(widths > 8192).mean() * 100:.1f}% wide, "
+            f"{(widths == 1).mean() * 100:.1f}% forced"
+        )
+    elif args.profiles == ["schema"]:
         rows, vocab_size, widths = build_schema_rows(args.qwen_model)
         print(
             f"typed schema: {len(widths)} steps, median width "
@@ -201,7 +236,7 @@ def main() -> None:
         )
     else:
         rows, vocab_size = build_rows(args.qwen_model)
-    if args.profiles != ["schema"]:
+    if args.profiles not in (["schema"], ["real"]):
         print(
             f"vocab={vocab_size} narrow_row={rows.widths[0]} "
             f"wide_row={rows.widths[1]} "
@@ -417,6 +452,42 @@ def _best_batch_matcher(xgr, matchers, mask, candidates):
 def _xgrammar_state(
     xgr, model: str, selected: np.ndarray, vocab_size: int, profile: str
 ):
+    if profile == "real":
+        # Rebuild each matcher at the exact schema and step the row came from.
+        compiler = _XGRAMMAR_CACHE.get("real_compiler")
+        if compiler is None:
+            from transformers import AutoTokenizer
+
+            tokenizer = AutoTokenizer.from_pretrained(model)
+            compiler = xgr.GrammarCompiler(
+                xgr.TokenizerInfo.from_huggingface(tokenizer),
+                cache_enabled=True,
+            )
+            _XGRAMMAR_CACHE["real_compiler"] = compiler
+            _XGRAMMAR_CACHE["real_compiled"] = {}
+        cache = _XGRAMMAR_CACHE["real_compiled"]
+        schemas = _XGRAMMAR_CACHE["real_schemas"]
+        sequences = _XGRAMMAR_CACHE["real_tokens"]
+        row_schema = _XGRAMMAR_CACHE["row_schema"]
+        row_step = _XGRAMMAR_CACHE["row_step"]
+        matchers = []
+        for row in selected:
+            schema_id = int(row_schema[int(row)])
+            if schema_id not in cache:
+                cache[schema_id] = compiler.compile_json_schema(
+                    schemas[schema_id]
+                )
+            matcher = xgr.GrammarMatcher(cache[schema_id])
+            for token in sequences[schema_id][: int(row_step[int(row)])]:
+                matcher.accept_token(token)
+            matchers.append(matcher)
+        mask = xgr.allocate_token_bitmask(len(matchers), vocab_size)
+        batch_matcher, threads, fill_us = _best_batch_matcher(
+            xgr, matchers, mask, _XGRAMMAR_THREAD_CANDIDATES
+        )
+        _XGRAMMAR_CACHE["threads"] = threads
+        _XGRAMMAR_CACHE["fill_us"] = fill_us
+        return mask, matchers, batch_matcher
     if profile == "schema":
         # Put every XGrammar matcher at the same schema position gpugrammar
         # is at, so its adaptive mask cache gets the same opportunity.

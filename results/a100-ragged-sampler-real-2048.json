@@ -1,0 +1,27 @@
+{
+  "metadata": {
+    "gpu": "NVIDIA A100 80GB PCIe",
+    "torch": "2.13.0+cu130",
+    "vocab_size": 151669,
+    "narrow_row_nnz": 5,
+    "wide_row_nnz": 371,
+    "wide_share": 0.514,
+    "temperature": 0.8,
+    "top_k": 50,
+    "top_p": 0.95
+  },
+  "benchmarks": [
+    {
+      "profile": "real",
+      "batch_size": 2048,
+      "gpugrammar_eager_us": 5878.2315,
+      "gpugrammar_ragged_us": 5801.532999999999,
+      "flashinfer_unconstrained_us": 13016.972,
+      "xgrammar_gpu_mask_us": 14724.9125,
+      "xgrammar_full_path_us": 38969.148,
+      "xgrammar_threads": "auto",
+      "xgrammar_fill_us": 19619.862,
+      "speedup_vs_unconstrained": 2.2437124808218796
+    }
+  ]
+}

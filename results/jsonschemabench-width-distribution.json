@@ -1,0 +1,23 @@
+{
+  "source": "epfl-dlab/JSONSchemaBench, all configs",
+  "model": "Qwen/Qwen3-0.6B under xgrammar constraint",
+  "schemas_declared": 66,
+  "schemas_compiled": 65,
+  "decoding_steps": 3265,
+  "vocab_size": 151669,
+  "allowed_tokens": {
+    "median": 376,
+    "mean": 40725.0808575804,
+    "p25": 10,
+    "p50": 376,
+    "p75": 147071,
+    "p90": 147138,
+    "p95": 147147,
+    "p99": 148342,
+    "min": 1,
+    "max": 148352
+  },
+  "share_wider_than_8192": 0.3099540581929556,
+  "share_forced_single_token": 0.026033690658499236,
+  "regenerate": "gpu-lr1-collect-real-rows --schemas-per-config 6 --max-new-tokens 80"
+}
