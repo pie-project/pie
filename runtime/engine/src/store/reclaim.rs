@@ -147,6 +147,10 @@ pub trait PoolPort: Send + Sync + 'static {
     /// Arms the suspend rung; without it the ladder is pool-only (a
     /// capability degradation, not a mode).
     fn suspend_capable(&self) -> bool;
+    /// The `(model, driver)` pair this pool belongs to — the safe-point
+    /// machinery derives its store and scheduler targets from this instead
+    /// of hardwiring `(0, 0)`.
+    fn locus(&self) -> (usize, usize);
     fn reserve_device(&self, count: u32) -> Option<Vec<crate::store::kv::page_table::PhysicalKvPageId>>;
     fn release_device(&self, pages: Vec<crate::store::kv::page_table::PhysicalKvPageId>);
     fn reserve_rs(&self, count: u32) -> Option<Vec<crate::store::rs::RsSlotId>>;
@@ -211,6 +215,10 @@ impl PoolPort for RegistryPool {
         self.suspend_capable
     }
 
+    fn locus(&self) -> (usize, usize) {
+        (self.model, self.driver)
+    }
+
     fn reserve_device(
         &self,
         count: u32,
@@ -273,17 +281,6 @@ impl std::fmt::Display for ContentionError {
 }
 
 impl std::error::Error for ContentionError {}
-
-/// What the caller must do after a successful acquisition.
-#[derive(Debug)]
-pub enum Acquired {
-    /// Concrete device pages and RS slots reserved for this request.
-    Granted(AllocationGrant),
-    /// A park request landed on the requester itself while it waited: it is
-    /// a process at the safe point like any other victim (D3). The caller
-    /// runs the safe-point suspend (honor), then retries.
-    SelfSuspendFirst,
-}
 
 /// Engagement counters (lock-free reads) — the e2e's proof that contention
 /// actually ENGAGED, so a trivially-passing run (pool never over-filled)
@@ -455,6 +452,11 @@ impl ContentionOrchestrator {
         self.config
     }
 
+    /// The `(model, driver)` pair this orchestrator manages.
+    pub fn locus(&self) -> (usize, usize) {
+        self.port.locus()
+    }
+
     /// Engagement counters (see [`ContentionStats`]).
     pub fn stats(&self) -> &ContentionStats {
         &self.stats
@@ -528,12 +530,18 @@ impl ContentionOrchestrator {
     // The acquisition path
     // =========================================================================
 
-    pub async fn acquire_or_self_suspend_for_pipeline(
+    /// Acquire one grant. The wait inside is a STANDING safe point (D2):
+    /// the requester holds nothing, so the caller must race this future
+    /// against the process's park signal and, when a request lands, drop
+    /// it, honor the request (suspend/restore), and re-acquire — victim and
+    /// requester are the same code at the same boundary (D3). Rank is the
+    /// spawn clock, so cancel-and-retry never loses queue position.
+    pub async fn acquire(
         &self,
         requester: ProcessId,
         quorum_id: ProcessId,
         demand: Demand,
-    ) -> Result<Acquired, ContentionError> {
+    ) -> Result<AllocationGrant, ContentionError> {
         let (_, kv_total) = self.port.device_stats();
         if demand.kv_pages > kv_total {
             return Err(ContentionError::Impossible {
@@ -553,13 +561,11 @@ impl ContentionOrchestrator {
         'register: loop {
             let (key, notify) = match self.register_waiter(requester, quorum_id, demand) {
                 Ok(registered) => registered,
-                Err(ContentionError::Cancelled) if self.should_park(requester) => {
-                    // The requester is itself a selected victim: it is at a
-                    // safe point right now (an acquire holds nothing), so it
-                    // yields first and retries after restore (D3).
-                    return Ok(Acquired::SelfSuspendFirst);
-                }
                 Err(ContentionError::Cancelled) if self.is_registered(requester) => {
+                    // Not Running — typically the requester itself was
+                    // selected as a victim (ParkRequested). Wait; the caller
+                    // observes the park signal at its safe point, cancels
+                    // this future, and yields.
                     self.wait_until_running(requester).await?;
                     continue 'register;
                 }
@@ -575,7 +581,7 @@ impl ContentionOrchestrator {
                 self.drain();
                 if let Some(grant) = self.take_allocation_grant(requester, key, demand) {
                     registration.disarm();
-                    return Ok(Acquired::Granted(grant));
+                    return Ok(grant);
                 }
                 if !self.is_registered(requester) {
                     registration.disarm();
@@ -1634,6 +1640,9 @@ mod tests {
         fn suspend_capable(&self) -> bool {
             self.suspend
         }
+        fn locus(&self) -> (usize, usize) {
+            (0, 0)
+        }
         fn reserve_device(
             &self,
             count: u32,
@@ -1707,20 +1716,13 @@ mod tests {
         (orch, pid, pool)
     }
 
-    /// Test-side acquire: plain (no pipeline aggregation), panicking on the
-    /// self-suspend exit unless the test drives the park protocol itself.
+    /// Test-side acquire: plain, no pipeline aggregation.
     async fn acquire(
         orch: &ContentionOrchestrator,
         pid: ProcessId,
         need: u32,
     ) -> Result<AllocationGrant, ContentionError> {
-        match orch
-            .acquire_or_self_suspend_for_pipeline(pid, pid, Demand::kv(need))
-            .await?
-        {
-            Acquired::Granted(grant) => Ok(grant),
-            Acquired::SelfSuspendFirst => panic!("unexpected self-suspend in mock test"),
-        }
+        orch.acquire(pid, pid, Demand::kv(need)).await
     }
 
     /// Drive the park protocol for a test victim: request → quiesce →
@@ -2032,8 +2034,8 @@ mod tests {
     #[tokio::test]
     async fn grant_carries_rs_slots_and_returns_them_on_drop() {
         let (orch, pid, pool) = orch_with_pool(4, 0, 16);
-        let grant = match orch
-            .acquire_or_self_suspend_for_pipeline(
+        let grant = orch
+            .acquire(
                 pid,
                 pid,
                 Demand {
@@ -2042,11 +2044,7 @@ mod tests {
                 },
             )
             .await
-            .unwrap()
-        {
-            Acquired::Granted(grant) => grant,
-            Acquired::SelfSuspendFirst => unreachable!(),
-        };
+            .unwrap();
         assert_eq!(grant.remaining_kv(), 2);
         assert_eq!(grant.remaining_rs(), 3);
         assert_eq!(pool.rs_free.load(Ordering::SeqCst), 61);
@@ -2056,22 +2054,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn requester_selected_as_victim_self_suspends_first() {
+    async fn requester_selected_as_victim_parks_until_the_caller_yields() {
         // An older head exists; the younger requester is the only candidate
-        // — the ladder picks it, and its own acquire returns
-        // SelfSuspendFirst (victim and requester are the same code, D3).
+        // — the ladder picks it, its acquire parks (a standing safe point),
+        // and the caller observes the park signal, cancels, and yields
+        // (victim and requester are the same code, D3).
         let (orch, older, _) = orch_with_config(0, 0, 10, Duration::from_secs(5));
         let younger = ProcessId::new_v4();
         orch.register(younger);
         let _ = orch.register_waiter(older, older, Demand::kv(4)).unwrap();
-        let acquired = tokio::time::timeout(
-            Duration::from_secs(1),
-            orch.acquire_or_self_suspend_for_pipeline(younger, younger, Demand::kv(2)),
-        )
+        let task = {
+            let orch = orch.clone();
+            tokio::spawn(async move { orch.acquire(younger, younger, Demand::kv(2)).await })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !orch.should_park(younger) {
+                tokio::task::yield_now().await;
+            }
+        })
         .await
-        .expect("victim selection must not hang")
-        .unwrap();
-        assert!(matches!(acquired, Acquired::SelfSuspendFirst));
-        assert!(orch.should_park(younger));
+        .expect("escalation must select the younger requester");
+        // The caller's safe point reacts: cancel the parked acquire and run
+        // the park protocol (here: teardown, the harshest cancellation).
+        task.abort();
+        let _ = task.await;
+        orch.unregister(younger);
+        assert!(!orch.is_registered(younger));
     }
 }

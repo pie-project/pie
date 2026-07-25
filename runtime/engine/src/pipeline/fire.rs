@@ -279,6 +279,14 @@ fn host_kv_demand(
 /// half-succeeds) from the contention orchestrator. Zero demand yields an
 /// empty grant so the build path stays uniform — every fire shape goes
 /// through prefix lending against one owned grant.
+///
+/// The wait inside `acquire` is a STANDING safe point (D2): the requester
+/// holds nothing, so this races the acquire against the process's park
+/// signal exactly like every idle host await does. When a park request
+/// lands — including when the requester itself is the selected victim (D3)
+/// — the acquire future is cancelled (rank is the spawn clock, so retry
+/// never loses queue position), the request is honored through the one
+/// yield point, and the acquire re-issues.
 async fn acquire_grant<C: FireContext>(
     ctx: &mut C,
     pipeline_id: uuid::Uuid,
@@ -292,18 +300,30 @@ async fn acquire_grant<C: FireContext>(
     let Some(orchestrator) = crate::store::reclaim::contention() else {
         return Err("pipeline: KV contention orchestrator is not installed".to_string());
     };
+    let pid = ctx.process_id();
     loop {
-        match orchestrator
-            .acquire_or_self_suspend_for_pipeline(ctx.process_id(), pipeline_id, demand)
-            .await
-            .map_err(|error| format!("pipeline: KV contention: {error}"))?
-        {
-            crate::store::reclaim::Acquired::Granted(grant) => return Ok(grant),
-            crate::store::reclaim::Acquired::SelfSuspendFirst => {
-                ctx.honor_preemption()
+        let yielded = {
+            let acquire = orchestrator.acquire(pid, pipeline_id, demand);
+            let Some(signal) = ctx.preemption_signal() else {
+                return acquire
                     .await
-                    .map_err(|error| format!("pipeline: KV preemption: {error:#}"))?;
+                    .map_err(|error| format!("pipeline: KV contention: {error}"));
+            };
+            tokio::pin!(acquire);
+            let notified = signal.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            tokio::select! {
+                result = &mut acquire => {
+                    return result.map_err(|error| format!("pipeline: KV contention: {error}"));
+                }
+                _ = &mut notified => true,
             }
+        };
+        if yielded {
+            ctx.honor_preemption()
+                .await
+                .map_err(|error| format!("pipeline: KV preemption: {error:#}"))?;
         }
     }
 }
