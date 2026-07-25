@@ -18,6 +18,7 @@ members = [
     "repetition-penalty",
     "dry-repetition-penalty",
     "gumbel-watermark",
+    "classifier-free-guidance",
     "sampling-primitives",
     "sliding-window-attention",
     "tail-free-sampling",
