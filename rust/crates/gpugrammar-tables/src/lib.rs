@@ -25,6 +25,7 @@ use gpugrammar_lex::lexicon::Lexicon;
 use gpugrammar_lex::{Lexer, VocabularyGroups};
 use gpugrammar_lr::cfg::Cfg;
 use gpugrammar_lr::tables::Tables;
+use rustc_hash::FxHashMap;
 use serde::Serialize;
 
 /// One way of reading a token.
@@ -160,14 +161,27 @@ pub fn emit(
     let mut offsets = Vec::with_capacity(lexer.num_states() + 1);
     offsets.push(0u32);
 
+    // Two groups with the same tokens share one bitset. They are common: the
+    // vocabulary a state admits changes far less often than the state does, so
+    // the same set is reached from many places. Measured on JSONSchemaBench the
+    // duplication is 2x to 27x, and since a bitset is the whole vocabulary -
+    // 19 KiB at 151,669 tokens - this is where the artifact's size lives.
+    let mut interned: FxHashMap<Vec<u32>, u32> = FxHashMap::default();
     for (state, state_groups) in groups.per_state.iter().enumerate() {
         for group in state_groups {
-            let offset = bitsets.len() as u32;
-            bitsets.resize(bitsets.len() + bitset_words, 0);
+            let mut bits = vec![0u32; bitset_words];
             for token in &group.tokens {
-                let word = offset as usize + (*token as usize) / 32;
-                bitsets[word] |= 1u32 << (*token % 32);
+                bits[(*token as usize) / 32] |= 1u32 << (*token % 32);
             }
+            let offset = match interned.get(&bits) {
+                Some(&existing) => existing,
+                None => {
+                    let fresh = bitsets.len() as u32;
+                    bitsets.extend_from_slice(&bits);
+                    interned.insert(bits, fresh);
+                    fresh
+                }
+            };
             entries.push(GroupEntry {
                 lexer_state: state as u32,
                 readings: group

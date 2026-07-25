@@ -24,7 +24,7 @@ pub mod regular;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 
 use gpugrammar_ir::fsm::{Automaton, FsmEdge, NfaGraph, StateId};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Identifies a terminal of the context-free skeleton.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -207,6 +207,99 @@ impl Lexer {
         }
     }
 
+    /// Merge states that behave identically from here on.
+    ///
+    /// Subset construction produces the reachable states, not the fewest. Two
+    /// states are the same for our purposes when they accept the same terminals
+    /// and every byte takes them to states that are themselves the same, and
+    /// merging them costs nothing: the mask a state implies is a function of
+    /// exactly that behaviour. It matters more here than in a normal scanner
+    /// because a lexer state carries a token bitset per group - measured at
+    /// 19 KiB with a 151,669-token vocabulary - so states are the unit of
+    /// memory, not just of table size.
+    ///
+    /// Moore's algorithm: start by separating states with different accepting
+    /// sets, then repeatedly split any block whose members disagree about which
+    /// block a byte leads to.
+    fn minimise(&mut self) {
+        let states = self.num_states();
+        if states <= 1 {
+            return;
+        }
+
+        let mut block: Vec<u32> = {
+            let mut by_accepting: FxHashMap<&[TerminalId], u32> = FxHashMap::default();
+            self.accepts
+                .iter()
+                .map(|accepting| {
+                    let next = by_accepting.len() as u32;
+                    *by_accepting.entry(accepting.as_slice()).or_insert(next)
+                })
+                .collect()
+        };
+
+        let mut signature: Vec<u32> = vec![0; 256];
+        loop {
+            let mut refined: FxHashMap<Vec<u32>, u32> = FxHashMap::default();
+            let mut next_block = vec![0u32; states];
+            for state in 0..states {
+                let row = state * 256;
+                for byte in 0..256 {
+                    let target = self.transitions[row + byte];
+                    signature[byte] = if target == NO_STATE {
+                        u32::MAX
+                    } else {
+                        block[target as usize]
+                    };
+                }
+                let mut key = Vec::with_capacity(257);
+                key.push(block[state]);
+                key.extend_from_slice(&signature);
+                let size = refined.len() as u32;
+                next_block[state] = *refined.entry(key).or_insert(size);
+            }
+            let settled = refined.len() == block.iter().collect::<FxHashSet<_>>().len();
+            block = next_block;
+            if settled {
+                break;
+            }
+        }
+
+        // The start state has to keep index zero, so renumber from it.
+        let blocks = block.iter().copied().max().map_or(0, |m| m as usize + 1);
+        if blocks == states {
+            return;
+        }
+        let mut representative: Vec<Option<u32>> = vec![None; blocks];
+        let mut order: Vec<u32> = Vec::with_capacity(blocks);
+        for state in 0..states {
+            let id = block[state] as usize;
+            if representative[id].is_none() {
+                representative[id] = Some(order.len() as u32);
+                order.push(state as u32);
+            }
+        }
+        let renumber =
+            |state: u32| -> u32 { representative[block[state as usize] as usize].unwrap() };
+
+        let mut transitions = vec![NO_STATE; order.len() * 256];
+        let mut accepts = Vec::with_capacity(order.len());
+        for (index, &state) in order.iter().enumerate() {
+            let row = state as usize * 256;
+            for byte in 0..256 {
+                let target = self.transitions[row + byte];
+                transitions[index * 256 + byte] = if target == NO_STATE {
+                    NO_STATE
+                } else {
+                    renumber(target)
+                };
+            }
+            accepts.push(self.accepts[state as usize].clone());
+        }
+        self.transitions = transitions;
+        self.accepts = accepts;
+    }
+
     fn step(&self, state: LexState, byte: u8) -> Option<LexState> {
         let next = self.transitions[state.0 as usize * 256 + byte as usize];
         (next != NO_STATE).then_some(LexState(next))
@@ -363,6 +456,7 @@ pub fn build_lexer_within(terminals: Vec<Terminal>, budget: usize) -> Option<Lex
     let end_of: HashMap<StateId, TerminalId> = ends.into_iter().collect();
     let mut lexer = determinise(&union, start, &end_of, names, budget)?;
     lexer.trim();
+    lexer.minimise();
     Some(lexer)
 }
 
