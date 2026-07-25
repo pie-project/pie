@@ -76,6 +76,13 @@ pub struct Artifact {
     pub pending_offsets: Vec<u32>,
     pub pending_terminals: Vec<u32>,
 
+    /// `lexer_transitions[state * 256 + byte]`, `u32::MAX` where impossible.
+    ///
+    /// Carried so the runtime can walk a token's bytes instead of reading a
+    /// precomputed mask. It costs `states * 1 KiB` and does not scale with the
+    /// vocabulary, where the masks cost `groups * vocabulary / 8`.
+    pub lexer_transitions: Vec<u32>,
+
     /// Terminals a lexer state accepts right now, CSR by state. A lexeme is
     /// withheld while another byte could extend it, so the last one in a
     /// document is still pending when the input ends; ending the input is what
@@ -190,6 +197,7 @@ pub fn emit(
         pending_offsets.push(pending_terminals.len() as u32);
     }
 
+    let lexer_transitions = lexer.transitions().to_vec();
     let mut accepting_offsets = Vec::with_capacity(lexer.num_states() + 1);
     let mut accepting_terminals = Vec::new();
     accepting_offsets.push(0u32);
@@ -222,6 +230,7 @@ pub fn emit(
         pending_terminals,
         accepting_offsets,
         accepting_terminals,
+        lexer_transitions,
         action_offsets,
         action_terminals,
         action_values,

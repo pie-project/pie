@@ -1,0 +1,35 @@
+{
+  "schema_index": 6,
+  "lexer_states": 1234,
+  "groups": 24359,
+  "vocab_size": 151669,
+  "transition_bytes": 1263616,
+  "mask_bytes": 461846640,
+  "measurements": [
+    {
+      "distinct_states": 1,
+      "walk_us": 174.43840503692627,
+      "median_allowed": 151117
+    },
+    {
+      "distinct_states": 8,
+      "walk_us": 311.1423969268799,
+      "median_allowed": 151117
+    },
+    {
+      "distinct_states": 32,
+      "walk_us": 910.0288391113281,
+      "median_allowed": 151117
+    },
+    {
+      "distinct_states": 128,
+      "walk_us": 3520.7168579101562,
+      "median_allowed": 151117
+    },
+    {
+      "distinct_states": 512,
+      "walk_us": 13947.442626953125,
+      "median_allowed": 151117
+    }
+  ]
+}

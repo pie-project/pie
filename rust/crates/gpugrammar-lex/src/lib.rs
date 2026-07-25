@@ -62,6 +62,20 @@ pub struct Lexer {
 }
 
 impl Lexer {
+    /// The raw transition table, `transitions[state * 256 + byte]`, with
+    /// [`NO_STATE`] where a byte is impossible.
+    ///
+    /// Precomputed masks are one way to answer "is this token allowed"; walking
+    /// the token's bytes on device is the other, and it needs this. The table
+    /// is `states * 256 * 4` bytes and, unlike a mask, does not scale with the
+    /// vocabulary at all.
+    pub fn transitions(&self) -> &[u32] {
+        &self.transitions
+    }
+
+    /// Sentinel for a byte with no transition.
+    pub const NO_STATE: u32 = NO_STATE;
+
     pub fn num_states(&self) -> usize {
         self.accepts.len()
     }

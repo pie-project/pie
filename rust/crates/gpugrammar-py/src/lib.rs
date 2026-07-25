@@ -121,6 +121,29 @@ impl CompiledGrammar {
         self.artifact.resident_bytes()
     }
 
+    /// `transitions[state * 256 + byte]`, `0xffffffff` where impossible.
+    ///
+    /// This is what a device-side token walk needs instead of the masks.
+    fn lexer_transitions<'py>(&self, python: Python<'py>) -> Bound<'py, PyBytes> {
+        let mut bytes = Vec::with_capacity(self.artifact.lexer_transitions.len() * 4);
+        for word in &self.artifact.lexer_transitions {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        PyBytes::new(python, &bytes)
+    }
+
+    /// One bit per lexer state: does a lexeme may end here?
+    fn lexer_accepting<'py>(&self, python: Python<'py>) -> Bound<'py, PyBytes> {
+        let states = self.artifact.num_lexer_states as usize;
+        let mut flags = vec![0u8; states];
+        for state in 0..states {
+            let from = self.artifact.accepting_offsets[state];
+            let to = self.artifact.accepting_offsets[state + 1];
+            flags[state] = u8::from(to > from);
+        }
+        PyBytes::new(python, &flags)
+    }
+
     /// The group bitsets, so a caller can upload them to the device.
     fn group_bitsets<'py>(&self, python: Python<'py>) -> Bound<'py, PyBytes> {
         let mut bytes = Vec::with_capacity(self.artifact.group_bitsets.len() * 4);
