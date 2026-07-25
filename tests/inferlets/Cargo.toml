@@ -25,6 +25,7 @@ members = [
     "sliding-window-attention",
     "tail-free-sampling",
     "text-completion-bench",
+    "token-healing",
     "top-a-sampling",
     "xtc-sampling",
 ]
