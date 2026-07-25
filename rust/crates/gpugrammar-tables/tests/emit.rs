@@ -4,7 +4,7 @@ use gpugrammar_lex::regular::analyze;
 use gpugrammar_lex::{build_lexer, group_vocabulary};
 use gpugrammar_lr::cfg::flatten;
 use gpugrammar_lr::tables::build;
-use gpugrammar_tables::{Artifact, emit};
+use gpugrammar_tables::{Artifact, GroupEntry, SetKind, emit};
 
 const JSON: &str = r#"
 value ::= object | array | string | number
@@ -40,41 +40,56 @@ fn artifact() -> (Artifact, Vec<Vec<u8>>) {
     )
 }
 
+/// Is `token` in this group, whichever form the set is stored in?
+fn holds(artifact: &gpugrammar_tables::Artifact, group: &GroupEntry, token: usize) -> bool {
+    let set = group.set;
+    let from = set.offset as usize;
+    let body = &artifact.set_payload[from..from + set.length as usize];
+    match set.kind {
+        SetKind::Sparse => body.binary_search(&(token as u32)).is_ok(),
+        SetKind::Complement => body.binary_search(&(token as u32)).is_err(),
+        SetKind::Dense => body[token / 32] >> (token % 32) & 1 == 1,
+    }
+}
+
 #[test]
-fn every_group_bitset_holds_exactly_its_tokens() {
+fn every_group_holds_exactly_its_tokens() {
+    // The set is stored sparsely, as a complement, or densely, whichever is
+    // smallest; all three have to answer the same question.
     let (artifact, vocab) = artifact();
-    let words = artifact.bitset_words as usize;
     let mut counted = 0usize;
     for group in &artifact.groups {
-        let start = group.bitset_offset as usize;
-        let set: usize = artifact.group_bitsets[start..start + words]
-            .iter()
-            .map(|word| word.count_ones() as usize)
-            .sum();
-        assert_eq!(set, group.token_count as usize);
-        counted += set;
-        for token in 0..vocab.len() {
-            let bit = artifact.group_bitsets[start + token / 32] >> (token % 32) & 1;
-            assert!(bit <= 1);
-        }
+        let members = (0..vocab.len())
+            .filter(|token| holds(&artifact, group, *token))
+            .count();
+        assert_eq!(members, group.token_count as usize);
+        counted += members;
     }
     assert!(counted > 0);
 }
 
 #[test]
+fn a_small_set_is_not_stored_as_a_whole_vocabulary() {
+    let (artifact, _) = artifact();
+    let words = artifact.bitset_words as usize;
+    let dense = artifact.groups.len() * words;
+    assert!(
+        artifact.set_payload.len() < dense,
+        "storage {} is no smaller than {dense} dense rows",
+        artifact.set_payload.len()
+    );
+}
+
+#[test]
 fn a_token_belongs_to_one_group_per_lexer_state() {
     let (artifact, vocab) = artifact();
-    let words = artifact.bitset_words as usize;
     for state in 0..artifact.num_lexer_states as usize {
         let from = artifact.group_offsets[state] as usize;
         let to = artifact.group_offsets[state + 1] as usize;
         for token in 0..vocab.len() {
             let hits = artifact.groups[from..to]
                 .iter()
-                .filter(|group| {
-                    let start = group.bitset_offset as usize;
-                    artifact.group_bitsets[start + token / 32] >> (token % 32) & 1 == 1
-                })
+                .filter(|group| holds(&artifact, group, token))
                 .count();
             assert!(
                 hits <= 1,

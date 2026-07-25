@@ -30,7 +30,7 @@ pub mod cache;
 
 use std::sync::Arc;
 
-use gpugrammar_tables::Artifact;
+use gpugrammar_tables::{Artifact, SetKind};
 
 /// One live reading of the input: a lexer state and the LR stack it produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -231,7 +231,11 @@ impl Matcher {
         next
     }
 
-    /// Union the admitted groups' bitsets into `mask`.
+    /// Union the admitted groups' token sets into `mask`.
+    ///
+    /// A group's set is stored in whichever exact form is smallest, so this
+    /// unions a token list, a complement list or a bitset depending on the
+    /// group. Only the dense case touches the whole mask.
     pub fn fill_bitmask(&self, mask: &mut [u32]) {
         let words = self.artifact.bitset_words as usize;
         mask[..words].fill(0);
@@ -239,10 +243,57 @@ impl Matcher {
             return;
         }
         for index in self.admissible_groups() {
-            let offset = self.artifact.groups[index].bitset_offset as usize;
-            for (slot, word) in mask[..words].iter_mut().enumerate() {
-                *word |= self.artifact.group_bitsets[offset + slot];
+            let set = self.artifact.groups[index].set;
+            let body = self.payload(set);
+            match set.kind {
+                SetKind::Sparse => {
+                    for token in body {
+                        mask[*token as usize / 32] |= 1u32 << (*token % 32);
+                    }
+                }
+                SetKind::Complement => {
+                    // Everything except the listed tokens, and the listed ones
+                    // only if some other group admits them - so build this
+                    // group's contribution separately and union it in.
+                    let mut all = vec![u32::MAX; words];
+                    for token in body {
+                        all[*token as usize / 32] &= !(1u32 << (*token % 32));
+                    }
+                    Self::clear_tail(&mut all, self.artifact.vocab_size as usize);
+                    for (slot, word) in mask[..words].iter_mut().enumerate() {
+                        *word |= all[slot];
+                    }
+                }
+                SetKind::Dense => {
+                    for (slot, word) in mask[..words].iter_mut().enumerate() {
+                        *word |= body[slot];
+                    }
+                }
             }
+        }
+    }
+
+    /// Bits past the last token must stay zero, or a complement would set them.
+    fn clear_tail(mask: &mut [u32], vocab_size: usize) {
+        let spare = mask.len() * 32 - vocab_size;
+        if spare > 0 {
+            let last = mask.len() - 1;
+            mask[last] &= u32::MAX >> spare;
+        }
+    }
+
+    fn payload(&self, set: gpugrammar_tables::TokenSet) -> &[u32] {
+        let from = set.offset as usize;
+        &self.artifact.set_payload[from..from + set.length as usize]
+    }
+
+    /// Does this group hold `token`?
+    fn contains(&self, set: gpugrammar_tables::TokenSet, token: u32) -> bool {
+        let body = self.payload(set);
+        match set.kind {
+            SetKind::Sparse => body.binary_search(&token).is_ok(),
+            SetKind::Complement => body.binary_search(&token).is_err(),
+            SetKind::Dense => body[token as usize / 32] & (1u32 << (token % 32)) != 0,
         }
     }
 
@@ -273,17 +324,12 @@ impl Matcher {
     /// One per state: a token belongs to exactly one group of a given state,
     /// but configurations may sit in different states.
     pub fn groups_of(&self, token: u32) -> Vec<usize> {
-        let word = token as usize / 32;
-        let bit = 1u32 << (token % 32);
         self.live_states()
             .into_iter()
             .filter_map(|state| {
                 let from = self.artifact.group_offsets[state as usize] as usize;
                 let to = self.artifact.group_offsets[state as usize + 1] as usize;
-                (from..to).find(|index| {
-                    let offset = self.artifact.groups[*index].bitset_offset as usize;
-                    self.artifact.group_bitsets[offset + word] & bit != 0
-                })
+                (from..to).find(|index| self.contains(self.artifact.groups[*index].set, token))
             })
             .collect()
     }

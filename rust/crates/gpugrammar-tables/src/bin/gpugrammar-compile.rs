@@ -75,7 +75,7 @@ fn main() -> Result<()> {
             );
         }};
     }
-    section!("group_bitsets", artifact.group_bitsets, "uint32");
+    section!("set_payload", artifact.set_payload, "uint32");
     section!("group_offsets", artifact.group_offsets, "uint32");
     section!("action_offsets", artifact.action_offsets, "uint32");
     section!("action_terminals", artifact.action_terminals, "uint32");

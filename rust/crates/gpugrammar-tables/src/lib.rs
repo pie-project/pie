@@ -35,6 +35,34 @@ pub struct Reading {
     pub next_lexer_state: u32,
 }
 
+/// How one group's token set is stored.
+///
+/// Every set was a bitset over the whole vocabulary: 18,960 bytes at 151,669
+/// tokens, whatever the set held. Measured over the corpus that is almost
+/// always the wrong choice - the median set has one token in it, and 99% have
+/// at most sixty-six - so a set is now kept in whichever of three exact forms
+/// is smallest. Approximation is not among them: a false positive admits a
+/// token the grammar forbids, and a Bloom filter at a false-positive rate low
+/// enough to be safe is no smaller than the exact list anyway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub enum SetKind {
+    /// `length` token ids, ascending. The usual case.
+    Sparse,
+    /// `length` token ids the set excludes, ascending. For a set that admits
+    /// nearly the whole vocabulary, as a string body does.
+    Complement,
+    /// `length` packed words. Only when neither list is smaller.
+    Dense,
+}
+
+/// A token set: a kind, and a run of `length` `u32`s at `offset`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct TokenSet {
+    pub kind: SetKind,
+    pub offset: u32,
+    pub length: u32,
+}
+
 /// A token group as the device sees it.
 #[derive(Debug, Clone, Serialize)]
 pub struct GroupEntry {
@@ -45,8 +73,9 @@ pub struct GroupEntry {
     /// first it can follow, which is how a generated lexicon's ambiguity - both
     /// which terminal and where the lexeme ends - is resolved.
     pub readings: Vec<Reading>,
-    /// Offset into `group_bitsets`, in words.
-    pub bitset_offset: u32,
+    /// Where the group's token set lives in `set_payload`, and how it is
+    /// stored there.
+    pub set: TokenSet,
     /// How many tokens the group holds, for diagnostics and weighting.
     pub token_count: u32,
 }
@@ -67,8 +96,9 @@ pub struct Artifact {
     pub groups: Vec<GroupEntry>,
     /// `group_offsets[state]..group_offsets[state + 1]` indexes `groups`.
     pub group_offsets: Vec<u32>,
-    /// Packed allowed-token bitsets, one run of `bitset_words` per group.
-    pub group_bitsets: Vec<u32>,
+    /// Every group's token set, back to back. A [`TokenSet`] says where each
+    /// one starts and how to read it.
+    pub set_payload: Vec<u32>,
 
     /// Terminals a lexeme left in progress could still become, CSR by lexer
     /// state. It depends only on the state, so groups share it rather than
@@ -109,7 +139,7 @@ pub struct Artifact {
 impl Artifact {
     /// Bytes the runtime keeps resident.
     pub fn resident_bytes(&self) -> usize {
-        4 * (self.group_bitsets.len()
+        4 * (self.set_payload.len()
             + self.group_offsets.len()
             + self.action_offsets.len()
             + self.action_terminals.len()
@@ -135,6 +165,58 @@ impl Artifact {
             .sum();
         allowed * 8 * self.num_parser_states as usize
     }
+}
+
+/// Store one token set in whichever exact form is smallest, sharing it with any
+/// identical set already stored.
+///
+/// The three forms cost `tokens`, `vocabulary - tokens`, and
+/// `vocabulary / 32` words respectively, so the choice is arithmetic. Sharing
+/// matters as much as the choice: the set a state admits changes far less often
+/// than the state does, and the same set arrives from two to twenty-seven
+/// different places.
+pub fn store_set(
+    tokens: &[u32],
+    vocab_size: usize,
+    bitset_words: usize,
+    payload: &mut Vec<u32>,
+    interned: &mut FxHashMap<(SetKind, Vec<u32>), TokenSet>,
+) -> TokenSet {
+    let sparse = tokens.len();
+    let complement = vocab_size - sparse;
+    let (kind, body) = if sparse <= complement && sparse <= bitset_words {
+        let mut ordered = tokens.to_vec();
+        ordered.sort_unstable();
+        (SetKind::Sparse, ordered)
+    } else if complement <= bitset_words {
+        let mut present = vec![false; vocab_size];
+        for token in tokens {
+            present[*token as usize] = true;
+        }
+        let missing = (0..vocab_size as u32)
+            .filter(|token| !present[*token as usize])
+            .collect();
+        (SetKind::Complement, missing)
+    } else {
+        let mut bits = vec![0u32; bitset_words];
+        for token in tokens {
+            bits[(*token as usize) / 32] |= 1u32 << (*token % 32);
+        }
+        (SetKind::Dense, bits)
+    };
+
+    let key = (kind, body);
+    if let Some(&existing) = interned.get(&key) {
+        return existing;
+    }
+    let set = TokenSet {
+        kind,
+        offset: payload.len() as u32,
+        length: key.1.len() as u32,
+    };
+    payload.extend_from_slice(&key.1);
+    interned.insert(key, set);
+    set
 }
 
 /// Assemble the artifact from a compiled grammar.
@@ -185,22 +267,16 @@ pub fn emit(
     // the same set is reached from many places. Measured on JSONSchemaBench the
     // duplication is 2x to 27x, and since a bitset is the whole vocabulary -
     // 19 KiB at 151,669 tokens - this is where the artifact's size lives.
-    let mut interned: FxHashMap<Vec<u32>, u32> = FxHashMap::default();
+    let mut interned: FxHashMap<(SetKind, Vec<u32>), TokenSet> = FxHashMap::default();
     for (state, state_groups) in groups.per_state.iter().enumerate() {
         for group in state_groups {
-            let mut bits = vec![0u32; bitset_words];
-            for token in &group.tokens {
-                bits[(*token as usize) / 32] |= 1u32 << (*token % 32);
-            }
-            let offset = match interned.get(&bits) {
-                Some(&existing) => existing,
-                None => {
-                    let fresh = bitsets.len() as u32;
-                    bitsets.extend_from_slice(&bits);
-                    interned.insert(bits, fresh);
-                    fresh
-                }
-            };
+            let set = store_set(
+                &group.tokens,
+                vocab_size,
+                bitset_words,
+                &mut bitsets,
+                &mut interned,
+            );
             entries.push(GroupEntry {
                 lexer_state: state as u32,
                 readings: group
@@ -212,7 +288,7 @@ pub fn emit(
                         next_lexer_state: option.next_state.0,
                     })
                     .collect(),
-                bitset_offset: offset,
+                set,
                 token_count: group.tokens.len() as u32,
             });
         }
@@ -258,7 +334,7 @@ pub fn emit(
         start_parser_state: tables.start_state as u32,
         groups: entries,
         group_offsets: offsets,
-        group_bitsets: bitsets,
+        set_payload: bitsets,
         pending_offsets,
         pending_terminals,
         accepting_offsets,

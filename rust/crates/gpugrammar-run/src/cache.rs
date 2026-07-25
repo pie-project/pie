@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use gpugrammar_lex::{Group, LexState, Lexer, group_state};
-use gpugrammar_tables::{Artifact, GroupEntry, Reading};
+use gpugrammar_tables::{Artifact, GroupEntry, Reading, SetKind, TokenSet};
 use rustc_hash::FxHashMap;
 
 /// An artifact whose group tables are filled as states are reached.
@@ -28,9 +28,9 @@ pub struct Cache {
     vocabulary: Arc<Vec<Vec<u8>>>,
     /// Where a state's groups start in `artifact.groups`, once filled.
     filled: FxHashMap<u32, (u32, u32)>,
-    /// Bitsets already stored, so two states admitting the same tokens share
-    /// one copy. Duplication is 2x to 27x across real schemas.
-    interned: FxHashMap<Vec<u32>, u32>,
+    /// Sets already stored, so two states admitting the same tokens share one
+    /// copy. Duplication is 2x to 27x across real schemas.
+    interned: FxHashMap<(SetKind, Vec<u32>), TokenSet>,
     misses: usize,
     hits: usize,
 }
@@ -83,7 +83,7 @@ impl Cache {
         let first = self.artifact.groups.len() as u32;
 
         for group in &groups {
-            let offset = self.store(group, words);
+            let set = self.store(group, words);
             self.artifact.groups.push(GroupEntry {
                 lexer_state: state,
                 readings: group
@@ -95,7 +95,7 @@ impl Cache {
                         next_lexer_state: option.next_state.0,
                     })
                     .collect(),
-                bitset_offset: offset,
+                set,
                 token_count: group.tokens.len() as u32,
             });
         }
@@ -106,19 +106,13 @@ impl Cache {
         self.artifact.group_offsets[state as usize + 1] = last;
     }
 
-    fn store(&mut self, group: &Group, words: usize) -> u32 {
-        let mut bits = vec![0u32; words];
-        for token in &group.tokens {
-            bits[(*token as usize) / 32] |= 1u32 << (*token % 32);
-        }
-        match self.interned.get(&bits) {
-            Some(&existing) => existing,
-            None => {
-                let offset = self.artifact.group_bitsets.len() as u32;
-                self.artifact.group_bitsets.extend_from_slice(&bits);
-                self.interned.insert(bits, offset);
-                offset
-            }
-        }
+    fn store(&mut self, group: &Group, words: usize) -> TokenSet {
+        gpugrammar_tables::store_set(
+            &group.tokens,
+            self.artifact.vocab_size as usize,
+            words,
+            &mut self.artifact.set_payload,
+            &mut self.interned,
+        )
     }
 }

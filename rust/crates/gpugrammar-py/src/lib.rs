@@ -144,11 +144,41 @@ impl CompiledGrammar {
         PyBytes::new(python, &flags)
     }
 
-    /// The group bitsets, so a caller can upload them to the device.
+    /// Every group's token set as a dense bitmask, for callers that want to
+    /// inspect the sets rather than the storage. The artifact itself keeps them
+    /// in whichever exact form is smallest.
     fn group_bitsets<'py>(&self, python: Python<'py>) -> Bound<'py, PyBytes> {
-        let mut bytes = Vec::with_capacity(self.artifact.group_bitsets.len() * 4);
-        for word in &self.artifact.group_bitsets {
-            bytes.extend_from_slice(&word.to_le_bytes());
+        let words = self.artifact.bitset_words as usize;
+        let vocab = self.artifact.vocab_size as usize;
+        let mut bytes = Vec::with_capacity(self.artifact.groups.len() * words * 4);
+        for group in &self.artifact.groups {
+            let set = group.set;
+            let from = set.offset as usize;
+            let body = &self.artifact.set_payload[from..from + set.length as usize];
+            let mut bits = match set.kind {
+                gpugrammar_tables::SetKind::Complement => vec![u32::MAX; words],
+                _ => vec![0u32; words],
+            };
+            match set.kind {
+                gpugrammar_tables::SetKind::Sparse => {
+                    for token in body {
+                        bits[*token as usize / 32] |= 1u32 << (*token % 32);
+                    }
+                }
+                gpugrammar_tables::SetKind::Complement => {
+                    for token in body {
+                        bits[*token as usize / 32] &= !(1u32 << (*token % 32));
+                    }
+                    let spare = words * 32 - vocab;
+                    if spare > 0 {
+                        bits[words - 1] &= u32::MAX >> spare;
+                    }
+                }
+                gpugrammar_tables::SetKind::Dense => bits.copy_from_slice(body),
+            }
+            for word in &bits {
+                bytes.extend_from_slice(&word.to_le_bytes());
+            }
         }
         PyBytes::new(python, &bytes)
     }
