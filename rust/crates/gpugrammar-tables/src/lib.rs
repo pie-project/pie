@@ -138,6 +138,25 @@ impl Artifact {
 }
 
 /// Assemble the artifact from a compiled grammar.
+/// Emit with no group tables at all, for a runtime that fills them on demand.
+///
+/// The parser tables and the lexer are complete; only the token-to-group
+/// translation is left empty, because that is the part that costs megabytes and
+/// the part a request uses only a fraction of.
+pub fn emit_ungrouped(
+    lexicon: &Lexicon,
+    lexer: &Lexer,
+    cfg: &Cfg,
+    tables: &Tables,
+    vocab_size: usize,
+) -> Result<Artifact> {
+    let empty = VocabularyGroups {
+        per_state: vec![Vec::new(); lexer.num_states()],
+        rejected: vec![0; lexer.num_states()],
+    };
+    emit(lexicon, lexer, &empty, cfg, tables, vocab_size)
+}
+
 pub fn emit(
     lexicon: &Lexicon,
     lexer: &Lexer,

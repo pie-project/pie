@@ -26,6 +26,8 @@
 //! same shape as a parser with a state set, kept small because the ambiguity is
 //! local: it resolves within a token or two.
 
+pub mod cache;
+
 use std::sync::Arc;
 
 use gpugrammar_tables::Artifact;
@@ -120,6 +122,23 @@ impl Matcher {
                 replay(&self.artifact, &config.stack, &[*terminal, eof], true).is_some()
             })
         })
+    }
+
+    /// The parser stack of the first live configuration.
+    pub fn stack(&self) -> &[u32] {
+        self.configs
+            .first()
+            .map_or(&[][..], |config| config.stack.as_slice())
+    }
+
+    /// Put the matcher back into a single known configuration.
+    ///
+    /// The lazy cache rebuilds a matcher each step as the artifact grows, so it
+    /// needs to carry the parse across.
+    pub fn restore(&mut self, lexer_state: u32, stack: Vec<u32>) {
+        self.configs.clear();
+        self.configs.push(Config { lexer_state, stack });
+        self.terminated = false;
     }
 
     pub fn reset(&mut self) {

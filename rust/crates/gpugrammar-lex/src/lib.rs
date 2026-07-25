@@ -558,6 +558,33 @@ impl VocabularyGroups {
     }
 }
 
+/// Group every token of `vocabulary`, from one lexer state.
+///
+/// Grouping a single state is what a lazy cache needs: a mask is a pure
+/// function of the state, and a real document reaches 2-44% of the states its
+/// grammar can, so grouping all of them up front pays for work no request will
+/// use.
+pub fn group_state(lexer: &Lexer, vocabulary: &[Vec<u8>], state: LexState) -> (Vec<Group>, u32) {
+    let mut rejected = 0u32;
+    let mut buckets: FxHashMap<Scan, Vec<u32>> = FxHashMap::default();
+    for (token_id, bytes) in vocabulary.iter().enumerate() {
+        if bytes.is_empty() {
+            rejected += 1;
+            continue;
+        }
+        match lexer.scan(bytes, state) {
+            Some(scan) => buckets.entry(scan).or_default().push(token_id as u32),
+            None => rejected += 1,
+        }
+    }
+    let mut groups: Vec<Group> = buckets
+        .into_iter()
+        .map(|(scan, tokens)| Group { scan, tokens })
+        .collect();
+    groups.sort_by(|a, b| b.tokens.len().cmp(&a.tokens.len()));
+    (groups, rejected)
+}
+
 /// Group every token of `vocabulary`, from every lexer state.
 pub fn group_vocabulary(lexer: &Lexer, vocabulary: &[Vec<u8>]) -> VocabularyGroups {
     let mut per_state = Vec::with_capacity(lexer.num_states());
