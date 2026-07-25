@@ -1,0 +1,15 @@
+[package]
+name = "asap-grammar-aligned-decoding"
+version = "0.1.0"
+description = "ASAp grammar-aligned decoding — undo the distribution distortion that hard grammar masking introduces"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", optional = true, description = "Prompt to send to the model"}
+schema = {type = "string", optional = true, description = "JSON Schema the output must satisfy"}
+rounds = {type = "int", optional = true, description = "ASAp refinement rounds, 1..16; round 1 is plain GCD (default: 6)"}
+max_tokens = {type = "int", optional = true, description = "Token budget per round (default: 64)"}
+seed = {type = "int", optional = true, description = "Sampling RNG key"}

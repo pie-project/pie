@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "asap-grammar-aligned-decoding",
     "attention-sink",
     "beam-search",
     "cacheback-speculative-decoding",
