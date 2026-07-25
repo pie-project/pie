@@ -407,8 +407,12 @@ target_include_directories(pie_driver_cuda_lib
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${PIE_DRIVER_ABI_INCLUDE_DIR}
-    ${NCCL_INCLUDE_DIR}
+    # Ahead of NCCL: its header is located with ${CUDAToolkit_INCLUDE_DIRS} as
+    # the first HINT, so on hosts that ship nccl.h inside the CUDA tree
+    # NCCL_INCLUDE_DIR *is* the toolkit include dir, and the toolkit's older
+    # bundled CCCL would shadow FlashInfer's vendored one.
     ${PIE_CCCL_INCLUDE_DIRS}
+    ${NCCL_INCLUDE_DIR}
     ${flashinfer_SOURCE_DIR}/include
     ${flashinfer_SOURCE_DIR}/csrc
     ${flashinfer_SOURCE_DIR}/3rdparty/cutlass/include

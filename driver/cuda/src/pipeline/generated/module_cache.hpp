@@ -120,8 +120,15 @@ class ModuleCache {
                 std::string(cudaGetErrorString(properties_status));
             return nullptr;
         }
+        // Real arch (`sm_`), not virtual (`compute_`): NVRTC then hands back a
+        // cubin and the driver only has to load it. Virtual-arch PTX would be
+        // JIT-compiled a second time by the driver, and driver-side PTX JIT is
+        // outside CUDA minor-version compatibility — it would force every host
+        // to carry a driver at least as new as the toolkit pie was built with.
+        // Targeting the live device costs nothing here: the capability comes
+        // from the device we are about to run on.
         const std::string architecture =
-            "--gpu-architecture=compute_" +
+            "--gpu-architecture=sm_" +
             std::to_string(properties.major) +
             std::to_string(properties.minor);
         int nvrtc_major = 0;
@@ -185,13 +192,13 @@ class ModuleCache {
                 const std::string entry =
                     entry_name(plan.signature_hash, region_index);
                 std::shared_ptr<FusedRegionExecutable> executable;
-                if (auto ptx = load_cached_ptx(
+                if (auto cubin = load_cached_cubin(
                         key, region_index, entry)) {
-                    executable = load_region(*ptx, entry, error);
+                    executable = load_region(*cubin, entry, error);
                     if (executable != nullptr) {
                         ++stats_.disk_hits;
                     } else {
-                        invalidate_cached_ptx(key, region_index);
+                        invalidate_cached_cubin(key, region_index);
                         ++stats_.disk_errors;
                         std::fprintf(
                             stderr,
@@ -210,13 +217,13 @@ class ModuleCache {
                         remember_negative(key, error);
                         return nullptr;
                     }
-                    std::string compiled_ptx;
+                    std::string compiled_cubin;
                     executable = compile_region(
                         source,
                         architecture,
                         failure_kind,
                         error,
-                        &compiled_ptx);
+                        &compiled_cubin);
                     if (executable == nullptr) {
                         if (failure_kind ==
                             CompileFailureKind::Deterministic) {
@@ -225,11 +232,11 @@ class ModuleCache {
                         return nullptr;
                     }
                     ++stats_.compilations;
-                    store_cached_ptx(
+                    store_cached_cubin(
                         key,
                         region_index,
                         entry,
-                        compiled_ptx);
+                        compiled_cubin);
                 }
                 stage->regions[region_index] = std::move(executable);
             }
@@ -323,7 +330,7 @@ class ModuleCache {
         std::ostringstream name;
         name << std::hex << std::setfill('0') << std::setw(16)
              << cache_key_hash(key) << "-" << std::dec << region_index
-             << ".ptx";
+             << ".cubin";
         return disk_cache_directory_ / name.str();
     }
 
@@ -343,7 +350,7 @@ class ModuleCache {
         }
     }
 
-    std::optional<std::string> load_cached_ptx(
+    std::optional<std::string> load_cached_cubin(
         const std::string& key,
         std::size_t region_index,
         const std::string& entry) {
@@ -366,7 +373,7 @@ class ModuleCache {
         constexpr std::streamoff kMaximumCacheEntryBytes =
             128 * 1024 * 1024;
         if (size < 28 || size > kMaximumCacheEntryBytes) {
-            invalidate_cached_ptx(key, region_index);
+            invalidate_cached_cubin(key, region_index);
             report_disk_error("invalid PTIR disk cache size", path, {});
             return std::nullopt;
         }
@@ -400,9 +407,9 @@ class ModuleCache {
             }
             return value;
         };
-        constexpr char kMagic[] = "PTRPTX01";
+        constexpr char kMagic[] = "PTRCUB01";
         if (bytes.compare(0, 8, kMagic, 8) != 0) {
-            invalidate_cached_ptx(key, region_index);
+            invalidate_cached_cubin(key, region_index);
             report_disk_error("invalid PTIR disk cache magic", path, {});
             return std::nullopt;
         }
@@ -410,37 +417,37 @@ class ModuleCache {
         const auto stored_region = take_u32();
         const auto key_size = take_u32();
         const auto entry_size = take_u32();
-        const auto ptx_size = take_u64();
+        const auto cubin_size = take_u64();
         const bool valid_sizes =
             stored_region.has_value() &&
             key_size.has_value() &&
             entry_size.has_value() &&
-            ptx_size.has_value() &&
+            cubin_size.has_value() &&
             *stored_region == region_index &&
             *key_size == key.size() &&
             *entry_size == entry.size() &&
-            *ptx_size <= bytes.size() &&
+            *cubin_size <= bytes.size() &&
             cursor <= bytes.size() &&
             static_cast<std::uint64_t>(bytes.size() - cursor) ==
                 static_cast<std::uint64_t>(*key_size) +
-                *entry_size + *ptx_size;
+                *entry_size + *cubin_size;
         if (!valid_sizes ||
             bytes.compare(cursor, key.size(), key) != 0 ||
             bytes.compare(
                 cursor + key.size(), entry.size(), entry) != 0) {
-            invalidate_cached_ptx(key, region_index);
+            invalidate_cached_cubin(key, region_index);
             report_disk_error("PTIR disk cache identity mismatch", path, {});
             return std::nullopt;
         }
         cursor += key.size() + entry.size();
-        return bytes.substr(cursor, static_cast<std::size_t>(*ptx_size));
+        return bytes.substr(cursor, static_cast<std::size_t>(*cubin_size));
     }
 
-    void store_cached_ptx(
+    void store_cached_cubin(
         const std::string& key,
         std::size_t region_index,
         const std::string& entry,
-        const std::string& ptx) {
+        const std::string& cubin) {
         if (disk_cache_directory_.empty()) return;
         if (key.size() > std::numeric_limits<std::uint32_t>::max() ||
             entry.size() > std::numeric_limits<std::uint32_t>::max()) {
@@ -460,14 +467,14 @@ class ModuleCache {
                 filesystem_error);
             return;
         }
-        std::string bytes("PTRPTX01", 8);
+        std::string bytes("PTRCUB01", 8);
         append_u32(bytes, static_cast<std::uint32_t>(region_index));
         append_u32(bytes, static_cast<std::uint32_t>(key.size()));
         append_u32(bytes, static_cast<std::uint32_t>(entry.size()));
-        append_u64(bytes, ptx.size());
+        append_u64(bytes, cubin.size());
         bytes.append(key);
         bytes.append(entry);
-        bytes.append(ptx);
+        bytes.append(cubin);
 
         const auto destination = cache_file(key, region_index);
         const std::uint64_t nonce =
@@ -506,7 +513,7 @@ class ModuleCache {
         ++stats_.disk_writes;
     }
 
-    void invalidate_cached_ptx(
+    void invalidate_cached_cubin(
         const std::string& key,
         std::size_t region_index) {
         if (disk_cache_directory_.empty()) return;
@@ -702,7 +709,7 @@ class ModuleCache {
         const std::string& architecture,
         CompileFailureKind& failure_kind,
         std::string& error,
-        std::string* compiled_ptx) {
+        std::string* compiled_cubin) {
         nvrtcProgram program = nullptr;
         nvrtcResult status = nvrtcCreateProgram(
             &program,
@@ -738,29 +745,29 @@ class ModuleCache {
             error = "NVRTC fused compilation failed: " + log;
             return nullptr;
         }
-        std::size_t ptx_size = 0;
-        status = nvrtcGetPTXSize(program, &ptx_size);
+        std::size_t cubin_size = 0;
+        status = nvrtcGetCUBINSize(program, &cubin_size);
         if (status != NVRTC_SUCCESS) {
             nvrtcDestroyProgram(&program);
             failure_kind = CompileFailureKind::Retryable;
-            error = "NVRTC fused PTX sizing failed: " +
+            error = "NVRTC fused cubin sizing failed: " +
                 std::string(nvrtcGetErrorString(status));
             return nullptr;
         }
-        std::string ptx(ptx_size, '\0');
-        status = nvrtcGetPTX(program, ptx.data());
+        std::string cubin(cubin_size, '\0');
+        status = nvrtcGetCUBIN(program, cubin.data());
         nvrtcDestroyProgram(&program);
         if (status != NVRTC_SUCCESS) {
             failure_kind = CompileFailureKind::Retryable;
-            error = "NVRTC fused PTX extraction failed: " +
+            error = "NVRTC fused cubin extraction failed: " +
                 std::string(nvrtcGetErrorString(status));
             return nullptr;
         }
-        if (compiled_ptx != nullptr) {
-            *compiled_ptx = ptx;
+        if (compiled_cubin != nullptr) {
+            *compiled_cubin = cubin;
         }
         auto executable =
-            load_region(ptx, generated.entry_name, error);
+            load_region(cubin, generated.entry_name, error);
         if (executable == nullptr) {
             failure_kind = CompileFailureKind::Retryable;
         }
@@ -768,13 +775,13 @@ class ModuleCache {
     }
 
     static std::shared_ptr<FusedRegionExecutable> load_region(
-        const std::string& ptx,
+        const std::string& cubin,
         const std::string& entry_name,
         std::string& error) {
         auto executable = std::make_shared<FusedRegionExecutable>();
         executable->entry_name = entry_name;
         CUresult driver_status =
-            cuModuleLoadData(&executable->module, ptx.data());
+            cuModuleLoadData(&executable->module, cubin.data());
         if (driver_status == CUDA_SUCCESS) {
             driver_status = cuModuleGetFunction(
                 &executable->function,
