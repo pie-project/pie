@@ -1,7 +1,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use pie_ptir::rng::{generate_cuda_header, generate_msl_preamble, hash_uniform, keyed_seed};
+use pie_ptir::rng::{
+    generate_cuda_header, generate_msl_preamble, hash_uniform, keyed_seed, RNG_FORMULA,
+    UNIFORM_MAX,
+};
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -73,6 +76,59 @@ fn keyed_rng_byte_parity_vectors() {
         assert_eq!(
             hash_uniform(seed, lane).to_bits().to_le_bytes(),
             expected_uniform_bits[index].to_le_bytes()
+        );
+    }
+}
+
+/// The uniform must stay strictly inside `[0, 1)`.
+///
+/// `(bits + 0.5) / 2^24` is mathematically below 1 for every representable
+/// `bits`, but at `bits = 2^24 - 1` the quotient lands exactly halfway between
+/// `0x1.fffffep-1` and `1.0` and round-to-even snaps it to `1.0`. Consumers
+/// read the draw as `gumbel = -ln(-ln(u))`, which is `+inf` at `u = 1`, and
+/// `+inf` wins every `argmax` it is added to — one uniformly random token per
+/// `2^24 / vocab` decode steps. The clamp is what keeps that from happening,
+/// so this test walks all `2^24` mantissa values rather than sampling.
+#[test]
+fn uniform_never_reaches_one() {
+    let denominator = (1u32 << RNG_FORMULA.uniform_mantissa_bits) as f32;
+    let mut unclamped_hits = 0u32;
+
+    for bits in 0..(1u32 << RNG_FORMULA.uniform_mantissa_bits) {
+        let raw = (bits as f32 + RNG_FORMULA.uniform_midpoint) * (1.0 / denominator);
+        if raw >= 1.0 {
+            unclamped_hits += 1;
+        }
+        let clamped = if raw < UNIFORM_MAX { raw } else { UNIFORM_MAX };
+        assert!(
+            (0.0..1.0).contains(&clamped),
+            "bits {bits} left the half-open unit interval: {clamped}"
+        );
+        assert!(
+            (-(-clamped.ln()).ln()).is_finite(),
+            "bits {bits} produced a non-finite gumbel"
+        );
+    }
+
+    assert_eq!(
+        unclamped_hits, 1,
+        "expected exactly one of 2^24 draws to round up to 1.0 without the clamp"
+    );
+    assert!(UNIFORM_MAX < 1.0);
+    assert_eq!(UNIFORM_MAX.to_bits(), 0x3f7f_ffff);
+}
+
+/// Both generated backends must carry the clamp, or the device diverges from
+/// the host on the one draw that matters.
+#[test]
+fn generated_backends_clamp_the_uniform() {
+    for (backend, source) in [
+        ("cuda", generate_cuda_header()),
+        ("metal", generate_msl_preamble()),
+    ] {
+        assert!(
+            source.contains("0.99999994f"),
+            "{backend} backend lost the uniform clamp"
         );
     }
 }
