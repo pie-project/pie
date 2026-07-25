@@ -944,25 +944,27 @@ contrastive decoding, not an artefact of the implementation.
 
 ### A9 costs less than sampling nothing
 
-The watermark landing *below* the control is not noise. `gumbel-watermark`
-carries a controlled experiment inside it: with `watermark = true` it samples
-via `reduce_argmax(add(scaled, gumbel(keyed, [vocab])))`, and with
-`watermark = false` it falls through to the fused `gumbel_max(scaled, state)` —
-same inferlet, same channels, same two extra `gumbel` tensors for the detector
-statistic, one op different.
+The watermark lands *below* the control, and the reason is measurement, not
+algorithms. `gumbel-watermark` carries an A/B inside it: with `watermark = true`
+it samples via `reduce_argmax(add(scaled, gumbel(keyed, [vocab])))`, and with
+`watermark = false` it falls through to `gumbel_max(scaled, state)`.
 
-| Sampling op | ms/token |
+| Sampling spelling | ms/token |
 |---|---|
-| `gumbel(...)` + `reduce_argmax` (decomposed) | 2.85 |
-| `gumbel_max(...)` (fused) | 3.60 |
-| `naive-baseline`, also fused | 3.51 |
+| `gumbel(...)` + `add` + `reduce_argmax` | 2.85 |
+| `gumbel_max(...)` | 3.60 |
+| `naive-baseline` | 3.51 |
 
-The fused `gumbel_max` is **27 % slower** than spelling the same computation out
-in two ops. A9 spells it out because the detector needs the noise tensor itself,
-not just the argmax — and inherits the faster path as a side effect. The
-watermark's true cost, measured against the decomposed form, is *zero*, which is
-the practical counterpart of its distortion-freeness: it changes neither the
-distribution nor the runtime.
+These are **the same program**. `gumbel_max` (`sdk/rust/ptir-dsl/src/value.rs:912-927`)
+emits exactly `RngKeyed{Gumbel}`, `Add`, `ReduceArgmax`; `gumbel()` (ibid. `:754`)
+emits the `RngKeyed` and the caller writes the other two. `PIE_PTIR_DUMP_PLAN=1`
+confirms both compile to a single fused region with no library regions. So the
+27 % gap is **cross-session variance**, not an op-selection effect — the control
+itself ranges 2.70–3.60 ms/token across server sessions, which brackets the whole
+gap. A9 spells the sampler out because the detector needs the noise tensor
+itself, not just the argmax; that choice is neutral for performance. The
+defensible statement about A9's cost is that it is *within noise of zero*, the
+practical counterpart of its distortion-freeness.
 
 ### A10 is bimodal
 

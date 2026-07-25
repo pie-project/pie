@@ -71,20 +71,27 @@ detection threshold.
 ## Cost
 
 **2.78 ms/token, 0.84× the [`naive-baseline`](../naive-baseline) control** on
-an L40S with Qwen3-0.6B. The watermark is not merely cheap, it measures
-*faster* than the baseline — and not because it does less work.
+an L40S with Qwen3-0.6B. The watermark measures *faster* than the baseline,
+which is the interesting part: the watermark is not free, so the comparison is
+telling us something about the measurement rather than about the algorithm.
 
-This inferlet contains its own controlled A/B: with `watermark=true` it samples
-via `reduce_argmax(add(scaled, gumbel(...)))`, and with `watermark=false` it
-uses the fused `gumbel_max` op. Same inferlet, same channels, one op different:
+This inferlet contains its own A/B: with `watermark=true` it samples via
+`reduce_argmax(add(scaled, gumbel(...)))`, and with `watermark=false` it calls
+the `gumbel_max` helper.
 
-| Sampling op | ms/token |
+| Sampling spelling | ms/token |
 | --- | --- |
-| `gumbel()` + `reduce_argmax` (decomposed) | 2.85 |
-| `gumbel_max()` (fused) | 3.60 |
+| `gumbel()` + `add` + `reduce_argmax` | 2.85 |
+| `gumbel_max()` | 3.60 |
 
-The fused op is **27 % slower**, so the watermark's true marginal cost is zero
-and the apparent speedup is an artifact of the faster code path.
+The two spellings are **the same program**. `gumbel_max` (`sdk/rust/ptir-dsl/src/value.rs:912-927`)
+emits `RngKeyed{Gumbel}`, `Add`, `ReduceArgmax`; `gumbel()` (ibid. `:754`) emits
+`RngKeyed{Gumbel}` and the caller adds the other two. Both compile to one fused
+region. So the 27 % gap is **not** attributable to the choice of op — it is
+run-to-run variance between two server sessions (the baseline itself drifts
+2.70–3.60 ms/token across sessions; see [`naive-baseline`](../naive-baseline#results)).
+Treat the watermark's marginal cost as *within noise of zero*, and do not read
+the table as evidence that one spelling is faster.
 
 ## Run
 
