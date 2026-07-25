@@ -515,55 +515,6 @@ fn prepare_impl(
     ))
 }
 
-/// Prepare an explicit-KV (device-geometry) fire: physical pages for
-/// `write_indexes` with no host projection — the driver resolves the geometry
-/// itself and the inferlet owns the token bookkeeping. Returns the
-/// `(index, physical id)` pairs for the granted slots, the CoW copy plan, and
-/// the held transaction.
-pub fn prepare_explicit(
-    store: &mut KvStore,
-    ws: WorkingSetId,
-    write_indexes: &[u64],
-) -> Result<(Vec<(u64, u32)>, (Vec<u32>, Vec<u32>), Vec<u32>, KvTxn), KvError> {
-    let prepared = store.prepare_write(ws, write_indexes)?;
-    let pages: Vec<(u64, u32)> = prepared
-        .targets()
-        .iter()
-        .map(|t| (t.index(), t.dst().0))
-        .collect();
-    let copies = prepared.copy_plan().map(|(s, d)| (s.0, d.0)).unzip();
-    // Device-geometry fires are non-canonical by construction, and the
-    // device owns the token bookkeeping — commit with no hash metadata;
-    // `KvStore::commit` poisons the chain state with an opaque draw.
-    let commits: Vec<PageCommit> = prepared
-        .targets()
-        .iter()
-        .map(|_| PageCommit {
-            token_hashes: Vec::new(),
-            page_hash: None,
-        })
-        .collect();
-    let (seq, cas_intents) = store.publish_prepared(prepared, &commits)?;
-    let (translation_version, translation) = match build_translation(store, ws) {
-        Ok(translation) => translation,
-        Err(error) => {
-            store.settle(cas_intents, false);
-            store.retire_through(seq);
-            return Err(error.into());
-        }
-    };
-    Ok((
-        pages,
-        copies,
-        translation,
-        KvTxn {
-            seq,
-            cas_intents,
-            mapping_version: translation_version,
-        },
-    ))
-}
-
 /// Physical-page demand for an explicit write without allocation or a
 /// prepared transaction.
 pub fn prepare_explicit_demand(

@@ -370,8 +370,8 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         });
         // D6's cost figure: pages only the candidate's working sets can
         // free — smallest-cover selection minimizes wasted copies.
-        orchestrator.set_footprint_probe(|pid, model, driver| {
-            crate::inferlet::process::residency::kv_exclusive_footprint(pid, model, driver)
+        orchestrator.set_footprint_probe(|pids, model, driver| {
+            crate::inferlet::process::residency::kv_exclusive_footprints(pids, model, driver)
         });
     }
 

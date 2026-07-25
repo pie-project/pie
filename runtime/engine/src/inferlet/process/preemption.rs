@@ -299,21 +299,11 @@ impl Drop for ResidencyTxnGuard {
 }
 
 async fn drain_preemption_safe_fires(ctx: &mut ProcessCtx) -> Result<()> {
-    let pipelines = ctx.residency_snapshot().pipelines;
+    let pipelines = ctx.residency_pipelines();
     for fires in pipelines {
         let _finalize_guard = fires.finalize_guard().await;
         loop {
-            let op = {
-                let mut queue = fires.lock().unwrap();
-                if queue
-                    .front()
-                    .is_some_and(PendingOp::is_preemption_safe_unprepared)
-                {
-                    None
-                } else {
-                    queue.pop_front()
-                }
-            };
+            let op = fires.lock().unwrap().pop_front();
             let Some(op) = op else {
                 break;
             };
@@ -372,14 +362,13 @@ impl SafePoint<'_> {
                 Ok(true)
             }
             SafePoint::Idle { residency, .. } => {
-                let snapshot = residency.lock().unwrap().snapshot();
-                for fires in &snapshot.pipelines {
+                let pipelines = residency.lock().unwrap().pipelines();
+                for fires in &pipelines {
                     let _finalize_guard = fires.finalize_guard().await;
                     loop {
                         let op = {
                             let mut queue = fires.lock().unwrap();
                             match queue.front() {
-                                Some(op) if op.is_preemption_safe_unprepared() => None,
                                 Some(op) if op.is_preemption_detachable() => queue.pop_front(),
                                 Some(_) => return Ok(false),
                                 None => None,
@@ -559,8 +548,7 @@ pub(crate) async fn serialize_under_contention(ctx: &mut ProcessCtx) -> Result<(
         }
         drain_preemption_safe_fires(ctx).await?;
         let progress = ctx
-            .residency_snapshot()
-            .pipelines
+            .residency_pipelines()
             .into_iter()
             .find_map(|fires| {
                 fires

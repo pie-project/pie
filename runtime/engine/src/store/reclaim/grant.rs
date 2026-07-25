@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use super::{PoolPort, ProcessId};
+use super::PoolPort;
 use crate::store::kv::page_table::PhysicalKvPageId;
 use crate::store::rs::RsSlotId;
 
@@ -160,36 +160,20 @@ impl Drop for RsSlotReservation {
 /// disposal IS the rollback.
 #[derive(Debug)]
 pub struct AllocationGrant {
-    pub process_id: ProcessId,
-    pub request_id: u64,
     demand: Demand,
     kv: DevicePageReservation,
     rs: RsSlotReservation,
 }
 
 impl AllocationGrant {
-    pub(super) fn new(
-        process_id: ProcessId,
-        request_id: u64,
-        demand: Demand,
-        kv: DevicePageReservation,
-        rs: RsSlotReservation,
-    ) -> Self {
-        Self {
-            process_id,
-            request_id,
-            demand,
-            kv,
-            rs,
-        }
+    pub(super) fn new(demand: Demand, kv: DevicePageReservation, rs: RsSlotReservation) -> Self {
+        Self { demand, kv, rs }
     }
 
     /// A grant carrying nothing, for zero-demand fires: the build path is
     /// uniform (everything goes through prefix lending) and disposal is free.
-    pub fn empty(process_id: ProcessId) -> Self {
+    pub fn empty() -> Self {
         Self {
-            process_id,
-            request_id: 0,
             demand: Demand::default(),
             kv: DevicePageReservation::empty(),
             rs: RsSlotReservation::empty(),

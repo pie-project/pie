@@ -293,9 +293,7 @@ async fn acquire_grant<C: FireContext>(
     demand: crate::store::reclaim::Demand,
 ) -> Result<crate::store::reclaim::AllocationGrant, String> {
     if demand.is_zero() {
-        return Ok(crate::store::reclaim::AllocationGrant::empty(
-            ctx.process_id(),
-        ));
+        return Ok(crate::store::reclaim::AllocationGrant::empty());
     }
     let Some(orchestrator) = crate::store::reclaim::contention() else {
         return Err("pipeline: KV contention orchestrator is not installed".to_string());
@@ -460,10 +458,6 @@ impl PendingOp {
         }
     }
 
-    pub(crate) fn is_preemption_safe_unprepared(&self) -> bool {
-        false
-    }
-
     pub(crate) fn is_preemption_detachable(&self) -> bool {
         matches!(
             self,
@@ -598,24 +592,21 @@ fn prepare_bound_rs<C: FireContext>(
         )));
     }
 
-    let mut working_sets = Vec::with_capacity(rs_reps.len());
+    // Resolution + model/driver validation live in the phase-A resolver;
+    // only the scope claim is prepare-time work.
+    let working_sets = match bound_rs_working_set_ids(ctx, model, driver, rs_reps)? {
+        Ok(ids) => ids,
+        Err(error) => return Ok(Err(ReservedError::Fatal(error))),
+    };
     for (row, &rep) in rs_reps.iter().enumerate() {
         let resource: Resource<RsWorkingSet> = Resource::new_borrow(rep);
         let rs = ctx.resources().get(&resource)?.clone();
-        if rs.model != model || rs.driver as usize != driver {
-            return Ok(Err(ReservedError::Fatal(format!(
-                "pipeline: rs-working-set at request row {row} belongs to model/driver \
-                 ({}, {}), expected ({model}, {driver})",
-                rs.model, rs.driver
-            ))));
-        }
         if let Err(owner) = rs.claim_pipeline_scope(pipeline_scope) {
             return Ok(Err(ReservedError::Fatal(format!(
                 "pipeline: rs-working-set at request row {row} is already scoped to pipeline \
                  {owner:#x}"
             ))));
         }
-        working_sets.push(rs.id);
     }
 
     let prepared = {

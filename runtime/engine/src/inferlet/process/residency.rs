@@ -30,6 +30,19 @@ pub(crate) struct ResidencySnapshot {
 }
 
 impl ProcessResidency {
+    /// Just the live pipeline queues — the hot-path subset of
+    /// [`Self::snapshot`], skipping the working-set clones.
+    pub(crate) fn pipelines(&mut self) -> Vec<PendingFires> {
+        let pipelines: Vec<_> = self
+            .pipelines
+            .iter()
+            .filter_map(|pipeline| pipeline.fires.upgrade())
+            .collect();
+        self.pipelines
+            .retain(|pipeline| pipeline.fires.strong_count() > 0);
+        pipelines
+    }
+
     pub(crate) fn snapshot(&mut self) -> ResidencySnapshot {
         let pipelines: Vec<_> = self
             .pipelines
@@ -102,28 +115,45 @@ pub(crate) fn unregister_residency(pid: uuid::Uuid) {
     RESIDENCIES.write().unwrap().remove(&pid);
 }
 
-/// Pages only `pid`'s working sets can free on `(model, driver)` — the
-/// contention ladder's victim-cost figure (D6 smallest-cover). `None` when
-/// the process is unknown or already tearing down.
-pub(crate) fn kv_exclusive_footprint(pid: uuid::Uuid, model: usize, driver: usize) -> Option<u32> {
-    let residency = RESIDENCIES.read().unwrap().get(&pid)?.upgrade()?;
-    let working_sets: Vec<WorkingSetId> = {
-        let residency = residency.lock().unwrap();
-        residency
-            .kv_working_sets
-            .iter()
-            .filter_map(|&(m, d, ws)| (m == model && d as usize == driver).then_some(ws))
+/// Pages only each candidate's working sets can free on `(model, driver)`
+/// — the contention ladder's victim-cost figures (D6 smallest-cover),
+/// computed for the whole candidate set under ONE store lock. `None` for a
+/// process that is unknown or already tearing down.
+pub(crate) fn kv_exclusive_footprints(
+    pids: &[uuid::Uuid],
+    model: usize,
+    driver: usize,
+) -> Vec<Option<u32>> {
+    let working_sets: Vec<Option<Vec<WorkingSetId>>> = {
+        let residencies = RESIDENCIES.read().unwrap();
+        pids.iter()
+            .map(|pid| {
+                let residency = residencies.get(pid)?.upgrade()?;
+                let residency = residency.lock().unwrap();
+                Some(
+                    residency
+                        .kv_working_sets
+                        .iter()
+                        .filter_map(|&(m, d, ws)| (m == model && d as usize == driver).then_some(ws))
+                        .collect(),
+                )
+            })
             .collect()
     };
-    if working_sets.is_empty() {
-        return Some(0);
-    }
-    let stores = crate::store::registry::try_get(model, driver)?;
-    let total = crate::store::registry::with_kv_lock(&stores.kv, "reclaim", |kv| {
+    let Some(stores) = crate::store::registry::try_get(model, driver) else {
+        return vec![None; pids.len()];
+    };
+    crate::store::registry::with_kv_lock(&stores.kv, "reclaim", |kv| {
         working_sets
-            .iter()
-            .map(|&ws| kv.exclusive_footprint(ws).unwrap_or(0))
-            .sum::<u64>()
-    });
-    u32::try_from(total).ok()
+            .into_iter()
+            .map(|working_sets| {
+                let working_sets = working_sets?;
+                let total: u64 = working_sets
+                    .iter()
+                    .map(|&ws| kv.exclusive_footprint(ws).unwrap_or(0))
+                    .sum();
+                u32::try_from(total).ok()
+            })
+            .collect()
+    })
 }

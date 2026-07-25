@@ -81,6 +81,9 @@ pub(super) struct Proc {
     /// excluded from further victim and kill selection while its teardown
     /// runs.
     pub killed: bool,
+    /// When this process collected its restore grant — the turnaround
+    /// diagnostic's start, cleared by the restored/failed transitions.
+    pub restoring_since: Option<std::time::Instant>,
     /// Wakes the process's safe-point watchers when a park request lands or
     /// clears, and its state-transition waiters.
     pub signal: Arc<Notify>,
@@ -94,6 +97,7 @@ impl Proc {
             restore_demand: 0,
             idle: false,
             killed: false,
+            restoring_since: None,
             signal: Arc::new(Notify::new()),
         }
     }

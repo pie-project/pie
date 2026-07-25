@@ -375,6 +375,11 @@ impl ProcessCtx {
         self.residency.lock().unwrap().snapshot()
     }
 
+    /// Just the live pipeline queues — for the per-prologue hot paths.
+    pub(crate) fn residency_pipelines(&self) -> Vec<crate::pipeline::fire::PendingFires> {
+        self.residency.lock().unwrap().pipelines()
+    }
+
     pub(crate) fn register_kv_working_set(
         &self,
         model: usize,

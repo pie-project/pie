@@ -49,7 +49,8 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
 
-pub use grant::{AllocationGrant, Demand, DevicePageReservation, RsSlotReservation};
+pub use grant::{AllocationGrant, Demand};
+use grant::{DevicePageReservation, RsSlotReservation};
 use queue::{Entry, EntryKey, EntryKind, Queue};
 use state::{Proc, ProcEvent, ProcState};
 
@@ -173,35 +174,33 @@ impl RegistryPool {
         }
     }
 
-    fn stores(&self) -> crate::store::registry::Stores {
-        crate::store::registry::get(self.model, self.driver)
+    fn with_kv<R>(&self, operation: impl FnOnce(&mut crate::store::kv::KvStore) -> R) -> R {
+        let stores = crate::store::registry::get(self.model, self.driver);
+        crate::store::registry::with_kv_lock(&stores.kv, "reclaim", operation)
+    }
+
+    fn with_rs<R>(&self, operation: impl FnOnce(&mut crate::store::rs::RsStore) -> R) -> R {
+        let stores = crate::store::registry::get(self.model, self.driver);
+        let mut store = stores.rs.lock().unwrap();
+        operation(&mut store)
     }
 }
 
 impl PoolPort for RegistryPool {
     fn device_stats(&self) -> (u32, u32) {
-        let stores = self.stores();
-        crate::store::registry::with_kv_lock(&stores.kv, "reclaim", |kv| {
-            (kv.available_pages() as u32, kv.capacity_pages())
-        })
+        self.with_kv(|kv| (kv.available_pages() as u32, kv.capacity_pages()))
     }
 
     fn host_stats(&self) -> (u32, u32) {
-        let stores = self.stores();
-        crate::store::registry::with_kv_lock(&stores.kv, "reclaim", |kv| {
-            (kv.host_swap_available() as u32, kv.host_swap_capacity())
-        })
+        self.with_kv(|kv| (kv.host_swap_available() as u32, kv.host_swap_capacity()))
     }
 
     fn rs_stats(&self) -> (u32, u32) {
-        let stores = self.stores();
-        let rs = stores.rs.lock().unwrap();
-        (rs.available_slots() as u32, rs.capacity_slots())
+        self.with_rs(|rs| (rs.available_slots() as u32, rs.capacity_slots()))
     }
 
     fn reclaim_idle(&self) -> u32 {
-        let stores = self.stores();
-        crate::store::registry::with_kv_lock(&stores.kv, "reclaim", |kv| {
+        self.with_kv(|kv| {
             let epoch = kv.current_epoch();
             let freed = kv.drop_unused_cache_leases(epoch);
             if freed > 0 {
@@ -223,27 +222,19 @@ impl PoolPort for RegistryPool {
         &self,
         count: u32,
     ) -> Option<Vec<crate::store::kv::page_table::PhysicalKvPageId>> {
-        let stores = self.stores();
-        crate::store::registry::with_kv_lock(&stores.kv, "reclaim", |kv| {
-            kv.reserve_device_pages(count as usize)
-        })
+        self.with_kv(|kv| kv.reserve_device_pages(count as usize))
     }
 
     fn release_device(&self, pages: Vec<crate::store::kv::page_table::PhysicalKvPageId>) {
-        let stores = self.stores();
-        crate::store::registry::with_kv_lock(&stores.kv, "reclaim", |kv| {
-            kv.release_device_reservation(pages);
-        });
+        self.with_kv(|kv| kv.release_device_reservation(pages));
     }
 
     fn reserve_rs(&self, count: u32) -> Option<Vec<crate::store::rs::RsSlotId>> {
-        let stores = self.stores();
-        stores.rs.lock().unwrap().reserve_slots(count as usize)
+        self.with_rs(|rs| rs.reserve_slots(count as usize))
     }
 
     fn release_rs(&self, slots: Vec<crate::store::rs::RsSlotId>) {
-        let stores = self.stores();
-        stores.rs.lock().unwrap().release_slot_reservation(slots);
+        self.with_rs(|rs| rs.release_slot_reservation(slots));
     }
 }
 
@@ -363,6 +354,32 @@ pub struct ContentionDiagnostics {
     pub deadline_kills_total: u64,
 }
 
+/// Queue `pid`'s restore entry at its spawn position (idempotent — a
+/// re-queued restore keeps one entry, one demand, a fresh suspended_at).
+fn enqueue_restore(inner: &mut Inner, pid: ProcessId, seq: u64, demand: Demand) {
+    if inner.queue.find_restore(pid).is_some() {
+        return;
+    }
+    let id = inner.next_entry_id;
+    inner.next_entry_id += 1;
+    inner.queue.insert(
+        (seq, id),
+        Entry {
+            pid,
+            demand,
+            kind: EntryKind::Restore {
+                suspended_at: Instant::now(),
+            },
+            kv_accum: DevicePageReservation::empty(),
+        },
+    );
+}
+
+/// Saturating microseconds for the stat counters.
+fn micros(elapsed: Duration) -> u64 {
+    elapsed.as_micros().min(u128::from(u64::MAX)) as u64
+}
+
 /// A restore grant issued by the drain, parked until its process collects it.
 struct IssuedRestore {
     grant: AllocationGrant,
@@ -376,8 +393,6 @@ struct Inner {
     procs: HashMap<ProcessId, Proc>,
     queue: Queue,
     restore_grants: HashMap<ProcessId, IssuedRestore>,
-    /// Restore-grant-collected → `report_restored` turnaround starts.
-    restoring_since: HashMap<ProcessId, Instant>,
     /// The single progress clock: armed for the queue head, reset by any
     /// progress toward it. `(head entry key, armed at)`.
     progress: Option<(EntryKey, Instant)>,
@@ -386,6 +401,18 @@ struct Inner {
 /// Packed summary word layout (the lock-free hot path):
 /// bits 0..16 allocation entries, 16..32 restore entries, 32..48 park
 /// requests. Recomputed from `Inner` at the single `with_inner` chokepoint.
+fn summary_has_allocations(word: u64) -> bool {
+    word & 0xFFFF != 0
+}
+
+fn summary_has_entries(word: u64) -> bool {
+    word & 0xFFFF_FFFF != 0
+}
+
+fn summary_has_parks(word: u64) -> bool {
+    (word >> 32) & 0xFFFF != 0
+}
+
 fn summarize(inner: &Inner) -> u64 {
     let (allocations, restores) = inner.queue.counts();
     let parks = inner
@@ -404,10 +431,13 @@ fn summarize(inner: &Inner) -> u64 {
 /// absent in unit tests unless a test installs its own.
 pub type KillHook = Box<dyn Fn(ProcessId, String) + Send + Sync>;
 
-/// Pages only this process's working sets could free on the orchestrator's
-/// (model, driver) — the D6 cost figure for victim selection. Installed by
-/// bootstrap (it crosses layers the store must not name).
-pub type FootprintProbe = Box<dyn Fn(ProcessId, usize, usize) -> Option<u32> + Send + Sync>;
+/// Pages only each candidate's working sets could free on the
+/// orchestrator's (model, driver) — the D6 cost figures for one victim
+/// selection, probed as a BATCH so the whole pass costs one store-lock
+/// round trip. Installed by bootstrap (it crosses layers the store must not
+/// name).
+pub type FootprintProbe =
+    Box<dyn Fn(&[ProcessId], usize, usize) -> Vec<Option<u32>> + Send + Sync>;
 
 pub struct ContentionOrchestrator {
     inner: Mutex<Inner>,
@@ -492,7 +522,7 @@ impl ContentionOrchestrator {
     /// Install the victim footprint probe (bootstrap, once).
     pub fn set_footprint_probe(
         &self,
-        probe: impl Fn(ProcessId, usize, usize) -> Option<u32> + Send + Sync + 'static,
+        probe: impl Fn(&[ProcessId], usize, usize) -> Vec<Option<u32>> + Send + Sync + 'static,
     ) {
         let _ = self.footprint.set(Box::new(probe));
     }
@@ -501,11 +531,12 @@ impl ContentionOrchestrator {
     /// idle host await — a permanent safe point, and D6's preferred victim
     /// class.
     pub fn note_idle_await(&self, pid: ProcessId, entered: bool) {
-        self.with_inner(|inner| {
-            if let Some(proc) = inner.procs.get_mut(&pid) {
-                proc.idle = entered;
-            }
-        });
+        // Plain lock, no summary recompute: `idle` is not in the summary
+        // word, and this rides the per-token idle-await path.
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(proc) = inner.procs.get_mut(&pid) {
+            proc.idle = entered;
+        }
     }
 
     /// The injected configuration (read-only; parsed once at bootstrap).
@@ -536,7 +567,7 @@ impl ContentionOrchestrator {
     /// True while any allocation waiter is queued — the pool is contended
     /// and deep-running lanes should self-serialize so their pins release.
     pub fn contended(&self) -> bool {
-        self.summary.load(Ordering::Acquire) & 0xFFFF != 0
+        summary_has_allocations(self.summary.load(Ordering::Acquire))
     }
 
     /// Register a process at spawn — its registration order is the FCFS
@@ -557,15 +588,10 @@ impl ContentionOrchestrator {
             let signal = inner.procs.remove(&pid).map(|proc| proc.signal);
             let entries = inner.queue.extract(|entry| entry.pid == pid);
             let issued = inner.restore_grants.remove(&pid);
-            inner.restoring_since.remove(&pid);
             inner.progress = None;
             (signal, entries, issued)
         });
-        for entry in &entries {
-            if let EntryKind::Allocation { notify, .. } = &entry.kind {
-                notify.notify_waiters();
-            }
-        }
+        queue::wake_displaced(&entries);
         if let Some(signal) = signal {
             signal.notify_waiters();
         }
@@ -578,7 +604,7 @@ impl ContentionOrchestrator {
     /// Pages or slots freed somewhere (a fire finalized, a process exited, a
     /// working set released). Drains if anyone is waiting.
     pub fn on_blocks_freed(&self) {
-        if self.summary.load(Ordering::Acquire) & 0xFFFF_FFFF != 0 {
+        if summary_has_entries(self.summary.load(Ordering::Acquire)) {
             self.drain();
         }
     }
@@ -660,39 +686,58 @@ impl ContentionOrchestrator {
                 }
                 self.escalate();
                 self.mark_waiter_parked(requester, key);
-                let notified = notify.notified();
-                tokio::pin!(notified);
-                notified.as_mut().enable();
-                // Lost-wakeup guard: re-check after arming the waiter.
-                if self.grant_ready(key) || !self.has_entry(key) {
-                    continue;
+                if let Some(error) = self
+                    .await_service(&notify, Some(key), || {
+                        self.grant_ready(key) || !self.has_entry(key)
+                    })
+                    .await
+                {
+                    registration.disarm();
+                    self.cancel_waiter(requester, key, false);
+                    return Err(error);
                 }
-                match self.head_deadline(key) {
-                    None => notified.await,
-                    Some(deadline) => {
-                        let sleep =
-                            tokio::time::sleep(deadline.saturating_duration_since(Instant::now()));
-                        tokio::pin!(sleep);
-                        tokio::select! {
-                            _ = &mut notified => {}
-                            _ = &mut sleep => {
-                                if let Some(error) = self.progress_breach(key) {
-                                    match self.escalate_breach(key, &error) {
-                                        // A kill reset the clock; keep waiting
-                                        // for the teardown's frees.
-                                        BreachAction::Killed => {}
-                                        BreachAction::FailLoud => {
-                                            registration.disarm();
-                                            self.cancel_waiter(requester, key, false);
-                                            self.stats
-                                                .exhaustion_timeouts
-                                                .fetch_add(1, Ordering::Relaxed);
-                                            return Err(error);
-                                        }
-                                    }
-                                }
-                            }
-                        }
+            }
+        }
+    }
+
+    /// One arming of a service wait, shared by the allocation and restore
+    /// paths: enable the waiter, re-check (the lost-wakeup guard), then
+    /// sleep until woken — or, when `key` is the queue head, until the
+    /// progress deadline breaches and the D7 ladder ends in FailLoud, which
+    /// surfaces here as the error the caller returns after removing its
+    /// entry.
+    async fn await_service(
+        &self,
+        signal: &Notify,
+        key: Option<EntryKey>,
+        ready: impl Fn() -> bool,
+    ) -> Option<ContentionError> {
+        let notified = signal.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if ready() {
+            return None;
+        }
+        let Some(deadline) = key.and_then(|key| self.head_deadline(key)) else {
+            notified.await;
+            return None;
+        };
+        let key = key.expect("deadline implies key");
+        let sleep = tokio::time::sleep(deadline.saturating_duration_since(Instant::now()));
+        tokio::pin!(sleep);
+        tokio::select! {
+            _ = &mut notified => None,
+            _ = &mut sleep => {
+                let error = self.progress_breach(key)?;
+                match self.escalate_breach(key, &error) {
+                    // A kill reset the clock; keep waiting for the
+                    // teardown's frees.
+                    BreachAction::Killed => None,
+                    BreachAction::FailLoud => {
+                        self.stats
+                            .exhaustion_timeouts
+                            .fetch_add(1, Ordering::Relaxed);
+                        Some(error)
                     }
                 }
             }
@@ -872,9 +917,12 @@ impl ContentionOrchestrator {
     // =========================================================================
 
     fn drain(&self) {
+        self.withdraw_stale_park_requests();
+        // One stats read; tracked locally across iterations (reservations
+        // are the only subtraction here; concurrent frees re-drain via
+        // their own on_blocks_freed).
+        let (mut free, _) = self.port.device_stats();
         loop {
-            self.withdraw_stale_park_requests();
-            let (free, _) = self.port.device_stats();
             let step = self.with_inner(|inner| {
                 let mut head: Option<(EntryKey, u32)> = None;
                 let mut donor: Option<EntryKey> = None;
@@ -929,6 +977,7 @@ impl ContentionOrchestrator {
                     let Some(pages) = self.port.reserve_device(count) else {
                         return; // lost a race to the pool; the next free event re-drains
                     };
+                    free = free.saturating_sub(count);
                     let reservation = DevicePageReservation::new(pages, self.port.clone());
                     let leftover = self.with_inner(|inner| {
                         match inner.queue.get_mut(&key) {
@@ -961,10 +1010,9 @@ impl ContentionOrchestrator {
                         FinishOutcome::RestoreIssued { signal, waited } => {
                             signal.notify_waiters();
                             self.stats.restore_grants.fetch_add(1, Ordering::Relaxed);
-                            self.stats.restore_wait_us.fetch_add(
-                                waited.as_micros().min(u128::from(u64::MAX)) as u64,
-                                Ordering::Relaxed,
-                            );
+                            self.stats
+                                .restore_wait_us
+                                .fetch_add(micros(waited), Ordering::Relaxed);
                         }
                         FinishOutcome::Vanished(reservation, stale_entry) => {
                             drop(reservation);
@@ -1000,59 +1048,44 @@ impl ContentionOrchestrator {
                     return FinishOutcome::Vanished(rs_reservation, stale);
                 }
             }
-            let mut entry = inner.queue.remove(&key).expect("entry present");
-            let kv = std::mem::replace(&mut entry.kv_accum, DevicePageReservation::empty());
-            let grant = AllocationGrant::new(entry.pid, key.1, entry.demand, kv, rs_reservation);
             inner.progress = None; // a grant is progress by definition
-            match entry.kind {
-                EntryKind::Allocation {
-                    quorum_id,
-                    notify,
-                    waiters,
-                    parked_reported,
-                    grant: existing,
-                } => {
-                    debug_assert!(existing.is_none(), "unmet entries carry no grant");
-                    // Re-insert with the grant attached; the waiting future
-                    // collects it via take_allocation_grant.
-                    inner.queue.insert(
-                        key,
-                        Entry {
-                            pid: entry.pid,
-                            demand: entry.demand,
-                            kind: EntryKind::Allocation {
-                                quorum_id,
-                                notify: notify.clone(),
-                                waiters,
-                                parked_reported,
-                                grant: Some(grant),
-                            },
-                            kv_accum: DevicePageReservation::empty(),
-                        },
-                    );
-                    FinishOutcome::Granted(notify)
-                }
-                EntryKind::Restore { suspended_at } => {
-                    let pid = entry.pid;
-                    let proc = inner.procs.get_mut(&pid).expect("validated above");
-                    proc.state = proc
-                        .state
-                        .apply(ProcEvent::GrantRestore)
-                        .expect("validated above");
-                    let signal = proc.signal.clone();
-                    inner.restore_grants.insert(
-                        pid,
-                        IssuedRestore {
-                            grant,
-                            issued_at: Instant::now(),
-                        },
-                    );
-                    FinishOutcome::RestoreIssued {
-                        signal,
-                        waited: suspended_at.elapsed(),
-                    }
-                }
+            if matches!(entry.kind, EntryKind::Restore { .. }) {
+                let mut entry = inner.queue.remove(&key).expect("entry present");
+                let kv = std::mem::replace(&mut entry.kv_accum, DevicePageReservation::empty());
+                let grant = AllocationGrant::new(entry.demand, kv, rs_reservation);
+                let EntryKind::Restore { suspended_at } = entry.kind else {
+                    unreachable!("matched above");
+                };
+                let pid = entry.pid;
+                let proc = inner.procs.get_mut(&pid).expect("validated above");
+                proc.state = proc
+                    .state
+                    .apply(ProcEvent::GrantRestore)
+                    .expect("validated above");
+                let signal = proc.signal.clone();
+                inner.restore_grants.insert(
+                    pid,
+                    IssuedRestore {
+                        grant,
+                        issued_at: Instant::now(),
+                    },
+                );
+                return FinishOutcome::RestoreIssued {
+                    signal,
+                    waited: suspended_at.elapsed(),
+                };
             }
+            // Allocation: attach the grant in place; the waiting future
+            // collects it via take_allocation_grant.
+            let entry = inner.queue.get_mut(&key).expect("entry present");
+            let kv = std::mem::replace(&mut entry.kv_accum, DevicePageReservation::empty());
+            let issued = AllocationGrant::new(entry.demand, kv, rs_reservation);
+            let EntryKind::Allocation { notify, grant, .. } = &mut entry.kind else {
+                unreachable!("restore handled above");
+            };
+            debug_assert!(grant.is_none(), "unmet entries carry no grant");
+            *grant = Some(issued);
+            FinishOutcome::Granted(notify.clone())
         })
     }
 
@@ -1132,11 +1165,7 @@ impl ContentionOrchestrator {
         });
         if let Some((park_signal, displaced)) = notifications {
             park_signal.notify_waiters();
-            for entry in &displaced {
-                if let EntryKind::Allocation { notify, .. } = &entry.kind {
-                    notify.notify_waiters();
-                }
-            }
+            queue::wake_displaced(&displaced);
             drop(displaced); // accumulated reservations return outside the lock
         }
     }
@@ -1148,19 +1177,25 @@ impl ContentionOrchestrator {
     /// their class; ties break youngest.
     fn select_costed(&self, residual: u32, candidates: Vec<VictimCandidate>) -> ProcessId {
         let (model, driver) = self.port.locus();
-        let probe = self.footprint.get();
+        let footprints = match self.footprint.get() {
+            Some(probe) if candidates.len() > 1 => {
+                let pids: Vec<ProcessId> = candidates.iter().map(|c| c.pid).collect();
+                probe(&pids, model, driver)
+            }
+            _ => vec![None; candidates.len()],
+        };
         candidates
             .into_iter()
-            .min_by_key(|candidate| {
-                let footprint = probe.and_then(|probe| probe(candidate.pid, model, driver));
+            .zip(footprints)
+            .min_by_key(|(candidate, footprint)| {
                 let (class, cost) = match footprint {
-                    Some(f) if f >= residual => (0u8, i64::from(f)),
-                    Some(f) => (1, -i64::from(f)),
+                    Some(f) if *f >= residual => (0u8, i64::from(*f)),
+                    Some(f) => (1, -i64::from(*f)),
                     None => (2, 0),
                 };
                 (!candidate.idle, class, cost, u64::MAX - candidate.seq)
             })
-            .map(|candidate| candidate.pid)
+            .map(|(candidate, _)| candidate.pid)
             .expect("candidates are non-empty")
     }
 
@@ -1249,7 +1284,7 @@ impl ContentionOrchestrator {
     /// Pressure relief, not timers: when nothing is waiting for pages any
     /// more, pending park requests are withdrawn.
     fn withdraw_stale_park_requests(&self) {
-        if (self.summary.load(Ordering::Acquire) >> 32) & 0xFFFF == 0 {
+        if !summary_has_parks(self.summary.load(Ordering::Acquire)) {
             return;
         }
         let signals = self.with_inner(|inner| {
@@ -1337,7 +1372,7 @@ impl ContentionOrchestrator {
 
     /// Victim-side step 1: does `pid` have a pending park request?
     pub fn should_park(&self, pid: ProcessId) -> bool {
-        if (self.summary.load(Ordering::Acquire) >> 32) & 0xFFFF == 0 {
+        if !summary_has_parks(self.summary.load(Ordering::Acquire)) {
             return false;
         }
         matches!(
@@ -1430,21 +1465,7 @@ impl ContentionOrchestrator {
             proc.state = next;
             proc.restore_demand = freed_now;
             let seq = proc.seq;
-            if inner.queue.find_restore(pid).is_none() {
-                let id = inner.next_entry_id;
-                inner.next_entry_id += 1;
-                inner.queue.insert(
-                    (seq, id),
-                    Entry {
-                        pid,
-                        demand: Demand::kv(freed_now),
-                        kind: EntryKind::Restore {
-                            suspended_at: Instant::now(),
-                        },
-                        kv_accum: DevicePageReservation::empty(),
-                    },
-                );
-            }
+            enqueue_restore(inner, pid, seq, Demand::kv(freed_now));
             inner.progress = None; // a suspend IS progress toward the head
             true
         });
@@ -1473,7 +1494,9 @@ impl ContentionOrchestrator {
             }
             let wait = self.with_inner(|inner| {
                 if let Some(issued) = inner.restore_grants.remove(&pid) {
-                    inner.restoring_since.insert(pid, issued.issued_at);
+                    if let Some(proc) = inner.procs.get_mut(&pid) {
+                        proc.restoring_since = Some(issued.issued_at);
+                    }
                     return Wait::Ready(Box::new(issued.grant));
                 }
                 let Some(proc) = inner.procs.get(&pid) else {
@@ -1491,43 +1514,17 @@ impl ContentionOrchestrator {
                 continue; // rung 0 freed pages; re-drain
             }
             self.escalate();
-            let notified = signal.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            // Lost-wakeup guard: the grant may have landed after the check.
-            if self.restore_ready(pid) {
-                continue;
-            }
-            match key.and_then(|key| self.head_deadline(key)) {
-                None => notified.await,
-                Some(deadline) => {
-                    let sleep =
-                        tokio::time::sleep(deadline.saturating_duration_since(Instant::now()));
-                    tokio::pin!(sleep);
-                    tokio::select! {
-                        _ = &mut notified => {}
-                        _ = &mut sleep => {
-                            let key = key.expect("deadline implies key");
-                            if let Some(error) = self.progress_breach(key) {
-                                match self.escalate_breach(key, &error) {
-                                    // A kill reset the clock; keep waiting
-                                    // for the teardown's frees.
-                                    BreachAction::Killed => {}
-                                    BreachAction::FailLoud => {
-                                        let removed = self.with_inner(|inner| {
-                                            inner.queue.remove(&key)
-                                        });
-                                        drop(removed);
-                                        self.stats
-                                            .exhaustion_timeouts
-                                            .fetch_add(1, Ordering::Relaxed);
-                                        return Err(error);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+            if let Some(error) = self
+                .await_service(&signal, key, || self.restore_ready(pid))
+                .await
+            {
+                let removed =
+                    self.with_inner(|inner| key.and_then(|key| inner.queue.remove(&key)));
+                drop(removed);
+                // The failed head's accumulation just returned to the pool:
+                // route it to the next head.
+                self.drain();
+                return Err(error);
             }
         }
     }
@@ -1547,11 +1544,10 @@ impl ContentionOrchestrator {
             };
             proc.state = next;
             proc.restore_demand = 0;
+            let turnaround = proc.restoring_since.take();
+            let signal = proc.signal.clone();
             inner.progress = None; // a restore IS progress
-            (
-                Some(proc.signal.clone()),
-                inner.restoring_since.remove(&pid),
-            )
+            (Some(signal), turnaround)
         });
         let Some(signal) = signal else { return };
         signal.notify_waiters();
@@ -1560,10 +1556,9 @@ impl ContentionOrchestrator {
             .h2d_pages
             .fetch_add(u64::from(restored_pages), Ordering::Relaxed);
         if let Some(since) = turnaround {
-            self.stats.restore_turnaround_us.fetch_add(
-                since.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
-                Ordering::Relaxed,
-            );
+            self.stats
+                .restore_turnaround_us
+                .fetch_add(micros(since.elapsed()), Ordering::Relaxed);
             self.stats
                 .restore_turnarounds
                 .fetch_add(1, Ordering::Relaxed);
@@ -1582,24 +1577,10 @@ impl ContentionOrchestrator {
                 return;
             };
             proc.state = next;
-            inner.restoring_since.remove(&pid);
+            proc.restoring_since = None;
             let seq = proc.seq;
             let demand = Demand::kv(proc.restore_demand);
-            if inner.queue.find_restore(pid).is_none() {
-                let id = inner.next_entry_id;
-                inner.next_entry_id += 1;
-                inner.queue.insert(
-                    (seq, id),
-                    Entry {
-                        pid,
-                        demand,
-                        kind: EntryKind::Restore {
-                            suspended_at: Instant::now(),
-                        },
-                        kv_accum: DevicePageReservation::empty(),
-                    },
-                );
-            }
+            enqueue_restore(inner, pid, seq, demand);
         });
         self.drain();
     }
@@ -1609,17 +1590,15 @@ impl ContentionOrchestrator {
     // =========================================================================
 
     pub fn record_d2h_copy(&self, elapsed: Duration) {
-        self.stats.d2h_copy_us.fetch_add(
-            elapsed.as_micros().min(u128::from(u64::MAX)) as u64,
-            Ordering::Relaxed,
-        );
+        self.stats
+            .d2h_copy_us
+            .fetch_add(micros(elapsed), Ordering::Relaxed);
     }
 
     pub fn record_h2d_copy(&self, elapsed: Duration) {
-        self.stats.h2d_copy_us.fetch_add(
-            elapsed.as_micros().min(u128::from(u64::MAX)) as u64,
-            Ordering::Relaxed,
-        );
+        self.stats
+            .h2d_copy_us
+            .fetch_add(micros(elapsed), Ordering::Relaxed);
     }
 
     pub fn record_grace_deferred(&self) {
@@ -1936,17 +1915,7 @@ mod tests {
         idle: u32,
         total: u32,
     ) -> (Arc<ContentionOrchestrator>, ProcessId, Arc<MockPool>) {
-        let pool = Arc::new(MockPool::new(free, idle, total));
-        let orch = Arc::new(ContentionOrchestrator::new(
-            pool.clone(),
-            ContentionConfig {
-                exhaustion: Duration::from_millis(200),
-                ..ContentionConfig::default()
-            },
-        ));
-        let pid = ProcessId::new_v4();
-        orch.register(pid);
-        (orch, pid, pool)
+        orch_with_config(free, idle, total, Duration::from_millis(200))
     }
 
     fn orch_with_config(
@@ -2364,7 +2333,10 @@ mod tests {
             (small, 4u32),
             (big, 20u32),
         ]));
-        orch.set_footprint_probe(move |pid, _, _| footprints.lock().unwrap().get(&pid).copied());
+        orch.set_footprint_probe(move |pids, _, _| {
+            let footprints = footprints.lock().unwrap();
+            pids.iter().map(|pid| footprints.get(pid).copied()).collect()
+        });
         let _ = orch.register_waiter(head, head, Demand::kv(3)).unwrap();
         orch.escalate();
         // Both cover the residual demand of 3; the 4-page victim wastes 1

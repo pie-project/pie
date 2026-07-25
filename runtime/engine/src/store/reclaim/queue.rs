@@ -173,3 +173,14 @@ impl Queue {
         (allocations, restores)
     }
 }
+
+/// Wake the acquire futures of displaced allocation entries so they observe
+/// the removal (the caller then drops the entries OUTSIDE the lock —
+/// forgetting the wake wedges a parked acquire).
+pub(super) fn wake_displaced(entries: &[Entry]) {
+    for entry in entries {
+        if let EntryKind::Allocation { notify, .. } = &entry.kind {
+            notify.notify_waiters();
+        }
+    }
+}
