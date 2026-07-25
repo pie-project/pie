@@ -16,6 +16,7 @@ members = [
     "mtp-speculative-decoding",
     "prefix-tree-kv-cache",
     "repetition-penalty",
+    "dry-repetition-penalty",
     "sampling-primitives",
     "sliding-window-attention",
     "tail-free-sampling",
