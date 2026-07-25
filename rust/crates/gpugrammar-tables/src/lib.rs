@@ -32,17 +32,17 @@ use serde::Serialize;
 pub struct GroupEntry {
     /// The lexer state this group applies in.
     pub lexer_state: u32,
-    /// Terminals the group's tokens emit, in order.
-    pub terminals: Vec<u32>,
+    /// Terminal sequences the group's tokens could emit, one per way of
+    /// resolving the lexical ambiguities the token crossed. The parser picks
+    /// the one it can follow; more than one surviving means the grammar is
+    /// ambiguous at that point.
+    pub terminal_choices: Vec<Vec<u32>>,
     /// The lexer state the group's tokens leave behind.
     pub next_lexer_state: u32,
     /// Offset into `group_bitsets`, in words.
     pub bitset_offset: u32,
     /// How many tokens the group holds, for diagnostics and weighting.
     pub token_count: u32,
-    /// Terminals the pending lexeme could still become, when the group leaves
-    /// one in progress. Empty when the group ends cleanly.
-    pub pending_terminals: Vec<u32>,
 }
 
 /// Flat, device-ready tables.
@@ -63,6 +63,13 @@ pub struct Artifact {
     pub group_offsets: Vec<u32>,
     /// Packed allowed-token bitsets, one run of `bitset_words` per group.
     pub group_bitsets: Vec<u32>,
+
+    /// Terminals a lexeme left in progress could still become, CSR by lexer
+    /// state. It depends only on the state, so groups share it rather than
+    /// each carrying a copy; with a large lexer the copies dominated the
+    /// artifact.
+    pub pending_offsets: Vec<u32>,
+    pub pending_terminals: Vec<u32>,
 
     /// CSR ACTION rows: `action_offsets[state]..action_offsets[state + 1]`.
     pub action_offsets: Vec<u32>,
@@ -128,6 +135,7 @@ pub fn emit(
     }
     let bitset_words = vocab_size.div_ceil(32);
 
+    let reachable = lexer.reachable_terminals_all();
     let mut entries = Vec::new();
     let mut bitsets: Vec<u32> = Vec::new();
     let mut offsets = Vec::with_capacity(lexer.num_states() + 1);
@@ -141,25 +149,31 @@ pub fn emit(
                 let word = offset as usize + (*token as usize) / 32;
                 bitsets[word] |= 1u32 << (*token % 32);
             }
-            let pending = if group.scan.next_state == gpugrammar_lex::START {
-                Vec::new()
-            } else {
-                lexer
-                    .reachable_terminals(group.scan.next_state)
-                    .into_iter()
-                    .map(|terminal| terminal.0)
-                    .collect()
-            };
             entries.push(GroupEntry {
                 lexer_state: state as u32,
-                terminals: group.scan.terminals.iter().map(|t| t.0).collect(),
+                terminal_choices: group
+                    .scan
+                    .choices
+                    .iter()
+                    .map(|choice| choice.iter().map(|terminal| terminal.0).collect())
+                    .collect(),
                 next_lexer_state: group.scan.next_state.0,
                 bitset_offset: offset,
                 token_count: group.tokens.len() as u32,
-                pending_terminals: pending,
             });
         }
         offsets.push(entries.len() as u32);
+    }
+
+    let mut pending_offsets = Vec::with_capacity(lexer.num_states() + 1);
+    let mut pending_terminals = Vec::new();
+    pending_offsets.push(0u32);
+    for state in 0..lexer.num_states() {
+        // A scan that ends back at the start left nothing in progress.
+        if state != gpugrammar_lex::START.0 as usize {
+            pending_terminals.extend(reachable[state].iter().map(|terminal| terminal.0));
+        }
+        pending_offsets.push(pending_terminals.len() as u32);
     }
 
     let (action_offsets, action_terminals, action_values) = flatten_action(tables);
@@ -177,6 +191,8 @@ pub fn emit(
         groups: entries,
         group_offsets: offsets,
         group_bitsets: bitsets,
+        pending_offsets,
+        pending_terminals,
         action_offsets,
         action_terminals,
         action_values,

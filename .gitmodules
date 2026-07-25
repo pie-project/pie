@@ -1,0 +1,4 @@
+[submodule "third_party/vllm"]
+	path = third_party/vllm
+	url = git@github.com:ingim/vllm.git
+	branch = gpugrammar

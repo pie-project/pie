@@ -1,0 +1,92 @@
+//! Print the intermediate forms for one schema, so a conflict can be read.
+//!
+//! Without an index, lists the schemas that fail LALR(1) construction. With
+//! one, dumps that schema's terminals and flattened productions, which is
+//! what a reduce/reduce conflict has to be explained from.
+
+use std::fs;
+
+use anyhow::{Result, bail};
+use gpugrammar_ir::json_schema::{JsonSchemaOptions, json_schema_to_grammar};
+use gpugrammar_lex::lexicon::extract;
+use gpugrammar_lex::regular::analyze;
+use gpugrammar_lr::cfg::{Cfg, Symbol};
+use gpugrammar_lr::tables::build;
+
+fn main() -> Result<()> {
+    let arguments: Vec<String> = std::env::args().collect();
+    if arguments.len() < 2 {
+        bail!("usage: gpugrammar-explain <schemas.json> [index]");
+    }
+    let schemas: Vec<String> = serde_json::from_str(&fs::read_to_string(&arguments[1])?)?;
+
+    let Some(index) = arguments
+        .get(2)
+        .and_then(|value| value.parse::<usize>().ok())
+    else {
+        for (index, schema) in schemas.iter().enumerate() {
+            let Ok(grammar) = json_schema_to_grammar(schema, &JsonSchemaOptions::default()) else {
+                continue;
+            };
+            let lexicon = extract(&grammar, &analyze(&grammar));
+            let cfg = gpugrammar_lr::cfg::flatten(&lexicon);
+            if let Err(error) = build(&cfg) {
+                println!(
+                    "{index:4}  {}  |  {}",
+                    error.to_string().lines().next().unwrap_or(""),
+                    &schema[..schema.len().min(150)].replace('\n', " ")
+                );
+            }
+        }
+        return Ok(());
+    };
+
+    let schema = &schemas[index];
+    println!("=== schema ===\n{schema}\n");
+
+    let grammar = json_schema_to_grammar(schema, &JsonSchemaOptions::default())?;
+    let lexicon = extract(&grammar, &analyze(&grammar));
+    println!("=== terminals ({}) ===", lexicon.terminals.len());
+    for (id, terminal) in lexicon.terminals.iter().enumerate() {
+        println!("  t{id:<3} {}", terminal.name);
+    }
+
+    let cfg = gpugrammar_lr::cfg::flatten(&lexicon);
+    println!("\n=== productions ({}) ===", cfg.productions.len());
+    for (id, production) in cfg.productions.iter().enumerate() {
+        println!(
+            "  p{id:<3} {} -> {}",
+            cfg.nonterminal_names[production.lhs as usize],
+            render(&cfg, &lexicon, &production.rhs)
+        );
+    }
+    println!(
+        "\nstart: {} ({} nonterminals, {} terminals)",
+        cfg.nonterminal_names[cfg.start as usize],
+        cfg.num_nonterminals(),
+        cfg.num_terminals
+    );
+
+    match build(&cfg) {
+        Ok(tables) => println!("\nLALR(1): {} states", tables.num_states()),
+        Err(error) => println!("\n{error}"),
+    }
+    Ok(())
+}
+
+fn render(cfg: &Cfg, lexicon: &gpugrammar_lex::lexicon::Lexicon, rhs: &[Symbol]) -> String {
+    if rhs.is_empty() {
+        return "ε".into();
+    }
+    rhs.iter()
+        .map(|symbol| match symbol {
+            Symbol::Terminal(terminal) => {
+                format!("t{}:{}", terminal.0, lexicon.terminal_name(*terminal))
+            }
+            Symbol::Nonterminal(nonterminal) => {
+                cfg.nonterminal_names[*nonterminal as usize].clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}

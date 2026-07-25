@@ -101,24 +101,42 @@ impl Matcher {
     /// lexeme is therefore required to have at least one continuation the
     /// parser would accept.
     fn admits(&self, group: &gpugrammar_tables::GroupEntry) -> bool {
-        let Some(stack) = self.replay(&group.terminals, false) else {
-            return false;
-        };
-        if group.pending_terminals.is_empty() {
-            return true;
+        self.follow(group).is_some()
+    }
+
+    /// The stack after the first terminal sequence the parser can follow.
+    ///
+    /// A token is admissible when *some* reading of it survives. Trying every
+    /// reading is what makes an ambiguous lexicon workable: the parser state,
+    /// not a declaration-order tie-break, decides whether `"id"` is a declared
+    /// property name or an arbitrary string.
+    fn follow(&self, group: &gpugrammar_tables::GroupEntry) -> Option<Vec<u32>> {
+        let from = self.artifact.pending_offsets[group.next_lexer_state as usize] as usize;
+        let to = self.artifact.pending_offsets[group.next_lexer_state as usize + 1] as usize;
+        let pending = &self.artifact.pending_terminals[from..to];
+        for choice in &group.terminal_choices {
+            let Some(stack) = self.replay(choice, false) else {
+                continue;
+            };
+            if pending.is_empty() {
+                return Some(stack);
+            }
+            let probe = Matcher {
+                artifact: self.artifact.clone(),
+                lexer_state: group.next_lexer_state,
+                stack: stack.clone(),
+                history: Vec::new(),
+                max_rollback: 0,
+                terminated: false,
+            };
+            if pending
+                .iter()
+                .any(|terminal| probe.replay(&[*terminal], true).is_some())
+            {
+                return Some(stack);
+            }
         }
-        let probe = Matcher {
-            artifact: self.artifact.clone(),
-            lexer_state: group.next_lexer_state,
-            stack,
-            history: Vec::new(),
-            max_rollback: 0,
-            terminated: false,
-        };
-        group
-            .pending_terminals
-            .iter()
-            .any(|terminal| probe.replay(&[*terminal], true).is_some())
+        None
     }
 
     /// Union the admitted groups' bitsets into `mask`.
@@ -149,12 +167,9 @@ impl Matcher {
             });
         }
         let entry = self.artifact.groups[group].clone();
-        if !self.admits(&entry) {
+        let Some(stack) = self.follow(&entry) else {
             return Err(Refusal::ParserRejected);
-        }
-        let stack = self
-            .replay(&entry.terminals, false)
-            .expect("admits just replayed this");
+        };
         self.stack = stack;
         self.lexer_state = entry.next_lexer_state;
         Ok(())

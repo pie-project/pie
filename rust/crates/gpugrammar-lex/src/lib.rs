@@ -47,12 +47,17 @@ pub struct Terminal {
 
 /// A deterministic scanner over the union of the declared terminals.
 ///
-/// Accepting states carry the terminal that wins there; ties break by
-/// declaration order, so a caller can put keywords ahead of identifiers.
+/// An accepting state carries *every* terminal that ends there, not just the
+/// first. Generated grammars are lexically ambiguous by construction — a
+/// declared property name `"id"` is also a generic JSON string, and a colon is
+/// also a character of a string body — so collapsing to one terminal loses the
+/// one the parser wanted and rejects valid input. The scan therefore returns
+/// candidate terminal sequences and the parser chooses among them, which is
+/// the LR viable-prefix property doing the disambiguation.
 pub struct Lexer {
     /// `transitions[state * 256 + byte]`, or `NO_STATE` when the byte is dead.
     transitions: Vec<u32>,
-    accepts: Vec<Option<TerminalId>>,
+    accepts: Vec<Vec<TerminalId>>,
     terminal_names: Vec<String>,
 }
 
@@ -69,8 +74,8 @@ impl Lexer {
         &self.terminal_names[terminal.0 as usize]
     }
 
-    pub fn accepting(&self, state: LexState) -> Option<TerminalId> {
-        self.accepts[state.0 as usize]
+    pub fn accepting(&self, state: LexState) -> &[TerminalId] {
+        &self.accepts[state.0 as usize]
     }
 
     /// Terminals still reachable from `state`, including one it may already
@@ -87,9 +92,7 @@ impl Lexer {
         let mut queue = VecDeque::from([state]);
         seen[state.0 as usize] = true;
         while let Some(current) = queue.pop_front() {
-            if let Some(terminal) = self.accepting(current) {
-                found.insert(terminal);
-            }
+            found.extend(self.accepting(current).iter().copied());
             let row = current.0 as usize * 256;
             for byte in 0..256usize {
                 let next = self.transitions[row + byte];
@@ -100,6 +103,72 @@ impl Lexer {
             }
         }
         found.into_iter().collect()
+    }
+
+    /// [`Self::reachable_terminals`] for every state at once.
+    ///
+    /// The artifact needs this per group, and a breadth-first search per group
+    /// is quadratic in the number of lexer states, which is what made a large
+    /// lexer take minutes to emit. One fixpoint over the reverse graph gives
+    /// them all: a state reaches what it accepts plus whatever its successors
+    /// reach.
+    pub fn reachable_terminals_all(&self) -> Vec<Vec<TerminalId>> {
+        let states = self.num_states();
+        let words = self.num_terminals().div_ceil(64).max(1);
+        let mut reach = vec![0u64; states * words];
+        for (state, accepting) in self.accepts.iter().enumerate() {
+            for terminal in accepting {
+                reach[state * words + terminal.0 as usize / 64] |= 1u64 << (terminal.0 % 64);
+            }
+        }
+
+        let mut predecessors: Vec<Vec<u32>> = vec![Vec::new(); states];
+        for state in 0..states {
+            let row = state * 256;
+            let mut seen: Vec<u32> = self.transitions[row..row + 256]
+                .iter()
+                .copied()
+                .filter(|next| *next != NO_STATE)
+                .collect();
+            seen.sort_unstable();
+            seen.dedup();
+            for next in seen {
+                predecessors[next as usize].push(state as u32);
+            }
+        }
+
+        let mut queue: VecDeque<u32> = (0..states as u32).collect();
+        let mut queued = vec![true; states];
+        while let Some(state) = queue.pop_front() {
+            queued[state as usize] = false;
+            for index in 0..predecessors[state as usize].len() {
+                let predecessor = predecessors[state as usize][index] as usize;
+                let mut changed = false;
+                for word in 0..words {
+                    let incoming = reach[state as usize * words + word];
+                    let slot = &mut reach[predecessor * words + word];
+                    if *slot | incoming != *slot {
+                        *slot |= incoming;
+                        changed = true;
+                    }
+                }
+                if changed && !queued[predecessor] {
+                    queued[predecessor] = true;
+                    queue.push_back(predecessor as u32);
+                }
+            }
+        }
+
+        (0..states)
+            .map(|state| {
+                (0..self.num_terminals())
+                    .filter(|terminal| {
+                        reach[state * words + terminal / 64] & (1u64 << (terminal % 64)) != 0
+                    })
+                    .map(|terminal| TerminalId(terminal as u32))
+                    .collect()
+            })
+            .collect()
     }
 
     fn step(&self, state: LexState, byte: u8) -> Option<LexState> {
@@ -127,7 +196,7 @@ impl Lexer {
     /// the next token may continue the same lexeme.
     pub fn scan(&self, token: &[u8], state: LexState) -> Option<Scan> {
         let mut current = state;
-        let mut terminals = Vec::new();
+        let mut committed: Vec<&[TerminalId]> = Vec::new();
         let mut index = 0usize;
         let mut rounds = 0usize;
 
@@ -142,7 +211,10 @@ impl Lexer {
             // A lexeme finished by an earlier token is still pending in
             // `current`; a byte that cannot extend it commits it rather than
             // failing the scan.
-            let mut last_accept = self.accepting(cursor).map(|terminal| (index, terminal));
+            let mut last_accept = match self.accepting(cursor) {
+                [] => None,
+                accepting => Some((index, accepting)),
+            };
 
             while position < token.len() {
                 let Some(next) = self.step(cursor, token[position]) else {
@@ -150,46 +222,77 @@ impl Lexer {
                 };
                 cursor = next;
                 position += 1;
-                if let Some(terminal) = self.accepting(cursor) {
-                    last_accept = Some((position, terminal));
+                match self.accepting(cursor) {
+                    [] => {}
+                    accepting => last_accept = Some((position, accepting)),
                 }
             }
 
             if position == token.len() {
                 return match last_accept {
-                    Some((end, terminal)) if end == position && self.is_dead_end(cursor) => {
-                        terminals.push(terminal);
+                    Some((end, accepting)) if end == position && self.is_dead_end(cursor) => {
+                        committed.push(accepting);
                         Some(Scan {
-                            terminals,
+                            choices: product(&committed),
                             next_state: START,
                         })
                     }
                     _ => Some(Scan {
-                        terminals,
+                        choices: product(&committed),
                         next_state: cursor,
                     }),
                 };
             }
 
             // A byte blocked the lexeme, so commit the longest match.
-            let (end, terminal) = last_accept?;
-            terminals.push(terminal);
+            let (end, accepting) = last_accept?;
+            committed.push(accepting);
             index = end;
             current = START;
         }
 
         Some(Scan {
-            terminals,
+            choices: product(&committed),
             next_state: current,
         })
     }
 }
 
 /// The result of scanning one token.
+///
+/// `choices` holds the terminal sequences the token could emit, one per way of
+/// resolving the lexical ambiguities it crossed. There is always at least one,
+/// and it is empty when the token ends mid-lexeme. All choices share
+/// `next_state`, because maximal munch fixes where the lexemes end; only which
+/// terminal each one is differs.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Scan {
-    pub terminals: Vec<TerminalId>,
+    pub choices: Vec<Vec<TerminalId>>,
     pub next_state: LexState,
+}
+
+/// How many disambiguations one token may carry. Real grammars stay at one or
+/// two; the cap only stops a pathological product.
+const MAX_CHOICES: usize = 16;
+
+/// Expand per-lexeme accepting sets into whole-token terminal sequences.
+fn product(committed: &[&[TerminalId]]) -> Vec<Vec<TerminalId>> {
+    let mut choices: Vec<Vec<TerminalId>> = vec![Vec::new()];
+    for accepting in committed {
+        let mut next = Vec::new();
+        for prefix in &choices {
+            for terminal in accepting.iter() {
+                if next.len() == MAX_CHOICES {
+                    break;
+                }
+                let mut extended = prefix.clone();
+                extended.push(*terminal);
+                next.push(extended);
+            }
+        }
+        choices = next;
+    }
+    choices
 }
 
 /// Build a scanner by determinising the union of the terminal automata.
@@ -197,6 +300,17 @@ pub struct Scan {
 /// `Automaton::to_dfa` is not reused because it discards which terminal
 /// accepted in each subset, and that tag is the whole point here.
 pub fn build_lexer(terminals: Vec<Terminal>) -> Lexer {
+    build_lexer_within(terminals, usize::MAX).expect("no state budget was set")
+}
+
+/// As [`build_lexer`], but abandoned once the DFA exceeds `budget` states.
+///
+/// A length bound has to be unrolled to be held in a DFA: `"maxLength": 2048`
+/// over UTF-8 costs roughly seventy states per counted position, so a single
+/// schema can ask for hundreds of thousands. Those are correct but too large
+/// to emit, and the caller needs to find that out cheaply rather than after
+/// determinising them.
+pub fn build_lexer_within(terminals: Vec<Terminal>, budget: usize) -> Option<Lexer> {
     let mut union = NfaGraph::new();
     let start = union.add_state();
     let mut ends: Vec<(StateId, TerminalId)> = Vec::new();
@@ -234,7 +348,7 @@ pub fn build_lexer(terminals: Vec<Terminal>) -> Lexer {
     }
 
     let end_of: HashMap<StateId, TerminalId> = ends.into_iter().collect();
-    determinise(&union, start, &end_of, names)
+    determinise(&union, start, &end_of, names, budget)
 }
 
 fn determinise(
@@ -242,7 +356,8 @@ fn determinise(
     start: StateId,
     end_of: &HashMap<StateId, TerminalId>,
     terminal_names: Vec<String>,
-) -> Lexer {
+    budget: usize,
+) -> Option<Lexer> {
     let mut subsets: FxHashMap<BTreeSet<StateId>, u32> = FxHashMap::default();
     let mut order: Vec<BTreeSet<StateId>> = Vec::new();
     let mut queue: VecDeque<BTreeSet<StateId>> = VecDeque::new();
@@ -274,6 +389,9 @@ fn determinise(
             let id = match subsets.get(&closure) {
                 Some(&existing) => existing,
                 None => {
+                    if order.len() >= budget {
+                        return None;
+                    }
                     let fresh = order.len() as u32;
                     subsets.insert(closure.clone(), fresh);
                     order.push(closure.clone());
@@ -285,21 +403,24 @@ fn determinise(
         }
     }
 
-    let accepts = order
+    let accepts: Vec<Vec<TerminalId>> = order
         .iter()
         .map(|subset| {
-            subset
+            let mut terminals: Vec<TerminalId> = subset
                 .iter()
                 .filter_map(|state| end_of.get(state).copied())
-                .min()
+                .collect();
+            terminals.sort_unstable();
+            terminals.dedup();
+            terminals
         })
         .collect();
 
-    Lexer {
+    Some(Lexer {
         transitions,
         accepts,
         terminal_names,
-    }
+    })
 }
 
 /// Tokens that are indistinguishable to the parser from one lexer state.

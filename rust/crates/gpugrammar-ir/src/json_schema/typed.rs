@@ -19,6 +19,8 @@ struct Converter<'a> {
     rules: Vec<FrontendRule>,
     names: HashSet<String>,
     counter: usize,
+    /// Lexeme rules already declared, keyed by shape.
+    lexemes: HashMap<String, String>,
 }
 
 impl<'a> Converter<'a> {
@@ -28,6 +30,7 @@ impl<'a> Converter<'a> {
             rules: Vec::new(),
             names: HashSet::new(),
             counter: 0,
+            lexemes: HashMap::new(),
         }
     }
 
@@ -187,8 +190,8 @@ impl<'a> Converter<'a> {
     fn visit_any(&mut self, hint: &str) -> Result<Expr> {
         let name = self.fresh_name(&format!("{}_value", hint));
         let value = Expr::RuleRef(name.clone());
-        let string = self.json_string(0, None);
-        let number = unbounded_number();
+        let string = self.json_string(0, None)?;
+        let number = self.lexeme("number", unbounded_number())?;
         let pair = seq(vec![
             string.clone(),
             self.ws(),
@@ -258,17 +261,40 @@ impl<'a> Converter<'a> {
             if has_length {
                 bail!("pattern cannot be combined with length constraints");
             }
-            return Ok(seq(vec![lit("\""), regex_to_expr(pattern)?, lit("\"")]));
+            let body = seq(vec![lit("\""), regex_to_expr(pattern)?, lit("\"")]);
+            return self.lexeme("pattern", body);
         }
-        Ok(self.json_string(min, max))
+        self.json_string(min, max)
     }
 
-    fn json_string(&self, min: u32, max: Option<u32>) -> Expr {
-        seq(vec![
-            lit("\""),
-            json_character().repeat(min, max),
-            lit("\""),
-        ])
+    fn json_string(&mut self, min: u32, max: Option<u32>) -> Result<Expr> {
+        self.lexeme(
+            "string",
+            seq(vec![
+                lit("\""),
+                json_character().repeat(min, max),
+                lit("\""),
+            ]),
+        )
+    }
+
+    /// Declare a lexical unit as its own rule.
+    ///
+    /// The lexer takes a whole regular rule as one terminal, so this is how the
+    /// front end says where a lexeme begins and ends. Left inline, a string
+    /// would reach the lexer as `'"'`, a body and `'"'`, and the body class
+    /// `[^"\\]*` overlaps every punctuation terminal in the grammar: after a
+    /// colon the scanner would keep munching as a string body and never commit
+    /// the colon the parser wanted. Identical shapes share one rule.
+    fn lexeme(&mut self, hint: &str, body: Expr) -> Result<Expr> {
+        let key = format!("{body:?}");
+        if let Some(name) = self.lexemes.get(&key) {
+            return Ok(Expr::RuleRef(name.clone()));
+        }
+        let name = self.fresh_name(&format!("{hint}_lexeme"));
+        self.lexemes.insert(key, name.clone());
+        self.define_named(name.clone(), body)?;
+        Ok(Expr::RuleRef(name))
     }
 
     fn visit_integer(&mut self, schema: &Value) -> Result<Expr> {
@@ -412,15 +438,13 @@ impl<'a> Converter<'a> {
                 });
             }
         }
-        let additional_pair = additional.map(|value| {
-            seq(vec![
-                self.json_string(0, None),
-                self.ws(),
-                lit(":"),
-                self.ws(),
-                value,
-            ])
-        });
+        let additional_pair = match additional {
+            Some(value) => {
+                let name = self.json_string(0, None)?;
+                Some(seq(vec![name, self.ws(), lit(":"), self.ws(), value]))
+            }
+            None => None,
+        };
         if known.is_empty() {
             return Ok(seq(vec![
                 lit("{"),
@@ -442,9 +466,12 @@ impl<'a> Converter<'a> {
                 sequence.push(tail);
             }
             seq(sequence)
-        } else if known.iter().filter(|property| !property.required).count() <= 8 {
-            enumerate_properties(&known, min, max, additional_pair, self.ws())?
         } else {
+            // Never enumerate subsets of the optional properties. That is
+            // exponential in their number and, worse, copies every property's
+            // value grammar into every subset, so a schema with eight optional
+            // properties duplicates each value 256 times. The state
+            // construction shares them behind one rule per (index, count).
             self.build_property_state(
                 hint,
                 &known,
@@ -571,47 +598,6 @@ impl<'a> Converter<'a> {
 struct Property {
     pair: Expr,
     required: bool,
-}
-
-fn enumerate_properties(
-    properties: &[Property],
-    min: u32,
-    max: Option<u32>,
-    additional: Option<Expr>,
-    ws: Expr,
-) -> Result<Expr> {
-    let optional: Vec<usize> = properties
-        .iter()
-        .enumerate()
-        .filter_map(|(index, property)| (!property.required).then_some(index))
-        .collect();
-    let mut alternatives = Vec::new();
-    for selected in 0usize..(1usize << optional.len()) {
-        let mut pairs = Vec::new();
-        for (index, property) in properties.iter().enumerate() {
-            let included = property.required
-                || optional
-                    .iter()
-                    .position(|&optional| optional == index)
-                    .is_some_and(|bit| selected & (1 << bit) != 0);
-            if included {
-                pairs.push(property.pair.clone());
-            }
-        }
-        let emitted = pairs.len() as u32;
-        let Some(tail) = additional_tail(emitted, min, max, additional.clone(), ws.clone())? else {
-            continue;
-        };
-        let mut sequence = intersperse_properties(pairs, ws.clone());
-        if tail != Expr::Empty {
-            sequence.push(tail);
-        }
-        alternatives.push(seq(sequence));
-    }
-    if alternatives.is_empty() {
-        bail!("object property constraints are unsatisfiable");
-    }
-    Ok(Expr::choice(alternatives))
 }
 
 fn additional_properties(

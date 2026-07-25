@@ -62,23 +62,28 @@ fn the_skeleton_keeps_only_structural_rules() {
 }
 
 #[test]
-fn adjacent_literals_stay_separate_terminals() {
-    // Merging them would make a lone "{" ambiguous: the scanner could not
-    // commit without seeing whether a "}" follows.
+fn a_whole_regular_rule_is_one_terminal() {
+    // `string` is regular, so it becomes a single terminal rather than a
+    // quote, a body and a quote. Splitting it would make the body a terminal
+    // of its own, and a body class such as `[^"\\]` overlaps every
+    // punctuation terminal: after a colon the scanner would keep munching as a
+    // string body and never commit the colon the parser wanted.
     let grammar = Grammar::from_ebnf(JSON, "value").unwrap();
     let lexicon = extract(&grammar, &analyze(&grammar));
+    let names: Vec<&str> = lexicon
+        .terminals
+        .iter()
+        .map(|terminal| terminal.name.as_str())
+        .collect();
     assert!(
-        !lexicon
-            .terminals
-            .iter()
-            .any(|terminal| terminal.name.contains("{}")),
-        "found a merged terminal in {:?}",
-        lexicon
-            .terminals
-            .iter()
-            .map(|t| t.name.as_str())
-            .collect::<Vec<_>>()
+        names.contains(&"string"),
+        "the string never became one terminal: {names:?}"
     );
+    // Adjacent literals in a sequence stay separate, because a non-regular
+    // neighbour breaks the run, so the skeleton still has its punctuation.
+    for literal in ["'{'", "'}'", "','", "':'"] {
+        assert!(names.contains(&literal), "missing {literal} in {names:?}");
+    }
 }
 
 #[test]
@@ -112,32 +117,33 @@ fn the_extracted_lexicon_drives_a_working_lexer() {
     let lexicon = extract(&grammar, &analyze(&grammar));
     let lexer = build_lexer(terminal_automata(&grammar, &lexicon));
 
-    let scan = lexer.scan(b"{", START).unwrap();
-    assert_eq!(scan.terminals.len(), 1);
-    assert_eq!(lexer.terminal_name(scan.terminals[0]), "'{'");
+    // `object ::= "{" "}"` is regular, so `{}` is a terminal too. A lone `{`
+    // is therefore withheld rather than committed: the next byte decides which
+    // of the two it was. What keeps that honest is that the pending lexeme is
+    // checked against the terminals it could still become.
+    let opening = lexer.scan(b"{", START).unwrap();
+    assert!(opening.choices.iter().all(|choice| choice.is_empty()));
+    assert!(
+        lexer
+            .reachable_terminals(opening.next_state)
+            .iter()
+            .any(|terminal| lexer.terminal_name(*terminal) == "'{'")
+    );
 
-    let opening = lexer.scan(b"\"ab", START).unwrap();
-    assert!(opening.terminals.is_empty());
-    assert_ne!(opening.next_state, START);
+    // Once the next byte cannot extend it, the longest match is committed.
+    let member = lexer.scan(b"{\"", START).unwrap();
+    assert_eq!(member.choices.len(), 1);
+    assert_eq!(
+        member.choices[0]
+            .iter()
+            .map(|terminal| lexer.terminal_name(*terminal))
+            .collect::<Vec<_>>(),
+        vec!["'{'"]
+    );
+
+    let string = lexer.scan(b"\"ab", START).unwrap();
+    assert!(string.choices.iter().all(|choice| choice.is_empty()));
+    assert_ne!(string.next_state, START);
 
     assert!(lexer.scan(b"@", START).is_none());
-}
-
-#[test]
-fn grouping_over_the_extracted_lexer_collapses_the_vocabulary() {
-    let grammar = Grammar::from_ebnf(JSON, "value").unwrap();
-    let lexicon = extract(&grammar, &analyze(&grammar));
-    let lexer = build_lexer(terminal_automata(&grammar, &lexicon));
-
-    let mut vocabulary: Vec<Vec<u8>> = (0u16..=255).map(|b| vec![b as u8]).collect();
-    for piece in ["\": ", "\", ", "{\"", "\"}", "], ", "1234", "hello world"] {
-        vocabulary.push(piece.as_bytes().to_vec());
-    }
-    let groups = group_vocabulary(&lexer, &vocabulary);
-    let at_start = &groups.per_state[START.0 as usize];
-    assert!(
-        at_start.len() * 8 < vocabulary.len(),
-        "expected at least an 8x collapse, got {} groups",
-        at_start.len()
-    );
 }

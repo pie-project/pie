@@ -12,7 +12,7 @@
 
 use gpugrammar_ir::fsm::{Automaton, FsmEdge, NfaGraph, StateId, build_rule_fsms};
 use gpugrammar_ir::grammar::{Expr, ExprId, Grammar, Rule, RuleId};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::regular::Regularity;
 use crate::{Terminal, TerminalId};
@@ -21,7 +21,19 @@ use crate::{Terminal, TerminalId};
 #[derive(Debug, Clone)]
 pub struct TerminalDef {
     pub name: String,
-    pub expr: ExprId,
+    /// The concatenation this terminal matches. Usually one expression, but a
+    /// run of consecutive regular siblings inside a sequence is merged into
+    /// one terminal, which is what keeps a quoted string whole.
+    pub parts: Vec<ExprId>,
+    /// True when the expression also matches the empty string.
+    ///
+    /// A scanner cannot emit an empty lexeme, so a nullable terminal would
+    /// never reach the parser and every rule needing it would be stuck: with
+    /// `__json_ws ::= [ \t\n\r]*` a document without whitespace could not be
+    /// parsed at all, and `""` was rejected because its content terminal was
+    /// nullable. Nullability therefore moves into the skeleton, as
+    /// `ε | terminal`, and the terminal's automaton is stripped of ε.
+    pub nullable: bool,
 }
 
 /// The skeleton form of an expression, with regular parts already cut out.
@@ -52,6 +64,10 @@ pub struct SkeletonRule {
 pub struct Lexicon {
     pub terminals: Vec<TerminalDef>,
     pub skeleton: Vec<SkeletonRule>,
+    /// The grammar's root. The skeleton follows declaration order, which need
+    /// not put the root first, so the LR construction has to be told which
+    /// rule to start from rather than guessing at the first one.
+    pub root: RuleId,
 }
 
 impl Lexicon {
@@ -67,6 +83,37 @@ impl Lexicon {
 pub fn extract(grammar: &Grammar, regularity: &Regularity) -> Lexicon {
     let mut interner = Interner::default();
     let mut skeleton = Vec::new();
+    let root = grammar.root_rule();
+
+    // A regular root means the whole language is regular, since a rule is only
+    // regular when everything it reaches is. The document is then one lexeme
+    // and the parser has nothing to do, which is the best case rather than a
+    // failure: the mask comes entirely from the lexer state and no stack is
+    // needed. Give the LR construction a trivial skeleton so the rest of the
+    // pipeline needs no special case. Measured on JSONSchemaBench this is 68%
+    // of schemas. Testing the root rather than the skeleton matters, because
+    // an unreachable non-regular rule would otherwise hide this case.
+    if regularity.is_regular(root) {
+        let expr = grammar.get_rule(root).body;
+        let terminal = if is_terminal_atom(grammar, expr, regularity) {
+            interner.intern(grammar, expr)
+        } else {
+            interner.intern_rule(grammar, root)
+        };
+        let body = optional_if_nullable(&interner, terminal);
+        skeleton.push(SkeletonRule {
+            rule: root,
+            name: grammar.get_rule(root).name.clone(),
+            body,
+        });
+        let mut lexicon = Lexicon {
+            terminals: interner.terminals,
+            skeleton,
+            root,
+        };
+        name_terminals_from_rules(grammar, &mut lexicon);
+        return lexicon;
+    }
 
     for (index, rule) in grammar.rules().iter().enumerate() {
         let id = RuleId(index as u32);
@@ -81,30 +128,10 @@ pub fn extract(grammar: &Grammar, regularity: &Regularity) -> Lexicon {
         });
     }
 
-    if skeleton.is_empty() {
-        // Every rule was regular, so the whole document is one lexeme and the
-        // parser has nothing to do. That is the best case rather than a
-        // failure: the mask comes entirely from the lexer state and no stack
-        // is needed. Give the LR construction a trivial skeleton so the rest
-        // of the pipeline does not need a special case. Measured on
-        // JSONSchemaBench this is 68% of schemas.
-        let root = grammar.root_rule();
-        let expr = grammar.get_rule(root).body;
-        let terminal = if is_terminal_atom(grammar, expr, regularity) {
-            interner.intern(grammar, expr)
-        } else {
-            interner.intern_rule(grammar, root)
-        };
-        skeleton.push(SkeletonRule {
-            rule: root,
-            name: grammar.get_rule(root).name.clone(),
-            body: SkeletonExpr::Terminal(terminal),
-        });
-    }
-
     let mut lexicon = Lexicon {
         terminals: interner.terminals,
         skeleton,
+        root,
     };
     name_terminals_from_rules(grammar, &mut lexicon);
     lexicon
@@ -126,9 +153,16 @@ pub fn terminal_automata(grammar: &Grammar, lexicon: &Lexicon) -> Vec<Terminal> 
     let mut extended = grammar.clone();
     let base = extended.rules.len();
     for (index, terminal) in lexicon.terminals.iter().enumerate() {
+        let body = if let [single] = terminal.parts[..] {
+            single
+        } else {
+            let id = ExprId(extended.exprs.len() as u32);
+            extended.exprs.push(Expr::Sequence(terminal.parts.clone()));
+            id
+        };
         extended.rules.push(Rule {
             name: format!("__terminal_{index}"),
-            body: terminal.expr,
+            body,
         });
     }
     let automata = build_rule_fsms(&extended);
@@ -136,11 +170,105 @@ pub fn terminal_automata(grammar: &Grammar, lexicon: &Lexicon) -> Vec<Terminal> 
         .terminals
         .iter()
         .enumerate()
-        .map(|(index, terminal)| Terminal {
-            name: terminal.name.clone(),
-            automaton: resolve_references(&automata, base + index),
+        .map(|(index, terminal)| {
+            let automaton = resolve_references(&automata, base + index);
+            Terminal {
+                name: terminal.name.clone(),
+                automaton: if terminal.nullable {
+                    without_empty(automaton)
+                } else {
+                    automaton
+                },
+            }
         })
         .collect()
+}
+
+/// Wrap a nullable terminal as `ε | terminal` in the skeleton.
+fn optional_if_nullable(interner: &Interner, terminal: TerminalId) -> SkeletonExpr {
+    if interner.terminals[terminal.0 as usize].nullable {
+        SkeletonExpr::Choice(vec![SkeletonExpr::Empty, SkeletonExpr::Terminal(terminal)])
+    } else {
+        SkeletonExpr::Terminal(terminal)
+    }
+}
+
+/// Does this expression match the empty string?
+fn is_nullable(grammar: &Grammar, expr: ExprId) -> bool {
+    fn walk(grammar: &Grammar, expr: ExprId, visiting: &mut FxHashSet<u32>) -> bool {
+        match grammar.get_expr(expr) {
+            Expr::EmptyString => true,
+            Expr::ByteString(bytes) => bytes.is_empty(),
+            Expr::CharacterClass { .. } => false,
+            Expr::CharacterClassStar { .. } => true,
+            Expr::Sequence(parts) => parts.iter().all(|part| walk(grammar, *part, visiting)),
+            Expr::Choices(alternatives) => alternatives
+                .iter()
+                .any(|alternative| walk(grammar, *alternative, visiting)),
+            Expr::RuleRef(rule) => walk_rule(grammar, *rule, visiting),
+            Expr::Repeat { rule, min, .. } => *min == 0 || walk_rule(grammar, *rule, visiting),
+        }
+    }
+
+    // A rule already on the path contributes nothing: reaching it again means
+    // at least one more expansion, and regularity only admits tail recursion,
+    // so that expansion cannot be empty.
+    fn walk_rule(grammar: &Grammar, rule: RuleId, visiting: &mut FxHashSet<u32>) -> bool {
+        if !visiting.insert(rule.0) {
+            return false;
+        }
+        let result = walk(grammar, grammar.get_rule(rule).body, visiting);
+        visiting.remove(&rule.0);
+        result
+    }
+
+    walk(grammar, expr, &mut FxHashSet::default())
+}
+
+/// The same language without the empty string.
+///
+/// A fresh start state takes over the byte edges leaving the old start's
+/// epsilon closure. Every non-empty word is still accepted, because its first
+/// byte was read from that closure; the empty word is not, because the new
+/// start is not accepting and has no epsilon edges.
+fn without_empty(mut automaton: Automaton<NfaGraph>) -> Automaton<NfaGraph> {
+    let mut closure = vec![false; automaton.fsm.num_states()];
+    let mut stack = vec![automaton.start];
+    closure[automaton.start.0 as usize] = true;
+    while let Some(state) = stack.pop() {
+        for edge in automaton.fsm.edges(state) {
+            if let FsmEdge::Epsilon(target) = edge {
+                if !closure[target.0 as usize] {
+                    closure[target.0 as usize] = true;
+                    stack.push(*target);
+                }
+            }
+        }
+    }
+
+    let mut edges = Vec::new();
+    for state in 0..automaton.fsm.num_states() {
+        if !closure[state] {
+            continue;
+        }
+        for edge in automaton.fsm.edges(StateId(state as u32)) {
+            if let FsmEdge::CharRange { min, max, target } = edge {
+                edges.push(FsmEdge::CharRange {
+                    min: *min,
+                    max: *max,
+                    target: *target,
+                });
+            }
+        }
+    }
+
+    let start = automaton.fsm.add_state();
+    automaton.ends.push(false);
+    for edge in edges {
+        automaton.fsm.add_edge(start, edge);
+    }
+    automaton.start = start;
+    automaton
 }
 
 /// Splice referenced rules into `root`'s automaton until no reference edges
@@ -221,23 +349,35 @@ impl Interner {
             return existing;
         }
         let id = TerminalId(self.terminals.len() as u32);
+        let body = grammar.get_rule(rule).body;
         self.terminals.push(TerminalDef {
             name: grammar.get_rule(rule).name.clone(),
-            expr: grammar.get_rule(rule).body,
+            parts: vec![body],
+            nullable: is_nullable(grammar, body),
         });
         self.by_key.insert(key, id);
         id
     }
 
     fn intern(&mut self, grammar: &Grammar, expr: ExprId) -> TerminalId {
-        let key = canonical(grammar, expr);
+        self.intern_run(grammar, &[unwrap_singleton(grammar, expr)])
+    }
+
+    /// Intern a concatenation of regular expressions as one terminal.
+    fn intern_run(&mut self, grammar: &Grammar, parts: &[ExprId]) -> TerminalId {
+        let key = parts
+            .iter()
+            .map(|part| canonical(grammar, *part))
+            .collect::<Vec<_>>()
+            .join("~");
         if let Some(&existing) = self.by_key.get(&key) {
             return existing;
         }
         let id = TerminalId(self.terminals.len() as u32);
         self.terminals.push(TerminalDef {
             name: display_name(&key),
-            expr,
+            parts: parts.to_vec(),
+            nullable: parts.iter().all(|part| is_nullable(grammar, *part)),
         });
         self.by_key.insert(key, id);
         id
@@ -253,8 +393,15 @@ fn lower(
     if matches!(grammar.get_expr(expr), Expr::EmptyString) {
         return SkeletonExpr::Empty;
     }
-    if is_terminal_atom(grammar, expr, regularity) {
-        return SkeletonExpr::Terminal(interner.intern(grammar, expr));
+    // Cut out the *maximal* regular subtree. A whole regular rule therefore
+    // becomes one terminal, which is how the front end declares what a lexeme
+    // is: a quoted string or a number is a rule, so it stays whole instead of
+    // splitting into `'"'`, a body and `'"'` whose body class overlaps every
+    // punctuation terminal in the grammar. Adjacent literals in a sequence are
+    // still separate, so a lone `{` remains committable.
+    if is_regular_expr(grammar, expr, regularity) {
+        let terminal = interner.intern(grammar, expr);
+        return optional_if_nullable(interner, terminal);
     }
     match grammar.get_expr(expr) {
         Expr::Sequence(parts) => SkeletonExpr::Sequence(
@@ -320,6 +467,22 @@ pub fn is_regular_expr(grammar: &Grammar, expr: ExprId, regularity: &Regularity)
     }
 }
 
+/// Strip sequences and choices of one element.
+///
+/// The EBNF front end wraps an alternative in a one-element sequence, so the
+/// same rule reference reaches the interner under two shapes and becomes two
+/// terminals with two ACTION columns - and only one of them keeps the rule's
+/// name.
+fn unwrap_singleton(grammar: &Grammar, expr: ExprId) -> ExprId {
+    match grammar.get_expr(expr) {
+        Expr::Sequence(parts) if parts.len() == 1 => unwrap_singleton(grammar, parts[0]),
+        Expr::Choices(alternatives) if alternatives.len() == 1 => {
+            unwrap_singleton(grammar, alternatives[0])
+        }
+        _ => expr,
+    }
+}
+
 /// Structural key, so identical subtrees intern to one terminal.
 fn canonical(grammar: &Grammar, expr: ExprId) -> String {
     let mut out = String::new();
@@ -375,7 +538,9 @@ fn display_name(key: &str) -> String {
 /// Name a terminal after the rule it came from, when it is a whole rule.
 fn name_terminals_from_rules(grammar: &Grammar, lexicon: &mut Lexicon) {
     for terminal in &mut lexicon.terminals {
-        if let Expr::RuleRef(target) = grammar.get_expr(terminal.expr) {
+        if let [single] = terminal.parts[..]
+            && let Expr::RuleRef(target) = grammar.get_expr(single)
+        {
             terminal.name = grammar.get_rule(*target).name.clone();
         }
     }

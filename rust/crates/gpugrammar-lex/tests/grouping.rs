@@ -43,8 +43,9 @@ const ORDER: &[&str] = &[
 fn a_structural_token_emits_one_terminal() {
     let lexer = lexer_from_rules(JSON_LEXER, ORDER);
     let scan = lexer.scan(b"{", START).unwrap();
-    assert_eq!(scan.terminals.len(), 1);
-    assert_eq!(lexer.terminal_name(scan.terminals[0]), "lbrace");
+    assert_eq!(scan.choices.len(), 1);
+    assert_eq!(scan.choices[0].len(), 1);
+    assert_eq!(lexer.terminal_name(scan.choices[0][0]), "lbrace");
     assert_eq!(scan.next_state, START);
 }
 
@@ -52,8 +53,7 @@ fn a_structural_token_emits_one_terminal() {
 fn a_token_spanning_several_terminals_emits_all_of_them() {
     let lexer = lexer_from_rules(JSON_LEXER, ORDER);
     let scan = lexer.scan(b"\"a\":", START).unwrap();
-    let names: Vec<_> = scan
-        .terminals
+    let names: Vec<_> = scan.choices[0]
         .iter()
         .map(|t| lexer.terminal_name(*t))
         .collect();
@@ -64,13 +64,12 @@ fn a_token_spanning_several_terminals_emits_all_of_them() {
 fn a_token_ending_mid_lexeme_carries_the_state() {
     let lexer = lexer_from_rules(JSON_LEXER, ORDER);
     let opening = lexer.scan(b"\"ab", START).unwrap();
-    assert!(opening.terminals.is_empty());
+    assert!(opening.choices.iter().all(|choice| choice.is_empty()));
     assert_ne!(opening.next_state, START);
 
     let closing = lexer.scan(b"cd\"", opening.next_state).unwrap();
     assert_eq!(
-        closing
-            .terminals
+        closing.choices[0]
             .iter()
             .map(|t| lexer.terminal_name(*t))
             .collect::<Vec<_>>(),
@@ -167,7 +166,7 @@ fn a_codepoint_split_across_tokens_is_scannable() {
 
     // The whole codepoint in one token stays inside the string.
     let whole = lexer.scan(snowman, inside).expect("whole codepoint");
-    assert!(whole.terminals.is_empty());
+    assert!(whole.choices.iter().all(|choice| choice.is_empty()));
 
     // Split after the lead byte: the first half must land in a state that the
     // second half can continue from.

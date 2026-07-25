@@ -58,11 +58,11 @@ pub fn flatten(lexicon: &Lexicon) -> Cfg {
         builder.emit_alternatives(lhs, &rule.body);
     }
 
-    let start = lexicon
-        .skeleton
-        .first()
-        .map(|rule| builder.by_rule[&rule.rule.0])
-        .unwrap_or(0);
+    let start = builder
+        .by_rule
+        .get(&lexicon.root.0)
+        .copied()
+        .expect("the root rule is always in the skeleton");
 
     // Identical alternatives are common once a schema has been lowered - two
     // branches of an anyOf can flatten to the same right-hand side - and two

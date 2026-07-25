@@ -13,3 +13,5 @@ gpugrammar-lex = { path = "../gpugrammar-lex" }
 gpugrammar-lr = { path = "../gpugrammar-lr" }
 gpugrammar-tables = { path = "../gpugrammar-tables" }
 rustc-hash.workspace = true
+serde.workspace = true
+serde_json.workspace = true

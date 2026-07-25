@@ -61,18 +61,22 @@ fn the_tables_accept_well_formed_sentences() {
     let colon = terminal(&lexicon, "':'");
     let string = terminal(&lexicon, "string");
     let number = terminal(&lexicon, "number");
+    // `object ::= "{" "}"` is regular in full, so the empty object is one
+    // terminal rather than two. The same holds for the empty array.
+    let empty_object = terminal(&lexicon, "(. b{ b})");
+    let empty_array = terminal(&lexicon, "(. b[ b])");
 
-    assert!(Parse::accepts(&tables, &[lb, rb]));
+    assert!(Parse::accepts(&tables, &[empty_object]));
     assert!(Parse::accepts(&tables, &[lb, string, colon, number, rb]));
     assert!(Parse::accepts(
         &tables,
         &[lb, string, colon, number, comma, string, colon, string, rb]
     ));
-    assert!(Parse::accepts(&tables, &[lk, rk]));
+    assert!(Parse::accepts(&tables, &[empty_array]));
     assert!(Parse::accepts(&tables, &[lk, number, comma, number, rk]));
     assert!(Parse::accepts(
         &tables,
-        &[lb, string, colon, lk, lb, rb, rk, rb]
+        &[lb, string, colon, lk, empty_object, rk, rb]
     ));
 }
 
