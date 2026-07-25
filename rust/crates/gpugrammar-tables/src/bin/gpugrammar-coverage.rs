@@ -10,9 +10,9 @@ use std::fs;
 
 use anyhow::{Result, bail};
 use gpugrammar_ir::json_schema::{JsonSchemaOptions, json_schema_to_grammar};
-use gpugrammar_lex::lexicon::extract;
+use gpugrammar_lex::lexicon::extract_within;
 use gpugrammar_lex::regular::analyze;
-use gpugrammar_lr::cfg::flatten;
+use gpugrammar_lr::cfg::flatten_within;
 use gpugrammar_lr::tables::build;
 
 fn main() -> Result<()> {
@@ -46,7 +46,12 @@ fn main() -> Result<()> {
         };
         lowered += 1;
 
-        let lexicon = extract(&grammar, &analyze(&grammar));
+        let budget: u64 = std::env::var("GPUGRAMMAR_TERMINAL_BUDGET")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(gpugrammar_lex::lexicon::DEFAULT_TERMINAL_BUDGET);
+        let clock = std::time::Instant::now();
+        let lexicon = extract_within(&grammar, &analyze(&grammar), budget);
         extracted += 1;
         if lexicon.skeleton.len() == 1 {
             *reasons
@@ -55,7 +60,30 @@ fn main() -> Result<()> {
         }
         terminals.push(lexicon.terminals.len());
 
-        let cfg = flatten(&lexicon);
+        let Some(cfg) = flatten_within(&lexicon, gpugrammar_lr::cfg::DEFAULT_PRODUCTION_BUDGET)
+        else {
+            *reasons
+                .entry("parser: grammar exceeds the production budget".into())
+                .or_default() += 1;
+            continue;
+        };
+        if std::env::var("GPUGRAMMAR_REPORT").is_ok() {
+            eprintln!(
+                "cfg: {} terminals, {} productions, {} nonterminals",
+                lexicon.terminals.len(),
+                cfg.productions.len(),
+                cfg.num_nonterminals()
+            );
+        }
+        if clock.elapsed().as_millis() > 500 {
+            eprintln!(
+                "slow: {} terminals, {} productions, {} nonterminals, {:?}",
+                lexicon.terminals.len(),
+                cfg.productions.len(),
+                cfg.num_nonterminals(),
+                clock.elapsed()
+            );
+        }
         match build(&cfg) {
             Ok(tables) => {
                 compiled += 1;

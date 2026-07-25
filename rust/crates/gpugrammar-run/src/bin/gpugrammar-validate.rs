@@ -12,10 +12,10 @@ use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use gpugrammar_ir::json_schema::{JsonSchemaOptions, json_schema_to_grammar};
-use gpugrammar_lex::lexicon::{extract, terminal_automata_within};
+use gpugrammar_lex::lexicon::{extract_within, terminal_automata_within};
 use gpugrammar_lex::regular::analyze;
 use gpugrammar_lex::{build_lexer_within, group_vocabulary};
-use gpugrammar_lr::cfg::flatten;
+use gpugrammar_lr::cfg::flatten_within;
 use gpugrammar_lr::tables::build;
 use gpugrammar_run::Matcher;
 use gpugrammar_tables::emit;
@@ -60,24 +60,49 @@ fn main() -> Result<()> {
     for (index, instance) in corpus.instances.iter().enumerate() {
         let Ok(grammar) = json_schema_to_grammar(&instance.schema, &JsonSchemaOptions::default())
         else {
+            if std::env::var("GPUGRAMMAR_REPORT").is_ok() {
+                println!("LOWERING {index}");
+            }
             continue;
         };
-        let lexicon = extract(&grammar, &analyze(&grammar));
+        let budget: u64 = std::env::var("GPUGRAMMAR_TERMINAL_BUDGET")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(gpugrammar_lex::lexicon::DEFAULT_TERMINAL_BUDGET);
+        let lexicon = extract_within(&grammar, &analyze(&grammar), budget);
         // A length bound is unrolled into the automaton, so refuse the schema
         // from its declared bounds rather than after building.
         let Some(automata) = terminal_automata_within(&grammar, &lexicon, state_limit as u64)
         else {
             oversized += 1;
+            if std::env::var("GPUGRAMMAR_REPORT").is_ok() {
+                println!("OVERSIZED_ESTIMATE {index}");
+            }
             continue;
         };
         let Some(lexer) = build_lexer_within(automata, state_limit) else {
             oversized += 1;
+            if std::env::var("GPUGRAMMAR_REPORT").is_ok() {
+                println!("OVERSIZED_DFA {index}");
+            }
             continue;
         };
         lexer_states.push(lexer.num_states());
         let groups = group_vocabulary(&lexer, &bytes);
-        let cfg = flatten(&lexicon);
-        let Ok(tables) = build(&cfg) else { continue };
+        let Some(cfg) = flatten_within(&lexicon, gpugrammar_lr::cfg::DEFAULT_PRODUCTION_BUDGET)
+        else {
+            oversized += 1;
+            if std::env::var("GPUGRAMMAR_REPORT").is_ok() {
+                println!("OVERSIZED_CFG {index}");
+            }
+            continue;
+        };
+        let Ok(tables) = build(&cfg) else {
+            if std::env::var("GPUGRAMMAR_REPORT").is_ok() {
+                println!("LR_CONFLICT {index}");
+            }
+            continue;
+        };
         let artifact = Arc::new(emit(&lexicon, &lexer, &groups, &cfg, &tables, bytes.len())?);
         compiled += 1;
 

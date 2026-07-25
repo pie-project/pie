@@ -80,7 +80,32 @@ impl Lexicon {
 ///
 /// A terminal that is a whole rule takes that rule's name, so the ACTION table
 /// reads like the grammar rather than like an arena index.
+/// How large a subtree may be and still become one terminal.
+///
+/// The lexer exists to collapse the vocabulary: many byte strings map to one
+/// terminal, and tokens that emit the same terminals become interchangeable.
+/// A distinction that merges no tokens buys nothing and costs a lexer state,
+/// and a lexer state is expensive - it carries a token bitset per group, so
+/// hundreds of them run to hundreds of megabytes. Measured on JSONSchemaBench,
+/// the schemas that blew up had ten thousand lexer states and 1.3 groups each,
+/// against seventy states and 4.6 groups for the ones that did not: the extra
+/// states collapsed nothing.
+///
+/// So a subtree becomes a terminal only if it fits. Anything larger is left to
+/// the parser, where the same structure costs an ACTION row instead of a
+/// bitset, and where a stack handles counting and rule reuse for free.
+pub const DEFAULT_TERMINAL_BUDGET: u64 = 512;
+
+/// Should this subtree become a single terminal?
+pub fn is_lexical(grammar: &Grammar, expr: ExprId, regularity: &Regularity, budget: u64) -> bool {
+    is_regular_expr(grammar, expr, regularity) && size_estimate(grammar, expr) <= budget
+}
+
 pub fn extract(grammar: &Grammar, regularity: &Regularity) -> Lexicon {
+    extract_within(grammar, regularity, DEFAULT_TERMINAL_BUDGET)
+}
+
+pub fn extract_within(grammar: &Grammar, regularity: &Regularity, budget: u64) -> Lexicon {
     let mut interner = Interner::default();
     let mut skeleton = Vec::new();
     let root = grammar.root_rule();
@@ -93,7 +118,7 @@ pub fn extract(grammar: &Grammar, regularity: &Regularity) -> Lexicon {
     // pipeline needs no special case. Measured on JSONSchemaBench this is 68%
     // of schemas. Testing the root rather than the skeleton matters, because
     // an unreachable non-regular rule would otherwise hide this case.
-    if regularity.is_regular(root) {
+    if is_lexical(grammar, grammar.get_rule(root).body, regularity, budget) {
         let expr = grammar.get_rule(root).body;
         let terminal = if is_terminal_atom(grammar, expr, regularity) {
             interner.intern(grammar, expr)
@@ -117,10 +142,13 @@ pub fn extract(grammar: &Grammar, regularity: &Regularity) -> Lexicon {
 
     for (index, rule) in grammar.rules().iter().enumerate() {
         let id = RuleId(index as u32);
-        if regularity.is_regular(id) {
+        // A lexical rule is interned wherever it is used, so it needs no
+        // skeleton entry. Everything else does, including regular rules too
+        // large for the lexer.
+        if is_lexical(grammar, rule.body, regularity, budget) {
             continue;
         }
-        let body = lower(grammar, rule.body, regularity, &mut interner);
+        let body = lower(grammar, rule.body, regularity, &mut interner, budget);
         skeleton.push(SkeletonRule {
             rule: id,
             name: rule.name.clone(),
@@ -288,6 +316,25 @@ fn terminal_automata_unchecked(grammar: &Grammar, lexicon: &Lexicon) -> Vec<Term
             }
         })
         .collect()
+}
+
+/// Refer to a rule from the skeleton.
+///
+/// A lexical rule has no skeleton entry - it is interned wherever it is used -
+/// so a reference to one has to become a terminal here rather than a
+/// nonterminal that resolves to nothing.
+fn lower_rule(
+    grammar: &Grammar,
+    rule: RuleId,
+    regularity: &Regularity,
+    interner: &mut Interner,
+    budget: u64,
+) -> SkeletonExpr {
+    if is_lexical(grammar, grammar.get_rule(rule).body, regularity, budget) {
+        let terminal = interner.intern_rule(grammar, rule);
+        return optional_if_nullable(interner, terminal);
+    }
+    SkeletonExpr::Nonterminal(rule)
 }
 
 /// Wrap a nullable terminal as `ε | terminal` in the skeleton.
@@ -507,6 +554,7 @@ fn lower(
     expr: ExprId,
     regularity: &Regularity,
     interner: &mut Interner,
+    budget: u64,
 ) -> SkeletonExpr {
     if matches!(grammar.get_expr(expr), Expr::EmptyString) {
         return SkeletonExpr::Empty;
@@ -517,7 +565,7 @@ fn lower(
     // splitting into `'"'`, a body and `'"'` whose body class overlaps every
     // punctuation terminal in the grammar. Adjacent literals in a sequence are
     // still separate, so a lone `{` remains committable.
-    if is_regular_expr(grammar, expr, regularity) {
+    if is_lexical(grammar, expr, regularity, budget) {
         let terminal = interner.intern(grammar, expr);
         return optional_if_nullable(interner, terminal);
     }
@@ -525,18 +573,18 @@ fn lower(
         Expr::Sequence(parts) => SkeletonExpr::Sequence(
             parts
                 .iter()
-                .map(|part| lower(grammar, *part, regularity, interner))
+                .map(|part| lower(grammar, *part, regularity, interner, budget))
                 .collect(),
         ),
         Expr::Choices(alternatives) => SkeletonExpr::Choice(
             alternatives
                 .iter()
-                .map(|alternative| lower(grammar, *alternative, regularity, interner))
+                .map(|alternative| lower(grammar, *alternative, regularity, interner, budget))
                 .collect(),
         ),
-        Expr::RuleRef(target) => SkeletonExpr::Nonterminal(*target),
+        Expr::RuleRef(target) => lower_rule(grammar, *target, regularity, interner, budget),
         Expr::Repeat { rule, min, max } => SkeletonExpr::Repeat {
-            inner: Box::new(SkeletonExpr::Nonterminal(*rule)),
+            inner: Box::new(lower_rule(grammar, *rule, regularity, interner, budget)),
             min: *min,
             max: *max,
         },

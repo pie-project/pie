@@ -38,12 +38,29 @@ impl Cfg {
     }
 }
 
+/// How many productions a grammar may have.
+///
+/// A bounded repeat costs one nonterminal per remaining count in any machine
+/// that keeps the counter in its states, and both the lexer and the parser do.
+/// Moving `x{0,65536}` from one to the other only moves the cost: it became
+/// 131,115 productions here. The real answer is a counter the runtime holds
+/// rather than compiles away; until then the budget says which schemas are out
+/// of reach instead of hanging on them.
+pub const DEFAULT_PRODUCTION_BUDGET: usize = 20_000;
+
 /// Flatten a skeleton into productions.
 pub fn flatten(lexicon: &Lexicon) -> Cfg {
+    flatten_within(lexicon, usize::MAX).expect("no production budget was set")
+}
+
+/// As [`flatten`], but refused past `budget` productions.
+pub fn flatten_within(lexicon: &Lexicon, budget: usize) -> Option<Cfg> {
     let mut builder = Builder {
         productions: Vec::new(),
         names: Vec::new(),
         by_rule: FxHashMap::default(),
+        budget,
+        over_budget: false,
     };
 
     // Reserve a nonterminal per skeleton rule first, so references resolve
@@ -73,18 +90,24 @@ pub fn flatten(lexicon: &Lexicon) -> Cfg {
         .productions
         .retain(|production| seen.insert((production.lhs, production.rhs.clone())));
 
-    Cfg {
+    if builder.over_budget || builder.productions.len() > budget {
+        return None;
+    }
+
+    Some(Cfg {
         productions: builder.productions,
         nonterminal_names: builder.names,
         num_terminals: lexicon.terminals.len(),
         start,
-    }
+    })
 }
 
 struct Builder {
     productions: Vec<Production>,
     names: Vec<String>,
     by_rule: FxHashMap<u32, u32>,
+    budget: usize,
+    over_budget: bool,
 }
 
 impl Builder {
@@ -169,16 +192,38 @@ impl Builder {
                 });
                 head
             }
+            // A chain, not one production per count. Enumerating counts is
+            // quadratic - `x{0,2048}` is 2049 productions totalling two million
+            // symbols - and a bounded repeat is exactly the structure a stack
+            // handles for free. One nonterminal per remaining count, each
+            // production at most two symbols long, is linear.
             Some(max) => {
-                let head = self.fresh(format!("__repeat{}", self.names.len()));
-                for count in min..=max {
-                    let mut rhs = Vec::new();
-                    for _ in 0..count {
-                        rhs.extend(body.clone());
-                    }
-                    self.productions.push(Production { lhs: head, rhs });
+                if self.productions.len() + 2 * max as usize > self.budget {
+                    self.over_budget = true;
+                    return self.fresh(format!("__overbudget{}", self.names.len()));
                 }
-                head
+                let mut next = self.fresh(format!("__repeat{}_{}", self.names.len(), max));
+                self.productions.push(Production {
+                    lhs: next,
+                    rhs: Vec::new(),
+                });
+                for count in (0..max).rev() {
+                    let head = self.fresh(format!("__repeat{}_{}", self.names.len(), count));
+                    let mut taken = body.clone();
+                    taken.push(Symbol::Nonterminal(next));
+                    self.productions.push(Production {
+                        lhs: head,
+                        rhs: taken,
+                    });
+                    if count >= min {
+                        self.productions.push(Production {
+                            lhs: head,
+                            rhs: Vec::new(),
+                        });
+                    }
+                    next = head;
+                }
+                next
             }
         }
     }

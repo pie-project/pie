@@ -49,6 +49,40 @@ All 23 Rust test suites pass. Coverage over 533 real JSONSchemaBench schemas:
 states: median 129, p90 356. The whole corpus compiles and validates in 5.1
 seconds.
 
+## What the lexer is for
+
+It collapses the vocabulary, and that is all. Many byte strings map to one
+terminal — `"abc"`, `"xyz"` and `"hello"` all emit `string` — so tokens that
+emit the same terminals become indistinguishable to the parser and share a
+group. Measured with Qwen3's 151,669 tokens, a lexer state has 1 to 13 groups,
+so a decode step is a handful of ACTION lookups regardless of vocabulary size.
+That is the whole point of the lexer/parser split, and it is why the left half
+of `allowed(token) = lexer_ok(...) AND parser_ok(...)` can be compile-time data.
+
+It follows that **a lexer state that merges no tokens is pure cost**. Each one
+carries a token bitset per group: 19 KB with this vocabulary. The schemas that
+blew up had 10,807 lexer states at 1.3 groups each and cost 252 MB; a
+well-behaved one had 76 states at 4.6 groups and cost 6 MB. The extra states
+were counting string length and distinguishing which use of a rule we were in —
+neither of which merges a single token, and both of which a stack does for free.
+That is what XGrammar gets by having no lexer at all: its grammar keeps
+`{0, 2048}` as a repetition node and its automaton counts at runtime, so the
+grammar is the same size whether the bound is 8 or 2048.
+
+`DEFAULT_TERMINAL_BUDGET` is the knob. A subtree becomes one terminal only if
+it fits; anything larger is left to the parser. Measured over the corpus:
+
+| terminal budget | compiled | accepted | acceptance |
+| --- | --- | --- | --- |
+| 128 | 385 | 212 | 55.1% |
+| 512 | 365 | **265** | 72.6% |
+| 4096 | 280 | 239 | 85.4% |
+| unbounded | 265 | 227 | 85.7% |
+
+Coarse terminals are accurate but do not fit; fine terminals fit but bring back
+the lexical ambiguity that coarse ones removed. The absolute number of schemas
+that both compile and accept peaks at 512, which is the default.
+
 ## What is broken, in priority order
 
 **1. We reject documents we should accept. Acceptance is 85.7%.** Of 265
@@ -70,7 +104,7 @@ Each correctness fix changed the lexicon, and a coarser lexicon means more
 reduce/reduce conflicts. The conflicts are real and unexamined. `gpugrammar-explain`
 dumps the terminals and productions for one schema.
 
-**3. Length bounds explode the lexer.** A DFA can only hold a counter by
+**3. Length bounds explode whatever holds them.** A DFA can only hold a counter by
 unrolling it, so `"maxLength": 2048` over UTF-8 costs about seventy states per
 counted position: one schema asked for 209,001 lexer states. 94 of 533 schemas
 carry a bound, 38 above 256. `build_lexer_within` abandons construction over a
