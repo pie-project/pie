@@ -425,15 +425,12 @@ impl ModelConfig {
 pub struct SchedulerConfig {
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
-    #[serde(default = "default_restore_pause_at_utilization")]
-    pub restore_pause_at_utilization: f64,
 }
 
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
             request_timeout_secs: default_request_timeout_secs(),
-            restore_pause_at_utilization: default_restore_pause_at_utilization(),
         }
     }
 }
@@ -444,19 +441,12 @@ impl SchedulerConfig {
             self.request_timeout_secs > 0,
             "scheduler.request_timeout_secs must be > 0"
         );
-        ensure!(
-            self.restore_pause_at_utilization > 0.0 && self.restore_pause_at_utilization <= 1.0,
-            "scheduler.restore_pause_at_utilization must be in (0.0, 1.0]"
-        );
         Ok(())
     }
 }
 
 fn default_request_timeout_secs() -> u64 {
     120
-}
-fn default_restore_pause_at_utilization() -> f64 {
-    0.85
 }
 
 // -----------------------------------------------------------------------------

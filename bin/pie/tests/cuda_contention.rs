@@ -37,8 +37,8 @@
 //!      the preempt/restore correctness: waiters block + wake, never error.
 //!   2. **Engagement** — the orchestrator's contention counters prove preempt/
 //!      restore actually happened: `waiters_parked > 0` + `waiters_woken > 0`
-//!      (v1 passive backend — a lane OOM'd, parked in the FIFO, and was woken
-//!      when a finisher freed blocks). So a fleet that merely FIT the pool (no
+//!      (a lane's demand outran the pool, parked in the queue, and was woken
+//!      when freed pages covered it). So a fleet that merely FIT the pool (no
 //!      contention) cannot pass trivially. This is what makes ② decisive.
 //!   3. **Transparency (classified)** — no position-0 divergence (prefill/page-0
 //!      corruption) AND no `restore_attributable` divergence (first divergence at
@@ -46,8 +46,7 @@
 //!      band is logged non-gating (non-batch-invariance; see the composite above).
 //!   4. **Active self-suspend** — `suspends > 0 && restores > 0`: victims
 //!      SAVE their own KV state (D2H offload) and RESTORE it (H2D). Preempt
-//!      is always on and always the active tier; this fires on every
-//!      contended profile run.
+//!      is always on; this fires on every contended profile run.
 //!
 //! Construction-based contention proof: the fleet is sized so its combined KV
 //! demand provably exceeds the (small) pool — so if all complete with zero
@@ -91,14 +90,11 @@ use pie_client::client::Client;
 /// A fleet large enough that its combined KV demand exceeds the shrunk pool
 /// (see `SMALL_POOL_GPU_MEM_UTIL`) — forcing the preempt/restore path.
 ///
-/// **Live-tunable via `PIE_CONTENTION_FLEET`** (charlie). Contention is forced by
-/// the explicit KV-page cap (`PIE_CONTENTION_TOTAL_PAGES` → `[batching].total_pages`,
-/// charlie — the cuda driver now HAS a page cap, mirroring metal), so the fleet
-/// just needs `fleet × pages_per_lane > total_pages` (each lane holds ~a handful of
-/// pages). The solo-reference guard confirms a single lane still fits. NOTE: under
-/// v2 active preempt (`PIE_KV_PREEMPT_ACTIVE=1`) sustained fleet=24 is the Phase-2
-/// hardened design point (the ≤12 guard is LIFTED — the f24 deadlock/livelock family
-/// is fixed: step-6, tombstone Join, age-gate, ignition pump).
+/// **Live-tunable via `PIE_CONTENTION_FLEET`**. Contention is forced by the
+/// explicit KV-page cap (`PIE_CONTENTION_TOTAL_PAGES` → `[batching].total_pages`),
+/// so the fleet just needs `fleet × pages_per_lane > total_pages` (each lane
+/// holds ~a handful of pages). The solo-reference guard confirms a single lane
+/// still fits.
 fn fleet_size() -> usize {
     std::env::var("PIE_CONTENTION_FLEET")
         .ok()
@@ -110,9 +106,9 @@ fn fleet_size() -> usize {
 /// fleet's aggregate demand exceeds the small pool. Greedy decode ⇒ deterministic
 /// per prompt, so the solo reference is exact.
 fn prompt(k: usize) -> String {
-    // `PIE_CONTENTION_BUDGET=N` (charlie, capstone C5): emit a bare-int budget so
-    // the generate inferlet decodes N tokens — LONGER-lived lanes sustain KV pool
-    // pressure long enough for the v2 active suspend/restore cycle to reliably
+    // `PIE_CONTENTION_BUDGET=N`: emit a bare-int budget so the generate
+    // inferlet decodes N tokens — LONGER-lived lanes sustain KV pool
+    // pressure long enough for the suspend/restore cycle to reliably
     // engage (5-token lanes finish before contention forms → flaky parked=0).
     // Unset → the original JSON prompt (default 5-token lanes preserved).
     if let Ok(b) = std::env::var("PIE_CONTENTION_BUDGET") {
@@ -527,11 +523,9 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
     // config into the actionable "fix your config" error instead of a
     // non-determinism trap. Without this a
     // fleet that merely FIT the pool (no contention) passes assertions 1+2
-    // trivially. Under the v1 passive backend, engagement = allocation waiters
-    // that PARKED (OOM'd → blocked in acquire's FIFO) and were later WOKEN (a
-    // finisher freed blocks → drain released them → they retried + succeeded);
-    // `suspends`/`restores` are zero-by-design in v1 (they arm with the v2
-    // state-save backend — logged for the record).
+    // trivially. Engagement = allocation waiters that PARKED (demand outran
+    // the pool → blocked in acquire's queue) and were later WOKEN (freed
+    // pages covered them → the drain released them → they succeeded).
     use std::sync::atomic::Ordering;
     let (parked, woken, suspends, restores) = pie_engine::store::reclaim::contention()
         .map(|o| {
@@ -642,9 +636,9 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
     );
 
     // Assertion 4 (active self-suspend): a victim doesn't just park on the
-    // pool — at its own execute_impl entry it SAVES its KV state (D2H
-    // offload) and RESTORES it (H2D) on release, so `suspends`/`restores`
-    // MUST fire. Preempt is always on and always the active tier.
+    // pool — at its next safe point (`yield_point`) it SAVES its KV state
+    // (D2H offload) and RESTORES it (H2D) on release, so `suspends`/
+    // `restores` MUST fire.
     if profile_mode == "contended" {
         assert!(
             suspends > 0 && restores > 0,
@@ -653,7 +647,7 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
              Zero means the active path never ran."
         );
         eprintln!(
-            "[contention] v2 active self-suspend engaged: suspends={suspends} restores={restores} ✓"
+            "[contention] self-suspend engaged: suspends={suspends} restores={restores} ✓"
         );
     }
 

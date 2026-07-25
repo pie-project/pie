@@ -132,7 +132,6 @@ fn build_model(
         drivers,
         scheduler: pie_engine::bootstrap::SchedulerConfig {
             request_timeout_secs: m.scheduler.request_timeout_secs,
-            restore_pause_at_utilization: m.scheduler.restore_pause_at_utilization,
         },
     })
 }

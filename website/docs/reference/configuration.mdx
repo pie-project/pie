@@ -49,7 +49,6 @@ batch_policy = "adaptive"
 request_timeout_secs = 120
 default_endowment_pages = 64
 admission_oversubscription_factor = 1.0
-restore_pause_at_utilization = 0.85
 # default_token_limit = 100000
 
 [model.driver]
@@ -132,7 +131,6 @@ Batch firing + per-process admission/market knobs:
 | `default_token_limit` | unset | Per-process compute cap (tokens) when the launch request doesn't specify one. Unset means no hard cap. Must be `> 0` if set. |
 | `default_endowment_pages` | `64` | Per-process initial endowment in KV pages. Sets the process's claim weight in the bidding market — bigger values guarantee more pages held under contention. Must be `> 0`. |
 | `admission_oversubscription_factor` | `1.0` | How much logical KV memory the market overcommits relative to physical: `Σ endowment ≤ total_pages × factor`. `1.0` = no overbook. Higher values sell more entitlement than physical capacity and are best treated as an explicit workload choice. Must be a finite `> 0` number. |
-| `restore_pause_at_utilization` | `0.85` | Pause restoring suspended processes when any device exceeds this GPU page utilization (`(0.0, 1.0]`). Prevents evict→restore→re-evict thrash. |
 
 ### `[model.driver]`
 

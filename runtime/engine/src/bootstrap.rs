@@ -165,10 +165,6 @@ pub struct DriverConfig {
 pub struct SchedulerConfig {
     /// Wall-clock cap on a single forward-pass request, in seconds.
     pub request_timeout_secs: u64,
-    /// Hard admission gate for the restore loop: pause restoring suspended
-    /// contexts when any driver's GPU page utilization exceeds this fraction.
-    /// Prevents the evict→restore→re-evict thrash cascade. Range: (0.0, 1.0].
-    pub restore_pause_at_utilization: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -536,11 +532,6 @@ fn verify_config(config: &Config) -> Result<()> {
             model.name
         );
     }
-    // (`scheduler.restore_pause_at_utilization` is accepted for config
-    // compatibility but no longer consulted: head-first-claim subsumed the
-    // restore utilization pause — a restore proceeds exactly when it is the
-    // queue head or fits in the surplus beyond the head's accumulation.)
-
     Ok(())
 }
 

@@ -22,16 +22,6 @@ impl pie::inferlet::grammar::Host for ProcessCtx {}
 /// resource impls. echo owns this (central bindgen) since it spans both lanes.
 impl pie::inferlet::working_set::Host for ProcessCtx {}
 
-/// v2 active self-suspend cycle (shared by the victim prologue and the
-/// `SelfSuspendFirst` requester-yield path). Saves `set`'s working set — D2H
-/// offloads its uniquely-owned pages + releases shared refs — reports the freed
-/// blocks to `orch`, parks until the restore phase releases it, then
-/// re-materialises (H2D). Returns the freed block count: **0** means nothing was
-/// suspended (no reclaimable page, or a grace-blocked set) — the caller decides
-/// (the victim prologue `decline_park`s; the requester path just retries). Every
-/// arena/WS lock is dropped before the `.await` park (guru's invariant: hold NO
-/// lock across a park). A restore-race `OutOfBlocks` re-reports the SAME
-/// `freed_now` and re-parks (bounded — fail loud rather than hang).
 pub struct Grammar {
     pub(crate) compiled: Arc<CompiledGrammar>,
 }
