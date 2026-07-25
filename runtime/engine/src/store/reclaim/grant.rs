@@ -21,7 +21,7 @@ pub struct Demand {
 }
 
 impl Demand {
-    pub fn kv(kv_pages: u32) -> Self {
+    pub(super) fn kv(kv_pages: u32) -> Self {
         Self {
             kv_pages,
             rs_slots: 0,
@@ -81,13 +81,12 @@ impl DevicePageReservation {
     }
 
     /// Fold another reservation from the same port into this one
-    /// (head-first-claim accumulation).
+    /// (head-first-claim accumulation). `other` drops empty afterwards.
     pub(super) fn absorb(&mut self, mut other: DevicePageReservation) {
         if self.port.is_none() {
             self.port = other.port.clone();
         }
         self.pages.append(&mut other.pages);
-        other.port = None;
     }
 
     /// Split up to `count` pages off as their own reservation (the head
@@ -180,8 +179,9 @@ impl AllocationGrant {
         }
     }
 
-    /// The ask this grant satisfied (diagnostics; the live remainder is
-    /// [`Self::remaining_kv`]/[`Self::remaining_rs`]).
+    /// The ask this grant satisfied. Load-bearing: `take_allocation_grant`
+    /// checks `covers` against the collector's demand so a smaller duplicate
+    /// caller cannot walk off with a larger aggregate grant.
     pub fn demand(&self) -> Demand {
         self.demand
     }

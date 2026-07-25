@@ -24,7 +24,6 @@ pub(crate) struct ProcessResidency {
 #[derive(Clone)]
 pub(crate) struct ResidencySnapshot {
     pub kv_working_sets: HashSet<(usize, crate::driver::DriverId, WorkingSetId)>,
-    pub rs_working_sets: HashSet<(usize, crate::driver::DriverId, RsWorkingSetId)>,
     pub pipelines: Vec<PendingFires>,
     pub departed_pipeline_ids: Vec<uuid::Uuid>,
 }
@@ -44,17 +43,9 @@ impl ProcessResidency {
     }
 
     pub(crate) fn snapshot(&mut self) -> ResidencySnapshot {
-        let pipelines: Vec<_> = self
-            .pipelines
-            .iter()
-            .filter_map(|pipeline| pipeline.fires.upgrade())
-            .collect();
-        self.pipelines
-            .retain(|pipeline| pipeline.fires.strong_count() > 0);
         ResidencySnapshot {
+            pipelines: self.pipelines(),
             kv_working_sets: self.kv_working_sets.clone(),
-            rs_working_sets: self.rs_working_sets.clone(),
-            pipelines,
             departed_pipeline_ids: Vec::new(),
         }
     }
@@ -63,41 +54,14 @@ impl ProcessResidency {
         let departed_pipeline_ids = self
             .pipelines
             .iter()
-            .filter_map(|pipeline| {
-                pipeline
-                    .scope
-                    .close()
-                    .then(|| pipeline.scope.scheduler_id())
-            })
+            // `close` is the side effect: it claims the departure exactly
+            // once, so a second teardown snapshot reports nothing.
+            .filter(|pipeline| pipeline.scope.close())
+            .map(|pipeline| pipeline.scope.scheduler_id())
             .collect();
         let mut snapshot = self.snapshot();
         snapshot.departed_pipeline_ids = departed_pipeline_ids;
         snapshot
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use super::{ProcessResidency, ResidentPipeline};
-
-    #[test]
-    fn teardown_closes_each_orphan_pipeline_once() {
-        let pipeline = crate::pipeline::Pipeline::new();
-        let pipeline_id = pipeline.scope.scheduler_id();
-        let mut residency = ProcessResidency::default();
-        residency.pipelines.push(ResidentPipeline {
-            scope: pipeline.scope.clone(),
-            fires: Arc::downgrade(&pipeline.fires),
-        });
-
-        let first = residency.teardown_snapshot();
-        assert_eq!(first.departed_pipeline_ids, vec![pipeline_id]);
-        assert!(pipeline.scope.is_closed());
-
-        let second = residency.teardown_snapshot();
-        assert!(second.departed_pipeline_ids.is_empty());
     }
 }
 
@@ -134,7 +98,7 @@ pub(crate) fn kv_exclusive_footprints(
                     residency
                         .kv_working_sets
                         .iter()
-                        .filter_map(|&(m, d, ws)| (m == model && d as usize == driver).then_some(ws))
+                        .filter_map(|&(m, d, ws)| (m == model && d == driver).then_some(ws))
                         .collect(),
                 )
             })
@@ -156,4 +120,29 @@ pub(crate) fn kv_exclusive_footprints(
             })
             .collect()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::{ProcessResidency, ResidentPipeline};
+
+    #[test]
+    fn teardown_closes_each_orphan_pipeline_once() {
+        let pipeline = crate::pipeline::Pipeline::new();
+        let pipeline_id = pipeline.scope.scheduler_id();
+        let mut residency = ProcessResidency::default();
+        residency.pipelines.push(ResidentPipeline {
+            scope: pipeline.scope.clone(),
+            fires: Arc::downgrade(&pipeline.fires),
+        });
+
+        let first = residency.teardown_snapshot();
+        assert_eq!(first.departed_pipeline_ids, vec![pipeline_id]);
+        assert!(pipeline.scope.is_closed());
+
+        let second = residency.teardown_snapshot();
+        assert!(second.departed_pipeline_ids.is_empty());
+    }
 }

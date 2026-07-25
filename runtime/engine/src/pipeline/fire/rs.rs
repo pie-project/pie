@@ -6,13 +6,9 @@
 //! (`rs_slot_ids`, `rs_slot_flags`, pre-launch d2d copy), and the prepared
 //! writes held across the async fire until [`finalize_many`].
 //!
-//! Complete pipeline domain API: some methods here (relaxed geometry
-//! variants, per-channel introspection, the pure `instantiate`/registry
-//! probe entry points, device-geometry lease internals) are not yet
-//! called by the current single-model/mock-driver fire path, but are
-//! exercised by this module's own unit tests and reserved for upcoming
-//! wiring (multi-pass channels, device-geometry beams) — kept rather
-//! than deleted, allowed rather than silently masked.
+//! The allow below covers exactly the singular test-exercised convenience
+//! wrappers ([`prepare`], [`finalize`]) around the `_many` production
+//! entries — kept rather than deleted, allowed rather than silently masked.
 #![allow(dead_code)]
 
 use crate::store::rs::write::RsPreparedWrite;
@@ -61,15 +57,18 @@ pub fn demand(store: &RsStore, working_sets: &[RsWorkingSetId]) -> Result<usize,
     Ok(total)
 }
 
-/// Prepare the in-forward folded-state write. Returns
-/// `(rs_slot_ids, rs_slot_flags, (copy_src, copy_dst), txns)`: thread the ids
-/// and flags into the launch in request order, issue one aggregated state-copy
-/// command before the launch when non-empty, hold all `txns` across the fire,
-/// then [`finalize_many`].
+/// Driver lowering for prepared folded-state writes:
+/// `(rs_slot_ids, rs_slot_flags, (copy_src, copy_dst), txns)`.
+pub type PreparedRs = (Vec<u32>, Vec<u8>, (Vec<u32>, Vec<u32>), Vec<RsTxn>);
+
+/// Prepare the in-forward folded-state write. Returns [`PreparedRs`]: thread
+/// the ids and flags into the launch in request order, issue one aggregated
+/// state-copy command before the launch when non-empty, hold all `txns`
+/// across the fire, then [`finalize_many`].
 pub fn prepare_many(
     store: &mut RsStore,
     working_sets: &[RsWorkingSetId],
-) -> Result<(Vec<u32>, Vec<u8>, (Vec<u32>, Vec<u32>), Vec<RsTxn>), String> {
+) -> Result<PreparedRs, String> {
     prepare_many_impl(store, working_sets, None)
 }
 
@@ -79,7 +78,7 @@ pub fn prepare_many_reserved(
     store: &mut RsStore,
     working_sets: &[RsWorkingSetId],
     granted: &mut Vec<crate::store::rs::RsSlotId>,
-) -> Result<(Vec<u32>, Vec<u8>, (Vec<u32>, Vec<u32>), Vec<RsTxn>), String> {
+) -> Result<PreparedRs, String> {
     prepare_many_impl(store, working_sets, Some(granted))
 }
 
@@ -87,7 +86,7 @@ fn prepare_many_impl(
     store: &mut RsStore,
     working_sets: &[RsWorkingSetId],
     mut granted: Option<&mut Vec<crate::store::rs::RsSlotId>>,
-) -> Result<(Vec<u32>, Vec<u8>, (Vec<u32>, Vec<u32>), Vec<RsTxn>), String> {
+) -> Result<PreparedRs, String> {
     for (index, ws) in working_sets.iter().enumerate() {
         if working_sets[..index].contains(ws) {
             return Err(format!(
@@ -103,7 +102,7 @@ fn prepare_many_impl(
     let mut txns = Vec::with_capacity(working_sets.len());
     for &ws in working_sets {
         let prepared = match granted.as_deref_mut() {
-            Some(granted) => store.prepare_write_reserved(ws, true, None, granted),
+            Some(granted) => store.prepare_write_reserved(ws, granted),
             None => store.prepare_write(ws, true, None),
         };
         let prepared = match prepared {
@@ -143,12 +142,8 @@ pub fn prepare(
     ))
 }
 
-/// Abandon a fire's prepared RS write (guest dropped the working set while
+/// Abandon fires' prepared RS writes (guest dropped the working set while
 /// the fire was in flight).
-pub fn abandon(store: &mut RsStore, txn: RsTxn) {
-    abandon_many(store, vec![txn]);
-}
-
 pub fn abandon_many(store: &mut RsStore, txns: Vec<RsTxn>) {
     let Some(seq) = txns.iter().map(|txn| txn.prepared.seq()).max() else {
         return;

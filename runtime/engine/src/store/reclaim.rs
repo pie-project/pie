@@ -96,7 +96,8 @@ pub(crate) fn set_pipeline_leave_hook(hook: impl Fn(ProcessId, LeaveKind) + Send
 pub struct ContentionConfig {
     /// The single system-wide progress deadline: how long the queue head may
     /// go without ANY progress toward it before the escalation ladder's
-    /// final rungs fire (fail-loud today; D7 kill lands with B6).
+    /// final rungs fire (D7: kill the youngest-necessary victim; fail loud
+    /// only when no younger work remains).
     pub exhaustion: Duration,
     /// Restore attempts per grant before the failure surfaces.
     pub restore_retries: u32,
@@ -124,8 +125,7 @@ impl ContentionConfig {
             restore_retries: std::env::var("PIE_KV_RESTORE_RETRIES")
                 .ok()
                 .and_then(|value| value.parse().ok())
-                .unwrap_or(defaults.restore_retries)
-                .max(1),
+                .unwrap_or(defaults.restore_retries),
         }
     }
 }
@@ -152,7 +152,10 @@ pub trait PoolPort: Send + Sync + 'static {
     /// machinery derives its store and scheduler targets from this instead
     /// of hardwiring `(0, 0)`.
     fn locus(&self) -> (usize, usize);
-    fn reserve_device(&self, count: u32) -> Option<Vec<crate::store::kv::page_table::PhysicalKvPageId>>;
+    fn reserve_device(
+        &self,
+        count: u32,
+    ) -> Option<Vec<crate::store::kv::page_table::PhysicalKvPageId>>;
     fn release_device(&self, pages: Vec<crate::store::kv::page_table::PhysicalKvPageId>);
     fn reserve_rs(&self, count: u32) -> Option<Vec<crate::store::rs::RsSlotId>>;
     fn release_rs(&self, slots: Vec<crate::store::rs::RsSlotId>);
@@ -280,14 +283,13 @@ impl std::error::Error for ContentionError {}
 pub struct ContentionStats {
     /// `acquire` calls that parked in the queue (demand not met immediately).
     pub waiters_parked: AtomicU64,
-    /// Parked acquires that returned satisfied.
+    /// Acquires that collected an issued grant (parked or not — pair with
+    /// [`Self::waiters_parked`] for the engagement proof).
     pub waiters_woken: AtomicU64,
     /// Victims whose state-save freed pages (`report_suspended`).
     pub suspends: AtomicU64,
     /// Suspended processes restored back to Running.
     pub restores: AtomicU64,
-    pub allocation_grants: AtomicU64,
-    pub restore_grants: AtomicU64,
     pub cancelled_waits: AtomicU64,
     pub exhaustion_timeouts: AtomicU64,
     pub grace_deferred: AtomicU64,
@@ -300,7 +302,8 @@ pub struct ContentionStats {
     pub host_swap_exhaustions: AtomicU64,
     pub restore_prepared: AtomicU64,
     pub h2d_submitted: AtomicU64,
-    /// Suspended → restore-grant-issued waits (µs total; count = restore_grants).
+    /// Suspended → restore-grant-issued waits (µs total across issued
+    /// restore grants).
     pub restore_wait_us: AtomicU64,
     /// Restore-grant-issued → rejoined-running turnarounds (µs total).
     pub restore_turnaround_us: AtomicU64,
@@ -310,7 +313,7 @@ pub struct ContentionStats {
     pub deadline_kills: AtomicU64,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone)]
 pub struct ContentionQueueEntry {
     pub process_id: String,
     pub submit_seq: u64,
@@ -319,9 +322,8 @@ pub struct ContentionQueueEntry {
     pub granted: bool,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone)]
 pub struct ContentionDiagnostics {
-    pub processes: Vec<ContentionQueueEntry>,
     pub waiters: Vec<ContentionQueueEntry>,
     pub suspended: Vec<ContentionQueueEntry>,
     pub device_pages_free: u32,
@@ -329,13 +331,10 @@ pub struct ContentionDiagnostics {
     pub device_pages_reserved: u32,
     pub host_slots_free: u32,
     pub host_slots_total: u32,
-    pub park_requests_current: usize,
     pub waiters_parked_total: u64,
     pub waiters_woken_total: u64,
     pub suspends_total: u64,
     pub restores_total: u64,
-    pub allocation_grants_total: u64,
-    pub restore_grants_total: u64,
     pub cancelled_waits_total: u64,
     pub exhaustion_timeouts_total: u64,
     pub grace_deferred_total: u64,
@@ -356,7 +355,12 @@ pub struct ContentionDiagnostics {
 
 /// Queue `pid`'s restore entry at its spawn position (idempotent — a
 /// re-queued restore keeps one entry, one demand, a fresh suspended_at).
-fn enqueue_restore(inner: &mut Inner, pid: ProcessId, seq: u64, demand: Demand) {
+/// Reads the seq and restore demand off the registered process.
+fn enqueue_restore(inner: &mut Inner, pid: ProcessId) {
+    let Some(proc) = inner.procs.get(&pid) else {
+        return;
+    };
+    let (seq, demand) = (proc.seq, Demand::kv(proc.restore_demand));
     if inner.queue.find_restore(pid).is_some() {
         return;
     }
@@ -380,19 +384,15 @@ fn micros(elapsed: Duration) -> u64 {
     elapsed.as_micros().min(u128::from(u64::MAX)) as u64
 }
 
-/// A restore grant issued by the drain, parked until its process collects it.
-struct IssuedRestore {
-    grant: AllocationGrant,
-    issued_at: Instant,
-}
-
 #[derive(Default)]
 struct Inner {
     next_seq: u64,
     next_entry_id: u64,
     procs: HashMap<ProcessId, Proc>,
     queue: Queue,
-    restore_grants: HashMap<ProcessId, IssuedRestore>,
+    /// Restore grants issued by the drain, parked until their processes
+    /// collect them (`Proc::restoring_since` stamps the issue instant).
+    restore_grants: HashMap<ProcessId, AllocationGrant>,
     /// The single progress clock: armed for the queue head, reset by any
     /// progress toward it. `(head entry key, armed at)`.
     progress: Option<(EntryKey, Instant)>,
@@ -436,8 +436,7 @@ pub type KillHook = Box<dyn Fn(ProcessId, String) + Send + Sync>;
 /// selection, probed as a BATCH so the whole pass costs one store-lock
 /// round trip. Installed by bootstrap (it crosses layers the store must not
 /// name).
-pub type FootprintProbe =
-    Box<dyn Fn(&[ProcessId], usize, usize) -> Vec<Option<u32>> + Send + Sync>;
+pub type FootprintProbe = Box<dyn Fn(&[ProcessId], usize, usize) -> Vec<Option<u32>> + Send + Sync>;
 
 pub struct ContentionOrchestrator {
     inner: Mutex<Inner>,
@@ -456,6 +455,27 @@ struct VictimCandidate {
     pid: ProcessId,
     seq: u64,
     idle: bool,
+}
+
+/// The victim eligibility rule shared by escalation and the breach ladder:
+/// younger than the head, not already being killed, and in a state the
+/// caller accepts (rung 1 wants Running; the breach ladder also targets the
+/// provably-uncooperative ParkRequested class).
+fn victim_candidates(
+    inner: &Inner,
+    head_seq: u64,
+    accept: impl Fn(ProcState) -> bool,
+) -> Vec<VictimCandidate> {
+    inner
+        .procs
+        .iter()
+        .filter(|(_, proc)| !proc.killed && proc.seq > head_seq && accept(proc.state))
+        .map(|(pid, proc)| VictimCandidate {
+            pid: *pid,
+            seq: proc.seq,
+            idle: proc.idle,
+        })
+        .collect()
 }
 
 /// What a progress-deadline breach escalated to (D7).
@@ -609,7 +629,7 @@ impl ContentionOrchestrator {
         }
     }
 
-    pub fn is_registered(&self, pid: ProcessId) -> bool {
+    fn is_registered(&self, pid: ProcessId) -> bool {
         self.inner.lock().unwrap().procs.contains_key(&pid)
     }
 
@@ -718,11 +738,11 @@ impl ContentionOrchestrator {
         if ready() {
             return None;
         }
-        let Some(deadline) = key.and_then(|key| self.head_deadline(key)) else {
+        let deadline = key.and_then(|key| self.head_deadline(key).map(|deadline| (key, deadline)));
+        let Some((key, deadline)) = deadline else {
             notified.await;
             return None;
         };
-        let key = key.expect("deadline implies key");
         let sleep = tokio::time::sleep(deadline.saturating_duration_since(Instant::now()));
         tokio::pin!(sleep);
         tokio::select! {
@@ -845,11 +865,11 @@ impl ContentionOrchestrator {
             if entry.pid != pid {
                 return None;
             }
-            if let EntryKind::Allocation { waiters, .. } = &mut entry.kind {
-                if *waiters > 1 {
-                    *waiters -= 1;
-                    return None;
-                }
+            if let EntryKind::Allocation { waiters, .. } = &mut entry.kind
+                && *waiters > 1
+            {
+                *waiters -= 1;
+                return None;
             }
             inner.queue.remove(&key)
         });
@@ -896,19 +916,16 @@ impl ContentionOrchestrator {
                 }
                 proc.signal.clone()
             };
-            let notified = signal.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            {
+            // Settled = running again or unregistered; the next loop pass
+            // (re-checking under the lock) tells the two apart.
+            let settled = || {
                 let inner = self.inner.lock().unwrap();
-                let Some(proc) = inner.procs.get(&pid) else {
-                    return Err(ContentionError::Cancelled);
-                };
-                if proc.state == ProcState::Running {
-                    return Ok(());
-                }
-            }
-            notified.await;
+                inner
+                    .procs
+                    .get(&pid)
+                    .is_none_or(|proc| proc.state == ProcState::Running)
+            };
+            self.await_service(&signal, None, settled).await;
         }
     }
 
@@ -1010,11 +1027,9 @@ impl ContentionOrchestrator {
                     match outcome {
                         FinishOutcome::Granted(notify) => {
                             notify.notify_waiters();
-                            self.stats.allocation_grants.fetch_add(1, Ordering::Relaxed);
                         }
                         FinishOutcome::RestoreIssued { signal, waited } => {
                             signal.notify_waiters();
-                            self.stats.restore_grants.fetch_add(1, Ordering::Relaxed);
                             self.stats
                                 .restore_wait_us
                                 .fetch_add(micros(waited), Ordering::Relaxed);
@@ -1049,13 +1064,14 @@ impl ContentionOrchestrator {
                     .is_some_and(|proc| proc.state.apply(ProcEvent::GrantRestore).is_ok());
                 if !ready {
                     // Teardown raced the grant; drop the stale entry too.
-                    let stale = inner.queue.remove(&key);
+                    let stale = inner.queue.remove(&key).map(Box::new);
                     return FinishOutcome::Vanished(rs_reservation, stale);
                 }
             }
             inner.progress = None; // a grant is progress by definition
-            // §8: a physical page is in exactly one place — the accumulation
-            // must match the demand exactly (Device fills never overshoot).
+            // §8: a physical page is in exactly one place — the Device-fill
+            // clamp above returns any concurrent-drain overshoot, so by
+            // Finish time the accumulation equals the demand exactly.
             debug_assert_eq!(entry.kv_accum.len() as u32, entry.demand.kv_pages);
             if matches!(entry.kind, EntryKind::Restore { .. }) {
                 let mut entry = inner.queue.remove(&key).expect("entry present");
@@ -1070,14 +1086,9 @@ impl ContentionOrchestrator {
                     .state
                     .apply(ProcEvent::GrantRestore)
                     .expect("validated above");
+                proc.restoring_since = Some(Instant::now());
                 let signal = proc.signal.clone();
-                inner.restore_grants.insert(
-                    pid,
-                    IssuedRestore {
-                        grant,
-                        issued_at: Instant::now(),
-                    },
-                );
+                inner.restore_grants.insert(pid, grant);
                 return FinishOutcome::RestoreIssued {
                     signal,
                     waited: suspended_at.elapsed(),
@@ -1127,19 +1138,7 @@ impl ContentionOrchestrator {
             if missing == 0 {
                 return None; // the head only waits for RS or collection
             }
-            let head_seq = key.0;
-            let candidates: Vec<VictimCandidate> = inner
-                .procs
-                .iter()
-                .filter(|(_, proc)| {
-                    proc.state == ProcState::Running && !proc.killed && proc.seq > head_seq
-                })
-                .map(|(pid, proc)| VictimCandidate {
-                    pid: *pid,
-                    seq: proc.seq,
-                    idle: proc.idle,
-                })
-                .collect();
+            let candidates = victim_candidates(inner, key.0, |state| state == ProcState::Running);
             (!candidates.is_empty()).then_some((missing, candidates))
         }) else {
             return;
@@ -1224,23 +1223,9 @@ impl ContentionOrchestrator {
                 return None; // the breach went stale under us
             }
             let head_seq = head_key.0;
-            let mut uncooperative: Vec<VictimCandidate> = Vec::new();
-            let mut running: Vec<VictimCandidate> = Vec::new();
-            for (pid, proc) in inner.procs.iter() {
-                if proc.killed || proc.seq <= head_seq {
-                    continue;
-                }
-                let candidate = VictimCandidate {
-                    pid: *pid,
-                    seq: proc.seq,
-                    idle: proc.idle,
-                };
-                match proc.state {
-                    ProcState::ParkRequested => uncooperative.push(candidate),
-                    ProcState::Running => running.push(candidate),
-                    _ => {}
-                }
-            }
+            let uncooperative =
+                victim_candidates(inner, head_seq, |state| state == ProcState::ParkRequested);
+            let running = victim_candidates(inner, head_seq, |state| state == ProcState::Running);
             Some((entry.kv_missing(), uncooperative, running))
         }) else {
             return BreachAction::FailLoud;
@@ -1301,11 +1286,11 @@ impl ContentionOrchestrator {
             }
             let mut signals = Vec::new();
             for proc in inner.procs.values_mut() {
-                if proc.state == ProcState::ParkRequested {
-                    if let Ok(next) = proc.state.apply(ProcEvent::DeclinePark) {
-                        proc.state = next;
-                        signals.push(proc.signal.clone());
-                    }
+                if proc.state == ProcState::ParkRequested
+                    && let Ok(next) = proc.state.apply(ProcEvent::DeclinePark)
+                {
+                    proc.state = next;
+                    signals.push(proc.signal.clone());
                 }
             }
             signals
@@ -1472,8 +1457,7 @@ impl ContentionOrchestrator {
             };
             proc.state = next;
             proc.restore_demand = freed_now;
-            let seq = proc.seq;
-            enqueue_restore(inner, pid, seq, Demand::kv(freed_now));
+            enqueue_restore(inner, pid);
             inner.progress = None; // a suspend IS progress toward the head
             true
         });
@@ -1501,11 +1485,8 @@ impl ContentionOrchestrator {
                 Park(Arc<Notify>, Option<EntryKey>),
             }
             let wait = self.with_inner(|inner| {
-                if let Some(issued) = inner.restore_grants.remove(&pid) {
-                    if let Some(proc) = inner.procs.get_mut(&pid) {
-                        proc.restoring_since = Some(issued.issued_at);
-                    }
-                    return Wait::Ready(Box::new(issued.grant));
+                if let Some(grant) = inner.restore_grants.remove(&pid) {
+                    return Wait::Ready(Box::new(grant));
                 }
                 let Some(proc) = inner.procs.get(&pid) else {
                     return Wait::Gone;
@@ -1526,8 +1507,7 @@ impl ContentionOrchestrator {
                 .await_service(&signal, key, || self.restore_ready(pid))
                 .await
             {
-                let removed =
-                    self.with_inner(|inner| key.and_then(|key| inner.queue.remove(&key)));
+                let removed = self.with_inner(|inner| key.and_then(|key| inner.queue.remove(&key)));
                 drop(removed);
                 // The failed head's accumulation just returned to the pool:
                 // route it to the next head.
@@ -1586,9 +1566,7 @@ impl ContentionOrchestrator {
             };
             proc.state = next;
             proc.restoring_since = None;
-            let seq = proc.seq;
-            let demand = Demand::kv(proc.restore_demand);
-            enqueue_restore(inner, pid, seq, demand);
+            enqueue_restore(inner, pid);
         });
         self.drain();
     }
@@ -1639,24 +1617,6 @@ impl ContentionOrchestrator {
         let (device_pages_free, device_pages_total) = self.port.device_stats();
         let (host_slots_free, host_slots_total) = self.port.host_stats();
         let inner = self.inner.lock().unwrap();
-        let mut processes: Vec<_> = inner
-            .procs
-            .iter()
-            .map(|(pid, proc)| ContentionQueueEntry {
-                process_id: pid.to_string(),
-                submit_seq: proc.seq,
-                state: match proc.state {
-                    ProcState::Running => "running",
-                    ProcState::ParkRequested => "park-requested",
-                    ProcState::Quiescing => "quiescing",
-                    ProcState::Suspended => "suspended",
-                    ProcState::Restoring => "restoring",
-                },
-                pages: proc.restore_demand,
-                granted: inner.restore_grants.contains_key(pid),
-            })
-            .collect();
-        processes.sort_by_key(|entry| entry.submit_seq);
         let mut waiters: Vec<_> = inner
             .queue
             .iter()
@@ -1675,9 +1635,7 @@ impl ContentionOrchestrator {
         let mut suspended: Vec<_> = inner
             .procs
             .iter()
-            .filter(|(_, proc)| {
-                matches!(proc.state, ProcState::Suspended | ProcState::Restoring)
-            })
+            .filter(|(_, proc)| matches!(proc.state, ProcState::Suspended | ProcState::Restoring))
             .map(|(pid, proc)| ContentionQueueEntry {
                 process_id: pid.to_string(),
                 submit_seq: proc.seq,
@@ -1707,17 +1665,11 @@ impl ContentionOrchestrator {
                 inner
                     .restore_grants
                     .values()
-                    .map(|issued| issued.grant.remaining_kv() as u32),
+                    .map(|grant| grant.remaining_kv() as u32),
             )
             .sum();
-        let park_requests_current = inner
-            .procs
-            .values()
-            .filter(|proc| proc.state == ProcState::ParkRequested)
-            .count();
         use Ordering::Relaxed;
         ContentionDiagnostics {
-            processes,
             waiters,
             suspended,
             device_pages_free,
@@ -1725,13 +1677,10 @@ impl ContentionOrchestrator {
             device_pages_reserved,
             host_slots_free,
             host_slots_total,
-            park_requests_current,
             waiters_parked_total: self.stats.waiters_parked.load(Relaxed),
             waiters_woken_total: self.stats.waiters_woken.load(Relaxed),
             suspends_total: self.stats.suspends.load(Relaxed),
             restores_total: self.stats.restores.load(Relaxed),
-            allocation_grants_total: self.stats.allocation_grants.load(Relaxed),
-            restore_grants_total: self.stats.restore_grants.load(Relaxed),
             cancelled_waits_total: self.stats.cancelled_waits.load(Relaxed),
             exhaustion_timeouts_total: self.stats.exhaustion_timeouts.load(Relaxed),
             grace_deferred_total: self.stats.grace_deferred.load(Relaxed),
@@ -1751,29 +1700,35 @@ impl ContentionOrchestrator {
         }
     }
 
+    /// Coarse pressure signal for the worker heartbeat. Computed from the
+    /// pool stats plus two flags under one lock — never via the full
+    /// [`Self::diagnostics`] snapshot (this rides the heartbeat path).
     pub fn kv_pressure_bucket(&self) -> u8 {
-        let diagnostics = self.diagnostics();
-        let device_used = diagnostics
-            .device_pages_total
-            .saturating_sub(diagnostics.device_pages_free);
-        let device_ratio = if diagnostics.device_pages_total == 0 {
-            0.0
-        } else {
-            f64::from(device_used) / f64::from(diagnostics.device_pages_total)
+        let (device_free, device_total) = self.port.device_stats();
+        let (host_free, host_total) = self.port.host_stats();
+        let ratio = |free: u32, total: u32| {
+            if total == 0 {
+                0.0
+            } else {
+                f64::from(total.saturating_sub(free)) / f64::from(total)
+            }
         };
-        let host_used = diagnostics
-            .host_slots_total
-            .saturating_sub(diagnostics.host_slots_free);
-        let host_ratio = if diagnostics.host_slots_total == 0 {
-            0.0
-        } else {
-            f64::from(host_used) / f64::from(diagnostics.host_slots_total)
+        let (has_waiters, has_suspended) = {
+            let inner = self.inner.lock().unwrap();
+            let (allocations, _) = inner.queue.counts();
+            let suspended = inner
+                .procs
+                .values()
+                .any(|proc| matches!(proc.state, ProcState::Suspended | ProcState::Restoring));
+            (allocations > 0, suspended)
         };
-        let mut bucket = (device_ratio.max(host_ratio) * 255.0).round() as u8;
-        if !diagnostics.suspended.is_empty() {
+        let mut bucket = (ratio(device_free, device_total).max(ratio(host_free, host_total))
+            * 255.0)
+            .round() as u8;
+        if has_suspended {
             bucket = bucket.max(224);
         }
-        if !diagnostics.waiters.is_empty() {
+        if has_waiters {
             bucket = bucket.max(240);
         }
         bucket
@@ -1788,16 +1743,17 @@ enum FinishOutcome {
     },
     /// The entry vanished or went stale under the race; the drain drops the
     /// returned reservation (and any stale entry) OUTSIDE the lock.
-    Vanished(RsSlotReservation, Option<Entry>),
+    Vanished(RsSlotReservation, Option<Box<Entry>>),
 }
 
 // =============================================================================
 // Registry-owned instances, per (model, driver)
 // =============================================================================
 
+type OrchestratorMap = HashMap<(usize, usize), Arc<ContentionOrchestrator>>;
+
 static PRIMARY: OnceLock<Arc<ContentionOrchestrator>> = OnceLock::new();
-static ORCHESTRATORS: OnceLock<RwLock<HashMap<(usize, usize), Arc<ContentionOrchestrator>>>> =
-    OnceLock::new();
+static ORCHESTRATORS: OnceLock<RwLock<OrchestratorMap>> = OnceLock::new();
 
 /// Install the orchestrator for `(model, driver)` (bootstrap, once per pair).
 pub fn init_contention(model: usize, driver: usize, orchestrator: ContentionOrchestrator) {
@@ -2092,12 +2048,7 @@ mod tests {
         assert!(!orch.should_park(head));
         // The victim's own entry was displaced.
         let inner = orch.inner.lock().unwrap();
-        assert!(
-            inner
-                .queue
-                .iter()
-                .all(|(_, entry)| entry.pid != younger)
-        );
+        assert!(inner.queue.iter().all(|(_, entry)| entry.pid != younger));
     }
 
     #[test]
@@ -2120,9 +2071,7 @@ mod tests {
         let second = ProcessId::new_v4();
         orch.register(second);
         let (first_key, _) = orch.register_waiter(first, first, Demand::kv(2)).unwrap();
-        let (second_key, _) = orch
-            .register_waiter(second, second, Demand::kv(2))
-            .unwrap();
+        let (second_key, _) = orch.register_waiter(second, second, Demand::kv(2)).unwrap();
         orch.drain();
         assert_eq!(pool.free.load(Ordering::SeqCst), 0);
         assert!(orch.grant_ready(first_key));
@@ -2171,8 +2120,14 @@ mod tests {
         orch.drain();
         let (same_key, _) = orch.register_waiter(pid, pid, Demand::kv(4)).unwrap();
         assert_eq!(key, same_key);
-        assert!(orch.take_allocation_grant(pid, key, Demand::kv(4)).is_none());
-        assert!(orch.take_allocation_grant(pid, key, Demand::kv(2)).is_some());
+        assert!(
+            orch.take_allocation_grant(pid, key, Demand::kv(4))
+                .is_none()
+        );
+        assert!(
+            orch.take_allocation_grant(pid, key, Demand::kv(2))
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -2343,7 +2298,9 @@ mod tests {
         ]));
         orch.set_footprint_probe(move |pids, _, _| {
             let footprints = footprints.lock().unwrap();
-            pids.iter().map(|pid| footprints.get(pid).copied()).collect()
+            pids.iter()
+                .map(|pid| footprints.get(pid).copied())
+                .collect()
         });
         let _ = orch.register_waiter(head, head, Demand::kv(3)).unwrap();
         orch.escalate();

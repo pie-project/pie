@@ -349,15 +349,15 @@ impl RsStore {
 
     /// Prepare a folded-state write from caller-owned reserved slots,
     /// consuming exactly the required prefix of `granted` (lend semantics:
-    /// failure consumes nothing, surplus stays caller-owned).
+    /// failure consumes nothing, surplus stays caller-owned). Always a
+    /// `write_state` prepare — the reserved path exists only for the fire's
+    /// folded-slot write.
     pub fn prepare_write_reserved(
         &mut self,
         ws: RsWorkingSetId,
-        write_state: bool,
-        buffer_tokens: Option<(u32, u32)>,
         granted: &mut Vec<RsSlotId>,
     ) -> Result<RsPreparedWrite, RsError> {
-        self.prepare(ws, write_state, None, buffer_tokens, Some(granted))
+        self.prepare(ws, true, None, None, Some(granted))
     }
 
     /// Phase-A demand: slots a folded-state write for `ws` would allocate

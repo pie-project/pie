@@ -159,9 +159,8 @@ pub(crate) fn defer_resource_teardown(
         // batch is posted only after `drop(context)` below: the drop's pass
         // teardowns post the instance closes first, and per-producer FIFO
         // then keeps the driver's instance-before-channel close order.
-        let channel_close_batches = crate::pipeline::channel::detach_channel_close_notifications(
-            &mut context.resources,
-        );
+        let channel_close_batches =
+            crate::pipeline::channel::detach_channel_close_notifications(&mut context.resources);
         if capped_execution {
             // Announce the slot BEFORE the permit drops (with `context`
             // below): the successor can only acquire after the drop, so its
@@ -193,6 +192,21 @@ pub(crate) fn defer_resource_teardown(
 enum ResidencyTxn {
     Suspend(KvSuspendTxn),
     Restore(KvRestoreTxn),
+}
+
+/// Abort a residency transaction against its store — the one rollback
+/// dispatch, shared by the sync path (guard drop with no copy in flight)
+/// and the deferred copy-completion path.
+fn abort_residency_txn(model: usize, driver: usize, txn: ResidencyTxn) {
+    let stores = crate::store::registry::get(model, driver);
+    let tag = match &txn {
+        ResidencyTxn::Suspend(_) => "preemption-suspend",
+        ResidencyTxn::Restore(_) => "preemption-restore",
+    };
+    crate::store::registry::with_kv_lock(&stores.kv, tag, |kv| match txn {
+        ResidencyTxn::Suspend(txn) => kv.abort_suspend(txn),
+        ResidencyTxn::Restore(txn) => kv.abort_restore(txn),
+    });
 }
 
 struct ResidencyTxnGuard {
@@ -243,19 +257,19 @@ impl ResidencyTxnGuard {
         }
     }
 
+    /// The driver copy plan `(gpu_ids, host_slots)` of the held transaction
+    /// — both variants carry one; the constructor fixed which.
+    fn copy_plan(&self) -> (Vec<u32>, Vec<u32>) {
+        match self.txn.as_ref().expect("transaction present") {
+            ResidencyTxn::Suspend(txn) => (txn.gpu_ids(), txn.host_slots()),
+            ResidencyTxn::Restore(txn) => (txn.gpu_ids(), txn.host_slots()),
+        }
+    }
+
     fn abort_now(&mut self) {
-        let Some(txn) = self.txn.take() else {
-            return;
-        };
-        let stores = crate::store::registry::get(self.model, self.driver);
-        let tag = match &txn {
-            ResidencyTxn::Suspend(_) => "preemption-suspend",
-            ResidencyTxn::Restore(_) => "preemption-restore",
-        };
-        crate::store::registry::with_kv_lock(&stores.kv, tag, |kv| match txn {
-            ResidencyTxn::Suspend(txn) => kv.abort_suspend(txn),
-            ResidencyTxn::Restore(txn) => kv.abort_restore(txn),
-        });
+        if let Some(txn) = self.txn.take() {
+            abort_residency_txn(self.model, self.driver, txn);
+        }
     }
 }
 
@@ -265,8 +279,7 @@ impl Drop for ResidencyTxnGuard {
             return;
         };
         let Some(completion) = self.completion.take() else {
-            self.txn = Some(txn);
-            self.abort_now();
+            abort_residency_txn(self.model, self.driver, txn);
             return;
         };
         let model = self.model;
@@ -282,15 +295,7 @@ impl Drop for ResidencyTxnGuard {
         };
         runtime.spawn(async move {
             let _ = completion.wait().await;
-            let stores = crate::store::registry::get(model, driver);
-            let tag = match &txn {
-                ResidencyTxn::Suspend(_) => "preemption-suspend",
-                ResidencyTxn::Restore(_) => "preemption-restore",
-            };
-            crate::store::registry::with_kv_lock(&stores.kv, tag, |kv| match txn {
-                ResidencyTxn::Suspend(txn) => kv.abort_suspend(txn),
-                ResidencyTxn::Restore(txn) => kv.abort_restore(txn),
-            });
+            abort_residency_txn(model, driver, txn);
             if let Some(orchestrator) = crate::store::reclaim::contention() {
                 orchestrator.on_blocks_freed();
             }
@@ -452,16 +457,11 @@ async fn yield_point_at(at: &mut SafePoint<'_>) -> Result<bool> {
     let working_sets: HashSet<WorkingSetId> = snapshot
         .kv_working_sets
         .iter()
-        .filter_map(|&(m, d, ws)| (m == model && d as usize == driver).then_some(ws))
+        .filter_map(|&(m, d, ws)| (m == model && d == driver).then_some(ws))
         .collect();
     if working_sets.is_empty() {
         return Ok(true); // honored with nothing to save; the guard declines
     }
-    tracing::debug!(
-        pid = %pid,
-        rs_working_sets = snapshot.rs_working_sets.len(),
-        "quiesced for KV-only suspension; recurrent state remains resident"
-    );
     if !suspend_at_safe_point(&mut park, orchestrator, model, driver, pid, &working_sets).await? {
         return Ok(false); // nothing to yield right now; the guard declines
     }
@@ -547,16 +547,13 @@ pub(crate) async fn serialize_under_contention(ctx: &mut ProcessCtx) -> Result<(
             return Ok(());
         }
         drain_preemption_safe_fires(ctx).await?;
-        let progress = ctx
-            .residency_pipelines()
-            .into_iter()
-            .find_map(|fires| {
-                fires
-                    .lock()
-                    .unwrap()
-                    .front()
-                    .map(PendingOp::preemption_signal)
-            });
+        let progress = ctx.residency_pipelines().into_iter().find_map(|fires| {
+            fires
+                .lock()
+                .unwrap()
+                .front()
+                .map(PendingOp::preemption_signal)
+        });
         let Some(progress) = progress else {
             return Ok(());
         };
@@ -606,14 +603,7 @@ async fn suspend_at_safe_point(
     };
 
     let mut suspend = ResidencyTxnGuard::suspend(model, driver, txn);
-    let gpu_ids = match suspend.txn.as_ref() {
-        Some(ResidencyTxn::Suspend(txn)) => txn.gpu_ids(),
-        _ => unreachable!(),
-    };
-    let host_slots = match suspend.txn.as_ref() {
-        Some(ResidencyTxn::Suspend(txn)) => txn.host_slots(),
-        _ => unreachable!(),
-    };
+    let (gpu_ids, host_slots) = suspend.copy_plan();
     let copy_started = Instant::now();
     let completion = match crate::scheduler::copy_d2h_tracked(driver, &gpu_ids, &host_slots) {
         Ok(completion) => completion,
@@ -682,14 +672,7 @@ async fn restore_from_park(
         };
         let mut restore = ResidencyTxnGuard::restore(model, driver, txn);
         orchestrator.record_restore_prepared();
-        let gpu_ids = match restore.txn.as_ref() {
-            Some(ResidencyTxn::Restore(txn)) => txn.gpu_ids(),
-            _ => unreachable!(),
-        };
-        let host_slots = match restore.txn.as_ref() {
-            Some(ResidencyTxn::Restore(txn)) => txn.host_slots(),
-            _ => unreachable!(),
-        };
+        let (gpu_ids, host_slots) = restore.copy_plan();
         let copy_started = Instant::now();
         let completion = match crate::scheduler::copy_h2d_tracked(driver, &gpu_ids, &host_slots) {
             Ok(completion) => completion,
