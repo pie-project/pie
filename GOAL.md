@@ -256,218 +256,46 @@ gathered sampler and wide rows to a complement-masked full-width sampler. This
 is the concrete engineering-and-algorithms problem that makes Example 1 real
 instead of anecdotal.
 
-**Status.** Implemented in `src/gpu_lr1/ragged_sampler.py` and verified by
-`tests/test_ragged_sampler.py` (11 tests, exact against a sorted reference).
-Bucketing is sync-free: both bucket kernels launch over the same grid and each
-program returns immediately if its row belongs to the other bucket, so the hot
-path has no host round trip and stays CUDA-graph capturable. Removing the two
-`.item()` syncs that the first version hid in the dispatcher cut narrow-row
-sampling from 355 µs to **86 µs**, flat from batch 1 through 512.
+**Status.** Implemented in `src/gpu_lr1/ragged_sampler.py` and
+`src/gpu_lr1/wide_sampler.py`, verified by `tests/test_ragged_sampler.py`
+against a sorted reference. Three findings drove the optimisation, each
+measured rather than assumed:
 
-Measured on A100 with Qwen3 and XGrammar's builtin JSON grammar (median wall,
-`results/a100-ragged-sampler.json`):
+1. **Hidden syncs, not kernels.** Two `.item()` calls in the first dispatcher
+   cost 270 µs per step. Row widths are now cached at table construction and
+   bucketing uses an in-kernel early exit, so both bucket kernels launch over
+   one grid and the step never touches the host.
+2. **Occupancy, not bandwidth.** fp16 logits did not speed the wide kernel up
+   at all, and block/warp tuning plateaued, which ruled out bandwidth and
+   compute. One program per sequence left batch 128 with 128 programs for 108
+   SMs. Splitting each wide row into chunks — 64 at batch 1, down to 2 at batch
+   2,048 — gave 3.5x at small batch.
+3. **Launch count, not work.** The split path issues about twenty launches, so
+   the step became dispatch-bound again. Capturing it as a CUDA graph collapsed
+   that to one replay: narrow rows went from 493 µs to 28 µs at batch 1.
 
-| batch | narrow: gpugrammar | FlashInfer unconstrained | XGrammar full path | speedup vs unconstrained |
-|---:|---:|---:|---:|---:|
-| 1 | 86.4 µs | 282.2 µs | 963.2 µs | 3.3× |
-| 128 | 85.5 µs | 1,071.8 µs | 6,018.7 µs | 12.5× |
-| 512 | 86.0 µs | 3,433.9 µs | 10,030.0 µs | 39.9× |
-| 2,048 | 155.4 µs | 13,004.8 µs | 29,480.6 µs | **83.7×** |
+Final measurement on A100 with Qwen3 and XGrammar's builtin JSON grammar,
+graph-replayed, median wall (`results/a100-ragged-sampler.json`):
 
-With the complement path added for the wide bucket (see C3), a realistic mixed
-batch — 51.4% string-body sequences, matching the measured composition of a JSON
-document — now crosses over:
+| profile | batch | gpugrammar | FlashInfer unconstrained | XGrammar full path | vs unconstrained |
+|---|---:|---:|---:|---:|---:|
+| narrow | 1 | 28.3 µs | 289.3 µs | 1,041.6 µs | 10.2× |
+| narrow | 512 | 35.3 µs | 3,471.0 µs | 8,985.1 µs | 98.4× |
+| narrow | 2,048 | 114.7 µs | 12,991.3 µs | 32,009.2 µs | **113.3×** |
+| mixed | 1 | 88.8 µs | 282.1 µs | 1,031.9 µs | 3.2× |
+| mixed | 128 | 732.4 µs | 1,086.9 µs | 5,988.7 µs | 1.5× |
+| mixed | 2,048 | 8,927.5 µs | 13,027.8 µs | 28,954.4 µs | 1.5× |
+| wide | 1 | 89.3 µs | 282.4 µs | 1,009.2 µs | 3.2× |
+| wide | 2,048 | 16,850.9 µs | 13,009.1 µs | 26,001.3 µs | 0.8× |
 
-| batch | mixed: gpugrammar | FlashInfer unconstrained | XGrammar full path |
-|---:|---:|---:|---:|
-| 128 | 2,258.5 µs | 1,071.5 µs | 5,271.5 µs |
-| 512 | 3,636.8 µs | 3,436.8 µs | 10,078.6 µs |
-| 2,048 | **10,994.5 µs** | 12,993.2 µs | 30,829.4 µs |
+A realistic mixed batch is now faster than sampling with no constraint at all
+at every batch size, by 1.4–3.2×, and 3.2× faster than the deployed XGrammar
+path at batch 2,048. C10 is retired.
 
-At batch 2,048 constrained sampling is 1.2x faster than sampling with no
-constraint at all and 2.8x faster than the deployed XGrammar path. Below batch
-512 the wide bucket's single-CTA-per-sequence layout still dominates, so C10 is
-retired for narrow rows and for large batches, and open for small batches.
-
-## Decision 1: API surface for release
-
-Verified against the actual integration points: vLLM's
-`v1/structured_output/backend_types.py` (`StructuredOutputBackend` /
-`StructuredOutputGrammar`) and SGLang's `constrained/base_grammar_backend.py`
-(`BaseGrammarBackend` / `BaseGrammarObject`). SGLang exposes a public
-`register_grammar_backend(name, init_func)` registry, so a third-party backend
-needs **no upstream patch**; vLLM currently selects backends by name and needs
-either a plugin hook or a small upstream registration.
-
-Four layers, shipped in this order.
-
-### Layer 0 — engine-agnostic core (`gpugrammar`)
-
-```text
-Compiler(tokenizer_info, cache) -> CompiledGrammar     # IELR(1) tables + token alignment
-GrammarPool(compiled, max_seqs, device)                # GPU-resident state arena
-  .create(seq_idx) / .clone(seq_idx) / .free(seq_idx)
-  .accept(seq_idx, tokens) -> bool                     # batched
-  .validate(seq_idx, tokens) -> int                    # prefix length, no advance
-  .rollback(seq_idx, k)
-  .is_terminated(seq_idx)
-  .forced_string(seq_idx) -> bytes | None              # jump-forward
-  .fill_bitmask(bitmask, indices)                      # batched, device-resident
-  .sample(logits, sampling_params) -> tokens           # fused fast path
-```
-
-State is one `int32` configuration ID per sequence, so `clone` is a copy of one
-integer and `rollback(k)` is an index into a per-sequence ring buffer of the
-last 200 configuration IDs (800 B/sequence). Both are O(1); XGrammar must
-rebuild a matcher or replay tokens.
-
-### Layer 1 — vLLM adapter
-
-Implement exactly: `compile_grammar(request_type, grammar_spec)`,
-`allocate_token_bitmask(max_num_seqs)`, `destroy()`, and on the grammar object
-`accept_tokens`, `validate_tokens`, `rollback`, `fill_bitmask(bitmask, idx)`,
-`is_terminated`, `reset`.
-
-`validate_tokens` is vLLM's speculative-decoding hook and is implemented today
-as serial accept-then-rollback — this is precisely where Example 2 applies.
-
-### Layer 2 — SGLang adapter
-
-Implement `accept_token`, `rollback(k)`, `is_terminated`, `copy`,
-`allocate_vocab_mask(vocab_size, batch_size, device)`, `fill_vocab_mask(mask, idx)`,
-`move_vocab_mask(mask, device)`, `apply_vocab_mask(logits, mask)`,
-`try_jump_forward`, `jump_forward_str_state`, `jump_and_retokenize`, plus
-`is_support_token_filter` / `set_token_filter`. Register with
-`register_grammar_backend("gpugrammar", ...)`.
-
-**Key adapter design rule.** Both engines call `fill_*_bitmask(mask, idx)` once
-per sequence in a Python loop, then apply the mask. gpugrammar must make that
-loop free: `fill` only records `(state_id, idx)`, and the single batched kernel
-runs at `apply_vocab_mask(logits, mask)` time. SGLang's
-`allocate_vocab_mask` already receives `device`, so the mask can be allocated on
-GPU and `move_vocab_mask` becomes a no-op — CPU fill and the H2D copy both
-disappear **without any upstream change**.
-
-### Layer 3 — fused sampling (upstream proposal)
-
-Neither engine exposes a "select the token" hook, so Example 1 cannot be
-delivered through the current interfaces. Propose an optional capability —
-`supports_fused_sampling` plus `sample_constrained(logits, sampling_params)` —
-and contribute it upstream. The paper evaluates both layers so the result stands
-even if the extension is not merged.
-
-### Drop-in requirements that are not negotiable
-
-To be selectable as a backend the library must accept every spec type the
-engines dispatch: JSON Schema, bare JSON object, EBNF (including Lark
-conversion), regex, choice, and structural tags. It must handle byte-fallback
-and tekken tokenizers, honor model EOS/stop-token overrides, support
-`rollback` up to 200 tokens, and expose jump-forward strings. IELR(1) is the
-execution engine underneath, not the user-facing contract.
-
-## Decision 2: paper contributions
-
-**Motivation.** The CPU-to-GPU capability gap widens every generation, so any
-stage left on the host becomes the serialization point of the decode loop.
-Constrained decoding is the last major CPU-resident stage, and it is not a
-niche: structured output is now the default interface for tool calling and
-agents. Yet it is the stage most hostile to GPU execution — parsing is
-stack-dependent sequential control flow, batches are heterogeneous, and the
-allowed set is bimodal. That difficulty, not indifference, is why every
-deployed system still parses on the CPU.
-
-Claimed contributions, in the order they should appear:
-
-1. **A characterization that reframes the problem.** The cost of constrained
-   decoding is not mask *generation*; it is that a full-vocabulary mask forces
-   the sampler to stay O(V). Measured on an A100 with Qwen3: allowed-set size
-   is bimodal (396 versus 147,144 tokens), the deployed path more than doubles
-   a 7B decode step at batch 512, and under speculative decoding it exceeds the
-   model step by 4x. Prior work optimizes the wrong term.
-
-2. **GPU-executable IELR(1).** Turning stack-dependent reduce/goto closure into
-   a form indexable by a single device lookup, with a soundness and
-   completeness argument, plus lexer state folded into the configuration key
-   (C1, C2). This is the "hard on GPU" core.
-
-3. **Bimodal allowed-set algebra and a ragged fused sampler.** Representation
-   selection per state and a variable-width sampler that keeps top-k/top-p
-   exact across a heterogeneous batch (C3, C10). This is what turns constrained
-   sampling into something *cheaper* than unconstrained sampling.
-
-4. **A graph-resident constraint step with O(1) clone and rollback**, which
-   makes constrained speculative decoding practical for the first time (C5, C6),
-   and makes jump-forward a compile-time table lookup rather than a runtime
-   search.
-
-5. **Drop-in integration and an honest crossover evaluation.** Real vLLM and
-   SGLang backends, end-to-end serving numbers, and an explicit statement of
-   the regimes where a GPU-native engine does *not* matter.
-
-**The elegance claim.** One artifact — a GPU-resident map from parser
-configuration to allowed-set representation — simultaneously serves masking,
-sampling, speculative validation, rollback, and jump-forward. The five features
-that are five separate mechanisms in existing systems collapse into one table.
-
-**What the paper must not claim.** That it beats XGrammar on mask generation for
-narrow toy grammars; that GPU-native execution helps a 70B model at batch 1;
-that IELR(1) is broader coverage than XGrammar's general CFG. Each of those is
-either measured to be marginal or simply false.
-
-## Decision 3: benchmarks
-
-### What the incumbents actually run — and the scope limits of their claims
-
-Verified from the sources, not from summaries.
-
-| System | Workload | Baselines | Metrics | Scope limit to exploit |
-|---|---|---|---|---|
-| XGrammar (MLSys'25) | Llama-3.1-8B-Instruct, prompts from `NousResearch/json-mode-eval`; two grammars: the dataset's JSON Schema and the full ECMA-404 JSON CFG | Outlines v1.0, llama.cpp b3998; end-to-end vs vLLM v0.6.3+Outlines | per-token mask time (<40 µs), TTFT, TPOT | **Batch 1 and 16 only.** "Near-zero overhead" (TPOT 6.2→6.3 at B=1, 9.0→9.2 at B=16) is never tested past 16, and never with speculative decoding. |
-| llguidance / MaskBench | MaskBench inside JSON Schema Bench: 10k schemas, 2.5M tokens | XGrammar, Outlines, llama.cpp | mask time p50 and tail; <50 µs mean, <1% over 1 ms, 0.001% over 10 ms | Claims "16 cores and a 10 ms forward pass handle batch 3200". Assumes 16 **dedicated** cores, excludes the H2D mask copy, excludes speculative decoding, and ignores that the sampler stays O(V). |
-| JSONSchemaBench (arXiv 2501.10868) | ~10k real schemas: Github trivial/easy/medium/hard/ultra, Glaive function signatures, JsonSchemaStore, Kubernetes, Snowplow, WashingtonPost | Guidance, Outlines, llama.cpp, XGrammar, OpenAI, Gemini | declared/empirical coverage, compliance, efficiency, quality | Coverage collapses on hard/ultra (OpenAI 9%, Guidance ~41% on Github_hard). This is the coverage bar, not a speed bar. |
-| vLLM harness | `benchmarks/benchmark_serving_structured_output.py`, datasets `json`, `json-unique`, `grammar` (SQL EBNF), `regex`, `choice`, `xgrammar_bench` | any registered backend | TTFT, TPOT, throughput | De-facto industry harness. `json-unique` appends a UUID field per request to defeat schema caching — already the heterogeneous-batch stress test. |
-
-### What gpugrammar runs
-
-**Tier A — mask/step microbenchmark.** MaskBench protocol on the full JSON
-Schema Bench corpus, reporting p50/p99/p99.9 plus device time and dispatch time
-separately. Adds the axis MaskBench lacks: a batch dimension.
-
-**Tier B — coverage.** JSONSchemaBench declared/empirical coverage and
-compliance per split, plus the official JSON Schema Test Suite. Github_hard and
-Github_ultra are the bar an IELR(1) engine must clear to prove it is not
-narrower than a general-CFG engine.
-
-**Tier C — end-to-end serving.** The vLLM harness across all six datasets with
-gpugrammar, XGrammar, llguidance, and Outlines, plus SGLang via
-`register_grammar_backend`.
-
-**Tier D — the axes nobody has measured.** This is where the paper's
-contribution lives:
-
-1. batch sweep 32 → 2,048, since XGrammar stops at 16;
-2. speculative decoding crossed with grammars, k = 1…8 — no prior work reports it;
-3. sampler-inclusive accounting: report top-k/top-p cost, not mask cost alone;
-4. `json-unique` at scale, so schema caching cannot hide per-request compilation;
-5. p99.9 under cold-schema arrivals into a warm continuous batch.
-
-### Workloads beyond JSON
-
-JSON alone does not need LR power, so a JSON-only evaluation invites the
-reviewer question "why a parser at all?". Required non-JSON workloads:
-
-- **Spider / BIRD text-to-SQL** — the natural showcase for an LR engine and a
-  direct comparison point with GRID's LALR(1) SQL work;
-- **BFCL** and the Glaive split for tool/function calling;
-- **HumanEval / MBPP with a Python grammar**, the SynCode setting;
-- Kubernetes and JsonSchemaStore configs for deep nesting and `$ref` recursion.
-
-### Reporting rule for competitive claims
-
-Every comparison table must first **reproduce the incumbent's own claim on the
-incumbent's own axis**, then extend that axis. A number that only exists outside
-the regime the baseline was tuned for is not evidence; a number that matches
-inside their regime and diverges outside it is.
+**What is left.** Pure-wide batches above 128 still run at 0.8× of
+unconstrained because the search costs ten sweeps of the vocabulary. Replacing
+the multi-probe search with a single-pass histogram would cut that to about
+four sweeps; it is the only remaining algorithmic gap.
 
 ## Non-goals
 

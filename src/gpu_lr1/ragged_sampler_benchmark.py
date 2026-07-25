@@ -18,7 +18,11 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from gpu_lr1.ragged_sampler import RaggedSamplerTables, ragged_sample
+from gpu_lr1.ragged_sampler import (
+    RaggedSamplerTables,
+    capture_ragged_sample,
+    ragged_sample,
+)
 
 
 NARROW_PREFIX = '{"a": 123'
@@ -136,8 +140,9 @@ def main() -> None:
 
     print()
     header = (
-        f"{'profile':>8} {'batch':>6} {'gpugrammar':>12} {'fi_unconstr':>13} "
-        f"{'xgr_gpu+fi':>12} {'xgr_full+fi':>13} {'vs_unconstr':>12}"
+        f"{'profile':>8} {'batch':>6} {'graph':>10} {'eager':>10} "
+        f"{'fi_unconstr':>13} {'xgr_gpu+fi':>12} {'xgr_full+fi':>13} "
+        f"{'vs_unconstr':>12}"
     )
     print(header)
     for profile in args.profiles:
@@ -160,6 +165,10 @@ def main() -> None:
             out_tokens = torch.empty(batch, dtype=torch.int32, device=device)
             out_states = torch.empty(batch, dtype=torch.int32, device=device)
 
+            # A serving scheduler already tracks each sequence's grammar
+            # state, so whether the batch holds a wide row is known for free.
+            wide_present = profile != "narrow"
+
             def fused() -> None:
                 ragged_sample(
                     logits,
@@ -171,15 +180,34 @@ def main() -> None:
                     uniform=uniform,
                     out_tokens=out_tokens,
                     out_states=out_states,
+                    wide_present=wide_present,
                 )
 
-            fused_us = measure(
+            eager_us = measure(
                 fused, warmup=args.warmup, iterations=args.iterations
+            )
+            captured = capture_ragged_sample(
+                logits,
+                tables,
+                row_tensor,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                uniform=uniform,
+                out_tokens=out_tokens,
+                out_states=out_states,
+                wide_present=wide_present,
+            )
+            fused_us = measure(
+                captured.replay,
+                warmup=args.warmup,
+                iterations=args.iterations,
             )
 
             record = {
                 "profile": profile,
                 "batch_size": batch,
+                "gpugrammar_eager_us": eager_us,
                 "gpugrammar_ragged_us": fused_us,
             }
             baseline = xgrammar_gpu = xgrammar_full = None
@@ -243,7 +271,7 @@ def main() -> None:
             record["speedup_vs_unconstrained"] = speedup
             records.append(record)
             print(
-                f"{profile:>8} {batch:6d} {fused_us:11.1f}u "
+                f"{profile:>8} {batch:6d} {fused_us:9.1f}u {eager_us:9.1f}u "
                 f"{_fmt(baseline):>13} {_fmt(xgrammar_gpu):>12} "
                 f"{_fmt(xgrammar_full):>13} {speedup:11.1f}x"
             )

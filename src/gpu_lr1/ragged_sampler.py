@@ -29,12 +29,33 @@ import torch
 import triton
 import triton.language as tl
 
+from gpu_lr1.wide_sampler import make_wide_workspace, wide_sample_split
+
 
 DEFAULT_BISECT_STEPS = 32
 MAX_SINGLE_TILE = 8192
 WIDE_BLOCK = 4096
 WIDE_PROBES = 8
-WIDE_ROUNDS = 8
+WIDE_ROUNDS = 7
+WIDE_NUM_WARPS = 8
+
+
+def wide_splits_for(batch: int) -> int:
+    """Chunks per wide row, chosen so the launch keeps the GPU occupied.
+
+    A wide row sweeps the whole vocabulary several times, so at small batch a
+    program-per-sequence layout leaves almost every SM idle. Measured optima on
+    an A100 for a 151,669-token vocabulary.
+    """
+    if batch <= 16:
+        return 64
+    if batch <= 64:
+        return 16
+    if batch <= 256:
+        return 8
+    if batch <= 1024:
+        return 4
+    return 2
 
 
 @triton.jit
@@ -330,6 +351,8 @@ class RaggedSamplerTables:
 
         self.bitset = None
         self.row_slot = None
+        self._wide_workspaces = {}
+        self._sequence_index = {}
         self.bitset_words = 0
         self.vocab_size = 0
         widths = (self.csr_indptr[1:] - self.csr_indptr[:-1]).cpu().numpy()
@@ -366,6 +389,27 @@ class RaggedSamplerTables:
         self.vocab_size = vocab_size
         return self
 
+    def sequence_index(self, batch: int, device: torch.device) -> torch.Tensor:
+        cached = self._sequence_index.get(batch)
+        if cached is None:
+            cached = torch.arange(batch, dtype=torch.int32, device=device)
+            self._sequence_index[batch] = cached
+        return cached
+
+    def wide_workspace(self, batch: int, splits: int, probes: int):
+        """Cache split-CTA scratch so the hot path never allocates."""
+        key = (batch, splits, probes)
+        workspace = self._wide_workspaces.get(key)
+        if workspace is None:
+            workspace = make_wide_workspace(
+                batch,
+                splits=splits,
+                probes=probes,
+                device=self.csr_indices.device,
+            )
+            self._wide_workspaces[key] = workspace
+        return workspace
+
     @property
     def num_rows(self) -> int:
         return int(self.csr_indptr.numel() - 1)
@@ -392,6 +436,8 @@ def ragged_sample(
     seq_index: torch.Tensor | None = None,
     wide_probes: int = WIDE_PROBES,
     wide_rounds: int = WIDE_ROUNDS,
+    wide_splits: int | None = None,
+    wide_present: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Sample one token per sequence from its grammar row only.
 
@@ -433,7 +479,7 @@ def ragged_sample(
     if write_state and out_states is None:
         out_states = torch.empty_like(rows)
     if seq_index is None:
-        seq_index = _all_sequences(batch, logits.device)
+        seq_index = tables.sequence_index(batch, logits.device)
 
     common = dict(
         logits=logits,
@@ -476,12 +522,31 @@ def ragged_sample(
             bucket=1,
             **common,
         )
-    if tables.bitset is not None:
-        _launch_wide(
-            probes=wide_probes,
-            rounds=wide_rounds,
-            **common,
-        )
+    if tables.bitset is not None and wide_present:
+        splits = wide_splits if wide_splits is not None else wide_splits_for(batch)
+        if splits > 1:
+            workspace = tables.wide_workspace(batch, splits, wide_probes)
+            wide_sample_split(
+                logits,
+                tables,
+                rows,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                uniform=uniform,
+                out_tokens=out_tokens,
+                out_states=out_states if write_state else None,
+                workspace=workspace,
+                rounds=wide_rounds,
+                block=WIDE_BLOCK,
+                num_warps=WIDE_NUM_WARPS,
+            )
+        else:
+            _launch_wide(
+                probes=wide_probes,
+                rounds=wide_rounds,
+                **common,
+            )
     else:
         _launch(tiled=True, block=1024, bucket=2, **common)
     return result
@@ -526,7 +591,7 @@ def _launch_wide(
         PROBES=probes,
         ROUNDS=rounds,
         WRITE_STATE=write_state,
-        num_warps=8,
+        num_warps=WIDE_NUM_WARPS,
     )
 
 
@@ -808,3 +873,67 @@ def _wide_sample_kernel(
             right = tl.where(go_right, right, middle)
         next_state = tl.load(csr_next_state_ptr + left, mask=left >= 0, other=0)
         tl.store(out_states_ptr + seq, next_state)
+
+
+@dataclass(frozen=True)
+class RaggedSampleGraph:
+    """A captured constrained-sampling step.
+
+    The split-CTA wide path issues about twenty launches, which dominates the
+    step whenever the device work is small. Capturing the whole step collapses
+    that into one replay and is also what a serving engine needs in order to
+    fold the constraint into the model graph.
+    """
+
+    graph: torch.cuda.CUDAGraph
+    tokens: torch.Tensor
+    states: torch.Tensor | None
+
+    def replay(self) -> tuple[torch.Tensor, torch.Tensor | None]:
+        self.graph.replay()
+        return self.tokens, self.states
+
+
+def capture_ragged_sample(
+    logits: torch.Tensor,
+    tables: RaggedSamplerTables,
+    rows: torch.Tensor,
+    *,
+    temperature: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    uniform: torch.Tensor,
+    out_tokens: torch.Tensor | None = None,
+    out_states: torch.Tensor | None = None,
+    **kwargs,
+) -> RaggedSampleGraph:
+    """Warm up, then capture one constrained-sampling step as a CUDA graph."""
+    batch = logits.shape[0]
+    device = logits.device
+    if out_tokens is None:
+        out_tokens = torch.empty(batch, dtype=torch.int32, device=device)
+    if out_states is None and tables.csr_next_state is not None:
+        out_states = torch.empty(batch, dtype=torch.int32, device=device)
+
+    def step() -> None:
+        ragged_sample(
+            logits,
+            tables,
+            rows,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            uniform=uniform,
+            out_tokens=out_tokens,
+            out_states=out_states,
+            **kwargs,
+        )
+
+    for _ in range(3):
+        step()
+    torch.cuda.synchronize(device)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        step()
+    torch.cuda.synchronize(device)
+    return RaggedSampleGraph(graph=graph, tokens=out_tokens, states=out_states)
