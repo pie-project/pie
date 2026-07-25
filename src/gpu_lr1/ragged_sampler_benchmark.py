@@ -25,6 +25,31 @@ from gpu_lr1.ragged_sampler import (
 )
 
 
+TYPED_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string", "pattern": "^[A-Za-z ]{1,40}$"},
+        "age": {"type": "integer"},
+        "role": {"enum": ["admin", "editor", "viewer"]},
+        "active": {"type": "boolean"},
+        "score": {"type": "number"},
+        "tags": {
+            "type": "array",
+            "items": {"enum": ["alpha", "beta", "gamma"]},
+        },
+    },
+    "required": ["name", "age", "role", "active", "score", "tags"],
+    "additionalProperties": False,
+}
+TYPED_INSTANCE = {
+    "name": "Ada Lovelace",
+    "age": 36,
+    "role": "admin",
+    "active": True,
+    "score": 9.5,
+    "tags": ["alpha", "beta"],
+}
+
 NARROW_PREFIX = '{"a": 123'
 WIDE_PREFIX = '{"a": "hello wor'
 WIDE_SHARE = 0.514
@@ -36,6 +61,53 @@ class Rows:
     indices: np.ndarray
     next_state: np.ndarray
     widths: list[int] = field(default_factory=list)
+
+
+def build_schema_rows(model: str) -> tuple[Rows, int, np.ndarray]:
+    """Rows taken from every step of a real schema-guided generation.
+
+    The free-form JSON grammar is the worst case for a width-sensitive engine
+    and the best case for nobody: a typed schema spends most steps at a
+    structural position where only a handful of tokens are legal.
+    """
+    import xgrammar as xgr
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model)
+    info = xgr.TokenizerInfo.from_huggingface(tokenizer)
+    compiled = xgr.GrammarCompiler(info).compile_json_schema(
+        json.dumps(TYPED_SCHEMA)
+    )
+    vocab_size = info.vocab_size
+    matcher = xgr.GrammarMatcher(compiled)
+    mask = xgr.allocate_token_bitmask(1, vocab_size)
+
+    sets: list[np.ndarray] = []
+    for token in tokenizer.encode(
+        json.dumps(TYPED_INSTANCE, separators=(",", ":"))
+    ):
+        matcher.fill_next_token_bitmask(mask)
+        bits = np.unpackbits(mask.numpy().view(np.uint8), bitorder="little")
+        sets.append(np.flatnonzero(bits[:vocab_size]).astype(np.int32))
+        if not matcher.accept_token(token):
+            break
+
+    indptr = np.zeros(len(sets) + 1, dtype=np.int32)
+    for index, row in enumerate(sets):
+        indptr[index + 1] = indptr[index] + row.size
+    indices = np.concatenate(sets).astype(np.int32)
+    widths = np.asarray([row.size for row in sets])
+    _XGRAMMAR_CACHE["schema_compiled"] = compiled
+    _XGRAMMAR_CACHE["schema_tokens"] = tokenizer.encode(
+        json.dumps(TYPED_INSTANCE, separators=(",", ":"))
+    )
+    rows = Rows(
+        indptr,
+        indices,
+        np.zeros(indices.size, dtype=np.int32),
+        widths.tolist(),
+    )
+    return rows, vocab_size, widths
 
 
 def build_rows(model: str) -> tuple[Rows, int]:
@@ -64,7 +136,12 @@ def build_rows(model: str) -> tuple[Rows, int]:
     return Rows(indptr, indices, next_state, [narrow.size, wide.size]), vocab_size
 
 
-def select_rows(profile: str, batch: int, seed: int) -> np.ndarray:
+def select_rows(
+    profile: str, batch: int, seed: int, num_rows: int = 2
+) -> np.ndarray:
+    if profile == "schema":
+        rng = np.random.default_rng(seed)
+        return rng.integers(0, num_rows, size=batch).astype(np.int32)
     if profile == "narrow":
         return np.zeros(batch, dtype=np.int32)
     if profile == "wide":
@@ -98,7 +175,7 @@ def main() -> None:
         "--profiles",
         nargs="+",
         default=["narrow", "wide", "mixed"],
-        choices=("narrow", "wide", "mixed"),
+        choices=("narrow", "wide", "mixed", "schema"),
     )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=30)
@@ -115,11 +192,21 @@ def main() -> None:
 
     device = torch.device(args.device)
     torch.cuda.set_device(device)
-    rows, vocab_size = build_rows(args.qwen_model)
-    print(
-        f"vocab={vocab_size} narrow_row={rows.widths[0]} wide_row={rows.widths[1]} "
-        f"exceptions={vocab_size - rows.widths[1]}"
-    )
+    if args.profiles == ["schema"]:
+        rows, vocab_size, widths = build_schema_rows(args.qwen_model)
+        print(
+            f"typed schema: {len(widths)} steps, median width "
+            f"{int(np.median(widths))}, "
+            f"{(widths > 8192).mean() * 100:.1f}% wide"
+        )
+    else:
+        rows, vocab_size = build_rows(args.qwen_model)
+    if args.profiles != ["schema"]:
+        print(
+            f"vocab={vocab_size} narrow_row={rows.widths[0]} "
+            f"wide_row={rows.widths[1]} "
+            f"exceptions={vocab_size - rows.widths[1]}"
+        )
 
     tables = RaggedSamplerTables(
         torch.from_numpy(rows.indptr).to(device),
@@ -142,12 +229,14 @@ def main() -> None:
     header = (
         f"{'profile':>8} {'batch':>6} {'graph':>10} {'eager':>10} "
         f"{'fi_unconstr':>13} {'xgr_gpu+fi':>12} {'xgr_full+fi':>13} "
-        f"{'vs_unconstr':>12}"
+        f"{'vs_unconstr':>12} {'xgr_thr':>8}"
     )
     print(header)
     for profile in args.profiles:
         for batch in args.batch_sizes:
-            selected = select_rows(profile, batch, args.seed + batch)
+            selected = select_rows(
+                profile, batch, args.seed + batch, tables.num_rows
+            )
             logits = torch.randn(
                 batch, vocab_size, dtype=torch.float32, device=device
             )
@@ -229,7 +318,7 @@ def main() -> None:
 
                 if xgr is not None:
                     mask, matchers, batch_matcher = _xgrammar_state(
-                        xgr, args.qwen_model, selected, vocab_size
+                        xgr, args.qwen_model, selected, vocab_size, profile
                     )
                     device_mask = mask.to(device)
                     pinned = mask.pin_memory()
@@ -266,6 +355,8 @@ def main() -> None:
                     )
                     record["xgrammar_gpu_mask_us"] = xgrammar_gpu
                     record["xgrammar_full_path_us"] = xgrammar_full
+                    record["xgrammar_threads"] = _XGRAMMAR_CACHE.get("threads")
+                    record["xgrammar_fill_us"] = _XGRAMMAR_CACHE.get("fill_us")
 
             speedup = baseline / fused_us if baseline else float("nan")
             record["speedup_vs_unconstrained"] = speedup
@@ -273,7 +364,8 @@ def main() -> None:
             print(
                 f"{profile:>8} {batch:6d} {fused_us:9.1f}u {eager_us:9.1f}u "
                 f"{_fmt(baseline):>13} {_fmt(xgrammar_gpu):>12} "
-                f"{_fmt(xgrammar_full):>13} {speedup:11.1f}x"
+                f"{_fmt(xgrammar_full):>13} {speedup:11.1f}x "
+                f"{str(_XGRAMMAR_CACHE.get('threads')):>8}"
             )
 
     payload = {
@@ -296,9 +388,53 @@ def main() -> None:
 
 
 _XGRAMMAR_CACHE: dict = {}
+_XGRAMMAR_THREAD_CANDIDATES = (1, 2, 4, 8, 16, "auto")
 
 
-def _xgrammar_state(xgr, model: str, selected: np.ndarray, vocab_size: int):
+def _best_batch_matcher(xgr, matchers, mask, candidates):
+    """Pick the fastest XGrammar thread count, as the repo's rules require.
+
+    `max_threads="auto"` is not optimal: on a 24-thread host it ran 2.4-2.9x
+    slower than the best fixed count, so using it would understate XGrammar.
+    """
+    best = None
+    best_us = float("inf")
+    for threads in candidates:
+        matcher = xgr.BatchGrammarMatcher(max_threads=threads)
+        for _ in range(2):
+            matcher.batch_fill_next_token_bitmask(matchers, mask)
+        samples = []
+        for _ in range(5):
+            started = time.perf_counter_ns()
+            matcher.batch_fill_next_token_bitmask(matchers, mask)
+            samples.append((time.perf_counter_ns() - started) / 1_000)
+        median = statistics.median(samples)
+        if median < best_us:
+            best_us, best = median, (matcher, threads)
+    return best[0], best[1], best_us
+
+
+def _xgrammar_state(
+    xgr, model: str, selected: np.ndarray, vocab_size: int, profile: str
+):
+    if profile == "schema":
+        # Put every XGrammar matcher at the same schema position gpugrammar
+        # is at, so its adaptive mask cache gets the same opportunity.
+        compiled = _XGRAMMAR_CACHE["schema_compiled"]
+        tokens = _XGRAMMAR_CACHE["schema_tokens"]
+        matchers = []
+        for row in selected:
+            matcher = xgr.GrammarMatcher(compiled)
+            for token in tokens[: int(row)]:
+                matcher.accept_token(token)
+            matchers.append(matcher)
+        mask = xgr.allocate_token_bitmask(len(matchers), vocab_size)
+        batch_matcher, threads, fill_us = _best_batch_matcher(
+            xgr, matchers, mask, _XGRAMMAR_THREAD_CANDIDATES
+        )
+        _XGRAMMAR_CACHE["threads"] = threads
+        _XGRAMMAR_CACHE["fill_us"] = fill_us
+        return mask, matchers, batch_matcher
     if "compiled" not in _XGRAMMAR_CACHE:
         from transformers import AutoTokenizer
 
@@ -311,11 +447,14 @@ def _xgrammar_state(xgr, model: str, selected: np.ndarray, vocab_size: int):
     matchers = []
     for row in selected:
         matcher = xgr.GrammarMatcher(compiled)
-        matcher.accept_string(WIDE_PREFIX if row else NARROW_PREFIX)
+        matcher.accept_string(WIDE_PREFIX if row % 2 else NARROW_PREFIX)
         matchers.append(matcher)
-    batch_matcher = xgr.BatchGrammarMatcher(max_threads="auto")
     mask = xgr.allocate_token_bitmask(len(matchers), vocab_size)
-    batch_matcher.batch_fill_next_token_bitmask(matchers, mask)
+    batch_matcher, threads, fill_us = _best_batch_matcher(
+        xgr, matchers, mask, _XGRAMMAR_THREAD_CANDIDATES
+    )
+    _XGRAMMAR_CACHE["threads"] = threads
+    _XGRAMMAR_CACHE["fill_us"] = fill_us
     return mask, matchers, batch_matcher
 
 

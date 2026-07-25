@@ -1,0 +1,75 @@
+{
+  "metadata": {
+    "gpu": "NVIDIA A100 80GB PCIe",
+    "torch": "2.13.0+cu130",
+    "vocab_size": 151669,
+    "narrow_row_nnz": 396,
+    "wide_row_nnz": 147144,
+    "wide_share": 0.514,
+    "temperature": 0.8,
+    "top_k": 50,
+    "top_p": 0.95
+  },
+  "benchmarks": [
+    {
+      "profile": "mixed",
+      "batch_size": 1,
+      "gpugrammar_eager_us": 425.069,
+      "gpugrammar_ragged_us": 89.27199999999999,
+      "flashinfer_unconstrained_us": 297.3855,
+      "xgrammar_gpu_mask_us": 362.323,
+      "xgrammar_full_path_us": 445.783,
+      "xgrammar_threads": 1,
+      "xgrammar_fill_us": 15.87,
+      "speedup_vs_unconstrained": 3.331229276816919
+    },
+    {
+      "profile": "mixed",
+      "batch_size": 32,
+      "gpugrammar_eager_us": 461.587,
+      "gpugrammar_ragged_us": 304.399,
+      "flashinfer_unconstrained_us": 549.046,
+      "xgrammar_gpu_mask_us": 612.0235,
+      "xgrammar_full_path_us": 938.885,
+      "xgrammar_threads": 1,
+      "xgrammar_fill_us": 226.374,
+      "speedup_vs_unconstrained": 1.8037050056012012
+    },
+    {
+      "profile": "mixed",
+      "batch_size": 128,
+      "gpugrammar_eager_us": 807.4895,
+      "gpugrammar_ragged_us": 736.4815000000001,
+      "flashinfer_unconstrained_us": 1080.6205,
+      "xgrammar_gpu_mask_us": 1185.2705,
+      "xgrammar_full_path_us": 6987.312,
+      "xgrammar_threads": 4,
+      "xgrammar_fill_us": 575.125,
+      "speedup_vs_unconstrained": 1.4672744665005162
+    },
+    {
+      "profile": "mixed",
+      "batch_size": 512,
+      "gpugrammar_eager_us": 2513.408,
+      "gpugrammar_ragged_us": 2442.736,
+      "flashinfer_unconstrained_us": 3446.5280000000002,
+      "xgrammar_gpu_mask_us": 3885.163,
+      "xgrammar_full_path_us": 10918.058,
+      "xgrammar_threads": 8,
+      "xgrammar_fill_us": 1239.186,
+      "speedup_vs_unconstrained": 1.4109293841004515
+    },
+    {
+      "profile": "mixed",
+      "batch_size": 2048,
+      "gpugrammar_eager_us": 8912.6005,
+      "gpugrammar_ragged_us": 8838.116,
+      "flashinfer_unconstrained_us": 13008.637999999999,
+      "xgrammar_gpu_mask_us": 14936.426,
+      "xgrammar_full_path_us": 23875.08,
+      "xgrammar_threads": 8,
+      "xgrammar_fill_us": 4267.317,
+      "speedup_vs_unconstrained": 1.4718790746806218
+    }
+  ]
+}

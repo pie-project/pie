@@ -292,6 +292,36 @@ A realistic mixed batch is now faster than sampling with no constraint at all
 at every batch size, by 1.4–3.2×, and 3.2× faster than the deployed XGrammar
 path at batch 2,048. C10 is retired.
 
+### Workload note: the free-form JSON grammar is the worst case
+
+The numbers above use XGrammar's builtin JSON grammar, where a string body
+allows 147,144 tokens and 51.4% of a document's tokens come from one. A real
+**typed** JSON Schema behaves very differently — measured over every step of a
+schema-guided generation with Qwen3:
+
+| workload | steps | median allowed | steps wider than 8,192 |
+|---|---:|---:|---:|
+| typed schema | 33 | **12** | 15.2% |
+| tool call | 17 | **9** | 23.5% |
+| free-form string field | 10 | 147,071 | 70.0% |
+
+This matters because **XGrammar's per-step cost is O(V) whatever the grammar** —
+it fills a full-vocabulary bitmask every step — while gpugrammar's is
+O(allowed). The tighter the schema, the wider the gap. With every XGrammar
+matcher driven to the same schema position so its adaptive mask cache gets the
+same opportunity, and its thread count swept to the fastest setting:
+
+| batch | gpugrammar | XGrammar full path | gap |
+|---:|---:|---:|---:|
+| 1 | 58.0 µs | 342.9 µs | 5.9× |
+| 32 | 182.2 µs | 5,987.1 µs | 32.9× |
+| 128 | 336.2 µs | 14,432.3 µs | **42.9×** |
+| 512 | 889.5 µs | 27,937.6 µs | 31.4× |
+| 2,048 | 2,881.7 µs | 45,125.3 µs | **15.7×** |
+
+Both profiles belong in the paper: the typed schema is the workload people
+actually run, and the free-form grammar is the honest worst case.
+
 **What is left.** Pure-wide batches above 128 still run at 0.8× of
 unconstrained because the search costs ten sweeps of the vocabulary. Replacing
 the multi-probe search with a single-pass histogram would cut that to about
