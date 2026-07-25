@@ -223,6 +223,19 @@ requests.
 visit), a persistent cross-request cache, and possibly GPU-side construction —
 while preserving the exactness guarantees of C2.
 
+**[measured] Rows repeat, so this is affordable.** Over the 55,406 real
+decoding steps of the Llama-3 replay there are only **5,837 distinct allowed
+sets**: a lazily built cache hits **89.5%** of the time and builds 105 rows per
+1,000 steps. Even with no cross-request sharing at all, reuse *within* a single
+request is 67.2%, so at most 32.8% of steps can miss.
+
+If a row costs one XGrammar mask fill (measured p50 6 µs, p99 1,071 µs), the
+amortised construction cost is **0.6 µs per step** warm and 2.0 µs cold,
+against 3.3 µs per sequence for the sampling step itself at batch 128. The
+asymmetry is the point: XGrammar fills a mask on *every* step, gpugrammar only
+on a cache miss, so including construction still leaves it ahead. The 1,071 µs
+p99 fill also confirms the tail behaviour llguidance criticises.
+
 ### C8. Correctness at scale, as a first-class artifact
 
 The prototype's parser core is exhaustively verified against an independent
