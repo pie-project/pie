@@ -8,7 +8,7 @@
 mod ctx;
 mod output;
 pub(crate) mod preemption;
-mod residency;
+pub(crate) mod residency;
 
 pub(crate) use ctx::OutputMode;
 pub use ctx::ProcessCtx;
@@ -755,14 +755,14 @@ impl Process {
         // actor could land after the teardown's ProcessQuiesced and mint a
         // tombstone nothing retires.)
 
-        // Task-B contention: unregister from the preempt/restore orchestrator
-        // (purges its waiters/restore-queue entries, wakes a parked task for
-        // teardown, and drains — the exiting process's KV frees follow via the
-        // WS-drop hook). Single exit funnel: covers natural completion AND
-        // external terminate. No-op unless PIE_KV_CONTENTION=preempt.
+        // Contention: unregister from the orchestrator (purges its queue
+        // entries, wakes a parked task for teardown, and drains — the exiting
+        // process's KV frees follow via the WS-drop hook). Single exit funnel:
+        // covers natural completion AND external terminate.
         if let Some(o) = crate::store::reclaim::contention() {
             o.unregister(self.process_id);
         }
+        residency::unregister_residency(self.process_id);
     }
 }
 

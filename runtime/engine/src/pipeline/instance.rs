@@ -8,14 +8,11 @@
 //! allocated driver-side from the declared shapes; the host instance carries the
 //! validated seeds to send at instantiation plus the host-channel index map.
 //!
-//! Complete pipeline domain API: some methods here (relaxed geometry
-//! variants, per-channel introspection, the pure `instantiate`/registry
-//! probe entry points, device-geometry lease internals) are not yet
-//! called by the current single-model/mock-driver fire path, but are
-//! exercised by this module's own unit tests and reserved for upcoming
-//! wiring (multi-pass channels, device-geometry beams) — kept rather
-//! than deleted, allowed rather than silently masked.
-#![allow(dead_code)]
+//! There is no module-level `dead_code` allow: the per-channel introspection
+//! helpers ([`Instance::host_channels`]/[`Instance::host_role`]) and the
+//! `KvPageSpan::open`/`KvDeclaration::all` constructors exist for this
+//! module's tests and are `#[cfg(test)]`, so the compiler keeps guarding
+//! everything else.
 
 #[cfg(test)]
 use std::fmt;
@@ -24,6 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(test)]
 use pie_ptir::container;
+#[cfg(test)]
 use pie_ptir::container::HostRole;
 
 use super::program::RegisteredProgram;
@@ -61,7 +59,9 @@ pub struct Instance {
 
 impl Instance {
     /// The dense indices of host-facing channels (`host-role != none`) — the
-    /// only channels the guest may obtain a host endpoint on.
+    /// only channels the guest may obtain a host endpoint on. Test
+    /// affordance: the host layer validates per-channel at attach time.
+    #[cfg(test)]
     pub fn host_channels(&self) -> Vec<u32> {
         self.program
             .bound
@@ -74,7 +74,9 @@ impl Instance {
             .collect()
     }
 
-    /// The host role of channel `index`, or `None` if the index is out of range.
+    /// The host role of channel `index`, or `None` if the index is out of
+    /// range. Test affordance — see [`Self::host_channels`].
+    #[cfg(test)]
     pub fn host_role(&self, index: u32) -> Option<HostRole> {
         self.program
             .bound
@@ -125,6 +127,7 @@ pub struct KvPageSpan {
 }
 
 impl KvPageSpan {
+    #[cfg(test)]
     pub const fn open(start: u64) -> Self {
         Self { start, end: None }
     }
@@ -141,17 +144,18 @@ impl KvPageSpan {
     }
 }
 
+/// The pass's declared KV window. The owning working set is
+/// [`BoundForwardPass::kv_ws`] — this carries only the spans.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KvDeclaration {
-    pub ws_rep: u32,
     pub readable: KvPageSpan,
     pub writable: KvPageSpan,
 }
 
 impl KvDeclaration {
-    pub const fn all(ws_rep: u32) -> Self {
+    #[cfg(test)]
+    pub const fn all() -> Self {
         Self {
-            ws_rep,
             readable: KvPageSpan::open(0),
             writable: KvPageSpan::open(0),
         }
@@ -267,10 +271,6 @@ pub struct BoundForwardPass {
     /// The bound channel cells, dense declaration order. Writer puts are
     /// coalesced into each fire; Reader cells hold direct mirror bindings.
     pub cells: crate::pipeline::channel::BoundCells,
-    /// Dense-channel-index → global-channel-id map (captured at bind from the
-    /// bound cells). Rides every submission so the driver binds the trace's
-    /// dense channel references to the global device channel registry.
-    pub channel_ids: Vec<u64>,
     /// The bound channel resource reps (captured at `forward-pass.program`), so
     /// `submit` can point each channel's await queue at the feeding pipeline
     /// (W3.1: the pipeline owns the FIFO; a pass may bind to any pipeline).
@@ -307,9 +307,13 @@ pub struct BoundForwardPass {
     /// Shape-derived decode layout whose values are resolved by the driver.
     pub decode_envelope: Option<crate::pipeline::fire::geometry::DecodeEnvelope>,
     /// The pass binds an `AttnMask` descriptor channel (dense device mask).
-    /// Its fires are marked mask-carrying on the launch plan so the
-    /// scheduler batches them SOLO (the composed multi-program batch does
-    /// not merge dense device masks — v1 scope).
+    /// Detected at bind, but NOT yet consulted: the intended rule — such
+    /// fires are marked mask-carrying on the launch plan so the scheduler
+    /// batches them SOLO, because the composed multi-program batch does not
+    /// merge dense device masks (v1 scope) — is unwired, here and at the
+    /// second copy of the same flag, [`crate::pipeline::fire::lease::DevGeo`]'s
+    /// `has_mask`. The `allow` marks that gap rather than hiding it.
+    #[allow(dead_code)]
     pub dense_mask: bool,
     /// Host mirror of the instance's committed channel state (seeds, then
     /// per-fire stage folds): the value oracle for evaluated fire geometry.
@@ -341,43 +345,6 @@ impl BoundForwardPass {
             ));
         }
         self.rs_ws = reps;
-        Ok(())
-    }
-
-    pub fn replace_kv_declaration(
-        &mut self,
-        ws_rep: u32,
-        readable: KvPageSpan,
-        writable: KvPageSpan,
-    ) -> Result<(), String> {
-        let pending = self
-            .fires
-            .as_ref()
-            .map(|fifo| fifo.lock().unwrap().len())
-            .unwrap_or(0);
-        if pending != 0 {
-            return Err(format!(
-                "cannot replace KV working-set declaration while {pending} operation(s) remain in the pass FIFO"
-            ));
-        }
-        if self.devgeo.is_some() {
-            return Err("a device-geometry pass cannot redeclare its KV working set".to_string());
-        }
-        if self.decode_envelope.is_some()
-            && (ws_rep != self.kv_ws || readable.start != 0 || readable.end.is_some())
-        {
-            return Err(
-                "a device-resolved pass cannot replace its KV working set or narrow readable pages"
-                    .to_string(),
-            );
-        }
-        self.kv_ws = ws_rep;
-        self.kv_declaration = KvDeclaration {
-            ws_rep,
-            readable,
-            writable,
-        };
-        self.kv_declaration_realized = false;
         Ok(())
     }
 
@@ -1115,11 +1082,10 @@ mod tests {
                 scheduler: crate::scheduler::scheduler_handle(bound_instance.driver_id).unwrap(),
                 bound_instance,
                 cells,
-                channel_ids: Vec::new(),
                 channel_reps: Vec::new(),
                 fires: None,
                 kv_ws: 0,
-                kv_declaration: KvDeclaration::all(0),
+                kv_declaration: KvDeclaration::all(),
                 rs_ws: Vec::new(),
                 kv_declaration_realized: false,
                 failed: None,
@@ -1173,94 +1139,6 @@ mod tests {
             assert_eq!(pass.rs_ws, vec![7]);
 
             fifo.lock().unwrap().clear();
-        }
-
-        #[tokio::test(flavor = "current_thread")]
-        async fn kv_rebind_is_in_place_and_resets_declaration_realization() {
-            let operation_log = Arc::new(Mutex::new(Vec::new()));
-            let (_scheduler, bound, cells, _) = setup(operation_log).await;
-            let mut pass = make_pass(bound, cells);
-            pass.kv_declaration_realized = true;
-            let instance_id = pass.bound_instance.instance_id;
-
-            pass.replace_kv_declaration(9, KvPageSpan::open(0), KvPageSpan::open(2))
-                .unwrap();
-
-            assert_eq!(pass.kv_ws, 9);
-            assert_eq!(pass.kv_declaration.ws_rep, 9);
-            assert_eq!(pass.kv_declaration.writable.start, 2);
-            assert!(!pass.kv_declaration_realized);
-            assert_eq!(pass.bound_instance.instance_id, instance_id);
-        }
-
-        #[tokio::test(flavor = "current_thread")]
-        async fn kv_rebind_rejects_nonempty_fifo_without_mutation() {
-            let operation_log = Arc::new(Mutex::new(Vec::new()));
-            let (_scheduler, bound, cells, _) = setup(operation_log).await;
-            let mut pass = make_pass(bound, cells);
-            pass.kv_ws = 7;
-            let fifo = Arc::new(crate::pipeline::fire::PendingFireQueue::from_queue(
-                std::collections::VecDeque::from([crate::pipeline::fire::test_pending_op_stub()]),
-            ));
-            pass.fires = Some(fifo.clone());
-
-            assert!(
-                pass.replace_kv_declaration(8, KvPageSpan::open(0), KvPageSpan::open(1))
-                    .is_err()
-            );
-            assert_eq!(pass.kv_ws, 7);
-
-            fifo.lock().unwrap().clear();
-        }
-
-        #[tokio::test(flavor = "current_thread")]
-        async fn device_geometry_rejects_kv_recall() {
-            let operation_log = Arc::new(Mutex::new(Vec::new()));
-            let (_scheduler, bound, cells, _) = setup(operation_log).await;
-            let mut pass = make_pass(bound, cells);
-            pass.kv_ws = 7;
-            pass.devgeo = Some(crate::pipeline::fire::lease::DevGeo {
-                lease: crate::pipeline::fire::lease::PageLease::new(2),
-                b: 2,
-                fresh_dense: 0,
-                w_cont_dense: 1,
-                has_mask: false,
-            });
-
-            assert!(
-                pass.replace_kv_declaration(7, KvPageSpan::open(0), KvPageSpan::open(0))
-                    .is_err()
-            );
-            assert_eq!(pass.kv_ws, 7);
-        }
-
-        #[tokio::test(flavor = "current_thread")]
-        async fn device_resolved_recall_keeps_ws_and_full_readable_span() {
-            let operation_log = Arc::new(Mutex::new(Vec::new()));
-            let (_scheduler, bound, cells, _) = setup(operation_log).await;
-            let mut pass = make_pass(bound, cells);
-            pass.kv_ws = 7;
-            pass.decode_envelope = Some(crate::pipeline::fire::geometry::DecodeEnvelope {
-                token_count: 1,
-                lane_count: 1,
-                token_indptr: vec![0, 1],
-                loop_carried: true,
-                device_positions: true,
-                has_mask: false,
-            });
-
-            assert!(
-                pass.replace_kv_declaration(8, KvPageSpan::open(0), KvPageSpan::open(0))
-                    .is_err()
-            );
-            assert!(
-                pass.replace_kv_declaration(7, KvPageSpan::open(1), KvPageSpan::open(0))
-                    .is_err()
-            );
-            pass.replace_kv_declaration(7, KvPageSpan::open(0), KvPageSpan::open(2))
-                .unwrap();
-            assert_eq!(pass.kv_declaration.writable.start, 2);
-            assert!(!pass.kv_declaration_realized);
         }
 
         #[tokio::test(flavor = "current_thread")]

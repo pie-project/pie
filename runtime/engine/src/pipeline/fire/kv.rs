@@ -1,41 +1,38 @@
-//! Fire KV preparation over the typed `KvStore` (kv_refact.md), plus the
-//! canonical-KV shape/evidence gate and the WIT-descriptor validation
-//! (`PrepareError` re-export, `check_generation`/`check_input_nonempty`).
+//! Fire KV preparation over the typed `KvStore` (kv_refact.md).
 //!
-//! `pipeline::fire::submit` calls [`prepare`] to classify the fire's KV
-//! write intents (fresh append / private in-place / shared-tail CoW rebase),
-//! allocate physical pages, and project the driver page geometry; it threads
-//! the returned [`KvTxn`] across the async fire and
+//! `pipeline::fire` calls [`realize_declaration_demand`] +
+//! [`realize_declaration_reserved`] under one KV lock (the staleness gate),
+//! threads the returned [`KvTxn`] across the async fire, and
 //! [`finalize`]s it (commit publishes the mapping; abort releases the
-//! pending slots and leaves the committed mapping authoritative).
+//! pending slots and leaves the committed mapping authoritative);
+//! `pipeline::offload` drives the non-reserved [`prepare`] path.
 //!
-//! Hash lifecycle (increment 1): canonical fires (bind-time shape gate
-//! [`canonical_kv_shape`] + fire-time host-known-token gate
-//! [`canonical_fire_evidence`], both called from `pipeline::fire`) commit
-//! chained `(token, position)` slot hashes and full-page hashes — feeding the
-//! store's chain state and CAS index; every other fire commits opaque slot
-//! hashes (concrete identity, never matchable). Matching/trim is the next
-//! increment.
+//! Hash lifecycle (increment 1): canonical fires — bind-time shape gate
+//! [`canonical_kv_shape`], fire-time evidence check
+//! [`canonical_hash_tokens`] — commit chained `(token, position)` slot
+//! hashes and full-page hashes, feeding the store's chain state and CAS
+//! index; every other fire commits opaque slot hashes (concrete identity,
+//! never matchable). Matching/trim ([`match_prefix`]) is the next increment.
 //!
-//! Complete pipeline domain API: some methods here (relaxed geometry
-//! variants, per-channel introspection, the pure `instantiate`/registry
-//! probe entry points, device-geometry lease internals) are not yet
-//! called by the current single-model/mock-driver fire path, but are
-//! exercised by this module's own unit tests and reserved for upcoming
-//! wiring (multi-pass channels, device-geometry beams) — kept rather
-//! than deleted, allowed rather than silently masked.
+//! The allow below covers exactly the reserved, test-exercised increments:
+//! [`realize_declaration`] (the non-reserved variant), [`match_prefix`]
+//! (trie matching, increment 2a), and the canonical-hash gate
+//! ([`canonical_kv_shape`] / [`CanonicalFireEvidence`] /
+//! [`canonical_hash_tokens`]) — spec'd and unit-tested here, not yet wired
+//! into the fire path.
 #![allow(dead_code)]
 
 use crate::store::kv::hash::{self, Hash256};
 use crate::store::kv::page_table::{PhysicalKvPageId, WorkingSetId};
-pub use crate::store::kv::project::PrepareError;
 use crate::store::kv::project::{KvProjection, KvWrite, project_kv};
 use crate::store::kv::write::{KvPreparedWrite, PageCommit, PreparedTarget};
 use crate::store::kv::{KvStore, KvStoreError};
 
-/// A KV prepare failure. Pool exhaustion stays typed so the fire path can
-/// route it through the contention ladder (acquire, then RETRY the prepare);
-/// everything else is a guest-visible fire error.
+/// A KV prepare failure. Pool exhaustion stays a typed variant
+/// (`OutOfPages`) so callers can tell it from guest-visible fire errors.
+/// The reserved fire path should never see it: demand is sized under the
+/// staleness gate and pages are lent from an owned grant, so exhaustion
+/// surfaces as a stale-demand retry BEFORE prepare, not here.
 #[derive(Debug)]
 pub enum KvError {
     /// The physical pool could not supply `requested` pages. Retryable after
@@ -179,6 +176,34 @@ fn build_commits(
     Ok(commits)
 }
 
+/// The mapped-overlap prologue shared by declaration realization and its
+/// demand probe: clamp the writable declaration to the mapped span and
+/// decide whether any overlap page is shared (needs COW work). `None` when
+/// the declaration has no mapped overlap. Keeping this in ONE place is what
+/// keeps the staleness gate honest — the demand probe and the realization
+/// must agree on which pages count.
+fn declaration_overlap(
+    store: &mut KvStore,
+    ws: WorkingSetId,
+    writable: std::ops::Range<u64>,
+) -> Result<Option<(u64, Vec<u64>, bool)>, KvError> {
+    let mapped = store.mapped_len(ws)?;
+    let start = writable.start.min(mapped);
+    let end = writable.end.min(mapped);
+    if start >= end {
+        return Ok(None);
+    }
+    let indexes: Vec<u64> = (start..end).collect();
+    let shared = indexes
+        .iter()
+        .copied()
+        .map(|index| store.privately_writable(ws, index))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .any(|private| !private);
+    Ok(Some((start, indexes, shared)))
+}
+
 /// Realize the mapped overlap of one writable declaration exactly once.
 /// Shared pages rebase through the existing COW protocol; private pages only
 /// lose transitional implicit-cache identity. Fresh backing is handled
@@ -188,52 +213,7 @@ pub fn realize_declaration(
     ws: WorkingSetId,
     writable: std::ops::Range<u64>,
 ) -> Result<((Vec<u32>, Vec<u32>), Option<KvTxn>), KvError> {
-    let mapped = store.mapped_len(ws)?;
-    let start = writable.start.min(mapped);
-    let end = writable.end.min(mapped);
-    if start >= end {
-        return Ok(((Vec::new(), Vec::new()), None));
-    }
-    let indexes: Vec<u64> = (start..end).collect();
-    let shared = indexes
-        .iter()
-        .copied()
-        .map(|index| store.privately_writable(ws, index))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .any(|private| !private);
-    if !shared {
-        store.opacify_suffix(ws, start)?;
-        return Ok(((Vec::new(), Vec::new()), None));
-    }
-
-    let prepared = store.prepare_write(ws, &indexes)?;
-    let commits = prepared
-        .targets()
-        .iter()
-        .map(|target| {
-            let index = target.index();
-            Ok(PageCommit {
-                token_hashes: store.page_token_hashes(ws, index)?,
-                page_hash: store.page_hash_at(ws, index)?,
-            })
-        })
-        .collect::<Result<Vec<_>, KvStoreError>>()?;
-    let copies = prepared
-        .copy_plan()
-        .map(|(src, dst)| (src.0, dst.0))
-        .unzip();
-    let (seq, cas_intents) = store.publish_prepared(prepared, &commits)?;
-    store.opacify_suffix(ws, start)?;
-    let (mapping_version, _) = build_translation(store, ws)?;
-    Ok((
-        copies,
-        Some(KvTxn {
-            seq,
-            cas_intents,
-            mapping_version,
-        }),
-    ))
+    realize_declaration_impl(store, ws, writable, None)
 }
 
 /// Physical-page demand for declaration realization without allocation,
@@ -243,24 +223,10 @@ pub fn realize_declaration_demand(
     ws: WorkingSetId,
     writable: std::ops::Range<u64>,
 ) -> Result<usize, KvError> {
-    let mapped = store.mapped_len(ws)?;
-    let start = writable.start.min(mapped);
-    let end = writable.end.min(mapped);
-    if start >= end {
-        return Ok(0);
+    match declaration_overlap(store, ws, writable)? {
+        Some((_, indexes, true)) => Ok(store.write_demand(ws, &indexes)?),
+        _ => Ok(0),
     }
-    let indexes: Vec<u64> = (start..end).collect();
-    let shared = indexes
-        .iter()
-        .copied()
-        .map(|index| store.privately_writable(ws, index))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .any(|private| !private);
-    if !shared {
-        return Ok(0);
-    }
-    Ok(store.write_demand(ws, &indexes)?)
 }
 
 /// Realize a declaration using caller-owned reserved pages. Consumes only the
@@ -271,26 +237,27 @@ pub fn realize_declaration_reserved(
     writable: std::ops::Range<u64>,
     granted: &mut Vec<PhysicalKvPageId>,
 ) -> Result<((Vec<u32>, Vec<u32>), Option<KvTxn>), KvError> {
-    let mapped = store.mapped_len(ws)?;
-    let start = writable.start.min(mapped);
-    let end = writable.end.min(mapped);
-    if start >= end {
+    realize_declaration_impl(store, ws, writable, Some(granted))
+}
+
+fn realize_declaration_impl(
+    store: &mut KvStore,
+    ws: WorkingSetId,
+    writable: std::ops::Range<u64>,
+    granted: Option<&mut Vec<PhysicalKvPageId>>,
+) -> Result<((Vec<u32>, Vec<u32>), Option<KvTxn>), KvError> {
+    let Some((start, indexes, shared)) = declaration_overlap(store, ws, writable)? else {
         return Ok(((Vec::new(), Vec::new()), None));
-    }
-    let indexes: Vec<u64> = (start..end).collect();
-    let shared = indexes
-        .iter()
-        .copied()
-        .map(|index| store.privately_writable(ws, index))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .any(|private| !private);
+    };
     if !shared {
         store.opacify_suffix(ws, start)?;
         return Ok(((Vec::new(), Vec::new()), None));
     }
 
-    let prepared = store.prepare_write_reserved(ws, &indexes, granted)?;
+    let prepared = match granted {
+        Some(granted) => store.prepare_write_reserved(ws, &indexes, granted)?,
+        None => store.prepare_write(ws, &indexes)?,
+    };
     let commits = prepared
         .targets()
         .iter()
@@ -373,20 +340,9 @@ pub fn match_prefix(
 /// [`finalize`]. `new_tokens`' VALUES are unused for the projection
 /// (pure page geometry keyed by the count); `hash_tokens = Some(values)` is
 /// the canonical-fire gate — the HOST-VERIFIED token values this fire embeds
-/// (see `canonical_kv_shape` + the host-known gate in `submit_pass`), which
-/// the committed pages hash under. `None` ⇒ opaque slot hashes.
+/// (see `canonical_kv_shape` + the host-known gate) — the committed pages
+/// hash under those values. `None` ⇒ opaque slot hashes.
 pub fn prepare(
-    store: &mut KvStore,
-    ws: WorkingSetId,
-    append_start: u32,
-    new_tokens: &[u32],
-    page_size: u32,
-    hash_tokens: Option<&[u32]>,
-) -> Result<(KvProjection, (Vec<u32>, Vec<u32>), Vec<u32>, KvTxn), KvError> {
-    prepare_impl(store, ws, append_start, new_tokens, page_size, hash_tokens)
-}
-
-fn prepare_impl(
     store: &mut KvStore,
     ws: WorkingSetId,
     append_start: u32,
@@ -421,7 +377,6 @@ fn prepare_impl(
             .1
             .iter()
             .copied()
-            .into_iter()
             .take(valid_pages)
             .map(|p| p.0)
             .collect()
@@ -434,8 +389,8 @@ fn prepare_impl(
     }
 
     // Classify + allocate the write slots [output_start, needed_pages).
-    // `KvStoreError::OutOfPages` stays typed through here — the caller
-    // routes it into the contention ladder and retries.
+    // `KvStoreError::OutOfPages` stays typed through here; the caller
+    // (the offload path) decides how to surface it.
     let output_start = (append_start / page_size) as u64;
     let write_indexes: Vec<u64> = (output_start..needed_pages).collect();
     let prepared = store.prepare_write(ws, &write_indexes)?;
@@ -506,55 +461,6 @@ fn prepare_impl(
     Ok((
         proj,
         (copy_src, copy_dst),
-        translation,
-        KvTxn {
-            seq,
-            cas_intents,
-            mapping_version: translation_version,
-        },
-    ))
-}
-
-/// Prepare an explicit-KV (device-geometry) fire: physical pages for
-/// `write_indexes` with no host projection — the driver resolves the geometry
-/// itself and the inferlet owns the token bookkeeping. Returns the
-/// `(index, physical id)` pairs for the granted slots, the CoW copy plan, and
-/// the held transaction.
-pub fn prepare_explicit(
-    store: &mut KvStore,
-    ws: WorkingSetId,
-    write_indexes: &[u64],
-) -> Result<(Vec<(u64, u32)>, (Vec<u32>, Vec<u32>), Vec<u32>, KvTxn), KvError> {
-    let prepared = store.prepare_write(ws, write_indexes)?;
-    let pages: Vec<(u64, u32)> = prepared
-        .targets()
-        .iter()
-        .map(|t| (t.index(), t.dst().0))
-        .collect();
-    let copies = prepared.copy_plan().map(|(s, d)| (s.0, d.0)).unzip();
-    // Device-geometry fires are non-canonical by construction, and the
-    // device owns the token bookkeeping — commit with no hash metadata;
-    // `KvStore::commit` poisons the chain state with an opaque draw.
-    let commits: Vec<PageCommit> = prepared
-        .targets()
-        .iter()
-        .map(|_| PageCommit {
-            token_hashes: Vec::new(),
-            page_hash: None,
-        })
-        .collect();
-    let (seq, cas_intents) = store.publish_prepared(prepared, &commits)?;
-    let (translation_version, translation) = match build_translation(store, ws) {
-        Ok(translation) => translation,
-        Err(error) => {
-            store.settle(cas_intents, false);
-            store.retire_through(seq);
-            return Err(error.into());
-        }
-    };
-    Ok((
-        pages,
-        copies,
         translation,
         KvTxn {
             seq,
@@ -644,30 +550,6 @@ pub fn finalize(store: &mut KvStore, txn: KvTxn, success: bool) -> Result<(), St
     Ok(())
 }
 
-/// Reject a forward with no query rows. `num_input_rows` is the driver
-/// `token_ids` length — text tokens plus the placeholder rows that image/audio
-/// spans contribute — i.e. the span of `qo_indptr`. A pass must compute at
-/// least one row; this mirrors the old context API's "must supply at least one
-/// token" invariant (W4: input lineage is inferlet-owned, so the runtime can no
-/// longer infer a token from an ambient context).
-pub fn check_input_nonempty(num_input_rows: usize) -> Result<(), PrepareError> {
-    if num_input_rows == 0 {
-        Err(PrepareError::NoInputTokens)
-    } else {
-        Ok(())
-    }
-}
-
-/// Validate a captured generation against the working set's current one.
-/// Called first in prepare so a stale mutation fails before any arena work.
-pub fn check_generation(captured: u32, current: u32) -> Result<(), PrepareError> {
-    if captured == current {
-        Ok(())
-    } else {
-        Err(PrepareError::StaleGeneration { captured, current })
-    }
-}
-
 /// Bind-time half of the canonical-KV gate (kv_refact.md, "Token-Slot
 /// Hashes, Page Hashes, and Trie Matching"): the pass writes exactly what
 /// the vanilla model produces for one appended token run under full causal
@@ -724,67 +606,6 @@ pub struct CanonicalFireEvidence {
     page_indptr: Option<Vec<u32>>,
     w_slot: Option<Vec<u32>>,
     w_off: Option<Vec<u32>>,
-}
-
-/// Fire-time half of the canonical-KV gate, over the fire's **evaluated
-/// descriptor ports** (`pie_ptir::pareval` folded through the host shadow):
-/// the host-verified token values this fire embeds, the kv-len it attends,
-/// and the append geometry the host derived. `None` unless the bind-time
-/// shape passed ([`canonical_kv_shape`], captured as `canonical_kv` at bind)
-/// and the embed/kv-len values are host-known — a device-decided value
-/// (loop-carried sampler output past the seed fire) yields no evidence, it
-/// never guesses. [`canonical_hash_tokens`] then verifies the values form
-/// this fire's contiguous full-context append.
-pub fn canonical_fire_evidence(
-    canonical_kv: bool,
-    ports: &[(
-        pie_ptir::registry::Port,
-        Result<pie_ptir::interp::Value, String>,
-    )],
-    container: &pie_ptir::container::TraceContainer,
-) -> Option<CanonicalFireEvidence> {
-    use pie_ptir::registry::Port;
-
-    if !canonical_kv {
-        return None;
-    }
-    let get = |port: Port| ports.iter().find(|(p, _)| *p == port);
-    let known = |port: Port| -> Option<Vec<u32>> {
-        match get(port) {
-            Some((_, Ok(value))) => Some(super::geometry::value_as_u32(value)),
-            _ => None,
-        }
-    };
-    // Unbound is fine (`Some(None)`); bound-but-unknown kills the evidence.
-    let optional = |port: Port| -> Option<Option<Vec<u32>>> {
-        match get(port) {
-            None => Some(None),
-            Some((_, Ok(value))) => Some(Some(super::geometry::value_as_u32(value))),
-            Some((_, Err(_))) => None,
-        }
-    };
-    let page_indptr = optional(pie_ptir::registry::Port::PageIndptr)?;
-    let pages = match optional(Port::Pages)? {
-        Some(raw) => Some(
-            super::geometry::compact_page_envelope(
-                container,
-                raw,
-                page_indptr.as_deref().unwrap_or(&[]),
-            )
-            .ok()?,
-        ),
-        None => None,
-    };
-    Some(CanonicalFireEvidence {
-        tokens: known(Port::EmbedTokens)?,
-        kv_len: known(Port::KvLen)?,
-        embed_indptr: optional(Port::EmbedIndptr)?,
-        positions: optional(Port::Positions)?,
-        pages,
-        page_indptr,
-        w_slot: optional(Port::WSlot)?,
-        w_off: optional(Port::WOff)?,
-    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -48,7 +48,7 @@ impl crate::pipeline::fire::FireContext for ProcessCtx {
     }
 
     async fn honor_preemption(&mut self) -> anyhow::Result<()> {
-        crate::inferlet::process::preemption::honor(self).await
+        crate::inferlet::process::preemption::yield_point(self).await
     }
 
     fn preemption_signal(&self) -> Option<std::sync::Arc<tokio::sync::Notify>> {

@@ -191,28 +191,15 @@ async fn materialize_channel(
 ) -> Anyhow<Result<Vec<u8>, String>> {
     let mut settle_ready_take = true;
     loop {
-        let state = accessor.with(|mut access| {
-            poll_channel(
-                access.get(),
-                &this,
-                mode,
-                false,
-                settle_ready_take,
-            )
-        })?;
+        let state = accessor
+            .with(|mut access| poll_channel(access.get(), &this, mode, false, settle_ready_take))?;
         let state = match state {
             ChannelPoll::Pending {
                 fires: Some(fires), ..
             } => {
                 let _finalize_guard = fires.finalize_guard().await;
                 let state = accessor.with(|mut access| {
-                    poll_channel(
-                        access.get(),
-                        &this,
-                        mode,
-                        true,
-                        settle_ready_take,
-                    )
+                    poll_channel(access.get(), &this, mode, true, settle_ready_take)
                 })?;
                 match state {
                     ChannelPoll::Finalize(op) => {
@@ -273,7 +260,7 @@ impl pie::inferlet::forward::Host for ProcessCtx {
             let _ = self.ctx().table.get(&fwd)?;
         }
         crate::inferlet::process::ensure_execution_admitted(self).await;
-        crate::inferlet::process::preemption::contention_gate(self).await?;
+        crate::inferlet::process::preemption::serialize_under_contention(self).await?;
         crate::pipeline::fire::submit_frame(self, on, slot_reps).await
     }
 }
@@ -285,7 +272,7 @@ impl pie::inferlet::forward::HostChannel for ProcessCtx {
         dtype: pie::inferlet::types::Dtype,
         capacity: u32,
     ) -> Anyhow<Resource<Channel>> {
-        crate::inferlet::process::preemption::honor(self).await?;
+        crate::inferlet::process::preemption::yield_point(self).await?;
         // Pure host bookkeeping — never fails at construction (the WIT
         // constructor cannot carry a result; a channel/decl mismatch instead
         // errors at forward-pass.new / submit).
@@ -301,7 +288,7 @@ impl pie::inferlet::forward::HostChannel for ProcessCtx {
     }
 
     async fn put(&mut self, this: Resource<Channel>, value: Vec<u8>) -> Anyhow<Result<(), String>> {
-        crate::inferlet::process::preemption::contention_gate(self).await?;
+        crate::inferlet::process::preemption::serialize_under_contention(self).await?;
         let cell = self.ctx().table.get(&this)?.cell.clone();
         loop {
             let result = cell.lock().unwrap().put_ref(&value);
@@ -327,7 +314,7 @@ impl pie::inferlet::forward::HostChannel for ProcessCtx {
     }
 
     async fn set(&mut self, this: Resource<Channel>, value: Vec<u8>) -> Anyhow<Result<(), String>> {
-        crate::inferlet::process::preemption::contention_gate(self).await?;
+        crate::inferlet::process::preemption::serialize_under_contention(self).await?;
         let cell = self.ctx().table.get(&this)?.cell.clone();
         let result = cell
             .lock()
@@ -371,7 +358,7 @@ impl pie::inferlet::forward::HostChannelWithStore<ProcessCtx> for HasSelf<Proces
 
 impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
     async fn new(&mut self) -> Anyhow<Resource<ForwardPass>> {
-        crate::inferlet::process::preemption::honor(self).await?;
+        crate::inferlet::process::preemption::yield_point(self).await?;
         Ok(self.ctx().table.push(ForwardPass::new())?)
     }
 
@@ -932,15 +919,10 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
                 bound_instance,
                 scheduler,
                 cells,
-                channel_ids,
                 channel_reps,
                 fires: None,
                 kv_ws: ws_rep,
-                kv_declaration: crate::pipeline::instance::KvDeclaration {
-                    ws_rep,
-                    readable,
-                    writable,
-                },
+                kv_declaration: crate::pipeline::instance::KvDeclaration { readable, writable },
                 rs_ws: rs_reps,
                 kv_declaration_realized: false,
                 failed: None,
@@ -1102,7 +1084,6 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
         }
         Ok(())
     }
-
 }
 
 #[cfg(test)]

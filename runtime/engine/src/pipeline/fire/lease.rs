@@ -25,14 +25,12 @@
 //! [`detect_device_geometry`] + [`DevGeo`] are the paired bind-time detector
 //! and per-pass lease bundle.
 //!
-//! Complete pipeline domain API: some methods here (relaxed geometry
-//! variants, per-channel introspection, the pure `instantiate`/registry
-//! probe entry points, device-geometry lease internals) are not yet
-//! called by the current single-model/mock-driver fire path, but are
-//! exercised by this module's own unit tests and reserved for upcoming
-//! wiring (multi-pass channels, device-geometry beams) — kept rather
-//! than deleted, allowed rather than silently masked.
-#![allow(dead_code)]
+//! Everything here — [`PageLease::new`]/[`seed`](PageLease::seed)/
+//! [`grant`](PageLease::grant)/[`reclaim_after_fire`](PageLease::reclaim_after_fire)/
+//! [`reclaim_all`](PageLease::reclaim_all), every [`DevGeo`] field, and
+//! [`detect_device_geometry`] — is on the production device-geometry path in
+//! `inferlet::host::forward` and `pipeline::fire`. The two items that are
+//! not carry their own annotated `allow`.
 
 /// A per-device-geometry-pass physical page lease. Tracks the pages granted to
 /// each in-flight fire (FIFO) so unused fresh grants are reclaimed as fires
@@ -116,7 +114,9 @@ impl PageLease {
         all
     }
 
-    /// Number of in-flight (un-reclaimed) fires — the pin-float depth × B bound.
+    /// Number of in-flight (un-reclaimed) fires — the pin-float depth × B
+    /// bound. Asserted by this module's unit tests; no production reader.
+    #[cfg(test)]
     pub fn in_flight(&self) -> usize {
         self.pending.len()
     }
@@ -139,9 +139,12 @@ pub struct DevGeo {
     /// at finalize to reclaim continuing heirs' unused fresh pages.
     pub w_cont_dense: usize,
     /// The program binds an `AttnMask` descriptor channel (dense per-cell
-    /// mask). Such fires are scheduled SOLO: the driver's composed
-    /// multi-program batch does not merge dense device masks with other
-    /// programs' geometry (v1 scope).
+    /// mask). Detected at bind and asserted by tests, but NOT yet consulted
+    /// by the fire or scheduler path: the intended rule — such fires are
+    /// scheduled SOLO, because the driver's composed multi-program batch
+    /// does not merge dense device masks with other programs' geometry (v1
+    /// scope) — is unwired. The `allow` marks that gap rather than hiding it.
+    #[allow(dead_code)]
     pub has_mask: bool,
 }
 

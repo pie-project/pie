@@ -1,7 +1,7 @@
 //! Process-owned membership inventory for KV/RS working sets and fire queues.
 
-use std::collections::HashSet;
-use std::sync::Weak;
+use std::collections::{HashMap, HashSet};
+use std::sync::{LazyLock, Mutex, RwLock, Weak};
 
 use crate::pipeline::fire::{PendingFireQueue, PendingFires};
 use crate::store::kv::page_table::WorkingSetId;
@@ -24,13 +24,14 @@ pub(crate) struct ProcessResidency {
 #[derive(Clone)]
 pub(crate) struct ResidencySnapshot {
     pub kv_working_sets: HashSet<(usize, crate::driver::DriverId, WorkingSetId)>,
-    pub rs_working_sets: HashSet<(usize, crate::driver::DriverId, RsWorkingSetId)>,
     pub pipelines: Vec<PendingFires>,
     pub departed_pipeline_ids: Vec<uuid::Uuid>,
 }
 
 impl ProcessResidency {
-    pub(crate) fn snapshot(&mut self) -> ResidencySnapshot {
+    /// Just the live pipeline queues — the hot-path subset of
+    /// [`Self::snapshot`], skipping the working-set clones.
+    pub(crate) fn pipelines(&mut self) -> Vec<PendingFires> {
         let pipelines: Vec<_> = self
             .pipelines
             .iter()
@@ -38,10 +39,13 @@ impl ProcessResidency {
             .collect();
         self.pipelines
             .retain(|pipeline| pipeline.fires.strong_count() > 0);
+        pipelines
+    }
+
+    pub(crate) fn snapshot(&mut self) -> ResidencySnapshot {
         ResidencySnapshot {
+            pipelines: self.pipelines(),
             kv_working_sets: self.kv_working_sets.clone(),
-            rs_working_sets: self.rs_working_sets.clone(),
-            pipelines,
             departed_pipeline_ids: Vec::new(),
         }
     }
@@ -50,17 +54,72 @@ impl ProcessResidency {
         let departed_pipeline_ids = self
             .pipelines
             .iter()
-            .filter_map(|pipeline| {
-                pipeline
-                    .scope
-                    .close()
-                    .then(|| pipeline.scope.scheduler_id())
-            })
+            // `close` is the side effect: it claims the departure exactly
+            // once, so a second teardown snapshot reports nothing.
+            .filter(|pipeline| pipeline.scope.close())
+            .map(|pipeline| pipeline.scope.scheduler_id())
             .collect();
         let mut snapshot = self.snapshot();
         snapshot.departed_pipeline_ids = departed_pipeline_ids;
         snapshot
     }
+}
+
+/// pid → residency, for cross-layer probes that only know a process id
+/// (victim footprint sizing). Weak entries; pruned on unregister and on
+/// probe misses.
+static RESIDENCIES: LazyLock<RwLock<HashMap<uuid::Uuid, Weak<Mutex<ProcessResidency>>>>> =
+    LazyLock::new(Default::default);
+
+pub(crate) fn register_residency(pid: uuid::Uuid, residency: Weak<Mutex<ProcessResidency>>) {
+    RESIDENCIES.write().unwrap().insert(pid, residency);
+}
+
+pub(crate) fn unregister_residency(pid: uuid::Uuid) {
+    RESIDENCIES.write().unwrap().remove(&pid);
+}
+
+/// Pages only each candidate's working sets can free on `(model, driver)`
+/// — the contention ladder's victim-cost figures (D6 smallest-cover),
+/// computed for the whole candidate set under ONE store lock. `None` for a
+/// process that is unknown or already tearing down.
+pub(crate) fn kv_exclusive_footprints(
+    pids: &[uuid::Uuid],
+    model: usize,
+    driver: usize,
+) -> Vec<Option<u32>> {
+    let working_sets: Vec<Option<Vec<WorkingSetId>>> = {
+        let residencies = RESIDENCIES.read().unwrap();
+        pids.iter()
+            .map(|pid| {
+                let residency = residencies.get(pid)?.upgrade()?;
+                let residency = residency.lock().unwrap();
+                Some(
+                    residency
+                        .kv_working_sets
+                        .iter()
+                        .filter_map(|&(m, d, ws)| (m == model && d == driver).then_some(ws))
+                        .collect(),
+                )
+            })
+            .collect()
+    };
+    let Some(stores) = crate::store::registry::try_get(model, driver) else {
+        return vec![None; pids.len()];
+    };
+    crate::store::registry::with_kv_lock(&stores.kv, "reclaim", |kv| {
+        working_sets
+            .into_iter()
+            .map(|working_sets| {
+                let working_sets = working_sets?;
+                let total: u64 = working_sets
+                    .iter()
+                    .map(|&ws| kv.exclusive_footprint(ws).unwrap_or(0))
+                    .sum();
+                u32::try_from(total).ok()
+            })
+            .collect()
+    })
 }
 
 #[cfg(test)]

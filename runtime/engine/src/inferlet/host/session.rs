@@ -14,7 +14,7 @@ use wasmtime::component::{Accessor, HasSelf};
 
 impl pie::inferlet::session::Host for ProcessCtx {
     async fn send(&mut self, message: String) -> Result<()> {
-        crate::inferlet::process::preemption::honor(self).await?;
+        crate::inferlet::process::preemption::yield_point(self).await?;
         let process_id = self.id();
         if let Ok(Some(client_id)) = process::get_client_id(process_id).await {
             if let Err(err) =
@@ -32,7 +32,7 @@ impl pie::inferlet::session::Host for ProcessCtx {
     }
 
     async fn send_file(&mut self, data: Vec<u8>) -> Result<()> {
-        crate::inferlet::process::preemption::honor(self).await?;
+        crate::inferlet::process::preemption::yield_point(self).await?;
         let process_id = self.id();
         if let Ok(Some(client_id)) = process::get_client_id(process_id).await {
             server::send_file(client_id, process_id, data.into())?;

@@ -24,7 +24,7 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
     /// driver 0. Geometry comes from the model's RS caps (0/0/1 for
     /// pure-attention models).
     async fn new(&mut self) -> Result<Resource<RsWorkingSet>> {
-        crate::inferlet::process::preemption::honor(self).await?;
+        crate::inferlet::process::preemption::yield_point(self).await?;
         let model = 0;
         let caps = pie_model::model().rs_caps();
         let geom = RsGeometry {
@@ -40,12 +40,12 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
     }
 
     async fn state_size(&mut self, this: Resource<RsWorkingSet>) -> Result<u64> {
-        crate::inferlet::process::preemption::honor(self).await?;
+        crate::inferlet::process::preemption::yield_point(self).await?;
         Ok(self.ctx().table.get(&this)?.geom.state_size)
     }
 
     async fn buffer_size(&mut self, this: Resource<RsWorkingSet>) -> Result<u32> {
-        crate::inferlet::process::preemption::honor(self).await?;
+        crate::inferlet::process::preemption::yield_point(self).await?;
         let ws = self.ctx().table.get(&this)?.clone();
         let stores = store_registry::get(ws.model, ws.driver as usize);
         let size = stores.rs.lock().unwrap().buffer_size(ws.id);
@@ -53,7 +53,7 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
     }
 
     async fn buffer_page_size(&mut self, this: Resource<RsWorkingSet>) -> Result<u32> {
-        crate::inferlet::process::preemption::honor(self).await?;
+        crate::inferlet::process::preemption::yield_point(self).await?;
         Ok(self.ctx().table.get(&this)?.geom.buffer_page_tokens)
     }
 
@@ -64,7 +64,7 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
     ) -> Result<Result<WitRange, String>> {
         // Strict admission: RS buffer slots are scarce pooled resources.
         crate::inferlet::process::ensure_bind_admitted(self).await;
-        crate::inferlet::process::preemption::honor(self).await?;
+        crate::inferlet::process::preemption::yield_point(self).await?;
         let ws = self.ctx().table.get(&this)?.clone();
         let stores = store_registry::get(ws.model, ws.driver as usize);
         let range = stores.rs.lock().unwrap().alloc_buffer(ws.id, n);
@@ -81,7 +81,7 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
         this: Resource<RsWorkingSet>,
         indices: Vec<u32>,
     ) -> Result<Result<(), String>> {
-        crate::inferlet::process::preemption::honor(self).await?;
+        crate::inferlet::process::preemption::yield_point(self).await?;
         let ws = self.ctx().table.get(&this)?.clone();
         let stores = store_registry::get(ws.model, ws.driver as usize);
         let mut rs = stores.rs.lock().unwrap();
@@ -98,7 +98,7 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
         this: Resource<RsWorkingSet>,
         perm: Vec<u32>,
     ) -> Result<Result<(), String>> {
-        crate::inferlet::process::preemption::honor(self).await?;
+        crate::inferlet::process::preemption::yield_point(self).await?;
         let ws = self.ctx().table.get(&this)?.clone();
         let stores = store_registry::get(ws.model, ws.driver as usize);
         let out = stores
@@ -115,7 +115,7 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
         this: Resource<RsWorkingSet>,
         on: Resource<Pipeline>,
     ) -> Result<Result<Resource<RsWorkingSet>, String>> {
-        crate::inferlet::process::preemption::honor(self).await?;
+        crate::inferlet::process::preemption::yield_point(self).await?;
         // A channel value can become host-visible just before its fire's
         // completion callback is drained. Fork must therefore retire every
         // earlier operation on `on` before snapshotting the parent's committed
@@ -160,7 +160,7 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
     }
 
     async fn drop(&mut self, this: Resource<RsWorkingSet>) -> Result<()> {
-        crate::inferlet::process::preemption::honor(self).await?;
+        crate::inferlet::process::preemption::yield_point(self).await?;
         // `release` performs the exact `release_working_set` /
         // `retire_idle` sequence and marks the shared lifecycle done; `ws`'s
         // own drop just below (and the fallback `RsLifecycle::drop` it would

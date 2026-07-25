@@ -165,10 +165,6 @@ pub struct DriverConfig {
 pub struct SchedulerConfig {
     /// Wall-clock cap on a single forward-pass request, in seconds.
     pub request_timeout_secs: u64,
-    /// Hard admission gate for the restore loop: pause restoring suspended
-    /// contexts when any driver's GPU page utilization exceeds this fraction.
-    /// Prevents the evict→restore→re-evict thrash cascade. Range: (0.0, 1.0].
-    pub restore_pause_at_utilization: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -208,6 +204,9 @@ pub async fn bootstrap_with_listener(
 }
 
 async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
+    // The bootstrap edge is the ONLY place contention knobs leave the
+    // environment; everything downstream receives this value explicitly.
+    let contention_config = crate::store::reclaim::ContentionConfig::from_env();
     verify_config(&config)?;
     let mut active_guard = ActiveRuntimeGuard::acquire()?;
 
@@ -302,6 +301,14 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         .iter()
         .map(|d| d.elastic_page_bytes != 0 && d.elastic_budget_pages != 0)
         .collect();
+    // Whether driver 0 (the contention-managed pool; working sets are
+    // hardwired to (0, 0) until the per-driver core lands) can physically
+    // move KV bytes to/from host swap — arms the suspend rung.
+    let kv_swap_required =
+        pie_driver_abi::KV_COPY_DEVICE_TO_HOST | pie_driver_abi::KV_COPY_HOST_TO_DEVICE;
+    let kv_swap_capable = driver_configs
+        .first()
+        .is_some_and(|d| d.kv_copy_domain_mask & kv_swap_required == kv_swap_required);
     let driver_count = driver_configs.len();
     let drivers: Vec<usize> = driver_configs
         .into_iter()
@@ -329,32 +336,39 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         &arena_rs_slots,
     );
 
-    // Task-B contention orchestrator (`PIE_KV_CONTENTION=preempt`): KV pool
-    // exhaustion becomes FCFS preempt/restore instead of an inferlet error;
-    // `max_concurrent_processes` stays a physical safety cap only. Off by
-    // default — the legacy error path is byte-for-byte unchanged. The
-    // existing `scheduler.restore_pause_at_utilization` config gates the
-    // restore anti-thrash pause (its long-reserved consumer).
-    if crate::store::reclaim::contention_mode() == crate::store::reclaim::ContentionMode::Preempt {
-        // Backend tiers: passive v1 (waiters ride natural frees — proven
-        // e2e, M-AB ②③) by default; `PIE_KV_PREEMPT_ACTIVE=1` selects the
-        // v2 self-suspend backend (active FCFS victim preempt).
-        let backend: Box<dyn crate::store::reclaim::ReclaimBackend> =
-            if crate::store::reclaim::preempt_active() {
-                Box::new(crate::store::reclaim::SelfSuspendBackend::new(
-                    arena_model_idx,
-                    0,
-                ))
-            } else {
-                Box::new(crate::store::reclaim::KvPoolBackend::new(
-                    arena_model_idx,
-                    0,
-                ))
-            };
-        crate::store::reclaim::init_contention(crate::store::reclaim::ContentionOrchestrator::new(
-            backend,
-            scheduler.restore_pause_at_utilization,
-        ));
+    // Contention orchestrator — ALWAYS installed: KV pool exhaustion is
+    // FCFS preempt/restore, never an inferlet error; there is no legacy
+    // mode. `max_concurrent_processes` stays a physical safety cap only.
+    // The suspend rung arms by CAPABILITY, not policy: a driver that
+    // advertises D2H+H2D KV copies gets active self-suspend; one that
+    // cannot move KV bytes (no host swap transport) degrades to pool-only
+    // orchestration — waiters ride idle reclaim and natural frees.
+    crate::store::reclaim::init_contention(
+        arena_model_idx,
+        0,
+        crate::store::reclaim::ContentionOrchestrator::new(
+            std::sync::Arc::new(crate::store::reclaim::RegistryPool::new(
+                arena_model_idx,
+                0,
+                kv_swap_capable,
+            )),
+            contention_config,
+        ),
+    );
+    if let Some(orchestrator) =
+        crate::store::reclaim::contention_for(arena_model_idx, 0)
+    {
+        // D7's kill rung: runtime-level terminate (quiesce-first, GPU
+        // lifetime respected, transactions unwound by the RAII guards) —
+        // never an OS signal, never a cleanup bypass.
+        orchestrator.set_kill_hook(|pid, reason| {
+            crate::inferlet::process::terminate(pid, Err(reason));
+        });
+        // D6's cost figure: pages only the candidate's working sets can
+        // free — smallest-cover selection minimizes wasted copies.
+        orchestrator.set_footprint_probe(|pids, model, driver| {
+            crate::inferlet::process::residency::kv_exclusive_footprints(pids, model, driver)
+        });
     }
 
     // (Context actor `context::spawn` removed — Phase 5. The unified arena
@@ -458,9 +472,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     //    directly from `inferlet::process`, which needs no such hook).
     crate::store::reclaim::set_pipeline_leave_hook(|pid, kind| {
         let kind = match kind {
-            crate::store::reclaim::LeaveKind::Terminate => {
-                crate::scheduler::worker::LeaveKind::Terminate
-            }
             crate::store::reclaim::LeaveKind::AllocationWait => {
                 crate::scheduler::worker::LeaveKind::Close
             }
@@ -521,44 +532,6 @@ fn verify_config(config: &Config) -> Result<()> {
             model.name
         );
     }
-    if crate::store::reclaim::contention_mode() == crate::store::reclaim::ContentionMode::Preempt
-        && crate::store::reclaim::preempt_active()
-    {
-        ensure!(
-            model.drivers.len() == 1,
-            "Model {:?}: active KV preemption currently requires exactly one driver",
-            model.name
-        );
-        let driver = &model.drivers[0];
-        ensure!(
-            matches!(driver.backend_kind.as_str(), "cuda" | "dummy"),
-            "Model {:?}: active KV preemption requires CUDA (dummy is allowed for deterministic tests), got {}",
-            model.name,
-            driver.backend_kind
-        );
-        let required =
-            pie_driver_abi::KV_COPY_DEVICE_TO_HOST | pie_driver_abi::KV_COPY_HOST_TO_DEVICE;
-        ensure!(
-            driver.kv_copy_domain_mask & required == required,
-            "Model {:?}: active KV preemption requires device-to-host and host-to-device KV copies",
-            model.name
-        );
-    }
-
-    // `restore_pause_at_utilization` is a GPU-utilization fraction in (0.0, 1.0]:
-    // the restore loop pauses while any driver's page utilization exceeds it.
-    // A value <= 0.0 makes the check `utilization > threshold` true even on an
-    // empty GPU (utilization == 0.0), so restore is paused forever and any
-    // suspended context's deferred page op deadlocks. Reject it fast here rather
-    // than hang at runtime.
-    ensure!(
-        model.scheduler.restore_pause_at_utilization > 0.0
-            && model.scheduler.restore_pause_at_utilization <= 1.0,
-        "Model {:?}: scheduler.restore_pause_at_utilization must be in (0.0, 1.0], got {}",
-        model.name,
-        model.scheduler.restore_pause_at_utilization
-    );
-
     Ok(())
 }
 

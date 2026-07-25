@@ -287,7 +287,11 @@ impl ProcessCtx {
             dynamic_resource_map: HashMap::new(),
             guest_resource_map: Vec::new(),
             next_dynamic_rep: 1,
-            residency: Arc::new(Mutex::new(ProcessResidency::default())),
+            residency: {
+                let residency = Arc::new(Mutex::new(ProcessResidency::default()));
+                super::residency::register_residency(id, Arc::downgrade(&residency));
+                residency
+            },
             prewarm_permit: None,
             bind_permit: None,
             bind_admitted: false,
@@ -369,6 +373,11 @@ impl ProcessCtx {
 
     pub(crate) fn residency_snapshot(&self) -> ResidencySnapshot {
         self.residency.lock().unwrap().snapshot()
+    }
+
+    /// Just the live pipeline queues — for the per-prologue hot paths.
+    pub(crate) fn residency_pipelines(&self) -> Vec<crate::pipeline::fire::PendingFires> {
+        self.residency.lock().unwrap().pipelines()
     }
 
     pub(crate) fn register_kv_working_set(

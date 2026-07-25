@@ -1128,9 +1128,10 @@ fn store_suspend_restore_roundtrip_remaps_without_exposing_stale_ids() {
     ));
     assert!(store.flat_table(ws).is_err());
 
-    let granted = store.reserve_device_pages(3).unwrap();
+    let mut granted = store.reserve_device_pages(3).unwrap();
     let restored_ids = granted.clone();
-    let txn = store.prepare_restore(&working_sets, granted).unwrap();
+    let txn = store.prepare_restore(&working_sets, &mut granted).unwrap();
+    assert!(granted.is_empty(), "restore consumes the exact prefix");
     assert_eq!(txn.page_count(), 3);
     store.commit_restore(txn).unwrap();
 
@@ -1168,8 +1169,8 @@ fn store_suspend_and_restore_abort_are_leak_free() {
         other => panic!("expected suspend transaction, got {other:?}"),
     };
     store.commit_suspend(suspend).unwrap();
-    let granted = store.reserve_device_pages(2).unwrap();
-    let restore = store.prepare_restore(&working_sets, granted).unwrap();
+    let mut granted = store.reserve_device_pages(2).unwrap();
+    let restore = store.prepare_restore(&working_sets, &mut granted).unwrap();
     store.abort_restore(restore);
     assert_eq!(store.available_pages(), 4);
     assert_eq!(store.host_swap_available(), 2);
@@ -1284,8 +1285,8 @@ fn teardown_during_residency_transactions_reclaims_pinned_orphans() {
         other => panic!("expected suspend transaction, got {other:?}"),
     };
     store.commit_suspend(suspend).unwrap();
-    let granted = store.reserve_device_pages(2).unwrap();
-    let restore = store.prepare_restore(&working_sets, granted).unwrap();
+    let mut granted = store.reserve_device_pages(2).unwrap();
+    let restore = store.prepare_restore(&working_sets, &mut granted).unwrap();
     let epoch = store.current_epoch();
     store.release_working_set(ws, epoch);
     store.abort_restore(restore);
@@ -1304,8 +1305,8 @@ fn teardown_during_successful_restore_retires_reclaimed_pages() {
         other => panic!("expected suspend transaction, got {other:?}"),
     };
     store.commit_suspend(suspend).unwrap();
-    let granted = store.reserve_device_pages(2).unwrap();
-    let restore = store.prepare_restore(&working_sets, granted).unwrap();
+    let mut granted = store.reserve_device_pages(2).unwrap();
+    let restore = store.prepare_restore(&working_sets, &mut granted).unwrap();
     let epoch = store.current_epoch();
     store.release_working_set(ws, epoch);
     store.commit_restore(restore).unwrap();
