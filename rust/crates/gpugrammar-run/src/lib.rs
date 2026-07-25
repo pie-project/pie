@@ -8,23 +8,45 @@
 //!
 //! ```text
 //! for each group of the current lexer state
-//!     replay its terminal sequence against a copy of the parser stack
-//!     if the replay survives, union the group's token bitset into the mask
+//!     for each way the group's tokens can be read
+//!         replay its terminal sequence against a copy of the parser stack
+//!     if any replay survives, union the group's token bitset into the mask
 //! ```
 //!
-//! The cost is one replay per group — a few hundred, independent of the
-//! vocabulary — rather than one check per token.
+//! The cost is a few replays per group — a few hundred groups, independent of
+//! the vocabulary — rather than one check per token.
+//!
+//! Scanning a generated lexicon is not deterministic. A whole regular rule
+//! becomes one terminal, so `{` is both a complete terminal and the start of a
+//! longer one covering an entire object, and a declared property name is also
+//! a generic string. Committing to one reading and hoping is wrong: the reading
+//! that survives the next token is not knowable yet. The matcher therefore
+//! carries every configuration still alive - a lexer state paired with a parser
+//! stack - and a token is admissible when it leaves at least one. That is the
+//! same shape as a parser with a state set, kept small because the ambiguity is
+//! local: it resolves within a token or two.
 
 use std::sync::Arc;
 
 use gpugrammar_tables::Artifact;
 
-/// A parse in progress: a lexer state plus the LR stack.
+/// One live reading of the input: a lexer state and the LR stack it produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Config {
+    lexer_state: u32,
+    stack: Vec<u32>,
+}
+
+/// How many configurations to carry. Ambiguity in these grammars is local, so
+/// the set collapses within a token or two; the cap only bounds the worst case.
+/// Dropping configurations can only make the matcher stricter, never looser.
+const MAX_CONFIGS: usize = 64;
+
+/// A parse in progress.
 #[derive(Debug, Clone)]
 pub struct Matcher {
     artifact: Arc<Artifact>,
-    lexer_state: u32,
-    stack: Vec<u32>,
+    configs: Vec<Config>,
     history: Vec<Snapshot>,
     max_rollback: usize,
     terminated: bool,
@@ -32,8 +54,7 @@ pub struct Matcher {
 
 #[derive(Debug, Clone)]
 struct Snapshot {
-    lexer_state: u32,
-    stack: Vec<u32>,
+    configs: Vec<Config>,
     terminated: bool,
 }
 
@@ -48,21 +69,33 @@ pub enum Refusal {
 impl Matcher {
     pub fn new(artifact: Arc<Artifact>, max_rollback: usize) -> Self {
         Self {
-            stack: vec![artifact.start_parser_state],
+            configs: vec![Config {
+                lexer_state: 0,
+                stack: vec![artifact.start_parser_state],
+            }],
             artifact,
-            lexer_state: 0,
             history: Vec::new(),
             max_rollback,
             terminated: false,
         }
     }
 
+    /// The lexer state of the first live configuration, for diagnostics.
     pub fn lexer_state(&self) -> u32 {
-        self.lexer_state
+        self.configs.first().map_or(0, |config| config.lexer_state)
     }
 
+    /// The parser state of the first live configuration, for diagnostics.
     pub fn parser_state(&self) -> u32 {
-        *self.stack.last().expect("the stack is never empty")
+        self.configs
+            .first()
+            .and_then(|config| config.stack.last().copied())
+            .unwrap_or(self.artifact.start_parser_state)
+    }
+
+    /// How many readings are still alive.
+    pub fn num_configs(&self) -> usize {
+        self.configs.len()
     }
 
     pub fn is_terminated(&self) -> bool {
@@ -70,73 +103,113 @@ impl Matcher {
     }
 
     /// Can the input end here?
+    ///
+    /// A lexeme may still be in progress: the closing brace of an object is
+    /// carried rather than settled, because a longer terminal starts the same
+    /// way. Ending the input is what settles it, so every terminal the lexer
+    /// state accepts is tried, in every live configuration.
     pub fn can_terminate(&self) -> bool {
-        self.lexer_state == 0 && self.replay(&[self.artifact.eof_terminal], true).is_some()
+        let eof = self.artifact.eof_terminal;
+        self.configs.iter().any(|config| {
+            if config.lexer_state == 0
+                && replay(&self.artifact, &config.stack, &[eof], true).is_some()
+            {
+                return true;
+            }
+            self.accepting(config.lexer_state).iter().any(|terminal| {
+                replay(&self.artifact, &config.stack, &[*terminal, eof], true).is_some()
+            })
+        })
     }
 
     pub fn reset(&mut self) {
-        self.lexer_state = 0;
-        self.stack.clear();
-        self.stack.push(self.artifact.start_parser_state);
+        self.configs.clear();
+        self.configs.push(Config {
+            lexer_state: 0,
+            stack: vec![self.artifact.start_parser_state],
+        });
         self.history.clear();
         self.terminated = false;
     }
 
-    /// Groups of the current lexer state whose terminals the parser accepts.
+    /// Terminals a lexer state accepts right now.
+    fn accepting(&self, lexer_state: u32) -> &[u32] {
+        let from = self.artifact.accepting_offsets[lexer_state as usize] as usize;
+        let to = self.artifact.accepting_offsets[lexer_state as usize + 1] as usize;
+        &self.artifact.accepting_terminals[from..to]
+    }
+
+    /// Terminals a lexeme left in progress could still become.
+    fn pending(&self, lexer_state: u32) -> &[u32] {
+        let from = self.artifact.pending_offsets[lexer_state as usize] as usize;
+        let to = self.artifact.pending_offsets[lexer_state as usize + 1] as usize;
+        &self.artifact.pending_terminals[from..to]
+    }
+
+    /// Groups admitted by at least one live configuration.
+    ///
+    /// Configurations may sit in different lexer states, so the candidate
+    /// groups are the union over those states.
     pub fn admissible_groups(&self) -> Vec<usize> {
-        let state = self.lexer_state as usize;
-        let from = self.artifact.group_offsets[state] as usize;
-        let to = self.artifact.group_offsets[state + 1] as usize;
-        (from..to)
-            .filter(|index| self.admits(&self.artifact.groups[*index]))
-            .collect()
-    }
-
-    /// Would the parser survive this group, including whatever lexeme it
-    /// leaves in progress?
-    ///
-    /// Checking only the emitted terminals is not enough: a token that ends
-    /// mid-lexeme emits none, so it would always be admitted, and a completed
-    /// document could be followed by the opening of a second one. A pending
-    /// lexeme is therefore required to have at least one continuation the
-    /// parser would accept.
-    fn admits(&self, group: &gpugrammar_tables::GroupEntry) -> bool {
-        self.follow(group).is_some()
-    }
-
-    /// The stack after the first terminal sequence the parser can follow.
-    ///
-    /// A token is admissible when *some* reading of it survives. Trying every
-    /// reading is what makes an ambiguous lexicon workable: the parser state,
-    /// not a declaration-order tie-break, decides whether `"id"` is a declared
-    /// property name or an arbitrary string.
-    fn follow(&self, group: &gpugrammar_tables::GroupEntry) -> Option<Vec<u32>> {
-        let from = self.artifact.pending_offsets[group.next_lexer_state as usize] as usize;
-        let to = self.artifact.pending_offsets[group.next_lexer_state as usize + 1] as usize;
-        let pending = &self.artifact.pending_terminals[from..to];
-        for choice in &group.terminal_choices {
-            let Some(stack) = self.replay(choice, false) else {
-                continue;
-            };
-            if pending.is_empty() {
-                return Some(stack);
-            }
-            let probe = Matcher {
-                artifact: self.artifact.clone(),
-                lexer_state: group.next_lexer_state,
-                stack: stack.clone(),
-                history: Vec::new(),
-                max_rollback: 0,
-                terminated: false,
-            };
-            if pending
-                .iter()
-                .any(|terminal| probe.replay(&[*terminal], true).is_some())
-            {
-                return Some(stack);
+        let mut groups: Vec<usize> = Vec::new();
+        for state in self.live_states() {
+            let from = self.artifact.group_offsets[state as usize] as usize;
+            let to = self.artifact.group_offsets[state as usize + 1] as usize;
+            for index in from..to {
+                if !self.successors(&self.artifact.groups[index]).is_empty() {
+                    groups.push(index);
+                }
             }
         }
-        None
+        groups.sort_unstable();
+        groups.dedup();
+        groups
+    }
+
+    fn live_states(&self) -> Vec<u32> {
+        let mut states: Vec<u32> = self.configs.iter().map(|c| c.lexer_state).collect();
+        states.sort_unstable();
+        states.dedup();
+        states
+    }
+
+    /// Every configuration this group leads to, from the ones alive now.
+    ///
+    /// A reading survives when the parser can follow its terminals and, if it
+    /// leaves a lexeme in progress, that lexeme could still become something
+    /// the parser would accept.
+    fn successors(&self, group: &gpugrammar_tables::GroupEntry) -> Vec<Config> {
+        let mut next: Vec<Config> = Vec::new();
+        for config in &self.configs {
+            if config.lexer_state != group.lexer_state {
+                continue;
+            }
+            for reading in &group.readings {
+                let Some(stack) = replay(&self.artifact, &config.stack, &reading.terminals, false)
+                else {
+                    continue;
+                };
+                let pending = self.pending(reading.next_lexer_state);
+                let viable = pending.is_empty()
+                    || pending.iter().any(|terminal| {
+                        replay(&self.artifact, &stack, &[*terminal], true).is_some()
+                    });
+                if !viable {
+                    continue;
+                }
+                let candidate = Config {
+                    lexer_state: reading.next_lexer_state,
+                    stack,
+                };
+                if !next.contains(&candidate) {
+                    next.push(candidate);
+                    if next.len() == MAX_CONFIGS {
+                        return next;
+                    }
+                }
+            }
+        }
+        next
     }
 
     /// Union the admitted groups' bitsets into `mask`.
@@ -161,38 +234,76 @@ impl Matcher {
         }
         if self.max_rollback > 0 {
             self.history.push(Snapshot {
-                lexer_state: self.lexer_state,
-                stack: self.stack.clone(),
+                configs: self.configs.clone(),
                 terminated: self.terminated,
             });
         }
-        let entry = self.artifact.groups[group].clone();
-        let Some(stack) = self.follow(&entry) else {
+        let next = self.successors(&self.artifact.groups[group]);
+        if next.is_empty() {
+            if self.max_rollback > 0 {
+                self.history.pop();
+            }
             return Err(Refusal::ParserRejected);
-        };
-        self.stack = stack;
-        self.lexer_state = entry.next_lexer_state;
+        }
+        self.configs = next;
         Ok(())
     }
 
-    /// Find the group a token belongs to in the current lexer state.
-    pub fn group_of(&self, token: u32) -> Option<usize> {
-        let state = self.lexer_state as usize;
-        let from = self.artifact.group_offsets[state] as usize;
-        let to = self.artifact.group_offsets[state + 1] as usize;
+    /// The group holding `token`, in each live lexer state.
+    ///
+    /// One per state: a token belongs to exactly one group of a given state,
+    /// but configurations may sit in different states.
+    pub fn groups_of(&self, token: u32) -> Vec<usize> {
         let word = token as usize / 32;
         let bit = 1u32 << (token % 32);
-        (from..to).find(|index| {
-            let offset = self.artifact.groups[*index].bitset_offset as usize;
-            self.artifact.group_bitsets[offset + word] & bit != 0
-        })
+        self.live_states()
+            .into_iter()
+            .filter_map(|state| {
+                let from = self.artifact.group_offsets[state as usize] as usize;
+                let to = self.artifact.group_offsets[state as usize + 1] as usize;
+                (from..to).find(|index| {
+                    let offset = self.artifact.groups[*index].bitset_offset as usize;
+                    self.artifact.group_bitsets[offset + word] & bit != 0
+                })
+            })
+            .collect()
+    }
+
+    /// The group holding `token` in the first live state, for diagnostics.
+    pub fn group_of(&self, token: u32) -> Option<usize> {
+        self.groups_of(token).into_iter().next()
     }
 
     pub fn accept_token(&mut self, token: u32) -> Result<(), Refusal> {
-        let Some(group) = self.group_of(token) else {
+        let groups = self.groups_of(token);
+        if groups.is_empty() {
             return Err(Refusal::NotInAnyGroup);
-        };
-        self.accept_group(group)
+        }
+        if self.max_rollback > 0 {
+            if self.history.len() == self.max_rollback {
+                self.history.remove(0);
+            }
+            self.history.push(Snapshot {
+                configs: self.configs.clone(),
+                terminated: self.terminated,
+            });
+        }
+        let mut next: Vec<Config> = Vec::new();
+        for group in groups {
+            for config in self.successors(&self.artifact.groups[group]) {
+                if !next.contains(&config) {
+                    next.push(config);
+                }
+            }
+        }
+        if next.is_empty() {
+            if self.max_rollback > 0 {
+                self.history.pop();
+            }
+            return Err(Refusal::ParserRejected);
+        }
+        self.configs = next;
+        Ok(())
     }
 
     pub fn rollback(&mut self, tokens: usize) {
@@ -200,8 +311,7 @@ impl Matcher {
             let Some(snapshot) = self.history.pop() else {
                 break;
             };
-            self.lexer_state = snapshot.lexer_state;
-            self.stack = snapshot.stack;
+            self.configs = snapshot.configs;
             self.terminated = snapshot.terminated;
         }
     }
@@ -210,56 +320,63 @@ impl Matcher {
         self.terminated = true;
     }
 
-    /// Run a terminal sequence against a copy of the stack.
-    ///
-    /// Returns the resulting stack, or `None` if the parser refuses. With
-    /// `accept_is_success` an ACCEPT action counts as surviving, which is what
-    /// the end-of-input check wants.
-    fn replay(&self, terminals: &[u32], accept_is_success: bool) -> Option<Vec<u32>> {
-        let mut stack = self.stack.clone();
-        for terminal in terminals {
-            loop {
-                let top = *stack.last()? as usize;
-                let action = self.action(top, *terminal)?;
-                if action == gpugrammar_lr::tables::ACCEPT {
-                    return accept_is_success.then_some(stack);
-                }
-                if action > 0 {
-                    stack.push(gpugrammar_lr::tables::decode_shift(action) as u32);
-                    break;
-                }
-                let production = gpugrammar_lr::tables::decode_reduce(action);
-                let lhs = self.artifact.production_lhs[production];
-                let arity = self.artifact.production_arity[production] as usize;
-                if stack.len() <= arity {
-                    return None;
-                }
-                stack.truncate(stack.len() - arity);
-                let exposed = *stack.last()? as usize;
-                let target = self.goto(exposed, lhs)?;
-                stack.push(target);
-            }
-        }
-        Some(stack)
-    }
-
     fn action(&self, state: usize, terminal: u32) -> Option<i32> {
-        let from = self.artifact.action_offsets[state] as usize;
-        let to = self.artifact.action_offsets[state + 1] as usize;
-        let slice = &self.artifact.action_terminals[from..to];
-        slice
-            .binary_search(&terminal)
-            .ok()
-            .map(|index| self.artifact.action_values[from + index])
+        action(&self.artifact, state, terminal)
     }
+}
 
-    fn goto(&self, state: usize, nonterminal: u32) -> Option<u32> {
-        let from = self.artifact.goto_offsets[state] as usize;
-        let to = self.artifact.goto_offsets[state + 1] as usize;
-        let slice = &self.artifact.goto_nonterminals[from..to];
-        slice
-            .binary_search(&nonterminal)
-            .ok()
-            .map(|index| self.artifact.goto_targets[from + index])
+/// Run a terminal sequence against a copy of `stack`.
+///
+/// Returns the resulting stack, or `None` if the parser refuses. With
+/// `accept_is_success` an ACCEPT action counts as surviving, which is what the
+/// end-of-input check wants.
+fn replay(
+    artifact: &Artifact,
+    from: &[u32],
+    terminals: &[u32],
+    accept_is_success: bool,
+) -> Option<Vec<u32>> {
+    let mut stack = from.to_vec();
+    for terminal in terminals {
+        loop {
+            let top = *stack.last()? as usize;
+            let value = action(artifact, top, *terminal)?;
+            if value == gpugrammar_lr::tables::ACCEPT {
+                return accept_is_success.then_some(stack);
+            }
+            if value > 0 {
+                stack.push(gpugrammar_lr::tables::decode_shift(value) as u32);
+                break;
+            }
+            let production = gpugrammar_lr::tables::decode_reduce(value);
+            let lhs = artifact.production_lhs[production];
+            let arity = artifact.production_arity[production] as usize;
+            if stack.len() <= arity {
+                return None;
+            }
+            stack.truncate(stack.len() - arity);
+            let exposed = *stack.last()? as usize;
+            let target = goto(artifact, exposed, lhs)?;
+            stack.push(target);
+        }
     }
+    Some(stack)
+}
+
+fn action(artifact: &Artifact, state: usize, terminal: u32) -> Option<i32> {
+    let from = artifact.action_offsets[state] as usize;
+    let to = artifact.action_offsets[state + 1] as usize;
+    artifact.action_terminals[from..to]
+        .binary_search(&terminal)
+        .ok()
+        .map(|index| artifact.action_values[from + index])
+}
+
+fn goto(artifact: &Artifact, state: usize, nonterminal: u32) -> Option<u32> {
+    let from = artifact.goto_offsets[state] as usize;
+    let to = artifact.goto_offsets[state + 1] as usize;
+    artifact.goto_nonterminals[from..to]
+        .binary_search(&nonterminal)
+        .ok()
+        .map(|index| artifact.goto_targets[from + index])
 }

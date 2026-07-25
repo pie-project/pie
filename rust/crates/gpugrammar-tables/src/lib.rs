@@ -27,18 +27,23 @@ use gpugrammar_lr::cfg::Cfg;
 use gpugrammar_lr::tables::Tables;
 use serde::Serialize;
 
+/// One way of reading a token.
+#[derive(Debug, Clone, Serialize)]
+pub struct Reading {
+    pub terminals: Vec<u32>,
+    pub next_lexer_state: u32,
+}
+
 /// A token group as the device sees it.
 #[derive(Debug, Clone, Serialize)]
 pub struct GroupEntry {
     /// The lexer state this group applies in.
     pub lexer_state: u32,
-    /// Terminal sequences the group's tokens could emit, one per way of
-    /// resolving the lexical ambiguities the token crossed. The parser picks
-    /// the one it can follow; more than one surviving means the grammar is
-    /// ambiguous at that point.
-    pub terminal_choices: Vec<Vec<u32>>,
-    /// The lexer state the group's tokens leave behind.
-    pub next_lexer_state: u32,
+    /// Every way the group's tokens can be read, longest match first: what
+    /// each reading emits and where it leaves the lexer. The parser picks the
+    /// first it can follow, which is how a generated lexicon's ambiguity - both
+    /// which terminal and where the lexeme ends - is resolved.
+    pub readings: Vec<Reading>,
     /// Offset into `group_bitsets`, in words.
     pub bitset_offset: u32,
     /// How many tokens the group holds, for diagnostics and weighting.
@@ -70,6 +75,13 @@ pub struct Artifact {
     /// artifact.
     pub pending_offsets: Vec<u32>,
     pub pending_terminals: Vec<u32>,
+
+    /// Terminals a lexer state accepts right now, CSR by state. A lexeme is
+    /// withheld while another byte could extend it, so the last one in a
+    /// document is still pending when the input ends; ending the input is what
+    /// settles it, and this says what it may settle as.
+    pub accepting_offsets: Vec<u32>,
+    pub accepting_terminals: Vec<u32>,
 
     /// CSR ACTION rows: `action_offsets[state]..action_offsets[state + 1]`.
     pub action_offsets: Vec<u32>,
@@ -151,13 +163,15 @@ pub fn emit(
             }
             entries.push(GroupEntry {
                 lexer_state: state as u32,
-                terminal_choices: group
+                readings: group
                     .scan
-                    .choices
+                    .options
                     .iter()
-                    .map(|choice| choice.iter().map(|terminal| terminal.0).collect())
+                    .map(|option| Reading {
+                        terminals: option.terminals.iter().map(|t| t.0).collect(),
+                        next_lexer_state: option.next_state.0,
+                    })
                     .collect(),
-                next_lexer_state: group.scan.next_state.0,
                 bitset_offset: offset,
                 token_count: group.tokens.len() as u32,
             });
@@ -174,6 +188,19 @@ pub fn emit(
             pending_terminals.extend(reachable[state].iter().map(|terminal| terminal.0));
         }
         pending_offsets.push(pending_terminals.len() as u32);
+    }
+
+    let mut accepting_offsets = Vec::with_capacity(lexer.num_states() + 1);
+    let mut accepting_terminals = Vec::new();
+    accepting_offsets.push(0u32);
+    for state in 0..lexer.num_states() {
+        accepting_terminals.extend(
+            lexer
+                .accepting(gpugrammar_lex::LexState(state as u32))
+                .iter()
+                .map(|terminal| terminal.0),
+        );
+        accepting_offsets.push(accepting_terminals.len() as u32);
     }
 
     let (action_offsets, action_terminals, action_values) = flatten_action(tables);
@@ -193,6 +220,8 @@ pub fn emit(
         group_bitsets: bitsets,
         pending_offsets,
         pending_terminals,
+        accepting_offsets,
+        accepting_terminals,
         action_offsets,
         action_terminals,
         action_values,

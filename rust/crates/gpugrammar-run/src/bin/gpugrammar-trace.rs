@@ -53,27 +53,26 @@ fn main() -> Result<()> {
     for (offset, byte) in instance.text.as_bytes().iter().enumerate() {
         let before = matcher.lexer_state();
         let scanned = lexer.scan(&[*byte], LexState(before));
-        let pending: Vec<String> = scanned
+        let readings: Vec<String> = scanned
             .as_ref()
             .map(|scan| {
-                lexer
-                    .reachable_terminals(scan.next_state)
-                    .into_iter()
-                    .map(|terminal| name(terminal.0))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let emitted: Vec<String> = scanned
-            .as_ref()
-            .map(|scan| {
-                scan.choices
+                scan.options
                     .iter()
-                    .map(|choice| {
-                        choice
+                    .map(|option| {
+                        let emitted = option
+                            .terminals
                             .iter()
                             .map(|terminal| name(terminal.0))
                             .collect::<Vec<_>>()
-                            .join("+")
+                            .join("+");
+                        let pending = lexer
+                            .reachable_terminals(option.next_state)
+                            .into_iter()
+                            .map(|terminal| name(terminal.0))
+                            .take(4)
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        format!("[{emitted}]->({pending})")
                     })
                     .collect()
             })
@@ -81,11 +80,10 @@ fn main() -> Result<()> {
 
         let result = matcher.accept_token(*byte as u32);
         println!(
-            "{offset:4} {:?} lex {before} parser {} | emit {:?} pending {:?} -> {}",
+            "{offset:4} {:?} lex {before} parser {} | {:?} -> {}",
             *byte as char,
             matcher.parser_state(),
-            emitted,
-            &pending[..pending.len().min(6)],
+            &readings[..readings.len().min(4)],
             match &result {
                 Ok(()) => "ok".to_string(),
                 Err(error) => format!("{error:?}"),

@@ -39,43 +39,73 @@ const ORDER: &[&str] = &[
     "ws",
 ];
 
+/// Names of the terminals each reading emits.
+fn readings<'a>(
+    lexer: &'a gpugrammar_lex::Lexer,
+    scan: &gpugrammar_lex::Scan,
+) -> Vec<Vec<&'a str>> {
+    scan.options
+        .iter()
+        .map(|option| {
+            option
+                .terminals
+                .iter()
+                .map(|terminal| lexer.terminal_name(*terminal))
+                .collect()
+        })
+        .collect()
+}
+
 #[test]
-fn a_structural_token_emits_one_terminal() {
+fn a_structural_token_can_be_read_as_one_terminal() {
+    // A scan offers every reading, because where a lexeme ends is a choice the
+    // parser has to make: `{` is a complete terminal, and it is also a prefix
+    // of longer ones. Carrying it comes first, since longest match wins
+    // whenever the parser can follow it, and settling it is offered too.
     let lexer = lexer_from_rules(JSON_LEXER, ORDER);
     let scan = lexer.scan(b"{", START).unwrap();
-    assert_eq!(scan.choices.len(), 1);
-    assert_eq!(scan.choices[0].len(), 1);
-    assert_eq!(lexer.terminal_name(scan.choices[0][0]), "lbrace");
-    assert_eq!(scan.next_state, START);
+    let all = readings(&lexer, &scan);
+    assert!(
+        all.contains(&vec!["lbrace"]),
+        "no reading emits lbrace: {all:?}"
+    );
+    let settled = scan
+        .options
+        .iter()
+        .find(|option| option.terminals.len() == 1)
+        .expect("a settled reading");
+    assert_eq!(settled.next_state, START);
 }
 
 #[test]
 fn a_token_spanning_several_terminals_emits_all_of_them() {
     let lexer = lexer_from_rules(JSON_LEXER, ORDER);
     let scan = lexer.scan(b"\"a\":", START).unwrap();
-    let names: Vec<_> = scan.choices[0]
-        .iter()
-        .map(|t| lexer.terminal_name(*t))
-        .collect();
-    assert_eq!(names, vec!["string", "colon"]);
+    let all = readings(&lexer, &scan);
+    assert!(
+        all.contains(&vec!["string", "colon"]),
+        "no reading emits both: {all:?}"
+    );
 }
 
 #[test]
 fn a_token_ending_mid_lexeme_carries_the_state() {
     let lexer = lexer_from_rules(JSON_LEXER, ORDER);
     let opening = lexer.scan(b"\"ab", START).unwrap();
-    assert!(opening.choices.iter().all(|choice| choice.is_empty()));
-    assert_ne!(opening.next_state, START);
-
-    let closing = lexer.scan(b"cd\"", opening.next_state).unwrap();
-    assert_eq!(
-        closing.choices[0]
+    assert!(
+        opening
+            .options
             .iter()
-            .map(|t| lexer.terminal_name(*t))
-            .collect::<Vec<_>>(),
-        vec!["string"]
+            .all(|option| option.terminals.is_empty())
     );
-    assert_eq!(closing.next_state, START);
+    assert_ne!(opening.options[0].next_state, START);
+
+    let closing = lexer.scan(b"cd\"", opening.options[0].next_state).unwrap();
+    let all = readings(&lexer, &closing);
+    assert!(
+        all.contains(&vec!["string"]),
+        "the string was never completed: {all:?}"
+    );
 }
 
 #[test]
@@ -127,7 +157,7 @@ fn the_vocabulary_collapses_into_few_groups() {
     // classes are Unicode codepoint ranges compiled to UTF-8, so a lone
     // continuation byte is not legal anywhere. Byte-level BPE vocabularies do
     // contain such fragments, and handling them is a known gap.
-    let inside = lexer.scan(b"\"", START).unwrap().next_state;
+    let inside = lexer.scan(b"\"", START).unwrap().options[0].next_state;
     let in_string = &groups.per_state[inside.0 as usize];
     let accepted: usize = in_string.iter().map(|g| g.tokens.len()).sum();
     assert!(
@@ -159,32 +189,41 @@ fn a_codepoint_split_across_tokens_is_scannable() {
     // sequence. Character classes compile to UTF-8 byte paths, so the halves
     // must meet in an intermediate lexer state rather than being rejected.
     let lexer = lexer_from_rules(JSON_LEXER, ORDER);
-    let inside = lexer.scan(b"\"", START).unwrap().next_state;
+    let inside = lexer.scan(b"\"", START).unwrap().options[0].next_state;
 
     let snowman = "☃".as_bytes();
     assert_eq!(snowman.len(), 3);
 
     // The whole codepoint in one token stays inside the string.
     let whole = lexer.scan(snowman, inside).expect("whole codepoint");
-    assert!(whole.choices.iter().all(|choice| choice.is_empty()));
+    assert!(
+        whole
+            .options
+            .iter()
+            .all(|option| option.terminals.is_empty())
+    );
 
     // Split after the lead byte: the first half must land in a state that the
     // second half can continue from.
     let first = lexer.scan(&snowman[..1], inside).expect("lead byte");
-    assert_ne!(first.next_state, inside);
+    assert_ne!(first.options[0].next_state, inside);
     let second = lexer
-        .scan(&snowman[1..], first.next_state)
+        .scan(&snowman[1..], first.options[0].next_state)
         .expect("continuation bytes");
-    assert_eq!(second.next_state, whole.next_state);
+    assert_eq!(second.options[0].next_state, whole.options[0].next_state);
 }
 
 #[test]
 fn a_bare_continuation_byte_is_only_legal_mid_codepoint() {
     let lexer = lexer_from_rules(JSON_LEXER, ORDER);
-    let inside = lexer.scan(b"\"", START).unwrap().next_state;
+    let inside = lexer.scan(b"\"", START).unwrap().options[0].next_state;
     let snowman = "☃".as_bytes();
 
     assert!(lexer.scan(&snowman[1..2], inside).is_none());
     let first = lexer.scan(&snowman[..1], inside).unwrap();
-    assert!(lexer.scan(&snowman[1..2], first.next_state).is_some());
+    assert!(
+        lexer
+            .scan(&snowman[1..2], first.options[0].next_state)
+            .is_some()
+    );
 }

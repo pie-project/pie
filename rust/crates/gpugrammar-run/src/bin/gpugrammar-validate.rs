@@ -57,7 +57,7 @@ fn main() -> Result<()> {
     let mut rejected = 0usize;
     let mut reported = 0usize;
 
-    for instance in corpus.instances.iter() {
+    for (index, instance) in corpus.instances.iter().enumerate() {
         let Ok(grammar) = json_schema_to_grammar(&instance.schema, &JsonSchemaOptions::default())
         else {
             continue;
@@ -102,7 +102,7 @@ fn main() -> Result<()> {
                     let from = offset.saturating_sub(40);
                     let to = (offset + 20).min(text.len());
                     eprintln!(
-                        "--- rejected ({}) at byte {offset}/{} ---\n  ...{}<HERE>{}",
+                        "--- rejected [{index}] ({}) at byte {offset}/{} ---\n  ...{}<HERE>{}",
                         instance.config,
                         text.len(),
                         String::from_utf8_lossy(&text[from..offset]).replace('\n', "\\n"),

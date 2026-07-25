@@ -171,6 +171,28 @@ impl Lexer {
             .collect()
     }
 
+    /// Cut transitions into states that can no longer accept anything.
+    ///
+    /// Subset construction leaves states from which no accepting state is
+    /// reachable. They are harmless for recognition, which reads to the end and
+    /// asks, but not for constrained decoding, which asks after every byte: a
+    /// live transition into a dead state says a token is allowed when nothing
+    /// can complete it. With a multi-terminal grammar the parser hides most of
+    /// this, but 68% of real schemas are purely regular, and there the lexer is
+    /// the only check there is.
+    fn trim(&mut self) {
+        let reachable = self.reachable_terminals_all();
+        let dead: Vec<bool> = reachable
+            .iter()
+            .map(|terminals| terminals.is_empty())
+            .collect();
+        for next in &mut self.transitions {
+            if *next != NO_STATE && dead[*next as usize] {
+                *next = NO_STATE;
+            }
+        }
+    }
+
     fn step(&self, state: LexState, byte: u8) -> Option<LexState> {
         let next = self.transitions[state.0 as usize * 256 + byte as usize];
         (next != NO_STATE).then_some(LexState(next))
@@ -185,115 +207,87 @@ impl Lexer {
             .all(|&next| next == NO_STATE)
     }
 
-    /// Scan one token with maximal munch, starting from `state`.
+    /// Every way this token can be read, longest match first.
     ///
-    /// `None` means the token is lexically impossible here, which is the case
-    /// that removes most of the vocabulary at a structural position.
+    /// `None` means the token is lexically impossible here, which is what
+    /// removes most of the vocabulary at a structural position.
     ///
-    /// A lexeme is only emitted once it cannot be extended. When a token ends
-    /// on an accepting state that a further byte could still extend — a digit
-    /// run, say — the terminal is withheld and the state is carried, because
-    /// the next token may continue the same lexeme.
+    /// Maximal munch alone is wrong for a generated lexicon. A whole regular
+    /// rule becomes one terminal, so `{` is both a complete terminal and the
+    /// start of a longer one covering an entire object; a greedy scanner
+    /// consumes the next byte and the `{` the parser needed can no longer be
+    /// emitted. Where a lexeme ends is therefore as much a choice as which
+    /// terminal it is, and both are left to the parser, which resolves them
+    /// with its viable prefixes. Longest match is offered first, so it wins
+    /// whenever the parser can follow it.
     pub fn scan(&self, token: &[u8], state: LexState) -> Option<Scan> {
-        let mut current = state;
-        let mut committed: Vec<&[TerminalId]> = Vec::new();
-        let mut index = 0usize;
-        let mut rounds = 0usize;
+        let mut options = Vec::new();
+        let mut emitted = Vec::new();
+        self.readings(token, 0, state, &mut emitted, &mut options);
+        (!options.is_empty()).then_some(Scan { options })
+    }
 
-        while index < token.len() {
-            rounds += 1;
-            if rounds > token.len() * 2 + 4 {
-                return None;
+    fn readings(
+        &self,
+        token: &[u8],
+        index: usize,
+        state: LexState,
+        emitted: &mut Vec<TerminalId>,
+        out: &mut Vec<ScanOption>,
+    ) {
+        if out.len() >= MAX_OPTIONS {
+            return;
+        }
+        if index == token.len() {
+            // Carry the lexeme into the next token, or settle it here.
+            out.push(ScanOption {
+                terminals: emitted.clone(),
+                next_state: state,
+            });
+            for terminal in self.accepting(state) {
+                emitted.push(*terminal);
+                out.push(ScanOption {
+                    terminals: emitted.clone(),
+                    next_state: START,
+                });
+                emitted.pop();
             }
-
-            let mut cursor = current;
-            let mut position = index;
-            // A lexeme finished by an earlier token is still pending in
-            // `current`; a byte that cannot extend it commits it rather than
-            // failing the scan.
-            let mut last_accept = match self.accepting(cursor) {
-                [] => None,
-                accepting => Some((index, accepting)),
-            };
-
-            while position < token.len() {
-                let Some(next) = self.step(cursor, token[position]) else {
-                    break;
-                };
-                cursor = next;
-                position += 1;
-                match self.accepting(cursor) {
-                    [] => {}
-                    accepting => last_accept = Some((position, accepting)),
-                }
-            }
-
-            if position == token.len() {
-                return match last_accept {
-                    Some((end, accepting)) if end == position && self.is_dead_end(cursor) => {
-                        committed.push(accepting);
-                        Some(Scan {
-                            choices: product(&committed),
-                            next_state: START,
-                        })
-                    }
-                    _ => Some(Scan {
-                        choices: product(&committed),
-                        next_state: cursor,
-                    }),
-                };
-            }
-
-            // A byte blocked the lexeme, so commit the longest match.
-            let (end, accepting) = last_accept?;
-            committed.push(accepting);
-            index = end;
-            current = START;
+            return;
         }
 
-        Some(Scan {
-            choices: product(&committed),
-            next_state: current,
-        })
+        if let Some(next) = self.step(state, token[index]) {
+            self.readings(token, index + 1, next, emitted, out);
+        }
+        // Settling restarts the scan at the same byte. It cannot loop, because
+        // the start state accepts nothing: nullable terminals were removed, so
+        // no lexeme is empty.
+        for terminal in self.accepting(state) {
+            emitted.push(*terminal);
+            self.readings(token, index, START, emitted, out);
+            emitted.pop();
+        }
     }
+}
+
+/// One way of reading a token: what it emits and where it leaves the lexer.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ScanOption {
+    pub terminals: Vec<TerminalId>,
+    pub next_state: LexState,
 }
 
 /// The result of scanning one token.
 ///
-/// `choices` holds the terminal sequences the token could emit, one per way of
-/// resolving the lexical ambiguities it crossed. There is always at least one,
-/// and it is empty when the token ends mid-lexeme. All choices share
-/// `next_state`, because maximal munch fixes where the lexemes end; only which
-/// terminal each one is differs.
+/// `options` holds the readings, longest match first. There is always at least
+/// one; a reading is empty when the token ends mid-lexeme.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Scan {
-    pub choices: Vec<Vec<TerminalId>>,
-    pub next_state: LexState,
+    pub options: Vec<ScanOption>,
 }
 
-/// How many disambiguations one token may carry. Real grammars stay at one or
-/// two; the cap only stops a pathological product.
-const MAX_CHOICES: usize = 16;
-
-/// Expand per-lexeme accepting sets into whole-token terminal sequences.
-fn product(committed: &[&[TerminalId]]) -> Vec<Vec<TerminalId>> {
-    let mut choices: Vec<Vec<TerminalId>> = vec![Vec::new()];
-    for accepting in committed {
-        let mut next = Vec::new();
-        for prefix in &choices {
-            for terminal in accepting.iter() {
-                if next.len() == MAX_CHOICES {
-                    break;
-                }
-                let mut extended = prefix.clone();
-                extended.push(*terminal);
-                next.push(extended);
-            }
-        }
-        choices = next;
-    }
-    choices
-}
+/// How many readings one token may carry. Real grammars stay at one or two;
+/// the cap only stops a pathological fan-out.
+const MAX_OPTIONS: usize = 16;
 
 /// Build a scanner by determinising the union of the terminal automata.
 ///
@@ -353,7 +347,9 @@ pub fn build_lexer_within(terminals: Vec<Terminal>, budget: usize) -> Option<Lex
     }
 
     let end_of: HashMap<StateId, TerminalId> = ends.into_iter().collect();
-    determinise(&union, start, &end_of, names, budget)
+    let mut lexer = determinise(&union, start, &end_of, names, budget)?;
+    lexer.trim();
+    Some(lexer)
 }
 
 fn determinise(

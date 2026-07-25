@@ -378,11 +378,23 @@ fn without_empty(mut automaton: Automaton<NfaGraph>) -> Automaton<NfaGraph> {
 }
 
 /// Splice referenced rules into `root`'s automaton until no reference edges
-/// remain. Each rule is spliced once, so recursion becomes a cycle.
+/// remain.
+///
+/// A rule is copied at each place it is used, not shared. Sharing one copy is
+/// tempting and wrong: every reference would attach its own predecessor to the
+/// shared entry and its own successor to the shared exit, so a path could enter
+/// through one use and leave through another. That is how an object grammar
+/// came to accept its properties in any order and to accept a trailing comma -
+/// the automaton had paths the grammar never described.
+///
+/// Only recursion shares, and only with itself: a rule already being spliced
+/// reuses its entry and exit, which turns the reference into a cycle. That is
+/// exactly right, because regularity analysis admits recursion only in tail
+/// position, where every recursive use does have the same continuation.
 fn resolve_references(automata: &[Automaton<NfaGraph>], root: usize) -> Automaton<NfaGraph> {
     let mut fsm = NfaGraph::new();
-    let mut spliced: FxHashMap<usize, (StateId, StateId)> = FxHashMap::default();
-    let (start, end) = splice(automata, root, &mut fsm, &mut spliced);
+    let mut active: FxHashMap<usize, (StateId, StateId)> = FxHashMap::default();
+    let (start, end) = splice(automata, root, &mut fsm, &mut active);
     let mut ends = vec![false; fsm.num_states()];
     ends[end.0 as usize] = true;
     Automaton { fsm, start, ends }
@@ -392,9 +404,9 @@ fn splice(
     automata: &[Automaton<NfaGraph>],
     rule: usize,
     fsm: &mut NfaGraph,
-    spliced: &mut FxHashMap<usize, (StateId, StateId)>,
+    active: &mut FxHashMap<usize, (StateId, StateId)>,
 ) -> (StateId, StateId) {
-    if let Some(&existing) = spliced.get(&rule) {
+    if let Some(&existing) = active.get(&rule) {
         return existing;
     }
     let source = &automata[rule];
@@ -404,7 +416,7 @@ fn splice(
     }
     let entry = StateId(offset + source.start.0);
     let exit = fsm.add_state();
-    spliced.insert(rule, (entry, exit));
+    active.insert(rule, (entry, exit));
 
     for state in 0..source.fsm.num_states() {
         let from = StateId(offset + state as u32);
@@ -422,8 +434,7 @@ fn splice(
                     fsm.add_epsilon(from, StateId(offset + target.0));
                 }
                 FsmEdge::RuleRef { rule: target, .. } => {
-                    let (inner_start, inner_end) =
-                        splice(automata, target.0 as usize, fsm, spliced);
+                    let (inner_start, inner_end) = splice(automata, target.0 as usize, fsm, active);
                     fsm.add_epsilon(from, inner_start);
                     // `edges` borrows `source`, so the continuation is added
                     // from the reference edge's own target below.
@@ -437,6 +448,7 @@ fn splice(
             fsm.add_epsilon(from, exit);
         }
     }
+    active.remove(&rule);
     (entry, exit)
 }
 

@@ -36,8 +36,12 @@ subprocess and nothing monkeypatched:
 
 ```
 xgrammar    64/64 valid | 1182 tokens in 0.64s = 1858 tok/s
-gpugrammar  64/64 valid | 1247 tokens in 0.77s = 1619 tok/s
+gpugrammar  64/64 valid | 1222 tokens in 0.88s = 1392 tok/s
 ```
+
+The grammar is exact on a small schema: correct documents are accepted, and
+out-of-order properties, a trailing comma and an undeclared property are each
+rejected at the byte where they go wrong.
 
 All 23 Rust test suites pass. Coverage over 533 real JSONSchemaBench schemas:
 461 lower to a grammar, 434 reach LALR(1) tables. Median parser state count is
@@ -47,11 +51,11 @@ seconds.
 
 ## What is broken, in priority order
 
-**1. We reject documents we should accept. Acceptance is 45.5%.** This is the
-important one, and it is now measured: of 290 schemas that compile within the
-lexer budget, only 132 accept the document a model produced under that same
-schema. A byte-level differential is the measurement — compile the schema, feed
-the instance one byte at a time. Reproduce a single case with:
+**1. We reject documents we should accept. Acceptance is 85.7%.** Of 265
+schemas that compile within the lexer budget, 227 accept the document a model
+produced under that same schema. A byte-level differential is the measurement —
+compile the schema, feed the instance one byte at a time. Reproduce a single
+case with:
 
 ```
 cargo run --release --bin gpugrammar-trace -- results/jsonschemabench-instances.json <index>

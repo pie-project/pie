@@ -117,24 +117,35 @@ fn the_extracted_lexicon_drives_a_working_lexer() {
     let lexicon = extract(&grammar, &analyze(&grammar));
     let lexer = build_lexer(terminal_automata(&grammar, &lexicon));
 
-    // `object ::= "{" "}"` is regular, so `{}` is a terminal too. A lone `{`
-    // is therefore withheld rather than committed: the next byte decides which
-    // of the two it was. What keeps that honest is that the pending lexeme is
-    // checked against the terminals it could still become.
+    // `object ::= "{" "}"` is regular, so `{}` is a terminal too, and a lone
+    // `{` is both a complete terminal and a prefix of it. The scan offers both
+    // readings and leaves the choice to the parser; carrying the lexeme comes
+    // first, because longest match wins whenever the parser can follow it.
     let opening = lexer.scan(b"{", START).unwrap();
-    assert!(opening.choices.iter().all(|choice| choice.is_empty()));
+    assert!(
+        opening.options[0].terminals.is_empty(),
+        "the longest reading should carry the lexeme"
+    );
     assert!(
         lexer
-            .reachable_terminals(opening.next_state)
+            .reachable_terminals(opening.options[0].next_state)
             .iter()
             .any(|terminal| lexer.terminal_name(*terminal) == "'{'")
+    );
+    assert!(
+        opening.options.iter().any(|option| option
+            .terminals
+            .iter()
+            .any(|terminal| lexer.terminal_name(*terminal) == "'{'")),
+        "no reading settles the brace"
     );
 
     // Once the next byte cannot extend it, the longest match is committed.
     let member = lexer.scan(b"{\"", START).unwrap();
-    assert_eq!(member.choices.len(), 1);
+    assert_eq!(member.options.len(), 1);
     assert_eq!(
-        member.choices[0]
+        member.options[0]
+            .terminals
             .iter()
             .map(|terminal| lexer.terminal_name(*terminal))
             .collect::<Vec<_>>(),
@@ -142,8 +153,13 @@ fn the_extracted_lexicon_drives_a_working_lexer() {
     );
 
     let string = lexer.scan(b"\"ab", START).unwrap();
-    assert!(string.choices.iter().all(|choice| choice.is_empty()));
-    assert_ne!(string.next_state, START);
+    assert!(
+        string
+            .options
+            .iter()
+            .all(|option| option.terminals.is_empty())
+    );
+    assert_ne!(string.options[0].next_state, START);
 
     assert!(lexer.scan(b"@", START).is_none());
 }

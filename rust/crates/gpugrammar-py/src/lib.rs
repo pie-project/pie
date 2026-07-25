@@ -187,6 +187,12 @@ impl Matcher {
         self.inner.lexer_state()
     }
 
+    /// How many readings of the input are still alive.
+    #[getter]
+    fn num_configs(&self) -> usize {
+        self.inner.num_configs()
+    }
+
     #[getter]
     fn parser_state(&self) -> u32 {
         self.inner.parser_state()
