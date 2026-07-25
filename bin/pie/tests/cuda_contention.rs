@@ -276,6 +276,10 @@ fn write_profile_record(
             "h2d_pages": diagnostics.h2d_pages_total,
             "d2h_copy_us": diagnostics.d2h_copy_us_total,
             "h2d_copy_us": diagnostics.h2d_copy_us_total,
+            "restore_wait_us": diagnostics.restore_wait_us_total,
+            "restore_turnaround_us": diagnostics.restore_turnaround_us_total,
+            "restore_turnarounds": diagnostics.restore_turnarounds_total,
+            "deadline_kills": diagnostics.deadline_kills_total,
         });
     }
     std::fs::write(&path, serde_json::to_vec_pretty(&document)?)?;
@@ -319,12 +323,14 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
     let profile_mode =
         std::env::var("PIE_CONTENTION_PROFILE_MODE").unwrap_or_else(|_| "contended".to_string());
     anyhow::ensure!(
-        matches!(profile_mode.as_str(), "baseline" | "contended"),
-        "PIE_CONTENTION_PROFILE_MODE must be baseline or contended (the legacy \
-         error-path profile is gone with the mode knob; measure the pre-rewrite \
-         ref via git for A/B)"
+        matches!(profile_mode.as_str(), "baseline" | "contended" | "ceiling"),
+        "PIE_CONTENTION_PROFILE_MODE must be baseline, contended, or ceiling \
+         (the legacy error-path profile is gone with the mode knob; measure \
+         the pre-rewrite ref via git for A/B). `ceiling` is the capped-but-\
+         uncontended fitting-width run that anchors gap-to-ceiling (§6): same \
+         page cap, a fleet that fits, engagement not required."
     );
-    let total_pages = if profile_mode != "contended" {
+    let total_pages = if profile_mode == "baseline" {
         0
     } else {
         std::env::var("PIE_CONTENTION_TOTAL_PAGES")
@@ -548,13 +554,15 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
              fleet never over-filled the pool, so assertions 1+2 proved nothing. Shrink the pool \
              (PIE_CONTENTION_UTIL / a total_pages cap) or grow PIE_CONTENTION_FLEET until it contends."
         );
-    } else {
+    } else if profile_mode == "baseline" {
         assert_eq!(
             (parked, suspends, restores),
             (0, 0, 0),
             "roomy baseline unexpectedly contended"
         );
     }
+    // `ceiling` asserts neither way: the fitting-width run may brush the cap
+    // transiently; only its physics (throughput at width) matters.
 
     // Assertion 3: TRANSPARENCY (classified) — preempt+restore preserved KV
     // content (W1). The naive `concurrent[k] == solo_reference[k]` is confounded
