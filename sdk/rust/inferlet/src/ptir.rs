@@ -42,12 +42,13 @@ pub use ptir_dsl::intrinsics;
 // `use inferlet::ptir::prelude::*;` (mirrors the old `ptir::prelude`).
 pub use ptir_dsl::DType as Dtype;
 pub use ptir_dsl::{
-    add, and, broadcast, cast, causal_mask, cummass_le, cumprod, cumsum, div, dtype, entropy,
+    abs, add, and, broadcast, cast, causal_mask, cummass_le, cumprod, cumsum, div, dtype, entropy,
     entropy_from_logprobs, eq, exp, gather, gather_row, ge, gt, gumbel, gumbel_max, iota, l2norm,
     le, log, log_softmax, lt, mask_apply, masked_argmax, matmul, max_elem, min_elem, mul, ne, neg,
-    not, nucleus_sample, or, pivot_threshold, prob_ge, rank_le, reduce_argmax, reduce_max,
+    not, nucleus_sample, or, pivot_threshold, prob_ge, rank_le, recip, reduce_argmax, reduce_max,
     reduce_min, reduce_sum, rem, reshape, rng, row_membership, scalar_gather, scatter_add,
-    scatter_set, select, sink_window_mask, sliding_window_mask, softmax, sub, top_k, transpose,
+    scatter_set, select, sign, sink_window_mask, sliding_window_mask, softmax, sort_desc, sub,
+    top_k, transpose,
 };
 
 // ---------------------------------------------------------------------------
@@ -1052,13 +1053,13 @@ pub mod prelude {
     pub use ptir_dsl::dtype;
     pub use ptir_dsl::intrinsics;
     pub use ptir_dsl::value::{
-        AsTensor, Tensor, add, and, broadcast, cast, causal_mask, cummass_le, cumprod, cumsum, div,
-        entropy, entropy_from_logprobs, eq, exp, gather, gather_row, ge, gt, gumbel, gumbel_max,
-        iota, l2norm, le, log, log_softmax, lt, mask_apply, masked_argmax, matmul, max_elem,
-        min_elem, mul, ne, neg, not, nucleus_sample, or, pivot_threshold, prob_ge, rank_le,
-        reduce_argmax, reduce_max, reduce_min, reduce_sum, rem, reshape, rng, row_membership,
-        scalar_gather, scatter_add, scatter_set, select, sink_window_mask, sliding_window_mask,
-        softmax, sub, top_k, transpose,
+        AsTensor, Tensor, abs, add, and, broadcast, cast, causal_mask, cummass_le, cumprod, cumsum,
+        div, entropy, entropy_from_logprobs, eq, exp, gather, gather_row, ge, gt, gumbel,
+        gumbel_max, iota, l2norm, le, log, log_softmax, lt, mask_apply, masked_argmax, matmul,
+        max_elem, min_elem, mul, ne, neg, not, nucleus_sample, or, pivot_threshold, prob_ge,
+        rank_le, recip, reduce_argmax, reduce_max, reduce_min, reduce_sum, rem, reshape, rng,
+        row_membership, scalar_gather, scatter_add, scatter_set, select, sign, sink_window_mask,
+        sliding_window_mask, softmax, sort_desc, sub, top_k, transpose,
     };
     pub use ptir_dsl::{DType, Stage};
 }

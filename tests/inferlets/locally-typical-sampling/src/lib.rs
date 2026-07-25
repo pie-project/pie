@@ -112,8 +112,7 @@ fn typical_keep(logits: &Tensor, vocab: u32, k_max: u32, mass: f32) -> (Tensor, 
     let h = entropy_from_logprobs(&probs, &logprobs);
     // deviation = log p(x) + H, i.e. signed typicality.
     let deviation = add(&logprobs, broadcast(&h, [vocab]));
-    // |deviation| without an abs op: max(d, -d).
-    let score = max_elem(&deviation, neg(&deviation));
+    let score = abs(&deviation);
 
     // Ascending typicality == descending (-score), capped at k_max candidates.
     let (_sorted_score, order) = top_k(neg(&score), k_max);

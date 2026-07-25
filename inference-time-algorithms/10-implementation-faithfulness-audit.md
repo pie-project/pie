@@ -86,12 +86,12 @@ from the conditional entropy*:
 score(x) = | -log p(x) - H(p) |      (nats)
 ```
 
-**Implemented** — `locally-typical-sampling/src/lib.rs:104-115`:
+**Implemented** — `locally-typical-sampling/src/lib.rs:104-114`:
 
 ```rust
 let h = entropy_from_logprobs(&probs, &logprobs);
 let deviation = add(&logprobs, broadcast(&h, [vocab]));   // log p + H
-let score = max_elem(&deviation, neg(&deviation));        // |·|
+let score = abs(&deviation);                              // |·|
 let (_sorted_score, order) = top_k(neg(&score), k_max);   // ascending in score
 let exclusive = sub(cumsum(&probs_sorted), &probs_sorted);
 let keep_sorted = lt(&exclusive, broadcast(Tensor::constant(mass), [k_max]));
