@@ -310,6 +310,11 @@ pub fn build_lexer(terminals: Vec<Terminal>) -> Lexer {
 /// schema can ask for hundreds of thousands. Those are correct but too large
 /// to emit, and the caller needs to find that out cheaply rather than after
 /// determinising them.
+///
+/// The budget bounds work, not just the result. Subset construction costs
+/// `dfa_states * 256 * subset_size`, and a large unrolled automaton makes the
+/// subsets large, so bounding the state count alone still leaves a
+/// determinisation that runs for minutes.
 pub fn build_lexer_within(terminals: Vec<Terminal>, budget: usize) -> Option<Lexer> {
     let mut union = NfaGraph::new();
     let start = union.add_state();
@@ -368,9 +373,15 @@ fn determinise(
     queue.push_back(initial);
 
     let mut transitions: Vec<u32> = Vec::new();
+    let mut work = 0usize;
+    let work_budget = budget.saturating_mul(50_000);
     while let Some(subset) = queue.pop_front() {
         let row = transitions.len();
         transitions.resize(row + 256, NO_STATE);
+        work = work.saturating_add(subset.len().saturating_mul(256));
+        if work > work_budget {
+            return None;
+        }
         for byte in 0..=255u8 {
             let mut targets = BTreeSet::new();
             for &state in &subset {

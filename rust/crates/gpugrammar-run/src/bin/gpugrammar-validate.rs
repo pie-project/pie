@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use gpugrammar_ir::json_schema::{JsonSchemaOptions, json_schema_to_grammar};
-use gpugrammar_lex::lexicon::{extract, terminal_automata};
+use gpugrammar_lex::lexicon::{extract, terminal_automata_within};
 use gpugrammar_lex::regular::analyze;
 use gpugrammar_lex::{build_lexer_within, group_vocabulary};
 use gpugrammar_lr::cfg::flatten;
@@ -62,34 +62,23 @@ fn main() -> Result<()> {
         else {
             continue;
         };
-        let clock = std::time::Instant::now();
         let lexicon = extract(&grammar, &analyze(&grammar));
-        let Some(lexer) = build_lexer_within(terminal_automata(&grammar, &lexicon), state_limit)
+        // A length bound is unrolled into the automaton, so refuse the schema
+        // from its declared bounds rather than after building.
+        let Some(automata) = terminal_automata_within(&grammar, &lexicon, state_limit as u64)
         else {
             oversized += 1;
             continue;
         };
+        let Some(lexer) = build_lexer_within(automata, state_limit) else {
+            oversized += 1;
+            continue;
+        };
         lexer_states.push(lexer.num_states());
-        let lexed = clock.elapsed();
         let groups = group_vocabulary(&lexer, &bytes);
-        let grouped = clock.elapsed();
         let cfg = flatten(&lexicon);
         let Ok(tables) = build(&cfg) else { continue };
-        let tabled = clock.elapsed();
         let artifact = Arc::new(emit(&lexicon, &lexer, &groups, &cfg, &tables, bytes.len())?);
-        let emitted = clock.elapsed();
-        if emitted.as_millis() > 500 {
-            eprintln!(
-                "slow: lexer states {} terminals {} parser states {} | lex {:?} group {:?} tables {:?} emit {:?}",
-                lexer.num_states(),
-                lexicon.terminals.len(),
-                tables.num_states(),
-                lexed,
-                grouped - lexed,
-                tabled - grouped,
-                emitted - tabled
-            );
-        }
         compiled += 1;
 
         let mut matcher = Matcher::new(artifact, 0);

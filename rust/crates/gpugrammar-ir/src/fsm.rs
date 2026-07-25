@@ -883,7 +883,23 @@ fn build_inlined_repeat(
 /// Returns a Vec indexed by rule id. Each entry is an `Automaton<NfaGraph>`
 /// representing the NFA for that rule.
 pub fn build_rule_fsms(grammar: &Grammar) -> Vec<Automaton<NfaGraph>> {
-    let inlineable = find_inlineable_rules(grammar);
+    build_rule_fsms_with(grammar, true)
+}
+
+/// As [`build_rule_fsms`], with a choice about inlining.
+///
+/// Inlining copies a referenced rule's body into every use, and it does so
+/// without memoisation, so a rule graph that shares subexpressions is expanded
+/// as a tree. Lowered JSON Schemas share heavily - one value expression serves
+/// every property that uses it - and the expansion is exponential: real schemas
+/// never finish building. Callers that resolve rule references themselves, with
+/// sharing, should pass `false`.
+pub fn build_rule_fsms_with(grammar: &Grammar, inline: bool) -> Vec<Automaton<NfaGraph>> {
+    let inlineable = if inline {
+        find_inlineable_rules(grammar)
+    } else {
+        HashSet::new()
+    };
     let mut result = Vec::new();
 
     for rule in grammar.rules() {

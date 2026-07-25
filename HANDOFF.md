@@ -39,16 +39,19 @@ xgrammar    64/64 valid | 1182 tokens in 0.64s = 1858 tok/s
 gpugrammar  64/64 valid | 1247 tokens in 0.77s = 1619 tok/s
 ```
 
-All 21 Rust test suites pass. Coverage over 533 real JSONSchemaBench schemas:
+All 23 Rust test suites pass. Coverage over 533 real JSONSchemaBench schemas:
 461 lower to a grammar, 434 reach LALR(1) tables. Median parser state count is
-3; the median schema needs no stack at all because it is purely regular.
+3; the median schema needs no stack at all because it is purely regular. Lexer
+states: median 129, p90 356. The whole corpus compiles and validates in 5.1
+seconds.
 
 ## What is broken, in priority order
 
-**1. We reject documents we should accept.** This is the important one. A byte
-level differential — compile each schema, feed the model-generated instance one
-byte at a time — still rejects some documents that XGrammar produced under the
-same schema. Reproduce a single case with:
+**1. We reject documents we should accept. Acceptance is 45.5%.** This is the
+important one, and it is now measured: of 290 schemas that compile within the
+lexer budget, only 132 accept the document a model produced under that same
+schema. A byte-level differential is the measurement — compile the schema, feed
+the instance one byte at a time. Reproduce a single case with:
 
 ```
 cargo run --release --bin gpugrammar-trace -- results/jsonschemabench-instances.json <index>
@@ -71,12 +74,14 @@ budget so the rest of the corpus stays measurable, but the real answer is a
 counter-augmented lexer, where the runtime state is `(dfa_state, counter)` and
 the counter is not compiled away. That is unbuilt.
 
-**4. Emission is slow for large lexers.** Reachability is now one fixpoint
-rather than a search per group, and pending-terminal lists are shared by lexer
-state rather than copied per group. It is still too slow to emit a
-20,000-state lexer against a byte vocabulary: a 60-instance validation run did
-not finish in 900 seconds, which is why there is no single acceptance number
-above. Not profiled properly yet.
+**4. Compilation was unusably slow, and is not any more.** The vendored FSM
+builder inlined a referenced rule into every use without memoisation, so a rule
+graph that shares subexpressions was expanded as a tree. Lowered schemas share
+heavily, and the expansion is exponential: validation over the corpus never
+finished. `resolve_references` already splices rule references with sharing, so
+the builder is now asked not to inline at all. The whole corpus went from never
+finishing to **5.1 seconds**. Reachability is also one fixpoint rather than a
+search per group, and pending-terminal lists are shared by lexer state.
 
 **5. 72 schemas fail before the lexer.** Front-end gaps, all in the vendored
 JSON Schema lowering: `allOf` with multiple schemas (18), `required` naming a

@@ -10,7 +10,7 @@
 //! Terminals are interned by structure, so a comma written in five different
 //! rules is one terminal with one column in the ACTION table.
 
-use gpugrammar_ir::fsm::{Automaton, FsmEdge, NfaGraph, StateId, build_rule_fsms};
+use gpugrammar_ir::fsm::{Automaton, FsmEdge, NfaGraph, StateId, build_rule_fsms_with};
 use gpugrammar_ir::grammar::{Expr, ExprId, Grammar, Rule, RuleId};
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -150,6 +150,108 @@ pub fn extract(grammar: &Grammar, regularity: &Regularity) -> Lexicon {
 /// turns that self-reference into a cycle, which is exactly right: regularity
 /// analysis only admits recursion in tail position.
 pub fn terminal_automata(grammar: &Grammar, lexicon: &Lexicon) -> Vec<Terminal> {
+    terminal_automata_within(grammar, lexicon, u64::MAX).expect("no size budget was set")
+}
+
+/// An upper bound on the states one terminal's automaton will need.
+///
+/// A bounded repeat is unrolled, so `x{0,2048}` costs two thousand copies of
+/// `x`. That is what makes a length-bounded schema explode - one schema in
+/// JSONSchemaBench asks for 209,001 lexer states, and building it takes
+/// seconds before the determiniser can even refuse it. Estimating from the
+/// declared bounds is immediate.
+pub fn size_estimate(grammar: &Grammar, expr: ExprId) -> u64 {
+    // Expressions form a directed graph, not a tree: a lowered schema shares
+    // one value expression across every property that uses it, and the FSM
+    // builder inlines each use. Without a memo the walk re-walks every shared
+    // subtree once per path and hangs while using no memory at all.
+    //
+    // The memo may not keep a value that was cut short by recursion. A rule
+    // already on the path stands for a cycle in the automaton and counts as
+    // one state, but that answer is only valid on that path: caching it would
+    // report a mutually recursive schema as tiny and let a grammar through
+    // that the builder cannot finish.
+    struct Walk<'a> {
+        grammar: &'a Grammar,
+        visiting: FxHashSet<u32>,
+        memo: FxHashMap<u32, u64>,
+    }
+
+    impl Walk<'_> {
+        fn expr(&mut self, expr: ExprId) -> (u64, bool) {
+            if let Some(&cached) = self.memo.get(&expr.0) {
+                return (cached, false);
+            }
+            let (value, truncated) = self.compute(expr);
+            if !truncated {
+                self.memo.insert(expr.0, value);
+            }
+            (value, truncated)
+        }
+
+        fn compute(&mut self, expr: ExprId) -> (u64, bool) {
+            match self.grammar.get_expr(expr).clone() {
+                Expr::EmptyString => (1, false),
+                Expr::ByteString(bytes) => (bytes.len().max(1) as u64, false),
+                Expr::CharacterClass { .. } | Expr::CharacterClassStar { .. } => (2, false),
+                Expr::Sequence(parts) | Expr::Choices(parts) => {
+                    let mut total = 1u64;
+                    let mut truncated = false;
+                    for part in parts {
+                        let (value, cut) = self.expr(part);
+                        total = total.saturating_add(value);
+                        truncated |= cut;
+                    }
+                    (total, truncated)
+                }
+                Expr::RuleRef(rule) => self.rule(rule),
+                Expr::Repeat { rule, min, max } => {
+                    let (inner, truncated) = self.rule(rule);
+                    let copies = max.unwrap_or(min).max(1) as u64;
+                    (inner.saturating_mul(copies), truncated)
+                }
+            }
+        }
+
+        fn rule(&mut self, rule: RuleId) -> (u64, bool) {
+            if !self.visiting.insert(rule.0) {
+                return (1, true);
+            }
+            let body = self.grammar.get_rule(rule).body;
+            let result = self.expr(body);
+            self.visiting.remove(&rule.0);
+            result
+        }
+    }
+
+    Walk {
+        grammar,
+        visiting: FxHashSet::default(),
+        memo: FxHashMap::default(),
+    }
+    .expr(expr)
+    .0
+}
+
+/// As [`terminal_automata`], but refused when a terminal would exceed `budget`
+/// states once its bounded repeats are unrolled.
+pub fn terminal_automata_within(
+    grammar: &Grammar,
+    lexicon: &Lexicon,
+    budget: u64,
+) -> Option<Vec<Terminal>> {
+    for terminal in &lexicon.terminals {
+        let estimate = terminal.parts.iter().fold(0u64, |total, part| {
+            total.saturating_add(size_estimate(grammar, *part))
+        });
+        if estimate > budget {
+            return None;
+        }
+    }
+    Some(terminal_automata_unchecked(grammar, lexicon))
+}
+
+fn terminal_automata_unchecked(grammar: &Grammar, lexicon: &Lexicon) -> Vec<Terminal> {
     let mut extended = grammar.clone();
     let base = extended.rules.len();
     for (index, terminal) in lexicon.terminals.iter().enumerate() {
@@ -165,7 +267,11 @@ pub fn terminal_automata(grammar: &Grammar, lexicon: &Lexicon) -> Vec<Terminal> 
             body,
         });
     }
-    let automata = build_rule_fsms(&extended);
+    // No inlining: the builder copies a referenced rule into every use without
+    // memoisation, and lowered schemas share subexpressions heavily enough that
+    // the copies are exponential. `resolve_references` below splices the rule
+    // reference edges with sharing instead.
+    let automata = build_rule_fsms_with(&extended, false);
     lexicon
         .terminals
         .iter()
