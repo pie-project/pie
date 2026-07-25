@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/gpugrammar-ir",
     "crates/gpugrammar-lex",
+    "crates/gpugrammar-lr",
 ]
 
 [workspace.package]
