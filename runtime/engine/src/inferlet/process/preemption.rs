@@ -493,6 +493,13 @@ pub(crate) async fn wait_yielding<T>(
     let Some(signal) = orchestrator.park_signal(pid) else {
         return Ok(Waited::Done(wait.await));
     };
+    // A truly idle await (no table access, nothing to drain) is D6's
+    // preferred victim class: suspending it costs no running lane. Mark it
+    // for the selector; the guard clears the mark on every exit.
+    let _idle_mark = matches!(at, SafePoint::Idle { .. }).then(|| {
+        orchestrator.note_idle_await(pid, true);
+        IdleMark { pid }
+    });
     let notified = signal.notified();
     tokio::pin!(notified);
     notified.as_mut().enable();
@@ -507,6 +514,20 @@ pub(crate) async fn wait_yielding<T>(
         _ = &mut notified => {
             yield_point_at(at).await?;
             Ok(Waited::Yielded)
+        }
+    }
+}
+
+/// Clears the process's idle-await mark on every exit from
+/// [`wait_yielding`], including cancellation.
+struct IdleMark {
+    pid: uuid::Uuid,
+}
+
+impl Drop for IdleMark {
+    fn drop(&mut self) {
+        if let Some(orchestrator) = crate::store::reclaim::contention() {
+            orchestrator.note_idle_await(self.pid, false);
         }
     }
 }

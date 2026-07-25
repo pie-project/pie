@@ -1,7 +1,7 @@
 //! Process-owned membership inventory for KV/RS working sets and fire queues.
 
-use std::collections::HashSet;
-use std::sync::Weak;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, LazyLock, Mutex, RwLock, Weak};
 
 use crate::pipeline::fire::{PendingFireQueue, PendingFires};
 use crate::store::kv::page_table::WorkingSetId;
@@ -86,4 +86,44 @@ mod tests {
         let second = residency.teardown_snapshot();
         assert!(second.departed_pipeline_ids.is_empty());
     }
+}
+
+/// pid → residency, for cross-layer probes that only know a process id
+/// (victim footprint sizing). Weak entries; pruned on unregister and on
+/// probe misses.
+static RESIDENCIES: LazyLock<RwLock<HashMap<uuid::Uuid, Weak<Mutex<ProcessResidency>>>>> =
+    LazyLock::new(Default::default);
+
+pub(crate) fn register_residency(pid: uuid::Uuid, residency: Weak<Mutex<ProcessResidency>>) {
+    RESIDENCIES.write().unwrap().insert(pid, residency);
+}
+
+pub(crate) fn unregister_residency(pid: uuid::Uuid) {
+    RESIDENCIES.write().unwrap().remove(&pid);
+}
+
+/// Pages only `pid`'s working sets can free on `(model, driver)` — the
+/// contention ladder's victim-cost figure (D6 smallest-cover). `None` when
+/// the process is unknown or already tearing down.
+pub(crate) fn kv_exclusive_footprint(pid: uuid::Uuid, model: usize, driver: usize) -> Option<u32> {
+    let residency = RESIDENCIES.read().unwrap().get(&pid)?.upgrade()?;
+    let working_sets: Vec<WorkingSetId> = {
+        let residency = residency.lock().unwrap();
+        residency
+            .kv_working_sets
+            .iter()
+            .filter_map(|&(m, d, ws)| (m == model && d as usize == driver).then_some(ws))
+            .collect()
+    };
+    if working_sets.is_empty() {
+        return Some(0);
+    }
+    let stores = crate::store::registry::try_get(model, driver)?;
+    let total = crate::store::registry::with_kv_lock(&stores.kv, "reclaim", |kv| {
+        working_sets
+            .iter()
+            .map(|&ws| kv.exclusive_footprint(ws).unwrap_or(0))
+            .sum::<u64>()
+    });
+    u32::try_from(total).ok()
 }

@@ -359,6 +359,21 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             contention_config,
         ),
     );
+    if let Some(orchestrator) =
+        crate::store::reclaim::contention_for(arena_model_idx, 0)
+    {
+        // D7's kill rung: runtime-level terminate (quiesce-first, GPU
+        // lifetime respected, transactions unwound by the RAII guards) —
+        // never an OS signal, never a cleanup bypass.
+        orchestrator.set_kill_hook(|pid, reason| {
+            crate::inferlet::process::terminate(pid, Err(reason));
+        });
+        // D6's cost figure: pages only the candidate's working sets can
+        // free — smallest-cover selection minimizes wasted copies.
+        orchestrator.set_footprint_probe(|pid, model, driver| {
+            crate::inferlet::process::residency::kv_exclusive_footprint(pid, model, driver)
+        });
+    }
 
     // (Context actor `context::spawn` removed — Phase 5. The unified arena
     // registry above is the per-model/driver physical home now.)

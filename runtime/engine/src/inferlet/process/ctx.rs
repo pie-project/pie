@@ -287,7 +287,11 @@ impl ProcessCtx {
             dynamic_resource_map: HashMap::new(),
             guest_resource_map: Vec::new(),
             next_dynamic_rep: 1,
-            residency: Arc::new(Mutex::new(ProcessResidency::default())),
+            residency: {
+                let residency = Arc::new(Mutex::new(ProcessResidency::default()));
+                super::residency::register_residency(id, Arc::downgrade(&residency));
+                residency
+            },
             prewarm_permit: None,
             bind_permit: None,
             bind_admitted: false,

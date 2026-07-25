@@ -73,6 +73,14 @@ pub(super) struct Proc {
     /// Pages freed when this process suspended — its restore ask, kept here
     /// so a failed restore can re-queue with the same demand.
     pub restore_demand: u32,
+    /// Self-reported: parked in a long idle host await (a permanent safe
+    /// point). Victim selection prefers idle holders (D6) — suspending one
+    /// costs no running lane.
+    pub idle: bool,
+    /// A progress-deadline kill was dispatched for this process (D7); it is
+    /// excluded from further victim and kill selection while its teardown
+    /// runs.
+    pub killed: bool,
     /// Wakes the process's safe-point watchers when a park request lands or
     /// clears, and its state-transition waiters.
     pub signal: Arc<Notify>,
@@ -84,6 +92,8 @@ impl Proc {
             seq,
             state: ProcState::Running,
             restore_demand: 0,
+            idle: false,
+            killed: false,
             signal: Arc::new(Notify::new()),
         }
     }

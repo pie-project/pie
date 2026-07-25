@@ -8,7 +8,7 @@
 mod ctx;
 mod output;
 pub(crate) mod preemption;
-mod residency;
+pub(crate) mod residency;
 
 pub(crate) use ctx::OutputMode;
 pub use ctx::ProcessCtx;
@@ -763,6 +763,7 @@ impl Process {
         if let Some(o) = crate::store::reclaim::contention() {
             o.unregister(self.process_id);
         }
+        residency::unregister_residency(self.process_id);
     }
 }
 

@@ -315,6 +315,8 @@ pub struct ContentionStats {
     pub restore_turnaround_us: AtomicU64,
     /// Count for [`Self::restore_turnaround_us`].
     pub restore_turnarounds: AtomicU64,
+    /// Progress-deadline breaches escalated to a kill (D7).
+    pub deadline_kills: AtomicU64,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -358,6 +360,7 @@ pub struct ContentionDiagnostics {
     pub restore_wait_us_total: u64,
     pub restore_turnaround_us_total: u64,
     pub restore_turnarounds_total: u64,
+    pub deadline_kills_total: u64,
 }
 
 /// A restore grant issued by the drain, parked until its process collects it.
@@ -395,6 +398,17 @@ fn summarize(inner: &Inner) -> u64 {
         | ((parks.min(0xFFFF) as u64) << 32)
 }
 
+/// Kills a process through the runtime abort path (`terminate`: quiesce
+/// first, GPU lifetime respected, transactions unwound by the RAII guards)
+/// — never an OS signal, never a cleanup bypass. Installed by bootstrap;
+/// absent in unit tests unless a test installs its own.
+pub type KillHook = Box<dyn Fn(ProcessId, String) + Send + Sync>;
+
+/// Pages only this process's working sets could free on the orchestrator's
+/// (model, driver) — the D6 cost figure for victim selection. Installed by
+/// bootstrap (it crosses layers the store must not name).
+pub type FootprintProbe = Box<dyn Fn(ProcessId, usize, usize) -> Option<u32> + Send + Sync>;
+
 pub struct ContentionOrchestrator {
     inner: Mutex<Inner>,
     /// See [`summarize`]. Readers may observe one transition late; every
@@ -403,6 +417,24 @@ pub struct ContentionOrchestrator {
     port: Arc<dyn PoolPort>,
     stats: ContentionStats,
     config: ContentionConfig,
+    kill: OnceLock<KillHook>,
+    footprint: OnceLock<FootprintProbe>,
+}
+
+/// One victim-selection candidate, snapshotted under the lock.
+struct VictimCandidate {
+    pid: ProcessId,
+    seq: u64,
+    idle: bool,
+}
+
+/// What a progress-deadline breach escalated to (D7).
+enum BreachAction {
+    /// A younger victim was killed; the head got a fresh deadline window.
+    Killed,
+    /// No younger work exists (or no kill path is wired): the head fails
+    /// itself — the final rung.
+    FailLoud,
 }
 
 /// One step of the drain: computed under the lock, executed against the
@@ -444,7 +476,33 @@ impl ContentionOrchestrator {
             port,
             stats: ContentionStats::default(),
             config,
+            kill: OnceLock::new(),
+            footprint: OnceLock::new(),
         }
+    }
+
+    /// Install the runtime kill path (bootstrap, once).
+    pub fn set_kill_hook(&self, hook: impl Fn(ProcessId, String) + Send + Sync + 'static) {
+        let _ = self.kill.set(Box::new(hook));
+    }
+
+    /// Install the victim footprint probe (bootstrap, once).
+    pub fn set_footprint_probe(
+        &self,
+        probe: impl Fn(ProcessId, usize, usize) -> Option<u32> + Send + Sync + 'static,
+    ) {
+        let _ = self.footprint.set(Box::new(probe));
+    }
+
+    /// Self-reported by the process side: `pid` entered (or left) a long
+    /// idle host await — a permanent safe point, and D6's preferred victim
+    /// class.
+    pub fn note_idle_await(&self, pid: ProcessId, entered: bool) {
+        self.with_inner(|inner| {
+            if let Some(proc) = inner.procs.get_mut(&pid) {
+                proc.idle = entered;
+            }
+        });
     }
 
     /// The injected configuration (read-only; parsed once at bootstrap).
@@ -616,12 +674,19 @@ impl ContentionOrchestrator {
                             _ = &mut notified => {}
                             _ = &mut sleep => {
                                 if let Some(error) = self.progress_breach(key) {
-                                    registration.disarm();
-                                    self.cancel_waiter(requester, key, false);
-                                    self.stats
-                                        .exhaustion_timeouts
-                                        .fetch_add(1, Ordering::Relaxed);
-                                    return Err(error);
+                                    match self.escalate_breach(key, &error) {
+                                        // A kill reset the clock; keep waiting
+                                        // for the teardown's frees.
+                                        BreachAction::Killed => {}
+                                        BreachAction::FailLoud => {
+                                            registration.disarm();
+                                            self.cancel_waiter(requester, key, false);
+                                            self.stats
+                                                .exhaustion_timeouts
+                                                .fetch_add(1, Ordering::Relaxed);
+                                            return Err(error);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -975,34 +1040,63 @@ impl ContentionOrchestrator {
 
     /// Post a park request to one victim younger than the queue head (D4's
     /// net-progress rule: suspending the head or its elders cannot make net
-    /// progress). Until B6 widens eligibility, candidates are processes with
-    /// their own allocation entries — the population proven to pass a safe
-    /// point (their acquire observes the request and self-suspends).
+    /// progress — and the keystone exemption falls out as a theorem, since
+    /// the globally-oldest process is never younger than any head).
+    ///
+    /// Eligibility is EVERY pin-free process younger than the head — hog
+    /// reclaim: a young process holding a large resident footprint while
+    /// making steady progress is a victim like any other; "pin-free" is
+    /// enforced where the request is honored (the safe point), not here.
+    ///
+    /// Selection is cost-aware inside the FCFS invariant (D6): suspension
+    /// is whole-process, so an oversized victim over-evicts. Prefer idle
+    /// holders (no running lane lost), then the smallest footprint that
+    /// covers the head's residual demand; tie-break youngest. Service
+    /// order stays the spawn clock regardless of who is picked.
     fn escalate(&self) {
         if !self.port.suspend_capable() {
             return;
         }
+        // Phase 1 (lock): the head's residual and the candidate set.
+        let Some((residual, candidates)) = self.with_inner(|inner| {
+            let (key, entry) = inner.queue.head()?;
+            let missing = entry.kv_missing();
+            if missing == 0 {
+                return None; // the head only waits for RS or collection
+            }
+            let head_seq = key.0;
+            let candidates: Vec<VictimCandidate> = inner
+                .procs
+                .iter()
+                .filter(|(_, proc)| {
+                    proc.state == ProcState::Running && !proc.killed && proc.seq > head_seq
+                })
+                .map(|(pid, proc)| VictimCandidate {
+                    pid: *pid,
+                    seq: proc.seq,
+                    idle: proc.idle,
+                })
+                .collect();
+            (!candidates.is_empty()).then_some((missing, candidates))
+        }) else {
+            return;
+        };
+        // Phase 2 (no lock — the probe takes store locks): D6 cost scoring.
+        let victim = self.select_costed(residual, candidates);
+        // Phase 3 (lock): re-validate against the current head and post.
         let notifications = self.with_inner(|inner| {
             let head_seq = {
                 let (key, entry) = inner.queue.head()?;
                 if entry.kv_missing() == 0 {
-                    return None; // the head only waits for RS or collection
+                    return None;
                 }
                 key.0
             };
             let Inner { procs, queue, .. } = &mut *inner;
-            let victim = procs
-                .iter()
-                .filter(|(pid, proc)| {
-                    proc.state == ProcState::Running
-                        && proc.seq > head_seq
-                        && queue
-                            .iter()
-                            .any(|(_, entry)| entry.pid == **pid && entry.is_unmet())
-                })
-                .max_by_key(|(_, proc)| proc.seq)
-                .map(|(pid, _)| *pid)?;
-            let proc = procs.get_mut(&victim).expect("victim exists");
+            let proc = procs.get_mut(&victim)?;
+            if proc.state != ProcState::Running || proc.killed || proc.seq <= head_seq {
+                return None;
+            }
             let Ok(next) = proc.state.apply(ProcEvent::RequestPark) else {
                 return None;
             };
@@ -1023,6 +1117,111 @@ impl ContentionOrchestrator {
             }
             drop(displaced); // accumulated reservations return outside the lock
         }
+    }
+
+    /// D6 cost order over a non-empty candidate set: idle holders first;
+    /// then the smallest footprint covering `residual` (a covering victim
+    /// ends the reclaim in one suspension), then the largest partial
+    /// footprint (most progress per eviction), unknown footprints last of
+    /// their class; ties break youngest.
+    fn select_costed(&self, residual: u32, candidates: Vec<VictimCandidate>) -> ProcessId {
+        let (model, driver) = self.port.locus();
+        let probe = self.footprint.get();
+        candidates
+            .into_iter()
+            .min_by_key(|candidate| {
+                let footprint = probe.and_then(|probe| probe(candidate.pid, model, driver));
+                let (class, cost) = match footprint {
+                    Some(f) if f >= residual => (0u8, i64::from(f)),
+                    Some(f) => (1, -i64::from(f)),
+                    None => (2, 0),
+                };
+                (!candidate.idle, class, cost, u64::MAX - candidate.seq)
+            })
+            .map(|candidate| candidate.pid)
+            .expect("candidates are non-empty")
+    }
+
+    /// D7 — the breach ladder: destruction before failure, youngest-
+    /// necessary first, never the head or its elders. Prefer an already-
+    /// selected victim that never reached its safe point (provably
+    /// uncooperative), else the D6 cost pick over the running set.
+    /// Suspended/quiescing processes are not targets — they already yielded
+    /// (or are yielding) their pages. Fail-loud survives only as the final
+    /// rung, when no younger work remains.
+    fn escalate_breach(&self, key: EntryKey, error: &ContentionError) -> BreachAction {
+        let Some(kill) = self.kill.get() else {
+            return BreachAction::FailLoud;
+        };
+        let Some((residual, uncooperative, running)) = self.with_inner(|inner| {
+            let (head_key, entry) = inner.queue.head()?;
+            if *head_key != key {
+                return None; // the breach went stale under us
+            }
+            let head_seq = head_key.0;
+            let mut uncooperative: Vec<VictimCandidate> = Vec::new();
+            let mut running: Vec<VictimCandidate> = Vec::new();
+            for (pid, proc) in inner.procs.iter() {
+                if proc.killed || proc.seq <= head_seq {
+                    continue;
+                }
+                let candidate = VictimCandidate {
+                    pid: *pid,
+                    seq: proc.seq,
+                    idle: proc.idle,
+                };
+                match proc.state {
+                    ProcState::ParkRequested => uncooperative.push(candidate),
+                    ProcState::Running => running.push(candidate),
+                    _ => {}
+                }
+            }
+            Some((entry.kv_missing(), uncooperative, running))
+        }) else {
+            return BreachAction::FailLoud;
+        };
+        let victim = if let Some(worst) = uncooperative
+            .into_iter()
+            .max_by_key(|candidate| candidate.seq)
+        {
+            Some(worst.pid)
+        } else if running.is_empty() {
+            None
+        } else {
+            Some(self.select_costed(residual, running))
+        };
+        let Some(victim) = victim else {
+            return BreachAction::FailLoud;
+        };
+        let marked = self.with_inner(|inner| {
+            let Some(proc) = inner.procs.get_mut(&victim) else {
+                // It unregistered under us — its frees are the progress.
+                inner.progress = None;
+                return true;
+            };
+            if proc.killed {
+                return false;
+            }
+            proc.killed = true;
+            // Destruction is the progress action here: the teardown's frees
+            // get a fresh deadline window.
+            inner.progress = None;
+            true
+        });
+        if !marked {
+            return BreachAction::FailLoud;
+        }
+        self.stats.deadline_kills.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            victim = %victim,
+            "KV contention progress deadline breached: killing the \
+             youngest-necessary victim through the runtime abort path (D7)"
+        );
+        kill(
+            victim,
+            format!("KV contention progress deadline expired: {error}"),
+        );
+        BreachAction::Killed
     }
 
     /// Pressure relief, not timers: when nothing is waiting for pages any
@@ -1137,19 +1336,38 @@ impl ContentionOrchestrator {
     }
 
     /// Victim-side step 2 — the commit point: `ParkRequested → Quiescing`.
+    /// Re-checks the pressure that justified the request (D4): the park is
+    /// honored only while an OLDER unmet head still exists; a stale request
+    /// is withdrawn right here — pressure relief, not timers.
     pub fn begin_quiesce(&self, pid: ProcessId) -> bool {
-        self.with_inner(|inner| {
-            let Some(proc) = inner.procs.get_mut(&pid) else {
-                return false;
+        let (accepted, withdrawn) = self.with_inner(|inner| {
+            let Some(proc) = inner.procs.get(&pid) else {
+                return (false, None);
             };
+            if proc.state != ProcState::ParkRequested {
+                return (false, None);
+            }
+            let seq = proc.seq;
+            let still_needed = inner.queue.head().is_some_and(|(key, _)| key.0 < seq);
+            let proc = inner.procs.get_mut(&pid).expect("checked above");
+            if !still_needed {
+                if let Ok(next) = proc.state.apply(ProcEvent::DeclinePark) {
+                    proc.state = next;
+                }
+                return (false, Some(proc.signal.clone()));
+            }
             match proc.state.apply(ProcEvent::BeginQuiesce) {
                 Ok(next) => {
                     proc.state = next;
-                    true
+                    (true, None)
                 }
-                Err(_) => false,
+                Err(_) => (false, None),
             }
-        })
+        });
+        if let Some(signal) = withdrawn {
+            signal.notify_waiters();
+        }
+        accepted
     }
 
     pub fn leave_for_suspend(&self, pid: ProcessId) {
@@ -1269,14 +1487,21 @@ impl ContentionOrchestrator {
                         _ = &mut sleep => {
                             let key = key.expect("deadline implies key");
                             if let Some(error) = self.progress_breach(key) {
-                                let removed = self.with_inner(|inner| {
-                                    inner.queue.remove(&key)
-                                });
-                                drop(removed);
-                                self.stats
-                                    .exhaustion_timeouts
-                                    .fetch_add(1, Ordering::Relaxed);
-                                return Err(error);
+                                match self.escalate_breach(key, &error) {
+                                    // A kill reset the clock; keep waiting
+                                    // for the teardown's frees.
+                                    BreachAction::Killed => {}
+                                    BreachAction::FailLoud => {
+                                        let removed = self.with_inner(|inner| {
+                                            inner.queue.remove(&key)
+                                        });
+                                        drop(removed);
+                                        self.stats
+                                            .exhaustion_timeouts
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        return Err(error);
+                                    }
+                                }
                             }
                         }
                     }
@@ -1509,6 +1734,7 @@ impl ContentionOrchestrator {
             restore_wait_us_total: self.stats.restore_wait_us.load(Relaxed),
             restore_turnaround_us_total: self.stats.restore_turnaround_us.load(Relaxed),
             restore_turnarounds_total: self.stats.restore_turnarounds.load(Relaxed),
+            deadline_kills_total: self.stats.deadline_kills.load(Relaxed),
         }
     }
 
@@ -1725,14 +1951,14 @@ mod tests {
         orch.acquire(pid, pid, Demand::kv(need)).await
     }
 
-    /// Drive the park protocol for a test victim: request → quiesce →
-    /// report_suspended(pages).
+    /// Drive the park protocol for a test victim straight to Quiescing —
+    /// tests forge suspensions without real pressure, and the production
+    /// `begin_quiesce` commit point would (correctly) withdraw them.
     fn suspend_for_test(orch: &ContentionOrchestrator, pid: ProcessId, pages: u32) {
         orch.with_inner(|inner| {
             let proc = inner.procs.get_mut(&pid).unwrap();
-            proc.state = ProcState::ParkRequested;
+            proc.state = ProcState::Quiescing;
         });
-        assert!(orch.begin_quiesce(pid));
         orch.report_suspended(pid, pages);
     }
 
@@ -2051,6 +2277,113 @@ mod tests {
         drop(grant);
         assert_eq!(pool.rs_free.load(Ordering::SeqCst), 64);
         assert_eq!(pool.free.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn hog_holding_pages_while_running_is_park_requested() {
+        // The behavioral gap this project exists to close: a young process
+        // with NO allocation entry — running steadily, holding pages — is a
+        // victim like any other once an older head starves.
+        let (orch, head, _) = orch_with_pool(0, 0, 10);
+        let hog = ProcessId::new_v4();
+        orch.register(hog);
+        let _ = orch.register_waiter(head, head, Demand::kv(4)).unwrap();
+        orch.escalate();
+        assert!(orch.should_park(hog));
+    }
+
+    #[test]
+    fn begin_quiesce_withdraws_a_stale_park_request() {
+        let (orch, older, _) = orch_with_pool(0, 0, 10);
+        let younger = ProcessId::new_v4();
+        orch.register(younger);
+        // No older unmet head exists: the commit point withdraws.
+        orch.with_inner(|inner| {
+            inner.procs.get_mut(&younger).unwrap().state = ProcState::ParkRequested;
+        });
+        assert!(!orch.begin_quiesce(younger));
+        assert!(!orch.should_park(younger));
+        // With an older unmet head, the same request commits.
+        let _ = orch.register_waiter(older, older, Demand::kv(4)).unwrap();
+        orch.with_inner(|inner| {
+            inner.procs.get_mut(&younger).unwrap().state = ProcState::ParkRequested;
+        });
+        assert!(orch.begin_quiesce(younger));
+    }
+
+    #[test]
+    fn idle_holder_is_preferred_over_a_running_victim() {
+        let (orch, head, _) = orch_with_pool(0, 0, 10);
+        let running = ProcessId::new_v4();
+        let idler = ProcessId::new_v4();
+        orch.register(running);
+        orch.register(idler);
+        orch.note_idle_await(idler, true);
+        let _ = orch.register_waiter(head, head, Demand::kv(4)).unwrap();
+        orch.escalate();
+        // `running` is younger (spawned later), but the idle holder costs
+        // no running lane (D6) and is selected first.
+        assert!(orch.should_park(idler));
+        assert!(!orch.should_park(running));
+    }
+
+    #[test]
+    fn smallest_covering_footprint_wins_within_a_class() {
+        let (orch, head, _) = orch_with_pool(0, 0, 32);
+        let small = ProcessId::new_v4();
+        let big = ProcessId::new_v4();
+        orch.register(small);
+        orch.register(big);
+        let footprints = std::sync::Mutex::new(std::collections::HashMap::from([
+            (small, 4u32),
+            (big, 20u32),
+        ]));
+        orch.set_footprint_probe(move |pid, _, _| footprints.lock().unwrap().get(&pid).copied());
+        let _ = orch.register_waiter(head, head, Demand::kv(3)).unwrap();
+        orch.escalate();
+        // Both cover the residual demand of 3; the 4-page victim wastes 1
+        // page of D2H, the 20-page victim wastes 17 (D6 smallest-cover).
+        assert!(orch.should_park(small));
+        assert!(!orch.should_park(big));
+    }
+
+    #[tokio::test]
+    async fn deadline_breach_kills_the_uncooperative_victim_before_failing_loud() {
+        let (orch, head, pool) = orch_with_config(0, 0, 10, Duration::from_millis(40));
+        let hog = ProcessId::new_v4();
+        orch.register(hog);
+        let kills: Arc<Mutex<Vec<ProcessId>>> = Arc::default();
+        {
+            let kills = kills.clone();
+            orch.set_kill_hook(move |pid, _reason| kills.lock().unwrap().push(pid));
+        }
+        let task = {
+            let orch = orch.clone();
+            tokio::spawn(async move { acquire(&orch, head, 2).await })
+        };
+        // The ladder first posts a park request to the hog; at the breach
+        // the still-uncooperative hog is the kill target (D7), and the head
+        // KEEPS WAITING on a fresh deadline window instead of failing.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while kills.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the breach must escalate to a kill");
+        assert_eq!(kills.lock().unwrap().as_slice(), &[hog]);
+        assert_eq!(orch.stats().deadline_kills.load(Ordering::Relaxed), 1);
+        assert!(!task.is_finished(), "the head must outlive the kill");
+        // The kill's teardown frees the hog's pages; the head completes.
+        orch.unregister(hog);
+        pool.free.store(2, Ordering::SeqCst);
+        orch.on_blocks_freed();
+        let got = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("the head must complete after the kill frees pages")
+            .unwrap();
+        assert!(got.is_ok());
+        assert_eq!(orch.stats().exhaustion_timeouts.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
