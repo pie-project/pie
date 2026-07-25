@@ -2269,9 +2269,16 @@ fn scan_partition(
                 return Err(PlanDecodeError::InvalidRecord);
             }
         }
+        // The nucleus region's shape is a wire ABI. Two forms exist: the plain
+        // `(logits, top_p, rng)` recipe and the scaled one, which additionally
+        // carries the temperature divisor and the pre-scale logits. Both are
+        // 13 nodes; they differ only in arity. Accepting only the plain form
+        // would reject plans this crate's own encoder produces and every CUDA
+        // backend accepts (`grouped_nucleus_region_supported`,
+        // `singleton_codegen`, `program_runtime`).
         if region_kind == 1
             && library == LibraryOp::NucleusSample as u8
-            && (nodes != 13 || inputs != 3 || outputs != 1 || sinks != 0)
+            && (nodes != 13 || (inputs != 3 && inputs != 5) || outputs != 1 || sinks != 0)
         {
             return Err(PlanDecodeError::InvalidRecord);
         }
@@ -3172,6 +3179,24 @@ mod tests {
         assert_eq!(nucleus.nodes, (6..=18).collect::<Vec<_>>());
         assert_eq!(nucleus.inputs, vec![2, 4, 5, 1, 0]);
         assert_eq!(nucleus.outputs, vec![18]);
+    }
+
+    /// The scaled nucleus carries 5 inputs, not 3. Every CUDA site accepts
+    /// both arities; the structural decoder used to accept only 3, so it
+    /// rejected a plan this crate's own encoder had just produced.
+    #[test]
+    fn a_scaled_nucleus_plan_survives_its_own_structural_decoder() {
+        let compiled = compile_stage(&scaled_nucleus_program(), Stage::Epilogue).unwrap();
+        let nucleus = compiled
+            .fused
+            .regions
+            .iter()
+            .find(|region| region.kind == RegionKind::Library(LibraryOp::NucleusSample))
+            .expect("scaled nucleus library region");
+        assert_eq!(nucleus.inputs.len(), 5);
+        let bytes = encode_stage_plan(&compiled);
+        let header = decode_plan_header(&bytes).expect("scaled nucleus plan must decode");
+        assert_eq!(header.signature_hash, compiled.signature.hash);
     }
 
     #[test]
