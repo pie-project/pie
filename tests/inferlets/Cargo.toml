@@ -17,6 +17,7 @@ members = [
     "prefix-tree-kv-cache",
     "repetition-penalty",
     "dry-repetition-penalty",
+    "gumbel-watermark",
     "sampling-primitives",
     "sliding-window-attention",
     "tail-free-sampling",
