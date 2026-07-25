@@ -1,0 +1,80 @@
+{
+  "NousResearch/Meta-Llama-3-8B-Instruct": {
+    "vocab_size": 128256,
+    "states": {
+      "value": {
+        "groups": 163,
+        "accepted_tokens": 49049,
+        "rejected_tokens": 79207,
+        "largest_group": 44523,
+        "top10_coverage": 99.13555831923179
+      },
+      "string": {
+        "groups": 55,
+        "accepted_tokens": 124280,
+        "rejected_tokens": 3976,
+        "largest_group": 123713,
+        "top10_coverage": 99.93080141615707
+      },
+      "number": {
+        "groups": 159,
+        "accepted_tokens": 52376,
+        "rejected_tokens": 75880,
+        "largest_group": 49300,
+        "top10_coverage": 99.171376202841
+      }
+    }
+  },
+  "Qwen/Qwen3.6-27B": {
+    "vocab_size": 248077,
+    "states": {
+      "value": {
+        "groups": 137,
+        "accepted_tokens": 73541,
+        "rejected_tokens": 174536,
+        "largest_group": 70347,
+        "top10_coverage": 99.6804503610231
+      },
+      "string": {
+        "groups": 49,
+        "accepted_tokens": 246027,
+        "rejected_tokens": 2050,
+        "largest_group": 245574,
+        "top10_coverage": 99.9760188922354
+      },
+      "number": {
+        "groups": 133,
+        "accepted_tokens": 76855,
+        "rejected_tokens": 171222,
+        "largest_group": 75139,
+        "top10_coverage": 99.67731442326459
+      }
+    }
+  },
+  "google/gemma-4-31b-it": {
+    "vocab_size": 262144,
+    "states": {
+      "value": {
+        "groups": 165,
+        "accepted_tokens": 88543,
+        "rejected_tokens": 173601,
+        "largest_group": 87810,
+        "top10_coverage": 99.72555707396407
+      },
+      "string": {
+        "groups": 49,
+        "accepted_tokens": 261545,
+        "rejected_tokens": 599,
+        "largest_group": 260858,
+        "top10_coverage": 99.97553002351411
+      },
+      "number": {
+        "groups": 161,
+        "accepted_tokens": 89136,
+        "rejected_tokens": 173008,
+        "largest_group": 88293,
+        "top10_coverage": 99.69597020283612
+      }
+    }
+  }
+}
