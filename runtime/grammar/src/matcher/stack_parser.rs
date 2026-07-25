@@ -56,6 +56,7 @@ impl StackState {
 
 const SMALL_DEDUP_THRESHOLD: usize = 12;
 
+#[derive(Clone)]
 pub(super) struct SmallDedup<T: Eq + Hash + Copy> {
     vec: Vec<T>,
     set: Option<FxHashSet<T>>,
@@ -129,6 +130,7 @@ enum SteadyAdvance {
 /// (same rule_id + dfa_state, only return_level differs by a uniform delta),
 /// the parser enters steady-state mode. In lazy mode (zero delta), only a counter
 /// is incremented. In delta mode, states are copied with adjusted return_levels.
+#[derive(Clone)]
 struct SteadyState {
     active: bool,
     ranges: Vec<(u8, u8)>,
@@ -187,6 +189,7 @@ impl SteadyState {
 /// `StackState` values (rule_id + dfa_state + return_level). The DFA encodes all
 /// intra-rule transitions, so predict/complete cycles are only needed at rule
 /// boundaries (RuleRef edges and accepting states).
+#[derive(Clone)]
 pub(super) struct StackParser {
     compiled: Arc<CompiledGrammar>,
     /// Flat arena of scanable states across all levels.

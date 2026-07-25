@@ -26,6 +26,7 @@ use stack_parser::{SmallDedup, StackParser, StackState};
 // ---------------------------------------------------------------------------
 
 /// Two-variant engine that eliminates all `if single_dfa_mode` dual-path code.
+#[derive(Clone)]
 enum ParserEngine {
     /// Single-DFA fast path: raw byte_table lookups (~2ns/byte).
     SingleDfa(SingleDfaEngine),
@@ -424,6 +425,35 @@ impl GrammarMatcher {
                 i += 1;
             }
         }
+    }
+
+    /// Split off an independent matcher that starts from this matcher's exact
+    /// current position.
+    ///
+    /// Search algorithms that branch -- beam search, speculative decoding,
+    /// tree-structured drafting -- need one grammar state per live branch, and
+    /// replaying the branch prefix from a fresh matcher costs O(prefix) per
+    /// branch per step. Forking copies only the parser state; the compiled
+    /// grammar and the tokenizer are shared, and the scratch arenas start
+    /// empty rather than being copied, since they carry no semantic state.
+    pub fn fork(&self) -> Self {
+        Self {
+            engine: self.engine.clone(),
+            compiled: self.compiled.clone(),
+            tokenizer: self.tokenizer.clone(),
+            stop_token_ids: self.stop_token_ids.clone(),
+            token_length_history: self.token_length_history.clone(),
+            terminated: self.terminated,
+            max_rollback_tokens: self.max_rollback_tokens,
+            trie_scratch: TrieWalkScratch::new(),
+            bitmask_scratch: vec![0u32; self.bitmask_scratch.len()],
+            bitmask_cache_key: Vec::new(),
+        }
+    }
+
+    /// The number of accepted tokens that `rollback` can still undo.
+    pub fn rollback_capacity(&self) -> usize {
+        self.token_length_history.len()
     }
 
     /// Rollback the last `num_tokens` accepted tokens.
