@@ -89,6 +89,17 @@ impl DevicePageReservation {
         self.pages.append(&mut other.pages);
         other.port = None;
     }
+
+    /// Split up to `count` pages off as their own reservation (the head
+    /// reclaiming a younger entry's stranded partial accumulation). Pure
+    /// bookkeeping — no port call.
+    pub(super) fn donate(&mut self, count: usize) -> DevicePageReservation {
+        let n = count.min(self.pages.len());
+        DevicePageReservation {
+            pages: self.pages.drain(..n).collect(),
+            port: self.port.clone(),
+        }
+    }
 }
 
 impl Drop for DevicePageReservation {

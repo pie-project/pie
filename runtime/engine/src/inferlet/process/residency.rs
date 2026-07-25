@@ -1,7 +1,7 @@
 //! Process-owned membership inventory for KV/RS working sets and fire queues.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, LazyLock, Mutex, RwLock, Weak};
+use std::sync::{LazyLock, Mutex, RwLock, Weak};
 
 use crate::pipeline::fire::{PendingFireQueue, PendingFires};
 use crate::store::kv::page_table::WorkingSetId;

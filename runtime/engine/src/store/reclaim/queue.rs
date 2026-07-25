@@ -132,6 +132,26 @@ impl Queue {
         })
     }
 
+    /// Move up to `count` accumulated pages from `from` to `to` — the head
+    /// exercising its first claim over a younger entry's stranded partial
+    /// accumulation. Pure bookkeeping under the caller's lock; returns the
+    /// pages moved.
+    pub fn transfer_accum(&mut self, from: &EntryKey, to: &EntryKey, count: usize) -> usize {
+        let Some(donor) = self.entries.get_mut(from) else {
+            return 0;
+        };
+        let donation = donor.kv_accum.donate(count);
+        let moved = donation.len();
+        if moved > 0 {
+            let recipient = self
+                .entries
+                .get_mut(to)
+                .expect("transfer target exists under the same lock");
+            recipient.kv_accum.absorb(donation);
+        }
+        moved
+    }
+
     /// The restore entry for `pid`, if queued.
     pub fn find_restore(&self, pid: ProcessId) -> Option<(&EntryKey, &Entry)> {
         self.entries

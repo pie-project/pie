@@ -445,6 +445,9 @@ enum Fill {
     /// Entry `key`'s KV side is covered; reserve `rs` slots and issue its
     /// grant.
     Finish { key: EntryKey, rs: u32 },
+    /// A younger entry's stranded partial accumulation moved to the head
+    /// (pure bookkeeping under the lock); re-scan.
+    Reclaimed,
 }
 
 struct WaitRegistration<'a> {
@@ -873,7 +876,8 @@ impl ContentionOrchestrator {
             self.withdraw_stale_park_requests();
             let (free, _) = self.port.device_stats();
             let step = self.with_inner(|inner| {
-                let mut head_seen = false;
+                let mut head: Option<(EntryKey, u32)> = None;
+                let mut donor: Option<EntryKey> = None;
                 for (key, entry) in inner.queue.iter() {
                     if !entry.is_unmet() {
                         continue;
@@ -885,24 +889,42 @@ impl ContentionOrchestrator {
                             rs: entry.demand.rs_slots,
                         });
                     }
-                    if !head_seen {
-                        head_seen = true;
-                        if free > 0 {
-                            // Head-first-claim: every free page flows to the
-                            // oldest unmet entry until its demand is covered.
-                            return Some(Fill::Device {
-                                key: *key,
-                                count: free.min(missing),
-                            });
-                        }
-                        // No pages for the head: younger entries may still
-                        // Finish (RS-only demand), so keep scanning.
+                    if head.is_none() {
+                        head = Some((*key, missing));
+                        // With no pages for the head, younger entries may
+                        // still Finish (RS-only demand) or hold a stranded
+                        // accumulation — keep scanning.
+                    } else if donor.is_none() && entry.kv_accum.len() > 0 {
+                        // A younger entry partially accumulated while IT was
+                        // the head, before this older process re-entered the
+                        // boundary. Head-first-claim says those pages belong
+                        // to the current head — stranding them would wedge
+                        // the queue with a full pool.
+                        donor = Some(*key);
                     }
                 }
-                None
+                let (head_key, missing) = head?;
+                if free > 0 {
+                    // Head-first-claim: every free page flows to the oldest
+                    // unmet entry until its demand is covered.
+                    return Some(Fill::Device {
+                        key: head_key,
+                        count: free.min(missing),
+                    });
+                }
+                let donor = donor?;
+                let moved = inner
+                    .queue
+                    .transfer_accum(&donor, &head_key, missing as usize);
+                if moved == 0 {
+                    return None;
+                }
+                inner.progress = None; // pages flowed to the head
+                Some(Fill::Reclaimed)
             });
             match step {
                 None => return,
+                Some(Fill::Reclaimed) => continue,
                 Some(Fill::Device { key, count }) => {
                     let Some(pages) = self.port.reserve_device(count) else {
                         return; // lost a race to the pool; the next free event re-drains
@@ -1598,6 +1620,10 @@ impl ContentionOrchestrator {
             elapsed.as_micros().min(u128::from(u64::MAX)) as u64,
             Ordering::Relaxed,
         );
+    }
+
+    pub fn record_grace_deferred(&self) {
+        self.stats.grace_deferred.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_suspend_rollback(&self) {

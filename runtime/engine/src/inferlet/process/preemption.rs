@@ -1,8 +1,19 @@
-//! Process-owned KV preemption lifecycle.
+//! Process-owned KV preemption lifecycle — the ONE safe point (D2/D3).
 //!
 //! WIT bindings delegate here; this module freezes scheduler preparation,
 //! drains process fire queues, executes transactional D2H/H2D, and parks the
 //! WASM continuation without putting domain orchestration in `inferlet/host`.
+//!
+//! The contract: eligibility to suspend is a STATE ("holds no pins"), not a
+//! place. `yield_point` is the fire-prologue safe point every WIT host
+//! method passes through; `wait_yielding` turns every long host await into
+//! a STANDING safe point (and `fire::acquire_grant` treats the grant wait
+//! the same way); both funnel into one park protocol whose halves are
+//! `suspend_at_safe_point` (prepare → D2H → commit → report, with the
+//! host-full kill rung) and `restore_from_park` (park → prepare → H2D →
+//! commit → report, bounded retries). `ParkGuard` declines the park on
+//! every early exit, so refusal is a scope exit, never a hand-written
+//! bail-out.
 
 use std::collections::HashSet;
 use std::future::Future;
@@ -599,9 +610,11 @@ async fn suspend_at_safe_point(
         };
     let txn = match prepared {
         KvSuspendPrepare::Prepared(txn) => txn,
-        KvSuspendPrepare::Deferred(
-            SuspendDisposition::NothingReclaimable | SuspendDisposition::GraceDeferred,
-        ) => return Ok(false),
+        KvSuspendPrepare::Deferred(SuspendDisposition::NothingReclaimable) => return Ok(false),
+        KvSuspendPrepare::Deferred(SuspendDisposition::GraceDeferred) => {
+            orchestrator.record_grace_deferred();
+            return Ok(false);
+        }
     };
 
     let mut suspend = ResidencyTxnGuard::suspend(model, driver, txn);

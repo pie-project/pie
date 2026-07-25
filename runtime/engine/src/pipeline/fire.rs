@@ -302,7 +302,7 @@ async fn acquire_grant<C: FireContext>(
     };
     let pid = ctx.process_id();
     loop {
-        let yielded = {
+        {
             let acquire = orchestrator.acquire(pid, pipeline_id, demand);
             let Some(signal) = ctx.preemption_signal() else {
                 return acquire
@@ -313,18 +313,23 @@ async fn acquire_grant<C: FireContext>(
             let notified = signal.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            tokio::select! {
-                result = &mut acquire => {
-                    return result.map_err(|error| format!("pipeline: KV contention: {error}"));
+            // Lost-wakeup guard: a park request that landed BEFORE the
+            // waiter armed (e.g. between honor and re-acquire under rapid
+            // escalation) would otherwise strand the acquire in its
+            // wait-until-running while nothing ever wakes this select.
+            if !orchestrator.should_park(pid) {
+                tokio::select! {
+                    result = &mut acquire => {
+                        return result
+                            .map_err(|error| format!("pipeline: KV contention: {error}"));
+                    }
+                    _ = &mut notified => {}
                 }
-                _ = &mut notified => true,
             }
-        };
-        if yielded {
-            ctx.honor_preemption()
-                .await
-                .map_err(|error| format!("pipeline: KV preemption: {error:#}"))?;
         }
+        ctx.honor_preemption()
+            .await
+            .map_err(|error| format!("pipeline: KV preemption: {error:#}"))?;
     }
 }
 
@@ -650,6 +655,9 @@ pub(crate) async fn drain_rs_predecessors<C: FireContext>(
             return Ok(());
         };
         if let Some(preemption) = ctx.preemption_signal() {
+            // Honor a request that landed before this waiter arms (the
+            // notified below only observes signals from here on).
+            ctx.honor_preemption().await?;
             let notified = preemption.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
