@@ -14,7 +14,6 @@ use inferlet::ptir::prelude::*;
 use inferlet::{Result, model as wit_model};
 use serde::Deserialize;
 
-const B: u32 = 2; // beams
 const PAGE_T: u32 = 16; // tokens per pool page
 const POOL_PAGES: u32 = 8; // shared pool pages (over-allocated; compaction bounds this)
 const POOL: u32 = POOL_PAGES * PAGE_T; // flat pool token positions
@@ -25,19 +24,27 @@ const BOS: i32 = 1;
 struct Input {
     #[serde(default = "default_max_tokens")]
     max_tokens: usize,
+    /// Beam width. `1` degenerates to greedy decoding (the beam identity).
+    #[serde(default = "default_beams")]
+    beams: u32,
 }
 
 fn default_max_tokens() -> usize {
     16
 }
 
+fn default_beams() -> u32 {
+    2
+}
+
 fn advance_hypotheses(
     hypotheses: &[Vec<u32>],
     picked: &[i32],
     parents: &[u32],
+    beams: u32,
 ) -> Result<Vec<Vec<u32>>> {
-    let mut next = Vec::with_capacity(B as usize);
-    for lane in 0..B as usize {
+    let mut next = Vec::with_capacity(beams as usize);
+    for lane in 0..beams as usize {
         let parent = *parents
             .get(lane)
             .ok_or_else(|| format!("missing parent for beam {lane}"))?
@@ -58,6 +65,17 @@ fn advance_hypotheses(
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
     let max_steps = input.max_tokens;
+    let b = input.beams;
+    if b == 0 {
+        return Err("beams must be at least 1".into());
+    }
+    if b > POOL - 1 {
+        return Err(format!("beams exceeds the fixed pool ({} positions)", POOL - 1));
+    }
+    // Bind the width once so the epilogue closure captures a plain `u32`
+    // exactly where the old `const B` was substituted.
+    #[allow(non_snake_case)]
+    let B = b;
     let capacity = ((POOL - 1) / B) as usize;
     if max_steps > capacity {
         return Err(format!(
@@ -176,7 +194,12 @@ async fn main(input: Input) -> Result<String> {
         let logical_slot = div(&wpos, PAGE_T); // [B] index into the pool
         let w_slot_v = gather(&pids, &logical_slot);
         let w_off_v = rem(&wpos, PAGE_T);
+        // Device-resolved geometry is loop-carried: the host never drains
+        // these rings, so the graph has to take before it puts or the
+        // readiness check sees a full ring and refuses to commit the pass.
+        w_slot.take();
         w_slot.put(&w_slot_v);
+        w_off.take();
         w_off.put(&w_off_v);
 
         // KV span after this step's appends (the mask restricts attention).
@@ -187,6 +210,7 @@ async fn main(input: Input) -> Result<String> {
         pos.put(add(pos.take(), 1u32));
         fill.put(&filled);
         scores.put(&s);
+        toks.take();
         toks.put(&tok_i);
         // Re-emit the fixed Pages port each fire: the pool ids tiled B
         // times (every beam references all POOL_PAGES pool pages; the mask does
@@ -240,7 +264,7 @@ async fn main(input: Input) -> Result<String> {
                 .await
                 .map_err(|e| format!("out_scr.take @{step}: {e}"))?;
             in_flight -= 1;
-            hypotheses = advance_hypotheses(&hypotheses, &picked, &parents)?;
+            hypotheses = advance_hypotheses(&hypotheses, &picked, &parents, B)?;
             if submitted < max_steps {
                 fwd.submit(&pipeline)
                     .map_err(|e| format!("submit @{submitted}: {e}"))?;
@@ -283,7 +307,7 @@ async fn main(input: Input) -> Result<String> {
                         .map_err(|e| format!("rs fork beam {lane} from parent {parent}: {e}"))?,
                 );
             }
-            hypotheses = advance_hypotheses(&hypotheses, &picked, &parents)?;
+            hypotheses = advance_hypotheses(&hypotheses, &picked, &parents, B)?;
             fwd.rs_working_sets(&next_rs)
                 .map_err(|e| format!("rebind recurrent states @{step}: {e}"))?;
             rs_working_sets = next_rs;

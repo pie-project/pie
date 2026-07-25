@@ -222,6 +222,12 @@ struct NotifyContext;
 
 namespace {
 
+// PIE_DEBUG_PULL_VALIDATE=1 makes the pull-validate kernel name the ticket
+// that vetoed a fire, which is otherwise reported only as the generic
+// "ptir prologue or channel readiness did not commit".
+const std::uint32_t kDiagnosePullValidate =
+    std::getenv("PIE_DEBUG_PULL_VALIDATE") != nullptr ? 1u : 0u;
+
 constexpr std::uint64_t kNoDescriptorReadyOffset =
     std::numeric_limits<std::uint64_t>::max();
 constexpr std::size_t kDescriptorCopiesPerBlock = 8;
@@ -2505,6 +2511,20 @@ BoundInstance::CommitSnapshot& commit_snapshot(
                             sizeof(std::uint32_t)));
                 }
             }
+            // W1.6 reads this word at PREPARE, i.e. before the fire's own
+            // pull-validate runs, so it is really the PREVIOUS fire's commit.
+            // A ring index used for the first time has no previous fire — the
+            // host's bind-time seeds are its predecessor — so it starts READY.
+            // Recycled snapshots carry a retired instance's value and must be
+            // re-seeded for the same reason.
+            const std::uint32_t seed[BoundInstance::CommitSnapshot::kWords] = {
+                1u, 0u};
+            CUDA_CHECK(cudaMemcpy(
+                snapshot.device,
+                seed,
+                sizeof(seed),
+                cudaMemcpyHostToDevice));
+            std::memcpy(snapshot.host, seed, sizeof(seed));
             bound.commit_snapshots.push_back(snapshot);
         } catch (...) {
             if (snapshot.host != nullptr) {
@@ -3855,6 +3875,7 @@ std::unique_ptr<StagedLaunch> Dispatch::begin_host(
             .ticket_offset = lane->device_ticket_offset,
             .ticket_count = lane->device_ticket_count,
             .initial_commit = initial_commit,
+            .diagnose = kDiagnosePullValidate,
         });
         state.touched_instances.push_back(
             view.ptir_program_instances.data()[program]);
@@ -5646,6 +5667,12 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
     // probe call without a staged launch keeps a blocking local pull.
     cudaStream_t descriptor_stream =
         staged == nullptr ? nullptr : staged->stream;
+    // Bind-time channel work (ring metadata, seeded-cell full bits, seed
+    // payloads) rides the initialization stream and is only awaited in
+    // `begin_enqueue` (RV-28). Prepare-time descriptor resolution reads those
+    // very cells EARLIER than that, so it has to take the same edge or a
+    // first fire sees its own seeds as "not yet produced".
+    s.channels.order_after_initialization(descriptor_stream);
     std::vector<std::vector<std::uint8_t>> local_writer_staging;
     auto& writer_staging = staged != nullptr
         ? staged->writer_staging

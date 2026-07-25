@@ -707,6 +707,7 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
                         fresh_dense,
                         w_cont_dense,
                         has_mask,
+                        pooled: false,
                     })
                 }
                 None => None,
@@ -750,6 +751,35 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
                         .to_string(),
                 ));
             }
+            // A decode loop that carries a DENSE device `AttnMask` has no home
+            // in the envelope class (the compose paths hold no per-lane mask
+            // state) and none in the Host class (a device-sampled token is not
+            // host-derivable). It DOES have one in the pool-owned device
+            // geometry class: the descriptor resolver reads every port —
+            // including the mask — straight from the channel cells, and such
+            // fires are scheduled solo. Take that route rather than letting the
+            // fire die on the first value the host cannot know.
+            let devgeo = match devgeo {
+                Some(devgeo) => Some(devgeo),
+                None if decode_envelope.is_none()
+                    && devgeo_capable
+                    && !taint.host_derivable()
+                    && readable.start == 0
+                    && readable.end.is_none() =>
+                {
+                    crate::pipeline::fire::lease::detect_pooled_device_geometry(
+                        &prog.bound.container,
+                    )
+                    .map(|lanes| {
+                        tracing::info!(
+                            "masked device-carried decode ({lanes} lane(s)) executes as a \
+                             pool-owned device-geometry pass"
+                        );
+                        crate::pipeline::fire::lease::DevGeo::pooled(lanes, true)
+                    })
+                }
+                None => None,
+            };
             let geometry_class = if devgeo.is_some() {
                 pie_driver_abi::GeometryClass::DeviceGeometry
             } else if decode_envelope.is_some() {

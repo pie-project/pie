@@ -87,6 +87,7 @@ async fn append_tokens(
 
 async fn generate(
     ws: &WorkingSet,
+    pipeline: &Pipeline,
     seq_len: u32,
     first_token: i32,
     max_tokens: usize,
@@ -158,7 +159,6 @@ async fn generate(
         token_out.put(&token);
     });
 
-    let pipeline = Pipeline::new();
     let budget = max_tokens.saturating_sub(generated.len());
     let mut submitted = 0usize;
     let mut in_flight = 0usize;
@@ -194,7 +194,6 @@ async fn generate(
             .map_err(|e| format!("drain leaf run-ahead token: {e}"))?;
         in_flight -= 1;
     }
-    pipeline.close();
     Ok(generated)
 }
 
@@ -247,14 +246,14 @@ async fn main(input: Input) -> Result<String> {
             ));
         }
     }
-    // Every append's token was awaited above, so the build stream is fully
-    // drained — this cancels nothing (R4-1).
-    tree_pipeline.close();
-
+    // A KV working set is scoped to the FIRST pipeline that fires it, and every
+    // leaf was built on `tree_pipeline` — so generation must stay on that same
+    // stream. It closes once, after the last leaf is drained.
     let mut outputs = Vec::with_capacity(leaves.len());
     for (label, ws, seq_len, first) in leaves {
-        let generated = generate(&ws, seq_len, first, input.num_tokens).await?;
+        let generated = generate(&ws, &tree_pipeline, seq_len, first, input.num_tokens).await?;
         outputs.push(format!("{label}: {}", wit_model::decode(&generated)?));
     }
+    tree_pipeline.close();
     Ok(outputs.join("\n"))
 }

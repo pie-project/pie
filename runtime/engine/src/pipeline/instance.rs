@@ -1145,6 +1145,7 @@ mod tests {
                 fresh_dense: 0,
                 w_cont_dense: 1,
                 has_mask: true,
+                pooled: false,
             });
             let instance_id = pass.bound_instance.instance_id;
 
@@ -1225,6 +1226,7 @@ mod tests {
                 fresh_dense: 0,
                 w_cont_dense: 1,
                 has_mask: false,
+                pooled: false,
             });
 
             assert!(

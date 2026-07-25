@@ -149,18 +149,19 @@ async fn main(input: Input) -> Result<String> {
         amateur_prefill_out.put(intrinsics::logits());
     });
 
-    // The amateur and expert are genuinely concurrent streams, so each
-    // prefill keeps its own pipeline and closes after its output is taken.
-    let amateur_prefill_pipeline = Pipeline::new();
+    // ONE PIPELINE for the whole inferlet: a KV working set is scoped to the
+    // first pipeline that fires it, so the amateur's prefill and its decode
+    // must share a FIFO (and likewise the expert's). The two streams are
+    // sequential anyway — the expert prefill consumes the amateur's logits.
+    let pipeline = Pipeline::new();
     amateur_prefill
-        .submit(&amateur_prefill_pipeline)
+        .submit(&pipeline)
         .map_err(|error| format!("amateur prefill: {error}"))?;
     let first_amateur_logits = amateur_prefill_out
         .take()
         .get::<f32>()
         .await
         .map_err(|error| format!("read amateur prefill logits: {error}"))?;
-    amateur_prefill_pipeline.close();
 
     // The expert keeps the complete context and consumes the amateur logits in
     // its epilogue to perform the contrastive token selection on-device.
@@ -206,14 +207,11 @@ async fn main(input: Input) -> Result<String> {
         first_out.put(token);
     });
 
-    // Same shape as the amateur prefill: its own stream's only submission.
     expert_prefill_amateur.put(first_amateur_logits);
-    let expert_prefill_pipeline = Pipeline::new();
     expert_prefill
-        .submit(&expert_prefill_pipeline)
+        .submit(&pipeline)
         .map_err(|error| format!("expert prefill: {error}"))?;
     let first = read_expert_token(&first_out).await?;
-    expert_prefill_pipeline.close();
 
     let mut generated = Vec::with_capacity(input.max_tokens);
     if !stop_tokens.contains(&first) {
@@ -331,7 +329,6 @@ async fn main(input: Input) -> Result<String> {
         expert_token_out.put(&token);
     });
 
-    let pipeline = Pipeline::new();
     let budget = input.max_tokens.saturating_sub(generated.len());
     amateur_token.put(vec![first as i32]);
     amateur_decode

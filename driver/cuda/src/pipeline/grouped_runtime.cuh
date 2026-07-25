@@ -229,7 +229,8 @@ static __global__ void k_grouped_stage_readiness(
     const std::uint8_t* full,
     const std::uint32_t* head,
     const std::uint32_t* tail,
-    const std::uint32_t* cap1) {
+    const std::uint32_t* cap1,
+    std::uint32_t diagnose) {
     const std::uint32_t lane =
         blockIdx.x * static_cast<std::uint32_t>(blockDim.x) + threadIdx.x;
     if (lane >= header->lane_count) return;
@@ -237,12 +238,26 @@ static __global__ void k_grouped_stage_readiness(
     bool ready = true;
     for (std::uint32_t index = 0; index < descriptor.full_count; ++index) {
         const std::uint32_t slot = slots[descriptor.full_offset + index];
-        ready = ready &&
+        const bool slot_ready =
             full[static_cast<std::size_t>(slot) * kMaxRing + head[slot]] != 0;
+        if (!slot_ready && diagnose != 0) {
+            printf(
+                "[pie-driver-cuda] stage-readiness reject: lane=%u slot=%u "
+                "reason=empty-cell head=%u\n",
+                lane, slot, head[slot]);
+        }
+        ready = ready && slot_ready;
     }
     for (std::uint32_t index = 0; index < descriptor.empty_count; ++index) {
         const std::uint32_t slot = slots[descriptor.empty_offset + index];
-        ready = ready && ((tail[slot] + 1) % cap1[slot]) != head[slot];
+        const bool slot_ready = ((tail[slot] + 1) % cap1[slot]) != head[slot];
+        if (!slot_ready && diagnose != 0) {
+            printf(
+                "[pie-driver-cuda] stage-readiness reject: lane=%u slot=%u "
+                "reason=full-ring head=%u tail=%u cap1=%u\n",
+                lane, slot, head[slot], tail[slot], cap1[slot]);
+        }
+        ready = ready && slot_ready;
     }
     if (!ready) atomicAnd(grouped_commit(lanes, lane), 0u);
 }
