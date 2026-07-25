@@ -48,6 +48,17 @@
 //! step's `α` as a sparse `(index, value)` pair list — a node can have at most
 //! one explored child per completed round, so a `rounds`-wide pair list is an
 //! exact representation, not a truncation.
+//!
+//! ## Source
+//!
+//! Park et al., *Grammar-Aligned Decoding* —
+//! <https://arxiv.org/abs/2405.21047> (Eq. 3–4, Algorithm 1).
+//!
+//! Faithfulness: **Exact (equivalent form)** — the paper's `EXPAND` walks a
+//! shared trie in place; this rebuilds the path each round from the stored
+//! `Vec<Vec<u32>>` of approximations, which is the same recurrence with
+//! different storage. See
+//! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 use inferlet::mask::bit_allowed;
 use inferlet::ptir::prelude::*;

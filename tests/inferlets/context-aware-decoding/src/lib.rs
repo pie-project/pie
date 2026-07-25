@@ -17,6 +17,16 @@
 //!
 //! Algebraically this is classifier-free guidance at γ = 1 + α, but the two
 //! streams differ in what they condition on rather than in guidance strength.
+//!
+//! ## Source
+//!
+//! Shi et al., *Trusting Your Evidence: Hallucinate Less with Context-aware
+//! Decoding* — <https://arxiv.org/abs/2305.14739> (§2.2).
+//!
+//! Faithfulness: **Exact (equivalent form)** — same logit-vs-log-probability
+//! argument as classifier-free guidance: the difference is a per-stream
+//! constant that cancels in the softmax. See
+//! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 use inferlet::ptir::prelude::*;
 use inferlet::{Result, chat, model as wit_model};

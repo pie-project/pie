@@ -39,6 +39,18 @@
 //! vocabulary. Only `counts` is a feedback channel; `prompt_present` is written
 //! once and cycled unchanged, which keeps the graph shape identical between the
 //! prefill and decode passes.
+//!
+//! ## Source
+//!
+//! Keskar et al., *CTRL: A Conditional Transformer Language Model for
+//! Controllable Generation* — <https://arxiv.org/abs/1909.05858> (§4.1) — for
+//! the multiplicative repetition penalty. The scope split (repetition reads
+//! `prompt ∪ output`; frequency and presence read the output only) follows
+//! vLLM `model_executor/layers/sampler.py` —
+//! <https://github.com/vllm-project/vllm>.
+//!
+//! Faithfulness: **Exact**. See
+//! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 use inferlet::ptir::prelude::*;
 use inferlet::{Result, model as wit_model};

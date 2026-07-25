@@ -24,6 +24,16 @@
 //!
 //! `heal = false` runs the identical geometry with an all-ones mask, which is
 //! the unhealed baseline; the two runs differ only in that first mask.
+//!
+//! ## Source
+//!
+//! No paper. Reference implementations: guidance-ai/guidance —
+//! <https://github.com/guidance-ai/guidance> — its `llguidance` backend —
+//! <https://github.com/guidance-ai/llguidance> — and llama.cpp's
+//! `--token-healing`.
+//!
+//! Faithfulness: **Exact**. See
+//! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 use inferlet::ptir::prelude::*;
 use inferlet::{Result, model as wit_model};

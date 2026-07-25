@@ -2,7 +2,15 @@
 
 Native MTP is build-validated separately because the default test model does
 not expose multi-token-prediction heads.
+
+The inference-time-algorithm inferlets each report the statistic that proves
+their rule fired, so these assert on that statistic rather than on the decoded
+text, which is model- and seed-dependent. Two of them additionally get an
+identity control: at the parameter value where the algorithm reduces to plain
+sampling, the reported divergence must be exactly zero.
 """
+
+import json
 
 from conftest import run_inferlet, run_tests
 
@@ -11,6 +19,20 @@ async def _nonempty(client, args, name: str, inputs: dict) -> str:
     output = await run_inferlet(client, name, inputs, timeout=args.timeout)
     assert output.strip(), f"{name} returned empty output"
     return output
+
+
+async def _report(client, args, name: str, inputs: dict, *, expect_text: bool = True) -> dict:
+    """Run an inferlet whose `Output` struct is serialized to JSON."""
+    output = await _nonempty(client, args, name, inputs)
+    start = output.find("{")
+    assert start >= 0, f"{name} returned no JSON object: {output[:200]!r}"
+    try:
+        report = json.loads(output[start:])
+    except json.JSONDecodeError as error:
+        raise AssertionError(f"{name} returned malformed JSON: {output[:200]!r}") from error
+    if expect_text:
+        assert report.get("text", "").strip(), f"{name} generated no text"
+    return report
 
 
 async def test_chat_completion(client, args):
@@ -102,6 +124,172 @@ async def test_contrastive_decoding(client, args):
     )
 
 
+async def test_locally_typical_sampling(client, args):
+    report = await _report(
+        client, args, "locally-typical-sampling", {"max_tokens": 4, "k_max": 64}
+    )
+    assert 0 < report["mean_kept"] <= 64, report
+    assert report["min_kept"] >= 1, "the typical set is never empty"
+    assert 0 < report["mean_mass"] <= 1.0, report
+
+
+async def test_eta_epsilon_sampling(client, args):
+    for mode in ("eta", "epsilon"):
+        report = await _report(
+            client, args, "eta-epsilon-sampling", {"max_tokens": 4, "mode": mode}
+        )
+        assert report["mode"] == mode, report
+        assert report["min_kept"] >= 1, "truncation never empties the candidate set"
+
+
+async def test_tail_free_sampling(client, args):
+    report = await _report(client, args, "tail-free-sampling", {"max_tokens": 4, "k_max": 64})
+    assert 0 < report["mean_kept"] <= 64, report
+    assert report["min_kept"] >= 1, report
+
+
+async def test_top_a_sampling(client, args):
+    loose = await _report(client, args, "top-a-sampling", {"max_tokens": 4, "a": 0.0001})
+    tight = await _report(client, args, "top-a-sampling", {"max_tokens": 4, "a": 1.0})
+    # The floor is a*p_max^2, so a larger `a` can only shrink the kept set.
+    assert tight["mean_kept"] <= loose["mean_kept"], (tight, loose)
+    assert tight["min_kept"] >= 1, tight
+
+
+async def test_xtc_sampling(client, args):
+    never = await _report(client, args, "xtc-sampling", {"max_tokens": 4, "probability": 0.0})
+    always = await _report(client, args, "xtc-sampling", {"max_tokens": 4, "probability": 1.0})
+    assert never["fire_rate"] == 0.0, never
+    assert always["fire_rate"] == 1.0, always
+    assert never["mean_dropped"] == 0.0, "a gate that never fires drops nothing"
+
+
+async def test_repetition_penalty(client, args):
+    report = await _report(
+        client,
+        args,
+        "repetition-penalty",
+        {"max_tokens": 4, "repetition_penalty": 1.5, "frequency_penalty": 0.1},
+    )
+    assert report["mean_penalized"] > 0, "the prompt alone makes some token penalized"
+    assert 0 < report["unique_ratio"] <= 1.0, report
+
+
+async def test_dry_repetition_penalty(client, args):
+    off = await _report(client, args, "dry-repetition-penalty", {"max_tokens": 4, "multiplier": 0.0})
+    on = await _report(client, args, "dry-repetition-penalty", {"max_tokens": 4, "multiplier": 2.0})
+    assert off["peak_penalty"] == 0.0, "multiplier=0 disables DRY entirely"
+    assert on["peak_penalty"] >= 0.0, on
+
+
+async def test_entropy_adaptive_temperature(client, args):
+    report = await _report(
+        client, args, "entropy-adaptive-temperature", {"max_tokens": 4, "t0": 1.0, "theta": 0.3}
+    )
+    # T = t0 * n^(theta/H) with 0<n<1, so the derived temperature never exceeds t0.
+    assert 0 < report["mean_temperature"] <= report["t0"], report
+    assert report["mean_entropy"] > 0, report
+
+
+async def test_gumbel_watermark(client, args):
+    # Detection *power* needs hundreds of tokens to separate from the null, so a
+    # short smoke test asserts the detector's structure rather than its verdict.
+    # The power curve versus n is measured in the faithfulness audit instead.
+    report = await _report(client, args, "gumbel-watermark", {"max_tokens": 8, "secret": 7})
+    assert report["watermark"] is True, report
+    assert 1 <= report["unique_contexts"] <= report["count"], report
+    assert report["mean_score"] > 0 and report["mean_null_score"] > 0, report
+
+
+async def test_synthid_tournament_sampling(client, args):
+    report = await _report(
+        client, args, "synthid-tournament-sampling", {"max_tokens": 8, "secret": 7, "depth": 4}
+    )
+    assert report["watermark"] is True, report
+    assert report["depth"] == 4, report
+    # g is Bernoulli-valued, so both means must land in [0,1] by construction.
+    assert 0.0 <= report["mean_score"] <= 1.0, report
+    assert 0.0 <= report["mean_null_score"] <= 1.0, report
+
+
+async def test_classifier_free_guidance(client, args):
+    output = await _nonempty(
+        client,
+        args,
+        "classifier-free-guidance",
+        {"max_tokens": 4, "guidance": 2.0, "negative_prompt": "Talk about the weather."},
+    )
+    assert "[cfg]" in output and "mean_kl=" in output, output
+
+
+async def test_classifier_free_guidance_identity(client, args):
+    """guidance=1.0 is plain conditional sampling, so the KL must be exactly 0."""
+    output = await _nonempty(
+        client, args, "classifier-free-guidance", {"max_tokens": 4, "guidance": 1.0}
+    )
+    assert "mean_kl=0.0000" in output, output
+
+
+async def test_context_aware_decoding(client, args):
+    output = await _nonempty(
+        client,
+        args,
+        "context-aware-decoding",
+        {"max_tokens": 4, "alpha": 0.5, "context": "The tallest mountain is Mt. Nowhere.",
+         "query": "What is the tallest mountain?"},
+    )
+    assert "[cad]" in output and "mean_kl=" in output, output
+
+
+async def test_context_aware_decoding_identity(client, args):
+    """alpha=0 is plain context-conditioned decoding, so the KL must be exactly 0."""
+    output = await _nonempty(
+        client,
+        args,
+        "context-aware-decoding",
+        {"max_tokens": 4, "alpha": 0.0, "context": "The sky is green.",
+         "query": "What colour is the sky?"},
+    )
+    assert "mean_kl=0.0000" in output, output
+
+
+async def test_asap_grammar_aligned_decoding(client, args):
+    report = await _report(
+        client,
+        args,
+        "asap-grammar-aligned-decoding",
+        {
+            "prompt": "Return an object with an integer field named value.",
+            "schema": (
+                '{"type":"object","properties":{"value":{"type":"integer"}},'
+                '"required":["value"],"additionalProperties":false}'
+            ),
+            "rounds": 3,
+            "max_tokens": 32,
+        },
+        expect_text=False,
+    )
+    assert report["rounds"] == 3, report
+    # ASAp's guarantee: the root approximation mass is non-decreasing in the
+    # round index. A regression here means the trie bookkeeping is wrong.
+    assert report["monotone"] is True, report["root_alpha_trace"]
+
+
+async def test_token_healing(client, args):
+    report = await _report(
+        client, args, "token-healing", {"prompt": "The capital of Fra", "max_tokens": 4}
+    )
+    assert report["healed"] is True, report
+    # Healing must re-emit the exact prompt bytes, never a shorter prefix.
+    assert report["prompt_preserved"] is True, report
+    assert report["prefix_candidates"] >= 1, report
+
+
+async def test_naive_baseline(client, args):
+    report = await _report(client, args, "naive-baseline", {"max_tokens": 4})
+    assert report["sampler"] == "naive-baseline", report
+
+
 def tests():
     return [
         test_chat_completion,
@@ -116,6 +304,23 @@ def tests():
         test_mirostat_v2_sampling,
         test_beam_search,
         test_contrastive_decoding,
+        test_locally_typical_sampling,
+        test_eta_epsilon_sampling,
+        test_tail_free_sampling,
+        test_top_a_sampling,
+        test_xtc_sampling,
+        test_repetition_penalty,
+        test_dry_repetition_penalty,
+        test_entropy_adaptive_temperature,
+        test_gumbel_watermark,
+        test_synthid_tournament_sampling,
+        test_classifier_free_guidance,
+        test_classifier_free_guidance_identity,
+        test_context_aware_decoding,
+        test_context_aware_decoding_identity,
+        test_asap_grammar_aligned_decoding,
+        test_token_healing,
+        test_naive_baseline,
     ]
 
 

@@ -31,6 +31,14 @@
 //! the `k_max` most typical tokens do not carry `mass` probability, the set is
 //! truncated there. `mass_reached` in the output reports whether that happened,
 //! so the approximation is observable rather than silent.
+//!
+//! ## Source
+//!
+//! Meister et al., *Locally Typical Sampling* —
+//! <https://arxiv.org/abs/2202.00666> (§3, Eq. 6).
+//!
+//! Faithfulness: **Exact**. See
+//! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 use inferlet::ptir::prelude::*;
 use inferlet::{Result, model as wit_model};

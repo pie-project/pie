@@ -13,6 +13,18 @@
 //!
 //! and renormalised. γ = 1 collapses to plain conditional decoding, which the
 //! reported `guidance_shift` statistic must confirm exactly.
+//!
+//! ## Source
+//!
+//! Sanchez et al., *Stay on topic with Classifier-Free Guidance* —
+//! <https://arxiv.org/abs/2306.17806> (Eq. 7).
+//!
+//! Faithfulness: **Exact (equivalent form)** — the paper writes the rule over
+//! log-probabilities and this works in logits, which differ by the per-stream
+//! `logsumexp` constant. That constant is uniform over the vocabulary, so it
+//! shifts every entry of the blended vector by the same amount and cancels in
+//! the softmax. See
+//! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 use inferlet::ptir::prelude::*;
 use inferlet::{Result, chat, model as wit_model};

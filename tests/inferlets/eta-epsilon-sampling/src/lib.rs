@@ -16,6 +16,14 @@
 //!
 //! A floor keeps the mask non-empty: the argmax token is OR-ed back in, so an
 //! aggressive `epsilon` degenerates to greedy instead of to an empty set.
+//!
+//! ## Source
+//!
+//! Hewitt et al., *Truncation Sampling as Language Model Desmoothing* —
+//! <https://arxiv.org/abs/2210.15191> (§3).
+//!
+//! Faithfulness: **Exact**. See
+//! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 use inferlet::ptir::prelude::*;
 use inferlet::{Result, model as wit_model};

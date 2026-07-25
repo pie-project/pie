@@ -2,7 +2,7 @@
 //! watermarked text is drawn from exactly the model's own distribution.
 //!
 //! The greenlist scheme already in this directory
-//! (`watermarked-sampling`, Kirchenbauer et al. 2301.10226) works by adding a
+//! (`greenlist-watermarking`, Kirchenbauer et al. 2301.10226) works by adding a
 //! bias `delta` to half the vocabulary. That is detectable, but it provably
 //! *changes what the model says*. The Gumbel scheme changes nothing:
 //!
@@ -54,6 +54,21 @@
 //! decoy secret. The gap between them is the watermark. Because the noise is
 //! recovered with `gumbel(state, ..)` and `scalar_gather`, both statistics are
 //! computed on the device, alongside the sampling they describe.
+//!
+//! ## Source
+//!
+//! Aaronson's rule, as stated and analysed in Kuditipudi et al., *Robust
+//! Distortion-free Watermarks for Language Models* —
+//! <https://arxiv.org/abs/2307.15593> (§2–3). The greenlist scheme it is
+//! contrasted with above is Kirchenbauer et al. —
+//! <https://arxiv.org/abs/2301.10226>.
+//!
+//! Faithfulness: **Exact (equivalent form)** — the exponential race
+//! `argmax ξ^(1/p)` and `argmax(log p + G)` have the same argmax, not an
+//! approximate one. One bounded deviation: the per-token score is floored at
+//! `1e-7`, biasing the null mean low by that amount, because without it a
+//! strongly favoured token yields `+∞` and destroys the statistic. See
+//! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 use inferlet::ptir::prelude::*;
 use inferlet::{Result, model as wit_model};

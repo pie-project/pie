@@ -19,7 +19,7 @@
 //! that *is* `p_max`, so running it the other way would let the floor collapse
 //! onto whatever survived.
 //!
-//! Community method (Kalomaze), shipped in llama.cpp and text-generation-webui.
+//! Community method (p-e-w), shipped in llama.cpp and text-generation-webui.
 //!
 //! ## The rule is self-limiting
 //!
@@ -34,6 +34,17 @@
 //! would preferentially fire on particular continuations. The gate therefore
 //! runs on a state offset by the golden-ratio constant rather than on the
 //! step's own `[key, ctr]`.
+//!
+//! ## Source
+//!
+//! p-e-w, *Exclude Top Choices (XTC)* — oobabooga/text-generation-webui
+//! PR #6335, <https://github.com/oobabooga/text-generation-webui/pull/6335>.
+//! Also in llama.cpp `src/llama-sampler.cpp`.
+//!
+//! Faithfulness: **Faithful with a bounded deviation** — the reference aborts
+//! on newline and EOS tokens, which needs a tokenizer-specific token-ID table
+//! this inferlet does not carry. See
+//! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 use inferlet::ptir::prelude::*;
 use inferlet::{Result, model as wit_model};

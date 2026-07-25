@@ -64,6 +64,18 @@
 //! `max_ngram` rounds of ~8 ops over `[L]`, then `max_ngram - allowed + 1`
 //! scatters over `[vocab]`. `L` is a few hundred, so the scan is free; the
 //! scatters dominate and are the reason `max_ngram` is capped at 16.
+//!
+//! ## Source
+//!
+//! p-e-w, *DRY* — first shipped in oobabooga/text-generation-webui, since
+//! adopted by llama.cpp `src/llama-sampler.cpp` —
+//! <https://github.com/ggml-org/llama.cpp> — and KoboldCpp.
+//!
+//! Faithfulness: **Faithful with two bounded deviations** — no sequence
+//! breakers (they are strings, and mapping them to token ids is
+//! tokenizer-dependent), and `max_ngram` caps the match length, so the penalty
+//! saturates at `multiplier · base^(max_ngram − allowed_length)`. See
+//! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 use inferlet::ptir::prelude::*;
 use inferlet::{Result, model as wit_model};

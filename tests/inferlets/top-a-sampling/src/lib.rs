@@ -22,6 +22,15 @@
 //!
 //! The most likely token always survives, because `p_max >= a · p_max²`
 //! whenever `a · p_max <= 1`, which holds for every `a <= 1`.
+//!
+//! ## Source
+//!
+//! No canonical paper. Reference implementations: KoboldAI —
+//! <https://github.com/KoboldAI/KoboldAI-Client> — and
+//! oobabooga/text-generation-webui.
+//!
+//! Faithfulness: **Exact**. See
+//! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 use inferlet::ptir::prelude::*;
 use inferlet::{Result, model as wit_model};

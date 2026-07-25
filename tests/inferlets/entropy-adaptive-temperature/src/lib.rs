@@ -41,6 +41,19 @@
 //! is floored at `1e-6` and the resulting temperature at `min_temperature`, so
 //! the division into the logits stays finite. Both floors are inert for any
 //! distribution a real model produces.
+//!
+//! ## Source
+//!
+//! Zhang et al., *EDT: Improving Large Language Models' Generation by
+//! Entropy-based Dynamic Temperature Sampling* —
+//! <https://arxiv.org/abs/2403.14541> (Eq. 7).
+//!
+//! Note that several secondary summaries state the rule as
+//! `T = T₀ + θ·(H / log K)`, which *inverts* the behaviour. Equation 7 is
+//! `T = T₀ · N^(θ/Entropy)` with `0 < N < 1`, which is what this implements.
+//!
+//! Faithfulness: **Exact**. See
+//! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 use inferlet::ptir::prelude::*;
 use inferlet::{Result, model as wit_model};
