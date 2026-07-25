@@ -2258,6 +2258,73 @@ mod lifecycle_tests {
         }
     }
 
+    /// §8 guard contract, failure-injected: a prepared KV write whose fire
+    /// never submits is rolled back by the guard's Drop — every page
+    /// returns to the pool, exactly once, through the destructor.
+    #[tokio::test(flavor = "current_thread")]
+    async fn kv_txn_guard_drop_returns_every_prepared_page() -> anyhow::Result<()> {
+        let model = crate::store::registry::register_model(16, &[8], &[0]);
+        let stores = crate::store::registry::get(model, 0);
+        let (ws, before) = crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| {
+            let ws = kv.create_working_set();
+            kv.reserve(ws, 2).unwrap();
+            (ws, kv.available_pages())
+        });
+        // Reserve pages as a grant would, lend them to the prepare, then
+        // drop the armed guard without submitting.
+        let (txn, leftover) = crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| {
+            let mut granted = kv.reserve_device_pages(3).expect("pool has pages");
+            let (_, txn) =
+                kv::realize_declaration_reserved(kv, ws, 0..2, &mut granted).expect("realize");
+            let txn = kv.ensure_backed_reserved(ws, 2, &mut granted).map(|_| txn);
+            (txn.expect("backed"), granted)
+        });
+        let guard = KvTxnGuard::new(model, 0, txn);
+        // The surplus page returns through the store, the prepared pages
+        // through the guard's abort — nothing needs a hand-written path.
+        crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| {
+            kv.release_device_reservation(leftover);
+        });
+        drop(guard);
+        crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| {
+            let epoch = kv.current_epoch();
+            kv.release_working_set(ws, epoch);
+            kv.retire_idle();
+            assert_eq!(kv.available_pages(), before, "every page returned exactly once");
+        });
+        Ok(())
+    }
+
+    /// Same contract for RS: abandoned folded-slot prepares release their
+    /// slots through the guard, not a hand-written error path.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rs_txns_guard_drop_releases_prepared_slots() -> anyhow::Result<()> {
+        let model = crate::store::registry::register_model(16, &[4], &[4]);
+        let stores = crate::store::registry::get(model, 0);
+        let (txns, before) = {
+            let mut store = stores.rs.lock().unwrap();
+            let ws = store.create_working_set(crate::store::rs::RsGeometry {
+                state_size: 64,
+                buffer_page_tokens: 4,
+                fold_granularity: 1,
+            });
+            let before = store.available_slots();
+            let mut granted = store.reserve_slots(2).expect("slots available");
+            let (_, _, _, txns) =
+                rs::prepare_many_reserved(&mut store, &[ws], &mut granted).expect("prepare");
+            store.release_slot_reservation(granted);
+            (txns, before)
+        };
+        drop(RsTxnsGuard::new(model, 0, txns));
+        let store = stores.rs.lock().unwrap();
+        assert_eq!(
+            store.available_slots(),
+            before,
+            "every reserved slot released exactly once"
+        );
+        Ok(())
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn close_and_drop_share_graceful_fifo_drain_semantics() -> anyhow::Result<()> {
         let mut context = TestContext {

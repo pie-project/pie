@@ -985,7 +985,12 @@ impl ContentionOrchestrator {
                                 entry.kv_accum.absorb(reservation);
                                 // Pages flowed to the head: progress.
                                 inner.progress = None;
-                                None
+                                // Concurrent drains may both have scanned the
+                                // same missing count; clamp the accumulation
+                                // to the demand and return the overshoot.
+                                let excess = (entry.kv_accum.len() as u32)
+                                    .saturating_sub(entry.demand.kv_pages);
+                                (excess > 0).then(|| entry.kv_accum.donate(excess as usize))
                             }
                             _ => Some(reservation),
                         }
@@ -1049,6 +1054,9 @@ impl ContentionOrchestrator {
                 }
             }
             inner.progress = None; // a grant is progress by definition
+            // §8: a physical page is in exactly one place — the accumulation
+            // must match the demand exactly (Device fills never overshoot).
+            debug_assert_eq!(entry.kv_accum.len() as u32, entry.demand.kv_pages);
             if matches!(entry.kind, EntryKind::Restore { .. }) {
                 let mut entry = inner.queue.remove(&key).expect("entry present");
                 let kv = std::mem::replace(&mut entry.kv_accum, DevicePageReservation::empty());
