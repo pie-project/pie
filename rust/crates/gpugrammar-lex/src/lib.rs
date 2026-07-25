@@ -73,6 +73,35 @@ impl Lexer {
         self.accepts[state.0 as usize]
     }
 
+    /// Terminals still reachable from `state`, including one it may already
+    /// accept.
+    ///
+    /// A token that ends mid-lexeme emits nothing, so the parser has nothing
+    /// to check and would admit it unconditionally. That is how a finished
+    /// document can be followed by the start of a second one. Knowing which
+    /// terminals the pending lexeme could still become turns that into a real
+    /// check.
+    pub fn reachable_terminals(&self, state: LexState) -> Vec<TerminalId> {
+        let mut seen = vec![false; self.num_states()];
+        let mut found = BTreeSet::new();
+        let mut queue = VecDeque::from([state]);
+        seen[state.0 as usize] = true;
+        while let Some(current) = queue.pop_front() {
+            if let Some(terminal) = self.accepting(current) {
+                found.insert(terminal);
+            }
+            let row = current.0 as usize * 256;
+            for byte in 0..256usize {
+                let next = self.transitions[row + byte];
+                if next != NO_STATE && !seen[next as usize] {
+                    seen[next as usize] = true;
+                    queue.push_back(LexState(next));
+                }
+            }
+        }
+        found.into_iter().collect()
+    }
+
     fn step(&self, state: LexState, byte: u8) -> Option<LexState> {
         let next = self.transitions[state.0 as usize * 256 + byte as usize];
         (next != NO_STATE).then_some(LexState(next))
@@ -100,11 +129,20 @@ impl Lexer {
         let mut current = state;
         let mut terminals = Vec::new();
         let mut index = 0usize;
+        let mut rounds = 0usize;
 
         while index < token.len() {
+            rounds += 1;
+            if rounds > token.len() * 2 + 4 {
+                return None;
+            }
+
             let mut cursor = current;
             let mut position = index;
-            let mut last_accept: Option<(usize, TerminalId)> = None;
+            // A lexeme finished by an earlier token is still pending in
+            // `current`; a byte that cannot extend it commits it rather than
+            // failing the scan.
+            let mut last_accept = self.accepting(cursor).map(|terminal| (index, terminal));
 
             while position < token.len() {
                 let Some(next) = self.step(cursor, token[position]) else {
@@ -115,11 +153,6 @@ impl Lexer {
                 if let Some(terminal) = self.accepting(cursor) {
                     last_accept = Some((position, terminal));
                 }
-            }
-
-            if position == index {
-                // Not a single byte could be consumed from here.
-                return None;
             }
 
             if position == token.len() {

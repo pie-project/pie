@@ -368,6 +368,43 @@ token:
 Tens of MiB is defensible next to a KiB-scale compiler cache only because it
 buys a GPU-resident step; the paper must report it, not hide it.
 
+### vLLM integration
+
+`gpu_lr1/vllm_backend.py` implements vLLM's `StructuredOutputBackend` on top of
+the Rust compiler, reached from Python through PyO3 bindings
+(`gpugrammar-py`). vLLM 0.25 dispatches backends with a hardcoded `if/elif` and
+has no registry, unlike SGLang's `register_grammar_backend`, so `install()`
+substitutes this backend for the name vLLM already knows. That is a measurement
+device; the upstream ask is a registry. The engine also runs in a subprocess by
+default, so measurement needs `VLLM_ENABLE_V1_MULTIPROCESSING=0` or a plugin
+entry point.
+
+**It works end to end.** Qwen3-0.6B under a JSON Schema produces 16/16 valid
+documents, the same as stock XGrammar. Compiling that schema against the full
+151,669-token vocabulary takes 83 ms and yields 88 groups; a mask fill takes
+19 µs.
+
+**It is not yet faster**: 571 tok/s against 692 for XGrammar at batch 16. That
+is expected and honest. The measured advantage lives in never materialising a
+mask, and this path still fills a CPU bitmask because that is the only
+interface vLLM offers — Layer 3 of Decision 1, the fused sampling hook, does
+not exist upstream. Batch 16 is also far below where the CPU fill dominates.
+
+**Coverage on real schemas.** Of 533 JSONSchemaBench schemas, 461 lower to a
+grammar and **446 compile to LALR(1) tables (83.7%)**. Of the rest, 72 fail in
+the vendored JSON Schema front end — `allOf` with multiple schemas, `required`
+naming an undeclared property, `pattern` combined with length bounds — and 15
+hit genuine reduce/reduce conflicts that need investigation. XGrammar reaches
+about 98.5%, so this is the gap to close.
+
+**Two bugs only end-to-end testing found.** A grammar with no recursion left an
+empty skeleton, which was treated as failure when it is the best case: the
+document is one lexeme, no stack is needed, and it covers 68% of the corpus.
+And a token that ends mid-lexeme emits no terminal, so nothing constrained it —
+a finished document could be followed by the opening of a second one, which is
+exactly what the model did. Groups now carry the terminals a pending lexeme
+could still become, and admissibility requires one of them to be acceptable.
+
 **Threats that remain.** Table construction is still excluded — rows are
 replayed, while XGrammar computes masks online from a compact automaton, so
 compile time and incremental admission (C7) must be measured before any

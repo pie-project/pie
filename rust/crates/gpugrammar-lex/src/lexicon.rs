@@ -81,6 +81,27 @@ pub fn extract(grammar: &Grammar, regularity: &Regularity) -> Lexicon {
         });
     }
 
+    if skeleton.is_empty() {
+        // Every rule was regular, so the whole document is one lexeme and the
+        // parser has nothing to do. That is the best case rather than a
+        // failure: the mask comes entirely from the lexer state and no stack
+        // is needed. Give the LR construction a trivial skeleton so the rest
+        // of the pipeline does not need a special case. Measured on
+        // JSONSchemaBench this is 68% of schemas.
+        let root = grammar.root_rule();
+        let expr = grammar.get_rule(root).body;
+        let terminal = if is_terminal_atom(grammar, expr, regularity) {
+            interner.intern(grammar, expr)
+        } else {
+            interner.intern_rule(grammar, root)
+        };
+        skeleton.push(SkeletonRule {
+            rule: root,
+            name: grammar.get_rule(root).name.clone(),
+            body: SkeletonExpr::Terminal(terminal),
+        });
+    }
+
     let mut lexicon = Lexicon {
         terminals: interner.terminals,
         skeleton,
@@ -192,6 +213,22 @@ struct Interner {
 }
 
 impl Interner {
+    /// Intern a whole rule as one terminal, by its identity rather than by a
+    /// subtree, so a regular root becomes a single lexeme.
+    fn intern_rule(&mut self, grammar: &Grammar, rule: RuleId) -> TerminalId {
+        let key = format!("r{}", rule.0);
+        if let Some(&existing) = self.by_key.get(&key) {
+            return existing;
+        }
+        let id = TerminalId(self.terminals.len() as u32);
+        self.terminals.push(TerminalDef {
+            name: grammar.get_rule(rule).name.clone(),
+            expr: grammar.get_rule(rule).body,
+        });
+        self.by_key.insert(key, id);
+        id
+    }
+
     fn intern(&mut self, grammar: &Grammar, expr: ExprId) -> TerminalId {
         let key = canonical(grammar, expr);
         if let Some(&existing) = self.by_key.get(&key) {

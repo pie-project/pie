@@ -7,7 +7,7 @@
 
 use gpugrammar_lex::TerminalId;
 use gpugrammar_lex::lexicon::{Lexicon, SkeletonExpr};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 /// A grammar symbol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -63,6 +63,15 @@ pub fn flatten(lexicon: &Lexicon) -> Cfg {
         .first()
         .map(|rule| builder.by_rule[&rule.rule.0])
         .unwrap_or(0);
+
+    // Identical alternatives are common once a schema has been lowered - two
+    // branches of an anyOf can flatten to the same right-hand side - and two
+    // productions that differ only by index are a reduce/reduce conflict for
+    // no reason.
+    let mut seen = FxHashSet::default();
+    builder
+        .productions
+        .retain(|production| seen.insert((production.lhs, production.rhs.clone())));
 
     Cfg {
         productions: builder.productions,

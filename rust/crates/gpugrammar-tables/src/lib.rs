@@ -40,6 +40,9 @@ pub struct GroupEntry {
     pub bitset_offset: u32,
     /// How many tokens the group holds, for diagnostics and weighting.
     pub token_count: u32,
+    /// Terminals the pending lexeme could still become, when the group leaves
+    /// one in progress. Empty when the group ends cleanly.
+    pub pending_terminals: Vec<u32>,
 }
 
 /// Flat, device-ready tables.
@@ -138,12 +141,22 @@ pub fn emit(
                 let word = offset as usize + (*token as usize) / 32;
                 bitsets[word] |= 1u32 << (*token % 32);
             }
+            let pending = if group.scan.next_state == gpugrammar_lex::START {
+                Vec::new()
+            } else {
+                lexer
+                    .reachable_terminals(group.scan.next_state)
+                    .into_iter()
+                    .map(|terminal| terminal.0)
+                    .collect()
+            };
             entries.push(GroupEntry {
                 lexer_state: state as u32,
                 terminals: group.scan.terminals.iter().map(|t| t.0).collect(),
                 next_lexer_state: group.scan.next_state.0,
                 bitset_offset: offset,
                 token_count: group.tokens.len() as u32,
+                pending_terminals: pending,
             });
         }
         offsets.push(entries.len() as u32);
