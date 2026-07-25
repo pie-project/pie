@@ -1,0 +1,16 @@
+[package]
+name = "gpugrammar-tables"
+description = "Device-resident table emission for GPU constrained decoding"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+gpugrammar-ir = { path = "../gpugrammar-ir" }
+gpugrammar-lex = { path = "../gpugrammar-lex" }
+gpugrammar-lr = { path = "../gpugrammar-lr" }
+rustc-hash.workspace = true
+serde.workspace = true
+serde_json.workspace = true

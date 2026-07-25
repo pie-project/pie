@@ -4,6 +4,7 @@ members = [
     "crates/gpugrammar-ir",
     "crates/gpugrammar-lex",
     "crates/gpugrammar-lr",
+    "crates/gpugrammar-tables",
 ]
 
 [workspace.package]

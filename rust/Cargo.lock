@@ -45,6 +45,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpugrammar-tables"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gpugrammar-ir",
+ "gpugrammar-lex",
+ "gpugrammar-lr",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
