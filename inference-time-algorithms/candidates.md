@@ -51,38 +51,49 @@ Effort is relative: **S** = a sampler-sized PTIR program; **M** = program +
 per-sequence channel state or mask plumbing; **L** = needs a driver/ABI change
 or multi-context orchestration.
 
-| ID | Candidate | Tier | Engine work | Effort |
-|---|---|---|---|---|
-| [A1](#a1) | Locally typical sampling | A | none | S |
-| [A2](#a2) | η- and ε-sampling | A | none | S |
-| [A3](#a3) | Tail-free sampling | A | none | S |
-| [A4](#a4) | Top-a sampling | A | none | S |
-| [A5](#a5) | XTC (exclude top choices) | A | none | S |
-| [A6](#a6) | Frequency / presence / repetition penalty | A | none | M |
-| [A7](#a7) | DRY repetition penalty | A | none | M |
-| [A8](#a8) | Entropy-adaptive temperature | A | none | M |
-| [A9](#a9) | Gumbel distortion-free watermark | A | none | M |
-| [A10](#a10) | SynthID-Text tournament sampling | A | none | M |
-| [B1](#b1) | H2O heavy-hitter eviction | B | none | M |
-| [B2](#b2) | SnapKV | B | none | M |
-| [B3](#b3) | TOVA | B | none | M |
-| [B4](#b4) | Quest query-aware page selection | B | none | M |
-| [B5](#b5) | RetrievalAttention | B | none | L |
-| [C0](#c0) | **Bind `hidden`/`value_head` in CUDA tier-0** | C | driver | M |
-| [C1](#c1) | EAGLE-style feature-level drafting | C | after C0 | L |
-| [C2](#c2) | Semantic entropy / confidence gating | C | after C0 | M |
-| [C3](#c3) | Value-head guided beam / step scoring | C | after C0 | M |
-| [C4](#c4) | DoLa layer-contrastive decoding | C | after C0 + per-layer readout | L |
-| [C5](#c5) | ITI / CAA / RepE activation steering | C | **blocked** — needs a write port | L |
-| [D1](#d1) | Classifier-free guidance for LLMs | D | none | M |
-| [D2](#d2) | Context-aware decoding (CAD) | D | none | M |
-| [D3](#d3) | Cross-model contrastive decoding | D | none | L |
-| [D4](#d4) | DExperts / proxy tuning / emulated fine-tuning | D | none | L |
-| [E1](#e1) | Grammar-aligned decoding (ASAp) | E | none | L |
-| [E2](#e2) | Token healing / tokenizer alignment | E | none | M |
+| ID | Candidate | Tier | Engine work | Effort | Status |
+|---|---|---|---|---|---|
+| [A1](#a1) | Locally typical sampling | A | none | S | ✅ `locally-typical-sampling` |
+| [A2](#a2) | η- and ε-sampling | A | none | S | ✅ `eta-epsilon-sampling` |
+| [A3](#a3) | Tail-free sampling | A | none | S | ✅ `tail-free-sampling` |
+| [A4](#a4) | Top-a sampling | A | none | S | ✅ `top-a-sampling` |
+| [A5](#a5) | XTC (exclude top choices) | A | none | S | ✅ `xtc-sampling` |
+| [A6](#a6) | Frequency / presence / repetition penalty | A | none | M | ✅ `repetition-penalty` |
+| [A7](#a7) | DRY repetition penalty | A | none | M | ✅ `dry-repetition-penalty` |
+| [A8](#a8) | Entropy-adaptive temperature | A | none | M | ✅ `entropy-adaptive-temperature` |
+| [A9](#a9) | Gumbel distortion-free watermark | A | none | M | ✅ `gumbel-watermark` |
+| [A10](#a10) | SynthID-Text tournament sampling | A | none | M | ✅ `synthid-tournament-sampling` |
+| [B1](#b1) | H2O heavy-hitter eviction | B | **attention/key tap** | M | ⛔ blocked |
+| [B2](#b2) | SnapKV | B | **attention/key tap** | M | ⛔ blocked |
+| [B3](#b3) | TOVA | B | **attention/key tap** | M | ⛔ blocked |
+| [B4](#b4) | Quest query-aware page selection | B | **key tap** | M | ⛔ blocked |
+| [B5](#b5) | RetrievalAttention | B | **key tap** | L | ⛔ blocked |
+| [C0](#c0) | **Bind `hidden`/`value_head` in CUDA tier-0** | C | driver | M | out of scope |
+| [C1](#c1) | EAGLE-style feature-level drafting | C | after C0 | L | out of scope |
+| [C2](#c2) | Semantic entropy / confidence gating | C | after C0 | M | out of scope |
+| [C3](#c3) | Value-head guided beam / step scoring | C | after C0 | M | out of scope |
+| [C4](#c4) | DoLa layer-contrastive decoding | C | after C0 + per-layer readout | L | out of scope |
+| [C5](#c5) | ITI / CAA / RepE activation steering | C | **blocked** — needs a write port | L | ⛔ blocked |
+| [D1](#d1) | Classifier-free guidance for LLMs | D | none | M | ✅ `classifier-free-guidance` |
+| [D2](#d2) | Context-aware decoding (CAD) | D | none | M | ✅ `context-aware-decoding` |
+| [D3](#d3) | Cross-model contrastive decoding | D | **multi-model service** | L | ⛔ blocked |
+| [D4](#d4) | DExperts / proxy tuning / emulated fine-tuning | D | **multi-model service** | L | ⛔ blocked |
+| [E1](#e1) | Grammar-aligned decoding (ASAp) | E | none | L | ✅ `asap-grammar-aligned-decoding` |
+| [E2](#e2) | Token healing / tokenizer alignment | E | none | M | ✅ `token-healing` |
 
-**Recommended order — items 1-5 need no engine changes at all:**
-`A6 → A8 → A1/A2 → A9 → B4` → `C0` → `C3/C1` → `D1/D2` → `E1`.
+**14 of 14 buildable candidates are implemented**, each verified by a build for
+`wasm32-wasip2` and a run against a live CUDA engine. Every crate lives in
+`tests/inferlets/<name>/`. Faithfulness against the source papers is audited in
+[`10-implementation-faithfulness-audit.md`](10-implementation-faithfulness-audit.md).
+
+The nine unbuilt rows are **not** backlog. Tier C is out of scope by request;
+B1–B5, C5, D3 and D4 are blocked on missing ABI surface, and the exact missing
+primitive for each is recorded in
+[`09-ptir-unbuilt-algorithms.md`](09-ptir-unbuilt-algorithms.md).
+
+**Order actually taken:** `A1/A2 → A3/A4/A5 → A6 → A7 → A8 → A9 → A10 → D1 →
+D2 → E2 → E1`. B4 was dropped from the plan once the attention tap turned out
+to be missing; C0 and its dependants were out of scope.
 
 ---
 
@@ -158,40 +169,81 @@ or multi-context orchestration.
 
 ---
 
-## Tier B — `query()` / `layer()`: wired on CUDA, zero usage
+## Tier B — score-driven KV policies: **blocked, and not on effort**
+
+> **Correction (verified against the interface, not inferred).** This tier was
+> originally listed as buildable on the strength of the `query()` tap. That is
+> wrong, and none of B1–B5 can be written today. The distinction that matters:
+>
+> - **The actuator already exists.** `Port::Pages`, `Port::PageIndptr` and
+>   `Port::AttnMask` (`interface/ptir/src/registry.rs:102-113`) are all
+>   guest-bound, so an inferlet can freely choose *which* pages a step attends
+>   to and mask *which* positions survive. Eviction and page selection are
+>   expressible.
+> - **The sensor does not.** Every one of B1–B5 decides *what* to evict from
+>   `softmax(QK^T)` — accumulated attention mass (H2O), a recent-window score
+>   (SnapKV), the current step's score (TOVA), a per-page bound on `q·k`
+>   (Quest), or a nearest-neighbour lookup over `K` (RetrievalAttention).
+>   `IntrinsicId` (`interface/ptir/src/op.rs:49-68`) is exhaustively
+>   `Logits, MtpLogits, Hidden, Query, ValueHead, Layer, MtpDrafts`. There is
+>   **no key, no attention score and no attention probability tap**, and
+>   `Port` has no KV-data port either — `Pages`/`PageIndptr`/`KvLen` carry page
+>   *geometry*, never page *contents*.
+>
+> `query()` alone is therefore insufficient by construction: `QK^T` needs `K`,
+> and `K` is not observable from an inferlet. Nor can `K` be reconstructed —
+> `Hidden` is epilogue-scoped (`registry.rs:185` restricts `Query`/`Layer` to
+> `Stage::OnAttnProj | Stage::OnAttn`, while `Hidden` is epilogue-only), and the
+> per-layer `W_k` projection is not exposed in any form.
+>
+> **What would unblock the whole tier:** one new intrinsic carrying either the
+> post-softmax attention probabilities or the layer's projected keys, readable
+> at `Stage::OnAttn`. Every algorithm below then becomes a small inferlet,
+> because the hard half — paged KV plus a guest-bound attention mask — is
+> already in place. This is recorded in
+> [`09-ptir-unbuilt-algorithms.md`](09-ptir-unbuilt-algorithms.md).
 
 Pie today has **static** attention policies (`attention-sink`,
 `sliding-window-attention`, upstream `windowed-attention`). It has no
-**score-driven dynamic** policy, because that needs the attention tap that
-nothing currently uses.
+**score-driven dynamic** policy, and cannot have one until the tap above lands.
 
 <a id="b1"></a>
 ### B1. H2O — heavy-hitter KV eviction — M
 - **Paper:** Zhang et al., [2306.14048](https://arxiv.org/abs/2306.14048)
 - **Build:** accumulate attention mass per position, evict the low-mass tail.
-- **Needs:** `query()` to derive scores; page discard via `WorkingSet` ops.
+- **Blocked on:** the accumulated attention mass itself. `query()` gives `Q`
+  but never `K`, so `softmax(QK^T)` cannot be formed.
 
 <a id="b2"></a>
 ### B2. SnapKV — M
 - **Paper:** Li et al., [2404.14469](https://arxiv.org/abs/2404.14469)
 - **Build:** use an observation window of recent attention to pick which KV each head keeps, at prefill time.
+- **Blocked on:** per-head attention scores over the observation window.
 
 <a id="b3"></a>
 ### B3. TOVA — M
 - **Paper:** Oren et al., [2401.06104](https://arxiv.org/abs/2401.06104), *Transformers are Multi-State RNNs*
-- **Build:** a single step's attention score decides the evicted token — the simplest score-driven policy, so the cheapest way to validate the `query()` tap.
+- **Build:** a single step's attention score decides the evicted token — the
+  simplest score-driven policy, and so the natural first client of an attention
+  tap once one exists.
+- **Blocked on:** that single step's attention score.
 
 <a id="b4"></a>
 ### B4. Quest — query-aware page selection — M ⭐
 - **Paper:** Tang et al., [2406.10774](https://arxiv.org/abs/2406.10774)
 - **Build:** keep per-page min/max key summaries, score them against the current query, attend only to the top-k pages.
-- **Why pie:** the KV is *already* paged and the attention mask is *already* a guest-bound channel. This is closer to a natural expression here than in any other engine — the strongest showcase in Tier B.
+- **Why pie:** the KV is *already* paged and the attention mask is *already* a
+  guest-bound channel. This is closer to a natural expression here than in any
+  other engine — the strongest showcase in Tier B, *once* the tap exists.
+- **Blocked on:** the per-page min/max key summaries. Quest scores a page by
+  `max_k q·k` bounded through elementwise key extrema; keys are unreadable.
 
 <a id="b5"></a>
 ### B5. RetrievalAttention — L
 - **Paper:** Liu et al., [2409.10516](https://arxiv.org/abs/2409.10516)
 - **Build:** ANN index over keys, retrieve the subset the query actually attends to, offload the rest.
 - **Effort:** L because it needs an index structure and host/device memory movement, not just a mask.
+- **Blocked on:** read access to `K` to build the ANN index at all.
 
 ---
 
@@ -257,14 +309,27 @@ anything like this today, and it is *same-model, bounded-context*.
 - **Paper:** Shi et al., [2305.14739](https://arxiv.org/abs/2305.14739), *Trusting Your Evidence*
 - **Build:** contrast with-context against without-context logits — the anti-hallucination form of D1, same program shape.
 
+> **Correction (verified).** D1 and D2 are built and passing. D3 and D4 are
+> **blocked, and not on effort**: both require two or more *different* models to
+> be resident and steppable from one inferlet, and
+> `sdk/rust/inferlet/wit/model.wit:3` states the invariant plainly — *"The
+> engine serves exactly one model; these are global functions over that single
+> bound model (no `model` resource handle)."* There is no model handle to pass
+> around, so no inferlet can name a second model. See
+> [`09-ptir-unbuilt-algorithms.md`](09-ptir-unbuilt-algorithms.md).
+
 <a id="d3"></a>
-### D3. Cross-model contrastive decoding — L
+### D3. Cross-model contrastive decoding — L, **blocked**
 - **Paper:** Li et al., [2210.15097](https://arxiv.org/abs/2210.15097)
 - **Gap:** the existing `contrastive-decoding` inferlet is one model at two context lengths; the original method contrasts an **expert and an amateur model**.
+- **Blocked on:** one model per engine. Two contexts are expressible (that is
+  exactly what D1/D2 do); two *models* are not.
 
 <a id="d4"></a>
-### D4. DExperts / proxy tuning / emulated fine-tuning — L
+### D4. DExperts / proxy tuning / emulated fine-tuning — L, **blocked**
 - **Build:** logit arithmetic across two or three models to transfer tuning effects at decode time.
+- **Blocked on:** one model per engine — same wall as D3, and it binds harder
+  here because proxy tuning needs *three* models.
 - **See:** `02-token-level-decoding-sampling.md`, `06-constrained-decoding-and-steering.md`.
 
 ---

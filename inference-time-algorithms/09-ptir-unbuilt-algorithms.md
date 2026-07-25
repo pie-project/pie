@@ -88,24 +88,60 @@ A1 is the canonical "new sampler" demo.
 
 ---
 
-## Tier B — `query()` / `layer()`: wired on CUDA, zero usage
+## Tier B — score-driven KV policies: blocked on a missing sensor
 
-The unexplored frontier that costs no driver work. Pie today has **static**
-attention policies (`attention-sink`, `sliding-window-attention`,
-`windowed-attention` upstream); it has no **score-driven dynamic** policy,
-because that needs the attention tap nothing uses.
+Pie today has **static** attention policies (`attention-sink`,
+`sliding-window-attention`, `windowed-attention` upstream); it has no
+**score-driven dynamic** policy. An earlier draft of this document, and of
+`candidates.md`, attributed that to `query()` simply being unused. **That was
+wrong.** The tier was re-checked against the interface while implementing
+Tiers A/D/E, and none of B1–B5 is writable today.
+
+### The half that exists, and the half that does not
+
+| | Capability | Status |
+|---|---|---|
+| **Actuator** | choose which pages a step attends to | ✅ `Port::Pages`, `Port::PageIndptr` — `interface/ptir/src/registry.rs:102-113` |
+| **Actuator** | mask which positions survive | ✅ `Port::AttnMask` — same enum |
+| **Sensor** | read `softmax(QK^T)` | ❌ no such intrinsic |
+| **Sensor** | read the layer's projected keys `K` | ❌ no such intrinsic |
+| **Sensor** | read the layer's projected query `Q` | ✅ `IntrinsicId::Query` |
+
+`IntrinsicId` (`interface/ptir/src/op.rs:49-68`) is exhaustively `Logits,
+MtpLogits, Hidden, Query, ValueHead, Layer, MtpDrafts`. `Port`
+(`registry.rs:102-113`) is exhaustively `EmbedTokens, EmbedIndptr, Positions,
+Pages, PageIndptr, KvLen, WSlot, WOff, Readout, AttnMask` — `Pages`,
+`PageIndptr` and `KvLen` carry page **geometry**, never page **contents**.
+
+So `query()` is necessary but not sufficient: every algorithm in this tier
+scores positions with `QK^T`, and `K` is not observable. Nor is it
+recoverable — `Query`/`Layer` are restricted to `Stage::OnAttnProj |
+Stage::OnAttn` (`registry.rs:185`) while `Hidden` is epilogue-only, and the
+per-layer `W_k` projection is not exposed in any form, so keys cannot be
+recomputed from anything an inferlet can see.
+
+### What would unblock it
+
+**One intrinsic**: either the post-softmax attention probabilities or the
+layer's projected keys, readable at `Stage::OnAttn`. Every row below then
+becomes a small inferlet, because the expensive half — paged KV plus a
+guest-bound attention mask — already exists. That makes this tier the highest
+leverage single ABI addition on the list: one tap, five algorithms.
 
 | # | Algorithm | Paper | What it needs | Why it's a gap |
 |---|---|---|---|---|
-| B1 | **H2O — heavy-hitter KV eviction** | Zhang et al., [2306.14048](https://arxiv.org/abs/2306.14048) | accumulate attention mass per position from `query()`, evict the tail | all current eviction is positional, not score-driven |
-| B2 | **SnapKV** | Li et al., [2404.14469](https://arxiv.org/abs/2404.14469) | observation-window attention scores → per-head page selection | absent |
-| B3 | **TOVA** | Oren et al., [2401.06104](https://arxiv.org/abs/2401.06104) | single-step attention score decides the evicted token | absent |
-| B4 | **Quest — query-aware page selection** | Tang et al., [2406.10774](https://arxiv.org/abs/2406.10774) | per-page min/max key summaries scored against `query()`, top pages into the mask | absent; a direct fit for pie's page model + mask channel |
-| B5 | **RetrievalAttention** | Liu et al., [2409.10516](https://arxiv.org/abs/2409.10516) | ANN over keys driven by `query()`, attend to the retrieved subset | absent |
+| # | Algorithm | Paper | Signal it needs | Blocked because |
+|---|---|---|---|---|
+| B1 | **H2O — heavy-hitter KV eviction** | Zhang et al., [2306.14048](https://arxiv.org/abs/2306.14048) | attention mass accumulated per position | needs `softmax(QK^T)`; `K` unreadable |
+| B2 | **SnapKV** | Li et al., [2404.14469](https://arxiv.org/abs/2404.14469) | per-head attention over an observation window | same |
+| B3 | **TOVA** | Oren et al., [2401.06104](https://arxiv.org/abs/2401.06104) | the current step's attention score | same |
+| B4 | **Quest — query-aware page selection** | Tang et al., [2406.10774](https://arxiv.org/abs/2406.10774) | per-page elementwise min/max of `K`, scored against `Q` | needs `K` directly |
+| B5 | **RetrievalAttention** | Liu et al., [2409.10516](https://arxiv.org/abs/2409.10516) | an ANN index over `K` | needs `K` directly |
 
-**Suggested first build: B4 (Quest).** Pie's KV is *already* paged and the
-attention mask is *already* a guest-bound channel, so Quest is closer to a
-natural expression here than in any other engine.
+**Still the best first build once unblocked: B4 (Quest).** Pie's KV is
+*already* paged and the attention mask is *already* a guest-bound channel, so
+Quest is closer to a natural expression here than in any other engine — the
+missing piece is purely the key summary, not the policy machinery.
 
 ---
 
@@ -143,8 +179,26 @@ before sampling is a natural PTIR program. Nothing does it today except
 |---|---|---|---|
 | D1 | **Classifier-free guidance for LLMs** | Sanchez et al., [2306.17806](https://arxiv.org/abs/2306.17806) | `logits = uncond + γ(cond − uncond)`; needs prompted/unprompted contexts in one frame |
 | D2 | **Context-aware decoding (CAD)** | Shi et al., [2305.14739](https://arxiv.org/abs/2305.14739) | with-context vs without-context contrast — the anti-hallucination version of D1 |
-| D3 | **Cross-model contrastive decoding** | Li et al., [2210.15097](https://arxiv.org/abs/2210.15097) | existing `contrastive-decoding` is one model with two context lengths; the original is expert **and** amateur *models* |
-| D4 | **DExperts / GeDi / proxy tuning / emulated fine-tuning** | see `02`, `06` | logit arithmetic across 2-3 models; heavier, but the same frame pattern |
+| D3 | *(blocked)* **Cross-model contrastive decoding** | Li et al., [2210.15097](https://arxiv.org/abs/2210.15097) | existing `contrastive-decoding` is one model with two context lengths; the original is expert **and** amateur *models* |
+| D4 | *(blocked)* **DExperts / GeDi / proxy tuning / emulated fine-tuning** | see `02`, `06` | logit arithmetic across 2-3 models |
+
+**D1 and D2 are built** (`classifier-free-guidance`, `context-aware-decoding`);
+the two-context frame pattern predicted here holds, with one correction — the
+two streams need **two `WorkingSet`s on one `Pipeline`**, not two pipelines, and
+the loop must be strictly sequential.
+
+**D3 and D4 are blocked, and not on effort.** Both need two or more *different*
+models resident and steppable from a single inferlet, and
+`sdk/rust/inferlet/wit/model.wit:3` fixes the opposite invariant:
+
+> The engine serves exactly one model; these are global functions over that
+> single bound model (no `model` resource handle).
+
+With no model handle in the WIT surface there is no way for an inferlet to name
+a second model, so the arithmetic these methods perform — `logit_expert −
+logit_amateur`, or `logit_base + logit_expert − logit_antiexpert` — has no
+second operand to fetch. Unblocking needs a multi-model service surface, which
+is a substantially larger change than the single attention tap Tier B wants.
 
 ---
 
