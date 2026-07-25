@@ -215,17 +215,15 @@ async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
         server=ServerConfig(port=0),
         auth=AuthConfig(enabled=False),
         telemetry=TelemetryConfig(),
-        models=[
-            ModelConfig(
-                name="default",
-                hf_repo=args.model,
-                driver=DriverConfig(
-                    type=args.driver,
-                    device=device,
-                    options=driver_subsection,
-                ),
+        model=ModelConfig(
+            name="default",
+            hf_repo=args.model,
+            driver=DriverConfig(
+                type=args.driver,
+                device=device,
+                options=driver_subsection,
             ),
-        ],
+        ),
     )
     out_dir = Path(args.output_dir) if args.output_dir else None
     if out_dir is not None:
