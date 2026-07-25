@@ -80,10 +80,6 @@ pub fn discover_safetensors_files(snapshot_dir: &Path) -> Result<Vec<PathBuf>, C
             .collect());
     }
 
-    if single.is_file() {
-        return Ok(vec![single]);
-    }
-
     Err(CompileError::InvalidInput(format!(
         "no model.safetensors[.index.json] in {}",
         snapshot_dir.display()

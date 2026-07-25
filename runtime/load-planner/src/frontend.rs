@@ -5,7 +5,7 @@ use crate::load_plan::StorageTarget;
 use crate::semantic::SemanticGraph;
 use crate::source::{CheckpointMetadata, RawTensor};
 use crate::types::{
-    DType, Encoding, QuantScheme, QuantSpec, Sharding, TensorDecl, TensorId, encoding_nbytes,
+    DType, Encoding, ExprId, QuantScheme, Sharding, TensorDecl, TensorId, encoding_nbytes,
 };
 
 pub fn plan_from_semantics(
@@ -40,10 +40,10 @@ fn lower_contract(
     contract: &RuntimeTensorContract,
     target: &StorageTarget,
     plan: &mut LayoutPlan,
-    contract_values: &[crate::types::ExprId],
+    contract_values: &[ExprId],
     output_id: TensorId,
     next_generated_tensor: &mut u32,
-) -> Result<(crate::types::ExprId, crate::types::ExprId), CompileError> {
+) -> Result<(ExprId, ExprId), CompileError> {
     let (mut current, mut current_decl) =
         lower_contract_source(metadata, graph, contract, plan, contract_values, output_id)?;
     let metadata_values = lower_metadata_sources(metadata, contract, plan)?;
@@ -135,7 +135,7 @@ fn lower_metadata_sources(
     metadata: &CheckpointMetadata,
     contract: &RuntimeTensorContract,
     plan: &mut LayoutPlan,
-) -> Result<Vec<crate::types::ExprId>, CompileError> {
+) -> Result<Vec<ExprId>, CompileError> {
     let mut values = Vec::with_capacity(contract.metadata.len());
     for tensor_id in &contract.metadata {
         let raw = metadata.tensor(*tensor_id).ok_or_else(|| {
@@ -157,9 +157,9 @@ fn lower_contract_source(
     graph: &SemanticGraph,
     contract: &RuntimeTensorContract,
     plan: &mut LayoutPlan,
-    contract_values: &[crate::types::ExprId],
+    contract_values: &[ExprId],
     output_id: TensorId,
-) -> Result<(crate::types::ExprId, TensorDecl), CompileError> {
+) -> Result<(ExprId, TensorDecl), CompileError> {
     match &contract.source {
         RuntimeTensorSource::DirectTensor(_) | RuntimeTensorSource::Semantic { .. } => {
             let raw = resolve_raw_tensor(metadata, graph, contract)?;
@@ -346,13 +346,13 @@ fn contract_decl(contract: &RuntimeTensorContract, output_id: TensorId) -> Tenso
 
 fn lower_encoding_change(
     plan: &mut LayoutPlan,
-    input: crate::types::ExprId,
-    metadata: &[crate::types::ExprId],
+    input: ExprId,
+    metadata: &[ExprId],
     current_decl: &mut TensorDecl,
     contract: &RuntimeTensorContract,
     output_id: TensorId,
     next_generated_tensor: &mut u32,
-) -> Result<crate::types::ExprId, CompileError> {
+) -> Result<ExprId, CompileError> {
     if current_decl.encoding == contract.encoding {
         return Ok(input);
     }
@@ -475,18 +475,4 @@ fn source_decl(raw: &RawTensor) -> TensorDecl {
 pub fn runtime_bytes(shape: &[i64], encoding: &Encoding) -> Result<u64, CompileError> {
     encoding_nbytes(shape, encoding)
         .ok_or_else(|| CompileError::InvalidInput("runtime tensor byte size overflow".to_string()))
-}
-
-#[allow(dead_code)]
-fn _raw_quant_spec(dtype: DType) -> QuantSpec {
-    QuantSpec {
-        scheme: crate::types::QuantScheme::None,
-        logical_dtype: dtype,
-        bits_per_element: 0,
-        group_size: 0,
-        channel_axis: None,
-        scale_dtype: None,
-        zero_point_dtype: None,
-        block_shape: Vec::new(),
-    }
 }

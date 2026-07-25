@@ -250,13 +250,15 @@ impl LoadPlan {
     }
 
     pub fn summary(&self) -> LoadPlanSummary {
-        let mut s = LoadPlanSummary::default();
-        s.tensor_count = self.tensors.len();
-        s.buffer_count = self.buffers.len();
-        s.schedule_len = self.schedule.len();
-        s.persistent_bytes = self.memory.persistent_bytes;
-        s.checkpoint_read_bytes = self.memory.checkpoint_read_bytes;
-        s.device_write_bytes = self.memory.device_write_bytes;
+        let mut s = LoadPlanSummary {
+            tensor_count: self.tensors.len(),
+            buffer_count: self.buffers.len(),
+            schedule_len: self.schedule.len(),
+            persistent_bytes: self.memory.persistent_bytes,
+            checkpoint_read_bytes: self.memory.checkpoint_read_bytes,
+            device_write_bytes: self.memory.device_write_bytes,
+            ..LoadPlanSummary::default()
+        };
         for instr in &self.instrs {
             match instr {
                 StorageInstr::Allocate { .. } => s.allocate_count += 1,
