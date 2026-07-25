@@ -1,0 +1,18 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/gpugrammar-ir",
+    "crates/gpugrammar-lex",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/ingim/gpu-lr1"
+
+[workspace.dependencies]
+anyhow = "1.0"
+rustc-hash = "2.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

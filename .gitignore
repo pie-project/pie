@@ -13,3 +13,6 @@ results/jsonschemabench-rows.json
 results/rows-*.npz
 results/rows-*.json
 results/jsonschemabench-instances.json
+
+# rust build artifacts
+rust/target/

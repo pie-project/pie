@@ -1,0 +1,279 @@
+//! JSON Schema grammar frontend.
+//!
+//! Supported schema forms:
+//! - Primitive JSON types, enums, and constants
+//! - String length, pattern, and selected format constraints
+//! - Inclusive i64 integer and bounded decimal number ranges
+//! - Arrays, fixed-order objects, local `$ref`, `anyOf`, and `oneOf`
+//!
+//! Bounded `number` schemas emit a sound non-exponent decimal subset.
+//! Pattern/format constraints cannot be combined with length constraints.
+
+mod typed;
+
+use anyhow::Result;
+use serde_json::Value;
+
+use crate::grammar::Grammar;
+
+/// Options for JSON Schema conversion.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct JsonSchemaOptions {
+    /// Allow arbitrary whitespace between JSON elements.
+    pub any_whitespace: bool,
+    /// If true, disallow additional properties/items not in the schema.
+    pub strict_mode: bool,
+}
+
+impl Default for JsonSchemaOptions {
+    fn default() -> Self {
+        Self {
+            any_whitespace: true,
+            strict_mode: true,
+        }
+    }
+}
+
+/// Convert a JSON Schema string directly to a grammar.
+pub fn json_schema_to_grammar(schema: &str, options: &JsonSchemaOptions) -> Result<Grammar> {
+    let schema: Value = serde_json::from_str(schema)?;
+    typed::convert(&schema, options)?.to_grammar()
+}
+
+/// Convert a parsed JSON Schema to an EBNF representation.
+pub fn json_schema_to_ebnf(schema: &Value, options: &JsonSchemaOptions) -> Result<String> {
+    Ok(typed::convert(schema, options)?.to_ebnf())
+}
+
+/// Create a grammar for any valid JSON value.
+pub fn builtin_json_grammar() -> Result<Grammar> {
+    Grammar::from_ebnf(BUILTIN_JSON_EBNF, "root")
+}
+
+const BUILTIN_JSON_EBNF: &str = r#"
+root ::= value
+value ::= object | array | string | number | "true" | "false" | "null"
+object ::= "{" ws (pair ("," ws pair)*)? ws "}"
+pair ::= ws string ws ":" ws value
+array ::= "[" ws (value ("," ws value)*)? ws "]"
+string ::= "\"" char* "\""
+char ::= [^"\\\x00-\x1f] | "\\" escape
+escape ::= "\"" | "\\" | "/" | "b" | "f" | "n" | "r" | "t" | "u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F]
+number ::= integer fraction? exponent?
+integer ::= "-"? ("0" | [1-9] [0-9]*)
+fraction ::= "." [0-9]+
+exponent ::= [eE] [+-]? [0-9]+
+ws ::= [ \t\n\r]*
+"#;
+
+pub(super) fn parse_i64_keyword(
+    schema: &serde_json::Map<String, Value>,
+    keyword: &str,
+) -> Result<Option<i64>> {
+    schema
+        .get(keyword)
+        .map(|value| {
+            value
+                .as_i64()
+                .ok_or_else(|| anyhow::anyhow!("{} must be an i64 integer", keyword))
+        })
+        .transpose()
+}
+
+pub(super) fn generate_integer_range_regex(min: Option<i64>, max: Option<i64>) -> String {
+    match (min, max) {
+        (None, None) => "-?(?:0|[1-9][0-9]*)".to_string(),
+        (Some(min), Some(max)) if min == max => min.to_string(),
+        (Some(min), Some(max)) if min >= 0 => positive_range_regex(min as u64, max as u64),
+        (Some(min), Some(max)) if max < 0 => {
+            format!(
+                "-{}",
+                positive_range_regex(max.unsigned_abs(), min.unsigned_abs())
+            )
+        }
+        (Some(min), Some(max)) => format!(
+            "(?:-{}|{})",
+            positive_range_regex(1, min.unsigned_abs()),
+            positive_range_regex(0, max as u64)
+        ),
+        (Some(min), None) if min >= 0 => positive_range_regex_unbounded(min as u64),
+        (Some(min), None) => format!(
+            "(?:-{}|(?:0|[1-9][0-9]*))",
+            positive_range_regex(1, min.unsigned_abs())
+        ),
+        (None, Some(max)) if max < 0 => format!(
+            "-(?:{})",
+            positive_range_regex_unbounded(max.unsigned_abs())
+        ),
+        (None, Some(max)) => format!("(?:-[1-9][0-9]*|{})", positive_range_regex(0, max as u64)),
+    }
+}
+
+pub(super) fn generate_bounded_number_regex(min: Option<i64>, max: Option<i64>) -> String {
+    let mut alternatives = Vec::new();
+    if min.is_none_or(|value| value <= 0) {
+        let magnitude_min = match max {
+            Some(value) if value < 0 => value.unsigned_abs(),
+            _ => 0,
+        };
+        let magnitude_max = min.map(i64::unsigned_abs);
+        if magnitude_max.is_none_or(|upper| magnitude_min <= upper) {
+            alternatives.push(format!(
+                "-(?:{})",
+                decimal_magnitude_regex(magnitude_min, magnitude_max)
+            ));
+        }
+    }
+    if max.is_none_or(|value| value >= 0) {
+        let nonnegative_min = min.unwrap_or(0).max(0) as u64;
+        let nonnegative_max = max.filter(|&value| value >= 0).map(|value| value as u64);
+        if nonnegative_max.is_none_or(|upper| nonnegative_min <= upper) {
+            alternatives.push(decimal_magnitude_regex(nonnegative_min, nonnegative_max));
+        }
+    }
+    match alternatives.len() {
+        1 => alternatives.pop().unwrap(),
+        _ => format!("(?:{})", alternatives.join("|")),
+    }
+}
+
+fn decimal_magnitude_regex(min: u64, max: Option<u64>) -> String {
+    match max {
+        None => format!("(?:{})(?:\\.[0-9]+)?", positive_range_regex_unbounded(min)),
+        Some(max) if min == max => format!("{}(?:\\.0+)?", max),
+        Some(max) => format!(
+            "(?:(?:{})(?:\\.[0-9]+)?|{}(?:\\.0+)?)",
+            positive_range_regex(min, max - 1),
+            max
+        ),
+    }
+}
+
+fn positive_range_regex(min: u64, max: u64) -> String {
+    if min == max {
+        return min.to_string();
+    }
+    let min_text = min.to_string();
+    let max_text = max.to_string();
+    if min_text.len() == max_text.len() {
+        return same_length_range(&min_text, &max_text);
+    }
+
+    let mut parts = Vec::new();
+    let first_ceiling = 10u64.pow(min_text.len() as u32) - 1;
+    if min <= first_ceiling {
+        parts.push(positive_range_regex(min, first_ceiling));
+    }
+    for digits in (min_text.len() + 1)..max_text.len() {
+        parts.push(format!("[1-9][0-9]{{{}}}", digits - 1));
+    }
+    let last_floor = 10u64.pow((max_text.len() - 1) as u32);
+    if last_floor <= max {
+        parts.push(positive_range_regex(last_floor, max));
+    }
+    match parts.len() {
+        1 => parts.pop().unwrap(),
+        _ => format!("(?:{})", parts.join("|")),
+    }
+}
+
+fn positive_range_regex_unbounded(min: u64) -> String {
+    match min {
+        0 => "(?:0|[1-9][0-9]*)".to_string(),
+        1 => "[1-9][0-9]*".to_string(),
+        _ => {
+            let text = min.to_string();
+            let ceiling = 10u64.pow(text.len() as u32) - 1;
+            format!(
+                "(?:{}|[1-9][0-9]{{{},}})",
+                positive_range_regex(min, ceiling),
+                text.len()
+            )
+        }
+    }
+}
+
+fn same_length_range(min: &str, max: &str) -> String {
+    let min: Vec<u8> = min.bytes().map(|byte| byte - b'0').collect();
+    let max: Vec<u8> = max.bytes().map(|byte| byte - b'0').collect();
+    build_digit_range(&min, &max, 0)
+}
+
+fn build_digit_range(min: &[u8], max: &[u8], position: usize) -> String {
+    if position >= min.len() {
+        return String::new();
+    }
+    if position == min.len() - 1 {
+        return digit_range(min[position], max[position]);
+    }
+    if min[position] == max[position] {
+        return format!(
+            "{}{}",
+            min[position],
+            build_digit_range(min, max, position + 1)
+        );
+    }
+
+    let mut parts = Vec::new();
+    let lower_max = vec![9; min.len() - position - 1];
+    parts.push(format!(
+        "{}{}",
+        min[position],
+        build_digit_range(&min[position + 1..], &lower_max, 0)
+    ));
+    if min[position] + 1 < max[position] {
+        parts.push(format!(
+            "{}[0-9]{{{}}}",
+            digit_range(min[position] + 1, max[position] - 1),
+            min.len() - position - 1
+        ));
+    }
+    let upper_min = vec![0; max.len() - position - 1];
+    parts.push(format!(
+        "{}{}",
+        max[position],
+        build_digit_range(&upper_min, &max[position + 1..], 0)
+    ));
+    format!("(?:{})", parts.join("|"))
+}
+
+fn digit_range(min: u8, max: u8) -> String {
+    match max - min {
+        0 => min.to_string(),
+        1 => format!("[{}{}]", min, max),
+        _ => format!("[{}-{}]", min, max),
+    }
+}
+
+pub(super) fn format_to_regex(format: &str) -> Option<String> {
+    match format {
+        "date" => Some(r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[1-2]\d|3[01])$".to_string()),
+        "time" => Some(
+            r"^([01]\d|2[0-3]):[0-5]\d:([0-5]\d|60)(\.\d+)?(Z|[+-]([01]\d|2[0-3]):[0-5]\d)$"
+                .to_string(),
+        ),
+        "date-time" => Some(r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[1-2]\d|3[01])T([01]\d|2[0-3]):[0-5]\d:([0-5]\d|60)(\.\d+)?(Z|[+-]([01]\d|2[0-3]):[0-5]\d)$".to_string()),
+        "email" => Some(r"^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$".to_string()),
+        "uuid" => Some(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$".to_string()),
+        "ipv4" => Some(r"^((25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(25[0-5]|2[0-4]\d|[01]?\d\d?)$".to_string()),
+        "hostname" => Some(r"^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$".to_string()),
+        _ => None,
+    }
+}
+
+pub(super) fn sanitize_rule_name(name: &str) -> String {
+    let mut sanitized: String = name
+        .chars()
+        .map(|ch| {
+            if ch.is_alphanumeric() || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        sanitized.push_str("rule");
+    }
+    sanitized
+}
