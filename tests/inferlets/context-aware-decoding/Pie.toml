@@ -1,0 +1,14 @@
+[package]
+name = "context-aware-decoding"
+version = "0.1.0"
+description = "Context-aware decoding — amplify the retrieved context against the model's parametric prior"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+context = {type = "string", optional = true, description = "Retrieved document the answer must be grounded in"}
+query = {type = "string", optional = true, description = "Question asked of the context"}
+alpha = {type = "float", optional = true, description = "Context amplification; 0.0 is plain context-conditioned decoding (default: 0.5)"}
+max_tokens = {type = "int", optional = true, description = "Number of generated tokens (default: 32)"}

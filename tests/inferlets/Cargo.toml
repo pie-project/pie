@@ -19,6 +19,7 @@ members = [
     "dry-repetition-penalty",
     "gumbel-watermark",
     "classifier-free-guidance",
+    "context-aware-decoding",
     "sampling-primitives",
     "sliding-window-attention",
     "tail-free-sampling",
