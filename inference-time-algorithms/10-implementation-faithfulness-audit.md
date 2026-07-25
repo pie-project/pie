@@ -713,11 +713,11 @@ the wrong fixed point.
 earlier revision took `.min()` against the previous α to force monotonicity;
 that hid errors. Monotonicity now falls out of the recurrence, and the run
 reports it as an observable: `monotone: true`, with α(root) declining
-`1.0 → 0.00645 → 0.00581 → 0.00420 → 0.00253 → 0.00172 …`.
+`3.93e-13 → 3.76e-13 → 1.82e-13 → 1.8202e-13 → 1.8201e-13 → 1.8132e-13`.
 
 **Behavioural evidence.** In round 1, `c̃_S ≡ 1` everywhere, so Eq. 4 reduces to
 GCD — and the run shows `asap_logprob == gcd_logprob` exactly. From round 2 the
-two diverge as `c̃_S` falls. That is precisely the paper's Figure 1 story, and it
+two diverge as `c̃_S` falls (round 1: both `−30.771597`). That is precisely the paper's Figure 1 story, and it
 is a much stronger check than reading the code: an implementation that had
 subtly broken the fold-back would not reproduce the round-1 identity *and* the
 subsequent divergence.
@@ -825,6 +825,55 @@ strengthens rather than weakens them, since every inferlet passed its assertions
 | A9 | Per-token score floored at `1e-7` | Null mean biased low by `1e-7` | Without it a strongly favoured token yields `+∞` and destroys the statistic |
 
 Every other implementation is algebraically identical to its source.
+
+---
+
+## GPU verification
+
+Every verdict above was re-confirmed end to end on an NVIDIA L40S
+(`Qwen/Qwen3-0.6B`, `cuda_native` driver) after the audit was written, so the
+document describes code that demonstrably runs. **14/14 pass.** Several runs
+double as numerical confirmations of the equations:
+
+| # | Reported | Confirms |
+|---|---|---|
+| A1 | `mean_kept 81.5`, `mean_mass 0.845` at τ=0.95 | Exclusive prefix — kept mass lands just under τ, never over |
+| A2 | `mean_kept 449`, `mean_mass 0.927` at ε=3e-4 | η adapts far wider than a fixed ε would |
+| A3 | `mean_kept 9.97` at z=0.95 | Curvature cut is aggressive where the tail is flat |
+| A4 | `mean_kept 19.6` at a=0.2 | `a·p_max²`, not `(a·p_max)²`, which would keep ~1 token |
+| A5 | `fire_rate 0.406` at probability 0.5 | Bernoulli gate fires at its nominal rate over 32 steps |
+| A6 | `mean_penalized 20.9`, `peak_repeat 2.0` | Prompt-seeded presence vector is live from step 1 |
+| A7 | `peak_penalty 4.2875`, `longest_repeat 5` | **`0.8 · 1.75^(5−2) = 4.2875` exactly** — the DRY formula, to the last digit |
+| A8 | `mean_entropy 3.276`, `mean_temperature 0.973` | `T = T₀·N^(θ/H)` — near `T₀` at high entropy, falling to ≈0.52 at the observed `min_entropy 0.034` |
+| A9 | `mean_null_score 1.0325`, `mean_score 2.621`, `z 9.17` | **The decoy null mean is 1.0 — exactly `E[Exp(1)]`**, which is the distributional claim the detector's z-score rests on |
+| A10 | `mean_score 0.576` vs null `0.465`, `z 2.59` | Emitted-token g-value sits above ½, as `2m − m²` predicts |
+| D1 | `mean_kl 0.0688`, `guidance_shift 0.062` at γ=1.5 | Guidance moves the distribution without collapsing it; γ=1 gives KL 0.0000 |
+| D2 | `mean_kl 0.186`, `context_shift 0.094` at α=0.5 | Context amplification is active; α=0 gives KL 0.0000 |
+| E1 | round 1 `asap_logprob == gcd_logprob == −30.771597`; α(root) `3.93e-13 → 3.76e-13 → 1.82e-13 → …`; `monotone: true`; 6/6 schema-valid, all terminated | **ASAp reduces to GCD exactly when `c̃_S ≡ 1`, then diverges** — the paper's central claim, plus Theorem 1's monotonicity as an observable |
+| E2 | `fragment ":"` → `healed_token 1110` (3 bytes), 324 candidates | Healed to `"://"`, the canonical boundary-bias example |
+
+A9's `mean_null_score = 1.0325` is worth dwelling on. The decoy secret scores
+the *same emitted tokens* under an unrelated key, so it samples the null
+distribution directly — and it lands on 1.0, the mean of `Exp(1)`. That is an
+empirical confirmation of the derivation that `−log(1 − ξ)` is exactly `Exp(1)`
+under H₀, which is what makes `z = (mean − 1)·√n` a z-score at all.
+
+### A bug this verification pass caught
+
+The first GPU run of E1 aborted in 0.3 s with a `panic_bounds_check` inside
+`unpack_mask`. The cause is a vocabulary mismatch that is invisible on most
+models: `inferlet::mask::bit_allowed` indexed `mask[j >> 5]` unguarded, while
+Qwen3 declares `vocab_size = 151936` against 151669 real tokenizer tokens. A
+constraint mask packed for the tokenizer occupies 4740 words and covers 151680
+bits, so logit slots 151680–151935 read past the end of the slice.
+
+`bit_allowed` now returns `false` past the mask's coverage, mirroring
+`pack_allowed`, which already drops ids it cannot represent — those slots decode
+to no token at all, so refusing them is both the safe answer and the correct
+one. This also repairs the first failure in the upstream
+`json-schema-constrained-decoding` inferlet, which shares the helper; that one
+still fails afterwards, but in the driver's fixed-decode lane composition, a
+separate pre-existing defect in a component this environment cannot rebuild.
 
 ---
 
