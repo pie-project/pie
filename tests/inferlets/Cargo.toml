@@ -15,6 +15,7 @@ members = [
     "locally-typical-sampling",
     "mirostat-v2-sampling",
     "mtp-speculative-decoding",
+    "naive-baseline",
     "prefix-tree-kv-cache",
     "repetition-penalty",
     "dry-repetition-penalty",

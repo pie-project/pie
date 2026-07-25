@@ -877,6 +877,106 @@ separate pre-existing defect in a component this environment cannot rebuild.
 
 ---
 
+## Runtime cost
+
+Faithfulness says nothing about price. Every inferlet below was timed against
+`naive-baseline`, a control written for this measurement: the *identical*
+skeleton — one N-wide prefill fire, a 1-wide device-carried decode loop kept
+`DEFAULT_RUNAHEAD_DEPTH` fires ahead of the host drain — whose epilogue does
+nothing but temperature-scale the logits and draw a Gumbel-max sample. Whatever
+an algorithm inferlet costs above that number is the algorithm.
+
+Cost is measured as a two-point regression rather than a throughput figure.
+Each configuration runs at a 32- and a 160-token budget, seven repetitions
+each after a discarded warm-up, and the *marginal* per-token cost is the slope
+
+```
+per_token_ms = (median_t(160) − median_t(32)) / 128
+```
+
+Differencing cancels install, JIT, prefill and teardown, which are identical at
+both points; the intercept recovers them. Medians rather than minima, because
+one inferlet (A10) turned out to be bimodal and a minimum would have reported
+its lucky mode. All fifteen configurations below ran in a single server session
+on one NVIDIA L40S with `Qwen/Qwen3-0.6B` (`vocab = 262144`), so the ratios are
+directly comparable; the absolute baseline drifts about ±10 % between sessions.
+
+| Inferlet | ms/token | × naive | Dominant cost |
+|---|---|---|---|
+| E2 `token-healing` | 2.48 | 0.75× | Greedy `reduce_argmax` — no noise tensor at all |
+| A9 `gumbel-watermark` | 2.78 | 0.84× | Free; see the note on `gumbel_max` below |
+| **`naive-baseline`** | **3.30** | **1.00×** | — |
+| A8 `entropy-adaptive-temperature` | 3.53 | 1.07× | One entropy reduction + a scalar power |
+| `naive-baseline` + 2 stat channels | 3.61 | 1.09× | The instrumentation, priced separately |
+| A4 `top-a-sampling` | 3.81 | 1.15× | One `ReduceMax`, one compare — no sort |
+| A2 `eta-epsilon-sampling` | 4.31 | 1.31× | Entropy + two elementwise passes |
+| A5 `xtc-sampling` | 4.48 | 1.36× | Threshold scan + Bernoulli gate |
+| A6 `repetition-penalty` | 4.89 | 1.48× | Scatter over the seen-token vector |
+| A7 `dry-repetition-penalty` | 7.08 | 2.15× | 8-deep n-gram match, unrolled on device |
+| D2 `context-aware-decoding` | 13.12 | 3.98× | **Two forward passes, serialized** |
+| D1 `classifier-free-guidance` | 13.87 | 4.21× | **Two forward passes, serialized** |
+| A3 `tail-free-sampling` | 17.47 | 5.30× | `top_k(k_max=128)` over a 262144 vocab |
+| A1 `locally-typical-sampling` | 17.71 | 5.37× | `top_k(k_max=128)` over a 262144 vocab |
+| A10 `synthid-tournament-sampling` | 33.55 | 10.2× | Nine knockout rounds per token |
+
+Three structural observations fall out of this table.
+
+**The overhead is entirely marginal, never fixed.** Intercepts land between 87
+and 165 ms for every configuration including the baseline — that is install plus
+prefill, and no inferlet carries a heavy one-time setup. Cost scales with tokens
+generated, so it is predictable and it never surprises a short request.
+
+**The 5× cliff is `top_k`, not the algorithm.** A1 and A3 are the only two
+samplers that need a ranking, and they pay for it identically (17.7 and 17.5
+ms/token) despite computing entirely different statistics. The tier-0
+`k_topk_rows` kernel is an incremental-threshold selection that rescans the row
+once per pick, so it costs `O(k·vocab)` — 33.5 M element visits per token at
+`k_max = 128` and this model's 262144-token vocabulary. `k_max` is therefore a
+performance knob with teeth, and A4's sort-free design is why it sits at 1.15×
+while doing comparable work.
+
+**D1/D2's 4× is two effects, not one.** Both score every token under two
+prompts, which is 2× the forward-pass work by construction. The other 2× is lost
+pipelining: the next input depends on the *combined* output of both passes, so
+neither inferlet may run ahead, and the run-ahead window that hides host latency
+for every other entry in this table is unavailable to them. This is inherent to
+contrastive decoding, not an artefact of the implementation.
+
+### A9 costs less than sampling nothing
+
+The watermark landing *below* the control is not noise. `gumbel-watermark`
+carries a controlled experiment inside it: with `watermark = true` it samples
+via `reduce_argmax(add(scaled, gumbel(keyed, [vocab])))`, and with
+`watermark = false` it falls through to the fused `gumbel_max(scaled, state)` —
+same inferlet, same channels, same two extra `gumbel` tensors for the detector
+statistic, one op different.
+
+| Sampling op | ms/token |
+|---|---|
+| `gumbel(...)` + `reduce_argmax` (decomposed) | 2.85 |
+| `gumbel_max(...)` (fused) | 3.60 |
+| `naive-baseline`, also fused | 3.51 |
+
+The fused `gumbel_max` is **27 % slower** than spelling the same computation out
+in two ops. A9 spells it out because the detector needs the noise tensor itself,
+not just the argmax — and inherits the faster path as a side effect. The
+watermark's true cost, measured against the decomposed form, is *zero*, which is
+the practical counterpart of its distortion-freeness: it changes neither the
+distribution nor the runtime.
+
+### A10 is bimodal
+
+`synthid-tournament-sampling` at a 160-token budget returned 1.50, 1.55 and
+6.19 s across sessions — two clearly separated modes, roughly 4× apart, with no
+input difference. The 33.55 ms/token above is the median of seven consecutive
+runs in the slow mode and should be read as an upper bound. The fast mode's
+slope is ≈2.4 ms/token. Nine sequential knockout rounds make this the deepest
+epilogue in the set, and the split most likely reflects a driver-side scheduling
+or pool interaction rather than the algorithm; the engine cannot be rebuilt in
+this environment, so the cause was not chased further.
+
+---
+
 ## Citations
 
 - **Title:** Locally Typical Sampling
