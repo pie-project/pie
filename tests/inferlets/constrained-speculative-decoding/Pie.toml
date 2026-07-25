@@ -1,0 +1,15 @@
+[package]
+name = "constrained-speculative-decoding"
+version = "0.1.0"
+description = "JSON-Schema constrained decoding composed with speculative drafting"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", optional = true, description = "Description of the JSON value to generate"}
+schema = {type = "string", optional = true, description = "JSON Schema used to constrain generation"}
+max_tokens = {type = "int", optional = true, description = "Maximum generated tokens (default: 256)"}
+draft_length = {type = "int", optional = true, description = "Tokens proposed per verification; 0 disables speculation (default: 4)"}
+max_ngram = {type = "int", optional = true, description = "Longest suffix the prompt-lookup drafter matches (default: 8)"}

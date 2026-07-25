@@ -144,6 +144,63 @@ async def test_cacheback_speculative_decoding(client, args):
         )
 
 
+async def test_constrained_speculative_decoding(client, args):
+    """Grammar constraints and speculation must compose without changing output.
+
+    Verification is greedy *and* grammar-masked at every readout row, so a draft
+    token survives only when it is what the target model would have produced
+    anyway under that row's mask. Speculation is therefore a pure latency
+    optimization on top of constrained decoding.
+
+    `draft_length=0` short-circuits the drafter and decodes sequentially through
+    the identical prompt, schema and `verify()` call, which makes it an exact
+    control. A divergence means the per-row masks are misaligned with the
+    positions they gate, or that rejected draft KV is leaking forward.
+
+    The inferlet also asserts internally, on every step, that rolling the
+    grammar back over a drafted window restores the exact state a `fork()` taken
+    beforehand reports. That check reaching a nonzero count here is the
+    end-to-end evidence that the matcher's fork/rollback ABI works through wasm.
+    """
+    # The inferlet's default prompt and schema are used verbatim: how far the
+    # model runs before closing the document is prompt-sensitive, and the test
+    # needs both arms to reach termination rather than the token cap.
+    base = {"max_tokens": 256, "max_ngram": 4}
+    sequential = await _report(
+        client, args, "constrained-speculative-decoding", {**base, "draft_length": 0}
+    )
+    speculative = await _report(
+        client, args, "constrained-speculative-decoding", {**base, "draft_length": 4}
+    )
+
+    # Both arms must have produced schema-valid JSON (the inferlet parses it
+    # before returning, so reaching here already proves that) ...
+    json.loads(sequential["text"])
+    json.loads(speculative["text"])
+
+    # ... and both must have exercised the fork/rollback invariant check.
+    assert sequential["rollback_checks"] > 0, sequential
+    assert speculative["rollback_checks"] > 0, speculative
+
+    # With no draft, every generated token costs exactly one forward pass.
+    assert sequential["drafted"] == 0, sequential
+    assert sequential["verification_steps"] == sequential["count"], sequential
+
+    # The comparison is only meaningful if speculation fired and was rejected.
+    rejected = speculative["drafted"] - speculative["accepted"]
+    assert speculative["accepted"] > 0, "no draft token was ever accepted"
+    assert rejected > 0, "no draft was ever rejected; the reject path is untested"
+    assert speculative["verification_steps"] < sequential["verification_steps"], (
+        "speculation ran no fewer forward passes than sequential decoding"
+    )
+
+    assert speculative["tokens"] == sequential["tokens"], (
+        "speculation changed the constrained output:\n"
+        f"  sequential  = {sequential['tokens']}\n"
+        f"  speculative = {speculative['tokens']}"
+    )
+
+
 async def test_mirostat_v2_sampling(client, args):
     output = await _nonempty(client, args, "mirostat-v2-sampling", {"max_tokens": 4})
     assert "mirostat-v2" in output
@@ -339,6 +396,7 @@ def tests():
         test_sliding_window_attention,
         test_prefix_tree_kv_cache,
         test_cacheback_speculative_decoding,
+        test_constrained_speculative_decoding,
         test_mirostat_v2_sampling,
         test_beam_search,
         test_contrastive_decoding,
