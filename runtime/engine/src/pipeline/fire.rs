@@ -806,9 +806,9 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // Device-geometry pass (Track B): the [B,P] geometry is
         // device-produced (the program traces the wire form in-graph) and
         // the driver resolves it pre-forward, so this pass leases physical
-        // pages + fires solo/prebuilt via `map_geometry_relaxed` — but it
-        // RUNS AHEAD like any pass (the FIFO carries it; NOT synchronous like
-        // the deleted host-replay beam branch).
+        // pages and fires prebuilt — but it RUNS AHEAD like any pass (the
+        // FIFO carries it; NOT synchronous like the deleted host-replay beam
+        // branch).
         if ctx.resources().get(&fwd)?.devgeo.is_some() {
             return fire_device_geometry(ctx, this, fwd, frame).await;
         }
@@ -1817,9 +1817,10 @@ fn reclaim_pending_device_grant<C: FireContext>(ctx: &mut C, fwd: &Resource<Forw
 /// live pages in-graph) and the driver resolves it pre-forward, so the host
 /// neither replays the epilogue arithmetic nor projects per-lane KV. The
 /// runtime leases `B` fresh physical pages, delivers them to the program as a
-/// host-put on the `fresh` channel, marks the fire solo/prebuilt via
-/// `map_geometry_relaxed` (wire fields empty), and fires it RUN-AHEAD onto the
-/// pipeline FIFO (unlike the deleted synchronous host-replay beam branch).
+/// host-put on the `fresh` channel, submits the fire prebuilt (the host wire
+/// geometry stays empty — `geometry::map_geometry_evaluated` maps what the
+/// driver resolved), and fires it RUN-AHEAD onto the pipeline FIFO (unlike
+/// the deleted synchronous host-replay beam branch).
 /// The per-fire arena/write txns ride the `PendingFire`; `finalize_op`
 /// commits/aborts them and reclaims continuing heirs' unused grants (w_cont).
 async fn fire_device_geometry<C: FireContext>(

@@ -191,28 +191,15 @@ async fn materialize_channel(
 ) -> Anyhow<Result<Vec<u8>, String>> {
     let mut settle_ready_take = true;
     loop {
-        let state = accessor.with(|mut access| {
-            poll_channel(
-                access.get(),
-                &this,
-                mode,
-                false,
-                settle_ready_take,
-            )
-        })?;
+        let state = accessor
+            .with(|mut access| poll_channel(access.get(), &this, mode, false, settle_ready_take))?;
         let state = match state {
             ChannelPoll::Pending {
                 fires: Some(fires), ..
             } => {
                 let _finalize_guard = fires.finalize_guard().await;
                 let state = accessor.with(|mut access| {
-                    poll_channel(
-                        access.get(),
-                        &this,
-                        mode,
-                        true,
-                        settle_ready_take,
-                    )
+                    poll_channel(access.get(), &this, mode, true, settle_ready_take)
                 })?;
                 match state {
                     ChannelPoll::Finalize(op) => {
@@ -932,15 +919,10 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
                 bound_instance,
                 scheduler,
                 cells,
-                channel_ids,
                 channel_reps,
                 fires: None,
                 kv_ws: ws_rep,
-                kv_declaration: crate::pipeline::instance::KvDeclaration {
-                    ws_rep,
-                    readable,
-                    writable,
-                },
+                kv_declaration: crate::pipeline::instance::KvDeclaration { readable, writable },
                 rs_ws: rs_reps,
                 kv_declaration_realized: false,
                 failed: None,
@@ -1102,7 +1084,6 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
         }
         Ok(())
     }
-
 }
 
 #[cfg(test)]

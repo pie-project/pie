@@ -19,21 +19,22 @@
 //! [`model_profile`] builds the bind-time [`ModelProfile`] from the loaded
 //! model: program-registration input, not fire-time glue.
 //!
-//! Complete pipeline domain API: some methods here (relaxed geometry
-//! variants, per-channel introspection, the pure `instantiate`/registry
-//! probe entry points, device-geometry lease internals) are not yet
-//! called by the current single-model/mock-driver fire path, but are
-//! exercised by this module's own unit tests and reserved for upcoming
-//! wiring (multi-pass channels, device-geometry beams) — kept rather
-//! than deleted, allowed rather than silently masked.
-#![allow(dead_code)]
+//! The registry probes ([`Registry::lookup`]/[`Registry::len`], the free
+//! [`lookup`]) and [`RegisteredProgram::stage_signature`] are `#[cfg(test)]`:
+//! production carries the `Arc<RegisteredProgram>` that [`register`] returns
+//! rather than probing by hash. [`Pricing`] is the one thing computed on the
+//! production path with no production consumer yet — thrust-2 capacity
+//! accounting is unwired — so it carries an annotated `allow` instead of a
+//! blanket module-level one.
 
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use lru::LruCache;
-use pie_ptir::compiler::{CompiledStage, StageSignature};
+use pie_ptir::compiler::CompiledStage;
+#[cfg(test)]
+use pie_ptir::compiler::StageSignature;
 use pie_ptir::container::{self, ContainerDecodeError, PortSource, TraceContainer};
 use pie_ptir::container_hash;
 use pie_ptir::op::Op;
@@ -50,8 +51,6 @@ pub struct Pricing {
     pub channel_bytes: u64,
     /// Number of declared channels.
     pub num_channels: usize,
-    /// Number of stage programs.
-    pub num_stages: usize,
     /// Read-out row count (from the `embed` indptr lanes, else 1) — the sampling
     /// row count thrust-2 prices the fire on.
     pub rows: u32,
@@ -67,6 +66,10 @@ pub struct RegisteredProgram {
     /// The validated, typed artifact (types, readiness, §7.1 classes).
     pub bound: BoundTrace,
     /// Compiler-owned normalized stages, signatures, and region partitions.
+    /// Retained from the compile so [`Self::stage_signature`] can probe it;
+    /// the driver reads the same information out of [`Self::sidecar`], so
+    /// production never reads this field.
+    #[allow(dead_code)]
     pub compiled_stages: Vec<CompiledStage>,
     /// Dense-channel `(consume, publish)` mask, derived once from immutable IR.
     pub channel_accesses: Vec<(bool, bool)>,
@@ -75,11 +78,18 @@ pub struct RegisteredProgram {
     /// (seed-independent, hash-keyed; its inner `container_hash` == [`Self::hash`],
     /// which the driver asserts). Charlie's `bound.hpp` reads exactly this.
     pub sidecar: Vec<u8>,
-    /// Registration-time pricing.
+    /// Registration-time pricing. Computed by [`price`] on every register,
+    /// but nothing consumes it yet (thrust-2 capacity accounting is
+    /// unwired) — the `allow` marks that gap rather than hiding it.
+    #[allow(dead_code)]
     pub pricing: Pricing,
 }
 
 impl RegisteredProgram {
+    /// Per-stage signature lookup — asserted by this module's sidecar
+    /// round-trip test; production reads the signatures through the sidecar
+    /// the driver receives.
+    #[cfg(test)]
     pub fn stage_signature(&self, stage: pie_ptir::registry::Stage) -> Option<&StageSignature> {
         self.compiled_stages
             .iter()
@@ -194,15 +204,14 @@ impl Registry {
     }
 
     /// Probe by identity hash (a hit bumps LRU recency).
+    #[cfg(test)]
     pub fn lookup(&mut self, hash: u64) -> Option<Arc<RegisteredProgram>> {
         self.inner.get(&hash).cloned()
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.inner.len()
-    }
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
     }
 }
 
@@ -235,7 +244,6 @@ fn price(c: &TraceContainer) -> Pricing {
     Pricing {
         channel_bytes,
         num_channels: c.channels.len(),
-        num_stages: c.stages.len(),
         rows,
     }
 }
@@ -264,7 +272,10 @@ pub fn register(
     global().register(bytes, profile)
 }
 
-/// Probe the process-wide registry by identity hash.
+/// Probe the process-wide registry by identity hash. Only the `#[cfg(test)]`
+/// `instance::instantiate` path probes by hash; production carries the
+/// `Arc<RegisteredProgram>` from `register`.
+#[cfg(test)]
 pub fn lookup(hash: u64) -> Option<Arc<RegisteredProgram>> {
     global().lookup(hash)
 }
