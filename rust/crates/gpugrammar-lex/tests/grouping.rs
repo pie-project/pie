@@ -153,3 +153,39 @@ fn scanning_is_total_over_every_state() {
         let _ = lexer.scan(b"x", LexState(state as u32));
     }
 }
+
+#[test]
+fn a_codepoint_split_across_tokens_is_scannable() {
+    // Byte-level BPE vocabularies contain pieces that are only part of a UTF-8
+    // sequence. Character classes compile to UTF-8 byte paths, so the halves
+    // must meet in an intermediate lexer state rather than being rejected.
+    let lexer = lexer_from_rules(JSON_LEXER, ORDER);
+    let inside = lexer.scan(b"\"", START).unwrap().next_state;
+
+    let snowman = "☃".as_bytes();
+    assert_eq!(snowman.len(), 3);
+
+    // The whole codepoint in one token stays inside the string.
+    let whole = lexer.scan(snowman, inside).expect("whole codepoint");
+    assert!(whole.terminals.is_empty());
+
+    // Split after the lead byte: the first half must land in a state that the
+    // second half can continue from.
+    let first = lexer.scan(&snowman[..1], inside).expect("lead byte");
+    assert_ne!(first.next_state, inside);
+    let second = lexer
+        .scan(&snowman[1..], first.next_state)
+        .expect("continuation bytes");
+    assert_eq!(second.next_state, whole.next_state);
+}
+
+#[test]
+fn a_bare_continuation_byte_is_only_legal_mid_codepoint() {
+    let lexer = lexer_from_rules(JSON_LEXER, ORDER);
+    let inside = lexer.scan(b"\"", START).unwrap().next_state;
+    let snowman = "☃".as_bytes();
+
+    assert!(lexer.scan(&snowman[1..2], inside).is_none());
+    let first = lexer.scan(&snowman[..1], inside).unwrap();
+    assert!(lexer.scan(&snowman[1..2], first.next_state).is_some());
+}
