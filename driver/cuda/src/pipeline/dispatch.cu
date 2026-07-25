@@ -1809,27 +1809,6 @@ enum class HostPublishTransport {
 // engine wins and the work goes back to DMA.
 constexpr std::size_t kMaxScatterCellBytes = 4096;
 
-// Diagnostic override, read once: `PIE_CUDA_HOST_PUBLISH=sequential|batched`
-// pins every wave to one transport so a single build can A/B them. Anything
-// else (including unset) leaves the policy below in charge.
-HostPublishTransport* host_publish_override() {
-    static HostPublishTransport storage{};
-    static HostPublishTransport* value = [] () -> HostPublishTransport* {
-        const char* setting = std::getenv("PIE_CUDA_HOST_PUBLISH");
-        if (setting == nullptr) return nullptr;
-        if (std::strcmp(setting, "sequential") == 0) {
-            storage = HostPublishTransport::Sequential;
-            return &storage;
-        }
-        if (std::strcmp(setting, "batched") == 0) {
-            storage = HostPublishTransport::Batched;
-            return &storage;
-        }
-        return nullptr;
-    }();
-    return value;
-}
-
 HostPublishTransport select_host_publish_transport(
     NotifyContext& context,
     cudaStream_t batch_stream) {
@@ -1840,24 +1819,16 @@ HostPublishTransport select_host_publish_transport(
     if (host_publish_destinations_overlap(context)) {
         return HostPublishTransport::Sequential;
     }
-    const bool batch_available =
-#if CUDART_VERSION >= 12080
-        batch_stream != nullptr;
-#else
-        (static_cast<void>(batch_stream), false);
-#endif
-    if (const HostPublishTransport* forced = host_publish_override()) {
-        if (*forced != HostPublishTransport::Batched || batch_available) {
-            return *forced;
-        }
-        return HostPublishTransport::Sequential;
-    }
     const bool cells_are_small = std::all_of(
         context.copy_sizes.begin(),
         context.copy_sizes.end(),
         [](std::size_t bytes) { return bytes <= kMaxScatterCellBytes; });
     if (cells_are_small) return HostPublishTransport::Scatter;
-    if (batch_available) return HostPublishTransport::Batched;
+#if CUDART_VERSION >= 12080
+    if (batch_stream != nullptr) return HostPublishTransport::Batched;
+#else
+    static_cast<void>(batch_stream);
+#endif
     return HostPublishTransport::Sequential;
 }
 
@@ -2678,7 +2649,14 @@ void wait_bound_instance_quiescent(
 
 void ensure_instance_reaper(Dispatch::Impl& s) {
     if (s.instance_reaper.joinable()) return;
-    s.instance_reaper = std::thread([&s]() {
+    // The reaper waits on CUDA events, and CUDA's current device is
+    // thread-local. Capture the device of whichever rank is starting the
+    // thread; a fresh thread would otherwise default to device 0 and, under
+    // TP, synchronize the wrong context.
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    s.instance_reaper = std::thread([&s, device]() {
+        CUDA_CHECK(cudaSetDevice(device));
         for (;;) {
             Dispatch::Impl::InstanceReapItem item;
             {

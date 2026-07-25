@@ -103,14 +103,40 @@ std::size_t cublaslt_bf16_workspace_bytes() {
     return bytes;
 }
 
+// Lazily-created singleton keyed by the CALLING THREAD'S CURRENT DEVICE.
+//
+// Tensor parallelism runs every rank inside this one process, each bound to
+// its own device. A plain process-global would therefore hand rank 1 state
+// that belongs to rank 0's device: cuBLASLt would run both ranks' matmuls
+// against a single scratch buffer (a live data race), and any algorithm that
+// zeroes its workspace bakes a memset of that foreign pointer into the
+// captured decode graph, which makes `cudaGraphInstantiate` reject the graph
+// on every rank but rank 0.
+template <typename T>
+T& per_device_singleton() {
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    thread_local int cached_device = -1;
+    thread_local T* cached = nullptr;
+    if (cached != nullptr && cached_device == device) return *cached;
+
+    static std::mutex mu;
+    static std::unordered_map<int, std::unique_ptr<T>> by_device;
+    std::lock_guard<std::mutex> lock(mu);
+    auto& slot = by_device[device];
+    if (!slot) slot = std::make_unique<T>();
+    cached = slot.get();
+    cached_device = device;
+    return *cached;
+}
+
 struct Bf16LtCtx {
     cublasLtHandle_t handle = nullptr;
     void* workspace = nullptr;
     std::size_t workspace_bytes = cublaslt_bf16_workspace_bytes();
 
     static Bf16LtCtx& instance() {
-        static Bf16LtCtx ctx;
-        return ctx;
+        return per_device_singleton<Bf16LtCtx>();
     }
 
     void ensure() {
@@ -164,9 +190,10 @@ struct Bf16LtPlanCache {
     std::unordered_map<Bf16LtKey, std::shared_ptr<Bf16LtPlan>, Bf16LtKeyHash>
         plans;
 
+    // Per device: a cached `cublasLtMatmulAlgo_t` is selected by heuristics
+    // for one handle on one device and must not be replayed on another.
     static Bf16LtPlanCache& instance() {
-        static Bf16LtPlanCache cache;
-        return cache;
+        return per_device_singleton<Bf16LtPlanCache>();
     }
 };
 
@@ -925,50 +952,58 @@ struct LtMatmulPref {
 };
 
 #ifdef PIE_CUDA_HAS_MARLIN
-// Per-process marlin workspace. Marlin's split-K reduce uses one int32
+// Per-DEVICE marlin workspace. Marlin's split-K reduce uses one int32
 // per SM as a barrier counter; we allocate generously (16 KiB) to cover
 // every realistic SM count without per-call allocation. Lazy-init on
-// first INT4_PACKED dispatch.
+// first INT4_PACKED dispatch. Keyed by device so an in-process TP rank
+// never barriers through another rank's memory.
+struct MarlinWorkspace {
+    void* ptr = nullptr;
+    std::size_t bytes = 0;
+};
+struct MarlinBarrierWs : MarlinWorkspace {};
+struct MarlinReduceWs : MarlinWorkspace {};
+struct MarlinResidualWs : MarlinWorkspace {};
+
 void* marlin_workspace_() {
-    static void* ws = nullptr;
-    static const std::size_t ws_bytes = 16 * 1024;
-    if (!ws) {
-        if (cudaMalloc(&ws, ws_bytes) != cudaSuccess) {
+    auto& ws = per_device_singleton<MarlinBarrierWs>();
+    if (!ws.ptr) {
+        ws.bytes = 16 * 1024;
+        if (cudaMalloc(&ws.ptr, ws.bytes) != cudaSuccess) {
             throw std::runtime_error("marlin: cudaMalloc workspace failed");
         }
-        cudaMemset(ws, 0, ws_bytes);
+        cudaMemset(ws.ptr, 0, ws.bytes);
     }
-    return ws;
+    return ws.ptr;
 }
 
 void* marlin_fp32_reduce_scratch_() {
-    static void* ws = nullptr;
-    static const std::size_t ws_bytes = 32 * 1024 * 1024;
-    if (!ws) {
-        if (cudaMalloc(&ws, ws_bytes) != cudaSuccess) {
+    auto& ws = per_device_singleton<MarlinReduceWs>();
+    if (!ws.ptr) {
+        ws.bytes = 32 * 1024 * 1024;
+        if (cudaMalloc(&ws.ptr, ws.bytes) != cudaSuccess) {
             throw std::runtime_error(
                 "marlin: cudaMalloc fp32 reduce scratch failed");
         }
     }
-    return ws;
+    return ws.ptr;
 }
 
-// Per-process bf16 residual scratch — used when the INT4 dispatcher is
+// Per-device bf16 residual scratch — used when the INT4 dispatcher is
 // called with beta=1 (the residual-add fusion the bf16/fp8 paths handle
 // natively via cuBLAS's beta param). Marlin overwrites C, so we run it
 // into a scratch and add into y in a second pass. Grows monotonically.
 void* marlin_residual_scratch_(std::size_t bytes) {
-    static void* buf = nullptr;
-    static std::size_t buf_bytes = 0;
-    if (bytes <= buf_bytes) return buf;
-    if (buf) cudaFree(buf);
-    if (cudaMalloc(&buf, bytes) != cudaSuccess) {
+    auto& ws = per_device_singleton<MarlinResidualWs>();
+    if (bytes <= ws.bytes) return ws.ptr;
+    if (ws.ptr) cudaFree(ws.ptr);
+    if (cudaMalloc(&ws.ptr, bytes) != cudaSuccess) {
         throw std::runtime_error(
             "marlin: cudaMalloc residual scratch failed (" +
             std::to_string(bytes) + " bytes)");
     }
-    buf_bytes = bytes;
-    return buf;
+    ws.bytes = bytes;
+    return ws.ptr;
 }
 #endif
 

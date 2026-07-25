@@ -338,6 +338,15 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument(
+        "--warmup-seconds",
+        type=float,
+        default=0.0,
+        help="Keep repeating the warmup set until this much wall time has "
+             "elapsed, on top of --warmup. Off by default: on this hardware "
+             "the run-to-run spread came from CPU pinning, not from a short "
+             "warmup, and a longer warmup did not reduce it.",
+    )
+    p.add_argument(
         "--warmup-max-tokens",
         type=int,
         default=None,
@@ -389,6 +398,72 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
              "WASM work — useful for measuring the wall-clock benefit "
              "of async chain firing on W>0 workloads. Default 0.",
     )
+
+
+def gpu_clock_state() -> list[dict[str, Any]]:
+    """Per-GPU SM clock and utilization, or [] when nvidia-smi is unavailable.
+
+    Recorded on both sides of the measured window so a run that executed at
+    a partially-ramped clock is visible in the result instead of silently
+    reading low.
+    """
+    try:
+        out = subprocess.run(
+            ["nvidia-smi",
+             "--query-gpu=index,clocks.sm,clocks.max.sm,utilization.gpu",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5, check=True).stdout
+    except Exception:
+        return []
+    state = []
+    for line in out.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) != 4:
+            continue
+        try:
+            state.append({
+                "index": int(parts[0]),
+                "sm_mhz": int(parts[1]),
+                "sm_max_mhz": int(parts[2]),
+                "util_pct": int(parts[3]),
+            })
+        except ValueError:
+            continue
+    return state
+
+
+async def run_timed_warmup(run_once, seconds: float, label: str = "pie") -> int:
+    """Repeat `run_once()` until `seconds` of wall time have elapsed.
+
+    Returns the number of extra passes performed. `run_once` is an async
+    callable that issues one full warmup set. Disabled (0) by default.
+    """
+    if seconds <= 0:
+        return 0
+    import time as _time
+    start = _time.monotonic()
+    passes = 0
+    while _time.monotonic() - start < seconds:
+        await run_once()
+        passes += 1
+    print(f"[{label}-bench] warmup: {passes} extra pass(es) over "
+          f"{_time.monotonic() - start:.1f}s", flush=True)
+    return passes
+
+
+def run_timed_warmup_sync(run_once, seconds: float, label: str = "vllm") -> int:
+    """Blocking counterpart of `run_timed_warmup`."""
+    if seconds <= 0:
+        return 0
+    import time as _time
+    start = _time.monotonic()
+    passes = 0
+    while _time.monotonic() - start < seconds:
+        run_once()
+        passes += 1
+    print(f"[{label}-bench] warmup: {passes} extra pass(es) over "
+          f"{_time.monotonic() - start:.1f}s", flush=True)
+    return passes
 
 
 def _filler_words(count: int) -> str:
@@ -565,8 +640,27 @@ def _format_cpu_list(cpus: set[int]) -> str:
     return ",".join(ranges)
 
 
+def _numa_node_cpus(node: int) -> set[int]:
+    try:
+        text = Path(
+            f"/sys/devices/system/node/node{node}/cpulist").read_text()
+    except OSError:
+        return set()
+    return _parse_cpu_list(text.strip())
+
+
 def gpu_local_cpu_affinity(gpu_ids: list[int]) -> set[int]:
-    """Return the union of CPU-affinity masks reported by `nvidia-smi topo -m`."""
+    """CPUs local to `gpu_ids`, preferring the GPU's whole NUMA node.
+
+    `nvidia-smi topo -m` has a "CPU Affinity" column, but on some hosts it
+    reports only a handful of cores (six, on a 64-core-per-node Xeon) while the
+    GPU's actual NUMA node holds far more. Pinning the whole benchmark — client,
+    engine, tokio workers and every concurrent inferlet — onto that short list
+    starves the host-side loop and leaves the GPU idle between batches: measured
+    here as a 1.8x drop in median throughput and a 2.1x run-to-run spread versus
+    the same run unpinned. So prefer the NUMA node's full CPU list and fall back
+    to the topology column only when the node is unknown.
+    """
     if not gpu_ids:
         return set()
     try:
@@ -584,14 +678,26 @@ def gpu_local_cpu_affinity(gpu_ids: list[int]) -> set[int]:
     header = lines[0].split()
     gpu_cols = sum(1 for tok in header if re.fullmatch(r"(?:GPU|NIC)\d+", tok))
     affinity_by_gpu: dict[int, set[int]] = {}
+    numa_by_gpu: dict[int, int] = {}
     for line in lines[1:]:
         toks = line.split()
         if len(toks) <= gpu_cols + 1 or not re.fullmatch(r"GPU\d+", toks[0]):
             continue
-        affinity_by_gpu[int(toks[0][3:])] = _parse_cpu_list(toks[1 + gpu_cols])
+        gpu = int(toks[0][3:])
+        affinity_by_gpu[gpu] = _parse_cpu_list(toks[1 + gpu_cols])
+        if len(toks) > gpu_cols + 2:
+            try:
+                numa_by_gpu[gpu] = int(toks[2 + gpu_cols])
+            except ValueError:
+                pass
     cpus: set[int] = set()
     for gpu in gpu_ids:
-        cpus.update(affinity_by_gpu.get(gpu, set()))
+        node = numa_by_gpu.get(gpu)
+        node_cpus = _numa_node_cpus(node) if node is not None else set()
+        cpus.update(node_cpus or affinity_by_gpu.get(gpu, set()))
+    # Never widen past what this process is actually allowed to run on.
+    if hasattr(os, "sched_getaffinity"):
+        cpus &= set(os.sched_getaffinity(0))
     return cpus
 
 

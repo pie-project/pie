@@ -16,6 +16,7 @@ CustomAllReduce::CustomAllReduce() = default;
 
 CustomAllReduce::CustomAllReduce(NcclComm& comm,
                                  bool /*same_process*/,
+                                 std::vector<int> /*group_devices*/,
                                  std::size_t /*max_bytes*/,
                                  std::size_t /*rank_data_bytes*/,
                                  int /*fusion_max_tokens*/,

@@ -23,11 +23,13 @@ from common import (
     cuda_profiler_start,
     cuda_profiler_stop,
     finish,
+    gpu_clock_state,
     hf_chat_token_ids_and_counts,
     make_prompts,
     maybe_set_cpu_affinity,
     request_max_tokens,
     resolve_local_model,
+    run_timed_warmup,
     summarize,
     visible_cuda_devices,
 )
@@ -346,6 +348,7 @@ def build_config(args: argparse.Namespace):
         config_blob["speculation depth"] = args.speculation_depth
     if args.warmup_max_tokens is not None:
         config_blob["warmup max tokens"] = args.warmup_max_tokens
+    config_blob["warmup seconds"] = args.warmup_seconds
     return cfg, config_blob
 
 
@@ -845,11 +848,19 @@ async def run(args: argparse.Namespace):
 
         if args.warmup:
             warmup_max_tokens = args.warmup_max_tokens or args.max_tokens
-            if args.mode == "tput":
-                await many(range(args.warmup), max_tokens=warmup_max_tokens)
-            else:
-                for i in range(args.warmup):
-                    await one(i, max_tokens=warmup_max_tokens)
+
+            async def warmup_pass() -> None:
+                if args.mode == "tput":
+                    await many(range(args.warmup), max_tokens=warmup_max_tokens)
+                else:
+                    for i in range(args.warmup):
+                        await one(i, max_tokens=warmup_max_tokens)
+
+            await warmup_pass()
+            # Optional duration-based extension of the warmup (off by
+            # default); see --warmup-seconds.
+            await run_timed_warmup(
+                warmup_pass, args.warmup_seconds, label="pie")
 
         start_idx = args.warmup
         # Snapshot cumulative stats after warmup so the final diff
@@ -861,6 +872,7 @@ async def run(args: argparse.Namespace):
                 pre_stats = json.loads(body)
         except Exception:
             pass
+        clocks_at_start = gpu_clock_state()
         print("[pie-bench] measured-start", flush=True)
         profiler_task = None
         if (
@@ -905,6 +917,7 @@ async def run(args: argparse.Namespace):
                     profiler_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await profiler_task
+            clocks_at_end = gpu_clock_state()
             print("[pie-bench] measured-end", flush=True)
         for result in results:
             if result.process_id is not None:
@@ -1120,6 +1133,11 @@ async def run(args: argparse.Namespace):
                 else {}
             ),
             "cpu affinity": cpu_affinity,
+            # Clock state on both edges of the measured window. A run that
+            # started mid-ramp reads far below steady state, so record it
+            # rather than let it silently skew the numbers.
+            "gpu clocks at start": clocks_at_start,
+            "gpu clocks at end": clocks_at_end,
             **engine_config,
         },
     )

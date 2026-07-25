@@ -8,7 +8,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <array>
 #include <chrono>
+#include <cstring>
+#include <cstdio>
 #include <cstdint>
 #include <iostream>
 #include <memory>
@@ -48,22 +51,108 @@ inline void cpu_relax() noexcept {
 #endif
 }
 
-void tp_cpu_gate_wait(const std::string& key,
+// Returns true when a fire epoch was consumed (or the gate is disabled, in
+// which case the follower falls through to the NCCL header broadcast).
+// Returns false when shutdown was requested — the caller must NOT post the
+// header broadcast in that case, because no peer will ever match it.
+bool tp_cpu_gate_wait(const std::string& key,
                       std::uint64_t& seen,
                       std::atomic<bool>& stop) {
-    if (key.empty()) return;
+    if (key.empty()) return true;
     auto gate = tp_cpu_gate_for(key);
     constexpr auto spin_budget = std::chrono::microseconds(2000);
     const auto start = std::chrono::steady_clock::now();
     while (!stop.load(std::memory_order_relaxed)) {
+        if (gate->stopped()) return false;
         const std::uint64_t seq = gate->published();
-        if (tp_cpu_gate_consume_one(seq, seen)) return;
+        if (tp_cpu_gate_consume_one(seq, seen)) return true;
         if (std::chrono::steady_clock::now() - start >= spin_budget) break;
         cpu_relax();
     }
+    if (stop.load(std::memory_order_relaxed)) return false;
 
-    static_cast<void>(gate->wait_one(seen, stop));
+    return gate->wait_one(seen, stop);
 }
+
+// ---------------------------------------------------------------------------
+// TP stage profiler (PIE_TP_PROFILE=1)
+//
+// The TP fan-out sits on the decode critical path, so knowing which stage of
+// it costs what is the difference between optimising and guessing. Host-side
+// wall clock per stage, accumulated per rank and dumped at process exit.
+// ---------------------------------------------------------------------------
+struct TpProfile {
+    enum Stage {
+        kGateWait = 0,
+        kWakeLatency,     // rank-0 notify -> follower observes the epoch
+        kStartSkew,       // rank-0 notify -> follower has launched its forward
+        kHeaderRecv,      // follower: header broadcast + D2H + stream sync
+        kPayloadRecv,     // follower: grouped payload broadcasts
+        kHostViews,       // follower: D2H of qo/KV layout + stream sync
+        kAttnPlan,        // follower: attention planner (host side)
+        kForwardBody,     // follower: forward launch (graph replay or eager)
+        kRootBroadcast,   // rank 0: header + payload broadcasts
+        kStageCount,
+    };
+    std::array<std::uint64_t, kStageCount> ns{};
+    std::array<std::uint64_t, kStageCount> hits{};
+
+    static bool enabled() {
+        static const bool on = [] {
+            const char* v = std::getenv("PIE_TP_PROFILE");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
+        return on;
+    }
+
+    static TpProfile& instance() {
+        static TpProfile p;
+        return p;
+    }
+
+    ~TpProfile() {
+        if (!enabled()) return;
+        static const char* names[kStageCount] = {
+            "gate_wait", "wake_latency", "start_skew", "header_recv",
+            "payload_recv", "host_views", "attn_plan", "forward_body",
+            "root_broadcast"};
+        for (int i = 0; i < kStageCount; ++i) {
+            if (hits[i] == 0) continue;
+            std::fprintf(stderr,
+                         "[tp-profile] %-15s calls=%-8llu total=%8.1f ms  "
+                         "avg=%8.1f us\n",
+                         names[i],
+                         static_cast<unsigned long long>(hits[i]),
+                         static_cast<double>(ns[i]) / 1e6,
+                         static_cast<double>(ns[i]) / 1e3 / hits[i]);
+        }
+    }
+};
+
+class TpStageTimer {
+  public:
+    explicit TpStageTimer(TpProfile::Stage stage)
+        : stage_(stage), on_(TpProfile::enabled()) {
+        if (on_) start_ = std::chrono::steady_clock::now();
+    }
+    ~TpStageTimer() { stop(); }
+
+    void stop() {
+        if (!on_ || stopped_) return;
+        stopped_ = true;
+        const auto dt = std::chrono::steady_clock::now() - start_;
+        auto& p = TpProfile::instance();
+        p.ns[stage_] += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(dt).count());
+        ++p.hits[stage_];
+    }
+
+  private:
+    TpProfile::Stage stage_;
+    bool on_;
+    bool stopped_ = false;
+    std::chrono::steady_clock::time_point start_;
+};
 
 // Broadcast header sent from rank 0 → followers before each fire's
 // per-fire payload. Followers parse it to size the subsequent broadcasts
@@ -94,8 +183,204 @@ struct TpFireHeader {
     std::int32_t rs_mode;
     std::int32_t rs_fold_lens_count;
     std::int32_t rs_buffer_ids_count;
+    // Chosen by rank 0 so both ranks always agree on how this fire's payload
+    // travels; the follower never decides for itself.
+    std::int32_t transport;
+    // Index into the cross-device event ring for this fire.
+    std::int32_t payload_slot;
 };
 static_assert(std::is_trivially_copyable_v<TpFireHeader>);
+
+// Identifiers for every persistent-input buffer that can travel in a fire's
+// payload. Both transports below are driven from ONE description keyed by
+// these ids, so an NCCL broadcast and a peer push can never disagree about
+// what a fire carries.
+enum class TpBuf : int {
+    kTokens = 0, kPositions, kRowValid, kWPage, kWOff,
+    kQoIndptr, kKvPageIndptr, kKvLastPageLens, kKvPageIndices,
+    kCustomMask, kCustomMaskIndptr,
+    kSlotIds, kIsFresh, kRsSlotFlags,
+    kRsFoldLens, kRsBufferSlotIndptr, kRsBufferSlotIds,
+    kSampleIdx,
+    kCount,
+};
+constexpr int kTpBufCount = static_cast<int>(TpBuf::kCount);
+
+enum : std::int32_t {
+    TP_TRANSPORT_NCCL = 0,
+};
+
+struct TpPayloadEntry {
+    TpBuf id;
+    void* local;         // this rank's pointer
+    std::size_t bytes;
+};
+
+void* tp_buffer_ptr(PersistentInputs& pi, TpBuf id) {
+    switch (id) {
+        case TpBuf::kTokens:             return pi.tokens.data();
+        case TpBuf::kPositions:          return pi.positions.data();
+        case TpBuf::kRowValid:           return pi.row_valid.data();
+        case TpBuf::kWPage:              return pi.w_page.data();
+        case TpBuf::kWOff:               return pi.w_off.data();
+        case TpBuf::kQoIndptr:           return pi.qo_indptr.data();
+        case TpBuf::kKvPageIndptr:       return pi.kv_page_indptr.data();
+        case TpBuf::kKvLastPageLens:     return pi.kv_last_page_lens.data();
+        case TpBuf::kKvPageIndices:      return pi.kv_page_indices.data();
+        case TpBuf::kCustomMask:         return pi.custom_mask.data();
+        case TpBuf::kCustomMaskIndptr:   return pi.custom_mask_indptr.data();
+        case TpBuf::kSlotIds:            return pi.slot_ids.data();
+        case TpBuf::kIsFresh:            return pi.is_fresh.data();
+        case TpBuf::kRsSlotFlags:        return pi.rs_slot_flags.data();
+        case TpBuf::kRsFoldLens:         return pi.rs_fold_lens.data();
+        case TpBuf::kRsBufferSlotIndptr: return pi.rs_buffer_slot_indptr.data();
+        case TpBuf::kRsBufferSlotIds:    return pi.rs_buffer_slot_ids.data();
+        case TpBuf::kSampleIdx:          return pi.sample_idx.data();
+        case TpBuf::kCount:              break;
+    }
+    return nullptr;
+}
+
+
+// ---------------------------------------------------------------------------
+// Process-shared fire mailbox
+//
+// TP ranks are threads in one process (the CPU gate already depends on that:
+// it is a process-global registry, so a cross-process follower could never be
+// notified). The fire header and the host-side CSR views the attention planner
+// needs are all host-known on rank 0, yet the follower used to obtain them by
+// broadcasting to device and copying back with a stream synchronize. That is a
+// full host-device round trip whose completion depends on rank 0's matching
+// kernel, which sits behind rank 0's entire previous decode step — so the
+// follower could never run ahead. Measured at ~2.8 ms per fire and flat across
+// batch widths.
+//
+// Passing the same bytes through shared host memory removes the round trip
+// altogether. The gate's publish/wait pair provides the ordering: `publish()`
+// stores the sequence with release semantics under its mutex and every waiter
+// loads it with acquire, so mailbox writes that precede the notify are visible
+// to the follower that observes the epoch.
+//
+// It also removes a real divergence risk: the follower used to plan attention
+// from the DEVICE-written CSRs while rank 0 planned from its host-side upper
+// bounds, so the two ranks could pick different attention kernels for the same
+// fire. Both now plan from identical values.
+// One published fire. The mailbox holds a RING of these: rank 0 runs ahead by
+// up to `PIE_SCHED_MAX_IN_FLIGHT` frames, so it can be publishing fire N+1
+// while the follower is still reading fire N. A single shared slot let the two
+// overlap and handed the follower a half-overwritten `qo_indptr`, which
+// FlashInfer's scheduler rejected ("should be non-negative") and killed the
+// follower thread — the process then stalled waiting for a rank that was gone.
+struct TpFireSlot {
+    TpFireHeader header{};
+    std::vector<std::uint32_t> qo_indptr;
+    std::vector<std::uint32_t> kv_page_indptr;
+    std::vector<std::uint32_t> kv_last_page_lens;
+    std::vector<std::uint32_t> kv_page_indices;
+};
+
+// Depth is a throughput buffer, NOT a correctness bound: `MAX_IN_FLIGHT`
+// counts FRAMES while this ring is indexed per FIRE, and one frame can carry
+// an unbounded number of steps (and one step an unbounded number of MTP
+// drafts), so rank 0 can lap any fixed depth inside a single `launch()`.
+// `tp_mailbox_reserve_slot` below enforces the invariant; this only sets how
+// far rank 0 may run ahead before it has to wait.
+constexpr std::uint64_t kTpMailboxRing = 8;
+
+struct TpFireMailbox {
+    std::array<TpFireSlot, kTpMailboxRing> slots{};
+
+    // Epochs the follower has finished READING out of the ring (it copies the
+    // header and planner views into locals before posting any collective, so
+    // it always releases a slot without needing rank 0 to progress first —
+    // that is what makes the reserve below deadlock-free).
+    std::atomic<std::uint64_t> consumed_fires{0};
+    // Set by rank 0 immediately before the gate notify; the follower diffs it
+    // on wake to separate "how long the wake took" from "how long my own work
+    // takes". Plain store/load: the gate's release/acquire pair orders it.
+    std::chrono::steady_clock::time_point notify_time{};
+    std::uint64_t fire_seq = 0;   // rank 0 only
+};
+
+// Set `PIE_TP_WATCHDOG=1` to have rank 0 report the publish/consume cursors
+// whenever they stop advancing. A TP hang is otherwise silent: both ranks are
+// parked and neither reports anything, and this says immediately whether the
+// follower fell behind, ran ahead, or never woke.
+struct TpStallWatchdog {
+    std::atomic<std::uint64_t> published{0};
+    std::atomic<std::uint64_t> consumed{0};
+    std::atomic<int> rank0_phase{-1};   // 0=publish 1=broadcast 2=settle
+    std::atomic<std::uint64_t> follower_forwards{0};
+    std::array<std::atomic<std::uint64_t>, 8> collectives{};
+    std::atomic<std::uint64_t> rank0_phase_seq{0};
+    std::atomic<bool> running{false};
+    std::thread thread;
+    static bool enabled() {
+        static const bool on = [] {
+            const char* v = std::getenv("PIE_TP_WATCHDOG");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
+        return on;
+    }
+    static TpStallWatchdog& instance() {
+        static TpStallWatchdog w;
+        return w;
+    }
+    void start() {
+        if (!enabled() || running.exchange(true)) return;
+        thread = std::thread([this] {
+            std::uint64_t last_pub = ~0ull, last_con = ~0ull;
+            int stuck = 0;
+            static const char* kPhase[] = {"publish", "broadcast",
+                                           "enqueue_done", "in_settle",
+                                           "settle_done"};
+            while (running.load(std::memory_order_acquire)) {
+                std::this_thread::sleep_for(std::chrono::seconds(5));
+                const auto p = published.load(std::memory_order_acquire);
+                const auto c = consumed.load(std::memory_order_acquire);
+                if (p == last_pub && c == last_con) {
+                    const int ph = rank0_phase.load(std::memory_order_acquire);
+                    std::fprintf(stderr,
+                        "[tp-watchdog] STALLED %ds: published=%llu consumed=%llu "
+                        "(delta=%lld) rank0_last_phase=%s seq=%llu "
+                        "follower_forwards=%llu collectives=[r0=%llu r1=%llu]\n",
+                        (++stuck) * 5,
+                        (unsigned long long)p, (unsigned long long)c,
+                        (long long)(p - c),
+                        (ph >= 0 && ph < 5) ? kPhase[ph] : "none",
+                        (unsigned long long)rank0_phase_seq.load(),
+                        (unsigned long long)follower_forwards.load(),
+                        (unsigned long long)collectives[0].load(),
+                        (unsigned long long)collectives[1].load());
+                } else {
+                    stuck = 0;
+                }
+                last_pub = p; last_con = c;
+            }
+        });
+        thread.detach();
+    }
+};
+
+std::mutex g_tp_mailboxes_mu;
+std::unordered_map<std::string, std::shared_ptr<TpFireMailbox>> g_tp_mailboxes;
+
+
+std::shared_ptr<TpFireMailbox> tp_mailbox_for(const std::string& key) {
+    std::lock_guard<std::mutex> lk(g_tp_mailboxes_mu);
+    auto& box = g_tp_mailboxes[key];
+    if (!box) box = std::make_shared<TpFireMailbox>();
+    return box;
+}
+
+template <typename T>
+void assign_span(std::vector<T>& dst, const T* src, std::size_t count) {
+    dst.resize(count);
+    if (count != 0 && src != nullptr) {
+        std::memcpy(dst.data(), src, count * sizeof(T));
+    }
+}
+
 constexpr std::int32_t TP_FIRE_MAGIC = 0x55504954;  // 'TPIU' tag
 constexpr std::int32_t TP_MTP_MAGIC  = 0x50544D54;  // 'TMTP' tag
 constexpr std::int32_t TP_STOP_MAGIC = 0x504F5453;  // 'STOP' tag
@@ -111,9 +396,131 @@ std::int32_t* tp_hdr_dev_buf() {
     return buf;
 }
 
+// Pinned staging for the fire header. `cudaMemcpyAsync` against PAGEABLE host
+// memory is synchronous: the driver stages it through its own pinned buffer
+// and waits, which drains everything already queued on the stream. With a
+// wide decode step in flight that turned each header hop into a full pipeline
+// drain — measured at 2.2 ms per fire on rank 0 and 3.1 ms on the follower.
+// Page-locking the staging buffer keeps the copy asynchronous.
+TpFireHeader* tp_hdr_host_buf() {
+    thread_local TpFireHeader* buf = nullptr;
+    if (buf == nullptr) {
+        void* raw = nullptr;
+        CUDA_CHECK(cudaMallocHost(&raw, sizeof(TpFireHeader)));
+        buf = static_cast<TpFireHeader*>(raw);
+    }
+    return buf;
+}
+
+// Rank 0 may not overwrite a ring slot the follower has not finished reading.
+// Without this the ring is only a heuristic: `launch()` runs `enqueue_step` for
+// every step of a frame back to back, and `enqueue_mtp_draft_logits` publishes
+// once per (work item x draft), both in tight host loops with no rank
+// synchronisation, so rank 0 laps the ring and `assign_span`'s `resize` can
+// free the very vector the follower is memcpy-ing out of.
+//
+// Deadlock-free by construction: the follower copies the header and the
+// planner views into locals and releases the slot BEFORE it posts any
+// collective, so it never needs rank 0 to make progress first.
+bool tp_cpu_gate_stopped(const std::string& key) {
+    if (key.empty()) return false;
+    return tp_cpu_gate_for(key)->stopped();
+}
+
+void tp_mailbox_reserve_slot(TpFireMailbox& box, const std::string& key) {
+    if (box.fire_seq < kTpMailboxRing) return;  // ring not full yet
+    const std::uint64_t oldest_live = box.fire_seq - kTpMailboxRing + 1;
+    if (box.consumed_fires.load(std::memory_order_acquire) >= oldest_live) {
+        return;
+    }
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    for (int spin = 0;; ++spin) {
+        if (box.consumed_fires.load(std::memory_order_acquire) >= oldest_live) {
+            return;
+        }
+        // A stopped gate means the follower is gone (teardown, or a failed
+        // frame fail-stopped the group). Returning lets the caller proceed to
+        // its collective, which then fails loudly instead of hanging here.
+        if (tp_cpu_gate_stopped(key)) return;
+        if (spin < 64) {
+            std::this_thread::yield();
+        } else {
+            std::this_thread::sleep_for(std::chrono::microseconds(20));
+        }
+        if (std::chrono::steady_clock::now() > deadline) {
+            throw std::runtime_error(
+                "tp: mailbox ring stalled - the follower stopped consuming "
+                "fires (published " + std::to_string(box.fire_seq) +
+                ", consumed " +
+                std::to_string(box.consumed_fires.load()) + ")");
+        }
+    }
+}
+
 }  // namespace
 
+void tp_publish_fire(const std::string& cpu_gate_key,
+                     const TpFirePlanViews& views,
+                     int N, int R, bool is_pure_decode,
+                     int kv_indices_count,
+                     int required_kv_pages,
+                     int mask_bytes, int mask_indptr_count,
+                     bool has_slot_ids,
+                     bool has_write_desc,
+                     int logit_rows,
+                     int structured_window_left,
+                     RsExecutionMode rs_mode,
+                     int rs_fold_lens_count,
+                     int rs_buffer_ids_count) {
+    if (cpu_gate_key.empty()) return;
+    auto box = tp_mailbox_for(cpu_gate_key);
+    TpStallWatchdog::instance().start();
+    TpStallWatchdog::instance().start();
+    tp_mailbox_reserve_slot(*box, cpu_gate_key);
+    TpFireSlot& fire = box->slots[box->fire_seq % kTpMailboxRing];
+    fire.header = TpFireHeader{
+        TP_FIRE_MAGIC, N, R, is_pure_decode ? 1 : 0,
+        kv_indices_count, required_kv_pages, mask_bytes, mask_indptr_count,
+        has_slot_ids ? 1 : 0,
+        has_write_desc ? 1 : 0,
+        logit_rows,
+        structured_window_left,
+        static_cast<std::int32_t>(rs_mode),
+        rs_fold_lens_count,
+        rs_buffer_ids_count,
+        TP_TRANSPORT_NCCL,
+        0,
+    };
+    const std::size_t requests = static_cast<std::size_t>(std::max(R, 0));
+    assign_span(fire.qo_indptr, views.qo_indptr, requests + 1);
+    assign_span(fire.kv_page_indptr, views.kv_page_indptr, requests + 1);
+    assign_span(fire.kv_last_page_lens, views.kv_last_page_lens, requests);
+    assign_span(fire.kv_page_indices, views.kv_page_indices,
+                views.kv_page_indices_len);
+    ++box->fire_seq;
+    {
+        auto& wd = TpStallWatchdog::instance();
+        wd.published.store(box->fire_seq, std::memory_order_release);
+        wd.rank0_phase.store(0, std::memory_order_release);
+        wd.rank0_phase_seq.store(box->fire_seq, std::memory_order_release);
+    }
+    if (TpStallWatchdog::enabled()) {
+        std::fprintf(stderr,
+            "[tp-hdr] R0 seq=%llu N=%d R=%d pure=%d kvidx=%d mask=%d "
+            "mask_indptr=%d slots=%d logit_rows=%d rs=%d\n",
+            (unsigned long long)box->fire_seq, N, R, is_pure_decode ? 1 : 0,
+            kv_indices_count, mask_bytes, mask_indptr_count,
+            has_slot_ids ? 1 : 0, logit_rows, static_cast<int>(rs_mode));
+    }
+    box->notify_time = std::chrono::steady_clock::now();
+    // Release/acquire on the gate publishes everything written above.
+    tp_cpu_gate_notify(cpu_gate_key);
+}
+
 void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
+                         const std::string& cpu_gate_key,
+                         const TpFirePlanViews& views,
                          int N, int R, bool is_pure_decode,
                          int kv_indices_count,
                          int required_kv_pages,
@@ -135,8 +542,8 @@ void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
         throw std::runtime_error(
             "TP root custom mask metadata exceeds persistent capacity");
     }
-    auto* d_hdr = tp_hdr_dev_buf();
-    TpFireHeader hdr{
+    TpStageTimer root_timer(TpProfile::kRootBroadcast);
+    const TpFireHeader header{
         TP_FIRE_MAGIC, N, R, is_pure_decode ? 1 : 0,
         kv_indices_count, required_kv_pages, mask_bytes, mask_indptr_count,
         has_slot_ids ? 1 : 0,
@@ -147,13 +554,20 @@ void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
         rs_fold_lens_count,
         rs_buffer_ids_count,
     };
-    // Header goes first (synchronous from the followers' POV — they need
-    // to parse sizes before posting matching payload broadcasts).
-    CUDA_CHECK(cudaMemcpyAsync(d_hdr, &hdr, sizeof(hdr),
-                               cudaMemcpyHostToDevice, stream));
-    NCCL_CHECK_ASYNC(ncclBroadcast(d_hdr, d_hdr, sizeof(hdr), ncclChar, 0,
-                                   comm.comm(), stream),
-                     comm.comm());
+    const bool via_mailbox = !cpu_gate_key.empty();
+    if (!via_mailbox) {
+        // Gate off: the follower is parked inside `ncclBroadcast`, so the
+        // header still has to travel through the device.
+        auto* d_hdr = tp_hdr_dev_buf();
+        TpFireHeader* hdr_host = tp_hdr_host_buf();
+        *hdr_host = header;
+        CUDA_CHECK(cudaMemcpyAsync(d_hdr, hdr_host, sizeof(TpFireHeader),
+                                   cudaMemcpyHostToDevice, stream));
+        NCCL_CHECK_ASYNC(
+            ncclBroadcast(d_hdr, d_hdr, sizeof(TpFireHeader), ncclChar, 0,
+                          comm.comm(), stream),
+            comm.comm());
+    }
     // Group the payload broadcasts so NCCL submits them as a single batch
     // — tens of microseconds of host-side launch overhead saved per fire,
     // most visible at small batch sizes (decode where each broadcast is
@@ -199,6 +613,13 @@ void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
                                  comm.comm(), stream));
     }
     if (!state_only_fold && kv_indices_count > 0) {
+        if (static_cast<std::size_t>(kv_indices_count) >
+            pi.kv_page_indices.size()) {
+            throw std::runtime_error(
+                "tp: kv_page_indices broadcast count " +
+                std::to_string(kv_indices_count) + " exceeds device capacity " +
+                std::to_string(pi.kv_page_indices.size()));
+        }
         NCCL_CHECK(ncclBroadcast(pi.kv_page_indices.data(),
                                  pi.kv_page_indices.data(),
                                  static_cast<std::size_t>(kv_indices_count) * 4,
@@ -259,29 +680,63 @@ void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
     NCCL_CHECK_ASYNC(ncclGroupEnd(), comm.comm());
 }
 
+// MTP draft steps ALSO have to go through the mailbox. The follower derives
+// its slot from the number of gate epochs it has consumed, so a bare
+// `tp_cpu_gate_notify` that publishes nothing would leave rank 0's `fire_seq`
+// permanently behind the follower's epoch count and every later fire would
+// read the wrong slot — a stale header, or a zeroed one that trips the
+// "unexpected header magic" abort and kills the follower thread.
+void tp_publish_mtp(const std::string& cpu_gate_key,
+                    int rows,
+                    int draft_step,
+                    int max_global_tokens) {
+    if (cpu_gate_key.empty()) return;
+    auto box = tp_mailbox_for(cpu_gate_key);
+    tp_mailbox_reserve_slot(*box, cpu_gate_key);
+    TpFireSlot& fire = box->slots[box->fire_seq % kTpMailboxRing];
+    fire.header = TpFireHeader{};
+    fire.header.magic = TP_MTP_MAGIC;
+    fire.header.total_tokens = rows;
+    fire.header.num_requests = draft_step;
+    fire.header.is_pure_decode = max_global_tokens;
+    fire.header.structured_window_left = -2;
+    fire.header.transport = TP_TRANSPORT_NCCL;
+    ++box->fire_seq;
+    auto& wd = TpStallWatchdog::instance();
+    wd.published.store(box->fire_seq, std::memory_order_release);
+    wd.rank0_phase.store(0, std::memory_order_release);
+    wd.rank0_phase_seq.store(box->fire_seq, std::memory_order_release);
+    box->notify_time = std::chrono::steady_clock::now();
+    tp_cpu_gate_notify(cpu_gate_key);
+}
+
 void tp_broadcast_mtp_step(
     NcclComm& comm,
     PersistentInputs& pi,
+    const std::string& cpu_gate_key,
     int rows,
     int draft_step,
     int max_global_tokens,
     cudaStream_t stream) {
-    auto* device_header = tp_hdr_dev_buf();
-    TpFireHeader header{
-        .magic = TP_MTP_MAGIC,
-        .total_tokens = rows,
-        .num_requests = draft_step,
-        .is_pure_decode = max_global_tokens,
-        .structured_window_left = -2,
-    };
-    CUDA_CHECK(cudaMemcpyAsync(
-        device_header, &header, sizeof(header),
-        cudaMemcpyHostToDevice, stream));
-    NCCL_CHECK_ASYNC(
-        ncclBroadcast(
-            device_header, device_header, sizeof(header), ncclChar, 0,
-            comm.comm(), stream),
-        comm.comm());
+    if (cpu_gate_key.empty()) {
+        // Gate off: the follower is parked inside the header broadcast.
+        auto* device_header = tp_hdr_dev_buf();
+        TpFireHeader* header = tp_hdr_host_buf();
+        *header = TpFireHeader{};
+        header->magic = TP_MTP_MAGIC;
+        header->total_tokens = rows;
+        header->num_requests = draft_step;
+        header->is_pure_decode = max_global_tokens;
+        header->structured_window_left = -2;
+        CUDA_CHECK(cudaMemcpyAsync(
+            device_header, header, sizeof(TpFireHeader),
+            cudaMemcpyHostToDevice, stream));
+        NCCL_CHECK_ASYNC(
+            ncclBroadcast(
+                device_header, device_header, sizeof(TpFireHeader), ncclChar,
+                0, comm.comm(), stream),
+            comm.comm());
+    }
     NCCL_CHECK(ncclGroupStart());
     for (void* buffer : {
              static_cast<void*>(pi.tokens.data()),
@@ -295,10 +750,33 @@ void tp_broadcast_mtp_step(
     NCCL_CHECK_ASYNC(ncclGroupEnd(), comm.comm());
 }
 
+void tp_watchdog_count_collective(int rank) {
+    if (!TpStallWatchdog::enabled()) return;
+    if (rank < 0 || rank >= 8) return;
+    TpStallWatchdog::instance().collectives[
+        static_cast<std::size_t>(rank)].fetch_add(1,
+            std::memory_order_relaxed);
+}
+
+void tp_watchdog_mark_phase(int phase) {
+    TpStallWatchdog::instance().rank0_phase.store(
+        phase, std::memory_order_release);
+}
+
 void tp_cpu_gate_notify(const std::string& key) {
     if (key.empty()) return;
     auto gate = tp_cpu_gate_for(key);
     gate->publish();
+}
+
+void tp_cpu_gate_request_stop(const std::string& key) {
+    if (key.empty()) return;
+    // Keep the registry entry: `tp_cpu_gate_wait` looks the gate up by key on
+    // every iteration and would otherwise default-construct a fresh, un-stopped
+    // gate that nothing can ever notify — a follower looping back after its
+    // last fire would park on it forever.
+    auto gate = tp_cpu_gate_for(key);
+    gate->request_stop();
 }
 
 // ============================================================================
@@ -335,20 +813,84 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
 
     // Sized lazily; R is at most max_workspace_tokens (one request per token).
     std::vector<std::uint32_t> h_qo, h_kvpp;
+    // Non-null whenever the CPU gate is on, which is also the only
+    // configuration in which TP ranks share this process.
+    const std::shared_ptr<TpFireMailbox> mailbox =
+        engine.tp_cpu_gate_key.empty()
+            ? nullptr
+            : tp_mailbox_for(engine.tp_cpu_gate_key);
 
     while (!stop.load()) {
-        tp_cpu_gate_wait(engine.tp_cpu_gate_key, cpu_gate_seq, stop);
-        // 1. Receive header.
-        NCCL_CHECK_ASYNC(ncclBroadcast(d_hdr, d_hdr, sizeof(TpFireHeader),
-                                       ncclChar, 0, comm.comm(), stream),
-                         comm.comm());
+        // A false return means shutdown, not a fire. Posting the header
+        // broadcast anyway would block forever on a collective rank 0 will
+        // never match, which is what previously wedged teardown.
+        {
+            TpStageTimer gate_timer(TpProfile::kGateWait);
+            if (!tp_cpu_gate_wait(engine.tp_cpu_gate_key, cpu_gate_seq, stop)) {
+                break;
+            }
+        }
+        if (mailbox != nullptr && TpProfile::enabled()) {
+            const auto now = std::chrono::steady_clock::now();
+            auto& prof = TpProfile::instance();
+            prof.ns[TpProfile::kWakeLatency] += static_cast<std::uint64_t>(
+                std::max<std::int64_t>(0,
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        now - mailbox->notify_time).count()));
+            ++prof.hits[TpProfile::kWakeLatency];
+        }
+        // 1. Receive header. This is a full host-device round trip on the
+        //    critical path: the follower cannot size any payload broadcast
+        //    until it has the header's contents host-side.
         TpFireHeader hdr{};
-        CUDA_CHECK(cudaMemcpyAsync(&hdr, d_hdr, sizeof(hdr),
-                                   cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        std::uint64_t fire_slot = 0;
+        {
+            TpStageTimer header_timer(TpProfile::kHeaderRecv);
+            if (mailbox != nullptr) {
+                // Straight out of host memory: no collective, no readback and
+                // no stream synchronize, so the follower is free to enqueue
+                // its receives without waiting on rank 0's GPU queue.
+                // `cpu_gate_seq` counts consumed epochs starting at 1, and
+                // rank 0 published epoch k into slot (k-1) % ring.
+                fire_slot = (cpu_gate_seq + kTpMailboxRing - 1) %
+                            kTpMailboxRing;
+                hdr = mailbox->slots[fire_slot].header;
+            } else {
+                TpFireHeader* hdr_host = tp_hdr_host_buf();
+                NCCL_CHECK_ASYNC(
+                    ncclBroadcast(d_hdr, d_hdr, sizeof(TpFireHeader),
+                                  ncclChar, 0, comm.comm(), stream),
+                    comm.comm());
+                CUDA_CHECK(cudaMemcpyAsync(hdr_host, d_hdr,
+                                           sizeof(TpFireHeader),
+                                           cudaMemcpyDeviceToHost, stream));
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                hdr = *hdr_host;
+            }
+        }
 
+        if (TpStallWatchdog::enabled() && hdr.magic == TP_FIRE_MAGIC) {
+            std::fprintf(stderr,
+                "[tp-hdr] R1 seq=%llu N=%d R=%d pure=%d kvidx=%d mask=%d "
+                "mask_indptr=%d slots=%d logit_rows=%d rs=%d slot=%llu\n",
+                (unsigned long long)cpu_gate_seq, hdr.total_tokens,
+                hdr.num_requests, hdr.is_pure_decode, hdr.kv_indices_count,
+                hdr.mask_bytes, hdr.mask_indptr_count, hdr.has_slot_ids,
+                hdr.logit_rows, hdr.rs_mode,
+                (unsigned long long)fire_slot);
+        }
         if (hdr.magic == TP_STOP_MAGIC) break;
         if (hdr.magic == TP_MTP_MAGIC) {
+            // Header is already copied out, and an MTP fire carries no planner
+            // views, so the slot is free here. Release it BEFORE the
+            // collectives below, or rank 0 (which is what unblocks them) could
+            // be waiting on this very slot.
+            if (mailbox != nullptr) {
+                mailbox->consumed_fires.store(cpu_gate_seq,
+                                              std::memory_order_release);
+                TpStallWatchdog::instance().consumed.store(
+                    cpu_gate_seq, std::memory_order_release);
+            }
             const int rows = hdr.total_tokens;
             NCCL_CHECK(ncclGroupStart());
             for (void* buffer : {
@@ -455,6 +997,8 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
         }
         const bool have_custom_mask =
             !state_only_fold && hdr.mask_indptr_count > 0;
+        const bool have_slot_ids = (hdr.has_slot_ids != 0) && R > 0;
+        TpStageTimer payload_timer(TpProfile::kPayloadRecv);
         NCCL_CHECK(ncclGroupStart());
         if (!state_only_fold) {
             NCCL_CHECK(ncclBroadcast(pi.tokens.data(), pi.tokens.data(),
@@ -467,7 +1011,6 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
                 pi.row_valid.data(), pi.row_valid.data(),
                 static_cast<std::size_t>(N), ncclChar, 0,
                 comm.comm(), stream));
-        }
         if (!state_only_fold && has_write_desc && N > 0) {
             NCCL_CHECK(ncclBroadcast(
                 pi.w_page.data(), pi.w_page.data(),
@@ -511,7 +1054,6 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
                                      static_cast<std::size_t>(hdr.mask_indptr_count) * 4,
                                      ncclChar, 0, comm.comm(), stream));
         }
-        const bool have_slot_ids = (hdr.has_slot_ids != 0) && R > 0;
         if (have_slot_ids) {
             NCCL_CHECK(ncclBroadcast(pi.slot_ids.data(), pi.slot_ids.data(),
                                      static_cast<std::size_t>(R) * 4,
@@ -554,9 +1096,15 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
                                      ncclChar, 0, comm.comm(), stream));
         }
         NCCL_CHECK_ASYNC(ncclGroupEnd(), comm.comm());
+        payload_timer.stop();
+        }
 
-        // 3. Pull the host views of qo/KV layout for the per-arch
-        // attention planner (lives outside the captured kernel sequence).
+        // 3. Host views of the qo/KV layout for the per-arch attention planner
+        // (it runs outside the captured kernel sequence). Rank 0 already holds
+        // exactly these, and plans from them itself, so take them from the
+        // mailbox: no readback, no synchronize, and both ranks provably plan
+        // from the same numbers.
+        TpStageTimer host_views_timer(TpProfile::kHostViews);
         h_qo.resize(R + 1);
         h_kvpp.resize(R + 1);
         std::vector<std::uint32_t> h_kvpi(
@@ -566,66 +1114,141 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
                       std::max(0, hdr.kv_indices_count)));
         std::vector<std::uint32_t> h_kvlpl(
             state_only_fold ? 0 : static_cast<std::size_t>(R));
-        CUDA_CHECK(cudaMemcpyAsync(h_qo.data(), pi.qo_indptr.data(),
-                                   static_cast<std::size_t>(R + 1) * 4,
-                                   cudaMemcpyDeviceToHost, stream));
-        if (!state_only_fold) {
-            CUDA_CHECK(cudaMemcpyAsync(
-                h_kvpp.data(), pi.kv_page_indptr.data(),
-                static_cast<std::size_t>(R + 1) * 4,
-                cudaMemcpyDeviceToHost, stream));
-        }
-        if (!state_only_fold && R > 0) {
-            CUDA_CHECK(cudaMemcpyAsync(h_kvlpl.data(), pi.kv_last_page_lens.data(),
-                                       static_cast<std::size_t>(R) * 4,
-                                       cudaMemcpyDeviceToHost, stream));
-        }
-        if (!h_kvpi.empty()) {
-            CUDA_CHECK(cudaMemcpyAsync(
-                h_kvpi.data(), pi.kv_page_indices.data(),
-                h_kvpi.size() * sizeof(std::uint32_t),
-                cudaMemcpyDeviceToHost, stream));
-        }
         std::vector<std::int32_t> h_slot_ids;
         std::vector<std::uint8_t> h_is_fresh;
-        if (have_slot_ids) {
-            h_slot_ids.resize(R);
-            h_is_fresh.resize(R);
-            CUDA_CHECK(cudaMemcpyAsync(h_slot_ids.data(), pi.slot_ids.data(),
-                                       static_cast<std::size_t>(R) * 4,
-                                       cudaMemcpyDeviceToHost, stream));
-            CUDA_CHECK(cudaMemcpyAsync(h_is_fresh.data(), pi.is_fresh.data(),
-                                       static_cast<std::size_t>(R),
-                                       cudaMemcpyDeviceToHost, stream));
-            CUDA_CHECK(cudaMemcpyAsync(
-                pi.rs_slot_flags_host.data(), pi.rs_slot_flags.data(),
-                static_cast<std::size_t>(R), cudaMemcpyDeviceToHost, stream));
-        }
-        if (rs_fold_lens_count > 0) {
-            CUDA_CHECK(cudaMemcpyAsync(
-                pi.rs_fold_lens_host.data(), pi.rs_fold_lens.data(),
-                static_cast<std::size_t>(rs_fold_lens_count) *
-                    sizeof(std::uint32_t),
-                cudaMemcpyDeviceToHost, stream));
-        }
-        if (rs_mode == RsExecutionMode::BufferWrite ||
-            rs_mode == RsExecutionMode::BufferFold) {
-            CUDA_CHECK(cudaMemcpyAsync(
-                pi.rs_buffer_slot_indptr_host.data(),
-                pi.rs_buffer_slot_indptr.data(),
-                static_cast<std::size_t>(R + 1) *
-                    sizeof(std::uint32_t),
-                cudaMemcpyDeviceToHost, stream));
-            if (rs_buffer_ids_count > 0) {
+        // Only synchronize if something was actually read back. On the common
+        // decode path the mailbox supplies everything, so the follower issues
+        // no D2H at all and never blocks on rank 0's GPU queue here.
+        bool host_readback = false;
+        if (mailbox != nullptr) {
+            const auto copy_from = [](auto& dst, const auto& src) {
+                const std::size_t n = std::min(dst.size(), src.size());
+                if (n != 0) std::memcpy(dst.data(), src.data(),
+                                        n * sizeof(dst[0]));
+            };
+            const TpFireSlot& fire = mailbox->slots[fire_slot];
+            copy_from(h_qo, fire.qo_indptr);
+            if (!state_only_fold) {
+                copy_from(h_kvpp, fire.kv_page_indptr);
+                copy_from(h_kvlpl, fire.kv_last_page_lens);
+                copy_from(h_kvpi, fire.kv_page_indices);
+            }
+            // Everything this fire's slot carries now lives in locals, so rank
+            // 0 may reuse it. Released before the payload collectives below for
+            // the same reason as the MTP branch.
+            mailbox->consumed_fires.store(cpu_gate_seq,
+                                          std::memory_order_release);
+            auto& wd_ = TpStallWatchdog::instance();
+            wd_.consumed.store(cpu_gate_seq, std::memory_order_release);
+            wd_.follower_forwards.fetch_add(1, std::memory_order_release);
+            // Recurrent-state metadata still comes back from device; those
+            // paths are cold and not worth widening the mailbox for.
+            if (have_slot_ids) {
+                h_slot_ids.resize(R);
+                h_is_fresh.resize(R);
+                host_readback = true;
                 CUDA_CHECK(cudaMemcpyAsync(
-                    pi.rs_buffer_slot_ids_host.data(),
-                    pi.rs_buffer_slot_ids.data(),
-                    static_cast<std::size_t>(rs_buffer_ids_count) *
+                    h_slot_ids.data(), pi.slot_ids.data(),
+                    static_cast<std::size_t>(R) * 4,
+                    cudaMemcpyDeviceToHost, stream));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    h_is_fresh.data(), pi.is_fresh.data(),
+                    static_cast<std::size_t>(R),
+                    cudaMemcpyDeviceToHost, stream));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    pi.rs_slot_flags_host.data(), pi.rs_slot_flags.data(),
+                    static_cast<std::size_t>(R),
+                    cudaMemcpyDeviceToHost, stream));
+            }
+            if (rs_fold_lens_count > 0) {
+                host_readback = true;
+                CUDA_CHECK(cudaMemcpyAsync(
+                    pi.rs_fold_lens_host.data(), pi.rs_fold_lens.data(),
+                    static_cast<std::size_t>(rs_fold_lens_count) *
                         sizeof(std::uint32_t),
                     cudaMemcpyDeviceToHost, stream));
             }
+            if (rs_mode == RsExecutionMode::BufferWrite ||
+                rs_mode == RsExecutionMode::BufferFold) {
+                host_readback = true;
+                CUDA_CHECK(cudaMemcpyAsync(
+                    pi.rs_buffer_slot_indptr_host.data(),
+                    pi.rs_buffer_slot_indptr.data(),
+                    static_cast<std::size_t>(R + 1) * sizeof(std::uint32_t),
+                    cudaMemcpyDeviceToHost, stream));
+                if (rs_buffer_ids_count > 0) {
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        pi.rs_buffer_slot_ids_host.data(),
+                        pi.rs_buffer_slot_ids.data(),
+                        static_cast<std::size_t>(rs_buffer_ids_count) *
+                            sizeof(std::uint32_t),
+                        cudaMemcpyDeviceToHost, stream));
+                }
+            }
+        } else {
+            host_readback = true;
+            CUDA_CHECK(cudaMemcpyAsync(h_qo.data(), pi.qo_indptr.data(),
+                                       static_cast<std::size_t>(R + 1) * 4,
+                                       cudaMemcpyDeviceToHost, stream));
+            if (!state_only_fold) {
+                CUDA_CHECK(cudaMemcpyAsync(
+                    h_kvpp.data(), pi.kv_page_indptr.data(),
+                    static_cast<std::size_t>(R + 1) * 4,
+                    cudaMemcpyDeviceToHost, stream));
+            }
+            if (!state_only_fold && R > 0) {
+                CUDA_CHECK(cudaMemcpyAsync(h_kvlpl.data(), pi.kv_last_page_lens.data(),
+                                           static_cast<std::size_t>(R) * 4,
+                                           cudaMemcpyDeviceToHost, stream));
+            }
+            if (!h_kvpi.empty()) {
+                CUDA_CHECK(cudaMemcpyAsync(
+                    h_kvpi.data(), pi.kv_page_indices.data(),
+                    h_kvpi.size() * sizeof(std::uint32_t),
+                    cudaMemcpyDeviceToHost, stream));
+            }
+            if (have_slot_ids) {
+                h_slot_ids.resize(R);
+                h_is_fresh.resize(R);
+                CUDA_CHECK(cudaMemcpyAsync(h_slot_ids.data(), pi.slot_ids.data(),
+                                           static_cast<std::size_t>(R) * 4,
+                                           cudaMemcpyDeviceToHost, stream));
+                CUDA_CHECK(cudaMemcpyAsync(h_is_fresh.data(), pi.is_fresh.data(),
+                                           static_cast<std::size_t>(R),
+                                           cudaMemcpyDeviceToHost, stream));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    pi.rs_slot_flags_host.data(), pi.rs_slot_flags.data(),
+                    static_cast<std::size_t>(R), cudaMemcpyDeviceToHost, stream));
+            }
+            if (rs_fold_lens_count > 0) {
+                CUDA_CHECK(cudaMemcpyAsync(
+                    pi.rs_fold_lens_host.data(), pi.rs_fold_lens.data(),
+                    static_cast<std::size_t>(rs_fold_lens_count) *
+                        sizeof(std::uint32_t),
+                    cudaMemcpyDeviceToHost, stream));
+            }
+            if (rs_mode == RsExecutionMode::BufferWrite ||
+                rs_mode == RsExecutionMode::BufferFold) {
+                CUDA_CHECK(cudaMemcpyAsync(
+                    pi.rs_buffer_slot_indptr_host.data(),
+                    pi.rs_buffer_slot_indptr.data(),
+                    static_cast<std::size_t>(R + 1) *
+                        sizeof(std::uint32_t),
+                    cudaMemcpyDeviceToHost, stream));
+                if (rs_buffer_ids_count > 0) {
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        pi.rs_buffer_slot_ids_host.data(),
+                        pi.rs_buffer_slot_ids.data(),
+                        static_cast<std::size_t>(rs_buffer_ids_count) *
+                            sizeof(std::uint32_t),
+                        cudaMemcpyDeviceToHost, stream));
+                }
+            }
         }
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        if (host_readback) {
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+        }
+        host_views_timer.stop();
         for (int request = 0; request < R && have_slot_ids; ++request) {
             const std::uint8_t flags =
                 pi.rs_slot_flags_host[static_cast<std::size_t>(request)];
@@ -679,6 +1302,14 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
         // 4. Run the same forward function as rank 0. Channel publication is
         // rank-0-only after the collectives complete.
         if (rs_mode != RsExecutionMode::BufferFold) {
+            TpStageTimer plan_timer(TpProfile::kAttnPlan);
+            // Claim a plan-staging slot exactly as rank 0 does. Without this
+            // the follower rewrites slot 0 on every fire and never records an
+            // upload event, so fire N+1's plan lands on top of the plan fire
+            // N's attention kernel is still reading — and that kernel then
+            // never retires. `AttentionWorkspace` sizes this ring for the
+            // in-flight STEP count precisely so ranks can run ahead.
+            engine.attn_ws.begin_plan_update();
             engine.forward_fn.invoke_prepare(
                 engine.attn_ws,
                 ForwardFn::PrepareInputs{
@@ -701,6 +1332,7 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
                     .have_custom_mask = have_custom_mask,
                     .runtime_window_left = structured_window_left,
                 });
+            engine.attn_ws.end_plan_update(stream);
         }
         // Mirror rank 0's graph capture/replay decision so NCCL ops
         // inside the body record on both ranks simultaneously (otherwise
@@ -708,6 +1340,7 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
         // first capture). The same `(R)` shape key keeps the per-rank
         // graph caches in lockstep; the captured graph on rank 1 has no
         // PTIR publication, just the forward kernels + NCCL.
+        TpStageTimer forward_timer(TpProfile::kForwardBody);
         const bool try_graphs = forward_graph_replay_eligible(
             engine,
             is_pure_decode,
@@ -801,6 +1434,16 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
                 engine.ws, engine.kv_cache, engine.attn_ws, engine.cublas,
                 fwd_in);
         }
+        forward_timer.stop();
+        if (mailbox != nullptr && TpProfile::enabled()) {
+            const auto now = std::chrono::steady_clock::now();
+            auto& prof = TpProfile::instance();
+            prof.ns[TpProfile::kStartSkew] += static_cast<std::uint64_t>(
+                std::max<std::int64_t>(0,
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        now - mailbox->notify_time).count()));
+            ++prof.hits[TpProfile::kStartSkew];
+        }
     }
 }
 
@@ -808,13 +1451,14 @@ void tp_send_shutdown(NcclComm& comm, const std::string& cpu_gate_key) {
     tp_cpu_gate_notify(cpu_gate_key);
     auto* d_hdr = tp_hdr_dev_buf();
     cudaStream_t stream = nullptr;
-    TpFireHeader hdr{
+    TpFireHeader* hdr_host = tp_hdr_host_buf();
+    *hdr_host = TpFireHeader{
         .magic = TP_STOP_MAGIC,
         .structured_window_left = -2,
     };
-    CUDA_CHECK(cudaMemcpyAsync(d_hdr, &hdr, sizeof(hdr),
+    CUDA_CHECK(cudaMemcpyAsync(d_hdr, hdr_host, sizeof(TpFireHeader),
                                cudaMemcpyHostToDevice, stream));
-    NCCL_CHECK_ASYNC(ncclBroadcast(d_hdr, d_hdr, sizeof(hdr), ncclChar, 0,
+    NCCL_CHECK_ASYNC(ncclBroadcast(d_hdr, d_hdr, sizeof(TpFireHeader), ncclChar, 0,
                                    comm.comm(), stream),
                      comm.comm());
     CUDA_CHECK(cudaStreamSynchronize(stream));
