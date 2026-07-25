@@ -139,7 +139,7 @@ or multi-context orchestration.
 <a id="a8"></a>
 ### A8. Entropy-adaptive temperature — M ⭐
 - **Papers:** EDT, [2403.14541](https://arxiv.org/abs/2403.14541); AdapT, [2309.02772](https://arxiv.org/abs/2309.02772)
-- **Build:** `T = f(H)` — raise temperature when the model is confident, lower it when uncertain.
+- **Build:** `T = T0 · N^(θ/H)` with `0 < N < 1` — raise temperature when the model is *confused*, lower it when it is confident. High entropy means the model cannot pick a good continuation anyway, so exploring costs little; low entropy means it should commit.
 - **PTIR:** entropy reduction (already proven by `entropycheck`) feeding the temperature path as a control word (already proven by `mirostat`).
 - **Gap:** `entropycheck` *measures* entropy and nothing *acts* on it. This candidate is literally connecting two existing inferlets.
 

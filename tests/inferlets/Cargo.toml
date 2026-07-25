@@ -7,16 +7,21 @@ members = [
     "chat-completion",
     "consensus-decoding",
     "contrastive-decoding",
-    "greenlist-watermarking",
+    "entropy-adaptive-temperature",
     "eta-epsilon-sampling",
+    "greenlist-watermarking",
     "json-schema-constrained-decoding",
     "locally-typical-sampling",
     "mirostat-v2-sampling",
     "mtp-speculative-decoding",
     "prefix-tree-kv-cache",
+    "repetition-penalty",
     "sampling-primitives",
     "sliding-window-attention",
+    "tail-free-sampling",
     "text-completion-bench",
+    "top-a-sampling",
+    "xtc-sampling",
 ]
 
 [profile.release]

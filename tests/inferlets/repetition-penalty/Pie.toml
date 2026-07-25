@@ -1,0 +1,17 @@
+[package]
+name = "repetition-penalty"
+version = "0.1.0"
+description = "Frequency, presence and repetition penalties driven by a device-resident token histogram"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", optional = true, description = "Prompt to send to the model"}
+frequency_penalty = {type = "float", optional = true, description = "Subtracted per prior occurrence, OpenAI semantics (default: 0.0)"}
+presence_penalty = {type = "float", optional = true, description = "Subtracted once if the token occurred at all (default: 0.0)"}
+repetition_penalty = {type = "float", optional = true, description = "CTRL-style multiplicative penalty, 1.0 disables (default: 1.1)"}
+temperature = {type = "float", optional = true, description = "Temperature applied after the penalties (default: 1.0)"}
+max_tokens = {type = "int", optional = true, description = "Number of generated tokens (default: 32)"}
+seed = {type = "int", optional = true, description = "RNG key for Gumbel-max sampling"}
