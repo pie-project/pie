@@ -26,16 +26,12 @@
 #include "../batch/persistent_inputs.hpp"
 #include "kv_cache.hpp"
 #include "../model/config.hpp"
-#ifndef PIE_CUDA_QWEN_ONLY
 #include "../model/gemma4/gemma4.hpp"
 #include "../model/deepseek_v4/deepseek_v4_forward.hpp"
 #include "../model/glm5/glm5_forward.hpp"
 #include "../model/kimi/kimi_forward.hpp"
-#endif
 #include "../model/loaded_model.hpp"
-#ifndef PIE_CUDA_QWEN_ONLY
 #include "../model/nemotron_h/nemotron_h_forward.hpp"
-#endif
 #include "../model/qwen3_5/qwen3_5_forward.hpp"
 #include "../model/qwen3_5/qwen3_5_moe_forward.hpp"
 #include "../model/workspace.hpp"
@@ -393,10 +389,6 @@ CudaMemoryPlan plan_cuda_memory(
         derive_kv_page_size_candidates(cfg, hf, prop);
 
     const std::size_t per_kv_token_bytes =
-#ifdef PIE_CUDA_QWEN_ONLY
-        pie_cuda_driver::kv_page_bytes_homogeneous(
-            hf, tp_size, kv_format);
-#else
         deepseek_v4_selected
             ? static_cast<std::size_t>(hf.num_hidden_layers) *
                   pie_cuda_driver::kv_cache_device_bytes_per_page(
@@ -416,7 +408,6 @@ CudaMemoryPlan plan_cuda_memory(
             : nemotron_h_selected
                 ? pie_cuda_driver::model::kv_page_bytes_nemotron_h(hf, tp_size, kv_format)
             : pie_cuda_driver::kv_page_bytes_homogeneous(hf, tp_size, kv_format);
-#endif
     if (per_kv_token_bytes == 0) {
         throw std::runtime_error("cuda memory planner: computed zero KV page bytes");
     }
@@ -503,12 +494,10 @@ CudaMemoryPlan plan_cuda_memory(
         ? static_cast<std::size_t>(std::max(0, qwen3_5_linear_layers)) *
               (per_slot_recurrent + per_slot_conv)
         : 0;
-#ifndef PIE_CUDA_QWEN_ONLY
     if (nemotron_h_selected) {
         state_slot_bytes =
             pie_cuda_driver::model::nemotron_h_state_slot_bytes(hf, nemotron_h_mamba_layers, tp_size);
     }
-#endif
 
     struct Candidate {
         CudaMemoryPlan plan;
@@ -599,7 +588,6 @@ CudaMemoryPlan plan_cuda_memory(
                 arena += pie_cuda_driver::model::qwen3_5_moe_workspace_bytes(
                     hf, N, tp_size);
             }
-#ifndef PIE_CUDA_QWEN_ONLY
             if (nemotron_h_selected) {
                 arena += pie_cuda_driver::model::nemotron_h_workspace_bytes(
                     hf, N, tp_size);
@@ -620,7 +608,6 @@ CudaMemoryPlan plan_cuda_memory(
                 arena += pie_cuda_driver::model::glm5_workspace_bytes(
                     hf, N, output_rows, hf.max_position_embeddings, tp_size);
             }
-#endif
             const std::size_t attn_float_bytes =
                 pie_cuda_driver::attention_float_workspace_bytes(
                     hf, cfg, prop);

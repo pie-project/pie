@@ -1,0 +1,112 @@
+//===-- kernels.def - model-derived CUDA kernel variants ------*- C++ -*-===//
+//
+// Single source of truth for the kernel variants pie instantiates.
+//
+// Consumed twice, with no code generation step and no build-directory
+// artifacts:
+//   * C++   -- #include with the PIE_* macros defined; expands to explicit
+//              instantiations, dispatch switch cases, constexpr tables and
+//              #include lists.
+//   * CMake -- file(STRINGS) + regex, to derive the per-head_dim translation
+//              unit list and to decide whether the vendored FlashInfer fused
+//              MoE launchers are reachable.
+//
+// ONLY model-derived axes belong here. The test is: can the value be decided
+// from a checkpoint's config.json alone, without seeing a batch? If not, it
+// is a runtime-policy axis and MUST stay fully instantiated -- pruning one
+// turns a valid input into a runtime throw. Runtime-policy axes deliberately
+// absent from this file:
+//
+//   attention  full_attention_variant (per batch, from num_requests),
+//              CTA_TILE_Q (from plan_info), MaskMode (per call site),
+//              logits_soft_cap
+//   MoE        CUTLASS tile shape M/N/K and pipeline stages (occupancy
+//              heuristic, resolved at run time)
+//   marlin     thread-config / shape search
+//
+// Target axes (sm80 vs sm90, CMAKE_CUDA_ARCHITECTURES) stay in CMakeLists.txt.
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef PIE_ATTN_HEAD_DIM
+#define PIE_ATTN_HEAD_DIM(hd)
+#endif
+#ifndef PIE_ATTN_DECODE_GQA
+#define PIE_ATTN_DECODE_GQA(g)
+#endif
+#ifndef PIE_MARLIN_SHAPE
+#define PIE_MARLIN_SHAPE(act, quant, out)
+#endif
+#ifndef PIE_MOE_ACTIVATION
+#define PIE_MOE_ACTIVATION(name)
+#endif
+
+// ---- attention: head_dim --------------------------------------------------
+// Checkpoint-derived, and pie accepts arbitrary HuggingFace repos
+// (bin/pie/src/ops/model.rs maps model_type -> arch; it is not a list of known
+// checkpoints). So this list stays PERMISSIVE: it is the set flashinfer
+// supports, not the set we happen to have tested. Narrowing it would make an
+// otherwise valid checkpoint fail at run time.
+//
+// The build win here is the translation-unit split, not pruning. cicc and
+// ptxas are single-threaded per TU, so holding every head_dim in one file made
+// it the build's critical path: 318s for the whole file versus 79s for
+// head_dim=128 alone, against only ~5s of fixed per-TU overhead.
+//
+// config.cpp's round_up_head_dim() maps every checkpoint onto one of these
+// four, so Phi-3-mini's 96 arrives as 128. 96 is deliberately absent: the
+// prefill dispatch never had a 96 case, so a checkpoint that truly reached the
+// kernels with 96 would already fail there -- which is what made the decode
+// side's <96> instantiations detectable as dead.
+PIE_ATTN_HEAD_DIM(64)   // llama3.2-1B
+PIE_ATTN_HEAD_DIM(128)  // qwen3/qwen2/llama/mistral/olmo3, phi3 (96 -> 128)
+PIE_ATTN_HEAD_DIM(256)  // gemma2/gemma3/gemma3n/gemma4 sliding layers
+PIE_ATTN_HEAD_DIM(512)  // gemma4 global layers, deepseek_v2/v3/v4 MLA, kimi_k2
+
+// ---- attention: decode GQA group size -------------------------------------
+// num_q_heads / num_kv_heads. Tensor-parallel invariant: llama_like.cpp
+// divides both by T, so the ratio is preserved. Must match flashinfer's
+// DISPATCH_GQA_GROUP_SIZE set; ratios outside it (5/6/7) are routed to the
+// prefill path by main.cpp's force_prefill_path gate and never reach decode.
+PIE_ATTN_DECODE_GQA(1)
+PIE_ATTN_DECODE_GQA(2)
+PIE_ATTN_DECODE_GQA(3)
+PIE_ATTN_DECODE_GQA(4)
+PIE_ATTN_DECODE_GQA(8)
+
+// ---- marlin: (activation dtype, quant type, output dtype) -----------------
+// Unlike attention, this list is fixed by pie's own code rather than by the
+// checkpoint, so pruning is unconditionally safe: the driver only ever calls
+// the bf16 launchers (ops/gemm.cpp launch_gptq_gemm_w4a16_bf16 and
+// launch_mxfp4_gemm_w4a16_bf16). The remaining upstream combos (fp16, int8,
+// u8b128, fe4m3fn) are dead code worth roughly five minutes of cicc time.
+//
+// These expand to #includes inside marlin.cu's single translation unit: CUDA
+// 13 gives __global__ template stubs static linkage, so splitting them into
+// separate TUs does not link (see CMakeLists.txt).
+PIE_MARLIN_SHAPE(bfloat16, u4,     bfloat16)  // AWQ-style u4, no zero-point bias
+PIE_MARLIN_SHAPE(bfloat16, u4b8,   bfloat16)  // GPTQ u4, bias-8 zero point
+PIE_MARLIN_SHAPE(bfloat16, fe2m1f, bfloat16)  // MXFP4 (gpt_oss)
+
+// ---- MoE: CUTLASS grouped-GEMM epilogue -----------------------------------
+// FlashInfer's MoeGemmRunner::moeGemmBiasAct switches on a runtime
+// ActivationType and instantiates one CUTLASS epilogue per case, dragging the
+// whole grouped-GEMM template stack along with each. pie reaches exactly one:
+// nemotron_h is the only consumer of CutlassMoeFCRunner and passes Relu2
+// (ops/flashinfer_moe.cu holds the only ActivationType:: uses in
+// driver/cuda/src). Like marlin, pie's code fixes this, not the checkpoint.
+//
+// Consequence for CMake: the vendored fused sm80 launchers are only reachable
+// when the epilogue is Silu or FtGelu, so with Relu2 alone they are dead and
+// third_party/flashinfer_generated/ drops out of the build entirely.
+//
+// NOTE: unlike attention and marlin, a missing entry here cannot be caught at
+// compile time -- the arch -> runner binding is a runtime decision. Routing a
+// new MoE arch through CutlassMoeFCRunner requires adding its activation here,
+// or it throws at run time.
+PIE_MOE_ACTIVATION(Relu2)  // nemotron_h
+
+#undef PIE_ATTN_HEAD_DIM
+#undef PIE_ATTN_DECODE_GQA
+#undef PIE_MARLIN_SHAPE
+#undef PIE_MOE_ACTIVATION

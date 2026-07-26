@@ -16,6 +16,7 @@
 #include <flashinfer/utils.cuh>
 
 #include "config.hpp"
+#include "kernels_manifest.hpp"
 #include "model/config.hpp"
 
 namespace pie_cuda_driver {
@@ -64,8 +65,7 @@ std::size_t attention_float_workspace_bytes(const HfConfig& hf,
     // it is sized unconditionally rather than gated on the decode
     // fast-path.
     const bool supported_head_dim =
-        hf.head_dim_kernel == 64 || hf.head_dim_kernel == 128 ||
-        hf.head_dim_kernel == 256 || hf.head_dim_kernel == 512;
+        attn_head_dim_instantiated(hf.head_dim_kernel);
     if (hf.num_attention_heads <= 0 || hf.num_key_value_heads <= 0 ||
         !supported_head_dim || prop.multiProcessorCount <= 0) {
         return base;

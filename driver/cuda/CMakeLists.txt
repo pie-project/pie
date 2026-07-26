@@ -25,11 +25,8 @@ endif()
 
 project(PIE_DRIVER_CUDA CUDA CXX)
 
-# Optional compiler cache (sccache/ccache) for host C++ compiles; speeds
-# clean rebuilds / branch switches. nvcc is NOT auto-launched: sccache
-# mishandles nvcc's fatbinary temp files (intermittent SIGHUP-killed
-# server). Opt in explicitly with -DCMAKE_CUDA_COMPILER_LAUNCHER=... if your
-# sccache build is known-good with nvcc.
+# Optional compiler cache; speeds clean rebuilds / branch switches.
+# Host C/C++ accepts either sccache or ccache.
 if(NOT CMAKE_C_COMPILER_LAUNCHER AND NOT CMAKE_CXX_COMPILER_LAUNCHER)
   if(DEFINED ENV{PIE_COMPILER_LAUNCHER} AND NOT "$ENV{PIE_COMPILER_LAUNCHER}" STREQUAL "")
     set(PIE_COMPILER_LAUNCHER "$ENV{PIE_COMPILER_LAUNCHER}")
@@ -39,13 +36,65 @@ if(NOT CMAKE_C_COMPILER_LAUNCHER AND NOT CMAKE_CXX_COMPILER_LAUNCHER)
   if(PIE_COMPILER_LAUNCHER)
     set(CMAKE_C_COMPILER_LAUNCHER "${PIE_COMPILER_LAUNCHER}")
     set(CMAKE_CXX_COMPILER_LAUNCHER "${PIE_COMPILER_LAUNCHER}")
-    message(STATUS "Using compiler launcher (C/C++ only): ${PIE_COMPILER_LAUNCHER}")
+    message(STATUS "Using compiler launcher (C/C++): ${PIE_COMPILER_LAUNCHER}")
+  endif()
+endif()
+
+# nvcc is launched through ccache ONLY. sccache mishandles nvcc's fatbinary
+# temp files (intermittent SIGHUP-killed server); ccache 4.x handles nvcc
+# correctly. Caching .cu matters far more than caching host C/C++: .cu
+# objects are ~95% of this build's CPU time, so a host-only cache leaves
+# nearly all of a rebuild uncached. Set -DCMAKE_CUDA_COMPILER_LAUNCHER=
+# explicitly to opt out or to force a different launcher.
+if(NOT DEFINED CMAKE_CUDA_COMPILER_LAUNCHER)
+  find_program(PIE_CUDA_COMPILER_LAUNCHER NAMES ccache)
+  if(PIE_CUDA_COMPILER_LAUNCHER)
+    set(CMAKE_CUDA_COMPILER_LAUNCHER "${PIE_CUDA_COMPILER_LAUNCHER}")
+    message(STATUS "Using CUDA compiler launcher: ${PIE_CUDA_COMPILER_LAUNCHER}")
+  else()
+    message(STATUS "ccache not found; nvcc compiles will not be cached")
   endif()
 endif()
 
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
+
+# ---- kernels.def ----------------------------------------------------------
+# Single source of truth for model-derived kernel variants, read by both C++
+# (as an X-macro include) and CMake (here). See src/kernels.def for the rule
+# about which axes may live there. CMake needs exactly two facts from it:
+# which head_dims get their own translation unit, and which MoE activations
+# are reachable.
+set(PIE_KERNELS_DEF "${CMAKE_CURRENT_SOURCE_DIR}/src/kernels.def")
+if(NOT EXISTS "${PIE_KERNELS_DEF}")
+  message(FATAL_ERROR "missing kernel manifest: ${PIE_KERNELS_DEF}")
+endif()
+set_property(DIRECTORY APPEND
+  PROPERTY CMAKE_CONFIGURE_DEPENDS "${PIE_KERNELS_DEF}")
+
+# Collect the arguments of every `<macro_name>(...)` invocation. Only lines
+# that *start* with the macro name are matched, so the #ifndef/#define/#undef
+# scaffolding and the prose comments are skipped.
+function(pie_read_kernels_def macro_name out_var)
+  file(STRINGS "${PIE_KERNELS_DEF}" _lines REGEX "^[ \t]*${macro_name}\\(")
+  set(_vals "")
+  foreach(_line IN LISTS _lines)
+    string(REGEX REPLACE "^[ \t]*${macro_name}\\(([^)]*)\\).*$" "\\1" _arg "${_line}")
+    string(REGEX REPLACE "[ \t]" "" _arg "${_arg}")
+    list(APPEND _vals "${_arg}")
+  endforeach()
+  set(${out_var} "${_vals}" PARENT_SCOPE)
+endfunction()
+
+pie_read_kernels_def(PIE_ATTN_HEAD_DIM PIE_ATTN_HEAD_DIMS)
+pie_read_kernels_def(PIE_MOE_ACTIVATION PIE_MOE_ACTIVATIONS)
+if(NOT PIE_ATTN_HEAD_DIMS)
+  message(FATAL_ERROR
+    "no PIE_ATTN_HEAD_DIM entries found in ${PIE_KERNELS_DEF}")
+endif()
+message(STATUS "Attention head_dims: ${PIE_ATTN_HEAD_DIMS}")
+message(STATUS "MoE activations: ${PIE_MOE_ACTIVATIONS}")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -225,93 +274,110 @@ else()
   message(STATUS "FlashInfer Mamba SM90 vertical/horizontal SSU kernels disabled (legacy + simple algorithm only)")
 endif()
 
-# Local PTIR development only needs the Qwen families. Opt-in (the dev build
-# script flips it ON): an unconfigured release must ship every model, not a
-# Qwen-only driver.
-option(PIE_CUDA_QWEN_ONLY
-  "Build only Qwen 3 and Qwen 3.5 CUDA model implementations" OFF)
-
+# Every CUDA model implementation. The registry (src/model/registry.cpp)
+# binds these by architecture name at load time.
 set(PIE_CUDA_MODEL_SOURCES
+  src/kernels/altup.cu
+  src/kernels/altup_aux.cu
+  src/kernels/attn_sink.cu
+  src/kernels/dsa_indexer.cu
+  src/kernels/dsv4_compress.cu
+  src/kernels/dsv4_hc.cu
+  src/kernels/dsv4_routing.cu
+  src/kernels/gaussian_topk.cu
+  src/kernels/kimi_mla.cu
+  src/kernels/mla_paged.cu
+  src/kernels/nemotron_h.cu
+  src/kernels/scalar_mul.cu
+  src/kernels/softcap.cu
   src/model/config.cpp
-  src/model/loaded_model.cpp
-  src/model/registry.cpp
-  src/model/weight_store.cpp
-  src/model/workspace.cpp
+  src/model/csm/csm.cpp
+  src/model/csm/csm_backbone_forward.cu
+  src/model/csm/csm_depth_decoder_forward.cu
+  src/model/csm/csm_model.cpp
+  src/model/csm/mimi_decoder_adapter.cpp
+  src/model/csm/mimi_decoder_forward.cu
+  src/model/deepseek_v4/deepseek_v4.cpp
+  src/model/deepseek_v4/deepseek_v4_forward.cpp
+  src/model/deepseek_v4/deepseek_v4_model.cpp
+  src/model/gemma/gemma2.cpp
+  src/model/gemma/gemma2_model.cpp
+  src/model/gemma3n/gemma3n.cpp
+  src/model/gemma3n/gemma3n_model.cpp
+  src/model/gemma4/gemma4.cpp
+  src/model/gemma4/gemma4_audio_adapter.cpp
+  src/model/gemma4/gemma4_audio_forward.cu
+  src/model/gemma4/gemma4_model.cpp
+  src/model/gemma4/gemma4_vision_adapter.cpp
+  src/model/gemma4/gemma4_vision_forward.cu
+  src/model/glm5/glm5.cpp
+  src/model/glm5/glm5_forward.cpp
+  src/model/glm5/glm5_model.cpp
+  src/model/kimi/kimi.cpp
+  src/model/kimi/kimi_forward.cpp
+  src/model/kimi/kimi_model.cpp
   src/model/llama_like/llama_like.cpp
   src/model/llama_like/llama_like_model.cpp
+  src/model/llama_like/mistral3.cpp
   src/model/llama_like/qwen3.cpp
+  src/model/loaded_model.cpp
+  src/model/mixtral/gpt_oss.cpp
+  src/model/mixtral/mixtral.cpp
+  src/model/mixtral/mixtral_model.cpp
+  src/model/nemotron_h/nemotron_h.cpp
+  src/model/nemotron_h/nemotron_h_forward.cpp
+  src/model/nemotron_h/nemotron_h_model.cpp
   src/model/qwen3_5/qwen3_5.cpp
   src/model/qwen3_5/qwen3_5_config.cpp
   src/model/qwen3_5/qwen3_5_forward.cpp
   src/model/qwen3_5/qwen3_5_model.cpp
   src/model/qwen3_5/qwen3_5_moe.cpp
   src/model/qwen3_5/qwen3_5_moe_forward.cpp
-  src/model/qwen3_5/qwen3_5_moe_model.cpp)
-
-if(PIE_CUDA_QWEN_ONLY)
-  message(STATUS "Building Qwen-only CUDA model registry")
-else()
-  list(APPEND PIE_CUDA_MODEL_SOURCES
-    src/model/csm/csm.cpp
-    src/model/csm/csm_backbone_forward.cu
-    src/model/csm/csm_depth_decoder_forward.cu
-    src/model/csm/csm_model.cpp
-    src/model/csm/mimi_decoder_adapter.cpp
-    src/model/csm/mimi_decoder_forward.cu
-    src/model/deepseek_v4/deepseek_v4.cpp
-    src/model/deepseek_v4/deepseek_v4_forward.cpp
-    src/model/deepseek_v4/deepseek_v4_model.cpp
-    src/model/gemma/gemma2.cpp
-    src/model/gemma/gemma2_model.cpp
-    src/model/gemma3n/gemma3n.cpp
-    src/model/gemma3n/gemma3n_model.cpp
-    src/model/gemma4/gemma4.cpp
-    src/model/gemma4/gemma4_audio_adapter.cpp
-    src/model/gemma4/gemma4_audio_forward.cu
-    src/model/gemma4/gemma4_model.cpp
-    src/model/gemma4/gemma4_vision_adapter.cpp
-    src/model/gemma4/gemma4_vision_forward.cu
-    src/model/glm5/glm5.cpp
-    src/model/glm5/glm5_forward.cpp
-    src/model/glm5/glm5_model.cpp
-    src/model/kimi/kimi.cpp
-    src/model/kimi/kimi_forward.cpp
-    src/model/kimi/kimi_model.cpp
-    src/model/llama_like/mistral3.cpp
-    src/model/mixtral/gpt_oss.cpp
-    src/model/mixtral/mixtral.cpp
-    src/model/mixtral/mixtral_model.cpp
-    src/model/nemotron_h/nemotron_h.cpp
-    src/model/nemotron_h/nemotron_h_forward.cpp
-    src/model/nemotron_h/nemotron_h_model.cpp
-    src/model/qwen3_vl/qwen3_vl.cpp
-    src/model/qwen3_vl/qwen3_vl_model.cpp
-    src/model/qwen3_vl/qwen3_vl_vision_adapter.cpp
-    src/model/qwen3_vl/qwen3_vl_vision_forward.cu
-    src/ops/attention_mla.cu
-    src/ops/flashinfer_mamba.cu
-    src/kernels/altup.cu
-    src/kernels/altup_aux.cu
-    src/kernels/attn_sink.cu
-    src/kernels/dsa_indexer.cu
-    src/kernels/dsv4_compress.cu
-    src/kernels/dsv4_hc.cu
-    src/kernels/dsv4_routing.cu
-    src/kernels/gaussian_topk.cu
-    src/kernels/kimi_mla.cu
-    src/kernels/mla_paged.cu
-    src/kernels/nemotron_h.cu
-    src/kernels/scalar_mul.cu
-    src/kernels/softcap.cu
-    src/store/dsa_cache.cpp
-    src/store/mla_cache.cpp)
-endif()
+  src/model/qwen3_5/qwen3_5_moe_model.cpp
+  src/model/qwen3_vl/qwen3_vl.cpp
+  src/model/qwen3_vl/qwen3_vl_model.cpp
+  src/model/qwen3_vl/qwen3_vl_vision_adapter.cpp
+  src/model/qwen3_vl/qwen3_vl_vision_forward.cu
+  src/model/registry.cpp
+  src/model/weight_store.cpp
+  src/model/workspace.cpp
+  src/ops/attention_mla.cu
+  src/ops/flashinfer_mamba.cu
+  src/store/dsa_cache.cpp
+  src/store/mla_cache.cpp)
 
 # ---- pie_driver_cuda_lib ---------------------------------------------------
 # Native CUDA backend. `pie_driver_cuda_lib` is linked in-process by the Rust
 # worker; `pie_driver_cuda` below is a thin direct-create diagnostic shim.
 # Every production translation unit under src/ is listed exactly once, grouped
 # to match the module tree (see README.md).
+
+# One attention translation unit per head_dim in kernels.def. These cannot be
+# generated -- a macro cannot expand to a source file -- so they are checked in
+# next to the primary TU and verified here instead.
+set(PIE_ATTENTION_HEAD_DIM_SOURCES)
+foreach(_pie_hd IN LISTS PIE_ATTN_HEAD_DIMS)
+  set(_pie_hd_src "src/ops/attention_flashinfer_hd${_pie_hd}.cu")
+  if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_pie_hd_src}")
+    message(FATAL_ERROR
+      "kernels.def declares PIE_ATTN_HEAD_DIM(${_pie_hd}) but ${_pie_hd_src} "
+      "is missing. Copy an existing attention_flashinfer_hd*.cu and change the "
+      "explicit instantiation to AttnHd<${_pie_hd}>.")
+  endif()
+  list(APPEND PIE_ATTENTION_HEAD_DIM_SOURCES "${_pie_hd_src}")
+endforeach()
+# ...and the reverse: a stub with no kernels.def entry would silently compile
+# nothing, since the header only declares the head_dims kernels.def lists.
+file(GLOB _pie_hd_stubs RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/ops/attention_flashinfer_hd*.cu")
+foreach(_pie_hd_src IN LISTS _pie_hd_stubs)
+  if(NOT _pie_hd_src IN_LIST PIE_ATTENTION_HEAD_DIM_SOURCES)
+    message(FATAL_ERROR
+      "${_pie_hd_src} has no matching PIE_ATTN_HEAD_DIM entry in "
+      "${PIE_KERNELS_DEF}; add one or delete the file.")
+  endif()
+endforeach()
+
 add_library(pie_driver_cuda_lib STATIC
   src/abi.cpp
   src/context.cpp
@@ -343,6 +409,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/loader/safetensors_manifest.cpp
   # ops/ -- attention / GEMM / MoE / SSM wrappers
   src/ops/attention_flashinfer.cu
+  ${PIE_ATTENTION_HEAD_DIM_SOURCES}
   ${PIE_CUDA_FLASHINFER_HOPPER_SOURCE}
   src/ops/attention_naive.cu
   src/ops/attention_naive_paged.cu
@@ -387,10 +454,6 @@ add_library(pie_driver_cuda_lib STATIC
   src/kernels/transcode.cu
 )
 
-if(PIE_CUDA_QWEN_ONLY)
-  target_compile_definitions(pie_driver_cuda_lib PUBLIC PIE_CUDA_QWEN_ONLY=1)
-endif()
-
 target_compile_options(pie_driver_cuda_lib PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:
     -Xcompiler=-Wall
@@ -431,20 +494,43 @@ target_link_libraries(pie_driver_cuda PRIVATE pie_driver_cuda_lib)
 # Python codegen and its tvm_ffi/pynvml/tqdm imports -- no external Python
 # deps. Refresh after bumping the vendored FlashInfer revision with:
 #   FLASHINFER_SRC=<src> driver/cuda/third_party/flashinfer_generated/regenerate.sh
+#
+# These define sm80_generic_fused_moe_gemm_kernelLauncher, which
+# moe_gemm_template_dispatch.h only reaches when the epilogue tag is
+# EpilogueOpDefaultSilu or EpilogueOpDefaultFtGelu. With kernels.def enabling
+# none of the activations that map onto those tags, every launcher here is
+# unreferenced and the whole set drops out of the build -- worth ~5 minutes of
+# cicc time, including the second-slowest translation unit in the project.
 set(PIE_FLASHINFER_MOE_GEN_DIR
   "${CMAKE_CURRENT_SOURCE_DIR}/third_party/flashinfer_generated")
-set(PIE_FLASHINFER_MOE_GENERATED_SOURCES
-  third_party/flashinfer_generated/gemm_grouped/80/cutlass_kernel_file_gemm_grouped_sm80_M16_group0.generated.cu
-  third_party/flashinfer_generated/gemm_grouped/80/cutlass_kernel_file_gemm_grouped_sm80_M16_group1.generated.cu
-  third_party/flashinfer_generated/gemm_grouped/80/cutlass_kernel_file_gemm_grouped_sm80_M16_group2.generated.cu
-  third_party/flashinfer_generated/gemm_grouped/80/cutlass_kernel_file_gemm_grouped_sm80_M32_group0.generated.cu
-  third_party/flashinfer_generated/gemm_grouped/80/cutlass_kernel_file_gemm_grouped_sm80_M32_group1.generated.cu
-  third_party/flashinfer_generated/gemm_grouped/80/cutlass_kernel_file_gemm_grouped_sm80_M64_group0.generated.cu
-  third_party/flashinfer_generated/gemm_grouped/80/cutlass_kernel_file_gemm_grouped_sm80_M64_group1.generated.cu
-  third_party/flashinfer_generated/gemm_grouped/80/cutlass_kernel_file_gemm_grouped_sm80_M128_group0.generated.cu
-  third_party/flashinfer_generated/gemm_grouped/80/cutlass_kernel_file_gemm_grouped_sm80_M128_group1.generated.cu)
-list(LENGTH PIE_FLASHINFER_MOE_GENERATED_SOURCES PIE_FLASHINFER_MOE_GENERATED_COUNT)
-message(STATUS "Using ${PIE_FLASHINFER_MOE_GENERATED_COUNT} FlashInfer generated MoE launchers")
+set(PIE_MOE_NEEDS_FUSED_LAUNCHERS OFF)
+foreach(_pie_act IN LISTS PIE_MOE_ACTIVATIONS)
+  # The four ActivationType values that moeGemmBiasAct maps onto those two
+  # tags; kept in sync by hand with the dispatch table in
+  # third_party/flashinfer_moe/moe_gemm_template_dispatch.h.
+  if(_pie_act STREQUAL "Silu" OR _pie_act STREQUAL "Swiglu"
+     OR _pie_act STREQUAL "Gelu" OR _pie_act STREQUAL "Geglu")
+    set(PIE_MOE_NEEDS_FUSED_LAUNCHERS ON)
+  endif()
+endforeach()
+if(PIE_MOE_NEEDS_FUSED_LAUNCHERS)
+  set(PIE_FLASHINFER_MOE_GENERATED_SOURCES
+    third_party/flashinfer_generated/gemm_grouped/80/cutlass_kernel_file_gemm_grouped_sm80_M16_group0.generated.cu
+    third_party/flashinfer_generated/gemm_grouped/80/cutlass_kernel_file_gemm_grouped_sm80_M16_group1.generated.cu
+    third_party/flashinfer_generated/gemm_grouped/80/cutlass_kernel_file_gemm_grouped_sm80_M16_group2.generated.cu
+    third_party/flashinfer_generated/gemm_grouped/80/cutlass_kernel_file_gemm_grouped_sm80_M32_group0.generated.cu
+    third_party/flashinfer_generated/gemm_grouped/80/cutlass_kernel_file_gemm_grouped_sm80_M32_group1.generated.cu
+    third_party/flashinfer_generated/gemm_grouped/80/cutlass_kernel_file_gemm_grouped_sm80_M64_group0.generated.cu
+    third_party/flashinfer_generated/gemm_grouped/80/cutlass_kernel_file_gemm_grouped_sm80_M64_group1.generated.cu
+    third_party/flashinfer_generated/gemm_grouped/80/cutlass_kernel_file_gemm_grouped_sm80_M128_group0.generated.cu
+    third_party/flashinfer_generated/gemm_grouped/80/cutlass_kernel_file_gemm_grouped_sm80_M128_group1.generated.cu)
+  list(LENGTH PIE_FLASHINFER_MOE_GENERATED_SOURCES PIE_FLASHINFER_MOE_GENERATED_COUNT)
+  message(STATUS "Using ${PIE_FLASHINFER_MOE_GENERATED_COUNT} FlashInfer generated MoE launchers")
+else()
+  set(PIE_FLASHINFER_MOE_GENERATED_SOURCES)
+  message(STATUS
+    "FlashInfer fused MoE launchers omitted: no Silu/Gelu-class activation in kernels.def")
+endif()
 
 # FlashInfer/TensorRT-LLM CUTLASS MoE runner. Kept as a separate OBJECT
 # library because its dependency slice (nv_internal/) is large and should
@@ -459,12 +545,16 @@ add_library(pie_flashinfer_cutlass_moe OBJECT
   ${flashinfer_SOURCE_DIR}/csrc/nv_internal/tensorrt_llm/kernels/preQuantScaleKernel.cu
   ${flashinfer_SOURCE_DIR}/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.cpp
   ${flashinfer_SOURCE_DIR}/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_tma_warp_specialized_input.cu
-  ${flashinfer_SOURCE_DIR}/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_bf16_bf16.cu
+  # Vendored so pie owns the activation dispatch; a quoted #include resolves
+  # against the including file's own directory first, so patching the header
+  # alone would be ignored by the upstream .cu.
+  third_party/flashinfer_moe/moe_gemm_kernels_bf16_bf16.cu
   ${flashinfer_SOURCE_DIR}/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.cu
   ${flashinfer_SOURCE_DIR}/csrc/nv_internal/tensorrt_llm/kernels/lora/lora.cpp
   ${PIE_FLASHINFER_MOE_GENERATED_SOURCES})
 target_include_directories(pie_flashinfer_cutlass_moe PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/flashinfer_moe
   ${PIE_CCCL_INCLUDE_DIRS}
   ${CUDAToolkit_INCLUDE_DIRS}
   ${flashinfer_SOURCE_DIR}/include
@@ -497,11 +587,7 @@ target_sources(pie_driver_cuda_lib PRIVATE
 # packed-weight GEMM on supported GPUs and fall back only on legacy targets.
 # Vendored under third_party/marlin/; the wrapper exposes a torch-free C++ API.
 option(PIE_CUDA_BUILD_MARLIN "Build vendored marlin W4A16/MXFP4 GEMM" ON)
-option(PIE_MARLIN_ALL_SHAPES
-  "Compile all Marlin dtype combos (fp16/bf16/int8 x u4/u4b8/fp8/mxfp4). \
-OFF (default) compiles only bf16x{u4,u4b8,mxfp4} -- the shapes pie dispatches."
-  OFF)
-# Env overrides (previously forwarded by worker/build.rs as -D...).
+# Env override (previously forwarded by worker/build.rs as -D...).
 if(DEFINED ENV{PIE_CUDA_BUILD_MARLIN})
   string(TOLOWER "$ENV{PIE_CUDA_BUILD_MARLIN}" _pie_marlin)
   if(_pie_marlin MATCHES "^(1|on|true|yes)$")
@@ -510,13 +596,44 @@ if(DEFINED ENV{PIE_CUDA_BUILD_MARLIN})
     set(PIE_CUDA_BUILD_MARLIN OFF)
   endif()
 endif()
-if(DEFINED ENV{PIE_MARLIN_ALL_SHAPES})
-  string(TOLOWER "$ENV{PIE_MARLIN_ALL_SHAPES}" _pie_marlin_all)
-  if(_pie_marlin_all MATCHES "^(1|on|true|yes)$")
-    set(PIE_MARLIN_ALL_SHAPES ON)
-  endif()
-endif()
 if(PIE_CUDA_BUILD_MARLIN)
+  # kernels.def owns the shape list, but it cannot drive marlin.cu directly: a
+  # macro cannot expand to an #include, and CUDA 13's static-linkage stubs
+  # force the single-TU #include layout (see below). So the list is written out
+  # in marlin.cu and reconciled here -- otherwise a drift between the two is
+  # invisible until it shows up as a missing kernel at run time or as several
+  # minutes of cicc time spent on shapes nothing dispatches.
+  pie_read_kernels_def(PIE_MARLIN_SHAPE PIE_MARLIN_SHAPES)
+  set(_pie_marlin_expected "")
+  foreach(_pie_shape IN LISTS PIE_MARLIN_SHAPES)
+    string(REPLACE "," ";" _pie_parts "${_pie_shape}")
+    list(LENGTH _pie_parts _pie_nparts)
+    if(NOT _pie_nparts EQUAL 3)
+      message(FATAL_ERROR
+        "PIE_MARLIN_SHAPE(${_pie_shape}) in ${PIE_KERNELS_DEF} needs exactly "
+        "three arguments: (activation dtype, quant type, output dtype)")
+    endif()
+    list(GET _pie_parts 0 _pie_act)
+    list(GET _pie_parts 1 _pie_quant)
+    list(GET _pie_parts 2 _pie_out)
+    list(APPEND _pie_marlin_expected
+      "sm80_kernel_${_pie_act}_${_pie_quant}_${_pie_out}.cu")
+  endforeach()
+
+  file(READ "${CMAKE_CURRENT_SOURCE_DIR}/third_party/marlin/marlin.cu" _pie_marlin_src)
+  string(REGEX MATCHALL "sm80_kernel_[A-Za-z0-9_]+\\.cu"
+    _pie_marlin_actual "${_pie_marlin_src}")
+  list(SORT _pie_marlin_expected)
+  list(SORT _pie_marlin_actual)
+  if(NOT _pie_marlin_expected STREQUAL _pie_marlin_actual)
+    message(FATAL_ERROR
+      "marlin shape drift.\n"
+      "  kernels.def: ${_pie_marlin_expected}\n"
+      "  marlin.cu:   ${_pie_marlin_actual}\n"
+      "Update the #include block in third_party/marlin/marlin.cu to match "
+      "${PIE_KERNELS_DEF}.")
+  endif()
+
   # CUDA 13 generates __global__ template stubs with static linkage,
   # breaking cross-TU explicit instantiations. marlin.cu #includes the
   # sm80_kernel_*.cu files directly so instantiation and selection share a
@@ -530,9 +647,6 @@ if(PIE_CUDA_BUILD_MARLIN)
   target_include_directories(pie_driver_cuda_lib PRIVATE
     third_party/marlin)
   target_compile_definitions(pie_driver_cuda_lib PRIVATE PIE_CUDA_HAS_MARLIN=1)
-  if(PIE_MARLIN_ALL_SHAPES)
-    target_compile_definitions(pie_driver_cuda_lib PRIVATE PIE_MARLIN_ALL_SHAPES=1)
-  endif()
 endif()
 
 # FlashInfer Mamba SSU on Hopper/Blackwell gates the vertical/horizontal
