@@ -504,17 +504,21 @@ def _candidate_kernel(
     low = tl.load(set_payload_ptr + offset, mask=listed, other=1)
     high = tl.load(set_payload_ptr + offset + length - 1, mask=listed, other=0)
     searching = listed & (token >= low) & (token <= high)
+    # A plain halving. A lane that has found its answer stops being active
+    # rather than having its bounds collapsed: writing `hi = lo` on a hit made
+    # `hi` depend on an already-updated `lo` within the same step, and a lane
+    # could then search backwards. Lanes that finish early idle, which costs
+    # the block nothing it was not already paying.
     lo = offset
     hi = offset + length
     at = tl.zeros((GROUP_BLOCK,), tl.int32) - 1
     for _ in range(0, SEARCH_STEPS):
-        active = searching & (lo < hi)
+        active = searching & (lo < hi) & (at < 0)
         middle = (lo + hi) // 2
         value = tl.load(set_payload_ptr + middle, mask=active, other=0)
-        hit = active & (value == token)
-        at = tl.where(hit, middle, at)
+        at = tl.where(active & (value == token), middle, at)
         lo = tl.where(active & (value < token), middle + 1, lo)
-        hi = tl.where(hit, lo, tl.where(active & (value > token), middle, hi))
+        hi = tl.where(active & (value > token), middle, hi)
     found = at >= 0
     complement = kind == _COMPLEMENT
     inside = tl.where(
@@ -819,7 +823,6 @@ class DeviceGrammar:
         # An advance keeps every reading that survives, not just the first, so
         # the candidate buffers are sized by the widest group in the grammar.
         self.max_readings = int(np.diff(readings).max()) if readings.size > 1 else 1
-        widest = int(np.diff(readings).max()) if readings.size > 1 else 1
         lengths = np.frombuffer(arrays["group_set_length"], dtype=np.uint32)
         longest = int(lengths.max()) if lengths.size else 1
         # The lanes of a block search in lockstep, so the loop runs a fixed
@@ -830,7 +833,10 @@ class DeviceGrammar:
         # tight enough for the scalar case left five schemas disagreeing with
         # the reference matcher. The margin is cheap: the extra iterations are
         # masked off for every lane that has finished.
-        self.search_steps = max(2, int(np.ceil(np.log2(longest + 2))) + 8)
+        # Lanes search in lockstep, so the loop runs a fixed number of times
+        # and every lane must have finished by then. A halving over `n` needs
+        # ceil(log2(n)) steps; the margin covers the ends being inclusive.
+        self.search_steps = max(2, int(np.ceil(np.log2(longest + 2))) + 2)
 
         def upload(name: str, dtype=torch.int32) -> torch.Tensor:
             return torch.frombuffer(bytearray(arrays[name]), dtype=dtype).cuda()
