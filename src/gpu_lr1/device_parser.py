@@ -38,6 +38,9 @@ import triton
 import triton.language as tl
 
 _GROUP_BLOCK = 64
+# Configurations admitted per pass. Bounds the replay scratch, which is one
+# stack copy per (sequence, configuration, group).
+_CONFIG_CHUNK = 4
 ACCEPT = -(2**31)
 SPARSE, COMPLEMENT, DENSE = 0, 1, 2
 
@@ -100,6 +103,7 @@ def _mask_kernel(
     overflow_ptr,
     mask_words,
     LIVE,
+    config_base,
     BATCH: tl.constexpr,
     CONFIGS: tl.constexpr,
     MAX_GROUPS: tl.constexpr,
@@ -123,7 +127,7 @@ def _mask_kernel(
     launched = tl.program_id(0)
     slot = tl.program_id(1)
     sequence = launched % BATCH
-    config = launched // BATCH
+    config = config_base + launched // BATCH
     if config >= tl.load(widest_ptr):
         return
     if config >= tl.load(config_count_ptr + sequence):
@@ -330,30 +334,13 @@ def _mask_kernel(
             use = use + 1
 
     if admitted == 1:
-        tl.store(admitted_ptr + launched * MAX_GROUPS + slot, 1)
+        tl.store(admitted_ptr + row_index * MAX_GROUPS + slot, 1)
         # A complement group is written here, before anything else: it sets the
         # whole mask and then punches its exclusions out, and the groups of one
         # lexer state are disjoint, so every other admitted group's tokens are
         # among those exclusions. Punching after them would erase them. The
         # additive groups follow in a second pass.
-        kind = tl.load(group_set_kind_ptr + group)
-        if kind == _COMPLEMENT:
-            offset = tl.load(group_set_offset_ptr + group)
-            length = tl.load(group_set_length_ptr + group)
-            row = mask_ptr + sequence * mask_words
-            for start in range(0, mask_words, BLOCK):
-                lane = start + tl.arange(0, BLOCK)
-                live = lane < mask_words
-                tl.atomic_or(row + lane, tl.full((BLOCK,), -1, tl.int32), mask=live)
-            for start in range(0, length, BLOCK):
-                lane = start + tl.arange(0, BLOCK)
-                live = lane < length
-                token = tl.load(set_payload_ptr + offset + lane, mask=live, other=0)
-                tl.atomic_and(
-                    row + token // 32,
-                    (~(1 << (token % 32))).to(tl.int32),
-                    mask=live,
-                )
+
 
 
 @triton.jit
@@ -371,24 +358,53 @@ def _scatter_kernel(
     BATCH: tl.constexpr,
     CONFIGS: tl.constexpr,
     MAX_GROUPS: tl.constexpr,
+    COMPLEMENTS_ONLY: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """Union the additive sets of the groups the first kernel admitted."""
+    """Write the sets of the admitted groups. Launched twice.
+
+    A complement sets the whole mask row and then punches its exclusions out,
+    and the groups of a lexer state are disjoint, so every other admitted
+    group's tokens are among those exclusions - writing a complement after them
+    would erase them. This used to live in the admission kernel, where one
+    launch covered every configuration and the ordering came for free. It no
+    longer does: admission runs in chunks so that its replay scratch is
+    bounded, and a complement in the first chunk would land after the additive
+    groups of the second. Two launches make the ordering the ordering of the
+    launches, which is the only ordering CUDA gives without a barrier.
+    """
     launched = tl.program_id(0)
     slot = tl.program_id(1)
-    if tl.load(admitted_ptr + launched * MAX_GROUPS + slot) == 0:
-        return
+    # Admission is recorded at the absolute row, since it runs in chunks and a
+    # chunk-relative index would have the chunks overwrite each other.
     sequence = launched % BATCH
     row_index = sequence * CONFIGS + launched // BATCH
+    if tl.load(admitted_ptr + row_index * MAX_GROUPS + slot) == 0:
+        return
     state = tl.load(lexer_state_ptr + row_index)
     group = tl.load(group_offsets_ptr + state) + slot
     kind = tl.load(group_set_kind_ptr + group)
-    if kind == _COMPLEMENT:
+    if COMPLEMENTS_ONLY == 1:
+        if kind != _COMPLEMENT:
+            return
+    elif kind == _COMPLEMENT:
         return
     offset = tl.load(group_set_offset_ptr + group)
     length = tl.load(group_set_length_ptr + group)
     row = mask_ptr + sequence * mask_words
-    if kind == _SPARSE:
+    if kind == _COMPLEMENT:
+        for start in range(0, mask_words, BLOCK):
+            lane = start + tl.arange(0, BLOCK)
+            live = lane < mask_words
+            tl.atomic_or(row + lane, tl.full((BLOCK,), -1, tl.int32), mask=live)
+        for start in range(0, length, BLOCK):
+            lane = start + tl.arange(0, BLOCK)
+            live = lane < length
+            token = tl.load(set_payload_ptr + offset + lane, mask=live, other=0)
+            tl.atomic_and(
+                row + token // 32, (~(1 << (token % 32))).to(tl.int32), mask=live
+            )
+    elif kind == _SPARSE:
         for start in range(0, length, BLOCK):
             lane = start + tl.arange(0, BLOCK)
             live = lane < length
@@ -1123,17 +1139,30 @@ class DeviceBatch:
         self.config_count = torch.ones(batch, dtype=torch.int32, device="cuda")
         # Two stacks per program: one for the reading being replayed, one for
         # probing what a pending lexeme could still become.
-        self.scratch = torch.zeros(
-            (rows * self.max_groups, 2 * grammar.max_stack),
-            dtype=torch.int32,
-            device="cuda",
-        )
+        # Sized for the configurations actually in play, not for the ceiling.
+        #
+        # A program needs its own copy of the stack it is replaying, so the
+        # scratch is one per (sequence, configuration, group) - and at the
+        # ceiling of 128 on a wide schema at batch 512 that is 44 GB, which
+        # simply does not allocate. The ceiling exists because some documents
+        # reach it; the sets in play are almost always one or two, and `live`
+        # already tracks that. Growing the buffer when `live` does costs a
+        # reallocation on the rare step that widens a parse.
+        self.scratch = self._scratch_for(_CONFIG_CHUNK)
         # The advance indexes its scratch by block, not by group - it sweeps
         # sixty-four groups per program where the fill takes one - so the two
         # cannot share a buffer. Sharing it had them writing over each other's
         # replays, which cost far more than the memory saved.
         self.advance_scratch = torch.zeros(
-            (rows * self.advance_blocks, 2 * grammar.max_stack),
+            (batch * self.advance_blocks, 2 * grammar.max_stack),
+            dtype=torch.int32,
+            device="cuda",
+        )
+        self.advance_live = 1
+
+    def _scratch_for(self, live: int) -> torch.Tensor:
+        return torch.zeros(
+            (self.batch * live * self.max_groups, 2 * self.grammar.max_stack),
             dtype=torch.int32,
             device="cuda",
         )
@@ -1216,6 +1245,13 @@ class DeviceBatch:
         self.old_lexer.copy_(self.lexer_state)
         self.old_count.copy_(self.config_count)
         live = self.live
+        if self.advance_live < live:
+            self.advance_live = live
+            self.advance_scratch = torch.zeros(
+                (self.batch * live * self.advance_blocks, 2 * grammar.max_stack),
+                dtype=torch.int32,
+                device="cuda",
+            )
         _candidate_kernel[(self.batch * live, self.advance_blocks)](
             grammar.group_offsets,
             grammar.group_set_kind,
@@ -1391,44 +1427,72 @@ class DeviceBatch:
             num_warps=1,
         )
         live = self.live
-        _mask_kernel[(self.batch * live, self.max_groups)](
+        # Wide parses run the admission pass in chunks so the replay scratch is
+        # reused rather than sized for the widest set the batch might hold. One
+        # program needs its own stack copy, and at a ceiling of 128 on a wide
+        # schema at batch 512 that would be 44 GB - which does not allocate.
+        # The chunk is only entered more than once when a parse has genuinely
+        # widened, which is rare.
+        for config_base in range(0, live, _CONFIG_CHUNK):
+            span = min(_CONFIG_CHUNK, live - config_base)
+            _mask_kernel[(self.batch * span, self.max_groups)](
+                grammar.group_offsets,
+                grammar.group_set_kind,
+                grammar.group_set_offset,
+                grammar.group_set_length,
+                grammar.set_payload,
+                grammar.reading_offsets,
+                grammar.reading_index,
+                grammar.reading_next_state,
+                grammar.reading_term_offsets,
+                grammar.reading_terminals,
+                grammar.action_offsets,
+                grammar.action_terminals,
+                grammar.action_values,
+                grammar.goto_offsets,
+                grammar.goto_nonterminals,
+                grammar.goto_targets,
+                grammar.production_lhs,
+                grammar.production_arity,
+                grammar.pending_offsets,
+                grammar.pending_terminals,
+                self.lexer_state,
+                self.stack,
+                self.depth,
+                self.config_count,
+                self.widest,
+                self.representative,
+                self.scratch,
+                self.admitted,
+                self.mask,
+                self.overflow,
+                grammar.mask_words,
+                live,
+                config_base,
+                BATCH=self.batch,
+                CONFIGS=self.configs,
+                MAX_GROUPS=self.max_groups,
+                STACK_STRIDE=grammar.max_stack,
+                MAX_REDUCTIONS=grammar.max_reductions,
+                BLOCK=128,
+                num_warps=1,
+            )
+
+        _scatter_kernel[(self.batch * live, self.max_groups)](
             grammar.group_offsets,
             grammar.group_set_kind,
             grammar.group_set_offset,
             grammar.group_set_length,
             grammar.set_payload,
-            grammar.reading_offsets,
-            grammar.reading_index,
-            grammar.reading_next_state,
-            grammar.reading_term_offsets,
-            grammar.reading_terminals,
-            grammar.action_offsets,
-            grammar.action_terminals,
-            grammar.action_values,
-            grammar.goto_offsets,
-            grammar.goto_nonterminals,
-            grammar.goto_targets,
-            grammar.production_lhs,
-            grammar.production_arity,
-            grammar.pending_offsets,
-            grammar.pending_terminals,
             self.lexer_state,
-            self.stack,
-            self.depth,
-            self.config_count,
-            self.widest,
-            self.representative,
-            self.scratch,
             self.admitted,
             self.mask,
-            self.overflow,
             grammar.mask_words,
             live,
             BATCH=self.batch,
             CONFIGS=self.configs,
             MAX_GROUPS=self.max_groups,
-            STACK_STRIDE=grammar.max_stack,
-            MAX_REDUCTIONS=grammar.max_reductions,
+            COMPLEMENTS_ONLY=1,
             BLOCK=128,
             num_warps=1,
         )
@@ -1446,6 +1510,7 @@ class DeviceBatch:
             BATCH=self.batch,
             CONFIGS=self.configs,
             MAX_GROUPS=self.max_groups,
+            COMPLEMENTS_ONLY=0,
             BLOCK=128,
             num_warps=1,
         )
