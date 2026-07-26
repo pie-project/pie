@@ -1,3 +1,11 @@
+//! The DSL's op constructors record what they claim to record.
+//!
+//! Each test traces a program, then checks both halves of the claim: the
+//! emitted op tags, and what the reference interpreter computes from them.
+//! Checking only the tags would pass for a program that assembles the right
+//! ops in the wrong order, and checking only the result would pass for one
+//! that reaches the answer through a library op the backends do not have.
+
 use pie_dsl::builder::Builder;
 use pie_dsl::prelude::*;
 use pie_dsl::ptir::op::Op;

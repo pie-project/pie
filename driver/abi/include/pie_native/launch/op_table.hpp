@@ -12,10 +12,15 @@
 // so it is a no-op sync).
 //
 // This header adds the driver-side metadata echo's table does not carry:
-// per-op OpFamily / LaunchClass / ResultKind, which drive launch-shape
-// selection and tier-1 fusion cut points. Composite ops (softmax, gumbel, …) are
-// NOT container ops — the container carries their core-op expansion (echo's
-// `expand.rs`); we keep them as tier-1 fused-kernel forms at private tags 0xE0+.
+// per-op arity and result count, which `op_result_count` and the Rust-side
+// `op_table_drift` test read. It once also carried OpFamily / LaunchClass /
+// ResultKind taxonomies, described as driving launch-shape selection and
+// tier-1 fusion cut points; nothing ever read them, and a column no code
+// consults cannot be wrong loudly, so they were removed rather than kept as a
+// claim about the driver that the driver does not make. Composite ops (softmax,
+// gumbel, …) are NOT container ops — the container carries their core-op
+// expansion (echo's `expand.rs`); we keep them as tier-1 fused-kernel forms at
+// private tags 0xE0+.
 
 #include <cstdint>
 #include <string_view>
@@ -81,95 +86,81 @@ enum class OpCode : std::uint8_t {
     IntrinsicVal = PTIR_OP_INTRINSIC_VAL, KernelCall = PTIR_OP_KERNEL_CALL, SinkCall = PTIR_OP_SINK_CALL,
 };
 
-enum class OpFamily : std::uint8_t {
-    Map, Compare, Choice, Shape, Index, Reduce, Order, Linear, Sampling, Structural,
-};
-
-enum class ResultKind : std::uint8_t { SameAsInput, Bool, Index, Custom, None };
-
-enum class LaunchClass : std::uint8_t {
-    Elementwise, RowLocal, Gather, Scatter, Library, Materialize, Alias, Structural,
-};
-
 struct OpInfo {
     OpCode      code;
-    OpFamily    family;
-    LaunchClass launch;
-    ResultKind  result;
     std::uint8_t arity;      // value-operand count (0xFE = variadic, 0xFF = unknown)
     std::uint8_t results;    // SSA ids defined (0 for chan_put/sink_call, 2 for sort/top_k)
     std::string_view name;
 };
 
 inline constexpr OpInfo op_info(OpCode c) {
-    using F = OpFamily; using L = LaunchClass; using R = ResultKind;
     switch (c) {
-        case OpCode::Exp:   return {c, F::Map, L::Elementwise, R::SameAsInput, 1, 1, "exp"};
-        case OpCode::Log:   return {c, F::Map, L::Elementwise, R::SameAsInput, 1, 1, "log"};
-        case OpCode::Neg:   return {c, F::Map, L::Elementwise, R::SameAsInput, 1, 1, "neg"};
-        case OpCode::Recip: return {c, F::Map, L::Elementwise, R::SameAsInput, 1, 1, "recip"};
-        case OpCode::Abs:   return {c, F::Map, L::Elementwise, R::SameAsInput, 1, 1, "abs"};
-        case OpCode::Sign:  return {c, F::Map, L::Elementwise, R::SameAsInput, 1, 1, "sign"};
-        case OpCode::Cast:  return {c, F::Map, L::Elementwise, R::Custom,      1, 1, "cast"};
-        case OpCode::Add:   return {c, F::Map, L::Elementwise, R::SameAsInput, 2, 1, "add"};
-        case OpCode::Sub:   return {c, F::Map, L::Elementwise, R::SameAsInput, 2, 1, "sub"};
-        case OpCode::Mul:   return {c, F::Map, L::Elementwise, R::SameAsInput, 2, 1, "mul"};
-        case OpCode::Div:   return {c, F::Map, L::Elementwise, R::SameAsInput, 2, 1, "div"};
-        case OpCode::MaxElem: return {c, F::Map, L::Elementwise, R::SameAsInput, 2, 1, "max_elem"};
-        case OpCode::MinElem: return {c, F::Map, L::Elementwise, R::SameAsInput, 2, 1, "min_elem"};
+        case OpCode::Exp:   return {c, 1, 1, "exp"};
+        case OpCode::Log:   return {c, 1, 1, "log"};
+        case OpCode::Neg:   return {c, 1, 1, "neg"};
+        case OpCode::Recip: return {c, 1, 1, "recip"};
+        case OpCode::Abs:   return {c, 1, 1, "abs"};
+        case OpCode::Sign:  return {c, 1, 1, "sign"};
+        case OpCode::Cast:  return {c, 1, 1, "cast"};
+        case OpCode::Add:   return {c, 2, 1, "add"};
+        case OpCode::Sub:   return {c, 2, 1, "sub"};
+        case OpCode::Mul:   return {c, 2, 1, "mul"};
+        case OpCode::Div:   return {c, 2, 1, "div"};
+        case OpCode::MaxElem: return {c, 2, 1, "max_elem"};
+        case OpCode::MinElem: return {c, 2, 1, "min_elem"};
 
-        case OpCode::Gt: return {c, F::Compare, L::Elementwise, R::Bool, 2, 1, "gt"};
-        case OpCode::Ge: return {c, F::Compare, L::Elementwise, R::Bool, 2, 1, "ge"};
-        case OpCode::Eq: return {c, F::Compare, L::Elementwise, R::Bool, 2, 1, "eq"};
-        case OpCode::Ne: return {c, F::Compare, L::Elementwise, R::Bool, 2, 1, "ne"};
-        case OpCode::Lt: return {c, F::Compare, L::Elementwise, R::Bool, 2, 1, "lt"};
-        case OpCode::Le: return {c, F::Compare, L::Elementwise, R::Bool, 2, 1, "le"};
-        case OpCode::And: return {c, F::Compare, L::Elementwise, R::Bool, 2, 1, "and"};
-        case OpCode::Or:  return {c, F::Compare, L::Elementwise, R::Bool, 2, 1, "or"};
-        case OpCode::Not: return {c, F::Compare, L::Elementwise, R::Bool, 1, 1, "not"};
-        case OpCode::Rem: return {c, F::Map, L::Elementwise, R::SameAsInput, 2, 1, "rem"};
+        case OpCode::Gt: return {c, 2, 1, "gt"};
+        case OpCode::Ge: return {c, 2, 1, "ge"};
+        case OpCode::Eq: return {c, 2, 1, "eq"};
+        case OpCode::Ne: return {c, 2, 1, "ne"};
+        case OpCode::Lt: return {c, 2, 1, "lt"};
+        case OpCode::Le: return {c, 2, 1, "le"};
+        case OpCode::And: return {c, 2, 1, "and"};
+        case OpCode::Or:  return {c, 2, 1, "or"};
+        case OpCode::Not: return {c, 1, 1, "not"};
+        case OpCode::Rem: return {c, 2, 1, "rem"};
 
-        case OpCode::Select: return {c, F::Choice, L::Elementwise, R::SameAsInput, 3, 1, "select"};
+        case OpCode::Select: return {c, 3, 1, "select"};
 
-        case OpCode::ReduceSum:    return {c, F::Reduce, L::RowLocal, R::SameAsInput, 1, 1, "reduce_sum"};
-        case OpCode::ReduceMax:    return {c, F::Reduce, L::RowLocal, R::SameAsInput, 1, 1, "reduce_max"};
-        case OpCode::ReduceMin:    return {c, F::Reduce, L::RowLocal, R::SameAsInput, 1, 1, "reduce_min"};
-        case OpCode::ReduceArgmax: return {c, F::Reduce, L::RowLocal, R::Index,       1, 1, "reduce_argmax"};
-        case OpCode::CumSum:       return {c, F::Reduce, L::RowLocal, R::SameAsInput, 1, 1, "cumsum"};
-        case OpCode::CumProd:      return {c, F::Reduce, L::RowLocal, R::SameAsInput, 1, 1, "cumprod"};
+        case OpCode::ReduceSum:    return {c, 1, 1, "reduce_sum"};
+        case OpCode::ReduceMax:    return {c, 1, 1, "reduce_max"};
+        case OpCode::ReduceMin:    return {c, 1, 1, "reduce_min"};
+        case OpCode::ReduceArgmax: return {c, 1, 1, "reduce_argmax"};
+        case OpCode::CumSum:       return {c, 1, 1, "cumsum"};
+        case OpCode::CumProd:      return {c, 1, 1, "cumprod"};
 
-        case OpCode::Broadcast: return {c, F::Shape, L::Materialize, R::SameAsInput, 1, 1, "broadcast"};
-        case OpCode::Reshape:   return {c, F::Shape, L::Alias,       R::SameAsInput, 1, 1, "reshape"};
-        case OpCode::Transpose: return {c, F::Shape, L::Materialize, R::SameAsInput, 1, 1, "transpose"};
+        case OpCode::Broadcast: return {c, 1, 1, "broadcast"};
+        case OpCode::Reshape:   return {c, 1, 1, "reshape"};
+        case OpCode::Transpose: return {c, 1, 1, "transpose"};
 
-        case OpCode::SortDesc:       return {c, F::Order, L::Library,  R::Custom, 1, 2, "sort_desc"};
-        case OpCode::TopK:           return {c, F::Order, L::Library,  R::Custom, 1, 2, "top_k"};
-        case OpCode::PivotThreshold: return {c, F::Order, L::RowLocal, R::Bool,   2, 1, "pivot_threshold"};
+        case OpCode::SortDesc:       return {c, 1, 2, "sort_desc"};
+        case OpCode::TopK:           return {c, 1, 2, "top_k"};
+        case OpCode::PivotThreshold: return {c, 2, 1, "pivot_threshold"};
 
-        case OpCode::Matmul: return {c, F::Linear, L::Library, R::SameAsInput, 2, 1, "matmul"};
+        case OpCode::Matmul: return {c, 2, 1, "matmul"};
 
-        case OpCode::Gather:     return {c, F::Index, L::Gather,  R::SameAsInput, 2, 1, "gather"};
-        case OpCode::GatherRow:  return {c, F::Index, L::Gather,  R::SameAsInput, 2, 1, "gather_row"};
-        case OpCode::ScatterAdd: return {c, F::Index, L::Scatter, R::SameAsInput, 3, 1, "scatter_add"};
-        case OpCode::ScatterSet: return {c, F::Index, L::Scatter, R::SameAsInput, 3, 1, "scatter_set"};
-        case OpCode::Iota:       return {c, F::Index, L::Elementwise, R::Index,   0, 1, "iota"};
+        case OpCode::Gather:     return {c, 2, 1, "gather"};
+        case OpCode::GatherRow:  return {c, 2, 1, "gather_row"};
+        case OpCode::ScatterAdd: return {c, 3, 1, "scatter_add"};
+        case OpCode::ScatterSet: return {c, 3, 1, "scatter_set"};
+        case OpCode::Iota:       return {c, 0, 1, "iota"};
 
-        case OpCode::MaskApplyPacked: return {c, F::Sampling, L::Elementwise, R::SameAsInput, 2, 1, "mask_apply_packed"};
-        case OpCode::CausalMask: return {c, F::Index, L::Elementwise, R::Bool, 1, 1, "causal_mask"};
-        case OpCode::SlidingWindowMask: return {c, F::Index, L::Elementwise, R::Bool, 1, 1, "sliding_window_mask"};
-        case OpCode::SinkWindowMask: return {c, F::Index, L::Elementwise, R::Bool, 1, 1, "sink_window_mask"};
-        case OpCode::Rng:      return {c, F::Sampling, L::Elementwise, R::SameAsInput, 0, 1, "rng"};
-        case OpCode::RngKeyed: return {c, F::Sampling, L::Elementwise, R::SameAsInput, 1, 1, "rng_keyed"};
+        case OpCode::MaskApplyPacked: return {c, 2, 1, "mask_apply_packed"};
+        case OpCode::CausalMask: return {c, 1, 1, "causal_mask"};
+        case OpCode::SlidingWindowMask: return {c, 1, 1, "sliding_window_mask"};
+        case OpCode::SinkWindowMask: return {c, 1, 1, "sink_window_mask"};
+        case OpCode::Rng:      return {c, 0, 1, "rng"};
+        case OpCode::RngKeyed: return {c, 1, 1, "rng_keyed"};
 
-        case OpCode::Const:        return {c, F::Structural, L::Structural, R::Custom,      0, 1, "const"};
-        case OpCode::ChanTake:     return {c, F::Structural, L::Structural, R::Custom,      0, 1, "chan_take"};
-        case OpCode::ChanRead:     return {c, F::Structural, L::Structural, R::Custom,      0, 1, "chan_read"};
-        case OpCode::ChanPut:      return {c, F::Structural, L::Structural, R::None,        1, 0, "chan_put"};
-        case OpCode::IntrinsicVal: return {c, F::Structural, L::Structural, R::Custom,      0, 1, "intrinsic_val"};
-        case OpCode::KernelCall:   return {c, F::Structural, L::Structural, R::Custom,   0xFE, 1, "kernel_call"};
-        case OpCode::SinkCall:     return {c, F::Structural, L::Structural, R::None,     0xFE, 0, "sink_call"};
+        case OpCode::Const:        return {c, 0, 1, "const"};
+        case OpCode::ChanTake:     return {c, 0, 1, "chan_take"};
+        case OpCode::ChanRead:     return {c, 0, 1, "chan_read"};
+        case OpCode::ChanPut:      return {c, 1, 0, "chan_put"};
+        case OpCode::IntrinsicVal: return {c, 0, 1, "intrinsic_val"};
+        case OpCode::KernelCall:   return {c, 0xFE, 1, "kernel_call"};
+        case OpCode::SinkCall:     return {c, 0xFE, 0, "sink_call"};
     }
-    return {c, OpFamily::Map, LaunchClass::Alias, ResultKind::Custom, 0xFF, 1, "?"};
+    return {c, 0xFF, 1, "?"};
 }
 
 inline constexpr bool op_is_known(OpCode c) { return op_info(c).arity != 0xFF; }

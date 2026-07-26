@@ -1,11 +1,13 @@
-//! Tier-0 result-parity tests (the semantic correctness gate): the SDK-emitted
-//! §3 / greedy container, bound and run on the IR's reference interpreter
+//! Result parity with the IR's own fixtures — the semantic correctness gate.
+//!
+//! The SDK-emitted
+//! greedy container, bound and run on the IR's reference interpreter
 //! (`ptir::interp`, `eval` feature), yields the SAME TOKEN RESULTS as the IR's
 //! golden `greedy_argmax` / `section3_masked_gumbel` fixtures — and encode→decode
 //! round-trips. This is the correctness contract (NOT hash-equality with the IR's
 //! hand-built containers; emission order may differ, results may not).
 //!
-//! The guest does not bind (D6): [`Builder::build`] lowers + lints only, and
+//! The guest does not bind: [`Builder::build`] lowers + lints only, and
 //! these native parity tests bind explicitly against a test profile (the same
 //! validator `forward-pass.new` runs host-side).
 
@@ -194,7 +196,7 @@ fn build_section3() -> Traced {
         out.put(t);
     });
     // Host-endpoint signals: mask is host-written each step, out is host-read
-    // (the §3 host-loop `mask.put(..)` / `out.take()` — mark Writer/Reader).
+    // (the host-loop `mask.put(..)` / `out.take()` — mark Writer/Reader).
     mask.put(vec![true; V32 as usize]);
     let _ = out.take();
     b.build().expect("section3 builds")
@@ -237,7 +239,7 @@ fn section3_tier0_matches_golden() {
         *traced.container()
     );
 
-    // Per-instance seeds (D2): tok=BOS, len=1, rng=[1234,0] (the IR's golden seeds).
+    // Per-instance seeds: tok=BOS, len=1, rng=[1234,0] (the IR's golden seeds).
     let mut inst = Instance::new(
         &bound,
         &[

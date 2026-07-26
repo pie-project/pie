@@ -73,6 +73,67 @@ template <typename T>
   out[idx] = T((outhat * float(w[lid])) * siluz);
 }
 
+template <typename T>
+[[kernel]] void gated_rms_strided(
+    const device T* x        [[buffer(0)]],   // core_out [V_h, V_d]
+    const device T* z        [[buffer(1)]],   // gate     [V_h, V_d]
+    const device T* w        [[buffer(2)]],   // gate_norm_w [V_d] (raw, act dtype)
+    device T* out            [[buffer(3)]],   // [V_h, V_d]
+    constant GatedRmsParams& p [[buffer(4)]],
+    constant int& row_pitch    [[buffer(5)]],
+    uint3 tgpos       [[threadgroup_position_in_grid]],
+    uint3 tpg         [[threadgroups_per_grid]],
+    uint3 lid3        [[thread_position_in_threadgroup]],
+    uint  simd_lane   [[thread_index_in_simdgroup]],
+    uint  simd_group  [[simdgroup_index_in_threadgroup]]) {
+  const uint vd   = p.vd;
+  const uint head = tgpos.y;          // value-head index
+  const uint lid  = lid3.x;
+  (void)tpg;
+  // Prefill layout: rows are a uniform `row_pitch` elements apart, so the whole
+  // prompt runs as one dispatch.  Arithmetic is identical to `gated_rms`.
+  const size_t idx = size_t(tgpos.z) * size_t(row_pitch) + size_t(head) * vd + lid;
+
+  float xi  = float(x[idx]);
+  float acc = simd_sum(xi * xi);
+
+  threadgroup float partials[32];     // <=32 simdgroups (vd<=1024)
+  if (simd_group == 0) {
+    partials[simd_lane] = 0;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_lane == 0) {
+    partials[simd_group] = acc;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  threadgroup float inv_rms[1];
+  if (simd_group == 0) {
+    float s = simd_sum(partials[simd_lane]);
+    if (simd_lane == 0) {
+      inv_rms[0] = precise::rsqrt(s / float(vd) + p.eps);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  float outhat = xi * inv_rms[0];
+  float zr  = float(z[idx]);
+  float y   = 1.0f / (1.0f + metal::exp(-metal::fabs(zr)));
+  float sig = (zr < 0.0f) ? (1.0f - y) : y;       // MLX stable sigmoid
+  float siluz = zr * sig;                          // silu(z) = z*sigmoid(z)
+  out[idx] = T((outhat * float(w[lid])) * siluz);
+}
+
+#define instantiate_gated_rms_strided(name, itype)                \
+  template [[host_name("gated_rms_strided_" #name)]] [[kernel]] void \
+  gated_rms_strided<itype>(                                       \
+      const device itype*, const device itype*, const device itype*, \
+      device itype*, constant GatedRmsParams&, constant int&, uint3, uint3, uint3, uint, uint);
+
+instantiate_gated_rms_strided(float32, float)
+instantiate_gated_rms_strided(float16, half)
+instantiate_gated_rms_strided(bfloat16, bfloat)
+
 #define instantiate_gated_rms(name, itype)                        \
   template [[host_name("gated_rms_" #name)]]                      \
   [[kernel]] void gated_rms<itype>(                               \

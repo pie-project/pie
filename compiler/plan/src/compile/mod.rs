@@ -14,14 +14,14 @@ use pie_ir::validate::BoundTrace;
 
 mod canonical;
 mod fold;
-mod lane;
 mod normalize;
+mod nucleus;
 mod region;
 mod signature;
 mod symbolic;
 
-pub use lane::*;
 pub use normalize::*;
+use nucleus::recognize_library_dataflows;
 pub use region::*;
 pub use signature::*;
 pub use symbolic::*;
@@ -37,26 +37,50 @@ pub const COMPILER_VERSION: u16 = 3;
 /// Bumped when region partitioning changes shape. See [`COMPILER_VERSION`].
 pub const REGION_PLAN_VERSION: u16 = 4;
 
+/// The complete plan for one stage, handed to `pie-codegen` as a value.
+///
+/// Produced by [`compile_stage_at`]. Both partitions are carried so a backend
+/// can emit the [`fused`](Self::fused) form yet fall back to the
+/// always-correct [`singleton`](Self::singleton) one without re-planning.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CompiledStage {
+    /// The normalized op DAG every other field was derived from.
     pub normalized: NormalizedStage,
+    /// The canonical signature; two stages sharing it may share an executable.
     pub signature: StageSignature,
+    /// One region per op — the always-correct fallback partition.
     pub singleton: RegionPartition,
+    /// Ops grouped by schedule with recognized library dataflows lifted out.
     pub fused: RegionPartition,
 }
 
+/// Static, backend-independent counts summarizing a [`CompiledStage`].
+///
+/// Diagnostic only — no planning decision reads these. The byte totals count
+/// only fully-static values; anything with a symbolic extent contributes zero,
+/// because its size is unknown until launch.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PlanMetrics {
+    /// PTIR ops in the stage before normalization.
     pub source_ops: u32,
+    /// Ops left after normalization dropped, folded and merged them.
     pub normalized_ops: u32,
+    /// Regions in the singleton partition — one per normalized op.
     pub singleton_regions: u32,
+    /// Regions in the fused partition.
     pub fused_regions: u32,
+    /// Fused regions dispatched to a library rather than generated inline.
     pub library_regions: u32,
+    /// Bytes of every statically-shaped value that is not a direct channel
+    /// sink — the stage's scratch footprint.
     pub static_scratch_bytes: u64,
+    /// Bytes of statically-shaped values a fused region writes straight to a
+    /// channel.
     pub direct_channel_sink_bytes: u64,
 }
 
 impl CompiledStage {
+    /// Summarizes this stage as [`PlanMetrics`] for diagnostics.
     pub fn metrics(&self) -> PlanMetrics {
         let static_bytes = |value_type: &SymbolicType| {
             let mut elements = 1u64;
@@ -111,6 +135,10 @@ pub fn compile_bound(bound: &BoundTrace) -> Vec<CompiledStage> {
         .collect()
 }
 
+/// Compiles the stage of the given [`Stage`] kind, or `None` when the
+/// container has no stage of that kind.
+///
+/// A thin wrapper over [`compile_stage_at`] that first locates the stage.
 pub fn compile_stage(bound: &BoundTrace, stage: Stage) -> Option<CompiledStage> {
     let stage_index = bound
         .container
@@ -120,6 +148,14 @@ pub fn compile_stage(bound: &BoundTrace, stage: Stage) -> Option<CompiledStage> 
     Some(compile_stage_at(bound, stage_index))
 }
 
+/// Compiles the stage at `stage_index` in container order.
+///
+/// The core of the crate: it normalizes the stage body, localizes its channels
+/// and names, signs it, and builds both the singleton and fused partitions.
+///
+/// # Panics
+///
+/// Panics if `stage_index` is out of range for the container's stage list.
 pub fn compile_stage_at(bound: &BoundTrace, stage_index: usize) -> CompiledStage {
     let mut normalized = normalize_stage(bound, stage_index);
     localize_stage(bound, &mut normalized);
@@ -189,10 +225,12 @@ pub fn debug_stage_plan(stage: &CompiledStage) -> String {
 /// The graph-cache identity of one compiled stage.
 ///
 /// A driver keys its graph cache on this value, so it is a decision about the
-/// program and — under `ptir-refactor.md`'s north star — belongs to the host.
-/// The Metal runtime is handed the bytes rather than deriving them
-/// (`m1_runtime.cpp:1089`, carried by `interface/driver/src/plan.rs`'s
-/// `identity`); the CUDA copy in `program_identity.hpp` no longer exists.
+/// program and belongs to the host. Every driver is handed the bytes rather
+/// than deriving them — the Metal runtime reads them out of
+/// `interface/driver/src/plan.rs`'s `identity` — because a driver-side copy of
+/// this derivation is a second definition of a cache key, and two definitions
+/// of a cache key that drift apart share graphs between programs that are not
+/// the same program.
 ///
 /// Because the key is published, moving it is an operational event and not a
 /// refactor: a stale key is silent, reusing a graph built by a different
@@ -228,7 +266,7 @@ pub fn stage_identity(stage: &CompiledStage) -> u64 {
         }
         hash.u32_le(region.sinks.len() as u32);
         for sink in &region.sinks {
-            hash.u32_le(sink.channel_slot);
+            hash.u32_le(sink.channel_slot.get());
             hash.u32_le(sink.value);
         }
     }

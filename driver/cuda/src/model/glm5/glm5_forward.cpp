@@ -339,13 +339,27 @@ void glm5_forward_paged(
     act_dump_step_begin(stream);
     act_dump_bf16("embed", ws.y.data(), total_tokens, H, stream);
 
+    // A layer's closing `y += moe_out` and the next layer's pre-norm are two
+    // launches over the same row that neither reads nor writes anything in
+    // between, and at decode both cost about what an empty kernel costs. Carry
+    // the addend forward and let the pre-norm do it. Held back when the
+    // activation dumper is on, which wants `y` finalised at the layer boundary.
+    const void* pending_residual = nullptr;
+
     for (int li = 0; li < cfg.num_hidden_layers; ++li) {
         const auto& Lw = w.layers[static_cast<std::size_t>(li)];
 
         // ── MLA attention ────────────────────────────────────────────
-        kernels::launch_rmsnorm_bf16(
-            ws.y.data(), Lw.attn_norm->data(), ws.norm_x.data(),
-            total_tokens, H, eps, stream);
+        if (pending_residual != nullptr) {
+            kernels::launch_residual_add_rmsnorm_bf16(
+                ws.y.data(), pending_residual, Lw.attn_norm->data(),
+                ws.norm_x.data(), total_tokens, H, eps, stream);
+            pending_residual = nullptr;
+        } else {
+            kernels::launch_rmsnorm_bf16(
+                ws.y.data(), Lw.attn_norm->data(), ws.norm_x.data(),
+                total_tokens, H, eps, stream);
+        }
 
         ops::gemm_act_x_w(cublas.handle(),
             ws.norm_x.data(),
@@ -770,9 +784,13 @@ void glm5_forward_paged(
             tp->all_reduce_bf16(ws.moe_out.data(),
                 static_cast<std::size_t>(total_tokens) * H, ncclSum, stream);
         }
-        kernels::launch_residual_add_bf16(
-            ws.y.data(), ws.moe_out.data(),
-            static_cast<std::size_t>(total_tokens) * H, stream);
+        if (!act_dump_enabled()) {
+            pending_residual = ws.moe_out.data();
+        } else {
+            kernels::launch_residual_add_bf16(
+                ws.y.data(), ws.moe_out.data(),
+                static_cast<std::size_t>(total_tokens) * H, stream);
+        }
         act_dump_bf16(act_dump_layer_tag("out", li).c_str(),
             ws.y.data(), total_tokens, H, stream);
     }
@@ -786,6 +804,13 @@ void glm5_forward_paged(
         num_logit_rows < total_tokens;
     const int rows = compact_logits ? num_logit_rows : total_tokens;
     const void* final_in = ws.y.data();
+    if (pending_residual != nullptr && compact_logits) {
+        // The gather reads `y`, so it has to be finalised first.
+        kernels::launch_residual_add_bf16(
+            ws.y.data(), pending_residual,
+            static_cast<std::size_t>(total_tokens) * H, stream);
+        pending_residual = nullptr;
+    }
     if (compact_logits) {
         kernels::launch_gather_bf16_rows(
             static_cast<const std::uint16_t*>(ws.y.data()),
@@ -794,9 +819,16 @@ void glm5_forward_paged(
             num_logit_rows, H, stream);
         final_in = ws.norm_x.data();
     }
-    kernels::launch_rmsnorm_bf16(
-        final_in, w.final_norm->data(), ws.norm_y.data(),
-        rows, H, eps, stream);
+    if (pending_residual != nullptr) {
+        kernels::launch_residual_add_rmsnorm_bf16(
+            ws.y.data(), pending_residual, w.final_norm->data(),
+            ws.norm_y.data(), rows, H, eps, stream);
+        pending_residual = nullptr;
+    } else {
+        kernels::launch_rmsnorm_bf16(
+            final_in, w.final_norm->data(), ws.norm_y.data(),
+            rows, H, eps, stream);
+    }
     if (w.lm_head_tp_sharded) {
         throw std::runtime_error(
             "glm5: sharded lm_head not supported in first-pass forward");

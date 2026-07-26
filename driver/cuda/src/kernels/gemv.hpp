@@ -20,9 +20,17 @@ namespace pie_cuda_driver::kernels {
 //
 // Returns false when the shape or alignment is not supported, in which case
 // the caller must fall back; nothing is enqueued in that case.
+//
+// `bias` is optional (nullptr = none). When present the epilogue computes
+// `out[n] = bf16(bf16(dot) + bias[n])`, which is bit-identical to running
+// `launch_add_bias_bf16` afterwards -- the double rounding is intentional.
+// This removes a whole kernel launch per biased projection; on gpt-oss-20b
+// that is 120 launches per decode step, each ~3.6 us against a 2.2 us
+// empty-launch floor, for a few KB of arithmetic.
 bool launch_gemv_bf16(
     const void* weight,   // bf16 [N, K], row stride K
     const void* act,      // bf16 [K]
+    const void* bias,     // bf16 [N] or nullptr
     void*       out,      // bf16 [N]
     int N, int K,
     cudaStream_t stream);

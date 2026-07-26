@@ -5,6 +5,7 @@
 //! text; the grouped (`M3`) forms are generic and read the same decisions out
 //! of a per-channel `M3ChannelMeta` flag word at run time.
 
+use crate::error::{EmitError, EmitterKind};
 use alloc::string::String;
 use core::fmt::Write as _;
 
@@ -32,11 +33,15 @@ const LANE_TABLE_ABI_VERSION: u32 = pie_plan::LANE_TABLE_ABI_VERSION;
 /// emitter's output it stated only that, and a program one channel wider
 /// produced a `[[buffer(31)]]` Metal rejects — a raw shader diagnostic at PSO
 /// build time, from a count a guest container chooses.
-pub fn emit_readiness(function_name: &str, channels: &[M1ChannelEffect]) -> Result<String, String> {
+pub fn emit_readiness(
+    function_name: &str,
+    channels: &[M1ChannelEffect],
+) -> Result<String, EmitError> {
     if channels.len() > METAL_M1_MAX_CHANNELS {
-        return Err(format!(
-            "readiness kernel exceeds the {METAL_M1_MAX_CHANNELS}-channel direct-binding limit"
-        ));
+        return Err(EmitError::ChannelLimitExceeded {
+            emitter: EmitterKind::MetalReadiness,
+            limit: METAL_M1_MAX_CHANNELS,
+        });
     }
     let mut source = String::new();
     source.push_str(common_effect_preamble());
@@ -123,11 +128,12 @@ pub fn emit_readiness(function_name: &str, channels: &[M1ChannelEffect]) -> Resu
 }
 
 /// `emit_commit_msl` — one lane; advance head for takes, tail for puts.
-pub fn emit_commit(function_name: &str, channels: &[M1ChannelEffect]) -> Result<String, String> {
+pub fn emit_commit(function_name: &str, channels: &[M1ChannelEffect]) -> Result<String, EmitError> {
     if channels.len() > METAL_M1_MAX_CHANNELS {
-        return Err(format!(
-            "commit kernel exceeds the {METAL_M1_MAX_CHANNELS}-channel direct-binding limit"
-        ));
+        return Err(EmitError::ChannelLimitExceeded {
+            emitter: EmitterKind::MetalCommit,
+            limit: METAL_M1_MAX_CHANNELS,
+        });
     }
     let mut source = String::new();
     source.push_str(common_effect_preamble());
@@ -269,13 +275,14 @@ pub fn emit_grouped_commit(function_name: &str) -> String {
 /// The per-program channel effect table the M1/M2 readiness and commit kernels
 /// are baked against.
 ///
-/// This is the host's copy of what `m1_runtime.cpp` used to derive for itself
-/// from the decoded plan: capacity and the take/put flags come from the
-/// container, the two readiness bits from the bound trace's first-op direction
-/// table. It is emitted rather than derived so the driver stops needing the
-/// plan (see `ptir-refactor.md` §2.3) — and, more immediately, so the effect
-/// kernels the M1 and M2 launch paths bind are host-emitted like every other
-/// kernel rather than being the one family the driver still built itself.
+/// Capacity and the take/put flags come from the container; the two readiness
+/// bits come from the bound trace's first-op direction table.
+///
+/// The table is emitted here rather than derived on the far side so that a
+/// driver never needs the decoded plan to build it. That keeps the effect
+/// kernels the M1 and M2 launch paths bind host-emitted like every other
+/// kernel, instead of leaving one kernel family that each driver assembles for
+/// itself and can get subtly different.
 pub fn channel_effects(bound: &BoundTrace) -> Vec<M1ChannelEffect> {
     let channels = &bound.container.channels;
     let mut effects = Vec::with_capacity(channels.len());

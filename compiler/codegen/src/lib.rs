@@ -23,14 +23,20 @@
 //!
 //! [`cuda`] and [`metal`] take a [`pie_plan`]-produced [`CompiledStage`] and
 //! return source (or a refusal — see [`EmittedKernel`]). They are pure
-//! `Plan -> String` with no device-architecture inputs, which is what let them
-//! move off the drivers' `fused_codegen.hpp` / `singleton_codegen.hpp` /
-//! `m1_codegen.cpp`. Supporting them:
+//! `Plan -> String` with no device-architecture inputs, which is what lets a
+//! kernel be emitted, diffed and reviewed on the host without a device in the
+//! loop. Supporting them:
 //!
 //! * [`op_view`] — a decoded, borrow-free view of a normalized op.
-//! * [`region_analysis`] — the per-region facts both backends need.
+//! * [`wellformed`] — what a plan must satisfy before *either* backend emits
+//!   from it, so that "well formed" cannot mean two things.
+//! * [`alias`] — when a reshape may be elided and its consumers pointed at its
+//!   source, and the table that carries that decision.
 //! * [`launch`] — the launch descriptors the drivers execute.
 //! * [`program`] — the whole-program bundle handed across the C ABI.
+//!
+//! Anything only one backend's driver reads lives under that backend, not here
+//! — see [`cuda::region_analysis`].
 //!
 //! Those last two are built out of [`pie_driver_abi`], which is why this crate
 //! is the one that reaches outside `compiler/`. That crate is the contract, not
@@ -45,7 +51,9 @@
 // still use them; `alloc` is available here through `std`.
 extern crate alloc;
 
+pub mod alias;
 pub mod cuda;
+pub mod error;
 pub mod fault;
 pub mod header;
 pub mod launch;
@@ -53,8 +61,8 @@ pub mod layout;
 pub mod metal;
 pub mod op_view;
 pub mod program;
-pub mod region_analysis;
 pub mod rng;
 #[cfg(test)]
 mod runtime_scan;
 pub mod slots;
+pub mod wellformed;

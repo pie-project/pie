@@ -15,6 +15,7 @@ template <int kWarps>
 __global__ void gemv_bf16_kernel(
     const __nv_bfloat16* __restrict__ weight,
     const __nv_bfloat16* __restrict__ act,
+    const __nv_bfloat16* __restrict__ bias,
     __nv_bfloat16* __restrict__ out,
     int N, int K)
 {
@@ -39,7 +40,20 @@ __global__ void gemv_bf16_kernel(
     for (int off = 16; off > 0; off >>= 1) {
         acc += __shfl_down_sync(0xffffffffu, acc, off);
     }
-    if (threadIdx.x == 0) out[row] = __float2bfloat16(acc);
+    if (threadIdx.x == 0) {
+        // Round to bf16 *before* adding the bias, then round again. That is
+        // a redundant-looking double rounding, and it is deliberate: it is
+        // exactly what the separate `add_bias_bf16_kernel` did when it read
+        // this kernel's bf16 output back. Folding the two launches into one
+        // is a launch-count optimization, not an arithmetic change, so it
+        // has to stay bit-identical or it stops being free to validate.
+        __nv_bfloat16 v = __float2bfloat16(acc);
+        if (bias != nullptr) {
+            v = __float2bfloat16(__bfloat162float(v) +
+                                 __bfloat162float(bias[row]));
+        }
+        out[row] = v;
+    }
 }
 
 bool aligned16(const void* p) {
@@ -51,6 +65,7 @@ bool aligned16(const void* p) {
 bool launch_gemv_bf16(
     const void* weight,
     const void* act,
+    const void* bias,
     void*       out,
     int N, int K,
     cudaStream_t stream)
@@ -71,6 +86,7 @@ bool launch_gemv_bf16(
         <<<dim3(static_cast<unsigned>(blocks)), dim3(32, kWarps), 0, stream>>>(
             static_cast<const __nv_bfloat16*>(weight),
             static_cast<const __nv_bfloat16*>(act),
+            static_cast<const __nv_bfloat16*>(bias),
             static_cast<__nv_bfloat16*>(out),
             N, K);
     return true;

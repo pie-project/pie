@@ -19,6 +19,7 @@
 #include "cuda_check.hpp"
 #include "kernels/dequant_fp4.hpp"
 #include "kernels/dequant_fp8.hpp"
+#include "kernels/add_bias.hpp"
 #include "kernels/gemv.hpp"
 #include "kernels/quant_bf16_to_fp8.hpp"
 #include "kernels/residual_add.hpp"
@@ -743,12 +744,18 @@ bool run_dense_tactic(cublasHandle_t handle, const DenseTactic& t,
                       const Bf16LtPlan* plan, const void* act, const void* W,
                       void* y, int M, int N, int K, float beta,
                       void* lt_workspace = nullptr,
-                      std::size_t lt_workspace_bytes = 0) {
+                      std::size_t lt_workspace_bytes = 0,
+                      const void* bias = nullptr) {
+    // Only the GEMV epilogue can absorb a bias. Anything else must decline
+    // rather than silently drop it.
+    if (bias != nullptr && static_cast<GemmKind>(t.kind) != GemmKind::Gemv) {
+        return false;
+    }
     switch (static_cast<GemmKind>(t.kind)) {
         case GemmKind::Gemv: {
             cudaStream_t stream = nullptr;
             return beta == 0.f && M == 1 && cublas_stream(handle, stream) &&
-                   kernels::launch_gemv_bf16(W, act, y, N, K, stream);
+                   kernels::launch_gemv_bf16(W, act, bias, y, N, K, stream);
         }
         case GemmKind::Lt: {
             if (plan == nullptr ||
@@ -1078,6 +1085,26 @@ bool dense_tactic_for(cublasHandle_t caller, const void* W, int M, int N,
     return true;
 }
 
+// Side-effect-free peek at the tuner's verdict for this shape. Deliberately
+// does *not* call `dense_tactic_for`: that bumps the `seen` counter and can
+// trigger a tune, and asking "would you have picked the GEMV?" must not
+// change the answer to "what will you pick?".
+bool gemv_fused_bias_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_GEMV_FUSED_BIAS");
+        return v == nullptr || !(v[0] == '0' && v[1] == '\0');
+    }();
+    return enabled;
+}
+
+bool dense_tactic_already_gemv(int M, int N, int K, float beta) {
+    auto& tuner = DenseGemmTuner::instance();
+    std::lock_guard<std::mutex> lock(tuner.mu);
+    const auto it = tuner.chosen.find(dense_key(M, N, K, beta));
+    return it != tuner.chosen.end() &&
+           static_cast<GemmKind>(it->second.kind) == GemmKind::Gemv;
+}
+
 void gemm_bf16_impl(
     cublasHandle_t handle,
     const void* act, const void* W, void* y,
@@ -1111,7 +1138,7 @@ void gemm_bf16_impl(
     cudaStream_t gemv_stream = nullptr;
     if (M == 1 && beta == 0.f && use_bf16_gemv() &&
         cublas_stream(handle, gemv_stream) &&
-        kernels::launch_gemv_bf16(W, act, y, N, K, gemv_stream)) {
+        kernels::launch_gemv_bf16(W, act, nullptr, y, N, K, gemv_stream)) {
         return;
     }
     const int lt_max_n = cublaslt_bf16_max_n();
@@ -2464,6 +2491,41 @@ void gemm_act_x_wt_bf16_cublas(
     float beta)
 {
     gemm_bf16_cublas_impl(handle, act, W, y, M, N, K, beta);
+}
+
+void gemm_act_x_wt_bias_bf16(
+    cublasHandle_t handle,
+    const void* act, const void* W, const void* bias, void* y,
+    int M, int N, int K,
+    cudaStream_t stream)
+{
+    // Ask the tuner the same question `gemm_bf16_impl` would, rather than
+    // peeking at what it has already decided: a shape is seen for the first
+    // time *during graph capture*, and a peek would miss then and bake the
+    // unfused pair into the graph forever.
+    if (bias != nullptr && M == 1 && gemv_fused_bias_enabled() &&
+        gemm_autotune_enabled()) {
+        cudaStream_t s = nullptr;
+        cudaStreamCaptureStatus capturing = cudaStreamCaptureStatusNone;
+        const Bf16LtPlan* plan = nullptr;
+        DenseTactic tactic{};
+        // `run_dense_tactic` declines any tactic that cannot absorb a bias,
+        // so a shape where cuBLAS beats the GEMV is never forced onto the
+        // GEMV just to save a launch -- it falls through below.
+        if (cublas_stream(handle, s) &&
+            cudaStreamIsCapturing(s, &capturing) == cudaSuccess &&
+            dense_tactic_for(handle, W, M, N, K, /*beta=*/0.f, capturing,
+                             &plan, &tactic) &&
+            run_dense_tactic(handle, tactic, plan, act, W, y, M, N, K,
+                             /*beta=*/0.f, nullptr, 0, bias)) {
+            return;
+        }
+        cudaGetLastError();
+    }
+    gemm_bf16_impl(handle, act, W, y, M, N, K, /*beta=*/0.f);
+    if (bias != nullptr) {
+        kernels::launch_add_bias_bf16(y, bias, M, N, stream);
+    }
 }
 
 void gemm_batched_act_x_w(

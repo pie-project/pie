@@ -1,7 +1,9 @@
-//! P1 exit tests: the overview §3 greedy-decode pipeline lowers to a canonical
-//! trace container and hashes stably (byte-identity locked to golden C3 hashes),
-//! plus error-message snapshot tests for the lint set (double-endpoint,
-//! readiness-direction conflict, sink misplacement).
+//! Lowering a program to a canonical trace container.
+//!
+//! The greedy-decode pipeline, lowered and hashed for byte
+//! identity against the golden FNV-1a hashes, plus error-message snapshots for
+//! the lint set (double-endpoint, readiness-direction conflict, sink
+//! misplacement).
 //!
 //! These drive the neutral [`Builder`] directly (the author-facing
 //! `ForwardPass`/`WorkingSet` surface lives in `inferlet`). Idiom note: values
@@ -32,10 +34,10 @@ fn initial_mask() -> Vec<bool> {
 }
 
 // ---------------------------------------------------------------------------
-// overview §3 — greedy + grammar-masked decode, software-pipelined
+// greedy + grammar-masked decode, software-pipelined
 // ---------------------------------------------------------------------------
 
-/// Build the §3 forward pass verbatim (the trace-producing portion). Channels
+/// Build the greedy-decode forward pass (the trace-producing portion). Channels
 /// live for `'static` via `Box::leak` (test-only; a real inferlet keeps them on
 /// its stack).
 fn build_s3() -> Traced {
@@ -65,9 +67,10 @@ fn build_s3() -> Traced {
         out.put(t);
     });
 
-    // prime mask_0 before the first submit (§3 line 261) so `mask` has a producer.
+    // prime mask_0 before the first submit so `mask` has a producer.
     mask.put(initial_mask());
-    b.build().expect("§3 must build to a validated container")
+    b.build()
+        .expect("greedy-decode must build to a validated container")
 }
 
 #[test]
@@ -95,7 +98,7 @@ fn s3_traces_and_validates() {
 fn s3_identity_hash_is_stable() {
     let a = build_s3().identity_hash();
     let b = build_s3().identity_hash();
-    assert_eq!(a, b, "the same program hashes identically (C3)");
+    assert_eq!(a, b, "the same program hashes identically");
     assert_eq!(
         a, GOLDEN_S3,
         "byte-identical to the channel-only descriptor golden"
@@ -127,7 +130,7 @@ fn different_program_hashes_differently() {
 }
 
 // ---------------------------------------------------------------------------
-// lint set — error-message snapshot tests (P1.3)
+// lint set — error-message snapshot tests
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -221,12 +224,12 @@ fn lint_sink_misplacement_in_epilogue() {
 }
 
 // ---------------------------------------------------------------------------
-// overview §6.2 — beam search (the second P1 exit gate): reorder = gathers,
+// beam search (the second exit gate): reorder = gathers,
 // divergence = freeze. Exercises the full op set (top_k, log_softmax, gather,
 // scatter_set, reshape, iota, broadcast, div/rem/mul/sub, lt/and/eq, cast).
-// F8: no auto-drain synthesis — the loop-carried peek-port channels
+// No auto-drain synthesis — the loop-carried peek-port channels
 // (klen/kvm) drain EXPLICITLY (`take()` directly before the re-put), which
-// reproduces the previously-synthesized ops verbatim (same golden hash).
+// reproduces the same ops verbatim (same golden hash).
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -236,7 +239,7 @@ fn s6_2_beam_epilogue_binds() {
     const P: u32 = 3;
     const PAGE_T: u32 = 4;
 
-    // channels 0..=15 as in overview §6.2 / the IR's beam_trace.
+    // channels 0..=15 for the beam-search epilogue.
     let pages: &'static Channel = leak(Channel::seeded([B, P], dtype::u32).named("pages"));
     let lens: &'static Channel = leak(Channel::seeded([B, P], dtype::u32).named("lens"));
     let klen: &'static Channel = leak(Channel::from(vec![0u32; B as usize]).named("klen"));
@@ -254,7 +257,7 @@ fn s6_2_beam_epilogue_binds() {
     let out_par: &'static Channel = leak(Channel::new([B], dtype::u32).named("out_par"));
     let out_scr: &'static Channel = leak(Channel::new([B], dtype::f32).named("out_scr"));
 
-    // host-fed headroom (slot grants are per-instance data; overview §5.2's
+    // host-fed headroom (slot grants are per-instance data,
     // `fresh.put(ws.alloc(B))`), primed before submit.
     fresh.put(vec![0u32; B as usize]);
 
@@ -320,7 +323,7 @@ fn s6_2_beam_epilogue_binds() {
         out_scr.put(&s);
     });
 
-    let traced = b.build().expect("§6.2 beam epilogue must bind");
+    let traced = b.build().expect("beam epilogue must bind");
     let c = traced.container();
     assert_eq!(c.stages[0].stage, Stage::Epilogue);
     assert_eq!(
@@ -381,8 +384,8 @@ fn s6_2_beam_epilogue_binds() {
     );
 }
 
-// overview §6.1 — native-MTP + grammar spec-verify binds (the M3-G1 §6.1 pass:
-// `mtp-grammar` inferlet's trace). Grammar mask BEFORE the argmax → grammar-legal
+// native-MTP + grammar spec-verify binds (the mtp-grammar inferlet's trace).
+// Grammar mask BEFORE the argmax → grammar-legal
 // picks; accept-prefix = leading run of picked[0..K] == argmax(mtp_logits).
 #[test]
 fn s6_1_mtp_grammar_binds() {
@@ -403,7 +406,7 @@ fn s6_1_mtp_grammar_binds() {
     b.stage(Stage::Epilogue, move || {
         let masked = mask_apply(intrinsics::logits(), gmask.take()); // [K+1, V]
         let picked = reduce_argmax(&masked); // [K+1] grammar-constrained target
-        // NATIVE MTP: K distinct draft heads [K, V] (the IR's §6.1 K-vs-K+1 contract).
+        // NATIVE MTP: K distinct draft heads [K, V] (the K-vs-K+1 contract).
         let mtp = intrinsics::mtp_logits(K); // [K, V]
         let draft = reduce_argmax(&mtp); // [K]
         // mtp_verify_tail: head = picked[0..K]; accept-prefix = leading run of matches.
@@ -418,7 +421,7 @@ fn s6_1_mtp_grammar_binds() {
         let commit = select(&keep, &picked, &neg1); // accept-prefix + -1 sentinels
         out.put(&commit);
     });
-    let traced = b.build().expect("§6.1 mtp-grammar epilogue must bind");
+    let traced = b.build().expect("mtp-grammar epilogue must bind");
     assert_eq!(
         traced.identity_hash(),
         GOLDEN_MTP_GRAMMAR,

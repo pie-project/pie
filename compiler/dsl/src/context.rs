@@ -15,7 +15,7 @@ use core::cell::RefCell;
 use pie_ir::op::{ChannelIndex, Op};
 use pie_ir::types::{DType, Shape, ValueType};
 
-use crate::error::Span;
+use crate::error::{Span, TraceError};
 use crate::value::ConstData;
 
 /// Attachment stage — re-export of the IR's canonical [`Stage`](pie_ir::registry::Stage).
@@ -33,7 +33,7 @@ pub struct ChannelState {
     pub dtype: DType,
     pub capacity: u32,
     /// Per-instance seed value (from `Channel::from` / a pre-submit host `put`);
-    /// its bytes are instance data, never in the container (D2).
+    /// its bytes are instance data, never in the container.
     pub seed: Option<ConstData>,
     pub seeded: bool,
 
@@ -99,8 +99,8 @@ impl Recorder {
     /// structurally valid program that computes something else.
     ///
     /// So `result_tys` is checked against it rather than trusted, and with a
-    /// real assert: this used to be a `debug_assert_eq!`, which is compiled out
-    /// of the release builds that actually run guest traces.
+    /// real assert — not a `debug_assert_eq!` — because debug-asserts are
+    /// compiled out of the release builds that actually run guest traces.
     fn push(&mut self, op: Op, result_tys: &[ValueType]) -> u32 {
         let base = self.types.len() as u32;
         assert_eq!(
@@ -126,6 +126,10 @@ pub(crate) struct Session {
     /// SHARED across stages (a `NameIndex` in one stage's op means the same
     /// thing in another), so it is interned at session scope, not stage scope.
     pub names: Vec<String>,
+    /// Authoring mistakes found while recording. Collected instead of
+    /// panicked so one `build()` reports all of them; see
+    /// [`TraceError::Authoring`](crate::error::TraceError::Authoring).
+    pub errors: Vec<TraceError>,
 }
 
 impl Session {
@@ -135,6 +139,7 @@ impl Session {
             channels: Vec::new(),
             current: None,
             names: Vec::new(),
+            errors: Vec::new(),
         }
     }
 
@@ -152,11 +157,43 @@ impl Session {
 
 thread_local! {
     static SESSION: RefCell<Option<Session>> = const { RefCell::new(None) };
-    /// gid → channel state, for the whole guest (F9): the guest-facing
+    /// Authoring mistakes recorded before a session opened — from a `Channel`
+    /// constructor, which runs ahead of the trace body. Drained by
+    /// [`with_session`] into the session it belongs to.
+    static PENDING: RefCell<Vec<TraceError>> = const { RefCell::new(Vec::new()) };
+    /// gid → channel state, for the whole guest: the guest-facing
     /// Channel is a Copy TOKEN holding only its gid; every op resolves
     /// the shared state through this registry. Populated at construction,
     /// owned here — handle lifetime belongs to the registry, not to leaked
     /// references.
+    ///
+    /// ## The strong `Rc` is the design, not a leak
+    ///
+    /// This map holds a strong [`ChannelRef`] and nothing drops it when the
+    /// last user-visible handle goes away. That reads like a leak and is
+    /// worth stating plainly that it is not: the SDK's `Channel`
+    /// (`sdk/rust/inferlet/src/ptir.rs`) is `Copy` and stores *only* a gid,
+    /// resolving through [`channel_state_by_gid`] on every operation. There
+    /// is no handle whose drop could mean "nobody wants this channel" —
+    /// a `Weak` here would free state that a live token still names, and
+    /// clearing the map at the end of a trace session would break the
+    /// host-side `put`/`take` that run after tracing. The registry *is* the
+    /// owner, so entries live until something says otherwise.
+    ///
+    /// ## What "otherwise" means
+    ///
+    /// [`release_channel_state`] is that something, and it is the only way
+    /// out. Until a caller invokes it, the retention is unbounded: a guest
+    /// that constructs a channel per request accumulates one entry per
+    /// request for the process's life. That is acceptable for the current
+    /// shape of an inferlet — channels are declared once at model setup, not
+    /// per request — and it is a real bug for any guest that does otherwise,
+    /// which is why the release path exists rather than being left implicit.
+    ///
+    /// Releasing is a decision only the frontend can make, because only it
+    /// knows a token will never be used again; the DSL cannot infer it from
+    /// a `Copy` token. The SDK keeps a second, parallel registry for WIT
+    /// handles and needs the mirrored release to fully reclaim a channel.
     static CHANNELS_BY_GID: RefCell<alloc::collections::BTreeMap<u64, ChannelRef>> =
         const { RefCell::new(alloc::collections::BTreeMap::new()) };
 }
@@ -171,6 +208,16 @@ pub(crate) fn channel_state_by_gid(gid: u64) -> Option<ChannelRef> {
     CHANNELS_BY_GID.with_borrow(|map| map.get(&gid).cloned())
 }
 
+pub(crate) fn release_channel_state(gid: u64) -> bool {
+    CHANNELS_BY_GID.with_borrow_mut(|map| map.remove(&gid).is_some())
+}
+
+/// How many channels the registry is holding. Surfaced as
+/// [`Channel::registered_count`](crate::channel::Channel::registered_count).
+pub(crate) fn registered_channel_count() -> usize {
+    CHANNELS_BY_GID.with_borrow(|map| map.len())
+}
+
 /// Are we currently tracing a stage closure?
 pub(crate) fn is_tracing() -> bool {
     SESSION.with_borrow(|s| s.as_ref().map(|s| s.current.is_some()).unwrap_or(false))
@@ -181,17 +228,40 @@ pub(crate) fn intern_channel(ch: &ChannelRef) -> ChannelIndex {
 }
 
 /// Run `f` with a fresh session active; return `f`'s result + the interned channels.
-pub(crate) fn with_session<R>(f: impl FnOnce() -> R) -> (R, Vec<ChannelRef>, Vec<String>) {
+pub(crate) fn with_session<R>(
+    f: impl FnOnce() -> R,
+) -> (R, Vec<ChannelRef>, Vec<String>, Vec<TraceError>) {
+    let carried = PENDING.with_borrow_mut(core::mem::take);
     SESSION.with_borrow_mut(|s| {
         debug_assert!(s.is_none(), "nested trace session");
-        *s = Some(Session::new());
+        let mut session = Session::new();
+        session.errors = carried;
+        *s = Some(session);
     });
     let r = f();
-    let (channels, names) = SESSION.with_borrow_mut(|s| {
+    let (channels, names, errors) = SESSION.with_borrow_mut(|s| {
         let session = s.take().expect("session present");
-        (session.channels, session.names)
+        (session.channels, session.names, session.errors)
     });
-    (r, channels, names)
+    (r, channels, names, errors)
+}
+
+/// Record an authoring mistake for the next [`Builder::build`] to report.
+///
+/// Channels are declared before the trace runs, so this has to work with no
+/// session active: a mistake made while building a `Channel` is still a
+/// mistake in the trace that channel belongs to. Errors recorded early land in
+/// [`PENDING`] and [`with_session`] adopts them, which keeps the alternative —
+/// panicking whenever no session happens to be open — out of a crate that
+/// traces inside a wasm guest.
+///
+/// [`Builder::build`]: crate::builder::Builder::build
+pub(crate) fn record_error(detail: String, span: Span) {
+    let error = TraceError::Authoring { detail, span };
+    SESSION.with_borrow_mut(|s| match s.as_mut() {
+        Some(session) => session.errors.push(error),
+        None => PENDING.with_borrow_mut(|p| p.push(error)),
+    });
 }
 
 /// Trace one stage closure into a completed [`StageResult`]. `rows` = the pass's
@@ -274,7 +344,7 @@ pub(crate) fn record_channel_read(ch: &ChannelRef, consume: bool, span: Span) ->
 }
 
 /// Record a channel `put` inside a stage (the value id must already match the
-/// channel's shape+dtype — the caller reshapes as needed). NO auto-drain (F8):
+/// channel's shape+dtype — the caller reshapes as needed). No auto-drain:
 /// producer programs are context-free — an unconsumed put sits in the ring
 /// (dropped at instance teardown) or back-pressures honestly at ring-full;
 /// loop-carried descriptor updates drain EXPLICITLY (`ch.take();` before the

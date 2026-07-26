@@ -145,6 +145,71 @@ __global__ void rmsnorm_bf16_vec8_kernel(
     }
 }
 
+// float4 form of the fused residual-add + pre-norm. Deliberately a copy of
+// `rmsnorm_bf16_vec8_kernel`'s structure -- same VBLOCK, same per-vector
+// accumulation order, same `block_reduce_sum_exact` -- with the residual add
+// folded into the first pass, rounded to bf16 exactly where
+// `residual_add_bf16_kernel` rounds it. Anything else and the sum associates
+// differently and the pair stops being bit-exact.
+template <int BLOCK>
+__global__ void residual_add_rmsnorm_bf16_vec8_kernel(
+    __nv_bfloat16* __restrict__ hidden,
+    const __nv_bfloat16* __restrict__ residual,
+    const __nv_bfloat16* __restrict__ weight,
+    __nv_bfloat16* __restrict__ norm_out,
+    int hidden_size,
+    float eps)
+{
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int nvec = hidden_size / 8;
+    const long long base = static_cast<long long>(row) * hidden_size;
+
+    float4* hr = reinterpret_cast<float4*>(hidden + base);
+    const float4* rr = reinterpret_cast<const float4*>(residual + base);
+    float4* nr = reinterpret_cast<float4*>(norm_out + base);
+    const float4* wr = reinterpret_cast<const float4*>(weight);
+
+    float local = 0.f;
+    for (int i = tid; i < nvec; i += BLOCK) {
+        float4 hv = hr[i];
+        float4 rv = rr[i];
+        __nv_bfloat162* hh = reinterpret_cast<__nv_bfloat162*>(&hv);
+        const __nv_bfloat162* rh = reinterpret_cast<const __nv_bfloat162*>(&rv);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float2 a = __bfloat1622float2(hh[j]);
+            const float2 b = __bfloat1622float2(rh[j]);
+            hh[j] = __floats2bfloat162_rn(a.x + b.x, a.y + b.y);
+            const float2 f = __bfloat1622float2(hh[j]);
+            local += f.x * f.x + f.y * f.y;
+        }
+        hr[i] = hv;
+    }
+
+    __shared__ float buf[BLOCK];
+    const float buf_sum = block_reduce_sum_exact<BLOCK>(local, buf);
+    const float inv_rms =
+        rsqrtf(buf_sum / static_cast<float>(hidden_size) + eps);
+
+    for (int i = tid; i < nvec; i += BLOCK) {
+        float4 v = hr[i];
+        float4 g = wr[i];
+        float4 o;
+        const __nv_bfloat162* hv = reinterpret_cast<const __nv_bfloat162*>(&v);
+        const __nv_bfloat162* hg = reinterpret_cast<const __nv_bfloat162*>(&g);
+        __nv_bfloat162* ho = reinterpret_cast<__nv_bfloat162*>(&o);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float2 a = __bfloat1622float2(hv[j]);
+            const float2 b = __bfloat1622float2(hg[j]);
+            ho[j] = __floats2bfloat162_rn(a.x * inv_rms * b.x,
+                                          a.y * inv_rms * b.y);
+        }
+        nr[i] = o;
+    }
+}
+
 template <int BLOCK>
 __global__ void residual_add_rmsnorm_bf16_kernel(
     __nv_bfloat16* __restrict__ hidden,
@@ -382,6 +447,18 @@ void launch_residual_add_rmsnorm_bf16(
 {
     constexpr int BLOCK = 256;
     dim3 grid(num_rows);
+    if (rmsnorm_vec8_ok(hidden, norm_out, weight, hidden_size,
+                        hidden_size, hidden_size) &&
+        (reinterpret_cast<std::uintptr_t>(residual) % 16) == 0) {
+        constexpr int VBLOCK = 512;
+        residual_add_rmsnorm_bf16_vec8_kernel<VBLOCK><<<grid, VBLOCK, 0, stream>>>(
+            static_cast<__nv_bfloat16*>(hidden),
+            static_cast<const __nv_bfloat16*>(residual),
+            static_cast<const __nv_bfloat16*>(weight),
+            static_cast<__nv_bfloat16*>(norm_out),
+            hidden_size, eps);
+        return;
+    }
     dim3 block(BLOCK);
     residual_add_rmsnorm_bf16_kernel<BLOCK><<<grid, block, 0, stream>>>(
         static_cast<__nv_bfloat16*>(hidden),

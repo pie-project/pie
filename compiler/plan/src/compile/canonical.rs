@@ -67,6 +67,12 @@ fn canonical_symbolic_shape(bytes: &mut Vec<u8>, value_type: &SymbolicType) {
 /// batch size stays out of the hash; everything else reuses the container's own
 /// op encoding ([`encode_op`]) rather than growing a second spelling of it.
 pub(crate) fn canonical_op(bytes: &mut Vec<u8>, op: &Op, result_type: Option<&SymbolicType>) {
+    // Invariant: every arm below that calls this is a shape-bearing op, and a
+    // shape-bearing op defines exactly one value — `pie_ir::op`'s table says
+    // so via `results`, and `validate::bind` checks each op's result count
+    // against it. Falling back to a default shape instead would hash two
+    // differently-shaped stages to the same signature and hand one stage the
+    // other's compiled plan.
     let result_type = || result_type.expect("shape-bearing op defines a value");
     match op {
         Op::Broadcast { value, .. } | Op::Reshape { value, .. } => {

@@ -4,7 +4,7 @@
 //! programs** over a closed first-party op set, **channels** (the only stateful
 //! construct), descriptor-port bindings, configuration sinks, and named
 //! second-party kernels — carried in one versioned **trace container**
-//! (`PTIR-CONTAINER.md`, magic `"PTIR"`). It is `no_std` (+ `alloc`) so a program
+//! ([`container`], magic `"PTIR"`). It is `no_std` (+ `alloc`) so a program
 //! can be authored/lowered without `std`; the host uses the default `std`
 //! feature to parse and validate.
 //!
@@ -33,6 +33,9 @@
 //!   sink stage-precedence, model gating) producing a bound trace.
 //! * [`expand`] — the composed ops (`gumbel`, `mask_apply`, `softmax`,
 //!   `log_softmax`, `l2norm`) as expansions over the core.
+//! * [`wire`] — the flat wire record an op projects onto, and the two
+//!   projections between it and the typed enum. [`container`]'s encoder and
+//!   decoder are both walks over the layout declared in the op table.
 //! * [`rng`] — the canonical keyed-RNG formula. Its deterministic CUDA/C++ and
 //!   MSL projections live in `pie-codegen`.
 //!
@@ -41,6 +44,14 @@
 //! [`pie-codegen`]: https://github.com/pie-project/pie/tree/dev/compiler/codegen
 
 #![cfg_attr(not(feature = "std"), no_std)]
+// This crate turns bytes it did not write into the vocabulary every other
+// crate trusts, and it is the one crate under `compiler/` with no truncating
+// cast left in it. A narrowing `as` here would silently re-describe a decoded
+// count, extent or index as a smaller one, and the program that results is
+// well-formed -- so the failure surfaces as a wrong answer rather than a
+// rejected container. Narrow through `try_from` and say what happens when it
+// does not fit.
+#![deny(clippy::cast_possible_truncation)]
 
 extern crate alloc;
 
@@ -54,6 +65,7 @@ pub mod rng;
 pub mod tagged;
 pub mod types;
 pub mod validate;
+pub mod wire;
 
 pub use types::{DType, Literal, MAX_RANK, Predicate, RngKind, Shape, ValueId, ValueType};
 
@@ -92,10 +104,12 @@ impl Fnv1a {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
 
+    /// A hasher at the FNV-1a offset basis.
     pub const fn new() -> Self {
         Self(Self::OFFSET)
     }
 
+    /// Folds one byte in.
     pub fn byte(&mut self, byte: u8) {
         self.0 ^= u64::from(byte);
         self.0 = self.0.wrapping_mul(Self::PRIME);
@@ -103,17 +117,19 @@ impl Fnv1a {
 
     /// Little-endian, four [`byte`](Self::byte) steps — the order the C++ walk uses.
     pub fn u32_le(&mut self, value: u32) {
-        for shift in (0..32).step_by(8) {
-            self.byte((value >> shift) as u8);
+        for byte in value.to_le_bytes() {
+            self.byte(byte);
         }
     }
 
+    /// Folds each byte of `bytes` in, in order.
     pub fn bytes(&mut self, bytes: &[u8]) {
         for &byte in bytes {
             self.byte(byte);
         }
     }
 
+    /// The accumulated hash.
     pub const fn finish(self) -> u64 {
         self.0
     }
@@ -133,7 +149,7 @@ pub fn fnv1a64(bytes: &[u8]) -> u64 {
 /// FNV-1a 64 over the canonical container bytes — the traced pass's identity
 /// (contract C3: the batching/graph key component, the compile-cache key). Seeds
 /// and per-instance data are NOT in the container, so identity is
-/// instance-independent by construction (D2).
+/// instance-independent by construction.
 ///
 /// Because the container encoder is canonical (same trace ⟺ same bytes) this is
 /// a *sound* identity key, and because it is byte-identical to the driver's

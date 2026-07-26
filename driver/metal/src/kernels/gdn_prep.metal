@@ -336,3 +336,189 @@ instantiate_gdn_prep(bfloat16, bfloat)
 instantiate_gdn_prep_slotted(float32, float)
 instantiate_gdn_prep_slotted(float16, half)
 instantiate_gdn_prep_slotted(bfloat16, bfloat)
+
+// ---------------------------------------------------------------------------
+// Prefill variants: one dispatch for a whole prompt instead of one per token.
+//
+// A prompt walked token by token serializes the GDN pair behind a barrier per
+// token -- 34 tokens x 18 layers x 2 kernels = 1224 dispatches in a strict
+// chain, measured at 25ms of a 60ms prefill.  Two observations remove it:
+//
+//   * The conv1d is a Kc-tap FIR over the prompt, so token t's window is just
+//     `mixed[t-Kc+1 .. t]`, falling back to the persisted history only while
+//     `t < Kc-1`.  No ping-pong is needed *within* a prompt, which makes the
+//     whole prep pass token-parallel.
+//   * The recurrent state row for (slot, hv, dv) is owned by exactly one
+//     simdgroup, so the scan over tokens can run in registers inside the kernel
+//     with no cross-threadgroup ordering at all.
+//
+// Both read the prompt through a uniform `row_pitch` (the prefill scratch
+// layout's widest tensor, in activation elements; fp32 scratch is half that)
+// off token 0's argument table, and only the last scanned token writes the
+// conv history forward -- which is why the caller keeps an odd trailing token
+// on the per-token path, so this always reads `conv_state` and writes
+// `new_conv_state` and never races the two.
+//
+// The arithmetic is unchanged: the same taps in the same order, the same
+// simd_sum reductions, the same fp32 scratch round-trip.
+template <typename T>
+[[kernel]] void gdn_prep_prefill(
+    const device T* mixed [[buffer(0)]], const device float* conv_state [[buffer(1)]],
+    const device T* conv_w [[buffer(2)]], const device T* conv_b [[buffer(3)]],
+    const device float* A_log [[buffer(4)]], const device T* dt_bias [[buffer(5)]],
+    const device T* a_gate [[buffer(6)]], const device T* b_gate [[buffer(7)]],
+    device float* pre_q [[buffer(8)]], device float* pre_k [[buffer(9)]],
+    device float* pre_gate [[buffer(10)]], device float* new_conv_state [[buffer(11)]],
+    constant GdnCoreParams& p [[buffer(12)]], const device uint* slot_ids [[buffer(13)]],
+    constant int& row_pitch [[buffer(14)]], constant int& n_scan [[buffer(15)]],
+    uint3 tpig [[thread_position_in_grid]], uint simd_lane [[thread_index_in_simdgroup]]) {
+  const int Dk = p.Dk, Hv = p.Hv, CDIM = p.conv_dim, Kc = p.Kc;
+  const int n = int(tpig.z), t = n / Hv, hv_idx = n % Hv;
+  const int slot = int(slot_ids[0]), dk_idx = int(tpig.x), n_per_t = Dk / 32;
+  const int q_off = p.q_off, k_off = p.k_off;
+  const size_t pitch_t = size_t(row_pitch);
+  const size_t pitch_f = size_t(row_pitch) / 2;   // fp32 scratch shares the byte pitch
+  const size_t row_t = size_t(t) * pitch_t;
+
+  // Tap j of token t's conv window: prompt row `t-(Kc-1)+j` when it exists,
+  // otherwise row `Kc + idx` of the history this prompt started from.
+  auto tap = [&](int j, int c) -> float {
+    const int idx = t - (Kc - 1) + j;
+    return idx >= 0 ? float(mixed[size_t(idx) * pitch_t + c])
+                    : conv_state[(slot * Kc + Kc + idx) * CDIM + c];
+  };
+  auto convsilu = [&](int c) -> float {
+    float acc = float(conv_b[c]);
+    for (int j = 0; j < Kc - 1; ++j) acc += tap(j, c) * float(conv_w[c * Kc + j]);
+    acc += float(mixed[row_t + c]) * float(conv_w[c * Kc + (Kc - 1)]);
+    return acc / (1.0f + exp(-acc));
+  };
+
+  float qraw[8], kraw[8];
+  for (int i = 0; i < n_per_t; ++i) {
+    const int d = n_per_t * dk_idx + i;
+    qraw[i] = convsilu(q_off + hv_idx * Dk + d);
+    kraw[i] = convsilu(k_off + hv_idx * Dk + d);
+  }
+  float qsq = 0.0f, ksq = 0.0f;
+  for (int i = 0; i < n_per_t; ++i) { qsq += qraw[i] * qraw[i]; ksq += kraw[i] * kraw[i]; }
+  qsq = simd_sum(qsq); ksq = simd_sum(ksq);
+  const float qinv = p.inv_sqrt_dk / sqrt(qsq + p.eps);
+  const float kinv = 1.0f / sqrt(ksq + p.eps);
+  device float* oq = pre_q + size_t(t) * pitch_f + size_t(hv_idx) * Dk;
+  device float* ok = pre_k + size_t(t) * pitch_f + size_t(hv_idx) * Dk;
+  for (int i = 0; i < n_per_t; ++i) {
+    const int d = n_per_t * dk_idx + i;
+    oq[d] = qraw[i] * qinv;
+    ok[d] = kraw[i] * kinv;
+  }
+  if (dk_idx == 0) {
+    const float ad = float(a_gate[row_t + hv_idx]) + float(dt_bias[hv_idx]);
+    const float sp = max(ad, 0.0f) + log(1.0f + exp(-fabs(ad)));
+    device float* g = pre_gate + size_t(t) * pitch_f + 2 * size_t(hv_idx);
+    g[0] = exp(-exp(float(A_log[hv_idx])) * sp);
+    g[1] = 1.0f / (1.0f + exp(-float(b_gate[row_t + hv_idx])));
+  }
+
+  // Only the last scanned token carries the history forward.
+  if (t != n_scan - 1) return;
+  auto wb = [&](int c) {
+    for (int j = 0; j < Kc; ++j) {
+      const int idx = t - (Kc - 1) + j;
+      new_conv_state[(slot * Kc + j) * CDIM + c] =
+          idx >= 0 ? float(mixed[size_t(idx) * pitch_t + c])
+                   : conv_state[(slot * Kc + Kc + idx) * CDIM + c];
+    }
+  };
+  for (int i = 0; i < n_per_t; ++i) {
+    const int d = n_per_t * dk_idx + i;
+    wb(q_off + hv_idx * Dk + d);
+    wb(k_off + hv_idx * Dk + d);
+  }
+}
+
+template <typename T>
+[[kernel]] void gdn_core_recurrent_prefill(
+    const device T* mixed [[buffer(0)]], const device float* conv_state [[buffer(1)]],
+    device float* rstate [[buffer(2)]], device T* core_out [[buffer(3)]],
+    const device T* conv_w [[buffer(4)]], const device T* conv_b [[buffer(5)]],
+    const device float* pre_q [[buffer(6)]], const device float* pre_k [[buffer(7)]],
+    const device float* pre_gate [[buffer(8)]], device float* new_conv_state [[buffer(9)]],
+    constant GdnCoreParams& p [[buffer(10)]], const device uint* slot_ids [[buffer(11)]],
+    constant int& row_pitch [[buffer(12)]], constant int& n_scan [[buffer(13)]],
+    uint3 tpig [[thread_position_in_grid]], uint simd_lane [[thread_index_in_simdgroup]]) {
+  const int Dk = p.Dk, Dv = p.Dv, Hv = p.Hv, CDIM = p.conv_dim, Kc = p.Kc;
+  const int hv_idx = int(tpig.z), dv_idx = int(tpig.y);
+  const int slot = int(slot_ids[0]), dk_idx = int(tpig.x), n_per_t = Dk / 32;
+  const int v_off = p.v_off;
+  const size_t pitch_t = size_t(row_pitch);
+  const size_t pitch_f = size_t(row_pitch) / 2;
+  const int vc = v_off + hv_idx * Dv + dv_idx;
+
+  // This simdgroup owns the whole (slot, hv, dv) state row, so the scan runs in
+  // registers with no ordering beyond the loop itself.
+  device float* i_state = rstate + (size_t((slot * Hv + hv_idx) * Dv + dv_idx) * Dk);
+  float st[8];
+  for (int i = 0; i < n_per_t; ++i) st[i] = i_state[n_per_t * dk_idx + i];
+
+  for (int t = 0; t < n_scan; ++t) {
+    const size_t row_t = size_t(t) * pitch_t;
+    float acc = float(conv_b[vc]);
+    for (int j = 0; j < Kc - 1; ++j) {
+      const int idx = t - (Kc - 1) + j;
+      const float tap = idx >= 0 ? float(mixed[size_t(idx) * pitch_t + vc])
+                                 : conv_state[(slot * Kc + Kc + idx) * CDIM + vc];
+      acc += tap * float(conv_w[vc * Kc + j]);
+    }
+    acc += float(mixed[row_t + vc]) * float(conv_w[vc * Kc + (Kc - 1)]);
+    const float vval = acc / (1.0f + exp(-acc));
+
+    const device float* iq = pre_q + size_t(t) * pitch_f + size_t(hv_idx) * Dk;
+    const device float* ik = pre_k + size_t(t) * pitch_f + size_t(hv_idx) * Dk;
+    const device float* g = pre_gate + size_t(t) * pitch_f + 2 * size_t(hv_idx);
+    float q[8], k[8];
+    for (int i = 0; i < n_per_t; ++i) {
+      const int d = n_per_t * dk_idx + i;
+      q[i] = iq[d];
+      k[i] = ik[d];
+    }
+    float kv_mem = 0.0f;
+    for (int i = 0; i < n_per_t; ++i) { st[i] *= g[0]; kv_mem += st[i] * k[i]; }
+    kv_mem = simd_sum(kv_mem);
+    const float delta = (vval - kv_mem) * g[1];
+    float out = 0.0f;
+    for (int i = 0; i < n_per_t; ++i) { st[i] += k[i] * delta; out += st[i] * q[i]; }
+    out = simd_sum(out);
+    if (simd_lane == 0)
+      core_out[row_t + size_t(hv_idx) * Dv + dv_idx] = static_cast<T>(out);
+  }
+  for (int i = 0; i < n_per_t; ++i) i_state[n_per_t * dk_idx + i] = st[i];
+
+  if (dk_idx != 0) return;
+  for (int j = 0; j < Kc; ++j) {
+    const int idx = (n_scan - 1) - (Kc - 1) + j;
+    new_conv_state[(slot * Kc + j) * CDIM + vc] =
+        idx >= 0 ? float(mixed[size_t(idx) * pitch_t + vc])
+                 : conv_state[(slot * Kc + Kc + idx) * CDIM + vc];
+  }
+}
+
+#define instantiate_gdn_prefill(name, itype)                                    \
+  template [[host_name("gdn_prep_prefill_" #name)]] [[kernel]] void             \
+  gdn_prep_prefill<itype>(                                                      \
+      const device itype*, const device float*, const device itype*,            \
+      const device itype*, const device float*, const device itype*,            \
+      const device itype*, const device itype*, device float*, device float*,   \
+      device float*, device float*, constant GdnCoreParams&, const device uint*,\
+      constant int&, constant int&, uint3, uint);                               \
+  template [[host_name("gdn_core_recurrent_prefill_" #name)]] [[kernel]] void   \
+  gdn_core_recurrent_prefill<itype>(                                            \
+      const device itype*, const device float*, device float*, device itype*,   \
+      const device itype*, const device itype*, const device float*,            \
+      const device float*, const device float*, device float*,                  \
+      constant GdnCoreParams&, const device uint*, constant int&, constant int&,\
+      uint3, uint);
+
+instantiate_gdn_prefill(float32, float)
+instantiate_gdn_prefill(float16, half)
+instantiate_gdn_prefill(bfloat16, bfloat)

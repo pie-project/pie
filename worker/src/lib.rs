@@ -9,6 +9,20 @@
 //! the surface they need — `serve::start_engine`, `config::Config`,
 //! and native-driver bootstrap helpers.
 
+/// The process-wide allocator for every engine entry point.
+///
+/// Declared here rather than in each binary because `#[global_allocator]` is
+/// resolved at link time across the whole graph, and `pie-worker` is the one
+/// crate the CLI, the standalone worker and the pyo3 wheel all link.
+///
+/// This is a measured change, not a preference. The scheduler loop is a
+/// single thread whose pass time is the critical path for every process hop
+/// at a cohort boundary (CONTENTION_FOLLOWUP.md §20.23), and retiring a wave
+/// frees 512 `LaunchPlan`s — thirty-odd `Vec`s each. Under glibc malloc those
+/// frees cost 2.93 ms per pass; under mimalloc, 0.77 ms.
+#[global_allocator]
+static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 pub mod config;
 pub mod driver_ffi;
 pub mod embedded_driver;

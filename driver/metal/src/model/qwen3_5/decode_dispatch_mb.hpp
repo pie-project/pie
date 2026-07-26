@@ -28,6 +28,68 @@ inline void qmv_mb_dispatch(int out_vec, int N, Grid& g, Threadgroup& tg) {
     tg = Threadgroup{32, 2, 1};
 }
 
+// Below this batch the GEMV is the faster kernel: measured, pie's per-step cost
+// beats mlx-lm's at every batch up to 8 with the GEMV and only loses above it.
+inline constexpr int kQmmMinBatch = 12;
+// The ported steel GEMM is instantiated aligned-only, at BM=16 and BK=32. K is
+// not checked: every qwen3.6 projection has K % 512 == 0 (the same fact the
+// GEMV port relies on for its "fast" variant), so K % BK == 0 is free.
+inline constexpr int kQmmBM = 16;
+
+// Output columns per threadgroup.  This GEMM is occupancy-bound, not bandwidth-
+// bound: measured standalone at the model's shapes it turns in ~380 GFLOP/s at
+// 16 threadgroups, ~900 at 32, ~1600 at 112 and saturates around 2.2-2.6 TFLOP/s
+// past ~200, against a 389 GB/s machine it only ever reaches 11% of.  So take
+// the widest tile -- wider means each x row is loaded fewer times -- that still
+// leaves enough threadgroups to fill the machine, and past that prefer more
+// threadgroups over a wider tile.
+//
+// The measured optimum for every projection in the checkpoint falls out of that
+// one rule: BN=64 for lm_head (3880 tg), 32 for the GDN in-projection (192),
+// 16 for everything else.  The old rule asked only whether `out_vec/64 >= 64`,
+// which handed the GDN in-projection a BN=64 that measured 21% slower.
+//
+// BN partitions output columns only -- every element's K sum is unchanged -- so
+// the choice is bit-exact whichever way it goes.
+inline constexpr int kQmmMinThreadgroups = 192;
+
+inline int qmm_bn(int out_vec, int N) {
+    if (N < kQmmMinBatch || N % kQmmBM != 0) return 0;
+    const int row_blocks = N / kQmmBM;
+    int best = 0;
+    for (int bn : {16, 32, 64}) {
+        if (out_vec % bn != 0) continue;
+        if (best == 0) best = bn;  // the narrowest that divides, as a floor
+        if ((out_vec / bn) * row_blocks >= kQmmMinThreadgroups) best = bn;
+    }
+    return best;
+}
+
+// `out/BN` threadgroups across the output, `M/BM` across the batch, each
+// 32x2x2 = 128 threads (WM=WN=2 simdgroups), which is the shape steel's
+// BlockMMA is written for.
+// The prefill's batched projection. Rows are padded up to a whole BM tile: the
+// scratch pool holds `max_tokens` rows and the tail rows land in ones the fire
+// does not use, so the padding computes discardable values rather than needing
+// a bounds-checked inner loop.
+inline int qmm_strided_rows(int N, int max_rows) {
+    const int padded = ((N + kQmmBM - 1) / kQmmBM) * kQmmBM;
+    return padded <= max_rows ? padded : 0;
+}
+
+inline void qmm_t_strided_dispatch(int out_vec, int padded_rows, Grid& g,
+                                   Threadgroup& tg) {
+    g  = Grid{32u * (uint32_t(out_vec) / 32u),
+              2u * (uint32_t(padded_rows) / uint32_t(kQmmBM)), 2};
+    tg = Threadgroup{32, 2, 2};
+}
+
+inline void qmm_t_dispatch(int out_vec, int N, int bn, Grid& g, Threadgroup& tg) {
+    g  = Grid{32u * (uint32_t(out_vec) / uint32_t(bn)),
+              2u * (uint32_t(N) / uint32_t(kQmmBM)), 2};
+    tg = Threadgroup{32, 2, 2};
+}
+
 // rms_single_row over N tokens × n_rows rows-per-token (e.g. per-head q/k norm). One
 // threadgroup per row; rows stack token-major [N*n_rows, row_size]. grid.x = (row_size/4)*n_rows*N.
 inline void rms_mb_dispatch(int row_size, int n_rows, int N, Grid& g, Threadgroup& tg) {

@@ -1,12 +1,11 @@
 // ptir_abi.h — GENERATED from `compiler/ir/src/{op,registry}.rs`.
 // DO NOT EDIT. Regenerate: PTIR_REGEN=1 cargo test -p pie-compiler-tests --test ptir_header
-// Container layout: interface/sampling-ir/PTIR-CONTAINER.md
 #pragma once
 #include <stdint.h>
 
 #define PTIR_MAGIC "PTIR"
 #define PTIR_VERSION 1
-// v1.1 extern channels (PTIR-CONTAINER.md section 6b): wire-version 2 iff externs
+// v1.1 extern channels: wire-version 2 iff the container declares externs
 #define PTIR_VERSION_EXTERN 2
 enum PtirExternDir : uint8_t { PTIR_EXTERN_IMPORT = 0, PTIR_EXTERN_EXPORT = 1 };
 
@@ -237,6 +236,11 @@ enum PtirIntrinsic : uint16_t {
   PTIR_INTR_MTP_DRAFTS = 6,
   PTIR_INTR_ATTN_SCORE = 7,
 };
+
+// Per-lane stride of any table indexed by PtirIntrinsic. One past the largest id
+// above, not the number of ids: an id that overflows this stride does not fault,
+// it silently reads the next lane's slot 0.
+#define PTIR_INTRINSIC_SLOTS 8u
 
 // ── channel host roles / readiness direction / lowering classes ──
 enum PtirHostRole : uint8_t { PTIR_HOST_NONE = 0, PTIR_HOST_WRITER = 1, PTIR_HOST_READER = 2 };

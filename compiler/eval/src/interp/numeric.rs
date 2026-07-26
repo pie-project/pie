@@ -277,8 +277,16 @@ pub(super) fn sort_desc_order(row: &[f32]) -> Vec<u32> {
     idx
 }
 
+/// [`Shape::rows`] as an index type, saturating rather than truncating.
+///
+/// A row count only has to fit `u64`, so narrowing it is a real conversion
+/// even on a 64-bit host. Saturating keeps the answer conservative: every
+/// caller divides a materialized lane count by this, and no buffer the
+/// interpreter holds is `usize::MAX` long, so an unrepresentable row count
+/// yields an empty row rather than a wrapped-small one that would slice the
+/// data at the wrong stride.
 pub(super) fn rows_of(shape: Shape) -> usize {
-    shape.rows() as usize
+    usize::try_from(shape.rows()).unwrap_or(usize::MAX)
 }
 
 /// Which of the three row reductions [`eval_op`] is evaluating.

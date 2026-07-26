@@ -2,13 +2,10 @@
 name = "pie-compiler-tests"
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
 description = "Conformance suite for the PTIR toolchain: golden traces, the malformed-wire corpus, generated-artifact drift checks, and cross-implementation parity. Test-only — it ships no library."
 license = "Apache-2.0"
 publish = false
-
-[lib]
-name = "pie_compiler_tests"
-path = "src/lib.rs"
 
 [dev-dependencies]
 pie-ir = { path = "../ir" }

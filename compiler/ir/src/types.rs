@@ -20,8 +20,11 @@ pub const MAX_RANK: usize = 4;
 /// add to `is_float` reads as "not a float" everywhere, silently.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DTypeClass {
+    /// Approximate reals; comparisons and reductions follow IEEE-754.
     Float,
+    /// Exact integers; division truncates.
     Int,
+    /// Booleans: the only class the compare and logic ops produce.
     Logical,
 }
 
@@ -38,7 +41,10 @@ macro_rules! declare_dtypes {
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
         #[repr(u8)]
         pub enum DType {
-            $($variant = $wire,)*
+            $(
+                #[doc = concat!("The `", $name, "` element type.")]
+                $variant = $wire,
+            )*
         }
 
         impl DType {
@@ -68,8 +74,9 @@ macro_rules! declare_dtypes {
             use super::*;
 
             /// `ALL` is indexed by wire byte, which is what makes
-            /// [`DType::from_wire`] a lookup and what every `dtype > Bool as u8`
-            /// bound in the decoders used to assume without saying.
+            /// [`DType::from_wire`] a lookup and what every `dtype > Bool as
+            /// u8` bound in the decoders relies on. Listing a dtype out of
+            /// wire order, or leaving a gap, silently breaks both.
             #[test]
             fn all_is_indexed_by_wire_byte() {
                 let mut wire = 0u8;
@@ -141,12 +148,16 @@ impl DType {
         DType::ALL.get(usize::from(byte)).copied()
     }
 
+    /// Whether this dtype is a [`DTypeClass::Float`].
     pub fn is_float(self) -> bool {
         self.class() == DTypeClass::Float
     }
+    /// Whether this dtype is a [`DTypeClass::Int`].
     pub fn is_int(self) -> bool {
         self.class() == DTypeClass::Int
     }
+    /// Whether this dtype admits arithmetic — float or int, but not
+    /// [`DTypeClass::Logical`].
     pub fn is_numeric(self) -> bool {
         matches!(self.class(), DTypeClass::Float | DTypeClass::Int)
     }
@@ -164,6 +175,7 @@ pub struct Shape {
 }
 
 impl Shape {
+    /// The rank-0 shape: one element, no axes.
     pub const SCALAR: Shape = Shape {
         dims: [0; MAX_RANK],
         rank: 0,
@@ -184,35 +196,66 @@ impl Shape {
         d[..dims.len()].copy_from_slice(dims);
         Some(Shape {
             dims: d,
-            rank: dims.len() as u8,
+            rank: u8::try_from(dims.len()).ok()?,
         })
     }
+    /// The rank-1 shape `[n]`.
+    ///
+    /// # Panics
+    ///
+    /// If `n` is `0`; every extent must be at least 1. Use [`Shape::new`]
+    /// for a length that came from outside the program.
     pub fn vector(n: u32) -> Shape {
         Shape::new(&[n]).unwrap()
     }
+    /// The rank-2 shape `[m, n]`.
+    ///
+    /// # Panics
+    ///
+    /// If either extent is `0`, or if `m * n` overflows `u64`. Use
+    /// [`Shape::new`] for extents that came from outside the program.
     pub fn matrix(m: u32, n: u32) -> Shape {
         Shape::new(&[m, n]).unwrap()
     }
 
+    /// The extents, outermost first. Length is the rank.
     pub fn dims(&self) -> &[u32] {
         &self.dims[..self.rank as usize]
     }
+    /// How many axes this shape has.
     pub fn rank(&self) -> usize {
         self.rank as usize
     }
+    /// Whether this is the rank-0 shape.
     pub fn is_scalar(&self) -> bool {
         self.rank == 0
     }
+    /// Total element count.
+    ///
+    /// Cannot overflow: [`Shape::new`] refuses a dim list whose `u64`
+    /// product does not fit, so every constructible shape has one.
     pub fn numel(&self) -> u64 {
         self.dims().iter().map(|&d| d as u64).product()
     }
+    /// The trailing extent — the axis reductions, scans and pivots run
+    /// along — or `None` for a scalar.
     pub fn last_len(&self) -> Option<u32> {
         self.dims().last().copied()
     }
-    pub fn rows(&self) -> u32 {
+    /// The number of rows a rank-`n` shape has: the product of every axis but
+    /// the last. Scalars and vectors are one row.
+    ///
+    /// `u64` rather than `u32`, matching [`Shape::numel`], because the only
+    /// bound [`Shape::new`] enforces is that the *whole* dim product fits
+    /// `u64`. A leading-dim product is smaller than that but still free to
+    /// exceed `u32`: `[65536, 65536, 2]` is a shape `new` accepts, and its row
+    /// count is `2^32`. Computing it in `u32` makes decoded — that is,
+    /// untrusted — input panic in debug and silently answer `0` in release,
+    /// which is a row loop that runs zero times rather than a rejection.
+    pub fn rows(&self) -> u64 {
         match self.rank as usize {
             0 | 1 => 1,
-            r => self.dims[..r - 1].iter().product(),
+            r => self.dims[..r - 1].iter().map(|&d| d as u64).product(),
         }
     }
     /// The shape with the last axis dropped (a reduction's result), or `None`
@@ -228,20 +271,29 @@ impl Shape {
 /// A value's full type: [`Shape`] + [`DType`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ValueType {
+    /// The value's extents.
     pub shape: Shape,
+    /// The value's element type.
     pub dtype: DType,
 }
 
 impl ValueType {
+    /// The type with the given shape and element type.
     pub const fn new(shape: Shape, dtype: DType) -> Self {
         Self { shape, dtype }
     }
+    /// The rank-0 type of element type `dtype`.
     pub fn scalar(dtype: DType) -> Self {
         Self {
             shape: Shape::SCALAR,
             dtype,
         }
     }
+    /// The `[n]` type of element type `dtype`.
+    ///
+    /// # Panics
+    ///
+    /// If `n` is `0`; see [`Shape::vector`].
     pub fn vector(n: u32, dtype: DType) -> Self {
         Self {
             shape: Shape::vector(n),
@@ -264,30 +316,97 @@ pub enum Predicate {
     ProbGe(ValueId),
 }
 
+impl Predicate {
+    /// The value id this predicate thresholds on.
+    ///
+    /// Every variant carries exactly one, which is what lets
+    /// [`Op::operands`](crate::op::Op::operands) treat `pivot_threshold` as a
+    /// two-operand op without
+    /// re-matching the predicate at each call site.
+    pub fn value(self) -> ValueId {
+        match self {
+            Predicate::RankLe(value) | Predicate::CummassLe(value) | Predicate::ProbGe(value) => {
+                value
+            }
+        }
+    }
+
+    /// The threshold value id, for rewriting it. See [`Predicate::value`].
+    pub fn value_slot(&mut self) -> &mut ValueId {
+        match self {
+            Predicate::RankLe(value) | Predicate::CummassLe(value) | Predicate::ProbGe(value) => {
+                value
+            }
+        }
+    }
+}
+
 /// Distribution sampled by the noise op. Tag bytes are stable wire constants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum RngKind {
+    /// Draws in `(0, 1)`, exclusive at both ends.
     Uniform = 0,
+    /// Standard Gumbel noise, for argmax-based categorical sampling.
     Gumbel = 1,
 }
 
 /// A compile-time constant scalar (the payload of a `const` op).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Literal {
+    /// An [`DType::F32`] constant.
     F32(f32),
+    /// An [`DType::I32`] constant.
     I32(i32),
+    /// A [`DType::U32`] constant.
     U32(u32),
+    /// A [`DType::Bool`] constant.
     Bool(bool),
 }
 
 impl Literal {
+    /// This literal's element type.
     pub fn dtype(self) -> DType {
         match self {
             Literal::F32(_) => DType::F32,
             Literal::I32(_) => DType::I32,
             Literal::U32(_) => DType::U32,
             Literal::Bool(_) => DType::Bool,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `rows` is the product of the leading axes, and [`Shape::new`] only
+    /// bounds the product of *all* of them. A shape whose full product fits
+    /// `u64` can still have more than `u32::MAX` rows, so the row count is
+    /// computed in `u64` — narrower arithmetic here panics in debug and wraps
+    /// to `0` in release on input the decoder accepts.
+    #[test]
+    fn rows_does_not_overflow_for_a_shape_new_accepts() {
+        let shape = Shape::new(&[65_536, 65_536, 2]).expect("the u64 dim product fits");
+        assert_eq!(shape.numel(), 8_589_934_592);
+        assert_eq!(shape.rows(), 4_294_967_296);
+        assert!(shape.rows() > u64::from(u32::MAX));
+    }
+
+    /// The identity the row count exists for, at a size where a `u32` product
+    /// would have wrapped.
+    #[test]
+    fn rows_times_last_len_is_numel() {
+        for dims in [
+            &[7u32][..],
+            &[3, 5],
+            &[2, 3, 4],
+            &[65_536, 65_536, 2],
+            &[1 << 20, 1 << 20, 3],
+        ] {
+            let shape = Shape::new(dims).expect("dim product fits u64");
+            let last = u64::from(shape.last_len().expect("non-scalar"));
+            assert_eq!(shape.rows() * last, shape.numel(), "dims {dims:?}");
         }
     }
 }

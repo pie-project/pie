@@ -8,6 +8,7 @@
 //! two inline expansions the single-lane form does not have — the MTP-draft
 //! argmax and the logits gather.
 
+use crate::error::{EmitError, EmitterKind, RegionForm};
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -15,7 +16,7 @@ use alloc::vec::Vec;
 use core::fmt::Write as _;
 use pie_ir::op::{intrinsic_tags, tags};
 
-use pie_plan::{CompiledStage, Dimension, Region};
+use pie_plan::{CompiledStage, Region};
 
 use super::METAL_M2_MAX_FUSED_CHANNELS;
 use super::preamble::{RUNTIME_TEMPLATE, grouped_preamble};
@@ -28,18 +29,6 @@ fn value_ptr(value: u32) -> String {
     format!("scratch + offsets[{value}]")
 }
 
-/// Follow a chain of elided reshapes to the value that actually holds the bytes.
-fn resolve_alias(alias: &BTreeMap<u32, u32>, mut value: u32) -> u32 {
-    // The chain is acyclic (SSA), but bound the walk anyway.
-    for _ in 0..64 {
-        match alias.get(&value) {
-            Some(&source) => value = source,
-            None => break,
-        }
-    }
-    value
-}
-
 /// Threads a grouped region's threadgroup gets per lane. The emitted kernel
 /// sizes its threadgroup reduction buffer to this; the driver launches the
 /// narrower of it and the pipeline's own maxTotalThreadsPerThreadgroup, and
@@ -47,9 +36,10 @@ fn resolve_alias(alias: &BTreeMap<u32, u32>, mut value: u32) -> u32 {
 /// buffer.
 ///
 /// Emitted into `ptir_abi.h` as `PTIR_METAL_M3_REGION_THREADS`, which is what
-/// `m1_runtime.cpp`'s `kM3RegionThreads` now reads. It used to be a hand-kept
-/// copy with a "must equal" comment and nothing comparing them, and it did
-/// drift: 256 in the driver against a 1024-element buffer in the goldens.
+/// `m1_runtime.cpp`'s `kM3RegionThreads` reads. It must not be transcribed on
+/// the driver side: a hand-kept copy carrying a "must equal" comment has
+/// nothing comparing the two, and the failure mode is a threadgroup sized for
+/// one count reducing over a buffer built for another.
 ///
 /// 512 measured against 256 with the model DAG truncated away, interleaved to
 /// cancel thermal drift: 0.951ms vs 1.557ms for the sampler region, reproduced
@@ -65,13 +55,16 @@ pub fn emit_fused_region(
     function_name: &str,
     stage: &CompiledStage,
     region: &Region,
-) -> Result<String, String> {
+) -> Result<String, EmitError> {
     if !library_region_valid(stage, region) {
-        return Err("library region ABI is invalid".to_string());
+        return Err(EmitError::LibraryRegionAbiInvalid(RegionForm::Unnamed));
     }
     let channel_bindings = &stage.normalized.channel_bindings;
     if channel_bindings.len() > METAL_M2_MAX_FUSED_CHANNELS {
-        return Err("fused region exceeds the 12-channel direct-binding limit".to_string());
+        return Err(EmitError::ChannelLimitExceeded {
+            emitter: EmitterKind::MetalFused,
+            limit: METAL_M2_MAX_FUSED_CHANNELS,
+        });
     }
     let ops: Vec<OpView> = OpView::of_all(&stage.normalized.ops);
     intrinsics_bindable(&ops, region)?;
@@ -108,17 +101,17 @@ pub fn emit_fused_region(
     for &node in &region.nodes {
         let node = node.index();
         let Some(op) = ops.get(node) else {
-            return Err("fused region node out of range".to_string());
+            return Err(EmitError::RegionNodeOutOfRange(RegionForm::Fused));
         };
         let mut slots = Slots::of(op, bases[node], value_ptr);
         if op.tag == tags::CHAN_TAKE || op.tag == tags::CHAN_READ {
             if op.chan < 0 || op.chan as usize >= channel_bindings.len() {
-                return Err("fused channel root binding out of range".to_string());
+                return Err(EmitError::ChannelRootBindingOutOfRange);
             }
             slots.a0 = format!("current_{}", op.chan);
         } else if op.tag == tags::CHAN_PUT {
             if op.chan < 0 || op.chan as usize >= channel_bindings.len() {
-                return Err("fused channel sink binding out of range".to_string());
+                return Err(EmitError::ChannelSinkBindingOutOfRange);
             }
             slots.o0 = format!("pending_{}", op.chan);
         } else if op.tag == tags::INTRINSIC_VAL {
@@ -143,9 +136,9 @@ pub fn emit_grouped_fused_region(
     function_name: &str,
     stage: &CompiledStage,
     region: &Region,
-) -> Result<String, String> {
+) -> Result<String, EmitError> {
     if !library_region_valid(stage, region) {
-        return Err("grouped library region ABI is invalid".to_string());
+        return Err(EmitError::LibraryRegionAbiInvalid(RegionForm::GroupedFused));
     }
     let ops: Vec<OpView> = OpView::of_all(&stage.normalized.ops);
     intrinsics_bindable(&ops, region)?;
@@ -259,62 +252,9 @@ pub fn emit_grouped_fused_region(
     // instead, as long as the result stays inside this region -- a region output
     // or sink is read through its own offset by someone else, so those keep the
     // copy.
-    let escapes: BTreeSet<u32> = region
-        .outputs
-        .iter()
-        .copied()
-        .chain(region.sinks.iter().map(|sink| sink.value))
-        .collect();
+    let escapes = crate::alias::escaping_values(region);
     let value_types = &stage.normalized.value_types;
-    // What the runtime actually does for a reshape is
-    // `m1_copy_typed(src, dst, dst_desc.len, dtype)` -- it takes the *result's*
-    // element count from offset 0 of the source. So the result is a prefix view
-    // of the source whenever the source is at least as long, and pointing
-    // consumers at the source reproduces it byte for byte: they read through
-    // the result's own descriptor, so they still read exactly `dst.len`.
-    //
-    // Comparing lengths must survive symbolic extents, because the one graph
-    // that needs this is the sampler, whose reshape is
-    // `[SampledRows, vocab] -> [vocab]`. Splitting a shape into its static
-    // product and the multiset of its symbolic ids is enough: if the result's
-    // symbolic ids are a sub-multiset of the source's and its static product is
-    // no larger, the result is no longer than the source under every binding.
-    // (An earlier version demanded fully static extents on both sides and so
-    // never fired at all.)
-    let footprint = |value: u32| -> Option<(u8, u64, Vec<u8>)> {
-        let ty = value_types.get(value as usize)?;
-        let mut statics: u64 = 1;
-        let mut symbolic: Vec<u8> = Vec::new();
-        for dim in &ty.dims {
-            match dim {
-                Dimension::Static(extent) => statics *= u64::from(*extent),
-                Dimension::Symbolic(id) => symbolic.push(*id as u8),
-            }
-        }
-        symbolic.sort_unstable();
-        Some((ty.dtype as u8, statics, symbolic))
-    };
-    // `result` is never longer than `source`, whatever the symbolic dims are.
-    let covers = |source: u32, result: u32| match (footprint(source), footprint(result)) {
-        (
-            Some((src_dtype, src_static, src_symbolic)),
-            Some((dst_dtype, dst_static, mut dst_symbolic)),
-        ) => {
-            if src_dtype != dst_dtype || dst_static > src_static {
-                return false;
-            }
-            let mut remaining = src_symbolic;
-            dst_symbolic.retain(|id| match remaining.iter().position(|kept| kept == id) {
-                Some(at) => {
-                    remaining.remove(at);
-                    false
-                }
-                None => true,
-            });
-            dst_symbolic.is_empty()
-        }
-        _ => false,
-    };
+    let covers = |source: u32, result: u32| crate::alias::covers(value_types, source, result);
 
     // Decided before anything is emitted, because the gather/argmax fusion below
     // has to see through these aliases to recognise its pattern.
@@ -328,12 +268,12 @@ pub fn emit_grouped_fused_region(
             && !escapes.contains(&bases[node])
             && covers(op.args[0], bases[node])
     };
-    let mut alias: BTreeMap<u32, u32> = BTreeMap::new();
+    let mut alias = crate::alias::AliasTable::new();
     for &node in &region.nodes {
         let node = node.index();
         if is_view_reshape(node) {
             let arg = ops[node].args[0];
-            alias.insert(bases[node], resolve_alias(&alias, arg));
+            alias.elide(bases[node], arg);
         }
     }
 
@@ -347,7 +287,7 @@ pub fn emit_grouped_fused_region(
         }
         if let Some(op) = ops.get(node.index()) {
             for &arg in &op.args {
-                *consumers.entry(resolve_alias(&alias, arg)).or_insert(0) += 1;
+                *consumers.entry(alias.resolve(arg)).or_insert(0) += 1;
             }
         }
     }
@@ -359,7 +299,7 @@ pub fn emit_grouped_fused_region(
         if op.tag != tags::REDUCE_ARGMAX || op.args.len() != 1 {
             continue;
         }
-        let source_value = resolve_alias(&alias, op.args[0]);
+        let source_value = alias.resolve(op.args[0]);
         if consumers.get(&source_value).copied().unwrap_or(0) != 1
             || escapes.contains(&source_value)
         {
@@ -382,14 +322,14 @@ pub fn emit_grouped_fused_region(
     for &node in &region.nodes {
         let node = node.index();
         let Some(op) = ops.get(node) else {
-            return Err("grouped fused region node out of range".to_string());
+            return Err(EmitError::RegionNodeOutOfRange(RegionForm::GroupedFused));
         };
         let base = bases[node];
         if elided_gather.contains(&node) {
             continue;
         }
         if let Some(&producer) = fused_argmax.get(&node) {
-            let slots = Slots::of(op, base, |value| value_ptr(resolve_alias(&alias, value)));
+            let slots = Slots::of(op, base, |value| value_ptr(alias.resolve(value)));
             emit_logits_argmax(
                 &mut source,
                 bases[producer],
@@ -403,7 +343,7 @@ pub fn emit_grouped_fused_region(
         if is_view_reshape(node) {
             continue;
         }
-        let mut slots = Slots::of(op, base, |value| value_ptr(resolve_alias(&alias, value)));
+        let mut slots = Slots::of(op, base, |value| value_ptr(alias.resolve(value)));
         if op.tag == tags::INTRINSIC_VAL && op.intr == intrinsic_tags::MTP_DRAFTS {
             emit_mtp_drafts(&mut source, base, &slots.o0);
             source.push_str(BARRIER);

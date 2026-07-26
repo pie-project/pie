@@ -81,7 +81,9 @@ tarpc = { version = "0.37", features = [
 # comes from `pie-client`, already a dependency below).
 tokio-tungstenite = "0.30.0"
 futures = "0.3.33"
-mimalloc = "0.1"
+# `local_dynamic_tls`: the pyo3 wheel is dlopen()ed, and mimalloc's default
+# initial-exec TLS model cannot be satisfied by a late-loaded library.
+mimalloc = { version = "0.1", features = ["local_dynamic_tls"] }
 tracing = "0.1"
 # Async HTTP client for the data-plane blob fetch (gateway_link.rs): the
 # worker pulls `GET {origin}/blob/{hash}` for multimodal inputs during

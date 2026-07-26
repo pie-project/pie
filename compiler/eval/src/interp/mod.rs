@@ -1,6 +1,5 @@
-//! **Tier-0 reference interpreter** (feature `eval`) — the golden model every
-//! backend diffs against (thrust-3 P4.1). Executes a validated
-//! [`BoundTrace`] cell-accurately, implementing overview §1 + §7.1 exactly:
+//! **Tier-0 reference interpreter** — the golden model every backend diffs
+//! against. Executes a validated [`BoundTrace`] cell-accurately:
 //!
 //! - **Per-phase readiness** in `prologue → descriptor → on_attn_proj →
 //!   on_attn → epilogue` order, from the bind-emitted first-op direction
@@ -20,23 +19,18 @@
 //!   call [`Instance::poison`] after its resubmission budget): blocked host
 //!   ops resolve to errors instead of hanging.
 //!
-//! The §7.1 in-place lowering classes (`validate::ChannelClass`) are perf-only and
-//! deliberately *not* consulted here — the ring semantics below are the
-//! observable contract they must preserve.
+//! The in-place lowering classes (`pie_ir::validate::ChannelClass`) are
+//! perf-only and deliberately *not* consulted here — the ring semantics below
+//! are the observable contract they must preserve.
 //!
 //! Integer arithmetic here is exact per dtype (beam geometry is u32 math).
 //!
 //! ## Layout
 //!
-//! This was one 2,263-line file. The seam is the one `pareval.rs` already
-//! imports: it needs `Value`, `PassInputs`, `StepError`, `const_value` and
-//! `eval_op`, and nothing else, so the split follows what a second consumer
-//! actually reached for rather than a line count.
-//!
 //! * this module — values, channels, the ring, and `Instance`'s stepping
-//! * [`numeric`] — the pinned arithmetic contract: canonical reduction order,
+//! * `numeric` — the pinned arithmetic contract: canonical reduction order,
 //!   argmax tie-breaking, NaN handling, dtype-exact lanes
-//! * [`eval_op`] — one op, no state: the function `pareval` folds with
+//! * `eval_op` — one op, no state: the function `pareval` folds with
 
 mod eval_op;
 mod numeric;
@@ -62,13 +56,18 @@ use pie_ir::validate::{BoundTrace, Direction};
 /// interpreter's working value; the golden model every backend diffs against.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
+    /// A buffer of `f32` lanes ([`DType::F32`]).
     F32(Vec<f32>),
+    /// A buffer of `i32` lanes ([`DType::I32`]).
     I32(Vec<i32>),
+    /// A buffer of `u32` lanes ([`DType::U32`]).
     U32(Vec<u32>),
+    /// A buffer of `bool` lanes ([`DType::Bool`]), one byte per lane.
     Bool(Vec<bool>),
 }
 
 impl Value {
+    /// The number of lanes in the buffer (`1` for a scalar).
     pub fn len(&self) -> usize {
         match self {
             Value::F32(v) => v.len(),
@@ -77,9 +76,11 @@ impl Value {
             Value::Bool(v) => v.len(),
         }
     }
+    /// Returns `true` if the buffer holds no lanes.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+    /// The [`DType`] this value is tagged with.
     pub fn dtype(&self) -> DType {
         match self {
             Value::F32(_) => DType::F32,
@@ -144,8 +145,8 @@ struct ChannelState {
     last: Value,
 }
 
-/// v1.1: one SHARED channel ring — the pairing object for an extern channel
-/// (§1 "SPSC pairs may span pipelines"). The instantiation broker creates it
+/// One SHARED channel ring — the pairing object for an extern channel
+/// (SPSC pairs may span pipelines). The instantiation broker creates it
 /// once per extern NAME and hands the same handle to the exporting and the
 /// importing instance; both operate on the one ring (each on its own clock,
 /// SPSC enforced by the two containers' extern directions at bind).
@@ -157,6 +158,8 @@ pub struct ExternChannel {
 }
 
 impl ExternChannel {
+    /// Creates an empty shared ring holding up to `capacity` committed cells
+    /// of element type `ty`.
     pub fn new(ty: ValueType, capacity: u32) -> ExternChannel {
         ExternChannel {
             inner: Arc::new(Mutex::new(ChannelState {
@@ -184,7 +187,7 @@ enum Chan {
     Shared(ExternChannel),
 }
 
-/// One binding of a traced program to its channels (overview §2: trace =
+/// One binding of a traced program to its channels (trace =
 /// identity, instance = state).
 #[derive(Clone, Debug)]
 pub struct Instance {
@@ -194,6 +197,7 @@ pub struct Instance {
 
 /// Host-side channel-op failure.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum HostError {
     /// The channel (or the whole instance) is poisoned — the `?` in
     /// `out.take().await?`.
@@ -203,9 +207,10 @@ pub enum HostError {
     WouldBlock,
     /// Not a host-visible channel of that direction (SPSC bind contract).
     NotHostChannel,
-    /// v1.1: the container declares an extern channel that was not paired at
+    /// The container declares an extern channel that was not paired at
     /// instantiation.
     ExternUnpaired,
+    /// The channel index is past the container's channel table.
     BadIndex,
     /// Put value doesn't match the declared element type.
     TypeMismatch,
@@ -213,11 +218,15 @@ pub enum HostError {
 
 /// Why a step failed hard (semantics, not readiness).
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum StepError {
+    /// The instance is already poisoned, so no pass runs.
     Poisoned,
     /// A second-party kernel faulted; the instance is now poisoned.
     KernelFault {
+        /// The faulting kernel's name.
         name: String,
+        /// The device fault text the kernel returned.
         message: String,
     },
     /// Missing per-pass intrinsic input (harness error, not program error).
@@ -227,14 +236,66 @@ pub enum StepError {
     Fault(String),
 }
 
+impl core::fmt::Display for HostError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            HostError::Poisoned => f.write_str("channel is poisoned"),
+            HostError::WouldBlock => f.write_str("channel would block"),
+            HostError::NotHostChannel => {
+                f.write_str("not a host-visible channel of that direction")
+            }
+            HostError::ExternUnpaired => {
+                f.write_str("extern channel was not paired at instantiation")
+            }
+            HostError::BadIndex => f.write_str("channel index out of range"),
+            HostError::TypeMismatch => {
+                f.write_str("value does not match the channel's declared element type")
+            }
+        }
+    }
+}
+
+impl std::error::Error for HostError {}
+
+/// The one rendering of a step failure.
+///
+/// A consumer that needs the text — a driver logging a fault, a partial
+/// evaluator recording a blocker — formats through this rather than matching
+/// the variants and building its own string. Two such matches in different
+/// crates are two vocabularies for one failure, and they drift without
+/// anything reporting it: the same `KernelFault` reading `kernel X fault: Y`
+/// in one log and `kernel X: Y` in another is a difference a reader will
+/// spend time on. Adding a variant here is also why this enum is
+/// `#[non_exhaustive]` — a downstream `match` would otherwise have to name
+/// every one.
+impl core::fmt::Display for StepError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            StepError::Poisoned => f.write_str("poisoned"),
+            StepError::KernelFault { name, message } => {
+                write!(f, "kernel {name} fault: {message}")
+            }
+            StepError::MissingIntrinsic(intrinsic) => {
+                write!(f, "missing intrinsic {}", intrinsic.name())
+            }
+            StepError::Fault(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for StepError {}
+
 /// A sink call the pass made (its args, evaluated) — the configuration
 /// effects a golden vector asserts on.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SinkRecord {
+    /// Name of the sink boundary that fired, from the container name table.
     pub name: String,
+    /// The [`Stage`] whose body issued the call.
     pub stage: Stage,
     /// Layer index for per-layer stages, 0 otherwise.
     pub layer: u32,
+    /// The call's arguments, each already evaluated to a concrete [`Value`].
     pub args: Vec<Value>,
 }
 
@@ -253,14 +314,24 @@ pub struct StepReport {
 }
 
 /// Per-pass intrinsic inputs — what the forward produced, supplied by the
-/// harness/driver ("the trunk is never expressed in PTIR", T9).
+/// harness/driver (the trunk is never expressed in PTIR).
 #[derive(Clone, Debug, Default)]
 pub struct PassInputs {
+    /// The forward's output logits, `[n_out, vocab]` F32, read by
+    /// [`IntrinsicId::Logits`] in the epilogue.
     pub logits: Option<Value>,
+    /// Multi-token-prediction head logits, `[K, vocab]` F32, read by
+    /// [`IntrinsicId::MtpLogits`] in the epilogue; `None` unless the model has
+    /// an MTP head.
     pub mtp_logits: Option<Value>,
     /// `[k]` I32 draft token ids (device-resident spec-decode drafts channel).
     pub mtp_drafts: Option<Value>,
+    /// The forward's final hidden states, `[n_out, d]` F32, read by
+    /// [`IntrinsicId::Hidden`] in the epilogue.
     pub hidden: Option<Value>,
+    /// The value head's per-token scalars, `[n_out]` F32, read by
+    /// [`IntrinsicId::ValueHead`] in the epilogue; `None` unless the model has
+    /// a value head.
     pub value_head: Option<Value>,
     /// One query value per layer (indexed by the tap's invocation layer).
     pub query: Vec<Value>,
@@ -273,6 +344,9 @@ pub struct PassInputs {
 /// Second-party kernel provider. The dummy driver implements test kernels; a
 /// returned `Err` is a device fault → poison.
 pub trait KernelHost {
+    /// Runs the second-party kernel `name` over `args`, producing a [`Value`]
+    /// of type `result`. An `Err` message is a device fault that poisons the
+    /// instance.
     fn kernel(&mut self, name: &str, args: &[Value], result: ValueType) -> Result<Value, String>;
 }
 
@@ -300,17 +374,18 @@ pub(super) fn value_matches(v: &Value, ty: ValueType) -> bool {
 
 impl Instance {
     /// Bind a validated trace to fresh channel state. `seeds` supplies the
-    /// initial value of every `seeded` channel, by channel index (the
-    /// per-instance data D2 keeps out of the container).
+    /// initial value of every `seeded` channel, by channel index (per-instance
+    /// data that the container does not carry).
     pub fn new(bound: &BoundTrace, seeds: &[(u32, Value)]) -> Result<Instance, HostError> {
         Instance::new_with_externs(bound, seeds, &[])
     }
 
-    /// v1.1: bind a trace whose container declares extern channels. `externs`
-    /// pairs each extern CHANNEL INDEX with the shared ring the broker
-    /// created (the same [`ExternChannel`] handle goes to the peer instance).
-    /// Every declared extern must be paired, with matching element type and
-    /// capacity.
+    /// Bind a trace whose container declares extern channels.
+    ///
+    /// `externs` pairs each extern CHANNEL INDEX with the shared ring the
+    /// broker created (the same [`ExternChannel`] handle goes to the peer
+    /// instance). Every declared extern must be paired, with matching element
+    /// type and capacity.
     pub fn new_with_externs(
         bound: &BoundTrace,
         seeds: &[(u32, Value)],
@@ -321,7 +396,7 @@ impl Instance {
 
     /// Like [`Self::new_with_externs`], plus driver-designated shared rings
     /// for channels the container does NOT declare extern: same-guest
-    /// cross-pass chaining (R4-4) — two passes of one pipeline attach the
+    /// cross-pass chaining — two passes of one pipeline attach the
     /// same DEVICE-ONLY channel, and the driver hands both instances one
     /// ring so a producer pass's put is visible to the consumer pass. A
     /// `seeded` channel cannot be shared this way (seed staging is
@@ -399,7 +474,7 @@ impl Instance {
         }
     }
     /// Host-side debug snapshot of the committed front cell (a read-only
-    /// tooling peek, not a `Register` — T10 open-Q#3).
+    /// tooling peek, not a channel register).
     pub fn peek_front(&self, chan: u32) -> Option<Value> {
         self.with_chan(chan as usize, |st| st.queue.front().cloned())
     }
@@ -409,12 +484,25 @@ impl Instance {
     pub fn poison(&mut self) {
         self.poisoned = true;
     }
+    /// Returns `true` once the instance has been poisoned (a device fault or a
+    /// readiness deadline the caller enforced).
     pub fn is_poisoned(&self) -> bool {
         self.poisoned
     }
 
     // ── host endpoint ops (async on a real host; try-ops here) ──────────
 
+    /// Host writer endpoint: try to append `v` to channel `chan`.
+    ///
+    /// Non-blocking here; on a real host the caller loops while this returns
+    /// [`HostError::WouldBlock`], the ring's back-pressure signal.
+    ///
+    /// # Errors
+    ///
+    /// [`HostError::WouldBlock`] if the ring is at capacity,
+    /// [`HostError::NotHostChannel`] if the host does not write `chan`,
+    /// [`HostError::TypeMismatch`] if `v`'s type does not match the channel,
+    /// or [`HostError::Poisoned`] / [`HostError::BadIndex`].
     pub fn host_put(&mut self, bound: &BoundTrace, chan: u32, v: Value) -> Result<(), HostError> {
         if self.poisoned {
             return Err(HostError::Poisoned);
@@ -439,6 +527,14 @@ impl Instance {
         })
     }
 
+    /// Host reader endpoint: try to pop channel `chan`'s front committed cell,
+    /// which then becomes the channel's dummy (last-committed) value.
+    ///
+    /// # Errors
+    ///
+    /// [`HostError::WouldBlock`] if the ring is empty,
+    /// [`HostError::NotHostChannel`] if the host does not read `chan`, or
+    /// [`HostError::Poisoned`] / [`HostError::BadIndex`].
     pub fn host_take(&mut self, bound: &BoundTrace, chan: u32) -> Result<Value, HostError> {
         if self.poisoned {
             return Err(HostError::Poisoned);
@@ -460,6 +556,14 @@ impl Instance {
         })
     }
 
+    /// Host reader endpoint: try to read channel `chan`'s front committed cell
+    /// without consuming it.
+    ///
+    /// # Errors
+    ///
+    /// [`HostError::WouldBlock`] if the ring is empty,
+    /// [`HostError::NotHostChannel`] if the host does not read `chan`, or
+    /// [`HostError::Poisoned`] / [`HostError::BadIndex`].
     pub fn host_read(&mut self, bound: &BoundTrace, chan: u32) -> Result<Value, HostError> {
         if self.poisoned {
             return Err(HostError::Poisoned);
@@ -476,8 +580,8 @@ impl Instance {
             .ok_or(HostError::WouldBlock)
     }
 
-    /// Committed-cell occupancy (test/debug surface; not a `Register` — a
-    /// host-side snapshot only, T10 open-Q#3).
+    /// Committed-cell occupancy (test/debug surface; not a channel register —
+    /// a host-side snapshot only).
     pub fn len(&self, chan: u32) -> usize {
         if (chan as usize) < self.channels.len() {
             self.with_chan(chan as usize, |st| st.queue.len())
@@ -501,7 +605,7 @@ impl Instance {
             return Err(StepError::Poisoned);
         }
 
-        // 1. Readiness (§7.1 fire-time predicate + per-stage checks).
+        // 1. Readiness (fire-time predicate: per-stage channel checks).
         let mut missed = None;
         for e in &bound.readiness {
             let ok = self.with_chan(e.chan as usize, |st| match e.dir {
@@ -567,7 +671,7 @@ impl Instance {
 
         exec_body(self, bound, &mut effects, Stage::Epilogue, 0, inputs, host)?;
 
-        // 3. Commit: predicated per-channel index bump (§7.1).
+        // 3. Commit: predicated per-channel index bump.
         let committed = missed.is_none();
         if committed {
             for ci in 0..self.channels.len() {
@@ -691,8 +795,8 @@ struct PassEffects {
 /// Run one stage of a pass. A stage the program does not define is a no-op.
 ///
 /// The ops and their inferred types are looked up here rather than passed in:
-/// they have to be the two halves of the same stage, and that was previously
-/// an invariant of the call site.
+/// they must be the two halves of the same stage, and co-locating the lookup
+/// ensures that invariant holds.
 fn exec_body(
     inst: &mut Instance,
     bound: &BoundTrace,

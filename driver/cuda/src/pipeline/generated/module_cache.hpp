@@ -52,8 +52,8 @@ struct FusedRegionExecutable {
 
 // One `argmax` that reads a logits intrinsic's device buffer directly, and
 // the nodes that rewrite makes redundant. Decided by the host
-// (`compiler/codegen/src/region_analysis.rs`), because the kernel that reads
-// these slots was emitted from the same answer.
+// (`compiler/codegen/src/cuda/region_analysis.rs`), because the kernel that
+// reads these slots was emitted from the same answer.
 struct StageRegionArgmax {
     std::uint32_t node = 0;
     std::uint32_t source_value = 0;

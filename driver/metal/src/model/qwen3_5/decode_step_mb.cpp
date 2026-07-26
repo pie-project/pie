@@ -22,7 +22,9 @@ Kernel mb_kind(Kernel k) {
     }
 }
 
-int qmv_out(Kernel k, const DecodeGeometry& g) {
+}  // namespace
+
+int qmv_out_size(Kernel k, const DecodeGeometry& g) {
     switch (k) {
         case Kernel::QmvIn: return g.gdn_conv_dim;
         case Kernel::QmvInZ: return g.gdn_v_total;
@@ -39,10 +41,27 @@ int qmv_out(Kernel k, const DecodeGeometry& g) {
     }
 }
 
+namespace {
+bool g_ab_arm = false;
+}  // namespace
+
+bool ab_enabled() {
+    static const bool on = std::getenv("PIE_METAL_AB") != nullptr;
+    return on;
+}
+bool ab_arm() { return g_ab_arm; }
+void ab_set_arm(bool b) { g_ab_arm = b; }
+
+namespace {
+
 void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
     auto rms = [&](int row, int rows) { rms_mb_dispatch(row, rows, n, d.grid, d.tg); };
-    if (const int out = qmv_out(d.kind, g); out != 0) {
-        qmv_mb_dispatch(out, n, d.grid, d.tg);
+    if (const int out = qmv_out_size(d.kind, g); out != 0) {
+        d.qmm_bn = qmm_bn(out, n);
+        if (d.qmm_bn > 0)
+            qmm_t_dispatch(out, n, d.qmm_bn, d.grid, d.tg);
+        else
+            qmv_mb_dispatch(out, n, d.grid, d.tg);
         return;
     }
     switch (d.kind) {
@@ -112,7 +131,15 @@ Pso mb_pso(const Dispatch& d, const DecodeStepPsos& base, const MultiBatchPsos& 
         case Kernel::GdnCoreSlotted: return mb.gdn_recurrent_slotted;
         case Kernel::KvAppendPaged: return mb.kv_append_paged;
         case Kernel::SdpaPaged: return mb.sdpa_paged;
-        default: return d.fuse_residual ? base.qmv_residual : base[d.kind];
+        default: {
+            if (d.qmm_bn > 0) {
+                const int slot = d.qmm_bn == 64 ? 2 : (d.qmm_bn == 32 ? 1 : 0);
+                const Pso& gemm =
+                    d.fuse_residual ? mb.qmm_t_residual[slot] : mb.qmm_t[slot];
+                if (gemm.valid()) return gemm;
+            }
+            return d.fuse_residual ? base.qmv_residual : base[d.kind];
+        }
     }
 }
 
@@ -277,6 +304,19 @@ void bind_decode_dag_mb(RawMetalContext& ctx, const BoundDecode& b,
     }
 }
 
+void alias_decode_conv_state_out(RawMetalContext& ctx, const BoundDecode& b,
+                                 const std::vector<Dispatch>& dag) {
+    for (const Dispatch& d : dag) {
+        if (d.kind != Kernel::GdnPrepSlotted && d.kind != Kernel::GdnCoreSlotted) continue;
+        const auto& s = b.gdn[size_t(d.layer)];
+        if (!s.conv_state.valid()) continue;
+        const uint8_t idx = d.kind == Kernel::GdnPrepSlotted
+                                ? uint8_t(bind::GdnPrep::ConvStateOut)
+                                : uint8_t(bind::GdnCoreRecurrent::ConvStateOut);
+        ctx.arg_bind_ordinal(d.ordinal, idx, s.conv_state);
+    }
+}
+
 void bind_prefill_gdn_state(RawMetalContext& ctx, const BoundDecode& b,
                             const std::vector<Dispatch>& dag, uint32_t slot, bool even) {
     for (const Dispatch& d : dag) {
@@ -340,7 +380,10 @@ void encode_prefill_dags_mb(StepEncoder& se,
                             const DecodeStepPsos& base_psos,
                             const MultiBatchPsos& mb_psos,
                             bool force_barriers,
-                            const std::vector<std::uint8_t>& row_needs_logits) {
+                            const std::vector<std::uint8_t>& row_needs_logits,
+                            const DecodeGeometry* geometry,
+                            int max_rows,
+                            const std::vector<GdnScanSegment>& gdn_scans) {
     const size_t n = n_tokens > 0 ? size_t(n_tokens) : 0;
     if (n == 0 || dags.size() < n) return;
     const size_t length = dags[0].size();
@@ -360,10 +403,110 @@ void encode_prefill_dags_mb(StepEncoder& se,
     // far past any cache -- so running it for a prompt row nobody samples is the
     // single most expensive wasted dispatch in a prefill.
     const bool skip_unsampled_logits = row_needs_logits.size() >= n;
+    // A projection does not depend on any other token's row, so the whole prompt
+    // can go through the GEMM in one dispatch instead of one GEMV per token --
+    // which is what turns N reads of the checkpoint into one. lm_head is left
+    // out: it writes the logits buffer, whose rows are the fire's readout rows
+    // and are not padded, and it already runs only for sampled rows.
+    const int strided_rows =
+        geometry != nullptr ? qmm_strided_rows(int(n), max_rows) : 0;
     for (size_t i = 0; i < length; ++i) {
+        const Dispatch& d0 = dags[0][i];
+        if (strided_rows > 0 && d0.kind != Kernel::QmvLmHead) {
+            const int out = qmv_out_size(d0.kind, *geometry);
+            if (out != 0 && out % 32 == 0) {
+                const Pso& gemm = d0.fuse_residual ? mb_psos.qmm_t_strided_residual
+                                                   : mb_psos.qmm_t_strided;
+                if (gemm.valid()) {
+                    Grid grid;
+                    Threadgroup tg;
+                    qmm_t_strided_dispatch(out, strided_rows, grid, tg);
+                    se.set_pso(gemm);
+                    se.set_argtable(d0.kind, d0.ordinal);
+                    se.dispatch(grid, tg);
+                    se.barrier();
+                    continue;
+                }
+            }
+        }
+        // Row-independent kernels: the prefill's scratch rows are a uniform pitch
+        // apart, so one dispatch over the whole prompt replaces one per token.
+        // The row-blocked variants take that pitch explicitly and are otherwise
+        // byte-for-byte the same arithmetic.
+        {
+            Pso strided{};
+            Grid grid = d0.grid;
+            switch (d0.kind) {
+                case Kernel::Rms:
+                case Kernel::FfnRms:
+                case Kernel::FinalRms:
+                    // One threadgroup per row only; the per-head norms (q/k) stack
+                    // several rows inside one dispatch and do not have a uniform pitch.
+                    if (d0.grid.x == d0.tg.x && d0.grid.y == 1 && d0.grid.z == 1) {
+                        strided = mb_psos.rms_strided;
+                        grid.x = d0.grid.x * uint32_t(n);
+                    }
+                    break;
+                case Kernel::SiluMul:
+                    if (d0.grid.y == 1 && d0.grid.z == 1) {
+                        strided = mb_psos.silu_mul_strided;
+                        grid.y = uint32_t(n);
+                    }
+                    break;
+                case Kernel::GatedRms:
+                    if (d0.grid.z == 1) {
+                        strided = mb_psos.gated_rms_strided;
+                        grid.z = uint32_t(n);
+                    }
+                    break;
+                default:
+                    break;
+            }
+            if (strided.valid()) {
+                se.set_pso(strided);
+                se.set_argtable(d0.kind, d0.ordinal);
+                se.dispatch(grid, d0.tg);
+                se.barrier();
+                continue;
+            }
+        }
         const bool serialize = carries_cross_token_state(dags[0][i].kind);
+        // The GDN pair is the prefill's only strict chain -- a barrier per token,
+        // 34 of them per layer.  When the caller says the prompt is one request's
+        // and hands us an even scan length (so the ping-pong lands where the
+        // trailing per-token dispatch expects it), the whole prompt goes through
+        // in one dispatch each: prep is token-parallel once its conv window comes
+        // off `mixed`, and the recurrent scan runs in registers.
+        // Each request's recurrence is independent, so one scan per request
+        // replaces that request's whole per-token chain; rows a scan does not
+        // cover (an even tail) fall through to the per-token path below.
+        std::vector<bool> scanned(n, false);
+        if (serialize && !gdn_scans.empty()) {
+            const Pso& scan = dags[0][i].kind == Kernel::GdnPrepSlotted
+                                  ? mb_psos.gdn_prep_prefill
+                                  : mb_psos.gdn_core_prefill;
+            if (scan.valid()) {
+                se.set_pso(scan);
+                for (const GdnScanSegment& seg : gdn_scans) {
+                    if (seg.rows < 2 || size_t(seg.start) >= n) continue;
+                    const Dispatch& d = dags[size_t(seg.start)][i];
+                    Grid grid = d.grid;
+                    // prep is (dk, 1, rows*heads); the recurrent kernel keeps
+                    // its (dk, dv, heads) grid and walks the rows internally.
+                    if (d.kind == Kernel::GdnPrepSlotted)
+                        grid.z = d.grid.z * uint32_t(seg.rows);
+                    se.set_argtable(d.kind, d.ordinal);
+                    se.dispatch(grid, d.tg);
+                    for (int r = 0; r < seg.rows; ++r)
+                        scanned[size_t(seg.start + r)] = true;
+                }
+                se.barrier();
+            }
+        }
         const bool logits_tail = skip_unsampled_logits && produces_logits(dags[0][i].kind);
+        bool prev_emitted = false;
         for (size_t t = 0; t < n; ++t) {
+            if (serialize && scanned[t]) continue;
             if (logits_tail && row_needs_logits[t] == 0) continue;
             const Dispatch& d = dags[t][i];
             if (d.kind != dags[0][i].kind) {
@@ -374,7 +517,11 @@ void encode_prefill_dags_mb(StepEncoder& se,
             se.set_pso(mb_pso(d, base_psos, mb_psos));
             se.set_argtable(d.kind, d.ordinal);
             se.dispatch(d.grid, d.tg);
-            if (serialize && t + 1 < n) se.barrier();
+            // Barrier between consecutive per-token GDN dispatches only; a
+            // scanned row in between has already been ordered by the scan's
+            // own barrier above.
+            if (serialize && prev_emitted) se.barrier();
+            prev_emitted = true;
         }
         se.barrier();
     }
@@ -389,7 +536,13 @@ void encode_decode_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
         se.set_pso(mb_pso(d, base_psos, mb_psos));
         se.set_argtable(d.kind, d.ordinal);
         se.dispatch(d.grid, d.tg);
-        if (force_barriers || barrier_after_mb(dag, i, run_ends)) se.barrier();
+        // Arm B of the interleaved A/B serializes the concurrency groups, which
+        // is the default question the meter answers: what is running independent
+        // dispatches together actually worth?  (Measured 3.8% at 16 lanes.)
+        // Point this at whatever change is being evaluated instead.
+        if (force_barriers || (ab_enabled() && ab_arm()) ||
+            barrier_after_mb(dag, i, run_ends))
+            se.barrier();
     }
 }
 

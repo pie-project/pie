@@ -1,5 +1,5 @@
 # oracle dump: pie_cuda_driver::pipeline::generated::emit_fused_region_cuda_verbatim
-# source of truth: driver/cuda/src/pipeline/generated/ (transitional; the Rust port is compiler/codegen/src/cuda/)
+# source of truth: compiler/codegen/src/cuda/ (the C++ oracle this was dumped from is deleted)
 # emitter_version: 19
 # @runtime: bytes=45277 fnv1a64=0x41b1d45aaef71184
 # cases: 36
