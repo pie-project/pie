@@ -9,9 +9,10 @@ repository = "https://github.com/pie-project/pie"
 keywords = ["pie", "ptir", "tracing", "inferlet"]
 categories = ["api-bindings"]
 
-# Standalone crate (excluded from the host workspace, like `sdk/rust/*`) so it can
-# be `cargo test`ed on the host while still building for `wasm32-wasip2`. It
-# lowers to the canonical `pie-ir` primitives (Shape / DType / container encoding
+# A host workspace member that also builds for `wasm32-wasip2`: it has no
+# wasm-only dependencies, so unlike `sdk/rust/*` it does not need to be excluded,
+# and being a member is what puts its tests in the CI battery. It lowers to the
+# canonical `pie-ir` primitives (Shape / DType / container encoding
 # / FNV-1a identity hash). The authoritative validator (`pie_ir::validate::bind`)
 # is a dev-only parity dependency: the guest does not bind — `forward-pass.new`
 # is the authoritative gate.
