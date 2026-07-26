@@ -61,7 +61,8 @@ void Glm5Model::body(Workspace& ws,
         in.qo_indptr_h, in.kv_page_indptr_h,
         in.total_tokens, in.num_requests, in.is_pure_decode,
         in.row_valid_d,
-        in.logit_row_indices_d, in.num_logit_rows);
+        in.logit_row_indices_d, in.num_logit_rows,
+        in.stage_hooks);
 }
 
 }  // namespace pie_cuda_driver::model

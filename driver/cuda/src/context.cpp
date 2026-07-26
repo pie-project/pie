@@ -823,6 +823,7 @@ int Context::Impl::load_model(
             {"has_kv_envelopes", false},
             {"has_attn_score", false},
             {"has_attn_page_mask", false},
+            {"has_lora", false},
             {"max_forward_tokens",
              static_cast<std::uint32_t>(std::max(1, c.max_model_len))},
             {"max_forward_requests", 256},
@@ -1680,6 +1681,18 @@ int Context::Impl::load_model(
 
     registry_->dispatch().set_attn_page_mask_available(has_attn_page_mask);
 
+    // `lora`: the llama_like forward applies the low-rank delta at its q/v
+    // projection GEMMs (llama_like.cpp `LoraFireState`), so that family — and
+    // only that family — may bind programs naming the sink. TP is excluded:
+    // the adapter's B is traced against the UNSHARDED projection widths, a TP
+    // rank holds only its head slice, and the lora table is resolved on rank
+    // 0 alone. This one bool feeds both the bind gate here and the `has_lora`
+    // capability rows below, so the engine's honour check and the driver
+    // cannot disagree.
+    const bool has_lora =
+        family == model::Family::LlamaLike && local_tp_size == 1;
+    registry_->dispatch().set_lora_available(has_lora);
+
     registry_->dispatch().set_kv_envelopes_available(
         has_kv_envelopes,
         has_kv_envelopes
@@ -1923,6 +1936,7 @@ int Context::Impl::load_model(
         {"has_kv_envelopes", has_kv_envelopes},
         {"has_attn_score", has_attn_score},
         {"has_attn_page_mask", has_attn_page_mask},
+        {"has_lora", has_lora},
         // RV-26: PIE_DEVICE_PORT_ATTN_MASK is deliberately NOT advertised.
         // The runtime classifies masked device-carried decode into the
         // DecodeEnvelope class exactly when this mask claims the port, but

@@ -57,6 +57,13 @@ members = [
     # drivers at cold start, not by the serving runtime (see loader/architecture.md).
     "loader",
     "loader/cbindgen",
+    # Forward-pass declarations: a tracing eDSL whose static control flow runs
+    # at model-load time; the traced form is what a driver executes and what
+    # the fire planner will classify divergence over. Shaped like `loader/`
+    # (plan = trace(declaration, config facts); C ABI later). See
+    # pie-application-plan.md §4/§5 and stage1-notes.md.
+    "forward",
+    "forward/cbindgen",
     "sdk/python-server",
     # Thin binary shells composing the `startup` skeleton + role lib(s). `bin/pie` is the
     # composition root (deps all three role libs; the standalone).

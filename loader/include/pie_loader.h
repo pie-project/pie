@@ -154,6 +154,14 @@ enum class PieLoaderTransformFusion : uint32_t {
   Fp8ToMxfp4 = 1,
 };
 
+/// A repack's kernel, across the ABI.
+///
+/// `None` is the wire sentinel for a transform that ends in no kernel, the way
+/// [`PieLoaderQuantScheme::None`] is for a transform that converts nothing. It
+/// is deliberately *not* a member of [`RepackLayout`]: outbound it means "this
+/// tile map is not a repack", and inbound — where the only reader is a contract
+/// node that has already said it is one — it is rejected, because an all-zero
+/// node is the shape a forgotten field has.
 enum class PieLoaderRepackLayout : uint32_t {
   None = 0,
   MarlinMxfp4Weight = 1,

@@ -54,20 +54,7 @@ struct AttentionMaskSink {
     }
 };
 
-/// Null outside a model body, or inside one whose fire runs no page-mask sink.
-AttentionMaskSink* active_attention_mask_sink() noexcept;
-
-class ScopedAttentionMaskSink {
-  public:
-    explicit ScopedAttentionMaskSink(AttentionMaskSink* sink) noexcept;
-    ~ScopedAttentionMaskSink() noexcept;
-
-    ScopedAttentionMaskSink(const ScopedAttentionMaskSink&) = delete;
-    ScopedAttentionMaskSink& operator=(const ScopedAttentionMaskSink&) = delete;
-
-  private:
-    AttentionMaskSink* previous_ = nullptr;
-};
+struct StageHooks;
 
 /// Fire-scoped owner of the page mask and of the compacted CSR it produces.
 ///
@@ -78,16 +65,18 @@ class ScopedAttentionMaskSink {
 /// Usage per layer:
 ///
 ///     mask.begin_layer(stream);          // re-seed to "keep everything"
-///     invoke_stage_hook(OnAttnProj, ...); // the sink may write into it
+///     invoke_stage_hook(hooks, OnAttnProj, ...,
+///                       {.mask_sink = mask.sink()});  // the sink may write
 ///     if (mask.written_for(L)) mask.compact(...);
 ///     ... attention, with mask.page_indices() when compacted ...
 class FirePageMask {
   public:
-    /// `wanted` is the launch's own answer to "does any program write the
-    /// sink". The fire's host page CSR is used only to SIZE the rows (as an
-    /// upper bound); it never addresses them, so a conservative host CSR costs
-    /// a little memory and nothing else.
-    FirePageMask(bool wanted, cudaStream_t stream);
+    /// Reads `wants_page_mask` — the launch's own answer to "does any program
+    /// write the sink" — and the fire geometry off `hooks`. The fire's host
+    /// page CSR is used only to SIZE the rows (as an upper bound); it never
+    /// addresses them, so a conservative host CSR costs a little memory and
+    /// nothing else.
+    FirePageMask(const StageHooks* hooks, cudaStream_t stream);
     ~FirePageMask();
 
     FirePageMask(const FirePageMask&) = delete;
@@ -116,9 +105,12 @@ class FirePageMask {
         return out_last_lens_;
     }
 
+    /// The write destination, for the layer's `OnAttnProj` sideband; null when
+    /// the fire wants no mask.
+    AttentionMaskSink* sink() noexcept { return active_ ? &sink_ : nullptr; }
+
   private:
     AttentionMaskSink sink_{};
-    ScopedAttentionMaskSink* binding_ = nullptr;
     std::uint32_t* out_indices_ = nullptr;
     std::uint32_t* out_indptr_ = nullptr;
     std::uint32_t* out_last_lens_ = nullptr;

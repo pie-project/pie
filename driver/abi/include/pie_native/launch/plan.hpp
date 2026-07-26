@@ -107,6 +107,9 @@ struct GroupedEnvelope {
     bool requires_page_mask() const {
         return (flags & PIE_STAGE_REQUIRES_PAGE_MASK) != 0;
     }
+    bool requires_lora() const {
+        return (flags & PIE_STAGE_REQUIRES_LORA) != 0;
+    }
     bool requires_mtp_rows() const {
         return (flags & PIE_STAGE_REQUIRES_MTP_ROWS) != 0;
     }

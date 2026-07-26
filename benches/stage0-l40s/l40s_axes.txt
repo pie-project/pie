@@ -1,0 +1,173 @@
+Qwen2.5-1.5B shapes: 28 layers, hidden 1536, inter 8960
+512 rows per batch, median of 5
+
+==============================================================================
+axis: DEPTH  (structural)
+  one checkpoint served at several depths; rows leave the stack mid-way. No engine batches this.
+==============================================================================
+  K   split (ms)   merged (ms)   speedup   rel. diff
+  2        8.886         7.708     1.15x    2.30e-03
+  4       15.159         7.708     1.97x    1.44e-03
+  8       30.007         7.663     3.92x    9.43e-04
+ 16       54.569         7.925     6.89x    2.07e-03
+ 32       54.609         8.084     6.76x    2.12e-03
+
+==============================================================================
+axis: RANK  (weight)
+  adapters of different rank co-batched. LoRAServe measures 84% TTFT degradation from mixing rank 8 with rank 128.
+==============================================================================
+  K   split (ms)   merged (ms)   speedup   rel. diff
+  2       13.453        11.452     1.17x    2.36e-03
+  4       22.475        12.845     1.75x    0.00e+00
+  8       44.832        16.253     2.76x    0.00e+00
+ 16       86.722        30.554     2.84x    3.17e-03
+ 32      175.428        38.251     4.59x    2.32e-03
+
+==============================================================================
+axis: QLEN  (structural)
+  speculative verify (k+1 rows) mixed with plain decode (1 row). All three major engines require homogeneous speculation.
+==============================================================================
+  K   split (ms)   merged (ms)   speedup   rel. diff
+  2       13.437         9.618     1.40x    2.84e-03
+  4       21.813         9.554     2.28x    2.09e-03
+  8       39.509         9.577     4.13x    1.71e-03
+ 16       77.787         8.528     9.12x    2.17e-03
+ 32      154.061        11.926    12.92x    2.28e-03
+
+==============================================================================
+axis: COMPOSITION
+  divergence axes multiply: A axes of cardinality c give c**A distinct programs.
+==============================================================================
+             axes live  programs   split (ms)   merged (ms)   speedup   rel. diff
+                 depth         4       17.475         9.412     1.86x    1.56e-03
+                  rank         4       22.705        13.063     1.74x    0.00e+00
+          depth x rank        16       65.388        22.783     2.87x    1.92e-03
+
+  the merged column is the point: it barely moves as the number of
+  distinct programs goes from 4 to 16.
+
+==============================================================================
+axis: SHARED FRACTION
+  4 programs sharing a prefix of the stack, private weights after.
+==============================================================================
+  shared    layers   split (ms)   merged (ms)   speedup   rel. diff
+     0%     0/28        20.353        20.310     1.00x    0.00e+00
+    25%     7/28        20.175        17.365     1.16x    0.00e+00
+    50%    14/28        20.329        14.472     1.40x    0.00e+00
+    75%    21/28        20.232        11.865     1.71x    0.00e+00
+   100%    28/28        20.241         9.518     2.13x    0.00e+00
+
+  at 0% shared the mechanism has nothing to merge and must cost nothing;
+  that row is the boundary of where any of this applies.
+
+==============================================================================
+axis: ROWS PER PROGRAM  (k = 8, depth axis)
+  merging matters exactly when the batch is spread thin.
+==============================================================================
+ rows/prog  total rows   split (ms)   merged (ms)   speedup
+         1           8       28.716         4.805     5.98x
+         2          16       27.982         4.754     5.89x
+         4          32       28.172         4.888     5.76x
+         8          64       28.386         5.019     5.66x
+        16         128       27.687         5.101     5.43x
+        32         256       28.881         5.713     5.06x
+        64         512       30.007         8.048     3.73x
+       128        1024       30.629        15.989     1.92x
+       256        2048       38.626        33.815     1.14x
+
+==============================================================================
+axis: VISION  (structural, asymmetric)
+  an encoder that runs for some requests and not others.
+==============================================================================
+ image frac   split (ms)   merged (ms)   speedup   rel. diff
+      0.0%       10.900        11.468     0.95x    0.00e+00
+     12.5%       14.319        10.868     1.32x    2.14e-03
+     25.0%       13.943        10.606     1.31x    2.84e-03
+     50.0%       13.031        10.657     1.22x    2.27e-03
+    100.0%       11.466        11.505     1.00x    0.00e+00
+
+  0% and 100% are homogeneous batches -- there is nothing to merge and
+  nothing to lose. The cost is entirely in the middle.
+
+==============================================================================
+axis: MoE  (weight, token granularity)
+  gather -> per-expert GEMM -> scatter against running every token through
+  every expert.
+==============================================================================
+ experts   dense (ms)   gathered (ms)   speedup   rel. diff
+       2        0.370           0.292     1.27x    5.89e-04
+       4        0.394           0.262     1.50x    8.55e-04
+       8        0.516           0.315     1.64x    0.00e+00
+      16        0.580           0.562     1.03x    3.94e-04
+      32        1.027           1.144     0.90x    5.71e-04
+
+==============================================================================
+axis: CFG  (structural)
+  guided requests need two passes, plain ones need one.
+==============================================================================
+ guided frac    rows   split (ms)   merged (ms)   speedup   rel. diff
+       0.0%     512        9.202        10.958     0.84x    0.00e+00
+      12.5%     512       14.919        10.655     1.40x    1.83e-03
+      25.0%     512       13.928        10.450     1.33x    1.96e-03
+      50.0%     512       12.866        10.449     1.23x    2.49e-03
+     100.0%     512       10.909        12.090     0.90x    0.00e+00
+
+  0% and 100% are homogeneous; the cost is in the middle.
+
+==============================================================================
+axis: MIXTURE-OF-DEPTHS  (structural, token granularity)
+  no production engine, two years after the architecture appeared.
+==============================================================================
+   kept   dense (ms)   routed (ms)   speedup
+ 12.5%        9.882         5.869     1.68x
+ 25.0%       10.529         6.137     1.72x
+ 50.0%       10.527         6.981     1.51x
+ 75.0%       10.943         9.429     1.16x
+100.0%       11.031        11.145     0.99x
+
+==============================================================================
+axis: SHARED PREFIX
+  already solved by prefix caching; measured for completeness.
+==============================================================================
+  caveat: the stand-in attention has no KV cache, so this counts the rows saved,
+  not the cross-attention a real implementation still pays.
+
+ requests   prefix   suffix   split (ms)   merged (ms)   speedup
+        4      256       32       32.625        25.111     1.30x
+        8      256       32       65.165        44.424     1.47x
+        8      512       32      101.645        46.904     2.17x
+        8      128      128       50.040        45.594     1.10x
+
+==============================================================================
+axis: SAMPLER / CONSTRAINED DECODING
+  engines already share the forward pass, so this is the value of a mechanism
+  they have -- swept to severe configuration diversity.
+==============================================================================
+ configs rows/cfg   split (ms)   merged (ms)   speedup   post-logit   of merged
+       1      512        8.267        11.341     0.73x       0.316        2.8%
+       2      256       13.510        10.676     1.27x       0.444        4.2%
+       4      128       21.017        10.297     2.04x       0.751        7.3%
+       8       64       40.915        10.246     3.99x       1.368       13.3%
+      16       32       79.414        11.011     7.21x       2.523       22.9%
+      32       16      151.813        11.456    13.25x       4.800       41.9%
+      64        8      309.539        14.116    21.93x       9.165       64.9%
+
+  The taxonomy is right that the forward pass is fully shared. The last column
+  is what sharing cannot reach: past a few dozen configurations the sampling
+  kernels are launch-bound on a handful of rows each, and that cost is there
+  whether or not anything upstream was merged.
+
+==============================================================================
+axis: WEIGHT PRECISION  (the negative case)
+  two precisions share no weight tensor, so nothing can be merged.
+==============================================================================
+ fp16 frac   ideal, 1 precision   actual, 2 passes   cost of the axis
+       0%                9.799             11.206              1.14x
+      25%                9.799             14.136              1.44x
+      50%                9.799             12.316              1.26x
+      75%                9.799             13.736              1.40x
+     100%                9.799             10.263              1.05x
+
+  A mixed batch costs more than a homogeneous one and this work does not
+  change that by a single percent. It is the concrete instance of the
+  shared-fraction sweep's 0% row.

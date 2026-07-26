@@ -29,6 +29,9 @@
 
 #include "pie_native/fire/fire_geometry.hpp"
 
+#include "model/lora.hpp"
+#include "model/stage_hooks.hpp"
+
 namespace pie_cuda_driver::pipeline {
 
 // Shared pure-host PTIR decode model (trace/op-table/container/bound/
@@ -222,6 +225,11 @@ class Dispatch {
         const pie_native::LaunchView& resolved_view,
         std::span<const std::uint32_t> program_token_starts);
 
+    // `sideband` carries what the model body published for exactly this hook
+    // invocation — the fire's KV geometry, the layer's captured scores, the
+    // page-mask destination. An empty sideband is "the body published
+    // nothing", and a program that then names the corresponding intrinsic
+    // fails loudly in the lane resolvers.
     void execute_attention_phase(
         StagedLaunch& launch,
         std::uint8_t phase,
@@ -230,7 +238,8 @@ class Dispatch {
         std::uint32_t query_columns,
         std::uint32_t layer,
         cudaStream_t stream,
-        bool query_is_f32 = false);
+        bool query_is_f32 = false,
+        const model::StageHookSideband& sideband = {});
 
     // Fire-timing sub-breakdown of `finish` (microseconds; -1 = not
     // measured): per-lane epilogue kernel enqueue, settlement-mutex
@@ -276,6 +285,17 @@ class Dispatch {
     bool launch_has_attention_stages(
         const pie_native::LaunchView& view) const;
 
+    // How many LEADING wire request rows are covered by no attention-stage
+    // program. Rows [0, n) may take hook-free fast paths; everything at or
+    // after row n must run hook-visible. Returns 0 — "no fast prefix" — when
+    // a hook-carrying program has no wire span to locate it by
+    // (device-resolved geometry) or when per-program row attribution is
+    // absent. The count is in WIRE request rows, and it is conservative by
+    // construction: rows past the wire span (composed device-geometry
+    // suffix) are never counted into the prefix.
+    std::uint32_t launch_hook_free_prefix_rows(
+        const pie_native::LaunchView& view) const;
+
     // Whether any program in this launch reads `AttnScore`. Capture is opt-in
     // per fire because it costs an extra `[num_q_heads, kv_len]` write inside
     // the attention kernel; a launch that does not observe scores must pay
@@ -293,6 +313,26 @@ class Dispatch {
     // not depend on the page counts it was planned against, or substituting a
     // compacted list at launch is silently wrong.
     void set_attn_page_mask_available(bool available);
+
+    // Whether any program in this launch calls the `lora` sink in its
+    // prologue. The frame queries this to decide whether to fetch and thread
+    // the resolved lora table into the model body.
+    bool launch_wants_lora(
+        const pie_native::LaunchView& view) const;
+
+    // Whether the active model's projection path can honour the `lora` sink
+    // (capability `has_lora`). Default FALSE: a program naming the sink is
+    // refused at bind until the model opts in, because a bound-but-ignored
+    // configuration sink is a program whose adapter silently never applied.
+    void set_lora_available(bool available);
+
+    // The launch's begin-time-resolved lora configuration: one entry per lane
+    // whose program carries the sink (empty when none does). A borrowed view
+    // into launch-owned storage — valid until the launch is finished or
+    // aborted. Populated when the prologue executes in `begin`, which is why
+    // the sink cannot use `attn_page_mask`'s body-owned-buffer shape: the
+    // model body does not exist yet at that point.
+    model::LoraTable launch_lora_table(const StagedLaunch& launch) const;
 
     // Whether this model + cache can honour the `envelope_dot` contract.
     // Mirrors the `has_kv_envelopes` driver capability; a program that names

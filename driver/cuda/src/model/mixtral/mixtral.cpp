@@ -144,7 +144,8 @@ void mixtral_forward_paged(
     int num_logit_rows,
     const std::uint8_t* custom_mask_d,
     const std::int32_t* custom_mask_indptr_d,
-    const std::uint8_t* row_valid_d)
+    const std::uint8_t* row_valid_d,
+    const StageHooks* hooks)
 {
     // TP-local dims. tp_size == 1 keeps the original single-GPU shapes.
     // For Mixtral we shard *within* each expert (per-expert TP), not
@@ -311,6 +312,7 @@ void mixtral_forward_paged(
         // post-rope -- compares in the same space. Placing it on the raw
         // projection instead would silently mis-rank pages for Quest.
         invoke_stage_hook(
+            hooks,
             StageHookPoint::OnAttnProj, ws.q.data(),
             static_cast<std::uint32_t>(N),
             static_cast<std::uint32_t>(Hq),
@@ -367,6 +369,7 @@ void mixtral_forward_paged(
                 N, num_q_heads_local, d, stream);
         }
         invoke_stage_hook(
+            hooks,
             StageHookPoint::OnAttn, ws.q.data(),
             static_cast<std::uint32_t>(N),
             static_cast<std::uint32_t>(Hq),

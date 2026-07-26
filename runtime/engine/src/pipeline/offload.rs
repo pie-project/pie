@@ -1739,6 +1739,7 @@ mod tests {
             has_value_head: true,
             has_attn_score: false,
             has_attn_page_mask: false,
+            has_lora: false,
             has_kv_envelopes: false,
             device_geometry_port_mask: 0,
             max_forward_tokens: 128,

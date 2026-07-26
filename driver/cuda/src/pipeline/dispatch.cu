@@ -48,6 +48,7 @@
 #include "model/attn_observation.hpp"
 #include "model/attn_page_mask.hpp"
 #include "model/attn_score.hpp"
+#include "model/lora.hpp"
 #include "store/kv_cache.hpp"
 
 namespace pie_cuda_driver::pipeline {
@@ -1428,6 +1429,7 @@ struct Dispatch::Impl {
     std::uint32_t model_layers = 0;
     bool kv_envelopes_available = false;
     bool attn_page_mask_available = false;
+    bool lora_available = false;
     std::function<void()> enable_kv_envelopes;
 };
 
@@ -1503,6 +1505,17 @@ struct StagedLaunch::State {
     std::vector<DecodeEnvelopeLane> decode_envelope_lanes;
     std::size_t decode_envelope_lane_count = 0;
     std::uint32_t decode_envelope_template_pages = 0;
+    // The `lora` sink's begin-time resolution: one entry per lane whose
+    // program carries the sink, rebuilt each time the prologue executes.
+    // Launch-owned because the prologue runs in `begin`, before the model
+    // body (and its buffers) exist — `launch_lora_table` hands the frame a
+    // borrowed view of exactly this storage. `lora_lane_sources` is parallel:
+    // the lane each entry came from, so `update_launch_geometry` — which the
+    // frame calls AFTER the prologue under the frame split — can re-stamp the
+    // entries' token spans with the resolved geometry instead of leaving the
+    // begin_host-time spans to go stale.
+    std::vector<model::LoraLaneView> lora_lanes;
+    std::vector<const StagedLane*> lora_lane_sources;
     std::uint32_t* device_layer = nullptr;
     cudaEvent_t source_ready = nullptr;
     cudaEvent_t phase_done[2] = {nullptr, nullptr};
@@ -3073,34 +3086,65 @@ int Dispatch::register_program(std::uint64_t program_hash,
                     op.name_idx < stage.names.size()
                         ? stage.names[op.name_idx]
                         : std::string();
-                if (name != "attn_page_mask") {
-                    if (err) {
-                        *err =
-                            "ptir model sinks are not implemented by the active CUDA model";
+                if (name == "attn_page_mask") {
+                    if (stage.stage != PTIR_STAGE_ON_ATTN_PROJ) {
+                        // `SinkScope::Attention` also admits `Prologue`, but a
+                        // prologue mask cannot name a layer, and this consumer
+                        // is per-layer. Refusing is better than honouring it
+                        // for layer 0 only.
+                        if (err) {
+                            *err =
+                                "attn_page_mask is only available at the "
+                                "on_attn_proj stage";
+                        }
+                        return PIE_STATUS_UNSUPPORTED;
                     }
-                    return PIE_STATUS_UNSUPPORTED;
-                }
-                if (stage.stage != PTIR_STAGE_ON_ATTN_PROJ) {
-                    // `SinkScope::Attention` also admits `Prologue`, but a
-                    // prologue mask cannot name a layer, and this consumer is
-                    // per-layer. Refusing is better than honouring it for
-                    // layer 0 only.
-                    if (err) {
-                        *err =
-                            "attn_page_mask is only available at the "
-                            "on_attn_proj stage";
+                    if (!impl_->attn_page_mask_available) {
+                        if (err) {
+                            *err =
+                                "attn_page_mask requires a decode attention "
+                                "path whose plan does not depend on the page "
+                                "count";
+                        }
+                        return PIE_STATUS_UNSUPPORTED;
                     }
-                    return PIE_STATUS_UNSUPPORTED;
+                    continue;
                 }
-                if (!impl_->attn_page_mask_available) {
-                    if (err) {
-                        *err =
-                            "attn_page_mask requires a decode attention path "
-                            "whose plan does not depend on the page count";
+                if (name == "lora") {
+                    if (stage.stage != PTIR_STAGE_PROLOGUE) {
+                        // Pass-wide sinks are confined to the prologue by the
+                        // compiler (T11), and this runtime additionally
+                        // RESOLVES the sink at begin time, when the prologue
+                        // runs. Any other placement would resolve after the
+                        // projections it configures.
+                        if (err) {
+                            *err =
+                                "lora is only available at the prologue "
+                                "stage";
+                        }
+                        return PIE_STATUS_UNSUPPORTED;
                     }
-                    return PIE_STATUS_UNSUPPORTED;
+                    if (!impl_->lora_available) {
+                        // Refused at bind, not skipped at fire: a lora-naming
+                        // program on a model that does not apply the delta is
+                        // a request whose adapter would silently never take
+                        // effect while every sample still returns.
+                        if (err) {
+                            *err =
+                                "lora requires a model whose projection path "
+                                "applies the low-rank delta (capability "
+                                "has_lora); the active CUDA model does not "
+                                "advertise it";
+                        }
+                        return PIE_STATUS_UNSUPPORTED;
+                    }
+                    continue;
                 }
-                continue;
+                if (err) {
+                    *err =
+                        "ptir model sinks are not implemented by the active CUDA model";
+                }
+                return PIE_STATUS_UNSUPPORTED;
             }
             if (op.tag == PTIR_OP_KERNEL_CALL) {
                 // Second-party kernels are named, not generic: the fused
@@ -3487,6 +3531,19 @@ void Dispatch::set_attn_page_mask_available(bool available) {
     impl_->attn_page_mask_available = available;
 }
 
+void Dispatch::set_lora_available(bool available) {
+    impl_->lora_available = available;
+}
+
+model::LoraTable Dispatch::launch_lora_table(
+    const StagedLaunch& launch) const {
+    const StagedLaunch::State& state = *launch.state_;
+    return model::LoraTable{
+        .lanes = state.lora_lanes.empty() ? nullptr : state.lora_lanes.data(),
+        .count = static_cast<std::uint32_t>(state.lora_lanes.size()),
+    };
+}
+
 void Dispatch::set_attention_hook_coverage(
     bool supported,
     std::uint32_t model_layers) {
@@ -3512,6 +3569,47 @@ bool Dispatch::launch_has_attention_stages(
         }
     }
     return false;
+}
+
+std::uint32_t Dispatch::launch_hook_free_prefix_rows(
+    const pie_native::LaunchView& view) const {
+    const std::size_t n_prog = view.ptir_program_hashes.size();
+    // Per-program row attribution is the only way to LOCATE a hook, so its
+    // absence means "no fast prefix", not "no hooks".
+    if (view.ptir_program_row_indptr.size() != n_prog + 1) return 0;
+    const std::uint32_t* row_indptr = view.ptir_program_row_indptr.data();
+    const std::uint32_t total_rows = row_indptr[n_prog];
+    if (total_rows == 0) return 0;
+
+    const auto has_attention_stages = [&](std::size_t program) {
+        const auto* plans =
+            impl_->cache.plans(view.ptir_program_hashes.data()[program]);
+        if (plans == nullptr) return false;
+        return std::any_of(
+            plans->begin(), plans->end(),
+            [](const plan::StagePlan& stage) {
+                return stage.stage == PTIR_STAGE_ON_ATTN_PROJ ||
+                    stage.stage == PTIR_STAGE_ON_ATTN;
+            });
+    };
+
+    std::uint32_t first_hook_row = total_rows;
+    for (std::size_t program = 0; program < n_prog; ++program) {
+        if (!has_attention_stages(program)) continue;
+        const std::uint32_t lo = row_indptr[program];
+        const std::uint32_t hi = row_indptr[program + 1];
+        // A hook-carrying program with an empty wire span (device-resolved
+        // geometry placeholder) cannot be located among the rows, so no row
+        // can be proven hook-free.
+        if (hi <= lo) return 0;
+        first_hook_row = std::min(first_hook_row, lo);
+    }
+    // Every row below the minimum hook-program row start is hook-free by
+    // construction (spans are contiguous [lo, hi)), so the minimum IS the
+    // fast prefix. Hook-free rows that happen to sit above it fall into the
+    // slow tail — a lost optimisation, not a correctness question; making
+    // them fast is the row-ordering half of this work (scheduler-side).
+    return first_hook_row;
 }
 
 bool Dispatch::launch_wants_attn_score(
@@ -3547,6 +3645,29 @@ bool Dispatch::launch_wants_page_mask(
                 const std::uint32_t name_idx = normalized.op.name_idx;
                 if (name_idx < stage.names.size() &&
                     stage.names[name_idx] == "attn_page_mask") {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+bool Dispatch::launch_wants_lora(
+    const pie_native::LaunchView& view) const {
+    for (std::size_t program = 0;
+         program < view.ptir_program_hashes.size();
+         ++program) {
+        const auto* plans =
+            impl_->cache.plans(view.ptir_program_hashes.data()[program]);
+        if (plans == nullptr) continue;
+        for (const plan::StagePlan& stage : *plans) {
+            if (stage.stage != PTIR_STAGE_PROLOGUE) continue;
+            for (const plan::NormalizedOp& normalized : stage.ops) {
+                if (normalized.op.tag != PTIR_OP_SINK_CALL) continue;
+                const std::uint32_t name_idx = normalized.op.name_idx;
+                if (name_idx < stage.names.size() &&
+                    stage.names[name_idx] == "lora") {
                     return true;
                 }
             }
@@ -3732,9 +3853,9 @@ GroupedLaneEnvelope resolve_lane_envelope(
     const StagedLane& lane,
     const float* query_base,
     std::uint32_t query_columns,
-    std::uint32_t layer) {
-    const model::AttentionObservation* obs =
-        model::active_attention_observation();
+    std::uint32_t layer,
+    const model::StageHookSideband& sideband) {
+    const model::AttentionObservation* obs = sideband.observation;
     if (obs == nullptr || !obs->usable()) {
         throw std::runtime_error(
             "envelope_dot ran outside a model body with kv geometry");
@@ -3845,14 +3966,14 @@ GroupedLaneEnvelope resolve_lane_envelope(
 // "keep everything" before each layer's hook.
 GroupedLanePageMask resolve_lane_page_mask(
     const StagedLane& lane,
-    std::uint32_t layer) {
-    model::AttentionMaskSink* sink = model::active_attention_mask_sink();
+    std::uint32_t layer,
+    const model::StageHookSideband& sideband) {
+    model::AttentionMaskSink* sink = sideband.mask_sink;
     if (sink == nullptr || !sink->usable()) {
         throw std::runtime_error(
             "attn_page_mask ran on a fire with no page-mask destination");
     }
-    const model::AttentionObservation* obs =
-        model::active_attention_observation();
+    const model::AttentionObservation* obs = sideband.observation;
     if (obs == nullptr || !obs->usable()) {
         throw std::runtime_error(
             "attn_page_mask ran outside a model body with kv geometry");
@@ -3892,13 +4013,198 @@ GroupedLanePageMask resolve_lane_page_mask(
     return GroupedLanePageMask{sink->keep + begin, sink->stride};
 }
 
+// Resolve one lane's `lora` sink into a launch-owned table entry.
+//
+// This deliberately does NOT follow `attn_page_mask`'s shape. The mask sink's
+// effect is a device write into a body-owned buffer at the layer hook — the
+// model body exists (and delivered its sideband) by the time it fires. The
+// lora sink fires in the PROLOGUE, which `Dispatch::begin` executes BEFORE
+// the model body runs, so a body-owned destination cannot exist yet; and its
+// effect is host-side configuration, not device computation — the program
+// hands the backend where the adapter weights live (A/B channel cells) and
+// where they apply (SITES), and the body's projection GEMMs consume that for
+// the whole forward. So resolving the sink IS executing it: the generated
+// runtime performs no device stores for it (`fused_runtime.cuh`).
+//
+// Every disagreement throws. A silently unresolved lora is a request whose
+// adapter never applied while every sample still returns — the exact failure
+// class the sink-name bind gate exists to prevent.
+model::LoraLaneView resolve_lane_lora(
+    const StagedLane& lane,
+    const plan::StagePlan& stage) {
+    // Value id -> producing op, via the stage's flat result numbering (the
+    // same walk the fused packer uses for its `bases` table).
+    std::vector<std::uint32_t> bases(stage.ops.size());
+    std::uint32_t values = 0;
+    for (std::size_t node = 0; node < stage.ops.size(); ++node) {
+        bases[node] = values;
+        values += stage.ops[node].op.results;
+    }
+    auto producer = [&](std::uint32_t value) -> const plan::PlanOp& {
+        for (std::size_t node = 0; node < stage.ops.size(); ++node) {
+            const std::uint32_t results = stage.ops[node].op.results;
+            if (value >= bases[node] && value < bases[node] + results) {
+                return stage.ops[node].op;
+            }
+        }
+        throw std::runtime_error(
+            "lora sink argument has no producing op in its stage");
+    };
+
+    const plan::PlanOp* sink = nullptr;
+    for (const auto& normalized : stage.ops) {
+        const auto& op = normalized.op;
+        if (op.tag != PTIR_OP_SINK_CALL) continue;
+        if (op.name_idx < stage.names.size() &&
+            stage.names[op.name_idx] == "lora") {
+            if (sink != nullptr) {
+                throw std::runtime_error(
+                    "lora sink appears twice in one prologue stage");
+            }
+            sink = &op;
+        }
+    }
+    if (sink == nullptr) {
+        throw std::runtime_error(
+            "lora resolution ran on a stage without the sink");
+    }
+    if (sink->args.size() != 3) {
+        throw std::runtime_error(
+            "lora sink does not have the (A, B, SITES) argument shape");
+    }
+
+    // A and B are channel CONTENTS (an adapter swap is a re-seed, never a
+    // re-trace), so the harvested address is the channel's committed cell —
+    // resolved exactly the way the fused packer positions a read: an
+    // engine-sequenced ticket pins the cell at its expected head, otherwise
+    // the live registry mirror is the head.
+    auto channel_address = [&](std::uint32_t value,
+                               const char* which) -> const void* {
+        const plan::PlanOp& op = producer(value);
+        if (op.tag != PTIR_OP_CHAN_READ || op.chan < 0) {
+            // The design admits in-graph adapter computation (a scaled or
+            // merged adapter feeding the sink); this begin-time resolver does
+            // not — a prologue value has no device buffer that outlives
+            // `execute_declared_phase`'s temporaries. Refuse loudly rather
+            // than harvest a pointer that dangles by the first projection.
+            throw std::runtime_error(
+                std::string("lora sink ") + which +
+                " argument is not a direct channel read; computed adapter "
+                "weights are not supported by the CUDA begin-time resolver");
+        }
+        const auto local = static_cast<std::size_t>(op.chan);
+        if (local >= stage.channel_bindings.size()) {
+            throw std::runtime_error(
+                std::string("lora sink ") + which +
+                " argument reads a channel outside the stage's bindings");
+        }
+        const std::uint32_t dense = stage.channel_bindings[local];
+        auto& view = lane.bound->instance->view();
+        const std::uint32_t slot = view.slot(dense);
+        const auto ticket = std::find_if(
+            lane.tickets.begin(),
+            lane.tickets.end(),
+            [slot](const DeviceHostChannelTicket& candidate) {
+                return candidate.slot == slot;
+            });
+        if (ticket != lane.tickets.end()) {
+            const std::uint64_t head =
+                ticket->expected_head == kNoChannelTicket
+                    ? view.registry()->host_head(slot)
+                    : ticket->expected_head;
+            return ticket->cells +
+                static_cast<std::size_t>(head % ticket->cap1) *
+                    ticket->native_bytes;
+        }
+        return view.committed_cell(dense);
+    };
+
+    // SITES is trace-known placement (a `Tensor::constant` bitmask over the
+    // model's site vocabulary): structure, not contents, so it lives in the
+    // plan as a literal rather than behind a channel.
+    const plan::PlanOp& sites = producer(sink->args[2]);
+    if (sites.tag != PTIR_OP_CONST) {
+        throw std::runtime_error(
+            "lora SITES argument is not a trace-known constant");
+    }
+    if (sites.lit_dtype != PTIR_DT_U32 && sites.lit_dtype != PTIR_DT_I32) {
+        throw std::runtime_error(
+            "lora SITES constant is not an integer site bitmask");
+    }
+
+    // Adapter geometry comes from the sink arguments' declared value types —
+    // the same flat SSA numbering the fused runtime types against. The rank
+    // is trace-known shape (a different rank = a different traced program,
+    // §6.5), so the plan carries it; a symbolic or non-rank-3 dim would mean
+    // the trace did not commit to a geometry the forward can loop over, and
+    // is refused here rather than mis-sliced per layer.
+    auto static_dims_3 =
+        [&](std::uint32_t value, const char* which) -> const plan::ValueType& {
+        if (value >= stage.value_types.size()) {
+            throw std::runtime_error(
+                std::string("lora sink ") + which +
+                " argument has no declared value type");
+        }
+        const plan::ValueType& type = stage.value_types[value];
+        if (type.dtype != PTIR_DT_F32) {
+            throw std::runtime_error(
+                std::string("lora sink ") + which +
+                " argument is not f32 (the channel wire dtype the consumer "
+                "expects to cast from)");
+        }
+        if (type.dims.size() != 3) {
+            throw std::runtime_error(
+                std::string("lora sink ") + which +
+                " argument is not rank-3 ([num_layers, R, d_in] / "
+                "[num_layers, d_out, R])");
+        }
+        for (const auto& dim : type.dims) {
+            if (dim.symbolic || dim.value == 0) {
+                throw std::runtime_error(
+                    std::string("lora sink ") + which +
+                    " argument has a symbolic or zero dimension; adapter "
+                    "geometry must be trace-known");
+            }
+        }
+        return type;
+    };
+    const plan::ValueType& a_type = static_dims_3(sink->args[0], "A");
+    const plan::ValueType& b_type = static_dims_3(sink->args[1], "B");
+    const std::uint32_t num_layers = a_type.dims[0].value;
+    const std::uint32_t rank = a_type.dims[1].value;
+    const std::uint32_t d_in = a_type.dims[2].value;
+    const std::uint32_t d_out = b_type.dims[1].value;
+    if (b_type.dims[0].value != num_layers || b_type.dims[2].value != rank) {
+        throw std::runtime_error(
+            "lora sink A and B disagree on num_layers/rank: A is [" +
+            std::to_string(num_layers) + ", " + std::to_string(rank) + ", " +
+            std::to_string(d_in) + "], B is [" +
+            std::to_string(b_type.dims[0].value) + ", " +
+            std::to_string(d_out) + ", " +
+            std::to_string(b_type.dims[2].value) + "]");
+    }
+
+    return model::LoraLaneView{
+        .a = channel_address(sink->args[0], "A"),
+        .b = channel_address(sink->args[1], "B"),
+        .sites_bits = sites.lit_bits,
+        .token_start = lane.token_start,
+        .token_count = lane.token_count,
+        .num_layers = num_layers,
+        .rank = rank,
+        .d_in = d_in,
+        .d_out = d_out,
+    };
+}
+
 const float* resolve_lane_attn_score(
     const StagedLane& lane,
     std::uint32_t layer,
     std::uint64_t declared_kv_max,
     cudaStream_t stream,
-    std::vector<void*>& temporaries) {
-    const model::AttentionScores* scores = model::active_attention_scores();
+    std::vector<void*>& temporaries,
+    const model::StageHookSideband& sideband) {
+    const model::AttentionScores* scores = sideband.scores;
     if (scores == nullptr || !scores->usable()) {
         throw std::runtime_error(
             "attn_score ran on a fire that captured no attention scores");
@@ -3907,8 +4213,7 @@ const float* resolve_lane_attn_score(
         throw std::runtime_error(
             "attn_score saw a capture from a different layer");
     }
-    const model::AttentionObservation* obs =
-        model::active_attention_observation();
+    const model::AttentionObservation* obs = sideband.observation;
     if (obs == nullptr || !obs->usable()) {
         throw std::runtime_error(
             "attn_score ran outside a model body with kv geometry");
@@ -4021,6 +4326,7 @@ void execute_declared_phase(
     std::uint32_t query_columns,
     std::uint32_t layer,
     cudaStream_t stream,
+    const model::StageHookSideband& sideband = {},
     Dispatch::FinishBreakdown* breakdown = nullptr) {
     const bool probing = breakdown != nullptr;
     std::int64_t assemble_total = 0;
@@ -4039,6 +4345,13 @@ void execute_declared_phase(
             "PTIR model hook layer order is not exact");
     }
     ++launch.phase_invocations[phase];
+    if (phase == PTIR_STAGE_PROLOGUE) {
+        // The lora table is a begin-time product of exactly this phase:
+        // rebuilt whenever the prologue runs so a stale resolution can never
+        // outlive the launch geometry it was harvested against.
+        launch.lora_lanes.clear();
+        launch.lora_lane_sources.clear();
+    }
     launch.stream = stream;
     const cudaStream_t source_stream = stream;
     const std::size_t bridge_index = phase % 2;
@@ -4140,10 +4453,31 @@ void execute_declared_phase(
                 query_base, query_columns, launch.device_layer);
             if (stage_calls_kernel(stage, "envelope_dot")) {
                 binding.envelope = resolve_lane_envelope(
-                    lane, query_base, query_columns, layer);
+                    lane, query_base, query_columns, layer, sideband);
             }
             if (stage_calls_sink(stage, "attn_page_mask")) {
-                binding.page_mask = resolve_lane_page_mask(lane, layer);
+                binding.page_mask =
+                    resolve_lane_page_mask(lane, layer, sideband);
+            }
+            if (phase == PTIR_STAGE_PROLOGUE &&
+                stage_calls_sink(stage, "lora")) {
+                // Resolving IS the sink's execution: the entry lands in the
+                // launch-owned table the frame later hands the model body,
+                // and the generated runtime performs no device work for the
+                // sink itself. See `resolve_lane_lora`. One lane gets ONE
+                // configuration for the whole forward — a prologue carrying
+                // the sink twice would otherwise silently produce two table
+                // entries with the same span and leave the consumer to pick.
+                if (std::find(
+                        launch.lora_lane_sources.begin(),
+                        launch.lora_lane_sources.end(),
+                        &lane) != launch.lora_lane_sources.end()) {
+                    throw std::runtime_error(
+                        "lora sink resolved twice for one lane");
+                }
+                launch.lora_lanes.push_back(
+                    resolve_lane_lora(lane, stage));
+                launch.lora_lane_sources.push_back(&lane);
             }
             std::uint64_t attn_score_kv_max = 0;
             std::uint32_t value_base = 0;
@@ -4183,7 +4517,7 @@ void execute_declared_phase(
             if (attn_score_kv_max != 0) {
                 binding.attn_score_base = resolve_lane_attn_score(
                     lane, layer, attn_score_kv_max, stream,
-                    phase_temporaries.pointers);
+                    phase_temporaries.pointers, sideband);
             }
             tasks.push_back(Task{
                 .lane = &lane,
@@ -4808,6 +5142,21 @@ void Dispatch::update_launch_geometry(
                 lane.bound->instance->view().slot(binding.channel));
         }
     }
+    // The prologue already ran under the frame split, so any lora entries it
+    // resolved carry begin_host-time token spans; re-stamp them from the
+    // resolved geometry just written above. The A/B addresses and SITES need
+    // no refresh — channel cells and trace constants do not move with the
+    // wire geometry.
+    if (state.lora_lanes.size() != state.lora_lane_sources.size()) {
+        throw std::runtime_error(
+            "lora table and its lane attribution are out of step");
+    }
+    for (std::size_t entry = 0; entry < state.lora_lanes.size(); ++entry) {
+        state.lora_lanes[entry].token_start =
+            state.lora_lane_sources[entry]->token_start;
+        state.lora_lanes[entry].token_count =
+            state.lora_lane_sources[entry]->token_count;
+    }
 }
 
 void Dispatch::execute_attention_phase(
@@ -4818,7 +5167,8 @@ void Dispatch::execute_attention_phase(
     std::uint32_t query_columns,
     std::uint32_t layer,
     cudaStream_t stream,
-    bool query_is_f32) {
+    bool query_is_f32,
+    const model::StageHookSideband& sideband) {
     if (phase != PTIR_STAGE_ON_ATTN_PROJ &&
         phase != PTIR_STAGE_ON_ATTN) {
         throw std::runtime_error("model hook invoked a non-attention PTIR phase");
@@ -4860,7 +5210,7 @@ void Dispatch::execute_attention_phase(
     try {
         execute_declared_phase(
             state, phase, nullptr, 0, query_f32,
-            query_rows, query_columns, layer, stream);
+            query_rows, query_columns, layer, stream, sideband);
     } catch (...) {
         if (query_f32 != nullptr && !query_is_f32) {
             cudaFreeAsync(query_f32, stream);
@@ -5005,6 +5355,7 @@ bool Dispatch::finish(
             0,
             0,
             stream,
+            /*sideband=*/{},
             trace_fire_timing ? breakdown : nullptr);
     } catch (...) {
         state.failed = true;

@@ -68,7 +68,8 @@ void Qwen35MoeModel::body(Workspace& ws,
         in.commit_advance_gather_d,
         in.rs_buffer_slot_ids_h, in.rs_buffer_slot_indptr_h,
         in.rs_fold_lens_d,
-        in.rs_buffer_write, in.rs_buffer_fold);
+        in.rs_buffer_write, in.rs_buffer_fold,
+        in.stage_hooks);
 }
 
 std::uint32_t Qwen35MoeModel::graph_layout() {

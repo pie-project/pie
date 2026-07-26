@@ -19,6 +19,8 @@
 
 namespace pie_cuda_driver::model {
 
+struct StageHooks;
+
 // Per-linear-attention-layer extra workspace. Allocated once and
 // reused across layers (linear layers are processed sequentially).
 struct Qwen3_5LinearAttnWorkspace {
@@ -181,7 +183,10 @@ void qwen3_5_forward_paged(
     const std::uint32_t* rs_buffer_slot_indptr_h = nullptr,
     const std::int32_t* rs_fold_lens_d = nullptr,
     bool rs_buffer_write = false,
-    bool rs_buffer_fold = false);
+    bool rs_buffer_fold = false,
+    // The fire's stage hooks (`ForwardInputs::stage_hooks`). Null = no
+    // program attached.
+    const StageHooks* hooks = nullptr);
 
 void qwen3_5_mtp_process_cache(
     const Qwen3_5Weights& w,

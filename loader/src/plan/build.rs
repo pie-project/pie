@@ -152,6 +152,23 @@ pub fn build(
     Ok(builder.program)
 }
 
+/// Whether a lowered value *is* the declaration it was lowered for, or an
+/// anonymous intermediate on the way to one.
+///
+/// They differ in exactly one place. A lowering that costs 1 is executed by
+/// aliasing rather than copying, and an alias has to be declared under some
+/// tensor id. The declaration's own is right for [`Role::Declared`] and wrong
+/// for [`Role::Operand`], because the kernel's result is about to claim it. So
+/// an operand's view is anonymous — which is what the staging buffer
+/// [`Builder::allocate`] hands the general case has always been.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    /// The value the contract publishes.
+    Declared,
+    /// A value a kernel node reads.
+    Operand,
+}
+
 /// Where a value lives once its contract has been built.
 #[derive(Clone, Debug)]
 pub(crate) enum Value {
@@ -194,45 +211,58 @@ struct Builder<'a> {
 
 impl Builder<'_> {
     /// One contract: its expression, its encoding, and its name.
+    ///
+    /// Errors are named here and only here, so that no path through the
+    /// compiler can report an anonymous one.
     fn tensor(&mut self, contract: &TensorContract, id: TensorId) -> Result<()> {
-        let (value, decl) = match &contract.expr {
+        self.build_tensor(contract, id)
+            .map_err(|err| annotate(err, &contract.name))
+    }
+
+    /// Build one contract, leaving it to the caller to name any error.
+    ///
+    /// The preamble — specialize, infer, check the declared shape, declare —
+    /// is shared by every node, kernel or not. It used to be written out once
+    /// per arm, and four copies of four steps drift: the `Repack` arm came to
+    /// skip [`check_declared_shape`] entirely, and the kernel arms came to
+    /// report an unnamed error where the affine path reported a named one. A
+    /// node that needs a kernel differs from an affine one in how it is
+    /// *lowered*, not in how it is checked, so only the lowering is per-arm.
+    fn build_tensor(&mut self, contract: &TensorContract, id: TensorId) -> Result<()> {
+        // Sharding is resolved before lowering, for every node: below this line
+        // the expression means the same thing on every rank, the factors a
+        // scale reads line up with the payload, and neither `compile` nor any
+        // kernel arm needs a case for `Expr::Shard`.
+        let expr = self
+            .resolver
+            .specialize(contract.expr.clone(), &contract.name)?;
+        // Type-checked before lowering, for every node. `infer` is where the
+        // algebra's rules live — the operand rule, `infer_scale`'s finite
+        // non-zero factor, `repack_spec`'s element width — and an arm that
+        // skips it demotes those rules to comments that fire only for
+        // expressions nested deep enough to reach an arm that does check.
+        let ty = self.resolver.infer(&expr, &contract.name)?;
+        check_declared_shape(contract, &ty)?;
+        let decl = TensorDecl {
+            id,
+            name: contract.name.clone(),
+            shape: ty.shape.clone(),
+            encoding: ty.encoding.clone(),
+            alignment: self.alignment,
+            visibility: Visibility::Public,
+        };
+
+        let (value, decl) = match &expr {
             // A repack is opaque: the layout transform declares its own result
             // and the compiler does not model the permutation. What it *reads*
             // is not opaque, so the operand is lowered the way any other
             // expression is and only the swizzle is a kernel.
-            Expr::Repack { .. } => {
-                // Sharding is resolved before lowering for the reason the
-                // `Scale` arm resolves it: below this line the operand has to
-                // mean the same thing on every rank, and `compile` has no arm
-                // for `Expr::Shard`.
-                let expr = self
-                    .resolver
-                    .specialize(contract.expr.clone(), &contract.name)
-                    .map_err(|err| annotate(err, &contract.name))?;
-                // Type-checked before lowering like everything else, even
-                // though the result is the declaration's: `infer` is where the
-                // operand rule lives, and skipping it would make that rule fire
-                // only for repacks nested somewhere it does run.
-                self.resolver
-                    .infer(&expr, &contract.name)
-                    .map_err(|err| annotate(err, &contract.name))?;
-                let Expr::Repack { src, layout, to } = &expr else {
-                    return Err(Error::Internal("Repack arm lost its node".to_string()));
-                };
-                let decl = TensorDecl {
-                    id,
-                    name: contract.name.clone(),
-                    shape: to.shape.clone(),
-                    encoding: to.encoding.clone(),
-                    alignment: self.alignment,
-                    visibility: Visibility::Public,
-                };
-                let operand = self
-                    .resolver
-                    .infer(src, &contract.name)
-                    .map_err(|err| annotate(err, &contract.name))?;
-                let spec = repack_spec(&operand, *layout, to)
-                    .map_err(|err| annotate(err, &contract.name))?;
+            //
+            // `infer` yields `to` for a repack, so the shared declaration is
+            // already the transform's own and there is nothing to override.
+            Expr::Repack { src, layout, to } => {
+                let operand = self.resolver.infer(src, &contract.name)?;
+                let spec = repack_spec(&operand, *layout, to)?;
                 let (payload, _) = self.operand_bytes(src, &decl)?;
                 let value = self.repack(payload, spec, &decl)?;
                 (value, decl)
@@ -241,40 +271,7 @@ impl Builder<'_> {
             // be answered with byte spans. What it reads still can be: the
             // operand is lowered the way any other expression is, and only the
             // multiply is a kernel.
-            Expr::Scale { .. } => {
-                // Sharding is resolved here for the same reason `affine`
-                // resolves it before lowering: below this line the expression
-                // means the same thing on every rank, and the factors — which
-                // were sharded by the contract that published them — line up
-                // with the payload the type checker is about to compare them
-                // against.
-                let expr = self
-                    .resolver
-                    .specialize(contract.expr.clone(), &contract.name)
-                    .map_err(|err| annotate(err, &contract.name))?;
-                // Type-check before lowering. `affine` does this for everything
-                // it handles, and an escape hatch that skips it turns every
-                // rule `infer_scale` states — no quantized operand for a
-                // constant, no integer elements, no zero or non-finite factor,
-                // one factor per group — into a comment that only fires for
-                // expressions nested deep enough to fall through to `affine`,
-                // which is exactly the shapes this arm rejects.
-                let ty = self
-                    .resolver
-                    .infer(&expr, &contract.name)
-                    .map_err(|err| annotate(err, &contract.name))?;
-                check_declared_shape(contract, &ty)?;
-                let Expr::Scale { src, factor } = &expr else {
-                    return Err(Error::Internal("Scale arm lost its node".to_string()));
-                };
-                let decl = TensorDecl {
-                    id,
-                    name: contract.name.clone(),
-                    shape: ty.shape,
-                    encoding: ty.encoding,
-                    alignment: self.alignment,
-                    visibility: Visibility::Public,
-                };
+            Expr::Scale { src, factor } => {
                 let (payload, elements) = self.operand_bytes(src, &decl)?;
                 let (spec, extra) = match factor {
                     ScaleFactor::Uniform(bits) => (
@@ -303,38 +300,35 @@ impl Builder<'_> {
             // A cast needs a kernel for the same reason a scale does, and its
             // operand is lowered the same way: the conversion is the only part
             // that costs anything.
-            Expr::Cast { .. } => {
-                let expr = self
-                    .resolver
-                    .specialize(contract.expr.clone(), &contract.name)
-                    .map_err(|err| annotate(err, &contract.name))?;
-                let ty = self
-                    .resolver
-                    .infer(&expr, &contract.name)
-                    .map_err(|err| annotate(err, &contract.name))?;
-                check_declared_shape(contract, &ty)?;
-                let Expr::Cast { src, to } = &expr else {
-                    return Err(Error::Internal("Cast arm lost its node".to_string()));
-                };
+            //
+            // The staging declaration is the shared one wearing the operand's
+            // encoding, because the operand's bytes are what gets written; it
+            // is `convert` that returns the declaration the cast yields.
+            Expr::Cast { src, to } => {
                 let operand = TensorDecl {
-                    id,
-                    name: contract.name.clone(),
-                    shape: ty.shape,
-                    encoding: self
-                        .resolver
-                        .infer(src, &contract.name)
-                        .map_err(|err| annotate(err, &contract.name))?
-                        .encoding,
-                    alignment: self.alignment,
-                    visibility: Visibility::Public,
+                    encoding: self.resolver.infer(src, &contract.name)?.encoding,
+                    ..decl
                 };
                 let (value, _) = self.operand_bytes(src, &operand)?;
-                self.convert(value, operand, to)
-                    .map_err(|err| annotate(err, &contract.name))?
+                self.convert(value, operand, to)?
             }
-            _ => self
-                .affine(contract, id)
-                .map_err(|err| annotate(err, &contract.name))?,
+            // The affine fragment: everything `compile` answers with byte
+            // spans. Spelled out rather than left to a wildcard, so that a node
+            // added to the algebra has to say which side of the cost ladder it
+            // falls on instead of silently arriving here and being rejected as
+            // an expression that "needs a kernel".
+            Expr::Src(_)
+            | Expr::Out(_)
+            | Expr::Fill { .. }
+            | Expr::Slice { .. }
+            | Expr::Stride { .. }
+            | Expr::Gather { .. }
+            | Expr::Concat { .. }
+            | Expr::Transmute { .. }
+            // `specialize` has already rewritten every shard into this rank's
+            // slice, so this case is unreachable. It is listed with the
+            // fragment it belongs to rather than made an exception.
+            | Expr::Shard { .. } => (self.affine(&expr, &decl)?, decl),
         };
 
         check_declared_encoding(contract, &decl)?;
@@ -360,30 +354,13 @@ impl Builder<'_> {
     }
 
     /// Solve the affine expression and emit the copies that satisfy it.
-    fn affine(&mut self, contract: &TensorContract, id: TensorId) -> Result<(Value, TensorDecl)> {
-        // Sharding is resolved here and nowhere else: below this line the
-        // expression means the same thing on every rank.
-        let expr = self
-            .resolver
-            .specialize(contract.expr.clone(), &contract.name)?;
-        let ty = self.resolver.infer(&expr, &contract.name)?;
-        check_declared_shape(contract, &ty)?;
-
-        let lowering = compile(&expr, self.resolver.checked(), MAX_RUNS)?;
-        let decl = TensorDecl {
-            id,
-            name: contract.name.clone(),
-            shape: ty.shape.clone(),
-            encoding: ty.encoding.clone(),
-            alignment: self.alignment,
-            visibility: Visibility::Public,
-        };
-        let value = self.copies(&lowering, &decl)?;
-        Ok((value, decl))
+    fn affine(&mut self, expr: &Expr, decl: &TensorDecl) -> Result<Value> {
+        let lowering = compile(expr, self.resolver.checked(), MAX_RUNS)?;
+        self.copies(&lowering, decl, Role::Declared)
     }
 
     /// Emit the rectangular copies of a solved expression.
-    fn copies(&mut self, lowering: &Lowering, decl: &TensorDecl) -> Result<Value> {
+    fn copies(&mut self, lowering: &Lowering, decl: &TensorDecl, role: Role) -> Result<Value> {
         let output_bytes = encoding_nbytes(&decl.shape, &decl.encoding)
             .or_overflow(format!("'{}' size overflow", decl.name))?;
         let rects = lowering.byte_pieces(&decl.encoding)?;
@@ -419,7 +396,7 @@ impl Builder<'_> {
                     }));
                 }
                 Value::Buffer(buffer) if rect.is_byte_run() => {
-                    let out = self.declare_view_buffer(decl);
+                    let out = self.view_buffer(decl, role == Role::Declared);
                     let instr = self.next_instr();
                     self.program.instrs.push(StorageInstr::CreateView {
                         id: instr,
@@ -582,7 +559,18 @@ impl Builder<'_> {
     /// `U8` are packed elements of a quantization scheme, and that statement is
     /// what tells the kernel to unpack them.
     ///
+    /// The leaves may be earlier contracts as well as checkpoint tensors, so a
+    /// kernel node is closed under the whole affine fragment and under
+    /// [`Expr::Out`]. That is what makes the two-step re-encode
+    /// [`Expr::Cast`]'s doc promises actually spellable: name the decoded
+    /// tensor with a [`Visibility::Internal`] declaration and cast that. The
+    /// only thing still refused is a kernel directly under a kernel, which
+    /// `compile` rejects because it lowers to byte runs and a kernel is not
+    /// one — naming the intermediate is how a contract sequences two.
+    ///
     /// [`Transmute`]: crate::contract::Expr::Transmute
+    /// [`Expr::Out`]: crate::contract::Expr::Out
+    /// [`Expr::Cast`]: crate::contract::Expr::Cast
     fn operand_bytes(&mut self, src: &Expr, decl: &TensorDecl) -> Result<(Value, Encoding)> {
         let ty = self
             .resolver
@@ -592,27 +580,15 @@ impl Builder<'_> {
             return Ok((Value::Source(self.source_view(name)?), ty.encoding));
         }
         let lowering = compile(src, self.resolver.checked(), MAX_RUNS)?;
-        // Reading another contract's output would land in `copies`' aliasing
-        // path, which declares its view under the tensor id it was handed —
-        // this one's, which the output is about to claim. Nothing has asked
-        // for it, and the message is better than the collision.
-        if lowering
-            .leaves
-            .iter()
-            .any(|leaf| matches!(leaf, Leaf::Contract(_)))
-        {
-            return Err(Error::Contract(format!(
-                "'{}' reads another contract's output through an expression; \
-                 transform the checkpoint tensors and publish the result",
-                decl.name
-            )));
-        }
         let operand = TensorDecl {
             shape: ty.shape,
             encoding: ty.encoding.clone(),
             ..decl.clone()
         };
-        Ok((self.copies(&lowering, &operand)?, ty.encoding))
+        Ok((
+            self.copies(&lowering, &operand, Role::Operand)?,
+            ty.encoding,
+        ))
     }
 
     /// The buffer holding a per-group `Scale`'s factors.
@@ -797,7 +773,7 @@ impl Builder<'_> {
             inputs,
             vec![out],
             TransformSpec {
-                repack,
+                repack: Some(repack),
                 scratch_bytes: input_bytes
                     .checked_add(stage_bytes)
                     .or_overflow("Repack scratch bytes")?,
@@ -1109,18 +1085,20 @@ impl Builder<'_> {
     }
 
     /// A buffer that owns no bytes of its own: a window on another one.
-    fn declare_view_buffer(&mut self, decl: &TensorDecl) -> BufferId {
+    fn view_buffer(&mut self, decl: &TensorDecl, declared: bool) -> BufferId {
         let buffer = BufferId(self.next_buffer);
         self.next_buffer += 1;
         self.program.buffers.push(BufferDecl {
             id: buffer,
-            tensor: Some(decl.id),
+            tensor: declared.then_some(decl.id),
             bytes: 0,
             alignment: decl.alignment,
             temporary: false,
             persistent_offset: None,
         });
-        self.declare(decl.clone());
+        if declared {
+            self.declare(decl.clone());
+        }
         buffer
     }
 
@@ -1294,6 +1272,10 @@ impl ScaleLayout {
     }
 }
 
+/// The declared shape is a claim about the expression, checked against it.
+///
+/// `TensorContract::shape` is optional, so this is a no-op for a contract that
+/// declares none. The caller names every error it returns, once.
 fn check_declared_shape(contract: &TensorContract, ty: &TensorType) -> Result<()> {
     if let Some(declared) = &contract.shape
         && ty.shape != *declared
@@ -1313,14 +1295,17 @@ fn check_declared_shape(contract: &TensorContract, ty: &TensorType) -> Result<()
 /// conversion, so the same two lines meant "check this" or "run a kernel"
 /// depending on whether they happened to agree. Now the kernel has a name and
 /// this is only the check.
+///
+/// Like [`check_declared_shape`], this leaves the contract unnamed: the caller
+/// names every error it returns, once.
 fn check_declared_encoding(contract: &TensorContract, decl: &TensorDecl) -> Result<()> {
     if contract.encoding == decl.encoding {
         return Ok(());
     }
     Err(Error::Contract(format!(
-        "'{}' declares {:?} but its expression yields {:?}; a change of \
+        "declares {:?} but its expression yields {:?}; a change of \
          representation is an explicit cast",
-        contract.name, contract.encoding, decl.encoding
+        contract.encoding, decl.encoding
     )))
 }
 

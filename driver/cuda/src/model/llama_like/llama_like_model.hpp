@@ -1,6 +1,7 @@
 #pragma once
 
 #include "model/imodel.hpp"
+#include "model/llama_like/declared_forward.hpp"
 #include "model/llama_like/llama_like.hpp"
 #include "model/llama_like/qwen3.hpp"
 
@@ -41,6 +42,11 @@ private:
     LlamaLikeForwardCfg fwd_cfg_;
     LlamaLikePlanState plan_;
     ModelCapabilities caps_;
+    // Stage 3 (pie-application-plan.md §7): the traced form of this
+    // deployment's forward, when PIE_DECLARED_FORWARD opted in and the
+    // config is representable. Empty otherwise; `body` then never consults
+    // it. Traced at construction because the facts are load-time facts.
+    LlamaLikeDeclaredPlan declared_;
 };
 
 }  // namespace pie_cuda_driver::model

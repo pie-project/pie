@@ -54,9 +54,15 @@ use pie_codegen::program::{Backend, emit_program};
 /// driver's cache — so a constant that moves on its own fails
 /// `the_pinned_versions_are_the_compiled_ones` until someone comes here and
 /// says so in the same commit.
+// Re-pinned WITHOUT a version bump when `lora_prologue` joined the corpus:
+// the fingerprint is a hash over everything the corpus emits, so growing the
+// corpus moves it even when no pre-existing case's bytes changed — and the
+// oracle dumps (`golden-cuda/`, `golden-msl/`) show that growth was purely
+// additive. Bumping the constants for that would discard every driver's
+// compile cache over sources they would re-emit identically.
 const PINNED: &[(&str, u16, u64)] = &[
-    ("cuda", 19, 0xe378_da9c_00f6_fda5),
-    ("metal", 35, 0x16e9_a27d_8fc5_3b4b),
+    ("cuda", 19, 0xd17b_b3da_e6c4_aff4),
+    ("metal", 35, 0xf737_01d0_a63d_5c52),
 ];
 
 /// Everything a driver receives for both corpora, hashed.

@@ -191,6 +191,26 @@ struct ModelFacts {
     // reads the nested form; this must agree with it.
     float rope_theta = 1.0e7f;
     float partial_rotary_factor = 0.25f;
+    // ── Gemma 4 ──
+    // Its shape is per attention type, and `rope_parameters` is nested one
+    // level deeper again: `{full_attention: {...}, sliding_attention: {...}}`
+    // rather than one object for the whole stack. Defaults are E2B's.
+    int g4_num_hidden_layers = 0;   // non-zero marks "this config was read as gemma4"
+    int g4_hidden_size = 0;
+    int g4_intermediate_size = 0;
+    int g4_num_attention_heads = 0;
+    int g4_num_key_value_heads = 0;
+    int g4_head_dim = 0;            // sliding layers
+    int g4_global_head_dim = 0;     // full layers
+    int g4_sliding_window = 0;
+    int g4_num_kv_shared_layers = 0;
+    int g4_per_layer_emb_dim = 0;   // hidden_size_per_layer_input
+    int g4_full_attn_interval = 0;  // derived from `layer_types`
+    bool g4_double_wide_mlp = false;
+    float g4_final_softcap = 0.0f;
+    float g4_rope_theta_full = 1.0e6f;
+    float g4_rope_theta_sliding = 1.0e4f;
+    float g4_full_partial_rotary = 0.25f;
     // Which storage schema this driver authors against. Parsed here because
     // this is already the driver's one read of `config.json`; the loader no
     // longer opens it (`loader/architecture.md` §10.4).
@@ -308,6 +328,68 @@ ModelFacts read_model_facts(const std::string& hf_path) {
         };
         facts.model_type = str_of(tc, "model_type");
         if (facts.model_type.empty()) facts.model_type = str_of(j, "model_type");
+
+        // ── Gemma 4 ──
+        // Read only when the config says so, so nothing here can perturb the
+        // family that already works.
+        if (facts.model_type == "gemma4" || facts.model_type == "gemma4_text") {
+            const auto i32_of = [](const nlohmann::json& obj, const char* key, int& out) {
+                if (obj.contains(key) && obj[key].is_number_integer()) {
+                    out = obj[key].get<int>();
+                    return true;
+                }
+                return false;
+            };
+            i32_of(tc, "num_hidden_layers", facts.g4_num_hidden_layers);
+            i32_of(tc, "hidden_size", facts.g4_hidden_size);
+            i32_of(tc, "intermediate_size", facts.g4_intermediate_size);
+            i32_of(tc, "num_attention_heads", facts.g4_num_attention_heads);
+            i32_of(tc, "num_key_value_heads", facts.g4_num_key_value_heads);
+            i32_of(tc, "head_dim", facts.g4_head_dim);
+            i32_of(tc, "global_head_dim", facts.g4_global_head_dim);
+            i32_of(tc, "sliding_window", facts.g4_sliding_window);
+            i32_of(tc, "num_kv_shared_layers", facts.g4_num_kv_shared_layers);
+            i32_of(tc, "hidden_size_per_layer_input", facts.g4_per_layer_emb_dim);
+            if (tc.contains("use_double_wide_mlp") && tc["use_double_wide_mlp"].is_boolean()) {
+                facts.g4_double_wide_mlp = tc["use_double_wide_mlp"].get<bool>();
+            }
+            f32_of(tc, "final_logit_softcapping", facts.g4_final_softcap);
+            // Per-attention-type rope.
+            if (rp != nullptr) {
+                if (rp->contains("full_attention") && (*rp)["full_attention"].is_object()) {
+                    const auto& full = (*rp)["full_attention"];
+                    f32_of(full, "rope_theta", facts.g4_rope_theta_full);
+                    f32_of(full, "partial_rotary_factor", facts.g4_full_partial_rotary);
+                }
+                if (rp->contains("sliding_attention") && (*rp)["sliding_attention"].is_object()) {
+                    f32_of((*rp)["sliding_attention"], "rope_theta",
+                           facts.g4_rope_theta_sliding);
+                }
+            }
+            // The full-attention schedule, derived from `layer_types` rather
+            // than assumed: the interval is the distance between the first two
+            // full-attention layers, and the list is then checked against it so
+            // an irregular stack is refused instead of silently mis-scheduled.
+            if (tc.contains("layer_types") && tc["layer_types"].is_array()) {
+                std::vector<int> full;
+                int idx = 0;
+                for (const auto& t : tc["layer_types"]) {
+                    if (t.is_string() && t.get<std::string>() == "full_attention") {
+                        full.push_back(idx);
+                    }
+                    ++idx;
+                }
+                if (!full.empty()) {
+                    const int interval = full[0] + 1;
+                    bool regular = true;
+                    for (std::size_t k = 0; k < full.size(); ++k) {
+                        regular = regular &&
+                                  full[k] == static_cast<int>(k + 1) * interval - 1;
+                    }
+                    facts.g4_full_attn_interval = regular ? interval : -1;
+                }
+            }
+        }
     } catch (const std::exception& e) {
         std::cerr << "[pie-driver-metal] warning: failed to parse "
                   << cfg.string() << ": " << e.what() << "\n";
@@ -363,7 +445,7 @@ std::string build_caps_json(const Config& cfg,
         const std::uint64_t recur_stride = g.gdn_recurrent_stride_bytes();
         int gdn_layers = 0;
         for (int l = 0; l < g.n_layers; ++l) {
-            if (!backend::DecodeGeometry::is_full_attn(l)) ++gdn_layers;
+            if (!g.is_full_attn(l)) ++gdn_layers;
         }
         rs_cache_slot_bytes = static_cast<std::uint32_t>(
             std::uint64_t(gdn_layers) * (2 * conv_stride + recur_stride));
@@ -1977,6 +2059,22 @@ class Context::Impl {
         setup_cfg.model_type = facts_.model_type;
         setup_cfg.rope_theta = facts_.rope_theta;
         setup_cfg.partial_rotary_factor = facts_.partial_rotary_factor;
+        setup_cfg.gemma4.n_layers = facts_.g4_num_hidden_layers;
+        setup_cfg.gemma4.hidden = facts_.g4_hidden_size;
+        setup_cfg.gemma4.intermediate = facts_.g4_intermediate_size;
+        setup_cfg.gemma4.n_q_heads = facts_.g4_num_attention_heads;
+        setup_cfg.gemma4.n_kv_heads = facts_.g4_num_key_value_heads;
+        setup_cfg.gemma4.head_dim = facts_.g4_head_dim;
+        setup_cfg.gemma4.global_head_dim = facts_.g4_global_head_dim;
+        setup_cfg.gemma4.sliding_window = facts_.g4_sliding_window;
+        setup_cfg.gemma4.num_kv_shared_layers = facts_.g4_num_kv_shared_layers;
+        setup_cfg.gemma4.per_layer_emb_dim = facts_.g4_per_layer_emb_dim;
+        setup_cfg.gemma4.full_attn_interval = facts_.g4_full_attn_interval;
+        setup_cfg.gemma4.double_wide_mlp = facts_.g4_double_wide_mlp;
+        setup_cfg.gemma4.final_softcap = facts_.g4_final_softcap;
+        setup_cfg.gemma4.rope_theta_full = facts_.g4_rope_theta_full;
+        setup_cfg.gemma4.rope_theta_sliding = facts_.g4_rope_theta_sliding;
+        setup_cfg.gemma4.full_partial_rotary = facts_.g4_full_partial_rotary;
         setup_cfg.storage_page_size = storage_page_size_;
         // Create + `setup()` the executor ON THE WORKER THREAD (Phase 3, §7):
         // MetalExecutor::setup builds the Metal device/heap/PSOs, which must

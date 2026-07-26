@@ -1,0 +1,31 @@
+Qwen2.5-1.5B shapes, 8 programs, median of 5
+axes: DEPTH (28 down to 15 layers), RANK (8-64), VISION (1 row in 8 carries an image)
+
+  axes live                 rows    split  padded  merged  PLANNED  vs split  vs padded  pad waste
+  depth only                   8    32.84    6.87    6.77     6.78     4.84x      1.01x      1.26x
+  depth x rank                 8    33.03    6.85   13.19     6.78     4.88x      1.01x      2.68x
+  depth x rank x vision        8    33.22    6.81   13.37     6.88     4.83x      0.99x      2.68x
+
+  depth only                  64    36.00    6.79    6.77     6.76     5.32x      1.00x      1.26x
+  depth x rank                64    36.09    6.82   13.17     6.79     5.31x      1.00x      2.68x
+  depth x rank x vision       64    36.27    6.84   13.37     6.96     5.21x      0.98x      2.68x
+
+  depth only                 512    35.93    9.94    9.97    10.30     3.49x      0.96x      1.26x
+  depth x rank               512    35.50   11.00   14.16     9.70     3.66x      1.13x      2.68x
+  depth x rank x vision      512    35.86   11.62   14.13    10.26     3.49x      1.13x      2.68x
+
+PLANNED is what tart actually emits: merged on the axes where merging wins and
+padded on the axis where plan.py returns "padded". It is the only column that is
+never worse than both of the pure strategies, and the pure MERGED column is the
+refutation of the obvious hypothesis -- composing axes does not compound the
+mechanism's advantage, it compounds whichever axis the mechanism loses.
+
+Read down the 'vs padded' column within one row count. Each axis on its own is
+something padding can absorb; the product is what it cannot, because the pad
+factors multiply while the merged pass is doing the same thing it was already
+doing. 'pad waste' is that product computed from the shapes alone -- the extra
+arithmetic padding signs up for, before any measurement.
+
+This is the argument for a general mechanism stated as a measurement. A point
+solution per axis leaves you with the product, and the product is the case
+vLLM's own table calls mutually exclusive.

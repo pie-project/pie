@@ -5523,3 +5523,488 @@ contention `soak` scenario runs 124 s and was already losing samples. Late CPU
 now accumulates into `CPU_CENSUS_DROPPED_NS` and every `cpu_census` record
 carries `window_us` and `dropped_us`, so a truncated census can no longer be
 read as a complete one.
+
+## §20.33 — the conc-512 gap is GPU work rate, not host scheduling
+
+§20.30 closed the conc-512 account on an assumption that turned out to be
+wrong: that vLLM's GPU-busy time is approximately its wall time. Measured
+directly (`nvidia-smi utilization.gpu` at 21 ms, window aligned to the exact
+benchmark duration, ABBA, identical 524288 output tokens):
+
+| run | wall | GPU-busy | util | GPU idle |
+|---|---|---|---|---|
+| pie | 16.66 s | 15.60 s | 93.6% | 6.4% |
+| pie | 17.00 s | 15.91 s | 93.6% | 6.4% |
+| vLLM | 16.32 s | **14.61 s** | 89.5% | **10.5%** |
+
+**pie keeps the GPU busier than vLLM and still loses.** The deficit is the GPU
+work itself. pie's own wave timing splits its 16.65 s span into 1032 decode
+waves = 14.49 s (median 14.20 ms, 512 tokens each) and 23 prefill waves =
+2.16 s. pie's decode alone is within 1% of vLLM's *entire* GPU-busy time, so
+the decode kernels are competitive and the whole gap sits in pie's separate
+prefill plus the turnover around it.
+
+### pie DOES support mixed prefill+decode in one forward pass
+
+A prior claim in this log — "pie has no chunked prefill" — was wrong as a
+capability statement, and the correction matters because it changes which
+levers are even available.
+
+- `driver/cuda/src/batch/frame.cpp:1173-1177` **derives** `is_pure_decode` per
+  step from `qo_indptr`: true iff every request contributes exactly one token.
+  Models then compute `use_decode_path = is_pure_decode && !force_prefill_path`,
+  so a step of 511 x Nr=1 plus 1 x Nr=37 simply runs the general ragged-prefill
+  kernel. Kernels read `Nr = qo_indptr[r+1] - qo_indptr[r]` per request, i.e. a
+  varlen layout — nothing assumes uniform token counts.
+- `runtime/engine/src/scheduler/worker.rs:383-437` `LaunchGrouping::accepts`
+  rejects only on: same instance, same pipeline (ordering rule B3), solo
+  submission, mask/device-geometry incompatibility, then capacity
+  (`max_forward_requests` / `max_forward_tokens` / `max_page_refs`).
+  **Per-request token count is never a grouping criterion.**
+
+### The cohort is emergent, not a pie concept
+
+There is no cohort object anywhere in the engine. The 24 pure-prefill waves are
+a workload-plus-admission artifact with two independent causes:
+
+1. **Lockstep from the workload shape.** All 4096 requests carry the same
+   ~37-token prompt and exactly 128 output tokens, so an admitted batch of 512
+   finishes in the same wave and frees all 512 execution seats at once. Each
+   such group = 3 prefill waves (221+221+70 requests, ~8177/8177/2590 tokens,
+   capped by `max_forward_tokens=8192`) + 129 decode waves. 8 x 3 = 24 prefill
+   and 8 x 129 = 1032 decode — exactly the observed counts. During the decode
+   phase no prefilling request exists, so there is nothing to mix.
+2. **The request cap equals the concurrency.** The planner derives
+   `decode_target=512` -> `max_forward_requests=512`, so a conc-512 decode wave
+   is exactly full and could not admit a prefill even if one were pending.
+
+### Boundary packing: both exits refuted
+
+Forcing the prefill budget in both directions (`PIE_CUDA_PREFILL_TOKENS`):
+
+| pft | waves | prefill waves | boundary shape | idle | busy | tok/s |
+|---|---|---|---|---|---|---|
+| 1024 | — | — | — | **305 ms** | **16.74 s** | 30274 |
+| 2048 | — | — | — | 1127 ms | 16.51 s | 29367 |
+| 4096 | — | — | — | 762 ms | 16.35 s | 30208 |
+| **8192** | 1056 | 24 | P221 D221 P221 D221 P70 D70 | 496 ms | **15.85 s** | **30541** |
+| 16384 | 1040 | 16 | P442 D442 P70 D70 | — | — | 29842 |
+| 32768 | 1024 | 8 | P512 D512 D512 | — | — | 29813 |
+
+- **Upward is slower.** pft=32768 produces exactly the "ideal" schedule — one
+  prefill wave per group, zero partial decode waves — and loses 2.7%. It
+  removes 110 ms of partial waves and adds ~250 ms of prefill plus ~100 ms of
+  decode (N=32768 costs 1153 MiB of persistent inputs vs 289 MiB).
+- **Downward is slower too.** pft=1024 does exactly what the idle theory
+  predicts (idle -38%, util 98.2%) and still loses, because busy grows 0.89 s.
+  **Buying one unit of idle costs ~4.7 units of GPU work.**
+- **A 3x cost-model error is corrected.** A decode wave does not cost ~14.35 ms
+  regardless of width: the 24 partial waves total 0.11 s, i.e. ~4.6 ms each.
+  Decode is **linear** in batch width here (14.37 ms / 512 = 28.1 us per
+  request; partial waves average 26.9 us). So boundary packing was only ever
+  worth 110 ms = 0.66%, not the 344 ms projected. pie's 512-wide decode step is
+  not launch-overhead-bound.
+- **Capacity never blocked mixing.** Mixed waves = 0 at every rung. At
+  pft=16384 the boundary is P442 **D442** P70 D70: while 442 decode, the last
+  70 prefills need 2590 tokens against 15942 free. The chunk structure is
+  self-perpetuating instead — a group that prefills in chunks of (221,221,70)
+  also *retires* in those chunks, so its successors are admitted in those
+  chunks. Remove the chunking (pft=32768) and the partial waves vanish
+  entirely, confirming the cycle. **There is no missed mixing opportunity in
+  this workload.**
+
+### The boundary bubble, fully characterized
+
+`idle2.py` computes GPU idle as the complement of the union of every wave's
+`[driver_started_us, native_complete_us]`. Span 16.35 s, busy 15.85 s, idle
+**0.496 s**, util 97.0% — and all of it is **7 discrete gaps** (6 x ~42 ms plus
+one outlier). Zero sub-15 ms micro-bubbles: inter-wave turnaround is fully
+hidden by the frame pipeline. 7 = 4096/512 - 1 is exactly the group-boundary
+count, and every gap is followed by a prefill wave.
+
+Phase split of a typical 42 ms bubble: ~5 ms idle -> first fire, **~27 ms
+arrival spread**, ~10 ms last-fire -> driver launch. And the cause is not guest
+latency: at every one of the 7 boundaries all 512 successors had *already*
+entered `guest_main` and been bind-admitted before the GPU went idle, with
+`sub_min - adm_min = 0.1 ms`. Prewarm and the double-buffered bind pool work
+perfectly. What is spread is the **execution admission** — the retiring group's
+512 `ProcessCtx::drop`s release their seats over ~32 ms, host-CPU bound.
+
+Host CPU at 10 ms resolution against the 13.6-core cgroup quota:
+
+| | in-bubble | out-of-bubble |
+|---|---|---|
+| total | **10.27 cores** | 5.41 mean / 3.25 p50 |
+| teardown | **1.30** | **0.01** |
+
+Decode leaves ~10 cores idle; the boundary needs them but the work does not
+exist yet. Teardown is 100% boundary-concentrated, and splitting it shows the
+filesystem was a red herring: **94% is the wasmtime `ResourceTable` drop**
+(155.7 us mean, 0.638 core-s total) against 0.1 us for scratch removal.
+Removing teardown entirely would free ~1.3 of the 10.27 in-bubble cores =>
+~4 ms/boundary => **0.17% of wall**. Not worth surgery.
+
+`ctx.rs`/`teardown.rs` did land one correctness fix found here: `scratch_dir`
+is now `Option<PathBuf>`, `Some` only when the sandbox actually created it.
+With `allow_fs` false `base_dir` is empty, so teardown was calling
+`remove_dir_all` on a **relative** `./<pid>` under the server's CWD. Measured
+neutral; kept because it is correct.
+
+### Global host configuration is exhausted
+
+Swept every process-wide knob looking for a second mimalloc-class win.
+
+- **Build profile** was the only real gap: the wheel ships with the default
+  `release` profile (`lto = false`, `codegen-units = 16`), so the perf-critical
+  pyo3 cdylib had cross-crate inlining off. Adding `lto = "thin"` doubled build
+  time (8 min -> 14m42s) for **+0.3%** on throughput and -1.0% of host CPU,
+  both under this box's ~2% resolution. **Reverted.**
+- **wasmtime** (`bootstrap.rs:608-636`): every perf-relevant default is already
+  the fast one — Cranelift `Speed`, `memory_init_cow`, SIMD on, fuel and epoch
+  interruption off, pooling allocator with all five `total_*` caps set.
+- **tokio** (`worker/src/engine.rs:339-345`): only `worker_threads` is set, and
+  **the scheduler loop is not on tokio at all** — it is a dedicated OS thread
+  parking on a crossbeam `recv_timeout` (`worker.rs:2550-2553`), so
+  `event_interval` / `global_queue_interval` / `disable_lifo_slot` cannot touch
+  the hot path.
+- **mimalloc env knobs** are inapplicable here: `HugePages_Total = 0` and THP
+  is in `madvise` mode.
+- **CUDA sync policy** is a non-issue: settlement is a `cudaLaunchHostFunc`
+  callback (`context.cpp:542`), not a host spin-wait.
+- **CUDA arch** is correctly detected (L40S, cc 8.9, 142 SM); 89 is not in
+  `PIE_CUDA_ACCELERATED_ARCHS`, so the missing-`a`-suffix trap does not apply.
+- **Attention backend** is FlashInfer v0.6.15, the same family vLLM uses.
+
+The structural reason the ceiling is low: pie is 93.6% GPU-busy, so only
+1.06 s of the 16.66 s wall is host-side idle and every process-wide host lever
+is capped at ~0.2-0.5% of wall. The mimalloc win landed when the host side had
+far more slack; that regime is gone.
+
+### What the clock/power trace says instead
+
+Sampling `clocks.sm,power.draw,utilization.gpu,utilization.memory` at 100 ms
+through a full conc-512 run of each engine (busy = `gpu_util >= 50`):
+
+| | sm MHz | power W (mean/p50) | gpu_util (mean/p10) | tok/s |
+|---|---|---|---|---|
+| pie | 2378 | **298.4 / 309.6** | 95.8 / **78** | 30906 |
+| vLLM | 2350 | **320.1 / 335.3** | 97.8 / **99** | 32633 |
+
+Neither engine is clock- or power-capped, so **vLLM extracts a higher work rate
+from the same silicon** (+7.3% power at the same clocks), and pie's util p10 of
+78% vs vLLM's 99% is the boundary bubble made visible in a second, independent
+trace.
+
+### The honest ranking
+
+1. **pie does ~1.2 s (8.5%) more GPU work than vLLM** — busy 15.85 s vs 14.61 s.
+   This is the decode step itself and it is *bigger* than the bubble.
+2. **Boundary bubble 496 ms (3.0% of span)** — fully characterized, both
+   wave-shape exits refuted, remaining host-CPU levers each worth <=0.3%.
+
+Closing the entire bubble would give ~+3.1% and still leave pie ~1.6% under
+vLLM. **The bubble is necessary but not sufficient; the decode step is where
+the rest lives.**
+
+## §20.34 — the driver measures its own prefill budget
+
+Every number in §20.33 was measured against `max_forward_tokens = 8192`. That
+value is not a scorer output. It is a hand-tuned constant fingerprinted to
+exactly this model and GPU, and it turns out to be **the wrong one**.
+
+### Where N=8192 came from
+
+`driver/cuda/src/store/memory_planner.cpp` selects a plan through three tiers:
+
+1. **profile cache** — reads `~/.cache/pie/cuda_memory_profiles.json` and pins
+   whatever it finds. **Dead machinery: nothing in the repo ever wrote that
+   file.** The only references were the path helper and this reader, so
+   `selector=profiled` could never fire without someone hand-authoring JSON.
+2. **model fingerprints** — four predicates carrying magic numbers
+   8192 / 12288 / 5632, each gated on `forced_prefill == 0`.
+3. generic max-score.
+
+Our benchmark reported `selector=rule N=8192`, and every clause of
+`prefer_qwen3_small_ada_prefill_shape` held (auto profile, tp=1, sm_89,
+SM=142>=100, `model_type=="qwen3"`, `hidden_size==1024` = Qwen3-0.6B). Tier 1
+could not fire, so tier 2 did.
+
+This also revealed a **confound in the pft ladder of §20.33**: forcing
+`PIE_CUDA_PREFILL_TOKENS` disables every `prefer_*` predicate, so the ladder's
+rungs resolved to `latency` while the baseline resolved to `balanced`. Checked
+after the fact — every rung logged identical `page_size=16 R=512
+page_refs=262144 logical_kv_pages=22038`, and the env var has exactly one
+reader — so the ladder *was* a valid single-variable sweep. But every rung was
+a **single sample** on a box that resolves ~2%, which matters below.
+
+### A candidate dump, and a fingerprint that was pure dead weight
+
+Added `PIE_CUDA_PLANNER_DUMP=K` — prints the top K scored candidates with
+`arena`/`kv_tokens`, marks the selected one, and says explicitly when an
+override moved the selection off rank 1. It showed the selected candidate **was
+already the scorer's rank-1**, and reading the scorer confirms
+`prefer_qwen3_small_ada_prefill_shape` feeds no score term at all — only the
+override branch. Deleting it produced a **byte-identical plan**
+(`N=8192 R=512 page=16 persistent=289 MiB logical_kv_pages=22038`). It was
+dead weight, and it was pinning the worse value.
+
+The dump also exposed a fragility worth recording: the top four candidates are
+**exact ties** at score 18.6689 (balanced and throughput produce identical
+plans), so `std::max_element` picks by iteration order.
+
+### Tier 1 made real: a measurement-based calibrator
+
+`store/planner_profile_cache.{hpp,cpp}` now owns the key schema, the lookup and
+an **atomic writer** (temp file + rename, replaces-or-appends by key, never
+throws on a corrupt cache). `memory_planner.cpp` drops its inline reader in
+favour of the shared one, and the cache-match loop now picks the
+**highest-scoring** match instead of the first.
+
+`batch/planner_calibration.{hpp,cpp}` runs the measurement, hooked into
+`context.cpp` right after `capture_forward_graph_lattice` — which already ran
+synthetic forwards post-init and is the working template (`invoke_prepare` +
+`invoke_body` + persistent-input fills, synthetic KV aliasing page 0). The hook
+**must sit before `attention_allocator_->trim_bytes(0)`**; placing it after
+released the arena and crashed FlashInfer with `invalid argument`.
+
+Design constraints, deliberately conservative:
+
+- **Opt-in** via `PIE_CUDA_PLANNER_CALIBRATE=1`. A process that never
+  calibrates behaves exactly as before. The sweep costs ~10-30 s of startup.
+- **Refuses** when `tp_size > 1` (ranks would desync on collectives) or when
+  `rs_cache != nullptr` (recurrent state is not idempotent).
+- Pins **only `max_forward_tokens`**. `policy_profile`, `kv_page_size` and
+  `max_forward_requests` stay wildcards, so the scorer still decides everything
+  that was never measured.
+- Measures with `emit_logits=true` and `num_logit_rows = R` so the LM head is
+  included; omitting it is a fixed per-step cost that biases toward smaller N.
+- Selection is **maximin over prompt lengths** — normalise each budget's rate
+  by the best rate at that same L, score by the worst normalised rate — with
+  the tolerance taken from the **measured stddev**, not a tuned constant.
+
+**Two design errors caught during development**, both worth stating because
+they are easy to repeat:
+
+- A 1-D sweep that couples `L = N/R` is invalid: growing the budget grows the
+  prompt length, and attention's O(L^2) term masquerades as a budget effect.
+  The sweep is 2-D — prompt length held fixed while the budget varies.
+- The first selection wrote `max_forward_requests` into the cache. R varied as
+  a *consequence* of (N, L) and was never the subject of measurement. Writing
+  it would have pinned an unmeasured field.
+
+### The surface, and the result
+
+tok/s by (prompt length L x budget N), Qwen3-0.6B / L40S, R=512, page 16,
+stddev ~0.1%:
+
+| L | 512 | 1024 | 2048 | 4096 | 8192 |
+|---|---|---|---|---|---|
+| 1 | 111019 | 109258 | 109407 | 109457 | 109568 |
+| 4 | 103152 | 121366 | 132620 | 132597 | 132759 |
+| 16 | 109750 | 131158 | 141787 | **151867** | 138958 |
+| 64 | 109513 | 134094 | 144837 | **154195** | 141567 |
+| 256 | 97260 | 116066 | 142453 | **152562** | 139492 |
+
+The knee is at **N=4096 for every L**, and N=8192 is ~9% worse everywhere. That
+the knee does not move with L is the result that makes it cacheable at all: it
+is a property of the device and the model, not of the workload. (The L=1 and
+L=4 rows plateau because token count saturates at `R*L`.)
+
+End-to-end, conc-512, ABBA over four pairs (A = calibrated cache present,
+B = cache absent):
+
+| | tok/s | mean |
+|---|---|---|
+| calibrated N=4096 (`selector=profiled`) | 31702 / 32013 / 31919 / 31589 | **31806** |
+| scored N=8192 (`selector=rule`) | 30638 / 31397 / 31844 / 31219 | **31274** |
+
+**+1.7%, all four pairwise deltas positive**, with A running at the *higher*
+average loadavg (17.3 vs 16.1). It also frees 1414 MiB of arena
+(3212 -> 1798 MiB) and drops persistent inputs from 289 to 145 MiB.
+
+Repeated independently after a rebase onto a later `dev`, four fresh pairs:
+
+| | tok/s | mean |
+|---|---|---|
+| calibrated N=4096 | 32387 / 31642 / 32268 / 32086 | **32096** |
+| scored N=8192 | 31554 / 31523 / 32021 / 31477 | **31644** |
+
+**+1.43%, again all four pairwise deltas positive** (+2.64 / +0.38 / +0.77 /
++1.93%), and again with A at the higher mean loadavg (16.8 vs 13.8). Across
+both campaigns that is **8 of 8 pairs in the same direction**.
+
+A single A-vs-B pair taken during that verification read the *opposite* sign
+(31749 vs 32064) — which is exactly the failure mode retracted below, observed
+live. One tok/s sample is not evidence on this box.
+
+### ⚠ RETRACTION
+
+§20.33's conclusion — "**8192 is a local optimum in both directions — do not
+retry wave-shape levers**" — **is refuted.** The ladder was not confounded, it
+was **under-powered**: one sample per rung on a box that resolves ~2%. A
+repeated ABBA at the same two points reverses the sign. Single-sample ladders
+are not evidence here, and this log should not have drawn a directional
+conclusion from one.
+
+### What is still hardcoded
+
+Three fingerprints remain (`prefer_qwen3_8b_prefill_shape` 12288,
+`prefer_qwen3_8b_tp2_ada_shape` 5632,
+`prefer_nemotron_h_tp2_ada_prefill_shape`), plus a `prefill_candidate_cap`
+ternary (`prop.major >= 12 ? 16384 : 8192`) and a qwen3_5_moe score hack. The
+calibrator is now the mechanism that can retire them — but all three cover
+configurations (Qwen3-8B TP1, Qwen3-8B TP2, Nemotron-H TP2) that cannot be
+validated on a single L40S, so they stay until someone can measure them.
+
+---
+
+## §20.35 — PTIR is already at the bandwidth roof; the fence tax was next door
+
+The remaining gap at conc-512 was **-1.56%** (pie 32052 vs vLLM 32562, ABBA
+3+3, calibrated `N=4096`). The question was whether pie's *programmability*
+machinery — running user programs on the device — is what pays for it, and
+whether any of it can be shaved without giving programmability up.
+
+### Decomposing pie's GPU time
+
+`nsys profile --trace=cuda --cuda-graph-trace=node`, 1024 requests at
+concurrency 512. **The `--cuda-graph-trace=node` flag is mandatory**: without
+it, graphs hide ~90% of kernels and the profile is actively misleading. nsys
+inflates wall time ~1.7x under node tracing, so only WITHIN-trace ratios are
+usable.
+
+| category | ms | % | instances |
+|---|---|---|---|
+| GEMM | 3316.1 | 52.8 | 64950 |
+| attention (`BatchDecodeWithPagedKVCache`) | 2585.2 | 41.2 | 7672 |
+| model elementwise / norm / rope / kv | 233.7 | 3.7 | 32560 |
+| **guest PTIR program** (`ptir_fused_*`) | **78.8** | **1.3** | 276 |
+| **host-channel pipeline** | **62.4** | **1.0** | 1644 |
+
+Two things fell out of this that contradict earlier assumptions in this log:
+
+- **~41% of the decode step is paged attention**, not GEMM. Decode is not
+  launch-bound and not GEMM-bound in the way §20.x assumed.
+- **pie-only machinery was 2.25% of GPU time — LARGER than the 1.56% gap.**
+  So it was, for once, a lever that could actually cover the deficit.
+
+### The PTIR kernel is NOT a pie tax — it is at the hardware roof
+
+`ptir_fused_8cdf1d4e51797f1c_r0` runs `grid=(512,1,1) blk=(1024,1,1)` —
+one block per request — at `REG:55 STACK:96 SHARED:516`, 308 us traced
+(~181 us real). Its job is argmax over the logits: 512 x 151936 bf16 =
+**155.6 MB**, which at 181 us is **~860 GB/s, essentially L40S peak**.
+
+**It is bandwidth-saturated and vLLM must read exactly the same logits to
+sample.** There is nothing to shave, and this corrects the earlier claim that
+the guest program was the top lead. Programmability is not costing anything
+here: the guest program is doing work every engine has to do.
+
+(Aside: PTIR regions are compiled at runtime by NVRTC with `--fmad=false
+--prec-div=true --prec-sqrt=true`. Relaxing those is a real lever but it
+changes numerics, so it was not pursued.)
+
+### THE FINDING — a system release fence per host-channel word
+
+Profiling the pie-specific kernels instead turned up an anomaly:
+`k_settle_host_channels_batch` cost **133.3 us/step** — 4x
+`k_scatter_host_publish_copies` at the *same* geometry (512 blocks x 128
+threads) despite doing strictly less work. The kernel body is trivial
+bookkeeping, but every word was written with a **system-scope release** store.
+
+A microbenchmark at that exact shape (`/root/p512/settle_bench.cu`, best-of-3
+with rotated variant order — GPU idle clocks drop to 210 MHz and can skew a
+run 3.4x):
+
+| tickets | release (was) | rlx+2fence | plain+1fence | rlx+1fence | **rlx+0fence** | speedup |
+|---|---|---|---|---|---|---|
+| 1 | 159.4 | 119.5 | 48.3 | 49.0 | **11.6** | 13.8x |
+| 2 | 273.8 | 189.5 | 50.4 | 50.7 | **12.5** | 21.8x |
+| 4 | 442.8 | 310.6 | 53.8 | 53.8 | **14.9** | 29.8x |
+| 8 | 792.4 | 543.6 | 66.0 | 64.8 | **19.0** | 41.8x |
+
+**The cost is the fence count, not the store count and not PCIe latency.**
+Relaxed and plain stores are nearly flat in ticket count — the writes pipeline
+fine. Release scales linearly, because each store waits. One
+`__threadfence_system()` measures ~37 us on its own in this shape.
+
+### Why relaxed is correct here
+
+Every word this kernel writes is read on the far side of a **kernel-completion
+boundary**, and kernel completion is itself a system-scope release:
+
+- `host_commit[0]`/`[1]` (the mapped commit mirror) are read by the
+  `cudaLaunchHostFunc` completion callback — the unmapped path issues a D2H
+  copy at exactly the same point, which is the proof that no reader is
+  intra-kernel — and by `settle_readiness` after a `cudaStreamSynchronize`.
+- The ring words are read by the guest, which that same callback wakes, and by
+  a later `k_pull_validate_host_channels_batch` on the same stream.
+- The one edge the protocol actually needs — **payload before ring tail** — is
+  supplied by `k_scatter_host_publish_copies` being a **prior kernel**, which
+  `channels.hpp` already documented.
+
+Relaxed system-scope atomics keep atomicity (no torn 64-bit word reaches the
+host, unlike plain stores) and give up only ordering that nothing observes.
+For the same reason `k_scatter_host_publish_copies`'s trailing
+`__threadfence_system()` went too — its own comment already called it
+belt-and-braces over the launch boundary, and it was ~100% of that kernel.
+
+### Result
+
+Per decode step, `nsys --cuda-graph-trace=node`, same workload:
+
+| kernel | before | after | |
+|---|---|---|---|
+| `k_settle_host_channels_batch` | 133.3 us | **37.0 us** | 3.6x |
+| `k_scatter_host_publish_copies` | 35.2 us | **3.5 us** | 10.1x |
+| `k_pull_validate_host_channels_batch` | 28.7 us | 30.4 us | untouched |
+
+The host-channel pipeline drops from **0.86% to 0.33% of pie's GPU time**.
+
+### ⚠ NO THROUGHPUT CLAIM IS MADE — A DIRECT A/B CONFIRMS IT IS UNDETECTABLE
+
+The sharpest possible test was run: **pie(before) vs pie(after)**, same box,
+same session, two prebuilt `_engine.so` binaries hot-swapped between runs so
+there is no rebuild gap, 8 pairs with alternating within-pair order.
+
+| pair | before | after | delta |
+|---|---|---|---|
+| 1 | 31129.3 | 32412.1 | +4.12% |
+| 2 | 26683.8 | 31799.5 | +19.17% |
+| 3 | 30583.8 | 29146.9 | -4.70% |
+| 4 | 31644.7 | 31500.9 | -0.45% |
+| 5 | 31667.1 | 31543.5 | -0.39% |
+| 6 | 31515.8 | 32272.8 | +2.40% |
+| 7 | 30558.3 | 31277.3 | +2.35% |
+| 8 | 31200.2 | 31032.7 | -0.54% |
+
+**after wins 4 of 8 — a coin flip.** Excluding pair 2 (a collapsed `before` run
+at 26684, the load artefact this box produces every few runs) the paired
+log-ratio is **+0.36% +/- 1.09% (SE), t = 0.33**. The point estimate brackets
+the +0.53% predicted from the GPU-time saving, and that is the most that can
+be said: **the confidence interval is 3x the effect, so this neither confirms
+nor refutes it.**
+
+A pie-vs-vLLM ABBA alongside it read 0.983, with pie's own spread at 3.3%
+against vLLM's 0.7% — all the variance is pie's host-CPU sensitivity, not the
+change.
+
+Contrast §20.34's calibrator: ~1.4% effect, 8 of 8 pairs in one direction.
+**At loadavg 15-28 this box resolves ~1.5%, not 0.5%.** Sub-1% GPU-time work
+cannot be validated end-to-end here at all, so changes of this size must be
+argued from deterministic instrument counts rather than tok/s — which is what
+this section does. The wall-clock effect remains owed a quiet-box
+(loadavg < 8) run.
+
+### Left on the table
+
+`k_pull_validate_host_channels_batch` (30 us/step) uses `load_system_acquire`
+per word. It was NOT relaxed: unlike the settlement stores, a relaxed load
+there would drop the "tail > head implies the payload at head is valid" edge
+that later kernels in the launch depend on, and the reasoning is subtler than
+the ~0.08% at stake. Worth revisiting only with a proper argument.
+
+After this change pie's remaining pie-only GPU cost is ~0.33% (channels)
+plus a PTIR kernel that is at the memory roof. **There is no longer a
+programmability tax large enough to explain the vLLM gap** — which relocates
+the question back to the shared attention/GEMM path.

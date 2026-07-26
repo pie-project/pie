@@ -265,7 +265,8 @@ void gemma3n_forward_paged(
     int R,
     bool is_pure_decode,
     const std::uint8_t* custom_mask_d,
-    const std::int32_t* custom_mask_indptr_d)
+    const std::int32_t* custom_mask_indptr_d,
+    const StageHooks* hooks)
 {
     // TP-local dims. tp_size == 1 keeps single-GPU semantics. AltUp /
     // Laurel / activation-sparsity / PLE work on the full [N, H] residual
@@ -538,6 +539,7 @@ void gemma3n_forward_paged(
         // observer scoring it against the cached keys -- which are stored
         // post-rope -- compares in the same space.
         invoke_stage_hook(
+            hooks,
             StageHookPoint::OnAttnProj, ws.q.data(),
             static_cast<std::uint32_t>(N),
             static_cast<std::uint32_t>(Hq),
@@ -575,6 +577,7 @@ void gemma3n_forward_paged(
                 /*logits_soft_cap=*/0.f, gemma3n_sm_scale);
         }
         invoke_stage_hook(
+            hooks,
             StageHookPoint::OnAttn, ws.q.data(),
             static_cast<std::uint32_t>(N),
             static_cast<std::uint32_t>(Hq),

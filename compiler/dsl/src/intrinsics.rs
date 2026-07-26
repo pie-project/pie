@@ -226,4 +226,37 @@ pub mod kernel {
         );
         record_sink(String::from("attn_page_mask"), span, SinkScope::Attention);
     }
+
+    /// `lora(a, b, sites)` — a pass-wide configuration sink: the whole forward
+    /// applies the low-rank delta `W'x = Wx + B(Ax)` at the declared
+    /// projection sites. Returns nothing; legal only in the pass prologue
+    /// (T11 — a pass-wide sink must precede everything that consumes it).
+    ///
+    /// Three invariants carried from the design (`tensor-ir-log.md` §6.5):
+    ///
+    /// * `a` is `[num_layers, R, d]` and `b` is `[num_layers, d_out, R]`, with
+    ///   the rank `R` trace-known — a different rank is a different traced
+    ///   program (a different bucket). The weight *contents* are data (fed
+    ///   through channels or computed in-graph), so swapping an adapter is
+    ///   re-seeding, never re-tracing.
+    /// * The LoRA scale `alpha/R` is folded into `b`'s contents — per-adapter
+    ///   data, so there is no scalar argument here.
+    /// * `sites` is a trace-known constant over the model's site vocabulary
+    ///   (q/k/v/o/up/..): placement is structure, weights are contents.
+    #[track_caller]
+    pub fn lora(a: impl AsTensor, b: impl AsTensor, sites: impl AsTensor) {
+        let span = Span::here();
+        let (a, _) = a.to_arg().materialize();
+        let (b, _) = b.to_arg().materialize();
+        let (sites, _) = sites.to_arg().materialize();
+        let name = intern_name("lora");
+        emit(
+            Op::SinkCall {
+                name,
+                args: vec![a, b, sites],
+            },
+            &[],
+        );
+        record_sink(String::from("lora"), span, SinkScope::PassWide);
+    }
 }

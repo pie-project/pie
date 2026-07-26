@@ -481,7 +481,8 @@ void linear_attn_layer_body(
     const std::uint32_t* rs_buffer_slot_ids_h = nullptr,
     const std::uint32_t* rs_buffer_slot_indptr_h = nullptr,
     bool rs_buffer_write = false,
-    bool rs_buffer_fold = false)
+    bool rs_buffer_fold = false,
+    const StageHooks* hooks = nullptr)
 {
     // TP-local dims for linear-attention. tp_size == 1 keeps everything
     // unsharded. The K/V head counts must divide tp_size (checked at
@@ -901,6 +902,7 @@ void linear_attn_layer_body(
         }
     });
     invoke_stage_hook(
+        hooks,
         StageHookPoint::OnAttnProj, la.q_pre.data(),
         static_cast<std::uint32_t>(N),
         static_cast<std::uint32_t>(K_h * K_d),
@@ -1198,6 +1200,7 @@ void linear_attn_layer_body(
         }
     });
     invoke_stage_hook(
+        hooks,
         StageHookPoint::OnAttn, la.q_pre.data(),
         static_cast<std::uint32_t>(N),
         static_cast<std::uint32_t>(K_h * K_d),
@@ -1271,7 +1274,8 @@ void full_attn_layer_body(
     const std::uint8_t* row_valid_d,
     bool has_write_desc,
     ops::CublasHandle& cublas,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    const StageHooks* hooks)
 {
     const int T  = std::max(1, fwd_cfg.tp_size);
     const int H  = cfg.hidden_size;
@@ -1333,6 +1337,7 @@ void full_attn_layer_body(
     // observer scoring it against the cached keys -- which are stored
     // post-rope -- compares in the same space.
     invoke_stage_hook(
+        hooks,
         StageHookPoint::OnAttnProj, ws.q.data(),
         static_cast<std::uint32_t>(N),
         static_cast<std::uint32_t>(Hq),
@@ -1391,6 +1396,7 @@ void full_attn_layer_body(
     kernels::launch_sigmoid_gate_inplace_bf16(
         ws.attn_out.data(), la.fa_gate.data(), N * Hq, stream);
     invoke_stage_hook(
+        hooks,
         StageHookPoint::OnAttn, ws.q.data(),
         static_cast<std::uint32_t>(N),
         static_cast<std::uint32_t>(Hq),
@@ -1536,7 +1542,8 @@ void qwen3_5_forward_paged(
     const std::uint32_t* rs_buffer_slot_indptr_h,
     const std::int32_t* rs_fold_lens,
     bool rs_buffer_write,
-    bool rs_buffer_fold)
+    bool rs_buffer_fold,
+    const StageHooks* hooks)
 {
     const int H  = cfg.hidden_size;
     const int V  = cfg.vocab_size;
@@ -1656,7 +1663,7 @@ void qwen3_5_forward_paged(
                 slot_ids_h, slot_ids_d, qo_indptr_h, qo_indptr,
                 cublas, stream, &profile, /*commit_len=*/commit_lens,
                 rs_buffer_slot_ids_h, rs_buffer_slot_indptr_h,
-                /*rs_buffer_write=*/false, rs_buffer_fold);
+                /*rs_buffer_write=*/false, rs_buffer_fold, hooks);
             ++linear_idx;
             continue;
         }
@@ -1681,7 +1688,7 @@ void qwen3_5_forward_paged(
                     slot_ids_h, slot_ids_d, qo_indptr_h, qo_indptr,
                     cublas, stream, &profile, /*commit_len=*/nullptr,
                     rs_buffer_slot_ids_h, rs_buffer_slot_indptr_h,
-                    rs_buffer_write, /*rs_buffer_fold=*/false);
+                    rs_buffer_write, /*rs_buffer_fold=*/false, hooks);
             });
         } else {
             ++profile.full_layers;
@@ -1694,7 +1701,7 @@ void qwen3_5_forward_paged(
                     positions, qo_indptr, kv_page_indices, kv_page_indptr,
                     kv_last_page_lens, qo_indptr_h, kv_page_indptr_h,
                     w_page_d, w_off_d, row_valid_d, has_write_desc,
-                    cublas, stream);
+                    cublas, stream, hooks);
             });
         }
 

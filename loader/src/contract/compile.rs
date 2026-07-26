@@ -582,9 +582,7 @@ impl Builder<'_> {
                 let inner = self.build(src)?;
                 let axis = usize::from(axis.0);
                 let mut shape = self.nodes[inner].shape.clone();
-                let operand_extent = *shape.get(axis).ok_or_else(|| {
-                    Error::Internal("Slice axis escaped the type checker".to_string())
-                })?;
+                let operand_extent = axis_extent(&shape, axis, "Slice")?;
                 shape[axis] = *len;
                 let whole = *start == 0 && *len == operand_extent;
                 self.push(
@@ -607,6 +605,7 @@ impl Builder<'_> {
                 let inner = self.build(src)?;
                 let axis = usize::from(axis.0);
                 let mut shape = self.nodes[inner].shape.clone();
+                axis_extent(&shape, axis, "Stride")?;
                 shape[axis] = *len;
                 self.push(
                     Kind::Stride {
@@ -622,6 +621,7 @@ impl Builder<'_> {
                 let inner = self.build(src)?;
                 let axis = usize::from(axis.0);
                 let mut shape = self.nodes[inner].shape.clone();
+                axis_extent(&shape, axis, "Gather")?;
                 shape[axis] = indices.len() as i64;
                 self.push(
                     Kind::Gather {
@@ -643,7 +643,7 @@ impl Builder<'_> {
                         shape = self.nodes[inner].shape.clone();
                     }
                     placed.push((offset, inner));
-                    offset += self.nodes[inner].shape[axis];
+                    offset += axis_extent(&self.nodes[inner].shape, axis, "Concat")?;
                 }
                 if placed.is_empty() {
                     return Err(Error::Internal(
@@ -680,15 +680,16 @@ impl Builder<'_> {
                 }
             },
             Expr::Fill { ty, .. } => self.push(Kind::Fill, ty.shape.clone()),
-            Expr::Repack { .. } => Err(Error::Contract(
-                "Repack needs a kernel and cannot be lowered to byte runs".to_string(),
-            )),
-            Expr::Cast { .. } => Err(Error::Contract(
-                "Cast needs a kernel and cannot be lowered to byte runs".to_string(),
-            )),
-            Expr::Scale { .. } => Err(Error::Contract(
-                "Scale needs a kernel and cannot be lowered to byte runs".to_string(),
-            )),
+            // The kernel column of the algebra, as a set. Each of these costs
+            // something no arrangement of byte runs can express, so lowering
+            // them is `plan::build`'s job and reaching here means a kernel node
+            // was nested where only the affine fragment fits.
+            Expr::Repack { .. } | Expr::Cast { .. } | Expr::Scale { .. } => {
+                Err(Error::Contract(format!(
+                    "{} needs a kernel and cannot be lowered to byte runs",
+                    expr.node_name()
+                )))
+            }
             Expr::Shard { .. } => Err(Error::Internal(
                 "Shard reached lowering; Resolver::specialize rewrites it into \
                  this rank's Slice, and byte offsets cannot be symbolic"
@@ -840,6 +841,21 @@ impl Builder<'_> {
             Kind::Fill => Ok((None, remaining)),
         }
     }
+}
+
+/// The operand's extent along `axis`, or an internal error if there is none.
+///
+/// The type checker bounds-checks every axis before lowering ever runs, so a
+/// failure here means the two disagree — a compiler bug. It is reported rather
+/// than panicked because this crate is reached across an FFI boundary, where an
+/// unwind is not recoverable.
+fn axis_extent(shape: &[i64], axis: usize, node: &str) -> Result<i64, Error> {
+    shape.get(axis).copied().ok_or_else(|| {
+        Error::Internal(format!(
+            "{node} axis {axis} escaped the type checker (operand rank {})",
+            shape.len()
+        ))
+    })
 }
 
 fn adjacent(last: &Run, source: RunSource, flat: i64) -> bool {

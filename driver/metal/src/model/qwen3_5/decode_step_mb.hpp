@@ -95,6 +95,8 @@ void alias_decode_conv_state_out(RawMetalContext& ctx, const BoundDecode& b,
 // only way left to decide a change here.  `ab_arm()` is read wherever the two
 // arms differ; `ab_enabled()` says whether to alternate at all.
 bool ab_enabled();
+// Whether arm B of the A/B also serializes every dispatch (PIE_METAL_AB_BARRIERS).
+bool ab_all_barriers();
 bool ab_arm();
 void ab_set_arm(bool b);
 

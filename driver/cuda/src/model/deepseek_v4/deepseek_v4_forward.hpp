@@ -13,6 +13,8 @@
 
 namespace pie_cuda_driver::model {
 
+struct StageHooks;
+
 struct DsV4ForwardCfg {
     int tp_size = 1;
     int tp_rank = 0;
@@ -154,6 +156,9 @@ void dsv4_forward_paged(
     bool is_pure_decode,
     const std::uint8_t* row_valid_d,
     const std::int32_t* logit_row_indices_d = nullptr,
-    int num_logit_rows = 0);
+    int num_logit_rows = 0,
+    // The fire's stage hooks (`ForwardInputs::stage_hooks`). Null = no
+    // program attached.
+    const StageHooks* hooks = nullptr);
 
 }  // namespace pie_cuda_driver::model

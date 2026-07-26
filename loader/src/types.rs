@@ -151,12 +151,16 @@ impl QuantScheme {
 /// needs -- how many rows, how many columns, which rows -- is either the
 /// operand's type or the declared output's, so the plan builder derives it and
 /// a contract never repeats it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// Every value here names a kernel, and there is deliberately no `None` and no
+/// [`Default`]: a repack with no layout is not a repack, so the algebra should
+/// not be able to hold one. The discriminants start at 1 for the same reason
+/// the enum is total — zero is what an uninitialized FFI field carries, so it
+/// must decode as an error rather than as the first kernel in the list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RepackLayout {
-    #[default]
-    None,
-    MarlinMxfp4Weight,
-    MarlinMxfp4Scale,
+    MarlinMxfp4Weight = 1,
+    MarlinMxfp4Scale = 2,
 }
 
 /// A repack as the *executor* needs it: the layout plus the geometry.
@@ -173,7 +177,7 @@ pub enum RepackLayout {
 /// `target_rows`/`target_cols` may exceed the source's: a layout with a tile
 /// quantum declares the padded shape and the kernel zero-fills the tail, which
 /// is the one geometric fact that is the kernel's and not the algebra's.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RepackSpec {
     pub layout: RepackLayout,
     pub batch: u32,

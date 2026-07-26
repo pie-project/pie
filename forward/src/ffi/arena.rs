@@ -1,0 +1,290 @@
+//! The arena that keeps a [`PieForwardPlan`]'s slices alive.
+//!
+//! Every pointer the driver reads points into buffers owned here, on the
+//! model of `loader/src/ffi/arena.rs`: build once, freeze, leak into the
+//! plan's `owner`, reclaim in `pie_forward_release`. Between those two
+//! points nothing mutates, so handing the plan to another thread is sound.
+//!
+//! One structural difference from the loader: the plan *header* is not boxed
+//! here. `pie_forward_trace_llama_like` writes it into caller-owned storage
+//! (`out_plan: *mut PieForwardPlan`), so the only Rust-owned allocation is
+//! the arena itself, and [`release`] resets the caller's header to
+//! [`PieForwardPlan::default`] after freeing it — which is what makes a
+//! double release a no-op instead of the double-free it would be in the
+//! loader's boxed-header scheme.
+
+use std::collections::HashMap;
+
+use crate::trace::{ForwardPlan, Op, OpKind, ValueInfo};
+
+use super::types::*;
+
+/// Owns the backing storage for one plan.
+///
+/// The vectors are frozen once [`build`] returns: the published slices point
+/// into their heap buffers, which moving or boxing the arena does not
+/// disturb (the same property `loader/src/ffi/arena.rs` relies on).
+#[derive(Default)]
+pub struct PlanArena {
+    values: Vec<PieForwardValue>,
+    ops: Vec<PieForwardOp>,
+    value_ids: Vec<u32>,
+    names: Vec<PieForwardName>,
+    name_bytes: Vec<u8>,
+}
+
+/// Interns strings into the arena's name table during a build.
+///
+/// Separate from [`PlanArena`] because the map is scaffolding: it exists to
+/// dedupe (`embed` is named by both `Embed` and a tied `LmHead`) and is
+/// dropped when the build finishes, so it must not ride along in the frozen
+/// arena the plan keeps alive.
+#[derive(Default)]
+struct Interner {
+    index: HashMap<String, u32>,
+}
+
+impl Interner {
+    fn intern(&mut self, arena: &mut PlanArena, name: &str) -> u32 {
+        if let Some(&id) = self.index.get(name) {
+            return id;
+        }
+        let offset = arena.name_bytes.len() as u32;
+        arena.name_bytes.extend_from_slice(name.as_bytes());
+        arena.names.push(PieForwardName {
+            offset,
+            len: name.len() as u32,
+        });
+        let id = (arena.names.len() - 1) as u32;
+        self.index.insert(name.to_string(), id);
+        id
+    }
+}
+
+/// Flatten one [`ValueInfo`] into the inline-dims POD form.
+///
+/// Panics if a shape outgrows [`PIE_FORWARD_MAX_DIMS`]. That is a tracer
+/// bug, not caller input — the tracer emits rank-2 shapes today — and the
+/// entry rules turn the panic into an abort rather than a status
+/// (`loader/src/ffi/entry.rs:1-19`).
+fn flatten_value(info: &ValueInfo) -> PieForwardValue {
+    assert!(
+        info.shape.0.len() <= PIE_FORWARD_MAX_DIMS,
+        "traced value of rank {} exceeds PIE_FORWARD_MAX_DIMS ({PIE_FORWARD_MAX_DIMS})",
+        info.shape.0.len()
+    );
+    let mut dims = [PieForwardDim::default(); PIE_FORWARD_MAX_DIMS];
+    for (slot, dim) in dims.iter_mut().zip(&info.shape.0) {
+        *slot = (*dim).into();
+    }
+    PieForwardValue {
+        rank: info.shape.0.len() as u32,
+        dims,
+        dtype: info.dtype.into(),
+    }
+}
+
+/// Flatten one [`OpKind`] into (kind tag, weight name, param0, param1).
+///
+/// The mapping is the table documented on [`PieForwardOp`]; keeping the two
+/// adjacent to one match arm each is what keeps the table honest.
+fn flatten_kind(
+    arena: &mut PlanArena,
+    interner: &mut Interner,
+    kind: &OpKind,
+) -> (PieForwardOpKind, u32, u32, u32) {
+    let mut name = |arena: &mut PlanArena, weight: &str| interner.intern(arena, weight);
+    match kind {
+        OpKind::Embed { weight } => (PieForwardOpKind::Embed, name(arena, weight), 0, 0),
+        OpKind::Matmul { weight, beta_one } => (
+            PieForwardOpKind::Matmul,
+            name(arena, weight),
+            u32::from(*beta_one),
+            0,
+        ),
+        OpKind::Rmsnorm { weight, variant } => (
+            PieForwardOpKind::Rmsnorm,
+            name(arena, weight),
+            PieForwardNormVariant::from(*variant) as u32,
+            0,
+        ),
+        OpKind::RmsnormPerHead { weight, head_dim } => (
+            PieForwardOpKind::RmsnormPerHead,
+            name(arena, weight),
+            *head_dim,
+            0,
+        ),
+        OpKind::SplitQkv { q_width, kv_width } => (
+            PieForwardOpKind::SplitQkv,
+            PIE_FORWARD_NO_NAME,
+            *q_width,
+            *kv_width,
+        ),
+        OpKind::Rope { kind } => (
+            PieForwardOpKind::Rope,
+            PIE_FORWARD_NO_NAME,
+            PieForwardRopeKind::from(*kind) as u32,
+            0,
+        ),
+        OpKind::KvAppend { layer } => {
+            (PieForwardOpKind::KvAppend, PIE_FORWARD_NO_NAME, *layer, 0)
+        }
+        OpKind::Attention { layer } => {
+            (PieForwardOpKind::Attention, PIE_FORWARD_NO_NAME, *layer, 0)
+        }
+        OpKind::Swiglu { inter } => (PieForwardOpKind::Swiglu, PIE_FORWARD_NO_NAME, *inter, 0),
+        OpKind::LmHead { weight } => (PieForwardOpKind::LmHead, name(arena, weight), 0, 0),
+    }
+}
+
+/// Append an op's operand ids to the flat array and describe the run.
+fn store_ids(arena: &mut PlanArena, ids: &[u32]) -> PieForwardIdRange {
+    let offset = arena.value_ids.len() as u32;
+    arena.value_ids.extend_from_slice(ids);
+    PieForwardIdRange {
+        offset,
+        len: ids.len() as u32,
+    }
+}
+
+fn flatten_op(arena: &mut PlanArena, interner: &mut Interner, op: &Op) -> PieForwardOp {
+    let (kind, weight_name, param0, param1) = flatten_kind(arena, interner, &op.kind);
+    let inputs = store_ids(arena, &op.inputs);
+    let outputs = store_ids(arena, &op.outputs);
+    PieForwardOp {
+        kind,
+        layer: op.layer.map_or(PIE_FORWARD_NO_LAYER, |l| l as i32),
+        weight_name,
+        param0,
+        param1,
+        inputs,
+        outputs,
+    }
+}
+
+/// Convert a traced [`ForwardPlan`] into the POD form the driver walks.
+///
+/// The returned header's slices point into an arena leaked behind `owner`;
+/// the caller (or the C caller holding the header) must hand it to
+/// [`release`].
+pub fn build(plan: &ForwardPlan) -> PieForwardPlan {
+    let mut arena = PlanArena::default();
+    let mut interner = Interner::default();
+
+    let family = interner.intern(&mut arena, &plan.family);
+
+    arena.values.reserve(plan.values.len());
+    for value in &plan.values {
+        let flat = flatten_value(value);
+        arena.values.push(flat);
+    }
+
+    arena.ops.reserve(plan.ops.len());
+    for op in &plan.ops {
+        let flat = flatten_op(&mut arena, &mut interner, op);
+        arena.ops.push(flat);
+    }
+
+    let values = PieForwardValueSlice {
+        ptr: arena.values.as_ptr(),
+        len: arena.values.len(),
+    };
+    let ops = PieForwardOpSlice {
+        ptr: arena.ops.as_ptr(),
+        len: arena.ops.len(),
+    };
+    let value_ids = PieForwardU32Slice {
+        ptr: arena.value_ids.as_ptr(),
+        len: arena.value_ids.len(),
+    };
+    let names = PieForwardNameSlice {
+        ptr: arena.names.as_ptr(),
+        len: arena.names.len(),
+    };
+    let name_bytes = PieForwardBytes {
+        ptr: arena.name_bytes.as_ptr(),
+        len: arena.name_bytes.len(),
+    };
+    let owner = Box::into_raw(Box::new(arena)).cast::<std::ffi::c_void>();
+    PieForwardPlan {
+        family,
+        values,
+        ops,
+        value_ids,
+        names,
+        name_bytes,
+        compiler_version: super::compiler_version(),
+        owner,
+    }
+}
+
+/// Reclaim the arena behind a plan header produced by [`build`] and reset
+/// the header to empty.
+///
+/// Idempotent: a released (or never-filled) header has a null `owner` and is
+/// left untouched. The loader cannot offer this — its header is itself a Rust
+/// allocation — but here the header belongs to the caller, so resetting it is
+/// both possible and the honest thing to leave behind.
+///
+/// # Safety
+///
+/// `plan` is null, or points at a writable header whose `owner` is null or
+/// was produced by [`build`] and not yet released.
+pub unsafe fn release(plan: *mut PieForwardPlan) {
+    if plan.is_null() {
+        return;
+    }
+    let plan = unsafe { &mut *plan };
+    if !plan.owner.is_null() {
+        drop(unsafe { Box::from_raw(plan.owner.cast::<PlanArena>()) });
+    }
+    *plan = PieForwardPlan::default();
+}
+
+/// The arena is immutable once published, and every pointer it hands out is
+/// into storage it exclusively owns, so a plan can be read from any thread
+/// and freed from a thread other than the one that built it — the same
+/// guarantee (and rationale) as `loader/src/ffi/arena.rs:466-474`.
+unsafe impl Send for PlanArena {}
+unsafe impl Sync for PlanArena {}
+unsafe impl Send for PieForwardPlan {}
+unsafe impl Sync for PieForwardPlan {}
+
+/// Read a plan's contents back as safe Rust slices, for tests that assert
+/// the POD form reproduces the trace it was built from.
+#[cfg(test)]
+pub(crate) mod view {
+    use super::*;
+
+    pub fn ops(plan: &PieForwardPlan) -> &[PieForwardOp] {
+        if plan.ops.ptr.is_null() {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(plan.ops.ptr, plan.ops.len) }
+    }
+
+    pub fn values(plan: &PieForwardPlan) -> &[PieForwardValue] {
+        if plan.values.ptr.is_null() {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(plan.values.ptr, plan.values.len) }
+    }
+
+    pub fn ids(plan: &PieForwardPlan, range: PieForwardIdRange) -> &[u32] {
+        if plan.value_ids.ptr.is_null() {
+            return &[];
+        }
+        let all = unsafe { std::slice::from_raw_parts(plan.value_ids.ptr, plan.value_ids.len) };
+        &all[range.offset as usize..(range.offset + range.len) as usize]
+    }
+
+    pub fn name(plan: &PieForwardPlan, index: u32) -> &str {
+        assert_ne!(index, PIE_FORWARD_NO_NAME, "op names no weight");
+        let names = unsafe { std::slice::from_raw_parts(plan.names.ptr, plan.names.len) };
+        let entry = names[index as usize];
+        let bytes =
+            unsafe { std::slice::from_raw_parts(plan.name_bytes.ptr, plan.name_bytes.len) };
+        std::str::from_utf8(&bytes[entry.offset as usize..(entry.offset + entry.len) as usize])
+            .expect("name table holds UTF-8")
+    }
+}

@@ -13,6 +13,8 @@
 
 #include "scratch.hpp"
 
+#include "scratch_color.hpp"
+
 #include <algorithm>
 
 namespace pie::metal {
@@ -238,59 +240,24 @@ ScratchSchedule build_scratch_schedule(const std::vector<Dispatch>& dag,
     // the approximation would now be wrong.
     const std::vector<int> run_ends = concurrent_run_ends(dag);
 
-    // Live intervals per value.
-    int nval = next_value;
-    std::vector<int> def(nval, -1), last(nval, -1);
+    // Colouring is family-agnostic and lives in `scratch_color.hpp`, so gemma4
+    // does not arrive with a second copy of it.
+    std::vector<pie::metal::scratch::Use> shared_uses;
+    shared_uses.reserve(uses.size());
     for (const Use& u : uses) {
-        if (def[u.value] < 0 || u.ordinal < def[u.value]) def[u.value] = u.ordinal;
-        if (u.ordinal > last[u.value]) last[u.value] = u.ordinal;
+        shared_uses.push_back({u.ordinal, u.bind_index, u.value, u.write});
     }
-    for (int v = 0; v < nval; ++v)
-        if (last[v] >= 0) last[v] = std::max(last[v], run_ends[last[v]]);
-
-    // Linear-scan coloring: values sorted by def; free a buffer once its holder's last
-    // use has passed. Inclusive overlap => same-dispatch WAR + concurrent ‖-pair outputs
-    // always interfere (distinct buffers), which is the hazard guarantee.
-    std::vector<int> order(nval);
-    for (int i = 0; i < nval; ++i) order[i] = i;
-    std::sort(order.begin(), order.end(), [&](int a, int b) { return def[a] < def[b]; });
-
-    std::vector<int> color(nval, -1);
-    std::vector<int> buf_free_at;  // buf_free_at[b] = ordinal after which buffer b is free
-    if (no_recycle) {
-        // One buffer per value: zero reuse. Preserves every intermediate for dumping and
-        // isolates scratch-aliasing races from in-kernel races.
-        for (int v = 0; v < nval; ++v) { color[v] = v; buf_free_at.push_back(last[v]); }
-    } else {
-        for (int v : order) {
-            int chosen = -1;
-            for (size_t b = 0; b < buf_free_at.size(); ++b) {
-                if (buf_free_at[b] < def[v]) { chosen = (int)b; break; }  // strictly before -> no overlap
-            }
-            if (chosen < 0) { chosen = (int)buf_free_at.size(); buf_free_at.push_back(-1); }
-            color[v] = chosen;
-            buf_free_at[chosen] = last[v];
-        }
-    }
+    const auto coloring = pie::metal::scratch::color_live_ranges(shared_uses, run_ends,
+                                                                next_value, no_recycle);
+    const std::vector<int>& color = coloring.color;
 
     ScratchSchedule sched;
     sched.per_dispatch.resize(dag.size());
-    sched.colors_used = (int)buf_free_at.size();
+    sched.colors_used = coloring.colors_used;
     for (const Use& u : uses) {
         sched.per_dispatch[u.ordinal].binds.push_back({u.bind_index, color[u.value]});
     }
-
-    // Self-check: no two values with overlapping (concurrency-extended) live intervals may
-    // share a buffer. Proves the schedule is WAR/WAW hazard-free by construction.
-    sched.hazard_free = true;
-    for (int a = 0; a < nval && sched.hazard_free; ++a) {
-        if (def[a] < 0) continue;
-        for (int b = a + 1; b < nval; ++b) {
-            if (def[b] < 0) continue;
-            bool overlap = std::max(def[a], def[b]) <= std::min(last[a], last[b]);
-            if (overlap && color[a] == color[b]) { sched.hazard_free = false; break; }
-        }
-    }
+    sched.hazard_free = coloring.hazard_free;
 
     (void)g;
     return sched;

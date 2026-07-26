@@ -1,0 +1,112 @@
+// Gemma 4 PSO compile gate — REAL Metal shader compilation on-device.
+//
+// Six `.metal` files shipped with this family's bring-up and had no PSO entry,
+// no `bind::` enum and no host-side params mirror: they compiled in the abstract
+// and nothing could reach them. `build_gemma4_psos` is the other half, and this
+// proves every entry point it names actually exists and builds against the real
+// sources — including both head widths of the sliding-window attention, which
+// this family needs because its head_dim is per attention type (256 sliding,
+// 512 full).
+//
+// No checkpoint: just `kernels/*.metal` on disk and a Metal device.
+
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+
+#include "model/gemma4/decode_step.hpp"
+#include "model/gemma4/encode.hpp"
+#include "model/gemma4/geometry.hpp"
+#include "model/gemma4/kernels.hpp"
+#include "decode_psos.hpp"
+#include "mtl4_context.hpp"
+
+using pie::metal::RawMetalContext;
+using pie::metal::gemma4::build_gemma4_psos;
+using pie::metal::gemma4::Gemma4Psos;
+
+namespace {
+
+int g_failures = 0;
+
+void expect(bool ok, const std::string& what) {
+    std::printf("  %s  %s\n", ok ? "PASS" : "FAIL", what.c_str());
+    if (!ok) ++g_failures;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    std::string kernels_dir = PIE_METAL_KERNELS_DIR_FOR_TEST;
+    if (argc > 1) kernels_dir = argv[1];
+    std::printf("gemma4 kernel PSOs (%s)\n", kernels_dir.c_str());
+
+    std::string error;
+    auto ctx = RawMetalContext::create(16u << 20);
+    if (!ctx) {
+        std::printf("  FAIL  RawMetalContext::create\n");
+        return 1;
+    }
+    expect(true, "RawMetalContext::create succeeds");
+
+    Gemma4Psos psos;
+    const bool built = build_gemma4_psos(*ctx, kernels_dir, psos, &error);
+    expect(built, "every gemma4 PSO compiles: " + (built ? std::string("ok") : error));
+    if (built) {
+        // Named individually so a regression says which kernel broke.
+        expect(psos.sdpa_swa_d256.valid(), "sdpa_vector_decode_swa d=256 (sliding layers)");
+        expect(psos.sdpa_swa_d512.valid(), "sdpa_vector_decode_swa d=512 (full layers)");
+        expect(psos.geglu_tanh.valid(), "geglu_tanh (gemma's FFN nonlinearity)");
+        expect(psos.logit_softcap.valid(), "logit_softcap (cap * tanh(x / cap))");
+        expect(psos.layer_scalar.valid(), "layer_scalar_mul (learned per-layer gain)");
+        expect(psos.ple_combine.valid(), "ple_combine (per-layer embeddings)");
+        expect(psos.vnorm.valid(), "vnorm_single_row (weightless V-norm)");
+        expect(psos.valid(), "the table reports itself complete");
+    }
+
+    // Every dispatch in the step has to resolve to a pipeline that exists and a
+    // grid the hardware will accept. `pso_max_threads` is 832 on an M1 Max, and
+    // exceeding it is NOT an error — it silently computes something else.
+    if (built) {
+        std::printf("[whole step resolves]\n");
+        pie::metal::DecodeStepPsos base;
+        std::string base_err;
+        const bool base_ok = pie::metal::load_decode_psos(*ctx, kernels_dir, base,
+                                                          /*with_argmax=*/true, &base_err);
+        expect(base_ok, "the shared decode PSOs compile: " + (base_ok ? std::string("ok")
+                                                                     : base_err));
+        if (base_ok) {
+            const pie::metal::gemma4::Gemma4Geometry g;
+            const auto dag = pie::metal::gemma4::build_gemma4_dag(g);
+            int missing = 0, oversized = 0, empty_grid = 0;
+            std::uint32_t worst_cap = 0;
+            for (const auto& d : dag) {
+                const auto pso = pie::metal::gemma4::pso_for(d, base, psos);
+                if (!pso.valid()) {
+                    ++missing;
+                    continue;
+                }
+                pie::metal::Grid grid;
+                pie::metal::Threadgroup tg;
+                pie::metal::gemma4::launch_shape(d, g, grid, tg);
+                const std::uint32_t threads = tg.x * tg.y * tg.z;
+                // Per PIPELINE, not per device: the cap depends on the kernel's
+                // register use, and exceeding it is not an error — it silently
+                // computes something else.
+                const std::uint32_t cap = ctx->pso_max_threads(pso);
+                if (cap > worst_cap) worst_cap = cap;
+                if (threads == 0 || threads > cap) ++oversized;
+                if (grid.x == 0 || grid.y == 0 || grid.z == 0) ++empty_grid;
+            }
+            std::printf("  (%zu dispatches, widest pipeline allows %u threads)\n", dag.size(),
+                        worst_cap);
+            expect(missing == 0, "every dispatch resolves to a compiled pipeline");
+            expect(oversized == 0, "no threadgroup exceeds what this device allows");
+            expect(empty_grid == 0, "no dispatch has an empty grid");
+        }
+    }
+
+    std::printf("\n==== gemma4_pso_test: %s ====\n", g_failures == 0 ? "all passed" : "FAILURES");
+    return g_failures == 0 ? 0 : 1;
+}

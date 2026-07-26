@@ -26,6 +26,9 @@
 
 namespace pie_cuda_driver::model {
 
+struct StageHooks;
+struct LoraTable;
+
 enum class RopeKind {
     Standard,      // pure theta-based, used by Qwen 2/3, Phi-3, Mistral
     YaRN,          // Llama-3 smoothed-interpolation YaRN
@@ -168,6 +171,13 @@ void prepare_llama_like_decode_plan(
 std::uint32_t llama_like_decode_graph_layout(
     const LlamaLikePlanState& state);
 
+// PIE_CUDA_DECODE_FUSED_POST kill switch for the fused decode QKV
+// postprocess (default on; the A/B rationale is at the definition).
+// Exposed so the declared executor's peephole (declared_forward.cpp) and
+// the hand-written `fused_decode_qkv_post` branch read ONE gate — the two
+// paths must fuse, or not, together.
+bool decode_fused_post_enabled();
+
 // Wire-driven forward body, plus a `cfg` knob block and an
 // externally-owned `LlamaLikePlanState`. The body never plans — it only
 // reads `state.decode_plan` (already populated by the prepare hook) which
@@ -205,7 +215,18 @@ void llama_like_forward_paged(
     bool has_write_desc = false,
     int runtime_window_left = -2,
     // Qwen3-VL multimodal side-inputs (nullptr = plain text forward).
-    const LlamaLikeVisionInputs* vision = nullptr);
+    const LlamaLikeVisionInputs* vision = nullptr,
+    // The fire's stage hooks (`ForwardInputs::stage_hooks`, observation
+    // attached by `invoke_body`). Null = no program attached, and every
+    // hook-conditional path in the body then folds to its fast form.
+    const StageHooks* hooks = nullptr,
+    // The fire's resolved lora configuration (`ForwardInputs::lora`,
+    // "model/lora.hpp"). Null = no program in the launch carries the sink,
+    // and the body is exactly what it was (§5.1: the CORRECTION term
+    // vanishes with no adapters). Non-null: the body applies
+    // `x(W+BA)^T = xW^T + (xA^T)B^T` at each lane's declared sites, scoped
+    // to that lane's token rows.
+    const LoraTable* lora = nullptr);
 
 // Map HF's rope_scaling_kind enum onto the driver's RopeKind. Llama3-style
 // frequency scaling maps to YaRN; the "original_yarn" branch keeps

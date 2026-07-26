@@ -1425,7 +1425,8 @@ void gemma4_forward_paged(
     int num_logit_rows,
     const Gemma4VisionInputs* vision_in,
     const Gemma4AudioInputs* audio_in,
-    const PrecomputedEmbeddingInputs* precomputed_embeddings)
+    const PrecomputedEmbeddingInputs* precomputed_embeddings,
+    const StageHooks* hooks)
 {
     const int H        = cfg.hidden_size;
     const int L        = cfg.num_hidden_layers;
@@ -1700,7 +1701,7 @@ void gemma4_forward_paged(
                 ws.norm_x.data(), layer.qkv_proj_fused->data(),
                 ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
             const bool can_fuse_packed_qkv_post =
-                active_stage_hooks == nullptr &&
+                hooks == nullptr &&
                 qk_norm_enabled && !partial && !dbg_dumps_enabled() &&
                 kv_view.is_native_bf16() &&
                 (use_row_decode_path || use_decode_path);
@@ -1828,6 +1829,7 @@ void gemma4_forward_paged(
         // observer scoring it against the cached keys -- which are stored
         // post-rope -- compares in the same space.
         invoke_stage_hook(
+            hooks,
             StageHookPoint::OnAttnProj, ws.q.data(),
             static_cast<std::uint32_t>(N),
             static_cast<std::uint32_t>(Hq),
@@ -1935,6 +1937,7 @@ void gemma4_forward_paged(
                 }
             });
         invoke_stage_hook(
+            hooks,
             StageHookPoint::OnAttn, ws.q.data(),
             static_cast<std::uint32_t>(N),
             static_cast<std::uint32_t>(Hq),

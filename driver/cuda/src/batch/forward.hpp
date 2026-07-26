@@ -43,6 +43,7 @@ struct Qwen3Weights;
 struct Workspace;
 class IModel;
 struct StageHooks;
+struct LoraTable;
 }  // namespace model
 
 namespace ops {
@@ -203,6 +204,15 @@ struct ForwardFn {
         // Launch-scoped PTIR anatomical hooks. Null for ordinary forwards and
         // TP followers; direct staged launches install this only on rank 0.
         const model::StageHooks* stage_hooks = nullptr;
+
+        // Launch-scoped lora configuration ("model/lora.hpp"), resolved by
+        // the dispatch when the prologue executed at begin time: per lane,
+        // the device addresses of the adapter A/B channel cells and the SITES
+        // placement constant. Null when no program in the launch carries the
+        // `lora` sink. A body that consumes it applies the low-rank delta at
+        // its projection GEMMs; a body that cannot must not advertise
+        // `has_lora`, and the bind gate then refuses the program instead.
+        const model::LoraTable* lora = nullptr;
     };
 
     struct PrepareInputs {
@@ -571,6 +581,8 @@ struct ForwardDispatchInputs {
     int                  num_clips = 0;
     PrecomputedEmbeddingInputs precomputed_embeddings;
     const model::StageHooks* stage_hooks = nullptr;
+    // See `ForwardInputs::lora` — threaded verbatim to the body.
+    const model::LoraTable* lora = nullptr;
 };
 
 // Whether a dispatch with these properties replays/captures a forward CUDA
@@ -594,7 +606,12 @@ bool forward_graph_replay_eligible(
     int forward_R,
     int num_images,
     int num_clips,
-    bool has_stage_hooks);
+    bool has_stage_hooks,
+    // A fire carrying a resolved lora table must run the direct body: the
+    // correction GEMMs read per-launch channel-cell addresses (and the graph
+    // key carries no adapter identity), so a replayed capture would either
+    // drop the delta or bake a stale adapter in.
+    bool has_lora);
 
 // Run the per-fire forward body directly against `forward_fn.body`. See
 // `ForwardDispatchInputs` for why this is not a graph-replay dispatcher.

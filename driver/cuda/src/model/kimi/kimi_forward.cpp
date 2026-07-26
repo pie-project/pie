@@ -536,7 +536,8 @@ void kimi_forward_paged(
     bool is_pure_decode,
     const std::uint8_t* row_valid_d,
     const std::int32_t* logit_row_indices_d,
-    int num_logit_rows)
+    int num_logit_rows,
+    const StageHooks* hooks)
 {
     (void)qo_indptr_h;
     (void)kv_page_indptr_h;
@@ -669,6 +670,7 @@ void kimi_forward_paged(
             act_dump_bf16(act_dump_layer_tag("q_b", li).c_str(),
                 kimi_ws.q_b.data(), total_tokens, heads * (q_nope + q_rope), stream);
             invoke_stage_hook(
+                hooks,
                 StageHookPoint::OnAttnProj, kimi_ws.q_b.data(),
                 static_cast<std::uint32_t>(total_tokens),
                 static_cast<std::uint32_t>(heads * (q_nope + q_rope)),
@@ -785,6 +787,7 @@ void kimi_forward_paged(
             act_dump_bf16(act_dump_layer_tag("attn_v", li).c_str(),
                 kimi_ws.attn_v.data(), total_tokens, heads * v_dim, stream);
             invoke_stage_hook(
+                hooks,
                 StageHookPoint::OnAttn, kimi_ws.q_b.data(),
                 static_cast<std::uint32_t>(total_tokens),
                 static_cast<std::uint32_t>(heads * (q_nope + q_rope)),

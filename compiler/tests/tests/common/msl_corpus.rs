@@ -30,6 +30,7 @@ pub const GOLDEN_NAMES: &[&str] = &[
     "dfa_ingraph",
     "extern_contrastive",
     "greedy_argmax",
+    "lora_prologue",
     "matrix_mask_apply_packed",
     "matrix_select_mask",
     "mtp_verify_tail",
@@ -78,6 +79,7 @@ pub fn golden_profile(name: &str) -> ModelProfile {
     match name {
         // `ModelProfile::dummy()` verbatim (vocab 32).
         "counter_pingpong"
+        | "lora_prologue"
         | "neg_body_type_error"
         | "neg_intrinsic_wrong_stage"
         | "neg_sink_at_epilogue"

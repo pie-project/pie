@@ -3,6 +3,8 @@
 # emitter_version: 19
 # @runtime: bytes=45277 fnv1a64=0x41b1d45aaef71184
 # cases: 320
+# REGENERATED: the body below is this compiler's output, not the recorded output of the source of truth above
+#   reason: additive corpus growth: new lora_prologue golden (stage-4 lora sink); every pre-existing case's identity and emitted text is unchanged — the new case's prologue has no generated regions beyond its channel reads, and its second-party sink region is answered by the chunk-1 gate
 === beam_epilogue#0 singleton#0
 entry_name: ptir_fused_b4fadd8446eb58dd_r0
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
@@ -936,6 +938,52 @@ ok: true
 error: 
 entry_name: ptir_fused_f2566cc0c1e0529a_r0
 source: bytes=91722 prefix=@runtime tail_bytes=46445 fnv1a64=0xaa7a734d7a60c3e6
+=== end
+=== lora_prologue#0 singleton#0
+entry_name: ptir_fused_26849b68dee54237_r0
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_26849b68dee54237_r0
+source: bytes=87547 prefix=@runtime tail_bytes=42270 fnv1a64=0x749de8f001fb29d4
+=== end
+=== lora_prologue#0 singleton#1
+entry_name: ptir_fused_26849b68dee54237_r1
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_26849b68dee54237_r1
+source: bytes=87547 prefix=@runtime tail_bytes=42270 fnv1a64=0x15cb541596ab185e
+=== end
+=== lora_prologue#0 singleton#2
+entry_name: ptir_fused_26849b68dee54237_r2
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_26849b68dee54237_r2
+source: bytes=87643 prefix=@runtime tail_bytes=42366 fnv1a64=0x5ba4919f843490de
+=== end
+=== lora_prologue#0 singleton#3
+entry_name: ptir_fused_26849b68dee54237_r3
+region: library=1 library_op=5 schedule=3 nodes=1 inputs=3 outputs=0 sinks=0
+ok: false
+error: fused CUDA emitter requires a non-library generated region
+entry_name: ptir_fused_26849b68dee54237_r3
+=== end
+=== lora_prologue#0 fused#0
+entry_name: ptir_fused_26849b68dee54237_r0
+region: library=0 library_op=0 schedule=1 nodes=3 inputs=0 outputs=3 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_26849b68dee54237_r0
+source: bytes=88707 prefix=@runtime tail_bytes=43430 fnv1a64=0xa9fa765600faed77
+=== end
+=== lora_prologue#0 fused#1
+entry_name: ptir_fused_26849b68dee54237_r1
+region: library=1 library_op=5 schedule=3 nodes=1 inputs=3 outputs=0 sinks=0
+ok: false
+error: fused CUDA emitter requires a non-library generated region
+entry_name: ptir_fused_26849b68dee54237_r1
 === end
 === matrix_mask_apply_packed#0 singleton#0
 entry_name: ptir_fused_6612fe00a51d7edc_r0

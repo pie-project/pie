@@ -230,6 +230,12 @@ pub(crate) struct PendingRequest {
     /// lane (and at k = 1 the synthesized single-slot stamp's lane).
     pub(crate) pipeline_id: Option<ProcessId>,
     pub(crate) prebuilt: bool,
+    /// Whether this fire's program declares an attention-hook stage
+    /// (OnAttnProj/OnAttn). Stamped at launch admission from the tracked
+    /// instance; the wire layout sorts hook-carrying rows last within their
+    /// wire class so the driver's hook-free fast prefix
+    /// (`StageHooks::hook_free_prefix_rows`) covers every hook-free lane.
+    pub(crate) hook_program: bool,
     pub(crate) prelaunch_copy: Option<crate::driver::KvCopyPlan>,
     pub(crate) prelaunch_state_copy: Option<StateCopyPlan>,
     /// Vesuvius frame identity: which lane/frame/slot this fire belongs to.
@@ -308,6 +314,9 @@ impl PendingRequest {
             process_id,
             pipeline_id,
             prebuilt,
+            // Not known at construction: stamped at launch admission, where
+            // the tracked instance's program flag is available.
+            hook_program: false,
             prelaunch_copy,
             prelaunch_state_copy,
             frame,
@@ -765,12 +774,23 @@ enum LaneCommit {
     /// ops that touch no worker state: program/channel registers, channel
     /// closes, failed binds after lane-side rollback).
     None,
+    /// A standalone program registration succeeded on the lane: record the
+    /// program's attention-hook flag in the worker's `program_attention` map
+    /// (the response already went out lane-side).
+    ProgramRegistered {
+        program_id: crate::driver::instance::ProgramId,
+        attention_hooks: bool,
+    },
     /// A successful bind: insert the instance, THEN respond (launch admission
     /// reads `instances` on the worker thread, so respond-after-insert is the
     /// ordering that makes the guest's first fire admissible).
     BindInstance {
         pipeline_id: Option<ProcessId>,
         bound: BoundInstance,
+        /// A program this combined control registered on the lane, with its
+        /// attention-hook flag — committed to `program_attention` before the
+        /// instance insert so `TrackedInstance` sees it.
+        registered_program: Option<(crate::driver::instance::ProgramId, bool)>,
         respond: BindRespond,
     },
     /// A bind control completed without creating an instance.
@@ -1017,6 +1037,16 @@ impl DriverLane {
         drop(driver.take());
     }
 
+    /// Whether the program declares an attention-hook stage. Stage kinds:
+    /// Prologue 0, OnAttnProj 1, OnAttn 2, Epilogue 3 (see `LaunchStage` in
+    /// `interface/driver/src/plan.rs`).
+    fn declares_attention_hooks(plan: &ProgramRegistration) -> bool {
+        plan.launch
+            .stages
+            .iter()
+            .any(|stage| stage.kind == 1 || stage.kind == 2)
+    }
+
     /// The driver half of the old `dispatch_ordered_item`: everything a
     /// control does against the driver and the lane-owned `channels` set,
     /// with worker-map effects returned as a [`LaneCommit`]. Failures respond
@@ -1101,12 +1131,19 @@ impl DriverLane {
                                 "scheduler RPC cancelled after program registration; retaining driver-lifetime program"
                             );
                         }
+                        // Even on a cancelled RPC the program stays registered
+                        // driver-lifetime, so its hook flag is still worth
+                        // recording.
+                        LaneCommit::ProgramRegistered {
+                            program_id,
+                            attention_hooks: Self::declares_attention_hooks(&plan),
+                        }
                     }
                     Err(error) => {
                         let _ = response.send(Err(error));
+                        LaneCommit::None
                     }
                 }
-                LaneCommit::None
             }
             QueuedItem::RegisterChannel { plan, response } => {
                 if response.is_closed() {
@@ -1209,6 +1246,7 @@ impl DriverLane {
                         Ok(bound) => LaneCommit::BindInstance {
                             pipeline_id,
                             bound,
+                            registered_program: None,
                             respond: BindRespond::Bind(response),
                         },
                         Err(error) => {
@@ -1286,6 +1324,9 @@ impl DriverLane {
                 }
                 let probe_t1 = bind_probe.then(Instant::now);
                 let program_registered = program.is_some();
+                let program_attention_hooks = program
+                    .as_ref()
+                    .map(|plan| Self::declares_attention_hooks(plan));
                 if let Some(plan) = &program {
                     match driver.register_program(plan) {
                         Ok(program_id) => bind.program_id = program_id,
@@ -1341,6 +1382,8 @@ impl DriverLane {
                         LaneCommit::BindInstance {
                             pipeline_id,
                             bound,
+                            registered_program: program_attention_hooks
+                                .map(|attention_hooks| (bind.program_id, attention_hooks)),
                             respond: BindRespond::ChannelsBind {
                                 registered,
                                 program_id: bind.program_id,
@@ -2301,6 +2344,13 @@ impl BatchScheduler {
         let mut lane_inflight: u64 = 0;
         let mut lane_token: u64 = 0;
         let mut instances = HashMap::new();
+        // Program-lifetime attention-hook flags, mirroring `instances`:
+        // populated when a registration commits back from the lane, read at
+        // bind commit to stamp the tracked instance (and from there each
+        // fire at admission) so the batch layout can sort hook-carrying rows
+        // last within their wire class.
+        let mut program_attention: HashMap<crate::driver::instance::ProgramId, bool> =
+            HashMap::new();
         let mut pending = PendingQueue::default();
         let mut scan_cache = ScanCache::default();
         let mut slot_buffer = SlotBuffer::new();
@@ -2377,6 +2427,7 @@ impl BatchScheduler {
                             &mut in_flight_launches,
                             &mut in_flight_control,
                             &mut instances,
+                            &mut program_attention,
                             &mut frame_policy,
                             &nudge_tx,
                         );
@@ -2625,6 +2676,7 @@ impl BatchScheduler {
                         &mut in_flight_launches,
                         &mut in_flight_control,
                         &mut instances,
+                        &mut program_attention,
                         &mut frame_policy,
                         &nudge_tx,
                     );
@@ -2864,6 +2916,13 @@ impl BatchScheduler {
                     }
                     launch.completion.reject_unsubmitted(message);
                 } else {
+                    // Stamp the attention-hook flag off the tracked instance
+                    // (admission just validated the id): the batch layout
+                    // sorts hook-carrying rows last within their wire class
+                    // so the driver's hook-free fast prefix is maximal.
+                    if let Some(instance) = instances.get(&launch.instance_id) {
+                        launch.hook_program = instance.hook_program;
+                    }
                     // The default single-slot deployment: every tracked fire
                     // IS a one-fire frame. Synthesizing the stamp at accept
                     // (lane = the pipeline scope, seq = the globally
@@ -4646,6 +4705,7 @@ impl BatchScheduler {
         in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
         in_flight_control: &mut Option<PendingControl>,
         instances: &mut HashMap<u64, TrackedInstance>,
+        program_attention: &mut HashMap<crate::driver::instance::ProgramId, bool>,
         frame_policy: &mut FramePolicy,
         rollback_tx: &crossbeam::channel::Sender<SchedulerItem>,
     ) {
@@ -4706,15 +4766,29 @@ impl BatchScheduler {
             }
             LaneReply::ControlDone { token, commit } => match commit {
                 LaneCommit::None => {}
+                LaneCommit::ProgramRegistered {
+                    program_id,
+                    attention_hooks,
+                } => {
+                    program_attention.insert(program_id, attention_hooks);
+                }
                 LaneCommit::BindFinished { pipeline_id } => {
                     frame_policy.on_bind_completed(pipeline_id);
                 }
                 LaneCommit::BindInstance {
                     pipeline_id,
                     bound,
+                    registered_program,
                     respond,
                 } => {
                     frame_policy.on_bind_completed(pipeline_id);
+                    // Record the combined control's program registration
+                    // FIRST (even if the bind commit below refuses): the
+                    // program is driver-lifetime either way, and the tracked
+                    // instance's flag reads this map.
+                    if let Some((program_id, attention_hooks)) = registered_program {
+                        program_attention.insert(program_id, attention_hooks);
+                    }
                     if instances.contains_key(&bound.instance_id) {
                         // Practically unreachable: driver-assigned ids are
                         // unique and requested ids are pre-checked at post
@@ -4737,7 +4811,14 @@ impl BatchScheduler {
                         return;
                     }
                     let instance_id = bound.instance_id;
-                    instances.insert(instance_id, TrackedInstance::from_bound(&bound));
+                    // Missing map entry (program registered before this code
+                    // shipped, or an unregistered id) degrades to `false`:
+                    // the row just doesn't join the hook-free fast prefix.
+                    let hook_program = program_attention
+                        .get(&bound.program_id)
+                        .copied()
+                        .unwrap_or(false);
+                    instances.insert(instance_id, TrackedInstance::from_bound(&bound, hook_program));
                     // Respond AFTER the insert: launch admission reads
                     // `instances` on this thread, so the guest's first fire
                     // (sent only after this response) is always admissible.
@@ -4891,15 +4972,19 @@ struct TrackedInstance {
     wait_slots: Arc<crate::driver::instance::BoundWaitSlots>,
     in_flight: usize,
     next_target_epoch: u64,
+    /// Whether the bound program declares an attention-hook stage
+    /// (OnAttnProj/OnAttn); copied onto each fire at launch admission.
+    hook_program: bool,
 }
 
 impl TrackedInstance {
-    fn from_bound(bound: &BoundInstance) -> Self {
+    fn from_bound(bound: &BoundInstance, hook_program: bool) -> Self {
         Self {
             pacing_wait_id: bound.pacing_wait_id,
             wait_slots: bound.wait_slots(),
             in_flight: 0,
             next_target_epoch: pie_waker::FIRST_COMPLETION_EPOCH,
+            hook_program,
         }
     }
 
@@ -5292,6 +5377,7 @@ mod tests {
         let mut launches = VecDeque::new();
         let mut control = None;
         let mut instances = HashMap::new();
+        let mut program_attention = HashMap::new();
         let mut frame_policy = FramePolicy::new(1, 1, 4096, None);
 
         BatchScheduler::apply_lane_reply(
@@ -5300,6 +5386,7 @@ mod tests {
                 commit: LaneCommit::BindInstance {
                     pipeline_id: None,
                     bound,
+                    registered_program: None,
                     respond: BindRespond::Bind(response),
                 },
             },
@@ -5307,6 +5394,7 @@ mod tests {
             &mut launches,
             &mut control,
             &mut instances,
+            &mut program_attention,
             &mut frame_policy,
             &rollback_tx,
         );

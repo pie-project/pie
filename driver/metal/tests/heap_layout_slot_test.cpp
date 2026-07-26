@@ -144,7 +144,7 @@ int main() {
 
         int gdn_layers = 0;
         for (int l = 0; l < g1.n_layers; ++l) {
-            if (!DecodeGeometry::is_full_attn(l)) ++gdn_layers;
+            if (!g1.is_full_attn(l)) ++gdn_layers;
         }
         const uint64_t one_slot_bytes_all_layers =
             uint64_t(gdn_layers) * (2 * conv_stride + recur_stride);

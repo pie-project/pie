@@ -97,6 +97,10 @@ pie-driver-dummy = { path = "../driver/dummy" }
 # fixture builder, CPU executor). Nothing under `ffi/` reaches them, and this is
 # what keeps that true.
 pie-loader = { path = "../loader", default-features = false }
+# Like the loader: no Rust in this process calls the forward toolchain — the
+# drivers reach it over its C ABI — so the dependency exists to put the rlib
+# in the link and to order the build-script include handoff.
+pie-forward = { path = "../forward" }
 
 # Pie websocket client — used by `pie run` to drive an inferlet against
 # the engine subprocess we boot. Same crate the dummy_roundtrip example

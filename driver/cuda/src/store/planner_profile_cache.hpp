@@ -83,8 +83,10 @@ std::optional<PlannerProfileShape> planner_profile_cache_lookup(
     std::string* error);
 
 // Replace (or append) the entry for `key`, preserving every other entry.
-// Atomic: the new document lands on a sibling temp file that is then renamed,
-// so a concurrent reader observes either the old cache or the new one.
+// Serialised and atomic: an exclusive `flock` on a sibling `.lock` file covers
+// the whole read -> merge -> rename, so two processes calibrating at once
+// cannot drop each other's entries, and the rename itself means a concurrent
+// reader observes either the old cache or the new one, never a partial write.
 bool planner_profile_cache_store(const PlannerProfileKey& key,
                                  const PlannerProfileShape& shape,
                                  const std::vector<PlannerShapeSample>& samples,

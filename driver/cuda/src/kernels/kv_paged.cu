@@ -39,9 +39,15 @@ __global__ void write_kv_kernel(
     int R,
     int page_size,
     int h_kv,
-    int d)
+    int d,
+    int first_token)
 {
-    const int t = blockIdx.x;
+    // `first_token` skips the leading tokens whose K/V a fused QKV kernel
+    // already wrote to the cache (the hook-free fast prefix). Everything here
+    // stays ABSOLUTE — `t` indexes the full fire's buffers and CSRs — so the
+    // tail write is the same write it always was, just not launched for rows
+    // another kernel owns.
+    const int t = blockIdx.x + first_token;
     if (row_valid != nullptr && row_valid[t] == 0) return;
 
     const int r = find_request(qo_indptr, R, t);
@@ -643,25 +649,30 @@ void launch_write_kv_to_pages_bf16(
     int head_dim,
     bool hnd_layout,
     cudaStream_t stream,
-    const std::uint8_t* row_valid)
+    const std::uint8_t* row_valid,
+    int first_token)
 {
     constexpr int BLOCK = 256;
+    const int launch_tokens = total_tokens - first_token;
+    if (launch_tokens <= 0) return;
     if (hnd_layout) {
-        write_kv_kernel<true><<<total_tokens, BLOCK, 0, stream>>>(
+        write_kv_kernel<true><<<launch_tokens, BLOCK, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(k_curr),
             static_cast<const __nv_bfloat16*>(v_curr),
             static_cast<__nv_bfloat16*>(k_pages),
             static_cast<__nv_bfloat16*>(v_pages),
             qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            row_valid, num_requests, page_size, num_kv_heads, head_dim);
+            row_valid, num_requests, page_size, num_kv_heads, head_dim,
+            first_token);
     } else {
-        write_kv_kernel<false><<<total_tokens, BLOCK, 0, stream>>>(
+        write_kv_kernel<false><<<launch_tokens, BLOCK, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(k_curr),
             static_cast<const __nv_bfloat16*>(v_curr),
             static_cast<__nv_bfloat16*>(k_pages),
             static_cast<__nv_bfloat16*>(v_pages),
             qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            row_valid, num_requests, page_size, num_kv_heads, head_dim);
+            row_valid, num_requests, page_size, num_kv_heads, head_dim,
+            first_token);
     }
 }
 
@@ -676,17 +687,27 @@ void launch_write_kv_to_pages(
     int total_tokens,
     int num_requests,
     cudaStream_t stream,
-    const std::uint8_t* row_valid)
+    const std::uint8_t* row_valid,
+    int first_token)
 {
     const int page_size = layer.page_size;
     const int num_kv_heads = layer.num_kv_heads;
     const int head_dim = layer.head_dim;
+    // A non-zero `first_token` means the leading tokens' K/V were written by
+    // a fused kernel that only exists for the native-bf16 cache; on any other
+    // scheme a partial write here would leave the prefix rows holding garbage
+    // from `k_curr` rows nobody filled. Refuse loudly.
+    if (first_token != 0 && !layer.is_native_bf16()) {
+        throw std::runtime_error(
+            "write_kv_to_pages: partial (first_token) writes require the "
+            "native bf16 cache");
+    }
     if (layer.is_native_bf16()) {
         launch_write_kv_to_pages_bf16(
             layer.k_pages, layer.v_pages, k_curr, v_curr,
             qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
             total_tokens, num_requests, page_size, num_kv_heads, head_dim,
-            layer.hnd_layout, stream, row_valid);
+            layer.hnd_layout, stream, row_valid, first_token);
         // Quest maintenance rides the append: the pages this fire just grew are
         // exactly the ones whose envelopes went stale, and the same stream
         // orders the refresh after the write. Opt-in -- `has_envelopes()` is

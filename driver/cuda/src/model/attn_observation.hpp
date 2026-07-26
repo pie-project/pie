@@ -18,11 +18,12 @@ namespace model {
 // live in — none of which is reachable from a stage hook, and all of which the
 // batch layer already has in `ForwardInputs`.
 //
-// It is published as a thread-local by `ForwardFn::invoke_body` for exactly the
-// duration of one model body, alongside `ScopedStageHooks`. That placement is
-// deliberate: it is the single choke point every model family already passes
-// through, so no model file has to know this exists. A model that is mid-body
-// on another thread has its own binding.
+// It is constructed by `ForwardFn::invoke_body` for exactly the duration of
+// one model body and carried on the fire's `StageHooks` (`hooks->observation`)
+// and in every hook's `StageHookSideband`. That placement is deliberate:
+// `invoke_body` is the single choke point every model family already passes
+// through, so no model file has to construct this — it only threads the hooks
+// pointer it was handed.
 //
 // Every pointer is borrowed from the caller's `ForwardInputs` and is only valid
 // while the body runs.
@@ -58,22 +59,6 @@ struct AttentionObservation {
                qo_indptr_h != nullptr && kv_page_indptr_h != nullptr &&
                kv_last_page_lens_h != nullptr && num_requests > 0;
     }
-};
-
-// Null outside a model body, or inside one that was invoked without a fire
-// descriptor.
-const AttentionObservation* active_attention_observation() noexcept;
-
-class ScopedAttentionObservation {
-  public:
-    explicit ScopedAttentionObservation(const AttentionObservation* observation) noexcept;
-    ~ScopedAttentionObservation() noexcept;
-
-    ScopedAttentionObservation(const ScopedAttentionObservation&) = delete;
-    ScopedAttentionObservation& operator=(const ScopedAttentionObservation&) = delete;
-
-  private:
-    const AttentionObservation* previous_ = nullptr;
 };
 
 }  // namespace model

@@ -99,7 +99,8 @@ void gemma2_forward_paged(
     int R,
     bool is_pure_decode,
     const std::uint8_t* custom_mask_d,
-    const std::int32_t* custom_mask_indptr_d)
+    const std::int32_t* custom_mask_indptr_d,
+    const StageHooks* hooks)
 {
     // TP-local dims. tp_size == 1 reverts to single-GPU shapes.
     const int T  = (fwd_cfg.tp_size > 0) ? fwd_cfg.tp_size : 1;
@@ -200,6 +201,7 @@ void gemma2_forward_paged(
         // post-rope -- compares in the same space. Placing it on the raw
         // projection instead would silently mis-rank pages for Quest.
         invoke_stage_hook(
+            hooks,
             StageHookPoint::OnAttnProj, ws.q.data(),
             static_cast<std::uint32_t>(N),
             static_cast<std::uint32_t>(Hq),
@@ -239,6 +241,7 @@ void gemma2_forward_paged(
                 layer_window_left, fwd_cfg.attn_logit_softcap);
         }
         invoke_stage_hook(
+            hooks,
             StageHookPoint::OnAttn, ws.q.data(),
             static_cast<std::uint32_t>(N),
             static_cast<std::uint32_t>(Hq),

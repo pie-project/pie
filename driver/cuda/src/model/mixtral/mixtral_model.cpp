@@ -39,7 +39,8 @@ void MixtralModel::body(Workspace& ws,
         in.total_tokens, in.num_requests, in.is_pure_decode,
         in.logit_row_indices_d, in.num_logit_rows,
         in.custom_mask_d, in.custom_mask_indptr_d,
-        in.row_valid_d);
+        in.row_valid_d,
+        in.stage_hooks);
 }
 
 }  // namespace pie_cuda_driver::model

@@ -25,9 +25,9 @@ use pie_driver_abi::local::{
     PIE_NO_CHANNEL, PIE_READINESS_NEEDS_EMPTY, PIE_READINESS_NEEDS_FULL, PIE_READINESS_UNTOUCHED,
     PIE_REGION_GENERATED, PIE_REGION_LIBRARY, PIE_STAGE_GROUPED_VALID,
     PIE_STAGE_REQUIRES_ATTN_SCORE, PIE_STAGE_REQUIRES_KERNEL_CALL, PIE_STAGE_REQUIRES_LAYER,
-    PIE_STAGE_REQUIRES_MTP_ROWS, PIE_STAGE_REQUIRES_PAGE_MASK, PIE_STAGE_REQUIRES_QUERY,
-    PIE_VALUE_CHANNEL_READ, PIE_VALUE_CHANNEL_TAKE, PIE_VALUE_CONST, PIE_VALUE_INTRINSIC,
-    PIE_VALUE_OP_RESULT,
+    PIE_STAGE_REQUIRES_LORA, PIE_STAGE_REQUIRES_MTP_ROWS, PIE_STAGE_REQUIRES_PAGE_MASK,
+    PIE_STAGE_REQUIRES_QUERY, PIE_VALUE_CHANNEL_READ, PIE_VALUE_CHANNEL_TAKE, PIE_VALUE_CONST,
+    PIE_VALUE_INTRINSIC, PIE_VALUE_OP_RESULT,
 };
 use pie_driver_abi::plan::{
     LaunchChannel, LaunchChannelRule, LaunchOp, LaunchPackage, LaunchPlanValue, LaunchPort,
@@ -304,6 +304,7 @@ fn lower_plan(stage: &CompiledStage) -> LaunchStagePlan {
     let grouped = GroupedPlan::derive(
         &ops,
         &normalized.value_types,
+        &normalized.names,
         normalized.channel_bindings.len(),
     );
 
@@ -428,7 +429,12 @@ struct GroupedPlan {
 }
 
 impl GroupedPlan {
-    fn derive(ops: &[OpView], value_types: &[SymbolicType], channel_count: usize) -> Self {
+    fn derive(
+        ops: &[OpView],
+        value_types: &[SymbolicType],
+        names: &[String],
+        channel_count: usize,
+    ) -> Self {
         let mut plan = GroupedPlan {
             flags: PIE_STAGE_GROUPED_VALID,
             ..GroupedPlan::default()
@@ -467,10 +473,16 @@ impl GroupedPlan {
                 plan.flags |= PIE_STAGE_REQUIRES_QUERY | PIE_STAGE_REQUIRES_KERNEL_CALL;
                 continue;
             }
-            // `attn_page_mask` is grouped-walkable but only fused-executable.
-            // Described here for the same reason.
+            // Sinks are grouped-walkable but only fused-executable.
+            // Described here for the same reason. Which flag depends on which
+            // sink: `lora` configures the whole forward, everything else is
+            // the page mask.
             if op.tag == tags::SINK_CALL {
-                plan.flags |= PIE_STAGE_REQUIRES_PAGE_MASK;
+                if names.get(op.name_idx as usize).map(String::as_str) == Some("lora") {
+                    plan.flags |= PIE_STAGE_REQUIRES_LORA;
+                } else {
+                    plan.flags |= PIE_STAGE_REQUIRES_PAGE_MASK;
+                }
             }
             if !grouped_supported_tag(op.tag) {
                 return plan.invalid("stage contains an unsupported grouped op");

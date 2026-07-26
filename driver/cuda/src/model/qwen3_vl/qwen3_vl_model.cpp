@@ -135,7 +135,8 @@ void Qwen3VLModel::body(Workspace& ws,
         in.custom_mask_d, in.custom_mask_indptr_d,
         in.w_page_d, in.w_off_d, in.row_valid_d, in.has_write_desc,
         in.runtime_window_left,
-        vision_ptr);
+        vision_ptr,
+        in.stage_hooks);
 }
 
 std::uint32_t Qwen3VLModel::graph_layout() {

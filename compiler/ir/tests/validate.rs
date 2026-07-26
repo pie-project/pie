@@ -313,6 +313,68 @@ fn sink_precedence_t11() {
     ));
 }
 
+/// §6.5: `lora` is a first-party pass-wide sink. The name always type-checks,
+/// so the backend's ability to HONOUR it has to be checked at bind (mirroring
+/// `attn_page_mask`'s gate): refused without `has_lora`, and — T11 — refused
+/// at any stage but the prologue.
+#[test]
+fn lora_honour_gate_and_placement() {
+    // A `[num_layers, R, d]`, B `[num_layers, d_out, R]`, SITES a small
+    // trace-known site vector; all three peeked, per §6.5.
+    let mk = |stage: Stage| TraceContainer {
+        names: vec!["lora".to_string()],
+        channels: vec![
+            chan(
+                Shape::new(&[2, 2, 4]).unwrap(),
+                DType::F32,
+                HostRole::None,
+                true,
+            ), // A
+            chan(
+                Shape::new(&[2, 4, 2]).unwrap(),
+                DType::F32,
+                HostRole::None,
+                true,
+            ), // B
+            chan(Shape::vector(4), DType::U32, HostRole::None, true), // SITES
+        ],
+        ports: vec![],
+        stages: vec![StageProgram {
+            stage,
+            ops: vec![
+                Op::ChanRead(0),
+                Op::ChanRead(1),
+                Op::ChanRead(2),
+                Op::SinkCall {
+                    name: 0,
+                    args: vec![0, 1, 2],
+                },
+            ],
+        }],
+        externs: Vec::new(),
+    };
+    // The dummy profile advertises the sink: a prologue call binds.
+    assert!(bind(mk(Stage::Prologue), ModelProfile::dummy()).is_ok());
+    // Without the capability the same program must be refused at bind — the
+    // fire-time alternative is an adapter that silently never applies.
+    let mut no_lora = ModelProfile::dummy();
+    no_lora.has_lora = false;
+    assert!(matches!(
+        bind(mk(Stage::Prologue), no_lora),
+        Err(ValidateError::KernelUnavailable { name, .. }) if name == "lora"
+    ));
+    // T11: pass-wide ⇒ prologue only. An attention-stage call comes after
+    // part of the forward it configures, and an epilogue call after all of it.
+    assert!(matches!(
+        bind(mk(Stage::OnAttnProj), ModelProfile::dummy()),
+        Err(ValidateError::SinkMisplaced { .. })
+    ));
+    assert!(matches!(
+        bind(mk(Stage::Epilogue), ModelProfile::dummy()),
+        Err(ValidateError::SinkMisplaced { .. })
+    ));
+}
+
 #[test]
 fn t10_non_replayable_kernel_rejected() {
     let mut profile = ModelProfile::dummy();

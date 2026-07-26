@@ -1,9 +1,13 @@
 #include "planner_profile_cache.hpp"
 
 #include <chrono>
+#include <cerrno>
 #include <cstdio>
+#include <cstring>
+#include <fcntl.h>
 #include <fstream>
 #include <string>
+#include <sys/file.h>
 #include <system_error>
 #include <unistd.h>
 
@@ -14,6 +18,48 @@
 
 namespace pie_cuda_driver {
 namespace {
+
+// Bump whenever the meaning of a stored field changes. A document that does
+// not carry this exact version is refused rather than partially interpreted.
+constexpr int kSchemaVersion = 1;
+
+// Exclusive advisory lock over the cache's read -> merge -> rename, held on a
+// sibling file so it survives the rename that replaces the cache itself.
+class CacheLock {
+  public:
+    explicit CacheLock(const std::filesystem::path& cache_path) {
+        const auto lock_path =
+            cache_path.parent_path() /
+            (cache_path.filename().string() + ".lock");
+        fd_ = ::open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+        if (fd_ < 0) {
+            error_ = std::string("cannot open ") + lock_path.string() + ": " +
+                     std::strerror(errno);
+            return;
+        }
+        if (::flock(fd_, LOCK_EX) != 0) {
+            error_ = std::string("cannot lock ") + lock_path.string() + ": " +
+                     std::strerror(errno);
+            ::close(fd_);
+            fd_ = -1;
+        }
+    }
+    ~CacheLock() {
+        if (fd_ >= 0) {
+            ::flock(fd_, LOCK_UN);
+            ::close(fd_);
+        }
+    }
+    CacheLock(const CacheLock&) = delete;
+    CacheLock& operator=(const CacheLock&) = delete;
+
+    bool held() const { return fd_ >= 0; }
+    const std::string& error() const { return error_; }
+
+  private:
+    int fd_ = -1;
+    std::string error_;
+};
 
 nlohmann::json key_to_json(const PlannerProfileKey& k) {
     return nlohmann::json{
@@ -120,6 +166,19 @@ std::optional<PlannerProfileShape> planner_profile_cache_lookup(
                                               error);
     const auto entries = root.find("entries");
     if (entries == root.end() || !entries->is_array()) return std::nullopt;
+    // A document with entries but no matching schema version was written by a
+    // different build (or by hand). Its fields may not mean what they say, so
+    // refuse it LOUDLY rather than silently matching a subset — a wrong
+    // max_forward_tokens is worse than none.
+    const int version = root.value("version", 0);
+    if (version != kSchemaVersion && !entries->empty()) {
+        if (error != nullptr) {
+            *error = "schema version " + std::to_string(version) +
+                     ", expected " + std::to_string(kSchemaVersion) +
+                     "; delete the file and re-calibrate";
+        }
+        return std::nullopt;
+    }
     for (const auto& entry : *entries) {
         if (!entry.is_object()) continue;
         const auto stored_key = entry.find("key");
@@ -151,7 +210,28 @@ bool planner_profile_cache_store(
         return false;
     }
 
+    std::error_code dir_ec;
+    std::filesystem::create_directories(path.parent_path(), dir_ec);
+    if (dir_ec) {
+        if (error != nullptr) *error = dir_ec.message();
+        return false;
+    }
+
+    // `rename` makes the file REPLACEMENT atomic for readers, but it does not
+    // make read-modify-write atomic against another writer: two processes
+    // calibrating at once would both read the pre-existing document and the
+    // second rename would drop the first one's entry. One process per GPU on a
+    // multi-GPU host sharing $HOME is exactly the case the "preserve every
+    // other entry" contract exists for, so hold an exclusive lock across the
+    // whole read -> merge -> rename.
+    CacheLock lock(path);
+    if (!lock.held()) {
+        if (error != nullptr) *error = lock.error();
+        return false;
+    }
+
     nlohmann::json root = read_document(path, nullptr);
+    root["version"] = kSchemaVersion;
     if (!root.contains("entries") || !root["entries"].is_array()) {
         root["entries"] = nlohmann::json::array();
     }
@@ -203,17 +283,17 @@ bool planner_profile_cache_store(
     if (!replaced) entries.push_back(entry);
 
     std::error_code ec;
-    std::filesystem::create_directories(path.parent_path(), ec);
-    if (ec) {
-        if (error != nullptr) *error = ec.message();
-        return false;
-    }
-
     // Rename is atomic within a directory, so a reader racing the write sees
-    // one whole document or the other — never a half-serialised one.
-    const auto tmp = path.parent_path() /
-                     (path.filename().string() + ".tmp." +
-                      std::to_string(static_cast<long>(::getpid())));
+    // one whole document or the other — never a half-serialised one. The temp
+    // name carries a clock component as well as the pid, because two
+    // containers sharing a $HOME mount can present the same pid.
+    const auto tmp =
+        path.parent_path() /
+        (path.filename().string() + ".tmp." +
+         std::to_string(static_cast<long>(::getpid())) + "." +
+         std::to_string(std::chrono::steady_clock::now()
+                            .time_since_epoch()
+                            .count()));
     try {
         std::ofstream out(tmp, std::ios::trunc);
         if (!out) {
@@ -224,6 +304,7 @@ bool planner_profile_cache_store(
         out.flush();
         if (!out) {
             if (error != nullptr) *error = "write failed: " + tmp.string();
+            std::filesystem::remove(tmp, ec);
             return false;
         }
     } catch (const std::exception& e) {

@@ -204,6 +204,65 @@ fn the_tap_folds_over_layers_and_reseeds() {
     );
 }
 
+/// `kernel::lora` (§6.5): a pass-wide configuration sink authored in the
+/// prologue. Three args — A, B, SITES; no scalar alpha (alpha/R is folded
+/// into B's contents); SITES trace-known. Gated at bind on the backend's
+/// `has_lora`, exactly as `attn_page_mask` gates on `has_attn_page_mask`.
+#[test]
+fn lora_traces_to_a_prologue_sink_call_and_gates_on_the_profile() {
+    const L: u32 = 2; // num_layers
+    const R: u32 = 2; // rank — trace-known: a different R is a different program
+    const D: u32 = 4;
+
+    let la = Channel::from_shaped([L, R, D], vec![0.0f32; (L * R * D) as usize]).named("lora_a");
+    let lb = Channel::from_shaped([L, D, R], vec![0.0f32; (L * D * R) as usize]).named("lora_b");
+    let mut b = Builder::new(V, PAGE_T);
+    b.stage(Stage::Prologue, move || {
+        // Placement is structure (a trace-known constant over the site
+        // vocabulary); weights are contents (channel reads — peeks, so the
+        // sink adds no edge to the decode chain).
+        intrinsics::kernel::lora(la.read(), lb.read(), Tensor::constant([0u32, 1, 2]));
+    });
+    let t = b.build().expect("the lora prologue traces");
+    let c = t.container();
+
+    assert_eq!(
+        c.names,
+        vec!["lora".to_string()],
+        "the sink name must land in the container-wide name index"
+    );
+    let prologue = c
+        .stages
+        .iter()
+        .find(|s| s.stage == Stage::Prologue)
+        .expect("Prologue stage");
+    let (name, args) = prologue
+        .ops
+        .iter()
+        .find_map(|op| match op {
+            Op::SinkCall { name, args } => Some((*name, args.clone())),
+            _ => None,
+        })
+        .expect("lora lowers to Op::SinkCall");
+    assert_eq!(name, 0, "first interned name is index 0");
+    assert_eq!(
+        args.len(),
+        3,
+        "A, B, SITES — and nothing else: the scale is per-adapter data"
+    );
+
+    bind(t.container().clone(), ModelProfile::dummy())
+        .expect("binds when the profile advertises has_lora");
+    let mut no_lora = ModelProfile::dummy();
+    no_lora.has_lora = false;
+    let err = bind(t.container().clone(), no_lora).expect_err("must be refused without has_lora");
+    let msg = format!("{err:?}").to_lowercase();
+    assert!(
+        msg.contains("lora"),
+        "error should name the sink, got: {msg}"
+    );
+}
+
 /// The name table is emitted SORTED, and every `name_idx` follows it.
 ///
 /// `intern_name` hands out indices in first-use order, but the container's

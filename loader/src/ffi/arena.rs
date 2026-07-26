@@ -288,7 +288,7 @@ fn flatten_instr(arena: &mut PlanArena, instr: &StorageInstr) -> PieLoaderStorag
                 Some(dest) => (arena.dest_extent(dest), true),
                 None => (PieLoaderDestExtentView::default(), false),
             };
-            let repack = &transform.repack;
+            let repack = transform.repack;
             (
                 id,
                 Op::TileMap {
@@ -303,12 +303,12 @@ fn flatten_instr(arena: &mut PlanArena, instr: &StorageInstr) -> PieLoaderStorag
                     transform_fusion: transform.fusion.into(),
                     transform_from: quant_or_none(transform.from),
                     transform_to: quant_or_none(transform.to),
-                    repack_layout: repack.layout.into(),
-                    transform_batch: repack.batch,
-                    transform_source_rows: repack.source_rows,
-                    transform_target_rows: repack.target_rows,
-                    transform_source_cols: repack.source_cols,
-                    transform_target_cols: repack.target_cols,
+                    repack_layout: repack.map_or(PieLoaderRepackLayout::None, |r| r.layout.into()),
+                    transform_batch: repack.map_or(0, |r| r.batch),
+                    transform_source_rows: repack.map_or(0, |r| r.source_rows),
+                    transform_target_rows: repack.map_or(0, |r| r.target_rows),
+                    transform_source_cols: repack.map_or(0, |r| r.source_cols),
+                    transform_target_cols: repack.map_or(0, |r| r.target_cols),
                     transform_scratch_bytes: transform.scratch_bytes,
                     transform_metadata_source: transform
                         .metadata_source

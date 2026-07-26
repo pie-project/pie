@@ -274,7 +274,12 @@ pub enum TransformFusion {
 pub struct TransformSpec {
     pub from: Option<QuantScheme>,
     pub to: Option<QuantScheme>,
-    pub repack: RepackSpec,
+    /// The kernel this transform ends in, when it ends in one.
+    ///
+    /// `None` rather than a layout of that name: a transform that does not
+    /// repack has no rows, no columns and no kernel, and a struct of zeros
+    /// standing for that is a value every reader has to know to disbelieve.
+    pub repack: Option<RepackSpec>,
     pub scratch_bytes: u64,
     pub fusion: TransformFusion,
     /// The checkpoint tensor holding this transform's *input* block scales.

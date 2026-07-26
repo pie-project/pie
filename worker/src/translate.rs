@@ -115,6 +115,7 @@ fn build_model(
                 has_value_head: g.caps.has_value_head,
                 has_kv_envelopes: g.caps.has_kv_envelopes,
                 has_attn_page_mask: g.caps.has_attn_page_mask,
+                has_lora: g.caps.has_lora,
                 has_attn_score: g.caps.has_attn_score,
                 device_geometry_port_mask: g.caps.device_geometry_port_mask,
                 limits: pie_engine::driver::SchedulerLimits {
@@ -170,9 +171,9 @@ mod tests {
             has_value_head: false,
             has_kv_envelopes: false,
             has_attn_page_mask: false,
+            has_lora: false,
             has_attn_score: false,
             device_geometry_port_mask: pie_driver_abi::PIE_DEVICE_GEOMETRY_PORTS,
-            codegen_backend: String::new(),
             kv_handle: None,
             codegen_backend: String::new(),
         }

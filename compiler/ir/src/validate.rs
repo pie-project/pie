@@ -610,6 +610,15 @@ fn check_second_party_names(
                             name: n.into(),
                         });
                     }
+                    // Same contract for `lora`: a backend that cannot consume
+                    // the sink's A/B/SITES configuration must refuse the
+                    // program at bind, or the adapter silently never applies.
+                    if n == "lora" && !profile.has_lora {
+                        return Err(ValidateError::KernelUnavailable {
+                            name_index: *name,
+                            name: n.into(),
+                        });
+                    }
                     let scope = KNOWN_SINKS
                         .iter()
                         .find(|(k, _)| *k == n)

@@ -30,6 +30,7 @@
 #include "kernels/pack_dense_mask.hpp"
 #include "model/loaded_model.hpp"
 #include "model/attn_score.hpp"
+#include "model/lora.hpp"
 #include "model/stage_hooks.hpp"
 #include "store/kv_cache.hpp"
 #include "store/recurrent_state_cache.hpp"
@@ -1525,7 +1526,8 @@ void prepare_step(
             s.fR_real,
             s.img_num_images,
             s.aud_num_clips,
-            s.has_attention_stages);
+            s.has_attention_stages,
+            engine.dispatch->launch_wants_lora(s.dispatch_view));
         if (eligible && engine.graph_pad_page >= 0) {
             const int max_requests = std::min(
                 engine.max_forward_requests, engine.max_workspace_tokens);
@@ -2277,6 +2279,16 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
     };
     dump_rs("PRE ");
 
+    // The lora table was resolved when the prologue executed inside
+    // `begin_enqueue` above; fetch the view only when some program in this
+    // launch actually carries the sink, so ordinary fires pay one predicate.
+    // The view borrows launch-owned storage, and `s.staged` outlives the
+    // body call below.
+    const model::LoraTable lora_table =
+        engine.dispatch->launch_wants_lora(s.dispatch_view)
+            ? engine.dispatch->launch_lora_table(*s.staged)
+            : model::LoraTable{};
+
     struct StageHookContext {
         pipeline::Dispatch* dispatch = nullptr;
         pipeline::StagedLaunch* launch = nullptr;
@@ -2291,6 +2303,8 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
         .attn_score_window = model::default_attn_score_window(),
         .wants_page_mask =
             engine.dispatch->launch_wants_page_mask(s.dispatch_view),
+        .hook_free_prefix_rows =
+            engine.dispatch->launch_hook_free_prefix_rows(s.dispatch_view),
         .execute = [](
             void* opaque,
             model::StageHookPoint point,
@@ -2299,7 +2313,8 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             std::uint32_t query_columns,
             std::uint32_t layer,
             cudaStream_t stream,
-            bool query_is_f32) {
+            bool query_is_f32,
+            const model::StageHookSideband& sideband) {
             auto& context =
                 *static_cast<StageHookContext*>(opaque);
             context.dispatch->execute_attention_phase(
@@ -2310,7 +2325,8 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
                 query_columns,
                 layer,
                 stream,
-                query_is_f32);
+                query_is_f32,
+                sideband);
         },
     };
     run_forward_dispatch(
@@ -2365,6 +2381,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             .precomputed_embeddings = s.precomputed_embeddings,
             .stage_hooks =
                 s.has_attention_stages ? &stage_hooks : nullptr,
+            .lora = lora_table.usable() ? &lora_table : nullptr,
         });
     dump_rs("POST");
     if (s.ir_trace) {

@@ -392,6 +392,7 @@ fn profile_from(
         has_value_head: ptir.has_value_head,
         has_attn_score: ptir.has_attn_score,
         has_attn_page_mask: ptir.has_attn_page_mask,
+        has_lora: ptir.has_lora,
         // Second-party kernels the backend advertises. `envelope_dot` is
         // replayable (a pure function of the query and the page envelopes) and
         // has no sink scope: it produces a value, it does not consume one.
@@ -550,6 +551,7 @@ mod tests {
             has_kv_envelopes: has,
             has_attn_score: false,
             has_attn_page_mask: false,
+            has_lora: false,
         };
         let bytes = quest_tap(VOCAB, 4).encode();
 
@@ -646,6 +648,7 @@ mod tests {
             has_kv_envelopes: has,
             has_attn_score: false,
             has_attn_page_mask: false,
+            has_lora: false,
         };
         // A backend that cannot honour the envelope contract must advertise NO
         // second-party kernel, so a Quest program fails to bind rather than

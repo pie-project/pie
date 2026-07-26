@@ -1970,6 +1970,23 @@ inline GroupedLaunchResult run_generated_stage(
             const std::uint32_t node = planned_region.nodes.front();
             const auto& op = stage.ops[node].op;
             if (planned_region.library_op == PTIR_LIBRARY_SECOND_PARTY) {
+                if (op.tag == PTIR_OP_SINK_CALL &&
+                    op.name_idx < stage.names.size() &&
+                    stage.names[op.name_idx] == "lora") {
+                    // `lora` is CONFIGURATION, not computation, so its
+                    // lowering here is deliberately nothing. A sink's effect
+                    // lands where its consumer lives: the mask sink below is
+                    // consumed by a device kernel (the layer's attention), so
+                    // it lowers to a device write; the lora sink is consumed
+                    // by the host-built launch configuration (the A/B channel
+                    // addresses and SITES constant the model body's
+                    // projection GEMMs read), which `Dispatch` resolved into
+                    // the launch-owned lora table when it assembled this
+                    // phase's bindings. By the time this region executes the
+                    // sink has already taken effect; a device store here
+                    // would have nowhere meaningful to land.
+                    continue;
+                }
                 if (op.tag == PTIR_OP_SINK_CALL) {
                     // `second_party_region_supported` already proved this is
                     // `attn_page_mask` at `OnAttnProj` with a rank-1 argument.

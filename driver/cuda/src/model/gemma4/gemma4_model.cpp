@@ -103,7 +103,8 @@ void Gemma4Model::body(Workspace& ws,
         in.logit_row_indices_d, in.num_logit_rows, vision_in_ptr, audio_in_ptr,
         in.precomputed_embeddings.num_blocks > 0
             ? &in.precomputed_embeddings
-            : nullptr);
+            : nullptr,
+        in.stage_hooks);
 }
 
 std::uint32_t Gemma4Model::graph_layout() {

@@ -32,7 +32,10 @@ void launch_write_kv_to_pages_bf16(
     int head_dim,
     bool hnd_layout,
     cudaStream_t stream,
-    const std::uint8_t* row_valid = nullptr);
+    const std::uint8_t* row_valid = nullptr,
+    // Skip the first `first_token` tokens (a fused QKV kernel already wrote
+    // their K/V — the hook-free fast prefix). Indexing stays absolute.
+    int first_token = 0);
 
 void launch_write_kv_to_pages(
     KvCacheLayerView layer,
@@ -45,7 +48,10 @@ void launch_write_kv_to_pages(
     int total_tokens,
     int num_requests,
     cudaStream_t stream,
-    const std::uint8_t* row_valid = nullptr);
+    const std::uint8_t* row_valid = nullptr,
+    // Non-zero only on the native-bf16 cache (throws otherwise): the skipped
+    // prefix is owned by the fused decode QKV kernel.
+    int first_token = 0);
 
 void launch_write_kv_to_pages_at_positions_bf16(
     KvCacheLayerView layer,

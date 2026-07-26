@@ -62,41 +62,21 @@ void ForwardFn::invoke_prepare(AttentionWorkspace& aws,
     if (model) model->prepare(aws, in);
 }
 
-namespace {
-
-thread_local const model::AttentionObservation* g_attention_observation = nullptr;
-
-}  // namespace
-
-namespace model {
-
-const AttentionObservation* active_attention_observation() noexcept {
-    return g_attention_observation;
-}
-
-ScopedAttentionObservation::ScopedAttentionObservation(
-    const AttentionObservation* observation) noexcept
-    : previous_(g_attention_observation) {
-    g_attention_observation = observation;
-}
-
-ScopedAttentionObservation::~ScopedAttentionObservation() noexcept {
-    g_attention_observation = previous_;
-}
-
-}  // namespace model
-
 void ForwardFn::invoke_body(model::Workspace& ws,
                             KvCache& kv,
                             AttentionWorkspace& aws,
                             ops::CublasHandle& cublas,
                             const ForwardInputs& in) {
     if (model) {
-        model::ScopedStageHooks hooks(in.stage_hooks);
-        // Publish the fire's KV geometry for the duration of the body so an
-        // attention-stage PTIR program can score the cache it is about to
-        // attend over. Scoped to the body, so a stage hook can never observe a
-        // page table from a different fire.
+        if (in.stage_hooks == nullptr) {
+            model->body(ws, kv, aws, cublas, in);
+            return;
+        }
+        // Attach the fire's KV geometry to the hooks for the duration of the
+        // body so an attention-stage PTIR program can score the cache it is
+        // about to attend over. The observation rides on a body-local copy of
+        // the hooks — never ambient state — so a stage hook can only ever see
+        // the page table of the fire that invoked it.
         const model::AttentionObservation observation{
             .kv = &kv,
             .kv_page_indices_d = in.kv_page_indices_d,
@@ -108,9 +88,11 @@ void ForwardFn::invoke_body(model::Workspace& ws,
             .num_requests = in.num_requests,
             .total_tokens = in.total_tokens,
         };
-        model::ScopedAttentionObservation observed(
-            in.stage_hooks != nullptr ? &observation : nullptr);
-        model->body(ws, kv, aws, cublas, in);
+        model::StageHooks hooks = *in.stage_hooks;
+        hooks.observation = &observation;
+        ForwardInputs body_in = in;
+        body_in.stage_hooks = &hooks;
+        model->body(ws, kv, aws, cublas, body_in);
     }
 }
 
@@ -576,7 +558,8 @@ bool forward_graph_replay_eligible(
     int forward_R,
     int num_images,
     int num_clips,
-    bool has_stage_hooks) {
+    bool has_stage_hooks,
+    bool has_lora) {
     const bool mask_pointers_stable =
         !have_custom_mask ||
         (engine.inputs.custom_mask.data() != nullptr &&
@@ -597,7 +580,8 @@ bool forward_graph_replay_eligible(
             static_cast<std::size_t>(std::max(forward_R, 0))) &&
         num_images == 0 &&
         num_clips == 0 &&
-        !has_stage_hooks;
+        !has_stage_hooks &&
+        !has_lora;
 }
 
 void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) {
@@ -621,7 +605,8 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
         in.forward_R,
         in.num_images,
         in.num_clips,
-        in.stage_hooks != nullptr);
+        in.stage_hooks != nullptr,
+        in.lora != nullptr);
     if (graph_eligible) {
         const std::uint32_t graph_layout =
             engine.forward_fn.invoke_graph_layout();
@@ -728,6 +713,7 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
     fwd_in.num_clips                    = in.num_clips;
     fwd_in.precomputed_embeddings       = in.precomputed_embeddings;
     fwd_in.stage_hooks                  = in.stage_hooks;
+    fwd_in.lora                         = in.lora;
     forward_fn.invoke_body(ws, kv_cache, attn_ws, cublas, fwd_in);
 }
 

@@ -1,8 +1,24 @@
 #include "model/llama_like/llama_like_model.hpp"
 
+#include <cstdlib>
 #include <utility>
 
 namespace pie_cuda_driver::model {
+
+namespace {
+
+// Stage 3 opt-in: run the declared-plan executor (declared_forward.cpp) on
+// eligible fires instead of the hand-written body. Default off; cached like
+// `decode_fused_post_enabled` in llama_like.cpp so the gate costs one load.
+bool declared_forward_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_DECLARED_FORWARD");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
+}  // namespace
 
 LlamaLikeModel::LlamaLikeModel(
     Qwen3Weights weights,
@@ -28,6 +44,15 @@ LlamaLikeModel::LlamaLikeModel(
     caps_.graph_padding_kv_write_safe = true;
     caps_.supports_compact_logits = true;
     caps_.supports_runtime_window = true;
+
+    // Trace the declared plan now rather than on first fire: the facts it
+    // needs (config + weight bindings) are all here, and an unrepresentable
+    // config yields an empty plan, which `body` treats as "hand-written
+    // path only" — never an error.
+    if (declared_forward_enabled()) {
+        declared_ = build_llama_like_declared_plan(
+            hf_config_, fwd_cfg_, weights_);
+    }
 }
 
 void LlamaLikeModel::prepare(AttentionWorkspace& attn_ws,
@@ -60,6 +85,45 @@ void LlamaLikeModel::body(Workspace& ws,
                           AttentionWorkspace& attn_ws,
                           ops::CublasHandle& cublas,
                           const ForwardFn::ForwardInputs& in) {
+    // The declared executor covers exactly the hand-written UNFUSED path's
+    // vocabulary; anything it cannot express falls back, per fire, to the
+    // hand-written body below. Build-time exclusions (TP, quantized
+    // projections, non-standard rope, ...) already left `declared_` empty.
+    const bool declared_eligible =
+        static_cast<bool>(declared_) &&
+        in.stage_hooks == nullptr &&
+        // The declared plan has no correction op yet: a lora fire falls back
+        // to the hand-written body, which applies the delta. Running the
+        // declared executor here would silently drop the adapter — the
+        // honest gate is exclusion.
+        in.lora == nullptr &&
+        in.custom_mask_d == nullptr &&
+        // Explicit KV-write fires are in scope (declared_forward.hpp says
+        // why: every graph-replayed decode fire carries them), but only
+        // when the descriptors actually arrived — the same guard the
+        // hand-written fused predicate applies.
+        (!in.has_write_desc ||
+         (in.w_page_d != nullptr && in.w_off_d != nullptr)) &&
+        in.runtime_window_left == -2 &&
+        // The trace committed to the fused QKV binding; a workspace without
+        // the packed buffer cannot honour it (same availability check the
+        // hand-written `use_fused_qkv` makes).
+        (!declared_.fused_qkv || !ws.qkv_fused.empty());
+    if (declared_eligible) {
+        llama_like_forward_declared(
+            declared_, weights_, hf_config_, fwd_cfg_, plan_,
+            ws, kv, attn_ws, cublas,
+            in.token_ids, in.positions,
+            in.qo_indptr_d, in.kv_page_indices_d, in.kv_page_indptr_d,
+            in.kv_last_page_lens_d,
+            in.qo_indptr_h, in.kv_page_indptr_h,
+            in.total_tokens, in.num_requests, in.is_pure_decode,
+            in.logit_row_indices_d, in.num_logit_rows,
+            in.w_page_d, in.w_off_d,
+            in.row_valid_d, in.has_write_desc,
+            in.runtime_window_left);
+        return;
+    }
     llama_like_forward_paged(
         weights_, hf_config_, fwd_cfg_, plan_,
         ws, kv, attn_ws, cublas,
@@ -71,7 +135,10 @@ void LlamaLikeModel::body(Workspace& ws,
         in.logit_row_indices_d, in.num_logit_rows,
         in.custom_mask_d, in.custom_mask_indptr_d,
         in.w_page_d, in.w_off_d, in.row_valid_d, in.has_write_desc,
-        in.runtime_window_left);
+        in.runtime_window_left,
+        /*vision=*/nullptr,
+        in.stage_hooks,
+        in.lora);
 }
 
 std::uint32_t LlamaLikeModel::graph_layout() {
