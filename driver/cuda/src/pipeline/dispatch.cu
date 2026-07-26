@@ -1492,6 +1492,13 @@ struct NotifyContext {
     std::size_t entry_count = 0;
     PinnedHostVector<CommitBumpLane> commit_lanes;
     PinnedHostVector<HostChannelSettlementLane> settlement_lanes;
+    // Scatter-kernel descriptors, materialized from the three vectors below
+    // only when that transport is selected. Pinned so the upload is a real
+    // async copy rather than a staging round trip on the lane thread.
+    PinnedHostVector<HostPublishCopy> publish_copies;
+    // Reused [begin, end) scratch for the destination-overlap test, so the
+    // per-wave check sorts without reallocating.
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> overlap_scratch;
     std::vector<void*> copy_destinations;
     std::vector<const void*> copy_sources;
     std::vector<std::size_t> copy_sizes;
@@ -1532,6 +1539,8 @@ struct NotifyContext {
         entry_count = 0;
         commit_lanes.clear();
         settlement_lanes.clear();
+        publish_copies.clear();
+        overlap_scratch.clear();
         copy_destinations.clear();
         copy_sources.clear();
         copy_sizes.clear();
@@ -1741,6 +1750,7 @@ void CUDART_CB notify_runtime_callback(void* userdata) {
     ctx->callback_fences.clear();
     ctx->commit_lanes.clear();
     ctx->settlement_lanes.clear();
+    ctx->publish_copies.clear();
     ctx->in_use.store(false, std::memory_order_release);
     settle_wave_record(impl, self);
 }
@@ -1751,59 +1761,135 @@ void close_bound_instance(
     std::uint64_t instance_id,
     bool retain_resources = true);
 
-bool host_publish_destinations_overlap(
-    const NotifyContext& context) {
-    for (std::size_t left = 0;
-         left < context.copy_destinations.size();
-         ++left) {
-        const auto left_begin = reinterpret_cast<std::uintptr_t>(
-            context.copy_destinations[left]);
-        const std::size_t left_bytes = context.copy_sizes[left];
-        if (left_bytes >
-            std::numeric_limits<std::uintptr_t>::max() - left_begin) {
+// True if any two publication destinations name overlapping bytes, in which
+// case only a sequential enqueue gives them a defined order.
+//
+// Sorting rather than comparing every pair: a 512-wide wave publishes 512
+// cells, and the quadratic form cost ~130 µs of lane-thread time per wave —
+// the same order as the whole settlement prologue it sits in.
+bool host_publish_destinations_overlap(NotifyContext& context) {
+    const std::size_t count = context.copy_destinations.size();
+    if (count < 2) return false;
+    context.overlap_scratch.clear();
+    context.overlap_scratch.reserve(count);
+    for (std::size_t index = 0; index < count; ++index) {
+        const auto begin =
+            reinterpret_cast<std::uintptr_t>(context.copy_destinations[index]);
+        const std::size_t bytes = context.copy_sizes[index];
+        if (bytes > std::numeric_limits<std::uintptr_t>::max() - begin) {
             return true;
         }
-        const auto left_end = left_begin + left_bytes;
-        for (std::size_t right = left + 1;
-             right < context.copy_destinations.size();
-             ++right) {
-            const auto right_begin = reinterpret_cast<std::uintptr_t>(
-                context.copy_destinations[right]);
-            const std::size_t right_bytes = context.copy_sizes[right];
-            if (right_bytes >
-                std::numeric_limits<std::uintptr_t>::max() - right_begin) {
-                return true;
-            }
-            const auto right_end = right_begin + right_bytes;
-            if (left_begin < right_end && right_begin < left_end) {
-                return true;
-            }
+        context.overlap_scratch.emplace_back(begin, begin + bytes);
+    }
+    std::sort(
+        context.overlap_scratch.begin(), context.overlap_scratch.end());
+    for (std::size_t index = 1; index < count; ++index) {
+        // Sorted by start, so a range can only overlap its predecessor's
+        // reach; empty ranges never overlap.
+        if (context.overlap_scratch[index].first <
+            context.overlap_scratch[index - 1].second) {
+            return true;
         }
     }
     return false;
 }
 
-bool can_batch_host_publish_copies(
-    const NotifyContext& context,
-    cudaStream_t stream) {
+// How a wave's host-visible output cells reach their pinned mirrors.
+//
+// `Scatter` is the default for the decode-shaped waves that dominate: one
+// kernel writes every cell straight into the mapped mirrors, so a wave costs
+// a single launch instead of one copy-engine transfer per (lane, host-read
+// output channel). `Batched` keeps the copy engine for cells big enough that
+// DMA bandwidth beats scattered PCIe writes. `Sequential` is the
+// always-available fallback, and the only path that gives overlapping
+// destinations a defined last-writer-wins order.
+enum class HostPublishTransport {
+    Sequential,
+    Batched,
+    Scatter,
+};
+
+// Cells at or below this size are published by the scatter kernel. A
+// copy-engine D2H costs ~2 µs of GPU time almost independently of size, so
+// below a few KB that fixed cost, not bandwidth, decides; above it the copy
+// engine wins and the work goes back to DMA.
+constexpr std::size_t kMaxScatterCellBytes = 4096;
+
+// Diagnostic override, read once: `PIE_CUDA_HOST_PUBLISH=sequential|batched`
+// pins every wave to one transport so a single build can A/B them. Anything
+// else (including unset) leaves the policy below in charge.
+HostPublishTransport* host_publish_override() {
+    static HostPublishTransport storage{};
+    static HostPublishTransport* value = [] () -> HostPublishTransport* {
+        const char* setting = std::getenv("PIE_CUDA_HOST_PUBLISH");
+        if (setting == nullptr) return nullptr;
+        if (std::strcmp(setting, "sequential") == 0) {
+            storage = HostPublishTransport::Sequential;
+            return &storage;
+        }
+        if (std::strcmp(setting, "batched") == 0) {
+            storage = HostPublishTransport::Batched;
+            return &storage;
+        }
+        return nullptr;
+    }();
+    return value;
+}
+
+HostPublishTransport select_host_publish_transport(
+    NotifyContext& context,
+    cudaStream_t batch_stream) {
+    if (context.copy_destinations.size() <= 1) {
+        return HostPublishTransport::Sequential;
+    }
+    // Neither aggregated transport orders its entries against each other.
+    if (host_publish_destinations_overlap(context)) {
+        return HostPublishTransport::Sequential;
+    }
+    const bool batch_available =
 #if CUDART_VERSION >= 12080
-    return stream != nullptr &&
-        context.copy_destinations.size() > 1 &&
-        !host_publish_destinations_overlap(context);
+        batch_stream != nullptr;
 #else
-    static_cast<void>(context);
-    static_cast<void>(stream);
-    return false;
+        (static_cast<void>(batch_stream), false);
 #endif
+    if (const HostPublishTransport* forced = host_publish_override()) {
+        if (*forced != HostPublishTransport::Batched || batch_available) {
+            return *forced;
+        }
+        return HostPublishTransport::Sequential;
+    }
+    const bool cells_are_small = std::all_of(
+        context.copy_sizes.begin(),
+        context.copy_sizes.end(),
+        [](std::size_t bytes) { return bytes <= kMaxScatterCellBytes; });
+    if (cells_are_small) return HostPublishTransport::Scatter;
+    if (batch_available) return HostPublishTransport::Batched;
+    return HostPublishTransport::Sequential;
 }
 
 void enqueue_host_publish_copies(
     NotifyContext& context,
     cudaStream_t stream,
-    bool batched) {
+    HostPublishTransport transport) {
     if (context.copy_destinations.empty()) return;
+    if (transport == HostPublishTransport::Scatter) {
+        context.publish_copies.clear();
+        for (std::size_t index = 0;
+             index < context.copy_destinations.size();
+             ++index) {
+            context.publish_copies.push_back(HostPublishCopy{
+                .destination = context.copy_destinations[index],
+                .source = context.copy_sources[index],
+                .bytes =
+                    static_cast<std::uint32_t>(context.copy_sizes[index]),
+            });
+        }
+        launch_scatter_host_publish_copies(
+            context.publish_copies.values(), stream);
+        return;
+    }
 #if CUDART_VERSION >= 12080
-    if (batched) {
+    if (transport == HostPublishTransport::Batched) {
         cudaMemcpyAttributes attributes{};
         attributes.srcAccessOrder =
             cudaMemcpySrcAccessOrderStream;
@@ -1844,8 +1930,6 @@ void enqueue_host_publish_copies(
         }
         return;
     }
-#else
-    static_cast<void>(batched);
 #endif
     for (std::size_t index = 0;
          index < context.copy_destinations.size();
@@ -4395,8 +4479,13 @@ bool Dispatch::finish(
             });
         }
     }
-    const bool batch_copies = can_batch_host_publish_copies(
-        *notify, impl_->output_copy_stream);
+    const HostPublishTransport publish_transport =
+        select_host_publish_transport(*notify, impl_->output_copy_stream);
+    // Only the copy-engine batch moves to the dedicated copy stream; the
+    // scatter kernel stays on `callback_stream` so plain stream order already
+    // places it ahead of the settlement kernel that publishes the tails.
+    const bool batch_copies =
+        publish_transport == HostPublishTransport::Batched;
     cudaStream_t settlement_stream = callback_stream;
     if (batch_copies) {
         CUDA_CHECK(cudaEventRecord(
@@ -4408,7 +4497,7 @@ bool Dispatch::finish(
         settlement_stream = impl_->output_copy_stream;
     }
     enqueue_host_publish_copies(
-        *notify, settlement_stream, batch_copies);
+        *notify, settlement_stream, publish_transport);
     launch_settle_host_channels_batch(
         notify->settlement_lanes.values(), settlement_stream);
     if (state.device_tickets != nullptr) {

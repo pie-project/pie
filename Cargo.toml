@@ -18,8 +18,9 @@ members = [
     # Model metadata + instruct chat templates + multimodal host-decode.
     "runtime/model",
     # Shared process skeleton (paths, config sourcing, tracing/metrics, signals,
-    # CLI skeleton). Depends on no role lib.
-    "bootstrap",
+    # CLI skeleton). Depends on no role lib. Lives under `bin/` because it also
+    # ships the `pie-env` command; the bins import its lib as `startup`.
+    "bin/env",
     # Role libraries (pure libs: run(Config) -> Handle; no bin, never dep each other).
     "controller",
     "gateway",
@@ -43,7 +44,7 @@ members = [
     "driver/dummy",
     "runtime/load-planner",
     "sdk/python-server",
-    # Thin binary shells composing bootstrap + role lib(s). `bin/pie` is the
+    # Thin binary shells composing the `startup` skeleton + role lib(s). `bin/pie` is the
     # composition root (deps all three role libs; the standalone).
     "bin/controller",
     "bin/gateway",

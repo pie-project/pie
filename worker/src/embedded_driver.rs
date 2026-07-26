@@ -142,7 +142,7 @@ fn write_toml_table(out_path: &Path, doc: toml::Table) -> Result<()> {
 /// but legal — different ports) don't clobber each other's TOML or
 /// aux sockets.
 pub fn launch_state_dir() -> PathBuf {
-    bootstrap::paths::pie_home()
+    crate::paths::pie_home()
         .join("standalone")
         .join(std::process::id().to_string())
 }

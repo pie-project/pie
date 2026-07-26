@@ -34,6 +34,7 @@
 #include "distributed.hpp"
 #include "entry_validation.hpp"
 #include "cuda_check.hpp"
+#include "kernels_manifest.hpp"
 #include "store/memory_planner.hpp"
 #include "device_buffer.hpp"
 #include "batch/frame.hpp"
@@ -45,7 +46,6 @@
 #include "store/elastic.hpp"
 #include "store/mla_cache.hpp"
 #include "store/dsa_cache.hpp"
-#ifndef PIE_CUDA_QWEN_ONLY
 #include "model/deepseek_v4/deepseek_v4_forward.hpp"
 #include "model/gemma/gemma2.hpp"
 #include "model/gemma4/gemma4.hpp"
@@ -53,13 +53,10 @@
 #include "model/gemma4/gemma4_vision_adapter.hpp"
 #include "model/glm5/glm5_forward.hpp"
 #include "model/kimi/kimi_forward.hpp"
-#endif
 #include "model/llama_like/llama_like.hpp"
 #include "model/loaded_model.hpp"
-#ifndef PIE_CUDA_QWEN_ONLY
 #include "model/nemotron_h/nemotron_h.hpp"
 #include "model/nemotron_h/nemotron_h_forward.hpp"
-#endif
 #include "model/qwen3_5/qwen3_5_config.hpp"
 #include "model/qwen3_5/qwen3_5_forward.hpp"
 #include "model/qwen3_5/qwen3_5_moe_forward.hpp"
@@ -533,10 +530,8 @@ class Context::Impl {
     pie_cuda_driver::BatchEngine* executor_ = nullptr;
     pie_cuda_driver::pipeline::Registry* registry_ = nullptr;
     pie_cuda_driver::model::IModel* model_ = nullptr;
-#ifndef PIE_CUDA_QWEN_ONLY
     pie_cuda_driver::model::VisRawWeights* encode_vision_ = nullptr;
     pie_cuda_driver::model::AudioRawWeights* encode_audio_ = nullptr;
-#endif
     pie_cuda_driver::KvCache* kv_cache_ = nullptr;
     pie_cuda_driver::SwapPool* swap_pool_ = nullptr;
     std::shared_ptr<pie_cuda_driver::CudaPhysicalPool> elastic_pool_;
@@ -708,9 +703,6 @@ int Context::Impl::load_model(
     const model::Family family = arch_entry->family;
 
     if (load.component == PIE_MODEL_COMPONENT_ENCODE) {
-#ifdef PIE_CUDA_QWEN_ONLY
-        return PIE_STATUS_UNSUPPORTED;
-#else
         if (tp_size_ > 1 || family != model::Family::Gemma4 ||
             (!engine.hf_config().gemma_vision.has_value() &&
              !engine.hf_config().gemma_audio.has_value())) {
@@ -765,7 +757,6 @@ int Context::Impl::load_model(
             caps_out->json_len = caps_json_.size();
         }
         return PIE_STATUS_OK;
-#endif
     }
     if (load.component != PIE_MODEL_COMPONENT_FULL) {
         return PIE_STATUS_UNSUPPORTED;
@@ -833,7 +824,6 @@ int Context::Impl::load_model(
     const int qwen3_5_linear_layers = static_cast<int>(std::count(
         qwen3_5_layer_is_linear.begin(), qwen3_5_layer_is_linear.end(), true));
 
-#ifndef PIE_CUDA_QWEN_ONLY
     const std::vector<bool>& nemotron_h_layer_is_mamba =
         plan_info.layer_is_mamba;
     const int nemotron_h_mamba_layers = static_cast<int>(std::count(
@@ -843,10 +833,6 @@ int Context::Impl::load_model(
         family == model::Family::NemotronH
             ? model::nemotron_h_attention_layers(engine.hf_config())
             : 0;
-#else
-    const int nemotron_h_mamba_layers = 0;
-    const int nemotron_h_attention_layer_count = 0;
-#endif
 
     const auto kv_format = kv_cache_format_from_string(
         cfg.batching.kv_cache_dtype, cfg.model.dtype);
@@ -934,10 +920,8 @@ int Context::Impl::load_model(
         (family == model::Family::Qwen3_5 ||
          family == model::Family::Qwen3_5Moe) &&
         qwen3_5_linear_layers > 0
-#ifndef PIE_CUDA_QWEN_ONLY
         || (family == model::Family::NemotronH &&
             nemotron_h_mamba_layers > 0)
-#endif
         ;
     const int runtime_state_slots =
         has_recurrent_state_cache ? mem_plan.max_requests : 0;
@@ -1019,10 +1003,6 @@ int Context::Impl::load_model(
     auto& kv_cache = *kv_cache_p;
     kv_cache.set_elastic_allocator(kv_allocator_);
 
-#ifdef PIE_CUDA_QWEN_ONLY
-    auto* mla_cache_p = own_value(MlaCache{});
-    auto* dsa_cache_p = own_value(DsaCache{});
-#else
     MlaCache* mla_cache_p = nullptr;
     {
         ScopedCudaArenaAllocator arena(*kv_allocator_);
@@ -1045,7 +1025,6 @@ int Context::Impl::load_model(
                   engine.hf_config().max_position_embeddings,
                   engine.hf_config().index_head_dim)
             : DsaCache{});
-#endif
     auto& mla_cache = *mla_cache_p;
     auto& dsa_cache = *dsa_cache_p;
 
@@ -1065,12 +1044,10 @@ int Context::Impl::load_model(
     auto& qwen3_5_state_cache = *qwen3_5_state_cache_p;
     auto* qwen3_5_moe_ws_p = own_emplace<model::Qwen3_5MoeMlpWorkspace>();
     auto& qwen3_5_moe_ws = *qwen3_5_moe_ws_p;
-#ifndef PIE_CUDA_QWEN_ONLY
     auto* nemotron_h_ws_p = own_emplace<model::NemotronHWorkspace>();
     auto& nemotron_h_ws = *nemotron_h_ws_p;
     auto* nemotron_h_state_cache_p = own_emplace<RecurrentStateCache>();
     auto& nemotron_h_state_cache = *nemotron_h_state_cache_p;
-#endif
     int qwen3_5_runtime_rs_slots = 0;
 
     if (family == model::Family::Qwen3_5 || family == model::Family::Qwen3_5Moe) {
@@ -1122,7 +1099,6 @@ int Context::Impl::load_model(
                 cfg_q.shared_expert_intermediate_size / local_tp_size);
         }
     }
-#ifndef PIE_CUDA_QWEN_ONLY
     else if (family == model::Family::NemotronH) {
         const auto& cfg_n = engine.hf_config();
         {
@@ -1153,7 +1129,6 @@ int Context::Impl::load_model(
                 std::max<int>(1, allocated_state_slots));
         }
     }
-#endif
 
     auto* swap_pool_p = own_value(SwapPool::allocate_for_cache(
         kv_cache, static_cast<int>(cfg.batching.swap_pool_size)));
@@ -1183,10 +1158,8 @@ int Context::Impl::load_model(
     auto& persistent_inputs = *persistent_inputs_p;
 
     model::LlamaLikeForwardCfg fwd_cfg{};
-#ifndef PIE_CUDA_QWEN_ONLY
     model::Gemma2ForwardCfg gemma_fwd_cfg{};
     model::Gemma4ForwardCfg gemma4_fwd_cfg{};
-#endif
     {
         const auto& hf = engine.hf_config();
         const std::string& mt = hf.model_type;
@@ -1228,7 +1201,6 @@ int Context::Impl::load_model(
                     local_q_heads / local_kv_heads, mem_plan.kv_page_size);
             }
         }
-#ifndef PIE_CUDA_QWEN_ONLY
         gemma_fwd_cfg.query_pre_attn_scalar =
             hf.gemma_query_pre_attn_scalar;
         gemma_fwd_cfg.final_logit_softcap =
@@ -1240,35 +1212,27 @@ int Context::Impl::load_model(
         gemma_fwd_cfg.force_prefill_path = !gqa_in_decode_set;
         gemma_fwd_cfg.tp_size = local_tp_size;
         gemma_fwd_cfg.tp_comm = tp_comm_ptr;
-#endif
         const bool homogeneous = !has_non_full_attention_layers(hf);
         if (!homogeneous) {
-#ifndef PIE_CUDA_QWEN_ONLY
             gemma_fwd_cfg.per_layer_window_left.reserve(hf.layer_types.size());
             gemma_fwd_cfg.per_layer_rope_theta.reserve(hf.layer_types.size());
-#endif
             fwd_cfg.per_layer_window_left.reserve(hf.layer_types.size());
             for (const auto& t : hf.layer_types) {
                 const bool is_sliding = (t == "sliding_attention");
                 const int window = is_sliding ? hf.sliding_window : -1;
-#ifndef PIE_CUDA_QWEN_ONLY
                 gemma_fwd_cfg.per_layer_window_left.push_back(window);
-#endif
                 fwd_cfg.per_layer_window_left.push_back(window);
-#ifndef PIE_CUDA_QWEN_ONLY
                 const float theta =
                     (is_sliding && hf.rope_local_base_freq > 0.f)
                         ? hf.rope_local_base_freq
                         : hf.rope_theta;
                 gemma_fwd_cfg.per_layer_rope_theta.push_back(theta);
-#endif
             }
         }
         cudaDeviceProp serving_prop{};
         CUDA_CHECK(cudaGetDeviceProperties(&serving_prop, device_ordinal_));
         const bool prefill_decode_supported_head_dim =
-            hf.head_dim_kernel == 64 || hf.head_dim_kernel == 128 ||
-            hf.head_dim_kernel == 256 || hf.head_dim_kernel == 512;
+            attn_head_dim_instantiated(hf.head_dim_kernel);
         const bool force_prefill_decode_plan = [] {
             const char* v = std::getenv("PIE_CUDA_PREFILL_DECODE_PLAN");
             return v != nullptr && v[0] != '\0' && v[0] != '0';
@@ -1290,7 +1254,6 @@ int Context::Impl::load_model(
                 kv_heavy_attention ? 1 : 7;
         }
     }
-#ifndef PIE_CUDA_QWEN_ONLY
     if (family == model::Family::Gemma4) {
         const auto& hf = engine.hf_config();
         gemma4_fwd_cfg.final_logit_softcap = hf.gemma_final_logit_softcap;
@@ -1299,13 +1262,11 @@ int Context::Impl::load_model(
         gemma4_fwd_cfg.tp_size = local_tp_size;
         gemma4_fwd_cfg.tp_comm = tp_comm_ptr;
     }
-#endif
 
     ForwardFn forward_fn;
     NativeSystemDrafter system_drafter;
     auto* graph_cache_p = use_cuda_graphs ? own_emplace<ForwardGraphCache>() : nullptr;
 
-#ifndef PIE_CUDA_QWEN_ONLY
     model::DsV4Workspace* dsv4_ws_p = nullptr;
     model::KimiWorkspace* kimi_ws_p = nullptr;
     model::Glm5Workspace* glm5_ws_p = nullptr;
@@ -1360,7 +1321,6 @@ int Context::Impl::load_model(
             hf_cfg.num_hidden_layers *
                 hf_cfg.gemma_hidden_size_per_layer_input);
     }
-#endif
 
     // The registry owns architecture selection: exactly one `create_model`
     // call constructs the `IModel` from the bound plan plus every
@@ -1385,7 +1345,6 @@ int Context::Impl::load_model(
     resources.qwen3_5_state_cache = &qwen3_5_state_cache;
     resources.system_drafter = &system_drafter;
     resources.native_mtp_num_drafts = native_mtp_num_drafts;
-#ifndef PIE_CUDA_QWEN_ONLY
     resources.gemma_fwd_cfg = &gemma_fwd_cfg;
     resources.gemma4_fwd_cfg = &gemma4_fwd_cfg;
     resources.gemma4_moe_ws = &gemma4_moe_ws;
@@ -1394,7 +1353,6 @@ int Context::Impl::load_model(
     resources.dsv4_ws = &dsv4_ws;
     resources.kimi_ws = &kimi_ws;
     resources.glm5_ws = &glm5_ws;
-#endif
 
     auto* model_holder =
         own_value(arch_entry->create_model(std::move(plan), resources));
@@ -1424,12 +1382,10 @@ int Context::Impl::load_model(
         std::max(1024, mem_plan.capacity.max_forward_requests * 48)));
     const bool complete_attention_hook_coverage =
         tp_size_ == 1
-#ifndef PIE_CUDA_QWEN_ONLY
         && family != model::Family::Csm &&
         !(family == model::Family::NemotronH &&
           nemotron_h_attention_layer_count !=
               engine.hf_config().num_hidden_layers)
-#endif
         ;
     registry_->dispatch().set_attention_hook_coverage(
         complete_attention_hook_coverage,
@@ -1458,11 +1414,7 @@ int Context::Impl::load_model(
                 : ((family == model::Family::Qwen3_5 ||
                     family == model::Family::Qwen3_5Moe)
                        ? &qwen3_5_state_cache
-#ifndef PIE_CUDA_QWEN_ONLY
                        : &nemotron_h_state_cache
-#else
-                       : nullptr
-#endif
                   ));
     }
     executor_p->dispatch = &registry_->dispatch();
@@ -1525,19 +1477,6 @@ int Context::Impl::load_model(
     c.total_pages = runtime_kv_pages;
     c.swap_pool_size = swap_pool.num_pages();
     const bool rs_cache_required = has_recurrent_state_cache && runtime_state_slots > 0;
-#ifdef PIE_CUDA_QWEN_ONLY
-    const std::uint64_t rs_cache_slots = rs_cache_required
-        ? static_cast<std::uint64_t>(qwen3_5_runtime_rs_slots)
-        : 0;
-    const std::uint64_t rs_cache_slot_bytes = rs_cache_required
-        ? static_cast<std::uint64_t>(qwen3_5_linear_layers) *
-              (qwen3_5_state_cache.conv_slot_stride_bytes() +
-               qwen3_5_state_cache.recurrent_slot_stride_bytes()) +
-              static_cast<std::uint64_t>(
-                  std::max(0, qwen3_5_state_cache.hidden_size())) *
-                  sizeof(std::uint16_t)
-        : 0;
-#else
     const std::uint64_t rs_cache_slots = rs_cache_required
         && family == model::Family::NemotronH
             ? static_cast<std::uint64_t>(runtime_state_slots)
@@ -1555,7 +1494,6 @@ int Context::Impl::load_model(
           static_cast<std::uint64_t>(
               std::max(0, qwen3_5_state_cache.hidden_size())) *
               sizeof(std::uint16_t);
-#endif
     const auto max_forward_requests_caps = rs_cache_required
         ? std::min<std::uint64_t>(
               static_cast<std::uint64_t>(mem_plan.capacity.max_forward_requests),
@@ -1996,11 +1934,6 @@ int Context::Impl::bind_instance(const PieInstanceDesc& instance, PieInstanceBin
 int Context::Impl::encode(const PieEncodeDesc& encode, PieCompletion completion) {
     pie_cuda_driver::ops::ScopedRuntimeQuantContext quant_scope(
         runtime_quant_context_);
-#ifdef PIE_CUDA_QWEN_ONLY
-    (void)encode;
-    (void)completion;
-    return PIE_STATUS_UNSUPPORTED;
-#else
     if (model_ == nullptr && encode_vision_ == nullptr &&
         encode_audio_ == nullptr) {
         return PIE_STATUS_CLOSED;
@@ -2096,7 +2029,6 @@ int Context::Impl::encode(const PieEncodeDesc& encode, PieCompletion completion)
         std::cerr << "[pie-driver-cuda] encode: " << e.what() << "\n";
         return PIE_STATUS_DRIVER_ERROR;
     }
-#endif
 }
 
 int Context::Impl::copy_kv(const PieKvCopyDesc& copy, PieCompletion completion) {
@@ -2193,7 +2125,25 @@ int Context::Impl::copy_kv(const PieKvCopyDesc& copy, PieCompletion completion) 
             keep_async_value(keepalive, std::move(d_src_page));
             keep_async_value(keepalive, std::move(d_src_off));
         }
-        if (has_page_copies && (!keepalive.empty() || completion.wait_id != 0)) {
+        if (copy.cells.len == 0) {
+            // Standalone page copies (suspend D2H / restore H2D / graft
+            // D2D): complete on the SWAP stream. Routing the completion
+            // through the compute stream — and making the compute stream
+            // WAIT on the swap event — turned every transfer into a wave
+            // stall: all launches posted after this point queued behind
+            // PCIe (CONTENTION_FOLLOWUP.md §17.1). No stream
+            // join is needed for visibility: the pages move only while
+            // grant-pinned or suspend-fenced, and the fires that read
+            // them are posted only after the engine observes this
+            // completion (ledger commit first) — host-side
+            // happens-before covers the device.
+            enqueue_completion(swap_pool_->stream(), completion);
+            return PIE_STATUS_OK;
+        }
+        if (has_page_copies) {
+            // Mixed descriptor (page copies + cell moves): the compute-
+            // stream cell kernels must observe the swap-stream page
+            // copies — keep the join.
             cudaEvent_t swap_done = nullptr;
             CUDA_CHECK(cudaEventCreateWithFlags(&swap_done, cudaEventDisableTiming));
             CUDA_CHECK(cudaEventRecord(swap_done, swap_pool_->stream()));

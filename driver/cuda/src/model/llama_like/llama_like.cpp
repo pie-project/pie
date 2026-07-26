@@ -21,9 +21,7 @@
 #include "kernels/rope.hpp"
 #include "kernels/split_packed.hpp"
 #include "kernels/swiglu.hpp"
-#ifndef PIE_CUDA_QWEN_ONLY
 #include "model/qwen3_vl/qwen3_vl_vision_forward.hpp"
-#endif
 #include "model/stage_hooks.hpp"
 #include "ops/attention_flashinfer.hpp"
 #include "ops/gemm.hpp"
@@ -367,7 +365,6 @@ void llama_like_forward_paged(
     // 1b. Qwen3-VL multimodal: encode each image and overwrite its soft-token
     // rows in the embed output; also stash the deepstack merger outputs (added
     // into the hidden state on image rows after early decoder layers below).
-#ifndef PIE_CUDA_QWEN_ONLY
     if (vision != nullptr && vision->vision_in != nullptr &&
         vision->vision_in->num_images > 0) {
         scatter_qwen3vl_vision(
@@ -377,9 +374,6 @@ void llama_like_forward_paged(
             static_cast<__nv_bfloat16*>(vision->deepstack_scratch),
             vision->num_deepstack, cublas.handle(), stream);
     }
-#else
-    (void)vision;
-#endif
 
     // Some GQA group sizes (Qwen2 small models — 6, 7) aren't in
     // flashinfer's decode dispatch table; for those we run the prefill

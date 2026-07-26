@@ -1864,7 +1864,7 @@ mod tests {
 
         let home_ws = {
             let stores = crate::store::registry::get(model_idx, 0);
-            let id = stores.kv.lock().unwrap().create_working_set();
+            let id = stores.kv.lock().create_working_set();
             id
         };
         let program = empty_registered_program();
@@ -1898,7 +1898,6 @@ mod tests {
             crate::store::registry::get(model_idx, 0)
                 .kv
                 .lock()
-                .unwrap()
                 .committed_token_len(home_ws, 16)
                 .unwrap(),
             32
@@ -1995,7 +1994,7 @@ mod tests {
             Some(client),
         );
         let home_stores = crate::store::registry::get(model_idx, 0);
-        let home_ws = home_stores.kv.lock().unwrap().create_working_set();
+        let home_ws = home_stores.kv.lock().create_working_set();
         let program = empty_registered_program();
         let tokens = (0..33).collect::<Vec<u32>>();
         let original = pie_driver_abi::LaunchPlan {
@@ -2023,7 +2022,7 @@ mod tests {
             .is_none()
         );
         assert_eq!(request, original, "fallback must keep the full local plan");
-        let home = home_stores.kv.lock().unwrap();
+        let home = home_stores.kv.lock();
         assert_eq!(home.mapped_len(home_ws).unwrap(), 0);
         assert_eq!(home.available_pages(), 8);
         drop(home);

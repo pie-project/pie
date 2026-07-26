@@ -47,12 +47,8 @@ impl crate::pipeline::fire::FireContext for ProcessCtx {
         ProcessCtx::commit_fire_timing(self, enabled);
     }
 
-    async fn honor_preemption(&mut self) -> anyhow::Result<()> {
-        crate::inferlet::process::preemption::honor(self).await
-    }
-
-    fn preemption_signal(&self) -> Option<std::sync::Arc<tokio::sync::Notify>> {
-        crate::store::reclaim::contention()?.park_signal(self.id())
+    async fn settle_pipeline_tail(&mut self) -> anyhow::Result<()> {
+        crate::inferlet::process::gate::drain_pending_fires(self).await
     }
 }
 

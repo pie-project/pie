@@ -1,5 +1,5 @@
 //! One-shot operational subcommands (P5b). Each runs after the light
-//! `bootstrap::init_cli` (tracing + paths, no daemon banner/config/metrics) on
+//! `startup::init_cli` (tracing + paths, no daemon banner/config/metrics) on
 //! the shared `#[tokio::main]` runtime. The R3 weight/runtime *download* IO
 //! (`hf`, `py_runtime`) lives here — the worker lib links no provisioning code.
 

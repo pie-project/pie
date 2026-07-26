@@ -131,7 +131,6 @@ fn cold_hold() -> Duration {
 /// epoch — an unresponsive lane leaves only through close/terminate.
 const STRICT_WATCHDOG_US: u64 = 1_000_000;
 
-
 struct ArrivedFire {
     slot: u32,
     /// `None` when the fire was rejected at scheduler admission — it counts
@@ -452,7 +451,6 @@ impl FramePolicy {
         !self.pending_binds.is_empty()
     }
 
-
     pub fn on_bind_completed(&mut self, pid: Option<ProcessId>) {
         if let Some(pid) = pid
             && let Some(count) = self.pending_binds.get_mut(&pid)
@@ -468,7 +466,19 @@ impl FramePolicy {
     /// queued fires were rejected); graceful Close releases the lane from
     /// the wait-set immediately but keeps queued frames — the
     /// already-accepted fires drain to settlement.
-    pub fn on_lane_leave(&mut self, lane: ProcessId, purge_queued: bool) {
+    ///
+    /// TWO KEY SPACES: `lane` is a PIPELINE SCOPE id (see `record_arrival`),
+    /// while `staged` / `joins_in_flight` / `pending_binds` are PROCESS
+    /// scoped. `owner` therefore has to be supplied by the caller whenever
+    /// the leaver has no lane yet — a process that parks in KV acquire
+    /// BEFORE its first fire has nothing in `lanes` to recover an owner
+    /// from, so cleaning the process-keyed maps with `lane` silently matched
+    /// nothing and left the process in `joins_in_flight` forever, wedging
+    /// the seal gate against a join that could never arrive.
+    pub fn on_lane_leave(&mut self, lane: ProcessId, owner: Option<ProcessId>, purge_queued: bool) {
+        // Recover the owner from the lane while it still exists; an explicit
+        // `owner` wins, since a laneless leaver can only be identified that way.
+        let owner = owner.or_else(|| self.lanes.get(&lane).and_then(|state| state.owner));
         if purge_queued {
             self.lanes.remove(&lane);
         } else if let Some(state) = self.lanes.get_mut(&lane) {
@@ -477,14 +487,37 @@ impl FramePolicy {
                 self.lanes.remove(&lane);
             }
         }
-        self.pending_binds.remove(&lane);
-        self.forget_staged(lane);
+        if let Some(owner) = owner {
+            self.pending_binds.remove(&owner);
+            self.forget_staged(owner);
+        }
         self.maybe_reset_episode();
     }
 
     /// Every scope owned by `owner` left (process terminate/suspend).
     pub fn on_process_leave(&mut self, owner: ProcessId) {
         self.lanes.retain(|_, lane| lane.owner != Some(owner));
+        self.pending_binds.remove(&owner);
+        self.forget_staged(owner);
+        self.maybe_reset_episode();
+    }
+
+    /// The planner is evicting `owner`: every lane it owns stops being
+    /// awaited so boundaries seal without it, but already-submitted frames
+    /// stay sealable — the tail drains untracked (exactly the graceful
+    /// pipeline-close shape, applied process-wide), releasing the fire
+    /// leases the eviction's quiescence wait needs. Purging here would
+    /// instead orphan the queued fires WITH their leases and wedge the
+    /// eviction. Rejoin is implicit: post-restore, the lane's next arrival
+    /// recreates it awaited.
+    pub fn on_process_suspend(&mut self, owner: ProcessId) {
+        self.lanes.retain(|_, lane| {
+            if lane.owner != Some(owner) {
+                return true;
+            }
+            lane.awaited = false;
+            !lane.frames.is_empty()
+        });
         self.pending_binds.remove(&owner);
         self.forget_staged(owner);
         self.maybe_reset_episode();
@@ -752,8 +785,7 @@ impl FramePolicy {
                 .lanes
                 .values()
                 .filter(|lane| {
-                    lane.awaited
-                        && !lane.frames.front().is_some_and(PendingFrame::is_complete)
+                    lane.awaited && !lane.frames.front().is_some_and(PendingFrame::is_complete)
                 })
                 .count();
             let joining = !self.joins_in_flight.is_empty()
@@ -820,10 +852,7 @@ impl FramePolicy {
                 .map(|deadline| deadline.saturating_duration_since(Instant::now())),
         );
         for (pid, lane) in &self.lanes {
-            let front_complete = lane
-                .frames
-                .front()
-                .is_some_and(PendingFrame::is_complete);
+            let front_complete = lane.frames.front().is_some_and(PendingFrame::is_complete);
             let _ = write!(
                 out,
                 "\n  lane {pid}: awaited={} queued_frames={} front_complete={front_complete}",
@@ -868,9 +897,7 @@ mod tests {
     fn drive_past_cold_hold(policy: &mut FramePolicy, queued: &HashSet<u64>) -> FramePlan {
         let now = Instant::now();
         match plan(policy, queued, now) {
-            FramePlan::Hold(hold) => {
-                plan(policy, queued, now + hold + Duration::from_micros(1))
-            }
+            FramePlan::Hold(hold) => plan(policy, queued, now + hold + Duration::from_micros(1)),
             plan => plan,
         }
     }
@@ -1053,9 +1080,12 @@ mod tests {
         // Seal happens; dispatch holds on the blocked lane.
         let now = Instant::now();
         let held = match policy.plan_dispatch(&queued, &blocked, false, now) {
-            FramePlan::Hold(hold) => {
-                policy.plan_dispatch(&queued, &blocked, false, now + hold + Duration::from_micros(1))
-            }
+            FramePlan::Hold(hold) => policy.plan_dispatch(
+                &queued,
+                &blocked,
+                false,
+                now + hold + Duration::from_micros(1),
+            ),
             plan => plan,
         };
         assert!(
@@ -1090,8 +1120,11 @@ mod tests {
              books alone do not re-arm the gather"
         );
         // Only the lane's LEAVE empties the wait-set and re-arms bootstrap.
-        policy.on_lane_leave(lane, false);
-        assert!(!policy.ever_sealed, "an emptied wait-set re-arms the gather");
+        policy.on_lane_leave(lane, None, false);
+        assert!(
+            !policy.ever_sealed,
+            "an emptied wait-set re-arms the gather"
+        );
     }
 
     #[test]
@@ -1197,7 +1230,7 @@ mod tests {
             plan => panic!("the gather must block on lane a, got {plan:?}"),
         }
         // a closes gracefully: released from the wait-set, b seals.
-        policy.on_lane_leave(a, false);
+        policy.on_lane_leave(a, None, false);
         let next = plan(&mut policy, &queued, Instant::now());
         assert_eq!(fires(&next), vec![92]);
     }
@@ -1248,6 +1281,57 @@ mod tests {
         assert_eq!(wave0, vec![95, 96], "both lanes gathered into one epoch");
     }
 
+    /// REGRESSION (the frame-seal wedge). A joined-but-unfired successor that
+    /// parks in KV allocation must release the seal — and it has NO lane yet,
+    /// so the only thing that identifies it is the owner travelling with the
+    /// leave. `lanes` is keyed by pipeline scope while `staged` /
+    /// `joins_in_flight` are keyed by process; cleaning the latter with the
+    /// lane id silently matched nothing, so the gather waited forever for a
+    /// join that could not arrive while the fleet held every KV page.
+    #[test]
+    fn a_parked_join_releases_the_seal_even_though_it_has_no_lane() {
+        let mut policy = FramePolicy::new(2, 64, 4096, None);
+        let lane = pid();
+        let successor = pid();
+        let successor_scope = pid(); // distinct id space from the process
+        policy.on_fire_enqueued(stamp(lane, 0, 0, 1), Some(lane), 95, 1, 1);
+        policy.on_bind_enqueued(Some(successor));
+        policy.on_bind_completed(Some(successor));
+        policy.on_execution_slot_released(pid());
+        policy.on_execution_slot_consumed(successor);
+        let queued: HashSet<u64> = [95].into_iter().collect();
+        match drive_past_cold_hold(&mut policy, &queued) {
+            FramePlan::Hold(_) => {}
+            plan => panic!("an admitted-but-unfired join must hold, got {plan:?}"),
+        }
+
+        // It blocks on KV before ever firing: leave carries the scope id it
+        // waits under AND the owning process.
+        policy.on_lane_leave(successor_scope, Some(successor), false);
+        let sealed = drive_past_cold_hold(&mut policy, &queued);
+        assert_eq!(
+            fires(&sealed),
+            vec![95],
+            "the fleet must seal without the parked join"
+        );
+    }
+
+    /// The owner is still recovered from the lane when the caller does not
+    /// supply one, so pipeline-scoped closes keep working unchanged.
+    #[test]
+    fn lane_leave_without_an_owner_recovers_it_from_the_lane() {
+        let mut policy = FramePolicy::new(2, 64, 4096, None);
+        let lane = pid();
+        let owner = pid();
+        policy.on_fire_enqueued(stamp(lane, 0, 0, 1), Some(owner), 95, 1, 1);
+        policy.on_bind_enqueued(Some(owner)); // stages the OWNER, not the lane
+        policy.on_lane_leave(lane, None, true);
+        assert!(
+            !policy.staged.contains(&owner),
+            "the lane's recorded owner must clear the process-keyed staging"
+        );
+    }
+
     /// Regression: between a slot holder's Terminate leave and its
     /// teardown's release broadcast the balance reads zero, and a seal
     /// check in that window closed on the partial cohort — splitting the
@@ -1268,7 +1352,7 @@ mod tests {
         policy.on_bind_completed(Some(successor));
         // Terminate leave lands pass-granular, release still in flight.
         policy.on_slotted_terminate(predecessor);
-        policy.on_lane_leave(predecessor, true);
+        policy.on_lane_leave(predecessor, None, true);
         policy.on_process_leave(predecessor);
         let queued: HashSet<u64> = [95].into_iter().collect();
         match drive_past_cold_hold(&mut policy, &queued) {
@@ -1457,8 +1541,8 @@ mod tests {
         policy.on_fire_enqueued(stamp(closed, 0, 0, 1), Some(owner), 50, 1, 1);
         policy.on_fire_enqueued(stamp(terminated, 0, 0, 1), Some(owner), 51, 1, 1);
 
-        policy.on_lane_leave(closed, false);
-        policy.on_lane_leave(terminated, true);
+        policy.on_lane_leave(closed, None, false);
+        policy.on_lane_leave(terminated, None, true);
         let queued: HashSet<u64> = [50].into_iter().collect();
         let sealed = drive_past_cold_hold(&mut policy, &queued);
         assert_eq!(fires(&sealed), vec![50]);

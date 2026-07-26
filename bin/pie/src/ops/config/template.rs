@@ -98,7 +98,6 @@ hf_repo = "Qwen/Qwen3-0.6B"
 
 [model.scheduler]
 request_timeout_secs = 120
-restore_pause_at_utilization = 0.85
 "#;
 
 #[cfg(feature = "driver-cuda")]

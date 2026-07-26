@@ -1,7 +1,7 @@
 //! `$PIE_HOME` and the well-known files under it.
 //!
 //! Re-implemented here (rather than reaching into the runtime crate) so
-//! `bootstrap` depends on no role/runtime library — it is the dependency floor
+//! `startup` depends on no role/runtime library — it is the dependency floor
 //! for the bins. Empty `$PIE_HOME` is ignored so callers get the same fallback
 //! semantics everywhere (`$PIE_HOME` else `~/.pie`).
 

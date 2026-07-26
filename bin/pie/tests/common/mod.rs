@@ -88,9 +88,9 @@ pub fn cuda_standalone_toml_capped(
     gpu_mem_utilization: f64,
     total_pages: u32,
 ) -> String {
-    // cpu_pages (the runtime KV stash pool for v2 suspend/restore) is derived from
-    // the cuda driver's `swap_pool_size` (translate.rs:117). MANDATORY > 0 for v2
-    // (guru: with swap_pool_size=0 the runtime cpu_pages=0 → every suspend is
+    // cpu_pages (the runtime KV stash pool for suspend/restore) is derived from
+    // the cuda driver's `swap_pool_size` (translate.rs:117). MANDATORY > 0 for
+    // suspend/restore (with swap_pool_size=0 the runtime cpu_pages=0 → every suspend is
     // all-cold → the fix makes suspends inert (freed_now=0 → decline), and pre-fix
     // it silently dropped written KV → "slot 0 has no written page"). Default 512
     // (host RAM is cheap; must hold the fleet's stashed overage). Override via

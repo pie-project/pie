@@ -1,11 +1,11 @@
 //! `pie-worker` daemon — runs the inference runtime: boots drivers, serves the
 //! engine, and (distributed) dials into the gateway + registers with the
-//! controller. A thin bin shell (Seam 3): the `bootstrap` process skeleton
+//! controller. A thin bin shell (Seam 3): the `startup` process skeleton
 //! composed with the `pie-worker` role library — only the two domain lines
 //! (`Config::parse` + `run`) and the role-specific flags differ from the other
 //! role bins.
 //!
-//! Model A: this bin owns the tokio runtime (`#[tokio::main]`); `bootstrap` is
+//! Model A: this bin owns the tokio runtime (`#[tokio::main]`); `startup` is
 //! runtime-agnostic; `run` / `run_until_signal` / `shutdown` are async, awaited
 //! on this runtime.
 
@@ -20,13 +20,13 @@ use clap::Parser;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 /// Pie worker daemon. Global flags (`--config` / `--log-level` / `--metrics-addr`)
-/// come from `bootstrap`'s [`GlobalArgs`](bootstrap::GlobalArgs); the worker adds
+/// come from `startup`'s [`GlobalArgs`](startup::GlobalArgs); the worker adds
 /// optional overrides of its config-file values.
 #[derive(Parser)]
 #[command(name = "pie-worker", version)]
 struct Cli {
     #[command(flatten)]
-    global: bootstrap::GlobalArgs,
+    global: startup::GlobalArgs,
 
     /// Override the client-facing server host from config.
     #[arg(long)]
@@ -48,8 +48,8 @@ struct Cli {
 #[tokio::main]
 async fn main() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
-    let ctx = bootstrap::init(
-        bootstrap::BootSpec::worker().version(env!("CARGO_PKG_VERSION")),
+    let ctx = startup::init(
+        startup::BootSpec::worker().version(env!("CARGO_PKG_VERSION")),
         cli.global,
     )?;
 

@@ -1,7 +1,7 @@
 //! The narrow surface [`fire`](super)'s orchestration needs from its caller:
 //! WASM component resource-table access (to get/get_mut/delete/push
 //! `Resource<Channel>`/`Resource<ForwardPass>`/`Resource<Pipeline>` handles)
-//! and the calling process's identity (the reclaim ladder's FCFS key). This
+//! and the calling process's identity (the planner's FCFS key). This
 //! trait names no `inferlet`/`ProcessCtx` type — only the external
 //! `wasmtime::component::ResourceTable` leaf type and `uuid::Uuid` — so
 //! `pipeline/` stays strictly below `inferlet/` in the layering.
@@ -19,8 +19,8 @@ pub trait FireContext {
     /// operates on).
     fn resources(&mut self) -> &mut ResourceTable;
 
-    /// This process's identity — the reclaim ladder's FCFS key
-    /// (`crate::store::reclaim::ProcessId` / `crate::scheduler::ProcessId`
+    /// This process's identity — the planner's FCFS key
+    /// (`crate::planner::ProcessId` / `crate::scheduler::ProcessId`
     /// are the same `uuid::Uuid` representation; returned as the leaf-crate
     /// type directly so this trait need not name either module).
     fn process_id(&self) -> uuid::Uuid;
@@ -34,10 +34,11 @@ pub trait FireContext {
     /// Commit a compact-ledger claim only after scheduler queue admission.
     fn commit_fire_timing(&mut self, _enabled: bool) {}
 
-    /// Honor a requester self-suspend decision while this task still owns the
-    /// process continuation.
-    async fn honor_preemption(&mut self) -> anyhow::Result<()>;
-
-    /// Notification raised when this process is asked to quiesce.
-    fn preemption_signal(&self) -> Option<std::sync::Arc<tokio::sync::Notify>>;
+    /// Settle this process's own pipeline tail (finalize every pending op,
+    /// device-geometry included — only the owning guest task can, since the
+    /// finalization needs its ResourceTable). Called when the planner yields
+    /// an acquire back for eviction. Non-process contexts have no tail.
+    async fn settle_pipeline_tail(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }

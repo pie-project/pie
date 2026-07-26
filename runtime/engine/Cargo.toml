@@ -19,6 +19,7 @@ pie-ptir = { path = "../../interface/ptir", features = ["eval"] }
 pie-client = { path = "../../client/rust" }
 tokio = { version = "1.53", features = ["full"] }
 tokio-util = "0.7"
+parking_lot = "0.12"
 tarpc = { version = "0.37", features = ["serde1"] }
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }

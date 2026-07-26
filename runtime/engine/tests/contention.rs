@@ -1,4 +1,5 @@
-//! Deterministic host-only active KV preemption integration test.
+//! Deterministic host-only planner eviction/restore integration test
+//! (Project Rainer).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,11 +12,6 @@ use pie_engine::inferlet::program::ProgramName;
 
 #[test]
 fn active_preemption_swaps_and_restores_an_over_capacity_fleet() {
-    unsafe {
-        std::env::set_var("PIE_KV_CONTENTION", "preempt");
-        std::env::set_var("PIE_KV_PREEMPT_ACTIVE", "1");
-        std::env::set_var("PIE_KV_EXHAUSTION_MS", "5000");
-    }
     inferlets::build_inferlets();
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let env = create_mock_env("contention-model", 1, 4, Arc::new(EchoBehavior(42)));
@@ -56,12 +52,10 @@ fn active_preemption_swaps_and_restores_an_over_capacity_fleet() {
             let received = match tokio::time::timeout(Duration::from_secs(20), receiver).await {
                 Ok(received) => received,
                 Err(_) => {
-                    // Dump the orchestrator AND scheduler state with the
+                    // Dump the planner AND scheduler state with the
                     // failure: which lane wedged, what it waits on, where the
                     // pool stands, and what the wave barrier holds.
-                    let diagnostics = pie_engine::store::reclaim::contention()
-                        .unwrap()
-                        .diagnostics();
+                    let diagnostics = pie_engine::planner::planner().unwrap().diagnostics();
                     let scheduler = pie_engine::scheduler::debug_dump(0)
                         .await
                         .unwrap_or_else(|error| format!("<unavailable: {error}>"));
@@ -92,14 +86,12 @@ fn active_preemption_swaps_and_restores_an_over_capacity_fleet() {
     runtime.block_on(async {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                let diagnostics = pie_engine::store::reclaim::contention()
-                    .unwrap()
-                    .diagnostics();
+                let diagnostics = pie_engine::planner::planner().unwrap().diagnostics();
                 if process::list().is_empty()
                     && diagnostics.host_slots_free == diagnostics.host_slots_total
                     && diagnostics.device_pages_free == diagnostics.device_pages_total
-                    && diagnostics.waiters.is_empty()
-                    && diagnostics.suspended.is_empty()
+                    && diagnostics.queue.is_empty()
+                    && diagnostics.proc_states[1..].iter().all(|&n| n == 0)
                 {
                     break;
                 }
@@ -109,11 +101,11 @@ fn active_preemption_swaps_and_restores_an_over_capacity_fleet() {
         .await
         .expect("contention processes must reach teardown");
     });
-    let orchestrator = pie_engine::store::reclaim::contention().unwrap();
-    let diagnostics = orchestrator.diagnostics();
+    let planner = pie_engine::planner::planner().unwrap();
+    let diagnostics = planner.diagnostics();
     assert!(
-        diagnostics.suspends_total > 0,
-        "active preemption never engaged; diagnostics: {diagnostics:#?}"
+        diagnostics.evictions_total > 0,
+        "planner eviction never engaged; diagnostics: {diagnostics:#?}"
     );
     assert!(diagnostics.restores_total > 0);
     assert!(diagnostics.d2h_pages_total > 0);
@@ -123,6 +115,6 @@ fn active_preemption_swaps_and_restores_an_over_capacity_fleet() {
         diagnostics.device_pages_free,
         diagnostics.device_pages_total
     );
-    assert!(diagnostics.waiters.is_empty());
-    assert!(diagnostics.suspended.is_empty());
+    assert!(diagnostics.queue.is_empty());
+    assert!(diagnostics.proc_states[1..].iter().all(|&n| n == 0));
 }

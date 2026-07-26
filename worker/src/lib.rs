@@ -12,6 +12,7 @@
 pub mod config;
 pub mod driver_ffi;
 pub mod embedded_driver;
+pub mod paths;
 pub mod translate;
 pub mod weights;
 

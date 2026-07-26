@@ -146,7 +146,6 @@ impl MockEnv {
                 drivers,
                 scheduler: SchedulerConfig {
                     request_timeout_secs: 30,
-                    restore_pause_at_utilization: 0.85,
                 },
             },
             runtime: RuntimeConfig {

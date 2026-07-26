@@ -303,12 +303,7 @@ impl TensorDecl {
 }
 
 pub fn tensor_nbytes(shape: &[i64], element_bytes: u64) -> Option<u64> {
-    let mut elements = 1u64;
-    for dim in shape {
-        let dim = u64::try_from(*dim).ok()?;
-        elements = elements.checked_mul(dim)?;
-    }
-    elements.checked_mul(element_bytes)
+    tensor_elements(shape)?.checked_mul(element_bytes)
 }
 
 pub fn tensor_elements(shape: &[i64]) -> Option<u64> {

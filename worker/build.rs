@@ -153,7 +153,7 @@ fn build_cuda() {
     let mut cfg = driver_cmake_config(&driver_dir, "cuda", "pie_driver_cuda_lib");
 
     // nvcc discovery, CUDA arch, the sccache/ccache launcher, the Marlin
-    // toggles and the CPM source cache are all handled by driver/cuda's
+    // toggle and the CPM source cache are all handled by driver/cuda's
     // CMakeLists (via find_program / `$ENV{...}`); we only declare the env
     // deps here so Cargo reconfigures when they change.
     for var in [
@@ -162,14 +162,9 @@ fn build_cuda() {
         "CMAKE_CUDA_ARCHITECTURES",
         "PIE_COMPILER_LAUNCHER",
         "PIE_CUDA_BUILD_MARLIN",
-        "PIE_CUDA_QWEN_ONLY",
-        "PIE_MARLIN_ALL_SHAPES",
         "CPM_SOURCE_CACHE",
     ] {
         println!("cargo:rerun-if-env-changed={var}");
-    }
-    if let Some(value) = std::env::var_os("PIE_CUDA_QWEN_ONLY") {
-        cfg.define("PIE_CUDA_QWEN_ONLY", value);
     }
 
     let build_dir = cfg.build().join("build");

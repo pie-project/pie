@@ -379,6 +379,73 @@ inline constexpr std::uint32_t kTicketRequireInput = 1u << 4;
         }
     }
 
+    // One host-visible output cell on its way to the pinned mirror that the
+    // guest reads. `destination` is pinned host memory — device-addressable
+    // under UVA, the same property `k_settle_host_channels_batch` already
+    // relies on to release-store the ring words — and `source` is the device
+    // cell (or the packed staging cell for bool channels).
+    struct HostPublishCopy {
+        void* destination = nullptr;
+        const void* source = nullptr;
+        std::uint32_t bytes = 0;
+    };
+
+    // Publish every host-visible output cell of a wave in ONE launch.
+    //
+    // A wave publishes one cell per (lane, host-read output channel), so a
+    // 512-wide decode wave issues 512 publications of a single 4-byte token
+    // each. As copy-engine transfers those cost ~2 µs of GPU time apiece
+    // almost independently of size, which is pure per-transfer overhead at
+    // this granularity. Writing the cells straight into the mapped mirrors
+    // keeps the whole wave at one launch and needs no particular CUDA
+    // version (the batched-memcpy API requires 12.8+).
+    //
+    // ORDERING: the caller enqueues this BEFORE
+    // `k_settle_host_channels_batch` on the same stream. Kernel completion
+    // makes every mirror write visible system-wide, so the release-store
+    // that publishes the ring tail cannot become visible to the guest ahead
+    // of the payload it announces.
+    __global__ void k_scatter_host_publish_copies(
+        const HostPublishCopy* __restrict__ copies,
+        std::uint32_t count) {
+        const std::uint32_t index = blockIdx.x;
+        if (index >= count) return;
+        const HostPublishCopy copy = copies[index];
+        auto* destination = static_cast<std::uint8_t*>(copy.destination);
+        const auto* source = static_cast<const std::uint8_t*>(copy.source);
+        for (std::uint32_t byte = threadIdx.x;
+             byte < copy.bytes;
+             byte += blockDim.x) {
+            destination[byte] = source[byte];
+        }
+        // Kernel completion already carries a system-scope fence, so this is
+        // belt-and-braces: it states outright that these are host-visible
+        // writes that must land before the settlement kernel's release-store
+        // of the ring tail, rather than leaving that to the launch boundary.
+        __threadfence_system();
+    }
+
+    inline void launch_scatter_host_publish_copies(
+        std::span<const HostPublishCopy> copies,
+        cudaStream_t stream) {
+        if (copies.empty()) return;
+        HostPublishCopy* device = nullptr;
+        CUDA_CHECK(cudaMallocAsync(
+            reinterpret_cast<void**>(&device),
+            copies.size() * sizeof(HostPublishCopy),
+            stream));
+        CUDA_CHECK(cudaMemcpyAsync(
+            device,
+            copies.data(),
+            copies.size() * sizeof(HostPublishCopy),
+            cudaMemcpyHostToDevice,
+            stream));
+        k_scatter_host_publish_copies<<<copies.size(), 128, 0, stream>>>(
+            device, static_cast<std::uint32_t>(copies.size()));
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaFreeAsync(device, stream));
+    }
+
     inline void launch_settle_host_channels_batch(
         std::span<const HostChannelSettlementLane> lanes,
         cudaStream_t stream) {

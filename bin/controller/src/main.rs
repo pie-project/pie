@@ -1,6 +1,6 @@
 //! `pie-controller` — standalone control-plane daemon (Seam 3 thin shell).
 //!
-//! Composes the shared [`bootstrap`] process skeleton (global flags, config
+//! Composes the shared [`startup`] process skeleton (global flags, config
 //! sourcing, tracing, `/metrics`, signal lifecycle) with the [`pie_controller`]
 //! role library. Only the two middle lines (`Config::parse` + `run`) are
 //! controller-specific; every pie daemon bin is otherwise identical.
@@ -18,7 +18,7 @@ use clap::Parser;
 #[command(name = "pie-controller", version)]
 struct Cli {
     #[command(flatten)]
-    global: bootstrap::GlobalArgs,
+    global: startup::GlobalArgs,
 
     /// Control endpoint to bind: `tcp://host:port`, a bare `host:port`, or
     /// `unix:/path`. Overrides `listen_addr` from the config file.
@@ -30,8 +30,8 @@ struct Cli {
 async fn main() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
 
-    let ctx = bootstrap::init(
-        bootstrap::BootSpec::controller().version(env!("CARGO_PKG_VERSION")),
+    let ctx = startup::init(
+        startup::BootSpec::controller().version(env!("CARGO_PKG_VERSION")),
         cli.global,
     )?;
 

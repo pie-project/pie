@@ -16,7 +16,7 @@
 //! the pass for further submits.
 //!
 //! **Layering.** The orchestration functions below (`submit_pass_stamped`,
-//! `finalize_fire`, `drain_settled`, `wire_channels_to_pipeline`,
+//! `finalize_op`, `drain_settled`, `wire_channels_to_pipeline`,
 //! `fire_device_geometry`, `pipeline_close`/`pipeline_drop`, `copy_into_inner`)
 //! need to get/get_mut/delete/push `Resource<Channel>`/`Resource<ForwardPass>`/
 //! `Resource<Pipeline>` handles in the WASM component resource table, but they
@@ -47,7 +47,6 @@ use crate::pipeline::channel::{BoundCells, Channel, ChannelError};
 use crate::pipeline::instance::ForwardPass;
 use crate::store::kv::working_set::{KvFireLease, KvWorkingSet};
 use crate::store::rs::working_set::RsWorkingSet;
-use lease::DevGeo;
 use pie_ptir::container::HostRole;
 
 /// A pass's in-flight fires, submit order. The queue mutex is never held across
@@ -76,10 +75,28 @@ impl PendingFireQueue {
     pub(crate) async fn finalize_guard(&self) -> tokio::sync::OwnedMutexGuard<()> {
         Arc::clone(&self.finalizer).lock_owned().await
     }
+
+    /// Non-blocking [`Self::finalize_guard`], for the planner's eviction
+    /// drain: the guard may be held indefinitely by the owner's guest task
+    /// (e.g. a channel materialize awaiting a peer), and an eviction must
+    /// abort rather than wait out another task's await.
+    pub(crate) fn try_finalize_guard(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        Arc::clone(&self.finalizer).try_lock_owned().ok()
+    }
 }
 
 pub type PendingFires = Arc<PendingFireQueue>;
 pub type PipelineFailure = Arc<Mutex<Option<String>>>;
+
+/// The pipeline's sticky failure, formatted as the guest-visible submit
+/// error — one helper so the message cannot drift between the gates.
+fn pipeline_failed(failure: &PipelineFailure) -> Option<String> {
+    failure
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|reason| format!("pipeline: pipeline failed: {reason}"))
+}
 
 struct CopyCompletionGuard {
     completion: Option<crate::driver::SubmissionCompletion>,
@@ -146,57 +163,132 @@ impl Drop for CopyCompletionGuard {
 
 type PreparedExplicitKv = (Vec<(u64, u32)>, (Vec<u32>, Vec<u32>), Vec<u32>, kv::KvTxn);
 
-fn reclaim_cache_roots(stores: &crate::store::registry::Stores) -> usize {
-    crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv_store| {
-        let epoch = kv_store.current_epoch();
-        let reclaimed = kv_store.drop_unused_cache_leases(epoch);
-        kv_store.retire_idle();
-        reclaimed
-    })
+/// Host-path prepared KV: the pre-launch D2D copy plan plus the open
+/// transaction (`None` when nothing rebased).
+type PreparedHostKv = ((Vec<u32>, Vec<u32>), Option<kv::KvTxn>);
+
+/// A reserved-path preparation error. `Stale` means the demand grew between
+/// its phase-A computation and this prepare (a peer lane touched the same
+/// working set while the requester awaited its grant): nothing was consumed;
+/// the caller recomputes both demands and re-acquires, bounded. `Fatal` is a
+/// real preparation failure.
+enum ReservedError {
+    Stale,
+    Fatal(String),
 }
 
-fn realize_host_declaration(
-    stores: &crate::store::registry::Stores,
+fn stale_demand_error() -> String {
+    format!(
+        "pipeline: resource demand kept drifting under contention \
+         (still stale after {STALE_DEMAND_ATTEMPTS} re-acquisitions)"
+    )
+}
+
+/// Bounded stale-demand recovery: how many times a fire re-acquires its
+/// grant when the demand drifts while it awaits the previous one.
+const STALE_DEMAND_ATTEMPTS: usize = 3;
+
+/// Abort-on-drop guard for a fire's prepared KV transaction: armed from
+/// preparation until the fire is enqueued on the pipeline FIFO (from there
+/// [`PendingFire`] owns commit/abort). Drop settles the write as failed, so
+/// error returns between prepare and enqueue need no hand-written rollback.
+struct KvTxnGuard {
+    model: usize,
+    driver: usize,
+    txn: Option<kv::KvTxn>,
+}
+
+impl KvTxnGuard {
+    fn new(model: usize, driver: usize, txn: Option<kv::KvTxn>) -> Self {
+        Self { model, driver, txn }
+    }
+
+    fn mapping_version(&self) -> Option<u64> {
+        self.txn.as_ref().map(kv::KvTxn::mapping_version)
+    }
+
+    /// Hand the transaction to its post-submit owner ([`PendingFire`]).
+    fn into_inner(mut self) -> Option<kv::KvTxn> {
+        self.txn.take()
+    }
+}
+
+impl Drop for KvTxnGuard {
+    fn drop(&mut self) {
+        let Some(txn) = self.txn.take() else {
+            return;
+        };
+        let stores = crate::store::registry::get(self.model, self.driver);
+        crate::store::registry::with_kv_lock(&stores.kv, "host-other", |store| {
+            kv::abandon(store, txn);
+        });
+        // The abort recycled pages; parked asks may fit now.
+        if let Some(planner) = crate::planner::planner_for(self.model, self.driver) {
+            planner.pages_freed();
+        }
+    }
+}
+
+/// Abort-on-drop guard for a fire's prepared RS transactions (which have no
+/// store-side Drop rollback of their own). Same protocol as [`KvTxnGuard`].
+struct RsTxnsGuard {
+    model: usize,
+    driver: usize,
+    txns: Vec<rs::RsTxn>,
+}
+
+impl RsTxnsGuard {
+    fn new(model: usize, driver: usize, txns: Vec<rs::RsTxn>) -> Self {
+        Self {
+            model,
+            driver,
+            txns,
+        }
+    }
+
+    fn into_inner(mut self) -> Vec<rs::RsTxn> {
+        std::mem::take(&mut self.txns)
+    }
+}
+
+impl Drop for RsTxnsGuard {
+    fn drop(&mut self) {
+        if self.txns.is_empty() {
+            return;
+        }
+        let stores = crate::store::registry::get(self.model, self.driver);
+        {
+            let mut store = stores.rs.lock().unwrap();
+            rs::abandon_many(&mut store, std::mem::take(&mut self.txns));
+        }
+        // The abort recycled slots; parked asks may fit now.
+        if let Some(planner) = crate::planner::planner_for(self.model, self.driver) {
+            planner.pages_freed();
+        }
+    }
+}
+
+fn host_kv_demand_locked(
+    store: &mut crate::store::kv::KvStore,
     ws: &KvWorkingSet,
     writable: std::ops::Range<u64>,
-) -> Result<((Vec<u32>, Vec<u32>), Option<kv::KvTxn>), String> {
-    let realize = || {
-        crate::store::registry::with_kv_lock(&stores.kv, "host-other", |store| {
-            kv::realize_declaration(store, ws.id, writable.clone())
-        })
+    declaration_realized: bool,
+) -> Result<usize, String> {
+    let realization = if declaration_realized {
+        0
+    } else {
+        kv::realize_declaration_demand(store, ws.id, writable.clone())
+            .map_err(|error| error.to_string())?
     };
-    match realize() {
-        Ok(realized) => Ok(realized),
-        Err(kv::KvError::OutOfPages { .. }) if reclaim_cache_roots(stores) != 0 => {
-            realize().map_err(|error| format!("pipeline: KV declaration realization: {error}"))
-        }
-        Err(error) => Err(format!("pipeline: KV declaration realization: {error}")),
-    }
+    let backing = store
+        .backing_demand(ws.id, writable.end)
+        .map_err(|error| error.to_string())?;
+    realization
+        .checked_add(backing)
+        .ok_or_else(|| "KV demand exceeds usize".to_string())
 }
 
-fn ensure_host_backing(
-    stores: &crate::store::registry::Stores,
-    ws: &KvWorkingSet,
-    end: u64,
-) -> Result<(), String> {
-    let ensure = || {
-        crate::store::registry::with_kv_lock(&stores.kv, "host-other", |store| {
-            store.ensure_backed(ws.id, end)
-        })
-    };
-    match ensure() {
-        Ok(_) => Ok(()),
-        Err(crate::store::kv::KvStoreError::OutOfPages { .. })
-            if reclaim_cache_roots(stores) != 0 =>
-        {
-            ensure()
-                .map(|_| ())
-                .map_err(|error| format!("pipeline: KV backing frontier: {error}"))
-        }
-        Err(error) => Err(format!("pipeline: KV backing frontier: {error}")),
-    }
-}
-
+/// Phase-A demand: pure computation, holding no grant, no pins, no txn.
 fn host_kv_demand(
     stores: &crate::store::registry::Stores,
     ws: &KvWorkingSet,
@@ -204,139 +296,168 @@ fn host_kv_demand(
     declaration_realized: bool,
 ) -> Result<usize, String> {
     crate::store::registry::with_kv_lock(&stores.kv, "host-other", |store| {
-        let realization = if declaration_realized {
-            0
-        } else {
-            kv::realize_declaration_demand(store, ws.id, writable.clone())
-                .map_err(|error| error.to_string())?
-        };
-        let backing = store
-            .backing_demand(ws.id, writable.end)
-            .map_err(|error| error.to_string())?;
-        realization
-            .checked_add(backing)
-            .ok_or_else(|| "KV demand exceeds usize".to_string())
+        host_kv_demand_locked(store, ws, writable.clone(), declaration_realized)
     })
     .map_err(|error| format!("pipeline: KV demand: {error}"))
 }
 
-async fn acquire_kv_pages<C: FireContext>(
+/// Acquire this fire's grant (KV pages and RS slots together — a fire never
+/// half-succeeds) from the residency planner. Zero demand yields an empty
+/// grant so the build path stays uniform — every fire shape goes through
+/// prefix lending against one owned grant.
+///
+/// Uncontended (no waiters, everyone resident) this is two free-list pops
+/// with no planner lock. Under pressure the ask parks FCFS at the process's
+/// spawn position; the parked task holds no lease, no pins, and no open
+/// transaction, so the planner is free to evict around (or through) it.
+/// On [`crate::planner::Acquired::Yield`] the process was chosen for
+/// eviction (or is already out of the set): settle its tail HERE — the ask
+/// holds no lease, no pins, and no open transaction, so this is the one
+/// safe point — then wait out the eviction and re-ask.
+async fn acquire_grant<C: FireContext>(
     ctx: &mut C,
     pipeline_id: uuid::Uuid,
-    demand: usize,
-) -> Result<Option<crate::store::reclaim::AllocationGrant>, String> {
-    if demand == 0 {
-        return Ok(None);
+    demand: crate::planner::Demand,
+) -> Result<crate::planner::AllocationGrant, String> {
+    if demand.is_zero() {
+        return Ok(crate::planner::AllocationGrant::empty());
     }
-    let Some(orchestrator) = crate::store::reclaim::contention() else {
-        return Ok(None);
+    let Some(planner) = crate::planner::planner() else {
+        return Err("pipeline: KV residency planner is not installed".to_string());
     };
-    let demand = u32::try_from(demand)
-        .map_err(|_| "pipeline: KV demand exceeds the contention ABI".to_string())?;
+    let pid = ctx.process_id();
     loop {
-        match orchestrator
-            .acquire_or_self_suspend_for_pipeline(ctx.process_id(), pipeline_id, demand, false)
+        match planner
+            .acquire(pid, pipeline_id, demand)
             .await
-            .map_err(|error| format!("pipeline: KV contention: {error}"))?
+            .map_err(|error| format!("pipeline: KV capacity: {error}"))?
         {
-            crate::store::reclaim::Acquired::Granted(grant) => return Ok(Some(grant)),
-            crate::store::reclaim::Acquired::SelfSuspendFirst => {
-                ctx.honor_preemption()
-                    .await
-                    .map_err(|error| format!("pipeline: KV preemption: {error:#}"))?;
-            }
+            crate::planner::Acquired::Granted(grant) => return Ok(grant),
+            crate::planner::Acquired::Yield => settle_and_wait_resident(ctx).await?,
         }
     }
 }
 
+/// Back off for THIS process's eviction: settle its pipeline tails (the
+/// parked task must hold no pins, and those finalizations release the fire
+/// leases the eviction's quiescence waits on), then wait out the eviction.
+/// `wait_resident` re-posts the process-wide leave before parking (the
+/// lane-resurrection seal wedge, CONTENTION_FOLLOWUP.md §15.2). One owner
+/// for the back-off protocol — every fire-submit park site calls this.
+async fn settle_and_wait_resident<C: FireContext>(ctx: &mut C) -> Result<(), String> {
+    let Some(planner) = crate::planner::planner() else {
+        return Err("pipeline: KV working set is suspend-fenced".to_string());
+    };
+    ctx.settle_pipeline_tail()
+        .await
+        .map_err(|error| format!("pipeline: settle for eviction: {error:#}"))?;
+    planner
+        .wait_resident(ctx.process_id())
+        .await
+        .map_err(|error| format!("pipeline: KV residency: {error}"))
+}
+
+/// Resolve the bound RS working sets for demand sizing (phase A: validation
+/// only, no scope claim, no allocation).
+fn bound_rs_working_set_ids<C: FireContext>(
+    ctx: &mut C,
+    model: usize,
+    driver: usize,
+    rs_reps: &[u32],
+) -> Anyhow<Result<Vec<crate::store::rs::RsWorkingSetId>, String>> {
+    let mut ids = Vec::with_capacity(rs_reps.len());
+    for (row, &rep) in rs_reps.iter().enumerate() {
+        let resource: Resource<RsWorkingSet> = Resource::new_borrow(rep);
+        let rs = ctx.resources().get(&resource)?.clone();
+        if rs.model != model || rs.driver != driver {
+            return Ok(Err(format!(
+                "pipeline: rs-working-set at request row {row} belongs to model/driver \
+                 ({}, {}), expected ({model}, {driver})",
+                rs.model, rs.driver
+            )));
+        }
+        ids.push(rs.id);
+    }
+    Ok(Ok(ids))
+}
+
+/// Phase-A RS demand for the acquisition grant.
+fn rs_slot_demand(
+    stores: &crate::store::registry::Stores,
+    ids: &[crate::store::rs::RsWorkingSetId],
+) -> Result<u32, String> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let store = stores.rs.lock().unwrap();
+    let demand = rs::demand(&store, ids)?;
+    u32::try_from(demand).map_err(|_| "pipeline: RS demand exceeds the contention ABI".to_string())
+}
+
+/// Prepare the host-projected KV write from the fire's grant, all under one
+/// store lock: re-check the demand (the staleness gate), realize the
+/// declaration, and back the writable frontier — draining exactly the
+/// consumed prefix from the grant. On `Stale` nothing was consumed. The
+/// grant's Drop returns whatever this did not consume; nothing is ever
+/// hand-released.
 fn prepare_host_kv_reserved(
     stores: &crate::store::registry::Stores,
     ws: &KvWorkingSet,
     writable: std::ops::Range<u64>,
     declaration_realized: bool,
-    grant: crate::store::reclaim::AllocationGrant,
-) -> Result<((Vec<u32>, Vec<u32>), Option<kv::KvTxn>), String> {
-    let mut granted = grant.into_pages();
+    grant: &mut crate::planner::AllocationGrant,
+) -> Result<PreparedHostKv, ReservedError> {
     crate::store::registry::with_kv_lock(&stores.kv, "host-other", |store| {
+        let required = host_kv_demand_locked(store, ws, writable.clone(), declaration_realized)
+            .map_err(|error| ReservedError::Fatal(format!("pipeline: KV demand: {error}")))?;
+        if required > grant.remaining_kv() {
+            return Err(ReservedError::Stale);
+        }
         let (copies, txn) = if declaration_realized {
             ((Vec::new(), Vec::new()), None)
         } else {
-            match kv::realize_declaration_reserved(store, ws.id, writable.clone(), &mut granted) {
-                Ok(realized) => realized,
-                Err(error) => {
-                    store.release_device_reservation(granted);
-                    return Err(format!("pipeline: KV declaration realization: {error}"));
-                }
-            }
+            kv::realize_declaration_reserved(store, ws.id, writable.clone(), grant.lend_kv())
+                .map_err(|error| {
+                    ReservedError::Fatal(format!("pipeline: KV declaration realization: {error}"))
+                })?
         };
-        if let Err(error) = store.ensure_backed_reserved(ws.id, writable.end, &mut granted) {
+        if let Err(error) = store.ensure_backed_reserved(ws.id, writable.end, grant.lend_kv()) {
             if let Some(txn) = txn {
                 kv::abandon(store, txn);
             }
-            store.release_device_reservation(granted);
-            return Err(format!("pipeline: KV backing frontier: {error}"));
+            return Err(ReservedError::Fatal(format!(
+                "pipeline: KV backing frontier: {error}"
+            )));
         }
-        store.release_device_reservation(granted);
         Ok((copies, txn))
     })
 }
 
-fn prepare_explicit_kv(
-    stores: &crate::store::registry::Stores,
-    ws: &KvWorkingSet,
-    write_indexes: &[u64],
-) -> Result<PreparedExplicitKv, String> {
-    let prepare = || {
-        crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv_store| {
-            kv::prepare_explicit(kv_store, ws.id, write_indexes)
-        })
-    };
-    match prepare() {
-        Ok(prepared) => Ok(prepared),
-        Err(kv::KvError::OutOfPages { .. }) => {
-            let reclaimed =
-                crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv_store| {
-                    let epoch = kv_store.current_epoch();
-                    let reclaimed = kv_store.drop_unused_cache_leases(epoch);
-                    kv_store.retire_idle();
-                    reclaimed
-                });
-            if reclaimed == 0 {
-                return Err(
-                    "pipeline: in-lease device-geometry allocation failed; reservation accounting is inconsistent"
-                        .to_string(),
-                );
-            }
-            prepare().map_err(|error| format!("pipeline: device-geometry grant: {error}"))
-        }
-        Err(error) => Err(format!("pipeline: device-geometry grant: {error}")),
-    }
-}
-
+/// Prepare a device-geometry explicit-KV write from the fire's grant, under
+/// one store lock with the same staleness gate as the host path.
 fn prepare_explicit_kv_reserved(
     stores: &crate::store::registry::Stores,
     ws: &KvWorkingSet,
     write_indexes: &[u64],
-    grant: crate::store::reclaim::AllocationGrant,
-) -> Result<PreparedExplicitKv, String> {
-    let mut granted = grant.into_pages();
+    grant: &mut crate::planner::AllocationGrant,
+) -> Result<PreparedExplicitKv, ReservedError> {
     crate::store::registry::with_kv_lock(&stores.kv, "host-other", |store| {
-        let prepared =
-            match kv::prepare_explicit_reserved(store, ws.id, write_indexes, &mut granted) {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    store.release_device_reservation(granted);
-                    return Err(format!("pipeline: device-geometry grant: {error}"));
-                }
-            };
-        store.release_device_reservation(granted);
-        Ok(prepared)
+        let required =
+            kv::prepare_explicit_demand(store, ws.id, write_indexes).map_err(|error| {
+                ReservedError::Fatal(format!("pipeline: device-geometry demand: {error}"))
+            })?;
+        if required > grant.remaining_kv() {
+            return Err(ReservedError::Stale);
+        }
+        kv::prepare_explicit_reserved(store, ws.id, write_indexes, grant.lend_kv()).map_err(
+            |error| ReservedError::Fatal(format!("pipeline: device-geometry grant: {error}")),
+        )
     })
 }
 
-/// A pipeline FIFO entry: a forward FIRE or a KV cell MOVE (Design-B
-/// compaction). Both hold an ordered slot on the same stream — the B3
-/// happens-before invariant; `take`/`read` drain them in submit order.
+/// A pipeline FIFO entry: a forward FIRE holding its ordered slot on the
+/// stream; `take`/`read` drain entries in submit order. (KV cell moves are
+/// awaited inline by `copy_into_inner` and never enter the FIFO.)
 pub enum PendingOp {
     Fire(PendingFire),
     #[cfg(test)]
@@ -345,7 +466,7 @@ pub enum PendingOp {
 
 impl PendingOp {
     /// Non-blocking probe: whether the op's completion has settled.
-    fn is_settled(&self) -> bool {
+    pub(crate) fn is_settled(&self) -> bool {
         match self {
             PendingOp::Fire(fire) => fire.completion.is_settled(),
             #[cfg(test)]
@@ -364,10 +485,6 @@ impl PendingOp {
         }
     }
 
-    pub(crate) fn is_preemption_safe_unprepared(&self) -> bool {
-        false
-    }
-
     pub(crate) fn is_preemption_detachable(&self) -> bool {
         matches!(
             self,
@@ -378,11 +495,6 @@ impl PendingOp {
         )
     }
 
-    pub(crate) fn preemption_signal(
-        &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-        Box::pin(self.completion_signal())
-    }
 }
 
 enum FinalizeAction {
@@ -464,8 +576,6 @@ pub struct PendingFire {
     ws_guard: KvFireLease,
     model: usize,
     driver: usize,
-    ws_rep: u32,
-    rs_reps: Vec<u32>,
     /// The owning pass, to fail it on a fire error (rep — the guest may have
     /// dropped the handle; failure marking is then moot).
     fwd_rep: u32,
@@ -484,10 +594,13 @@ fn prepare_bound_rs<C: FireContext>(
     rs_reps: &[u32],
     qo_indptr: &[u32],
     pipeline_scope: &crate::store::PipelineScope,
-) -> Anyhow<Result<PreparedRs, String>> {
+    grant: &mut crate::planner::AllocationGrant,
+) -> Anyhow<Result<PreparedRs, ReservedError>> {
     let has_recurrent_state = pie_model::model().rs_caps().state_size > 0;
     if let Err(error) = rs::validate_count(rs_reps.len(), qo_indptr, has_recurrent_state) {
-        return Ok(Err(format!("pipeline: recurrent-state binding: {error}")));
+        return Ok(Err(ReservedError::Fatal(format!(
+            "pipeline: recurrent-state binding: {error}"
+        ))));
     }
     if rs_reps.is_empty() {
         return Ok(Ok((
@@ -499,41 +612,44 @@ fn prepare_bound_rs<C: FireContext>(
         )));
     }
 
-    let mut working_sets = Vec::with_capacity(rs_reps.len());
+    // Resolution + model/driver validation live in the phase-A resolver;
+    // only the scope claim is prepare-time work.
+    let working_sets = match bound_rs_working_set_ids(ctx, model, driver, rs_reps)? {
+        Ok(ids) => ids,
+        Err(error) => return Ok(Err(ReservedError::Fatal(error))),
+    };
     for (row, &rep) in rs_reps.iter().enumerate() {
         let resource: Resource<RsWorkingSet> = Resource::new_borrow(rep);
         let rs = ctx.resources().get(&resource)?.clone();
-        if rs.model != model || rs.driver as usize != driver {
-            return Ok(Err(format!(
-                "pipeline: rs-working-set at request row {row} belongs to model/driver \
-                 ({}, {}), expected ({model}, {driver})",
-                rs.model, rs.driver
-            )));
-        }
         if let Err(owner) = rs.claim_pipeline_scope(pipeline_scope) {
-            return Ok(Err(format!(
+            return Ok(Err(ReservedError::Fatal(format!(
                 "pipeline: rs-working-set at request row {row} is already scoped to pipeline \
                  {owner:#x}"
-            )));
+            ))));
         }
-        working_sets.push(rs.id);
     }
 
     let prepared = {
         let mut store = stores.rs.lock().unwrap();
-        rs::prepare_many(&mut store, &working_sets)
+        // Staleness gate under the same lock as the prepare: if the demand
+        // grew while the requester awaited its grant, nothing is consumed
+        // and the caller re-acquires.
+        let required = match rs::demand(&store, &working_sets) {
+            Ok(required) => required,
+            Err(error) => {
+                return Ok(Err(ReservedError::Fatal(format!(
+                    "pipeline: rs demand: {error}"
+                ))));
+            }
+        };
+        if required > grant.remaining_rs() {
+            return Ok(Err(ReservedError::Stale));
+        }
+        rs::prepare_many_reserved(&mut store, &working_sets, grant.lend_rs())
     };
     Ok(prepared
         .map(|(ids, flags, (copy_src, copy_dst), txns)| (ids, flags, copy_src, copy_dst, txns))
-        .map_err(|error| format!("pipeline: rs prepare: {error}")))
-}
-
-fn abort_rs_transactions(stores: &crate::store::registry::Stores, txns: Vec<rs::RsTxn>) {
-    if txns.is_empty() {
-        return;
-    }
-    let mut store = stores.rs.lock().unwrap();
-    rs::abandon_many(&mut store, txns);
+        .map_err(|error| ReservedError::Fatal(format!("pipeline: rs prepare: {error}"))))
 }
 
 pub(crate) async fn drain_rs_predecessors<C: FireContext>(
@@ -546,23 +662,12 @@ pub(crate) async fn drain_rs_predecessors<C: FireContext>(
             .unwrap()
             .front()
             .map(PendingOp::completion_signal);
-        let Some(mut completion) = completion else {
+        let Some(completion) = completion else {
             return Ok(());
         };
-        if let Some(preemption) = ctx.preemption_signal() {
-            let notified = preemption.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            tokio::select! {
-                _ = &mut completion => {}
-                _ = &mut notified => {
-                    ctx.honor_preemption().await?;
-                    continue;
-                }
-            }
-        } else {
-            completion.await;
-        }
+        // Predecessor fires retire with their frames regardless of this
+        // process's residency, so a plain await cannot deadlock the planner.
+        completion.await;
 
         let _finalize_guard = fires.finalize_guard().await;
         let op = {
@@ -690,12 +795,16 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // Device-geometry pass (Track B): the [B,P] geometry is
         // device-produced (the program traces the wire form in-graph) and
         // the driver resolves it pre-forward, so this pass leases physical
-        // pages + fires solo/prebuilt via `map_geometry_relaxed` — but it
-        // RUNS AHEAD like any pass (the FIFO carries it; NOT synchronous like
-        // the deleted host-replay beam branch).
+        // pages and fires prebuilt — but it RUNS AHEAD like any pass (the
+        // FIFO carries it; NOT synchronous like the deleted host-replay beam
+        // branch).
         if ctx.resources().get(&fwd)?.devgeo.is_some() {
             return fire_device_geometry(ctx, this, fwd, frame).await;
         }
+        // Contention-probe marker: when the guest's WIT call reached the
+        // host (vs `hp-acquire` below — the delta is the build preamble,
+        // including the settlement drain).
+        crate::planner::trace_mark!("build", ctx.process_id(), "hp-enter");
         // W3.1: the PIPELINE owns the in-flight FIFO. Point each of this
         // pass's channels at this pipeline's queue so their `take`/`read`
         // await the right FIFO — enforcing the same-pipeline constraint
@@ -715,8 +824,8 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // txns finalize here so arena pins stay bounded by run-ahead depth
         // even when the guest never takes.
         drain_settled(ctx, Some(&pipe_fires)).await?;
-        if let Some(reason) = pipeline_failure.lock().unwrap().clone() {
-            return Ok(Err(format!("pipeline: pipeline failed: {reason}")));
+        if let Some(error) = pipeline_failed(&pipeline_failure) {
+            return Ok(Err(error));
         }
         if let Err(error) = wire_channels_to_pipeline(ctx, &fwd, &pipe_fires)? {
             return Ok(Err(error));
@@ -726,8 +835,8 @@ pub async fn submit_pass_stamped<C: FireContext>(
             // serialization prevents a later run-ahead fire from preparing
             // against stale committed state (double RESET / repeated CoW).
             drain_rs_predecessors(ctx, &pipe_fires).await?;
-            if let Some(reason) = pipeline_failure.lock().unwrap().clone() {
-                return Ok(Err(format!("pipeline: pipeline failed: {reason}")));
+            if let Some(error) = pipeline_failed(&pipeline_failure) {
+                return Ok(Err(error));
             }
         }
         let timing_enabled = ctx.fire_timing_requested();
@@ -837,7 +946,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // WorkingSet translation.
         let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
         let ws = ctx.resources().get(&ws_res)?.clone();
-        let stores = crate::store::registry::get(ws.model, ws.driver as usize);
+        let stores = crate::store::registry::get(ws.model, ws.driver);
         let (readable_pages, writable_pages) =
             match crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv_store| {
                 let page_len = kv_store.page_len(ws.id)?;
@@ -861,115 +970,140 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     )));
                 }
             };
-        let pid = ctx.process_id();
-        let kv_demand = match host_kv_demand(
-            &stores,
-            &ws,
-            writable_pages.clone(),
-            kv_declaration_realized,
-        ) {
-            Ok(demand) => demand,
-            Err(error) => return Ok(Err(error)),
-        };
-        let quorum_pipeline_id = pipeline_scope.scheduler_id();
-        let kv_grant = match acquire_kv_pages(ctx, quorum_pipeline_id, kv_demand).await {
-            Ok(grant) => grant,
-            Err(error) => return Ok(Err(error)),
-        };
-        if let Err(owner) = ws.claim_pipeline_scope(&pipeline_scope) {
-            return Ok(Err(format!(
-                "pipeline: KV working set is already scoped to pipeline {owner:032x}"
-            )));
-        }
-        let ws_guard = match ws.fire_lease() {
-            Ok(lease) => lease,
-            Err(error) => return Ok(Err(format!("pipeline: KV working set: {error}"))),
-        };
-        // Recurrent-state rows are lowered independently, in resolved request
-        // order. Their CoW copies ride the scheduler's typed pre-launch state
-        // copy so a copy failure rejects this fire before model execution.
-        let (rs_slot_ids, rs_slot_flags, rs_copy_src, rs_copy_dst, rstxns) = match prepare_bound_rs(
-            ctx,
-            &stores,
-            ws.model,
-            ws.driver as usize,
-            &rs_reps,
-            &req.qo_indptr,
-            &pipeline_scope,
-        )? {
-            Ok(prepared) => prepared,
-            Err(error) => return Ok(Err(error)),
-        };
-        req.rs_slot_ids = rs_slot_ids;
-        req.rs_slot_flags = rs_slot_flags;
-
+        // Structural declaration checks — fail fast, before anything is
+        // claimed, acquired, or prepared.
         if writable_pages.is_empty() {
-            abort_rs_transactions(&stores, rstxns);
             return Ok(Err(
                 "pipeline: writable KV page declaration is empty".to_string()
             ));
         }
-        if decode_envelope.is_none() {
-            if let Some(&page) = req
+        if decode_envelope.is_none()
+            && let Some(&page) = req
                 .kv_page_indices
                 .iter()
                 .find(|&&page| !readable_pages.contains(&u64::from(page)))
-            {
-                abort_rs_transactions(&stores, rstxns);
-                return Ok(Err(format!(
-                    "pipeline: KV read page {page} escapes the readable declaration"
-                )));
-            }
+        {
+            return Ok(Err(format!(
+                "pipeline: KV read page {page} escapes the readable declaration"
+            )));
         }
         let page_size = u64::from(ws.page_size);
         req.kv_write_lower_bounds = vec![writable_pages.start * page_size];
         req.kv_write_upper_bounds = vec![writable_pages.end * page_size];
         let model = ws.model;
-        let driver = ws.driver as usize;
-        let ((copy_src, copy_dst), kvtxn) = if let Some(grant) = kv_grant {
-            match prepare_host_kv_reserved(
+        let driver = ws.driver;
+        let pid = ctx.process_id();
+        let quorum_pipeline_id = pipeline_scope.scheduler_id();
+        // Scope claim precedes acquisition (symmetric with the
+        // device-geometry path).
+        if let Err(owner) = ws.claim_pipeline_scope(&pipeline_scope) {
+            return Ok(Err(format!(
+                "pipeline: KV working set is already scoped to pipeline {owner:032x}"
+            )));
+        }
+        // Phase A: pure demand for both resources, holding nothing. Phase
+        // B: acquire the one grant (KV pages + RS slots — a fire never
+        // half-succeeds); the acquire awaits are the only awaits in this
+        // build, and the requester waits at the safe point with no pins, no
+        // lease, no open transaction. Phase C: prepare from the grant; if
+        // the demand drifted while waiting (a peer lane touched the same
+        // working set), recompute both demands and re-acquire, bounded.
+        let rs_ws_ids = match bound_rs_working_set_ids(ctx, model, driver, &rs_reps)? {
+            Ok(ids) => ids,
+            Err(error) => return Ok(Err(error)),
+        };
+        crate::planner::trace_mark!("build", pid, "hp-acquire");
+        let mut attempts = 0;
+        let (ws_guard, (copy_src, copy_dst), kvtxn, rs_prepared) = loop {
+            let kv_demand = match host_kv_demand(
                 &stores,
                 &ws,
                 writable_pages.clone(),
                 kv_declaration_realized,
-                grant,
+            ) {
+                Ok(demand) => demand,
+                Err(error) => return Ok(Err(error)),
+            };
+            let Ok(kv_demand) = u32::try_from(kv_demand) else {
+                return Ok(Err(
+                    "pipeline: KV demand exceeds the planner ABI".to_string()
+                ));
+            };
+            let rs_demand = match rs_slot_demand(&stores, &rs_ws_ids) {
+                Ok(demand) => demand,
+                Err(error) => return Ok(Err(error)),
+            };
+            let demand = crate::planner::Demand {
+                kv_pages: kv_demand,
+                rs_slots: rs_demand,
+            };
+            let mut grant = match acquire_grant(ctx, quorum_pipeline_id, demand).await {
+                Ok(grant) => grant,
+                Err(error) => return Ok(Err(error)),
+            };
+            // The lease is the suspend seal: acquired AFTER any park (a
+            // parked ask must hold no lease, or the planner could never
+            // quiesce it) and BEFORE the prepare (so an eviction either
+            // sees this fire's lease and waits it out, or fenced first and
+            // this fire backs off to wait out the eviction).
+            let ws_guard = match ws.fire_lease() {
+                Ok(lease) => lease,
+                Err(crate::store::kv::working_set::FireLeaseError::Fenced) => {
+                    drop(grant); // the pages fund the eviction's head
+                    if let Err(error) = settle_and_wait_resident(ctx).await {
+                        return Ok(Err(error));
+                    }
+                    continue;
+                }
+                Err(error) => return Ok(Err(format!("pipeline: KV working set: {error}"))),
+            };
+            let (copies, kvtxn) = match prepare_host_kv_reserved(
+                &stores,
+                &ws,
+                writable_pages.clone(),
+                kv_declaration_realized,
+                &mut grant,
             ) {
                 Ok(prepared) => prepared,
-                Err(error) => {
-                    abort_rs_transactions(&stores, rstxns);
-                    return Ok(Err(error));
+                Err(ReservedError::Stale) if attempts < STALE_DEMAND_ATTEMPTS => {
+                    attempts += 1;
+                    continue; // the grant drops here; its pages serve the queue
                 }
-            }
-        } else if kv_declaration_realized {
-            ((Vec::new(), Vec::new()), None)
-        } else {
-            match realize_host_declaration(&stores, &ws, writable_pages.clone()) {
-                Ok(realized) => realized,
-                Err(error) => {
-                    abort_rs_transactions(&stores, rstxns);
-                    return Ok(Err(error));
+                Err(ReservedError::Stale) => return Ok(Err(stale_demand_error())),
+                Err(ReservedError::Fatal(error)) => return Ok(Err(error)),
+            };
+            let kvtxn = KvTxnGuard::new(model, driver, kvtxn);
+            // Recurrent-state rows are lowered independently, in resolved
+            // request order. Their CoW copies ride the scheduler's typed
+            // pre-launch state copy so a copy failure rejects this fire
+            // before model execution.
+            match prepare_bound_rs(
+                ctx,
+                &stores,
+                model,
+                driver,
+                &rs_reps,
+                &req.qo_indptr,
+                &pipeline_scope,
+                &mut grant,
+            )? {
+                Ok(prepared) => break (ws_guard, copies, kvtxn, prepared),
+                Err(ReservedError::Stale) if attempts < STALE_DEMAND_ATTEMPTS => {
+                    attempts += 1;
+                    // kvtxn's guard aborts the prepared KV write on drop.
+                    continue;
                 }
+                Err(ReservedError::Stale) => return Ok(Err(stale_demand_error())),
+                Err(ReservedError::Fatal(error)) => return Ok(Err(error)),
             }
         };
-        if let Err(error) = ensure_host_backing(&stores, &ws, writable_pages.end) {
-            abort_rs_transactions(&stores, rstxns);
-            if let Some(kvtxn) = kvtxn {
-                crate::store::registry::with_kv_lock(&stores.kv, "host-other", |store| {
-                    let _ = kv::finalize(store, kvtxn, false);
-                });
-                record_submit_failure(ctx, &fwd, &pipeline_failure, &error);
-            }
-            return Ok(Err(error));
-        }
+        let (rs_slot_ids, rs_slot_flags, rs_copy_src, rs_copy_dst, rstxns) = rs_prepared;
+        let rstxns = RsTxnsGuard::new(model, driver, rstxns);
+        req.rs_slot_ids = rs_slot_ids;
+        req.rs_slot_flags = rs_slot_flags;
         let (translation_version, translation) = match ws.translation() {
             Ok(translation) => translation,
             Err(error) => {
-                abort_rs_transactions(&stores, rstxns);
-                if let Some(kvtxn) = kvtxn {
-                    crate::store::registry::with_kv_lock(&stores.kv, "host-other", |store| {
-                        let _ = kv::finalize(store, kvtxn, false);
-                    });
-                }
                 let reason = format!("pipeline: KV translation: {error}");
                 record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
                 return Ok(Err(reason));
@@ -1006,18 +1140,9 @@ pub async fn submit_pass_stamped<C: FireContext>(
         .err()
         .map(|error| format!("{error:#}"));
         if let Some(error) = submit_error {
+            // The KV/RS transaction guards roll everything back on return.
             let reason = format!("pipeline: submit failed: {error}");
-            abort_rs_transactions(&stores, rstxns);
-            if let Some(kvtxn) = kvtxn {
-                crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv_store| {
-                    let _ = kv::finalize(kv_store, kvtxn, false);
-                });
-            }
-            ctx.resources().get_mut(&fwd)?.failed = Some(reason.clone());
-            let mut failure = pipeline_failure.lock().unwrap();
-            if failure.is_none() {
-                *failure = Some(reason.clone());
-            }
+            record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
             return Ok(Err(reason));
         }
         ctx.commit_fire_timing(timing_enabled);
@@ -1037,13 +1162,11 @@ pub async fn submit_pass_stamped<C: FireContext>(
             .unwrap()
             .push_back(PendingOp::Fire(PendingFire {
                 completion,
-                kv: FireKv::Host(kvtxn),
-                rstxns,
+                kv: FireKv::Host(kvtxn.into_inner()),
+                rstxns: rstxns.into_inner(),
                 ws_guard,
                 model,
                 driver,
-                ws_rep,
-                rs_reps,
                 fwd_rep,
                 instance_id,
                 cells,
@@ -1081,7 +1204,7 @@ pub async fn submit_frame<C: FireContext>(
         .collect();
     if fired.is_empty() {
         return Ok(Err(
-            "pipeline: a frame needs at least one non-no-op slot".to_string(),
+            "pipeline: a frame needs at least one non-no-op slot".to_string()
         ));
     }
     for &(slot, rep) in &fired {
@@ -1309,8 +1432,8 @@ pub async fn copy_into_inner<C: FireContext>(
         )
     };
     drain_rs_predecessors(ctx, &pipe_fires).await?;
-    if let Some(reason) = pipeline_failure.lock().unwrap().clone() {
-        return Ok(Err(format!("pipeline: pipeline failed: {reason}")));
+    if let Some(error) = pipeline_failed(&pipeline_failure) {
+        return Ok(Err(error));
     }
     let ws_handle = ctx.resources().get(&ws)?.clone();
 
@@ -1321,7 +1444,7 @@ pub async fn copy_into_inner<C: FireContext>(
     // in-flight fires that could remap these pages (a CoW rebase) are the
     // guest's ordering hazard, like any same-WS run-ahead write overlap.
     let (kv_move_dst_pages, kv_move_src_pages): (Vec<u32>, Vec<u32>) = {
-        let stores = crate::store::registry::get(ws_handle.model, ws_handle.driver as usize);
+        let stores = crate::store::registry::get(ws_handle.model, ws_handle.driver);
         if let Err(owner) = ws_handle.claim_pipeline_scope(&pipeline_scope) {
             return Ok(Err(format!(
                 "pipeline: KV working set is already scoped to pipeline {owner:032x}"
@@ -1370,9 +1493,31 @@ pub async fn copy_into_inner<C: FireContext>(
             },
         )
         .collect::<Vec<_>>();
-    let lease = match ws_handle.fire_lease() {
-        Ok(lease) => lease,
-        Err(error) => return Ok(Err(format!("pipeline copy_into: {error}"))),
+    let lease = loop {
+        match ws_handle.fire_lease() {
+            Ok(lease) => break lease,
+            Err(crate::store::kv::working_set::FireLeaseError::Fenced) => {
+                // The planner is suspending this working set; wait out the
+                // eviction and retry against the restored pages
+                // (`wait_resident` posts the leave before parking).
+                //
+                // DIVERGENCE, kept deliberately un-"fixed": unlike the
+                // fire-submit back-off (`settle_and_wait_resident`), this
+                // park does not settle the process's pipeline tails first.
+                // An unsettled fire elsewhere keeps its lease, and the
+                // eviction's quiescence then depends on another finalizer —
+                // a liveness question under watch (CONTENTION_FOLLOWUP.md
+                // §16.2), not a cleanup-pass alignment.
+                let pid = ctx.process_id();
+                let Some(planner) = crate::planner::planner() else {
+                    return Ok(Err("pipeline copy_into: working set is suspend-fenced".into()));
+                };
+                if let Err(error) = planner.wait_resident(pid).await {
+                    return Ok(Err(format!("pipeline copy_into: {error}")));
+                }
+            }
+            Err(error) => return Ok(Err(format!("pipeline copy_into: {error}"))),
+        }
     };
     let completion = match crate::scheduler::copy_kv_cells(0, cells).await {
         Ok(completion) => completion,
@@ -1382,7 +1527,7 @@ pub async fn copy_into_inner<C: FireContext>(
         completion: Some(completion),
         lease: Some(lease),
         model: ws_handle.model,
-        driver: ws_handle.driver as usize,
+        driver: ws_handle.driver,
         ws: ws_handle.id,
         indexes: dst_page_ids,
     }
@@ -1422,10 +1567,7 @@ async fn pipeline_close_inner<C: FireContext>(
             if crate::inferlet::process::execution_admission_is_capped() {
                 crate::scheduler::worker::notify_pipeline_close(pipeline_id).await;
             } else {
-                crate::scheduler::worker::notify_pipeline_leave(
-                    pipeline_id,
-                    crate::scheduler::worker::LeaveKind::Close,
-                );
+                crate::scheduler::worker::notify_lane_close(pipeline_id, None);
             }
         }
         drain_settled(ctx, Some(&fires)).await?;
@@ -1467,10 +1609,6 @@ pub async fn working_set_copy_into<C: FireContext>(
     .await
 }
 
-/// Drain one pipeline FIFO entry in submit order: a forward fire finalizes
-/// its KV/RS txns and exposes mirror epochs; a KV cell MOVE awaits its
-/// payload-free completion. Move failures are logged because no channel is
-/// associated with the operation.
 /// Pop and finalize pipeline ops whose completions have already settled,
 /// without blocking (plan §6): submit and take/read entry call this so
 /// KV/RS transaction pins stay bounded by run-ahead depth while value
@@ -1491,6 +1629,36 @@ pub async fn drain_settled<C: FireContext>(
                 drained = true;
             }
             None => return Ok(drained),
+        }
+    }
+}
+
+/// Pop and finalize EVERY pending op of one pipeline FIFO, in submit order,
+/// under the queue's finalize guard — the full-drain sibling of
+/// [`drain_settled`], shared by the residency gate, forward-pass drop, and
+/// process teardown. `continue_on_error` is the teardown policy (log and
+/// keep draining — the table is about to drop); the strict form propagates
+/// the first failure.
+pub(crate) async fn finalize_all<C: FireContext>(
+    ctx: &mut C,
+    fires: &PendingFires,
+    continue_on_error: bool,
+) -> Anyhow<()> {
+    let _finalize_guard = fires.finalize_guard().await;
+    loop {
+        let op = fires.lock().unwrap().pop_front();
+        let Some(op) = op else {
+            return Ok(());
+        };
+        if let Err(error) = finalize_op(ctx, op).await {
+            if !continue_on_error {
+                return Err(error);
+            }
+            tracing::error!(
+                pid = %ctx.process_id(),
+                %error,
+                "failed to finalize a pending pipeline operation"
+            );
         }
     }
 }
@@ -1548,9 +1716,10 @@ pub(crate) fn complete_finalize<C: FireContext>(ctx: &mut C, finalized: Finalize
 }
 
 /// Finalize an ordinary host-geometry op without a `ResourceTable` borrow.
-/// Used by accessor-based long host awaits after the scheduler freeze barrier.
-/// Device-geometry fires are excluded because their lease reclamation lives on
-/// the `ForwardPass` resource and still requires `FireContext`.
+/// Used by the idle-park drain (accessor-based long host awaits), which runs
+/// before the scheduler freeze barrier. Device-geometry fires are excluded
+/// because their lease reclamation lives on the `ForwardPass` resource and
+/// still requires `FireContext`.
 pub(crate) async fn finalize_op_detached(op: PendingOp) -> Anyhow<()> {
     debug_assert!(op.is_preemption_detachable());
     let FinalizeOutcome { action, ws_guard } = finalize_op_await(op).await?;
@@ -1587,8 +1756,6 @@ async fn finalize_fire_await(fire: PendingFire) -> Anyhow<FinalizeOutcome> {
         ws_guard,
         model,
         driver,
-        ws_rep,
-        rs_reps,
         fwd_rep,
         instance_id,
         cells,
@@ -1600,8 +1767,6 @@ async fn finalize_fire_await(fire: PendingFire) -> Anyhow<FinalizeOutcome> {
     let success = result.is_ok() && prior_failure.is_none();
 
     let (kv_failure, rs_failure) = {
-        let _ = ws_rep;
-        let _ = rs_reps;
         let stores = crate::store::registry::get(model, driver);
         // RS transactions have no Drop rollback. Retire them before the only
         // await below so process cancellation cannot leak their slots.
@@ -1613,30 +1778,26 @@ async fn finalize_fire_await(fire: PendingFire) -> Anyhow<FinalizeOutcome> {
                 .err()
                 .map(|error| format!("pipeline: recurrent-state finalize failed: {error}"))
         };
-        let kv_failure = match kv {
-            FireKv::DeviceGeom { kvtxn } => {
-                crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv_store| {
-                    kv::finalize(kv_store, kvtxn, success)
-                        .err()
-                        .map(|error| format!("pipeline: KV finalize failed: {error}"))
-                })
-            }
-            FireKv::Host(kvtxn) => kvtxn.and_then(|kvtxn| {
-                crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv_store| {
-                    kv::finalize(kv_store, kvtxn, success)
-                        .err()
-                        .map(|error| format!("pipeline: KV finalize failed: {error}"))
-                })
-            }),
+        let kvtxn = match kv {
+            FireKv::DeviceGeom { kvtxn } => Some(kvtxn),
+            FireKv::Host(kvtxn) => kvtxn,
         };
+        let kv_failure = kvtxn.and_then(|kvtxn| {
+            crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv_store| {
+                kv::finalize(kv_store, kvtxn, success)
+                    .err()
+                    .map(|error| format!("pipeline: KV finalize failed: {error}"))
+            })
+        });
         (kv_failure, rs_failure)
     }; // store locks released before the contention drain re-locks pools
 
     // The fire's sequence retired: recycled slots (aborts, CoW'd tails,
-    // collected suffixes) are allocatable now — wake parked allocators
-    // and drain-gated lanes.
-    if let Some(orch) = crate::store::reclaim::contention() {
-        orch.on_blocks_freed();
+    // collected suffixes) are allocatable now — wake parked asks. This is
+    // also the planner's per-fire quiescence event: the lease this fire
+    // held has just released.
+    if let Some(planner) = crate::planner::planner() {
+        planner.pages_freed();
     }
 
     // Values are already visible through the release-published tail words
@@ -1712,22 +1873,22 @@ fn reclaim_pending_device_grant<C: FireContext>(ctx: &mut C, fwd: &Resource<Forw
 /// live pages in-graph) and the driver resolves it pre-forward, so the host
 /// neither replays the epilogue arithmetic nor projects per-lane KV. The
 /// runtime leases `B` fresh physical pages, delivers them to the program as a
-/// host-put on the `fresh` channel, marks the fire solo/prebuilt via
-/// `map_geometry_relaxed` (wire fields empty), and fires it RUN-AHEAD onto the
-/// pipeline FIFO (unlike the deleted synchronous host-replay beam branch).
-/// The per-fire arena/write txns ride the `PendingFire`; `finalize_fire`
+/// host-put on the `fresh` channel, submits the fire prebuilt (the host wire
+/// geometry stays empty — `geometry::map_geometry_evaluated` maps what the
+/// driver resolved), and fires it RUN-AHEAD onto the pipeline FIFO (unlike
+/// the deleted synchronous host-replay beam branch).
+/// The per-fire arena/write txns ride the `PendingFire`; `finalize_op`
 /// commits/aborts them and reclaims continuing heirs' unused grants (w_cont).
-///
-/// BRING-UP (4090, shadow-verify): the exact fresh-page materialization
-/// (`cow_write_slot`), the fire-0 seed source, and the physical-page ids fed
-/// on `fresh` are validated against the beam goldens on device; the geometry
-/// contract itself is host-verified (`ptir-dsl` `beam_designb_goldens`).
 async fn fire_device_geometry<C: FireContext>(
     ctx: &mut C,
     this: Resource<Pipeline>,
     fwd: Resource<ForwardPass>,
     frame: Option<crate::scheduler::FrameStamp>,
 ) -> Anyhow<Result<(), String>> {
+    // Contention-probe marker: when the guest's WIT call reached the host
+    // (vs when its build reaches `acquire` — the delta is the build
+    // preamble, including the settlement drain below).
+    crate::planner::trace_mark!("build", ctx.process_id(), "dg-enter");
     // Wire each of this pass's channels at this pipeline's FIFO (§3.4: all
     // passes binding a channel must submit on ONE pipeline — the entire
     // ordering/FIFO correctness argument).
@@ -1744,16 +1905,16 @@ async fn fire_device_geometry<C: FireContext>(
     };
     // Non-blocking settlement drain (plan §6), as in the ordinary submit.
     drain_settled(ctx, Some(&pipe_fires)).await?;
-    if let Some(reason) = pipeline_failure.lock().unwrap().clone() {
-        return Ok(Err(format!("pipeline: pipeline failed: {reason}")));
+    if let Some(error) = pipeline_failed(&pipeline_failure) {
+        return Ok(Err(error));
     }
     if let Err(e) = wire_channels_to_pipeline(ctx, &fwd, &pipe_fires)? {
         return Ok(Err(e));
     }
     if !ctx.resources().get(&fwd)?.rs_ws.is_empty() {
         drain_rs_predecessors(ctx, &pipe_fires).await?;
-        if let Some(reason) = pipeline_failure.lock().unwrap().clone() {
-            return Ok(Err(format!("pipeline: pipeline failed: {reason}")));
+        if let Some(error) = pipeline_failed(&pipeline_failure) {
+            return Ok(Err(error));
         }
     }
     let timing_enabled = ctx.fire_timing_requested();
@@ -1765,7 +1926,7 @@ async fn fire_device_geometry<C: FireContext>(
     let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
     let ws = ctx.resources().get(&ws_res)?.clone();
     let page_size = ws.page_size;
-    let stores = crate::store::registry::get(ws.model, ws.driver as usize);
+    let stores = crate::store::registry::get(ws.model, ws.driver);
     let pid = ctx.process_id();
     let quorum_pipeline_id = pipeline_scope.scheduler_id();
     if let Err(owner) = ws.claim_pipeline_scope(&pipeline_scope) {
@@ -1773,52 +1934,67 @@ async fn fire_device_geometry<C: FireContext>(
             "pipeline: KV working set is already scoped to pipeline {owner:032x}"
         )));
     }
-    // Grant B pages, allocating their physical backing under one prepared
-    // write (no borrow held across submit).
-    let (
-        completion,
-        instance_id,
-        scheduler,
-        cells,
-        fwd_rep,
-        kvtxn,
-        kv_translation_version,
-        kv_translation,
-        wire_pages,
-        copy_src,
-        copy_dst,
-        accesses,
-        rs_slot_ids,
-        rs_slot_flags,
-        rs_copy_src,
-        rs_copy_dst,
-        resolved_qo_indptr,
-        rstxns,
-        ws_guard,
-    ) = {
-        // Fail-fast.
-        {
-            let p = ctx.resources().get_mut(&fwd)?;
-            if let Some(e) = &p.failed {
-                return Ok(Err(format!(
-                    "pipeline: forward-pass failed by an earlier fire: {e}"
-                )));
+    // Fail-fast on an already-failed pass.
+    {
+        let p = ctx.resources().get(&fwd)?;
+        if let Some(e) = &p.failed {
+            return Ok(Err(format!(
+                "pipeline: forward-pass failed by an earlier fire: {e}"
+            )));
+        }
+    }
+
+    // Grant B logical slots and size the physical demand — DevGeo STAYS in
+    // the resource table throughout (no take/put-back dance); every error
+    // path reverts the lease grant through `reclaim_pending_device_grant`.
+    // The lease grant is purely logical (free-list reuse, then fresh
+    // logical reserves) — it can never exhaust the pool, so it runs ONCE;
+    // only the physical prepare below retries under contention.
+    // A pool-owned pass resolves its own write targets in-graph, so the host
+    // cannot name them: materialize the program's declared WRITABLE span and let
+    // the translation cover every slot the device might pick. The declaration is
+    // the containment promise — preparing outside it would copy-on-write a
+    // shared prefix the program never touches. Resolved before the `devgeo`
+    // borrow below, which would otherwise alias the pass's declaration.
+    let pooled = ctx
+        .resources()
+        .get(&fwd)?
+        .devgeo
+        .as_ref()
+        .expect("fire_device_geometry on a non-device-geometry pass")
+        .pooled;
+    let pooled_write_indexes: Vec<u64> = if pooled {
+        let writable = ctx.resources().get(&fwd)?.kv_declaration.writable;
+        let reserved =
+            crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv_store| {
+                kv_store.page_len(ws.id)
+            });
+        let span = reserved
+            .map_err(|error| error.to_string())
+            .and_then(|page_len| writable.resolve(page_len));
+        match span {
+            Ok(span) => span.collect(),
+            Err(error) => {
+                return Ok(Err(format!("pipeline: pool-owned device geometry: {error}")));
             }
         }
-
-        // Take the DevGeo out so the lease grant can use the store
-        // (distinct table resources can't be borrowed mutably at once).
-        let mut devgeo: DevGeo = ctx
-            .resources()
-            .get_mut(&fwd)?
+    } else {
+        Vec::new()
+    };
+    let (grant_slots, write_indexes, fresh_dense, devgeo_b) = {
+        let p = ctx.resources().get_mut(&fwd)?;
+        let devgeo = p
             .devgeo
-            .take()
+            .as_mut()
             .expect("fire_device_geometry on a non-device-geometry pass");
+        let fresh_dense = devgeo.fresh_dense;
+        let devgeo_b = devgeo.b;
 
         // Grant B slots: lease free-list first, then fresh logical
         // reserves. Purely logical — this can never exhaust the pool, so
         // it runs ONCE; only the physical prepare below retries under
-        // contention.
+        // contention. A pool-owned pass resolves its own write targets
+        // in-graph, so it grants nothing.
         let grant_slots = if devgeo.pooled {
             Vec::new()
         } else {
@@ -1831,168 +2007,180 @@ async fn fire_device_geometry<C: FireContext>(
                 })
             })
         };
-        // A pool-owned pass resolves its own write targets in-graph, so the
-        // host cannot name them: materialize the program's declared WRITABLE
-        // span and let the translation cover every slot the device might pick.
-        // The declaration is the containment promise — preparing outside it
-        // would copy-on-write a shared prefix the program never touches.
         let mut write_indexes: Vec<u64> = if devgeo.pooled {
-            let writable = ctx.resources().get(&fwd)?.kv_declaration.writable;
-            let reserved =
-                crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv_store| {
-                    kv_store.page_len(ws.id)
-                });
-            let span = reserved
-                .map_err(|error| error.to_string())
-                .and_then(|page_len| writable.resolve(page_len));
-            match span {
-                Ok(span) => span.collect(),
-                Err(error) => {
-                    ctx.resources().get_mut(&fwd)?.devgeo = Some(devgeo);
-                    return Ok(Err(format!("pipeline: pool-owned device geometry: {error}")));
-                }
-            }
+            pooled_write_indexes
         } else {
             grant_slots.iter().map(|&slot| u64::from(slot)).collect()
         };
         write_indexes.sort_unstable();
         write_indexes.dedup();
-        let demand = match crate::store::registry::with_kv_lock(&stores.kv, "host-other", |store| {
-            kv::prepare_explicit_demand(store, ws.id, &write_indexes)
-        }) {
+        (grant_slots, write_indexes, fresh_dense, devgeo_b)
+    };
+
+    // Device geometry resolves B request rows in-graph. Validate the bound
+    // RS list against that resolved arity before the launch and prepare one
+    // folded target per row. The zero-valued `qo_indptr` carries only the
+    // known row count; the driver still resolves its values in-graph.
+    let resolved_qo_indptr = vec![0; devgeo_b + 1];
+    let rs_ws_ids = match bound_rs_working_set_ids(ctx, ws.model, ws.driver, &rs_reps)? {
+        Ok(ids) => ids,
+        Err(error) => {
+            reclaim_pending_device_grant(ctx, &fwd);
+            return Ok(Err(error));
+        }
+    };
+    // Phase B: acquire the one grant (KV pages + RS slots) — the only
+    // awaits in this build; nothing physical is held. Phase C: prepare from
+    // it; on stale demand recompute both figures and re-acquire, bounded.
+    crate::planner::trace_mark!("build", pid, "dg-acquire");
+    let mut attempts = 0;
+    let (ws_guard, pages, (copy_src, copy_dst), kv_translation, kvtxn, rs_prepared) = loop {
+        let kv_demand =
+            match crate::store::registry::with_kv_lock(&stores.kv, "host-other", |store| {
+                kv::prepare_explicit_demand(store, ws.id, &write_indexes)
+            }) {
+                Ok(demand) => demand,
+                Err(error) => {
+                    reclaim_pending_device_grant(ctx, &fwd);
+                    return Ok(Err(format!("pipeline: device-geometry demand: {error}")));
+                }
+            };
+        let Ok(kv_demand) = u32::try_from(kv_demand) else {
+            reclaim_pending_device_grant(ctx, &fwd);
+            return Ok(Err(
+                "pipeline: KV demand exceeds the planner ABI".to_string()
+            ));
+        };
+        let rs_demand = match rs_slot_demand(&stores, &rs_ws_ids) {
             Ok(demand) => demand,
             Err(error) => {
-                devgeo.lease.reclaim_after_fire(&vec![true; devgeo.b]);
-                ctx.resources().get_mut(&fwd)?.devgeo = Some(devgeo);
-                return Ok(Err(format!("pipeline: device-geometry demand: {error}")));
-            }
-        };
-        let kv_grant = match acquire_kv_pages(ctx, quorum_pipeline_id, demand).await {
-            Ok(grant) => grant,
-            Err(error) => {
-                devgeo.lease.reclaim_after_fire(&vec![true; devgeo.b]);
-                ctx.resources().get_mut(&fwd)?.devgeo = Some(devgeo);
+                reclaim_pending_device_grant(ctx, &fwd);
                 return Ok(Err(error));
             }
         };
+        let demand = crate::planner::Demand {
+            kv_pages: kv_demand,
+            rs_slots: rs_demand,
+        };
+        let mut grant = match acquire_grant(ctx, quorum_pipeline_id, demand).await {
+            Ok(grant) => grant,
+            Err(error) => {
+                reclaim_pending_device_grant(ctx, &fwd);
+                return Ok(Err(error));
+            }
+        };
+        // The suspend seal — see the host path: lease after any park,
+        // before the prepare.
         let ws_guard = match ws.fire_lease() {
             Ok(lease) => lease,
+            Err(crate::store::kv::working_set::FireLeaseError::Fenced) => {
+                drop(grant);
+                if let Err(error) = settle_and_wait_resident(ctx).await {
+                    reclaim_pending_device_grant(ctx, &fwd);
+                    return Ok(Err(error));
+                }
+                continue;
+            }
             Err(error) => {
-                devgeo.lease.reclaim_after_fire(&vec![true; devgeo.b]);
-                ctx.resources().get_mut(&fwd)?.devgeo = Some(devgeo);
+                reclaim_pending_device_grant(ctx, &fwd);
                 return Ok(Err(format!("pipeline: KV working set: {error}")));
             }
         };
-        // Device geometry resolves B request rows in-graph. Validate the bound
-        // RS list against that resolved arity before the launch and prepare one
-        // folded target per row. The zero-valued `qo_indptr` carries only the
-        // known row count; the driver still resolves its values in-graph.
-        let resolved_qo_indptr = vec![0; devgeo.b + 1];
-        let prepared_rs = prepare_bound_rs(
+        let (pages, copies, kv_translation, kvtxn) =
+            match prepare_explicit_kv_reserved(&stores, &ws, &write_indexes, &mut grant) {
+                Ok(prepared) => prepared,
+                Err(ReservedError::Stale) if attempts < STALE_DEMAND_ATTEMPTS => {
+                    attempts += 1;
+                    continue;
+                }
+                Err(ReservedError::Stale) => {
+                    reclaim_pending_device_grant(ctx, &fwd);
+                    return Ok(Err(stale_demand_error()));
+                }
+                Err(ReservedError::Fatal(error)) => {
+                    reclaim_pending_device_grant(ctx, &fwd);
+                    return Ok(Err(error));
+                }
+            };
+        let kvtxn = KvTxnGuard::new(ws.model, ws.driver, Some(kvtxn));
+        match prepare_bound_rs(
             ctx,
             &stores,
             ws.model,
-            ws.driver as usize,
+            ws.driver,
             &rs_reps,
             &resolved_qo_indptr,
             &pipeline_scope,
-        );
-        let (rs_slot_ids, rs_slot_flags, rs_copy_src, rs_copy_dst, rstxns) = match prepared_rs {
-            Ok(Ok(prepared)) => prepared,
-            outcome => {
-                devgeo.lease.reclaim_after_fire(&vec![true; devgeo.b]);
-                ctx.resources().get_mut(&fwd)?.devgeo = Some(devgeo);
-                return match outcome {
-                    Ok(Err(error)) => {
-                        record_submit_failure(ctx, &fwd, &pipeline_failure, &error);
-                        Ok(Err(error))
-                    }
-                    Err(error) => {
-                        let reason =
-                            format!("pipeline: device-geometry RS prepare failed: {error:#}");
-                        record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
-                        Err(error)
-                    }
-                    Ok(Ok(_)) => unreachable!(),
-                };
+            &mut grant,
+        ) {
+            Ok(Ok(prepared)) => break (ws_guard, pages, copies, kv_translation, kvtxn, prepared),
+            Ok(Err(ReservedError::Stale)) if attempts < STALE_DEMAND_ATTEMPTS => {
+                attempts += 1;
+                // kvtxn's guard aborts the prepared KV write on drop.
+                continue;
             }
-        };
-        let (pages, (copy_src, copy_dst), kv_translation, kvtxn) = match match kv_grant {
-            Some(grant) => prepare_explicit_kv_reserved(&stores, &ws, &write_indexes, grant),
-            None => prepare_explicit_kv(&stores, &ws, &write_indexes),
-        } {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                abort_rs_transactions(&stores, rstxns);
-                devgeo.lease.reclaim_after_fire(&vec![true; devgeo.b]);
-                ctx.resources().get_mut(&fwd)?.devgeo = Some(devgeo);
+            Ok(Err(ReservedError::Stale)) => {
+                reclaim_pending_device_grant(ctx, &fwd);
+                return Ok(Err(stale_demand_error()));
+            }
+            Ok(Err(ReservedError::Fatal(error))) => {
+                reclaim_pending_device_grant(ctx, &fwd);
+                record_submit_failure(ctx, &fwd, &pipeline_failure, &error);
                 return Ok(Err(error));
             }
-        };
-        // Wire page refs (scheduler capacity accounting): this fire's
-        // physical write targets.
-        let wire_pages: Vec<u32> = pages.iter().map(|&(_, dst)| dst).collect();
-        // Deliver the fresh grant to the program as a direct put on its
-        // `fresh` channel — a shared-ring write the driver pulls before
-        // the pass (plan §4.2/§4.3). The grants are WorkingSet-RELATIVE
-        // indexes — the program's in-graph geometry stays logical
-        // end-to-end and the driver translates its resolved
-        // `Pages`/`WSlot` values through `kv_translation` (which the
-        // prepared write above backs physically). This also matches the
-        // bind-time seed (`reserve(b)`), which was already logical.
-        let fresh_dense = devgeo.fresh_dense;
-        let pooled = devgeo.pooled;
-        let fresh_error = {
-            let p = ctx.resources().get_mut(&fwd)?;
-            let bytes: Vec<u8> = grant_slots.iter().flat_map(|s| s.to_le_bytes()).collect();
-            let error = if pooled {
-                None
-            } else {
-                match p.cells.get(fresh_dense) {
-                    Some(cell) => cell.lock().unwrap().put(bytes).err(),
-                    None => Some(ChannelError::Empty),
-                }
-            };
-            p.devgeo = Some(devgeo);
-            error
+            Err(error) => {
+                reclaim_pending_device_grant(ctx, &fwd);
+                let reason = format!("pipeline: device-geometry RS prepare failed: {error:#}");
+                record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
+                return Err(error);
+            }
+        }
+    };
+    let (rs_slot_ids, rs_slot_flags, rs_copy_src, rs_copy_dst, rstxns) = rs_prepared;
+    let rstxns = RsTxnsGuard::new(ws.model, ws.driver, rstxns);
+
+    // Deliver the fresh grant to the program as a direct put on its `fresh`
+    // channel — a shared-ring write the driver pulls before the pass (plan
+    // §4.2/§4.3). The grants are WorkingSet-RELATIVE indexes — the
+    // program's in-graph geometry stays logical end-to-end and the driver
+    // translates its resolved `Pages`/`WSlot` values through
+    // `kv_translation` (which the prepared write above backs physically).
+    // This also matches the bind-time seed (`reserve(b)`), which was
+    // already logical.
+    let (completion, instance_id, scheduler, cells, fwd_rep, accesses) = {
+        let p = ctx.resources().get_mut(&fwd)?;
+        let bytes: Vec<u8> = grant_slots.iter().flat_map(|s| s.to_le_bytes()).collect();
+        // A pool-owned pass resolves its write targets in-graph, so there is no
+        // host grant to deliver and its `fresh` channel is never read.
+        let fresh_error = if pooled {
+            None
+        } else {
+            match p.cells.get(fresh_dense) {
+                Some(cell) => cell.lock().unwrap().put(bytes).err(),
+                None => Some(ChannelError::Empty),
+            }
         };
         if let Some(error) = fresh_error {
-            abort_rs_transactions(&stores, rstxns);
-            crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv_store| {
-                let _ = kv::finalize(kv_store, kvtxn, false);
-            });
             reclaim_pending_device_grant(ctx, &fwd);
             let reason = format!("pipeline: device-geometry fresh grant put: {error}");
             record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
             return Ok(Err(reason));
         }
-
         let p = ctx.resources().get_mut(&fwd)?;
         let completion = p.bound_instance.reserve_completion();
         let accesses = p.instance.program.channel_accesses.clone();
-        let kv_translation_version = kvtxn.mapping_version();
         (
             completion,
             p.bound_instance.instance_id,
             p.scheduler.clone(),
             p.cells.clone(),
             fwd.rep(),
-            kvtxn,
-            kv_translation_version,
-            kv_translation,
-            wire_pages,
-            copy_src,
-            copy_dst,
             accesses,
-            rs_slot_ids,
-            rs_slot_flags,
-            rs_copy_src,
-            rs_copy_dst,
-            resolved_qo_indptr,
-            rstxns,
-            ws_guard,
         )
     };
+    let kv_translation_version = kvtxn
+        .mapping_version()
+        .expect("device-geometry fire always holds a KV transaction");
 
     // Device geometry and mask provenance are independent. A seed or
     // host-staged mask still lowers through the wire BRLE path on this fire;
@@ -2009,10 +2197,6 @@ async fn fire_device_geometry<C: FireContext>(
     let attn_mask = match attn_mask {
         Ok(mask) => mask,
         Err(error) => {
-            abort_rs_transactions(&stores, rstxns);
-            crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv_store| {
-                let _ = kv::finalize(kv_store, kvtxn, false);
-            });
             reclaim_pending_device_grant(ctx, &fwd);
             let reason = format!("pipeline: device-geometry attention mask: {error}");
             record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
@@ -2029,7 +2213,7 @@ async fn fire_device_geometry<C: FireContext>(
     attn_mask.apply_to(&mut req);
     let ticket_reservation = TicketReservation::new(&cells, &accesses);
     ticket_reservation.apply_to(&mut req);
-    let last_page_len = wire_pages.last().map(|_| page_size).unwrap_or(0);
+    let last_page_len = if pages.is_empty() { 0 } else { page_size };
     let submit_error = crate::scheduler::submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
         &scheduler,
         req,
@@ -2048,11 +2232,8 @@ async fn fire_device_geometry<C: FireContext>(
     .err()
     .map(|error| format!("{error:#}"));
     if let Some(error) = submit_error {
+        // The KV/RS transaction guards roll everything back on return.
         let reason = format!("pipeline: device-geometry submit failed: {error}");
-        abort_rs_transactions(&stores, rstxns);
-        crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv_store| {
-            let _ = kv::finalize(kv_store, kvtxn, false);
-        });
         reclaim_pending_device_grant(ctx, &fwd);
         record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
         return Ok(Err(reason));
@@ -2076,13 +2257,15 @@ async fn fire_device_geometry<C: FireContext>(
         .unwrap()
         .push_back(PendingOp::Fire(PendingFire {
             completion,
-            kv: FireKv::DeviceGeom { kvtxn },
-            rstxns,
+            kv: FireKv::DeviceGeom {
+                kvtxn: kvtxn
+                    .into_inner()
+                    .expect("device-geometry fire always holds a KV transaction"),
+            },
+            rstxns: rstxns.into_inner(),
             ws_guard,
             model: ws.model,
-            driver: ws.driver as usize,
-            ws_rep,
-            rs_reps,
+            driver: ws.driver,
             fwd_rep,
             instance_id,
             cells,
@@ -2131,35 +2314,31 @@ fn wire_channels_to_pipeline<C: FireContext>(
 /// free those ws slots. No-op for a non-device-geometry pass.
 fn reclaim_device_geometry_grants<C: FireContext>(ctx: &mut C, fwd_rep: u32, instance_id: u64) {
     let res: Resource<ForwardPass> = Resource::new_borrow(fwd_rep);
-    let (ws_rep, reclaimed) = {
-        let Ok(p) = ctx.resources().get_mut(&res) else {
-            return;
-        };
-        let Ok(p) = p.bound_mut() else {
-            return;
-        };
-        let Some(devgeo) = p.devgeo.as_mut() else {
-            return;
-        };
-        let Some(cell) = p.cells.get(devgeo.w_cont_dense) else {
-            return;
-        };
-        let w_cont = cell
-            .lock()
-            .unwrap()
-            .latest_reader_value(instance_id)
-            .ok()
-            .flatten()
-            .unwrap_or_default();
-        let w_cont: Vec<bool> = w_cont.iter().map(|&byte| byte != 0).collect();
-        let reclaimed = devgeo.lease.reclaim_after_fire(&w_cont);
-        (p.kv_ws, reclaimed)
+    let Ok(p) = ctx.resources().get_mut(&res) else {
+        return;
     };
-    // Reclaimed grants return to the lease free-list (done above) and are
-    // re-granted to later fires; the store mapping keeps their committed
-    // pages until the working set discards or drops them (a discard here
-    // would shift live indexes under the pass — see the pass-drop note).
-    let _ = (ws_rep, reclaimed);
+    let Ok(p) = p.bound_mut() else {
+        return;
+    };
+    let Some(devgeo) = p.devgeo.as_mut() else {
+        return;
+    };
+    let Some(cell) = p.cells.get(devgeo.w_cont_dense) else {
+        return;
+    };
+    let w_cont = cell
+        .lock()
+        .unwrap()
+        .latest_reader_value(instance_id)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let w_cont: Vec<bool> = w_cont.iter().map(|&byte| byte != 0).collect();
+    // Reclaimed grants return to the lease free-list and are re-granted to
+    // later fires; the store mapping keeps their committed pages until the
+    // working set discards or drops them (a discard here would shift live
+    // indexes under the pass — see the pass-drop note).
+    devgeo.lease.reclaim_after_fire(&w_cont);
 }
 
 #[cfg(test)]
@@ -2180,14 +2359,77 @@ mod lifecycle_tests {
         fn process_id(&self) -> uuid::Uuid {
             self.id
         }
+    }
 
-        async fn honor_preemption(&mut self) -> anyhow::Result<()> {
-            Ok(())
-        }
+    /// §8 guard contract, failure-injected: a prepared KV write whose fire
+    /// never submits is rolled back by the guard's Drop — every page
+    /// returns to the pool, exactly once, through the destructor.
+    #[tokio::test(flavor = "current_thread")]
+    async fn kv_txn_guard_drop_returns_every_prepared_page() -> anyhow::Result<()> {
+        let model = crate::store::registry::register_model(16, &[8], &[0]);
+        let stores = crate::store::registry::get(model, 0);
+        let (ws, before) = crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| {
+            let ws = kv.create_working_set();
+            kv.reserve(ws, 2).unwrap();
+            (ws, kv.available_pages())
+        });
+        // Reserve pages as a grant would, lend them to the prepare, then
+        // drop the armed guard without submitting.
+        let (txn, leftover) = crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| {
+            let mut granted = kv.reserve_device_pages(3).expect("pool has pages");
+            let (_, txn) =
+                kv::realize_declaration_reserved(kv, ws, 0..2, &mut granted).expect("realize");
+            let txn = kv.ensure_backed_reserved(ws, 2, &mut granted).map(|_| txn);
+            (txn.expect("backed"), granted)
+        });
+        let guard = KvTxnGuard::new(model, 0, txn);
+        // The surplus page returns through the store, the prepared pages
+        // through the guard's abort — nothing needs a hand-written path.
+        crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| {
+            kv.release_device_reservation(leftover);
+        });
+        drop(guard);
+        crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| {
+            let epoch = kv.current_epoch();
+            kv.release_working_set(ws, epoch);
+            kv.retire_idle();
+            assert_eq!(
+                kv.available_pages(),
+                before,
+                "every page returned exactly once"
+            );
+        });
+        Ok(())
+    }
 
-        fn preemption_signal(&self) -> Option<Arc<tokio::sync::Notify>> {
-            None
-        }
+    /// Same contract for RS: abandoned folded-slot prepares release their
+    /// slots through the guard, not a hand-written error path.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rs_txns_guard_drop_releases_prepared_slots() -> anyhow::Result<()> {
+        let model = crate::store::registry::register_model(16, &[4], &[4]);
+        let stores = crate::store::registry::get(model, 0);
+        let (txns, before) = {
+            let mut store = stores.rs.lock().unwrap();
+            let ws = store.create_working_set(crate::store::rs::RsGeometry {
+                state_size: 64,
+                buffer_page_tokens: 4,
+                fold_granularity: 1,
+            });
+            let before = store.available_slots();
+            let mut granted = store.reserve_slots(2).expect("slots available");
+            let (_, _, _, txns) =
+                rs::prepare_many_reserved(&mut store, &[ws], &mut granted).expect("prepare");
+            store.release_slot_reservation(granted);
+            (txns, before)
+        };
+        drop(RsTxnsGuard::new(model, 0, txns));
+        let store = stores.rs.lock().unwrap();
+        assert_eq!(
+            store.available_slots(),
+            before,
+            "every reserved slot released exactly once"
+        );
+        Ok(())
     }
 
     #[tokio::test(flavor = "current_thread")]

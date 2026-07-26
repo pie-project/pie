@@ -21,8 +21,10 @@
 //!      the Writer endpoint exists a put writes the wire bytes straight into
 //!      the driver-shared pinned ring and release-publishes the tail word
 //!      (bool packed to the wire, D1) — no launch-descriptor involvement;
-//!   2. first bind: [`take_seed`](ChannelCell::take_seed) pops each `seeded`
-//!      channel's staged cell into the instance descriptor's seed table, then
+//!   2. first bind: [`peek_seed`](ChannelCell::peek_seed) +
+//!      [`commit_seed`](ChannelCell::commit_seed) move each `seeded`
+//!      channel's staged cell into the instance descriptor's seed table
+//!      (peek-then-commit, so a failed bind does not consume it), then
 //!      [`flush_writer_staging`](ChannelCell::flush_writer_staging) moves any
 //!      remaining staged Writer cells into the ring;
 //!   3. the driver pulls Writer ring entries pre-pass, and publishes Reader
@@ -34,14 +36,10 @@
 //! Cells are dtype-native (1 byte / bool); only the wire packs bool to bits
 //! (`pack_bool`/`unpack_bool`), matching `PortSource::Const`'s D1 note.
 //!
-//! Complete pipeline domain API: some methods here (relaxed geometry
-//! variants, per-channel introspection, the pure `instantiate`/registry
-//! probe entry points, device-geometry lease internals) are not yet
-//! called by the current single-model/mock-driver fire path, but are
-//! exercised by this module's own unit tests and reserved for upcoming
-//! wiring (multi-pass channels, device-geometry beams) — kept rather
-//! than deleted, allowed rather than silently masked.
-#![allow(dead_code)]
+//! There is no module-level `dead_code` allow: every item here is on a
+//! production path, and the three test-only affordances
+//! ([`ChannelCell::matches_decl`], [`ChannelCell::take_seed`],
+//! [`pack_bool`]) are `#[cfg(test)]` so the compiler keeps guarding the rest.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -221,7 +219,10 @@ impl ChannelCell {
     }
 
     /// Whether the cell's constructor-declared geometry matches a container
-    /// channel declaration (bind-time validation).
+    /// channel declaration (bind-time validation). Test affordance: the host
+    /// layer calls [`Self::validate_attachment`] directly, since it also has
+    /// the extern binding to pass.
+    #[cfg(test)]
     pub fn matches_decl(&self, decl: &ChannelDecl) -> Result<(), String> {
         self.validate_attachment(decl, None)
     }
@@ -350,36 +351,6 @@ impl ChannelCell {
 
     pub fn endpoint(&self) -> Option<Arc<ChannelEndpoint>> {
         self.endpoint.clone()
-    }
-
-    pub fn permanent_retry_cause(&self, accessed: bool) -> Option<String> {
-        if !accessed {
-            return None;
-        }
-        let Some(endpoint) = &self.endpoint else {
-            return Some(format!("channel {} has no native endpoint", self.global_id));
-        };
-        let binding = endpoint.registered().binding;
-        let poison = load_word(binding.word_base, binding.poison_word_index as usize);
-        if poison != 0 {
-            return Some(format!(
-                "channel {} is poisoned at epoch {poison}",
-                self.global_id
-            ));
-        }
-        if load_word(binding.word_base, binding.closed_word_index as usize) != 0 {
-            return Some(format!("channel {} is closed", self.global_id));
-        }
-        None
-    }
-
-    /// F8 deadlock decidability: a DEVICE-ONLY ring (no host role, unseeded)
-    /// with fewer than two pass attachments has no consumer for its puts —
-    /// after `pipeline.close` a publish blocked on it can never commit
-    /// (close is what makes this decidable: before it, a consumer pass
-    /// could still attach).
-    pub fn is_consumerless_device_ring(&self) -> bool {
-        self.role == Some(HostRole::None) && !self.seeded && self.attachments.len() < 2
     }
 
     pub fn reserve_device_ticket(&mut self, consume: bool, publish: bool) -> (u64, u64) {
@@ -819,6 +790,10 @@ impl ChannelCell {
 
     /// Pop this `seeded` channel's staged seed for the first fire (D2 —
     /// per-instance data, never identity). Errors if nothing was staged.
+    /// Test affordance: the production bind path splits the same work into
+    /// [`Self::peek_seed`] + [`Self::commit_seed`] so a failed bind does not
+    /// consume the seed.
+    #[cfg(test)]
     pub fn take_seed(&mut self) -> Result<Vec<u8>, ChannelError> {
         let seed = self.staged.pop_front().ok_or(ChannelError::MissingSeed)?;
         self.seed_taken = true;
@@ -892,8 +867,6 @@ impl ChannelCell {
         });
         Ok(())
     }
-
-    pub fn detach_reader_mirror(&mut self, _instance_id: u64) {}
 
     /// Peek the most recently release-published mirror cell (device-geometry
     /// reclaim reads `w_cont` this way) without touching the take cursor.
@@ -1089,6 +1062,9 @@ fn decode_reader_cell(
 }
 
 /// Pack a 1-byte-per-bool cell to the bit-packed wire (LSB-first, D1).
+/// Test affordance: production packs in place through
+/// [`pack_bool_into`], straight into the pinned ring cell.
+#[cfg(test)]
 pub fn pack_bool(native: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; native.len().div_ceil(8)];
     pack_bool_into(native, &mut out);
@@ -1119,14 +1095,8 @@ pub fn unpack_bool(wire: &[u8], numel: usize) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{self, ChannelRegistrationPlan, DriverSpec, SchedulerLimits};
-    use crate::scheduler::{self, worker::BatchScheduler};
-    use pie_driver_dummy_lib::DummyDriverOptions;
-    use pie_ptir::container::{ChanDType, ChannelDecl, StageProgram, TraceContainer};
-    use pie_ptir::op::Op;
-    use pie_ptir::registry::Stage;
+    use pie_ptir::container::{ChanDType, ChannelDecl};
     use pie_ptir::types::{DType, Shape};
-    use tokio::time::{Duration, timeout};
 
     fn decl(shape: Shape, dtype: DType, role: HostRole, seeded: bool) -> ChannelDecl {
         ChannelDecl {
@@ -1138,41 +1108,6 @@ mod tests {
         }
     }
 
-    fn chan(shape: Shape, dtype: DType, role: HostRole, seeded: bool) -> ChannelDecl {
-        ChannelDecl {
-            shape,
-            dtype: ChanDType::Concrete(dtype),
-            capacity: 2,
-            host_role: role,
-            seeded,
-        }
-    }
-
-    fn dummy_launch() -> crate::driver::LaunchPlan {
-        crate::driver::LaunchPlan {
-            token_ids: vec![1],
-            position_ids: vec![0],
-            kv_page_indptr: vec![0, 0],
-            kv_last_page_lens: vec![0],
-            qo_indptr: vec![0, 1],
-            sampling_indices: vec![0],
-            sampling_indptr: vec![0, 1],
-            mask_indptr: vec![0, 0],
-            single_token_mode: true,
-            ..crate::driver::LaunchPlan::default()
-        }
-    }
-
-    /// Plan §14 gates 4/5 over the REAL put path: `ChannelCell::put` writes
-    /// the driver-shared ring directly; puts past capacity are `Full`; a
-    /// fire with no put retries without effects; a consuming fire publishes
-    /// the head word and notifies the writer wait slot.
-    ///
-    /// Lives here (not `scheduler::tests`) because it exercises `ChannelCell`
-    /// directly as the driver-shared ring's memory — the scheduler itself
-    /// stays ignorant of cell semantics (the completion-sink inversion);
-    /// this integration test is `pipeline`-level (downward import of
-    /// `scheduler`/`driver`, never the reverse).
     /// §3 shape: mask (bool [8], host Writer) + out (i32 [1], host Reader) +
     /// a device-private seeded channel (tok).
     fn bound() -> BoundCells {
