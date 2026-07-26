@@ -67,12 +67,23 @@ per token.
 an L40S with Qwen3-0.6B at the default `depth = 9`. That is nine full knockout
 rounds per token, and it is the most expensive algorithm in this set.
 
-Two caveats on that number. It is roughly linear in `depth`, so lowering
-`depth` buys back most of it. And this inferlet was observed to be **bimodal**
-— the same inputs returned ~1.5 s in some server sessions and ~5.4 s in others,
-about 4× apart, while remaining stable *within* any one session. The figure
-above is the slow mode and should be read as an upper bound; the fast mode's
-slope is ≈2.4 ms/token. The cause was not chased.
+Two caveats on that number. It is roughly linear in `depth`, so lowering `depth`
+buys back most of it — at `depth = 3` a 160-token run is a stable 816–864 ms.
+And at the default `depth = 9` this inferlet is **bimodal**: the same inputs
+return either ~1.3 s or ~5–6 s for a 160-token budget, and consecutive calls in
+one process alternate between the two. The figure above is the slow mode and
+should be read as an upper bound; the fast mode's slope is ≈2.4 ms/token.
+
+The response is **bit-identical** in both modes (same text, same `z_score`), so
+this is purely a latency effect. It is host-bound — the GPU is ~25 % utilised in
+both modes — and it is not explained by run-ahead depth, ring capacity, GPU
+contention, or compiler nondeterminism, all of which were tested. See the "A10
+is bimodal" section of
+`inference-time-algorithms/10-implementation-faithfulness-audit.md`.
+
+Separately: the **first** call against a plan shape it has not seen before pays
+a 12–31 s NVRTC compile, cached thereafter under `~/.cache/pie/ptir-cuda`. All
+figures here are warm.
 
 ## Run
 

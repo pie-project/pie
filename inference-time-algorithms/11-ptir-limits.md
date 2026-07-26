@@ -108,7 +108,7 @@ was really a fixable constant.
 
 ## 2. Performance
 
-The full measurement is in `10-implementation-faithfulness-audit.md`. Three
+The full measurement is in `10-implementation-faithfulness-audit.md`. Four
 findings belong here because they are properties of **PTIR**, not of the
 algorithms:
 
@@ -139,11 +139,40 @@ principle; neither is today, because the mask construction needs data structures
 (a hash-seeded permutation, a DFA transition table) that PTIR has no way to hold
 across steps.
 
-**One anomaly remains unexplained.** `synthid-tournament-sampling` returns 1.50,
-1.55 or 6.19 s at a fixed 160-token budget — two clean modes ~4× apart with no
-input difference. Nine sequential knockout rounds make it the deepest epilogue in
-the set, and the barrier cost model that accounts for every other slope does not
-predict the split.
+**One anomaly is now characterized, if not fully explained.**
+`synthid-tournament-sampling` returns either ~1.3 s or ~5–6 s at a fixed
+160-token budget. What is now established:
+
+- It is **per call, not per session**. Consecutive calls in one process
+  alternate between the two modes. (The original reading — that a session picked
+  a mode and kept it — was an artefact of the disk cache described below.)
+- It is **not a correctness problem**. Output is bit-identical in both modes:
+  same text, same `z_score = 3.175`, same `unique_contexts`. Only latency moves.
+- It is **host-bound, not device-bound**. The GPU sits at ~25 % mean utilisation
+  in *both* modes at full SM clock, with no external process on the device.
+- It is **specific to program size, with a sharp knee**. At `depth = 1` and
+  `depth = 3` the same inferlet is rock-stable once warm (780–864 ms, ±3 %). At
+  the production `depth = 9` it is bimodal. The fast mode (~1.3 s) is the
+  *correct* cost; the slow mode is a stall.
+- Ruled out: GPU contention, compiler nondeterminism (no hash-ordered iteration
+  in `compiler.rs`), run-ahead depth (2, 4, 6, 8 and 12 are all bimodal), and
+  read-back ring capacity (extra slack shifts the ratio slightly, fixes
+  nothing).
+
+A10 is also the only inferlet that reads back **three** channels per token
+rather than one. The working hypothesis is that at `depth = 9` its per-fire host
+cost reaches parity with its device time, leaving it balanced exactly on the
+pipelining knee — but deepening the run-ahead window does not rescue it, so that
+account is incomplete.
+
+**A cold plan costs 12–31 s to compile, and nothing says so.** Fused regions are
+NVRTC-compiled on first use and cached on disk at `~/.cache/pie/ptir-cuda` (537
+modules, 176 MB on this machine). A cache hit is invisible; a miss is a
+30-second stall inside what looks like an ordinary request. The cache key covers
+the plan bytes, so *any* shape change mints a new entry — including a changed
+channel capacity or a changed `depth`, both of which an author would reasonably
+regard as tuning rather than recompilation. This is the largest single latency
+in the system and it is entirely undocumented at the surface.
 
 ---
 
@@ -260,5 +289,5 @@ the orchestration layer instead.
 |---|---|
 | **Fusion** | Strong. 27/30 inferlets compile with zero barriers. The barrier set is small and its cost is exactly where the cliffs are. |
 | **Fusion — risk** | The one library pattern is an exact match, and a miss dropped to an asymptotically worse implementation. Fixed; the class of defect is not. |
-| **Performance** | Overhead is marginal, never fixed. The real limit is lost run-ahead for any host-dependent step — architectural, not incidental. |
+| **Performance** | Overhead is marginal, never fixed. The real limit is lost run-ahead for any host-dependent step — architectural, not incidental. The largest single latency is invisible: a cold plan pays a 12–31 s NVRTC compile. |
 | **Expressiveness** | Algorithms read close to their equations. Four silent-failure contracts and one leaking shape rule are the sharp edges; the missing attention-score intrinsic is the one hard wall. |
