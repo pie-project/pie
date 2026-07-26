@@ -591,17 +591,14 @@ void linear_attn_layer_body(
                 cudaMemcpyDeviceToDevice, stream));
             return;
         }
-        if (Lw.la_in_proj_qkvz != nullptr && Lw.la_in_proj_ba != nullptr) {
+        // The qkv/z and b/a fusions are independent (see the loader).
+        if (Lw.la_in_proj_qkvz != nullptr) {
             ops::gemm_act_x_w(cublas.handle(),
                 ws.norm_x.data(), *Lw.la_in_proj_qkvz,
                 la.mixed_qkvz.data(), N, conv_dim + V_dim, H);
-            ops::gemm_act_x_w(cublas.handle(),
-                ws.norm_x.data(), *Lw.la_in_proj_ba,
-                la.ba.data(), N, 2 * V_h, H);
-            kernels::launch_split_qwen_gdn_projections_bf16(
-                la.mixed_qkvz.data(), la.ba.data(),
-                la.mixed_qkv.data(), la.z.data(), la.b.data(), la.a.data(),
-                N, conv_dim, V_dim, V_h, stream);
+            kernels::launch_split_bf16_rows(
+                la.mixed_qkvz.data(), la.mixed_qkv.data(), la.z.data(),
+                N, conv_dim, V_dim, stream);
         } else {
             // mixed_qkv [N, conv_dim] = norm_x @ in_proj_qkv.T
             ops::gemm_act_x_w(cublas.handle(),
@@ -611,6 +608,14 @@ void linear_attn_layer_body(
             ops::gemm_act_x_w(cublas.handle(),
                 ws.norm_x.data(), *Lw.la_in_proj_z,
                 la.z.data(), N, V_dim, H);
+        }
+        if (Lw.la_in_proj_ba != nullptr) {
+            ops::gemm_act_x_w(cublas.handle(),
+                ws.norm_x.data(), *Lw.la_in_proj_ba,
+                la.ba.data(), N, 2 * V_h, H);
+            kernels::launch_split_qwen_gdn_ba_bf16(
+                la.ba.data(), la.b.data(), la.a.data(), N, V_h, stream);
+        } else {
             // a [N, V_h] = norm_x @ in_proj_a.T   (b symmetric)
             ops::gemm_act_x_w(cublas.handle(),
                 ws.norm_x.data(), *Lw.la_in_proj_a,

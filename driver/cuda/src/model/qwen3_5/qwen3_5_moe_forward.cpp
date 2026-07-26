@@ -659,17 +659,16 @@ void linear_attn_body(
                 }
                 return;
             }
-            if (Lw.la_in_proj_qkvz != nullptr && Lw.la_in_proj_ba != nullptr) {
+            // The qkv/z and b/a fusions are independent: b/a is always
+            // fused (tiny weights, same per-GEMV floor), qkv/z only when
+            // the weight duplication fits.
+            if (Lw.la_in_proj_qkvz != nullptr) {
                 ops::gemm_act_x_wt_bf16(cublas.handle(),
                     ws.norm_x.data(), Lw.la_in_proj_qkvz->data(),
                     la.mixed_qkvz.data(), N, conv_dim + V_dim, H);
-                ops::gemm_act_x_wt_bf16(cublas.handle(),
-                    ws.norm_x.data(), Lw.la_in_proj_ba->data(),
-                    la.ba.data(), N, 2 * V_h, H);
-                kernels::launch_split_qwen_gdn_projections_bf16(
-                    la.mixed_qkvz.data(), la.ba.data(),
-                    la.mixed_qkv.data(), la.z.data(), la.b.data(), la.a.data(),
-                    N, conv_dim, V_dim, V_h, stream);
+                kernels::launch_split_bf16_rows(
+                    la.mixed_qkvz.data(), la.mixed_qkv.data(), la.z.data(),
+                    N, conv_dim, V_dim, stream);
             } else {
                 ops::gemm_act_x_wt_bf16(cublas.handle(),
                     ws.norm_x.data(), Lw.la_in_proj_qkv->data(),
@@ -677,6 +676,14 @@ void linear_attn_body(
                 ops::gemm_act_x_wt_bf16(cublas.handle(),
                     ws.norm_x.data(), Lw.la_in_proj_z->data(),
                     la.z.data(), N, V_dim, H);
+            }
+            if (Lw.la_in_proj_ba != nullptr) {
+                ops::gemm_act_x_wt_bf16(cublas.handle(),
+                    ws.norm_x.data(), Lw.la_in_proj_ba->data(),
+                    la.ba.data(), N, 2 * V_h, H);
+                kernels::launch_split_qwen_gdn_ba_bf16(
+                    la.ba.data(), la.b.data(), la.a.data(), N, V_h, stream);
+            } else {
                 ops::gemm_act_x_wt_bf16(cublas.handle(),
                     ws.norm_x.data(), Lw.la_in_proj_a->data(),
                     la.a.data(), N, V_h, H);
