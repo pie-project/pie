@@ -8,22 +8,19 @@
 //!
 //! CUDA and `WeightStore` ownership stay on the C++ side. Reading a checkpoint
 //! is `crate::checkpoint`'s alone, and the compiler below it opens nothing —
-//! `crate::host_executor` does, which is exactly why it is not the compiler.
+//! `crate::testkit::host_executor` does, which is exactly why it is not the
+//! compiler.
 
-pub mod artifact;
+pub mod cache_key;
 pub mod checkpoint;
 pub mod contract;
-#[cfg(feature = "testkit")]
-pub mod contract_writer;
 pub mod dump;
 pub mod error;
 pub mod extent;
 pub mod ffi;
-#[cfg(feature = "testkit")]
-pub mod host_executor;
 pub mod plan;
 #[cfg(feature = "testkit")]
-pub mod reference;
+pub mod testkit;
 pub mod types;
 pub mod verify;
 

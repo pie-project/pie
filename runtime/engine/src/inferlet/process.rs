@@ -17,7 +17,7 @@ pub use ctx::ProcessCtx;
 pub(crate) use residency::ProcessResidency;
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -118,7 +118,30 @@ static EXECUTION_SLOT_CAPACITY: OnceLock<Option<usize>> = OnceLock::new();
 pub(crate) fn execution_slot_capacity() -> Option<usize> {
     EXECUTION_SLOT_CAPACITY.get().copied().flatten()
 }
-const MAX_PREWARM_PROCESSES: usize = 64;
+
+/// The calling thread's OS id, for correlating timing records across threads.
+/// `libc::gettid` is Linux-only; Darwin spells it `pthread_threadid_np`.
+fn os_thread_id() -> u64 {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::gettid() as u64
+    }
+    #[cfg(target_os = "macos")]
+    unsafe {
+        let mut tid: u64 = 0;
+        libc::pthread_threadid_np(0, &mut tid);
+        tid
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        0
+    }
+}
+
+/// Prewarm-conveyor width when execution admission is UNCAPPED. With a cap the
+/// conveyor is one cohort wide instead (see `init_admission`); without one
+/// there is no cohort to size it by, so this flat ladder stands.
+const UNCAPPED_PREWARM_PROCESSES: usize = 64;
 
 static PROCESS_COMPLETED: AtomicU64 = AtomicU64::new(0);
 static PROCESS_ADMISSION_WAIT_US: AtomicU64 = AtomicU64::new(0);
@@ -217,15 +240,26 @@ pub fn get_runtime_stats() -> RuntimeProcessStats {
 pub fn init_admission(max_concurrent: Option<usize>) {
     let limit = max_concurrent.filter(|&n| n > 0);
     let sem = limit.map(|n| Arc::new(Semaphore::new(n)));
-    // The prewarm bound is DECOUPLED from execution admission (W3): with
-    // unlimited execution (the hard-default shape) an unbounded prewarm
-    // would fan every queued process's instantiation out at once — a
-    // thundering herd of Store/linker/WASI setup competing with the
-    // scheduler threads. A bounded conveyor of MAX_PREWARM_PROCESSES keeps
-    // instantiation saturating the (now concurrent) linker without
-    // swamping the runtime; execution permits stay lazy and uncapped.
+    // The prewarm conveyor bounds INSTANTIATION. A process holds its
+    // conveyor slot from spawn until it wins a BIND permit, so the number
+    // of processes that have paid for a Store/linker/WASI world but cannot
+    // yet make any driver progress is bounded by the conveyor instead of by
+    // the request count. Releasing the slot at the park instead let the
+    // conveyor rotate at guest-prologue speed: every queued request
+    // instantiated at t=0 (measured at conc 512: all 4096 instantiated
+    // within 309 ms) and the opening cohort's own bring-up was the 1/8th of
+    // that work that mattered — the first wave could not dispatch until the
+    // LAST of its 512 was admitted at 293 ms.
+    //
+    // One whole cohort wide when execution is capped: a turnover has to be
+    // able to hand its entire successor cohort a slot at once, and the
+    // cohort is the unit every other stage here is sized in. Uncapped
+    // execution has no cohort, so the flat UNCAPPED_PREWARM_PROCESSES ladder
+    // stands — with unlimited execution an unbounded prewarm would fan
+    // every queued process's instantiation out at once, a thundering herd
+    // of Store/linker/WASI setup competing with the scheduler threads.
     let prewarm = Some(Arc::new(Semaphore::new(
-        limit.map_or(MAX_PREWARM_PROCESSES, |n| n.min(MAX_PREWARM_PROCESSES)),
+        limit.unwrap_or(UNCAPPED_PREWARM_PROCESSES),
     )));
     // Double-buffered bring-up: the executing cohort plus STAGED_COHORTS
     // whole successor cohorts hold bind permits. A staged cohort
@@ -241,7 +275,20 @@ pub fn init_admission(max_concurrent: Option<usize>) {
     // Depth 2 and 3 were measured at conc 512 (30054 / 30109 tok/s vs
     // 30443 at depth 1): no gain, so the structural depth stands.
     const STAGED_COHORTS: usize = 1;
-    let bind_ahead = limit.map(|n| Arc::new(Semaphore::new(n.saturating_mul(1 + STAGED_COHORTS))));
+    // The staged half opens only once the FIRST cohort is fully seated. A
+    // pool that is 2n wide from t=0 lets the successor cohort run its
+    // working-set reservation and prefill construction alongside the very
+    // cohort it is staged behind, and at startup that is the only work on
+    // the critical path: measured at conc 512, cohort 0's bind ->
+    // execution-admit step took 155 ms (p50) against 1536 concurrent guest
+    // prologues, and the opening wave cannot dispatch until the LAST of the
+    // 512 is admitted. Staging is by definition an overlap with a RUNNING
+    // generation, so the reserve is held back until there is one.
+    let bind_ahead = limit.map(|n| Arc::new(Semaphore::new(n)));
+    BIND_STAGED_RESERVE.store(
+        limit.map_or(0, |n| n.saturating_mul(STAGED_COHORTS)),
+        Relaxed,
+    );
     EXECUTION_SLOT_CAPACITY
         .set(limit)
         .expect("execution slot capacity already initialized");
@@ -260,6 +307,97 @@ pub(crate) fn execution_admission_is_capped() -> bool {
     ADMISSION.get().is_some_and(Option::is_some)
 }
 
+/// Bind permits withheld from the pool until the first generation is
+/// seated (see `init_admission`). Handed over exactly once.
+static BIND_STAGED_RESERVE: AtomicUsize = AtomicUsize::new(0);
+
+/// Open the staged half of the bind pool. Called the moment execution
+/// admission runs out of seats — that is the engine's own statement that a
+/// whole generation is now resident, which is the precondition for
+/// "staged" to mean anything.
+fn open_staged_bind_pool() {
+    let reserve = BIND_STAGED_RESERVE.swap(0, Relaxed);
+    if reserve == 0 {
+        return;
+    }
+    if let Some(Some(semaphore)) = BIND_ADMISSION.get() {
+        semaphore.add_permits(reserve);
+    }
+}
+
+// -----------------------------------------------------------------------
+// Cohort-boundary bind deferral
+// -----------------------------------------------------------------------
+// A retiring process returns its bind permit at the end of teardown. At a
+// fleet-wide turnover that happens 512 times at once, and it admits a WHOLE
+// staged cohort into working-set declaration, KV reservation and prefill
+// construction at exactly the instant the boundary frame is trying to
+// gather. That cohort does not run for another generation; the successors
+// that ARE on the critical path already hold their permits (bind is always
+// acquired before execution). So the release is pure interference: measured
+// per boundary, 512 `process_bind_admitted` land inside the same window as
+// the 512 admissions that matter, and the one boundary that carries no
+// staged binds — the last — is consistently the shortest of the run.
+//
+// The gate parks released permits while the frame policy has a join in
+// flight and hands them over once the boundary frame is away.
+//
+// LIVENESS: the hold is asserted by the scheduler pass and is cleared
+// unconditionally whenever that pass made no progress with nothing in
+// flight, i.e. the moment the engine has nothing left to do. A hold can
+// therefore never be the last thing standing: whatever it defers is
+// released before the engine can idle on it. (A process parked on bind
+// admission also cannot be what a join is waiting for — `joins_in_flight`
+// is populated at execution-slot consumption, which is downstream of bind
+// admission on the same task.)
+//
+// SCOPE: process-global, like the pools it gates — `ADMISSION`,
+// `BIND_ADMISSION`, `PREWARM_ADMISSION` and `EXECUTION_SLOT_CAPACITY` are all
+// `OnceLock`s set once by `init_admission`. A second engine in the same
+// process would share this hold with the first, which is the same constraint
+// the semaphores themselves already impose. Reset is by process exit only:
+// nothing here is per-run state.
+static BIND_RELEASE_HOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static HELD_BIND_PERMITS: Mutex<Vec<tokio::sync::OwnedSemaphorePermit>> = Mutex::new(Vec::new());
+
+/// Return a departing process's bind permit, deferring the handover past a
+/// cohort boundary while one is in progress.
+pub(crate) fn release_bind_permit(permit: Option<tokio::sync::OwnedSemaphorePermit>) {
+    let Some(permit) = permit else {
+        return;
+    };
+    if BIND_RELEASE_HOLD.load(Relaxed) {
+        let mut held = HELD_BIND_PERMITS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Re-checked under the lock, against a concurrent open: the opener
+        // clears the flag BEFORE it takes the lock, so a permit either
+        // lands in the vector the opener then drains, or observes the
+        // cleared flag here and is handed over directly. Neither order can
+        // strand it.
+        if BIND_RELEASE_HOLD.load(Relaxed) {
+            held.push(permit);
+            return;
+        }
+    }
+    drop(permit);
+}
+
+/// Scheduler-pass assertion of the boundary hold. Clearing it hands every
+/// parked permit over at once.
+pub(crate) fn set_bind_release_hold(hold: bool) {
+    if !BIND_RELEASE_HOLD.swap(hold, Relaxed) || hold {
+        return;
+    }
+    let drained = {
+        let mut held = HELD_BIND_PERMITS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *held)
+    };
+    drop(drained);
+}
+
 /// Bind gate: acquire the bind permit lazily, at the first operation
 /// that creates per-instance driver state (channel registration / instance
 /// bind / working-set declaration). Idempotent per process. The bind pool
@@ -271,12 +409,12 @@ pub(crate) async fn ensure_bind_admitted(ctx: &mut ProcessCtx) {
     if ctx.bind_admitted() {
         return;
     }
-    // The prewarm conveyor slot covers spawn -> instantiate -> guest
-    // bring-up. Release it BEFORE parking on bind admission: a parked
-    // process holding its prewarm permit clogs the conveyor, and the
-    // next cohort behind it can never instantiate ahead of the turnover
-    // (measured: the whole herd ladder ran inside the boundary hole).
-    ctx.release_prewarm_permit();
+    // The prewarm conveyor slot covers spawn -> instantiate -> BIND, and is
+    // released on the far side of the park, not in front of it: a process
+    // that cannot bind cannot make driver progress, so letting it off the
+    // conveyor only buys the next arrival the right to instantiate work
+    // nothing is waiting for. The conveyor is one cohort wide, so a
+    // turnover still hands its whole successor cohort through in one go.
     let started = Instant::now();
     let permit = match BIND_ADMISSION.get().and_then(|value| value.as_ref()) {
         Some(semaphore) => Some(
@@ -287,6 +425,7 @@ pub(crate) async fn ensure_bind_admitted(ctx: &mut ProcessCtx) {
         ),
         None => None,
     };
+    ctx.release_prewarm_permit();
     ctx.admit_bind(permit);
     if crate::scheduler::fire_timing_enabled() {
         crate::scheduler::fire_timing_write(&serde_json::json!({
@@ -305,6 +444,7 @@ pub(crate) async fn ensure_bind_admitted(ctx: &mut ProcessCtx) {
 /// same order everywhere: bind, then execution — permits are only ever
 /// acquired in that order, so the two gates cannot deadlock).
 pub(crate) async fn ensure_execution_admitted(ctx: &mut ProcessCtx) {
+    let entered = Instant::now();
     ensure_bind_admitted(ctx).await;
     if ctx.execution_admitted() {
         return;
@@ -316,6 +456,11 @@ pub(crate) async fn ensure_execution_admitted(ctx: &mut ProcessCtx) {
                 .acquire_owned()
                 .await
                 .expect("admission semaphore closed");
+            if semaphore.available_permits() == 0 {
+                // The last seat of a generation just went out: staging can
+                // now overlap something. Idempotent.
+                open_staged_bind_pool();
+            }
             // EVERY capped admission notifies — uncontended ones too. The
             // policy's slot balance must see each consumed permit whether it
             // came from a retirement or the initial pool (the semaphore
@@ -327,11 +472,13 @@ pub(crate) async fn ensure_execution_admitted(ctx: &mut ProcessCtx) {
         }
         None => None,
     };
+    let sem_done = Instant::now();
     ctx.admit_execution(permit, duration_us(started.elapsed()));
     // The planner registers at spawn (registration order is the FCFS clock),
     // but only from here on can this process hold pooled pages. Its wedge
     // predicate needs that distinction: an unadmitted process is neither
     // running nor able to free anything.
+    let note_started = Instant::now();
     if let Some(planner) = crate::planner::planner() {
         planner.note_admitted(ctx.id());
     }
@@ -343,6 +490,10 @@ pub(crate) async fn ensure_execution_admitted(ctx: &mut ProcessCtx) {
             "process_id": ctx.id(),
             "admitted_us": crate::scheduler::fire_timing_now_us(),
             "admission_wait_us": ctx.admission_wait_us(),
+            "bind_wait_us": duration_us(started.duration_since(entered)),
+            "sem_us": duration_us(sem_done.duration_since(started)),
+            "note_us": duration_us(note_started.elapsed()),
+            "tid": os_thread_id(),
         }));
     }
 }
@@ -538,14 +689,22 @@ impl Process {
     ) -> Self {
         let result_tx: SharedResultTx = Arc::new(Mutex::new(result_tx));
 
-        let handle = tokio::spawn(Self::run(
+        let task = Self::run(
             process_id,
             username.clone(),
             program.clone(),
             input.clone(),
             capture_outputs,
             result_tx.clone(),
-        ));
+        );
+        let handle = if crate::scheduler::fire_timing_enabled() {
+            tokio::spawn(crate::scheduler::CpuMetered::new(
+                crate::scheduler::CpuClass::Process,
+                task,
+            ))
+        } else {
+            tokio::spawn(task)
+        };
 
         Process {
             process_id,
@@ -690,7 +849,13 @@ impl Process {
                 }));
             }
             let wasm_run_start = Instant::now();
-            let result = match run_func.call_async(&mut store, (&input,)).await {
+            let call = run_func.call_async(&mut store, (&input,));
+            let called = if crate::scheduler::fire_timing_enabled() {
+                crate::scheduler::CpuMetered::new(crate::scheduler::CpuClass::Guest, call).await
+            } else {
+                call.await
+            };
+            let result = match called {
                 Ok((Ok(output),)) => {
                     wasm_run_us = duration_us(wasm_run_start.elapsed());
                     Ok(output)
@@ -714,6 +879,26 @@ impl Process {
                 }));
             }
             admission_wait_us = store.data().admission_wait_us();
+            // Drop the store HERE rather than at the end of this block, so
+            // the wasmtime teardown it triggers (`ProcessCtx::drop` and the
+            // instance's own memory) is visible: at a cohort boundary 512 of
+            // these run at once and the record is the only way to see them.
+            if crate::scheduler::fire_timing_enabled() {
+                let store_drop_started_us = crate::scheduler::fire_timing_now_us();
+                drop(store);
+                crate::scheduler::fire_timing_write(&serde_json::json!({
+                    "schema": 1,
+                    "source": "runtime",
+                    "event": "process_store_drop",
+                    "process_id": process_id,
+                    "started_us": store_drop_started_us,
+                    "store_drop_us":
+                        crate::scheduler::fire_timing_now_us() - store_drop_started_us,
+                    "tid": os_thread_id(),
+                }));
+            } else {
+                drop(store);
+            }
             result
         }
         .await;
@@ -734,7 +919,19 @@ impl Process {
             let _ = tx.send(result.clone());
         }
 
+        let terminate_started_us =
+            crate::scheduler::fire_timing_enabled().then(crate::scheduler::fire_timing_now_us);
         terminate(process_id, result);
+        if let Some(started_us) = terminate_started_us {
+            crate::scheduler::fire_timing_write(&serde_json::json!({
+                "schema": 1,
+                "source": "runtime",
+                "event": "process_terminate",
+                "process_id": process_id,
+                "started_us": started_us,
+                "terminate_us": crate::scheduler::fire_timing_now_us() - started_us,
+            }));
+        }
     }
 
     /// Abort the WASM execution task, notify any attached client, and unregister.

@@ -11,7 +11,7 @@ use crate::plan::{
     BufferDecl, Extent, FUSION_FP8_TO_MXFP4, LoadPlan, SourceTensorDecl, StorageInstr, TileSpec,
     TransformSpec,
 };
-use crate::types::{FileId, InstrId, QuantSpec, TensorId};
+use crate::types::{FileId, InstrId, QuantSpec, TensorId, Visibility};
 
 const MIB: u64 = 1024 * 1024;
 
@@ -259,6 +259,7 @@ fn encode_plan(encoding: Encoding, rows: i64, cols: i64) -> LoadPlan {
         shape: vec![rows, cols],
         encoding: Encoding::Raw(DType::BF16),
         alignment: 1,
+        visibility: Visibility::Public,
     });
     plan.buffers.push(BufferDecl {
         id: BufferId(0),

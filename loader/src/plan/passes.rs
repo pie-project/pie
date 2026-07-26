@@ -8,8 +8,8 @@
 //! was seven consecutive statements in the middle of a 954-line file.
 //!
 //! The four modules split by what a pass *does*, not by what it touches:
-//! [`arena`] assigns the persistent offsets everything downstream reads,
-//! [`rewrite`] rewrites the schedule, [`memory`] recounts it, and [`validate`]
+//! `arena` assigns the persistent offsets everything downstream reads,
+//! `rewrite` rewrites the schedule, `memory` recounts it, and `validate`
 //! only refuses. Nothing here is re-exported as a prelude — a pass names what
 //! it uses, so moving one is a matter of moving its imports with it.
 
@@ -63,6 +63,10 @@ pub fn all() -> &'static [Pass] {
         Pass {
             name: "validate-target-support",
             run: validate::validate_target_support,
+        },
+        Pass {
+            name: "validate-scale-factors",
+            run: validate::validate_scale_factors,
         },
         Pass {
             name: "validate-persistent-layout",

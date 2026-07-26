@@ -6,22 +6,23 @@
       "expr": {
         "Repack": {
           "src": {
-            "Src": "model.layers.0.mlp.experts.gate_up_proj_blocks"
+            "Stride": {
+              "src": {
+                "Shard": {
+                  "src": {
+                    "Src": "model.layers.0.mlp.experts.gate_up_proj_blocks"
+                  },
+                  "axis": 1
+                }
+              },
+              "axis": 1,
+              "start": 0,
+              "len": 64,
+              "step": 2
+            }
           },
-          "spec": {
-            "layout": "MarlinMxfp4Weight",
-            "row_map": "Even",
-            "batch": 2,
-            "source_rows": 256,
-            "source_row_offset": 64,
-            "target_rows": 128,
-            "valid_rows": 64,
-            "source_stride_cols": 64,
-            "source_col_offset": 0,
-            "source_cols": 64,
-            "target_cols": 64
-          },
-          "out": {
+          "layout": "MarlinMxfp4Weight",
+          "to": {
             "shape": [
               2,
               128,
@@ -69,22 +70,23 @@
       "expr": {
         "Repack": {
           "src": {
-            "Src": "model.layers.0.mlp.experts.gate_up_proj_scales"
+            "Stride": {
+              "src": {
+                "Shard": {
+                  "src": {
+                    "Src": "model.layers.0.mlp.experts.gate_up_proj_scales"
+                  },
+                  "axis": 1
+                }
+              },
+              "axis": 1,
+              "start": 0,
+              "len": 64,
+              "step": 2
+            }
           },
-          "spec": {
-            "layout": "MarlinMxfp4Scale",
-            "row_map": "Even",
-            "batch": 2,
-            "source_rows": 256,
-            "source_row_offset": 64,
-            "target_rows": 128,
-            "valid_rows": 64,
-            "source_stride_cols": 2,
-            "source_col_offset": 0,
-            "source_cols": 2,
-            "target_cols": 2
-          },
-          "out": {
+          "layout": "MarlinMxfp4Scale",
+          "to": {
             "shape": [
               2,
               128,
@@ -108,32 +110,19 @@
     {
       "name": "model.layers.0.mlp.experts.gate_proj.bias",
       "expr": {
-        "Repack": {
+        "Stride": {
           "src": {
-            "Src": "model.layers.0.mlp.experts.gate_up_proj_bias"
-          },
-          "spec": {
-            "layout": "DenseRowGather",
-            "row_map": "Even",
-            "batch": 2,
-            "source_rows": 256,
-            "source_row_offset": 64,
-            "target_rows": 64,
-            "valid_rows": 64,
-            "source_stride_cols": 1,
-            "source_col_offset": 0,
-            "source_cols": 1,
-            "target_cols": 1
-          },
-          "out": {
-            "shape": [
-              2,
-              64
-            ],
-            "encoding": {
-              "Raw": "BF16"
+            "Shard": {
+              "src": {
+                "Src": "model.layers.0.mlp.experts.gate_up_proj_bias"
+              },
+              "axis": 1
             }
-          }
+          },
+          "axis": 1,
+          "start": 0,
+          "len": 64,
+          "step": 2
         }
       },
       "shape": [
@@ -149,22 +138,23 @@
       "expr": {
         "Repack": {
           "src": {
-            "Src": "model.layers.0.mlp.experts.gate_up_proj_blocks"
+            "Stride": {
+              "src": {
+                "Shard": {
+                  "src": {
+                    "Src": "model.layers.0.mlp.experts.gate_up_proj_blocks"
+                  },
+                  "axis": 1
+                }
+              },
+              "axis": 1,
+              "start": 1,
+              "len": 64,
+              "step": 2
+            }
           },
-          "spec": {
-            "layout": "MarlinMxfp4Weight",
-            "row_map": "Odd",
-            "batch": 2,
-            "source_rows": 256,
-            "source_row_offset": 64,
-            "target_rows": 128,
-            "valid_rows": 64,
-            "source_stride_cols": 64,
-            "source_col_offset": 0,
-            "source_cols": 64,
-            "target_cols": 64
-          },
-          "out": {
+          "layout": "MarlinMxfp4Weight",
+          "to": {
             "shape": [
               2,
               128,
@@ -212,22 +202,23 @@
       "expr": {
         "Repack": {
           "src": {
-            "Src": "model.layers.0.mlp.experts.gate_up_proj_scales"
+            "Stride": {
+              "src": {
+                "Shard": {
+                  "src": {
+                    "Src": "model.layers.0.mlp.experts.gate_up_proj_scales"
+                  },
+                  "axis": 1
+                }
+              },
+              "axis": 1,
+              "start": 1,
+              "len": 64,
+              "step": 2
+            }
           },
-          "spec": {
-            "layout": "MarlinMxfp4Scale",
-            "row_map": "Odd",
-            "batch": 2,
-            "source_rows": 256,
-            "source_row_offset": 64,
-            "target_rows": 128,
-            "valid_rows": 64,
-            "source_stride_cols": 2,
-            "source_col_offset": 0,
-            "source_cols": 2,
-            "target_cols": 2
-          },
-          "out": {
+          "layout": "MarlinMxfp4Scale",
+          "to": {
             "shape": [
               2,
               128,
@@ -251,32 +242,19 @@
     {
       "name": "model.layers.0.mlp.experts.up_proj.bias",
       "expr": {
-        "Repack": {
+        "Stride": {
           "src": {
-            "Src": "model.layers.0.mlp.experts.gate_up_proj_bias"
-          },
-          "spec": {
-            "layout": "DenseRowGather",
-            "row_map": "Odd",
-            "batch": 2,
-            "source_rows": 256,
-            "source_row_offset": 64,
-            "target_rows": 64,
-            "valid_rows": 64,
-            "source_stride_cols": 1,
-            "source_col_offset": 0,
-            "source_cols": 1,
-            "target_cols": 1
-          },
-          "out": {
-            "shape": [
-              2,
-              64
-            ],
-            "encoding": {
-              "Raw": "BF16"
+            "Shard": {
+              "src": {
+                "Src": "model.layers.0.mlp.experts.gate_up_proj_bias"
+              },
+              "axis": 1
             }
-          }
+          },
+          "axis": 1,
+          "start": 1,
+          "len": 64,
+          "step": 2
         }
       },
       "shape": [
@@ -292,22 +270,15 @@
       "expr": {
         "Repack": {
           "src": {
-            "Src": "model.layers.0.mlp.experts.down_proj_blocks"
+            "Shard": {
+              "src": {
+                "Src": "model.layers.0.mlp.experts.down_proj_blocks"
+              },
+              "axis": 2
+            }
           },
-          "spec": {
-            "layout": "MarlinMxfp4Weight",
-            "row_map": "Identity",
-            "batch": 2,
-            "source_rows": 64,
-            "source_row_offset": 0,
-            "target_rows": 64,
-            "valid_rows": 64,
-            "source_stride_cols": 128,
-            "source_col_offset": 64,
-            "source_cols": 64,
-            "target_cols": 128
-          },
-          "out": {
+          "layout": "MarlinMxfp4Weight",
+          "to": {
             "shape": [
               2,
               64,
@@ -355,22 +326,15 @@
       "expr": {
         "Repack": {
           "src": {
-            "Src": "model.layers.0.mlp.experts.down_proj_scales"
+            "Shard": {
+              "src": {
+                "Src": "model.layers.0.mlp.experts.down_proj_scales"
+              },
+              "axis": 2
+            }
           },
-          "spec": {
-            "layout": "MarlinMxfp4Scale",
-            "row_map": "Identity",
-            "batch": 2,
-            "source_rows": 64,
-            "source_row_offset": 0,
-            "target_rows": 64,
-            "valid_rows": 64,
-            "source_stride_cols": 4,
-            "source_col_offset": 2,
-            "source_cols": 2,
-            "target_cols": 4
-          },
-          "out": {
+          "layout": "MarlinMxfp4Scale",
+          "to": {
             "shape": [
               2,
               64,

@@ -44,8 +44,12 @@ inline void bind_const(RawMetalContext& ctx, int ord, uint8_t idx, const V& val,
     if (count) ++*count;
 }
 
+
+bool is_qmv(Kernel k) { return qmv_kn(k, DecodeGeometry{}).N != 0; }
+
+}  // namespace
+
 // qmv in_vec (K) / out_vec (N) per kind, from geometry (matches the staged weight shapes).
-struct KN { int K, N; };
 KN qmv_kn(Kernel k, const DecodeGeometry& g) {
     const int H = g.hidden;
     const int q_wide = 2 * g.n_q_heads * g.head_dim;   // 2×-wide gated q_proj (4096)
@@ -67,9 +71,6 @@ KN qmv_kn(Kernel k, const DecodeGeometry& g) {
     }
 }
 
-bool is_qmv(Kernel k) { return qmv_kn(k, DecodeGeometry{}).N != 0; }
-
-}  // namespace
 
 int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                        const DecodeGeometry& g, int max_ctx, bool gdn_prep) {

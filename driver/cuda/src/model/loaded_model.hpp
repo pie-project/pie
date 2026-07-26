@@ -55,20 +55,16 @@ public:
     const HfConfig& hf_config() const noexcept { return hf_; }
     const DistributedConfig& distributed() const noexcept { return boot_.distributed; }
     const WeightStore& weight_store() const noexcept { return weights_; }
-    /// How MXFP4 experts are executed, as the loader resolved it.
+    /// How MXFP4 experts are executed, as the *contract author* decided.
     ///
-    /// Read back rather than re-decided: the plan already materialized the
-    /// weights in the layout this implies, so a second opinion here could only
-    /// disagree with the bytes on the device.
+    /// Read back rather than re-decided. The caller's request is answered once,
+    /// by the family that knows what its own alternatives are, and the plan
+    /// then materialized the weights in the layout that answer implies -- so a
+    /// second opinion here could only disagree with the bytes on the device.
+    /// That is why there is no accessor for the raw request: a bind path that
+    /// wants to know reads the weights it was handed.
     model::Mxfp4MoePolicy mxfp4_moe_policy() const noexcept {
         return mxfp4_moe_policy_;
-    }
-    /// What the caller asked for, before device capability narrowed it.
-    /// Families that can honour a request the loader's `Auto` rule does not
-    /// cover (DeepSeek-V4 caches a BF16 dequant of its experts) need to see
-    /// `Auto` as distinct from an explicit `RoutedDecode`.
-    model::Mxfp4MoeRequest mxfp4_moe_request() const noexcept {
-        return mxfp4_moe_request_;
     }
     LoadedModelCapabilities capabilities() const;
 
@@ -93,8 +89,6 @@ private:
     Config boot_;
     HfConfig hf_;
     WeightStore weights_;
-    model::Mxfp4MoeRequest mxfp4_moe_request_ =
-        model::Mxfp4MoeRequest::Auto;
     model::Mxfp4MoePolicy mxfp4_moe_policy_ =
         model::Mxfp4MoePolicy::EagerBf16;
 };

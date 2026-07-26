@@ -158,7 +158,7 @@ inline void push_mlx_affine_u4(ModelContract& out, const SourceTensor& raw,
     const PieLoaderEncodingSpec encoding = pie_loader::quantized(quant);
 
     out.define(std::move(output),
-               out.bitcast(out.src(std::string(raw.name)), {rows, logical_cols}, encoding),
+               out.transmute(out.src(std::string(raw.name)), {rows, logical_cols}, encoding),
                encoding)
         .expect(std::vector<std::int64_t>{rows, logical_cols});
 }

@@ -515,6 +515,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/batch/frame.cpp
   src/batch/forward.cpp
   src/batch/persistent_inputs.cpp
+  src/batch/planner_calibration.cpp
   src/batch/tp.cpp
   src/batch/workspace.cu
   # pipeline/ -- guest programs (PTIR dispatch, tier0, frame carrier)
@@ -529,6 +530,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/store/kv_cache_format.cpp
   src/store/elastic.cpp
   src/store/memory_planner.cpp
+  src/store/planner_profile_cache.cpp
   src/store/recurrent_state_cache.cpp
   src/store/swap_pool.cpp
   # ops/ -- attention / GEMM / MoE / SSM wrappers
@@ -1057,9 +1059,12 @@ pie_add_cuda_target(test_flashinfer_decode_head_dim_guard
   SOURCES tests/test_flashinfer_decode_head_dim_guard.cpp
   LIBS pie_driver_cuda_lib)
 pie_add_cuda_target(test_graph_variant SOURCES tests/graph_variant_test.cpp)
+# Reaches `pie_native/fire/descriptor.hpp`, which pulls in `launch/program.hpp`
+# and so `pie_driver_abi.h` — the ABI include dir is not optional here even
+# though nothing in the test names it directly.
 pie_add_cuda_target(test_decode_envelope_contract
   SOURCES tests/decode_envelope_contract_test.cpp
-  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include)
+  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include ${PIE_DRIVER_ABI_INCLUDE_DIR})
 pie_add_cuda_target(test_tp_gate
   SOURCES tests/tp_gate_test.cpp
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -1152,9 +1157,18 @@ pie_add_cuda_target(test_ptir_golden_exec
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR}
   LIBS CUDA::cudart
   TEST_ARGS ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures)
-pie_add_cuda_target(test_entry_validation
-  SOURCES tests/entry_validation_test.cpp
-  LIBS pie_driver_cuda_lib)
+# Validation the `extern "C"` entry points owe their caller. Reaches
+# `pie_driver_cuda_lib`, and so `loaded_model.cpp`, which calls the loader —
+# same reason `test_model_registry` below needs the staticlib.
+if(PIE_LOADER_STATICLIB)
+  pie_add_cuda_target(test_entry_validation
+    SOURCES tests/entry_validation_test.cpp
+    LIBS pie_driver_cuda_lib ${PIE_LOADER_STATICLIB} dl pthread)
+else()
+  message(STATUS
+    "test_entry_validation: skipped (no libpie_loader.a; build one with "
+    "`cargo rustc -p pie-loader --lib --crate-type staticlib`)")
+endif()
 pie_add_cuda_target(test_rs_descriptor_validation
   SOURCES tests/rs_descriptor_validation_test.cpp
   INCLUDE_DIRS

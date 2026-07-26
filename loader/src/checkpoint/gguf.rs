@@ -1,23 +1,22 @@
 //! Native Rust GGUF header parser for load planning.
 //!
-//! Ports the checkpoint-parsing half of the C++ `GgufCheckpointSource`
-//! (`driver/cuda/src/loader/gguf_source.cpp`) to Rust. Like the safetensors
-//! header parser, it reads **only** the GGUF framing — magic, version, the
-//! metadata key/value table, and the tensor-info table — and computes each
-//! tensor's absolute file offset and byte span. The bulk tensor payloads are
-//! never read; the C++ reference slurps the whole file, but here we stream the
-//! header region and bounds-check against the on-disk size, so the runtime
+//! Reads **only** the GGUF framing — magic, version, the metadata key/value
+//! table, and the tensor-info table — and computes each tensor's absolute file
+//! offset and byte span. Bulk tensor payloads are never read: the header region
+//! is streamed and bounds-checked against the on-disk size, so planning a load
 //! never maps weight bytes.
 //!
 //! GGUF is inherently block-quantized. Dense GGML types (`F32`/`F16`/`BF16`/
 //! `I8`/`I32`) become [`Encoding::Raw`]; `Q4_0` becomes an
 //! [`Encoding::Quant`] with [`QuantScheme::GgufQ4_0`] (32-element / 18-byte
-//! blocks). The remaining GGUF block schemes (`Q4K`/`Q5`/`Q8`) exist in the
-//! [`QuantScheme`] enum but, matching the C++ loader, are not yet mapped here.
+//! blocks). The remaining block schemes have [`QuantScheme`] variants
+//! (`GgufQ4K`/`GgufQ5_0`/`GgufQ5K`/`GgufQ8_0`) but no mapping here, so a tensor
+//! using one is refused by name and id rather than guessed at.
 //!
-//! GAP: there is no GGUF checkpoint on the verification box, so this parser is
-//! exercised only by synthetic fixtures (unit tests) — it is **not**
-//! device-proven end to end. See `plan.md` §"RUNTIME REFACTOR".
+//! Coverage: the tests below build their GGUF bytes from synthetic fixtures,
+//! and no golden plan is compiled from a real `.gguf`. Agreement with a
+//! production checkpoint is therefore unproven — a first run against real
+//! weights is what would establish it, not a regression of it.
 
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
@@ -29,7 +28,7 @@ use crate::types::{
     Axis, CheckpointFormat, DType, Encoding, FileId, QuantScheme, QuantSpec, TensorId,
 };
 
-/// GGUF metadata value type tags (`gguf_source.cpp` `GgufValueType`).
+/// GGUF metadata value type tags, as numbered by the GGUF format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GgufValueType {
     Uint8,
@@ -72,7 +71,11 @@ impl GgufValueType {
     }
 }
 
-/// GGML tensor type ids we recognise (`gguf_source.cpp` `GgmlType`).
+/// The GGML tensor type ids this parser recognises.
+///
+/// The ids are fixed by the GGUF format, so the numbers below are not a choice
+/// this loader gets to make. Anything outside this set is refused rather than
+/// mapped to a neighbour.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GgmlType {
     F32,
@@ -311,8 +314,10 @@ fn numel_for_shape(shape: &[i64], tensor_name: &str) -> Result<u64, Error> {
     Ok(out)
 }
 
-/// Default GGUF tensor-data alignment when `general.alignment` is absent
-/// (`gguf_source.cpp` initializes `alignment_` to 32).
+/// Default GGUF tensor-data alignment when `general.alignment` is absent.
+///
+/// Fixed by the format at 32; a file that wants another value states it in the
+/// metadata, so this is a fallback, not a guess.
 const GGUF_DEFAULT_ALIGNMENT: u64 = 32;
 
 struct PendingTensor {
@@ -374,7 +379,7 @@ pub fn parse_gguf_checkpoint(path: &Path) -> Result<CheckpointMetadata, Error> {
         for _ in 0..dim_count {
             let dim = r.read_u64("tensor dimension")?;
             if dim > i64::MAX as u64 {
-                return Err(Error::Overflow(format!(
+                return Err(Error::Checkpoint(format!(
                     "gguf: dimension too large for '{name}'"
                 )));
             }
@@ -471,7 +476,7 @@ pub fn decode_gguf_q4_0_block(block: &[u8]) -> Result<Vec<f32>, Error> {
     Ok(values)
 }
 
-/// IEEE-754 half → f32 (`gguf_source.cpp` `half_to_float`).
+/// IEEE-754 half → f32.
 fn half_to_float(half: u16) -> f32 {
     let sign = ((half >> 15) & 0x1) as u32;
     let exp = ((half >> 10) & 0x1f) as u32;

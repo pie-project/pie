@@ -24,17 +24,14 @@ struct NemotronHLayerWeights {
     const DeviceTensor* mamba_dt_bias = nullptr;
     const DeviceTensor* mamba_norm_w = nullptr;
     const DeviceTensor* mamba_out_proj = nullptr;
-    DeviceTensor mamba_in_proj_tp;
-    DeviceTensor mamba_conv_w_tp;
-    DeviceTensor mamba_conv_b_tp;
-    DeviceTensor mamba_A_log_tp;
-    DeviceTensor mamba_D_tp;
-    DeviceTensor mamba_dt_bias_tp;
-    DeviceTensor mamba_norm_w_tp;
-    DeviceTensor mamba_out_proj_tp;
     DeviceBuffer<float> mamba_A;
     DeviceBuffer<float> mamba_D_f32;
     DeviceBuffer<float> mamba_dt_bias_f32;
+    /// Whether the pointers above hold this rank's share or the whole mixer.
+    ///
+    /// Not a property of the tensors -- the contract split them before they
+    /// were ever on the device -- but the forward still has to know, because
+    /// the head and group counts it reshapes with follow from the same answer.
     bool mamba_tp_sharded = false;
 
     // Attention mixer.
@@ -68,7 +65,6 @@ struct NemotronHWeights {
     std::vector<NemotronHLayerWeights> layers;
 };
 
-bool nemotron_h_tp_mamba_sharding_enabled(int tp_size);
 NemotronHWeights bind_nemotron_h(const LoadedModel& engine);
 
 }  // namespace pie_cuda_driver::model

@@ -44,6 +44,7 @@ inline constexpr std::uint32_t kTileMapEncode = PIE_LOADER_TILE_MAP_ENCODE;
 inline constexpr std::uint32_t kTileMapTranscode = PIE_LOADER_TILE_MAP_TRANSCODE;
 inline constexpr std::uint32_t kTileMapReblock = PIE_LOADER_TILE_MAP_REBLOCK;
 inline constexpr std::uint32_t kTileMapRepack = PIE_LOADER_TILE_MAP_REPACK;
+inline constexpr std::uint32_t kTileMapScale = PIE_LOADER_TILE_MAP_SCALE;
 
 /// Everything the loader reported about one call, owned and freed by C++.
 class LoadPlanDiagnostics {

@@ -1,20 +1,20 @@
 //! Lowering the affine fragment of [`Expr`] to byte movement.
 //!
-//! Every expression built from `Src`, `Out`, `Slice`, `Cat`, `Reshape` and
-//! `Pad` denotes a piecewise-affine partial map from output coordinates to
+//! Every expression built from `Src`, `Out`, `Fill`, `Slice`, `Concat` and
+//! `Transmute` denotes a piecewise-affine partial map from output coordinates to
 //! source coordinates. This module evaluates that map into a list of maximal
 //! contiguous [`Run`]s — the only form the rest of the loader needs — without
 //! materializing any intermediate buffer, however deeply the expression nests.
 //!
-//! The two escape hatches ([`Expr::Repack`], [`Expr::Quantize`]) are rejected
+//! The two escape hatches ([`Expr::Repack`], [`Expr::Cast`]) are rejected
 //! here by design: they need a kernel, so they are the planner's problem.
 //!
 //! See `loader/spec.md` §3.1 and §3.3.
 
 use std::collections::HashMap;
 
+use super::Expr;
 use super::infer::Checked;
-use super::{Expr, resolve_reshape};
 use crate::error::{Error, OrOverflow};
 use crate::extent::{Dim, Rect};
 use crate::types::Encoding;
@@ -56,7 +56,8 @@ pub struct Run {
 pub enum RunSource {
     /// Index into [`Lowering::leaves`], plus an element offset into that leaf.
     Leaf { leaf: usize, src_elem: i64 },
-    /// A hole introduced by [`Expr::Pad`]. Reads as zero.
+    /// A hole: a coordinate no source reaches, left as the zero the
+    /// destination was filled with. Introduced by [`Expr::Fill`].
     Zero,
 }
 
@@ -367,7 +368,7 @@ fn fold_once(items: &[Piece]) -> Option<Vec<Piece>> {
             // a span starting at `file_offset`, so a descending progression
             // would read below that anchor. Such a run is a perfectly good
             // rectangle — it just is not one this ABI can name, and the pieces
-            // are individually copyable, so leave them unfolded. `Cat` in
+            // are individually copyable, so leave them unfolded. `Concat` in
             // descending source order (e.g. re-joining a fused gate/up weight
             // as `[up | gate]`) is the case that reaches this.
             && strides.0 >= 0
@@ -468,26 +469,31 @@ enum Kind {
         src: usize,
         axis: usize,
         start: i64,
-        step: i64,
-        /// Whether the slice covers the operand's whole axis with step 1, in
-        /// which case it introduces no discontinuity at all.
+        /// Whether the band covers the operand's whole axis, in which case it
+        /// introduces no discontinuity at all.
         whole: bool,
     },
-    Cat {
+    Stride {
+        src: usize,
+        axis: usize,
+        start: i64,
+        step: i64,
+    },
+    Gather {
+        src: usize,
+        axis: usize,
+        indices: Vec<i64>,
+    },
+    Concat {
         axis: usize,
         /// `(offset along axis, node)`, in increasing order.
         parts: Vec<(i64, usize)>,
     },
-    Reshape {
+    Transmute {
         src: usize,
     },
-    Pad {
-        src: usize,
-        axis: usize,
-        before: i64,
-        /// One past the last output index backed by data.
-        data_end: i64,
-    },
+    /// Backed by nothing. Every coordinate under it is a hole.
+    Fill,
 }
 
 struct Builder<'a> {
@@ -544,7 +550,7 @@ impl Builder<'_> {
                     .checked
                     .source(name)
                     .ok_or_else(|| {
-                        Error::Contract(format!(
+                        Error::Internal(format!(
                             "checkpoint tensor '{name}' was not resolved by the type checker"
                         ))
                     })?
@@ -558,7 +564,7 @@ impl Builder<'_> {
                     .checked
                     .output(name)
                     .ok_or_else(|| {
-                        Error::Contract(format!(
+                        Error::Internal(format!(
                             "contract '{name}' was not resolved by the type checker"
                         ))
                     })?
@@ -572,7 +578,6 @@ impl Builder<'_> {
                 axis,
                 start,
                 len,
-                step,
             } => {
                 let inner = self.build(src)?;
                 let axis = usize::from(axis.0);
@@ -581,19 +586,53 @@ impl Builder<'_> {
                     Error::Internal("Slice axis escaped the type checker".to_string())
                 })?;
                 shape[axis] = *len;
-                let whole = *step == 1 && *start == 0 && *len == operand_extent;
+                let whole = *start == 0 && *len == operand_extent;
                 self.push(
                     Kind::Slice {
                         src: inner,
                         axis,
                         start: *start,
-                        step: *step,
                         whole,
                     },
                     shape,
                 )
             }
-            Expr::Cat { axis, parts } => {
+            Expr::Stride {
+                src,
+                axis,
+                start,
+                len,
+                step,
+            } => {
+                let inner = self.build(src)?;
+                let axis = usize::from(axis.0);
+                let mut shape = self.nodes[inner].shape.clone();
+                shape[axis] = *len;
+                self.push(
+                    Kind::Stride {
+                        src: inner,
+                        axis,
+                        start: *start,
+                        step: *step,
+                    },
+                    shape,
+                )
+            }
+            Expr::Gather { src, axis, indices } => {
+                let inner = self.build(src)?;
+                let axis = usize::from(axis.0);
+                let mut shape = self.nodes[inner].shape.clone();
+                shape[axis] = indices.len() as i64;
+                self.push(
+                    Kind::Gather {
+                        src: inner,
+                        axis,
+                        indices: indices.clone(),
+                    },
+                    shape,
+                )
+            }
+            Expr::Concat { axis, parts } => {
                 let axis = usize::from(axis.0);
                 let mut placed = Vec::with_capacity(parts.len());
                 let mut offset = 0_i64;
@@ -608,68 +647,52 @@ impl Builder<'_> {
                 }
                 if placed.is_empty() {
                     return Err(Error::Internal(
-                        "empty Cat escaped the type checker".to_string(),
+                        "empty Concat escaped the type checker".to_string(),
                     ));
                 }
                 shape[axis] = offset;
                 self.push(
-                    Kind::Cat {
+                    Kind::Concat {
                         axis,
                         parts: placed,
                     },
                     shape,
                 )
             }
-            Expr::Reshape { src, shape } => {
-                let inner = self.build(src)?;
-                let resolved = resolve_reshape(shape, self.nodes[inner].elements)?;
-                self.push(Kind::Reshape { src: inner }, resolved)
-            }
-            Expr::Pad {
-                src,
-                axis,
-                before,
-                after,
-            } => {
-                let inner = self.build(src)?;
-                let axis = usize::from(axis.0);
-                let mut shape = self.nodes[inner].shape.clone();
-                let data_end = before + shape[axis];
-                shape[axis] = data_end + after;
-                self.push(
-                    Kind::Pad {
-                        src: inner,
-                        axis,
-                        before: *before,
-                        data_end,
-                    },
-                    shape,
-                )
-            }
+            // Nothing moves, so the only question is whether the operand's
+            // element grid survives. It does when the element width is
+            // unchanged, and flat order is then the identity; when it is not,
+            // `infer_transmute` has already proved the operand is a whole tensor,
+            // so the leaf is simply read under its new type over the same
+            // bytes.
+            Expr::Transmute { src, to } => match src.as_ref() {
+                Expr::Src(name) => {
+                    let leaf = self.intern(Leaf::Checkpoint(name.clone()));
+                    self.push(Kind::Leaf(leaf), to.shape.clone())
+                }
+                Expr::Out(name) => {
+                    let leaf = self.intern(Leaf::Contract(name.clone()));
+                    self.push(Kind::Leaf(leaf), to.shape.clone())
+                }
+                _ => {
+                    let inner = self.build(src)?;
+                    self.push(Kind::Transmute { src: inner }, to.shape.clone())
+                }
+            },
+            Expr::Fill { ty, .. } => self.push(Kind::Fill, ty.shape.clone()),
             Expr::Repack { .. } => Err(Error::Contract(
                 "Repack needs a kernel and cannot be lowered to byte runs".to_string(),
             )),
-            Expr::Quantize { .. } => Err(Error::Contract(
-                "Quantize needs a kernel and cannot be lowered to byte runs".to_string(),
+            Expr::Cast { .. } => Err(Error::Contract(
+                "Cast needs a kernel and cannot be lowered to byte runs".to_string(),
             )),
-            // Nothing moves: the leaf is simply read under its declared type.
-            // The type checker has already proved the byte size is unchanged
-            // and that the operand is a whole tensor, so the run this produces
-            // covers exactly the same bytes it did before.
-            Expr::Bitcast { src, out } => {
-                let leaf = match src.as_ref() {
-                    Expr::Src(name) => self.intern(Leaf::Checkpoint(name.clone())),
-                    Expr::Out(name) => self.intern(Leaf::Contract(name.clone())),
-                    _ => {
-                        return Err(Error::Contract(
-                            "Bitcast may only reinterpret a whole tensor".to_string(),
-                        ));
-                    }
-                };
-                self.push(Kind::Leaf(leaf), out.shape.clone())
-            }
+            Expr::Scale { .. } => Err(Error::Contract(
+                "Scale needs a kernel and cannot be lowered to byte runs".to_string(),
+            )),
             Expr::Shard { .. } => Err(Error::Internal(
-                "Shard must be specialized against a target before lowering".to_string(),
+                "Shard reached lowering; Resolver::specialize rewrites it into \
+                 this rank's Slice, and byte offsets cannot be symbolic"
+                    .to_string(),
             )),
         }
     }
@@ -733,31 +756,60 @@ impl Builder<'_> {
                 src,
                 axis,
                 start,
-                step,
                 whole,
+            } => {
+                let mut inner = *coord;
+                inner.dims[*axis] = start + coord.dims[*axis];
+                let inner_flat = flatten(&inner, &self.nodes[*src].shape);
+                let (found, span) = self.step(*src, &inner, inner_flat)?;
+                // A band leaves every inner extent alone, so the source advances
+                // in lockstep with the output even across increments of `axis`.
+                // Only the wrap of `axis` breaks it — and not even that when the
+                // band covers the whole axis.
+                let limit = if *whole || *axis == 0 {
+                    i64::MAX
+                } else {
+                    distance_to(node, coord, flat, *axis - 1, coord.dims[*axis - 1] + 1)
+                };
+                Ok((found, span.min(limit).min(remaining)))
+            }
+            // Where a band advances in lockstep, a stride does not: the source
+            // jumps by `step` every time `axis` increments, so the run ends
+            // there. This is the whole cost difference between the two nodes.
+            Kind::Stride {
+                src,
+                axis,
+                start,
+                step,
             } => {
                 let mut inner = *coord;
                 inner.dims[*axis] = start + coord.dims[*axis] * step;
                 let inner_flat = flatten(&inner, &self.nodes[*src].shape);
                 let (found, span) = self.step(*src, &inner, inner_flat)?;
-                // With step 1 the source advances in lockstep with the output
-                // even across increments of `axis`, because slicing leaves every
-                // inner extent alone. Only the wrap of `axis` breaks it — and
-                // not even that when the slice covers the whole axis.
-                let limit = if *whole {
-                    i64::MAX
-                } else if *step == 1 {
-                    if *axis == 0 {
-                        i64::MAX
-                    } else {
-                        distance_to(node, coord, flat, *axis - 1, coord.dims[*axis - 1] + 1)
-                    }
-                } else {
-                    distance_to(node, coord, flat, *axis, coord.dims[*axis] + 1)
-                };
+                let limit = distance_to(node, coord, flat, *axis, coord.dims[*axis] + 1);
                 Ok((found, span.min(limit).min(remaining)))
             }
-            Kind::Cat { axis, parts } => {
+            // A gather's run ends at the first index that is not one past the
+            // last, which is what makes a list with consecutive stretches
+            // cheaper than one without: the byte runs coalesce over them, and a
+            // permutation of contiguous blocks costs one run per block rather
+            // than one per element.
+            Kind::Gather { src, axis, indices } => {
+                let at = coord.dims[*axis] as usize;
+                let mut inner = *coord;
+                inner.dims[*axis] = *indices.get(at).ok_or_else(|| {
+                    Error::Internal(format!("Gather has no index for position {at}"))
+                })?;
+                let inner_flat = flatten(&inner, &self.nodes[*src].shape);
+                let (found, span) = self.step(*src, &inner, inner_flat)?;
+                let mut end = at + 1;
+                while end < indices.len() && indices[end] == indices[end - 1] + 1 {
+                    end += 1;
+                }
+                let limit = distance_to(node, coord, flat, *axis, end as i64);
+                Ok((found, span.min(limit).min(remaining)))
+            }
+            Kind::Concat { axis, parts } => {
                 let at = coord.dims[*axis];
                 let (offset, part) = parts
                     .iter()
@@ -765,7 +817,7 @@ impl Builder<'_> {
                     .find(|(offset, _)| *offset <= at)
                     .copied()
                     .ok_or_else(|| {
-                        Error::Internal(format!("Cat has no part covering index {at}"))
+                        Error::Internal(format!("Concat has no part covering index {at}"))
                     })?;
                 let mut inner = *coord;
                 inner.dims[*axis] = at - offset;
@@ -775,36 +827,17 @@ impl Builder<'_> {
                 let limit = distance_to(node, coord, flat, *axis, part_end);
                 Ok((found, span.min(limit).min(remaining)))
             }
-            Kind::Reshape { src } => {
-                // Reshape preserves flat order, so it is the identity here.
+            Kind::Transmute { src } => {
+                // A rename preserves flat order, so it is the identity here.
                 let mut inner = Coord::default();
                 unflatten(flat, &self.nodes[*src].shape, &mut inner);
                 let (found, span) = self.step(*src, &inner, flat)?;
                 Ok((found, span.min(remaining)))
             }
-            Kind::Pad {
-                src,
-                axis,
-                before,
-                data_end,
-            } => {
-                let at = coord.dims[*axis];
-                if at < *before {
-                    return Ok((None, distance_to(node, coord, flat, *axis, *before)));
-                }
-                if at >= *data_end {
-                    return Ok((
-                        None,
-                        distance_to(node, coord, flat, *axis, node.shape[*axis]),
-                    ));
-                }
-                let mut inner = *coord;
-                inner.dims[*axis] = at - before;
-                let inner_flat = flatten(&inner, &self.nodes[*src].shape);
-                let (found, span) = self.step(*src, &inner, inner_flat)?;
-                let limit = distance_to(node, coord, flat, *axis, *data_end);
-                Ok((found, span.min(limit).min(remaining)))
-            }
+            // The whole node is a hole, so the walk can jump to its end in one
+            // step. Where the hole sits inside the output is the enclosing
+            // `Concat`'s business, which is the point of the node being a leaf.
+            Kind::Fill => Ok((None, remaining)),
         }
     }
 }
@@ -866,7 +899,7 @@ fn flatten(coord: &Coord, shape: &[i64]) -> i64 {
 mod tests {
     use super::*;
     use crate::contract::infer::{Checked, CheckpointTypes, Resolver, infer_type};
-    use crate::contract::{ModelContract, TensorContract, TensorType};
+    use crate::contract::{ModelContract, Partition, TensorContract, TensorType};
     use crate::types::{Axis, DType, QuantScheme, QuantSpec};
 
     struct Fake(HashMap<String, TensorType>);
@@ -893,12 +926,34 @@ mod tests {
         }
     }
 
+    /// What the retired `Pad` node meant, written as the composition that
+    /// replaced it. `shape` is the operand's, which the old node left implicit
+    /// and which the type checker now sees.
+    fn pad(src: Expr, shape: &[i64], axis: u8, before: i64, after: i64) -> Expr {
+        let leg = |extent: i64| {
+            let mut shape = shape.to_vec();
+            shape[usize::from(axis)] = extent;
+            Expr::fill(0.0, TensorType::raw(shape, DType::BF16))
+        };
+        let mut parts = Vec::new();
+        if before > 0 {
+            parts.push(leg(before));
+        }
+        parts.push(src);
+        if after > 0 {
+            parts.push(leg(after));
+        }
+        Expr::concat(axis, parts)
+    }
+
     /// Resolve a whole contract the way the frontend does, so that a view can
     /// be compiled against the bank it reads.
     fn resolve(contract: &ModelContract, checkpoint: &dyn CheckpointTypes) -> Checked {
-        let mut resolver = Resolver::new(checkpoint);
+        let mut resolver = Resolver::new(checkpoint, Partition::WHOLE);
         for tensor in &contract.tensors {
-            let ty = resolver.infer(&tensor.expr).expect("type check failed");
+            let ty = resolver
+                .infer(&tensor.expr, &tensor.name)
+                .expect("type check failed");
             resolver.publish(&tensor.name, ty);
         }
         resolver.into_checked()
@@ -958,7 +1013,7 @@ mod tests {
     #[test]
     fn qkv_fusion_is_three_runs() {
         let out = lower(
-            Expr::cat(
+            Expr::concat(
                 0,
                 vec![
                     Expr::src("q_proj"),
@@ -981,7 +1036,7 @@ mod tests {
     fn tp_shard_then_fuse_is_still_three_runs() {
         // spec.md §5. Rows are contiguous, so sharding costs nothing extra.
         let out = lower(
-            Expr::cat(
+            Expr::concat(
                 0,
                 vec![
                     Expr::src("q_proj").slice(0, 1024, 1024),
@@ -1011,8 +1066,8 @@ mod tests {
     #[test]
     fn strided_select_picks_alternating_rows() {
         let checkpoint = Fake::new(&[("gate_up", &[8, 4])]);
-        let gate = lower(Expr::src("gate_up").slice_step(0, 0, 4, 2), &checkpoint);
-        let up = lower(Expr::src("gate_up").slice_step(0, 1, 4, 2), &checkpoint);
+        let gate = lower(Expr::src("gate_up").stride(0, 0, 4, 2), &checkpoint);
+        let up = lower(Expr::src("gate_up").stride(0, 1, 4, 2), &checkpoint);
         assert_eq!(srcs(&gate), vec![0, 8, 16, 24]);
         assert_eq!(srcs(&up), vec![4, 12, 20, 28]);
         assert!(gate.runs.iter().all(|run| run.len == 4));
@@ -1022,11 +1077,11 @@ mod tests {
     fn expert_stack_is_one_run_per_expert() {
         let checkpoint = Fake::new(&[("e0", &[6144, 2048]), ("e1", &[6144, 2048])]);
         let out = lower(
-            Expr::cat(
+            Expr::concat(
                 0,
                 vec![
-                    Expr::src("e0").reshape(vec![1, 6144, 2048]),
-                    Expr::src("e1").reshape(vec![1, 6144, 2048]),
+                    Expr::src("e0").transmute(TensorType::raw(vec![1, 6144, 2048], DType::BF16)),
+                    Expr::src("e1").transmute(TensorType::raw(vec![1, 6144, 2048], DType::BF16)),
                 ],
             ),
             &checkpoint,
@@ -1037,12 +1092,13 @@ mod tests {
 
     #[test]
     fn interleaved_gate_up_shard_matches_the_qwen_moe_pass() {
-        // abi/qwen_moe.rs emits two byte spans per expert: the local half of
-        // gate, then the local half of up. The algebra derives the same thing
-        // from a declaration that mentions neither experts nor MoE.
+        // The hand-written MoE pass this replaced emitted two byte spans per
+        // expert: the local half of gate, then the local half of up. The
+        // algebra derives the same thing from a declaration that mentions
+        // neither experts nor MoE.
         let checkpoint = Fake::new(&[("gate_up", &[2, 8, 4])]);
         let out = lower(
-            Expr::cat(
+            Expr::concat(
                 1,
                 vec![
                     Expr::src("gate_up").slice(1, 0, 2),
@@ -1063,7 +1119,7 @@ mod tests {
     #[test]
     fn pad_on_the_outer_axis_brackets_the_data() {
         let checkpoint = Fake::new(&[("w", &[3, 4])]);
-        let out = lower(Expr::src("w").pad(0, 1, 2), &checkpoint);
+        let out = lower(pad(Expr::src("w"), &[3, 4], 0, 1, 2), &checkpoint);
         assert_eq!(out.elements, 6 * 4);
         assert_eq!(out.run_count(), 3);
         assert_eq!(out.runs[0].source, RunSource::Zero);
@@ -1076,7 +1132,7 @@ mod tests {
     #[test]
     fn pad_on_an_inner_axis_interleaves() {
         let checkpoint = Fake::new(&[("w", &[3, 4])]);
-        let out = lower(Expr::src("w").pad(1, 0, 2), &checkpoint);
+        let out = lower(pad(Expr::src("w"), &[3, 4], 1, 0, 2), &checkpoint);
         assert_eq!(out.elements, 3 * 6);
         assert_eq!(out.run_count(), 6);
         assert_eq!(out.runs[0].len, 4);
@@ -1091,7 +1147,7 @@ mod tests {
             tensors: vec![
                 TensorContract::new(
                     "qkv",
-                    Expr::cat(0, vec![Expr::src("q_proj"), Expr::src("k_proj")]),
+                    Expr::concat(0, vec![Expr::src("q_proj"), Expr::src("k_proj")]),
                     vec![3072, 2048],
                     Encoding::Raw(DType::BF16),
                 ),
@@ -1123,11 +1179,11 @@ mod tests {
     fn every_output_element_is_covered_exactly_once() {
         let checkpoint = Fake::new(&[("a", &[4, 6]), ("b", &[2, 6])]);
         let out = lower(
-            Expr::cat(
+            Expr::concat(
                 0,
                 vec![
-                    Expr::src("a").slice_step(0, 0, 2, 2),
-                    Expr::src("b").pad(1, 1, 0).slice(1, 0, 6),
+                    Expr::src("a").stride(0, 0, 2, 2),
+                    pad(Expr::src("b"), &[2, 6], 1, 1, 0).slice(1, 0, 6),
                 ],
             ),
             &checkpoint,
@@ -1142,10 +1198,11 @@ mod tests {
 
     #[test]
     fn deep_nesting_still_reaches_the_leaves() {
-        // Slice(Cat(Slice(...))) — the composition abi/fusion.rs refuses.
+        // Slice(Concat(Slice(...))) — the composition the hand-written per-model
+        // fusion pass refused.
         let checkpoint = Fake::new(&[("a", &[8, 4]), ("b", &[8, 4])]);
         let out = lower(
-            Expr::cat(
+            Expr::concat(
                 0,
                 vec![Expr::src("a").slice(0, 2, 4), Expr::src("b").slice(0, 0, 4)],
             )
@@ -1153,7 +1210,7 @@ mod tests {
             &checkpoint,
         );
         assert_eq!(out.elements, 16);
-        // Rows 2,3 of the cat are a's rows 4,5; rows 4,5 are b's rows 0,1.
+        // Rows 2,3 of the concat are a's rows 4,5; rows 4,5 are b's rows 0,1.
         assert_eq!(srcs(&out), vec![16, 0]);
         assert_eq!(out.runs.iter().map(|run| run.len).sum::<i64>(), 16);
     }
@@ -1168,11 +1225,11 @@ mod tests {
         let shard = lower(Expr::src("w").slice(1, 0, 3072), &ck);
         assert_eq!(shard.run_count(), 2048);
         assert_eq!(shard.cost(), 1);
-        assert_eq!(lower(Expr::src("e").slice_step(0, 0, 4, 2), &ck).cost(), 1);
+        assert_eq!(lower(Expr::src("e").stride(0, 0, 4, 2), &ck).cost(), 1);
         // Fusing three tensors is three copies: one per source.
         assert_eq!(
             lower(
-                Expr::cat(
+                Expr::concat(
                     0,
                     vec![
                         Expr::src("q_proj"),
@@ -1187,7 +1244,7 @@ mod tests {
         );
         // A pad is one fill plus one copy per surviving band: the bands sit
         // in a destination that skips, and a copy engine writes forwards.
-        assert_eq!(lower(Expr::src("p").pad(1, 1, 1), &ck).cost(), 5);
+        assert_eq!(lower(pad(Expr::src("p"), &[4, 4], 1, 1, 1), &ck).cost(), 5);
     }
 
     #[test]
@@ -1203,7 +1260,7 @@ mod tests {
     #[test]
     fn escape_hatches_are_refused() {
         let checkpoint = Fake::new(&[("w", &[4, 32])]);
-        let expr = Expr::src("w").quantize(mxfp4());
+        let expr = Expr::src("w").cast(Encoding::Quant(mxfp4()));
         let (_, checked) = infer_type(&expr, &checkpoint).unwrap();
         let err = compile(&expr, &checked, 1024).unwrap_err();
         assert!(err.to_string().contains("needs a kernel"));
@@ -1280,6 +1337,14 @@ mod tests {
                 Some((name.clone(), flat_of(coord, &shape)))
             }
             Expr::Slice {
+                src, axis, start, ..
+            } => {
+                let axis = usize::from(axis.0);
+                let mut inner = coord.to_vec();
+                inner[axis] = start + coord[axis];
+                oracle(src, &inner, ck)
+            }
+            Expr::Stride {
                 src,
                 axis,
                 start,
@@ -1291,7 +1356,13 @@ mod tests {
                 inner[axis] = start + coord[axis] * step;
                 oracle(src, &inner, ck)
             }
-            Expr::Cat { axis, parts } => {
+            Expr::Gather { src, axis, indices } => {
+                let axis = usize::from(axis.0);
+                let mut inner = coord.to_vec();
+                inner[axis] = indices[coord[axis] as usize];
+                oracle(src, &inner, ck)
+            }
+            Expr::Concat { axis, parts } => {
                 let axis = usize::from(axis.0);
                 let mut offset = 0;
                 for part in parts {
@@ -1303,27 +1374,23 @@ mod tests {
                     }
                     offset += extent;
                 }
-                panic!("Cat coordinate out of range");
+                panic!("Concat coordinate out of range");
             }
-            Expr::Reshape { src, .. } => {
+            // Same elements in the same flat order, so the coordinate is
+            // simply re-indexed. The oracle's corpus is dense, and a rename
+            // that also changed the element width would have no coordinate
+            // correspondence to check.
+            Expr::Transmute { src, .. } => {
                 let mine = shape_of(expr, ck);
                 let theirs = shape_of(src, ck);
                 oracle(src, &unflat_of(flat_of(coord, &mine), &theirs), ck)
             }
-            Expr::Pad {
-                src, axis, before, ..
-            } => {
-                let axis = usize::from(axis.0);
-                let extent = shape_of(src, ck)[axis];
-                if coord[axis] < *before || coord[axis] >= before + extent {
-                    return None;
-                }
-                let mut inner = coord.to_vec();
-                inner[axis] = coord[axis] - before;
-                oracle(src, &inner, ck)
-            }
-            Expr::Bitcast { src, .. } => oracle(src, coord, ck),
-            Expr::Out(_) | Expr::Repack { .. } | Expr::Quantize { .. } | Expr::Shard { .. } => {
+            Expr::Fill { .. } => None,
+            Expr::Out(_)
+            | Expr::Repack { .. }
+            | Expr::Cast { .. }
+            | Expr::Scale { .. }
+            | Expr::Shard { .. } => {
                 unreachable!("the oracle covers only Src-rooted affine expressions")
             }
         }
@@ -1382,47 +1449,57 @@ mod tests {
             Expr::src("a"),
             Expr::src("a").slice(0, 2, 3),
             Expr::src("a").slice(1, 1, 2),
-            Expr::src("a").slice_step(0, 1, 3, 2),
-            Expr::src("a").slice_step(1, 0, 2, 2),
+            Expr::src("a").stride(0, 1, 3, 2),
+            Expr::src("a").stride(1, 0, 2, 2),
             // Concatenation on every axis.
-            Expr::cat(0, vec![Expr::src("a"), Expr::src("b")]),
-            Expr::cat(1, vec![Expr::src("b"), Expr::src("b")]),
+            Expr::concat(0, vec![Expr::src("a"), Expr::src("b")]),
+            Expr::concat(1, vec![Expr::src("b"), Expr::src("b")]),
             // Shard-then-fuse, the spec.md §5 shape.
-            Expr::cat(
+            Expr::concat(
                 0,
                 vec![Expr::src("a").slice(0, 0, 3), Expr::src("b").slice(0, 2, 2)],
             ),
-            // Slice above a Cat: the composition abi/fusion.rs cannot express.
-            Expr::cat(0, vec![Expr::src("a"), Expr::src("b")]).slice(0, 3, 5),
-            Expr::cat(1, vec![Expr::src("b"), Expr::src("b")]).slice(1, 2, 4),
-            // Reshape in both directions, and above a Cat.
-            Expr::src("c").reshape(vec![6, 4]),
-            Expr::src("d").reshape(vec![2, 3, 4]),
-            Expr::cat(0, vec![Expr::src("b"), Expr::src("b")]).reshape(vec![4, 8]),
-            Expr::cat(
+            // Slice above a Concat: a composition the hand-written per-model
+            // fusion pass could not express.
+            Expr::concat(0, vec![Expr::src("a"), Expr::src("b")]).slice(0, 3, 5),
+            Expr::concat(1, vec![Expr::src("b"), Expr::src("b")]).slice(1, 2, 4),
+            // Renaming in both directions, and above a Concat.
+            Expr::src("c").transmute(TensorType::raw(vec![6, 4], DType::BF16)),
+            Expr::src("d").transmute(TensorType::raw(vec![2, 3, 4], DType::BF16)),
+            Expr::concat(0, vec![Expr::src("b"), Expr::src("b")])
+                .transmute(TensorType::raw(vec![4, 8], DType::BF16)),
+            Expr::concat(
                 0,
                 vec![
-                    Expr::src("b").reshape(vec![1, 4, 4]),
-                    Expr::src("b").reshape(vec![1, 4, 4]),
+                    Expr::src("b").transmute(TensorType::raw(vec![1, 4, 4], DType::BF16)),
+                    Expr::src("b").transmute(TensorType::raw(vec![1, 4, 4], DType::BF16)),
                 ],
             ),
-            // Padding on each axis, and under a Cat.
-            Expr::src("b").pad(0, 1, 2),
-            Expr::src("b").pad(1, 2, 1),
-            Expr::src("c").pad(1, 1, 1),
-            Expr::cat(
-                0,
-                vec![Expr::src("b").pad(1, 0, 2), Expr::src("a").pad(1, 1, 1)],
-            ),
-            // Three levels deep, mixing every constructor.
-            Expr::cat(
+            // Padding on each axis, and under a Concat.
+            pad(Expr::src("b"), &[4, 4], 0, 1, 2),
+            pad(Expr::src("b"), &[4, 4], 1, 2, 1),
+            pad(Expr::src("c"), &[2, 3, 4], 1, 1, 1),
+            Expr::concat(
                 0,
                 vec![
-                    Expr::src("a").slice_step(0, 0, 3, 2).pad(1, 1, 0),
-                    Expr::src("c")
-                        .reshape(vec![6, 4])
-                        .slice(0, 1, 4)
-                        .pad(1, 1, 0),
+                    pad(Expr::src("b"), &[4, 4], 1, 0, 2),
+                    pad(Expr::src("a"), &[6, 4], 1, 1, 1),
+                ],
+            ),
+            // Three levels deep, mixing every constructor.
+            Expr::concat(
+                0,
+                vec![
+                    pad(Expr::src("a").stride(0, 0, 3, 2), &[3, 4], 1, 1, 0),
+                    pad(
+                        Expr::src("c")
+                            .transmute(TensorType::raw(vec![6, 4], DType::BF16))
+                            .slice(0, 1, 4),
+                        &[4, 4],
+                        1,
+                        1,
+                        0,
+                    ),
                 ],
             )
             .slice(0, 1, 5),
@@ -1537,7 +1614,7 @@ mod tests {
     #[test]
     fn a_strided_select_folds_too() {
         let ck = Fake::new(&[("w", &[8, 4])]);
-        let out = lower(Expr::src("w").slice_step(0, 0, 4, 2), &ck);
+        let out = lower(Expr::src("w").stride(0, 0, 4, 2), &ck);
         assert_eq!(out.run_count(), 4);
         let pieces = assert_fold_preserves(&out);
         assert_eq!(pieces.len(), 1);
@@ -1563,7 +1640,7 @@ mod tests {
         // Fusion reads three different tensors, so there is no progression to
         // find and the piece count equals the run count.
         let out = lower(
-            Expr::cat(
+            Expr::concat(
                 0,
                 vec![
                     Expr::src("q_proj"),
@@ -1581,10 +1658,11 @@ mod tests {
     #[test]
     fn a_sharded_fusion_folds_each_part_but_not_across_them() {
         // Three leaves, each contributing a strided half. Three pieces, each a
-        // two-deep nest — the shape `abi/fusion.rs` cannot express today.
+        // two-deep nest — a shape the hand-written per-model fusion pass could
+        // not express.
         let ck = Fake::new(&[("q", &[512, 256]), ("k", &[256, 256]), ("v", &[256, 256])]);
         let out = lower(
-            Expr::cat(
+            Expr::concat(
                 0,
                 vec![
                     Expr::src("q").slice(1, 0, 128),
@@ -1624,7 +1702,7 @@ mod tests {
         // would need a copy that skips in the destination, and nothing below
         // this layer can execute one. The honest answer is one copy per row.
         let ck = Fake::new(&[("w", &[4, 4])]);
-        let out = lower(Expr::src("w").pad(1, 1, 1), &ck);
+        let out = lower(pad(Expr::src("w"), &[4, 4], 1, 1, 1), &ck);
         assert!(out.needs_zero_fill());
         let pieces = assert_fold_preserves(&out);
         assert!(pieces.len() > 1);
@@ -1668,22 +1746,27 @@ mod tests {
         let cases = vec![
             Expr::src("a"),
             Expr::src("a").slice(1, 1, 2),
-            Expr::src("a").slice_step(0, 1, 3, 2),
-            Expr::cat(0, vec![Expr::src("a"), Expr::src("b")]),
-            Expr::cat(1, vec![Expr::src("b"), Expr::src("b")]),
-            Expr::src("c").reshape(vec![6, 4]),
-            Expr::src("b").pad(0, 1, 2),
-            Expr::src("b").pad(1, 2, 1),
-            Expr::src("c").pad(1, 1, 1),
-            Expr::cat(0, vec![Expr::src("a"), Expr::src("b")]).slice(0, 3, 5),
-            Expr::cat(
+            Expr::src("a").stride(0, 1, 3, 2),
+            Expr::concat(0, vec![Expr::src("a"), Expr::src("b")]),
+            Expr::concat(1, vec![Expr::src("b"), Expr::src("b")]),
+            Expr::src("c").transmute(TensorType::raw(vec![6, 4], DType::BF16)),
+            pad(Expr::src("b"), &[4, 4], 0, 1, 2),
+            pad(Expr::src("b"), &[4, 4], 1, 2, 1),
+            pad(Expr::src("c"), &[2, 3, 4], 1, 1, 1),
+            Expr::concat(0, vec![Expr::src("a"), Expr::src("b")]).slice(0, 3, 5),
+            Expr::concat(
                 0,
                 vec![
-                    Expr::src("a").slice_step(0, 0, 3, 2).pad(1, 1, 0),
-                    Expr::src("c")
-                        .reshape(vec![6, 4])
-                        .slice(0, 1, 4)
-                        .pad(1, 1, 0),
+                    pad(Expr::src("a").stride(0, 0, 3, 2), &[3, 4], 1, 1, 0),
+                    pad(
+                        Expr::src("c")
+                            .transmute(TensorType::raw(vec![6, 4], DType::BF16))
+                            .slice(0, 1, 4),
+                        &[4, 4],
+                        1,
+                        1,
+                        0,
+                    ),
                 ],
             )
             .slice(0, 1, 5),
@@ -1703,7 +1786,7 @@ mod tests {
             tensors: vec![
                 TensorContract::new(
                     "bank",
-                    Expr::cat(
+                    Expr::concat(
                         0,
                         vec![
                             Expr::src("q_proj"),

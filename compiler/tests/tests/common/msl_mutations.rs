@@ -1,5 +1,7 @@
-//! The plan mutations the `validate_singleton_plan` corpus is built from,
-//! mirroring `kMutations` / `mutate()` in `compiler/tests/oracle/`.
+//! The plan mutations the `validate_singleton_plan` corpus is built from. They
+//! were transcribed from `kMutations` / `mutate()` in an in-driver C++ oracle
+//! that has since been deleted, and are now the definition rather than a copy
+//! of one.
 //!
 //! `validate_singleton_plan` rejects things a well-formed compiler plan never
 //! produces, so almost all of its error paths are only reachable by damaging a

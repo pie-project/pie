@@ -659,6 +659,31 @@ class Context::Impl {
         if (steps == nullptr || step_count == 0) {
             return PIE_STATUS_INVALID_ARGUMENT;
         }
+        // ABI v14 says a frame carries k steps the driver runs as one closed
+        // system. Whether the engine actually sends k > 1 decides whether the
+        // per-step host round trip is the driver's to remove or the engine's.
+        if (std::getenv("PIE_METAL_FRAME_TRACE") != nullptr) {
+            // Whether a step's tokens come off the device decides whether a
+            // non-tail step could commit without waiting. Measured: every step
+            // carries HOST token ids (device=0 host=256), so `commit_step_async`
+            // cannot be used here without double-buffering the per-step IO --
+            // the host's write for step i+1 would race step i's read.
+            for (std::size_t si = 0; si < step_count; ++si) {
+                static int dg = 0, hg = 0;
+                (steps[si].token_ids.len == 0 ? dg : hg) += 1;
+                if ((dg + hg) % 512 == 0)
+                    std::fprintf(stderr, "[geom] device-carried=%d host-carried=%d\n", dg,
+                                 hg);
+            }
+            static std::map<std::size_t, int> hist;
+            static int n = 0;
+            ++hist[step_count];
+            if (++n % 256 == 0) {
+                std::fprintf(stderr, "[frame] steps-per-launch:");
+                for (const auto& [k, c] : hist) std::fprintf(stderr, " %zux%d", k, c);
+                std::fprintf(stderr, "\n");
+            }
+        }
         for (std::size_t i = 0; i < step_count; ++i) {
             StepExpansion expansion;
             expand_step(frame, steps[i], &expansion);

@@ -29,15 +29,16 @@
 //! the largest contract, borrowed for one call — and buys the property that a
 //! field the caller forgot is a zero, not garbage from another variant.
 
-use crate::contract::{Expr, ModelContract, Scales, TensorContract, TensorType};
+use crate::contract::{
+    Expr, ModelContract, ScaleFactor, Scales, TensorContract, TensorType, Visibility,
+};
 use crate::ffi::types::{
     PieLoaderBytes, PieLoaderDType, PieLoaderEncodingKind, PieLoaderI64Slice,
-    PieLoaderQuantGranularity, PieLoaderQuantScheme, PieLoaderRepackLayout, PieLoaderRowMap,
-    PieLoaderScaleForm, PieLoaderSlice, PieLoaderU32Slice,
+    PieLoaderQuantGranularity, PieLoaderQuantScheme, PieLoaderRepackLayout, PieLoaderScaleForm,
+    PieLoaderSlice, PieLoaderU32Slice, PieLoaderVisibility,
 };
 use crate::types::{
-    Axis, DType, Encoding, QuantGranularity, QuantScheme, QuantSpec, RepackLayout, RepackSpec,
-    RowMap, ScaleForm,
+    Axis, DType, Encoding, QuantGranularity, QuantScheme, QuantSpec, RepackLayout, ScaleForm,
 };
 
 /// `PieLoaderExprNode::src` when the node has no single operand.
@@ -45,20 +46,22 @@ pub const PIE_LOADER_NO_NODE: u32 = u32::MAX;
 
 /// Which constructor a node is. Mirrors [`crate::contract::Expr`] exactly; a
 /// variant added there without a variant here is a compile error in
-/// [`read_expr`].
+/// `read_expr`.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PieLoaderExprKind {
     Src = 0,
     Out = 1,
-    Slice = 2,
-    Cat = 3,
-    Reshape = 4,
-    Pad = 5,
-    Shard = 6,
-    Repack = 7,
-    Quantize = 8,
-    Bitcast = 9,
+    Fill = 2,
+    Slice = 3,
+    Stride = 4,
+    Gather = 5,
+    Concat = 6,
+    Transmute = 7,
+    Shard = 8,
+    Repack = 9,
+    Cast = 10,
+    Scale = 11,
 }
 
 impl TryFrom<u32> for PieLoaderExprKind {
@@ -67,14 +70,16 @@ impl TryFrom<u32> for PieLoaderExprKind {
         Ok(match value {
             0 => Self::Src,
             1 => Self::Out,
-            2 => Self::Slice,
-            3 => Self::Cat,
-            4 => Self::Reshape,
-            5 => Self::Pad,
-            6 => Self::Shard,
-            7 => Self::Repack,
-            8 => Self::Quantize,
-            9 => Self::Bitcast,
+            2 => Self::Fill,
+            3 => Self::Slice,
+            4 => Self::Stride,
+            5 => Self::Gather,
+            6 => Self::Concat,
+            7 => Self::Transmute,
+            8 => Self::Shard,
+            9 => Self::Repack,
+            10 => Self::Cast,
+            11 => Self::Scale,
             other => return Err(other),
         })
     }
@@ -135,48 +140,10 @@ impl Default for PieLoaderEncodingSpec {
     }
 }
 
-/// [`crate::types::RepackSpec`], flattened. All eleven fields, because a repack
-/// is opaque to the type checker and therefore has to state everything.
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct PieLoaderRepackSpecView {
-    /// A `PieLoaderRepackLayout` value, as `uint32_t`.
-    pub layout: u32,
-    /// A `PieLoaderRowMap` value, as `uint32_t`.
-    pub row_map: u32,
-    pub batch: u32,
-    pub source_rows: u32,
-    pub source_row_offset: u32,
-    pub target_rows: u32,
-    pub valid_rows: u32,
-    pub source_stride_cols: u32,
-    pub source_col_offset: u32,
-    pub source_cols: u32,
-    pub target_cols: u32,
-}
-
-impl Default for PieLoaderRepackSpecView {
-    fn default() -> Self {
-        Self {
-            layout: PieLoaderRepackLayout::None as u32,
-            row_map: PieLoaderRowMap::Identity as u32,
-            batch: 0,
-            source_rows: 0,
-            source_row_offset: 0,
-            target_rows: 0,
-            valid_rows: 0,
-            source_stride_cols: 0,
-            source_col_offset: 0,
-            source_cols: 0,
-            target_cols: 0,
-        }
-    }
-}
-
 /// One node of the expression graph.
 ///
 /// Every field is read by exactly the kinds that need it and ignored by the
-/// rest; see [`read_expr`] for the mapping, which is the only place it is
+/// rest; see `read_expr` for the mapping, which is the only place it is
 /// written down.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -189,30 +156,64 @@ pub struct PieLoaderExprNode {
     pub name: PieLoaderBytes,
     /// The single operand, for every kind that has one. Must be strictly less
     /// than this node's own index. [`PIE_LOADER_NO_NODE`] for `Src`, `Out` and
-    /// `Cat`.
+    /// `Concat`.
     pub src: u32,
-    /// `Cat`: the operands, in order. Same index rule.
+    /// `Concat`: the operands, in order. Same index rule.
     pub parts: PieLoaderU32Slice,
-    /// `Slice`, `Cat`, `Pad`, `Shard`.
+    /// `Slice`, `Stride`, `Concat`, `Shard`, and a per-group `Scale`.
     pub axis: u8,
-    /// `Slice`.
+    /// `Slice` and `Stride`.
     pub start: i64,
     pub len: i64,
-    /// `Slice`. `0` is rejected; state `1` for a contiguous run.
+    /// `Stride`. A contiguous run is a `Slice`, so this must be at least 2.
     pub step: i64,
-    /// `Pad`.
-    pub before: i64,
-    pub after: i64,
-    /// `Reshape`: the new shape. At most one extent may be `-1`.
-    pub shape: PieLoaderI64Slice,
-    /// `Repack`, `Bitcast`: the declared output type, which the checker takes on
-    /// trust because it cannot see through either.
+    /// `Gather`: the indices to read along `axis`, in output order.
+    ///
+    /// Constants rather than a nested node, which is what keeps a contract
+    /// comparable and hashable. Borrowed for the call, like every other slice
+    /// in this struct.
+    pub indices: PieLoaderI64Slice,
+    /// `Fill`: the constant, as the bit pattern of an IEEE-754 binary32, for
+    /// the reason `scale_factor_bits` gives.
+    ///
+    /// An unset field reads as `+0.0`, which is the one value a fill may
+    /// carry -- so unlike `Scale`, a `Fill` is not told apart from a forgotten
+    /// field by this. Its shape is: the loader rejects a rank-0 fill, and a
+    /// zeroed node has no shape at all.
+    pub fill_bits: u32,
+    /// `Transmute`: the type to read the same bytes under. `Repack`: the declared
+    /// output type, which the checker takes on trust because it cannot see
+    /// through the swizzle. `Fill`: the type of the constant tensor. At most
+    /// one extent may be `-1`, and never for a `Fill`.
     pub out_shape: PieLoaderI64Slice,
     pub out_encoding: PieLoaderEncodingSpec,
-    /// `Repack`.
-    pub repack: PieLoaderRepackSpecView,
-    /// `Quantize`.
-    pub quant: PieLoaderQuantSpecView,
+    /// `Repack`: a `PieLoaderRepackLayout` value, as `uint32_t`. The whole of
+    /// what a repack says -- every count a kernel needs is the operand's type
+    /// or `out_shape`'s, so the loader derives it.
+    pub repack_layout: u32,
+    /// `Scale`: the multiplier, as the bit pattern of an IEEE-754 binary32.
+    ///
+    /// A `float` field would make this struct's layout depend on the C++
+    /// compiler agreeing about float ABI. `pie_loader::ModelContract::scale`
+    /// does the conversion, so no author writes a bit pattern.
+    ///
+    /// Leaving it unset means zero, which reads as `+0.0`; the loader rejects
+    /// that rather than scaling a tensor to nothing.
+    pub scale_factor_bits: u32,
+    /// `Scale`: the operand holding one factor per `scale_group` elements along
+    /// `axis`. Same index rule as `src`.
+    ///
+    /// [`PIE_LOADER_NO_NODE`] for a uniform factor, which is what an unset
+    /// field reads as.
+    pub scale_by: u32,
+    /// `Scale`: elements per factor. Zero selects the uniform factor in
+    /// `scale_factor_bits`.
+    ///
+    /// The two forms are told apart by this field rather than by which of the
+    /// others happens to be set, so a node built by zeroing the struct and
+    /// filling in one field is always the uniform case and never a per-group
+    /// case with a missing operand.
+    pub scale_group: u32,
 }
 
 impl Default for PieLoaderExprNode {
@@ -226,13 +227,14 @@ impl Default for PieLoaderExprNode {
             start: 0,
             len: 0,
             step: 1,
-            before: 0,
-            after: 0,
-            shape: PieLoaderI64Slice::default(),
+            indices: PieLoaderI64Slice::default(),
+            fill_bits: 0,
             out_shape: PieLoaderI64Slice::default(),
             out_encoding: PieLoaderEncodingSpec::default(),
-            repack: PieLoaderRepackSpecView::default(),
-            quant: PieLoaderQuantSpecView::default(),
+            repack_layout: PieLoaderRepackLayout::None as u32,
+            scale_factor_bits: 0,
+            scale_by: PIE_LOADER_NO_NODE,
+            scale_group: 0,
         }
     }
 }
@@ -253,7 +255,8 @@ pub struct PieLoaderTensorContractView {
     /// for a packed quantized weight, whose on-disk extents are a property of
     /// the quantizer that produced the checkpoint and not of the model. The
     /// alternative — the driver guessing, and the loader checking the guess —
-    /// is what `LogicalShape` in `model_contracts.hpp` was working around.
+    /// is what a `LogicalShape`-style helper exists to work around, and the
+    /// reason there is no such helper here.
     pub shape: PieLoaderI64Slice,
     /// What the driver wants the tensor to *be*. Unlike the shape this is never
     /// optional, because it is not a prediction: the loader inserts whatever
@@ -261,6 +264,32 @@ pub struct PieLoaderTensorContractView {
     pub encoding: PieLoaderEncodingSpec,
     /// Set when this entry holds the scales for another entry.
     pub scales: PieLoaderScalesView,
+    /// Whether the driver binds this tensor, or the contract just needed a
+    /// name for it. Zero -- the default -- is `Public`, so an author who does
+    /// not set it gets the tensor bound, which is what every existing
+    /// declaration means.
+    pub visibility: PieLoaderVisibility,
+}
+
+impl TryFrom<u32> for PieLoaderVisibility {
+    type Error = u32;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Public),
+            1 => Ok(Self::Internal),
+            other => Err(other),
+        }
+    }
+}
+
+impl From<PieLoaderVisibility> for Visibility {
+    fn from(value: PieLoaderVisibility) -> Self {
+        match value {
+            PieLoaderVisibility::Public => Self::Public,
+            PieLoaderVisibility::Internal => Self::Internal,
+        }
+    }
 }
 
 /// What a scale tensor scales, said by the entry that declares the scales.
@@ -283,11 +312,22 @@ pub struct PieLoaderScalesView {
     /// Unlike `Expr::Out` this may name a *later* declaration: it pairs two
     /// published tensors rather than feeding one into the other.
     pub of: PieLoaderBytes,
-    pub granularity: PieLoaderQuantGranularity,
+    /// A [`PieLoaderQuantGranularity`], as a `u32`.
+    ///
+    /// Spelled as the underlying integer for the reason
+    /// [`PieLoaderTargetSpec::encode_scratch_dtype`] is: this struct is an
+    /// *input*, so the value is whatever C++ wrote, and a Rust enum holding a
+    /// value outside its variants is undefined behaviour the moment the
+    /// containing slice is borrowed — before `read_scales` could reject it.
+    /// `read_scales` converts it.
+    ///
+    /// [`PieLoaderTargetSpec::encode_scratch_dtype`]: crate::ffi::entry::PieLoaderTargetSpec::encode_scratch_dtype
+    pub granularity: u32,
     /// Elements of `of` per scale entry, for `PerGroup`.
     pub group_size: u32,
     pub channel_axis: u32,
-    pub form: PieLoaderScaleForm,
+    /// A [`PieLoaderScaleForm`], as a `u32`. See [`Self::granularity`].
+    pub form: u32,
 }
 
 pub type PieLoaderTensorContractSlice = PieLoaderSlice<PieLoaderTensorContractView>;
@@ -362,24 +402,10 @@ fn read_encoding(spec: &PieLoaderEncodingSpec, what: &str) -> Result<Encoding, S
     })
 }
 
-fn read_repack(spec: &PieLoaderRepackSpecView, what: &str) -> Result<RepackSpec, String> {
-    let layout = PieLoaderRepackLayout::try_from(spec.layout)
-        .map_err(|v| format!("{what}.layout: {v} is not a PieLoaderRepackLayout"))?;
-    let row_map = PieLoaderRowMap::try_from(spec.row_map)
-        .map_err(|v| format!("{what}.row_map: {v} is not a PieLoaderRowMap"))?;
-    Ok(RepackSpec {
-        layout: RepackLayout::from(layout),
-        row_map: RowMap::from(row_map),
-        batch: spec.batch,
-        source_rows: spec.source_rows,
-        source_row_offset: spec.source_row_offset,
-        target_rows: spec.target_rows,
-        valid_rows: spec.valid_rows,
-        source_stride_cols: spec.source_stride_cols,
-        source_col_offset: spec.source_col_offset,
-        source_cols: spec.source_cols,
-        target_cols: spec.target_cols,
-    })
+fn read_repack(layout: u32, what: &str) -> Result<RepackLayout, String> {
+    PieLoaderRepackLayout::try_from(layout)
+        .map(RepackLayout::from)
+        .map_err(|v| format!("{what}: {v} is not a PieLoaderRepackLayout"))
 }
 
 fn read_type(
@@ -403,10 +429,11 @@ unsafe fn read_scales(view: &PieLoaderScalesView, what: &str) -> Result<Option<S
         return Ok(None);
     }
     let of = unsafe { text(&view.of, &format!("{what}.scales.of")) }?;
-    let granularity = match view.granularity {
-        PieLoaderQuantGranularity::PerChannel => QuantGranularity::PerChannel,
-        PieLoaderQuantGranularity::PerGroup => QuantGranularity::PerGroup,
-    };
+    let granularity = QuantGranularity::from(
+        PieLoaderQuantGranularity::try_from(view.granularity).map_err(|v| {
+            format!("{what}.scales.granularity: {v} is not a PieLoaderQuantGranularity")
+        })?,
+    );
     if granularity == QuantGranularity::PerGroup && view.group_size == 0 {
         return Err(format!(
             "{what}.scales is PerGroup with group_size 0, which describes no grouping"
@@ -417,10 +444,10 @@ unsafe fn read_scales(view: &PieLoaderScalesView, what: &str) -> Result<Option<S
         granularity,
         group_size: view.group_size,
         channel_axis: view.channel_axis,
-        form: match view.form {
-            PieLoaderScaleForm::RawE8M0 => ScaleForm::RawE8M0,
-            PieLoaderScaleForm::F32Factors => ScaleForm::F32Factors,
-        },
+        form: ScaleForm::from(
+            PieLoaderScaleForm::try_from(view.form)
+                .map_err(|v| format!("{what}.scales.form: {v} is not a PieLoaderScaleForm"))?,
+        ),
     }))
 }
 
@@ -460,14 +487,25 @@ fn read_expr(node: &PieLoaderExprNode, index: usize, done: &[Expr]) -> Result<Ex
             axis,
             start: node.start,
             len: node.len,
+        },
+        PieLoaderExprKind::Stride => Expr::Stride {
+            src: src()?,
+            axis,
+            start: node.start,
+            len: node.len,
             step: node.step,
         },
-        PieLoaderExprKind::Cat => {
+        PieLoaderExprKind::Gather => Expr::Gather {
+            src: src()?,
+            axis,
+            indices: unsafe { slice_of(node.indices.ptr, node.indices.len) }.to_vec(),
+        },
+        PieLoaderExprKind::Concat => {
             let parts = unsafe { slice_of(node.parts.ptr, node.parts.len) };
             if parts.is_empty() {
-                return Err(format!("{what}.parts: a Cat of nothing has no type"));
+                return Err(format!("{what}.parts: a Concat of nothing has no type"));
             }
-            Expr::Cat {
+            Expr::Concat {
                 axis,
                 parts: parts
                     .iter()
@@ -475,29 +513,35 @@ fn read_expr(node: &PieLoaderExprNode, index: usize, done: &[Expr]) -> Result<Ex
                     .collect::<Result<_, _>>()?,
             }
         }
-        PieLoaderExprKind::Reshape => Expr::Reshape {
+        PieLoaderExprKind::Transmute => Expr::Transmute {
             src: src()?,
-            shape: unsafe { slice_of(node.shape.ptr, node.shape.len) }.to_vec(),
+            to: read_type(&node.out_shape, &node.out_encoding, &format!("{what}.out"))?,
         },
-        PieLoaderExprKind::Pad => Expr::Pad {
-            src: src()?,
-            axis,
-            before: node.before,
-            after: node.after,
+        PieLoaderExprKind::Fill => Expr::Fill {
+            value: node.fill_bits,
+            ty: read_type(&node.out_shape, &node.out_encoding, &format!("{what}.out"))?,
         },
         PieLoaderExprKind::Shard => Expr::Shard { src: src()?, axis },
         PieLoaderExprKind::Repack => Expr::Repack {
             src: src()?,
-            spec: read_repack(&node.repack, &format!("{what}.repack"))?,
-            out: read_type(&node.out_shape, &node.out_encoding, &format!("{what}.out"))?,
+            layout: read_repack(node.repack_layout, &format!("{what}.repack_layout"))?,
+            to: read_type(&node.out_shape, &node.out_encoding, &format!("{what}.out"))?,
         },
-        PieLoaderExprKind::Quantize => Expr::Quantize {
+        PieLoaderExprKind::Cast => Expr::Cast {
             src: src()?,
-            spec: read_quant(&node.quant, &format!("{what}.quant"))?,
+            to: read_encoding(&node.out_encoding, &format!("{what}.out"))?,
         },
-        PieLoaderExprKind::Bitcast => Expr::Bitcast {
+        PieLoaderExprKind::Scale => Expr::Scale {
             src: src()?,
-            out: read_type(&node.out_shape, &node.out_encoding, &format!("{what}.out"))?,
+            factor: if node.scale_group == 0 {
+                ScaleFactor::Uniform(node.scale_factor_bits)
+            } else {
+                ScaleFactor::PerGroup {
+                    by: Box::new(child(node.scale_by, "scale_by")?),
+                    group: node.scale_group,
+                    axis,
+                }
+            },
         },
     })
 }
@@ -544,6 +588,9 @@ pub unsafe fn read_contract(view: &PieLoaderModelContractView) -> Result<ModelCo
             shape: (!shape.is_empty()).then(|| shape.to_vec()),
             encoding: read_encoding(&tensor.encoding, &what)?,
             scales,
+            visibility: PieLoaderVisibility::try_from(tensor.visibility as u32)
+                .map_err(|v| format!("{what}.visibility: {v} is not a PieLoaderVisibility"))?
+                .into(),
         });
     }
 
@@ -557,7 +604,7 @@ pub unsafe fn read_contract(view: &PieLoaderModelContractView) -> Result<ModelCo
 //
 // The loader writes two of these formats in production: a checkpoint's tensor
 // table (`ffi::checkpoint`) and, in tests, a whole contract
-// (`crate::contract_writer`). Flattening a *contract* is not on the load path
+// (`crate::testkit::contract_writer`). Flattening a *contract* is not on the load path
 // and lives in the latter.
 
 pub(crate) fn write_quant(spec: &QuantSpec) -> PieLoaderQuantSpecView {

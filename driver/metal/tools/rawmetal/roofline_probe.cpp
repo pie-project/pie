@@ -77,6 +77,7 @@ int main(int argc, char** argv) {
     const int BN = argc > 3 ? atoi(argv[3]) : 32;
     const int SPLIT = argc > 4 ? atoi(argv[4]) : 1;
     const bool COLD = getenv("PROBE_COLD") != nullptr;
+    const int BM = getenv("PROBE_BM") ? atoi(getenv("PROBE_BM")) : 16;
 
     auto ctx = RawMetalContext::create(/*heap_bytes=*/3072ull << 20);
     if (!ctx) { printf("FAIL: no context\n"); return 1; }
@@ -87,7 +88,8 @@ int main(int argc, char** argv) {
     if (!stream.valid()) { printf("FAIL stream compile: %s\n", err.c_str()); return 1; }
     Pso qmm = ctx->compile_pso_from_file(
         dir + "/quantized_qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_64_b_4_bm_16_bn_" + std::to_string(BN), &err);
+        "affine_qmm_t_bfloat16_gs_64_b_4_bm_" + std::to_string(BM) + "_bn_" +
+            std::to_string(BN), &err);
     if (!qmm.valid()) { printf("FAIL qmm compile: %s\n", err.c_str()); return 1; }
     Pso qmv = ctx->compile_pso_from_file(dir + "/quantized_qmv.metal",
                                          "affine_qmv_fast_bfloat16_gs_64_b_4", &err);
@@ -208,9 +210,9 @@ int main(int argc, char** argv) {
             tg = Threadgroup{32, 2, 1};
         } else {
             pso = qmm;
-            const uint32_t rows = uint32_t((M + 15) / 16 * 16);
+            const uint32_t rows = uint32_t((M + BM - 1) / BM * BM);
             if (N % uint32_t(BN) != 0) { printf("  %s: N %% BN != 0\n", s.label); continue; }
-            g = Grid{32u * (N / uint32_t(BN)), 2u * (rows / 16u), 2};
+            g = Grid{32u * (N / uint32_t(BN)), 2u * (rows / uint32_t(BM)), 2};
             tg = Threadgroup{32, 2, 2};
         }
         double ms;

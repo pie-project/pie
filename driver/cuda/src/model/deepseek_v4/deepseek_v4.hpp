@@ -94,13 +94,17 @@ struct DsV4LayerWeights {
     // Routed experts (MXFP4)
     std::vector<DsV4ExpertWeights> experts;
 
-    // BF16 dequant of the routed experts, materialised once on first use and
-    // reused across forwards. The packed MXFP4 weights cannot feed cuBLAS
-    // directly, and dequantising them every layer of every step costs more
-    // bandwidth than the GEMMs themselves. Layout matches the shared MoE
-    // kernels: [E, 2*moe_I, H] and [E, H, moe_I].
-    mutable std::unique_ptr<DeviceTensor> moe_gate_up_bf16;
-    mutable std::unique_ptr<DeviceTensor> moe_down_bf16;
+    // BF16 dequant of the routed experts, stacked per layer. The packed MXFP4
+    // weights cannot feed cuBLAS directly, and dequantising them every layer of
+    // every step costs more bandwidth than the GEMMs themselves. Layout matches
+    // the shared MoE kernels: [E, 2*moe_I, H] and [E, H, moe_I].
+    //
+    // Null when the contract left the experts packed, which is the whole
+    // signal: `author_deepseek_v4_contract` decides between the two, and the
+    // branches below read that decision off which weights it published rather
+    // than off a flag carried alongside them.
+    const DeviceTensor* moe_gate_up_bf16 = nullptr;  // [E, 2*moe_I, H] BF16
+    const DeviceTensor* moe_down_bf16    = nullptr;  // [E, H, moe_I] BF16
 
     // Shared expert (block-scaled FP8)
     const DeviceTensor* shared_w1       = nullptr;  // gate

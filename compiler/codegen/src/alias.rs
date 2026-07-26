@@ -35,9 +35,13 @@ use pie_plan::{Dimension, Region, SymbolicType};
 /// `b -> c` after `a -> b` leaves `a` one hop short. The walk is bounded by the
 /// number of entries, which is a termination proof rather than a guess — a
 /// chain that took more steps than there are entries would have to revisit one,
-/// and a revisited entry is a cycle. SSA makes cycles unreachable, so the bound
-/// is never hit; it exists so that a future caller who breaks that assumption
-/// gets a wrong answer in a debug build instead of a hang in production.
+/// and a revisited entry is a cycle. The bound is reached routinely, by every
+/// chain that is as long as the table is large, and reaching it is correct:
+/// after that many hops the walk has followed each entry at most once, so the
+/// value it holds cannot be a key unless the aliases form a cycle. SSA makes
+/// cycles unreachable; the `debug_assert!` after the loop is what a future
+/// caller who breaks that assumption trips, so the failure is a panic in a
+/// debug build rather than a silently wrong offset in a release one.
 #[derive(Debug, Default, Clone)]
 pub struct AliasTable {
     of: BTreeMap<u32, u32>,

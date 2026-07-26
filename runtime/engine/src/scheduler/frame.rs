@@ -408,6 +408,17 @@ impl FramePolicy {
         tokens: usize,
         rows: usize,
     ) {
+        if Self::stamp_trace() {
+            use std::sync::atomic::{AtomicU64, Ordering as O};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, O::Relaxed) + 1;
+            if n % 256 == 0 {
+                eprintln!(
+                    "[stamp] n={n} k={} slot={} fires={} seq={}",
+                    self.k, stamp.slot, stamp.fires, stamp.seq
+                );
+            }
+        }
         self.record_arrival(
             stamp,
             owner,
@@ -424,6 +435,17 @@ impl FramePolicy {
     /// toward its frame's arrival completeness so the frame can seal (its
     /// surviving fires execute; the guest observed the rejection).
     pub fn on_fire_rejected_at_admission(&mut self, stamp: FrameStamp, owner: Option<ProcessId>) {
+        if Self::stamp_trace() {
+            use std::sync::atomic::{AtomicU64, Ordering as O};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, O::Relaxed) + 1;
+            if n % 256 == 0 {
+                eprintln!(
+                    "[stamp] n={n} k={} slot={} fires={} seq={}",
+                    self.k, stamp.slot, stamp.fires, stamp.seq
+                );
+            }
+        }
         self.record_arrival(
             stamp,
             owner,
@@ -537,6 +559,11 @@ impl FramePolicy {
         }
     }
 
+    fn stamp_trace() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("PIE_FRAME_SHAPE").is_some())
+    }
+
     /// Bootstrap: seed the slot balance with the execution pool's initial
     /// free capacity, so the "free slot with a staged taker" hold covers
     /// the COLD START by the same rule as a turnover — the first seal
@@ -597,6 +624,15 @@ impl FramePolicy {
     /// teardown closes so fresh-lane bring-up owns the driver lane.
     pub fn has_pending_binds(&self) -> bool {
         !self.pending_binds.is_empty()
+    }
+
+    /// Whether the seal is waiting on a successor's arrival: a swap is
+    /// earmarked (a slot was released or a holder is departing, with a
+    /// staged taker for it) or an admitted successor's first fire is still
+    /// in flight. This is exactly the cohort-boundary window.
+    pub fn is_joining(&self) -> bool {
+        !self.joins_in_flight.is_empty()
+            || ((self.pending_slots > 0 || !self.departing.is_empty()) && !self.staged.is_empty())
     }
 
     pub fn on_bind_completed(&mut self, pid: Option<ProcessId>) {
@@ -1046,9 +1082,7 @@ impl FramePolicy {
                     }
                 }
             }
-            let joining = !self.joins_in_flight.is_empty()
-                || ((self.pending_slots > 0 || !self.departing.is_empty())
-                    && !self.staged.is_empty());
+            let joining = self.is_joining();
             let mode = rebind_escape_mode();
             // Mode 2 escapes only from the deadlock shape itself: every missing
             // lane is EMPTY and nothing is executing, so nothing the engine
@@ -1226,6 +1260,22 @@ mod tests {
         }
     }
 
+    /// The mode-2 rebind escape arms its deadline on the first blocked plan
+    /// and only releases the idle rebinder once [`REBIND_ESCAPE_US`] has
+    /// passed, which is longer than the gather poll one
+    /// [`drive_past_cold_hold`] step advances by.
+    fn drive_past_rebind_escape(policy: &mut FramePolicy, queued: &QueuedFireIds) -> FramePlan {
+        let now = Instant::now();
+        match plan(policy, queued, now) {
+            FramePlan::Hold(_) => plan(
+                policy,
+                queued,
+                now + Duration::from_micros(REBIND_ESCAPE_US + 1),
+            ),
+            plan => plan,
+        }
+    }
+
     /// Flatten a whole-frame dispatch for order-insensitive membership
     /// asserts.
     fn fires(plan: &FramePlan) -> Vec<u64> {
@@ -1338,8 +1388,14 @@ mod tests {
         let queued: QueuedFireIds = [1, 2, 3].into_iter().collect();
         let t0 = Instant::now();
         match plan(&mut policy, &queued, t0) {
+            // A blocked gather re-looks at the GATHER POLL cadence, not at
+            // the watchdog's. The watchdog is report-only and its deadline
+            // stays an order of magnitude further out; sleeping the whole
+            // way there with the GPU idle was the 2x regression that split
+            // the two constants apart.
             FramePlan::Hold(hold) => {
-                assert_eq!(hold, Duration::from_micros(STRICT_WATCHDOG_US));
+                assert_eq!(hold, Duration::from_micros(gather_poll_us()));
+                assert!(hold < Duration::from_micros(STRICT_WATCHDOG_US));
             }
             plan => panic!("wait-all must hold for the incomplete lane, got {plan:?}"),
         }
@@ -1693,7 +1749,7 @@ mod tests {
         policy.on_bind_enqueued(Some(rebinder));
 
         let queued: QueuedFireIds = [12].into_iter().collect();
-        let sealed = drive_past_cold_hold(&mut policy, &queued);
+        let sealed = drive_past_rebind_escape(&mut policy, &queued);
         assert_eq!(
             fires(&sealed),
             vec![12],

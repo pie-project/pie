@@ -45,12 +45,20 @@ struct MultiBatchPsos {
     Pso kv_append_paged{}; // kv_append_paged_bfloat16                  (page-table scatter write)
     // affine_qmm_t: MLX's steel quantized GEMM, for the batched decode. [0] is
     // BN=32, [1] is BN=64. Selected only above `kQmmMinBatch`.
-    Pso qmm_t[3]{};
-    Pso qmm_t_residual[3]{};
+    // [bm_wide][bn]: 16/32 rows per block x 16/32/64 columns.
+    Pso qmm_t[2][3]{};
+    Pso qmm_t_residual[2][3]{};
     // affine_qmm_t_strided: the same GEMM with an explicit row pitch, for the
     // prefill, whose scratch rows are laid at a uniform `scratch_widest_elems`
     // rather than packed at `K`.
+    // Split-K: [bm_wide] x {gemm, reduce}.  MLX sends every transposed
+    // non-batched decode down this path; the split is chosen per shape.
+    Pso qmm_t_splitk[2]{};
+    Pso qmm_splitk_reduce{};
+    Pso qmm_splitk_reduce_residual{};
     Pso qmm_t_strided{};
+    Pso qmm_t_strided_wide{};
+    Pso qmm_t_strided_wide_residual{};
     Pso qmm_t_strided_residual{};
     // Row-independent prefill kernels with an explicit row pitch, so a whole
     // prompt runs as one dispatch instead of one per token.  Same arithmetic as
@@ -59,6 +67,7 @@ struct MultiBatchPsos {
     Pso rms_strided{};
     Pso silu_mul_strided{};
     Pso gated_rms_strided{};
+    Pso dense_gemv_strided{};
     // GDN over a whole prompt in one dispatch (prep is token-parallel, the
     // recurrent scan runs in registers) instead of one serialized pair per token.
     Pso gdn_prep_prefill{};

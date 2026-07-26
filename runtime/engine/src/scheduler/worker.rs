@@ -1585,7 +1585,12 @@ impl DriverLane {
 }
 
 enum QueuedItem {
-    Launch(PendingRequest),
+    /// Boxed: the queue is rotated and compacted item-by-item on every
+    /// dispatcher pass, and an inline `PendingRequest` made `QueuedItem`
+    /// 1280 bytes — a cohort boundary moved ~800 MB through `VecDeque`
+    /// rotations alone. The indirection makes every queue move a pointer
+    /// move; the payload itself never moves.
+    Launch(Box<PendingRequest>),
     PreLaunchCopy {
         plan: PreLaunchCopy,
         logical_completion: WorkItemCompletion,
@@ -1667,7 +1672,7 @@ enum LaunchState {
 
 struct PendingLaunchBatch {
     state: LaunchState,
-    requests: Vec<PendingRequest>,
+    requests: Vec<Box<PendingRequest>>,
     started: Instant,
     batch_size: u64,
     total_tokens: usize,
@@ -1737,6 +1742,10 @@ impl QueueScan {
 struct PendingQueue {
     items: VecDeque<QueuedItem>,
     epoch: u64,
+    /// `(epoch, index of the first non-`Launch` item)`.
+    first_other: Option<(u64, Option<usize>)>,
+    /// `(epoch, index of the first queued close)`.
+    first_close: Option<(u64, usize)>,
 }
 
 impl PendingQueue {
@@ -1748,6 +1757,73 @@ impl PendingQueue {
     fn replace(&mut self, items: VecDeque<QueuedItem>) {
         self.items = items;
         self.epoch = self.epoch.wrapping_add(1);
+    }
+
+    /// Offset of the first item that is not a `Launch`, or `None` when the
+    /// queue is all launches.
+    ///
+    /// Both this and [`Self::first_close`] answer "where does the launch run
+    /// end", which every worker pass asks at least once. At a cohort boundary
+    /// the queue is a run of thousands of launches held back by an unsealed
+    /// frame, so the linear search — run once per pass and once per queued
+    /// control — was measured as the loop's single largest per-pass cost
+    /// (~18 us/pass against ~3 us elsewhere). The scan itself is unavoidable;
+    /// repeating it while the queue is unchanged is not, so both are cached
+    /// against the same epoch that guards [`ScanCache`].
+    fn first_other(&mut self) -> Option<usize> {
+        if let Some((epoch, idx)) = self.first_other
+            && epoch == self.epoch
+        {
+            return idx;
+        }
+        let idx = self
+            .items
+            .iter()
+            .position(|item| !matches!(item, QueuedItem::Launch(_)));
+        self.first_other = Some((self.epoch, idx));
+        idx
+    }
+
+    /// Offset of the first queued close, or the length when there is none.
+    fn first_close(&mut self) -> usize {
+        if let Some((epoch, idx)) = self.first_close
+            && epoch == self.epoch
+        {
+            return idx;
+        }
+        let idx = self
+            .items
+            .iter()
+            .position(|item| {
+                matches!(
+                    item,
+                    QueuedItem::CloseInstance { .. } | QueuedItem::CloseChannels { .. }
+                )
+            })
+            .unwrap_or(self.items.len());
+        self.first_close = Some((self.epoch, idx));
+        idx
+    }
+
+    /// Move the leading run of launches behind the rest of the queue.
+    ///
+    /// Equivalent to popping each leading launch off the front and pushing it
+    /// back, but as one rotation rather than thousands of individual moves.
+    fn rotate_launch_run_to_back(&mut self, run_len: usize) {
+        self.items.rotate_left(run_len);
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+
+    /// Insert a bring-up control ahead of the trailing close run.
+    fn insert_before_closes(&mut self, item: QueuedItem) {
+        let index = self.first_close();
+        self.items.insert(index, item);
+        self.epoch = self.epoch.wrapping_add(1);
+        // The insert shifted the close run one to the right and put a
+        // non-close at `index`, so the next control lands after this one and
+        // bind-vs-bind order is preserved without rescanning.
+        self.first_close = Some((self.epoch, index + 1));
+        self.first_other = None;
     }
 }
 
@@ -1767,7 +1843,12 @@ impl std::ops::DerefMut for PendingQueue {
 
 impl From<VecDeque<QueuedItem>> for PendingQueue {
     fn from(items: VecDeque<QueuedItem>) -> Self {
-        Self { items, epoch: 0 }
+        Self {
+            items,
+            epoch: 0,
+            first_other: None,
+            first_close: None,
+        }
     }
 }
 
@@ -1776,6 +1857,8 @@ impl FromIterator<QueuedItem> for PendingQueue {
         Self {
             items: iter.into_iter().collect(),
             epoch: 0,
+            first_other: None,
+            first_close: None,
         }
     }
 }
@@ -1793,7 +1876,7 @@ struct ScanCache {
 /// sealed slot, and a fresh `Vec` per frame would be a ~650 KB allocation on
 /// the loop's critical path. Compaction `take()`s every slot, so the buffer
 /// comes back empty and only ever grows.
-type SlotBuffer = Vec<Vec<Option<PendingRequest>>>;
+type SlotBuffer = Vec<Vec<Option<Box<PendingRequest>>>>;
 
 struct SchedulerControl {
     tx: crossbeam::channel::Sender<SchedulerItem>,
@@ -2398,6 +2481,19 @@ impl BatchScheduler {
                 break;
             }
 
+            // Cohort-boundary bind deferral: while the seal waits on a
+            // successor's arrival, hold back the bind permits that retiring
+            // processes return, so the staged cohort's working-set
+            // declaration and prefill construction do not compete with the
+            // boundary's own bring-up. Cleared the moment this pass has
+            // nothing left to do, which is what makes the hold incapable of
+            // being the last thing standing.
+            crate::inferlet::process::set_bind_release_hold(
+                !stopping
+                    && frame_policy.is_joining()
+                    && (progress || !in_flight_launches.is_empty() || in_flight_control.is_some()),
+            );
+
             if progress {
                 stall_since = None;
                 stall_dumps = 0;
@@ -2993,7 +3089,7 @@ impl BatchScheduler {
         for copy in copies {
             pending.push_back(copy);
         }
-        pending.push_back(QueuedItem::Launch(request));
+        pending.push_back(QueuedItem::Launch(Box::new(request)));
     }
 
     /// Whether any queued fire still targets `instance_id` (a queued
@@ -3025,6 +3121,32 @@ impl BatchScheduler {
                 | QueuedItem::CopyKvTracked { .. }
                 | QueuedItem::CopyState { .. }
         )
+    }
+
+    /// Items that a rotation can usefully expose at the queue FRONT — the
+    /// only reason to move a held close backward.
+    ///
+    /// Three kinds dispatch without ever reaching the front, so rotating for
+    /// them is pure churn. A `Launch` is picked by fire id in
+    /// `dispatch_frame_work`, which reads the whole queue. A standalone copy
+    /// is pulled from any position by the tail sweep below. And a close is
+    /// excluded because this predicate is only asked while the WHOLE close
+    /// run is held, where exposing one held close behind another dispatches
+    /// nothing.
+    ///
+    /// Measured cost of asking the wrong question (`any non-close behind`,
+    /// which a queue of held closes followed by the next cohort's launches
+    /// always answers yes): 0.5M rotations and 103 ms of the loop thread in
+    /// ONE cohort boundary at 512 lanes, and 6.6M rotations over a 1024-lane
+    /// run whose GPU then idled 6.4 s. Each rotation also bumps the queue
+    /// epoch, so it invalidated `ScanCache` and re-walked the queue on top.
+    const fn rotation_target(item: &QueuedItem) -> bool {
+        !matches!(
+            item,
+            QueuedItem::Launch(_)
+                | QueuedItem::CloseInstance { .. }
+                | QueuedItem::CloseChannels { .. }
+        ) && !Self::standalone_copy(item)
     }
 
     /// Controls that dispatch without draining in-flight launches. The
@@ -3115,16 +3237,7 @@ impl BatchScheduler {
         // committed), so binds still jump the close tail and closes drain
         // during the next generation's execution. Bind-vs-bind order is
         // preserved (insertion before the trailing close run).
-        let index = pending
-            .iter()
-            .position(|queued| {
-                matches!(
-                    queued,
-                    QueuedItem::CloseInstance { .. } | QueuedItem::CloseChannels { .. }
-                )
-            })
-            .unwrap_or(pending.len());
-        pending.insert(index, item);
+        pending.insert_before_closes(item);
     }
 
     /// launch that reached the queue front has no queued copy left).
@@ -3132,13 +3245,10 @@ impl BatchScheduler {
         if !matches!(pending.front(), Some(QueuedItem::Launch(_))) {
             return false;
         }
-        let Some(work) = pending
-            .iter()
-            .skip(1)
-            .find(|item| !matches!(item, QueuedItem::Launch(_)))
-        else {
+        let Some(run_len) = pending.first_other() else {
             return false;
         };
+        let work = &pending[run_len];
         if !(Self::standalone_copy(work)
             || (allow_controls
                 && (Self::lifecycle_control(work)
@@ -3146,10 +3256,7 @@ impl BatchScheduler {
         {
             return false;
         }
-        while matches!(pending.front(), Some(QueuedItem::Launch(_))) {
-            let launch = pending.pop_front().expect("launch front");
-            pending.push_back(launch);
-        }
+        pending.rotate_launch_run_to_back(run_len);
         true
     }
 
@@ -3170,6 +3277,8 @@ impl BatchScheduler {
         slot_buffer: &mut SlotBuffer,
         stopping: bool,
     ) -> (bool, Option<Duration>) {
+        let probe_disp = super::fire_timing_enabled();
+        let disp_started = probe_disp.then(Instant::now);
         let (mut progress, wait_hint) = Self::dispatch_frame_work(
             scan_cache,
             slot_buffer,
@@ -3186,6 +3295,15 @@ impl BatchScheduler {
             stats,
             stopping,
         );
+        if let Some(started) = disp_started {
+            super::LOOP_PHASES
+                .disp_frame_ns
+                .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+        let mut rot_ns = 0u64;
+        let mut rot_n = 0u64;
+        let mut busy_ns = 0u64;
+        let mut busy_n = 0u64;
         // Busy-close rotations this pass: bounded so a queue of nothing but
         // busy closes breaks out instead of spinning.
         let mut close_rotations = 0usize;
@@ -3230,15 +3348,14 @@ impl BatchScheduler {
                         // progress (a rotation changes nothing dispatchable;
                         // the bind-completed lane reply that empties
                         // `pending_binds` is the wake that re-checks).
-                        if close_rotations >= pending.len()
-                            || !pending.iter().skip(1).any(|item| {
-                                !matches!(
-                                    item,
-                                    QueuedItem::CloseInstance { .. }
-                                        | QueuedItem::CloseChannels { .. }
-                                )
-                            })
-                        {
+                        let rot_t = probe_disp.then(Instant::now);
+                        let rot_stop = close_rotations >= pending.len()
+                            || !pending.iter().skip(1).any(Self::rotation_target);
+                        if let Some(t) = rot_t {
+                            rot_ns += t.elapsed().as_nanos() as u64;
+                            rot_n += 1;
+                        }
+                        if rot_stop {
                             break;
                         }
                         close_rotations += 1;
@@ -3246,10 +3363,15 @@ impl BatchScheduler {
                         pending.push_back(item);
                         continue;
                     }
+                    let busy_t = probe_disp.then(Instant::now);
                     let busy = instances
                         .get(&id)
                         .is_some_and(|tracked| tracked.in_flight != 0)
                         || Self::instance_has_queued_work(pending, id);
+                    if let Some(t) = busy_t {
+                        busy_ns += t.elapsed().as_nanos() as u64;
+                        busy_n += 1;
+                    }
                     if !busy {
                         let item = pending.pop_front().expect("close front");
                         Self::post_control(
@@ -3262,38 +3384,52 @@ impl BatchScheduler {
                             item,
                         );
                         progress = true;
+                        continue;
                     }
                     // Busy: rotate the close behind the queue so the fires
                     // that will quiesce it (and everything unrelated) keep
                     // flowing; its own retirement re-checks it. A close can
                     // only move BACKWARD, so it never overtakes its own
                     // instance's queued work.
-                    if close_rotations >= pending.len()
+                    //
+                    // No progress claim: a rotation dispatches nothing, and
+                    // `busy` is precisely the condition that guarantees a
+                    // later wake (in-flight work completes, or queued work
+                    // dispatches and then completes). Claiming progress here
+                    // instead makes the run loop re-enter immediately and
+                    // spin: at a cohort boundary the queue front is hundreds
+                    // of busy closes, so every pass rotated the whole queue
+                    // and the loop paid it thousands of times over.
+                    let rot_t = probe_disp.then(Instant::now);
+                    let rot_stop = close_rotations >= pending.len()
                         || !pending.iter().skip(1).any(|item| {
                             !matches!(
                                 item,
                                 QueuedItem::CloseInstance { .. } | QueuedItem::CloseChannels { .. }
                             )
-                        })
-                    {
+                        });
+                    if let Some(t) = rot_t {
+                        rot_ns += t.elapsed().as_nanos() as u64;
+                        rot_n += 1;
+                    }
+                    if rot_stop {
                         break;
                     }
                     close_rotations += 1;
                     let item = pending.pop_front().expect("close front");
                     pending.push_back(item);
-                    progress = true;
                 }
                 QueuedItem::CloseChannels { .. } if hold_closes => {
                     // Same bounded rotation as a held instance close; no
                     // progress claim (see the CloseInstance hold branch).
-                    if close_rotations >= pending.len()
-                        || !pending.iter().skip(1).any(|item| {
-                            !matches!(
-                                item,
-                                QueuedItem::CloseInstance { .. } | QueuedItem::CloseChannels { .. }
-                            )
-                        })
-                    {
+                    let rot_t = probe_disp.then(Instant::now);
+                    let rot_stop = close_rotations >= pending.len()
+                        || !pending.iter().skip(1).any(Self::rotation_target);
+                    if let Some(t) = rot_t {
+                        rot_ns += t.elapsed().as_nanos() as u64;
+                        rot_n += 1;
+                    }
+                    if rot_stop {
                         break;
                     }
                     close_rotations += 1;
@@ -3333,6 +3469,7 @@ impl BatchScheduler {
         // copies ARE the residency planner's forward progress — leaving
         // them positional starved the very traffic that unsticks a held
         // frame (CONTENTION_FOLLOWUP.md §12).
+        let copy_t = probe_disp.then(Instant::now);
         if in_flight_control.is_none()
             && let Some(index) = pending.iter().position(|item| Self::standalone_copy(item))
             && let Some(item) = pending.remove(index)
@@ -3347,6 +3484,15 @@ impl BatchScheduler {
                 item,
             );
             progress = true;
+        }
+        if let Some(t) = copy_t {
+            let acc = &super::LOOP_PHASES;
+            acc.disp_copy_ns
+                .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            acc.disp_rot_ns.fetch_add(rot_ns, Ordering::Relaxed);
+            acc.disp_rot_n.fetch_add(rot_n, Ordering::Relaxed);
+            acc.disp_busy_ns.fetch_add(busy_ns, Ordering::Relaxed);
+            acc.disp_busy_n.fetch_add(busy_n, Ordering::Relaxed);
         }
         (progress, wait_hint)
     }
@@ -3727,6 +3873,12 @@ impl BatchScheduler {
     /// settled/stale, assemble the v14 frame submission, and post it as ONE
     /// launch. Returns (progress, posted-a-frame).
     #[allow(clippy::too_many_arguments)]
+    /// Cached so the frame path does not pay an environment lookup per frame.
+    fn frame_shape_trace() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("PIE_FRAME_SHAPE").is_some())
+    }
+
     /// Whether a queued fire still belongs in the frame being built; settles
     /// it with a rejection if not.
     fn admits_to_frame(
@@ -3803,7 +3955,7 @@ impl BatchScheduler {
         }
         // A fire id repeated across the queue cannot be placed twice; it is
         // degenerate, but it must still be dispatched rather than dropped.
-        let mut collisions: Vec<(usize, PendingRequest)> = Vec::new();
+        let mut collisions: Vec<(usize, Box<PendingRequest>)> = Vec::new();
         while let Some(item) = pending.pop_front() {
             match item {
                 QueuedItem::Launch(request) => match slot_of.get(&request.logical_fire_id) {
@@ -3830,7 +3982,7 @@ impl BatchScheduler {
         });
         // Compact the slots and drop settled/cancelled/stale fires in one
         // pass — the frame posts without them.
-        let mut survivors: Vec<Vec<PendingRequest>> = Vec::with_capacity(waves.len());
+        let mut survivors: Vec<Vec<Box<PendingRequest>>> = Vec::with_capacity(waves.len());
         for slots in slot_buffer.iter_mut() {
             let mut kept_wave = Vec::with_capacity(slots.len());
             for request in slots.iter_mut().filter_map(Option::take) {
@@ -3869,8 +4021,26 @@ impl BatchScheduler {
                 }
             }
         }
+        let nonempty_waves = survivors.iter().filter(|w| !w.is_empty()).count();
         let (submission, requests) =
             batch::build_frame_submission(survivors, limits, page_size, stats);
+        // How many waves a sealed frame actually carries. ABI v14 has a frame
+        // carry k steps the driver runs as one closed system, and the guest does
+        // submit `live_slots` fires per frame -- but this reports
+        // `nonempty_waves=1` at every k, so each fire becomes its own frame and
+        // every decode step pays a host round trip (2.31ms of a 25.6ms step at
+        // 32 lanes, measured driver-side with PIE_METAL_GPU_METER).
+        if Self::frame_shape_trace() {
+            use std::sync::atomic::{AtomicU64, Ordering as O};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, O::Relaxed) + 1;
+            if n % 256 == 0 {
+                eprintln!(
+                    "[frame-shape] n={n} nonempty_waves={nonempty_waves} steps={}",
+                    submission.steps.len()
+                );
+            }
+        }
         let batch_size = requests.len() as u64;
         let total_tokens = requests
             .iter()
@@ -4152,7 +4322,7 @@ impl BatchScheduler {
             .count()
     }
 
-    fn fire_timing_snapshots(requests: &[PendingRequest]) -> Vec<FireTimingSnapshot> {
+    fn fire_timing_snapshots(requests: &[Box<PendingRequest>]) -> Vec<FireTimingSnapshot> {
         requests
             .iter()
             .enumerate()
@@ -4261,6 +4431,14 @@ impl BatchScheduler {
             take(&acc.post_tail_ns) / 1_000,
             take(&acc.post_drain_n),
         );
+        let (disp_frame, disp_rot, disp_rot_n, disp_busy, disp_busy_n, disp_copy) = (
+            take(&acc.disp_frame_ns) / 1_000,
+            take(&acc.disp_rot_ns) / 1_000,
+            take(&acc.disp_rot_n),
+            take(&acc.disp_busy_ns) / 1_000,
+            take(&acc.disp_busy_n),
+            take(&acc.disp_copy_ns) / 1_000,
+        );
         let mut record = serde_json::json!({
             "schema": 1,
             "source": "scheduler",
@@ -4328,6 +4506,12 @@ impl BatchScheduler {
                 ("retire_emit_us", retire_emit),
                 ("retire_n", retire_n),
                 ("loop_scans", loop_scans),
+                ("disp_frame_us", disp_frame),
+                ("disp_rot_us", disp_rot),
+                ("disp_rot_n", disp_rot_n),
+                ("disp_busy_us", disp_busy),
+                ("disp_busy_n", disp_busy_n),
+                ("disp_copy_us", disp_copy),
                 (
                     "loop_lag_us",
                     if loop_lag_n > 0 {
@@ -5497,7 +5681,8 @@ mod tests {
             None,
             false,
         );
-        let mut pending: PendingQueue = VecDeque::from([QueuedItem::Launch(request)]).into();
+        let mut pending: PendingQueue =
+            VecDeque::from([QueuedItem::Launch(Box::new(request))]).into();
         completion.request_cancel();
         BatchScheduler::reject_pipeline_queued(&mut pending, pid, Some(&completion));
         assert_eq!(pending.len(), 1);
@@ -6869,8 +7054,8 @@ mod tests {
         Ok(())
     }
 
-    fn dummy_launch_request(pipeline_id: ProcessId, instance_id: u64) -> PendingRequest {
-        PendingRequest::direct(
+    fn dummy_launch_request(pipeline_id: ProcessId, instance_id: u64) -> Box<PendingRequest> {
+        Box::new(PendingRequest::direct(
             dummy_launch(),
             instance_id,
             WorkItemCompletion::deferred_with_guard(None),
@@ -6882,7 +7067,7 @@ mod tests {
             None,
             None,
             false,
-        )
+        ))
     }
 
     #[test]
@@ -7080,7 +7265,8 @@ mod tests {
         let mut frame_policy = FramePolicy::new(1, 1, 4096, None);
         frame_policy.on_fire_enqueued(stamp, Some(pid), fire_id, 1, 1);
 
-        let mut pending: PendingQueue = VecDeque::from([QueuedItem::Launch(request)]).into();
+        let mut pending: PendingQueue =
+            VecDeque::from([QueuedItem::Launch(Box::new(request))]).into();
         let (lane, _lane_rx) = test_lane(None);
         let mut lane_inflight = 0u64;
         let mut lane_token = 0u64;
@@ -7167,7 +7353,7 @@ mod tests {
 
         let (resize_tx, _resize_rx) = tokio::sync::oneshot::channel();
         let mut pending: PendingQueue = VecDeque::from([
-            QueuedItem::Launch(request),
+            QueuedItem::Launch(Box::new(request)),
             QueuedItem::ResizePool {
                 plan: PoolResizePlan::default(),
                 response: resize_tx,
@@ -7256,7 +7442,7 @@ mod tests {
         let (resize_tx, _resize_rx) = tokio::sync::oneshot::channel();
         let (copy_tx, _copy_rx) = tokio::sync::oneshot::channel();
         let pending: PendingQueue = VecDeque::from([
-            QueuedItem::Launch(request_a),
+            QueuedItem::Launch(Box::new(request_a)),
             QueuedItem::ResizePool {
                 plan: PoolResizePlan::default(),
                 response: resize_tx,
@@ -7269,7 +7455,7 @@ mod tests {
                 plan: crate::driver::KvCopyPlan::default(),
                 response: copy_tx,
             },
-            QueuedItem::Launch(request_b),
+            QueuedItem::Launch(Box::new(request_b)),
             QueuedItem::PreLaunchCopy {
                 plan: PreLaunchCopy::Kv(crate::driver::KvCopyPlan::default()),
                 logical_completion: WorkItemCompletion::deferred_with_guard(None),
@@ -7335,8 +7521,11 @@ mod tests {
         }));
         let rider = make(None);
         let (stamped_id, rider_id) = (stamped.logical_fire_id, rider.logical_fire_id);
-        let mut pending: PendingQueue =
-            VecDeque::from([QueuedItem::Launch(stamped), QueuedItem::Launch(rider)]).into();
+        let mut pending: PendingQueue = VecDeque::from([
+            QueuedItem::Launch(Box::new(stamped)),
+            QueuedItem::Launch(Box::new(rider)),
+        ])
+        .into();
 
         let mut cache = ScanCache::default();
         let scan = BatchScheduler::scan_queue(&mut cache, &pending, false);
@@ -7403,7 +7592,8 @@ mod tests {
             let fire_id = request.logical_fire_id;
             let mut frame_policy = FramePolicy::new(1, 1, 4096, None);
             frame_policy.on_fire_enqueued(stamp, Some(pid), fire_id, 1, 1);
-            let mut pending: PendingQueue = VecDeque::from([QueuedItem::Launch(request)]).into();
+            let mut pending: PendingQueue =
+                VecDeque::from([QueuedItem::Launch(Box::new(request))]).into();
             let (lane, _lane_rx) = test_lane(None);
             let mut lane_inflight = 0u64;
             let mut lane_token = 1u64;

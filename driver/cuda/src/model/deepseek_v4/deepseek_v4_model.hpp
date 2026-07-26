@@ -24,8 +24,7 @@ public:
         int tp_size,
         int tp_rank,
         NcclComm* tp_comm,
-        bool emit_logits,
-        bool eager_bf16_experts = true);
+        bool emit_logits);
 
     void prepare(AttentionWorkspace& attn_ws,
                  const ForwardFn::PrepareInputs& in) override;

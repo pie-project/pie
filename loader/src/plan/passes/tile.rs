@@ -1,17 +1,17 @@
 //! Backend tile-map lowering.
 //!
-//! §9 draws the line this file sits on. A fact the driver can *measure* is data
-//! and travels in [`StorageTarget`]; a rule that differs per backend and cannot
-//! be parameterized is code and lives here. It is the same split LLVM draws
-//! between target features and `TargetLowering`.
+//! `architecture.md` §9 draws the line this file sits on. A fact the driver can
+//! *measure* is data and travels in [`StorageTarget`]; a rule that differs per
+//! backend and cannot be parameterized is code and lives here. It is the same
+//! split LLVM draws between target features and `TargetLowering`.
 //!
 //! Everything here answers a question the C++ driver used to answer at run
 //! time. That mattered less for being wrong than for being *unrecorded*:
 //! `driver/cuda/src/loader/transcode_engine.hpp` chose a tile size and a fusion
 //! strategy while executing, so one plan could run two different kernel
-//! sequences and nothing in the plan said which (§8.1). Deciding here puts the
-//! answer in the plan, which puts it in the plan hash, which makes "the plan
-//! determines execution" true rather than aspirational.
+//! sequences and nothing in the plan said which (`architecture.md` §8.1).
+//! Deciding here puts the answer in the plan, which puts it in the plan hash,
+//! which makes "the plan determines execution" true rather than aspirational.
 //!
 //! It used to be a `trait Backend` with three implementations, of which two
 //! returned a constant and the third was one function. A trait is the right
@@ -21,7 +21,8 @@
 use crate::plan::index::PlanIndex;
 use crate::plan::{
     FUSION_FP8_TO_MXFP4, LoadPlan, SourceExtent, StorageInstr, StorageTarget, TILE_MAP_CAST,
-    TILE_MAP_ENCODE, TILE_MAP_REBLOCK, TILE_MAP_REPACK, TileMapKind, TransformFusion,
+    TILE_MAP_ENCODE, TILE_MAP_REBLOCK, TILE_MAP_REPACK, TILE_MAP_SCALE, TileMapKind,
+    TransformFusion,
 };
 use crate::types::{BackendKind, BufferId, DType, Encoding, QuantScheme, TensorDecl};
 
@@ -29,7 +30,7 @@ use crate::types::{BackendKind, BufferId, DType, Encoding, QuantScheme, TensorDe
 /// `kCudaTileMapMask`, which is defined in terms of the generated bits rather
 /// than restated, so the two cannot drift.
 pub const CUDA_TILE_MAP_MASK: u32 =
-    TILE_MAP_CAST | TILE_MAP_ENCODE | TILE_MAP_REBLOCK | TILE_MAP_REPACK;
+    TILE_MAP_CAST | TILE_MAP_ENCODE | TILE_MAP_REBLOCK | TILE_MAP_REPACK | TILE_MAP_SCALE;
 
 /// Metal's load executor binds tensors into a heap and runs no tile-map
 /// transforms at all. The loader will therefore not emit a transform this
@@ -39,7 +40,7 @@ pub const METAL_TILE_MAP_MASK: u32 = 0;
 
 /// The transforms `host_executor` implements. Not a device capability, so it is
 /// not part of the C surface.
-pub const HOST_TILE_MAP_MASK: u32 = TILE_MAP_CAST | TILE_MAP_REBLOCK;
+pub const HOST_TILE_MAP_MASK: u32 = TILE_MAP_CAST | TILE_MAP_REBLOCK | TILE_MAP_SCALE;
 
 /// The loader's own model of what a backend's kernels do.
 ///
@@ -49,10 +50,10 @@ pub const HOST_TILE_MAP_MASK: u32 = TILE_MAP_CAST | TILE_MAP_REBLOCK;
 /// claiming a transform the loader has no model of is rejected at compile time
 /// instead of surfacing as a failed kernel dispatch.
 ///
-/// The comparison is deliberately one-sided. §9 makes the driver the authority
-/// on what its kernels do, so a *narrower* driver mask is fine — it implements
-/// fewer transforms than the loader can lower. A *wider* one is a claim about
-/// kernels the loader cannot reason about, and is refused.
+/// The comparison is deliberately one-sided. `architecture.md` §9 makes the
+/// driver the authority on what its kernels do, so a *narrower* driver mask is
+/// fine — it implements fewer transforms than the loader can lower. A *wider*
+/// one is a claim about kernels the loader cannot reason about, and is refused.
 pub fn tile_map_mask(backend: BackendKind) -> u32 {
     match backend {
         BackendKind::Cuda => CUDA_TILE_MAP_MASK,
@@ -145,7 +146,7 @@ fn lower_tile_map(facts: &TileMapFacts, target: &StorageTarget) -> TileLowering 
         // Metal runs no transforms, and the host executor derives its own
         // tiling from `max_tile_bytes` at run time — which it is allowed to do
         // precisely because it is not the thing whose execution the plan is
-        // supposed to determine (§10.3).
+        // supposed to determine (`architecture.md` §10.3).
         BackendKind::Metal | BackendKind::Unknown => TileLowering::default(),
     }
 }
@@ -154,7 +155,7 @@ fn lower_tile_map(facts: &TileMapFacts, target: &StorageTarget) -> TileLowering 
 ///
 /// The behaviour is deliberately unchanged from the C++ it replaces — this
 /// moves *where* the decision happens, not *what* it decides, so the existing
-/// kernel parity tests stay valid as the safety net (§8.1).
+/// kernel parity tests stay valid as the safety net (`architecture.md` §8.1).
 fn cuda_encode(facts: &TileMapFacts, target: &StorageTarget) -> TileLowering {
     if facts.kind != TileMapKind::Encode {
         return TileLowering::default();
@@ -222,14 +223,14 @@ fn encode_rows_per_tile(facts: &TileMapFacts, target: &StorageTarget) -> u32 {
 /// that the opt-out is now a bit in `StorageTarget::fusion_mask` — a compile
 /// input — instead of `PIE_CUDA_DISABLE_FUSED_TRANSCODE` read inside the
 /// executor. An environment variable that silently selects different kernels
-/// for the same plan is exactly the thing §8.1 objects to; as a target field it
-/// produces a *different plan*, which is the honest representation of different
-/// execution.
+/// for the same plan is exactly the thing `architecture.md` §8.1 objects to; as
+/// a target field it produces a *different plan*, which is the honest
+/// representation of different execution.
 ///
-/// The *chain* stays here rather than becoming data, and that is the §9 line:
-/// which two steps `Fp8ToMxfp4` collapses, and the proof that collapsing them
-/// is bit-identical, is the loader's model of the transform. Whether the kernel
-/// exists is the driver's, and that is the bit.
+/// The *chain* stays here rather than becoming data, and that is the
+/// `architecture.md` §9 line: which two steps `Fp8ToMxfp4` collapses, and the
+/// proof that collapsing them is bit-identical, is the loader's model of the
+/// transform. Whether the kernel exists is the driver's, and that is the bit.
 fn encode_fusion(facts: &TileMapFacts, target: &StorageTarget) -> TransformFusion {
     let fusable = target.fusion_mask & FUSION_FP8_TO_MXFP4 != 0
         && facts.transform_to == Some(QuantScheme::Mxfp4E2M1E8M0)

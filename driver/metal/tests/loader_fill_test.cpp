@@ -206,9 +206,13 @@ bool a_padded_contract_stages_zeros_where_no_source_reaches() {
     const auto target = pie::metal::metal_device_target();
     pie_loader::ModelContract contract;
     contract.align(target.preferred_alignment);
+    const auto bf16 = pie_loader::raw(pie_loader::PieLoaderDType::BF16);
     contract.define("padded",
-                    contract.pad(contract.src("w"), 0, kPadBefore, kPadAfter),
-                    pie_loader::raw(pie_loader::PieLoaderDType::BF16))
+                    contract.concat({contract.fill(0.0f, {kPadBefore, kCols}, bf16),
+                                     contract.src("w"),
+                                     contract.fill(0.0f, {kPadAfter, kCols}, bf16)},
+                                    0),
+                    bf16)
         .expect({kRows + kPadBefore + kPadAfter, kCols});
 
     const auto request =

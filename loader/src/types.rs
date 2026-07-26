@@ -95,6 +95,19 @@ pub enum QuantScheme {
     GgufQ5_0,
     GgufQ5K,
     GgufQ8_0,
+    /// 4-bit integers biased by 8, eight to a 32-bit word, low nibble first.
+    ///
+    /// An element is `nibble - 8`, so the stored range `0..=15` reads as
+    /// `-8..=7`. The group scales are a separate tensor rather than part of
+    /// this name -- a contract pairs the two with [`crate::contract::Expr`]'s
+    /// `Scale` -- which is why, unlike [`Self::AwqInt4`] and
+    /// [`Self::GptqInt4`], there is no zero-point tensor implied here: the
+    /// zero point *is* the 8.
+    ///
+    /// New variants go on the end. The FFI discriminants follow declaration
+    /// order and the C++ side reads them as integers, so inserting one in the
+    /// middle renumbers every scheme after it.
+    Int4B8,
 }
 
 impl QuantScheme {
@@ -105,7 +118,8 @@ impl QuantScheme {
             | Self::Mxfp4E2M1E8M0
             | Self::MlxAffineU4
             | Self::GgufQ4_0
-            | Self::GgufQ4K => 4,
+            | Self::GgufQ4K
+            | Self::Int4B8 => 4,
             Self::GgufQ5_0 | Self::GgufQ5K => 5,
             Self::Fp8E4M3
             | Self::Fp8E5M2
@@ -118,7 +132,7 @@ impl QuantScheme {
 
     pub fn default_group_size(self) -> u32 {
         match self {
-            Self::AwqInt4 | Self::GptqInt4 | Self::Mxfp4E2M1E8M0 => 32,
+            Self::AwqInt4 | Self::GptqInt4 | Self::Mxfp4E2M1E8M0 | Self::Int4B8 => 32,
             Self::MlxAffineU4 => 64,
             Self::GgufQ4_0 | Self::GgufQ4K | Self::GgufQ5_0 | Self::GgufQ5K => 32,
             Self::Fp8E4M3
@@ -131,34 +145,40 @@ impl QuantScheme {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum RowMap {
-    #[default]
-    Identity,
-    Even,
-    Odd,
-}
-
+/// Which backend kernel a [`Expr::Repack`](crate::contract::Expr::Repack) names.
+///
+/// The whole of what a repack says in a contract. Everything a kernel also
+/// needs -- how many rows, how many columns, which rows -- is either the
+/// operand's type or the declared output's, so the plan builder derives it and
+/// a contract never repeats it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RepackLayout {
     #[default]
     None,
     MarlinMxfp4Weight,
     MarlinMxfp4Scale,
-    DenseRowGather,
 }
 
+/// A repack as the *executor* needs it: the layout plus the geometry.
+///
+/// Not part of the contract. Every field but `layout` is derived by
+/// [`plan::compile`](crate::plan::compile) from the operand's type and the
+/// declaration, which is what keeps the algebra from restating in integers what
+/// it already says in nodes. A contract selects rows with
+/// [`Expr::Slice`](crate::contract::Expr::Slice),
+/// [`Expr::Shard`](crate::contract::Expr::Shard) and
+/// [`Expr::Stride`](crate::contract::Expr::Stride); by the time a spec exists
+/// the operand is exactly the block the kernel reads.
+///
+/// `target_rows`/`target_cols` may exceed the source's: a layout with a tile
+/// quantum declares the padded shape and the kernel zero-fills the tail, which
+/// is the one geometric fact that is the kernel's and not the algebra's.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RepackSpec {
     pub layout: RepackLayout,
-    pub row_map: RowMap,
     pub batch: u32,
     pub source_rows: u32,
-    pub source_row_offset: u32,
     pub target_rows: u32,
-    pub valid_rows: u32,
-    pub source_stride_cols: u32,
-    pub source_col_offset: u32,
     pub source_cols: u32,
     pub target_cols: u32,
 }
@@ -233,6 +253,29 @@ pub fn normalize_encoding(encoding: &Encoding) -> Encoding {
     }
 }
 
+/// Whether a declared tensor is something the driver binds, or a name the
+/// contract needed for itself.
+///
+/// The algebra has no `let`: the only way to use a subexpression twice, or to
+/// feed one entry's result into another's [`Expr::Scale`](crate::contract::Expr::Scale) factors, is to give it
+/// a name. Without this, every such name is also a runtime weight — a stacked
+/// slab of dequantization factors ends up in the persistent arena and stays
+/// there for the life of the process, and the bind namespace fills with
+/// tensors no kernel will ever ask for.
+///
+/// `Internal` is that name without those consequences. It resolves through
+/// [`Expr::Out`](crate::contract::Expr::Out) like any other, but the plan emits no `Finalize` for it, so the
+/// driver never sees it and its buffer stays a temporary the memory planner may
+/// reuse.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Visibility {
+    /// A runtime weight. The driver binds it by name.
+    #[default]
+    Public,
+    /// A name for the contract's own use. Not bound, not persistent.
+    Internal,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TensorDecl {
     pub id: TensorId,
@@ -240,6 +283,15 @@ pub struct TensorDecl {
     pub shape: Vec<i64>,
     pub encoding: Encoding,
     pub alignment: u32,
+    /// Whether the driver binds this name. See [`Visibility`].
+    #[serde(default, skip_serializing_if = "Visibility::is_public")]
+    pub visibility: Visibility,
+}
+
+impl Visibility {
+    pub fn is_public(&self) -> bool {
+        matches!(self, Visibility::Public)
+    }
 }
 
 impl TensorDecl {

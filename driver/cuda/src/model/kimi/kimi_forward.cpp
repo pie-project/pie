@@ -41,7 +41,6 @@ constexpr int kKimiMoeGemvMaxTokens = 1;
 // checkpoints (E=8) need ~0.7 GiB; a full 384-expert Kimi would need ~34 GiB,
 // so it stays on the W4A16 path where each expert is touched at most a few
 // times per step anyway.
-constexpr std::size_t kKimiMoeBf16StackBudget = 4ull << 30;
 
 namespace {
 
@@ -317,68 +316,6 @@ void dequant_expert_w4(
 }
 
 }  // namespace
-
-void kimi_materialize_bf16_expert_stacks(
-    KimiWeights& weights,
-    const HfConfig& cfg,
-    int tp_size)
-{
-    const int T = std::max(1, tp_size);
-    const int H = cfg.hidden_size;
-    const int I = cfg.moe_intermediate_size > 0 ? cfg.moe_intermediate_size / T : 0;
-    const int E = cfg.num_experts;
-    if (H <= 0 || I <= 0 || E <= 0) return;
-
-    const std::size_t stack_bytes =
-        static_cast<std::size_t>(E) * 3 * I * H * sizeof(std::uint16_t);
-    if (stack_bytes > kKimiMoeBf16StackBudget) return;
-
-    const std::size_t half = static_cast<std::size_t>(I) * H;
-    const std::size_t gu_stride = 2 * half;
-    const std::size_t dn_stride = static_cast<std::size_t>(H) * I;
-    cudaStream_t stream = nullptr;
-
-    for (auto& Lw : weights.layers) {
-        if (!Lw.is_moe || static_cast<int>(Lw.experts.size()) < E) continue;
-        if (Lw.experts[0].gate_packed == nullptr) continue;
-        if (Lw.moe_gate_up_bf16 != nullptr) continue;
-
-        Lw.moe_gate_up_bf16 = std::make_unique<DeviceTensor>(
-            DeviceTensor::allocate(DType::BF16, {E, 2 * I, H}));
-        Lw.moe_down_bf16 = std::make_unique<DeviceTensor>(
-            DeviceTensor::allocate(DType::BF16, {E, H, I}));
-        auto* gu = static_cast<std::uint16_t*>(Lw.moe_gate_up_bf16->data());
-        auto* dn = static_cast<std::uint16_t*>(Lw.moe_down_bf16->data());
-        // Which half each projection lands in. There is no checkpoint tensor
-        // with this layout -- the loader publishes `gate_packed` and
-        // `up_packed` per expert and this stack is synthesised by dequantising
-        // them -- so the order is chosen here, at no cost, rather than undone
-        // later by a copy. `[up | gate]` is what flashinfer's grouped GEMM
-        // reads fc1 as.
-        const bool gate_second = kimi_moe_gate_up_swapped();
-        const std::size_t gate_off = gate_second ? half : 0;
-        const std::size_t up_off   = gate_second ? 0 : half;
-        for (int e = 0; e < E; ++e) {
-            const auto& ew = Lw.experts[static_cast<std::size_t>(e)];
-            if (ew.gate_packed == nullptr) continue;
-            kernels::launch_dequant_wna16_int4b8_to_bf16(
-                static_cast<const std::int32_t*>(ew.gate_packed->data()),
-                ew.gate_scale->data(),
-                gu + static_cast<std::size_t>(e) * gu_stride + gate_off,
-                I, H, 32, stream);
-            kernels::launch_dequant_wna16_int4b8_to_bf16(
-                static_cast<const std::int32_t*>(ew.up_packed->data()),
-                ew.up_scale->data(),
-                gu + static_cast<std::size_t>(e) * gu_stride + up_off,
-                I, H, 32, stream);
-            kernels::launch_dequant_wna16_int4b8_to_bf16(
-                static_cast<const std::int32_t*>(ew.down_packed->data()),
-                ew.down_scale->data(),
-                dn + static_cast<std::size_t>(e) * dn_stride, H, I, 32, stream);
-        }
-    }
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-}
 
 KimiWorkspace KimiWorkspace::allocate(
     const HfConfig& cfg,

@@ -1,4 +1,5 @@
 #include "model/qwen3_5/qwen3_5.hpp"
+#include "model/qwen3_5/qwen3_5_moe.hpp"
 
 #include <cstdlib>
 #include <stdexcept>
@@ -24,14 +25,6 @@ const DeviceTensor& must(const LoadedModel& e, const std::string& name) {
 
 const DeviceTensor* maybe(const LoadedModel& e, const std::string& name) {
     return e.has(name) ? &e.get(name) : nullptr;
-}
-
-bool fused_gdn_projection_weights_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_QWEN35_FUSED_GDN_PROJ");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return enabled;
 }
 
 bool mtp_int8_lm_head_enabled() {
@@ -76,98 +69,6 @@ DeviceBuffer<float> to_fp32(const DeviceTensor& t) {
 // `model.language_model.`; the vision tower lives under `model.visual.`
 // and is unused on the text-only path.
 constexpr const char* kPrefix = "model.language_model.";
-
-// Slice a fused [K1|K2|V] tensor along its leading `conv_dim` dimension
-// into a per-rank tensor of shape [conv_dim_local, ...trailing] where
-// conv_dim_local = 2*K_dim/T + V_dim/T. The trailing element count is
-// the product of every shape[1:].
-//
-DeviceTensor concat_axis0_bf16(
-    const DeviceTensor& first,
-    const DeviceTensor& second,
-    const char* what)
-{
-    if (first.dtype() != DType::BF16 || second.dtype() != DType::BF16) {
-        throw std::runtime_error(std::string(what) + ": expected bf16 tensors");
-    }
-    if (first.shape().empty() || first.shape().size() != second.shape().size()) {
-        throw std::runtime_error(std::string(what) + ": rank mismatch");
-    }
-    for (std::size_t i = 1; i < first.shape().size(); ++i) {
-        if (first.shape()[i] != second.shape()[i]) {
-            throw std::runtime_error(std::string(what) + ": trailing shape mismatch");
-        }
-    }
-
-    std::vector<std::int64_t> shape = first.shape();
-    shape[0] += second.shape()[0];
-    auto fused = DeviceTensor::allocate(DType::BF16, shape);
-    auto* dst = static_cast<std::uint8_t*>(fused.data());
-    CUDA_CHECK(cudaMemcpy(
-        dst, first.data(), first.nbytes(), cudaMemcpyDeviceToDevice));
-    CUDA_CHECK(cudaMemcpy(
-        dst + first.nbytes(), second.data(), second.nbytes(),
-        cudaMemcpyDeviceToDevice));
-    return fused;
-}
-
-DeviceTensor concat_axis0_bf16(
-    const DeviceTensor& first,
-    const DeviceTensor& second,
-    const DeviceTensor& third,
-    const char* what)
-{
-    if (first.dtype() != DType::BF16 ||
-        second.dtype() != DType::BF16 ||
-        third.dtype() != DType::BF16) {
-        throw std::runtime_error(std::string(what) + ": expected bf16 tensors");
-    }
-    if (first.shape().empty() ||
-        first.shape().size() != second.shape().size() ||
-        first.shape().size() != third.shape().size()) {
-        throw std::runtime_error(std::string(what) + ": rank mismatch");
-    }
-    for (std::size_t i = 1; i < first.shape().size(); ++i) {
-        if (first.shape()[i] != second.shape()[i] ||
-            first.shape()[i] != third.shape()[i]) {
-            throw std::runtime_error(std::string(what) + ": trailing shape mismatch");
-        }
-    }
-
-    std::vector<std::int64_t> shape = first.shape();
-    shape[0] += second.shape()[0] + third.shape()[0];
-    auto fused = DeviceTensor::allocate(DType::BF16, shape);
-    auto* dst = static_cast<std::uint8_t*>(fused.data());
-    CUDA_CHECK(cudaMemcpy(
-        dst, first.data(), first.nbytes(), cudaMemcpyDeviceToDevice));
-    CUDA_CHECK(cudaMemcpy(
-        dst + first.nbytes(), second.data(), second.nbytes(),
-        cudaMemcpyDeviceToDevice));
-    CUDA_CHECK(cudaMemcpy(
-        dst + first.nbytes() + second.nbytes(), third.data(), third.nbytes(),
-        cudaMemcpyDeviceToDevice));
-    return fused;
-}
-
-void maybe_fuse_full_attn_qgkv_projection(
-    Qwen3_5Weights& w,
-    Qwen3_5LayerWeights& Lw,
-    const char* what)
-{
-    if (Lw.fa_q_proj == nullptr || Lw.fa_k_proj == nullptr ||
-        Lw.fa_v_proj == nullptr ||
-        Lw.fa_q_proj_quant.has_value() ||
-        Lw.fa_k_proj_quant.has_value() ||
-        Lw.fa_v_proj_quant.has_value() ||
-        Lw.fa_q_proj->dtype() != DType::BF16 ||
-        Lw.fa_k_proj->dtype() != DType::BF16 ||
-        Lw.fa_v_proj->dtype() != DType::BF16) {
-        return;
-    }
-    w.owned_bf16_buffers.push_back(
-        concat_axis0_bf16(*Lw.fa_q_proj, *Lw.fa_k_proj, *Lw.fa_v_proj, what));
-    Lw.fa_qgkv_proj_fused = &w.owned_bf16_buffers.back();
-}
 
 }  // namespace
 
@@ -228,52 +129,28 @@ Qwen3_5Weights bind_qwen3_5(LoadedModel& engine) {
         Lw.gate_proj_quant = engine.quant_meta(lp + "mlp.gate_proj.weight");
         Lw.up_proj_quant   = engine.quant_meta(lp + "mlp.up_proj.weight");
         Lw.down_proj_quant = engine.quant_meta(lp + "mlp.down_proj.weight");
-        if (Lw.gate_proj != nullptr && Lw.up_proj != nullptr &&
-            !Lw.gate_proj_quant.has_value() && !Lw.up_proj_quant.has_value() &&
-            Lw.gate_proj->dtype() == DType::BF16 &&
-            Lw.up_proj->dtype() == DType::BF16) {
-            w.owned_bf16_buffers.push_back(
-                concat_axis0_bf16(*Lw.gate_proj, *Lw.up_proj,
-                    "qwen3_5: fuse mlp.gate_up_proj"));
-            Lw.gate_up_proj_fused = &w.owned_bf16_buffers.back();
-            engine.erase_runtime_weight(lp + "mlp.gate_proj.weight");
-            engine.erase_runtime_weight(lp + "mlp.up_proj.weight");
-            Lw.gate_proj = nullptr;
-            Lw.up_proj = nullptr;
-        }
+        // The contract publishes the join plus views of it under the original
+        // names, so this reads the same way whether or not the group was fused
+        // -- and when it was, gate/up are views into the fused bank rather than
+        // a second copy of it.
+        Lw.gate_up_proj_fused = maybe(engine, lp + "mlp.gate_up_proj.fused.weight");
 
         if (kind == "linear_attention") {
             Lw.kind = Qwen3_5LayerWeights::Kind::LinearAttn;
             const std::string la = lp + "linear_attn.";
-            const auto* full_qkv = &must(engine, la + "in_proj_qkv.weight");
-            const auto* full_conv_w = &must(engine, la + "conv1d.weight");
-            const auto* full_conv_b = maybe(engine, la + "conv1d.bias");
-            // Slice the [K1|K2|V] block layout per-rank when TP > 1; the
-            // engine load left these tensors replicated because uniform
-            // axis-0 partitioning crosses block boundaries.
-            // Already this rank's `[K/T | K/T | V/T]`: the contract states the
-            // per-block shard (`gdn_kkv_blocked_shards`), so the whole tensor
-            // is never resident here to begin with.
-            Lw.la_in_proj_qkv = full_qkv;
-            Lw.la_conv1d_w = full_conv_w;
-            Lw.la_conv1d_b = full_conv_b;
-            Lw.la_in_proj_z   = &must(engine, la + "in_proj_z.weight");
-            Lw.la_in_proj_b   = &must(engine, la + "in_proj_b.weight");
-            Lw.la_in_proj_a   = &must(engine, la + "in_proj_a.weight");
-            if (fused_gdn_projection_weights_enabled()) {
-                w.owned_bf16_buffers.push_back(concat_axis0_bf16(
-                    *Lw.la_in_proj_qkv, *Lw.la_in_proj_z,
-                    "qwen3_5: fuse linear_attn.in_proj_qkvz"));
-                Lw.la_in_proj_qkvz = &w.owned_bf16_buffers.back();
-                engine.erase_runtime_weight(la + "in_proj_qkv.weight");
-                engine.erase_runtime_weight(la + "in_proj_z.weight");
-                w.owned_bf16_buffers.push_back(concat_axis0_bf16(
-                    *Lw.la_in_proj_b, *Lw.la_in_proj_a,
-                    "qwen3_5: fuse linear_attn.in_proj_ba"));
-                Lw.la_in_proj_ba = &w.owned_bf16_buffers.back();
-                engine.erase_runtime_weight(la + "in_proj_b.weight");
-                engine.erase_runtime_weight(la + "in_proj_a.weight");
-            }
+            // Whichever layout the contract published. The fused switch makes
+            // the join a load-time `Concat`, so the separate tensors are simply
+            // absent -- there is never a moment when both are resident.
+            Lw.la_in_proj_qkvz = maybe(engine, la + "in_proj_qkvz.weight");
+            Lw.la_in_proj_ba = maybe(engine, la + "in_proj_ba.weight");
+            Lw.la_in_proj_qkv = maybe(engine, la + "in_proj_qkv.weight");
+            Lw.la_in_proj_z = maybe(engine, la + "in_proj_z.weight");
+            Lw.la_in_proj_b = maybe(engine, la + "in_proj_b.weight");
+            Lw.la_in_proj_a = maybe(engine, la + "in_proj_a.weight");
+            // This rank's `[K/T | K/T | V/T]`: the contract states the
+            // per-block shard, so the whole tensor is never resident here.
+            Lw.la_conv1d_w = &must(engine, la + "conv1d.weight");
+            Lw.la_conv1d_b = maybe(engine, la + "conv1d.bias");
             Lw.la_dt_bias  = &must(engine, la + "dt_bias");
             // Materialise fp32 copies of A_log + RMSNormGated.weight.
             // HF ships these as fp32 on Qwen3.5-4B and bf16 on
@@ -299,8 +176,8 @@ Qwen3_5Weights bind_qwen3_5(LoadedModel& engine) {
             Lw.fa_v_proj_quant = engine.quant_meta(fa + "v_proj.weight");
             Lw.fa_o_proj_quant = engine.quant_meta(fa + "o_proj.weight");
             if (fused_full_attn_qgkv_weights_enabled()) {
-                maybe_fuse_full_attn_qgkv_projection(
-                    w, Lw, "qwen3_5: fuse self_attn.qgkv_proj");
+                Lw.fa_qgkv_proj_fused =
+                    maybe(engine, fa + "qkv_proj.fused.weight");
             }
             Lw.kv_layer = kv_slot++;
         } else {
@@ -338,8 +215,7 @@ Qwen3_5Weights bind_qwen3_5(LoadedModel& engine) {
         Lw.fa_v_proj_quant = engine.quant_meta(fa + "v_proj.weight");
         Lw.fa_o_proj_quant = engine.quant_meta(fa + "o_proj.weight");
         if (fused_full_attn_qgkv_weights_enabled()) {
-            maybe_fuse_full_attn_qgkv_projection(
-                w, Lw, "qwen3_5: fuse mtp.self_attn.qgkv_proj");
+            Lw.fa_qgkv_proj_fused = maybe(engine, fa + "qkv_proj.fused.weight");
         }
         Lw.gate_proj = &must(engine, lp + "mlp.gate_proj.weight");
         Lw.up_proj = &must(engine, lp + "mlp.up_proj.weight");
@@ -347,15 +223,8 @@ Qwen3_5Weights bind_qwen3_5(LoadedModel& engine) {
         Lw.gate_proj_quant = engine.quant_meta(lp + "mlp.gate_proj.weight");
         Lw.up_proj_quant = engine.quant_meta(lp + "mlp.up_proj.weight");
         Lw.down_proj_quant = engine.quant_meta(lp + "mlp.down_proj.weight");
-        if (Lw.gate_proj != nullptr && Lw.up_proj != nullptr &&
-            !Lw.gate_proj_quant.has_value() && !Lw.up_proj_quant.has_value() &&
-            Lw.gate_proj->dtype() == DType::BF16 &&
-            Lw.up_proj->dtype() == DType::BF16) {
-            w.owned_bf16_buffers.push_back(
-                concat_axis0_bf16(*Lw.gate_proj, *Lw.up_proj,
-                    "qwen3_5: fuse mtp.mlp.gate_up_proj"));
-            Lw.gate_up_proj_fused = &w.owned_bf16_buffers.back();
-        }
+        Lw.gate_up_proj_fused =
+            maybe(engine, lp + "mlp.gate_up_proj.fused.weight");
         Lw.kv_layer = kv_slot++;
         if (mtp_int8_lm_head_enabled() &&
             mtp.lm_head != nullptr &&
