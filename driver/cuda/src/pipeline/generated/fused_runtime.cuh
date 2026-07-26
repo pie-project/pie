@@ -1007,6 +1007,49 @@ inline GroupedLaunchResult run_generated_stage(
     std::vector<std::uint8_t> temporary_elided(value_count, 0);
     std::vector<std::uint8_t> absorbed_scale_nodes(
         stage.ops.size(), 0);
+    // The nucleus kernels can read the pre-scale logits straight out of the
+    // lane's bf16 rows, so that value need not be materialized. That only holds
+    // when the value really is the logits intrinsic, optionally reshaped --
+    // exactly what `direct_logits_kind` walks at the launch site. Any other
+    // producer (a broadcast of one read-out row across B sampling lanes, say)
+    // still runs and still writes a full tensor, so shrinking its slot to four
+    // bytes lets it overrun the values laid out after it.
+    auto produces_logits_intrinsic = [&](std::uint32_t value) {
+        for (std::size_t node = 0; node < stage.ops.size(); ++node) {
+            const auto& op = stage.ops[node].op;
+            if (value < bases[node] ||
+                value >= bases[node] + op.results) {
+                continue;
+            }
+            return op.tag == PTIR_OP_INTRINSIC_VAL &&
+                (op.intr == PTIR_INTR_LOGITS ||
+                 op.intr == PTIR_INTR_MTP_LOGITS);
+        }
+        return false;
+    };
+    auto resolves_to_logits_intrinsic = [&](std::uint32_t value) {
+        if (produces_logits_intrinsic(value)) return true;
+        for (std::size_t node = 0; node < stage.ops.size(); ++node) {
+            const auto& op = stage.ops[node].op;
+            if (value < bases[node] ||
+                value >= bases[node] + op.results) {
+                continue;
+            }
+            return op.tag == PTIR_OP_RESHAPE && !op.args.empty() &&
+                produces_logits_intrinsic(op.args[0]);
+        }
+        return false;
+    };
+    // The scale divide is only folded into the nucleus kernels when the driver
+    // actually skips it, and it skips it only when the divide is a region of its
+    // own. Fused into a larger generated region the divide still runs and still
+    // writes a full tensor, so its value has to keep a full slot.
+    std::vector<std::uint8_t> lone_generated_node(stage.ops.size(), 0);
+    for (const auto& region : stage.fused.regions) {
+        if (!region.library && region.nodes.size() == 1) {
+            lone_generated_node[region.nodes[0]] = 1;
+        }
+    }
     for (const auto& region : stage.fused.regions) {
         if (!region.library ||
             region.library_op != PTIR_LIBRARY_NUCLEUS_SAMPLE ||
@@ -1018,7 +1061,8 @@ inline GroupedLaunchResult run_generated_stage(
                 [](const auto& lane) {
                     return lane.logits_bf16_rows != nullptr;
                 });
-        if (direct_logits) {
+        if (direct_logits &&
+            resolves_to_logits_intrinsic(region.inputs[0])) {
             maximum_value_bytes[region.inputs[0]] = 4;
             temporary_elided[region.inputs[0]] = 1;
         }
@@ -1029,10 +1073,12 @@ inline GroupedLaunchResult run_generated_stage(
                 scaled_value >= bases[node] + op.results) {
                 continue;
             }
+            if (lone_generated_node[node] == 0) break;
             absorbed_scale_nodes[node] = 1;
             maximum_value_bytes[scaled_value] = 4;
             temporary_elided[scaled_value] = 1;
-            if (op.tag == PTIR_OP_DIV && !op.args.empty()) {
+            if (op.tag == PTIR_OP_DIV && !op.args.empty() &&
+                resolves_to_logits_intrinsic(op.args[0])) {
                 const std::uint32_t reshape_value = op.args[0];
                 maximum_value_bytes[reshape_value] = 4;
                 temporary_elided[reshape_value] = 1;

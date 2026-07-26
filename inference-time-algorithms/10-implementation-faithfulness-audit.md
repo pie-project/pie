@@ -1056,9 +1056,9 @@ cutoff. `sampling-primitives` pins it with a keep-mask published in a shape that
 contract without depending on float summation order: 37 tokens, 0.901134 mass at
 `top_p = 0.9`, in 0.2 s.
 
-### Three inferlet authoring contracts, discovered the hard way
+### Four inferlet authoring contracts, discovered the hard way
 
-Both of these fail **silently** — no error, no exception, just a wrong or empty
+All of these fail **silently** — no error, no exception, just a wrong or empty
 result — which is why they cost the most debugging time.
 
 - **Loop-carried geometry ports must `take()` before they `put()`.** Under
@@ -1073,6 +1073,10 @@ result — which is why they cost the most debugging time.
   port.** Six inferlets over-declared it and read uninitialised KV. This one gets
   its own section below, because it is the most serious defect this project
   found and the test suite was structurally incapable of catching it.
+- **Logits entering a `NucleusSample` must come from the logits intrinsic behind
+  at most a `reshape`.** One inferlet (`consensus-decoding`) fed the sampler a
+  `broadcast`; the compiler matched the pattern anyway and the driver's scratch
+  elision corrupted the sampler's own input. Also below.
 
 ### Three algorithms are structurally depth-1
 
@@ -1179,6 +1183,69 @@ A liveness assertion cannot detect a corruption that preserves liveness. The
 suite now carries `_attends_prompt`, which runs the fixed prompt "The capital of
 France is" and requires the continuation to mention France or Paris — a
 content assertion, cheap, and the pre-fix binaries fail it.
+
+### A second silent corruption: the nucleus fast path's unstated precondition
+
+Fixing the page CSR left `consensus-decoding` with one residual symptom: every
+candidate's **first** token was junk (`"cumplir"`, `"!user"`, `"!human"`) even
+though the rest of the continuation was fluent and on-topic. The prefill and the
+decode loop use the same sampler expression, so the difference had to be
+geometric — and it was.
+
+`consensus-decoding` prefills the shared prompt once. That fire has **one**
+read-out row, so `intrinsics::logits()` is `[1, vocab]`. To give `B` candidates
+independent starting tokens the inferlet broadcast that row to `[B, vocab]`,
+applied the shared nucleus keep-mask, and added `B` independent Gumbel draws.
+This is textbook — it is exactly how you sample `B` times from one distribution —
+and every layer accepted it.
+
+The mechanism, established by bisection:
+
+1. The compiler's `match_nucleus_add_order`
+   (`interface/ptir/src/compiler.rs:1393`) matches a 13-node DAG **structurally**.
+   It never asks where the logits came from, so the broadcast form matches.
+2. The driver's nucleus prep
+   (`driver/cuda/src/pipeline/generated/fused_runtime.cuh`, ~L1007) then applies
+   an optimisation that is only sound for the intrinsic: it sets
+   `maximum_value_bytes[region.inputs[0]] = 4` and `temporary_elided[...] = 1`,
+   because the real logits live in the model's own buffer and the sampler reads
+   them directly. It applied the same elision to the scale-divide's numerator.
+3. Per-lane scratch offsets are assigned from `maximum_value_bytes` with **no
+   liveness reuse**, so a value whose slot was shrunk to 4 bytes sits immediately
+   adjacent to live neighbours.
+4. The `broadcast` is not elided-away — it still executes, and writes a full
+   `[B, vocab]` tensor into that 4-byte slot.
+5. `k_grouped_nucleus_*` (the three-kernel fast path taken because
+   `vocab > kMaxExactNucleusLibraryVocab = 4096`) additionally early-returned on
+   `row >= lanes[lane].sampled_rows`, leaving rows `1..B` of a broadcast fire
+   never written at all.
+
+The debugging lever worth recording: `wide`, the pre-divide value, is the one
+intermediate the pattern does **not** exact-consumer-check. Tapping it to a host
+channel therefore preserves the match, whereas tapping any other intermediate
+breaks the match and silently *fixes* the output by falling back to the generated
+path. "Adding a probe makes the bug disappear" was itself the diagnosis.
+
+Three driver narrowings landed — bound `sampled_rows` only for direct bf16 lane
+reads, gate both elisions on the input actually resolving to the logits
+intrinsic, and only absorb the scale-divide when the region is the single node
+the launch-time skip expects. They make the runtime conservative in exactly the
+cases the optimisation was not written for. They do **not** make the broadcast
+form correct: the compiler still claims a pattern whose precondition it does not
+verify, and closing that in the matcher destabilised six unrelated compiler
+fixtures. So the fix that shipped is at the inferlet: the prefill now nucleus-
+samples its single `[1, vocab]` row and all `B` lanes start from that token, with
+divergence coming from the decode loop, whose logits genuinely are `[B, vocab]`.
+Sampling diversity was then verified directly — at `temperature = 1.2` the three
+candidates diverge by the second sentence; at `0.6` they are identical because
+the keep-set is a single token, which is the distribution's fault and not the
+sampler's. `temperature` and `top_p` are now inferlet parameters rather than
+constants, so that distinction is testable rather than assumed.
+
+The general lesson generalises past this bug: **a fast path chosen by pattern
+match must validate every assumption it makes beyond the pattern.** The author's
+contract is the pattern; anything else the runtime relies on is a precondition
+nobody agreed to.
 
 ---
 

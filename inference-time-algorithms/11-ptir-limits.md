@@ -150,9 +150,9 @@ reason `reshape(&x, [1, vocab])` incantations are scattered through the
 inferlets. The defensive spelling, `reshape(intrinsics::logits(), [B, v])`, is
 something every author must learn by being bitten.
 
-### Three unchecked contracts that fail silently
+### Four unchecked contracts that fail silently
 
-Neither of these is expressible in the type system, and both produce a wrong
+None of these is expressible in the type system, and all four produce a wrong
 answer rather than an error:
 
 1. **Loop-carried geometry ports must `take()` before they `put()`.** Under
@@ -171,15 +171,28 @@ answer rather than an error:
    `page_indptr = [0, reserved_pool_pages]` — the natural reading of "these are
    my pages" — makes attention read every uninitialised cell between the true
    length and the pool boundary.
+4. **The logits feeding a `NucleusSample` must come from the logits intrinsic,
+   behind at most a `reshape`.** The compiler's matcher
+   (`match_nucleus_add_order`, `interface/ptir/src/compiler.rs:1393`) matches on
+   *DAG shape only*, so it happily claims a sampler whose logits were produced by
+   a `broadcast`, a `gather` or any other op. The driver then assumes what the
+   compiler did not check: the nucleus prep in
+   `driver/cuda/src/pipeline/generated/fused_runtime.cuh` (~L1007) shrinks the
+   scratch slot for the region's logits input to **4 bytes** and marks it elided,
+   on the theory that it is the intrinsic and will never be materialised. With
+   any other producer the op still runs and writes a full `[rows, vocab]` tensor
+   into that 4-byte slot, scribbling over neighbouring values in the same
+   per-lane scratch arena.
 
 Between them these cost more debugging time than every genuine algorithm
-question in this project combined. All three are mechanically checkable — the
+question in this project combined. All four are mechanically checkable — the
 first from the geometry class and the port's loop-carried status, the second by
 comparing the takes of a submitted fire against the puts issued before it, the
 third by asserting `page_indptr` spans agree with the `KvLen` the same fire
-declares — and none is checked.
+declares, the fourth by having the matcher verify the provenance it is already
+relying on — and none is checked.
 
-The third is the worst of the three, because it is the only one whose failure
+The third and fourth are the worst, because they are the only ones whose failure
 mode is *plausible output*. The other two produce a dummy run or a stale
 constant, which shows up immediately. Over-declared pages produce grammatical,
 confidently-wrong text — six of the thirty inferlets shipped with it, passing a
@@ -187,6 +200,17 @@ green test suite, until an end-to-end test that asserted on *content* rather
 than on liveness caught it. Nor does the attention mask save you: `pack_dense_mask.cu`
 packs mask cells over the lane's *derived physical* span, so a correctly-sized
 mask is simply laid out against the wrong geometry.
+
+The fourth has the same shape of consequence and a nastier root cause: it is a
+**disagreement between two components about who validates what**. The compiler
+pattern is purely structural; the runtime's optimisation is provenance-dependent.
+Neither is wrong in isolation. `consensus-decoding` hit it by broadcasting one
+read-out row to `[B, vocab]` so that `B` lanes could draw independent Gumbel
+noise from a shared distribution — a completely reasonable program, which the
+type system accepts, the compiler compiles, the scheduler fuses, and the GPU
+silently mis-executes. The general lesson is that **a fast path selected by
+pattern-matching must validate every assumption it makes beyond the pattern**,
+because the pattern is what the author is implicitly promised.
 
 ### The missing intrinsic sets a hard boundary
 
@@ -224,4 +248,4 @@ the orchestration layer instead.
 | **Fusion** | Strong. 27/30 inferlets compile with zero barriers. The barrier set is small and its cost is exactly where the cliffs are. |
 | **Fusion — risk** | The one library pattern is an exact match, and a miss dropped to an asymptotically worse implementation. Fixed; the class of defect is not. |
 | **Performance** | Overhead is marginal, never fixed. The real limit is lost run-ahead for any host-dependent step — architectural, not incidental. |
-| **Expressiveness** | Algorithms read close to their equations. Three silent-failure contracts and one leaking shape rule are the sharp edges; the missing attention-score intrinsic is the one hard wall. |
+| **Expressiveness** | Algorithms read close to their equations. Four silent-failure contracts and one leaking shape rule are the sharp edges; the missing attention-score intrinsic is the one hard wall. |

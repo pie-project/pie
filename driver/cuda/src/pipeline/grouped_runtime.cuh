@@ -208,6 +208,20 @@ __device__ __forceinline__ float grouped_direct_bf16_load(
         static_cast<std::uint32_t>(source[column]) << 16);
 }
 
+// The `sampled_rows` bound exists to keep direct bf16 reads inside the lane's
+// read-out rows. When the logits come from the value table the tensor is
+// materialized at `[launch.rows, launch.len]`, so every row the launch geometry
+// declares is in bounds — and bounding those by `sampled_rows` silently leaves
+// the surplus outputs unwritten instead of sampling them.
+__device__ __forceinline__ bool grouped_nucleus_row_out_of_range(
+    const PtirLaneRecord* lanes,
+    std::uint32_t lane,
+    std::uint32_t row,
+    const GroupedNucleusLaunch& launch) {
+    if (launch.logits_kind == 0) return false;
+    return row >= lanes[lane].sampled_rows;
+}
+
 __device__ __forceinline__ float grouped_nucleus_logit_scale(
     const std::uint64_t* values,
     std::uint32_t value_count,
@@ -551,7 +565,7 @@ static __global__ void k_grouped_nucleus_max_chunks(
     const std::uint32_t lane = segment / launch.rows;
     const std::uint32_t row = segment % launch.rows;
     if (lane >= header->lane_count ||
-        row >= lanes[lane].sampled_rows ||
+        grouped_nucleus_row_out_of_range(lanes, lane, row, launch) ||
         *grouped_commit(lanes, lane) == 0) {
         return;
     }
@@ -601,7 +615,7 @@ static __global__ void k_grouped_nucleus_weight_chunks(
     const std::uint32_t lane = segment / launch.rows;
     const std::uint32_t row = segment % launch.rows;
     if (lane >= header->lane_count ||
-        row >= lanes[lane].sampled_rows ||
+        grouped_nucleus_row_out_of_range(lanes, lane, row, launch) ||
         *grouped_commit(lanes, lane) == 0) {
         return;
     }
@@ -673,7 +687,7 @@ static __global__ void k_grouped_nucleus_inverse_sample(
     const std::uint32_t lane = segment / launch.rows;
     const std::uint32_t row = segment % launch.rows;
     if (lane >= header->lane_count ||
-        row >= lanes[lane].sampled_rows ||
+        grouped_nucleus_row_out_of_range(lanes, lane, row, launch) ||
         *grouped_commit(lanes, lane) == 0) {
         return;
     }
@@ -870,7 +884,7 @@ static __global__ void k_grouped_nucleus_sample(
     const std::uint32_t lane = grouped_row / launch.rows;
     const std::uint32_t row = grouped_row % launch.rows;
     if (lane >= header->lane_count ||
-        row >= lanes[lane].sampled_rows ||
+        grouped_nucleus_row_out_of_range(lanes, lane, row, launch) ||
         *grouped_commit(lanes, lane) == 0) {
         return;
     }
