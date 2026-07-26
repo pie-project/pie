@@ -20,6 +20,7 @@ members = [
     "prefix-tree-kv-cache",
     "quest-attention",
     "tova-attention",
+    "trackb-h2o",
     "repetition-penalty",
     "dry-repetition-penalty",
     "gumbel-watermark",

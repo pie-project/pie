@@ -432,6 +432,21 @@ _QUEST_PROMPT = (
 )
 
 
+# Coherence is compared at NEAR-GREEDY, not at a sampling temperature.
+# Running a policy program changes the decode batch's shape and therefore the
+# attention kernel's split/reduction plan, so its logits differ from the plain
+# baseline's in the last bits or two. That is expected and benign -- the CUDA
+# test `test_attn_score_capture` already proves the capture variant leaves the
+# attention output BIT-identical, so the residue is plan-level, not policy-level
+# -- but under Gumbel sampling at tau=0.1 those last bits are amplified 10x and
+# occasionally decide a near-tied token. Measured over 24 tokens x 5 seeds x 3
+# programs: 15/15 exact at tau=0.001, scattered single-token flips at tau=0.1
+# that hit the mask-only program (quest) as readily as the capture ones. So the
+# invariant worth asserting is the one that is actually true: with an all-keep
+# mask the policy reproduces the baseline's ARGMAX path exactly.
+_COHERENCE_TAU = 0.001
+
+
 async def test_quest_attention(client, args):
     report = await _report(
         client, args, "quest-attention",
@@ -461,8 +476,8 @@ async def test_quest_attention(client, args):
     # verbatim. `test_mask_enforced.py` covers the same ground in isolation;
     # keeping a version here means the matrix cannot go green on a build where
     # `attn_page_mask` silently stopped being applied.
-    common = {"prompt": _QUEST_PROMPT, "max_tokens": 8, "temperature": 0.1,
-              "seed": 4242}
+    common = {"prompt": _QUEST_PROMPT, "max_tokens": 8,
+              "temperature": _COHERENCE_TAU, "seed": 4242}
     wide = await _report(
         client, args, "quest-attention", {**common, "page_budget": 4096})
     tight = await _report(
@@ -534,6 +549,52 @@ async def test_tova_attention(client, args):
     assert 4 < report["evicted_first"] < report["kv_len"] - 4, report
 
 
+async def test_h2o_attention(client, args):
+    common = {"prompt": _QUEST_PROMPT, "max_tokens": 8,
+              "temperature": _COHERENCE_TAU, "seed": 4242}
+    report = await _report(
+        client, args, "trackb-h2o", {**common, "page_budget": 4096})
+    # H2O's whole claim is the CARRY: the score row is accumulated across fires
+    # rather than re-seeded from the latest one. Each fire adds one softmax row
+    # per layer, so the mass must grow by exactly `layers_per_fire` every time.
+    # This is the single assertion that separates H2O from TOVA -- with the
+    # accumulator re-seeded the trace would be flat instead of a staircase.
+    trace = [float(m) for m in report["mass_trace"]]
+    assert len(trace) >= 2, report
+    steps = [b - a for a, b in zip(trace, trace[1:])]
+    per_fire = report["layers_per_fire"]
+    for step in steps:
+        assert abs(step - per_fire) < 0.05, (
+            f"H2O is not accumulating: mass grew by {step}, not {per_fire}\n"
+            f"  trace = {trace}"
+        )
+    # No attention may land past the live prefix. (Unlike TOVA this cannot be
+    # "exactly zero" -- H2O seeds a cold-start ramp it never re-seeds away --
+    # so the bar is the seed ceiling.)
+    assert report["tail_polluted"] == 0, report
+    assert report["scores_nan"] == 0, report
+    # The heavy hitters must be heavy: a uniform row would pass everything
+    # above. On a real model the attention sink at the head of the sequence
+    # dominates by orders of magnitude over the repeated filler.
+    page_mass = [float(m) for m in report["page_mass"]]
+    assert page_mass[0] == max(page_mass), report
+    assert page_mass[0] > 10 * sorted(page_mass)[len(page_mass) // 2], report
+    # ...and the policy must be ENFORCED, not merely computed. Same pair as
+    # Quest: a one-page budget has to change the continuation, and an all-keep
+    # budget has to reproduce the unmasked answer verbatim.
+    tight = await _report(
+        client, args, "trackb-h2o", {**common, "page_budget": 1})
+    base = await _report(client, args, "naive-baseline", common)
+    assert report["text"] != tight["text"], (
+        "attn_page_mask is not enforced under H2O: a 1-page budget produced "
+        "the same continuation as an all-keep one"
+    )
+    assert report["text"] == base["text"], (
+        "an all-keep page mask perturbed the output\n"
+        f"  {report['text']!r}\n  {base['text']!r}"
+    )
+
+
 async def test_naive_baseline(client, args):
     report = await _report(client, args, "naive-baseline", {"max_tokens": 4})
     assert report["sampler"] == "naive-baseline", report
@@ -594,6 +655,7 @@ def tests():
         test_naive_baseline,
         test_quest_attention,
         test_tova_attention,
+        test_h2o_attention,
     ]
 
 

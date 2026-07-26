@@ -848,3 +848,101 @@ cannot enforce. `has_attn_page_mask` now travels from the CUDA context through
 `PtirCaps` to `ModelProfile`, and `validate.rs` refuses the bind where it is
 false. Backends that only observe now say so at bind time rather than at
 runtime, or worse, never.
+
+## 11. H2O as built (implementation record)
+
+### 11.1 One line separates H2O from TOVA
+
+`tova-attention` re-seeds its accumulator in the epilogue; `trackb-h2o` puts it
+back unchanged. That is the entire algorithmic difference, and it is the reason
+H2O needed no new driver code — the `AttnScore` tap of §9 and the
+`attn_page_mask` consumption of §10 were already the two halves it needs.
+
+The carry is directly observable, which makes it self-validating. Each layer of
+each fire contributes one softmax row, so the accumulated mass must grow by
+exactly the model's layer count on every fire. Measured on Qwen3-0.6B (28
+layers, 18 pages):
+
+```
+mass_trace = [28.014, 56.014, 84.014, ..., 308.014]     # +28.000 per fire
+```
+
+A flat trace would mean the loop-carried channel was being re-seeded behind the
+program's back; a jumpy one would mean it was reading stale device memory.
+Neither can hide.
+
+The keep-set is the heavy-hitter signature the paper predicts, and it
+discriminates by orders of magnitude rather than marginally — page 0 (the
+attention sink) carries 63% of all mass on a prompt whose remaining 14 pages are
+near-identical filler:
+
+```
+page_mass = [193.5, 5.2, 4.2, 105.1, 0.0012, 0.0011, ... 0.00005]
+kept(budget=3) = [0, 1, 3]   evict_next = 17
+```
+
+### 11.2 The cold start needs a descending ramp, not a zero seed
+
+The first decode fire must choose a keep-set having observed nothing — prefill
+does not capture (§9.5). An all-zero seed makes every page tie, so the selection
+is arbitrary and real context is evicted at random. The seed is instead a small
+descending ramp (`1e-4 * (kv_max - i) / kv_max`), four orders of magnitude below
+the 1.0 a single layer-fire contributes, so one observation dominates it
+completely.
+
+It must be *descending*. An ascending ramp would rank never-used tail slots
+above live ones and evict everything real. Descending degenerates to "keep the
+earliest positions" — an attention sink — while the driver independently
+force-keeps the in-flight last page, which is a local window. The cold-start
+behaviour is therefore the StreamingLLM Λ-shape, which is the right prior to
+hold for exactly one fire.
+
+The consequence is that H2O's score row is never exactly zero anywhere, so —
+unlike TOVA — it cannot assert that slots past the live prefix are zero. The
+invariant that survives is that no *attention* lands out there: every tail slot
+must stay under the seed ceiling. A position that does not exist cannot have
+been attended to.
+
+### 11.3 Page granularity is not a shortcut
+
+A position-granular mask can stop attention from reading a position, but it
+cannot free the page holding it. Only page granularity delivers the memory
+H2O exists to reclaim, so the eviction unit is the page and the score is
+`reduce_sum(reshape(acc, [max_pages, page_size]))` — a reinterpretation, since
+`kv_max == max_pages * page_size` exactly.
+
+### 11.4 Coherence must be asserted at near-greedy, not at a sampling temperature
+
+The natural check for "an all-keep mask is a no-op" is that the policy program
+reproduces `naive-baseline` token for token. Asserted at `temperature=0.1` this
+is **latently flaky**, and finding out why was worth the detour.
+
+Running a policy program changes the decode batch's shape and therefore the
+attention kernel's split/reduction plan, so its logits differ from the plain
+baseline's in the last bit or two. This is not the tap: `test_attn_score_capture`
+asserts the capture variant leaves the attention output *bit*-identical and
+passes. It is plan-level residue, and it is unavoidable — floating-point
+addition is not associative, and a different split is a different order.
+
+Under Gumbel sampling at `tau=0.1` those last bits are amplified 10x and
+occasionally decide a near-tied token. Measured over 24 tokens x 5 seeds x 3
+programs:
+
+| tau | result |
+|---|---|
+| 0.001 | 15/15 exact, reproducible across sessions |
+| 0.1 | scattered single-token flips, hitting the mask-only program (Quest) as readily as the capture ones, and not stable across sessions |
+
+So the assertion was moved to near-greedy, where the decision margin is wider
+than the residue. This is not a weakening: "the policy follows the baseline's
+argmax path exactly" is the claim that was actually meant, and unlike the
+`tau=0.1` version it is true. The enforcement half of the pair — a one-page
+budget must *change* the continuation — is robust at any temperature and was
+left alone.
+
+A second, duller cause was hiding under the same failure: `trackb-h2o` inherited
+`tova-attention`'s RNG salt (`seed ^ 0x70a`) while `naive-baseline` and
+`quest-attention` use `seed ^ 0x5bd1`. Two programs drawing from different
+Gumbel streams disagree for reasons that have nothing to do with attention. Any
+inferlet whose test compares its text against the baseline's must share the
+baseline's salt.
