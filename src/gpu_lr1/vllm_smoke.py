@@ -35,6 +35,13 @@ def main() -> int:
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
     parser.add_argument("--prompts", type=int, default=16)
     parser.add_argument("--max-tokens", type=int, default=96)
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=1,
+        help="throughput here is noisy enough that one run says little; the "
+        "median of several is what to compare",
+    )
     arguments = parser.parse_args()
 
     from vllm import LLM, SamplingParams
@@ -58,9 +65,16 @@ def main() -> int:
         for index in range(arguments.prompts)
     ]
 
-    start = time.perf_counter()
-    outputs = llm.generate(prompts, params)
-    elapsed = time.perf_counter() - start
+    rates = []
+    for _ in range(arguments.repeats):
+        start = time.perf_counter()
+        outputs = llm.generate(prompts, params)
+        elapsed = time.perf_counter() - start
+        rates.append(
+            sum(len(output.outputs[0].token_ids) for output in outputs) / elapsed
+        )
+    rates.sort()
+    median = rates[len(rates) // 2]
 
     valid = 0
     for output in outputs:
@@ -74,10 +88,9 @@ def main() -> int:
         except Exception as error:  # noqa: BLE001
             print("INVALID:", repr(text[:120]), error)
 
-    tokens = sum(len(output.outputs[0].token_ids) for output in outputs)
     print(
-        f"{valid}/{len(outputs)} valid | {tokens} tokens in {elapsed:.2f}s "
-        f"= {tokens / elapsed:.0f} tok/s"
+        f"{valid}/{len(outputs)} valid | median {median:.0f} tok/s "
+        f"over {len(rates)} runs (min {rates[0]:.0f}, max {rates[-1]:.0f})"
     )
     return 0 if valid == len(outputs) else 1
 

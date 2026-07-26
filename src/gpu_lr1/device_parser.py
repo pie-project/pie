@@ -479,17 +479,40 @@ class DeviceBatch:
         self, sequence: int, configurations: list[tuple[int, list[int]]]
     ) -> None:
         """Put one sequence into a known set of parse states."""
-        if len(configurations) > self.configs:
-            raise ValueError(
-                f"{len(configurations)} configurations exceeds the batch's "
-                f"limit of {self.configs}"
-            )
-        self.config_count[sequence] = len(configurations)
-        for index, (lexer_state, stack) in enumerate(configurations):
-            row = sequence * self.configs + index
-            self.lexer_state[row] = lexer_state
-            self.stack[row, : len(stack)] = torch.tensor(stack, dtype=torch.int32)
-            self.depth[row] = len(stack)
+        self.set_batch_configurations({sequence: configurations})
+
+    def set_batch_configurations(
+        self, per_sequence: dict[int, list[tuple[int, list[int]]]]
+    ) -> None:
+        """Put many sequences into known parse states, in one transfer each.
+
+        Writing a row at a time is a host-to-device copy per row per step, and
+        at a serving batch that dominates everything the kernel then does. The
+        state is assembled on the host and sent once.
+        """
+        rows = max(per_sequence) + 1 if per_sequence else 0
+        if rows == 0:
+            return
+        lexer = np.zeros(rows * self.configs, dtype=np.int32)
+        stacks = np.zeros((rows * self.configs, self.grammar.max_stack), dtype=np.int32)
+        depths = np.ones(rows * self.configs, dtype=np.int32)
+        counts = np.ones(rows, dtype=np.int32)
+        for sequence, configurations in per_sequence.items():
+            if len(configurations) > self.configs:
+                raise ValueError(
+                    f"{len(configurations)} configurations exceeds the batch's "
+                    f"limit of {self.configs}"
+                )
+            counts[sequence] = len(configurations)
+            for index, (lexer_state, stack) in enumerate(configurations):
+                row = sequence * self.configs + index
+                lexer[row] = lexer_state
+                stacks[row, : len(stack)] = stack
+                depths[row] = len(stack)
+        self.lexer_state[: rows * self.configs].copy_(torch.from_numpy(lexer))
+        self.stack[: rows * self.configs].copy_(torch.from_numpy(stacks))
+        self.depth[: rows * self.configs].copy_(torch.from_numpy(depths))
+        self.config_count[:rows].copy_(torch.from_numpy(counts))
 
     def fill_mask(self) -> torch.Tensor:
         grammar = self.grammar
