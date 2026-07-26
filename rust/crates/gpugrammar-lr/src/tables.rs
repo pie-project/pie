@@ -61,6 +61,12 @@ pub struct Tables {
     pub num_terminals: usize,
     pub eof: u32,
     pub start_state: usize,
+    /// Shift/reduce conflicts resolved in favour of shift. Reported rather than
+    /// hidden: the resolution is standard and, for the adjacent optionals a
+    /// lowered schema produces, language-preserving — but it is a choice the
+    /// caller is entitled to see, and a grammar with many of them deserves a
+    /// second look.
+    pub shift_reduce_resolved: usize,
 }
 
 impl Tables {
@@ -101,6 +107,7 @@ pub fn build(cfg: &Cfg) -> Result<Tables> {
     let automaton = Lr0::build(&augmented, cfg.num_nonterminals());
     let lookaheads = propagate(&augmented, &automaton, eof, dummy);
 
+    let mut resolved = 0usize;
     let mut action: Vec<FxHashMap<u32, i32>> = vec![FxHashMap::default(); automaton.states.len()];
     let mut goto: Vec<FxHashMap<u32, u32>> = vec![FxHashMap::default(); automaton.states.len()];
 
@@ -108,7 +115,13 @@ pub fn build(cfg: &Cfg) -> Result<Tables> {
         for (symbol, target) in &automaton.transitions[index] {
             match symbol {
                 Symbol::Terminal(terminal) => {
-                    set_action(&mut action, index, terminal.0, encode_shift(*target))?;
+                    set_action(
+                        &mut action,
+                        &mut resolved,
+                        index,
+                        terminal.0,
+                        encode_shift(*target),
+                    )?;
                 }
                 Symbol::Nonterminal(nonterminal) => {
                     goto[index].insert(*nonterminal, *target as u32);
@@ -122,7 +135,7 @@ pub fn build(cfg: &Cfg) -> Result<Tables> {
                 continue;
             }
             if item.production == 0 {
-                set_action(&mut action, index, eof, ACCEPT)?;
+                set_action(&mut action, &mut resolved, index, eof, ACCEPT)?;
                 continue;
             }
             let Some(follow) = lookaheads.get(&(index, item)) else {
@@ -131,6 +144,7 @@ pub fn build(cfg: &Cfg) -> Result<Tables> {
             for terminal in follow {
                 set_action(
                     &mut action,
+                    &mut resolved,
                     index,
                     *terminal,
                     encode_reduce(item.production as usize),
@@ -149,22 +163,39 @@ pub fn build(cfg: &Cfg) -> Result<Tables> {
         num_terminals: cfg.num_terminals,
         eof,
         start_state: 0,
+        shift_reduce_resolved: resolved,
     })
 }
 
 fn set_action(
     action: &mut [FxHashMap<u32, i32>],
+    resolved: &mut usize,
     state: usize,
     terminal: u32,
     incoming: i32,
 ) -> Result<()> {
     match action[state].get(&terminal) {
-        Some(&existing) if existing != incoming => bail!(
-            "grammar is not LALR(1): state {state}, terminal {terminal}, \
-             {} versus {}",
-            describe(existing),
-            describe(incoming)
-        ),
+        Some(&existing) if existing != incoming => {
+            // Shift wins over reduce, as in every parser generator since yacc.
+            // The conflicts a lowered schema produces are adjacent optionals -
+            // `ws? ws?` from whitespace allowed between every pair of tokens -
+            // where both parses accept the same strings and shifting means
+            // "this optional takes it". Reduce/reduce has no such reading and
+            // is still an error.
+            let shift = existing.max(incoming);
+            let reduce = existing.min(incoming);
+            if shift > 0 && reduce < 0 && reduce != ACCEPT {
+                action[state].insert(terminal, shift);
+                *resolved += 1;
+                return Ok(());
+            }
+            bail!(
+                "grammar is not LALR(1): state {state}, terminal {terminal}, \
+                 {} versus {}",
+                describe(existing),
+                describe(incoming)
+            )
+        }
         _ => {
             action[state].insert(terminal, incoming);
             Ok(())
@@ -279,7 +310,8 @@ fn propagate(
     eof: u32,
     dummy: u32,
 ) -> FxHashMap<(usize, Item), FxHashSet<u32>> {
-    let first = first_sets(productions);
+    let nullable = nullable_sets(productions);
+    let first = first_sets(productions, &nullable);
     let mut lookaheads: FxHashMap<(usize, Item), FxHashSet<u32>> = FxHashMap::default();
     let mut links: Vec<((usize, Item), (usize, Item))> = Vec::new();
 
@@ -296,7 +328,7 @@ fn propagate(
 
     for (index, state) in automaton.states.iter().enumerate() {
         for kernel in state {
-            let seeded = closure1(productions, &first, *kernel, dummy);
+            let seeded = closure1(productions, &nullable, &first, *kernel, dummy);
             for (item, lookahead) in seeded {
                 let production = &productions[item.production as usize];
                 let Some(symbol) = production.rhs.get(item.dot as usize) else {
@@ -347,7 +379,7 @@ fn propagate(
                 .get(&(index, *kernel))
                 .cloned()
                 .unwrap_or_default();
-            for (item, lookahead) in closure1(productions, &first, *kernel, dummy) {
+            for (item, lookahead) in closure1(productions, &nullable, &first, *kernel, dummy) {
                 let production = &productions[item.production as usize];
                 if item.dot as usize != production.rhs.len() {
                     continue;
@@ -367,6 +399,7 @@ fn propagate(
 /// LR(1) closure of a single seeded item.
 fn closure1(
     productions: &[Production],
+    nullable: &[bool],
     first: &[FxHashSet<u32>],
     seed: Item,
     lookahead: u32,
@@ -381,8 +414,8 @@ fn closure1(
             continue;
         };
         let rest = &production.rhs[item.dot as usize + 1..];
-        let mut heads = first_of(first, rest);
-        if nullable_sequence(productions, first, rest) {
+        let mut heads = first_of(productions, nullable, first, rest);
+        if nullable_sequence(nullable, rest) {
             heads.insert(ahead);
         }
         for (index, candidate) in productions.iter().enumerate() {
@@ -407,7 +440,7 @@ fn closure1(
 }
 
 /// FIRST for every nonterminal, indexed by nonterminal id.
-fn first_sets(productions: &[Production]) -> Vec<FxHashSet<u32>> {
+fn first_sets(productions: &[Production], nullable: &[bool]) -> Vec<FxHashSet<u32>> {
     let count = productions
         .iter()
         .filter_map(|production| {
@@ -436,7 +469,7 @@ fn first_sets(productions: &[Production]) -> Vec<FxHashSet<u32>> {
                         for head in inherited {
                             changed |= first[lhs].insert(head);
                         }
-                        if !nullable(productions, *nonterminal) {
+                        if !nullable[*nonterminal as usize] {
                             break;
                         }
                     }
@@ -447,38 +480,75 @@ fn first_sets(productions: &[Production]) -> Vec<FxHashSet<u32>> {
     first
 }
 
-fn first_of(first: &[FxHashSet<u32>], symbols: &[Symbol]) -> FxHashSet<u32> {
+/// The terminals a symbol sequence can begin with.
+///
+/// A nullable symbol has to be looked past, not stopped at. Optional parts are
+/// everywhere in a lowered schema — whitespace, a sign, an absent property — and
+/// two of them in a row is the common case: `"id" ws? ":" ws? "-"? digits`.
+/// Stopping at the first symbol makes the digits invisible as a lookahead, so
+/// the parser has no action for them and rejects a number it should accept.
+fn first_of(
+    productions: &[Production],
+    nullable: &[bool],
+    first: &[FxHashSet<u32>],
+    symbols: &[Symbol],
+) -> FxHashSet<u32> {
+    let _ = productions;
     let mut heads = FxHashSet::default();
     for symbol in symbols {
         match symbol {
             Symbol::Terminal(terminal) => {
                 heads.insert(terminal.0);
-                break;
+                return heads;
             }
             Symbol::Nonterminal(nonterminal) => {
                 heads.extend(first[*nonterminal as usize].iter().copied());
-                break;
+                if !nullable[*nonterminal as usize] {
+                    return heads;
+                }
             }
         }
     }
     heads
 }
 
-fn nullable(productions: &[Production], nonterminal: u32) -> bool {
-    // A conservative one-level test is enough here: the flattener only emits
-    // an empty production directly, never through a chain.
-    productions
+/// Which nonterminals derive the empty string, to a fixpoint.
+///
+/// Not a one-level test: flattening produces chains such as
+/// `properties -> choice` with `choice -> ε`, so a nonterminal can be nullable
+/// without having an empty production of its own.
+fn nullable_sets(productions: &[Production]) -> Vec<bool> {
+    let count = productions
         .iter()
-        .any(|production| production.lhs == nonterminal && production.rhs.is_empty())
+        .filter_map(|production| {
+            (production.lhs != u32::MAX).then_some(production.lhs as usize + 1)
+        })
+        .max()
+        .unwrap_or(0);
+    let mut nullable = vec![false; count];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for production in productions {
+            if production.lhs == u32::MAX || nullable[production.lhs as usize] {
+                continue;
+            }
+            let empty = production.rhs.iter().all(|symbol| match symbol {
+                Symbol::Terminal(_) => false,
+                Symbol::Nonterminal(nonterminal) => nullable[*nonterminal as usize],
+            });
+            if empty {
+                nullable[production.lhs as usize] = true;
+                changed = true;
+            }
+        }
+    }
+    nullable
 }
 
-fn nullable_sequence(
-    productions: &[Production],
-    _first: &[FxHashSet<u32>],
-    symbols: &[Symbol],
-) -> bool {
+fn nullable_sequence(nullable: &[bool], symbols: &[Symbol]) -> bool {
     symbols.iter().all(|symbol| match symbol {
         Symbol::Terminal(_) => false,
-        Symbol::Nonterminal(nonterminal) => nullable(productions, *nonterminal),
+        Symbol::Nonterminal(nonterminal) => nullable[*nonterminal as usize],
     })
 }

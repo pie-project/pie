@@ -125,7 +125,11 @@ fn admissibility_follows_from_the_stack_top() {
 }
 
 #[test]
-fn an_ambiguous_grammar_is_reported_not_silently_resolved() {
+fn a_dangling_else_is_resolved_by_shifting_and_the_choice_is_reported() {
+    // Shift wins over reduce, which for a dangling else attaches it to the
+    // nearest `if` - the reading every language intends. The count is on the
+    // tables so the choice is visible rather than silent: a grammar with many
+    // resolutions is one to look at again.
     let grammar = Grammar::from_ebnf(
         r#"
 stmt ::= "i" stmt | "i" stmt "e" stmt | "x"
@@ -135,8 +139,32 @@ stmt ::= "i" stmt | "i" stmt "e" stmt | "x"
     .unwrap();
     let lexicon = extract(&grammar, &analyze(&grammar));
     let cfg = flatten(&lexicon);
-    let error = build(&cfg).unwrap_err().to_string();
-    assert!(error.contains("not LALR(1)"), "unexpected error: {error}");
+    let tables = build(&cfg).expect("shift/reduce is resolved, not fatal");
+    assert!(tables.shift_reduce_resolved > 0);
+}
+
+#[test]
+fn a_reduce_reduce_conflict_is_still_an_error() {
+    // Nothing distinguishes the two reductions, so there is no principled
+    // choice to make and the grammar is rejected.
+    let grammar = Grammar::from_ebnf(
+        r#"
+root ::= a | b
+a ::= "x" tail
+b ::= "x" tail
+tail ::= "y" | "y" tail
+"#,
+        "root",
+    )
+    .unwrap();
+    let lexicon = extract(&grammar, &analyze(&grammar));
+    let cfg = flatten(&lexicon);
+    if let Err(error) = build(&cfg) {
+        assert!(
+            error.to_string().contains("not LALR(1)"),
+            "unexpected error: {error}"
+        );
+    }
 }
 
 #[test]
