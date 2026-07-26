@@ -380,3 +380,170 @@ it should be built on a tap path that has already been shown to work.
 
 **B5 (RetrievalAttention) stays out of scope.** An ANN index over `K` is a
 subsystem, not an intrinsic.
+
+---
+
+## 8. Track A as built (implementation record)
+
+Sections 1-7 were the plan. This is what the hardware actually required, and it
+differs from the plan in three places that matter.
+
+### 8.1 What runs
+
+`envelope_dot` executes as a second-party PTIR kernel at **every layer of every
+decode step**, on `cuda_native`, scoring every page of the request's page list
+against that layer's post-RoPE query. The `quest-attention` inferlet reports the
+per-page bound, the classification of those bounds, and the page set Quest would
+keep. Curated matrix **36/36**.
+
+The selection is **reported, not applied** — see §8.5.
+
+### 8.2 The DSL had no way to emit a KernelCall
+
+The plan assumed the authoring surface existed. It did not: `ptir-dsl` could
+name a kernel but not emit `Op::KernelCall`, and `attn_page_mask` *discarded its
+argument* (`let _ = mask.to_arg()`), recording only a name for T11 precedence.
+So a program that configured attention and one that did not lowered to the same
+trace.
+
+Both are fixed. `Session` now interns names (`intern_name`), `kernel::
+envelope_dot` emits a real `Op::KernelCall`, and `attn_page_mask` emits a real
+`Op::SinkCall` carrying the mask value.
+
+### 8.3 Rejecting an op in the SHARED lowering makes it invisible to every backend
+
+`container_to_trace` (`driver/common/include/pie_native/ptir/bound.hpp`) is the
+lowering **all** backends decode through, and `Dispatch::register_program` calls
+it *before* any capability check. It hard-rejected `PTIR_OP_KERNEL_CALL` and
+silently dropped `PTIR_OP_SINK_CALL`. A backend that could launch the kernel
+never got to see it.
+
+Both now lower into real `Op`s. The `Op` record predates named ops, so the name
+index rides in `imm` and a new `Trace::names` resolves it — the shape Metal's
+interpreter already assumed. Hosts that cannot execute them fault at execution
+(`"tier-0 uncovered op/dtype: kernel_call"`), which is the correct layer.
+
+**Generalised lesson**, alongside the four in `11-ptir-limits.md`: *a shared
+lowering must carry ops it does not understand, because refusing there is a
+refusal on behalf of backends it knows nothing about.*
+
+### 8.4 Envelopes cannot be enabled lazily — they have to be budgeted
+
+This was the expensive discovery. Two independent reasons, either one fatal:
+
+1. **Staleness.** Envelopes are maintained *incrementally*:
+   `launch_envelope_update_appended_bf16` refreshes only the pages a fire
+   appended to. Envelopes were being switched on at `register_program`, i.e.
+   *after* the prefill had written the whole prompt, so every full page kept its
+   `(+inf, -inf)` empty seed and scored `+inf` forever. The tap ran, reported
+   28 layers, produced fluent text — and had scored nothing. Exactly the
+   "silently wrong contract" class this repo already documents four times.
+
+2. **Memory.** Envelopes are `2 x 4 x kv_heads x head_dim` bytes per page per
+   layer = **`2/page_size` of the KV cache** (12.5% at page_size 16; 5.7 GB for
+   Qwen3-0.6B on a 46 GB L40S). The KV pool is sized to *consume the device*, so
+   by the time a program binds there is nothing left. Recomputing the pool on
+   enable — the fix for (1) — hit `cudaMalloc` failure, and CUDA error 700 is
+   sticky, so it surfaced under an unrelated stack.
+
+Both are solved by allocating envelopes **with the pages** and charging them to
+the page count: `memory_planner.cpp` adds `envelope_bytes_per_page` to the
+per-page cost, so the pool simply holds proportionally fewer pages. On a fresh
+cache no page holds a key, so the empty seed is *exact*, and every append
+thereafter refreshes what it touched. A page recycled from a retired request is
+correct after its first append, because `envelope_update_appended_kernel`
+recomputes a touched page in full over its live range rather than folding into
+the old value.
+
+Two consequences worth stating explicitly:
+
+- **Envelopes escape the KV arena.** It is elastic (`commit_on_allocate =
+  false`): an allocation is unbacked virtual address space until `ensure_pages`
+  commits it, so seeding the range faults. Envelopes are not elastic in nature —
+  every page the pool can hold needs one — so they are plain device allocations.
+- **It is an operator opt-in**, `PIE_CUDA_KV_ENVELOPES=1`, and
+  `has_kv_envelopes` requires it. This is a *fourth* gate on top of the three in
+  §5 (native bf16 NHD, post-RoPE query, `tp_size == 1`). Advertising the
+  capability without the memory would let a Quest program bind and then fail at
+  its first fire; gating makes it fail at bind, with a message that names the
+  switch.
+
+### 8.5 Measured cost
+
+Qwen3-0.6B on an L40S, ~400-token prompt, best of 3 warm runs:
+
+| | ms/token |
+|---|---|
+| `naive-baseline`, envelopes off | 5.04 |
+| `naive-baseline`, envelopes on | 4.50 |
+| `quest-attention` (tap active, 28 layers) | 6.35 |
+
+**Envelope maintenance on the KV append path is free within noise.** The whole
+cost is the tap: **+1.24 ms/token (+24%)**, about 44 us per layer for the
+channel take, `envelope_dot`, `max_elem` fold and put.
+
+That is currently *pure* cost, because the selection is reported rather than
+applied. It is also fixed per layer, whereas Quest's saving grows with context,
+so the number to beat is not 24% but 24% measured at a context long enough for
+attention to dominate. This should be re-measured at 8K-128K once §8.6 lands.
+
+### 8.6 What remains: mask consumption
+
+The one piece of Track A not built. The design is now fully determined by two
+findings, both verified against the sources:
+
+**(a) Page selection needs no FlashInfer change and no replan.** On the
+**static no-split decode plan** — the default on SM80+ for batches of <= 512
+requests (`can_use_static_nonsplit_decode_plan`,
+`driver/cuda/src/ops/attention_flashinfer.cu:69-79,194-201`) — the plan is a
+trivial one-CTA-per-`(request, head)` descriptor: `request_indices[r] = r`,
+`kv_tile_indices = 0`, `o_indptr[r] = r`, `split_kv = false` (ibid. 88-170). It
+does **not** depend on page counts. The kernel takes `kv_len` from the
+`paged_kv_t` built at *launch* from the device page list
+(`attention_flashinfer_common.cuh:444-454`; `decode.cuh` reads
+`paged_kv.get_length(batch_idx)`).
+
+So a different `kv_page_indices`/`kv_page_indptr`/`kv_last_page_lens` may be
+passed **per layer** with the plan untouched. This must be gated: under a
+**split-KV** plan the plan arrays *are* derived from page counts and
+substituting a shorter list would be silently wrong.
+
+**(b) The hook fires before the attention it governs.** `OnAttnProj` runs
+post-RoPE and post-QK-norm at `llama_like.cpp:589-600`; the decode dispatch is
+at `678-684`. So a program that scores pages at the hook can restrict the
+attention of that same layer.
+
+The build is therefore:
+
+1. A **compaction kernel**: per request, walk the page list in order, keep the
+   masked-in pages, *always* keep the last page (it holds the tokens this fire
+   is writing, and keeping it last means `last_page_len` and the `kv_len`
+   identity carry over unchanged), and emit a tight CSR.
+2. A **return path on the stage hook**, which is currently one-way. The natural
+   place is beside `AttentionObservation` — a per-layer `AttentionPageSelection`
+   published by the hook, tagged with its layer so a stale view cannot leak into
+   the next one.
+3. **Substitution at the decode call only.** The fire's own CSR must keep
+   serving the KV append: it is the true source of `kv_len` (`geometry.cu`) and
+   the address keys are written through. Compacting it would corrupt the cache.
+
+The **unresolved** part, and the reason this was not built blind: a `SinkCall`
+inside a generated region has to be *executed*, and `singleton_codegen.hpp:449`
+currently whitelists it as a semantic **boundary**. Whether the fused/NVRTC path
+executes the sink or splits the region around it decides where the mask write
+belongs — and getting it wrong yields a program whose sink is silently skipped,
+which is precisely the failure mode `11-ptir-limits.md` catalogues. That
+question should be settled first, against `fused_runtime.cuh:1901`,
+`module_cache.hpp:679` and `singleton_codegen.hpp:231`.
+
+### 8.7 Deviations from the paper, as built
+
+1. **Union over heads, not per-head selection.** `paged_kv_t` has one page list
+   per request and the custom-mask offset `qo_idx * kv_len + kv_idx` has no head
+   index, so a per-head selection has nowhere to live. The kernel takes the max
+   over KV heads: a page is kept if *any* head wants it. Quality >= Quest;
+   speedup <= Quest.
+2. **In-flight pages score `+inf`.** A page the current fire is still filling
+   has no settled envelope, so it is pinned rather than scored from partial
+   data. Fail-safe, and it coincides with Quest's "keep the local window".
+3. **Selection is observed, not enforced** (§8.6).
