@@ -36,6 +36,30 @@ Qwen35MoeModel::Qwen35MoeModel(
     caps_.graph_padding_kv_write_safe  = true;
     caps_.supports_compact_logits      = true;
     caps_.supports_small_prefill_graph = supports_small_prefill_graph;
+
+    // The per-expert dispatch reads the routing table back off the device and
+    // syncs on it, and page-in adds a host-chosen slot and a plan run on top.
+    // None of that is capturable.
+    //
+    // Unlike DeepSeek-V4 this is not conditional on the cache being able to
+    // miss: streamed experts have no fused slab to stride, so every device-side
+    // path is off the table and the forward takes the syncing one even when the
+    // slab holds the whole group.
+    bool host_work_in_forward = qwen35_moe_force_general_path();
+    for (const auto& L : weights_.layers) {
+        if (L.expert_cache != nullptr) {
+            host_work_in_forward = true;
+            break;
+        }
+    }
+    if (host_work_in_forward) {
+        // Only the capture caps. `graph_padding_kv_write_safe` states that this
+        // family's KV writes are gated on `row_valid`, which is a property of
+        // its kernels and stays true either way -- startup validates it against
+        // the padding aliasing.
+        caps_.graph_safe = false;
+        caps_.supports_small_prefill_graph = false;
+    }
 }
 
 void Qwen35MoeModel::prepare(AttentionWorkspace& attn_ws,

@@ -16,9 +16,9 @@
 
 use crate::contract::{Expr, ModelContract, ScaleFactor, Visibility};
 use crate::ffi::contract::{
-    PieLoaderExprKind, PieLoaderExprNode, PieLoaderExprNodeSlice, PieLoaderModelContractView,
-    PieLoaderRepackSpecView, PieLoaderScalesView, PieLoaderTensorContractSlice,
-    PieLoaderTensorContractView, write_encoding,
+    PieLoaderExprKind, PieLoaderExprNode, PieLoaderExprNodeSlice, PieLoaderGroupContractSlice,
+    PieLoaderGroupContractView, PieLoaderModelContractView, PieLoaderRepackSpecView,
+    PieLoaderScalesView, PieLoaderTensorContractSlice, PieLoaderTensorContractView, write_encoding,
 };
 use crate::ffi::types::*;
 use crate::types::RepackSpec;
@@ -34,6 +34,10 @@ pub struct OwnedContract {
     names: Vec<Box<str>>,
     shapes: Vec<Box<[i64]>>,
     parts: Vec<Box<[u32]>>,
+    groups: Vec<PieLoaderGroupContractView>,
+    /// Each group's declarations, boxed so the views above point at storage
+    /// that does not move when a later group is appended.
+    group_tensors: Vec<Box<[PieLoaderTensorContractView]>>,
 }
 
 impl OwnedContract {
@@ -48,6 +52,10 @@ impl OwnedContract {
             tensors: PieLoaderTensorContractSlice {
                 ptr: self.tensors.as_ptr(),
                 len: self.tensors.len(),
+            },
+            groups: PieLoaderGroupContractSlice {
+                ptr: self.groups.as_ptr(),
+                len: self.groups.len(),
             },
         }
     }
@@ -263,12 +271,45 @@ pub fn write_contract(contract: &ModelContract) -> OwnedContract {
         names: Vec::new(),
         shapes: Vec::new(),
         parts: Vec::new(),
+        groups: Vec::new(),
+        group_tensors: Vec::new(),
     };
     // Two passes over each tensor, because `name`, `shape` and the node array
     // all borrow from `owned`: the borrow checker is enforcing the same rule
     // the C++ side has to follow by hand, which is that nothing may point into
     // a store while it is being appended to.
     for tensor in &contract.tensors {
+        let view = owned.write_tensor(tensor);
+        owned.tensors.push(view);
+    }
+    for group in &contract.groups {
+        let mut tensors = Vec::with_capacity(group.tensors.len());
+        for tensor in &group.tensors {
+            let view = owned.write_tensor(tensor);
+            tensors.push(view);
+        }
+        let boxed = tensors.into_boxed_slice();
+        let view = PieLoaderGroupContractView {
+            name: owned.name(&group.name),
+            arity: group.arity,
+            tensors: PieLoaderTensorContractSlice {
+                ptr: boxed.as_ptr(),
+                len: boxed.len(),
+            },
+        };
+        owned.group_tensors.push(boxed);
+        owned.groups.push(view);
+    }
+    owned
+}
+
+impl OwnedContract {
+    /// Flatten one declaration. Shared by the contract's tensors and a group's.
+    fn write_tensor(
+        &mut self,
+        tensor: &crate::contract::TensorContract,
+    ) -> PieLoaderTensorContractView {
+        let owned = self;
         let root = owned.write_expr(&tensor.expr);
         let name = owned.name(&tensor.name);
         let shape = match &tensor.shape {
@@ -286,7 +327,7 @@ pub fn write_contract(contract: &ModelContract) -> OwnedContract {
             },
             None => PieLoaderScalesView::default(),
         };
-        owned.tensors.push(PieLoaderTensorContractView {
+        PieLoaderTensorContractView {
             name,
             root,
             shape,
@@ -296,7 +337,6 @@ pub fn write_contract(contract: &ModelContract) -> OwnedContract {
                 Visibility::Public => PieLoaderVisibility::Public,
                 Visibility::Internal => PieLoaderVisibility::Internal,
             },
-        });
+        }
     }
-    owned
 }

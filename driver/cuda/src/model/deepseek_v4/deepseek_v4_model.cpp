@@ -1,5 +1,7 @@
 #include "model/deepseek_v4/deepseek_v4_model.hpp"
 
+#include "loader/group_stream_cache.hpp"
+
 #include <cstdlib>
 #include <utility>
 
@@ -34,7 +36,18 @@ DsV4Model::DsV4Model(
     // but graphs are only captured for pure-decode shapes.
     {
         const char* v = std::getenv("PIE_DSV4_GRAPH");
-        const bool on = !(v != nullptr && v[0] == '0');
+        bool on = !(v != nullptr && v[0] == '0');
+        // Paging experts is host work in the middle of the forward -- a routing
+        // table read back off the device, a slot chosen, a plan run -- and none
+        // of it is capturable. When the slab holds the whole group it never
+        // happens after the first sweep, so the question is whether the cache
+        // can miss, not whether streaming is on.
+        for (const auto& L : weights_.layers) {
+            if (L.expert_cache != nullptr && !L.expert_cache->fully_resident()) {
+                on = false;
+                break;
+            }
+        }
         caps_.graph_safe = on;
         caps_.graph_padding_kv_write_safe = on;
     }

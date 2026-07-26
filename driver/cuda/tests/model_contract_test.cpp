@@ -49,6 +49,7 @@
 #include "model/contract.hpp"
 #include "model/csm/csm_contract.hpp"
 #include "model/deepseek_v4/deepseek_v4_contract.hpp"
+#include "model/mixtral/mixtral_contract.hpp"
 #include "model/kimi/kimi_contract.hpp"
 #include "model/nemotron_h/nemotron_h_contract.hpp"
 #include "model/qwen3_5/qwen3_5_contract.hpp"
@@ -104,6 +105,65 @@ void test_expect_states_a_shape() {
     const auto v = c.view();
     check(v.tensors.len == 1 && v.tensors.ptr[0].shape.len == 2, "expect states a rank-2 shape");
     check(v.tensors.ptr[0].shape.ptr[1] == 8, "the stated extents come back");
+}
+
+// A group is `arity` interchangeable declarations. What the builder owes is
+// that they land in storage of their own -- a `define` on a group must not
+// reach the contract's tensor list -- and that `expect` and `internal` still
+// address the declaration they were chained onto once there are two lists they
+// could mean.
+void test_a_group_declares_its_own_tensors() {
+    pie_loader::ModelContract c;
+    c.define("norm", c.src("norm"), pie_loader::raw(pie_loader::PieLoaderDType::BF16));
+
+    auto experts = c.group("experts", 128);
+    auto bank = c.src("experts.gate_up");
+    experts.define("gate_up", c.select(bank, 0, 1, 1),
+                   pie_loader::raw(pie_loader::PieLoaderDType::BF16))
+        .expect({1, 64, 128});
+    experts.define("down", c.index_src("experts.{}.down"),
+                   pie_loader::raw(pie_loader::PieLoaderDType::BF16))
+        .internal();
+
+    const auto v = c.view();
+    check(v.tensors.len == 1, "a group's declarations stay out of the contract's");
+    check(v.groups.len == 1, "one group");
+    check(view_of(v.groups.ptr[0].name) == "experts", "group name");
+    check(v.groups.ptr[0].arity == 128, "group arity");
+    check(v.groups.ptr[0].tensors.len == 2, "two declarations in the group");
+    check(v.groups.ptr[0].tensors.ptr[0].shape.len == 3,
+          "expect on a group's declaration reaches that declaration");
+    check(v.groups.ptr[0].tensors.ptr[1].visibility ==
+              pie_loader::PieLoaderVisibility::Internal,
+          "internal on a group's declaration reaches that declaration");
+    // The index nodes share the one node pool, as every other node does.
+    std::size_t indexed = 0;
+    for (std::size_t i = 0; i < v.nodes.len; ++i) {
+        const std::uint32_t kind = v.nodes.ptr[i].kind;
+        if (kind == static_cast<std::uint32_t>(pie_loader::PieLoaderExprKind::SrcIndexed) ||
+            kind == static_cast<std::uint32_t>(pie_loader::PieLoaderExprKind::Select)) {
+            ++indexed;
+        }
+    }
+    check(indexed == 2, "both index nodes are in the shared pool");
+}
+
+// A group whose declarations were added after the view was taken must not be
+// read through the stale view -- but a view taken *after* must see them, which
+// is the growth rule the contract's own tensors already have.
+void test_a_group_view_survives_growth() {
+    pie_loader::ModelContract c;
+    for (int i = 0; i < 64; ++i) {
+        auto g = c.group("g" + std::to_string(i), 4);
+        g.define("w", c.index_src("t.{}.w"), pie_loader::raw(pie_loader::PieLoaderDType::BF16));
+    }
+    const auto v = c.view();
+    check(v.groups.len == 64, "every group is in the view");
+    for (std::size_t i = 0; i < v.groups.len; ++i) {
+        check(v.groups.ptr[i].tensors.len == 1, "each group kept its declaration");
+        check(view_of(v.groups.ptr[i].name) == "g" + std::to_string(i),
+              "each group kept its name");
+    }
 }
 
 // A scale tensor states which weight it scales. The name it states is stored
@@ -289,31 +349,45 @@ inline bool planned_internal(const pie_loader::LoadPlan& plan, std::string_view 
 /// tensor parallelism: the scale node's operand carries the shard, so each
 /// rank dequantizes only the slice it keeps, and the declared slab shapes are
 /// this rank's share rather than the whole expert.
-void test_deepseek_v4_stacks_experts_as_bf16() {
-    constexpr std::int64_t kExperts = 2;
-    constexpr std::int64_t kHidden = 64;
-    constexpr std::int64_t kInterFull = 64;
-    constexpr std::int64_t kGroup = 32;
+constexpr std::int64_t kDsV4Experts = 2;
+constexpr std::int64_t kDsV4Hidden = 64;
+constexpr std::int64_t kDsV4InterFull = 64;
+constexpr std::int64_t kDsV4Group = 32;
 
+/// One layer of packed-MXFP4 routed experts, as DeepSeek-V4 ships them.
+std::filesystem::path dsv4_mxfp4_checkpoint(const char* name) {
     std::vector<TypedTensor> tensors{
-        {"model.embed_tokens.weight", {16, kHidden}, "BF16"},
-        {"model.norm.weight", {kHidden}, "BF16"},
-        {"lm_head.weight", {16, kHidden}, "BF16"},
-        {"model.layers.0.ffn.gate.weight", {kExperts, kHidden}, "BF16"},
+        {"model.embed_tokens.weight", {16, kDsV4Hidden}, "BF16"},
+        {"model.norm.weight", {kDsV4Hidden}, "BF16"},
+        {"lm_head.weight", {16, kDsV4Hidden}, "BF16"},
+        {"model.layers.0.ffn.gate.weight", {kDsV4Experts, kDsV4Hidden}, "BF16"},
     };
     const std::string ffn = "model.layers.0.ffn.";
-    for (int e = 0; e < kExperts; ++e) {
+    for (int e = 0; e < kDsV4Experts; ++e) {
         const std::string ep = ffn + "experts." + std::to_string(e) + ".";
         // `w1`/`w3` are `[I_full, H/2]`; `w2` is `[H, I_full/2]`. Halved
         // because two 4-bit elements share a stored byte.
         for (const char* gate_up : {"w1", "w3"}) {
-            tensors.push_back({ep + gate_up + ".weight", {kInterFull, kHidden / 2}, "I8"});
-            tensors.push_back({ep + gate_up + ".scale", {kInterFull, kHidden / kGroup}, "U8"});
+            tensors.push_back(
+                {ep + gate_up + ".weight", {kDsV4InterFull, kDsV4Hidden / 2}, "I8"});
+            tensors.push_back(
+                {ep + gate_up + ".scale", {kDsV4InterFull, kDsV4Hidden / kDsV4Group}, "U8"});
         }
-        tensors.push_back({ep + "w2.weight", {kHidden, kInterFull / 2}, "I8"});
-        tensors.push_back({ep + "w2.scale", {kHidden, kInterFull / kGroup}, "U8"});
+        tensors.push_back({ep + "w2.weight", {kDsV4Hidden, kDsV4InterFull / 2}, "I8"});
+        tensors.push_back(
+            {ep + "w2.scale", {kDsV4Hidden, kDsV4InterFull / kDsV4Group}, "U8"});
     }
-    const std::filesystem::path dir = write_typed_checkpoint("dsv4_mxfp4_experts", tensors);
+    return write_typed_checkpoint(name, tensors);
+}
+
+void test_deepseek_v4_stacks_experts_as_bf16() {
+    constexpr std::int64_t kExperts = kDsV4Experts;
+    constexpr std::int64_t kHidden = kDsV4Hidden;
+    constexpr std::int64_t kInterFull = kDsV4InterFull;
+    constexpr std::int64_t kGroup = kDsV4Group;
+
+    const std::string ffn = "model.layers.0.ffn.";
+    const std::filesystem::path dir = dsv4_mxfp4_checkpoint("dsv4_mxfp4_experts");
 
     std::string open_error;
     pie_loader::Checkpoint checkpoint = pie_loader::Checkpoint::open(dir.string(), &open_error);
@@ -344,7 +418,7 @@ void test_deepseek_v4_stacks_experts_as_bf16() {
             try {
                 model::ContractBuilder builder(checkpoint, facts, target, "",
                                                model::Mxfp4MoeRequest::Auto,
-                                               model::Component::Full, contract);
+                                               model::Component::Full, /*stream_routed_experts=*/false, contract);
                 model::author_deepseek_v4_contract(builder);
                 builder.finish();
                 // The family answers for itself: there is no native MXFP4 GEMM
@@ -413,6 +487,430 @@ void test_deepseek_v4_stacks_experts_as_bf16() {
                 check(false, "compiling" + at + ": " + error.what());
             }
         }
+    }
+}
+
+/// DeepSeek-V4 declares its routed experts as a group when they are streamed.
+///
+/// The same expression, one rank lower. A stack says "every expert of this
+/// layer, concatenated"; a group says "one expert of this layer", with the
+/// index left standing -- so what this pins is that removing the outer concat
+/// removed the *only* thing that was per-expert, and that the dequantization,
+/// the shard and the scale pairing all survived the move.
+///
+/// Two facts matter more than the shapes. The group's declarations are not the
+/// contract's, so nothing publishes a slab: the resident plan gets smaller by
+/// exactly the experts. And the group's plan prices one expert, not E, which
+/// is the number a driver sizes a slot against -- if that ever equalled the
+/// stack's, streaming would be buying nothing.
+///
+/// The loader proves interchangeability by compiling every instance and
+/// requiring them equal, so `LoadPlan::compile` succeeding here is not a
+/// formality: it is the statement that these E experts really are one program
+/// read at E offsets.
+void test_deepseek_v4_streams_experts_as_a_group() {
+    constexpr std::int64_t kExperts = kDsV4Experts;
+    constexpr std::int64_t kHidden = kDsV4Hidden;
+    constexpr std::int64_t kInterFull = kDsV4InterFull;
+    constexpr std::int64_t kGroup = kDsV4Group;
+
+    const std::string ffn = "model.layers.0.ffn.";
+    const std::filesystem::path dir = dsv4_mxfp4_checkpoint("dsv4_mxfp4_streamed");
+
+    std::string open_error;
+    pie_loader::Checkpoint checkpoint = pie_loader::Checkpoint::open(dir.string(), &open_error);
+    check(static_cast<bool>(checkpoint), "the synthetic checkpoint opens: " + open_error);
+    if (!checkpoint) return;
+
+    const pie_cuda_driver::model::ModelFacts facts{
+        .model_type = "deepseek_v4",
+        .quant_method = "",
+        .num_hidden_layers = 1,
+        .num_experts = kExperts,
+        .head_dim = 0,
+        .mamba_groups = 0,
+    };
+    namespace model = pie_cuda_driver::model;
+
+    // Under TP too: a group and a shard index on different axes -- one picks
+    // the tensor, the other the slice of it -- so a sharded group needs no
+    // special care from either side, and this is where that is checked.
+    for (int tp : {1, 2}) {
+        for (int rank = 0; rank < tp; ++rank) {
+            const std::int64_t inter = kInterFull / tp;
+            const std::string at =
+                " (tp " + std::to_string(tp) + " rank " + std::to_string(rank) + ")";
+
+            auto target = pie_cuda_driver::cuda_device_target();
+            target.tp_size = static_cast<std::uint32_t>(tp);
+            target.tp_rank = static_cast<std::uint32_t>(rank);
+
+            pie_loader::ModelContract contract;
+            try {
+                model::ContractBuilder builder(checkpoint, facts, target, "",
+                                               model::Mxfp4MoeRequest::Auto,
+                                               model::Component::Full,
+                                               /*stream_routed_experts=*/true, contract);
+                model::author_deepseek_v4_contract(builder);
+                builder.finish();
+            } catch (const std::exception& error) {
+                check(false, "authoring" + at + ": " + error.what());
+                continue;
+            }
+
+            const auto v = contract.view();
+            check(v.groups.len == 1, "one group, for the one layer" + at);
+            if (v.groups.len != 1) continue;
+            const auto& g = v.groups.ptr[0];
+            check(view_of(g.name) == ffn + "experts",
+                  "the group is named for its layer" + at);
+            check(g.arity == kExperts, "one instance per expert" + at);
+
+            std::map<std::string_view, std::vector<std::int64_t>> declared;
+            std::map<std::string_view, std::uint32_t> dtypes;
+            std::map<std::string_view, bool> internal;
+            for (std::size_t i = 0; i < g.tensors.len; ++i) {
+                const auto& t = g.tensors.ptr[i];
+                declared[view_of(t.name)] =
+                    std::vector<std::int64_t>(t.shape.ptr, t.shape.ptr + t.shape.len);
+                dtypes[view_of(t.name)] = t.encoding.dtype;
+                internal[view_of(t.name)] =
+                    t.visibility == pie_loader::PieLoaderVisibility::Internal;
+            }
+            const auto declares = [&](const std::string& name,
+                                      const std::vector<std::int64_t>& want,
+                                      pie_loader::PieLoaderDType dtype) {
+                const auto found = declared.find(name);
+                check(found != declared.end() && found->second == want &&
+                          dtypes[name] == static_cast<std::uint32_t>(dtype),
+                      "the group declares '" + name + "' as this rank's share" + at);
+            };
+            // No layer and no expert in the name: there is one plan, and it is
+            // the same plan for every instance.
+            declares("gate_up.weight", {2 * inter, kHidden}, pie_loader::PieLoaderDType::BF16);
+            declares("down.weight", {kHidden, inter}, pie_loader::PieLoaderDType::BF16);
+            declares("gate_up.scale", {2 * inter, kHidden / kGroup},
+                     pie_loader::PieLoaderDType::E8M0);
+            declares("down.scale", {kHidden, inter / kGroup},
+                     pie_loader::PieLoaderDType::E8M0);
+            check(internal["gate_up.scale"] && internal["down.scale"],
+                  "the factors are consumed by the dequantize, not bound" + at);
+
+            for (std::size_t i = 0; i < v.tensors.len; ++i) {
+                const auto name = view_of(v.tensors.ptr[i].name);
+                check(name.find("experts") == std::string_view::npos,
+                      "no expert slab is published outside the group" + at);
+            }
+
+            try {
+                const pie_loader::PieLoaderContractRequest request =
+                    pie_loader::build_contract_request(checkpoint, target, v);
+                // Compiling *is* the interchangeability proof: every instance
+                // is compiled and required to equal instance 0 everywhere but
+                // the three fields that locate bytes.
+                const pie_loader::LoadPlan plan = pie_loader::LoadPlan::compile(request);
+                plan.verify(request);
+
+                const auto& pv = plan.view();
+                check(pv.groups.len == 1, "the plan carries the group" + at);
+                if (pv.groups.len != 1) continue;
+                const auto& pg = pv.groups.ptr[0];
+                check(pg.arity == kExperts, "the plan agrees on the arity" + at);
+                check(pg.plan != nullptr, "the group carries a whole plan" + at);
+                check(pg.bindings_per_instance > 0,
+                      "an expert is read from somewhere" + at);
+                check(pg.bindings.len ==
+                          pg.bindings_per_instance * static_cast<std::size_t>(kExperts),
+                      "every instance is bound" + at);
+
+                // A slot holds one expert. Both halves of one expert, this
+                // rank's share: gate_up is `[2I, H]` and down is `[H, I]`, two
+                // bytes an element. Alignment may round it up, never down.
+                const std::uint64_t one_expert = static_cast<std::uint64_t>(
+                    (2 * inter * kHidden + kHidden * inter) * 2);
+                check(pg.plan->memory.persistent_bytes >= one_expert &&
+                          pg.plan->memory.persistent_bytes <
+                              one_expert + 4096,
+                      "a slot is priced at one expert, not " +
+                          std::to_string(kExperts) + at);
+                // And the resident plan no longer carries them at all.
+                check(pv.memory.persistent_bytes < one_expert,
+                      "the experts left the resident plan" + at);
+            } catch (const std::exception& error) {
+                check(false, "compiling" + at + ": " + error.what());
+            }
+        }
+    }
+}
+
+/// Qwen3-MoE declares its per-expert weights as a group when asked to stream.
+///
+/// The plain HF MoE source layout -- one tensor per expert per projection --
+/// is the case `index_src` exists for, and this is the whole of it: the
+/// streaming branch is the stacking pass with the outer concatenation removed,
+/// so the instance it leaves behind is what the stack was already building per
+/// expert. GLM-5 shares the helper, so this covers it too.
+void test_qwen3_moe_streams_experts_as_a_group() {
+    constexpr std::int64_t kExperts = 4;
+    constexpr std::int64_t kHidden = 64;
+    constexpr std::int64_t kInter = 32;
+    constexpr std::int64_t kLayers = 2;
+
+    std::vector<TypedTensor> tensors{
+        {"model.embed_tokens.weight", {16, kHidden}, "BF16"},
+        {"model.norm.weight", {kHidden}, "BF16"},
+        {"lm_head.weight", {16, kHidden}, "BF16"},
+    };
+    for (int layer = 0; layer < kLayers; ++layer) {
+        const std::string lp = "model.layers." + std::to_string(layer) + ".mlp.";
+        tensors.push_back({lp + "gate.weight", {kExperts, kHidden}, "BF16"});
+        for (int e = 0; e < kExperts; ++e) {
+            const std::string ep = lp + "experts." + std::to_string(e) + ".";
+            tensors.push_back({ep + "gate_proj.weight", {kInter, kHidden}, "BF16"});
+            tensors.push_back({ep + "up_proj.weight", {kInter, kHidden}, "BF16"});
+            tensors.push_back({ep + "down_proj.weight", {kHidden, kInter}, "BF16"});
+        }
+    }
+    const std::filesystem::path dir =
+        write_typed_checkpoint("qwen3_moe_streamed", tensors);
+
+    std::string open_error;
+    pie_loader::Checkpoint checkpoint = pie_loader::Checkpoint::open(dir.string(), &open_error);
+    check(static_cast<bool>(checkpoint), "the synthetic checkpoint opens: " + open_error);
+    if (!checkpoint) return;
+
+    const pie_cuda_driver::model::ModelFacts facts{
+        .model_type = "qwen3_moe",
+        .quant_method = "",
+        .num_hidden_layers = kLayers,
+        .num_experts = kExperts,
+        .head_dim = 0,
+        .mamba_groups = 0,
+    };
+    namespace model = pie_cuda_driver::model;
+
+    pie_loader::ModelContract contract;
+    try {
+        model::ContractBuilder builder(checkpoint, facts,
+                                       pie_cuda_driver::cuda_device_target(), "",
+                                       model::Mxfp4MoeRequest::Auto,
+                                       model::Component::Full,
+                                       /*stream_routed_experts=*/true, contract);
+        model::author_qwen3_5_moe_contract(builder);
+        builder.finish();
+    } catch (const std::exception& error) {
+        check(false, std::string("authoring: ") + error.what());
+        return;
+    }
+
+    const auto v = contract.view();
+    // One group per layer, not one for the model: a name template carries a
+    // single `{}` and this checkpoint spells an expert with two indices.
+    check(v.groups.len == kLayers, "one group per layer");
+    if (v.groups.len != kLayers) return;
+
+    for (std::size_t layer = 0; layer < v.groups.len; ++layer) {
+        const auto& g = v.groups.ptr[layer];
+        const std::string at = " (layer " + std::to_string(layer) + ")";
+        check(view_of(g.name) ==
+                  "model.layers." + std::to_string(layer) + ".mlp.experts",
+              "the group is named where the bind looks for it" + at);
+        check(g.arity == kExperts, "one instance per expert" + at);
+
+        std::map<std::string_view, std::vector<std::int64_t>> declared;
+        for (std::size_t i = 0; i < g.tensors.len; ++i) {
+            const auto& t = g.tensors.ptr[i];
+            declared[view_of(t.name)] =
+                std::vector<std::int64_t>(t.shape.ptr, t.shape.ptr + t.shape.len);
+        }
+        check(declared.size() == 2, "two tensors, gate_up and down" + at);
+        // Rank 2, not 3: the stack's leading 1 existed only to make the
+        // per-expert slabs concatenable, and there is no concatenation left.
+        check(declared["gate_up_proj"] == std::vector<std::int64_t>{2 * kInter, kHidden},
+              "gate and up, joined" + at);
+        check(declared["down_proj"] == std::vector<std::int64_t>{kHidden, kInter},
+              "down, as the checkpoint stores it" + at);
+    }
+
+    for (std::size_t i = 0; i < v.tensors.len; ++i) {
+        const auto name = view_of(v.tensors.ptr[i].name);
+        check(name.find("experts.") == std::string_view::npos,
+              "no per-expert tensor is published outside the group");
+    }
+
+    try {
+        const pie_loader::PieLoaderContractRequest request =
+            pie_loader::build_contract_request(
+                checkpoint, pie_cuda_driver::cuda_device_target(), v);
+        // Compiling *is* the interchangeability proof.
+        const pie_loader::LoadPlan plan = pie_loader::LoadPlan::compile(request);
+        plan.verify(request);
+
+        const auto& pv = plan.view();
+        check(pv.groups.len == kLayers, "the plan carries every group");
+        if (pv.groups.len != kLayers) return;
+        const std::uint64_t one_expert =
+            static_cast<std::uint64_t>((2 * kInter * kHidden + kHidden * kInter) * 2);
+        for (std::size_t layer = 0; layer < pv.groups.len; ++layer) {
+            const auto& pg = pv.groups.ptr[layer];
+            const std::string at = " (layer " + std::to_string(layer) + ")";
+            check(pg.arity == kExperts, "the plan agrees on the arity" + at);
+            check(pg.bindings.len ==
+                      pg.bindings_per_instance * static_cast<std::size_t>(kExperts),
+                  "every instance is bound" + at);
+            check(pg.plan->memory.persistent_bytes >= one_expert &&
+                      pg.plan->memory.persistent_bytes < one_expert + 4096,
+                  "a slot is priced at one expert" + at);
+        }
+        check(pv.memory.persistent_bytes < one_expert * kExperts,
+              "the experts left the resident plan");
+    } catch (const std::exception& error) {
+        check(false, std::string("compiling: ") + error.what());
+    }
+}
+
+/// GPT-OSS streams its experts out of a fused bank, which is what `select` is.
+///
+/// The counterpart to the Qwen test and the other half of what a group has to
+/// cover: there the checkpoint names a tensor per expert and an instance is
+/// picked by substituting into a template; here one tensor per layer holds all
+/// of them and an instance is a band whose start is the only thing the index
+/// decides. The type of that band cannot depend on the index -- a slice of
+/// fixed length has a fixed shape -- so interchangeability is structural, and
+/// the compile is the proof.
+void test_gpt_oss_streams_experts_as_a_group() {
+    constexpr std::int64_t kExperts = 4;
+    constexpr std::int64_t kHidden = 64;
+    constexpr std::int64_t kInter = 32;
+    constexpr std::int64_t kLayers = 2;
+
+    std::vector<TypedTensor> tensors{
+        {"model.embed_tokens.weight", {16, kHidden}, "BF16"},
+        {"model.norm.weight", {kHidden}, "BF16"},
+        {"lm_head.weight", {16, kHidden}, "BF16"},
+    };
+    for (int layer = 0; layer < kLayers; ++layer) {
+        const std::string ep =
+            "model.layers." + std::to_string(layer) + ".mlp.experts.";
+        tensors.push_back({ep + "gate_up_proj_blocks",
+                           {kExperts, 2 * kInter, kHidden / 32, 16}, "U8"});
+        tensors.push_back({ep + "gate_up_proj_scales",
+                           {kExperts, 2 * kInter, kHidden / 32}, "U8"});
+        tensors.push_back({ep + "gate_up_proj_bias", {kExperts, 2 * kInter}, "BF16"});
+        tensors.push_back({ep + "down_proj_blocks",
+                           {kExperts, kHidden, kInter / 32, 16}, "U8"});
+        tensors.push_back({ep + "down_proj_scales",
+                           {kExperts, kHidden, kInter / 32}, "U8"});
+        tensors.push_back({ep + "down_proj_bias", {kExperts, kHidden}, "BF16"});
+    }
+    const std::filesystem::path dir =
+        write_typed_checkpoint("gpt_oss_streamed", tensors);
+
+    std::string open_error;
+    pie_loader::Checkpoint checkpoint = pie_loader::Checkpoint::open(dir.string(), &open_error);
+    check(static_cast<bool>(checkpoint), "the synthetic checkpoint opens: " + open_error);
+    if (!checkpoint) return;
+
+    const pie_cuda_driver::model::ModelFacts facts{
+        .model_type = "gpt_oss",
+        .quant_method = "",
+        .num_hidden_layers = kLayers,
+        .num_experts = kExperts,
+        .head_dim = 0,
+        .mamba_groups = 0,
+    };
+    namespace model = pie_cuda_driver::model;
+
+    pie_loader::ModelContract contract;
+    try {
+        model::ContractBuilder builder(checkpoint, facts,
+                                       pie_cuda_driver::cuda_device_target(), "",
+                                       model::Mxfp4MoeRequest::RoutedDecode,
+                                       model::Component::Full,
+                                       /*stream_routed_experts=*/true, contract);
+        model::author_gpt_oss_contract(builder);
+        builder.finish();
+    } catch (const std::exception& error) {
+        check(false, std::string("authoring: ") + error.what());
+        return;
+    }
+
+    const auto v = contract.view();
+    check(v.groups.len == kLayers, "one group per layer");
+    if (v.groups.len != kLayers) return;
+
+    for (std::size_t layer = 0; layer < v.groups.len; ++layer) {
+        const auto& g = v.groups.ptr[layer];
+        const std::string at = " (layer " + std::to_string(layer) + ")";
+        check(view_of(g.name) ==
+                  "model.layers." + std::to_string(layer) + ".mlp.experts",
+              "the group is named where the bind looks for it" + at);
+        check(g.arity == kExperts, "one instance per expert" + at);
+
+        std::map<std::string_view, std::vector<std::int64_t>> declared;
+        for (std::size_t i = 0; i < g.tensors.len; ++i) {
+            const auto& t = g.tensors.ptr[i];
+            declared[view_of(t.name)] =
+                std::vector<std::int64_t>(t.shape.ptr, t.shape.ptr + t.shape.len);
+        }
+        check(declared.size() == 4, "weights and scales, both halves" + at);
+        // The leading 1 survives: a `Select` lowers to a `Slice`, and a slice
+        // keeps its rank.
+        check(declared["gate_up_proj.weight"] ==
+                  std::vector<std::int64_t>{1, 2 * kInter, kHidden / 32, 16},
+              "one expert's packed gate/up band" + at);
+        check(declared["down_proj.weight"] ==
+                  std::vector<std::int64_t>{1, kHidden, kInter / 32, 16},
+              "one expert's packed down band" + at);
+        check(declared["gate_up_proj.weight_scale"] ==
+                  std::vector<std::int64_t>{1, 2 * kInter, kHidden / 32},
+              "its factors come with it" + at);
+    }
+
+    // The biases are small and need a de-interleave the contract has no node
+    // for, so they stay resident under the names the bind already reads.
+    bool bias_resident = false;
+    for (std::size_t i = 0; i < v.tensors.len; ++i) {
+        const auto name = view_of(v.tensors.ptr[i].name);
+        if (name == "model.layers.0.mlp.experts.gate_up_proj.bias") {
+            bias_resident = true;
+        }
+        check(name.find("_blocks") == std::string_view::npos &&
+                  name.find("_scales") == std::string_view::npos,
+              "no expert bank is published outside the group");
+    }
+    check(bias_resident, "the expert biases stayed resident");
+
+    try {
+        const pie_loader::PieLoaderContractRequest request =
+            pie_loader::build_contract_request(
+                checkpoint, pie_cuda_driver::cuda_device_target(), v);
+        // Compiling is the interchangeability proof, and for `select` it is
+        // also the bounds check: an arity wider than the bank fails here
+        // rather than producing a slot of whatever followed it.
+        const pie_loader::LoadPlan plan = pie_loader::LoadPlan::compile(request);
+        plan.verify(request);
+
+        const auto& pv = plan.view();
+        check(pv.groups.len == kLayers, "the plan carries every group");
+        if (pv.groups.len != kLayers) return;
+        const std::uint64_t one_expert = static_cast<std::uint64_t>(
+            2 * kInter * (kHidden / 32) * 16 + 2 * kInter * (kHidden / 32) +
+            kHidden * (kInter / 32) * 16 + kHidden * (kInter / 32));
+        for (std::size_t layer = 0; layer < pv.groups.len; ++layer) {
+            const auto& pg = pv.groups.ptr[layer];
+            const std::string at = " (layer " + std::to_string(layer) + ")";
+            check(pg.arity == kExperts, "the plan agrees on the arity" + at);
+            check(pg.bindings.len ==
+                      pg.bindings_per_instance * static_cast<std::size_t>(kExperts),
+                  "every instance is bound" + at);
+            check(pg.plan->memory.persistent_bytes >= one_expert &&
+                      pg.plan->memory.persistent_bytes < one_expert + 4096,
+                  "a slot is priced at one expert, not " +
+                      std::to_string(kExperts) + at);
+        }
+    } catch (const std::exception& error) {
+        check(false, std::string("compiling: ") + error.what());
     }
 }
 
@@ -487,7 +985,7 @@ void test_kimi_stacks_experts_as_bf16() {
             try {
                 model::ContractBuilder builder(checkpoint, facts, target, "",
                                                model::Mxfp4MoeRequest::Auto,
-                                               model::Component::Full, contract);
+                                               model::Component::Full, /*stream_routed_experts=*/false, contract);
                 model::author_kimi_contract(builder);
                 builder.finish();
             } catch (const std::exception& error) {
@@ -596,7 +1094,7 @@ void test_csm_narrows_fp32_weights_to_bf16() {
     try {
         model::ContractBuilder builder(checkpoint, facts, target, "",
                                        model::Mxfp4MoeRequest::RoutedDecode,
-                                       model::Component::Full, contract);
+                                       model::Component::Full, /*stream_routed_experts=*/false, contract);
         model::author_csm_contract(builder);
         builder.finish();
     } catch (const std::exception& error) {
@@ -699,7 +1197,7 @@ void test_nemotron_h_mamba_splits_on_unit_boundaries() {
             try {
                 model::ContractBuilder builder(checkpoint, facts, target, "",
                                                model::Mxfp4MoeRequest::RoutedDecode,
-                                               model::Component::Full, contract);
+                                               model::Component::Full, /*stream_routed_experts=*/false, contract);
                 model::author_nemotron_h_contract(builder);
                 builder.finish();
             } catch (const std::exception& error) {
@@ -818,7 +1316,7 @@ void test_qwen3_5_gdn_splits_by_block() {
             try {
                 model::ContractBuilder builder(checkpoint, facts, target, "",
                                                model::Mxfp4MoeRequest::RoutedDecode,
-                                               model::Component::Full, contract);
+                                               model::Component::Full, /*stream_routed_experts=*/false, contract);
                 model::author_qwen3_5_contract(builder);
                 builder.finish();
             } catch (const std::exception& error) {
@@ -1192,7 +1690,7 @@ void author_real_contract(const std::string& snapshot, const char* dest) {
             try {
                 model::ContractBuilder builder(
                     checkpoint, facts, target, "", model::Mxfp4MoeRequest::Auto,
-                    model::Component::Full, contract);
+                    model::Component::Full, /*stream_routed_experts=*/false, contract);
                 arch->author_contract(builder);
                 builder.finish();
             } catch (const std::exception& error) {
@@ -1269,11 +1767,16 @@ int main() {
     test_scaling_states_the_weight();
     test_scale_carries_its_factor();
     test_the_view_survives_growth();
+    test_a_group_declares_its_own_tensors();
+    test_a_group_view_survives_growth();
     test_csm_narrows_fp32_weights_to_bf16();
     test_deepseek_v4_stacks_experts_as_bf16();
+    test_deepseek_v4_streams_experts_as_a_group();
     test_kimi_stacks_experts_as_bf16();
     test_nemotron_h_mamba_splits_on_unit_boundaries();
     test_qwen3_5_gdn_splits_by_block();
+    test_qwen3_moe_streams_experts_as_a_group();
+    test_gpt_oss_streams_experts_as_a_group();
 
     const char* snapshot = std::getenv("PIE_TEST_SNAPSHOT");
     if (snapshot != nullptr) {

@@ -139,8 +139,8 @@ inline void dsv4_bf16_expert_stacks(ContractBuilder& b) {
     // the checkpoint, and a config-driven loop would ask for tensors that this
     // process was never given.
     for (std::uint32_t layer = 0;; ++layer) {
-        const std::string ffn =
-            "model.layers." + std::to_string(layer) + ".ffn.";
+        const std::string ffn = std::string(b.decoder_layer_prefix()) +
+                                std::to_string(layer) + ".ffn.";
         if (b.find(b.source_name(ffn + "experts.0.w1.weight")) == nullptr) {
             break;
         }
@@ -283,6 +283,164 @@ inline void dsv4_bf16_expert_stacks(ContractBuilder& b) {
     }
 }
 
+/// The same experts, as a group per layer, for a driver that will page them.
+///
+/// `dsv4_bf16_expert_stacks` says "every expert of this layer, concatenated".
+/// This says "one expert of this layer", once, with the expert index left
+/// standing -- which is the same sentence with the outer `concat` removed and
+/// each `src` replaced by the `index_src` it was a member of. Everything that
+/// made the stack correct is still here in the same order: the transmutes that
+/// name packed nibbles as MXFP4, the shard that keeps only this rank's slice,
+/// and the `scale_per_group` that dequantizes. A group's plan is a whole plan,
+/// so all of it runs on the page-in path; nothing had to be reduced to plain
+/// copies to be streamable.
+///
+/// One group per layer rather than one for the model, because a name template
+/// carries a single `{}` and this checkpoint spells an expert
+/// `layers.<L>.ffn.experts.<E>.w1`. That is the contract vocabulary declining
+/// to grow a second index, and it costs nothing: the driver's slab spans the
+/// groups.
+///
+/// The declared names carry no layer and no expert -- there is one plan, and
+/// it is the same plan for every instance of every layer. The driver asks a
+/// group by name and gets back `gate_up.weight` and `down.weight`, which is
+/// what the per-expert GEMM path wants anyway.
+inline void dsv4_streamed_expert_groups(ContractBuilder& b) {
+    using contract_detail::fail;
+    using contract_detail::is_raw;
+    using contract_detail::shape_of;
+    constexpr std::int64_t kGroup = 32;
+
+    for (std::uint32_t layer = 0;; ++layer) {
+        const std::string ffn = std::string(b.decoder_layer_prefix()) +
+                                std::to_string(layer) + ".ffn.";
+        if (b.find(b.source_name(ffn + "experts.0.w1.weight")) == nullptr) {
+            break;
+        }
+
+        // Instance 0 is the shape oracle. It has to be: the group's plan is
+        // compiled at index 0 and every other instance is then required to
+        // match it, so a shape read anywhere else would be a shape the loader
+        // is about to reject anyway.
+        const SourceTensor* proto[6] = {
+            b.find(b.source_name(ffn + "experts.0.w1.weight")),
+            b.find(b.source_name(ffn + "experts.0.w1.scale")),
+            b.find(b.source_name(ffn + "experts.0.w3.weight")),
+            b.find(b.source_name(ffn + "experts.0.w3.scale")),
+            b.find(b.source_name(ffn + "experts.0.w2.weight")),
+            b.find(b.source_name(ffn + "experts.0.w2.scale")),
+        };
+        for (const SourceTensor* part : proto) {
+            if (part == nullptr) {
+                fail("deepseek_v4 expert group: " + ffn +
+                     "experts.0 is missing a weight or scale");
+            }
+        }
+        if (!is_raw(proto[0]->encoding, PieLoaderDType::I8) ||
+            !is_raw(proto[4]->encoding, PieLoaderDType::I8)) {
+            // Not packed MXFP4. Leave the whole checkpoint alone rather than
+            // half of it, exactly as the stacking pass does.
+            return;
+        }
+
+        const std::vector<std::int64_t> up_raw = shape_of(*proto[0]);
+        const std::vector<std::int64_t> down_raw = shape_of(*proto[4]);
+        if (up_raw.size() != 2 || down_raw.size() != 2) {
+            fail("deepseek_v4 expert group: " + ffn +
+                 "experts.0 expects rank-2 expert weights");
+        }
+        const std::int64_t inter_full = up_raw[0];
+        const std::int64_t hidden = up_raw[1] * 2;
+        const std::int64_t inter = b.local_extent(inter_full);
+        if (hidden % kGroup != 0 || inter % kGroup != 0) {
+            fail("deepseek_v4 expert group: " + ffn +
+                 "experts.0 expects both expert dims to be a multiple of 32");
+        }
+
+        // Count the experts, and claim every tensor all of them read. A group
+        // reads through a template, so the sources it consumes are not named
+        // by any node and `author_dense_contract` would otherwise publish
+        // every one of them.
+        std::uint32_t experts = 0;
+        std::vector<std::uint32_t> consumed;
+        for (;; ++experts) {
+            const std::string ep =
+                ffn + "experts." + std::to_string(experts) + ".";
+            const SourceTensor* w1 = b.find(b.source_name(ep + "w1.weight"));
+            if (w1 == nullptr) break;
+            for (const char* suffix : {"w1.weight", "w1.scale", "w3.weight",
+                                       "w3.scale", "w2.weight", "w2.scale"}) {
+                const SourceTensor* part = b.find(b.source_name(ep + suffix));
+                if (part == nullptr) {
+                    fail("deepseek_v4 expert group: " + ep +
+                         " is missing a weight or scale");
+                }
+                consumed.push_back(part->id);
+            }
+        }
+        if (experts == 0) continue;
+
+        auto& c = b.contract();
+        auto packed = [&](const std::string& tmpl, std::vector<std::int64_t> shape,
+                          std::uint8_t axis) {
+            return b.shard(c.transmute(c.index_src(b.source_name(ffn + tmpl)), shape,
+                                       mxfp4_encoding(c, static_cast<std::uint8_t>(2))),
+                           shape, ShardAxis{axis})
+                .first;
+        };
+        auto factors = [&](const std::string& tmpl, std::vector<std::int64_t> shape,
+                           std::uint8_t axis) {
+            return b.shard(c.transmute(c.index_src(b.source_name(ffn + tmpl)), shape,
+                                       pie_loader::raw(PieLoaderDType::E8M0)),
+                           shape, ShardAxis{axis})
+                .first;
+        };
+
+        // Named the way every bound tensor is named -- prefix stripped --
+        // because the driver looks a group up beside the weights it binds, and
+        // one naming convention for both is one less thing to get wrong.
+        auto group = c.group(b.output_name(ffn + "experts"), experts);
+        // Same structure as the stack, one rank lower: with no expert axis to
+        // stack along, `w1`/`w3` concatenate along the intermediate dim they
+        // were already sharded on, and the scale groups run along the last
+        // axis as before.
+        group.define("gate_up.scale",
+                     c.concat({factors("experts.{}.w1.scale",
+                                       {inter_full, hidden / kGroup}, 0),
+                               factors("experts.{}.w3.scale",
+                                       {inter_full, hidden / kGroup}, 0)},
+                              0),
+                     pie_loader::raw(PieLoaderDType::E8M0))
+            .expect({2 * inter, hidden / kGroup})
+            .internal();
+        group.define("down.scale",
+                     factors("experts.{}.w2.scale",
+                             {down_raw[0], inter_full / kGroup}, 1),
+                     pie_loader::raw(PieLoaderDType::E8M0))
+            .expect({down_raw[0], inter / kGroup})
+            .internal();
+        group.define(
+                 "gate_up.weight",
+                 c.scale_per_group(
+                     c.concat({packed("experts.{}.w1.weight", {inter_full, hidden}, 0),
+                               packed("experts.{}.w3.weight", {inter_full, hidden}, 0)},
+                              0),
+                     c.out("gate_up.scale"), kGroup, 1),
+                 pie_loader::raw(PieLoaderDType::BF16))
+            .expect({2 * inter, hidden});
+        group.define("down.weight",
+                     c.scale_per_group(
+                         packed("experts.{}.w2.weight", {down_raw[0], inter_full}, 1),
+                         c.out("down.scale"), kGroup, 1),
+                     pie_loader::raw(PieLoaderDType::BF16))
+            .expect({down_raw[0], inter});
+
+        for (std::uint32_t id : consumed) {
+            b.consume(id);
+        }
+    }
+}
+
 }  // namespace contract_detail
 
 /// DeepSeek-V4.
@@ -301,11 +459,24 @@ inline void dsv4_bf16_expert_stacks(ContractBuilder& b) {
 /// nothing about this family. The choice here is between eager and per-step,
 /// so anything short of an explicit `RoutedDecode` takes the eager path.
 inline void author_deepseek_v4_contract(ContractBuilder& b) {
+    // Ask where the layers are rather than declare it. This family's released
+    // checkpoints name them `layers.<L>.`, not the HF `model.layers.<L>.` the
+    // default assumes, and the two expert passes below select by that prefix --
+    // so with it wrong they matched nothing and the forward pass's packed
+    // fallback quietly covered for them, dequantizing every routed expert on
+    // every layer of every step. That is the failure `decoder_layer_prefix_any_of`
+    // was written for, and the same silence would have hidden it here.
+    b.decoder_layer_prefix_any_of({"model.layers.", "layers."});
     b.shard_axis_fn(contract_detail::dsv4_shard_axis);
     b.decide_mxfp4_moe(b.mxfp4_moe_request() == Mxfp4MoeRequest::RoutedDecode
                            ? Mxfp4MoePolicy::RoutedDecode
                            : Mxfp4MoePolicy::EagerBf16);
-    if (b.mxfp4_moe() == Mxfp4MoePolicy::EagerBf16) {
+    if (b.stream_routed_experts()) {
+        // Streaming and stacking are alternatives, not layers: a stack is one
+        // slab per layer holding every expert, which is exactly the residency
+        // the slab is there to avoid.
+        contract_detail::dsv4_streamed_expert_groups(b);
+    } else if (b.mxfp4_moe() == Mxfp4MoePolicy::EagerBf16) {
         contract_detail::dsv4_bf16_expert_stacks(b);
     }
     contract_detail::dsv4_block_scales_to_fp32(b);

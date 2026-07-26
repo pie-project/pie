@@ -1,5 +1,6 @@
 #include "model/deepseek_v4/deepseek_v4_forward.hpp"
 
+#include "loader/group_stream_cache.hpp"
 #include "model/act_dump.hpp"
 #include "model/stage_hooks.hpp"
 
@@ -1123,7 +1124,19 @@ void dsv4_forward_paged(
         cudaMemsetAsync(ws.moe_out.data(), 0,
                         static_cast<std::size_t>(N) * H * 2, stream);
         const bool stacked = Lw.moe_gate_up_bf16 != nullptr;
-        if (stacked || (!Lw.experts.empty() && Lw.experts[0].w1 != nullptr)) {
+        // Streamed experts take the per-expert path and only that path. The
+        // two device-side fast paths index a stack by `weight_base + e*N*K`,
+        // which is a statement about a slab that holds every expert in routing
+        // order; a slot holds whichever expert was asked for last, so there is
+        // no stride that makes them mean the right thing.
+        //
+        // That path is commented below as correct and slow, and it is, but the
+        // comparison has changed: reading an expert off an SSD costs more than
+        // any dispatch, so what used to be the fallback's penalty is now noise
+        // against the transfer it exists to serve.
+        const bool streamed = Lw.expert_cache != nullptr;
+        if (stacked || streamed ||
+            (!Lw.experts.empty() && Lw.experts[0].w1 != nullptr)) {
             // Either the contract published dense bf16 stacks or it left the
             // experts packed, and exactly one of the two is bound. cuBLAS
             // cannot read the packed form, so the packed path pays a dequant
@@ -1235,6 +1248,18 @@ void dsv4_forward_paged(
             CUDA_CHECK(cudaStreamSynchronize(stream));
 
             const auto routing = build_routing(topk_idx_h, topk_w_h, N, K, E);
+            if (streamed) {
+                // The whole layer's routing is known before any of it runs, and
+                // experts are paged one at a time, so say which ones are wanted
+                // now: the read for the next overlaps the GEMMs for this one.
+                for (int e = 0; e < E; ++e) {
+                    if (routing.token_idx[static_cast<std::size_t>(e)].empty()) {
+                        continue;
+                    }
+                    Lw.expert_cache->prefetch(
+                        Lw.expert_group, static_cast<std::uint32_t>(e));
+                }
+            }
             for (int e = 0; e < E; ++e) {
                 const auto& tok_idx = routing.token_idx[static_cast<std::size_t>(e)];
                 const int Ne = static_cast<int>(tok_idx.size());
@@ -1244,7 +1269,20 @@ void dsv4_forward_paged(
                 const void* w_gate = ws.expert_gate_w.data();
                 const void* w_up   = ws.expert_up_w.data();
                 const void* w_down = ws.expert_down_w.data();
-                if (stacked) {
+                if (streamed) {
+                    // Page it in. The slot comes back holding exactly what the
+                    // stack would have held for this expert -- the group's
+                    // plan is the stack's expression with the expert axis
+                    // removed, so the dequantize already ran on the way in and
+                    // these are bf16 weights, not packed ones.
+                    const WeightStore& slot = Lw.expert_cache->ensure_resident(
+                        Lw.expert_group, static_cast<std::uint32_t>(e), stream);
+                    const auto* gu_e = static_cast<const std::uint16_t*>(
+                        slot.get("gate_up.weight").data());
+                    w_gate = gu_e;
+                    w_up   = gu_e + static_cast<std::size_t>(local_moe_I) * H;
+                    w_down = slot.get("down.weight").data();
+                } else if (stacked) {
                     const auto* gu_e =
                         static_cast<const std::uint16_t*>(Lw.moe_gate_up_bf16->data()) +
                         static_cast<std::size_t>(e) * 2 * local_moe_I * H;
@@ -1315,6 +1353,21 @@ void dsv4_forward_paged(
                     static_cast<const std::int32_t*>(ws.route_idx.data()),
                     static_cast<const float*>(ws.route_w.data()),
                     Ne, H, stream);
+
+                if (streamed) {
+                    // Unpin here rather than at the end of the layer, so that
+                    // the pin covers exactly the launches that read the slot
+                    // and no more. Holding every routed expert of a layer
+                    // pinned at once would make the slab's minimum size the
+                    // number of experts a step happens to route to, which is
+                    // not a number anyone can budget for; this way one slot is
+                    // enough to be correct and more slots only buy hits.
+                    //
+                    // Nothing is racing: these GEMMs are queued on `stream`,
+                    // and a later page-in that wants this slot synchronizes
+                    // `stream` before it writes.
+                    Lw.expert_cache->end_batch();
+                }
             }
             }  // end per-expert fallback
         }

@@ -1069,6 +1069,23 @@ pie_add_cuda_target(test_tp_gate
   LIBS Threads::Threads)
 pie_add_cuda_target(test_grouped_copy
   SOURCES tests/grouped_copy_test.cpp)
+# The eviction rule for streamed group instances. Header-only and CUDA-free on
+# purpose: whether a slab thrashes is decided here, and that must be checkable
+# without a device.
+pie_add_cuda_target(test_group_slot_index
+  SOURCES tests/group_slot_index_test.cpp)
+# The slab itself, against the residency it replaces: needs a device, a
+# checkpoint on disk and the loader, because the claim it checks is about bytes.
+if(PIE_LOADER_STATICLIB)
+  pie_add_cuda_target(test_group_stream_cache
+    SOURCES tests/group_stream_cache_test.cpp
+    INCLUDE_DIRS
+      ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include
+      ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include
+      ${PIE_DRIVER_ABI_INCLUDE_DIR}
+      ${PIE_LOADER_INCLUDE_DIR}
+    LIBS pie_driver_cuda_lib nlohmann_json::nlohmann_json ${PIE_LOADER_STATICLIB} dl pthread)
+endif()
 pie_add_cuda_target(test_nucleus_region
   SOURCES tests/nucleus_region_test.cpp
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR}
