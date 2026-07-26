@@ -200,71 +200,31 @@ async fn main(input: Input) -> Result<String> {
             rng.put(add(&rng_value, iota(2)));
         });
 
+        // The greenlist is keyed on the PREVIOUS OUTPUT token, so the host
+        // cannot supply fire k+1's mask until fire k has settled: this loop is
+        // inherently depth-1. Running ahead would submit fires whose Writer
+        // channel has no published value and fail the fire outright.
         let mut previous = first;
         let budget = input.max_tokens.saturating_sub(generated.len());
         let mut submitted = 0usize;
-        let mut supplied = 0usize;
-        let mut in_flight = 0usize;
 
-        green.put(green_mask(vocab, previous, input.gamma));
-        supplied += 1;
-        decode
-            .submit(&pipeline)
-            .map_err(|e| format!("watermark decode: {e}"))?;
-        submitted += 1;
-        in_flight += 1;
-        while in_flight < DEFAULT_RUNAHEAD_DEPTH && submitted < budget {
+        while submitted < budget {
+            green.put(green_mask(vocab, previous, input.gamma));
             decode
                 .submit(&pipeline)
                 .map_err(|e| format!("watermark decode: {e}"))?;
             submitted += 1;
-            in_flight += 1;
-        }
-        // Budget spent inside the burst: the last submit ends the stream —
-        // finish() right after it (F7).
-
-        let mut stopped = false;
-        while in_flight > 0 {
             let token = token_out
                 .take()
                 .get::<i32>()
                 .await
                 .map_err(|e| format!("read generated token: {e}"))?[0]
                 as u32;
-            in_flight -= 1;
+            previous = token;
             if stop_tokens.contains(&token) {
-                previous = token;
-                stopped = true;
                 break;
             }
             generated.push(token);
-            previous = token;
-
-            if supplied < submitted {
-                green.put(green_mask(vocab, previous, input.gamma));
-                supplied += 1;
-            }
-            if submitted < budget {
-                decode
-                    .submit(&pipeline)
-                    .map_err(|e| format!("watermark decode: {e}"))?;
-                submitted += 1;
-                in_flight += 1;
-            }
-        }
-
-        while stopped && in_flight > 0 {
-            if supplied < submitted {
-                green.put(green_mask(vocab, previous, input.gamma));
-                supplied += 1;
-            }
-            previous = token_out
-                .take()
-                .get::<i32>()
-                .await
-                .map_err(|e| format!("drain watermarked run-ahead token: {e}"))?[0]
-                as u32;
-            in_flight -= 1;
         }
     }
     pipeline.close();

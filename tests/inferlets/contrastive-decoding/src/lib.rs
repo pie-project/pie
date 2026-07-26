@@ -329,19 +329,15 @@ async fn main(input: Input) -> Result<String> {
         expert_token_out.put(&token);
     });
 
+    // No run-ahead is available here: the expert's pick for step k needs the
+    // amateur's logits for step k, and the amateur's input for step k+1 is
+    // that very pick. Every submit is therefore preceded by the host put of
+    // the Writer channel the fire takes.
     let budget = input.max_tokens.saturating_sub(generated.len());
     amateur_token.put(vec![first as i32]);
     amateur_decode
         .submit(&pipeline)
         .map_err(|error| format!("amateur decode: {error}"))?;
-    expert_decode
-        .submit(&pipeline)
-        .map_err(|error| format!("expert decode: {error}"))?;
-    if budget > 1 {
-        amateur_decode
-            .submit(&pipeline)
-            .map_err(|error| format!("amateur decode: {error}"))?;
-    }
 
     for step in 0..budget {
         let amateur_logits = amateur_logits_out
@@ -351,32 +347,22 @@ async fn main(input: Input) -> Result<String> {
             .map_err(|error| format!("read amateur logits: {error}"))?;
 
         expert_amateur.put(amateur_logits);
+        expert_decode
+            .submit(&pipeline)
+            .map_err(|error| format!("expert decode: {error}"))?;
         let token = read_expert_token(&expert_token_out).await?;
         if stop_tokens.contains(&token) {
-            if step + 1 < budget {
-                amateur_token.put(vec![token as i32]);
-                amateur_logits_out
-                    .take()
-                    .get::<f32>()
-                    .await
-                    .map_err(|error| format!("drain amateur run-ahead logits: {error}"))?;
-            }
             break;
         }
         generated.push(token);
         if step + 1 < budget {
             amateur_token.put(vec![token as i32]);
-            expert_decode
+            amateur_decode
                 .submit(&pipeline)
-                .map_err(|error| format!("expert decode: {error}"))?;
-            if step + 2 < budget {
-                amateur_decode
-                    .submit(&pipeline)
-                    .map_err(|error| format!("amateur decode: {error}"))?;
-            }
+                .map_err(|error| format!("amateur decode: {error}"))?;
         }
     }
-    // Every fire, including the run-ahead amateur, was drained above.
+    // Every submitted fire was drained above.
     pipeline.close();
 
     wit_model::decode(&generated)
