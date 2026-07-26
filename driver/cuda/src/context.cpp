@@ -861,9 +861,21 @@ int Context::Impl::load_model(
     case model::Family::Gemma4:
         for (int v : plan_info.per_layer_intermediate)
             max_mlp_intermediate = std::max(max_mlp_intermediate, v);
-        for (int d : plan_info.per_layer_head_dim) {
+        // Gemma-4 varies BOTH the head dim and the KV head count per layer
+        // (full-attention layers can use `num_global_key_value_heads`), so
+        // the K/V staging buffers must be sized from the widest layer's
+        // OWN (kv_heads x head_dim), pairwise. Folding only the per-layer
+        // head dim while taking the KV head count from the model-level
+        // config undersizes `ws.k`/`ws.v` for any layer that is wider than
+        // the config scalar. Sharded, because the forward produces exactly
+        // `layer.num_kv_heads / tp_size` heads into these buffers.
+        for (std::size_t i = 0; i < plan_info.per_layer_head_dim.size(); ++i) {
+            const int d = plan_info.per_layer_head_dim[i];
+            const int kvh = i < plan_info.per_layer_num_kv_heads.size()
+                                ? plan_info.per_layer_num_kv_heads[i] / local_tp_size
+                                : local_kv_heads;
             max_Hq = std::max(max_Hq, local_q_heads * d);
-            max_Hk = std::max(max_Hk, local_kv_heads * d);
+            max_Hk = std::max(max_Hk, kvh * d);
         }
         break;
     case model::Family::Gemma3n:
@@ -881,6 +893,19 @@ int Context::Impl::load_model(
     default:
         break;
     }
+
+    // The KV cache stores only THIS rank's heads, so the per-layer override
+    // must be sharded exactly like the `local_kv_heads` scalar it overrides.
+    // Unsharded, the cache reports a 2x-wide layer to `write_kv_kernel`,
+    // which then strides the (correctly sharded) `ws.k`/`ws.v` staging
+    // buffers by the full width and reads past their end from token
+    // `max_workspace_tokens / tp_size` on. Reads below that point silently
+    // pick up a neighbouring allocation.
+    std::vector<int> gemma4_local_per_layer_kv_heads;
+    gemma4_local_per_layer_kv_heads.reserve(
+        plan_info.per_layer_num_kv_heads.size());
+    for (int kvh : plan_info.per_layer_num_kv_heads)
+        gemma4_local_per_layer_kv_heads.push_back(kvh / local_tp_size);
 
     // Recurrent/linear-attention layer maps come straight from the bound
     // plan's pre-construction surface (populated once at bind time from
@@ -1052,7 +1077,7 @@ int Context::Impl::load_model(
                 local_kv_heads,
                 plan_info.per_layer_head_dim,
                 plan_info.kv_source_layer,
-                plan_info.per_layer_num_kv_heads,
+                gemma4_local_per_layer_kv_heads,
                 kv_format);
         case model::Family::NemotronH:
             return KvCache::allocate(
