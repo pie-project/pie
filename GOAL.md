@@ -612,8 +612,33 @@ and should not be printed beside it: XGrammar keeps an automaton on the host
 and recomputes the token mapping every step, and buying out that recomputation
 is what the memory is for.
 
-**Still unanswered.** End-to-end serving with error bars (q08), grammar cost as
-a fraction of a real forward pass (q09), whether XGrammar can be made to accept
+**The decisive measurement (q09).** Grammar cost as a share of one real decode
+step, Qwen3-0.6B on an A100:
+
+| batch | 1 | 32 | 128 | 512 |
+|---|---|---|---|---|
+| gpugrammar | 0.09% | 0.11% | 0.12% | 0.15% |
+| XGrammar | 0.07% | 0.55% | 1.41% | **4.98%** |
+
+This bounds the entire performance argument. Even at batch 512, deleting
+XGrammar's grammar cost *entirely* would buy 5% end-to-end; at batch 32 it
+would buy 0.55%. A 15x per-step win lands on 4.8% of a step, and the
+withdrawn vLLM throughput claim was noise for exactly this reason - the signal
+was smaller than the run-to-run variance.
+
+It is also the most favourable case that could be measured. A 0.6B model has
+the fastest forward pass available here; a 7B or 70B makes the step slower and
+the grammar share correspondingly smaller.
+
+The conclusion is uncomfortable and has to be stated plainly: **constrained
+decoding overhead is not a bottleneck worth a paper.** A system that eliminates
+it cannot be sold on throughput. What remains defensible is what the same
+measurements did show - that the mask is sound in a way nobody has demonstrated
+before, that properties can arrive in any order without giving up `required`,
+and that the cost of getting there is a compiler 5x slower and a megabyte of
+device memory per schema.
+
+**Still unanswered.** End-to-end serving with error bars (q08), whether XGrammar can be made to accept
 any property order (q06), non-JSON grammars (q07), speculative decoding in a
 serving path (q13), depth scaling (q14), llguidance and outlines as baselines
 (q19), and the per-mechanism ablation (q20).
