@@ -285,11 +285,26 @@ pub fn lookup(hash: u64) -> Option<Arc<RegisteredProgram>> {
 /// conservative until the model surfaces them).
 pub fn model_profile() -> ModelProfile {
     let m = pie_model::model();
-    let ptir = m.ptir_caps();
+    profile_from(
+        m.vocab_size(),
+        crate::store::registry::get(0, 0).kv_page_size,
+        m.num_layers(),
+        m.ptir_caps(),
+    )
+}
+
+/// The pure caps -> profile mapping, split out so it is testable without a
+/// registered model.
+fn profile_from(
+    vocab: u32,
+    page_size: u32,
+    num_layers: u32,
+    ptir: pie_model::PtirCaps,
+) -> ModelProfile {
     ModelProfile {
-        vocab: m.vocab_size(),
-        page_size: crate::store::registry::get(0, 0).kv_page_size,
-        num_layers: m.num_layers(),
+        vocab,
+        page_size,
+        num_layers,
         activation: pie_ptir::types::DType::F32,
         has_mtp_logits: ptir.has_mtp_logits,
         has_mtp_drafts: ptir.has_mtp_drafts,
@@ -406,6 +421,81 @@ mod tests {
         }
     }
 
+    /// The greedy pass plus a Quest attention tap: per layer, score this
+    /// request's pages with `envelope_dot(query)` and publish the scores to a
+    /// host-read channel. Deliberately stops short of the `attn_page_mask`
+    /// sink — that consumer is not executable yet, and the point here is the
+    /// bind-time availability of the KERNEL.
+    fn quest_tap(vocab: u32, pages: u32) -> TraceContainer {
+        let mut container = greedy(vocab);
+        container.names = vec!["envelope_dot".to_string()];
+        container.channels.push(chan(
+            Shape::vector(pages),
+            DType::F32,
+            HostRole::Reader,
+            false,
+        ));
+        container.stages.insert(
+            0,
+            StageProgram {
+                stage: Stage::OnAttnProj,
+                ops: vec![
+                    Op::IntrinsicVal {
+                        intr: IntrinsicId::Query,
+                        shape: Shape::vector(pages),
+                        dtype: DType::F32,
+                    },
+                    Op::KernelCall {
+                        name: 0,
+                        args: vec![0],
+                        shape: Shape::vector(pages),
+                        dtype: DType::F32,
+                    },
+                    Op::ChanPut { chan: 2, value: 1 },
+                ],
+            },
+        );
+        container
+    }
+
+    #[test]
+    fn quest_tap_binds_only_against_a_backend_with_kv_envelopes() {
+        let caps = |has: bool| pie_model::PtirCaps {
+            has_mtp_logits: false,
+            has_mtp_drafts: false,
+            has_value_head: false,
+            has_kv_envelopes: has,
+        };
+        let bytes = quest_tap(VOCAB, 4).encode();
+
+        // Without the capability the profile advertises no kernel, and bind is
+        // where that has to be caught: a program that reaches the driver
+        // naming a kernel it cannot launch would fail mid-fire instead.
+        let mut registry = reg(2);
+        let refused = registry.register(
+            bytes.clone(),
+            &ModelProfile {
+                vocab: VOCAB,
+                ..profile_from(VOCAB, 16, 4, caps(false))
+            },
+        );
+        assert!(
+            refused.is_err(),
+            "envelope_dot must be unavailable without has_kv_envelopes"
+        );
+
+        let mut registry = reg(2);
+        registry
+            .register(
+                bytes,
+                &ModelProfile {
+                    vocab: VOCAB,
+                    ..profile_from(VOCAB, 16, 4, caps(true))
+                },
+            )
+            .expect("quest tap must bind against a backend with kv envelopes");
+    }
+
     fn reg(cap: usize) -> Registry {
         Registry::new(NonZeroUsize::new(cap).unwrap())
     }
@@ -460,6 +550,34 @@ mod tests {
         assert!(!program.bound.profile.has_mtp_logits);
         assert!(program.bound.profile.has_mtp_drafts);
         assert!(!program.bound.profile.has_value_head);
+    }
+
+    #[test]
+    fn kv_envelope_capability_gates_the_envelope_dot_kernel() {
+        let caps = |has: bool| pie_model::PtirCaps {
+            has_mtp_logits: false,
+            has_mtp_drafts: false,
+            has_value_head: false,
+            has_kv_envelopes: has,
+        };
+        // A backend that cannot honour the envelope contract must advertise NO
+        // second-party kernel, so a Quest program fails to bind rather than
+        // reaching a driver that would refuse it mid-fire.
+        assert!(profile_from(VOCAB, 16, 4, caps(false)).kernels.is_empty());
+
+        let advertised = profile_from(VOCAB, 16, 4, caps(true));
+        let kernel = advertised
+            .kernel("envelope_dot")
+            .expect("envelope_dot must be advertised when the backend has envelopes");
+        assert!(
+            kernel.replayable,
+            "envelope_dot is a pure function of the query and the page \
+             envelopes, so re-running a fire must reproduce it"
+        );
+        assert!(
+            kernel.sink_scope.is_none(),
+            "envelope_dot produces a value; it consumes no attention effect"
+        );
     }
 
     #[test]
