@@ -364,6 +364,7 @@ inline bool map_intrinsic(std::uint16_t intr, Intrinsic& out) {
         case PTIR_INTR_VALUE_HEAD: out = Intrinsic::ValueHead; return true;
         case PTIR_INTR_LAYER: out = Intrinsic::Layer; return true;
         case PTIR_INTR_MTP_DRAFTS: out = Intrinsic::MtpDrafts; return true;
+        case PTIR_INTR_ATTN_SCORE: out = Intrinsic::AttnScore; return true;
         default: return false;
     }
 }
@@ -381,6 +382,7 @@ inline TranslateResult container_to_trace(const container::Container& c, const B
     if (c.hash != b.container_hash) return fail("sidecar container_hash mismatch");
 
     Trace& t = r.trace;
+    t.names = c.names;
     for (const container::CChannel& ch : c.channels) {
         Channel out;
         out.id = (ChannelId)t.channels.size();
@@ -450,10 +452,60 @@ inline TranslateResult container_to_trace(const container::Container& c, const B
                     stage.puts.push_back({(ChannelId)op.chan, gid(op.args[0])});
                     break;   // defines 0 ids
                 }
-                case PTIR_OP_SINK_CALL:
-                    break;   // no result; tier-0 without kernels ignores the sink effect
-                case PTIR_OP_KERNEL_CALL:
-                    return fail("kernel_call needs a second-party kernel (not tier-0 executable)");
+                case PTIR_OP_SINK_CALL: {
+                    // Defines 0 ids, but it is NOT free to drop: the sink is
+                    // how a mask value reaches the forward pass, so dropping it
+                    // here would silently turn a program that configures
+                    // attention into one that does not. Carry it through and
+                    // let the backend decide, exactly as for KernelCall — a
+                    // host with no sinks refuses at bind (`dispatch.cu`), and
+                    // tier-0's `launch_op` has no arm for the tag.
+                    //
+                    // The name index rides in `imm`; `Trace::names` resolves it.
+                    if (op.name_idx >= c.names.size()) {
+                        return fail("sink_call names an out-of-range sink");
+                    }
+                    Op o;
+                    o.code = OpCode::SinkCall;
+                    o.result_count = 0;
+                    o.imm = op.name_idx;
+                    for (std::uint32_t a : op.args) o.args.push_back(gid(a));
+                    stage.ops.push_back(std::move(o));
+                    break;
+                }
+                case PTIR_OP_KERNEL_CALL: {
+                    // A second-party kernel is opaque to this lowering: it
+                    // defines one SSA id of a declared type and names a kernel
+                    // the *backend* may or may not be able to launch. Carry it
+                    // through rather than rejecting it here — refusing at
+                    // lowering time makes the program undecodable, so a backend
+                    // that CAN launch the kernel never gets to see it. Hosts
+                    // that cannot fault at execution instead: tier-0's
+                    // `launch_op` has no arm for the tag and reports
+                    // "tier-0 uncovered op/dtype: kernel_call".
+                    //
+                    // The name index lives in `imm` (the `Op` record predates
+                    // named ops and has no name field); `Trace::names` resolves
+                    // it.
+                    if (op.name_idx >= c.names.size()) {
+                        return fail("kernel_call names an out-of-range kernel");
+                    }
+                    Op o;
+                    o.code = OpCode::KernelCall;
+                    o.result_type = ty(local);
+                    o.result_id = gid(local);
+                    o.result_count = 1;
+                    o.imm = op.name_idx;
+                    for (std::uint32_t a : op.args) o.args.push_back(gid(a));
+                    stage.ops.push_back(std::move(o));
+                    Value v;
+                    v.id = gid(local);
+                    v.type = ty(local);
+                    v.source = ValueSource::OpResult;
+                    t.values.push_back(v);
+                    local += 1;
+                    break;
+                }
                 default: {
                     // A compute op — its OpCode byte IS the tag (op_table mirrors ptir_abi).
                     if (!op_is_known(code)) return fail("unknown op tag in stage body");

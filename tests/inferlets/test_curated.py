@@ -11,8 +11,17 @@ sampling, the reported divergence must be exactly zero.
 """
 
 import json
+import os
 
-from conftest import run_inferlet, run_tests
+# `quest-attention` needs the per-page key envelopes, which are an operator
+# opt-in because they cost `2/page_size` of the KV pool and have to be
+# allocated with the pages (driver/cuda/src/store/kv_cache.cpp). Set it before
+# the engine boots — the driver reads it while sizing the cache. Enabling it
+# for the whole run is deliberate: it also proves the envelope maintenance that
+# now rides every KV append does not perturb the other inferlets.
+os.environ.setdefault("PIE_CUDA_KV_ENVELOPES", "1")
+
+from conftest import run_inferlet, run_tests  # noqa: E402
 
 
 async def _nonempty(client, args, name: str, inputs: dict) -> str:
@@ -414,6 +423,92 @@ async def test_token_healing(client, args):
     assert report["prefix_candidates"] >= 1, report
 
 
+# Long enough to fill several pages, so the tap has something to rank. The
+# answer sits in the FIRST page, which is what makes the score meaningful:
+# Quest must rank that page above the filler that follows it.
+_QUEST_PROMPT = (
+    "The capital of France is Paris. "
+    + "Paris is a large European city with a long history. " * 24
+)
+
+
+async def test_quest_attention(client, args):
+    report = await _report(
+        client, args, "quest-attention",
+        {"prompt": _QUEST_PROMPT, "max_tokens": 8, "page_budget": 4},
+    )
+    # The tap has to fire once per layer, on every layer.
+    assert report["layers_observed"] > 0, report
+    # Every page the request has already filled must carry a real bound. Only
+    # the in-flight last page is allowed to be pinned (+inf, "always keep"),
+    # and nothing may be NaN or missing.
+    assert report["pages_finite"] == report["max_pages"] - 1, report
+    assert report["pages_pinned"] == 1, report
+    assert report["pages_absent"] == 0, report
+    assert report["pages_nan"] == 0, report
+    # The budget must be honoured and the in-flight page force-kept.
+    assert len(report["kept_pages"]) == report["page_budget"], report
+    assert report["max_pages"] - 1 in report["kept_pages"], report
+    # The criticality bound must actually discriminate: the page holding the
+    # answer outranks the repeated filler.
+    scores = [float(s) for s in report["page_scores"][:-1]]
+    assert scores[0] == max(scores), report
+
+
+_TOVA_PROMPT = (
+    "The capital of France is Paris. "
+    + "Paris is a large European city with a long history. " * 8
+)
+
+
+async def test_tova_attention(client, args):
+    report = await _report(
+        client, args, "tova-attention",
+        {"prompt": _TOVA_PROMPT, "max_tokens": 8, "cache_size": 16},
+    )
+    # The tap has to fire once per layer, on every layer.
+    assert report["layers_observed"] > 0, report
+    # Every live KV position must carry a finite, non-negative probability, and
+    # every slot past the live length must be EXACTLY zero.
+    assert report["live_scored"] == report["kv_len"], report
+    assert report["tail_nonzero"] == 0, report
+    assert report["scores_nan"] == 0, report
+    # The row must describe the positions the program THINKS it describes. The
+    # host-side page CSR the driver hands a model body is allowed to be a
+    # conservative upper bound (graph-lattice padding, the decode-envelope KV
+    # bound), while the device CSR the attention kernel reads is exact. If the
+    # capture ever sizes itself off the bound without zeroing the slack, the
+    # tail of the row is live garbage — and because it is garbage rather than
+    # absence, an eviction policy keeps a position that does not exist and
+    # drops a real one. This ran clean for the first few fires and only then
+    # diverged, so it is checked on EVERY fire, not just the last.
+    for declared, observed in report["trace"]:
+        assert declared == observed, report
+    # Each layer contributes a softmax distribution over the live prefix, so
+    # the folded row must sum to exactly the number of layers observed. This is
+    # what makes the drained row self-validating: it fails if the capture is
+    # mis-normalized, mis-strided, or truncated.
+    assert abs(report["score_mass"] - report["layers_observed"]) < 0.05, report
+    # The keep-set is well formed and honours the budget.
+    assert len(report["kept_positions"]) == min(
+        report["cache_size"], report["kv_len"]), report
+    assert len(set(report["kept_positions"])) == len(
+        report["kept_positions"]), report
+    assert max(report["kept_positions"]) < report["kv_len"], report
+    assert report["evicted_first"] is not None, report
+    assert report["evicted_first"] not in report["kept_positions"], report
+    # The scores must DISCRIMINATE, not merely be well formed. A uniform row
+    # would satisfy every check above. TOVA on a real model reliably keeps two
+    # things: the attention sink at the start of the sequence, and a recency
+    # window at the end. Requiring both is what separates "the plumbing works"
+    # from "the plumbing carries the signal the algorithm needs".
+    kept = set(report["kept_positions"])
+    assert 0 in kept, report
+    assert any(p >= report["kv_len"] - 4 for p in kept), report
+    # ...and it must drop something in the middle, or it is not a policy.
+    assert 4 < report["evicted_first"] < report["kv_len"] - 4, report
+
+
 async def test_naive_baseline(client, args):
     report = await _report(client, args, "naive-baseline", {"max_tokens": 4})
     assert report["sampler"] == "naive-baseline", report
@@ -472,6 +567,8 @@ def tests():
         test_asap_grammar_aligned_decoding,
         test_token_healing,
         test_naive_baseline,
+        test_quest_attention,
+        test_tova_attention,
     ]
 
 

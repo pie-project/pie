@@ -338,6 +338,15 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument(
+        "--warmup-seconds",
+        type=float,
+        default=0.0,
+        help="Keep repeating the warmup set until this much wall time has "
+             "elapsed, on top of --warmup. Off by default: on this hardware "
+             "the run-to-run spread came from CPU pinning, not from a short "
+             "warmup, and a longer warmup did not reduce it.",
+    )
+    p.add_argument(
         "--warmup-max-tokens",
         type=int,
         default=None,
@@ -368,6 +377,15 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--request-timeout", type=float, default=300.0)
     p.add_argument("--tp-size", type=int, default=1)
     p.add_argument(
+        "--dp-size",
+        type=int,
+        default=1,
+        help="Data-parallel replicas. Each replica is its own tp-size-wide "
+             "shard group, so the run occupies tp_size * dp_size devices. "
+             "PIE derives this from the device list (world_size / tp_size); "
+             "vLLM takes it as data_parallel_size.",
+    )
+    p.add_argument(
         "--cpu-affinity",
         default="auto",
         help="CPU affinity for the benchmark process. Use 'auto' to pin to "
@@ -389,6 +407,72 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
              "WASM work — useful for measuring the wall-clock benefit "
              "of async chain firing on W>0 workloads. Default 0.",
     )
+
+
+def gpu_clock_state() -> list[dict[str, Any]]:
+    """Per-GPU SM clock and utilization, or [] when nvidia-smi is unavailable.
+
+    Recorded on both sides of the measured window so a run that executed at
+    a partially-ramped clock is visible in the result instead of silently
+    reading low.
+    """
+    try:
+        out = subprocess.run(
+            ["nvidia-smi",
+             "--query-gpu=index,clocks.sm,clocks.max.sm,utilization.gpu",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5, check=True).stdout
+    except Exception:
+        return []
+    state = []
+    for line in out.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) != 4:
+            continue
+        try:
+            state.append({
+                "index": int(parts[0]),
+                "sm_mhz": int(parts[1]),
+                "sm_max_mhz": int(parts[2]),
+                "util_pct": int(parts[3]),
+            })
+        except ValueError:
+            continue
+    return state
+
+
+async def run_timed_warmup(run_once, seconds: float, label: str = "pie") -> int:
+    """Repeat `run_once()` until `seconds` of wall time have elapsed.
+
+    Returns the number of extra passes performed. `run_once` is an async
+    callable that issues one full warmup set. Disabled (0) by default.
+    """
+    if seconds <= 0:
+        return 0
+    import time as _time
+    start = _time.monotonic()
+    passes = 0
+    while _time.monotonic() - start < seconds:
+        await run_once()
+        passes += 1
+    print(f"[{label}-bench] warmup: {passes} extra pass(es) over "
+          f"{_time.monotonic() - start:.1f}s", flush=True)
+    return passes
+
+
+def run_timed_warmup_sync(run_once, seconds: float, label: str = "vllm") -> int:
+    """Blocking counterpart of `run_timed_warmup`."""
+    if seconds <= 0:
+        return 0
+    import time as _time
+    start = _time.monotonic()
+    passes = 0
+    while _time.monotonic() - start < seconds:
+        run_once()
+        passes += 1
+    print(f"[{label}-bench] warmup: {passes} extra pass(es) over "
+          f"{_time.monotonic() - start:.1f}s", flush=True)
+    return passes
 
 
 def _filler_words(count: int) -> str:
@@ -437,20 +521,36 @@ def make_prompts(args: argparse.Namespace, n: int) -> list[str]:
     return [args.prompt for _ in range(n)]
 
 
+def _render_chat(tok, system: str, prompts: list[str]) -> list[str]:
+    """Chat-render `prompts`, falling back to plain text when the tokenizer
+    ships no chat template.
+
+    Some checkpoints (gemma-4-E4B) have no `chat_template`, and
+    `apply_chat_template` then raises. PIE tokenizes prompts itself and was
+    unaffected, but vLLM went through this path and failed outright, which made
+    the model impossible to compare. Both engines get the same rendered string
+    either way, so the comparison stays honest.
+    """
+    if getattr(tok, "chat_template", None):
+        return [
+            tok.apply_chat_template(
+                [{"role": "system", "content": system},
+                 {"role": "user", "content": p}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            for p in prompts
+        ]
+    return [f"{system}\n\n{p}" if system else p for p in prompts]
+
+
 def hf_chat_prompts_and_counts(
     model: str, system: str, prompts: list[str]
 ) -> tuple[list[str], list[int]]:
     from transformers import AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
-    rendered = [
-        tok.apply_chat_template(
-            [{"role": "system", "content": system}, {"role": "user", "content": p}],
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        for p in prompts
-    ]
+    rendered = _render_chat(tok, system, prompts)
     counts = [len(tok.encode(p, add_special_tokens=False)) for p in rendered]
     return rendered, counts
 
@@ -460,14 +560,7 @@ def hf_chat_token_ids_and_counts(
 ) -> tuple[list[list[int]], list[int]]:
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
-    rendered = [
-        tok.apply_chat_template(
-            [{"role": "system", "content": system}, {"role": "user", "content": p}],
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        for p in prompts
-    ]
+    rendered = _render_chat(tok, system, prompts)
     token_ids = [tok.encode(p, add_special_tokens=False) for p in rendered]
     return token_ids, [len(ids) for ids in token_ids]
 
@@ -481,6 +574,22 @@ def finish(summary: BenchSummary, results: list[RequestResult], json_out: str | 
 
 def _load_cudart():
     candidates = []
+    if override := os.environ.get("CUDART_LIBRARY"):
+        candidates.append(override)
+    for env_name in ("CUDA_HOME", "CUDA_PATH"):
+        if cuda_root := os.environ.get(env_name):
+            candidates.extend(
+                (
+                    str(Path(cuda_root) / "lib64" / "libcudart.so"),
+                    str(
+                        Path(cuda_root)
+                        / "targets"
+                        / "x86_64-linux"
+                        / "lib"
+                        / "libcudart.so"
+                    ),
+                )
+            )
     found = ctypes.util.find_library("cudart")
     if found:
         candidates.append(found)
@@ -549,8 +658,27 @@ def _format_cpu_list(cpus: set[int]) -> str:
     return ",".join(ranges)
 
 
+def _numa_node_cpus(node: int) -> set[int]:
+    try:
+        text = Path(
+            f"/sys/devices/system/node/node{node}/cpulist").read_text()
+    except OSError:
+        return set()
+    return _parse_cpu_list(text.strip())
+
+
 def gpu_local_cpu_affinity(gpu_ids: list[int]) -> set[int]:
-    """Return the union of CPU-affinity masks reported by `nvidia-smi topo -m`."""
+    """CPUs local to `gpu_ids`, preferring the GPU's whole NUMA node.
+
+    `nvidia-smi topo -m` has a "CPU Affinity" column, but on some hosts it
+    reports only a handful of cores (six, on a 64-core-per-node Xeon) while the
+    GPU's actual NUMA node holds far more. Pinning the whole benchmark — client,
+    engine, tokio workers and every concurrent inferlet — onto that short list
+    starves the host-side loop and leaves the GPU idle between batches: measured
+    here as a 1.8x drop in median throughput and a 2.1x run-to-run spread versus
+    the same run unpinned. So prefer the NUMA node's full CPU list and fall back
+    to the topology column only when the node is unknown.
+    """
     if not gpu_ids:
         return set()
     try:
@@ -568,18 +696,33 @@ def gpu_local_cpu_affinity(gpu_ids: list[int]) -> set[int]:
     header = lines[0].split()
     gpu_cols = sum(1 for tok in header if re.fullmatch(r"(?:GPU|NIC)\d+", tok))
     affinity_by_gpu: dict[int, set[int]] = {}
+    numa_by_gpu: dict[int, int] = {}
     for line in lines[1:]:
         toks = line.split()
         if len(toks) <= gpu_cols + 1 or not re.fullmatch(r"GPU\d+", toks[0]):
             continue
-        affinity_by_gpu[int(toks[0][3:])] = _parse_cpu_list(toks[1 + gpu_cols])
+        gpu = int(toks[0][3:])
+        affinity_by_gpu[gpu] = _parse_cpu_list(toks[1 + gpu_cols])
+        if len(toks) > gpu_cols + 2:
+            try:
+                numa_by_gpu[gpu] = int(toks[2 + gpu_cols])
+            except ValueError:
+                pass
     cpus: set[int] = set()
     for gpu in gpu_ids:
-        cpus.update(affinity_by_gpu.get(gpu, set()))
+        node = numa_by_gpu.get(gpu)
+        node_cpus = _numa_node_cpus(node) if node is not None else set()
+        cpus.update(node_cpus or affinity_by_gpu.get(gpu, set()))
+    # Never widen past what this process is actually allowed to run on.
+    if hasattr(os, "sched_getaffinity"):
+        cpus &= set(os.sched_getaffinity(0))
     return cpus
 
 
-def visible_cuda_devices(tp_size: int) -> list[int]:
+def visible_cuda_devices(tp_size: int, dp_size: int = 1) -> list[int]:
+    # A run occupies one device per rank: tp_size ranks per replica,
+    # dp_size replicas.
+    world = max(1, tp_size) * max(1, dp_size)
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     if visible:
         ids: list[int] = []
@@ -588,8 +731,8 @@ def visible_cuda_devices(tp_size: int) -> list[int]:
             if item.isdigit():
                 ids.append(int(item))
         if ids:
-            return ids[: max(1, tp_size)]
-    return list(range(max(1, tp_size)))
+            return ids[:world]
+    return list(range(world))
 
 
 def maybe_set_cpu_affinity(args: argparse.Namespace, gpu_ids: list[int]) -> str | None:

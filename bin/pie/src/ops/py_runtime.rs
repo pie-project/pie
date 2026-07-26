@@ -20,7 +20,7 @@ const RUNTIME_URL: &str =
 
 /// Where the host loader expects to find the runtime tree.
 pub fn runtime_dir() -> PathBuf {
-    bootstrap::paths::pie_home().join("py-runtime")
+    startup::paths::pie_home().join("py-runtime")
 }
 
 /// Sentinel file the host loader links against. Its presence is what
@@ -49,7 +49,7 @@ pub fn ensure_installed(quiet: bool) -> Result<PathBuf> {
         return Ok(dir);
     }
 
-    let pie_home = bootstrap::paths::pie_home();
+    let pie_home = startup::paths::pie_home();
     std::fs::create_dir_all(&pie_home).map_err(|e| anyhow!("create {pie_home:?}: {e}"))?;
 
     if !quiet {

@@ -5,6 +5,7 @@
 #include <stdexcept>
 
 #include <nlohmann/json.hpp>
+#include "kernels_manifest.hpp"
 #include "model/hf_config_json.hpp"
 
 namespace pie_cuda_driver {
@@ -97,18 +98,10 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
         cfg.head_dim = cfg.qk_nope_head_dim + cfg.qk_rope_head_dim;
     }
 
-    // Round head_dim up to the nearest flashinfer-supported dispatch
-    // value for kernel bookkeeping. Models in our supported set hit
-    // this path only for Phi-3-mini (96 → 128); everything else maps
-    // identically (64, 128, 256, 512).
-    auto round_up_head_dim = [](int hd) {
-        if (hd <= 64)   return 64;
-        if (hd <= 128)  return 128;
-        if (hd <= 256)  return 256;
-        if (hd <= 512)  return 512;
-        return hd;   // unsupported, but let the dispatch error surface
-    };
-    cfg.head_dim_kernel = round_up_head_dim(cfg.head_dim);
+    // Round head_dim up to the nearest instantiated dispatch value for
+    // kernel bookkeeping (kernels.def). Models in our supported set hit this
+    // path only for Phi-3-mini (96 → 128); everything else maps identically.
+    cfg.head_dim_kernel = round_up_attn_head_dim(cfg.head_dim);
     cfg.vocab_size               = require<int>(j, "vocab_size", path_str);
     cfg.max_position_embeddings  = require<int>(j, "max_position_embeddings", path_str);
 

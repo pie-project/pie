@@ -23,11 +23,13 @@ from common import (
     cuda_profiler_start,
     cuda_profiler_stop,
     finish,
+    gpu_clock_state,
     hf_chat_token_ids_and_counts,
     make_prompts,
     maybe_set_cpu_affinity,
     request_max_tokens,
     resolve_local_model,
+    run_timed_warmup,
     summarize,
     visible_cuda_devices,
 )
@@ -76,6 +78,9 @@ def reconstruct_token_arrivals(
             f"token timing count is {len(arrivals)}, expected {output_tokens}"
         )
     return arrivals
+
+
+PIE_BENCH_DEFAULT_DEVICE = "cuda:0"
 
 
 def bench_inferlet_paths(inferlet_dir: str | None) -> tuple[Path, Path, str]:
@@ -195,6 +200,12 @@ def build_config(args: argparse.Namespace):
         TelemetryConfig,
     )
 
+    # One device per TP rank. Data parallelism is NOT an engine shape — a
+    # worker serves one replica — so `--dp-size` spawns workers (see
+    # `run_data_parallel`) and never widens this list. An explicit
+    # `--device` still wins.
+    if args.device == PIE_BENCH_DEFAULT_DEVICE and args.tp_size > 1:
+        args.device = ",".join(f"cuda:{i}" for i in range(args.tp_size))
     device = [d.strip() for d in args.device.split(",")] if "," in args.device else [args.device]
     driver_options: dict[str, Any]
     if args.driver == "cuda_native":
@@ -287,12 +298,14 @@ def build_config(args: argparse.Namespace):
     else:
         driver_options = {}
 
-    # Concurrency 0 means "no admission cap" (all submitted inferlets run wasm
-    # immediately; the inference scheduler still caps via max_forward_requests).
+    # Concurrency 0 means "no explicit cap": the engine then defaults its
+    # admission cap to the driver's max_forward_requests (R). Admitting more
+    # than R processes cannot widen a batch (one fire per process per forward),
+    # it only makes batches ragged -- see bootstrap.rs.
     if args.mode == "latency":
         max_concurrent_processes: int | None = 1
     elif args.concurrency == 0:
-        max_concurrent_processes = None  # serializer drops field → unlimited
+        max_concurrent_processes = None  # serializer drops field → engine default
     else:
         max_concurrent_processes = args.concurrency
     requested_scheduler_kwargs = {
@@ -346,6 +359,7 @@ def build_config(args: argparse.Namespace):
         config_blob["speculation depth"] = args.speculation_depth
     if args.warmup_max_tokens is not None:
         config_blob["warmup max tokens"] = args.warmup_max_tokens
+    config_blob["warmup seconds"] = args.warmup_seconds
     return cfg, config_blob
 
 
@@ -530,7 +544,8 @@ async def run(args: argparse.Namespace):
 
     # Pin to GPU-local CPUs before the server spawns so the pie serve
     # subprocess inherits the affinity mask (mirrors vllm/sglang benches).
-    cpu_affinity = maybe_set_cpu_affinity(args, visible_cuda_devices(args.tp_size))
+    cpu_affinity = maybe_set_cpu_affinity(
+        args, visible_cuda_devices(args.tp_size, args.dp_size))
 
     n = args.requests if args.mode == "latency" else args.num_requests
     prompts = make_prompts(args, n + args.warmup)
@@ -845,11 +860,19 @@ async def run(args: argparse.Namespace):
 
         if args.warmup:
             warmup_max_tokens = args.warmup_max_tokens or args.max_tokens
-            if args.mode == "tput":
-                await many(range(args.warmup), max_tokens=warmup_max_tokens)
-            else:
-                for i in range(args.warmup):
-                    await one(i, max_tokens=warmup_max_tokens)
+
+            async def warmup_pass() -> None:
+                if args.mode == "tput":
+                    await many(range(args.warmup), max_tokens=warmup_max_tokens)
+                else:
+                    for i in range(args.warmup):
+                        await one(i, max_tokens=warmup_max_tokens)
+
+            await warmup_pass()
+            # Optional duration-based extension of the warmup (off by
+            # default); see --warmup-seconds.
+            await run_timed_warmup(
+                warmup_pass, args.warmup_seconds, label="pie")
 
         start_idx = args.warmup
         # Snapshot cumulative stats after warmup so the final diff
@@ -861,6 +884,7 @@ async def run(args: argparse.Namespace):
                 pre_stats = json.loads(body)
         except Exception:
             pass
+        clocks_at_start = gpu_clock_state()
         print("[pie-bench] measured-start", flush=True)
         profiler_task = None
         if (
@@ -905,6 +929,7 @@ async def run(args: argparse.Namespace):
                     profiler_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await profiler_task
+            clocks_at_end = gpu_clock_state()
             print("[pie-bench] measured-end", flush=True)
         for result in results:
             if result.process_id is not None:
@@ -1120,6 +1145,11 @@ async def run(args: argparse.Namespace):
                 else {}
             ),
             "cpu affinity": cpu_affinity,
+            # Clock state on both edges of the measured window. A run that
+            # started mid-ramp reads far below steady state, so record it
+            # rather than let it silently skew the numbers.
+            "gpu clocks at start": clocks_at_start,
+            "gpu clocks at end": clocks_at_end,
             **engine_config,
         },
     )
@@ -1136,7 +1166,7 @@ def build_parser() -> argparse.ArgumentParser:
             help="Path to a built text-completion-bench inferlet project "
                  "(or set PIE_BENCH_INFERLET_DIR).",
         )
-        sp.add_argument("--device", default="cuda:0")
+        sp.add_argument("--device", default=PIE_BENCH_DEFAULT_DEVICE)
         sp.add_argument("--driver", default="cuda_native",
                         choices=["cuda_native", "vllm", "sglang", "tensorrt_llm", "dummy"])
         sp.add_argument("--default-token-limit", type=int, default=200_000)
@@ -1295,9 +1325,91 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def run_data_parallel(args):
+    """Fan the request set out over `dp_size` single-replica workers.
+
+    A replica is a worker, not a driver inside one engine, so measuring DP
+    means running that many engines. Each child gets its own slice of the
+    devices through CUDA_VISIBLE_DEVICES and its own server port. Wall
+    clock is the slowest child's own measured window — they run
+    concurrently, so that is the wall the merged request set saw, and it
+    excludes the minutes each spends loading weights.
+
+    This mirrors `vllm_bench.run_data_parallel` exactly, so both engines
+    are measured the same way.
+    """
+    import subprocess
+    import tempfile
+
+    total = args.requests if args.mode == "latency" else args.num_requests
+    per = [total // args.dp_size] * args.dp_size
+    for i in range(total % args.dp_size):
+        per[i] += 1
+
+    rewritten = {"--dp-size", "--json-out", "--requests", "--num-requests",
+                 "--device"}
+    forwarded, skip_next = [], False
+    for token in sys.argv[1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        if token in rewritten:
+            skip_next = True
+            continue
+        if any(token.startswith(f"{flag}=") for flag in rewritten):
+            continue
+        forwarded.append(token)
+
+    procs, outs = [], []
+    tmpdir = tempfile.mkdtemp(prefix="pie-dp-")
+    for replica, count in enumerate(per):
+        if count == 0:
+            continue
+        devices = ",".join(
+            str(replica * args.tp_size + i) for i in range(args.tp_size))
+        out = os.path.join(tmpdir, f"replica{replica}.json")
+        outs.append(out)
+        # `forwarded` already carries the mode: it is argv[1].
+        argv = [sys.executable, os.path.abspath(__file__),
+                *forwarded, "--json-out", out]
+        argv += (["--requests", str(count)] if args.mode == "latency"
+                 else ["--num-requests", str(count)])
+        env = {**os.environ, "CUDA_VISIBLE_DEVICES": devices}
+        procs.append(subprocess.Popen(argv, env=env))
+    failures = [p.wait() for p in procs]
+    if any(rc != 0 for rc in failures):
+        raise RuntimeError(f"pie data-parallel replica failed: {failures}")
+
+    merged: list = []
+    wall = 0.0
+    for path in outs:
+        with open(path) as fh:
+            payload = json.load(fh)
+        wall = max(wall, float(payload["summary"]["wall_s"]))
+        for record in payload["requests"]:
+            merged.append(RequestResult(**record))
+    summary = summarize(
+        mode=args.mode,
+        engine="pie",
+        model=args.model,
+        results=merged,
+        wall_s=wall,
+        config={
+            "data_parallel_size": args.dp_size,
+            "tensor_parallel_size": args.tp_size,
+            "dp_replica_requests": per,
+            "max_tokens": args.max_tokens,
+        },
+    )
+    return summary, merged
+
+
 def main() -> None:
     args = build_parser().parse_args()
-    summary, results = asyncio.run(run(args))
+    if args.dp_size > 1:
+        summary, results = run_data_parallel(args)
+    else:
+        summary, results = asyncio.run(run(args))
     finish(summary, results, args.json_out)
 
 

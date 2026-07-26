@@ -1000,15 +1000,49 @@ practical counterpart of its distortion-freeness.
 
 ### A10 is bimodal
 
-`synthid-tournament-sampling` at a 160-token budget returned 1.50, 1.55 and
-6.19 s across sessions — two clearly separated modes, roughly 4× apart, with no
-input difference. The 33.55 ms/token above is the median of seven consecutive
-runs in the slow mode and should be read as an upper bound. The fast mode's
-slope is ≈2.4 ms/token. Nine sequential knockout rounds make this the deepest
-epilogue in the set, and the split most likely reflects a driver-side scheduling
-or pool interaction rather than the algorithm. It remains unexplained: the
-barrier cost model that accounts for every other inferlet's slope does not
-predict a 4× split with no input difference.
+`synthid-tournament-sampling` at a 160-token budget returns either ~1.3 s or
+~5–6 s. The 33.55 ms/token above is a slow-mode figure and should be read as an
+upper bound; the fast mode's slope is ≈2.4 ms/token, which is the honest cost.
+
+The split was originally recorded as varying *across sessions*. It does not: a
+run of six consecutive calls inside one process alternates between the modes
+(6225, 1294, 5874, 5599, 4982, 1383 ms). The apparent session-stability was the
+NVRTC disk cache — a first-ever plan shape pays a 12–31 s compile, which
+dominated whatever came after it.
+
+What the split is not:
+
+- **Not a correctness problem.** The response is bit-identical in both modes —
+  same text, `mean_score = 0.5764`, `z_score = 3.1754`, `unique_contexts = 48`.
+- **Not device contention.** The GPU sits at ~25 % mean utilisation in *both*
+  modes at full SM clock, with no other process resident on it. A10 is
+  host-bound.
+- **Not run-ahead depth.** Run-ahead of 2, 4, 6, 8 and 12 are all bimodal.
+  Read-back ring capacity beyond the run-ahead window shifts the fast/slow ratio
+  slightly and fixes nothing.
+- **Not compiler nondeterminism.** `compiler.rs` contains no hash-ordered
+  iteration, and the emitted plan hashes to the same cache key every time.
+
+What it is: **a sharp knee in program size.** The identical inferlet at
+`depth = 1` and `depth = 3` is stable to ±3 % once warm (780–864 ms across six
+calls). Only the production `depth = 9` is bimodal. A10 is also the only
+inferlet in the set that reads back three channels per token instead of one. The
+working hypothesis is that at depth 9 its per-fire host cost reaches parity with
+its device time and it sits balanced on the pipelining knee — but a deeper
+run-ahead window does not rescue it, so that account is not yet complete.
+
+### The undocumented 30-second first call
+
+Fused regions are NVRTC-compiled on first use and cached on disk under
+`~/.cache/pie/ptir-cuda` — 537 modules, 176 MB, on the machine these numbers
+were taken on. A hit is invisible; a miss is a 12–31 s stall inside what looks
+like an ordinary request. Two consequences worth stating plainly:
+
+1. Every benchmark in this document is a **warm** number. The first call against
+   any new plan is one to two orders of magnitude slower.
+2. The cache key covers the plan bytes, so any shape change mints a new entry —
+   including a changed channel capacity or a changed `depth`, which an author
+   would reasonably regard as tuning rather than as a recompile.
 
 ---
 

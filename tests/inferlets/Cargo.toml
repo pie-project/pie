@@ -18,6 +18,8 @@ members = [
     "mtp-speculative-decoding",
     "naive-baseline",
     "prefix-tree-kv-cache",
+    "quest-attention",
+    "tova-attention",
     "repetition-penalty",
     "dry-repetition-penalty",
     "gumbel-watermark",

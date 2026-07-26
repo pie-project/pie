@@ -124,19 +124,50 @@ fn kv_lock_trace() -> &'static KvLockTrace {
     &TRACE
 }
 
+/// parking_lot mutexes do not poison: a panic unwinding mid-mutation would
+/// leave a half-updated `KvStore` silently live (std's poisoning made the
+/// next `lock().unwrap()` crash loud). This taint flag restores fail-loud —
+/// set on unwind inside [`with_kv_lock`], asserted on every entry.
+///
+/// KNOWN BLAST RADIUS: the flag is process-global, not per-store — one
+/// panic taints every `(model, driver)` store in the process, and in the
+/// test binary a single panicking `with_kv_lock` cascades into every later
+/// KV test in the same process. Acceptable while deployment is one store;
+/// a multi-store engine should move the flag beside the mutex it guards
+/// (a `KvStoreLock { mutex, tainted }` newtype in `Stores`).
+static KV_TAINTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+struct KvTaintOnPanic;
+
+impl Drop for KvTaintOnPanic {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            KV_TAINTED.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
 #[inline(always)]
 pub fn with_kv_lock<T>(
-    store: &Mutex<KvStore>,
+    store: &parking_lot::Mutex<KvStore>,
     tag: &'static str,
     operation: impl FnOnce(&mut KvStore) -> T,
 ) -> T {
+    assert!(
+        !KV_TAINTED.load(Ordering::Relaxed),
+        "KV store tainted by an earlier panic mid-mutation ({tag})"
+    );
+    let taint = KvTaintOnPanic;
     if !kv_lock_trace_enabled() {
-        let mut guard = store.lock().unwrap();
-        return operation(&mut guard);
+        let mut guard = store.lock();
+        let result = operation(&mut guard);
+        drop(guard);
+        drop(taint);
+        return result;
     }
 
     let wait_started = Instant::now();
-    let mut guard = store.lock().unwrap();
+    let mut guard = store.lock();
     let wait_ns = u64::try_from(wait_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let t_acquire_us = crate::scheduler::fire_timing_now_us();
     let hold_started = Instant::now();
@@ -163,7 +194,10 @@ pub fn dump_kv_lock_trace() -> anyhow::Result<()> {
 /// The typed stores for one (model, driver).
 #[derive(Clone)]
 pub struct Stores {
-    pub kv: Arc<Mutex<KvStore>>,
+    // parking_lot: adaptive spinning beats the futex round trip under the
+    // contended herd (every guest's finalize/prepare takes this lock; the
+    // measured wake-herd lock storm cost ~2 ms per wave — §15).
+    pub kv: Arc<parking_lot::Mutex<KvStore>>,
     pub rs: Arc<Mutex<RsStore>>,
     /// Tokens per KV page for this model/driver.
     pub kv_page_size: u32,
@@ -194,7 +228,7 @@ pub fn register_model_with_swap(
 ) -> usize {
     let stores: Vec<Option<Stores>> = (0..num_kv_pages.len())
         .map(|d| {
-            let kv = Arc::new(Mutex::new(KvStore::new_with_swap(
+            let kv = Arc::new(parking_lot::Mutex::new(KvStore::new_with_swap(
                 num_kv_pages[d] as u32,
                 num_host_pages.get(d).copied().unwrap_or(0) as u32,
                 rand::random::<[u8; 32]>(),
@@ -238,7 +272,7 @@ pub fn register_driver_with_swap(
             existing.kv_page_size
         );
     }
-    let kv = Arc::new(Mutex::new(KvStore::new_with_swap_range(
+    let kv = Arc::new(parking_lot::Mutex::new(KvStore::new_with_swap_range(
         base_page,
         num_kv_pages as u32,
         num_host_pages as u32,

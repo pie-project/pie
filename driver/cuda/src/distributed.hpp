@@ -97,12 +97,19 @@ public:
     void all_gather_bytes(const void* send, void* recv,
                           std::size_t count_per_rank, cudaStream_t stream);
 
+    // Host-buffer variant of the above: stages through device memory and
+    // synchronizes, so `recv` holds every rank's bytes on return. Cold path
+    // only (startup handshakes).
+    void all_gather_host_bytes(const void* send, void* recv,
+                               std::size_t bytes_per_rank);
+
     // Stream-synchronous device barrier. Implemented as a 1-byte all-reduce
     // so we don't depend on `ncclAllReduce(0, …)` semantics across versions.
     void barrier(cudaStream_t stream);
 
     // Best-effort teardown wake-up for follower ranks blocked in NCCL. Safe to
-    // call multiple times; after abort the communicator remains unusable.
+    // call multiple times; the communicator is released and this object's
+    // handle is cleared, so `comm()` returns nullptr afterwards.
     void abort() noexcept;
 
     // Optional fast-path: when set, `all_reduce_bf16(... ncclSum ...)`

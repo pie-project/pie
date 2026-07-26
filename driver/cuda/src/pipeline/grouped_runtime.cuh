@@ -40,6 +40,48 @@ inline constexpr std::uint32_t kMaxExactNucleusLibraryVocab = 4096;
 inline constexpr std::uint32_t kFastNucleusThreads = 256;
 inline constexpr std::uint32_t kFastNucleusChunks = 4;
 
+// Device-side mirror of `GroupedLaneEnvelope`, uploaded as a per-lane side
+// table. It is a SEPARATE array rather than extra `PtirLaneRecord` fields
+// because that record is a pinned 96-byte ABI: it is static_asserted, emitted
+// verbatim into the NVRTC source of every generated region, and the on-disk
+// module cache is keyed on the plan bytes that produced it. Widening it would
+// invalidate every cached module for a field only one kernel reads.
+struct GroupedLaneEnvelopeDevice {
+    const float* env_min;
+    const float* env_max;
+    const float* query;
+    const std::uint32_t* page_ids;
+    std::uint32_t page_count;
+    std::uint32_t scored_pages;
+    std::uint32_t num_q_heads;
+    std::uint32_t num_kv_heads;
+    std::uint32_t head_dim;
+    std::uint32_t reserved;
+};
+
+// Per-lane resolution of the fire's KV geometry, for the `envelope_dot`
+// second-party kernel. Populated only at an attention stage of a program that
+// actually calls it; every other lane leaves `env_min`/`env_max` null and the
+// runtime refuses to launch rather than scoring garbage.
+struct GroupedLaneEnvelope {
+    const float* env_min = nullptr;   // [num_pages, num_kv_heads, head_dim]
+    const float* env_max = nullptr;
+    // This lane's query row to score with: the LAST token of the lane, which is
+    // the token whose attention the mask will govern.
+    const float* query = nullptr;
+    // Device slice of the fire's `kv_page_indices` belonging to this lane.
+    const std::uint32_t* page_ids = nullptr;
+    std::uint32_t page_count = 0;
+    // Pages whose envelope is FINAL as of this hook: the hook fires before the
+    // layer's KV append, so a page the fire is still filling has a stale
+    // envelope. Those pages score +inf (always kept), which is both fail-safe
+    // and exactly Quest's "keep the local window" rule.
+    std::uint32_t scored_pages = 0;
+    std::uint32_t num_q_heads = 0;
+    std::uint32_t num_kv_heads = 0;
+    std::uint32_t head_dim = 0;
+};
+
 struct GroupedLaneBinding {
     PtirInstance* instance = nullptr;
     const plan::StagePlan* plan = nullptr;
@@ -71,6 +113,13 @@ struct GroupedLaneBinding {
     std::uint32_t vocab = 0;          // PTIR-visible logical vocabulary
     std::uint32_t logits_stride = 0; // physical model row stride
     std::uint32_t program_index = 0;
+    GroupedLaneEnvelope envelope{};
+    // Per-lane `[kv_max]` f32 attention-probability row, materialized by
+    // `resolve_lane_attn_score` from the layer capture. Null when the stage
+    // does not read `AttnScore`; reading it while null is a hard error rather
+    // than a zero row, because a silently-zero score is indistinguishable from
+    // "every position is evictable".
+    const float* attn_score_base = nullptr;
 };
 
 struct GroupedExecutionOptions {
@@ -1397,6 +1446,22 @@ struct GroupedStageStaticPlan {
         }
         for (std::size_t node = 0; node < stage.ops.size(); ++node) {
             const container::COp& op = stage.ops[node].op;
+            // A second-party kernel is deliberately NOT in
+            // `grouped_supported_tag`. That predicate is the "can a generic
+            // CUDA op cover this tag" question, and the answer for a named
+            // kernel is no — only the fused path can launch it. But this static
+            // plan is the shared lane-binding metadata the FUSED path resolves
+            // through too, so it must describe the op rather than reject it.
+            // Execution coverage is enforced twice elsewhere: once at
+            // registration (`Dispatch::register_program` name+capability gate)
+            // and once per execution group (`generated_stage_supported`).
+            // `requires_query` is set because the kernel consumes the lane's
+            // post-rope query row.
+            if (op.tag == PTIR_OP_KERNEL_CALL) {
+                requires_query = true;
+                requires_kernel_call = true;
+                continue;
+            }
             if (!grouped_supported_tag(op.tag)) {
                 fail("stage contains an unsupported grouped op");
                 return;
@@ -1424,6 +1489,8 @@ struct GroupedStageStaticPlan {
                     }
                     requires_mtp_rows = true;
                     mtp_rows = required_rows;
+                } else if (op.intr == PTIR_INTR_ATTN_SCORE) {
+                    requires_attn_score = true;
                 } else if (op.intr != PTIR_INTR_LOGITS) {
                     fail("stage uses an unsupported intrinsic");
                     return;
@@ -1471,6 +1538,17 @@ struct GroupedStageStaticPlan {
     std::size_t channel_count = 0;
     bool requires_query = false;
     bool requires_layer = false;
+    // The stage reads `AttnScore`. Like `requires_kernel_call` this is
+    // descriptive: only the fused path can serve it (the grouped kernel has no
+    // intrinsic-strided read), but this static plan is the shared lane-binding
+    // metadata the fused path resolves through, so describing it here is what
+    // lets `register_program` accept the program at all.
+    bool requires_attn_score = false;
+    // The stage names a second-party kernel. Only the fused path can launch
+    // one; `Dispatch::register_program` refuses any name the backend cannot
+    // launch, and `generated_stage_supported` is re-checked per execution
+    // group, so this is descriptive rather than a gate.
+    bool requires_kernel_call = false;
     bool requires_mtp_rows = false;
     std::size_t mtp_rows = 0;
     std::vector<std::uint8_t> used_extents;
@@ -1680,6 +1758,10 @@ class GroupedStageAccumulator {
         if (static_plan_->requires_layer &&
             lane.layer_base == nullptr) {
             return fail("Layer intrinsic is unavailable");
+        }
+        if (static_plan_->requires_attn_score &&
+            lane.attn_score_base == nullptr) {
+            return fail("AttnScore intrinsic is unavailable");
         }
         if (static_plan_->requires_mtp_rows &&
             (lane.mtp_logits_bf16_rows == nullptr ||

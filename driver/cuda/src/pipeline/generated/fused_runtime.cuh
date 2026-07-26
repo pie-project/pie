@@ -20,6 +20,7 @@
 #include <cuda_runtime.h>
 
 #include "batch/fire_timing.hpp"
+#include "kernels/envelope_device.cuh"
 #include "cuda_check.hpp"
 #include "pipeline/generated/module_cache.hpp"
 #include "pipeline/grouped_runtime.cuh"
@@ -648,6 +649,77 @@ static __global__ void k_generated_scan_u32(
     }
 }
 
+// `envelope_dot` — Quest page criticality (Tang et al., arXiv:2406.10774).
+//
+// One block per (lane, page slot). The block reduces the per-head Quest bound
+// over the GQA group and then takes the MAX over kv heads.
+//
+// The max-over-heads is a DELIBERATE deviation from the paper, forced by the
+// consumer: Quest selects pages per head, but FlashInfer's paged layout carries
+// ONE page list shared by every head of a request, so a per-head selection has
+// no way to be expressed downstream. Reducing with max is the union of the
+// per-head selections, which keeps a page any head considers critical. That is
+// strictly more conservative than Quest: quality >= Quest, speedup <= Quest.
+//
+// Slot semantics, in the order the branches test them:
+//   slot >= page_count   -> -inf. Not a page of this request at all; a
+//                           top-k consumer must never choose it.
+//   slot >= scored_pages -> +inf. A page this fire is still writing, so its
+//                           envelope predates the tokens in it. Always keep.
+//                           This is both the fail-safe direction and Quest's
+//                           own "keep the local window" rule.
+//   otherwise            -> the bound.
+template <int BLOCK>
+static __global__ void k_generated_envelope_dot(
+    const PtirLaneTableHeader* header,
+    const PtirLaneRecord* lanes,
+    const GroupedLaneEnvelopeDevice* envelopes,
+    const std::uint64_t* values,
+    std::uint32_t value_count,
+    std::uint32_t output_value,
+    std::uint32_t max_pages) {
+    const std::uint32_t lane = blockIdx.x / max_pages;
+    const std::uint32_t slot = blockIdx.x - lane * max_pages;
+    if (lane >= header->lane_count) return;
+    if (*grouped_commit(lanes, lane) == 0) return;
+
+    const GroupedLaneEnvelopeDevice e = envelopes[lane];
+    float* out = grouped_value<float>(values, value_count, lane, output_value);
+    if (out == nullptr || e.env_min == nullptr) return;
+
+    if (slot >= e.page_count) {
+        if (threadIdx.x == 0) out[slot] = -CUDART_INF_F;
+        return;
+    }
+    if (slot >= e.scored_pages) {
+        if (threadIdx.x == 0) out[slot] = CUDART_INF_F;
+        return;
+    }
+
+    const int page = static_cast<int>(e.page_ids[slot]);
+    const int num_kv_heads = static_cast<int>(e.num_kv_heads);
+    const int head_dim = static_cast<int>(e.head_dim);
+    const int group = static_cast<int>(e.num_q_heads) / num_kv_heads;
+
+    __shared__ float buf[BLOCK];
+    float best = -CUDART_INF_F;
+    for (int kh = 0; kh < num_kv_heads; ++kh) {
+        const long env_base =
+            (static_cast<long>(page) * num_kv_heads + kh) * head_dim;
+        buf[threadIdx.x] = kernels::envelope_dot_thread_partial(
+            e.query, e.env_min, e.env_max, env_base, kh * group, group,
+            head_dim, static_cast<int>(threadIdx.x), BLOCK);
+        __syncthreads();
+        for (int off = BLOCK / 2; off > 0; off >>= 1) {
+            if (threadIdx.x < off) buf[threadIdx.x] += buf[threadIdx.x + off];
+            __syncthreads();
+        }
+        if (buf[0] > best) best = buf[0];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[slot] = best;
+}
+
 static __global__ void k_generated_matmul_f32(
     const PtirLaneTableHeader* header,
     const PtirLaneRecord* lanes,
@@ -730,8 +802,11 @@ inline bool generated_stage_supported(
         const auto& region = stage.fused.regions[index];
         if (region.library) {
             if (region.library_op == PTIR_LIBRARY_SECOND_PARTY) {
-                return fail(
-                    "fused stage still requires a second-party library");
+                if (!second_party_region_supported(stage, region)) {
+                    return fail(
+                        "fused stage still requires a second-party library");
+                }
+                continue;
             }
             if (region.library_op == PTIR_LIBRARY_NUCLEUS_SAMPLE) {
                 if (!grouped_nucleus_region_supported(stage, region)) {
@@ -1276,11 +1351,11 @@ inline GroupedLaunchResult run_generated_stage(
                     static_cast<std::uint32_t>(op.chan)));
         }
     }
-    std::vector<std::uint64_t> host_intrinsic_bases(lane_count * 7, 0);
-    std::vector<std::uint32_t> host_intrinsic_modes(lane_count * 7, 0);
-    std::vector<std::uint32_t> host_intrinsic_widths(lane_count * 7, 0);
-    std::vector<std::uint32_t> host_intrinsic_strides(lane_count * 7, 0);
-    std::vector<std::uint32_t> host_intrinsic_offsets(lane_count * 7, 0);
+    std::vector<std::uint64_t> host_intrinsic_bases(lane_count * kPtirIntrinsicSlots, 0);
+    std::vector<std::uint32_t> host_intrinsic_modes(lane_count * kPtirIntrinsicSlots, 0);
+    std::vector<std::uint32_t> host_intrinsic_widths(lane_count * kPtirIntrinsicSlots, 0);
+    std::vector<std::uint32_t> host_intrinsic_strides(lane_count * kPtirIntrinsicSlots, 0);
+    std::vector<std::uint32_t> host_intrinsic_offsets(lane_count * kPtirIntrinsicSlots, 0);
     std::vector<std::uint64_t> host_bf16_rows;
     std::vector<std::uint32_t> bf16_row_offsets(lane_count, UINT32_MAX);
     std::vector<std::uint64_t> host_mtp_rows;
@@ -1329,7 +1404,8 @@ inline GroupedLaunchResult run_generated_stage(
             const auto& op = stage.ops[node].op;
             if (op.tag != PTIR_OP_INTRINSIC_VAL) continue;
             const std::size_t index =
-                static_cast<std::size_t>(lane) * 7 + op.intr;
+                static_cast<std::size_t>(lane) * kPtirIntrinsicSlots +
+                op.intr;
             const GeneratedValueDesc& descriptor =
                 host_descriptors[
                     static_cast<std::size_t>(lane) * value_count +
@@ -1380,6 +1456,16 @@ inline GroupedLaunchResult run_generated_stage(
                         lanes[lane].layer_base);
                 host_intrinsic_widths[index] = 1;
                 host_intrinsic_strides[index] = 1;
+            } else if (op.intr == PTIR_INTR_ATTN_SCORE) {
+                if (lanes[lane].attn_score_base == nullptr) {
+                    throw std::runtime_error(
+                        "generated fused AttnScore intrinsic has no capture "
+                        "buffer for this lane");
+                }
+                host_intrinsic_bases[index] =
+                    reinterpret_cast<std::uint64_t>(
+                        lanes[lane].attn_score_base);
+                host_intrinsic_strides[index] = descriptor.last;
             } else {
                 throw std::runtime_error(
                     "generated fused intrinsic is unavailable");
@@ -1823,6 +1909,68 @@ inline GroupedLaunchResult run_generated_stage(
             }
             const std::uint32_t node = planned_region.nodes.front();
             const auto& op = stage.ops[node].op;
+            if (planned_region.library_op == PTIR_LIBRARY_SECOND_PARTY) {
+                // `generated_stage_supported` already proved this is
+                // `envelope_dot` at an attention stage with an f32 vector
+                // result; what is left is that the caller actually resolved the
+                // fire's KV geometry for every lane. A lane without it means
+                // the attention observation was missing, which is a wiring bug,
+                // not a data-dependent condition — so it throws.
+                const auto out_shape = grouped_row_shape(
+                    stage.value_types[bases[node]], lanes);
+                const std::uint32_t max_pages = out_shape.max_columns;
+                if (max_pages == 0) {
+                    throw std::runtime_error(
+                        "envelope_dot result has no page slots");
+                }
+                std::vector<GroupedLaneEnvelopeDevice> host_envelopes(
+                    lane_count);
+                for (std::uint32_t lane = 0; lane < lane_count; ++lane) {
+                    const auto& e = lanes[lane].envelope;
+                    if (e.env_min == nullptr || e.env_max == nullptr ||
+                        e.query == nullptr || e.page_ids == nullptr ||
+                        e.num_kv_heads == 0 || e.head_dim == 0 ||
+                        e.num_q_heads % e.num_kv_heads != 0) {
+                        throw std::runtime_error(
+                            "envelope_dot lane has no resolved kv envelope");
+                    }
+                    if (e.page_count > max_pages) {
+                        throw std::runtime_error(
+                            "envelope_dot result is narrower than the lane's "
+                            "page list");
+                    }
+                    host_envelopes[lane] = GroupedLaneEnvelopeDevice{
+                        e.env_min,      e.env_max,      e.query,
+                        e.page_ids,     e.page_count,   e.scored_pages,
+                        e.num_q_heads,  e.num_kv_heads, e.head_dim,
+                        0u};
+                }
+                GroupedLaneEnvelopeDevice* device_envelopes = nullptr;
+                const std::size_t envelope_bytes =
+                    host_envelopes.size() * sizeof(GroupedLaneEnvelopeDevice);
+                CUDA_CHECK(cudaMallocAsync(
+                    reinterpret_cast<void**>(&device_envelopes),
+                    envelope_bytes, stream));
+                allocations.values.push_back(device_envelopes);
+                CUDA_CHECK(cudaMemcpyAsync(
+                    device_envelopes, host_envelopes.data(), envelope_bytes,
+                    cudaMemcpyHostToDevice, stream));
+                k_generated_envelope_dot<kTier0Block><<<
+                    lane_count * max_pages,
+                    kTier0Block,
+                    0,
+                    stream>>>(
+                    device_header,
+                    device_lanes,
+                    device_envelopes,
+                    device_value_pointers,
+                    value_count,
+                    bases[node],
+                    max_pages);
+                CUDA_CHECK(cudaGetLastError());
+                ++result.body_op_launches;
+                continue;
+            }
             if (planned_region.library_op == PTIR_LIBRARY_SCAN) {
                 const auto shape = grouped_row_shape(
                     stage.value_types[op.args[0]], lanes);

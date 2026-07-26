@@ -652,14 +652,23 @@ impl WorkItemCompletionState {
     fn resolve_success(&self) {
         self.resolution
             .store(WORK_ITEM_RESOLUTION_SUCCESS, Ordering::Release);
-        let _ = WakerTable::global().publish(self.slot, 1);
+        // Unconditional doorbell, NOT `publish(slot, 1)`: the resolution
+        // lives in the atomic above, outside the epoch machinery, and the
+        // driver may already have published a HIGHER epoch to this slot
+        // (its per-fire terminal notify). A waiter that re-registered after
+        // observing that epoch would filter a `publish(1)` as stale and
+        // sleep forever — the lost wakeup behind "settled fire, hung
+        // finalize" (found via the Rainer eviction drain, but reachable by
+        // any await that straddles the driver-notify → worker-retire gap).
+        let _ = WakerTable::global().wake(self.slot);
     }
 
     fn resolve_failure(&self, message: impl Into<String>) {
         *self.message.lock().unwrap() = Some(message.into());
         self.resolution
             .store(WORK_ITEM_RESOLUTION_FAILED, Ordering::Release);
-        let _ = WakerTable::global().publish(self.slot, 1);
+        // See `resolve_success`: unconditional doorbell.
+        let _ = WakerTable::global().wake(self.slot);
     }
 
     fn request_cancel(&self) {

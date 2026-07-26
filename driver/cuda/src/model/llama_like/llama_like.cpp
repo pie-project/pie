@@ -21,9 +21,8 @@
 #include "kernels/rope.hpp"
 #include "kernels/split_packed.hpp"
 #include "kernels/swiglu.hpp"
-#ifndef PIE_CUDA_QWEN_ONLY
 #include "model/qwen3_vl/qwen3_vl_vision_forward.hpp"
-#endif
+#include "model/attn_score.hpp"
 #include "model/stage_hooks.hpp"
 #include "ops/attention_flashinfer.hpp"
 #include "ops/gemm.hpp"
@@ -367,7 +366,6 @@ void llama_like_forward_paged(
     // 1b. Qwen3-VL multimodal: encode each image and overwrite its soft-token
     // rows in the embed output; also stash the deepstack merger outputs (added
     // into the hidden state on image rows after early decoder layers below).
-#ifndef PIE_CUDA_QWEN_ONLY
     if (vision != nullptr && vision->vision_in != nullptr &&
         vision->vision_in->num_images > 0) {
         scatter_qwen3vl_vision(
@@ -377,9 +375,6 @@ void llama_like_forward_paged(
             static_cast<__nv_bfloat16*>(vision->deepstack_scratch),
             vision->num_deepstack, cublas.handle(), stream);
     }
-#else
-    (void)vision;
-#endif
 
     // Some GQA group sizes (Qwen2 small models — 6, 7) aren't in
     // flashinfer's decode dispatch table; for those we run the prefill
@@ -526,13 +521,6 @@ void llama_like_forward_paged(
             maybe_add_bias(ws.k.data(), layer.k_bias, N, Hk, stream);
             maybe_add_bias(ws.v.data(), layer.v_bias, N, Hk, stream);
         }
-        invoke_stage_hook(
-            StageHookPoint::OnAttnProj,
-            ws.q.data(),
-            static_cast<std::uint32_t>(N),
-            static_cast<std::uint32_t>(Hq),
-            static_cast<std::uint32_t>(L),
-            stream);
 
         // q_norm / k_norm: two conventions ship in the wild.
         //   * Per-head (Qwen3, OLMo-2 small, Gemma-3): weight shape
@@ -599,6 +587,19 @@ void llama_like_forward_paged(
                        stream);
         }
 
+        // Fires POST-rope (and post q/k-norm): the query a PTIR program
+        // observes here is the one that actually enters attention, so an
+        // observer scoring it against the cached keys -- which are stored
+        // post-rope -- compares in the same space. Placing it on the raw
+        // projection instead would silently mis-rank pages for Quest.
+        invoke_stage_hook(
+            StageHookPoint::OnAttnProj,
+            ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            static_cast<std::uint32_t>(L),
+            stream);
+
         // Pad Q/K/V to `dk` when the model's head_dim isn't a flashinfer
         // dispatch value. The padded buffers are zero on the trailing
         // `dk - d` cols per head; QK·V dot products therefore equal the
@@ -660,6 +661,21 @@ void llama_like_forward_paged(
                ? fwd_cfg.per_layer_window_left[L]
                : fwd_cfg.sliding_window;
 
+        // Track B: observe the attention this layer is about to compute, when
+        // the fire's PTIR programs read `AttnScore`. `LayerScoreCapture` is a
+        // no-op otherwise, and the substitution below is the whole cost --
+        // the scores come out of the kernel's own logits, so nothing is
+        // recomputed and nothing can drift from what attention actually used.
+        //
+        // Only the plain decode path is capture-capable. The other branches
+        // capture nothing, and the PTIR side then throws at the hook rather
+        // than handing a program a buffer nobody wrote.
+        model::LayerScoreCapture score_capture(
+            static_cast<std::uint32_t>(L),
+            static_cast<std::uint32_t>(num_q_heads_local),
+            /*capturable=*/layer_window_left < 0,
+            stream);
+
         if (use_xqa_decode_path) {
             ops::launch_attention_xqa_decode_bf16_prepared(
                 attn_q, kv_view.k_bf16_pages, kv_view.v_bf16_pages, attn_out_buf,
@@ -676,12 +692,25 @@ void llama_like_forward_paged(
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 attn_ws, stream, /*logits_soft_cap=*/0.f, sm_scale_override);
         } else if (use_decode_path) {
-            ops::dispatch_attention_flashinfer_decode(
-                *decode_plan,
-                attn_q, kv_view, attn_out_buf,
-                kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                attn_ws, stream, layer_window_left,
-                /*logits_soft_cap=*/0.f, sm_scale_override);
+            if (score_capture.active()) {
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *decode_plan,
+                    attn_q, kv_view, attn_out_buf,
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_ws, stream,
+                    score_capture.raw(), score_capture.indptr_d(),
+                    layer_window_left,
+                    /*logits_soft_cap=*/0.f, sm_scale_override);
+                score_capture.publish(
+                    kv_page_indptr, kv_last_page_lens, cache.page_size());
+            } else {
+                ops::dispatch_attention_flashinfer_decode(
+                    *decode_plan,
+                    attn_q, kv_view, attn_out_buf,
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_ws, stream, layer_window_left,
+                    /*logits_soft_cap=*/0.f, sm_scale_override);
+            }
         } else if (custom_mask_d) {
             if (!plan_state.use_prefill_plan || prefill_plan == nullptr) {
                 throw std::runtime_error(

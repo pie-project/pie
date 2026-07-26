@@ -22,11 +22,13 @@ namespace pie_cuda_driver {
 
 namespace {
 
-// Helper to enable peer access from `device` to every other GPU in the
+// Helper to enable peer access from `self_device` to every other GPU in the
 // group. Idempotent — subsequent calls just return cudaErrorPeerAccessAlreadyEnabled
-// which we swallow.
-void enable_peer_access(int self_device, int world_size) {
-    for (int peer = 0; peer < world_size; ++peer) {
+// which we swallow. `peers` holds real device ordinals: a TP group is not
+// necessarily devices 0..world_size-1 (a second group on an 4-GPU box runs on
+// devices 2 and 3), so rank index must never be used as a device ordinal here.
+void enable_peer_access(int self_device, const std::vector<int>& peers) {
+    for (int peer : peers) {
         if (peer == self_device) continue;
         int can_access = 0;
         const auto can_err = cudaDeviceCanAccessPeer(
@@ -51,12 +53,9 @@ void enable_peer_access(int self_device, int world_size) {
     }
 }
 
-bool has_full_peer_access(int world_size) {
-    int device_count = 0;
-    if (cudaGetDeviceCount(&device_count) != cudaSuccess) return false;
-    if (device_count < world_size) return false;
-    for (int src = 0; src < world_size; ++src) {
-        for (int dst = 0; dst < world_size; ++dst) {
+bool has_full_peer_access(const std::vector<int>& group_devices) {
+    for (int src : group_devices) {
+        for (int dst : group_devices) {
             if (src == dst) continue;
             int can_access = 0;
             if (cudaDeviceCanAccessPeer(&can_access, src, dst) != cudaSuccess) {
@@ -195,6 +194,77 @@ void cross_device_reduce_residual_rmsnorm_1stage_exact_bf16(
     vllm::multi_gpu_barrier<2, false>(signals, self_signal, rank);
 }
 
+// ---- fused all-reduce dispatch -------------------------------------------
+// flashinfer's own allreduce_fusion_op() switches over every AllReduceFusion
+// pattern, instantiating all ten even though pie only ever sets one. Its inner
+// launcher is public, so we expand kernels.def into an equivalent switch and
+// call that directly instead -- see the PIE_AR_FUSION_PATTERN block there.
+
+template <flashinfer::trtllm_allreduce_fusion::AllReduceFusionPattern Pattern,
+          typename T, int NRanks>
+cudaError_t launch_ar_fusion(
+    const flashinfer::trtllm_allreduce_fusion::AllReduceFusionParams<T>& params,
+    bool launch_with_pdl,
+    bool fp32_acc)
+{
+    using flashinfer::trtllm_allreduce_fusion::allreduce_fusion_kernel_launcher;
+    if (fp32_acc) {
+        return allreduce_fusion_kernel_launcher<Pattern, T, NRanks, true>(
+            params, launch_with_pdl);
+    }
+    return allreduce_fusion_kernel_launcher<Pattern, T, NRanks, false>(
+        params, launch_with_pdl);
+}
+
+template <typename T, int NRanks>
+cudaError_t dispatch_ar_fusion_pattern(
+    const flashinfer::trtllm_allreduce_fusion::AllReduceFusionParams<T>& params,
+    bool launch_with_pdl,
+    bool fp32_acc)
+{
+    using flashinfer::trtllm_allreduce_fusion::AllReduceFusionPattern;
+    switch (params.pattern) {
+#define PIE_AR_FUSION_PATTERN(name)                                          \
+    case AllReduceFusionPattern::name:                                       \
+        return launch_ar_fusion<AllReduceFusionPattern::name, T, NRanks>(    \
+            params, launch_with_pdl, fp32_acc);
+#include "kernels.def"
+    default:
+        break;
+    }
+    throw std::runtime_error(
+        "custom_all_reduce: AllReduceFusionPattern " +
+        std::to_string(static_cast<int>(params.pattern)) +
+        " is not instantiated in this build; add it to PIE_AR_FUSION_PATTERN "
+        "in driver/cuda/src/kernels.def");
+}
+
+// nranks is upstream flashinfer's supported set rather than a pie-owned axis,
+// so it stays fully instantiated: TP world size is a deployment choice and
+// pruning it would turn a valid launch into a runtime throw.
+template <typename T>
+cudaError_t pie_allreduce_fusion_op(
+    const flashinfer::trtllm_allreduce_fusion::AllReduceFusionParams<T>& params,
+    bool launch_with_pdl,
+    bool fp32_acc)
+{
+    switch (params.nranks) {
+    case 2:
+        return dispatch_ar_fusion_pattern<T, 2>(params, launch_with_pdl, fp32_acc);
+    case 4:
+        return dispatch_ar_fusion_pattern<T, 4>(params, launch_with_pdl, fp32_acc);
+    case 8:
+        return dispatch_ar_fusion_pattern<T, 8>(params, launch_with_pdl, fp32_acc);
+    case 16:
+        return dispatch_ar_fusion_pattern<T, 16>(params, launch_with_pdl, fp32_acc);
+    default:
+        break;
+    }
+    throw std::runtime_error(
+        "custom_all_reduce: fused all-reduce does not support TP world size " +
+        std::to_string(params.nranks) + " (flashinfer supports 2, 4, 8, 16)");
+}
+
 }  // namespace
 
 // Default ctor defined here (not = default in header) so the compiler
@@ -205,6 +275,7 @@ CustomAllReduce::CustomAllReduce() = default;
 
 CustomAllReduce::CustomAllReduce(NcclComm& comm,
                                  bool same_process,
+                                 std::vector<int> group_devices,
                                  std::size_t max_bytes,
                                  std::size_t rank_data_bytes,
                                  int fusion_max_tokens,
@@ -229,10 +300,20 @@ CustomAllReduce::CustomAllReduce(NcclComm& comm,
     // hard error if P2P is not actually available between this GPU and a peer.
     int dev = 0;
     CUDA_CHECK(cudaGetDevice(&dev));
-    enable_peer_access(dev, world_size_);
+    if (group_devices.empty()) {
+        throw std::runtime_error(
+            "custom_all_reduce: group device ordinals are required");
+    }
+    if (static_cast<int>(group_devices.size()) != world_size_) {
+        throw std::runtime_error(
+            "custom_all_reduce: group device list has " +
+            std::to_string(group_devices.size()) + " entries for world_size " +
+            std::to_string(world_size_));
+    }
+    enable_peer_access(dev, group_devices);
     // vLLM's custom all-reduce can handle larger TP groups only when every
     // rank has direct peer access to every other rank.
-    fully_connected_ = world_size_ <= 2 || has_full_peer_access(world_size_);
+    fully_connected_ = world_size_ <= 2 || has_full_peer_access(group_devices);
 
     // Allocate the local Signal struct plus the temporary region needed by
     // flashinfer's 2-stage algorithm. TP=2 uses the 1-stage kernel, but
@@ -642,7 +723,7 @@ void CustomAllReduce::all_reduce_residual_rmsnorm_bf16(
     params.trigger_completion_at_end = false;
     static const bool use_fp32_acc =
         env_bool_default("PIE_CUDA_FUSED_AR_NORM_FP32_ACC", true);
-    CUDA_CHECK((allreduce_fusion_op<__nv_bfloat16>(
+    CUDA_CHECK((pie_allreduce_fusion_op<__nv_bfloat16>(
         params, /*launch_with_pdl=*/false, use_fp32_acc)));
 }
 

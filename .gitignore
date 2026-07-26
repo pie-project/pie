@@ -134,6 +134,10 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+# `env/` above is the Python-virtualenv convention and is unanchored, so it
+# also swallows `bin/env` — the crate behind the `pie-env` command. Re-include
+# the directory itself (a negation inside an excluded dir would never be seen).
+!bin/env/
 # Spyder project settings
 .spyderproject
 .spyproject

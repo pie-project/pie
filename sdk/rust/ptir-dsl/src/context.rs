@@ -112,6 +112,10 @@ pub(crate) struct Session {
     chan_by_gid: alloc::collections::BTreeMap<u64, ChannelIndex>,
     pub channels: Vec<ChannelRef>,
     pub current: Option<Recorder>,
+    /// Second-party names, in first-use order. The container's name table is
+    /// SHARED across stages (a `NameIndex` in one stage's op means the same
+    /// thing in another), so it is interned at session scope, not stage scope.
+    pub names: Vec<String>,
 }
 
 impl Session {
@@ -120,6 +124,7 @@ impl Session {
             chan_by_gid: alloc::collections::BTreeMap::new(),
             channels: Vec::new(),
             current: None,
+            names: Vec::new(),
         }
     }
 
@@ -166,14 +171,17 @@ pub(crate) fn intern_channel(ch: &ChannelRef) -> ChannelIndex {
 }
 
 /// Run `f` with a fresh session active; return `f`'s result + the interned channels.
-pub(crate) fn with_session<R>(f: impl FnOnce() -> R) -> (R, Vec<ChannelRef>) {
+pub(crate) fn with_session<R>(f: impl FnOnce() -> R) -> (R, Vec<ChannelRef>, Vec<String>) {
     SESSION.with_borrow_mut(|s| {
         debug_assert!(s.is_none(), "nested trace session");
         *s = Some(Session::new());
     });
     let r = f();
-    let channels = SESSION.with_borrow_mut(|s| s.take().expect("session present").channels);
-    (r, channels)
+    let (channels, names) = SESSION.with_borrow_mut(|s| {
+        let session = s.take().expect("session present");
+        (session.channels, session.names)
+    });
+    (r, channels, names)
 }
 
 /// Trace one stage closure into a completed [`StageResult`]. `rows` = the pass's
@@ -285,6 +293,20 @@ pub(crate) fn record_channel_put(ch: &ChannelRef, value: u32, span: Span) {
         }
         let rec = sess.current.as_mut().expect("stage active");
         rec.push(Op::ChanPut { chan: dense, value }, &[]);
+    })
+}
+
+/// Intern a second-party name into the session's shared name table, returning
+/// its `NameIndex`. First use wins, so the table is deterministic in trace
+/// order and the container bytes stay byte-stable across runs.
+pub(crate) fn intern_name(name: &str) -> u16 {
+    SESSION.with_borrow_mut(|s| {
+        let sess = s.as_mut().expect("name interned outside a session");
+        if let Some(index) = sess.names.iter().position(|n| n == name) {
+            return index as u16;
+        }
+        sess.names.push(String::from(name));
+        (sess.names.len() - 1) as u16
     })
 }
 

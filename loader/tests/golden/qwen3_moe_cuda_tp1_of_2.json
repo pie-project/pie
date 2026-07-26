@@ -1,0 +1,1850 @@
+{
+  "version": 5,
+  "compiler_version": 0,
+  "target": {
+    "backend": "Cuda",
+    "tp_rank": 1,
+    "tp_size": 2,
+    "max_tile_bytes": 67108864,
+    "preferred_alignment": 256,
+    "tile_map_mask": 117,
+    "mxfp4_moe": "RoutedDecode",
+    "native_mxfp4_moe": false,
+    "fused_transcode": true
+  },
+  "optimizer": {
+    "passes": [
+      {
+        "name": "live-normalization",
+        "exprs_before": 66,
+        "exprs_after": 66,
+        "rewrites": 0
+      }
+    ]
+  },
+  "files": [
+    {
+      "id": 0,
+      "path": "checkpoint-0.safetensors",
+      "size_bytes": 1017600,
+      "format": "Safetensors"
+    }
+  ],
+  "sources": [
+    {
+      "id": 0,
+      "name": "model.embed_tokens.weight",
+      "file_id": 0,
+      "file_offset": 0,
+      "span_bytes": 65536,
+      "shape": [
+        256,
+        128
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      }
+    },
+    {
+      "id": 1,
+      "name": "model.layers.0.input_layernorm.weight",
+      "file_id": 0,
+      "file_offset": 65536,
+      "span_bytes": 256,
+      "shape": [
+        128
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      }
+    },
+    {
+      "id": 2,
+      "name": "model.layers.0.self_attn.q_proj.weight",
+      "file_id": 0,
+      "file_offset": 65792,
+      "span_bytes": 32768,
+      "shape": [
+        128,
+        128
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      }
+    },
+    {
+      "id": 3,
+      "name": "model.layers.0.self_attn.k_proj.weight",
+      "file_id": 0,
+      "file_offset": 98560,
+      "span_bytes": 16384,
+      "shape": [
+        64,
+        128
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      }
+    },
+    {
+      "id": 4,
+      "name": "model.layers.0.self_attn.v_proj.weight",
+      "file_id": 0,
+      "file_offset": 114944,
+      "span_bytes": 16384,
+      "shape": [
+        64,
+        128
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      }
+    },
+    {
+      "id": 5,
+      "name": "model.layers.0.self_attn.o_proj.weight",
+      "file_id": 0,
+      "file_offset": 131328,
+      "span_bytes": 32768,
+      "shape": [
+        128,
+        128
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      }
+    },
+    {
+      "id": 6,
+      "name": "model.layers.0.post_attention_layernorm.weight",
+      "file_id": 0,
+      "file_offset": 164096,
+      "span_bytes": 256,
+      "shape": [
+        128
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      }
+    },
+    {
+      "id": 7,
+      "name": "model.layers.0.mlp.gate.weight",
+      "file_id": 0,
+      "file_offset": 164352,
+      "span_bytes": 1024,
+      "shape": [
+        4,
+        128
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      }
+    },
+    {
+      "id": 8,
+      "name": "model.layers.0.mlp.experts.0.gate_proj.weight",
+      "file_id": 0,
+      "file_offset": 165376,
+      "span_bytes": 65536,
+      "shape": [
+        256,
+        128
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      }
+    },
+    {
+      "id": 9,
+      "name": "model.layers.0.mlp.experts.0.up_proj.weight",
+      "file_id": 0,
+      "file_offset": 230912,
+      "span_bytes": 65536,
+      "shape": [
+        256,
+        128
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      }
+    },
+    {
+      "id": 10,
+      "name": "model.layers.0.mlp.experts.0.down_proj.weight",
+      "file_id": 0,
+      "file_offset": 296448,
+      "span_bytes": 65536,
+      "shape": [
+        128,
+        256
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      }
+    },
+    {
+      "id": 11,
+      "name": "model.layers.0.mlp.experts.1.gate_proj.weight",
+      "file_id": 0,
+      "file_offset": 361984,
+      "span_bytes": 65536,
+      "shape": [
+        256,
+        128
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      }
+    },
+    {
+      "id": 12,
+      "name": "model.layers.0.mlp.experts.1.up_proj.weight",
+      "file_id": 0,
+      "file_offset": 427520,
+      "span_bytes": 65536,
+      "shape": [
+        256,
+        128
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      }
+    },
+    {
+      "id": 13,
+      "name": "model.layers.0.mlp.experts.1.down_proj.weight",
+      "file_id": 0,
+      "file_offset": 493056,
+      "span_bytes": 65536,
+      "shape": [
+        128,
+        256
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      }
+    },
+    {
+      "id": 14,
+      "name": "model.layers.0.mlp.experts.2.gate_proj.weight",
+      "file_id": 0,
+      "file_offset": 558592,
+      "span_bytes": 65536,
+      "shape": [
+        256,
+        128
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      }
+    },
+    {
+      "id": 15,
+      "name": "model.layers.0.mlp.experts.2.up_proj.weight",
+      "file_id": 0,
+      "file_offset": 624128,
+      "span_bytes": 65536,
+      "shape": [
+        256,
+        128
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      }
+    },
+    {
+      "id": 16,
+      "name": "model.layers.0.mlp.experts.2.down_proj.weight",
+      "file_id": 0,
+      "file_offset": 689664,
+      "span_bytes": 65536,
+      "shape": [
+        128,
+        256
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      }
+    },
+    {
+      "id": 17,
+      "name": "model.layers.0.mlp.experts.3.gate_proj.weight",
+      "file_id": 0,
+      "file_offset": 755200,
+      "span_bytes": 65536,
+      "shape": [
+        256,
+        128
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      }
+    },
+    {
+      "id": 18,
+      "name": "model.layers.0.mlp.experts.3.up_proj.weight",
+      "file_id": 0,
+      "file_offset": 820736,
+      "span_bytes": 65536,
+      "shape": [
+        256,
+        128
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      }
+    },
+    {
+      "id": 19,
+      "name": "model.layers.0.mlp.experts.3.down_proj.weight",
+      "file_id": 0,
+      "file_offset": 886272,
+      "span_bytes": 65536,
+      "shape": [
+        128,
+        256
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      }
+    },
+    {
+      "id": 20,
+      "name": "model.norm.weight",
+      "file_id": 0,
+      "file_offset": 951808,
+      "span_bytes": 256,
+      "shape": [
+        128
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      }
+    },
+    {
+      "id": 21,
+      "name": "lm_head.weight",
+      "file_id": 0,
+      "file_offset": 952064,
+      "span_bytes": 65536,
+      "shape": [
+        256,
+        128
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      }
+    }
+  ],
+  "tensors": [
+    {
+      "id": 0,
+      "name": "model.embed_tokens.weight",
+      "shape": [
+        256,
+        128
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "layout": {
+        "alignment": 256
+      },
+      "sharding": {
+        "axis": null,
+        "world": 1,
+        "rank": 0
+      },
+      "alignment": 256
+    },
+    {
+      "id": 1,
+      "name": "model.layers.0.input_layernorm.weight",
+      "shape": [
+        128
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "layout": {
+        "alignment": 256
+      },
+      "sharding": {
+        "axis": null,
+        "world": 1,
+        "rank": 0
+      },
+      "alignment": 256
+    },
+    {
+      "id": 2,
+      "name": "model.layers.0.self_attn.q_proj.weight",
+      "shape": [
+        64,
+        128
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "layout": {
+        "alignment": 256
+      },
+      "sharding": {
+        "axis": 0,
+        "world": 2,
+        "rank": 1
+      },
+      "alignment": 256
+    },
+    {
+      "id": 3,
+      "name": "model.layers.0.self_attn.k_proj.weight",
+      "shape": [
+        32,
+        128
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "layout": {
+        "alignment": 256
+      },
+      "sharding": {
+        "axis": 0,
+        "world": 2,
+        "rank": 1
+      },
+      "alignment": 256
+    },
+    {
+      "id": 4,
+      "name": "model.layers.0.self_attn.v_proj.weight",
+      "shape": [
+        32,
+        128
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "layout": {
+        "alignment": 256
+      },
+      "sharding": {
+        "axis": 0,
+        "world": 2,
+        "rank": 1
+      },
+      "alignment": 256
+    },
+    {
+      "id": 5,
+      "name": "model.layers.0.self_attn.o_proj.weight",
+      "shape": [
+        128,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "layout": {
+        "alignment": 256
+      },
+      "sharding": {
+        "axis": 1,
+        "world": 2,
+        "rank": 1
+      },
+      "alignment": 256
+    },
+    {
+      "id": 6,
+      "name": "model.layers.0.post_attention_layernorm.weight",
+      "shape": [
+        128
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "layout": {
+        "alignment": 256
+      },
+      "sharding": {
+        "axis": null,
+        "world": 1,
+        "rank": 0
+      },
+      "alignment": 256
+    },
+    {
+      "id": 7,
+      "name": "model.layers.0.mlp.gate.weight",
+      "shape": [
+        4,
+        128
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "layout": {
+        "alignment": 256
+      },
+      "sharding": {
+        "axis": null,
+        "world": 1,
+        "rank": 0
+      },
+      "alignment": 256
+    },
+    {
+      "id": 8,
+      "name": "model.layers.0.mlp.experts.0.gate_proj.weight",
+      "shape": [
+        128,
+        128
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "layout": {
+        "alignment": 256
+      },
+      "sharding": {
+        "axis": 0,
+        "world": 2,
+        "rank": 1
+      },
+      "alignment": 256
+    },
+    {
+      "id": 9,
+      "name": "model.layers.0.mlp.experts.0.up_proj.weight",
+      "shape": [
+        128,
+        128
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "layout": {
+        "alignment": 256
+      },
+      "sharding": {
+        "axis": 0,
+        "world": 2,
+        "rank": 1
+      },
+      "alignment": 256
+    },
+    {
+      "id": 10,
+      "name": "model.layers.0.mlp.experts.0.down_proj.weight",
+      "shape": [
+        128,
+        128
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "layout": {
+        "alignment": 256
+      },
+      "sharding": {
+        "axis": 1,
+        "world": 2,
+        "rank": 1
+      },
+      "alignment": 256
+    },
+    {
+      "id": 11,
+      "name": "model.layers.0.mlp.experts.1.gate_proj.weight",
+      "shape": [
+        128,
+        128
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "layout": {
+        "alignment": 256
+      },
+      "sharding": {
+        "axis": 0,
+        "world": 2,
+        "rank": 1
+      },
+      "alignment": 256
+    },
+    {
+      "id": 12,
+      "name": "model.layers.0.mlp.experts.1.up_proj.weight",
+      "shape": [
+        128,
+        128
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "layout": {
+        "alignment": 256
+      },
+      "sharding": {
+        "axis": 0,
+        "world": 2,
+        "rank": 1
+      },
+      "alignment": 256
+    },
+    {
+      "id": 13,
+      "name": "model.layers.0.mlp.experts.1.down_proj.weight",
+      "shape": [
+        128,
+        128
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "layout": {
+        "alignment": 256
+      },
+      "sharding": {
+        "axis": 1,
+        "world": 2,
+        "rank": 1
+      },
+      "alignment": 256
+    },
+    {
+      "id": 14,
+      "name": "model.layers.0.mlp.experts.2.gate_proj.weight",
+      "shape": [
+        128,
+        128
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "layout": {
+        "alignment": 256
+      },
+      "sharding": {
+        "axis": 0,
+        "world": 2,
+        "rank": 1
+      },
+      "alignment": 256
+    },
+    {
+      "id": 15,
+      "name": "model.layers.0.mlp.experts.2.up_proj.weight",
+      "shape": [
+        128,
+        128
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "layout": {
+        "alignment": 256
+      },
+      "sharding": {
+        "axis": 0,
+        "world": 2,
+        "rank": 1
+      },
+      "alignment": 256
+    },
+    {
+      "id": 16,
+      "name": "model.layers.0.mlp.experts.2.down_proj.weight",
+      "shape": [
+        128,
+        128
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "layout": {
+        "alignment": 256
+      },
+      "sharding": {
+        "axis": 1,
+        "world": 2,
+        "rank": 1
+      },
+      "alignment": 256
+    },
+    {
+      "id": 17,
+      "name": "model.layers.0.mlp.experts.3.gate_proj.weight",
+      "shape": [
+        128,
+        128
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "layout": {
+        "alignment": 256
+      },
+      "sharding": {
+        "axis": 0,
+        "world": 2,
+        "rank": 1
+      },
+      "alignment": 256
+    },
+    {
+      "id": 18,
+      "name": "model.layers.0.mlp.experts.3.up_proj.weight",
+      "shape": [
+        128,
+        128
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "layout": {
+        "alignment": 256
+      },
+      "sharding": {
+        "axis": 0,
+        "world": 2,
+        "rank": 1
+      },
+      "alignment": 256
+    },
+    {
+      "id": 19,
+      "name": "model.layers.0.mlp.experts.3.down_proj.weight",
+      "shape": [
+        128,
+        128
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "layout": {
+        "alignment": 256
+      },
+      "sharding": {
+        "axis": 1,
+        "world": 2,
+        "rank": 1
+      },
+      "alignment": 256
+    },
+    {
+      "id": 20,
+      "name": "model.norm.weight",
+      "shape": [
+        128
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "layout": {
+        "alignment": 256
+      },
+      "sharding": {
+        "axis": null,
+        "world": 1,
+        "rank": 0
+      },
+      "alignment": 256
+    },
+    {
+      "id": 21,
+      "name": "lm_head.weight",
+      "shape": [
+        256,
+        128
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      },
+      "layout": {
+        "alignment": 256
+      },
+      "sharding": {
+        "axis": null,
+        "world": 1,
+        "rank": 0
+      },
+      "alignment": 256
+    }
+  ],
+  "buffers": [
+    {
+      "id": 0,
+      "tensor": 0,
+      "bytes": 65536,
+      "alignment": 256,
+      "temporary": false,
+      "persistent_offset": 0
+    },
+    {
+      "id": 1,
+      "tensor": 1,
+      "bytes": 256,
+      "alignment": 256,
+      "temporary": false,
+      "persistent_offset": 65536
+    },
+    {
+      "id": 2,
+      "tensor": 2,
+      "bytes": 16384,
+      "alignment": 256,
+      "temporary": false,
+      "persistent_offset": 65792
+    },
+    {
+      "id": 3,
+      "tensor": 3,
+      "bytes": 8192,
+      "alignment": 256,
+      "temporary": false,
+      "persistent_offset": 82176
+    },
+    {
+      "id": 4,
+      "tensor": 4,
+      "bytes": 8192,
+      "alignment": 256,
+      "temporary": false,
+      "persistent_offset": 90368
+    },
+    {
+      "id": 5,
+      "tensor": 5,
+      "bytes": 16384,
+      "alignment": 256,
+      "temporary": false,
+      "persistent_offset": 427776
+    },
+    {
+      "id": 6,
+      "tensor": 6,
+      "bytes": 256,
+      "alignment": 256,
+      "temporary": false,
+      "persistent_offset": 98560
+    },
+    {
+      "id": 7,
+      "tensor": 7,
+      "bytes": 1024,
+      "alignment": 256,
+      "temporary": false,
+      "persistent_offset": 98816
+    },
+    {
+      "id": 8,
+      "tensor": 8,
+      "bytes": 32768,
+      "alignment": 256,
+      "temporary": false,
+      "persistent_offset": 99840
+    },
+    {
+      "id": 9,
+      "tensor": 9,
+      "bytes": 32768,
+      "alignment": 256,
+      "temporary": false,
+      "persistent_offset": 132608
+    },
+    {
+      "id": 10,
+      "tensor": 10,
+      "bytes": 32768,
+      "alignment": 256,
+      "temporary": false,
+      "persistent_offset": 444160
+    },
+    {
+      "id": 11,
+      "tensor": 11,
+      "bytes": 32768,
+      "alignment": 256,
+      "temporary": false,
+      "persistent_offset": 165376
+    },
+    {
+      "id": 12,
+      "tensor": 12,
+      "bytes": 32768,
+      "alignment": 256,
+      "temporary": false,
+      "persistent_offset": 198144
+    },
+    {
+      "id": 13,
+      "tensor": 13,
+      "bytes": 32768,
+      "alignment": 256,
+      "temporary": false,
+      "persistent_offset": 476928
+    },
+    {
+      "id": 14,
+      "tensor": 14,
+      "bytes": 32768,
+      "alignment": 256,
+      "temporary": false,
+      "persistent_offset": 230912
+    },
+    {
+      "id": 15,
+      "tensor": 15,
+      "bytes": 32768,
+      "alignment": 256,
+      "temporary": false,
+      "persistent_offset": 263680
+    },
+    {
+      "id": 16,
+      "tensor": 16,
+      "bytes": 32768,
+      "alignment": 256,
+      "temporary": false,
+      "persistent_offset": 509696
+    },
+    {
+      "id": 17,
+      "tensor": 17,
+      "bytes": 32768,
+      "alignment": 256,
+      "temporary": false,
+      "persistent_offset": 296448
+    },
+    {
+      "id": 18,
+      "tensor": 18,
+      "bytes": 32768,
+      "alignment": 256,
+      "temporary": false,
+      "persistent_offset": 329216
+    },
+    {
+      "id": 19,
+      "tensor": 19,
+      "bytes": 32768,
+      "alignment": 256,
+      "temporary": false,
+      "persistent_offset": 542464
+    },
+    {
+      "id": 20,
+      "tensor": 20,
+      "bytes": 256,
+      "alignment": 256,
+      "temporary": false,
+      "persistent_offset": 361984
+    },
+    {
+      "id": 21,
+      "tensor": 21,
+      "bytes": 65536,
+      "alignment": 256,
+      "temporary": false,
+      "persistent_offset": 362240
+    }
+  ],
+  "instrs": [
+    {
+      "Allocate": {
+        "id": 0,
+        "buffer": 0
+      }
+    },
+    {
+      "Allocate": {
+        "id": 1,
+        "buffer": 1
+      }
+    },
+    {
+      "Allocate": {
+        "id": 2,
+        "buffer": 2
+      }
+    },
+    {
+      "Allocate": {
+        "id": 3,
+        "buffer": 3
+      }
+    },
+    {
+      "Allocate": {
+        "id": 4,
+        "buffer": 4
+      }
+    },
+    {
+      "Allocate": {
+        "id": 5,
+        "buffer": 5
+      }
+    },
+    {
+      "Allocate": {
+        "id": 6,
+        "buffer": 6
+      }
+    },
+    {
+      "Allocate": {
+        "id": 7,
+        "buffer": 7
+      }
+    },
+    {
+      "Allocate": {
+        "id": 8,
+        "buffer": 8
+      }
+    },
+    {
+      "Allocate": {
+        "id": 9,
+        "buffer": 9
+      }
+    },
+    {
+      "Allocate": {
+        "id": 10,
+        "buffer": 10
+      }
+    },
+    {
+      "Allocate": {
+        "id": 11,
+        "buffer": 11
+      }
+    },
+    {
+      "Allocate": {
+        "id": 12,
+        "buffer": 12
+      }
+    },
+    {
+      "Allocate": {
+        "id": 13,
+        "buffer": 13
+      }
+    },
+    {
+      "Allocate": {
+        "id": 14,
+        "buffer": 14
+      }
+    },
+    {
+      "Allocate": {
+        "id": 15,
+        "buffer": 15
+      }
+    },
+    {
+      "Allocate": {
+        "id": 16,
+        "buffer": 16
+      }
+    },
+    {
+      "Allocate": {
+        "id": 17,
+        "buffer": 17
+      }
+    },
+    {
+      "Allocate": {
+        "id": 18,
+        "buffer": 18
+      }
+    },
+    {
+      "Allocate": {
+        "id": 19,
+        "buffer": 19
+      }
+    },
+    {
+      "Allocate": {
+        "id": 20,
+        "buffer": 20
+      }
+    },
+    {
+      "Allocate": {
+        "id": 21,
+        "buffer": 21
+      }
+    },
+    {
+      "BulkExtentWrite": {
+        "id": 22,
+        "source": {
+          "file_id": 0,
+          "tensor_id": 0,
+          "file_offset": 0,
+          "span_bytes": 65792,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 1,
+            "dims": [
+              {
+                "count": 65792,
+                "src_stride": 1,
+                "dst_stride": 1
+              }
+            ]
+          }
+        },
+        "dest_offset": 0
+      }
+    },
+    {
+      "BulkExtentWrite": {
+        "id": 23,
+        "source": {
+          "file_id": 0,
+          "tensor_id": 2,
+          "file_offset": 82176,
+          "span_bytes": 16384,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 1,
+            "dims": [
+              {
+                "count": 16384,
+                "src_stride": 1,
+                "dst_stride": 1
+              }
+            ]
+          }
+        },
+        "dest_offset": 65792
+      }
+    },
+    {
+      "BulkExtentWrite": {
+        "id": 24,
+        "source": {
+          "file_id": 0,
+          "tensor_id": 3,
+          "file_offset": 106752,
+          "span_bytes": 8192,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 1,
+            "dims": [
+              {
+                "count": 8192,
+                "src_stride": 1,
+                "dst_stride": 1
+              }
+            ]
+          }
+        },
+        "dest_offset": 82176
+      }
+    },
+    {
+      "BulkExtentWrite": {
+        "id": 25,
+        "source": {
+          "file_id": 0,
+          "tensor_id": 4,
+          "file_offset": 123136,
+          "span_bytes": 8192,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 1,
+            "dims": [
+              {
+                "count": 8192,
+                "src_stride": 1,
+                "dst_stride": 1
+              }
+            ]
+          }
+        },
+        "dest_offset": 90368
+      }
+    },
+    {
+      "BulkExtentWrite": {
+        "id": 26,
+        "source": {
+          "file_id": 0,
+          "tensor_id": 6,
+          "file_offset": 164096,
+          "span_bytes": 1280,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 1,
+            "dims": [
+              {
+                "count": 1280,
+                "src_stride": 1,
+                "dst_stride": 1
+              }
+            ]
+          }
+        },
+        "dest_offset": 98560
+      }
+    },
+    {
+      "BulkExtentWrite": {
+        "id": 27,
+        "source": {
+          "file_id": 0,
+          "tensor_id": 8,
+          "file_offset": 198144,
+          "span_bytes": 32768,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 1,
+            "dims": [
+              {
+                "count": 32768,
+                "src_stride": 1,
+                "dst_stride": 1
+              }
+            ]
+          }
+        },
+        "dest_offset": 99840
+      }
+    },
+    {
+      "BulkExtentWrite": {
+        "id": 28,
+        "source": {
+          "file_id": 0,
+          "tensor_id": 9,
+          "file_offset": 263680,
+          "span_bytes": 32768,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 1,
+            "dims": [
+              {
+                "count": 32768,
+                "src_stride": 1,
+                "dst_stride": 1
+              }
+            ]
+          }
+        },
+        "dest_offset": 132608
+      }
+    },
+    {
+      "BulkExtentWrite": {
+        "id": 29,
+        "source": {
+          "file_id": 0,
+          "tensor_id": 11,
+          "file_offset": 394752,
+          "span_bytes": 32768,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 1,
+            "dims": [
+              {
+                "count": 32768,
+                "src_stride": 1,
+                "dst_stride": 1
+              }
+            ]
+          }
+        },
+        "dest_offset": 165376
+      }
+    },
+    {
+      "BulkExtentWrite": {
+        "id": 30,
+        "source": {
+          "file_id": 0,
+          "tensor_id": 12,
+          "file_offset": 460288,
+          "span_bytes": 32768,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 1,
+            "dims": [
+              {
+                "count": 32768,
+                "src_stride": 1,
+                "dst_stride": 1
+              }
+            ]
+          }
+        },
+        "dest_offset": 198144
+      }
+    },
+    {
+      "BulkExtentWrite": {
+        "id": 31,
+        "source": {
+          "file_id": 0,
+          "tensor_id": 14,
+          "file_offset": 591360,
+          "span_bytes": 32768,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 1,
+            "dims": [
+              {
+                "count": 32768,
+                "src_stride": 1,
+                "dst_stride": 1
+              }
+            ]
+          }
+        },
+        "dest_offset": 230912
+      }
+    },
+    {
+      "BulkExtentWrite": {
+        "id": 32,
+        "source": {
+          "file_id": 0,
+          "tensor_id": 15,
+          "file_offset": 656896,
+          "span_bytes": 32768,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 1,
+            "dims": [
+              {
+                "count": 32768,
+                "src_stride": 1,
+                "dst_stride": 1
+              }
+            ]
+          }
+        },
+        "dest_offset": 263680
+      }
+    },
+    {
+      "BulkExtentWrite": {
+        "id": 33,
+        "source": {
+          "file_id": 0,
+          "tensor_id": 17,
+          "file_offset": 787968,
+          "span_bytes": 32768,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 1,
+            "dims": [
+              {
+                "count": 32768,
+                "src_stride": 1,
+                "dst_stride": 1
+              }
+            ]
+          }
+        },
+        "dest_offset": 296448
+      }
+    },
+    {
+      "BulkExtentWrite": {
+        "id": 34,
+        "source": {
+          "file_id": 0,
+          "tensor_id": 18,
+          "file_offset": 853504,
+          "span_bytes": 32768,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 1,
+            "dims": [
+              {
+                "count": 32768,
+                "src_stride": 1,
+                "dst_stride": 1
+              }
+            ]
+          }
+        },
+        "dest_offset": 329216
+      }
+    },
+    {
+      "BulkExtentWrite": {
+        "id": 35,
+        "source": {
+          "file_id": 0,
+          "tensor_id": 20,
+          "file_offset": 951808,
+          "span_bytes": 65792,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 1,
+            "dims": [
+              {
+                "count": 65792,
+                "src_stride": 1,
+                "dst_stride": 1
+              }
+            ]
+          }
+        },
+        "dest_offset": 361984
+      }
+    },
+    {
+      "Finalize": {
+        "id": 36,
+        "tensor": 0,
+        "name": "model.embed_tokens.weight"
+      }
+    },
+    {
+      "Finalize": {
+        "id": 37,
+        "tensor": 1,
+        "name": "model.layers.0.input_layernorm.weight"
+      }
+    },
+    {
+      "Finalize": {
+        "id": 38,
+        "tensor": 2,
+        "name": "model.layers.0.self_attn.q_proj.weight"
+      }
+    },
+    {
+      "Finalize": {
+        "id": 39,
+        "tensor": 3,
+        "name": "model.layers.0.self_attn.k_proj.weight"
+      }
+    },
+    {
+      "Finalize": {
+        "id": 40,
+        "tensor": 4,
+        "name": "model.layers.0.self_attn.v_proj.weight"
+      }
+    },
+    {
+      "ExtentWrite": {
+        "id": 41,
+        "source": {
+          "file_id": 0,
+          "tensor_id": 5,
+          "file_offset": 131456,
+          "span_bytes": 16384,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 128,
+            "dims": [
+              {
+                "count": 128,
+                "src_stride": 256,
+                "dst_stride": 128
+              }
+            ]
+          }
+        },
+        "dest": {
+          "buffer": 5,
+          "offset": 0,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 2,
+            "dims": [
+              {
+                "count": 128,
+                "src_stride": 128,
+                "dst_stride": 128
+              },
+              {
+                "count": 64,
+                "src_stride": 2,
+                "dst_stride": 2
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "Finalize": {
+        "id": 42,
+        "tensor": 5,
+        "name": "model.layers.0.self_attn.o_proj.weight"
+      }
+    },
+    {
+      "Finalize": {
+        "id": 43,
+        "tensor": 6,
+        "name": "model.layers.0.post_attention_layernorm.weight"
+      }
+    },
+    {
+      "Finalize": {
+        "id": 44,
+        "tensor": 7,
+        "name": "model.layers.0.mlp.gate.weight"
+      }
+    },
+    {
+      "Finalize": {
+        "id": 45,
+        "tensor": 8,
+        "name": "model.layers.0.mlp.experts.0.gate_proj.weight"
+      }
+    },
+    {
+      "Finalize": {
+        "id": 46,
+        "tensor": 9,
+        "name": "model.layers.0.mlp.experts.0.up_proj.weight"
+      }
+    },
+    {
+      "ExtentWrite": {
+        "id": 47,
+        "source": {
+          "file_id": 0,
+          "tensor_id": 10,
+          "file_offset": 296704,
+          "span_bytes": 32768,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 256,
+            "dims": [
+              {
+                "count": 128,
+                "src_stride": 512,
+                "dst_stride": 256
+              }
+            ]
+          }
+        },
+        "dest": {
+          "buffer": 10,
+          "offset": 0,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 2,
+            "dims": [
+              {
+                "count": 128,
+                "src_stride": 256,
+                "dst_stride": 256
+              },
+              {
+                "count": 128,
+                "src_stride": 2,
+                "dst_stride": 2
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "Finalize": {
+        "id": 48,
+        "tensor": 10,
+        "name": "model.layers.0.mlp.experts.0.down_proj.weight"
+      }
+    },
+    {
+      "Finalize": {
+        "id": 49,
+        "tensor": 11,
+        "name": "model.layers.0.mlp.experts.1.gate_proj.weight"
+      }
+    },
+    {
+      "Finalize": {
+        "id": 50,
+        "tensor": 12,
+        "name": "model.layers.0.mlp.experts.1.up_proj.weight"
+      }
+    },
+    {
+      "ExtentWrite": {
+        "id": 51,
+        "source": {
+          "file_id": 0,
+          "tensor_id": 13,
+          "file_offset": 493312,
+          "span_bytes": 32768,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 256,
+            "dims": [
+              {
+                "count": 128,
+                "src_stride": 512,
+                "dst_stride": 256
+              }
+            ]
+          }
+        },
+        "dest": {
+          "buffer": 13,
+          "offset": 0,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 2,
+            "dims": [
+              {
+                "count": 128,
+                "src_stride": 256,
+                "dst_stride": 256
+              },
+              {
+                "count": 128,
+                "src_stride": 2,
+                "dst_stride": 2
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "Finalize": {
+        "id": 52,
+        "tensor": 13,
+        "name": "model.layers.0.mlp.experts.1.down_proj.weight"
+      }
+    },
+    {
+      "Finalize": {
+        "id": 53,
+        "tensor": 14,
+        "name": "model.layers.0.mlp.experts.2.gate_proj.weight"
+      }
+    },
+    {
+      "Finalize": {
+        "id": 54,
+        "tensor": 15,
+        "name": "model.layers.0.mlp.experts.2.up_proj.weight"
+      }
+    },
+    {
+      "ExtentWrite": {
+        "id": 55,
+        "source": {
+          "file_id": 0,
+          "tensor_id": 16,
+          "file_offset": 689920,
+          "span_bytes": 32768,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 256,
+            "dims": [
+              {
+                "count": 128,
+                "src_stride": 512,
+                "dst_stride": 256
+              }
+            ]
+          }
+        },
+        "dest": {
+          "buffer": 16,
+          "offset": 0,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 2,
+            "dims": [
+              {
+                "count": 128,
+                "src_stride": 256,
+                "dst_stride": 256
+              },
+              {
+                "count": 128,
+                "src_stride": 2,
+                "dst_stride": 2
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "Finalize": {
+        "id": 56,
+        "tensor": 16,
+        "name": "model.layers.0.mlp.experts.2.down_proj.weight"
+      }
+    },
+    {
+      "Finalize": {
+        "id": 57,
+        "tensor": 17,
+        "name": "model.layers.0.mlp.experts.3.gate_proj.weight"
+      }
+    },
+    {
+      "Finalize": {
+        "id": 58,
+        "tensor": 18,
+        "name": "model.layers.0.mlp.experts.3.up_proj.weight"
+      }
+    },
+    {
+      "ExtentWrite": {
+        "id": 59,
+        "source": {
+          "file_id": 0,
+          "tensor_id": 19,
+          "file_offset": 886528,
+          "span_bytes": 32768,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 256,
+            "dims": [
+              {
+                "count": 128,
+                "src_stride": 512,
+                "dst_stride": 256
+              }
+            ]
+          }
+        },
+        "dest": {
+          "buffer": 19,
+          "offset": 0,
+          "stride": {
+            "base_offset": 0,
+            "element_bytes": 2,
+            "dims": [
+              {
+                "count": 128,
+                "src_stride": 256,
+                "dst_stride": 256
+              },
+              {
+                "count": 128,
+                "src_stride": 2,
+                "dst_stride": 2
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "Finalize": {
+        "id": 60,
+        "tensor": 19,
+        "name": "model.layers.0.mlp.experts.3.down_proj.weight"
+      }
+    },
+    {
+      "Finalize": {
+        "id": 61,
+        "tensor": 20,
+        "name": "model.norm.weight"
+      }
+    },
+    {
+      "Finalize": {
+        "id": 62,
+        "tensor": 21,
+        "name": "lm_head.weight"
+      }
+    }
+  ],
+  "schedule": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36,
+    37,
+    38,
+    39,
+    40,
+    41,
+    42,
+    43,
+    44,
+    45,
+    46,
+    47,
+    48,
+    49,
+    50,
+    51,
+    52,
+    53,
+    54,
+    55,
+    56,
+    57,
+    58,
+    59,
+    60,
+    61,
+    62
+  ],
+  "memory": {
+    "persistent_bytes": 575232,
+    "temporary_peak_bytes": 0,
+    "transform_scratch_peak_bytes": 0,
+    "checkpoint_read_bytes": 575232,
+    "device_write_bytes": 575232
+  },
+  "attachments": []
+}

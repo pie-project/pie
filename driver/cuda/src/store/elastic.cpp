@@ -1,6 +1,9 @@
 #include "elastic.hpp"
 
+#include <cuda_runtime.h>
+
 #include <algorithm>
+#include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -57,6 +60,41 @@ CudaPhysicalPool::CudaPhysicalPool(
 }
 
 CudaPhysicalPool::~CudaPhysicalPool() = default;
+
+void CudaPhysicalPool::set_peer_devices(std::vector<int> peers) {
+    peer_devices_.clear();
+    for (int peer : peers) {
+        if (peer == device_ordinal_) continue;
+        int accessible = 0;
+        if (cudaDeviceCanAccessPeer(&accessible, device_ordinal_, peer) !=
+                cudaSuccess ||
+            accessible == 0) {
+            std::cerr << "[pie-driver-cuda] elastic pool: device "
+                      << device_ordinal_ << " cannot peer-access device "
+                      << peer << "; arenas stay device-private\n";
+            continue;
+        }
+        peer_devices_.push_back(peer);
+    }
+}
+
+std::vector<CUmemAccessDesc> CudaPhysicalPool::access_descriptors() const {
+    std::vector<CUmemAccessDesc> descs;
+    descs.reserve(peer_devices_.size() + 1);
+    CUmemAccessDesc self{};
+    self.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    self.location.id = device_ordinal_;
+    self.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    descs.push_back(self);
+    for (int peer : peer_devices_) {
+        CUmemAccessDesc desc{};
+        desc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        desc.location.id = peer;
+        desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        descs.push_back(desc);
+    }
+    return descs;
+}
 
 bool CudaPhysicalPool::try_reserve(std::size_t pages) {
     std::lock_guard lock(mutex_);
@@ -273,12 +311,9 @@ void CudaArena::grow_reserved(std::size_t bytes) {
     if (target <= committed_bytes()) return;
     const std::size_t old_count = handles_.size();
     const std::size_t old_cached_count = cached_handles_.size();
+    const std::vector<CUmemAccessDesc> access = pool_->access_descriptors();
     try {
         while (committed_bytes() < target) {
-            CUmemAllocationProp prop{};
-            prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-            prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-            prop.location.id = pool_->device_ordinal();
             const bool reused = !cached_handles_.empty();
             CUmemGenericAllocationHandle handle = 0;
             if (reused) {
@@ -299,11 +334,9 @@ void CudaArena::grow_reserved(std::size_t bytes) {
                     cuMemMap(address, map_unit_bytes_, 0, handle, 0),
                     "cuMemMap");
                 mapped = true;
-                CUmemAccessDesc access{};
-                access.location = prop.location;
-                access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
                 check_cu(
-                    cuMemSetAccess(address, map_unit_bytes_, &access, 1),
+                    cuMemSetAccess(address, map_unit_bytes_, access.data(),
+                                   access.size()),
                     "cuMemSetAccess");
             } catch (...) {
                 if (mapped) {
@@ -477,6 +510,17 @@ std::size_t CudaArenaAllocator::committed_bytes() const noexcept {
 std::size_t CudaArenaAllocator::allocated_bytes() const noexcept {
     std::lock_guard lock(mutex_);
     return allocated_bytes_;
+}
+
+std::vector<void*> CudaArenaAllocator::arena_bases() const {
+    std::lock_guard lock(mutex_);
+    std::vector<void*> bases;
+    bases.reserve(arenas_.size());
+    for (const auto& arena : arenas_) {
+        if (arena->committed_bytes() == 0) continue;
+        bases.push_back(reinterpret_cast<void*>(arena->base()));
+    }
+    return bases;
 }
 
 std::size_t CudaArenaAllocator::target_bytes(

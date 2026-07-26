@@ -64,6 +64,36 @@ pub fn value_head() -> Tensor {
 pub fn layer() -> Tensor {
     intrinsic_val(IntrinsicId::Layer, Shape::SCALAR, DType::U32)
 }
+/// `intrinsics::attn_score(kv_max)` — how much attention THIS layer paid to
+/// each live KV position, `[kv_max]` F32. Readable only at `on_attn` (the
+/// scores do not exist until the layer's attention has run) and model-gated on
+/// `has_attn_score`.
+///
+/// The value is the attention probability the request's MOST RECENT query
+/// token assigned to KV position `i`, averaged over the query heads. That is
+/// TOVA's quantity exactly (Oren et al., arXiv:2401.06104), H2O's per-step
+/// increment (Zhang et al., arXiv:2306.14048), and SnapKV's observation window
+/// at width 1.
+///
+/// Heads are folded by the backend, not by the program, for the same reason
+/// Quest's `envelope_dot` folds them: the paged KV layout carries ONE page list
+/// per request, so eviction is a per-request decision and a per-head score has
+/// no representable consumer. Folding in the kernel also avoids materialising
+/// `[num_heads, kv_max]` per layer.
+///
+/// Slot semantics:
+///   - `i < kv_len` -> the mean attention probability at that position; the
+///     live prefix sums to 1;
+///   - `kv_len <= i < kv_max` -> `0.0`. A position that does not exist received
+///     no attention, so it sorts to the bottom of every eviction ranking
+///     without a sentinel.
+///
+/// `kv_max` is the program's own ceiling (`prompt + max_tokens`, mirroring
+/// `envelope_dot`'s `p_max`); the backend refuses a request longer than it
+/// rather than truncating.
+pub fn attn_score(kv_max: u32) -> Tensor {
+    intrinsic_val(IntrinsicId::AttnScore, Shape::vector(kv_max.max(1)), DType::F32)
+}
 
 /// Reshape a `[1, vocab]` logits matrix to `[vocab]` for the single-row case
 /// (matches echo's §3 golden). Multi-row passes keep the matrix.
@@ -79,19 +109,81 @@ fn single_row_reshape(t: Tensor) -> Tensor {
 /// Second-party kernels (`intrinsics::kernel::*`, overview §4). Full rollout is
 /// P7; a minimal `attn_page_mask` sink exists now so T11 is enforceable.
 pub mod kernel {
-    use crate::context::record_sink;
+    use crate::context::{emit, intern_name, record_sink};
     use crate::error::Span;
-    use crate::value::AsTensor;
+    use crate::value::{AsTensor, Tensor};
     use alloc::string::String;
+    use alloc::vec;
+    use pie_ptir::op::{IntrinsicId, Op};
     use pie_ptir::registry::SinkScope;
+    use pie_ptir::types::{DType, Shape, ValueType};
+
+    /// `envelope_dot(p_max)` — Quest page criticality for THIS layer, `[p_max]`
+    /// F32 (Tang et al., arXiv:2406.10774). Model-gated on the backend's
+    /// `envelope_dot` kernel; a backend without per-page key envelopes refuses
+    /// the program at bind.
+    ///
+    /// Slot semantics, so a consumer can be written without guessing:
+    ///   - a page this request owns whose contents are final -> its criticality
+    ///     upper bound, `max` over kv heads of `Σ_qh Σ_d max(q·kmin, q·kmax)`;
+    ///   - a page the current forward is still filling -> `+inf`, i.e. always
+    ///     selected. Quest keeps the local window anyway, and a stale bound
+    ///     would be a silent mis-rank;
+    ///   - a slot past this request's page list -> `-inf`, so a `rank_le` never
+    ///     picks one.
+    ///
+    /// `p_max` is the program's own page ceiling; the backend refuses a request
+    /// whose page list is longer, rather than truncating it.
+    ///
+    /// Takes no argument even though the underlying op is
+    /// `KernelCall(envelope_dot, [query])`: the query it scores is the model's
+    /// projected query for this fire's last token, whose width
+    /// (`num_q_heads * head_dim`) is a backend constant PTIR has no extent for.
+    /// The declared query is therefore a HANDLE — the backend binds the real
+    /// row — and the DSL emits it rather than asking an author to invent a
+    /// width.
+    #[track_caller]
+    pub fn envelope_dot(p_max: u32) -> Tensor {
+        let query_ty = ValueType::new(Shape::vector(1), super::activation_type);
+        let query = emit(
+            Op::IntrinsicVal {
+                intr: IntrinsicId::Query,
+                shape: query_ty.shape,
+                dtype: query_ty.dtype,
+            },
+            &[query_ty],
+        );
+        let score_ty = ValueType::new(Shape::vector(p_max), DType::F32);
+        let name = intern_name("envelope_dot");
+        Tensor::node(
+            emit(
+                Op::KernelCall {
+                    name,
+                    args: vec![query],
+                    shape: score_ty.shape,
+                    dtype: score_ty.dtype,
+                },
+                &[score_ty],
+            ),
+            score_ty,
+        )
+    }
 
     /// `attn_page_mask(mask)` — a configuration sink (overview §6.1): this
-    /// layer's attention consumes the page mask. Returns nothing. Recorded for
-    /// T11 precedence (must precede this layer's attention).
+    /// layer's attention consumes the page mask. Returns nothing.
+    ///
+    /// `mask` is `[p_max]`, one entry per page of the request's page list in
+    /// order; a nonzero entry keeps the page. It is recorded twice on purpose:
+    /// as an `Op::SinkCall` so the mask VALUE reaches the backend, and in the
+    /// session's sink list so T11 can check this call precedes the layer's
+    /// attention. Dropping the argument (as this did before it had a lowering)
+    /// makes the sink a no-op that still type-checks.
     #[track_caller]
     pub fn attn_page_mask(mask: impl AsTensor) {
         let span = Span::here();
-        let _ = mask.to_arg();
+        let (mask, _) = mask.to_arg().materialize();
+        let name = intern_name("attn_page_mask");
+        emit(Op::SinkCall { name, args: vec![mask] }, &[]);
         record_sink(String::from("attn_page_mask"), span, SinkScope::Attention);
     }
 }

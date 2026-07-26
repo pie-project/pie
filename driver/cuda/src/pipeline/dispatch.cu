@@ -45,6 +45,9 @@
 #include "pipeline/frame_carrier.hpp"
 #include "pipeline/page_translation.hpp"
 #include "batch/rs_metadata.hpp"
+#include "model/attn_observation.hpp"
+#include "model/attn_score.hpp"
+#include "store/kv_cache.hpp"
 
 namespace pie_cuda_driver::pipeline {
 
@@ -52,6 +55,13 @@ namespace pie_cuda_driver::pipeline {
 // fire-geometry) now lives in pie_native::ptir (driver/common); bring it into
 // scope so the CUDA-side tier-0/1 code below can use it unqualified.
 using namespace pie_native::ptir;
+
+// `store/kv_cache.hpp` (pulled in for the `envelope_dot` KV geometry) declares
+// its own `pie_cuda_driver::DType`, which sits closer in the lookup chain than
+// the using-directive above and would silently retarget every unqualified
+// `DType` in this file. Pin the PTIR one explicitly; the cache's own dtype is
+// spelled `pie_cuda_driver::DType` where it is needed.
+using DType = pie_native::ptir::DType;
 
 struct CallbackFence {
     std::atomic<std::uint32_t> pending{0};
@@ -202,6 +212,12 @@ struct BoundInstance {
         std::uint32_t* device = nullptr;
         std::uint32_t* host = nullptr;
         std::uint32_t* host_device = nullptr;
+        // Set once a wave's pull-validate has seeded the words below.
+        // FramePrepare reads the commit word BEFORE this wave's
+        // pull-validate runs, so an unseeded snapshot carries no verdict —
+        // gating on it would refuse the lane for whatever the pool (or
+        // `cudaMalloc`) happened to leave behind.
+        bool ever_validated = false;
     };
 
     std::uint64_t program_hash = 0;
@@ -1274,6 +1290,8 @@ struct Dispatch::Impl {
     cudaStream_t signature_streams[kSignatureStreamCount] = {};
     bool attention_hook_coverage = false;
     std::uint32_t model_layers = 0;
+    bool kv_envelopes_available = false;
+    std::function<void()> enable_kv_envelopes;
 };
 
 struct StagedLane {
@@ -1492,6 +1510,13 @@ struct NotifyContext {
     std::size_t entry_count = 0;
     PinnedHostVector<CommitBumpLane> commit_lanes;
     PinnedHostVector<HostChannelSettlementLane> settlement_lanes;
+    // Scatter-kernel descriptors, materialized from the three vectors below
+    // only when that transport is selected. Pinned so the upload is a real
+    // async copy rather than a staging round trip on the lane thread.
+    PinnedHostVector<HostPublishCopy> publish_copies;
+    // Reused [begin, end) scratch for the destination-overlap test, so the
+    // per-wave check sorts without reallocating.
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> overlap_scratch;
     std::vector<void*> copy_destinations;
     std::vector<const void*> copy_sources;
     std::vector<std::size_t> copy_sizes;
@@ -1532,6 +1557,8 @@ struct NotifyContext {
         entry_count = 0;
         commit_lanes.clear();
         settlement_lanes.clear();
+        publish_copies.clear();
+        overlap_scratch.clear();
         copy_destinations.clear();
         copy_sources.clear();
         copy_sizes.clear();
@@ -1741,6 +1768,7 @@ void CUDART_CB notify_runtime_callback(void* userdata) {
     ctx->callback_fences.clear();
     ctx->commit_lanes.clear();
     ctx->settlement_lanes.clear();
+    ctx->publish_copies.clear();
     ctx->in_use.store(false, std::memory_order_release);
     settle_wave_record(impl, self);
 }
@@ -1751,59 +1779,106 @@ void close_bound_instance(
     std::uint64_t instance_id,
     bool retain_resources = true);
 
-bool host_publish_destinations_overlap(
-    const NotifyContext& context) {
-    for (std::size_t left = 0;
-         left < context.copy_destinations.size();
-         ++left) {
-        const auto left_begin = reinterpret_cast<std::uintptr_t>(
-            context.copy_destinations[left]);
-        const std::size_t left_bytes = context.copy_sizes[left];
-        if (left_bytes >
-            std::numeric_limits<std::uintptr_t>::max() - left_begin) {
+// True if any two publication destinations name overlapping bytes, in which
+// case only a sequential enqueue gives them a defined order.
+//
+// Sorting rather than comparing every pair: a 512-wide wave publishes 512
+// cells, and the quadratic form cost ~130 µs of lane-thread time per wave —
+// the same order as the whole settlement prologue it sits in.
+bool host_publish_destinations_overlap(NotifyContext& context) {
+    const std::size_t count = context.copy_destinations.size();
+    if (count < 2) return false;
+    context.overlap_scratch.clear();
+    context.overlap_scratch.reserve(count);
+    for (std::size_t index = 0; index < count; ++index) {
+        const auto begin =
+            reinterpret_cast<std::uintptr_t>(context.copy_destinations[index]);
+        const std::size_t bytes = context.copy_sizes[index];
+        if (bytes > std::numeric_limits<std::uintptr_t>::max() - begin) {
             return true;
         }
-        const auto left_end = left_begin + left_bytes;
-        for (std::size_t right = left + 1;
-             right < context.copy_destinations.size();
-             ++right) {
-            const auto right_begin = reinterpret_cast<std::uintptr_t>(
-                context.copy_destinations[right]);
-            const std::size_t right_bytes = context.copy_sizes[right];
-            if (right_bytes >
-                std::numeric_limits<std::uintptr_t>::max() - right_begin) {
-                return true;
-            }
-            const auto right_end = right_begin + right_bytes;
-            if (left_begin < right_end && right_begin < left_end) {
-                return true;
-            }
+        context.overlap_scratch.emplace_back(begin, begin + bytes);
+    }
+    std::sort(
+        context.overlap_scratch.begin(), context.overlap_scratch.end());
+    for (std::size_t index = 1; index < count; ++index) {
+        // Sorted by start, so a range can only overlap its predecessor's
+        // reach; empty ranges never overlap.
+        if (context.overlap_scratch[index].first <
+            context.overlap_scratch[index - 1].second) {
+            return true;
         }
     }
     return false;
 }
 
-bool can_batch_host_publish_copies(
-    const NotifyContext& context,
-    cudaStream_t stream) {
+// How a wave's host-visible output cells reach their pinned mirrors.
+//
+// `Scatter` is the default for the decode-shaped waves that dominate: one
+// kernel writes every cell straight into the mapped mirrors, so a wave costs
+// a single launch instead of one copy-engine transfer per (lane, host-read
+// output channel). `Batched` keeps the copy engine for cells big enough that
+// DMA bandwidth beats scattered PCIe writes. `Sequential` is the
+// always-available fallback, and the only path that gives overlapping
+// destinations a defined last-writer-wins order.
+enum class HostPublishTransport {
+    Sequential,
+    Batched,
+    Scatter,
+};
+
+// Cells at or below this size are published by the scatter kernel. A
+// copy-engine D2H costs ~2 µs of GPU time almost independently of size, so
+// below a few KB that fixed cost, not bandwidth, decides; above it the copy
+// engine wins and the work goes back to DMA.
+constexpr std::size_t kMaxScatterCellBytes = 4096;
+
+HostPublishTransport select_host_publish_transport(
+    NotifyContext& context,
+    cudaStream_t batch_stream) {
+    if (context.copy_destinations.size() <= 1) {
+        return HostPublishTransport::Sequential;
+    }
+    // Neither aggregated transport orders its entries against each other.
+    if (host_publish_destinations_overlap(context)) {
+        return HostPublishTransport::Sequential;
+    }
+    const bool cells_are_small = std::all_of(
+        context.copy_sizes.begin(),
+        context.copy_sizes.end(),
+        [](std::size_t bytes) { return bytes <= kMaxScatterCellBytes; });
+    if (cells_are_small) return HostPublishTransport::Scatter;
 #if CUDART_VERSION >= 12080
-    return stream != nullptr &&
-        context.copy_destinations.size() > 1 &&
-        !host_publish_destinations_overlap(context);
+    if (batch_stream != nullptr) return HostPublishTransport::Batched;
 #else
-    static_cast<void>(context);
-    static_cast<void>(stream);
-    return false;
+    static_cast<void>(batch_stream);
 #endif
+    return HostPublishTransport::Sequential;
 }
 
 void enqueue_host_publish_copies(
     NotifyContext& context,
     cudaStream_t stream,
-    bool batched) {
+    HostPublishTransport transport) {
     if (context.copy_destinations.empty()) return;
+    if (transport == HostPublishTransport::Scatter) {
+        context.publish_copies.clear();
+        for (std::size_t index = 0;
+             index < context.copy_destinations.size();
+             ++index) {
+            context.publish_copies.push_back(HostPublishCopy{
+                .destination = context.copy_destinations[index],
+                .source = context.copy_sources[index],
+                .bytes =
+                    static_cast<std::uint32_t>(context.copy_sizes[index]),
+            });
+        }
+        launch_scatter_host_publish_copies(
+            context.publish_copies.values(), stream);
+        return;
+    }
 #if CUDART_VERSION >= 12080
-    if (batched) {
+    if (transport == HostPublishTransport::Batched) {
         cudaMemcpyAttributes attributes{};
         attributes.srcAccessOrder =
             cudaMemcpySrcAccessOrderStream;
@@ -1844,8 +1919,6 @@ void enqueue_host_publish_copies(
         }
         return;
     }
-#else
-    static_cast<void>(batched);
 #endif
     for (std::size_t index = 0;
          index < context.copy_destinations.size();
@@ -2129,6 +2202,23 @@ std::uint32_t stage_logits_vocab(
             "PTIR logical vocabulary exceeds the model row stride");
     }
     return logical_vocab;
+}
+
+// Does this stage name a second-party kernel? Used to decide whether the fire's
+// KV geometry has to be resolved for the lane at all: resolving it is cheap but
+// it THROWS when unavailable, so it must only run for stages that need it.
+bool stage_calls_kernel(
+    const plan::StagePlan& stage,
+    std::string_view name) {
+    for (const auto& normalized : stage.ops) {
+        const auto& op = normalized.op;
+        if (op.tag != PTIR_OP_KERNEL_CALL) continue;
+        if (op.name_idx < stage.names.size() &&
+            stage.names[op.name_idx] == name) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool stage_uses_intrinsic(
@@ -2455,6 +2545,11 @@ BoundInstance::CommitSnapshot& commit_snapshot(
             snapshot = owner.available_commit_snapshots.back();
             owner.available_commit_snapshots.pop_back();
         }
+        // A pooled word still holds the previous instance's verdict, and a
+        // freshly mapped one holds nothing at all. Either way this snapshot
+        // carries no information about any wave until a pull-validate seeds
+        // it, so no reader may treat its contents as a verdict.
+        snapshot.ever_validated = false;
         try {
             if (snapshot.device == nullptr) {
                 CUDA_CHECK(cudaMalloc(
@@ -2614,7 +2709,14 @@ void wait_bound_instance_quiescent(
 
 void ensure_instance_reaper(Dispatch::Impl& s) {
     if (s.instance_reaper.joinable()) return;
-    s.instance_reaper = std::thread([&s]() {
+    // The reaper waits on CUDA events, and CUDA's current device is
+    // thread-local. Capture the device of whichever rank is starting the
+    // thread; a fresh thread would otherwise default to device 0 and, under
+    // TP, synchronize the wrong context.
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    s.instance_reaper = std::thread([&s, device]() {
+        CUDA_CHECK(cudaSetDevice(device));
         for (;;) {
             Dispatch::Impl::InstanceReapItem item;
             {
@@ -2718,6 +2820,7 @@ int Dispatch::register_program(std::uint64_t program_hash,
         if (err) *err = "ptir program has no compiler region plans";
         return PIE_STATUS_INVALID_ARGUMENT;
     }
+    bool needs_kv_envelopes = false;
     for (const plan::StagePlan& stage : *plans) {
         if ((stage.stage == PTIR_STAGE_ON_ATTN_PROJ ||
              stage.stage == PTIR_STAGE_ON_ATTN) &&
@@ -2737,6 +2840,44 @@ int Dispatch::register_program(std::uint64_t program_hash,
                 }
                 return PIE_STATUS_UNSUPPORTED;
             }
+            if (op.tag == PTIR_OP_KERNEL_CALL) {
+                // Second-party kernels are named, not generic: the fused
+                // runtime dispatches them by name, so a name it cannot launch
+                // has to be refused at bind rather than silently skipped.
+                // `grouped_supported_tag` deliberately still excludes the tag —
+                // the grouped interpreter has no arm for it.
+                const std::string& name =
+                    op.name_idx < stage.names.size()
+                        ? stage.names[op.name_idx]
+                        : std::string();
+                if (name != "envelope_dot") {
+                    if (err) {
+                        *err =
+                            "ptir second-party kernel is not implemented by "
+                            "the active CUDA model";
+                    }
+                    return PIE_STATUS_UNSUPPORTED;
+                }
+                if (!impl_->kv_envelopes_available) {
+                    if (err) {
+                        *err =
+                            "envelope_dot requires a native bf16 NHD kv cache "
+                            "and a post-rope query on this model";
+                    }
+                    return PIE_STATUS_UNSUPPORTED;
+                }
+                needs_kv_envelopes = true;
+                if (stage.stage != PTIR_STAGE_ON_ATTN_PROJ &&
+                    stage.stage != PTIR_STAGE_ON_ATTN) {
+                    if (err) {
+                        *err =
+                            "envelope_dot is only available at an attention "
+                            "stage";
+                    }
+                    return PIE_STATUS_UNSUPPORTED;
+                }
+                continue;
+            }
             if (!grouped_supported_tag(op.tag)) {
                 if (err) {
                     *err =
@@ -2752,7 +2893,9 @@ int Dispatch::register_program(std::uint64_t program_hash,
                 ((stage.stage == PTIR_STAGE_ON_ATTN_PROJ ||
                   stage.stage == PTIR_STAGE_ON_ATTN) &&
                  (op.intr == PTIR_INTR_QUERY ||
-                  op.intr == PTIR_INTR_LAYER));
+                  op.intr == PTIR_INTR_LAYER)) ||
+                (stage.stage == PTIR_STAGE_ON_ATTN &&
+                 op.intr == PTIR_INTR_ATTN_SCORE);
             if (!valid) {
                 if (err) {
                     *err =
@@ -2760,6 +2903,21 @@ int Dispatch::register_program(std::uint64_t program_hash,
                 }
                 return PIE_STATUS_UNSUPPORTED;
             }
+        }
+    }
+    if (needs_kv_envelopes && impl_->enable_kv_envelopes) {
+        // Envelopes cost 4/page_size of the KV cache, so they are allocated
+        // LAZILY: the first program that names `envelope_dot` pays for them and
+        // every model that never observes attention pays nothing. Registration
+        // is a control-plane call, so allocating + seeding here (which
+        // synchronizes) does not race a fire.
+        try {
+            impl_->enable_kv_envelopes();
+        } catch (const std::exception& e) {
+            if (err) {
+                *err = std::string("kv envelopes are unavailable: ") + e.what();
+            }
+            return PIE_STATUS_UNSUPPORTED;
         }
     }
     generated::CompileFailureKind compile_failure =
@@ -3058,6 +3216,13 @@ int Dispatch::validate_launch(
     return PIE_STATUS_OK;
 }
 
+void Dispatch::set_kv_envelopes_available(
+    bool available,
+    std::function<void()> enable) {
+    impl_->kv_envelopes_available = available;
+    impl_->enable_kv_envelopes = available ? std::move(enable) : nullptr;
+}
+
 void Dispatch::set_attention_hook_coverage(
     bool supported,
     std::uint32_t model_layers) {
@@ -3080,6 +3245,24 @@ bool Dispatch::launch_has_attention_stages(
                         stage.stage == PTIR_STAGE_ON_ATTN;
                 })) {
             return true;
+        }
+    }
+    return false;
+}
+
+bool Dispatch::launch_wants_attn_score(
+    const pie_native::LaunchView& view) const {
+    for (std::size_t program = 0;
+         program < view.ptir_program_hashes.size();
+         ++program) {
+        const auto* plans =
+            impl_->cache.plans(view.ptir_program_hashes.data()[program]);
+        if (plans == nullptr) continue;
+        for (const plan::StagePlan& stage : *plans) {
+            if (stage.stage != PTIR_STAGE_ON_ATTN) continue;
+            if (stage_uses_intrinsic(stage, PTIR_INTR_ATTN_SCORE)) {
+                return true;
+            }
         }
     }
     return false;
@@ -3250,6 +3433,191 @@ std::uint64_t sample_output_channel_mask(
     return mask;
 }
 
+// Resolve one lane's slice of the fire's KV geometry so `envelope_dot` can
+// score the pages this lane's request actually owns.
+//
+// The lane->request mapping goes through `qo_indptr_h`: `make_staged_binding`
+// already offsets the query by `token_start * query_columns`, and
+// `qo_indptr_h[r]` IS request r's token start, so the two agree by
+// construction. A lane whose token start is not a request boundary is a wiring
+// bug and throws rather than scoring another request's pages.
+GroupedLaneEnvelope resolve_lane_envelope(
+    const StagedLane& lane,
+    const float* query_base,
+    std::uint32_t query_columns,
+    std::uint32_t layer) {
+    const model::AttentionObservation* obs =
+        model::active_attention_observation();
+    if (obs == nullptr || !obs->usable()) {
+        throw std::runtime_error(
+            "envelope_dot ran outside a model body with kv geometry");
+    }
+    if (query_base == nullptr || query_columns == 0 ||
+        lane.token_count == kUnavailableGroupedExtent ||
+        lane.token_count == 0) {
+        throw std::runtime_error("envelope_dot has no query to score with");
+    }
+    const KvCacheLayerView view =
+        obs->kv->layer_view(static_cast<int>(layer));
+    if (!view.has_envelopes()) {
+        throw std::runtime_error(
+            "envelope_dot ran on a layer without kv envelopes");
+    }
+    if (view.head_dim <= 0 || view.num_kv_heads <= 0 ||
+        query_columns % static_cast<std::uint32_t>(view.head_dim) != 0) {
+        throw std::runtime_error(
+            "envelope_dot query width is not a multiple of head_dim");
+    }
+
+    int request = -1;
+    for (int r = 0; r < obs->num_requests; ++r) {
+        if (obs->qo_indptr_h[r] == lane.token_start) {
+            request = r;
+            break;
+        }
+    }
+    if (request < 0) {
+        throw std::runtime_error(
+            "envelope_dot lane does not start at a request boundary");
+    }
+
+    const std::uint32_t page_begin = obs->kv_page_indptr_h[request];
+    const std::uint32_t page_end = obs->kv_page_indptr_h[request + 1];
+    if (page_end < page_begin) {
+        throw std::runtime_error("envelope_dot saw a malformed kv page CSR");
+    }
+    const std::uint32_t page_count = page_end - page_begin;
+    const std::uint32_t page_size =
+        static_cast<std::uint32_t>(view.page_size);
+
+    // `kv_last_page_lens` is POST-append (see `write_kv_kernel`), so the KV
+    // length this fire will END at is derivable, and subtracting the fire's own
+    // tokens gives the length the envelopes currently describe. Only pages
+    // entirely below that are final.
+    std::uint32_t scored_pages = 0;
+    if (page_count > 0) {
+        const std::uint32_t kv_after =
+            (page_count - 1) * page_size + obs->kv_last_page_lens_h[request];
+        const std::uint32_t qo_len =
+            obs->qo_indptr_h[request + 1] - obs->qo_indptr_h[request];
+        const std::uint32_t kv_before =
+            kv_after >= qo_len ? kv_after - qo_len : 0u;
+        scored_pages = std::min(kv_before / page_size, page_count);
+    }
+    if (const char* dbg = std::getenv("PIE_QUEST_DEBUG"); dbg && *dbg == '1') {
+        static std::atomic<int> shots{0};
+        if (shots.fetch_add(1) < 4) {
+            std::fprintf(stderr,
+                "[quest] req=%d layer=%u tok_start=%u tok_count=%u "
+                "page_begin=%u page_count=%u page_size=%u last_len=%u "
+                "qo=[%u,%u] scored=%u kv_heads=%d head_dim=%d qcols=%u\n",
+                request, layer, lane.token_start, lane.token_count,
+                page_begin, page_count, page_size,
+                obs->kv_last_page_lens_h[request],
+                obs->qo_indptr_h[request], obs->qo_indptr_h[request + 1],
+                scored_pages, view.num_kv_heads, view.head_dim, query_columns);
+        }
+    }
+
+    return GroupedLaneEnvelope{
+        .env_min = view.k_env_min,
+        .env_max = view.k_env_max,
+        .query = query_base +
+            static_cast<std::size_t>(lane.token_start + lane.token_count - 1) *
+                query_columns,
+        .page_ids = obs->kv_page_indices_d + page_begin,
+        .page_count = page_count,
+        .scored_pages = scored_pages,
+        .num_q_heads =
+            query_columns / static_cast<std::uint32_t>(view.head_dim),
+        .num_kv_heads = static_cast<std::uint32_t>(view.num_kv_heads),
+        .head_dim = static_cast<std::uint32_t>(view.head_dim),
+    };
+}
+
+// Materialize one lane's `[declared_kv_max]` attention-probability row from the
+// layer capture published by the model body.
+//
+// The capture is ragged and exactly `kv_len` wide; the program declared a static
+// ceiling (it cannot know `kv_len` at compile time, exactly like `envelope_dot`'s
+// `p_max`). So this pads to the declared width with zeros -- a position that does
+// not exist received no attention, which is already the correct value and sorts
+// to the bottom of every eviction ranking without needing a sentinel.
+//
+// Every disagreement here throws. Truncating a row that overflows the ceiling
+// would silently make the tail of the context un-evictable, and a zero row would
+// be indistinguishable from "evict everything": both are the class of failure
+// this driver's unchecked-contract list exists to prevent.
+const float* resolve_lane_attn_score(
+    const StagedLane& lane,
+    std::uint32_t layer,
+    std::uint64_t declared_kv_max,
+    cudaStream_t stream,
+    std::vector<void*>& temporaries) {
+    const model::AttentionScores* scores = model::active_attention_scores();
+    if (scores == nullptr || !scores->usable()) {
+        throw std::runtime_error(
+            "attn_score ran on a fire that captured no attention scores");
+    }
+    if (scores->layer != layer) {
+        throw std::runtime_error(
+            "attn_score saw a capture from a different layer");
+    }
+    const model::AttentionObservation* obs =
+        model::active_attention_observation();
+    if (obs == nullptr || !obs->usable()) {
+        throw std::runtime_error(
+            "attn_score ran outside a model body with kv geometry");
+    }
+    if (static_cast<std::uint32_t>(obs->num_requests) !=
+        scores->num_requests) {
+        throw std::runtime_error(
+            "attn_score capture and kv geometry disagree on request count");
+    }
+    if (declared_kv_max == 0) {
+        throw std::runtime_error("attn_score declares an empty row");
+    }
+
+    int request = -1;
+    for (int r = 0; r < obs->num_requests; ++r) {
+        if (obs->qo_indptr_h[r] == lane.token_start) {
+            request = r;
+            break;
+        }
+    }
+    if (request < 0) {
+        throw std::runtime_error(
+            "attn_score lane does not start at a request boundary");
+    }
+
+    const std::uint32_t begin = scores->offsets_h[request];
+    const std::uint32_t end = scores->offsets_h[request + 1];
+    if (end < begin) {
+        throw std::runtime_error("attn_score saw a malformed capture CSR");
+    }
+    const std::uint32_t kv_len = end - begin;
+    if (static_cast<std::uint64_t>(kv_len) > declared_kv_max) {
+        throw std::runtime_error(
+            "attn_score declared kv_max " + std::to_string(declared_kv_max) +
+            " but the request holds " + std::to_string(kv_len) +
+            " kv positions; raise the program's ceiling");
+    }
+
+    float* row = nullptr;
+    CUDA_CHECK(cudaMallocAsync(
+        &row, declared_kv_max * sizeof(float), stream));
+    temporaries.push_back(row);
+    CUDA_CHECK(cudaMemsetAsync(
+        row, 0, declared_kv_max * sizeof(float), stream));
+    if (kv_len > 0) {
+        CUDA_CHECK(cudaMemcpyAsync(
+            row, scores->values + begin,
+            static_cast<std::size_t>(kv_len) * sizeof(float),
+            cudaMemcpyDeviceToDevice, stream));
+    }
+    return row;
+}
+
 GroupedLaneBinding make_staged_binding(
     StagedLane& lane,
     const plan::StagePlan& stage,
@@ -3371,6 +3739,18 @@ void execute_declared_phase(
         max_occurrences = std::max(
             max_occurrences, (*lane->phase_plans)[phase].size());
     }
+    // Per-lane intrinsic rows materialized below. Freed stream-ordered after
+    // every occurrence has been launched and every side stream rejoined, so
+    // the frees cannot outrun the kernels that read them.
+    struct PhaseTemporaries {
+        std::vector<void*> pointers;
+        cudaStream_t stream = nullptr;
+        ~PhaseTemporaries() {
+            for (void* pointer : pointers) {
+                cudaFreeAsync(pointer, stream);
+            }
+        }
+    } phase_temporaries{{}, stream};
     for (std::size_t occurrence = 0;
          occurrence < max_occurrences;
          ++occurrence) {
@@ -3414,6 +3794,11 @@ void execute_declared_phase(
             GroupedLaneBinding binding = make_staged_binding(
                 lane, stage, logits_base, logits_stride,
                 query_base, query_columns, launch.device_layer);
+            if (stage_calls_kernel(stage, "envelope_dot")) {
+                binding.envelope = resolve_lane_envelope(
+                    lane, query_base, query_columns, layer);
+            }
+            std::uint64_t attn_score_kv_max = 0;
             std::uint32_t value_base = 0;
             for (const auto& normalized : stage.ops) {
                 if (normalized.op.tag == PTIR_OP_INTRINSIC_VAL &&
@@ -3428,7 +3813,30 @@ void execute_declared_phase(
                             "program query tensor");
                     }
                 }
+                if (normalized.op.tag == PTIR_OP_INTRINSIC_VAL &&
+                    normalized.op.intr == PTIR_INTR_ATTN_SCORE) {
+                    if (value_base >= stage.value_types.size()) {
+                        throw std::runtime_error(
+                            "AttnScore intrinsic has no declared value type");
+                    }
+                    const std::uint64_t declared = grouped_numel(
+                        stage.value_types[value_base], binding);
+                    // One occurrence per stage may declare several reads; they
+                    // must agree, since one buffer backs them all.
+                    if (attn_score_kv_max != 0 &&
+                        attn_score_kv_max != declared) {
+                        throw std::runtime_error(
+                            "AttnScore is read at two different widths in one "
+                            "stage");
+                    }
+                    attn_score_kv_max = declared;
+                }
                 value_base += normalized.op.results;
+            }
+            if (attn_score_kv_max != 0) {
+                binding.attn_score_base = resolve_lane_attn_score(
+                    lane, layer, attn_score_kv_max, stream,
+                    phase_temporaries.pointers);
             }
             tasks.push_back(Task{
                 .lane = &lane,
@@ -3941,6 +4349,9 @@ void Dispatch::begin_enqueue(StagedLaunch& launch) {
         state.ticket_staging,
         state.pull_staging,
         stream);
+    for (const auto& lane : state.lanes) {
+        if (lane->snapshot != nullptr) lane->snapshot->ever_validated = true;
+    }
     if (begin_timing) {
         launch.begin_breakdown_.pull_validate_us = fire_timing::duration_us(
             begin_mark, fire_timing::Clock::now());
@@ -4395,8 +4806,13 @@ bool Dispatch::finish(
             });
         }
     }
-    const bool batch_copies = can_batch_host_publish_copies(
-        *notify, impl_->output_copy_stream);
+    const HostPublishTransport publish_transport =
+        select_host_publish_transport(*notify, impl_->output_copy_stream);
+    // Only the copy-engine batch moves to the dedicated copy stream; the
+    // scatter kernel stays on `callback_stream` so plain stream order already
+    // places it ahead of the settlement kernel that publishes the tails.
+    const bool batch_copies =
+        publish_transport == HostPublishTransport::Batched;
     cudaStream_t settlement_stream = callback_stream;
     if (batch_copies) {
         CUDA_CHECK(cudaEventRecord(
@@ -4408,7 +4824,7 @@ bool Dispatch::finish(
         settlement_stream = impl_->output_copy_stream;
     }
     enqueue_host_publish_copies(
-        *notify, settlement_stream, batch_copies);
+        *notify, settlement_stream, publish_transport);
     launch_settle_host_channels_batch(
         notify->settlement_lanes.values(), settlement_stream);
     if (state.device_tickets != nullptr) {
@@ -5406,6 +5822,99 @@ bool Dispatch::enqueue_fixed_decode(
     return true;
 }
 
+// A lane whose pass-commit word came back zero was refused by exactly one of
+// the gates in `k_pull_validate_host_channels_batch`. Replay those gates on
+// the host (the ticket words are mapped pinned memory the CPU can read) so
+// the retry names the channel and the predicate that failed instead of the
+// whole class of causes.
+std::string describe_uncommitted_lane(
+    std::uint64_t instance_id,
+    const BoundInstance& bound,
+    const StagedLane& lane) {
+    std::string message =
+        "ptir prologue or channel readiness did not commit";
+    if (bound.trace == nullptr) return message;
+    auto channel_label = [&](std::uint32_t slot) -> std::string {
+        for (std::size_t c = 0; c < bound.trace->channels.size() &&
+                                c < bound.channel_ids.size();
+             ++c) {
+            if (bound.instance == nullptr) break;
+            if (bound.instance->view().slot(bound.trace->channels[c].id) !=
+                slot) {
+                continue;
+            }
+            const auto& channel = bound.trace->channels[c];
+            std::string label = "chan#" + std::to_string(channel.id);
+            if (!channel.extern_name.empty()) {
+                label += "(" + channel.extern_name + ")";
+            }
+            return label;
+        }
+        return "chan?";
+    };
+    std::string refused;
+    std::size_t refused_count = 0;
+    for (const DeviceHostChannelTicket& ticket : lane.tickets) {
+        if (ticket.words == nullptr) continue;
+        const std::uint64_t head =
+            std::atomic_ref<const std::uint64_t>(ticket.words[0])
+                .load(std::memory_order_acquire);
+        const std::uint64_t tail =
+            std::atomic_ref<const std::uint64_t>(ticket.words[1])
+                .load(std::memory_order_acquire);
+        const char* reason = nullptr;
+        if ((ticket.flags & kTicketConsume) != 0 &&
+            head != ticket.expected_head) {
+            reason = "consume-head-moved";
+        } else if ((ticket.flags & kTicketRequireInput) != 0 &&
+                   !(tail > head)) {
+            reason = "required-input-empty";
+        } else if ((ticket.flags & kTicketPublish) != 0) {
+            const std::uint64_t same_fire_consume =
+                (ticket.flags & kTicketConsume) != 0 ? 1u : 0u;
+            if (tail != ticket.expected_tail) {
+                reason = "publish-tail-moved";
+            } else if (!(tail - head <
+                         static_cast<std::uint64_t>(ticket.cap1 - 1) +
+                             same_fire_consume)) {
+                reason = "publish-ring-full";
+            }
+        }
+        if (reason == nullptr) continue;
+        ++refused_count;
+        if (refused_count > 4) continue;
+        if (!refused.empty()) refused += ", ";
+        refused += channel_label(ticket.slot);
+        refused += " slot=" + std::to_string(ticket.slot);
+        refused += " ";
+        refused += reason;
+        refused += " head=" + std::to_string(head);
+        refused += "/exp" + std::to_string(ticket.expected_head);
+        refused += " tail=" + std::to_string(tail);
+        refused += "/exp" + std::to_string(ticket.expected_tail);
+        refused += " cap1=" + std::to_string(ticket.cap1);
+    }
+    message += " (instance=" + std::to_string(instance_id);
+    message += " geometry_class=" +
+               std::to_string(static_cast<int>(bound.geometry_class));
+    message += " tickets=" + std::to_string(lane.tickets.size());
+    message += " snapshot_seeded=" +
+               std::string(lane.snapshot != nullptr &&
+                                   lane.snapshot->ever_validated
+                               ? "yes"
+                               : "no");
+    if (refused.empty()) {
+        // Every ring gate agrees: the refusal came from the device-side
+        // prologue itself (a compose fail-stop or an envelope kill), not
+        // from host channel staging.
+        message += " refused_by=none-of-the-ring-gates)";
+    } else {
+        message += " refused=" + std::to_string(refused_count);
+        message += " [" + refused + "])";
+    }
+    return message;
+}
+
 bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
                                    std::uint32_t page_size,
                                    std::uint32_t device_pages,
@@ -5794,7 +6303,11 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
                 .ready_offset = ready_offset,
             });
         }
-        if (staged != nullptr) {
+        // FramePrepare runs BEFORE this wave's `begin_enqueue`, so the
+        // commit word cannot describe this wave. It only carries a verdict
+        // once some wave's pull-validate has seeded it; before that it is
+        // uninitialized (or a pooled leftover) and must not gate anything.
+        if (staged != nullptr && staged->lanes[p]->snapshot->ever_validated) {
             snapshot_offsets[p] = reserve_packed(
                 sizeof(std::uint32_t), alignof(std::uint32_t));
         }
@@ -5845,6 +6358,10 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
                 s.instances.at(view.ptir_program_instances.data()[p]);
             if (instance.geometry_class == PIE_GEOMETRY_CLASS_HOST &&
                 !resolve_device_mask) {
+                continue;
+            }
+            if (snapshot_offsets[p] ==
+                std::numeric_limits<std::size_t>::max()) {
                 continue;
             }
             pack_copies.push_back(DescriptorPackCopy{
@@ -5907,9 +6424,9 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
         const std::unordered_set<std::uint32_t>* pending_slots = nullptr;
         if (staged != nullptr) {
             const StagedLane& lane = *staged->lanes[p];
-            if (ready[p] == 0) {
+            if (lane.snapshot->ever_validated && ready[p] == 0) {
                 throw RetryableLaunchError(
-                    "ptir prologue or channel readiness did not commit");
+                    describe_uncommitted_lane(iid, it->second, lane));
             }
             pending_slots = &lane.prologue_put_slots;
         }

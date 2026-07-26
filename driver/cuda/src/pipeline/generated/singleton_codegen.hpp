@@ -449,13 +449,26 @@ inline bool validate_singleton_plan(
             const bool envelope_dot =
                 op.name_idx < plan.names.size() &&
                 plan.names[op.name_idx] == "envelope_dot";
-            if (op.name_idx >= plan.names.size() ||
-                (!identity && !envelope_dot) ||
-                op.args.size() != 1 ||
-                result_base >= plan.value_types.size() ||
-                !detail::same_type(
-                    plan.value_types[op.args[0]],
-                    plan.value_types[result_base])) {
+            // `cuda.identity` is a pass-through, so its result must match
+            // its argument. `envelope_dot` is not: it maps a query
+            // (`[num_q_heads * head_dim]`) to a per-page score (`[P_MAX]`).
+            // Demanding `same_type` of it would only ever be satisfiable by a
+            // program whose query happens to be P_MAX wide, which is a test
+            // artefact rather than a real shape.
+            const bool arity_ok =
+                op.name_idx < plan.names.size() && (identity || envelope_dot) &&
+                op.args.size() == 1 &&
+                op.args[0] < plan.value_types.size() &&
+                result_base < plan.value_types.size();
+            const bool boundary_types_ok =
+                arity_ok &&
+                (envelope_dot
+                     ? (plan.value_types[result_base].dtype == PTIR_DT_F32 &&
+                        plan.value_types[result_base].dims.size() == 1)
+                     : detail::same_type(
+                           plan.value_types[op.args[0]],
+                           plan.value_types[result_base]));
+            if (!boundary_types_ok) {
                 error =
                     "unsupported CUDA semantic kernel boundary " +
                     (op.name_idx < plan.names.size()
@@ -1578,19 +1591,26 @@ __device__ __forceinline__ void ptir_m1_execute(
           }
         }
       } else if (p.pred_tag == 1) {
-        // Descending selection that carries the previous pick as a total-order
-        // threshold and stops as soon as the exclusive mass clears the cutoff.
-        // The earlier form kept a `temporary` visited list and rescanned it per
-        // candidate, i.e. O(len^3) on a single thread.
+        // Descending selection with the LAST PICK's total-order key as the
+        // availability threshold (the k_pivot_cummassle technique) instead
+        // of an already-picked rescan: the rescan made this O(len^3) on ONE
+        // thread — a de-facto hang at LM vocab sizes (>10^15 steps at
+        // 151,936). Bit-identical picks and keep bits: m1_sort_better is a
+        // strict total order, so "strictly after the previous pick" visits
+        // the same elements in the same order, and once `exclusive` clears
+        // the threshold (or goes NaN) every later keep is false — they are
+        // pre-stored and the loop stops early.
         const float threshold =
             m1_load_f(a1, m1_pick(d1.len, row), d1.dtype);
         for (m1_u32 i = 0; i < d0.last; ++i)
           m1_store_b(o0, base + i, false);
         float exclusive = 0.0f;
-        float previous_value = m1_pos_inf();
-        m1_u32 previous_index = 0u;
-        for (m1_u32 position = 0; position < d0.last; ++position) {
-          if (!(exclusive < threshold)) break;
+        float prev_value = 0.0f;
+        m1_u32 prev_index = 0;
+        bool have_prev = false;
+        for (m1_u32 position = 0;
+             position < d0.last && exclusive < threshold;
+             ++position) {
           m1_u32 best_index = 0;
           float best_value = 0.0f;
           bool found = false;
@@ -1599,8 +1619,9 @@ __device__ __forceinline__ void ptir_m1_execute(
                ++candidate) {
             const float value =
                 m1_load_f(a0, base + candidate, d0.dtype);
-            if (!m1_sort_better(
-                    previous_value, previous_index, value, candidate))
+            if (have_prev &&
+                !m1_sort_better(
+                    prev_value, prev_index, value, candidate))
               continue;
             if (!found ||
                 m1_sort_better(
@@ -1611,10 +1632,11 @@ __device__ __forceinline__ void ptir_m1_execute(
             }
           }
           if (!found) break;
-          m1_store_b(o0, base + best_index, true);
+          m1_store_b(o0, base + best_index, exclusive < threshold);
           exclusive += best_value;
-          previous_value = best_value;
-          previous_index = best_index;
+          prev_value = best_value;
+          prev_index = best_index;
+          have_prev = true;
         }
       } else {
         const float threshold =

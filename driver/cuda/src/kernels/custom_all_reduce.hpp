@@ -38,8 +38,13 @@ class NcclComm;
 class CustomAllReduce {
 public:
     CustomAllReduce();
+    // `group_devices` holds the CUDA device ordinal of every rank in the
+    // group, indexed by rank. A TP group is not necessarily devices
+    // 0..world_size-1, so the ordinals have to be supplied rather than
+    // inferred from rank indices.
     CustomAllReduce(NcclComm& comm,
                     bool same_process,
+                    std::vector<int> group_devices,
                     std::size_t max_bytes = 8 * 1024 * 1024,
                     std::size_t rank_data_bytes = 8 * 1024 * 1024,
                     int fusion_max_tokens = 0,

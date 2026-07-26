@@ -4,7 +4,7 @@
 //! The rework's headline claim (In Gim): KV contention is **preempt/restore, not
 //! admission**. When a fleet's combined KV demand EXCEEDS the physical pool, an
 //! alloc-fail must NOT surface a `WorkingSetError` to the inferlet — instead it
-//! routes to the contention orchestrator (`PIE_KV_CONTENTION=preempt`):
+//! routes to the contention orchestrator (always on):
 //!   OOM in prep → `acquire()` (FCFS wait / preempt a younger process) → a
 //!   completing/terminating process frees its pages (the WS-drop drain hook) →
 //!   `on_blocks_freed` wakes the FIFO waiter → the prep retries → succeeds.
@@ -37,18 +37,16 @@
 //!      the preempt/restore correctness: waiters block + wake, never error.
 //!   2. **Engagement** — the orchestrator's contention counters prove preempt/
 //!      restore actually happened: `waiters_parked > 0` + `waiters_woken > 0`
-//!      (v1 passive backend — a lane OOM'd, parked in the FIFO, and was woken
-//!      when a finisher freed blocks). So a fleet that merely FIT the pool (no
+//!      (a lane's demand outran the pool, parked in the queue, and was woken
+//!      when freed pages covered it). So a fleet that merely FIT the pool (no
 //!      contention) cannot pass trivially. This is what makes ② decisive.
 //!   3. **Transparency (classified)** — no position-0 divergence (prefill/page-0
 //!      corruption) AND no `restore_attributable` divergence (first divergence at
 //!      KV position >= page_size = a sealed/restored page). The [1, page_size)
 //!      band is logged non-gating (non-batch-invariance; see the composite above).
-//!   4. **v2 active self-suspend** (only when `PIE_KV_PREEMPT_ACTIVE=1`) —
-//!      `suspends > 0 && restores > 0`: the `SelfSuspendBackend` had victims
-//!      SAVE their own KV state (D2H offload) and RESTORE it (H2D). Gated on
-//!      active mode: in v1 passive these are zero-by-design, so it only fires
-//!      when the active backend is armed.
+//!   4. **Active self-suspend** — `suspends > 0 && restores > 0`: victims
+//!      SAVE their own KV state (D2H offload) and RESTORE it (H2D). Preempt
+//!      is always on; this fires on every contended profile run.
 //!
 //! Construction-based contention proof: the fleet is sized so its combined KV
 //! demand provably exceeds the (small) pool — so if all complete with zero
@@ -56,21 +54,17 @@
 //! have errored the over-capacity lanes).
 //!
 //! `#[ignore]` (needs the 4090 + cuda + qwen3-0.6b). Run:
-//!   PIE_KV_CONTENTION=preempt PIE_COMPILER_LAUNCHER=env \
+//!   PIE_COMPILER_LAUNCHER=env \
 //!     cargo test -p pie-bin --features driver-cuda \
 //!     --test cuda_contention -- --ignored --nocapture
 //!
 //! Quantitative A/B (each command is a separate process because boot is
-//! process-global; the optional record file prints the ratio after both runs):
-//!   PIE_KV_CONTENTION=error PIE_CONTENTION_PROFILE_MODE=legacy \
-//!   PIE_CONTENTION_PROFILE_RECORD=/tmp/pie-contention.json \
-//!     cargo test -p pie-bin --features driver-cuda --test cuda_contention \
-//!     over_capacity_fleet_preempts_and_restores_transparently -- --ignored --exact --nocapture
-//!   PIE_KV_CONTENTION=preempt PIE_KV_PREEMPT_ACTIVE=1 \
+//! process-global; the optional record file prints the ratio after both
+//! runs). The pre-rewrite/legacy side of an A/B is measured by checking out
+//! the baseline git ref — the runtime no longer has an error-path mode:
 //!   PIE_CONTENTION_PROFILE_MODE=baseline PIE_CONTENTION_PROFILE_RECORD=/tmp/pie-contention.json \
 //!     cargo test -p pie-bin --features driver-cuda --test cuda_contention \
 //!     over_capacity_fleet_preempts_and_restores_transparently -- --ignored --exact --nocapture
-//!   PIE_KV_CONTENTION=preempt PIE_KV_PREEMPT_ACTIVE=1 \
 //!   PIE_CONTENTION_PROFILE_MODE=contended PIE_CONTENTION_TOTAL_PAGES=8 \
 //!   PIE_CONTENTION_PROFILE_RECORD=/tmp/pie-contention.json \
 //!     cargo test -p pie-bin --features driver-cuda --test cuda_contention \
@@ -96,14 +90,11 @@ use pie_client::client::Client;
 /// A fleet large enough that its combined KV demand exceeds the shrunk pool
 /// (see `SMALL_POOL_GPU_MEM_UTIL`) — forcing the preempt/restore path.
 ///
-/// **Live-tunable via `PIE_CONTENTION_FLEET`** (charlie). Contention is forced by
-/// the explicit KV-page cap (`PIE_CONTENTION_TOTAL_PAGES` → `[batching].total_pages`,
-/// charlie — the cuda driver now HAS a page cap, mirroring metal), so the fleet
-/// just needs `fleet × pages_per_lane > total_pages` (each lane holds ~a handful of
-/// pages). The solo-reference guard confirms a single lane still fits. NOTE: under
-/// v2 active preempt (`PIE_KV_PREEMPT_ACTIVE=1`) sustained fleet=24 is the Phase-2
-/// hardened design point (the ≤12 guard is LIFTED — the f24 deadlock/livelock family
-/// is fixed: step-6, tombstone Join, age-gate, ignition pump).
+/// **Live-tunable via `PIE_CONTENTION_FLEET`**. Contention is forced by the
+/// explicit KV-page cap (`PIE_CONTENTION_TOTAL_PAGES` → `[batching].total_pages`),
+/// so the fleet just needs `fleet × pages_per_lane > total_pages` (each lane
+/// holds ~a handful of pages). The solo-reference guard confirms a single lane
+/// still fits.
 fn fleet_size() -> usize {
     std::env::var("PIE_CONTENTION_FLEET")
         .ok()
@@ -115,9 +106,9 @@ fn fleet_size() -> usize {
 /// fleet's aggregate demand exceeds the small pool. Greedy decode ⇒ deterministic
 /// per prompt, so the solo reference is exact.
 fn prompt(k: usize) -> String {
-    // `PIE_CONTENTION_BUDGET=N` (charlie, capstone C5): emit a bare-int budget so
-    // the generate inferlet decodes N tokens — LONGER-lived lanes sustain KV pool
-    // pressure long enough for the v2 active suspend/restore cycle to reliably
+    // `PIE_CONTENTION_BUDGET=N`: emit a bare-int budget so the generate
+    // inferlet decodes N tokens — LONGER-lived lanes sustain KV pool
+    // pressure long enough for the suspend/restore cycle to reliably
     // engage (5-token lanes finish before contention forms → flaky parked=0).
     // Unset → the original JSON prompt (default 5-token lanes preserved).
     if let Ok(b) = std::env::var("PIE_CONTENTION_BUDGET") {
@@ -270,17 +261,21 @@ fn write_profile_record(
         "bubble_p50_us": bubble_p50_us,
         "bubble_p99_us": bubble_p99_us,
     });
-    if let Some(orchestrator) = pie_engine::store::reclaim::contention() {
-        let diagnostics = orchestrator.diagnostics();
+    if let Some(planner) = pie_engine::planner::planner() {
+        let diagnostics = planner.diagnostics();
         document[mode]["contention"] = serde_json::json!({
-            "parked": diagnostics.waiters_parked_total,
-            "woken": diagnostics.waiters_woken_total,
-            "suspends": diagnostics.suspends_total,
+            "parked": diagnostics.parks_total,
+            "woken": diagnostics.serves_total,
+            "suspends": diagnostics.evictions_total,
             "restores": diagnostics.restores_total,
             "d2h_pages": diagnostics.d2h_pages_total,
             "h2d_pages": diagnostics.h2d_pages_total,
             "d2h_copy_us": diagnostics.d2h_copy_us_total,
             "h2d_copy_us": diagnostics.h2d_copy_us_total,
+            "eviction_rollbacks": diagnostics.eviction_rollbacks_total,
+            "restore_failures": diagnostics.restore_failures_total,
+            "starvations": diagnostics.starvations_total,
+            "host_swap_exhaustions": diagnostics.host_swap_exhaustions_total,
         });
     }
     std::fs::write(&path, serde_json::to_vec_pretty(&document)?)?;
@@ -317,23 +312,21 @@ fn write_profile_record(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "Task-B contention over-capacity e2e: needs the 4090 + cuda + qwen3-0.6b + PIE_KV_CONTENTION=preempt"]
+#[ignore = "contention over-capacity e2e: needs the 4090 + cuda + qwen3-0.6b"]
 async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()> {
     common::init_trace();
 
     let profile_mode =
         std::env::var("PIE_CONTENTION_PROFILE_MODE").unwrap_or_else(|_| "contended".to_string());
     anyhow::ensure!(
-        matches!(profile_mode.as_str(), "legacy" | "baseline" | "contended"),
-        "PIE_CONTENTION_PROFILE_MODE must be legacy, baseline, or contended"
+        matches!(profile_mode.as_str(), "baseline" | "contended" | "ceiling"),
+        "PIE_CONTENTION_PROFILE_MODE must be baseline, contended, or ceiling \
+         (the legacy error-path profile is gone with the mode knob; measure \
+         the pre-rewrite ref via git for A/B). `ceiling` is the capped-but-\
+         uncontended fitting-width run that anchors gap-to-ceiling (§6): same \
+         page cap, a fleet that fits, engagement not required."
     );
-    let configured_contention = std::env::var("PIE_KV_CONTENTION").unwrap_or_default();
-    anyhow::ensure!(
-        (profile_mode == "legacy" && configured_contention != "preempt")
-            || (profile_mode != "legacy" && configured_contention == "preempt"),
-        "legacy mode requires PIE_KV_CONTENTION=error; baseline/contended require preempt"
-    );
-    let total_pages = if profile_mode != "contended" {
+    let total_pages = if profile_mode == "baseline" {
         0
     } else {
         std::env::var("PIE_CONTENTION_TOTAL_PAGES")
@@ -395,27 +388,27 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
         Some(tokio::spawn(async move {
             let t0 = std::time::Instant::now();
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                if let Some(orch) = pie_engine::store::reclaim::contention() {
-                    let s = orch.stats();
-                    use std::sync::atomic::Ordering::Relaxed;
-                    let diagnostics = orch.diagnostics();
+                if let Some(planner) = pie_engine::planner::planner() {
+                    let d = planner.diagnostics();
                     eprintln!(
                         "[contention-trace] t={}ms parked={} woken={} suspends={} restores={} \
-                         restore_prepared={} h2d_submitted={} h2d_us={} \
-                         free={}/{} reserved={} waiters={:?} suspended={:?}",
+                         restore_failures={} h2d_pages={} h2d_us={} \
+                         free={}/{} host_free={}/{} accum={} queue={} states={:?}",
                         t0.elapsed().as_millis(),
-                        s.waiters_parked.load(Relaxed),
-                        s.waiters_woken.load(Relaxed),
-                        s.suspends.load(Relaxed),
-                        s.restores.load(Relaxed),
-                        diagnostics.restore_prepared_total,
-                        diagnostics.h2d_submitted_total,
-                        diagnostics.h2d_copy_us_total,
-                        diagnostics.device_pages_free,
-                        diagnostics.device_pages_total,
-                        diagnostics.device_pages_reserved,
-                        diagnostics.waiters,
-                        diagnostics.suspended,
+                        d.parks_total,
+                        d.serves_total,
+                        d.evictions_total,
+                        d.restores_total,
+                        d.restore_failures_total,
+                        d.h2d_pages_total,
+                        d.h2d_copy_us_total,
+                        d.device_pages_free,
+                        d.device_pages_total,
+                        d.host_slots_free,
+                        d.host_slots_total,
+                        d.accumulation,
+                        d.queue.len(),
+                        d.proc_states,
                     );
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
@@ -466,14 +459,14 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
         bubble_p50_us,
         bubble_p99_us,
     );
-    if let Some(orchestrator) = pie_engine::store::reclaim::contention() {
-        let diagnostics = orchestrator.diagnostics();
+    if let Some(planner) = pie_engine::planner::planner() {
+        let diagnostics = planner.diagnostics();
         eprintln!(
             "[contention-profile] parked={} woken={} suspends={} restores={} \
              d2h_pages={} h2d_pages={} d2h={:.3}ms h2d={:.3}ms",
-            diagnostics.waiters_parked_total,
-            diagnostics.waiters_woken_total,
-            diagnostics.suspends_total,
+            diagnostics.parks_total,
+            diagnostics.serves_total,
+            diagnostics.evictions_total,
             diagnostics.restores_total,
             diagnostics.d2h_pages_total,
             diagnostics.h2d_pages_total,
@@ -499,18 +492,12 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
     // assertion so a transparency RED still surfaces whether preempt/restore
     // fired (a degenerate-replay mismatch with suspends==0 falsifies the
     // "restore corruption" framing → the bug is not on the restore path).
-    {
-        use std::sync::atomic::Ordering as O;
-        if let Some(o) = pie_engine::store::reclaim::contention() {
-            let s = o.stats();
-            eprintln!(
-                "[contention] final-engagement: parked={} woken={} suspends={} restores={}",
-                s.waiters_parked.load(O::Relaxed),
-                s.waiters_woken.load(O::Relaxed),
-                s.suspends.load(O::Relaxed),
-                s.restores.load(O::Relaxed),
-            );
-        }
+    if let Some(planner) = pie_engine::planner::planner() {
+        let d = planner.diagnostics();
+        eprintln!(
+            "[contention] final-engagement: parked={} woken={} suspends={} restores={}",
+            d.parks_total, d.serves_total, d.evictions_total, d.restores_total,
+        );
     }
 
     // Assertion 1: ZERO WorkingSetError — every lane completed with tokens.
@@ -530,20 +517,17 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
     // config into the actionable "fix your config" error instead of a
     // non-determinism trap. Without this a
     // fleet that merely FIT the pool (no contention) passes assertions 1+2
-    // trivially. Under the v1 passive backend, engagement = allocation waiters
-    // that PARKED (OOM'd → blocked in acquire's FIFO) and were later WOKEN (a
-    // finisher freed blocks → drain released them → they retried + succeeded);
-    // `suspends`/`restores` are zero-by-design in v1 (they arm with the v2
-    // state-save backend — logged for the record).
-    use std::sync::atomic::Ordering;
-    let (parked, woken, suspends, restores) = pie_engine::store::reclaim::contention()
-        .map(|o| {
-            let s = o.stats();
+    // trivially. Engagement = allocation waiters that PARKED (demand outran
+    // the pool → blocked in acquire's queue) and were later WOKEN (freed
+    // pages covered them → the drain released them → they succeeded).
+    let (parked, woken, suspends, restores) = pie_engine::planner::planner()
+        .map(|planner| {
+            let d = planner.diagnostics();
             (
-                s.waiters_parked.load(Ordering::Relaxed),
-                s.waiters_woken.load(Ordering::Relaxed),
-                s.suspends.load(Ordering::Relaxed),
-                s.restores.load(Ordering::Relaxed),
+                d.parks_total,
+                d.serves_total,
+                d.evictions_total,
+                d.restores_total,
             )
         })
         .unwrap_or((0, 0, 0, 0));
@@ -557,13 +541,15 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
              fleet never over-filled the pool, so assertions 1+2 proved nothing. Shrink the pool \
              (PIE_CONTENTION_UTIL / a total_pages cap) or grow PIE_CONTENTION_FLEET until it contends."
         );
-    } else {
+    } else if profile_mode == "baseline" {
         assert_eq!(
             (parked, suspends, restores),
             (0, 0, 0),
             "roomy baseline unexpectedly contended"
         );
     }
+    // `ceiling` asserts neither way: the fitting-width run may brush the cap
+    // transiently; only its physics (throughput at width) matters.
 
     // Assertion 3: TRANSPARENCY (classified) — preempt+restore preserved KV
     // content (W1). The naive `concurrent[k] == solo_reference[k]` is confounded
@@ -642,22 +628,19 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
          corruption of a sealed page, not a pre-seal near-tie flip."
     );
 
-    // Assertion 4 (v2 active self-suspend): when the active `SelfSuspendBackend`
-    // is armed (`PIE_KV_PREEMPT_ACTIVE=1`), a victim doesn't just park on the pool
-    // — at its own execute_impl entry it SAVES its KV state (D2H offload) and
-    // RESTORES it (H2D) on release, so `suspends`/`restores` MUST fire. This is
-    // GATED on active mode: in v1 passive the backend returns `Unsupported` and
-    // both stay zero-by-design, so the assertion only applies when armed.
-    let preempt_active = std::env::var("PIE_KV_PREEMPT_ACTIVE").as_deref() == Ok("1");
-    if preempt_active && profile_mode == "contended" {
+    // Assertion 4 (active self-suspend): a victim doesn't just park on the
+    // pool — at its next safe point (`yield_point`) it SAVES its KV state
+    // (D2H offload) and RESTORES it (H2D) on release, so `suspends`/
+    // `restores` MUST fire.
+    if profile_mode == "contended" {
         assert!(
             suspends > 0 && restores > 0,
-            "v2 active self-suspend did NOT ENGAGE (suspends={suspends}, restores={restores}) — \
-             PIE_KV_PREEMPT_ACTIVE=1 arms the SelfSuspendBackend, so victims must actively save \
-             (suspend) and restore their KV state. Zero means the active path never ran."
+            "active self-suspend did NOT ENGAGE (suspends={suspends}, restores={restores}) — \
+             victims must actively save (suspend) and restore their KV state. \
+             Zero means the active path never ran."
         );
         eprintln!(
-            "[contention] v2 active self-suspend engaged: suspends={suspends} restores={restores} ✓"
+            "[contention] self-suspend engaged: suspends={suspends} restores={restores} ✓"
         );
     }
 

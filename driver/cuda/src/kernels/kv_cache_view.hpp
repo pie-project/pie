@@ -34,8 +34,19 @@ struct KvCacheLayerView {
     void* v_scales = nullptr;
     void* k_bf16_pages = nullptr;
     void* v_bf16_pages = nullptr;
+    // Quest per-page key envelopes, [num_pages, num_kv_heads, head_dim] f32
+    // each. Null unless envelopes were explicitly enabled on the cache: they
+    // cost 8 bytes per (page, kv_head, dim) against the page's own
+    // `page_size * 2`, i.e. 4/page_size of the KV cache, so they are never
+    // allocated for models that no program asks to observe.
+    float* k_env_min = nullptr;
+    float* k_env_max = nullptr;
     bool hnd_layout = false;
     bool native_bf16 = false;
+
+    bool has_envelopes() const noexcept {
+        return k_env_min != nullptr && k_env_max != nullptr;
+    }
 
     bool is_native_bf16() const noexcept { return native_bf16; }
 };

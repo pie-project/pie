@@ -4,6 +4,8 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import os
+import sys
 import time
 from typing import Any
 
@@ -13,10 +15,12 @@ from common import (
     cuda_profiler_start,
     cuda_profiler_stop,
     finish,
+    gpu_clock_state,
     hf_chat_prompts_and_counts,
     make_prompts,
     maybe_set_cpu_affinity,
     request_max_tokens,
+    run_timed_warmup_sync,
     summarize,
     visible_cuda_devices,
 )
@@ -198,6 +202,17 @@ def run(args: argparse.Namespace):
         max_tokens=args.max_tokens,
         ignore_eos=args.ignore_eos,
     )
+
+    def sampling_for(i: int) -> "SamplingParams":
+        if not getattr(args, "mixed_phase", False):
+            return sampling
+        return SamplingParams(
+            temperature=args.temperature,
+            top_p=args.top_p,
+            max_tokens=request_max_tokens(args, i),
+            ignore_eos=args.ignore_eos,
+        )
+
     if args.warmup:
         warmup_sampling = sampling
         if args.warmup_max_tokens is not None:
@@ -207,9 +222,16 @@ def run(args: argparse.Namespace):
                 max_tokens=args.warmup_max_tokens,
                 ignore_eos=args.ignore_eos,
             )
-        llm.generate(prompts[: args.warmup], warmup_sampling)
+        def warmup_pass() -> None:
+            llm.generate(prompts[: args.warmup], warmup_sampling)
+
+        warmup_pass()
+        # Optional duration-based extension of the warmup; see common.py.
+        run_timed_warmup_sync(
+            warmup_pass, args.warmup_seconds, label="vllm")
 
     spec_metrics_before = _vllm_spec_metrics(llm)
+    clocks_at_start = gpu_clock_state()
     run_prompts = prompts[args.warmup:]
     run_prompt_counts = prompt_counts[args.warmup:]
     results: list[RequestResult] = []
@@ -217,9 +239,12 @@ def run(args: argparse.Namespace):
     start = time.perf_counter()
     try:
         if args.mode == "latency":
-            for p, prompt_count in zip(run_prompts, run_prompt_counts):
+            for i, (p, prompt_count) in enumerate(
+                zip(run_prompts, run_prompt_counts),
+                start=args.warmup,
+            ):
                 req_start = time.perf_counter()
-                outputs = llm.generate([p], sampling)
+                outputs = llm.generate([p], sampling_for(i))
                 req_wall = time.perf_counter() - req_start
                 for out in outputs:
                     results.append(
@@ -231,7 +256,15 @@ def run(args: argparse.Namespace):
                         )
                     )
         else:
-            outputs = llm.generate(run_prompts, sampling)
+            measured_sampling = (
+                [
+                    sampling_for(args.warmup + i)
+                    for i in range(len(run_prompts))
+                ]
+                if getattr(args, "mixed_phase", False)
+                else sampling
+            )
+            outputs = llm.generate(run_prompts, measured_sampling)
             for out, prompt_count in zip(outputs, run_prompt_counts):
                 results.append(
                     RequestResult(True, 0.0, len(out.outputs[0].token_ids), prompt_count)
@@ -239,6 +272,7 @@ def run(args: argparse.Namespace):
     finally:
         wall = time.perf_counter() - start
         cuda_profiler_stop(args.cuda_profiler_capture)
+        clocks_at_end = gpu_clock_state()
     spec_metrics_after = _vllm_spec_metrics(llm)
 
     summary = summarize(
@@ -260,6 +294,9 @@ def run(args: argparse.Namespace):
             "unique_prompts": args.unique_prompts,
             "cuda profiler capture": args.cuda_profiler_capture,
             "cpu affinity": cpu_affinity,
+            "warmup seconds": args.warmup_seconds,
+            "gpu clocks at start": clocks_at_start,
+            "gpu clocks at end": clocks_at_end,
             "warmup max tokens": args.warmup_max_tokens,
             **_vllm_spec_delta(spec_metrics_after, spec_metrics_before),
         },
@@ -319,7 +356,7 @@ def run_streaming(args: argparse.Namespace):
         return SamplingParams(
             temperature=args.temperature,
             top_p=args.top_p,
-            max_tokens=request_max_tokens(args, i),
+            max_tokens=request_max_tokens(args, args.warmup + i),
             ignore_eos=args.ignore_eos,
         )
 
@@ -560,6 +597,16 @@ def main() -> None:
             "additional latency reporting.",
         )
     args = parser.parse_args()
+    # vLLM refuses in-process data parallelism ("not supported for
+    # single-process usage and may hang"), so a replica is a process. The
+    # parent shards the request set, runs one child per replica pinned to
+    # its own tp-size-wide slice of the devices, and merges the results —
+    # which is what `data_parallel_offline.py` demonstrates, reduced to
+    # what this benchmark needs.
+    if args.dp_size > 1 and not os.environ.get("_VLLM_BENCH_REPLICA"):
+        summary, results = run_data_parallel(args)
+        finish(summary, results, args.json_out)
+        return
     if (
         getattr(args, "report_timing", False)
         or getattr(args, "report_arrivals", False)
@@ -568,6 +615,86 @@ def main() -> None:
     else:
         summary, results = run(args)
     finish(summary, results, args.json_out)
+
+
+def run_data_parallel(args):
+    """Fan the request set out over `dp_size` single-replica children.
+
+    Wall clock is the max over children (they run concurrently), so
+    throughput sums and latency percentiles pool — the same numbers a
+    real DP deployment would report."""
+    import subprocess
+    import tempfile
+
+    total = args.requests if args.mode == "latency" else args.num_requests
+    per = [total // args.dp_size] * args.dp_size
+    for i in range(total % args.dp_size):
+        per[i] += 1
+
+    procs, outs = [], []
+    tmpdir = tempfile.mkdtemp(prefix="vllm-dp-")
+    for replica, count in enumerate(per):
+        if count == 0:
+            continue
+        devices = ",".join(
+            str(replica * args.tp_size + i) for i in range(args.tp_size))
+        out = os.path.join(tmpdir, f"replica{replica}.json")
+        outs.append(out)
+        # Forward the parent's own argv rather than reconstructing it from
+        # the namespace: `store_true` flags have no `--no-` form, and the
+        # namespace cannot tell them from `BooleanOptionalAction` ones.
+        # Only the per-replica options are rewritten.
+        rewritten = {"--dp-size", "--json-out", "--requests", "--num-requests"}
+        forwarded, skip_next = [], False
+        for token in sys.argv[1:]:
+            if skip_next:
+                skip_next = False
+                continue
+            if token in rewritten:
+                skip_next = True
+                continue
+            if any(token.startswith(f"{flag}=") for flag in rewritten):
+                continue
+            forwarded.append(token)
+        argv = [sys.executable, os.path.abspath(__file__), *forwarded]
+        argv += ["--json-out", out]
+        argv += (["--requests", str(count)] if args.mode == "latency"
+                 else ["--num-requests", str(count)])
+        env = {**os.environ, "CUDA_VISIBLE_DEVICES": devices,
+               "_VLLM_BENCH_REPLICA": str(replica)}
+        procs.append(subprocess.Popen(argv, env=env))
+    failures = [p.wait() for p in procs]
+    if any(rc != 0 for rc in failures):
+        raise RuntimeError(f"vllm data-parallel replica failed: {failures}")
+
+    # Wall clock is the SLOWEST replica's own measured window, not the
+    # parent's subprocess lifetime — the children spend minutes loading
+    # weights before they start measuring, and counting that would report
+    # a 35B model's throughput as a fraction of its real value. The
+    # replicas run concurrently, so the max is the wall the merged set
+    # would have seen.
+    merged: list = []
+    wall = 0.0
+    for path in outs:
+        with open(path) as fh:
+            payload = json.load(fh)
+        wall = max(wall, float(payload["summary"]["wall_s"]))
+        for record in payload["requests"]:
+            merged.append(RequestResult(**record))
+    summary = summarize(
+        mode=args.mode,
+        engine="vllm",
+        model=args.model,
+        results=merged,
+        wall_s=wall,
+        config={
+            "data_parallel_size": args.dp_size,
+            "tensor_parallel_size": args.tp_size,
+            "dp_replica_requests": per,
+            "max_tokens": args.max_tokens,
+        },
+    )
+    return summary, merged
 
 
 if __name__ == "__main__":

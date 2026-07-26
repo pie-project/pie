@@ -60,6 +60,17 @@ fn pie_driver_abi_include_dir() -> PathBuf {
     PathBuf::from(dir)
 }
 
+/// Directory holding `pie_loader.h`, the cbindgen-generated view of the
+/// loader's FFI. The native drivers compile the plan themselves, so they need
+/// this on their include path.
+fn pie_loader_include_dir() -> PathBuf {
+    let dir = std::env::var("DEP_PIE_LOADER_INCLUDE").expect(
+        "pie-loader's build.rs did not emit cargo:include — \
+                 check that `links = \"pie_loader\"` is set in loader/Cargo.toml",
+    );
+    PathBuf::from(dir)
+}
+
 // -----------------------------------------------------------------------------
 // driver/metal — MLX-free raw-Metal driver (Apple Silicon, macOS-only)
 // -----------------------------------------------------------------------------
@@ -153,7 +164,7 @@ fn build_cuda() {
     let mut cfg = driver_cmake_config(&driver_dir, "cuda", "pie_driver_cuda_lib");
 
     // nvcc discovery, CUDA arch, the sccache/ccache launcher, the Marlin
-    // toggles and the CPM source cache are all handled by driver/cuda's
+    // toggle and the CPM source cache are all handled by driver/cuda's
     // CMakeLists (via find_program / `$ENV{...}`); we only declare the env
     // deps here so Cargo reconfigures when they change.
     for var in [
@@ -162,14 +173,9 @@ fn build_cuda() {
         "CMAKE_CUDA_ARCHITECTURES",
         "PIE_COMPILER_LAUNCHER",
         "PIE_CUDA_BUILD_MARLIN",
-        "PIE_CUDA_QWEN_ONLY",
-        "PIE_MARLIN_ALL_SHAPES",
         "CPM_SOURCE_CACHE",
     ] {
         println!("cargo:rerun-if-env-changed={var}");
-    }
-    if let Some(value) = std::env::var_os("PIE_CUDA_QWEN_ONLY") {
-        cfg.define("PIE_CUDA_QWEN_ONLY", value);
     }
 
     let build_dir = cfg.build().join("build");
@@ -202,15 +208,17 @@ fn build_cuda() {
 /// Shared `cmake::Config` for a native driver flavor. Per-flavor `out_dir`
 /// keeps multi-driver builds from clobbering each other's CMake cache; the
 /// archives are static + PIC (downstream may relink them into the pyo3
-/// `pie-server` shared object), and the direct ABI include handoff published
-/// by `pie-driver-abi` is forwarded so the C++ targets can find the headers.
+/// `pie-server` shared object), and the direct ABI and loader include handoffs
+/// published by `pie-driver-abi` and `pie-loader` are forwarded so the C++
+/// targets can find the headers.
 fn driver_cmake_config(driver_dir: &Path, out_subdir: &str, build_target: &str) -> cmake::Config {
     let mut cfg = cmake::Config::new(driver_dir);
     cfg.out_dir(PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join(out_subdir));
     cfg.build_target(build_target)
         .define("BUILD_SHARED_LIBS", "OFF")
         .define("CMAKE_POSITION_INDEPENDENT_CODE", "ON")
-        .define("PIE_DRIVER_ABI_INCLUDE_DIR", pie_driver_abi_include_dir());
+        .define("PIE_DRIVER_ABI_INCLUDE_DIR", pie_driver_abi_include_dir())
+        .define("PIE_LOADER_INCLUDE_DIR", pie_loader_include_dir());
     cfg
 }
 

@@ -22,10 +22,25 @@ pub enum ResolvedFlavor {
     Embedded(Flavor),
 }
 
-/// Partition `world_size` ranks into TP groups of size `tp_degree`.
+/// Partition `world_size` ranks into ONE tensor-parallel group.
 ///
-/// Example: `world_size=4, tp_degree=2 → [[0,1], [2,3]]` — two DP
-/// replicas, each with two TP-sharded ranks.
+/// Example: `world_size=2, tp_degree=2 → [[0, 1]]`.
+///
+/// A worker serves exactly one replica of its model. Data parallelism is a
+/// CLUSTER shape, not an engine one: N replicas are N workers, and the
+/// gateway already spreads requests over them by the coarse load each
+/// reports (`gateway::admission` filters on `kv_pressure_bucket` and
+/// `inflight`), which is both load-aware and the path that already exists.
+///
+/// Putting several replicas in one engine instead asks the CUDA driver to
+/// serve two devices from one process, and almost nothing in it is written
+/// that way: the driver holds ~96 process-global statics, and every one
+/// that owns device memory or a stream is a fault waiting for the second
+/// device. Three have already had to be made per-device — the cuBLASLt
+/// context and plan cache, the frame carrier's copy stream, and the baked
+/// buffer pool — each found only after it crashed. There is no way to know
+/// the rest have been found. (Tensor parallelism does share a process
+/// across devices, which is exactly why those three were bugs there too.)
 pub fn calculate_topology(world_size: usize, tp_degree: usize) -> Result<Vec<Vec<usize>>> {
     if tp_degree == 0 {
         anyhow::bail!("tensor_parallel_size must be > 0");
@@ -37,6 +52,16 @@ pub fn calculate_topology(world_size: usize, tp_degree: usize) -> Result<Vec<Vec
         );
     }
     let num_groups = world_size / tp_degree;
+    if num_groups > 1 {
+        anyhow::bail!(
+            "model.driver.device lists {world_size} devices with \
+             tensor_parallel_size = {tp_degree}, which asks for \
+             {num_groups} data-parallel replicas in one engine. A worker \
+             serves one replica: run {num_groups} workers, each with \
+             {tp_degree} device(s), and let the gateway spread requests \
+             over them."
+        );
+    }
     Ok((0..num_groups)
         .map(|g| (g * tp_degree..(g + 1) * tp_degree).collect())
         .collect())
@@ -115,12 +140,9 @@ mod tests {
     }
 
     #[test]
-    fn topology_dp_two() {
-        assert_eq!(
-            calculate_topology(2, 1).unwrap(),
-            vec![vec![0], vec![1]],
-            "DP=2, TP=1 → two single-rank groups"
-        );
+    fn topology_rejects_dp_two() {
+        let err = calculate_topology(2, 1).unwrap_err().to_string();
+        assert!(err.contains("run 2 workers"), "got: {err}");
     }
 
     #[test]
@@ -133,12 +155,9 @@ mod tests {
     }
 
     #[test]
-    fn topology_dp2_tp2() {
-        assert_eq!(
-            calculate_topology(4, 2).unwrap(),
-            vec![vec![0, 1], vec![2, 3]],
-            "DP=2, TP=2 → two two-rank groups"
-        );
+    fn topology_rejects_dp2_tp2() {
+        let err = calculate_topology(4, 2).unwrap_err().to_string();
+        assert!(err.contains("run 2 workers"), "got: {err}");
     }
 
     #[test]

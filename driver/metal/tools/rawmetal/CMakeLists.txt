@@ -8,17 +8,15 @@ endfunction()
 add_rawmetal_tool(decoder_smoke decoder_smoke.cpp)
 add_rawmetal_tool(rawmetal_harness harness_main.cpp harness.cpp)
 add_rawmetal_tool(rawmetal_microbench bench_kernels.cpp harness.cpp)
-add_rawmetal_tool(st_probe st_probe.cpp)
 add_rawmetal_tool(sparse_probe sparse_probe.mm)
 add_rawmetal_tool(sparse_probe2 sparse_probe2.mm)
 add_rawmetal_tool(sparse_probe3 sparse_probe3.mm)
 
-add_rawmetal_tool(
-  gemma4_decode_run
-  gemma4_decode_run.cpp
-  gemma4_encode.cpp
-  gemma4_heap_bind.cpp
-  gemma4_consts.cpp)
+# `st_probe` and `gemma4_decode_run` were removed with §6: both were bring-up
+# harnesses built on `SafetensorsView`, the driver-side name-addressed
+# checkpoint reader. The plan now carries the byte offsets, so nothing in a
+# driver resolves a tensor by name any more and the capability they were written
+# against no longer exists.
 add_rawmetal_tool(
   gemma4_encode_probe
   gemma4_encode_probe.cpp

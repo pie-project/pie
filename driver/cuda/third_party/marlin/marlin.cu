@@ -42,28 +42,20 @@
 // Each file opens/closes its own `namespace MARLIN_NAMESPACE_NAME`, so
 // they must appear before our `namespace marlin {` below.
 //
-// Only the shapes pie's driver actually dispatches are compiled.  The
-// runtime uses bf16 activations (launch_gptq_gemm_w4a16_bf16 and
-// launch_mxfp4_gemm_w4a16_bf16), so only bf16 × {u4, u4b8, fe2m1f}
-// kernel files are needed.  The remaining dtype combos (fp16, int8,
-// u8b128, fe4m3fn) are dead code that would add ~5 min of cicc time.
-// Define PIE_MARLIN_ALL_SHAPES=1 to compile every combo.
+// The shape list is owned by driver/cuda/src/kernels.def (PIE_MARLIN_SHAPE);
+// it has to be spelled out again here because a macro cannot expand to an
+// #include.  CMakeLists.txt fails the configure if the two disagree, so edit
+// kernels.def first and then mirror it below.
+//
+// marlin_wrapper.hpp exposes exactly two entry points, both bf16-in/bf16-out
+// (launch_gptq_gemm_w4a16_bf16, launch_mxfp4_gemm_w4a16_bf16), so bf16 ×
+// {u4, u4b8, fe2m1f} is the complete reachable set.  The other vendored
+// sm80_kernel_*.cu files (fp16, s8, u8b128, fe4m3fn) stay on disk unbuilt --
+// there is no API that could dispatch them, and compiling them cost ~5 min of
+// cicc time.  To add one, add a PIE_MARLIN_SHAPE entry and an #include here.
 #include "sm80_kernel_bfloat16_u4_bfloat16.cu"
 #include "sm80_kernel_bfloat16_u4b8_bfloat16.cu"
 #include "sm80_kernel_bfloat16_fe2m1f_bfloat16.cu"
-#if defined(PIE_MARLIN_ALL_SHAPES)
-#include "sm80_kernel_bfloat16_fe4m3fn_bfloat16.cu"
-#include "sm80_kernel_bfloat16_u8b128_bfloat16.cu"
-#include "sm80_kernel_float16_u4_float16.cu"
-#include "sm80_kernel_float16_u4b8_float16.cu"
-#include "sm80_kernel_float16_fe2m1f_float16.cu"
-#include "sm80_kernel_float16_fe4m3fn_float16.cu"
-#include "sm80_kernel_float16_u8b128_float16.cu"
-#include "sm80_kernel_s8_u4_bfloat16.cu"
-#include "sm80_kernel_s8_u4b8_bfloat16.cu"
-#include "sm80_kernel_s8_u4_float16.cu"
-#include "sm80_kernel_s8_u4b8_float16.cu"
-#endif
 
 namespace marlin {
 

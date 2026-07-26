@@ -24,11 +24,53 @@ namespace pie_cuda_driver {
 
 struct BatchEngine;
 
+// Host-side CSR views rank 0 uses for its own attention plan. Handed to the
+// follower through the shared mailbox so both ranks plan from identical
+// values and the follower needs no device readback.
+struct TpFirePlanViews {
+    const std::uint32_t* qo_indptr = nullptr;          // R + 1
+    const std::uint32_t* kv_page_indptr = nullptr;     // R + 1
+    const std::uint32_t* kv_last_page_lens = nullptr;  // R
+    const std::uint32_t* kv_page_indices = nullptr;    // kv_page_indices_len
+    std::size_t kv_page_indices_len = 0;
+};
+
+// Publish the fire's host-known metadata (header + planner CSR views) into the
+// process-shared mailbox and wake the follower — WITHOUT touching the device.
+//
+// Called as early as possible in the enqueue path. Rank 0 pre-enqueues its
+// whole step (`pull_validate`, compose, broadcast, forward) in one go, so its
+// forward starts ~17 us after the payload broadcast completes. The follower is
+// reactive: it cannot enqueue anything until it is notified, and profiling
+// showed its forward starting 588 us after the same broadcast, which rank 0
+// then absorbed as a 583 us wait inside the step's FIRST all-reduce (73% of
+// rank 0's entire all-reduce time). Waking the follower before rank 0's own
+// uploads and compose hands it that window as a head start.
+void tp_publish_fire(const std::string& cpu_gate_key,
+                     const TpFirePlanViews& views,
+                     int N, int R, bool is_pure_decode,
+                     int kv_indices_count,
+                     int required_kv_pages,
+                     int mask_bytes, int mask_indptr_count,
+                     bool has_slot_ids,
+                     bool has_write_desc,
+                     int logit_rows,
+                     int structured_window_left,
+                     RsExecutionMode rs_mode,
+                     int rs_fold_lens_count,
+                     int rs_buffer_ids_count);
+
 // Issue every per-fire broadcast in dependency order. Caller has already
 // refilled `pi.*` with the current fire's data; this just fans them out.
 // All ops run on `stream` so they sequence correctly with the kernels that
 // follow inside `forward_fn.body`.
+//
+// Also publishes the fire header and `views` into the process-shared mailbox
+// and notifies the CPU gate, in that order: the follower reads both from host
+// memory instead of paying a device round trip for them.
 void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
+                         const std::string& cpu_gate_key,
+                         const TpFirePlanViews& views,
                          int N, int R, bool is_pure_decode,
                          int kv_indices_count,
                          int required_kv_pages,
@@ -42,9 +84,18 @@ void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
                          int rs_buffer_ids_count,
                          cudaStream_t stream);
 
+// Publish an MTP draft step's header into the mailbox and wake the follower.
+// Every gate epoch must own exactly one published slot or the follower's slot
+// index drifts away from rank 0's.
+void tp_publish_mtp(const std::string& cpu_gate_key,
+                    int rows,
+                    int draft_step,
+                    int max_global_tokens);
+
 void tp_broadcast_mtp_step(
     NcclComm& comm,
     PersistentInputs& pi,
+    const std::string& cpu_gate_key,
     int rows,
     int draft_step,
     int max_global_tokens,
@@ -52,15 +103,25 @@ void tp_broadcast_mtp_step(
 
 // Notify TP followers waiting on the CPU gate keyed by `key` that rank 0 has
 // begun broadcasting a new fire. No-op when `key` is empty (CPU gate off).
+void tp_watchdog_mark_phase(int phase);
+void tp_watchdog_count_collective(int rank);
+
 void tp_cpu_gate_notify(const std::string& key);
+
+// Release every waiter parked on the CPU gate keyed by `key` and mark the gate
+// permanently stopped, so followers leave `tp_follower_serve` without posting
+// an unmatched collective. Both ranks share the gate (it is keyed by the NCCL
+// unique id), which makes teardown independent of Context destruction order.
+// Idempotent and safe to call from any rank.
+void tp_cpu_gate_request_stop(const std::string& key);
 
 // TP-follower service loop. Called only on TP ranks > 0. Mirrors
 // the frame step pipeline minus PTIR publication: the loop blocks on
 // `ncclBroadcast(root=0)` for each fire's header + inputs, runs the same
 // `forward_fn.body` so the all-reduces inside complete against rank 0, then
-// loops. `stop` is checked between fires; rank 0 also sends an explicit
-// shutdown header before tearing down so a follower waiting on a broadcast
-// unblocks cleanly.
+// loops. The loop exits when `stop` is set or the CPU gate is stopped; with
+// the gate off, rank 0's shutdown header releases a follower parked inside
+// `ncclBroadcast`.
 void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop);
 
 // Send the shutdown sentinel header from rank 0 so followers exit their

@@ -1,0 +1,376 @@
+//! Quest — query-aware sparsity via page criticality (Tang et al., 2024).
+//!
+//! <https://arxiv.org/abs/2406.10774>
+//!
+//! Quest observes, at every layer and every decode step, an upper bound on how
+//! much each KV *page* could contribute to attention, and keeps only the
+//! top-`page_budget` pages. The bound is exact and cheap: for a page holding
+//! keys `K`, precompute the elementwise envelope `kmin = min(K, axis=pos)` and
+//! `kmax = max(K, axis=pos)`; then for a query `q`,
+//!
+//! ```text
+//!     criticality(page) = Σ_d max(q_d * kmin_d, q_d * kmax_d)  ≥  max_k q·k
+//! ```
+//!
+//! This inferlet is the **observability half** of that algorithm: it runs the
+//! real bound on real hardware, per layer, against the live KV cache, and
+//! drains the per-page scores back to the host so the selection can be
+//! verified against a reference. It does not yet elide the unselected pages
+//! from the attention kernel, so it produces *bit-identical output to
+//! `naive-baseline`* — which is precisely what makes it testable: any
+//! divergence is a bug in the tap, not in the algorithm.
+//!
+//! ## What the backend does under `intrinsics::kernel::envelope_dot`
+//!
+//! The call lowers to `Op::KernelCall{name:"envelope_dot"}`, which the CUDA
+//! driver binds to a second-party kernel only when the model reports the
+//! `has_kv_envelopes` capability (native bf16 NHD pages, a post-rope query
+//! family, and `tp == 1`). The kernel reads the *runtime* post-rope query row
+//! for the lane, so the `p_max` argument declares only the score width; there
+//! is no query operand to shape.
+//!
+//! ## Two documented deviations from the paper
+//!
+//! 1. **Union over heads.** Quest selects top-K pages *per head*. The paged
+//!    attention layout here carries one page list per request, so the kernel
+//!    emits `score[p] = max over kv_heads (Σ_{qh in group} Σ_d max(q·kmin, q·kmax))`
+//!    — the union of the per-head selections. Quality ≥ Quest, sparsity ≤ Quest.
+//!
+//! 2. **The in-flight page is always kept.** The observation hook fires
+//!    *before* the layer's KV append, so pages the current fire is still
+//!    filling hold envelopes that predate their contents. Those pages score
+//!    `+inf` and are unconditionally retained. This is fail-safe, and it
+//!    coincides with Quest's own rule that the local window is never evicted.
+//!    Pages outside the request's page list score `-inf`.
+
+use inferlet::ptir::prelude::*;
+use inferlet::{Result, model as wit_model};
+use serde::{Deserialize, Serialize};
+
+#[derive(Deserialize)]
+struct Input {
+    #[serde(default = "default_prompt")]
+    prompt: String,
+    #[serde(default = "default_temperature")]
+    temperature: f32,
+    #[serde(default = "default_max_tokens")]
+    max_tokens: usize,
+    #[serde(default = "default_seed")]
+    seed: u32,
+    /// Pages Quest would keep per layer.
+    #[serde(default = "default_page_budget")]
+    page_budget: u32,
+}
+
+fn default_prompt() -> String {
+    "The capital of France is".into()
+}
+
+fn default_temperature() -> f32 {
+    1.0
+}
+
+fn default_max_tokens() -> usize {
+    32
+}
+
+fn default_seed() -> u32 {
+    0x9e57
+}
+
+fn default_page_budget() -> u32 {
+    4
+}
+
+#[derive(Serialize)]
+struct Output {
+    sampler: &'static str,
+    text: String,
+    count: usize,
+    /// Pages the program was allowed to score.
+    max_pages: u32,
+    page_budget: u32,
+    /// Layers whose envelope tap actually fired, counted on-device.
+    layers_observed: u32,
+    /// Per-page criticality, max-reduced over layers, from the last step.
+    /// Non-finite bounds are meaningful here — `+inf` is an in-flight page and
+    /// `-inf` is a page outside the request — and JSON has no encoding for
+    /// them, so they are rendered as strings.
+    page_scores: Vec<String>,
+    /// How the last step's bounds broke down. `nan` is always a bug.
+    pages_finite: usize,
+    pages_pinned: usize,
+    pages_absent: usize,
+    pages_nan: usize,
+    /// The pages Quest would have kept at the last step.
+    kept_pages: Vec<u32>,
+    /// True when at least one page carried a finite (i.e. genuinely scored)
+    /// bound — the signal that the tap saw real envelopes, not just the
+    /// fail-safe `+inf` of an in-flight page.
+    scored_any_page: bool,
+}
+
+/// One sampling step: temperature, then a Gumbel-max draw over the full vocab.
+fn step(logits: Tensor, temperature: f32, rng_state: impl AsTensor + Copy) -> Tensor {
+    let scaled = if temperature == 1.0 {
+        logits
+    } else {
+        div(&logits, temperature)
+    };
+    gumbel_max(scaled, rng_state)
+}
+
+#[inferlet::main]
+async fn main(input: Input) -> Result<Output> {
+    if !input.temperature.is_finite() || input.temperature <= 0.0 {
+        return Err("temperature must be finite and greater than 0".into());
+    }
+    if input.page_budget == 0 {
+        return Err("page_budget must be at least 1".into());
+    }
+    let max_tokens = input.max_tokens;
+    let temperature = input.temperature;
+    let ws = WorkingSet::new();
+    let page_size = ws.page_size();
+
+    if max_tokens == 0 {
+        return Err("max_tokens must be at least 1".into());
+    }
+
+    let mut prompt = wit_model::encode(&input.prompt);
+    if prompt.is_empty() {
+        prompt.push(0);
+    }
+    let n = prompt.len() as u32;
+    let max_pages = (n + max_tokens as u32 + 1).div_ceil(page_size).max(1);
+    let p_max = max_pages;
+    let budget = input.page_budget.min(p_max);
+    ws.reserve(max_pages)
+        .map_err(|e| format!("reserve KV: {e}"))?;
+
+    let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
+
+    // ── PREFILL FIRE (N-wide): no Quest tap. ──
+    //
+    // Every page of a fresh prefill is in-flight by construction (`kv_before`
+    // is zero), so the bound is `+inf` everywhere and carries no information.
+    let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
+    let toks_p = Channel::from(prompt_i32).named("toks_p");
+    let embed_indptr_p = Channel::from(vec![0u32, n]).named("embed_indptr_p");
+    let positions_p = Channel::from((0..n).collect::<Vec<_>>()).named("positions_p");
+    let pages_p = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages_p");
+    let page_indptr_p = Channel::from(vec![0u32, n.div_ceil(page_size)]).named("page_indptr_p");
+    let w_slot_p =
+        Channel::from((0..n).map(|p| p / page_size).collect::<Vec<_>>()).named("w_slot_p");
+    let w_off_p = Channel::from((0..n).map(|p| p % page_size).collect::<Vec<_>>()).named("w_off_p");
+    let kv_len_p = Channel::from(vec![n]).named("kv_len_p");
+    let rng_p = Channel::from(vec![input.seed, 0]).named("rng_p");
+    let tok_out_p = Channel::new([1], dtype::i32).named("tok_out_p");
+
+    let fwd_p = ForwardPass::new();
+    fwd_p.embed(&toks_p, &embed_indptr_p)?;
+    fwd_p.attention(
+        &ws,
+        ..,
+        ..,
+        &kv_len_p,
+        &pages_p,
+        &page_indptr_p,
+        &w_slot_p,
+        &w_off_p,
+        &positions_p,
+        None,
+    )?;
+    fwd_p.epilogue(move || {
+        let r = rng_p.take();
+        let logits = intrinsics::logits();
+        let token = step(logits, temperature, &r);
+        tok_out_p.put(&token);
+        rng_p.put(&add(&r, iota(2)));
+    });
+
+    let pipe = Pipeline::new();
+    fwd_p
+        .submit(&pipe)
+        .map_err(|e| format!("prefill submit: {e}"))?;
+
+    let g0 = tok_out_p
+        .take()
+        .get::<i32>()
+        .await
+        .map_err(|e| format!("g0 take: {e}"))?[0];
+    generated.push(g0 as u32);
+
+    let mut last_scores: Vec<f32> = Vec::new();
+    let mut layers_observed = 0u32;
+
+    // ── DECODE LOOP (1-wide, run-ahead), with the Quest tap. ──
+    if generated.len() < max_tokens {
+        let tok_in = Channel::from(vec![g0; 1]).named("tok_in");
+        let rng = Channel::from(vec![input.seed ^ 0x5bd1, 0]).named("rng");
+        let tok_out = Channel::new([1], dtype::i32)
+            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+            .named("tok_out");
+        let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
+        let positions = Channel::from(vec![n]).named("positions");
+        let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
+        let page_indptr =
+            Channel::from(vec![0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
+        let w_slot = Channel::from(vec![n / page_size]).named("w_slot");
+        let w_off = Channel::from(vec![n % page_size]).named("w_off");
+        let kv_len = Channel::from(vec![n + 1]).named("kv_len");
+
+        // The per-layer accumulator. `OnAttnProj` fires once per layer and the
+        // inferlet has no way to ask the model how many layers there are, so
+        // the layer loop folds into a device-carried channel and the epilogue
+        // — which fires exactly once per fire — publishes the fold. The seed
+        // is `-inf` (the identity of `max`) and a zero layer counter.
+        let acc = Channel::from(vec![f32::NEG_INFINITY; p_max as usize]).named("quest_acc");
+        let layer_ct = Channel::from(vec![0u32]).named("quest_layers");
+
+        // Host drains.
+        let scores_out = Channel::new([p_max], dtype::f32)
+            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+            .named("quest_scores");
+        let layers_out = Channel::new([1], dtype::u32)
+            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+            .named("quest_layer_count");
+
+        let fwd = ForwardPass::new();
+        fwd.embed(&tok_in, &lane1)?;
+        fwd.attention(
+            &ws,
+            ..,
+            (n / page_size)..,
+            &kv_len,
+            &pages,
+            &page_indptr,
+            &w_slot,
+            &w_off,
+            &positions,
+            None,
+        )?;
+
+        // ── THE TAP. Fires once per layer, inside the fire, after the layer's
+        //    Q/K/V projection and rope but before its KV append. ──
+        fwd.on_attn_proj(move || {
+            let prev = acc.take().tensor();
+            let ct = layer_ct.take().tensor();
+            let scores = intrinsics::kernel::envelope_dot(p_max);
+            acc.put(&max_elem(&prev, &scores));
+            layer_ct.put(&add(&ct, 1u32));
+        });
+
+        fwd.epilogue(move || {
+            let length = kv_len.take().tensor();
+            let r = rng.take();
+            let logits = intrinsics::logits();
+            let token = step(logits, temperature, &r);
+
+            let next_length = add(&length, 1u32);
+            let page_count = div(add(&next_length, page_size - 1), page_size);
+
+            tok_in.put(&token);
+            kv_len.put(&next_length);
+            positions.put(&length);
+            w_slot.put(div(&length, page_size));
+            w_off.put(rem(&length, page_size));
+            page_indptr.take();
+            page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
+            tok_out.put(&token);
+            rng.put(&add(&r, iota(2)));
+
+            // Publish the layer fold, then re-seed it for the next fire.
+            let folded = acc.take().tensor();
+            let layers = layer_ct.take().tensor();
+            scores_out.put(&folded);
+            layers_out.put(&layers);
+            acc.put(&broadcast(f32::NEG_INFINITY, [p_max]));
+            layer_ct.put(&reshape(&mul(&layers, 0u32), [1]));
+        });
+
+        let budget_n = max_tokens - 1;
+        let mut submitted = 0usize;
+        let mut in_flight = 0usize;
+        while in_flight < DEFAULT_RUNAHEAD_DEPTH && submitted < budget_n {
+            fwd.submit(&pipe)
+                .map_err(|e| format!("decode submit @{}: {e}", submitted + 1))?;
+            submitted += 1;
+            in_flight += 1;
+        }
+        while in_flight > 0 {
+            let t = tok_out
+                .take()
+                .get::<i32>()
+                .await
+                .map_err(|e| format!("tok_out.take @{}: {e}", generated.len()))?[0];
+            last_scores = scores_out
+                .take()
+                .get::<f32>()
+                .await
+                .map_err(|e| format!("quest_scores.take @{}: {e}", generated.len()))?;
+            layers_observed = layers_out
+                .take()
+                .get::<u32>()
+                .await
+                .map_err(|e| format!("quest_layer_count.take @{}: {e}", generated.len()))?[0];
+            in_flight -= 1;
+            generated.push(t as u32);
+            if submitted < budget_n {
+                fwd.submit(&pipe)
+                    .map_err(|e| format!("decode submit @{}: {e}", submitted + 1))?;
+                submitted += 1;
+                in_flight += 1;
+            }
+        }
+    }
+    pipe.close();
+
+    // The host-side mirror of Quest's selection: keep the `budget` highest
+    // bounds. `+inf` pages (in-flight, always kept) sort to the front for free.
+    let mut order: Vec<u32> = (0..last_scores.len() as u32).collect();
+    order.sort_by(|&a, &b| {
+        last_scores[b as usize]
+            .partial_cmp(&last_scores[a as usize])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(&b))
+    });
+    let mut kept: Vec<u32> = order
+        .into_iter()
+        .filter(|&p| last_scores[p as usize] != f32::NEG_INFINITY)
+        .take(budget as usize)
+        .collect();
+    kept.sort_unstable();
+
+    Ok(Output {
+        sampler: "quest-attention",
+        text: wit_model::decode(&generated)?,
+        count: generated.len(),
+        max_pages,
+        page_budget: budget,
+        layers_observed,
+        scored_any_page: last_scores.iter().any(|s| s.is_finite()),
+        pages_finite: last_scores.iter().filter(|s| s.is_finite()).count(),
+        pages_pinned: last_scores.iter().filter(|s| **s == f32::INFINITY).count(),
+        pages_absent: last_scores
+            .iter()
+            .filter(|s| **s == f32::NEG_INFINITY)
+            .count(),
+        pages_nan: last_scores.iter().filter(|s| s.is_nan()).count(),
+        page_scores: last_scores
+            .iter()
+            .map(|s| {
+                if s.is_nan() {
+                    "nan".to_string()
+                } else if *s == f32::INFINITY {
+                    "inf".to_string()
+                } else if *s == f32::NEG_INFINITY {
+                    "-inf".to_string()
+                } else {
+                    format!("{s:.4}")
+                }
+            })
+            .collect(),
+        kept_pages: kept,
+    })
+}

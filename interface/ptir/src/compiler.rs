@@ -2140,7 +2140,7 @@ fn scan_planned_op(bytes: &[u8]) -> Result<u32, PlanDecodeError> {
             0
         }
         0xA0 => {
-            if reader.u16()? > IntrinsicId::MtpDrafts as u16 || reader.u8()? > DType::Bool as u8 {
+            if reader.u16()? > IntrinsicId::AttnScore as u16 || reader.u8()? > DType::Bool as u8 {
                 return Err(PlanDecodeError::InvalidRecord);
             }
             scan_plan_shape(&mut reader)?;

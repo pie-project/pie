@@ -25,11 +25,8 @@ endif()
 
 project(PIE_DRIVER_CUDA CUDA CXX)
 
-# Optional compiler cache (sccache/ccache) for host C++ compiles; speeds
-# clean rebuilds / branch switches. nvcc is NOT auto-launched: sccache
-# mishandles nvcc's fatbinary temp files (intermittent SIGHUP-killed
-# server). Opt in explicitly with -DCMAKE_CUDA_COMPILER_LAUNCHER=... if your
-# sccache build is known-good with nvcc.
+# Optional compiler cache; speeds clean rebuilds / branch switches.
+# Host C/C++ accepts either sccache or ccache.
 if(NOT CMAKE_C_COMPILER_LAUNCHER AND NOT CMAKE_CXX_COMPILER_LAUNCHER)
   if(DEFINED ENV{PIE_COMPILER_LAUNCHER} AND NOT "$ENV{PIE_COMPILER_LAUNCHER}" STREQUAL "")
     set(PIE_COMPILER_LAUNCHER "$ENV{PIE_COMPILER_LAUNCHER}")
@@ -39,22 +36,75 @@ if(NOT CMAKE_C_COMPILER_LAUNCHER AND NOT CMAKE_CXX_COMPILER_LAUNCHER)
   if(PIE_COMPILER_LAUNCHER)
     set(CMAKE_C_COMPILER_LAUNCHER "${PIE_COMPILER_LAUNCHER}")
     set(CMAKE_CXX_COMPILER_LAUNCHER "${PIE_COMPILER_LAUNCHER}")
-    message(STATUS "Using compiler launcher (C/C++ only): ${PIE_COMPILER_LAUNCHER}")
+    message(STATUS "Using compiler launcher (C/C++): ${PIE_COMPILER_LAUNCHER}")
   endif()
 endif()
 
-if(NOT CMAKE_BUILD_TYPE)
-  set(CMAKE_BUILD_TYPE Release)
+# nvcc is launched through ccache ONLY. sccache mishandles nvcc's fatbinary
+# temp files (intermittent SIGHUP-killed server); ccache 4.x handles nvcc
+# correctly. Caching .cu matters far more than caching host C/C++: .cu
+# objects are ~95% of this build's CPU time, so a host-only cache leaves
+# nearly all of a rebuild uncached. Set -DCMAKE_CUDA_COMPILER_LAUNCHER=
+# explicitly to opt out or to force a different launcher.
+if(NOT DEFINED CMAKE_CUDA_COMPILER_LAUNCHER)
+  find_program(PIE_CUDA_COMPILER_LAUNCHER NAMES ccache)
+  if(PIE_CUDA_COMPILER_LAUNCHER)
+    set(CMAKE_CUDA_COMPILER_LAUNCHER "${PIE_CUDA_COMPILER_LAUNCHER}")
+    message(STATUS "Using CUDA compiler launcher: ${PIE_CUDA_COMPILER_LAUNCHER}")
+  else()
+    message(STATUS "ccache not found; nvcc compiles will not be cached")
+  endif()
 endif()
+
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING
+    "Build type (Debug, Release, RelWithDebInfo, MinSizeRel)" FORCE)
+endif()
+
+# ---- kernels.def ----------------------------------------------------------
+# Single source of truth for model-derived kernel variants, read by both C++
+# (as an X-macro include) and CMake (here). See src/kernels.def for the rule
+# about which axes may live there. CMake needs exactly two facts from it:
+# which head_dims get their own translation unit, and which MoE activations
+# are reachable.
+set(PIE_KERNELS_DEF "${CMAKE_CURRENT_SOURCE_DIR}/src/kernels.def")
+if(NOT EXISTS "${PIE_KERNELS_DEF}")
+  message(FATAL_ERROR "missing kernel manifest: ${PIE_KERNELS_DEF}")
+endif()
+set_property(DIRECTORY APPEND
+  PROPERTY CMAKE_CONFIGURE_DEPENDS "${PIE_KERNELS_DEF}")
+
+# Collect the arguments of every `<macro_name>(...)` invocation. Only lines
+# that *start* with the macro name are matched, so the #ifndef/#define/#undef
+# scaffolding and the prose comments are skipped.
+function(pie_read_kernels_def macro_name out_var)
+  file(STRINGS "${PIE_KERNELS_DEF}" _lines REGEX "^[ \t]*${macro_name}\\(")
+  set(_vals "")
+  foreach(_line IN LISTS _lines)
+    string(REGEX REPLACE "^[ \t]*${macro_name}\\(([^)]*)\\).*$" "\\1" _arg "${_line}")
+    string(REGEX REPLACE "[ \t]" "" _arg "${_arg}")
+    list(APPEND _vals "${_arg}")
+  endforeach()
+  set(${out_var} "${_vals}" PARENT_SCOPE)
+endfunction()
+
+pie_read_kernels_def(PIE_ATTN_HEAD_DIM PIE_ATTN_HEAD_DIMS)
+pie_read_kernels_def(PIE_MOE_ACTIVATION PIE_MOE_ACTIVATIONS)
+if(NOT PIE_ATTN_HEAD_DIMS)
+  message(FATAL_ERROR
+    "no PIE_ATTN_HEAD_DIM entries found in ${PIE_KERNELS_DEF}")
+endif()
+message(STATUS "Attention head_dims: ${PIE_ATTN_HEAD_DIMS}")
+message(STATUS "MoE activations: ${PIE_MOE_ACTIVATIONS}")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/bin)
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/lib)
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/lib)
 
 find_package(CUDAToolkit REQUIRED)
 find_package(Threads REQUIRED)
@@ -62,20 +112,14 @@ find_package(Threads REQUIRED)
 # are vendored (third_party/flashinfer_generated) and flashinfer itself is
 # fetched DOWNLOAD_ONLY for headers.
 
-# CUDA 13+ ships libcudacxx/CUB/Thrust under a `cccl/` prefix; CUTLASS and
-# vendored Marlin still `#include <cuda/std/...>` etc. without that prefix.
-# Add the CCCL dir when the non-prefixed headers don't exist.
-foreach(_cuda_inc IN LISTS CUDAToolkit_INCLUDE_DIRS)
-  if(EXISTS "${_cuda_inc}/cccl" AND NOT EXISTS "${_cuda_inc}/cuda/std")
-    list(APPEND PIE_CCCL_INCLUDE_DIRS "${_cuda_inc}/cccl")
-  endif()
-endforeach()
-if(PIE_CCCL_INCLUDE_DIRS)
-  message(STATUS "Adding CCCL include dirs for CUDA 13+: ${PIE_CCCL_INCLUDE_DIRS}")
-endif()
-
 if(NOT PIE_DRIVER_ABI_INCLUDE_DIR)
   set(PIE_DRIVER_ABI_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../interface/driver/include")
+endif()
+
+# `pie_loader.h` is generated by `cargo run -p pie-loader-cbindgen` and
+# committed, so a standalone CMake configure works without a Cargo build.
+if(NOT PIE_LOADER_INCLUDE_DIR)
+  set(PIE_LOADER_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../loader/include")
 endif()
 
 # NCCL for tensor-parallel collectives. Single-GPU runs never load it (call
@@ -101,17 +145,62 @@ endif()
 # flashinfer ships no top-level CMakeLists.txt since v0.3.0; fetch
 # DOWNLOAD_ONLY for headers/csrc and compile only the launchers we need
 # directly into the driver (see the generated-MoE and Hopper/FA3 blocks below).
-cpmaddpackage(
+CPMAddPackage(
   NAME flashinfer
   GITHUB_REPOSITORY flashinfer-ai/flashinfer
   GIT_TAG v0.6.15
   GIT_SHALLOW TRUE
   DOWNLOAD_ONLY YES)
 
-# v0.6.15 has a narrowing-conversion warning nvcc escalates to an error
-# (`state_stride_batch`, signed long, brace-initialized into a uint64_t
-# field). Patch once after fetch; a sentinel file avoids re-patching every
-# fresh build-hash dir.
+# FlashInfer v0.6.15 uses APIs introduced by its vendored CCCL 3.3.2.
+# Keep these ahead of the toolkit-bundled CCCL, which may be older even on
+# CUDA 13 installations.
+set(_FI_CCCL_ROOT "${flashinfer_SOURCE_DIR}/3rdparty/cccl")
+set(PIE_CCCL_INCLUDE_DIRS
+  "${_FI_CCCL_ROOT}/cub"
+  "${_FI_CCCL_ROOT}/libcudacxx/include"
+  "${_FI_CCCL_ROOT}/thrust")
+foreach(_fi_cccl_include IN LISTS PIE_CCCL_INCLUDE_DIRS)
+  if(NOT EXISTS "${_fi_cccl_include}")
+    message(FATAL_ERROR
+      "FlashInfer vendored CCCL headers are missing: ${_fi_cccl_include}")
+  endif()
+endforeach()
+message(STATUS "Using FlashInfer vendored CCCL: ${_FI_CCCL_ROOT}")
+
+# Upstream bug: `state_stride_batch` is an int64_t stride everywhere else in
+# FlashInfer, but buildNdDescriptor() takes `std::vector<uint64_t> const&`, so
+# the two brace-initialized call sites narrow. Narrowing an initializer_list
+# element is ill-formed, not a warning, so nvcc hard-errors:
+#
+#   error: invalid narrowing conversion from "signed long" to "unsigned long"
+#
+# and no -Wno-* or --diag-suppress can demote it. (Were the parameter an
+# ordinary aggregate this would be warning #2361-D and nothing to fix.)
+#
+# Only sm_90+ builds see it: both sites live inside the header's
+# FLASHINFER_MAMBA_ENABLE_SM90 block, which is exactly the macro the
+# Hopper/Blackwell Mamba gate below defines. Upstream's own builds do not
+# compile that path, which is why the bug has survived unnoticed -- as of
+# v0.6.15 both sites are still unfixed on main and on today's nightly, and
+# v0.6.15.post1 is the newest release, so there is no version to bump to.
+# Reported upstream as flashinfer-ai/flashinfer#4155; drop this whole block
+# once a release carrying that fix lands and GIT_TAG moves past it.
+#
+# Upstream has two more identical sites in invoke_selective_state_update_mtp.cuh
+# guarded by FLASHINFER_MAMBA_ENABLE_SM100. We do not patch those because we
+# never define that macro; enabling sm_100 Mamba means extending this patch.
+#
+# Patching the fetched source in place is deliberate but not free: it mutates
+# the CPM source cache that every build directory on the machine shares, and
+# CPM notices ("Cache for flashinfer ... is dirty"). It is kept because the
+# alternative is worse -- vendoring cannot shadow this header alone, since its
+# only includer reaches it through a relative `#include "..."` that resolves
+# next to the includer before any -I path, so a vendored copy would have to
+# carry both files (~1460 lines) to fix one cast.
+#
+# The sentinel avoids re-patching every fresh build-hash dir; the FATAL_ERROR
+# fires if a FlashInfer bump ever makes the patch stop applying.
 set(_FI_PATCH_SENTINEL "${flashinfer_SOURCE_DIR}/.pie_narrowing_patched")
 set(_FI_PATCH_FILE
   "${flashinfer_SOURCE_DIR}/include/flashinfer/mamba/kernel_selective_state_update_stp.cuh")
@@ -164,9 +253,9 @@ if(NOT _PIE_CCCL_HAS_FAST_MOD_DIV)
     "CCCL at ${_PIE_FI_CCCL}")
 endif()
 
-cpmaddpackage(URI "gh:marzer/tomlplusplus@3.4.0")
-cpmaddpackage(URI "gh:CLIUtils/CLI11@2.5.0")
-cpmaddpackage(URI "gh:nlohmann/json@3.12.0" OPTIONS "JSON_BuildTests OFF")
+CPMAddPackage(URI "gh:marzer/tomlplusplus@3.4.0")
+CPMAddPackage(URI "gh:CLIUtils/CLI11@2.5.0")
+CPMAddPackage(URI "gh:nlohmann/json@3.12.0" OPTIONS "JSON_BuildTests OFF")
 
 # ---- Helper functions ------------------------------------------------------
 
@@ -253,93 +342,113 @@ else()
   message(STATUS "FlashInfer Mamba SM90 vertical/horizontal SSU kernels disabled (legacy + simple algorithm only)")
 endif()
 
-# Local PTIR development only needs the Qwen families. Opt-in (the dev build
-# script flips it ON): an unconfigured release must ship every model, not a
-# Qwen-only driver.
-option(PIE_CUDA_QWEN_ONLY
-  "Build only Qwen 3 and Qwen 3.5 CUDA model implementations" OFF)
-
+# Every CUDA model implementation. The registry (src/model/registry.cpp)
+# binds these by architecture name at load time.
 set(PIE_CUDA_MODEL_SOURCES
+  src/kernels/altup.cu
+  src/kernels/altup_aux.cu
+  src/kernels/attn_sink.cu
+  src/kernels/dsa_indexer.cu
+  src/kernels/dsv4_compress.cu
+  src/kernels/dsv4_hc.cu
+  src/kernels/dsv4_routing.cu
+  src/kernels/gaussian_topk.cu
+  src/kernels/kimi_mla.cu
+  src/kernels/mla_paged.cu
+  src/kernels/nemotron_h.cu
+  src/kernels/scalar_mul.cu
+  src/kernels/softcap.cu
+  src/model/attn_score.cu
   src/model/config.cpp
-  src/model/loaded_model.cpp
-  src/model/registry.cpp
-  src/model/weight_store.cpp
-  src/model/workspace.cpp
+  src/model/csm/csm.cpp
+  src/model/csm/csm_backbone_forward.cu
+  src/model/csm/csm_depth_decoder_forward.cu
+  src/model/csm/csm_model.cpp
+  src/model/csm/mimi_decoder_adapter.cpp
+  src/model/csm/mimi_decoder_forward.cu
+  src/model/deepseek_v4/deepseek_v4.cpp
+  src/model/deepseek_v4/deepseek_v4_forward.cpp
+  src/model/deepseek_v4/deepseek_v4_model.cpp
+  src/model/gemma/gemma2.cpp
+  src/model/gemma/gemma2_model.cpp
+  src/model/gemma3n/gemma3n.cpp
+  src/model/gemma3n/gemma3n_model.cpp
+  src/model/gemma4/gemma4.cpp
+  src/model/gemma4/gemma4_audio_adapter.cpp
+  src/model/gemma4/gemma4_audio_forward.cu
+  src/model/gemma4/gemma4_model.cpp
+  src/model/gemma4/gemma4_vision_adapter.cpp
+  src/model/gemma4/gemma4_vision_forward.cu
+  src/model/glm5/glm5.cpp
+  src/model/glm5/glm5_forward.cpp
+  src/model/glm5/glm5_model.cpp
+  src/model/kimi/kimi.cpp
+  src/model/kimi/kimi_forward.cpp
+  src/model/kimi/kimi_model.cpp
   src/model/llama_like/llama_like.cpp
   src/model/llama_like/llama_like_model.cpp
+  src/model/llama_like/mistral3.cpp
   src/model/llama_like/qwen3.cpp
+  src/model/loaded_model.cpp
+  src/model/mixtral/gpt_oss.cpp
+  src/model/mixtral/mixtral.cpp
+  src/model/mixtral/mixtral_model.cpp
+  src/model/nemotron_h/nemotron_h.cpp
+  src/model/nemotron_h/nemotron_h_forward.cpp
+  src/model/nemotron_h/nemotron_h_model.cpp
   src/model/qwen3_5/qwen3_5.cpp
   src/model/qwen3_5/qwen3_5_config.cpp
   src/model/qwen3_5/qwen3_5_forward.cpp
   src/model/qwen3_5/qwen3_5_model.cpp
   src/model/qwen3_5/qwen3_5_moe.cpp
   src/model/qwen3_5/qwen3_5_moe_forward.cpp
-  src/model/qwen3_5/qwen3_5_moe_model.cpp)
-
-if(PIE_CUDA_QWEN_ONLY)
-  message(STATUS "Building Qwen-only CUDA model registry")
-else()
-  list(APPEND PIE_CUDA_MODEL_SOURCES
-    src/model/csm/csm.cpp
-    src/model/csm/csm_backbone_forward.cu
-    src/model/csm/csm_depth_decoder_forward.cu
-    src/model/csm/csm_model.cpp
-    src/model/csm/mimi_decoder_adapter.cpp
-    src/model/csm/mimi_decoder_forward.cu
-    src/model/deepseek_v4/deepseek_v4.cpp
-    src/model/deepseek_v4/deepseek_v4_forward.cpp
-    src/model/deepseek_v4/deepseek_v4_model.cpp
-    src/model/gemma/gemma2.cpp
-    src/model/gemma/gemma2_model.cpp
-    src/model/gemma3n/gemma3n.cpp
-    src/model/gemma3n/gemma3n_model.cpp
-    src/model/gemma4/gemma4.cpp
-    src/model/gemma4/gemma4_audio_adapter.cpp
-    src/model/gemma4/gemma4_audio_forward.cu
-    src/model/gemma4/gemma4_model.cpp
-    src/model/gemma4/gemma4_vision_adapter.cpp
-    src/model/gemma4/gemma4_vision_forward.cu
-    src/model/glm5/glm5.cpp
-    src/model/glm5/glm5_forward.cpp
-    src/model/glm5/glm5_model.cpp
-    src/model/kimi/kimi.cpp
-    src/model/kimi/kimi_forward.cpp
-    src/model/kimi/kimi_model.cpp
-    src/model/llama_like/mistral3.cpp
-    src/model/mixtral/gpt_oss.cpp
-    src/model/mixtral/mixtral.cpp
-    src/model/mixtral/mixtral_model.cpp
-    src/model/nemotron_h/nemotron_h.cpp
-    src/model/nemotron_h/nemotron_h_forward.cpp
-    src/model/nemotron_h/nemotron_h_model.cpp
-    src/model/qwen3_vl/qwen3_vl.cpp
-    src/model/qwen3_vl/qwen3_vl_model.cpp
-    src/model/qwen3_vl/qwen3_vl_vision_adapter.cpp
-    src/model/qwen3_vl/qwen3_vl_vision_forward.cu
-    src/ops/attention_mla.cu
-    src/ops/flashinfer_mamba.cu
-    src/kernels/altup.cu
-    src/kernels/altup_aux.cu
-    src/kernels/attn_sink.cu
-    src/kernels/dsa_indexer.cu
-    src/kernels/dsv4_compress.cu
-    src/kernels/dsv4_hc.cu
-    src/kernels/dsv4_routing.cu
-    src/kernels/gaussian_topk.cu
-    src/kernels/kimi_mla.cu
-    src/kernels/mla_paged.cu
-    src/kernels/nemotron_h.cu
-    src/kernels/scalar_mul.cu
-    src/kernels/softcap.cu
-    src/store/dsa_cache.cpp
-    src/store/mla_cache.cpp)
-endif()
+  src/model/qwen3_5/qwen3_5_moe_model.cpp
+  src/model/qwen3_vl/qwen3_vl.cpp
+  src/model/qwen3_vl/qwen3_vl_model.cpp
+  src/model/qwen3_vl/qwen3_vl_vision_adapter.cpp
+  src/model/qwen3_vl/qwen3_vl_vision_forward.cu
+  src/model/registry.cpp
+  src/model/weight_store.cpp
+  src/model/workspace.cpp
+  src/ops/attention_mla.cu
+  src/ops/flashinfer_mamba.cu
+  src/store/dsa_cache.cpp
+  src/store/mla_cache.cpp)
 
 # ---- pie_driver_cuda_lib ---------------------------------------------------
 # Native CUDA backend. `pie_driver_cuda_lib` is linked in-process by the Rust
 # worker; `pie_driver_cuda` below is a thin direct-create diagnostic shim.
 # Every production translation unit under src/ is listed exactly once, grouped
-# to match the module tree (see README.md).
+# to match the module tree.
+
+# One attention translation unit per head_dim in kernels.def. These cannot be
+# generated -- a macro cannot expand to a source file -- so they are checked in
+# next to the primary TU and verified here instead.
+set(PIE_ATTENTION_HEAD_DIM_SOURCES)
+foreach(_pie_hd IN LISTS PIE_ATTN_HEAD_DIMS)
+  set(_pie_hd_src "src/ops/attention_flashinfer_hd${_pie_hd}.cu")
+  if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_pie_hd_src}")
+    message(FATAL_ERROR
+      "kernels.def declares PIE_ATTN_HEAD_DIM(${_pie_hd}) but ${_pie_hd_src} "
+      "is missing. Copy an existing attention_flashinfer_hd*.cu and change the "
+      "explicit instantiation to AttnHd<${_pie_hd}>.")
+  endif()
+  list(APPEND PIE_ATTENTION_HEAD_DIM_SOURCES "${_pie_hd_src}")
+endforeach()
+# ...and the reverse: a stub with no kernels.def entry would silently compile
+# nothing, since the header only declares the head_dims kernels.def lists.
+# CONFIGURE_DEPENDS so that dropping in a new stub re-runs the check instead of
+# passing until someone happens to reconfigure.
+file(GLOB _pie_hd_stubs CONFIGURE_DEPENDS RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/ops/attention_flashinfer_hd*.cu")
+foreach(_pie_hd_src IN LISTS _pie_hd_stubs)
+  if(NOT _pie_hd_src IN_LIST PIE_ATTENTION_HEAD_DIM_SOURCES)
+    message(FATAL_ERROR
+      "${_pie_hd_src} has no matching PIE_ATTN_HEAD_DIM entry in "
+      "${PIE_KERNELS_DEF}; add one or delete the file.")
+  endif()
+endforeach()
+
 add_library(pie_driver_cuda_lib STATIC
   src/abi.cpp
   src/context.cpp
@@ -366,11 +475,9 @@ add_library(pie_driver_cuda_lib STATIC
   src/store/memory_planner.cpp
   src/store/recurrent_state_cache.cpp
   src/store/swap_pool.cpp
-  # loader/ -- snapshot -> WeightStore
-  src/loader/checkpoint_source.cpp
-  src/loader/safetensors_manifest.cpp
   # ops/ -- attention / GEMM / MoE / SSM wrappers
   src/ops/attention_flashinfer.cu
+  ${PIE_ATTENTION_HEAD_DIM_SOURCES}
   ${PIE_CUDA_FLASHINFER_HOPPER_SOURCE}
   src/ops/attention_naive.cu
   src/ops/attention_naive_paged.cu
@@ -396,6 +503,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/kernels/envelope.cu
   src/kernels/gated_delta_net.cu
   src/kernels/gather_rows.cu
+  src/kernels/gemv.cu
   src/kernels/gather_tokens.cu
   src/kernels/geometry.cu
   src/kernels/head_dim_pad.cu
@@ -415,10 +523,6 @@ add_library(pie_driver_cuda_lib STATIC
   src/kernels/transcode.cu
 )
 
-if(PIE_CUDA_QWEN_ONLY)
-  target_compile_definitions(pie_driver_cuda_lib PUBLIC PIE_CUDA_QWEN_ONLY=1)
-endif()
-
 target_compile_options(pie_driver_cuda_lib PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:
     -Xcompiler=-Wall
@@ -434,9 +538,13 @@ target_include_directories(pie_driver_cuda_lib
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${PIE_DRIVER_ABI_INCLUDE_DIR}
-    ${NCCL_INCLUDE_DIR}
+    ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR}
+    # Ahead of NCCL: its header is located with ${CUDAToolkit_INCLUDE_DIRS} as
+    # the first HINT, so on hosts that ship nccl.h inside the CUDA tree
+    # NCCL_INCLUDE_DIR *is* the toolkit include dir, and the toolkit's older
+    # bundled CCCL would shadow FlashInfer's vendored one.
     ${PIE_CCCL_INCLUDE_DIRS}
+    ${NCCL_INCLUDE_DIR}
     ${flashinfer_SOURCE_DIR}/include
     ${flashinfer_SOURCE_DIR}/csrc
     ${flashinfer_SOURCE_DIR}/3rdparty/cutlass/include
@@ -455,20 +563,43 @@ target_link_libraries(pie_driver_cuda PRIVATE pie_driver_cuda_lib)
 # Python codegen and its tvm_ffi/pynvml/tqdm imports -- no external Python
 # deps. Refresh after bumping the vendored FlashInfer revision with:
 #   FLASHINFER_SRC=<src> driver/cuda/third_party/flashinfer_generated/regenerate.sh
+#
+# These define sm80_generic_fused_moe_gemm_kernelLauncher, which
+# moe_gemm_template_dispatch.h only reaches when the epilogue tag is
+# EpilogueOpDefaultSilu or EpilogueOpDefaultFtGelu. With kernels.def enabling
+# none of the activations that map onto those tags, every launcher here is
+# unreferenced and the whole set drops out of the build -- worth ~5 minutes of
+# cicc time, including the second-slowest translation unit in the project.
 set(PIE_FLASHINFER_MOE_GEN_DIR
   "${CMAKE_CURRENT_SOURCE_DIR}/third_party/flashinfer_generated")
-set(PIE_FLASHINFER_MOE_GENERATED_SOURCES
-  third_party/flashinfer_generated/gemm_grouped/80/cutlass_kernel_file_gemm_grouped_sm80_M16_group0.generated.cu
-  third_party/flashinfer_generated/gemm_grouped/80/cutlass_kernel_file_gemm_grouped_sm80_M16_group1.generated.cu
-  third_party/flashinfer_generated/gemm_grouped/80/cutlass_kernel_file_gemm_grouped_sm80_M16_group2.generated.cu
-  third_party/flashinfer_generated/gemm_grouped/80/cutlass_kernel_file_gemm_grouped_sm80_M32_group0.generated.cu
-  third_party/flashinfer_generated/gemm_grouped/80/cutlass_kernel_file_gemm_grouped_sm80_M32_group1.generated.cu
-  third_party/flashinfer_generated/gemm_grouped/80/cutlass_kernel_file_gemm_grouped_sm80_M64_group0.generated.cu
-  third_party/flashinfer_generated/gemm_grouped/80/cutlass_kernel_file_gemm_grouped_sm80_M64_group1.generated.cu
-  third_party/flashinfer_generated/gemm_grouped/80/cutlass_kernel_file_gemm_grouped_sm80_M128_group0.generated.cu
-  third_party/flashinfer_generated/gemm_grouped/80/cutlass_kernel_file_gemm_grouped_sm80_M128_group1.generated.cu)
-list(LENGTH PIE_FLASHINFER_MOE_GENERATED_SOURCES PIE_FLASHINFER_MOE_GENERATED_COUNT)
-message(STATUS "Using ${PIE_FLASHINFER_MOE_GENERATED_COUNT} FlashInfer generated MoE launchers")
+set(PIE_MOE_NEEDS_FUSED_LAUNCHERS OFF)
+foreach(_pie_act IN LISTS PIE_MOE_ACTIVATIONS)
+  # The four ActivationType values that moeGemmBiasAct maps onto those two
+  # tags; kept in sync by hand with the dispatch table in
+  # third_party/flashinfer_moe/moe_gemm_template_dispatch.h.
+  if(_pie_act STREQUAL "Silu" OR _pie_act STREQUAL "Swiglu"
+     OR _pie_act STREQUAL "Gelu" OR _pie_act STREQUAL "Geglu")
+    set(PIE_MOE_NEEDS_FUSED_LAUNCHERS ON)
+  endif()
+endforeach()
+if(PIE_MOE_NEEDS_FUSED_LAUNCHERS)
+  set(PIE_FLASHINFER_MOE_GENERATED_SOURCES
+    third_party/flashinfer_generated/gemm_grouped/80/cutlass_kernel_file_gemm_grouped_sm80_M16_group0.generated.cu
+    third_party/flashinfer_generated/gemm_grouped/80/cutlass_kernel_file_gemm_grouped_sm80_M16_group1.generated.cu
+    third_party/flashinfer_generated/gemm_grouped/80/cutlass_kernel_file_gemm_grouped_sm80_M16_group2.generated.cu
+    third_party/flashinfer_generated/gemm_grouped/80/cutlass_kernel_file_gemm_grouped_sm80_M32_group0.generated.cu
+    third_party/flashinfer_generated/gemm_grouped/80/cutlass_kernel_file_gemm_grouped_sm80_M32_group1.generated.cu
+    third_party/flashinfer_generated/gemm_grouped/80/cutlass_kernel_file_gemm_grouped_sm80_M64_group0.generated.cu
+    third_party/flashinfer_generated/gemm_grouped/80/cutlass_kernel_file_gemm_grouped_sm80_M64_group1.generated.cu
+    third_party/flashinfer_generated/gemm_grouped/80/cutlass_kernel_file_gemm_grouped_sm80_M128_group0.generated.cu
+    third_party/flashinfer_generated/gemm_grouped/80/cutlass_kernel_file_gemm_grouped_sm80_M128_group1.generated.cu)
+  list(LENGTH PIE_FLASHINFER_MOE_GENERATED_SOURCES PIE_FLASHINFER_MOE_GENERATED_COUNT)
+  message(STATUS "Using ${PIE_FLASHINFER_MOE_GENERATED_COUNT} FlashInfer generated MoE launchers")
+else()
+  set(PIE_FLASHINFER_MOE_GENERATED_SOURCES)
+  message(STATUS
+    "FlashInfer fused MoE launchers omitted: no Silu/Gelu-class activation in kernels.def")
+endif()
 
 # FlashInfer/TensorRT-LLM CUTLASS MoE runner. Kept as a separate OBJECT
 # library because its dependency slice (nv_internal/) is large and should
@@ -483,14 +614,18 @@ add_library(pie_flashinfer_cutlass_moe OBJECT
   ${flashinfer_SOURCE_DIR}/csrc/nv_internal/tensorrt_llm/kernels/preQuantScaleKernel.cu
   ${flashinfer_SOURCE_DIR}/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.cpp
   ${flashinfer_SOURCE_DIR}/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_tma_warp_specialized_input.cu
-  ${flashinfer_SOURCE_DIR}/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_bf16_bf16.cu
+  # Vendored so pie owns the activation dispatch; a quoted #include resolves
+  # against the including file's own directory first, so patching the header
+  # alone would be ignored by the upstream .cu.
+  third_party/flashinfer_moe/moe_gemm_kernels_bf16_bf16.cu
   ${flashinfer_SOURCE_DIR}/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.cu
   ${flashinfer_SOURCE_DIR}/csrc/nv_internal/tensorrt_llm/kernels/lora/lora.cpp
   ${PIE_FLASHINFER_MOE_GENERATED_SOURCES})
 target_include_directories(pie_flashinfer_cutlass_moe PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
-  ${CUDAToolkit_INCLUDE_DIRS}
+  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/flashinfer_moe
   ${PIE_CCCL_INCLUDE_DIRS}
+  ${CUDAToolkit_INCLUDE_DIRS}
   ${flashinfer_SOURCE_DIR}/include
   ${flashinfer_SOURCE_DIR}/csrc
   ${flashinfer_SOURCE_DIR}/csrc/fused_moe/cutlass_backend
@@ -517,15 +652,23 @@ target_sources(pie_driver_cuda_lib PRIVATE
   $<TARGET_OBJECTS:pie_flashinfer_cutlass_moe>)
 
 # ---- Marlin (W4A16 / MXFP4 GEMM via vendored vLLM kernel) ------------------
-# Built by default: GPT-OSS's MXFP4 auto policy should use native
-# packed-weight GEMM on supported GPUs and fall back only on legacy targets.
+# OFF by default. marlin.cu is the build's critical path -- 142s of a 228s
+# clean build, because 150 explicit instantiations of a 2082-line __global__
+# template produce 152 kernels averaging 3098 SASS instructions each (91s cicc
+# + 41s ptxas). Nothing else in the driver comes close.
+#
+# What turning it off costs, and why that is an acceptable default:
+#   * GPTQ/AWQ INT4 dense GEMM throws at run time (ops/gemm.cpp) with a message
+#     naming this option. Those checkpoints are not part of pie's supported set.
+#   * GPT-OSS native MXFP4 MoE is refused at load time, but only on Blackwell:
+#     mxfp4_native_gemm is `major >= 10`, so Ada/Hopper already take the
+#     routed-dequant path and are unaffected.
+# Everything else -- every bf16 and FP8 model -- is untouched.
+#
 # Vendored under third_party/marlin/; the wrapper exposes a torch-free C++ API.
-option(PIE_CUDA_BUILD_MARLIN "Build vendored marlin W4A16/MXFP4 GEMM" ON)
-option(PIE_MARLIN_ALL_SHAPES
-  "Compile all Marlin dtype combos (fp16/bf16/int8 x u4/u4b8/fp8/mxfp4). \
-OFF (default) compiles only bf16x{u4,u4b8,mxfp4} -- the shapes pie dispatches."
-  OFF)
-# Env overrides (previously forwarded by worker/build.rs as -D...).
+# Enable with -DPIE_CUDA_BUILD_MARLIN=ON or PIE_CUDA_BUILD_MARLIN=1.
+option(PIE_CUDA_BUILD_MARLIN "Build vendored marlin W4A16/MXFP4 GEMM" OFF)
+# Env override (previously forwarded by worker/build.rs as -D...).
 if(DEFINED ENV{PIE_CUDA_BUILD_MARLIN})
   string(TOLOWER "$ENV{PIE_CUDA_BUILD_MARLIN}" _pie_marlin)
   if(_pie_marlin MATCHES "^(1|on|true|yes)$")
@@ -534,12 +677,48 @@ if(DEFINED ENV{PIE_CUDA_BUILD_MARLIN})
     set(PIE_CUDA_BUILD_MARLIN OFF)
   endif()
 endif()
-if(DEFINED ENV{PIE_MARLIN_ALL_SHAPES})
-  string(TOLOWER "$ENV{PIE_MARLIN_ALL_SHAPES}" _pie_marlin_all)
-  if(_pie_marlin_all MATCHES "^(1|on|true|yes)$")
-    set(PIE_MARLIN_ALL_SHAPES ON)
+
+# kernels.def owns the shape list, but it cannot drive marlin.cu directly: a
+# macro cannot expand to an #include, and CUDA 13's static-linkage stubs force
+# the single-TU #include layout (see below). So the list is written out in
+# marlin.cu and reconciled here -- otherwise a drift between the two is
+# invisible until it shows up as a missing kernel at run time or as several
+# minutes of cicc time spent on shapes nothing dispatches.
+#
+# Deliberately outside the PIE_CUDA_BUILD_MARLIN gate: this only reads two
+# files, and now that marlin is off by default a gated check would never run,
+# letting drift accumulate until someone enables it.
+pie_read_kernels_def(PIE_MARLIN_SHAPE PIE_MARLIN_SHAPES)
+set(_pie_marlin_expected "")
+foreach(_pie_shape IN LISTS PIE_MARLIN_SHAPES)
+  string(REPLACE "," ";" _pie_parts "${_pie_shape}")
+  list(LENGTH _pie_parts _pie_nparts)
+  if(NOT _pie_nparts EQUAL 3)
+    message(FATAL_ERROR
+      "PIE_MARLIN_SHAPE(${_pie_shape}) in ${PIE_KERNELS_DEF} needs exactly "
+      "three arguments: (activation dtype, quant type, output dtype)")
   endif()
+  list(GET _pie_parts 0 _pie_act)
+  list(GET _pie_parts 1 _pie_quant)
+  list(GET _pie_parts 2 _pie_out)
+  list(APPEND _pie_marlin_expected
+    "sm80_kernel_${_pie_act}_${_pie_quant}_${_pie_out}.cu")
+endforeach()
+
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/third_party/marlin/marlin.cu" _pie_marlin_src)
+string(REGEX MATCHALL "sm80_kernel_[A-Za-z0-9_]+\\.cu"
+  _pie_marlin_actual "${_pie_marlin_src}")
+list(SORT _pie_marlin_expected)
+list(SORT _pie_marlin_actual)
+if(NOT _pie_marlin_expected STREQUAL _pie_marlin_actual)
+  message(FATAL_ERROR
+    "marlin shape drift.\n"
+    "  kernels.def: ${_pie_marlin_expected}\n"
+    "  marlin.cu:   ${_pie_marlin_actual}\n"
+    "Update the #include block in third_party/marlin/marlin.cu to match "
+    "${PIE_KERNELS_DEF}.")
 endif()
+
 if(PIE_CUDA_BUILD_MARLIN)
   # CUDA 13 generates __global__ template stubs with static linkage,
   # breaking cross-TU explicit instantiations. marlin.cu #includes the
@@ -554,9 +733,6 @@ if(PIE_CUDA_BUILD_MARLIN)
   target_include_directories(pie_driver_cuda_lib PRIVATE
     third_party/marlin)
   target_compile_definitions(pie_driver_cuda_lib PRIVATE PIE_CUDA_HAS_MARLIN=1)
-  if(PIE_MARLIN_ALL_SHAPES)
-    target_compile_definitions(pie_driver_cuda_lib PRIVATE PIE_MARLIN_ALL_SHAPES=1)
-  endif()
 endif()
 
 # FlashInfer Mamba SSU on Hopper/Blackwell gates the vertical/horizontal
@@ -566,6 +742,13 @@ if(PIE_CUDA_FLASHINFER_MAMBA_SM90)
   target_compile_definitions(pie_driver_cuda_lib PRIVATE
     FLASHINFER_MAMBA_ENABLE_SM90=1)
 endif()
+
+# nvcc cannot parse toml++ 3.4.0's bool-returning for_each detection. The
+# library-provided fallback preserves ordinary traversal in CUDA translation
+# units; host C++ builds retain early-exit support.
+target_compile_definitions(pie_driver_cuda_lib PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:TOML_RETURN_BOOL_FROM_FOR_EACH_BROKEN=1>
+  $<$<COMPILE_LANGUAGE:CUDA>:TOML_RETURN_BOOL_FROM_FOR_EACH_BROKEN_ACKNOWLEDGED=1>)
 
 target_link_libraries(pie_driver_cuda_lib PUBLIC
   CLI11::CLI11
@@ -589,9 +772,9 @@ enable_testing()
 # TEST_ARGS), the load-parity harness (tests/load_parity/run.py, driven
 # manually against a live GPU + recipe), the qwen3.5 multi-request parity
 # script, and the tier0/tier1/masked-attention host reference headers
-# (#include-only, no standalone translation unit). Grouped into one
-# SOURCES-only custom target so `check-structure.sh` rule 6 sees them as
-# part of the build graph without compiling them.
+# (#include-only, no standalone translation unit). Listed as a SOURCES-only
+# custom target so IDE-generating generators surface them in the project tree
+# and so a reader can tell "not compiled" from "forgotten".
 add_custom_target(pie_driver_cuda_test_fixtures SOURCES
   tests/support/host_eval.hpp
   tests/support/tier1_codegen.hpp
@@ -629,6 +812,16 @@ pie_add_cuda_target(test_ptir_decoder_limits
     ${CMAKE_CURRENT_SOURCE_DIR}/../../interface/ptir/tests/malformed_wire_corpus.txt
     ${PIE_PTIR_CANONICAL_GOLDENS})
 
+# The driver's declared contract vs. the plan the loader builds (§12 row 7b-4b).
+# Set PIE_TEST_SNAPSHOT to also check it against a real checkpoint.
+pie_add_cuda_target(test_model_contract
+  SOURCES tests/model_contract_test.cpp src/model/config.cpp
+  INCLUDE_DIRS
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+    ${PIE_DRIVER_ABI_INCLUDE_DIR}
+    ${PIE_LOADER_INCLUDE_DIR}
+  LIBS nlohmann_json::nlohmann_json)
+
 # Mixed prefill/decode batch: a continuing T=1 request must reuse its conv window.
 pie_add_cuda_target(test_causal_conv1d
   SOURCES tests/test_causal_conv1d.cu src/kernels/causal_conv1d.cu
@@ -664,6 +857,14 @@ pie_add_cuda_target(test_decode_batch_parity
   SOURCES tests/test_decode_batch_parity.cu
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/tests
   LIBS pie_driver_cuda_lib CUDA::cudart)
+pie_add_cuda_target(test_attn_score_capture
+  SOURCES tests/test_attn_score_capture.cu
+  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/tests
+  LIBS pie_driver_cuda_lib CUDA::cudart)
+pie_add_cuda_target(test_attn_score_fold
+  SOURCES tests/test_attn_score_fold.cu
+  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/tests
+  LIBS pie_driver_cuda_lib CUDA::cudart)
 pie_add_cuda_target(test_decode_fused_write_parity
   SOURCES tests/test_decode_fused_write_parity.cu
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/tests
@@ -677,7 +878,7 @@ pie_add_cuda_target(test_decode_cobatch_chain
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/tests
   LIBS pie_driver_cuda_lib CUDA::cudart)
 pie_add_cuda_target(test_driver_common
-  SOURCES tests/test_common.cpp src/loader/safetensors_manifest.cpp
+  SOURCES tests/test_common.cpp
   LIBS nlohmann_json::nlohmann_json)
 pie_add_cuda_target(test_kv_cache_format
   SOURCES tests/test_kv_cache_format.cpp src/store/kv_cache_format.cpp)
@@ -793,7 +994,7 @@ pie_add_cuda_target(test_ptir_graph_key
   SOURCES tests/ptir_graph_key_test.cpp
   INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
-    ${PIE_DRIVER_ABI_INCLUDE_DIR}
+    ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR}
   LIBS CUDA::cudart tomlplusplus::tomlplusplus)
 pie_add_cuda_target(test_frame_carrier_device
   SOURCES
@@ -808,7 +1009,7 @@ pie_add_cuda_target(test_pipeline_dispatch_bind
     src/pipeline/dispatch.cu
     src/pipeline/frame_carrier.cpp
     src/pipeline/frame_carrier_kernels.cu
-  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../common/include ${PIE_DRIVER_ABI_INCLUDE_DIR}
+  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../common/include ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR}
   LIBS CUDA::cudart CUDA::cuda_driver CUDA::nvrtc
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 # Same-instance run-ahead concurrency gate; build with -fsanitize=thread for the TSAN run.
@@ -818,7 +1019,7 @@ pie_add_cuda_target(test_pipeline_dispatch_race
     src/pipeline/dispatch.cu
     src/pipeline/frame_carrier.cpp
     src/pipeline/frame_carrier_kernels.cu
-  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../common/include ${PIE_DRIVER_ABI_INCLUDE_DIR}
+  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../common/include ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR}
   LIBS CUDA::cudart CUDA::cuda_driver CUDA::nvrtc
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 pie_add_cuda_target(test_ptir_tier0
@@ -830,7 +1031,7 @@ pie_add_cuda_target(test_ptir_runner
   INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/tests
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
-    ${PIE_DRIVER_ABI_INCLUDE_DIR}
+    ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR}
   LIBS CUDA::cudart)
 pie_add_cuda_target(test_ptir_container
   SOURCES tests/ptir_container_test.cpp
@@ -842,14 +1043,14 @@ pie_add_cuda_target(test_ptir_tier1
   INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/tests
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
-    ${PIE_DRIVER_ABI_INCLUDE_DIR}
+    ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR}
   LIBS CUDA::cudart CUDA::cuda_driver CUDA::nvrtc)
 pie_add_cuda_target(test_ptir_generated_singleton
   SOURCES tests/ptir_generated_singleton_test.cu
   INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/tests
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
-    ${PIE_DRIVER_ABI_INCLUDE_DIR}
+    ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR}
   LIBS CUDA::cudart CUDA::cuda_driver CUDA::nvrtc
   TEST_ARGS
     ${CMAKE_CURRENT_SOURCE_DIR}/../../interface/ptir/tests/golden-ptir)
@@ -862,7 +1063,7 @@ pie_add_cuda_target(test_ptir_grouped_dispatch
   INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/tests
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
-    ${PIE_DRIVER_ABI_INCLUDE_DIR}
+    ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR}
   LIBS CUDA::cudart CUDA::cuda_driver CUDA::nvrtc
   TEST_ARGS ${CMAKE_CURRENT_SOURCE_DIR}/tests/golden-ptir)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -875,7 +1076,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     INCLUDE_DIRS
       ${CMAKE_CURRENT_SOURCE_DIR}/tests
       ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
-      ${PIE_DRIVER_ABI_INCLUDE_DIR}
+      ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR}
     LIBS CUDA::cudart CUDA::cuda_driver CUDA::nvrtc
     TEST_ARGS ${CMAKE_CURRENT_SOURCE_DIR}/tests/golden-ptir)
   target_compile_options(test_ptir_grouped_dispatch_asan PRIVATE
@@ -891,7 +1092,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 pie_add_cuda_target(test_ptir_golden_exec
   SOURCES tests/ptir_golden_exec_test.cu
-  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../common/include ${PIE_DRIVER_ABI_INCLUDE_DIR}
+  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../common/include ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR}
   LIBS CUDA::cudart
   TEST_ARGS ${CMAKE_CURRENT_SOURCE_DIR}/tests/golden-ptir)
 pie_add_cuda_target(test_entry_validation
@@ -902,13 +1103,13 @@ pie_add_cuda_target(test_rs_descriptor_validation
   INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
-    ${PIE_DRIVER_ABI_INCLUDE_DIR})
+    ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR})
 pie_add_cuda_target(test_precomputed_embeddings
   SOURCES tests/precomputed_embeddings_test.cpp
   INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
-    ${PIE_DRIVER_ABI_INCLUDE_DIR}
+    ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR}
   LIBS CUDA::cudart)
 # Structural proof for model/registry.{hpp,cpp}: every model_type resolves to its
 # intended family/binder; unrecognized archs are rejected. No GPU, no weights.

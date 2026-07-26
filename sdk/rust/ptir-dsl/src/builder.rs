@@ -124,9 +124,10 @@ impl<'a> Builder<'a> {
     /// lints only; authoritative validation is `forward-pass.program`'s result (D6).
     pub fn build(&self) -> Result<Traced, TraceErrors> {
         let rows = self.rows();
-        let (result, channels) = crate::model::with_constants(self.vocab, self.page_size, || {
-            context::with_session(|| self.record(rows))
-        });
+        let (result, channels, names) =
+            crate::model::with_constants(self.vocab, self.page_size, || {
+                context::with_session(|| self.record(rows))
+            });
         let (stage_results, ports) = result;
 
         // The recorder interns channels in first-REFERENCE order (the order they
@@ -232,7 +233,7 @@ impl<'a> Builder<'a> {
 
         let container = TraceContainer {
             externs: Vec::new(),
-            names: Vec::new(),
+            names,
             channels: channel_decls,
             ports,
             stages,
@@ -259,9 +260,10 @@ impl<'a> Builder<'a> {
     #[doc(hidden)]
     pub fn debug_container(&self) -> TraceContainer {
         let rows = self.rows();
-        let (result, channels) = crate::model::with_constants(self.vocab, self.page_size, || {
-            context::with_session(|| self.record(rows))
-        });
+        let (result, channels, names) =
+            crate::model::with_constants(self.vocab, self.page_size, || {
+                context::with_session(|| self.record(rows))
+            });
         let (stage_results, ports) = result;
         let channel_decls: Vec<ChannelDecl> = channels
             .iter()
@@ -287,7 +289,7 @@ impl<'a> Builder<'a> {
         ports.sort_by_key(|p| p.port as u8);
         TraceContainer {
             externs: Vec::new(),
-            names: Vec::new(),
+            names,
             channels: channel_decls,
             ports,
             stages,

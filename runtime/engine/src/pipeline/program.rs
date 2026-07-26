@@ -19,21 +19,22 @@
 //! [`model_profile`] builds the bind-time [`ModelProfile`] from the loaded
 //! model: program-registration input, not fire-time glue.
 //!
-//! Complete pipeline domain API: some methods here (relaxed geometry
-//! variants, per-channel introspection, the pure `instantiate`/registry
-//! probe entry points, device-geometry lease internals) are not yet
-//! called by the current single-model/mock-driver fire path, but are
-//! exercised by this module's own unit tests and reserved for upcoming
-//! wiring (multi-pass channels, device-geometry beams) — kept rather
-//! than deleted, allowed rather than silently masked.
-#![allow(dead_code)]
+//! The registry probes ([`Registry::lookup`]/[`Registry::len`], the free
+//! [`lookup`]) and [`RegisteredProgram::stage_signature`] are `#[cfg(test)]`:
+//! production carries the `Arc<RegisteredProgram>` that [`register`] returns
+//! rather than probing by hash. [`Pricing`] is the one thing computed on the
+//! production path with no production consumer yet — thrust-2 capacity
+//! accounting is unwired — so it carries an annotated `allow` instead of a
+//! blanket module-level one.
 
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use lru::LruCache;
-use pie_ptir::compiler::{CompiledStage, StageSignature};
+use pie_ptir::compiler::CompiledStage;
+#[cfg(test)]
+use pie_ptir::compiler::StageSignature;
 use pie_ptir::container::{self, ContainerDecodeError, PortSource, TraceContainer};
 use pie_ptir::container_hash;
 use pie_ptir::op::Op;
@@ -50,8 +51,6 @@ pub struct Pricing {
     pub channel_bytes: u64,
     /// Number of declared channels.
     pub num_channels: usize,
-    /// Number of stage programs.
-    pub num_stages: usize,
     /// Read-out row count (from the `embed` indptr lanes, else 1) — the sampling
     /// row count thrust-2 prices the fire on.
     pub rows: u32,
@@ -67,6 +66,10 @@ pub struct RegisteredProgram {
     /// The validated, typed artifact (types, readiness, §7.1 classes).
     pub bound: BoundTrace,
     /// Compiler-owned normalized stages, signatures, and region partitions.
+    /// Retained from the compile so [`Self::stage_signature`] can probe it;
+    /// the driver reads the same information out of [`Self::sidecar`], so
+    /// production never reads this field.
+    #[allow(dead_code)]
     pub compiled_stages: Vec<CompiledStage>,
     /// Dense-channel `(consume, publish)` mask, derived once from immutable IR.
     pub channel_accesses: Vec<(bool, bool)>,
@@ -75,11 +78,18 @@ pub struct RegisteredProgram {
     /// (seed-independent, hash-keyed; its inner `container_hash` == [`Self::hash`],
     /// which the driver asserts). Charlie's `bound.hpp` reads exactly this.
     pub sidecar: Vec<u8>,
-    /// Registration-time pricing.
+    /// Registration-time pricing. Computed by [`price`] on every register,
+    /// but nothing consumes it yet (thrust-2 capacity accounting is
+    /// unwired) — the `allow` marks that gap rather than hiding it.
+    #[allow(dead_code)]
     pub pricing: Pricing,
 }
 
 impl RegisteredProgram {
+    /// Per-stage signature lookup — asserted by this module's sidecar
+    /// round-trip test; production reads the signatures through the sidecar
+    /// the driver receives.
+    #[cfg(test)]
     pub fn stage_signature(&self, stage: pie_ptir::registry::Stage) -> Option<&StageSignature> {
         self.compiled_stages
             .iter()
@@ -194,15 +204,14 @@ impl Registry {
     }
 
     /// Probe by identity hash (a hit bumps LRU recency).
+    #[cfg(test)]
     pub fn lookup(&mut self, hash: u64) -> Option<Arc<RegisteredProgram>> {
         self.inner.get(&hash).cloned()
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.inner.len()
-    }
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
     }
 }
 
@@ -235,7 +244,6 @@ fn price(c: &TraceContainer) -> Pricing {
     Pricing {
         channel_bytes,
         num_channels: c.channels.len(),
-        num_stages: c.stages.len(),
         rows,
     }
 }
@@ -264,7 +272,10 @@ pub fn register(
     global().register(bytes, profile)
 }
 
-/// Probe the process-wide registry by identity hash.
+/// Probe the process-wide registry by identity hash. Only the `#[cfg(test)]`
+/// `instance::instantiate` path probes by hash; production carries the
+/// `Arc<RegisteredProgram>` from `register`.
+#[cfg(test)]
 pub fn lookup(hash: u64) -> Option<Arc<RegisteredProgram>> {
     global().lookup(hash)
 }
@@ -274,16 +285,43 @@ pub fn lookup(hash: u64) -> Option<Arc<RegisteredProgram>> {
 /// conservative until the model surfaces them).
 pub fn model_profile() -> ModelProfile {
     let m = pie_model::model();
-    let ptir = m.ptir_caps();
+    profile_from(
+        m.vocab_size(),
+        crate::store::registry::get(0, 0).kv_page_size,
+        m.num_layers(),
+        m.ptir_caps(),
+    )
+}
+
+/// The pure caps -> profile mapping, split out so it is testable without a
+/// registered model.
+fn profile_from(
+    vocab: u32,
+    page_size: u32,
+    num_layers: u32,
+    ptir: pie_model::PtirCaps,
+) -> ModelProfile {
     ModelProfile {
-        vocab: m.vocab_size(),
-        page_size: crate::store::registry::get(0, 0).kv_page_size,
-        num_layers: m.num_layers(),
+        vocab,
+        page_size,
+        num_layers,
         activation: pie_ptir::types::DType::F32,
         has_mtp_logits: ptir.has_mtp_logits,
         has_mtp_drafts: ptir.has_mtp_drafts,
         has_value_head: ptir.has_value_head,
-        kernels: Vec::new(),
+        has_attn_score: ptir.has_attn_score,
+        // Second-party kernels the backend advertises. `envelope_dot` is
+        // replayable (a pure function of the query and the page envelopes) and
+        // has no sink scope: it produces a value, it does not consume one.
+        kernels: if ptir.has_kv_envelopes {
+            vec![pie_ptir::registry::KernelInfo {
+                name: "envelope_dot".into(),
+                sink_scope: None,
+                replayable: true,
+            }]
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -384,6 +422,82 @@ mod tests {
         }
     }
 
+    /// The greedy pass plus a Quest attention tap: per layer, score this
+    /// request's pages with `envelope_dot(query)` and publish the scores to a
+    /// host-read channel. Deliberately stops short of the `attn_page_mask`
+    /// sink — that consumer is not executable yet, and the point here is the
+    /// bind-time availability of the KERNEL.
+    fn quest_tap(vocab: u32, pages: u32) -> TraceContainer {
+        let mut container = greedy(vocab);
+        container.names = vec!["envelope_dot".to_string()];
+        container.channels.push(chan(
+            Shape::vector(pages),
+            DType::F32,
+            HostRole::Reader,
+            false,
+        ));
+        container.stages.insert(
+            0,
+            StageProgram {
+                stage: Stage::OnAttnProj,
+                ops: vec![
+                    Op::IntrinsicVal {
+                        intr: IntrinsicId::Query,
+                        shape: Shape::vector(pages),
+                        dtype: DType::F32,
+                    },
+                    Op::KernelCall {
+                        name: 0,
+                        args: vec![0],
+                        shape: Shape::vector(pages),
+                        dtype: DType::F32,
+                    },
+                    Op::ChanPut { chan: 2, value: 1 },
+                ],
+            },
+        );
+        container
+    }
+
+    #[test]
+    fn quest_tap_binds_only_against_a_backend_with_kv_envelopes() {
+        let caps = |has: bool| pie_model::PtirCaps {
+            has_mtp_logits: false,
+            has_mtp_drafts: false,
+            has_value_head: false,
+            has_kv_envelopes: has,
+            has_attn_score: false,
+        };
+        let bytes = quest_tap(VOCAB, 4).encode();
+
+        // Without the capability the profile advertises no kernel, and bind is
+        // where that has to be caught: a program that reaches the driver
+        // naming a kernel it cannot launch would fail mid-fire instead.
+        let mut registry = reg(2);
+        let refused = registry.register(
+            bytes.clone(),
+            &ModelProfile {
+                vocab: VOCAB,
+                ..profile_from(VOCAB, 16, 4, caps(false))
+            },
+        );
+        assert!(
+            refused.is_err(),
+            "envelope_dot must be unavailable without has_kv_envelopes"
+        );
+
+        let mut registry = reg(2);
+        registry
+            .register(
+                bytes,
+                &ModelProfile {
+                    vocab: VOCAB,
+                    ..profile_from(VOCAB, 16, 4, caps(true))
+                },
+            )
+            .expect("quest tap must bind against a backend with kv envelopes");
+    }
+
     fn reg(cap: usize) -> Registry {
         Registry::new(NonZeroUsize::new(cap).unwrap())
     }
@@ -438,6 +552,35 @@ mod tests {
         assert!(!program.bound.profile.has_mtp_logits);
         assert!(program.bound.profile.has_mtp_drafts);
         assert!(!program.bound.profile.has_value_head);
+    }
+
+    #[test]
+    fn kv_envelope_capability_gates_the_envelope_dot_kernel() {
+        let caps = |has: bool| pie_model::PtirCaps {
+            has_mtp_logits: false,
+            has_mtp_drafts: false,
+            has_value_head: false,
+            has_kv_envelopes: has,
+            has_attn_score: false,
+        };
+        // A backend that cannot honour the envelope contract must advertise NO
+        // second-party kernel, so a Quest program fails to bind rather than
+        // reaching a driver that would refuse it mid-fire.
+        assert!(profile_from(VOCAB, 16, 4, caps(false)).kernels.is_empty());
+
+        let advertised = profile_from(VOCAB, 16, 4, caps(true));
+        let kernel = advertised
+            .kernel("envelope_dot")
+            .expect("envelope_dot must be advertised when the backend has envelopes");
+        assert!(
+            kernel.replayable,
+            "envelope_dot is a pure function of the query and the page \
+             envelopes, so re-running a fire must reproduce it"
+        );
+        assert!(
+            kernel.sink_scope.is_none(),
+            "envelope_dot produces a value; it consumes no attention effect"
+        );
     }
 
     #[test]

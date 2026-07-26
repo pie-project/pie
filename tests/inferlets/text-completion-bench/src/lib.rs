@@ -271,6 +271,22 @@ async fn run_one(
         .capacity(out_capacity as u32)
         .named("out");
 
+    // Hybrid/recurrent architectures (Qwen3.6's GDN layers, Mamba2) carry a
+    // folded recurrent state per request alongside the KV pages, and the
+    // driver rejects a forward whose rs-working-set count doesn't match its
+    // request rows. One row per fire here, so one set — reused by BOTH passes
+    // so the decode continues the prefill's state rather than starting cold.
+    // `rs_state_size() == 0` on pure-attention models, which bind none.
+    // `is_linear()` is the documented class flag (model.wit: "Prefer this over
+    // reading rs-state-size() as a class flag"): true iff the model folds a
+    // recurrent state, which is exactly when the driver requires one
+    // rs-working-set per request row.
+    let rs_ws: Vec<RsWorkingSet> = if wit_model::is_linear() {
+        vec![RsWorkingSet::new()]
+    } else {
+        Vec::new()
+    };
+
     let fwd_p = ForwardPass::new();
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
     let kv_len_p = Channel::from(vec![n]).named("kv_len_p");
@@ -286,6 +302,11 @@ async fn run_one(
         &positions_p,
         None,
     )?;
+    if !rs_ws.is_empty() {
+        fwd_p
+            .rs_working_sets(&rs_ws)
+            .map_err(|e| format!("bind prefill recurrent state: {e}"))?;
+    }
     fwd_p.epilogue(move || {
         let t = reshape(
             sample(intrinsics::logits(), vocab, temperature, top_p, prefill_rng),
@@ -323,6 +344,10 @@ async fn run_one(
             &positions,
             None,
         )?;
+        if !rs_ws.is_empty() {
+            fwd.rs_working_sets(&rs_ws)
+                .map_err(|e| format!("bind decode recurrent state: {e}"))?;
+        }
         fwd.epilogue(move || {
             let length = kv_len.take().tensor();
             let t = reshape(
@@ -347,10 +372,19 @@ async fn run_one(
 
     let pipe = Pipeline::new();
 
-    // First frame: the prefill chunk in slot 0, then up to k-1 decode slots.
-    // At k = 1 this is a bare prefill submit (`submit` IS a single-slot
-    // frame); trailing slots pad to no-ops.
-    let first_decodes = budget.min(k - 1);
+    // A recurrent-state pass serializes behind every earlier fire's
+    // settlement, so it cannot share a frame: the frame would sit one fire
+    // short of sealing while the fire that would complete it waits for the
+    // frame to run. Such a model gets one live slot per frame whatever k
+    // is (the rest pad to no-ops), which costs the k-wide batching but is
+    // the only shape the contract allows. The runtime rejects the other
+    // shape rather than hanging on it.
+    let live_slots = if rs_ws.is_empty() { k } else { 1 };
+
+    // First frame: the prefill chunk in slot 0, then up to live_slots-1
+    // decode slots. At live_slots = 1 this is a bare prefill submit
+    // (`submit` IS a single-slot frame); trailing slots pad to no-ops.
+    let first_decodes = budget.min(live_slots - 1);
     reserve_to_tokens(n + first_decodes as u32 + 1)
         .map_err(|e| format!("reserve first frame: {e}"))?;
     let mut first_slots: Vec<Option<&ForwardPass>> = Vec::with_capacity(k);
@@ -373,9 +407,9 @@ async fn run_one(
     // Decode geometry is device-carried (`tok_in`), so a successor never
     // waits on a sampled token.
     let submit_ahead = |mut submitted: usize, drained: usize| -> std::result::Result<usize, String> {
-        let window_fires = 2 * k;
+        let window_fires = 2 * live_slots;
         while submitted < budget && submitted - drained < window_fires {
-            let s = (budget - submitted).min(k);
+            let s = (budget - submitted).min(live_slots);
             reserve_to_tokens(n + (submitted + s) as u32 + 1)
                 .map_err(|e| format!("reserve decode frame: {e}"))?;
             let fwd = fwd_d.as_ref().expect("decode pass exists while budget > 0");

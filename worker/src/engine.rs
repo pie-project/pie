@@ -226,7 +226,7 @@ impl ExecutorHandle {
 /// Daemon entry (`bin/worker`): derive the topology from `cfg.cluster`, boot the
 /// engine, dial the cluster (distributed) or terminate clients directly
 /// (single-node), and return a [`WorkerHandle`]. Async (Model A) — the bin owns
-/// the runtime and drives `shutdown` on signal via `bootstrap`.
+/// the runtime and drives `shutdown` on signal via the bin layer's `startup` skeleton.
 pub async fn run(cfg: config::Config) -> Result<WorkerHandle> {
     let mode = match (&cfg.cluster.controller, cfg.cluster.role) {
         (Some(controller), Some(role)) => {

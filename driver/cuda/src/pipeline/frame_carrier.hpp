@@ -182,7 +182,10 @@ public:
     void carry_in(std::uint64_t instance, const void* host_src, std::size_t n_bytes,
                   std::size_t frame_offset);
 
-    cudaStream_t copy_stream() const { return stream_; }
+    // The dedicated non-blocking copy stream for the CURRENT device.
+    // Device-owned, so it cannot be one process-wide handle: see the
+    // definition.
+    cudaStream_t copy_stream() const;
 
     // Introspection for the isolation test (asserts bind allocated distinct,
     // non-null bases and close reclaimed them).
@@ -205,7 +208,9 @@ private:
                                        std::uint64_t* out_mirror_base,
                                        std::uint64_t* out_word_base);
 
-    cudaStream_t stream_ = nullptr;  // the dedicated non-blocking copy stream
+    // One non-blocking copy stream per device, created on first use.
+    mutable std::mutex stream_mutex_;
+    mutable std::unordered_map<int, cudaStream_t> streams_;
     mutable std::mutex mu_;
     std::vector<FrameLayout> programs_;             // program id -> layout (1-based)
     std::unordered_map<std::uint64_t, FrameInstance*> instances_;  // instance id -> regions

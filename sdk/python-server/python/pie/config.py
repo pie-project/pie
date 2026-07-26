@@ -91,7 +91,6 @@ class DriverConfig:
 @dataclass
 class SchedulerConfig:
     request_timeout_secs: Optional[int] = None
-    restore_pause_at_utilization: Optional[float] = None
     speculation_depth: Optional[int] = None
 
 
