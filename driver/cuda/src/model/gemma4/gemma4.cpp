@@ -1229,6 +1229,15 @@ inline bool dbg_dumps_enabled() {
     static const bool enabled = std::getenv("PIE_GEMMA4_DUMP_DIR") != nullptr;
     return enabled;
 }
+inline int dbg_dump_layer_limit() {
+    static const int limit = [] {
+        const char* v = std::getenv("PIE_GEMMA4_DUMP_LAYERS");
+        if (v == nullptr || v[0] == '\0') return 4;
+        const int n = std::atoi(v);
+        return n > 0 ? n : 4;
+    }();
+    return limit;
+}
 inline void dbg_dump_bf16(const char* tag, const void* dev_ptr,
                           std::size_t numel) {
     if (!dbg_dumps_enabled()) return;
@@ -2200,7 +2209,7 @@ void gemma4_forward_paged(
 
         // Parity dump: residual stream after attention/MLP/PLE for
         // the first few layers.
-        if (l < 4) {
+        if (l < dbg_dump_layer_limit()) {
             char tag[32];
             std::snprintf(tag, sizeof tag, "layer_%d_post_ple_y", l);
             dbg_sync_dump_bf16(tag, ws.y.data(),
@@ -2217,7 +2226,7 @@ void gemma4_forward_paged(
 
         // Post-layer_scalar dump for parity comparison against HF's
         // `hidden_states[layer+1]` (which is after the scalar mul).
-        if (l < 4) {
+        if (l < dbg_dump_layer_limit()) {
             char tag[32];
             std::snprintf(tag, sizeof tag, "layer_%d_post_scalar_y", l);
             dbg_sync_dump_bf16(tag, ws.y.data(),
