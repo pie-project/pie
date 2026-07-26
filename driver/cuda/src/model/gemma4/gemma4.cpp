@@ -831,6 +831,17 @@ Gemma4Weights bind_gemma4(const LoadedModel& engine) {
     int global_head_dim = cfg.head_dim;
     {
         // First full-attention layer's q_proj reveals global_head_dim.
+        // The bound weight is already ROW-SHARDED, so it has
+        // `num_attention_heads / tp_size` heads, not `num_attention_heads`.
+        // Dividing by the model-wide head count returned
+        // `global_head_dim / tp_size` — 256 instead of 512 for E4B at tp=2 —
+        // which silently ran every full-attention layer at half its head
+        // width while the sliding layers (whose head dim comes from the
+        // config, not from a weight) stayed correct. The residual stream is
+        // clean through layer 4 and diverges at layer 5, the first
+        // full-attention layer.
+        const int tp = std::max(1, engine.distributed().tp_size);
+        const int local_q_heads = std::max(1, cfg.num_attention_heads / tp);
         for (int i = 0; i < L; ++i) {
             if (cfg.layer_types[i] == "full_attention") {
                 const std::string q_name = p + "layers." + std::to_string(i) +
@@ -840,7 +851,7 @@ Gemma4Weights bind_gemma4(const LoadedModel& engine) {
                     const auto& s = qt.shape();
                     if (!s.empty()) {
                         global_head_dim = static_cast<int>(s[0]) /
-                                          cfg.num_attention_heads;
+                                          local_q_heads;
                     }
                 }
                 break;
@@ -1654,7 +1665,14 @@ void gemma4_forward_paged(
     bool attn_norm_precomputed = false;
     for (int l = 0; l < debug_max_layers; ++l) {
         const auto& layer = w.layers[l];
-        const bool dump_this = (l == 0);
+        // Which layer the L0_* intra-layer dumps come from. Still layer 0 by
+        // default; `PIE_GEMMA4_DUMP_LAYER` retargets it, which is how a fault
+        // that only appears in gemma-4's full-attention layers can be seen.
+        static const int dump_layer = [] {
+            const char* v = std::getenv("PIE_GEMMA4_DUMP_LAYER");
+            return (v == nullptr || v[0] == '\0') ? 0 : std::atoi(v);
+        }();
+        const bool dump_this = (l == dump_layer);
         // Pair the sync with the dump so a release run (no dump dir
         // env var) skips both — the standalone syncs that used to
         // precede each dump_l0 call were the dominant per-step
