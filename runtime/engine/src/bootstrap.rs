@@ -409,7 +409,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                      free={}/{} host_free={}/{} head_rs={} rs_free={}/{} \
                      parks={} serves={} evictions={} \
                      evict_rollbacks={} restores={} restore_failures={} gate_parks={} \
-                     hogs={} starved={} salvaged={} swapfull={}/{} e6_relax={} \
+                     hogs={} starved={} restarted={} salvaged={} swapfull={}/{} e6_relax={} \
                      d2h_pages={} h2d_pages={} d2h_ms={} h2d_ms={} \
                      resident={} evicting={} evicted={} restoring={} admitted={} \
                      runners=[{}]",
@@ -433,6 +433,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     d.gate_parks_total,
                     d.hog_failures_total,
                     d.starvations_total,
+                    d.starvation_restarts_total,
                     d.salvages_total,
                     d.host_swap_exhaustions_total,
                     d.host_swap_unblocks_total,

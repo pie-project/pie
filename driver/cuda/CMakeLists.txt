@@ -437,6 +437,9 @@ set(PIE_CUDA_MODEL_SOURCES
   src/model/glm5/glm5.cpp
   src/model/glm5/glm5_forward.cpp
   src/model/glm5/glm5_model.cpp
+  src/model/kimi_k3/kimi_k3.cpp
+  src/model/kimi_k3/kimi_k3_forward.cpp
+  src/model/kimi_k3/kimi_k3_model.cpp
   src/model/kimi/kimi.cpp
   src/model/kimi/kimi_forward.cpp
   src/model/kimi/kimi_model.cpp
@@ -515,6 +518,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/batch/frame.cpp
   src/batch/forward.cpp
   src/batch/persistent_inputs.cpp
+  src/batch/planner_calibration.cpp
   src/batch/tp.cpp
   src/batch/workspace.cu
   # pipeline/ -- guest programs (PTIR dispatch, tier0, frame carrier)
@@ -529,6 +533,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/store/kv_cache_format.cpp
   src/store/elastic.cpp
   src/store/memory_planner.cpp
+  src/store/planner_profile_cache.cpp
   src/store/recurrent_state_cache.cpp
   src/store/swap_pool.cpp
   # ops/ -- attention / GEMM / MoE / SSM wrappers
@@ -558,6 +563,8 @@ add_library(pie_driver_cuda_lib STATIC
   src/kernels/embed.cu
   src/kernels/envelope.cu
   src/kernels/gated_delta_net.cu
+  src/kernels/kda.cu
+  src/kernels/attn_res.cu
   src/kernels/gather_rows.cu
   src/kernels/gemv.cu
   src/kernels/gather_tokens.cu
@@ -935,6 +942,11 @@ pie_add_cuda_target(test_gather_tokens
 pie_add_cuda_target(test_pack_dense_mask
   SOURCES tests/pack_dense_mask_test.cu
   LIBS pie_driver_cuda_lib)
+# Names three src/ files (kda, attn_res, swiglu), so by the rule above it links
+# the lib rather than hand-maintaining that closure.
+pie_add_cuda_target(test_kimi_k3_kernels
+  SOURCES tests/kimi_k3_kernels_test.cu
+  LIBS pie_driver_cuda_lib)
 pie_add_cuda_target(test_envelope_dot
   SOURCES tests/test_envelope_dot.cu src/kernels/envelope.cu
   LIBS CUDA::cudart)
@@ -956,6 +968,12 @@ pie_add_cuda_target(masked_attention_parity
   LIBS pie_driver_cuda_lib CUDA::cudart)
 pie_add_cuda_target(test_decode_batch_parity
   SOURCES tests/test_decode_batch_parity.cu
+  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/tests
+  LIBS pie_driver_cuda_lib CUDA::cudart)
+# The three GDN recurrent-decode kernels must agree; the SMEM one is the
+# production default wherever the GQA launcher is reached.
+pie_add_cuda_target(gdn_recurrent_step_parity
+  SOURCES tests/gdn_recurrent_step_parity.cu
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/tests
   LIBS pie_driver_cuda_lib CUDA::cudart)
 pie_add_cuda_target(test_attn_score_capture
@@ -1074,6 +1092,12 @@ pie_add_cuda_target(test_grouped_copy
 # without a device.
 pie_add_cuda_target(test_group_slot_index
   SOURCES tests/group_slot_index_test.cpp)
+# When a pack on disk may be trusted. Header-only, device-free and backend-free
+# on purpose: the pack is a property of the load plan, both drivers can use one,
+# and every check here stands between a mapping and the wrong weights.
+pie_add_cuda_target(test_stream_pack
+  SOURCES tests/stream_pack_test.cpp
+  INCLUDE_DIRS ${PIE_LOADER_INCLUDE_DIR})
 # The slab itself, against the residency it replaces: needs a device, a
 # checkpoint on disk and the loader, because the claim it checks is about bytes.
 if(PIE_LOADER_STATICLIB)
@@ -1086,6 +1110,23 @@ if(PIE_LOADER_STATICLIB)
       ${PIE_LOADER_INCLUDE_DIR}
     LIBS pie_driver_cuda_lib nlohmann_json::nlohmann_json ${PIE_LOADER_STATICLIB} dl pthread)
 endif()
+# The materialized-weight artifact's round trip and its page alignment. Needs a
+# device because the format's payload is device memory: serializing is a D2H of
+# every owned buffer.
+pie_add_cuda_target(test_weight_store_codec
+  SOURCES tests/weight_store_codec_test.cpp
+  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/src ${PIE_LOADER_INCLUDE_DIR}
+  LIBS pie_driver_cuda_lib CUDA::cudart)
+# The non-compact ExtentWrite path. Header-only: it builds its own one-file
+# plan, so it needs the loader's headers but not the staticlib.
+pie_add_cuda_target(test_strided_copy
+  SOURCES tests/strided_copy_test.cu
+  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/src ${PIE_LOADER_INCLUDE_DIR}
+  LIBS CUDA::cudart)
+pie_add_cuda_target(test_chunked_argmax
+  SOURCES tests/test_chunked_argmax.cu src/kernels/argmax.cu
+  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/src ${PIE_LOADER_INCLUDE_DIR}
+  LIBS CUDA::cudart)
 pie_add_cuda_target(test_nucleus_region
   SOURCES tests/nucleus_region_test.cpp
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR}

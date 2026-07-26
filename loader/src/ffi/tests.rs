@@ -201,25 +201,19 @@ fn plan_with_every_instr() -> LoadPlan {
             transform: TransformSpec {
                 from: Some(QuantScheme::MlxAffineU4),
                 to: Some(QuantScheme::Mxfp4E2M1E8M0),
-                repack: RepackSpec {
+                repack: Some(RepackSpec {
                     layout: RepackLayout::MarlinMxfp4Weight,
-                    row_map: RowMap::Odd,
                     batch: 2,
                     source_rows: 32,
-                    source_row_offset: 4,
                     target_rows: 64,
-                    valid_rows: 30,
-                    source_stride_cols: 128,
-                    source_col_offset: 8,
                     source_cols: 96,
                     target_cols: 112,
-                },
+                }),
                 scratch_bytes: 8192,
                 fusion: TransformFusion::Fp8ToMxfp4,
                 metadata_source: Some(TensorId(2)),
                 scale_factor_bits: 0.5f32.to_bits(),
-                scale_group: 32,
-                scale_axis: 1,
+                scale_blocks: vec![1, 32],
             },
         },
         StorageInstr::CreateView {
@@ -533,7 +527,6 @@ fn tile_map_carries_the_whole_transform() {
             transform_from,
             transform_to,
             repack_layout,
-            row_map,
         ) = operands!(
             tile,
             TileMap {
@@ -545,7 +538,6 @@ fn tile_map_carries_the_whole_transform() {
                 transform_from,
                 transform_to,
                 repack_layout,
-                row_map,
             }
         );
         assert_eq!(*tile_kind, PieLoaderTileMapKind::Repack);
@@ -556,26 +548,20 @@ fn tile_map_carries_the_whole_transform() {
         assert_eq!(*transform_from, PieLoaderQuantScheme::MlxAffineU4);
         assert_eq!(*transform_to, PieLoaderQuantScheme::Mxfp4E2M1E8M0);
         assert_eq!(*repack_layout, PieLoaderRepackLayout::MarlinMxfp4Weight);
-        assert_eq!(*row_map, PieLoaderRowMap::Odd);
 
-        let (batch, source_rows, row_offset, target_rows, valid_rows) = operands!(
+        let (batch, source_rows, target_rows) = operands!(
             tile,
             TileMap {
                 transform_batch,
                 transform_source_rows,
-                transform_source_row_offset,
                 transform_target_rows,
-                transform_valid_rows,
             }
         );
-        assert_eq!((*batch, *source_rows, *row_offset), (2, 32, 4));
-        assert_eq!((*target_rows, *valid_rows), (64, 30));
+        assert_eq!((*batch, *source_rows, *target_rows), (2, 32, 64));
 
-        let (stride_cols, col_offset, cols, target_cols, scratch, metadata, factor) = operands!(
+        let (cols, target_cols, scratch, metadata, factor) = operands!(
             tile,
             TileMap {
-                transform_source_stride_cols,
-                transform_source_col_offset,
                 transform_source_cols,
                 transform_target_cols,
                 transform_scratch_bytes,
@@ -583,8 +569,8 @@ fn tile_map_carries_the_whole_transform() {
                 transform_scale_factor_bits,
             }
         );
-        assert_eq!((*stride_cols, *col_offset, *cols), (128, 8, 96));
-        assert_eq!((*target_cols, *scratch, *metadata), (112, 8192, 2));
+        assert_eq!((*cols, *target_cols), (96, 112));
+        assert_eq!((*scratch, *metadata), (8192, 2));
         assert_eq!(f32::from_bits(*factor), 0.5);
     });
 }
@@ -1528,12 +1514,6 @@ fn mirror_enum_discriminants_are_pinned() {
     assert_eq!(PieLoaderRepackLayout::None as u32, 0);
     assert_eq!(PieLoaderRepackLayout::MarlinMxfp4Weight as u32, 1);
     assert_eq!(PieLoaderRepackLayout::MarlinMxfp4Scale as u32, 2);
-    assert_eq!(PieLoaderRepackLayout::DenseRowGather as u32, 3);
-
-    // PieLoaderRowMap
-    assert_eq!(PieLoaderRowMap::Identity as u32, 0);
-    assert_eq!(PieLoaderRowMap::Even as u32, 1);
-    assert_eq!(PieLoaderRowMap::Odd as u32, 2);
 
     // PieLoaderTileMapKind
     assert_eq!(PieLoaderTileMapKind::Cast as u32, 0);
@@ -1599,21 +1579,15 @@ fn storage_op_tags_are_the_wire_values() {
             transform_from: PieLoaderQuantScheme::None,
             transform_to: PieLoaderQuantScheme::None,
             repack_layout: PieLoaderRepackLayout::None,
-            row_map: PieLoaderRowMap::Identity,
             transform_batch: 0,
             transform_source_rows: 0,
-            transform_source_row_offset: 0,
             transform_target_rows: 0,
-            transform_valid_rows: 0,
-            transform_source_stride_cols: 0,
-            transform_source_col_offset: 0,
             transform_source_cols: 0,
             transform_target_cols: 0,
             transform_scratch_bytes: 0,
             transform_metadata_source: PIE_LOADER_NO_TENSOR,
             transform_scale_factor_bits: 0,
-            transform_scale_group: 0,
-            transform_scale_axis: 0,
+            transform_scale_blocks: PieLoaderI64Slice::default(),
         }),
         2
     );
@@ -1708,4 +1682,33 @@ fn a_group_survives_the_contract_ffi() {
     let owned = crate::testkit::contract_writer::write_contract(&contract);
     let read = unsafe { super::contract::read_contract(&owned.view()) }.expect("reads back");
     assert_eq!(read, contract);
+}
+
+/// The rule `RepackLayout` used to state as a variant, now stated where it can
+/// still be violated.
+///
+/// Zero is what an all-zero node carries, and a `Repack` that names no kernel
+/// would otherwise reach the device as a transform that does nothing to bytes
+/// a GEMM is about to read as swizzled.
+#[test]
+fn a_repack_that_names_no_kernel_is_refused_at_the_boundary() {
+    use crate::contract::{Expr, ModelContract, TensorContract, TensorType};
+    use crate::types::RepackLayout;
+    let contract = ModelContract {
+        alignment: 256,
+        tensors: vec![TensorContract::inferred(
+            "packed",
+            Expr::src("blocks").repack(
+                RepackLayout::MarlinMxfp4Weight,
+                TensorType::raw(vec![2, 32, 64], DType::BF16),
+            ),
+            Encoding::Raw(DType::BF16),
+        )],
+        groups: Vec::new(),
+    };
+    let mut owned = crate::testkit::contract_writer::write_contract(&contract);
+    let node = owned.first_repack().expect("the contract has a Repack");
+    owned.set_raw_repack_layout(node, PieLoaderRepackLayout::None as u32);
+    let err = unsafe { super::contract::read_contract(&owned.view()) }.unwrap_err();
+    assert!(err.contains("names a kernel"), "{err}");
 }

@@ -28,6 +28,27 @@ interface model {
     // (irreversible fold ⇒ fold-commit), not a byte-accounting accident.
     is-linear: func() -> bool;
 
+    // Which forward-pass kind the bound model requires. A guest may only
+    // construct the `forward-pass` of the matching interface; the other
+    // interfaces' constructors error immediately.
+    //
+    // Do NOT derive this by parsing `architecture()` — that is an open set and
+    // every new model family would break guests. This enum is closed over
+    // STATE SEMANTICS, so it does not grow with the model zoo.
+    //
+    // Relationship to `is-linear`: `is-linear()` == (`pass-kind()` !=
+    // attention). `is-linear` remains as the commit-policy hint (irreversible
+    // fold ⇒ FOLD-COMMIT); `pass-kind` is what selects the binding surface.
+    enum forward-kind {
+        // Per-token, reversibly discardable KV only  -> `forward`
+        attention,
+        // Irreversibly folded recurrent state only   -> `forward-recurrent`
+        recurrent,
+        // Both attention and recurrent layers        -> `forward-hybrid`
+        hybrid,
+    }
+    pass-kind: func() -> forward-kind;
+
     // Logits/output dimension (= hf_config.vocab_size). May EXCEED the
     // tokenizer's vocabs() token count due to padding. Use THIS for
     // sampler-program lowering and any logits-shaped op; use vocabs() only for

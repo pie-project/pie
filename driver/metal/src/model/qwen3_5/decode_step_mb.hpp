@@ -19,7 +19,13 @@ inline constexpr int kPrefillOrdinalStride = 512;
 // from 64 to 512 walked the prefill range straight through PTIR's base at
 // 100000, which showed up as "no argument table bound for ordinal=100038".
 // Deriving one from the other means they cannot silently overlap again.
-inline constexpr int kPrefillOrdinalMaxRows = 512;  // == executor::kPagedMaxForwardTokensCeiling
+//
+// Raised 512 -> 1024 with `kPagedMaxForwardTokensCeiling`, because rows are the
+// longest prompt this driver accepts and a 650-token one was being refused. The
+// ordinal space itself is free -- argument tables are created on demand, keyed
+// by ordinal -- and the per-row prefill DAGs measured free too: 566 rows and
+// 1024 rows give the same 2.35GB peak RSS and the same wall clock.
+inline constexpr int kPrefillOrdinalMaxRows = 1024;  // == executor::kPagedMaxForwardTokensCeiling
 inline constexpr int kPrefillOrdinalLimit =
     kPrefillOrdinalBase + kPrefillOrdinalMaxRows * kPrefillOrdinalStride;
 
@@ -95,6 +101,8 @@ void alias_decode_conv_state_out(RawMetalContext& ctx, const BoundDecode& b,
 // only way left to decide a change here.  `ab_arm()` is read wherever the two
 // arms differ; `ab_enabled()` says whether to alternate at all.
 bool ab_enabled();
+// Whether arm B of the A/B also serializes every dispatch (PIE_METAL_AB_BARRIERS).
+bool ab_all_barriers();
 bool ab_arm();
 void ab_set_arm(bool b);
 

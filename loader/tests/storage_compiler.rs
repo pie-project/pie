@@ -20,7 +20,7 @@ use pie_loader::plan::compile as compile_load_plan;
 use pie_loader::plan::{LoadPlan, StorageInstr, StorageTarget, TileMapKind};
 use pie_loader::types::{
     Axis, BackendKind, CheckpointFormat, DType, Encoding, FileId, QuantGranularity, QuantScheme,
-    QuantSpec, RepackLayout, RowMap, ScaleForm, TensorId,
+    QuantSpec, RepackLayout, ScaleForm, TensorId,
 };
 
 #[test]
@@ -359,6 +359,112 @@ fn target_support_rejects_cuda_decode_at_compile_time() {
     assert!(err.contains("does not support Decode"), "{err}");
 }
 
+/// The two-step re-encode [`Expr::Cast`]'s doc promises, actually spelled.
+///
+/// A quantized tensor cannot be cast straight to another scheme -- no kernel
+/// does it, and the destination's scales are not a function of the source's --
+/// so the doc offers the route through a decoded intermediate. That route was
+/// unspellable until the kernel-operand rule stopped refusing an `Expr::Out`:
+/// step two is a `Cast` over the intermediate, and `plan::build` rejected any
+/// kernel operand whose lowering read another contract. The refusal was an
+/// artifact of the aliasing path claiming the declaration's own tensor id, not
+/// anything about the algebra, so the escape route the doc names is the test.
+///
+/// The decode here is a per-group `Scale`, which is what decodes a block-scaled
+/// scheme; `TileMapKind::Decode` is in the plan vocabulary but no backend
+/// implements it yet.
+#[test]
+fn a_quantized_tensor_is_re_encoded_through_a_decoded_intermediate() {
+    let int8 = Encoding::Quant(QuantSpec {
+        scheme: QuantScheme::Int8Symmetric,
+        logical_dtype: DType::BF16,
+        bits_per_element: 8,
+        group_size: 32,
+        channel_axis: Some(Axis(1)),
+    });
+    let mut contract = block_scaled_contract("scales", "s", vec![4, 1]);
+    // `w` is the decoded BF16 tensor the fixture publishes. Make it the
+    // intermediate and re-encode it.
+    contract.tensors[1] = contract.tensors[1].clone().internal();
+    contract.tensors.push(TensorContract::new(
+        "w_int8",
+        Expr::out("w").cast(int8.clone()),
+        vec![4, 32],
+        int8,
+    ));
+
+    let target = StorageTarget {
+        backend: BackendKind::Cuda,
+        tile_map_mask: pie_loader::plan::CUDA_TILE_MAP_MASK,
+        ..StorageTarget::default()
+    };
+    let plan = compile_load_plan(&block_scaled_metadata(), &contract, target)
+        .expect("the documented two-step must compile");
+
+    let kinds: Vec<TileMapKind> = plan
+        .instrs
+        .iter()
+        .filter_map(|instr| match instr {
+            StorageInstr::TileMap { kind, .. } => Some(*kind),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![TileMapKind::Scale, TileMapKind::Encode],
+        "decode then encode, each its own kernel"
+    );
+
+    // 64 payload + 4 exponents, read once. If the encode had gone back to the
+    // checkpoint rather than reading what the decode wrote, this would be more.
+    assert_eq!(plan.memory.checkpoint_read_bytes, 68);
+    // `Finalize` is what puts a name in the driver's bind table, and an
+    // internal declaration gets none. Asserted on the instruction rather than
+    // on `plan.tensors`, which lists internal declarations too so a kernel can
+    // know their type.
+    let bound: Vec<&str> = plan
+        .instrs
+        .iter()
+        .filter_map(|instr| match instr {
+            StorageInstr::Finalize { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        bound,
+        // `w_int8_scale_inv` is the encoder's own factors -- the second half of
+        // what a raw-to-quantized cast publishes. `w`, the decoded
+        // intermediate, is the one name missing, which is the point.
+        vec!["scales", "w_int8_scale_inv", "w_int8"],
+        "the intermediate is not bound"
+    );
+}
+
+/// Casting one quantization scheme straight to another stays refused.
+///
+/// The companion to the test above: the two-step exists because the one-step
+/// does not, so if this ever starts compiling the intermediate is dead weight.
+#[test]
+fn a_quantized_tensor_may_not_be_cast_straight_to_another_scheme() {
+    let err = compile_load_plan(
+        &quant_metadata(),
+        &ModelContract {
+            alignment: 1,
+            tensors: vec![TensorContract::new(
+                "w",
+                Expr::src("q").cast(Encoding::Quant(quant(QuantScheme::Fp8E4M3, DType::BF16))),
+                vec![4, 8],
+                Encoding::Quant(quant(QuantScheme::Fp8E4M3, DType::BF16)),
+            )],
+            groups: Vec::new(),
+        },
+        StorageTarget::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("no kernel does that in one step"), "{err}");
+}
+
 #[test]
 fn packed_quant_source_requires_exact_affine_size() {
     let mut metadata = quant_metadata();
@@ -413,22 +519,17 @@ fn gpt_oss_native_mxfp4_default_abi_lowers_to_repack_tile_maps() {
             _ => None,
         })
         .collect();
-    assert_eq!(repacks.len(), 8);
-    assert!(
-        repacks
-            .iter()
-            .any(|spec| spec.repack.layout == RepackLayout::MarlinMxfp4Weight)
-    );
-    assert!(
-        repacks
-            .iter()
-            .any(|spec| spec.repack.layout == RepackLayout::MarlinMxfp4Scale)
-    );
-    assert!(
-        repacks
-            .iter()
-            .any(|spec| spec.repack.layout == RepackLayout::DenseRowGather)
-    );
+    // Six, not eight: the two biases are a row selection and nothing else, so
+    // they are affine and never reach a kernel.
+    assert_eq!(repacks.len(), 6);
+    assert!(repacks.iter().any(|spec| {
+        spec.repack
+            .is_some_and(|r| r.layout == RepackLayout::MarlinMxfp4Weight)
+    }));
+    assert!(repacks.iter().any(|spec| {
+        spec.repack
+            .is_some_and(|r| r.layout == RepackLayout::MarlinMxfp4Scale)
+    }));
     let names = program
         .tensors
         .iter()
@@ -441,12 +542,50 @@ fn gpt_oss_native_mxfp4_default_abi_lowers_to_repack_tile_maps() {
     assert!(program.memory.transform_scratch_peak_bytes > 0);
 }
 
-/// GPT-OSS reads one `gate_up_proj` block twice, once for the even rows and
-/// once for the odd ones. The compiler cannot fold the two reads into one, but
-/// it can schedule them back to back so an executor that keeps the block it just
-/// staged serves the second one without going back to the checkpoint.
+/// A repack declaration is checked against its transform like every other node.
+///
+/// The `Repack` arm used to be the one path through `Builder::tensor` that
+/// inferred a type and then discarded it, taking `to.shape` as the answer
+/// instead of comparing the two. A declaration that disagreed with the
+/// transform compiled silently, and the plan carried the transform's shape
+/// under the declaration's name. Found by adding 7 to each of gpt-oss's six
+/// repack declarations and watching a clean plan come out; this is that
+/// experiment kept.
 #[test]
-fn gpt_oss_native_mxfp4_schedules_shared_source_reads_together() {
+fn a_repack_declaration_is_checked_against_its_transform() {
+    let target = StorageTarget {
+        backend: BackendKind::Cuda,
+        tile_map_mask: pie_loader::plan::CUDA_TILE_MAP_MASK,
+        native_mxfp4_moe: true,
+        ..StorageTarget::default()
+    };
+    let mut contract = stored_contract("gpt_oss_native_mxfp4");
+    let repacked = contract
+        .tensors
+        .iter_mut()
+        .find(|tensor| matches!(tensor.expr, Expr::Repack { .. }))
+        .expect("the gpt-oss contract repacks");
+    let name = repacked.name.clone();
+    repacked
+        .shape
+        .as_mut()
+        .expect("a repack declaration states its shape")[1] += 7;
+
+    let error = compile_load_plan(&gpt_oss_mxfp4_metadata(), &contract, target)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains(&name), "{error}");
+    assert!(error.contains("declares shape"), "{error}");
+}
+
+/// GPT-OSS's gate and up halves are the even and odd rows of one block.
+///
+/// Each is now an `Expr::Stride`, so each repack reads only the rows it wants:
+/// two interleaved gathers of half the block instead of two full reads of all
+/// of it that an executor had to cache to make cheap. The two spans are equal,
+/// they start one row apart, and together they are the block exactly once.
+#[test]
+fn gpt_oss_native_mxfp4_reads_each_interleaved_half_once() {
     let target = StorageTarget {
         backend: BackendKind::Cuda,
         tile_map_mask: pie_loader::plan::CUDA_TILE_MAP_MASK,
@@ -460,162 +599,109 @@ fn gpt_oss_native_mxfp4_schedules_shared_source_reads_together() {
     )
     .unwrap();
 
-    let reads: Vec<(FileId, u64, u64)> = program
-        .schedule
+    // `gate_up_proj_blocks` is [2, 128, 2, 16] u8, so a row is 32 bytes and the
+    // whole tensor is 8192.
+    let blocks = TensorId(10);
+    let mut halves: Vec<(u64, u64)> = program
+        .instrs
         .iter()
-        .filter_map(|id| program.instrs.iter().find(|instr| instr_id(instr) == *id))
         .filter_map(|instr| match instr {
             StorageInstr::TileMap {
                 source: Some(source),
-                inputs,
                 ..
-            } if inputs.is_empty() => Some((source.file_id, source.file_offset, source.span_bytes)),
+            } if source.tensor_id == blocks => Some((source.file_offset, source.span_bytes)),
             _ => None,
         })
         .collect();
-
-    let mut shared = 0;
-    for (position, read) in reads.iter().enumerate() {
-        let readers = reads.iter().filter(|other| *other == read).count();
-        if readers == 1 {
-            continue;
-        }
-        shared += 1;
-        let adjacent =
-            (position > 0 && reads[position - 1] == *read) || reads.get(position + 1) == Some(read);
-        assert!(
-            adjacent,
-            "read {read:?} at {position} is separated from the tile map that shares it: {reads:?}"
-        );
-    }
-    assert_eq!(
-        shared, 6,
-        "expected the three gate/up pairs to share a source"
-    );
+    halves.sort_unstable();
+    assert_eq!(halves.len(), 2, "{halves:?}");
+    assert_eq!(halves[0].1, halves[1].1, "the halves are the same size");
+    assert_eq!(halves[1].0 - halves[0].0, 32, "one row apart");
+    assert_eq!(halves[0].1 + halves[1].1, 8192, "the block, once");
 }
 
+/// The acceptance test for moving the repack's source selection into the
+/// algebra.
+///
+/// The old contract carried `source_row_offset: 64` -- `rank * local` for rank
+/// one -- as an integer inside the spec, so the *contract* was valid for
+/// exactly one rank and the driver had to re-author it per rank. Flipping the
+/// target's rank then changed exactly one line of the plan: the recorded
+/// `tp_rank`. Every read offset was identical.
+///
+/// Now the selection is an `Expr::Shard`, so one contract serves every rank and
+/// the rank reaches the plan only through the target. Both halves of that are
+/// asserted here: the contract holds no rank-derived integer, and compiling it
+/// at two ranks reads two different bands.
 #[test]
-fn gpt_oss_native_mxfp4_tp_uses_row_and_column_offset_repack_contracts() {
-    let target = StorageTarget {
-        backend: BackendKind::Cuda,
-        tile_map_mask: pie_loader::plan::CUDA_TILE_MAP_MASK,
-        tp_rank: 1,
-        tp_size: 2,
-        native_mxfp4_moe: true,
-        ..StorageTarget::default()
-    };
+fn gpt_oss_native_mxfp4_tp_resolves_the_rank_from_the_target() {
     let metadata = gpt_oss_mxfp4_metadata_with_intermediate(128);
     let contract = stored_contract("gpt_oss_native_mxfp4_tp1_of_2");
-    let abi_repacks = contract
+
+    // Every repack now takes a composed operand, which is the shape of the
+    // claim: the selection is stated in the algebra, not in the spec.
+    let repacks = contract
         .tensors
         .iter()
-        .filter_map(|contract| match &contract.expr {
-            pie_loader::contract::Expr::Repack { spec, .. } => Some(*spec),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert!(
-        abi_repacks
-            .iter()
-            .any(|spec| spec.layout == RepackLayout::MarlinMxfp4Weight
-                && spec.row_map == RowMap::Even
-                && spec.source_row_offset == 64
-                && spec.valid_rows == 64
-                && spec.source_stride_cols == 64
-                && spec.source_col_offset == 0)
+        .filter(|tensor| matches!(tensor.expr, pie_loader::contract::Expr::Repack { .. }))
+        .count();
+    assert_eq!(
+        repacks, 6,
+        "a weight and a scale for each of gate, up and down -- the biases are affine"
     );
     assert!(
-        abi_repacks
-            .iter()
-            .any(|spec| spec.layout == RepackLayout::MarlinMxfp4Weight
-                && spec.row_map == RowMap::Identity
-                && spec.source_col_offset == 64
-                && spec.source_stride_cols == 128
-                && spec.source_cols == 64)
+        contract.tensors.iter().all(|tensor| !matches!(
+            &tensor.expr,
+            pie_loader::contract::Expr::Repack { src, .. } if matches!(**src, pie_loader::contract::Expr::Src(_))
+        )),
+        "a repack whose operand is a bare source has nowhere to have put the shard"
     );
 
-    let program = compile_load_plan(&metadata, &contract, target).unwrap();
+    let plan_at = |rank: u32| {
+        let target = StorageTarget {
+            backend: BackendKind::Cuda,
+            tile_map_mask: pie_loader::plan::CUDA_TILE_MAP_MASK,
+            tp_rank: rank,
+            tp_size: 2,
+            native_mxfp4_moe: true,
+            ..StorageTarget::default()
+        };
+        let program = compile_load_plan(&metadata, &contract, target).unwrap();
+        let mut reads: Vec<(u32, u64, u64)> = program
+            .instrs
+            .iter()
+            .filter_map(|instr| match instr {
+                StorageInstr::TileMap {
+                    source: Some(source),
+                    ..
+                } => Some((source.tensor_id.0, source.file_offset, source.span_bytes)),
+                _ => None,
+            })
+            .collect();
+        reads.sort_unstable();
+        (reads, program.memory.checkpoint_read_bytes)
+    };
 
-    let repacks = program
-        .instrs
-        .iter()
-        .filter_map(|instr| match instr {
-            StorageInstr::TileMap {
-                kind: TileMapKind::Repack,
-                transform,
-                ..
-            } => Some(transform.repack),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    let repack_sources = program
-        .instrs
-        .iter()
-        .filter_map(|instr| match instr {
-            StorageInstr::TileMap {
-                kind: TileMapKind::Repack,
-                source,
-                transform,
-                ..
-            } => source.as_ref().map(|source| (transform.repack, source)),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+    let (rank0, bytes0) = plan_at(0);
+    let (rank1, bytes1) = plan_at(1);
+    assert_ne!(
+        rank0, rank1,
+        "the two ranks must not read the same bytes: {rank0:?}"
+    );
+    assert_eq!(bytes0, bytes1, "and each rank must read the same volume");
 
-    assert_eq!(repacks.len(), 8);
-    assert!(
-        repacks
+    // The gate/up block is [2, 256, 2, 16], so a row is 32 bytes and an expert
+    // is 8192. Rank one's band starts halfway into each expert.
+    let band_start = |reads: &[(u32, u64, u64)]| {
+        reads
             .iter()
-            .any(|spec| spec.layout == RepackLayout::MarlinMxfp4Weight
-                && spec.row_map == RowMap::Even
-                && spec.source_rows == 128
-                && spec.source_row_offset == 0
-                && spec.valid_rows == 64
-                && spec.target_rows == 128
-                && spec.source_stride_cols == 64
-                && spec.source_col_offset == 0
-                && spec.source_cols == 64
-                && spec.target_cols == 64)
-    );
-    assert!(
-        repacks
-            .iter()
-            .any(|spec| spec.layout == RepackLayout::DenseRowGather
-                && spec.row_map == RowMap::Odd
-                && spec.source_rows == 128
-                && spec.source_row_offset == 0
-                && spec.valid_rows == 64
-                && spec.target_rows == 64)
-    );
-    assert!(
-        repacks
-            .iter()
-            .any(|spec| spec.layout == RepackLayout::MarlinMxfp4Weight
-                && spec.row_map == RowMap::Identity
-                && spec.source_col_offset == 0
-                && spec.source_stride_cols == 64
-                && spec.source_cols == 64
-                && spec.target_cols == 128)
-    );
-    assert!(
-        repacks
-            .iter()
-            .any(|spec| spec.layout == RepackLayout::MarlinMxfp4Scale
-                && spec.row_map == RowMap::Identity
-                && spec.source_col_offset == 0
-                && spec.source_stride_cols == 2
-                && spec.source_cols == 2
-                && spec.target_cols == 4)
-    );
-    assert!(repack_sources.iter().any(|(spec, source)| spec.layout
-        == RepackLayout::MarlinMxfp4Weight
-        && spec.row_map == RowMap::Even
-        && source.span_bytes == 8192));
-    assert!(repack_sources.iter().any(|(spec, source)| spec.layout
-        == RepackLayout::MarlinMxfp4Weight
-        && spec.row_map == RowMap::Identity
-        && source.span_bytes == 4096));
-    assert_eq!(program.memory.checkpoint_read_bytes, 23_040);
+            .filter(|(id, ..)| *id == 10)
+            .map(|(_, offset, _)| *offset)
+            .min()
+            .unwrap()
+    };
+    assert_eq!(band_start(&rank0), 0);
+    assert_eq!(band_start(&rank1), 128 * 32);
 }
 
 #[test]
@@ -960,6 +1046,38 @@ fn a_scale_whose_declared_shape_is_wrong_is_rejected() {
     assert!(error.contains("declares shape [4]"), "{error}");
 }
 
+/// Every path through the compiler names the contract its error came from.
+///
+/// `Builder::tensor` used to annotate the affine path at the call site and the
+/// kernel paths call by call, so the same mistake read `'out': declares shape
+/// [4] ...` through one and `declares shape [4] ...` through the other. In a
+/// contract with hundreds of tensors the second message names nothing. The
+/// annotation now happens once, at the boundary, for every path.
+#[test]
+fn every_path_names_the_contract_its_error_came_from() {
+    for expr in [
+        Expr::src("a"),
+        Expr::src("a").scale(0.5),
+        Expr::src("a").cast(Encoding::Raw(DType::F16)),
+    ] {
+        let node = expr.node_name();
+        let contract = ModelContract {
+            alignment: 256,
+            tensors: vec![TensorContract::new(
+                "out",
+                expr,
+                vec![99],
+                Encoding::Raw(DType::F32),
+            )],
+            groups: Vec::new(),
+        };
+        let error = compile_load_plan(&metadata(), &contract, StorageTarget::default())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("'out'"), "{node}: {error}");
+    }
+}
+
 /// A checkpoint holding one block-scaled MXFP4 tensor and its factors.
 ///
 /// Both arrive as the bytes a safetensors file actually stores — `U8` payloads
@@ -977,6 +1095,11 @@ fn block_scaled_metadata() -> CheckpointMetadata {
         tensors: vec![
             sized_raw(0, "w", 0, 64, &[4, 16], DType::U8),
             sized_raw(1, "s", 64, 4, &[4, 1], DType::U8),
+            // Two more factor tensors, sized so that the shapes the rejection
+            // tests need are legal renames of *something*: three exponents do
+            // not divide four rows, and 128 give one per element.
+            sized_raw(2, "s3", 68, 3, &[3, 1], DType::U8),
+            sized_raw(3, "s128", 71, 128, &[128], DType::U8),
         ],
     }
 }
@@ -993,17 +1116,22 @@ fn mxfp4(channel_axis: u8) -> QuantSpec {
 /// `factors` names the tensor holding the exponents, and is the whole point:
 /// the payload and its factors are paired by a name the contract already
 /// checks, not by a suffix the executor appends to a name and hopes for.
-fn block_scaled_contract(factors: &str, group: u32, axis: u8) -> ModelContract {
+///
+/// `from` and `shape` are what the factors are, because **the factors' shape
+/// is the whole statement of how the payload is blocked**. There is no group
+/// size and no axis to pass: `[4, 1]` over `[4, 32]` says one factor per row,
+/// `[2, 2]` says 2x16 tiles. Every rejection below is therefore a shape.
+fn block_scaled_contract(factors: &str, from: &str, shape: Vec<i64>) -> ModelContract {
     ModelContract {
         alignment: 256,
         tensors: vec![
             TensorContract::new(
                 "scales",
-                Expr::src("s").transmute(TensorType {
-                    shape: vec![4, 1],
+                Expr::src(from).transmute(TensorType {
+                    shape: shape.clone(),
                     encoding: Encoding::Raw(DType::E8M0),
                 }),
-                vec![4, 1],
+                shape,
                 Encoding::Raw(DType::E8M0),
             ),
             TensorContract::new(
@@ -1013,7 +1141,7 @@ fn block_scaled_contract(factors: &str, group: u32, axis: u8) -> ModelContract {
                         shape: vec![4, 32],
                         encoding: Encoding::Quant(mxfp4(1)),
                     })
-                    .scale_per_group(Expr::out(factors), group, axis),
+                    .scale_per_block(Expr::out(factors)),
                 vec![4, 32],
                 Encoding::Raw(DType::BF16),
             ),
@@ -1026,7 +1154,7 @@ fn block_scaled_contract(factors: &str, group: u32, axis: u8) -> ModelContract {
 fn a_block_scaled_dequant_is_one_scale_with_its_factors_as_an_operand() {
     let plan = compile_load_plan(
         &block_scaled_metadata(),
-        &block_scaled_contract("scales", 32, 1),
+        &block_scaled_contract("scales", "s", vec![4, 1]),
         StorageTarget::default(),
     )
     .expect("block-scaled dequant should compile");
@@ -1046,8 +1174,7 @@ fn a_block_scaled_dequant_is_one_scale_with_its_factors_as_an_operand() {
         .collect();
     assert_eq!(scales.len(), 1, "{:#?}", plan.instrs);
     let (inputs, transform) = &scales[0];
-    assert_eq!(transform.scale_group, 32);
-    assert_eq!(transform.scale_axis, 1);
+    assert_eq!(transform.scale_blocks, vec![1, 32]);
     assert_eq!(transform.from, Some(QuantScheme::Mxfp4E2M1E8M0));
     assert_eq!(
         transform.scale_factor_bits, 0,
@@ -1092,7 +1219,7 @@ fn a_sharded_block_scaled_dequant_scales_only_its_own_rank() {
                         encoding: Encoding::Quant(mxfp4(1)),
                     })
                     .shard(0)
-                    .scale_per_group(Expr::out("scales"), 32, 1),
+                    .scale_per_block(Expr::out("scales")),
                 vec![2, 32],
                 Encoding::Raw(DType::BF16),
             ),
@@ -1122,7 +1249,7 @@ fn a_sharded_block_scaled_dequant_scales_only_its_own_rank() {
         })
         .unwrap_or_else(|| panic!("no Scale instruction: {:#?}", plan.instrs));
     let (source, inputs, transform) = scale;
-    assert_eq!(transform.scale_group, 32);
+    assert_eq!(transform.scale_blocks, vec![1, 32]);
     assert_eq!(inputs.len(), 1, "the one operand is the factors");
     let source = source.expect("rank 1's rows are contiguous, so they stay a source read");
     assert_eq!(
@@ -1145,7 +1272,7 @@ fn a_sharded_block_scaled_dequant_scales_only_its_own_rank() {
 fn a_scale_by_a_tensor_no_contract_declares_is_rejected() {
     let error = compile_load_plan(
         &block_scaled_metadata(),
-        &block_scaled_contract("absent", 32, 1),
+        &block_scaled_contract("absent", "s", vec![4, 1]),
         StorageTarget::default(),
     )
     .unwrap_err()
@@ -1153,40 +1280,78 @@ fn a_scale_by_a_tensor_no_contract_declares_is_rejected() {
     assert!(error.contains("is declared before this one"), "{error}");
 }
 
+/// Blocks on two axes at once, which one group size could not have said.
+///
+/// `[2, 2]` factors over a `[4, 32]` payload is a 2x16 tile. Nothing in the
+/// contract names either number: both fall out of the ratio, and the plan is
+/// where they first appear as numbers -- which is what makes them checkable
+/// against the two shapes rather than trusted.
 #[test]
-fn a_scale_by_the_wrong_number_of_factors_is_rejected() {
-    let error = compile_load_plan(
+fn a_scale_blocks_every_axis_the_factors_divide() {
+    let plan = compile_load_plan(
         &block_scaled_metadata(),
-        &block_scaled_contract("scales", 16, 1),
+        &block_scaled_contract("scales", "s", vec![2, 2]),
         StorageTarget::default(),
     )
-    .unwrap_err()
-    .to_string();
-    assert!(error.contains("needs [4, 2]"), "{error}");
+    .expect("a two-dimensional blocking should compile");
+
+    let blocks: Vec<_> = plan
+        .instrs
+        .iter()
+        .filter_map(|instr| match instr {
+            StorageInstr::TileMap {
+                kind: TileMapKind::Scale,
+                transform,
+                ..
+            } => Some(transform.scale_blocks.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(blocks, vec![vec![2, 16]]);
 }
 
 #[test]
-fn a_scale_grouped_on_an_axis_that_is_not_the_last_is_rejected() {
+fn a_scale_by_factors_of_a_different_rank_is_rejected() {
     let error = compile_load_plan(
         &block_scaled_metadata(),
-        &block_scaled_contract("scales", 4, 0),
+        &block_scaled_contract("scales", "s", vec![4]),
         StorageTarget::default(),
     )
     .unwrap_err()
     .to_string();
-    assert!(error.contains("last axis"), "{error}");
+    assert!(
+        error.contains("same rank and dividing each axis"),
+        "{error}"
+    );
 }
 
 #[test]
-fn a_scale_by_an_unset_group_is_rejected() {
+fn a_scale_by_factors_that_do_not_divide_the_payload_is_rejected() {
     let error = compile_load_plan(
         &block_scaled_metadata(),
-        &block_scaled_contract("scales", 0, 1),
+        &block_scaled_contract("scales", "s3", vec![3, 1]),
         StorageTarget::default(),
     )
     .unwrap_err()
     .to_string();
-    assert!(error.contains("group size is zero"), "{error}");
+    assert!(
+        error.contains("axis 0 of [4, 32] is not a whole number of blocks"),
+        "{error}"
+    );
+}
+
+/// One factor per element groups nothing, so it is an elementwise product and
+/// not a block scale. Symmetry rule A: a node may not denote its operand.
+#[test]
+fn a_scale_by_one_factor_per_element_is_rejected() {
+    let error = compile_load_plan(
+        &block_scaled_metadata(),
+        &block_scaled_contract("scales", "s128", vec![4, 32]),
+        StorageTarget::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("they group nothing"), "{error}");
 }
 
 /// Scaling by an expression, rather than by a tensor some contract published,
@@ -1206,14 +1371,10 @@ fn a_scale_by_an_undeclared_expression_is_rejected() {
                     shape: vec![4, 32],
                     encoding: Encoding::Quant(mxfp4(1)),
                 })
-                .scale_per_group(
-                    Expr::src("s").transmute(TensorType {
-                        shape: vec![4, 1],
-                        encoding: Encoding::Raw(DType::E8M0),
-                    }),
-                    32,
-                    1,
-                ),
+                .scale_per_block(Expr::src("s").transmute(TensorType {
+                    shape: vec![4, 1],
+                    encoding: Encoding::Raw(DType::E8M0),
+                })),
             vec![4, 32],
             Encoding::Raw(DType::BF16),
         )],
@@ -1723,6 +1884,83 @@ fn a_padded_head_dim_zeroes_the_buffer_before_it_writes_the_rows() {
     assert_eq!(program.memory.device_write_bytes, 32);
     assert_eq!(program.memory.persistent_bytes, 40);
     assert_eq!(program.buffer(filled).unwrap().bytes, 40);
+}
+
+/// And the padding is actually zero when the plan runs.
+///
+/// The test above proves the *plan* says `Fill`; nothing proved that executing
+/// it produces zeros, because no golden carries a `Fill` and the goldens are
+/// what drive the host executor. So `HostExecutor::fill` was reachable code
+/// that no test had ever run. The pad is the one region of a materialized
+/// tensor whose bytes come from no source, which makes it exactly the region a
+/// missing zeroing would leave holding whatever the allocator last had.
+#[test]
+fn a_padded_head_dim_materializes_zeros_where_no_source_covers() {
+    let dir = std::env::temp_dir().join(format!("pie_fill_replay_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let snapshot = dir.join("model.safetensors");
+
+    // Four rows of four bf16 elements, every byte non-zero, so a pad that was
+    // left uninitialised cannot pass by coincidence and a pad written from the
+    // wrong offset shows up as source bytes rather than zeros.
+    let source: Vec<u8> = (0..32).map(|i| (i as u8) | 0x80).collect();
+    std::fs::write(&snapshot, &source).unwrap();
+
+    let metadata = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "model.safetensors".to_string(),
+            size_bytes: source.len() as u64,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors: vec![RawTensor {
+            id: TensorId(0),
+            name: "q_proj.weight".to_string(),
+            file_id: FileId(0),
+            file_offset: 0,
+            span_bytes: 32,
+            shape: vec![4, 4],
+            encoding: Encoding::Raw(DType::BF16),
+        }],
+    };
+    let contract = ModelContract {
+        groups: Vec::new(),
+        alignment: 1,
+        tensors: vec![TensorContract::new(
+            "q_proj.weight",
+            Expr::concat(
+                1,
+                vec![
+                    Expr::src("q_proj.weight"),
+                    Expr::fill(0.0, TensorType::raw(vec![4, 1], DType::BF16)),
+                ],
+            ),
+            vec![4, 5],
+            Encoding::Raw(DType::BF16),
+        )],
+    };
+
+    let plan = compile_load_plan(&metadata, &contract, StorageTarget::default()).unwrap();
+    let storage = pie_loader::testkit::host_executor::execute_plan(&plan, &dir)
+        .expect("the padded plan does not execute");
+    let got = storage.tensors.get("q_proj.weight").expect("materialized");
+
+    assert_eq!(got.len(), 40, "four rows of five bf16 elements");
+    for row in 0..4 {
+        let at = row * 10;
+        assert_eq!(
+            &got[at..at + 8],
+            &source[row * 8..row * 8 + 8],
+            "row {row} did not get its source bytes"
+        );
+        assert_eq!(
+            &got[at + 8..at + 10],
+            &[0, 0],
+            "row {row}'s padded column is not zero"
+        );
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// A block scale is bytes in the file and an exponent to the GEMM.

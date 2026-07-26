@@ -292,10 +292,6 @@ pub(crate) fn build_frame_submission(
             .take_while(|req| !req.request.device_resolved_geometry)
             .count();
         let envelope_count = group.len() - wire_count;
-        // TEMP DIAG (remove before landing).
-        if super::sched_trace_enabled() && envelope_count > 0 && wire_count > 0 {
-            eprintln!("[sched] MIXED step wire={wire_count} envelope={envelope_count}");
-        }
         let mut sub_batch_indptr: Vec<u32> = vec![0];
         let mut sub_batch_class: Vec<u32> = Vec::new();
         if wire_count > 0 {

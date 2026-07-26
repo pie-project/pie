@@ -158,17 +158,18 @@ enum class PieLoaderTransformFusion : uint32_t {
   Fp8ToMxfp4 = 1,
 };
 
+/// A repack's kernel, across the ABI.
+///
+/// `None` is the wire sentinel for a transform that ends in no kernel, the way
+/// [`PieLoaderQuantScheme::None`] is for a transform that converts nothing. It
+/// is deliberately *not* a member of [`RepackLayout`]: outbound it means "this
+/// tile map is not a repack", and inbound — where the only reader is a contract
+/// node that has already said it is one — it is rejected, because an all-zero
+/// node is the shape a forgotten field has.
 enum class PieLoaderRepackLayout : uint32_t {
   None = 0,
   MarlinMxfp4Weight = 1,
   MarlinMxfp4Scale = 2,
-  DenseRowGather = 3,
-};
-
-enum class PieLoaderRowMap : uint32_t {
-  Identity = 0,
-  Even = 1,
-  Odd = 2,
 };
 
 enum class PieLoaderBackendKind : uint32_t {
@@ -385,24 +386,6 @@ struct PieLoaderTargetSpec {
 
 using PieLoaderU32Slice = PieLoaderSlice<uint32_t>;
 
-/// [`crate::types::RepackSpec`], flattened. All eleven fields, because a repack
-/// is opaque to the type checker and therefore has to state everything.
-struct PieLoaderRepackSpecView {
-  /// A `PieLoaderRepackLayout` value, as `uint32_t`.
-  uint32_t layout;
-  /// A `PieLoaderRowMap` value, as `uint32_t`.
-  uint32_t row_map;
-  uint32_t batch;
-  uint32_t source_rows;
-  uint32_t source_row_offset;
-  uint32_t target_rows;
-  uint32_t valid_rows;
-  uint32_t source_stride_cols;
-  uint32_t source_col_offset;
-  uint32_t source_cols;
-  uint32_t target_cols;
-};
-
 /// One node of the expression graph.
 ///
 /// Every field is read by exactly the kinds that need it and ignored by the
@@ -448,8 +431,10 @@ struct PieLoaderExprNode {
   /// one extent may be `-1`, and never for a `Fill`.
   PieLoaderI64Slice out_shape;
   PieLoaderEncodingSpec out_encoding;
-  /// `Repack`.
-  PieLoaderRepackSpecView repack;
+  /// `Repack`: a `PieLoaderRepackLayout` value, as `uint32_t`. The whole of
+  /// what a repack says -- every count a kernel needs is the operand's type
+  /// or `out_shape`'s, so the loader derives it.
+  uint32_t repack_layout;
   /// `Scale`: the multiplier, as the bit pattern of an IEEE-754 binary32.
   ///
   /// A `float` field would make this struct's layout depend on the C++
@@ -459,20 +444,21 @@ struct PieLoaderExprNode {
   /// Leaving it unset means zero, which reads as `+0.0`; the loader rejects
   /// that rather than scaling a tensor to nothing.
   uint32_t scale_factor_bits;
-  /// `Scale`: the operand holding one factor per `scale_group` elements along
-  /// `axis`. Same index rule as `src`.
+  /// `Scale`: the operand holding the factors, one per block. Same index
+  /// rule as `src`.
   ///
-  /// [`PIE_LOADER_NO_NODE`] for a uniform factor, which is what an unset
-  /// field reads as.
+  /// [`PIE_LOADER_NO_NODE`] for a uniform factor, and that sentinel is what
+  /// tells the two forms apart. There used to be a separate `scale_group`
+  /// discriminant, on the grounds that a struct zeroed by hand would then
+  /// always read as the uniform case; but `src` has always carried the same
+  /// exposure — node zero is a legal index — so the sentinel is the rule
+  /// everywhere rather than in all places but one, and
+  /// [`PieLoaderExprNode::default`] sets it.
+  ///
+  /// The blocking itself is not stated here. It is the ratio of this
+  /// operand's shape to `src`'s, which is the only place it can be stated
+  /// once.
   uint32_t scale_by;
-  /// `Scale`: elements per factor. Zero selects the uniform factor in
-  /// `scale_factor_bits`.
-  ///
-  /// The two forms are told apart by this field rather than by which of the
-  /// others happens to be set, so a node built by zeroing the struct and
-  /// filling in one field is always the uniform case and never a per-group
-  /// case with a missing operand.
-  uint32_t scale_group;
 };
 
 using PieLoaderExprNodeSlice = PieLoaderSlice<PieLoaderExprNode>;
@@ -742,14 +728,9 @@ struct PieLoaderStorageOp {
     PieLoaderQuantScheme transform_from;
     PieLoaderQuantScheme transform_to;
     PieLoaderRepackLayout repack_layout;
-    PieLoaderRowMap row_map;
     uint32_t transform_batch;
     uint32_t transform_source_rows;
-    uint32_t transform_source_row_offset;
     uint32_t transform_target_rows;
-    uint32_t transform_valid_rows;
-    uint32_t transform_source_stride_cols;
-    uint32_t transform_source_col_offset;
     uint32_t transform_source_cols;
     uint32_t transform_target_cols;
     uint64_t transform_scratch_bytes;
@@ -769,16 +750,20 @@ struct PieLoaderStorageOp {
     /// constant the contract named — `__uint_as_float` on the CUDA side
     /// costs nothing and cannot round.
     uint32_t transform_scale_factor_bits;
-    /// Elements per factor along `transform_scale_axis` for a per-group
-    /// [`PieLoaderTileMapKind::Scale`]; zero when the factor is the uniform
-    /// constant above.
+    /// Elements of the operand per factor, on each axis, for a per-block
+    /// [`PieLoaderTileMapKind::Scale`]; empty when the factor is the
+    /// uniform constant above.
     ///
-    /// Non-zero is what tells the executor to read its factors from
+    /// Non-empty is what tells the executor to read its factors from
     /// `input_buffers[0]` — the operand the contract paired with the
     /// payload — instead of from `transform_scale_factor_bits`.
-    uint32_t transform_scale_group;
-    /// The axis `transform_scale_group` counts along.
-    uint8_t transform_scale_axis;
+    ///
+    /// One entry per axis of the destination, so a DeepSeek-style FP8
+    /// checkpoint's two-dimensional block scale is `[128, 128]` and the
+    /// ordinary row-wise case is `[1, 32]`. The executor already knows both
+    /// shapes, so this is a statement it can check rather than one it must
+    /// trust.
+    PieLoaderI64Slice transform_scale_blocks;
   };
 
   struct CreateView_Body {

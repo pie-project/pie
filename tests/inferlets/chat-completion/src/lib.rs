@@ -8,7 +8,7 @@
 //! handling; the sampled token itself remains device-carried into the next pass.
 
 use inferlet::ptir::Taken;
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, chat, model as wit_model};
 use serde::Deserialize;
 

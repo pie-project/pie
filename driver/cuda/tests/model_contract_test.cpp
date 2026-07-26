@@ -25,6 +25,7 @@
 // be rewritten — `Shard(Slice(..))` and a `Slice` with the rank folded into its
 // offset are different graphs — while the plan must not move at all.
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -46,11 +47,14 @@
 #include "pie_loader/request.hpp"
 #include "pie_loader/source_checkpoint.hpp"
 
+#include "loader/load_plan_bridge.hpp"
 #include "model/contract.hpp"
 #include "model/csm/csm_contract.hpp"
 #include "model/deepseek_v4/deepseek_v4_contract.hpp"
+#include "model/glm5/glm5_contract.hpp"
 #include "model/mixtral/mixtral_contract.hpp"
 #include "model/kimi/kimi_contract.hpp"
+#include "model/mixtral/mixtral_contract.hpp"
 #include "model/nemotron_h/nemotron_h_contract.hpp"
 #include "model/qwen3_5/qwen3_5_contract.hpp"
 #include "model/registry.hpp"
@@ -252,6 +256,22 @@ struct TypedTensor {
     std::string dtype;
 };
 
+/// Flush and close, and say so when the bytes did not land.
+///
+/// These fixtures are written to `$TMPDIR`, which on a shared box is a tmpfs
+/// several users are competing for. A stream that runs out of room drops its
+/// whole buffer silently, leaving a zero-byte file, and the test then fails
+/// several frames later reading a header that was never written. Naming the
+/// real cause here is the difference between a two-minute diagnosis and an
+/// afternoon spent suspecting the contract.
+void close_or_throw(std::ofstream& out, const std::filesystem::path& path) {
+    out.close();
+    if (!out) {
+        throw std::runtime_error("could not write the fixture " + path.string() +
+                                 " (is the filesystem holding $TMPDIR full?)");
+    }
+}
+
 /// Write a safetensors file whose tensors do *not* all share a dtype.
 ///
 /// A packed-MXFP4 checkpoint is the case that needs this: the weight is `I8`
@@ -282,6 +302,7 @@ std::filesystem::path write_typed_checkpoint(const std::string& tag,
     out.write(text.data(), static_cast<std::streamsize>(text.size()));
     const std::vector<char> zeros(static_cast<std::size_t>(offset), 0);
     out.write(zeros.data(), static_cast<std::streamsize>(zeros.size()));
+    close_or_throw(out, dir / "model.safetensors");
     return dir;
 }
 
@@ -317,6 +338,7 @@ std::filesystem::path write_synthetic_checkpoint(
     out.write(text.data(), static_cast<std::streamsize>(text.size()));
     const std::vector<char> zeros(static_cast<std::size_t>(offset), 0);
     out.write(zeros.data(), static_cast<std::streamsize>(zeros.size()));
+    close_or_throw(out, dir / "model.safetensors");
     return dir;
 }
 
@@ -641,6 +663,224 @@ void test_deepseek_v4_streams_experts_as_a_group() {
             }
         }
     }
+}
+
+/// The shared expert's gate and up projections are joined by the contract.
+///
+/// Additive, not a replacement: `try_fold_shared_into_routed` still reads the
+/// two projections separately, and which path runs is a per-step decision, so
+/// the sources must survive. Sharded on axis 0, so the join's row count has to
+/// follow the rank rather than the checkpoint.
+/// GLM-5.1 ships `kv_b_proj` as FP8 with a two-dimensional block scale, and
+/// the kernels that read it want BF16.
+///
+/// This is the case that forced the scale factor's `group`/`axis` pair to be
+/// replaced by the factors' own shape. A single group size along a single axis
+/// can name a row-wise blocking and nothing else, but the kernel this driver
+/// already ships (`dequant_fp8_e4m3_blocked_kernel`) indexes
+/// `scale[row / row_block][col / col_block]` -- so the checkpoint's actual
+/// layout was one the algebra could not spell.
+///
+/// What the test pins is that the FP8 pair leaves the checkpoint and one BF16
+/// tensor arrives: `kv_b_proj.weight` is declared BF16 at this rank's row
+/// count, and the factors are declared but not bound. `bind_glm5` used to
+/// dequantize into a side buffer and keep the FP8 original resident, so both
+/// halves of that are what changed.
+void test_glm5_dequantizes_kv_b_proj() {
+    constexpr std::int64_t kHidden = 64;
+    constexpr std::int64_t kKvBRows = 128;
+    constexpr std::int64_t kKvLora = 64;
+    // A 64x32 block: deliberately not square and not the whole row, so a
+    // reader that assumes either is wrong about this fixture.
+    constexpr std::int64_t kScaleRows = 2;
+    constexpr std::int64_t kScaleCols = 2;
+
+    const std::string lp = "model.layers.0.";
+    const std::string ap = lp + "self_attn.";
+    std::vector<TypedTensor> tensors{
+        {"model.embed_tokens.weight", {16, kHidden}, "BF16"},
+        {"model.norm.weight", {kHidden}, "BF16"},
+        {"lm_head.weight", {16, kHidden}, "BF16"},
+        {lp + "input_layernorm.weight", {kHidden}, "BF16"},
+        {lp + "post_attention_layernorm.weight", {kHidden}, "BF16"},
+        {ap + "kv_b_proj.weight", {kKvBRows, kKvLora}, "F8_E4M3"},
+        {ap + "kv_b_proj.weight_scale_inv", {kScaleRows, kScaleCols}, "F32"},
+        {ap + "o_proj.weight", {kHidden, kHidden}, "BF16"},
+        {lp + "mlp.gate_proj.weight", {kHidden, kHidden}, "BF16"},
+        {lp + "mlp.up_proj.weight", {kHidden, kHidden}, "BF16"},
+        {lp + "mlp.down_proj.weight", {kHidden, kHidden}, "BF16"},
+    };
+
+    const std::filesystem::path dir = write_typed_checkpoint("glm5_kv_b_fp8", tensors);
+    std::string open_error;
+    pie_loader::Checkpoint checkpoint = pie_loader::Checkpoint::open(dir.string(), &open_error);
+    check(static_cast<bool>(checkpoint), "the synthetic checkpoint opens: " + open_error);
+    if (!checkpoint) {
+        std::filesystem::remove_all(dir);
+        return;
+    }
+
+    const pie_cuda_driver::model::ModelFacts facts{
+        .model_type = "glm5",
+        .quant_method = "",
+        .num_hidden_layers = 1,
+        .num_experts = 0,
+        .head_dim = 0,
+        .mamba_groups = 0,
+    };
+    namespace model = pie_cuda_driver::model;
+
+    for (int tp : {1, 2}) {
+        for (int rank = 0; rank < tp; ++rank) {
+            const std::string at =
+                " (tp " + std::to_string(tp) + " rank " + std::to_string(rank) + ")";
+            auto target = pie_cuda_driver::cuda_device_target();
+            target.tp_size = static_cast<std::uint32_t>(tp);
+            target.tp_rank = static_cast<std::uint32_t>(rank);
+
+            pie_loader::ModelContract contract;
+            try {
+                model::ContractBuilder builder(checkpoint, facts, target, "",
+                                               model::Mxfp4MoeRequest::Auto,
+                                               model::Component::Full,
+                                               /*stream_routed_experts=*/false, contract);
+                model::author_glm5_contract(builder);
+                builder.finish();
+            } catch (const std::exception& error) {
+                check(false, "authoring" + at + ": " + error.what());
+                continue;
+            }
+
+            const auto v = contract.view();
+            bool found = false;
+            for (std::size_t i = 0; i < v.tensors.len; ++i) {
+                const auto& t = v.tensors.ptr[i];
+                if (view_of(t.name) != ap + "kv_b_proj.weight") continue;
+                found = true;
+                const std::vector<std::int64_t> shape(t.shape.ptr, t.shape.ptr + t.shape.len);
+                check(shape == std::vector<std::int64_t>{kKvBRows / tp, kKvLora},
+                      "kv_b_proj is this rank's rows" + at);
+                check(t.encoding.dtype ==
+                          static_cast<std::uint32_t>(pie_loader::PieLoaderDType::BF16),
+                      "kv_b_proj reaches the bind dequantized" + at);
+            }
+            check(found, "kv_b_proj is published" + at);
+
+            try {
+                const pie_loader::PieLoaderContractRequest request =
+                    pie_loader::build_contract_request(checkpoint, target, v);
+                const pie_loader::LoadPlan plan = pie_loader::LoadPlan::compile(request);
+                plan.verify(request);
+                // The factors are consumed by the dequant, so binding them
+                // would pin FP32 bytes nothing reads for the process's life.
+                check(planned_internal(plan, ap + "kv_b_proj.weight_scale_inv"),
+                      "the block scales are not bound" + at);
+            } catch (const std::exception& error) {
+                check(false, "compiling" + at + ": " + error.what());
+            }
+        }
+    }
+    std::filesystem::remove_all(dir);
+}
+
+void test_qwen3_5_moe_joins_the_shared_expert() {
+    constexpr std::int64_t kExperts = 4;
+    constexpr std::int64_t kHidden = 64;
+    constexpr std::int64_t kInter = 32;
+    constexpr std::int64_t kShared = 16;
+
+    std::vector<TypedTensor> tensors{
+        {"model.embed_tokens.weight", {16, kHidden}, "BF16"},
+        {"model.norm.weight", {kHidden}, "BF16"},
+        {"lm_head.weight", {16, kHidden}, "BF16"},
+    };
+    const std::string lp = "model.layers.0.";
+    tensors.push_back({lp + "input_layernorm.weight", {kHidden}, "BF16"});
+    tensors.push_back({lp + "post_attention_layernorm.weight", {kHidden}, "BF16"});
+    for (const char* proj : {"q_proj", "k_proj", "v_proj", "o_proj"}) {
+        tensors.push_back({lp + "self_attn." + proj + ".weight", {kHidden, kHidden}, "BF16"});
+    }
+    tensors.push_back({lp + "mlp.gate.weight", {kExperts, kHidden}, "BF16"});
+    tensors.push_back({lp + "mlp.experts.gate_up_proj", {kExperts, 2 * kInter, kHidden}, "BF16"});
+    tensors.push_back({lp + "mlp.experts.down_proj", {kExperts, kHidden, kInter}, "BF16"});
+    tensors.push_back({lp + "mlp.shared_expert.gate_proj.weight", {kShared, kHidden}, "BF16"});
+    tensors.push_back({lp + "mlp.shared_expert.up_proj.weight", {kShared, kHidden}, "BF16"});
+    tensors.push_back({lp + "mlp.shared_expert.down_proj.weight", {kHidden, kShared}, "BF16"});
+    tensors.push_back({lp + "mlp.shared_expert_gate.weight", {1, kHidden}, "BF16"});
+
+    const std::filesystem::path dir =
+        write_typed_checkpoint("qwen3_5_moe_shared", tensors);
+
+    std::string open_error;
+    pie_loader::Checkpoint checkpoint = pie_loader::Checkpoint::open(dir.string(), &open_error);
+    check(static_cast<bool>(checkpoint), "the synthetic checkpoint opens: " + open_error);
+    if (!checkpoint) {
+        std::filesystem::remove_all(dir);
+        return;
+    }
+
+    const pie_cuda_driver::model::ModelFacts facts{
+        .model_type = "qwen3_5_moe",
+        .quant_method = "",
+        .num_hidden_layers = 1,
+        .num_experts = kExperts,
+        .head_dim = 0,
+        .mamba_groups = 0,
+    };
+    namespace model = pie_cuda_driver::model;
+    const bool folded = model::qwen35_fused_shared_scalar_gate_enabled();
+    const std::string joined =
+        lp + "mlp.shared_expert." + (folded ? "gate_up_gate_proj.weight" : "gate_up_proj.weight");
+
+    for (std::uint32_t tp : {1u, 2u}) {
+        const std::string at = " (tp " + std::to_string(tp) + ")";
+        auto target = pie_cuda_driver::cuda_device_target();
+        target.tp_size = tp;
+        target.tp_rank = 0;
+
+        pie_loader::ModelContract contract;
+        try {
+            model::ContractBuilder builder(checkpoint, facts, target, "",
+                                           model::Mxfp4MoeRequest::Auto,
+                                           model::Component::Full,
+                                           /*stream_routed_experts=*/false, contract);
+            model::author_qwen3_5_moe_contract(builder);
+            builder.finish();
+        } catch (const std::exception& error) {
+            check(false, "authoring" + at + ": " + error.what());
+            continue;
+        }
+
+        const auto v = contract.view();
+        std::map<std::string_view, std::vector<std::int64_t>> shapes;
+        for (std::size_t i = 0; i < v.tensors.len; ++i) {
+            const auto& t = v.tensors.ptr[i];
+            shapes[view_of(t.name)] =
+                std::vector<std::int64_t>(t.shape.ptr, t.shape.ptr + t.shape.len);
+        }
+
+        const std::int64_t local = kShared / static_cast<std::int64_t>(tp);
+        check(shapes[joined] ==
+                  std::vector<std::int64_t>{2 * local + (folded ? 1 : 0), kHidden},
+              "the join is this rank's two bands, in row order" + at);
+        // Additive: the fold-into-routed path reads these separately.
+        check(shapes.count(lp + "mlp.shared_expert.gate_proj.weight") == 1 &&
+                  shapes.count(lp + "mlp.shared_expert.up_proj.weight") == 1,
+              "the unfused projections survive beside it" + at);
+        check(shapes[lp + "mlp.shared_expert.gate_proj.weight"] ==
+                  std::vector<std::int64_t>{local, kHidden},
+              "and are themselves sharded" + at);
+
+        try {
+            const pie_loader::PieLoaderContractRequest request =
+                pie_loader::build_contract_request(checkpoint, target, v);
+            const pie_loader::LoadPlan plan = pie_loader::LoadPlan::compile(request);
+            plan.verify(request);
+        } catch (const std::exception& error) {
+            check(false, "compiling" + at + ": " + error.what());
+        }
+    }
+    std::filesystem::remove_all(dir);
 }
 
 /// Qwen3-MoE declares its per-expert weights as a group when asked to stream.
@@ -1258,6 +1498,129 @@ void test_nemotron_h_mamba_splits_on_unit_boundaries() {
 /// its decoder `model.language_model.layers.`: it never fired, and nothing
 /// noticed because the only thing that could have is a test with the real
 /// names in it. Which is what this is.
+/// The speculative head reads the same `lm_head` as the main path, in int8.
+///
+/// Env-gated, so this asserts whichever side of `PIE_QWEN35_MTP_INT8_LM_HEAD`
+/// this process is on. Both are load-bearing: with the flag off there must be
+/// no second view at all, and with it on the bf16 original must survive -- the
+/// main path still reads it, so a re-encode here would be a regression rather
+/// than an optimization.
+void test_qwen3_5_mtp_int8_lm_head() {
+    constexpr std::int64_t kHidden = 8;
+    constexpr std::int64_t kVocab = 32;
+    const std::string p = "model.";
+    const std::string l0 = p + "layers.0.";
+    const std::string m0 = "mtp.layers.0.";
+    const std::filesystem::path dir = write_synthetic_checkpoint(
+        "qwen3_5_mtp_int8", {{p + "embed_tokens.weight", {kVocab, kHidden}},
+                             {p + "norm.weight", {kHidden}},
+                             {"lm_head.weight", {kVocab, kHidden}},
+                             {l0 + "input_layernorm.weight", {kHidden}},
+                             {l0 + "post_attention_layernorm.weight", {kHidden}},
+                             {l0 + "self_attn.q_proj.weight", {kHidden, kHidden}},
+                             {l0 + "self_attn.k_proj.weight", {kHidden, kHidden}},
+                             {l0 + "self_attn.v_proj.weight", {kHidden, kHidden}},
+                             {l0 + "self_attn.o_proj.weight", {kHidden, kHidden}},
+                             {l0 + "mlp.gate_proj.weight", {kHidden, kHidden}},
+                             {l0 + "mlp.up_proj.weight", {kHidden, kHidden}},
+                             {l0 + "mlp.down_proj.weight", {kHidden, kHidden}},
+                             {"mtp.fc.weight", {kHidden, 2 * kHidden}},
+                             {"mtp.norm.weight", {kHidden}},
+                             {"mtp.pre_fc_norm_embedding.weight", {kHidden}},
+                             {"mtp.pre_fc_norm_hidden.weight", {kHidden}},
+                             {m0 + "input_layernorm.weight", {kHidden}},
+                             {m0 + "post_attention_layernorm.weight", {kHidden}},
+                             {m0 + "self_attn.q_proj.weight", {kHidden, kHidden}},
+                             {m0 + "self_attn.k_proj.weight", {kHidden, kHidden}},
+                             {m0 + "self_attn.v_proj.weight", {kHidden, kHidden}},
+                             {m0 + "self_attn.o_proj.weight", {kHidden, kHidden}},
+                             {m0 + "mlp.gate_proj.weight", {kHidden, kHidden}},
+                             {m0 + "mlp.up_proj.weight", {kHidden, kHidden}},
+                             {m0 + "mlp.down_proj.weight", {kHidden, kHidden}}});
+
+    std::string open_error;
+    pie_loader::Checkpoint checkpoint = pie_loader::Checkpoint::open(dir.string(), &open_error);
+    check(static_cast<bool>(checkpoint), "the synthetic checkpoint opens: " + open_error);
+    if (!checkpoint) return;
+
+    const pie_cuda_driver::model::ModelFacts facts{
+        .model_type = "qwen3_5",
+        .quant_method = "",
+        .num_hidden_layers = 1,
+        .num_experts = 0,
+        .head_dim = 0,
+        .mamba_groups = 0,
+    };
+    namespace model = pie_cuda_driver::model;
+
+    auto target = pie_cuda_driver::cuda_device_target();
+    target.tp_size = 1;
+    target.tp_rank = 0;
+
+    pie_loader::ModelContract contract;
+    try {
+        model::ContractBuilder builder(checkpoint, facts, target, "",
+                                       model::Mxfp4MoeRequest::RoutedDecode,
+                                       model::Component::Full, /*stream_routed_experts=*/false,
+                                       contract);
+        model::author_qwen3_5_contract(builder);
+        builder.finish();
+    } catch (const std::exception& error) {
+        check(false, std::string("authoring: ") + error.what());
+        std::filesystem::remove_all(dir);
+        return;
+    }
+
+    const auto v = contract.view();
+    const pie_loader::PieLoaderTensorContractView* head = nullptr;
+    const pie_loader::PieLoaderTensorContractView* original = nullptr;
+    for (std::size_t i = 0; i < v.tensors.len; ++i) {
+        const auto& t = v.tensors.ptr[i];
+        if (view_of(t.name) == "mtp.lm_head") head = &t;
+        if (view_of(t.name) == "lm_head.weight") original = &t;
+    }
+
+    if (model::qwen35_mtp_int8_lm_head_enabled()) {
+        check(head != nullptr, "the int8 speculative head is published");
+        if (head != nullptr) {
+            check(head->encoding.kind ==
+                          static_cast<std::uint32_t>(pie_loader::PieLoaderEncodingKind::Quant) &&
+                      head->encoding.quant.scheme ==
+                          static_cast<std::uint32_t>(pie_loader::PieLoaderQuantScheme::Int8Symmetric),
+                  "the speculative head is int8-symmetric");
+        }
+        // A view, not a re-encode: the main path still reads bf16.
+        check(original != nullptr &&
+                  original->encoding.dtype ==
+                      static_cast<std::uint32_t>(pie_loader::PieLoaderDType::BF16),
+              "the bf16 head survives beside it");
+    } else {
+        check(head == nullptr, "no speculative head without the flag");
+        check(original != nullptr, "the bf16 head is published");
+    }
+
+    try {
+        const pie_loader::PieLoaderContractRequest request =
+            pie_loader::build_contract_request(checkpoint, target, v);
+        const pie_loader::LoadPlan plan = pie_loader::LoadPlan::compile(request);
+        plan.verify(request);
+
+        // The bind reads `engine.quant_meta("mtp.lm_head")`, which the weight
+        // store keys off exactly this table. The scale is named by appending a
+        // suffix to the declaration, and "mtp.lm_head" does not end in
+        // ".weight", so this is the assertion that the name carries.
+        bool attached = false;
+        for (const auto& a : pie_cuda_driver::resolve_quant_attachments(plan.view())) {
+            if (a.tensor_name == "mtp.lm_head") attached = true;
+        }
+        check(attached == model::qwen35_mtp_int8_lm_head_enabled(),
+              "the speculative head's scale reaches the driver's bind table");
+    } catch (const std::exception& error) {
+        check(false, std::string("compiling: ") + error.what());
+    }
+    std::filesystem::remove_all(dir);
+}
+
 void test_qwen3_5_gdn_splits_by_block() {
     constexpr std::int64_t kKey = 8;
     constexpr std::int64_t kValue = 16;
@@ -1325,11 +1688,13 @@ void test_qwen3_5_gdn_splits_by_block() {
             }
 
             std::map<std::string_view, std::vector<std::int64_t>> declared;
+            std::map<std::string_view, std::uint32_t> dtypes;
             const auto v = contract.view();
             for (std::size_t i = 0; i < v.tensors.len; ++i) {
                 const auto& t = v.tensors.ptr[i];
                 declared[view_of(t.name)] =
                     std::vector<std::int64_t>(t.shape.ptr, t.shape.ptr + t.shape.len);
+                dtypes[view_of(t.name)] = t.encoding.dtype;
             }
             const auto shape_is = [&](const std::string& name,
                                       const std::vector<std::int64_t>& want) {
@@ -1337,6 +1702,26 @@ void test_qwen3_5_gdn_splits_by_block() {
                 check(found != declared.end() && found->second == want,
                       "'" + name + "' is this rank's share" + at);
             };
+            // The gated-delta-net kernels take these two as `const float*`.
+            // The checkpoint above is bf16, so the widening has to be the
+            // contract's: bind used to allocate an fp32 copy of each and leave
+            // the bf16 original resident beside it. `dt_bias` is the control --
+            // it sits in the same module, is read as bf16, and must not widen.
+            const auto dtype_is = [&](const std::string& name,
+                                      pie_loader::PieLoaderDType want) {
+                const auto found = dtypes.find(name);
+                check(found != dtypes.end() &&
+                          found->second == static_cast<std::uint32_t>(want),
+                      "'" + name + "' is declared " +
+                          (want == pie_loader::PieLoaderDType::F32 ? "fp32" : "bf16") + at);
+            };
+            dtype_is(la + "A_log", pie_loader::PieLoaderDType::F32);
+            dtype_is(la + "norm.weight", pie_loader::PieLoaderDType::F32);
+            dtype_is(la + "dt_bias", pie_loader::PieLoaderDType::BF16);
+            // A_log is per-value-head, so it shards; the gated norm is over
+            // head_v_dim, which every rank holds whole.
+            shape_is(la + "A_log", {kValue / static_cast<std::int64_t>(tp)});
+            shape_is(la + "norm.weight", {kValue});
             shape_is(la + "conv1d.weight", {local, kConvKernel});
             shape_is(la + "conv1d.bias", {local});
             // Under `PIE_QWEN35_FUSED_GDN_PROJ` the shard is the first leg of
@@ -1398,21 +1783,7 @@ nlohmann::json contract_to_json(const pie_loader::PieLoaderModelContractView& v)
                          {"step", n.step},
                          {"fill_bits", n.fill_bits},
                          {"out_shape", shape_to_json(n.out_shape)},
-                         // A `Repack` carries its offsets as integers, so this
-                         // is where a `tp_rank` can still be baked into a
-                         // contract. Omitting it made the cross-rank diff below
-                         // blind to the one case it must not miss.
-                         {"repack", {{"layout", n.repack.layout},
-                                     {"row_map", n.repack.row_map},
-                                     {"batch", n.repack.batch},
-                                     {"source_rows", n.repack.source_rows},
-                                     {"source_row_offset", n.repack.source_row_offset},
-                                     {"target_rows", n.repack.target_rows},
-                                     {"valid_rows", n.repack.valid_rows},
-                                     {"source_stride_cols", n.repack.source_stride_cols},
-                                     {"source_col_offset", n.repack.source_col_offset},
-                                     {"source_cols", n.repack.source_cols},
-                                     {"target_cols", n.repack.target_cols}}},
+                         {"repack_layout", n.repack_layout},
                          {"out_encoding", {{"kind", n.out_encoding.kind},
                                            {"dtype", n.out_encoding.dtype},
                                            {"quant", quant_to_json(n.out_encoding.quant)}}}});
@@ -1435,9 +1806,28 @@ nlohmann::json contract_to_json(const pie_loader::PieLoaderModelContractView& v)
         }
         tensors.push_back(std::move(entry));
     }
+    // Groups are dumped beside the tensors because the rank-blindness identity
+    // is only as wide as what it compares: a streamed contract declares its
+    // experts *here* and nowhere in `tensors`, so a group that started folding
+    // the rank into its own expression would have gone unseen.
+    nlohmann::json groups = nlohmann::json::array();
+    for (std::size_t i = 0; i < v.groups.len; ++i) {
+        const auto& g = v.groups.ptr[i];
+        nlohmann::json members = nlohmann::json::array();
+        for (std::size_t t = 0; t < g.tensors.len; ++t) {
+            const auto& m = g.tensors.ptr[t];
+            members.push_back({{"name", std::string(view_of(m.name))},
+                               {"root", m.root},
+                               {"shape", shape_to_json(m.shape)}});
+        }
+        groups.push_back({{"name", std::string(view_of(g.name))},
+                          {"arity", g.arity},
+                          {"tensors", std::move(members)}});
+    }
     return {{"alignment", v.alignment},
             {"nodes", std::move(nodes)},
-            {"tensors", std::move(tensors)}};
+            {"tensors", std::move(tensors)},
+            {"groups", std::move(groups)}};
 }
 
 /// Everything that can be checked about a contract without a compiler.
@@ -1575,10 +1965,9 @@ nlohmann::json plan_to_json(const pie_loader::LoadPlanView& p) {
             entry["repack_layout"] = static_cast<int>(op.repack_layout);
             entry["t_batch"] = op.transform_batch;
             entry["t_source_rows"] = op.transform_source_rows;
-            entry["t_source_row_offset"] = op.transform_source_row_offset;
             entry["t_target_rows"] = op.transform_target_rows;
-            entry["t_valid_rows"] = op.transform_valid_rows;
-            entry["t_source_col_offset"] = op.transform_source_col_offset;
+            entry["t_source_cols"] = op.transform_source_cols;
+            entry["t_target_cols"] = op.transform_target_cols;
             break;
         }
         case Tag::CreateView: {
@@ -1723,22 +2112,17 @@ void author_real_contract(const std::string& snapshot, const char* dest) {
         // every affine site can be written that way and the contract comes out
         // identical on every rank.
         //
-        // `Repack` is the exception and cannot be one of these by accident: it
-        // carries `source_row_offset` as an integer a kernel reads, so there is
-        // nowhere to hang a `Shard`. Naming the exception this precisely is the
-        // point — anything else that starts baking a rank fails here.
+        // `Repack` used to be an exception -- it carried `source_row_offset` as
+        // an integer a kernel reads, so there was nowhere to hang a `Shard` --
+        // and this check had to let a repacking family through. It does not any
+        // more: a repack names a layout and takes an expression, so the shard
+        // goes where every other family puts it. There is no exception left.
         if (by_rank.size() > 1 && by_rank.contains("0")) {
             const auto& first = by_rank["0"]["contract"];
-            bool repacks = false;
-            for (const auto& node : first["nodes"]) {
-                if (node["kind"] ==
-                    static_cast<std::uint32_t>(pie_loader::PieLoaderExprKind::Repack)) repacks = true;
-            }
             for (const auto& [rank, entry] : by_rank.items()) {
-                const bool same = entry["contract"] == first;
-                check(same || repacks,
+                check(entry["contract"] == first,
                       "authoring does not read the rank: tp " + std::to_string(tp) +
-                          " rank " + rank + " authors what rank 0 does, or repacks");
+                          " rank " + rank + " must author what rank 0 does");
             }
         }
         by_tp[std::to_string(tp)] = std::move(by_rank);
@@ -1761,6 +2145,346 @@ void author_real_contract(const std::string& snapshot, const char* dest) {
 
 }  // namespace
 
+/// Does the expression published under `name` contain an `Expr::Shard`?
+///
+/// Walks the whole subtree, not just the spine, because the shard sits under a
+/// `Stride` for the interleaved halves and under nothing for the down columns.
+bool expr_contains_shard(const nlohmann::json& contract, const std::string& name) {
+    const auto& nodes = contract["nodes"];
+    std::int64_t root = -1;
+    for (const auto& tensor : contract["tensors"]) {
+        if (tensor["name"] == name) root = tensor["root"].get<std::int64_t>();
+    }
+    if (root < 0) return false;
+
+    std::vector<std::int64_t> stack{root};
+    while (!stack.empty()) {
+        const std::int64_t at = stack.back();
+        stack.pop_back();
+        if (at < 0 || at >= static_cast<std::int64_t>(nodes.size())) continue;
+        const auto& node = nodes[static_cast<std::size_t>(at)];
+        if (node["kind"] ==
+            static_cast<std::uint32_t>(pie_loader::PieLoaderExprKind::Shard)) {
+            return true;
+        }
+        stack.push_back(node["src"].get<std::int64_t>());
+        for (const auto& part : node["parts"]) stack.push_back(part.get<std::int64_t>());
+    }
+    return false;
+}
+
+/// The escape hatch's last rank.
+///
+/// A slot holds this rank's share, and only where the resident path sharded too.
+///
+/// Streaming is a residency decision, so a group under TP has to declare
+/// whatever the resident path would have declared on that rank -- no more and
+/// no less. The two streamed families sit on opposite sides of that:
+///
+///   - Qwen stores a tensor per expert, and the family's TP path bands the
+///     intermediate axis. The group shards each half before the gate/up join,
+///     so a slot is priced at `2*(I/W)*H + H*(I/W)` -- half of what one rank
+///     holds at `tp=1`.
+///   - GPT-OSS packed publishes its expert banks with `push_direct`, unsharded:
+///     every rank holds every expert and the MoE is replicated. A group that
+///     took a band here would *not* match what it replaces, so its slot stays
+///     full width.
+///
+/// Both are rank-blind in the contract: a shard names an axis, and
+/// `Resolver::specialize` is the one pass that knows which rank is asking.
+void test_streamed_expert_groups_follow_the_resident_tp_layout() {
+    constexpr std::int64_t kExperts = 4;
+    constexpr std::int64_t kHidden = 64;
+    constexpr std::int64_t kInter = 32;
+    constexpr std::int64_t kLayers = 2;
+    constexpr std::uint32_t kWorld = 2;
+    constexpr std::int64_t kLocalInter = kInter / kWorld;
+    namespace model = pie_cuda_driver::model;
+
+    std::vector<TypedTensor> common{
+        {"model.embed_tokens.weight", {16, kHidden}, "BF16"},
+        {"model.norm.weight", {kHidden}, "BF16"},
+        {"lm_head.weight", {16, kHidden}, "BF16"},
+    };
+    std::vector<TypedTensor> qwen = common;
+    std::vector<TypedTensor> oss = common;
+    for (int layer = 0; layer < kLayers; ++layer) {
+        const std::string lp = "model.layers." + std::to_string(layer) + ".mlp.";
+        qwen.push_back({lp + "gate.weight", {kExperts, kHidden}, "BF16"});
+        for (int e = 0; e < kExperts; ++e) {
+            const std::string ep = lp + "experts." + std::to_string(e) + ".";
+            qwen.push_back({ep + "gate_proj.weight", {kInter, kHidden}, "BF16"});
+            qwen.push_back({ep + "up_proj.weight", {kInter, kHidden}, "BF16"});
+            qwen.push_back({ep + "down_proj.weight", {kHidden, kInter}, "BF16"});
+        }
+        const std::string ep = lp + "experts.";
+        oss.push_back({ep + "gate_up_proj_blocks",
+                       {kExperts, 2 * kInter, kHidden / 32, 16}, "U8"});
+        oss.push_back({ep + "gate_up_proj_scales",
+                       {kExperts, 2 * kInter, kHidden / 32}, "U8"});
+        oss.push_back({ep + "gate_up_proj_bias", {kExperts, 2 * kInter}, "BF16"});
+        oss.push_back({ep + "down_proj_blocks",
+                       {kExperts, kHidden, kInter / 32, 16}, "U8"});
+        oss.push_back({ep + "down_proj_scales",
+                       {kExperts, kHidden, kInter / 32}, "U8"});
+        oss.push_back({ep + "down_proj_bias", {kExperts, kHidden}, "BF16"});
+    }
+
+    // What one slot is worth on a rank. Spelled from the shapes rather than
+    // from a measured number, so a layout that quietly changed could not drag
+    // the expectation along with it.
+    struct Family {
+        const char* label;
+        const char* model_type;
+        const std::vector<TypedTensor>* tensors;
+        model::Mxfp4MoeRequest mxfp4;
+        void (*author)(model::ContractBuilder&);
+        const char* gate_up_name;
+        const char* down_name;
+        std::vector<std::int64_t> gate_up;
+        std::vector<std::int64_t> down;
+        std::uint64_t slot_bytes;
+    };
+    const Family families[] = {
+        {"qwen3_moe", "qwen3_moe", &qwen, model::Mxfp4MoeRequest::Auto,
+         &model::author_qwen3_5_moe_contract, "gate_up_proj", "down_proj",
+         {2 * kLocalInter, kHidden}, {kHidden, kLocalInter},
+         static_cast<std::uint64_t>(
+             (2 * kLocalInter * kHidden + kHidden * kLocalInter) * 2)},
+        {"gpt_oss", "gpt_oss", &oss, model::Mxfp4MoeRequest::RoutedDecode,
+         &model::author_gpt_oss_contract, "gate_up_proj.weight", "down_proj.weight",
+         {1, 2 * kInter, kHidden / 32, 16}, {1, kHidden, kInter / 32, 16},
+         static_cast<std::uint64_t>(
+             2 * kInter * (kHidden / 32) * 16 + 2 * kInter * (kHidden / 32) +
+             kHidden * (kInter / 32) * 16 + kHidden * (kInter / 32))},
+    };
+
+    for (const Family& family : families) {
+        const std::filesystem::path dir = write_typed_checkpoint(
+            std::string("tp_streamed_") + family.label, *family.tensors);
+        std::string open_error;
+        pie_loader::Checkpoint checkpoint =
+            pie_loader::Checkpoint::open(dir.string(), &open_error);
+        check(static_cast<bool>(checkpoint), std::string(family.label) +
+                  ": the synthetic checkpoint opens: " + open_error);
+        if (!checkpoint) continue;
+
+        const model::ModelFacts facts{
+            .model_type = family.model_type,
+            .quant_method = "",
+            .num_hidden_layers = kLayers,
+            .num_experts = kExperts,
+            .head_dim = 0,
+            .mamba_groups = 0,
+        };
+
+        nlohmann::json first_contract;
+        for (std::uint32_t rank = 0; rank < kWorld; ++rank) {
+            const std::string at = std::string(" (") + family.label + " rank " +
+                                   std::to_string(rank) + " of " +
+                                   std::to_string(kWorld) + ")";
+            auto target = pie_cuda_driver::cuda_device_target();
+            target.tp_size = kWorld;
+            target.tp_rank = rank;
+
+            pie_loader::ModelContract contract;
+            try {
+                model::ContractBuilder builder(checkpoint, facts, target, "",
+                                               family.mxfp4, model::Component::Full,
+                                               /*stream_routed_experts=*/true, contract);
+                family.author(builder);
+                builder.finish();
+            } catch (const std::exception& error) {
+                check(false, "authoring" + at + ": " + error.what());
+                continue;
+            }
+
+            const auto v = contract.view();
+            check(v.groups.len == kLayers, "one group per layer" + at);
+            if (v.groups.len != kLayers) continue;
+            for (std::size_t layer = 0; layer < v.groups.len; ++layer) {
+                std::map<std::string_view, std::vector<std::int64_t>> declared;
+                const auto& g = v.groups.ptr[layer];
+                for (std::size_t i = 0; i < g.tensors.len; ++i) {
+                    const auto& t = g.tensors.ptr[i];
+                    declared[view_of(t.name)] = std::vector<std::int64_t>(
+                        t.shape.ptr, t.shape.ptr + t.shape.len);
+                }
+                check(declared[family.gate_up_name] == family.gate_up,
+                      "gate/up is declared at this rank's width" + at);
+                check(declared[family.down_name] == family.down,
+                      "down is declared at this rank's width" + at);
+            }
+
+            const nlohmann::json dumped = contract_to_json(v);
+            if (rank == 0) {
+                first_contract = dumped;
+            } else {
+                check(dumped == first_contract,
+                      "every rank authors the same contract" + at);
+            }
+
+            try {
+                const pie_loader::PieLoaderContractRequest request =
+                    pie_loader::build_contract_request(checkpoint, target, v);
+                const pie_loader::LoadPlan plan = pie_loader::LoadPlan::compile(request);
+                plan.verify(request);
+                const auto& pv = plan.view();
+                check(pv.groups.len == kLayers, "the plan carries every group" + at);
+                for (std::size_t layer = 0; layer < pv.groups.len; ++layer) {
+                    const auto& pg = pv.groups.ptr[layer];
+                    check(pg.arity == kExperts, "the plan agrees on the arity" + at);
+                    check(pg.plan->memory.persistent_bytes >= family.slot_bytes &&
+                              pg.plan->memory.persistent_bytes <
+                                  family.slot_bytes + 4096,
+                          "a slot is priced at this rank's share: expected " +
+                              std::to_string(family.slot_bytes) + ", got " +
+                              std::to_string(pg.plan->memory.persistent_bytes) + at);
+                }
+            } catch (const std::exception& error) {
+                check(false, std::string("compiling") + at + ": " + error.what());
+            }
+        }
+    }
+}
+
+/// GPT-OSS's native MXFP4 path was the only place a `tp_rank` reached a
+/// contract: a repack spec carried `source_row_offset` as an integer, so the
+/// driver computed `rank * local` while authoring and the contract was valid for
+/// exactly one rank. The cross-rank check in `author_real_contract` had to let
+/// that through, and it only runs against a real snapshot anyway -- so the one
+/// family that broke the rule was also the one nothing checked by default.
+///
+/// The selection is `Shard` and `Stride` now, so this asserts the rule with no
+/// exception: every rank authors byte-identical bytes, and the rank still
+/// reaches the *plan*, which is where it belongs.
+void test_gpt_oss_native_repack_is_rank_blind() {
+    constexpr std::int64_t kExperts = 2;
+    constexpr std::int64_t kHidden = 64;
+    constexpr std::int64_t kInterFull = 128;
+    constexpr std::int64_t kHiddenGroups = kHidden / 32;
+    constexpr std::int64_t kInterGroups = kInterFull / 32;
+
+    const std::string ep = "model.layers.0.mlp.experts.";
+    const std::vector<TypedTensor> tensors{
+        {"model.embed_tokens.weight", {16, kHidden}, "BF16"},
+        {"model.norm.weight", {kHidden}, "BF16"},
+        {"lm_head.weight", {16, kHidden}, "BF16"},
+        // gate and up are interleaved row by row on the fused axis.
+        {ep + "gate_up_proj_blocks", {kExperts, 2 * kInterFull, kHiddenGroups, 16}, "U8"},
+        {ep + "gate_up_proj_scales", {kExperts, 2 * kInterFull, kHiddenGroups}, "U8"},
+        {ep + "gate_up_proj_bias", {kExperts, 2 * kInterFull}, "BF16"},
+        {ep + "down_proj_blocks", {kExperts, kHidden, kInterGroups, 16}, "U8"},
+        {ep + "down_proj_scales", {kExperts, kHidden, kInterGroups}, "U8"},
+        {ep + "down_proj_bias", {kExperts, kHidden}, "BF16"},
+    };
+    const std::filesystem::path dir = write_typed_checkpoint("gpt_oss_native_mxfp4", tensors);
+
+    std::string open_error;
+    pie_loader::Checkpoint checkpoint = pie_loader::Checkpoint::open(dir.string(), &open_error);
+    check(static_cast<bool>(checkpoint), "the synthetic checkpoint opens: " + open_error);
+    if (!checkpoint) return;
+
+    const pie_cuda_driver::model::ModelFacts facts{
+        .model_type = "gpt_oss",
+        .quant_method = "mxfp4",
+        .num_hidden_layers = 1,
+        .num_experts = kExperts,
+        .head_dim = 0,
+        .mamba_groups = 0,
+    };
+    namespace model = pie_cuda_driver::model;
+
+    for (int tp : {1, 2}) {
+        nlohmann::json first_contract;
+        std::vector<nlohmann::json> reads;
+        for (int rank = 0; rank < tp; ++rank) {
+            const std::string at =
+                " (tp " + std::to_string(tp) + " rank " + std::to_string(rank) + ")";
+            auto target = pie_cuda_driver::cuda_device_target();
+            target.tp_size = static_cast<std::uint32_t>(tp);
+            target.tp_rank = static_cast<std::uint32_t>(rank);
+            target.native_mxfp4_moe = true;
+
+            pie_loader::ModelContract contract;
+            try {
+                model::ContractBuilder builder(checkpoint, facts, target, "",
+                                               model::Mxfp4MoeRequest::NativeGemm,
+                                               model::Component::Full,
+                                               /*stream_routed_experts=*/false, contract);
+                model::author_gpt_oss_contract(builder);
+                builder.finish();
+            } catch (const std::exception& error) {
+                check(false, "authoring" + at + ": " + error.what());
+                return;
+            }
+            const auto v = contract.view();
+            const nlohmann::json dumped = contract_to_json(v);
+
+            if (rank == 0) {
+                // Without this the identity below would pass on a contract that
+                // never took the native path at all.
+                int repacks = 0;
+                for (const auto& node : dumped["nodes"]) {
+                    if (node["kind"] == static_cast<std::uint32_t>(
+                                            pie_loader::PieLoaderExprKind::Repack)) {
+                        ++repacks;
+                    }
+                }
+                check(repacks == 6,
+                      "the native path authors a weight and a scale repack for gate, up "
+                      "and down" + at + ": got " + std::to_string(repacks));
+                first_contract = dumped;
+
+                // Each sharded tensor must carry the shard in its *own*
+                // expression. Comparing whole plans is not enough: down_proj's
+                // column shard alone makes two ranks read different bytes, so a
+                // gate_up that quietly stopped sharding would still pass.
+                if (tp > 1) {
+                    for (const char* leaf : {"gate_proj.weight", "gate_proj.bias",
+                                             "up_proj.weight_scale", "down_proj.weight"}) {
+                        check(expr_contains_shard(dumped, ep + leaf),
+                              std::string(leaf) + " selects this rank's band with a Shard" + at);
+                    }
+                }
+            } else {
+                check(dumped == first_contract,
+                      "every rank authors the same contract" + at);
+            }
+
+            const pie_loader::PieLoaderContractRequest request =
+                pie_loader::build_contract_request(checkpoint, target, v);
+            try {
+                const pie_loader::LoadPlan plan = pie_loader::LoadPlan::compile(request);
+                plan.verify(request);
+                nlohmann::json sources = nlohmann::json::array();
+                const nlohmann::json dumped_plan = plan_to_json(plan.view());
+                for (const auto& instr : dumped_plan["instrs"]) {
+                    if (instr.contains("src_tensor")) {
+                        sources.push_back({instr["src_tensor"], instr["src_offset"],
+                                           instr["src_span"]});
+                    }
+                }
+                std::sort(sources.begin(), sources.end(),
+                          [](const nlohmann::json& a, const nlohmann::json& b) {
+                              return a.dump() < b.dump();
+                          });
+                reads.push_back(std::move(sources));
+            } catch (const std::exception& error) {
+                check(false, "compiling" + at + ": " + error.what());
+                return;
+            }
+        }
+        // ...and the rank is not lost, it moved: the target is what selects the
+        // band now, so two ranks must read two different sets of bytes.
+        if (tp > 1) {
+            check(!reads[0].empty(), "the plan reads the checkpoint at all");
+            check(reads[0] != reads[1],
+                  "tp " + std::to_string(tp) + " ranks read different bytes");
+        }
+    }
+}
+
 int main() {
     test_a_handle_names_one_node();
     test_expect_states_a_shape();
@@ -1775,8 +2499,13 @@ int main() {
     test_kimi_stacks_experts_as_bf16();
     test_nemotron_h_mamba_splits_on_unit_boundaries();
     test_qwen3_5_gdn_splits_by_block();
+    test_qwen3_5_mtp_int8_lm_head();
+    test_gpt_oss_native_repack_is_rank_blind();
+    test_qwen3_5_moe_joins_the_shared_expert();
+    test_glm5_dequantizes_kv_b_proj();
     test_qwen3_moe_streams_experts_as_a_group();
     test_gpt_oss_streams_experts_as_a_group();
+    test_streamed_expert_groups_follow_the_resident_tp_layout();
 
     const char* snapshot = std::getenv("PIE_TEST_SNAPSHOT");
     if (snapshot != nullptr) {

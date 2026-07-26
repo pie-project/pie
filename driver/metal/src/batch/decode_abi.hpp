@@ -93,9 +93,13 @@ enum class IoSlot : uint8_t {
     AttnMask       = 15, // u8[N,mask_stride] dense allow mask
     AttnMaskStride = 16, // u32[1] dense mask row stride
     AttnMaskEnabled= 17, // u8[N] 1 iff row consumes AttnMask
+    // Which rows the fire will SAMPLE, in readout order. The tail runs over
+    // these and no others: a prefill computes every row of the body but reads
+    // one per request, and the LM head is the step's most expensive dispatch.
+    SampleRows     = 18, // u32[S] — row indices into the body's [N, hidden]
 };
 inline constexpr int kIoSlotCount =
-    static_cast<int>(IoSlot::AttnMaskEnabled) + 1;
+    static_cast<int>(IoSlot::SampleRows) + 1;
 
 // ── Per-kernel binding indices (arg order the encoder binds into MTL4ArgumentTable) ──
 // Grounded in MLX's host-side dispatch arg order, adjusted for I1 (scalars→buffers).
@@ -138,6 +142,15 @@ enum class SdpaPaged : uint8_t {
     KvPageIndptr = 8,    // IoSlot::KvPageIndptr
     PageSize = 9, NKvHeads = 10, Scale = 11,
     AttnMask = 12, AttnMaskStride = 13, AttnMaskEnabled = 14,
+    // Sliding window, in positions. <=0 is full attention. Full-attention
+    // families must still BIND it -- one kernel serves both, so an unbound slot
+    // is a window read out of uninitialized memory, which is wrong attention
+    // rather than a crash.
+    Window = 15,
+    // gpt-oss's learned per-head scalar, which joins the softmax denominator as
+    // though it were one more key. Bound only by the family that has one; the
+    // `sink` instantiation is a separate pipeline, so the others never read it.
+    Sinks = 16,
 };
 
 // rms_single_row: group=(row/N_READS), grid=(1,1,1). Buffer 3 is a packed
@@ -170,7 +183,12 @@ enum class Rope : uint8_t { X = 0, Position = 1, Scale = 2, Base = 3, HeadDim = 
 // embedding gather (4-bit dequant of the shared lm_head bundle; tied). TokenId is
 // IO::TokenId (I1). Matches embed_gather.metal: W/Scales/Biases (same 4-bit packing
 // as Qmv) + token id + out + hidden. Bound to the SAME lm_head slots as QmvLmHead.
-enum class Embed : uint8_t { W = 0, Scales = 1, Biases = 2, TokenId = 3, Out = 4, Hidden = 5 };
+enum class Embed : uint8_t {
+    W = 0, Scales = 1, Biases = 2, TokenId = 3, Out = 4, Hidden = 5,
+    // gemma4's `embed_gather_scaled_4bit` only. qwen3.5 runs the unscaled
+    // instantiation, which has no buffer 6 to bind.
+    Scale = 6,
+};
 
 // KV append (in-place write at position): Pos is IO::Position (I1). Matches kv_append.metal:
 //   0=k_new, 1=v_new, 2=k_cache, 3=v_cache, 4=pos(IO), 5=head_dim, 6=k_head_stride
@@ -289,6 +307,110 @@ enum class GatedRms : uint8_t { X = 0, Z = 1, W = 2, Out = 3, Params = 4 };
 // inert until the resident-loop / M>1 wiring binds them.
 enum class Argmax : uint8_t { Logits = 0, NextToken = 1, Params = 2, EosFlag = 3 };
 
+// ── Gemma 4 ────────────────────────────────────────────────────────────────
+// Six kernels shipped with this family's bring-up and were never bound to
+// anything: their .metal sources exist, and nothing named their buffers. These
+// are those ABIs, written against the sources rather than from memory.
+//
+// The params structs they take are mirrored host-side in the gemma4 consts.
+
+// sdpa_sliding.metal `sdpa_vector_decode_swa`. bind::Sdpa's layout plus the
+// window, deliberately: the shared prefix means one binder serves both, and a
+// sliding layer differs from a full one only by that last value.
+enum class SdpaSliding : uint8_t {
+    Q = 0, K = 1, V = 2, Out = 3, GqaFactor = 4, N = 5,
+    KHeadStride = 6, KSeqStride = 7, VHeadStride = 8, VSeqStride = 9, Scale = 10,
+    Window = 11,   // attend the last `window` positions; <=0 means all of them
+    // Stated by the caller rather than inferred: decode's Q is one row, a
+    // prefill's is [M, n_heads*D] from a GEMM, and a kernel that guessed wrong
+    // between them would read plausible garbage instead of failing.
+    QRowStride = 12,
+    ORowStride = 13,
+};
+
+// geglu_tanh.metal: out = gelu_tanh(gate) * up. Gemma's FFN nonlinearity, where
+// qwen3.5 uses SwiGLU — same two operands, different curve.
+enum class Geglu : uint8_t { Gate = 0, Up = 1, Out = 2, Params = 3 };
+
+// logit_softcap.metal: out = cap * tanh(logits / cap), over the vocabulary.
+enum class Softcap : uint8_t { Logits = 0, Out = 1, Params = 2 };
+
+// row_gather.metal: out[i,:] = in[rows[i],:] — the fire's sampled rows, dense.
+enum class RowGather : uint8_t { In = 0, Out = 1, Rows = 2, Params = 3 };
+
+// layer_scalar.metal: out = x * scalar[0]. A learned per-layer gain, broadcast.
+enum class LayerScalar : uint8_t { X = 0, Scalar = 1, Out = 2, Params = 3 };
+
+// ple_combine.metal: out = (proj + token) * 1/sqrt(2), over n_layers*ple_dim.
+enum class PleCombine : uint8_t { Proj = 0, Token = 1, Out = 2, Params = 3 };
+
+// vnorm.metal `vnorm_single_row`: RMS with NO learnable weight, applied to V
+// before the KV write. Distinct from bind::Rms, which always has one.
+enum class VNorm : uint8_t { X = 0, Out = 1, Params = 2 };
+
+// rms_norm.metal `rms_residual` / `rms_residual_scaled` (gemma4): the norm
+// sandwich's second half and the residual add it always precedes, in one
+// dispatch. `bind::Rms`'s four slots verbatim, so the weight bind is shared,
+// plus the residual and (scaled variant only) the learned per-layer gain.
+//
+//   out = rms_norm(x) * w + r            [* s[0]]
+// ── GPT-OSS ────────────────────────────────────────────────────────────────
+// The matvec, plus the two things every projection in this family has that no
+// other one does: an additive bias, and (for the MoE) an expert index the GPU
+// picked. `bind::Qmv`'s seven slots verbatim, so the weight binds are shared.
+enum class GoQmv : uint8_t {
+    W = 0, Scales = 1, Biases = 2, X = 3, Out = 4, K = 5, N = 6,
+    Bias = 7,        // the Linear's additive bias -- NOT `Biases`, the zero point
+    ExpertIds = 8,   // routed projections only: [experts_per_token] from the router
+    // Whether the INPUT is per-expert as well as the weight. `gate` and `up`
+    // read one shared norm output (0); `down` reads the SwiGLU's k-wide stack
+    // (K). Stated rather than inferred from the kind, because a kernel that
+    // guessed would read four copies of the first expert's activation and
+    // produce a plausible wrong token.
+    XSlotStride = 9,
+    // The token row's pitch in `x`. Stated rather than assumed to be K, because
+    // `down` reads the SwiGLU's [rows, k, intermediate] stack, whose row is k
+    // times as wide as its slot.
+    XRowStride = 10,
+    // How many expert slots each row selects, so a routed dispatch can find
+    // ITS row's ids: at M>1 every row routes independently, which is why a
+    // batched MoE is not one wider matmul.
+    SlotsPerRow = 11,
+};
+
+// router_topk: top-k over the router's logits, then a softmax over the k that
+// survive. Emits both halves of the routing decision.
+enum class GoRouterTopK : uint8_t { Logits = 0, Ids = 1, Weights = 2, Params = 3 };
+
+// gptoss_swiglu: gate*sigmoid(alpha*gate) * (up+1), both operands clamped.
+enum class GoSwiGlu : uint8_t { Gate = 0, Up = 1, Out = 2, Params = 3 };
+
+// expert_combine: the weighted sum of the k experts' outputs.
+enum class GoExpertCombine : uint8_t { Y = 0, Weights = 1, Out = 2, Params = 3 };
+
+// sdpa_vector_decode_sink: bind::SdpaSliding verbatim plus the per-head sink.
+enum class SdpaSink : uint8_t {
+    Q = 0, K = 1, V = 2, Out = 3, GqaFactor = 4, N = 5,
+    KHeadStride = 6, KSeqStride = 7, VHeadStride = 8, VSeqStride = 9, Scale = 10,
+    Window = 11, QRowStride = 12, ORowStride = 13,
+    Sinks = 14,
+};
+
+// rope_neox_freqs_decode: the frequencies are a TABLE, not a base. Whatever
+// closed form produced them (YaRN here) is the host's arithmetic, done once.
+enum class RopeFreqs : uint8_t {
+    X = 0, Position = 1, Scale = 2, InvFreq = 3, HeadDim = 4,
+    MScale = 5,  // YaRN's attention-temperature correction on q and k
+    // `rope_neox_freqs_mb` only: the token row's pitch, `n_heads * head_dim`.
+    // Not derivable from the grid -- q and k have different head counts and
+    // share the kernel.
+    RowStride = 6,
+};
+
+enum class RmsResidual : uint8_t {
+    X = 0, W = 1, Out = 2, Params = 3, Residual = 4, Scalar = 5,
+};
+
 }  // namespace bind
 
 // Argmax kernel constant (argmax.metal:struct ArgmaxParams) — replicated EXACTLY.
@@ -325,6 +447,46 @@ enum class Kernel : uint8_t {
     // Multi-batch-only variants.  APPEND ONLY: all pre-existing serialized
     // Kernel values are part of the M=1 argument-table ABI.
     KvAppendPaged, SdpaPaged, GdnCoreSlotted, GdnPrepSlotted,
+    // ── Gemma 4. APPEND ONLY, same rule as above. ──
+    // Only the kinds whose WEIGHT NAME or ABI differs from a qwen3.5 kind are
+    // here; the rest of the family reuses them, because `self_attn.q_proj` is
+    // `self_attn.q_proj` in both and the consts are bound per ordinal rather
+    // than per kind. The exception is the norm sandwich: gemma4 has four norms
+    // per layer where qwen3.5 has two, so `FfnRms`'s name is already taken by
+    // `post_attention_layernorm` and all three of the others need their own.
+    G4AttnPostNorm,      // post_attention_layernorm
+    G4FfnPreNorm,        // pre_feedforward_layernorm
+    G4FfnPostNorm,       // post_feedforward_layernorm
+    G4VNorm,             // weightless RMS on V, before the KV write
+    G4Geglu,             // gelu_tanh(gate) * up
+    G4LayerScalar,       // learned per-layer gain
+    G4Softcap,           // cap * tanh(logits / cap)
+    G4RowGather,         // the sampled rows, compacted before the tail
+    G4SdpaSliding,       // sliding-window decode attention
+    // Per-Layer Embeddings.
+    G4PleTokenGather,    // embed_tokens_per_layer
+    G4PleProjGemv,       // per_layer_model_projection
+    G4PleProjNorm,       // per_layer_projection_norm
+    G4PleCombine,        // (proj + token) * 1/sqrt(2)
+    G4PleGateGemv,       // per_layer_input_gate
+    G4PleGeglu,          // gelu_tanh(gate) * ple
+    G4PleProjLayerGemv,  // per_layer_projection
+    G4PleNorm,           // post_per_layer_input_norm
+    G4PleResidual,       // hidden += ple
+    // Fused: the norm sandwich's closing norm and the residual add it always
+    // precedes. Three per layer, so three barriers a layer at ~5.8 us each.
+    G4AttnPostResidual,  // rms(block)*post_attention_layernorm + resid
+    G4FfnPostResidual,   // rms(block)*post_feedforward_layernorm + resid
+    G4PleResidualScaled, // (rms(ple)*post_per_layer_input_norm + resid)*layer_scalar
+    // ── GPT-OSS. Its embedding and head are separate tensors, and every
+    // projection is biased, so none of the shared kinds' weight maps fit.
+    GoEmbed,             // model.embed_tokens (quantized, NOT tied)
+    GoLmHead,            // lm_head (quantized, its own tensor)
+    GoQmvQ, GoQmvK, GoQmvV, GoQmvO,
+    GoSdpaSink,          // self_attn.sinks
+    GoRouter,            // mlp.router (8-bit affine) + its bias
+    GoExpertGate, GoExpertUp, GoExpertDown,
+    GoRouterTopK, GoSwiGlu, GoExpertCombine
 };
 
 // ── Bucketed command-buffer key (relaxes "byte-identical CB" → "byte-identical

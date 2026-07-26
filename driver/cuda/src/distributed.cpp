@@ -15,6 +15,103 @@
 
 namespace pie_cuda_driver {
 
+namespace {
+
+/// Copy a known pattern from `src` to `dst` over the peer path and check it
+/// arrives. Returns false on any CUDA error or on a mismatch.
+///
+/// `cudaDeviceCanAccessPeer` answers "is there a path the driver is willing to
+/// map", not "does traffic over that path arrive". On a PCIe box with ACS
+/// enabled upstream of the GPUs -- the common case inside a VM or a container
+/// on a virtualised host -- the answer is yes for every pair and peer copies
+/// then land as zeros, silently. So ask the question that matters by moving
+/// bytes.
+bool peer_copy_round_trips(int src, int dst) {
+    constexpr int kCount = 64;
+    constexpr std::size_t kBytes = kCount * sizeof(std::uint32_t);
+
+    std::vector<std::uint32_t> pattern(kCount);
+    for (int i = 0; i < kCount; ++i) {
+        pattern[static_cast<std::size_t>(i)] = 0xA5A50000u ^ static_cast<std::uint32_t>(i * 2654435761u);
+    }
+
+    void* src_buf = nullptr;
+    void* dst_buf = nullptr;
+    bool ok = false;
+
+    if (cudaSetDevice(src) != cudaSuccess) return false;
+    // Enable the direct mapping the real collectives use. Already-enabled is
+    // success for our purposes; anything else means there is no peer path.
+    const cudaError_t peer = cudaDeviceEnablePeerAccess(dst, 0);
+    if (peer != cudaSuccess && peer != cudaErrorPeerAccessAlreadyEnabled) {
+        cudaGetLastError();
+        return false;
+    }
+    if (cudaMalloc(&src_buf, kBytes) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    if (cudaMemcpy(src_buf, pattern.data(), kBytes, cudaMemcpyHostToDevice) ==
+        cudaSuccess) {
+        if (cudaSetDevice(dst) == cudaSuccess &&
+            cudaMalloc(&dst_buf, kBytes) == cudaSuccess) {
+            std::vector<std::uint32_t> got(kCount, 0u);
+            // Poison the destination so "nothing arrived" cannot be mistaken
+            // for "the pattern arrived".
+            if (cudaMemset(dst_buf, 0, kBytes) == cudaSuccess &&
+                cudaMemcpyPeer(dst_buf, dst, src_buf, src, kBytes) ==
+                    cudaSuccess &&
+                cudaDeviceSynchronize() == cudaSuccess &&
+                cudaMemcpy(got.data(), dst_buf, kBytes,
+                           cudaMemcpyDeviceToHost) == cudaSuccess) {
+                ok = got == pattern;
+            }
+        }
+    }
+
+    if (dst_buf != nullptr) {
+        cudaSetDevice(dst);
+        cudaFree(dst_buf);
+    }
+    if (src_buf != nullptr) {
+        cudaSetDevice(src);
+        cudaFree(src_buf);
+    }
+    cudaGetLastError();
+    return ok;
+}
+
+}  // namespace
+
+bool p2p_transport_usable() {
+    static const bool usable = [] {
+        int devices = 0;
+        if (cudaGetDeviceCount(&devices) != cudaSuccess || devices < 2) {
+            return false;
+        }
+        int original = 0;
+        if (cudaGetDevice(&original) != cudaSuccess) return false;
+
+        bool ok = true;
+        for (int src = 0; ok && src < devices; ++src) {
+            for (int dst = 0; dst < devices; ++dst) {
+                if (src == dst) continue;
+                int can_access = 0;
+                if (cudaDeviceCanAccessPeer(&can_access, src, dst) !=
+                        cudaSuccess ||
+                    can_access == 0 || !peer_copy_round_trips(src, dst)) {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        cudaSetDevice(original);
+        cudaGetLastError();
+        return ok;
+    }();
+    return usable;
+}
+
 std::string nccl_unique_id_to_hex(const ncclUniqueId& id) {
     static const char* k = "0123456789abcdef";
     const auto* p = reinterpret_cast<const std::uint8_t*>(&id);
@@ -108,24 +205,20 @@ NcclComm::NcclComm(int world_size, int rank, const ncclUniqueId& uid)
         // But that also gives up NVLink on machines that have it. Probe the
         // topology instead: keep P2P when every visible device can reach every
         // other directly, disable it only where the original hazard exists.
+        //
+        // "Can reach" has to be measured, not asked. `cudaDeviceCanAccessPeer`
+        // returns 1 for all 64 pairs on a PCIe box whose peer copies land as
+        // zeros, so trusting it left P2P on exactly where it is broken -- and
+        // a broken peer path does not announce itself: NCCL hangs on the first
+        // collective, or worse, reduces zeros and the model emits fluent
+        // nonsense. `p2p_transport_usable` moves bytes and checks them.
         if (std::getenv("NCCL_P2P_DISABLE") != nullptr) return;
-        int devices = 0;
-        bool fully_connected = cudaGetDeviceCount(&devices) == cudaSuccess &&
-                               devices > 1;
-        for (int src = 0; fully_connected && src < devices; ++src) {
-            for (int dst = 0; dst < devices; ++dst) {
-                if (src == dst) continue;
-                int can_access = 0;
-                if (cudaDeviceCanAccessPeer(&can_access, src, dst) !=
-                        cudaSuccess ||
-                    can_access == 0) {
-                    fully_connected = false;
-                    break;
-                }
-            }
-        }
-        if (!fully_connected) {
+        if (!p2p_transport_usable()) {
             setenv("NCCL_P2P_DISABLE", "1", /*overwrite=*/0);
+            std::fprintf(stderr,
+                         "[pie-driver-cuda] peer-to-peer transport failed a "
+                         "round-trip check; disabling NCCL P2P and the custom "
+                         "all-reduce (collectives stage through the host)\n");
         }
     });
     ncclConfig_t config = NCCL_CONFIG_INITIALIZER;

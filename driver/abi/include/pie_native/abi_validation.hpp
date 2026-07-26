@@ -497,6 +497,12 @@ inline int validate_step_desc(const PieStepDesc* desc,
     PIE_VALIDATE_SLICE(rs_fold_lens);
     PIE_VALIDATE_SLICE(rs_buffer_slot_ids);
     PIE_VALIDATE_SLICE(rs_buffer_slot_indptr);
+    PIE_VALIDATE_SLICE(rs_buffer_read_slot_ids);
+    PIE_VALIDATE_SLICE(rs_buffer_read_indptr);
+    PIE_VALIDATE_SLICE(rs_buffer_read_lens);
+    PIE_VALIDATE_SLICE(rs_buffer_heads);
+    PIE_VALIDATE_SLICE(rs_translation);
+    PIE_VALIDATE_SLICE(rs_translation_indptr);
     PIE_VALIDATE_SLICE(sampling_indices);
     PIE_VALIDATE_SLICE(sampling_indptr);
     PIE_VALIDATE_SLICE(context_ids);
@@ -553,6 +559,8 @@ inline int validate_step_desc(const PieStepDesc* desc,
              desc->rs_fold_lens.len,
              desc->rs_buffer_slot_ids.len,
              desc->rs_buffer_slot_indptr.len,
+             desc->rs_translation.len,
+             desc->rs_translation_indptr.len,
              desc->masks.request_indptr.len,
              desc->masks.word_indptr.len,
              desc->masks.words.len,
@@ -661,7 +669,16 @@ inline int validate_step_desc(const PieStepDesc* desc,
     const bool has_rs_fold_lens = desc->rs_fold_lens.len != 0;
     for (std::size_t i = 0; i < desc->rs_slot_flags.len; ++i) {
         const std::uint8_t flags = desc->rs_slot_flags.ptr[i];
-        if ((flags & ~(PIE_RS_FLAG_RESET | PIE_RS_FLAG_FOLD)) != 0) {
+        if ((flags & ~(PIE_RS_FLAG_RESET | PIE_RS_FLAG_FOLD |
+                       PIE_RS_FLAG_BUFFER_WRITE |
+                       PIE_RS_FLAG_FOLD_LEN_DEVICE)) != 0) {
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
+        // A device-resident fold length is only meaningful on a folding row,
+        // and its wire slot must carry the host's non-zero upper bound so the
+        // clamp in composition has something to clamp against.
+        if ((flags & PIE_RS_FLAG_FOLD_LEN_DEVICE) != 0 &&
+            (flags & PIE_RS_FLAG_FOLD) == 0) {
             return PIE_STATUS_INVALID_ARGUMENT;
         }
         const bool folds = (flags & PIE_RS_FLAG_FOLD) != 0;
@@ -725,6 +742,14 @@ inline int validate_step_desc(const PieStepDesc* desc,
         : validate_csr(
               desc->rs_buffer_slot_indptr,
               desc->rs_buffer_slot_ids.len,
+              wire_row_count);
+    if (status != PIE_STATUS_OK) return status;
+    status = defer_rs_outer
+        ? validate_deferred_outer_csr(
+              desc->rs_translation_indptr, desc->rs_translation.len)
+        : validate_csr(
+              desc->rs_translation_indptr,
+              desc->rs_translation.len,
               wire_row_count);
     if (status != PIE_STATUS_OK) return status;
     status = validate_csr(

@@ -6,7 +6,7 @@
 //! `log p_expert - lambda * log p_amateur`, restricted to tokens whose expert
 //! probability is at least `alpha` times the expert's maximum probability.
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, chat, model as wit_model};
 use serde::Deserialize;
 

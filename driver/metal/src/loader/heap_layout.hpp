@@ -71,7 +71,7 @@ inline HeapPlan plan_heap(const DecodeGeometry& g,
 
     // ── KV (append-only, full-attn layers only) ──
     int n_full = 0;
-    for (int L = 0; L < g.n_layers; ++L) n_full += DecodeGeometry::is_full_attn(L) ? 1 : 0;
+    for (int L = 0; L < g.n_layers; ++L) n_full += g.is_full_attn(L) ? 1 : 0;
     // per full-attn layer: k + v, each [n_kv_heads, max_ctx, head_dim] act-dtype.
     p.kv_per_layer = size_t(2) * g.n_kv_heads * max_ctx * g.head_dim * act_dtype_bytes;
     p.kv_bytes = align_region(size_t(n_full) * p.kv_per_layer);

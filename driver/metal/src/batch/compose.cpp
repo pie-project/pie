@@ -1,12 +1,16 @@
 #include <pie_native/step_launch.hpp>
 #include "batch/compose.hpp"
 
+#include <stdexcept>
 #include <algorithm>
 
 namespace pie::metal::batch {
 
 namespace {
 
+constexpr std::uint8_t kRsFlagFold = 2;
+constexpr std::uint8_t kRsFlagBufferWrite = 4;
+constexpr std::uint8_t kRsFlagFoldLenDevice = 8;
 constexpr std::uint8_t kRsFlagReset = 1;
 
 template <typename T>
@@ -53,6 +57,127 @@ pie_native::LaunchView build_launch_view(const pie_native::StepLaunch& launch) {
         pie_native::slice_from_u32(
             launch.rs_buffer_slot_indptr.ptr,
             launch.rs_buffer_slot_indptr.len);
+    // The buffer READ path is CUDA-only. Metal has no extended token layout,
+    // so it would run the new tokens' recurrence from the FOLDED state and
+    // silently ignore what is already buffered -- a wrong answer that then
+    // gets folded and cannot be recovered. Refuse instead.
+    if (launch.rs_buffer_read_lens.len != 0 &&
+        std::any_of(launch.rs_buffer_read_lens.ptr,
+                    launch.rs_buffer_read_lens.ptr +
+                        launch.rs_buffer_read_lens.len,
+                    [](std::uint32_t len) { return len != 0; })) {
+        throw std::runtime_error(
+            "this driver cannot replay buffered recurrent tokens; fold the "
+            "buffer before appending to it");
+    }
+    // A device-resident fold length is CUDA-only too, and it fails in the
+    // quietest way of all: the wire slot carries the host's UPPER BOUND, so
+    // this driver would read a perfectly well-formed number and fold the whole
+    // buffer instead of the prefix the device actually accepted. There is no
+    // descriptor resolution here to substitute the real value.
+    if (launch.rs_slot_flags.len != 0 &&
+        std::any_of(launch.rs_slot_flags.ptr,
+                    launch.rs_slot_flags.ptr + launch.rs_slot_flags.len,
+                    [](std::uint8_t f) {
+                        return (f & kRsFlagFoldLenDevice) != 0;
+                    })) {
+        throw std::runtime_error(
+            "this driver cannot resolve a device-resident fold length; read "
+            "the length back to the host and pass it as a constant");
+    }
+    // Likewise for a mid-page fold: this driver's buffer gather/scatter treat
+    // logical buffer token 0 as physical offset 0, so a non-zero head would
+    // read the tokens a fold already absorbed and overwrite the live ones.
+    if (launch.rs_buffer_heads.len != 0 &&
+        std::any_of(launch.rs_buffer_heads.ptr,
+                    launch.rs_buffer_heads.ptr + launch.rs_buffer_heads.len,
+                    [](std::uint32_t head) { return head != 0; })) {
+        throw std::runtime_error(
+            "this driver cannot address a buffer whose first live token is "
+            "mid-page; fold whole pages only");
+    }
+    // A fold boundary landing strictly INSIDE a fire's own new tokens needs
+    // the 2R-segment two-call shape: the row is cut at the boundary, the head
+    // persists the state there and the tail continues from it without moving
+    // it again. This driver issues one call per fire and would fold the whole
+    // row, leaving the host believing tokens are still buffered that the
+    // device has already absorbed -- a double fold on the next fire.
+    // The per-row refusals below are SAFETY checks, so an unexpected shape
+    // must fail rather than skip them: silently admitting a fire because its
+    // arrays did not line up is exactly the outcome the checks exist to
+    // prevent.
+    if (launch.rs_fold_lens.len != 0 &&
+        (launch.rs_slot_flags.len != launch.rs_fold_lens.len ||
+         launch.qo_indptr.len != launch.rs_fold_lens.len + 1)) {
+        throw std::runtime_error(
+            "malformed RS launch: per-row fold lengths, slot flags and the "
+            "token CSR must agree on the row count");
+    }
+    if (launch.rs_fold_lens.len != 0) {
+        for (std::size_t r = 0; r < launch.rs_fold_lens.len; ++r) {
+            if ((launch.rs_slot_flags.ptr[r] & kRsFlagBufferWrite) == 0) continue;
+            const std::uint32_t n = launch.rs_fold_lens.ptr[r];
+            // Reads are refused above, so the extended row IS the fire's own
+            // tokens and the boundary is directly comparable to their count.
+            const std::uint32_t rows =
+                launch.qo_indptr.ptr[r + 1] - launch.qo_indptr.ptr[r];
+            if (n != 0 && n < rows) {
+                throw std::runtime_error(
+                    "this driver cannot land a fold boundary inside a fire's "
+                    "own tokens; fold the whole row or none of it");
+            }
+        }
+    }
+    // A row spanning NO TOKENS is how a guest says "compute nothing, only
+    // move the recurrent boundary". This driver has no replay path at all
+    // (the read refusal above), so such a row would run an empty forward and
+    // move nothing, leaving the host believing a fold happened.
+    if (launch.rs_fold_lens.len != 0) {
+        for (std::size_t r = 0; r < launch.rs_fold_lens.len; ++r) {
+            if (launch.qo_indptr.ptr[r + 1] == launch.qo_indptr.ptr[r]) {
+                throw std::runtime_error(
+                    "this driver cannot replay a buffered prefix, so a request "
+                    "row carrying no tokens would fold nothing; fold in a fire "
+                    "that computes");
+            }
+        }
+    }
+    // And likewise for a MIXED fire, where one row folds its recurrence while
+    // another only buffers. The two shapes are the same dispatch and differ
+    // only in whether the state persists, which CUDA expresses as a per-row
+    // mask; this driver has only the pass-level flag, so it would fold every
+    // row or none of them. Either way one row's state is wrong and the error
+    // is unrecoverable once folded.
+    if (launch.rs_slot_flags.len != 0 &&
+        launch.rs_buffer_slot_indptr.len != launch.rs_slot_flags.len + 1) {
+        throw std::runtime_error(
+            "malformed RS launch: the buffer-slot CSR and the per-row slot "
+            "flags must agree on the row count");
+    }
+    if (launch.rs_slot_flags.len != 0) {
+        const auto persists = [&](std::size_t r) {
+            const bool buffered =
+                launch.rs_buffer_slot_indptr.ptr[r + 1] >
+                launch.rs_buffer_slot_indptr.ptr[r];
+            return !buffered ||
+                (launch.rs_slot_flags.ptr[r] & kRsFlagFold) != 0;
+        };
+        for (std::size_t r = 1; r < launch.rs_slot_flags.len; ++r) {
+            if (persists(r) != persists(0)) {
+                throw std::runtime_error(
+                    "this driver cannot fold one request's recurrent state while "
+                    "another only buffers; split the fire");
+            }
+        }
+    }
+    view.rs_translation =
+        pie_native::slice_from_u32(
+            launch.rs_translation.ptr,
+            launch.rs_translation.len);
+    view.rs_translation_indptr =
+        pie_native::slice_from_u32(
+            launch.rs_translation_indptr.ptr,
+            launch.rs_translation_indptr.len);
     view.sampling_indices =
         pie_native::slice_from_u32(
             launch.sampling_indices.ptr,
@@ -102,6 +227,10 @@ OwnedLaunchView OwnedLaunchView::capture(const pie_native::StepLaunch& launch) {
         copy_slice(
             launch.rs_buffer_slot_indptr.ptr,
             launch.rs_buffer_slot_indptr.len);
+    owned.rs_translation =
+        copy_slice(launch.rs_translation.ptr, launch.rs_translation.len);
+    owned.rs_translation_indptr =
+        copy_slice(launch.rs_translation_indptr.ptr, launch.rs_translation_indptr.len);
     owned.sampling_indices =
         copy_slice(launch.sampling_indices.ptr, launch.sampling_indices.len);
     owned.sampling_indptr =
@@ -143,6 +272,10 @@ pie_native::LaunchView OwnedLaunchView::view() const {
         rs_buffer_slot_ids.data(), rs_buffer_slot_ids.size());
     view.rs_buffer_slot_indptr = pie_native::slice_from_u32(
         rs_buffer_slot_indptr.data(), rs_buffer_slot_indptr.size());
+    view.rs_translation =
+        pie_native::slice_from_u32(rs_translation.data(), rs_translation.size());
+    view.rs_translation_indptr = pie_native::slice_from_u32(
+        rs_translation_indptr.data(), rs_translation_indptr.size());
     view.sampling_indices =
         pie_native::slice_from_u32(sampling_indices.data(), sampling_indices.size());
     view.sampling_indptr =

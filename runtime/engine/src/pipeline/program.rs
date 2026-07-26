@@ -79,6 +79,14 @@ pub struct RegisteredProgram {
     /// This program in the shape a driver executes it, built on first use.
     /// See [`Self::launch`].
     launch: std::sync::OnceLock<pie_driver_abi::plan::LaunchPackage>,
+    /// Static geometry-derivability taint, and the per-pass shadow fold
+    /// schedule derived from it. Both are functions of `bound` alone, and a
+    /// program is registered once but instantiated many times — at a cohort
+    /// boundary a whole herd instantiates at once, so re-deriving a
+    /// whole-trace taint fixpoint per instance lands squarely on the
+    /// critical path.
+    geometry_taint: std::sync::OnceLock<pie_eval::pareval::GeometryTaint>,
+    shadow_plan: std::sync::OnceLock<Arc<crate::pipeline::fire::shadow::ShadowPlan>>,
     /// Registration-time pricing. Computed by [`price`] on every register,
     /// but nothing consumes it yet (thrust-2 capacity accounting is
     /// unwired) — the `allow` marks that gap rather than hiding it.
@@ -103,6 +111,24 @@ impl RegisteredProgram {
     pub fn launch(&self) -> &pie_driver_abi::plan::LaunchPackage {
         self.launch
             .get_or_init(|| pie_codegen::launch::build(&self.bound, &self.compiled_stages))
+    }
+
+    /// Whether the host can derive this program's submission geometry, and
+    /// which channels the device decides. Derived once — see the field.
+    pub fn geometry_taint(&self) -> &pie_eval::pareval::GeometryTaint {
+        self.geometry_taint
+            .get_or_init(|| pie_eval::pareval::geometry_taint(&self.bound))
+    }
+
+    /// The per-pass fold schedule every instance's [`HostShadow`] runs.
+    ///
+    /// [`HostShadow`]: crate::pipeline::fire::shadow::HostShadow
+    pub fn shadow_plan(&self) -> Arc<crate::pipeline::fire::shadow::ShadowPlan> {
+        Arc::clone(self.shadow_plan.get_or_init(|| {
+            Arc::new(crate::pipeline::fire::shadow::ShadowPlan::derive(
+                &self.bound,
+            ))
+        }))
     }
 
     /// Every per-region decision the CUDA driver derives for itself in
@@ -226,6 +252,8 @@ impl Registry {
             compiled_stages,
             channel_accesses,
             launch,
+            geometry_taint: std::sync::OnceLock::new(),
+            shadow_plan: std::sync::OnceLock::new(),
             pricing,
             emitted: Mutex::new(HashMap::new()),
         });
@@ -678,6 +706,8 @@ mod tests {
                 compiled_stages: program.compiled_stages.clone(),
                 channel_accesses: program.channel_accesses.clone(),
                 launch: program.launch.clone(),
+                geometry_taint: program.geometry_taint.clone(),
+                shadow_plan: program.shadow_plan.clone(),
                 pricing: program.pricing,
                 emitted: Mutex::new(HashMap::new()),
             }),

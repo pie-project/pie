@@ -357,6 +357,8 @@ pub(super) struct FramePolicy {
     strict_watchdog_deadline: Option<Instant>,
     /// Deadline for the escape-mode-2 rebind grace period.
     rebind_escape_deadline: Option<Instant>,
+    /// Deadline for the join-gate grace period ([`FramePolicy::join_gate_circular`]).
+    join_escape_deadline: Option<Instant>,
     cold_hold_deadline: Option<Instant>,
     ever_sealed: bool,
     /// Probe sink (`profile-fire` wave counters); `None` in unit tests.
@@ -386,6 +388,7 @@ impl FramePolicy {
             truncated_seqs: BTreeMap::new(),
             strict_watchdog_deadline: None,
             rebind_escape_deadline: None,
+            join_escape_deadline: None,
             cold_hold_deadline: None,
             ever_sealed: false,
             stats,
@@ -626,6 +629,46 @@ impl FramePolicy {
         !self.pending_binds.is_empty()
     }
 
+    /// Whether the seal is waiting on a successor's arrival: a swap is
+    /// earmarked (a slot was released or a holder is departing, with a
+    /// staged taker for it) or an admitted successor's first fire is still
+    /// in flight. This is exactly the cohort-boundary window.
+    pub fn is_joining(&self) -> bool {
+        !self.joins_in_flight.is_empty()
+            || ((self.pending_slots > 0 || !self.departing.is_empty()) && !self.staged.is_empty())
+    }
+
+    /// Whether the JOIN half of the seal gate is provably circular.
+    ///
+    /// [`Self::is_joining`] holds the seal because a staged successor's
+    /// admission and first fire are *imminent*. When every staged successor
+    /// is still behind an unfinished bind, none of them is imminent at all:
+    /// a bind completes through the driver lane's control slot, which is
+    /// ordered behind the dispatch this unsealed boundary is holding. The
+    /// wait then closes the same `bind -> dispatch -> seal -> bind` cycle
+    /// the rebind escape breaks on the `missing` side (§20.3) — but by a
+    /// route that escape cannot reach, because it only ever decrements
+    /// `missing`. Observed under open-loop arrivals as `lanes=29 awaited=29
+    /// sealed=0 pending_binds=99 staged=99 pending_slots=99
+    /// joins_in_flight=0`, every lane's front frame complete, nothing
+    /// executing: the GPU sat idle and the fleet never moved again.
+    ///
+    /// The two exclusions are the cases where the wait is NOT circular.
+    /// A non-empty `joins_in_flight` means a successor already holds its
+    /// slot, so its fire is genuinely in flight. A non-empty `departing`
+    /// means a slot release is still coming from a teardown task that this
+    /// seal does not gate. Either one is real progress, so neither escapes.
+    fn join_gate_circular(&self, executing: bool) -> bool {
+        !executing
+            && self.joins_in_flight.is_empty()
+            && self.departing.is_empty()
+            && !self.staged.is_empty()
+            && self
+                .staged
+                .iter()
+                .all(|pid| self.pending_binds.contains_key(pid))
+    }
+
     pub fn on_bind_completed(&mut self, pid: Option<ProcessId>) {
         if let Some(pid) = pid
             && let Some(count) = self.pending_binds.get_mut(&pid)
@@ -787,6 +830,7 @@ impl FramePolicy {
         self.cold_hold_deadline = None;
         self.strict_watchdog_deadline = None;
         self.rebind_escape_deadline = None;
+        self.join_escape_deadline = None;
     }
 
     fn have_seal_candidate(&self) -> bool {
@@ -1028,6 +1072,7 @@ impl FramePolicy {
                 // Nothing queued anywhere: no gather episode is running.
                 self.strict_watchdog_deadline = None;
                 self.rebind_escape_deadline = None;
+                self.join_escape_deadline = None;
                 return FramePlan::Park;
             }
             // `missing` counts awaited lanes whose next frame is not fully
@@ -1073,9 +1118,20 @@ impl FramePolicy {
                     }
                 }
             }
-            let joining = !self.joins_in_flight.is_empty()
-                || ((self.pending_slots > 0 || !self.departing.is_empty())
-                    && !self.staged.is_empty());
+            let joining = self.is_joining();
+            let joining = if joining && self.join_gate_circular(executing) {
+                // Same grace period as the rebind escape, for the same
+                // reason: a healthy gather resolves in microseconds, so
+                // waiting REBIND_ESCAPE_US before concluding the cycle is
+                // real costs nothing and keeps the dense wait-all path.
+                let deadline = *self
+                    .join_escape_deadline
+                    .get_or_insert(now + Duration::from_micros(REBIND_ESCAPE_US));
+                now < deadline
+            } else {
+                self.join_escape_deadline = None;
+                joining
+            };
             let mode = rebind_escape_mode();
             // Mode 2 escapes only from the deadlock shape itself: every missing
             // lane is EMPTY and nothing is executing, so nothing the engine
@@ -1155,6 +1211,7 @@ impl FramePolicy {
             }
             self.strict_watchdog_deadline = None;
             self.rebind_escape_deadline = None;
+            self.join_escape_deadline = None;
             // EARLY seal: the gate held (every awaited lane's next frame is
             // fully submitted, no earmarked successor assembling), so seal NOW — normally
             // while the previous frame still executes. Sealing early is
@@ -1249,6 +1306,22 @@ mod tests {
         let now = Instant::now();
         match plan(policy, queued, now) {
             FramePlan::Hold(hold) => plan(policy, queued, now + hold + Duration::from_micros(1)),
+            plan => plan,
+        }
+    }
+
+    /// The mode-2 rebind escape arms its deadline on the first blocked plan
+    /// and only releases the idle rebinder once [`REBIND_ESCAPE_US`] has
+    /// passed, which is longer than the gather poll one
+    /// [`drive_past_cold_hold`] step advances by.
+    fn drive_past_rebind_escape(policy: &mut FramePolicy, queued: &QueuedFireIds) -> FramePlan {
+        let now = Instant::now();
+        match plan(policy, queued, now) {
+            FramePlan::Hold(_) => plan(
+                policy,
+                queued,
+                now + Duration::from_micros(REBIND_ESCAPE_US + 1),
+            ),
             plan => plan,
         }
     }
@@ -1365,8 +1438,14 @@ mod tests {
         let queued: QueuedFireIds = [1, 2, 3].into_iter().collect();
         let t0 = Instant::now();
         match plan(&mut policy, &queued, t0) {
+            // A blocked gather re-looks at the GATHER POLL cadence, not at
+            // the watchdog's. The watchdog is report-only and its deadline
+            // stays an order of magnitude further out; sleeping the whole
+            // way there with the GPU idle was the 2x regression that split
+            // the two constants apart.
             FramePlan::Hold(hold) => {
-                assert_eq!(hold, Duration::from_micros(STRICT_WATCHDOG_US));
+                assert_eq!(hold, Duration::from_micros(gather_poll_us()));
+                assert!(hold < Duration::from_micros(STRICT_WATCHDOG_US));
             }
             plan => panic!("wait-all must hold for the incomplete lane, got {plan:?}"),
         }
@@ -1690,6 +1769,83 @@ mod tests {
         assert_eq!(fires(&sealed), vec![95]);
     }
 
+    /// REGRESSION (the join-gate wedge). The same
+    /// `bind -> dispatch -> seal -> bind` cycle as above, reached through
+    /// [`FramePolicy::is_joining`] instead of through `missing`, which the
+    /// rebind escape cannot break because it only decrements `missing`.
+    ///
+    /// Every awaited lane's front frame is COMPLETE, so the quorum is
+    /// ready; the seal is held solely by staged successors that are still
+    /// behind their binds, and those binds need the control slot this
+    /// dispatch holds. Observed under open-loop arrivals as `lanes=29
+    /// awaited=29 sealed=0 pending_binds=99 staged=99 pending_slots=99
+    /// joins_in_flight=0` with nothing executing: the GPU went to 0% and
+    /// the fleet never moved again.
+    #[test]
+    fn staged_successors_stuck_behind_their_binds_do_not_hold_the_seal() {
+        let mut policy = FramePolicy::new(2, 64, 4096, None);
+        let runner = pid();
+        let successor = pid();
+
+        policy.on_fire_enqueued(stamp(runner, 0, 0, 1), Some(runner), 10, 1, 1);
+        let queued: QueuedFireIds = [10].into_iter().collect();
+        assert_eq!(fires(&drive_past_cold_hold(&mut policy, &queued)), vec![10]);
+
+        // A slot is free and a successor is staged for it, but the
+        // successor has not bound yet: `is_joining()` holds the seal.
+        policy.on_execution_slot_released(runner);
+        policy.on_bind_enqueued(Some(successor));
+        assert!(policy.is_joining());
+
+        policy.on_fire_enqueued(stamp(runner, 1, 0, 1), Some(runner), 11, 1, 1);
+        let queued: QueuedFireIds = [11].into_iter().collect();
+        let sealed = drive_past_rebind_escape(&mut policy, &queued);
+        assert_eq!(
+            fires(&sealed),
+            vec![11],
+            "the boundary must seal without the staged successor, whose bind \
+             cannot commit until this dispatch releases the control slot"
+        );
+
+        // Scoped to the bind, exactly like the rebind escape: once the bind
+        // commits, the successor's admission is imminent again and the seal
+        // waits for it.
+        policy.on_bind_completed(Some(successor));
+        policy.on_fire_enqueued(stamp(runner, 2, 0, 1), Some(runner), 12, 1, 1);
+        let queued: QueuedFireIds = [12].into_iter().collect();
+        match plan(&mut policy, &queued, Instant::now()) {
+            FramePlan::Hold(_) => {}
+            plan => panic!("a bound staged successor must hold the seal, got {plan:?}"),
+        }
+    }
+
+    /// A successor that already holds its execution slot is genuinely about
+    /// to fire, so the join gate must still wait for it even though it has
+    /// a bind outstanding. Without this the escape would fire on every
+    /// ordinary cohort turnover and shred epoch density.
+    #[test]
+    fn a_slotted_successor_still_holds_the_seal() {
+        let mut policy = FramePolicy::new(2, 64, 4096, None);
+        let runner = pid();
+        let successor = pid();
+
+        policy.on_fire_enqueued(stamp(runner, 0, 0, 1), Some(runner), 10, 1, 1);
+        let queued: QueuedFireIds = [10].into_iter().collect();
+        assert_eq!(fires(&drive_past_cold_hold(&mut policy, &queued)), vec![10]);
+
+        policy.on_execution_slot_released(runner);
+        policy.on_bind_enqueued(Some(successor));
+        policy.on_execution_slot_consumed(successor);
+        assert!(!policy.joins_in_flight.is_empty());
+
+        policy.on_fire_enqueued(stamp(runner, 1, 0, 1), Some(runner), 11, 1, 1);
+        let queued: QueuedFireIds = [11].into_iter().collect();
+        match drive_past_rebind_escape(&mut policy, &queued) {
+            FramePlan::Hold(_) | FramePlan::Park => {}
+            plan => panic!("an admitted successor's first fire must be waited for, got {plan:?}"),
+        }
+    }
+
     /// REGRESSION (the rebind-seal wedge, CONTENTION_FOLLOWUP.md §20).
     /// A process whose lane has drained to empty and that has a bind in
     /// flight must not hold the boundary: its next fire is ordered behind
@@ -1720,7 +1876,7 @@ mod tests {
         policy.on_bind_enqueued(Some(rebinder));
 
         let queued: QueuedFireIds = [12].into_iter().collect();
-        let sealed = drive_past_cold_hold(&mut policy, &queued);
+        let sealed = drive_past_rebind_escape(&mut policy, &queued);
         assert_eq!(
             fires(&sealed),
             vec![12],

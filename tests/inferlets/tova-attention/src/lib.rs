@@ -53,7 +53,7 @@
 //! folding `L` layers the row sums to `L`, which is what `layers_observed`
 //! lets the host check: the drained row is self-validating.
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, model as wit_model};
 use serde::{Deserialize, Serialize};
 

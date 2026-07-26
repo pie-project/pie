@@ -21,7 +21,7 @@
 //! sequence must come out **identical**. If the per-window KV rebuild ever
 //! stopped isolating rejected drafts, the two would diverge.
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, chat, model as wit_model};
 use serde::{Deserialize, Serialize};
 

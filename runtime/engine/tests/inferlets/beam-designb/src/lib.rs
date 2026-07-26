@@ -26,7 +26,7 @@
 //! (a generic per-token, all-layers KV cell-move — `copy_into`) is OUT OF SCOPE
 //! here; this inferlet exercises the steady-state append + mask-out path only.
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, model as wit_model};
 
 const B: u32 = 2; // beams

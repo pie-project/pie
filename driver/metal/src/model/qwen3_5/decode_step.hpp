@@ -28,7 +28,12 @@
 namespace pie::metal {
 
 // Number of Kernel kinds (for PSO-by-kind table sizing).
-inline constexpr int kKernelKindCount = static_cast<int>(Kernel::GdnPrepSlotted) + 1;
+// Every kind, including the families appended after qwen3.5's. This sizes the
+// PSO table and the timing arrays, so pinning it to one family's last kind is
+// an out-of-bounds read the moment another family appends — which is exactly
+// what happened, as a segfault with nothing pointing at the cause. Anchored on
+// the enum's actual last member instead.
+inline constexpr int kKernelKindCount = static_cast<int>(Kernel::G4PleResidual) + 1;
 
 // One emitted dispatch in the per-token DAG.
 struct Dispatch {

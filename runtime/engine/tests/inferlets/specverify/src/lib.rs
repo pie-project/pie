@@ -38,7 +38,7 @@
 //!
 //! JSON input: `{"k": 4}` (draft-window size, default 4, min 2).
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, model as wit_model, serde_json};
 
 const PAGE_T: u32 = 16; // tokens per KV page (mock env page size)

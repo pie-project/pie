@@ -183,6 +183,12 @@ pub fn new_batched_forward_request_with_capacity(n_requests: usize) -> crate::dr
         rs_fold_lens: Vec::with_capacity(req_cap),
         rs_buffer_slot_ids: Vec::new(),
         rs_buffer_slot_indptr: indptr(indptr_cap),
+        rs_buffer_read_slot_ids: Vec::new(),
+        rs_buffer_read_indptr: indptr(indptr_cap),
+        rs_buffer_read_lens: Vec::new(),
+        rs_buffer_heads: Vec::new(),
+        rs_translation: Vec::new(),
+        rs_translation_indptr: indptr(indptr_cap),
         masks: Vec::new(),
         mask_indptr: indptr(indptr_cap),
         sampling_indices: Vec::with_capacity(req_cap),
@@ -385,6 +391,27 @@ pub fn append_request_with_options(
     batch
         .rs_buffer_slot_indptr
         .push(batch.rs_buffer_slot_ids.len() as u32);
+    // The read side is per-ROW and must stay aligned even for requests that
+    // read nothing, because a batch mixes readers with non-readers. A request
+    // with an empty read side contributes an explicit zero rather than
+    // nothing -- the same shape `rs_buffer_slot_indptr` already has, where the
+    // CSR is always full length and the id vector is empty when unused.
+    batch
+        .rs_buffer_read_slot_ids
+        .extend(&req.rs_buffer_read_slot_ids);
+    batch
+        .rs_buffer_read_indptr
+        .push(batch.rs_buffer_read_slot_ids.len() as u32);
+    batch
+        .rs_buffer_read_lens
+        .push(req.rs_buffer_read_lens.first().copied().unwrap_or(0));
+    batch
+        .rs_buffer_heads
+        .push(req.rs_buffer_heads.first().copied().unwrap_or(0));
+    batch.rs_translation.extend(&req.rs_translation);
+    batch
+        .rs_translation_indptr
+        .push(batch.rs_translation.len() as u32);
 
     // Attention masks. The runtime synthesizes causal masks for every
     // request so context lineage remains explicit, but pure single-token
@@ -531,6 +558,53 @@ pub fn append_request_with_options(
                 batch
                     .rs_buffer_slot_indptr
                     .push(batch.rs_buffer_slot_ids.len() as u32);
+            }
+        }
+        if req.rs_buffer_read_indptr.len() == rows + 1 {
+            let read_base = batch.rs_buffer_read_slot_ids.len() as u32;
+            batch
+                .rs_buffer_read_slot_ids
+                .extend(&req.rs_buffer_read_slot_ids);
+            for &boundary in req.rs_buffer_read_indptr.iter().skip(1) {
+                batch.rs_buffer_read_indptr.push(read_base + boundary);
+            }
+        } else {
+            assert!(
+                req.rs_buffer_read_slot_ids.is_empty(),
+                "multi-row RS buffer reads require a row CSR"
+            );
+            for _ in 0..rows {
+                batch
+                    .rs_buffer_read_indptr
+                    .push(batch.rs_buffer_read_slot_ids.len() as u32);
+            }
+        }
+        for row in 0..rows {
+            batch
+                .rs_buffer_read_lens
+                .push(req.rs_buffer_read_lens.get(row).copied().unwrap_or(0));
+            batch
+                .rs_buffer_heads
+                .push(req.rs_buffer_heads.get(row).copied().unwrap_or(0));
+        }
+
+        // Per-row like the buffer CSR, and for the same reason: one RS working
+        // set per request means one translation table per request.
+        if req.rs_translation_indptr.len() == rows + 1 {
+            let base = batch.rs_translation.len() as u32;
+            batch.rs_translation.extend(&req.rs_translation);
+            for &boundary in req.rs_translation_indptr.iter().skip(1) {
+                batch.rs_translation_indptr.push(base + boundary);
+            }
+        } else {
+            assert!(
+                req.rs_translation.is_empty(),
+                "multi-row RS translations require a row CSR"
+            );
+            for _ in 0..rows {
+                batch
+                    .rs_translation_indptr
+                    .push(batch.rs_translation.len() as u32);
             }
         }
 

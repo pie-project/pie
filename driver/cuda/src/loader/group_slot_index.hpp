@@ -113,11 +113,11 @@ public:
     /// Give back the pin an `acquire` took, leaving the slot's contents and
     /// its recency alone.
     ///
-    /// For a speculative page-in, which must not hold a slot against the
-    /// reader that actually knows what it needs. A batch that guesses wrong
-    /// would otherwise pin its wrong guesses alongside its right ones and run
-    /// the cache out of slots -- which is a failure, not a slowdown, since
-    /// `acquire` has nothing to evict.
+    /// For a caller that acquires a slot to write it rather than to read it,
+    /// and so has no batch to hold it against. `place_all` is the one that
+    /// does: it walks every instance in turn, and pinning each as it went
+    /// would run the index out of slots before it finished -- which is a
+    /// failure, not a slowdown, since `acquire` has nothing left to evict.
     void release(std::uint32_t slot) noexcept {
         if (slot < slots_.size()) slots_[slot].pinned = false;
     }

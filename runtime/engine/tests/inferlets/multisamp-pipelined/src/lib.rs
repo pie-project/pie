@@ -16,7 +16,7 @@
 //! draining fire `t`'s token; the host-facing `out` ring is widened to `DEPTH`
 //! cells to absorb the run-ahead.
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, model as wit_model};
 
 const TEMPERATURE: f32 = 0.8;

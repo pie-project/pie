@@ -18,7 +18,7 @@
 //! KvLen-root dense geometry, same single bound decode pass resubmitted for
 //! the whole run. Input: an optional token budget (default 6), e.g. `"9"`.
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::hybrid::prelude::*;
 use inferlet::{Result, model as wit_model};
 
 const DEFAULT_MAX_TOKENS: usize = 6;
@@ -86,7 +86,7 @@ async fn main(input: String) -> Result<String> {
         None,
     )?;
     if has_rs {
-        fwd_p.rs_working_sets(std::slice::from_ref(&rs))?;
+        fwd_p.recurrent(std::slice::from_ref(&rs))?;
     }
     fwd_p.epilogue(move || {
         let t = reduce_argmax(intrinsics::logits());
@@ -138,7 +138,7 @@ async fn main(input: String) -> Result<String> {
             None,
         )?;
         if has_rs {
-            fwd.rs_working_sets(std::slice::from_ref(&rs))?;
+            fwd.recurrent(std::slice::from_ref(&rs))?;
         }
         // Every descriptor is device-advanced, so slot i+1 of the SAME frame
         // reads what slot i wrote — no host round trip inside a frame.

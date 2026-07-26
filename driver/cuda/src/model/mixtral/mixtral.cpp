@@ -1,5 +1,4 @@
 #include <cstring>
-#include <iostream>
 #include "model/mixtral/mixtral.hpp"
 #include "model/stage_hooks.hpp"
 
@@ -9,7 +8,6 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-#include <chrono>
 
 #include <cuda_runtime.h>
 
@@ -120,47 +118,24 @@ ExpertRouting build_routing(
     return r;
 }
 
-}  // namespace
+// The four device-side arrays the fused MXFP4 decode kernels index by expert.
+//
+// One struct rather than four loose vectors so that the two paths that fill it
+// -- a slab that holds every expert and one that pages the routed set -- state
+// the slot's tensor names in one place. An entry left null is an expert this
+// step did not route to, which the kernels never read.
+struct ExpertPtrTable {
+    explicit ExpertPtrTable(int experts)
+        : gate_up(static_cast<std::size_t>(experts), nullptr),
+          gate_up_scale(static_cast<std::size_t>(experts), nullptr),
+          down(static_cast<std::size_t>(experts), nullptr),
+          down_scale(static_cast<std::size_t>(experts), nullptr) {}
 
-namespace {
-
-/// The distinct experts a bf16 router-logit block would route to.
-///
-/// Host-side because its consumer is host-side: a page-in is chosen by slot
-/// bookkeeping the device knows nothing about. For decode the block is one
-/// row of `num_experts`, so this is cheaper than a kernel launch.
-std::vector<int> top_k_of(const std::vector<std::uint16_t>& logits,
-                          int rows, int num_experts, int top_k)
-{
-    std::vector<int> out;
-    std::vector<char> taken(static_cast<std::size_t>(num_experts), 0);
-    std::vector<std::pair<float, int>> scored;
-    for (int r = 0; r < rows; ++r) {
-        scored.clear();
-        scored.reserve(num_experts);
-        for (int e = 0; e < num_experts; ++e) {
-            const std::uint32_t bits =
-                static_cast<std::uint32_t>(
-                    logits[static_cast<std::size_t>(r) * num_experts + e])
-                << 16;
-            float f;
-            std::memcpy(&f, &bits, sizeof(f));
-            scored.emplace_back(f, e);
-        }
-        std::partial_sort(scored.begin(), scored.begin() + top_k, scored.end(),
-                          [](const auto& a, const auto& b) {
-                              return a.first > b.first;
-                          });
-        for (int k = 0; k < top_k; ++k) {
-            const int e = scored[k].second;
-            if (!taken[e]) {
-                taken[e] = 1;
-                out.push_back(e);
-            }
-        }
-    }
-    return out;
-}
+    std::vector<const std::uint8_t*> gate_up;
+    std::vector<const std::uint8_t*> gate_up_scale;
+    std::vector<const std::uint8_t*> down;
+    std::vector<const std::uint8_t*> down_scale;
+};
 
 }  // namespace
 
@@ -313,61 +288,8 @@ void mixtral_forward_paged(
         DeviceBuffer<std::uint16_t>::alloc(gemv_routes * I);
     auto d_mxfp4_route_out =
         DeviceBuffer<std::uint16_t>::alloc(gemv_routes * H);
-    // Speculative routing, measured before it is trusted.
-    //
-    // Layer L+1's router will read a normalization of the residual stream. The
-    // stream as it stands at the end of layer L differs from that only by
-    // layer L+1's attention output, so running L+1's own router on it early is
-    // a prediction that costs one [N,H]x[H,E] matmul and no training. It is
-    // worth building the asynchronous page-in it would drive only if the
-    // predicted set actually covers the routed one, which is what this counts.
-    // Off by default, because on this path it buys nothing yet.
-    //
-    // The prediction itself is good: measured against the real router a layer
-    // later it names 92% of the experts actually routed to, with no training
-    // and no change to the model. What it cannot do is help a run that is not
-    // waiting on the transfer. With the host tier warm, a slab big enough to
-    // hold every expert still takes 2.1-2.9 s against 887 ms resident while
-    // moving only 616 slots -- half a second of DMA at most. The rest is the
-    // per-layer host work the streamed path adds, and prefetching has nothing
-    // to hide behind until that is gone.
-    //
-    // Kept, rather than deleted, because it is the only mechanism that can
-    // address a compulsory miss, and because being wrong about which of two
-    // costs dominates is exactly the mistake this feature has already made
-    // twice.
-    const bool predict_next =
-        loader_config::env_truthy("PIE_CUDA_STREAM_PREDICT");
-    const bool predict_probe = predict_next;
-    std::vector<int> predicted_next;
-    std::uint64_t predict_hit = 0, predict_total = 0, predict_layers = 0;
-
-    // Where the streamed path's per-layer host time actually goes. The sync is
-    // split out from the bookkeeping because they mean opposite things: time
-    // in the synchronize is the host waiting for a GPU that is still busy,
-    // which costs nothing on its own, while time after it is the GPU going
-    // idle behind a host that is not issuing.
-    const bool phase_probe = loader_config::env_truthy("PIE_CUDA_STREAM_PHASES");
-    std::uint64_t ph_sync = 0, ph_pagein = 0, ph_upload = 0;
-    std::uint64_t ph_d2h = 0, ph_block = 0;
-    const auto now_ns = [] {
-        return static_cast<std::uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count());
-    };
-    const std::uint64_t ph_t0 = phase_probe ? now_ns() : 0;
-
     auto d_mxfp4_moe_out = DeviceBuffer<std::uint16_t>::alloc(
         use_mxfp4_decode_gemv ? static_cast<std::size_t>(N) * H : 0);
-    // The speculative router needs its own normed activations: `ws.norm_y`
-    // still holds this layer's, which its expert GEMV has not read yet.
-    const bool any_streamed = std::any_of(
-        w.layers.begin(), w.layers.end(),
-        [](const auto& l) { return l.expert_cache != nullptr; });
-    auto d_pred_norm = DeviceBuffer<std::uint16_t>::alloc(
-        (predict_next && any_streamed) ? static_cast<std::size_t>(N) * H : 0);
-    std::vector<std::uint16_t> pred_logits;
-
     for (int L = 0; L < cfg.num_hidden_layers; ++L) {
         const auto& layer = w.layers[L];
 
@@ -539,41 +461,37 @@ void mixtral_forward_paged(
         // routed set falls back to the per-expert loop rather than deadlock
         // against its own pins.
         bool streamed_fused = false;
-        std::vector<int> routed_for_probe;
-        const std::uint64_t t_blk0 = phase_probe ? now_ns() : 0;
-        // Once the slab holds the whole group, nothing about residency can
-        // change again: every expert owns a slot for the rest of the process.
-        // The routed set was only ever read back so the host could decide what
-        // to page in and where to point the kernel, and both answers are now
-        // fixed -- so write the pointer array once, for every expert, and stop
-        // reading anything back.
-        //
-        // This is the difference between streaming costing 18% and costing
-        // nothing. The D2H is a full stream drain, so it converts a pipeline
-        // that ran the host a whole token ahead of the device into one that
-        // serialises at every layer; deleting it puts the pipeline back.
-        if (layer.expert_cache != nullptr && use_mxfp4_decode_gemv &&
-            !layer.expert_gate_up_packed_ptrs.empty() &&
-            !layer.expert_ptrs_static && layer.expert_cache->all_placed()) {
-            std::vector<const std::uint8_t*> gu(num_experts, nullptr);
-            std::vector<const std::uint8_t*> gs(num_experts, nullptr);
-            std::vector<const std::uint8_t*> dn(num_experts, nullptr);
-            std::vector<const std::uint8_t*> ds(num_experts, nullptr);
-            bool complete = true;
-            for (int e = 0; e < num_experts; ++e) {
-                const WeightStore* slot = layer.expert_cache->store_of(
-                    layer.expert_group, static_cast<std::uint32_t>(e));
-                if (slot == nullptr) { complete = false; break; }
-                gu[e] = static_cast<const std::uint8_t*>(
-                    slot->get("gate_up_proj.weight").data());
-                gs[e] = static_cast<const std::uint8_t*>(
-                    slot->get("gate_up_proj.weight_scale").data());
-                dn[e] = static_cast<const std::uint8_t*>(
-                    slot->get("down_proj.weight").data());
-                ds[e] = static_cast<const std::uint8_t*>(
-                    slot->get("down_proj.weight_scale").data());
-            }
-            if (complete) {
+        // The routing table is read back at most once per layer. The fused
+        // paged path below needs it to decide what to page in, and the generic
+        // dispatch further down needs it to build its per-expert lists; when a
+        // layer takes both -- which is exactly the case where the slab is too
+        // small for the routed set -- reading it twice would drain the stream
+        // twice in the configuration already under the most pressure.
+        std::vector<std::int32_t> topk_idx_h;
+        bool topk_idx_read = false;
+        // Whether the fused decode kernels can run at all: they index the
+        // experts through a device-side pointer array, so a layer that has no
+        // such array, or is not on the decode path, has nothing to fuse.
+        const bool fusable = layer.expert_cache != nullptr &&
+            use_mxfp4_decode_gemv &&
+            !layer.expert_gate_up_packed_ptrs.empty();
+        if (fusable) {
+            // The four arrays the fused kernels index by expert, and the one
+            // place their runtime names are written down. Both the static and the
+            // paged path fill the same table from the same slot layout; they
+            // differ only in how they come by the slot.
+            ExpertPtrTable ptrs(num_experts);
+            const auto read_slot = [&](int e, const WeightStore& slot) {
+                ptrs.gate_up[e] = static_cast<const std::uint8_t*>(
+                    slot.get("gate_up_proj.weight").data());
+                ptrs.gate_up_scale[e] = static_cast<const std::uint8_t*>(
+                    slot.get("gate_up_proj.weight_scale").data());
+                ptrs.down[e] = static_cast<const std::uint8_t*>(
+                    slot.get("down_proj.weight").data());
+                ptrs.down_scale[e] = static_cast<const std::uint8_t*>(
+                    slot.get("down_proj.weight_scale").data());
+            };
+            const auto upload_ptrs = [&] {
                 const std::size_t nb =
                     static_cast<std::size_t>(num_experts) * sizeof(const void*);
                 const auto up = [&](const DeviceBuffer<const std::uint8_t*>& d,
@@ -582,159 +500,78 @@ void mixtral_forward_paged(
                         const_cast<void*>(static_cast<const void*>(d.data())),
                         h.data(), nb, cudaMemcpyHostToDevice, stream));
                 };
-                up(layer.expert_gate_up_packed_ptrs, gu);
-                up(layer.expert_gate_up_scale_ptrs, gs);
-                up(layer.expert_down_packed_ptrs, dn);
-                up(layer.expert_down_scale_ptrs, ds);
-                // The kernels below read the array on the same stream, so the
-                // upload is ordered ahead of them; but a later forward will
-                // not re-issue it, so make sure it has landed before the flag
-                // says it did.
-                CUDA_CHECK(cudaStreamSynchronize(stream));
-                layer.expert_ptrs_static = true;
-            }
-        }
-        if (layer.expert_cache != nullptr && layer.expert_ptrs_static &&
-            use_mxfp4_decode_gemv && !layer.expert_gate_up_packed_ptrs.empty()) {
-            streamed_fused = true;
-        } else if (layer.expert_cache != nullptr && use_mxfp4_decode_gemv &&
-            !layer.expert_gate_up_packed_ptrs.empty()) {
-            // Speculate on the next layer while reading this one's routing.
+                up(layer.expert_gate_up_packed_ptrs, ptrs.gate_up);
+                up(layer.expert_gate_up_scale_ptrs, ptrs.gate_up_scale);
+                up(layer.expert_down_packed_ptrs, ptrs.down);
+                up(layer.expert_down_scale_ptrs, ptrs.down_scale);
+            };
+
+            // Once the slab holds the whole group, nothing about residency
+            // can change again: every expert owns a slot for the rest of the
+            // process. The routed set was only ever read back so the host
+            // could decide what to page in and where to point the kernel, and
+            // both answers are now fixed -- so write the pointer array once,
+            // for every expert, and stop reading anything back.
             //
-            // The residual stream here is missing this layer's MoE output and
-            // the next layer's attention, so the next router will not see quite
-            // this vector -- but it is close enough that its top-k mostly
-            // agrees, and being a layer early is what makes the copy free.
-            //
-            // It rides the D2H below rather than adding a sync of its own.
-            // That matters more than it sounds: with page-ins served from
-            // pinned DRAM the host runs whole layers ahead of the device, and a
-            // second synchronize per layer gives that up. Measured, predicting
-            // from a later and more accurate point but paying one extra
-            // synchronize was *slower* than not predicting at all.
-            // Decode only. A prefill step routes to most of the experts at
-            // once, so there is nothing to predict and no idle copy engine to
-            // predict onto -- and its routed set alone can already be most of
-            // the slab.
-            const bool speculate =
-                predict_next && N == 1 && L + 1 < cfg.num_hidden_layers &&
-                w.layers[L + 1].expert_cache != nullptr;
-            if (speculate) {
-                const auto& nxt = w.layers[L + 1];
-                kernels::launch_rmsnorm_bf16(
-                    ws.y.data(), nxt.mlp_norm->data(), d_pred_norm.data(),
-                    N, H, eps, stream);
-                // `ws.gate` held this layer's router logits, which the top-k
-                // above has already consumed.
-                ops::gemm_act_x_wt_bias_bf16(cublas.handle(),
-                    d_pred_norm.data(), nxt.router->data(),
-                    nxt.router_bias ? nxt.router_bias->data() : nullptr,
-                    ws.gate.data(), N, num_experts, H, stream);
-                pred_logits.resize(
-                    static_cast<std::size_t>(N) * num_experts);
-                CUDA_CHECK(cudaMemcpyAsync(
-                    pred_logits.data(), ws.gate.data(),
-                    pred_logits.size() * sizeof(std::uint16_t),
-                    cudaMemcpyDeviceToHost, stream));
-            }
-            std::vector<std::int32_t> idx_h(static_cast<std::size_t>(N) * top_k);
-            const std::uint64_t t_d2h0 = phase_probe ? now_ns() : 0;
-            CUDA_CHECK(cudaMemcpyAsync(idx_h.data(), d_topk_idx.data(),
-                                       idx_h.size() * sizeof(std::int32_t),
-                                       cudaMemcpyDeviceToHost, stream));
-            if (phase_probe) ph_d2h += now_ns() - t_d2h0;
-            const std::uint64_t t_sync0 = phase_probe ? now_ns() : 0;
-            CUDA_CHECK(cudaStreamSynchronize(stream));
-            if (phase_probe) ph_sync += now_ns() - t_sync0;
-            if (speculate) {
-                const auto& nxt = w.layers[L + 1];
-                if (predict_probe && predict_layers > 0) {
-                    std::vector<char> want(
-                        static_cast<std::size_t>(num_experts), 0);
-                    for (const std::int32_t e : idx_h) {
-                        if (e >= 0 && e < num_experts) want[e] = 1;
-                    }
-                    for (int e = 0; e < num_experts; ++e) {
-                        if (!want[e]) continue;
-                        ++predict_total;
-                        if (std::find(predicted_next.begin(),
-                                      predicted_next.end(), e) !=
-                            predicted_next.end()) {
-                            ++predict_hit;
-                        }
-                    }
+            // This is the difference between streaming costing 18% and costing
+            // nothing. The D2H is a full stream drain, so it converts a
+            // pipeline that ran the host a whole token ahead of the device
+            // into one that serialises at every layer; deleting it puts the
+            // pipeline back.
+            if (!layer.expert_ptrs_static && layer.expert_cache->all_placed()) {
+                bool complete = true;
+                for (int e = 0; e < num_experts; ++e) {
+                    const WeightStore* slot = layer.expert_cache->store_of(
+                        layer.expert_group, static_cast<std::uint32_t>(e));
+                    if (slot == nullptr) { complete = false; break; }
+                    read_slot(e, *slot);
                 }
-                predicted_next = top_k_of(pred_logits, N, num_experts, top_k);
-                // Issue now, on the cache's own stream, so the bytes move
-                // beside the next layer's attention instead of in front of its
-                // experts. A wrong guess costs one slot of bandwidth; the real
-                // router still pages in whatever it actually wants.
-                for (const int e : predicted_next) {
-                    nxt.expert_cache->prefetch_resident(
-                        nxt.expert_group, static_cast<std::uint32_t>(e),
-                        stream);
-                }
-                ++predict_layers;
-            }
-            std::vector<int> routed;
-            std::vector<char> seen(static_cast<std::size_t>(num_experts), 0);
-            for (const std::int32_t e : idx_h) {
-                if (e >= 0 && e < num_experts && !seen[e]) {
-                    seen[e] = 1;
-                    routed.push_back(e);
+                if (complete) {
+                    upload_ptrs();
+                    // The kernels below read the array on the same stream, so the
+                    // upload is ordered ahead of them; but a later forward will
+                    // not re-issue it, so make sure it has landed before the flag
+                    // says it did.
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                    layer.expert_ptrs_static = true;
                 }
             }
-            routed_for_probe = routed;
-            if (routed.size() <= layer.expert_cache->num_slots()) {
-                const std::uint64_t t_pg0 = phase_probe ? now_ns() : 0;
-                for (const int e : routed) {
-                    layer.expert_cache->prefetch(layer.expert_group,
-                                                 static_cast<std::uint32_t>(e));
-                }
-                std::vector<const std::uint8_t*> gu(num_experts, nullptr);
-                std::vector<const std::uint8_t*> gs(num_experts, nullptr);
-                std::vector<const std::uint8_t*> dn(num_experts, nullptr);
-                std::vector<const std::uint8_t*> ds(num_experts, nullptr);
-                for (const int e : routed) {
-                    const WeightStore& slot = layer.expert_cache->ensure_resident(
-                        layer.expert_group, static_cast<std::uint32_t>(e), stream);
-                    gu[e] = static_cast<const std::uint8_t*>(
-                        slot.get("gate_up_proj.weight").data());
-                    gs[e] = static_cast<const std::uint8_t*>(
-                        slot.get("gate_up_proj.weight_scale").data());
-                    dn[e] = static_cast<const std::uint8_t*>(
-                        slot.get("down_proj.weight").data());
-                    ds[e] = static_cast<const std::uint8_t*>(
-                        slot.get("down_proj.weight_scale").data());
-                }
-                if (phase_probe) ph_pagein += now_ns() - t_pg0;
-                // Pageable source, so the driver stages it before returning and
-                // these vectors may die at the end of the block; the DMA that
-                // follows is ordered on `stream` ahead of the kernels.
-                const std::uint64_t t_up0 = phase_probe ? now_ns() : 0;
-                const std::size_t nbytes =
-                    static_cast<std::size_t>(num_experts) * sizeof(const void*);
-                CUDA_CHECK(cudaMemcpyAsync(
-                    const_cast<void*>(static_cast<const void*>(
-                        layer.expert_gate_up_packed_ptrs.data())), gu.data(), nbytes,
-                    cudaMemcpyHostToDevice, stream));
-                CUDA_CHECK(cudaMemcpyAsync(
-                    const_cast<void*>(static_cast<const void*>(
-                        layer.expert_gate_up_scale_ptrs.data())), gs.data(), nbytes,
-                    cudaMemcpyHostToDevice, stream));
-                CUDA_CHECK(cudaMemcpyAsync(
-                    const_cast<void*>(static_cast<const void*>(
-                        layer.expert_down_packed_ptrs.data())), dn.data(), nbytes,
-                    cudaMemcpyHostToDevice, stream));
-                CUDA_CHECK(cudaMemcpyAsync(
-                    const_cast<void*>(static_cast<const void*>(
-                        layer.expert_down_scale_ptrs.data())), ds.data(), nbytes,
-                    cudaMemcpyHostToDevice, stream));
-                if (phase_probe) ph_upload += now_ns() - t_up0;
+            if (layer.expert_ptrs_static) {
                 streamed_fused = true;
+            } else {
+                topk_idx_h.resize(static_cast<std::size_t>(N) * top_k);
+                CUDA_CHECK(cudaMemcpyAsync(topk_idx_h.data(), d_topk_idx.data(),
+                                           topk_idx_h.size() * sizeof(std::int32_t),
+                                           cudaMemcpyDeviceToHost, stream));
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                topk_idx_read = true;
+                std::vector<int> routed;
+                std::vector<char> seen(static_cast<std::size_t>(num_experts), 0);
+                for (const std::int32_t e : topk_idx_h) {
+                    if (e >= 0 && e < num_experts && !seen[e]) {
+                        seen[e] = 1;
+                        routed.push_back(e);
+                    }
+                }
+                if (routed.size() <= layer.expert_cache->num_slots()) {
+                    for (const int e : routed) {
+                        layer.expert_cache->prefetch(layer.expert_group,
+                                                     static_cast<std::uint32_t>(e));
+                    }
+                    for (const int e : routed) {
+                        read_slot(e, layer.expert_cache->ensure_resident(
+                            layer.expert_group, static_cast<std::uint32_t>(e),
+                            stream));
+                    }
+                    // Pageable source, so the driver stages it before
+                    // returning and `ptrs` may die at the end of this block;
+                    // the DMA that follows is ordered on `stream` ahead of the
+                    // kernels.
+                    upload_ptrs();
+                    streamed_fused = true;
+                }
             }
         }
-        if (phase_probe && layer.expert_cache != nullptr) ph_block += now_ns() - t_blk0;
         if ((layer.expert_cache == nullptr || streamed_fused) &&
             use_mxfp4_decode_gemv &&
             !layer.expert_gate_up_packed_ptrs.empty()) {
@@ -793,11 +630,13 @@ void mixtral_forward_paged(
         }
 
         // 2. D2H copy of routing decisions; build per-expert lists.
-        std::vector<std::int32_t> topk_idx_h(static_cast<std::size_t>(N) * top_k);
         std::vector<float>        topk_w_h  (static_cast<std::size_t>(N) * top_k);
-        CUDA_CHECK(cudaMemcpyAsync(topk_idx_h.data(), d_topk_idx.data(),
-                                   topk_idx_h.size() * sizeof(std::int32_t),
-                                   cudaMemcpyDeviceToHost, stream));
+        if (!topk_idx_read) {
+            topk_idx_h.resize(static_cast<std::size_t>(N) * top_k);
+            CUDA_CHECK(cudaMemcpyAsync(topk_idx_h.data(), d_topk_idx.data(),
+                                       topk_idx_h.size() * sizeof(std::int32_t),
+                                       cudaMemcpyDeviceToHost, stream));
+        }
         CUDA_CHECK(cudaMemcpyAsync(topk_w_h.data(), d_topk_w.data(),
                                    topk_w_h.size() * sizeof(float),
                                    cudaMemcpyDeviceToHost, stream));
@@ -1016,23 +855,6 @@ void mixtral_forward_paged(
         }
     }
 
-    if (phase_probe) {
-        // Issue time is how long the host took to walk the loop; total adds
-        // the wait for the device to finish what the loop queued. Their
-        // difference is the only honest way to say whether the streamed path
-        // is slow because the host is not issuing or because the GPU is busy.
-        const std::uint64_t t_issue = now_ns() - ph_t0;
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        const std::uint64_t t_total = now_ns() - ph_t0;
-        std::cerr << "[pie-driver-cuda] MoE forward N=" << N << " issue "
-                  << (t_issue / 1e6) << " ms, total " << (t_total / 1e6)
-                  << " ms | streamed host: sync " << (ph_sync / 1e6)
-                  << " ms, page-in+ptrs " << (ph_pagein / 1e6)
-                  << " ms, upload " << (ph_upload / 1e6) << " ms, d2h "
-                  << (ph_d2h / 1e6) << " ms, whole block " << (ph_block / 1e6)
-                  << " ms\n";
-    }
-
     if (!fwd_cfg.emit_logits) {
         return;
     }
@@ -1058,15 +880,6 @@ void mixtral_forward_paged(
             lm_head_rows, V, H);
         return;
     }
-    if (predict_probe && predict_total > 0) {
-        std::cerr << "[pie-driver-cuda] speculative routing: "
-                  << (100.0 * static_cast<double>(predict_hit) /
-                      static_cast<double>(predict_total))
-                  << "% of routed experts were predicted a layer ahead ("
-                  << predict_hit << " of " << predict_total << " over "
-                  << predict_layers << " layers)\n";
-    }
-
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), w.final_norm->data(), ws.norm_x.data(),
         N, H, eps, stream);

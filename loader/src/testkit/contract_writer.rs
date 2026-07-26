@@ -17,11 +17,10 @@
 use crate::contract::{Expr, ModelContract, ScaleFactor, Visibility};
 use crate::ffi::contract::{
     PieLoaderExprKind, PieLoaderExprNode, PieLoaderExprNodeSlice, PieLoaderGroupContractSlice,
-    PieLoaderGroupContractView, PieLoaderModelContractView, PieLoaderRepackSpecView,
-    PieLoaderScalesView, PieLoaderTensorContractSlice, PieLoaderTensorContractView, write_encoding,
+    PieLoaderGroupContractView, PieLoaderModelContractView, PieLoaderScalesView,
+    PieLoaderTensorContractSlice, PieLoaderTensorContractView, write_encoding,
 };
 use crate::ffi::types::*;
-use crate::types::RepackSpec;
 
 /// A contract flattened into the POD form, with its backing storage.
 ///
@@ -86,6 +85,23 @@ impl OwnedContract {
         self.tensors
             .iter()
             .position(|tensor| tensor.scales.of.len != 0)
+    }
+
+    /// Write a raw integer into a node's `repack_layout`, for the same reason
+    /// [`set_raw_scale_codes`](Self::set_raw_scale_codes) exists.
+    ///
+    /// [`RepackLayout`](crate::types::RepackLayout) has no member for "no
+    /// layout", so a typed builder cannot express the zero an all-zero node
+    /// carries — which is exactly the value the boundary has to reject.
+    pub fn set_raw_repack_layout(&mut self, node: usize, layout: u32) {
+        self.nodes[node].repack_layout = layout;
+    }
+
+    /// Position of the first `Repack` node.
+    pub fn first_repack(&self) -> Option<usize> {
+        self.nodes
+            .iter()
+            .position(|node| node.kind == PieLoaderExprKind::Repack as u32)
     }
 
     fn name(&mut self, value: &str) -> PieLoaderBytes {
@@ -214,11 +230,11 @@ impl OwnedContract {
                 node.src = src;
                 node.axis = axis.0;
             }
-            Expr::Repack { src, spec, to } => {
+            Expr::Repack { src, layout, to } => {
                 let src = self.write_expr(src);
                 node.kind = PieLoaderExprKind::Repack as u32;
                 node.src = src;
-                node.repack = write_repack(spec);
+                node.repack_layout = PieLoaderRepackLayout::from(*layout) as u32;
                 node.out_shape = self.shape(&to.shape);
                 node.out_encoding = write_encoding(&to.encoding);
             }
@@ -234,31 +250,13 @@ impl OwnedContract {
                 node.src = src;
                 match factor {
                     ScaleFactor::Uniform(bits) => node.scale_factor_bits = *bits,
-                    ScaleFactor::PerGroup { by, group, axis } => {
+                    ScaleFactor::PerBlock { by } => {
                         node.scale_by = self.write_expr(by);
-                        node.scale_group = *group;
-                        node.axis = axis.0;
                     }
                 }
             }
         }
         self.push(node)
-    }
-}
-
-fn write_repack(spec: &RepackSpec) -> PieLoaderRepackSpecView {
-    PieLoaderRepackSpecView {
-        layout: PieLoaderRepackLayout::from(spec.layout) as u32,
-        row_map: PieLoaderRowMap::from(spec.row_map) as u32,
-        batch: spec.batch,
-        source_rows: spec.source_rows,
-        source_row_offset: spec.source_row_offset,
-        target_rows: spec.target_rows,
-        valid_rows: spec.valid_rows,
-        source_stride_cols: spec.source_stride_cols,
-        source_col_offset: spec.source_col_offset,
-        source_cols: spec.source_cols,
-        target_cols: spec.target_cols,
     }
 }
 

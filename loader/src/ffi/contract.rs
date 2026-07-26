@@ -34,12 +34,11 @@ use crate::contract::{
 };
 use crate::ffi::types::{
     PieLoaderBytes, PieLoaderDType, PieLoaderEncodingKind, PieLoaderI64Slice,
-    PieLoaderQuantGranularity, PieLoaderQuantScheme, PieLoaderRepackLayout, PieLoaderRowMap,
-    PieLoaderScaleForm, PieLoaderSlice, PieLoaderU32Slice, PieLoaderVisibility,
+    PieLoaderQuantGranularity, PieLoaderQuantScheme, PieLoaderRepackLayout, PieLoaderScaleForm,
+    PieLoaderSlice, PieLoaderU32Slice, PieLoaderVisibility,
 };
 use crate::types::{
-    Axis, DType, Encoding, QuantGranularity, QuantScheme, QuantSpec, RepackLayout, RepackSpec,
-    RowMap, ScaleForm,
+    Axis, DType, Encoding, QuantGranularity, QuantScheme, QuantSpec, RepackLayout, ScaleForm,
 };
 
 /// `PieLoaderExprNode::src` when the node has no single operand.
@@ -151,44 +150,6 @@ impl Default for PieLoaderEncodingSpec {
     }
 }
 
-/// [`crate::types::RepackSpec`], flattened. All eleven fields, because a repack
-/// is opaque to the type checker and therefore has to state everything.
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct PieLoaderRepackSpecView {
-    /// A `PieLoaderRepackLayout` value, as `uint32_t`.
-    pub layout: u32,
-    /// A `PieLoaderRowMap` value, as `uint32_t`.
-    pub row_map: u32,
-    pub batch: u32,
-    pub source_rows: u32,
-    pub source_row_offset: u32,
-    pub target_rows: u32,
-    pub valid_rows: u32,
-    pub source_stride_cols: u32,
-    pub source_col_offset: u32,
-    pub source_cols: u32,
-    pub target_cols: u32,
-}
-
-impl Default for PieLoaderRepackSpecView {
-    fn default() -> Self {
-        Self {
-            layout: PieLoaderRepackLayout::None as u32,
-            row_map: PieLoaderRowMap::Identity as u32,
-            batch: 0,
-            source_rows: 0,
-            source_row_offset: 0,
-            target_rows: 0,
-            valid_rows: 0,
-            source_stride_cols: 0,
-            source_col_offset: 0,
-            source_cols: 0,
-            target_cols: 0,
-        }
-    }
-}
-
 /// One node of the expression graph.
 ///
 /// Every field is read by exactly the kinds that need it and ignored by the
@@ -236,8 +197,10 @@ pub struct PieLoaderExprNode {
     /// one extent may be `-1`, and never for a `Fill`.
     pub out_shape: PieLoaderI64Slice,
     pub out_encoding: PieLoaderEncodingSpec,
-    /// `Repack`.
-    pub repack: PieLoaderRepackSpecView,
+    /// `Repack`: a `PieLoaderRepackLayout` value, as `uint32_t`. The whole of
+    /// what a repack says -- every count a kernel needs is the operand's type
+    /// or `out_shape`'s, so the loader derives it.
+    pub repack_layout: u32,
     /// `Scale`: the multiplier, as the bit pattern of an IEEE-754 binary32.
     ///
     /// A `float` field would make this struct's layout depend on the C++
@@ -247,20 +210,21 @@ pub struct PieLoaderExprNode {
     /// Leaving it unset means zero, which reads as `+0.0`; the loader rejects
     /// that rather than scaling a tensor to nothing.
     pub scale_factor_bits: u32,
-    /// `Scale`: the operand holding one factor per `scale_group` elements along
-    /// `axis`. Same index rule as `src`.
+    /// `Scale`: the operand holding the factors, one per block. Same index
+    /// rule as `src`.
     ///
-    /// [`PIE_LOADER_NO_NODE`] for a uniform factor, which is what an unset
-    /// field reads as.
+    /// [`PIE_LOADER_NO_NODE`] for a uniform factor, and that sentinel is what
+    /// tells the two forms apart. There used to be a separate `scale_group`
+    /// discriminant, on the grounds that a struct zeroed by hand would then
+    /// always read as the uniform case; but `src` has always carried the same
+    /// exposure — node zero is a legal index — so the sentinel is the rule
+    /// everywhere rather than in all places but one, and
+    /// [`PieLoaderExprNode::default`] sets it.
+    ///
+    /// The blocking itself is not stated here. It is the ratio of this
+    /// operand's shape to `src`'s, which is the only place it can be stated
+    /// once.
     pub scale_by: u32,
-    /// `Scale`: elements per factor. Zero selects the uniform factor in
-    /// `scale_factor_bits`.
-    ///
-    /// The two forms are told apart by this field rather than by which of the
-    /// others happens to be set, so a node built by zeroing the struct and
-    /// filling in one field is always the uniform case and never a per-group
-    /// case with a missing operand.
-    pub scale_group: u32,
 }
 
 impl Default for PieLoaderExprNode {
@@ -278,10 +242,9 @@ impl Default for PieLoaderExprNode {
             fill_bits: 0,
             out_shape: PieLoaderI64Slice::default(),
             out_encoding: PieLoaderEncodingSpec::default(),
-            repack: PieLoaderRepackSpecView::default(),
+            repack_layout: PieLoaderRepackLayout::None as u32,
             scale_factor_bits: 0,
             scale_by: PIE_LOADER_NO_NODE,
-            scale_group: 0,
         }
     }
 }
@@ -473,23 +436,16 @@ fn read_encoding(spec: &PieLoaderEncodingSpec, what: &str) -> Result<Encoding, S
     })
 }
 
-fn read_repack(spec: &PieLoaderRepackSpecView, what: &str) -> Result<RepackSpec, String> {
-    let layout = PieLoaderRepackLayout::try_from(spec.layout)
-        .map_err(|v| format!("{what}.layout: {v} is not a PieLoaderRepackLayout"))?;
-    let row_map = PieLoaderRowMap::try_from(spec.row_map)
-        .map_err(|v| format!("{what}.row_map: {v} is not a PieLoaderRowMap"))?;
-    Ok(RepackSpec {
-        layout: RepackLayout::from(layout),
-        row_map: RowMap::from(row_map),
-        batch: spec.batch,
-        source_rows: spec.source_rows,
-        source_row_offset: spec.source_row_offset,
-        target_rows: spec.target_rows,
-        valid_rows: spec.valid_rows,
-        source_stride_cols: spec.source_stride_cols,
-        source_col_offset: spec.source_col_offset,
-        source_cols: spec.source_cols,
-        target_cols: spec.target_cols,
+/// The layout of a `Repack` node, which must name a kernel.
+///
+/// Zero is not a layout here even though it is a legal wire value elsewhere: an
+/// all-zero node is what a forgotten field looks like, and a repack that names
+/// no kernel would otherwise be discovered missing on the device.
+fn read_repack(layout: u32, what: &str) -> Result<RepackLayout, String> {
+    let wire = PieLoaderRepackLayout::try_from(layout)
+        .map_err(|v| format!("{what}: {v} is not a PieLoaderRepackLayout"))?;
+    RepackLayout::try_from(wire).map_err(|()| {
+        format!("{what}: a Repack names a kernel, and PieLoaderRepackLayout_None names none")
     })
 }
 
@@ -620,7 +576,7 @@ fn read_expr(node: &PieLoaderExprNode, index: usize, done: &[Expr]) -> Result<Ex
         PieLoaderExprKind::Shard => Expr::Shard { src: src()?, axis },
         PieLoaderExprKind::Repack => Expr::Repack {
             src: src()?,
-            spec: read_repack(&node.repack, &format!("{what}.repack"))?,
+            layout: read_repack(node.repack_layout, &format!("{what}.repack_layout"))?,
             to: read_type(&node.out_shape, &node.out_encoding, &format!("{what}.out"))?,
         },
         PieLoaderExprKind::Cast => Expr::Cast {
@@ -629,13 +585,11 @@ fn read_expr(node: &PieLoaderExprNode, index: usize, done: &[Expr]) -> Result<Ex
         },
         PieLoaderExprKind::Scale => Expr::Scale {
             src: src()?,
-            factor: if node.scale_group == 0 {
+            factor: if node.scale_by == PIE_LOADER_NO_NODE {
                 ScaleFactor::Uniform(node.scale_factor_bits)
             } else {
-                ScaleFactor::PerGroup {
+                ScaleFactor::PerBlock {
                     by: Box::new(child(node.scale_by, "scale_by")?),
-                    group: node.scale_group,
-                    axis,
                 }
             },
         },

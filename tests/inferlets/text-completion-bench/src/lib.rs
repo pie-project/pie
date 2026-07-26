@@ -22,7 +22,7 @@
 //! runs in parallel, off the critical path. `close()` ends the stream after
 //! the submitted tail is drained.
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, chat, model as wit_model, session};
 use serde::{Deserialize, Serialize};
 
@@ -171,15 +171,28 @@ struct RunResult {
     prologue_us: Vec<u64>,
 }
 
-async fn run_one(
-    input: &Input,
-    prompt: &str,
-    prompt_tokens: Option<&[u32]>,
-    stop_tokens: &[u32],
-    honor_wait_for_start: bool,
-    rng_seed: u32,
-    main_pre_us: Option<u64>,
-) -> Result<RunResult> {
+/// `run_one`, generated once per forward-pass kind.
+///
+/// `pie:inferlet` now exposes three forward interfaces, so `ForwardPass` is
+/// three unrelated types and this benchmark -- which drives BOTH a
+/// pure-attention model and a hybrid GDN model -- can no longer be one
+/// function. The runtime `is_linear()` branch that used to decide whether to
+/// bind recurrent state has moved UP to a `model::pass_kind()` branch over two
+/// monomorphisations. The body is written once here and expanded twice, so the
+/// two versions cannot drift.
+macro_rules! define_run_one {
+    ($name:ident, $kind:ident, $bind_rs:expr) => {
+async fn $name(
+        input: &Input,
+        prompt: &str,
+        prompt_tokens: Option<&[u32]>,
+        stop_tokens: &[u32],
+        honor_wait_for_start: bool,
+        rng_seed: u32,
+        main_pre_us: Option<u64>,
+    ) -> Result<RunResult> {
+        use inferlet::ptir::$kind::{ForwardPass, submit_frame};
+
     let mut prologue_us: Vec<u64> = Vec::new();
     if input.report_timing {
         prologue_us.push(main_pre_us.unwrap_or(0)); // [0] main_pre
@@ -329,11 +342,9 @@ async fn run_one(
         &positions_p,
         None,
     )?;
-    if !rs_ws.is_empty() {
-        fwd_p
-            .rs_working_sets(&rs_ws)
-            .map_err(|e| format!("bind prefill recurrent state: {e}"))?;
-    }
+        if !rs_ws.is_empty() {
+            $bind_rs(&fwd_p, &rs_ws).map_err(|e| format!("bind prefill recurrent state: {e}"))?;
+        }
     fwd_p.epilogue(move || {
         let t = reshape(
             sample(intrinsics::logits(), vocab, temperature, top_p, prefill_rng),
@@ -371,10 +382,10 @@ async fn run_one(
             &positions,
             None,
         )?;
-        if !rs_ws.is_empty() {
-            fwd.rs_working_sets(&rs_ws)
-                .map_err(|e| format!("bind decode recurrent state: {e}"))?;
-        }
+            if !rs_ws.is_empty() {
+                $bind_rs(&fwd, &rs_ws)
+                    .map_err(|e| format!("bind decode recurrent state: {e}"))?;
+            }
         fwd.epilogue(move || {
             let length = kv_len.take().tensor();
             let t = reshape(
@@ -549,10 +560,79 @@ async fn run_one(
         prologue_us,
     })
 }
+    };
+}
+
+define_run_one!(run_one_attention, attention, |_fwd: &ForwardPass,
+                                               _rs: &[RsWorkingSet]|
+ -> ::std::result::Result<(), String> {
+    unreachable!("an attention-only model binds no recurrent state")
+});
+define_run_one!(
+    run_one_hybrid,
+    hybrid,
+    |fwd: &ForwardPass, rs: &[RsWorkingSet]| fwd.recurrent(rs)
+);
+
+async fn run_one(
+    input: &Input,
+    prompt: &str,
+    prompt_tokens: Option<&[u32]>,
+    stop_tokens: &[u32],
+    honor_wait_for_start: bool,
+    rng_seed: u32,
+    main_pre_us: Option<u64>,
+) -> Result<RunResult> {
+    match inferlet::model::pass_kind() {
+        inferlet::model::ForwardKind::Attention => {
+            run_one_attention(
+                input,
+                prompt,
+                prompt_tokens,
+                stop_tokens,
+                honor_wait_for_start,
+                rng_seed,
+                main_pre_us,
+            )
+            .await
+        }
+        inferlet::model::ForwardKind::Hybrid => {
+            run_one_hybrid(
+                input,
+                prompt,
+                prompt_tokens,
+                stop_tokens,
+                honor_wait_for_start,
+                rng_seed,
+                main_pre_us,
+            )
+            .await
+        }
+        inferlet::model::ForwardKind::Recurrent => Err(
+            "this benchmark has no recurrent-only path (no registered model reports that kind)"
+                .to_string()
+                .into(),
+        ),
+    }
+}
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
     let main_start = std::time::Instant::now();
+
+    // This program is pure: it reads its input, generates, and returns the
+    // token counts in one envelope. Nothing is streamed and nothing outside
+    // the process is touched, so a re-run is indistinguishable from the
+    // first run and the planner may reclaim our KV pages by restarting us
+    // instead of failing the request.
+    //
+    // The `wait_for_start` handshake is the one exception: it hands "ready"
+    // to the harness and waits to be released, and the harness releases each
+    // process exactly once. A restart there would wait forever, so that mode
+    // keeps the fail-loud contract.
+    if !input.wait_for_start {
+        inferlet::runtime::declare_restartable();
+    }
 
     let stop_tokens: Vec<u32> = if input.ignore_eos {
         Vec::new()

@@ -11,7 +11,7 @@
 //! baseline): this validates that the temperature epilogue shape survives
 //! run-ahead submission, not just the synchronous drain.
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, model as wit_model};
 
 const TEMPERATURE: f32 = 0.8;

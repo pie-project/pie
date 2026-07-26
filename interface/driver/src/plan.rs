@@ -48,6 +48,23 @@ pub struct LaunchPlan {
     pub rs_fold_lens: Vec<u32>,
     pub rs_buffer_slot_ids: Vec<u32>,
     pub rs_buffer_slot_indptr: Vec<u32>,
+    /// The buffered prefix each row REPLAYS ahead of its own tokens: the slabs
+    /// (`rs_buffer_read_slot_ids`), the row CSR over them
+    /// (`rs_buffer_read_indptr`, `R + 1`), and how many tokens of them to
+    /// replay (`rs_buffer_read_lens`, `R`). Empty when nothing is buffered.
+    pub rs_buffer_read_slot_ids: Vec<u32>,
+    pub rs_buffer_read_indptr: Vec<u32>,
+    pub rs_buffer_read_lens: Vec<u32>,
+    /// Physical offset of each row's logical buffer token 0 (`R`). A fold that
+    /// lands mid-page cannot release the page it half-consumed, so the
+    /// survivors keep their offsets and every buffer span is `head + logical`.
+    pub rs_buffer_heads: Vec<u32>,
+    /// WorkingSet-relative buffer page -> physical slot, for channel-resolved
+    /// `rs-geometry`. Per REQUEST ROW, unlike [`Self::kv_translation`]: a pass
+    /// binds one RS working set per request, so there is no single table for
+    /// the fire. `rs_translation_indptr` is the row CSR, `R + 1` entries.
+    pub rs_translation: Vec<u32>,
+    pub rs_translation_indptr: Vec<u32>,
     pub masks: Vec<EncodedMask>,
     pub mask_indptr: Vec<u32>,
     pub sampling_indices: Vec<u32>,
@@ -90,6 +107,10 @@ pub struct LaunchPlan {
 
 pub const RS_FLAG_RESET: u8 = 1;
 pub const RS_FLAG_FOLD: u8 = 2;
+pub const RS_FLAG_BUFFER_WRITE: u8 = 4;
+/// This row's fold length is not host-known; it comes from the `rs_fold_len`
+/// descriptor port and `rs_fold_lens[r]` is a placeholder.
+pub const RS_FLAG_FOLD_LEN_DEVICE: u8 = 8;
 
 #[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProgramRegistration {

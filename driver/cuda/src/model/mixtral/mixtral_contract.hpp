@@ -50,64 +50,42 @@ inline void gpt_oss_native_gate_up(ContractBuilder& b, const SourceTensor& block
     }
     const std::int64_t full_intermediate = fused_rows / 2;
     const std::int64_t hidden = groups * 32;
-    const auto [local_start, local_intermediate] =
-        b.local_range(full_intermediate, "the intermediate size of '" + base + "'");
+    const std::int64_t local_intermediate = b.local_extent(full_intermediate);
     const std::int64_t intermediate_native = align_up(local_intermediate, 128);
     const std::string prefix =
         base.substr(0, base.size() - std::string_view("gate_up_proj").size());
 
+    // gate and up are interleaved row by row, so this rank's share of the
+    // *logical* intermediate axis is `split` on the fused axis -- which lands on
+    // `[2 * local_start, 2 * (local_start + local_intermediate))` -- followed by
+    // the even or odd rows of that band. Both are ordinary nodes, so the rank
+    // stays where every other family puts it: in the target, resolved by the
+    // loader, never written into the contract.
     const struct {
         std::string_view name;
-        PieLoaderRowMap row_map;
-    } halves[] = {{"gate_proj", PieLoaderRowMap::Even}, {"up_proj", PieLoaderRowMap::Odd}};
+        std::int64_t first_row;
+    } halves[] = {{"gate_proj", 0}, {"up_proj", 1}};
     for (const auto& half : halves) {
         const std::string out_base = prefix + std::string(half.name);
+        const auto rows = [&](const SourceTensor& raw) {
+            return b.contract().stride(b.split(b.contract().src(std::string(raw.name)), 1), 1,
+                                       half.first_row, local_intermediate, 2);
+        };
 
-        PieLoaderRepackSpecView weight =
-            repack_spec(PieLoaderRepackLayout::MarlinMxfp4Weight, half.row_map);
-        weight.batch = u32_dim(experts, "GPT-OSS experts");
-        weight.source_rows = u32_dim(fused_rows, "GPT-OSS gate/up source rows");
-        weight.source_row_offset = u32_dim(local_start, "GPT-OSS gate/up source row offset");
-        weight.target_rows = u32_dim(intermediate_native, "GPT-OSS gate/up target rows");
-        weight.valid_rows = u32_dim(local_intermediate, "GPT-OSS gate/up valid rows");
-        weight.source_stride_cols = u32_dim(hidden, "GPT-OSS hidden stride");
-        weight.source_col_offset = 0;
-        weight.source_cols = u32_dim(hidden, "GPT-OSS hidden size");
-        weight.target_cols = u32_dim(hidden, "GPT-OSS hidden size");
-        b.push_repack(out_base + ".weight", block, mxfp4_encoding(b.contract(), 1),
-                    {experts, intermediate_native, hidden}, weight);
+        b.push_repack(out_base + ".weight", rows(block), PieLoaderRepackLayout::MarlinMxfp4Weight,
+                      mxfp4_encoding(b.contract(), 1),
+                      {experts, intermediate_native, hidden});
 
-        PieLoaderRepackSpecView scale_spec =
-            repack_spec(PieLoaderRepackLayout::MarlinMxfp4Scale, half.row_map);
-        scale_spec.batch = u32_dim(experts, "GPT-OSS experts");
-        scale_spec.source_rows = u32_dim(fused_rows, "GPT-OSS gate/up source rows");
-        scale_spec.source_row_offset =
-            u32_dim(local_start, "GPT-OSS gate/up source row offset");
-        scale_spec.target_rows = u32_dim(intermediate_native, "GPT-OSS gate/up target rows");
-        scale_spec.valid_rows = u32_dim(local_intermediate, "GPT-OSS gate/up valid rows");
-        scale_spec.source_stride_cols = u32_dim(groups, "GPT-OSS hidden group stride");
-        scale_spec.source_col_offset = 0;
-        scale_spec.source_cols = u32_dim(groups, "GPT-OSS hidden groups");
-        scale_spec.target_cols = u32_dim(groups, "GPT-OSS hidden groups");
-        auto scales = b.push_repack(out_base + ".weight_scale", scale,
-                    pie_loader::raw(PieLoaderDType::U8),
-                    {experts, intermediate_native, groups}, scale_spec);
+        auto scales = b.push_repack(out_base + ".weight_scale", rows(scale),
+                                    PieLoaderRepackLayout::MarlinMxfp4Scale,
+                                    pie_loader::raw(PieLoaderDType::U8),
+                                    {experts, intermediate_native, groups});
         state_mxfp4_block_scales(scales, out_base + ".weight");
 
-        PieLoaderRepackSpecView bias_spec =
-            repack_spec(PieLoaderRepackLayout::DenseRowGather, half.row_map);
-        bias_spec.batch = u32_dim(experts, "GPT-OSS experts");
-        bias_spec.source_rows = u32_dim(fused_rows, "GPT-OSS gate/up bias rows");
-        bias_spec.source_row_offset =
-            u32_dim(local_start, "GPT-OSS gate/up bias source row offset");
-        bias_spec.target_rows = u32_dim(local_intermediate, "GPT-OSS gate/up bias target rows");
-        bias_spec.valid_rows = u32_dim(local_intermediate, "GPT-OSS gate/up bias valid rows");
-        bias_spec.source_stride_cols = 1;
-        bias_spec.source_col_offset = 0;
-        bias_spec.source_cols = 1;
-        bias_spec.target_cols = 1;
-        b.push_repack(out_base + ".bias", bias, pie_loader::raw(PieLoaderDType::BF16),
-                    {experts, local_intermediate}, bias_spec);
+        // The bias needed a `DenseRowGather` kernel only because the algebra
+        // could not say "every other row of this rank's band". It can, so this
+        // is a copy.
+        b.push_expr(out_base + ".bias", bias, {experts, local_intermediate}, rows(bias));
     }
 }
 
@@ -126,44 +104,25 @@ inline void gpt_oss_native_down(ContractBuilder& b, const SourceTensor& block, c
         bias.shape[0] != experts || bias.shape[1] != hidden) {
         fail("GPT-OSS native down '" + base + "' scale/bias shape mismatch");
     }
-    const std::int64_t full_intermediate = groups * 32;
-    const auto [local_start, local_intermediate] =
-        b.local_range(full_intermediate, "the intermediate size of '" + base + "'");
-    if (local_start % 32 != 0 || local_intermediate % 32 != 0) {
+    const std::int64_t local_intermediate = b.local_extent(groups * 32);
+    if (local_intermediate % 32 != 0) {
         fail("GPT-OSS native down '" + base +
              "' TP shard must align to MXFP4 32-wide groups");
     }
-    const std::int64_t local_groups = local_intermediate / 32;
-    const std::int64_t source_group_offset = local_start / 32;
     const std::int64_t intermediate_native = align_up(local_intermediate, 128);
 
-    PieLoaderRepackSpecView weight =
-        repack_spec(PieLoaderRepackLayout::MarlinMxfp4Weight, PieLoaderRowMap::Identity);
-    weight.batch = u32_dim(experts, "GPT-OSS experts");
-    weight.source_rows = u32_dim(hidden, "GPT-OSS down source rows");
-    weight.source_row_offset = 0;
-    weight.target_rows = u32_dim(hidden, "GPT-OSS down target rows");
-    weight.valid_rows = u32_dim(hidden, "GPT-OSS down valid rows");
-    weight.source_stride_cols = u32_dim(full_intermediate, "GPT-OSS down source stride");
-    weight.source_col_offset = u32_dim(local_start, "GPT-OSS down source column offset");
-    weight.source_cols = u32_dim(local_intermediate, "GPT-OSS intermediate size");
-    weight.target_cols = u32_dim(intermediate_native, "GPT-OSS padded intermediate size");
-    b.push_repack(base + ".weight", block, mxfp4_encoding(b.contract(), 2),
-                {experts, hidden, intermediate_native}, weight);
+    // Down is sharded along K, which is the packed axis: one group is 32
+    // elements, so this rank's column band is a `split` of the *group* axis and
+    // the offset never has to be spelled in elements.
+    b.push_repack(base + ".weight", b.split(b.contract().src(std::string(block.name)), 2),
+                  PieLoaderRepackLayout::MarlinMxfp4Weight, mxfp4_encoding(b.contract(), 2),
+                  {experts, hidden, intermediate_native});
 
-    PieLoaderRepackSpecView scale_spec =
-        repack_spec(PieLoaderRepackLayout::MarlinMxfp4Scale, PieLoaderRowMap::Identity);
-    scale_spec.batch = u32_dim(experts, "GPT-OSS experts");
-    scale_spec.source_rows = u32_dim(hidden, "GPT-OSS down source rows");
-    scale_spec.source_row_offset = 0;
-    scale_spec.target_rows = u32_dim(hidden, "GPT-OSS down target rows");
-    scale_spec.valid_rows = u32_dim(hidden, "GPT-OSS down valid rows");
-    scale_spec.source_stride_cols = u32_dim(groups, "GPT-OSS down source group stride");
-    scale_spec.source_col_offset = u32_dim(source_group_offset, "GPT-OSS down source group offset");
-    scale_spec.source_cols = u32_dim(local_groups, "GPT-OSS down source groups");
-    scale_spec.target_cols = u32_dim(intermediate_native / 32, "GPT-OSS down target groups");
-    auto scales = b.push_repack(base + ".weight_scale", scale, pie_loader::raw(PieLoaderDType::U8),
-                {experts, hidden, intermediate_native / 32}, scale_spec);
+    auto scales = b.push_repack(base + ".weight_scale",
+                                b.split(b.contract().src(std::string(scale.name)), 2),
+                                PieLoaderRepackLayout::MarlinMxfp4Scale,
+                                pie_loader::raw(PieLoaderDType::U8),
+                                {experts, hidden, intermediate_native / 32});
     state_mxfp4_block_scales(scales, base + ".weight");
 
     b.push_direct(bias, base + ".bias", std::nullopt);
@@ -197,6 +156,14 @@ inline void gpt_oss_native_group(ContractBuilder& b, const SourceTensor& block, 
 /// bind de-interleaves the gate/up bias with a kernel -- which is host work a
 /// group plan has no node for. Streaming them would buy nothing and cost a
 /// transform the contract cannot express, so they stay resident.
+///
+/// Rank-blind, and correctly so. The packed resident path publishes these same
+/// blocks with `push_direct`, unsharded: every rank holds the whole expert and
+/// the MoE is replicated rather than split. A group that selected this rank's
+/// band would therefore not match the residency it replaces. Streaming is a
+/// residency decision, so it inherits whatever TP layout the resident path
+/// chose -- here, none. (The native path *is* sharded, and it does not reach
+/// this function.)
 ///
 /// Packed only. The native path Marlin-repacks into a layout whose rows are
 /// permuted across the whole bank, so a single expert's repacked bytes are not
@@ -277,7 +244,7 @@ inline void gpt_oss_mxfp4_groups(ContractBuilder& b) {
     if (native && !b.target().native_mxfp4_moe) {
         fail("GPT-OSS native MXFP4 requested, but target does not support native MXFP4 MoE");
     }
-    if (!native && b.stream_routed_experts() && b.target().tp_size == 1) {
+    if (!native && b.stream_routed_experts()) {
         gpt_oss_streamed_expert_groups(b);
         return;
     }

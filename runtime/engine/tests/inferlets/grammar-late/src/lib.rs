@@ -26,7 +26,7 @@
 //! JSON input: `{"alphabet":[..],"max_tokens":N}` (defaults `[10,11,12,13]`, 8).
 
 use inferlet::mask::{all_allowed, apply_mask_argmax, bit_allowed, pack_allowed};
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, model as wit_model, serde_json};
 
 /// Default constraint alphabet: the only token ids the grammar ever allows.

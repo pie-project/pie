@@ -8,11 +8,25 @@ from abc import abstractmethod
 import weakref
 
 from componentize_py_types import Result, Ok, Err, Some
+from .imports import wasi_filesystem_types
+from .imports import wasi_http_types
 import componentize_py_async_support
 from componentize_py_async_support.streams import StreamReader, StreamWriter, ByteStreamReader, ByteStreamWriter
 from componentize_py_async_support.futures import FutureReader, FutureWriter
 
-def string_stream() -> tuple[StreamWriter[str], StreamReader[str]]:
+def byte_stream() -> tuple[ByteStreamWriter, ByteStreamReader]:
+    raise NotImplementedError
+
+def result_option_wasi_http_types_fields_wasi_http_types_error_code_future(default: Callable[[], Result[Optional[wasi_http_types.Fields], wasi_http_types.ErrorCode]]) -> tuple[FutureWriter[Result[Optional[wasi_http_types.Fields], wasi_http_types.ErrorCode]], FutureReader[Result[Optional[wasi_http_types.Fields], wasi_http_types.ErrorCode]]]:
+    raise NotImplementedError
+
+def result_unit_wasi_http_types_error_code_future(default: Callable[[], Result[None, wasi_http_types.ErrorCode]]) -> tuple[FutureWriter[Result[None, wasi_http_types.ErrorCode]], FutureReader[Result[None, wasi_http_types.ErrorCode]]]:
+    raise NotImplementedError
+
+def result_unit_wasi_filesystem_types_error_code_future(default: Callable[[], Result[None, wasi_filesystem_types.ErrorCode]]) -> tuple[FutureWriter[Result[None, wasi_filesystem_types.ErrorCode]], FutureReader[Result[None, wasi_filesystem_types.ErrorCode]]]:
+    raise NotImplementedError
+
+def wasi_filesystem_types_directory_entry_stream() -> tuple[StreamWriter[wasi_filesystem_types.DirectoryEntry], StreamReader[wasi_filesystem_types.DirectoryEntry]]:
     raise NotImplementedError
 
 

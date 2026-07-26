@@ -1,5 +1,5 @@
 """
-Session — ``pie:core/session``.
+Session — ``pie:inferlet/session``.
 
 Client communication: send/receive text and files.
 """

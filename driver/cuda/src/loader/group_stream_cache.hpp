@@ -76,42 +76,7 @@ public:
         bool verbose = false)
         : loader_(loader), groups_(groups), verbose_(verbose)
     {
-        if (groups.len == 0) {
-            throw std::runtime_error(
-                "group stream cache: nothing to page (no groups)");
-        }
-        std::uint64_t total_instances = 0;
-        for (std::size_t g = 0; g < groups.len; ++g) {
-            const auto& group = groups.ptr[g];
-            const std::string name = pie_loader::bytes_to_string(group.name);
-            if (group.plan == nullptr) {
-                throw std::runtime_error(
-                    "group stream cache: group \"" + name + "\" has no plan");
-            }
-            const std::uint64_t bytes = group.plan->memory.persistent_bytes;
-            if (bytes == 0) {
-                throw std::runtime_error(
-                    "group stream cache: group \"" + name + "\" occupies no "
-                    "persistent memory, so there is nothing to page");
-            }
-            // One stride for the whole slab, so a slot can hold any instance
-            // of any group. Every layer's experts have the same shape, so a
-            // disagreement here means the groups were not meant to share a
-            // cache and sizing one slab for them would be a guess.
-            if (slot_bytes_ == 0) {
-                slot_bytes_ = bytes;
-            } else if (bytes != slot_bytes_) {
-                throw std::runtime_error(
-                    "group stream cache: group \"" + name + "\" wants " +
-                    std::to_string(bytes) + " bytes per instance but \"" +
-                    pie_loader::bytes_to_string(groups.ptr[0].name) +
-                    "\" wants " + std::to_string(slot_bytes_) +
-                    ", so they cannot share a slab");
-            }
-            group_base_.push_back(total_instances);
-            total_instances += group.arity;
-            span_by_instr_.push_back(read_spans(*group.plan));
-        }
+        const std::uint64_t total_instances = scan_groups();
         if (budget_bytes < slot_bytes_) {
             throw std::runtime_error(
                 "group stream cache: one instance needs " +
@@ -143,27 +108,37 @@ public:
         // same thing without it.
         prefetch_enabled_ =
             !loader_config::env_present("PIE_CUDA_STREAM_NO_PREFETCH");
+        // Read once, not per access: `verify_fill` is called on every hit as
+        // well as every miss, and a `getenv` there is a scan of the
+        // environment inside the forward pass.
+        verify_fills_ =
+            loader_config::env_truthy("PIE_CUDA_STREAM_VERIFY");
+        CUDA_CHECK(cudaEventCreateWithFlags(&transform_done_,
+                                            cudaEventDisableTiming));
         allocate_slab();
-        if (cudaStreamCreateWithFlags(&prefetch_stream_, cudaStreamNonBlocking)
-            != cudaSuccess) {
-            prefetch_stream_ = nullptr;
-        }
-        slot_ready_.assign(slots, nullptr);
-        slot_pending_.assign(slots, false);
-        for (auto& ev : slot_ready_) {
-            CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
-        }
-        if (fully_resident()) {
-            // The budget can hold the group outright, so there is nothing to
-            // decide at runtime and no reason to pay for deciding. Fill every
-            // slot now and the forward never calls back into the host: no
-            // routed-set readback, no pointer rebuild, no eviction. A host
-            // tier would only be a second copy of what the slab already holds,
-            // so it is neither allocated nor warmed.
-            place_all();
-        } else {
-            allocate_host_tier(host_budget_bytes, total_instances);
-            warm_host_tier();
+        // Everything past the allocation can throw -- a missing binding, a
+        // layout that moved, any CUDA_CHECK. The destructor does not run for
+        // an object whose constructor did not finish, so without this a failed
+        // load leaks the whole slab and the pinned tier.
+        try {
+            if (fully_resident()) {
+                // The budget can hold the group outright, so there is nothing
+                // to decide at runtime and no reason to pay for deciding. Fill
+                // every slot now and the forward never calls back into the
+                // host: no routed-set readback, no pointer rebuild, no
+                // eviction. A host tier would only be a second copy of what
+                // the slab already holds, so it is neither allocated nor
+                // warmed.
+                place_all();
+            } else {
+                allocate_host_tier(host_budget_bytes, total_instances);
+                warm_host_tier();
+            }
+        } catch (...) {
+            free_slab();
+            free_host_tier();
+            if (transform_done_ != nullptr) cudaEventDestroy(transform_done_);
+            throw;
         }
     }
 
@@ -176,10 +151,7 @@ public:
         }
         free_slab();
         free_host_tier();
-        for (auto& ev : slot_ready_) {
-            if (ev != nullptr) cudaEventDestroy(ev);
-        }
-        if (prefetch_stream_ != nullptr) cudaStreamDestroy(prefetch_stream_);
+        if (transform_done_ != nullptr) cudaEventDestroy(transform_done_);
     }
 
     /// What paging actually cost, in the terms the next decision needs.
@@ -196,6 +168,10 @@ public:
         const std::uint64_t steady_ns =
             s.page_in_ns > s.first_page_in_ns ? s.page_in_ns - s.first_page_in_ns : 0;
         const std::uint64_t steady_misses = s.misses > 1 ? s.misses - 1 : 0;
+        const std::uint64_t steady_bytes =
+            s.bytes_paged_in > s.first_page_in_bytes
+                ? s.bytes_paged_in - s.first_page_in_bytes
+                : 0;
         const double page_in_ms = static_cast<double>(steady_ns) / 1e6;
         const double secs = static_cast<double>(steady_ns) / 1e9;
         out << "[pie-driver-cuda] group stream cache: " << accesses
@@ -209,16 +185,15 @@ public:
                     : static_cast<double>(steady_ns) / 1e3 /
                           static_cast<double>(steady_misses))
             << " us each, of "
-            << (s.misses == 0 ? 0.0
-                              : static_cast<double>(s.bytes_paged_in) /
-                                    static_cast<double>(s.misses) / 1048576.0)
+            << (steady_misses == 0 ? 0.0
+                                   : static_cast<double>(steady_bytes) /
+                                         static_cast<double>(steady_misses) / 1048576.0)
             << " MiB in " << page_in_ms << " ms ("
             << (secs == 0.0 ? 0.0
-                            : static_cast<double>(s.bytes_paged_in) / 1048576.0 / secs)
+                            : static_cast<double>(steady_bytes) / 1048576.0 / secs)
             << " MiB/s), " << (static_cast<double>(s.evict_wait_ns) / 1e6)
             << " ms waiting to evict, " << s.prefetches
-            << " prefetched, " << s.speculations << " speculative ("
-            << s.speculation_hits << " read before eviction), "
+            << " prefetched, "
             << s.host_tier_hits << " from host tier of "
             << host_slots_ << " slots; of the page-in, alloc " << s.alloc_ms
             << " ms, transfer " << s.transfer_ms << " ms, transform "
@@ -228,7 +203,6 @@ public:
     GroupStreamCache(const GroupStreamCache&) = delete;
     GroupStreamCache& operator=(const GroupStreamCache&) = delete;
 
-    std::size_t num_groups() const noexcept { return groups_.len; }
     /// The group named `name`, or `kNoGroup`. A bind path holds names, not
     /// indices, and resolving once at bind keeps the forward pass indexing.
     static constexpr std::size_t kNoGroup = static_cast<std::size_t>(-1);
@@ -257,8 +231,14 @@ public:
         return slot_bytes_ * num_slots();
     }
     /// True when the slab holds the whole group, so no page-in can ever miss
-    /// after the first sweep. The caller may use this to keep CUDA graph
-    /// capture on, since nothing will call into the host mid-forward.
+    /// after the first sweep.
+    ///
+    /// Not a capture claim. Every family that can stream turns CUDA graph
+    /// capture off on the cache existing at all, because a streamed contract
+    /// publishes groups instead of stacks and the forward then takes the
+    /// per-expert path, which reads the routing table back and synchronizes
+    /// whether or not the slab can miss. What sizing does buy is `all_placed`
+    /// below, and what that buys is a pointer table written once.
     bool fully_resident() const noexcept {
         return num_slots() == total_instances();
     }
@@ -284,7 +264,7 @@ public:
     /// established by other means -- `all_placed()` -- that residency cannot
     /// change under it, and only wants the pointers.
     const WeightStore* store_of(
-        std::size_t group, std::uint32_t instance) const noexcept
+        std::size_t group, std::uint32_t instance) const
     {
         const auto found = index_.find(flatten(group, instance));
         if (found == GroupSlotIndex::kAbsent) return nullptr;
@@ -308,16 +288,6 @@ public:
         if (found != GroupSlotIndex::kAbsent) {
             const auto slot = static_cast<std::uint32_t>(found);
             index_.touch_and_pin(slot);
-            // A speculative page-in ran on its own stream so that it could
-            // overlap the compute in front of it. This is where that bet is
-            // collected: the reader waits for the copy, on the device, without
-            // the host blocking on either.
-            if (slot_pending_[slot]) {
-                CUDA_CHECK(cudaStreamWaitEvent(
-                    compute_stream, slot_ready_[slot], 0));
-                slot_pending_[slot] = false;
-                ++stats_.speculation_hits;
-            }
             ++stats_.hits;
             verify_fill(slot, key, compute_stream);
             return slot_stores_[slot];
@@ -326,7 +296,6 @@ public:
         const auto acquired = index_.acquire(key);
         ++stats_.misses;
         if (!acquired.evicted) ++placed_;
-        drain_prefetch(acquired.slot);
         if (acquired.evicted) {
             const auto started = Clock::now();
             sync_stream(compute_stream);
@@ -341,46 +310,6 @@ public:
 
     /// Page `instance` in now, against a guess, on a stream of its own.
     ///
-    /// The same work `ensure_resident` does, moved earlier and off the compute
-    /// stream. Both halves matter: issuing it early is what gives the copy
-    /// something to hide behind, and issuing it elsewhere is what lets it
-    /// actually hide -- a copy queued on the compute stream runs between that
-    /// stream's kernels, not beside them.
-    ///
-    /// Speculative, so it is allowed to be wrong. A prediction that misses
-    /// costs one slot's worth of bandwidth and nothing else; the reader still
-    /// pages the right instance in on demand. Nothing here may block the host,
-    /// because the whole point is to return before the bytes have moved.
-    void prefetch_resident(
-        std::size_t group,
-        std::uint32_t instance,
-        cudaStream_t compute_stream)
-    {
-        if (prefetch_stream_ == nullptr) return;
-        const std::uint32_t key = flatten(group, instance);
-        if (index_.find(key) != GroupSlotIndex::kAbsent) return;
-        // Only when the bytes can actually move without the host.
-        //
-        // A page-in that reads the checkpoint runs the group's plan, and that
-        // flushes its copy streams -- it blocks the host whichever stream it is
-        // handed. Speculating on one does not overlap anything; it just moves
-        // the same stall earlier and adds the cost of every guess that was
-        // wrong. Measured on gpt-oss-20b reading from SSD, predicting made the
-        // run 30% slower. From the host tier the copy is one async DMA out of
-        // pinned memory, which is the case this is for.
-        if (host_of_.count(key) == 0) return;
-        const auto acquired = index_.acquire(key);
-        ++stats_.misses;
-        ++stats_.speculations;
-        if (!acquired.evicted) ++placed_;
-        drain_prefetch(acquired.slot);
-        if (acquired.evicted) sync_stream(compute_stream);
-        fill(acquired.slot, group, instance, key, prefetch_stream_);
-        CUDA_CHECK(cudaEventRecord(slot_ready_[acquired.slot], prefetch_stream_));
-        slot_pending_[acquired.slot] = true;
-        index_.release(acquired.slot);
-    }
-
     /// Say that `instance` will be wanted, without waiting for it.
     ///
     /// Only the host half: it asks the kernel to start faulting in the bytes
@@ -441,25 +370,67 @@ public:
         /// microseconds against a steady-state miss of a few tens it would
         /// otherwise dominate the average and hide what a miss really costs.
         std::uint64_t first_page_in_ns = 0;
+        /// Its bytes, held out for the same reason. Reporting MiB/s over the
+        /// unadjusted byte total against a time total that excludes warm-up
+        /// inflates the rate by exactly the warm-up transfer, and MiB/s is the
+        /// number that decides whether the source is fast enough.
+        std::uint64_t first_page_in_bytes = 0;
         std::uint64_t prefetches = 0;
         /// Misses served from the host tier rather than the checkpoint. They
         /// are still misses -- the slab did not hold the instance -- but they
         /// cost one H2D instead of a read, a plan and a transform.
         std::uint64_t host_tier_hits = 0;
-        /// Page-ins issued against a prediction, and how many were read before
-        /// being evicted. The ratio is the prediction's accuracy as the cache
-        /// sees it, which is the only form of it that pays.
-        std::uint64_t speculations = 0;
-        std::uint64_t speculation_hits = 0;
     };
 
-    Stats stats() const noexcept {
-        Stats out = stats_;
-        return out;
-    }
+    Stats stats() const noexcept { return stats_; }
     std::uint64_t evictions() const noexcept { return index_.evictions(); }
 
 private:
+    /// Validate the groups and lay out the one flat key space over them.
+    ///
+    /// Returns the total instance count, and on the way establishes the
+    /// single slot stride the whole slab is sized in.
+    std::uint64_t scan_groups()
+    {
+        if (groups_.len == 0) {
+            throw std::runtime_error(
+                "group stream cache: nothing to page (no groups)");
+        }
+        std::uint64_t total_instances = 0;
+        for (std::size_t g = 0; g < groups_.len; ++g) {
+            const auto& group = groups_.ptr[g];
+            const std::string name = pie_loader::bytes_to_string(group.name);
+            if (group.plan == nullptr) {
+                throw std::runtime_error(
+                    "group stream cache: group \"" + name + "\" has no plan");
+            }
+            const std::uint64_t bytes = group.plan->memory.persistent_bytes;
+            if (bytes == 0) {
+                throw std::runtime_error(
+                    "group stream cache: group \"" + name + "\" occupies no "
+                    "persistent memory, so there is nothing to page");
+            }
+            // One stride for the whole slab, so a slot can hold any instance
+            // of any group. Every layer's experts have the same shape, so a
+            // disagreement here means the groups were not meant to share a
+            // cache and sizing one slab for them would be a guess.
+            if (slot_bytes_ == 0) {
+                slot_bytes_ = bytes;
+            } else if (bytes != slot_bytes_) {
+                throw std::runtime_error(
+                    "group stream cache: group \"" + name + "\" wants " +
+                    std::to_string(bytes) + " bytes per instance but \"" +
+                    pie_loader::bytes_to_string(groups_.ptr[0].name) +
+                    "\" wants " + std::to_string(slot_bytes_) +
+                    ", so they cannot share a slab");
+            }
+            group_base_.push_back(total_instances);
+            total_instances += group.arity;
+            span_by_instr_.push_back(read_spans(*group.plan));
+        }
+        return total_instances;
+    }
+
     /// How much each rebindable instruction reads, by instruction id.
     ///
     /// A binding says where an instance reads and not how much, because the
@@ -506,14 +477,8 @@ private:
         return slab_ + static_cast<std::uint64_t>(slot) * slot_bytes_;
     }
 
-    /// Run instance `instance`'s plan into `slot`.
-    ///
-    /// The executor is the one the resident load uses, told two things: the
-    /// destination arena is this slot, and the sources are this instance's.
-    /// Its output goes to a scratch store; on a slot's first fill that store
-    /// becomes the slot's, and afterwards it is checked against it and thrown
-    /// away, because the layout is what the loader proved constant, not the
-    /// bytes.
+    /// One flat key space over every instance of every group, which is what
+    /// the slot index is addressed by.
     std::uint32_t flatten(std::size_t group, std::uint32_t instance) const
     {
         if (group >= groups_.len) {
@@ -585,13 +550,13 @@ private:
     /// reduces to.
     void verify_fill(std::uint32_t slot, std::uint32_t key, cudaStream_t stream)
     {
-        if (!loader_config::env_truthy("PIE_CUDA_STREAM_VERIFY")) return;
-        // Windows spread across the whole slot, not just its ends: a page-in
-        // is many buffers and a wrong one in the middle is exactly what the
-        // ends cannot see.
-        // Over the named tensors, not the raw slot: the gaps a plan leaves
+        if (!verify_fills_) return;
+        // Over the named tensors rather than the raw slot, and windowed
+        // across each rather than sampled at its ends. The gaps a plan leaves
         // between its buffers are nobody's bytes and nothing reads them, so
-        // hashing them only reports that a slot was previously somebody else.
+        // hashing them would only report that the slot was previously
+        // somebody else; and a page-in is many buffers, so a wrong one in the
+        // middle is exactly what the ends cannot see.
         constexpr std::size_t kWindows = 16;
         constexpr std::size_t kWindow = 4096;
         std::vector<std::uint8_t> buf(kWindow);
@@ -627,12 +592,18 @@ private:
         }
     }
 
-    std::unordered_map<std::uint32_t, std::uint64_t> fill_digest_;
-
     std::uint8_t* host_slot(std::uint32_t at) const noexcept {
         return host_tier_ + static_cast<std::uint64_t>(at) * slot_bytes_;
     }
 
+    /// Run instance `instance`'s plan into `slot`.
+    ///
+    /// The executor is the one the resident load uses, told two things: the
+    /// destination arena is this slot, and the sources are this instance's.
+    /// Its output goes to a scratch store; on a slot's first fill that store
+    /// becomes the slot's, and afterwards it is checked against it and thrown
+    /// away, because the layout is what the loader proved constant, not the
+    /// bytes.
     void fill(std::uint32_t slot, std::size_t group_index,
               std::uint32_t instance, std::uint32_t key, cudaStream_t stream)
     {
@@ -671,11 +642,30 @@ private:
 
         const auto started = Clock::now();
         const auto stats = executor.execute(*group.plan, how);
+        // The executor's `flush` synchronizes its copy streams, but a plan's
+        // transforms -- tile maps, MXFP4 and WNA16 dequants, casts -- launch on
+        // the legacy default stream and nothing has waited for those. The
+        // compute stream is created `cudaStreamNonBlocking`, so it carries no
+        // implicit ordering against stream 0, and without this the caller can
+        // launch a GEMM over a slot whose dequant is still running.
+        //
+        // Groups whose plan is pure `ExtentWrite` -- GPT-OSS's packed experts,
+        // which is what this path was measured on -- never expose it. One that
+        // carries a `scale_per_block`, like DeepSeek-V4's, always would.
+        //
+        // An event rather than a synchronize: the point is to order the two
+        // streams, not to stop the host, and `keep_in_host` below reads the
+        // slot on `stream` and needs the same ordering.
+        CUDA_CHECK(cudaEventRecord(transform_done_, nullptr));
+        CUDA_CHECK(cudaStreamWaitEvent(stream, transform_done_, 0));
         stats_.bytes_paged_in += stats.h2d_copy_bytes;
         const std::uint64_t elapsed_ns = static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 Clock::now() - started).count());
-        if (stats_.misses == 1) stats_.first_page_in_ns = elapsed_ns;
+        if (stats_.misses == 1) {
+            stats_.first_page_in_ns = elapsed_ns;
+            stats_.first_page_in_bytes = stats_.bytes_paged_in;
+        }
         stats_.alloc_ms += stats.phase_alloc_ms;
         stats_.transfer_ms += stats.phase_transfer_ms;
         stats_.transform_ms += stats.phase_transform_ms;
@@ -755,20 +745,6 @@ private:
         host_of_.reserve(host_slots_);
     }
 
-    /// Read every instance the tier has room for, once, before the first token.
-    ///
-    /// Filling the tier on demand cannot pay for the misses that dominate a
-    /// routed model. Those are compulsory -- the first time a token routes to
-    /// an expert, nothing has seen it yet -- and a cache populated by misses
-    /// only ever serves the *second* miss on a key. Measured on gpt-oss-20b at
-    /// a 6 GB slab, 754 page-ins produced 141 tier hits, because at an 88% hit
-    /// rate almost nothing is fetched twice.
-    ///
-    /// So this is not a cache warm-up but a placement decision, made where the
-    /// resident path makes the same one: at load. It costs a full read of the
-    /// group here in exchange for every later page-in being a PCIe transfer
-    /// rather than a disk read, which the numbers price at roughly 4 GB/s
-    /// against 15 GB/s.
     /// Give every instance its permanent slot, at load.
     ///
     /// Only called when `fully_resident()`, where the index hands out a
@@ -806,6 +782,20 @@ private:
         }
     }
 
+    /// Read every instance the tier has room for, once, before the first token.
+    ///
+    /// Filling the tier on demand cannot pay for the misses that dominate a
+    /// routed model. Those are compulsory -- the first time a token routes to
+    /// an expert, nothing has seen it yet -- and a cache populated by misses
+    /// only ever serves the *second* miss on a key. Measured on gpt-oss-20b at
+    /// a 6 GB slab, 754 page-ins produced 141 tier hits, because at an 88% hit
+    /// rate almost nothing is fetched twice.
+    ///
+    /// So this is not a cache warm-up but a placement decision, made where the
+    /// resident path makes the same one: at load. It costs a full read of the
+    /// group here in exchange for every later page-in being a PCIe transfer
+    /// rather than a disk read, which the numbers price at roughly 4 GB/s
+    /// against 15 GB/s.
     void warm_host_tier()
     {
         if (host_tier_ == nullptr || host_slots_ == 0 || slot_stores_.empty()) {
@@ -834,6 +824,18 @@ private:
                 // `fill` stages into the tier itself; this loop only has to
                 // choose where.
                 fill(scratch, g, i, key, nullptr);
+                // The staging slot is about to be rewritten by the next
+                // iteration, whose copies run on the engine's own non-blocking
+                // streams -- unordered against the D2H `fill` just queued into
+                // the tier. Without this, instance i's tier entry can be
+                // overwritten by instance i+1's page-in while it is still being
+                // read out, and the corruption is invisible: the layout check
+                // passes because only the bytes are wrong.
+                //
+                // In the steady state the same reuse is safe only because
+                // eviction synchronizes first. This loop evicts nothing, so it
+                // has to say so itself.
+                CUDA_CHECK(cudaStreamSynchronize(nullptr));
                 ++staged;
             }
         }
@@ -848,18 +850,6 @@ private:
                              Clock::now() - started).count()
                       << " ms\n";
         }
-    }
-
-    /// Wait out any speculative copy still landing in `slot`.
-    ///
-    /// Blocking, unlike the reader's wait, because the caller is about to
-    /// overwrite these bytes from the host side and there is no kernel to
-    /// order against.
-    void drain_prefetch(std::uint32_t slot)
-    {
-        if (slot >= slot_pending_.size() || !slot_pending_[slot]) return;
-        CUDA_CHECK(cudaEventSynchronize(slot_ready_[slot]));
-        slot_pending_[slot] = false;
     }
 
     void free_host_tier() noexcept
@@ -898,6 +888,7 @@ private:
     std::vector<std::unordered_map<std::uint32_t, Span>> span_by_instr_;
     bool verbose_ = false;
     bool prefetch_enabled_ = true;
+    bool verify_fills_ = false;
 
     std::uint64_t slot_bytes_ = 0;
     std::uint8_t* slab_ = nullptr;
@@ -906,10 +897,9 @@ private:
     std::uint32_t host_slots_ = 0;
     std::unordered_map<std::uint32_t, std::uint32_t> host_of_;
 
-    /// Where speculative page-ins run, and how a reader learns one has landed.
-    cudaStream_t prefetch_stream_ = nullptr;
-    std::vector<cudaEvent_t> slot_ready_;
-    std::vector<bool> slot_pending_;
+    /// Orders a page-in's transforms, which run on the legacy default stream,
+    /// against whichever stream the reader is on.
+    cudaEvent_t transform_done_ = nullptr;
 
     /// Distinct instances that have ever been given a slot. Only meaningful
     /// alongside `fully_resident()`, where a slot is never taken back.
@@ -918,6 +908,8 @@ private:
     std::vector<WeightStore> slot_stores_;
     std::vector<bool> slot_filled_;
     Stats stats_;
+    /// `verify_fill`'s record of what each instance hashed to last time.
+    std::unordered_map<std::uint32_t, std::uint64_t> fill_digest_;
 };
 
 }  // namespace pie_cuda_driver

@@ -64,7 +64,7 @@
 //! tensor; only the one-time hand-off is on the host, which is also what makes
 //! the selection independently checkable in `Output`.
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, model as wit_model};
 use serde::{Deserialize, Serialize};
 

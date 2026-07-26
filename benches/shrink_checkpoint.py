@@ -234,6 +234,10 @@ class Plan:
     config_rewrite: Callable[[dict, "Plan"], None] | None = None
     # sub-config holding the text model (Kimi wraps it in "text_config")
     text_cfg_key: str | None = None
+    # AttnRes residual-block stride, scaled with the depth (Kimi-K3)
+    attn_res_block_size: int | None = None
+    # drop the vision tower and flatten `text_cfg_key` to the top level
+    text_only: bool = False
 
 
 def _text_cfg(cfg: dict, plan: Plan) -> dict:
@@ -247,7 +251,7 @@ def _rewrite_common(cfg: dict, plan: Plan) -> None:
         for key in ("n_routed_experts", "num_experts", "num_local_experts"):
             if key in tc:
                 tc[key] = plan.experts
-        for key in ("num_experts_per_tok", "moe_topk"):
+        for key in ("num_experts_per_tok", "num_experts_per_token", "moe_topk"):
             if key in tc and isinstance(tc[key], int):
                 tc[key] = min(tc[key], plan.experts)
         # noaux_tc group routing must stay divisible
@@ -295,6 +299,93 @@ def _rewrite_kimi(cfg: dict, plan: Plan) -> None:
             1 for i in plan.src_layers if i < tc["first_k_dense_replace"])
 
 
+def _dense_prefix_len(plan: Plan, first_k_dense_replace: int) -> int:
+    """Length of the leading run of selected layers that are dense.
+
+    `first_k_dense_replace` names a *prefix* of the output layers, so a
+    selection that puts a dense source layer anywhere but at the front (or
+    repeats it) cannot be described by the config at all.
+    """
+    is_dense = [i < first_k_dense_replace for i in plan.src_layers]
+    n = 0
+    while n < len(is_dense) and is_dense[n]:
+        n += 1
+    if any(is_dense[n:]):
+        raise SystemExit(
+            f"{plan.family}: the dense (pre-MoE) source layers must be selected "
+            f"once and up front, because `first_k_dense_replace` can only name a "
+            f"prefix; got --layers {plan.src_layers}")
+    return n
+
+
+TEXT_TOWER_PREFIX = "language_model."
+
+
+def _strip_text_tower(name: str) -> str:
+    return name[len(TEXT_TOWER_PREFIX):] if name.startswith(TEXT_TOWER_PREFIX) else name
+
+
+def _flatten_text_only(cfg: dict, plan: Plan) -> None:
+    """Turn a multimodal config into a text-only one of the same decoder.
+
+    The text sub-config moves to the top level, the vision half goes away, and
+    the architecture is renamed so nothing claims to still take images. The
+    decoder itself is untouched -- same widths, same layer types, same weights
+    -- which is the whole point: a text-only K3 is still a K3 text tower, and
+    it is the only half a text-generation parity run compares.
+    """
+    tc = cfg.pop(plan.text_cfg_key)
+    for key in ("architectures", "auto_map", "_name_or_path", "model_type",
+                "torch_dtype", "dtype"):
+        tc.pop(key, None)
+    for key in ("vision_config", "auto_map", "image_placeholder",
+                "media_placeholder_token_id", "ignore_index"):
+        cfg.pop(key, None)
+    cfg.update(tc)
+    cfg["model_type"] = "kimi_k3"
+    cfg["architectures"] = ["KimiK3ForCausalLM"]
+
+
+def _rewrite_kimi_k3(cfg: dict, plan: Plan) -> None:
+    _rewrite_common(cfg, plan)
+    tc = _text_cfg(cfg, plan)
+    if "first_k_dense_replace" in tc:
+        tc["first_k_dense_replace"] = _dense_prefix_len(
+            plan, tc["first_k_dense_replace"])
+
+    # `kda_layers` / `full_attn_layers` are **1-indexed**: layer `i` is KDA
+    # when `i + 1` is listed (`KimiLinearConfig.is_kda_layer`). Rebuild both
+    # from the source layers' types so the hybrid pattern survives the cut.
+    lac = tc.get("linear_attn_config")
+    if isinstance(lac, dict):
+        src_kda = set(lac.get("kda_layers") or ())
+        kda: list[int] = []
+        full: list[int] = []
+        for out_idx, src_idx in enumerate(plan.src_layers):
+            (kda if (src_idx + 1) in src_kda else full).append(out_idx + 1)
+        if not kda or not full:
+            raise SystemExit(
+                "kimi_k3: the selection must keep at least one KDA layer and one "
+                "full-attention (MLA) layer; source MLA layers are "
+                f"{sorted(i - 1 for i in (lac.get('full_attn_layers') or ()))[:8]}...")
+        lac["kda_layers"] = kda
+        lac["full_attn_layers"] = full
+
+    # AttnRes opens a new residual block every `attn_res_block_size` layers and
+    # every layer then blends over the blocks opened so far. Left at the
+    # production 12 a shrunken model would only ever hold one block -- the one
+    # width the blend does not actually have to mix -- so scale the stride with
+    # the depth unless the caller pinned it.
+    if "attn_res_block_size" in tc:
+        want = plan.attn_res_block_size
+        if want is None:
+            want = max(2, len(plan.src_layers) // 3)
+        tc["attn_res_block_size"] = min(int(want), tc["attn_res_block_size"])
+
+    if plan.text_only:
+        _flatten_text_only(cfg, plan)
+
+
 def _rewrite_gpt_oss(cfg: dict, plan: Plan) -> None:
     _rewrite_common(cfg, plan)
     # `layer_types` is what makes a layer sliding vs full attention.
@@ -305,7 +396,42 @@ def _rewrite_gpt_oss(cfg: dict, plan: Plan) -> None:
         cfg["experts_per_token"] = min(cfg["experts_per_token"], plan.experts)
 
 
+def _rewrite_qwen3_5_moe(cfg: dict, plan: Plan) -> None:
+    _rewrite_common(cfg, plan)
+    # Everything below lives in `text_config`, not at the top level: the
+    # checkpoint is a `Qwen3_5MoeForConditionalGeneration` wrapper around the
+    # text tower, and reading `cfg` directly silently rewrites nothing.
+    tc = _text_cfg(cfg, plan)
+    # `layer_types` is what makes a layer linear vs full attention, and the
+    # pattern has period `full_attention_interval`; a block that is a whole
+    # number of periods keeps the ratio the model was trained with.
+    if isinstance(tc.get("layer_types"), list):
+        tc["layer_types"] = _slice_list(tc["layer_types"], plan.src_layers)
+
+
 FAMILIES: dict[str, dict[str, Any]] = {
+    "qwen3_5_moe": dict(
+        layer_prefix="model.language_model.layers.",
+        # Qwen3.5 ships the routed bank already stacked on dim 0 -- one
+        # `gate_up_proj` and one `down_proj` per layer, no per-expert name --
+        # so `router_suffixes` does all the slicing, as it does for gpt-oss.
+        expert_re=None,
+        router_suffixes=(
+            "mlp.gate.weight",
+            "mlp.experts.gate_up_proj",
+            "mlp.experts.down_proj",
+        ),
+        globals_keep=("model.language_model.embed_tokens.weight",
+                      "model.language_model.norm.weight",
+                      "lm_head.weight"),
+        # Period 4: three `linear_attention` layers then one `full_attention`.
+        # Eight layers is two whole periods, so both kernels and both cache
+        # kinds are exercised.
+        default_layers="0-7",
+        config_rewrite=_rewrite_qwen3_5_moe,
+        text_cfg_key="text_config",
+        keep_res=(re.compile(r"^model\.visual\."),),
+    ),
     "glm_moe_dsa": dict(
         layer_prefix="model.layers.",
         expert_re=re.compile(r"\.mlp\.experts\.(\d+)\."),
@@ -332,6 +458,25 @@ FAMILIES: dict[str, dict[str, Any]] = {
                       "language_model.lm_head.weight"),
         default_layers="0-3",
         config_rewrite=_rewrite_kimi,
+        text_cfg_key="text_config",
+        keep_res=(re.compile(r"^vision_tower\."), re.compile(r"^mm_projector\.")),
+    ),
+    "kimi_k3": dict(
+        layer_prefix="language_model.model.layers.",
+        expert_re=re.compile(r"\.block_sparse_moe\.experts\.(\d+)\."),
+        router_suffixes=("block_sparse_moe.gate.weight",
+                         "block_sparse_moe.gate.e_score_correction_bias"),
+        globals_keep=("language_model.model.embed_tokens.weight",
+                      "language_model.model.norm.weight",
+                      "language_model.lm_head.weight",
+                      # AttnRes blends the whole block stack once more at the end
+                      "language_model.model.output_attn_res_norm.weight",
+                      "language_model.model.output_attn_res_proj.weight"),
+        # Layer 0 is the only dense MLP and the attention pattern has period 4
+        # (three KDA layers then one MLA layer), so 0-7 covers every layer kind
+        # twice and stays a whole number of periods.
+        default_layers="0-7",
+        config_rewrite=_rewrite_kimi_k3,
         text_cfg_key="text_config",
         keep_res=(re.compile(r"^vision_tower\."), re.compile(r"^mm_projector\.")),
     ),
@@ -443,6 +588,14 @@ def main() -> int:
                          "reused, so this costs no extra download)")
     ap.add_argument("--experts", type=int, default=8,
                     help="routed experts to keep per MoE layer (0 = all)")
+    ap.add_argument("--attn-res-block-size", type=int, default=None,
+                    help="Kimi-K3 AttnRes residual-block stride (default: "
+                         "scaled down with the kept depth so the blend sees "
+                         "more than one block)")
+    ap.add_argument("--text-only", action="store_true",
+                    help="drop the vision tower and flatten the text sub-config "
+                         "to the top level, producing a text-only checkpoint of "
+                         "the same decoder (Kimi-K3)")
     ap.add_argument("--cache", default=None,
                     help="raw tensor cache dir (default: <out>/.srccache)")
     ap.add_argument("--keep-cache", action="store_true")
@@ -476,13 +629,22 @@ def main() -> int:
         globals_keep=fam["globals_keep"],
         config_rewrite=fam["config_rewrite"],
         text_cfg_key=fam.get("text_cfg_key"),
+        attn_res_block_size=args.attn_res_block_size,
+        text_only=args.text_only,
     )
 
     index_json = json.loads(fetch_bytes(args.repo, args.revision,
                                         "model.safetensors.index.json"))
     weight_map: dict[str, str] = index_json["weight_map"]
 
-    pairs = build_out_tensors(weight_map, plan, fam.get("keep_res", ()))
+    pairs = build_out_tensors(weight_map, plan,
+                              () if args.text_only else fam.get("keep_res", ()))
+    if args.text_only and plan.layer_prefix.startswith(TEXT_TOWER_PREFIX):
+        # A text-only checkpoint has no second tower to disambiguate, and the
+        # text-only architecture reads its own weights at the top level -- so
+        # the wrapper prefix has to come off the tensor names too, not just
+        # out of the config.
+        pairs = [(_strip_text_tower(out), src) for out, src in pairs]
     src_names = sorted({s for _, s in pairs})
     print(f"      {len(weight_map)} source tensors -> {len(pairs)} output tensors "
           f"({len(src_names)} distinct downloads)")

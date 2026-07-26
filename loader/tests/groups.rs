@@ -428,3 +428,80 @@ fn a_group_composes_with_a_shard() {
         assert_eq!(binding[0].file_offset, index as u64 * span + half);
     }
 }
+
+/// Which storage shape a group uses decides whether a checkpoint rewrite can
+/// make it streamable, so the loader states it rather than leaving the tool to
+/// infer it from names.
+///
+/// Streaming reads a weight where it lies, through a mapping, so an instance
+/// has to begin on a page of its own. When each instance is its own tensor,
+/// moving that tensor onto a page aligns the instance -- the instance *is* the
+/// tensor. When every instance is a band of one fused bank, moving the bank
+/// aligns instance 0 and no other: the rest begin at `base + i * stride`, and
+/// the stride is whatever the shape makes it. Nothing a rewrite can do to a
+/// bank's position changes that.
+mod streamability {
+    use super::*;
+    use pie_loader::checkpoint::align::streamable_tensors;
+
+    /// A bank is reported as a bank. Aligning it would produce a checkpoint
+    /// that loads, streams, and faults in all four experts to read one --
+    /// correct, slower than not streaming, and with nothing on disk to say so.
+    #[test]
+    fn a_fused_bank_cannot_be_aligned_by_moving_it() {
+        let expr = Expr::src("experts.bank").select(0, 1, 1);
+        let metadata = fused_checkpoint();
+        let plan = compile(&metadata, &contract(banded(expr)), target()).unwrap();
+
+        let streamable = streamable_tensors(&plan, &metadata);
+        assert_eq!(
+            streamable.banded.iter().cloned().collect::<Vec<_>>(),
+            vec!["experts.bank".to_string()]
+        );
+        assert!(
+            streamable.whole.is_empty(),
+            "instance 0 binds the bank's own offset and must not be mistaken for a \
+             whole tensor on that evidence: {:?}",
+            streamable.whole
+        );
+    }
+
+    /// Separately named instances are alignable, and every one of them is
+    /// named -- an aligner told about only some would leave the rest streaming
+    /// off unaligned pages.
+    #[test]
+    fn separately_named_instances_are_each_alignable() {
+        let expr = Expr::src_indexed("experts.{}.w");
+        let metadata = named_checkpoint();
+        let plan = compile(&metadata, &contract(group(expr)), target()).unwrap();
+
+        let streamable = streamable_tensors(&plan, &metadata);
+        assert!(streamable.banded.is_empty(), "{:?}", streamable.banded);
+        assert_eq!(
+            streamable.whole.iter().cloned().collect::<Vec<_>>(),
+            (0..EXPERTS)
+                .map(|e| format!("experts.{e}.w"))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A contract with no groups declares nothing interchangeable, so there is
+    /// nothing to stream and aligning would only add padding.
+    #[test]
+    fn a_contract_without_groups_offers_nothing_to_stream() {
+        let metadata = named_checkpoint();
+        let plan = compile(
+            &metadata,
+            &ModelContract {
+                alignment: 256,
+                tensors: Vec::new(),
+                groups: Vec::new(),
+            },
+            target(),
+        )
+        .unwrap();
+
+        let streamable = streamable_tensors(&plan, &metadata);
+        assert!(streamable.whole.is_empty() && streamable.banded.is_empty());
+    }
+}

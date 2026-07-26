@@ -9,7 +9,7 @@
 //! int-bits-as-f32 ≈ a ~1e-40 denormal); a plausible positive entropy here
 //! proves the #18-class stays locked.
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, model as wit_model};
 
 #[inferlet::main]

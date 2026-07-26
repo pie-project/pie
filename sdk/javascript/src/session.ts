@@ -1,7 +1,7 @@
-// Session functions — wraps pie:core/session WIT interface.
+// Session functions — wraps pie:inferlet/session WIT interface.
 // Handles communication with the remote user client.
 
-import * as _session from 'pie:core/session';
+import * as _session from 'pie:inferlet/session';
 
 /** Sends a message to the remote user client.
  *

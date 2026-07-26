@@ -625,6 +625,18 @@ pub struct MetalDriverOptions {
     pub max_forward_requests: u32,
     pub cpu_pages: u32,
     pub kv_cache_dtype: String,
+    /// Page routed MoE experts in from a mapping of the checkpoint instead of
+    /// keeping every expert resident in the heap.
+    ///
+    /// The same knob, spelled the same way, as the CUDA driver's -- because it
+    /// is the same decision: a residency trade the operator makes about a
+    /// model. What the two backends *do* with it differs (CUDA copies through
+    /// a bounded slab, Metal binds over a file-backed mapping and lets the
+    /// kernel evict), which is a backend's business and not the operator's.
+    ///
+    /// Off by default: it trades resident memory for page faults, which only
+    /// pays when the weights do not comfortably fit.
+    pub stream_routed_experts: bool,
     #[serde(skip)]
     pub device: String,
     #[serde(skip)]
@@ -645,6 +657,7 @@ impl Default for MetalDriverOptions {
             max_forward_requests: 512,
             cpu_pages: 0,
             kv_cache_dtype: "auto".to_string(),
+            stream_routed_experts: false,
             device: "metal:0".to_string(),
             verbose: false,
             ready_timeout_s: 120.0,

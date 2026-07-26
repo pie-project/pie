@@ -14,9 +14,7 @@
 //!   `has_*: bool` companion, matching the C++ views this replaces, so the
 //!   layout is legible from C without knowing Rust's niche rules.
 
-use crate::types::{
-    BackendKind, DType, QuantGranularity, QuantScheme, RepackLayout, RowMap, ScaleForm,
-};
+use crate::types::{BackendKind, DType, QuantGranularity, QuantScheme, RepackLayout, ScaleForm};
 
 /// Sentinel for "no buffer", mirroring the C++ `numeric_limits<uint32_t>::max()`
 /// default on `PieLoaderStorageInstrView::buffer_id`.
@@ -235,61 +233,38 @@ impl From<PieLoaderQuantScheme> for QuantScheme {
     }
 }
 
+/// A repack's kernel, across the ABI.
+///
+/// `None` is the wire sentinel for a transform that ends in no kernel, the way
+/// [`PieLoaderQuantScheme::None`] is for a transform that converts nothing. It
+/// is deliberately *not* a member of [`RepackLayout`]: outbound it means "this
+/// tile map is not a repack", and inbound — where the only reader is a contract
+/// node that has already said it is one — it is rejected, because an all-zero
+/// node is the shape a forgotten field has.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PieLoaderRepackLayout {
     None = 0,
     MarlinMxfp4Weight = 1,
     MarlinMxfp4Scale = 2,
-    DenseRowGather = 3,
 }
 
 impl From<RepackLayout> for PieLoaderRepackLayout {
     fn from(value: RepackLayout) -> Self {
         match value {
-            RepackLayout::None => Self::None,
             RepackLayout::MarlinMxfp4Weight => Self::MarlinMxfp4Weight,
             RepackLayout::MarlinMxfp4Scale => Self::MarlinMxfp4Scale,
-            RepackLayout::DenseRowGather => Self::DenseRowGather,
         }
     }
 }
 
-impl From<PieLoaderRepackLayout> for RepackLayout {
-    fn from(value: PieLoaderRepackLayout) -> Self {
+impl TryFrom<PieLoaderRepackLayout> for RepackLayout {
+    type Error = ();
+    fn try_from(value: PieLoaderRepackLayout) -> Result<Self, ()> {
         match value {
-            PieLoaderRepackLayout::None => Self::None,
-            PieLoaderRepackLayout::MarlinMxfp4Weight => Self::MarlinMxfp4Weight,
-            PieLoaderRepackLayout::MarlinMxfp4Scale => Self::MarlinMxfp4Scale,
-            PieLoaderRepackLayout::DenseRowGather => Self::DenseRowGather,
-        }
-    }
-}
-
-#[repr(u32)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PieLoaderRowMap {
-    Identity = 0,
-    Even = 1,
-    Odd = 2,
-}
-
-impl From<RowMap> for PieLoaderRowMap {
-    fn from(value: RowMap) -> Self {
-        match value {
-            RowMap::Identity => Self::Identity,
-            RowMap::Even => Self::Even,
-            RowMap::Odd => Self::Odd,
-        }
-    }
-}
-
-impl From<PieLoaderRowMap> for RowMap {
-    fn from(value: PieLoaderRowMap) -> Self {
-        match value {
-            PieLoaderRowMap::Identity => Self::Identity,
-            PieLoaderRowMap::Even => Self::Even,
-            PieLoaderRowMap::Odd => Self::Odd,
+            PieLoaderRepackLayout::None => Err(()),
+            PieLoaderRepackLayout::MarlinMxfp4Weight => Ok(Self::MarlinMxfp4Weight),
+            PieLoaderRepackLayout::MarlinMxfp4Scale => Ok(Self::MarlinMxfp4Scale),
         }
     }
 }
@@ -362,19 +337,6 @@ impl TryFrom<u32> for PieLoaderRepackLayout {
             0 => Self::None,
             1 => Self::MarlinMxfp4Weight,
             2 => Self::MarlinMxfp4Scale,
-            3 => Self::DenseRowGather,
-            other => return Err(other),
-        })
-    }
-}
-
-impl TryFrom<u32> for PieLoaderRowMap {
-    type Error = u32;
-    fn try_from(value: u32) -> Result<Self, u32> {
-        Ok(match value {
-            0 => Self::Identity,
-            1 => Self::Even,
-            2 => Self::Odd,
             other => return Err(other),
         })
     }
@@ -822,14 +784,9 @@ pub enum PieLoaderStorageOp {
         transform_from: PieLoaderQuantScheme,
         transform_to: PieLoaderQuantScheme,
         repack_layout: PieLoaderRepackLayout,
-        row_map: PieLoaderRowMap,
         transform_batch: u32,
         transform_source_rows: u32,
-        transform_source_row_offset: u32,
         transform_target_rows: u32,
-        transform_valid_rows: u32,
-        transform_source_stride_cols: u32,
-        transform_source_col_offset: u32,
         transform_source_cols: u32,
         transform_target_cols: u32,
         transform_scratch_bytes: u64,
@@ -849,16 +806,20 @@ pub enum PieLoaderStorageOp {
         /// constant the contract named — `__uint_as_float` on the CUDA side
         /// costs nothing and cannot round.
         transform_scale_factor_bits: u32,
-        /// Elements per factor along `transform_scale_axis` for a per-group
-        /// [`PieLoaderTileMapKind::Scale`]; zero when the factor is the uniform
-        /// constant above.
+        /// Elements of the operand per factor, on each axis, for a per-block
+        /// [`PieLoaderTileMapKind::Scale`]; empty when the factor is the
+        /// uniform constant above.
         ///
-        /// Non-zero is what tells the executor to read its factors from
+        /// Non-empty is what tells the executor to read its factors from
         /// `input_buffers[0]` — the operand the contract paired with the
         /// payload — instead of from `transform_scale_factor_bits`.
-        transform_scale_group: u32,
-        /// The axis `transform_scale_group` counts along.
-        transform_scale_axis: u8,
+        ///
+        /// One entry per axis of the destination, so a DeepSeek-style FP8
+        /// checkpoint's two-dimensional block scale is `[128, 128]` and the
+        /// ordinary row-wise case is `[1, 32]`. The executor already knows both
+        /// shapes, so this is a statement it can check rather than one it must
+        /// trust.
+        transform_scale_blocks: PieLoaderI64Slice,
     } = 2,
     CreateView {
         input_buffer: u32,

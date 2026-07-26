@@ -41,6 +41,7 @@
 #include "batch/frame.hpp"
 #include "batch/fire_timing.hpp"
 #include "batch/forward.hpp"
+#include "batch/planner_calibration.hpp"
 #include "batch/tp.hpp"
 #include "kernels/kv_paged.hpp"
 #include "store/kv_cache.hpp"
@@ -56,6 +57,7 @@
 #include "model/gemma4/gemma4_vision_adapter.hpp"
 #include "model/glm5/glm5_forward.hpp"
 #include "model/kimi/kimi_forward.hpp"
+#include "model/kimi_k3/kimi_k3_forward.hpp"
 #include "model/llama_like/llama_like.hpp"
 #include "model/loaded_model.hpp"
 #include "model/nemotron_h/nemotron_h_contract.hpp"
@@ -186,6 +188,12 @@ struct LaunchScratch {
         view.rs_fold_lens = pie_native::slice_from_u32(launch.rs_fold_lens.ptr, launch.rs_fold_lens.len);
         view.rs_buffer_slot_ids = pie_native::slice_from_u32(launch.rs_buffer_slot_ids.ptr, launch.rs_buffer_slot_ids.len);
         view.rs_buffer_slot_indptr = pie_native::slice_from_u32(launch.rs_buffer_slot_indptr.ptr, launch.rs_buffer_slot_indptr.len);
+        view.rs_buffer_read_slot_ids = pie_native::slice_from_u32(launch.rs_buffer_read_slot_ids.ptr, launch.rs_buffer_read_slot_ids.len);
+        view.rs_buffer_read_indptr = pie_native::slice_from_u32(launch.rs_buffer_read_indptr.ptr, launch.rs_buffer_read_indptr.len);
+        view.rs_buffer_read_lens = pie_native::slice_from_u32(launch.rs_buffer_read_lens.ptr, launch.rs_buffer_read_lens.len);
+        view.rs_buffer_heads = pie_native::slice_from_u32(launch.rs_buffer_heads.ptr, launch.rs_buffer_heads.len);
+        view.rs_translation = pie_native::slice_from_u32(launch.rs_translation.ptr, launch.rs_translation.len);
+        view.rs_translation_indptr = pie_native::slice_from_u32(launch.rs_translation_indptr.ptr, launch.rs_translation_indptr.len);
         view.flattened_masks = pie_native::slice_from_u32(launch.masks.words.ptr, launch.masks.words.len);
         view.mask_indptr = pie_native::slice_from_u32(launch.masks.word_indptr.ptr, launch.masks.word_indptr.len);
         view.sampling_indices = pie_native::slice_from_u32(launch.sampling_indices.ptr, launch.sampling_indices.len);
@@ -276,6 +284,12 @@ void expand_step(
     launch.rs_fold_lens = step.rs_fold_lens;
     launch.rs_buffer_slot_ids = step.rs_buffer_slot_ids;
     launch.rs_buffer_slot_indptr = step.rs_buffer_slot_indptr;
+    launch.rs_buffer_read_slot_ids = step.rs_buffer_read_slot_ids;
+    launch.rs_buffer_read_indptr = step.rs_buffer_read_indptr;
+    launch.rs_buffer_read_lens = step.rs_buffer_read_lens;
+    launch.rs_buffer_heads = step.rs_buffer_heads;
+    launch.rs_translation = step.rs_translation;
+    launch.rs_translation_indptr = step.rs_translation_indptr;
     launch.masks = step.masks;
     launch.sampling_indices = step.sampling_indices;
     launch.sampling_indptr = step.sampling_indptr;
@@ -977,6 +991,7 @@ int Context::Impl::load_model(
         family == model::Family::DeepSeekV4,
         family == model::Family::Kimi,
         family == model::Family::Glm5,
+        family == model::Family::KimiK3,
         kv_format, runtime_quant_scratch_base, verbose);
     std::size_t free_device_bytes = 0;
     std::size_t total_device_bytes = 0;
@@ -1045,6 +1060,7 @@ int Context::Impl::load_model(
          family == model::Family::Gemma4 ||
          family == model::Family::NemotronH ||
          family == model::Family::Kimi ||
+         family == model::Family::KimiK3 ||
          family == model::Family::Glm5 ||
          family == model::Family::Mixtral ||
          family == model::Family::DeepSeekV4);
@@ -1056,7 +1072,8 @@ int Context::Impl::load_model(
         : -1;
     const bool has_recurrent_state_cache =
         (family == model::Family::Qwen3_5 ||
-         family == model::Family::Qwen3_5Moe) &&
+         family == model::Family::Qwen3_5Moe ||
+         family == model::Family::KimiK3) &&
         qwen3_5_linear_layers > 0
         || (family == model::Family::NemotronH &&
             nemotron_h_mamba_layers > 0)
@@ -1101,6 +1118,7 @@ int Context::Impl::load_model(
                 engine.hf_config().head_dim,
                 kv_format);
         case model::Family::Kimi:
+        case model::Family::KimiK3:
         case model::Family::Glm5:
             return KvCache::allocate(
                 engine.hf_config().num_hidden_layers,
@@ -1157,9 +1175,13 @@ int Context::Impl::load_model(
     {
         ScopedCudaArenaAllocator arena(*kv_allocator_);
         mla_cache_p = own_value(
-            (family == model::Family::Kimi || family == model::Family::Glm5)
+            (family == model::Family::Kimi || family == model::Family::Glm5 ||
+             family == model::Family::KimiK3)
                 ? MlaCache::allocate(
-                      engine.hf_config().num_hidden_layers,
+                      family == model::Family::KimiK3
+                          ? engine.hf_config().num_hidden_layers -
+                                qwen3_5_linear_layers
+                          : engine.hf_config().num_hidden_layers,
                       physical_kv_pages,
                       mem_plan.kv_page_size,
                       engine.hf_config().kv_lora_rank,
@@ -1199,6 +1221,25 @@ int Context::Impl::load_model(
     auto* nemotron_h_state_cache_p = own_emplace<RecurrentStateCache>();
     auto& nemotron_h_state_cache = *nemotron_h_state_cache_p;
     int qwen3_5_runtime_rs_slots = 0;
+
+    if (family == model::Family::KimiK3 && qwen3_5_linear_layers > 0) {
+        // KDA is not grouped: q, k and v all carry `linear_num_value_heads`
+        // heads of `linear_value_head_dim`, and the three short convolutions
+        // are separate, so the conv slab is three full widths rather than
+        // Qwen3.5's `2*K + V`.
+        const auto& cfg_k = engine.hf_config();
+        const int local_kda_heads = cfg_k.linear_num_value_heads / local_tp_size;
+        const int W = local_kda_heads * cfg_k.linear_value_head_dim;
+        qwen3_5_runtime_rs_slots = std::max(1, runtime_state_slots);
+        {
+            ScopedCudaArenaAllocator arena(*state_allocator_);
+            qwen3_5_state_cache = RecurrentStateCache::allocate(
+                qwen3_5_layer_is_linear, /*conv_dim=*/3 * W,
+                cfg_k.linear_conv_kernel_dim, local_kda_heads,
+                cfg_k.linear_value_head_dim, cfg_k.linear_value_head_dim,
+                cfg_k.hidden_size, qwen3_5_runtime_rs_slots);
+        }
+    }
 
     if (family == model::Family::Qwen3_5 || family == model::Family::Qwen3_5Moe) {
         const auto& cfg_q = engine.hf_config();
@@ -1423,6 +1464,7 @@ int Context::Impl::load_model(
     model::DsV4Workspace* dsv4_ws_p = nullptr;
     model::KimiWorkspace* kimi_ws_p = nullptr;
     model::Glm5Workspace* glm5_ws_p = nullptr;
+    model::KimiK3Workspace* kimi_k3_ws_p = nullptr;
     {
         ScopedCudaArenaAllocator arena(*workspace_allocator_);
         dsv4_ws_p = own_value(
@@ -1444,7 +1486,14 @@ int Context::Impl::load_model(
                       mem_plan.capacity.max_logit_rows,
                       engine.hf_config().max_position_embeddings, local_tp_size)
                 : model::Glm5Workspace{});
+        kimi_k3_ws_p = own_value(
+            family == model::Family::KimiK3
+                ? model::KimiK3Workspace::allocate(
+                      engine.hf_config(), max_workspace_tokens,
+                      mem_plan.capacity.max_logit_rows, local_tp_size)
+                : model::KimiK3Workspace{});
     }
+    auto& kimi_k3_ws = *kimi_k3_ws_p;
     auto& dsv4_ws = *dsv4_ws_p;
     auto& kimi_ws = *kimi_ws_p;
     auto& glm5_ws = *glm5_ws_p;
@@ -1507,6 +1556,8 @@ int Context::Impl::load_model(
     resources.dsv4_comp_cache = &dsv4_comp_cache;
     resources.kimi_ws = &kimi_ws;
     resources.glm5_ws = &glm5_ws;
+    resources.kimi_k3_ws = &kimi_k3_ws;
+    resources.kimi_k3_state_cache = &qwen3_5_state_cache;
 
     auto* model_holder =
         own_value(arch_entry->create_model(std::move(plan), resources));
@@ -1592,7 +1643,8 @@ int Context::Impl::load_model(
             !has_recurrent_state_cache
                 ? nullptr
                 : ((family == model::Family::Qwen3_5 ||
-                    family == model::Family::Qwen3_5Moe)
+                    family == model::Family::Qwen3_5Moe ||
+                    family == model::Family::KimiK3)
                        ? &qwen3_5_state_cache
                        : &nemotron_h_state_cache
                   ));
@@ -1627,7 +1679,8 @@ int Context::Impl::load_model(
     // failure this repo already documents as unacceptable.
     const bool family_query_is_post_rope =
         family != model::Family::DeepSeekV4 && family != model::Family::Glm5 &&
-        family != model::Family::Kimi && family != model::Family::Qwen3_5 &&
+        family != model::Family::Kimi && family != model::Family::KimiK3 &&
+        family != model::Family::Qwen3_5 &&
         family != model::Family::Qwen3_5Moe &&
         family != model::Family::NemotronH;
     //
@@ -1714,6 +1767,14 @@ int Context::Impl::load_model(
         const CustomArVote local{
             static_cast<std::uint8_t>(
                 (disabled == nullptr || std::strcmp(disabled, "1") != 0) &&
+                        // The custom all-reduce reads its peers' arenas through
+                        // direct peer mappings, so it needs the same working
+                        // peer path NCCL's P2P transport does. Where that path
+                        // is broken it does not fail loudly -- it reduces
+                        // whatever the mapping yields (zeros) or wedges. Refuse
+                        // it on measured evidence rather than on topology
+                        // claims; NCCL's host-staged fallback still works.
+                        pie_cuda_driver::p2p_transport_usable() &&
                         !tp_group_devices_.empty() && !workspace_bases.empty()
                     ? 1
                     : 0),
@@ -1767,6 +1828,24 @@ int Context::Impl::load_model(
         attention_allocator_->ensure_all();
         state_allocator_->ensure_all();
         capture_forward_graph_lattice(*executor_);
+        if (!is_tp_follower()) {
+            workspace_allocator_->trim_bytes(pie::elastic::kLogicalPageBytes);
+            attention_allocator_->trim_bytes(0);
+            if (tp_size_ == 1) {
+                state_allocator_->trim_bytes(0);
+            }
+        }
+    }
+    // Opt-in: time the forward step across the token-budget ladder and cache
+    // the winner, so the next start selects `max_forward_tokens` from a
+    // measurement on THIS device instead of from the planner's analytic score.
+    // The sweep runs the real forward body, so it needs the arenas resident —
+    // hence the ensure/trim pair here rather than relying on the capture path's.
+    if (planner_calibration_requested()) {
+        workspace_allocator_->ensure_all();
+        attention_allocator_->ensure_all();
+        state_allocator_->ensure_all();
+        calibrate_memory_planner(*executor_, tp_size_, mem_plan.kv_page_size);
         if (!is_tp_follower()) {
             workspace_allocator_->trim_bytes(pie::elastic::kLogicalPageBytes);
             attention_allocator_->trim_bytes(0);
@@ -1882,7 +1961,8 @@ int Context::Impl::load_model(
              {"region_page_bytes", std::move(kv_region_page_bytes)},
          }},
     };
-    if (family == model::Family::Kimi || family == model::Family::Glm5) {
+    if (family == model::Family::Kimi || family == model::Family::Glm5 ||
+        family == model::Family::KimiK3) {
         // These families decode from MlaCache (and GLM5 also DsaCache);
         // kv_cache is only a 1x1 compatibility placeholder.
         kv_handle = nullptr;
@@ -1980,6 +2060,12 @@ std::size_t Context::Impl::required_state_slots(
     };
     include(launch.rs_slot_ids);
     include(launch.rs_buffer_slot_ids);
+    // Replayed slabs are read, never written, but they must still be resident:
+    // the gather gets a null slab pointer for an out-of-range id and would
+    // silently skip the replay, leaving the recurrence to start from the
+    // folded state alone -- the exact wrong answer the read path exists to
+    // prevent.
+    include(launch.rs_buffer_read_slot_ids);
     if (executor_->graph_pad_slot >= 0) {
         slots = std::max<std::size_t>(
             slots,
@@ -2608,7 +2694,19 @@ int Context::Impl::copy_state(const PieStateCopyDesc& copy, PieCompletion comple
 
 int Context::Impl::resize_pool(const PiePoolResizeDesc& resize, PieCompletion completion) {
     if (executor_ == nullptr) return PIE_STATUS_CLOSED;
-    if (tp_size_ > 1) return PIE_STATUS_UNSUPPORTED;
+    if (tp_size_ > 1) {
+        // UNSUPPORTED is the protocol's "not right now, ask again", so a
+        // permanent refusal here is indistinguishable from backpressure and
+        // the scheduler retries the resize forever. Say it once so the stall
+        // is attributable instead of silent.
+        static std::once_flag once;
+        std::call_once(once, [] {
+            std::cerr << "[pie-driver-cuda] resize_pool: elastic pools are "
+                         "not resizable at tp>1; every request will be "
+                         "refused\n";
+        });
+        return PIE_STATUS_UNSUPPORTED;
+    }
     collect_ready_async_resources();
     if (resize.pool_id > PIE_ELASTIC_POOL_WORKSPACE) {
         return PIE_STATUS_UNSUPPORTED;

@@ -32,18 +32,6 @@
       "rewrites": 2
     },
     {
-      "pass": "group-shared-source-reads",
-      "instrs_before": 89,
-      "instrs_after": 89,
-      "rewrites": 0
-    },
-    {
-      "pass": "merge-adjacent-extent-writes",
-      "instrs_before": 89,
-      "instrs_after": 89,
-      "rewrites": 0
-    },
-    {
       "pass": "recompute-memory-plan",
       "instrs_before": 89,
       "instrs_after": 89,
@@ -1527,25 +1515,11 @@
         "transform": {
           "from": null,
           "to": "Fp8E4M3",
-          "repack": {
-            "layout": "None",
-            "row_map": "Identity",
-            "batch": 0,
-            "source_rows": 0,
-            "source_row_offset": 0,
-            "target_rows": 0,
-            "valid_rows": 0,
-            "source_stride_cols": 0,
-            "source_col_offset": 0,
-            "source_cols": 0,
-            "target_cols": 0
-          },
+          "repack": null,
           "scratch_bytes": 0,
           "fusion": "None",
           "metadata_source": null,
-          "scale_factor_bits": 0,
-          "scale_group": 0,
-          "scale_axis": 0
+          "scale_factor_bits": 0
         }
       }
     },
@@ -1603,25 +1577,11 @@
         "transform": {
           "from": null,
           "to": "Fp8E4M3",
-          "repack": {
-            "layout": "None",
-            "row_map": "Identity",
-            "batch": 0,
-            "source_rows": 0,
-            "source_row_offset": 0,
-            "target_rows": 0,
-            "valid_rows": 0,
-            "source_stride_cols": 0,
-            "source_col_offset": 0,
-            "source_cols": 0,
-            "target_cols": 0
-          },
+          "repack": null,
           "scratch_bytes": 0,
           "fusion": "None",
           "metadata_source": null,
-          "scale_factor_bits": 0,
-          "scale_group": 0,
-          "scale_axis": 0
+          "scale_factor_bits": 0
         }
       }
     },
@@ -1679,25 +1639,11 @@
         "transform": {
           "from": null,
           "to": "Fp8E4M3",
-          "repack": {
-            "layout": "None",
-            "row_map": "Identity",
-            "batch": 0,
-            "source_rows": 0,
-            "source_row_offset": 0,
-            "target_rows": 0,
-            "valid_rows": 0,
-            "source_stride_cols": 0,
-            "source_col_offset": 0,
-            "source_cols": 0,
-            "target_cols": 0
-          },
+          "repack": null,
           "scratch_bytes": 0,
           "fusion": "None",
           "metadata_source": null,
-          "scale_factor_bits": 0,
-          "scale_group": 0,
-          "scale_axis": 0
+          "scale_factor_bits": 0
         }
       }
     },
@@ -1755,25 +1701,11 @@
         "transform": {
           "from": null,
           "to": "Fp8E4M3",
-          "repack": {
-            "layout": "None",
-            "row_map": "Identity",
-            "batch": 0,
-            "source_rows": 0,
-            "source_row_offset": 0,
-            "target_rows": 0,
-            "valid_rows": 0,
-            "source_stride_cols": 0,
-            "source_col_offset": 0,
-            "source_cols": 0,
-            "target_cols": 0
-          },
+          "repack": null,
           "scratch_bytes": 0,
           "fusion": "None",
           "metadata_source": null,
-          "scale_factor_bits": 0,
-          "scale_group": 0,
-          "scale_axis": 0
+          "scale_factor_bits": 0
         }
       }
     },
@@ -1838,25 +1770,11 @@
         "transform": {
           "from": null,
           "to": "Fp8E4M3",
-          "repack": {
-            "layout": "None",
-            "row_map": "Identity",
-            "batch": 0,
-            "source_rows": 0,
-            "source_row_offset": 0,
-            "target_rows": 0,
-            "valid_rows": 0,
-            "source_stride_cols": 0,
-            "source_col_offset": 0,
-            "source_cols": 0,
-            "target_cols": 0
-          },
+          "repack": null,
           "scratch_bytes": 0,
           "fusion": "None",
           "metadata_source": null,
-          "scale_factor_bits": 0,
-          "scale_group": 0,
-          "scale_axis": 0
+          "scale_factor_bits": 0
         }
       }
     },
@@ -1914,25 +1832,11 @@
         "transform": {
           "from": null,
           "to": "Fp8E4M3",
-          "repack": {
-            "layout": "None",
-            "row_map": "Identity",
-            "batch": 0,
-            "source_rows": 0,
-            "source_row_offset": 0,
-            "target_rows": 0,
-            "valid_rows": 0,
-            "source_stride_cols": 0,
-            "source_col_offset": 0,
-            "source_cols": 0,
-            "target_cols": 0
-          },
+          "repack": null,
           "scratch_bytes": 0,
           "fusion": "None",
           "metadata_source": null,
-          "scale_factor_bits": 0,
-          "scale_group": 0,
-          "scale_axis": 0
+          "scale_factor_bits": 0
         }
       }
     },
@@ -1990,25 +1894,11 @@
         "transform": {
           "from": null,
           "to": "Fp8E4M3",
-          "repack": {
-            "layout": "None",
-            "row_map": "Identity",
-            "batch": 0,
-            "source_rows": 0,
-            "source_row_offset": 0,
-            "target_rows": 0,
-            "valid_rows": 0,
-            "source_stride_cols": 0,
-            "source_col_offset": 0,
-            "source_cols": 0,
-            "target_cols": 0
-          },
+          "repack": null,
           "scratch_bytes": 0,
           "fusion": "None",
           "metadata_source": null,
-          "scale_factor_bits": 0,
-          "scale_group": 0,
-          "scale_axis": 0
+          "scale_factor_bits": 0
         }
       }
     },
@@ -2073,25 +1963,11 @@
         "transform": {
           "from": null,
           "to": "Fp8E4M3",
-          "repack": {
-            "layout": "None",
-            "row_map": "Identity",
-            "batch": 0,
-            "source_rows": 0,
-            "source_row_offset": 0,
-            "target_rows": 0,
-            "valid_rows": 0,
-            "source_stride_cols": 0,
-            "source_col_offset": 0,
-            "source_cols": 0,
-            "target_cols": 0
-          },
+          "repack": null,
           "scratch_bytes": 0,
           "fusion": "None",
           "metadata_source": null,
-          "scale_factor_bits": 0,
-          "scale_group": 0,
-          "scale_axis": 0
+          "scale_factor_bits": 0
         }
       }
     },
@@ -2149,25 +2025,11 @@
         "transform": {
           "from": null,
           "to": "Fp8E4M3",
-          "repack": {
-            "layout": "None",
-            "row_map": "Identity",
-            "batch": 0,
-            "source_rows": 0,
-            "source_row_offset": 0,
-            "target_rows": 0,
-            "valid_rows": 0,
-            "source_stride_cols": 0,
-            "source_col_offset": 0,
-            "source_cols": 0,
-            "target_cols": 0
-          },
+          "repack": null,
           "scratch_bytes": 0,
           "fusion": "None",
           "metadata_source": null,
-          "scale_factor_bits": 0,
-          "scale_group": 0,
-          "scale_axis": 0
+          "scale_factor_bits": 0
         }
       }
     },
@@ -2225,25 +2087,11 @@
         "transform": {
           "from": null,
           "to": "Fp8E4M3",
-          "repack": {
-            "layout": "None",
-            "row_map": "Identity",
-            "batch": 0,
-            "source_rows": 0,
-            "source_row_offset": 0,
-            "target_rows": 0,
-            "valid_rows": 0,
-            "source_stride_cols": 0,
-            "source_col_offset": 0,
-            "source_cols": 0,
-            "target_cols": 0
-          },
+          "repack": null,
           "scratch_bytes": 0,
           "fusion": "None",
           "metadata_source": null,
-          "scale_factor_bits": 0,
-          "scale_group": 0,
-          "scale_axis": 0
+          "scale_factor_bits": 0
         }
       }
     },
@@ -2301,25 +2149,11 @@
         "transform": {
           "from": null,
           "to": "Fp8E4M3",
-          "repack": {
-            "layout": "None",
-            "row_map": "Identity",
-            "batch": 0,
-            "source_rows": 0,
-            "source_row_offset": 0,
-            "target_rows": 0,
-            "valid_rows": 0,
-            "source_stride_cols": 0,
-            "source_col_offset": 0,
-            "source_cols": 0,
-            "target_cols": 0
-          },
+          "repack": null,
           "scratch_bytes": 0,
           "fusion": "None",
           "metadata_source": null,
-          "scale_factor_bits": 0,
-          "scale_group": 0,
-          "scale_axis": 0
+          "scale_factor_bits": 0
         }
       }
     },
@@ -2384,25 +2218,11 @@
         "transform": {
           "from": null,
           "to": "Fp8E4M3",
-          "repack": {
-            "layout": "None",
-            "row_map": "Identity",
-            "batch": 0,
-            "source_rows": 0,
-            "source_row_offset": 0,
-            "target_rows": 0,
-            "valid_rows": 0,
-            "source_stride_cols": 0,
-            "source_col_offset": 0,
-            "source_cols": 0,
-            "target_cols": 0
-          },
+          "repack": null,
           "scratch_bytes": 0,
           "fusion": "None",
           "metadata_source": null,
-          "scale_factor_bits": 0,
-          "scale_group": 0,
-          "scale_axis": 0
+          "scale_factor_bits": 0
         }
       }
     },
@@ -2460,25 +2280,11 @@
         "transform": {
           "from": null,
           "to": "Fp8E4M3",
-          "repack": {
-            "layout": "None",
-            "row_map": "Identity",
-            "batch": 0,
-            "source_rows": 0,
-            "source_row_offset": 0,
-            "target_rows": 0,
-            "valid_rows": 0,
-            "source_stride_cols": 0,
-            "source_col_offset": 0,
-            "source_cols": 0,
-            "target_cols": 0
-          },
+          "repack": null,
           "scratch_bytes": 0,
           "fusion": "None",
           "metadata_source": null,
-          "scale_factor_bits": 0,
-          "scale_group": 0,
-          "scale_axis": 0
+          "scale_factor_bits": 0
         }
       }
     },
@@ -2536,25 +2342,11 @@
         "transform": {
           "from": null,
           "to": "Fp8E4M3",
-          "repack": {
-            "layout": "None",
-            "row_map": "Identity",
-            "batch": 0,
-            "source_rows": 0,
-            "source_row_offset": 0,
-            "target_rows": 0,
-            "valid_rows": 0,
-            "source_stride_cols": 0,
-            "source_col_offset": 0,
-            "source_cols": 0,
-            "target_cols": 0
-          },
+          "repack": null,
           "scratch_bytes": 0,
           "fusion": "None",
           "metadata_source": null,
-          "scale_factor_bits": 0,
-          "scale_group": 0,
-          "scale_axis": 0
+          "scale_factor_bits": 0
         }
       }
     },

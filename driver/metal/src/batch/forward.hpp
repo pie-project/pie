@@ -27,6 +27,7 @@
 #include <cstddef>
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <string>
@@ -226,39 +227,70 @@ inline constexpr std::uint32_t kMetalMaxCtxTokens =
 // `paged_max_forward_tokens` divides a budget by that, so a small-vocabulary
 // model is allowed more rows and a large one fewer, instead of every model
 // inheriting a number tuned against one checkpoint.  The floor keeps a single
-// long prompt working; the ceiling is where a full fleet stops splitting
-// (measured: sixteen 34-token prompts take 6 fires at 256 and 4 at both 512 and
-// 1024, so nothing above 512 buys anything for a batch this wide) and also
-// bounds prefill DAG construction, which is per row.
-// Sized so this checkpoint lands on its measured optimum: 677KB per row x 512
-// rows is ~340MB, which is what the budget below allows.  A model with a much
-// larger vocabulary pays more per row and is given proportionally fewer, which
-// is the point -- the staging is genuinely allocated either way.
-inline constexpr std::uint32_t kPagedForwardRowBudgetBytes = 384u << 20;
+// long prompt working.
+//
+// The ceiling is not a throughput optimum.  512 was, measured: sixteen 34-token
+// prompts take 6 fires at 256 and 4 at both 512 and 1024, so nothing above 512
+// buys a batch this wide anything.  But rows are also the longest prompt this
+// driver will ACCEPT -- a longer one is refused, not chunked -- so the ceiling
+// has to be sized for the longest prompt, not for the widest batch.  At 512 a
+// 650-token prompt was refused by every family.  1024 is what the 1GB budget
+// below affords this checkpoint (677KB per row), and it is free: measured
+// through `pie serve`, 566 rows and 1024 rows give the same 2.35GB peak RSS and
+// the same wall clock, because the pool is a heap RESERVATION and a fire
+// touches only the rows it has.
+//
+// `kPrefillOrdinalMaxRows` must be raised with this: qwen3.5's prefill builds
+// one DAG per row and claims an ordinal block for each, and PTIR's ordinal base
+// is derived from where that range ends.
+inline constexpr std::uint64_t kPagedForwardRowBudgetBytes = 1024ull << 20;
 // The scratch coloring is computed from the DAG, which does not exist yet when
 // capabilities are built.  A generous fixed count is fine here: at 12KB per
 // color against 485KB of logits, the whole scratch term is noise in this
 // division, and over-counting it can only make the answer conservative.
 inline constexpr std::uint32_t kPagedScratchColors = 16;
 inline constexpr std::uint32_t kPagedMinForwardTokens = 64;
-inline constexpr std::uint32_t kPagedMaxForwardTokensCeiling = 512;
+inline constexpr std::uint32_t kPagedMaxForwardTokensCeiling = 1024;
+/// The bound for a family whose row budget is DERIVED rather than priced.
+///
+/// 512 is what a per-row price of `vocab * 2` buys, and that price stopped
+/// being true for these families when `Kind::RowGather` moved the LM head onto
+/// the sampled rows only. A prompt longer than the ceiling is refused, not
+/// chunked, so the ceiling is a hard bound on what can be run -- worth deriving
+/// from the pool that will actually be allocated. This caps that derivation:
+/// past a few thousand rows a fire is no longer a prompt, and the argument
+/// tables are per-row.
+inline constexpr std::uint32_t kPagedMaxForwardTokensHardCeiling = 4096;
 // Every row claims a block of argument-table ordinals, so this ceiling also
 // fixes where the prefill's ordinal space ends and PTIR's may begin; see
 // `kPrefillOrdinalLimit`, which the setup path cross-checks against this.
 
 inline std::uint32_t paged_max_forward_tokens(std::uint32_t vocab,
                                               std::uint32_t scratch_widest_elems,
-                                              std::uint32_t scratch_colors) {
+                                              std::uint32_t scratch_colors,
+                                              std::uint64_t budget_bytes =
+                                                  kPagedForwardRowBudgetBytes) {
     const std::uint64_t per_row = std::uint64_t(vocab) * 2u +
                                   std::uint64_t(scratch_widest_elems) * 2u *
                                       std::max<std::uint32_t>(1, scratch_colors) +
                                   64u;  // per-row IO scalars
-    const std::uint64_t rows = per_row == 0 ? kPagedMaxForwardTokensCeiling
-                                            : kPagedForwardRowBudgetBytes / per_row;
+    const std::uint64_t rows =
+        per_row == 0 ? kPagedMaxForwardTokensCeiling : budget_bytes / per_row;
     return std::clamp<std::uint32_t>(static_cast<std::uint32_t>(rows),
                                      kPagedMinForwardTokens,
                                      kPagedMaxForwardTokensCeiling);
 }
+
+/// The row budget for the families `SimpleFamilyEngine` serves.
+///
+/// They allocate their activation pool for `max_forward_tokens` ROWS at setup,
+/// so what is advertised and what is allocated have to be the SAME number --
+/// advertise more and the driver accepts a fire it cannot hold; allocate more
+/// and an 11.8 GB checkpoint fails to create its heap over a fire nobody asked
+/// for. One function, called from both places.
+// The rows-per-fire bound for a `SimpleFamilyEngine` family is DERIVED from the
+// activation pool it will actually allocate; see `simple_family_row_budget` in
+// context.cpp. There is no fixed ceiling for them to consult here.
 
 struct SetupConfig {
     std::string checkpoint_dir;  // HF snapshot dir (config.json + safetensors)
@@ -279,9 +311,62 @@ struct SetupConfig {
     // itself, because only the driver knows the device
     // (`loader/architecture.md` §3).
     std::string snapshot_dir;
+    // Page this model's routed experts in from a mapping instead of keeping
+    // them resident in the heap.
+    //
+    // The same `[model].stream_routed_experts` the CUDA driver reads. It is
+    // one switch because it is one decision -- a residency trade the operator
+    // makes about a model, not about a backend. It used to be
+    // `PIE_METAL_STREAM_EXPERTS` here, which meant setting the config on a
+    // Metal backend did nothing and said nothing.
+    bool stream_routed_experts = false;
     // Which storage schema to author against. It selects a contract on this
     // side of the loader call and never crosses it (§10.4).
     std::string model_type;
+    /// Gemma 4's shape, when `model_type` says so. Zero means "not gemma4", so
+    /// a config that never mentions this family cannot accidentally select it.
+    struct Gemma4Facts {
+        int n_layers = 0;
+        int hidden = 0;
+        int intermediate = 0;
+        int n_q_heads = 0;
+        int n_kv_heads = 0;
+        int head_dim = 0;         // sliding layers
+        int global_head_dim = 0;  // full layers
+        int sliding_window = 0;
+        int num_kv_shared_layers = 0;
+        int per_layer_emb_dim = 0;
+        int full_attn_interval = 0;  // -1: `layer_types` is irregular, refuse
+        bool double_wide_mlp = false;
+        float final_softcap = 0.0f;
+        float rope_theta_full = 1.0e6f;
+        float rope_theta_sliding = 1.0e4f;
+        float full_partial_rotary = 0.25f;
+        bool present() const { return n_layers > 0 && hidden > 0; }
+    } gemma4;
+    /// GPT-OSS's shape, when `model_type` says so. Zero means "not gpt-oss",
+    /// on the same principle: a config that never mentions this family cannot
+    /// accidentally select it.
+    struct GptOssFacts {
+        int n_layers = 0;
+        int hidden = 0;
+        int vocab = 0;
+        int n_q_heads = 0;
+        int n_kv_heads = 0;
+        int head_dim = 0;
+        int sliding_window = 0;
+        int n_experts = 0;
+        int experts_per_token = 0;
+        int intermediate = 0;
+        int rope_original_max_position = 4096;
+        float eps = 1e-5f;
+        float swiglu_limit = 7.0f;
+        float rope_theta = 150000.0f;
+        float rope_factor = 32.0f;
+        float rope_beta_fast = 32.0f;
+        float rope_beta_slow = 1.0f;
+        bool present() const { return n_layers > 0 && hidden > 0; }
+    } gptoss;
     // `config.json`'s RoPE hyperparameters, read out of the nested
     // `rope_parameters` object this family uses (context.cpp). The defaults
     // below are Qwen3.5's, so a checkpoint that omits them still lands on the
@@ -594,6 +679,17 @@ class MetalExecutor {
     bool run_member_forward(const MemberForwardDesc& desc, LogitsOut& out,
                             bool batch_serialized, std::string* err,
                             const PtirCommandCallbacks* ptir = nullptr);
+    /// The paged batch path for the families `SimpleFamilyEngine` serves.
+    ///
+    /// Several requests share ONE fire: their tokens are concatenated, the CSR
+    /// says who owns which rows, and each request's history is its own page
+    /// list. Prefill rows and decode rows differ only in how many a request
+    /// contributes, so a mixed batch needs nothing further.
+    bool run_simple_batch_forward(const std::vector<MemberForwardDesc>& descs,
+                                  std::vector<LogitsOut>& outs,
+                                  std::vector<std::uint8_t>& success,
+                                  std::vector<std::string>& errors,
+                                  const std::vector<PtirCommandCallbacks>* ptir = nullptr);
     bool run_paged_batch_forward(const std::vector<MemberForwardDesc>& descs,
                                  std::vector<LogitsOut>& outs,
                                  std::vector<std::uint8_t>& success,

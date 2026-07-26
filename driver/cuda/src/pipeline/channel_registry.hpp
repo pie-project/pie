@@ -478,7 +478,18 @@ class DeviceChannelRegistry {
             if (!decl_matches(slot, decl)) {
                 if (err)
                     *err = "ptir: channel " + std::to_string(id) +
-                           " re-bound with a conflicting shape/dtype/capacity decl";
+                           " re-bound with a conflicting shape/dtype/capacity decl"
+                           " (have bytes=" + std::to_string(cell_bytes_[slot]) +
+                           " cap1=" + std::to_string(host_cap1_[slot]) +
+                           " dtype=" + std::to_string(dtype_[slot]) +
+                           " seeded=" + std::to_string(seeded_[slot]) +
+                           " role=" + std::to_string(host_role_[slot]) +
+                           "; want bytes=" + std::to_string(decl_cell_bytes(decl)) +
+                           " cap1=" + std::to_string(cap1_of(decl)) +
+                           " dtype=" + std::to_string(static_cast<int>(decl.type.dtype)) +
+                           " seeded=" + std::to_string(decl.has_seed) +
+                           " reader=" + std::to_string(decl.host_reader) +
+                           " visible=" + std::to_string(decl.host_visible) + ")";
                 return kBadSlot;
             }
             // Same-guest cross-pass sharing (F8, unconditional): a

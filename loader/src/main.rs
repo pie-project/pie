@@ -9,12 +9,22 @@
 //! pie-loader verify SNAPSHOT CONTRACT [options]        compile, then check the result
 //! pie-loader diff   SNAPSHOT CONTRACT GOLDEN [options] compile and compare to a dump
 //! pie-loader replay SNAPSHOT CONTRACT [options]        execute the plan on the host
+//! pie-loader align  SNAPSHOT CONTRACT OUT [options]     rewrite it streamable
 //! ```
 //!
 //! `CONTRACT` is a JSON [`ModelContract`] — what the tool holds instead of a
 //! model's name, because the loader does not have families any more. A driver
 //! authors one in C++ (`driver/*/src/model/<family>/<family>_contract.hpp`);
 //! `loader/tests/golden/contracts/` holds the ones the tests use.
+//!
+//! `align` is the one command that writes a checkpoint rather than reading
+//! one. A streamed weight is read by the device where it lies, through a
+//! mapping, so it has to begin on a page of its own -- and published
+//! checkpoints put essentially no tensor on a page. `align` rewrites the
+//! shards so the ones a driver can stream do, which is a property of the bytes'
+//! placement and not of what the checkpoint means: every tensor keeps its name,
+//! dtype, shape and contents. Which tensors those are comes from the contract's
+//! groups, so the tool is not guessing from names.
 //!
 //! `replay` is the strongest statement the loader can make about itself
 //! offline: it reads the checkpoint through the plan and reports what each
@@ -30,6 +40,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use pie_loader::checkpoint::CheckpointMetadata;
+use pie_loader::checkpoint::align::{STREAM_PAGE_BYTES, align_checkpoint, streamable_tensors};
 use pie_loader::checkpoint::read::parse_checkpoint_metadata;
 use pie_loader::contract::ModelContract;
 use pie_loader::dump::dump_load_plan_json;
@@ -51,6 +62,7 @@ commands:
   verify SNAPSHOT CONTRACT          compile, then check the plan against its contract
   diff   SNAPSHOT CONTRACT GOLDEN   compile and compare against a stored `dump` output
   replay SNAPSHOT CONTRACT          compile and execute the plan against the checkpoint
+  align  SNAPSHOT CONTRACT OUT      write OUT: the same checkpoint, streamable
 
 CONTRACT is a JSON ModelContract; see loader/tests/golden/contracts/.
 
@@ -102,14 +114,20 @@ fn run(args: &[String]) -> Result<(), Fail> {
         return Err(Fail::Usage(format!("{command} needs a contract file")));
     };
 
-    // `diff` takes one extra positional before the options.
-    let (golden, rest) = if command == "diff" {
-        let Some(golden) = args.get(3).map(PathBuf::from) else {
-            return Err(Fail::Usage("diff needs a golden dump".to_string()));
-        };
-        (Some(golden), &args[4..])
-    } else {
-        (None, &args[3..])
+    // `diff` and `align` each take one extra positional before the options.
+    let (extra, rest) = match command.as_str() {
+        "diff" | "align" => {
+            let what = if command == "diff" {
+                "a golden dump"
+            } else {
+                "an output directory"
+            };
+            let Some(extra) = args.get(3).map(PathBuf::from) else {
+                return Err(Fail::Usage(format!("{command} needs {what}")));
+            };
+            (Some(extra), &args[4..])
+        }
+        _ => (None, &args[3..]),
     };
 
     let options = Options::parse(rest)?;
@@ -117,8 +135,9 @@ fn run(args: &[String]) -> Result<(), Fail> {
     match command.as_str() {
         "dump" => dump(&snapshot, &contract, &options),
         "verify" => run_verify(&snapshot, &contract, &options),
-        "diff" => diff(&snapshot, &contract, golden.as_deref().unwrap(), &options),
+        "diff" => diff(&snapshot, &contract, extra.as_deref().unwrap(), &options),
         "replay" => replay(&snapshot, &contract, &options),
+        "align" => align(&snapshot, &contract, extra.as_deref().unwrap(), &options),
         other => Err(Fail::Usage(format!("unknown command '{other}'"))),
     }
 }
@@ -263,6 +282,79 @@ fn compile(snapshot: &Path, contract: &ModelContract, options: &Options) -> Resu
         started.elapsed()
     );
     Ok(plan)
+}
+
+/// Write a streamable copy of the checkpoint.
+///
+/// The set of tensors to put on pages is taken from the compiled plan's groups
+/// rather than from a name pattern. A group is a contract's statement that its
+/// instances are interchangeable, which is precisely the property that lets a
+/// driver hold one instance's weights instead of another's at run time -- so
+/// the tensors a group binds are the tensors streaming can page, as a fact the
+/// contract states rather than a guess about what `mlp.experts.` means.
+///
+/// Aligning everything would be the wrong policy and is not offered: padding
+/// costs a page per tensor, which disappears against a 132 MB expert bank and
+/// triples the size of a small one.
+fn align(
+    snapshot: &Path,
+    contract: &ModelContract,
+    out: &Path,
+    options: &Options,
+) -> Result<(), Fail> {
+    let metadata = parse_checkpoint_metadata(snapshot)?;
+    let plan = compile_load_plan(&metadata, contract, options.target())?;
+    let streamable = streamable_tensors(&plan, &metadata);
+    if streamable.whole.is_empty() && streamable.banded.is_empty() {
+        return Err(Fail::Failed(
+            "this contract declares no groups, so nothing in it can be streamed and \
+             aligning the checkpoint would only make it bigger"
+                .to_string(),
+        ));
+    }
+    // A fused bank cannot be aligned by moving it: its instances begin at
+    // `base + i * stride`, and the stride is whatever the shape makes it.
+    // Aligning it anyway would produce a checkpoint that loads, streams, and
+    // faults in the whole bank to read one expert -- correct, and slower than
+    // not streaming, with nothing on disk to explain why.
+    if !streamable.banded.is_empty() {
+        return Err(Fail::Failed(format!(
+            "{} of this contract's group tensors are fused banks, which aligning cannot \
+             separate: every instance reads a band of one tensor, so moving it puts \
+             instance 0 on a page and no other. First: {}",
+            streamable.banded.len(),
+            streamable.banded.iter().next().unwrap()
+        )));
+    }
+    let names = streamable.whole;
+
+    let report = align_checkpoint(snapshot, out, &names, STREAM_PAGE_BYTES)?;
+    for file in &report.files {
+        eprintln!(
+            "{}: {} tensors aligned, {} fillers, +{} bytes",
+            file.path.display(),
+            file.aligned,
+            file.fillers,
+            file.overhead_bytes()
+        );
+    }
+    // A name the plan resolved but the rewrite never saw means the two disagree
+    // about what is in the checkpoint, which would silently leave a streamed
+    // tensor unaligned -- correct, and slow in a way nothing would explain.
+    if !report.missing.is_empty() {
+        return Err(Fail::Failed(format!(
+            "{} tensor(s) the plan reads are not in the checkpoint's shards, first {}",
+            report.missing.len(),
+            report.missing[0]
+        )));
+    }
+    println!(
+        "{} aligned to {STREAM_PAGE_BYTES} bytes: {} tensors, {} bytes of padding",
+        out.display(),
+        report.aligned(),
+        report.overhead_bytes()
+    );
+    Ok(())
 }
 
 fn dump(snapshot: &Path, contract: &ModelContract, options: &Options) -> Result<(), Fail> {

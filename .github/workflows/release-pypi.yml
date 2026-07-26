@@ -63,6 +63,67 @@ jobs:
       - name: Install build tools
         run: python -m pip install --upgrade build twine uv
 
+      # Two gates, cheap then real.
+      #
+      # The name check needs no toolchain and is what would have caught the
+      # actual drift: when `pie:core/inference` was deleted the SDK kept
+      # importing it and nothing said so. It also refuses to pass while the
+      # SDK reaches no forward-pass surface at all, which is the state today.
+      # See forward_refactor.md 10.4.
+      - name: Check SDK targets a live WIT surface
+        if: needs.setup.outputs.package_path == 'sdk/python'
+        run: scripts/check-sdk-interfaces.sh
+
+      # The unit tests stub `wit_world`, so they prove the wrapper layer's
+      # marshalling but say nothing about whether the world is real -- the
+      # previous suite passed for months against a mock of a deleted
+      # interface.
+      - name: Unit tests
+        if: needs.setup.outputs.package_path == 'sdk/python'
+        run: |
+          python -m pip install pytest
+          python -m pytest sdk/python/tests -q
+
+      # This is the one that checks the world. The wheel's `import inferlet`
+      # cannot run outside a componentize-py build (the smoke test below says
+      # so), but componentize-py itself can be installed here, and building a
+      # component resolves every WIT import against `interface/inferlet/` for
+      # real. An interface, function, or signature the host no longer offers
+      # fails at this step.
+      - name: Build a component against the SDK
+        if: needs.setup.outputs.package_path == 'sdk/python'
+        run: |
+          python -m pip install componentize-py
+          mkdir -p "$RUNNER_TEMP/componentize"
+          cat > "$RUNNER_TEMP/componentize/app.py" <<'PY'
+          import inferlet
+          from inferlet import chat, model, reasoning, session, tokenizer
+          from wit_world.exports import Run as RunBase
+
+
+          class Run(RunBase):
+              async def run(self, input: str) -> str:
+                  # Touch each surviving surface so an interface that lost a
+                  # function fails the build instead of the first user.
+                  _ = (
+                      model.name(),
+                      model.pass_kind(),
+                      model.frame_size(),
+                      model.rs_state_size(),
+                      tokenizer.encode("hi"),
+                      chat.stop_tokens(),
+                      chat.Decoder(),
+                      reasoning.Decoder(),
+                  )
+                  session.send(input)
+                  return "ok"
+          PY
+          componentize-py -d interface/inferlet -w inferlet componentize \
+            -p "$RUNNER_TEMP/componentize" \
+            -p sdk/python/src \
+            -p sdk/python/src/inferlet/bindings \
+            app -o "$RUNNER_TEMP/componentize/app.wasm"
+
       - name: Build package
         run: python -m build "${{ needs.setup.outputs.package_path }}"
 

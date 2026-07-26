@@ -17,6 +17,10 @@
 
 #if defined(__APPLE__)
 #include "batch_schedule.hpp"
+#include "model/contract.hpp"
+#include "model/gemma4/decode_step.hpp"
+#include "model/gemma4/geometry.hpp"
+#include "simple_family.hpp"
 #include "decode_consts.hpp"
 #include "decode_dispatch_mb.hpp"
 #include "decode_psos.hpp"
@@ -554,6 +558,28 @@ struct MetalExecutor::Impl {
     std::vector<GdnDisp> gdn_disp_{};
     LinearStateSlots linear_state_slots_{};
 
+    // ── Families with no recurrent state ──
+    // gemma4 and gpt-oss share none of the machinery above -- no GDN slots, no
+    // conv ping-pong, no split-K -- so their family-shaped half lives in
+    // `SimpleFamilyEngine` and everything that is NOT family-shaped (this
+    // context, the logits staging, the sequence bookkeeping) stays here.
+    model::ModelFamily family_ = model::ModelFamily::Qwen35;
+    std::unique_ptr<SimpleFamilyEngine> simple_{};
+    bool is_simple() const { return simple_ != nullptr; }
+    SimpleFamilyEngine* simple_engine() const { return simple_.get(); }
+    StepTiming fire_simple(const SimpleFamilyEngine::FireCsr& csr,
+                           const SimpleFamilyEngine::EncodeHook& pre = {},
+                           const SimpleFamilyEngine::EncodeHook& post = {}) {
+        const StepTiming t = simple_->fire(*ctx_, csr, pre, post);
+        if (golden_taps_enabled()) simple_->dump_taps(int(csr.token_ids.size()));
+        return t;
+    }
+
+    /// Build one of those, and the context it lives in.
+    bool setup_simple(model::ModelFamily family, const std::string& kernels_dir,
+                      const SetupConfig& cfg, const pie_loader::LoadPlan& load_plan,
+                      std::string* err);
+
     static constexpr bool gdn_prep_ = true;
     // Folds the block/MLP residual add into the projection that feeds it,
     // dropping 48 of the DAG's 411 dispatches. The decode DAG is launch-bound
@@ -573,9 +599,10 @@ struct MetalExecutor::Impl {
         const DecodeGeometry& geometry,
         const pie_loader::LoadPlan& load_plan,
         std::size_t storage_page_size,
+        bool stream_routed_experts,
         std::string* error);
     bool ready() const { return ctx_ != nullptr; }
-    int vocab() const { return g_.vocab; }
+    int vocab() const { return simple_ ? simple_->vocab() : g_.vocab; }
     const DecodeGeometry& geometry() const { return g_; }
     bool setup_kv_pool(
         std::uint32_t total_pages,
@@ -634,6 +661,12 @@ struct MetalExecutor::Impl {
     std::uint32_t argmax() const;
     bool ensure_ptir_logits_rows(std::uint32_t rows, std::string* error);
     std::uint32_t reserve_ptir_logits_rows(std::uint32_t rows);
+    // Rows the forward should copy into the PTIR staging buffer as part of its
+    // OWN command buffer. Staging used to be a second `run_step` -- a whole
+    // command-buffer submit and completion wait per token, for a copy that is
+    // ~1 us of bandwidth. Set before `run_batch_step`, consumed by its encoder.
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> pending_logits_stage_{};
+    bool encode_logits_stage(StepEncoder& encoder, std::string* error);
     bool stage_ptir_logits_rows(
         const std::vector<std::pair<std::uint32_t, std::uint32_t>>& rows,
         std::string* error);
@@ -675,10 +708,85 @@ void write_u32(const SlotHandle& s, uint32_t v) {
 
 }  // namespace
 
+bool MetalExecutor::Impl::setup_simple(model::ModelFamily family,
+                                       const std::string& kernels_dir,
+                                       const SetupConfig& cfg,
+                                       const pie_loader::LoadPlan& load_plan,
+                                       std::string* err) {
+    family_ = family;
+    // The heap: the weights the plan already sized, plus what the family needs
+    // on top of them. `plan_heap` is not consulted -- it is `DecodeGeometry`'s.
+    const std::size_t weights = load_plan.view().memory.persistent_bytes;
+    // Streamed tensors are bound over a pack, so they must not be counted here:
+    // a heap sized for weights that are then ALSO mapped is the footprint
+    // doubled rather than halved, and on a machine where the model only just
+    // fits that is the difference between running and reading zeros.
+    const auto streams = SimpleFamilyEngine::stream_predicate(family, cfg.stream_routed_experts);
+    const std::size_t streamed =
+        streams ? std::size_t(streamable_plan_bytes(load_plan, streams)) : 0;
+    const std::size_t heap_bytes = (weights > streamed ? weights - streamed : weights) +
+                                   SimpleFamilyEngine::extra_heap_bytes(family, cfg, max_ctx_);
+    ctx_ = RawMetalContext::create(heap_bytes);
+    if (!ctx_) {
+        if (err) *err = "RawMetalContext::create failed";
+        return false;
+    }
+    simple_ = SimpleFamilyEngine::create(family, *ctx_, kernels_dir, cfg, load_plan, max_ctx_,
+                                         err);
+    if (!simple_) return false;
+
+    // The sampler reads through the same staging path qwen3.5 uses, so the
+    // engine's logits slot takes the place of `b_.io[Logits]` at its ordinal --
+    // and the copy that fills it needs its own pipeline, which qwen's `setup`
+    // builds and this one bypasses.
+    g_.vocab = simple_->vocab();
+    std::string pso_err;
+    ptir_logits_copy_pso_ = ctx_->compile_ptir_pso_from_file(
+        (std::filesystem::path(kernels_dir) / "ptir_logits_copy.metal").string(),
+        "ptir_copy_logits_bf16", &pso_err);
+    if (!ptir_logits_copy_pso_.valid()) {
+        if (err) *err = "compiling the logits staging copy: " + pso_err;
+        return false;
+    }
+    ptir_logits_copy_params_ =
+        ctx_->create_standalone_buffer(sizeof(PtirLogitsCopyParams) * kPtirLogitsCopyMaxRows);
+    if (!ptir_logits_copy_params_.valid()) {
+        if (err) *err = "allocating the logits staging params";
+        return false;
+    }
+    ctx_->arg_bind_ordinal(kPtirLogitsCopyOrdinal, 2, ptir_logits_copy_params_);
+    if (!ensure_ptir_logits_rows(1, err)) return false;
+    ctx_->arg_bind_ordinal(kPtirLogitsCopyOrdinal, 0, simple_->logits_slot());
+
+    // The KV pool the engine plans against.
+    //
+    // A paged family reports the pages it really allocated, which is what makes
+    // the runtime's physical page ids mean something: they index the engine's
+    // per-layer pools directly. A ring-backed one reports the capacity the RING
+    // has -- not a lie about storage, since `ensure_kv_pages` bounds demand
+    // against the same number, but a page is not a thing it stores into. What
+    // is genuinely absent for both -- moving pages around, which is what prefix
+    // sharing and forking need -- is refused as absent.
+    const std::uint32_t page =
+        simple_->paged() ? std::uint32_t(simple_->page_size())
+                         : (cfg.kv_page_size > 0 ? cfg.kv_page_size : 1u);
+    kv_pool_.enabled = true;
+    kv_pool_.page_size = page;
+    kv_pool_.total_pages = simple_->paged() ? std::uint32_t(simple_->total_pages())
+                                            : std::uint32_t(max_ctx_) / page;
+    kv_pool_.capacity_pages = kv_pool_.total_pages;
+    kv_pool_.committed_pages = kv_pool_.total_pages;
+    kv_pool_.layers.clear();
+
+    ctx_->make_resident();
+    return true;
+}
+
 bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
                             const DecodeGeometry& geom,
                             const pie_loader::LoadPlan& load_plan,
                             std::size_t storage_page_size,
+                            bool stream_routed_experts,
                             std::string* err) {
     g_ = geom;
 
@@ -721,8 +829,18 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
         size_t(std::max({sched_.colors_used, mb_sched_.colors_used,
                          prefill_sched_.colors_used})) *
         plan_.scratch_slot_bytes;
+    // Streamed weights are bound over a pack, so the heap must be created
+    // WITHOUT them: a heap sized for weights that are then also mapped is the
+    // footprint doubled rather than halved, which on a machine where the model
+    // only just fits is the difference between running and reading zeros.
+    const auto streams = SimpleFamilyEngine::stream_predicate(
+        model::ModelFamily::Qwen35, stream_routed_experts);
+    const size_t streamed =
+        streams ? size_t(streamable_plan_bytes(load_plan, streams)) : 0;
+    const size_t resident_weights =
+        plan_.weights_bytes > streamed ? plan_.weights_bytes - streamed : plan_.weights_bytes;
     const size_t heap_bytes =
-        plan_.weights_bytes + plan_.io_bytes + plan_.mb_io_bytes +
+        resident_weights + plan_.io_bytes + plan_.mb_io_bytes +
         consts_budget + (32u << 20);
     const size_t elastic_budget =
         plan_.kv_bytes + plan_.state_bytes + plan_.scratch_bytes +
@@ -735,7 +853,7 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
     }
 
     // ── Stage weights/state/KV/IO; bind weight/state/KV/IO slots by ordinal. ──
-    b_ = stage_decode_storage(*ctx_, view, load_plan, g_, plan_);
+    b_ = stage_decode_storage(*ctx_, view, load_plan, g_, plan_, streams);
     bind_decode_dag(*ctx_, b_, dag_, g_, gdn_prep_);
 
     // ── Scratch pool (colors_used slots) → beta's bind pass. ──
@@ -848,6 +966,18 @@ void MetalExecutor::Impl::reset_state() {
 // this slot's own ping-pong step parity (Phase 1b state-slot fix) so a fresh sequence on
 // `slot` always starts at parity 0, independent of any other slot's step history.
 void MetalExecutor::Impl::reset_state(uint32_t slot) {
+    if (is_simple()) {
+        // A PAGED family resets through the runtime's page table -- a fresh
+        // sequence gets fresh pages -- exactly as qwen3.5 does. Zeroing here
+        // would zero EVERY page, which with several sequences resident is not a
+        // reset but the destruction of its neighbours.
+        //
+        // A ring-backed one has nowhere else to put the boundary: the KV is the
+        // only thing it carries between tokens, and there is no conv history to
+        // ping-pong and no recurrent state to clear.
+        if (!simple_->paged()) simple_->reset();
+        return;
+    }
     const size_t conv_stride  = g_.gdn_conv_stride_bytes();
     const size_t recur_stride = g_.gdn_recurrent_stride_bytes();
     const size_t conv_off  = size_t(slot) * conv_stride;
@@ -1056,7 +1186,7 @@ bool MetalExecutor::Impl::setup_kv_pool(uint32_t total_pages, uint32_t page_size
     }
     int n_full = 0;
     for (int L = 0; L < g_.n_layers; ++L) {
-        if (DecodeGeometry::is_full_attn(L)) ++n_full;
+        if (g_.is_full_attn(L)) ++n_full;
     }
     if (n_full == 0) {
         if (err) {
@@ -1070,7 +1200,7 @@ bool MetalExecutor::Impl::setup_kv_pool(uint32_t total_pages, uint32_t page_size
     KvPagePool pool;
     pool.layers.resize(size_t(g_.n_layers));
     for (int L = 0; L < g_.n_layers; ++L) {
-        if (!DecodeGeometry::is_full_attn(L)) continue;
+        if (!g_.is_full_attn(L)) continue;
         const size_t initial = std::min(layer_bytes, size_t{2} << 20);
         pool.layers[size_t(L)].k_pages =
             ctx_->create_elastic_buffer(layer_bytes, initial);
@@ -1127,7 +1257,7 @@ bool MetalExecutor::Impl::bind_paged_dag(std::string* err) {
         std::vector<SlotHandle> k_pages(size_t(g_.n_layers));
         std::vector<SlotHandle> v_pages(size_t(g_.n_layers));
         for (int L = 0; L < g_.n_layers; ++L) {
-            if (!DecodeGeometry::is_full_attn(L)) continue;
+            if (!g_.is_full_attn(L)) continue;
             k_pages[size_t(L)] = kv_pool_.layers[size_t(L)].k_pages;
             v_pages[size_t(L)] = kv_pool_.layers[size_t(L)].v_pages;
         }
@@ -1266,7 +1396,7 @@ bool MetalExecutor::Impl::copy_kv_pages(const std::vector<uint32_t>& src_pages,
     // independent; the caller sequences non-conflicting moves, or issues them as
     // separate calls when a true swap/rotate is needed).
     for (int L = 0; L < g_.n_layers; ++L) {
-        if (!DecodeGeometry::is_full_attn(L)) continue;
+        if (!g_.is_full_attn(L)) continue;
         const auto& lp = kv_pool_.layers[size_t(L)];
         for (size_t i = 0; i < src_pages.size(); ++i) {
             const size_t src_off = size_t(src_pages[i]) * page_bytes;
@@ -1316,7 +1446,7 @@ bool MetalExecutor::Impl::copy_kv_cells(const std::vector<KvMoveCell>& cells, st
     const size_t row_bytes = kv_pool_row_bytes(g_);
     const size_t page_bytes = size_t(kv_pool_.page_size) * row_bytes;
     for (int L = 0; L < g_.n_layers; ++L) {
-        if (!DecodeGeometry::is_full_attn(L)) continue;
+        if (!g_.is_full_attn(L)) continue;
         const auto& lp = kv_pool_.layers[size_t(L)];
         for (const auto& c : cells) {
             const size_t src_off = size_t(c.src_page_id) * page_bytes +
@@ -1378,7 +1508,7 @@ bool MetalExecutor::Impl::resize_kv_pool(uint32_t new_total_pages, bool unmapped
     const size_t committed_bytes =
         size_t(new_total_pages) * size_t(kv_pool_.page_size) * row_bytes;
     for (int L = 0; L < g_.n_layers; ++L) {
-        if (!DecodeGeometry::is_full_attn(L)) continue;
+        if (!g_.is_full_attn(L)) continue;
         auto& layer = kv_pool_.layers[size_t(L)];
         if (!ctx_->ensure_elastic_buffer(layer.k_pages, committed_bytes) ||
             !ctx_->ensure_elastic_buffer(layer.v_pages, committed_bytes)) {
@@ -1448,6 +1578,19 @@ StepTiming MetalExecutor::Impl::step(
     uint32_t position,
     uint32_t slot,
     const PtirCommandCallbacks* ptir) {
+    if (is_simple()) {
+        // No elastic commit, no state slot, no ping-pong: the engine owns one
+        // DAG and a contiguous KV, and `slot` has nothing to select.
+        (void)slot;
+        (void)ptir;
+        const StepTiming t = simple_->step(*ctx_, token_id, position);
+        // The walk, pointed at the ENGINE rather than at the raw path. Off
+        // unless PIE_METAL_GOLDEN_DIR is set; when it is, the LAST step's
+        // activations are what land there, so the caller chooses which step is
+        // examined by choosing the prompt.
+        if (golden_taps_enabled()) simple_->dump_taps(1);
+        return t;
+    }
     std::string commit_error;
     if (!ensure_elastic_storage(
             0,
@@ -1718,6 +1861,8 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
     // Alternate the two arms fire by fire so both see the same machine.
     static bool ab_flip = false;
     if (ab_enabled()) ab_set_arm(ab_flip = !ab_flip);
+    std::string stage_err;
+    bool stage_failed = false;
     const std::vector<Dispatch> fire_dag =
         build_decode_dag_mb(g_, schedule.N, kMultiBatchOrdinalBase, fuse_residual_, gdn_prep_);
     const StepTiming timing = ctx_->run_step([&](StepEncoder& se) {
@@ -1730,9 +1875,11 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
             for (const auto& callbacks : *ptir)
                 if (callbacks.post_forward) callbacks.post_forward(se);
         }
+        if (!encode_logits_stage(se, &stage_err)) stage_failed = true;
     });
     if (!timing.succeeded())
         return fail("Metal command timed out before its completion fence");
+    if (stage_failed) return fail(stage_err);
     // Step meter.  This machine is permanently contended (the agent process
     // alone runs at ~250% CPU), so wall-clock A/B swings 3x and cannot decide
     // anything; the command buffer's own execution time can.  Bucketed by lane
@@ -1936,8 +2083,13 @@ bool MetalExecutor::Impl::ensure_ptir_logits_rows(
     SlotHandle old = ptir_logits_;
     ptir_logits_ = replacement;
     ptir_logits_capacity_rows_ = rows;
-    ctx_->arg_bind_ordinal(
-        kPtirLogitsCopyOrdinal, 0, b_.io[int(IoSlot::Logits)]);
+    // The copy's SOURCE. `b_.io[Logits]` is qwen3.5's; a simple family's tail
+    // writes a slot of its own, and rebinding qwen's here would leave the copy
+    // reading an unallocated buffer -- which is silent, and reads downstream as
+    // logits of exactly zero. Only reachable on GROWTH, so it survived every
+    // single-row fire.
+    ctx_->arg_bind_ordinal(kPtirLogitsCopyOrdinal, 0,
+                           is_simple() ? simple_->logits_slot() : b_.io[int(IoSlot::Logits)]);
     ctx_->arg_bind_ordinal(kPtirLogitsCopyOrdinal, 1, ptir_logits_);
     ctx_->arg_bind_ordinal(
         kPtirLogitsCopyOrdinal, 2, ptir_logits_copy_params_);
@@ -1950,6 +2102,38 @@ std::uint32_t MetalExecutor::Impl::reserve_ptir_logits_rows(
     const std::uint32_t base = ptir_logits_next_row_;
     ptir_logits_next_row_ += rows;
     return base;
+}
+
+bool MetalExecutor::Impl::encode_logits_stage(StepEncoder& encoder, std::string* error) {
+    const auto& rows = pending_logits_stage_;
+    if (rows.empty()) return true;
+    if (!ptir_logits_copy_pso_.valid() || rows.size() > kPtirLogitsCopyMaxRows) {
+        if (error != nullptr) *error = "PTIR logits staging is not ready";
+        return false;
+    }
+    auto* params =
+        static_cast<PtirLogitsCopyParams*>(ptir_logits_copy_params_.contents());
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        if (rows[i].second >= ptir_logits_capacity_rows_) {
+            if (error != nullptr) *error = "PTIR logits staging is not ready";
+            return false;
+        }
+        params[i] = {
+            .source_row = rows[i].first,
+            .destination_row = rows[i].second,
+            .vocab = static_cast<std::uint32_t>(g_.vocab),
+            .reserved = 0,
+        };
+    }
+    // The copy reads the logits the forward just wrote.
+    encoder.barrier();
+    encoder.set_pso(ptir_logits_copy_pso_);
+    encoder.set_argtable_ordinal(kPtirLogitsCopyOrdinal);
+    encoder.dispatch(
+        Grid{static_cast<std::uint32_t>(g_.vocab),
+             static_cast<std::uint32_t>(rows.size()), 1},
+        Threadgroup{256, 1, 1});
+    return true;
 }
 
 bool MetalExecutor::Impl::stage_ptir_logits_rows(
@@ -2119,14 +2303,22 @@ std::uint32_t MetalExecutor::argmax_native() const {
 }
 
 bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
-    // Phase 1a targets exactly the shipped qwen3.6 (GDN-hybrid) geometry —
-    // refuse truthfully rather than let caps advertise a forward that does
-    // not exist (metal_ptir_plan.md §5.5, §12 "Caps honesty").
-    if (!cfg.has_linear_attn) {
+    // Which family is this? Answered from the config's own `model_type`, so a
+    // checkpoint gets a diagnosis about ITSELF rather than about the family that
+    // happens to be wired up.
+    switch (model::model_family_of(cfg.model_type)) {
+    case model::ModelFamily::Qwen35:
+        break;
+    // gemma4 and gpt-oss run through `SimpleFamilyEngine`: one DAG, contiguous
+    // KV, no recurrent state. `MetalExecutor::Impl`'s own machinery is
+    // qwen3.5's and stays untouched.
+    case model::ModelFamily::Gemma4:
+    case model::ModelFamily::GptOss:
+        break;
+    case model::ModelFamily::Unknown:
         if (err != nullptr) {
-            *err = "Metal PTIR forward requires the qwen3.6 (GDN-hybrid) checkpoint "
-                   "geometry in this increment (config '" +
-                   cfg.arch_name + "' has no linear-attention layers)";
+            *err = "Metal has no model family for config '" + cfg.arch_name +
+                   "' (model_type '" + cfg.model_type + "')";
         }
         return false;
     }
@@ -2172,22 +2364,31 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
     geom.total_pages = static_cast<int>(cfg.total_pages);
     geom.paged_kv_enabled = cfg.total_pages > 0 && cfg.kv_page_size > 0 &&
                             geom.max_tokens > 0 && geom.max_requests > 0;
-    if (cfg.vocab_size != 0 &&
-        cfg.vocab_size != static_cast<std::uint32_t>(geom.vocab)) {
-        if (err != nullptr) {
-            *err = "checkpoint vocab_size (" + std::to_string(cfg.vocab_size) +
-                   ") does not match the shipped qwen3.6 geometry (" +
-                   std::to_string(geom.vocab) +
-                   "); only the qwen3.6 checkpoint is supported in this increment";
-        }
-        return false;
+    // The vocabulary is a property of the checkpoint, so take it from the
+    // checkpoint. It used to be cross-checked against the hard-coded 248320 and
+    // REFUSED on mismatch, which meant even another size of the same family
+    // could not load. Every consumer reads `geom.vocab`; nothing else pinned it.
+    if (cfg.vocab_size != 0) {
+        geom.vocab = static_cast<int>(cfg.vocab_size);
     }
     std::string derr;
+    const model::ModelFamily family = model::model_family_of(cfg.model_type);
+    if (family != model::ModelFamily::Qwen35) {
+        if (!impl->setup_simple(family, cfg.kernels_dir, cfg, load_plan, &derr)) {
+            if (err != nullptr) *err = "Metal forward setup failed: " + derr;
+            return false;
+        }
+        impl_ = std::move(impl);
+        vocab_ = static_cast<std::uint32_t>(impl_->vocab());
+        slot_states_.clear();
+        return true;
+    }
     if (!impl->setup(
             cfg.kernels_dir,
             geom,
             load_plan,
             cfg.storage_page_size,
+            cfg.stream_routed_experts,
             &derr)) {
         if (err != nullptr) *err = "Metal forward setup failed: " + derr;
         return false;
@@ -2222,7 +2423,12 @@ RawMetalContext* MetalExecutor::command_context() {
 }
 
 SlotHandle MetalExecutor::logits_device_slot() const {
-    return ready() ? impl_->b_.io[int(IoSlot::Logits)] : SlotHandle{};
+    if (!ready()) return SlotHandle{};
+    // `b_.io[Logits]` is qwen3.5's. A simple family's tail writes a slot of its
+    // own, and PTIR's device program samples from whatever this names -- so
+    // naming an unallocated buffer is silent, and reads as logits of zero.
+    return impl_->is_simple() ? impl_->simple_engine()->logits_slot()
+                              : impl_->b_.io[int(IoSlot::Logits)];
 }
 
 std::uint32_t MetalExecutor::rs_slots() const {
@@ -2271,6 +2477,20 @@ std::uint32_t MetalExecutor::kv_pool_page_size() const {
 bool MetalExecutor::ensure_kv_pages(
     std::uint32_t pages,
     std::string* error) {
+    if (ready() && impl_->is_simple()) {
+        // Nothing to commit: the ring is allocated whole at setup. The demand is
+        // still checked, against the capacity that ring actually has.
+        if (pages > impl_->kv_pool().total_pages) {
+            if (error != nullptr) {
+                *error = "this family's KV ring holds " +
+                         std::to_string(impl_->kv_pool().total_pages) +
+                         " pages' worth of tokens, and this fire asked for " +
+                         std::to_string(pages);
+            }
+            return false;
+        }
+        return true;
+    }
     if (!ready() || !impl_->kv_pool().enabled) {
         if (error != nullptr) *error = "Metal KV pool is unavailable";
         return false;
@@ -2364,6 +2584,48 @@ bool MetalExecutor::forward(const MemberForwardDesc& desc, LogitsOut& out, std::
     }
     const std::uint32_t slot = desc.has_rs_slot ? desc.rs_slot_id : 0u;
     const auto state = slot_states_.find(slot);
+    // gemma4 and gpt-oss hold their KV as a contiguous per-layer ring indexed by
+    // position, which is qwen3.5's M=1 fast path and not its paged one. The
+    // engine still marks a fire `requires_paged` because the POOL is configured;
+    // for these families that says nothing about how the KV is stored, and
+    // `validate_linear_sequence_geometry` below is what actually enforces the
+    // one-resident-sequence invariant the ring needs.
+    if (impl_->is_simple()) {
+        SimpleFamilyEngine* eng = impl_->simple_engine();
+        if (eng != nullptr && eng->paged()) {
+            // One member is a batch of one: the same fire, the same CSR.
+            std::vector<LogitsOut> outs(1);
+            std::vector<std::uint8_t> ok(1, 0);
+            std::vector<std::string> errs(1);
+            run_simple_batch_forward({desc}, outs, ok, errs);
+            if (ok[0] != 0) {
+                out = std::move(outs[0]);
+                return true;
+            }
+            if (err != nullptr) *err = errs[0].empty() ? "Metal forward failed" : errs[0];
+            return false;
+        }
+        if (desc.has_write_desc) {
+            if (err != nullptr) {
+                *err = "this family stores KV as a position-indexed ring, so an explicit "
+                       "page-write descriptor has nothing to address";
+            }
+            return false;
+        }
+        std::string member_err;
+        if (run_member_forward(desc, out, /*batch_serialized=*/false, &member_err, nullptr)) {
+            return true;
+        }
+        // The ring holds one sequence. Say what would lift that, since the
+        // generic message is qwen3.5's and names a phase rather than a gap.
+        if (err != nullptr) {
+            *err = member_err +
+                   " [this family serves one sequence at a time: its KV is a "
+                   "position-indexed ring, so a second resident sequence would clobber the "
+                   "first]";
+        }
+        return false;
+    }
     if (desc.requires_paged || desc.has_write_desc ||
         (state != slot_states_.end() && state->second.paged_backed)) {
         std::vector<LogitsOut> outs;
@@ -2409,6 +2671,42 @@ void MetalExecutor::forward_batch(const std::vector<MemberForwardDesc>& descs,
         return;
     }
     impl_->ptir_logits_next_row_ = 0;
+    // One member at a time for the families on the ring: it holds exactly one
+    // sequence's history, so a second member in the same fire would clobber the
+    // first. Refused per member rather than per batch, which is what the caller
+    // poisons on.
+    if (impl_->is_simple()) {
+        SimpleFamilyEngine* eng = impl_->simple_engine();
+        if (eng != nullptr && eng->paged()) {
+            run_simple_batch_forward(descs, outs, success, errors, ptir);
+            for (std::size_t i = 0; i < descs.size(); ++i) {
+                if (success[i] == 0 && !errors[i].empty()) {
+                    std::cerr << "[pie-driver-metal] member forward rejected: " << errors[i]
+                              << "\n";
+                }
+            }
+            return;
+        }
+        if (descs.size() != 1) {
+            for (auto& e : errors) {
+                e = "this family's KV is a single-sequence ring, so a batch of " +
+                    std::to_string(descs.size()) + " members cannot be forwarded together";
+            }
+            return;
+        }
+        std::string member_err;
+        if (run_member_forward(descs[0], outs[0], /*batch_serialized=*/false, &member_err,
+                               ptir != nullptr ? &(*ptir)[0] : nullptr)) {
+            success[0] = 1;
+        } else {
+            // A rejected member becomes a poison epoch by the time the client
+            // sees it, which says nothing about why. This is the only place the
+            // reason exists.
+            std::cerr << "[pie-driver-metal] member forward rejected: " << member_err << "\n";
+            errors[0] = member_err;
+        }
+        return;
+    }
     if (descs.size() == 1 && !descs[0].requires_paged && !descs[0].has_write_desc) {
         if (ptir != nullptr) {
             if ((*ptir)[0].set_logits_row)
@@ -2791,16 +3089,13 @@ bool MetalExecutor::run_paged_batch_forward(const std::vector<MemberForwardDesc>
             *ptir);
         dispatch_callbacks = &compacted_callbacks;
     }
-    if (!impl_->run_batch_step(
-            schedule, in, &batch_err, dispatch_callbacks)) {
-        for (const std::size_t member : accepted_members) {
-            errors[member] = batch_err;
-        }
-        return false;
-    }
-    // Every member's rows go in ONE staging dispatch. One command buffer per
-    // row meant a sixteen-request fire paid sixteen round trips per token.
-    std::vector<std::pair<std::uint32_t, std::uint32_t>> staged_rows;
+    // Every member's rows go in ONE staging dispatch, and that dispatch rides
+    // the forward's OWN command buffer. It used to be a second `run_step`:
+    // another submit and another completion wait, per token, for a copy worth
+    // about a microsecond of bandwidth. Nothing here depends on the forward's
+    // result -- the destination rows are just a bump allocation -- so it can all
+    // be decided first and encoded at the tail of the same buffer.
+    impl_->pending_logits_stage_.clear();
     for (const std::size_t i : accepted_members) {
         LogitsOut& out = outs[i];
         out.vocab = vocab_;
@@ -2811,15 +3106,19 @@ bool MetalExecutor::run_paged_batch_forward(const std::vector<MemberForwardDesc>
         impl_->attach_ptir_logits_view(out);
         if (ptir != nullptr && (*ptir)[i].consumes_logits_directly) continue;
         for (uint32_t row = 0; row < out.rows; ++row)
-            staged_rows.emplace_back(rows[row], out.device_row_offset + row);
+            impl_->pending_logits_stage_.emplace_back(
+                rows[row], out.device_row_offset + row);
     }
-    std::string staging_error;
-    const bool staged = impl_->stage_ptir_logits_rows(staged_rows, &staging_error);
-    for (const std::size_t i : accepted_members) {
-        if (!staged) {
-            errors[i] = staging_error;
-            continue;
+    const bool ran = impl_->run_batch_step(
+        schedule, in, &batch_err, dispatch_callbacks);
+    impl_->pending_logits_stage_.clear();
+    if (!ran) {
+        for (const std::size_t member : accepted_members) {
+            errors[member] = batch_err;
         }
+        return false;
+    }
+    for (const std::size_t i : accepted_members) {
         if (!errors[i].empty()) continue;
         success[i] = 1;
     }
@@ -2830,6 +3129,282 @@ bool MetalExecutor::run_paged_batch_forward(const std::vector<MemberForwardDesc>
             slot_states_, d, request.local_request);
     }
     return true;
+}
+
+bool MetalExecutor::run_simple_batch_forward(const std::vector<MemberForwardDesc>& descs,
+                                            std::vector<LogitsOut>& outs,
+                                            std::vector<std::uint8_t>& success,
+                                            std::vector<std::string>& errors,
+                                            const std::vector<PtirCommandCallbacks>* ptir) {
+    SimpleFamilyEngine* eng = impl_->simple_engine();
+    if (eng == nullptr || !eng->paged()) {
+        for (auto& e : errors) e = "this family has no paged batch path";
+        return false;
+    }
+    const int page_size = eng->page_size();
+    const std::uint32_t total_pages = std::uint32_t(eng->total_pages());
+
+    // ── Build one fire out of every member that validates ──
+    //
+    // A member may carry several requests (its own CSR); each becomes a request
+    // of the fire, so the fire's request ids are global and its `qo_indptr`
+    // spans them all.
+    SimpleFamilyEngine::FireCsr csr;
+    csr.qo_indptr.push_back(0);
+    csr.kv_page_indptr.push_back(0);
+    struct Accepted {
+        std::size_t member = 0;
+        std::uint32_t row0 = 0;  // this member's first row in the fire
+    };
+    std::vector<Accepted> accepted;
+    bool any_rejected = false;
+    const auto reject = [&](std::size_t i, const std::string& why) {
+        errors[i] = why;
+        any_rejected = true;
+    };
+
+    for (std::size_t i = 0; i < descs.size(); ++i) {
+        const MemberForwardDesc& d = descs[i];
+        if (d.token_ids.empty() || d.token_ids.size() != d.position_ids.size()) {
+            reject(i, "forward token/position count mismatch or empty span");
+            continue;
+        }
+        if (d.qo_indptr.size() < 2 || d.qo_indptr.front() != 0 ||
+            d.qo_indptr.back() != d.token_ids.size() ||
+            d.kv_page_indptr.size() != d.qo_indptr.size() ||
+            d.kv_page_indptr.front() != 0 ||
+            d.kv_page_indptr.back() != d.kv_pages.size()) {
+            reject(i, "member CSR is malformed");
+            continue;
+        }
+        if (d.has_write_desc &&
+            (d.w_page.size() != d.token_ids.size() || d.w_off.size() != d.token_ids.size())) {
+            reject(i, "explicit w_page/w_off must have one entry per token");
+            continue;
+        }
+        if (d.has_attention_mask || d.structured_mask) {
+            reject(i, "this family's attention is bounded by position, and has no dense "
+                      "mask port");
+            continue;
+        }
+        bool bad = false;
+        for (const std::uint32_t p : d.kv_pages) {
+            if (p >= total_pages) {
+                reject(i, "a KV page id (" + std::to_string(p) + ") is outside the pool's " +
+                              std::to_string(total_pages) + " pages");
+                bad = true;
+                break;
+            }
+        }
+        if (bad) continue;
+        for (const std::uint32_t local : d.readout_local_indices) {
+            if (local >= d.token_ids.size()) {
+                reject(i, "readout index exceeds this fire's token span");
+                bad = true;
+                break;
+            }
+        }
+        if (bad) continue;
+
+        // Per-request: positions are absolute within the sequence, so the page
+        // a token lands in is its position's page IN THIS REQUEST'S LIST.
+        const std::size_t requests = d.qo_indptr.size() - 1;
+        const std::uint32_t row0 = std::uint32_t(csr.token_ids.size());
+        SimpleFamilyEngine::FireCsr add;
+        for (std::size_t r = 0; r < requests && !bad; ++r) {
+            const std::uint32_t q0 = d.qo_indptr[r], q1 = d.qo_indptr[r + 1];
+            const std::uint32_t k0 = d.kv_page_indptr[r], k1 = d.kv_page_indptr[r + 1];
+            const std::uint32_t req_id =
+                std::uint32_t(csr.kv_page_indptr.size() - 1 + add.qo_indptr.size());
+            for (std::uint32_t t = q0; t < q1; ++t) {
+                const std::uint32_t pos = d.position_ids[t];
+                const std::uint32_t page_ix = pos / std::uint32_t(page_size);
+                if (k0 + page_ix >= k1) {
+                    reject(i, "a token at position " + std::to_string(pos) +
+                                  " has no page in its request's list");
+                    bad = true;
+                    break;
+                }
+                add.token_ids.push_back(d.token_ids[t]);
+                add.position_ids.push_back(pos);
+                add.req_of_token.push_back(req_id);
+                add.w_page.push_back(d.has_write_desc ? d.w_page[t] : d.kv_pages[k0 + page_ix]);
+                add.w_off.push_back(d.has_write_desc ? d.w_off[t]
+                                                     : pos % std::uint32_t(page_size));
+            }
+            add.qo_indptr.push_back(std::uint32_t(add.token_ids.size()));
+            for (std::uint32_t p = k0; p < k1; ++p) add.kv_page_indices.push_back(d.kv_pages[p]);
+            add.kv_page_indptr.push_back(std::uint32_t(add.kv_page_indices.size()));
+        }
+        if (bad) continue;
+        if (csr.token_ids.size() + add.token_ids.size() > std::size_t(eng->max_rows())) {
+            reject(i, "this fire would exceed the driver's " +
+                          std::to_string(eng->max_rows()) + "-row forward budget");
+            continue;
+        }
+        // The tail is allocated per SAMPLED row, not per token, so it has a
+        // bound of its own.
+        if (csr.sample_rows.size() + d.readout_local_indices.size() >
+            std::size_t(eng->max_sampled_rows())) {
+            reject(i, "this fire would read more than the driver's " +
+                          std::to_string(eng->max_sampled_rows()) + " logits rows");
+            continue;
+        }
+        // `add`'s indptrs are this member's own cumulative counts, one entry
+        // per request and no leading zero; the fire's carry a leading zero and
+        // continue from where the previous member left off.
+        const std::uint32_t token_base = csr.qo_indptr.back();
+        const std::uint32_t page_base = csr.kv_page_indptr.back();
+        for (std::size_t k = 0; k < add.qo_indptr.size(); ++k) {
+            csr.qo_indptr.push_back(token_base + add.qo_indptr[k]);
+            csr.kv_page_indptr.push_back(page_base + add.kv_page_indptr[k]);
+        }
+        csr.token_ids.insert(csr.token_ids.end(), add.token_ids.begin(), add.token_ids.end());
+        csr.position_ids.insert(csr.position_ids.end(), add.position_ids.begin(),
+                                add.position_ids.end());
+        csr.req_of_token.insert(csr.req_of_token.end(), add.req_of_token.begin(),
+                                add.req_of_token.end());
+        csr.w_page.insert(csr.w_page.end(), add.w_page.begin(), add.w_page.end());
+        csr.w_off.insert(csr.w_off.end(), add.w_off.begin(), add.w_off.end());
+        csr.kv_page_indices.insert(csr.kv_page_indices.end(), add.kv_page_indices.begin(),
+                                   add.kv_page_indices.end());
+        // Only these rows reach the LM head. A prefill computes every row of the
+        // body and reads one; the head is `hidden * vocab` per row, so this is
+        // most of a prefill's cost and all of its logits memory.
+        for (const std::uint32_t local : d.readout_local_indices) {
+            csr.sample_rows.push_back(row0 + local);
+        }
+        accepted.push_back({i, row0});
+    }
+    if (accepted.empty()) return !any_rejected;
+
+    // Reserve every accepted member's readout rows BEFORE the fire: the staging
+    // copy runs after it, and the row a member's logits land in has to be
+    // stable across the whole batch.
+    for (const Accepted& a : accepted) {
+        LogitsOut& out = outs[a.member];
+        out.vocab = vocab_;
+        out.rows = std::uint32_t(descs[a.member].readout_local_indices.size());
+        out.device_row_offset = impl_->reserve_ptir_logits_rows(out.rows);
+        impl_->attach_ptir_logits_view(out);
+    }
+
+    // PTIR is told which rows are whose, and its group is finalized, BEFORE the
+    // fire: `post_forward` encodes a program whose descriptors those calls
+    // wrote. Encoding first and describing after leaves the group's lanes
+    // never dispatched -- which reports as `state=0`, a lane that did not run,
+    // rather than as anything about ordering.
+    std::vector<PtirCommandCallbacks> hooks;
+    if (ptir != nullptr) {
+        std::uint32_t ptir_sample = 0;
+        for (const Accepted& a : accepted) {
+            std::vector<std::uint32_t> rows;
+            for (std::size_t r = 0; r < descs[a.member].readout_local_indices.size(); ++r) {
+                // Sample indices, not token rows: the tail produced one row per
+                // SAMPLED row, and PTIR reads the tail's buffer.
+                rows.push_back(ptir_sample++);
+            }
+            PtirCommandCallbacks cb = (*ptir)[a.member];
+            if (cb.set_logits_rows) cb.set_logits_rows(rows);
+            if (cb.set_logits_row && rows.size() == 1) cb.set_logits_row(rows[0]);
+            hooks.push_back(std::move(cb));
+        }
+        for (PtirCommandCallbacks& cb : hooks) {
+            if (cb.finalize_group) cb.finalize_group();
+        }
+    }
+
+    // PTIR's device program is encoded into the SAME command buffer, before and
+    // after the model, which is what makes a sampled token available without a
+    // second submission.
+    SimpleFamilyEngine::EncodeHook pre, post;
+    const auto fire_t0 = std::chrono::steady_clock::now();
+    if (!hooks.empty()) {
+        pre = [&](StepEncoder& se) {
+            for (const PtirCommandCallbacks& cb : hooks) {
+                if (cb.pre_forward) cb.pre_forward(se);
+            }
+        };
+        post = [&](StepEncoder& se) {
+            for (const PtirCommandCallbacks& cb : hooks) {
+                if (cb.post_forward) cb.post_forward(se);
+            }
+        };
+    }
+    const StepTiming timing = impl_->fire_simple(csr, pre, post);
+    // Same meter as `run_batch_step`'s, on the path the simple families take.
+    // Without it a question like "what bounds gpt-oss in a batch" can only be
+    // answered from the outside, where the driver's time and the engine's are
+    // added together.
+    if (std::getenv("PIE_METAL_GPU_METER") != nullptr) {
+        static double gpu[33] = {};
+        static double enc[33] = {};
+        static double wall[33] = {};
+        static int n[33] = {};
+        const int rows = int(csr.token_ids.size());
+        const int lanes = rows < 33 ? rows : 32;
+        gpu[lanes] += timing.gpu_exec_ms;
+        enc[lanes] += timing.encode_ms;
+        wall[lanes] +=
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - fire_t0)
+                .count();
+        if (++n[lanes] % 128 == 0) {
+            std::fprintf(stderr,
+                         "[gpu] lanes=%d n=%d gpu %.4f enc %.4f wall %.4f ms"
+                         " | gpu/row %.4f ms\n",
+                         lanes, n[lanes], gpu[lanes] / n[lanes], enc[lanes] / n[lanes],
+                         wall[lanes] / n[lanes], gpu[lanes] / n[lanes] / (rows > 0 ? rows : 1));
+        }
+    }
+    if (!timing.succeeded()) {
+        for (const Accepted& a : accepted) {
+            errors[a.member] = "Metal forward timed out before its completion fence";
+        }
+        return false;
+    }
+
+    // The logits buffer holds one row per SAMPLED row, in `csr.sample_rows`
+    // order -- not one per token. So the copy's source is the sample's index,
+    // which is the order the members were accepted in.
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> copies;
+    std::uint32_t sample = 0;
+    for (const Accepted& a : accepted) {
+        const MemberForwardDesc& d = descs[a.member];
+        const bool direct = ptir != nullptr && (*ptir)[a.member].consumes_logits_directly;
+        for (std::uint32_t r = 0; r < d.readout_local_indices.size(); ++r, ++sample) {
+            if (direct) continue;
+            copies.push_back({sample, outs[a.member].device_row_offset + r});
+        }
+    }
+    // `stage_ptir_logits_rows` fires one copy dispatch per call, bounded by
+    // `kPtirLogitsCopyMaxRows`; a large batch needs several.
+    for (std::size_t off = 0; off < copies.size(); off += kPtirLogitsCopyMaxRows) {
+        const std::size_t n = std::min<std::size_t>(kPtirLogitsCopyMaxRows, copies.size() - off);
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> chunk(copies.begin() + off,
+                                                                  copies.begin() + off + n);
+        std::string stage_err;
+        if (!impl_->stage_ptir_logits_rows(chunk, &stage_err)) {
+            for (const Accepted& a : accepted) errors[a.member] = stage_err;
+            return false;
+        }
+    }
+
+    for (const Accepted& a : accepted) {
+        const MemberForwardDesc& d = descs[a.member];
+        const std::uint32_t slot = d.has_rs_slot ? d.rs_slot_id : 0u;
+        LinearSequenceState& state = slot_states_[slot];
+        state.has_resident = true;
+        state.resident_sequence_id = d.sequence_id;
+        state.resident_slot = slot;
+        state.resident_next_position = d.position_ids.back() + 1;
+        state.resident_pages = d.kv_pages;
+        // Paged, not ring-backed: several sequences are resident at once, each
+        // in its own pages, so nothing here is exclusive.
+        state.ring_backed = false;
+        state.paged_backed = true;
+        success[a.member] = 1;
+    }
+    return !any_rejected;
 }
 
 bool MetalExecutor::run_member_forward(const MemberForwardDesc& desc, LogitsOut& out,

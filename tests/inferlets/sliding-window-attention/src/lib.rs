@@ -4,7 +4,7 @@
 //! each query can attend only to the most recent `window_size` positions. The
 //! example masks old KV cells but does not evict their backing pages.
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, chat, model as wit_model};
 use serde::Deserialize;
 

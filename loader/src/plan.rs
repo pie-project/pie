@@ -279,7 +279,12 @@ pub enum TransformFusion {
 pub struct TransformSpec {
     pub from: Option<QuantScheme>,
     pub to: Option<QuantScheme>,
-    pub repack: RepackSpec,
+    /// The kernel this transform ends in, when it ends in one.
+    ///
+    /// `None` rather than a layout of that name: a transform that does not
+    /// repack has no rows, no columns and no kernel, and a struct of zeros
+    /// standing for that is a value every reader has to know to disbelieve.
+    pub repack: Option<RepackSpec>,
     pub scratch_bytes: u64,
     pub fusion: TransformFusion,
     /// The checkpoint tensor holding this transform's *input* block scales.
@@ -301,16 +306,23 @@ pub struct TransformSpec {
     /// same 32 bits the contract named rather than a widened value that would
     /// have to be narrowed again.
     pub scale_factor_bits: u32,
-    /// Elements per factor along [`scale_axis`](TransformSpec::scale_axis) for
-    /// a per-group [`TileMapKind::Scale`]; zero when the factor is the uniform
-    /// constant in [`scale_factor_bits`](TransformSpec::scale_factor_bits).
+    /// Elements of the operand per factor, on each axis, for a per-block
+    /// [`TileMapKind::Scale`]; empty when the factor is the uniform constant in
+    /// [`scale_factor_bits`](TransformSpec::scale_factor_bits).
     ///
-    /// Non-zero is what tells the executor to read its factors from the extra
+    /// Non-empty is what tells the executor to read its factors from the extra
     /// input buffer instead, so the two cases cannot be confused for one
     /// another by a field left unset.
-    pub scale_group: u32,
-    /// The axis [`scale_group`](TransformSpec::scale_group) counts along.
-    pub scale_axis: u8,
+    ///
+    /// One entry per axis, so a two-dimensional block scale — which is what a
+    /// DeepSeek-style FP8 checkpoint ships — is `[128, 128]` and the ordinary
+    /// row-wise case is `[1, 32]`. Derived here rather than restated by the
+    /// author: [`ScaleFactor::PerBlock`](crate::contract::ScaleFactor::PerBlock)
+    /// carries only the factors, and the blocking is the ratio of the two
+    /// inferred shapes. Both executors can recompute it and check this against
+    /// what they see.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scale_blocks: Vec<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

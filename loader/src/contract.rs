@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, OrOverflow};
 pub use crate::types::Visibility;
-use crate::types::{Axis, DType, Encoding, QuantGranularity, RepackSpec, ScaleForm};
+use crate::types::{Axis, DType, Encoding, QuantGranularity, RepackLayout, ScaleForm};
 
 pub mod compile;
 pub mod infer;
@@ -32,12 +32,52 @@ pub mod rewrite;
 /// [`Expr::Repack`], [`Expr::Cast`] and [`Expr::Scale`] are the escape
 /// hatches. They need a kernel and are deliberately marked as such.
 ///
-/// The organizing question is what each node *preserves*, not what it is called:
-/// the affine fragment preserves bytes, values and type together and only moves
-/// them; [`Expr::Transmute`] preserves the bytes and renames them;
-/// [`Expr::Scale`] preserves the type and rewrites the values; [`Expr::Cast`]
-/// preserves the values and rewrites their representation. [`Expr::Repack`] is
-/// what is left when none of those hold.
+/// The organizing question is what each node *preserves*, not what it is called.
+/// Two axes classify the nine that have an operand: what is preserved, and
+/// whether it is free. The three leaves — [`Expr::Src`], [`Expr::Out`] and
+/// [`Expr::Fill`] — sit outside the table, because with no operand to preserve
+/// anything *from*, neither axis says anything about them.
+///
+/// |          | free                                       | kernel  |
+/// |----------|--------------------------------------------|---------|
+/// | layout   | `Slice` `Stride` `Gather` `Concat` `Shard` | `Repack`|
+/// | type     | `Transmute`                                | `Cast`  |
+/// | value    | —                                          | `Scale` |
+///
+/// A row says what a node is allowed to change; everything below its row it
+/// preserves. So the affine fragment preserves bytes, values and type together
+/// and only moves them; [`Expr::Transmute`] preserves the bytes and renames
+/// them; [`Expr::Cast`] preserves the values and rewrites their representation;
+/// [`Expr::Scale`] preserves the type and rewrites the values. [`Expr::Repack`]
+/// is not "what is left" -- it is placement priced as a kernel, and it is held
+/// to its row: it may pad, and it may not reinterpret an element.
+///
+/// The empty cell is principled rather than missing. A value cannot be changed
+/// for free, so there is nothing to put there.
+///
+/// Within a row, placement is a strict cost ladder that `infer` enforces in
+/// both directions: a `Stride` expressible as a `Slice` is refused, a `Gather`
+/// expressible as either is refused, and no node may denote exactly its
+/// operand. The cheap node must not be spellable as the expensive one, or the
+/// distinction buys nothing.
+///
+/// [`Expr::Gather`] has no user today — every selection a driver has needed so
+/// far is a band or an arithmetic progression, and the one place that once
+/// wanted an index list turned out to be a `Stride`. It is kept because it is
+/// the ladder's top rung and the placement fragment's closure: it is what makes
+/// "these elements, in this order" expressible at all, and without it the two
+/// rungs below it are two special cases rather than the cheap ends of one
+/// operation. That is recorded here because nothing else would tell a reader
+/// why a fully implemented node has no callers.
+///
+/// **What the placement fragment cannot say.** Every node maps output axis `k`
+/// from operand axis `k`, so as index maps they are the per-axis-diagonal
+/// subgroup: no node permutes axes. A permutation that fixes the innermost
+/// axis is expressible as a `Concat` of `Slice`s, verbosely; a transpose that
+/// moves the innermost axis is not expressible at all, because it is the one
+/// rearrangement that is not a reordering of runs. Nothing needs it today —
+/// every tile swizzle that would want it is inside a [`Expr::Repack`] — and it
+/// is recorded here so that the next node added is measured against it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Expr {
     /// A tensor read from the checkpoint, by its on-disk name.
@@ -229,9 +269,35 @@ pub enum Expr {
     },
     /// Escape hatch: a backend-specific layout swizzle. Opaque to the type
     /// checker, so it must declare its own output type.
+    ///
+    /// Opaque in one direction only. *What* the swizzle does to a byte is the
+    /// kernel's business -- a sub-word tile interleave is a fact about a GEMM,
+    /// not about tensors -- but *how many* bytes there are on each side is not
+    /// opaque at all: the operand's type says one side and `to` says the other.
+    ///
+    /// So a repack names a kernel and nothing else. Which rows it reads is
+    /// `src`'s business, and `src` is an ordinary expression: a band is
+    /// [`Expr::Slice`], this rank's share is [`Expr::Shard`], an interleaved
+    /// half is [`Expr::Stride`]. That is what keeps the escape hatch from
+    /// re-implementing the algebra beside it, and what lets a repack be
+    /// sharded like everything else instead of by a rank resolved into an
+    /// integer before the contract is written.
+    ///
+    /// The one geometric fact left to the kernel is padding: a layout with a
+    /// tile quantum takes a `to` with more rows or columns than the operand
+    /// has and zero-fills the tail. Stating it as `Concat[src, Fill]` would be
+    /// truthful but would materialize the padded operand before the swizzle
+    /// that is about to rewrite it anyway.
+    ///
+    /// Padding is the *only* thing it may add. An element is the same width on
+    /// both sides, because this is the kernel-priced member of the placement
+    /// family: it changes where a byte sits and never what a byte means. A
+    /// repack that named a different element width sized its destination
+    /// buffer from a lie, which is [`Expr::Transmute`]'s invariant reached
+    /// from the other side.
     Repack {
         src: Box<Expr>,
-        spec: RepackSpec,
+        layout: RepackLayout,
         to: TensorType,
     },
     /// Escape hatch: the same values in a different representation.
@@ -252,8 +318,14 @@ pub enum Expr {
     /// Shape is preserved in every direction: a cast has an opinion about
     /// element representation and none about placement. Re-encoding one
     /// quantized scheme directly as another is refused -- no kernel does it,
-    /// and the two-step is spellable as an [`Visibility::Internal`]
-    /// declaration of the decoded tensor.
+    /// and the destination's scales are not a function of the source's -- so
+    /// the two-step is what a contract says instead: declare the decoded
+    /// tensor [`Visibility::Internal`] and cast *that*. A kernel node reads any
+    /// expression, [`Expr::Out`] included, which is what makes step two
+    /// spellable; what it may not read is another kernel directly, and naming
+    /// the intermediate is how a contract sequences two. Which node decodes
+    /// depends on the scheme -- a cast to the logical dtype where a backend
+    /// implements one, a per-group [`Expr::Scale`] for a block-scaled scheme.
     ///
     /// Stated as a node rather than left implicit in the gap between what an
     /// expression yields and what its declaration says, because that gap hid a
@@ -273,7 +345,7 @@ pub enum Expr {
     /// the alternative — a driver copying the tensor to the host, scaling it
     /// there and uploading the result during bind, outside the plan entirely.
     ///
-    /// With a [`ScaleFactor::PerGroup`] factor this is dequantization, and it
+    /// With a [`ScaleFactor::PerBlock`] factor this is dequantization, and it
     /// overlaps [`Expr::Cast`] into a raw encoding on purpose: a cast decodes
     /// with the scales the *scheme* says are there, while this decodes with
     /// scales an author names. That is the whole difference, and it is why this
@@ -303,23 +375,28 @@ pub enum ScaleFactor {
     /// what an all-zero FFI node carries, so accepting it would turn a
     /// forgotten field into a tensor of zeros that loads and runs.
     Uniform(u32),
-    /// One factor per `group` consecutive elements along `axis`, read from a
-    /// companion expression: `out[.., i, ..] = src[.., i, ..] * by[.., i / group, ..]`.
+    /// One factor per block, read from a companion expression whose shape says
+    /// how big a block is: `out[i0, .., ik] = src[i0, .., ik] * by[i0 / g0, .., ik / gk]`
+    /// where `gj = src.shape[j] / by.shape[j]`.
+    ///
+    /// **The grouping is the shape ratio, and nothing else states it.** A
+    /// `[256, 512]` weight with `[2, 4]` factors is blocked 128x128; with
+    /// `[256, 4]` it is blocked 1x128, which is the one-dimensional case; with
+    /// `[256, 1]` it is one factor per row. This used to carry a `group` and an
+    /// `axis` beside the operand, which said the same thing a second time and
+    /// therefore could disagree with it — and being one number, could only ever
+    /// say it about one axis, so a two-dimensional block scale was not
+    /// expressible at all even though both executors' kernels index one.
     ///
     /// This is how a block-scaled checkpoint is dequantized, and stating it as
     /// an expression is the point. The scales are a tensor like any other, so
     /// they take the same [`Expr::Shard`], [`Expr::Slice`] and [`Expr::Concat`]
-    /// the weight takes, written beside it and checked against `group` by
+    /// the weight takes, written beside it and checked against the weight by
     /// `infer`. The alternative — pairing a weight with its scales by appending
     /// a suffix to its name, somewhere below the contract — cannot be checked
     /// at all: a partition applied to one and not the other is silent, and a
     /// pairing that fails to match simply does nothing.
-    PerGroup {
-        by: Box<Expr>,
-        /// Elements of `src` per element of `by`, along `axis`. Never zero.
-        group: u32,
-        axis: Axis,
-    },
+    PerBlock { by: Box<Expr> },
 }
 
 /// The type of a tensor-valued expression: logical shape plus how its elements
@@ -645,6 +722,30 @@ pub fn resolve_extents(requested: &[i64], total: i64) -> Result<Vec<i64>, Error>
 }
 
 impl Expr {
+    /// The node's name in the algebra, for diagnostics.
+    ///
+    /// This is the constructor's own name, not a description: it is what the
+    /// table in this module's documentation calls the node, so an error can
+    /// say which cell a rejected expression came from.
+    pub fn node_name(&self) -> &'static str {
+        match self {
+            Expr::Src(_) => "Src",
+            Expr::Out(_) => "Out",
+            Expr::Fill { .. } => "Fill",
+            Expr::Slice { .. } => "Slice",
+            Expr::Stride { .. } => "Stride",
+            Expr::Gather { .. } => "Gather",
+            Expr::Concat { .. } => "Concat",
+            Expr::Transmute { .. } => "Transmute",
+            Expr::Shard { .. } => "Shard",
+            Expr::Repack { .. } => "Repack",
+            Expr::Cast { .. } => "Cast",
+            Expr::Scale { .. } => "Scale",
+            Expr::SrcIndexed(_) => "SrcIndexed",
+            Expr::Select { .. } => "Select",
+        }
+    }
+
     pub fn src(name: impl Into<String>) -> Self {
         Expr::Src(name.into())
     }
@@ -718,10 +819,10 @@ impl Expr {
         }
     }
 
-    pub fn repack(self, spec: RepackSpec, to: TensorType) -> Self {
+    pub fn repack(self, layout: RepackLayout, to: TensorType) -> Self {
         Expr::Repack {
             src: Box::new(self),
-            spec,
+            layout,
             to,
         }
     }
@@ -742,18 +843,14 @@ impl Expr {
         }
     }
 
-    /// Multiply by `by`, one factor per `group` elements along `axis`.
+    /// Multiply by `by`, one factor per block, blocked by the shape ratio.
     ///
     /// Over a quantized `self` this is dequantization, and the result is the
     /// scheme's logical dtype.
-    pub fn scale_per_group(self, by: Expr, group: u32, axis: u8) -> Self {
+    pub fn scale_per_block(self, by: Expr) -> Self {
         Expr::Scale {
             src: Box::new(self),
-            factor: ScaleFactor::PerGroup {
-                by: Box::new(by),
-                group,
-                axis: Axis(axis),
-            },
+            factor: ScaleFactor::PerBlock { by: Box::new(by) },
         }
     }
 
@@ -821,7 +918,7 @@ impl Expr {
             | Expr::Cast { src, .. } => src.visit(seen),
             Expr::Scale { src, factor } => {
                 src.visit(seen);
-                if let ScaleFactor::PerGroup { by, .. } = factor {
+                if let ScaleFactor::PerBlock { by } = factor {
                     by.visit(seen);
                 }
             }
@@ -897,9 +994,9 @@ impl Expr {
                 src: boxed(src)?,
                 to,
             },
-            Expr::Repack { src, spec, to } => Expr::Repack {
+            Expr::Repack { src, layout, to } => Expr::Repack {
                 src: boxed(src)?,
-                spec,
+                layout,
                 to,
             },
             Expr::Cast { src, to } => Expr::Cast {
@@ -909,11 +1006,7 @@ impl Expr {
             Expr::Scale { src, factor } => Expr::Scale {
                 src: boxed(src)?,
                 factor: match factor {
-                    ScaleFactor::PerGroup { by, group, axis } => ScaleFactor::PerGroup {
-                        by: boxed(by)?,
-                        group,
-                        axis,
-                    },
+                    ScaleFactor::PerBlock { by } => ScaleFactor::PerBlock { by: boxed(by)? },
                     uniform => uniform,
                 },
             },
