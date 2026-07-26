@@ -512,20 +512,36 @@ def make_prompts(args: argparse.Namespace, n: int) -> list[str]:
     return [args.prompt for _ in range(n)]
 
 
+def _render_chat(tok, system: str, prompts: list[str]) -> list[str]:
+    """Chat-render `prompts`, falling back to plain text when the tokenizer
+    ships no chat template.
+
+    Some checkpoints (gemma-4-E4B) have no `chat_template`, and
+    `apply_chat_template` then raises. PIE tokenizes prompts itself and was
+    unaffected, but vLLM went through this path and failed outright, which made
+    the model impossible to compare. Both engines get the same rendered string
+    either way, so the comparison stays honest.
+    """
+    if getattr(tok, "chat_template", None):
+        return [
+            tok.apply_chat_template(
+                [{"role": "system", "content": system},
+                 {"role": "user", "content": p}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            for p in prompts
+        ]
+    return [f"{system}\n\n{p}" if system else p for p in prompts]
+
+
 def hf_chat_prompts_and_counts(
     model: str, system: str, prompts: list[str]
 ) -> tuple[list[str], list[int]]:
     from transformers import AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
-    rendered = [
-        tok.apply_chat_template(
-            [{"role": "system", "content": system}, {"role": "user", "content": p}],
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        for p in prompts
-    ]
+    rendered = _render_chat(tok, system, prompts)
     counts = [len(tok.encode(p, add_special_tokens=False)) for p in rendered]
     return rendered, counts
 
@@ -535,14 +551,7 @@ def hf_chat_token_ids_and_counts(
 ) -> tuple[list[list[int]], list[int]]:
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
-    rendered = [
-        tok.apply_chat_template(
-            [{"role": "system", "content": system}, {"role": "user", "content": p}],
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        for p in prompts
-    ]
+    rendered = _render_chat(tok, system, prompts)
     token_ids = [tok.encode(p, add_special_tokens=False) for p in rendered]
     return token_ids, [len(ids) for ids in token_ids]
 

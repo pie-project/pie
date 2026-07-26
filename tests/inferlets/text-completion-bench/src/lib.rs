@@ -271,6 +271,22 @@ async fn run_one(
         .capacity(out_capacity as u32)
         .named("out");
 
+    // Hybrid/recurrent architectures (Qwen3.6's GDN layers, Mamba2) carry a
+    // folded recurrent state per request alongside the KV pages, and the
+    // driver rejects a forward whose rs-working-set count doesn't match its
+    // request rows. One row per fire here, so one set — reused by BOTH passes
+    // so the decode continues the prefill's state rather than starting cold.
+    // `rs_state_size() == 0` on pure-attention models, which bind none.
+    // `is_linear()` is the documented class flag (model.wit: "Prefer this over
+    // reading rs-state-size() as a class flag"): true iff the model folds a
+    // recurrent state, which is exactly when the driver requires one
+    // rs-working-set per request row.
+    let rs_ws: Vec<RsWorkingSet> = if wit_model::is_linear() {
+        vec![RsWorkingSet::new()]
+    } else {
+        Vec::new()
+    };
+
     let fwd_p = ForwardPass::new();
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
     let kv_len_p = Channel::from(vec![n]).named("kv_len_p");
@@ -286,6 +302,11 @@ async fn run_one(
         &positions_p,
         None,
     )?;
+    if !rs_ws.is_empty() {
+        fwd_p
+            .rs_working_sets(&rs_ws)
+            .map_err(|e| format!("bind prefill recurrent state: {e}"))?;
+    }
     fwd_p.epilogue(move || {
         let t = reshape(
             sample(intrinsics::logits(), vocab, temperature, top_p, prefill_rng),
@@ -323,6 +344,10 @@ async fn run_one(
             &positions,
             None,
         )?;
+        if !rs_ws.is_empty() {
+            fwd.rs_working_sets(&rs_ws)
+                .map_err(|e| format!("bind decode recurrent state: {e}"))?;
+        }
         fwd.epilogue(move || {
             let length = kv_len.take().tensor();
             let t = reshape(
