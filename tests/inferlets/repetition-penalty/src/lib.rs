@@ -35,7 +35,7 @@
 //!
 //! ## Memory
 //!
-//! Two `[vocab]` f32 channels, so 1 MiB each at this model's 262144-token
+//! Two `[vocab]` f32 channels, so ~594 KiB each at this model's 151936-token
 //! vocabulary. Only `counts` is a feedback channel; `prompt_present` is written
 //! once and cycled unchanged, which keeps the graph shape identical between the
 //! prefill and decode passes.

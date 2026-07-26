@@ -920,11 +920,11 @@ directly comparable; the absolute baseline drifts about ±10 % between sessions.
 | A2 `eta-epsilon-sampling` | 4.31 | 1.31× | Entropy + two elementwise passes |
 | A5 `xtc-sampling` | 4.48 | 1.36× | Threshold scan + Bernoulli gate |
 | A6 `repetition-penalty` | 4.89 | 1.48× | Scatter over the seen-token vector |
+| A3 `tail-free-sampling` | 5.20 | 1.49× | `top_k(k_max=128)` over a 151936 vocab |
+| A1 `locally-typical-sampling` | 5.39 | 1.54× | `top_k(k_max=128)` over a 151936 vocab |
 | A7 `dry-repetition-penalty` | 7.08 | 2.15× | 8-deep n-gram match, unrolled on device |
 | D2 `context-aware-decoding` | 13.12 | 3.98× | **Two forward passes, serialized** |
 | D1 `classifier-free-guidance` | 13.87 | 4.21× | **Two forward passes, serialized** |
-| A3 `tail-free-sampling` | 17.47 | 5.30× | `top_k(k_max=128)` over a 262144 vocab |
-| A1 `locally-typical-sampling` | 17.71 | 5.37× | `top_k(k_max=128)` over a 262144 vocab |
 | A10 `synthid-tournament-sampling` | 33.55 | 10.2× | Nine knockout rounds per token |
 
 Three structural observations fall out of this table.
@@ -934,14 +934,38 @@ and 165 ms for every configuration including the baseline — that is install pl
 prefill, and no inferlet carries a heavy one-time setup. Cost scales with tokens
 generated, so it is predictable and it never surprises a short request.
 
-**The 5× cliff is `top_k`, not the algorithm.** A1 and A3 are the only two
-samplers that need a ranking, and they pay for it identically (17.7 and 17.5
-ms/token) despite computing entirely different statistics. The tier-0
-`k_topk_rows` kernel is an incremental-threshold selection that rescans the row
-once per pick, so it costs `O(k·vocab)` — 33.5 M element visits per token at
-`k_max = 128` and this model's 262144-token vocabulary. `k_max` is therefore a
-performance knob with teeth, and A4's sort-free design is why it sits at 1.15×
-while doing comparable work.
+**The `top_k` cliff was an implementation defect, and it is fixed.** A1 and A3
+originally measured 17.71 and 17.47 ms/token — a 5.3× cliff over the baseline —
+and they paid it *identically* despite computing entirely different statistics,
+which is what identified `top_k` rather than the algorithms as the cause. The
+kernel behind it was an incremental-threshold selection that rescans the whole
+row once per pick, costing `O(k · vocab)`: 19.4 M element visits per token at
+`k_max = 128` and this model's 151936-token vocabulary, executed by a *single*
+256-thread block. Replacing it with a radix select of the cut followed by a
+bitonic sort of the `k` survivors — `O(8·vocab + k·log²k)` — brings A1 to 5.39
+and A3 to 5.20 ms/token, and makes the cost **flat in `k`**:
+
+| `k_max` | before | after |
+| --- | --- | --- |
+| 8 | 5.92 | 5.64 |
+| 128 | 17.75 | 5.39 |
+| 1024 | 116.18 | 5.67 |
+
+The residual ~1.5× over the baseline is the barrier structure (`top_k` and
+`cum_sum` are hard schedule barriers), which is a real property of the language.
+The 5.3× was not.
+
+**Four copies of `top_k` is the story worth keeping.** The first fix targeted
+tier-0's `k_topk_rows` and moved the benchmark **not at all**, because `top_k`
+is an `L::Library` op: the fused runtime dispatches it to `k_grouped_topk` in
+`grouped_runtime.cuh`, and tier-0's copy only serves the standalone path. There
+were four independent implementations of the same total order — tier-0, grouped,
+the generated fused emitter, and the M1 singleton — and optimising the one named
+after the op was not optimising the one that runs. The fix now routes tier-0 and
+the grouped runtime through a single shared `t0_block_topk_fast` template
+parameterised on a value accessor, so the total order has one definition rather
+than four. *A benchmark that does not move after a fix is evidence about
+dispatch, not evidence that the fix was wrong.*
 
 **D1/D2's 4× is two effects, not one.** Both score every token under two
 prompts, which is 2× the forward-pass work by construction. The other 2× is lost

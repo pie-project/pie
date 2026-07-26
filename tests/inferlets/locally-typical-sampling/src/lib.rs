@@ -20,17 +20,19 @@
 //! top_k(-score, k_max) -> gather(probs) -> cumsum -> lt(mass) -> scatter_set
 //! ```
 //!
-//! `k_max` is a *bound*, not a detail. The tier-0 `k_topk_rows` kernel is an
-//! incremental-threshold selection that rescans the row once per pick, so it
-//! costs `O(k · vocab)`. A full sort (`k = vocab`) is `O(vocab²)` — about
-//! 6.9e10 operations at this model's 262144-token vocabulary, which stalls the
-//! driver. Capping the candidate set keeps the cost at `O(k_max · vocab)` and
-//! matches what production samplers do anyway.
+//! `k_max` is a *bound*, not a detail. `top_k` is a schedule barrier, so a
+//! ranking always costs a region break. The kernel itself is a radix select of
+//! the cut followed by a bitonic sort of the `k` survivors, so its cost is
+//! `O(vocab + k·log²k)` — effectively flat in `k_max`. (It was not always: the
+//! kernel used to rescan the row once per pick, `O(k · vocab)`, which made
+//! `k_max` a performance knob with teeth. See the runtime-cost section of
+//! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.)
 //!
-//! The cap is a real semantic bound: at most `k_max` tokens can be retained. If
-//! the `k_max` most typical tokens do not carry `mass` probability, the set is
-//! truncated there. `mass_reached` in the output reports whether that happened,
-//! so the approximation is observable rather than silent.
+//! The cap remains a real semantic bound: at most `k_max` tokens can be
+//! retained. If the `k_max` most typical tokens do not carry `mass`
+//! probability, the set is truncated there. `mass_reached` in the output
+//! reports whether that happened, so the approximation is observable rather
+//! than silent.
 //!
 //! ## Source
 //!

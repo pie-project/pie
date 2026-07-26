@@ -49,11 +49,14 @@ tells you whether it is binding: if it sits well below `mass`, raise `k_max`.
 
 ## Cost
 
-**17.71 ms/token, 5.37× the [`naive-baseline`](../naive-baseline) control** on
-an L40S with Qwen3-0.6B. Almost all of it is `top_k` over a 262144-entry
-vocabulary, not the typicality maths — `tail-free-sampling` computes a
-completely different statistic and costs the same. `k_max` is the dial that
-matters.
+**5.39 ms/token, 1.54× the [`naive-baseline`](../naive-baseline) control** on an
+L40S with Qwen3-0.6B. The residual is the region break that `top_k` and
+`cum_sum` force as schedule barriers, not the typicality maths —
+`tail-free-sampling` computes a completely different statistic and costs the
+same. It read 17.71 ms (5.37×) until the `top_k` kernel was changed from a
+per-pick row rescan to a radix select; cost is now effectively flat in `k_max`
+(5.64 / 5.39 / 5.67 ms at `k_max` = 8 / 128 / 1024, against 5.92 / 17.75 /
+116.18 before).
 
 ## Run
 

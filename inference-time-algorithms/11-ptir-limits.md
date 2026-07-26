@@ -40,9 +40,11 @@ nine-round tournament knockouts — none of these break a region. An entire
 sampler epilogue, however baroque, compiles to a single fused kernel as long as
 it does not need a *ranking* or a *prefix scan*.
 
-And the cost table bears this out exactly: the only two samplers with a cliff
-(A1 at 5.37×, A3 at 5.30×) are precisely the two with barrier ops. The other
-eight land between 0.84× and 2.15×.
+And the cost table bears this out: the only two samplers that carry measurable
+extra cost (A1 at 1.54×, A3 at 1.49×) are precisely the two with barrier ops.
+The other eight land between 0.84× and 2.15×. Note the gap is now *modest* — it
+read 5.37× and 5.30× until the `top_k` kernel behind it was fixed, and the part
+attributable to the barrier structure itself was always the smaller half.
 
 ### Where it strains: the library recognizer is a single exact pattern
 
@@ -79,17 +81,28 @@ block-cooperative selection loop into the generated path, and
 > optimisation.** Whenever those two diverge in *asymptotics* rather than in
 > constants, a fusion heuristic silently becomes a correctness cliff.
 
-`pivot_threshold(rank_le)` is the next candidate — its generated implementation
-is O(len²), untested at vocabulary scale.
+`pivot_threshold(rank_le)` was the next candidate — its generated implementation
+was O(len²), untested at vocabulary scale. It is now a radix select, verified at
+151936 columns.
 
 ### Where it strains: no cost model, so barriers are invisible
 
-Nothing in the DSL tells an author that `top_k` costs 5× and `pivot_threshold`
-costs 1.15×. The tier-0 `k_topk_rows` kernel is an incremental-threshold
-selection that rescans the row once per pick — `O(k · vocab)`, or 33.5 M element
-visits per token at `k_max = 128` on a 262144-token vocabulary. A1 and A3 could
-both be re-expressed without a ranking (A4 demonstrates the style), but nothing
-in the surface language nudges an author that way.
+Nothing in the DSL tells an author that `top_k` and `cum_sum` are hard schedule
+barriers while `pivot_threshold` is not. That gap is real and it is the reason
+A1/A3 still sit ~1.5× above the baseline while A4, which needs no ranking, sits
+at 1.15×.
+
+What the gap is *not* is the 5.3× cliff those two originally measured. That was
+an implementation defect: the `top_k` kernel actually dispatched
+(`k_grouped_topk`) rescanned the full row once per pick, `O(k · vocab)`, on a
+single 256-thread block. A radix select plus a bitonic sort of the survivors
+removed it and made the cost flat in `k` (116 → 5.7 ms/token at `k_max = 1024`).
+
+The episode carries a language-design lesson anyway: an author had no way to
+tell the difference between "this op is inherently a barrier" and "this op has a
+slow kernel today", because the surface language exposes neither. A1's source
+carried a comment confidently attributing its cost to an algorithmic bound that
+was really a fixable constant.
 
 ---
 

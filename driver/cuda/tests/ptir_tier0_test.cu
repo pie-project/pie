@@ -937,6 +937,72 @@ void test_new_ops() {
     CUDA_OK(cudaFree(adversarial_values));
     CUDA_OK(cudaFree(adversarial_device));
 
+    // top_k at the 151936-token vocab scale with k=128 — the configuration
+    // `locally-typical-sampling` and `tail-free-sampling` default to, and the
+    // one the incremental selection loop paid O(k*len) for.
+    {
+        const std::uint32_t rows_big = 2, len_big = 151936, k_big = 128;
+        std::vector<float> big((std::size_t)rows_big * len_big);
+        std::uint32_t seed = 0xb7e15163u;
+        for (std::size_t i = 0; i < big.size(); ++i) {
+            seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+            big[i] = (float)((std::int32_t)(seed % 40001u) - 20000) * 1e-3f;
+        }
+        big[12345] = std::nanf("");         // NaN must sort last, never into the top-k
+        big[999] = -0.0f;
+        big[1000] = 0.0f;
+        float* dbig = dev_from(big);
+        float* dbv = dev_alloc<float>((std::size_t)rows_big * k_big);
+        std::uint32_t* dbi = dev_alloc<std::uint32_t>((std::size_t)rows_big * k_big);
+        cudaEvent_t start = nullptr;
+        cudaEvent_t stop = nullptr;
+        CUDA_OK(cudaEventCreate(&start));
+        CUDA_OK(cudaEventCreate(&stop));
+        CUDA_OK(cudaEventRecord(start));
+        k_topk_rows<<<rows_big, kTier0Block>>>(dbig, dbv, dbi, rows_big, len_big, k_big);
+        CUDA_OK(cudaEventRecord(stop));
+        CUDA_OK(cudaEventSynchronize(stop));
+        float elapsed_ms = 0.0f;
+        CUDA_OK(cudaEventElapsedTime(&elapsed_ms, start, stop));
+        CUDA_OK(cudaDeviceSynchronize());
+        std::vector<float> want_v((std::size_t)rows_big * k_big);
+        std::vector<std::uint32_t> want_i((std::size_t)rows_big * k_big);
+        for (std::uint32_t r = 0; r < rows_big; ++r) {
+            std::vector<std::uint32_t> order(len_big);
+            for (std::uint32_t i = 0; i < len_big; ++i) order[i] = i;
+            const float* base = big.data() + (std::size_t)r * len_big;
+            std::partial_sort(
+                order.begin(), order.begin() + k_big, order.end(),
+                [&](std::uint32_t a, std::uint32_t b) {
+                    const bool na = std::isnan(base[a]), nb = std::isnan(base[b]);
+                    if (na != nb) return nb;
+                    if (na && nb) return a < b;
+                    if (base[a] != base[b]) return base[a] > base[b];
+                    return a < b;
+                });
+            for (std::uint32_t p = 0; p < k_big; ++p) {
+                want_i[(std::size_t)r * k_big + p] = order[p];
+                want_v[(std::size_t)r * k_big + p] = base[order[p]];
+            }
+        }
+        check("top_k (151936-vocab, k=128) values",
+              to_host(dbv, (std::size_t)rows_big * k_big), want_v);
+        check("top_k (151936-vocab, k=128) indices",
+              to_host(dbi, (std::size_t)rows_big * k_big), want_i);
+        if (elapsed_ms < 50.0f) {
+            ++g_pass;
+            std::printf("  PASS  production-vocab top_k timing (%g ms)\n",
+                        static_cast<double>(elapsed_ms));
+        } else {
+            ++g_fail;
+            std::printf("  FAIL  production-vocab top_k timing (%g ms)\n",
+                        static_cast<double>(elapsed_ms));
+        }
+        CUDA_OK(cudaEventDestroy(stop));
+        CUDA_OK(cudaEventDestroy(start));
+        CUDA_OK(cudaFree(dbig)); CUDA_OK(cudaFree(dbv)); CUDA_OK(cudaFree(dbi));
+    }
+
     // mask_apply_packed [2, 40] (2 mask words/row)
     std::uint32_t pr = 2, pl = 40, pw = (pl + 31) / 32;
     std::vector<float> plog(pr * pl);

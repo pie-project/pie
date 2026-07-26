@@ -90,12 +90,15 @@ Three conclusions, spelled out in the audit's `## Runtime cost` section:
 - **Overhead is entirely marginal, never fixed.** Intercepts land at 87–165 ms
   for every configuration including the baseline. No inferlet has heavy
   one-time setup.
-- **The 5× cliff is `top_k`, not the algorithm.** `tail-free-sampling` and
-  `locally-typical-sampling` compute completely unrelated statistics yet cost
-  the same, because the tier-0 `k_topk_rows` is an incremental-threshold
-  selection that rescans the row once per pick — `O(k · vocab)`, or 33.5 M
-  element visits per token at `k_max = 128`. `top-a-sampling`, which needs no
-  ranking at all, sits at 1.15×.
+- **The 5× `top_k` cliff was a kernel defect, and it is fixed.**
+  `tail-free-sampling` and `locally-typical-sampling` compute completely
+  unrelated statistics yet cost the same, which identified `top_k` rather than
+  the algorithms as the cause. The kernel rescanned the row once per pick —
+  `O(k · vocab)`, or 19.4 M element visits per token at `k_max = 128` — on a
+  single 256-thread block. A radix select plus a bitonic sort of the survivors
+  brings them to 1.49× and 1.54× and makes the cost flat in `k`. What remains
+  is the schedule barrier; `top-a-sampling`, which needs no ranking at all,
+  sits at 1.15×.
 - **The 4× on the contrastive pair is two effects.** Two forward passes by
   construction, *plus* loss of run-ahead because the next input depends on both
   passes' combined output.

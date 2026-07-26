@@ -33,6 +33,10 @@
 namespace pie_cuda_driver::pipeline {
 
 inline constexpr int kTier0Block = 256;   // fixed CTA width for row-local kernels
+// Largest `k` the `k_topk_rows` radix-select fast path handles; above it the
+// per-row staging buffer would not fit in shared memory and the incremental
+// selection loop takes over.
+inline constexpr std::uint32_t kTopkFastMaxK = 1024;
 inline constexpr int kCanonicalReduceWidth = 32;
 inline constexpr int kCanonicalReduceLevels = 8;
 
@@ -687,6 +691,164 @@ __device__ __forceinline__ std::uint32_t t0_desc_key(float v) {
     return ~asc;
 }
 
+// Block-cooperative 4-pass 8-bit MSB radix select. Returns the `target`-th
+// smallest key (1-indexed, counting multiplicity) among `key_of(i)` for i in
+// [0, len). Every thread in the block must reach this call. `sh_hist` needs 256
+// entries, `sh_state` needs 2. Cost is 4 passes over the row regardless of
+// `target`, against the O(target * len) of an incremental-threshold selection
+// loop and the O(len^2) of a per-element rank pass.
+template <class KeyFn>
+__device__ std::uint32_t t0_block_radix_select(std::uint32_t len, std::uint32_t target,
+                                               std::uint32_t* sh_hist,
+                                               std::uint32_t* sh_state,
+                                               KeyFn key_of) {
+    if (threadIdx.x == 0) { sh_state[0] = 0u; sh_state[1] = target; }
+    __syncthreads();
+    for (int pass = 0; pass < 4; ++pass) {
+        const int shift = 24 - 8 * pass;
+        // Bits fixed by earlier passes; `pass == 0` is special-cased because
+        // shifting a 32-bit value by 32 is undefined, not zero.
+        const std::uint32_t hi_mask = (pass == 0) ? 0u : (0xFFFFFFFFu << (shift + 8));
+        for (std::uint32_t b = threadIdx.x; b < 256u; b += blockDim.x) sh_hist[b] = 0u;
+        __syncthreads();
+        const std::uint32_t prefix = sh_state[0];
+        for (std::uint32_t i = threadIdx.x; i < len; i += blockDim.x) {
+            const std::uint32_t key = key_of(i);
+            if ((key & hi_mask) == (prefix & hi_mask))
+                atomicAdd(&sh_hist[(key >> shift) & 0xFFu], 1u);
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            const std::uint32_t t = sh_state[1];
+            std::uint32_t run = 0u;
+            std::uint32_t chosen = 255u;
+            for (std::uint32_t b = 0; b < 256u; ++b) {
+                if (run + sh_hist[b] >= t) { chosen = b; break; }
+                run += sh_hist[b];
+            }
+            sh_state[1] = t - run;
+            sh_state[0] = prefix | (chosen << shift);
+        }
+        __syncthreads();
+    }
+    return sh_state[0];
+}
+
+// Key functors for `t0_block_radix_select`. Explicit structs rather than device
+// lambdas, which would need `--extended-lambda`.
+struct T0DescKeyOf {
+    const float* row;
+    __device__ std::uint32_t operator()(std::uint32_t i) const { return t0_desc_key(row[i]); }
+};
+struct T0TieIndexOf {
+    const float* row;
+    std::uint32_t cut_key;
+    __device__ std::uint32_t operator()(std::uint32_t i) const {
+        return t0_desc_key(row[i]) == cut_key ? i : 0xFFFFFFFFu;
+    }
+};
+
+// Accessor-generic forms, so the grouped runtime — whose rows may be a strided
+// float span or a BF16 read-out that has to be decoded per element — shares one
+// definition of the top_k total order instead of keeping a fourth copy of it.
+struct T0RowValue {
+    const float* row;
+    __device__ __forceinline__ float operator()(std::uint32_t i) const { return row[i]; }
+};
+template <class ValueFn>
+struct T0DescKeyOfValue {
+    ValueFn value_of;
+    __device__ std::uint32_t operator()(std::uint32_t i) const {
+        return t0_desc_key(value_of(i));
+    }
+};
+template <class ValueFn>
+struct T0TieIndexOfValue {
+    ValueFn value_of;
+    std::uint32_t cut_key;
+    __device__ std::uint32_t operator()(std::uint32_t i) const {
+        return t0_desc_key(value_of(i)) == cut_key ? i : 0xFFFFFFFFu;
+    }
+};
+
+// Block-cooperative top_k: radix-select the cut, gather exactly `k`, then
+// bitonic-sort them — O(8*len + k*log^2 k) against the incremental-threshold
+// selection loop's O(k*len). At the `k_max = 128` these samplers default to and
+// a 151936-token vocabulary that is ~19.4M element visits per token reduced to
+// ~1.2M.
+//
+// The ordering is the same total order `t0_desc_before` defines, expressed as a
+// single ascending u64 comparison: `(t0_desc_key(v) << 32) | index` reverses
+// value order, sends NaN last, canonicalises signed zero, and breaks ties by
+// ascending source index.
+//
+// `out_val`/`out_idx` are already offset to this row. Returns false without
+// touching them when `k` is outside the fast path's range, in which case the
+// caller must run its selection loop. The guard is block-uniform, so the
+// `__syncthreads()` below are not divergent.
+template <class ValueFn>
+__device__ bool t0_block_topk_fast(ValueFn value_of, std::uint32_t len, std::uint32_t k,
+                                   float* out_val, std::uint32_t* out_idx,
+                                   std::uint64_t* sh_pair, std::uint32_t* sh_hist,
+                                   std::uint32_t* sh_state, std::uint32_t* sh_count) {
+    if (!(k > 0u && k <= len && k <= kTopkFastMaxK)) return false;
+    const std::uint32_t cut_key = t0_block_radix_select(
+        len, k, sh_hist, sh_state, T0DescKeyOfValue<ValueFn>{value_of});
+    if (threadIdx.x == 0) *sh_count = 0u;
+    __syncthreads();
+    std::uint32_t local_lt = 0u;
+    for (std::uint32_t i = threadIdx.x; i < len; i += blockDim.x)
+        if (t0_desc_key(value_of(i)) < cut_key) ++local_lt;
+    if (local_lt != 0u) atomicAdd(sh_count, local_lt);
+    __syncthreads();
+    // `cut_key` is the k-th smallest key, so at most k-1 keys are strictly
+    // smaller: the remaining slots are always >= 1 and go to the lowest source
+    // indices tying at the cut, which is exactly the tie rule.
+    const std::uint32_t strictly_better = *sh_count;
+    const std::uint32_t cut_index = t0_block_radix_select(
+        len, k - strictly_better, sh_hist, sh_state,
+        T0TieIndexOfValue<ValueFn>{value_of, cut_key});
+    if (threadIdx.x == 0) *sh_count = 0u;
+    __syncthreads();
+    for (std::uint32_t i = threadIdx.x; i < len; i += blockDim.x) {
+        const std::uint32_t key = t0_desc_key(value_of(i));
+        if (key < cut_key || (key == cut_key && i <= cut_index)) {
+            const std::uint32_t slot = atomicAdd(sh_count, 1u);
+            if (slot < kTopkFastMaxK)
+                sh_pair[slot] = ((std::uint64_t)key << 32) | (std::uint64_t)i;
+        }
+    }
+    __syncthreads();
+    std::uint32_t padded = 1u;
+    while (padded < k) padded <<= 1;
+    for (std::uint32_t i = k + threadIdx.x; i < padded; i += blockDim.x)
+        sh_pair[i] = 0xFFFFFFFFFFFFFFFFull;
+    __syncthreads();
+    for (std::uint32_t span = 2u; span <= padded; span <<= 1) {
+        for (std::uint32_t stride = span >> 1; stride > 0u; stride >>= 1) {
+            for (std::uint32_t i = threadIdx.x; i < padded; i += blockDim.x) {
+                const std::uint32_t partner = i ^ stride;
+                if (partner > i) {
+                    const bool ascending = ((i & span) == 0u);
+                    if ((sh_pair[i] > sh_pair[partner]) == ascending) {
+                        const std::uint64_t swap = sh_pair[i];
+                        sh_pair[i] = sh_pair[partner];
+                        sh_pair[partner] = swap;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+    for (std::uint32_t pick = threadIdx.x; pick < k; pick += blockDim.x) {
+        const std::uint32_t idx = (std::uint32_t)(sh_pair[pick] & 0xFFFFFFFFull);
+        out_val[pick] = value_of(idx);
+        out_idx[pick] = idx;
+    }
+    __syncthreads();
+    return true;
+}
+
 // rank_le predicate inside pivot_threshold: `k` is a dynamic (scalar or
 // per-row) I32/U32 trace value — NOT a host immediate (unlike the standalone
 // `rank_le` op above). Ties/NaN contract mirrors interp.rs exactly: a NaN
@@ -713,8 +875,7 @@ __global__ void k_pivot_rankle(const float* __restrict__ in, std::uint8_t* __res
                                std::uint32_t rows, std::uint32_t len,
                                const KT* __restrict__ k_buf, std::uint32_t k_numel) {
     __shared__ std::uint32_t sh_hist[256];
-    __shared__ std::uint32_t sh_prefix;
-    __shared__ std::uint32_t sh_target;
+    __shared__ std::uint32_t sh_state[2];
 
     const std::uint32_t row = blockIdx.x;
     if (row >= rows) return;
@@ -728,41 +889,8 @@ __global__ void k_pivot_rankle(const float* __restrict__ in, std::uint8_t* __res
         return;
     }
 
-    if (threadIdx.x == 0) {
-        sh_prefix = 0u;
-        sh_target = (std::uint32_t)kk;
-    }
-    __syncthreads();
-
-    for (int pass = 0; pass < 4; ++pass) {
-        const int shift = 24 - 8 * pass;
-        // Bits fixed by earlier passes. `pass == 0` is special-cased because
-        // `1u << 32` is undefined, not zero.
-        const std::uint32_t hi_mask = (pass == 0) ? 0u : (0xFFFFFFFFu << (shift + 8));
-        for (std::uint32_t b = threadIdx.x; b < 256u; b += blockDim.x) sh_hist[b] = 0u;
-        __syncthreads();
-        const std::uint32_t prefix = sh_prefix;
-        for (std::uint32_t i = threadIdx.x; i < len; i += blockDim.x) {
-            const std::uint32_t key = t0_desc_key(r[i]);
-            if ((key & hi_mask) == (prefix & hi_mask))
-                atomicAdd(&sh_hist[(key >> shift) & 0xFFu], 1u);
-        }
-        __syncthreads();
-        if (threadIdx.x == 0) {
-            const std::uint32_t target = sh_target;
-            std::uint32_t run = 0u;
-            std::uint32_t bucket = 255u;
-            for (std::uint32_t t = 0; t < 256u; ++t) {
-                if (run + sh_hist[t] >= target) { bucket = t; break; }
-                run += sh_hist[t];
-            }
-            sh_target = target - run;
-            sh_prefix = prefix | (bucket << shift);
-        }
-        __syncthreads();
-    }
-
-    const std::uint32_t thr = sh_prefix;
+    const std::uint32_t thr = t0_block_radix_select(
+        len, (std::uint32_t)kk, sh_hist, sh_state, T0DescKeyOf{r});
     for (std::uint32_t i = threadIdx.x; i < len; i += blockDim.x) {
         const float v = r[i];
         o[i] = (!isnan(v) && t0_desc_key(v) <= thr) ? 1u : 0u;
@@ -892,9 +1020,20 @@ __global__ void k_topk_rows(const float* __restrict__ in, float* __restrict__ ou
     __shared__ std::uint32_t prev_i;
     __shared__ std::uint8_t prev_nan;
     __shared__ std::uint8_t prev_valid;
+    __shared__ std::uint64_t sh_pair[kTopkFastMaxK];
+    __shared__ std::uint32_t sh_hist[256];
+    __shared__ std::uint32_t sh_state[2];
+    __shared__ std::uint32_t sh_count;
     const std::uint32_t row = blockIdx.x;
     if (row >= rows) return;
     const float* r = in + (std::uint64_t)row * len;
+
+    if (t0_block_topk_fast(T0RowValue{r}, len, k,
+                           out_val + (std::uint64_t)row * k,
+                           out_idx + (std::uint64_t)row * k,
+                           sh_pair, sh_hist, sh_state, &sh_count)) {
+        return;
+    }
 
     if (threadIdx.x == 0) {
         prev_v = 0.0f;

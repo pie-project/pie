@@ -56,9 +56,11 @@ Two, both deliberate:
 
 ## Cost
 
-**17.47 ms/token, 5.30× the [`naive-baseline`](../naive-baseline) control** on
-an L40S with Qwen3-0.6B. As with `locally-typical-sampling`, the cost is the
-`top_k` over a 262144-entry vocabulary rather than the curvature arithmetic.
+**5.20 ms/token, 1.49× the [`naive-baseline`](../naive-baseline) control** on an
+L40S with Qwen3-0.6B. The residual is the region break that `top_k` and
+`cum_sum` force as schedule barriers, not the curvature arithmetic. It read
+17.47 ms (5.30×) until the `top_k` kernel was changed from a per-pick row rescan
+to a radix select; cost is now effectively flat in `k_max`.
 
 ## Run
 

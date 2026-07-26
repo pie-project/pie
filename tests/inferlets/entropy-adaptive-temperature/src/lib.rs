@@ -24,7 +24,7 @@
 //!
 //! ## Why this needs a device program
 //!
-//! The entropy has to be reduced over the full 262144-token logit row and then
+//! The entropy has to be reduced over the full 151936-token logit row and then
 //! fed *back into the same step's* temperature before sampling. On a black-box
 //! server that is a host round-trip per token: read logits out, reduce, decide,
 //! push back. Here it is four PTIR ops inside the forward pass, and the decode
