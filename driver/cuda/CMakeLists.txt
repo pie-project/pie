@@ -767,6 +767,19 @@ target_link_libraries(pie_driver_cuda_lib PUBLIC
 # ---- Tests and harnesses ----------------------------------------------------
 enable_testing()
 
+# One rule for test targets: link pie_driver_cuda_lib unless the test needs
+# exactly one src/ file. A target naming two or more src/ files is not
+# expressing a boundary, it is hand-maintaining a transitive closure, and that
+# closure goes stale the moment a listed file grows a new call edge -- an
+# undefined-symbol link error that nothing in CI catches, because ci.yml only
+# builds two tests. Single-file targets keep their explicit source: there the
+# list *is* the unit under test, so it carries real isolation.
+#
+# Three targets are exempt and say why at their definition: csm_backbone_parity
+# and csm_generate_parity (they #include the forward under test, so linking the
+# lib would duplicate those symbols) and test_ptir_grouped_dispatch_asan (it
+# must compile its own -fsanitize=address copies of what it exercises).
+
 # Runtime fixtures/scripts consumed by tests but not compiled: golden PTIR
 # containers (tests/golden-ptir, read by test_ptir_container/golden_exec via
 # TEST_ARGS), the load-parity harness (tests/load_parity/run.py, driven
@@ -830,13 +843,8 @@ pie_add_cuda_target(test_gather_tokens
   SOURCES tests/test_gather_tokens.cu src/kernels/gather_tokens.cu
   LIBS CUDA::cudart)
 pie_add_cuda_target(test_pack_dense_mask
-  SOURCES
-    tests/pack_dense_mask_test.cu
-    src/batch/persistent_inputs.cpp
-    src/kernels/graph_pad.cu
-    src/kernels/pack_dense_mask.cu
-    src/tensor.cpp
-  LIBS CUDA::cudart)
+  SOURCES tests/pack_dense_mask_test.cu
+  LIBS pie_driver_cuda_lib)
 pie_add_cuda_target(test_envelope_dot
   SOURCES tests/test_envelope_dot.cu src/kernels/envelope.cu
   LIBS CUDA::cudart)
@@ -883,46 +891,26 @@ pie_add_cuda_target(test_driver_common
 pie_add_cuda_target(test_kv_cache_format
   SOURCES tests/test_kv_cache_format.cpp src/store/kv_cache_format.cpp)
 pie_add_cuda_target(test_elastic
-  SOURCES tests/test_elastic.cpp src/tensor.cpp src/store/elastic.cpp
-  INCLUDE_DIRS
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
-  LIBS CUDA::cudart CUDA::cuda_driver)
+  SOURCES tests/test_elastic.cpp
+  LIBS pie_driver_cuda_lib)
 pie_add_cuda_target(test_elastic_converted_pools
   SOURCES tests/test_elastic_converted_pools.cpp
   LIBS pie_driver_cuda_lib CUDA::cudart CUDA::cuda_driver)
 pie_add_cuda_target(test_kv_cache_quant
-  SOURCES
-    tests/test_kv_cache_quant.cu
-    src/tensor.cpp
-    src/store/elastic.cpp
-    src/store/kv_cache.cpp
-    src/store/kv_cache_format.cpp
-    src/kernels/kv_paged.cu
-  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
-  LIBS CUDA::cudart CUDA::cuda_driver)
+  SOURCES tests/test_kv_cache_quant.cu
+  LIBS pie_driver_cuda_lib)
 pie_add_cuda_target(test_swap_pool
-  SOURCES
-    tests/test_swap_pool.cpp
-    src/tensor.cpp
-    src/store/elastic.cpp
-    src/store/kv_cache.cpp
-    src/store/kv_cache_format.cpp
-    src/store/swap_pool.cpp
-  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
-  LIBS CUDA::cudart CUDA::cuda_driver)
+  SOURCES tests/test_swap_pool.cpp
+  LIBS pie_driver_cuda_lib)
 pie_add_cuda_target(test_mxfp4_marlin
   SOURCES tests/test_mxfp4_marlin.cu src/kernels/mxfp4_marlin.cu
   LIBS CUDA::cudart)
 pie_add_cuda_target(test_transcode_fused
-  SOURCES
-    tests/test_transcode_fused.cu
-    src/kernels/transcode.cu
-    src/kernels/dequant_fp8.cu
-    src/kernels/quant_bf16_to_mxfp4.cu
-  LIBS CUDA::cudart)
-# Model-family full-forward parity harnesses: manual GPU de-risk tools. Most
-# textually include the forward under test and remain standalone. Compare
+  SOURCES tests/test_transcode_fused.cu
+  LIBS pie_driver_cuda_lib)
+# Model-family full-forward parity harnesses: manual GPU de-risk tools. They
+# textually include the forward under test, so they stay standalone -- linking
+# pie_driver_cuda_lib would duplicate every symbol in that forward. Compare
 # against scripts/<family>_*_dump.py reference dumps at runtime (kept outside
 # the repo).
 pie_add_cuda_target(csm_backbone_parity
@@ -997,30 +985,17 @@ pie_add_cuda_target(test_ptir_graph_key
     ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR}
   LIBS CUDA::cudart tomlplusplus::tomlplusplus)
 pie_add_cuda_target(test_frame_carrier_device
-  SOURCES
-    tests/test_frame_carrier_device.cpp
-    src/pipeline/frame_carrier.cpp
-    src/pipeline/frame_carrier_kernels.cu
-  LIBS CUDA::cudart
+  SOURCES tests/test_frame_carrier_device.cpp
+  LIBS pie_driver_cuda_lib
   TEST_NAME pipeline_frame_carrier_device)
 pie_add_cuda_target(test_pipeline_dispatch_bind
-  SOURCES
-    tests/test_pipeline_dispatch_bind.cpp
-    src/pipeline/dispatch.cu
-    src/pipeline/frame_carrier.cpp
-    src/pipeline/frame_carrier_kernels.cu
-  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../common/include ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR}
-  LIBS CUDA::cudart CUDA::cuda_driver CUDA::nvrtc
+  SOURCES tests/test_pipeline_dispatch_bind.cpp
+  LIBS pie_driver_cuda_lib
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 # Same-instance run-ahead concurrency gate; build with -fsanitize=thread for the TSAN run.
 pie_add_cuda_target(test_pipeline_dispatch_race
-  SOURCES
-    tests/pipeline_dispatch_race_test.cpp
-    src/pipeline/dispatch.cu
-    src/pipeline/frame_carrier.cpp
-    src/pipeline/frame_carrier_kernels.cu
-  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../common/include ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR}
-  LIBS CUDA::cudart CUDA::cuda_driver CUDA::nvrtc
+  SOURCES tests/pipeline_dispatch_race_test.cpp
+  LIBS pie_driver_cuda_lib
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 pie_add_cuda_target(test_ptir_tier0
   SOURCES tests/ptir_tier0_test.cu
@@ -1055,18 +1030,14 @@ pie_add_cuda_target(test_ptir_generated_singleton
   TEST_ARGS
     ${CMAKE_CURRENT_SOURCE_DIR}/../../interface/ptir/tests/golden-ptir)
 pie_add_cuda_target(test_ptir_grouped_dispatch
-  SOURCES
-    tests/ptir_grouped_dispatch_test.cpp
-    src/pipeline/dispatch.cu
-    src/pipeline/frame_carrier.cpp
-    src/pipeline/frame_carrier_kernels.cu
-  INCLUDE_DIRS
-    ${CMAKE_CURRENT_SOURCE_DIR}/tests
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
-    ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR}
-  LIBS CUDA::cudart CUDA::cuda_driver CUDA::nvrtc
+  SOURCES tests/ptir_grouped_dispatch_test.cpp
+  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/tests
+  LIBS pie_driver_cuda_lib
   TEST_ARGS ${CMAKE_CURRENT_SOURCE_DIR}/tests/golden-ptir)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  # Keeps its own copies of the sources under test: -fsanitize=address below is
+  # PRIVATE, so linking pie_driver_cuda_lib would hand it uninstrumented
+  # objects and the sanitizer would see nothing of what this target exists for.
   pie_add_cuda_target(test_ptir_grouped_dispatch_asan
     SOURCES
       tests/ptir_grouped_dispatch_test.cpp
