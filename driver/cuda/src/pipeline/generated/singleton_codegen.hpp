@@ -1541,24 +1541,30 @@ __device__ __forceinline__ void ptir_m1_execute(
               !m1_isnan(value) && (m1_u32)greater < k);
         }
       } else if (p.pred_tag == 1) {
+        // Descending selection that carries the previous pick as a total-order
+        // threshold and stops as soon as the exclusive mass clears the cutoff.
+        // The earlier form kept a `temporary` visited list and rescanned it per
+        // candidate, i.e. O(len^3) on a single thread.
         const float threshold =
             m1_load_f(a1, m1_pick(d1.len, row), d1.dtype);
+        for (m1_u32 i = 0; i < d0.last; ++i)
+          m1_store_b(o0, base + i, false);
         float exclusive = 0.0f;
+        float previous_value = m1_pos_inf();
+        m1_u32 previous_index = 0u;
         for (m1_u32 position = 0; position < d0.last; ++position) {
+          if (!(exclusive < threshold)) break;
           m1_u32 best_index = 0;
-          float best_value = m1_nan();
+          float best_value = 0.0f;
           bool found = false;
           for (m1_u32 candidate = 0;
                candidate < d0.last;
                ++candidate) {
-            bool used = false;
-            for (m1_u32 prior = 0; prior < position; ++prior)
-              if (reinterpret_cast<m1_u32*>(temporary)[prior] ==
-                  candidate)
-                used = true;
-            if (used) continue;
             const float value =
                 m1_load_f(a0, base + candidate, d0.dtype);
+            if (!m1_sort_better(
+                    previous_value, previous_index, value, candidate))
+              continue;
             if (!found ||
                 m1_sort_better(
                     value, candidate, best_value, best_index)) {
@@ -1567,9 +1573,11 @@ __device__ __forceinline__ void ptir_m1_execute(
               best_index = candidate;
             }
           }
-          reinterpret_cast<m1_u32*>(temporary)[position] = best_index;
-          m1_store_b(o0, base + best_index, exclusive < threshold);
+          if (!found) break;
+          m1_store_b(o0, base + best_index, true);
           exclusive += best_value;
+          previous_value = best_value;
+          previous_index = best_index;
         }
       } else {
         const float threshold =
