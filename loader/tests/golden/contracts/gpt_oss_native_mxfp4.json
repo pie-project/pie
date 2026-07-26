@@ -21,7 +21,7 @@
             "source_cols": 64,
             "target_cols": 64
           },
-          "out": {
+          "to": {
             "shape": [
               2,
               128,
@@ -84,7 +84,7 @@
             "source_cols": 2,
             "target_cols": 2
           },
-          "out": {
+          "to": {
             "shape": [
               2,
               128,
@@ -125,7 +125,7 @@
             "source_cols": 1,
             "target_cols": 1
           },
-          "out": {
+          "to": {
             "shape": [
               2,
               64
@@ -164,7 +164,7 @@
             "source_cols": 64,
             "target_cols": 64
           },
-          "out": {
+          "to": {
             "shape": [
               2,
               128,
@@ -227,7 +227,7 @@
             "source_cols": 2,
             "target_cols": 2
           },
-          "out": {
+          "to": {
             "shape": [
               2,
               128,
@@ -268,7 +268,7 @@
             "source_cols": 1,
             "target_cols": 1
           },
-          "out": {
+          "to": {
             "shape": [
               2,
               64
@@ -307,7 +307,7 @@
             "source_cols": 64,
             "target_cols": 128
           },
-          "out": {
+          "to": {
             "shape": [
               2,
               64,
@@ -370,7 +370,7 @@
             "source_cols": 2,
             "target_cols": 4
           },
-          "out": {
+          "to": {
             "shape": [
               2,
               64,

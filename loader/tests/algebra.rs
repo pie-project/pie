@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use pie_loader::contract::compile::{Leaf, Lowering, Run, RunSource, compile};
 use pie_loader::contract::infer::{CheckpointTypes, infer_type};
 use pie_loader::contract::{Expr, TensorType};
-use pie_loader::reference::{TensorValue, replay};
+use pie_loader::testkit::reference::{TensorValue, replay};
 use pie_loader::types::{DType, Encoding, TensorDecl, TensorId};
 
 const MAX_RUNS: usize = 1 << 16;
@@ -85,6 +85,7 @@ fn decl(id: u32, name: &str, shape: &[i64]) -> TensorDecl {
         shape: shape.to_vec(),
         encoding: Encoding::Raw(DTYPE),
         alignment: 256,
+        visibility: Default::default(),
     }
 }
 
@@ -129,6 +130,18 @@ fn resolve(expr: &Expr, index: &[i64], fixture: &Fixture) -> Option<i64> {
             axis,
             start,
             len,
+        } => {
+            let mut inner = index.to_vec();
+            let at = usize::from(axis.0);
+            assert!(inner[at] < *len);
+            inner[at] += start;
+            resolve(input, &inner, fixture)
+        }
+        Expr::Stride {
+            src: input,
+            axis,
+            start,
+            len,
             step,
         } => {
             let mut inner = index.to_vec();
@@ -137,7 +150,17 @@ fn resolve(expr: &Expr, index: &[i64], fixture: &Fixture) -> Option<i64> {
             inner[at] = start + inner[at] * step;
             resolve(input, &inner, fixture)
         }
-        Expr::Cat { axis, parts } => {
+        Expr::Gather {
+            src: input,
+            axis,
+            indices,
+        } => {
+            let mut inner = index.to_vec();
+            let at = usize::from(axis.0);
+            inner[at] = indices[inner[at] as usize];
+            resolve(input, &inner, fixture)
+        }
+        Expr::Concat { axis, parts } => {
             let at = usize::from(axis.0);
             let mut offset = 0;
             for part in parts {
@@ -150,12 +173,12 @@ fn resolve(expr: &Expr, index: &[i64], fixture: &Fixture) -> Option<i64> {
                 }
                 offset += extent;
             }
-            panic!("cat index out of range")
+            panic!("concat index out of range")
         }
-        Expr::Reshape { src: input, shape } => {
+        Expr::Transmute { src: input, to } => {
             let mut flat = 0i64;
             for (at, coordinate) in index.iter().enumerate() {
-                flat = flat * shape[at] + coordinate;
+                flat = flat * to.shape[at] + coordinate;
             }
             let (inner_ty, _) = infer_type(input, fixture).unwrap();
             let mut inner = vec![0; inner_ty.shape.len()];
@@ -166,21 +189,7 @@ fn resolve(expr: &Expr, index: &[i64], fixture: &Fixture) -> Option<i64> {
             }
             resolve(input, &inner, fixture)
         }
-        Expr::Pad {
-            src: input,
-            axis,
-            before,
-            after: _,
-        } => {
-            let at = usize::from(axis.0);
-            let (inner_ty, _) = infer_type(input, fixture).unwrap();
-            let mut inner = index.to_vec();
-            inner[at] -= before;
-            if inner[at] < 0 || inner[at] >= inner_ty.shape[at] {
-                return None;
-            }
-            resolve(input, &inner, fixture)
-        }
+        Expr::Fill { .. } => None,
         other => panic!("the oracle does not model {other:?}"),
     }
 }
@@ -211,14 +220,35 @@ fn a_column_shard_reads_a_stride() {
 #[test]
 fn a_strided_slice_picks_every_other_expert() {
     let fixture = Fixture::new(&[("e", &[8, 3])]);
-    check(Expr::src("e").slice_step(0, 1, 4, 2), &fixture);
+    check(Expr::src("e").stride(0, 1, 4, 2), &fixture);
+}
+
+#[test]
+fn a_gather_reorders_rows() {
+    let fixture = Fixture::new(&[("e", &[8, 3])]);
+    check(Expr::src("e").gather(0, vec![5, 1, 7, 0, 3]), &fixture);
+}
+
+/// Two properties at once: an index may repeat, and a run of consecutive
+/// indices is one byte run rather than one per row. The second is what makes a
+/// gather of contiguous blocks affordable, and is why `Repack`'s permutations
+/// are eventually expressible here.
+#[test]
+fn a_gather_repeats_rows_and_coalesces_consecutive_ones() {
+    let fixture = Fixture::new(&[("e", &[8, 3])]);
+    check(Expr::src("e").gather(0, vec![4, 5, 6, 4, 5, 6]), &fixture);
+
+    let expr = Expr::src("e").gather(0, vec![4, 5, 6, 4, 5, 6]);
+    let (_, checked) = infer_type(&expr, &fixture).unwrap();
+    let lowering = compile(&expr, &checked, MAX_RUNS).unwrap();
+    assert_eq!(lowering.run_count(), 2, "two blocks of three rows");
 }
 
 #[test]
 fn fusing_three_projections_concatenates_them() {
     let fixture = Fixture::new(&[("q", &[4, 6]), ("k", &[2, 6]), ("v", &[2, 6])]);
     check(
-        Expr::cat(0, vec![Expr::src("q"), Expr::src("k"), Expr::src("v")]),
+        Expr::concat(0, vec![Expr::src("q"), Expr::src("k"), Expr::src("v")]),
         &fixture,
     );
 }
@@ -229,7 +259,7 @@ fn fusing_shards_interleaves_them() {
     // and the fusion cannot collapse into one copy.
     let fixture = Fixture::new(&[("q", &[4, 8]), ("k", &[4, 8])]);
     check(
-        Expr::cat(
+        Expr::concat(
             1,
             vec![Expr::src("q").slice(1, 0, 4), Expr::src("k").slice(1, 4, 4)],
         ),
@@ -240,15 +270,21 @@ fn fusing_shards_interleaves_them() {
 #[test]
 fn reshaping_does_not_move_anything() {
     let fixture = Fixture::new(&[("w", &[4, 6])]);
-    check(Expr::src("w").reshape(vec![2, 2, 6]), &fixture);
-    check(Expr::src("w").reshape(vec![24]), &fixture);
+    check(
+        Expr::src("w").transmute(TensorType::raw(vec![2, 2, 6], DTYPE)),
+        &fixture,
+    );
+    check(
+        Expr::src("w").transmute(TensorType::raw(vec![24], DTYPE)),
+        &fixture,
+    );
 }
 
 #[test]
 fn slicing_a_fusion_reaches_through_it() {
     let fixture = Fixture::new(&[("a", &[8, 4]), ("b", &[8, 4])]);
     check(
-        Expr::cat(0, vec![Expr::src("a").slice(0, 2, 4), Expr::src("b")]).slice(0, 2, 6),
+        Expr::concat(0, vec![Expr::src("a").slice(0, 2, 4), Expr::src("b")]).slice(0, 2, 6),
         &fixture,
     );
 }
@@ -257,12 +293,12 @@ fn slicing_a_fusion_reaches_through_it() {
 fn stacking_experts_is_a_reshaped_concatenation() {
     let fixture = Fixture::new(&[("e0", &[2, 3]), ("e1", &[2, 3]), ("e2", &[2, 3])]);
     check(
-        Expr::cat(
+        Expr::concat(
             0,
             vec![
-                Expr::src("e0").reshape(vec![1, 2, 3]),
-                Expr::src("e1").reshape(vec![1, 2, 3]),
-                Expr::src("e2").reshape(vec![1, 2, 3]),
+                Expr::src("e0").transmute(TensorType::raw(vec![1, 2, 3], DTYPE)),
+                Expr::src("e1").transmute(TensorType::raw(vec![1, 2, 3], DTYPE)),
+                Expr::src("e2").transmute(TensorType::raw(vec![1, 2, 3], DTYPE)),
             ],
         ),
         &fixture,
@@ -369,6 +405,25 @@ fn the_replay_rejects_a_lowering_that_writes_one_element_twice() {
     assert!(err.contains("twice"), "{err}");
 }
 
+/// What the retired `Pad` node meant, written as the composition that replaced
+/// it. `shape` is the operand's, which the old node left implicit.
+fn pad(src: Expr, shape: &[i64], axis: u8, before: i64, after: i64) -> Expr {
+    let leg = |extent: i64| {
+        let mut shape = shape.to_vec();
+        shape[usize::from(axis)] = extent;
+        Expr::fill(0.0, TensorType::raw(shape, DTYPE))
+    };
+    let mut parts = Vec::new();
+    if before > 0 {
+        parts.push(leg(before));
+    }
+    parts.push(src);
+    if after > 0 {
+        parts.push(leg(after));
+    }
+    Expr::concat(axis, parts)
+}
+
 #[test]
 fn padding_a_head_dim_leaves_zeros_and_folds_the_copies() {
     // spec.md §2 case 9: a model whose head_dim is not one the kernel takes is
@@ -376,7 +431,7 @@ fn padding_a_head_dim_leaves_zeros_and_folds_the_copies() {
     // a `[4, 4]` padded by one column, priced at 5 — so it is the case that
     // says whether the code and the paper agree.
     let fixture = Fixture::new(&[("q", &[4, 4])]);
-    let expr = Expr::src("q").pad(1, 0, 1);
+    let expr = pad(Expr::src("q"), &[4, 4], 1, 0, 1);
     check(expr.clone(), &fixture);
 
     let (ty, checked) = infer_type(&expr, &fixture).unwrap();
@@ -393,6 +448,6 @@ fn padding_a_head_dim_leaves_zeros_and_folds_the_copies() {
 #[test]
 fn padding_the_front_shifts_the_data_instead_of_the_zeros() {
     let fixture = Fixture::new(&[("q", &[2, 3])]);
-    check(Expr::src("q").pad(1, 2, 0), &fixture);
-    check(Expr::src("q").pad(0, 1, 1), &fixture);
+    check(pad(Expr::src("q"), &[2, 3], 1, 2, 0), &fixture);
+    check(pad(Expr::src("q"), &[2, 3], 0, 1, 1), &fixture);
 }

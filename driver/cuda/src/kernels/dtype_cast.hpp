@@ -1,7 +1,8 @@
 #pragma once
 
 // Element-wise dtype casts used by the loader to bring non-bf16
-// checkpoints into our standard bf16 format.
+// checkpoints into our standard bf16 format, plus the element-wise scale
+// the loader's `Scale` tile map dispatches to.
 
 #include <cstddef>
 #include <cstdint>
@@ -42,6 +43,37 @@ void launch_cast_e8m0_to_fp32(
     const void*   src_e8m0,
     void*         dst_fp32,
     std::size_t   n,
+    cudaStream_t  stream);
+
+/// `dst[i] = src[i] * factor` for `n` elements, in the dtype named by the
+/// suffix. Backs the loader's `Scale` tile map, which is how a contract says
+/// "fold this constant into the weight" instead of the driver copying the
+/// tensor to the host, multiplying it there and uploading the result.
+///
+/// The arithmetic is done in fp32 for every input dtype, matching the loader's
+/// host executor exactly so the two can be compared bit for bit. `src` and
+/// `dst` may be the same pointer.
+void launch_scale_bf16(
+    const void*   src_bf16,
+    void*         dst_bf16,
+    std::size_t   n,
+    float         factor,
+    cudaStream_t  stream);
+
+/// `dst[i] = src[i] * factor` for `n` fp32 elements. See `launch_scale_bf16`.
+void launch_scale_fp32(
+    const void*   src_fp32,
+    void*         dst_fp32,
+    std::size_t   n,
+    float         factor,
+    cudaStream_t  stream);
+
+/// `dst[i] = src[i] * factor` for `n` fp16 elements. See `launch_scale_bf16`.
+void launch_scale_fp16(
+    const void*   src_fp16,
+    void*         dst_fp16,
+    std::size_t   n,
+    float         factor,
     cudaStream_t  stream);
 
 /// In-place marlin scale permutation. Marlin's gptq W4A16 kernel reads

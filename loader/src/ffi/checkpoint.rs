@@ -71,6 +71,8 @@ impl Default for PieLoaderRawTensorSlice {
 /// close, so it may be read from several threads — which is the case that
 /// matters, because the ranks of a TP group compile in parallel from one
 /// checkpoint.
+///
+/// [`pie_loader_close_checkpoint`]: crate::ffi::entry::pie_loader_close_checkpoint
 #[repr(C)]
 #[derive(Debug)]
 pub struct PieLoaderCheckpoint {

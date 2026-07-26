@@ -15,7 +15,7 @@ use crate::types::{Axis, Encoding};
 /// Replace many equally-shaped row shards with one bank plus views of it.
 ///
 /// A rank holding the same row band of a hundred identically-shaped weights
-/// reads a hundred small strided copies; stated as one `Cat` of those bands
+/// reads a hundred small strided copies; stated as one `Concat` of those bands
 /// plus a `Slice` per member, it reads one. Purely an optimization: the
 /// contract it returns declares exactly the same tensors.
 pub fn coalesce_direct_row_shards(
@@ -194,7 +194,7 @@ fn emit_row_shard_bank(
     let bank_name = format!("__pie.row_shard_bank.{group_id}");
     new_tensors.push(TensorContract::new(
         bank_name.clone(),
-        Expr::cat(0, parts),
+        Expr::concat(0, parts),
         vec![local_rows * indices.len() as i64, cols],
         first.encoding.clone(),
     ));

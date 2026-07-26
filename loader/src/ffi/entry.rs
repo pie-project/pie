@@ -20,7 +20,7 @@
 
 use std::path::PathBuf;
 
-use crate::artifact::{ArtifactInputs, artifact_cache_key};
+use crate::cache_key::{ArtifactInputs, artifact_cache_key};
 use crate::checkpoint::read::parse_checkpoint_metadata;
 use crate::error::Error;
 use crate::plan::LoadPlan;
@@ -160,10 +160,10 @@ unsafe fn release_diagnostics(diags: *mut PieLoaderDiagnostics) {
 
 /// The device-measured half of a request.
 ///
-/// Every field is a fact only the driver can state: what the device is, how wide
-/// the TP group is, and which transforms this backend's kernels implement. The
-/// loader never guesses any of it, which is what makes a plan reproducible from
-/// a recorded spec on a machine with no GPU (§2 P2).
+/// Every field is a fact only the driver can state: what the device is, how
+/// wide the TP group is, and which transforms this backend's kernels implement.
+/// The loader never guesses any of it, which is what makes a plan reproducible
+/// from a recorded spec on a machine with no GPU (`architecture.md` §2 P2).
 ///
 /// `backend` and `encode_scratch_dtype` are plain `uint32_t` rather than their
 /// enum types, and the same goes for every enum-valued *input* field. C++ lets a
@@ -188,7 +188,7 @@ pub struct PieLoaderTargetSpec {
     /// The opt-out that used to be `PIE_CUDA_DISABLE_FUSED_TRANSCODE`, read
     /// inside the executor. As a request field it changes the *plan*, so two
     /// settings produce two artifacts instead of one plan that runs two ways
-    /// (§8.1). Backends with no fused kernels pass `0`.
+    /// (`architecture.md` §8.1). Backends with no fused kernels pass `0`.
     pub fusion_mask: u32,
     /// The dtype this target's encode kernels dequantize through. Decides how
     /// many rows of scratch fit in `max_tile_bytes`.
@@ -408,8 +408,11 @@ pub unsafe extern "C" fn pie_loader_close_checkpoint(checkpoint: *mut PieLoaderC
 
 /// Compile a driver-authored contract into a plan.
 ///
-/// The contract path and [`pie_loader_compile`] produce the same kind of plan
-/// and are freed the same way; they differ only in who decides what to build.
+/// This is the only way to obtain a plan: what gets built is decided by the
+/// contract the driver authors, never by a model name the loader recognizes.
+/// The plan is owned by the caller and freed with [`pie_loader_release`];
+/// diagnostics are a separate allocation freed with
+/// [`pie_loader_release_diagnostics`].
 ///
 /// # Safety
 ///
@@ -461,7 +464,10 @@ pub unsafe extern "C" fn pie_loader_compile_contract(
 ///
 /// # Safety
 ///
-/// As [`pie_loader_verify`], with a [`PieLoaderContractRequest`].
+/// `plan` must point at a plan from [`pie_loader_compile_contract`] that has
+/// not been released. `req` must point at a valid [`PieLoaderContractRequest`]
+/// whose borrowed memory is live for the call. `out_diags` is either null or a
+/// writable slot.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pie_loader_verify_contract(
     plan: *const PieLoaderPlan,
@@ -537,7 +543,8 @@ pub unsafe extern "C" fn pie_loader_release_diagnostics(diags: *mut PieLoaderDia
 ///
 /// The second is specific to this boundary and cannot be asked without the
 /// request: was this plan compiled *for the caller*? Rank divergence is the
-/// motivating case (§6.2), and no amount of internal consistency detects it.
+/// motivating case (`architecture.md` §6.2), and no amount of internal
+/// consistency detects it.
 fn verify_plan_contract(
     plan: &PieLoaderPlan,
     contract: &crate::verify::ContractView<'_>,
@@ -628,12 +635,12 @@ unsafe impl Sync for EntryAddr {}
 
 /// Anchors the entry points against dead-code elimination.
 ///
-/// `pie-loader` is an rlib, and nothing in Rust calls these functions — the only
-/// caller is the C++ driver, linked afterwards. Without a reference from a
+/// `pie-loader` is an rlib, and nothing in Rust calls these functions — the
+/// only caller is the C++ driver, linked afterwards. Without a reference from a
 /// reachable item, `rustc` and the linker are free to drop `#[no_mangle]`
 /// functions from an rlib, and the failure surfaces as an undefined symbol at
-/// final link rather than anywhere near this file (§3.4). `#[used]` keeps the
-/// table, and the table keeps the functions.
+/// final link rather than anywhere near this file (`architecture.md` §3.4).
+/// `#[used]` keeps the table, and the table keeps the functions.
 #[used]
 static KEEP_ALIVE: [EntryAddr; 6] = [
     EntryAddr(pie_loader_open_checkpoint as *const ()),

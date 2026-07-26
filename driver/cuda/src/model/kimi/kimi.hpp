@@ -60,11 +60,16 @@ struct KimiLayerWeights {
     DeviceBuffer<const void*>         expert_up_scale_ptrs;
     DeviceBuffer<const std::int32_t*> expert_down_packed_ptrs;
     DeviceBuffer<const void*>         expert_down_scale_ptrs;
-    // Lazily materialised BF16 expert stack: `[E, 2*I, H]` and `[E, H, I]`.
-    // Only built when the batched MoE path is viable (see
-    // `kKimiMoeBf16StackBudget`); the W4A16 GEMVs are used otherwise.
-    mutable std::unique_ptr<DeviceTensor> moe_gate_up_bf16;
-    mutable std::unique_ptr<DeviceTensor> moe_down_bf16;
+    // BF16 dequant of the routed experts, stacked per layer, additive on top
+    // of the packed weights above: the batched MoE path reads these and the
+    // W4A16 GEMVs read those, chosen per step by token count.
+    //
+    // Null when the contract judged the slabs too large to hold beside the
+    // packed originals, which is the whole signal -- `author_kimi_contract`
+    // decides, and the branches below read that decision off which weights it
+    // published rather than off a flag carried alongside them.
+    const DeviceTensor* moe_gate_up_bf16 = nullptr;  // [E, 2*I, H] BF16
+    const DeviceTensor* moe_down_bf16    = nullptr;  // [E, H, I] BF16
     const DeviceTensor* shared_gate_proj = nullptr;     // [I_shared, H]
     const DeviceTensor* shared_up_proj   = nullptr;     // [I_shared, H]
     const DeviceTensor* shared_down_proj = nullptr;     // [H, I_shared]

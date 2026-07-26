@@ -20,8 +20,7 @@
 //! rejected; `I64`/`U64` are carried through untouched for integer index
 //! tables such as DeepSeek-V4's `ffn.gate.tid2eid`.
 //!
-//! Offset convention matches the C++ loader
-//! (`driver/cuda/src/loader/safetensors.cpp`):
+//! The offset convention is the safetensors format's own:
 //! `data_section_offset = 8 + header_size` and a tensor's absolute
 //! `file_offset = data_section_offset + data_offsets[0]`.
 
@@ -78,7 +77,7 @@ pub fn dtype_from_safetensors(s: &str) -> Result<DType, Error> {
         // `F8_E8M0` deliberately does NOT map to `DType::E8M0`, even though
         // that dtype now exists: the same tag names MXFP4's scales, which the
         // repack path reads as bytes. A contract that wants the exponent
-        // decoded says so with `Bitcast(.., E8M0)` -- naming the reading is
+        // decoded says so with `Transmute(.., E8M0)` -- naming the reading is
         // that node's whole job, and it leaves the file's tag meaning what
         // gpt-oss means by it.
         "F4_E2M1" | "F8_E8M0" => DType::U8,
@@ -256,7 +255,12 @@ pub fn tensors_from_safetensors_entries(
     let mut out = Vec::with_capacity(entries.len());
     for (index, entry) in entries.iter().enumerate() {
         let dtype = dtype_from_safetensors(&entry.dtype)?;
-        let span_bytes = entry.end - entry.begin;
+        let span_bytes = entry.end.checked_sub(entry.begin).ok_or_else(|| {
+            Error::Checkpoint(format!(
+                "safetensors tensor {} has data_offsets [{}, {}), which end before they begin",
+                entry.name, entry.begin, entry.end
+            ))
+        })?;
         let expected = expected_span_bytes(&entry.dtype, &entry.shape, dtype, &entry.name)?;
         if expected != span_bytes {
             return Err(Error::Checkpoint(format!(

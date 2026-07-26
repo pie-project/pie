@@ -1526,6 +1526,8 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
 instantiate_qmm_t(16, 32, 32)
 instantiate_qmm_t(16, 32, 64)
 instantiate_qmm_t(16, 32, 16)
+instantiate_qmm_t(32, 32, 16)
+instantiate_qmm_t(32, 32, 32)
 
 // ── Strided form, for the prefill ────────────────────────────────────────────
 // Identical to the aligned kernel above except that the row pitch of `x`, `y`
@@ -1667,3 +1669,166 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
       uint3, uint, uint);
 
 instantiate_qmm_t_strided(16, 32, 32)
+instantiate_qmm_t_strided(32, 32, 32)
+
+
+// Same as `qmm_t_aligned_impl`, except the K loop runs `k_len` columns from the
+// bases the caller advanced, while the row pitches still come from the full K.
+template <typename T, int group_size, int bits, int BM, int BK, int BN>
+METAL_FUNC void qmm_t_splitk_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    threadgroup T* Xs,
+    threadgroup T* Ws,
+    const constant int& K,
+    const constant int& k_len,
+    const constant int& N,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int WM = 2;
+  constexpr int WN = 2;
+  constexpr int pack_factor = get_pack_factor<bits, 8>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+
+  using mma_t = mlx::steel::
+      BlockMMA<T, T, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
+  using loader_x_t =
+      mlx::steel::BlockLoader<T, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
+  using loader_w_t = QuantizedBlockLoader<
+      T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE, group_size, bits>;
+
+  const int K_w = K * bytes_per_pack / pack_factor;
+  const int K_g = K / group_size;
+  const int y_row = int(tid.y) * BM;
+  const int y_col = int(tid.x) * BN;
+
+  auto wl = (const device uint8_t*)w;
+  x += y_row * static_cast<int64_t>(K);
+  wl += y_col * K_w;
+  scales += y_col * K_g;
+  biases += y_col * K_g;
+  y += y_row * static_cast<int64_t>(N) + y_col;
+
+  loader_x_t loader_x(x, K, Xs, simd_gid, simd_lid);
+  loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid);
+  mma_t mma_op(simd_gid, simd_lid);
+
+  for (int k = 0; k < k_len; k += BK) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    loader_x.load_unsafe();
+    loader_w.load_unsafe();
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    mma_op.mma(Xs, Ws);
+    loader_x.next();
+    loader_w.next();
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  mma_op.store_result(y, N);
+}
+
+// ── Split-K, following MLX's dispatch ────────────────────────────────────────
+//
+// MLX does not use the plain qmm for a transposed non-batched decode at all:
+// `QuantizedMatmul::eval_gpu` sends that case to `qmm_splitk`
+// (backend/metal/quantized.cpp:1518), and picks the split to land near 512
+// threadgroups:
+//
+//     split_k = max(1, 512 / (n_tiles * m_tiles))
+//
+// which is the same saturation point `roofline_probe` measures independently --
+// this GEMM's throughput tracks threadgroup count almost linearly up to ~200 and
+// flattens past it.  A projection to hidden (N=1024) gets 32 tiles and so a
+// split of 16; a wide one like gate/up (N=3584) gets 4; lm_head has 7760 tiles
+// of its own and takes none.
+//
+// An earlier attempt here used a fixed split of 4 for every shape and measured
+// slower end to end.  That is why: the shapes that needed it most were given a
+// quarter of the parallelism they had room for.
+//
+// Each threadgroup takes one K partition and writes its own [M, N] slice; the
+// reduce below sums the slices.  Partials are the activation type, as in MLX.
+// The K sum is reassociated into `split_k` contiguous blocks -- pairwise rather
+// than strictly sequential, which is the better-conditioned order, but it does
+// mean this is not bit-identical to the unsplit kernel.
+template <typename T, int group_size, int bits, int BM, int BK, int BN>
+[[kernel]] void affine_qmm_t_splitk(
+    const device uint32_t* w [[buffer(0)]],
+    const device T* scales   [[buffer(1)]],
+    const device T* biases   [[buffer(2)]],
+    const device T* x        [[buffer(3)]],
+    device T* y              [[buffer(8)]],   // [split_k, M, N], act dtype
+    const constant int& K    [[buffer(5)]],
+    const constant int& N    [[buffer(6)]],
+    const constant int& k_partition_size [[buffer(9)]],
+    const constant int& split_k_partition_stride [[buffer(10)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  constexpr int pack_factor = get_pack_factor<bits, 8>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
+
+  threadgroup T Xs[BM * BK_padded];
+  threadgroup T Ws[BN * BK_padded];
+
+  const int k_start = int(tid.z) * k_partition_size;
+  x += k_start;
+  auto wl = (const device uint8_t*)w;
+  wl += k_start * bytes_per_pack / pack_factor;
+  scales += k_start / group_size;
+  biases += k_start / group_size;
+  y += int64_t(tid.z) * split_k_partition_stride;
+
+  // The impl walks `K` columns from the bases above, so pass the partition
+  // length as its K -- the row pitches (K_w, K_g) come from the real K.
+  qmm_t_splitk_impl<T, group_size, bits, BM, BK, BN>(
+      (const device uint32_t*)wl, scales, biases, x, y, Xs, Ws, K,
+      k_partition_size, N, tid, simd_gid, simd_lid);
+}
+
+// Sum the split_k slices and write the activation type, folding in the block
+// residual the fused projection would otherwise have applied.
+template <typename T, bool WITH_RESIDUAL>
+[[kernel]] void qmm_splitk_reduce(
+    device T* y                 [[buffer(4)]],
+    const constant int& N       [[buffer(6)]],
+    const device T* residual    [[buffer(7)]],
+    const device T* partial     [[buffer(8)]],
+    const constant int& split_k [[buffer(9)]],
+    const constant int& stride  [[buffer(10)]],
+    uint2 gid [[thread_position_in_grid]]) {
+  const int col = int(gid.x);
+  if (col >= N) return;
+  const int64_t o = int64_t(gid.y) * N + col;
+  float acc = 0.0f;
+  for (int s = 0; s < split_k; ++s)
+    acc += float(partial[o + int64_t(s) * stride]);
+  if (WITH_RESIDUAL) acc += float(residual[o]);
+  y[o] = static_cast<T>(acc);
+}
+
+#define instantiate_qmm_t_splitk(bm, bk, bn)                                    \
+  template [[host_name("affine_qmm_t_splitk_bfloat16_gs_64_b_4_bm_" #bm         \
+                       "_bn_" #bn)]]                                            \
+  [[kernel]] void affine_qmm_t_splitk<bfloat, 64, 4, bm, bk, bn>(               \
+      const device uint32_t*, const device bfloat*, const device bfloat*,       \
+      const device bfloat*, device bfloat*, const constant int&,                \
+      const constant int&, const constant int&, const constant int&,            \
+      uint3, uint, uint);
+
+instantiate_qmm_t_splitk(16, 32, 32)
+instantiate_qmm_t_splitk(32, 32, 32)
+
+template [[host_name("qmm_splitk_reduce_bfloat16")]] [[kernel]] void
+qmm_splitk_reduce<bfloat, false>(device bfloat*, const constant int&,
+                                 const device bfloat*, const device bfloat*,
+                                 const constant int&, const constant int&, uint2);
+template [[host_name("qmm_splitk_reduce_residual_bfloat16")]] [[kernel]] void
+qmm_splitk_reduce<bfloat, true>(device bfloat*, const constant int&,
+                                const device bfloat*, const device bfloat*,
+                                const constant int&, const constant int&, uint2);

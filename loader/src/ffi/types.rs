@@ -14,7 +14,9 @@
 //!   `has_*: bool` companion, matching the C++ views this replaces, so the
 //!   layout is legible from C without knowing Rust's niche rules.
 
-use crate::types::{BackendKind, DType, QuantScheme, RepackLayout, RowMap};
+use crate::types::{
+    BackendKind, DType, QuantGranularity, QuantScheme, RepackLayout, RowMap, ScaleForm,
+};
 
 /// Sentinel for "no buffer", mirroring the C++ `numeric_limits<uint32_t>::max()`
 /// default on `PieLoaderStorageInstrView::buffer_id`.
@@ -41,6 +43,7 @@ pub const PIE_LOADER_TILE_MAP_ENCODE: u32 = 1 << 2;
 pub const PIE_LOADER_TILE_MAP_TRANSCODE: u32 = 1 << 3;
 pub const PIE_LOADER_TILE_MAP_REBLOCK: u32 = 1 << 4;
 pub const PIE_LOADER_TILE_MAP_REPACK: u32 = 1 << 6;
+pub const PIE_LOADER_TILE_MAP_SCALE: u32 = 1 << 7;
 
 // Fused-chain capability bits, on the same principle: the *loader* knows what a
 // fusion means — which two-step chain `PieLoaderTransformFusion::Fp8ToMxfp4`
@@ -183,6 +186,7 @@ pub enum PieLoaderQuantScheme {
     GgufQ5_0 = 11,
     GgufQ5K = 12,
     GgufQ8_0 = 13,
+    Int4B8 = 14,
 }
 
 impl From<QuantScheme> for PieLoaderQuantScheme {
@@ -202,6 +206,7 @@ impl From<QuantScheme> for PieLoaderQuantScheme {
             QuantScheme::GgufQ5_0 => Self::GgufQ5_0,
             QuantScheme::GgufQ5K => Self::GgufQ5K,
             QuantScheme::GgufQ8_0 => Self::GgufQ8_0,
+            QuantScheme::Int4B8 => Self::Int4B8,
         }
     }
 }
@@ -225,6 +230,7 @@ impl From<PieLoaderQuantScheme> for QuantScheme {
             PieLoaderQuantScheme::GgufQ5_0 => Self::GgufQ5_0,
             PieLoaderQuantScheme::GgufQ5K => Self::GgufQ5K,
             PieLoaderQuantScheme::GgufQ8_0 => Self::GgufQ8_0,
+            PieLoaderQuantScheme::Int4B8 => Self::Int4B8,
         }
     }
 }
@@ -343,6 +349,7 @@ impl TryFrom<u32> for PieLoaderQuantScheme {
             11 => Self::GgufQ5_0,
             12 => Self::GgufQ5K,
             13 => Self::GgufQ8_0,
+            14 => Self::Int4B8,
             other => return Err(other),
         })
     }
@@ -374,8 +381,14 @@ impl TryFrom<u32> for PieLoaderRowMap {
 }
 
 /// `None` is the resting value for instructions that carry no tile map, so it
-/// sorts last rather than first — matching the C++ enum and the default on
-/// `PieLoaderStorageInstrView::tile_kind`.
+/// sorts after the transforms that existed when it was chosen — matching the
+/// C++ enum and the default on `PieLoaderStorageInstrView::tile_kind`.
+///
+/// These discriminants are not the `TILE_MAP_*` capability bits and are not
+/// required to agree with them: the two happen to line up below `None` and stop
+/// there, because a kind added afterwards has to take a free discriminant while
+/// its bit is chosen from the free bits. The loader's `TileMapKind` states the
+/// pairing in one place, by name, and nothing derives one from the other.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PieLoaderTileMapKind {
@@ -386,6 +399,7 @@ pub enum PieLoaderTileMapKind {
     Reblock = 4,
     Repack = 6,
     None = 7,
+    Scale = 8,
 }
 
 impl From<crate::plan::TileMapKind> for PieLoaderTileMapKind {
@@ -398,6 +412,7 @@ impl From<crate::plan::TileMapKind> for PieLoaderTileMapKind {
             K::Transcode => Self::Transcode,
             K::Reblock => Self::Reblock,
             K::Repack => Self::Repack,
+            K::Scale => Self::Scale,
         }
     }
 }
@@ -492,7 +507,7 @@ pub struct PieLoaderSourceExtentView {
     pub stride: PieLoaderStridedExtentView,
     /// The type these bytes are read as. Not necessarily
     /// `PieLoaderPlan::sources[tensor_id].dtype`: a contract that reinterprets
-    /// a tensor with `Bitcast` -- DeepSeek-V4's E8M0 block scales are stored
+    /// a tensor with `Transmute` -- DeepSeek-V4's E8M0 block scales are stored
     /// as `U8` -- says so here, and an executor that consulted the source
     /// table instead would undo the reinterpretation.
     pub dtype: PieLoaderDType,
@@ -518,9 +533,21 @@ pub struct PieLoaderTensorDeclView {
     pub quant_group_size: u32,
     pub shape: PieLoaderI64Slice,
     pub alignment: u32,
+    pub visibility: PieLoaderVisibility,
 }
 
 pub type PieLoaderTensorDeclSlice = PieLoaderSlice<PieLoaderTensorDeclView>;
+
+/// Whether a declared tensor is bound by the driver. Mirrors [`Visibility`](crate::types::Visibility).
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PieLoaderVisibility {
+    /// A runtime weight, bound by name.
+    #[default]
+    Public = 0,
+    /// A name the contract needed for itself: not bound, not persistent.
+    Internal = 1,
+}
 
 /// How a scale tensor's entries map onto the tensor they scale.
 #[repr(u32)]
@@ -546,6 +573,64 @@ pub enum PieLoaderScaleForm {
     F32Factors = 1,
 }
 
+impl From<QuantGranularity> for PieLoaderQuantGranularity {
+    fn from(value: QuantGranularity) -> Self {
+        match value {
+            QuantGranularity::PerChannel => Self::PerChannel,
+            QuantGranularity::PerGroup => Self::PerGroup,
+        }
+    }
+}
+
+impl From<PieLoaderQuantGranularity> for QuantGranularity {
+    fn from(value: PieLoaderQuantGranularity) -> Self {
+        match value {
+            PieLoaderQuantGranularity::PerChannel => Self::PerChannel,
+            PieLoaderQuantGranularity::PerGroup => Self::PerGroup,
+        }
+    }
+}
+
+impl TryFrom<u32> for PieLoaderQuantGranularity {
+    type Error = u32;
+    fn try_from(value: u32) -> Result<Self, u32> {
+        Ok(match value {
+            0 => Self::PerChannel,
+            1 => Self::PerGroup,
+            other => return Err(other),
+        })
+    }
+}
+
+impl From<ScaleForm> for PieLoaderScaleForm {
+    fn from(value: ScaleForm) -> Self {
+        match value {
+            ScaleForm::RawE8M0 => Self::RawE8M0,
+            ScaleForm::F32Factors => Self::F32Factors,
+        }
+    }
+}
+
+impl From<PieLoaderScaleForm> for ScaleForm {
+    fn from(value: PieLoaderScaleForm) -> Self {
+        match value {
+            PieLoaderScaleForm::RawE8M0 => Self::RawE8M0,
+            PieLoaderScaleForm::F32Factors => Self::F32Factors,
+        }
+    }
+}
+
+impl TryFrom<u32> for PieLoaderScaleForm {
+    type Error = u32;
+    fn try_from(value: u32) -> Result<Self, u32> {
+        Ok(match value {
+            0 => Self::RawE8M0,
+            1 => Self::F32Factors,
+            other => return Err(other),
+        })
+    }
+}
+
 /// A quantized tensor paired with the tensor holding its scales.
 ///
 /// Both are entries in [`PieLoaderPlan::tensors`], named by `id`. The driver has
@@ -564,6 +649,49 @@ pub struct PieLoaderQuantAttachmentView {
 }
 
 pub type PieLoaderQuantAttachmentSlice = PieLoaderSlice<PieLoaderQuantAttachmentView>;
+
+/// Where one instruction of a group's plan reads, for one instance.
+///
+/// The whole of what distinguishes instance `i` from instance 0: a group did
+/// not compile unless every other field of every instruction agreed across all
+/// of them. `instr_id` names the instruction in
+/// [`PieLoaderGroupView::plan`](PieLoaderGroupView) whose source extent these
+/// three fields replace.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PieLoaderSourceBindingView {
+    pub instr_id: u32,
+    pub file_id: u32,
+    pub tensor_id: u32,
+    pub file_offset: u64,
+}
+
+pub type PieLoaderSourceBindingSlice = PieLoaderSlice<PieLoaderSourceBindingView>;
+
+/// A set of interchangeable tensors: one plan, `arity` instances.
+///
+/// The driver decides what to do with it. Running `plan` `arity` times into
+/// `arity` destinations makes the group resident, which is what a driver that
+/// has never heard of streaming should do; running it on demand into a bounded
+/// set of slots is streaming. The loader states only that the two are the same
+/// program.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PieLoaderGroupView {
+    pub name: PieLoaderBytes,
+    pub arity: u32,
+    /// The program one instance runs, compiled at index 0. A whole plan, so it
+    /// goes to the same executor the resident load already uses.
+    pub plan: *const PieLoaderPlan,
+    /// `arity * bindings_per_instance` entries, instance-major. Instance `i`
+    /// owns `[i * bindings_per_instance, (i + 1) * bindings_per_instance)`.
+    pub bindings: PieLoaderSourceBindingSlice,
+    /// How many instructions of `plan` name a source. Zero only if the group's
+    /// plan reads nothing, which no group does.
+    pub bindings_per_instance: usize,
+}
+
+pub type PieLoaderGroupSlice = PieLoaderSlice<PieLoaderGroupView>;
 
 /// Which on-disk format a checkpoint file uses.
 #[repr(u32)]
@@ -586,7 +714,7 @@ impl From<crate::types::CheckpointFormat> for PieLoaderCheckpointFormat {
 
 /// One file the plan reads from. `PieLoaderSourceTensorView::file_id` indexes
 /// `PieLoaderPlan::files`, so the driver no longer has to re-derive the file
-/// order for itself (§6).
+/// order for itself (`architecture.md` §6).
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct PieLoaderCheckpointFileView {
@@ -686,7 +814,8 @@ pub enum PieLoaderStorageOp {
         /// budget itself does not cross the boundary: the driver stated it in
         /// the request, the loader answered with a row count in
         /// `backend::lower`, and sending the question back alongside the answer
-        /// would only invite the executor to re-derive it (§8.1).
+        /// would only invite the executor to re-derive it (`architecture.md`
+        /// §8.1).
         rows_per_tile: u32,
         /// A transform chain the backend collapsed into one kernel.
         transform_fusion: PieLoaderTransformFusion,
@@ -712,6 +841,24 @@ pub enum PieLoaderStorageOp {
         /// shape the way it reaches the payload's — instead of appending
         /// `_scale_inv` to a name and hoping the checkpoint agrees.
         transform_metadata_source: u32,
+        /// The multiplier for a [`PieLoaderTileMapKind::Scale`], as the bit
+        /// pattern of an IEEE-754 binary32; zero on every other kind.
+        ///
+        /// Bits rather than a `float` field so this union's layout does not
+        /// depend on float ABI, and so the executor multiplies with exactly the
+        /// constant the contract named — `__uint_as_float` on the CUDA side
+        /// costs nothing and cannot round.
+        transform_scale_factor_bits: u32,
+        /// Elements per factor along `transform_scale_axis` for a per-group
+        /// [`PieLoaderTileMapKind::Scale`]; zero when the factor is the uniform
+        /// constant above.
+        ///
+        /// Non-zero is what tells the executor to read its factors from
+        /// `input_buffers[0]` — the operand the contract paired with the
+        /// payload — instead of from `transform_scale_factor_bits`.
+        transform_scale_group: u32,
+        /// The axis `transform_scale_group` counts along.
+        transform_scale_axis: u8,
     } = 2,
     CreateView {
         input_buffer: u32,
@@ -750,7 +897,7 @@ pub struct PieLoaderMemoryPlanView {
 /// The target the plan was compiled against. The driver reads it back to assert
 /// the plan it received is the plan it asked for — the same fields it supplied
 /// in the request, plus the rank identity that makes a TP shard distinguishable
-/// from its siblings (§6.2).
+/// from its siblings (`architecture.md` §6.2).
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct PieLoaderTargetView {
@@ -818,6 +965,9 @@ pub struct PieLoaderPlan {
     /// dump. Rendered by the loader so no driver keeps a second table of
     /// instruction names to fall out of step with this one.
     pub stats_json: PieLoaderBytes,
+    /// Interchangeable tensor sets, each compiled once. Empty for a plan whose
+    /// contract declared no group, which is every contract that predates them.
+    pub groups: PieLoaderGroupSlice,
     pub owner: *mut std::ffi::c_void,
 }
 
@@ -834,5 +984,6 @@ const _: () = {
     assert!(PIE_LOADER_TILE_MAP_TRANSCODE == p::TILE_MAP_TRANSCODE);
     assert!(PIE_LOADER_TILE_MAP_REBLOCK == p::TILE_MAP_REBLOCK);
     assert!(PIE_LOADER_TILE_MAP_REPACK == p::TILE_MAP_REPACK);
+    assert!(PIE_LOADER_TILE_MAP_SCALE == p::TILE_MAP_SCALE);
     assert!(PIE_LOADER_FUSION_FP8_TO_MXFP4 == p::FUSION_FP8_TO_MXFP4);
 };

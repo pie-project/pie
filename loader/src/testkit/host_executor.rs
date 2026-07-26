@@ -1,9 +1,10 @@
 //! Running a finished plan on the CPU, against the real checkpoint bytes.
 //!
-//! Not a production path (§10.3). It exists so a plan can be executed without
-//! a GPU and its output compared against `crate::reference`, which is the only
-//! offline check that can fail because the plan moved the *wrong* bytes rather
-//! than an ill-formed number of them.
+//! Not a production path (`architecture.md` §10.3). It exists so a plan can be
+//! executed without a GPU and its output compared against
+//! `crate::testkit::reference`, which is the only offline check that can fail
+//! because the plan moved the *wrong* bytes rather than an ill-formed number of
+//! them.
 //!
 //! It is the one module below `lib.rs` that opens a file, which is why it is
 //! named for what it is rather than sharing a name with the backend whose
@@ -19,10 +20,12 @@ use std::path::{Path, PathBuf};
 use half::{bf16, f16};
 
 use crate::error::Error;
+use crate::plan::index::{PlanIndex, instr_by_id};
 use crate::plan::{
     DestExtent, Extent, HOST_TILE_MAP_MASK, LoadPlan, SourceExtent, StorageInstr, TileMapKind,
+    TransformSpec,
 };
-use crate::types::{BufferId, DType, Encoding};
+use crate::types::{BufferId, DType, Encoding, QuantScheme};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostStorage {
@@ -54,10 +57,10 @@ enum Root {
 /// Execute a plan against the checkpoint it names.
 ///
 /// `snapshot_dir` is only a base for relative paths. The files themselves come
-/// from `plan.files`, which is the rule step 6 established for every executor:
-/// an executor that rediscovered the checkpoint by scanning a directory could
-/// disagree with the plan about which file id means which file, and every
-/// offset in the plan is expressed against that table.
+/// from `plan.files`, which is the rule for every executor: an executor that
+/// rediscovered the checkpoint by scanning a directory could disagree with the
+/// plan about which file id means which file, and every offset in the plan is
+/// expressed against that table.
 pub fn execute_plan(plan: &LoadPlan, snapshot_dir: &Path) -> Result<HostStorage, Error> {
     if plan.target.tile_map_mask & !HOST_TILE_MAP_MASK != 0 {
         return Err(invalid(
@@ -81,6 +84,7 @@ pub fn execute_plan(plan: &LoadPlan, snapshot_dir: &Path) -> Result<HostStorage,
         .map_err(|_| invalid("persistent arena does not fit host address space"))?;
     let mut executor = HostExecutor {
         plan,
+        index: PlanIndex::new(plan),
         files,
         arena: vec![0; arena_len],
         buffers: HashMap::new(),
@@ -97,6 +101,10 @@ pub fn execute_plan(plan: &LoadPlan, snapshot_dir: &Path) -> Result<HostStorage,
 
 struct HostExecutor<'a> {
     plan: &'a LoadPlan,
+    /// The sparse half of plan lookup. Buffers and instructions are dense, so
+    /// they go through [`LoadPlan::buffer`] and [`instr_by_id`] directly; tensor
+    /// ids interleave two allocators and need the map.
+    index: PlanIndex,
     files: HashMap<u32, PathBuf>,
     arena: Vec<u8>,
     buffers: HashMap<BufferId, BufferLoc>,
@@ -107,13 +115,7 @@ struct HostExecutor<'a> {
 impl HostExecutor<'_> {
     fn execute(&mut self) -> Result<(), Error> {
         for id in &self.plan.schedule {
-            let instr = self
-                .plan
-                .instrs
-                .iter()
-                .find(|instr| instr_id(instr) == *id)
-                .ok_or_else(|| invalid(format!("scheduled instruction {} is missing", id.0)))?
-                .clone();
+            let instr = instr_by_id(&self.plan.instrs, *id)?.clone();
             match instr {
                 StorageInstr::Allocate { buffer, .. } => self.allocate(buffer)?,
                 StorageInstr::Fill { buffer, .. } => self.fill(buffer)?,
@@ -129,22 +131,7 @@ impl HostExecutor<'_> {
                     let bytes = self.read_extent(&source)?;
                     self.write_arena(dest_offset, &bytes)?;
                 }
-                StorageInstr::TileMap {
-                    kind,
-                    source,
-                    dest,
-                    inputs,
-                    outputs,
-                    tile,
-                    ..
-                } => self.tile_map(
-                    kind,
-                    source.as_ref(),
-                    dest.as_ref(),
-                    &inputs,
-                    &outputs,
-                    tile.max_tile_bytes,
-                )?,
+                StorageInstr::TileMap { .. } => self.tile_map(&instr)?,
                 StorageInstr::CreateView {
                     input,
                     output,
@@ -171,12 +158,7 @@ impl HostExecutor<'_> {
     }
 
     fn allocate(&mut self, id: BufferId) -> Result<(), Error> {
-        let decl = self
-            .plan
-            .buffers
-            .iter()
-            .find(|buffer| buffer.id == id)
-            .ok_or_else(|| invalid(format!("buffer {} is missing", id.0)))?;
+        let decl = self.plan.buffer(id)?;
         let len = checked_usize(decl.bytes)?;
         let loc = if let Some(offset) = decl.persistent_offset {
             let offset = checked_usize(offset)?;
@@ -287,15 +269,23 @@ impl HostExecutor<'_> {
         Ok(())
     }
 
-    fn tile_map(
-        &mut self,
-        kind: TileMapKind,
-        source: Option<&SourceExtent>,
-        dest: Option<&DestExtent>,
-        inputs: &[BufferId],
-        outputs: &[BufferId],
-        max_tile_bytes: u64,
-    ) -> Result<(), Error> {
+    fn tile_map(&mut self, instr: &StorageInstr) -> Result<(), Error> {
+        let StorageInstr::TileMap {
+            kind,
+            source,
+            dest,
+            inputs,
+            outputs,
+            tile,
+            transform,
+            ..
+        } = instr
+        else {
+            return Err(invalid("tile_map was handed something else"));
+        };
+        let (kind, max_tile_bytes) = (*kind, tile.max_tile_bytes);
+        let (source, dest) = (source.as_ref(), dest.as_ref());
+        let transform = transform.clone();
         let input = if let Some(source) = source {
             self.read_extent(source)?
         } else {
@@ -312,6 +302,9 @@ impl HostExecutor<'_> {
                 outputs.first().copied(),
                 &input,
             )?,
+            TileMapKind::Scale => {
+                self.scale_bytes(source, inputs, outputs.first().copied(), &input, &transform)?
+            }
             other => {
                 return Err(invalid(format!(
                     "host storage executor does not implement {other:?} transforms"
@@ -325,7 +318,13 @@ impl HostExecutor<'_> {
         };
         if let Some(dest) = dest {
             let source_stride = source.map(|source| &source.stride).unwrap_or(&dest.stride);
-            require_same_byte_count(source_stride, &dest.stride)?;
+            // A per-group `Scale` is the one transform whose output is a
+            // different width from its input by design: unpacking four-bit
+            // codes into `BF16` quadruples the bytes. Every other kind moves
+            // the same bytes it read, and the mismatch is a bug worth catching.
+            if transform.scale_group == 0 {
+                require_same_byte_count(source_stride, &dest.stride)?;
+            }
             if !dest.stride.has_dense_destination() {
                 return Err(invalid("non-compact TileMap destinations are unsupported"));
             }
@@ -356,6 +355,98 @@ impl HostExecutor<'_> {
         Ok(())
     }
 
+    /// `Scale` multiplies, and what it multiplies by is the only thing that
+    /// varies: a constant every element shares, or one factor per group of
+    /// elements read from a second operand.
+    ///
+    /// The uniform form keeps the type it was handed — `infer` gives it back
+    /// unchanged — so there is no output dtype to look up. The per-group form
+    /// is the one that also *decodes*, because a quantized tensor's elements
+    /// are only numbers once their factors are applied; its output dtype is
+    /// therefore the one the output buffer declares.
+    ///
+    /// The multiply happens in `f32`, not in the `f64` `decode_values` yields,
+    /// because that is what the CUDA kernel does and the two executors are
+    /// compared bit for bit. Every input dtype either form accepts is exactly
+    /// representable in `f32`, so the narrowing before the multiply cannot
+    /// lose anything the device would have kept.
+    fn scale_bytes(
+        &self,
+        source: Option<&SourceExtent>,
+        inputs: &[BufferId],
+        output: Option<BufferId>,
+        bytes: &[u8],
+        transform: &TransformSpec,
+    ) -> Result<Vec<u8>, Error> {
+        let payload = || -> Result<DType, Error> {
+            if let Some(source) = source {
+                self.source_dtype(source.tensor_id)
+            } else if let Some(input) = inputs.first() {
+                self.buffer_dtype(*input)
+            } else {
+                Err(invalid("host Scale requires a source or input buffer"))
+            }
+        };
+        if transform.scale_group != 0 {
+            let elements = match transform.from {
+                None => decode_values(bytes, payload()?)?,
+                Some(QuantScheme::Mxfp4E2M1E8M0) => decode_mxfp4_elements(bytes),
+                Some(QuantScheme::Int4B8) => decode_int4b8_elements(bytes),
+                Some(other) => {
+                    return Err(invalid(format!(
+                        "host Scale does not implement {other:?} elements"
+                    )));
+                }
+            };
+            let output =
+                output.ok_or_else(|| invalid("per-group Scale requires an output buffer"))?;
+            return self.scale_per_group(elements, inputs, self.buffer_dtype(output)?, transform);
+        }
+        let dtype = payload()?;
+        let factor = f32::from_bits(transform.scale_factor_bits);
+        let mut values = decode_values(bytes, dtype)?;
+        for value in &mut values {
+            *value = f64::from(*value as f32 * factor);
+        }
+        encode_values(&values, dtype)
+    }
+
+    /// One factor per `scale_group` elements, read from the last input buffer.
+    ///
+    /// The elements are flattened before the grouping is applied, which is
+    /// exact rather than approximate: `infer_scale_per_group` accepts the
+    /// grouping only on the last axis, and on the last axis the groups of the
+    /// row-major layout and the groups of the logical shape are the same runs.
+    /// Every earlier axis therefore contributes whole rows, and a whole row is
+    /// a whole number of groups.
+    fn scale_per_group(
+        &self,
+        mut values: Vec<f64>,
+        inputs: &[BufferId],
+        output: DType,
+        transform: &TransformSpec,
+    ) -> Result<Vec<u8>, Error> {
+        let factors = *inputs
+            .last()
+            .ok_or_else(|| invalid("per-group Scale has no factor operand"))?;
+        let factors = decode_values(self.buffer_bytes(factors)?, self.buffer_dtype(factors)?)?;
+        let group = transform.scale_group as usize;
+        if values.len() != factors.len() * group {
+            return Err(invalid(format!(
+                "per-group Scale has {} elements but {} factors of {group}",
+                values.len(),
+                factors.len()
+            )));
+        }
+        for (chunk, factor) in values.chunks_mut(group).zip(&factors) {
+            let factor = *factor as f32;
+            for value in chunk {
+                *value = f64::from(*value as f32 * factor);
+            }
+        }
+        encode_values(&values, output)
+    }
+
     fn cast_bytes(
         &self,
         source: Option<&SourceExtent>,
@@ -380,21 +471,10 @@ impl HostExecutor<'_> {
     }
 
     fn buffer_dtype(&self, id: BufferId) -> Result<DType, Error> {
-        let buffer = self
-            .plan
-            .buffers
-            .iter()
-            .find(|buffer| buffer.id == id)
-            .ok_or_else(|| invalid(format!("buffer {} is missing", id.0)))?;
-        let tensor_id = buffer
-            .tensor
-            .ok_or_else(|| invalid(format!("buffer {} has no tensor type", id.0)))?;
         let tensor = self
-            .plan
-            .tensors
-            .iter()
-            .find(|tensor| tensor.id == tensor_id)
-            .ok_or_else(|| invalid(format!("tensor {} is missing", tensor_id.0)))?;
+            .index
+            .buffer_tensor(self.plan, id)
+            .ok_or_else(|| invalid(format!("buffer {} has no tensor type", id.0)))?;
         match tensor.encoding {
             Encoding::Raw(dtype) => Ok(dtype),
             Encoding::Quant(_) => Err(invalid("host Cast does not accept quantized buffers")),
@@ -403,10 +483,8 @@ impl HostExecutor<'_> {
 
     fn source_dtype(&self, id: crate::types::TensorId) -> Result<DType, Error> {
         let source = self
-            .plan
-            .sources
-            .iter()
-            .find(|source| source.id == id)
+            .index
+            .source(self.plan, id)
             .ok_or_else(|| invalid(format!("source tensor {} is missing", id.0)))?;
         match source.encoding {
             Encoding::Raw(dtype) => Ok(dtype),
@@ -629,6 +707,38 @@ fn physical_bytes(extent: &Extent, source: bool) -> Result<u64, Error> {
         .ok_or_else(|| invalid("extent range overflow"))
 }
 
+/// One `f64` per E2M1 code, low nibble first.
+///
+/// The nibble order and the codepoint table are the OCP MX FP4 spec's, and
+/// have to stay the CUDA kernel's: `kFp4Lut` in `kernels/dequant_fp4.cu` is
+/// the same sixteen values in the same order, and the two executors are
+/// compared element for element.
+/// Unpack `QuantScheme::Int4B8` nibbles, low nibble first.
+///
+/// The nibbles are stored eight to a 32-bit word, but a little-endian word's
+/// nibbles run low-to-high across its bytes in exactly that order, so reading
+/// bytes is reading words. An element is `nibble - 8`.
+fn decode_int4b8_elements(bytes: &[u8]) -> Vec<f64> {
+    let mut values = Vec::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        values.push(f64::from((byte & 0xF) as i8 - 8));
+        values.push(f64::from((byte >> 4) as i8 - 8));
+    }
+    values
+}
+
+fn decode_mxfp4_elements(bytes: &[u8]) -> Vec<f64> {
+    const LUT: [f64; 16] = [
+        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    ];
+    let mut values = Vec::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        values.push(LUT[(byte & 0xF) as usize]);
+        values.push(LUT[(byte >> 4) as usize]);
+    }
+    values
+}
+
 fn decode_values(bytes: &[u8], dtype: DType) -> Result<Vec<f64>, Error> {
     let width = dtype.bytes() as usize;
     if !bytes.len().is_multiple_of(width) {
@@ -698,18 +808,6 @@ fn encode_values(values: &[f64], dtype: DType) -> Result<Vec<u8>, Error> {
     Ok(out)
 }
 
-fn instr_id(instr: &StorageInstr) -> crate::types::InstrId {
-    match instr {
-        StorageInstr::Allocate { id, .. }
-        | StorageInstr::Fill { id, .. }
-        | StorageInstr::ExtentWrite { id, .. }
-        | StorageInstr::BulkExtentWrite { id, .. }
-        | StorageInstr::TileMap { id, .. }
-        | StorageInstr::CreateView { id, .. }
-        | StorageInstr::Finalize { id, .. } => *id,
-    }
-}
-
 fn checked_usize(value: u64) -> Result<usize, Error> {
     usize::try_from(value).map_err(|_| invalid("value does not fit usize"))
 }
@@ -755,7 +853,7 @@ mod tests {
     #[test]
     fn a_padded_tensor_comes_back_with_zeros_where_no_source_reaches() {
         use crate::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
-        use crate::contract::{Expr, ModelContract, TensorContract};
+        use crate::contract::{Expr, ModelContract, TensorContract, TensorType};
 
         let dir = std::env::temp_dir().join(format!("pie_host_pad_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -788,10 +886,18 @@ mod tests {
             alignment: 1,
             tensors: vec![TensorContract::new(
                 "padded",
-                Expr::src("raw").pad(1, 1, 1),
+                Expr::concat(
+                    1,
+                    vec![
+                        Expr::fill(0.0, TensorType::raw(vec![2, 1], DType::U8)),
+                        Expr::src("raw"),
+                        Expr::fill(0.0, TensorType::raw(vec![2, 1], DType::U8)),
+                    ],
+                ),
                 vec![2, 5],
                 Encoding::Raw(DType::U8),
             )],
+            groups: Vec::new(),
         };
 
         let plan = crate::plan::compile(&metadata, &contract, StorageTarget::default()).unwrap();
@@ -800,6 +906,445 @@ mod tests {
             storage.tensors["padded"],
             vec![0, 1, 2, 3, 0, 0, 4, 5, 6, 0]
         );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The one node that changes a value, compiled and then actually run.
+    #[test]
+    fn a_scaled_tensor_comes_back_multiplied() {
+        use crate::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
+        use crate::contract::{Expr, ModelContract, TensorContract};
+
+        let dir = std::env::temp_dir().join(format!("pie_host_scale_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let values: [f32; 4] = [1.0, 2.0, 3.0, 5.0];
+        let header = r#"{"raw":{"dtype":"F32","shape":[4],"data_offsets":[0,16]}}"#;
+        let mut file = (header.len() as u64).to_le_bytes().to_vec();
+        file.extend_from_slice(header.as_bytes());
+        let data_offset = file.len() as u64;
+        for value in values {
+            file.extend_from_slice(&value.to_le_bytes());
+        }
+        let size_bytes = file.len() as u64;
+        std::fs::write(dir.join("model.safetensors"), &file).unwrap();
+
+        let metadata = CheckpointMetadata {
+            files: vec![CheckpointFile {
+                id: FileId(0),
+                path: "model.safetensors".to_string(),
+                size_bytes,
+                format: crate::types::CheckpointFormat::Safetensors,
+            }],
+            tensors: vec![RawTensor {
+                id: TensorId(0),
+                name: "raw".to_string(),
+                file_id: FileId(0),
+                file_offset: data_offset,
+                span_bytes: 16,
+                shape: vec![4],
+                encoding: Encoding::Raw(DType::F32),
+            }],
+        };
+        // Not a round number: a factor the executor merely copied instead of
+        // multiplying by would still pass with 1.0, and one it truncated to
+        // `f64` would still pass with 0.25.
+        let factor = 1.0f32 / 3.0;
+        let contract = ModelContract {
+            alignment: 1,
+            tensors: vec![TensorContract::new(
+                "scaled",
+                Expr::src("raw").scale(factor),
+                vec![4],
+                Encoding::Raw(DType::F32),
+            )],
+            groups: Vec::new(),
+        };
+
+        let plan = crate::plan::compile(&metadata, &contract, StorageTarget::default()).unwrap();
+        assert!(
+            plan.instrs.iter().any(|instr| matches!(
+                instr,
+                StorageInstr::TileMap {
+                    kind: TileMapKind::Scale,
+                    transform,
+                    ..
+                } if transform.scale_factor_bits == factor.to_bits()
+            )),
+            "the factor did not survive lowering: {:?}",
+            plan.instrs
+        );
+
+        let storage = execute_plan(&plan, &dir).unwrap();
+        let expected: Vec<u8> = values
+            .iter()
+            .flat_map(|value| (value * factor).to_le_bytes())
+            .collect();
+        assert_eq!(storage.tensors["scaled"], expected);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// `Int4B8` is a different element format under the same `Scale` node.
+    ///
+    /// Nothing about the node changes -- one operand, one factor tensor, the
+    /// same grouping rule -- so what this pins is that the *scheme* is what
+    /// says how a code becomes a number: `nibble - 8` here against a lookup
+    /// table for MXFP4. Reading one as the other is silent, because both are
+    /// four bits packed low nibble first.
+    #[test]
+    fn an_int4b8_source_is_dequantized_by_its_factors() {
+        use crate::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
+        use crate::contract::{Expr, ModelContract, TensorContract, TensorType};
+        use crate::types::{Axis, QuantSpec};
+
+        let dir = std::env::temp_dir().join(format!("pie_host_int4b8_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Two rows of 32 codes. Every byte is 0x9E, so the codes alternate
+        // 14 (+6) and 9 (+1) -- an asymmetric pair straddling the bias, so
+        // neither a swapped nibble order nor a missing `- 8` still passes.
+        let packed = [0x9Eu8; 32];
+        // bf16 2.0 and -0.5, one per row: different enough that a factor
+        // applied to the wrong row cannot go unnoticed, and signed so that a
+        // factor read as unsigned cannot either.
+        let mut factors = Vec::new();
+        for value in [2.0f32, -0.5] {
+            factors.extend_from_slice(&bf16::from_f32(value).to_bits().to_le_bytes());
+        }
+
+        let header = r#"{"w":{"dtype":"U8","shape":[2,16],"data_offsets":[0,32]},"#.to_string()
+            + r#""s":{"dtype":"BF16","shape":[2,1],"data_offsets":[32,36]}}"#;
+        let mut file = (header.len() as u64).to_le_bytes().to_vec();
+        file.extend_from_slice(header.as_bytes());
+        let data_offset = file.len() as u64;
+        file.extend_from_slice(&packed);
+        file.extend_from_slice(&factors);
+        let size_bytes = file.len() as u64;
+        std::fs::write(dir.join("model.safetensors"), &file).unwrap();
+
+        let metadata = CheckpointMetadata {
+            files: vec![CheckpointFile {
+                id: FileId(0),
+                path: "model.safetensors".to_string(),
+                size_bytes,
+                format: crate::types::CheckpointFormat::Safetensors,
+            }],
+            tensors: vec![
+                RawTensor {
+                    id: TensorId(0),
+                    name: "w".to_string(),
+                    file_id: FileId(0),
+                    file_offset: data_offset,
+                    span_bytes: 32,
+                    shape: vec![2, 16],
+                    encoding: Encoding::Raw(DType::U8),
+                },
+                RawTensor {
+                    id: TensorId(1),
+                    name: "s".to_string(),
+                    file_id: FileId(0),
+                    file_offset: data_offset + 32,
+                    span_bytes: 4,
+                    shape: vec![2, 1],
+                    encoding: Encoding::Raw(DType::BF16),
+                },
+            ],
+        };
+
+        let int4b8 = QuantSpec {
+            scheme: QuantScheme::Int4B8,
+            logical_dtype: DType::BF16,
+            bits_per_element: 4,
+            group_size: 32,
+            channel_axis: Some(Axis(1)),
+        };
+        let contract = ModelContract {
+            alignment: 1,
+            tensors: vec![
+                TensorContract::new(
+                    "scales",
+                    Expr::src("s"),
+                    vec![2, 1],
+                    Encoding::Raw(DType::BF16),
+                ),
+                TensorContract::new(
+                    "w",
+                    Expr::src("w")
+                        .transmute(TensorType {
+                            shape: vec![2, 32],
+                            encoding: Encoding::Quant(int4b8),
+                        })
+                        .scale_per_group(Expr::out("scales"), 32, 1),
+                    vec![2, 32],
+                    Encoding::Raw(DType::BF16),
+                ),
+            ],
+            groups: Vec::new(),
+        };
+
+        let plan = crate::plan::compile(&metadata, &contract, StorageTarget::default()).unwrap();
+        let storage = execute_plan(&plan, &dir).unwrap();
+
+        let mut expected = Vec::new();
+        for row_scale in [2.0f32, -0.5] {
+            for _ in 0..16 {
+                expected
+                    .extend_from_slice(&bf16::from_f32(6.0 * row_scale).to_bits().to_le_bytes());
+                expected
+                    .extend_from_slice(&bf16::from_f32(1.0 * row_scale).to_bits().to_le_bytes());
+            }
+        }
+        assert_eq!(storage.tensors["w"], expected);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Factors a contract needed but the driver does not: declared, used,
+    /// never bound.
+    ///
+    /// The algebra has no `let`, so scaling by a tensor means publishing that
+    /// tensor. Published as a runtime weight, a slab of dequantization factors
+    /// lands in the persistent arena and stays there for the life of the
+    /// process -- an arena view reclaims nothing when erased -- and the driver
+    /// gets a name in its bind table that no kernel will ever ask for.
+    ///
+    /// `Visibility::Internal` is that name without either consequence. What
+    /// this pins is that both go away together and the arithmetic does not
+    /// change: the same bytes come out of `w`, `scales` is absent from the
+    /// bind table, and the plan's persistent footprint drops by exactly the
+    /// factors it no longer keeps.
+    #[test]
+    fn internal_factors_are_used_but_never_bound() {
+        use crate::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
+        use crate::contract::{Expr, ModelContract, TensorContract, TensorType};
+        use crate::types::{Axis, QuantSpec};
+
+        let dir = std::env::temp_dir().join(format!("pie_host_internal_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let packed = [0x9Eu8; 32];
+        let mut factors = Vec::new();
+        for value in [2.0f32, -0.5] {
+            factors.extend_from_slice(&bf16::from_f32(value).to_bits().to_le_bytes());
+        }
+        let header = r#"{"w":{"dtype":"U8","shape":[2,16],"data_offsets":[0,32]},"#.to_string()
+            + r#""s":{"dtype":"BF16","shape":[2,1],"data_offsets":[32,36]}}"#;
+        let mut file = (header.len() as u64).to_le_bytes().to_vec();
+        file.extend_from_slice(header.as_bytes());
+        let data_offset = file.len() as u64;
+        file.extend_from_slice(&packed);
+        file.extend_from_slice(&factors);
+        let size_bytes = file.len() as u64;
+        std::fs::write(dir.join("model.safetensors"), &file).unwrap();
+
+        let metadata = CheckpointMetadata {
+            files: vec![CheckpointFile {
+                id: FileId(0),
+                path: "model.safetensors".to_string(),
+                size_bytes,
+                format: crate::types::CheckpointFormat::Safetensors,
+            }],
+            tensors: vec![
+                RawTensor {
+                    id: TensorId(0),
+                    name: "w".to_string(),
+                    file_id: FileId(0),
+                    file_offset: data_offset,
+                    span_bytes: 32,
+                    shape: vec![2, 16],
+                    encoding: Encoding::Raw(DType::U8),
+                },
+                RawTensor {
+                    id: TensorId(1),
+                    name: "s".to_string(),
+                    file_id: FileId(0),
+                    file_offset: data_offset + 32,
+                    span_bytes: 4,
+                    shape: vec![2, 1],
+                    encoding: Encoding::Raw(DType::BF16),
+                },
+            ],
+        };
+
+        let int4b8 = QuantSpec {
+            scheme: QuantScheme::Int4B8,
+            logical_dtype: DType::BF16,
+            bits_per_element: 4,
+            group_size: 32,
+            channel_axis: Some(Axis(1)),
+        };
+        let contract = |scales: TensorContract| ModelContract {
+            alignment: 1,
+            tensors: vec![
+                scales,
+                TensorContract::new(
+                    "w",
+                    Expr::src("w")
+                        .transmute(TensorType {
+                            shape: vec![2, 32],
+                            encoding: Encoding::Quant(int4b8.clone()),
+                        })
+                        .scale_per_group(Expr::out("scales"), 32, 1),
+                    vec![2, 32],
+                    Encoding::Raw(DType::BF16),
+                ),
+            ],
+            groups: Vec::new(),
+        };
+        let declare_scales = || {
+            TensorContract::new(
+                "scales",
+                Expr::src("s"),
+                vec![2, 1],
+                Encoding::Raw(DType::BF16),
+            )
+        };
+
+        let public = crate::plan::compile(
+            &metadata,
+            &contract(declare_scales()),
+            StorageTarget::default(),
+        )
+        .unwrap();
+        let internal = crate::plan::compile(
+            &metadata,
+            &contract(declare_scales().internal()),
+            StorageTarget::default(),
+        )
+        .unwrap();
+
+        let storage = execute_plan(&internal, &dir).unwrap();
+        let mut expected = Vec::new();
+        for row_scale in [2.0f32, -0.5] {
+            for _ in 0..16 {
+                expected
+                    .extend_from_slice(&bf16::from_f32(6.0 * row_scale).to_bits().to_le_bytes());
+                expected
+                    .extend_from_slice(&bf16::from_f32(1.0 * row_scale).to_bits().to_le_bytes());
+            }
+        }
+        assert_eq!(storage.tensors["w"], expected);
+        assert!(
+            !storage.tensors.contains_key("scales"),
+            "an internal declaration must not reach the driver's bind table"
+        );
+        // 2 rows x 1 bf16 factor: the whole of what the public declaration was
+        // keeping. Stated exactly, because "smaller" would also pass if the
+        // arena had merely stopped aligning it.
+        assert_eq!(
+            public.memory.persistent_bytes - internal.memory.persistent_bytes,
+            4
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A block-scaled MXFP4 tensor and its factors, dequantized by the plan.
+    ///
+    /// This is the shape the DeepSeek families' expert weights arrive in, and
+    /// the reason `Scale` takes a tensor factor at all: before it did, a driver
+    /// loaded both halves, ran its own kernel, and left the packed originals
+    /// resident because a view into the arena cannot be freed.
+    #[test]
+    fn a_block_scaled_source_is_dequantized_by_its_factors() {
+        use crate::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
+        use crate::contract::{Expr, ModelContract, TensorContract, TensorType};
+        use crate::types::{Axis, QuantSpec};
+
+        let dir = std::env::temp_dir().join(format!("pie_host_mxfp4_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Two rows of 32 codes. Every byte is 0x21, so the codes alternate
+        // 1 (0.5) and 2 (1.0) — an asymmetric pair, so a nibble order that
+        // swapped low for high would not still pass.
+        let packed = [0x21u8; 32];
+        // 2^(128-127) = 2 on row 0, 2^(126-127) = 0.5 on row 1: different
+        // enough that a factor applied to the wrong row cannot go unnoticed.
+        let exponents = [128u8, 126];
+
+        let header = r#"{"w":{"dtype":"U8","shape":[2,16],"data_offsets":[0,32]},"#.to_string()
+            + r#""s":{"dtype":"U8","shape":[2,1],"data_offsets":[32,34]}}"#;
+        let mut file = (header.len() as u64).to_le_bytes().to_vec();
+        file.extend_from_slice(header.as_bytes());
+        let data_offset = file.len() as u64;
+        file.extend_from_slice(&packed);
+        file.extend_from_slice(&exponents);
+        let size_bytes = file.len() as u64;
+        std::fs::write(dir.join("model.safetensors"), &file).unwrap();
+
+        let metadata = CheckpointMetadata {
+            files: vec![CheckpointFile {
+                id: FileId(0),
+                path: "model.safetensors".to_string(),
+                size_bytes,
+                format: crate::types::CheckpointFormat::Safetensors,
+            }],
+            tensors: vec![
+                RawTensor {
+                    id: TensorId(0),
+                    name: "w".to_string(),
+                    file_id: FileId(0),
+                    file_offset: data_offset,
+                    span_bytes: 32,
+                    shape: vec![2, 16],
+                    encoding: Encoding::Raw(DType::U8),
+                },
+                RawTensor {
+                    id: TensorId(1),
+                    name: "s".to_string(),
+                    file_id: FileId(0),
+                    file_offset: data_offset + 32,
+                    span_bytes: 2,
+                    shape: vec![2, 1],
+                    encoding: Encoding::Raw(DType::U8),
+                },
+            ],
+        };
+
+        let mxfp4 = QuantSpec {
+            scheme: QuantScheme::Mxfp4E2M1E8M0,
+            logical_dtype: DType::BF16,
+            bits_per_element: 4,
+            group_size: 32,
+            channel_axis: Some(Axis(1)),
+        };
+        let contract = ModelContract {
+            alignment: 1,
+            tensors: vec![
+                TensorContract::new(
+                    "scales",
+                    Expr::src("s").transmute(TensorType {
+                        shape: vec![2, 1],
+                        encoding: Encoding::Raw(DType::E8M0),
+                    }),
+                    vec![2, 1],
+                    Encoding::Raw(DType::E8M0),
+                ),
+                TensorContract::new(
+                    "w",
+                    Expr::src("w")
+                        .transmute(TensorType {
+                            shape: vec![2, 32],
+                            encoding: Encoding::Quant(mxfp4),
+                        })
+                        .scale_per_group(Expr::out("scales"), 32, 1),
+                    vec![2, 32],
+                    Encoding::Raw(DType::BF16),
+                ),
+            ],
+            groups: Vec::new(),
+        };
+
+        let plan = crate::plan::compile(&metadata, &contract, StorageTarget::default()).unwrap();
+        let storage = execute_plan(&plan, &dir).unwrap();
+
+        let mut expected = Vec::new();
+        for row_scale in [2.0f32, 0.5] {
+            for _ in 0..16 {
+                expected
+                    .extend_from_slice(&bf16::from_f32(0.5 * row_scale).to_bits().to_le_bytes());
+                expected
+                    .extend_from_slice(&bf16::from_f32(1.0 * row_scale).to_bits().to_le_bytes());
+            }
+        }
+        assert_eq!(storage.tensors["w"], expected);
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -847,6 +1392,7 @@ mod tests {
                 shape: vec![2, 2],
                 encoding: Encoding::Raw(DType::U8),
                 alignment: 8,
+                visibility: crate::types::Visibility::Public,
             },
             TensorDecl {
                 id: TensorId(1),
@@ -854,6 +1400,7 @@ mod tests {
                 shape: vec![2, 2],
                 encoding: Encoding::Raw(DType::U16),
                 alignment: 8,
+                visibility: crate::types::Visibility::Public,
             },
         ];
         program.buffers = vec![

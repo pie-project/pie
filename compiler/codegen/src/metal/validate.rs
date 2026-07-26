@@ -9,11 +9,11 @@
 //! ([`Op`](pie_ir::op::Op) only names known tags).
 
 use crate::error::{EmitError, RegionForm, ValueLayoutSite};
-use crate::wellformed::{region_ranges_valid, value_types_valid};
+use crate::wellformed::{op_valid, region_ranges_valid, value_types_valid};
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use pie_ir::op::{OP_TABLE, VARIADIC, intrinsic_tags, tags};
+use pie_ir::op::{intrinsic_tags, tags};
 use pie_ir::types::DType;
 use pie_plan::{
     CompiledStage, Dimension, LibraryOp, PartitionKind, Region, RegionKind, RegionPartition,
@@ -210,7 +210,6 @@ fn validate_into(stage: &CompiledStage, operations: &mut Vec<M1OpMeta>) -> Resul
     let normalized = &stage.normalized;
     let value_types = &normalized.value_types;
     let names = &normalized.names;
-    let channel_bindings = &normalized.channel_bindings;
 
     if stage.signature.hash == 0
         || pie_ir::fnv1a64(&stage.signature.canonical_bytes) != stage.signature.hash
@@ -233,11 +232,6 @@ fn validate_into(stage: &CompiledStage, operations: &mut Vec<M1OpMeta>) -> Resul
         if region.nodes.len() != 1 || region.nodes[0].index() != node {
             return Err(EmitError::SingletonRegionOrderingMismatch);
         }
-        // The C++ rejects an unknown tag here; `Op` has none.
-        let spec = OP_TABLE
-            .iter()
-            .find(|spec| spec.tag == op.tag)
-            .expect("every Op tag is in OP_TABLE");
         if op.tag == tags::KERNEL_CALL {
             // The C++ indexes `value_types[args[0]]` before it has checked
             // `args[0] < result_base`; the `get` below is that read made safe.
@@ -259,33 +253,10 @@ fn validate_into(stage: &CompiledStage, operations: &mut Vec<M1OpMeta>) -> Resul
         } else if op.tag == tags::INTRINSIC_VAL && !metal_intrinsic_supported(op.intr) {
             return Err(EmitError::UnbindableIntrinsic { intrinsic: op.intr });
         }
-        let expected_arity = if op.tag == tags::PIVOT_THRESHOLD {
-            1
-        } else {
-            spec.val_operands
-        };
-        if expected_arity != VARIADIC && op.args.len() != expected_arity as usize {
-            return Err(EmitError::NormalizedOpArityMismatch);
-        }
-        if op.results != u32::from(spec.results)
-            || result_base > u32::MAX - op.results
-            || (result_base + op.results) as usize > value_types.len()
-        {
-            return Err(EmitError::NormalizedOpResultRangeInvalid);
-        }
-        if op.args.iter().any(|argument| *argument >= result_base) {
-            return Err(EmitError::NormalizedOperandNotPriorValue);
-        }
-        if op.tag == tags::PIVOT_THRESHOLD && (op.pred_tag > 2 || op.pred_payload >= result_base) {
-            return Err(EmitError::PivotPredicatePayloadOutOfRange);
-        }
-        let channel_op =
-            op.tag == tags::CHAN_TAKE || op.tag == tags::CHAN_READ || op.tag == tags::CHAN_PUT;
-        if (channel_op && (op.chan < 0 || op.chan as usize >= channel_bindings.len()))
-            || (!channel_op && op.chan >= 0)
-        {
-            return Err(EmitError::NormalizedChannelSlotInvalid);
-        }
+        // Checked per op inside this loop rather than as a pre-pass: the
+        // partial `operations` handed back on rejection records how far
+        // validation got, and hoisting these would move that point.
+        op_valid(op, result_base, stage)?;
         operations.push(M1OpMeta {
             node: node as u32,
             result_base,

@@ -25,10 +25,13 @@
 // be rewritten — `Shard(Slice(..))` and a `Slice` with the rank folded into its
 // offset are different graphs — while the plan must not move at all.
 
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <iostream>
 #include <string>
 #include <string_view>
@@ -44,6 +47,11 @@
 #include "pie_loader/source_checkpoint.hpp"
 
 #include "model/contract.hpp"
+#include "model/csm/csm_contract.hpp"
+#include "model/deepseek_v4/deepseek_v4_contract.hpp"
+#include "model/kimi/kimi_contract.hpp"
+#include "model/nemotron_h/nemotron_h_contract.hpp"
+#include "model/qwen3_5/qwen3_5_contract.hpp"
 #include "model/registry.hpp"
 
 #include "loader/load_plan.hpp"
@@ -70,10 +78,10 @@ std::string_view view_of(const pie_loader::PieLoaderBytes& b) {
 void test_a_handle_names_one_node() {
     pie_loader::ModelContract c;
     auto q = c.src("q");
-    // Naming `q` three times must build one `Src`, not three: a `cat` of three
+    // Naming `q` three times must build one `Src`, not three: a `concat` of three
     // slices of one tensor has to read that tensor once, and the compiler
     // decides that by node identity.
-    c.define("qkv", c.cat({q, q, q}, 0), pie_loader::raw(pie_loader::PieLoaderDType::BF16));
+    c.define("qkv", c.concat({q, q, q}, 0), pie_loader::raw(pie_loader::PieLoaderDType::BF16));
 
     const auto v = c.view();
     std::size_t srcs = 0;
@@ -119,9 +127,32 @@ void test_scaling_states_the_weight() {
     const auto& sc = v.tensors.ptr[1].scales;
     check(view_of(sc.of) == "w", "the scale states the weight it belongs to");
     check(sc.group_size == 128 && sc.channel_axis == 0, "the stated block size comes back");
-    check(sc.granularity == pie_loader::PieLoaderQuantGranularity::PerGroup &&
-              sc.form == pie_loader::PieLoaderScaleForm::F32Factors,
+    check(sc.granularity ==
+                  static_cast<std::uint32_t>(pie_loader::PieLoaderQuantGranularity::PerGroup) &&
+              sc.form == static_cast<std::uint32_t>(pie_loader::PieLoaderScaleForm::F32Factors),
           "the stated granularity and form come back");
+}
+
+// The one node that changes a value. The factor crosses the boundary as a bit
+// pattern, so what this checks is that `scale()` produced the bits of the float
+// it was handed and nothing reinterpreted them on the way.
+void test_scale_carries_its_factor() {
+    pie_loader::ModelContract c;
+    const float factor = 1.f / std::sqrt(2048.f);
+    c.define("router.scale", c.scale(c.src("router.scale"), factor),
+             pie_loader::raw(pie_loader::PieLoaderDType::BF16))
+        .expect({2048});
+    const auto v = c.view();
+    check(v.tensors.len == 1, "one declaration");
+    const auto& node = v.nodes.ptr[v.tensors.ptr[0].root];
+    check(node.kind == static_cast<std::uint32_t>(pie_loader::PieLoaderExprKind::Scale),
+          "the node is a Scale");
+    float round_tripped = 0.f;
+    std::memcpy(&round_tripped, &node.scale_factor_bits, sizeof(round_tripped));
+    check(round_tripped == factor, "the factor comes back bit for bit");
+    check(v.nodes.ptr[node.src].kind ==
+              static_cast<std::uint32_t>(pie_loader::PieLoaderExprKind::Src),
+          "the operand is the source it was given");
 }
 
 // The reason the builder stores names, shapes and nodes in deques. With a
@@ -153,6 +184,692 @@ void test_the_view_survives_growth() {
 
 // -- the real declaration ----------------------------------------------------
 
+/// One entry for `write_typed_checkpoint`: a name, a shape, and the safetensors
+/// dtype string the header should carry.
+struct TypedTensor {
+    std::string name;
+    std::vector<std::int64_t> shape;
+    std::string dtype;
+};
+
+/// Write a safetensors file whose tensors do *not* all share a dtype.
+///
+/// A packed-MXFP4 checkpoint is the case that needs this: the weight is `I8`
+/// and its block scales are `U8`, and a pass that reads one as the other is
+/// exactly the mistake worth pinning.
+std::filesystem::path write_typed_checkpoint(const std::string& tag,
+                                             const std::vector<TypedTensor>& tensors) {
+    const std::filesystem::path dir =
+        std::filesystem::temp_directory_path() / ("pie_contract_test_" + tag);
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+
+    nlohmann::json header = nlohmann::json::object();
+    std::uint64_t offset = 0;
+    for (const TypedTensor& t : tensors) {
+        std::uint64_t bytes =
+            (t.dtype == "F32" || t.dtype == "I32") ? 4 : (t.dtype == "BF16" ? 2 : 1);
+        for (std::int64_t extent : t.shape) bytes *= static_cast<std::uint64_t>(extent);
+        header[t.name] = {{"dtype", t.dtype},
+                          {"shape", t.shape},
+                          {"data_offsets", {offset, offset + bytes}}};
+        offset += bytes;
+    }
+    const std::string text = header.dump();
+    std::ofstream out(dir / "model.safetensors", std::ios::binary);
+    const std::uint64_t len = text.size();
+    out.write(reinterpret_cast<const char*>(&len), sizeof(len));
+    out.write(text.data(), static_cast<std::streamsize>(text.size()));
+    const std::vector<char> zeros(static_cast<std::size_t>(offset), 0);
+    out.write(zeros.data(), static_cast<std::streamsize>(zeros.size()));
+    return dir;
+}
+
+/// Write a safetensors file holding `tensors`, zero-filled.
+///
+/// The container is 8 bytes of little-endian header length, that many bytes of
+/// JSON, then the data. Small enough to write by hand, which is the point: a
+/// pass that reshards a fused tensor is checkable against a checkpoint whose
+/// only real content is its *shapes*.
+std::filesystem::path write_synthetic_checkpoint(
+    const std::string& tag,
+    const std::vector<std::pair<std::string, std::vector<std::int64_t>>>& tensors,
+    const std::string& dtype = "BF16") {
+    const std::filesystem::path dir =
+        std::filesystem::temp_directory_path() / ("pie_contract_test_" + tag);
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+
+    nlohmann::json header = nlohmann::json::object();
+    std::uint64_t offset = 0;
+    for (const auto& [name, shape] : tensors) {
+        std::uint64_t elems = dtype == "F32" ? 4 : 2;
+        for (std::int64_t extent : shape) elems *= static_cast<std::uint64_t>(extent);
+        header[name] = {{"dtype", dtype},
+                        {"shape", shape},
+                        {"data_offsets", {offset, offset + elems}}};
+        offset += elems;
+    }
+    const std::string text = header.dump();
+    std::ofstream out(dir / "model.safetensors", std::ios::binary);
+    const std::uint64_t len = text.size();
+    out.write(reinterpret_cast<const char*>(&len), sizeof(len));
+    out.write(text.data(), static_cast<std::streamsize>(text.size()));
+    const std::vector<char> zeros(static_cast<std::size_t>(offset), 0);
+    out.write(zeros.data(), static_cast<std::streamsize>(zeros.size()));
+    return dir;
+}
+
+/// True when the compiled plan declares `name` as a name for the contract's own
+/// use rather than a weight the driver will bind.
+///
+/// The declaration is still there -- the dequantizing multiply reads its dtype
+/// and shape -- so its absence from the plan is not what to check for.
+inline bool planned_internal(const pie_loader::LoadPlan& plan, std::string_view name) {
+    const auto& v = plan.view();
+    for (std::size_t i = 0; i < v.tensors.len; ++i) {
+        const auto& t = v.tensors.ptr[i];
+        if (view_of(t.name) == name) {
+            return t.visibility == pie_loader::PieLoaderVisibility::Internal;
+        }
+    }
+    return false;
+}
+
+/// DeepSeek-V4 dequantizes and stacks its routed experts in the contract.
+///
+/// The checkpoint stores each expert separately as packed MXFP4 -- an `I8`
+/// tensor of two E2M1 nibbles per byte, beside `U8` E8M0 block scales -- and
+/// the batched expert GEMM wants one dense bf16 slab per layer. That used to
+/// be a bind-time loop calling `launch_dequant_mxfp4_to_bf16` 3E times per
+/// layer into slabs outside the storage arena, leaving the packed originals
+/// resident because an arena view cannot be freed.
+///
+/// What this pins is that the algebra states it instead, and states it *under*
+/// tensor parallelism: the scale node's operand carries the shard, so each
+/// rank dequantizes only the slice it keeps, and the declared slab shapes are
+/// this rank's share rather than the whole expert.
+void test_deepseek_v4_stacks_experts_as_bf16() {
+    constexpr std::int64_t kExperts = 2;
+    constexpr std::int64_t kHidden = 64;
+    constexpr std::int64_t kInterFull = 64;
+    constexpr std::int64_t kGroup = 32;
+
+    std::vector<TypedTensor> tensors{
+        {"model.embed_tokens.weight", {16, kHidden}, "BF16"},
+        {"model.norm.weight", {kHidden}, "BF16"},
+        {"lm_head.weight", {16, kHidden}, "BF16"},
+        {"model.layers.0.ffn.gate.weight", {kExperts, kHidden}, "BF16"},
+    };
+    const std::string ffn = "model.layers.0.ffn.";
+    for (int e = 0; e < kExperts; ++e) {
+        const std::string ep = ffn + "experts." + std::to_string(e) + ".";
+        // `w1`/`w3` are `[I_full, H/2]`; `w2` is `[H, I_full/2]`. Halved
+        // because two 4-bit elements share a stored byte.
+        for (const char* gate_up : {"w1", "w3"}) {
+            tensors.push_back({ep + gate_up + ".weight", {kInterFull, kHidden / 2}, "I8"});
+            tensors.push_back({ep + gate_up + ".scale", {kInterFull, kHidden / kGroup}, "U8"});
+        }
+        tensors.push_back({ep + "w2.weight", {kHidden, kInterFull / 2}, "I8"});
+        tensors.push_back({ep + "w2.scale", {kHidden, kInterFull / kGroup}, "U8"});
+    }
+    const std::filesystem::path dir = write_typed_checkpoint("dsv4_mxfp4_experts", tensors);
+
+    std::string open_error;
+    pie_loader::Checkpoint checkpoint = pie_loader::Checkpoint::open(dir.string(), &open_error);
+    check(static_cast<bool>(checkpoint), "the synthetic checkpoint opens: " + open_error);
+    if (!checkpoint) return;
+
+    const pie_cuda_driver::model::ModelFacts facts{
+        .model_type = "deepseek_v4",
+        .quant_method = "",
+        .num_hidden_layers = 1,
+        .num_experts = kExperts,
+        .head_dim = 0,
+        .mamba_groups = 0,
+    };
+    namespace model = pie_cuda_driver::model;
+
+    for (int tp : {1, 2}) {
+        for (int rank = 0; rank < tp; ++rank) {
+            const std::int64_t inter = kInterFull / tp;
+            const std::string at =
+                " (tp " + std::to_string(tp) + " rank " + std::to_string(rank) + ")";
+
+            auto target = pie_cuda_driver::cuda_device_target();
+            target.tp_size = static_cast<std::uint32_t>(tp);
+            target.tp_rank = static_cast<std::uint32_t>(rank);
+
+            pie_loader::ModelContract contract;
+            try {
+                model::ContractBuilder builder(checkpoint, facts, target, "",
+                                               model::Mxfp4MoeRequest::Auto,
+                                               model::Component::Full, contract);
+                model::author_deepseek_v4_contract(builder);
+                builder.finish();
+                // The family answers for itself: there is no native MXFP4 GEMM
+                // to fall back from, so `Auto` is eager whatever the device
+                // reports.
+                check(builder.mxfp4_moe() == model::Mxfp4MoePolicy::EagerBf16,
+                      "Auto resolves to eager for this family" + at);
+            } catch (const std::exception& error) {
+                check(false, "authoring" + at + ": " + error.what());
+                continue;
+            }
+
+            std::map<std::string_view, std::vector<std::int64_t>> declared;
+            std::map<std::string_view, std::uint32_t> dtypes;
+            const auto v = contract.view();
+            for (std::size_t i = 0; i < v.tensors.len; ++i) {
+                const auto& t = v.tensors.ptr[i];
+                declared[view_of(t.name)] =
+                    std::vector<std::int64_t>(t.shape.ptr, t.shape.ptr + t.shape.len);
+                dtypes[view_of(t.name)] = t.encoding.dtype;
+            }
+            const auto declares = [&](const std::string& name,
+                                      const std::vector<std::int64_t>& want,
+                                      pie_loader::PieLoaderDType dtype) {
+                const auto found = declared.find(name);
+                check(found != declared.end() && found->second == want &&
+                          dtypes[name] == static_cast<std::uint32_t>(dtype),
+                      "'" + name + "' is this rank's share" + at);
+            };
+            declares(ffn + "experts.gate_up.weight", {kExperts, 2 * inter, kHidden},
+                     pie_loader::PieLoaderDType::BF16);
+            declares(ffn + "experts.down.weight", {kExperts, kHidden, inter},
+                     pie_loader::PieLoaderDType::BF16);
+            declares(ffn + "experts.gate_up.scale", {kExperts, 2 * inter, kHidden / kGroup},
+                     pie_loader::PieLoaderDType::E8M0);
+            declares(ffn + "experts.down.scale", {kExperts, kHidden, inter / kGroup},
+                     pie_loader::PieLoaderDType::E8M0);
+
+            // The packed originals are the stacks' input, not a second copy of
+            // the model: nothing should still publish them under their own
+            // names.
+            for (int e = 0; e < kExperts; ++e) {
+                const std::string ep = ffn + "experts." + std::to_string(e) + ".";
+                for (const char* part : {"w1", "w2", "w3"}) {
+                    check(declared.find(ep + part + ".weight") == declared.end(),
+                          "'" + ep + part + ".weight' was consumed by the stack" + at);
+                }
+            }
+
+            // Authoring is only half of it: the shapes above are what the
+            // contract *claims*, and only compilation checks the claim against
+            // the expression that is supposed to produce it.
+            try {
+                const pie_loader::PieLoaderContractRequest request =
+                    pie_loader::build_contract_request(checkpoint, target, v);
+                const pie_loader::LoadPlan plan = pie_loader::LoadPlan::compile(request);
+                plan.verify(request);
+                // The stacked factors are a name, not a weight: the dequantize
+                // that consumes them happens at load, so binding them would
+                // pin bytes in the persistent arena that nothing reads.
+                for (const char* half : {"gate_up", "down"}) {
+                    const std::string name = ffn + "experts." + half + ".scale";
+                    check(planned_internal(plan, name), "'" + name + "' is not bound" + at);
+                }
+            } catch (const std::exception& error) {
+                check(false, "compiling" + at + ": " + error.what());
+            }
+        }
+    }
+}
+
+/// Kimi dequantizes and stacks its routed experts in the contract.
+///
+/// The checkpoint stores each expert separately as W4A16: `I32` words of eight
+/// 4-bit codes beside `BF16` group scales, an element being `code - 8` times
+/// its factor. That is `QuantScheme::Int4B8`, and it is a different element
+/// format under the same `Scale` node MXFP4 uses.
+///
+/// Unlike DeepSeek-V4 the packed originals are *kept*: Kimi picks between the
+/// W4A16 GEMVs and the batched bf16 path per step, by token count, so both
+/// forms have to be resident. What this pins is that the stacks are additive
+/// and correctly sharded, and that nothing consumed the packed weights the
+/// other path still reads.
+void test_kimi_stacks_experts_as_bf16() {
+    constexpr std::int64_t kExperts = 2;
+    constexpr std::int64_t kHidden = 64;
+    constexpr std::int64_t kInterFull = 64;
+    constexpr std::int64_t kGroup = 32;
+    constexpr std::int64_t kCodesPerWord = 8;
+
+    const std::string prefix = "language_model.";
+    std::vector<TypedTensor> tensors{
+        {prefix + "model.embed_tokens.weight", {16, kHidden}, "BF16"},
+        {prefix + "model.norm.weight", {kHidden}, "BF16"},
+        {prefix + "lm_head.weight", {16, kHidden}, "BF16"},
+        {prefix + "model.layers.0.mlp.gate.weight", {kExperts, kHidden}, "BF16"},
+    };
+    const std::string mlp = "model.layers.0.mlp.";
+    for (int e = 0; e < kExperts; ++e) {
+        const std::string ep = prefix + mlp + "experts." + std::to_string(e) + ".";
+        for (const char* fc1 : {"gate_proj", "up_proj"}) {
+            tensors.push_back(
+                {ep + fc1 + ".weight_packed", {kInterFull, kHidden / kCodesPerWord}, "I32"});
+            tensors.push_back(
+                {ep + fc1 + ".weight_scale", {kInterFull, kHidden / kGroup}, "BF16"});
+        }
+        tensors.push_back(
+            {ep + "down_proj.weight_packed", {kHidden, kInterFull / kCodesPerWord}, "I32"});
+        tensors.push_back(
+            {ep + "down_proj.weight_scale", {kHidden, kInterFull / kGroup}, "BF16"});
+    }
+    const std::filesystem::path dir = write_typed_checkpoint("kimi_w4a16_experts", tensors);
+
+    std::string open_error;
+    pie_loader::Checkpoint checkpoint = pie_loader::Checkpoint::open(dir.string(), &open_error);
+    check(static_cast<bool>(checkpoint), "the synthetic checkpoint opens: " + open_error);
+    if (!checkpoint) return;
+
+    const pie_cuda_driver::model::ModelFacts facts{
+        .model_type = "kimi_k2",
+        .quant_method = "",
+        .num_hidden_layers = 1,
+        .num_experts = kExperts,
+        .head_dim = 0,
+        .mamba_groups = 0,
+    };
+    namespace model = pie_cuda_driver::model;
+
+    for (int tp : {1, 2}) {
+        for (int rank = 0; rank < tp; ++rank) {
+            const std::int64_t inter = kInterFull / tp;
+            const std::string at =
+                " (tp " + std::to_string(tp) + " rank " + std::to_string(rank) + ")";
+
+            auto target = pie_cuda_driver::cuda_device_target();
+            target.tp_size = static_cast<std::uint32_t>(tp);
+            target.tp_rank = static_cast<std::uint32_t>(rank);
+
+            pie_loader::ModelContract contract;
+            try {
+                model::ContractBuilder builder(checkpoint, facts, target, "",
+                                               model::Mxfp4MoeRequest::Auto,
+                                               model::Component::Full, contract);
+                model::author_kimi_contract(builder);
+                builder.finish();
+            } catch (const std::exception& error) {
+                check(false, "authoring" + at + ": " + error.what());
+                continue;
+            }
+
+            std::map<std::string_view, std::vector<std::int64_t>> declared;
+            std::map<std::string_view, std::uint32_t> dtypes;
+            const auto v = contract.view();
+            for (std::size_t i = 0; i < v.tensors.len; ++i) {
+                const auto& t = v.tensors.ptr[i];
+                declared[view_of(t.name)] =
+                    std::vector<std::int64_t>(t.shape.ptr, t.shape.ptr + t.shape.len);
+                dtypes[view_of(t.name)] = t.encoding.dtype;
+            }
+            const auto declares = [&](const std::string& name,
+                                      const std::vector<std::int64_t>& want) {
+                const auto found = declared.find(name);
+                check(found != declared.end() && found->second == want &&
+                          dtypes[name] ==
+                              static_cast<std::uint32_t>(pie_loader::PieLoaderDType::BF16),
+                      "'" + name + "' is this rank's share" + at);
+            };
+            declares(mlp + "experts.gate_up.weight", {kExperts, 2 * inter, kHidden});
+            declares(mlp + "experts.down.weight", {kExperts, kHidden, inter});
+            declares(mlp + "experts.gate_up.scale", {kExperts, 2 * inter, kHidden / kGroup});
+            declares(mlp + "experts.down.scale", {kExperts, kHidden, inter / kGroup});
+
+            // The per-step W4A16 GEMV path reads the packed weights, so the
+            // stacks are additive and must not have consumed them.
+            for (int e = 0; e < kExperts; ++e) {
+                const std::string ep = mlp + "experts." + std::to_string(e) + ".";
+                check(declared.count(ep + "gate_proj.weight_packed") == 1 &&
+                          declared.count(ep + "down_proj.weight_packed") == 1,
+                      "'" + ep + "' is still published packed" + at);
+            }
+
+            // Authoring is only half of it: the shapes above are what the
+            // contract *claims*, and only compilation checks the claim against
+            // the expression that is supposed to produce it.
+            try {
+                const pie_loader::PieLoaderContractRequest request =
+                    pie_loader::build_contract_request(checkpoint, target, v);
+                const pie_loader::LoadPlan plan = pie_loader::LoadPlan::compile(request);
+                plan.verify(request);
+                // The stacked factors are a name, not a weight: the dequantize
+                // that consumes them happens at load, so binding them would
+                // pin bytes in the persistent arena that nothing reads.
+                for (const char* half : {"gate_up", "down"}) {
+                    const std::string name = mlp + "experts." + half + ".scale";
+                    check(planned_internal(plan, name), "'" + name + "' is not bound" + at);
+                }
+            } catch (const std::exception& error) {
+                check(false, "compiling" + at + ": " + error.what());
+            }
+        }
+    }
+}
+
+/// CSM narrows the whole checkpoint to bf16, in the contract.
+///
+/// eustlb/csm-1b ships fp32 and every CSM kernel is bf16-store/fp32-compute.
+/// The bind used to allocate a bf16 copy of each weight while the fp32
+/// original stayed loaded, so peak memory was three times the bf16 model. What
+/// this pins is that the declaration alone does it -- a dtype is not an
+/// operator, so nothing but the declared encoding had to change -- and that
+/// the resulting plan compiles.
+void test_csm_narrows_fp32_weights_to_bf16() {
+    constexpr std::int64_t kHidden = 8;
+    constexpr std::int64_t kInter = 16;
+    const std::string p = "backbone_model.";
+    const std::filesystem::path dir = write_synthetic_checkpoint(
+        "csm_fp32",
+        {{"embed_text_tokens.weight", {32, kHidden}},
+         {p + "norm.weight", {kHidden}},
+         {"lm_head.weight", {32, kHidden}},
+         {p + "layers.0.input_layernorm.weight", {kHidden}},
+         {p + "layers.0.self_attn.q_proj.weight", {kHidden, kHidden}},
+         {p + "layers.0.self_attn.o_proj.weight", {kHidden, kHidden}},
+         {p + "layers.0.mlp.gate_proj.weight", {kInter, kHidden}},
+         {p + "layers.0.mlp.up_proj.weight", {kInter, kHidden}},
+         {p + "layers.0.mlp.down_proj.weight", {kHidden, kInter}}},
+        "F32");
+
+    std::string open_error;
+    pie_loader::Checkpoint checkpoint = pie_loader::Checkpoint::open(dir.string(), &open_error);
+    check(static_cast<bool>(checkpoint), "the synthetic checkpoint opens: " + open_error);
+    if (!checkpoint) return;
+
+    const pie_cuda_driver::model::ModelFacts facts{
+        .model_type = "csm",
+        .quant_method = "",
+        .num_hidden_layers = 1,
+        .num_experts = 0,
+        .head_dim = 0,
+        .mamba_groups = 0,
+    };
+    namespace model = pie_cuda_driver::model;
+
+    auto target = pie_cuda_driver::cuda_device_target();
+    target.tp_size = 1;
+    target.tp_rank = 0;
+
+    pie_loader::ModelContract contract;
+    try {
+        model::ContractBuilder builder(checkpoint, facts, target, "",
+                                       model::Mxfp4MoeRequest::RoutedDecode,
+                                       model::Component::Full, contract);
+        model::author_csm_contract(builder);
+        builder.finish();
+    } catch (const std::exception& error) {
+        check(false, std::string("authoring: ") + error.what());
+        return;
+    }
+
+    const auto v = contract.view();
+    std::size_t declared = 0;
+    for (std::size_t i = 0; i < v.tensors.len; ++i) {
+        const auto& t = v.tensors.ptr[i];
+        ++declared;
+        check(t.encoding.kind ==
+                      static_cast<std::uint32_t>(pie_loader::PieLoaderEncodingKind::Raw) &&
+                  t.encoding.dtype ==
+                      static_cast<std::uint32_t>(pie_loader::PieLoaderDType::BF16),
+              "'" + std::string(view_of(t.name)) + "' is declared bf16");
+    }
+    check(declared == 9, "every source tensor is still published");
+
+    try {
+        const pie_loader::PieLoaderContractRequest request =
+            pie_loader::build_contract_request(checkpoint, target, v);
+        const pie_loader::LoadPlan plan = pie_loader::LoadPlan::compile(request);
+        plan.verify(request);
+    } catch (const std::exception& error) {
+        check(false, std::string("compiling: ") + error.what());
+    }
+    std::filesystem::remove_all(dir);
+}
+
+/// Nemotron-H's Mamba mixer is split by the contract, on head and group
+/// boundaries.
+///
+/// The mixer's `in_proj` stacks five bands that split by different units, so a
+/// rank's share is not a row range of it -- it is the concatenation of five
+/// independently sharded bands. Bind used to build that with `cudaMemcpy2D`
+/// after the load, which meant every rank still read and kept the whole mixer.
+///
+/// What this pins is that the pass says it in the algebra and that the result
+/// compiles: the local extents are exact, `A_log` and friends follow the same
+/// head split, and `out_proj` splits by column instead of by row.
+void test_nemotron_h_mamba_splits_on_unit_boundaries() {
+    constexpr std::int64_t kHeads = 8;
+    constexpr std::int64_t kHeadDim = 4;
+    constexpr std::int64_t kGroups = 4;
+    constexpr std::int64_t kState = 2;
+    constexpr std::int64_t kHidden = 6;
+    constexpr std::int64_t kConvKernel = 4;
+    constexpr std::int64_t kIntermediate = kHeads * kHeadDim;
+    constexpr std::int64_t kGroupState = kGroups * kState;
+    constexpr std::int64_t kConvDim = kIntermediate + 2 * kGroupState;
+    constexpr std::int64_t kProjection = 2 * kIntermediate + 2 * kGroupState + kHeads;
+
+    const std::string mixer = "language_model.backbone.layers.0.mixer.";
+    const std::filesystem::path dir = write_synthetic_checkpoint(
+        "nemotron_h_mamba",
+        {{"language_model.backbone.embeddings.weight", {16, kHidden}},
+         {"language_model.backbone.norm_f.weight", {kHidden}},
+         {"language_model.lm_head.weight", {16, kHidden}},
+         {"language_model.backbone.layers.0.norm.weight", {kHidden}},
+         {mixer + "in_proj.weight", {kProjection, kHidden}},
+         {mixer + "conv1d.weight", {kConvDim, kConvKernel}},
+         {mixer + "conv1d.bias", {kConvDim}},
+         {mixer + "A_log", {kHeads}},
+         {mixer + "D", {kHeads}},
+         {mixer + "dt_bias", {kHeads}},
+         {mixer + "norm.weight", {kIntermediate}},
+         {mixer + "out_proj.weight", {kHidden, kIntermediate}}});
+
+    std::string open_error;
+    pie_loader::Checkpoint checkpoint = pie_loader::Checkpoint::open(dir.string(), &open_error);
+    check(static_cast<bool>(checkpoint), "the synthetic checkpoint opens: " + open_error);
+    if (!checkpoint) return;
+
+    const pie_cuda_driver::model::ModelFacts facts{
+        .model_type = "nemotron_h",
+        .quant_method = "",
+        .num_hidden_layers = 1,
+        .num_experts = 0,
+        .head_dim = 0,
+        .mamba_groups = static_cast<std::uint32_t>(kGroups),
+    };
+    namespace model = pie_cuda_driver::model;
+
+    for (std::uint32_t tp : {1u, 2u, 4u}) {
+        for (std::uint32_t rank = 0; rank < tp; ++rank) {
+            const std::string at =
+                " (tp " + std::to_string(tp) + " rank " + std::to_string(rank) + ")";
+            const std::int64_t local_heads = kHeads / tp;
+            const std::int64_t local_groups = kGroups / tp;
+            const std::int64_t local_intermediate = local_heads * kHeadDim;
+            const std::int64_t local_group_state = local_groups * kState;
+
+            auto target = pie_cuda_driver::cuda_device_target();
+            target.tp_size = tp;
+            target.tp_rank = rank;
+
+            pie_loader::ModelContract contract;
+            try {
+                model::ContractBuilder builder(checkpoint, facts, target, "",
+                                               model::Mxfp4MoeRequest::RoutedDecode,
+                                               model::Component::Full, contract);
+                model::author_nemotron_h_contract(builder);
+                builder.finish();
+            } catch (const std::exception& error) {
+                check(false, "authoring" + at + ": " + error.what());
+                continue;
+            }
+
+            std::map<std::string_view, std::vector<std::int64_t>> declared;
+            const auto v = contract.view();
+            for (std::size_t i = 0; i < v.tensors.len; ++i) {
+                const auto& t = v.tensors.ptr[i];
+                declared[view_of(t.name)] =
+                    std::vector<std::int64_t>(t.shape.ptr, t.shape.ptr + t.shape.len);
+            }
+            const auto shape_is = [&](const std::string& name,
+                                      const std::vector<std::int64_t>& want) {
+                const auto found = declared.find(name);
+                check(found != declared.end() && found->second == want,
+                      "'" + name + "' is this rank's share" + at);
+            };
+            shape_is(mixer + "in_proj.weight",
+                     {2 * local_intermediate + 2 * local_group_state + local_heads, kHidden});
+            shape_is(mixer + "conv1d.weight",
+                     {local_intermediate + 2 * local_group_state, kConvKernel});
+            shape_is(mixer + "conv1d.bias", {local_intermediate + 2 * local_group_state});
+            shape_is(mixer + "A_log", {local_heads});
+            shape_is(mixer + "D", {local_heads});
+            shape_is(mixer + "dt_bias", {local_heads});
+            shape_is(mixer + "norm.weight", {local_intermediate});
+            shape_is(mixer + "out_proj.weight", {kHidden, local_intermediate});
+
+            // Authoring is only half of it: the shapes above are what the
+            // contract *claims*, and only compilation checks the claim against
+            // the expression that is supposed to produce it.
+            try {
+                const pie_loader::PieLoaderContractRequest request =
+                    pie_loader::build_contract_request(checkpoint, target, v);
+                const pie_loader::LoadPlan plan = pie_loader::LoadPlan::compile(request);
+                plan.verify(request);
+            } catch (const std::exception& error) {
+                check(false, "compiling" + at + ": " + error.what());
+            }
+        }
+    }
+    std::filesystem::remove_all(dir);
+}
+
+/// Qwen3.5's Gated DeltaNet tensors are split by block, under the prefix the
+/// checkpoint actually uses.
+///
+/// `in_proj_qkv`, `conv1d.weight` and `conv1d.bias` stack `[K | K | V]` on axis
+/// 0, so a uniform row shard hands a rank part of K where it needs V -- and
+/// because none of those names is in the HF shard-axis table, the fallback is
+/// not a wrong split but no split at all, which is a rank holding the whole
+/// tensor while the kernel indexes it as its share.
+///
+/// The pass that says this went in matching `model.layers.`, and Qwen3.5 names
+/// its decoder `model.language_model.layers.`: it never fired, and nothing
+/// noticed because the only thing that could have is a test with the real
+/// names in it. Which is what this is.
+void test_qwen3_5_gdn_splits_by_block() {
+    constexpr std::int64_t kKey = 8;
+    constexpr std::int64_t kValue = 16;
+    constexpr std::int64_t kHidden = 6;
+    constexpr std::int64_t kConvKernel = 4;
+    constexpr std::int64_t kConvDim = 2 * kKey + kValue;
+
+    const std::string p = "model.language_model.";
+    const std::string la = p + "layers.0.linear_attn.";
+    const std::filesystem::path dir = write_synthetic_checkpoint(
+        "qwen3_5_gdn", {{p + "embed_tokens.weight", {16, kHidden}},
+                        {p + "norm.weight", {kHidden}},
+                        {"lm_head.weight", {16, kHidden}},
+                        {p + "layers.0.input_layernorm.weight", {kHidden}},
+                        {p + "layers.0.post_attention_layernorm.weight", {kHidden}},
+                        {p + "layers.0.mlp.gate_proj.weight", {kValue, kHidden}},
+                        {p + "layers.0.mlp.up_proj.weight", {kValue, kHidden}},
+                        {p + "layers.0.mlp.down_proj.weight", {kHidden, kValue}},
+                        {la + "in_proj_qkv.weight", {kConvDim, kHidden}},
+                        {la + "conv1d.weight", {kConvDim, kConvKernel}},
+                        {la + "conv1d.bias", {kConvDim}},
+                        {la + "in_proj_z.weight", {kValue, kHidden}},
+                        {la + "in_proj_b.weight", {kValue, kHidden}},
+                        {la + "in_proj_a.weight", {kValue, kHidden}},
+                        {la + "dt_bias", {kValue}},
+                        {la + "A_log", {kValue}},
+                        {la + "norm.weight", {kValue}},
+                        {la + "out_proj.weight", {kHidden, kValue}}});
+
+    std::string open_error;
+    pie_loader::Checkpoint checkpoint = pie_loader::Checkpoint::open(dir.string(), &open_error);
+    check(static_cast<bool>(checkpoint), "the synthetic checkpoint opens: " + open_error);
+    if (!checkpoint) return;
+
+    const pie_cuda_driver::model::ModelFacts facts{
+        .model_type = "qwen3_5",
+        .quant_method = "",
+        .num_hidden_layers = 1,
+        .num_experts = 0,
+        .head_dim = 0,
+        .mamba_groups = 0,
+    };
+    namespace model = pie_cuda_driver::model;
+
+    for (std::uint32_t tp : {1u, 2u}) {
+        for (std::uint32_t rank = 0; rank < tp; ++rank) {
+            const std::string at =
+                " (tp " + std::to_string(tp) + " rank " + std::to_string(rank) + ")";
+            const std::int64_t local = static_cast<std::int64_t>(2 * kKey / tp + kValue / tp);
+
+            auto target = pie_cuda_driver::cuda_device_target();
+            target.tp_size = tp;
+            target.tp_rank = rank;
+
+            pie_loader::ModelContract contract;
+            try {
+                model::ContractBuilder builder(checkpoint, facts, target, "",
+                                               model::Mxfp4MoeRequest::RoutedDecode,
+                                               model::Component::Full, contract);
+                model::author_qwen3_5_contract(builder);
+                builder.finish();
+            } catch (const std::exception& error) {
+                check(false, "authoring" + at + ": " + error.what());
+                continue;
+            }
+
+            std::map<std::string_view, std::vector<std::int64_t>> declared;
+            const auto v = contract.view();
+            for (std::size_t i = 0; i < v.tensors.len; ++i) {
+                const auto& t = v.tensors.ptr[i];
+                declared[view_of(t.name)] =
+                    std::vector<std::int64_t>(t.shape.ptr, t.shape.ptr + t.shape.len);
+            }
+            const auto shape_is = [&](const std::string& name,
+                                      const std::vector<std::int64_t>& want) {
+                const auto found = declared.find(name);
+                check(found != declared.end() && found->second == want,
+                      "'" + name + "' is this rank's share" + at);
+            };
+            shape_is(la + "conv1d.weight", {local, kConvKernel});
+            shape_is(la + "conv1d.bias", {local});
+            // Under `PIE_QWEN35_FUSED_GDN_PROJ` the shard is the first leg of
+            // the join rather than a tensor of its own, so assert whichever
+            // layout this process selected. Both must be this rank's share.
+            if (model::qwen35_fused_gdn_projection_enabled()) {
+                shape_is(la + "in_proj_qkvz.weight",
+                         {local + kValue / static_cast<std::int64_t>(tp), kHidden});
+            } else {
+                shape_is(la + "in_proj_qkv.weight", {local, kHidden});
+            }
+
+            // The same prefix decides whether the generic dense join fires, so
+            // a wrong one is invisible here and expensive there: bind falls
+            // back to concatenating gate/up on the device, after the load.
+            check(declared.count(p + "layers.0.mlp.gate_up_proj.fused.weight") == 1,
+                  "the dense gate/up join fired" + at);
+
+            try {
+                const pie_loader::PieLoaderContractRequest request =
+                    pie_loader::build_contract_request(checkpoint, target, v);
+                const pie_loader::LoadPlan plan = pie_loader::LoadPlan::compile(request);
+                plan.verify(request);
+            } catch (const std::exception& error) {
+                check(false, "compiling" + at + ": " + error.what());
+            }
+        }
+    }
+    std::filesystem::remove_all(dir);
+}
+
 nlohmann::json shape_to_json(const pie_loader::PieLoaderI64Slice& s) {
     nlohmann::json out = nlohmann::json::array();
     for (std::size_t i = 0; i < s.len; ++i) out.push_back(s.ptr[i]);
@@ -181,9 +898,7 @@ nlohmann::json contract_to_json(const pie_loader::PieLoaderModelContractView& v)
                          {"start", n.start},
                          {"len", n.len},
                          {"step", n.step},
-                         {"before", n.before},
-                         {"after", n.after},
-                         {"shape", shape_to_json(n.shape)},
+                         {"fill_bits", n.fill_bits},
                          {"out_shape", shape_to_json(n.out_shape)},
                          // A `Repack` carries its offsets as integers, so this
                          // is where a `tp_rank` can still be baked into a
@@ -200,7 +915,6 @@ nlohmann::json contract_to_json(const pie_loader::PieLoaderModelContractView& v)
                                      {"source_col_offset", n.repack.source_col_offset},
                                      {"source_cols", n.repack.source_cols},
                                      {"target_cols", n.repack.target_cols}}},
-                         {"quant", quant_to_json(n.quant)},
                          {"out_encoding", {{"kind", n.out_encoding.kind},
                                            {"dtype", n.out_encoding.dtype},
                                            {"quant", quant_to_json(n.out_encoding.quant)}}}});
@@ -258,7 +972,7 @@ void check_well_formed(const pie_loader::Checkpoint& checkpoint,
             check(n.src < i, "an operand precedes its use" + at);
         }
         for (std::size_t p = 0; p < n.parts.len; ++p) {
-            check(n.parts.ptr[p] < i, "every cat part precedes the cat" + at);
+            check(n.parts.ptr[p] < i, "every concat part precedes the concat" + at);
         }
         if (kind == pie_loader::PieLoaderExprKind::Src) {
             ++sources;
@@ -449,6 +1163,7 @@ void author_real_contract(const std::string& snapshot, const char* dest) {
         .num_hidden_layers = static_cast<std::uint32_t>(std::max(0, hf.num_hidden_layers)),
         .num_experts = static_cast<std::uint32_t>(std::max(0, hf.num_experts)),
         .head_dim = static_cast<std::uint32_t>(std::max(0, hf.head_dim)),
+        .mamba_groups = static_cast<std::uint32_t>(std::max(0, hf.mamba_n_groups)),
     };
 
     namespace model = pie_cuda_driver::model;
@@ -476,9 +1191,7 @@ void author_real_contract(const std::string& snapshot, const char* dest) {
             pie_loader::ModelContract contract;
             try {
                 model::ContractBuilder builder(
-                    checkpoint, facts, target, "",
-                    model::resolve_mxfp4_moe(model::Mxfp4MoeRequest::Auto,
-                                             target.native_mxfp4_moe),
+                    checkpoint, facts, target, "", model::Mxfp4MoeRequest::Auto,
                     model::Component::Full, contract);
                 arch->author_contract(builder);
                 builder.finish();
@@ -554,7 +1267,13 @@ int main() {
     test_a_handle_names_one_node();
     test_expect_states_a_shape();
     test_scaling_states_the_weight();
+    test_scale_carries_its_factor();
     test_the_view_survives_growth();
+    test_csm_narrows_fp32_weights_to_bf16();
+    test_deepseek_v4_stacks_experts_as_bf16();
+    test_kimi_stacks_experts_as_bf16();
+    test_nemotron_h_mamba_splits_on_unit_boundaries();
+    test_qwen3_5_gdn_splits_by_block();
 
     const char* snapshot = std::getenv("PIE_TEST_SNAPSHOT");
     if (snapshot != nullptr) {

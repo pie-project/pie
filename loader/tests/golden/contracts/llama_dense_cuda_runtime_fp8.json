@@ -29,7 +29,23 @@
     {
       "name": "model.layers.0.self_attn.q_proj.weight",
       "expr": {
-        "Src": "model.layers.0.self_attn.q_proj.weight"
+        "Cast": {
+          "src": {
+            "Src": "model.layers.0.self_attn.q_proj.weight"
+          },
+          "to": {
+            "Quant": {
+              "scheme": "Fp8E4M3",
+              "logical_dtype": "F8E4M3",
+              "bits_per_element": 8,
+              "group_size": 1,
+              "channel_axis": 0,
+              "scale_dtype": "F32",
+              "zero_point_dtype": null,
+              "block_shape": []
+            }
+          }
+        }
       },
       "shape": [
         256,
@@ -51,7 +67,23 @@
     {
       "name": "model.layers.0.self_attn.k_proj.weight",
       "expr": {
-        "Src": "model.layers.0.self_attn.k_proj.weight"
+        "Cast": {
+          "src": {
+            "Src": "model.layers.0.self_attn.k_proj.weight"
+          },
+          "to": {
+            "Quant": {
+              "scheme": "Fp8E4M3",
+              "logical_dtype": "F8E4M3",
+              "bits_per_element": 8,
+              "group_size": 1,
+              "channel_axis": 0,
+              "scale_dtype": "F32",
+              "zero_point_dtype": null,
+              "block_shape": []
+            }
+          }
+        }
       },
       "shape": [
         64,
@@ -73,7 +105,23 @@
     {
       "name": "model.layers.0.self_attn.v_proj.weight",
       "expr": {
-        "Src": "model.layers.0.self_attn.v_proj.weight"
+        "Cast": {
+          "src": {
+            "Src": "model.layers.0.self_attn.v_proj.weight"
+          },
+          "to": {
+            "Quant": {
+              "scheme": "Fp8E4M3",
+              "logical_dtype": "F8E4M3",
+              "bits_per_element": 8,
+              "group_size": 1,
+              "channel_axis": 0,
+              "scale_dtype": "F32",
+              "zero_point_dtype": null,
+              "block_shape": []
+            }
+          }
+        }
       },
       "shape": [
         64,
@@ -95,7 +143,23 @@
     {
       "name": "model.layers.0.self_attn.o_proj.weight",
       "expr": {
-        "Src": "model.layers.0.self_attn.o_proj.weight"
+        "Cast": {
+          "src": {
+            "Src": "model.layers.0.self_attn.o_proj.weight"
+          },
+          "to": {
+            "Quant": {
+              "scheme": "Fp8E4M3",
+              "logical_dtype": "F8E4M3",
+              "bits_per_element": 8,
+              "group_size": 1,
+              "channel_axis": 0,
+              "scale_dtype": "F32",
+              "zero_point_dtype": null,
+              "block_shape": []
+            }
+          }
+        }
       },
       "shape": [
         256,
@@ -129,7 +193,23 @@
     {
       "name": "model.layers.0.mlp.gate_proj.weight",
       "expr": {
-        "Src": "model.layers.0.mlp.gate_proj.weight"
+        "Cast": {
+          "src": {
+            "Src": "model.layers.0.mlp.gate_proj.weight"
+          },
+          "to": {
+            "Quant": {
+              "scheme": "Fp8E4M3",
+              "logical_dtype": "F8E4M3",
+              "bits_per_element": 8,
+              "group_size": 1,
+              "channel_axis": 0,
+              "scale_dtype": "F32",
+              "zero_point_dtype": null,
+              "block_shape": []
+            }
+          }
+        }
       },
       "shape": [
         704,
@@ -151,7 +231,23 @@
     {
       "name": "model.layers.0.mlp.up_proj.weight",
       "expr": {
-        "Src": "model.layers.0.mlp.up_proj.weight"
+        "Cast": {
+          "src": {
+            "Src": "model.layers.0.mlp.up_proj.weight"
+          },
+          "to": {
+            "Quant": {
+              "scheme": "Fp8E4M3",
+              "logical_dtype": "F8E4M3",
+              "bits_per_element": 8,
+              "group_size": 1,
+              "channel_axis": 0,
+              "scale_dtype": "F32",
+              "zero_point_dtype": null,
+              "block_shape": []
+            }
+          }
+        }
       },
       "shape": [
         704,
@@ -173,7 +269,23 @@
     {
       "name": "model.layers.0.mlp.down_proj.weight",
       "expr": {
-        "Src": "model.layers.0.mlp.down_proj.weight"
+        "Cast": {
+          "src": {
+            "Src": "model.layers.0.mlp.down_proj.weight"
+          },
+          "to": {
+            "Quant": {
+              "scheme": "Fp8E4M3",
+              "logical_dtype": "F8E4M3",
+              "bits_per_element": 8,
+              "group_size": 1,
+              "channel_axis": 0,
+              "scale_dtype": "F32",
+              "zero_point_dtype": null,
+              "block_shape": []
+            }
+          }
+        }
       },
       "shape": [
         256,
@@ -207,7 +319,23 @@
     {
       "name": "model.layers.1.self_attn.q_proj.weight",
       "expr": {
-        "Src": "model.layers.1.self_attn.q_proj.weight"
+        "Cast": {
+          "src": {
+            "Src": "model.layers.1.self_attn.q_proj.weight"
+          },
+          "to": {
+            "Quant": {
+              "scheme": "Fp8E4M3",
+              "logical_dtype": "F8E4M3",
+              "bits_per_element": 8,
+              "group_size": 1,
+              "channel_axis": 0,
+              "scale_dtype": "F32",
+              "zero_point_dtype": null,
+              "block_shape": []
+            }
+          }
+        }
       },
       "shape": [
         256,
@@ -229,7 +357,23 @@
     {
       "name": "model.layers.1.self_attn.k_proj.weight",
       "expr": {
-        "Src": "model.layers.1.self_attn.k_proj.weight"
+        "Cast": {
+          "src": {
+            "Src": "model.layers.1.self_attn.k_proj.weight"
+          },
+          "to": {
+            "Quant": {
+              "scheme": "Fp8E4M3",
+              "logical_dtype": "F8E4M3",
+              "bits_per_element": 8,
+              "group_size": 1,
+              "channel_axis": 0,
+              "scale_dtype": "F32",
+              "zero_point_dtype": null,
+              "block_shape": []
+            }
+          }
+        }
       },
       "shape": [
         64,
@@ -251,7 +395,23 @@
     {
       "name": "model.layers.1.self_attn.v_proj.weight",
       "expr": {
-        "Src": "model.layers.1.self_attn.v_proj.weight"
+        "Cast": {
+          "src": {
+            "Src": "model.layers.1.self_attn.v_proj.weight"
+          },
+          "to": {
+            "Quant": {
+              "scheme": "Fp8E4M3",
+              "logical_dtype": "F8E4M3",
+              "bits_per_element": 8,
+              "group_size": 1,
+              "channel_axis": 0,
+              "scale_dtype": "F32",
+              "zero_point_dtype": null,
+              "block_shape": []
+            }
+          }
+        }
       },
       "shape": [
         64,
@@ -273,7 +433,23 @@
     {
       "name": "model.layers.1.self_attn.o_proj.weight",
       "expr": {
-        "Src": "model.layers.1.self_attn.o_proj.weight"
+        "Cast": {
+          "src": {
+            "Src": "model.layers.1.self_attn.o_proj.weight"
+          },
+          "to": {
+            "Quant": {
+              "scheme": "Fp8E4M3",
+              "logical_dtype": "F8E4M3",
+              "bits_per_element": 8,
+              "group_size": 1,
+              "channel_axis": 0,
+              "scale_dtype": "F32",
+              "zero_point_dtype": null,
+              "block_shape": []
+            }
+          }
+        }
       },
       "shape": [
         256,
@@ -307,7 +483,23 @@
     {
       "name": "model.layers.1.mlp.gate_proj.weight",
       "expr": {
-        "Src": "model.layers.1.mlp.gate_proj.weight"
+        "Cast": {
+          "src": {
+            "Src": "model.layers.1.mlp.gate_proj.weight"
+          },
+          "to": {
+            "Quant": {
+              "scheme": "Fp8E4M3",
+              "logical_dtype": "F8E4M3",
+              "bits_per_element": 8,
+              "group_size": 1,
+              "channel_axis": 0,
+              "scale_dtype": "F32",
+              "zero_point_dtype": null,
+              "block_shape": []
+            }
+          }
+        }
       },
       "shape": [
         704,
@@ -329,7 +521,23 @@
     {
       "name": "model.layers.1.mlp.up_proj.weight",
       "expr": {
-        "Src": "model.layers.1.mlp.up_proj.weight"
+        "Cast": {
+          "src": {
+            "Src": "model.layers.1.mlp.up_proj.weight"
+          },
+          "to": {
+            "Quant": {
+              "scheme": "Fp8E4M3",
+              "logical_dtype": "F8E4M3",
+              "bits_per_element": 8,
+              "group_size": 1,
+              "channel_axis": 0,
+              "scale_dtype": "F32",
+              "zero_point_dtype": null,
+              "block_shape": []
+            }
+          }
+        }
       },
       "shape": [
         704,
@@ -351,7 +559,23 @@
     {
       "name": "model.layers.1.mlp.down_proj.weight",
       "expr": {
-        "Src": "model.layers.1.mlp.down_proj.weight"
+        "Cast": {
+          "src": {
+            "Src": "model.layers.1.mlp.down_proj.weight"
+          },
+          "to": {
+            "Quant": {
+              "scheme": "Fp8E4M3",
+              "logical_dtype": "F8E4M3",
+              "bits_per_element": 8,
+              "group_size": 1,
+              "channel_axis": 0,
+              "scale_dtype": "F32",
+              "zero_point_dtype": null,
+              "block_shape": []
+            }
+          }
+        }
       },
       "shape": [
         256,

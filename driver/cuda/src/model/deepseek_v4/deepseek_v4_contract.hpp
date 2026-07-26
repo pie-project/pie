@@ -35,8 +35,6 @@ inline ShardAxis dsv4_shard_axis(std::string_view name) {
     return std::nullopt;
 }
 
-}  // namespace contract_detail
-
 /// Decode the block scales that ride beside DeepSeek-V4's FP8 weights.
 ///
 /// The checkpoint stores one byte per tile of the weight, and that byte is OCP
@@ -80,7 +78,7 @@ inline void dsv4_block_scales_to_fp32(ContractBuilder& b) {
         }
         std::vector<std::int64_t> shape = contract_detail::shape_of(raw);
         auto [expr, local] = b.shard(
-            b.contract().bitcast(b.contract().src(std::string(raw.name)), shape,
+            b.contract().transmute(b.contract().src(std::string(raw.name)), shape,
                                  pie_loader::raw(PieLoaderDType::E8M0)),
             shape, b.shard_axis(raw.name));
         auto defined = b.define(b.output_name(raw.name), expr,
@@ -105,9 +103,212 @@ inline void dsv4_block_scales_to_fp32(ContractBuilder& b) {
     }
 }
 
+/// Dequantize DeepSeek-V4's routed experts and stack them, at load time.
+///
+/// The forward pass wants two dense bf16 slabs per layer -- `[E, 2I, H]` gate
+/// over up, and `[E, H, I]` down -- because a batched GEMM over experts wants
+/// one base pointer and a stride, not 3E separate tensors. The checkpoint
+/// stores the other thing: per expert, `w1`/`w2`/`w3` as packed MXFP4 (an `I8`
+/// tensor holding two E2M1 nibbles per byte) beside E8M0 block scales.
+///
+/// Both halves of the gap are sayable. `Bitcast` names the packed bytes as the
+/// quantization they are; `Concat` and `Reshape` build the slab; and
+/// `scale_per_group` multiplies each group of 32 elements by its own factor,
+/// which over a quantized operand *is* the dequantization. Sharding sits
+/// inside all of it, so each rank dequantizes only the slice it keeps.
+///
+/// The order matters: the concatenation is *inside* the scale, not outside.
+/// One scale node over the whole slab is one instruction per slab whose packed
+/// input is a temporary the memory planner can reuse; E separate scales
+/// concatenated afterwards would not typecheck, and would have kept the packed
+/// originals resident besides.
+///
+/// This ran during bind until the algebra could state it: a loop calling
+/// `launch_dequant_mxfp4_to_bf16` 3E times per layer, into slabs allocated
+/// outside the storage arena, with the packed originals left resident because
+/// every loaded weight is a view into that one arena and dropping a view
+/// reclaims nothing.
+inline void dsv4_bf16_expert_stacks(ContractBuilder& b) {
+    using contract_detail::fail;
+    using contract_detail::is_raw;
+    using contract_detail::shape_of;
+    constexpr std::int64_t kGroup = 32;
+
+    // The layer and expert counts are read off the names that are actually
+    // present rather than off the config: a `Component` build holds a slice of
+    // the checkpoint, and a config-driven loop would ask for tensors that this
+    // process was never given.
+    for (std::uint32_t layer = 0;; ++layer) {
+        const std::string ffn =
+            "model.layers." + std::to_string(layer) + ".ffn.";
+        if (b.find(b.source_name(ffn + "experts.0.w1.weight")) == nullptr) {
+            break;
+        }
+        std::vector<Node> gate_up, gate_up_scales, down, down_scales;
+        std::vector<std::uint32_t> consumed;
+        std::int64_t local_inter = 0;
+        std::int64_t hidden = 0;
+
+        for (std::uint32_t expert = 0;; ++expert) {
+            const std::string ep = ffn + "experts." + std::to_string(expert) + ".";
+            if (b.find(b.source_name(ep + "w1.weight")) == nullptr) {
+                break;
+            }
+            const SourceTensor* parts[6] = {
+                b.find(b.source_name(ep + "w1.weight")),
+                b.find(b.source_name(ep + "w1.scale")),
+                b.find(b.source_name(ep + "w3.weight")),
+                b.find(b.source_name(ep + "w3.scale")),
+                b.find(b.source_name(ep + "w2.weight")),
+                b.find(b.source_name(ep + "w2.scale")),
+            };
+            for (const SourceTensor* part : parts) {
+                if (part == nullptr) {
+                    fail("deepseek_v4 expert stack: " + ep + " is missing a weight or scale");
+                }
+            }
+            // Packed nibbles are stored as `I8`, two elements per byte. A
+            // checkpoint that stores its experts some other way is not this
+            // pass's to rewrite, and stacking it anyway would hand the GEMM
+            // garbage -- so leave the whole checkpoint alone rather than half
+            // of it, and let `author_dense_contract` publish the experts as
+            // they are.
+            if (!is_raw(parts[0]->encoding, PieLoaderDType::I8) ||
+                !is_raw(parts[4]->encoding, PieLoaderDType::I8)) {
+                return;
+            }
+
+            // `w1`/`w3` are `[I_full, H/2]` packed; `w2` is `[H, I_full/2]`.
+            // The logical shapes the transmutes declare unpack the last axis.
+            const std::vector<std::int64_t> up_raw = shape_of(*parts[0]);
+            const std::vector<std::int64_t> down_raw = shape_of(*parts[4]);
+            if (up_raw.size() != 2 || down_raw.size() != 2) {
+                fail("deepseek_v4 expert stack: " + ep + " expects rank-2 expert weights");
+            }
+            const std::int64_t inter_full = up_raw[0];
+            const std::int64_t h = up_raw[1] * 2;
+            const std::int64_t inter = b.local_extent(inter_full);
+            if (h % kGroup != 0 || inter % kGroup != 0) {
+                fail("deepseek_v4 expert stack: " + ep +
+                     " expects both expert dims to be a multiple of 32");
+            }
+            if (local_inter != 0 && (inter != local_inter || h != hidden)) {
+                fail("deepseek_v4 expert stack: " + ep + " disagrees with its siblings on shape");
+            }
+            local_inter = inter;
+            hidden = h;
+
+            // Every leg is declared rank 3 with a leading 1, so that the
+            // outer concatenation over axis 0 is a stack. `Bitcast` is what
+            // carries the rank lift: it already says "read these bytes as this
+            // shape and this type", so nothing has to reshape a packed tensor
+            // afterwards -- and reshaping one is not meaningful anyway, since
+            // the byte layout is a function of the shape it was packed for.
+            //
+            // `w1`/`w3` shard the out dim and `w2` the in dim -- the same
+            // split `dsv4_shard_axis` states, applied to the logical shapes
+            // rather than the packed ones, which is why it is spelled out
+            // here.
+            auto packed = [&](const SourceTensor& raw, std::vector<std::int64_t> shape,
+                              std::uint8_t axis) {
+                return b.shard(b.contract().transmute(
+                                   b.contract().src(std::string(raw.name)), shape,
+                                   mxfp4_encoding(b.contract(), static_cast<std::uint8_t>(2))),
+                               shape, ShardAxis{axis})
+                    .first;
+            };
+            auto factors = [&](const SourceTensor& raw, std::vector<std::int64_t> shape,
+                               std::uint8_t axis) {
+                return b.shard(b.contract().transmute(b.contract().src(std::string(raw.name)),
+                                                    shape,
+                                                    pie_loader::raw(PieLoaderDType::E8M0)),
+                               shape, ShardAxis{axis})
+                    .first;
+            };
+
+            gate_up.push_back(
+                b.contract().concat({packed(*parts[0], {1, inter_full, h}, 1),
+                                  packed(*parts[2], {1, inter_full, h}, 1)},
+                                 1));
+            gate_up_scales.push_back(
+                b.contract().concat({factors(*parts[1], {1, inter_full, h / kGroup}, 1),
+                                  factors(*parts[3], {1, inter_full, h / kGroup}, 1)},
+                                 1));
+            down.push_back(packed(*parts[4], {1, down_raw[0], inter_full}, 2));
+            down_scales.push_back(
+                factors(*parts[5], {1, down_raw[0], inter_full / kGroup}, 2));
+            for (const SourceTensor* part : parts) {
+                consumed.push_back(part->id);
+            }
+        }
+        if (gate_up.empty()) {
+            continue;
+        }
+        const auto experts = static_cast<std::int64_t>(gate_up.size());
+
+        // Named but not bound. `scale_per_group` takes its factors by output
+        // name -- a scale is a tensor the contract declared, not a companion
+        // the lowering guesses at from a suffix -- and the stacked slab is
+        // dequantized here, so no kernel ever reads these again. Left public
+        // they would sit in the persistent arena for the process's lifetime,
+        // one E8M0 byte per 32 weights, and appear in the driver's bind table
+        // under a name nothing asks for.
+        const std::string gu_scale = ffn + "experts.gate_up.scale";
+        const std::string dn_scale = ffn + "experts.down.scale";
+        if (auto gu = b.define(gu_scale, b.contract().concat(gate_up_scales, 0),
+                               pie_loader::raw(PieLoaderDType::E8M0),
+                               std::vector<std::int64_t>{experts, 2 * local_inter,
+                                                         hidden / kGroup})) {
+            gu->internal();
+        }
+        if (auto dn = b.define(dn_scale, b.contract().concat(down_scales, 0),
+                               pie_loader::raw(PieLoaderDType::E8M0),
+                               std::vector<std::int64_t>{experts, hidden,
+                                                         local_inter / kGroup})) {
+            dn->internal();
+        }
+        b.define(ffn + "experts.gate_up.weight",
+                 b.contract().scale_per_group(b.contract().concat(gate_up, 0),
+                                              b.contract().out(gu_scale), kGroup, 2),
+                 pie_loader::raw(PieLoaderDType::BF16),
+                 std::vector<std::int64_t>{experts, 2 * local_inter, hidden});
+        b.define(ffn + "experts.down.weight",
+                 b.contract().scale_per_group(b.contract().concat(down, 0),
+                                              b.contract().out(dn_scale), kGroup, 2),
+                 pie_loader::raw(PieLoaderDType::BF16),
+                 std::vector<std::int64_t>{experts, hidden, local_inter});
+        for (std::uint32_t id : consumed) {
+            b.consume(id);
+        }
+    }
+}
+
+}  // namespace contract_detail
+
+/// DeepSeek-V4.
+///
+/// The routed experts are handed to the driver one of two ways, and this
+/// contract picks which. Dequantized and stacked -- `dsv4_bf16_expert_stacks`
+/// -- is what the batched expert GEMM wants and is the default. Left packed is
+/// the fallback: the forward pass dequantizes a slice per step instead, which
+/// is correct and slow, and is worth taking only when the caller asks for it
+/// to hold memory down.
+///
+/// The device rule `resolve_mxfp4_moe` applies is not this family's rule.
+/// That rule asks whether there are native MXFP4 GEMM kernels to fall back
+/// *from*, and DeepSeek-V4 has none -- so on a device without them it would
+/// answer `RoutedDecode`, picking the per-step path on grounds that say
+/// nothing about this family. The choice here is between eager and per-step,
+/// so anything short of an explicit `RoutedDecode` takes the eager path.
 inline void author_deepseek_v4_contract(ContractBuilder& b) {
     b.shard_axis_fn(contract_detail::dsv4_shard_axis);
-    dsv4_block_scales_to_fp32(b);
+    b.decide_mxfp4_moe(b.mxfp4_moe_request() == Mxfp4MoeRequest::RoutedDecode
+                           ? Mxfp4MoePolicy::RoutedDecode
+                           : Mxfp4MoePolicy::EagerBf16);
+    if (b.mxfp4_moe() == Mxfp4MoePolicy::EagerBf16) {
+        contract_detail::dsv4_bf16_expert_stacks(b);
+    }
+    contract_detail::dsv4_block_scales_to_fp32(b);
     author_dense_contract(b);
 }
 }  // namespace pie_cuda_driver::model

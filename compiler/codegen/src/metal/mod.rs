@@ -10,13 +10,17 @@
 //! transcript of one: nothing can re-derive them, so a diff is a decision to be
 //! justified, not a comparison to be re-run.
 //!
-//! Emitters return [`Result<String, EmitError>`] and refuse rather than emit a
-//! kernel they cannot justify. Three refusals the earlier design needed have no
-//! counterpart here — an out-of-range symbolic extent role, an out-of-range
-//! dtype, and an unknown op tag — because `SymbolicExtent`, `DType` and `Op`
-//! are closed enums whose variants are exactly the legal values. A refusal that
-//! the types already make unrepresentable is dead code that reads like a live
-//! guard.
+//! Most emitters return [`Result<String, EmitError>`] and refuse rather than
+//! emit a kernel they cannot justify. The three that take no plan —
+//! [`singleton::emit_singleton_region`], [`effects::emit_grouped_readiness`]
+//! and [`effects::emit_grouped_commit`] — return a bare `String`, because their
+//! inputs are a name and a closed-enum tag and there is nothing left to refuse.
+//!
+//! Three refusals the earlier design needed have no counterpart here — an
+//! out-of-range symbolic extent role, an out-of-range dtype, and an unknown op
+//! tag — because `SymbolicExtent`, `DType` and `Op` are closed enums whose
+//! variants are exactly the legal values. A refusal that the types already make
+//! unrepresentable is dead code that reads like a live guard.
 //!
 //! [`EmitError`]: crate::error::EmitError
 //!

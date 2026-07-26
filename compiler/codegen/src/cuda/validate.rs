@@ -4,8 +4,8 @@
 //! at all, and `second_party_region_supported` names the one second-party
 //! kernel this backend launches.
 
-use crate::error::{EmitError, RegionForm};
-use crate::wellformed::{region_ranges_valid, value_types_valid};
+use crate::error::{EmitError, RegionForm, ValueLayoutSite};
+use crate::wellformed::{ops_valid, region_ranges_valid, value_types_valid};
 
 use pie_ir::op::Op;
 use pie_ir::registry::Stage;
@@ -83,6 +83,7 @@ pub fn validate_generated_region(stage: &CompiledStage, region: &Region) -> Resu
         return Err(EmitError::FusedRequiresGeneratedRegion);
     }
     value_types_valid(stage)?;
+    ops_valid(stage, ValueLayoutSite::CudaFusedStage)?;
     region_ranges_valid(stage, region, RegionForm::Fused)?;
     for &node in &region.nodes {
         let op = &stage.normalized.ops[node.index()];

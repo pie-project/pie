@@ -80,3 +80,47 @@ template <typename T>
 instantiate_dense_gemv_coop(float32, float)
 instantiate_dense_gemv_coop(float16, half)
 instantiate_dense_gemv_coop(bfloat16, bfloat)
+
+// ── Prefill variant: an explicit row pitch ───────────────────────────────────
+// `dense_gemv_coop` walks `tgpos.z` at the packed decode pitch (K in, N out),
+// which is the multi-batch layout. A prefill's scratch rows are instead a
+// uniform `row_pitch` elements apart -- the widest tensor in the layout -- for
+// EVERY tensor, so both the input and the output row share one pitch. Taking it
+// explicitly lets a whole prompt run as one dispatch (grid.z = rows) instead of
+// one per token, which is what these two projections cost most: 18 GDN layers x
+// 2 = 41% of a prefill fire's per-row dispatches.
+//
+// The arithmetic is byte-for-byte `dense_gemv_coop` -- only the row's base
+// address changes.
+template <typename T>
+[[kernel]] void dense_gemv_coop_strided(
+    const device T* w       [[buffer(0)]],   // [N, K] row-major
+    const device T* x       [[buffer(1)]],   // row t at t * row_pitch
+    device T* out           [[buffer(2)]],   // row t at t * row_pitch
+    constant uint& K        [[buffer(3)]],
+    constant uint& N        [[buffer(4)]],
+    constant int& row_pitch [[buffer(5)]],
+    uint3 tgpos   [[threadgroup_position_in_grid]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  const uint row = tgpos.y;
+  if (row >= N) return;
+  const device T* wrow = w + (uint64_t)row * K;
+  const size_t base = size_t(tgpos.z) * size_t(row_pitch);
+  x += base;
+  float acc = 0.0f;
+  for (uint k = simd_lid; k < K; k += 32) {
+    acc += float(wrow[k]) * float(x[k]);
+  }
+  acc = simd_sum(acc);
+  if (simd_lid == 0) out[base + row] = T(acc);
+}
+
+#define instantiate_dense_gemv_coop_strided(name, itype)          \
+  template [[host_name("dense_gemv_coop_strided_" #name)]]        \
+  [[kernel]] void dense_gemv_coop_strided<itype>(                 \
+      const device itype*, const device itype*, device itype*,    \
+      constant uint&, constant uint&, constant int&, uint3, uint);
+
+instantiate_dense_gemv_coop_strided(float32, float)
+instantiate_dense_gemv_coop_strided(float16, half)
+instantiate_dense_gemv_coop_strided(bfloat16, bfloat)

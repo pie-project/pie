@@ -6,6 +6,7 @@
 #include <stdexcept>
 
 #include "decode_dispatch.hpp"
+#include "decode_consts.hpp"
 #include "decode_dispatch_mb.hpp"
 #include "heap_bind.hpp"
 
@@ -58,8 +59,15 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
     auto rms = [&](int row, int rows) { rms_mb_dispatch(row, rows, n, d.grid, d.tg); };
     if (const int out = qmv_out_size(d.kind, g); out != 0) {
         d.qmm_bn = qmm_bn(out, n);
-        if (d.qmm_bn > 0)
-            qmm_t_dispatch(out, n, d.qmm_bn, d.grid, d.tg);
+        d.qmm_bm = qmm_bm(n);
+        static const bool split_off = std::getenv("PIE_METAL_NO_SPLITK") != nullptr;
+        d.qmm_split = (d.qmm_bn > 0 && !split_off)
+                          ? qmm_split_k(out, n, qmv_kn(d.kind, g).K, d.qmm_bm)
+                          : 1;
+        if (d.qmm_split > 1)
+            qmm_t_splitk_dispatch(out, n, d.qmm_bm, d.qmm_split, d.grid, d.tg);
+        else if (d.qmm_bn > 0)
+            qmm_t_dispatch(out, n, d.qmm_bn, d.qmm_bm, d.grid, d.tg);
         else
             qmv_mb_dispatch(out, n, d.grid, d.tg);
         return;
@@ -132,10 +140,14 @@ Pso mb_pso(const Dispatch& d, const DecodeStepPsos& base, const MultiBatchPsos& 
         case Kernel::KvAppendPaged: return mb.kv_append_paged;
         case Kernel::SdpaPaged: return mb.sdpa_paged;
         default: {
+            const int wide_ = d.qmm_bm == kQmmBMWide ? 1 : 0;
+            if (d.qmm_split > 1 && mb.qmm_t_splitk[wide_].valid())
+                return mb.qmm_t_splitk[wide_];
             if (d.qmm_bn > 0) {
                 const int slot = d.qmm_bn == 64 ? 2 : (d.qmm_bn == 32 ? 1 : 0);
-                const Pso& gemm =
-                    d.fuse_residual ? mb.qmm_t_residual[slot] : mb.qmm_t[slot];
+                const int wide = wide_;
+                const Pso& gemm = d.fuse_residual ? mb.qmm_t_residual[wide][slot]
+                                                  : mb.qmm_t[wide][slot];
                 if (gemm.valid()) return gemm;
             }
             return d.fuse_residual ? base.qmv_residual : base[d.kind];
@@ -415,8 +427,13 @@ void encode_prefill_dags_mb(StepEncoder& se,
         if (strided_rows > 0 && d0.kind != Kernel::QmvLmHead) {
             const int out = qmv_out_size(d0.kind, *geometry);
             if (out != 0 && out % 32 == 0) {
-                const Pso& gemm = d0.fuse_residual ? mb_psos.qmm_t_strided_residual
-                                                   : mb_psos.qmm_t_strided;
+                const bool wide = qmm_strided_bm(strided_rows) == kQmmBMWide &&
+                                  mb_psos.qmm_t_strided_wide.valid();
+                const Pso& gemm =
+                    wide ? (d0.fuse_residual ? mb_psos.qmm_t_strided_wide_residual
+                                             : mb_psos.qmm_t_strided_wide)
+                         : (d0.fuse_residual ? mb_psos.qmm_t_strided_residual
+                                             : mb_psos.qmm_t_strided);
                 if (gemm.valid()) {
                     Grid grid;
                     Threadgroup tg;
@@ -456,6 +473,16 @@ void encode_prefill_dags_mb(StepEncoder& se,
                 case Kernel::GatedRms:
                     if (d0.grid.z == 1) {
                         strided = mb_psos.gated_rms_strided;
+                        grid.z = uint32_t(n);
+                    }
+                    break;
+                case Kernel::GdnInA:
+                case Kernel::GdnInB:
+                    // grid is (32, N_out, 1): the simdgroup lane, the output row,
+                    // and -- once strided -- the prompt row.  Worth 1.4% of the
+                    // fire: 18 GDN layers x 2 is 42% of its per-row dispatches.
+                    if (d0.grid.z == 1) {
+                        strided = mb_psos.dense_gemv_strided;
                         grid.z = uint32_t(n);
                     }
                     break;

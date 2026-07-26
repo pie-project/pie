@@ -349,6 +349,12 @@ pub(crate) struct LoopPhaseAcc {
     pub post_filter_ns: AtomicU64,
     pub post_tail_ns: AtomicU64,
     pub post_drain_n: AtomicU64,
+    pub disp_frame_ns: AtomicU64,
+    pub disp_rot_ns: AtomicU64,
+    pub disp_rot_n: AtomicU64,
+    pub disp_busy_ns: AtomicU64,
+    pub disp_busy_n: AtomicU64,
+    pub disp_copy_ns: AtomicU64,
 }
 
 /// Guest-side turnaround probe: how long an inferlet lane takes between
@@ -409,6 +415,12 @@ pub(crate) static LOOP_PHASES: LoopPhaseAcc = LoopPhaseAcc {
     post_filter_ns: AtomicU64::new(0),
     post_tail_ns: AtomicU64::new(0),
     post_drain_n: AtomicU64::new(0),
+    disp_frame_ns: AtomicU64::new(0),
+    disp_rot_ns: AtomicU64::new(0),
+    disp_rot_n: AtomicU64::new(0),
+    disp_busy_ns: AtomicU64::new(0),
+    disp_busy_n: AtomicU64::new(0),
+    disp_copy_ns: AtomicU64::new(0),
 };
 
 pub(crate) fn ledger_timing_enabled() -> bool {
@@ -473,13 +485,77 @@ pub(crate) fn fire_timing_unix_us() -> u64 {
 
 /// Emit one NDJSON-compatible timing record. CUDA emits the same prefix, so a
 /// benchmark log can be split and correlated without a second transport.
+/// Messages to the fire-timing writer thread.
+enum FireTimingMsg {
+    Line(String),
+    Flush(std::sync::mpsc::Sender<()>),
+}
+
+/// Formatted records go to a dedicated writer thread instead of straight to
+/// `stderr`.
+///
+/// Writing inline took the process-wide `stderr` lock and issued one `write`
+/// syscall PER RECORD. That is harmless at a few hundred records, but the
+/// per-process lifecycle stream emits ~28 records per process, so a 512-lane
+/// cohort boundary pushed ~14k locked syscalls through a single mutex — tens
+/// of milliseconds of serialisation landing exactly on the boundary the
+/// stream exists to measure, and paid by the guest, scheduler and driver-lane
+/// threads alike. The producer now pays a channel send; ordering is preserved
+/// because a single consumer writes them.
+fn fire_timing_sink() -> &'static crossbeam::channel::Sender<FireTimingMsg> {
+    static SINK: OnceLock<crossbeam::channel::Sender<FireTimingMsg>> = OnceLock::new();
+    SINK.get_or_init(|| {
+        let (tx, rx) = crossbeam::channel::unbounded::<FireTimingMsg>();
+        std::thread::Builder::new()
+            .name("pie-fire-timing".into())
+            .spawn(move || {
+                use std::io::Write;
+                let mut out = std::io::BufWriter::with_capacity(1 << 20, std::io::stderr());
+                while let Ok(msg) = rx.recv() {
+                    match msg {
+                        FireTimingMsg::Line(line) => {
+                            let _ = out.write_all(line.as_bytes());
+                            // Flush only when the producers have gone quiet:
+                            // a burst costs one syscall, and nothing is left
+                            // sitting in the buffer once the burst ends.
+                            if rx.is_empty() {
+                                let _ = out.flush();
+                            }
+                        }
+                        FireTimingMsg::Flush(ack) => {
+                            let _ = out.flush();
+                            let _ = ack.send(());
+                        }
+                    }
+                }
+                let _ = out.flush();
+            })
+            .expect("spawning the fire-timing writer thread");
+        tx
+    })
+}
+
+/// Block until every record queued so far has reached `stderr`. Called on
+/// scheduler shutdown so a benchmark that reads the stream after the process
+/// exits sees the tail.
+pub(crate) fn fire_timing_flush() {
+    if !fire_timing_enabled() {
+        return;
+    }
+    let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+    if fire_timing_sink()
+        .send(FireTimingMsg::Flush(ack_tx))
+        .is_ok()
+    {
+        let _ = ack_rx.recv_timeout(std::time::Duration::from_secs(5));
+    }
+}
+
 pub(crate) fn fire_timing_write(record: &serde_json::Value) {
     if !fire_timing_enabled() {
         return;
     }
-    use std::io::Write;
-    let line = format!("[pie-fire-timing] {record}\n");
-    let _ = std::io::stderr().lock().write(line.as_bytes());
+    let _ = fire_timing_sink().send(FireTimingMsg::Line(format!("[pie-fire-timing] {record}\n")));
 }
 
 // =============================================================================
@@ -540,6 +616,7 @@ impl SchedulerShutdownHandle {
         // `BatchScheduler::drop` joins the worker thread and clears the
         // handle registry; dropping the Vec here shuts every driver down.
         drop(self.schedulers);
+        fire_timing_flush();
         Ok(())
     }
 }

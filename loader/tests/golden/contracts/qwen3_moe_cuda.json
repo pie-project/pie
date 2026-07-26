@@ -4,13 +4,13 @@
     {
       "name": "model.layers.0.mlp.experts.gate_up_proj",
       "expr": {
-        "Cat": {
+        "Concat": {
           "axis": 0,
           "parts": [
             {
-              "Reshape": {
+              "Transmute": {
                 "src": {
-                  "Cat": {
+                  "Concat": {
                     "axis": 0,
                     "parts": [
                       {
@@ -22,17 +22,22 @@
                     ]
                   }
                 },
-                "shape": [
-                  1,
-                  512,
-                  128
-                ]
+                "to": {
+                  "shape": [
+                    1,
+                    512,
+                    128
+                  ],
+                  "encoding": {
+                    "Raw": "BF16"
+                  }
+                }
               }
             },
             {
-              "Reshape": {
+              "Transmute": {
                 "src": {
-                  "Cat": {
+                  "Concat": {
                     "axis": 0,
                     "parts": [
                       {
@@ -44,17 +49,22 @@
                     ]
                   }
                 },
-                "shape": [
-                  1,
-                  512,
-                  128
-                ]
+                "to": {
+                  "shape": [
+                    1,
+                    512,
+                    128
+                  ],
+                  "encoding": {
+                    "Raw": "BF16"
+                  }
+                }
               }
             },
             {
-              "Reshape": {
+              "Transmute": {
                 "src": {
-                  "Cat": {
+                  "Concat": {
                     "axis": 0,
                     "parts": [
                       {
@@ -66,17 +76,22 @@
                     ]
                   }
                 },
-                "shape": [
-                  1,
-                  512,
-                  128
-                ]
+                "to": {
+                  "shape": [
+                    1,
+                    512,
+                    128
+                  ],
+                  "encoding": {
+                    "Raw": "BF16"
+                  }
+                }
               }
             },
             {
-              "Reshape": {
+              "Transmute": {
                 "src": {
-                  "Cat": {
+                  "Concat": {
                     "axis": 0,
                     "parts": [
                       {
@@ -88,11 +103,16 @@
                     ]
                   }
                 },
-                "shape": [
-                  1,
-                  512,
-                  128
-                ]
+                "to": {
+                  "shape": [
+                    1,
+                    512,
+                    128
+                  ],
+                  "encoding": {
+                    "Raw": "BF16"
+                  }
+                }
               }
             }
           ]
@@ -110,55 +130,75 @@
     {
       "name": "model.layers.0.mlp.experts.down_proj",
       "expr": {
-        "Cat": {
+        "Concat": {
           "axis": 0,
           "parts": [
             {
-              "Reshape": {
+              "Transmute": {
                 "src": {
                   "Src": "model.layers.0.mlp.experts.0.down_proj.weight"
                 },
-                "shape": [
-                  1,
-                  128,
-                  256
-                ]
+                "to": {
+                  "shape": [
+                    1,
+                    128,
+                    256
+                  ],
+                  "encoding": {
+                    "Raw": "BF16"
+                  }
+                }
               }
             },
             {
-              "Reshape": {
+              "Transmute": {
                 "src": {
                   "Src": "model.layers.0.mlp.experts.1.down_proj.weight"
                 },
-                "shape": [
-                  1,
-                  128,
-                  256
-                ]
+                "to": {
+                  "shape": [
+                    1,
+                    128,
+                    256
+                  ],
+                  "encoding": {
+                    "Raw": "BF16"
+                  }
+                }
               }
             },
             {
-              "Reshape": {
+              "Transmute": {
                 "src": {
                   "Src": "model.layers.0.mlp.experts.2.down_proj.weight"
                 },
-                "shape": [
-                  1,
-                  128,
-                  256
-                ]
+                "to": {
+                  "shape": [
+                    1,
+                    128,
+                    256
+                  ],
+                  "encoding": {
+                    "Raw": "BF16"
+                  }
+                }
               }
             },
             {
-              "Reshape": {
+              "Transmute": {
                 "src": {
                   "Src": "model.layers.0.mlp.experts.3.down_proj.weight"
                 },
-                "shape": [
-                  1,
-                  128,
-                  256
-                ]
+                "to": {
+                  "shape": [
+                    1,
+                    128,
+                    256
+                  ],
+                  "encoding": {
+                    "Raw": "BF16"
+                  }
+                }
               }
             }
           ]

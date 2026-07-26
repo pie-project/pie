@@ -118,6 +118,26 @@ static EXECUTION_SLOT_CAPACITY: OnceLock<Option<usize>> = OnceLock::new();
 pub(crate) fn execution_slot_capacity() -> Option<usize> {
     EXECUTION_SLOT_CAPACITY.get().copied().flatten()
 }
+
+/// The calling thread's OS id, for correlating timing records across threads.
+/// `libc::gettid` is Linux-only; Darwin spells it `pthread_threadid_np`.
+fn os_thread_id() -> u64 {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::gettid() as u64
+    }
+    #[cfg(target_os = "macos")]
+    unsafe {
+        let mut tid: u64 = 0;
+        libc::pthread_threadid_np(0, &mut tid);
+        tid
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        0
+    }
+}
+
 const MAX_PREWARM_PROCESSES: usize = 64;
 
 static PROCESS_COMPLETED: AtomicU64 = AtomicU64::new(0);
@@ -305,6 +325,7 @@ pub(crate) async fn ensure_bind_admitted(ctx: &mut ProcessCtx) {
 /// same order everywhere: bind, then execution — permits are only ever
 /// acquired in that order, so the two gates cannot deadlock).
 pub(crate) async fn ensure_execution_admitted(ctx: &mut ProcessCtx) {
+    let entered = Instant::now();
     ensure_bind_admitted(ctx).await;
     if ctx.execution_admitted() {
         return;
@@ -327,11 +348,13 @@ pub(crate) async fn ensure_execution_admitted(ctx: &mut ProcessCtx) {
         }
         None => None,
     };
+    let sem_done = Instant::now();
     ctx.admit_execution(permit, duration_us(started.elapsed()));
     // The planner registers at spawn (registration order is the FCFS clock),
     // but only from here on can this process hold pooled pages. Its wedge
     // predicate needs that distinction: an unadmitted process is neither
     // running nor able to free anything.
+    let note_started = Instant::now();
     if let Some(planner) = crate::planner::planner() {
         planner.note_admitted(ctx.id());
     }
@@ -343,6 +366,10 @@ pub(crate) async fn ensure_execution_admitted(ctx: &mut ProcessCtx) {
             "process_id": ctx.id(),
             "admitted_us": crate::scheduler::fire_timing_now_us(),
             "admission_wait_us": ctx.admission_wait_us(),
+            "bind_wait_us": duration_us(started.duration_since(entered)),
+            "sem_us": duration_us(sem_done.duration_since(started)),
+            "note_us": duration_us(note_started.elapsed()),
+            "tid": os_thread_id(),
         }));
     }
 }
@@ -714,6 +741,26 @@ impl Process {
                 }));
             }
             admission_wait_us = store.data().admission_wait_us();
+            // Drop the store HERE rather than at the end of this block, so
+            // the wasmtime teardown it triggers (`ProcessCtx::drop` and the
+            // instance's own memory) is visible: at a cohort boundary 512 of
+            // these run at once and the record is the only way to see them.
+            if crate::scheduler::fire_timing_enabled() {
+                let store_drop_started_us = crate::scheduler::fire_timing_now_us();
+                drop(store);
+                crate::scheduler::fire_timing_write(&serde_json::json!({
+                    "schema": 1,
+                    "source": "runtime",
+                    "event": "process_store_drop",
+                    "process_id": process_id,
+                    "started_us": store_drop_started_us,
+                    "store_drop_us":
+                        crate::scheduler::fire_timing_now_us() - store_drop_started_us,
+                    "tid": os_thread_id(),
+                }));
+            } else {
+                drop(store);
+            }
             result
         }
         .await;
@@ -734,7 +781,19 @@ impl Process {
             let _ = tx.send(result.clone());
         }
 
+        let terminate_started_us =
+            crate::scheduler::fire_timing_enabled().then(crate::scheduler::fire_timing_now_us);
         terminate(process_id, result);
+        if let Some(started_us) = terminate_started_us {
+            crate::scheduler::fire_timing_write(&serde_json::json!({
+                "schema": 1,
+                "source": "runtime",
+                "event": "process_terminate",
+                "process_id": process_id,
+                "started_us": started_us,
+                "terminate_us": crate::scheduler::fire_timing_now_us() - started_us,
+            }));
+        }
     }
 
     /// Abort the WASM execution task, notify any attached client, and unregister.

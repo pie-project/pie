@@ -98,53 +98,6 @@ ExpertRouting build_routing(
 
 }  // namespace
 
-void dsv4_materialize_bf16_expert_stacks(
-    DsV4Weights& weights,
-    const HfConfig& cfg,
-    int tp_size)
-{
-    const int T = std::max(1, tp_size);
-    const int H = cfg.hidden_size;
-    const int I = cfg.moe_intermediate_size / T;
-    const int E = cfg.num_experts;
-    if (H <= 0 || I <= 0 || E <= 0) return;
-
-    const std::size_t gu_stride = static_cast<std::size_t>(2) * I * H;
-    const std::size_t half = static_cast<std::size_t>(I) * H;
-    const std::size_t dn_stride = static_cast<std::size_t>(H) * I;
-    cudaStream_t stream = nullptr;
-
-    for (auto& Lw : weights.layers) {
-        if (Lw.experts.empty() || Lw.experts[0].w1 == nullptr) continue;
-        if (static_cast<int>(Lw.experts.size()) < E) continue;
-        if (Lw.moe_gate_up_bf16 != nullptr) continue;
-
-        Lw.moe_gate_up_bf16 = std::make_unique<DeviceTensor>(
-            DeviceTensor::allocate(DType::BF16, {E, 2 * I, H}));
-        Lw.moe_down_bf16 = std::make_unique<DeviceTensor>(
-            DeviceTensor::allocate(DType::BF16, {E, H, I}));
-        auto* gu = static_cast<std::uint16_t*>(Lw.moe_gate_up_bf16->data());
-        auto* dn = static_cast<std::uint16_t*>(Lw.moe_down_bf16->data());
-        for (int e = 0; e < E; ++e) {
-            const auto& ew = Lw.experts[static_cast<std::size_t>(e)];
-            if (!ew.w1 || !ew.w1_scale) continue;
-            kernels::launch_dequant_mxfp4_to_bf16(
-                static_cast<const std::uint8_t*>(ew.w1->data()),
-                static_cast<const std::uint8_t*>(ew.w1_scale->data()),
-                gu + static_cast<std::size_t>(e) * gu_stride, I, H, stream);
-            kernels::launch_dequant_mxfp4_to_bf16(
-                static_cast<const std::uint8_t*>(ew.w3->data()),
-                static_cast<const std::uint8_t*>(ew.w3_scale->data()),
-                gu + static_cast<std::size_t>(e) * gu_stride + half, I, H, stream);
-            kernels::launch_dequant_mxfp4_to_bf16(
-                static_cast<const std::uint8_t*>(ew.w2->data()),
-                static_cast<const std::uint8_t*>(ew.w2_scale->data()),
-                dn + static_cast<std::size_t>(e) * dn_stride, H, I, stream);
-        }
-    }
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-}
-
 DsV4Workspace DsV4Workspace::allocate(
     const HfConfig& cfg,
     int max_tokens,
@@ -1169,13 +1122,14 @@ void dsv4_forward_paged(
         // Routed expert dispatch (MXFP4 weights, dequant to bf16)
         cudaMemsetAsync(ws.moe_out.data(), 0,
                         static_cast<std::size_t>(N) * H * 2, stream);
-        if (!Lw.experts.empty() && Lw.experts[0].w1 != nullptr) {
-            // Materialise the BF16 expert stack once. Dequantising MXFP4 on
-            // every forward moves far more bytes than the GEMMs that consume
-            // it, and cuBLAS cannot read the packed form directly. The stack
-            // is built at model construction: allocating here would land in
-            // whatever allocator the forward happens to run under.
-            const bool stacked = Lw.moe_gate_up_bf16 != nullptr;
+        const bool stacked = Lw.moe_gate_up_bf16 != nullptr;
+        if (stacked || (!Lw.experts.empty() && Lw.experts[0].w1 != nullptr)) {
+            // Either the contract published dense bf16 stacks or it left the
+            // experts packed, and exactly one of the two is bound. cuBLAS
+            // cannot read the packed form, so the packed path pays a dequant
+            // of every routed expert on every layer of every step -- far more
+            // bytes than the GEMMs that consume it -- which is why the stacks
+            // are the default.
             if (stacked && ws.aligned_block_size > 0 &&
                 N <= ops::moe_gemv_max_tokens(kDsV4MoeGemvMaxTokens) &&
                 (H % 8) == 0 &&
@@ -1285,23 +1239,23 @@ void dsv4_forward_paged(
                 const auto& tok_idx = routing.token_idx[static_cast<std::size_t>(e)];
                 const int Ne = static_cast<int>(tok_idx.size());
                 if (Ne == 0) continue;
-                const auto& ew = Lw.experts[static_cast<std::size_t>(e)];
-                if (!ew.w1 || !ew.w1_scale) continue;
                 const auto& wts = routing.weights[static_cast<std::size_t>(e)];
 
                 const void* w_gate = ws.expert_gate_w.data();
                 const void* w_up   = ws.expert_up_w.data();
                 const void* w_down = ws.expert_down_w.data();
-                if (Lw.moe_gate_up_bf16 != nullptr) {
-                    auto* gu_e =
-                        static_cast<std::uint16_t*>(Lw.moe_gate_up_bf16->data()) +
+                if (stacked) {
+                    const auto* gu_e =
+                        static_cast<const std::uint16_t*>(Lw.moe_gate_up_bf16->data()) +
                         static_cast<std::size_t>(e) * 2 * local_moe_I * H;
                     w_gate = gu_e;
                     w_up   = gu_e + static_cast<std::size_t>(local_moe_I) * H;
                     w_down =
-                        static_cast<std::uint16_t*>(Lw.moe_down_bf16->data()) +
+                        static_cast<const std::uint16_t*>(Lw.moe_down_bf16->data()) +
                         static_cast<std::size_t>(e) * H * local_moe_I;
                 } else {
+                    const auto& ew = Lw.experts[static_cast<std::size_t>(e)];
+                    if (!ew.w1 || !ew.w1_scale) continue;
                     kernels::launch_dequant_mxfp4_to_bf16(
                         static_cast<const std::uint8_t*>(ew.w1->data()),
                         static_cast<const std::uint8_t*>(ew.w1_scale->data()),

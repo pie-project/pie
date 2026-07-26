@@ -18,6 +18,7 @@
 #if defined(__APPLE__)
 #include "batch_schedule.hpp"
 #include "decode_consts.hpp"
+#include "decode_dispatch_mb.hpp"
 #include "decode_psos.hpp"
 #include "decode_step.hpp"
 #include "decode_step_mb.hpp"
@@ -532,6 +533,11 @@ struct MetalExecutor::Impl {
     // requests, each with its own scan length, and the row's argument table is
     // what selects the segment -- so the length has to be per row too.
     std::vector<SlotHandle> prefill_scan_rows_{};
+    // Split-K partials, shared by every projection on that path: each is
+    // serialized behind its own reduce, so one buffer serves all of them.
+    SlotHandle splitk_partial_{};
+    std::vector<SlotHandle> splitk_split_{};
+    std::vector<SlotHandle> splitk_stride_{};
     // A slot whose conv history was last written by the prefill's ping-pong may
     // hold it in ConvStateOut; the paged decode writes in place and always
     // leaves it in ConvState, so only the handover needs a copy.
@@ -787,6 +793,10 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
             static_cast<std::int32_t>(scratch_widest_elems(g_));
     }
     prefill_scan_rows_.clear();
+    // Widest projection row x the widest batch x the largest split.
+    splitk_partial_ = ctx_->create_standalone_buffer(
+        sizeof(std::uint16_t) * std::size_t(pie::metal::kQmmSplitMaxSplits) *
+        std::size_t(kPagedMaxForwardRequests) * std::size_t(pie::metal::kQmmSplitMaxOut));
     if (!ptir_logits_copy_pso_.valid() ||
         !ptir_logits_copy_params_.valid() ||
         !ensure_ptir_logits_rows(1, &load_err)) {
@@ -1141,6 +1151,25 @@ bool MetalExecutor::Impl::bind_paged_dag(std::string* err) {
             // channels -- which saves copying every slot's whole conv slab back
             // on the host after every single token.
             alias_decode_conv_state_out(*ctx_, b_, mb_dag_);
+            // Split-K binds: the partials buffer plus this dispatch's own split
+            // count and slice stride, which depend on its shape.
+            splitk_split_.clear();
+            splitk_stride_.clear();
+            for (const Dispatch& d : mb_dag_) {
+                if (d.qmm_split <= 1 || !splitk_partial_.valid()) continue;
+                SlotHandle sp = ctx_->create_standalone_buffer(sizeof(std::int32_t));
+                SlotHandle st = ctx_->create_standalone_buffer(sizeof(std::int32_t));
+                if (!sp.valid() || !st.valid()) continue;
+                *static_cast<std::int32_t*>(sp.contents()) = d.qmm_split;
+                *static_cast<std::int32_t*>(st.contents()) =
+                    std::int32_t(qmv_out_size(d.kind, g_)) *
+                    std::int32_t(int(d.grid.y / 2u) * d.qmm_bm);
+                ctx_->arg_bind_ordinal(d.ordinal, 8, splitk_partial_);
+                ctx_->arg_bind_ordinal(d.ordinal, 9, sp);
+                ctx_->arg_bind_ordinal(d.ordinal, 10, st);
+                splitk_split_.push_back(sp);
+                splitk_stride_.push_back(st);
+            }
             prefill_scan_rows_.assign(prefill_dags_.size(), SlotHandle{});
             for (size_t t = 0; t < prefill_dags_.size(); ++t) {
                 bind_scratch(*ctx_, prefill_dags_[t], prefill_sched_, pool_.data(),
@@ -1179,6 +1208,10 @@ bool MetalExecutor::Impl::bind_paged_dag(std::string* err) {
                             ctx_->arg_bind_ordinal(d.ordinal, 4, prefill_row_stride_);
                             break;
                         case Kernel::GatedRms:
+                            ctx_->arg_bind_ordinal(d.ordinal, 5, prefill_row_stride_);
+                            break;
+                        case Kernel::GdnInA:
+                        case Kernel::GdnInB:
                             ctx_->arg_bind_ordinal(d.ordinal, 5, prefill_row_stride_);
                             break;
 
@@ -1490,9 +1523,19 @@ StepTiming MetalExecutor::Impl::step(
     return t;
 }
 
+namespace {
+// The step meter's `gap` covers everything between one forward's encode and the
+// next's, and `run_batch_step` does a lane-wide preamble before it ever reaches
+// that point.  These two marks split the gap into the caller's share
+// (`forward_batch` composing the batch) and this function's own, which is what
+// separated "the engine is late" from "the driver is busy" -- it is the driver.
+std::chrono::steady_clock::time_point g_forward_batch_t0{};
+}  // namespace
+
 bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const BatchStepInputs& in,
                                      std::string* err,
                                      const std::vector<PtirCommandCallbacks>* ptir) {
+    const auto fn_t0 = std::chrono::steady_clock::now();
     auto fail = [&](const std::string& why) {
         if (err) *err = "MetalExecutor::Impl::run_batch_step: " + why;
         return false;
@@ -1624,6 +1667,7 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
         seq_len[size_t(t)] = schedule.spans[schedule.req_of_token[size_t(t)]].seqlen;
     copy_to(IoSlot::SeqLen, seq_len);
 
+    const auto step_t0 = std::chrono::steady_clock::now();
     if (!schedule.is_pure_decode) {
         if (std::getenv("PIE_METAL_PREFILL_TRACE") == nullptr)
             return run_prefill_step(schedule, in, err, ptir);
@@ -1689,20 +1733,66 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
     });
     if (!timing.succeeded())
         return fail("Metal command timed out before its completion fence");
-    // GPU-only step meter.  This machine is permanently contended (the agent
-    // process alone runs at ~250% CPU), so wall-clock A/B swings 3x and cannot
-    // decide anything; the command buffer's own execution time can.  Bucketed by
-    // lane count, since the cost is strongly batch-dependent.
+    // Step meter.  This machine is permanently contended (the agent process
+    // alone runs at ~250% CPU), so wall-clock A/B swings 3x and cannot decide
+    // anything; the command buffer's own execution time can.  Bucketed by lane
+    // count, since the cost is strongly batch-dependent.
+    //
+    // `wall` is this function's own span, so `host` = wall - gpu - encode is the
+    // driver's per-step CPU with nothing else folded in.  It reads 0.013ms at 32
+    // lanes, which is how the search for a throughput gap was steered away from
+    // the driver and into the engine.
     if (std::getenv("PIE_METAL_GPU_METER") != nullptr) {
         static double sum[2][33] = {};
+        static double wall[33] = {};
+        static double enc[33] = {};
+        // Gap between one step returning and the next arriving: the GPU is idle
+        // for all of it, and nothing inside this driver can see it otherwise.
+        static double gap[33] = {};
+        // Bucketed, because the mean cannot tell "every step round-trips" from
+        // "only frame boundaries do".
+        static int gap_lt1[33] = {};
+        static int gap_ge1[33] = {};
+        static double gap_max[33] = {};
+        static double pre_fb[33] = {};
+        static double pre_fn[33] = {};
+        static std::chrono::steady_clock::time_point last[33] = {};
         static int n[2][33] = {};
         const int lanes = schedule.N < 33 ? schedule.N : 32;
         const int arm = ab_enabled() && ab_arm() ? 1 : 0;
         sum[arm][lanes] += timing.gpu_exec_ms;
+        const auto now_tp = std::chrono::steady_clock::now();
+        wall[lanes] += std::chrono::duration<double, std::milli>(now_tp - step_t0).count();
+        enc[lanes] += timing.encode_ms;
+        pre_fb[lanes] +=
+            std::chrono::duration<double, std::milli>(fn_t0 - g_forward_batch_t0).count();
+        pre_fn[lanes] += std::chrono::duration<double, std::milli>(step_t0 - fn_t0).count();
+        if (last[lanes].time_since_epoch().count() != 0) {
+            const double g =
+                std::chrono::duration<double, std::milli>(step_t0 - last[lanes]).count();
+            gap[lanes] += g;
+            if (g < 1.0) ++gap_lt1[lanes]; else ++gap_ge1[lanes];
+            if (g > gap_max[lanes]) gap_max[lanes] = g;
+        }
+        last[lanes] = now_tp;
         if (++n[arm][lanes] % 128 == 0) {
-            std::fprintf(stderr, "[gpu] lanes=%d A n=%d %.4f ms | B n=%d %.4f ms\n", lanes,
-                         n[0][lanes], n[0][lanes] ? sum[0][lanes] / n[0][lanes] : 0.0,
-                         n[1][lanes], n[1][lanes] ? sum[1][lanes] / n[1][lanes] : 0.0);
+            std::fprintf(stderr,
+                         "[gpu] lanes=%d A n=%d %.4f | B n=%d %.4f | wall %.4f enc %.4f "
+                         "host %.4f ms\n",
+                         lanes, n[0][lanes],
+                         n[0][lanes] ? sum[0][lanes] / n[0][lanes] : 0.0, n[1][lanes],
+                         n[1][lanes] ? sum[1][lanes] / n[1][lanes] : 0.0,
+                         wall[lanes] / (n[0][lanes] + n[1][lanes]),
+                         enc[lanes] / (n[0][lanes] + n[1][lanes]),
+                         (wall[lanes] - sum[0][lanes] - sum[1][lanes] - enc[lanes]) /
+                             (n[0][lanes] + n[1][lanes]));
+            std::fprintf(stderr,
+                         "[gap] lanes=%d mean %.4f ms  <1ms=%d  >=1ms=%d  max %.2f ms"
+                         "  | fb_pre %.4f  step_pre %.4f ms\n",
+                         lanes, gap[lanes] / (n[0][lanes] + n[1][lanes]), gap_lt1[lanes],
+                         gap_ge1[lanes], gap_max[lanes],
+                         pre_fb[lanes] / (n[0][lanes] + n[1][lanes]),
+                         pre_fn[lanes] / (n[0][lanes] + n[1][lanes]));
         }
     }
 
@@ -1766,6 +1856,11 @@ bool MetalExecutor::Impl::run_prefill_step(
     }
     // One command buffer, request-major token order.  Every complete layer DAG
     // ends in a barrier, so token t+1 observes token t's GDN and paged KV writes.
+    // Alternate the arms fire by fire so both see the same machine, exactly as
+    // the decode step does -- prefill fires are few, so without interleaving a
+    // single contended window decides the answer.
+    static bool prefill_ab_flip = false;
+    if (ab_enabled()) ab_set_arm(prefill_ab_flip = !prefill_ab_flip);
     const StepTiming timing = ctx_->run_step([&](StepEncoder& se) {
         if (ptir != nullptr) {
             for (const auto& callbacks : *ptir)
@@ -1781,6 +1876,25 @@ bool MetalExecutor::Impl::run_prefill_step(
     });
     if (!timing.succeeded())
         return fail("Metal command timed out before its completion fence");
+    // Prefill meter.  Prefill fires are few and long, so the per-row cost is what
+    // compares across arms -- a raw total confuses "faster" with "shorter prompt".
+    if (std::getenv("PIE_METAL_GPU_METER") != nullptr) {
+        static double ms[2] = {};
+        static double rows[2] = {};
+        static double enc[2] = {};
+        static int n[2] = {};
+        const int arm = ab_enabled() && ab_arm() ? 1 : 0;
+        ms[arm] += timing.gpu_exec_ms;
+        enc[arm] += timing.encode_ms;
+        rows[arm] += double(schedule.N);
+        ++n[arm];
+        std::fprintf(stderr,
+                     "[prefill] A n=%d %.2f ms %.4f ms/row | B n=%d %.2f ms %.4f ms/row"
+                     " | enc A %.2f B %.2f ms\n",
+                     n[0], n[0] ? ms[0] / n[0] : 0.0, rows[0] > 0 ? ms[0] / rows[0] : 0.0,
+                     n[1], n[1] ? ms[1] / n[1] : 0.0, rows[1] > 0 ? ms[1] / rows[1] : 0.0,
+                     n[0] ? enc[0] / n[0] : 0.0, n[1] ? enc[1] / n[1] : 0.0);
+    }
     if (golden_taps_enabled()) {
         // Every prefill token walks its own copy of the DAG, and bind_scratch lays
         // token t's row at t * (widest * sizeof(bf16)) inside each pool slot — so one
@@ -2272,6 +2386,7 @@ void MetalExecutor::forward_batch(const std::vector<MemberForwardDesc>& descs,
                                   std::vector<std::uint8_t>& success,
                                   std::vector<std::string>& errors,
                                   const std::vector<PtirCommandCallbacks>* ptir) {
+    g_forward_batch_t0 = std::chrono::steady_clock::now();
     outs.assign(descs.size(), LogitsOut{});
     success.assign(descs.size(), 0);
     errors.assign(descs.size(), std::string{});
@@ -2347,6 +2462,15 @@ bool MetalExecutor::run_paged_batch_forward(const std::vector<MemberForwardDesc>
     }
     in.attention_mask_stride =
         static_cast<std::uint32_t>(mask_stride64);
+    // The dense mask is one byte per addressable KV token per row -- 131072 bytes
+    // here -- so materializing it costs `rows * stride` of zero-fill plus the same
+    // again copying it to the IO slot. `run_batch_step` treats a non-empty
+    // `attention_mask_enabled` as "this batch is masked", so pushing a zero per
+    // token made every batch pay both, for a buffer no kernel reads: 8.4 MB of
+    // memory traffic per step at 32 lanes, growing linearly with lane count.
+    // Nothing downstream needs either vector when no member carries a mask.
+    bool any_attention_mask = false;
+    for (const auto& d : descs) any_attention_mask = any_attention_mask || d.has_attention_mask;
     struct AcceptedRequest {
         std::size_t member = 0;
         std::uint32_t local_request = 0;
@@ -2610,22 +2734,24 @@ bool MetalExecutor::run_paged_batch_forward(const std::vector<MemberForwardDesc>
                     d.has_write_desc
                         ? d.w_off[token]
                         : token_pos % pool.page_size);
-                in.attention_mask_enabled.push_back(
-                    d.has_attention_mask ? 1 : 0);
-                const std::size_t mask_base =
-                    in.attention_mask.size();
-                in.attention_mask.resize(
-                    mask_base + in.attention_mask_stride,
-                    0);
-                if (d.has_attention_mask) {
-                    const auto* source =
-                        d.attention_mask.data() +
-                        token * d.attention_mask_stride;
-                    std::copy(
-                        source,
-                        source + d.attention_mask_stride,
-                        in.attention_mask.begin() +
-                            mask_base);
+                if (any_attention_mask) {
+                    in.attention_mask_enabled.push_back(
+                        d.has_attention_mask ? 1 : 0);
+                    const std::size_t mask_base =
+                        in.attention_mask.size();
+                    in.attention_mask.resize(
+                        mask_base + in.attention_mask_stride,
+                        0);
+                    if (d.has_attention_mask) {
+                        const auto* source =
+                            d.attention_mask.data() +
+                            token * d.attention_mask_stride;
+                        std::copy(
+                            source,
+                            source + d.attention_mask_stride,
+                            in.attention_mask.begin() +
+                                mask_base);
+                    }
                 }
             }
             for (std::uint32_t sample = span.s0;

@@ -174,26 +174,26 @@ LoadedModel LoadedModel::load(
         .num_hidden_layers = static_cast<std::uint32_t>(std::max(0, e.hf_.num_hidden_layers)),
         .num_experts = static_cast<std::uint32_t>(std::max(0, e.hf_.num_experts)),
         .head_dim = static_cast<std::uint32_t>(std::max(0, e.hf_.head_dim)),
+        .mamba_groups = static_cast<std::uint32_t>(std::max(0, e.hf_.mamba_n_groups)),
     };
     pie_loader::ModelContract contract;
+    model::Mxfp4MoePolicy mxfp4_moe_policy = model::Mxfp4MoePolicy::RoutedDecode;
     {
         model::ContractBuilder builder(
             checkpoint, facts, device_target,
             model::resolve_runtime_quant(runtime_quant, fp8_native),
-            model::resolve_mxfp4_moe(mxfp4_moe, device_target.native_mxfp4_moe), component,
-            contract);
+            mxfp4_moe, component, contract);
         arch->author_contract(builder);
         builder.finish();
+        mxfp4_moe_policy = builder.mxfp4_moe();
     }
 
-    // The policy is the *author's* answer, not the plan's. It used to be read
-    // back off `plan.target`, which meant the loader had to carry a field it
-    // never decided anything with: an expert weight is MXFP4 in the plan because
-    // a contract node says so, and this is the same resolution the contract was
-    // written from.
-    e.mxfp4_moe_request_ = mxfp4_moe;
-    e.mxfp4_moe_policy_ =
-        model::resolve_mxfp4_moe(mxfp4_moe, device_target.native_mxfp4_moe);
+    // The policy is the *author's* answer, not the plan's -- and it is read
+    // back off the builder rather than recomputed, so there is one answer
+    // rather than two that have to be kept agreeing. An expert weight is MXFP4
+    // in the plan because a contract node says so, and this is the decision
+    // that node was written from.
+    e.mxfp4_moe_policy_ = mxfp4_moe_policy;
 
     LoadPlanResult planned_load = prepare_load_plan(checkpoint, contract, device_target);
     log_stage("compile LoadPlan done");

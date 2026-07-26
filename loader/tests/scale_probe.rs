@@ -52,6 +52,7 @@ fn fixture(n: u32) -> (CheckpointMetadata, ModelContract) {
                 )
             })
             .collect(),
+        groups: Vec::new(),
     };
     (metadata, contract)
 }

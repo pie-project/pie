@@ -6,13 +6,13 @@
 //! equivalent is to allocate each run as its own boxed slice, which is stable by
 //! construction and needs no growth discipline at all.
 //!
-//! [`PlanArena`] is built once, then frozen: [`PlanArena::finish`] leaks it into
+//! [`PlanArena`] is built once, then frozen: `PlanArena::finish` leaks it into
 //! a raw pointer stored in `PieLoaderPlan::owner`, and `pie_loader_release`
 //! reclaims it. Between those two points nothing mutates, so handing the plan to
 //! another thread is sound.
 
 use crate::plan::{DestExtent, Extent, LoadPlan, SourceExtent, StorageInstr};
-use crate::types::{Encoding, QuantGranularity, QuantScheme, ScaleForm};
+use crate::types::{Encoding, QuantScheme, Visibility};
 
 use super::types::*;
 
@@ -34,6 +34,17 @@ pub struct PlanArena {
     instrs: Vec<PieLoaderStorageInstrView>,
     schedule: Vec<u32>,
     attachments: Vec<PieLoaderQuantAttachmentView>,
+    groups: Vec<PieLoaderGroupView>,
+    bindings: Vec<Box<[PieLoaderSourceBindingView]>>,
+    /// Group plans, each built by [`build`] into an arena of its own.
+    ///
+    /// A nested plan cannot share this arena: the exported slices point at
+    /// *these* vectors, and a second plan's instructions would have to live in
+    /// the same one, which would make either plan's slice cover both. Owning
+    /// the children as whole plans instead costs one indirection and makes
+    /// [`release`] recursive, which is the honest shape -- a group's plan is a
+    /// plan, and it is freed like one.
+    children: Vec<*mut PieLoaderPlan>,
 }
 
 impl PlanArena {
@@ -149,6 +160,10 @@ impl PlanArena {
             ptr: self.attachments.as_ptr(),
             len: self.attachments.len(),
         };
+        let groups = PieLoaderGroupSlice {
+            ptr: self.groups.as_ptr(),
+            len: self.groups.len(),
+        };
         // Rendered here rather than driver-side so the loader stays the only
         // place that knows how to name its own instructions.
         let mut arena = self;
@@ -176,6 +191,7 @@ impl PlanArena {
             cache_key,
             summary,
             stats_json,
+            groups,
             owner,
         }))
     }
@@ -318,6 +334,9 @@ fn flatten_instr(arena: &mut PlanArena, instr: &StorageInstr) -> PieLoaderStorag
                     transform_metadata_source: transform
                         .metadata_source
                         .map_or(PIE_LOADER_NO_TENSOR, |id| id.0),
+                    transform_scale_factor_bits: transform.scale_factor_bits,
+                    transform_scale_group: transform.scale_group,
+                    transform_scale_axis: transform.scale_axis,
                 },
             )
         }
@@ -374,6 +393,10 @@ pub fn build(plan: &LoadPlan, cache_key: &str) -> *mut PieLoaderPlan {
             quant_group_size,
             shape,
             alignment: tensor.alignment,
+            visibility: match tensor.visibility {
+                Visibility::Public => PieLoaderVisibility::Public,
+                Visibility::Internal => PieLoaderVisibility::Internal,
+            },
         });
     }
 
@@ -436,16 +459,45 @@ pub fn build(plan: &LoadPlan, cache_key: &str) -> *mut PieLoaderPlan {
         arena.attachments.push(PieLoaderQuantAttachmentView {
             tensor_id: attachment.tensor.0,
             scale_tensor_id: attachment.scale_tensor.0,
-            granularity: match attachment.granularity {
-                QuantGranularity::PerChannel => PieLoaderQuantGranularity::PerChannel,
-                QuantGranularity::PerGroup => PieLoaderQuantGranularity::PerGroup,
-            },
+            granularity: PieLoaderQuantGranularity::from(attachment.granularity),
             group_size: attachment.group_size,
             channel_axis: attachment.channel_axis,
-            scale_form: match attachment.scale_form {
-                ScaleForm::RawE8M0 => PieLoaderScaleForm::RawE8M0,
-                ScaleForm::F32Factors => PieLoaderScaleForm::F32Factors,
-            },
+            scale_form: PieLoaderScaleForm::from(attachment.scale_form),
+        });
+    }
+
+    arena.groups.reserve(plan.groups.len());
+    for group in &plan.groups {
+        // Built first: `store_str` borrows `arena` mutably, and the child plan
+        // is an independent allocation either way.
+        let child = build(&group.plan, UNKEYED);
+        arena.children.push(child);
+
+        let name = arena.store_str(&group.name);
+        let per_instance = group.bindings.first().map_or(0, Vec::len);
+        let flat: Box<[PieLoaderSourceBindingView]> = group
+            .bindings
+            .iter()
+            .flatten()
+            .map(|binding| PieLoaderSourceBindingView {
+                instr_id: binding.instr.0,
+                file_id: binding.file_id.0,
+                tensor_id: binding.tensor_id.0,
+                file_offset: binding.file_offset,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let bindings = PieLoaderSourceBindingSlice {
+            ptr: flat.as_ptr(),
+            len: flat.len(),
+        };
+        arena.bindings.push(flat);
+        arena.groups.push(PieLoaderGroupView {
+            name,
+            arity: group.arity,
+            plan: child,
+            bindings,
+            bindings_per_instance: per_instance,
         });
     }
 
@@ -464,6 +516,20 @@ pub unsafe fn release(plan: *mut PieLoaderPlan) {
     let boxed = unsafe { Box::from_raw(plan) };
     if !boxed.owner.is_null() {
         drop(unsafe { Box::from_raw(boxed.owner.cast::<PlanArena>()) });
+    }
+}
+
+/// A group's plans are freed with the plan that owns them.
+///
+/// Implemented on the arena rather than in [`release`] so that the recursion
+/// happens exactly where the ownership is recorded -- a child added to
+/// `children` is reclaimed whether it was reached through `release` or through
+/// a parent arena being dropped.
+impl Drop for PlanArena {
+    fn drop(&mut self) {
+        for child in std::mem::take(&mut self.children) {
+            unsafe { release(child) };
+        }
     }
 }
 

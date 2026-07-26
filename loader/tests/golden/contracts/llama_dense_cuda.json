@@ -4,7 +4,7 @@
     {
       "name": "model.layers.0.self_attn.qkv_proj.fused.weight",
       "expr": {
-        "Cat": {
+        "Concat": {
           "axis": 0,
           "parts": [
             {
@@ -30,7 +30,7 @@
     {
       "name": "model.layers.1.self_attn.qkv_proj.fused.weight",
       "expr": {
-        "Cat": {
+        "Concat": {
           "axis": 0,
           "parts": [
             {
@@ -56,7 +56,7 @@
     {
       "name": "model.layers.0.mlp.gate_up_proj.fused.weight",
       "expr": {
-        "Cat": {
+        "Concat": {
           "axis": 0,
           "parts": [
             {
@@ -79,7 +79,7 @@
     {
       "name": "model.layers.1.mlp.gate_up_proj.fused.weight",
       "expr": {
-        "Cat": {
+        "Concat": {
           "axis": 0,
           "parts": [
             {
