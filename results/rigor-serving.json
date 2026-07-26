@@ -1,0 +1,131 @@
+{
+  "gpu": "NVIDIA A100 80GB PCIe",
+  "answers": [
+    {
+      "question_id": "q21-contention",
+      "headline": "at batch 128 with 24 busy cores, XGrammar's fill goes from 383 to 404 us (1.06x) while ours goes from 89 to 89 us (1.01x)",
+      "detail": {
+        "batch": 128,
+        "schema": 2,
+        "rows": [
+          {
+            "workers": 0,
+            "gpugrammar": {
+              "count": 50,
+              "p50": 88.79601955413818,
+              "p90": 90.43910540640354,
+              "p99": 105.08694685995579,
+              "maximum": 105.08694685995579,
+              "minimum": 87.80392818152905,
+              "mean": 89.45878595113754
+            },
+            "xgrammar": {
+              "count": 50,
+              "p50": 382.74587132036686,
+              "p90": 406.0680512338877,
+              "p99": 417.8108647465706,
+              "maximum": 417.8108647465706,
+              "minimum": 372.32600152492523,
+              "mean": 387.2971748933196
+            }
+          },
+          {
+            "workers": 8,
+            "gpugrammar": {
+              "count": 50,
+              "p50": 89.24701251089573,
+              "p90": 96.4500941336155,
+              "p99": 119.3028874695301,
+              "maximum": 119.3028874695301,
+              "minimum": 88.00416253507137,
+              "mean": 90.78712202608585
+            },
+            "xgrammar": {
+              "count": 50,
+              "p50": 429.49290946125984,
+              "p90": 450.35197399556637,
+              "p99": 453.7380300462246,
+              "maximum": 453.7380300462246,
+              "minimum": 422.60996997356415,
+              "mean": 435.0838204845786
+            }
+          },
+          {
+            "workers": 16,
+            "gpugrammar": {
+              "count": 50,
+              "p50": 89.71802890300751,
+              "p90": 98.40400889515877,
+              "p99": 130.00285252928734,
+              "maximum": 130.00285252928734,
+              "minimum": 88.43513205647469,
+              "mean": 92.68078487366438
+            },
+            "xgrammar": {
+              "count": 50,
+              "p50": 413.34214620292187,
+              "p90": 440.4739011079073,
+              "p99": 456.23304322361946,
+              "maximum": 456.23304322361946,
+              "minimum": 403.0128475278616,
+              "mean": 419.2013991996646
+            }
+          },
+          {
+            "workers": 24,
+            "gpugrammar": {
+              "count": 50,
+              "p50": 89.24701251089573,
+              "p90": 105.6380569934845,
+              "p99": 3080.889116972685,
+              "maximum": 3080.889116972685,
+              "minimum": 88.44491094350815,
+              "mean": 151.9166398793459
+            },
+            "xgrammar": {
+              "count": 50,
+              "p50": 404.3059889227152,
+              "p90": 3410.103963688016,
+              "p99": 3435.9318669885397,
+              "maximum": 3435.9318669885397,
+              "minimum": 393.24513636529446,
+              "mean": 768.2666415348649
+            }
+          }
+        ]
+      },
+      "unanswered": null
+    },
+    {
+      "question_id": "q22-capture",
+      "headline": "decode-step CUDA graph can contain the fill: gpugrammar yes, xgrammar no",
+      "detail": {
+        "gpugrammar": {
+          "captured": true,
+          "why": ""
+        },
+        "xgrammar": {
+          "captured": false,
+          "why": "Cannot copy between CPU and CUDA tensors during CUDA graph capture unless the CPU tensor is pinned. Please use tensor.pin_memory() or allocate the tensor with p"
+        },
+        "note": "A graph records device work. Host work inside the captured region simply does not go in, so a host-side fill has to be hoisted out and joined - which is the synchronisation the graph was there to remove."
+      },
+      "unanswered": null
+    },
+    {
+      "question_id": "q09-forward",
+      "headline": "captured decode step: batch 1 4886us, batch 32 6545us, batch 128 9384us, batch 512 22069us",
+      "detail": {
+        "captured_step_us": {
+          "1": 4885.814101435244,
+          "32": 6545.00677715987,
+          "128": 9384.072138927877,
+          "512": 22068.92671994865
+        },
+        "note": "Replaces the eager measurement, which was 30 ms at every batch size and was therefore timing the Python interpreter rather than the model."
+      },
+      "unanswered": null
+    }
+  ],
+  "model": "Qwen/Qwen3-0.6B"
+}

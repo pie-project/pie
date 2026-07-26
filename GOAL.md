@@ -612,31 +612,48 @@ and should not be printed beside it: XGrammar keeps an automaton on the host
 and recomputes the token mapping every step, and buying out that recomputation
 is what the memory is for.
 
-**The decisive measurement (q09).** Grammar cost as a share of one real decode
-step, Qwen3-0.6B on an A100:
+**The decisive measurement (q09), corrected.** The first attempt at this
+concluded that grammar cost is at most 5% of a decode step and that the
+performance argument was therefore dead. That was wrong, and wrong in the
+direction that flattered the host-side baseline, for a reason worth recording:
+the denominator was a HuggingFace model in eager mode, which answered 30 ms at
+*every* batch size from 1 to 512. No forward pass behaves that way. It was
+timing the Python interpreter.
 
-| batch | 1 | 32 | 128 | 512 |
+A serving engine captures the decode step as a CUDA graph precisely to delete
+that overhead. Measured that way the step is 4.9 ms at batch 1 and 22.1 ms at
+batch 512, and the picture inverts:
+
+| batch | captured step | gpugrammar | XGrammar | end-to-end |
 |---|---|---|---|---|
-| gpugrammar | 0.09% | 0.11% | 0.12% | 0.15% |
-| XGrammar | 0.07% | 0.55% | 1.41% | **4.98%** |
+| 1 | 4.9 ms | 0.5% | 0.4% | 1.00x |
+| 32 | 6.5 ms | 3.2% | 7.3% | 1.04x |
+| 128 | 9.4 ms | 4.1% | 18.2% | 1.13x |
+| 512 | 22.1 ms | 5.1% | **30.2%** | **1.24x** |
 
-This bounds the entire performance argument. Even at batch 512, deleting
-XGrammar's grammar cost *entirely* would buy 5% end-to-end; at batch 32 it
-would buy 0.55%. A 15x per-step win lands on 4.8% of a step, and the
-withdrawn vLLM throughput claim was noise for exactly this reason - the signal
-was smaller than the run-to-run variance.
+On the schema that stresses each engine most, XGrammar reaches 52.7% of a
+decode step at batch 512 and the end-to-end gain is 1.37x. This is a whole-
+system result, not a microbenchmark ratio.
 
-It is also the most favourable case that could be measured. A 0.6B model has
-the fastest forward pass available here; a 7B or 70B makes the step slower and
-the grammar share correspondingly smaller.
+**The fill cannot be captured (q22).** This is the structural finding and it is
+binary rather than a matter of microseconds. A CUDA graph records device work;
+host work inside the captured region does not go in at all. Attempting to
+capture XGrammar's fill produces an empty graph - PyTorch says so - and replay
+then reproduces whatever the host buffer happened to hold. Our fill captures
+and replays bit-identically.
 
-The conclusion is uncomfortable and has to be stated plainly: **constrained
-decoding overhead is not a bottleneck worth a paper.** A system that eliminates
-it cannot be sold on throughput. What remains defensible is what the same
-measurements did show - that the mask is sound in a way nobody has demonstrated
-before, that properties can arrive in any order without giving up `required`,
-and that the cost of getting there is a compiler 5x slower and a megabyte of
-device memory per schema.
+A serving engine that captures its decode step therefore cannot put a host-side
+mask inside it. The fill has to be hoisted out and joined to the graph, which
+reinstates the synchronisation the graph existed to remove, and forecloses
+running several decode steps - speculative drafts, multi-step scheduling -
+without returning to the host between them. That is what device residency buys,
+and no amount of optimising a host-side fill can buy it.
+
+**Host contention (q21).** Weaker than expected and worth saying so. With
+twenty-four cores deliberately saturated, XGrammar's fill slows by 1.06x and
+ours by 1.01x; both engines' p99 degrades to about 3 ms, which is the operating
+system rather than either design. Contention is not the argument. Capturability
+is.
 
 **Still unanswered.** End-to-end serving with error bars (q08), whether XGrammar can be made to accept
 any property order (q06), non-JSON grammars (q07), speculative decoding in a
