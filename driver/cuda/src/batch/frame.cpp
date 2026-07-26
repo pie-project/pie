@@ -1,6 +1,8 @@
 #include "batch/frame.hpp"
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
@@ -60,6 +62,120 @@ struct MtpDraftPlan {
     std::size_t total_drafts = 0;
     std::uint32_t vocab = 0;
 };
+
+// A published TP fire COMMITS this rank to posting the matching collectives:
+// the follower consumes the epoch the moment it is notified and immediately
+// posts its receives. If the publisher throws before broadcasting, the frame
+// fails but the process keeps serving, and those orphaned receives would pair
+// with the NEXT fire's sends at different sizes — permanent collective
+// misalignment. Fail the TP group instead: unrecoverable either way, but loud
+// and bounded rather than a hang or silent corruption.
+struct TpFireCommit {
+    const std::string* key = nullptr;
+    bool completed = false;
+    ~TpFireCommit() {
+        if (key == nullptr || completed) return;
+        std::cerr << "[pie-driver-cuda] TP fire published but not broadcast; "
+                     "stopping the TP group\n";
+        pie_cuda_driver::tp_cpu_gate_request_stop(*key);
+    }
+};
+
+// Probe lever for the k>1 TP hang: the device-composed path leaves the HOST
+// CSRs as a 1-page placeholder (only `enqueue_fixed_decode` can consume that
+// form), but a TP follower builds its OWN attention plan from exactly those
+// host views, published through the mailbox.
+// Bounded TP fire pipeline.
+//
+// Rank 0 may NOT run arbitrarily far ahead of the follower: `pi.*` and the
+// NCCL communicator are one shared set, and with `PIE_FRAME_SIZE` > 1 a frame's
+// steps are enqueued back to back with no rendezvous, so rank 0 would post fire
+// N+1's payload group while the follower is still inside fire N's forward on
+// that same communicator. That deadlocked the pair (the follower's decode
+// attention kernel never retired).
+//
+// Debug lever, disabled by default. Before posting fire N's collectives, wait
+// for fire N-D to have retired; D=0 means no bound. This existed to work around
+// a TP hang at `PIE_FRAME_SIZE` > 1 that turned out to be the follower skipping
+// the attention plan-staging protocol — fixed there instead. Retained because
+// forcing D=1 collapses a whole class of cross-rank overlap bug into a clean
+// yes/no answer, which is how that one was isolated.
+int tp_fire_runahead_depth() {
+    static const int depth = [] {
+        if (const char* v = std::getenv("PIE_TP_RUNAHEAD_DEPTH")) {
+            const int parsed = std::atoi(v);
+            if (parsed >= 0 && parsed <= 8) return parsed;
+        }
+        // Depth 1 (one TP fire in flight on the device).
+        //
+        // The follower's missing attention plan-staging slot was ONE cause of
+        // the k>1 TP deadlock and is fixed at its source, but it was not the
+        // only one: with bind-time projection packing enabled the hang comes
+        // back at k=1 and k=2 (and not at k=4), which is the signature of a
+        // second overlap hazard that packing's different timing exposes. Until
+        // that one is found too, keep the bound.
+        //
+        // Cost measured at 1.9% (39,182 vs 39,941 tok/s at 448-wide, k=4),
+        // small because rank 0 is the rank with slack — the follower is
+        // reactive and already waits inside the payload broadcast.
+        return 1;
+    }();
+    return depth;
+}
+
+// Two halves: WAIT before this fire's collectives are posted, RECORD after its
+// forward has been enqueued. Waiting on the event `depth` fires back means rank
+// 0 stays `depth` fires ahead of retirement — enqueue still overlaps execution
+// — while the number of TP fires concurrently in flight stays bounded.
+namespace tp_runahead {
+
+constexpr int kMaxDepth = 8;
+
+struct Ring {
+    std::array<cudaEvent_t, kMaxDepth> ev{};
+    std::array<bool, kMaxDepth> armed{};
+    std::uint64_t next = 0;
+};
+
+Ring& ring() {
+    static thread_local Ring r;
+    return r;
+}
+
+void wait_for_slot() {
+    const int depth = tp_fire_runahead_depth();
+    if (depth <= 0) return;
+    Ring& r = ring();
+    const std::size_t slot = static_cast<std::size_t>(r.next % depth);
+    if (r.armed[slot]) {
+        CUDA_CHECK(cudaEventSynchronize(r.ev[slot]));
+        r.armed[slot] = false;
+    }
+}
+
+void record_slot(cudaStream_t stream) {
+    const int depth = tp_fire_runahead_depth();
+    if (depth <= 0) return;
+    Ring& r = ring();
+    const std::size_t slot = static_cast<std::size_t>(r.next % depth);
+    if (r.ev[slot] == nullptr) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&r.ev[slot],
+                                            cudaEventDisableTiming));
+    }
+    CUDA_CHECK(cudaEventRecord(r.ev[slot], stream));
+    r.armed[slot] = true;
+    ++r.next;
+}
+
+}  // namespace tp_runahead
+
+bool tp_device_compose_disabled() {
+    static const bool off = [] {
+        const char* v = std::getenv("PIE_TP_DISABLE_DEVICE_COMPOSE");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return off;
+}
 
 MtpDraftPlan preflight_mtp_draft_logits(
     BatchEngine& engine,
@@ -284,14 +400,24 @@ void enqueue_mtp_draft_logits(
                 pipeline::mtp_global_history_tokens(
                     position, draft, prefix_global);
             if (engine.tp_comm != nullptr) {
-                tp_cpu_gate_notify(engine.tp_cpu_gate_key);
+                // Same commit rule as `enqueue_step`: publishing wakes the
+                // follower, which immediately posts four broadcasts. A throw
+                // in between (both NCCL_CHECK forms throw) would orphan them
+                // and permanently misalign the group.
+                TpFireCommit mtp_commit;
+                tp_publish_mtp(
+                    engine.tp_cpu_gate_key, 1,
+                    static_cast<int>(draft), max_global_tokens);
+                mtp_commit.key = &engine.tp_cpu_gate_key;
                 tp_broadcast_mtp_step(
                     *engine.tp_comm,
                     engine.inputs,
+                    engine.tp_cpu_gate_key,
                     1,
                     static_cast<int>(draft),
                     max_global_tokens,
                     stream);
+                mtp_commit.completed = true;
             }
             engine.system_drafter.draft_step(
                 engine.ws,
@@ -539,6 +665,9 @@ struct PreparedStep::Impl {
     bool has_attention_stages = false;
     bool has_decode_envelopes = false;
     bool use_fixed_decode = false;
+    // Set once the host-side envelope page upper bound has replaced the
+    // placeholder CSR. TP requires it to size follower broadcasts.
+    bool envelope_bounds_applied = false;
     pipeline::FixedDecodeDeviceBuffers fixed_buffers{};
     pipeline::DecodeEnvelopeDeviceBuffers envelope_buffers{};
     bool compact_logits = false;
@@ -766,6 +895,16 @@ void prepare_step(
     // nothing and use the wire geometry unchanged.
     if (!view.ptir_program_hashes.empty()) {
         std::string dg_err;
+        // Device composition is orthogonal to tensor parallelism. The
+        // composed CSRs are broadcast to followers from the DEVICE buffers
+        // (so followers see the kernel-written values), while the host-side
+        // extents that size those broadcasts come from
+        // `envelope_plan_page_bounds` below — a static upper bound taken
+        // from the envelope's declared page channel, not from the 1-page
+        // placeholder geometry. Gating composition on `tp_comm == nullptr`
+        // pushed every all-envelope decode step onto the generic readback
+        // fallback, which cannot resolve chained values host-side and so
+        // failed readiness forever.
         s.dg_resolved = engine.dispatch->resolve_descriptors(
             view,
             static_cast<std::uint32_t>(kv_cache.page_size()),
@@ -776,7 +915,7 @@ void prepare_step(
             s.staged.get(),
             engine.graph_cache != nullptr &&
                 engine.forward_fn.graph_safe &&
-                engine.tp_comm == nullptr);
+                !(engine.tp_comm != nullptr && tp_device_compose_disabled()));
         if (!s.dg_resolved && !dg_err.empty()) {
             throw std::runtime_error(dg_err);
         }
@@ -1678,6 +1817,17 @@ void prepare_step(
             static_cast<std::size_t>(s.fR_real), page);
         s.h_kvpp_forward = s.plan_kv_page_indptr.data();
         s.h_kvlpl_forward = s.plan_kv_last_lens.data();
+        s.envelope_bounds_applied = true;
+    }
+    // Under TP the bound above is what sizes the KV-index broadcast. Without
+    // it `h_kvpp_forward` still holds the 1-page placeholder, so followers
+    // would silently receive truncated page indices and diverge from rank 0.
+    // Fail the step instead of producing wrong logits on the followers.
+    if (engine.tp_comm != nullptr && s.has_decode_envelopes &&
+        !s.envelope_bounds_applied) {
+        throw std::runtime_error(
+            "tp: decode-envelope step has no host-side KV page bound to "
+            "size the follower broadcast");
     }
 
     // Apply the graph-lattice padding decided above. Padded COPIES of the
@@ -1740,9 +1890,69 @@ void prepare_step(
     // already covers this one — mark the hook skippable.
     if (previous != nullptr) {
         s.skip_plan = plan_inputs_identical(s, *previous->impl());
+        if (std::getenv("PIE_DISABLE_SKIP_PLAN")) s.skip_plan = false;
     }
+
     if (dbg_fire) s.timing.prepare_end = fire_timing::Clock::now();
 }
+
+// Sub-phase timers for the enqueue half of the critical path
+// (PIE_STEP_PROFILE=1). `enqueue_step` measured 753 us per fire, the largest
+// host phase; this says which part of it.
+namespace {
+
+struct EnqProfile {
+    enum Phase { kUploads = 0, kCompose, kAttnPlan, kForward, kOther,
+                 kPhaseCount };
+    std::array<std::uint64_t, kPhaseCount> ns{};
+    std::array<std::uint64_t, kPhaseCount> hits{};
+    static bool enabled() {
+        static const bool on = [] {
+            const char* v = std::getenv("PIE_STEP_PROFILE");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
+        return on;
+    }
+    static EnqProfile& instance() { static EnqProfile p; return p; }
+    ~EnqProfile() {
+        if (!enabled()) return;
+        static const char* names[kPhaseCount] = {
+            "enq.uploads", "enq.compose", "enq.attn_plan", "enq.forward",
+            "enq.other"};
+        for (int i = 0; i < kPhaseCount; ++i) {
+            if (hits[i] == 0) continue;
+            std::cerr << "[step-profile] " << names[i]
+                      << " calls=" << hits[i]
+                      << " avg_us="
+                      << (static_cast<double>(ns[i]) / 1e3 / hits[i]) << "\n";
+        }
+    }
+};
+
+class EnqTimer {
+  public:
+    explicit EnqTimer(EnqProfile::Phase p)
+        : phase_(p), on_(EnqProfile::enabled()) {
+        if (on_) start_ = std::chrono::steady_clock::now();
+    }
+    ~EnqTimer() { stop(); }
+    void stop() {
+        if (!on_ || stopped_) return;
+        stopped_ = true;
+        auto& p = EnqProfile::instance();
+        p.ns[phase_] += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - start_).count());
+        ++p.hits[phase_];
+    }
+  private:
+    EnqProfile::Phase phase_;
+    bool on_;
+    bool stopped_ = false;
+    std::chrono::steady_clock::time_point start_;
+};
+
+}  // namespace
 
 void enqueue_step(BatchEngine& engine, PreparedStep& step) {
     PreparedStep::Impl& s = *step.impl();
@@ -1758,6 +1968,49 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
     // now, before every later phase (attention hooks, Epilogue, settle).
     engine.dispatch->update_launch_geometry(
         *s.staged, s.dispatch_view, s.program_token_starts);
+
+    // Wake the follower FIRST, before this rank's uploads, compose and payload
+    // broadcast, so it gets that window as a head start. Rank 0 pre-enqueues
+    // its whole step and its forward starts ~17 us after the payload broadcast
+    // lands; the follower is reactive and was starting 588 us later, which
+    // rank 0 paid back as a 583 us stall inside the step's FIRST all-reduce.
+    //
+    // Not any earlier: publishing at the end of `prepare_step` measured WORSE
+    // (median 36.6k versus 44.9k tok/s). The follower then posts its payload
+    // receive long before rank 0's data is ready and the receive kernel sits
+    // spinning on the follower's GPU with its forward queued behind it.
+    TpFireCommit tp_commit;  // see the struct: publish commits us to broadcast
+
+    if (engine.tp_comm != nullptr && !s.empty_step) {
+        const int tp_kv_indices_count = s.rs_is_fold
+            ? 0
+            : static_cast<int>(s.h_kvpp_forward[s.forward_R]);
+        tp_publish_fire(
+            engine.tp_cpu_gate_key,
+            pie_cuda_driver::TpFirePlanViews{
+                .qo_indptr = s.h_qo_forward,
+                .kv_page_indptr = s.rs_is_fold ? nullptr : s.h_kvpp_forward,
+                .kv_last_page_lens =
+                    s.rs_is_fold ? nullptr : s.h_kvlpl_forward,
+                .kv_page_indices = s.rs_is_fold ? nullptr : s.h_kvpi_forward,
+                .kv_page_indices_len = s.rs_is_fold
+                    ? 0
+                    : static_cast<std::size_t>(tp_kv_indices_count),
+            },
+            s.forward_N, s.forward_R, s.is_pure_decode,
+            tp_kv_indices_count,
+            engine.required_kv_pages,
+            s.rs_is_fold ? 0 : s.mask_bytes,
+            s.rs_is_fold ? 0 : s.mask_indptr_count,
+            /*has_slot_ids=*/s.use_slots,
+            !s.rs_is_fold && s.has_write_desc,
+            s.compact_logits ? s.num_sampling : 0,
+            s.structured_window_left,
+            s.rs_plan.mode,
+            static_cast<int>(s.rs_fold_len_view.size()),
+            static_cast<int>(s.rs_buf_id_view.size()));
+        tp_commit.key = &engine.tp_cpu_gate_key;
+    }
     if (s.empty_step) {
         if (dbg_fire) {
             s.timing.begin_breakdown = s.staged->begin_breakdown();
@@ -1768,6 +2021,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
     }
 
     // Parameter-block commits, in the original per-fire order.
+    EnqTimer uploads_timer(EnqProfile::kUploads);
     if (s.wire_refill) {
         pi.tokens.commit_staged(s.up_tokens);
         pi.positions.commit_staged(s.up_positions);
@@ -1827,6 +2081,9 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             static_cast<std::size_t>(s.fN_real),
             cublas.stream()));
     }
+    uploads_timer.stop();
+    std::optional<EnqTimer> forward_timer;
+    EnqTimer compose_timer(EnqProfile::kCompose);
     if (s.has_decode_envelopes) {
         std::string compose_error;
         const bool enqueued = s.use_fixed_decode
@@ -1861,15 +2118,26 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             cublas.stream());
     }
 
-    // TP fan-out. Rank 0 broadcasts the per-fire payload (header +
-    // refilled persistent_inputs) to every follower; the all-reduces
-    // inside `forward_fn.body` then synchronise the ranks layer-by-layer.
+    // TP payload fan-out. The header and planner views were already published
+    // and the follower woken at the top of this function (see `tp_publish_fire`);
+    // this only puts the device payload on the wire.
     if (engine.tp_comm != nullptr) {
-        tp_cpu_gate_notify(engine.tp_cpu_gate_key);
         const int tp_kv_indices_count = s.rs_is_fold
             ? 0
             : static_cast<int>(s.h_kvpp_forward[s.forward_R]);
+        const pie_cuda_driver::TpFirePlanViews tp_views{
+            .qo_indptr = s.h_qo_forward,
+            .kv_page_indptr = s.rs_is_fold ? nullptr : s.h_kvpp_forward,
+            .kv_last_page_lens = s.rs_is_fold ? nullptr : s.h_kvlpl_forward,
+            .kv_page_indices = s.rs_is_fold ? nullptr : s.h_kvpi_forward,
+            .kv_page_indices_len = s.rs_is_fold
+                ? 0
+                : static_cast<std::size_t>(tp_kv_indices_count),
+        };
+        tp_runahead::wait_for_slot();
         tp_broadcast_inputs(*engine.tp_comm, pi,
+                            engine.tp_cpu_gate_key,
+                            tp_views,
                             s.forward_N, s.forward_R, s.is_pure_decode,
                             tp_kv_indices_count,
                             engine.required_kv_pages,
@@ -1883,6 +2151,26 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
                             static_cast<int>(s.rs_fold_len_view.size()),
                             static_cast<int>(s.rs_buf_id_view.size()),
                             /*stream=*/nullptr);
+        tp_commit.completed = true;
+        pie_cuda_driver::tp_watchdog_mark_phase(2);
+        // One TP fire in flight on the device at a time.
+        //
+        // The persistent input buffers (`pi.*`) and the NCCL communicator are
+        // a SINGLE set shared by every fire. With `PIE_FRAME_SIZE` > 1 a frame
+        // holds several steps and `launch` enqueues them back to back with no
+        // rendezvous between them, so rank 0 would post fire N+1's payload
+        // group while the follower is still executing fire N's forward — whose
+        // all-reduces run on that same communicator and read those same
+        // buffers. That overlap deadlocked the pair: the follower's decode
+        // attention kernel never retired and rank 0 parked in the all-reduce
+        // behind it (reproducible at 512-wide, k >= 2; a blocking sync on
+        // EITHER rank made it disappear, which is what identified it as a
+        // race rather than a mismatch).
+        //
+        // Cost is nil in practice: rank 0 is the rank with slack (the follower
+        // is reactive and already waits inside the payload broadcast), and the
+        // wait is once per fire, not per step.
+
     }
 
     // ── attention-plan hook ─────────────────────────────────────────
@@ -1894,6 +2182,8 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
     // identical to the frame's previous step skips the hook — the
     // workspace already holds the identical plan.
     if (!s.rs_is_fold && !s.skip_plan) {
+        compose_timer.stop();
+        EnqTimer plan_timer(EnqProfile::kAttnPlan);
         engine.attn_ws.begin_plan_update();
         engine.forward_fn.invoke_prepare(
             engine.attn_ws,
@@ -1918,6 +2208,8 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
                 .runtime_window_left = s.structured_window_left,
             });
         engine.attn_ws.end_plan_update(cublas.stream());
+        plan_timer.stop();
+        forward_timer.emplace(EnqProfile::kForward);
     }
     if (dbg_fire) s.timing.h2d_end = fire_timing::Clock::now();
 
@@ -2046,6 +2338,12 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
     if (!s.rs_is_fold) {
         enqueue_mtp_draft_logits(engine, s.mtp_plan);
     }
+    // Close this fire's slot in the bounded TP pipeline: everything this fire
+    // puts on the communicator and the shared `pi.*` buffers is now enqueued,
+    // so a later fire may reuse the slot once this event retires.
+    if (engine.tp_comm != nullptr && !s.empty_step) {
+        tp_runahead::record_slot(cublas.stream());
+    }
 }
 
 void settle_step(
@@ -2059,6 +2357,7 @@ void settle_step(
     const pipeline::DispatchStats stats_before = dbg_fire
         ? engine.dispatch->stats()
         : pipeline::DispatchStats{};
+    EnqTimer settle_finish_timer(EnqProfile::kOther);
     if (s.settle_plain) {
         engine.dispatch->finish(
             *s.staged, s.dispatch_view, nullptr, 0,

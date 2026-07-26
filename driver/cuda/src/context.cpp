@@ -5,6 +5,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <nvtx3/nvToolsExt.h>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
@@ -44,6 +45,7 @@
 #include "kernels/kv_paged.hpp"
 #include "store/kv_cache.hpp"
 #include "store/elastic.hpp"
+#include "kernels/custom_all_reduce.hpp"
 #include "store/mla_cache.hpp"
 #include "store/dsa_cache.hpp"
 #include "model/deepseek_v4/deepseek_v4_forward.hpp"
@@ -383,8 +385,30 @@ class Context::Impl {
             cudaStreamDestroy(media_stream_);
             media_stream_ = nullptr;
         }
+        // Detach the custom all-reduce before anything is torn down: it and
+        // the communicator are separate owned values, and nothing should be
+        // able to dispatch through a dangling pointer in between.
+        if (tp_comm_ != nullptr) {
+            tp_comm_->set_custom_all_reduce(nullptr);
+            tp_custom_ar_ = nullptr;
+        }
+        // Host-side group shutdown, issued before anything blocking. Both TP
+        // ranks live in this process and share the gate (keyed by the NCCL
+        // unique id), so whichever Context is destroyed first releases the
+        // follower. Without this the follower stays parked in the gate's
+        // condition variable — `tp_follower_stop_` is a plain atomic and
+        // never wakes it — and the join below deadlocks whenever rank 1 is
+        // destroyed before rank 0.
+        if (tp_size_ > 1) {
+            pie_cuda_driver::tp_cpu_gate_request_stop(tp_cpu_gate_key_);
+        }
         try {
-            if (tp_comm_ != nullptr && tp_size_ > 1 && tp_rank_ == 0) {
+            // With the gate on, an idle follower is always parked on the gate
+            // and has already been released above. The NCCL sentinel is only
+            // needed when the gate is off, where the follower instead parks
+            // inside `ncclBroadcast`.
+            if (tp_comm_ != nullptr && tp_size_ > 1 && tp_rank_ == 0 &&
+                tp_cpu_gate_key_.empty()) {
                 pie_cuda_driver::tp_send_shutdown(*tp_comm_, tp_cpu_gate_key_);
             }
         } catch (const std::exception& e) {
@@ -402,6 +426,12 @@ class Context::Impl {
             if (it->ptr != nullptr && it->deleter != nullptr) it->deleter(it->ptr);
         }
     }
+
+    // Bind the calling thread to this rank's device. CUDA's current device is
+    // thread-local and the runtime calls in from threads this Context never
+    // created, so every entry point re-binds. A thread-local store in the CUDA
+    // runtime, negligible next to the work each call does.
+    void bind_device() const { cudaSetDevice(device_ordinal_); }
 
     int initialize(const std::string& config_path, const PieRuntimeCallbacks& runtime);
     void fill_device_facts(PieDriverCaps* caps) const {
@@ -542,6 +572,9 @@ class Context::Impl {
     std::size_t elastic_safety_floor_bytes_ = 0;
     pie_cuda_driver::ops::RuntimeQuantContext runtime_quant_context_;
     pie_cuda_driver::NcclComm* tp_comm_ = nullptr;
+    pie_cuda_driver::CustomAllReduce* tp_custom_ar_ = nullptr;
+    // CUDA device ordinal of every rank in the TP group, indexed by rank.
+    std::vector<int> tp_group_devices_;
     std::string caps_json_;
     std::string device_facts_json_;
     std::size_t kv_proportional_peak_required_pages_ = 0;
@@ -559,6 +592,28 @@ class Context::Impl {
     std::atomic<bool> tp_follower_stop_{false};
     std::thread tp_follower_thread_;
     std::vector<std::unique_ptr<PendingAsyncResources>> pending_async_resources_;
+
+    // All TP ranks live in this process, but each Context only knows its own
+    // device from its config, so the group's device ordinals are exchanged
+    // over the communicator that is already up by this point. Indexed by rank.
+    std::vector<int> gather_tp_group_devices() {
+        std::vector<std::int32_t> all(
+            static_cast<std::size_t>(tp_size_), 0);
+        const std::int32_t self = device_ordinal_;
+        tp_comm_->all_gather_host_bytes(&self, all.data(), sizeof(self));
+        return std::vector<int>(all.begin(), all.end());
+    }
+
+    std::vector<int> tp_peer_devices() const {
+        std::vector<int> peers;
+        for (int rank = 0; rank < tp_size_; ++rank) {
+            if (rank == tp_rank_) continue;
+            if (static_cast<std::size_t>(rank) >= tp_group_devices_.size()) break;
+            peers.push_back(tp_group_devices_[static_cast<std::size_t>(rank)]);
+        }
+        return peers;
+    }
+
 };
 
 int Context::Impl::initialize(
@@ -863,6 +918,14 @@ int Context::Impl::load_model(
         device_ordinal_,
         elastic_budget,
         cuda_vmm_handle_bytes());
+    if (tp_comm_ != nullptr && tp_size_ > 1) {
+        // Publish the TP peers before any arena grows. The custom P2P
+        // all-reduce reads a peer rank's activations straight out of its
+        // workspace arena, and VMM pages are private to the owning device
+        // unless the peer is in the mapping's access list.
+        tp_group_devices_ = gather_tp_group_devices();
+        elastic_pool_->set_peer_devices(tp_peer_devices());
+    }
     kv_allocator_ = std::make_shared<CudaArenaAllocator>(
         elastic_pool_, "kv", false);
     state_allocator_ = std::make_shared<CudaArenaAllocator>(
@@ -1422,6 +1485,72 @@ int Context::Impl::load_model(
     const bool has_usable_mtp_logits =
         has_mtp_logits && static_cast<bool>(executor_p->system_drafter);
 
+    // Custom P2P all-reduce. The per-layer attn-O / MLP-down reductions are
+    // small enough that NCCL is launch-latency bound; the NVLink kernel is
+    // several times faster in that regime. Attaching it here lets
+    // `NcclComm::all_reduce_bf16*` pick it up transparently, with NCCL still
+    // serving anything the kernel declines.
+    if (tp_comm_ != nullptr && tp_size_ > 1) {
+        // Everything below issues collectives on `tp_comm_`, so the ranks have
+        // to agree BEFORE any of them are posted. A rank that gave up midway
+        // would leave the group with mismatched collective counts, and the
+        // "did it work?" exchange would itself be the mismatched call — the
+        // group would hang instead of falling back. So the vote is taken on
+        // purely local information first, and once it passes, a failure is
+        // fatal rather than silently recoverable.
+        workspace_allocator_->ensure_all();
+        tp_startup_cpu_barrier(cfg);
+
+        const char* disabled =
+            std::getenv("PIE_CUDA_DISABLE_CUSTOM_ALL_REDUCE");
+        const std::vector<void*> workspace_bases =
+            workspace_allocator_->arena_bases();
+        struct CustomArVote {
+            std::uint8_t wanted;
+            std::uint32_t arenas;
+        };
+        const CustomArVote local{
+            static_cast<std::uint8_t>(
+                (disabled == nullptr || std::strcmp(disabled, "1") != 0) &&
+                        !tp_group_devices_.empty() && !workspace_bases.empty()
+                    ? 1
+                    : 0),
+            static_cast<std::uint32_t>(workspace_bases.size())};
+        std::vector<CustomArVote> votes(
+            static_cast<std::size_t>(tp_size_), CustomArVote{});
+        tp_comm_->all_gather_host_bytes(&local, votes.data(), sizeof(local));
+        const bool unanimous = std::all_of(
+            votes.begin(), votes.end(), [&](const CustomArVote& vote) {
+                // The registration loop posts one collective per arena, so the
+                // arena counts must agree too.
+                return vote.wanted != 0 && vote.arenas == local.arenas;
+            });
+
+        if (unanimous) {
+            auto* car = own_emplace<pie_cuda_driver::CustomAllReduce>(
+                *tp_comm_,
+                /*same_process=*/true,
+                tp_group_devices_,
+                /*max_bytes=*/8ull * 1024 * 1024,
+                /*rank_data_bytes=*/8ull * 1024 * 1024,
+                /*fusion_max_tokens=*/max_workspace_tokens,
+                /*fusion_hidden=*/engine.hf_config().hidden_size);
+            for (void* base : workspace_bases) {
+                car->register_buffer(*tp_comm_, base, 0);
+            }
+            tp_comm_->set_custom_all_reduce(car);
+            tp_custom_ar_ = car;
+            if (verbose) {
+                std::cerr << "[pie-driver-cuda] custom all-reduce enabled "
+                          << "(rank " << tp_rank_ << "/" << tp_size_
+                          << ", NCCL handles the rest)\n";
+            }
+        } else if (verbose) {
+            std::cerr << "[pie-driver-cuda] custom all-reduce off for rank "
+                      << tp_rank_ << ", using NCCL\n";
+        }
+    }
+
     tp_startup_cpu_barrier(cfg);
     // Upfront lattice capture for EVERY topology (V6 iteration 53). Lazy
     // first-use capture pays ~10 ms of capture+instantiate INSIDE
@@ -1450,6 +1579,17 @@ int Context::Impl::load_model(
     if (is_tp_follower()) {
         tp_follower_stop_.store(false);
         tp_follower_thread_ = std::thread([this, verbose]() {
+            // CUDA's current device is thread-local state, and this thread
+            // starts on the process default. Without binding it to this
+            // rank's device the follower runs its forward kernels against
+            // device 0 while dereferencing this rank's pointers.
+            const cudaError_t bind = cudaSetDevice(device_ordinal_);
+            if (bind != cudaSuccess) {
+                std::cerr << "[pie-driver-cuda] tp follower rank " << tp_rank_
+                          << ": cudaSetDevice(" << device_ordinal_
+                          << ") failed: " << cudaGetErrorString(bind) << "\n";
+                return;
+            }
             if (verbose) {
                 std::cerr << "[pie-driver-cuda] tp follower rank "
                          << tp_rank_
@@ -1729,6 +1869,73 @@ int Context::Impl::validate_finalized_launch(
 // order as one closed system. The tail step carries the frame completion:
 // settle host callbacks are stream-ordered, so the tail's notify implies
 // every step's terminals are latched.
+// Host-phase profiler for the launch critical path (PIE_STEP_PROFILE=1).
+//
+// The submitting thread is the pipeline's critical path: profiling showed the
+// GPU sits idle ~850 us between one wave's `k_settle_host_channels_batch` and
+// the next wave's `k_pull_validate_host_channels`, and that this thread is
+// COMPUTING (not blocked) for 94% of that window. This says which phase.
+namespace {
+
+struct StepProfile {
+    enum Phase { kPrepare = 0, kEnqueue, kSettle, kPhaseCount };
+    std::array<std::uint64_t, kPhaseCount> ns{};
+    std::array<std::uint64_t, kPhaseCount> hits{};
+
+    static bool enabled() {
+        static const bool on = [] {
+            const char* v = std::getenv("PIE_STEP_PROFILE");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
+        return on;
+    }
+    static StepProfile& instance() {
+        static StepProfile p;
+        return p;
+    }
+    ~StepProfile() {
+        if (!enabled()) return;
+        static const char* names[kPhaseCount] = {"prepare", "enqueue", "settle"};
+        for (int i = 0; i < kPhaseCount; ++i) {
+            if (hits[i] == 0) continue;
+            std::cerr << "[step-profile] " << names[i]
+                      << " calls=" << hits[i]
+                      << " total_ms=" << (static_cast<double>(ns[i]) / 1e6)
+                      << " avg_us=" << (static_cast<double>(ns[i]) / 1e3 / hits[i])
+                      << "\n";
+        }
+    }
+};
+
+class StepPhaseTimer {
+  public:
+    explicit StepPhaseTimer(StepProfile::Phase phase)
+        : phase_(phase), on_(StepProfile::enabled()) {
+        if (on_) {
+            static const char* names[StepProfile::kPhaseCount] = {
+                "prepare", "enqueue", "settle"};
+            nvtxRangePushA(names[phase]);
+            start_ = std::chrono::steady_clock::now();
+        }
+    }
+    ~StepPhaseTimer() {
+        if (!on_) return;
+        nvtxRangePop();
+        auto& p = StepProfile::instance();
+        p.ns[phase_] += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - start_).count());
+        ++p.hits[phase_];
+    }
+
+  private:
+    StepProfile::Phase phase_;
+    bool on_;
+    std::chrono::steady_clock::time_point start_;
+};
+
+}  // namespace
+
 int Context::Impl::launch(const PieFrameDesc& frame, PieCompletion completion) {
     pie_cuda_driver::ops::ScopedRuntimeQuantContext quant_scope(
         runtime_quant_context_);
@@ -1870,6 +2077,7 @@ int Context::Impl::launch(const PieFrameDesc& frame, PieCompletion completion) {
     // wave freezes its channel-cursor window into its tickets.
     for (std::size_t i = 0; i < step_count; ++i) {
         try {
+            StepPhaseTimer timer(StepProfile::kPrepare);
             pie_cuda_driver::prepare_step(
                 *executor_, views[i], prepared[i],
                 i == 0 ? nullptr : &prepared[i - 1]);
@@ -1886,9 +2094,17 @@ int Context::Impl::launch(const PieFrameDesc& frame, PieCompletion completion) {
         const PieCompletion step_completion =
             tail ? completion : PieCompletion{0, 0, nullptr};
         try {
-            pie_cuda_driver::enqueue_step(*executor_, prepared[i]);
-            pie_cuda_driver::settle_step(
-                *executor_, runtime_, step_completion, prepared[i]);
+            {
+                StepPhaseTimer timer(StepProfile::kEnqueue);
+                pie_cuda_driver::enqueue_step(*executor_, prepared[i]);
+            }
+            {
+                StepPhaseTimer timer(StepProfile::kSettle);
+                pie_cuda_driver::tp_watchdog_mark_phase(3);   // entering settle
+                pie_cuda_driver::settle_step(
+                    *executor_, runtime_, step_completion, prepared[i]);
+                pie_cuda_driver::tp_watchdog_mark_phase(4);   // settle returned
+            }
         } catch (const std::exception& e) {
             return fail_frame(i, "launch", e, i, i);
         }
@@ -2287,6 +2503,14 @@ int Context::Impl::close_channel(std::uint64_t channel_id) {
 Context::Context() : impl_(std::make_unique<Impl>()) {}
 Context::~Context() = default;
 
+// CUDA's current device is thread-local, and the runtime drives this Context
+// from scheduler/worker threads it never created. Every entry point therefore
+// re-binds: without it a rank whose device is not the process default records
+// its events and streams against device 0 and the first launch fails with
+// `invalid resource handle`. `cudaSetDevice` is a thread-local store, so the
+// cost is negligible next to the work each of these calls does.
+#define PIE_CUDA_BIND_DEVICE() impl_->bind_device()
+
 int Context::initialize(const std::string& config_path, const PieRuntimeCallbacks& runtime) {
     return impl_->initialize(config_path, runtime);
 }
@@ -2296,48 +2520,61 @@ void Context::fill_device_facts(PieDriverCaps* caps) const {
 }
 
 int Context::load_model(const PieModelLoadDesc& load, PieDriverCaps* caps) {
+    PIE_CUDA_BIND_DEVICE();
     return impl_->load_model(load, caps);
 }
 
 int Context::register_program(const PieProgramDesc& program, std::uint64_t* program_id) {
+    PIE_CUDA_BIND_DEVICE();
     return impl_->register_program(program, program_id);
 }
 
 int Context::register_channel(
     const PieChannelDesc& channel, PieChannelEndpointBinding* binding) {
+    PIE_CUDA_BIND_DEVICE();
     return impl_->register_channel(channel, binding);
 }
 
 int Context::bind_instance(const PieInstanceDesc& instance, PieInstanceBinding* binding) {
+    PIE_CUDA_BIND_DEVICE();
     return impl_->bind_instance(instance, binding);
 }
 
 int Context::launch(const PieFrameDesc& frame, PieCompletion completion) {
+    PIE_CUDA_BIND_DEVICE();
     return impl_->launch(frame, completion);
 }
 
 int Context::encode(const PieEncodeDesc& encode, PieCompletion completion) {
+    PIE_CUDA_BIND_DEVICE();
     return impl_->encode(encode, completion);
 }
 
 int Context::copy_kv(const PieKvCopyDesc& copy, PieCompletion completion) {
+    PIE_CUDA_BIND_DEVICE();
     return impl_->copy_kv(copy, completion);
 }
 
 int Context::copy_state(const PieStateCopyDesc& copy, PieCompletion completion) {
+    PIE_CUDA_BIND_DEVICE();
     return impl_->copy_state(copy, completion);
 }
 
 int Context::resize_pool(const PiePoolResizeDesc& resize, PieCompletion completion) {
+    PIE_CUDA_BIND_DEVICE();
     return impl_->resize_pool(resize, completion);
 }
 
 int Context::close_instance(std::uint64_t instance_id) {
+    PIE_CUDA_BIND_DEVICE();
     return impl_->close_instance(instance_id);
 }
 
 int Context::close_channel(std::uint64_t channel_id) {
+    PIE_CUDA_BIND_DEVICE();
     return impl_->close_channel(channel_id);
 }
+
+#undef PIE_CUDA_BIND_DEVICE
 
 }  // namespace pie::cuda

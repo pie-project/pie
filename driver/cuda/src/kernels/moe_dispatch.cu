@@ -486,7 +486,113 @@ __global__ void moe_decode_wmma_bf16_kernel(
 #endif
 }
 
+// Bandwidth-optimal decode GEMV for the sparse MoE hot path.
+//
+// At decode the routed GEMMs are M=1: 8 experts x [1, H] x [H, N]. There
+// is no reuse of the weight to exploit, so the only thing that matters is
+// reading it at full HBM bandwidth. Tensor cores buy nothing at M=1 (the
+// WMMA path measured 45% SLOWER end-to-end), and `cublasGemmBatchedEx`
+// leaves bandwidth on the table because its tiling is chosen for shapes
+// with an M to fill. One warp per output row, float4 loads, fp32
+// accumulate, one shuffle reduction: 1624 GB/s vs cuBLAS's 1282 on A100
+// for Qwen3.6's gate/up shape (routes=8, N=1024, K=2048).
+//
+// `ActByToken` selects the input row: gate/up reads the token's hidden
+// state (shared by the token's top_k routes), down reads the route's own
+// activation.
+template <bool ActByToken, int kWarps>
+__global__ void moe_decode_gemv_bf16_kernel(
+    const std::int32_t* __restrict__ topk_idx,
+    const __nv_bfloat16* __restrict__ act,
+    const __nv_bfloat16* __restrict__ weight_base,
+    __nv_bfloat16* __restrict__ out,
+    int top_k, int K, int N, long long expert_stride)
+{
+    const int route = blockIdx.y;
+    const int row = blockIdx.x * kWarps + threadIdx.y;
+    if (row >= N) return;
+    const int expert = topk_idx[route];
+    const __nv_bfloat16* w =
+        weight_base + expert * expert_stride + (long long)row * K;
+    const __nv_bfloat16* x =
+        act + (long long)(ActByToken ? route / top_k : route) * K;
+
+    const int lane = threadIdx.x;
+    float acc = 0.f;
+    const int vec = K / 8;
+    const float4* w4 = reinterpret_cast<const float4*>(w);
+    const float4* x4 = reinterpret_cast<const float4*>(x);
+    for (int i = lane; i < vec; i += 32) {
+        float4 wv = w4[i];
+        float4 xv = x4[i];
+        const __nv_bfloat16* wb = reinterpret_cast<const __nv_bfloat16*>(&wv);
+        const __nv_bfloat16* xb = reinterpret_cast<const __nv_bfloat16*>(&xv);
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            acc += __bfloat162float(wb[j]) * __bfloat162float(xb[j]);
+        }
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    }
+    if (lane == 0) out[(long long)route * N + row] = __float2bfloat16(acc);
+}
+
 }  // namespace
+
+void launch_moe_gate_up_decode_gemv_bf16(
+    const std::int32_t* topk_idx,
+    const void* norm_x,
+    const void* gate_up_base,
+    void* expert_gate_up,
+    int num_tokens,
+    int top_k,
+    int H,
+    int I_moe,
+    cudaStream_t stream)
+{
+    const int routes = num_tokens * top_k;
+    const int N = 2 * I_moe;
+    // float4 loads need every row to start 16-byte aligned, which holds
+    // iff the reduction extent is a multiple of 8 bf16.
+    if (routes <= 0 || H <= 0 || N <= 0 || (H % 8) != 0) return;
+    constexpr int kWarps = 4;
+    const dim3 grid((N + kWarps - 1) / kWarps, routes);
+    const dim3 block(32, kWarps);
+    moe_decode_gemv_bf16_kernel</*ActByToken=*/true, kWarps>
+        <<<grid, block, 0, stream>>>(
+            topk_idx,
+            static_cast<const __nv_bfloat16*>(norm_x),
+            static_cast<const __nv_bfloat16*>(gate_up_base),
+            static_cast<__nv_bfloat16*>(expert_gate_up),
+            top_k, H, N, static_cast<long long>(N) * H);
+}
+
+void launch_moe_down_decode_gemv_bf16(
+    const std::int32_t* topk_idx,
+    const void* expert_act,
+    const void* down_base,
+    void* expert_out,
+    int num_tokens,
+    int top_k,
+    int H,
+    int I_moe,
+    cudaStream_t stream)
+{
+    const int routes = num_tokens * top_k;
+    if (routes <= 0 || H <= 0 || I_moe <= 0 || (I_moe % 8) != 0) return;
+    constexpr int kWarps = 4;
+    const dim3 grid((H + kWarps - 1) / kWarps, routes);
+    const dim3 block(32, kWarps);
+    moe_decode_gemv_bf16_kernel</*ActByToken=*/false, kWarps>
+        <<<grid, block, 0, stream>>>(
+            topk_idx,
+            static_cast<const __nv_bfloat16*>(expert_act),
+            static_cast<const __nv_bfloat16*>(down_base),
+            static_cast<__nv_bfloat16*>(expert_out),
+            top_k, I_moe, H, static_cast<long long>(H) * I_moe);
+}
 
 void launch_moe_gate_up_decode_wmma_bf16(
     const std::int32_t* topk_idx,

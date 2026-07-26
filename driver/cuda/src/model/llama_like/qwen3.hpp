@@ -112,6 +112,8 @@ struct Qwen3Weights {
     const DeviceTensor* final_norm  = nullptr;  // [hidden]
     const DeviceTensor* lm_head     = nullptr;  // [vocab, hidden] (may alias embed)
     std::vector<Qwen3LayerWeights> layers;
+    std::vector<DeviceTensor> owned_qkv_fused;
+    std::vector<DeviceTensor> owned_gate_up_fused;
 };
 
 /// Build the schema by name-binding tensors out of the engine. Throws if a

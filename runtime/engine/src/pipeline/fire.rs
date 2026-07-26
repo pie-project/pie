@@ -1278,6 +1278,24 @@ fn validate_frame<C: FireContext>(
     let mut uses: std::collections::HashMap<usize, ChannelUse> = std::collections::HashMap::new();
     let mut device_rings: std::collections::HashMap<usize, DeviceRingUse> =
         std::collections::HashMap::new();
+    // A pass that binds recurrent state cannot share a frame with any
+    // other fire. `fire` serializes such a pass behind EVERY predecessor
+    // fire's settlement (`drain_rs_predecessors`) because RS mappings only
+    // publish at finalize — but a frame's fires cannot settle until all of
+    // them are submitted, and submitting the next one is what blocks. The
+    // two rules are structurally incompatible, and the result is a silent
+    // hang: the frame sits one fire short of sealing forever. Reject it
+    // here, where the frame's shape is known.
+    if fired.len() > 1 {
+        for &(slot, rep) in fired {
+            let fwd: Resource<ForwardPass> = Resource::new_borrow(rep);
+            if !ctx.resources().get(&fwd)?.rs_ws.is_empty() {
+                return Ok(Err(format!(
+                    "pipeline: frame slot {slot} binds recurrent state, so it                      serializes behind every earlier fire's settlement and                      cannot share a frame — give a recurrent-state pass a                      frame of its own (one live slot, the rest none)"
+                )));
+            }
+        }
+    }
     for &(_, rep) in fired {
         let fwd: Resource<ForwardPass> = Resource::new_borrow(rep);
         let pass = ctx.resources().get(&fwd)?;

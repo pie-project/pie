@@ -11,6 +11,7 @@
 #include <condition_variable>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -295,8 +296,50 @@ cudaGraphExec_t capture_forward_graph_exec(
     cublas_stream.restore();
 
     CudaGraphExecOwner exec;
-    CUDA_CHECK(cudaGraphInstantiate(
-        exec.out(), graph.get(), nullptr, nullptr, 0));
+    if (graph.get() == nullptr) {
+        throw std::runtime_error(
+            "forward graph capture produced a null graph (N=" +
+            std::to_string(N) + ", R=" + std::to_string(R) + ")");
+    }
+    // A sticky error left by an earlier async launch surfaces on the next
+    // runtime call and would be misreported as an instantiate failure.
+    const cudaError_t pending = cudaGetLastError();
+    const cudaError_t inst = cudaGraphInstantiate(
+        exec.out(), graph.get(), nullptr, nullptr, 0);
+    if (inst != cudaSuccess) {
+        std::size_t nodes = 0;
+        cudaGraphGetNodes(graph.get(), nullptr, &nodes);
+        std::string histogram;
+        if (nodes > 0) {
+            std::vector<cudaGraphNode_t> node_list(nodes);
+            if (cudaGraphGetNodes(graph.get(), node_list.data(), &nodes) ==
+                cudaSuccess) {
+                std::map<int, int> by_type;
+                for (cudaGraphNode_t node : node_list) {
+                    cudaGraphNodeType type{};
+                    if (cudaGraphNodeGetType(node, &type) == cudaSuccess) {
+                        ++by_type[static_cast<int>(type)];
+                    }
+                }
+                for (const auto& [type, count] : by_type) {
+                    histogram += " t" + std::to_string(type) + "=" +
+                                 std::to_string(count);
+                }
+            }
+        }
+        int device = -1;
+        cudaGetDevice(&device);
+        throw std::runtime_error(
+            std::string("cudaGraphInstantiate failed: ") +
+            cudaGetErrorString(inst) + " (N=" + std::to_string(N) +
+            ", R=" + std::to_string(R) + ", nodes=" + std::to_string(nodes) +
+            ", device=" + std::to_string(device) + ", tp_rank=" +
+            std::to_string(engine.tp_comm != nullptr
+                               ? engine.tp_comm->rank()
+                               : -1) +
+            ", node_types:" + histogram + ", pending_before=" +
+            cudaGetErrorName(pending) + ")");
+    }
     CUDA_CHECK(cudaGraphUpload(exec.get(), nullptr));
     return exec.release();
 }

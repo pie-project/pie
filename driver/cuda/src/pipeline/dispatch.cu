@@ -202,6 +202,12 @@ struct BoundInstance {
         std::uint32_t* device = nullptr;
         std::uint32_t* host = nullptr;
         std::uint32_t* host_device = nullptr;
+        // Set once a wave's pull-validate has seeded the words below.
+        // FramePrepare reads the commit word BEFORE this wave's
+        // pull-validate runs, so an unseeded snapshot carries no verdict —
+        // gating on it would refuse the lane for whatever the pool (or
+        // `cudaMalloc`) happened to leave behind.
+        bool ever_validated = false;
     };
 
     std::uint64_t program_hash = 0;
@@ -1809,27 +1815,6 @@ enum class HostPublishTransport {
 // engine wins and the work goes back to DMA.
 constexpr std::size_t kMaxScatterCellBytes = 4096;
 
-// Diagnostic override, read once: `PIE_CUDA_HOST_PUBLISH=sequential|batched`
-// pins every wave to one transport so a single build can A/B them. Anything
-// else (including unset) leaves the policy below in charge.
-HostPublishTransport* host_publish_override() {
-    static HostPublishTransport storage{};
-    static HostPublishTransport* value = [] () -> HostPublishTransport* {
-        const char* setting = std::getenv("PIE_CUDA_HOST_PUBLISH");
-        if (setting == nullptr) return nullptr;
-        if (std::strcmp(setting, "sequential") == 0) {
-            storage = HostPublishTransport::Sequential;
-            return &storage;
-        }
-        if (std::strcmp(setting, "batched") == 0) {
-            storage = HostPublishTransport::Batched;
-            return &storage;
-        }
-        return nullptr;
-    }();
-    return value;
-}
-
 HostPublishTransport select_host_publish_transport(
     NotifyContext& context,
     cudaStream_t batch_stream) {
@@ -1840,24 +1825,16 @@ HostPublishTransport select_host_publish_transport(
     if (host_publish_destinations_overlap(context)) {
         return HostPublishTransport::Sequential;
     }
-    const bool batch_available =
-#if CUDART_VERSION >= 12080
-        batch_stream != nullptr;
-#else
-        (static_cast<void>(batch_stream), false);
-#endif
-    if (const HostPublishTransport* forced = host_publish_override()) {
-        if (*forced != HostPublishTransport::Batched || batch_available) {
-            return *forced;
-        }
-        return HostPublishTransport::Sequential;
-    }
     const bool cells_are_small = std::all_of(
         context.copy_sizes.begin(),
         context.copy_sizes.end(),
         [](std::size_t bytes) { return bytes <= kMaxScatterCellBytes; });
     if (cells_are_small) return HostPublishTransport::Scatter;
-    if (batch_available) return HostPublishTransport::Batched;
+#if CUDART_VERSION >= 12080
+    if (batch_stream != nullptr) return HostPublishTransport::Batched;
+#else
+    static_cast<void>(batch_stream);
+#endif
     return HostPublishTransport::Sequential;
 }
 
@@ -2533,6 +2510,11 @@ BoundInstance::CommitSnapshot& commit_snapshot(
             snapshot = owner.available_commit_snapshots.back();
             owner.available_commit_snapshots.pop_back();
         }
+        // A pooled word still holds the previous instance's verdict, and a
+        // freshly mapped one holds nothing at all. Either way this snapshot
+        // carries no information about any wave until a pull-validate seeds
+        // it, so no reader may treat its contents as a verdict.
+        snapshot.ever_validated = false;
         try {
             if (snapshot.device == nullptr) {
                 CUDA_CHECK(cudaMalloc(
@@ -2678,7 +2660,14 @@ void wait_bound_instance_quiescent(
 
 void ensure_instance_reaper(Dispatch::Impl& s) {
     if (s.instance_reaper.joinable()) return;
-    s.instance_reaper = std::thread([&s]() {
+    // The reaper waits on CUDA events, and CUDA's current device is
+    // thread-local. Capture the device of whichever rank is starting the
+    // thread; a fresh thread would otherwise default to device 0 and, under
+    // TP, synchronize the wrong context.
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    s.instance_reaper = std::thread([&s, device]() {
+        CUDA_CHECK(cudaSetDevice(device));
         for (;;) {
             Dispatch::Impl::InstanceReapItem item;
             {
@@ -4004,6 +3993,9 @@ void Dispatch::begin_enqueue(StagedLaunch& launch) {
         state.ticket_staging,
         state.pull_staging,
         stream);
+    for (const auto& lane : state.lanes) {
+        if (lane->snapshot != nullptr) lane->snapshot->ever_validated = true;
+    }
     if (begin_timing) {
         launch.begin_breakdown_.pull_validate_us = fire_timing::duration_us(
             begin_mark, fire_timing::Clock::now());
@@ -5474,6 +5466,99 @@ bool Dispatch::enqueue_fixed_decode(
     return true;
 }
 
+// A lane whose pass-commit word came back zero was refused by exactly one of
+// the gates in `k_pull_validate_host_channels_batch`. Replay those gates on
+// the host (the ticket words are mapped pinned memory the CPU can read) so
+// the retry names the channel and the predicate that failed instead of the
+// whole class of causes.
+std::string describe_uncommitted_lane(
+    std::uint64_t instance_id,
+    const BoundInstance& bound,
+    const StagedLane& lane) {
+    std::string message =
+        "ptir prologue or channel readiness did not commit";
+    if (bound.trace == nullptr) return message;
+    auto channel_label = [&](std::uint32_t slot) -> std::string {
+        for (std::size_t c = 0; c < bound.trace->channels.size() &&
+                                c < bound.channel_ids.size();
+             ++c) {
+            if (bound.instance == nullptr) break;
+            if (bound.instance->view().slot(bound.trace->channels[c].id) !=
+                slot) {
+                continue;
+            }
+            const auto& channel = bound.trace->channels[c];
+            std::string label = "chan#" + std::to_string(channel.id);
+            if (!channel.extern_name.empty()) {
+                label += "(" + channel.extern_name + ")";
+            }
+            return label;
+        }
+        return "chan?";
+    };
+    std::string refused;
+    std::size_t refused_count = 0;
+    for (const DeviceHostChannelTicket& ticket : lane.tickets) {
+        if (ticket.words == nullptr) continue;
+        const std::uint64_t head =
+            std::atomic_ref<const std::uint64_t>(ticket.words[0])
+                .load(std::memory_order_acquire);
+        const std::uint64_t tail =
+            std::atomic_ref<const std::uint64_t>(ticket.words[1])
+                .load(std::memory_order_acquire);
+        const char* reason = nullptr;
+        if ((ticket.flags & kTicketConsume) != 0 &&
+            head != ticket.expected_head) {
+            reason = "consume-head-moved";
+        } else if ((ticket.flags & kTicketRequireInput) != 0 &&
+                   !(tail > head)) {
+            reason = "required-input-empty";
+        } else if ((ticket.flags & kTicketPublish) != 0) {
+            const std::uint64_t same_fire_consume =
+                (ticket.flags & kTicketConsume) != 0 ? 1u : 0u;
+            if (tail != ticket.expected_tail) {
+                reason = "publish-tail-moved";
+            } else if (!(tail - head <
+                         static_cast<std::uint64_t>(ticket.cap1 - 1) +
+                             same_fire_consume)) {
+                reason = "publish-ring-full";
+            }
+        }
+        if (reason == nullptr) continue;
+        ++refused_count;
+        if (refused_count > 4) continue;
+        if (!refused.empty()) refused += ", ";
+        refused += channel_label(ticket.slot);
+        refused += " slot=" + std::to_string(ticket.slot);
+        refused += " ";
+        refused += reason;
+        refused += " head=" + std::to_string(head);
+        refused += "/exp" + std::to_string(ticket.expected_head);
+        refused += " tail=" + std::to_string(tail);
+        refused += "/exp" + std::to_string(ticket.expected_tail);
+        refused += " cap1=" + std::to_string(ticket.cap1);
+    }
+    message += " (instance=" + std::to_string(instance_id);
+    message += " geometry_class=" +
+               std::to_string(static_cast<int>(bound.geometry_class));
+    message += " tickets=" + std::to_string(lane.tickets.size());
+    message += " snapshot_seeded=" +
+               std::string(lane.snapshot != nullptr &&
+                                   lane.snapshot->ever_validated
+                               ? "yes"
+                               : "no");
+    if (refused.empty()) {
+        // Every ring gate agrees: the refusal came from the device-side
+        // prologue itself (a compose fail-stop or an envelope kill), not
+        // from host channel staging.
+        message += " refused_by=none-of-the-ring-gates)";
+    } else {
+        message += " refused=" + std::to_string(refused_count);
+        message += " [" + refused + "])";
+    }
+    return message;
+}
+
 bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
                                    std::uint32_t page_size,
                                    std::uint32_t device_pages,
@@ -5856,7 +5941,11 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
                 .ready_offset = ready_offset,
             });
         }
-        if (staged != nullptr) {
+        // FramePrepare runs BEFORE this wave's `begin_enqueue`, so the
+        // commit word cannot describe this wave. It only carries a verdict
+        // once some wave's pull-validate has seeded it; before that it is
+        // uninitialized (or a pooled leftover) and must not gate anything.
+        if (staged != nullptr && staged->lanes[p]->snapshot->ever_validated) {
             snapshot_offsets[p] = reserve_packed(
                 sizeof(std::uint32_t), alignof(std::uint32_t));
         }
@@ -5907,6 +5996,10 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
                 s.instances.at(view.ptir_program_instances.data()[p]);
             if (instance.geometry_class == PIE_GEOMETRY_CLASS_HOST &&
                 !resolve_device_mask) {
+                continue;
+            }
+            if (snapshot_offsets[p] ==
+                std::numeric_limits<std::size_t>::max()) {
                 continue;
             }
             pack_copies.push_back(DescriptorPackCopy{
@@ -5969,9 +6062,9 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
         const std::unordered_set<std::uint32_t>* pending_slots = nullptr;
         if (staged != nullptr) {
             const StagedLane& lane = *staged->lanes[p];
-            if (ready[p] == 0) {
+            if (lane.snapshot->ever_validated && ready[p] == 0) {
                 throw RetryableLaunchError(
-                    "ptir prologue or channel readiness did not commit");
+                    describe_uncommitted_lane(iid, it->second, lane));
             }
             pending_slots = &lane.prologue_put_slots;
         }

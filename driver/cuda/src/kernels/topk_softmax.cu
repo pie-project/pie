@@ -13,6 +13,75 @@ constexpr int BLOCK = 64;
 // static shared-memory slab large enough for both. 512 floats == 2 KB.
 constexpr int MAX_EXPERTS = 512;
 
+// Block-wide argmax over `scores[0..num_experts)`, ties resolved to the
+// LOWEST index — the same winner a serial `for (j) if (s[j] > best)` scan
+// picks, so routing decisions stay bit-identical.
+//
+// The serial form cost K * num_experts iterations on thread 0 while the
+// other 63 threads idled: at 256 experts and K = 8 that is 2048 dependent
+// shared-memory reads, which measured 21 us per layer (7% of a Qwen3.6
+// decode step). Strided scan plus a log-depth reduction is ~10 steps.
+__device__ inline void block_argmax(
+    const float* __restrict__ scores,
+    int num_experts,
+    float floor_value,
+    float* __restrict__ value_buf,
+    int* __restrict__ index_buf,
+    float& best_value,
+    int& best_index)
+{
+    const int tid = threadIdx.x;
+    // Strictly above `floor_value`, matching the serial scan's seed: an
+    // already-picked expert is excluded by writing the floor back into
+    // `scores`, and the floor itself must never win.
+    float local_v = floor_value;
+    int local_i = -1;
+    for (int j = tid; j < num_experts; j += BLOCK) {
+        const float v = scores[j];
+        if (v > local_v) {
+            local_v = v;
+            local_i = j;
+        }
+    }
+    value_buf[tid] = local_v;
+    index_buf[tid] = local_i;
+    __syncthreads();
+    // A shared-memory tree over all BLOCK lanes costs log2(BLOCK)
+    // __syncthreads PER ROUND, and there are K rounds. Fold the upper
+    // warp once, then finish inside warp 0 with shuffles, which need no
+    // barrier at all: 2 barriers per round instead of 8.
+    static_assert(BLOCK == 64, "block_argmax folds exactly one upper warp");
+    if (tid < 32) {
+        float v = value_buf[tid];
+        int i = index_buf[tid];
+        // A strided scan gives thread t the indices t, t+BLOCK, ..., so the
+        // lower index of a tie is not always in the lower lane: compare
+        // indices explicitly rather than relying on lane order. This keeps
+        // the winner identical to a serial `if (s[j] > best)` scan.
+        auto take = [](float& v, int& i, float ov, int oi) {
+            if (ov > v || (ov == v && oi >= 0 && (i < 0 || oi < i))) {
+                v = ov;
+                i = oi;
+            }
+        };
+        take(v, i, value_buf[tid + 32], index_buf[tid + 32]);
+        for (int off = 16; off > 0; off >>= 1) {
+            take(v, i,
+                 __shfl_down_sync(0xffffffffu, v, off),
+                 __shfl_down_sync(0xffffffffu, i, off));
+        }
+        if (tid == 0) {
+            value_buf[0] = v;
+            index_buf[0] = i;
+        }
+    }
+    __syncthreads();
+    best_value = value_buf[0];
+    best_index = index_buf[0];
+    // No trailing barrier: every caller syncs after acting on the winner,
+    // which is what orders the next round's `value_buf` writes.
+}
+
 // One block per token. Phase 1: thread-local max-reduce + exp+sum-reduce
 // for softmax. Phase 2: K iterations of argmax-with-exclusion to pick the
 // top-K probs. Phase 3: thread 0 renormalizes and writes back.
@@ -28,6 +97,7 @@ __global__ void topk_softmax_bf16_kernel(
 
     __shared__ float probs[MAX_EXPERTS];
     __shared__ float buf[BLOCK];
+    __shared__ int ibuf[BLOCK];
 
     // 1. Stage row into shared memory + find max.
     float local_max = -FLT_MAX;
@@ -61,24 +131,26 @@ __global__ void topk_softmax_bf16_kernel(
     const float inv_Z = 1.f / buf[0];
     __syncthreads();
 
-    if (tid == 0) {
-        // Normalize in shared mem, then K-argmax with exclusion.
-        for (int j = 0; j < num_experts; ++j) probs[j] *= inv_Z;
+    // 3. Normalize in shared mem, then K block-wide argmaxes with exclusion.
+    for (int j = tid; j < num_experts; j += BLOCK) probs[j] *= inv_Z;
+    __syncthreads();
 
-        std::int32_t* out_idx = topk_idx + static_cast<long long>(n) * K;
-        float*        out_w   = topk_w   + static_cast<long long>(n) * K;
-        float w_sum = 0.f;
-        for (int k = 0; k < K; ++k) {
-            int   best_i = -1;
-            float best_v = -1.f;
-            for (int j = 0; j < num_experts; ++j) {
-                if (probs[j] > best_v) { best_v = probs[j]; best_i = j; }
-            }
+    std::int32_t* out_idx = topk_idx + static_cast<long long>(n) * K;
+    float*        out_w   = topk_w   + static_cast<long long>(n) * K;
+    float w_sum = 0.f;
+    for (int k = 0; k < K; ++k) {
+        float best_v = -1.f;
+        int best_i = -1;
+        block_argmax(probs, num_experts, -1.f, buf, ibuf, best_v, best_i);
+        if (tid == 0) {
             out_idx[k] = best_i;
-            out_w[k]   = best_v;
-            w_sum += best_v;
-            probs[best_i] = -1.f;  // exclude on next pass
+            out_w[k] = best_v;
+            if (best_i >= 0) probs[best_i] = -1.f;  // exclude on next pass
         }
+        w_sum += best_v;
+        __syncthreads();
+    }
+    if (tid == 0) {
         const float inv_w = 1.f / w_sum;
         for (int k = 0; k < K; ++k) out_w[k] *= inv_w;
     }
@@ -155,6 +227,8 @@ __global__ void topk_sigmoid_bias_bf16_kernel(
 
     __shared__ float probs[MAX_EXPERTS];
     __shared__ float choice[MAX_EXPERTS];
+    __shared__ float buf[BLOCK];
+    __shared__ int ibuf[BLOCK];
 
     for (int j = tid; j < num_experts; j += BLOCK) {
         const float z = __bfloat162float(row[j]);
@@ -164,24 +238,23 @@ __global__ void topk_sigmoid_bias_bf16_kernel(
     }
     __syncthreads();
 
-    if (tid == 0) {
-        std::int32_t* out_idx = topk_idx + static_cast<long long>(n) * K;
-        float* out_w = topk_w + static_cast<long long>(n) * K;
-        float sum = 0.f;
-        for (int k = 0; k < K; ++k) {
-            int best_i = -1;
-            float best_v = -FLT_MAX;
-            for (int j = 0; j < num_experts; ++j) {
-                if (choice[j] > best_v) {
-                    best_v = choice[j];
-                    best_i = j;
-                }
-            }
+    std::int32_t* out_idx = topk_idx + static_cast<long long>(n) * K;
+    float* out_w = topk_w + static_cast<long long>(n) * K;
+    float sum = 0.f;
+    for (int k = 0; k < K; ++k) {
+        float best_v = -FLT_MAX;
+        int best_i = -1;
+        block_argmax(choice, num_experts, -FLT_MAX, buf, ibuf, best_v, best_i);
+        const float weight = best_i >= 0 ? probs[best_i] : 0.f;
+        if (tid == 0) {
             out_idx[k] = best_i;
-            out_w[k] = probs[best_i];
-            sum += out_w[k];
-            choice[best_i] = -FLT_MAX;
+            out_w[k] = weight;
+            if (best_i >= 0) choice[best_i] = -FLT_MAX;
         }
+        sum += weight;
+        __syncthreads();
+    }
+    if (tid == 0) {
         const float scale =
             normalize ? (routed_scaling_factor / (sum + 1e-20f))
                       : routed_scaling_factor;
@@ -207,6 +280,8 @@ __global__ void topk_sigmoid_bias_fp32_kernel(
 
     __shared__ float probs[MAX_EXPERTS];
     __shared__ float choice[MAX_EXPERTS];
+    __shared__ float buf[BLOCK];
+    __shared__ int ibuf[BLOCK];
 
     for (int j = tid; j < num_experts; j += BLOCK) {
         const float z = row[j];
@@ -216,24 +291,23 @@ __global__ void topk_sigmoid_bias_fp32_kernel(
     }
     __syncthreads();
 
-    if (tid == 0) {
-        std::int32_t* out_idx = topk_idx + static_cast<long long>(n) * K;
-        float* out_w = topk_w + static_cast<long long>(n) * K;
-        float sum = 0.f;
-        for (int k = 0; k < K; ++k) {
-            int best_i = -1;
-            float best_v = -FLT_MAX;
-            for (int j = 0; j < num_experts; ++j) {
-                if (choice[j] > best_v) {
-                    best_v = choice[j];
-                    best_i = j;
-                }
-            }
+    std::int32_t* out_idx = topk_idx + static_cast<long long>(n) * K;
+    float* out_w = topk_w + static_cast<long long>(n) * K;
+    float sum = 0.f;
+    for (int k = 0; k < K; ++k) {
+        float best_v = -FLT_MAX;
+        int best_i = -1;
+        block_argmax(choice, num_experts, -FLT_MAX, buf, ibuf, best_v, best_i);
+        const float weight = best_i >= 0 ? probs[best_i] : 0.f;
+        if (tid == 0) {
             out_idx[k] = best_i;
-            out_w[k] = probs[best_i];
-            sum += out_w[k];
-            choice[best_i] = -FLT_MAX;
+            out_w[k] = weight;
+            if (best_i >= 0) choice[best_i] = -FLT_MAX;
         }
+        sum += weight;
+        __syncthreads();
+    }
+    if (tid == 0) {
         const float scale =
             normalize ? (routed_scaling_factor / (sum + 1e-20f))
                       : routed_scaling_factor;

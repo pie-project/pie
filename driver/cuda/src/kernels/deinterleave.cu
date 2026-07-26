@@ -122,41 +122,6 @@ __global__ void concat_bf16_rows_kernel(
     }
 }
 
-__global__ void split_qwen_gdn_projections_kernel(
-    const __nv_bfloat16* __restrict__ qkvz,
-    const __nv_bfloat16* __restrict__ ba,
-    __nv_bfloat16* __restrict__ qkv_out,
-    __nv_bfloat16* __restrict__ z_out,
-    __nv_bfloat16* __restrict__ b_out,
-    __nv_bfloat16* __restrict__ a_out,
-    int conv_dim, int v_dim, int v_h)
-{
-    const int n = blockIdx.x;
-    const int qkvz_dim = conv_dim + v_dim;
-    const int ba_dim = 2 * v_h;
-    const int max_dim = qkvz_dim > ba_dim ? qkvz_dim : ba_dim;
-
-    const __nv_bfloat16* qkvz_row = qkvz + (long long)n * qkvz_dim;
-    const __nv_bfloat16* ba_row = ba + (long long)n * ba_dim;
-    __nv_bfloat16* qkv_row = qkv_out + (long long)n * conv_dim;
-    __nv_bfloat16* z_row = z_out + (long long)n * v_dim;
-    __nv_bfloat16* b_row = b_out + (long long)n * v_h;
-    __nv_bfloat16* a_row = a_out + (long long)n * v_h;
-
-    for (int i = threadIdx.x; i < max_dim; i += blockDim.x) {
-        if (i < conv_dim) {
-            qkv_row[i] = qkvz_row[i];
-        } else if (i < qkvz_dim) {
-            z_row[i - conv_dim] = qkvz_row[i];
-        }
-        if (i < v_h) {
-            b_row[i] = ba_row[i];
-        } else if (i < ba_dim) {
-            a_row[i - v_h] = ba_row[i];
-        }
-    }
-}
-
 __global__ void split_qwen_gdn_ba_kernel(
     const __nv_bfloat16* __restrict__ ba,
     __nv_bfloat16* __restrict__ b_out,
@@ -171,6 +136,26 @@ __global__ void split_qwen_gdn_ba_kernel(
     for (int i = tid; i < v_h; i += blockDim.x) {
         b_row[i] = ba_row[i];
         a_row[i] = ba_row[v_h + i];
+    }
+}
+
+__global__ void split_bf16_rows_kernel(
+    const __nv_bfloat16* __restrict__ src,
+    __nv_bfloat16* __restrict__ left,
+    __nv_bfloat16* __restrict__ right,
+    int left_dim, int right_dim)
+{
+    const int n = blockIdx.x;
+    const int total = left_dim + right_dim;
+    const __nv_bfloat16* row = src + (long long)n * total;
+    __nv_bfloat16* l = left + (long long)n * left_dim;
+    __nv_bfloat16* r = right + (long long)n * right_dim;
+    for (int i = threadIdx.x; i < total; i += blockDim.x) {
+        if (i < left_dim) {
+            l[i] = row[i];
+        } else {
+            r[i - left_dim] = row[i];
+        }
     }
 }
 
@@ -207,20 +192,16 @@ void launch_concat_bf16_rows(
         N, left_dim, right_dim);
 }
 
-void launch_split_qwen_gdn_projections_bf16(
-    const void* qkvz, const void* ba,
-    void* qkv_out, void* z_out, void* b_out, void* a_out,
-    int N, int conv_dim, int v_dim, int v_h, cudaStream_t stream)
+void launch_split_bf16_rows(
+    const void* src, void* left, void* right,
+    int N, int left_dim, int right_dim, cudaStream_t stream)
 {
-    if (N <= 0 || conv_dim <= 0 || v_dim <= 0 || v_h <= 0) return;
-    split_qwen_gdn_projections_kernel<<<N, 256, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(qkvz),
-        static_cast<const __nv_bfloat16*>(ba),
-        static_cast<__nv_bfloat16*>(qkv_out),
-        static_cast<__nv_bfloat16*>(z_out),
-        static_cast<__nv_bfloat16*>(b_out),
-        static_cast<__nv_bfloat16*>(a_out),
-        conv_dim, v_dim, v_h);
+    if (N <= 0 || left_dim <= 0 || right_dim <= 0) return;
+    split_bf16_rows_kernel<<<N, 256, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(src),
+        static_cast<__nv_bfloat16*>(left),
+        static_cast<__nv_bfloat16*>(right),
+        left_dim, right_dim);
 }
 
 void launch_split_qwen_gdn_ba_bf16(
