@@ -76,10 +76,7 @@ pub(crate) fn unregister_residency(pid: uuid::Uuid) {
     RESIDENCIES.write().unwrap().remove(&pid);
 }
 
-fn with_residency<R: Default>(
-    pid: uuid::Uuid,
-    f: impl FnOnce(&mut ProcessResidency) -> R,
-) -> R {
+fn with_residency<R: Default>(pid: uuid::Uuid, f: impl FnOnce(&mut ProcessResidency) -> R) -> R {
     let residency = {
         let residencies = RESIDENCIES.read().unwrap();
         residencies.get(&pid).and_then(Weak::upgrade)

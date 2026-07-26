@@ -13,21 +13,21 @@ use pie_driver_abi::{
     PIE_GEOMETRY_CLASS_DECODE_ENVELOPE, PIE_GEOMETRY_CLASS_DEVICE_GEOMETRY,
     PIE_GEOMETRY_CLASS_HOST, PIE_TERMINAL_OUTCOME_FAILED, PIE_TERMINAL_OUTCOME_RETRY,
     PIE_TERMINAL_OUTCOME_SUCCESS, PieBytes, PieChannelDesc, PieChannelEndpointBinding,
-    PieChannelValueDescSlice, PieCompletion, PieEncodeDesc, PieInstanceBinding, PieInstanceDesc,
-    PieFrameDesc, PieKvCopyDesc, PiePoolResizeDesc, PieProgramDesc, PieStepDesc,
-    PieRuntimeCallbacks, PieStateCopyDesc, PieTerminalCell, PieTerminalCellPtrSlice, PieU32Slice,
+    PieChannelValueDescSlice, PieCompletion, PieEncodeDesc, PieFrameDesc, PieInstanceBinding,
+    PieInstanceDesc, PieKvCopyDesc, PiePoolResizeDesc, PieProgramDesc, PieRuntimeCallbacks,
+    PieStateCopyDesc, PieStepDesc, PieTerminalCell, PieTerminalCellPtrSlice, PieU32Slice,
     PieU64Slice, validate_channel_desc, validate_completion, validate_encode_desc,
     validate_frame_desc, validate_instance_desc, validate_kv_copy_desc, validate_pool_resize_desc,
     validate_program_desc, validate_state_copy_desc,
 };
-use pie_ptir::container::{self, ExternDir, HostRole};
-use pie_ptir::interp::{
+use pie_eval::interp::{
     ExternChannel, HostError, Instance as InterpInstance, NoKernels, PassInputs, StepError, Value,
 };
-use pie_ptir::op::{IntrinsicId, Op};
-use pie_ptir::registry::{KernelInfo, ModelProfile};
-use pie_ptir::types::{DType, ValueType};
-use pie_ptir::validate::BoundTrace;
+use pie_ir::container::{self, ExternDir, HostRole};
+use pie_ir::op::{IntrinsicId, Op};
+use pie_ir::registry::{KernelInfo, ModelProfile};
+use pie_ir::types::{DType, ValueType};
+use pie_ir::validate::BoundTrace;
 
 pub mod kv_export;
 
@@ -470,7 +470,7 @@ impl DummyDriver {
             !canonical_bytes.is_empty(),
             "program registration requires canonical PTIR bytes"
         );
-        let hash = pie_ptir::container_hash(&canonical_bytes);
+        let hash = pie_ir::container_hash(&canonical_bytes);
         if desc.program_hash != 0 {
             ensure!(
                 desc.program_hash == hash,
@@ -480,7 +480,7 @@ impl DummyDriver {
         }
         let container = container::decode(&canonical_bytes)
             .map_err(|err| anyhow!("program decode failed: {err}"))?;
-        let bound = pie_ptir::validate::bind(container, self.model_profile()).map_err(|err| {
+        let bound = pie_ir::validate::bind(container, self.model_profile()).map_err(|err| {
             anyhow!(
                 "program bind failed: {err} (profile: vocab={}, page_size={})",
                 self.model_profile().vocab,
@@ -546,7 +546,7 @@ impl DummyDriver {
                     && desc.seeded == 0)
             {
                 let dtype = channel_program_dtype(desc.dtype)?;
-                let shape = pie_ptir::types::Shape::new(&shape)
+                let shape = pie_ir::types::Shape::new(&shape)
                     .ok_or_else(|| anyhow!("channel shape rank is unsupported"))?;
                 Some(ExternChannel::new(
                     ValueType::new(shape, dtype),
@@ -1594,7 +1594,7 @@ fn ensure_endpoint_matches_program(
     endpoint: &DummyEndpoint,
     program: &DummyProgram,
     dense: usize,
-    decl: &pie_ptir::container::ChannelDecl,
+    decl: &pie_ir::container::ChannelDecl,
     instance_id: u64,
 ) -> Result<()> {
     ensure!(
@@ -1620,7 +1620,7 @@ fn ensure_endpoint_matches_program(
             // (prefill→decode `tok_in` handoff). Host-visible or seeded
             // channels keep the one-attachment rule.
             let device_only =
-                endpoint.host_role == pie_ptir::container::HostRole::None as u8 && !endpoint.seeded;
+                endpoint.host_role == pie_ir::container::HostRole::None as u8 && !endpoint.seeded;
             ensure!(
                 endpoint.extern_name.is_none() && (endpoint.attachments.is_empty() || device_only),
                 "private channel {} is already attached",
@@ -1711,9 +1711,7 @@ fn build_pass_inputs(
         .attn_score
         .map(|ty| {
             (0..2)
-                .map(|layer| {
-                    deterministic_attn_score(ty, base.wrapping_add(layer as u64 * 29))
-                })
+                .map(|layer| deterministic_attn_score(ty, base.wrapping_add(layer as u64 * 29)))
                 .collect()
         })
         .unwrap_or_default();
@@ -1790,7 +1788,8 @@ fn deterministic_attn_score(ty: ValueType, base: u64) -> Value {
     Value::F32(out)
 }
 
-fn deterministic_drafts(ty: ValueType, base: u64, vocab: u32) -> Value {    let len = ty.shape.numel().max(1) as usize;
+fn deterministic_drafts(ty: ValueType, base: u64, vocab: u32) -> Value {
+    let len = ty.shape.numel().max(1) as usize;
     let mut drafts = Vec::with_capacity(len);
     for idx in 0..len {
         drafts.push(((base as u32 + idx as u32) % vocab.max(2)) as i32);
@@ -2270,10 +2269,7 @@ mod tests {
                 ptr: instance_ids.as_ptr(),
                 len: instance_ids.len(),
             },
-            steps: pie_driver_abi::PieStepDescSlice {
-                ptr: &step,
-                len: 1,
-            },
+            steps: pie_driver_abi::PieStepDescSlice { ptr: &step, len: 1 },
             ..PieFrameDesc::default()
         };
         driver.launch(&frame, completion)
@@ -2283,12 +2279,12 @@ mod tests {
         PIE_CHANNEL_EXTERN_EXPORT, PIE_CHANNEL_HOST_ROLE_NONE, PIE_TERMINAL_OUTCOME_PENDING,
         PieChannelValueDesc,
     };
-    use pie_ptir::container::{
+    use pie_ir::container::{
         ChanDType, ChannelDecl, ExternDecl, PortBinding, PortSource, StageProgram, TraceContainer,
     };
-    use pie_ptir::expand;
-    use pie_ptir::registry::{Port, Stage};
-    use pie_ptir::types::{Literal, Shape};
+    use pie_ir::expand;
+    use pie_ir::registry::{Port, Stage};
+    use pie_ir::types::{Literal, Shape};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
@@ -2456,7 +2452,7 @@ mod tests {
         }
         let program_id = driver
             .register_program(&PieProgramDesc {
-                program_hash: pie_ptir::container_hash(&bytes),
+                program_hash: pie_ir::container_hash(&bytes),
                 canonical_bytes: PieBytes {
                     ptr: bytes.as_ptr(),
                     len: bytes.len(),
@@ -2546,7 +2542,7 @@ mod tests {
         let bytes = container.encode();
         driver
             .register_program(&PieProgramDesc {
-                program_hash: pie_ptir::container_hash(&bytes),
+                program_hash: pie_ir::container_hash(&bytes),
                 canonical_bytes: PieBytes {
                     ptr: bytes.as_ptr(),
                     len: bytes.len(),
@@ -3058,16 +3054,16 @@ mod tests {
             .each_mut()
             .map(|cell| cell as *mut PieTerminalCell);
         launch_single_step(
-                &mut driver,
-                &instance_ids,
-                &terminal_ptrs,
-                PieCompletion {
-                    wait_id: 401,
-                    target_epoch: 7,
-                    terminal_cell: std::ptr::null_mut(),
-                }
-            )
-            .unwrap();
+            &mut driver,
+            &instance_ids,
+            &terminal_ptrs,
+            PieCompletion {
+                wait_id: 401,
+                target_epoch: 7,
+                terminal_cell: std::ptr::null_mut(),
+            },
+        )
+        .unwrap();
         callbacks.wait_for_notification((401, 7));
         let notices = callbacks.notifications_for(401);
         assert_eq!(notices, vec![(401, 7)]);
@@ -3096,7 +3092,7 @@ mod tests {
 
         let logits = match deterministic_logits(
             ValueType::new(Shape::matrix(1, vocab), DType::F32),
-            1 ^ binding.instance_id ^ pie_ptir::container_hash(&suite_container(vocab)),
+            1 ^ binding.instance_id ^ pie_ir::container_hash(&suite_container(vocab)),
             vocab,
         ) {
             Value::F32(values) => values,
@@ -3160,16 +3156,16 @@ mod tests {
             .each_mut()
             .map(|cell| cell as *mut PieTerminalCell);
         launch_single_step(
-                &mut driver,
-                &instance_ids,
-                &terminal_ptrs,
-                PieCompletion {
-                    wait_id: 421,
-                    target_epoch: 3,
-                    terminal_cell: std::ptr::null_mut(),
-                }
-            )
-            .unwrap();
+            &mut driver,
+            &instance_ids,
+            &terminal_ptrs,
+            PieCompletion {
+                wait_id: 421,
+                target_epoch: 3,
+                terminal_cell: std::ptr::null_mut(),
+            },
+        )
+        .unwrap();
         callbacks.wait_for_notification((421, 3));
         assert_eq!(callbacks.notifications_for(421), vec![(421, 3)]);
         assert_eq!(terminal_cells[0].outcome, PIE_TERMINAL_OUTCOME_SUCCESS);
@@ -3238,16 +3234,16 @@ mod tests {
             .each_mut()
             .map(|cell| cell as *mut PieTerminalCell);
         launch_single_step(
-                &mut driver,
-                &instance_ids,
-                &terminal_ptrs,
-                PieCompletion {
-                    wait_id: 431,
-                    target_epoch: 5,
-                    terminal_cell: std::ptr::null_mut(),
-                }
-            )
-            .unwrap();
+            &mut driver,
+            &instance_ids,
+            &terminal_ptrs,
+            PieCompletion {
+                wait_id: 431,
+                target_epoch: 5,
+                terminal_cell: std::ptr::null_mut(),
+            },
+        )
+        .unwrap();
         callbacks.wait_for_notification((431, 5));
         assert_eq!(callbacks.notifications_for(431), vec![(431, 5)]);
         assert!(
@@ -3376,16 +3372,16 @@ mod tests {
             .each_mut()
             .map(|cell| cell as *mut PieTerminalCell);
         launch_single_step(
-                &mut driver,
-                &instance_ids,
-                &terminal_ptrs,
-                PieCompletion {
-                    wait_id: 501,
-                    target_epoch: 11,
-                    terminal_cell: std::ptr::null_mut(),
-                }
-            )
-            .unwrap();
+            &mut driver,
+            &instance_ids,
+            &terminal_ptrs,
+            PieCompletion {
+                wait_id: 501,
+                target_epoch: 11,
+                terminal_cell: std::ptr::null_mut(),
+            },
+        )
+        .unwrap();
         callbacks.wait_for_notification((501, 11));
         let notices = callbacks.notifications_for(501);
         assert_eq!(notices, vec![(501, 11)]);
@@ -3460,16 +3456,16 @@ mod tests {
             .each_mut()
             .map(|cell| cell as *mut PieTerminalCell);
         launch_single_step(
-                &mut driver,
-                &instance_ids,
-                &terminal_ptrs,
-                PieCompletion {
-                    wait_id: 511,
-                    target_epoch: 13,
-                    terminal_cell: std::ptr::null_mut(),
-                }
-            )
-            .unwrap();
+            &mut driver,
+            &instance_ids,
+            &terminal_ptrs,
+            PieCompletion {
+                wait_id: 511,
+                target_epoch: 13,
+                terminal_cell: std::ptr::null_mut(),
+            },
+        )
+        .unwrap();
         callbacks.wait_for_notification((511, 13));
         let notices = callbacks.notifications_for(511);
         assert_eq!(notices, vec![(511, 13)]);
@@ -3517,16 +3513,16 @@ mod tests {
             .each_mut()
             .map(|cell| cell as *mut PieTerminalCell);
         launch_single_step(
-                &mut driver,
-                &instance_ids,
-                &terminal_ptrs,
-                PieCompletion {
-                    wait_id: 451,
-                    target_epoch: 9,
-                    terminal_cell: std::ptr::null_mut(),
-                }
-            )
-            .unwrap();
+            &mut driver,
+            &instance_ids,
+            &terminal_ptrs,
+            PieCompletion {
+                wait_id: 451,
+                target_epoch: 9,
+                terminal_cell: std::ptr::null_mut(),
+            },
+        )
+        .unwrap();
         callbacks.wait_for_notification((451, 9));
         let channel = read_binding_by_id(&binding, 51);
         let words = read_words(&binding);
@@ -3599,10 +3595,7 @@ mod tests {
                         ptr: instance_ids.as_ptr(),
                         len: instance_ids.len(),
                     },
-                    steps: pie_driver_abi::PieStepDescSlice {
-                        ptr: &step,
-                        len: 1,
-                    },
+                    steps: pie_driver_abi::PieStepDescSlice { ptr: &step, len: 1 },
                     ..PieFrameDesc::default()
                 },
                 PieCompletion {
@@ -3699,16 +3692,16 @@ mod tests {
             .map(|cell| cell as *mut PieTerminalCell);
 
         let err = launch_single_step(
-                &mut driver,
-                &instance_ids,
-                &terminal_ptrs,
-                PieCompletion {
-                    wait_id: 462,
-                    target_epoch: 1,
-                    terminal_cell: std::ptr::null_mut(),
-                }
-            )
-            .unwrap_err();
+            &mut driver,
+            &instance_ids,
+            &terminal_ptrs,
+            PieCompletion {
+                wait_id: 462,
+                target_epoch: 1,
+                terminal_cell: std::ptr::null_mut(),
+            },
+        )
+        .unwrap_err();
 
         assert!(err.to_string().contains("unknown instance"));
         assert_eq!(
@@ -3754,16 +3747,16 @@ mod tests {
             .each_mut()
             .map(|cell| cell as *mut PieTerminalCell);
         launch_single_step(
-                &mut driver,
-                &instance_ids,
-                &terminal_ptrs,
-                PieCompletion {
-                    wait_id: 471,
-                    target_epoch: 1,
-                    terminal_cell: std::ptr::null_mut(),
-                }
-            )
-            .unwrap();
+            &mut driver,
+            &instance_ids,
+            &terminal_ptrs,
+            PieCompletion {
+                wait_id: 471,
+                target_epoch: 1,
+                terminal_cell: std::ptr::null_mut(),
+            },
+        )
+        .unwrap();
         let started = Instant::now();
         driver.close_instance(binding.instance_id).unwrap();
         assert!(started.elapsed() < Duration::from_millis(40));
@@ -3804,16 +3797,16 @@ mod tests {
             .each_mut()
             .map(|cell| cell as *mut PieTerminalCell);
         launch_single_step(
-                &mut driver,
-                &instance_ids,
-                &terminal_ptrs,
-                PieCompletion {
-                    wait_id: 481,
-                    target_epoch: 1,
-                    terminal_cell: std::ptr::null_mut(),
-                }
-            )
-            .unwrap();
+            &mut driver,
+            &instance_ids,
+            &terminal_ptrs,
+            PieCompletion {
+                wait_id: 481,
+                target_epoch: 1,
+                terminal_cell: std::ptr::null_mut(),
+            },
+        )
+        .unwrap();
         drop(driver);
         let at_drop = callbacks.count.load(Ordering::SeqCst);
         std::thread::sleep(Duration::from_millis(80));

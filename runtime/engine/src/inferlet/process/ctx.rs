@@ -8,9 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::OwnedSemaphorePermit;
 use wasmtime::component::{ResourceAny, ResourceTable};
-use wasmtime_wasi::{
-    DirPerms, FilePerms, HostMonotonicClock, WasiCtx, WasiCtxView, WasiView,
-};
+use wasmtime_wasi::{DirPerms, FilePerms, HostMonotonicClock, WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::WasiHttpCtx;
 use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
 use wasmtime_wasi_http::p3::{
@@ -183,9 +181,7 @@ impl ProcessCtx {
         py_runtime_dir: Option<&Path>,
     ) -> anyhow::Result<Self> {
         let mut builder = WasiCtx::builder();
-        if std::env::var("PIE_LEDGER_TIMING")
-            .is_ok_and(|value| !value.is_empty() && value != "0")
-        {
+        if std::env::var("PIE_LEDGER_TIMING").is_ok_and(|value| !value.is_empty() && value != "0") {
             struct SharedMonotonicClock;
             impl HostMonotonicClock for SharedMonotonicClock {
                 fn resolution(&self) -> u64 {

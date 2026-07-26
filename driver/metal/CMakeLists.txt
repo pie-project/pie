@@ -263,7 +263,7 @@ function(add_metal_linked_test target source)
 endfunction()
 
 file(GLOB PIE_PTIR_CANONICAL_GOLDENS CONFIGURE_DEPENDS
-  ${CMAKE_CURRENT_SOURCE_DIR}/../../interface/ptir/tests/golden-ptir/*.txt)
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/tests/golden/*.txt)
 add_executable(
   ptir_decoder_limits_test
   ${CMAKE_CURRENT_SOURCE_DIR}/../common/tests/ptir_decoder_limits_test.cpp)
@@ -273,7 +273,7 @@ target_compile_features(ptir_decoder_limits_test PRIVATE cxx_std_20)
 add_test(
   NAME ptir_decoder_limits_test
   COMMAND ptir_decoder_limits_test
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../interface/ptir/tests/malformed_wire_corpus.txt
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/tests/malformed_wire_corpus.txt
     ${PIE_PTIR_CANONICAL_GOLDENS})
 
 add_metal_host_test(pipeline_interp_test tests/pipeline_interp_test.cpp)
@@ -316,7 +316,7 @@ add_test(NAME executor_worker_test COMMAND executor_worker_test)
 if(APPLE)
   add_metal_linked_test(m1_generated_test tests/m1_generated_test.cpp)
   target_compile_definitions(m1_generated_test PRIVATE
-    PIE_PTIR_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../interface/ptir/tests/golden-ptir")
+    PIE_PTIR_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/tests/golden")
   add_metal_linked_test(ptir_m0_device_test tests/ptir_m0_device_test.cpp)
   add_metal_linked_test(ptir_checkpoint_e2e_test tests/ptir_checkpoint_e2e_test.cpp)
   add_metal_linked_test(kv_append_paged_pso_test tests/kv_append_paged_pso_test.cpp)

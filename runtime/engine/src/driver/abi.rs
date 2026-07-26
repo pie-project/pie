@@ -206,7 +206,10 @@ impl<'a> InstanceDescBorrow<'a> {
     }
 }
 
-fn step_desc<'a>(step: &'a StepSubmission, masks: &'a MaskWordsStorage) -> pie_driver_abi::PieStepDesc {
+fn step_desc<'a>(
+    step: &'a StepSubmission,
+    masks: &'a MaskWordsStorage,
+) -> pie_driver_abi::PieStepDesc {
     let plan = &step.plan;
     pie_driver_abi::PieStepDesc {
         roster_rows: u32_slice(&step.roster_rows),

@@ -13,7 +13,8 @@ crate-type = ["rlib"]
 
 [dependencies]
 pie-driver-abi = { path = "../../interface/driver" }
-pie-ptir = { path = "../../interface/ptir", features = ["eval"] }
+pie-ir = { path = "../../compiler/ir" }
+pie-eval = { path = "../../compiler/eval" }
 pie-load-planner = { path = "../../runtime/load-planner" }
 anyhow = "1.0"
 

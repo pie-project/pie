@@ -238,8 +238,7 @@ pub fn init_admission(max_concurrent: Option<usize>) {
     // beyond that are neutral because without an earmarked taker the
     // stall just moves into mid-generation seals.
     const STAGED_COHORTS: usize = 1;
-    let bind_ahead =
-        limit.map(|n| Arc::new(Semaphore::new(n.saturating_mul(1 + STAGED_COHORTS))));
+    let bind_ahead = limit.map(|n| Arc::new(Semaphore::new(n.saturating_mul(1 + STAGED_COHORTS))));
     EXECUTION_SLOT_CAPACITY
         .set(limit)
         .expect("execution slot capacity already initialized");

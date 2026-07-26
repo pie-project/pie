@@ -3169,9 +3169,7 @@ impl BatchScheduler {
         // them positional starved the very traffic that unsticks a held
         // frame (CONTENTION_FOLLOWUP.md §12).
         if in_flight_control.is_none()
-            && let Some(index) = pending
-                .iter()
-                .position(|item| Self::standalone_copy(item))
+            && let Some(index) = pending.iter().position(|item| Self::standalone_copy(item))
             && let Some(item) = pending.remove(index)
         {
             Self::post_control(
@@ -4271,10 +4269,10 @@ mod tests {
     };
     use pie_driver_abi::{PieInstanceBinding, PieKvMoveCell, PiePoolRange};
     use pie_driver_dummy_lib::DummyDriverOptions;
-    use pie_ptir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
-    use pie_ptir::op::Op;
-    use pie_ptir::registry::Stage;
-    use pie_ptir::types::{DType, Literal, Shape};
+    use pie_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
+    use pie_ir::op::Op;
+    use pie_ir::registry::Stage;
+    use pie_ir::types::{DType, Literal, Shape};
     use tokio::time::{Duration, timeout};
 
     async fn setup_scheduler(
@@ -4388,7 +4386,7 @@ mod tests {
         }
         .encode();
         ProgramRegistration {
-            program_hash: pie_ptir::container_hash(&bytes),
+            program_hash: pie_ir::container_hash(&bytes),
             canonical_bytes: bytes,
             sidecar_bytes: Vec::new(),
         }
@@ -5782,7 +5780,7 @@ mod tests {
         // Plan §14 gate 3: instance A's fire fills a shared extern channel;
         // instance B's fire consumes it and publishes to its host reader —
         // cross-instance dataflow over one global channel registration.
-        use pie_ptir::container::{ExternDecl, ExternDir};
+        use pie_ir::container::{ExternDecl, ExternDir};
         let driver_id = driver::register_driver_backend(
             DriverSpec {
                 num_kv_pages: 16,
@@ -5852,7 +5850,7 @@ mod tests {
         let exporter_program = crate::scheduler::register_program(
             driver_id,
             ProgramRegistration {
-                program_hash: pie_ptir::container_hash(&exporter_bytes),
+                program_hash: pie_ir::container_hash(&exporter_bytes),
                 canonical_bytes: exporter_bytes,
                 sidecar_bytes: Vec::new(),
             },
@@ -5861,7 +5859,7 @@ mod tests {
         let importer_program = crate::scheduler::register_program(
             driver_id,
             ProgramRegistration {
-                program_hash: pie_ptir::container_hash(&importer_bytes),
+                program_hash: pie_ir::container_hash(&importer_bytes),
                 canonical_bytes: importer_bytes,
                 sidecar_bytes: Vec::new(),
             },

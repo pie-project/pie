@@ -20,9 +20,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(test)]
-use pie_ptir::container;
+use pie_ir::container;
 #[cfg(test)]
-use pie_ptir::container::HostRole;
+use pie_ir::container::HostRole;
 
 use super::program::RegisteredProgram;
 #[cfg(test)]
@@ -580,12 +580,12 @@ pub fn validate_seeds(
 mod tests {
     use super::*;
     use crate::pipeline::program::{Registry, register};
-    use pie_ptir::container::{
+    use pie_ir::container::{
         ChanDType, ChannelDecl, PortBinding, PortSource, StageProgram, TraceContainer,
     };
-    use pie_ptir::op::{IntrinsicId, Op};
-    use pie_ptir::registry::{ModelProfile, Port, Stage};
-    use pie_ptir::types::{DType, Shape};
+    use pie_ir::op::{IntrinsicId, Op};
+    use pie_ir::registry::{ModelProfile, Port, Stage};
+    use pie_ir::types::{DType, Shape};
     use std::num::NonZeroUsize;
 
     const VOCAB: u32 = 32;
@@ -838,8 +838,8 @@ mod tests {
 
     #[test]
     fn register_instantiate_run_on_mock_interp() {
-        use pie_ptir::interp::Value;
-        use pie_ptir::interp::{Instance as Interp, NoKernels, PassInputs};
+        use pie_eval::interp::Value;
+        use pie_eval::interp::{Instance as Interp, NoKernels, PassInputs};
 
         let prog = register(
             greedy().encode(),
@@ -921,7 +921,7 @@ mod tests {
                     stage: Stage::Epilogue,
                     ops: vec![
                         Op::ChanTake(0),
-                        Op::Const(pie_ptir::types::Literal::U32(1)),
+                        Op::Const(pie_ir::types::Literal::U32(1)),
                         Op::Add(0, 1),
                         Op::ChanPut { chan: 0, value: 2 },
                         Op::ChanPut { chan: 1, value: 2 },
@@ -930,7 +930,7 @@ mod tests {
             }
             .encode();
             ProgramRegistration {
-                program_hash: pie_ptir::container_hash(&bytes),
+                program_hash: pie_ir::container_hash(&bytes),
                 canonical_bytes: bytes,
                 sidecar_bytes: Vec::new(),
             }

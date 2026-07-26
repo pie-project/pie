@@ -3,16 +3,16 @@
 //! This is the only home of the overview §3/§5 author surface
 //! (`ForwardPass`/`Pipeline`/`WorkingSet`/`Channel`). It wraps the WIT
 //! resources (`channel`, `forward-pass`, `kv-working-set`, `pipeline`) and
-//! drives the neutral [`Builder`](ptir_dsl::Builder) from the `ptir-dsl`
+//! drives the neutral [`Builder`](pie_dsl::Builder) from the `pie-dsl`
 //! crate: the author writes stage closures + port bindings, the bridge lowers
 //! them to the canonical PTIR container, orders the WIT channel handles by the
 //! builder↔bridge contract
-//! ([`Traced::channel_order`](ptir_dsl::Traced::channel_order)), and calls
+//! ([`Traced::channel_order`](pie_dsl::Traced::channel_order)), and calls
 //! the empty `forward-pass` builder and attaches the traced program (which
 //! binds against the model — the guest does not bind, D6). Program identity,
 //! dedup, and validation happen host-side at program attachment.
 //!
-//! A [`Channel`] owns BOTH sides: the `ptir-dsl` trace declaration (its `take`/
+//! A [`Channel`] owns BOTH sides: the `pie-dsl` trace declaration (its `take`/
 //! `put`/`read` record ops inside a stage closure, and host `put`s record the
 //! host-role endpoint) and the WIT `channel` resource (the host transport). The
 //! two are constructed from the same `(shape, dtype, capacity)` so the decl
@@ -23,10 +23,10 @@ use std::collections::HashMap;
 use std::ops::{Bound, RangeBounds};
 use std::rc::Rc;
 
-use ptir_dsl::builder::Builder;
-use ptir_dsl::channel::PutValue;
-use ptir_dsl::value::{Arg, ConstData};
-use ptir_dsl::{
+use pie_dsl::builder::Builder;
+use pie_dsl::channel::PutValue;
+use pie_dsl::value::{Arg, ConstData};
+use pie_dsl::{
     AsTensor, Channel as DslChannel, DType, IntoConst, IntoPut, IntoShape, Port, Shape, Stage,
     Tensor,
 };
@@ -36,12 +36,12 @@ use crate::pie::inferlet::pipeline as wit_pipeline;
 use crate::pie::inferlet::types::Dtype as WitDtype;
 use crate::working_set::{KvWorkingSet, PageRange, PageSpan};
 
-pub use ptir_dsl::intrinsics;
+pub use pie_dsl::intrinsics;
 
 // Re-export the eDSL vocabulary so an author writes stage closures with a single
 // `use inferlet::ptir::prelude::*;` (mirrors the old `ptir::prelude`).
-pub use ptir_dsl::DType as Dtype;
-pub use ptir_dsl::{
+pub use pie_dsl::DType as Dtype;
+pub use pie_dsl::{
     abs, add, and, broadcast, cast, causal_mask, cummass_le, cumprod, cumsum, div, dtype, entropy,
     entropy_from_logprobs, eq, exp, gather, gather_row, ge, gt, gumbel, gumbel_max, iota, l2norm,
     le, log, log_softmax, lt, mask_apply, masked_argmax, matmul, max_elem, min_elem, mul, ne, neg,
@@ -106,7 +106,7 @@ fn claim_port(port: Port, ch: &Channel) -> DslChannel {
     dsl
 }
 
-/// A GPU-resident bounded queue (overview §1). Owns the `ptir-dsl` trace
+/// A GPU-resident bounded queue (overview §1). Owns the `pie-dsl` trace
 /// declaration and the WIT `channel` resource. In a stage closure `take`/`read`/
 /// `put` record IR ops; on the host `put` stages a value (seed / host-writer
 /// cell) and `Taken::get().await`/`Taken::bytes().await` materialize a committed value.
@@ -333,7 +333,7 @@ impl Channel {
 /// an in-program value (via [`AsTensor`]); on the host [`get`](Self::get) /
 /// [`bytes`](Self::bytes) await the committed value.
 pub struct Taken {
-    dsl: ptir_dsl::Taken,
+    dsl: pie_dsl::Taken,
     wit: Rc<wit::Channel>,
     mode: TakenMode,
     dtype: DType,
@@ -1050,9 +1050,9 @@ pub mod prelude {
         Channel, DEFAULT_RUNAHEAD_DEPTH, ForwardPass, PageGrant, Pipeline, RsWorkingSet, TOKEN_PAD,
         WorkingSet, frame_size, max_embed_length, pad_tokens, submit_frame, unpad_tokens,
     };
-    pub use ptir_dsl::dtype;
-    pub use ptir_dsl::intrinsics;
-    pub use ptir_dsl::value::{
+    pub use pie_dsl::dtype;
+    pub use pie_dsl::intrinsics;
+    pub use pie_dsl::value::{
         AsTensor, Tensor, abs, add, and, broadcast, cast, causal_mask, cummass_le, cumprod, cumsum,
         div, entropy, entropy_from_logprobs, eq, exp, gather, gather_row, ge, gt, gumbel,
         gumbel_max, iota, l2norm, le, log, log_softmax, lt, mask_apply, masked_argmax, matmul,
@@ -1061,5 +1061,5 @@ pub mod prelude {
         row_membership, scalar_gather, scatter_add, scatter_set, select, sign, sink_window_mask,
         sliding_window_mask, softmax, sort_desc, sub, top_k, transpose,
     };
-    pub use ptir_dsl::{DType, Stage};
+    pub use pie_dsl::{DType, Stage};
 }

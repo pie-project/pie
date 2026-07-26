@@ -768,12 +768,12 @@ add_custom_target(pie_driver_cuda_test_fixtures SOURCES
   tests/golden-ptir/structured_masks.txt)
 
 file(GLOB PIE_PTIR_CANONICAL_GOLDENS CONFIGURE_DEPENDS
-  ${CMAKE_CURRENT_SOURCE_DIR}/../../interface/ptir/tests/golden-ptir/*.txt)
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/tests/golden/*.txt)
 pie_add_cuda_target(test_ptir_decoder_limits
   SOURCES ../common/tests/ptir_decoder_limits_test.cpp
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
   TEST_ARGS
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../interface/ptir/tests/malformed_wire_corpus.txt
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/tests/malformed_wire_corpus.txt
     ${PIE_PTIR_CANONICAL_GOLDENS})
 
 # Mixed prefill/decode batch: a continuing T=1 request must reuse its conv window.
@@ -1003,7 +1003,7 @@ pie_add_cuda_target(test_ptir_generated_singleton
     ${PIE_DRIVER_ABI_INCLUDE_DIR}
   LIBS CUDA::cudart CUDA::cuda_driver CUDA::nvrtc
   TEST_ARGS
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../interface/ptir/tests/golden-ptir)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/tests/golden)
 pie_add_cuda_target(test_ptir_grouped_dispatch
   SOURCES
     tests/ptir_grouped_dispatch_test.cpp

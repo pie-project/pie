@@ -518,12 +518,20 @@ impl Inner {
 /// port/store outside it.
 enum Step {
     /// The head still misses `count` device pages; pull them from the pool.
-    Absorb { count: u32 },
+    Absorb {
+        count: u32,
+    },
     /// The head's KV side is covered; finish an allocation with `rs` slots.
-    ServeAllocation { key: EntryKey, demand: Demand },
+    ServeAllocation {
+        key: EntryKey,
+        demand: Demand,
+    },
     /// The head is a restore whose recorded demand is covered; re-validate
     /// its swapped count and board it.
-    ServeRestore { key: EntryKey, pid: ProcessId },
+    ServeRestore {
+        key: EntryKey,
+        pid: ProcessId,
+    },
     /// Nobody waits: return the stranded accumulation to the pool.
     Release(DevicePageReservation),
     Done,
@@ -631,8 +639,7 @@ impl ResidencyPlanner {
     /// re-arms rung 0 (the idle-reclaim scan may find work again). Every
     /// caller pairs it with a poke; only the poke's condition differs.
     fn re_arm_idle_reclaim(&self) {
-        self.idle_reclaim_exhausted
-            .store(false, Ordering::Release);
+        self.idle_reclaim_exhausted.store(false, Ordering::Release);
     }
 
     /// The `(model, driver)` pair this planner manages.
@@ -1058,8 +1065,7 @@ impl ResidencyPlanner {
                         .swap(true, std::sync::atomic::Ordering::AcqRel)
                         && self.port.reclaim_idle() > 0
                     {
-                        self.idle_reclaim_exhausted
-                            .store(false, Ordering::Release);
+                        self.idle_reclaim_exhausted.store(false, Ordering::Release);
                         continue;
                     }
                     self.plan_eviction();
@@ -1087,7 +1093,10 @@ impl ResidencyPlanner {
                         }
                         let kv = inner.accum.donate(demand.kv_pages as usize);
                         let waiter = inner.queue.get_mut(&key).expect("head exists");
-                        let WaitKind::Allocation { outcome, notify, .. } = &mut waiter.kind else {
+                        let WaitKind::Allocation {
+                            outcome, notify, ..
+                        } = &mut waiter.kind
+                        else {
                             unreachable!("ServeAllocation only targets allocation entries");
                         };
                         debug_assert!(outcome.is_none(), "unserved head carries no outcome");
@@ -1230,9 +1239,8 @@ impl ResidencyPlanner {
         let mut candidates: Vec<(ProcessId, u64, bool)> = candidates
             .into_iter()
             .map(|(pid, seq)| {
-                let quiescent = crate::inferlet::process::residency::kv_lease_quiescent(
-                    pid, model, driver,
-                );
+                let quiescent =
+                    crate::inferlet::process::residency::kv_lease_quiescent(pid, model, driver);
                 (pid, seq, quiescent)
             })
             .collect();
@@ -1279,8 +1287,7 @@ impl ResidencyPlanner {
                 let Some(proc) = inner.procs.get_mut(&pid) else {
                     continue;
                 };
-                if proc.state != Residency::Resident || proc.seq <= head_seq || !proc.progressed
-                {
+                if proc.state != Residency::Resident || proc.seq <= head_seq || !proc.progressed {
                     continue;
                 }
                 proc.state = Residency::Evicting;
@@ -1334,7 +1341,9 @@ impl ResidencyPlanner {
             let mut parked = std::collections::HashSet::new();
             for waiter in inner.queue.values() {
                 match &waiter.kind {
-                    WaitKind::Allocation { outcome: Some(_), .. } => return false,
+                    WaitKind::Allocation {
+                        outcome: Some(_), ..
+                    } => return false,
                     _ => {
                         parked.insert(waiter.pid);
                     }
@@ -1404,15 +1413,12 @@ impl ResidencyPlanner {
             return;
         }
         let (model, driver) = self.port.locus();
-        let held = crate::inferlet::process::residency::kv_reclaim_quotes(
-            &[head_pid],
-            model,
-            driver,
-        )
-        .pop()
-        .flatten()
-        .map_or(0, ReclaimQuote::pages)
-            + swapped_page_count(head_pid, model, driver);
+        let held =
+            crate::inferlet::process::residency::kv_reclaim_quotes(&[head_pid], model, driver)
+                .pop()
+                .flatten()
+                .map_or(0, ReclaimQuote::pages)
+                + swapped_page_count(head_pid, model, driver);
         let (_, total) = self.port.device_stats();
         let notify = self.with_inner(|inner| {
             let waiter = inner.queue.get_mut(&head_key)?;
@@ -1504,9 +1510,7 @@ impl ResidencyPlanner {
     /// fences up by simply never reporting a restore.
     fn report_restored(self: &Arc<Self>, pid: ProcessId, restored: u32) {
         let (model, driver) = self.port.locus();
-        for handle in
-            crate::inferlet::process::residency::kv_suspend_handles(pid, model, driver)
-        {
+        for handle in crate::inferlet::process::residency::kv_suspend_handles(pid, model, driver) {
             handle.unfence();
         }
         let signal = self.with_inner(|inner| {
@@ -1690,8 +1694,7 @@ fn micros(elapsed: Duration) -> u64 {
 /// The process's swapped page count on `(model, driver)` — the exact restore
 /// ask, computed fresh at serve time.
 fn swapped_page_count(pid: ProcessId, model: usize, driver: usize) -> u32 {
-    let working_sets =
-        crate::inferlet::process::residency::kv_working_set_ids(pid, model, driver);
+    let working_sets = crate::inferlet::process::residency::kv_working_set_ids(pid, model, driver);
     if working_sets.is_empty() {
         return 0;
     }

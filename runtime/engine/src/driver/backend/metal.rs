@@ -1,8 +1,9 @@
 use anyhow::{Result, anyhow};
 
+use crate::driver::FrameLaunchOutcome;
 use crate::driver::abi::{
-    ChannelDescBorrow, FrameDescBorrow, InstanceDescBorrow, KvCopyDescBorrow,
-    PoolResizeDescBorrow, ProgramDescBorrow, StateCopyDescBorrow,
+    ChannelDescBorrow, FrameDescBorrow, InstanceDescBorrow, KvCopyDescBorrow, PoolResizeDescBorrow,
+    ProgramDescBorrow, StateCopyDescBorrow,
 };
 use crate::driver::channel::RegisteredChannel;
 use crate::driver::command::{
@@ -12,7 +13,6 @@ use crate::driver::command::{
 use crate::driver::completion::{CompletionBroker, SubmissionCompletion};
 use crate::driver::instance::{BoundInstance, InstanceBindingPlan};
 use crate::driver::submission::FrameSubmission;
-use crate::driver::FrameLaunchOutcome;
 
 fn sync_status(status: i32, op: &str) -> Result<()> {
     if status == 0 {
@@ -23,10 +23,9 @@ fn sync_status(status: i32, op: &str) -> Result<()> {
 }
 use pie_driver_abi::{
     PieBytes, PieChannelEndpointBinding, PieDriver, PieDriverCaps, PieDriverCreateDesc,
-    PieModelLoadDesc, pie_metal_bind_instance, pie_metal_close_channel,
-    pie_metal_close_instance, pie_metal_copy_kv, pie_metal_copy_state, pie_metal_create,
-    pie_metal_destroy, pie_metal_launch, pie_metal_load_model,
-    pie_metal_register_channel, pie_metal_register_program,
+    PieModelLoadDesc, pie_metal_bind_instance, pie_metal_close_channel, pie_metal_close_instance,
+    pie_metal_copy_kv, pie_metal_copy_state, pie_metal_create, pie_metal_destroy, pie_metal_launch,
+    pie_metal_load_model, pie_metal_register_channel, pie_metal_register_program,
     pie_metal_resize_pool,
 };
 

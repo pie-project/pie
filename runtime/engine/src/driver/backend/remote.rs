@@ -10,6 +10,7 @@ use pie_driver_abi::{
     TerminalCellState,
 };
 
+use crate::driver::FrameLaunchOutcome;
 use crate::driver::channel::RegisteredChannel;
 use crate::driver::command::{
     ChannelRegistrationPlan, KvCopyPlan, MediaEncodePlan, PoolResizePlan, ProgramRegistration,
@@ -17,7 +18,6 @@ use crate::driver::command::{
 };
 use crate::driver::completion::{CompletionBroker, SubmissionCompletion};
 use crate::driver::instance::{BoundInstance, InstanceBindingPlan};
-use crate::driver::FrameLaunchOutcome;
 use crate::driver::submission::FrameSubmission;
 
 const RPC_DEADLINE: Duration = Duration::from_secs(300);

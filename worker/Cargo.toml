@@ -100,7 +100,7 @@ pie-client = { path = "../client/rust" }
 
 [dev-dependencies]
 tempfile = "3"
-pie-ptir = { path = "../interface/ptir" }
+pie-ir = { path = "../compiler/ir" }
 
 [build-dependencies]
 cmake = "0.1"

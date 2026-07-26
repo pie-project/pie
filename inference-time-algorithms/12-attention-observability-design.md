@@ -213,7 +213,7 @@ signature. **Two variant structs must be maintained.** Decode is unaffected.
 
 ### Layer 2 — PTIR: one appended intrinsic
 
-Follow the `MtpDrafts = 6` precedent exactly (`interface/ptir/src/op.rs:63-67`),
+Follow the `MtpDrafts = 6` precedent exactly (`compiler/ir/src/op.rs:63-67`),
 whose doc comment records the rule: *append, leave 0..6 byte-stable so every
 prior program's bytecode and identity hash is unchanged.*
 
@@ -254,12 +254,12 @@ Update surface, from the `MtpDrafts` precedent
 (`git log -S MtpDrafts`, head `c1e148ef`):
 
 ```
-interface/ptir/src/op.rs              enum + from_u16 + name
-interface/ptir/src/header.rs          generated C enum
-interface/ptir/src/registry.rs        intrinsic_stages()
-interface/ptir/src/validate.rs        scope check + type rule
-interface/ptir/src/interp.rs          PassInputs field + eval root
-interface/ptir/include/ptir_abi.h     PTIR_INTR_ATTN_SCORE = 7
+compiler/ir/src/op.rs              enum + from_u16 + name
+compiler/codegen/src/header.rs          generated C enum
+compiler/ir/src/registry.rs        intrinsic_stages()
+compiler/ir/src/validate.rs        scope check + type rule
+compiler/eval/src/interp.rs          PassInputs field + eval root
+compiler/codegen/include/ptir_abi.h     PTIR_INTR_ATTN_SCORE = 7
 driver/common/.../ptir_abi.h          mirror
 driver/common/.../trace.hpp           C++ mirror enum + static_asserts
 driver/common/.../bound.hpp           wire decode

@@ -284,8 +284,7 @@ async fn drain_detachable(pid: ProcessId) {
 
 async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
     let (model, driver) = planner.locus();
-    let handles =
-        crate::inferlet::process::residency::kv_suspend_handles(pid, model, driver);
+    let handles = crate::inferlet::process::residency::kv_suspend_handles(pid, model, driver);
     let working_sets: HashSet<WorkingSetId> =
         crate::inferlet::process::residency::kv_working_set_ids(pid, model, driver);
     if working_sets.is_empty() {
@@ -311,7 +310,11 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
     // Step 5: lease quiescence — the seal against mid-build stragglers.
     for (index, handle) in fence.handles.iter().enumerate() {
         if handle.active_leases() > 0 {
-            step!(pid, "quiesce: waiting on set {index} ({} lease(s))", handle.active_leases());
+            step!(
+                pid,
+                "quiesce: waiting on set {index} ({} lease(s))",
+                handle.active_leases()
+            );
         }
         handle.quiesce().await;
     }

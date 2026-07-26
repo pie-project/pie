@@ -37,10 +37,15 @@ members = [
     "interface/controller",
     "interface/worker",
     "interface/client",
-    # PTIR — the Pie Tensor IR: the cross-language seam for programmable dataflow
-    # (stage-tagged trace container + validation + versioned wire format).
-    # `no_std` core; the wasm SDK depends on it with `default-features = false`.
-    "interface/ptir",
+    # The tensor-program toolchain: authoring eDSL -> PTIR -> planning ->
+    # CUDA/Metal codegen, plus the reference interpreter every backend diffs
+    # against. `compiler/dsl` is excluded (below): it targets wasm alongside the
+    # rest of the SDK. See `compiler/README.md`.
+    "compiler/ir",
+    "compiler/plan",
+    "compiler/eval",
+    "compiler/codegen",
+    "compiler/tests",
     "driver/dummy",
     "runtime/load-planner",
     "sdk/python-server",
@@ -54,6 +59,9 @@ members = [
 exclude = [
     "tests/inferlets",
     "sdk/rust",
+    # Wasm-target crate like `sdk/rust/*`: the authoring eDSL builds into an
+    # inferlet, so it stays out of the host build graph.
+    "compiler/dsl",
     # Worktree checkouts under .claude/worktrees/ must never be captured by
     # THIS manifest when cargo walks up from a worktree's excluded package
     # (e.g. .claude/worktrees/<x>/tests/inferlets/<name> — the worktree's own root

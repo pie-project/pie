@@ -47,7 +47,7 @@ use crate::pipeline::channel::{BoundCells, Channel, ChannelError};
 use crate::pipeline::instance::ForwardPass;
 use crate::store::kv::working_set::{KvFireLease, KvWorkingSet};
 use crate::store::rs::working_set::RsWorkingSet;
-use pie_ptir::container::HostRole;
+use pie_ir::container::HostRole;
 
 /// A pass's in-flight fires, submit order. The queue mutex is never held across
 /// an await; the async finalizer gate serializes pop-through-finalize instead.
@@ -494,7 +494,6 @@ impl PendingOp {
             })
         )
     }
-
 }
 
 enum FinalizeAction {
@@ -1528,7 +1527,9 @@ pub async fn copy_into_inner<C: FireContext>(
                 // §16.2), not a cleanup-pass alignment.
                 let pid = ctx.process_id();
                 let Some(planner) = crate::planner::planner() else {
-                    return Ok(Err("pipeline copy_into: working set is suspend-fenced".into()));
+                    return Ok(Err(
+                        "pipeline copy_into: working set is suspend-fenced".into()
+                    ));
                 };
                 if let Err(error) = planner.wait_resident(pid).await {
                     return Ok(Err(format!("pipeline copy_into: {error}")));
@@ -1983,17 +1984,18 @@ async fn fire_device_geometry<C: FireContext>(
         .pooled;
     let pooled_write_indexes: Vec<u64> = if pooled {
         let writable = ctx.resources().get(&fwd)?.kv_declaration.writable;
-        let reserved =
-            crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv_store| {
-                kv_store.page_len(ws.id)
-            });
+        let reserved = crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv_store| {
+            kv_store.page_len(ws.id)
+        });
         let span = reserved
             .map_err(|error| error.to_string())
             .and_then(|page_len| writable.resolve(page_len));
         match span {
             Ok(span) => span.collect(),
             Err(error) => {
-                return Ok(Err(format!("pipeline: pool-owned device geometry: {error}")));
+                return Ok(Err(format!(
+                    "pipeline: pool-owned device geometry: {error}"
+                )));
             }
         }
     } else {

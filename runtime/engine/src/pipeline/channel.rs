@@ -47,8 +47,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::driver::ChannelEndpoint;
 use pie_driver_abi::PieChannelEndpointBinding;
-use pie_ptir::container::{self, ChanDType, ChannelDecl, ExternDir, HostRole};
-use pie_ptir::types::DType;
+use pie_ir::container::{self, ChanDType, ChannelDecl, ExternDir, HostRole};
+use pie_ir::types::DType;
 
 /// Process-wide monotonic source of GLOBAL channel identities (0 reserved as a
 /// null sentinel). Minted when the guest constructs a `channel` resource; a
@@ -1095,8 +1095,8 @@ pub fn unpack_bool(wire: &[u8], numel: usize) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pie_ptir::container::{ChanDType, ChannelDecl};
-    use pie_ptir::types::{DType, Shape};
+    use pie_ir::container::{ChanDType, ChannelDecl};
+    use pie_ir::types::{DType, Shape};
 
     fn decl(shape: Shape, dtype: DType, role: HostRole, seeded: bool) -> ChannelDecl {
         ChannelDecl {

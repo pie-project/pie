@@ -1,7 +1,7 @@
 //! Program registry (thrust-3 P2.2/P2.3) — the host-side "register a traced
 //! pass once, cache by identity" counterpart to the inferlet program cache.
 //!
-//! The wire artifact is the **canonical container bytes** (the `pie_ptir`
+//! The wire artifact is the **canonical container bytes** (the `pie_ir`
 //! IR's `container`); the guest cannot bind (bind needs the backend
 //! [`ModelProfile`]). Registration:
 //!
@@ -32,14 +32,14 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use lru::LruCache;
-use pie_ptir::compiler::CompiledStage;
+use pie_ir::container::{self, ContainerDecodeError, PortSource, TraceContainer};
+use pie_ir::container_hash;
+use pie_ir::op::Op;
+use pie_ir::registry::{ModelProfile, Port};
+use pie_ir::validate::{BoundTrace, ValidateError, bind};
+use pie_plan::CompiledStage;
 #[cfg(test)]
-use pie_ptir::compiler::StageSignature;
-use pie_ptir::container::{self, ContainerDecodeError, PortSource, TraceContainer};
-use pie_ptir::container_hash;
-use pie_ptir::op::Op;
-use pie_ptir::registry::{ModelProfile, Port};
-use pie_ptir::validate::{BoundTrace, ValidateError, bind};
+use pie_plan::StageSignature;
 
 /// Registration-time pricing (thrust-3 P2.3): per-instance costs computed once
 /// per program and attached to its identity (feeds thrust-2's capacity
@@ -90,7 +90,7 @@ impl RegisteredProgram {
     /// round-trip test; production reads the signatures through the sidecar
     /// the driver receives.
     #[cfg(test)]
-    pub fn stage_signature(&self, stage: pie_ptir::registry::Stage) -> Option<&StageSignature> {
+    pub fn stage_signature(&self, stage: pie_ir::registry::Stage) -> Option<&StageSignature> {
         self.compiled_stages
             .iter()
             .find(|compiled| compiled.normalized.stage == stage)
@@ -155,16 +155,16 @@ impl Registry {
         let pricing = price(&decoded);
         let channel_accesses = Self::channel_accesses(&decoded);
         let bound = bind(decoded, profile.clone()).map_err(RegisterError::Bind)?;
-        let compiled_stages = pie_ptir::compiler::compile_bound(&bound);
+        let compiled_stages = pie_plan::compile_bound(&bound);
         if std::env::var_os("PIE_PTIR_DUMP_PLAN").is_some() {
             for stage in &compiled_stages {
-                eprintln!("{}", pie_ptir::compiler::debug_stage_plan(stage));
+                eprintln!("{}", pie_plan::debug_stage_plan(stage));
                 eprintln!("  metrics={:?}", stage.metrics());
             }
         }
         // The PTIB sidecar is the host→driver wire form of `BoundTrace`
         // (seed-independent, hash-keyed) — computed once, cached beside pricing.
-        let sidecar = pie_ptir::sidecar::encode_bound_with_plans(&bound, &compiled_stages);
+        let sidecar = pie_plan::sidecar::encode_bound_with_plans(&bound, &compiled_stages);
         let entry = Arc::new(RegisteredProgram {
             bytes,
             hash,
@@ -230,7 +230,7 @@ fn price(c: &TraceContainer) -> Pricing {
     let rows = c
         .ports
         .iter()
-        .find(|p| p.port == pie_ptir::registry::Port::EmbedIndptr)
+        .find(|p| p.port == pie_ir::registry::Port::EmbedIndptr)
         .and_then(|p| match &p.source {
             container::PortSource::Const { shape, .. } => {
                 Some((shape.numel() as u32).saturating_sub(1).max(1))
@@ -305,7 +305,7 @@ fn profile_from(
         vocab,
         page_size,
         num_layers,
-        activation: pie_ptir::types::DType::F32,
+        activation: pie_ir::types::DType::F32,
         has_mtp_logits: ptir.has_mtp_logits,
         has_mtp_drafts: ptir.has_mtp_drafts,
         has_value_head: ptir.has_value_head,
@@ -314,7 +314,7 @@ fn profile_from(
         // replayable (a pure function of the query and the page envelopes) and
         // has no sink scope: it produces a value, it does not consume one.
         kernels: if ptir.has_kv_envelopes {
-            vec![pie_ptir::registry::KernelInfo {
+            vec![pie_ir::registry::KernelInfo {
                 name: "envelope_dot".into(),
                 sink_scope: None,
                 replayable: true,
@@ -328,12 +328,12 @@ fn profile_from(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pie_ptir::container::{
+    use pie_ir::container::{
         ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram,
     };
-    use pie_ptir::op::{IntrinsicId, Op};
-    use pie_ptir::registry::{Port, Stage};
-    use pie_ptir::types::{DType, Shape};
+    use pie_ir::op::{IntrinsicId, Op};
+    use pie_ir::registry::{Port, Stage};
+    use pie_ir::types::{DType, Shape};
 
     const VOCAB: u32 = 32;
 
@@ -605,7 +605,7 @@ mod tests {
         let mut r = reg(4);
         let bytes = greedy(VOCAB).encode();
         let prog = r.register(bytes.clone(), &prof(VOCAB)).unwrap();
-        let decoded = pie_ptir::sidecar::decode_bound(&prog.sidecar).unwrap();
+        let decoded = pie_plan::sidecar::decode_bound(&prog.sidecar).unwrap();
         assert_eq!(
             decoded.container_hash, prog.hash,
             "PTIB inner hash == container identity"
@@ -616,7 +616,7 @@ mod tests {
         let signature = prog
             .stage_signature(Stage::Epilogue)
             .expect("epilogue signature");
-        let plan = pie_ptir::compiler::decode_plan_header(&decoded.stage_plans[0].1).unwrap();
+        let plan = pie_plan::decode_plan_header(&decoded.stage_plans[0].1).unwrap();
         assert_eq!(plan.signature_hash, signature.hash);
     }
 

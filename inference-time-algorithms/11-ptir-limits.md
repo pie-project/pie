@@ -16,7 +16,7 @@ control — all of which now pass on CUDA (`10-implementation-faithfulness-audit
 
 ### The barrier set is narrow, and that is the good news
 
-`region_kind_for_node` (`interface/ptir/src/compiler.rs:1771`) assigns every op
+`region_kind_for_node` (`compiler/plan/src/compile.rs:1771`) assigns every op
 to a region kind. Exactly five op families become their own `Library` region —
 `TopK`, `SortDesc`, `CumSum`/`CumProd`, `MatMul`, and second-party
 `KernelCall`/`SinkCall` — and `compatible_schedule` (`:1782`) makes the first
@@ -215,7 +215,7 @@ answer rather than an error:
    length and the pool boundary.
 4. **The logits feeding a `NucleusSample` must come from the logits intrinsic,
    behind at most a `reshape`.** The compiler's matcher
-   (`match_nucleus_add_order`, `interface/ptir/src/compiler.rs:1393`) matches on
+   (`match_nucleus_add_order`, `compiler/plan/src/compile.rs:1393`) matches on
    *DAG shape only*, so it happily claims a sampler whose logits were produced by
    a `broadcast`, a `gather` or any other op. The driver then assumes what the
    compiler did not check: the nucleus prep in
@@ -258,7 +258,7 @@ because the pattern is what the author is implicitly promised.
 
 Five algorithms in the survey (H2O, SnapKV, TOVA, Quest, RetrievalAttention) are
 unimplementable for one reason: they evict or select KV entries by **attention
-score**, and `IntrinsicId` (`interface/ptir/src/op.rs:49-68`) exposes logits,
+score**, and `IntrinsicId` (`compiler/ir/src/op.rs:49-68`) exposes logits,
 embeddings and geometry but no attention weights. This is not a fusion or
 performance limit; it is a hole in the surface area, and it removes the entire
 KV-eviction family. `attention-sink` and `sliding-window-attention` are in the

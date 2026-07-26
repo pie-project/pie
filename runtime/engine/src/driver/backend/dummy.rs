@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow};
 
+use crate::driver::FrameLaunchOutcome;
 use crate::driver::abi::{
     ChannelDescBorrow, EncodeDescBorrow, FrameDescBorrow, InstanceDescBorrow, KvCopyDescBorrow,
     PoolResizeDescBorrow, ProgramDescBorrow, StateCopyDescBorrow,
@@ -12,7 +13,6 @@ use crate::driver::command::{
 use crate::driver::completion::{CompletionBroker, SubmissionCompletion};
 use crate::driver::instance::{BoundInstance, InstanceBindingPlan};
 use crate::driver::submission::FrameSubmission;
-use crate::driver::FrameLaunchOutcome;
 
 pub struct DummyDriver {
     inner: pie_driver_dummy_lib::DummyDriver,
@@ -41,7 +41,6 @@ impl DummyDriver {
     pub fn export_kv_handle(&self) -> Option<pie_driver_abi::KvHandle> {
         self.inner.export_kv_handle()
     }
-
 
     pub fn load_model(
         &mut self,

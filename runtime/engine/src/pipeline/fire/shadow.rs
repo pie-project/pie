@@ -3,7 +3,7 @@
 //!
 //! The engine mirrors, per bound pass, what each channel's committed cells
 //! hold: seeds at bind, then per fire the net effect of folding the trace's
-//! stage programs through [`pie_ptir::pareval`] (a device-decided value —
+//! stage programs through [`pie_eval::pareval`] (a device-decided value —
 //! sampler output, kernel result — shadows as *unknown* rather than a wrong
 //! guess). A fire's submission-time value for a channel is the Writer put
 //! staged for that fire, else the shadow's front cell.
@@ -15,12 +15,12 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use pie_ptir::container::PortSource;
-use pie_ptir::interp::Value;
-use pie_ptir::op::Op;
-use pie_ptir::pareval::{EvalBlocker, fold_stage};
-use pie_ptir::registry::Stage;
-use pie_ptir::validate::BoundTrace;
+use pie_eval::interp::Value;
+use pie_eval::pareval::{EvalBlocker, fold_stage};
+use pie_ir::container::PortSource;
+use pie_ir::op::Op;
+use pie_ir::registry::Stage;
+use pie_ir::validate::BoundTrace;
 
 use crate::pipeline::channel::{BoundCells, staged_put_bytes};
 use crate::pipeline::instance::ChannelSeed;
@@ -45,7 +45,7 @@ impl HostShadow {
                 .get(seed.channel as usize)
                 .map(|decl| decl.dtype)
             {
-                Some(pie_ptir::container::ChanDType::Concrete(dtype)) => dtype,
+                Some(pie_ir::container::ChanDType::Concrete(dtype)) => dtype,
                 _ => continue,
             };
             let value = Value::from_le_bytes(dtype, &seed.data);
@@ -87,7 +87,7 @@ impl HostShadow {
             && let Some(bytes) = staged_put_bytes(cell)
         {
             let dtype = match bound.container.channels.get(chan as usize)?.dtype {
-                pie_ptir::container::ChanDType::Concrete(dtype) => dtype,
+                pie_ir::container::ChanDType::Concrete(dtype) => dtype,
                 _ => return None,
             };
             return Value::from_le_bytes(dtype, &bytes);
@@ -96,7 +96,7 @@ impl HostShadow {
             && let Some(bytes) = cell.lock().unwrap().front_override()
         {
             let dtype = match bound.container.channels.get(chan as usize)?.dtype {
-                pie_ptir::container::ChanDType::Concrete(dtype) => dtype,
+                pie_ir::container::ChanDType::Concrete(dtype) => dtype,
                 _ => return None,
             };
             return Value::from_le_bytes(dtype, &bytes);
@@ -164,12 +164,12 @@ impl HostShadow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pie_ptir::container::{
+    use pie_ir::container::{
         ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
     };
-    use pie_ptir::op::{IntrinsicId, Op};
-    use pie_ptir::registry::{ModelProfile, Port, Stage};
-    use pie_ptir::types::{DType, Shape};
+    use pie_ir::op::{IntrinsicId, Op};
+    use pie_ir::registry::{ModelProfile, Port, Stage};
+    use pie_ir::types::{DType, Shape};
 
     fn channel(shape: Shape, dtype: DType) -> ChannelDecl {
         ChannelDecl {
@@ -269,7 +269,7 @@ mod tests {
                 ],
             }],
         };
-        let bound = pie_ptir::validate::bind(container, profile).unwrap();
+        let bound = pie_ir::validate::bind(container, profile).unwrap();
         let seeds = vec![
             ChannelSeed {
                 channel: 0,

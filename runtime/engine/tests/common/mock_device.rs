@@ -60,12 +60,12 @@ pub struct EchoBehavior(pub u32);
 impl Behavior for EchoBehavior {}
 
 fn mock_hash_uniform(seed_eff: u64, j: u32) -> f32 {
-    pie_ptir::rng::hash_uniform(seed_eff, j)
+    pie_ir::rng::hash_uniform(seed_eff, j)
 }
 
 /// Deterministic pseudo-random logits row seeded by request id, in ~[-4, 4].
 pub fn synthetic_logits(req_id: u64, vocab: usize) -> Vec<f32> {
-    let seed = req_id ^ pie_ptir::rng::seed_eff(0);
+    let seed = req_id ^ pie_ir::rng::seed_eff(0);
     (0..vocab as u32)
         .map(|j| (mock_hash_uniform(seed, j) * 2.0 - 1.0) * 4.0)
         .collect()

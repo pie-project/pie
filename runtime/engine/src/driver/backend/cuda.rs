@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow};
 
+use crate::driver::FrameLaunchOutcome;
 use crate::driver::abi::{
     ChannelDescBorrow, EncodeDescBorrow, FrameDescBorrow, InstanceDescBorrow, KvCopyDescBorrow,
     PoolResizeDescBorrow, ProgramDescBorrow, StateCopyDescBorrow,
@@ -12,14 +13,12 @@ use crate::driver::command::{
 use crate::driver::completion::{CompletionBroker, SubmissionCompletion};
 use crate::driver::instance::{BoundInstance, InstanceBindingPlan};
 use crate::driver::submission::FrameSubmission;
-use crate::driver::FrameLaunchOutcome;
 use pie_driver_abi::{
     PieBytes, PieChannelEndpointBinding, PieDriver, PieDriverCaps, PieDriverCreateDesc,
-    PieModelLoadDesc, pie_cuda_bind_instance, pie_cuda_close_channel,
-    pie_cuda_close_instance, pie_cuda_copy_kv, pie_cuda_copy_state, pie_cuda_create,
-    pie_cuda_destroy, pie_cuda_encode, pie_cuda_launch,
-    pie_cuda_load_model, pie_cuda_register_channel,
-    pie_cuda_register_program, pie_cuda_resize_pool,
+    PieModelLoadDesc, pie_cuda_bind_instance, pie_cuda_close_channel, pie_cuda_close_instance,
+    pie_cuda_copy_kv, pie_cuda_copy_state, pie_cuda_create, pie_cuda_destroy, pie_cuda_encode,
+    pie_cuda_launch, pie_cuda_load_model, pie_cuda_register_channel, pie_cuda_register_program,
+    pie_cuda_resize_pool,
 };
 
 struct CudaDriverHandle {
