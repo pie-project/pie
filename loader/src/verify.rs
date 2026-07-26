@@ -571,7 +571,7 @@ impl ContractCoverage {
 mod tests {
     use super::*;
     use crate::load_plan::{StorageTarget, compiler_version};
-    use crate::types::{BufferId, Encoding, InstrId, Layout, Sharding, TensorDecl, TensorId};
+    use crate::types::{BufferId, Encoding, InstrId, Layout, TensorDecl, TensorId};
 
     fn decl(name: &str) -> TensorDecl {
         TensorDecl {
@@ -580,7 +580,6 @@ mod tests {
             shape: vec![1],
             encoding: Encoding::Raw(crate::types::DType::U8),
             layout: Layout::dense(1),
-            sharding: Sharding::replicated(),
             alignment: 1,
         }
     }

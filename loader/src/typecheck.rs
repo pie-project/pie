@@ -176,17 +176,6 @@ fn infer_expr(
             validate_repack_spec(index, source, decl, *spec)?;
             Ok(decl.clone())
         }
-        LayoutExpr::Attach {
-            data,
-            metadata,
-            decl,
-        } => {
-            let expected = input_decl(inferred, data.0, index)?.clone();
-            for meta in metadata {
-                let _ = input_decl(inferred, meta.0, index)?;
-            }
-            expect_decl(index, decl, expected)
-        }
         LayoutExpr::Realize {
             input,
             runtime_name,

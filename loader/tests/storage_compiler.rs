@@ -6,7 +6,7 @@ use pie_loader::load_plan::{StorageInstr, StorageTarget, TileMapKind};
 use pie_loader::planner::{compile_load_plan, lower_layout_plan};
 use pie_loader::types::{
     Axis, BackendKind, CheckpointFormat, DType, Encoding, FileId, Layout, Mxfp4MoePolicy,
-    QuantScheme, QuantSpec, RepackLayout, RowMap, Sharding, TensorDecl, TensorId,
+    QuantScheme, QuantSpec, RepackLayout, RowMap, TensorDecl, TensorId,
 };
 
 #[test]
@@ -939,7 +939,6 @@ fn decl(id: u32, name: &str, shape: &[i64], encoding: Encoding) -> TensorDecl {
         shape: shape.to_vec(),
         encoding,
         layout: Layout::dense(1),
-        sharding: Sharding::replicated(),
         alignment: 1,
     }
 }
@@ -1282,7 +1281,6 @@ fn instr_id(instr: &StorageInstr) -> pie_loader::types::InstrId {
         | StorageInstr::SlabScatter { id, .. }
         | StorageInstr::TileMap { id, .. }
         | StorageInstr::CreateView { id, .. }
-        | StorageInstr::Attach { id, .. }
         | StorageInstr::Release { id, .. }
         | StorageInstr::Finalize { id, .. } => *id,
     }

@@ -6,8 +6,8 @@ use crate::error::CompileError;
 use crate::frontend::{plan_from_contracts, runtime_bytes};
 use crate::ir::{GatherPiece, LayoutExpr, LayoutPlan};
 use crate::load_plan::{
-    BufferDecl, DestExtent, DimSpec, LoadPlan, MetadataSpec, SlabPlacement, SourceExtent,
-    StorageInstr, StorageTarget, StridedExtent, TileMapKind, TileSpec, TransformSpec,
+    BufferDecl, DestExtent, DimSpec, LoadPlan, SlabPlacement, SourceExtent, StorageInstr,
+    StorageTarget, StridedExtent, TileMapKind, TileSpec, TransformSpec,
 };
 use crate::optimizer::{OptimizerPassStats, optimize_with_report};
 use crate::typecheck::typecheck;
@@ -233,28 +233,6 @@ impl StorageCompiler<'_> {
                 },
             ),
             LayoutExpr::Repack { input, spec, .. } => self.lower_repack(id, *input, *spec),
-            LayoutExpr::Attach { data, metadata, .. } => {
-                let value = self.value(*data)?;
-                if metadata.is_empty() {
-                    return Ok(value);
-                }
-                let buffer = self.ensure_buffer(*data)?;
-                let mut metadata_buffers = Vec::with_capacity(metadata.len());
-                for meta in metadata {
-                    metadata_buffers.push(self.ensure_buffer(*meta)?);
-                }
-                let instr = self.next_instr();
-                self.program.instrs.push(StorageInstr::Attach {
-                    id: instr,
-                    tensor: buffer,
-                    metadata: metadata_buffers,
-                    spec: MetadataSpec {
-                        kind: "quant".to_string(),
-                    },
-                });
-                self.program.schedule.push(instr);
-                Ok(ValueLoc::Buffer(buffer))
-            }
             LayoutExpr::Realize {
                 input,
                 runtime_name,

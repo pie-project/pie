@@ -109,7 +109,6 @@ fn plan_with_every_instr() -> LoadPlan {
             block_shape: vec![32],
         }),
         layout: Layout::dense(256),
-        sharding: Sharding::replicated(),
         alignment: 256,
     });
     plan.tensors.push(TensorDecl {
@@ -118,7 +117,6 @@ fn plan_with_every_instr() -> LoadPlan {
         shape: vec![4096],
         encoding: Encoding::Raw(DType::BF16),
         layout: Layout::dense(256),
-        sharding: Sharding::replicated(),
         alignment: 256,
     });
     plan.sources.push(SourceTensorDecl {
@@ -235,14 +233,6 @@ fn plan_with_every_instr() -> LoadPlan {
             output: BufferId(13),
             view: dest_extent(13),
             layout: Layout::dense(256),
-        },
-        StorageInstr::Attach {
-            id: InstrId(6),
-            tensor: BufferId(0),
-            metadata: vec![BufferId(20), BufferId(21)],
-            spec: MetadataSpec {
-                kind: "scale".to_string(),
-            },
         },
         StorageInstr::Release {
             id: InstrId(7),
@@ -486,7 +476,7 @@ fn allocate_and_release_carry_only_a_buffer() {
         assert!(!alloc.has_dest);
         assert_eq!(alloc.tile_kind, PieLoaderTileMapKind::None);
 
-        let release = &instrs[7];
+        let release = &instrs[6];
         assert_eq!(release.kind, PieLoaderStorageInstrKind::Release);
         assert_eq!(release.buffer_id, 1);
         assert!(!release.has_source);
@@ -654,13 +644,7 @@ fn scalar_operands_are_published_as_one_element_runs() {
         assert!(view_instr.has_dest);
         assert_eq!(view_instr.dest.buffer_id, 13);
 
-        let attach = &instrs[6];
-        assert_eq!(attach.kind, PieLoaderStorageInstrKind::Attach);
-        assert_eq!(attach.buffer_id, 0);
-        assert_eq!(unsafe { view::u32s(&attach.input_buffers) }, &[20, 21]);
-        assert_eq!(unsafe { view::u32s(&attach.output_buffers) }, &[0]);
-
-        let finalize = &instrs[8];
+        let finalize = &instrs[7];
         assert_eq!(finalize.kind, PieLoaderStorageInstrKind::Finalize);
         assert_eq!(finalize.buffer_id, 0);
         assert_eq!(unsafe { view::u32s(&finalize.output_buffers) }, &[0]);
@@ -677,7 +661,7 @@ fn schedule_and_optimizer_report_survive() {
     with_plan(&plan, |pod| {
         assert_eq!(
             unsafe { view::schedule(pod) },
-            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9][..]
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8][..]
         );
         let passes = unsafe { view::passes(pod) };
         assert_eq!(passes.len(), 1);
@@ -759,7 +743,7 @@ fn plans_can_be_built_and_released_from_other_threads() {
         .collect();
     for handle in handles {
         let (pod, count) = handle.join().unwrap();
-        assert_eq!(count, 10);
+        assert_eq!(count, 9);
         unsafe { arena::release(pod as *mut PieLoaderPlan) };
     }
 }

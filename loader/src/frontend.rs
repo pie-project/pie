@@ -16,9 +16,7 @@ use crate::contract::{Expr, Resolver, TensorType};
 use crate::error::CompileError;
 use crate::ir::{GatherDim, GatherPiece, LayoutExpr, LayoutPlan};
 use crate::load_plan::StorageTarget;
-use crate::types::{
-    DType, Encoding, ExprId, QuantScheme, Sharding, TensorDecl, TensorId, encoding_nbytes,
-};
+use crate::types::{DType, Encoding, ExprId, QuantScheme, TensorDecl, TensorId, encoding_nbytes};
 
 /// How many contiguous stretches one expression may break into before the
 /// compiler refuses to keep going.
@@ -83,7 +81,6 @@ impl Frontend<'_> {
             shape: current_decl.shape.clone(),
             encoding: contract.encoding.clone(),
             layout: contract.layout.clone(),
-            sharding: current_decl.sharding,
             alignment: contract.alignment,
         };
 
@@ -128,7 +125,6 @@ impl Frontend<'_> {
                     shape: out.shape.clone(),
                     encoding: out.encoding.clone(),
                     layout: contract.layout.clone(),
-                    sharding: contract.sharding,
                     alignment: contract.alignment,
                 };
                 let node = self.plan.push(LayoutExpr::Repack {
@@ -156,7 +152,7 @@ impl Frontend<'_> {
             )));
         }
 
-        let (expr, ty, sharding) = match contract.shard_axis.filter(|_| self.target.tp_size > 1) {
+        let (expr, ty) = match contract.shard_axis.filter(|_| self.target.tp_size > 1) {
             Some(axis) => {
                 let index = usize::from(axis.0);
                 let world = i64::from(self.target.tp_size);
@@ -183,17 +179,9 @@ impl Frontend<'_> {
                 let len = base_type.shape[index] / world;
                 let sharded = base.slice(axis.0, i64::from(self.target.tp_rank) * len, len);
                 let ty = self.resolver.infer(&sharded)?;
-                (
-                    sharded,
-                    ty,
-                    Sharding {
-                        axis: Some(axis),
-                        world: self.target.tp_size,
-                        rank: self.target.tp_rank,
-                    },
-                )
+                (sharded, ty)
             }
-            None => (base, base_type, contract.sharding),
+            None => (base, base_type),
         };
 
         let lowering = compile(&expr, self.resolver.checked(), MAX_RUNS)?;
@@ -224,7 +212,6 @@ impl Frontend<'_> {
             shape: ty.shape.clone(),
             encoding: ty.encoding.clone(),
             layout: contract.layout.clone(),
-            sharding,
             alignment: contract.alignment,
         };
         let node = self.plan.push(LayoutExpr::Gather {
@@ -359,7 +346,6 @@ impl Frontend<'_> {
             shape,
             encoding,
             layout: contract.layout.clone(),
-            sharding: quant_decl.sharding,
             alignment: contract.alignment,
         }]
     }
@@ -399,7 +385,6 @@ fn source_decl(raw: &RawTensor) -> TensorDecl {
         shape: raw.shape.clone(),
         encoding: crate::types::normalize_encoding(&raw.encoding),
         layout: raw.layout.clone(),
-        sharding: Sharding::replicated(),
         alignment: raw.layout.alignment.max(1),
     }
 }

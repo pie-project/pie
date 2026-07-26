@@ -187,7 +187,6 @@ impl HostExecutor<'_> {
                     self.buffers
                         .insert(output, BufferLoc::View { input, offset, len });
                 }
-                StorageInstr::Attach { .. } => {}
                 StorageInstr::Release { buffer, .. } => {
                     self.buffers.remove(&buffer);
                 }
@@ -741,7 +740,6 @@ fn instr_id(instr: &StorageInstr) -> crate::types::InstrId {
         | StorageInstr::SlabScatter { id, .. }
         | StorageInstr::TileMap { id, .. }
         | StorageInstr::CreateView { id, .. }
-        | StorageInstr::Attach { id, .. }
         | StorageInstr::Release { id, .. }
         | StorageInstr::Finalize { id, .. } => *id,
     }
@@ -828,7 +826,6 @@ mod tests {
                 shape: vec![2, 2],
                 encoding: Encoding::Raw(DType::U8),
                 layout: Layout::dense(8),
-                sharding: crate::types::Sharding::replicated(),
                 alignment: 8,
             },
             TensorDecl {
@@ -837,7 +834,6 @@ mod tests {
                 shape: vec![2, 2],
                 encoding: Encoding::Raw(DType::U16),
                 layout: Layout::dense(8),
-                sharding: crate::types::Sharding::replicated(),
                 alignment: 8,
             },
         ];

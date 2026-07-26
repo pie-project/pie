@@ -355,11 +355,6 @@ pub struct TransformSpec {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MetadataSpec {
-    pub kind: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StorageInstr {
     Allocate {
         id: InstrId,
@@ -398,12 +393,6 @@ pub enum StorageInstr {
         output: BufferId,
         view: DestExtent,
         layout: Layout,
-    },
-    Attach {
-        id: InstrId,
-        tensor: BufferId,
-        metadata: Vec<BufferId>,
-        spec: MetadataSpec,
     },
     Release {
         id: InstrId,
@@ -484,7 +473,6 @@ impl LoadPlan {
                 }
                 StorageInstr::TileMap { .. } => s.tile_map_count += 1,
                 StorageInstr::CreateView { .. } => s.create_view_count += 1,
-                StorageInstr::Attach { .. } => s.attach_count += 1,
                 StorageInstr::Release { .. } => s.release_count += 1,
                 StorageInstr::Finalize { .. } => s.finalize_count += 1,
             }
@@ -512,7 +500,6 @@ pub struct LoadPlanSummary {
     pub slab_scatter_payload_bytes: u64,
     pub tile_map_count: usize,
     pub create_view_count: usize,
-    pub attach_count: usize,
     pub release_count: usize,
     pub finalize_count: usize,
 }
@@ -548,7 +535,7 @@ impl std::fmt::Display for LoadPlanSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Axis, Layout, QuantScheme, QuantSpec, Sharding, TensorId};
+    use crate::types::{Axis, Layout, QuantScheme, QuantSpec, TensorId};
 
     fn tensor(id: u32, name: &str, encoding: Encoding) -> TensorDecl {
         TensorDecl {
@@ -557,7 +544,6 @@ mod tests {
             shape: vec![8, 32],
             encoding,
             layout: Layout { alignment: 256 },
-            sharding: Sharding::replicated(),
             alignment: 256,
         }
     }

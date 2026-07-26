@@ -10,7 +10,7 @@ use super::*;
 use crate::load_plan::{
     BufferDecl, DimSpec, LoadPlan, SourceTensorDecl, StorageInstr, TileSpec, TransformSpec,
 };
-use crate::types::{FileId, InstrId, Layout, QuantSpec, Sharding, TensorId};
+use crate::types::{FileId, InstrId, Layout, QuantSpec, TensorId};
 
 const MIB: u64 = 1024 * 1024;
 
@@ -256,7 +256,6 @@ fn encode_plan(encoding: Encoding, rows: i64, cols: i64) -> LoadPlan {
         shape: vec![rows, cols],
         encoding: Encoding::Raw(DType::BF16),
         layout: Layout::dense(1),
-        sharding: Sharding::replicated(),
         alignment: 1,
     });
     plan.buffers.push(BufferDecl {

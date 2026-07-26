@@ -243,23 +243,6 @@ impl Layout {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Sharding {
-    pub axis: Option<Axis>,
-    pub world: u32,
-    pub rank: u32,
-}
-
-impl Sharding {
-    pub fn replicated() -> Self {
-        Self {
-            axis: None,
-            world: 1,
-            rank: 0,
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TensorDecl {
     pub id: TensorId,
@@ -267,7 +250,6 @@ pub struct TensorDecl {
     pub shape: Vec<i64>,
     pub encoding: Encoding,
     pub layout: Layout,
-    pub sharding: Sharding,
     pub alignment: u32,
 }
 
@@ -276,7 +258,6 @@ impl TensorDecl {
         self.shape == other.shape
             && self.encoding == other.encoding
             && self.layout == other.layout
-            && self.sharding == other.sharding
             && self.alignment == other.alignment
     }
 

@@ -335,11 +335,6 @@
       "layout": {
         "alignment": 256
       },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
-      },
       "alignment": 256
     },
     {
@@ -353,11 +348,6 @@
       },
       "layout": {
         "alignment": 256
-      },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
       },
       "alignment": 256
     },
@@ -383,11 +373,6 @@
       "layout": {
         "alignment": 256
       },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
-      },
       "alignment": 256
     },
     {
@@ -401,11 +386,6 @@
       },
       "layout": {
         "alignment": 256
-      },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
       },
       "alignment": 256
     },
@@ -431,11 +411,6 @@
       "layout": {
         "alignment": 256
       },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
-      },
       "alignment": 256
     },
     {
@@ -449,11 +424,6 @@
       },
       "layout": {
         "alignment": 256
-      },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
       },
       "alignment": 256
     },
@@ -479,11 +449,6 @@
       "layout": {
         "alignment": 256
       },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
-      },
       "alignment": 256
     },
     {
@@ -497,11 +462,6 @@
       },
       "layout": {
         "alignment": 256
-      },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
       },
       "alignment": 256
     },
@@ -527,11 +487,6 @@
       "layout": {
         "alignment": 256
       },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
-      },
       "alignment": 256
     },
     {
@@ -546,11 +501,6 @@
       "layout": {
         "alignment": 256
       },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
-      },
       "alignment": 256
     },
     {
@@ -564,11 +514,6 @@
       },
       "layout": {
         "alignment": 256
-      },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
       },
       "alignment": 256
     },
@@ -594,11 +539,6 @@
       "layout": {
         "alignment": 256
       },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
-      },
       "alignment": 256
     },
     {
@@ -612,11 +552,6 @@
       },
       "layout": {
         "alignment": 256
-      },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
       },
       "alignment": 256
     },
@@ -642,11 +577,6 @@
       "layout": {
         "alignment": 256
       },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
-      },
       "alignment": 256
     },
     {
@@ -660,11 +590,6 @@
       },
       "layout": {
         "alignment": 256
-      },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
       },
       "alignment": 256
     },
@@ -690,11 +615,6 @@
       "layout": {
         "alignment": 256
       },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
-      },
       "alignment": 256
     },
     {
@@ -709,11 +629,6 @@
       "layout": {
         "alignment": 256
       },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
-      },
       "alignment": 256
     },
     {
@@ -727,11 +642,6 @@
       },
       "layout": {
         "alignment": 256
-      },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
       },
       "alignment": 256
     },
@@ -757,11 +667,6 @@
       "layout": {
         "alignment": 256
       },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
-      },
       "alignment": 256
     },
     {
@@ -775,11 +680,6 @@
       },
       "layout": {
         "alignment": 256
-      },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
       },
       "alignment": 256
     },
@@ -805,11 +705,6 @@
       "layout": {
         "alignment": 256
       },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
-      },
       "alignment": 256
     },
     {
@@ -823,11 +718,6 @@
       },
       "layout": {
         "alignment": 256
-      },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
       },
       "alignment": 256
     },
@@ -853,11 +743,6 @@
       "layout": {
         "alignment": 256
       },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
-      },
       "alignment": 256
     },
     {
@@ -871,11 +756,6 @@
       },
       "layout": {
         "alignment": 256
-      },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
       },
       "alignment": 256
     },
@@ -901,11 +781,6 @@
       "layout": {
         "alignment": 256
       },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
-      },
       "alignment": 256
     },
     {
@@ -920,11 +795,6 @@
       "layout": {
         "alignment": 256
       },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
-      },
       "alignment": 256
     },
     {
@@ -938,11 +808,6 @@
       },
       "layout": {
         "alignment": 256
-      },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
       },
       "alignment": 256
     },
@@ -968,11 +833,6 @@
       "layout": {
         "alignment": 256
       },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
-      },
       "alignment": 256
     },
     {
@@ -986,11 +846,6 @@
       },
       "layout": {
         "alignment": 256
-      },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
       },
       "alignment": 256
     },
@@ -1016,11 +871,6 @@
       "layout": {
         "alignment": 256
       },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
-      },
       "alignment": 256
     },
     {
@@ -1034,11 +884,6 @@
       },
       "layout": {
         "alignment": 256
-      },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
       },
       "alignment": 256
     },
@@ -1064,11 +909,6 @@
       "layout": {
         "alignment": 256
       },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
-      },
       "alignment": 256
     },
     {
@@ -1082,11 +922,6 @@
       },
       "layout": {
         "alignment": 256
-      },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
       },
       "alignment": 256
     },
@@ -1102,11 +937,6 @@
       "layout": {
         "alignment": 256
       },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
-      },
       "alignment": 256
     },
     {
@@ -1121,11 +951,6 @@
       },
       "layout": {
         "alignment": 256
-      },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
       },
       "alignment": 256
     }

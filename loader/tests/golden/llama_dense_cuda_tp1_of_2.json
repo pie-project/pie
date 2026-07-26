@@ -335,11 +335,6 @@
       "layout": {
         "alignment": 256
       },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
-      },
       "alignment": 256
     },
     {
@@ -353,11 +348,6 @@
       },
       "layout": {
         "alignment": 256
-      },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
       },
       "alignment": 256
     },
@@ -374,11 +364,6 @@
       "layout": {
         "alignment": 256
       },
-      "sharding": {
-        "axis": 0,
-        "world": 2,
-        "rank": 1
-      },
       "alignment": 256
     },
     {
@@ -393,11 +378,6 @@
       },
       "layout": {
         "alignment": 256
-      },
-      "sharding": {
-        "axis": 0,
-        "world": 2,
-        "rank": 1
       },
       "alignment": 256
     },
@@ -414,11 +394,6 @@
       "layout": {
         "alignment": 256
       },
-      "sharding": {
-        "axis": 0,
-        "world": 2,
-        "rank": 1
-      },
       "alignment": 256
     },
     {
@@ -434,11 +409,6 @@
       "layout": {
         "alignment": 256
       },
-      "sharding": {
-        "axis": 1,
-        "world": 2,
-        "rank": 1
-      },
       "alignment": 256
     },
     {
@@ -452,11 +422,6 @@
       },
       "layout": {
         "alignment": 256
-      },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
       },
       "alignment": 256
     },
@@ -473,11 +438,6 @@
       "layout": {
         "alignment": 256
       },
-      "sharding": {
-        "axis": 0,
-        "world": 2,
-        "rank": 1
-      },
       "alignment": 256
     },
     {
@@ -492,11 +452,6 @@
       },
       "layout": {
         "alignment": 256
-      },
-      "sharding": {
-        "axis": 0,
-        "world": 2,
-        "rank": 1
       },
       "alignment": 256
     },
@@ -513,11 +468,6 @@
       "layout": {
         "alignment": 256
       },
-      "sharding": {
-        "axis": 1,
-        "world": 2,
-        "rank": 1
-      },
       "alignment": 256
     },
     {
@@ -531,11 +481,6 @@
       },
       "layout": {
         "alignment": 256
-      },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
       },
       "alignment": 256
     },
@@ -552,11 +497,6 @@
       "layout": {
         "alignment": 256
       },
-      "sharding": {
-        "axis": 0,
-        "world": 2,
-        "rank": 1
-      },
       "alignment": 256
     },
     {
@@ -571,11 +511,6 @@
       },
       "layout": {
         "alignment": 256
-      },
-      "sharding": {
-        "axis": 0,
-        "world": 2,
-        "rank": 1
       },
       "alignment": 256
     },
@@ -592,11 +527,6 @@
       "layout": {
         "alignment": 256
       },
-      "sharding": {
-        "axis": 0,
-        "world": 2,
-        "rank": 1
-      },
       "alignment": 256
     },
     {
@@ -612,11 +542,6 @@
       "layout": {
         "alignment": 256
       },
-      "sharding": {
-        "axis": 1,
-        "world": 2,
-        "rank": 1
-      },
       "alignment": 256
     },
     {
@@ -630,11 +555,6 @@
       },
       "layout": {
         "alignment": 256
-      },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
       },
       "alignment": 256
     },
@@ -651,11 +571,6 @@
       "layout": {
         "alignment": 256
       },
-      "sharding": {
-        "axis": 0,
-        "world": 2,
-        "rank": 1
-      },
       "alignment": 256
     },
     {
@@ -670,11 +585,6 @@
       },
       "layout": {
         "alignment": 256
-      },
-      "sharding": {
-        "axis": 0,
-        "world": 2,
-        "rank": 1
       },
       "alignment": 256
     },
@@ -691,11 +601,6 @@
       "layout": {
         "alignment": 256
       },
-      "sharding": {
-        "axis": 1,
-        "world": 2,
-        "rank": 1
-      },
       "alignment": 256
     },
     {
@@ -709,11 +614,6 @@
       },
       "layout": {
         "alignment": 256
-      },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
       },
       "alignment": 256
     },
@@ -729,11 +629,6 @@
       },
       "layout": {
         "alignment": 256
-      },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
       },
       "alignment": 256
     }

@@ -109,7 +109,6 @@ impl DefaultAbiBuilder<'_> {
                 encoding: Encoding::Raw(DType::BF16),
                 shape: vec![candidate.rows, candidate.cols],
                 layout: Layout::dense(self.alignment()),
-                sharding: Sharding::replicated(),
                 alignment: self.alignment(),
                 shard_axis: None,
             });
@@ -161,7 +160,6 @@ impl DefaultAbiBuilder<'_> {
                 encoding: Encoding::Raw(DType::BF16),
                 shape: vec![candidate.rows, candidate.cols],
                 layout: Layout::dense(self.alignment()),
-                sharding: Sharding::replicated(),
                 alignment: self.alignment(),
                 shard_axis: None,
             });

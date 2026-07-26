@@ -116,9 +116,7 @@ pub(super) fn recompute_memory_plan(program: &mut LoadPlan) -> Result<(), Compil
                 transform_scratch_peak_bytes =
                     transform_scratch_peak_bytes.max(write_bytes.max(transform.scratch_bytes));
             }
-            StorageInstr::CreateView { .. }
-            | StorageInstr::Attach { .. }
-            | StorageInstr::Finalize { .. } => {}
+            StorageInstr::CreateView { .. } | StorageInstr::Finalize { .. } => {}
         }
     }
 

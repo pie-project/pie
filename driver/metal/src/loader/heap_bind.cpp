@@ -240,8 +240,6 @@ BoundDecode stage_decode_storage(
             }
             break;
         }
-        case K::Attach:
-            break;
         case K::Release:
             buffers.erase(instr.buffer_id);
             break;

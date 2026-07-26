@@ -92,11 +92,6 @@ pub enum LayoutExpr {
         spec: RepackSpec,
         decl: TensorDecl,
     },
-    Attach {
-        data: ExprId,
-        metadata: Vec<ExprId>,
-        decl: TensorDecl,
-    },
     Realize {
         input: ExprId,
         runtime_name: String,
@@ -166,11 +161,6 @@ impl LayoutExpr {
                 out.extend(metadata.iter().copied());
                 out
             }
-            Self::Attach { data, metadata, .. } => {
-                let mut out = vec![*data];
-                out.extend(metadata.iter().copied());
-                out
-            }
         }
     }
 
@@ -183,7 +173,6 @@ impl LayoutExpr {
             | Self::Encode { decl, .. }
             | Self::Transcode { decl, .. }
             | Self::Repack { decl, .. }
-            | Self::Attach { decl, .. }
             | Self::Realize { decl, .. } => decl,
         }
     }
@@ -197,7 +186,6 @@ impl LayoutExpr {
             | Self::Encode { decl, .. }
             | Self::Transcode { decl, .. }
             | Self::Repack { decl, .. }
-            | Self::Attach { decl, .. }
             | Self::Realize { decl, .. } => decl,
         }
     }

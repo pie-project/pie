@@ -5,7 +5,7 @@ use crate::error::CompileError;
 use crate::load_plan::StorageTarget;
 use crate::types::{
     Axis, BackendKind, DType, Encoding, Layout, Mxfp4MoePolicy, QuantScheme, QuantSpec,
-    RepackLayout, RepackSpec, RowMap, Sharding, TensorId,
+    RepackLayout, RepackSpec, RowMap, TensorId,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -36,7 +36,6 @@ pub struct RuntimeTensorContract {
     pub encoding: Encoding,
     pub shape: Vec<i64>,
     pub layout: Layout,
-    pub sharding: Sharding,
     pub alignment: u32,
     pub shard_axis: Option<Axis>,
 }
@@ -363,7 +362,6 @@ impl RuntimeAbi {
             encoding: first.encoding.clone(),
             shape: vec![local_rows * indices.len() as i64, cols],
             layout: first.layout.clone(),
-            sharding: Sharding::replicated(),
             alignment: first.alignment,
             shard_axis: None,
         });
@@ -377,7 +375,6 @@ impl RuntimeAbi {
                 encoding: original.encoding.clone(),
                 shape: vec![local_rows, cols],
                 layout: original.layout.clone(),
-                sharding: Sharding::replicated(),
                 alignment: original.alignment,
                 shard_axis: None,
             });
@@ -488,7 +485,6 @@ impl DefaultAbiBuilder<'_> {
             encoding: raw.encoding.clone(),
             shape: raw.shape.clone(),
             layout: Layout::dense(self.alignment()),
-            sharding: Sharding::replicated(),
             alignment: self.alignment(),
             shard_axis,
         });
@@ -581,7 +577,6 @@ impl DefaultAbiBuilder<'_> {
             encoding: Encoding::Quant(spec),
             shape: raw.shape.clone(),
             layout: Layout::dense(self.alignment()),
-            sharding: Sharding::replicated(),
             alignment: self.alignment(),
             shard_axis: self.shard_axis(&raw.name),
         });
@@ -595,7 +590,6 @@ impl DefaultAbiBuilder<'_> {
             encoding: Encoding::Raw(self.dtype(raw)),
             shape,
             layout: Layout::dense(self.alignment()),
-            sharding: Sharding::replicated(),
             alignment: self.alignment(),
             shard_axis: None,
         });
@@ -620,7 +614,6 @@ impl DefaultAbiBuilder<'_> {
             encoding,
             shape,
             layout: Layout::dense(self.alignment()),
-            sharding: Sharding::replicated(),
             alignment: self.alignment(),
             shard_axis: None,
         });
@@ -770,7 +763,6 @@ mod tests {
             encoding: Encoding::Raw(DType::U8),
             shape: vec![1],
             layout: Layout::dense(1),
-            sharding: Sharding::replicated(),
             alignment: 1,
             shard_axis: None,
         }

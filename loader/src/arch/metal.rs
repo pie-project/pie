@@ -115,7 +115,6 @@ impl DefaultAbiBuilder<'_> {
             encoding,
             shape: vec![rows, logical_cols],
             layout: Layout::dense(self.alignment()),
-            sharding: Sharding::replicated(),
             alignment: self.alignment(),
             shard_axis: None,
         });

@@ -181,7 +181,6 @@ impl DefaultAbiBuilder<'_> {
                 encoding: Encoding::Raw(s.dtype),
                 shape: s.gate_up_shape,
                 layout: Layout::dense(align),
-                sharding: Sharding::replicated(),
                 alignment: align,
                 shard_axis: None,
             });
@@ -191,7 +190,6 @@ impl DefaultAbiBuilder<'_> {
                 encoding: Encoding::Raw(s.dtype),
                 shape: s.down_shape,
                 layout: Layout::dense(align),
-                sharding: Sharding::replicated(),
                 alignment: align,
                 shard_axis: None,
             });

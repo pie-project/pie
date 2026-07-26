@@ -119,7 +119,6 @@ impl DefaultAbiBuilder<'_> {
             encoding: Encoding::Raw(DType::BF16),
             shape: vec![expert_count * local_intermediate, hidden],
             layout: Layout::dense(self.alignment()),
-            sharding: Sharding::replicated(),
             alignment: self.alignment(),
             shard_axis: None,
         });
@@ -134,7 +133,6 @@ impl DefaultAbiBuilder<'_> {
             encoding: Encoding::Raw(DType::BF16),
             shape: vec![expert_count * hidden, full_intermediate],
             layout: Layout::dense(self.alignment()),
-            sharding: Sharding::replicated(),
             alignment: self.alignment(),
             shard_axis: (self.target.tp_size > 1).then_some(Axis(1)),
         });
@@ -153,7 +151,6 @@ impl DefaultAbiBuilder<'_> {
                 encoding: Encoding::Raw(DType::BF16),
                 shape: vec![local_intermediate, hidden],
                 layout: Layout::dense(self.alignment()),
-                sharding: Sharding::replicated(),
                 alignment: self.alignment(),
                 shard_axis: None,
             });
@@ -164,22 +161,12 @@ impl DefaultAbiBuilder<'_> {
             let expert = i64::try_from(expert).map_err(|_| {
                 CompileError::InvalidInput("Nemotron-H expert index does not fit i64".to_string())
             })?;
-            let sharding = if self.target.tp_size > 1 {
-                Sharding {
-                    axis: Some(Axis(1)),
-                    world: self.target.tp_size,
-                    rank: self.target.tp_rank,
-                }
-            } else {
-                Sharding::replicated()
-            };
             self.tensors.push(RuntimeTensorContract {
                 output_name: raw.name.clone(),
                 expr: Expr::out(down_name.clone()).slice(0, expert * hidden, hidden),
                 encoding: Encoding::Raw(DType::BF16),
                 shape: vec![hidden, local_intermediate],
                 layout: Layout::dense(self.alignment()),
-                sharding,
                 alignment: self.alignment(),
                 shard_axis: None,
             });

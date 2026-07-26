@@ -259,7 +259,7 @@ fn quant_or_none(scheme: Option<QuantScheme>) -> PieLoaderQuantScheme {
 ///   dim of `span_bytes`) against the sentinel buffer, which is what makes the
 ///   arena-relative write representable in the same struct as a buffer-relative
 ///   one.
-/// * `CreateView`, `Attach`, and `Finalize` publish their scalar operands as
+/// * `CreateView` and `Finalize` publish their scalar operands as
 ///   one-element `input_buffers`/`output_buffers` runs, so a consumer walking
 ///   dataflow edges never has to special-case them.
 fn flatten_instr(arena: &mut PlanArena, instr: &StorageInstr) -> PieLoaderStorageInstrView {
@@ -381,18 +381,6 @@ fn flatten_instr(arena: &mut PlanArena, instr: &StorageInstr) -> PieLoaderStorag
             out.buffer_id = output.0;
             out.dest = arena.dest_extent(view);
             out.has_dest = true;
-        }
-        StorageInstr::Attach {
-            id,
-            tensor,
-            metadata,
-            spec: _,
-        } => {
-            out.id = id.0;
-            out.kind = PieLoaderStorageInstrKind::Attach;
-            out.buffer_id = tensor.0;
-            out.input_buffers = arena.store_u32(metadata.iter().map(|b| b.0));
-            out.output_buffers = arena.store_u32([tensor.0]);
         }
         StorageInstr::Release { id, buffer } => {
             out.id = id.0;
