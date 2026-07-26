@@ -428,6 +428,145 @@ void dispatch_attention_flashinfer_decode_bf16(
     CUDA_CHECK(status);
 }
 
+// ── Score-observing decode ─────────────────────────────────────────────────
+
+// Turn the captured scaled logits into attention probabilities, in place.
+//
+// This is a plain row-wise softmax and NOT an approximation: at decode
+// `qo_len == 1`, so the row the variant captured is the complete set of
+// logits the kernel's own online softmax consumed. Recomputing the
+// denominator here is therefore exact, and it means the decode path does not
+// have to allocate or plumb an LSE buffer it otherwise never needs.
+//
+// `kv_len` is derived from the page CSR rather than passed in. That is
+// deliberate: the CSR is the single source of truth for sequence length in
+// this driver (`kernels/geometry.cu`), and a second, independently-computed
+// length is exactly how a silent mis-attribution bug gets in.
+__global__ void k_attn_score_normalize(
+    float* __restrict__ scores,
+    const std::int32_t* __restrict__ score_indptr,
+    const std::uint32_t* __restrict__ kv_page_indptr,
+    const std::uint32_t* __restrict__ kv_last_page_lens,
+    int page_size)
+{
+    constexpr int kThreads = 256;
+    __shared__ float shared[kThreads];
+
+    const int request = static_cast<int>(blockIdx.x);
+    const int head = static_cast<int>(blockIdx.y);
+    const int pages = static_cast<int>(kv_page_indptr[request + 1]) -
+                      static_cast<int>(kv_page_indptr[request]);
+    if (pages <= 0) return;
+    const int kv_len =
+        (pages - 1) * page_size + static_cast<int>(kv_last_page_lens[request]);
+    if (kv_len <= 0) return;
+
+    float* row = scores + static_cast<std::size_t>(score_indptr[request]) +
+                 static_cast<std::size_t>(head) * static_cast<std::size_t>(kv_len);
+
+    float local = -INFINITY;
+    for (int i = threadIdx.x; i < kv_len; i += kThreads) {
+        local = fmaxf(local, row[i]);
+    }
+    shared[threadIdx.x] = local;
+    __syncthreads();
+    for (int stride = kThreads / 2; stride > 0; stride >>= 1) {
+        if (static_cast<int>(threadIdx.x) < stride) {
+            shared[threadIdx.x] =
+                fmaxf(shared[threadIdx.x], shared[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    const float row_max = shared[0];
+    __syncthreads();
+
+    float total = 0.f;
+    for (int i = threadIdx.x; i < kv_len; i += kThreads) {
+        const float e = __expf(row[i] - row_max);
+        row[i] = e;
+        total += e;
+    }
+    shared[threadIdx.x] = total;
+    __syncthreads();
+    for (int stride = kThreads / 2; stride > 0; stride >>= 1) {
+        if (static_cast<int>(threadIdx.x) < stride) {
+            shared[threadIdx.x] += shared[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    const float denom = shared[0];
+    if (denom <= 0.f) return;
+    const float inv = 1.f / denom;
+    for (int i = threadIdx.x; i < kv_len; i += kThreads) {
+        row[i] *= inv;
+    }
+}
+
+void dispatch_attention_flashinfer_decode_capture_bf16(
+    const DecodePlanCache& cache,
+    const void* q, void* k_pages, void* v_pages, void* o,
+    const std::uint32_t* kv_page_indices_d,
+    const std::uint32_t* kv_page_indptr_d,
+    const std::uint32_t* kv_last_page_lens_d,
+    AttentionWorkspace& workspace,
+    cudaStream_t stream,
+    float* score_out,
+    const std::int32_t* score_indptr_d,
+    int window_left,
+    float logits_soft_cap,
+    float sm_scale,
+    float* lse_out)
+{
+    if (!cache.valid) {
+        throw std::runtime_error(
+            "dispatch_attention_flashinfer_decode_capture_bf16: cache is "
+            "empty; call plan_attention_flashinfer_decode_bf16 first");
+    }
+    if (score_out == nullptr || score_indptr_d == nullptr) {
+        throw std::invalid_argument(
+            "dispatch_attention_flashinfer_decode_capture_bf16: score sink is "
+            "null");
+    }
+    if (logits_soft_cap > 0.f) {
+        throw std::invalid_argument(
+            "attention score capture does not support logits_soft_cap: the "
+            "hook would record cap*tanh(s/cap), which is not the pre-softmax "
+            "score H2O/TOVA define their eviction policy over");
+    }
+    if (window_left >= 0) {
+        throw std::invalid_argument(
+            "attention score capture does not support sliding-window "
+            "attention: LogitsMask runs after LogitsTransform, so the "
+            "captured row would include positions the softmax discards");
+    }
+
+    const fa2::DecodeScoreSink sink{
+        score_out, reinterpret_cast<const fa2::IdType*>(score_indptr_d)};
+
+    cudaError_t status;
+    switch (cache.head_dim) {
+#define PIE_ATTN_HEAD_DIM(HD)                                                \
+        case HD:                                                             \
+            status = AttnHd<HD>::dispatch_decode_capture(                    \
+                cache, q, k_pages, v_pages, o, kv_page_indices_d,            \
+                kv_page_indptr_d, kv_last_page_lens_d, workspace, stream,    \
+                window_left, logits_soft_cap, sm_scale, lse_out, sink);      \
+            break;
+#include "kernels.def"
+        default:
+            throw_unsupported_head_dim(
+                "flashinfer decode capture dispatch", cache.head_dim);
+    }
+    CUDA_CHECK(status);
+
+    const dim3 grid(static_cast<unsigned>(cache.num_requests),
+                    static_cast<unsigned>(cache.num_q_heads));
+    k_attn_score_normalize<<<grid, 256, 0, stream>>>(
+        score_out, score_indptr_d, kv_page_indptr_d, kv_last_page_lens_d,
+        cache.page_size);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void dispatch_attention_flashinfer_decode(
     const DecodePlanCache& cache,
     const void* q,

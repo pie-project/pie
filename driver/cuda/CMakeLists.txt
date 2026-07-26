@@ -811,6 +811,10 @@ pie_add_cuda_target(test_decode_batch_parity
   SOURCES tests/test_decode_batch_parity.cu
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/tests
   LIBS pie_driver_cuda_lib CUDA::cudart)
+pie_add_cuda_target(test_attn_score_capture
+  SOURCES tests/test_attn_score_capture.cu
+  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/tests
+  LIBS pie_driver_cuda_lib CUDA::cudart)
 pie_add_cuda_target(test_decode_fused_write_parity
   SOURCES tests/test_decode_fused_write_parity.cu
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/tests

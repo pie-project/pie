@@ -53,6 +53,7 @@
 #include "kernels_manifest.hpp"
 #include "kernels/kv_paged.hpp"
 #include "ops/attention_flashinfer_hopper.hpp"
+#include "ops/attention_score_capture.cuh"
 
 namespace pie_cuda_driver::ops {
 
@@ -122,6 +123,33 @@ using AttnVariantCustomSoftcap = ::flashinfer::DefaultAttention<
 
 using DecodeParams  = ::flashinfer::BatchDecodeParams<DTypeQ, DTypeKV, DTypeO, IdType>;
 using PrefillParams = ::flashinfer::BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeO, IdType>;
+
+// Score-observing decode (design §3). Both capture variants wrap a stock
+// `DefaultAttention`, so attention output stays bit-identical to the
+// uncaptured path; only the side-channel is new.
+//
+// Neither soft-cap nor sliding-window is instantiated here, and that is a
+// deliberate refusal rather than an omission:
+//
+//  * soft-cap rewrites the score to `cap * tanh(s / cap)`, so what the hook
+//    would record is not the quantity H2O/TOVA define their policy over;
+//  * sliding-window masks positions in `LogitsMask`, which runs *after*
+//    `LogitsTransform` -- captured rows would include scores the softmax
+//    then discards, and the normalisation kernel (which derives its own
+//    denominator) would silently spread mass onto masked positions.
+//
+// `dispatch_decode_capture` rejects both cases loudly instead.
+using AttnScoreCapture     = PieScoreCapture<AttnVariant>;
+using AttnScoreCaptureFull = PieScoreCapture<AttnVariantFull>;
+
+using DecodeScoreParams = PieScoreParams<DecodeParams, IdType>;
+
+/// Where a score-observing decode deposits `p[head, kv_idx]`, ragged over the
+/// batch. Both pointers are device memory owned by the caller.
+struct DecodeScoreSink {
+    float* scores = nullptr;
+    const IdType* indptr = nullptr;
+};
 
 // flashinfer's `GetPtrFromBaseOffset` is `(base + offset_bytes) reinterpret to T*`.
 template <typename T>
@@ -332,6 +360,25 @@ struct AttnHd {
         float sm_scale,
         float* lse_out);
 
+    /// Score-observing decode. Same kernel, same plan, plus a
+    /// `[num_qo_heads, kv_len]` per-request score row written through the
+    /// variant's `LogitsTransform` hook. Returns `cudaErrorInvalidValue` if
+    /// the configuration is one where a captured score would not mean what
+    /// H2O/TOVA assume it means (soft-cap or sliding window).
+    static cudaError_t dispatch_decode_capture(
+        const DecodePlanCache& cache,
+        const void* q, void* k_pages, void* v_pages, void* o,
+        const std::uint32_t* kv_page_indices_d,
+        const std::uint32_t* kv_page_indptr_d,
+        const std::uint32_t* kv_last_page_lens_d,
+        AttentionWorkspace& workspace,
+        cudaStream_t stream,
+        int window_left,
+        float logits_soft_cap,
+        float sm_scale,
+        float* lse_out,
+        const DecodeScoreSink& sink);
+
     /// Prefill with a built-in mask. `causal_mask` only reaches the kernel on
     /// the full-attention variants: the sliding-window variants are causal by
     /// construction, so a kNone instantiation of them would be dead.
@@ -354,7 +401,7 @@ private:
         PrefillParams& params, const ::flashinfer::PrefillPlanInfo& plan_info,
         DTypeO* tmp_v, float* tmp_s, bool enable_pdl, cudaStream_t stream);
 
-    template <class Variant>
+    template <class Variant, class Params = DecodeParams>
     static cudaError_t run_decode(
         const DecodePlanCache& cache,
         const void* q, void* k_pages, void* v_pages, void* o,
@@ -366,7 +413,8 @@ private:
         int window_left,
         float logits_soft_cap,
         float sm_scale,
-        float* lse_out);
+        float* lse_out,
+        const DecodeScoreSink* sink = nullptr);
 };
 
 // ── AttnHd definitions ─────────────────────────────────────────────────────
@@ -427,7 +475,7 @@ cudaError_t AttnHd<HEAD_DIM>::plan_decode(
 }
 
 template <uint32_t HEAD_DIM>
-template <class Variant>
+template <class Variant, class Params>
 cudaError_t AttnHd<HEAD_DIM>::run_decode(
     const DecodePlanCache& cache,
     const void* q, void* k_pages, void* v_pages, void* o,
@@ -439,7 +487,8 @@ cudaError_t AttnHd<HEAD_DIM>::run_decode(
     int window_left,
     float logits_soft_cap,
     float sm_scale,
-    float* lse_out)
+    float* lse_out,
+    const DecodeScoreSink* sink)
 {
     ::flashinfer::paged_kv_t<DTypeKV, IdType> paged_kv(
         static_cast<uint32_t>(cache.num_kv_heads),
@@ -453,7 +502,7 @@ cudaError_t AttnHd<HEAD_DIM>::run_decode(
         const_cast<IdType*>(reinterpret_cast<const IdType*>(kv_page_indptr_d)),
         const_cast<IdType*>(reinterpret_cast<const IdType*>(kv_last_page_lens_d)));
 
-    DecodeParams params;
+    Params params;
     params.q = const_cast<DTypeQ*>(static_cast<const DTypeQ*>(q));
     params.q_rope_offset = nullptr;
     params.paged_kv = paged_kv;
@@ -470,6 +519,23 @@ cudaError_t AttnHd<HEAD_DIM>::run_decode(
         : (1.0f / std::sqrt(static_cast<float>(cache.head_dim)));
     params.rope_rcp_scale = 1.0f;
     params.rope_rcp_theta = 1.0f;
+
+    // `PieScoreCapture` records `kv_idx` verbatim, and the kernel derives that
+    // from `paged_kv.rope_pos_offset` (`decode.cuh:541`). pie leaves it null,
+    // which is what makes `kv_idx` an absolute KV index; if a future forward
+    // graph ever sets it, every captured score silently lands at the wrong
+    // position. Cheap to assert, impossible to notice otherwise.
+    if constexpr (!std::is_same_v<Params, DecodeParams>) {
+        if (paged_kv.rope_pos_offset != nullptr) {
+            return cudaErrorInvalidValue;
+        }
+        if (sink == nullptr || sink->scores == nullptr ||
+            sink->indptr == nullptr) {
+            return cudaErrorInvalidValue;
+        }
+        params.score_out = sink->scores;
+        params.score_indptr = sink->indptr;
+    }
 
     void* int_buf = workspace.int_buffer();
     void* float_buf = workspace.float_buffer();
@@ -521,7 +587,7 @@ cudaError_t AttnHd<HEAD_DIM>::run_decode(
     }
 
     return ::flashinfer::BatchDecodeWithPagedKVCacheDispatched<
-        HEAD_DIM, POS_ENC, Variant, DecodeParams>(
+        HEAD_DIM, POS_ENC, Variant, Params>(
         params, tmp_v, tmp_s, cache.enable_pdl, stream);
 }
 
@@ -555,6 +621,40 @@ cudaError_t AttnHd<HEAD_DIM>::dispatch_decode(
         cache, q, k_pages, v_pages, o,
         kv_page_indices_d, kv_page_indptr_d, kv_last_page_lens_d,
         workspace, stream, window_left, /*soft_cap=*/0.f, sm_scale, lse_out);
+}
+
+template <uint32_t HEAD_DIM>
+cudaError_t AttnHd<HEAD_DIM>::dispatch_decode_capture(
+    const DecodePlanCache& cache,
+    const void* q, void* k_pages, void* v_pages, void* o,
+    const std::uint32_t* kv_page_indices_d,
+    const std::uint32_t* kv_page_indptr_d,
+    const std::uint32_t* kv_last_page_lens_d,
+    AttentionWorkspace& workspace,
+    cudaStream_t stream,
+    int window_left,
+    float logits_soft_cap,
+    float sm_scale,
+    float* lse_out,
+    const DecodeScoreSink& sink)
+{
+    // Refuse rather than capture a score that does not mean what the caller
+    // thinks. See the `AttnScoreCapture` alias for why each case is excluded.
+    if (logits_soft_cap > 0.f || window_left >= 0) {
+        return cudaErrorInvalidValue;
+    }
+    if (cache.full_attention_variant) {
+        return run_decode<AttnScoreCaptureFull, DecodeScoreParams>(
+            cache, q, k_pages, v_pages, o,
+            kv_page_indices_d, kv_page_indptr_d, kv_last_page_lens_d,
+            workspace, stream, window_left, /*soft_cap=*/0.f, sm_scale,
+            lse_out, &sink);
+    }
+    return run_decode<AttnScoreCapture, DecodeScoreParams>(
+        cache, q, k_pages, v_pages, o,
+        kv_page_indices_d, kv_page_indptr_d, kv_last_page_lens_d,
+        workspace, stream, window_left, /*soft_cap=*/0.f, sm_scale,
+        lse_out, &sink);
 }
 
 template <uint32_t HEAD_DIM>
