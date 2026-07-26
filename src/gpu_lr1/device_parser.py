@@ -179,10 +179,14 @@ def _mask_kernel(
                         if value == _ACCEPT:
                             alive = 0
                         elif value > 0:
-                            tl.store(scratch_ptr + scratch + copy_depth, value - 1)
-                            copy_depth = copy_depth + 1
-                            top = value - 1
-                            settled = 1
+                            if copy_depth >= STACK_STRIDE:
+                                alive = 0
+                                tl.store(overflow_ptr + sequence, 1)
+                            else:
+                                tl.store(scratch_ptr + scratch + copy_depth, value - 1)
+                                copy_depth = copy_depth + 1
+                                top = value - 1
+                                settled = 1
                         else:
                             production = -value - 1
                             arity = tl.load(production_arity_ptr + production)
@@ -426,6 +430,7 @@ def _candidate_kernel(
     cand_lexer_ptr,
     cand_depth_ptr,
     cand_stack_ptr,
+    overflow_ptr,
     mask_words,
     LIVE,
     CONFIGS: tl.constexpr,
@@ -505,10 +510,14 @@ def _candidate_kernel(
                         if value == _ACCEPT:
                             alive = 0
                         elif value > 0:
-                            tl.store(scratch_ptr + scratch + copy_depth, value - 1)
-                            copy_depth = copy_depth + 1
-                            top = value - 1
-                            settled = 1
+                            if copy_depth >= STACK_STRIDE:
+                                alive = 0
+                                tl.store(overflow_ptr + sequence, 1)
+                            else:
+                                tl.store(scratch_ptr + scratch + copy_depth, value - 1)
+                                copy_depth = copy_depth + 1
+                                top = value - 1
+                                settled = 1
                         else:
                             production = -value - 1
                             arity = tl.load(production_arity_ptr + production)
@@ -525,6 +534,9 @@ def _candidate_kernel(
                                 )
                                 if target < 0:
                                     alive = 0
+                                elif copy_depth >= STACK_STRIDE:
+                                    alive = 0
+                                    tl.store(overflow_ptr + sequence, 1)
                                 else:
                                     top = tl.load(goto_targets_ptr + target)
                                     tl.store(scratch_ptr + scratch + copy_depth, top)
@@ -720,7 +732,7 @@ class DeviceGrammar:
     def __init__(
         self,
         compiled,
-        max_stack: int = 64,
+        max_stack: int = 256,
         max_reductions: int | None = None,
         max_configs: int = 16,
     ):
@@ -730,6 +742,11 @@ class DeviceGrammar:
         self.start_parser_state = int(arrays["start_parser_state"])
         offsets = np.frombuffer(arrays["group_offsets"], dtype=np.uint32)
         self.max_groups_per_state = int(np.diff(offsets).max()) if offsets.size > 1 else 1
+        # Sixty-four was a guess and real documents reach ninety. A stack that
+        # overflows is not a slow parser, it is a wrong one: the replay is
+        # declared dead and the mask silently narrows. Every write is now
+        # bounds-checked and an overflow is recorded rather than absorbed, so
+        # the limit being too small is something that can be found out.
         self.max_stack = max_stack
         # How many reductions a single terminal may take before the parser is
         # declared stuck. Sixteen was a guess, and it was wrong: a `}` closing
@@ -833,6 +850,7 @@ class DeviceBatch:
         # property of the sequence that hit it, and reading it back to find out
         # which would be the synchronisation this is all avoiding.
         self.terminated = torch.zeros(batch, dtype=torch.int32, device="cuda")
+        self.overflow = torch.zeros(batch, dtype=torch.int32, device="cuda")
         self.token = torch.zeros(batch, dtype=torch.int32, device="cuda")
         rows = batch * self.configs
         self.lexer_state = torch.zeros(rows, dtype=torch.int32, device="cuda")
@@ -966,6 +984,7 @@ class DeviceBatch:
             self.cand_lexer,
             self.cand_depth,
             self.cand_stack,
+            self.overflow,
             grammar.mask_words,
             live,
             CONFIGS=self.configs,
