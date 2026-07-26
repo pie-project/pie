@@ -1188,11 +1188,6 @@ void full_attn_body(
     ops::gemm_act_x_w(cublas.handle(),
         ws.norm_x.data(), make_weight_view(Lw.fa_v_proj, Lw.fa_v_proj_quant),
         ws.v.data(), N, Hk, H);
-    invoke_stage_hook(
-        StageHookPoint::OnAttnProj, ws.q.data(),
-        static_cast<std::uint32_t>(N),
-        static_cast<std::uint32_t>(Hq),
-        static_cast<std::uint32_t>(model_layer), stream);
 
     rmsnorm_bf16_dispatch(cfg,
         ws.q.data(), Lw.fa_q_norm->data(), ws.q.data(),
@@ -1205,6 +1200,16 @@ void full_attn_body(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads_local, num_kv_heads_local,
         d, rotary_dim, cfg.rope_theta, stream);
+    // Fires POST-rope (and post q/k-norm): the query a PTIR program
+    // observes here is the one that actually enters attention, so an
+    // observer scoring it against the cached keys -- which are stored
+    // post-rope -- compares in the same space.
+    invoke_stage_hook(
+        StageHookPoint::OnAttnProj, ws.q.data(),
+        static_cast<std::uint32_t>(N),
+        static_cast<std::uint32_t>(Hq),
+        static_cast<std::uint32_t>(model_layer), stream);
+
     auto kv_view = cache.layer_view(kv_layer);
     if (has_write_desc) {
         kernels::launch_write_kv_explicit_bf16(

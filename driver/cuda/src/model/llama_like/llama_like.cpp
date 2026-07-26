@@ -520,13 +520,6 @@ void llama_like_forward_paged(
             maybe_add_bias(ws.k.data(), layer.k_bias, N, Hk, stream);
             maybe_add_bias(ws.v.data(), layer.v_bias, N, Hk, stream);
         }
-        invoke_stage_hook(
-            StageHookPoint::OnAttnProj,
-            ws.q.data(),
-            static_cast<std::uint32_t>(N),
-            static_cast<std::uint32_t>(Hq),
-            static_cast<std::uint32_t>(L),
-            stream);
 
         // q_norm / k_norm: two conventions ship in the wild.
         //   * Per-head (Qwen3, OLMo-2 small, Gemma-3): weight shape
@@ -592,6 +585,19 @@ void llama_like_forward_paged(
                        N, num_q_heads_local, num_kv_heads_local, d,
                        stream);
         }
+
+        // Fires POST-rope (and post q/k-norm): the query a PTIR program
+        // observes here is the one that actually enters attention, so an
+        // observer scoring it against the cached keys -- which are stored
+        // post-rope -- compares in the same space. Placing it on the raw
+        // projection instead would silently mis-rank pages for Quest.
+        invoke_stage_hook(
+            StageHookPoint::OnAttnProj,
+            ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            static_cast<std::uint32_t>(L),
+            stream);
 
         // Pad Q/K/V to `dk` when the model's head_dim isn't a flashinfer
         // dispatch value. The padded buffers are zero on the trailing

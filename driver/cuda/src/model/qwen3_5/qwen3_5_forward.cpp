@@ -1314,11 +1314,6 @@ void full_attn_layer_body(
     kernels::launch_split_q_gate_bf16(
         la.fa_qg_packed.data(), ws.q.data(), la.fa_gate.data(),
         N, num_q_heads_local, d, stream);
-    invoke_stage_hook(
-        StageHookPoint::OnAttnProj, ws.q.data(),
-        static_cast<std::uint32_t>(N),
-        static_cast<std::uint32_t>(Hq),
-        static_cast<std::uint32_t>(model_layer), stream);
 
     // ── q_norm / k_norm (gemma-style (1+w)·x_hat) ─────────────────
     kernels::launch_rmsnorm_gemma_bf16(
@@ -1333,6 +1328,16 @@ void full_attn_layer_body(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads_local, num_kv_heads_local,
         d, rotary_dim, cfg.rope_theta, stream);
+    // Fires POST-rope (and post q/k-norm): the query a PTIR program
+    // observes here is the one that actually enters attention, so an
+    // observer scoring it against the cached keys -- which are stored
+    // post-rope -- compares in the same space.
+    invoke_stage_hook(
+        StageHookPoint::OnAttnProj, ws.q.data(),
+        static_cast<std::uint32_t>(N),
+        static_cast<std::uint32_t>(Hq),
+        static_cast<std::uint32_t>(model_layer), stream);
+
     // ── Write K/V to paged cache ──────────────────────────────────
     auto kv_view = cache.layer_view(kv_layer);
     if (has_write_desc) {

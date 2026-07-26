@@ -6,6 +6,8 @@
 #include <string>
 #include <utility>
 
+#include "../cuda_check.hpp"
+#include "../kernels/envelope.hpp"
 #include "../model/config.hpp"
 #include "elastic.hpp"
 
@@ -289,6 +291,18 @@ void KvCache::enable_envelopes() {
     const int slots = static_cast<int>(k_layers_.size());
     k_env_min_layers_.reserve(slots);
     k_env_max_layers_.reserve(slots);
+    // Envelopes are maintained INCREMENTALLY: only a page a fire appends to is
+    // refreshed. Pages already resident when envelopes are switched on would
+    // therefore keep whatever the fresh allocation happened to contain, so seed
+    // every page to the empty envelope (+inf, -inf). That is the fail-safe
+    // direction: `envelope_dot` scores an empty envelope +inf, so an unseen
+    // page is always KEPT rather than silently dropped. Reusing the recompute
+    // launcher with an all-zero live-length vector is exactly that seed, and it
+    // is the same code path `test_envelope_dot` covers.
+    DeviceTensor zero_lens =
+        DeviceTensor::allocate(DType::INT32, {num_pages_});
+    CUDA_CHECK(cudaMemset(zero_lens.data(), 0,
+                          static_cast<std::size_t>(num_pages_) * sizeof(std::int32_t)));
     for (int i = 0; i < slots; ++i) {
         const int hd = head_dim_at(i);
         const int kvh = num_kv_heads_at(i);
@@ -296,7 +310,14 @@ void KvCache::enable_envelopes() {
             DType::FP32, {num_pages_, kvh, hd}));
         k_env_max_layers_.push_back(DeviceTensor::allocate(
             DType::FP32, {num_pages_, kvh, hd}));
+        kernels::launch_envelope_recompute_bf16(
+            static_cast<const std::uint16_t*>(k_layers_[i].data()),
+            static_cast<const std::int32_t*>(zero_lens.data()),
+            static_cast<float*>(k_env_min_layers_[i].data()),
+            static_cast<float*>(k_env_max_layers_[i].data()),
+            num_pages_, page_size_, kvh, hd, nullptr);
     }
+    CUDA_CHECK(cudaStreamSynchronize(nullptr));
     envelopes_enabled_ = true;
 }
 
