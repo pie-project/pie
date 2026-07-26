@@ -427,6 +427,38 @@ token:
 Tens of MiB is defensible next to a KiB-scale compiler cache only because it
 buys a GPU-resident step; the paper must report it, not hide it.
 
+### Measured: the grammar half of a decode step
+
+**[measured, A100, Qwen3 151,669-token vocabulary]** A step's grammar cost is
+not only the mask fill. Every accepted token also has to advance the parser,
+once per sequence per step, and that half lands *after* the sampled token, on
+the critical path, with nothing to overlap. Charging both halves, replaying the
+same document through both backends so they visit the same states, and giving
+XGrammar its best thread count:
+
+| batch | XGrammar fill | XGrammar advance | total | ours fill | ours advance | total | ratio |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 32 | 281 µs | 28 µs | 309 µs | 458 µs | 12 µs | 470 µs | **0.66x** |
+| 128 | 653 | 173 | 826 | 663 | 40 | 703 | 1.18x |
+| 256 | 1,075 | 343 | 1,418 | 971 | 75 | 1,046 | 1.36x |
+| 512 | 1,925 | 632 | 2,557 | 1,576 | 143 | 1,720 | **1.49x** |
+
+Two things to read off it. The crossover is near batch 100: below that a kernel
+launch costs more than the CPU work it replaces, and we are *slower*. Above it
+the gap widens, because the CPU cost scales with the batch and the GPU cost
+barely does — which is the premise the project was founded on, now measured
+rather than assumed.
+
+And the advance is 4–5x cheaper throughout. That is the half that cannot hide
+behind the forward pass, and it is the half that speculative decoding multiplies
+by the draft length.
+
+**What this does not support.** An end-to-end throughput claim. Grammar work is
+a fraction of a decode step, so a 1.49x on that fraction is a few percent
+end to end, and a vLLM A/B at batch 256 ranged from 4,523 to 13,325 tokens per
+second across runs — too noisy to attribute a difference to anything. The
+per-step number is the defensible one.
+
 ### vLLM integration
 
 `gpu_lr1/vllm_backend.py` implements vLLM's `StructuredOutputBackend` on top of

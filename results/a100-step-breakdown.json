@@ -1,0 +1,74 @@
+{
+  "steps": 21,
+  "vocab_size": 151669,
+  "batches": [
+    {
+      "batch_size": 32,
+      "backends": {
+        "xgrammar": {
+          "threads": 1,
+          "fill_us": 280.9305830548207,
+          "advance_us": 28.150721586176324,
+          "total_us": 309.081304640997
+        },
+        "gpugrammar": {
+          "fill_us": 457.5080570897886,
+          "advance_us": 12.470453622795286,
+          "total_us": 469.97851071258384
+        }
+      },
+      "ratio": 0.657649866102104
+    },
+    {
+      "batch_size": 128,
+      "backends": {
+        "xgrammar": {
+          "threads": 4,
+          "fill_us": 653.1393155455589,
+          "advance_us": 173.16250263580253,
+          "total_us": 826.3018181813616
+        },
+        "gpugrammar": {
+          "fill_us": 663.3003220139515,
+          "advance_us": 39.6173092580977,
+          "total_us": 702.9176312720491
+        }
+      },
+      "ratio": 1.1755315010181602
+    },
+    {
+      "batch_size": 256,
+      "backends": {
+        "xgrammar": {
+          "threads": 4,
+          "fill_us": 1074.626043971096,
+          "advance_us": 342.9998621521961,
+          "total_us": 1417.625906123292
+        },
+        "gpugrammar": {
+          "fill_us": 971.2552917855126,
+          "advance_us": 74.75244014390879,
+          "total_us": 1046.0077319294214
+        }
+      },
+      "ratio": 1.3552728749991163
+    },
+    {
+      "batch_size": 512,
+      "backends": {
+        "xgrammar": {
+          "threads": 4,
+          "fill_us": 1924.8118734962884,
+          "advance_us": 631.8052764981985,
+          "total_us": 2556.617149994487
+        },
+        "gpugrammar": {
+          "fill_us": 1576.382467257125,
+          "advance_us": 143.28975452198867,
+          "total_us": 1719.6722217791137
+        }
+      },
+      "ratio": 1.4866886361340994
+    }
+  ]
+}

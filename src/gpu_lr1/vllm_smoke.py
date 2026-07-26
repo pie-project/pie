@@ -92,6 +92,14 @@ def main() -> int:
         f"{valid}/{len(outputs)} valid | median {median:.0f} tok/s "
         f"over {len(rates)} runs (min {rates[0]:.0f}, max {rates[-1]:.0f})"
     )
+    if os.environ.get("VLLM_GRAMMAR_TIMING"):
+        from vllm.v1.structured_output import StructuredOutputManager
+
+        spent = StructuredOutputManager.grammar_seconds
+        print(
+            f"  time inside the grammar: {spent:.2f}s of "
+            f"{sum(1 / rate for rate in rates) * 0 + arguments.repeats:.0f} runs"
+        )
     return 0 if valid == len(outputs) else 1
 
 
