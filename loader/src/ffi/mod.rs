@@ -21,8 +21,8 @@ pub use entry::{
 };
 pub use types::*;
 
-use crate::arch::RuntimeAbi;
 use crate::config::ModelConfig;
+use crate::contract::ModelContract;
 use crate::error::CompileError;
 use crate::load_plan::StorageTarget;
 use crate::types::{BackendKind, Mxfp4MoePolicy};
@@ -141,13 +141,13 @@ fn storage_target(
 /// guards below are the ones the worker applied before the boundary moved; they
 /// live here now because this is where the request arrives.
 fn scope_to_component(
-    abi: RuntimeAbi,
+    contract: ModelContract,
     component: PieLoaderComponent,
     model: &ModelConfig,
     target: &StorageTarget,
-) -> Result<RuntimeAbi, CompileError> {
+) -> Result<ModelContract, CompileError> {
     if component != PieLoaderComponent::Encode || target.backend != BackendKind::Cuda {
-        return Ok(abi);
+        return Ok(contract);
     }
     if target.tp_size != 1 {
         return Err(CompileError::InvalidInput(
@@ -160,7 +160,7 @@ fn scope_to_component(
             model.model_type
         )));
     }
-    abi.retain_outputs(|name| {
+    contract.retain_outputs(|name| {
         name.starts_with("model.vision_tower.")
             || name.starts_with("model.embed_vision.")
             || name.starts_with("model.audio_tower.")

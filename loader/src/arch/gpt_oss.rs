@@ -2,7 +2,7 @@
 
 use super::*;
 
-impl DefaultAbiBuilder<'_> {
+impl ContractBuilder<'_> {
     pub(super) fn add_gpt_oss_mxfp4_groups(&mut self) -> Result<(), CompileError> {
         if !self.profile().gpt_oss_mxfp4_groups {
             return Ok(());

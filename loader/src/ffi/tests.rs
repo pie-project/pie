@@ -108,7 +108,6 @@ fn plan_with_every_instr() -> LoadPlan {
             zero_point_dtype: None,
             block_shape: vec![32],
         }),
-        layout: Layout::dense(256),
         alignment: 256,
     });
     plan.tensors.push(TensorDecl {
@@ -116,7 +115,6 @@ fn plan_with_every_instr() -> LoadPlan {
         name: "model.norm.weight".to_string(),
         shape: vec![4096],
         encoding: Encoding::Raw(DType::BF16),
-        layout: Layout::dense(256),
         alignment: 256,
     });
     plan.sources.push(SourceTensorDecl {
@@ -232,7 +230,6 @@ fn plan_with_every_instr() -> LoadPlan {
             input: BufferId(0),
             output: BufferId(13),
             view: dest_extent(13),
-            layout: Layout::dense(256),
         },
         StorageInstr::Release {
             id: InstrId(7),

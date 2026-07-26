@@ -182,20 +182,72 @@ pub struct ModelContract {
     pub tensors: Vec<TensorContract>,
 }
 
+impl ModelContract {
+    /// Keep only the entries `retain` selects, plus everything they read.
+    ///
+    /// A contract is a DAG, so selecting an output selects its dependencies
+    /// too; the closure is taken until it stops growing. This is how a caller
+    /// asks for part of a model without authoring a second contract for it.
+    pub fn retain_outputs(
+        mut self,
+        mut retain: impl FnMut(&str) -> bool,
+    ) -> Result<Self, CompileError> {
+        let mut selected = self
+            .tensors
+            .iter()
+            .map(|contract| retain(&contract.name))
+            .collect::<Vec<_>>();
+        let by_name: std::collections::HashMap<&str, usize> = self
+            .tensors
+            .iter()
+            .enumerate()
+            .map(|(index, contract)| (contract.name.as_str(), index))
+            .collect();
+        loop {
+            let mut changed = false;
+            for index in 0..self.tensors.len() {
+                if !selected[index] {
+                    continue;
+                }
+                for name in self.tensors[index].expr.outputs() {
+                    let dep = *by_name.get(name).ok_or_else(|| {
+                        CompileError::InvalidInput(format!(
+                            "contract {index} reads missing contract '{name}'"
+                        ))
+                    })?;
+                    if !selected[dep] {
+                        selected[dep] = true;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        if !selected.iter().any(|selected| *selected) {
+            return Err(CompileError::InvalidInput(
+                "the component filter selected no tensors".to_string(),
+            ));
+        }
+        let mut keep = selected.into_iter();
+        self.tensors.retain(|_| keep.next().unwrap_or(false));
+        Ok(self)
+    }
+}
+
 /// Resolves [`Expr::Src`] names against a checkpoint.
 pub trait CheckpointTypes {
     fn tensor_type(&self, name: &str) -> Option<TensorType>;
 }
 
-/// The result of type-checking a [`ModelContract`]: every inferred type, plus
-/// the checkpoint types the expressions actually consulted.
+/// What resolving a contract's expressions turned up: the checkpoint tensors
+/// they consulted, and the types the earlier entries published.
 ///
-/// The compiler needs the same name→shape resolution the checker just did, so
-/// the checker hands it over rather than making it look everything up twice.
+/// The compiler needs the same name→shape resolution the resolver just did, so
+/// the resolver hands it over rather than making it look everything up twice.
 #[derive(Clone, Debug, Default)]
 pub struct Checked {
-    /// Inferred type of each entry, in declaration order.
-    pub types: Vec<TensorType>,
     /// Checkpoint tensors referenced by some [`Expr::Src`], by name.
     pub sources: std::collections::HashMap<String, TensorType>,
     /// Declared contracts, by name.
@@ -209,54 +261,6 @@ impl Checked {
 
     pub fn output(&self, name: &str) -> Option<&TensorType> {
         self.outputs.get(name)
-    }
-}
-
-impl ModelContract {
-    /// Type-check every entry against `checkpoint`.
-    ///
-    /// Rejects duplicate names, references to undeclared or later entries, and
-    /// any entry whose declared `shape`/`encoding` disagrees with its `expr`.
-    pub fn check(&self, checkpoint: &dyn CheckpointTypes) -> Result<Checked, CompileError> {
-        let mut scope = Scope {
-            checkpoint,
-            resolved: Checked {
-                types: Vec::with_capacity(self.tensors.len()),
-                ..Checked::default()
-            },
-        };
-        for contract in &self.tensors {
-            if scope.resolved.outputs.contains_key(contract.name.as_str()) {
-                return Err(CompileError::InvalidInput(format!(
-                    "contract declares '{}' twice",
-                    contract.name
-                )));
-            }
-            let found = infer(&contract.expr, &mut scope).map_err(|err| {
-                CompileError::InvalidInput(format!("contract '{}': {err}", contract.name))
-            })?;
-            let want = contract.declared();
-            if found.shape != want.shape {
-                return Err(CompileError::InvalidInput(format!(
-                    "contract '{}' declares shape {:?} but its expression yields {:?}",
-                    contract.name, want.shape, found.shape
-                )));
-            }
-            if crate::types::normalize_encoding(&found.encoding)
-                != crate::types::normalize_encoding(&want.encoding)
-            {
-                return Err(CompileError::InvalidInput(format!(
-                    "contract '{}' declares encoding {:?} but its expression yields {:?}",
-                    contract.name, want.encoding, found.encoding
-                )));
-            }
-            scope
-                .resolved
-                .outputs
-                .insert(contract.name.clone(), found.clone());
-            scope.resolved.types.push(found);
-        }
-        Ok(scope.resolved)
     }
 }
 
@@ -976,6 +980,29 @@ mod tests {
     }
 
     #[test]
+    fn a_component_filter_keeps_what_the_selection_reads() {
+        let one = |name: &str, expr: Expr| {
+            TensorContract::new(name, expr, vec![1], Encoding::Raw(DType::U8))
+        };
+        let contract = ModelContract {
+            abi_version: 1,
+            alignment: 1,
+            tensors: vec![
+                one("text.weight", Expr::src("text")),
+                one("vision.base", Expr::src("vision")),
+                one("vision.view", Expr::out("vision.base").slice(0, 0, 1)),
+            ],
+        };
+
+        let filtered = contract
+            .retain_outputs(|name| name == "vision.view")
+            .unwrap();
+        assert_eq!(filtered.tensors.len(), 2);
+        assert_eq!(filtered.tensors[0].name, "vision.base");
+        assert_eq!(filtered.tensors[1].name, "vision.view");
+    }
+
+    #[test]
     fn shard_has_no_type_until_it_is_specialized() {
         let err = check_one(Expr::src("q_proj").shard(0), &qwen3()).unwrap_err();
         assert!(format!("{err}").contains("specialize"), "{err}");
@@ -1239,35 +1266,34 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_correct_contract_checks() {
-        let inferred = model(vec![qkv_contract(vec![4096, 2048])])
-            .check(&qwen3())
-            .unwrap();
-        assert_eq!(inferred.types[0].shape, vec![4096, 2048]);
+    /// Resolve a run of contracts in declaration order, exactly as the frontend
+    /// does: each entry's type is published under its name so that later
+    /// entries can read it through [`Expr::Out`].
+    fn resolve(
+        tensors: &[TensorContract],
+        checkpoint: &dyn CheckpointTypes,
+    ) -> Result<Vec<TensorType>, CompileError> {
+        let mut resolver = Resolver::new(checkpoint);
+        tensors
+            .iter()
+            .map(|tensor| {
+                let ty = resolver.infer(&tensor.expr)?;
+                resolver.publish(&tensor.name, ty.clone());
+                Ok(ty)
+            })
+            .collect()
     }
 
     #[test]
-    fn a_wrong_declared_shape_is_caught() {
-        let err = model(vec![qkv_contract(vec![4096, 4096])])
-            .check(&qwen3())
-            .unwrap_err();
-        let text = err.to_string();
-        assert!(text.contains("declares shape [4096, 4096]"), "{text}");
-        assert!(text.contains("yields [4096, 2048]"), "{text}");
-    }
-
-    #[test]
-    fn a_wrong_declared_encoding_is_caught() {
-        let mut contract = qkv_contract(vec![4096, 2048]);
-        contract.encoding = Encoding::Raw(DType::F32);
-        let err = model(vec![contract]).check(&qwen3()).unwrap_err();
-        assert!(err.to_string().contains("declares encoding"));
+    fn a_contract_resolves_to_what_it_declares() {
+        let tensors = vec![qkv_contract(vec![4096, 2048])];
+        let found = resolve(&tensors, &qwen3()).unwrap();
+        assert_eq!(found[0], tensors[0].declared());
     }
 
     #[test]
     fn a_bank_publishes_views_by_name() {
-        let contract = model(vec![
+        let tensors = vec![
             qkv_contract(vec![4096, 2048]),
             TensorContract::new(
                 "q_proj",
@@ -1281,24 +1307,26 @@ mod tests {
                 vec![1024, 2048],
                 Encoding::Raw(DType::BF16),
             ),
-        ]);
-        let inferred = contract.check(&qwen3()).unwrap();
-        assert_eq!(inferred.types[1].shape, vec![2048, 2048]);
-        assert_eq!(inferred.types[2].shape, vec![1024, 2048]);
+        ];
+        let found = resolve(&tensors, &qwen3()).unwrap();
+        assert_eq!(found[1].shape, vec![2048, 2048]);
+        assert_eq!(found[2].shape, vec![1024, 2048]);
     }
 
     #[test]
     fn out_cannot_name_a_later_contract() {
-        let err = model(vec![
-            TensorContract::new(
-                "early",
-                Expr::out("late"),
-                vec![2048, 2048],
-                Encoding::Raw(DType::BF16),
-            ),
-            qkv_contract(vec![4096, 2048]),
-        ])
-        .check(&qwen3())
+        let err = resolve(
+            &[
+                TensorContract::new(
+                    "early",
+                    Expr::out("late"),
+                    vec![2048, 2048],
+                    Encoding::Raw(DType::BF16),
+                ),
+                qkv_contract(vec![4096, 2048]),
+            ],
+            &qwen3(),
+        )
         .unwrap_err();
         assert!(err.to_string().contains("declared before this one"));
     }
@@ -1307,34 +1335,26 @@ mod tests {
     fn out_and_src_do_not_collide() {
         // "q_proj" is both a checkpoint tensor and a declared contract; Src and
         // Out must keep pointing at different things.
-        let contract = model(vec![
-            TensorContract::new(
-                "q_proj",
-                Expr::src("q_proj").pad(0, 0, 64),
-                vec![2112, 2048],
-                Encoding::Raw(DType::BF16),
-            ),
-            TensorContract::new(
-                "q_proj.head0",
-                Expr::out("q_proj").slice(0, 0, 128),
-                vec![128, 2048],
-                Encoding::Raw(DType::BF16),
-            ),
-        ]);
-        let inferred = contract.check(&qwen3()).unwrap();
-        assert_eq!(inferred.types[0].shape, vec![2112, 2048]);
-        assert_eq!(inferred.types[1].shape, vec![128, 2048]);
-    }
-
-    #[test]
-    fn duplicate_names_are_rejected() {
-        let err = model(vec![
-            qkv_contract(vec![4096, 2048]),
-            qkv_contract(vec![4096, 2048]),
-        ])
-        .check(&qwen3())
-        .unwrap_err();
-        assert!(err.to_string().contains("twice"));
+        let found = resolve(
+            &[
+                TensorContract::new(
+                    "q_proj",
+                    Expr::src("q_proj").pad(0, 0, 64),
+                    vec![2112, 2048],
+                    Encoding::Raw(DType::BF16),
+                ),
+                TensorContract::new(
+                    "q_proj.head0",
+                    Expr::out("q_proj").slice(0, 0, 128),
+                    vec![128, 2048],
+                    Encoding::Raw(DType::BF16),
+                ),
+            ],
+            &qwen3(),
+        )
+        .unwrap();
+        assert_eq!(found[0].shape, vec![2112, 2048]);
+        assert_eq!(found[1].shape, vec![128, 2048]);
     }
 
     #[test]
@@ -1356,6 +1376,9 @@ mod tests {
             vec![2048, 2048],
             Encoding::Quant(fp8_per_row()),
         )]);
-        assert!(contract.check(&qwen3()).is_ok());
+        assert_eq!(
+            resolve(&contract.tensors, &qwen3()).unwrap()[0],
+            contract.tensors[0].declared()
+        );
     }
 }

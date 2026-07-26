@@ -18,7 +18,6 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 
-use crate::arch::RuntimeAbi;
 use crate::artifact::{ArtifactInputs, artifact_cache_key};
 use crate::error::CompileError;
 use crate::ffi::inproc::parse_checkpoint_metadata;
@@ -396,11 +395,11 @@ fn compile_request(
 
     let metadata = parse_checkpoint_metadata(&snapshot_dir)
         .map_err(|err| (compile_error_status(&err), err.to_string()))?;
-    let abi = RuntimeAbi::default_for_target(&metadata, &model, &target)
+    let contract = crate::arch::default_contract(&metadata, &model, &target)
         .map_err(|err| (compile_error_status(&err), err.to_string()))?;
-    let abi = super::scope_to_component(abi, checked.component, &model, &target)
+    let contract = super::scope_to_component(contract, checked.component, &model, &target)
         .map_err(|err| (compile_error_status(&err), err.to_string()))?;
-    compile_load_plan(&metadata, &abi, target)
+    compile_load_plan(&metadata, &contract, target)
         .map_err(|err| (compile_error_status(&err), err.to_string()))
         .map(|plan| {
             // Both derived here, while the request is still in hand, so the plan

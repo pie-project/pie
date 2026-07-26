@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::optimizer::OptimizerReport;
 use crate::types::{
-    BackendKind, BufferId, CheckpointFormat, DType, Encoding, FileId, InstrId, Layout,
-    Mxfp4MoePolicy, QuantScheme, RepackSpec, TensorDecl, TensorId,
+    BackendKind, BufferId, CheckpointFormat, DType, Encoding, FileId, InstrId, Mxfp4MoePolicy,
+    QuantScheme, RepackSpec, TensorDecl, TensorId,
 };
 
 pub use crate::ffi::types::{
@@ -392,7 +392,6 @@ pub enum StorageInstr {
         input: BufferId,
         output: BufferId,
         view: DestExtent,
-        layout: Layout,
     },
     Release {
         id: InstrId,
@@ -535,7 +534,7 @@ impl std::fmt::Display for LoadPlanSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Axis, Layout, QuantScheme, QuantSpec, TensorId};
+    use crate::types::{Axis, QuantScheme, QuantSpec, TensorId};
 
     fn tensor(id: u32, name: &str, encoding: Encoding) -> TensorDecl {
         TensorDecl {
@@ -543,7 +542,6 @@ mod tests {
             name: name.to_string(),
             shape: vec![8, 32],
             encoding,
-            layout: Layout { alignment: 256 },
             alignment: 256,
         }
     }

@@ -18,14 +18,13 @@
 //! * every checkpoint tensor is emitted as [`Encoding::Raw`] with the storage
 //!   dtype (MXFP4 recognition is by *name* inside the compiler);
 //! * the RuntimeABI is left implicit so the compiler uses
-//!   [`RuntimeAbi::default_for_target`] — the C++ side only sets the ABI
+//!   [`crate::arch::default_contract`] — the C++ side only sets the ABI
 //!   *name*/*version* (`"pie-cuda"`, `1`), never the tensor contracts, so the
 //!   two paths compile byte-identical plans.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use crate::arch::RuntimeAbi;
 use crate::checkpoint::CheckpointMetadata;
 use crate::checkpoint::gguf::parse_gguf_checkpoint;
 use crate::checkpoint::header::parse_safetensors_checkpoint;
@@ -140,7 +139,7 @@ pub fn parse_checkpoint_metadata(snapshot_dir: &Path) -> Result<CheckpointMetada
 ///
 /// `model` and `target` carry the same coarse configuration the C++ bridge
 /// builds from the HF config + backend caps. The RuntimeABI is derived with
-/// [`RuntimeAbi::default_for_target`], exactly as the FFI compile does when the
+/// [`crate::arch::default_contract`], exactly as the FFI compile does when the
 /// caller supplies no explicit contracts.
 pub fn compile_snapshot(
     snapshot_dir: &Path,
@@ -148,8 +147,8 @@ pub fn compile_snapshot(
     target: StorageTarget,
 ) -> Result<LoadPlan, CompileError> {
     let metadata = parse_checkpoint_metadata(snapshot_dir)?;
-    let abi = RuntimeAbi::default_for_target(&metadata, model, &target)?;
-    compile_load_plan(&metadata, &abi, target)
+    let contract = crate::arch::default_contract(&metadata, model, &target)?;
+    compile_load_plan(&metadata, &contract, target)
 }
 
 /// Compile a checkpoint directory and serialize the resulting plan as the

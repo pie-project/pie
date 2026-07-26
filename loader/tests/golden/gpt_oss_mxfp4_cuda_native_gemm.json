@@ -130,9 +130,6 @@
       "encoding": {
         "Raw": "BF16"
       },
-      "layout": {
-        "alignment": 256
-      },
       "alignment": 256
     },
     {
@@ -147,9 +144,6 @@
       "encoding": {
         "Raw": "U8"
       },
-      "layout": {
-        "alignment": 256
-      },
       "alignment": 256
     },
     {
@@ -162,9 +156,6 @@
       ],
       "encoding": {
         "Raw": "U8"
-      },
-      "layout": {
-        "alignment": 256
       },
       "alignment": 256
     },
@@ -180,9 +171,6 @@
       "encoding": {
         "Raw": "U8"
       },
-      "layout": {
-        "alignment": 256
-      },
       "alignment": 256
     },
     {
@@ -196,9 +184,6 @@
       "encoding": {
         "Raw": "U8"
       },
-      "layout": {
-        "alignment": 256
-      },
       "alignment": 256
     },
     {
@@ -209,9 +194,6 @@
       ],
       "encoding": {
         "Raw": "BF16"
-      },
-      "layout": {
-        "alignment": 256
       },
       "alignment": 256
     }

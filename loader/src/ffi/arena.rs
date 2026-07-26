@@ -372,7 +372,6 @@ fn flatten_instr(arena: &mut PlanArena, instr: &StorageInstr) -> PieLoaderStorag
             input,
             output,
             view,
-            layout: _,
         } => {
             out.id = id.0;
             out.kind = PieLoaderStorageInstrKind::CreateView;

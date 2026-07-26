@@ -1,7 +1,7 @@
 pub mod gguf;
 pub mod header;
 
-use crate::types::{CheckpointFormat, Encoding, FileId, Layout, TensorId};
+use crate::types::{CheckpointFormat, Encoding, FileId, TensorId};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointMetadata {
@@ -26,7 +26,6 @@ pub struct RawTensor {
     pub span_bytes: u64,
     pub shape: Vec<i64>,
     pub encoding: Encoding,
-    pub layout: Layout,
 }
 
 impl CheckpointMetadata {

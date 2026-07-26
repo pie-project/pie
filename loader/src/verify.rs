@@ -204,17 +204,13 @@ impl<'a> TensorDemand<'a> {
 
 impl<'a> ContractView<'a> {
     /// Read a contract as the rank that will execute it sees it.
-    pub fn of(abi: &'a crate::arch::RuntimeAbi) -> Self {
+    pub fn of(contract: &'a crate::contract::ModelContract) -> Self {
         Self {
-            tensors: abi
+            tensors: contract
                 .tensors
                 .iter()
-                .map(|contract| {
-                    TensorDemand::exact(
-                        contract.output_name.as_str(),
-                        &contract.shape,
-                        &contract.encoding,
-                    )
+                .map(|tensor| {
+                    TensorDemand::exact(tensor.name.as_str(), &tensor.shape, &tensor.encoding)
                 })
                 .collect(),
         }
@@ -566,7 +562,7 @@ impl ContractCoverage {
 mod tests {
     use super::*;
     use crate::load_plan::{StorageTarget, compiler_version};
-    use crate::types::{BufferId, Encoding, InstrId, Layout, TensorDecl, TensorId};
+    use crate::types::{BufferId, Encoding, InstrId, TensorDecl, TensorId};
 
     fn decl(name: &str) -> TensorDecl {
         TensorDecl {
@@ -574,7 +570,6 @@ mod tests {
             name: name.to_string(),
             shape: vec![1],
             encoding: Encoding::Raw(crate::types::DType::U8),
-            layout: Layout::dense(1),
             alignment: 1,
         }
     }

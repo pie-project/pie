@@ -233,23 +233,11 @@ pub fn normalize_encoding(encoding: &Encoding) -> Encoding {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Layout {
-    pub alignment: u32,
-}
-
-impl Layout {
-    pub fn dense(alignment: u32) -> Self {
-        Self { alignment }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TensorDecl {
     pub id: TensorId,
     pub name: String,
     pub shape: Vec<i64>,
     pub encoding: Encoding,
-    pub layout: Layout,
     pub alignment: u32,
 }
 
@@ -257,7 +245,6 @@ impl TensorDecl {
     pub fn same_runtime_contract(&self, other: &Self) -> bool {
         self.shape == other.shape
             && self.encoding == other.encoding
-            && self.layout == other.layout
             && self.alignment == other.alignment
     }
 

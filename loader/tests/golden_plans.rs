@@ -24,7 +24,7 @@
 
 use std::path::PathBuf;
 
-use pie_loader::arch::RuntimeAbi;
+use pie_loader::arch::default_contract;
 use pie_loader::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
 use pie_loader::config::ModelConfig;
 use pie_loader::load_plan::{
@@ -32,8 +32,8 @@ use pie_loader::load_plan::{
 };
 use pie_loader::planner::compile_load_plan;
 use pie_loader::types::{
-    BackendKind, CheckpointFormat, DType, Encoding, FileId, Layout, Mxfp4MoePolicy, QuantScheme,
-    QuantSpec, TensorId,
+    BackendKind, CheckpointFormat, DType, Encoding, FileId, Mxfp4MoePolicy, QuantScheme, QuantSpec,
+    TensorId,
 };
 use pie_loader::verify::{ContractCoverage, ContractView, PlanView, verify};
 
@@ -72,7 +72,6 @@ impl Checkpoint {
             span_bytes,
             shape: shape.to_vec(),
             encoding,
-            layout: Layout::dense(1),
         });
         self.offset += span_bytes;
         self
@@ -383,12 +382,12 @@ fn check_stats_render(name: &str, plan: &LoadPlan) {
 /// the file would faithfully record whatever came out. Requiring the plan to
 /// verify before it is allowed to become golden is what stops that.
 fn check(name: &str, metadata: &CheckpointMetadata, cfg: &ModelConfig, target: StorageTarget) {
-    let abi = RuntimeAbi::default_for_target(metadata, cfg, &target)
+    let contract = default_contract(metadata, cfg, &target)
         .unwrap_or_else(|err| panic!("{name}: building the contract failed: {err}"));
-    let plan = compile_load_plan(metadata, &abi, target)
+    let plan = compile_load_plan(metadata, &contract, target)
         .unwrap_or_else(|err| panic!("{name}: compiling failed: {err}"));
 
-    if let Err(violations) = verify(&PlanView::from(&plan), Some(&ContractView::of(&abi))) {
+    if let Err(violations) = verify(&PlanView::from(&plan), Some(&ContractView::of(&contract))) {
         let listed: Vec<String> = violations.iter().map(ToString::to_string).collect();
         panic!(
             "{name}: the plan does not honour its contract:\n  {}",

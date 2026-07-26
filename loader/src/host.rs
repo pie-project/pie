@@ -765,7 +765,7 @@ mod tests {
         BufferDecl, DestExtent, DimSpec, MemoryPlan, SourceTensorDecl, StorageTarget, TileSpec,
         TransformSpec,
     };
-    use crate::types::{FileId, InstrId, Layout, TensorDecl, TensorId};
+    use crate::types::{FileId, InstrId, TensorDecl, TensorId};
 
     fn extent(base_offset: u64, element_bytes: u32, dims: &[(i64, i64, i64)]) -> StridedExtent {
         StridedExtent {
@@ -825,7 +825,6 @@ mod tests {
                 name: "selected".to_string(),
                 shape: vec![2, 2],
                 encoding: Encoding::Raw(DType::U8),
-                layout: Layout::dense(8),
                 alignment: 8,
             },
             TensorDecl {
@@ -833,7 +832,6 @@ mod tests {
                 name: "cast".to_string(),
                 shape: vec![2, 2],
                 encoding: Encoding::Raw(DType::U16),
-                layout: Layout::dense(8),
                 alignment: 8,
             },
         ];

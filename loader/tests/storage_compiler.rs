@@ -1,12 +1,12 @@
-use pie_loader::arch::RuntimeAbi;
+use pie_loader::arch::default_contract;
 use pie_loader::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
 use pie_loader::config::ModelConfig;
 use pie_loader::ir::{GatherPiece, LayoutExpr, LayoutPlan};
 use pie_loader::load_plan::{StorageInstr, StorageTarget, TileMapKind};
 use pie_loader::planner::{compile_load_plan, lower_layout_plan};
 use pie_loader::types::{
-    Axis, BackendKind, CheckpointFormat, DType, Encoding, FileId, Layout, Mxfp4MoePolicy,
-    QuantScheme, QuantSpec, RepackLayout, RowMap, TensorDecl, TensorId,
+    Axis, BackendKind, CheckpointFormat, DType, Encoding, FileId, Mxfp4MoePolicy, QuantScheme,
+    QuantSpec, RepackLayout, RowMap, TensorDecl, TensorId,
 };
 
 #[test]
@@ -53,7 +53,6 @@ fn metal_qwen35_schema_emits_canonical_affine_u4_arena() {
                 span_bytes,
                 shape,
                 encoding: Encoding::Raw(dtype),
-                layout: Layout::dense(1),
             };
             offset += span_bytes;
             tensor
@@ -80,11 +79,11 @@ fn metal_qwen35_schema_emits_canonical_affine_u4_arena() {
         preferred_alignment: 256,
         ..StorageTarget::default()
     };
-    let abi = RuntimeAbi::default_for_target(&metadata, &config, &target).unwrap();
-    let names = abi
+    let contract = default_contract(&metadata, &config, &target).unwrap();
+    let names = contract
         .tensors
         .iter()
-        .map(|tensor| tensor.output_name.as_str())
+        .map(|tensor| tensor.name.as_str())
         .collect::<Vec<_>>();
     assert!(names.contains(&"shared_embedding.weight"));
     assert!(names.contains(&"final_norm.weight"));
@@ -95,10 +94,10 @@ fn metal_qwen35_schema_emits_canonical_affine_u4_arena() {
             .iter()
             .any(|name| name.contains("visual") || name.contains("mtp"))
     );
-    let shared = abi
+    let shared = contract
         .tensors
         .iter()
-        .find(|tensor| tensor.output_name == "shared_embedding.weight")
+        .find(|tensor| tensor.name == "shared_embedding.weight")
         .unwrap();
     let Encoding::Quant(spec) = &shared.encoding else {
         panic!("shared embedding should carry MLX affine-U4 encoding");
@@ -111,7 +110,7 @@ fn metal_qwen35_schema_emits_canonical_affine_u4_arena() {
         model_type: "qwen3_next".to_string(),
         ..config.clone()
     };
-    assert!(RuntimeAbi::default_for_target(&metadata, &alias_config, &target).is_ok());
+    assert!(default_contract(&metadata, &alias_config, &target).is_ok());
 
     let mut unexpected = metadata.clone();
     unexpected.tensors.push(RawTensor {
@@ -122,14 +121,13 @@ fn metal_qwen35_schema_emits_canonical_affine_u4_arena() {
         span_bytes: 2,
         shape: vec![1],
         encoding: Encoding::Raw(DType::BF16),
-        layout: Layout::dense(1),
     });
-    let error = RuntimeAbi::default_for_target(&unexpected, &config, &target)
+    let error = default_contract(&unexpected, &config, &target)
         .unwrap_err()
         .to_string();
     assert!(error.contains("no declared mapping or skip"));
 
-    let program = compile_load_plan(&metadata, &abi, target).unwrap();
+    let program = compile_load_plan(&metadata, &contract, target).unwrap();
     assert!(
         !program
             .instrs
@@ -240,7 +238,6 @@ fn direct_copy_lowers_to_identity_extent_write() {
             span_bytes: 8,
             shape: vec![2, 2],
             encoding: Encoding::Raw(DType::BF16),
-            layout: Layout::dense(1),
         }],
     };
 
@@ -433,7 +430,6 @@ fn packed_quant_source_requires_exact_affine_size() {
         span_bytes: 32,
         shape: vec![4, 8],
         encoding: Encoding::Quant(quant(QuantScheme::GgufQ4_0, DType::BF16)),
-        layout: Layout::dense(1),
     });
 
     let err = lower_layout_plan(&metadata, &plan, StorageTarget::default())
@@ -460,8 +456,8 @@ fn gpt_oss_native_mxfp4_default_abi_lowers_to_repack_tile_maps() {
         ..StorageTarget::default()
     };
     let metadata = gpt_oss_mxfp4_metadata();
-    let abi = pie_loader::arch::RuntimeAbi::default_for_target(&metadata, &cfg, &target).unwrap();
-    let program = compile_load_plan(&metadata, &abi, target).unwrap();
+    let contract = default_contract(&metadata, &cfg, &target).unwrap();
+    let program = compile_load_plan(&metadata, &contract, target).unwrap();
 
     let repacks: Vec<_> = program
         .instrs
@@ -523,8 +519,8 @@ fn gpt_oss_native_mxfp4_tp_uses_row_and_column_offset_repack_contracts() {
         ..StorageTarget::default()
     };
     let metadata = gpt_oss_mxfp4_metadata_with_intermediate(128);
-    let abi = pie_loader::arch::RuntimeAbi::default_for_target(&metadata, &cfg, &target).unwrap();
-    let abi_repacks = abi
+    let contract = default_contract(&metadata, &cfg, &target).unwrap();
+    let abi_repacks = contract
         .tensors
         .iter()
         .filter_map(|contract| match &contract.expr {
@@ -552,7 +548,7 @@ fn gpt_oss_native_mxfp4_tp_uses_row_and_column_offset_repack_contracts() {
                 && spec.source_cols == 64)
     );
 
-    let program = compile_load_plan(&metadata, &abi, target).unwrap();
+    let program = compile_load_plan(&metadata, &contract, target).unwrap();
 
     let repacks = program
         .instrs
@@ -655,29 +651,28 @@ fn nemotron_h_default_abi_packs_experts_and_exposes_views() {
         ..StorageTarget::default()
     };
     let metadata = nemotron_h_expert_metadata();
-    let abi = pie_loader::arch::RuntimeAbi::default_for_target(&metadata, &cfg, &target).unwrap();
+    let contract = default_contract(&metadata, &cfg, &target).unwrap();
 
-    assert!(abi.tensors.iter().any(|contract| {
-        contract.output_name
-            == "language_model.backbone.layers.0.mixer.experts.up_proj.packed.weight"
+    assert!(contract.tensors.iter().any(|contract| {
+        contract.name == "language_model.backbone.layers.0.mixer.experts.up_proj.packed.weight"
             && contract.shape == vec![4, 3]
     }));
-    assert!(abi.tensors.iter().any(|contract| {
-        contract.output_name
+    assert!(contract.tensors.iter().any(|contract| {
+        contract.name
             == "language_model.backbone.layers.0.mixer.experts.down_proj.packed.weight"
             && contract.shape == vec![6, 2]
             && matches!(&contract.expr, pie_loader::contract::Expr::Shard { axis, .. } if *axis == Axis(1))
     }));
-    assert!(abi.tensors.iter().any(|contract| {
-        contract.output_name == "language_model.backbone.layers.0.mixer.experts.0.up_proj.weight"
+    assert!(contract.tensors.iter().any(|contract| {
+        contract.name == "language_model.backbone.layers.0.mixer.experts.0.up_proj.weight"
             && contract.shape == vec![2, 3]
     }));
-    assert!(abi.tensors.iter().any(|contract| {
-        contract.output_name == "language_model.backbone.layers.0.mixer.experts.1.down_proj.weight"
+    assert!(contract.tensors.iter().any(|contract| {
+        contract.name == "language_model.backbone.layers.0.mixer.experts.1.down_proj.weight"
             && contract.shape == vec![3, 2]
     }));
 
-    let program = compile_load_plan(&metadata, &abi, target).unwrap();
+    let program = compile_load_plan(&metadata, &contract, target).unwrap();
     let names = program
         .tensors
         .iter()
@@ -737,6 +732,46 @@ fn nemotron_h_default_abi_packs_experts_and_exposes_views() {
     assert_eq!(program.memory.persistent_bytes, 280);
 }
 
+#[test]
+fn a_contract_that_declares_a_name_twice_is_rejected() {
+    let one = |name: &str| {
+        pie_loader::contract::TensorContract::new(
+            name,
+            pie_loader::contract::Expr::src("a"),
+            vec![2],
+            Encoding::Raw(DType::F32),
+        )
+    };
+    let contract = pie_loader::contract::ModelContract {
+        abi_version: 1,
+        alignment: 256,
+        tensors: vec![one("dup"), one("dup")],
+    };
+    let error = compile_load_plan(&metadata(), &contract, StorageTarget::default())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("declares 'dup' twice"), "{error}");
+}
+
+#[test]
+fn a_contract_whose_declared_shape_is_wrong_is_rejected() {
+    let contract = pie_loader::contract::ModelContract {
+        abi_version: 1,
+        alignment: 256,
+        tensors: vec![pie_loader::contract::TensorContract::new(
+            "a",
+            pie_loader::contract::Expr::src("a"),
+            vec![4],
+            Encoding::Raw(DType::F32),
+        )],
+    };
+    let error = compile_load_plan(&metadata(), &contract, StorageTarget::default())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("declared shape [4]"), "{error}");
+    assert!(error.contains("source shape [2]"), "{error}");
+}
+
 fn metadata() -> CheckpointMetadata {
     CheckpointMetadata {
         files: vec![CheckpointFile {
@@ -787,7 +822,6 @@ fn nemotron_h_expert_metadata() -> CheckpointMetadata {
             span_bytes: bytes,
             shape,
             encoding: Encoding::Raw(DType::BF16),
-            layout: Layout::dense(1),
         });
         offset += bytes;
     }
@@ -819,7 +853,6 @@ fn quant_metadata() -> CheckpointMetadata {
                 span_bytes: 16,
                 shape: vec![4, 8],
                 encoding: Encoding::Quant(quant(QuantScheme::AwqInt4, DType::BF16)),
-                layout: Layout::dense(1),
             },
             RawTensor {
                 id: TensorId(3),
@@ -829,7 +862,6 @@ fn quant_metadata() -> CheckpointMetadata {
                 span_bytes: 4,
                 shape: vec![4],
                 encoding: Encoding::Quant(quant(QuantScheme::Fp8E4M3, DType::BF16)),
-                layout: Layout::dense(1),
             },
             RawTensor {
                 id: TensorId(4),
@@ -839,7 +871,6 @@ fn quant_metadata() -> CheckpointMetadata {
                 span_bytes: 14,
                 shape: vec![4, 7],
                 encoding: Encoding::Quant(quant(QuantScheme::AwqInt4, DType::BF16)),
-                layout: Layout::dense(1),
             },
         ],
     }
@@ -904,7 +935,6 @@ fn gpt_oss_mxfp4_metadata_with_intermediate(intermediate: i64) -> CheckpointMeta
             span_bytes: bytes,
             shape,
             encoding: Encoding::Raw(dtype),
-            layout: Layout::dense(1),
         });
         offset += bytes;
     }
@@ -928,7 +958,6 @@ fn raw(id: u32, name: &str, offset: u64, shape: &[i64], dtype: DType) -> RawTens
         span_bytes: 8,
         shape: shape.to_vec(),
         encoding: Encoding::Raw(dtype),
-        layout: Layout::dense(1),
     }
 }
 
@@ -938,7 +967,6 @@ fn decl(id: u32, name: &str, shape: &[i64], encoding: Encoding) -> TensorDecl {
         name: name.to_string(),
         shape: shape.to_vec(),
         encoding,
-        layout: Layout::dense(1),
         alignment: 1,
     }
 }
@@ -1161,7 +1189,6 @@ fn raw_big(id: u32, name: &str, offset: u64, span_bytes: u64, dtype: DType) -> R
         span_bytes,
         shape: vec![count],
         encoding: Encoding::Raw(dtype),
-        layout: Layout::dense(1),
     }
 }
 
@@ -1221,7 +1248,6 @@ fn mla_q_kv_a_fusion_produces_joined_tensor() {
             span_bytes: bytes,
             shape: shape.clone(),
             encoding: Encoding::Raw(DType::BF16),
-            layout: Layout::dense(1),
         });
         offset += bytes;
     }
@@ -1244,8 +1270,8 @@ fn mla_q_kv_a_fusion_produces_joined_tensor() {
         tile_map_mask: pie_loader::load_plan::CUDA_TILE_MAP_MASK,
         ..StorageTarget::default()
     };
-    let abi = pie_loader::arch::RuntimeAbi::default_for_target(&meta, &cfg, &target).unwrap();
-    let program = compile_load_plan(&meta, &abi, target).unwrap();
+    let contract = default_contract(&meta, &cfg, &target).unwrap();
+    let program = compile_load_plan(&meta, &contract, target).unwrap();
     let summary = program.summary();
 
     // The fusion should have joined q_a_proj + kv_a_proj into one tensor

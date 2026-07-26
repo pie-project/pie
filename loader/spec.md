@@ -336,7 +336,7 @@ pub struct ModelContract {
 }
 ```
 
-Four fields per tensor, down from nine in `RuntimeTensorContract`.
+Four fields per tensor, down from nine in the old `RuntimeTensorContract`.
 
 ### 4.1 Why `shape` is intentionally redundant
 
@@ -360,8 +360,8 @@ threads byte spans across the FFI, and it costs one `Vec<i64>` per tensor.
 | ------------------------------ | ------------------------------------------------------------- |
 | `dtype`                        | already in `Encoding::Raw(d)` / `Quant(spec).logical_dtype`    |
 | `metadata: Vec<TensorId>`      | never populated at any construction site; dead                 |
-| `layout.strides`               | always empty; `Layout::dense()` is the only constructor        |
-| per-tensor `alignment`         | always `target.preferred_alignment.max(1)`; hoisted to header  |
+| `layout` (the whole struct)    | **done** — one field (`alignment`), duplicated by `TensorDecl.alignment` and discarded at the FFI |
+| per-tensor `alignment`         | **done** — always `target.preferred_alignment.max(1)`; hoisted to `ModelContract.alignment` |
 | `sharding` + `shard_axis`      | **done** — a TP shard **is** a `Slice`; `Shard` states the intent, `specialize` writes the arithmetic |
 | `RuntimeTensorSource::SelectContract` | an `Out` ref — a DAG edge                               |
 | `RuntimeByteSpan` in the contract | now the compiler's *output*, not a driver's input           |
@@ -443,7 +443,7 @@ TensorContract::new("…v_proj.weight", Expr::src("…qkv_proj.weight").slice(0,
 | `mla_fused_joins`, `nemotron_packed_experts`, `stack_per_expert_moe`, `gpt_oss_mxfp4_groups`, `metal_qwen35` | ~900 | declarations, not inferences |
 | `Sharding`, `shard_axis`                                       |     — | **done** — a shard is a `Slice`, and `Shard` is the node that says so |
 | `SelectContract`                                               |     — | an `Out` ref is a DAG edge                                  |
-| `metadata`, `Layout.strides`, duplicated `alignment`           |     — | dead fields                                                 |
+| `metadata`, `Layout`, duplicated `alignment`                   |     — | **done** — dead fields; `alignment` is one header field now  |
 
 Most of `RepackSpec`'s 11 fields are absorbed by `Slice` / `Pad` / `Reshape`,
 leaving only the `layout` enum.

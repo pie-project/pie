@@ -24,8 +24,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
-use pie_loader::arch::RuntimeAbi;
 use pie_loader::checkpoint::CheckpointMetadata;
+use pie_loader::contract::ModelContract;
 use pie_loader::dump::dump_load_plan_json;
 use pie_loader::error::CompileError;
 use pie_loader::ffi::inproc::{parse_checkpoint_metadata, parse_model_config};
@@ -199,7 +199,7 @@ impl Options {
 ///
 /// A driver states the model facts in its request; a tool holding only a
 /// directory reads them the way the driver's own config parser does.
-fn compile(snapshot: &Path, options: &Options) -> Result<(LoadPlan, RuntimeAbi), Fail> {
+fn compile(snapshot: &Path, options: &Options) -> Result<(LoadPlan, ModelContract), Fail> {
     let model = parse_model_config(snapshot, options.runtime_quant.clone())?;
     let target = options.target();
     let metadata: CheckpointMetadata = parse_checkpoint_metadata(snapshot)?;
@@ -207,8 +207,8 @@ fn compile(snapshot: &Path, options: &Options) -> Result<(LoadPlan, RuntimeAbi),
     // Kept separate from `compile_snapshot` so `verify` can be handed the
     // contract as well as the plan: checking one against the other is only
     // worth anything when they arrive from different places.
-    let abi = RuntimeAbi::default_for_target(&metadata, &model, &target)?;
-    let plan = compile_load_plan(&metadata, &abi, target)?;
+    let contract = pie_loader::arch::default_contract(&metadata, &model, &target)?;
+    let plan = compile_load_plan(&metadata, &contract, target)?;
     eprintln!(
         "compiled {} source tensors into {} runtime tensors and {} instructions in {:?}",
         plan.sources.len(),
@@ -216,7 +216,7 @@ fn compile(snapshot: &Path, options: &Options) -> Result<(LoadPlan, RuntimeAbi),
         plan.instrs.len(),
         started.elapsed()
     );
-    Ok((plan, abi))
+    Ok((plan, contract))
 }
 
 fn dump(snapshot: &Path, options: &Options) -> Result<(), Fail> {
@@ -226,8 +226,8 @@ fn dump(snapshot: &Path, options: &Options) -> Result<(), Fail> {
 }
 
 fn run_verify(snapshot: &Path, options: &Options) -> Result<(), Fail> {
-    let (plan, abi) = compile(snapshot, options)?;
-    match verify(&PlanView::from(&plan), Some(&ContractView::of(&abi))) {
+    let (plan, contract) = compile(snapshot, options)?;
+    match verify(&PlanView::from(&plan), Some(&ContractView::of(&contract))) {
         Ok(certificate) => {
             println!("{certificate}");
             Ok(())

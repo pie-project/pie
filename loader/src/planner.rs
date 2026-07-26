@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::arch::RuntimeAbi;
 use crate::checkpoint::{CheckpointMetadata, RawTensor};
+use crate::contract::ModelContract;
 use crate::error::CompileError;
 use crate::frontend::{plan_from_contracts, runtime_bytes};
 use crate::ir::{GatherPiece, LayoutExpr, LayoutPlan};
@@ -35,11 +35,11 @@ use passes::{
 
 pub fn compile_load_plan(
     metadata: &CheckpointMetadata,
-    abi: &RuntimeAbi,
+    contract: &ModelContract,
     target: StorageTarget,
 ) -> Result<LoadPlan, CompileError> {
-    let abi = abi.coalesce_direct_row_shards(metadata, &target)?;
-    let plan = plan_from_contracts(metadata, &abi, &target)?;
+    let contract = crate::arch::coalesce_direct_row_shards(contract, metadata, &target)?;
+    let plan = plan_from_contracts(metadata, &contract, &target)?;
     let optimized = optimize_with_report(plan)?;
     let mut program = lower_layout_plan(metadata, &optimized.plan, target)?;
     program.optimizer = optimized.report;
@@ -350,7 +350,6 @@ impl StorageCompiler<'_> {
                             offset: piece.src_offset,
                             stride: storage_extent_for_shape(&decl.shape, &decl.encoding)?,
                         },
-                        layout: decl.layout.clone(),
                     });
                     self.program.schedule.push(instr);
                     return Ok(ValueLoc::Buffer(out));
@@ -869,7 +868,6 @@ mod persistent_layout_tests {
                     }],
                 },
             },
-            layout: crate::types::Layout::dense(1),
         });
         // window [32, 96) escapes the 64-byte backing buffer.
         assert!(validate_persistent_layout(&p).is_err());
