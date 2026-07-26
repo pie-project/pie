@@ -1,0 +1,53 @@
+{
+  "gpu": "NVIDIA A100 80GB PCIe",
+  "answers": [
+    {
+      "question_id": "q01-sound",
+      "headline": "documents generated under the mask that validate: gpugrammar 46/46 valid (100.0%)",
+      "detail": {
+        "schemas": {
+          "gpugrammar": 25
+        },
+        "walks_per_schema": 6,
+        "per_engine": {
+          "gpugrammar": {
+            "walks": 150,
+            "valid": 46,
+            "invalid": 0,
+            "unfinished": 104
+          }
+        },
+        "causes": {},
+        "note": "Every document was produced by choosing only bytes the mask admitted, so an invalid one is a byte the mask should have refused. Both engines walk the same schemas over the same 256-byte vocabulary."
+      },
+      "unanswered": null
+    },
+    {
+      "question_id": "q02-superset",
+      "headline": "over-acceptance by precision level: Ordered 100.0% valid of 5, Unordered 100.0% valid of 41",
+      "detail": {
+        "per_level": {
+          "Unordered": {
+            "valid": 41,
+            "invalid": 0
+          },
+          "Ordered": {
+            "valid": 5,
+            "invalid": 0
+          }
+        }
+      },
+      "unanswered": null
+    },
+    {
+      "question_id": "q03-vs-xgr-mask",
+      "headline": "",
+      "detail": {},
+      "unanswered": "skipped by request"
+    }
+  ],
+  "walks_per_schema": 6,
+  "seed": 20260726,
+  "invalid_examples": [],
+  "invalid_total": 0
+}

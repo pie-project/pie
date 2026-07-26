@@ -451,6 +451,9 @@ class DeviceBatch:
         self.grammar = grammar
         self.batch = batch
         self.configs = grammar.max_configs
+        self.live = 1
+        self.graph: torch.cuda.CUDAGraph | None = None
+        self.captured_live = 0
         rows = batch * self.configs
         self.lexer_state = torch.zeros(rows, dtype=torch.int32, device="cuda")
         self.stack = torch.zeros(
@@ -509,16 +512,57 @@ class DeviceBatch:
                 lexer[row] = lexer_state
                 stacks[row, : len(stack)] = stack
                 depths[row] = len(stack)
+        # The widest configuration set in the batch, recorded while it is still
+        # on the host. Asking the device for it costs a synchronisation every
+        # step - the one thing this design exists to avoid - and launching for
+        # the ceiling instead wastes a grid dimension on programs that return
+        # immediately. The host put the counts there; it can remember them.
+        self.live = int(counts.max())
         self.lexer_state[: rows * self.configs].copy_(torch.from_numpy(lexer))
         self.stack[: rows * self.configs].copy_(torch.from_numpy(stacks))
         self.depth[: rows * self.configs].copy_(torch.from_numpy(depths))
         self.config_count[:rows].copy_(torch.from_numpy(counts))
 
+    def capture(self) -> None:
+        """Record the fill as a CUDA graph and replay it thereafter.
+
+        Two Triton launches cost about 110us of *host* time to issue - argument
+        marshalling, not arithmetic - and on a small schema that is the entire
+        measurement. It is also precisely the cost this design claims to remove
+        from the critical path, so leaving it in would be answering the CPU
+        bottleneck with a different CPU bottleneck.
+
+        Capture is only possible because the fill no longer asks the device
+        anything: every shape is fixed at construction and the one value that
+        used to come back from the device, the live configuration count, is now
+        remembered on the host. A graph cannot contain a synchronisation.
+        """
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                self._fill()
+        torch.cuda.current_stream().wait_stream(stream)
+
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph):
+            self._fill()
+        self.captured_live = self.live
+
     def fill_mask(self) -> torch.Tensor:
+        # The graph baked in a configuration count. If the batch has since grown
+        # a wider one the recording no longer covers it, so fall back rather
+        # than silently mask too little.
+        if self.graph is not None and self.live == self.captured_live:
+            self.graph.replay()
+            return self.mask
+        return self._fill()
+
+    def _fill(self) -> torch.Tensor:
         grammar = self.grammar
         self.mask.zero_()
         self.admitted.zero_()
-        live = int(self.config_count.max())
+        live = self.live
         _mask_kernel[(self.batch * live, self.max_groups)](
             grammar.group_offsets,
             grammar.group_set_kind,

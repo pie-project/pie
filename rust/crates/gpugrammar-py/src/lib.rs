@@ -8,8 +8,8 @@
 use std::sync::Arc;
 
 use gpugrammar_ir::grammar::Grammar;
-use gpugrammar_ir::json_schema::{JsonSchemaOptions, json_schema_to_grammar};
 use gpugrammar_ir::regex::regex_to_grammar;
+use gpugrammar_tables::pipeline::{Limits, compile_json_schema as compile_schema};
 use gpugrammar_lex::lexicon::{extract, terminal_automata};
 use gpugrammar_lex::regular::analyze;
 use gpugrammar_lex::{build_lexer, group_vocabulary};
@@ -44,11 +44,22 @@ impl Compiler {
         Self { vocabulary }
     }
 
-    fn compile_json_schema(&self, schema: &str) -> PyResult<CompiledGrammar> {
-        let grammar = json_schema_to_grammar(schema, &JsonSchemaOptions::default())
-            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    /// Compile a JSON Schema, searching the lowerings for one that is LALR(1).
+    #[pyo3(signature = (schema, lexer_states = None))]
+    fn compile_json_schema(
+        &self,
+        schema: &str,
+        lexer_states: Option<usize>,
+    ) -> PyResult<CompiledGrammar> {
+        let limits = Limits {
+            lexer_states: lexer_states.unwrap_or(Limits::default().lexer_states),
+            ..Default::default()
+        };
+        let compiled = compile_schema(schema, &self.vocabulary, limits)
+            .map_err(|failure| PyValueError::new_err(failure.to_string()))?;
         Ok(CompiledGrammar {
-            artifact: Arc::new(compile(&self.vocabulary, grammar)?),
+            artifact: Arc::new(compiled.artifact),
+            precision: format!("{:?}", compiled.precision),
         })
     }
 
@@ -57,6 +68,7 @@ impl Compiler {
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
         Ok(CompiledGrammar {
             artifact: Arc::new(compile(&self.vocabulary, grammar)?),
+            precision: "n/a".to_string(),
         })
     }
 
@@ -65,6 +77,7 @@ impl Compiler {
             regex_to_grammar(pattern).map_err(|error| PyValueError::new_err(error.to_string()))?;
         Ok(CompiledGrammar {
             artifact: Arc::new(compile(&self.vocabulary, grammar)?),
+            precision: "n/a".to_string(),
         })
     }
 
@@ -79,6 +92,10 @@ impl Compiler {
 #[derive(Clone)]
 pub struct CompiledGrammar {
     artifact: Arc<Artifact>,
+    /// Which lowering the pipeline settled on. A benchmark that reports
+    /// acceptance has to be able to separate the schemas that got the exact
+    /// treatment from those that had to be relaxed.
+    precision: String,
 }
 
 #[pymethods]
@@ -88,6 +105,7 @@ impl CompiledGrammar {
         Matcher {
             inner: RunMatcher::new(self.artifact.clone(), max_rollback),
             words: self.artifact.bitset_words as usize,
+            vocabulary_size: self.artifact.vocab_size as usize,
         }
     }
 
@@ -114,6 +132,11 @@ impl CompiledGrammar {
     #[getter]
     fn bitset_words(&self) -> usize {
         self.artifact.bitset_words as usize
+    }
+
+    #[getter]
+    fn precision(&self) -> &str {
+        &self.precision
     }
 
     #[getter]
@@ -279,6 +302,7 @@ impl CompiledGrammar {
 pub struct Matcher {
     inner: RunMatcher,
     words: usize,
+    vocabulary_size: usize,
 }
 
 #[pymethods]
@@ -303,6 +327,28 @@ impl Matcher {
 
     fn accept_token(&mut self, token: u32) -> bool {
         self.inner.accept_token(token).is_ok()
+    }
+
+    /// Every token the matcher admits right now.
+    ///
+    /// The bitmask path is what serving uses; this is for tests and
+    /// benchmarks, which need the set itself rather than a buffer to apply.
+    fn allowed_tokens(&self) -> Vec<u32> {
+        let mut words = vec![0u32; self.words];
+        self.inner.fill_bitmask(&mut words);
+        let mut allowed = Vec::new();
+        for (index, word) in words.iter().enumerate() {
+            let mut bits = *word;
+            while bits != 0 {
+                let bit = bits.trailing_zeros();
+                bits &= bits - 1;
+                let token = index as u32 * 32 + bit;
+                if (token as usize) < self.vocabulary_size {
+                    allowed.push(token);
+                }
+            }
+        }
+        allowed
     }
 
     fn rollback(&mut self, tokens: usize) {
