@@ -1,0 +1,79 @@
+#include "kernels/gemv.hpp"
+
+#include <cuda_bf16.h>
+
+#include <cstdint>
+
+namespace pie_cuda_driver::kernels {
+
+namespace {
+
+// One warp per output row. Each lane walks the row in float4 strides (8
+// bf16 = 16 B, so a warp step covers 512 B — four full cache lines) and
+// accumulates in fp32; a single shuffle tree finishes the dot product.
+template <int kWarps>
+__global__ void gemv_bf16_kernel(
+    const __nv_bfloat16* __restrict__ weight,
+    const __nv_bfloat16* __restrict__ act,
+    __nv_bfloat16* __restrict__ out,
+    int N, int K)
+{
+    const int row = blockIdx.x * kWarps + threadIdx.y;
+    if (row >= N) return;
+    const float4* w4 =
+        reinterpret_cast<const float4*>(weight + (long long)row * K);
+    const float4* x4 = reinterpret_cast<const float4*>(act);
+    const int vectors = K / 8;
+    float acc = 0.f;
+    for (int i = threadIdx.x; i < vectors; i += 32) {
+        float4 wv = w4[i];
+        float4 xv = x4[i];
+        const __nv_bfloat16* wb = reinterpret_cast<const __nv_bfloat16*>(&wv);
+        const __nv_bfloat16* xb = reinterpret_cast<const __nv_bfloat16*>(&xv);
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            acc += __bfloat162float(wb[j]) * __bfloat162float(xb[j]);
+        }
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    }
+    if (threadIdx.x == 0) out[row] = __float2bfloat16(acc);
+}
+
+bool aligned16(const void* p) {
+    return (reinterpret_cast<std::uintptr_t>(p) & 15u) == 0;
+}
+
+}  // namespace
+
+bool launch_gemv_bf16(
+    const void* weight,
+    const void* act,
+    void*       out,
+    int N, int K,
+    cudaStream_t stream)
+{
+    // The float4 loads need each row to start 16-byte aligned: that holds
+    // iff the base is aligned and the row stride is a multiple of 8 bf16.
+    if (N <= 0 || K <= 0 || (K % 8) != 0) return false;
+    if (weight == nullptr || act == nullptr || out == nullptr) return false;
+    if (!aligned16(weight) || !aligned16(act)) return false;
+    constexpr int kWarps = 4;
+    const long long blocks = (N + kWarps - 1) / kWarps;
+    if (blocks > 2147483647LL) return false;
+    // Everything below is unconditional, so the caller never has to
+    // reason about a half-enqueued launch. In particular this must not
+    // poll `cudaGetLastError`: that would consume an unrelated pending
+    // error the driver's own checks are waiting to report.
+    gemv_bf16_kernel<kWarps>
+        <<<dim3(static_cast<unsigned>(blocks)), dim3(32, kWarps), 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(weight),
+            static_cast<const __nv_bfloat16*>(act),
+            static_cast<__nv_bfloat16*>(out),
+            N, K);
+    return true;
+}
+
+}  // namespace pie_cuda_driver::kernels

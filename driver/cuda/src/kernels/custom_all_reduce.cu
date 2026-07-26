@@ -22,11 +22,13 @@ namespace pie_cuda_driver {
 
 namespace {
 
-// Helper to enable peer access from `device` to every other GPU in the
+// Helper to enable peer access from `self_device` to every other GPU in the
 // group. Idempotent — subsequent calls just return cudaErrorPeerAccessAlreadyEnabled
-// which we swallow.
-void enable_peer_access(int self_device, int world_size) {
-    for (int peer = 0; peer < world_size; ++peer) {
+// which we swallow. `peers` holds real device ordinals: a TP group is not
+// necessarily devices 0..world_size-1 (a second group on an 4-GPU box runs on
+// devices 2 and 3), so rank index must never be used as a device ordinal here.
+void enable_peer_access(int self_device, const std::vector<int>& peers) {
+    for (int peer : peers) {
         if (peer == self_device) continue;
         int can_access = 0;
         const auto can_err = cudaDeviceCanAccessPeer(
@@ -51,12 +53,9 @@ void enable_peer_access(int self_device, int world_size) {
     }
 }
 
-bool has_full_peer_access(int world_size) {
-    int device_count = 0;
-    if (cudaGetDeviceCount(&device_count) != cudaSuccess) return false;
-    if (device_count < world_size) return false;
-    for (int src = 0; src < world_size; ++src) {
-        for (int dst = 0; dst < world_size; ++dst) {
+bool has_full_peer_access(const std::vector<int>& group_devices) {
+    for (int src : group_devices) {
+        for (int dst : group_devices) {
             if (src == dst) continue;
             int can_access = 0;
             if (cudaDeviceCanAccessPeer(&can_access, src, dst) != cudaSuccess) {
@@ -205,6 +204,7 @@ CustomAllReduce::CustomAllReduce() = default;
 
 CustomAllReduce::CustomAllReduce(NcclComm& comm,
                                  bool same_process,
+                                 std::vector<int> group_devices,
                                  std::size_t max_bytes,
                                  std::size_t rank_data_bytes,
                                  int fusion_max_tokens,
@@ -229,10 +229,20 @@ CustomAllReduce::CustomAllReduce(NcclComm& comm,
     // hard error if P2P is not actually available between this GPU and a peer.
     int dev = 0;
     CUDA_CHECK(cudaGetDevice(&dev));
-    enable_peer_access(dev, world_size_);
+    if (group_devices.empty()) {
+        throw std::runtime_error(
+            "custom_all_reduce: group device ordinals are required");
+    }
+    if (static_cast<int>(group_devices.size()) != world_size_) {
+        throw std::runtime_error(
+            "custom_all_reduce: group device list has " +
+            std::to_string(group_devices.size()) + " entries for world_size " +
+            std::to_string(world_size_));
+    }
+    enable_peer_access(dev, group_devices);
     // vLLM's custom all-reduce can handle larger TP groups only when every
     // rank has direct peer access to every other rank.
-    fully_connected_ = world_size_ <= 2 || has_full_peer_access(world_size_);
+    fully_connected_ = world_size_ <= 2 || has_full_peer_access(group_devices);
 
     // Allocate the local Signal struct plus the temporary region needed by
     // flashinfer's 2-stage algorithm. TP=2 uses the 1-stage kernel, but

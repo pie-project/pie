@@ -34,21 +34,44 @@ class TpSequenceGate {
         condition_.notify_all();
     }
 
+    // Group-wide shutdown. `stop` alone cannot release a parked waiter: it is
+    // an ordinary atomic, so flipping it never wakes `condition_`, and the
+    // predicate is only re-evaluated on a notification. Teardown must go
+    // through here so waiters actually observe the request.
+    void request_stop() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopped_.store(true, std::memory_order_release);
+        }
+        condition_.notify_all();
+    }
+
+    bool stopped() const noexcept {
+        return stopped_.load(std::memory_order_acquire);
+    }
+
+    // Returns true when an epoch was consumed, false when the wait ended
+    // because shutdown was requested.
     bool wait_one(
         std::uint64_t& consumed,
         const std::atomic<bool>& stop) {
         std::unique_lock<std::mutex> lock(mutex_);
         condition_.wait(lock, [&] {
             return stop.load(std::memory_order_relaxed) ||
+                stopped_.load(std::memory_order_relaxed) ||
                 sequence_.load(std::memory_order_acquire) > consumed;
         });
-        if (stop.load(std::memory_order_relaxed)) return false;
+        if (stop.load(std::memory_order_relaxed) ||
+            stopped_.load(std::memory_order_relaxed)) {
+            return false;
+        }
         return tp_cpu_gate_consume_one(
             sequence_.load(std::memory_order_acquire), consumed);
     }
 
   private:
     std::atomic<std::uint64_t> sequence_{0};
+    std::atomic<bool> stopped_{false};
     std::mutex mutex_;
     std::condition_variable condition_;
 };

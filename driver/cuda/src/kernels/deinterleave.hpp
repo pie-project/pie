@@ -65,17 +65,13 @@ void launch_concat_bf16_rows(
     int N, int left_dim, int right_dim,
     cudaStream_t stream);
 
-// Split Qwen GDN fused projection outputs:
-//   qkvz: [N, conv_dim + v_dim] -> qkv [N, conv_dim], z [N, v_dim]
-//   ba:   [N, 2 * v_h]          -> b [N, v_h], a [N, v_h]
-void launch_split_qwen_gdn_projections_bf16(
-    const void* qkvz,
-    const void* ba,
-    void*       qkv_out,
-    void*       z_out,
-    void*       b_out,
-    void*       a_out,
-    int N, int conv_dim, int v_dim, int v_h,
+// Inverse of `launch_concat_bf16_rows`:
+//   src: [N, left_dim + right_dim] -> left [N, left_dim], right [N, right_dim]
+void launch_split_bf16_rows(
+    const void* src,
+    void*       left,
+    void*       right,
+    int N, int left_dim, int right_dim,
     cudaStream_t stream);
 
 // Split just Qwen GDN's tiny fused b/a projection:

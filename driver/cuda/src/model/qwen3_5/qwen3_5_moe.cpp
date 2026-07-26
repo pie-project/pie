@@ -34,10 +34,16 @@ bool fused_gdn_projection_weights_enabled() {
     return enabled;
 }
 
+// The shared expert's scalar gate is a [1, H] projection. Packed onto the
+// gate/up weight it is one extra row of a GEMM that already runs; left on
+// its own it is a whole kernel (`sigmoid_dot_scalar_gate_add`, ~7 us per
+// layer, 283 us per Qwen3.6 decode step) for a single dot product. The
+// packed weight is the same size either way, so this is on by default.
 bool fused_shared_scalar_gate_enabled() {
     static const bool enabled = [] {
         const char* v = std::getenv("PIE_QWEN35_FUSED_SHARED_SCALAR_GATE");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
+        if (v == nullptr || v[0] == '\0') return true;
+        return v[0] != '0';
     }();
     return enabled;
 }
@@ -292,6 +298,12 @@ Qwen3_5MoeWeights bind_qwen3_5_moe(const LoadedModel& engine) {
             Lw.la_in_proj_z   = &must(engine, la + "in_proj_z.weight");
             Lw.la_in_proj_b   = &must(engine, la + "in_proj_b.weight");
             Lw.la_in_proj_a   = &must(engine, la + "in_proj_a.weight");
+            // Measured on Qwen3.6-35B-A3B: fusing b/a saves nothing (the
+            // split kernel that unpacks the result costs back what the
+            // dropped GEMV saved), and fusing qkv/z needs 1.4 GB of
+            // duplicate weights — the originals are arena-backed, so
+            // erasing them reclaims nothing — which leaves no viable
+            // forward/KV layout. Both stay opt-in.
             if (fused_gdn_projection_weights_enabled()) {
                 w.owned_bf16_buffers.push_back(concat_axis0_bf16(
                     *Lw.la_in_proj_qkv, *Lw.la_in_proj_z,

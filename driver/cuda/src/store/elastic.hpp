@@ -39,6 +39,21 @@ class CudaPhysicalPool final : public pie::elastic::PhysicalPool {
         return allocation_granularity_;
     }
     std::size_t handle_bytes() const noexcept { return handle_bytes_; }
+
+    // Grant peer devices read/write access to every arena page backed by this
+    // pool. VMM mappings are private to the owning device unless the peer is
+    // named in the access descriptor, so without this a same-process tensor-
+    // parallel peer faults when it reads this rank's activations directly
+    // (which is exactly what the custom P2P all-reduce kernel does). Must be
+    // called before any arena grows; pages mapped later pick the list up
+    // automatically.
+    void set_peer_devices(std::vector<int> peers);
+    const std::vector<int>& peer_devices() const noexcept {
+        return peer_devices_;
+    }
+    // Access descriptors for the owning device plus every peer.
+    std::vector<CUmemAccessDesc> access_descriptors() const;
+
     void mark_committed(std::size_t pages);
     void mark_uncommitted(std::size_t pages) noexcept;
     void recalibrate_budget(
@@ -52,6 +67,7 @@ class CudaPhysicalPool final : public pie::elastic::PhysicalPool {
 
   private:
     int device_ordinal_ = 0;
+    std::vector<int> peer_devices_;
     std::size_t allocation_granularity_ = 0;
     std::size_t handle_bytes_ = 0;
     std::size_t budget_pages_ = 0;
@@ -138,6 +154,11 @@ class CudaArenaAllocator {
     std::size_t target_bytes(
         std::size_t used,
         std::size_t capacity) const noexcept;
+
+    // Base address of every arena backing this allocator. The custom P2P
+    // all-reduce registers allocations by base pointer, so this is what has
+    // to be handed to it for the workspace the model all-reduces out of.
+    std::vector<void*> arena_bases() const;
 
   private:
     static void* allocate_callback(
