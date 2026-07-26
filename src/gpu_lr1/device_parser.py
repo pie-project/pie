@@ -178,7 +178,15 @@ def _mask_kernel(
         while term < term_end and alive == 1:
             terminal = tl.load(reading_terminals_ptr + term)
             settled = 0
-            for _ in range(0, MAX_REDUCTIONS):
+            # Bounded, but not fixed. A reduction chain ends at the first
+            # shift, and on real documents that is two to four steps, while the
+            # bound has to cover the deepest chain the grammar admits - the
+            # stack depth, 256. Running the bound every time did sixty times
+            # the work a typical token needs. The counter is a guard against a
+            # grammar that never settles, not the schedule.
+            spins = 0
+            while settled == 0 and alive == 1 and spins < MAX_REDUCTIONS:
+                spins = spins + 1
                 if settled == 0 and alive == 1:
                     row = tl.load(action_offsets_ptr + top)
                     row_end = tl.load(action_offsets_ptr + top + 1)
@@ -254,7 +262,13 @@ def _mask_kernel(
                     probe_top = top
                     probe_alive = 1
                     probe_settled = 0
-                    for _ in range(0, MAX_REDUCTIONS):
+                    probe_spins = 0
+                    while (
+                        probe_settled == 0
+                        and probe_alive == 1
+                        and probe_spins < MAX_REDUCTIONS
+                    ):
+                        probe_spins = probe_spins + 1
                         if probe_settled == 0 and probe_alive == 1:
                             row = tl.load(action_offsets_ptr + probe_top)
                             row_end = tl.load(action_offsets_ptr + probe_top + 1)
@@ -574,7 +588,15 @@ def _candidate_kernel(
         while term < term_end and alive == 1:
             terminal = tl.load(reading_terminals_ptr + term)
             settled = 0
-            for _ in range(0, MAX_REDUCTIONS):
+            # Bounded, but not fixed. A reduction chain ends at the first
+            # shift, and on real documents that is two to four steps, while the
+            # bound has to cover the deepest chain the grammar admits - the
+            # stack depth, 256. Running the bound every time did sixty times
+            # the work a typical token needs. The counter is a guard against a
+            # grammar that never settles, not the schedule.
+            spins = 0
+            while settled == 0 and alive == 1 and spins < MAX_REDUCTIONS:
+                spins = spins + 1
                 if settled == 0 and alive == 1:
                     row = tl.load(action_offsets_ptr + top)
                     row_end = tl.load(action_offsets_ptr + top + 1)
@@ -643,7 +665,13 @@ def _candidate_kernel(
                     probe_top = top
                     probe_alive = 1
                     probe_settled = 0
-                    for _ in range(0, MAX_REDUCTIONS):
+                    probe_spins = 0
+                    while (
+                        probe_settled == 0
+                        and probe_alive == 1
+                        and probe_spins < MAX_REDUCTIONS
+                    ):
+                        probe_spins = probe_spins + 1
                         if probe_settled == 0 and probe_alive == 1:
                             row = tl.load(action_offsets_ptr + probe_top)
                             row_end = tl.load(action_offsets_ptr + probe_top + 1)
