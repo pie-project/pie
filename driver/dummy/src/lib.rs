@@ -331,8 +331,10 @@ impl DummyDriver {
                 has_value_head: options.has_value_head,
                 has_attn_score: options.has_attn_score,
                 // The dummy driver has no real KV keys, so it can never honour
-                // the `envelope_dot` contract.
+                // the `envelope_dot` contract, nor act on a page selection made
+                // over keys it does not have.
                 has_kv_envelopes: false,
+                has_attn_page_mask: false,
                 device_geometry_port_mask: pie_driver_abi::PIE_DEVICE_GEOMETRY_PORTS
                     | pie_driver_abi::PIE_DEVICE_PORT_ATTN_MASK,
                 max_forward_tokens: options.max_forward_tokens,
@@ -1122,6 +1124,7 @@ impl DummyDriver {
             has_mtp_drafts: self.capabilities.has_mtp_drafts,
             has_value_head: self.capabilities.has_value_head,
             has_attn_score: self.capabilities.has_attn_score,
+            has_attn_page_mask: false,
             kernels: vec![KernelInfo {
                 name: "boom".to_string(),
                 sink_scope: None,

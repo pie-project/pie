@@ -831,6 +831,17 @@ Gemma4Weights bind_gemma4(const LoadedModel& engine) {
     int global_head_dim = cfg.head_dim;
     {
         // First full-attention layer's q_proj reveals global_head_dim.
+        // The bound weight is already ROW-SHARDED, so it has
+        // `num_attention_heads / tp_size` heads, not `num_attention_heads`.
+        // Dividing by the model-wide head count returned
+        // `global_head_dim / tp_size` — 256 instead of 512 for E4B at tp=2 —
+        // which silently ran every full-attention layer at half its head
+        // width while the sliding layers (whose head dim comes from the
+        // config, not from a weight) stayed correct. The residual stream is
+        // clean through layer 4 and diverges at layer 5, the first
+        // full-attention layer.
+        const int tp = std::max(1, engine.distributed().tp_size);
+        const int local_q_heads = std::max(1, cfg.num_attention_heads / tp);
         for (int i = 0; i < L; ++i) {
             if (cfg.layer_types[i] == "full_attention") {
                 const std::string q_name = p + "layers." + std::to_string(i) +
@@ -840,7 +851,7 @@ Gemma4Weights bind_gemma4(const LoadedModel& engine) {
                     const auto& s = qt.shape();
                     if (!s.empty()) {
                         global_head_dim = static_cast<int>(s[0]) /
-                                          cfg.num_attention_heads;
+                                          local_q_heads;
                     }
                 }
                 break;
@@ -1229,6 +1240,15 @@ inline bool dbg_dumps_enabled() {
     static const bool enabled = std::getenv("PIE_GEMMA4_DUMP_DIR") != nullptr;
     return enabled;
 }
+inline int dbg_dump_layer_limit() {
+    static const int limit = [] {
+        const char* v = std::getenv("PIE_GEMMA4_DUMP_LAYERS");
+        if (v == nullptr || v[0] == '\0') return 4;
+        const int n = std::atoi(v);
+        return n > 0 ? n : 4;
+    }();
+    return limit;
+}
 inline void dbg_dump_bf16(const char* tag, const void* dev_ptr,
                           std::size_t numel) {
     if (!dbg_dumps_enabled()) return;
@@ -1236,7 +1256,14 @@ inline void dbg_dump_bf16(const char* tag, const void* dev_ptr,
     static const char* dir = std::getenv("PIE_GEMMA4_DUMP_DIR");
     std::vector<std::uint16_t> tmp(numel);
     cudaMemcpy(tmp.data(), dev_ptr, numel * 2, cudaMemcpyDeviceToHost);
-    std::string path = std::string(dir) + "/" + tag + ".bin";
+    // Name the file by device. TP ranks share this process and run the same
+    // forward concurrently, so a rank-less name has every rank writing the
+    // SAME file: the result is a mix of both ranks' rows, which reads as a
+    // numerical divergence that does not exist. Cost a full debugging pass.
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) device = 0;
+    std::string path = std::string(dir) + "/" + tag + ".dev" +
+        std::to_string(device) + ".bin";
     std::ofstream out(path, std::ios::binary);
     if (!out) return;
     out.write(reinterpret_cast<const char*>(tmp.data()), numel * 2);
@@ -1638,7 +1665,14 @@ void gemma4_forward_paged(
     bool attn_norm_precomputed = false;
     for (int l = 0; l < debug_max_layers; ++l) {
         const auto& layer = w.layers[l];
-        const bool dump_this = (l == 0);
+        // Which layer the L0_* intra-layer dumps come from. Still layer 0 by
+        // default; `PIE_GEMMA4_DUMP_LAYER` retargets it, which is how a fault
+        // that only appears in gemma-4's full-attention layers can be seen.
+        static const int dump_layer = [] {
+            const char* v = std::getenv("PIE_GEMMA4_DUMP_LAYER");
+            return (v == nullptr || v[0] == '\0') ? 0 : std::atoi(v);
+        }();
+        const bool dump_this = (l == dump_layer);
         // Pair the sync with the dump so a release run (no dump dir
         // env var) skips both — the standalone syncs that used to
         // precede each dump_l0 call were the dominant per-step
@@ -1651,6 +1685,15 @@ void gemma4_forward_paged(
         };
         // Per-layer dims sharded by tp_size on TP runs. The head/intermediate
         // counts must be divisible by tp_size — guarded at engine load.
+        //
+        // `num_attention_heads` and `num_kv_heads` come from the CONFIG, so
+        // they are model-wide totals and have to be divided here.
+        // `layer.intermediate` does NOT: it is read back from the bound
+        // `gate_proj` weight (`shape()[0]`), which the loader already
+        // row-sharded, so it is this rank's own width. Dividing it again gave
+        // each rank half the intermediate it owns — at tp=2 the GEGLU ran
+        // 2560 wide where the tensor is 5120, so the two ranks together
+        // computed a quarter of the MLP and the model emitted noise.
         const int T  = (fwd_cfg.tp_size > 0) ? fwd_cfg.tp_size : 1;
         const int d  = layer.head_dim;
         const int num_q_heads_local  = cfg.num_attention_heads / T;
@@ -1660,7 +1703,7 @@ void gemma4_forward_paged(
         const int num_kv_heads_local = layer.num_kv_heads / T;
         const int Hq = num_q_heads_local * d;
         const int Hk = num_kv_heads_local * d;
-        const int I  = layer.intermediate / T;
+        const int I  = layer.intermediate;
         NcclComm* tp = (T > 1) ? fwd_cfg.tp_comm : nullptr;
 
         // ── 3a. Attention block ─────────────────────────────────────────
@@ -1675,6 +1718,24 @@ void gemma4_forward_paged(
         attn_norm_precomputed = false;
         dump_l0("attn_norm_pre", ws.norm_x.data(),
                 static_cast<std::size_t>(N) * H);
+        // Weight dumps: separates "wrong shard bytes" from "wrong GEMM" when
+        // a TP rank's projection output diverges from the tp=1 reference.
+        if (layer.q_proj != nullptr) {
+            dump_l0("w_q_proj", layer.q_proj->data(),
+                    static_cast<std::size_t>(Hq) * H);
+        }
+        if (layer.k_proj != nullptr) {
+            dump_l0("w_k_proj", layer.k_proj->data(),
+                    static_cast<std::size_t>(Hk) * H);
+        }
+        if (layer.o_proj != nullptr) {
+            dump_l0("w_o_proj", layer.o_proj->data(),
+                    static_cast<std::size_t>(H) * Hq);
+        }
+        if (layer.down_proj != nullptr) {
+            dump_l0("w_down_proj", layer.down_proj->data(),
+                    static_cast<std::size_t>(H) * I);
+        }
 
         // RoPE: partial rotary on full-attention layers
         // (`partial_rotary_factor < 1`), full rotation otherwise.
@@ -2166,7 +2227,7 @@ void gemma4_forward_paged(
 
         // Parity dump: residual stream after attention/MLP/PLE for
         // the first few layers.
-        if (l < 4) {
+        if (l < dbg_dump_layer_limit()) {
             char tag[32];
             std::snprintf(tag, sizeof tag, "layer_%d_post_ple_y", l);
             dbg_sync_dump_bf16(tag, ws.y.data(),
@@ -2183,7 +2244,7 @@ void gemma4_forward_paged(
 
         // Post-layer_scalar dump for parity comparison against HF's
         // `hidden_states[layer+1]` (which is after the scalar mul).
-        if (l < 4) {
+        if (l < dbg_dump_layer_limit()) {
             char tag[32];
             std::snprintf(tag, sizeof tag, "layer_%d_post_scalar_y", l);
             dbg_sync_dump_bf16(tag, ws.y.data(),

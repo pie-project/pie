@@ -30,7 +30,7 @@ pub(super) fn metal_qwen35_runtime_name(raw_name: &str) -> Result<Option<String>
     Ok(Some(format!("layers.{layer}.{suffix}")))
 }
 
-impl DefaultAbiBuilder<'_> {
+impl ContractBuilder<'_> {
     pub(super) fn add_metal_qwen35_contracts(&mut self) -> Result<(), CompileError> {
         let tensors = self.metadata.tensors.clone();
         for raw in &tensors {
@@ -109,16 +109,12 @@ impl DefaultAbiBuilder<'_> {
         // The checkpoint stores these 4-bit weights eight to a u32 word. The
         // contract names them for what they are; no byte moves.
         let out = crate::contract::TensorType::new(vec![rows, logical_cols], encoding.clone());
-        self.tensors.push(RuntimeTensorContract {
+        self.tensors.push(TensorContract::new(
             output_name,
-            expr: Expr::src(raw.name.clone()).bitcast(out),
+            Expr::src(raw.name.clone()).bitcast(out),
+            vec![rows, logical_cols],
             encoding,
-            shape: vec![rows, logical_cols],
-            layout: Layout::dense(self.alignment()),
-            sharding: Sharding::replicated(),
-            alignment: self.alignment(),
-            shard_axis: None,
-        });
+        ));
         Ok(())
     }
 }

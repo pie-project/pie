@@ -412,7 +412,7 @@ pub fn bits_per_element(encoding: &Encoding) -> u32 {
     }
 }
 
-/// Compile `expr` into runs, using the types [`super::ModelContract::check`]
+/// Compile `expr` into runs, using the types the resolver
 /// already resolved for it.
 ///
 /// `max_runs` bounds the walker's own output so a pathological expression
@@ -656,6 +656,9 @@ impl Builder<'_> {
                 };
                 self.push(Kind::Leaf(leaf), out.shape.clone())
             }
+            Expr::Shard { .. } => Err(CompileError::Internal(
+                "Shard must be specialized against a target before lowering".to_string(),
+            )),
         }
     }
 
@@ -850,7 +853,9 @@ fn flatten(coord: &Coord, shape: &[i64]) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::{CheckpointTypes, ModelContract, TensorContract, TensorType, infer_type};
+    use crate::contract::{
+        Checked, CheckpointTypes, ModelContract, Resolver, TensorContract, TensorType, infer_type,
+    };
     use crate::types::{Axis, DType, QuantScheme, QuantSpec};
 
     struct Fake(HashMap<String, TensorType>);
@@ -875,6 +880,17 @@ mod tests {
         fn tensor_type(&self, name: &str) -> Option<TensorType> {
             self.0.get(name).cloned()
         }
+    }
+
+    /// Resolve a whole contract the way the frontend does, so that a view can
+    /// be compiled against the bank it reads.
+    fn resolve(contract: &ModelContract, checkpoint: &dyn CheckpointTypes) -> Checked {
+        let mut resolver = Resolver::new(checkpoint);
+        for tensor in &contract.tensors {
+            let ty = resolver.infer(&tensor.expr).expect("type check failed");
+            resolver.publish(&tensor.name, ty);
+        }
+        resolver.into_checked()
     }
 
     fn lower(expr: Expr, checkpoint: &dyn CheckpointTypes) -> Lowering {
@@ -1080,7 +1096,7 @@ mod tests {
                 ),
             ],
         };
-        let checked = contract.check(&qwen3()).unwrap();
+        let checked = resolve(&contract, &qwen3());
         let view = compile(&contract.tensors[1].expr, &checked, 1024).unwrap();
         assert_eq!(view.leaves, vec![Leaf::Contract("qkv".to_string())]);
         assert_eq!(
@@ -1300,7 +1316,7 @@ mod tests {
                 oracle(src, &inner, ck)
             }
             Expr::Bitcast { src, .. } => oracle(src, coord, ck),
-            Expr::Out(_) | Expr::Repack { .. } | Expr::Quantize { .. } => {
+            Expr::Out(_) | Expr::Repack { .. } | Expr::Quantize { .. } | Expr::Shard { .. } => {
                 unreachable!("the oracle covers only Src-rooted affine expressions")
             }
         }
@@ -1712,7 +1728,7 @@ mod tests {
                 ),
             ],
         };
-        let checked = contract.check(&qwen3()).unwrap();
+        let checked = resolve(&contract, &qwen3());
         let starts: Vec<i64> = contract.tensors[1..]
             .iter()
             .map(|entry| {

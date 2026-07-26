@@ -61,7 +61,7 @@ credible if it covers all of them.
 | 2  | Rename                                        | `abi/metal.rs` `metal_qwen35_runtime_name`        |
 | 3  | Concat (q,k,v → qkv)                          | `abi/fusion.rs`, `Join { axis }`                  |
 | 4  | Split (qkv → q,k,v)                           | `abi/phi3.rs`, `ByteSpans`                        |
-| 5  | Tensor-parallel shard                         | `Sharding` + `shard_axis`                         |
+| 5  | Tensor-parallel shard                         | `Shard` (was `Sharding` + `shard_axis`)           |
 | 6  | Expert stack (`[I,H]`×E → `[E,2I,H]`)         | `abi/qwen_moe.rs` `add_qwen_moe_expert_stacks`    |
 | 7  | Nested shard-inside-concat                    | `abi/qwen_moe.rs` `add_fused_moe_gate_up_tp_slices` |
 | 8  | Strided select (even/odd rows)                | `RowMap::{Even,Odd}`                              |
@@ -96,12 +96,13 @@ Expr :=
   | Reshape(Expr, shape)                      -- row-major: a byte identity
   | Pad    (Expr, axis, before, after)
   | Bitcast(Expr, out: TensorType)             -- same bytes, different element type
+  | Shard  (Expr, axis)                       -- this rank's 1/world band; specialized away
   ---------------------------------------------- affine fragment ends here
   | Repack  (Expr, spec, out: TensorType)     -- escape hatch 1: hardware swizzle
   | Quantize(Expr, spec)                      -- escape hatch 2: arithmetic
 ```
 
-Seven constructors, plus two explicitly-labelled escape hatches.
+Eight constructors, plus two explicitly-labelled escape hatches.
 
 `Src` and `Out` are separate on purpose. A single `Ref` with a resolution order
 looks tidier, but contracts routinely re-publish checkpoint names — a bank plus
@@ -132,6 +133,21 @@ because once the element width changes, an element offset into a partial view
 denotes nothing: `Slice(e, 0, 3, 1)` before the cast and after it are different
 byte ranges, and no rule picks one.
 
+`Shard` is the one node whose meaning depends on the target, and the reason
+compilation has a *specialization* stage. A tensor-parallel band is a `Slice`
+(§2 case 5) but the author cannot write that `Slice`: its `start` is
+`rank * len`, so writing it directly would make the contract rank-dependent, and
+a contract that means something different on each of `world` ranks cannot be
+authored once. `Shard` says the *intent* — split this along that axis — and
+`Resolver::specialize` computes the arithmetic once per rank, before inference,
+after which no rank-dependence survives. Stated as a node rather than as a field
+beside the expression it also composes: a shard of one leg of a `Cat` (§2 case
+7) is expressible, which a whole-expression flag cannot say.
+
+The declared shape is therefore always the *rank's* shape, never the model's.
+There is no second convention to disambiguate, and it is what a driver actually
+receives.
+
 Coverage of §2:
 
 | Case                     | Expression                                         |
@@ -140,7 +156,7 @@ Coverage of §2:
 | 2 rename                 | not an expression — the name is a record field     |
 | 3 concat                 | `Cat`                                              |
 | 4 split                  | `Slice`                                            |
-| 5 TP shard               | `Slice(e, axis, rank*len, len)`                    |
+| 5 TP shard               | `Shard(e, axis)` → `Slice(e, axis, rank*len, len)`  |
 | 6 expert stack           | `Cat(0, [Reshape(e_i, [1,I,H]) for i])`            |
 | 7 nested                 | `Cat` ∘ `Slice` ∘ `Cat` — plain composition        |
 | 8 strided select         | `Slice(e, 0, 0, n, step=2)`                        |
@@ -320,7 +336,7 @@ pub struct ModelContract {
 }
 ```
 
-Four fields per tensor, down from nine in `RuntimeTensorContract`.
+Four fields per tensor, down from nine in the old `RuntimeTensorContract`.
 
 ### 4.1 Why `shape` is intentionally redundant
 
@@ -344,12 +360,13 @@ threads byte spans across the FFI, and it costs one `Vec<i64>` per tensor.
 | ------------------------------ | ------------------------------------------------------------- |
 | `dtype`                        | already in `Encoding::Raw(d)` / `Quant(spec).logical_dtype`    |
 | `metadata: Vec<TensorId>`      | never populated at any construction site; dead                 |
-| `layout.strides`               | always empty; `Layout::dense()` is the only constructor        |
-| per-tensor `alignment`         | always `target.preferred_alignment.max(1)`; hoisted to header  |
-| `sharding` + `shard_axis`      | a TP shard **is** a `Slice`                                    |
+| `layout` (the whole struct)    | **done** — one field (`alignment`), duplicated by `TensorDecl.alignment` and discarded at the FFI |
+| per-tensor `alignment`         | **done** — always `target.preferred_alignment.max(1)`; hoisted to `ModelContract.alignment` |
+| `sharding` + `shard_axis`      | **done** — a TP shard **is** a `Slice`; `Shard` states the intent, `specialize` writes the arithmetic |
 | `RuntimeTensorSource::SelectContract` | an `Out` ref — a DAG edge                               |
 | `RuntimeByteSpan` in the contract | now the compiler's *output*, not a driver's input           |
 | `consumed: HashSet` + pass order  | a declaration has no evaluation order                       |
+| `shape: Vec<i64>` → `Option`   | **done** — not a removal but a weakening, and the more useful one. A driver genuinely cannot predict the on-disk extents of a packed AWQ or GPTQ weight, which is why `contract_detail::LogicalShape` erased the shape whenever `hf.quant_method` was non-empty. Not stating it is now expressible, so the workaround is deleted and the check is `Some(declared)`-conditional rather than skipped by family. |
 
 ### 4.3 The DAG makes bank-and-view stop being a pattern
 
@@ -425,9 +442,9 @@ TensorContract::new("…v_proj.weight", Expr::src("…qkv_proj.weight").slice(0,
 | `phi3_fused_splits`                                            |    94 | the same declaration in the opposite direction              |
 | `bind_projection_or_fused_view` (C++)                          |    32 | views are published by the loader for free                  |
 | `mla_fused_joins`, `nemotron_packed_experts`, `stack_per_expert_moe`, `gpt_oss_mxfp4_groups`, `metal_qwen35` | ~900 | declarations, not inferences |
-| `Sharding`, `shard_axis`                                       |     — | a shard is a `Slice`                                        |
+| `Sharding`, `shard_axis`                                       |     — | **done** — a shard is a `Slice`, and `Shard` is the node that says so |
 | `SelectContract`                                               |     — | an `Out` ref is a DAG edge                                  |
-| `metadata`, `Layout.strides`, duplicated `alignment`           |     — | dead fields                                                 |
+| `metadata`, `Layout`, duplicated `alignment`                   |     — | **done** — dead fields; `alignment` is one header field now  |
 
 Most of `RepackSpec`'s 11 fields are absorbed by `Slice` / `Pad` / `Reshape`,
 leaving only the `layout` enum.

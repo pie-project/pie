@@ -85,6 +85,16 @@ pub enum KvPageBacking {
 /// the same rule [`PageTable::private_resident_pages`] applies at suspend
 /// time. Victim selection consumes this, so selection and execution cannot
 /// disagree about what a candidate is worth.
+///
+/// **This is a transient policy signal, never a holdings measure.** It has
+/// no scalar accessor on purpose: the `pages()` that used to exist returned
+/// 0 for every `Nothing` variant, and `check_hog` read it as "pages this
+/// process holds" — so a head occupying the whole pool measured as holding
+/// nothing the moment one in-flight pin or one sharer appeared, and the hog
+/// endgame could not fire (`rainer_v3.md` §3.3). Liveness predicates call
+/// [`PageTable::held_pages`]; victim selection matches the variants
+/// directly, which forces each caller to say what a given [`NoReclaim`]
+/// means to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReclaimQuote {
     /// Suspending this group frees exactly this many resident pages.
@@ -111,16 +121,6 @@ pub enum NoReclaim {
     /// An in-flight pin overlaps the group's residency. Cleared when this
     /// process's own fires drain.
     Pinned,
-}
-
-impl ReclaimQuote {
-    /// Pages this quote promises; zero for every `Nothing` variant.
-    pub fn pages(self) -> u32 {
-        match self {
-            ReclaimQuote::Pages(pages) => pages,
-            ReclaimQuote::Nothing(_) => 0,
-        }
-    }
 }
 
 /// Stable location of an owned page while a suspend/restore transaction pins
@@ -1780,6 +1780,29 @@ impl KvPageTable {
                 KvPageBacking::Resident(_) => None,
             })
             .collect())
+    }
+
+    /// Every page this group holds — resident AND swapped, pinned or not,
+    /// shared or not.
+    ///
+    /// This is the DURABLE fact, and it is deliberately not a
+    /// [`ReclaimQuote`]: a quote answers "what would suspending free right
+    /// now", a transient property that collapses to zero the instant a pin
+    /// or a sharer appears. Liveness predicates need the other question —
+    /// "how much of the pool does this process occupy that evicting
+    /// everyone else cannot recover" — and reading `ReclaimQuote::pages()`
+    /// for it silently under-counted a 39-page holder to 0 whenever one
+    /// in-flight pin overlapped, disarming the hog endgame
+    /// (`rainer_v3.md` §3.3).
+    ///
+    /// Shared pages count: a sharer releasing does not hand the page back
+    /// to the pool while this group still references it.
+    pub fn held_pages(&self, working_sets: &HashSet<WorkingSetId>) -> Result<usize, KvTableError> {
+        let mut locations = HashSet::new();
+        for &ws in working_sets {
+            locations.extend(self.working_set_locations(ws)?);
+        }
+        Ok(locations.len())
     }
 
     pub fn pin_working_sets(

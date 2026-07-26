@@ -476,6 +476,48 @@ fn reclaim_quotes_count_only_the_private_resident_suffix() {
 }
 
 #[test]
+fn held_pages_is_a_durable_fact_where_a_reclaim_quote_is_not() {
+    let group = |ws| HashSet::from([ws]);
+    let mut t = KvPageTable::new();
+    let a = t.create_working_set();
+    publish(&mut t, a, 0..5);
+    let b = t.fork(a).unwrap();
+    publish(&mut t, a, 5..10); // a's private suffix
+    publish(&mut t, b, 10..12); // b's private suffix
+
+    // Holdings include the SHARED prefix: a sharer releasing does not hand
+    // those pages back to the pool while this group still references them.
+    // The quote, answering a different question, counts only the private
+    // suffix it could actually free.
+    assert_eq!(t.held_pages(&group(a)).unwrap(), 10);
+    assert_eq!(t.held_pages(&group(b)).unwrap(), 7);
+    assert_eq!(t.reclaim_quotes(&[group(a)]), vec![ReclaimQuote::Pages(5)]);
+
+    // THE REGRESSION THIS GUARDS (rainer_v3.md §3.3): a pin collapses the
+    // quote to zero, but holdings must not move. `check_hog` read
+    // `ReclaimQuote::pages()` as "pages held", so a head holding the whole
+    // pool measured as holding NOTHING the moment one in-flight fire
+    // overlapped its residency — the hog endgame could not fire, and the
+    // starvation rung destroyed the innocent youngest ask instead.
+    let term_a = t.terminal(a).unwrap().unwrap();
+    t.pin(term_a);
+    assert_eq!(
+        t.reclaim_quotes(&[group(a)]),
+        vec![ReclaimQuote::Nothing(NoReclaim::Pinned)]
+    );
+    assert_eq!(
+        t.held_pages(&group(a)).unwrap(),
+        10,
+        "an in-flight pin must not shrink what the process is holding"
+    );
+    t.unpin(term_a);
+
+    // Quoted together the prefix counts once, exactly as for quotes.
+    assert_eq!(t.held_pages(&HashSet::from([a, b])).unwrap(), 12);
+    assert_eq!(t.held_pages(&HashSet::new()).unwrap(), 0);
+}
+
+#[test]
 fn pin_blocks_in_place_extension() {
     let mut t = KvPageTable::new();
     let a = t.create_working_set();

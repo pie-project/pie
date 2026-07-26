@@ -14,9 +14,7 @@ use pie_loader::ir::{GatherDim, GatherPiece, LayoutExpr, LayoutPlan};
 use pie_loader::optimizer::optimize;
 use pie_loader::reference::{TensorValue, evaluate};
 use pie_loader::typecheck::typecheck;
-use pie_loader::types::{
-    DType, Encoding, ExprId, Layout, Sharding, TensorDecl, TensorId, encoding_nbytes,
-};
+use pie_loader::types::{DType, Encoding, ExprId, TensorDecl, TensorId, encoding_nbytes};
 
 const MAX_RUNS: usize = 1 << 16;
 const DTYPE: DType = DType::I32;
@@ -85,8 +83,6 @@ fn decl(id: u32, name: &str, shape: &[i64]) -> TensorDecl {
         name: name.to_string(),
         shape: shape.to_vec(),
         encoding: Encoding::Raw(DTYPE),
-        layout: Layout::dense(256),
-        sharding: Sharding::replicated(),
         alignment: 256,
     }
 }

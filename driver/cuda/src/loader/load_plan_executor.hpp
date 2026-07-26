@@ -138,9 +138,6 @@ public:
                 copy_engine_.flush();
                 buffers_.erase(instr.buffer_id);
                 break;
-            case pie_loader::PieLoaderStorageInstrKind::Attach:
-                copy_engine_.flush();
-                break;
             }
         }
         copy_engine_.flush();
@@ -292,10 +289,13 @@ private:
                 "implemented");
         }
         if (!pie_loader::compact_extent(instr.source.stride)) {
+            const std::uint64_t dst_offset =
+                instr.dest.offset + instr.dest.stride.base_offset;
+            const std::uint64_t dst_total = dst_it->second.nbytes();
             copy_strided_extent_to_device(
                 loader_, instr,
                 dst,
-                pie_loader::extent_shape(instr.dest.stride));
+                dst_offset > dst_total ? 0 : dst_total - dst_offset);
             return;
         }
         copy_engine_.queue(

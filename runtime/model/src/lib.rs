@@ -143,6 +143,8 @@ pub struct PtirCaps {
     /// Backend can observe per-position softmax attention weights at an
     /// `OnAttn` tap (`IntrinsicId::AttnScore`) -- H2O/TOVA.
     pub has_attn_score: bool,
+    /// Backend honours the `attn_page_mask` sink (page-granular eviction).
+    pub has_attn_page_mask: bool,
 }
 
 impl std::fmt::Debug for Model {

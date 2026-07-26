@@ -29,6 +29,7 @@
 #include "kernels/graph_pad.hpp"
 #include "kernels/pack_dense_mask.hpp"
 #include "model/loaded_model.hpp"
+#include "model/attn_score.hpp"
 #include "model/stage_hooks.hpp"
 #include "store/kv_cache.hpp"
 #include "store/recurrent_state_cache.hpp"
@@ -2206,6 +2207,10 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
                 .is_pure_decode = s.is_pure_decode,
                 .have_custom_mask = s.have_custom_mask,
                 .runtime_window_left = s.structured_window_left,
+                .attn_score_window =
+                    engine.dispatch->launch_wants_attn_score(s.dispatch_view)
+                        ? model::default_attn_score_window()
+                        : 0u,
             });
         engine.attn_ws.end_plan_update(cublas.stream());
         plan_timer.stop();
@@ -2252,6 +2257,9 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
         .context = &stage_hook_context,
         .wants_attn_score =
             engine.dispatch->launch_wants_attn_score(s.dispatch_view),
+        .attn_score_window = model::default_attn_score_window(),
+        .wants_page_mask =
+            engine.dispatch->launch_wants_page_mask(s.dispatch_view),
         .execute = [](
             void* opaque,
             model::StageHookPoint point,

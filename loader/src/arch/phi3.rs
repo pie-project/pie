@@ -2,7 +2,7 @@
 
 use super::*;
 
-impl DefaultAbiBuilder<'_> {
+impl ContractBuilder<'_> {
     pub(super) fn add_phi3_fused_splits(&mut self) -> Result<(), CompileError> {
         if !self.profile().phi3_fused_splits {
             return Ok(());

@@ -28,6 +28,21 @@ inline bool second_party_region_supported(
     const std::uint32_t node = region.nodes.front();
     if (node >= stage.ops.size()) return false;
     const auto& op = stage.ops[node].op;
+    if (op.tag == PTIR_OP_SINK_CALL) {
+        // `attn_page_mask(mask)` -- a configuration sink. One argument, no
+        // result. The mask is a per-page vector over the request's page list,
+        // so the only structural claim that holds is rank 1; its extent is the
+        // program's own page ceiling, which the runtime checks against the
+        // lane's actual page count.
+        if (op.name_idx >= stage.names.size()) return false;
+        if (stage.names[op.name_idx] != "attn_page_mask") return false;
+        if (op.args.size() != 1 || op.results != 0) return false;
+        if (!region.outputs.empty()) return false;
+        if (region.inputs.size() != 1) return false;
+        const auto& mask_type = stage.value_types[region.inputs.front()];
+        if (mask_type.dims.size() != 1) return false;
+        return stage.stage == PTIR_STAGE_ON_ATTN_PROJ;
+    }
     if (op.tag != PTIR_OP_KERNEL_CALL) return false;
     if (op.name_idx >= stage.names.size()) return false;
     if (stage.names[op.name_idx] != "envelope_dot") return false;

@@ -10,7 +10,9 @@
     "tile_map_mask": 17,
     "mxfp4_moe": "RoutedDecode",
     "native_mxfp4_moe": false,
-    "fused_transcode": false
+    "fusion_mask": 0,
+    "encode_scratch_dtype": "BF16",
+    "block_scale_rows": 128
   },
   "optimizer": {
     "passes": [
@@ -348,14 +350,6 @@
       "encoding": {
         "Raw": "BF16"
       },
-      "layout": {
-        "alignment": 256
-      },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
-      },
       "alignment": 256
     },
     {
@@ -366,14 +360,6 @@
       ],
       "encoding": {
         "Raw": "BF16"
-      },
-      "layout": {
-        "alignment": 256
-      },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
       },
       "alignment": 256
     },
@@ -387,14 +373,6 @@
       "encoding": {
         "Raw": "BF16"
       },
-      "layout": {
-        "alignment": 256
-      },
-      "sharding": {
-        "axis": 0,
-        "world": 2,
-        "rank": 1
-      },
       "alignment": 256
     },
     {
@@ -406,14 +384,6 @@
       ],
       "encoding": {
         "Raw": "BF16"
-      },
-      "layout": {
-        "alignment": 256
-      },
-      "sharding": {
-        "axis": 0,
-        "world": 2,
-        "rank": 1
       },
       "alignment": 256
     },
@@ -427,14 +397,6 @@
       "encoding": {
         "Raw": "BF16"
       },
-      "layout": {
-        "alignment": 256
-      },
-      "sharding": {
-        "axis": 0,
-        "world": 2,
-        "rank": 1
-      },
       "alignment": 256
     },
     {
@@ -447,14 +409,6 @@
       "encoding": {
         "Raw": "BF16"
       },
-      "layout": {
-        "alignment": 256
-      },
-      "sharding": {
-        "axis": 1,
-        "world": 2,
-        "rank": 1
-      },
       "alignment": 256
     },
     {
@@ -465,14 +419,6 @@
       ],
       "encoding": {
         "Raw": "BF16"
-      },
-      "layout": {
-        "alignment": 256
-      },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
       },
       "alignment": 256
     },
@@ -486,14 +432,6 @@
       "encoding": {
         "Raw": "BF16"
       },
-      "layout": {
-        "alignment": 256
-      },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
-      },
       "alignment": 256
     },
     {
@@ -505,14 +443,6 @@
       ],
       "encoding": {
         "Raw": "BF16"
-      },
-      "layout": {
-        "alignment": 256
-      },
-      "sharding": {
-        "axis": 0,
-        "world": 2,
-        "rank": 1
       },
       "alignment": 256
     },
@@ -526,14 +456,6 @@
       "encoding": {
         "Raw": "BF16"
       },
-      "layout": {
-        "alignment": 256
-      },
-      "sharding": {
-        "axis": 0,
-        "world": 2,
-        "rank": 1
-      },
       "alignment": 256
     },
     {
@@ -545,14 +467,6 @@
       ],
       "encoding": {
         "Raw": "BF16"
-      },
-      "layout": {
-        "alignment": 256
-      },
-      "sharding": {
-        "axis": 1,
-        "world": 2,
-        "rank": 1
       },
       "alignment": 256
     },
@@ -566,14 +480,6 @@
       "encoding": {
         "Raw": "BF16"
       },
-      "layout": {
-        "alignment": 256
-      },
-      "sharding": {
-        "axis": 0,
-        "world": 2,
-        "rank": 1
-      },
       "alignment": 256
     },
     {
@@ -585,14 +491,6 @@
       ],
       "encoding": {
         "Raw": "BF16"
-      },
-      "layout": {
-        "alignment": 256
-      },
-      "sharding": {
-        "axis": 0,
-        "world": 2,
-        "rank": 1
       },
       "alignment": 256
     },
@@ -606,14 +504,6 @@
       "encoding": {
         "Raw": "BF16"
       },
-      "layout": {
-        "alignment": 256
-      },
-      "sharding": {
-        "axis": 1,
-        "world": 2,
-        "rank": 1
-      },
       "alignment": 256
     },
     {
@@ -625,14 +515,6 @@
       ],
       "encoding": {
         "Raw": "BF16"
-      },
-      "layout": {
-        "alignment": 256
-      },
-      "sharding": {
-        "axis": 0,
-        "world": 2,
-        "rank": 1
       },
       "alignment": 256
     },
@@ -646,14 +528,6 @@
       "encoding": {
         "Raw": "BF16"
       },
-      "layout": {
-        "alignment": 256
-      },
-      "sharding": {
-        "axis": 0,
-        "world": 2,
-        "rank": 1
-      },
       "alignment": 256
     },
     {
@@ -665,14 +539,6 @@
       ],
       "encoding": {
         "Raw": "BF16"
-      },
-      "layout": {
-        "alignment": 256
-      },
-      "sharding": {
-        "axis": 1,
-        "world": 2,
-        "rank": 1
       },
       "alignment": 256
     },
@@ -686,14 +552,6 @@
       "encoding": {
         "Raw": "BF16"
       },
-      "layout": {
-        "alignment": 256
-      },
-      "sharding": {
-        "axis": 0,
-        "world": 2,
-        "rank": 1
-      },
       "alignment": 256
     },
     {
@@ -705,14 +563,6 @@
       ],
       "encoding": {
         "Raw": "BF16"
-      },
-      "layout": {
-        "alignment": 256
-      },
-      "sharding": {
-        "axis": 0,
-        "world": 2,
-        "rank": 1
       },
       "alignment": 256
     },
@@ -726,14 +576,6 @@
       "encoding": {
         "Raw": "BF16"
       },
-      "layout": {
-        "alignment": 256
-      },
-      "sharding": {
-        "axis": 1,
-        "world": 2,
-        "rank": 1
-      },
       "alignment": 256
     },
     {
@@ -744,14 +586,6 @@
       ],
       "encoding": {
         "Raw": "BF16"
-      },
-      "layout": {
-        "alignment": 256
-      },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
       },
       "alignment": 256
     },
@@ -764,14 +598,6 @@
       ],
       "encoding": {
         "Raw": "BF16"
-      },
-      "layout": {
-        "alignment": 256
-      },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
       },
       "alignment": 256
     }

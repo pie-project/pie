@@ -430,6 +430,16 @@ pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTra
                     let n = resolve_name(&container, *name);
                     // First-party sinks have spec-owned scopes; second-party
                     // sinks come from the profile.
+                    // A first-party sink name always type-checks, so the
+                    // backend's ability to HONOUR it has to be checked here or
+                    // not at all: a program emitting `attn_page_mask` against a
+                    // driver that cannot compact its page table would bind
+                    // cleanly and then either fail mid-fire or -- far worse --
+                    // run as a silent no-op whose eviction policy never
+                    // evicts anything.
+                    if n == "attn_page_mask" && !profile.has_attn_page_mask {
+                        return Err(ValidateError::KernelUnavailable { name_index: *name });
+                    }
                     let scope = KNOWN_SINKS
                         .iter()
                         .find(|(k, _)| *k == n)

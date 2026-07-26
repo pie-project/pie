@@ -23,18 +23,13 @@ inline void copy_strided_extent_to_device(
     pie_loader::CheckpointSource& loader,
     const pie_loader::PieLoaderStorageInstrView& instr,
     void* dst,
-    const std::vector<std::int64_t>& dst_shape) {
+    std::uint64_t dst_capacity_bytes) {
     const auto& extent = instr.source.stride;
-    if (extent.dims.len != dst_shape.size()) {
-        throw std::runtime_error(
-            "storage executor: strided source rank mismatch");
-    }
     std::uint64_t physical_bytes = extent.element_bytes;
     std::uint64_t elements = 1;
     for (std::size_t axis = 0; axis < extent.dims.len; ++axis) {
         const auto& dim = extent.dims.ptr[axis];
-        if (dim.count < 0 || dim.src_stride < 0 ||
-            dim.count != dst_shape[axis]) {
+        if (dim.count < 0 || dim.src_stride < 0) {
             throw std::runtime_error(
                 "storage executor: invalid strided source geometry");
         }
@@ -55,6 +50,17 @@ inline void copy_strided_extent_to_device(
     if (compact_bytes != instr.source.span_bytes) {
         throw std::runtime_error(
             "storage executor: strided compact byte count mismatch");
+    }
+    // The gathered run lands contiguously at `dst`, so the destination
+    // constraint is a byte bound, not a shape. It cannot be a shape: one
+    // instruction writes a SUB-REGION of its destination buffer (a single
+    // expert's shard of a stacked MoE weight, say), so the buffer's own
+    // extent has neither the rank nor the extents of what is being written.
+    if (compact_bytes > dst_capacity_bytes) {
+        throw std::runtime_error(
+            "storage executor: strided write of " +
+            std::to_string(compact_bytes) + " bytes overflows its " +
+            std::to_string(dst_capacity_bytes) + "-byte destination");
     }
     const auto* source = loader.storage_host_ptr(
         instr.source.file_id,

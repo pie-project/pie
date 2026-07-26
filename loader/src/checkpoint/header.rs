@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 
 use crate::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
 use crate::error::CompileError;
-use crate::types::{CheckpointFormat, DType, Encoding, FileId, Layout, TensorId, tensor_nbytes};
+use crate::types::{CheckpointFormat, DType, Encoding, FileId, TensorId, tensor_nbytes};
 
 /// Width of the safetensors little-endian header-length prefix.
 pub(crate) const SAFETENSORS_LEN_PREFIX: usize = 8;
@@ -253,7 +253,6 @@ pub fn tensors_from_safetensors_entries(
             span_bytes,
             shape: entry.shape.clone(),
             encoding: Encoding::Raw(dtype),
-            layout: Layout::dense(1),
         });
     }
     Ok(out)

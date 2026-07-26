@@ -734,7 +734,6 @@ pub(super) fn instr_id_of(instr: &StorageInstr) -> InstrId {
         | StorageInstr::SlabScatter { id, .. }
         | StorageInstr::TileMap { id, .. }
         | StorageInstr::CreateView { id, .. }
-        | StorageInstr::Attach { id, .. }
         | StorageInstr::Release { id, .. }
         | StorageInstr::Finalize { id, .. } => *id,
     }
@@ -748,7 +747,6 @@ pub(super) fn set_instr_id(instr: &mut StorageInstr, new_id: InstrId) {
         | StorageInstr::SlabScatter { id, .. }
         | StorageInstr::TileMap { id, .. }
         | StorageInstr::CreateView { id, .. }
-        | StorageInstr::Attach { id, .. }
         | StorageInstr::Release { id, .. }
         | StorageInstr::Finalize { id, .. } => *id = new_id,
     }

@@ -1,0 +1,15 @@
+[package]
+name = "trackb-snapkv"
+version = "0.1.0"
+description = "SnapKV — prompt compression from the observation window's attention, selected once at the end of prefill"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", optional = true, description = "Prompt to send to the model"}
+temperature = {type = "float", optional = true, description = "Temperature applied before the Gumbel-max draw (default: 1.0)"}
+max_tokens = {type = "int", optional = true, description = "Number of generated tokens (default: 32)"}
+seed = {type = "int", optional = true, description = "RNG key for Gumbel-max sampling"}
+page_budget = {type = "int", optional = true, description = "Prompt KV pages SnapKV keeps; pages written after prefill are always kept (default: 4)"}

@@ -257,6 +257,24 @@ async fn main(input: Input) -> Result<Output> {
             let prev = acc.take().tensor();
             let ct = layer_ct.take().tensor();
             let scores = intrinsics::kernel::envelope_dot(p_max);
+
+            // ── THE ENFORCEMENT. `pivot_threshold(.., rank_le(budget))` is the
+            //    top-`budget` keep predicate over the page scores, and
+            //    `attn_page_mask` is what makes this layer's attention read
+            //    only those pages. Without this call the program is an
+            //    OBSERVER: it computes a perfectly good ranking and the
+            //    backend attends over everything anyway, which is why a
+            //    Quest run has to be checked against `naive-baseline` for
+            //    DIFFERENCE, not just for coherence.
+            //
+            //    The backend keeps the request's last page whatever this says
+            //    -- it holds the token this fire is writing -- which is also
+            //    Quest's own rule that the local window is never evicted.
+            intrinsics::kernel::attn_page_mask(&pivot_threshold(
+                &scores,
+                rank_le(budget),
+            ));
+
             acc.put(&max_elem(&prev, &scores));
             layer_ct.put(&add(&ct, 1u32));
         });

@@ -21,7 +21,7 @@ pub(super) fn dense_fused_projection_budget_bytes() -> u64 {
     DEFAULT_BUDGET
 }
 
-impl DefaultAbiBuilder<'_> {
+impl ContractBuilder<'_> {
     pub(super) fn add_dense_fused_projection_joins(
         &mut self,
         runtime_quant_enabled: bool,
@@ -103,16 +103,12 @@ impl DefaultAbiBuilder<'_> {
             for tensor in &candidate.tensors {
                 self.consumed.insert(*tensor);
             }
-            self.tensors.push(RuntimeTensorContract {
-                output_name: candidate.output_name,
-                expr: Expr::cat(0, candidate.names.iter().cloned().map(Expr::src).collect()),
-                encoding: Encoding::Raw(DType::BF16),
-                shape: vec![candidate.rows, candidate.cols],
-                layout: Layout::dense(self.alignment()),
-                sharding: Sharding::replicated(),
-                alignment: self.alignment(),
-                shard_axis: None,
-            });
+            self.tensors.push(TensorContract::new(
+                candidate.output_name,
+                Expr::cat(0, candidate.names.iter().cloned().map(Expr::src).collect()),
+                vec![candidate.rows, candidate.cols],
+                Encoding::Raw(DType::BF16),
+            ));
         }
 
         Ok(())
@@ -155,16 +151,12 @@ impl DefaultAbiBuilder<'_> {
             for tensor in &candidate.tensors {
                 self.consumed.insert(*tensor);
             }
-            self.tensors.push(RuntimeTensorContract {
-                output_name: candidate.output_name,
-                expr: Expr::cat(0, candidate.names.iter().cloned().map(Expr::src).collect()),
-                encoding: Encoding::Raw(DType::BF16),
-                shape: vec![candidate.rows, candidate.cols],
-                layout: Layout::dense(self.alignment()),
-                sharding: Sharding::replicated(),
-                alignment: self.alignment(),
-                shard_axis: None,
-            });
+            self.tensors.push(TensorContract::new(
+                candidate.output_name,
+                Expr::cat(0, candidate.names.iter().cloned().map(Expr::src).collect()),
+                vec![candidate.rows, candidate.cols],
+                Encoding::Raw(DType::BF16),
+            ));
         }
         Ok(())
     }

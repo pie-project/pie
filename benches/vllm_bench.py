@@ -127,6 +127,10 @@ def run(args: argparse.Namespace):
         llm_kwargs["attention_config"] = {"backend": args.attention_backend}
     if args.enforce_eager:
         llm_kwargs["enforce_eager"] = True
+    if getattr(args, "num_gpu_blocks_override", 0):
+        llm_kwargs["num_gpu_blocks_override"] = args.num_gpu_blocks_override
+    if getattr(args, "block_size", 0):
+        llm_kwargs["block_size"] = args.block_size
     speculative_config = None
     if args.speculative_config is not None:
         speculative_config = json.loads(args.speculative_config)
@@ -329,6 +333,10 @@ def run_streaming(args: argparse.Namespace):
     engine_kwargs = {}
     if args.enforce_eager:
         engine_kwargs["enforce_eager"] = True
+    if getattr(args, "num_gpu_blocks_override", 0):
+        engine_kwargs["num_gpu_blocks_override"] = args.num_gpu_blocks_override
+    if getattr(args, "block_size", 0):
+        engine_kwargs["block_size"] = args.block_size
     engine = AsyncLLM.from_engine_args(
         AsyncEngineArgs(
             model=args.model,
@@ -541,6 +549,22 @@ def main() -> None:
     for sp in parser._subparsers._group_actions[0].choices.values():
         sp.add_argument("--attention-backend", default=None)
         sp.add_argument("--enforce-eager", action="store_true")
+        sp.add_argument(
+            "--num-gpu-blocks-override",
+            type=int,
+            default=0,
+            help="Exact KV block count. Paired with --block-size 16 this is "
+                 "the token-for-token match to pie's `total_pages` driver "
+                 "option, so both engines can be sized by the same budget "
+                 "instead of by a calibrated memory fraction.",
+        )
+        sp.add_argument(
+            "--block-size",
+            type=int,
+            default=0,
+            help="KV block size in tokens. 0 leaves vLLM's default; set 16 to "
+                 "match pie's page size when using --num-gpu-blocks-override.",
+        )
         sp.add_argument(
             "--prefix-caching",
             action=argparse.BooleanOptionalAction,

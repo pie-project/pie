@@ -34,8 +34,11 @@ std::uint32_t decode_plan_graph_layout(const DecodePlanCache& cache) {
         (cache.hnd_layout ? 8u : 0u));
 }
 
-std::uint32_t prefill_plan_graph_layout(const PrefillPlanCache& cache) {
-    if (!cache.valid) return 0;
+bool decode_plan_is_page_count_independent(const DecodePlanCache& cache) {
+    return cache.valid && cache.page_count_independent;
+}
+
+std::uint32_t prefill_plan_graph_layout(const PrefillPlanCache& cache) {    if (!cache.valid) return 0;
     if (cache.use_sm90) {
         return 0x00800000u |
                static_cast<std::uint32_t>(
@@ -197,8 +200,10 @@ void plan_attention_flashinfer_decode_bf16(
             cache, kv_page_indptr_h, num_requests, num_q_heads, num_kv_heads,
             head_dim, page_size, workspace, stream, enable_cuda_graph,
             full_attention_variant, hnd_layout);
+        cache.page_count_independent = true;
         return;
     }
+    cache.page_count_independent = false;
 
     cache.indptr_h_buf.resize(num_requests + 1);
     for (int r = 0; r <= num_requests; ++r) {
@@ -250,15 +255,32 @@ void plan_attention_flashinfer_prefill_bf16(
     bool full_attention_variant,
     bool hnd_layout,
     bool causal_mask,
-    bool custom_mask)
+    bool custom_mask,
+    bool wants_prefill_score)  // NOLINT(readability-non-const-parameter)
 {
     if (!attn_head_dim_instantiated(head_dim)) {
         throw_unsupported_head_dim("flashinfer prefill plan", head_dim);
     }
+    if (wants_prefill_score) {
+        if (window_left >= 0) {
+            throw std::invalid_argument(
+                "prefill score capture does not support sliding-window "
+                "attention: LogitsMask runs after LogitsTransform, so the "
+                "captured row would include positions the softmax discards");
+        }
+        // `AttnVariant` differs from `AttnVariantFull` only by a runtime
+        // window predicate that is trivially true at `window_left < 0` (see
+        // the alias comments in attention_flashinfer_common.cuh), and the
+        // prefill plan itself does not depend on the variant -- only on
+        // `window_left` and geometry. Promoting here therefore changes no
+        // numerics; it just spares the capture kernel a second instantiation
+        // over a template flag that cannot fire.
+        full_attention_variant = true;
+    }
     cache.use_sm90 = false;
     cache.sm90_plan.valid = false;
     cache.graph_capturable = false;
-    if (!custom_mask && !hnd_layout &&
+    if (!custom_mask && !hnd_layout && !wants_prefill_score &&
         kv_last_page_lens_h != nullptr &&
         hopper_prefill_supported(
             head_dim, window_left, total_tokens, num_requests)) {
@@ -502,6 +524,166 @@ __global__ void k_attn_score_normalize(
     }
 }
 
+// Prefill counterpart. Two things make this not just the decode kernel with an
+// extra grid dimension:
+//
+//  1. **Every window row has a different causal support.** The hook fires
+//     before the kernel's mask (`LogitsMask` runs after `LogitsTransform`), so
+//     a captured row contains real dot products at positions the softmax is
+//     about to discard. Normalising over the full `kv_len` would spread mass
+//     onto the future. Window row `w` belongs to the query at absolute
+//     position `kv_len - rows + w`, so it may attend to `kv_len - rows + w + 1`
+//     keys and no more. Everything past that is zeroed here, which is also
+//     what makes the folded row a distribution over the prefix.
+//
+//  2. **`rows` is `min(window, qo_len)`.** A prompt shorter than the
+//     observation window contributes fewer rows; the rest of its slot is never
+//     written by the kernel and must already be zero.
+__global__ void k_attn_prefill_score_normalize(
+    float* __restrict__ scores,
+    const std::int32_t* __restrict__ score_indptr,
+    const std::uint32_t* __restrict__ qo_indptr,
+    const std::uint32_t* __restrict__ kv_page_indptr,
+    const std::uint32_t* __restrict__ kv_last_page_lens,
+    int page_size,
+    int window)
+{
+    constexpr int kThreads = 256;
+    __shared__ float shared[kThreads];
+
+    const int request = static_cast<int>(blockIdx.x);
+    const int head = static_cast<int>(blockIdx.y);
+    const int w = static_cast<int>(blockIdx.z);
+
+    const int pages = static_cast<int>(kv_page_indptr[request + 1]) -
+                      static_cast<int>(kv_page_indptr[request]);
+    if (pages <= 0) return;
+    const int kv_len =
+        (pages - 1) * page_size + static_cast<int>(kv_last_page_lens[request]);
+    if (kv_len <= 0) return;
+    const int qo_len = static_cast<int>(qo_indptr[request + 1]) -
+                       static_cast<int>(qo_indptr[request]);
+    const int rows = min(window, qo_len);
+    if (w >= rows) return;
+
+    const int limit = min(kv_len - rows + w + 1, kv_len);
+    if (limit <= 0) return;
+
+    float* row = scores + static_cast<std::size_t>(score_indptr[request]) +
+                 (static_cast<std::size_t>(head) * static_cast<std::size_t>(window) +
+                  static_cast<std::size_t>(w)) *
+                     static_cast<std::size_t>(kv_len);
+
+    float local = -INFINITY;
+    for (int i = threadIdx.x; i < limit; i += kThreads) {
+        local = fmaxf(local, row[i]);
+    }
+    shared[threadIdx.x] = local;
+    __syncthreads();
+    for (int stride = kThreads / 2; stride > 0; stride >>= 1) {
+        if (static_cast<int>(threadIdx.x) < stride) {
+            shared[threadIdx.x] =
+                fmaxf(shared[threadIdx.x], shared[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    const float row_max = shared[0];
+    __syncthreads();
+
+    // Accumulate the denominator WITHOUT storing the exponentials. Storing them
+    // and rescaling in a second pass costs one more full write and one more full
+    // read of a `heads * window * kv_len` buffer, which at 8K context is 16 MB
+    // per layer; recomputing `__expf` in the final pass is a handful of SFU
+    // cycles against a kernel that is entirely bandwidth-bound.
+    float total = 0.f;
+    for (int i = threadIdx.x; i < limit; i += kThreads) {
+        total += __expf(row[i] - row_max);
+    }
+    shared[threadIdx.x] = total;
+    __syncthreads();
+    for (int stride = kThreads / 2; stride > 0; stride >>= 1) {
+        if (static_cast<int>(threadIdx.x) < stride) {
+            shared[threadIdx.x] += shared[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    const float denom = shared[0];
+    // `denom >= 1` in exact arithmetic -- the argmax element contributes
+    // `exp(0)` -- so this is unreachable. Zeroing rather than returning is still
+    // the right failure: an early return would leave raw LOGITS in a buffer the
+    // fold is about to average, and negative logits would read as negative
+    // attention mass.
+    const float inv = denom > 0.f ? 1.f / denom : 0.f;
+
+    // One pass over the WHOLE row: positions at or past the causal limit were
+    // computed by the kernel but never attended to (`LogitsMask` runs after
+    // `LogitsTransform`), so they are zeroed here rather than in a separate
+    // sweep. This is what makes the folded row a distribution over the prefix.
+    for (int i = threadIdx.x; i < kv_len; i += kThreads) {
+        row[i] = i < limit ? __expf(row[i] - row_max) * inv : 0.f;
+    }
+}
+
+// Fold `[head, window_row, kv]` down to one row per request.
+//
+// Averaging rather than summing, for the same reason the decode fold averages:
+// every contributing row is a distribution over the prefix, so the mean is one
+// too, and a policy can threshold it in absolute terms without knowing how many
+// heads or window rows went into it. The divisor is `heads * rows` with
+// `rows = min(window, qo_len)` -- rows that do not exist contribute nothing and
+// must not be counted, or a short prompt's mass would be scaled down.
+//
+// The folded row lands at `score_indptr[r] / (heads * window)`, which is the
+// same derivation trick the decode fold uses: the ragged offset divided by the
+// per-request multiplier is exactly the folded offset.
+__global__ void k_attn_prefill_score_fold(
+    const float* __restrict__ scores,
+    float* __restrict__ folded,
+    const std::int32_t* __restrict__ score_indptr,
+    const std::uint32_t* __restrict__ qo_indptr,
+    const std::uint32_t* __restrict__ kv_page_indptr,
+    const std::uint32_t* __restrict__ kv_last_page_lens,
+    int page_size,
+    int num_q_heads,
+    int window)
+{
+    const int request = static_cast<int>(blockIdx.x);
+    const int pages = static_cast<int>(kv_page_indptr[request + 1]) -
+                      static_cast<int>(kv_page_indptr[request]);
+    if (pages <= 0) return;
+    const int kv_len =
+        (pages - 1) * page_size + static_cast<int>(kv_last_page_lens[request]);
+    if (kv_len <= 0) return;
+    const int qo_len = static_cast<int>(qo_indptr[request + 1]) -
+                       static_cast<int>(qo_indptr[request]);
+    const int rows = min(window, qo_len);
+    if (rows <= 0) return;
+
+    const std::size_t base = static_cast<std::size_t>(score_indptr[request]);
+    const std::size_t out_base =
+        base / (static_cast<std::size_t>(num_q_heads) *
+                static_cast<std::size_t>(window));
+    const float inv = 1.f / static_cast<float>(num_q_heads * rows);
+
+    for (int k = static_cast<int>(threadIdx.x) +
+                 static_cast<int>(blockIdx.y) * static_cast<int>(blockDim.x);
+         k < kv_len;
+         k += static_cast<int>(blockDim.x) * static_cast<int>(gridDim.y)) {
+        float acc = 0.f;
+        for (int h = 0; h < num_q_heads; ++h) {
+            for (int w = 0; w < rows; ++w) {
+                acc += scores[base +
+                              (static_cast<std::size_t>(h) *
+                                   static_cast<std::size_t>(window) +
+                               static_cast<std::size_t>(w)) *
+                                  static_cast<std::size_t>(kv_len) +
+                              static_cast<std::size_t>(k)];
+            }
+        }
+        folded[out_base + static_cast<std::size_t>(k)] = acc * inv;
+    }
+}
+
 void dispatch_attention_flashinfer_decode_capture_bf16(
     const DecodePlanCache& cache,
     const void* q, void* k_pages, void* v_pages, void* o,
@@ -695,41 +877,25 @@ void dispatch_attention_flashinfer_decode(
 
 // ── Prefill ────────────────────────────────────────────────────────────────
 
-void dispatch_attention_flashinfer_prefill_bf16(
+// The FA2 prefill params block, shared by the plain and score-capturing
+// dispatches. Factored out because the two must agree exactly: if the capture
+// path built its params even slightly differently it would compute a different
+// attention, and the whole premise of an observation hook is that it observes
+// the attention that actually ran.
+static PrefillParams make_prefill_params(
     const PrefillPlanCache& cache,
-    const void* q,
-    void* k_pages, void* v_pages, void* o,
+    const void* q, void* k_pages, void* v_pages, void* o,
     const std::uint32_t* qo_indptr_d,
     const std::uint32_t* kv_page_indices_d,
     const std::uint32_t* kv_page_indptr_d,
     const std::uint32_t* kv_last_page_lens_d,
     AttentionWorkspace& workspace,
-    cudaStream_t stream,
     float logits_soft_cap,
     float sm_scale,
-    float* lse_out)
+    float* lse_out,
+    DTypeO*& tmp_v,
+    float*& tmp_s)
 {
-    if (!cache.valid) {
-        throw std::runtime_error(
-            "dispatch_attention_flashinfer_prefill_bf16: cache is empty; "
-            "call plan_attention_flashinfer_prefill_bf16 first");
-    }
-    if (cache.use_sm90) {
-        dispatch_attention_flashinfer_prefill_sm90_bf16(
-            cache.sm90_plan,
-            q,
-            k_pages,
-            v_pages,
-            o,
-            kv_page_indices_d,
-            workspace,
-            stream,
-            logits_soft_cap,
-            sm_scale,
-            lse_out);
-        return;
-    }
-
     ::flashinfer::paged_kv_t<DTypeKV, IdType> paged_kv(
         static_cast<uint32_t>(cache.num_kv_heads),
         static_cast<uint32_t>(cache.page_size),
@@ -784,8 +950,8 @@ void dispatch_attention_flashinfer_prefill_bf16(
     params.token_pos_in_items_len = 0;
     params.maybe_max_item_len_ptr = nullptr;
 
-    DTypeO* tmp_v = nullptr;
-    float* tmp_s = nullptr;
+    tmp_v = nullptr;
+    tmp_s = nullptr;
     if (plan_info.split_kv) {
         params.merge_indptr = offset_ptr<IdType>(int_buf, plan_info.merge_indptr_offset);
         tmp_v = offset_ptr<DTypeO>(float_buf, plan_info.v_offset);
@@ -795,6 +961,52 @@ void dispatch_attention_flashinfer_prefill_bf16(
                 offset_ptr<bool>(int_buf, plan_info.block_valid_mask_offset);
         }
     }
+
+    return params;
+}
+
+void dispatch_attention_flashinfer_prefill_bf16(
+    const PrefillPlanCache& cache,
+    const void* q,
+    void* k_pages, void* v_pages, void* o,
+    const std::uint32_t* qo_indptr_d,
+    const std::uint32_t* kv_page_indices_d,
+    const std::uint32_t* kv_page_indptr_d,
+    const std::uint32_t* kv_last_page_lens_d,
+    AttentionWorkspace& workspace,
+    cudaStream_t stream,
+    float logits_soft_cap,
+    float sm_scale,
+    float* lse_out)
+{
+    if (!cache.valid) {
+        throw std::runtime_error(
+            "dispatch_attention_flashinfer_prefill_bf16: cache is empty; "
+            "call plan_attention_flashinfer_prefill_bf16 first");
+    }
+    if (cache.use_sm90) {
+        dispatch_attention_flashinfer_prefill_sm90_bf16(
+            cache.sm90_plan,
+            q,
+            k_pages,
+            v_pages,
+            o,
+            kv_page_indices_d,
+            workspace,
+            stream,
+            logits_soft_cap,
+            sm_scale,
+            lse_out);
+        return;
+    }
+
+    DTypeO* tmp_v = nullptr;
+    float* tmp_s = nullptr;
+    const auto& plan_info = cache.plan_info;
+    PrefillParams params = make_prefill_params(
+        cache, q, k_pages, v_pages, o, qo_indptr_d, kv_page_indices_d,
+        kv_page_indptr_d, kv_last_page_lens_d, workspace, logits_soft_cap,
+        sm_scale, lse_out, tmp_v, tmp_s);
 
     // Mask mode and attention variant are runtime-policy axes, so they stay
     // inside AttnHd; only head_dim selects a translation unit.
@@ -812,6 +1024,110 @@ void dispatch_attention_flashinfer_prefill_bf16(
             throw_unsupported_head_dim("flashinfer prefill dispatch", cache.head_dim);
     }
     CUDA_CHECK(status);
+}
+
+void dispatch_attention_flashinfer_prefill_capture_bf16(
+    const PrefillPlanCache& cache,
+    const void* q,
+    void* k_pages, void* v_pages, void* o,
+    const std::uint32_t* qo_indptr_d,
+    const std::uint32_t* kv_page_indices_d,
+    const std::uint32_t* kv_page_indptr_d,
+    const std::uint32_t* kv_last_page_lens_d,
+    AttentionWorkspace& workspace,
+    cudaStream_t stream,
+    float* score_out,
+    float* folded_out,
+    const std::int32_t* score_indptr_d,
+    int window,
+    float logits_soft_cap,
+    float sm_scale,
+    float* lse_out)
+{
+    if (!cache.valid) {
+        throw std::runtime_error(
+            "dispatch_attention_flashinfer_prefill_capture_bf16: cache is "
+            "empty; call plan_attention_flashinfer_prefill_bf16 first");
+    }
+    if (score_out == nullptr || score_indptr_d == nullptr ||
+        folded_out == nullptr) {
+        throw std::invalid_argument(
+            "dispatch_attention_flashinfer_prefill_capture_bf16: score sink is "
+            "null");
+    }
+    if (window <= 0) {
+        throw std::invalid_argument(
+            "prefill score capture needs a positive observation window");
+    }
+    if (cache.use_sm90) {
+        // The Hopper kernel takes a different variant API -- a constructor over
+        // a block coordinate rather than (params, batch_idx, smem), and no
+        // inherited qo_len -- so it needs its own capture struct. Refusing here
+        // is the honest behaviour: a silent fallthrough would run attention
+        // with no capture and hand the policy an all-zero row, which reads as
+        // "nothing was attended to" and evicts the whole prefix.
+        throw std::runtime_error(
+            "prefill score capture is not implemented for the SM90 kernel; "
+            "plan without it (the planner honours wants_prefill_score)");
+    }
+    if (logits_soft_cap > 0.f) {
+        throw std::invalid_argument(
+            "prefill score capture does not support logits_soft_cap: the hook "
+            "would record cap*tanh(s/cap), which is not the pre-softmax score "
+            "SnapKV defines its selection over");
+    }
+    if (cache.window_left >= 0) {
+        throw std::invalid_argument(
+            "prefill score capture does not support sliding-window attention: "
+            "LogitsMask runs after LogitsTransform, so the captured row would "
+            "include positions the softmax discards");
+    }
+    if (!cache.full_attention_variant) {
+        throw std::invalid_argument(
+            "prefill score capture requires the full-attention variant");
+    }
+
+    DTypeO* tmp_v = nullptr;
+    float* tmp_s = nullptr;
+    const auto& plan_info = cache.plan_info;
+    PrefillParams params = make_prefill_params(
+        cache, q, k_pages, v_pages, o, qo_indptr_d, kv_page_indices_d,
+        kv_page_indptr_d, kv_last_page_lens_d, workspace, logits_soft_cap,
+        sm_scale, lse_out, tmp_v, tmp_s);
+
+    const fa2::PrefillScoreSink sink{
+        score_out, reinterpret_cast<const fa2::IdType*>(score_indptr_d),
+        static_cast<std::uint32_t>(window)};
+
+    cudaError_t status;
+    switch (cache.head_dim) {
+#define PIE_ATTN_HEAD_DIM(HD)                                                \
+        case HD:                                                             \
+            status = AttnHd<HD>::prefill_capture(                            \
+                params, plan_info, tmp_v, tmp_s, cache.enable_pdl, stream,   \
+                cache.causal_mask, logits_soft_cap, cache.window_left,       \
+                sink);                                                       \
+            break;
+#include "kernels.def"
+        default:
+            throw_unsupported_head_dim(
+                "flashinfer prefill capture dispatch", cache.head_dim);
+    }
+    CUDA_CHECK(status);
+
+    const dim3 norm_grid(static_cast<unsigned>(cache.num_requests),
+                         static_cast<unsigned>(cache.num_q_heads),
+                         static_cast<unsigned>(window));
+    k_attn_prefill_score_normalize<<<norm_grid, 256, 0, stream>>>(
+        score_out, score_indptr_d, qo_indptr_d, kv_page_indptr_d,
+        kv_last_page_lens_d, cache.page_size, window);
+    CUDA_CHECK(cudaGetLastError());
+
+    const dim3 fold_grid(static_cast<unsigned>(cache.num_requests), 32u);
+    k_attn_prefill_score_fold<<<fold_grid, 256, 0, stream>>>(
+        score_out, folded_out, score_indptr_d, qo_indptr_d, kv_page_indptr_d,
+        kv_last_page_lens_d, cache.page_size, cache.num_q_heads, window);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void launch_attention_flashinfer_prefill_bf16(

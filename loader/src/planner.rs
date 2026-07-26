@@ -1,13 +1,13 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::arch::RuntimeAbi;
 use crate::checkpoint::{CheckpointMetadata, RawTensor};
+use crate::contract::ModelContract;
 use crate::error::CompileError;
 use crate::frontend::{plan_from_contracts, runtime_bytes};
 use crate::ir::{GatherPiece, LayoutExpr, LayoutPlan};
 use crate::load_plan::{
-    BufferDecl, DestExtent, DimSpec, LoadPlan, MetadataSpec, SlabPlacement, SourceExtent,
-    StorageInstr, StorageTarget, StridedExtent, TileMapKind, TileSpec, TransformSpec,
+    BufferDecl, DestExtent, DimSpec, LoadPlan, SlabPlacement, SourceExtent, StorageInstr,
+    StorageTarget, StridedExtent, TileMapKind, TileSpec, TransformSpec,
 };
 use crate::optimizer::{OptimizerPassStats, optimize_with_report};
 use crate::typecheck::typecheck;
@@ -35,11 +35,11 @@ use passes::{
 
 pub fn compile_load_plan(
     metadata: &CheckpointMetadata,
-    abi: &RuntimeAbi,
+    contract: &ModelContract,
     target: StorageTarget,
 ) -> Result<LoadPlan, CompileError> {
-    let abi = abi.coalesce_direct_row_shards(metadata, &target)?;
-    let plan = plan_from_contracts(metadata, &abi, &target)?;
+    let contract = crate::arch::coalesce_direct_row_shards(contract, metadata, &target)?;
+    let plan = plan_from_contracts(metadata, &contract, &target)?;
     let optimized = optimize_with_report(plan)?;
     let mut program = lower_layout_plan(metadata, &optimized.plan, target)?;
     program.optimizer = optimized.report;
@@ -233,28 +233,6 @@ impl StorageCompiler<'_> {
                 },
             ),
             LayoutExpr::Repack { input, spec, .. } => self.lower_repack(id, *input, *spec),
-            LayoutExpr::Attach { data, metadata, .. } => {
-                let value = self.value(*data)?;
-                if metadata.is_empty() {
-                    return Ok(value);
-                }
-                let buffer = self.ensure_buffer(*data)?;
-                let mut metadata_buffers = Vec::with_capacity(metadata.len());
-                for meta in metadata {
-                    metadata_buffers.push(self.ensure_buffer(*meta)?);
-                }
-                let instr = self.next_instr();
-                self.program.instrs.push(StorageInstr::Attach {
-                    id: instr,
-                    tensor: buffer,
-                    metadata: metadata_buffers,
-                    spec: MetadataSpec {
-                        kind: "quant".to_string(),
-                    },
-                });
-                self.program.schedule.push(instr);
-                Ok(ValueLoc::Buffer(buffer))
-            }
             LayoutExpr::Realize {
                 input,
                 runtime_name,
@@ -372,7 +350,6 @@ impl StorageCompiler<'_> {
                             offset: piece.src_offset,
                             stride: storage_extent_for_shape(&decl.shape, &decl.encoding)?,
                         },
-                        layout: decl.layout.clone(),
                     });
                     self.program.schedule.push(instr);
                     return Ok(ValueLoc::Buffer(out));
@@ -891,7 +868,6 @@ mod persistent_layout_tests {
                     }],
                 },
             },
-            layout: crate::types::Layout::dense(1),
         });
         // window [32, 96) escapes the 64-byte backing buffer.
         assert!(validate_persistent_layout(&p).is_err());

@@ -2,7 +2,7 @@
 
 use super::*;
 
-impl DefaultAbiBuilder<'_> {
+impl ContractBuilder<'_> {
     pub(super) fn add_fused_moe_gate_up_tp_slices(&mut self) -> Result<(), CompileError> {
         if self.target.tp_size <= 1 {
             return Ok(());
@@ -173,28 +173,19 @@ impl DefaultAbiBuilder<'_> {
             });
         }
 
-        let align = self.alignment();
         for s in stacks {
-            self.tensors.push(RuntimeTensorContract {
-                output_name: s.gate_up_name,
-                expr: s.gate_up,
-                encoding: Encoding::Raw(s.dtype),
-                shape: s.gate_up_shape,
-                layout: Layout::dense(align),
-                sharding: Sharding::replicated(),
-                alignment: align,
-                shard_axis: None,
-            });
-            self.tensors.push(RuntimeTensorContract {
-                output_name: s.down_name,
-                expr: s.down,
-                encoding: Encoding::Raw(s.dtype),
-                shape: s.down_shape,
-                layout: Layout::dense(align),
-                sharding: Sharding::replicated(),
-                alignment: align,
-                shard_axis: None,
-            });
+            self.tensors.push(TensorContract::new(
+                s.gate_up_name,
+                s.gate_up,
+                s.gate_up_shape,
+                Encoding::Raw(s.dtype),
+            ));
+            self.tensors.push(TensorContract::new(
+                s.down_name,
+                s.down,
+                s.down_shape,
+                Encoding::Raw(s.dtype),
+            ));
             for id in s.consumed {
                 self.consumed.insert(id);
             }

@@ -144,11 +144,30 @@ using AttnScoreCaptureFull = PieScoreCapture<AttnVariantFull>;
 
 using DecodeScoreParams = PieScoreParams<DecodeParams, IdType>;
 
+// Score-observing prefill (SnapKV, design section 12). Only the full-attention
+// causal variant is instantiated, for the same two reasons the decode capture
+// refuses soft-cap and sliding-window: soft-cap records a quantity the policy
+// is not defined over, and a sliding window masks in `LogitsMask`, which runs
+// after `LogitsTransform`, so the normalisation kernel would spread mass onto
+// positions the softmax discards.
+using AttnScoreCapturePrefill = PieScoreCaptureWindow<AttnVariantFull>;
+using PrefillScoreParams = PieScoreWindowParams<PrefillParams, IdType>;
+
 /// Where a score-observing decode deposits `p[head, kv_idx]`, ragged over the
 /// batch. Both pointers are device memory owned by the caller.
 struct DecodeScoreSink {
     float* scores = nullptr;
     const IdType* indptr = nullptr;
+};
+
+/// Where a score-observing prefill deposits `p[head, window_row, kv_idx]`,
+/// ragged over the batch. `window` is the observation-window width; a request
+/// whose `qo_len` is shorter records `qo_len` rows and leaves the rest of its
+/// slot untouched, so the caller must zero the buffer first.
+struct PrefillScoreSink {
+    float* scores = nullptr;
+    const IdType* indptr = nullptr;
+    std::uint32_t window = 0;
 };
 
 // flashinfer's `GetPtrFromBaseOffset` is `(base + offset_bytes) reinterpret to T*`.
@@ -293,6 +312,15 @@ struct DecodePlanCache {
     bool full_attention_variant = false;
     bool hnd_layout = false;
     bool valid = false;
+    // True when the plan was built by `plan_static_nonsplit_decode`, whose
+    // descriptor is `request_indices[r] = r`, `kv_tile_indices = 0`,
+    // `o_indptr[r] = r`, `split_kv = false` -- a schedule that does NOT depend
+    // on the page counts it was planned with. That independence is what lets a
+    // caller hand the *launch* a different (compacted) page list than the one
+    // it planned against, which is how `attn_page_mask` restricts a layer's
+    // attention without a replan. Under any other plan the arrays ARE derived
+    // from page counts, and substituting a shorter list is silently wrong.
+    bool page_count_independent = false;
     int static_nonsplit_num_requests = 0;
     std::vector<IdType> static_request_indices;
     std::vector<IdType> static_kv_tile_indices;
@@ -388,6 +416,16 @@ struct AttnHd {
         DTypeO* tmp_v, float* tmp_s, bool enable_pdl, cudaStream_t stream,
         bool full_attention_variant, bool causal_mask, float logits_soft_cap);
 
+    /// Prefill that also records the observation window's scores (SnapKV).
+    /// Refuses soft-cap and sliding-window loudly rather than recording a
+    /// quantity the policy is not defined over.
+    static cudaError_t prefill_capture(
+        PrefillParams& base_params,
+        const ::flashinfer::PrefillPlanInfo& plan_info,
+        DTypeO* tmp_v, float* tmp_s, bool enable_pdl, cudaStream_t stream,
+        bool causal_mask, float logits_soft_cap, int window_left,
+        const PrefillScoreSink& sink);
+
     /// Prefill against a caller-supplied mask bitmap (MaskMode::kCustom).
     static cudaError_t prefill_custom(
         PrefillParams& params,
@@ -396,9 +434,10 @@ struct AttnHd {
         float logits_soft_cap);
 
 private:
-    template <::flashinfer::MaskMode MASK, class Variant>
+    template <::flashinfer::MaskMode MASK, class Variant,
+              class Params = PrefillParams>
     static cudaError_t run_prefill(
-        PrefillParams& params, const ::flashinfer::PrefillPlanInfo& plan_info,
+        Params& params, const ::flashinfer::PrefillPlanInfo& plan_info,
         DTypeO* tmp_v, float* tmp_s, bool enable_pdl, cudaStream_t stream);
 
     template <class Variant, class Params = DecodeParams>
@@ -658,9 +697,9 @@ cudaError_t AttnHd<HEAD_DIM>::dispatch_decode_capture(
 }
 
 template <uint32_t HEAD_DIM>
-template <::flashinfer::MaskMode MASK, class Variant>
+template <::flashinfer::MaskMode MASK, class Variant, class Params>
 cudaError_t AttnHd<HEAD_DIM>::run_prefill(
-    PrefillParams& params, const ::flashinfer::PrefillPlanInfo& plan_info,
+    Params& params, const ::flashinfer::PrefillPlanInfo& plan_info,
     DTypeO* tmp_v, float* tmp_s, bool enable_pdl, cudaStream_t stream)
 {
     cudaError_t status;
@@ -671,7 +710,7 @@ cudaError_t AttnHd<HEAD_DIM>::run_prefill(
             CTA_TILE_Q, HEAD_DIM, HEAD_DIM, POS_ENC,
             /*USE_FP16_QK_REDUCTION=*/true,
             MASK,
-            Variant, PrefillParams>(
+            Variant, Params>(
             params, tmp_v, tmp_s, enable_pdl, stream);
     });
     return status;
@@ -705,6 +744,33 @@ cudaError_t AttnHd<HEAD_DIM>::prefill(
     }
     return run_prefill<MaskMode::kCausal, AttnVariant>(
         params, plan_info, tmp_v, tmp_s, enable_pdl, stream);
+}
+
+template <uint32_t HEAD_DIM>
+cudaError_t AttnHd<HEAD_DIM>::prefill_capture(
+    PrefillParams& base_params,
+    const ::flashinfer::PrefillPlanInfo& plan_info,
+    DTypeO* tmp_v, float* tmp_s, bool enable_pdl, cudaStream_t stream,
+    bool causal_mask, float logits_soft_cap, int window_left,
+    const PrefillScoreSink& sink)
+{
+    using ::flashinfer::MaskMode;
+    if (logits_soft_cap > 0.f || window_left >= 0) return cudaErrorInvalidValue;
+    if (sink.scores == nullptr || sink.indptr == nullptr || sink.window == 0) {
+        return cudaErrorInvalidValue;
+    }
+    PrefillScoreParams params;
+    static_cast<PrefillParams&>(params) = base_params;
+    params.score_out = sink.scores;
+    params.score_indptr = sink.indptr;
+    params.score_window = sink.window;
+    return causal_mask
+        ? run_prefill<MaskMode::kCausal, AttnScoreCapturePrefill,
+                      PrefillScoreParams>(
+              params, plan_info, tmp_v, tmp_s, enable_pdl, stream)
+        : run_prefill<MaskMode::kNone, AttnScoreCapturePrefill,
+                      PrefillScoreParams>(
+              params, plan_info, tmp_v, tmp_s, enable_pdl, stream);
 }
 
 template <uint32_t HEAD_DIM>

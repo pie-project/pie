@@ -2,7 +2,7 @@
 
 use super::*;
 
-impl DefaultAbiBuilder<'_> {
+impl ContractBuilder<'_> {
     pub(super) fn add_nemotron_h_packed_expert_views(&mut self) -> Result<(), CompileError> {
         if self.target.backend != BackendKind::Cuda
             || !self.profile().nemotron_packed_experts
@@ -113,50 +113,43 @@ impl DefaultAbiBuilder<'_> {
             .iter()
             .map(|raw| Expr::src(raw.name.clone()).slice(0, local_start, local_intermediate))
             .collect();
-        self.tensors.push(RuntimeTensorContract {
-            output_name: up_name.clone(),
-            expr: Expr::cat(0, up_parts),
-            encoding: Encoding::Raw(DType::BF16),
-            shape: vec![expert_count * local_intermediate, hidden],
-            layout: Layout::dense(self.alignment()),
-            sharding: Sharding::replicated(),
-            alignment: self.alignment(),
-            shard_axis: None,
-        });
+        self.tensors.push(TensorContract::new(
+            up_name.clone(),
+            Expr::cat(0, up_parts),
+            vec![expert_count * local_intermediate, hidden],
+            Encoding::Raw(DType::BF16),
+        ));
 
-        let down_name = format!("{base}.down_proj.packed.weight");
-        self.tensors.push(RuntimeTensorContract {
-            output_name: down_name.clone(),
-            expr: Expr::cat(
+        let (expr, shape) = self.shard(
+            Expr::cat(
                 0,
                 down.iter().map(|raw| Expr::src(raw.name.clone())).collect(),
             ),
-            encoding: Encoding::Raw(DType::BF16),
-            shape: vec![expert_count * hidden, full_intermediate],
-            layout: Layout::dense(self.alignment()),
-            sharding: Sharding::replicated(),
-            alignment: self.alignment(),
-            shard_axis: (self.target.tp_size > 1).then_some(Axis(1)),
-        });
+            vec![expert_count * hidden, full_intermediate],
+            Some(Axis(1)),
+        );
+        let down_name = format!("{base}.down_proj.packed.weight");
+        self.tensors.push(TensorContract::new(
+            down_name.clone(),
+            expr,
+            shape,
+            Encoding::Raw(DType::BF16),
+        ));
 
         for (expert, raw) in up.iter().enumerate() {
             let expert = i64::try_from(expert).map_err(|_| {
                 CompileError::InvalidInput("Nemotron-H expert index does not fit i64".to_string())
             })?;
-            self.tensors.push(RuntimeTensorContract {
-                output_name: raw.name.clone(),
-                expr: Expr::out(up_name.clone()).slice(
+            self.tensors.push(TensorContract::new(
+                raw.name.clone(),
+                Expr::out(up_name.clone()).slice(
                     0,
                     expert * local_intermediate,
                     local_intermediate,
                 ),
-                encoding: Encoding::Raw(DType::BF16),
-                shape: vec![local_intermediate, hidden],
-                layout: Layout::dense(self.alignment()),
-                sharding: Sharding::replicated(),
-                alignment: self.alignment(),
-                shard_axis: None,
-            });
+                vec![local_intermediate, hidden],
+                Encoding::Raw(DType::BF16),
+            ));
             self.consumed.insert(raw.id);
         }
 
@@ -164,25 +157,12 @@ impl DefaultAbiBuilder<'_> {
             let expert = i64::try_from(expert).map_err(|_| {
                 CompileError::InvalidInput("Nemotron-H expert index does not fit i64".to_string())
             })?;
-            let sharding = if self.target.tp_size > 1 {
-                Sharding {
-                    axis: Some(Axis(1)),
-                    world: self.target.tp_size,
-                    rank: self.target.tp_rank,
-                }
-            } else {
-                Sharding::replicated()
-            };
-            self.tensors.push(RuntimeTensorContract {
-                output_name: raw.name.clone(),
-                expr: Expr::out(down_name.clone()).slice(0, expert * hidden, hidden),
-                encoding: Encoding::Raw(DType::BF16),
-                shape: vec![hidden, local_intermediate],
-                layout: Layout::dense(self.alignment()),
-                sharding,
-                alignment: self.alignment(),
-                shard_axis: None,
-            });
+            self.tensors.push(TensorContract::new(
+                raw.name.clone(),
+                Expr::out(down_name.clone()).slice(0, expert * hidden, hidden),
+                vec![hidden, local_intermediate],
+                Encoding::Raw(DType::BF16),
+            ));
             self.consumed.insert(raw.id);
         }
 

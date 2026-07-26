@@ -432,6 +432,21 @@ _QUEST_PROMPT = (
 )
 
 
+# Coherence is compared at NEAR-GREEDY, not at a sampling temperature.
+# Running a policy program changes the decode batch's shape and therefore the
+# attention kernel's split/reduction plan, so its logits differ from the plain
+# baseline's in the last bits or two. That is expected and benign -- the CUDA
+# test `test_attn_score_capture` already proves the capture variant leaves the
+# attention output BIT-identical, so the residue is plan-level, not policy-level
+# -- but under Gumbel sampling at tau=0.1 those last bits are amplified 10x and
+# occasionally decide a near-tied token. Measured over 24 tokens x 5 seeds x 3
+# programs: 15/15 exact at tau=0.001, scattered single-token flips at tau=0.1
+# that hit the mask-only program (quest) as readily as the capture ones. So the
+# invariant worth asserting is the one that is actually true: with an all-keep
+# mask the policy reproduces the baseline's ARGMAX path exactly.
+_COHERENCE_TAU = 0.001
+
+
 async def test_quest_attention(client, args):
     report = await _report(
         client, args, "quest-attention",
@@ -453,6 +468,31 @@ async def test_quest_attention(client, args):
     # answer outranks the repeated filler.
     scores = [float(s) for s in report["page_scores"][:-1]]
     assert scores[0] == max(scores), report
+
+    # Everything above is about the RANKING, and a ranking the driver computes
+    # and then discards looks exactly like one it honours. This is the part
+    # that separates them: with a budget of one page the continuation has to
+    # change, and with a budget of everything it has to be the unmasked answer
+    # verbatim. `test_mask_enforced.py` covers the same ground in isolation;
+    # keeping a version here means the matrix cannot go green on a build where
+    # `attn_page_mask` silently stopped being applied.
+    common = {"prompt": _QUEST_PROMPT, "max_tokens": 8,
+              "temperature": _COHERENCE_TAU, "seed": 4242}
+    wide = await _report(
+        client, args, "quest-attention", {**common, "page_budget": 4096})
+    tight = await _report(
+        client, args, "quest-attention", {**common, "page_budget": 1})
+    base = await _report(client, args, "naive-baseline", common)
+    assert tight["pages_nan"] == 0, tight
+    assert wide["text"] != tight["text"], (
+        "attn_page_mask is not enforced: a 1-page budget produced the same "
+        f"continuation as a {wide['page_budget']}-page one"
+    )
+    assert wide["text"] == base["text"], (
+        "an all-keep page mask perturbed the output; compaction is not "
+        f"equivalent to the original page table\n  {wide['text']!r}\n"
+        f"  {base['text']!r}"
+    )
 
 
 _TOVA_PROMPT = (
@@ -507,6 +547,111 @@ async def test_tova_attention(client, args):
     assert any(p >= report["kv_len"] - 4 for p in kept), report
     # ...and it must drop something in the middle, or it is not a policy.
     assert 4 < report["evicted_first"] < report["kv_len"] - 4, report
+
+
+async def test_h2o_attention(client, args):
+    common = {"prompt": _QUEST_PROMPT, "max_tokens": 8,
+              "temperature": _COHERENCE_TAU, "seed": 4242}
+    report = await _report(
+        client, args, "trackb-h2o", {**common, "page_budget": 4096})
+    # H2O's whole claim is the CARRY: the score row is accumulated across fires
+    # rather than re-seeded from the latest one. Each fire adds one softmax row
+    # per layer, so the mass must grow by exactly `layers_per_fire` every time.
+    # This is the single assertion that separates H2O from TOVA -- with the
+    # accumulator re-seeded the trace would be flat instead of a staircase.
+    trace = [float(m) for m in report["mass_trace"]]
+    assert len(trace) >= 2, report
+    steps = [b - a for a, b in zip(trace, trace[1:])]
+    per_fire = report["layers_per_fire"]
+    for step in steps:
+        assert abs(step - per_fire) < 0.05, (
+            f"H2O is not accumulating: mass grew by {step}, not {per_fire}\n"
+            f"  trace = {trace}"
+        )
+    # No attention may land past the live prefix. (Unlike TOVA this cannot be
+    # "exactly zero" -- H2O seeds a cold-start ramp it never re-seeds away --
+    # so the bar is the seed ceiling.)
+    assert report["tail_polluted"] == 0, report
+    assert report["scores_nan"] == 0, report
+    # The heavy hitters must be heavy: a uniform row would pass everything
+    # above. On a real model the attention sink at the head of the sequence
+    # dominates by orders of magnitude over the repeated filler.
+    page_mass = [float(m) for m in report["page_mass"]]
+    assert page_mass[0] == max(page_mass), report
+    assert page_mass[0] > 10 * sorted(page_mass)[len(page_mass) // 2], report
+    # ...and the policy must be ENFORCED, not merely computed. Same pair as
+    # Quest: a one-page budget has to change the continuation, and an all-keep
+    # budget has to reproduce the unmasked answer verbatim.
+    tight = await _report(
+        client, args, "trackb-h2o", {**common, "page_budget": 1})
+    base = await _report(client, args, "naive-baseline", common)
+    assert report["text"] != tight["text"], (
+        "attn_page_mask is not enforced under H2O: a 1-page budget produced "
+        "the same continuation as an all-keep one"
+    )
+    assert report["text"] == base["text"], (
+        "an all-keep page mask perturbed the output\n"
+        f"  {report['text']!r}\n  {base['text']!r}"
+    )
+
+
+async def test_snapkv_attention(client, args):
+    common = {"prompt": _QUEST_PROMPT, "max_tokens": 8,
+              "temperature": _COHERENCE_TAU, "seed": 4242}
+    report = await _report(
+        client, args, "trackb-snapkv", {**common, "page_budget": 4096})
+    # SnapKV reads a DIFFERENT TAP from every other policy here: the prefill
+    # capture, which records the last `window` rows of the prompt against the
+    # whole prefix, once, before any token is generated. So the row must
+    # describe the prompt -- not the decode step H2O and TOVA see.
+    assert report["observed_live"] == report["prompt_len"], (
+        f"the score row covers {report['observed_live']} positions but the "
+        f"prompt is {report['prompt_len']} tokens; the capture fired on a "
+        f"different kv length than the program thinks\n  {report}"
+    )
+    # Unlike H2O there is no cold-start seed ramp in this row -- the prefill
+    # capture writes exactly one entry per live kv position -- so slack past the
+    # prompt is a bug, not a policy choice, and the bar is exactly zero.
+    assert report["tail_nonzero"] == 0, report
+    assert report["scores_nan"] == 0, report
+    # Every layer folds one softmax distribution over the prefix, averaged over
+    # heads and over window rows but NOT over layers, so the total mass is the
+    # layer count. This pins the fold divisor: `heads * window` instead of
+    # `heads * rows` would scale a short window down, and no normalization at
+    # all would land at `heads * rows * layers`.
+    layers = report["layers_observed"]
+    assert layers > 0, report
+    assert abs(report["score_mass"] - layers) < 0.02 * layers, (
+        f"score mass {report['score_mass']} should equal the layer count "
+        f"{layers} -- one folded distribution per layer\n  {report}"
+    )
+    # The mass has to sit where SnapKV says it does. `test_snapkv.py` sweeps the
+    # window width to show the profile tracks it; here the cheap invariant is
+    # that the observation window's own pages outweigh the middle of the prompt,
+    # with the attention sink held out of both sides.
+    page_mass = [float(m) for m in report["page_mass"]]
+    win_lo = max(report["prompt_len"] - 32, 0) // report["page_size"]
+    mid, win = page_mass[1:win_lo], page_mass[win_lo:]
+    assert win and mid, report
+    assert min(win) > max(mid), (
+        f"the observation window {win} does not separate from the middle of "
+        f"the prompt (max {max(mid):.5f}); the capture is not describing an "
+        f"END-of-prompt window\n  {report['page_mass']}"
+    )
+    # ...and the policy must be ENFORCED, not merely computed. Same pair as
+    # Quest and H2O: a one-page budget has to change the continuation, and an
+    # all-keep budget has to reproduce the unmasked answer verbatim.
+    tight = await _report(
+        client, args, "trackb-snapkv", {**common, "page_budget": 1})
+    base = await _report(client, args, "naive-baseline", common)
+    assert report["text"] != tight["text"], (
+        "attn_page_mask is not enforced under SnapKV: a 1-page budget produced "
+        "the same continuation as an all-keep one"
+    )
+    assert report["text"] == base["text"], (
+        "an all-keep page mask perturbed the output\n"
+        f"  {report['text']!r}\n  {base['text']!r}"
+    )
 
 
 async def test_naive_baseline(client, args):
@@ -569,6 +714,8 @@ def tests():
         test_naive_baseline,
         test_quest_attention,
         test_tova_attention,
+        test_h2o_attention,
+        test_snapkv_attention,
     ]
 
 

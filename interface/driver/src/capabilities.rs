@@ -123,6 +123,13 @@ pub struct DriverCapabilities {
     /// the softmax those policies are defined over.
     #[serde(default)]
     pub has_attn_score: bool,
+    /// The driver can HONOUR an `attn_page_mask` sink: it compacts the fire's
+    /// page table to the kept pages before the layer's attention. Advertised
+    /// separately from `has_attn_score` because observing scores and enforcing
+    /// a selection are independent backend abilities -- a driver may well have
+    /// one without the other.
+    #[serde(default)]
+    pub has_attn_page_mask: bool,
     /// Descriptor-port tags the driver can resolve on-device for decode envelopes.
     #[serde(default)]
     pub device_geometry_port_mask: u32,

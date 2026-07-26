@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -221,8 +222,19 @@ MtpMoeMode mtp_moe_mode() {
     return mode;
 }
 
+// Timing means synchronizing on an event, which CUDA forbids while the stream
+// is capturing a graph, and which under TP stalls one rank inside a collective
+// the other rank has already left. Either way the engine dies mid-run instead
+// of reporting numbers, so a capturing stream runs the work untimed.
+inline bool profile_stream_is_capturing(cudaStream_t stream) {
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &status) != cudaSuccess) return true;
+    return status != cudaStreamCaptureStatusNone;
+}
+
 struct Qwen35MoeForwardProfile {
     bool enabled = false;
+    bool timing_suspended = false;
     int tp_rank = 0;
     int N = 0;
     int R = 0;
@@ -252,6 +264,7 @@ struct Qwen35MoeForwardProfile {
     double moe_shared_down_ms = 0.0;
     double moe_shared_gate_ms = 0.0;
     double moe_allreduce_ms = 0.0;
+
     double residual_ms = 0.0;
     double lm_head_ms = 0.0;
     double forward_ms = 0.0;
@@ -301,11 +314,13 @@ struct Qwen35MoeForwardProfile {
         moe_reduce_ms = moe_shared_gate_up_ms = moe_shared_down_ms = 0.0;
         moe_shared_gate_ms = 0.0;
         residual_ms = lm_head_ms = forward_ms = 0.0;
+        timing_suspended = profile_stream_is_capturing(stream);
+        if (timing_suspended) return;
         CUDA_CHECK(cudaEventRecord(forward_start, stream));
     }
 
     void end(cudaStream_t stream) {
-        if (!enabled) return;
+        if (!enabled || timing_suspended) return;
         CUDA_CHECK(cudaEventRecord(forward_stop, stream));
         CUDA_CHECK(cudaEventSynchronize(forward_stop));
         float ms = 0.0f;
@@ -318,6 +333,11 @@ struct Qwen35MoeForwardProfile {
     }
 };
 
+// Stages MUST NOT nest. There is a single shared `stage_start`/`stage_stop`
+// event pair, so an inner stage overwrites the outer one's start and the
+// outer reading comes back as just its own tail — wrapping `moe_block`
+// around its four inner stages reported 1.35 ms for a block whose child
+// alone measured 22.85 ms.
 template <class F>
 void profile_cuda_stage(
     Qwen35MoeForwardProfile* profile,
@@ -325,7 +345,8 @@ void profile_cuda_stage(
     cudaStream_t stream,
     F&& fn)
 {
-    if (profile == nullptr || !profile->enabled || dst == nullptr) {
+    if (profile == nullptr || !profile->enabled || dst == nullptr ||
+        profile_stream_is_capturing(stream)) {
         fn();
         return;
     }
@@ -345,7 +366,8 @@ void profile_cuda_detail_stage(
     cudaStream_t stream,
     F&& fn)
 {
-    if (profile == nullptr || !profile->enabled || dst == nullptr) {
+    if (profile == nullptr || !profile->enabled || dst == nullptr ||
+        profile_stream_is_capturing(stream)) {
         fn();
         return;
     }
@@ -371,7 +393,11 @@ void maybe_print_profile(const Qwen35MoeForwardProfile& p) {
         p.moe_router_ms + p.moe_routed_ms + p.moe_shared_ms +
         p.moe_allreduce_ms + p.residual_ms + p.lm_head_ms;
     const double other = p.forward_ms > named ? p.forward_ms - named : 0.0;
-    std::cerr
+    // One buffered line, one write. TP ranks profile concurrently, and a
+    // chain of `std::cerr <<` interleaves their fields mid-number, which
+    // silently corrupts anything parsing the output.
+    std::ostringstream os;
+    os
         << "[pie-qwen35-moe-profile] seq=" << seq
         << " rank=" << p.tp_rank
         << " N=" << p.N
@@ -406,6 +432,7 @@ void maybe_print_profile(const Qwen35MoeForwardProfile& p) {
         << " lm_head_ms=" << p.lm_head_ms
         << " other_ms=" << other
         << "\n";
+    std::cerr << os.str() << std::flush;
 }
 
 struct MtpProfile {

@@ -1,13 +1,14 @@
 use crate::checkpoint::{CheckpointMetadata, RawTensor};
 use crate::config::ModelConfig;
-use crate::contract::Expr;
+use crate::contract::{Expr, ModelContract, TensorContract};
 use crate::error::CompileError;
+use crate::ffi::PieLoaderComponent;
 use crate::load_plan::StorageTarget;
 use crate::types::{
-    Axis, BackendKind, DType, Encoding, Layout, Mxfp4MoePolicy, QuantScheme, QuantSpec,
-    RepackLayout, RepackSpec, RowMap, Sharding, TensorId,
+    Axis, BackendKind, DType, Encoding, Mxfp4MoePolicy, QuantScheme, QuantSpec, RepackLayout,
+    RepackSpec, RowMap, TensorId,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 mod fusion;
 mod gpt_oss;
@@ -21,398 +22,301 @@ mod qwen_moe;
 use policy::{runtime_quant_model_supported, runtime_quantizable_name};
 use profile::{ArchProfile, arch_profile};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RuntimeAbi {
-    pub name: String,
-    pub version: u32,
-    pub tensors: Vec<RuntimeTensorContract>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RuntimeTensorContract {
-    pub output_name: String,
-    /// What this tensor *is*, in the algebra of [`crate::contract`].
-    pub expr: Expr,
-    pub encoding: Encoding,
-    pub shape: Vec<i64>,
-    pub layout: Layout,
-    pub sharding: Sharding,
-    pub alignment: u32,
-    pub shard_axis: Option<Axis>,
-}
-
-impl RuntimeTensorContract {
-    /// The shape a driver will actually find, which is not always `shape`.
-    ///
-    /// `shape` is the tensor as the *model* describes it. When `shard_axis` is
-    /// set, each rank holds only its slice of that axis, so the declared shape
-    /// and the delivered shape differ by a factor of the world size. Keeping
-    /// both is what lets a pass describe a tensor once and have it sharded
-    /// consistently; this is the function that says which is which.
-    pub fn runtime_shape(&self, tp_size: u32) -> Vec<i64> {
-        let mut shape = self.shape.clone();
-        if tp_size > 1
-            && let Some(axis) = self.shard_axis
-            && let Some(dim) = shape.get_mut(usize::from(axis.0))
-            && *dim % i64::from(tp_size) == 0
-        {
-            *dim /= i64::from(tp_size);
-        }
-        shape
+/// Infer a contract for `cfg`'s family, from the tensors `metadata` names.
+///
+/// The one function in the loader that knows what a model *is* — everything
+/// below it works from the contract alone. It exists so that a driver which has
+/// not yet been taught to author its own contract still gets one.
+pub fn default_contract(
+    metadata: &CheckpointMetadata,
+    cfg: &ModelConfig,
+    target: &StorageTarget,
+) -> Result<ModelContract, CompileError> {
+    let mut builder = ContractBuilder {
+        metadata,
+        cfg,
+        target,
+        consumed: HashSet::new(),
+        tensors: Vec::new(),
+    };
+    builder.build()?;
+    let sharded = builder
+        .tensors
+        .iter()
+        .filter(|contract| contract.expr.is_sharded())
+        .count();
+    let (total_bytes, sharded_bytes) =
+        builder
+            .tensors
+            .iter()
+            .fold((0_u64, 0_u64), |(total, sharded), contract| {
+                let bytes = match contract.expr.sources().as_slice() {
+                    [name] => metadata
+                        .tensor_by_name(name)
+                        .map(|raw| raw.span_bytes)
+                        .unwrap_or(0),
+                    _ => 0,
+                };
+                (
+                    total.saturating_add(bytes),
+                    sharded.saturating_add(if contract.expr.is_sharded() { bytes } else { 0 }),
+                )
+            });
+    if crate::planner_debug_enabled() {
+        eprintln!(
+            "[pie-loader] default ABI model_type={} tp={}/{} tensors={} sharded={} bytes={} sharded_bytes={}",
+            cfg.model_type,
+            target.tp_rank,
+            target.tp_size,
+            builder.tensors.len(),
+            sharded,
+            total_bytes,
+            sharded_bytes
+        );
     }
+    Ok(ModelContract {
+        abi_version: 1,
+        alignment: target.preferred_alignment.max(1),
+        tensors: builder.tensors,
+    })
 }
 
-impl RuntimeAbi {
-    pub fn default_for_target(
-        metadata: &CheckpointMetadata,
-        cfg: &ModelConfig,
-        target: &StorageTarget,
-    ) -> Result<Self, CompileError> {
-        let mut builder = DefaultAbiBuilder {
-            metadata,
-            cfg,
-            target,
-            consumed: HashSet::new(),
-            tensors: Vec::new(),
+/// Replace many equally-shaped row shards with one bank plus views of it.
+///
+/// A rank holding the same row band of a hundred identically-shaped weights
+/// reads a hundred small strided copies; stated as one `Cat` of those bands
+/// plus a `Slice` per member, it reads one. Purely an optimization: the
+/// contract it returns declares exactly the same tensors.
+pub fn coalesce_direct_row_shards(
+    contract: &ModelContract,
+    metadata: &CheckpointMetadata,
+    target: &StorageTarget,
+) -> Result<ModelContract, CompileError> {
+    if target.tp_size <= 1 {
+        return Ok(contract.clone());
+    }
+
+    const MIN_GROUP_TENSORS: usize = 16;
+    const DEFAULT_MAX_BANK_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+    let max_bank_bytes = DEFAULT_MAX_BANK_BYTES;
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct GroupKey {
+        shape: Vec<i64>,
+        encoding: Encoding,
+    }
+
+    let mut buckets: Vec<(GroupKey, Vec<usize>)> = Vec::new();
+    let mut local_bytes_by_index = vec![0_u64; contract.tensors.len()];
+    for (index, tensor) in contract.tensors.iter().enumerate() {
+        // One pattern says everything the old flag-plus-match pair said:
+        // this tensor is a whole checkpoint tensor, split by row.
+        let Expr::Shard { src, axis: Axis(0) } = &tensor.expr else {
+            continue;
         };
-        builder.build()?;
-        let sharded = builder
-            .tensors
-            .iter()
-            .filter(|contract| contract.shard_axis.is_some())
-            .count();
-        let (total_bytes, sharded_bytes) =
-            builder
-                .tensors
-                .iter()
-                .fold((0_u64, 0_u64), |(total, sharded), contract| {
-                    let bytes = match contract.expr.sources().as_slice() {
-                        [name] => metadata
-                            .tensor_by_name(name)
-                            .map(|raw| raw.span_bytes)
-                            .unwrap_or(0),
-                        _ => 0,
-                    };
-                    (
-                        total.saturating_add(bytes),
-                        sharded.saturating_add(if contract.shard_axis.is_some() {
-                            bytes
-                        } else {
-                            0
-                        }),
-                    )
-                });
-        if crate::planner_debug_enabled() {
-            eprintln!(
-                "[pie-loader] default ABI model_type={} tp={}/{} tensors={} sharded={} bytes={} sharded_bytes={}",
-                cfg.model_type,
-                target.tp_rank,
-                target.tp_size,
-                builder.tensors.len(),
-                sharded,
-                total_bytes,
-                sharded_bytes
-            );
+        let Expr::Src(name) = src.as_ref() else {
+            continue;
+        };
+        let Some(raw) = metadata.tensor_by_name(name) else {
+            continue;
+        };
+        // Extents come off the checkpoint, because the contract's shape is
+        // already this rank's band and cannot say how wide the whole is.
+        if raw.shape.len() != 2 || raw.shape[0] <= 0 || raw.shape[1] <= 0 {
+            continue;
         }
-        Ok(Self {
-            name: match target.backend {
-                crate::types::BackendKind::Cuda => "pie-cuda".to_string(),
-                crate::types::BackendKind::Metal => "pie-metal".to_string(),
-                crate::types::BackendKind::Unknown => "pie".to_string(),
-            },
-            version: 1,
-            tensors: builder.tensors,
-        })
+        if raw.encoding != tensor.encoding {
+            continue;
+        }
+        let elem = match dense_element_bytes(raw, "direct row shard coalescing") {
+            Ok(elem) => elem,
+            Err(_) => continue,
+        };
+        let (_, local_rows) = local_range(
+            raw.shape[0],
+            target,
+            &format!("the row count of '{}'", tensor.name),
+        )?;
+        if tensor.shape.as_deref() != Some(&[local_rows, raw.shape[1]][..]) {
+            continue;
+        }
+        let row_bytes =
+            checked_mul_i64(raw.shape[1], elem, "direct row shard coalescing row bytes")?;
+        local_bytes_by_index[index] = checked_mul_i64(
+            local_rows,
+            row_bytes,
+            "direct row shard coalescing local bytes",
+        )?;
+        let key = GroupKey {
+            shape: raw.shape.clone(),
+            encoding: tensor.encoding.clone(),
+        };
+        if let Some((_, indices)) = buckets.iter_mut().find(|(candidate, _)| *candidate == key) {
+            indices.push(index);
+        } else {
+            buckets.push((key, vec![index]));
+        }
     }
 
-    pub fn retain_outputs(
-        mut self,
-        mut retain: impl FnMut(&str) -> bool,
-    ) -> Result<Self, CompileError> {
-        let mut selected = self
-            .tensors
-            .iter()
-            .map(|contract| retain(&contract.output_name))
-            .collect::<Vec<_>>();
-        let by_name: HashMap<&str, usize> = self
-            .tensors
-            .iter()
-            .enumerate()
-            .map(|(index, contract)| (contract.output_name.as_str(), index))
-            .collect();
-        loop {
-            let mut changed = false;
-            for index in 0..self.tensors.len() {
-                if !selected[index] {
-                    continue;
-                }
-                for name in self.tensors[index].expr.outputs() {
-                    let dep = *by_name.get(name).ok_or_else(|| {
-                        CompileError::InvalidInput(format!(
-                            "runtime ABI contract {index} reads missing contract '{name}'"
-                        ))
-                    })?;
-                    if !selected[dep] {
-                        selected[dep] = true;
-                        changed = true;
-                    }
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
-        if !selected.iter().any(|selected| *selected) {
-            return Err(CompileError::InvalidInput(
-                "runtime ABI component filter selected no tensors".to_string(),
-            ));
-        }
-
-        // References are by name, so dropping tensors needs no renumbering.
-        let mut tensors = Vec::new();
-        for (contract, selected) in self.tensors.into_iter().zip(selected) {
-            if selected {
-                tensors.push(contract);
-            }
-        }
-        self.tensors = tensors;
-        Ok(self)
-    }
-
-    pub fn coalesce_direct_row_shards(
-        &self,
-        metadata: &CheckpointMetadata,
-        target: &StorageTarget,
-    ) -> Result<Self, CompileError> {
-        if target.tp_size <= 1 {
-            return Ok(self.clone());
-        }
-
-        const MIN_GROUP_TENSORS: usize = 16;
-        const DEFAULT_MAX_BANK_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-        let max_bank_bytes = DEFAULT_MAX_BANK_BYTES;
-
-        #[derive(Clone, Debug, PartialEq, Eq)]
-        struct GroupKey {
-            shape: Vec<i64>,
-            encoding: Encoding,
-            layout: Layout,
-            alignment: u32,
-        }
-
-        let mut buckets: Vec<(GroupKey, Vec<usize>)> = Vec::new();
-        let mut local_bytes_by_index = vec![0_u64; self.tensors.len()];
-        for (index, contract) in self.tensors.iter().enumerate() {
-            if contract.shard_axis != Some(Axis(0))
-                || contract.shape.len() != 2
-                || contract.shape[0] <= 0
-                || contract.shape[1] <= 0
+    let mut group_for = vec![None; contract.tensors.len()];
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (_, indices) in &buckets {
+        let mut chunk = Vec::new();
+        let mut chunk_bytes = 0_u64;
+        for &index in indices {
+            let tensor_bytes = local_bytes_by_index[index];
+            if !chunk.is_empty()
+                && chunk_bytes.saturating_add(tensor_bytes) > max_bank_bytes
+                && chunk.len() >= MIN_GROUP_TENSORS
             {
-                continue;
-            }
-            let Expr::Src(name) = &contract.expr else {
-                continue;
-            };
-            let Some(raw) = metadata.tensor_by_name(name) else {
-                continue;
-            };
-            if raw.shape != contract.shape || raw.encoding != contract.encoding {
-                continue;
-            }
-            let elem = match dense_element_bytes(raw, "direct row shard coalescing") {
-                Ok(elem) => elem,
-                Err(_) => continue,
-            };
-            let (_, local_rows) = local_range(
-                contract.shape[0],
-                target,
-                &format!("the row count of '{}'", contract.output_name),
-            )?;
-            let row_bytes = checked_mul_i64(
-                contract.shape[1],
-                elem,
-                "direct row shard coalescing row bytes",
-            )?;
-            local_bytes_by_index[index] = checked_mul_i64(
-                local_rows,
-                row_bytes,
-                "direct row shard coalescing local bytes",
-            )?;
-            let key = GroupKey {
-                shape: contract.shape.clone(),
-                encoding: contract.encoding.clone(),
-                layout: contract.layout.clone(),
-                alignment: contract.alignment,
-            };
-            if let Some((_, indices)) = buckets.iter_mut().find(|(candidate, _)| *candidate == key)
-            {
-                indices.push(index);
-            } else {
-                buckets.push((key, vec![index]));
-            }
-        }
-
-        let mut group_for = vec![None; self.tensors.len()];
-        let mut groups: Vec<Vec<usize>> = Vec::new();
-        for (_, indices) in &buckets {
-            let mut chunk = Vec::new();
-            let mut chunk_bytes = 0_u64;
-            for &index in indices {
-                let tensor_bytes = local_bytes_by_index[index];
-                if !chunk.is_empty()
-                    && chunk_bytes.saturating_add(tensor_bytes) > max_bank_bytes
-                    && chunk.len() >= MIN_GROUP_TENSORS
-                {
-                    let group_id = groups.len();
-                    for &member in &chunk {
-                        group_for[member] = Some(group_id);
-                    }
-                    groups.push(std::mem::take(&mut chunk));
-                    chunk_bytes = 0;
-                }
-                chunk.push(index);
-                chunk_bytes = chunk_bytes.saturating_add(tensor_bytes);
-            }
-            if chunk.len() >= MIN_GROUP_TENSORS {
                 let group_id = groups.len();
                 for &member in &chunk {
                     group_for[member] = Some(group_id);
                 }
-                groups.push(chunk);
+                groups.push(std::mem::take(&mut chunk));
+                chunk_bytes = 0;
             }
+            chunk.push(index);
+            chunk_bytes = chunk_bytes.saturating_add(tensor_bytes);
         }
-
-        if groups.is_empty() {
-            return Ok(self.clone());
+        if chunk.len() >= MIN_GROUP_TENSORS {
+            let group_id = groups.len();
+            for &member in &chunk {
+                group_for[member] = Some(group_id);
+            }
+            groups.push(chunk);
         }
+    }
 
-        if crate::planner_debug_enabled() {
-            let coalesced = groups.iter().map(Vec::len).sum::<usize>();
-            eprintln!(
-                "[pie-loader] row-shard coalescing groups={} tensors={} max_bank_bytes={}",
-                groups.len(),
-                coalesced,
-                max_bank_bytes
-            );
-        }
+    if groups.is_empty() {
+        return Ok(contract.clone());
+    }
 
-        let mut emitted_groups = vec![false; groups.len()];
-        let mut old_to_new = vec![usize::MAX; self.tensors.len()];
-        let mut new_tensors = Vec::with_capacity(self.tensors.len() + groups.len());
+    if crate::planner_debug_enabled() {
+        let coalesced = groups.iter().map(Vec::len).sum::<usize>();
+        eprintln!(
+            "[pie-loader] row-shard coalescing groups={} tensors={} max_bank_bytes={}",
+            groups.len(),
+            coalesced,
+            max_bank_bytes
+        );
+    }
 
-        for old_index in 0..self.tensors.len() {
-            if let Some(group_id) = group_for[old_index] {
-                if emitted_groups[group_id] {
-                    continue;
-                }
-                emitted_groups[group_id] = true;
-                self.emit_row_shard_bank(
-                    metadata,
-                    target,
-                    group_id,
-                    &groups[group_id],
-                    &mut old_to_new,
-                    &mut new_tensors,
-                )?;
+    let mut emitted_groups = vec![false; groups.len()];
+    let mut old_to_new = vec![usize::MAX; contract.tensors.len()];
+    let mut new_tensors = Vec::with_capacity(contract.tensors.len() + groups.len());
+
+    for old_index in 0..contract.tensors.len() {
+        if let Some(group_id) = group_for[old_index] {
+            if emitted_groups[group_id] {
                 continue;
             }
-
-            old_to_new[old_index] = new_tensors.len();
-            new_tensors.push(self.tensors[old_index].clone());
+            emitted_groups[group_id] = true;
+            emit_row_shard_bank(
+                contract,
+                metadata,
+                target,
+                group_id,
+                &groups[group_id],
+                &mut old_to_new,
+                &mut new_tensors,
+            )?;
+            continue;
         }
 
-        Ok(Self {
-            name: self.name.clone(),
-            version: self.version,
-            tensors: new_tensors,
-        })
+        old_to_new[old_index] = new_tensors.len();
+        new_tensors.push(contract.tensors[old_index].clone());
     }
 
-    fn emit_row_shard_bank(
-        &self,
-        metadata: &CheckpointMetadata,
-        target: &StorageTarget,
-        group_id: usize,
-        indices: &[usize],
-        old_to_new: &mut [usize],
-        new_tensors: &mut Vec<RuntimeTensorContract>,
-    ) -> Result<(), CompileError> {
-        let first = &self.tensors[indices[0]];
-        let rows = first.shape[0];
-        let cols = first.shape[1];
-        let first_raw = direct_raw(metadata, first)?;
-        dense_element_bytes(first_raw, "direct row shard coalescing")?;
-        let (local_start, local_rows) = local_range(
-            rows,
-            target,
-            &format!("the row count of '{}'", first.output_name),
-        )?;
+    Ok(ModelContract {
+        tensors: new_tensors,
+        ..contract.clone()
+    })
+}
 
-        // The bank is the local row band of every member, end to end. Stated as
-        // an expression the offsets are the compiler's problem, not this pass's.
-        let mut parts = Vec::with_capacity(indices.len());
-        for &old_index in indices {
-            let raw = direct_raw(metadata, &self.tensors[old_index])?;
-            parts.push(Expr::src(raw.name.clone()).slice(0, local_start, local_rows));
-        }
+fn emit_row_shard_bank(
+    contract: &ModelContract,
+    metadata: &CheckpointMetadata,
+    target: &StorageTarget,
+    group_id: usize,
+    indices: &[usize],
+    old_to_new: &mut [usize],
+    new_tensors: &mut Vec<TensorContract>,
+) -> Result<(), CompileError> {
+    let first = &contract.tensors[indices[0]];
+    let first_raw = direct_raw(metadata, first)?;
+    let rows = first_raw.shape[0];
+    let cols = first_raw.shape[1];
+    dense_element_bytes(first_raw, "direct row shard coalescing")?;
+    let (local_start, local_rows) =
+        local_range(rows, target, &format!("the row count of '{}'", first.name))?;
 
-        let bank_name = format!("__pie.row_shard_bank.{group_id}");
-        new_tensors.push(RuntimeTensorContract {
-            output_name: bank_name.clone(),
-            expr: Expr::cat(0, parts),
-            encoding: first.encoding.clone(),
-            shape: vec![local_rows * indices.len() as i64, cols],
-            layout: first.layout.clone(),
-            sharding: Sharding::replicated(),
-            alignment: first.alignment,
-            shard_axis: None,
-        });
-
-        for (slot, &old_index) in indices.iter().enumerate() {
-            let original = &self.tensors[old_index];
-            old_to_new[old_index] = new_tensors.len();
-            new_tensors.push(RuntimeTensorContract {
-                output_name: original.output_name.clone(),
-                expr: Expr::out(bank_name.clone()).slice(0, slot as i64 * local_rows, local_rows),
-                encoding: original.encoding.clone(),
-                shape: vec![local_rows, cols],
-                layout: original.layout.clone(),
-                sharding: Sharding::replicated(),
-                alignment: original.alignment,
-                shard_axis: None,
-            });
-        }
-        Ok(())
+    // The bank is the local row band of every member, end to end. Stated as
+    // an expression the offsets are the compiler's problem, not this pass's.
+    let mut parts = Vec::with_capacity(indices.len());
+    for &old_index in indices {
+        let raw = direct_raw(metadata, &contract.tensors[old_index])?;
+        parts.push(Expr::src(raw.name.clone()).slice(0, local_start, local_rows));
     }
+
+    let bank_name = format!("__pie.row_shard_bank.{group_id}");
+    new_tensors.push(TensorContract::new(
+        bank_name.clone(),
+        Expr::cat(0, parts),
+        vec![local_rows * indices.len() as i64, cols],
+        first.encoding.clone(),
+    ));
+
+    for (slot, &old_index) in indices.iter().enumerate() {
+        let original = &contract.tensors[old_index];
+        old_to_new[old_index] = new_tensors.len();
+        new_tensors.push(TensorContract::new(
+            original.name.clone(),
+            Expr::out(bank_name.clone()).slice(0, slot as i64 * local_rows, local_rows),
+            vec![local_rows, cols],
+            original.encoding.clone(),
+        ));
+    }
+    Ok(())
 }
 
 fn direct_raw<'a>(
     metadata: &'a CheckpointMetadata,
-    contract: &RuntimeTensorContract,
+    contract: &TensorContract,
 ) -> Result<&'a RawTensor, CompileError> {
-    let Expr::Src(name) = &contract.expr else {
+    let Some(name) = direct_src(&contract.expr) else {
         return Err(CompileError::InvalidInput(format!(
             "runtime tensor '{}' is not a direct tensor",
-            contract.output_name
+            contract.name
         )));
     };
     metadata.tensor_by_name(name).ok_or_else(|| {
         CompileError::InvalidInput(format!(
             "runtime tensor '{}' references missing source tensor '{name}'",
-            contract.output_name
+            contract.name
         ))
     })
 }
 
-struct DefaultAbiBuilder<'a> {
+/// The checkpoint tensor a direct contract reads, seeing through the partition
+/// a sharded one wraps it in — a rank's band of a tensor is still that tensor.
+fn direct_src(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Src(name) => Some(name.as_str()),
+        Expr::Shard { src, .. } => direct_src(src),
+        _ => None,
+    }
+}
+
+struct ContractBuilder<'a> {
     metadata: &'a CheckpointMetadata,
     cfg: &'a ModelConfig,
     target: &'a StorageTarget,
     consumed: HashSet<TensorId>,
-    tensors: Vec<RuntimeTensorContract>,
+    tensors: Vec<TensorContract>,
 }
 
-impl DefaultAbiBuilder<'_> {
+impl ContractBuilder<'_> {
     fn profile(&self) -> ArchProfile {
         arch_profile(&self.cfg.model_type)
     }
@@ -473,25 +377,43 @@ impl DefaultAbiBuilder<'_> {
         raw_name.to_string()
     }
 
-    fn alignment(&self) -> u32 {
-        self.target.preferred_alignment.max(1)
-    }
-
     fn dtype(&self, raw: &RawTensor) -> DType {
         dtype_for_encoding(&raw.encoding)
     }
 
     fn push_direct(&mut self, raw: &RawTensor, output_name: String, shard_axis: Option<Axis>) {
-        self.tensors.push(RuntimeTensorContract {
+        let (expr, shape) = self.shard(Expr::src(raw.name.clone()), raw.shape.clone(), shard_axis);
+        self.tensors.push(TensorContract::new(
             output_name,
-            expr: Expr::src(raw.name.clone()),
-            encoding: raw.encoding.clone(),
-            shape: raw.shape.clone(),
-            layout: Layout::dense(self.alignment()),
-            sharding: Sharding::replicated(),
-            alignment: self.alignment(),
-            shard_axis,
-        });
+            expr,
+            shape,
+            raw.encoding.clone(),
+        ));
+    }
+
+    /// Partition an expression and its shape across ranks along `axis`.
+    ///
+    /// The expression records *that* the tensor is split; the shape records what
+    /// this rank ends up holding. Both are left alone when there is nothing to
+    /// split, so a single-GPU build is identical to one authored without
+    /// sharding, and a non-divisible extent is left for the frontend to reject
+    /// with a message that names the tensor.
+    pub(super) fn shard(
+        &self,
+        expr: Expr,
+        mut shape: Vec<i64>,
+        axis: Option<Axis>,
+    ) -> (Expr, Vec<i64>) {
+        let world = i64::from(self.target.tp_size);
+        let Some(axis) = axis.filter(|_| world > 1) else {
+            return (expr, shape);
+        };
+        if let Some(dim) = shape.get_mut(usize::from(axis.0))
+            && *dim % world == 0
+        {
+            *dim /= world;
+        }
+        (expr.shard(axis.0), shape)
     }
 
     fn push_runtime_quant(
@@ -575,30 +497,27 @@ impl DefaultAbiBuilder<'_> {
                 )));
             }
         };
-        self.tensors.push(RuntimeTensorContract {
+        let (expr, shape) = self.shard(
+            Expr::src(raw.name.clone()),
+            raw.shape.clone(),
+            self.shard_axis(&raw.name),
+        );
+        self.tensors.push(TensorContract::new(
             output_name,
-            expr: Expr::src(raw.name.clone()),
-            encoding: Encoding::Quant(spec),
-            shape: raw.shape.clone(),
-            layout: Layout::dense(self.alignment()),
-            sharding: Sharding::replicated(),
-            alignment: self.alignment(),
-            shard_axis: self.shard_axis(&raw.name),
-        });
+            expr,
+            shape,
+            Encoding::Quant(spec),
+        ));
         Ok(())
     }
 
     fn push_expr(&mut self, output_name: String, raw: &RawTensor, shape: Vec<i64>, expr: Expr) {
-        self.tensors.push(RuntimeTensorContract {
+        self.tensors.push(TensorContract::new(
             output_name,
             expr,
-            encoding: Encoding::Raw(self.dtype(raw)),
             shape,
-            layout: Layout::dense(self.alignment()),
-            sharding: Sharding::replicated(),
-            alignment: self.alignment(),
-            shard_axis: None,
-        });
+            Encoding::Raw(self.dtype(raw)),
+        ));
         self.consumed.insert(raw.id);
     }
 
@@ -614,16 +533,12 @@ impl DefaultAbiBuilder<'_> {
             shape: shape.clone(),
             encoding: encoding.clone(),
         };
-        self.tensors.push(RuntimeTensorContract {
+        self.tensors.push(TensorContract::new(
             output_name,
-            expr: Expr::src(raw.name.clone()).repack(spec, out),
-            encoding,
+            Expr::src(raw.name.clone()).repack(spec, out),
             shape,
-            layout: Layout::dense(self.alignment()),
-            sharding: Sharding::replicated(),
-            alignment: self.alignment(),
-            shard_axis: None,
-        });
+            encoding,
+        ));
     }
 
     fn shard_axis(&self, name: &str) -> Option<Axis> {
@@ -759,39 +674,39 @@ fn checked_mul_u64(lhs: u64, rhs: u64, context: &str) -> Result<u64, CompileErro
         .ok_or_else(|| CompileError::InvalidInput(format!("{context}: byte overflow")))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn contract(name: &str, expr: Expr) -> RuntimeTensorContract {
-        RuntimeTensorContract {
-            output_name: name.to_string(),
-            expr,
-            encoding: Encoding::Raw(DType::U8),
-            shape: vec![1],
-            layout: Layout::dense(1),
-            sharding: Sharding::replicated(),
-            alignment: 1,
-            shard_axis: None,
-        }
+/// Narrow the ABI to the requested component.
+///
+/// `Full` and `Text` keep everything. `Encode` retains only the multimodal
+/// towers, so an encoder-only rank never materializes the language model. The
+/// This is family knowledge, so it lives beside the rest of it: the guard
+/// names a model type, and the prefixes name the tensors *that* family calls a
+/// tower. Under a driver-authored contract none of it is needed — a rank that
+/// should not materialize the language model simply does not declare it — so
+/// this function is deleted by `p4-delete-arch` along with its caller.
+pub fn scope_to_component(
+    contract: ModelContract,
+    component: PieLoaderComponent,
+    model: &ModelConfig,
+    target: &StorageTarget,
+) -> Result<ModelContract, CompileError> {
+    if component != PieLoaderComponent::Encode || target.backend != BackendKind::Cuda {
+        return Ok(contract);
     }
-
-    #[test]
-    fn component_filter_retains_selected_dependencies() {
-        let abi = RuntimeAbi {
-            name: "test".to_string(),
-            version: 1,
-            tensors: vec![
-                contract("text.weight", Expr::src("text")),
-                contract("vision.base", Expr::src("vision")),
-                contract("vision.view", Expr::out("vision.base").slice(0, 0, 1)),
-            ],
-        };
-
-        let filtered = abi.retain_outputs(|name| name == "vision.view").unwrap();
-        assert_eq!(filtered.tensors.len(), 2);
-        assert_eq!(filtered.tensors[0].output_name, "vision.base");
-        assert_eq!(filtered.tensors[1].output_name, "vision.view");
-        assert_eq!(filtered.tensors[1].expr.outputs(), ["vision.base"]);
+    if target.tp_size != 1 {
+        return Err(CompileError::InvalidInput(
+            "encode-scoped CUDA loading does not support tensor parallelism".to_string(),
+        ));
     }
+    if !matches!(model.model_type.as_str(), "gemma4" | "gemma4_text") {
+        return Err(CompileError::InvalidInput(format!(
+            "encode-scoped CUDA loading currently supports Gemma-4, got {}",
+            model.model_type
+        )));
+    }
+    contract.retain_outputs(|name| {
+        name.starts_with("model.vision_tower.")
+            || name.starts_with("model.embed_vision.")
+            || name.starts_with("model.audio_tower.")
+            || name.starts_with("model.embed_audio.")
+    })
 }

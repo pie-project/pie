@@ -1411,6 +1411,15 @@ impl KvStore {
         Ok(self.table.swapped_pages(working_sets)?.len())
     }
 
+    /// Total pages held by `working_sets`, resident and swapped alike —
+    /// see [`PageTable::held_pages`]. For liveness predicates only.
+    pub fn held_page_count(
+        &self,
+        working_sets: &HashSet<WorkingSetId>,
+    ) -> Result<usize, KvStoreError> {
+        Ok(self.table.held_pages(working_sets)?)
+    }
+
     /// Prepare a restore from caller-owned reserved pages, consuming exactly
     /// the required prefix of `granted` (lend semantics: failure consumes
     /// nothing, and surplus stays caller-owned — the caller's grant guard is
