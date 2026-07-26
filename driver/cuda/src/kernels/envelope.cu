@@ -9,20 +9,20 @@ namespace pie_cuda_driver::kernels {
 
 namespace {
 
-// One block per (page, kv_head); threads stride over head_dim, each reducing its
-// dims' min/max across the page's live tokens. Streaming reads of the NHD layout.
-__global__ void envelope_recompute_kernel(
+// The per-(page, kv_head) min/max reduction, shared by full recompute and the
+// page-list update so both paths are literally the same numerics (the full
+// recompute is what `test_envelope_dot` parity-checks).
+__device__ inline void envelope_reduce_page(
     const __nv_bfloat16* __restrict__ k_pages,
-    const std::int32_t* __restrict__ page_live_lens,
-    float* __restrict__ env_min,
-    float* __restrict__ env_max,
+    int page,
+    int kh,
+    int live,
     int page_size,
     int num_kv_heads,
-    int head_dim)
+    int head_dim,
+    float* __restrict__ env_min,
+    float* __restrict__ env_max)
 {
-    const int page = blockIdx.x;
-    const int kh = blockIdx.y;
-    const int live = page_live_lens[page];
     const long token_stride = static_cast<long>(num_kv_heads) * head_dim;
     const long page_base = static_cast<long>(page) * page_size * token_stride +
                            static_cast<long>(kh) * head_dim;
@@ -41,6 +41,48 @@ __global__ void envelope_recompute_kernel(
         env_min[env_base + d] = mn;
         env_max[env_base + d] = mx;
     }
+}
+
+// One block per (page, kv_head); threads stride over head_dim, each reducing its
+// dims' min/max across the page's live tokens. Streaming reads of the NHD layout.
+__global__ void envelope_recompute_kernel(
+    const __nv_bfloat16* __restrict__ k_pages,
+    const std::int32_t* __restrict__ page_live_lens,
+    float* __restrict__ env_min,
+    float* __restrict__ env_max,
+    int page_size,
+    int num_kv_heads,
+    int head_dim)
+{
+    const int page = blockIdx.x;
+    const int kh = blockIdx.y;
+    envelope_reduce_page(k_pages, page, kh, page_live_lens[page], page_size,
+                         num_kv_heads, head_dim, env_min, env_max);
+}
+
+// Refresh exactly the pages this fire appended to. The host knows which those
+// are -- a request's new tokens are the last `qo_len` of its `kv_len`, so the
+// touched page span is host arithmetic on the CSR mirrors -- so the kernel takes
+// an explicit (physical page, live length) list and does no CSR walk at all.
+// One block per (refresh slot, kv_head). Pages are append-only, so rewriting a
+// whole touched page gives the same answer an incremental merge would.
+__global__ void envelope_update_pages_kernel(
+    const __nv_bfloat16* __restrict__ k_pages,
+    const std::uint32_t* __restrict__ refresh_pages,
+    const std::uint32_t* __restrict__ refresh_live_lens,
+    float* __restrict__ env_min,
+    float* __restrict__ env_max,
+    int page_size,
+    int num_kv_heads,
+    int head_dim)
+{
+    const int slot = blockIdx.x;
+    const int kh = blockIdx.y;
+    const int live = static_cast<int>(refresh_live_lens[slot]);
+    if (live <= 0) return;
+    envelope_reduce_page(k_pages, static_cast<int>(refresh_pages[slot]), kh,
+                         live, page_size, num_kv_heads, head_dim,
+                         env_min, env_max);
 }
 
 // One block per (kv_head, page); threads reduce over the group·head_dim terms of
@@ -134,6 +176,29 @@ void launch_envelope_dot_f32(
     envelope_dot_kernel<BLOCK><<<grid, BLOCK, 0, stream>>>(
         q, env_min, env_max, score,
         num_q_heads, num_kv_heads, head_dim, p_max, live_pages);
+}
+
+void launch_envelope_update_pages_bf16(
+    const std::uint16_t* k_pages,
+    const std::uint32_t* refresh_pages,
+    const std::uint32_t* refresh_live_lens,
+    float* env_min,
+    float* env_max,
+    int num_refresh,
+    int page_size,
+    int num_kv_heads,
+    int head_dim,
+    cudaStream_t stream)
+{
+    if (num_refresh <= 0 || num_kv_heads <= 0 || head_dim <= 0) return;
+    const dim3 grid(static_cast<unsigned>(num_refresh),
+                    static_cast<unsigned>(num_kv_heads));
+    const int threads = head_dim < 256 ? head_dim : 256;
+    envelope_update_pages_kernel<<<grid, threads, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(k_pages),
+        refresh_pages, refresh_live_lens,
+        env_min, env_max,
+        page_size, num_kv_heads, head_dim);
 }
 
 }  // namespace pie_cuda_driver::kernels

@@ -65,4 +65,27 @@ void launch_envelope_dot_f32(
     int live_pages,
     cudaStream_t stream);
 
+// Maintenance: refresh the envelopes of exactly the pages a fire appended to.
+// The caller passes an explicit (physical page id, live token count) list, which
+// it computes on the host from the CSR mirrors -- a request's new tokens are the
+// last `qo_len` of its `kv_len`, so the touched page span is host arithmetic.
+// Rescanning the whole page list instead would cost a full KV read per layer,
+// i.e. as much as attention itself.
+//
+// Pages are append-only, so recomputing a touched page in full gives the same
+// answer an incremental merge would. Shares its per-(page, kv_head) reduction
+// with `launch_envelope_recompute_bf16`, so the numerics are the ones
+// `test_envelope_dot` parity-checks. NHD layout only.
+void launch_envelope_update_pages_bf16(
+    const std::uint16_t* k_pages,
+    const std::uint32_t* refresh_pages,      // [num_refresh] physical page ids
+    const std::uint32_t* refresh_live_lens,  // [num_refresh] live tokens
+    float* env_min,
+    float* env_max,
+    int num_refresh,
+    int page_size,
+    int num_kv_heads,
+    int head_dim,
+    cudaStream_t stream);
+
 }  // namespace pie_cuda_driver::kernels

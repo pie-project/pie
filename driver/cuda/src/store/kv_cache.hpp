@@ -139,6 +139,15 @@ public:
     void trim_pages(int pages);
     std::size_t committed_bytes() const noexcept;
 
+    // Allocate the Quest per-page key envelopes (min/max over each page's live
+    // keys), [num_pages, num_kv_heads, head_dim] f32 per layer per bound. Not
+    // done at construction: at page_size 16 this is 25% of the KV cache. Safe
+    // to call repeatedly; the second call is a no-op. Envelopes only describe
+    // pages written after they exist, which is correct because a program that
+    // asks for them installs them before its first fire.
+    void enable_envelopes();
+    bool envelopes_enabled() const noexcept { return envelopes_enabled_; }
+
 private:
     int resolve_(int layer) const noexcept {
         return kv_source_layer_.empty() ? layer : kv_source_layer_[layer];
@@ -157,6 +166,10 @@ private:
     std::vector<DeviceTensor> v_scale_layers_;
     std::vector<DeviceTensor> k_bf16_layers_;
     std::vector<DeviceTensor> v_bf16_layers_;
+    // Quest key envelopes, allocated only when `enable_envelopes` is called.
+    std::vector<DeviceTensor> k_env_min_layers_;
+    std::vector<DeviceTensor> k_env_max_layers_;
+    bool envelopes_enabled_ = false;
     // Empty for homogeneous allocations. When populated:
     //   * `per_layer_head_dim_[L]` is layer L's K/V head_dim.
     //   * `kv_source_layer_[L]` is the slot index whose physical

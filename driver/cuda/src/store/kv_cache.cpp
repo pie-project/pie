@@ -273,8 +273,34 @@ const void* KvCache::v_for_attention(int layer) const {
                                     : v_bf16_layers_[src].data();
 }
 
-KvCacheLayerView KvCache::layer_view(int layer) {
-    const int src = resolve_(layer);
+void KvCache::enable_envelopes() {
+    if (envelopes_enabled_) return;
+    // Envelopes describe BF16 keys. Quantized formats keep their dequantized
+    // mirror in k_bf16_layers_, but the append path writes the storage tier, so
+    // restrict to native BF16 rather than silently envelope stale mirrors.
+    if (!format_.is_native_bf16()) {
+        throw std::runtime_error(
+            "kv envelopes require a native bf16 kv cache");
+    }
+    if (hnd_layout_) {
+        throw std::runtime_error(
+            "kv envelopes require the NHD page layout");
+    }
+    const int slots = static_cast<int>(k_layers_.size());
+    k_env_min_layers_.reserve(slots);
+    k_env_max_layers_.reserve(slots);
+    for (int i = 0; i < slots; ++i) {
+        const int hd = head_dim_at(i);
+        const int kvh = num_kv_heads_at(i);
+        k_env_min_layers_.push_back(DeviceTensor::allocate(
+            DType::FP32, {num_pages_, kvh, hd}));
+        k_env_max_layers_.push_back(DeviceTensor::allocate(
+            DType::FP32, {num_pages_, kvh, hd}));
+    }
+    envelopes_enabled_ = true;
+}
+
+KvCacheLayerView KvCache::layer_view(int layer) {    const int src = resolve_(layer);
     const int hd = head_dim_at(src);
     const int kvh = num_kv_heads_at(src);
     auto data_or_null = [](DeviceTensor& t) -> void* {
@@ -298,6 +324,12 @@ KvCacheLayerView KvCache::layer_view(int layer) {
                                                  : k_bf16_layers_[src].data(),
         .v_bf16_pages = format_.is_native_bf16() ? v_layers_[src].data()
                                                  : v_bf16_layers_[src].data(),
+        .k_env_min = envelopes_enabled_
+            ? static_cast<float*>(k_env_min_layers_[src].data())
+            : nullptr,
+        .k_env_max = envelopes_enabled_
+            ? static_cast<float*>(k_env_max_layers_[src].data())
+            : nullptr,
         .hnd_layout = hnd_layout_,
         .native_bf16 = format_.is_native_bf16(),
     };
