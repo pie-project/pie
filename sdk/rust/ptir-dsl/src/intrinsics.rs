@@ -79,11 +79,65 @@ fn single_row_reshape(t: Tensor) -> Tensor {
 /// Second-party kernels (`intrinsics::kernel::*`, overview §4). Full rollout is
 /// P7; a minimal `attn_page_mask` sink exists now so T11 is enforceable.
 pub mod kernel {
-    use crate::context::record_sink;
+    use crate::context::{emit, intern_name, record_sink};
     use crate::error::Span;
-    use crate::value::AsTensor;
+    use crate::value::{AsTensor, Tensor};
     use alloc::string::String;
+    use alloc::vec;
+    use pie_ptir::op::{IntrinsicId, Op};
     use pie_ptir::registry::SinkScope;
+    use pie_ptir::types::{DType, Shape, ValueType};
+
+    /// `envelope_dot(p_max)` — Quest page criticality for THIS layer, `[p_max]`
+    /// F32 (Tang et al., arXiv:2406.10774). Model-gated on the backend's
+    /// `envelope_dot` kernel; a backend without per-page key envelopes refuses
+    /// the program at bind.
+    ///
+    /// Slot semantics, so a consumer can be written without guessing:
+    ///   - a page this request owns whose contents are final -> its criticality
+    ///     upper bound, `max` over kv heads of `Σ_qh Σ_d max(q·kmin, q·kmax)`;
+    ///   - a page the current forward is still filling -> `+inf`, i.e. always
+    ///     selected. Quest keeps the local window anyway, and a stale bound
+    ///     would be a silent mis-rank;
+    ///   - a slot past this request's page list -> `-inf`, so a `rank_le` never
+    ///     picks one.
+    ///
+    /// `p_max` is the program's own page ceiling; the backend refuses a request
+    /// whose page list is longer, rather than truncating it.
+    ///
+    /// Takes no argument even though the underlying op is
+    /// `KernelCall(envelope_dot, [query])`: the query it scores is the model's
+    /// projected query for this fire's last token, whose width
+    /// (`num_q_heads * head_dim`) is a backend constant PTIR has no extent for.
+    /// The declared query is therefore a HANDLE — the backend binds the real
+    /// row — and the DSL emits it rather than asking an author to invent a
+    /// width.
+    #[track_caller]
+    pub fn envelope_dot(p_max: u32) -> Tensor {
+        let query_ty = ValueType::new(Shape::vector(1), super::activation_type);
+        let query = emit(
+            Op::IntrinsicVal {
+                intr: IntrinsicId::Query,
+                shape: query_ty.shape,
+                dtype: query_ty.dtype,
+            },
+            &[query_ty],
+        );
+        let score_ty = ValueType::new(Shape::vector(p_max), DType::F32);
+        let name = intern_name("envelope_dot");
+        Tensor::node(
+            emit(
+                Op::KernelCall {
+                    name,
+                    args: vec![query],
+                    shape: score_ty.shape,
+                    dtype: score_ty.dtype,
+                },
+                &[score_ty],
+            ),
+            score_ty,
+        )
+    }
 
     /// `attn_page_mask(mask)` — a configuration sink (overview §6.1): this
     /// layer's attention consumes the page mask. Returns nothing. Recorded for
