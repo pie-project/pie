@@ -1,0 +1,157 @@
+{
+  "abi_version": 1,
+  "alignment": 256,
+  "tensors": [
+    {
+      "name": "language_model.backbone.layers.0.mixer.experts.up_proj.packed.weight",
+      "expr": {
+        "Cat": {
+          "axis": 0,
+          "parts": [
+            {
+              "Slice": {
+                "src": {
+                  "Src": "language_model.backbone.layers.0.mixer.experts.0.up_proj.weight"
+                },
+                "axis": 0,
+                "start": 2,
+                "len": 2,
+                "step": 1
+              }
+            },
+            {
+              "Slice": {
+                "src": {
+                  "Src": "language_model.backbone.layers.0.mixer.experts.1.up_proj.weight"
+                },
+                "axis": 0,
+                "start": 2,
+                "len": 2,
+                "step": 1
+              }
+            }
+          ]
+        }
+      },
+      "shape": [
+        4,
+        3
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      }
+    },
+    {
+      "name": "language_model.backbone.layers.0.mixer.experts.down_proj.packed.weight",
+      "expr": {
+        "Shard": {
+          "src": {
+            "Cat": {
+              "axis": 0,
+              "parts": [
+                {
+                  "Src": "language_model.backbone.layers.0.mixer.experts.0.down_proj.weight"
+                },
+                {
+                  "Src": "language_model.backbone.layers.0.mixer.experts.1.down_proj.weight"
+                }
+              ]
+            }
+          },
+          "axis": 1
+        }
+      },
+      "shape": [
+        6,
+        2
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      }
+    },
+    {
+      "name": "language_model.backbone.layers.0.mixer.experts.0.up_proj.weight",
+      "expr": {
+        "Slice": {
+          "src": {
+            "Out": "language_model.backbone.layers.0.mixer.experts.up_proj.packed.weight"
+          },
+          "axis": 0,
+          "start": 0,
+          "len": 2,
+          "step": 1
+        }
+      },
+      "shape": [
+        2,
+        3
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      }
+    },
+    {
+      "name": "language_model.backbone.layers.0.mixer.experts.1.up_proj.weight",
+      "expr": {
+        "Slice": {
+          "src": {
+            "Out": "language_model.backbone.layers.0.mixer.experts.up_proj.packed.weight"
+          },
+          "axis": 0,
+          "start": 2,
+          "len": 2,
+          "step": 1
+        }
+      },
+      "shape": [
+        2,
+        3
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      }
+    },
+    {
+      "name": "language_model.backbone.layers.0.mixer.experts.0.down_proj.weight",
+      "expr": {
+        "Slice": {
+          "src": {
+            "Out": "language_model.backbone.layers.0.mixer.experts.down_proj.packed.weight"
+          },
+          "axis": 0,
+          "start": 0,
+          "len": 3,
+          "step": 1
+        }
+      },
+      "shape": [
+        3,
+        2
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      }
+    },
+    {
+      "name": "language_model.backbone.layers.0.mixer.experts.1.down_proj.weight",
+      "expr": {
+        "Slice": {
+          "src": {
+            "Out": "language_model.backbone.layers.0.mixer.experts.down_proj.packed.weight"
+          },
+          "axis": 0,
+          "start": 3,
+          "len": 3,
+          "step": 1
+        }
+      },
+      "shape": [
+        3,
+        2
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      }
+    }
+  ]
+}

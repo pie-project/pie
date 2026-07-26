@@ -1,6 +1,7 @@
 #include "kernels/gated_delta_net.hpp"
 
 #include <cuda_bf16.h>
+#include <cstdint>
 #include <cstdlib>
 #include <map>
 #include <mutex>
@@ -1612,7 +1613,21 @@ __global__ void recurrent_step_batched_gqa_smem_kernel(
     //   R=1   19.7 -> 10.8 us      R=8   29.6 -> 16.1 us
     //   R=2   22.9 -> 11.7 us      R=64 138.0 -> 96.5 us
     // bf16 stays bf16 the whole way, so the staged values are identical.
-    {
+    // When one block covers the whole v axis, SMEM's [k][v] layout is
+    // byte-for-byte the HBM tile's, so staging is a flat copy -- and a flat
+    // copy can move 16 bytes per thread instead of 2. The scalar path below
+    // has each warp touch 32 adjacent bf16, a 64-byte transaction: half a
+    // cache line, and the reason this kernel sustained ~1100 GB/s where
+    // flashinfer's equivalent reaches ~1450 GB/s on the same shape.
+    const bool vec_tile =
+        (BV == V_d) && ((V_d & 7) == 0) &&
+        ((reinterpret_cast<std::uintptr_t>(state) & 15) == 0);
+    const int n_vec = (K_d * V_d) >> 3;
+    if (vec_tile) {
+        const uint4* __restrict__ src = reinterpret_cast<const uint4*>(state);
+        uint4* __restrict__ dst = reinterpret_cast<uint4*>(s_state);
+        for (int i = threadIdx.x; i < n_vec; i += BV) dst[i] = src[i];
+    } else {
         constexpr int kStageTile = 16;
         __nv_bfloat16 staged[kStageTile];
         int k = 0;
@@ -1654,9 +1669,23 @@ __global__ void recurrent_step_batched_gqa_smem_kernel(
         float s = __bfloat162float(s_state[k * BV + threadIdx.x]) * g_h
                 + sk[k] * delta;
         out_v += s * sq[k];
-        state[(long long)k * V_d + v_idx] = __float2bfloat16(s);
+        // Each thread owns column `threadIdx.x` for every k, so rewriting
+        // its own SMEM slot races with nothing. Costing a SMEM round trip
+        // to make the HBM store a flat vectorised copy is a good trade:
+        // the store is the second half of this kernel's HBM traffic.
+        if (vec_tile) {
+            s_state[k * BV + threadIdx.x] = __float2bfloat16(s);
+        } else {
+            state[(long long)k * V_d + v_idx] = __float2bfloat16(s);
+        }
     }
     out_bh[v_idx] = out_v;
+    if (vec_tile) {
+        __syncthreads();
+        const uint4* __restrict__ src = reinterpret_cast<const uint4*>(s_state);
+        uint4* __restrict__ dst = reinterpret_cast<uint4*>(state);
+        for (int i = threadIdx.x; i < n_vec; i += BV) dst[i] = src[i];
+    }
 }
 
 // Opt-in FLA-port path (PIE_QWEN35_GDN_FLA_STEP=1).

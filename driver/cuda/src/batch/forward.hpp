@@ -218,6 +218,12 @@ struct ForwardFn {
         bool is_pure_decode = false;
         bool have_custom_mask = false;
         int runtime_window_left = -2;
+        // Non-zero when this fire's PTIR programs read `AttnScore` and the
+        // prefill plan should therefore be built for the FA2 score-capturing
+        // dispatch. It has to be known at PREPARE time because that is where
+        // SM90-vs-FA2 is chosen, and only FA2 is instrumented. Zero on the
+        // paths that run no stage hooks.
+        std::uint32_t attn_score_window = 0;
     };
 
     // The arch implementation. context.cpp sets this once at construction;

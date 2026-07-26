@@ -23,6 +23,19 @@ struct StageHooks {
     // buffer nobody wrote.
     bool wants_attn_score = false;
 
+    // How many query rows at the TAIL of a prefill chunk are observed, when
+    // the fire is a prefill and `wants_attn_score` is set. Decode ignores it:
+    // a decode step has exactly one query row, so the window is 1 by
+    // construction.
+    //
+    // This is an observation parameter, not a policy one -- the same way
+    // "averaged over heads" is. It lives on the hooks because that is where
+    // "what this fire's programs need" is expressed; a future PTIR-declared
+    // window would be a one-line change at the construction site rather than a
+    // new plumbing path. `attn_score_window()` in attn_score.cu supplies the
+    // default (SnapKV's 32) and the `PIE_ATTN_SCORE_WINDOW` override.
+    std::uint32_t attn_score_window = 0;
+
     // The fire's PTIR programs write `attn_page_mask` at `OnAttnProj`, and the
     // model is expected to honour it by compacting its page table before the
     // attention call.

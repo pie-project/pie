@@ -881,7 +881,8 @@ void moe_layer(
                     kernels::launch_gather_moe_aligned_inputs_bf16(
                         ws.norm_x.data(), sorted_route_ids,
                         nem_ws.expert_in.data(), routes, offset,
-                        K, H, stream);
+                        K, H, /*shared_row_begin=*/-1,
+                        /*num_tokens=*/0, stream);
                     nem_ws.b_up_ptrs.copy_from_host(
                         std::span<const std::uint16_t* const>(
                             act_ptrs.data(), act_ptrs.size()));
@@ -969,7 +970,8 @@ void moe_layer(
                 kernels::launch_gather_moe_aligned_inputs_bf16(
                     ws.norm_x.data(), sorted_route_ids,
                     nem_ws.expert_in.data(), routes, aligned_rows,
-                    K, H, stream);
+                    K, H, /*shared_row_begin=*/-1,
+                    /*num_tokens=*/0, stream);
                 kernels::launch_build_nemotron_moe_ptrs_aligned_bf16(
                     expert_ids,
                     reinterpret_cast<const void* const*>(Lw.expert_up_ptrs.data()),
@@ -1075,7 +1077,8 @@ void moe_layer(
                     kernels::launch_gather_moe_aligned_inputs_bf16(
                         ws.norm_x.data(), nem_ws.expert_idx.data(),
                         nem_ws.expert_in.data(), N * K, routed_rows,
-                        K, H, stream);
+                        K, H, /*shared_row_begin=*/-1,
+                        /*num_tokens=*/0, stream);
                     nem_ws.b_up_ptrs.copy_from_host(
                         std::span<const std::uint16_t* const>(
                             act_ptrs.data(), act_ptrs.size()));

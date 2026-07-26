@@ -129,6 +129,11 @@ struct LlamaLikePlanState {
     ops::PrefillPlanCachePtr prefill_decode_plan;
     bool use_prefill_plan = false;
     bool use_prefill_decode_plan = false;
+    // Set when the prefill plan was built for the FA2 score-capturing
+    // dispatch. SM90-vs-FA2 is decided at PLAN time, so the body cannot
+    // decide to capture on its own -- it can only honour what the prepare
+    // hook already committed to.
+    std::uint32_t prefill_score_window = 0;
     bool use_xqa_decode = false;
     int xqa_max_pages_per_seq = 0;
     std::vector<std::uint32_t> prefill_decode_qo_indptr_h;
@@ -154,7 +159,11 @@ void prepare_llama_like_decode_plan(
     int total_tokens,
     int num_requests,
     bool is_pure_decode,
-    bool have_custom_mask);
+    bool have_custom_mask,
+    // Non-zero when the fire's PTIR programs read `AttnScore`; the prefill
+    // plan is then built for the FA2 score-capturing dispatch. Decided here
+    // and not in the body because SM90-vs-FA2 is a plan-time choice.
+    std::uint32_t attn_score_window = 0);
 
 std::uint32_t llama_like_decode_graph_layout(
     const LlamaLikePlanState& state);

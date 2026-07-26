@@ -79,6 +79,9 @@ FirePageMask::FirePageMask(bool wanted, cudaStream_t stream)
             reinterpret_cast<void**>(&out_indptr_), indptr_bytes, stream) ==
             cudaSuccess &&
         cudaMallocAsync(
+            reinterpret_cast<void**>(&counts_), lens_bytes, stream) ==
+            cudaSuccess &&
+        cudaMallocAsync(
             reinterpret_cast<void**>(&out_last_lens_), lens_bytes, stream) ==
             cudaSuccess;
     if (!allocated) {
@@ -86,9 +89,11 @@ FirePageMask::FirePageMask(bool wanted, cudaStream_t stream)
         if (out_indices_ != nullptr) cudaFreeAsync(out_indices_, stream);
         if (out_indptr_ != nullptr) cudaFreeAsync(out_indptr_, stream);
         if (out_last_lens_ != nullptr) cudaFreeAsync(out_last_lens_, stream);
+        if (counts_ != nullptr) cudaFreeAsync(counts_, stream);
         out_indices_ = nullptr;
         out_indptr_ = nullptr;
         out_last_lens_ = nullptr;
+        counts_ = nullptr;
         throw std::runtime_error(
             "attn_page_mask could not allocate its page buffers");
     }
@@ -104,6 +109,7 @@ FirePageMask::FirePageMask(bool wanted, cudaStream_t stream)
         cudaFreeAsync(out_indices_, stream);
         cudaFreeAsync(out_indptr_, stream);
         cudaFreeAsync(out_last_lens_, stream);
+        cudaFreeAsync(counts_, stream);
         sink_ = AttentionMaskSink{};
         out_indices_ = nullptr;
         out_indptr_ = nullptr;
@@ -140,7 +146,7 @@ void FirePageMask::compact(
             "attn_page_mask compaction and fire disagree on request count");
     }
     kernels::launch_compact_page_csr(
-        page_indices_d, page_indptr_d, last_page_lens_d, sink_.keep,
+        page_indices_d, page_indptr_d, last_page_lens_d, sink_.keep, counts_,
         sink_.stride, static_cast<int>(sink_.num_requests), out_indices_,
         out_indptr_, out_last_lens_, stream);
 }
@@ -152,6 +158,7 @@ FirePageMask::~FirePageMask() {
     if (out_indices_ != nullptr) cudaFreeAsync(out_indices_, stream_);
     if (out_indptr_ != nullptr) cudaFreeAsync(out_indptr_, stream_);
     if (out_last_lens_ != nullptr) cudaFreeAsync(out_last_lens_, stream_);
+    if (counts_ != nullptr) cudaFreeAsync(counts_, stream_);
     sink_ = AttentionMaskSink{};
     out_indices_ = nullptr;
     out_indptr_ = nullptr;

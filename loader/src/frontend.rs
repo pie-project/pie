@@ -9,16 +9,13 @@
 
 use std::collections::HashMap;
 
-use crate::arch::{RuntimeAbi, RuntimeTensorContract};
 use crate::checkpoint::{CheckpointMetadata, RawTensor};
 use crate::contract::compile::{Leaf, compile};
-use crate::contract::{Expr, Resolver, TensorType};
+use crate::contract::{Expr, ModelContract, Resolver, TensorContract, TensorType};
 use crate::error::CompileError;
 use crate::ir::{GatherDim, GatherPiece, LayoutExpr, LayoutPlan};
 use crate::load_plan::StorageTarget;
-use crate::types::{
-    DType, Encoding, ExprId, QuantScheme, Sharding, TensorDecl, TensorId, encoding_nbytes,
-};
+use crate::types::{DType, Encoding, ExprId, QuantScheme, TensorDecl, TensorId, encoding_nbytes};
 
 /// How many contiguous stretches one expression may break into before the
 /// compiler refuses to keep going.
@@ -31,7 +28,7 @@ const MAX_RUNS: usize = 1 << 20;
 
 pub fn plan_from_contracts(
     metadata: &CheckpointMetadata,
-    abi: &RuntimeAbi,
+    contract: &ModelContract,
     target: &StorageTarget,
 ) -> Result<LayoutPlan, CompileError> {
     let mut frontend = Frontend {
@@ -41,10 +38,20 @@ pub fn plan_from_contracts(
         resolver: Resolver::new(metadata),
         sources: HashMap::new(),
         values: HashMap::new(),
-        next_generated_tensor: abi.tensors.len() as u32,
+        alignment: contract.alignment.max(1),
+        next_generated_tensor: contract.tensors.len() as u32,
     };
-    for (index, contract) in abi.tensors.iter().enumerate() {
-        frontend.lower_contract(contract, TensorId(index as u32))?;
+    for (index, tensor) in contract.tensors.iter().enumerate() {
+        // Rejected here rather than left to collide downstream: two entries
+        // under one name would each publish a value and each be finalized, and
+        // the plan would carry a name that means two things.
+        if frontend.values.contains_key(&tensor.name) {
+            return Err(CompileError::InvalidInput(format!(
+                "the contract declares '{}' twice",
+                tensor.name
+            )));
+        }
+        frontend.lower_contract(tensor, TensorId(index as u32))?;
     }
     Ok(frontend.plan)
 }
@@ -58,19 +65,21 @@ struct Frontend<'a> {
     sources: HashMap<TensorId, ExprId>,
     /// The value each finished contract produced, by name.
     values: HashMap<String, ExprId>,
+    /// Byte alignment every materialized buffer must satisfy. A target
+    /// property, stated once on the contract rather than on every tensor.
+    alignment: u32,
     next_generated_tensor: u32,
 }
 
 impl Frontend<'_> {
     fn lower_contract(
         &mut self,
-        contract: &RuntimeTensorContract,
+        contract: &TensorContract,
         output_id: TensorId,
     ) -> Result<(), CompileError> {
-        let (mut current, mut current_decl) =
-            self.lower_source(contract, output_id).map_err(|err| {
-                CompileError::InvalidInput(format!("'{}': {err}", contract.output_name))
-            })?;
+        let (mut current, mut current_decl) = self
+            .lower_source(contract, output_id)
+            .map_err(|err| CompileError::InvalidInput(format!("'{}': {err}", contract.name)))?;
 
         current = self.lower_encoding_change(current, &mut current_decl, contract, output_id)?;
 
@@ -79,17 +88,15 @@ impl Frontend<'_> {
         // are simply stated on the realized declaration.
         let realized = TensorDecl {
             id: output_id,
-            name: contract.output_name.clone(),
+            name: contract.name.clone(),
             shape: current_decl.shape.clone(),
             encoding: contract.encoding.clone(),
-            layout: contract.layout.clone(),
-            sharding: current_decl.sharding,
-            alignment: contract.alignment,
+            alignment: self.alignment,
         };
 
-        self.values.insert(contract.output_name.clone(), current);
+        self.values.insert(contract.name.clone(), current);
         self.resolver.publish(
-            &contract.output_name,
+            &contract.name,
             TensorType {
                 shape: realized.shape.clone(),
                 encoding: realized.encoding.clone(),
@@ -97,7 +104,7 @@ impl Frontend<'_> {
         );
         let node = self.plan.push(LayoutExpr::Realize {
             input: current,
-            runtime_name: contract.output_name.clone(),
+            runtime_name: contract.name.clone(),
             decl: realized,
         });
         self.plan.outputs.push(node);
@@ -108,7 +115,7 @@ impl Frontend<'_> {
     /// the one escape hatch that is not affine.
     fn lower_source(
         &mut self,
-        contract: &RuntimeTensorContract,
+        contract: &TensorContract,
         output_id: TensorId,
     ) -> Result<(ExprId, TensorDecl), CompileError> {
         match &contract.expr {
@@ -124,12 +131,10 @@ impl Frontend<'_> {
                 let input = self.source_node(raw)?;
                 let decl = TensorDecl {
                     id: output_id,
-                    name: contract.output_name.clone(),
+                    name: contract.name.clone(),
                     shape: out.shape.clone(),
                     encoding: out.encoding.clone(),
-                    layout: contract.layout.clone(),
-                    sharding: contract.sharding,
-                    alignment: contract.alignment,
+                    alignment: self.alignment,
                 };
                 let node = self.plan.push(LayoutExpr::Repack {
                     input,
@@ -144,57 +149,28 @@ impl Frontend<'_> {
 
     fn lower_affine(
         &mut self,
-        contract: &RuntimeTensorContract,
+        contract: &TensorContract,
         output_id: TensorId,
     ) -> Result<(ExprId, TensorDecl), CompileError> {
-        let base = contract.expr.clone();
-        let base_type = self.resolver.infer(&base)?;
-        if base_type.shape != contract.shape {
+        // Sharding is resolved here and nowhere else: below this line the
+        // expression means the same thing on every rank.
+        let expr = self.resolver.specialize(
+            contract.expr.clone(),
+            self.target.tp_rank,
+            self.target.tp_size,
+            &contract.name,
+        )?;
+        let ty = self.resolver.infer(&expr)?;
+        // A declaration that declined to predict the shape has nothing to check
+        // here; one that predicted is held to it.
+        if let Some(declared) = &contract.shape
+            && ty.shape != *declared
+        {
             return Err(CompileError::InvalidInput(format!(
-                "declared shape {:?} does not match source shape {:?}",
-                contract.shape, base_type.shape
+                "'{}' declares shape {declared:?} but its expression yields {:?}",
+                contract.name, ty.shape
             )));
         }
-
-        let (expr, ty, sharding) = match contract.shard_axis.filter(|_| self.target.tp_size > 1) {
-            Some(axis) => {
-                let index = usize::from(axis.0);
-                let world = i64::from(self.target.tp_size);
-                if index >= base_type.shape.len() {
-                    return Err(CompileError::InvalidInput(format!(
-                        "'{}' has rank {} and cannot be partitioned on axis {}",
-                        contract.output_name,
-                        base_type.shape.len(),
-                        axis.0
-                    )));
-                }
-                if base_type.shape[index] % world != 0 {
-                    // Named, because this is the message a user gets for
-                    // "tp_size does not divide this model". The driver used to
-                    // pre-empt it with its own per-family divisibility table
-                    // over `config.json`, which was the same fact checked twice
-                    // and reachable only for the families someone had listed.
-                    return Err(CompileError::InvalidInput(format!(
-                        "'{}' has {} along axis {}, which tp_size {} does not \
-                         divide; use a tp_size that divides it or run single-GPU",
-                        contract.output_name, base_type.shape[index], axis.0, self.target.tp_size
-                    )));
-                }
-                let len = base_type.shape[index] / world;
-                let sharded = base.slice(axis.0, i64::from(self.target.tp_rank) * len, len);
-                let ty = self.resolver.infer(&sharded)?;
-                (
-                    sharded,
-                    ty,
-                    Sharding {
-                        axis: Some(axis),
-                        world: self.target.tp_size,
-                        rank: self.target.tp_rank,
-                    },
-                )
-            }
-            None => (base, base_type, contract.sharding),
-        };
 
         let lowering = compile(&expr, self.resolver.checked(), MAX_RUNS)?;
         if lowering.needs_zero_fill() {
@@ -220,12 +196,10 @@ impl Frontend<'_> {
 
         let decl = TensorDecl {
             id: output_id,
-            name: contract.output_name.clone(),
+            name: contract.name.clone(),
             shape: ty.shape.clone(),
             encoding: ty.encoding.clone(),
-            layout: contract.layout.clone(),
-            sharding,
-            alignment: contract.alignment,
+            alignment: self.alignment,
         };
         let node = self.plan.push(LayoutExpr::Gather {
             inputs,
@@ -256,7 +230,7 @@ impl Frontend<'_> {
         &mut self,
         input: ExprId,
         current_decl: &mut TensorDecl,
-        contract: &RuntimeTensorContract,
+        contract: &TensorContract,
         output_id: TensorId,
     ) -> Result<ExprId, CompileError> {
         if current_decl.encoding == contract.encoding {
@@ -273,7 +247,7 @@ impl Frontend<'_> {
                 if source.logical_dtype != dtype {
                     return Err(CompileError::InvalidInput(format!(
                         "runtime tensor '{}' requests raw {:?} from quantized {:?}",
-                        contract.output_name, dtype, source.logical_dtype
+                        contract.name, dtype, source.logical_dtype
                     )));
                 }
                 let mut decl = current_decl.clone();
@@ -289,7 +263,7 @@ impl Frontend<'_> {
             (Encoding::Raw(_), Encoding::Quant(target)) => {
                 let mut decl = current_decl.clone();
                 decl.id = output_id;
-                decl.name = contract.output_name.clone();
+                decl.name = contract.name.clone();
                 decl.encoding = Encoding::Quant(target.clone());
                 *current_decl = decl.clone();
                 let metadata_outputs = self.quant_metadata_outputs(contract, &decl);
@@ -319,7 +293,7 @@ impl Frontend<'_> {
 
     fn quant_metadata_outputs(
         &mut self,
-        contract: &RuntimeTensorContract,
+        contract: &TensorContract,
         quant_decl: &TensorDecl,
     ) -> Vec<TensorDecl> {
         let Encoding::Quant(spec) = &quant_decl.encoding else {
@@ -330,7 +304,7 @@ impl Frontend<'_> {
         }
         let (name, shape, encoding) = match spec.scheme {
             QuantScheme::Fp8E4M3 | QuantScheme::Int8Symmetric => (
-                format!("{}_scale_inv", contract.output_name),
+                format!("{}_scale_inv", contract.name),
                 vec![quant_decl.shape[0]],
                 Encoding::Raw(DType::F32),
             ),
@@ -344,7 +318,7 @@ impl Frontend<'_> {
                     return Vec::new();
                 }
                 (
-                    format!("{}_scale", contract.output_name),
+                    format!("{}_scale", contract.name),
                     vec![quant_decl.shape[0], cols / 32],
                     Encoding::Raw(DType::U8),
                 )
@@ -358,9 +332,7 @@ impl Frontend<'_> {
             name,
             shape,
             encoding,
-            layout: contract.layout.clone(),
-            sharding: quant_decl.sharding,
-            alignment: contract.alignment,
+            alignment: self.alignment,
         }]
     }
 
@@ -398,9 +370,7 @@ fn source_decl(raw: &RawTensor) -> TensorDecl {
         name: raw.name.clone(),
         shape: raw.shape.clone(),
         encoding: crate::types::normalize_encoding(&raw.encoding),
-        layout: raw.layout.clone(),
-        sharding: Sharding::replicated(),
-        alignment: raw.layout.alignment.max(1),
+        alignment: 1,
     }
 }
 

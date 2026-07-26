@@ -1,14 +1,14 @@
 # Model Contract Specification
 
-> **Status: implemented in Rust; the C++ half is not.** This specifies the
-> declaration format a driver hands to the loader. The algebra, its type
-> checker, its lowering, and all six of `loader/src/arch/`'s passes now run on
-> it; `RuntimeTensorSource` and the hand-computed byte spans it carried are
-> deleted. What has not moved is *authorship*: `arch/` still infers the
-> declaration from `model_type` rather than being handed one. See §9.
+> **Status: implemented, both halves.** This specifies the declaration format a
+> driver hands to the loader. The algebra, its type checker and its lowering run
+> on it, and as of `architecture.md` §12 row 12 phase 4 so does *authorship*:
+> `driver/common/include/pie_driver/model_contracts.hpp` writes the contract and
+> `loader/src/arch/` is deleted. The loader infers nothing from `model_type`
+> because it is never told one. See §9.
 >
-> This is the spec for step 7b of `architecture.md` §12. It is expected to
-> change as it is implemented; amend it in place rather than writing errata.
+> This is the spec for step 7b of `architecture.md` §12. Amend it in place rather
+> than writing errata.
 >
 > Citations of the form `path:line` refer to the current tree and exist to
 > ground each claim in evidence.
@@ -28,10 +28,11 @@ There is exactly one question that decides where this boundary goes:
 | **loader** | file layout, storage bandwidth, memory budget, DMA engine     | *how* the bytes get there    |
 | **either** | —                                                             | **neither needs the model family** |
 
-The last row is the load-bearing one. Today `loader/src/abi/arch.rs` carries a
-13-field `ArchProfile` keyed by `model_type`, and every field exists because one
-side had to guess something the other side knew. If the driver declares what it
-wants, there is nothing left to infer, and the table deletes.
+The last row is the load-bearing one. `loader/src/abi/arch.rs` used to carry a
+13-field `ArchProfile` keyed by `model_type`, and every field existed because one
+side had to guess something the other side knew. The driver declares what it
+wants now, so there is nothing left to infer, and the table is deleted — along
+with the rest of `arch/`.
 
 Two corollaries that fall out of the principle and are worth stating up front,
 because they kill concepts that look load-bearing:
@@ -61,7 +62,7 @@ credible if it covers all of them.
 | 2  | Rename                                        | `abi/metal.rs` `metal_qwen35_runtime_name`        |
 | 3  | Concat (q,k,v → qkv)                          | `abi/fusion.rs`, `Join { axis }`                  |
 | 4  | Split (qkv → q,k,v)                           | `abi/phi3.rs`, `ByteSpans`                        |
-| 5  | Tensor-parallel shard                         | `Sharding` + `shard_axis`                         |
+| 5  | Tensor-parallel shard                         | `Shard` (was `Sharding` + `shard_axis`)           |
 | 6  | Expert stack (`[I,H]`×E → `[E,2I,H]`)         | `abi/qwen_moe.rs` `add_qwen_moe_expert_stacks`    |
 | 7  | Nested shard-inside-concat                    | `abi/qwen_moe.rs` `add_fused_moe_gate_up_tp_slices` |
 | 8  | Strided select (even/odd rows)                | `RowMap::{Even,Odd}`                              |
@@ -96,12 +97,13 @@ Expr :=
   | Reshape(Expr, shape)                      -- row-major: a byte identity
   | Pad    (Expr, axis, before, after)
   | Bitcast(Expr, out: TensorType)             -- same bytes, different element type
+  | Shard  (Expr, axis)                       -- this rank's 1/world band; specialized away
   ---------------------------------------------- affine fragment ends here
   | Repack  (Expr, spec, out: TensorType)     -- escape hatch 1: hardware swizzle
   | Quantize(Expr, spec)                      -- escape hatch 2: arithmetic
 ```
 
-Seven constructors, plus two explicitly-labelled escape hatches.
+Eight constructors, plus two explicitly-labelled escape hatches.
 
 `Src` and `Out` are separate on purpose. A single `Ref` with a resolution order
 looks tidier, but contracts routinely re-publish checkpoint names — a bank plus
@@ -132,6 +134,21 @@ because once the element width changes, an element offset into a partial view
 denotes nothing: `Slice(e, 0, 3, 1)` before the cast and after it are different
 byte ranges, and no rule picks one.
 
+`Shard` is the one node whose meaning depends on the target, and the reason
+compilation has a *specialization* stage. A tensor-parallel band is a `Slice`
+(§2 case 5) but the author cannot write that `Slice`: its `start` is
+`rank * len`, so writing it directly would make the contract rank-dependent, and
+a contract that means something different on each of `world` ranks cannot be
+authored once. `Shard` says the *intent* — split this along that axis — and
+`Resolver::specialize` computes the arithmetic once per rank, before inference,
+after which no rank-dependence survives. Stated as a node rather than as a field
+beside the expression it also composes: a shard of one leg of a `Cat` (§2 case
+7) is expressible, which a whole-expression flag cannot say.
+
+The declared shape is therefore always the *rank's* shape, never the model's.
+There is no second convention to disambiguate, and it is what a driver actually
+receives.
+
 Coverage of §2:
 
 | Case                     | Expression                                         |
@@ -140,7 +157,7 @@ Coverage of §2:
 | 2 rename                 | not an expression — the name is a record field     |
 | 3 concat                 | `Cat`                                              |
 | 4 split                  | `Slice`                                            |
-| 5 TP shard               | `Slice(e, axis, rank*len, len)`                    |
+| 5 TP shard               | `Shard(e, axis)` → `Slice(e, axis, rank*len, len)`  |
 | 6 expert stack           | `Cat(0, [Reshape(e_i, [1,I,H]) for i])`            |
 | 7 nested                 | `Cat` ∘ `Slice` ∘ `Cat` — plain composition        |
 | 8 strided select         | `Slice(e, 0, 0, n, step=2)`                        |
@@ -320,7 +337,7 @@ pub struct ModelContract {
 }
 ```
 
-Four fields per tensor, down from nine in `RuntimeTensorContract`.
+Four fields per tensor, down from nine in the old `RuntimeTensorContract`.
 
 ### 4.1 Why `shape` is intentionally redundant
 
@@ -344,12 +361,13 @@ threads byte spans across the FFI, and it costs one `Vec<i64>` per tensor.
 | ------------------------------ | ------------------------------------------------------------- |
 | `dtype`                        | already in `Encoding::Raw(d)` / `Quant(spec).logical_dtype`    |
 | `metadata: Vec<TensorId>`      | never populated at any construction site; dead                 |
-| `layout.strides`               | always empty; `Layout::dense()` is the only constructor        |
-| per-tensor `alignment`         | always `target.preferred_alignment.max(1)`; hoisted to header  |
-| `sharding` + `shard_axis`      | a TP shard **is** a `Slice`                                    |
+| `layout` (the whole struct)    | **done** — one field (`alignment`), duplicated by `TensorDecl.alignment` and discarded at the FFI |
+| per-tensor `alignment`         | **done** — always `target.preferred_alignment.max(1)`; hoisted to `ModelContract.alignment` |
+| `sharding` + `shard_axis`      | **done** — a TP shard **is** a `Slice`; `Shard` states the intent, `specialize` writes the arithmetic |
 | `RuntimeTensorSource::SelectContract` | an `Out` ref — a DAG edge                               |
 | `RuntimeByteSpan` in the contract | now the compiler's *output*, not a driver's input           |
 | `consumed: HashSet` + pass order  | a declaration has no evaluation order                       |
+| `shape: Vec<i64>` → `Option`   | **done** — not a removal but a weakening, and the more useful one. A driver genuinely cannot predict the on-disk extents of a packed AWQ or GPTQ weight, which is why `contract_detail::LogicalShape` erased the shape whenever `hf.quant_method` was non-empty. Not stating it is now expressible, so the workaround is deleted and the check is `Some(declared)`-conditional rather than skipped by family. |
 
 ### 4.3 The DAG makes bank-and-view stop being a pattern
 
@@ -420,14 +438,14 @@ TensorContract::new("…v_proj.weight", Expr::src("…qkv_proj.weight").slice(0,
 
 | Deleted                                                       | Lines | Why                                                        |
 | ------------------------------------------------------------- | ----: | ---------------------------------------------------------- |
-| `loader/src/abi/arch.rs` — `ArchProfile`, 13 fields            |   174 | nothing left to infer from `model_type`                     |
+| `loader/src/abi/arch.rs` — `ArchProfile`, 13 fields            |   174 | **done** — nothing left to infer from `model_type`; `arch.rs` + `arch/` are deleted whole (2,110 lines) |
 | `skip_dense_qkv_fusion`                                        |     — | a C++ binder gap encoded as an architecture property        |
 | `phi3_fused_splits`                                            |    94 | the same declaration in the opposite direction              |
 | `bind_projection_or_fused_view` (C++)                          |    32 | views are published by the loader for free                  |
 | `mla_fused_joins`, `nemotron_packed_experts`, `stack_per_expert_moe`, `gpt_oss_mxfp4_groups`, `metal_qwen35` | ~900 | declarations, not inferences |
-| `Sharding`, `shard_axis`                                       |     — | a shard is a `Slice`                                        |
+| `Sharding`, `shard_axis`                                       |     — | **done** — a shard is a `Slice`, and `Shard` is the node that says so |
 | `SelectContract`                                               |     — | an `Out` ref is a DAG edge                                  |
-| `metadata`, `Layout.strides`, duplicated `alignment`           |     — | dead fields                                                 |
+| `metadata`, `Layout`, duplicated `alignment`                   |     — | **done** — dead fields; `alignment` is one header field now  |
 
 Most of `RepackSpec`'s 11 fields are absorbed by `Slice` / `Pad` / `Reshape`,
 leaving only the `layout` enum.
@@ -504,38 +522,39 @@ leaving only the `layout` enum.
 | The cost model and the DMA-vs-gather choice | **done** — `Lowering::cost`; `compile`'s `max_runs` is a compile-time guard, not the cost |
 | The HIGH IR node the fragment lowers to | **done** — `ir::LayoutExpr::Gather`; eight affine variants deleted with it |
 | Wiring the loader's frontend, optimizer, type checker, planner and evaluator onto it | **done** — `loader/tests/algebra.rs`, 13 tests |
-| Porting `arch/`'s six passes onto declarations | **done** — all six emit `Expr`; `RuntimeTensorSource`, `RuntimeByteSpan`, `SelectContract` and `frontend::bridge_expr` deleted |
-| Retiring the loader's `config.json` read | **done** — `PieLoaderModelSpec` on the request; both drivers fill it |
+| Porting `arch/`'s six passes onto declarations | **done** — all six emitted `Expr`, and then all six were deleted: with the contract stated, each was a way of computing an expression the contract already contains |
+| Retiring the loader's `config.json` read | **done** — the driver states the facts it needs as arguments to `author_model_contract`; `config.rs` and `parse_model_config` are deleted |
+| Moving *authorship* to C++ | **done** — `driver/common/include/pie_driver/model_contracts.hpp`; checked by diffing 2,240 plans and cache keys against the Rust author, 0 differences |
 | Checking a plan against the contract | **done** — `loader/src/verify.rs`, `verify(&PlanView, Option<&ContractView>)` |
 | Golden plans | **done** — `loader/tests/golden_plans.rs`, 10 plans across 4 architectures, 2 backends, 3 TP configs |
 | The loader as a tool | **done** — `loader/src/main.rs`: `dump · verify · diff · replay` |
-| C++ builder façade and the FFI shape | not started — see §9.2 |
+| C++ builder façade and the FFI shape | **done** — `loader/include/pie_loader/{model_contract,source_checkpoint}.hpp`; the contract crosses the ABI as a flat node arena, both ways (§9.2) |
 
-The record and the algebra are expected to keep moving while the remaining
-pieces are written. Amend this document in place.
+Amend this document in place.
 
-### 9.2 What the C++ façade is still for
+### 9.2 What the C++ façade is for
 
-With the passes ported and `config.json` retired, the loader no longer reads
-anything about the model from disk: the driver states the five facts it needs
-(`PieLoaderModelSpec`). What has *not* moved is the declaration itself. `arch/`
-still decides, from `model_type`, which tensors a model wants and in what shape,
-and that decision belongs to whoever knows which kernels will read them.
+The driver authors. `pie_loader::ModelContract`
+(`loader/include/pie_loader/model_contract.hpp`) is the builder —
+`define(name, expr).expect(shape)` plus a constructor per node — and
+`pie_driver::author_model_contract`
+(`driver/common/include/pie_driver/model_contracts.hpp`) is where the families
+live. The loader is handed the result and lowers it.
 
-The remaining evidence that this is the right end state is `ArchProfile`'s four
-layer-3 gates — `skip_dense_qkv_fusion`, `stack_per_expert_moe`,
-`phi3_fused_splits`, `metal_qwen35`. Each exists because a pass guesses at what
-the driver wants and the guess is wrong for some architecture. `fusion.rs`
-invents the name `...self_attn.qkv_proj.fused.weight` and hopes something binds
-it; `skip_dense_qkv_fusion` is the list of models where hoping failed. None of
-these survive a world where the driver names the tensor it intends to bind.
+`ArchProfile`'s four layer-3 gates are the evidence that this was the right end
+state, and they are gone with the rest of `arch/`. Each existed because a pass
+guessed at what the driver wanted and the guess was wrong for some architecture:
+`fusion.rs` invented the name `...self_attn.qkv_proj.fused.weight` and hoped
+something would bind it, and `skip_dense_qkv_fusion` was the list of models where
+hoping failed. None of them survive a world where the author names the tensor it
+intends to bind.
 
-Until then, the contract the loader authors is still a contract *someone*
-authored separately from the plan, which is why `verify`'s contract check is
-already worth running (§7): `arch/` and the `frontend → optimizer → planner`
-pipeline are different code, and a bug in the second cannot hide in the first.
-What it cannot yet catch is `arch/` and the driver disagreeing, because only one
-of them currently speaks.
+`verify`'s contract check keeps its meaning, and gains one. It was always worth
+running because the author and the `frontend → optimizer → planner` pipeline are
+different code, so a bug in the second cannot hide in the first. Now the two are
+in different *languages* and on opposite sides of the ABI — and the case it
+newly covers is §6.2's: a plan restored from an artifact another rank or another
+build wrote, checked against the contract this one authored.
 
 ### 9.1 How the lowering is trusted
 

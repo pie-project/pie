@@ -1290,3 +1290,576 @@ rainer.md's FCFS core, none is a cleanup-pass change):
   (c) accept 0.79x press as the FCFS-fairness price at 2x oversub.
 h2h's remaining 4% is the rows/wave occupancy (69 vs vLLM ~104) — the
 bounded small-ask-service-under-a-large-head idea, same design tier.
+
+## §18 The 33-case pie-vs-vLLM contention matrix (#30, 2026-07-26)
+
+User directive: benchmark pie's contention management against vLLM across
+many workload shapes and contention levels (>= 30 cases), and profile
+anything that loses badly or hangs.
+
+Environment: one RTX 4090, Qwen3-0.6B, tp=1, greedy (temperature 0),
+`ignore_eos`, prefix caching OFF on both engines, pie @ `61a678bf1`
+(= origin/dev, Rainer v1 + §17 fixes), vLLM 0.22.0 / torch 2.11.0+cu130.
+Raw records: session `files/run1` (33 cases), `run2` (repeat sample),
+`trace/`, `adm-P1092/`.
+
+### §18.1 Methodology fix: the budgets are now token-for-token identical
+
+Every prior comparison sized the two engines by *calibrating* a memory
+fraction (pie util 0.26 vs vLLM 0.217, "0.9% apart"). That slack is the
+same order as several of the effects being measured. Both engines are now
+driven by an exact block count instead:
+
+| engine | knob | result |
+|---|---|---|
+| pie  | driver option `total_pages = P` (16 tok/page) | `kv_tokens = 16P` |
+| vLLM | `num_gpu_blocks_override = P`, `block_size = 16` | `GPU KV cache size: 16P tokens` |
+
+Verified at P=2151: both report **34,416 tokens**. Harness knobs added:
+`benches/pie_bench.py --total-pages/--swap-pool-size` (§10 trap 2/3 — the
+shipped harness could not express a KV cap at all) and
+`benches/vllm_bench.py --num-gpu-blocks-override/--block-size`.
+
+Oversubscription **X = concurrency x (prompt + max_tokens) / 16P**.
+
+### §18.2 The matrix
+
+33 cases, one sample each (8 re-sampled in `run2`). **No hangs, no
+timeouts.**
+
+**Spread — corrected 2026-07-26 (§18.11).** The original claim here ("vLLM
+<0.5%, pie <0.4% at parity cells") was an artefact of `run1` and `run2`
+landing in the same regime. Controlled re-measurement found the roomy
+cells are **bimodal by ~10% on the shipped tree**: A1 15.3-17.2K, A2
+15.5-16.8K, on BOTH the baseline and the modified build. Treat any
+single-sample per-case delta below ~10% on A1/A2 as noise.
+
+| id | X | conc | nreq | out | pie tok/s | vLLM tok/s | ratio |
+|---|---|---|---|---|---|---|---|
+| A1 | 0.5x | 128 | 256 | 512 | 17,193 | 17,194 | **1.000x** |
+| A2 | 1.0x | 128 | 256 | 512 | 16,822 | 17,042 | 0.987x |
+| A3 | 1.5x | 128 | 256 | 512 | 13,041 | 15,000 | 0.869x |
+| A4 | 2.0x | 128 | 256 | 512 | 11,618 | 14,257 | 0.815x |
+| A5 | 3.0x | 128 | 256 | 512 | 9,509 | 12,462 | 0.763x |
+| A6 | 4.0x | 128 | 256 | 512 | 8,486 | 11,220 | 0.756x |
+| A7 | 8.0x | 128 | 256 | 512 | 5,962 | 7,815 | 0.763x |
+| B1 | 0.25x | 16 | 256 | 512 | 5,255 | 5,170 | 1.017x |
+| B2 | 0.5x | 32 | 256 | 512 | 9,058 | 9,135 | 0.992x |
+| B3 | 1.0x | 64 | 256 | 512 | 12,352 | 13,001 | 0.950x |
+| B4 | 1.5x | 96 | 256 | 512 | 11,803 | 14,126 | 0.836x |
+| B5 | 3.0x | 192 | 256 | 512 | 11,436 | 14,783 | 0.774x |
+| B6 | 4.0x | 256 | 256 | 512 | 11,732 | 14,471 | 0.811x |
+| C1 | 2.0x | 64 | 128 | 128 | 10,123 | 13,405 | 0.755x |
+| C2 | 2.0x | 64 | 128 | 1024 | 6,719 | 7,808 | 0.860x |
+| C3 | 2.0x | 64 | 128 | 32 | 2,230 | 2,429 | 0.918x |
+| C4 | 2.0x | 64 | 128 | 512 | 3,257 | 4,240 | 0.768x |
+| C5 | 2.0x | 64 | 128 | 512 | 8,556 | 8,910 | 0.960x |
+| C6 | 2.0x | 64 | 128 | 128 | 4,646 | 5,193 | 0.895x |
+| D1 | 4.0x | 64 | 128 | 128 | 6,210 | 8,005 | 0.776x |
+| D2 | 4.0x | 64 | 128 | 1024 | 4,733 | 6,101 | 0.776x |
+| D3 | 4.0x | 64 | 128 | 32 | 1,892 | 2,008 | 0.942x |
+| D4 | 4.0x | 64 | 128 | 512 | 2,762 | 3,475 | 0.795x |
+| D5 | 4.0x | 64 | 128 | 512 | 5,422 | 6,362 | 0.852x |
+| D6 | 4.0x | 64 | 128 | 128 | 3,277 | 3,731 | 0.878x |
+| E1 | 4.0x | 256 | 256 | 512 | 11,209 | 14,426 | 0.777x |
+| E2 | 2.0x | 128 | 512 | 512 | 10,946 | 14,706 | 0.744x |
+| E3 | 2.0x | 64 | 1024 | 512 | 7,902 | 11,209 | **0.705x** |
+| E4 | 2.0x | 256 | 512 | 512 | 12,178 | 16,944 | 0.719x |
+| F1 | idle | 1 | - | 512 | 483 | 491 | 0.984x |
+| F2 | 13.7x | 16 | 32 | 512 | 654 | 796 | 0.821x (+ **31/32**) |
+| F3 | 2.0x | 32 | 64 | 2048 | 3,605 | 4,061 | 0.888x |
+| F4 | 2.0x | 128 | 128 | 512 | 13,578 | 14,042 | **0.967x** |
+
+C/D shapes: 1 short/short, 2 short/long, 3 long-prompt/short-gen,
+4 long/long, 5 mixed-phase, 6 prefix-heavy. 17 of 33 cells below 0.85x,
+8 at parity, zero wins.
+
+### §18.3 The gap tracks CHURN, not pressure
+
+The A-sweep reads like a pressure curve, but the controlled experiment says
+otherwise. Same budget (P=2184), same offered concurrency (128), same
+shape — **only the number of requests varies**, i.e. how many times the
+fleet turns over:
+
+| nreq | refills | tok/s | ratio | evictions | evict/req | pages moved | pages/req |
+|---|---|---|---|---|---|---|---|
+| 128 (F4) | 0 | 13,578 | **0.967x** | 66 | 0.52 | 2,678 | 20.9 |
+| 256 (A4) | 1 | 11,618 | 0.815x | 399 | 1.56 | 12,495 | 48.8 |
+| 512 (E2) | 3 | 10,946 | 0.744x | 776 | 1.52 | 25,392 | 49.6 |
+
+(throughput from `run1`; counters from matched `PIE_CONTENTION_TRACE_MS=500`
+re-runs, which cost ~8% themselves.)
+
+**A single oversubscribed wave is nearly free — 0.967x at 2x oversub.** The
+price is paid by *arrivals into a full pool*: one refill triples evictions
+per request and more than doubles pages moved per request. E3 (1024 req,
+the most turnover in the matrix) is the worst cell at 0.705x.
+
+### §18.4 What the ledger shows: a 70-page round trip to deliver 1 page
+
+E3 traced, final sample (67 s run, 1,024 requests):
+
+```
+queue=31 head_pages=1 head_kind=allocation accum=4 free=0/1092 host_free=3744/4096
+parks=19651 serves=18744 evictions=1608 restores=1588 evict_rollbacks=0
+d2h_pages=26668 h2d_pages=26316 d2h_ms=3462 h2d_ms=5906 resident=56 evicted=20
+```
+
+- `free=0/1092` in **every** sample: the pool is pinned at zero.
+- `head_pages=1 head_kind=allocation` dominates: the head is a decode
+  crossing a page boundary and needing **one** page.
+- To supply it the planner evicts a whole working set (26,668 D2H pages /
+  1,608 evictions = **16.6 pages per eviction**), and that victim then
+  re-queues for a full restore (1,588 restores). **~33 pages of PCIe
+  traffic move to hand one page to the head** (52,984 pages / 1,608
+  evict-restore cycles = 32.9; a victim evicted at full length costs
+  ~70, but the measured average victim is mid-flight).
+- Total 52,984 pages moved against 35,840 pages of real demand
+  (1,024 x 35) = **1.48 pages copied per page of KV actually wanted**, and
+  9.4 s of copy time inside a 67 s run.
+- `evict_rollbacks=0`, `restore_failures=0`, `hogs=0`: the machinery is
+  working exactly as designed. This is the design's cost, not a defect.
+
+vLLM does **zero** of this. Its scheduler holds the surplus at the door:
+A6 logs `Running: 48 reqs, Waiting: 34 reqs, GPU KV cache usage: 98.8%`,
+A7 `Running: 24, Waiting: 107, usage: 100.0%`, with no preemption lines at
+all. It never commits KV it cannot sustain, so it never has to move any.
+
+### §18.5 The mechanism: contention collapses pie's run-ahead overlap
+
+Pie's throughput is `rows_per_batch / wall_per_batch`. Comparing the
+harness's own batch accounting against wall time across the A-sweep
+(`total batches`, `total requests`, `avg batch latency us`, `wall`):
+
+| case | X | rows/batch | batch latency | wall/batch | overlap |
+|---|---|---|---|---|---|
+| A1 | 0.5x | 128.0 | 13.78 ms | 7.44 ms | **185%** |
+| A2 | 1.0x | 123.3 | 13.14 ms | 7.33 ms | 179% |
+| A3 | 1.5x | 92.6 | 8.65 ms | 7.10 ms | 122% |
+| A4 | 2.0x | 85.1 | 6.95 ms | 7.32 ms | 95% |
+| A5 | 3.0x | 61.2 | 5.61 ms | 6.44 ms | 87% |
+| A6 | 4.0x | 48.8 | 4.75 ms | 5.75 ms | **83%** |
+| A7 | 8.0x | 24.9 | 3.72 ms | 4.17 ms | 89% |
+
+Roomy, pie keeps ~1.85 batches in flight (the Venus run-ahead) and ties
+vLLM to four digits. Under contention the overlap falls below 1.0: the GPU
+waits between batches. Every page-boundary crossing parks its lane, and the
+lane cannot submit its next fire until an eviction has physically landed —
+so the eviction latency, not the kernel, sets the cadence.
+
+Head to head at P=1092 the two engines run *the same batch width* and pie
+is still 37% slower per step:
+
+| | rows/step | wall/step | tok/s |
+|---|---|---|---|
+| pie (conc 128) | 49.0 | 6.10 ms | 8,043 |
+| vLLM (self-limited to 50 running) | 50 | 4.45 ms | 11,226 |
+
+### §18.6 It is NOT over-admission — pie's own optimum is still 0.78x
+
+The obvious hypothesis is that pie admits 128 where vLLM admits 48, so
+capping admission would close the gap. Measured, it does not. Admission
+sweep at P=1092 (resident capacity ~31 requests at full length), vLLM given
+the full 128 offered load for reference:
+
+| pie conc | 16 | 24 | 31 | 40 | **48** | 64 | 96 | 128 |
+|---|---|---|---|---|---|---|---|---|
+| tok/s | 5,133 | 7,190 | 8,243 | 8,586 | **8,770** | 8,456 | 8,042 | 8,043 |
+
+vLLM, same budget, full offered load: **11,226**.
+
+Pie's best achievable throughput at this budget, over every admission
+level, is 8,770 = **0.78x** of what vLLM gets. Admission tuning is worth
++9% (8,043 -> 8,770); the remaining 22% is the residency mechanism itself.
+This kills tuning as a fix and confirms §17.1's reading: the cost is the
+evict/restore **rotation**, and rotation is what FCFS-by-spawn requires
+whenever a younger process must fund an older head.
+
+Corollary for the shape cells: the losses are worst where working sets are
+large relative to the budget and turn over fast (C1/D1 short-short 0.755x /
+0.776x, C4/D4 long/long 0.768x / 0.795x) and mildest where each request
+holds its pages only briefly (C3/D3 long-prompt/short-gen 0.918x / 0.942x)
+or where half the fleet is short-lived (C5 mixed-phase 0.960x).
+
+### §18.7 F2 — a request is failed loud, and the message named the wrong cause
+
+F2 is the extreme edge: P=40 pages (640 tokens) against a 546-token
+request, concurrency 16 (X = 13.65x). vLLM completes 32/32. **Pie drops a
+request in 4 of 7 runs** — intermittent, race-dependent:
+
+```
+decode frame submit: pipeline: KV capacity: KV pool starved under host swap
+exhaustion: 1 pages asked, 0 free of 40, no swap room to evict into, ...
+```
+
+The message is wrong. The traced failure shows `host_free=4069/4096` — the
+host swap pool was **99.3% empty**. The real state at the kill:
+
+```
+queue=2 head_pages=17 head_kind=restore accum=9 free=0/40 resident=1 evicted=2
+```
+
+One resident holds the pool; the head is a 17-page restore. `plan_eviction`
+builds its candidate set from `proc.seq > head_seq && Resident &&
+progressed` — the FCFS anti-thrash rule, which forbids evicting anyone
+**older** than the head. The sole page-holder is older, so `picks` is empty,
+and the fall-through calls `check_starvation`, which fails the youngest
+parked allocation loud. `PlannerError::Starved`'s `Display` hardcoded
+"under host swap exhaustion" for *both* of `check_starvation`'s callers,
+so it misattributed a policy wedge to a resource exhaustion.
+
+**Fixed** (`runtime/engine/src/planner.rs`): a `StarveCause`
+(`NoSwapRoom` | `NoEligibleVictim`) is threaded from each caller into the
+error and the `tracing::warn!`. The same failure now reports:
+
+```
+KV pool starved: 1 pages asked, 0 free of 40, no evictable victim — every
+page is held by a process OLDER than the head, which FCFS anti-thrash
+forbids evicting, and no fire in flight anywhere to complete and free pages
+```
+
+Diagnostics only — no policy change. Lib tests 343/343.
+
+The underlying behaviour was a **real gap**: when the budget is near one
+working set, pie's ordering reached a state with no legal move and
+destroyed a request, where vLLM simply serializes and completes all of
+them. Root-caused and fixed in §18.9.
+
+### §18.8 Standing summary
+
+- **Parity is real and reproducible** at or below capacity (A1 1.000x,
+  A2 0.987x, B1 1.017x, B2 0.992x, F1 0.984x) and for a single
+  oversubscribed wave (F4 0.967x). Pie's kernels and batching are not the
+  problem.
+- **The contended deficit is 0.70-0.82x**, driven by fleet turnover, not by
+  pressure level; it plateaus at ~0.76x beyond 3x oversub.
+- **The cause is rotation economics**, quantified: 1.48 pages of PCIe
+  traffic per page of demand, ~33 pages moved per 1-page head, and a
+  run-ahead overlap that falls 185% -> 83%.
+- **Not fixable by admission control** (best case 0.78x) — it is the design
+  question §17.1 already framed, now with a measured ceiling on the tuning
+  branch.
+- The three directions from §17.1 (organic-frees-only restores; restore
+  chunking; accept the FCFS price) are unchanged.
+- **F2's request destruction is fixed** (§18.9); the throughput gap is not.
+
+
+## §18.9 F2 root cause: E6 hysteresis in the liveness path (#31, 2026-07-26)
+
+§18.7 recorded the symptom (a request destroyed in 4 of 7 F2 runs) and
+corrected the message. This is the mechanism and the fix.
+
+### The wedge, captured
+
+Instrumenting the no-pick fall-through and the kill decision
+(`PIE_CONTENTION_TRACE_MS`, both trace-gated) caught the state exactly:
+
+```
+NOPICK head_seq=32 deficit=1 procs: older_or_head=1 nonresident=0
+       not_progressed=1 eligible_but_quoted_zero=0
+
+WEDGE-KILL cause=NoEligibleVictim
+  queue=[31:alloc:need=1, 32:restore:need=12, 33:alloc:need=1]
+  procs=[32:Evicted:prog=true, 31:Resident:prog=true, 33:Resident:prog=false]
+```
+
+The head asks for **one page**. The only resident younger than the head
+(seq 33) holds the pool, and is excluded solely by E6 — `progressed=false`.
+
+**Why the veto never lifts.** `progressed` is cleared when a restore lands
+and is set only inside `acquire` (`note_progress` /
+`note_ask_and_check_elder`). A process that is restored and then parks on
+an unmet ask never reaches another `acquire` — it is waiting for pages —
+so its veto is permanent. Meanwhile it is the only thing that could fund
+the head. Circular, and `check_starvation` reads the circle as "no
+completion can ever arrive" and destroys the youngest ask.
+
+E6 is documented as **hysteresis** ("one line of membership hysteresis: a
+restored member stays a member until one fire completes", rainer.md §14),
+while rainer.md §15 requires "no timers, no knobs, no heuristics **in any
+liveness path**". E6 sitting where it can force a destruction violates
+that criterion on the design's own terms.
+
+### The fix, and the wrong version of it first
+
+**Wrong version (recorded because the failure mode is instructive):** relax
+E6 whenever the normal candidate set yields no picks. `picks` comes up
+empty *routinely* — 15,139 times in one 30 s F2 run — so relaxation fired
+593 times, and phase 3's own `!proc.progressed` re-validation then
+silently rejected every relaxed pick. Result: a **livelock**, throughput
+654 -> 49 tok/s and 29/32 completed. Worse than the bug.
+
+**Landed version:** E6 relaxation is the last rung *before* destruction,
+gated on the wedge predicate itself:
+
+- the wedge test is extracted to `ResidencyPlanner::is_wedged()` so the
+  relaxation rung and `check_starvation` cannot disagree on what "wedged"
+  means;
+- `plan_eviction` collects eligible and E6-vetoed candidates separately;
+  on an empty pick it runs `check_hog`, and only if `is_wedged()` holds
+  does it re-quote the E6-vetoed set;
+- an `e6_relaxed` flag threads to phase 3 so the re-validation accepts the
+  relaxed pick (this is what the wrong version missed);
+- counter `e6_relaxations`, surfaced in the sampler line as `e6_relax=`.
+
+Anti-thrash is untouched: victims are still strictly younger than the head
+and still Resident. Only E6's hysteresis yields, and only in the state that
+would otherwise destroy a request.
+
+### Verification
+
+| | F2 completed 32/32 | tok/s |
+|---|---|---|
+| before | **3 of 7 runs** | 654 |
+| naive relaxation | 1 of 2 (livelock) | 49 |
+| landed fix | **25 of 26 runs** | 563-665 (unchanged) |
+
+`e6_relax` fires 0-2 times per F2 run. Under normal contention it fires
+**zero** times: a traced E3 run (1,024 req, 1,679 evictions, 1,663
+restores) reports `e6_relax=0 starved=0`. The rung is inert outside the
+endgame, which is why throughput is unmoved:
+
+| case | pre s1 | pre s2 | post-fix | |
+|---|---|---|---|---|
+| A1 | 17,193 | 17,220 | 17,161 | in band |
+| A4 | 11,618 | 10,867 | 11,534 | in band |
+| A6 | 8,486 | 7,689 | 8,145 | in band |
+| B3 | 12,352 | 12,368 | 12,727 | in band |
+| C1 | 10,123 | 10,440 | 10,352 | in band |
+| E2 | 10,946 | 10,605 | 10,592 | in band |
+| E3 | 7,902 | 7,877 | 7,592 / 7,840 / 7,737 | in band (4% spread) |
+| F4 | 13,578 | 13,539 | 13,489 | in band |
+
+Lib tests 343/343 and the full `--tests` suite green. One integration
+test had to move with the message: `contention_host_full`'s
+`host_swap_exhaustion_kills_a_victim_without_wedging_the_fleet` asserted
+on the literal `"host swap exhaustion"`. That case sets `cpu_pages = 0`,
+so it is genuinely `StarveCause::NoSwapRoom`; it now asserts on
+`"no host swap room to evict into"`. (It is worth noting that a `--lib`
+run does NOT catch this — the message assertions live in `--test`
+targets.) `planner.rs` rustfmt diffs 10 -> 7 (all remaining pre-existing).
+
+### Residual: a second, rarer wedge class
+
+One of the 26 runs still failed, in a **different** state — both processes
+`prog=true`, so E6 was not involved:
+
+```
+WEDGE-KILL cause=NoEligibleVictim
+  queue=[32:alloc:need=1, 33:alloc:need=1]
+  procs=[33:Resident:prog=true, 32:Resident:prog=true]
+```
+
+Root-caused in §18.10 — and the guess in this paragraph was wrong: the
+victim's quote was not `Nothing` at all.
+
+
+## §18.10 The residual 1-in-26: a stale candidate snapshot (#32, 2026-07-26)
+
+§18.9 left one failure in 26. Two more repros were captured with the
+per-process `ReclaimQuote` dump, and they were **two different states** —
+neither matching the §18.9 guess that the victim was unreclaimable:
+
+**Repro A** (E6-vetoed victim, healthy quote):
+```
+procs  = [33:Resident prog=FALSE, 32:Resident prog=true]
+quotes = [33:Pages(19), 32:Pages(21)]
+head   = 32:alloc need=1
+```
+**Repro B** (ordinary victim, healthy quote, E6 not involved at all):
+```
+head   = 19:alloc need=1
+19: Resident prog=true  quote=Pages(27)   (the head itself)
+20: Resident prog=true  quote=Pages(13)   <- eligible by every rule
+21,22,23: Evicted (AllSwapped); 24-33: Resident, HoldsNothing
+```
+In both, a victim younger than the head sat there holding double-digit
+reclaimable pages while the planner destroyed a request for want of ONE.
+
+### Root cause: the kill is decided on a snapshot nobody re-read
+
+`plan_eviction` samples the candidate set in phase 1, releases the lock to
+quote (quoting takes store locks), and only much later reaches
+`check_starvation`. A process that was `Evicting` or `Restoring` at sample
+time is in **neither** the eligible nor the E6-vetoed list — and
+`is_wedged()` is false while anything is in transit, so the §18.9
+relaxation rung, gated on that same predicate, correctly declined to fire.
+Then the transfer lands, the process becomes `Resident` holding its pages,
+`is_wedged()` flips true, and `check_starvation` kills — using a candidate
+scan taken before that process existed as a candidate.
+
+§18.9 fixed only the E6 half of this (repro A) and only from the stale
+snapshot; repro B shows the same gap swallowing an *ordinary* candidate,
+which E6 relaxation could never have reached.
+
+### Fix
+
+`ResidencyPlanner::last_resort_evict()` — invoked from `check_starvation`
+immediately before the kill, re-reading the process table **at that
+instant**:
+
+1. ordinary candidates (E6 honoured) — no hysteresis is spent if a
+   normally-eligible victim exists;
+2. E6-vetoed candidates — hysteresis yields rather than let a request die.
+
+Eligibility is otherwise unchanged (strictly younger than the head, still
+Resident), so FCFS anti-thrash — the real safety property — is untouched.
+Phase 3 was extracted to `commit_evictions()` so the mark/yield/spawn step
+is shared by both entry points.
+
+**Gated on `cause == NoEligibleVictim`.** Under `NoSwapRoom` there is
+nowhere to evict *into*: a pick would be marked `Evicting`, fail in the
+executor, roll back, and repeat forever. Running the rung unconditionally
+made `contention_host_full` spin until its 10 s timeout — which is what
+earns the `StarveCause` distinction added in §18.7 its keep.
+
+### Verification
+
+| build | F2 completed 32/32 |
+|---|---|
+| pre-§18.9 | 3 of 7 |
+| §18.9 | 25 of 26 |
+| §18.10 | **45 of 45** |
+
+- `last-resort-evict` fires **0** times under normal contention (traced E3,
+  1,024 req, ~1,200 evictions): the rung is inert outside the endgame.
+- Throughput, 3 samples per case, post-fix vs the three pre-fix samples:
+  A1 17,192-17,237 (pre 17,161-17,220), A4 11,178-11,439 (10,867-11,618),
+  A6 8,146-8,545 (7,689-8,486), B3 12,404-12,724 (12,352-12,727),
+  C1 10,227-10,615 (10,123-10,440), E2 10,509-10,573 (10,592-10,946),
+  F4 13,536-13,583 (13,489-13,578), E3 7,598-7,786 (7,592-7,902). In band
+  everywhere.
+- Full `--tests` suite green (343 lib + 43 integration).
+
+**One observed hang was NOT this change.** A traced E3 run wedged with the
+seal watchdog (`frame k=1 lanes=64 awaited=64 sealed=0 pending_binds=2`),
+planner uninvolved (`starved=0 e6_relax=0`, last-resort 0). Controlled
+A/B — engine changes stashed, harness kept — gives **0 hangs in 5 traced
+E3 runs on the baseline and 0 in 5 on the fixed build**. It is the
+pre-existing intermittent seal-path wedge (§1b, #15 class), not a
+regression; it is not reproducible at this rate and remains open.
+
+### What is still open
+
+- The throughput gap (§18.3-§18.6) is untouched by any of this.
+- The seal-watchdog wedge above.
+- The starvation rung itself remains reachable in principle: if no victim
+  younger than the head holds reclaimable pages at the kill instant, a
+  request still dies. No such state has been observed since the fix, but
+  nothing proves it unreachable — the FCFS "never evict your senior" rule
+  is what leaves the possibility open, and only the §17.1 (a) redesign
+  removes it structurally.
+
+## §19 Design consequences → `rainer_v3.md` (2026-07-26)
+
+The defects in §18.7–§18.10 were not four unrelated bugs. Three of the
+four (and the §1 livelock and §12 deadlock before them) are one class:
+**a decision taken on state that was already stale when it was acted on.**
+`last_resort_evict()` (§18.10) is a hand-rolled emulation of the one
+property that fixes the class — re-read a consistent snapshot at the
+instant of an irreversible decision — which is exactly what `rainer.md`
+v2's single-writer boundary pass provides structurally.
+
+That changes v2's standing. `rainer.md` §10 parked it as "a robustness
+refactor ... not a rewrite justified by throughput". The throughput half
+of that verdict still holds (§18.4 says the contended gap is rotation
+economics, which v2 reduces but does not remove). The robustness half was
+weighed against no evidence; there is evidence now — three destroyed
+requests and one self-inflicted livelock, in one session, all in that seam.
+
+`rainer_v3.md` records the full argument plus the three defects v2 does
+NOT address:
+
+1. **Liveness and policy share one funnel, enforced by nothing.** §15's
+   "no heuristics in any liveness path" is prose; E6 sat there until it
+   destroyed requests. Proposal: make it a type — an exact `VictimSet`
+   from the boundary pass that only endgame predicates may consume, and
+   an `Ordering` over it that heuristics may reorder but never empty.
+2. **`ReclaimQuote` conflates a durable fact with a transient one.**
+   `pages()` returns 0 for every `Nothing` variant, and `check_hog` reads
+   it as "pages held" — so a head holding 39 pages reads as holding 0 the
+   moment one in-flight pin overlaps, the hog predicate never fires, and
+   the starvation rung destroys the innocent youngest instead. Code-evident,
+   **not yet reproduced at runtime**. It is the same collapse `NoReclaim`'s
+   own doc comment warns about, one level down: the *reason* was split into
+   variants, the *quantity* is still overloaded.
+3. **The eviction unit is not the ask unit.** §18.4 measured it: a 1-page
+   head funded by a whole-working-set evict + restore, ~33 pages moved per
+   page delivered (32.9 measured; ~70 for a full-length victim).
+   §17.1(b) is promoted from a lever to the central structural change,
+   because that is where the gap physically is.
+
+Suggested order (each independently landable): the `ReclaimQuote` accessor
+split first (small, local, removes a latent request-destroying bug), then
+the typed liveness boundary, then v2's boundary pass, then divisible
+residency — the only item that moves 0.70–0.82x.
+
+## §18.11 Two benchmarking traps found while gating the v3 work (2026-07-26)
+
+Both were caught by A/B-ing the engine changes against the stashed tree
+(engine files stashed, harness kept), and both had already produced a false
+alarm before being identified.
+
+**Trap 1 — preceding GPU load.** A full 33-case matrix run (`run3`) started
+after ~40 minutes of continuous benchmarking reported pie's roomy A1 at
+15,636 vs `run1`'s 17,193 (-9.1%), while vLLM in the same run was
+unchanged. Rested re-measurement of the SAME build gave 17,145-17,175 over
+five runs. The matrix is sensitive to what ran before it; per-case deltas
+across differently-conditioned runs are not comparable. Compare only
+runs taken from a comparable state, or A/B back to back.
+
+**Trap 2 — engine-level regime bistability, ~10%.** The roomy cells are
+bimodal, and it is NOT a property of this branch:
+
+| case | baseline (stashed) | with §3.1-§3.3 |
+|---|---|---|
+| A1 | 17,124 / 17,192 / 17,124 / 17,168 / 17,205 | 17,145-17,175 (5) |
+| A2 | 16,750 / 16,637 / **15,482** | 15,263 / 16,658 |
+| C5 | 7,424 / 7,423 / 7,549 | **7,680 / 7,706** |
+
+A2 straddles ~15.5K and ~16.8K on both builds. C5's apparent -11.7% in
+`run3` inverts under controlled comparison — the modified build is 2-3%
+FASTER than baseline, and `run1`'s 8,556 was the outlier.
+
+This is the engine-level instance of what `rainer.md` L3 calls performance
+resting "on a stable accident" and what its §15 promises v2 would remove
+("regime bistability is eliminated, not won"). It had been characterised
+for inferlets (A10, synthid) but not, as far as this record goes, for
+engine roomy throughput. **Consequence for every future comparison: a
+single-sample roomy delta under ~10% carries no information.**
+
+Verdict for the v3 work: **no regression.** Controlled 5-vs-5 on A1 and
+3-vs-3 on A2/C5 put the modified build at or above baseline everywhere.
+
+## §18.12 Standing state after the v3 work (2026-07-26)
+
+Landed, each independently gated:
+
+| item | effect | evidence |
+|---|---|---|
+| §18.7 `StarveCause` | the starvation error names its real cause | reproduced live |
+| §18.9 E6 out of the liveness path | F2 3/7 → 25/26 | + a rejected naive version that livelocked (654→49 tok/s) |
+| §18.10 kill decided at the kill instant | F2 → 45/45 | two repros, two different wedge classes |
+| v3 §3.3 `held_pages` / `ReclaimQuote::pages()` deleted | a latent hog under-count removed, misuse now unrepresentable | unit test on the pin divergence |
+| v3 §3.2 `VictimSet` | E6 is a tag, never a filter | — |
+| v3 §3.1 step 1: atomic endgame snapshot | the stale-snapshot seam closed for the endgame | F2 20/20 |
+| v3 §8.5: elder bypass deleted (−23) | one ordering rule gone, free | A4/A6/E3 in band, F2 12/12 |
+
+Final verification, all at once: full suite **344 lib + 43 integration**,
+**F2 15/15**, throughput **in band on 8 cases** against a 7-sample band,
+`planner.rs` rustfmt diffs unchanged from baseline (7).
+
+Rejected after measurement — recorded so nobody re-does them:
+- **v3 §3.4** divisible residency / declared intent (user decision; sign
+  uncertain, g4 counter-evidence, large mechanism).
+- **§8.4** funding-batch: +35 lines, zero throughput change on
+  A4/A6/E3/E2 — the bottleneck is eviction latency, not port round trips.
+- The naive E6 relaxation (§18.9) and the asker-last ordering (§17.1 g5).
+
+Not attempted: v2's boundary pass proper. §8.5 records why the sequencing
+is worse than it looks — membership push alone deletes nothing, and the
+117 deletable lines arrive only with the full funding model, indivisibly.
+
+The contended **0.70-0.82x vs vLLM stands untouched** and is accepted cost
+(§17.1(c)). Nothing in this session's work was aimed at it, and §18.6
+showed the tuning branch tops out at 0.78x.

@@ -152,6 +152,48 @@ pub(crate) fn kv_lease_quiescent(pid: uuid::Uuid, model: usize, driver: usize) -
 /// same question `prepare_suspend` answers, so victim selection and eviction
 /// execution cannot disagree; a zero answer carries the reason.
 ///
+/// The per-process KV working sets on `(model, driver)`, gathered WITHOUT
+/// touching the KV store lock.
+///
+/// Split out of [`kv_reclaim_quotes`] so a caller that needs an atomic
+/// decision can gather here first and then take the store lock itself:
+/// `RESIDENCIES` is acquired *before* the KV lock everywhere in the tree,
+/// and taking them the other way round would invert that order.
+pub(crate) fn kv_working_sets_for(
+    pids: &[uuid::Uuid],
+    model: usize,
+    driver: usize,
+) -> Vec<Option<HashSet<WorkingSetId>>> {
+    let residencies = RESIDENCIES.read().unwrap();
+    pids.iter()
+        .map(|pid| {
+            let residency = residencies.get(pid)?.upgrade()?;
+            let residency = residency.lock().unwrap();
+            Some(
+                residency
+                    .kv_working_sets
+                    .keys()
+                    .filter_map(|&(m, d, ws)| (m == model && d as usize == driver).then_some(ws))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+/// Quote `working_sets` against an ALREADY-LOCKED store, keeping the result
+/// positional with the `pids` the sets came from.
+pub(crate) fn quote_locked(
+    kv: &crate::store::kv::KvStore,
+    working_sets: Vec<Option<HashSet<WorkingSetId>>>,
+) -> Vec<Option<ReclaimQuote>> {
+    let known: Vec<HashSet<WorkingSetId>> = working_sets.iter().flatten().cloned().collect();
+    let mut quotes = kv.reclaim_quotes(&known).into_iter();
+    working_sets
+        .into_iter()
+        .map(|entry| entry.and(quotes.next()))
+        .collect()
+}
+
 /// `None` for a process that is unknown or already tearing down — that is
 /// "no opinion", distinct from a quote of "frees nothing".
 pub(crate) fn kv_reclaim_quotes(
@@ -159,37 +201,11 @@ pub(crate) fn kv_reclaim_quotes(
     model: usize,
     driver: usize,
 ) -> Vec<Option<ReclaimQuote>> {
-    let working_sets: Vec<Option<HashSet<WorkingSetId>>> = {
-        let residencies = RESIDENCIES.read().unwrap();
-        pids.iter()
-            .map(|pid| {
-                let residency = residencies.get(pid)?.upgrade()?;
-                let residency = residency.lock().unwrap();
-                Some(
-                    residency
-                        .kv_working_sets
-                        .keys()
-                        .filter_map(|&(m, d, ws)| {
-                            (m == model && d as usize == driver).then_some(ws)
-                        })
-                        .collect(),
-                )
-            })
-            .collect()
-    };
+    let working_sets = kv_working_sets_for(pids, model, driver);
     let Some(stores) = crate::store::registry::try_get(model, driver) else {
         return vec![None; pids.len()];
     };
-    // Quote only the known candidates, then splice the answers back so the
-    // result stays positional with `pids`.
-    let known: Vec<HashSet<WorkingSetId>> = working_sets.iter().flatten().cloned().collect();
-    let mut quotes = crate::store::registry::with_kv_lock(&stores.kv, "planner", |kv| {
-        kv.reclaim_quotes(&known).into_iter()
-    });
-    working_sets
-        .into_iter()
-        .map(|entry| entry.and(quotes.next()))
-        .collect()
+    crate::store::registry::with_kv_lock(&stores.kv, "planner", |kv| quote_locked(kv, working_sets))
 }
 
 #[cfg(test)]

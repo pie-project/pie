@@ -1798,16 +1798,15 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
         load_plan = compile_load_plan(
             cfg.snapshot_dir,
             metal_device_target(),
-            pie_loader::ModelFacts{
+            pie_driver::ModelFacts{
                 .model_type = cfg.model_type,
                 .quant_method = cfg.quant_method,
                 .num_hidden_layers = cfg.num_hidden_layers,
                 .num_experts = cfg.num_experts,
-                .num_experts_per_tok = cfg.num_experts_per_tok,
             },
             cfg.runtime_quant,
             cfg.mxfp4_moe,
-            pie_loader::PieLoaderComponent::Full);
+            pie_driver::Component::Full);
     } catch (const std::exception& error) {
         if (err != nullptr) {
             *err = std::string("LoadPlan compile failed: ") + error.what();

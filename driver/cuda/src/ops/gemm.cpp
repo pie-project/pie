@@ -1745,4 +1745,60 @@ void gemm_batched_act_x_w(
     unsupported("gemm_batched_act_x_w", act_dtype, w_dtype, y_dtype);
 }
 
+
+void mla_absorb_q_to_latent_bf16(
+    cublasHandle_t handle,
+    const void* q_nope, const void* kv_b_proj, void* q_latent,
+    int tokens, int heads, int qk_nope_dim, int v_head_dim, int kv_lora_rank)
+{
+    if (tokens <= 0 || heads <= 0) return;
+    const float alpha = 1.f, beta = 0.f;
+    // Row-major C[T, kv_lora] = A[T, nope] @ B[nope, kv_lora] per head, written
+    // column-major as C^T = B^T @ A^T.
+    const auto status = cublasGemmStridedBatchedEx(
+        handle, CUBLAS_OP_N, CUBLAS_OP_N,
+        /*m=*/kv_lora_rank, /*n=*/tokens, /*k=*/qk_nope_dim,
+        &alpha,
+        /*A=*/kv_b_proj, CUDA_R_16BF, /*lda=*/kv_lora_rank,
+        /*strideA=*/static_cast<long long>(qk_nope_dim + v_head_dim) * kv_lora_rank,
+        /*B=*/q_nope, CUDA_R_16BF, /*ldb=*/heads * qk_nope_dim,
+        /*strideB=*/qk_nope_dim,
+        &beta,
+        /*C=*/q_latent, CUDA_R_16BF, /*ldc=*/heads * kv_lora_rank,
+        /*strideC=*/kv_lora_rank,
+        /*batchCount=*/heads,
+        bf16_compute_type(), CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        throw std::runtime_error("mla_absorb_q_to_latent_bf16: cuBLAS failed");
+    }
+}
+
+void mla_absorb_latent_to_v_bf16(
+    cublasHandle_t handle,
+    const void* attn_latent, const void* kv_b_proj, void* attn_v,
+    int tokens, int heads, int qk_nope_dim, int v_head_dim, int kv_lora_rank)
+{
+    if (tokens <= 0 || heads <= 0) return;
+    const float alpha = 1.f, beta = 0.f;
+    const auto* wv = static_cast<const __nv_bfloat16*>(kv_b_proj) +
+                     static_cast<long long>(qk_nope_dim) * kv_lora_rank;
+    // Row-major C[T, v_dim] = A[T, kv_lora] @ W[v_dim, kv_lora]^T per head.
+    const auto status = cublasGemmStridedBatchedEx(
+        handle, CUBLAS_OP_T, CUBLAS_OP_N,
+        /*m=*/v_head_dim, /*n=*/tokens, /*k=*/kv_lora_rank,
+        &alpha,
+        /*A=*/wv, CUDA_R_16BF, /*lda=*/kv_lora_rank,
+        /*strideA=*/static_cast<long long>(qk_nope_dim + v_head_dim) * kv_lora_rank,
+        /*B=*/attn_latent, CUDA_R_16BF, /*ldb=*/heads * kv_lora_rank,
+        /*strideB=*/kv_lora_rank,
+        &beta,
+        /*C=*/attn_v, CUDA_R_16BF, /*ldc=*/heads * v_head_dim,
+        /*strideC=*/v_head_dim,
+        /*batchCount=*/heads,
+        bf16_compute_type(), CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        throw std::runtime_error("mla_absorb_latent_to_v_bf16: cuBLAS failed");
+    }
+}
+
 }  // namespace pie_cuda_driver::ops

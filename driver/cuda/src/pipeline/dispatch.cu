@@ -1234,6 +1234,23 @@ struct Dispatch::Impl {
     cudaEvent_t publications_done = nullptr;
     bool publications_recorded = false;
     std::vector<BoundInstance::CommitSnapshot> available_commit_snapshots;
+    // Backing storage for `available_commit_snapshots`. Snapshots are two
+    // words each, but they were allocated ONE PER INSTANCE, and each
+    // `cudaHostAlloc` page-locks and maps a fresh page: 128 fresh lanes cost a
+    // measured ~47ms of `begin_pass_a` on the fleet's first decode wave (steady
+    // state is 17us). They are carved out of these slabs instead, so a whole
+    // fleet costs two allocations. Snapshots therefore do NOT own their memory
+    // — only these slabs are freed.
+    std::vector<void*> commit_snapshot_device_slabs;
+    std::vector<void*> commit_snapshot_host_slabs;
+    // Private, non-blocking stream for seeding commit snapshots. The seed used
+    // to be a blocking `cudaMemcpy`, which orders against the LEGACY DEFAULT
+    // STREAM — so seeding the first decode wave's 128 lanes blocked the
+    // submitting thread until the still-running prefill finished. That was the
+    // entire measured 47ms `begin_pass_a` spike. A fresh (or quiesced,
+    // recycled) snapshot is referenced by no launched kernel, so seeding it off
+    // to the side and waiting only for that copy is both correct and free.
+    cudaStream_t commit_seed_stream = nullptr;
     // W4 exit reaper: a closed instance's resources may only be reclaimed
     // after its callback fence drains and its publication events settle —
     // waits that used to run ON THE LANE, serializing every exit close
@@ -2475,10 +2492,15 @@ Dispatch::~Dispatch() {
     for (cudaEvent_t event : impl_->available_launch_events) {
         if (event != nullptr) CUDA_CHECK(cudaEventDestroy(event));
     }
-    for (const BoundInstance::CommitSnapshot& snapshot :
-         impl_->available_commit_snapshots) {
-        if (snapshot.device != nullptr) CUDA_CHECK(cudaFree(snapshot.device));
-        if (snapshot.host != nullptr) CUDA_CHECK(cudaFreeHost(snapshot.host));
+    for (void* slab : impl_->commit_snapshot_device_slabs) {
+        if (slab != nullptr) CUDA_CHECK(cudaFree(slab));
+    }
+    for (void* slab : impl_->commit_snapshot_host_slabs) {
+        if (slab != nullptr) CUDA_CHECK(cudaFreeHost(slab));
+    }
+    if (impl_->commit_seed_stream != nullptr) {
+        CUDA_CHECK(cudaStreamDestroy(impl_->commit_seed_stream));
+        impl_->commit_seed_stream = nullptr;
     }
     for (std::size_t index = 0; index < 2; ++index) {
         if (impl_->group_streams[index] != nullptr) {
@@ -2551,101 +2573,127 @@ void release_launch_event(Dispatch::Impl& s, cudaEvent_t event) {
     cudaEventDestroy(event);
 }
 
+// Carve a slab's worth of commit snapshots into the pool. Each snapshot is
+// two words, but neighbouring lanes write theirs concurrently from both host
+// and device, so they are spread `kCommitSnapshotStride` bytes apart (one
+// device cache line) rather than packed — packing them would trade the
+// allocation cost for false sharing on the settle path.
+constexpr std::size_t kCommitSnapshotStride = 128;
+constexpr std::size_t kCommitSnapshotChunk = 256;
+
+void refill_commit_snapshot_pool(Dispatch::Impl& owner) {
+    static_assert(
+        BoundInstance::CommitSnapshot::kWords * sizeof(std::uint32_t) <=
+            kCommitSnapshotStride,
+        "commit snapshot does not fit its stride");
+    const std::size_t bytes = kCommitSnapshotStride * kCommitSnapshotChunk;
+
+    void* device_slab = nullptr;
+    CUDA_CHECK(cudaMalloc(&device_slab, bytes));
+    try {
+        owner.commit_snapshot_device_slabs.push_back(device_slab);
+    } catch (...) {
+        cudaFree(device_slab);
+        throw;
+    }
+
+    // Same mapped-host preference as before, just once per slab instead of
+    // once per instance.
+    static const bool try_mapping = [] {
+        int device = 0;
+        cudaDeviceProp properties{};
+        if (cudaGetDevice(&device) != cudaSuccess ||
+            cudaGetDeviceProperties(&properties, device) != cudaSuccess) {
+            static_cast<void>(cudaGetLastError());
+            return false;
+        }
+        return properties.canMapHostMemory != 0 &&
+               std::getenv("PIE_CUDA_DISABLE_MAPPED_COMMITS") == nullptr;
+    }();
+
+    void* host_slab = nullptr;
+    void* host_device_slab = nullptr;
+    if (try_mapping) {
+        const cudaError_t status = cudaHostAlloc(
+            &host_slab, bytes, cudaHostAllocMapped | cudaHostAllocPortable);
+        if (status != cudaSuccess) {
+            static_cast<void>(cudaGetLastError());
+            host_slab = nullptr;
+        } else if (cudaHostGetDevicePointer(&host_device_slab, host_slab, 0) !=
+                   cudaSuccess) {
+            static_cast<void>(cudaGetLastError());
+            cudaFreeHost(host_slab);
+            host_slab = nullptr;
+            host_device_slab = nullptr;
+        }
+    }
+    if (host_slab == nullptr) {
+        CUDA_CHECK(cudaMallocHost(&host_slab, bytes));
+        host_device_slab = nullptr;
+    }
+    try {
+        owner.commit_snapshot_host_slabs.push_back(host_slab);
+        owner.available_commit_snapshots.reserve(
+            owner.available_commit_snapshots.size() + kCommitSnapshotChunk);
+    } catch (...) {
+        cudaFreeHost(host_slab);
+        throw;
+    }
+
+    auto* device_base = static_cast<std::byte*>(device_slab);
+    auto* host_base = static_cast<std::byte*>(host_slab);
+    auto* host_device_base = static_cast<std::byte*>(host_device_slab);
+    for (std::size_t i = 0; i < kCommitSnapshotChunk; ++i) {
+        const std::size_t offset = i * kCommitSnapshotStride;
+        BoundInstance::CommitSnapshot snapshot{};
+        snapshot.device =
+            reinterpret_cast<std::uint32_t*>(device_base + offset);
+        snapshot.host = reinterpret_cast<std::uint32_t*>(host_base + offset);
+        snapshot.host_device =
+            host_device_base == nullptr
+                ? nullptr
+                : reinterpret_cast<std::uint32_t*>(host_device_base + offset);
+        owner.available_commit_snapshots.push_back(snapshot);
+    }
+}
+
 BoundInstance::CommitSnapshot& commit_snapshot(
     Dispatch::Impl& owner,
     BoundInstance& bound,
     std::size_t index) {
     while (bound.commit_snapshots.size() <= index) {
-        BoundInstance::CommitSnapshot snapshot{};
-        if (!owner.available_commit_snapshots.empty()) {
-            snapshot = owner.available_commit_snapshots.back();
-            owner.available_commit_snapshots.pop_back();
+        if (owner.available_commit_snapshots.empty()) {
+            refill_commit_snapshot_pool(owner);
         }
+        BoundInstance::CommitSnapshot snapshot =
+            owner.available_commit_snapshots.back();
+        owner.available_commit_snapshots.pop_back();
         // A pooled word still holds the previous instance's verdict, and a
-        // freshly mapped one holds nothing at all. Either way this snapshot
+        // freshly carved one holds nothing at all. Either way this snapshot
         // carries no information about any wave until a pull-validate seeds
         // it, so no reader may treat its contents as a verdict.
         snapshot.ever_validated = false;
-        try {
-            if (snapshot.device == nullptr) {
-                CUDA_CHECK(cudaMalloc(
-                    reinterpret_cast<void**>(&snapshot.device),
-                    BoundInstance::CommitSnapshot::kWords *
-                        sizeof(std::uint32_t)));
-            }
-            if (snapshot.host == nullptr) {
-                int device = 0;
-                cudaDeviceProp properties{};
-                CUDA_CHECK(cudaGetDevice(&device));
-                CUDA_CHECK(cudaGetDeviceProperties(
-                    &properties, device));
-                const bool try_mapping =
-                    properties.canMapHostMemory != 0 &&
-                    std::getenv(
-                        "PIE_CUDA_DISABLE_MAPPED_COMMITS") == nullptr;
-                if (try_mapping) {
-                    const cudaError_t host_status = cudaHostAlloc(
-                        reinterpret_cast<void**>(&snapshot.host),
-                        BoundInstance::CommitSnapshot::kWords *
-                            sizeof(std::uint32_t),
-                        cudaHostAllocMapped | cudaHostAllocPortable);
-                    if (host_status != cudaSuccess &&
-                        host_status != cudaErrorNotSupported) {
-                        CUDA_CHECK(host_status);
-                    }
-                    if (host_status == cudaErrorNotSupported) {
-                        static_cast<void>(cudaGetLastError());
-                    }
-                }
-                if (snapshot.host != nullptr) {
-                    const cudaError_t mapping_status =
-                        cudaHostGetDevicePointer(
-                            reinterpret_cast<void**>(
-                                &snapshot.host_device),
-                            snapshot.host,
-                            0);
-                    if (mapping_status != cudaSuccess) {
-                        cudaFreeHost(snapshot.host);
-                        snapshot.host = nullptr;
-                        snapshot.host_device = nullptr;
-                        if (mapping_status != cudaErrorNotSupported &&
-                            mapping_status != cudaErrorInvalidValue) {
-                            CUDA_CHECK(mapping_status);
-                        }
-                        static_cast<void>(cudaGetLastError());
-                    }
-                }
-                if (snapshot.host == nullptr) {
-                    CUDA_CHECK(cudaMallocHost(
-                        reinterpret_cast<void**>(&snapshot.host),
-                        BoundInstance::CommitSnapshot::kWords *
-                            sizeof(std::uint32_t)));
-                }
-            }
-            // W1.6 reads this word at PREPARE, i.e. before the fire's own
-            // pull-validate runs, so it is really the PREVIOUS fire's commit.
-            // A ring index used for the first time has no previous fire — the
-            // host's bind-time seeds are its predecessor — so it starts READY.
-            // Recycled snapshots carry a retired instance's value and must be
-            // re-seeded for the same reason.
-            const std::uint32_t seed[BoundInstance::CommitSnapshot::kWords] = {
-                1u, 0u};
-            CUDA_CHECK(cudaMemcpy(
-                snapshot.device,
-                seed,
-                sizeof(seed),
-                cudaMemcpyHostToDevice));
-            std::memcpy(snapshot.host, seed, sizeof(seed));
-            bound.commit_snapshots.push_back(snapshot);
-        } catch (...) {
-            if (snapshot.host != nullptr) {
-                cudaFreeHost(snapshot.host);
-            }
-            if (snapshot.device != nullptr) {
-                cudaFree(snapshot.device);
-            }
-            throw;
+        // W1.6 reads this word at PREPARE, i.e. before the fire's own
+        // pull-validate runs, so it is really the PREVIOUS fire's commit.
+        // A ring index used for the first time has no previous fire — the
+        // host's bind-time seeds are its predecessor — so it starts READY.
+        // Recycled snapshots carry a retired instance's value and must be
+        // re-seeded for the same reason.
+        const std::uint32_t seed[BoundInstance::CommitSnapshot::kWords] = {
+            1u, 0u};
+        if (owner.commit_seed_stream == nullptr) {
+            CUDA_CHECK(cudaStreamCreateWithFlags(
+                &owner.commit_seed_stream, cudaStreamNonBlocking));
         }
+        CUDA_CHECK(cudaMemcpyAsync(
+            snapshot.device,
+            seed,
+            sizeof(seed),
+            cudaMemcpyHostToDevice,
+            owner.commit_seed_stream));
+        CUDA_CHECK(cudaStreamSynchronize(owner.commit_seed_stream));
+        std::memcpy(snapshot.host, seed, sizeof(seed));
+        bound.commit_snapshots.push_back(snapshot);
     }
     return bound.commit_snapshots[index];
 }
@@ -2685,12 +2733,9 @@ void reclaim_bound_instance(
             }
         }
         if (!retained) {
-            if (snapshot.device != nullptr) {
-                CUDA_CHECK(cudaFree(snapshot.device));
-            }
-            if (snapshot.host != nullptr) {
-                CUDA_CHECK(cudaFreeHost(snapshot.host));
-            }
+            // Slab-carved (see `refill_commit_snapshot_pool`): the snapshot
+            // owns nothing, so dropping it past the pool cap just leaks its
+            // slot back to no one. The slabs are freed with the Impl.
         }
         snapshot = {};
     }
@@ -3561,48 +3606,52 @@ GroupedLaneEnvelope resolve_lane_envelope(
     if (page_end < page_begin) {
         throw std::runtime_error("envelope_dot saw a malformed kv page CSR");
     }
-    const std::uint32_t page_count = page_end - page_begin;
+    // A BOUND, not the count. It sizes the result row; the kernel takes the
+    // real count from the device CSR. See `GroupedLaneEnvelope`.
+    const std::uint32_t page_bound = page_end - page_begin;
     const std::uint32_t page_size =
         static_cast<std::uint32_t>(view.page_size);
+    const std::uint32_t qo_len =
+        obs->qo_indptr_h[request + 1] - obs->qo_indptr_h[request];
 
-    // `kv_last_page_lens` is POST-append (see `write_kv_kernel`), so the KV
-    // length this fire will END at is derivable, and subtracting the fire's own
-    // tokens gives the length the envelopes currently describe. Only pages
-    // entirely below that are final.
-    std::uint32_t scored_pages = 0;
-    if (page_count > 0) {
-        const std::uint32_t kv_after =
-            (page_count - 1) * page_size + obs->kv_last_page_lens_h[request];
-        const std::uint32_t qo_len =
-            obs->qo_indptr_h[request + 1] - obs->qo_indptr_h[request];
-        const std::uint32_t kv_before =
-            kv_after >= qo_len ? kv_after - qo_len : 0u;
-        scored_pages = std::min(kv_before / page_size, page_count);
-    }
     if (const char* dbg = std::getenv("PIE_QUEST_DEBUG"); dbg && *dbg == '1') {
+        // The fire's request count, reported once per new maximum. A test that
+        // wants to prove the R>1 path was exercised has no other way to see it:
+        // co-batching is a scheduling outcome, not something a program asks for.
+        static std::atomic<int> seen_requests{0};
+        int prev = seen_requests.load(std::memory_order_relaxed);
+        while (obs->num_requests > prev &&
+               !seen_requests.compare_exchange_weak(prev, obs->num_requests)) {
+        }
+        if (obs->num_requests > prev) {
+            std::fprintf(stderr, "[quest] R_max=%d\n", obs->num_requests);
+        }
         static std::atomic<int> shots{0};
         if (shots.fetch_add(1) < 4) {
             std::fprintf(stderr,
-                "[quest] req=%d layer=%u tok_start=%u tok_count=%u "
-                "page_begin=%u page_count=%u page_size=%u last_len=%u "
-                "qo=[%u,%u] scored=%u kv_heads=%d head_dim=%d qcols=%u\n",
-                request, layer, lane.token_start, lane.token_count,
-                page_begin, page_count, page_size,
-                obs->kv_last_page_lens_h[request],
+                "[quest] req=%d/%d layer=%u tok_start=%u tok_count=%u "
+                "page_begin(bound)=%u page_bound=%u page_size=%u "
+                "qo=[%u,%u] kv_heads=%d head_dim=%d qcols=%u\n",
+                request, obs->num_requests, layer, lane.token_start,
+                lane.token_count, page_begin, page_bound, page_size,
                 obs->qo_indptr_h[request], obs->qo_indptr_h[request + 1],
-                scored_pages, view.num_kv_heads, view.head_dim, query_columns);
+                view.num_kv_heads, view.head_dim, query_columns);
         }
     }
 
     return GroupedLaneEnvelope{
-        .env_min = view.k_env_min,
-        .env_max = view.k_env_max,
+        .env_min = reinterpret_cast<const __nv_bfloat16*>(view.k_env_min),
+        .env_max = reinterpret_cast<const __nv_bfloat16*>(view.k_env_max),
         .query = query_base +
             static_cast<std::size_t>(lane.token_start + lane.token_count - 1) *
                 query_columns,
-        .page_ids = obs->kv_page_indices_d + page_begin,
-        .page_count = page_count,
-        .scored_pages = scored_pages,
+        .page_ids = obs->kv_page_indices_d,
+        .page_indptr = obs->kv_page_indptr_d,
+        .last_page_lens = obs->kv_last_page_lens_d,
+        .request = static_cast<std::uint32_t>(request),
+        .qo_len = qo_len,
+        .page_size = page_size,
+        .page_bound = page_bound,
         .num_q_heads =
             query_columns / static_cast<std::uint32_t>(view.head_dim),
         .num_kv_heads = static_cast<std::uint32_t>(view.num_kv_heads),

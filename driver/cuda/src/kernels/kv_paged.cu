@@ -840,6 +840,18 @@ void launch_write_kv_explicit_bf16(
             layer.head_dim);
     }
     CUDA_CHECK(cudaGetLastError());
+    // Quest maintenance rides this append too. The CSR-derived path in
+    // `launch_write_kv_to_pages` cannot be reused: there is no page list here,
+    // only the per-token descriptor the program wrote. Opt-in on
+    // `has_envelopes()`, same stream, so the refresh is ordered after the
+    // write it describes.
+    if (layer.has_envelopes() && !layer.hnd_layout) {
+        launch_envelope_merge_written_bf16(
+            static_cast<const std::uint16_t*>(k_curr),
+            w_page, w_off, row_valid, layer.k_env_min, layer.k_env_max,
+            B, layer.num_kv_heads, layer.head_dim, stream);
+        CUDA_CHECK(cudaGetLastError());
+    }
 }
 
 void launch_copy_kv_cells_bf16(

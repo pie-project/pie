@@ -1,0 +1,209 @@
+{
+  "abi_version": 1,
+  "alignment": 256,
+  "tensors": [
+    {
+      "name": "model.embed_tokens.weight",
+      "expr": {
+        "Src": "model.embed_tokens.weight"
+      },
+      "shape": [
+        256,
+        256
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      }
+    },
+    {
+      "name": "model.layers.0.input_layernorm.weight",
+      "expr": {
+        "Src": "model.layers.0.input_layernorm.weight"
+      },
+      "shape": [
+        256
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      }
+    },
+    {
+      "name": "model.layers.0.self_attn.q_proj.weight",
+      "expr": {
+        "Src": "model.layers.0.self_attn.q_proj.weight"
+      },
+      "shape": [
+        256,
+        256
+      ],
+      "encoding": {
+        "Quant": {
+          "scheme": "AwqInt4",
+          "logical_dtype": "BF16",
+          "bits_per_element": 4,
+          "group_size": 32,
+          "channel_axis": null,
+          "scale_dtype": "BF16",
+          "zero_point_dtype": null,
+          "block_shape": []
+        }
+      }
+    },
+    {
+      "name": "model.layers.0.self_attn.k_proj.weight",
+      "expr": {
+        "Src": "model.layers.0.self_attn.k_proj.weight"
+      },
+      "shape": [
+        64,
+        256
+      ],
+      "encoding": {
+        "Quant": {
+          "scheme": "AwqInt4",
+          "logical_dtype": "BF16",
+          "bits_per_element": 4,
+          "group_size": 32,
+          "channel_axis": null,
+          "scale_dtype": "BF16",
+          "zero_point_dtype": null,
+          "block_shape": []
+        }
+      }
+    },
+    {
+      "name": "model.layers.0.self_attn.v_proj.weight",
+      "expr": {
+        "Src": "model.layers.0.self_attn.v_proj.weight"
+      },
+      "shape": [
+        64,
+        256
+      ],
+      "encoding": {
+        "Quant": {
+          "scheme": "AwqInt4",
+          "logical_dtype": "BF16",
+          "bits_per_element": 4,
+          "group_size": 32,
+          "channel_axis": null,
+          "scale_dtype": "BF16",
+          "zero_point_dtype": null,
+          "block_shape": []
+        }
+      }
+    },
+    {
+      "name": "model.layers.0.self_attn.o_proj.weight",
+      "expr": {
+        "Src": "model.layers.0.self_attn.o_proj.weight"
+      },
+      "shape": [
+        256,
+        256
+      ],
+      "encoding": {
+        "Quant": {
+          "scheme": "AwqInt4",
+          "logical_dtype": "BF16",
+          "bits_per_element": 4,
+          "group_size": 32,
+          "channel_axis": null,
+          "scale_dtype": "BF16",
+          "zero_point_dtype": null,
+          "block_shape": []
+        }
+      }
+    },
+    {
+      "name": "model.layers.0.mlp.gate_proj.weight",
+      "expr": {
+        "Src": "model.layers.0.mlp.gate_proj.weight"
+      },
+      "shape": [
+        512,
+        256
+      ],
+      "encoding": {
+        "Quant": {
+          "scheme": "AwqInt4",
+          "logical_dtype": "BF16",
+          "bits_per_element": 4,
+          "group_size": 32,
+          "channel_axis": null,
+          "scale_dtype": "BF16",
+          "zero_point_dtype": null,
+          "block_shape": []
+        }
+      }
+    },
+    {
+      "name": "model.layers.0.mlp.up_proj.weight",
+      "expr": {
+        "Src": "model.layers.0.mlp.up_proj.weight"
+      },
+      "shape": [
+        512,
+        256
+      ],
+      "encoding": {
+        "Quant": {
+          "scheme": "AwqInt4",
+          "logical_dtype": "BF16",
+          "bits_per_element": 4,
+          "group_size": 32,
+          "channel_axis": null,
+          "scale_dtype": "BF16",
+          "zero_point_dtype": null,
+          "block_shape": []
+        }
+      }
+    },
+    {
+      "name": "model.layers.0.mlp.down_proj.weight",
+      "expr": {
+        "Src": "model.layers.0.mlp.down_proj.weight"
+      },
+      "shape": [
+        256,
+        512
+      ],
+      "encoding": {
+        "Quant": {
+          "scheme": "AwqInt4",
+          "logical_dtype": "BF16",
+          "bits_per_element": 4,
+          "group_size": 32,
+          "channel_axis": null,
+          "scale_dtype": "BF16",
+          "zero_point_dtype": null,
+          "block_shape": []
+        }
+      }
+    },
+    {
+      "name": "model.layers.0.post_attention_layernorm.weight",
+      "expr": {
+        "Src": "model.layers.0.post_attention_layernorm.weight"
+      },
+      "shape": [
+        256
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      }
+    },
+    {
+      "name": "model.norm.weight",
+      "expr": {
+        "Src": "model.norm.weight"
+      },
+      "shape": [
+        256
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      }
+    }
+  ]
+}

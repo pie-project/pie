@@ -1,0 +1,52 @@
+{
+  "abi_version": 1,
+  "alignment": 1,
+  "tensors": [
+    {
+      "name": "model.layers.0.mlp.gate_up_proj.fused.weight",
+      "expr": {
+        "Cat": {
+          "axis": 0,
+          "parts": [
+            {
+              "Src": "model.layers.0.mlp.gate_proj.weight"
+            },
+            {
+              "Src": "model.layers.0.mlp.up_proj.weight"
+            }
+          ]
+        }
+      },
+      "shape": [
+        256,
+        128
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      }
+    },
+    {
+      "name": "model.layers.0.self_attn.q_kv_a_proj.fused.weight",
+      "expr": {
+        "Cat": {
+          "axis": 0,
+          "parts": [
+            {
+              "Src": "model.layers.0.self_attn.q_a_proj.weight"
+            },
+            {
+              "Src": "model.layers.0.self_attn.kv_a_proj_with_mqa.weight"
+            }
+          ]
+        }
+      },
+      "shape": [
+        48,
+        128
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      }
+    }
+  ]
+}

@@ -59,6 +59,19 @@ pub enum Expr {
         before: i64,
         after: i64,
     },
+    /// This rank's `1/world` partition of `src` along `axis`.
+    ///
+    /// The one node whose meaning depends on the target, and the reason
+    /// compilation has a *specialization* stage: a contract is authored once
+    /// and specialized once per rank, where [`Resolver::specialize`] rewrites
+    /// each `Shard` into the concrete [`Expr::Slice`] that rank reads. Nothing
+    /// below the frontend ever sees one.
+    ///
+    /// Stated as a node rather than a field beside the expression so that a
+    /// contract stays rank-independent — the author writes the partition, not
+    /// the arithmetic — and so that it composes: a shard of one leg of a
+    /// [`Expr::Cat`] is expressible, which a whole-expression flag cannot say.
+    Shard { src: Box<Expr>, axis: Axis },
     /// Escape hatch: a backend-specific layout swizzle. Opaque to the type
     /// checker, so it must declare its own output type.
     Repack {
@@ -124,15 +137,23 @@ impl TensorType {
 
 /// One declared tensor.
 ///
-/// `shape` and `encoding` are derivable from `expr`; they are declared anyway
-/// and checked, so that a contract is simultaneously a request and a proof
-/// obligation. A driver whose model of the checkpoint is wrong fails to compile
-/// instead of silently binding a plausible-looking buffer.
+/// `encoding` is what the driver wants the tensor to *be*, and the loader
+/// inserts whatever cast, decode or encode reaches it. `shape` is different: it
+/// is a *prediction*, checked against what the expression actually yields, so
+/// that a driver whose model of the checkpoint is wrong fails to compile instead
+/// of silently binding a plausible-looking buffer.
+///
+/// A prediction may be declined. `shape: None` says "I do not claim to know",
+/// which is the honest answer for a packed quantized weight whose on-disk
+/// extents are a property of the quantizer that produced the file rather than of
+/// the model. Forcing a claim there is what produced `LogicalShape` in
+/// `model_contracts.hpp`: a helper whose only job was to erase a shape the
+/// driver had been made to state and could not stand behind.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TensorContract {
     pub name: String,
     pub expr: Expr,
-    pub shape: Vec<i64>,
+    pub shape: Option<Vec<i64>>,
     pub encoding: Encoding,
 }
 
@@ -141,16 +162,19 @@ impl TensorContract {
         Self {
             name: name.into(),
             expr,
-            shape,
+            shape: Some(shape),
             encoding,
         }
     }
 
-    /// The type this contract claims to have.
-    pub fn declared(&self) -> TensorType {
-        TensorType {
-            shape: self.shape.clone(),
-            encoding: self.encoding.clone(),
+    /// A declaration that states the encoding it wants and declines to predict
+    /// the shape.
+    pub fn inferred(name: impl Into<String>, expr: Expr, encoding: Encoding) -> Self {
+        Self {
+            name: name.into(),
+            expr,
+            shape: None,
+            encoding,
         }
     }
 }
@@ -169,20 +193,72 @@ pub struct ModelContract {
     pub tensors: Vec<TensorContract>,
 }
 
+impl ModelContract {
+    /// Keep only the entries `retain` selects, plus everything they read.
+    ///
+    /// A contract is a DAG, so selecting an output selects its dependencies
+    /// too; the closure is taken until it stops growing. This is how a caller
+    /// asks for part of a model without authoring a second contract for it.
+    pub fn retain_outputs(
+        mut self,
+        mut retain: impl FnMut(&str) -> bool,
+    ) -> Result<Self, CompileError> {
+        let mut selected = self
+            .tensors
+            .iter()
+            .map(|contract| retain(&contract.name))
+            .collect::<Vec<_>>();
+        let by_name: std::collections::HashMap<&str, usize> = self
+            .tensors
+            .iter()
+            .enumerate()
+            .map(|(index, contract)| (contract.name.as_str(), index))
+            .collect();
+        loop {
+            let mut changed = false;
+            for index in 0..self.tensors.len() {
+                if !selected[index] {
+                    continue;
+                }
+                for name in self.tensors[index].expr.outputs() {
+                    let dep = *by_name.get(name).ok_or_else(|| {
+                        CompileError::InvalidInput(format!(
+                            "contract {index} reads missing contract '{name}'"
+                        ))
+                    })?;
+                    if !selected[dep] {
+                        selected[dep] = true;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        if !selected.iter().any(|selected| *selected) {
+            return Err(CompileError::InvalidInput(
+                "the component filter selected no tensors".to_string(),
+            ));
+        }
+        let mut keep = selected.into_iter();
+        self.tensors.retain(|_| keep.next().unwrap_or(false));
+        Ok(self)
+    }
+}
+
 /// Resolves [`Expr::Src`] names against a checkpoint.
 pub trait CheckpointTypes {
     fn tensor_type(&self, name: &str) -> Option<TensorType>;
 }
 
-/// The result of type-checking a [`ModelContract`]: every inferred type, plus
-/// the checkpoint types the expressions actually consulted.
+/// What resolving a contract's expressions turned up: the checkpoint tensors
+/// they consulted, and the types the earlier entries published.
 ///
-/// The compiler needs the same name→shape resolution the checker just did, so
-/// the checker hands it over rather than making it look everything up twice.
+/// The compiler needs the same name→shape resolution the resolver just did, so
+/// the resolver hands it over rather than making it look everything up twice.
 #[derive(Clone, Debug, Default)]
 pub struct Checked {
-    /// Inferred type of each entry, in declaration order.
-    pub types: Vec<TensorType>,
     /// Checkpoint tensors referenced by some [`Expr::Src`], by name.
     pub sources: std::collections::HashMap<String, TensorType>,
     /// Declared contracts, by name.
@@ -196,54 +272,6 @@ impl Checked {
 
     pub fn output(&self, name: &str) -> Option<&TensorType> {
         self.outputs.get(name)
-    }
-}
-
-impl ModelContract {
-    /// Type-check every entry against `checkpoint`.
-    ///
-    /// Rejects duplicate names, references to undeclared or later entries, and
-    /// any entry whose declared `shape`/`encoding` disagrees with its `expr`.
-    pub fn check(&self, checkpoint: &dyn CheckpointTypes) -> Result<Checked, CompileError> {
-        let mut scope = Scope {
-            checkpoint,
-            resolved: Checked {
-                types: Vec::with_capacity(self.tensors.len()),
-                ..Checked::default()
-            },
-        };
-        for contract in &self.tensors {
-            if scope.resolved.outputs.contains_key(contract.name.as_str()) {
-                return Err(CompileError::InvalidInput(format!(
-                    "contract declares '{}' twice",
-                    contract.name
-                )));
-            }
-            let found = infer(&contract.expr, &mut scope).map_err(|err| {
-                CompileError::InvalidInput(format!("contract '{}': {err}", contract.name))
-            })?;
-            let want = contract.declared();
-            if found.shape != want.shape {
-                return Err(CompileError::InvalidInput(format!(
-                    "contract '{}' declares shape {:?} but its expression yields {:?}",
-                    contract.name, want.shape, found.shape
-                )));
-            }
-            if crate::types::normalize_encoding(&found.encoding)
-                != crate::types::normalize_encoding(&want.encoding)
-            {
-                return Err(CompileError::InvalidInput(format!(
-                    "contract '{}' declares encoding {:?} but its expression yields {:?}",
-                    contract.name, want.encoding, found.encoding
-                )));
-            }
-            scope
-                .resolved
-                .outputs
-                .insert(contract.name.clone(), found.clone());
-            scope.resolved.types.push(found);
-        }
-        Ok(scope.resolved)
     }
 }
 
@@ -289,6 +317,21 @@ impl<'a> Resolver<'a> {
     /// published so far.
     pub fn infer(&mut self, expr: &Expr) -> Result<TensorType, CompileError> {
         infer(expr, &mut self.scope)
+    }
+
+    /// Rewrite `expr` for one rank of a `world`-way tensor-parallel split,
+    /// replacing every [`Expr::Shard`] with the slice that rank reads.
+    ///
+    /// `what` names the thing being specialized and appears in the divisibility
+    /// error, which is what a user sees when a tp_size does not fit the model.
+    pub fn specialize(
+        &mut self,
+        expr: Expr,
+        rank: u32,
+        world: u32,
+        what: &str,
+    ) -> Result<Expr, CompileError> {
+        specialize(expr, &mut self.scope, rank, world, what)
     }
 
     /// Bring `name` into scope for later expressions.
@@ -377,7 +420,104 @@ fn infer(expr: &Expr, scope: &mut Scope<'_>) -> Result<TensorType, CompileError>
             }
             Ok(out.clone())
         }
+        Expr::Shard { .. } => Err(CompileError::Internal(
+            "Shard has no type until it is specialized against a target; call \
+             Resolver::specialize first"
+                .to_string(),
+        )),
     }
+}
+
+/// Rewrite every [`Expr::Shard`] in `expr` into the concrete slice `rank` reads,
+/// resolving extents through `scope`.
+///
+/// Children first, so that a shard over a shard — or over a [`Expr::Cat`] whose
+/// legs are themselves sharded — sees an operand it can already type.
+fn specialize(
+    expr: Expr,
+    scope: &mut Scope<'_>,
+    rank: u32,
+    world: u32,
+    what: &str,
+) -> Result<Expr, CompileError> {
+    macro_rules! go {
+        ($src:expr) => {
+            Box::new(specialize(*$src, scope, rank, world, what)?)
+        };
+    }
+    Ok(match expr {
+        Expr::Src(_) | Expr::Out(_) => expr,
+        Expr::Slice {
+            src,
+            axis,
+            start,
+            len,
+            step,
+        } => Expr::Slice {
+            src: go!(src),
+            axis,
+            start,
+            len,
+            step,
+        },
+        Expr::Reshape { src, shape } => Expr::Reshape {
+            src: go!(src),
+            shape,
+        },
+        Expr::Pad {
+            src,
+            axis,
+            before,
+            after,
+        } => Expr::Pad {
+            src: go!(src),
+            axis,
+            before,
+            after,
+        },
+        Expr::Repack { src, spec, out } => Expr::Repack {
+            src: go!(src),
+            spec,
+            out,
+        },
+        Expr::Quantize { src, spec } => Expr::Quantize {
+            src: go!(src),
+            spec,
+        },
+        Expr::Bitcast { src, out } => Expr::Bitcast { src: go!(src), out },
+        Expr::Cat { axis, parts } => Expr::Cat {
+            axis,
+            parts: parts
+                .into_iter()
+                .map(|part| specialize(part, scope, rank, world, what))
+                .collect::<Result<_, _>>()?,
+        },
+        Expr::Shard { src, axis } => {
+            let src = specialize(*src, scope, rank, world, what)?;
+            if world <= 1 {
+                // Not a degenerate one-rank slice but the operand itself, so
+                // that a single-GPU plan is identical to one compiled from a
+                // contract that never mentioned sharding.
+                return Ok(src);
+            }
+            let ty = infer(&src, scope)?;
+            let index = axis_index(axis, ty.shape.len(), what)?;
+            let extent = ty.shape[index];
+            if extent % i64::from(world) != 0 {
+                // Named, because this is the message a user gets for "tp_size
+                // does not divide this model". The driver used to pre-empt it
+                // with its own per-family divisibility table over `config.json`,
+                // which was the same fact checked twice and reachable only for
+                // the families someone had listed.
+                return Err(CompileError::InvalidInput(format!(
+                    "'{what}' has {extent} along axis {index}, which tp_size {world} does not \
+                     divide; use a tp_size that divides it or run single-GPU"
+                )));
+            }
+            let len = extent / i64::from(world);
+            src.slice(axis.0, i64::from(rank) * len, len)
+        }
+    })
 }
 
 /// Resolve an [`Axis`] against a rank, rejecting out-of-range axes.
@@ -714,6 +854,13 @@ impl Expr {
         }
     }
 
+    pub fn shard(self, axis: u8) -> Self {
+        Expr::Shard {
+            src: Box::new(self),
+            axis: Axis(axis),
+        }
+    }
+
     /// Whether this expression lies entirely in the affine fragment, and so
     /// compiles to byte spans with no kernel and no intermediate buffer.
     pub fn is_affine(&self) -> bool {
@@ -724,8 +871,17 @@ impl Expr {
             }
             Expr::Cat { parts, .. } => parts.iter().all(Expr::is_affine),
             Expr::Bitcast { .. } => true,
+            Expr::Shard { src, .. } => src.is_affine(),
             Expr::Repack { .. } | Expr::Quantize { .. } => false,
         }
+    }
+
+    /// Whether any part of this expression is partitioned across ranks, and so
+    /// means something different on each of them.
+    pub fn is_sharded(&self) -> bool {
+        let mut found = false;
+        self.visit(&mut |expr| found |= matches!(expr, Expr::Shard { .. }));
+        found
     }
 
     /// Names of the checkpoint tensors this expression reads, in traversal
@@ -765,6 +921,7 @@ impl Expr {
             | Expr::Pad { src, .. }
             | Expr::Repack { src, .. }
             | Expr::Bitcast { src, .. }
+            | Expr::Shard { src, .. }
             | Expr::Quantize { src, .. } => src.visit(seen),
             Expr::Cat { parts, .. } => {
                 for part in parts {
@@ -826,6 +983,83 @@ mod tests {
             zero_point_dtype: None,
             block_shape: Vec::new(),
         }
+    }
+
+    fn specialize_one(expr: Expr, rank: u32, world: u32) -> Result<Expr, CompileError> {
+        let checkpoint = qwen3();
+        Resolver::new(&checkpoint).specialize(expr, rank, world, "q")
+    }
+
+    #[test]
+    fn a_component_filter_keeps_what_the_selection_reads() {
+        let one = |name: &str, expr: Expr| {
+            TensorContract::new(name, expr, vec![1], Encoding::Raw(DType::U8))
+        };
+        let contract = ModelContract {
+            abi_version: 1,
+            alignment: 1,
+            tensors: vec![
+                one("text.weight", Expr::src("text")),
+                one("vision.base", Expr::src("vision")),
+                one("vision.view", Expr::out("vision.base").slice(0, 0, 1)),
+            ],
+        };
+
+        let filtered = contract
+            .retain_outputs(|name| name == "vision.view")
+            .unwrap();
+        assert_eq!(filtered.tensors.len(), 2);
+        assert_eq!(filtered.tensors[0].name, "vision.base");
+        assert_eq!(filtered.tensors[1].name, "vision.view");
+    }
+
+    #[test]
+    fn shard_has_no_type_until_it_is_specialized() {
+        let err = check_one(Expr::src("q_proj").shard(0), &qwen3()).unwrap_err();
+        assert!(format!("{err}").contains("specialize"), "{err}");
+    }
+
+    #[test]
+    fn shard_becomes_this_ranks_slice() {
+        let expr = specialize_one(Expr::src("q_proj").shard(0), 3, 4).unwrap();
+        assert_eq!(expr, Expr::src("q_proj").slice(0, 1536, 512));
+        assert_eq!(
+            check_one(expr, &qwen3()).unwrap(),
+            TensorType::raw(vec![512, 2048], DType::BF16)
+        );
+    }
+
+    #[test]
+    fn a_single_rank_shard_is_the_tensor_itself() {
+        // Not a degenerate full-width slice: a one-GPU plan must be identical
+        // to one compiled from a contract that never mentioned sharding.
+        let expr = specialize_one(Expr::src("q_proj").shard(0), 0, 1).unwrap();
+        assert_eq!(expr, Expr::src("q_proj"));
+    }
+
+    #[test]
+    fn shard_composes_under_the_affine_fragment() {
+        let expr = specialize_one(
+            Expr::cat(
+                0,
+                vec![Expr::src("k_proj").shard(0), Expr::src("v_proj").shard(0)],
+            ),
+            1,
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            check_one(expr, &qwen3()).unwrap(),
+            TensorType::raw(vec![1024, 2048], DType::BF16)
+        );
+    }
+
+    #[test]
+    fn an_indivisible_extent_is_rejected_by_name() {
+        let err = specialize_one(Expr::src("k_proj").shard(0), 0, 3).unwrap_err();
+        let message = format!("{err}");
+        assert!(message.contains("'q' has 1024 along axis 0"), "{message}");
+        assert!(message.contains("tp_size 3"), "{message}");
     }
 
     #[test]
@@ -1043,35 +1277,45 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_correct_contract_checks() {
-        let inferred = model(vec![qkv_contract(vec![4096, 2048])])
-            .check(&qwen3())
-            .unwrap();
-        assert_eq!(inferred.types[0].shape, vec![4096, 2048]);
+    /// Resolve a run of contracts in declaration order, exactly as the frontend
+    /// does: each entry's type is published under its name so that later
+    /// entries can read it through [`Expr::Out`].
+    fn resolve(
+        tensors: &[TensorContract],
+        checkpoint: &dyn CheckpointTypes,
+    ) -> Result<Vec<TensorType>, CompileError> {
+        let mut resolver = Resolver::new(checkpoint);
+        tensors
+            .iter()
+            .map(|tensor| {
+                let ty = resolver.infer(&tensor.expr)?;
+                resolver.publish(&tensor.name, ty.clone());
+                Ok(ty)
+            })
+            .collect()
+    }
+
+    /// The type a contract that declares its shape claims to have.
+    fn declared(contract: &TensorContract) -> TensorType {
+        TensorType {
+            shape: contract
+                .shape
+                .clone()
+                .expect("test contract declares a shape"),
+            encoding: contract.encoding.clone(),
+        }
     }
 
     #[test]
-    fn a_wrong_declared_shape_is_caught() {
-        let err = model(vec![qkv_contract(vec![4096, 4096])])
-            .check(&qwen3())
-            .unwrap_err();
-        let text = err.to_string();
-        assert!(text.contains("declares shape [4096, 4096]"), "{text}");
-        assert!(text.contains("yields [4096, 2048]"), "{text}");
-    }
-
-    #[test]
-    fn a_wrong_declared_encoding_is_caught() {
-        let mut contract = qkv_contract(vec![4096, 2048]);
-        contract.encoding = Encoding::Raw(DType::F32);
-        let err = model(vec![contract]).check(&qwen3()).unwrap_err();
-        assert!(err.to_string().contains("declares encoding"));
+    fn a_contract_resolves_to_what_it_declares() {
+        let tensors = vec![qkv_contract(vec![4096, 2048])];
+        let found = resolve(&tensors, &qwen3()).unwrap();
+        assert_eq!(found[0], declared(&tensors[0]));
     }
 
     #[test]
     fn a_bank_publishes_views_by_name() {
-        let contract = model(vec![
+        let tensors = vec![
             qkv_contract(vec![4096, 2048]),
             TensorContract::new(
                 "q_proj",
@@ -1085,24 +1329,26 @@ mod tests {
                 vec![1024, 2048],
                 Encoding::Raw(DType::BF16),
             ),
-        ]);
-        let inferred = contract.check(&qwen3()).unwrap();
-        assert_eq!(inferred.types[1].shape, vec![2048, 2048]);
-        assert_eq!(inferred.types[2].shape, vec![1024, 2048]);
+        ];
+        let found = resolve(&tensors, &qwen3()).unwrap();
+        assert_eq!(found[1].shape, vec![2048, 2048]);
+        assert_eq!(found[2].shape, vec![1024, 2048]);
     }
 
     #[test]
     fn out_cannot_name_a_later_contract() {
-        let err = model(vec![
-            TensorContract::new(
-                "early",
-                Expr::out("late"),
-                vec![2048, 2048],
-                Encoding::Raw(DType::BF16),
-            ),
-            qkv_contract(vec![4096, 2048]),
-        ])
-        .check(&qwen3())
+        let err = resolve(
+            &[
+                TensorContract::new(
+                    "early",
+                    Expr::out("late"),
+                    vec![2048, 2048],
+                    Encoding::Raw(DType::BF16),
+                ),
+                qkv_contract(vec![4096, 2048]),
+            ],
+            &qwen3(),
+        )
         .unwrap_err();
         assert!(err.to_string().contains("declared before this one"));
     }
@@ -1111,34 +1357,26 @@ mod tests {
     fn out_and_src_do_not_collide() {
         // "q_proj" is both a checkpoint tensor and a declared contract; Src and
         // Out must keep pointing at different things.
-        let contract = model(vec![
-            TensorContract::new(
-                "q_proj",
-                Expr::src("q_proj").pad(0, 0, 64),
-                vec![2112, 2048],
-                Encoding::Raw(DType::BF16),
-            ),
-            TensorContract::new(
-                "q_proj.head0",
-                Expr::out("q_proj").slice(0, 0, 128),
-                vec![128, 2048],
-                Encoding::Raw(DType::BF16),
-            ),
-        ]);
-        let inferred = contract.check(&qwen3()).unwrap();
-        assert_eq!(inferred.types[0].shape, vec![2112, 2048]);
-        assert_eq!(inferred.types[1].shape, vec![128, 2048]);
-    }
-
-    #[test]
-    fn duplicate_names_are_rejected() {
-        let err = model(vec![
-            qkv_contract(vec![4096, 2048]),
-            qkv_contract(vec![4096, 2048]),
-        ])
-        .check(&qwen3())
-        .unwrap_err();
-        assert!(err.to_string().contains("twice"));
+        let found = resolve(
+            &[
+                TensorContract::new(
+                    "q_proj",
+                    Expr::src("q_proj").pad(0, 0, 64),
+                    vec![2112, 2048],
+                    Encoding::Raw(DType::BF16),
+                ),
+                TensorContract::new(
+                    "q_proj.head0",
+                    Expr::out("q_proj").slice(0, 0, 128),
+                    vec![128, 2048],
+                    Encoding::Raw(DType::BF16),
+                ),
+            ],
+            &qwen3(),
+        )
+        .unwrap();
+        assert_eq!(found[0].shape, vec![2112, 2048]);
+        assert_eq!(found[1].shape, vec![128, 2048]);
     }
 
     #[test]
@@ -1160,6 +1398,9 @@ mod tests {
             vec![2048, 2048],
             Encoding::Quant(fp8_per_row()),
         )]);
-        assert!(contract.check(&qwen3()).is_ok());
+        assert_eq!(
+            resolve(&contract.tensors, &qwen3()).unwrap()[0],
+            declared(&contract.tensors[0])
+        );
     }
 }

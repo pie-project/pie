@@ -39,10 +39,24 @@ bool fused_gdn_projection_weights_enabled() {
 // its own it is a whole kernel (`sigmoid_dot_scalar_gate_add`, ~7 us per
 // layer, 283 us per Qwen3.6 decode step) for a single dot product. The
 // packed weight is the same size either way, so this is on by default.
+// Fusing the shared expert's scalar gate row onto its gate/up projection
+// saves one GEMM, but it makes the fused weight `2*I_shared + 1` rows --
+// an ODD N, so both N and ldc break 16-byte alignment and cuBLAS drops off
+// its aligned tensor-core kernels onto a much slower fallback. The cost is
+// superlinear in M, which hides at small batches and is brutal at large
+// ones: on Qwen3.6-35B-A3B tp2 the shared gate_up GEMM measured 1.41 ms at
+// N=128 but 6.18 ms at N=256 (4.4x for 2x the rows), against 0.83 ms
+// unfused, where N is 512. End to end that is +2.3% at 128 requests and
+// +9.5% at 256; tp=1 is unchanged (1496 against 1502 tok/s).
+//
+// So the split path wins despite the extra launch, and is the default.
+// Padding the fused weight up to a multiple of 8 would recover the saved
+// launch as well -- the swiglu and scalar-gate kernels already take the
+// row stride as an argument -- but is worth only ~0.3 ms more.
 bool fused_shared_scalar_gate_enabled() {
     static const bool enabled = [] {
         const char* v = std::getenv("PIE_QWEN35_FUSED_SHARED_SCALAR_GATE");
-        if (v == nullptr || v[0] == '\0') return true;
+        if (v == nullptr || v[0] == '\0') return false;
         return v[0] != '0';
     }();
     return enabled;

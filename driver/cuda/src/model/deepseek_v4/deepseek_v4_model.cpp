@@ -8,13 +8,16 @@ DsV4Model::DsV4Model(
     DsV4Weights weights,
     const HfConfig& hf_config,
     DsV4Workspace& ws,
+    DsV4CompressCache& comp_cache,
     int tp_size,
     int tp_rank,
     NcclComm* tp_comm,
-    bool emit_logits)
+    bool emit_logits,
+    bool eager_bf16_experts)
     : weights_(std::move(weights)),
       hf_config_(hf_config),
-      ws_(ws)
+      ws_(ws),
+      comp_cache_(comp_cache)
 {
     fwd_cfg_.tp_size = tp_size;
     fwd_cfg_.tp_rank = tp_rank;
@@ -24,6 +27,10 @@ DsV4Model::DsV4Model(
     // DSV4 emits dense or compact logits via the standard path; it does
     // not opt into CUDA-graph capture or fused-argmax.
     caps_.supports_compact_logits = true;
+    fwd_cfg_.eager_bf16_experts = eager_bf16_experts;
+    if (eager_bf16_experts) {
+        dsv4_materialize_bf16_expert_stacks(weights_, hf_config_, tp_size);
+    }
 }
 
 void DsV4Model::prepare(AttentionWorkspace& /*attn_ws*/,
@@ -37,7 +44,7 @@ void DsV4Model::body(Workspace& ws,
                      ops::CublasHandle& cublas,
                      const ForwardFn::ForwardInputs& in) {
     dsv4_forward_paged(
-        weights_, hf_config_, fwd_cfg_, ws_, kv, attn_ws, cublas,
+        weights_, hf_config_, fwd_cfg_, ws_, kv, comp_cache_, attn_ws, cublas,
         ws.logits.data(),
         in.token_ids, in.positions,
         in.qo_indptr_d, in.kv_page_indices_d, in.kv_page_indptr_d,

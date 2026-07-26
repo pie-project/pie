@@ -138,9 +138,6 @@ public:
                 copy_engine_.flush();
                 buffers_.erase(instr.buffer_id);
                 break;
-            case pie_loader::PieLoaderStorageInstrKind::Attach:
-                copy_engine_.flush();
-                break;
             }
         }
         copy_engine_.flush();

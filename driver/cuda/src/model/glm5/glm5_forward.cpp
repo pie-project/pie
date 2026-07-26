@@ -1,4 +1,6 @@
 #include "model/glm5/glm5_forward.hpp"
+
+#include "model/act_dump.hpp"
 #include "model/stage_hooks.hpp"
 
 #include <algorithm>
@@ -85,6 +87,13 @@ ExpertRouting build_routing(
 
 }  // namespace
 
+// Expert-block size for the device-side aligned MoE path.
+// TEMP ablation switch for perf bring-up: PIE_GLM_ABLATE=lmhead,dsa,moe
+
+static constexpr int kGlm5MoeAlignedBlock = 16;
+// Above this token count the aligned batched GEMM beats the decode GEMVs.
+static constexpr int kGlm5MoeGemvMaxTokens = 8;
+
 Glm5Workspace Glm5Workspace::allocate(
     const HfConfig& cfg,
     int max_tokens,
@@ -164,6 +173,32 @@ Glm5Workspace Glm5Workspace::allocate(
     ws.shared_up     = DeviceTensor::allocate(DType::BF16, {N, std::max(1, shared_I)});
     ws.shared_act    = DeviceTensor::allocate(DType::BF16, {N, std::max(1, shared_I)});
     ws.shared_out    = DeviceTensor::allocate(DType::BF16, {N, H});
+
+    // Aligned MoE scratch. `routed_blocks` is the worst case: every one of the
+    // `routes` rows lands in a distinct expert block, each padded to `block`.
+    if (routed_I > 0 && cfg.num_experts > 0) {
+        const int block = kGlm5MoeAlignedBlock;
+        const int active_expert_cap = std::min(cfg.num_experts, routes);
+        const int max_blocks =
+            (routes + active_expert_cap * (block - 1) + block - 1) / block;
+        const int aligned_rows = max_blocks * block;
+        ws.aligned_block_size  = block;
+        ws.aligned_max_blocks  = max_blocks;
+        ws.aligned_route_ids   = DeviceTensor::allocate(DType::INT32, {aligned_rows});
+        ws.aligned_expert_ids  = DeviceTensor::allocate(DType::INT32, {max_blocks});
+        ws.aligned_expert_in   = DeviceTensor::allocate(DType::BF16, {aligned_rows, H});
+        ws.aligned_gate_up     = DeviceTensor::allocate(DType::BF16, {aligned_rows, 2 * routed_I});
+        ws.aligned_act         = DeviceTensor::allocate(DType::BF16, {aligned_rows, routed_I});
+        ws.aligned_out         = DeviceTensor::allocate(DType::BF16, {aligned_rows, H});
+        const std::int64_t pw =
+            static_cast<std::int64_t>(max_blocks) * sizeof(void*) / sizeof(std::int64_t);
+        ws.a_gu_ptrs = DeviceTensor::allocate(DType::INT64, {std::max<std::int64_t>(pw, 1)});
+        ws.b_gu_ptrs = DeviceTensor::allocate(DType::INT64, {std::max<std::int64_t>(pw, 1)});
+        ws.c_gu_ptrs = DeviceTensor::allocate(DType::INT64, {std::max<std::int64_t>(pw, 1)});
+        ws.a_dn_ptrs = DeviceTensor::allocate(DType::INT64, {std::max<std::int64_t>(pw, 1)});
+        ws.b_dn_ptrs = DeviceTensor::allocate(DType::INT64, {std::max<std::int64_t>(pw, 1)});
+        ws.c_dn_ptrs = DeviceTensor::allocate(DType::INT64, {std::max<std::int64_t>(pw, 1)});
+    }
     ws.logits        = DeviceTensor::allocate(DType::BF16, {O, cfg.vocab_size});
     return ws;
 }
@@ -238,6 +273,12 @@ void glm5_forward_paged(
     // (all keys in-batch; no decode-time indexer cache yet). For seq_len <=
     // index_topk it reduces to dense, and for decode / multi-request it's
     // skipped (dense), which is exact while seq_len <= index_topk.
+    //
+    // GLM-5.2 only ships indexer weights for the layers whose `indexer_types`
+    // entry is "full"; a "shared" layer reuses the selection computed by the
+    // most recent "full" layer (upstream calls this the index cache — one
+    // `topk_indices_buffer` written by indexer layers and read by the skipped
+    // ones). Hoisting the mask out of the layer loop gives exactly that.
     const int idx_nh = cfg.index_n_heads;
     const int idx_hd = cfg.index_head_dim;
     const int idx_topk = cfg.index_topk;
@@ -263,6 +304,13 @@ void glm5_forward_paged(
             token_ids, w.embed->data(), ws.y.data(),
             total_tokens, H, cfg.vocab_size, stream);
     }
+
+    // Carried across layers: "shared" indexer layers reuse the last mask.
+    const std::uint8_t* idx_mask_ptr = nullptr;
+    int idx_mask_stride = 0;
+
+    act_dump_step_begin();
+    act_dump_bf16("embed", ws.y.data(), total_tokens, H, stream);
 
     for (int li = 0; li < cfg.num_hidden_layers; ++li) {
         const auto& Lw = w.layers[static_cast<std::size_t>(li)];
@@ -295,8 +343,6 @@ void glm5_forward_paged(
             static_cast<std::uint32_t>(li), stream);
 
         // ── DSA lightning-indexer: build top-k mask for this layer ───────
-        const std::uint8_t* idx_mask_ptr = nullptr;
-        int idx_mask_stride = 0;
         if (use_indexer && Lw.idx_wq_b != nullptr) {
             // q_idx = wq_b(q_a_normed); k_idx = wk(norm_x); w = weights_proj(norm_x)
             ops::gemm_act_x_w(cublas.handle(),
@@ -355,10 +401,10 @@ void glm5_forward_paged(
         // kv_b_proj_bf16 holds a BF16 copy of the (possibly FP8) kv_b
         // weight that the kimi_mla kernels require.
         const void* kv_b_bf16 = Lw.kv_b_proj_bf16->data();
-        kernels::launch_kimi_q_nope_to_latent_bf16(
+        ops::mla_absorb_q_to_latent_bf16(cublas.handle(),
             ws.q_nope.data(), kv_b_bf16,
             ws.q_nope_latent.data(),
-            total_tokens, heads, q_nope, v_dim, kv_lora, stream);
+            total_tokens, heads, q_nope, v_dim, kv_lora);
 
         if (!mla_plan.mla_plan) {
             throw std::runtime_error("glm5: MLA plan missing; prepare hook did not run");
@@ -375,10 +421,10 @@ void glm5_forward_paged(
             /*lse_out=*/nullptr,
             qo_indptr, kv_page_indptr, kv_last_page_lens,
             idx_mask_ptr, idx_mask_stride);
-        kernels::launch_kimi_latent_to_v_bf16(
+        ops::mla_absorb_latent_to_v_bf16(cublas.handle(),
             ws.attn_latent.data(), kv_b_bf16,
             ws.attn_v.data(),
-            total_tokens, heads, q_nope, v_dim, kv_lora, stream);
+            total_tokens, heads, q_nope, v_dim, kv_lora);
         invoke_stage_hook(
             StageHookPoint::OnAttn, ws.q_b.data(),
             static_cast<std::uint32_t>(total_tokens),
@@ -403,6 +449,8 @@ void glm5_forward_paged(
         }
 
         // ── MLP / MoE ────────────────────────────────────────────────
+        act_dump_bf16(act_dump_layer_tag("post_attn", li).c_str(),
+            ws.y.data(), total_tokens, H, stream);
         kernels::launch_rmsnorm_bf16(
             ws.y.data(), Lw.mlp_norm->data(), ws.norm_y.data(),
             total_tokens, H, eps, stream);
@@ -454,11 +502,100 @@ void glm5_forward_paged(
             total_tokens, E, K, cfg.norm_topk_prob,
             cfg.routed_scaling_factor, stream);
 
+        // ── Device-side aligned MoE ─────────────────────────────────
+        // vLLM/SGL-style: bucket routes into fixed-size expert blocks on
+        // device, run two batched GEMMs, scatter back. No host round-trip and
+        // no stream sync, so the forward stays graph-capturable.
+        if (Lw.moe_gate_up_proj != nullptr && ws.aligned_block_size > 0 &&
+            total_tokens <= kGlm5MoeGemvMaxTokens && (H % 8) == 0 &&
+            (routed_I % 8) == 0) {
+            // Decode: at M=1 the routed GEMMs are pure streaming reads with no
+            // weight reuse, so one warp per output row beats a batched GEMM
+            // whose tiling assumes an M worth filling.
+            const int routes = total_tokens * K;
+            kernels::launch_moe_gate_up_decode_gemv_bf16(
+                static_cast<const std::int32_t*>(ws.topk_idx.data()),
+                ws.norm_y.data(), Lw.moe_gate_up_proj->data(),
+                ws.aligned_gate_up.data(),
+                total_tokens, K, H, routed_I, stream);
+            kernels::launch_chunked_swiglu_bf16(
+                ws.aligned_gate_up.data(), ws.aligned_act.data(),
+                routes, routed_I, stream);
+            kernels::launch_moe_down_decode_gemv_bf16(
+                static_cast<const std::int32_t*>(ws.topk_idx.data()),
+                ws.aligned_act.data(), Lw.moe_down_proj->data(),
+                ws.expert_out.data(),
+                total_tokens, K, H, routed_I, stream);
+            kernels::launch_token_batched_weighted_sum_bf16(
+                ws.moe_out.data(), ws.expert_out.data(),
+                static_cast<const float*>(ws.topk_weights.data()),
+                total_tokens, K, H, stream);
+        } else if (Lw.moe_gate_up_proj != nullptr && ws.aligned_block_size > 0) {
+            const int routes = total_tokens * K;
+            const int block = ws.aligned_block_size;
+            const int active_expert_cap = std::min(E, routes);
+            const int max_blocks =
+                (routes + active_expert_cap * (block - 1) + block - 1) / block;
+            const int aligned_rows = max_blocks * block;
+            if (max_blocks > ws.aligned_max_blocks) {
+                throw std::runtime_error("glm5: aligned MoE scratch too small");
+            }
+
+            kernels::launch_moe_align_decode(
+                static_cast<const std::int32_t*>(ws.topk_idx.data()),
+                static_cast<std::int32_t*>(ws.aligned_route_ids.data()),
+                static_cast<std::int32_t*>(ws.aligned_expert_ids.data()),
+                /*route_to_aligned_row=*/nullptr,
+                routes, E, block, max_blocks, stream);
+            kernels::launch_gather_moe_aligned_inputs_bf16(
+                ws.norm_y.data(),
+                static_cast<const std::int32_t*>(ws.aligned_route_ids.data()),
+                ws.aligned_expert_in.data(),
+                routes, aligned_rows, K, H,
+                /*shared_row_begin=*/-1, total_tokens, stream);
+            kernels::launch_build_moe_ptrs_aligned_bf16(
+                static_cast<const std::int32_t*>(ws.aligned_expert_ids.data()),
+                Lw.moe_gate_up_proj->data(), Lw.moe_down_proj->data(),
+                ws.aligned_expert_in.data(), ws.aligned_gate_up.data(),
+                ws.aligned_act.data(), ws.aligned_out.data(),
+                reinterpret_cast<const void**>(ws.a_gu_ptrs.data()),
+                reinterpret_cast<const void**>(ws.b_gu_ptrs.data()),
+                reinterpret_cast<void**>(ws.c_gu_ptrs.data()),
+                reinterpret_cast<const void**>(ws.a_dn_ptrs.data()),
+                reinterpret_cast<const void**>(ws.b_dn_ptrs.data()),
+                reinterpret_cast<void**>(ws.c_dn_ptrs.data()),
+                max_blocks, block, H, routed_I,
+                /*routed_blocks=*/max_blocks, nullptr, nullptr, stream);
+
+            ops::gemm_batched_act_x_wt_bf16(cublas.handle(),
+                reinterpret_cast<const void* const*>(ws.b_gu_ptrs.data()),
+                reinterpret_cast<const void* const*>(ws.a_gu_ptrs.data()),
+                reinterpret_cast<void* const*>(ws.c_gu_ptrs.data()),
+                block, 2 * routed_I, H, max_blocks);
+            kernels::launch_chunked_swiglu_bf16(
+                ws.aligned_gate_up.data(), ws.aligned_act.data(),
+                aligned_rows, routed_I, stream);
+            ops::gemm_batched_act_x_wt_bf16(cublas.handle(),
+                reinterpret_cast<const void* const*>(ws.b_dn_ptrs.data()),
+                reinterpret_cast<const void* const*>(ws.a_dn_ptrs.data()),
+                reinterpret_cast<void* const*>(ws.c_dn_ptrs.data()),
+                block, H, routed_I, max_blocks);
+            kernels::launch_reorder_moe_aligned_output_bf16(
+                ws.aligned_out.data(),
+                static_cast<const std::int32_t*>(ws.aligned_route_ids.data()),
+                ws.expert_out.data(),
+                routes, aligned_rows, H,
+                /*shared_row_begin=*/-1, total_tokens, nullptr, stream);
+            kernels::launch_token_batched_weighted_sum_bf16(
+                ws.moe_out.data(), ws.expert_out.data(),
+                static_cast<const float*>(ws.topk_weights.data()),
+                total_tokens, K, H, stream);
+        } else {
+
         // ── Per-expert prefill MoE ──────────────────────────────────
-        // Single path that works for prefill and decode. Builds host-side
-        // routing, then walks experts sequentially. This is the simple
-        // worst-case-correct path; Kimi's INT4 decode fast-path doesn't
-        // apply to GLM-5.1's FP8 expert layout.
+        // Fallback for quantised checkpoints, where the loader keeps the
+        // per-expert layout. Builds host-side routing, then walks experts
+        // sequentially.
         std::vector<std::int32_t> topk_idx_h(
             static_cast<std::size_t>(total_tokens) * K);
         std::vector<float> topk_w_h(static_cast<std::size_t>(total_tokens) * K);
@@ -519,6 +656,7 @@ void glm5_forward_paged(
                 static_cast<const float*>(ws.route_w.data()),
                 Ne, H, stream);
         }
+        }  // end per-expert fallback
 
         // ── Shared experts ──────────────────────────────────────────
         if (shared_I > 0 && Lw.shared_gate_proj != nullptr) {
@@ -549,12 +687,13 @@ void glm5_forward_paged(
         kernels::launch_residual_add_bf16(
             ws.y.data(), ws.moe_out.data(),
             static_cast<std::size_t>(total_tokens) * H, stream);
+        act_dump_bf16(act_dump_layer_tag("out", li).c_str(),
+            ws.y.data(), total_tokens, H, stream);
     }
 
     if (!fwd_cfg.emit_logits) {
         return;
     }
-
     // ── Final norm + lm_head ─────────────────────────────────────────
     const bool compact_logits =
         logit_row_indices_d != nullptr && num_logit_rows > 0 &&
@@ -576,9 +715,11 @@ void glm5_forward_paged(
         throw std::runtime_error(
             "glm5: sharded lm_head not supported in first-pass forward");
     }
+    act_dump_bf16("final_norm", ws.norm_y.data(), rows, H, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.norm_y.data(), *w.lm_head, logits_out,
         rows, V, H);
+    act_dump_bf16("logits", logits_out, rows, V, stream);
 }
 
 }  // namespace pie_cuda_driver::model

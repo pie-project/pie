@@ -43,7 +43,37 @@ __global__ void gpt_oss_glu_bf16_kernel(
     y[idx] = __float2bfloat16((u + 1.f) * glu);
 }
 
+__global__ void swiglu_clamp_bf16_kernel(
+    const __nv_bfloat16* __restrict__ gate,
+    const __nv_bfloat16* __restrict__ up,
+    __nv_bfloat16* __restrict__ y,
+    int n,
+    float limit)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    float g = __bfloat162float(gate[idx]);
+    float u = __bfloat162float(up[idx]);
+    g = fminf(g, limit);
+    u = fminf(fmaxf(u, -limit), limit);
+    y[idx] = __float2bfloat16((g / (1.f + expf(-g))) * u);
+}
+
 }  // namespace
+
+void launch_swiglu_clamp_bf16(
+    const void* gate, const void* up, void* y,
+    int num_elements, float limit, cudaStream_t stream)
+{
+    constexpr int BLOCK = 256;
+    const int grid = (num_elements + BLOCK - 1) / BLOCK;
+    swiglu_clamp_bf16_kernel<<<grid, BLOCK, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(gate),
+        static_cast<const __nv_bfloat16*>(up),
+        static_cast<__nv_bfloat16*>(y),
+        num_elements, limit);
+}
 
 void launch_swiglu_bf16(
     const void* gate, const void* up, void* y,
@@ -155,6 +185,24 @@ __global__ void chunked_swiglu_bf16_kernel(
     y[row + i] = __float2bfloat16(silu * u);
 }
 
+__global__ void chunked_swiglu_clamp_bf16_kernel(
+    const __nv_bfloat16* __restrict__ packed,
+    __nv_bfloat16*       __restrict__ y,
+    int N, int I, float limit)
+{
+    const int n = blockIdx.x;
+    const int i = blockIdx.y * blockDim.x + threadIdx.x;
+    if (n >= N || i >= I) return;
+
+    const long long row = static_cast<long long>(n) * I;
+    const long long packed_row = row * 2;
+    float g = __bfloat162float(packed[packed_row + i]);
+    float u = __bfloat162float(packed[packed_row + I + i]);
+    g = fminf(g, limit);
+    u = fminf(fmaxf(u, -limit), limit);
+    y[row + i] = __float2bfloat16((g / (1.f + expf(-g))) * u);
+}
+
 __global__ void chunked_swiglu_bf16_vec2_kernel(
     const __nv_bfloat16* __restrict__ packed,
     __nv_bfloat16*       __restrict__ y,
@@ -254,6 +302,17 @@ void launch_chunked_swiglu_bf16(
         static_cast<const __nv_bfloat16*>(packed),
         static_cast<__nv_bfloat16*>(y),
         N, I);
+}
+
+void launch_chunked_swiglu_clamp_bf16(
+    const void* packed, void* y, int N, int I, float limit,
+    cudaStream_t stream)
+{
+    constexpr int BLOCK = 256;
+    const dim3 grid(N, (I + BLOCK - 1) / BLOCK);
+    chunked_swiglu_clamp_bf16_kernel<<<grid, BLOCK, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(packed),
+        static_cast<__nv_bfloat16*>(y), N, I, limit);
 }
 
 void launch_chunked_swiglu_strided_bf16(

@@ -169,19 +169,6 @@ fn normalize_expr(
                 decl: decl.clone(),
             })
         }
-        LayoutExpr::Attach {
-            data,
-            metadata,
-            decl,
-        } => {
-            let data = normalize_expr(plan, *data, out, memo)?;
-            let metadata = normalize_inputs(plan, metadata, out, memo)?;
-            out.push(LayoutExpr::Attach {
-                data,
-                metadata,
-                decl: decl.clone(),
-            })
-        }
         LayoutExpr::Realize {
             input,
             runtime_name,

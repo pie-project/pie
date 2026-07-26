@@ -20,7 +20,7 @@
 //! | quorum fire rule (F1–F6), depth-1 enqueue | **2** (bravo) | `QuorumPolicy` (unit + fleet-sim tested); wired behind `run-ahead` |
 //! | in-flight-safe `alloc` headroom top-up | **2 + 1** | proven in `runahead_alloc.rs` |
 //! | MTP speculation (K+1 window, match-verify) | **3** | extension point — building blocks present (`mtp_argmax`/`spec_verify_greedy`/MtpLogits mock support); pending the composed decode-loop inferlet |
-//! | Quest page-mask attention sink | **3 + 1** | extension point — pending `attn_page_mask` backend + `envelope_dot` (overview §4, direction-only) |
+//! | Quest page-mask attention sink | **3 + 1** | proven below (§4 bind rule both directions + zero added decode edges); numerics on the real-driver harness, design doc §10 |
 //! | §6.2 beam search (B lanes in ONE forward) | **1 + 3** | pending — single batched instance ⇒ dodges the multi-pipeline arena bug; likely first full composition to run |
 //!
 //! ## Extension points (as the thrusts land)
@@ -267,21 +267,142 @@ fn north_star_mtp_grammar_composition() {
     );
 }
 
-/// **Quest page-mask attention sink (extension point).** The §6.1 attention leg:
-/// per-layer page importance → `pivot_threshold(score, rank_le(budget))` →
-/// `attn_page_mask` sink, produced and consumed inside one forward (no channel,
-/// no decode-chain edge). Gated on backend `attn_page_mask` availability
-/// (overview §4 bind-time rule; direction-only under the no-attention-kernel
-/// constraint) + thrust-1's `envelope_dot` kernel. `#[ignore]` until the backend
-/// exposes it.
+/// **§6.1 Quest page-mask attention leg — runnable (bind rule + zero edges).**
+/// The attention third of the north star: per-layer page importance
+/// (`envelope_dot`) → `pivot_threshold(score, rank_le(budget))` →
+/// `attn_page_mask` sink, produced and consumed inside ONE `OnAttnProj` stage.
+///
+/// Two properties, and the second is the one that makes the composition free:
+///   - **the §4 bind-time rule** — the leg binds against a backend advertising
+///     `envelope_dot` and `attn_page_mask`, and is REFUSED against one that
+///     does not. `attn_page_mask` is a *first-party* sink name, so nothing in
+///     the sink registry gates it; without an explicit capability check a
+///     program binds on every backend and silently no-ops on the ones that only
+///     observe, which is strictly worse than not running at all.
+///   - **zero added decode edges** — the leg declares no channel and no port.
+///     Score and mask are both stage-local values, so composing it onto the
+///     MTP+grammar loop above adds nothing to the decode chain: no
+///     loop-carried geometry, no host round trip, no extra fire dependency.
+///     This is why §6.1 can claim all three programs ride one forward.
+///
+/// Numerics are the real-driver harness's job and are covered there: on
+/// L40S/Qwen3-0.6B a 1-page budget diverges from an all-page budget while an
+/// all-page budget reproduces the unmasked baseline token for token
+/// (`tests/inferlets/test_mask_enforced.py`, design doc §10). The eval-mock has
+/// no attention values to score, so what it can prove is the structure — which
+/// is exactly what this harness is for.
 #[test]
-#[ignore = "pending backend attn_page_mask availability + thrust-1 envelope_dot kernel (overview §4/§6.1, direction-only)"]
 fn north_star_quest_attention_sink() {
-    // TODO(M3, overview §6.1): on_attn_proj(|| {
-    //   let score = envelope_dot(query());                       // [P_MAX]
-    //   attn_page_mask(pivot_threshold(score, rank_le(budget))); // sink, [P_MAX] bool
-    // }); — composes onto the MTP+grammar loop with zero added decode edges.
-    unreachable!("scaffold only");
+    use pie_ptir::container::{StageProgram, TraceContainer};
+    use pie_ptir::op::{IntrinsicId, Op};
+    use pie_ptir::registry::{KernelInfo, ModelProfile, Stage};
+    use pie_ptir::types::{DType, Literal, Predicate, Shape};
+    use pie_ptir::validate::{bind, ValidateError};
+
+    const PAGES: u32 = 8;
+    const BUDGET: u32 = 3;
+
+    // The §6.1 attention leg verbatim. Names are sorted, as the container
+    // requires -- `attn_page_mask` before `envelope_dot`, which is the reverse
+    // of the order a program uses them in (see the ptir-dsl regression test
+    // `the_name_table_is_sorted_and_indices_are_remapped`).
+    let quest_leg = |budget: u32| TraceContainer {
+        names: vec!["attn_page_mask".to_string(), "envelope_dot".to_string()],
+        externs: vec![],
+        channels: vec![],
+        ports: vec![],
+        stages: vec![StageProgram {
+            stage: Stage::OnAttnProj,
+            ops: vec![
+                // 0: the layer's query, the kernel's only input.
+                Op::IntrinsicVal {
+                    intr: IntrinsicId::Query,
+                    shape: Shape::vector(1),
+                    dtype: DType::F32,
+                },
+                // 1: per-page criticality bound.
+                Op::KernelCall {
+                    name: 1,
+                    args: vec![0],
+                    shape: Shape::vector(PAGES),
+                    dtype: DType::F32,
+                },
+                // 2: the budget. `RankLe` takes a value id, not a literal --
+                //    the rank is allowed to be computed (Quest clamps it to the
+                //    request's page count).
+                Op::Const(Literal::U32(budget)),
+                // 3: keep-mask = the top `budget` pages, in one op. `top_k`
+                //    would need a second reduce and is a library region, i.e. a
+                //    fusion barrier; `pivot_threshold` is generated.
+                Op::PivotThreshold {
+                    input: 1,
+                    predicate: Predicate::RankLe(2),
+                },
+                // 4: apply. No result id -- the sink configures this forward.
+                Op::SinkCall { name: 0, args: vec![3] },
+            ],
+        }],
+    };
+
+    let profile = |quest: bool| {
+        let mut p = ModelProfile {
+            vocab: 32,
+            page_size: 16,
+            num_layers: 2,
+            has_attn_page_mask: quest,
+            ..ModelProfile::dummy()
+        };
+        p.kernels.retain(|k| k.name != "envelope_dot");
+        if quest {
+            p.kernels.push(KernelInfo {
+                name: "envelope_dot".to_string(),
+                sink_scope: None,
+                replayable: true,
+            });
+        }
+        p
+    };
+
+    // The container must also be emittable -- `bind` checks the name table is
+    // sorted, but only `encode` proves the whole thing serialises.
+    assert!(!quest_leg(BUDGET).encode().is_empty());
+
+    // (1) The §4 bind rule, both directions.
+    let bound = bind(quest_leg(BUDGET), profile(true))
+        .expect("the quest leg must bind against a backend that advertises envelope_dot + attn_page_mask");
+
+    match bind(quest_leg(BUDGET), profile(false)) {
+        Err(ValidateError::KernelUnavailable { .. }) => {}
+        Err(other) => panic!(
+            "the quest leg must be refused for the RIGHT reason on a backend without \
+             the capability, got: {other:?}"
+        ),
+        Ok(_) => panic!(
+            "the quest leg bound against a backend that neither scores pages nor honours \
+             attn_page_mask -- it would have observed and silently discarded the mask, \
+             paying the cost for none of the benefit"
+        ),
+    }
+
+    // (2) Zero added decode edges: the whole leg is stage-local.
+    let c = &bound.container;
+    assert!(
+        c.channels.is_empty(),
+        "the quest leg must carry no channel -- a loop-carried value would put it on the \
+         decode chain and §6.1's one-forward composition would no longer be free: {:?}",
+        c.channels
+    );
+    assert!(
+        c.ports.is_empty(),
+        "the quest leg must bind no port -- it reads the forward it is running in: {:?}",
+        c.ports
+    );
+    assert_eq!(
+        c.stages.len(),
+        1,
+        "the leg lives entirely in OnAttnProj; anything else is an extra pass"
+    );
+    assert_eq!(c.stages[0].stage, Stage::OnAttnProj);
 }
 
 /// **§6.2 beam-search composition (extension point).** Beam search runs **B lanes
@@ -381,7 +502,7 @@ fn north_star_fleet_8_concurrent_decode_completes() {
 /// with the tier-0 reference interpreter (echo's golden model). Until then it is
 /// `#[ignore]`d so the harness compiles and documents the target.
 #[test]
-#[ignore = "pending thrust-3 PTIR program model (MTP epilogue) + Quest attn_page_mask backend"]
+#[ignore = "pending thrust-3 PTIR program model (MTP epilogue); the Quest leg now runs -- see north_star_quest_attention_sink"]
 fn north_star_mtp_grammar_quest_composition() {
     // TODO(M3): compose overview §6.1 —
     //   - MTP epilogue emits K drafts + match-verify (n_acc, sentinel -1);

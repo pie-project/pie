@@ -45,6 +45,10 @@ pub struct TileMapFacts {
     /// the driver refused to tile those.
     pub compact_source: bool,
     /// Declared 2-D shape of the primary output, or `None` if it is not 2-D.
+    ///
+    /// Read from the *instruction*, not the target: the planner may narrow the
+    /// budget for one instruction (`planner.rs` does, for a repack), and a rule
+    /// that consulted the target would silently ignore that.
     pub shape: Option<(u64, u64)>,
     pub max_tile_bytes: u64,
 }

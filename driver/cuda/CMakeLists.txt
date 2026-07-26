@@ -415,6 +415,7 @@ set(PIE_CUDA_MODEL_SOURCES
   src/ops/attention_mla.cu
   src/ops/flashinfer_mamba.cu
   src/store/dsa_cache.cpp
+  src/store/dsv4_compress_cache.cpp
   src/store/mla_cache.cpp)
 
 # ---- pie_driver_cuda_lib ---------------------------------------------------
@@ -827,15 +828,35 @@ pie_add_cuda_target(test_ptir_decoder_limits
     ${CMAKE_CURRENT_SOURCE_DIR}/../../interface/ptir/tests/malformed_wire_corpus.txt
     ${PIE_PTIR_CANONICAL_GOLDENS})
 
-# The driver's declared contract vs. the plan the loader builds (§12 row 7b-4b).
-# Set PIE_TEST_SNAPSHOT to also check it against a real checkpoint.
-pie_add_cuda_target(test_model_contract
-  SOURCES tests/model_contract_test.cpp src/model/config.cpp
-  INCLUDE_DIRS
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
-    ${PIE_DRIVER_ABI_INCLUDE_DIR}
-    ${PIE_LOADER_INCLUDE_DIR}
-  LIBS nlohmann_json::nlohmann_json)
+# The contract this driver authors (§12 row 12).
+# Set PIE_TEST_SNAPSHOT to also author it against a real checkpoint.
+#
+# Authoring reads the checkpoint's tensor table, which means calling into
+# `pie-loader` — and `pie-loader` is an rlib the *worker* links, not something a
+# C++ test binary can pull in. `cargo rustc -p pie-loader --lib --crate-type
+# staticlib` emits an archive that does link. When it is there this test is
+# built; when it is not the target is skipped, because failing the whole build
+# for everyone who has not run that command would be worse than not running one
+# test.
+if(NOT PIE_LOADER_STATICLIB)
+  find_library(PIE_LOADER_STATICLIB
+    NAMES pie_loader
+    PATHS ${CMAKE_CURRENT_SOURCE_DIR}/../../target/debug
+    NO_DEFAULT_PATH)
+endif()
+if(PIE_LOADER_STATICLIB)
+  pie_add_cuda_target(test_model_contract
+    SOURCES tests/model_contract_test.cpp src/model/config.cpp
+    INCLUDE_DIRS
+      ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+      ${PIE_DRIVER_ABI_INCLUDE_DIR}
+      ${PIE_LOADER_INCLUDE_DIR}
+    LIBS nlohmann_json::nlohmann_json ${PIE_LOADER_STATICLIB} dl pthread)
+else()
+  message(STATUS
+    "test_model_contract: skipped (no libpie_loader.a; build one with "
+    "`cargo rustc -p pie-loader --lib --crate-type staticlib`)")
+endif()
 
 # Mixed prefill/decode batch: a continuing T=1 request must reuse its conv window.
 pie_add_cuda_target(test_causal_conv1d
@@ -872,6 +893,10 @@ pie_add_cuda_target(test_decode_batch_parity
   LIBS pie_driver_cuda_lib CUDA::cudart)
 pie_add_cuda_target(test_attn_score_capture
   SOURCES tests/test_attn_score_capture.cu
+  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/tests
+  LIBS pie_driver_cuda_lib CUDA::cudart)
+pie_add_cuda_target(test_attn_prefill_score_capture
+  SOURCES tests/test_attn_prefill_score_capture.cu
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/tests
   LIBS pie_driver_cuda_lib CUDA::cudart)
 pie_add_cuda_target(test_attn_score_fold

@@ -104,9 +104,9 @@ becomes once the plan is an in-process pointer rather than a byte buffer.
   ╔════════════════════════════════════════════════════════════════╗
   ║  driver/{cuda,metal}/         C++. owns load_model end-to-end.  ║
   ║                                                                ║
-  ║    declares its own contract + TargetSpec                      ║
+  ║    authors its own contract + TargetSpec                       ║
   ║          │                                                     ║
-  ║          │ ① pie_loader_compile(...)   extern "C" → Rust       ║
+  ║          │ ① pie_loader_compile_contract(...)  extern "C" →    ║
   ║          ▼                                                     ║
   ║  ┌──────────────────────────────────────────────────────────┐  ║
   ║  │ loader/     pure Rust · no GPU · no device calls          │  ║
@@ -191,12 +191,17 @@ The loader's surface is small:
 namespace pie_loader {
 extern "C" {
 
-PieLoaderStatus pie_loader_compile(const PieLoaderRequest* req,
-                                   PieLoaderPlan**         out_plan,
-                                   PieLoaderDiagnostics**  out_diags);
-PieLoaderStatus pie_loader_verify (const PieLoaderPlan*    plan,
-                                   const PieLoaderRequest* req,
-                                   PieLoaderDiagnostics**  out_diags);
+PieLoaderStatus pie_loader_open_checkpoint (PieLoaderBytes           dir,
+                                            PieLoaderCheckpoint**    out,
+                                            PieLoaderDiagnostics**   out_diags);
+void            pie_loader_close_checkpoint(PieLoaderCheckpoint* ckpt);
+
+PieLoaderStatus pie_loader_compile_contract(const PieLoaderContractRequest* req,
+                                            PieLoaderPlan**          out_plan,
+                                            PieLoaderDiagnostics**   out_diags);
+PieLoaderStatus pie_loader_verify_contract (const PieLoaderPlan*     plan,
+                                            const PieLoaderContractRequest* req,
+                                            PieLoaderDiagnostics**   out_diags);
 void            pie_loader_release(PieLoaderPlan* plan);
 void            pie_loader_release_diagnostics(PieLoaderDiagnostics* diags);
 
@@ -205,7 +210,7 @@ void            pie_loader_release_diagnostics(PieLoaderDiagnostics* diags);
 ```
 
 The header is generated in cbindgen's **C++ mode**, not C. The linkage is still
-plain C — `extern "C"` is emitted inside the namespace, so the four symbols are
+plain C — `extern "C"` is emitted inside the namespace, so the six symbols are
 unmangled and the ABI is unchanged — but the declarations are C++: scoped
 `enum class`, and everything wrapped in `namespace pie_loader`. That
 choice is not cosmetic. Both drivers are C++ and already spelled these types
@@ -229,9 +234,17 @@ walks it in place.
 // driver/cuda/src/loader/load_model.cpp
 PieLoaderPlan*        plan  = nullptr;
 PieLoaderDiagnostics* diags = nullptr;
-PieLoaderRequest req{ snapshot_dir, cuda_contract(), target_spec(), policy };
-if (pie_loader_compile(&req, &plan, &diags) != PIE_LOADER_OK) return fail(diags);
-if (pie_loader_verify(plan, &req.contract, &diags) != PIE_LOADER_OK) return fail(diags);
+
+// Three inputs, none of them a model's name: the tensor table, the program
+// stated over it, and the device. `author_model_contract` reads the first to
+// write the second (§10.2).
+pie_loader::Checkpoint ckpt = pie_loader::Checkpoint::open(snapshot_dir, &err);
+pie_loader::ModelContract contract;
+pie_driver::author_model_contract(ckpt, facts, target, /*...*/, contract);
+
+PieLoaderContractRequest req{ ckpt.get(), target_spec(target), contract.view() };
+if (pie_loader_compile_contract(&req, &plan, &diags) != PIE_LOADER_OK) return fail(diags);
+if (pie_loader_verify_contract(plan, &req, &diags) != PIE_LOADER_OK) return fail(diags);
 
 void* arena = ctx.alloc(plan->memory.persistent_bytes);
 execute(plan, arena);            // mmap · staged H2D · kernel_id → launch
@@ -288,7 +301,7 @@ Two things are therefore needed, and both are in place:
   entry point brings all four, since they share the object file that holds the
   table.
 * `PIE_LOADER_ENTRY_ANCHOR` in `worker/src/embedded_driver.rs`, a `#[used]`
-  static holding `pie_loader_compile`'s address. This is the reference. It is
+  static holding `pie_loader_compile_contract`'s address. This is the reference. It is
   redundant today, because the worker still calls `pie-loader` for
   `compiler_version()`; it becomes load-bearing at step 2, when those calls go
   away. Deleting it then would reintroduce exactly the bug it prevents.
@@ -440,7 +453,7 @@ link because the C++ driver is linked into the same binary (§3.2).
                 + measured device values (SM count, smem, VRAM)
                 + tp_rank / tp_size for this rank (§6.3)
 3.  driver C++: build the contract it declares (from tensor_spec.hpp vocabulary)
-4.  driver C++: pie_loader_compile(&req, &plan, &diags)  ─┐
+4.  driver C++: pie_loader_compile_contract(&req, ...)   ─┐
        ┌─────────────────────────────────────────────────┘
        │  loader (Rust):
        │    parse checkpoint headers   (no tensor data read)
@@ -537,17 +550,19 @@ The sequence above is one rank. Tensor-parallel loads run it `tp_size` times,
 and almost nothing new is required, because both halves already exist.
 
 **The loader already shards.** `StorageTarget` carries `tp_rank` and `tp_size`
-(`loader/src/load_plan.rs:40-41`); `frontend.rs:57-78` divides the declared
-shape along the contract's shard axis and attaches `Sharding { world, rank }`;
-`abi.rs:811-816` rejects a dimension that does not divide evenly. `TargetSpec`
-absorbs these two fields and the behaviour carries over unchanged.
+(`loader/src/load_plan.rs:40-41`); a partition is written into the contract as
+`Expr::Shard`, and `Resolver::specialize` rewrites each one into the slice that
+rank reads, rejecting a dimension that does not divide evenly and naming the
+tensor when it refuses. Below `frontend.rs` the expression means the same thing
+on every rank. `TargetSpec` absorbs these two fields and the behaviour carries
+over unchanged.
 
 **The ranks already load in parallel.**
 `runtime/engine/src/driver/backend/cuda.rs:331-345` spawns one thread per rank
 inside a `std::thread::scope` and calls `load_model` on each. Three consequences
 follow, and only the third is a design decision:
 
-* **Thread safety is a requirement, not an aspiration.** `pie_loader_compile`
+* **Thread safety is a requirement, not an aspiration.** `pie_loader_compile_contract`
   will be entered concurrently by `tp_size` threads on day one. It must hold no
   global mutable state — the same contract `runtime/waker/src/ffi.rs` states as
   *"callable from any thread, never unwinds."*
@@ -857,7 +872,7 @@ failure mode left to check for.
 
 Moving the call site into the driver deletes the cycle outright rather than
 merely reversing it: the driver builds `TargetSpec` with the device in hand and
-passes it directly to `pie_loader_compile`, so there is no outward hop for the
+passes it directly to `pie_loader_compile_contract`, so there is no outward hop for the
 constant to make. Device-measured values still flow in; only the loader's own
 constants stop pretending to be discoveries.
 
@@ -945,22 +960,36 @@ loader/
 ├── architecture.md          this document
 ├── contribution.md          research framing
 ├── include/
-│   └── pie_loader.h         committed generated header — the only thing C++ sees
+│   ├── pie_loader.h         committed generated header — the only thing C++ sees
+│   └── pie_loader/          the header-only C++ SDK over it
+│       ├── plan.hpp         RAII plan handle + diagnostics
+│       ├── request.hpp      DeviceTarget → PieLoaderTargetSpec (`target_spec`)
+│       ├── model_contract.hpp   the authoring DSL: `define(name, expr).expect(shape)`
+│       ├── source_checkpoint.hpp  Checkpoint RAII handle: `tensors` · `find` · `has`
+│       └── checkpoint_source.hpp  the mmap byte reader (§12 row 11a)
 ├── cbindgen/                [bin] pie-loader-cbindgen — owns cbindgen.toml
 ├── src/
 │   ├── lib.rs
-│   ├── main.rs              CLI: dump · verify · diff · replay
-│   ├── ffi/                 #[repr(C)] LOW IR + the four entry points — the only
+│   ├── main.rs              CLI: dump · verify · diff · replay — takes a
+│   │                          SNAPSHOT and a CONTRACT, because there is no
+│   │                          longer anything that could guess the second
+│   ├── ffi/                 #[repr(C)] LOW IR + the six entry points — the only
 │   │   │                      module cbindgen reads.  was load_plan.rs + inproc.rs
 │   │   ├── mod.rs           re-exports; request → compiler-input translation
 │   │   ├── types.rs         the POD vocabulary + the PIE_LOADER_* constants
 │   │   ├── arena.rs         owning arena; LoadPlan → PieLoaderPlan; release
+│   │   ├── contract.rs      the contract *both ways*: `read_contract` for the
+│   │   │                      driver's declaration, `write_contract` for the
+│   │   │                      round-trip the goldens check (§12 row 12)
+│   │   ├── checkpoint.rs    PieLoaderCheckpoint — source facts as an FFI value,
+│   │   │                      so contract and plan are about one parse
 │   │   └── entry.rs         status/diagnostics + the extern "C" functions
 │   ├── error.rs             CompileError — flattened into PieLoaderDiagnostics
-│   ├── types.rs             shared vocabulary: DType, Encoding, Sharding, ids
+│   ├── types.rs             shared vocabulary: DType, Encoding, ids
 │   ├── checkpoint/          safetensors · gguf · headers
-│   │                          was checkpoint_header.rs + gguf.rs + source.rs
-│   ├── frontend.rs          contracts → HIGH IR; applies TP sharding (§6.3)
+│   │   └── read.rs          the one module that opens a file (§12 row 12,
+│   │                          phase 2); pinned by tests/standalone.rs
+│   ├── frontend.rs          contracts → HIGH IR; specializes TP shards (§6.3)
 │   │                          `plan_from_contracts`; semantic.rs, schema.rs and
 │   │                          schemas/ are deleted (step 7a, §10.2.1)
 │   ├── contract.rs          the declaration format and its type checker
@@ -975,13 +1004,12 @@ loader/
 │   │   ├── cuda.rs          fusion rules · tile sizing
 │   │   ├── metal.rs         empty tile-map mask: no transform kernels
 │   │   └── host.rs          reference lowering — declines every optimization
-│   ├── arch/                was abi/ — keeps only the layer-3 IR transforms;
-│   │                          shrinks further as contracts retire the
-│   │                          model_type gating (§10.2.1, §10.4)
+│   ├── planner/rewrite.rs   contract → contract optimizations; all that
+│   │                          survived `arch/` (§12 row 12, phase 4)
 │   ├── verify.rs            fn verify(&PlanView, Option<&ContractView>)
 │   │                            -> Result<Certificate, Vec<Violation>>
-│   │                          the contract is the driver's declaration, marshalled
-│   │                          at the FFI boundary by ffi/entry.rs::contract_view
+│   │                          the contract is the driver's, read back off the
+│   │                          request by ffi/entry.rs::read_contract_request
 │   ├── dump.rs              plan → text: the CLI's dumps, and the boot-log
 │   │                          line and JSON shape summary the driver used to
 │   │                          assemble itself (§12 row 10)
@@ -992,9 +1020,13 @@ loader/
     ├── algebra.rs           Expr → compile → Gather → reference, vs a naive
     │                          per-coordinate oracle: the byte-level differential
     ├── storage_compiler.rs  plan shape for hand-built ABIs
+    ├── standalone.rs        the architecture as a test: nothing below the reader
+    │                          opens a file, names a model, or states a device
+    │                          constant — and a plan compiles from a value alone
     └── golden_plans.rs      whole compiled plans, byte-exact, for 4 synthetic
                                architectures × 2 backends × 3 TP configs;
-                               UPDATE_GOLDEN=1 regenerates
+                               each also asserts its *contract* survives the FFI
+                               round-trip; UPDATE_GOLDEN=1 regenerates
 ```
 
 The loader ships a small C++ SDK beside the generated header. It is part of the
@@ -1011,11 +1043,14 @@ loader/include/
     │                          extent_bytes, bytes_to_string). States nothing
     │                          about any backend — see §9 on why the tile-map
     │                          masks stay with the kernels that honour them
-    ├── request.hpp          DeviceTarget / ModelFacts / build_request — the
-    │                          typed front for PieLoaderRequest's borrowed spans
-    ├── tensor_contract.hpp  the builder façade — demand / demand_optional /
-    │                          slice; deque-backed so the borrowed PODs survive
-    │                          growth (§10.2.1)
+    ├── request.hpp          DeviceTarget → PieLoaderTargetSpec (`target_spec`).
+    │                          One function: the two copies it replaced, one per
+    │                          driver, had already disagreed once
+    ├── model_contract.hpp   the authoring DSL — `define(name, expr).expect(shape)`
+    │                          and all ten node constructors; deque-backed so the
+    │                          borrowed PODs survive growth (§10.2)
+    ├── source_checkpoint.hpp  Checkpoint RAII handle: tensors · find · has —
+    │                          the tensor table an author writes against
     └── checkpoint_source.hpp
                              mmap + pread over the file table the plan names.
                                Pure POSIX: it was written twice, once per
@@ -1030,9 +1065,9 @@ driver/cuda/
 ├── src/loader/
 │   ├── load_plan.hpp        kCudaTileMapMask and the device constants, and
 │   │                          cuda_device_target() which fills them in
-│   ├── model_contracts.hpp  declare_model_contract(hf, tp_size), dispatching
-│   │                          on model_type; an undeclared family returns an
-│   │                          empty contract, which is a no-op
+│   │                          (`author_model_contract` lives one level up, in
+│   │                          driver/common/include/pie_driver, because both
+│   │                          drivers author the same contracts)
 │   ├── tensor_spec.hpp      TensorDecl — what the store knows about a resident
 │   │                          tensor beyond its bytes: dtype/shape (the plan's
 │   │                          claim, re-checked against the tensor), ownership
@@ -1044,15 +1079,23 @@ driver/cuda/
 │                              before the rest moved to Rust — §12 row 10)
 └── tests/model_contract_test.cpp
                              the builder's invariants, plus — under
-                             PIE_TEST_SNAPSHOT — an export of the real
-                             declaration for the Rust side to check (§12)
+                             PIE_TEST_SNAPSHOT — authoring the real contract
+                             against a real checkpoint, and under
+                             PIE_TEST_CONTRACT_DUMP exporting it as JSON (§12)
+
+driver/common/include/pie_driver/
+└── model_contracts.hpp      author_model_contract(checkpoint, facts, target,
+                               runtime_quant, mxfp4_moe, component, &out) —
+                               every family, for both backends. The one place
+                               in the system that knows what a `model_type` is
 ```
 
-`config.rs` survives, but no longer on the load path. Since step 7b-4's first
-half the driver states the five model facts on the request
-(`PieLoaderModelSpec`), so `pie_loader_compile` opens no JSON at all; the parser
-remains only for `ffi/inproc.rs`'s callers — the CLI, the tools and the tests —
-which hold a snapshot directory and no driver.
+The loader reads no `config.json`. The driver has already parsed it to build its
+own model, and states the handful of facts a contract needs as arguments to
+`author_model_contract`; `config.rs` and `parse_model_config` are deleted (§12
+row 12, phase 4). `loader/tests/standalone.rs` holds this as a property rather
+than a habit: it greps every production line of the crate for a family name in a
+string literal, with no module exempt.
 
 ### 10.1 One crate, not five
 
@@ -1072,11 +1115,13 @@ publishing — none of which apply. Rust modules provide the layering.
 
 ### 10.2 Naming: `ffi` vs `arch`
 
-`src/abi/` was the *model architecture* guessing layer (`nemotron.rs`,
-`qwen_moe.rs`, `gpt_oss.rs`, `fusion.rs`). That is "model ABI", which collides
-with "C ABI" once a real C surface exists. The C surface is `ffi/`; the model
-layer is now `arch/`, and mostly disappears once contracts are declared rather
-than inferred.
+*Historical.* `src/abi/` was the *model architecture* guessing layer
+(`nemotron.rs`, `qwen_moe.rs`, `gpt_oss.rs`, `fusion.rs`). That is "model ABI",
+which collides with "C ABI" once a real C surface exists. The C surface is
+`ffi/`, and it is the only one left: the model layer, renamed `arch/`, was
+deleted whole in §12 row 12 phase 4 once contracts were declared rather than
+inferred. The subsection below records what the three layers were, because the
+reasoning is what made the deletion safe rather than brave.
 
 #### 10.2.1 `abi/` is three layers, not one
 
@@ -1093,7 +1138,7 @@ three stages of a compiler:
 Read that way, three things fall out that the flat reading hides.
 
 **Layer 1 is already dead, and was never driver knowledge.** Nothing constructs
-`RuntimeTensorSource::Semantic`. `RuntimeAbi::default_for_target` is the only
+`RuntimeTensorSource::Semantic`. `arch::default_contract` is the only
 builder, and it resolves names to `TensorId`s directly, emitting `DirectTensor`
 exclusively — so `planner.rs`'s `needs_semantic_graph` check was always false
 and `build_semantic_graph` was never called. `schema.rs` (28), `schemas/` (233)
@@ -1126,9 +1171,17 @@ contract nobody wrote down. Once the contract is declared, the pass fuses iff a
 fused output is demanded, and `skip_dense_qkv_fusion`, `stack_per_expert_moe`,
 `phi3_fused_splits` and `metal_qwen35` have nothing left to say.
 
-So step 7b does not "move `arch/` to C++". Layer 1 is deleted, layer 2 is
-declared by the driver, and layer 3 **stays in Rust and shrinks**, because most
-of what makes it look model-specific is scar tissue from the missing layer 2.
+So step 7b did not "move `arch/` to C++". Layer 1 was deleted, layer 2 is
+authored by the driver, and layer 3 **stayed in Rust and shrank** — because most
+of what made it look model-specific was scar tissue from the missing layer 2.
+
+That prediction held further than it was stated. With layer 2 written down, all
+four remaining layer-3 gates had nothing left to say, and so did the passes they
+guarded: `fusion.rs`, `phi3.rs`, `qwen_moe.rs`, `nemotron.rs`, `gpt_oss.rs` and
+`metal.rs` were each a way of computing an expression the contract now simply
+contains. What survived is `planner/rewrite.rs` — `coalesce_direct_row_shards`
+and its helpers — which is layer 3 with no layer-2 guess in it at all: it
+rewrites a contract into a cheaper contract, and asks nothing about the model.
 
 One genuine decision looked like it survived, and it does not. Fusion appeared
 to be a real optimizer choice: `dense_fused_projection_budget_bytes` notes that
@@ -1160,37 +1213,40 @@ publishes for free because it already computed the offsets.
 The declaration format that follows from this is specified separately in
 [`spec.md`](spec.md).
 
-**Where the declaration lives now.** `pie_loader::TensorContract`
-(`loader/include/pie_loader/tensor_contract.hpp`) is the builder, and it
-is deliberately dumb: `demand(name, shape)`, `demand(name)`,
-`demand_optional(name, shape)`, plus a `slice()` of borrowed PODs for the FFI.
-The one non-obvious thing about it is that the names and shapes are stored in a
-`std::deque`. The PODs point *into* that storage, so a `std::vector` would
-invalidate every already-built demand on growth — a use-after-free that appears
-only above some tensor count, which is to say only on large models. A test
-builds 512 demands and reads every one of them back.
+**Where the contract is authored now.** `pie_loader::ModelContract`
+(`loader/include/pie_loader/model_contract.hpp`) is the builder:
+`define(name, expr).expect(shape)`, plus a constructor for each of the ten
+algebra nodes and a `view()` of borrowed PODs for the FFI. The one non-obvious
+thing about it is that the names, shapes and nodes are stored in `std::deque`s.
+The PODs point *into* that storage, so a `std::vector` would invalidate every
+already-built node on growth — a use-after-free that appears only above some
+tensor count, which is to say only on large models. A test builds 512 tensors
+and reads every one of them back.
 
-Per-family declarations live in `driver/cuda/src/loader/model_contracts.hpp`.
-`declare_model_contract(hf, tp_size)` dispatches on `model_type` and a family
-that has not been written out returns an empty contract, which is a no-op rather
-than a failure.
+Per-family authoring lives in
+`driver/common/include/pie_driver/model_contracts.hpp`, one header both drivers
+include, because a checkpoint's layout is not a property of the device reading
+it. `author_model_contract` dispatches on `model_type`; a family it does not
+recognize is an *error*, not an empty contract — the empty-contract no-op made
+sense only while the loader had a second, guessing path to fall back on.
 
-Two properties of the declaration are worth stating because they are not
-obvious. First, **a demand states only what the demander knows**: shape and
-encoding are both optional. A driver always knows the name and usually the
-shape, but it does not know the *encoding* — which quantization a weight lands
-in is the loader's decision under the runtime quant policy, and binders probe
-`->dtype()` afterwards precisely because of that. Demanding a guessed encoding
-would turn a correct plan into a violation. The same applies to shapes on
-AWQ/GPTQ/compressed checkpoints, where weights are packed and often transposed,
-so those families declare names alone.
+Two properties of the contract are worth stating because they are not obvious.
+First, **a declaration states only what the author knows**: `shape` is
+`Option<Vec<i64>>`, so `define(name, expr)` without `.expect(...)` is a legal
+and common thing to write. An author always knows the name and usually the
+shape, but on AWQ/GPTQ/compressed checkpoints the weights are packed and often
+transposed, and predicting the on-disk extents would turn a correct plan into a
+violation. Encoding is different: it is *stated*, because the author is the one
+choosing it — the frontend's job is to insert whatever `Cast`/`Decode`/`Encode`/
+`Transcode` gets from what is on disk to what was asked for.
 
-Second, **sharding must be in the declaration**. `RuntimeTensorContract.shape`
-is the model's shape and `TensorDecl.shape` is the rank's, so declaring the
-model-wide extent for a sharded weight would report a mismatch on every one of
-them. `declare_*_contract` therefore takes `tp_size`, and the real-checkpoint
-test asserts the declaration actually *changes* with it — otherwise a
-declaration that quietly dropped sharding would still pass, and check nothing.
+Second, **sharding is in the declaration** — as an expression, not as a shape.
+`Expr::Shard` is the tenth node (§12 row 12, phase 1), so an author writes the
+partition and not `rank * len`, and the rank-dependence is confined to one pass
+that runs before inference. What `TensorContract.shape` states, when it states
+anything, is the *rank's* shape, which is what `TensorDecl.shape` means too;
+declaring the model-wide extent for a sharded weight would report a mismatch on
+every rank.
 
 ### 10.3 `host` is not a production path
 
@@ -1298,13 +1354,19 @@ place to look at it.
 | `loaded_model.cpp`'s `supports_tp` + per-family divisibility table | 89 | **done (step 11)** — the loader partitions the tensor, so the loader finds the axis `tp_size` does not divide, and it names the tensor |
 | `driver/cuda/.../backend_target.hpp` | 26 | **done (step 11)** — `BackendTarget` was a local that was never passed anywhere; `Mxfp4MoeLowering` was a third spelling of `PieLoaderMxfp4MoePolicy` |
 | `TensorDecl`'s write-only half (`TensorLayoutKind`, `TensorParallelKind`, `QuantFormat`, `QuantSpec`, the view triple) + `QuantGranularity` | ~60 | **done (step 11)** — assigned, serialized, restored, never read for a decision |
+| `LayoutExpr::Attach` + `StorageInstr::Attach` + `MetadataSpec` + both drivers' `case Attach` | ~70 | **done (step 12)** — an unreachable node: nothing ever constructed it, so the instruction was never emitted and both executors' arms were no-ops. §2 case 14 had already made it redundant by expressing a quant triplet as three contracts sharing an `Encoding::Quant` |
+| `types::Sharding` + `TensorDecl.sharding` + `RuntimeTensorContract.sharding` | ~80 | **done (step 12)** — carried through the whole compiler and serialized into every golden, but read by nothing except its own `PartialEq`. The rank's extent is already in `shape` |
+| `RuntimeTensorContract.shard_axis` + `runtime_shape()` + `frontend.rs`'s shard expansion | ~55 | **done (step 12)** — a field wearing a node's clothes. Replaced by `Expr::Shard`, which makes the partition part of what the tensor *is*, keeps the contract rank-independent, and composes inside a `Cat` — which a whole-expression flag cannot say. Two shape conventions collapsed into one: `shape` is now always the rank's |
+| `types::Layout` + `TensorDecl.layout` + `StorageInstr::CreateView.layout` + `RawTensor.layout` | ~40 | **done (step 12)** — a one-field struct wrapping `alignment`, so `TensorDecl` carried the same number twice. Its only propagation path ended at `ffi/arena.rs`, which destructured it as `layout: _`. 678 golden lines deleted, 0 added |
+| per-tensor `alignment` → `ModelContract.alignment` | ~20 | **done (step 12)** — every construction site wrote `target.preferred_alignment.max(1)`; a per-tensor field that is uniform is a header field |
+| `RuntimeAbi` + `RuntimeTensorContract` | ~90 | **done (step 12)** — the same declaration written twice, once for the driver and once for the checker. Now one `ModelContract` / `TensorContract` (§10.2) |
+| `ModelContract::check` + `Checked.types` | ~120 | **done (step 12)** — a second type checker that no caller ran. It required the expression to *already* yield the declared encoding, which the frontend instead *achieves* by inserting `Cast`/`Decode`/`Encode`; running it would have rejected every runtime-quant and AWQ contract. The frontend is the one checker |
 | `mxfp4_moe` post-hoc validation | ~15 | unrepresentable once `TargetSpec` is an input (§9.1) |
 | tautological coverage check | ~10 | replaced by a real one in step 8 (§8.2) |
 | dummy's loader path | ~30 | dead, write-only |
 | `schema.rs` + `schemas/` + `semantic.rs` | 351 | **deleted (step 7a)** — layer 1 (§10.2.1), reachable only through `RuntimeTensorSource::Semantic`, which no builder ever constructed. Took the variant, `SemanticId`, the `SemanticGraph` parameter in four `frontend.rs` functions, and `compile_load_plan`'s `ModelConfig` parameter with it. |
-| `arch/` layer-2 inference (`policy.rs`, half of `arch.rs`) | ~250 | replaced by declared contracts (§10.2.1) |
-| `arch/` layer-3 `model_type` gating | ~300 of ~800 | not moved — *dissolved*. The family-specific branches exist to second-guess an undeclared contract (§10.2.1); the passes themselves stay in Rust. |
-| `parse_model_config` + `config.rs` | ~90 | the loader stops reading `config.json` (§10.4) |
+| `arch.rs` + `arch/` (8 modules) | 2,110 | **done (§12 row 12, phase 4)** — every line of it, layers 2 and 3 alike. Layer 2 was replaced by the driver authoring the contract; layer 3 turned out to be layer 2 wearing a different hat — `skip_dense_qkv_fusion`, `stack_per_expert_moe`, `phi3_fused_splits` and `metal_qwen35` all existed to second-guess an undeclared contract, and a stated one has nothing to second-guess. What survived is `planner/rewrite.rs`: `coalesce_direct_row_shards` and its helpers, which rewrite a contract into a cheaper contract and never ask what model it is. |
+| `config.rs` + `parse_model_config` | ~99 | **done (§12 row 12, phase 4)** — the loader does not read `config.json` at all (§10.4) |
 | `inproc.rs` | 378 | the pre-FFI compile entry point; folded into `ffi/` (§10) |
 | tile-map-mask round-trip | 5 sites | TargetSpec inversion |
 | `compile_load_plan_bytes` + `model_load_desc` in worker bootstrap | ~150 | moves into the driver |
@@ -1350,7 +1412,8 @@ parity tests.
 | 9 | **done** — `src/main.rs`, the `dump · verify · diff · replay` CLI | The one item in §10's tree with no earlier step. `replay` is what settles `host.rs`'s fate: it **survives**, because it is the only way to check offline that a plan moves the *right* bytes rather than a well-formed number of them. That is not hypothetical — replaying Qwen3-1.7B produced 4,063,479,808 bytes across 311 tensors, and hashing 113 of them against an independent safetensors reader found no mismatch. `dump` absorbed and replaced `examples/plan_dump.rs`. |
 | 10 | **done** — the driver keeps only what only it can state | Not a numbered step originally; it followed from finishing the others. Once the loader hands back a driver-specific low IR, everything the driver still did *to* that IR was either computation the loader could have done or C++ vocabulary the loader could have shipped. `load_plan_bridge.hpp` went 464 → 105 lines. To Rust: the quant-attachment inference (`load_plan.rs::derive_quant_attachments` — the loader *named* the scale tensor, so C++ re-deriving the pairing by name suffix was guesswork about the loader's own decision), the artifact cache key (`artifact.rs`, which Metal had never had at all, and which now mixes the whole plan through serde rather than a hand-enumerated field list that a new field silently escapes), contract coverage (`verify.rs::ContractCoverage`), and both plan renderings (`dump.rs`), whose two enum-name tables were `default`-less switches returning `"Unknown"` for anything Rust added. All four ride on the plan itself, so no new FFI entry point exists. To the loader's C++ SDK: `pie_loader/{plan,request,tensor_contract}.hpp`. The namespace went with them: `pie_load_planner` was a name no file, directory or crate carried, so it is now `pie_loader`, matching the header, the directory and the crate. The `::cpp` sub-namespace under it was flattened at the same time — it had distinguished the hand-written helpers from a generated half that no longer exists. The two drivers' request builders were one file written twice and had already drifted — CUDA's grew an env-gated `fused_transcode` default Metal's never mentioned. `CheckpointSource` is now a pure mapper on both backends, with the H2D copy moved to the engine that owns the stream. Deleted: `shard_plan.hpp` (dead since §6.3), `load_plan_cache_key_test.cpp` (532 lines, replaced by `artifact.rs`'s nine tests). |
 | 11 | **done** — the second pass over the driver side | Step 10 asked what the driver still *computed*; this one asks what it still *knows*. Five answers, all of the same shape — a fact stated twice, in two languages, with no mechanism keeping the copies equal. (a) `checkpoint_source` was 408 lines of POSIX written once per driver, already drifted (`MAP_SHARED`/lazy on CUDA, `MAP_PRIVATE`/eager on Metal, different method names); merged into `loader/include/pie_loader/checkpoint_source.hpp`, taking the stricter option each time. (b) `loaded_model.cpp` carried a twenty-family `supports_tp()` list plus eighty lines of per-family divisibility rules read off `config.json` — but the loader computes the shard extents, so it is the loader that discovers an indivisible axis. Its message now names the tensor, the dimension and the axis (`"the row count of 'model.layers.0.self_attn.k_proj.weight' is 1024, which tp_size 3 does not divide"`), which is more than the driver's table could say; the table is deleted. A family missing from that list got no check at all, and a family in it got two. (c) The executor decided "keep these scale bytes as raw E8M0" from `group_size == 32` — the same class of inference as the name-suffix matching step 10 deleted. The loader chose the encoding, so it now states it: `ScaleForm::{RawE8M0, F32Factors}` on the attachment. (d) `TensorDecl` carried `TensorLayoutKind`, `TensorParallelKind`, `QuantFormat`, `QuantSpec` and a view triple that were assigned, serialized by the artifact codec, restored — and never read for any decision. The live quantization metadata is `ops::QuantMeta`, which `ops/gemm.cpp` reads; the codec version is bumped to 4. `QuantGranularity` went too: the driver was translating `PieLoaderQuantGranularity` into it only to translate it again into `QuantMeta::Kind`. (e) `BackendTarget` was a struct built in `loaded_model.cpp` and never passed anywhere; two of its three fields were write-only, and the third, `Mxfp4MoeLowering`, was a third spelling of a policy the plan already carries. `LoadedModel` stores `PieLoaderMxfp4MoePolicy` now. |
-| — | **done** — golden plans | Implied by §10's tree, owned by no numbered step. `loader/tests/golden_plans.rs` pins ten whole compiled plans byte-exactly, across four synthetic architectures (dense llama, per-expert MoE, MXFP4 MoE, AWQ), two backends, three TP configurations and both MXFP4 policies. Each is verified against its contract *before* it is allowed to become golden, so a regenerated golden cannot lock in a broken compiler. `UPDATE_GOLDEN=1` regenerates. |
+| 12 | **done** — the loader as a standalone compile library | The remaining tensions in §13 reduce to one property: `compile` should be a function of exactly three inputs — what is in the file, what the caller wants out, and what the device can do — and none of them should be a model's name. Measured against that, everything else in `PieLoaderRequest` is authorship input that belongs to the driver: `ModelFacts`, `runtime_quant` and the three-way `mxfp4_moe` are read only inside `arch/`, and `component` is subsumed by the contract, since declaring only the outputs you want is what `retain_outputs` already does. Phase 0 is this row's first landing and is pure subtraction — two things that survived every earlier pass because nothing forced anyone to ask whether they were read. Phase 1 is the algebra: `Expr::Shard` is now a tenth node and `shard_axis` is gone. A shard is not a property of a *contract*, it is a property of a *tensor* — so it belongs in the expression, where it stays rank-independent (the author writes the partition, not `rank * len`), composes inside a `Cat`, and confines rank-dependence to one pass, `Resolver::specialize`, which runs before inference and below which every rank sees the same expression. The proof that the rewrite is exactly what the old field-driven expansion did is that all fourteen golden plans are byte-identical without re-blessing. `shape` is now unconditionally the rank's shape, which is also what the C++ `declare_*_contract` has always meant by it (§10.2), so `runtime_shape()` — the function whose whole job was to say which of two conventions applied — has nothing left to disambiguate. That collapse then landed: `RuntimeAbi`/`RuntimeTensorContract` and `ModelContract`/`TensorContract` were the same declaration written twice — once for the driver, once for the checker — and the type checker was attached to the spelling nothing compiled. `ModelContract::check` went with them rather than being adopted, because it and the frontend are not the same operation: `check` *requires* the expression to already yield the declared encoding, while the frontend *achieves* it by inserting `Cast`/`Decode`/`Encode`/`Transcode` from the `(current, declared)` pair. Running `check` on every compile would have rejected every runtime-quant and AWQ contract; the frontend is the one checker, and the one thing `check` had that it lacked — duplicate-name rejection — moved into `plan_from_contracts`. The merge also exposed `types::Layout`: a one-field struct wrapping `alignment`, sitting next to `TensorDecl.alignment`, whose only propagation path ended at an FFI destructuring that spelled it `layout: _`. Since every construction site wrote the same `target.preferred_alignment.max(1)`, the survivor is a single `ModelContract.alignment` header field. The evidence that all of this is inert is the golden diff: **678 lines deleted, 0 added**, every one of them a `"layout": {"alignment": N}` block. Phases 2, 3 and 5 then landed together, because each is a different half of the same sentence. **Phase 2** — `compile()` opens no files — was mostly true already (the fourteen goldens compile from synthetic metadata with no checkpoint on disk) but was nowhere *stated*: `parse_checkpoint_metadata` lived in `ffi/inproc.rs`, above the compiler rather than beside the other reader, so the rule was a habit. It moved to `checkpoint/read.rs`, and `loader/tests/standalone.rs` now greps the source for `std::fs`/`File::open`/`memmap` below that module and compiles a plan against a path that provably does not exist. Four modules are exempt and each for a reason about bytes rather than about a decision — `host.rs` executes a plan, `artifact.rs` caches its output, `verify.rs` exists precisely to compare a plan against the world, and `main.rs` is a caller. **Phase 3** puts the contract itself on the ABI. `ffi/contract.rs` marshals `ModelContract` as a flat, topologically sorted arena of `PieLoaderExprNode`, and `PieLoaderContractRequest` has exactly three fields — `checkpoint`, `target`, `contract` — which is the row's thesis written as a struct. Everything else in `PieLoaderRequest` turned out to be subsumed rather than dropped: no `model`, because nothing is inferred from it; no `runtime_quant`, because every tensor states the encoding it wants; no `mxfp4_moe`, because a contract either declares an MXFP4 expert weight or does not; no `component`, because a rank that should not materialize the language model simply does not declare it; and no `demands`, because the contract's own shape *is* the declaration the frontend already checks. `snapshot_dir` became a `PieLoaderCheckpoint` handle rather than a path — the driver must read the tensor table to author a contract at all, and two reads can disagree, so the handle makes the contract and the plan provably about one parse. The check that this is faithful is not a new test but the old ones: `read_contract(write_contract(c)) == c` runs on all fourteen goldens, so MXFP4 repacks, fused QKV `Cat`s, aliasing `Out`s and strided GPTQ slices each cover themselves. `TensorContract.shape` became `Option<Vec<i64>>` in the process, which deletes `contract_detail::LogicalShape` — the C++ workaround that erased the shape whenever `hf.quant_method` was non-empty, because a driver genuinely cannot predict the on-disk extents of a packed AWQ weight. Not stating it is now expressible. **Phase 5** is the third input. `FALLBACK_TILE_BYTES` was a 64 MiB guess the loader made on the driver's behalf; `max_tile_bytes == 0` is now an error, because a target that reports no tile budget is not saying "no limit", it is saying it did not measure one. Two more device facts joined it — `encode_scratch_dtype` and `block_scale_rows` — and `fused_transcode: bool` became `fusion_mask: u32`, so a second fused chain is a bit rather than a field. The evidence that these are the *same* rules newly parameterized is again the goldens: re-blessing changed the target header and not one instruction. Two more properties joined `standalone.rs`, and the first found a real leak on its first run — `ffi/mod.rs` matched on `"gemma4"`, which is family knowledge sitting above the boundary. It moved into `arch/`, which is exempt *by name* so that deleting the module is what turns the test from a lint into a proof. **Phase 4** is that deletion: `arch.rs`, `arch/`'s eight modules and `config.rs` are gone — 2,119 lines — and the exemption with them, so `nothing_in_the_compiler_knows_what_a_model_is` now holds over the whole crate. Authorship moved to `driver/common/include/pie_driver/model_contracts.hpp`, one ~1,180-line header both drivers include. What made a port of that size checkable without a forward-pass test was building the check first: a harness that opens every checkpoint on disk, authors a contract through the C++ path *and* compiles one through the Rust path, and diffs a canonical dump of both plans plus their artifact cache keys — 22 snapshots × 2 backends × 8 option variants × 7 rank configs, **2,240 comparisons, 0 differences**. It found four real bugs no test in the tree would have: a `std::initializer_list` stored as a struct member (dangling by the time anything read it); a missing `block_shape`, invisible to every executor and to the plan dump but *in* the cache key, so MXFP4 and MLX models would have missed the artifact cache forever; an Encode component that produced a wrong contract instead of an error for multimodal non-gemma4 families; and `plan.target.mxfp4_moe`, which turned out to be read by exactly one line of `arch/gpt_oss.rs` and is now deleted from `StorageTarget` — the policy is a *driver* concept, since an expert weight is MXFP4 in a plan because a contract node says so. The goldens are the same fourteen plans minus that one field: **14 lines deleted, 0 added, not one instruction changed**. The last thing to go was `pie_loader_compile`/`pie_loader_verify` themselves, with `PieLoaderRequest`, `PieLoaderModelSpec`, `PieLoaderComponent`, `PieLoaderMxfp4Moe{Request,Policy}` and the demand list; `pie_loader.h` lost 127 lines net. `compile` now has one spelling, and its argument list is the property. |
+| — | **done** — golden plans | Implied by §10's tree, owned by no numbered step. `loader/tests/golden_plans.rs` pins fourteen whole compiled plans byte-exactly, across four synthetic architectures (dense llama, per-expert MoE, MXFP4 MoE, AWQ), two backends, three TP configurations and both MXFP4 policies. Each is verified against its contract *before* it is allowed to become golden, so a regenerated golden cannot lock in a broken compiler. `UPDATE_GOLDEN=1` regenerates. |
 
 Step 1 before step 2: the reverse binding is the one piece of this design with
 real build-system risk (§3.4), so it was proven with the Rust half and a
@@ -1381,11 +1444,23 @@ been declared.
 
 ### Why 7b-4b was split
 
+*The split was right and the reason it gave was wrong.* Recorded as written,
+because the correction is the useful part.
+
 Full 7b-4b makes the driver the *author* of the contract and deletes the `arch/`
-passes that currently guess at it. That is roughly 18k lines of binder across
-twelve families, and it cannot be validated here: there is no forward-pass test
-in this repository and only four checkpoints on the machine, so a mistranslation
-in a family nobody can run would surface as garbage output, not as a failure.
+passes that guess at it. That is roughly 18k lines of binder across twelve
+families, and the argument here was that it could not be validated: no
+forward-pass test, few checkpoints, so a mistranslation in a family nobody can
+run would surface as garbage output rather than as a failure.
+
+What that missed is that a forward pass is not the only oracle. The old author
+was still in the tree, so the two could be *compared* — and a plan is a value, so
+the comparison can be exact rather than statistical. §12 row 12 phase 4 landed
+authorship in one step behind a harness that diffs 2,240 plan dumps and cache
+keys between the Rust and C++ authors and requires zero differences. The split
+was still right: the declaration path built the FFI, the C++ vocabulary and the
+`write_contract` round-trip that the proof then ran on. It was the prerequisite,
+not the smaller version.
 
 So authorship stayed in Rust and the *declaration* moved to C++. The driver says
 what it will bind; the loader still builds the plan; `verify` compares two
@@ -1400,10 +1475,11 @@ answers derived by different code in different languages from the same
   dissolved — moving authorship with nothing checking the result is how a silent
   mistranslation gets in.
 
-Adoption is per family and needs no flag day: `declare_model_contract` returns an
-empty contract for anything not written out, an empty contract makes the coverage
-check `0 == 0`, and every other check still runs. A family is added by writing
-one function and one dispatch line.
+Adoption was per family and needed no flag day: `declare_model_contract` returned
+an empty contract for anything not written out, an empty contract made the
+coverage check `0 == 0`, and every other check still ran. Once authorship moved,
+that escape hatch went with it — an unrecognized `model_type` is now an error,
+because there is no second path for it to fall back to.
 
 The declaration is checked against real checkpoints by exporting it. The C++ test
 binaries cannot link `pie-loader` (it is an rlib consumed by the worker), so
@@ -1431,10 +1507,17 @@ invalidates cached plans by design.
 
 ## 13. Open tensions
 
-**Backend knowledge enters Rust.** `backend/` gives `pie-loader` opinions about
-CUDA. This is the correct location — it is LLVM's `TargetLowering` — but it must
-stay parameterized by `TargetSpec` data rather than `#[cfg]`, or P2 breaks and
-GPU-less verification with it.
+**Backend knowledge enters Rust.** *Answered, and now enforced.* `backend/`
+gives `pie-loader` opinions about CUDA. This is the correct location — it is
+LLVM's `TargetLowering` — but it must stay parameterized by `TargetSpec` data
+rather than `#[cfg]`, or P2 breaks and GPU-less verification with it. Phase 5 of
+§12 row 12 moved the three constants that had drifted back in
+(`FALLBACK_TILE_BYTES`, the encode scratch dtype, the block-scale row count)
+onto the target, and `tests/standalone.rs::the_backend_lowering_reads_its_
+numbers_off_the_target` fails on the next `const` added to `backend/cuda.rs`.
+The one exemption is `TILE_MAP_MASK`, which is not a capability claim: it is the
+set of transforms the *loader* knows how to emit, which the driver's own mask is
+intersected with (§9).
 
 **Verification independence weakens when the plan becomes a pointer.** P6 wants
 `verify` to consume what the driver consumes and nothing else, and §10.1 rests
@@ -1450,7 +1533,15 @@ lowering, not that it shares no memory with it.
 **`TargetSpec` will accumulate.** Every backend-specific decision migrated from
 C++ adds a field. The discipline is that each field must be either a
 backend-static constant or a device-measured value, with no third category of
-"flag the loader sets so the driver can check it".
+"flag the loader sets so the driver can check it". Phase 5 tested that
+discipline and it held, but it also showed the cheaper move: `fused_transcode:
+bool` became `fusion_mask: u32`, so the second fused chain is a bit rather than
+a field. A capability that is one of a *set* should arrive as a mask; only a
+capability that is a *number* deserves its own field. What the discipline does
+not yet cover is that every field is an input the artifact key must include —
+`artifact.rs` gets this right by mixing the whole target through serde rather
+than a hand-written list, and that is the property to keep, not the field
+count.
 
 **Rank-uniformity is a constraint, not a check.** §6.3 makes the leader own
 `TargetSpec` so tensor-parallel ranks cannot disagree. That works only as long
@@ -1459,16 +1550,38 @@ input appears, the guarantee reverts to an invariant somebody has to remember,
 and the honest response then is to compare plan hashes across ranks rather than
 to hope.
 
-**Contracts must be declared somewhere.** Moving inference out of `arch/`
-requires the backends to state what they want. `tensor_spec.hpp` shows this
-vocabulary already exists in C++; unifying it is step 7b, and it is the step most
-likely to reveal that the two vocabularies disagree.
+**Contracts must be declared somewhere.** *Closed (§12 row 12, phase 4).* The
+driver authors, in `driver/common/include/pie_driver/model_contracts.hpp`;
+`arch/` is deleted. The worry recorded here — that the two vocabularies would
+disagree — was answerable rather than speculative, and it was answered twice.
+First by `write_contract`: the Rust side emits the same POD arena a C++ builder
+emits, so all fourteen goldens assert `read_contract(write_contract(c)) == c`.
+Then by the port itself, which was checked *before* it was landed, by diffing
+2,240 (snapshot × backend × options × rank) plan dumps and cache keys between
+the two authors and requiring zero differences. That is stronger than the
+family-by-family plan this paragraph used to describe, and it is what made
+deleting all 2,119 lines in one step defensible.
 
-**The reverse binding is the one build-system risk.** C++ → Rust symbol
-resolution across a static archive depends on link order and archive-member
-selection, and nothing in the tree exercises it yet — `pie_wake` is exported for
-this purpose but currently only Rust calls it. This is why it is step 1: prove
-it with a trivial entry point before the architecture depends on it.
+The honest statement of the residual risk is unchanged and worth keeping: **there
+is still no forward-pass test here.** What the port has is byte-identity with
+what `arch/` authored, on every checkpoint on this disk, which is not the same as
+the model producing the right tokens. A family with no checkpoint on disk was
+covered only by the code being the same shape as one that had.
+
+**The reverse binding is the one build-system risk.** *Settled.* C++ → Rust
+symbol resolution across a static archive depends on link order and
+archive-member selection. It was proven with a trivial entry point at step 1,
+and the whole driver has depended on it since step 2. The residue is a testing
+gap rather than a build risk: the C++ test binaries under `driver/cuda/tests/`
+cannot link the loader, because it is an rlib the *worker* consumes. Since
+authorship moved to C++, `model_contract_test.cpp` needs the loader for real —
+it opens a checkpoint to author against — so `driver/cuda/CMakeLists.txt` looks
+for `target/debug/libpie_loader.a` (`cargo rustc -p pie-loader --lib
+--crate-type staticlib`) and builds the target only when it is there. Skipping
+one test is a better failure than breaking the build for everyone who has not
+run that command. Under `PIE_TEST_CONTRACT_DUMP` the binary still exports its
+authored contract as JSON, which is how anything needing the *compiler* reaches
+it from the Rust side.
 
 **The driver's Rust and C++ halves both remain.** This design does not collapse
 them, and should not. The C ABI at `interface/driver` is the seam that lets

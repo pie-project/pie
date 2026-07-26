@@ -270,6 +270,36 @@ pub enum Acquired {
     Yield,
 }
 
+/// Why eviction could not fund the head at the instant the starvation
+/// predicate was evaluated. Carried into [`PlannerError::Starved`] so the
+/// message names the real wedge: the two callers fail for unrelated
+/// reasons, and reporting resource exhaustion for a policy wedge sends the
+/// reader hunting a full swap pool that is in fact ~99% free
+/// (CONTENTION_FOLLOWUP.md §18.7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StarveCause {
+    /// The driver advertises no KV swap transport, or the host swap pool has
+    /// no free slot to evict into.
+    NoSwapRoom,
+    /// Swap room exists, but no candidate was eligible or had pages to give.
+    /// Eligibility is FCFS-anti-thrash: only processes YOUNGER than the head
+    /// may be evicted for it. When the pages are all held by processes OLDER
+    /// than the head, the planner has no legal move.
+    NoEligibleVictim,
+}
+
+impl StarveCause {
+    fn describe(self) -> &'static str {
+        match self {
+            StarveCause::NoSwapRoom => "no host swap room to evict into (or no swap transport)",
+            StarveCause::NoEligibleVictim => {
+                "no evictable victim — every page is held by a process OLDER \
+                 than the head, which FCFS anti-thrash forbids evicting"
+            }
+        }
+    }
+}
+
 /// A hard failure out of [`ResidencyPlanner::acquire`]. Every variant is a
 /// computed predicate — none is a timer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -280,12 +310,16 @@ pub enum PlannerError {
     /// pool, so no amount of evicting OTHERS can ever cover it. Fail loud.
     Hog { need: u32, held: u32, total: u32 },
     /// The starvation endgame, computed — not timed: the head is unmet,
-    /// eviction cannot fund it (no swap transport, or host swap exhaustion),
-    /// no transfer is in flight, and not one fire lease is held anywhere —
-    /// no completion can ever arrive. The youngest parked ask is failed
-    /// loud so its frees restart the fleet (destruction youngest-first,
-    /// never the head).
-    Starved { need: u32, free: u32, total: u32 },
+    /// eviction cannot fund it (see [`StarveCause`]), no transfer is in
+    /// flight, and not one fire lease is held anywhere — no completion can
+    /// ever arrive. The youngest parked ask is failed loud so its frees
+    /// restart the fleet (destruction youngest-first, never the head).
+    Starved {
+        need: u32,
+        free: u32,
+        total: u32,
+        cause: StarveCause,
+    },
     /// The process was unregistered while waiting.
     Cancelled,
 }
@@ -302,11 +336,16 @@ impl std::fmt::Display for PlannerError {
                 "KV pool exhausted by this process alone: it holds {held} pages and asks \
                  {need} more of a {total}-page pool — no eviction of others can cover it"
             ),
-            PlannerError::Starved { need, free, total } => write!(
+            PlannerError::Starved {
+                need,
+                free,
+                total,
+                cause,
+            } => write!(
                 f,
-                "KV pool starved under host swap exhaustion: {need} pages asked, {free} free \
-                 of {total}, no swap room to evict into, and no fire in flight anywhere \
-                 to complete and free pages"
+                "KV pool starved: {need} pages asked, {free} free of {total}, {}, and no \
+                 fire in flight anywhere to complete and free pages",
+                cause.describe()
             ),
             PlannerError::Cancelled => f.write_str("planner request cancelled"),
         }
@@ -340,6 +379,10 @@ pub struct PlannerStats {
     pub hog_failures: AtomicU64,
     /// Youngest asks failed loud by the starvation predicate.
     pub starvations: AtomicU64,
+    /// Evictions that had to relax the E6 post-restore hysteresis because
+    /// no normally-eligible victim could fund the head. Nonzero means the
+    /// fleet reached the state that used to destroy a request (§18.7).
+    pub e6_relaxations: AtomicU64,
     pub host_swap_exhaustions: AtomicU64,
     pub d2h_pages: AtomicU64,
     pub h2d_pages: AtomicU64,
@@ -376,6 +419,7 @@ pub struct PlannerDiagnostics {
     pub cancelled_waits_total: u64,
     pub hog_failures_total: u64,
     pub starvations_total: u64,
+    pub e6_relaxations_total: u64,
     pub host_swap_exhaustions_total: u64,
     pub d2h_pages_total: u64,
     pub h2d_pages_total: u64,
@@ -383,8 +427,59 @@ pub struct PlannerDiagnostics {
     pub h2d_copy_us_total: u64,
 }
 
+/// One process the FCFS anti-thrash rule permits evicting for the current
+/// head. `e6_fresh` is POLICY (see [`VictimSet`]), never eligibility.
+#[derive(Clone, Copy)]
+struct Victim {
+    pid: ProcessId,
+    seq: u64,
+    /// False while the process is inside its post-restore E6 hysteresis
+    /// window. A reason to *prefer* someone else, never a reason to
+    /// consider this process un-evictable.
+    e6_fresh: bool,
+}
+
+/// The legal victims for one head on the ROUTINE eviction path, from one
+/// consistent snapshot.
+///
+/// The split this type exists to enforce (`rainer_v3.md` §3.2): membership
+/// is the FCFS anti-thrash rule and nothing else — younger than the head,
+/// resident. E6 hysteresis rides as a per-member tag and narrows only
+/// [`Self::preferred`], the *policy* view. It can never remove a member,
+/// so it can never make the fleet look wedged when it is not; that is the
+/// property whose absence let a hysteresis rule destroy requests (§18.9).
+///
+/// The liveness question — "does a legal victim exist at all?" — is NOT
+/// answered here. [`ResidencyPlanner::last_resort_evict`] recomputes the
+/// same membership rule fused with quoting inside one atomic
+/// store+planner snapshot, because a set built here and quoted after the
+/// lock is released is exactly the stale snapshot that destroyed requests
+/// twice (§18.10, `rainer_v3.md` §8.3).
+struct VictimSet {
+    head: EntryKey,
+    head_pid: ProcessId,
+    deficit: u32,
+    members: Vec<Victim>,
+}
+
 /// Where a registered process stands. Two real states plus the two
 /// transfer-in-flight transients — membership, not negotiation.
+
+impl VictimSet {
+    /// Members E6 hysteresis permits evicting right now — the routine
+    /// path. May be empty while the set is not; callers must therefore
+    /// never read this as "no victim exists".
+    fn preferred(&self) -> Vec<(ProcessId, u64)> {
+        self.members
+            .iter()
+            .filter(|v| v.e6_fresh)
+            .map(|v| (v.pid, v.seq))
+            .collect()
+    }
+
+}
+
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Residency {
     Resident,
@@ -755,19 +850,27 @@ impl ResidencyPlanner {
         }
         loop {
             // Fast path. Uncontended (no waiters, everyone resident): two
-            // free-list pops, no planner lock. Contended: an ELDER of the
-            // queue head may still reserve directly — the head's claim is
-            // physically protected by the accumulation (pages already
-            // pulled OUT of the free list), so an older process taking
-            // surplus never starves it, and parking the fleet's elders on
-            // every page-boundary crossing would put a park/serve round
-            // trip on every frame's critical path (the 47% inter-batch gap
-            // measured 2026-07-25). Younger asks park behind the head.
+            // free-list pops, no planner lock. Once anything is queued the
+            // fast path closes and EVERY ask parks FCFS at its process's
+            // spawn position.
+            //
+            // The elder bypass that used to live here — a process older
+            // than the queue head could still reserve directly — was
+            // deleted 2026-07-26 (`rainer_v3.md` §8.5). It was justified by
+            // a 47% inter-batch gap measured 2026-07-25, before the §17
+            // mechanism fixes; re-measured after them it earns nothing:
+            // A4/A6/E3 all land inside their bands with it gone, F2 stays
+            // 12/12, and one ordering rule disappears with it. v2 lists it
+            // under "dies ... derivatives of implicit membership".
             let uncontended = self.waiters.load(Ordering::Acquire) == 0
                 && self.nonresident.load(Ordering::Acquire) == 0;
-            if (uncontended || self.note_ask_and_check_elder(pid))
-                && let Some(grant) = self.try_reserve(demand)
-            {
+            if !uncontended {
+                // E6 progress: this process is asking to fire again. Under
+                // contention only — the same condition the zero-demand path
+                // uses, and the elder check used to fold this in.
+                self.note_progress(pid);
+            }
+            if uncontended && let Some(grant) = self.try_reserve(demand) {
                 return Ok(Acquired::Granted(grant));
             }
             // The reserve failed (or the fast path is closed): run the
@@ -878,29 +981,6 @@ impl ResidencyPlanner {
     fn note_progress(&self, pid: ProcessId) {
         if let Some(proc) = self.inner.lock().procs.get_mut(&pid) {
             proc.progressed = true;
-        }
-    }
-
-    /// The contended nonzero ask's pre-check, deliberately TWO effects in
-    /// one lock acquisition (this runs on every contended nonzero acquire,
-    /// which is exactly the set of E6 lift events):
-    ///
-    /// 1. notes E6 progress — `pid` is asking to run again;
-    /// 2. answers whether `pid` is resident and OLDER than the oldest
-    ///    unmet ask (the FCFS head). Elders bypass parking: the head's
-    ///    pages live in the accumulation, not the free list, so an elder's
-    ///    direct reserve can only take surplus.
-    fn note_ask_and_check_elder(&self, pid: ProcessId) -> bool {
-        let mut inner = self.inner.lock();
-        let Some(seq) = inner.procs.get_mut(&pid).and_then(|proc| {
-            proc.progressed = true;
-            (proc.state == Residency::Resident).then_some(proc.seq)
-        }) else {
-            return false;
-        };
-        match inner.unmet_head() {
-            Some(((head_seq, _), _)) => seq < head_seq,
-            None => true,
         }
     }
 
@@ -1167,79 +1247,36 @@ impl ResidencyPlanner {
     // Eviction planning — deficit-sized, youngest-first, younger than head
     // =========================================================================
 
-    fn plan_eviction(self: &Arc<Self>) {
-        // Eviction funds the head only when KV bytes can physically move
-        // out: a swap-incapable driver or an exhausted host pool leaves the
-        // starvation predicate as the last rung.
-        let (host_free, _) = self.port.host_stats();
-        if !self.port.suspend_capable() || host_free == 0 {
-            self.check_starvation();
-            return;
-        }
-        // Phase 1 (lock): the head's residual and the candidate set.
-        let Some((head_key, head_pid, deficit, candidates)) = self.with_inner(|inner| {
-            let (key, waiter) = inner.unmet_head()?;
-            let kv_need = waiter.kv_need();
-            let missing = kv_need.saturating_sub(inner.accum.len() as u32);
-            if missing == 0 {
-                return None;
-            }
-            // Evictions already in flight fund the head when they land;
-            // never over-evict for pages that are already on their way.
-            let expected: u32 = inner.evicting.values().sum();
-            let deficit = missing.saturating_sub(expected);
-            if deficit == 0 {
-                return None;
-            }
-            let head_seq = key.0;
-            // E6: a freshly restored process (`!progressed`) is not a
-            // candidate — it must ask to fire once before it can be evicted
-            // again, or the swap channel burns on evict⇄restore ping-pong.
-            // Its guest is waking from the residency gate right now; its
-            // `acquire` both lifts the veto and re-plans.
-            let candidates: Vec<(ProcessId, u64)> = inner
-                .procs
-                .iter()
-                .filter(|(_, proc)| {
-                    proc.seq > head_seq && proc.state == Residency::Resident && proc.progressed
-                })
-                .map(|(pid, proc)| (*pid, proc.seq))
-                .collect();
-            Some((key, waiter.pid, deficit, candidates))
-        }) else {
-            return;
-        };
-        let (model, driver) = self.port.locus();
-        // Phase 2 (no lock — the probe takes store locks): quote LAZILY, in
-        // small chunks, stopping as soon as the deficit is covered. One
-        // victim usually suffices, and quoting the whole fleet under a
-        // single KV-lock hold was the planner's p99 483 µs hold — the seed
-        // of the residual guest-wait convoy (§16: 3.9 s of aggregate
-        // KV-lock wait against 4.4% hold utilization).
-        //
-        // Order: lease-QUIESCENT candidates first (a racy preference
-        // snapshot), youngest-first within each class. Evicting a process
-        // with zero in-flight fires skips the lease drain — the p50 9.1 ms
-        // of the evict chain — which sets the page-supply cadence every
-        // boundary-parked lane waits on (CONTENTION_FOLLOWUP.md §17).
-        // Eligibility is unchanged
-        // (younger than the head, resident, progressed), so the anti-thrash
-        // invariant and E6 are intact; this only reorders WITHIN the
-        // eligible set. (An "asker-last" term was tried and reverted — it
-        // does not reduce the restore rotation and costs h2h 5%; §17.1.)
-        let mut candidates: Vec<(ProcessId, u64, bool)> = candidates
+    /// Quote `candidates` lazily, in small chunks, stopping as soon as
+    /// `deficit` is covered, and return the victims to evict.
+    ///
+    /// Quoting is done OUTSIDE the planner lock (the probe takes store
+    /// locks) and in chunks: quoting the whole fleet under a single KV-lock
+    /// hold was the planner's p99 483 µs hold — the seed of the residual
+    /// guest-wait convoy (§16: 3.9 s of aggregate KV-lock wait against 4.4%
+    /// hold utilization). One victim usually suffices.
+    ///
+    /// Candidates are ordered lease-QUIESCENT first (a racy preference
+    /// snapshot), youngest-first within each class.
+    fn quote_and_pick(
+        &self,
+        candidates: Vec<(ProcessId, u64)>,
+        deficit: u32,
+        model: usize,
+        driver: usize,
+    ) -> Vec<(ProcessId, u32)> {
+        let mut ordered: Vec<(ProcessId, u64, bool)> = candidates
             .into_iter()
             .map(|(pid, seq)| {
-                let quiescent = crate::inferlet::process::residency::kv_lease_quiescent(
-                    pid, model, driver,
-                );
+                let quiescent =
+                    crate::inferlet::process::residency::kv_lease_quiescent(pid, model, driver);
                 (pid, seq, quiescent)
             })
             .collect();
-        candidates.sort_by_key(|&(_, seq, quiescent)| (!quiescent, std::cmp::Reverse(seq)));
+        ordered.sort_by_key(|&(_, seq, quiescent)| (!quiescent, std::cmp::Reverse(seq)));
         let mut picks = Vec::new();
         let mut covered = 0u32;
-        for chunk in candidates.chunks(8) {
+        for chunk in ordered.chunks(8) {
             if covered >= deficit {
                 break;
             }
@@ -1258,16 +1295,101 @@ impl ResidencyPlanner {
                 }
             }
         }
-        if picks.is_empty() {
-            self.check_hog(head_key, head_pid);
-            self.check_starvation();
+        picks
+    }
+
+    fn plan_eviction(self: &Arc<Self>) {
+        // Eviction funds the head only when KV bytes can physically move
+        // out: a swap-incapable driver or an exhausted host pool leaves the
+        // starvation predicate as the last rung.
+        let (host_free, _) = self.port.host_stats();
+        if !self.port.suspend_capable() || host_free == 0 {
+            self.check_starvation(StarveCause::NoSwapRoom);
             return;
         }
-        // Phase 3 (lock): re-validate and mark; spawn the executors outside.
-        // Marking also YIELDS the victim's parked allocations: their fire
-        // tasks wake, settle the victim's pipeline tail (the only tasks that
-        // can finalize device-geometry ops), and wait out the eviction —
-        // that settling is what drains the leases the eviction quiesces on.
+        let Some(victims) = self.victim_set() else {
+            return;
+        };
+        let (model, driver) = self.port.locus();
+        // Routine path: honour E6 hysteresis. `preferred()` may be empty
+        // while the set is not — that is a policy outcome, and it is why
+        // the endgame below must consult the SET, never this subset.
+        let picks = self.quote_and_pick(victims.preferred(), victims.deficit, model, driver);
+        if picks.is_empty() {
+            self.check_hog(victims.head, victims.head_pid);
+            // The last-resort rung lives in `check_starvation`, which
+            // builds its own `VictimSet` at the instant the kill is
+            // decided. Re-using this one would decide against a snapshot
+            // that is already stale — the defect that destroyed a request
+            // twice (§18.9, §18.10).
+            self.check_starvation(StarveCause::NoEligibleVictim);
+            return;
+        }
+        self.commit_evictions(victims.head, picks, false);
+    }
+
+    /// Snapshot every process FCFS permits evicting for the current head.
+    ///
+    /// **This is the liveness-bearing fact.** Membership is exactly the
+    /// anti-thrash rule — younger than the head, resident — and nothing
+    /// else. E6 hysteresis rides along as a per-member *policy tag*
+    /// ([`Victim::e6_fresh`]) and can never remove a member, because a
+    /// heuristic that can empty this set is a heuristic that can destroy a
+    /// request: that is precisely what E6 did before §18.9.
+    ///
+    /// Read under one lock so the set is internally consistent, and cheap
+    /// enough to re-take at every decision point — callers are expected to
+    /// build a FRESH one rather than carry one across a lock release.
+    fn victim_set(&self) -> Option<VictimSet> {
+        self.with_inner(|inner| {
+            let (head, waiter) = inner.unmet_head()?;
+            let missing = waiter.kv_need().saturating_sub(inner.accum.len() as u32);
+            // Evictions already in flight fund the head when they land;
+            // never over-evict for pages that are already on their way.
+            let expected: u32 = inner.evicting.values().sum();
+            let deficit = missing.saturating_sub(expected);
+            if deficit == 0 {
+                return None;
+            }
+            let head_seq = head.0;
+            let members = inner
+                .procs
+                .iter()
+                .filter(|(_, proc)| proc.seq > head_seq && proc.state == Residency::Resident)
+                .map(|(pid, proc)| Victim {
+                    pid: *pid,
+                    seq: proc.seq,
+                    e6_fresh: proc.progressed,
+                })
+                .collect();
+            Some(VictimSet {
+                head,
+                head_pid: waiter.pid,
+                deficit,
+                members,
+            })
+        })
+    }
+
+    /// Mark the picked victims and spawn their eviction executors.
+    ///
+    /// Re-validates under the lock (the quotes were taken without it) and
+    /// YIELDS each victim's parked allocations: their fire tasks wake,
+    /// settle the victim's pipeline tail (the only tasks that can finalize
+    /// device-geometry ops), and wait out the eviction — that settling is
+    /// what drains the leases the eviction quiesces on.
+    ///
+    /// `e6_relaxed` waives the post-restore hysteresis check here too;
+    /// without it a relaxed pick is silently dropped at this re-validation
+    /// and the planner spins (the livelock in §18.9).
+    ///
+    /// Returns whether anything was actually spawned.
+    fn commit_evictions(
+        self: &Arc<Self>,
+        head_key: EntryKey,
+        picks: Vec<(ProcessId, u32)>,
+        e6_relaxed: bool,
+    ) -> bool {
         let mut spawned = Vec::new();
         let mut wake = Vec::new();
         self.with_inner(|inner| {
@@ -1279,7 +1401,9 @@ impl ResidencyPlanner {
                 let Some(proc) = inner.procs.get_mut(&pid) else {
                     continue;
                 };
-                if proc.state != Residency::Resident || proc.seq <= head_seq || !proc.progressed
+                if proc.state != Residency::Resident
+                    || proc.seq <= head_seq
+                    || (!proc.progressed && !e6_relaxed)
                 {
                     continue;
                 }
@@ -1300,10 +1424,12 @@ impl ResidencyPlanner {
         for notify in wake {
             notify.notify_waiters();
         }
+        let any = !spawned.is_empty();
         for pid in spawned {
             self.stats.evictions_started.fetch_add(1, Ordering::Relaxed);
             exec::spawn_evict(self.clone(), pid);
         }
+        any
     }
 
     /// The starvation endgame, as a computed predicate — the timer-free
@@ -1311,7 +1437,8 @@ impl ResidencyPlanner {
     /// of the following hold at once:
     ///
     /// - the head is unmet and eviction cannot fund it (checked by the
-    ///   caller: no swap transport, or host swap exhausted);
+    ///   caller, which names the reason via [`StarveCause`]: no swap
+    ///   transport / exhausted host pool, or no eligible victim);
     /// - no eviction is in flight (its landing pokes);
     /// - every OTHER registered process is either parked in this queue or
     ///   out of the resident set — nobody is running, so no completion can
@@ -1323,18 +1450,28 @@ impl ResidencyPlanner {
     /// destruction youngest-first), and its rollback frees restart the
     /// fleet. Every quantity is read at one instant; any new fire or free
     /// re-plans and re-evaluates.
-    fn check_starvation(self: &Arc<Self>) {
-        let wedged = self.with_inner(|inner| {
+    /// The wedge predicate: nothing is running, nothing is in transit, and
+    /// every resident process is parked — so no completion can arrive to
+    /// free pages on its own. Shared by the E6 relaxation rung and
+    /// [`Self::check_starvation`] so the two can never disagree about what
+    /// "wedged" means.
+    ///
+    /// A SERVED-but-uncollected entry means its process is about to run
+    /// (and eventually complete, freeing pages): that is relief on its way,
+    /// not a wedge. Only genuinely unmet parks count. A lease snapshot is
+    /// NOT enough either: a guest between two fires holds no lease for an
+    /// instant but is very much alive.
+    fn is_wedged(&self) -> bool {
+        self.with_inner(|inner| {
             if !inner.evicting.is_empty() {
                 return false;
             }
-            // A SERVED-but-uncollected entry means its process is about to
-            // run (and eventually complete, freeing pages): that is relief
-            // on its way, not a wedge. Only genuinely unmet parks count.
             let mut parked = std::collections::HashSet::new();
             for waiter in inner.queue.values() {
                 match &waiter.kind {
-                    WaitKind::Allocation { outcome: Some(_), .. } => return false,
+                    WaitKind::Allocation {
+                        outcome: Some(_), ..
+                    } => return false,
                     _ => {
                         parked.insert(waiter.pid);
                     }
@@ -1345,9 +1482,180 @@ impl ResidencyPlanner {
                 Residency::Evicting | Residency::Restoring => false,
                 Residency::Evicted => true,
             })
-        });
-        if !wedged {
+        })
+    }
+
+    /// Last-resort victim search, immediately before the starvation rung
+    /// would destroy a request — decided from ONE atomic snapshot.
+    ///
+    /// This is the shape `rainer_v3.md` §8.3 argues the whole planner
+    /// should have. The stale-snapshot defects (§18.9, §18.10) all trace to
+    /// one cause: `plan_eviction` must release the planner lock to quote,
+    /// because reclaimability lives behind the KV store lock. Candidate set
+    /// at T0, quotes at T1, decision at T2 — and a process that changed
+    /// state in between is invisible or misjudged.
+    ///
+    /// Here the store lock is taken FIRST and the planner lock inside it,
+    /// which is the tree's documented order (`inner` is innermost), so the
+    /// procs, the queue and the quotes are all read at one instant and the
+    /// decision cannot be overtaken. Working sets are gathered before
+    /// either lock: `RESIDENCIES` is acquired before the KV lock
+    /// everywhere, and inverting that would risk deadlock.
+    ///
+    /// A process registered after the gather cannot invalidate the result:
+    /// it starts with no pages, and it cannot acquire any while this holds
+    /// the planner lock.
+    ///
+    /// Runs only in the wedge, so the (rare) KV-lock hold does not touch
+    /// the convoy §16 measured on the per-fire path.
+    ///
+    /// Returns whether an eviction was spawned.
+    fn last_resort_evict(self: &Arc<Self>) -> bool {
+        let (model, driver) = self.port.locus();
+        let Some(stores) = crate::store::registry::try_get(model, driver) else {
+            return false;
+        };
+        // Outside every lock: which processes might we quote?
+        let pids: Vec<ProcessId> = self.with_inner(|inner| inner.procs.keys().copied().collect());
+        if pids.is_empty() {
+            return false;
+        }
+        let working_sets =
+            crate::inferlet::process::residency::kv_working_sets_for(&pids, model, driver);
+
+        // One atomic decision: store lock outside, planner lock inside.
+        let (head, deficit, picks) =
+            crate::store::registry::with_kv_lock(&stores.kv, "planner-endgame", |kv| {
+                self.with_inner(|inner| {
+                    let Some((head, waiter)) = inner.unmet_head() else {
+                        return (None, 0, Vec::new());
+                    };
+                    let missing = waiter.kv_need().saturating_sub(inner.accum.len() as u32);
+                    let expected: u32 = inner.evicting.values().sum();
+                    let deficit = missing.saturating_sub(expected);
+                    if deficit == 0 {
+                        return (None, 0, Vec::new());
+                    }
+                    let head_seq = head.0;
+                    let quotes =
+                        crate::inferlet::process::residency::quote_locked(kv, working_sets);
+                    // Legal victims: younger than the head and resident.
+                    // E6 hysteresis is waived here and ONLY here — it is a
+                    // preference, never a reason to let a request die
+                    // (§18.9). Order: E6-fresh first, then youngest-first.
+                    let mut legal: Vec<(ProcessId, u64, bool, u32)> = pids
+                        .iter()
+                        .zip(quotes)
+                        .filter_map(|(pid, quote)| {
+                            let proc = inner.procs.get(pid)?;
+                            if proc.seq <= head_seq || proc.state != Residency::Resident {
+                                return None;
+                            }
+                            match quote? {
+                                ReclaimQuote::Pages(pages) if pages > 0 => {
+                                    Some((*pid, proc.seq, proc.progressed, pages))
+                                }
+                                _ => None,
+                            }
+                        })
+                        .collect();
+                    legal.sort_by_key(|&(_, seq, fresh, _)| (!fresh, std::cmp::Reverse(seq)));
+                    let mut picks = Vec::new();
+                    let mut covered = 0u32;
+                    for (pid, _, _, pages) in legal {
+                        if covered >= deficit {
+                            break;
+                        }
+                        covered += pages;
+                        picks.push((pid, pages));
+                    }
+                    (Some(head), deficit, picks)
+                })
+            });
+        let (Some(head), false) = (head, picks.is_empty()) else {
+            return false;
+        };
+        let n = picks.len();
+        if !self.commit_evictions(head, picks, true) {
+            return false;
+        }
+        self.stats.e6_relaxations.fetch_add(1, Ordering::Relaxed);
+        ptrace!(
+            "last-resort-evict head_seq={} deficit={} picked={}",
+            head.0,
+            deficit,
+            n
+        );
+        true
+    }
+
+    fn check_starvation(self: &Arc<Self>, cause: StarveCause) {
+        if !self.is_wedged() {
             return;
+        }
+        // Last rung before destruction: re-scan for ANY evictable victim
+        // younger than the head, at THIS instant rather than at the
+        // caller's phase-1 sample (§18.10).
+        //
+        // Only for `NoEligibleVictim`. Under `NoSwapRoom` there is nowhere
+        // to evict INTO, so a pick would be marked `Evicting`, fail in the
+        // executor and roll back, forever — the rung must not run when the
+        // swap channel is the thing that is gone.
+        if cause == StarveCause::NoEligibleVictim && self.last_resort_evict() {
+            return;
+        }
+        // The relaxed scan may itself have raced; re-verify before killing.
+        if !self.is_wedged() {
+            return;
+        }
+        // Trace-gated post-mortem: the exact state that reached destruction.
+        // Every field here was needed to tell the two wedge classes apart
+        // (E6 hysteresis vs a genuinely unreclaimable holder) — see §18.7/§18.9.
+        if trace_enabled() {
+            let (pids, dump) = self.with_inner(|inner| {
+                let q: Vec<String> = inner
+                    .queue
+                    .iter()
+                    .map(|((seq, _), w)| {
+                        let kind = match &w.kind {
+                            WaitKind::Allocation {
+                                outcome, yielded, ..
+                            } => format!("alloc:served={}:yielded={}", outcome.is_some(), yielded),
+                            WaitKind::Restore { .. } => "restore".to_string(),
+                        };
+                        format!("{seq}:{kind}:need={}", w.kv_need())
+                    })
+                    .collect();
+                let p: Vec<String> = inner
+                    .procs
+                    .values()
+                    .map(|proc| format!("{}:{:?}:prog={}", proc.seq, proc.state, proc.progressed))
+                    .collect();
+                let pids: Vec<(ProcessId, u64)> = inner
+                    .procs
+                    .iter()
+                    .map(|(id, proc)| (*id, proc.seq))
+                    .collect();
+                (
+                    pids,
+                    format!("queue=[{}] procs=[{}]", q.join(","), p.join(",")),
+                )
+            });
+            let (model, driver) = self.port.locus();
+            let ids: Vec<ProcessId> = pids.iter().map(|(id, _)| *id).collect();
+            let quotes =
+                crate::inferlet::process::residency::kv_reclaim_quotes(&ids, model, driver);
+            let q: Vec<String> = pids
+                .iter()
+                .zip(quotes)
+                .map(|((_, seq), quote)| format!("{seq}:{quote:?}"))
+                .collect();
+            ptrace!(
+                "WEDGE-KILL cause={:?} {} quotes=[{}]",
+                cause,
+                dump,
+                q.join(",")
+            );
         }
         let (free, total) = self.port.device_stats();
         let notify = self.with_inner(|inner| {
@@ -1375,12 +1683,14 @@ impl ResidencyPlanner {
                 need: demand.kv_pages,
                 free,
                 total,
+                cause,
             }));
             Some(notify.clone())
         });
         if let Some(notify) = notify {
             self.stats.starvations.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
+                cause = ?cause,
                 "planner: pool starved with no reclaim path — failing the youngest parked ask"
             );
             notify.notify_waiters();
@@ -1404,15 +1714,13 @@ impl ResidencyPlanner {
             return;
         }
         let (model, driver) = self.port.locus();
-        let held = crate::inferlet::process::residency::kv_reclaim_quotes(
-            &[head_pid],
-            model,
-            driver,
-        )
-        .pop()
-        .flatten()
-        .map_or(0, ReclaimQuote::pages)
-            + swapped_page_count(head_pid, model, driver);
+        // The head's OWN footprint: resident + swapped, pinned or shared
+        // alike. This must be the durable `held_page_count`, never a
+        // `ReclaimQuote` — `pages()` reports 0 for every `Nothing` variant,
+        // so reading it here silently under-counted a head holding the whole
+        // pool to 0 the moment one in-flight pin overlapped, and the hog
+        // endgame never fired (`rainer_v3.md` §3.3).
+        let held = held_page_count(head_pid, model, driver);
         let (_, total) = self.port.device_stats();
         let notify = self.with_inner(|inner| {
             let waiter = inner.queue.get_mut(&head_key)?;
@@ -1633,6 +1941,7 @@ impl ResidencyPlanner {
             cancelled_waits_total: self.stats.cancelled_waits.load(Relaxed),
             hog_failures_total: self.stats.hog_failures.load(Relaxed),
             starvations_total: self.stats.starvations.load(Relaxed),
+            e6_relaxations_total: self.stats.e6_relaxations.load(Relaxed),
             host_swap_exhaustions_total: self.stats.host_swap_exhaustions.load(Relaxed),
             d2h_pages_total: self.stats.d2h_pages.load(Relaxed),
             h2d_pages_total: self.stats.h2d_pages.load(Relaxed),
@@ -1690,6 +1999,28 @@ fn micros(elapsed: Duration) -> u64 {
 /// The process's swapped page count on `(model, driver)` — the exact restore
 /// ask, computed fresh at serve time.
 fn swapped_page_count(pid: ProcessId, model: usize, driver: usize) -> u32 {
+    kv_page_count(pid, model, driver, |kv, ws| {
+        kv.swapped_page_count(ws).unwrap_or(0)
+    })
+}
+
+/// Every device+host page this process holds — the DURABLE fact the
+/// liveness predicates need, never a [`ReclaimQuote`] (`rainer_v3.md` §3.3).
+fn held_page_count(pid: ProcessId, model: usize, driver: usize) -> u32 {
+    kv_page_count(pid, model, driver, |kv, ws| {
+        kv.held_page_count(ws).unwrap_or(0)
+    })
+}
+
+fn kv_page_count(
+    pid: ProcessId,
+    model: usize,
+    driver: usize,
+    count: impl FnOnce(
+        &crate::store::kv::KvStore,
+        &std::collections::HashSet<crate::store::kv::page_table::WorkingSetId>,
+    ) -> usize,
+) -> u32 {
     let working_sets =
         crate::inferlet::process::residency::kv_working_set_ids(pid, model, driver);
     if working_sets.is_empty() {
@@ -1699,7 +2030,7 @@ fn swapped_page_count(pid: ProcessId, model: usize, driver: usize) -> u32 {
         return 0;
     };
     crate::store::registry::with_kv_lock(&stores.kv, "planner", |kv| {
-        kv.swapped_page_count(&working_sets).unwrap_or(0) as u32
+        count(kv, &working_sets) as u32
     })
 }
 

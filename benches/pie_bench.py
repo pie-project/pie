@@ -20,6 +20,7 @@ from common import (
     ROOT,
     RequestResult,
     add_mode_subcommands,
+    hash_output_tokens,
     cuda_profiler_start,
     cuda_profiler_stop,
     finish,
@@ -47,11 +48,6 @@ EMBEDDED_CLI_DRIVERS: set[str] = {
 }
 
 
-def hash_output_tokens(token_ids: list[int]) -> str:
-    digest = hashlib.sha256()
-    for token in token_ids:
-        digest.update(int(token).to_bytes(4, "little", signed=False))
-    return digest.hexdigest()
 KV_CACHE_DTYPES = [
     "auto",
     "bf16",
@@ -90,11 +86,16 @@ def bench_inferlet_paths(inferlet_dir: str | None) -> tuple[Path, Path, str]:
             "--inferlet-dir or set PIE_BENCH_INFERLET_DIR"
         )
     inferlet_dir = Path(inferlet_dir).expanduser().resolve()
-    wasm = (
-        inferlet_dir / "target" / "wasm32-wasip2" / "release"
-        / "text_completion_bench.wasm"
-    )
+    rel = Path("target") / "wasm32-wasip2" / "release" / "text_completion_bench.wasm"
+    candidates = [inferlet_dir / rel]
+    for parent in inferlet_dir.parents:
+        candidates.append(parent / rel)
+        if (parent / "Cargo.toml").exists() and "[workspace]" in (
+            parent / "Cargo.toml"
+        ).read_text():
+            break
     manifest = inferlet_dir / "Pie.toml"
+    wasm = next((c for c in candidates if c.exists()), candidates[0])
     if not wasm.exists():
         raise FileNotFoundError(
             f"missing {wasm}; build with: cd {inferlet_dir} && "
@@ -229,6 +230,14 @@ def build_config(args: argparse.Namespace):
             driver_options["mtp_num_drafts"] = args.mtp_num_drafts
         if args.enable_system_speculation:
             driver_options["enable_system_speculation"] = True
+        # `gpu_mem_utilization` sizes only the memory planner's *logical* KV
+        # budget; the runtime is free to exceed it, so it cannot create KV
+        # pressure. `total_pages` is the one binding cap, and `swap_pool_size`
+        # is what arms the suspend/restore rung (it defaults to 0, i.e. off).
+        if getattr(args, "total_pages", 0):
+            driver_options["total_pages"] = args.total_pages
+        if getattr(args, "swap_pool_size", 0):
+            driver_options["swap_pool_size"] = args.swap_pool_size
     elif args.driver == "vllm":
         driver_options = {
             "gpu_memory_utilization": args.gpu_mem_util,
@@ -573,6 +582,11 @@ async def run(args: argparse.Namespace):
                 "top_p": args.top_p,
                 "ignore_eos": args.ignore_eos,
                 "wasm_delay_us": args.wasm_delay_us,
+                **(
+                    {"run_ahead_frames": args.run_ahead_frames}
+                    if getattr(args, "run_ahead_frames", None)
+                    else {}
+                ),
                 "return_text": args.dump_first_text or args.dump_all_texts,
                 "report_timing": args.report_timing,
                 "report_arrivals": args.report_arrivals,
@@ -1178,7 +1192,28 @@ def build_parser() -> argparse.ArgumentParser:
             default="auto",
             choices=["auto", "latency", "balanced", "throughput", "capacity"],
         )
-        sp.add_argument("--kv-pages", type=int, default=2048)
+        sp.add_argument(
+            "--kv-pages", type=int, default=2048,
+            help="DEAD for cuda_native: never reaches driver_options, so it "
+                 "silently does nothing. Use --total-pages to cap KV.",
+        )
+        sp.add_argument(
+            "--total-pages",
+            type=int,
+            default=0,
+            help="HARD cap on resident KV pages (cuda_native driver option). "
+                 "0 leaves the driver to derive its own budget. This is the "
+                 "only knob that actually bounds KV residency — --gpu-mem-util "
+                 "sizes the planner's logical budget only.",
+        )
+        sp.add_argument(
+            "--swap-pool-size",
+            type=int,
+            default=0,
+            help="Host-side swap pages (cuda_native driver option). Must be "
+                 ">0 to arm the suspend/restore rung; 0 leaves the residency "
+                 "planner with pool-only reclaim.",
+        )
         sp.add_argument("--kv-cache-dtype", choices=KV_CACHE_DTYPES, default="auto")
         sp.add_argument("--max-forward-tokens", type=int, default=10240)
         sp.add_argument("--max-forward-requests", type=int, default=512)
