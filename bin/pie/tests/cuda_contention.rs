@@ -261,21 +261,21 @@ fn write_profile_record(
         "bubble_p50_us": bubble_p50_us,
         "bubble_p99_us": bubble_p99_us,
     });
-    if let Some(orchestrator) = pie_engine::store::reclaim::contention() {
-        let diagnostics = orchestrator.diagnostics();
+    if let Some(planner) = pie_engine::planner::planner() {
+        let diagnostics = planner.diagnostics();
         document[mode]["contention"] = serde_json::json!({
-            "parked": diagnostics.waiters_parked_total,
-            "woken": diagnostics.waiters_woken_total,
-            "suspends": diagnostics.suspends_total,
+            "parked": diagnostics.parks_total,
+            "woken": diagnostics.serves_total,
+            "suspends": diagnostics.evictions_total,
             "restores": diagnostics.restores_total,
             "d2h_pages": diagnostics.d2h_pages_total,
             "h2d_pages": diagnostics.h2d_pages_total,
             "d2h_copy_us": diagnostics.d2h_copy_us_total,
             "h2d_copy_us": diagnostics.h2d_copy_us_total,
-            "restore_wait_us": diagnostics.restore_wait_us_total,
-            "restore_turnaround_us": diagnostics.restore_turnaround_us_total,
-            "restore_turnarounds": diagnostics.restore_turnarounds_total,
-            "deadline_kills": diagnostics.deadline_kills_total,
+            "eviction_rollbacks": diagnostics.eviction_rollbacks_total,
+            "restore_failures": diagnostics.restore_failures_total,
+            "starvations": diagnostics.starvations_total,
+            "host_swap_exhaustions": diagnostics.host_swap_exhaustions_total,
         });
     }
     std::fs::write(&path, serde_json::to_vec_pretty(&document)?)?;
@@ -388,27 +388,27 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
         Some(tokio::spawn(async move {
             let t0 = std::time::Instant::now();
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                if let Some(orch) = pie_engine::store::reclaim::contention() {
-                    let s = orch.stats();
-                    use std::sync::atomic::Ordering::Relaxed;
-                    let diagnostics = orch.diagnostics();
+                if let Some(planner) = pie_engine::planner::planner() {
+                    let d = planner.diagnostics();
                     eprintln!(
                         "[contention-trace] t={}ms parked={} woken={} suspends={} restores={} \
-                         restore_prepared={} h2d_submitted={} h2d_us={} \
-                         free={}/{} reserved={} waiters={:?} suspended={:?}",
+                         restore_failures={} h2d_pages={} h2d_us={} \
+                         free={}/{} host_free={}/{} accum={} queue={} states={:?}",
                         t0.elapsed().as_millis(),
-                        s.waiters_parked.load(Relaxed),
-                        s.waiters_woken.load(Relaxed),
-                        s.suspends.load(Relaxed),
-                        s.restores.load(Relaxed),
-                        diagnostics.restore_prepared_total,
-                        diagnostics.h2d_submitted_total,
-                        diagnostics.h2d_copy_us_total,
-                        diagnostics.device_pages_free,
-                        diagnostics.device_pages_total,
-                        diagnostics.device_pages_reserved,
-                        diagnostics.waiters,
-                        diagnostics.suspended,
+                        d.parks_total,
+                        d.serves_total,
+                        d.evictions_total,
+                        d.restores_total,
+                        d.restore_failures_total,
+                        d.h2d_pages_total,
+                        d.h2d_copy_us_total,
+                        d.device_pages_free,
+                        d.device_pages_total,
+                        d.host_slots_free,
+                        d.host_slots_total,
+                        d.accumulation,
+                        d.queue.len(),
+                        d.proc_states,
                     );
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
@@ -459,14 +459,14 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
         bubble_p50_us,
         bubble_p99_us,
     );
-    if let Some(orchestrator) = pie_engine::store::reclaim::contention() {
-        let diagnostics = orchestrator.diagnostics();
+    if let Some(planner) = pie_engine::planner::planner() {
+        let diagnostics = planner.diagnostics();
         eprintln!(
             "[contention-profile] parked={} woken={} suspends={} restores={} \
              d2h_pages={} h2d_pages={} d2h={:.3}ms h2d={:.3}ms",
-            diagnostics.waiters_parked_total,
-            diagnostics.waiters_woken_total,
-            diagnostics.suspends_total,
+            diagnostics.parks_total,
+            diagnostics.serves_total,
+            diagnostics.evictions_total,
             diagnostics.restores_total,
             diagnostics.d2h_pages_total,
             diagnostics.h2d_pages_total,
@@ -492,18 +492,12 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
     // assertion so a transparency RED still surfaces whether preempt/restore
     // fired (a degenerate-replay mismatch with suspends==0 falsifies the
     // "restore corruption" framing → the bug is not on the restore path).
-    {
-        use std::sync::atomic::Ordering as O;
-        if let Some(o) = pie_engine::store::reclaim::contention() {
-            let s = o.stats();
-            eprintln!(
-                "[contention] final-engagement: parked={} woken={} suspends={} restores={}",
-                s.waiters_parked.load(O::Relaxed),
-                s.waiters_woken.load(O::Relaxed),
-                s.suspends.load(O::Relaxed),
-                s.restores.load(O::Relaxed),
-            );
-        }
+    if let Some(planner) = pie_engine::planner::planner() {
+        let d = planner.diagnostics();
+        eprintln!(
+            "[contention] final-engagement: parked={} woken={} suspends={} restores={}",
+            d.parks_total, d.serves_total, d.evictions_total, d.restores_total,
+        );
     }
 
     // Assertion 1: ZERO WorkingSetError — every lane completed with tokens.
@@ -526,15 +520,14 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
     // trivially. Engagement = allocation waiters that PARKED (demand outran
     // the pool → blocked in acquire's queue) and were later WOKEN (freed
     // pages covered them → the drain released them → they succeeded).
-    use std::sync::atomic::Ordering;
-    let (parked, woken, suspends, restores) = pie_engine::store::reclaim::contention()
-        .map(|o| {
-            let s = o.stats();
+    let (parked, woken, suspends, restores) = pie_engine::planner::planner()
+        .map(|planner| {
+            let d = planner.diagnostics();
             (
-                s.waiters_parked.load(Ordering::Relaxed),
-                s.waiters_woken.load(Ordering::Relaxed),
-                s.suspends.load(Ordering::Relaxed),
-                s.restores.load(Ordering::Relaxed),
+                d.parks_total,
+                d.serves_total,
+                d.evictions_total,
+                d.restores_total,
             )
         })
         .unwrap_or((0, 0, 0, 0));

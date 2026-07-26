@@ -65,24 +65,31 @@ void launch_envelope_dot_f32(
     int live_pages,
     cudaStream_t stream);
 
-// Maintenance: refresh the envelopes of exactly the pages a fire appended to.
-// The caller passes an explicit (physical page id, live token count) list, which
-// it computes on the host from the CSR mirrors -- a request's new tokens are the
-// last `qo_len` of its `kv_len`, so the touched page span is host arithmetic.
+// Maintenance: refresh the envelopes of exactly the pages a fire appended to,
+// deriving that set on-device from the same CSR arithmetic `write_kv_kernel`
+// uses (a request's post-append length is `(pages-1)*page_size +
+// last_page_len`, so its new tokens are the last `qo_len` of that span). The KV
+// write path only ever holds device pointers, which is why the touched set is
+// derived in-kernel rather than passed as an explicit host-built list.
 // Rescanning the whole page list instead would cost a full KV read per layer,
 // i.e. as much as attention itself.
 //
-// Pages are append-only, so recomputing a touched page in full gives the same
-// answer an incremental merge would. Shares its per-(page, kv_head) reduction
-// with `launch_envelope_recompute_bf16`, so the numerics are the ones
-// `test_envelope_dot` parity-checks. NHD layout only.
-void launch_envelope_update_pages_bf16(
+// `max_touched` is the host's worst-case bound on the number of touched pages,
+// `ceil(total_tokens/page_size) + num_requests`; blocks past the true count exit
+// without writing. Pages are append-only, so recomputing a touched page in full
+// gives the same answer an incremental merge would. Shares its per-(page,
+// kv_head) reduction with `launch_envelope_recompute_bf16`, so the numerics are
+// the ones `test_envelope_dot` parity-checks. NHD layout only.
+void launch_envelope_update_appended_bf16(
     const std::uint16_t* k_pages,
-    const std::uint32_t* refresh_pages,      // [num_refresh] physical page ids
-    const std::uint32_t* refresh_live_lens,  // [num_refresh] live tokens
+    const std::uint32_t* qo_indptr,          // [num_requests + 1]
+    const std::uint32_t* kv_page_indices,    // [kv_page_indptr[num_requests]]
+    const std::uint32_t* kv_page_indptr,     // [num_requests + 1]
+    const std::uint32_t* kv_last_page_lens,  // [num_requests]
     float* env_min,
     float* env_max,
-    int num_refresh,
+    int num_requests,
+    int max_touched,
     int page_size,
     int num_kv_heads,
     int head_dim,

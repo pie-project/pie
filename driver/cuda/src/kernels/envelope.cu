@@ -60,29 +60,71 @@ __global__ void envelope_recompute_kernel(
                          num_kv_heads, head_dim, env_min, env_max);
 }
 
-// Refresh exactly the pages this fire appended to. The host knows which those
-// are -- a request's new tokens are the last `qo_len` of its `kv_len`, so the
-// touched page span is host arithmetic on the CSR mirrors -- so the kernel takes
-// an explicit (physical page, live length) list and does no CSR walk at all.
-// One block per (refresh slot, kv_head). Pages are append-only, so rewriting a
-// whole touched page gives the same answer an incremental merge would.
-__global__ void envelope_update_pages_kernel(
+// Refresh exactly the pages this fire appended to, deriving that set on-device
+// from the same CSR arithmetic `write_kv_kernel` uses. A request's post-append
+// length is `(pages-1)*page_size + last_page_len`, so its new tokens occupy
+// `[total_after - qo_len, total_after)` and the touched pages are that span
+// divided by `page_size`. Rescanning the whole page list instead would cost a
+// full KV read per layer -- as much as attention itself.
+//
+// One block per (touched slot, kv_head), where the grid's x extent is the host's
+// worst-case bound `ceil(total_tokens/page_size) + num_requests`; blocks past
+// the true count exit. Pages are append-only, so recomputing a touched page in
+// full gives the same answer an incremental merge would.
+__global__ void envelope_update_appended_kernel(
     const __nv_bfloat16* __restrict__ k_pages,
-    const std::uint32_t* __restrict__ refresh_pages,
-    const std::uint32_t* __restrict__ refresh_live_lens,
+    const std::uint32_t* __restrict__ qo_indptr,
+    const std::uint32_t* __restrict__ kv_page_indices,
+    const std::uint32_t* __restrict__ kv_page_indptr,
+    const std::uint32_t* __restrict__ kv_last_page_lens,
     float* __restrict__ env_min,
     float* __restrict__ env_max,
+    int num_requests,
     int page_size,
     int num_kv_heads,
     int head_dim)
 {
     const int slot = blockIdx.x;
     const int kh = blockIdx.y;
-    const int live = static_cast<int>(refresh_live_lens[slot]);
-    if (live <= 0) return;
-    envelope_reduce_page(k_pages, static_cast<int>(refresh_pages[slot]), kh,
-                         live, page_size, num_kv_heads, head_dim,
-                         env_min, env_max);
+
+    // Walk requests accumulating their touched-page counts until `slot` lands
+    // inside one. R is the batch size, so a linear scan beats the divergence a
+    // binary search would add.
+    int seen = 0;
+    for (int r = 0; r < num_requests; ++r) {
+        const int pages_first = static_cast<int>(kv_page_indptr[r]);
+        const int pages_last = static_cast<int>(kv_page_indptr[r + 1]);
+        const int num_pages_r = pages_last - pages_first;
+        if (num_pages_r <= 0) continue;
+
+        const int qo_len =
+            static_cast<int>(qo_indptr[r + 1]) - static_cast<int>(qo_indptr[r]);
+        if (qo_len <= 0) continue;
+
+        const int total_after =
+            (num_pages_r - 1) * page_size + static_cast<int>(kv_last_page_lens[r]);
+        const int pre_len = total_after - qo_len;
+        if (total_after <= 0) continue;
+
+        const int first_page = pre_len / page_size;
+        const int last_page = (total_after - 1) / page_size;
+        const int touched = last_page - first_page + 1;
+
+        if (slot < seen + touched) {
+            const int page_in_req = first_page + (slot - seen);
+            if (page_in_req >= num_pages_r) return;
+            const int live = (page_in_req == last_page)
+                ? static_cast<int>(kv_last_page_lens[r])
+                : page_size;
+            if (live <= 0) return;
+            envelope_reduce_page(
+                k_pages,
+                static_cast<int>(kv_page_indices[pages_first + page_in_req]),
+                kh, live, page_size, num_kv_heads, head_dim, env_min, env_max);
+            return;
+        }
+        seen += touched;
+    }
 }
 
 // One block per (kv_head, page); threads reduce over the group·head_dim terms of
@@ -178,27 +220,33 @@ void launch_envelope_dot_f32(
         num_q_heads, num_kv_heads, head_dim, p_max, live_pages);
 }
 
-void launch_envelope_update_pages_bf16(
+void launch_envelope_update_appended_bf16(
     const std::uint16_t* k_pages,
-    const std::uint32_t* refresh_pages,
-    const std::uint32_t* refresh_live_lens,
+    const std::uint32_t* qo_indptr,
+    const std::uint32_t* kv_page_indices,
+    const std::uint32_t* kv_page_indptr,
+    const std::uint32_t* kv_last_page_lens,
     float* env_min,
     float* env_max,
-    int num_refresh,
+    int num_requests,
+    int max_touched,
     int page_size,
     int num_kv_heads,
     int head_dim,
     cudaStream_t stream)
 {
-    if (num_refresh <= 0 || num_kv_heads <= 0 || head_dim <= 0) return;
-    const dim3 grid(static_cast<unsigned>(num_refresh),
+    if (num_requests <= 0 || max_touched <= 0 || num_kv_heads <= 0 ||
+        head_dim <= 0 || page_size <= 0) {
+        return;
+    }
+    const dim3 grid(static_cast<unsigned>(max_touched),
                     static_cast<unsigned>(num_kv_heads));
     const int threads = head_dim < 256 ? head_dim : 256;
-    envelope_update_pages_kernel<<<grid, threads, 0, stream>>>(
+    envelope_update_appended_kernel<<<grid, threads, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(k_pages),
-        refresh_pages, refresh_live_lens,
+        qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
         env_min, env_max,
-        page_size, num_kv_heads, head_dim);
+        num_requests, page_size, num_kv_heads, head_dim);
 }
 
 }  // namespace pie_cuda_driver::kernels
