@@ -73,6 +73,7 @@ def _mask_kernel(
     group_set_length_ptr,
     set_payload_ptr,
     reading_offsets_ptr,
+    reading_index_ptr,
     reading_next_state_ptr,
     reading_term_offsets_ptr,
     reading_terminals_ptr,
@@ -148,9 +149,10 @@ def _mask_kernel(
     base = row_index * STACK_STRIDE
 
     admitted = 0
-    reading = tl.load(reading_offsets_ptr + group)
-    reading_end = tl.load(reading_offsets_ptr + group + 1)
-    while reading < reading_end:
+    use = tl.load(reading_offsets_ptr + group)
+    use_end = tl.load(reading_offsets_ptr + group + 1)
+    while use < use_end:
+        reading = tl.load(reading_index_ptr + use)
         # Most groups die on their first terminal, so the stack is only copied
         # once that is known to be shiftable. Copying first, and a byte at a
         # time, cost more than the decision it was for.
@@ -303,9 +305,9 @@ def _mask_kernel(
 
         if alive == 1:
             admitted = 1
-            reading = reading_end
+            use = use_end
         else:
-            reading = reading + 1
+            use = use + 1
 
     if admitted == 1:
         tl.store(admitted_ptr + launched * MAX_GROUPS + slot, 1)
@@ -427,6 +429,7 @@ def _candidate_kernel(
     group_set_length_ptr,
     set_payload_ptr,
     reading_offsets_ptr,
+    reading_index_ptr,
     reading_next_state_ptr,
     reading_term_offsets_ptr,
     reading_terminals_ptr,
@@ -552,10 +555,11 @@ def _candidate_kernel(
     base = row_index * STACK_STRIDE
     out_base = row_index * MAX_READINGS
 
-    reading = tl.load(reading_offsets_ptr + group)
-    reading_end = tl.load(reading_offsets_ptr + group + 1)
+    use = tl.load(reading_offsets_ptr + group)
+    use_end = tl.load(reading_offsets_ptr + group + 1)
     index = 0
-    while reading < reading_end and index < MAX_READINGS:
+    while use < use_end and index < MAX_READINGS:
+        reading = tl.load(reading_index_ptr + use)
         term = tl.load(reading_term_offsets_ptr + reading)
         term_end = tl.load(reading_term_offsets_ptr + reading + 1)
         top = tl.load(stack_ptr + base + depth - 1)
@@ -693,7 +697,7 @@ def _candidate_kernel(
                 mask=lane < copy_depth,
             )
             index = index + 1
-        reading = reading + 1
+        use = use + 1
 
 
 @triton.jit
@@ -862,6 +866,7 @@ class DeviceGrammar:
 
         for name in (
             "group_offsets",
+            "reading_index",
             "group_set_kind",
             "group_set_offset",
             "group_set_length",
@@ -1064,6 +1069,7 @@ class DeviceBatch:
             grammar.group_set_length,
             grammar.set_payload,
             grammar.reading_offsets,
+            grammar.reading_index,
             grammar.reading_next_state,
             grammar.reading_term_offsets,
             grammar.reading_terminals,
@@ -1203,6 +1209,7 @@ class DeviceBatch:
             grammar.group_set_length,
             grammar.set_payload,
             grammar.reading_offsets,
+            grammar.reading_index,
             grammar.reading_next_state,
             grammar.reading_term_offsets,
             grammar.reading_terminals,

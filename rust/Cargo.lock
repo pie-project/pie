@@ -93,6 +93,7 @@ dependencies = [
  "gpugrammar-run",
  "gpugrammar-tables",
  "pyo3",
+ "rustc-hash",
 ]
 
 [[package]]

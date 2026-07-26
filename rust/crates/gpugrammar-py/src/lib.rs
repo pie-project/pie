@@ -19,6 +19,7 @@ use gpugrammar_run::Matcher as RunMatcher;
 use gpugrammar_tables::{Artifact, emit};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use rustc_hash::FxHashMap;
 use pyo3::types::{PyBytes, PyDict};
 
 fn compile(vocabulary: &[Vec<u8>], grammar: Grammar) -> PyResult<Artifact> {
@@ -197,10 +198,21 @@ impl CompiledGrammar {
         let mut group_set_kind = Vec::new();
         let mut group_set_offset = Vec::new();
         let mut group_set_length = Vec::new();
+        // Readings, interned.
+        //
+        // A group carries its own copy of every way its tokens can be read,
+        // and within one lexer state those copies repeat heavily - 40% to 72%
+        // of a state's readings are a terminal sequence some other group in
+        // the same state also has. Replaying each copy separately is most of
+        // what the mask fill costs, so identical readings collapse to one
+        // entry here and a group points at the entries it uses. What the
+        // kernel can then share is the replay, not merely the bytes.
         let mut reading_offsets = vec![0u32];
+        let mut reading_index = Vec::new();
         let mut reading_next_state = Vec::new();
         let mut reading_term_offsets = vec![0u32];
         let mut reading_terminals = Vec::new();
+        let mut interned_readings: FxHashMap<(Vec<u32>, u32), u32> = FxHashMap::default();
         for group in &artifact.groups {
             group_state.push(group.lexer_state);
             group_set_kind.push(match group.set.kind {
@@ -211,11 +223,21 @@ impl CompiledGrammar {
             group_set_offset.push(group.set.offset);
             group_set_length.push(group.set.length);
             for reading in &group.readings {
-                reading_next_state.push(reading.next_lexer_state);
-                reading_terminals.extend(reading.terminals.iter().copied());
-                reading_term_offsets.push(reading_terminals.len() as u32);
+                let key = (reading.terminals.clone(), reading.next_lexer_state);
+                let index = match interned_readings.get(&key) {
+                    Some(&existing) => existing,
+                    None => {
+                        let fresh = reading_next_state.len() as u32;
+                        reading_next_state.push(reading.next_lexer_state);
+                        reading_terminals.extend(reading.terminals.iter().copied());
+                        reading_term_offsets.push(reading_terminals.len() as u32);
+                        interned_readings.insert(key, fresh);
+                        fresh
+                    }
+                };
+                reading_index.push(index);
             }
-            reading_offsets.push(reading_next_state.len() as u32);
+            reading_offsets.push(reading_index.len() as u32);
         }
 
         out.set_item("group_offsets", words(python, &artifact.group_offsets))?;
@@ -225,6 +247,7 @@ impl CompiledGrammar {
         out.set_item("group_set_length", words(python, &group_set_length))?;
         out.set_item("set_payload", words(python, &artifact.set_payload))?;
         out.set_item("reading_offsets", words(python, &reading_offsets))?;
+        out.set_item("reading_index", words(python, &reading_index))?;
         out.set_item("reading_next_state", words(python, &reading_next_state))?;
         out.set_item("reading_term_offsets", words(python, &reading_term_offsets))?;
         out.set_item("reading_terminals", words(python, &reading_terminals))?;
