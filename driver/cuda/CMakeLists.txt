@@ -368,6 +368,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/kernels/envelope.cu
   src/kernels/gated_delta_net.cu
   src/kernels/gather_rows.cu
+  src/kernels/gemv.cu
   src/kernels/gather_tokens.cu
   src/kernels/geometry.cu
   src/kernels/head_dim_pad.cu

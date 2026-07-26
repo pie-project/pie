@@ -18,6 +18,7 @@
 #include "cuda_check.hpp"
 #include "kernels/dequant_fp4.hpp"
 #include "kernels/dequant_fp8.hpp"
+#include "kernels/gemv.hpp"
 #include "kernels/quant_bf16_to_fp8.hpp"
 #include "kernels/residual_add.hpp"
 
@@ -196,6 +197,22 @@ struct Bf16LtPlanCache {
         return per_device_singleton<Bf16LtPlanCache>();
     }
 };
+
+bool use_bf16_gemv() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_BF16_GEMV");
+        if (v == nullptr || v[0] == '\0') return true;
+        return v[0] != '0';
+    }();
+    return enabled;
+}
+
+// The handle's stream, or `false` if cuBLAS will not say. Never guess:
+// falling back to the null stream would run the GEMV outside the
+// caller's ordering and race whatever produced its input.
+bool cublas_stream(cublasHandle_t handle, cudaStream_t& stream) {
+    return cublasGetStream(handle, &stream) == CUBLAS_STATUS_SUCCESS;
+}
 
 bool use_cublaslt_bf16() {
     static const bool enabled = [] {
@@ -618,6 +635,17 @@ void gemm_bf16_impl(
     float beta)
 {
     const float alpha = 1.f;
+    // M=1 is the decode shape: a single activation row against the whole
+    // weight, so there is no reuse for a tiled GEMM to exploit and the
+    // call is a pure streaming read. cuBLAS picks kernels sized for an M
+    // worth filling and reaches roughly half of HBM bandwidth on these;
+    // a warp-per-row GEMV nearly doubles it (see `launch_gemv_bf16`).
+    cudaStream_t gemv_stream = nullptr;
+    if (M == 1 && beta == 0.f && use_bf16_gemv() &&
+        cublas_stream(handle, gemv_stream) &&
+        kernels::launch_gemv_bf16(W, act, y, N, K, gemv_stream)) {
+        return;
+    }
     const int lt_max_n = cublaslt_bf16_max_n();
     if (use_cublaslt_bf16() &&
         M >= cublaslt_bf16_min_m() &&
