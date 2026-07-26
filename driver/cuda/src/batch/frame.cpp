@@ -2250,6 +2250,8 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
     };
     const model::StageHooks stage_hooks{
         .context = &stage_hook_context,
+        .wants_attn_score =
+            engine.dispatch->launch_wants_attn_score(s.dispatch_view),
         .execute = [](
             void* opaque,
             model::StageHookPoint point,

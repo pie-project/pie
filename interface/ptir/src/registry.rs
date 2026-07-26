@@ -229,8 +229,8 @@ pub struct ModelProfile {
     /// a model with an MTP head serving device-resident spec-decode drafts.
     pub has_mtp_drafts: bool,
     pub has_value_head: bool,
-    /// `[num_heads, kv_len]` F32 attention weights ([`IntrinsicId::AttnScore`])
-    /// available. Unlike the MTP flags this is a *backend* property as much as
+    /// `[kv_max]` F32 head-folded attention weights
+    /// ([`IntrinsicId::AttnScore`]) available. Unlike the MTP flags this is a *backend* property as much as
     /// a model one: it needs a score-observing attention kernel, and it is
     /// refused for soft-capped or sliding-window attention, where the captured
     /// row would not be the softmax the eviction papers define.

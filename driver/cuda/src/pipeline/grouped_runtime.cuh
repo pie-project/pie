@@ -114,6 +114,12 @@ struct GroupedLaneBinding {
     std::uint32_t logits_stride = 0; // physical model row stride
     std::uint32_t program_index = 0;
     GroupedLaneEnvelope envelope{};
+    // Per-lane `[kv_max]` f32 attention-probability row, materialized by
+    // `resolve_lane_attn_score` from the layer capture. Null when the stage
+    // does not read `AttnScore`; reading it while null is a hard error rather
+    // than a zero row, because a silently-zero score is indistinguishable from
+    // "every position is evictable".
+    const float* attn_score_base = nullptr;
 };
 
 struct GroupedExecutionOptions {
@@ -1483,6 +1489,8 @@ struct GroupedStageStaticPlan {
                     }
                     requires_mtp_rows = true;
                     mtp_rows = required_rows;
+                } else if (op.intr == PTIR_INTR_ATTN_SCORE) {
+                    requires_attn_score = true;
                 } else if (op.intr != PTIR_INTR_LOGITS) {
                     fail("stage uses an unsupported intrinsic");
                     return;
@@ -1530,6 +1538,12 @@ struct GroupedStageStaticPlan {
     std::size_t channel_count = 0;
     bool requires_query = false;
     bool requires_layer = false;
+    // The stage reads `AttnScore`. Like `requires_kernel_call` this is
+    // descriptive: only the fused path can serve it (the grouped kernel has no
+    // intrinsic-strided read), but this static plan is the shared lane-binding
+    // metadata the fused path resolves through, so describing it here is what
+    // lets `register_program` accept the program at all.
+    bool requires_attn_score = false;
     // The stage names a second-party kernel. Only the fused path can launch
     // one; `Dispatch::register_program` refuses any name the backend cannot
     // launch, and `generated_stage_supported` is re-checked per execution
@@ -1744,6 +1758,10 @@ class GroupedStageAccumulator {
         if (static_plan_->requires_layer &&
             lane.layer_base == nullptr) {
             return fail("Layer intrinsic is unavailable");
+        }
+        if (static_plan_->requires_attn_score &&
+            lane.attn_score_base == nullptr) {
+            return fail("AttnScore intrinsic is unavailable");
         }
         if (static_plan_->requires_mtp_rows &&
             (lane.mtp_logits_bf16_rows == nullptr ||

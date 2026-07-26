@@ -43,7 +43,18 @@ inline bool second_party_region_supported(
            stage.stage == PTIR_STAGE_ON_ATTN;
 }
 
-inline constexpr std::uint16_t kCudaGeneratedEmitterVersion = 18;
+inline constexpr std::uint16_t kCudaGeneratedEmitterVersion = 19;
+
+// Per-lane stride of the intrinsic side tables (bases / modes / widths /
+// strides / offsets), in slots. Indexed by `IntrinsicId`, so it must be one
+// past the largest id -- an id that overflows this stride does not fault, it
+// silently reads the NEXT lane's slot 0. Both the host packer
+// (`fused_runtime.cuh`) and the emitted device source below index with it, and
+// `module_cache.hpp` keys the disk cache on `kCudaGeneratedEmitterVersion`, so
+// widening it must bump that version or stale cubins keep the old stride.
+inline constexpr std::uint32_t kPtirIntrinsicSlots =
+    static_cast<std::uint32_t>(PTIR_INTR_ATTN_SCORE) + 1u;
+static_assert(kPtirIntrinsicSlots == 8u);
 
 inline bool validate_generated_region(
     const pie_native::ptir::plan::StagePlan& stage,
@@ -1540,7 +1551,8 @@ extern "C" __global__ void )PTIR_CUDA"
         } else if (op.tag == PTIR_OP_INTRINSIC_VAL) {
             source
                 << "    const m1_u32 intrinsic_index = "
-                   "dispatch_lane * 7u + p.intr;\n"
+                   "dispatch_lane * "
+                << kPtirIntrinsicSlots << "u + p.intr;\n"
                 << "    p.intrinsic_dtype = "
                    "intrinsic_modes[intrinsic_index];\n"
                 << "    p.imm = intrinsic_widths[intrinsic_index];\n"
@@ -1673,7 +1685,8 @@ extern "C" __global__ void )PTIR_CUDA"
                 std::numeric_limits<std::uint16_t>::max()) {
                 source
                     << "    const m1_u32 direct_intrinsic_index = "
-                       "dispatch_lane * 7u + "
+                       "dispatch_lane * "
+                    << kPtirIntrinsicSlots << "u + "
                     << direct_argmax_intrinsic[node] << "u;\n"
                     << "    ptir_fast_argmax_intrinsic(\n"
                     << "        reinterpret_cast<const m1_u8*>("

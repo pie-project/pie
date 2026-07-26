@@ -262,6 +262,13 @@ class Dispatch {
     bool launch_has_attention_stages(
         const pie_native::LaunchView& view) const;
 
+    // Whether any program in this launch reads `AttnScore`. Capture is opt-in
+    // per fire because it costs an extra `[num_q_heads, kv_len]` write inside
+    // the attention kernel; a launch that does not observe scores must pay
+    // nothing.
+    bool launch_wants_attn_score(
+        const pie_native::LaunchView& view) const;
+
     // Whether this model + cache can honour the `envelope_dot` contract.
     // Mirrors the `has_kv_envelopes` driver capability; a program that names
     // the kernel is refused at bind when false.

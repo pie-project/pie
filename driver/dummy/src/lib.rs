@@ -1770,7 +1770,7 @@ fn deterministic_value(ty: ValueType, base: u64) -> Value {
     }
 }
 
-/// `[num_heads, kv_len]` attention weights. Rows are normalised because the
+/// `[kv_max]` head-folded attention weights. The row is normalised because the
 /// real intrinsic is a softmax output, and an eviction policy that reads a
 /// row summing to something other than 1 would behave differently here than
 /// on hardware — the dummy driver exists to catch exactly that class of drift.

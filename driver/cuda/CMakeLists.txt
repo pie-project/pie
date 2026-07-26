@@ -322,6 +322,7 @@ set(PIE_CUDA_MODEL_SOURCES
   src/kernels/nemotron_h.cu
   src/kernels/scalar_mul.cu
   src/kernels/softcap.cu
+  src/model/attn_score.cu
   src/model/config.cpp
   src/model/csm/csm.cpp
   src/model/csm/csm_backbone_forward.cu
@@ -813,6 +814,10 @@ pie_add_cuda_target(test_decode_batch_parity
   LIBS pie_driver_cuda_lib CUDA::cudart)
 pie_add_cuda_target(test_attn_score_capture
   SOURCES tests/test_attn_score_capture.cu
+  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/tests
+  LIBS pie_driver_cuda_lib CUDA::cudart)
+pie_add_cuda_target(test_attn_score_fold
+  SOURCES tests/test_attn_score_fold.cu
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/tests
   LIBS pie_driver_cuda_lib CUDA::cudart)
 pie_add_cuda_target(test_decode_fused_write_parity

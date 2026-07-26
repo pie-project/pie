@@ -1351,11 +1351,11 @@ inline GroupedLaunchResult run_generated_stage(
                     static_cast<std::uint32_t>(op.chan)));
         }
     }
-    std::vector<std::uint64_t> host_intrinsic_bases(lane_count * 7, 0);
-    std::vector<std::uint32_t> host_intrinsic_modes(lane_count * 7, 0);
-    std::vector<std::uint32_t> host_intrinsic_widths(lane_count * 7, 0);
-    std::vector<std::uint32_t> host_intrinsic_strides(lane_count * 7, 0);
-    std::vector<std::uint32_t> host_intrinsic_offsets(lane_count * 7, 0);
+    std::vector<std::uint64_t> host_intrinsic_bases(lane_count * kPtirIntrinsicSlots, 0);
+    std::vector<std::uint32_t> host_intrinsic_modes(lane_count * kPtirIntrinsicSlots, 0);
+    std::vector<std::uint32_t> host_intrinsic_widths(lane_count * kPtirIntrinsicSlots, 0);
+    std::vector<std::uint32_t> host_intrinsic_strides(lane_count * kPtirIntrinsicSlots, 0);
+    std::vector<std::uint32_t> host_intrinsic_offsets(lane_count * kPtirIntrinsicSlots, 0);
     std::vector<std::uint64_t> host_bf16_rows;
     std::vector<std::uint32_t> bf16_row_offsets(lane_count, UINT32_MAX);
     std::vector<std::uint64_t> host_mtp_rows;
@@ -1404,7 +1404,8 @@ inline GroupedLaunchResult run_generated_stage(
             const auto& op = stage.ops[node].op;
             if (op.tag != PTIR_OP_INTRINSIC_VAL) continue;
             const std::size_t index =
-                static_cast<std::size_t>(lane) * 7 + op.intr;
+                static_cast<std::size_t>(lane) * kPtirIntrinsicSlots +
+                op.intr;
             const GeneratedValueDesc& descriptor =
                 host_descriptors[
                     static_cast<std::size_t>(lane) * value_count +
@@ -1455,6 +1456,16 @@ inline GroupedLaunchResult run_generated_stage(
                         lanes[lane].layer_base);
                 host_intrinsic_widths[index] = 1;
                 host_intrinsic_strides[index] = 1;
+            } else if (op.intr == PTIR_INTR_ATTN_SCORE) {
+                if (lanes[lane].attn_score_base == nullptr) {
+                    throw std::runtime_error(
+                        "generated fused AttnScore intrinsic has no capture "
+                        "buffer for this lane");
+                }
+                host_intrinsic_bases[index] =
+                    reinterpret_cast<std::uint64_t>(
+                        lanes[lane].attn_score_base);
+                host_intrinsic_strides[index] = descriptor.last;
             } else {
                 throw std::runtime_error(
                     "generated fused intrinsic is unavailable");

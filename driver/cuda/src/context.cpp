@@ -1527,6 +1527,27 @@ int Context::Impl::load_model(
                                   kv_cache_p->format().is_native_bf16() &&
                                   !kv_cache_p->hnd_layout() &&
                                   kv_cache_p->envelopes_enabled();
+    // Track B: `AttnScore` reads the attention probabilities the decode kernel
+    // actually computed. Only the plain paged-decode path carries the capture
+    // variant, so the capability is exactly the set of models whose every
+    // decode fire lands there:
+    //   * llama_like family -- the only family whose body is wired for capture.
+    //   * no sliding window -- the row would describe a truncated context while
+    //     claiming to describe the whole one.
+    //   * `use_prefill_decode_plan` off -- SM90+ routes decode through the
+    //     prefill kernel, which has no capture variant.
+    //   * native bf16, non-HND KV and TP 1 -- the capture dispatch dequants to
+    //     bf16, and a TP rank holds only its slice of the query heads, so the
+    //     head fold would average a subset while claiming to average all.
+    // Anything false here makes `bind_program` reject the program at bind
+    // instead of letting it read a buffer nobody wrote.
+    const bool has_attn_score =
+        family == model::Family::LlamaLike && local_tp_size == 1 &&
+        kv_cache_p != nullptr && kv_cache_p->format().is_native_bf16() &&
+        !kv_cache_p->hnd_layout() && fwd_cfg.sliding_window < 0 &&
+        fwd_cfg.per_layer_window_left.empty() &&
+        !fwd_cfg.use_prefill_decode_plan;
+
     registry_->dispatch().set_kv_envelopes_available(
         has_kv_envelopes,
         has_kv_envelopes
@@ -1750,12 +1771,7 @@ int Context::Impl::load_model(
         {"has_mtp_drafts", false},
         {"has_value_head", false},
         {"has_kv_envelopes", has_kv_envelopes},
-        // Track B layer 2: the AttnScore intrinsic exists in the ABI but this
-        // driver does not yet materialize scores at OnAttn, so the capability
-        // stays false and `bind_program` rejects such a program loudly
-        // (dispatch.cu stage/intrinsic gate) instead of binding a program that
-        // would read an unwritten buffer.
-        {"has_attn_score", false},
+        {"has_attn_score", has_attn_score},
         // RV-26: PIE_DEVICE_PORT_ATTN_MASK is deliberately NOT advertised.
         // The runtime classifies masked device-carried decode into the
         // DecodeEnvelope class exactly when this mask claims the port, but

@@ -547,3 +547,130 @@ question should be settled first, against `fused_runtime.cuh:1901`,
    has no settled envelope, so it is pinned rather than scored from partial
    data. Fail-safe, and it coincides with Quest's "keep the local window".
 3. **Selection is observed, not enforced** (§8.6).
+
+---
+
+## 9. Track B as built (implementation record)
+
+### 9.1 What runs
+
+`tova-attention` reads the real softmax attention weights, at **all 28 layers**,
+on real hardware, for every decode fire. `test_curated.py` is **37/37**.
+
+The row is self-validating and the test exploits that: each layer contributes a
+distribution over the live prefix, so the folded row must sum to exactly
+`layers_observed`. Measured: `score_mass = 27.99999` against 28 layers.
+
+The scores discriminate. On a prompt whose answer sits at the front, TOVA's
+keep-set comes out as `[0..7, 12, 17, 97..102]` — the attention sink plus a
+recency window — and the first eviction is position 48, mid-filler. That is the
+published behaviour of the algorithm, not merely a well-formed buffer.
+
+| Commit | Content |
+|---|---|
+| `1a8f62d65` | Layer 1 — observe attention scores through a FlashInfer variant |
+| `800fe40b6` | Layer 2 — the `AttnScore` intrinsic in the PTIR ABI |
+| (this) | Layer 3 — capture wired into the forward, bound at `OnAttn` |
+
+### 9.2 The intrinsic table stride was hardcoded at 7, and `AttnScore` is 7
+
+`fused_runtime.cuh` sized the per-lane intrinsic side tables (bases / modes /
+widths / strides / offsets) at `lane_count * 7`, and `fused_codegen.hpp` emitted
+`dispatch_lane * 7u + p.intr` into the **generated device source**. `AttnScore`
+is id 7. The read would not have faulted — it would have returned
+`intrinsic_bases[lane*7 + 7]`, which is the **next lane's `Logits` base**.
+
+Two things make this worth recording. First, the constant lived in two places,
+one of them a string literal inside a code generator, so a reader checking the
+host packer would have seen nothing wrong. Second, the emitted source is cached
+as cubins on disk keyed by `kCudaGeneratedEmitterVersion`, so widening the
+stride without bumping that version would have left every existing machine
+replaying the old stride against the new host layout.
+
+Both sites now derive from one `kPtirIntrinsicSlots = PTIR_INTR_ATTN_SCORE + 1`
+with a `static_assert`, and the emitter version went 18 -> 19.
+
+This is contract-family #4's shape: a fast path indexed by an id that the id
+space quietly outgrew.
+
+### 9.3 The host page CSR is an upper bound; the device CSR is exact
+
+**This is the bug that cost the most, and it is a new instance of contract #3.**
+
+`AttentionObservation` carries the fire's host-side page CSR. `frame.cpp` is
+free to replace that CSR with a *conservative* one before the body runs — graph
+lattice padding (`:1869`) and the decode-envelope KV bound (`:1818`, which
+assigns `kv_last_page_lens = page_size` for every request) both do. The **device**
+CSR the attention kernel reads stays exact.
+
+So `LayerScoreCapture` sized its ragged buffers from the host CSR (an upper
+bound), while the capture and fold kernels wrote exactly `kv_len` entries as
+derived from the device CSR. The slack between the two was never written, and
+`cudaMallocAsync` hands back recently-freed memory: the tail of the score row
+was **live garbage from a previous fire**.
+
+The failure signature is worth remembering:
+
+- It was **not** deterministic. Three runs in five were clean.
+- It was **not** wrong from the start. The first three or four fires of a run
+  were exact, then the observed length pinned to the bound and stuck.
+- It was **not** loud. The garbage was ~1e-5 in magnitude, so the row still
+  summed to 28 and still looked like a distribution.
+
+An eviction policy fed that row keeps positions that do not exist and drops real
+ones — silently, and only sometimes.
+
+The fix is to `cudaMemsetAsync` the folded buffer at allocation. That is not
+papering over the gap: `0.0` is the intrinsic's *defined* value for a position
+past `kv_len`, because a position that does not exist received no attention.
+
+The general rule this reinforces: **a host-side CSR handed to a model body is a
+bound, not a measurement.** Anything sized from it must zero the slack, and
+anything that needs the true length must derive it from the device CSR — which
+is what `k_attn_score_normalize` and `k_attn_score_fold_heads` already do.
+
+The regression test asserts the declared and observed lengths agree on **every**
+fire, not just the last one, because the first fires were clean.
+
+### 9.4 `GroupedStageStaticPlan` is a hard gate at registration, not routing
+
+`GroupedStageStaticPlan::valid == false` reads like a "cannot go grouped, fall
+back to fused" routing decision, and inside `try_add` it is exactly that. But
+`Dispatch::register_program` (`dispatch.cu:2971`) constructs the same plan and
+**refuses the whole program** when it is invalid. A stage reading a new
+intrinsic therefore has to be described there even though only the fused path
+can serve it — the same status `requires_kernel_call` already has for
+`envelope_dot`.
+
+### 9.5 Prefill needs no capture path
+
+The concern was that real inferlets prefill first, so a decode-only capture
+would throw on the first fire. It does not arise: the repo's own pattern is a
+**separate tap-free `ForwardPass` for prefill** (`quest-attention` does this,
+and `tova-attention` follows it). That is also correct on the algorithm's terms
+— TOVA ranks by the most recent query token, and during prefill "most recent" is
+still moving.
+
+### 9.6 Capability gating
+
+`has_attn_score` is true only where every decode fire lands on the plain paged
+decode path: llama-like family, `tp == 1`, native bf16 non-HND pages, no sliding
+window, and `use_prefill_decode_plan` off (SM90+ routes decode through the
+prefill kernel, which has no capture variant). A windowed layer additionally
+passes `capturable = false` so the capture is never constructed — a row that
+described a truncated context while claiming to describe all of it would be
+wrong in exactly the way §9.3 is about.
+
+### 9.7 Deviations from the papers, as built
+
+1. **Heads are folded by the backend.** TOVA ranks per head; one page list per
+   request means a per-head keep-set has no representable consumer. The backend
+   returns the mean over query heads. Identical collapse, identical reason, as
+   Quest (§8.7.1).
+2. **Layers are folded by the program.** TOVA keeps a cache per layer; the
+   inferlet sums the per-layer rows and ranks the sum. This is the
+   layer-uniform variant TOVA itself evaluates, and it is monotone-equivalent
+   to the mean.
+3. **Selection is observed, not enforced.** As with Quest, the mask does not yet
+   reach attention, so output is bit-identical to `naive-baseline` — which is
+   what makes the tap testable.
