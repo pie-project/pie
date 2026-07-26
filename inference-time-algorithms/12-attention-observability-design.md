@@ -983,3 +983,184 @@ A second, duller cause was hiding under the same failure: `trackb-h2o` inherited
 Gumbel streams disagree for reasons that have nothing to do with attention. Any
 inferlet whose test compares its text against the baseline's must share the
 baseline's salt.
+
+## 12. SnapKV as built (implementation record)
+
+### 12.1 SnapKV needed a second tap, not a second policy
+
+TOVA and H2O are decode-time policies: they watch the attention of each
+generated token and re-rank continuously, so both ride the `AttnScore` tap of
+§9, which fires on a one-row decode. SnapKV is a *prefill-time* policy. It looks
+at what the **tail of the prompt** attended to, selects a keep-set once, and
+then holds it fixed for the whole generation. There is no decode observation to
+read, and by the time the first token is generated the decision has already been
+made.
+
+That is a different kernel. FlashInfer's prefill path is a separate template
+tree from decode, so the tap had to be built a second time:
+`dispatch_attention_flashinfer_prefill_capture_bf16`, `PieScoreCaptureWindow`,
+and two post-processing kernels. What did *not* have to be rebuilt is everything
+downstream — the `AttnScore` ABI, the page fold, `attn_page_mask` consumption,
+and the compaction of §10 are all shared. The inferlet is ~460 lines and the
+enforcement half of it is the same code H2O runs.
+
+### 12.2 Three things make the prefill capture unlike the decode one
+
+**(a) The `threadIdx.x == 0` guard must not be carried over.** In the decode
+capture the `bdx` lanes hold identical `s[j]` after a butterfly reduction, so one
+lane writes and the rest are redundant. In prefill the threads hold *distinct*
+MMA fragment elements: `q_idx` and `qo_head_idx` come from
+`divmod(qo_packed_idx, group_size)` and `kv_idx` from the lane's position in the
+tile. Keeping the guard would silently drop 31 of every 32 scores — and it is
+invisible without an exact reference, because a row missing most of its entries
+still normalises into a plausible-looking distribution. Exactly-once still holds
+without atomics: split-KV chunks are disjoint in `kv`.
+
+**(b) `q_idx` needs its own bounds check.** The last MMA tile is padded, so
+`q_idx` can exceed `qo_len`. Decode never had a q dimension to overrun.
+
+**(c) The hook's `batch_idx` argument is literally `0` in prefill.** The real
+request index only reaches the *constructor*, so the row base is resolved there
+and the hook receives it as state.
+
+The window gate itself is cheap: `qo_len` is an inherited member of
+`DefaultAttention`, so `first_qo = qo_len > window ? qo_len - window : 0` and the
+per-score test is a register compare. Rows outside the window cost one compare
+and nothing else.
+
+### 12.3 The causal limit has to be applied after the fact
+
+`LogitsMask` runs *after* `LogitsTransform`, so the hook records real dot
+products at positions the softmax is about to discard. Normalising over the full
+`kv_len` would spread mass onto the future.
+
+Window row `w` belongs to the query at absolute position `kv_len - rows + w`
+(with `rows = min(window, qo_len)`), so it may attend to `kv_len - rows + w + 1`
+keys and no more. `k_attn_prefill_score_normalize` zeroes `[limit, kv_len)` and
+softmaxes `[0, limit)`. The derivation is general — it stays correct under
+chunked prefill, where `kv_len > qo_len`.
+
+`[0, limit)` is always *fully* written, which is what lets the raw buffer go
+un-zeroed: within a q-tile every kv index in the processed range is evaluated
+for every q row (the mask is applied afterwards), and with split-KV the chunks
+together still cover the range. The fold therefore reads exactly the region
+normalize wrote. Only the folded buffer needs zeroing, because the host page CSR
+is an upper bound while the device CSR is exact.
+
+The fold divisor is `heads * rows`, **not** `heads * window`. A prompt shorter
+than the observation window contributes fewer rows, and counting rows that do
+not exist would scale its mass down.
+
+### 12.4 The planner had to learn about the tap
+
+Whether a prefill runs on SM90 or FA2 is a *plan-time* decision, so refusing
+SM90 at dispatch time would be too late. `wants_prefill_score` therefore threads
+into `plan_attention_flashinfer_prefill_bf16`.
+
+It also promotes `full_attention_variant` to true. The real prefill path plans
+with the sliding-window template while the capture is instantiated over
+`AttnVariantFull`; the two differ only by a runtime window predicate that is
+trivially true at `window_left < 0`, and `PrefillPlan<IdType>` does not depend on
+the variant at all — only on `window_left` and geometry. So the promotion changes
+no numerics and saves an instantiation. `window_left >= 0` throws.
+
+SM90 is refused **loudly**, never silently fallen through. A silent fallthrough
+would hand the policy an all-zero row, which reads as "nothing was attended to"
+and evicts the entire prefix. Hopper's `StandardAttention` has a different
+constructor, stores neither `qo_len` nor `kv_len`, and would need `score_out`
+threaded through `AdditionalParams` → `to_underlying_arguments`; that is a real
+port, not a flag. This is the one known gap.
+
+### 12.5 The pooling deviation
+
+SnapKV pools the observed scores with an overlapping max-pool (kernel 7, stride
+1) before ranking, to avoid keeping an isolated high-attention token without its
+neighbours. We fold non-overlapping, at page granularity, and sum rather than
+max.
+
+This is deliberate and it is the same argument as §11.3: a position-granular
+selection can stop attention from reading a position but cannot free the page
+holding it. Page granularity is the only unit that returns memory, so it is the
+unit the policy must rank in. Pooling at a finer granularity and then rounding up
+to pages would produce a *different ranking of the same pages*, not a finer
+eviction. The non-overlapping page fold is the enforceable analogue.
+
+### 12.6 What the capture actually shows
+
+Qwen3-0.6B, 28 layers, 272-token prompt (17 pages of 16), default window 32 —
+so the observation window is pages 15..16:
+
+```
+page_mass = [14.64, 0.76, 0.54, 0.51, 0.42, 0.46, 0.36, 0.44, 0.37,
+             0.37, 0.43, 0.42, 0.55, 0.60, 1.60, 3.22, 2.31]
+             ^sink  <------------ flat filler ------------>  <-window->
+score_mass = 28.0000 = layers_observed        tail_nonzero = 0
+```
+
+The total is the layer count to four decimals, which pins the fold divisor: an
+un-normalised fold would land at `heads * rows * layers` and a `heads * window`
+divisor would undershoot on a short prompt.
+
+The shape is checked by *sweeping the window* rather than by asserting a
+constant, because the profile is a prediction. `test_snapkv.py` derives the
+window's page span independently of the driver and both agree at every setting:
+
+| `PIE_ATTN_SCORE_WINDOW` | window pages | window page vs. ordinary prefix page |
+|---|---|---|
+| 16 | 16..16 | 8.0x |
+| 32 (default) | 15..16 | 4.9x |
+| 64 | 13..16 | 3.0x |
+| 128 | 9..16 | 1.6x |
+
+The elevated region grows and its peak marches *left* as the window widens. That
+is not a curiosity, it is the causal mask being obeyed: kv position
+`first_row + j` is weighted by only `window - j` of the `window` captured rows,
+so the very last page is structurally attended by the fewest rows. A profile that
+peaked at the final page would mean the mask had *not* been applied to the
+captured rows, and the test asserts it does not.
+
+At `window = 128` the "window" covers half the prompt and the contrast
+legitimately washes out; that is a statement about the configuration, so the
+strong separation check is gated on `win_pages * 3 <= n` rather than being
+weakened for everyone.
+
+### 12.7 Cost
+
+CUDA-event isolated, one request, L40S, `window` = the observation window:
+
+| `qo_len` | window | plain | capture | ratio |
+|---|---|---|---|---|
+| 512 | 32 | 0.0345 ms | 0.0670 ms | 1.94x |
+| 512 | 128 | 0.0342 ms | 0.1411 ms | 4.12x |
+| 2048 | 32 | 0.1246 ms | 0.2085 ms | 1.67x |
+| 2048 | 128 | 0.1244 ms | 0.2945 ms | 2.37x |
+| 8192 | 32 | 1.3328 ms | 1.6567 ms | **1.24x** |
+| 8192 | 128 | 1.3453 ms | 1.8642 ms | 1.39x |
+
+The ratio *falls* as the prompt grows, which is the opposite of the decode
+capture: prefill work scales with `qo_len * kv_len` while the tap scales with
+`window * kv_len`, so a fixed window amortises. The right way to read the
+production row (8192 / 32) is **+0.32 ms per layer, once per sequence** — roughly
++7% on a prefill forward pass, paid to avoid carrying an uncompressed cache
+through hundreds of decode steps. Plain prefill is untouched: the planner only
+promotes when `wants_prefill_score`, and the decode path is not involved at all.
+
+The tap is bandwidth-bound and close to the machine. At 8192/128 it moves ~402 MB
+per layer in 519 us — 775 GB/s against the L40S's 864 GB/s peak. Fusing the
+softmax rescale into a recompute pass (5 full-buffer passes down to 4) moved the
+8192/32 ratio only 1.25x → 1.24x, which locates the remaining cost where it
+actually is: the variant's stores are scattered across MMA fragments, not
+coalesced, and that is inherent to reading per-`(row, kv, head)` scores out of a
+fused kernel. It was kept anyway — strictly less traffic, no added complexity.
+
+Memory is transient and capped: `heads * window * kv_len * 4B` per request per
+layer, 16.8 MB at 16 heads / window 32 / 8K context, refused above 1 GiB.
+
+### 12.8 Chunked prefill is well defined, not merely tolerated
+
+The window is the last `window` rows *of this firing*. For one-shot prefill that
+is exactly SnapKV's definition. Under chunked prefill the *final* chunk's firing
+matches SnapKV, and the earlier firings are well-defined observations of earlier
+windows — so a policy that acts on the most recent firing gets SnapKV's semantics
+without special-casing. The mixed prefill+decode plan deliberately does not
+capture, and the PTIR side fails loudly there rather than returning a zero row.
