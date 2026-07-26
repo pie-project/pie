@@ -377,6 +377,15 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--request-timeout", type=float, default=300.0)
     p.add_argument("--tp-size", type=int, default=1)
     p.add_argument(
+        "--dp-size",
+        type=int,
+        default=1,
+        help="Data-parallel replicas. Each replica is its own tp-size-wide "
+             "shard group, so the run occupies tp_size * dp_size devices. "
+             "PIE derives this from the device list (world_size / tp_size); "
+             "vLLM takes it as data_parallel_size.",
+    )
+    p.add_argument(
         "--cpu-affinity",
         default="auto",
         help="CPU affinity for the benchmark process. Use 'auto' to pin to "
@@ -710,7 +719,10 @@ def gpu_local_cpu_affinity(gpu_ids: list[int]) -> set[int]:
     return cpus
 
 
-def visible_cuda_devices(tp_size: int) -> list[int]:
+def visible_cuda_devices(tp_size: int, dp_size: int = 1) -> list[int]:
+    # A run occupies one device per rank: tp_size ranks per replica,
+    # dp_size replicas.
+    world = max(1, tp_size) * max(1, dp_size)
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     if visible:
         ids: list[int] = []
@@ -719,8 +731,8 @@ def visible_cuda_devices(tp_size: int) -> list[int]:
             if item.isdigit():
                 ids.append(int(item))
         if ids:
-            return ids[: max(1, tp_size)]
-    return list(range(max(1, tp_size)))
+            return ids[:world]
+    return list(range(world))
 
 
 def maybe_set_cpu_affinity(args: argparse.Namespace, gpu_ids: list[int]) -> str | None:

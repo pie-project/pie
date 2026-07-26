@@ -373,10 +373,19 @@ impl FramePolicy {
     pub fn on_bind_enqueued(&mut self, pid: Option<ProcessId>) {
         if let Some(pid) = pid {
             *self.pending_binds.entry(pid).or_default() += 1;
-            // Process-scoped (pid is the owning process). A live rebinder
-            // gets a transient entry too — cleared by its next fire — which
-            // can at most extend a gather by the rebind window.
-            self.staged.insert(pid);
+            // Only a process with NO lane yet is a successor the seal
+            // should wait for. One that has already fired is in the
+            // wait-set through its lane, and staging it again makes the
+            // seal wait for a fire it cannot issue: its next fire may be
+            // ordered behind the settlement of the frame the seal is
+            // holding. A recurrent-state pass is exactly that — it
+            // serializes behind every earlier fire — so a guest that
+            // binds a second program after its first fire (prefill then
+            // decode, the ordinary shape) deadlocked the whole gather
+            // whenever the execution pool was capped.
+            if !self.lanes.values().any(|lane| lane.owner == Some(pid)) {
+                self.staged.insert(pid);
+            }
         }
     }
 
@@ -841,12 +850,18 @@ impl FramePolicy {
     pub fn debug_summary(&self) -> String {
         use std::fmt::Write as _;
         let mut out = format!(
-            "frame k={} lanes={} awaited={} sealed={} pending_binds={} ever_sealed={} watchdog={:?}",
+            "frame k={} lanes={} awaited={} sealed={} pending_binds={} \
+staged={} joins_in_flight={} departing={} pending_slots={} \
+ever_sealed={} watchdog={:?}",
             self.k,
             self.lanes.len(),
             self.lanes.values().filter(|lane| lane.awaited).count(),
             self.sealed.len(),
             self.pending_binds.values().sum::<usize>(),
+            self.staged.len(),
+            self.joins_in_flight.len(),
+            self.departing.len(),
+            self.pending_slots,
             self.ever_sealed,
             self.strict_watchdog_deadline
                 .map(|deadline| deadline.saturating_duration_since(Instant::now())),
@@ -855,7 +870,8 @@ impl FramePolicy {
             let front_complete = lane.frames.front().is_some_and(PendingFrame::is_complete);
             let _ = write!(
                 out,
-                "\n  lane {pid}: awaited={} queued_frames={} front_complete={front_complete}",
+                "\n  lane {pid}: owner={:?} awaited={} queued_frames={} front_complete={front_complete}",
+                lane.owner,
                 lane.awaited,
                 lane.frames.len(),
             );

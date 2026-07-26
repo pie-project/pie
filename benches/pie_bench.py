@@ -80,6 +80,9 @@ def reconstruct_token_arrivals(
     return arrivals
 
 
+PIE_BENCH_DEFAULT_DEVICE = "cuda:0"
+
+
 def bench_inferlet_paths(inferlet_dir: str | None) -> tuple[Path, Path, str]:
     if not inferlet_dir:
         raise FileNotFoundError(
@@ -197,6 +200,13 @@ def build_config(args: argparse.Namespace):
         TelemetryConfig,
     )
 
+    # PIE derives BOTH parallelism degrees from the device list: it needs
+    # one device per rank, and splits world_size / tensor_parallel_size
+    # into replica groups. So the list has to cover tp * dp whenever
+    # either exceeds 1. An explicit `--device` still wins.
+    world = max(1, args.tp_size) * max(1, args.dp_size)
+    if args.device == PIE_BENCH_DEFAULT_DEVICE and world > 1:
+        args.device = ",".join(f"cuda:{i}" for i in range(world))
     device = [d.strip() for d in args.device.split(",")] if "," in args.device else [args.device]
     driver_options: dict[str, Any]
     if args.driver == "cuda_native":
@@ -533,7 +543,8 @@ async def run(args: argparse.Namespace):
 
     # Pin to GPU-local CPUs before the server spawns so the pie serve
     # subprocess inherits the affinity mask (mirrors vllm/sglang benches).
-    cpu_affinity = maybe_set_cpu_affinity(args, visible_cuda_devices(args.tp_size))
+    cpu_affinity = maybe_set_cpu_affinity(
+        args, visible_cuda_devices(args.tp_size, args.dp_size))
 
     n = args.requests if args.mode == "latency" else args.num_requests
     prompts = make_prompts(args, n + args.warmup)
@@ -1154,7 +1165,7 @@ def build_parser() -> argparse.ArgumentParser:
             help="Path to a built text-completion-bench inferlet project "
                  "(or set PIE_BENCH_INFERLET_DIR).",
         )
-        sp.add_argument("--device", default="cuda:0")
+        sp.add_argument("--device", default=PIE_BENCH_DEFAULT_DEVICE)
         sp.add_argument("--driver", default="cuda_native",
                         choices=["cuda_native", "vllm", "sglang", "tensorrt_llm", "dummy"])
         sp.add_argument("--default-token-limit", type=int, default=200_000)

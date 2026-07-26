@@ -22,6 +22,10 @@
 #include "kernels/kv_paged.hpp"
 #include "kernels/moe_dispatch.hpp"
 #include "kernels/residual_add.hpp"
+#include <mutex>
+#include <set>
+#include <tuple>
+
 #include "kernels/rmsnorm.hpp"
 #include "kernels/rope.hpp"
 #include "kernels/slab_scatter.hpp"
@@ -106,13 +110,28 @@ int qwen35_gdn_warp_tiled_max_tokens() {
     return max_tokens;
 }
 
+bool moe_path_log_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_MOE_PATH_LOG");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
+// Every block is one entry of a batched GEMM and reads a whole expert
+// weight, and a block belongs to exactly one expert — so the row count
+// pads up to roughly `active_experts * block`. With 256 experts holding
+// only a few routes each, 16 padded 512 real routes to 4352 rows for the
+// same number of weight reads; 8 halves the padding. Measured on
+// Qwen3.6-35B-A3B, 128 requests x 256 tokens: 1197 tok/s at 8 against
+// 1107 at 16, and it falls off either side (921 at 32, 586 at 64).
 int qwen35_moe_aligned_decode_block_size() {
     static const int block = [] {
         const char* v = std::getenv("PIE_QWEN35_MOE_ALIGNED_DECODE_BLOCK");
-        if (v == nullptr || v[0] == '\0') return 16;
+        if (v == nullptr || v[0] == '\0') return 8;
         char* end = nullptr;
         long parsed_long = std::strtol(v, &end, 10);
-        if (end == v) return 16;
+        if (end == v) return 8;
         int parsed = static_cast<int>(parsed_long);
         if (parsed <= 1) return 0;
         if (parsed < 2) parsed = 2;
@@ -131,11 +150,30 @@ int qwen35_moe_aligned_decode_min_routes() {
     return min_routes;
 }
 
+// Row count above which a NON-pure-decode step leaves the device-side
+// MoE dispatch for the host-driven one. The host path resolves routing on
+// the CPU, which costs a device sync per layer and then walks all
+// `num_experts` slots issuing per-expert copies and GEMMs — 256 of them
+// on Qwen3.6, 40 times per step. It exists for prefill, where the per
+// expert row counts are large enough to amortise that; on a continuous
+// batching mixed step it is simply the wrong path, and the steps that
+// take it are the ones with the most rows to lose.
+//
+// No clamp: the cap is a tuning knob, not a safety bound, and clamping it
+// to 128 silently pinned mixed steps of 144-252 rows to the host path.
+//
+// The default follows rows per expert rather than rows: an N-token step
+// gives each expert about N*K/E rows, and the host path only earns its
+// per-layer sync and its `num_experts` dispatches once that is a
+// GEMM-sized number. At Qwen3.6's E=256, K=8, 1024 tokens is ~32 rows
+// per expert. A real bulk prefill (8192 tokens) still takes the host
+// path. Measured, 128 requests x 256 tokens: 64 gave 918-986 tok/s,
+// everything from 128 up gave 994-1116 (within run-to-run spread).
 int qwen35_moe_decode_fast_max_tokens() {
     static const int max_tokens = [] {
         const char* v = std::getenv("PIE_QWEN35_MOE_DECODE_FAST_N");
-        if (v == nullptr || v[0] == '\0') return 64;
-        return std::clamp(std::atoi(v), 0, 128);
+        if (v == nullptr || v[0] == '\0') return 1024;
+        return std::max(0, std::atoi(v));
     }();
     return max_tokens;
 }
@@ -1317,6 +1355,24 @@ bool moe_block(
     const bool use_decode_fast_path =
         is_pure_decode ||
         (N > 0 && N <= qwen35_moe_decode_fast_max_tokens());
+    if (moe_path_log_enabled()) {
+        // One line per distinct (N, pure_decode, path) triple, so a whole
+        // run reports which shapes took which path without 40 lines per
+        // step drowning the log.
+        static std::mutex seen_mutex;
+        static std::set<std::tuple<int, bool, bool>> seen;
+        const auto key = std::make_tuple(N, is_pure_decode, use_decode_fast_path);
+        bool fresh = false;
+        {
+            std::lock_guard<std::mutex> lock(seen_mutex);
+            fresh = seen.insert(key).second;
+        }
+        if (fresh) {
+            std::fprintf(
+                stderr, "[pie-moe-path] N=%d pure_decode=%d fast_path=%d\n",
+                N, is_pure_decode ? 1 : 0, use_decode_fast_path ? 1 : 0);
+        }
+    }
     const bool add_to_residual = (T == 1) && use_decode_fast_path;
     void* moe_out = add_to_residual ? ws.y.data() : ws.norm_y.data();
 
