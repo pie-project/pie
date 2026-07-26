@@ -659,6 +659,37 @@ On the schema that stresses each engine most, XGrammar reaches 52.7% of a
 decode step at batch 512 and the end-to-end gain is 1.37x. This is a whole-
 system result, not a microbenchmark ratio.
 
+**Per-step cost, with the parser resident (2026-07-26).** Both engines charged
+for the fill *and* the advance, on a batch where each sequence sits at its own
+point in its document - which is what a serving batch looks like, and which
+matters because our fill deduplicates. Median over four schemas, against a
+CUDA-graph decode step:
+
+| batch | 1 | 8 | 32 | 128 | 512 |
+|---|---|---|---|---|---|
+| whole step | 0.20x | 0.60x | 1.89x | 3.82x | **7.83x** |
+| only what cannot overlap | 0.01x | 0.11x | 0.23x | 0.21x | **0.18x** |
+
+The second row is new and it is bad news, so it is reported first. Our advance
+costs a flat 53 us however large the batch, while XGrammar's is 0.9 us at batch
+1 and 11 us at 512. Charging only the half that cannot be hidden behind the
+forward pass, we are five times *worse*, not one and a half times better as the
+earlier host-side measurement suggested.
+
+The flatness is the diagnosis: 53 us that does not move with the batch is not
+work, it is two kernel launches and a set of buffer clears. The advance does
+genuinely little arithmetic - it replays one group per configuration - so it is
+entirely overhead, and overhead is what a decode loop pays 128 times a second.
+Both halves are already captured as CUDA graphs; the remaining cost is the
+clears, which scale with the configuration ceiling rather than with the width
+in use.
+
+So the honest summary of the device-resident parser today is: the fill is
+decisively better at batch (7.8x, and 19x on the widest schema), the advance is
+decisively worse, and the crossover for the two together is batch 32. The
+tail is ours by a wide margin - at batch 512 on one schema, p50 504 us and p99
+519 us against 12,009 us and 12,786 us.
+
 **The fill cannot be captured (q22).** This is the structural finding and it is
 binary rather than a matter of microseconds. A CUDA graph records device work;
 host work inside the captured region does not go in at all. Attempting to

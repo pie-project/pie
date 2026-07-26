@@ -1,5 +1,14 @@
 """What does a constrained decode step actually cost, charged honestly?
 
+Sequences sit where a real batch puts them. Earlier versions of this benchmark
+put every sequence in the same parse state, which is the one arrangement that
+flatters a design that deduplicates: a serving batch runs many requests against
+one grammar at *different* points of their own documents. Here each sequence is
+advanced a random distance into the corpus instance first, so the duplication
+the fill exploits is whatever the workload actually offers rather than
+whatever the benchmark arranged.
+
+
 The performance claim has already had to be withdrawn once, so this module is
 built around the objections rather than around the result.
 
@@ -31,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -76,18 +86,22 @@ def measure_ours(
     device_grammar = DeviceGrammar(grammar)
     device_batch = DeviceBatch(device_grammar, batch)
 
-    matchers = [grammar.matcher() for _ in range(batch)]
-    for index, matcher in enumerate(matchers):
-        for byte in tokens[: index % max(1, len(tokens))]:
-            matcher.accept_token(byte)
+    rng = random.Random(20260726)
+    matchers = []
+    for _ in range(batch):
+        matcher = grammar.matcher()
+        for token in tokens[: rng.randrange(1, max(2, len(tokens)))]:
+            if not matcher.accept_token(token):
+                break
+        matchers.append(matcher)
     device_batch.set_batch_configurations(
         {index: matcher.configurations() for index, matcher in enumerate(matchers)}
     )
 
-    def advance() -> None:
-        for matcher, token in zip(matchers, tokens):
-            matcher.accept_token(token)
-            matcher.rollback(1)
+    # The advance is a device kernel taking a device tensor, so nothing about
+    # the sampled token comes back to the host. XGrammar's equivalent is a host
+    # call per sequence, which is the difference being measured.
+    sampled = torch.full((batch,), tokens[0], dtype=torch.int32, device="cuda")
 
     eager = _timed(device_batch._fill, warmup=warmup, repeats=repeats, sync=True)
     reference = device_batch.fill_mask().clone()
@@ -96,10 +110,17 @@ def measure_ours(
     if not torch.equal(reference, device_batch.fill_mask()):
         raise AssertionError("the captured graph does not reproduce the eager mask")
 
+    device_batch.advance(sampled)
+    device_batch.capture_advance()
     return {
         "fill": graphed,
         "fill_eager": eager,
-        "advance": _timed(advance, warmup=warmup, repeats=repeats, sync=False),
+        "advance": _timed(
+            lambda: device_batch.advance(sampled),
+            warmup=warmup,
+            repeats=repeats,
+            sync=True,
+        ),
     }
 
 
@@ -115,13 +136,16 @@ def measure_xgrammar(
     import torch
     import xgrammar as xg
 
-    matchers = [
-        xg.GrammarMatcher(compiled, terminate_without_stop_token=True)
-        for _ in range(batch)
-    ]
-    for index, matcher in enumerate(matchers):
-        for token in tokens[: index % max(1, len(tokens))]:
-            matcher.accept_token(token)
+    rng = random.Random(20260726)
+    matchers = []
+    for _ in range(batch):
+        matcher = xg.GrammarMatcher(
+            compiled, terminate_without_stop_token=True, max_rollback_tokens=4
+        )
+        for token in tokens[: rng.randrange(1, max(2, len(tokens)))]:
+            if not matcher.accept_token(token):
+                break
+        matchers.append(matcher)
 
     host_mask = xg.allocate_token_bitmask(batch, vocabulary_size)
     device_mask = torch.zeros_like(host_mask, device="cuda")
@@ -131,10 +155,17 @@ def measure_xgrammar(
             matcher.fill_next_token_bitmask(host_mask, index)
         device_mask.copy_(host_mask, non_blocking=True)
 
+    # One host call per sequence, and it cannot be overlapped with the forward
+    # pass because it follows the token that was just sampled. The rollback
+    # restores the state so the measurement repeats.
+    # One host call per sequence, and it cannot be overlapped with the forward
+    # pass because it follows the token that was just sampled. The rollback
+    # restores the state so the measurement repeats; a sequence that refuses
+    # the token has nothing to roll back, so it is charged the refusal only.
     def advance() -> None:
         for matcher, token in zip(matchers, tokens):
-            matcher.accept_token(token)
-            matcher.rollback(1)
+            if matcher.accept_token(token):
+                matcher.rollback(1)
 
     return {
         "fill": _timed(fill, warmup=warmup, repeats=repeats, sync=True),

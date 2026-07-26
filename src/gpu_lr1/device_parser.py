@@ -781,19 +781,25 @@ def _commit_kernel(
     lane = tl.arange(0, STACK_STRIDE)
     written = 0
 
-    for state_slot in range(0, CONFIGS):
-        if state_slot < count and written < CONFIGS:
+    # Bounded by the count, not by the ceiling. Running to 128 when the parse
+    # holds one configuration made the advance cost 88 us instead of 27 - the
+    # loops are nested, so the ceiling enters squared.
+    state_slot = 0
+    while state_slot < count and written < CONFIGS:
+        if 1 == 1:
             state = tl.load(old_lexer_ptr + sequence * CONFIGS + state_slot)
             # Only the first configuration carrying a lexer state introduces
             # it; a later one would repeat every candidate the first produced.
             seen = 0
-            for earlier in range(0, CONFIGS):
-                if earlier < state_slot:
-                    if tl.load(old_lexer_ptr + sequence * CONFIGS + earlier) == state:
-                        seen = 1
+            earlier = 0
+            while earlier < state_slot:
+                if tl.load(old_lexer_ptr + sequence * CONFIGS + earlier) == state:
+                    seen = 1
+                earlier = earlier + 1
             if seen == 0:
-                for source in range(0, CONFIGS):
-                    if source < count and written < CONFIGS:
+                source = 0
+                while source < count and written < CONFIGS:
+                    if 1 == 1:
                         if tl.load(old_lexer_ptr + sequence * CONFIGS + source) == state:
                             base = (sequence * CONFIGS + source) * MAX_READINGS
                             for index in range(0, MAX_READINGS):
@@ -809,8 +815,8 @@ def _commit_kernel(
                                             other=0,
                                         )
                                         duplicate = 0
-                                        for done in range(0, CONFIGS):
-                                            if done < written:
+                                        done = 0
+                                        while done < written:
                                                 out = sequence * CONFIGS + done
                                                 if (
                                                     tl.load(lexer_state_ptr + out)
@@ -833,6 +839,7 @@ def _commit_kernel(
                                                         )
                                                     ) == 0:
                                                         duplicate = 1
+                                                done = done + 1
                                         if duplicate == 0:
                                             out = sequence * CONFIGS + written
                                             tl.store(lexer_state_ptr + out, next_state)
@@ -843,6 +850,8 @@ def _commit_kernel(
                                                 mask=lane < depth,
                                             )
                                             written = written + 1
+                        source = source + 1
+        state_slot = state_slot + 1
 
     # No candidate survived: the token was refused. The set is left as it was
     # and the sequence is marked, because a mask filled from an empty set would
