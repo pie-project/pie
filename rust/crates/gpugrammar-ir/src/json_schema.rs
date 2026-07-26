@@ -79,9 +79,28 @@ pub(super) fn parse_i64_keyword(
     schema
         .get(keyword)
         .map(|value| {
-            value
-                .as_i64()
-                .ok_or_else(|| anyhow::anyhow!("{} must be an i64 integer", keyword))
+            // A bound written as a float still bounds an integer: `1.0` and
+            // `1e3` are how JSON Schema authors write 1 and 1000, and refusing
+            // them costs a schema for nothing. A fractional bound is tightened
+            // inward, which is what it means for integers.
+            if let Some(exact) = value.as_i64() {
+                return Ok(exact);
+            }
+            let approximate = value
+                .as_f64()
+                .ok_or_else(|| anyhow::anyhow!("{keyword} must be a number"))?;
+            if !approximate.is_finite() {
+                anyhow::bail!("{keyword} must be finite");
+            }
+            let tightened = if keyword.contains("inimum") {
+                approximate.ceil()
+            } else {
+                approximate.floor()
+            };
+            if tightened < i64::MIN as f64 || tightened > i64::MAX as f64 {
+                anyhow::bail!("{keyword} is outside the representable range");
+            }
+            Ok(tightened as i64)
         })
         .transpose()
 }

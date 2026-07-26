@@ -95,6 +95,12 @@ impl<'a> Converter<'a> {
             let reference = reference
                 .as_str()
                 .ok_or_else(|| anyhow!("$ref must be a string"))?;
+            // `#` is the document itself, which is the root rule. A schema
+            // that refers to it is recursive, and the root is already a named
+            // rule, so the reference resolves like any other.
+            if reference == "#" || reference == "#/" {
+                return Ok(Expr::RuleRef("root".to_string()));
+            }
             for prefix in ["#/definitions/", "#/$defs/"] {
                 if let Some(name) = reference.strip_prefix(prefix) {
                     return Ok(Expr::RuleRef(sanitize_rule_name(name)));
@@ -130,10 +136,11 @@ impl<'a> Converter<'a> {
             let all_of = all_of
                 .as_array()
                 .ok_or_else(|| anyhow!("allOf must be an array"))?;
-            if all_of.len() != 1 {
-                bail!("allOf with multiple schemas is not supported");
+            if all_of.len() == 1 {
+                return self.visit(&all_of[0], hint);
             }
-            return self.visit(&all_of[0], hint);
+            let merged = merge_all_of(schema, all_of)?;
+            return self.visit(&merged, hint);
         }
 
         match object.get("type") {
@@ -258,8 +265,24 @@ impl<'a> Converter<'a> {
             let pattern = pattern
                 .as_str()
                 .ok_or_else(|| anyhow!("pattern must be a string"))?;
+            // A grammar cannot intersect two languages, so a pattern and a
+            // length bound can only be lowered together when one of them makes
+            // the other redundant. That is decidable: the pattern's own length
+            // range is computable, and when it lies inside the bound the bound
+            // says nothing the pattern does not already say.
             if has_length {
-                bail!("pattern cannot be combined with length constraints");
+                let expr = regex_to_expr(pattern)?;
+                let (shortest, longest) = length_range(&expr);
+                let within_min = shortest >= u64::from(min);
+                let within_max = max.is_none_or(|max| longest.is_some_and(|l| l <= u64::from(max)));
+                if !(within_min && within_max) {
+                    bail!(
+                        "pattern matches strings of length {shortest}..{} and the \
+                         schema also bounds the length, which needs an intersection",
+                        longest.map_or("unbounded".to_string(), |l| l.to_string())
+                    );
+                }
+                return Ok(seq(vec![lit("\""), expr, lit("\"")]));
             }
             let body = seq(vec![lit("\""), regex_to_expr(pattern)?, lit("\"")]);
             return self.lexeme("pattern", body);
@@ -397,12 +420,6 @@ impl<'a> Converter<'a> {
             .and_then(Value::as_array)
             .map(|required| required.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default();
-        if required
-            .iter()
-            .any(|name| properties.is_none_or(|properties| !properties.contains_key(*name)))
-        {
-            bail!("required properties must be declared in properties");
-        }
         let min = count_keyword(object, "minProperties")?.unwrap_or(0);
         let max = count_keyword(object, "maxProperties")?;
         if max.is_some_and(|max| min > max) {
@@ -435,6 +452,34 @@ impl<'a> Converter<'a> {
                         self.visit(schema, &format!("{}_{}", hint, sanitize_rule_name(name)))?,
                     ]),
                     required: required.contains(name.as_str()),
+                });
+            }
+        }
+
+        // `required` may name a property `properties` does not describe. That
+        // is not a contradiction: it says the property must be present, and
+        // what it may hold is whatever `additionalProperties` allows. Only when
+        // additional properties are forbidden is the schema unsatisfiable.
+        let mut undeclared: Vec<&str> = required
+            .iter()
+            .copied()
+            .filter(|name| properties.is_none_or(|declared| !declared.contains_key(*name)))
+            .collect();
+        undeclared.sort_unstable();
+        if !undeclared.is_empty() {
+            let Some(value) = additional.clone() else {
+                bail!("a required property is neither declared nor allowed as additional");
+            };
+            for name in undeclared {
+                known.push(Property {
+                    pair: seq(vec![
+                        lit(&serde_json::to_string(name)?),
+                        self.ws(),
+                        lit(":"),
+                        self.ws(),
+                        value.clone(),
+                    ]),
+                    required: true,
                 });
             }
         }
@@ -668,6 +713,101 @@ fn intersperse_properties(properties: Vec<Expr>, ws: Expr) -> Vec<Expr> {
         result.push(property);
     }
     result
+}
+
+/// The shortest and longest strings an expression matches, in bytes.
+///
+/// `None` for the longest means unbounded. Used to decide whether a length
+/// bound adds anything to a pattern that already constrains the length.
+fn length_range(expr: &Expr) -> (u64, Option<u64>) {
+    match expr {
+        Expr::Empty => (0, Some(0)),
+        Expr::Literal(bytes) => (bytes.len() as u64, Some(bytes.len() as u64)),
+        // A character class is one codepoint, and UTF-8 spends up to four bytes
+        // on one. Both ends are needed, since the bound is over characters.
+        Expr::CharacterClass { .. } => (1, Some(4)),
+        // A rule reference could be anything without resolving it, and guessing
+        // would defeat the point of deciding rather than approximating.
+        Expr::RuleRef(_) => (0, None),
+        Expr::Group(inner) => length_range(inner),
+        Expr::Sequence(parts) => parts.iter().fold((0, Some(0)), |(low, high), part| {
+            let (part_low, part_high) = length_range(part);
+            (
+                low.saturating_add(part_low),
+                high.zip(part_high).map(|(a, b)| a.saturating_add(b)),
+            )
+        }),
+        Expr::Choice(alternatives) => {
+            alternatives
+                .iter()
+                .fold((u64::MAX, Some(0)), |(low, high), alternative| {
+                    let (alt_low, alt_high) = length_range(alternative);
+                    (low.min(alt_low), high.zip(alt_high).map(|(a, b)| a.max(b)))
+                })
+        }
+        Expr::Repeat { expr, min, max } => {
+            let (inner_low, inner_high) = length_range(expr);
+            (
+                inner_low.saturating_mul(u64::from(*min)),
+                max.and_then(|max| inner_high.map(|high| high.saturating_mul(u64::from(max)))),
+            )
+        }
+    }
+}
+
+/// Combine `allOf` branches into one schema.
+///
+/// A grammar cannot intersect two languages, so the branches have to be merged
+/// before lowering. That is exact for the shape `allOf` is actually used in -
+/// several partial object descriptions, each naming properties and requirements
+/// the others do not - because a conjunction of those is the union of their
+/// properties and requirements. It is refused rather than approximated whenever
+/// two branches say something different about the same thing, since a mask that
+/// is nearly right is a mask that lets an invalid token through.
+fn merge_all_of(parent: &Value, branches: &[Value]) -> Result<Value> {
+    let mut merged = serde_json::Map::new();
+    for (key, value) in parent.as_object().expect("checked by the caller") {
+        if key != "allOf" {
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+
+    for branch in branches {
+        let branch = branch
+            .as_object()
+            .ok_or_else(|| anyhow!("allOf branches must be objects"))?;
+        for (key, value) in branch {
+            match (key.as_str(), merged.get_mut(key)) {
+                (_, None) => {
+                    merged.insert(key.clone(), value.clone());
+                }
+                ("properties", Some(Value::Object(into))) => {
+                    for (name, schema) in value
+                        .as_object()
+                        .ok_or_else(|| anyhow!("properties must be an object"))?
+                    {
+                        if into.get(name).is_some_and(|existing| existing != schema) {
+                            bail!("allOf branches disagree about property '{name}'");
+                        }
+                        into.insert(name.clone(), schema.clone());
+                    }
+                }
+                ("required", Some(Value::Array(into))) => {
+                    for name in value
+                        .as_array()
+                        .ok_or_else(|| anyhow!("required must be an array"))?
+                    {
+                        if !into.contains(name) {
+                            into.push(name.clone());
+                        }
+                    }
+                }
+                (_, Some(existing)) if existing == value => {}
+                (key, _) => bail!("allOf branches disagree about '{key}'"),
+            }
+        }
+    }
+    Ok(Value::Object(merged))
 }
 
 fn integer_bounds(schema: &Value) -> Result<(Option<i64>, Option<i64>)> {
