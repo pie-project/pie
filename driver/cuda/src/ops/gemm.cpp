@@ -1626,9 +1626,10 @@ void gemm_act_x_w(
         return;
 #else
         throw std::runtime_error(
-            "gemm_act_x_w[INT4_PACKED]: marlin is not compiled into this "
-            "build (PIE_CUDA_BUILD_MARLIN was OFF). Reconfigure cmake with "
-            "-DPIE_CUDA_BUILD_MARLIN=ON to enable W4A16 GEMM.");
+            "gemm_act_x_w[INT4_PACKED]: GPTQ/AWQ W4A16 needs the vendored "
+            "marlin kernels, which are not built by default because they "
+            "dominate CUDA build time. Reconfigure with "
+            "-DPIE_CUDA_BUILD_MARLIN=ON (or PIE_CUDA_BUILD_MARLIN=1).");
 #endif
     }
     if (act_dtype == DType::BF16 && w.dtype == DType::MXFP4_PACKED &&
@@ -1675,7 +1676,10 @@ void gemm_act_x_w(
             return;
 #else
             throw std::runtime_error(
-                "gemm_act_x_w[MXFP4]: marlin requested but not compiled in");
+                "gemm_act_x_w[MXFP4]: PIE_MXFP4_GEMM=marlin was requested, but "
+                "the vendored marlin kernels are not built (configure with "
+                "-DPIE_CUDA_BUILD_MARLIN=ON). Unset PIE_MXFP4_GEMM to use the "
+                "dequant fallback.");
 #endif
         }
 

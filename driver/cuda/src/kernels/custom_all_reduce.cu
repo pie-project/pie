@@ -194,6 +194,77 @@ void cross_device_reduce_residual_rmsnorm_1stage_exact_bf16(
     vllm::multi_gpu_barrier<2, false>(signals, self_signal, rank);
 }
 
+// ---- fused all-reduce dispatch -------------------------------------------
+// flashinfer's own allreduce_fusion_op() switches over every AllReduceFusion
+// pattern, instantiating all ten even though pie only ever sets one. Its inner
+// launcher is public, so we expand kernels.def into an equivalent switch and
+// call that directly instead -- see the PIE_AR_FUSION_PATTERN block there.
+
+template <flashinfer::trtllm_allreduce_fusion::AllReduceFusionPattern Pattern,
+          typename T, int NRanks>
+cudaError_t launch_ar_fusion(
+    const flashinfer::trtllm_allreduce_fusion::AllReduceFusionParams<T>& params,
+    bool launch_with_pdl,
+    bool fp32_acc)
+{
+    using flashinfer::trtllm_allreduce_fusion::allreduce_fusion_kernel_launcher;
+    if (fp32_acc) {
+        return allreduce_fusion_kernel_launcher<Pattern, T, NRanks, true>(
+            params, launch_with_pdl);
+    }
+    return allreduce_fusion_kernel_launcher<Pattern, T, NRanks, false>(
+        params, launch_with_pdl);
+}
+
+template <typename T, int NRanks>
+cudaError_t dispatch_ar_fusion_pattern(
+    const flashinfer::trtllm_allreduce_fusion::AllReduceFusionParams<T>& params,
+    bool launch_with_pdl,
+    bool fp32_acc)
+{
+    using flashinfer::trtllm_allreduce_fusion::AllReduceFusionPattern;
+    switch (params.pattern) {
+#define PIE_AR_FUSION_PATTERN(name)                                          \
+    case AllReduceFusionPattern::name:                                       \
+        return launch_ar_fusion<AllReduceFusionPattern::name, T, NRanks>(    \
+            params, launch_with_pdl, fp32_acc);
+#include "kernels.def"
+    default:
+        break;
+    }
+    throw std::runtime_error(
+        "custom_all_reduce: AllReduceFusionPattern " +
+        std::to_string(static_cast<int>(params.pattern)) +
+        " is not instantiated in this build; add it to PIE_AR_FUSION_PATTERN "
+        "in driver/cuda/src/kernels.def");
+}
+
+// nranks is upstream flashinfer's supported set rather than a pie-owned axis,
+// so it stays fully instantiated: TP world size is a deployment choice and
+// pruning it would turn a valid launch into a runtime throw.
+template <typename T>
+cudaError_t pie_allreduce_fusion_op(
+    const flashinfer::trtllm_allreduce_fusion::AllReduceFusionParams<T>& params,
+    bool launch_with_pdl,
+    bool fp32_acc)
+{
+    switch (params.nranks) {
+    case 2:
+        return dispatch_ar_fusion_pattern<T, 2>(params, launch_with_pdl, fp32_acc);
+    case 4:
+        return dispatch_ar_fusion_pattern<T, 4>(params, launch_with_pdl, fp32_acc);
+    case 8:
+        return dispatch_ar_fusion_pattern<T, 8>(params, launch_with_pdl, fp32_acc);
+    case 16:
+        return dispatch_ar_fusion_pattern<T, 16>(params, launch_with_pdl, fp32_acc);
+    default:
+        break;
+    }
+    throw std::runtime_error(
+        "custom_all_reduce: fused all-reduce does not support TP world size " +
+        std::to_string(params.nranks) + " (flashinfer supports 2, 4, 8, 16)");
+}
+
 }  // namespace
 
 // Default ctor defined here (not = default in header) so the compiler
@@ -652,7 +723,7 @@ void CustomAllReduce::all_reduce_residual_rmsnorm_bf16(
     params.trigger_completion_at_end = false;
     static const bool use_fp32_acc =
         env_bool_default("PIE_CUDA_FUSED_AR_NORM_FP32_ACC", true);
-    CUDA_CHECK((allreduce_fusion_op<__nv_bfloat16>(
+    CUDA_CHECK((pie_allreduce_fusion_op<__nv_bfloat16>(
         params, /*launch_with_pdl=*/false, use_fp32_acc)));
 }
 

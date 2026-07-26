@@ -178,8 +178,9 @@ LoadedModel LoadedModel::load(
     case pie_load_planner::PieLoaderMxfp4MoePolicy::NativeGemm:
         if (!backend_target.mxfp4_native_gemm) {
             throw std::runtime_error(
-                "engine: LoadPlan requires native MXFP4 MoE, but this "
-                "device/build does not provide it");
+                "engine: LoadPlan requires native MXFP4 MoE, which needs both "
+                "a Blackwell-class GPU (sm100+) and the vendored marlin "
+                "kernels (-DPIE_CUDA_BUILD_MARLIN=ON, off by default)");
         }
         backend_target.mxfp4_moe = Mxfp4MoeLowering::NativeGemm;
         break;

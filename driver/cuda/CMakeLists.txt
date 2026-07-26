@@ -616,10 +616,22 @@ target_sources(pie_driver_cuda_lib PRIVATE
   $<TARGET_OBJECTS:pie_flashinfer_cutlass_moe>)
 
 # ---- Marlin (W4A16 / MXFP4 GEMM via vendored vLLM kernel) ------------------
-# Built by default: GPT-OSS's MXFP4 auto policy should use native
-# packed-weight GEMM on supported GPUs and fall back only on legacy targets.
+# OFF by default. marlin.cu is the build's critical path -- 142s of a 228s
+# clean build, because 150 explicit instantiations of a 2082-line __global__
+# template produce 152 kernels averaging 3098 SASS instructions each (91s cicc
+# + 41s ptxas). Nothing else in the driver comes close.
+#
+# What turning it off costs, and why that is an acceptable default:
+#   * GPTQ/AWQ INT4 dense GEMM throws at run time (ops/gemm.cpp) with a message
+#     naming this option. Those checkpoints are not part of pie's supported set.
+#   * GPT-OSS native MXFP4 MoE is refused at load time, but only on Blackwell:
+#     mxfp4_native_gemm is `major >= 10`, so Ada/Hopper already take the
+#     routed-dequant path and are unaffected.
+# Everything else -- every bf16 and FP8 model -- is untouched.
+#
 # Vendored under third_party/marlin/; the wrapper exposes a torch-free C++ API.
-option(PIE_CUDA_BUILD_MARLIN "Build vendored marlin W4A16/MXFP4 GEMM" ON)
+# Enable with -DPIE_CUDA_BUILD_MARLIN=ON or PIE_CUDA_BUILD_MARLIN=1.
+option(PIE_CUDA_BUILD_MARLIN "Build vendored marlin W4A16/MXFP4 GEMM" OFF)
 # Env override (previously forwarded by worker/build.rs as -D...).
 if(DEFINED ENV{PIE_CUDA_BUILD_MARLIN})
   string(TOLOWER "$ENV{PIE_CUDA_BUILD_MARLIN}" _pie_marlin)
@@ -629,44 +641,49 @@ if(DEFINED ENV{PIE_CUDA_BUILD_MARLIN})
     set(PIE_CUDA_BUILD_MARLIN OFF)
   endif()
 endif()
-if(PIE_CUDA_BUILD_MARLIN)
-  # kernels.def owns the shape list, but it cannot drive marlin.cu directly: a
-  # macro cannot expand to an #include, and CUDA 13's static-linkage stubs
-  # force the single-TU #include layout (see below). So the list is written out
-  # in marlin.cu and reconciled here -- otherwise a drift between the two is
-  # invisible until it shows up as a missing kernel at run time or as several
-  # minutes of cicc time spent on shapes nothing dispatches.
-  pie_read_kernels_def(PIE_MARLIN_SHAPE PIE_MARLIN_SHAPES)
-  set(_pie_marlin_expected "")
-  foreach(_pie_shape IN LISTS PIE_MARLIN_SHAPES)
-    string(REPLACE "," ";" _pie_parts "${_pie_shape}")
-    list(LENGTH _pie_parts _pie_nparts)
-    if(NOT _pie_nparts EQUAL 3)
-      message(FATAL_ERROR
-        "PIE_MARLIN_SHAPE(${_pie_shape}) in ${PIE_KERNELS_DEF} needs exactly "
-        "three arguments: (activation dtype, quant type, output dtype)")
-    endif()
-    list(GET _pie_parts 0 _pie_act)
-    list(GET _pie_parts 1 _pie_quant)
-    list(GET _pie_parts 2 _pie_out)
-    list(APPEND _pie_marlin_expected
-      "sm80_kernel_${_pie_act}_${_pie_quant}_${_pie_out}.cu")
-  endforeach()
 
-  file(READ "${CMAKE_CURRENT_SOURCE_DIR}/third_party/marlin/marlin.cu" _pie_marlin_src)
-  string(REGEX MATCHALL "sm80_kernel_[A-Za-z0-9_]+\\.cu"
-    _pie_marlin_actual "${_pie_marlin_src}")
-  list(SORT _pie_marlin_expected)
-  list(SORT _pie_marlin_actual)
-  if(NOT _pie_marlin_expected STREQUAL _pie_marlin_actual)
+# kernels.def owns the shape list, but it cannot drive marlin.cu directly: a
+# macro cannot expand to an #include, and CUDA 13's static-linkage stubs force
+# the single-TU #include layout (see below). So the list is written out in
+# marlin.cu and reconciled here -- otherwise a drift between the two is
+# invisible until it shows up as a missing kernel at run time or as several
+# minutes of cicc time spent on shapes nothing dispatches.
+#
+# Deliberately outside the PIE_CUDA_BUILD_MARLIN gate: this only reads two
+# files, and now that marlin is off by default a gated check would never run,
+# letting drift accumulate until someone enables it.
+pie_read_kernels_def(PIE_MARLIN_SHAPE PIE_MARLIN_SHAPES)
+set(_pie_marlin_expected "")
+foreach(_pie_shape IN LISTS PIE_MARLIN_SHAPES)
+  string(REPLACE "," ";" _pie_parts "${_pie_shape}")
+  list(LENGTH _pie_parts _pie_nparts)
+  if(NOT _pie_nparts EQUAL 3)
     message(FATAL_ERROR
-      "marlin shape drift.\n"
-      "  kernels.def: ${_pie_marlin_expected}\n"
-      "  marlin.cu:   ${_pie_marlin_actual}\n"
-      "Update the #include block in third_party/marlin/marlin.cu to match "
-      "${PIE_KERNELS_DEF}.")
+      "PIE_MARLIN_SHAPE(${_pie_shape}) in ${PIE_KERNELS_DEF} needs exactly "
+      "three arguments: (activation dtype, quant type, output dtype)")
   endif()
+  list(GET _pie_parts 0 _pie_act)
+  list(GET _pie_parts 1 _pie_quant)
+  list(GET _pie_parts 2 _pie_out)
+  list(APPEND _pie_marlin_expected
+    "sm80_kernel_${_pie_act}_${_pie_quant}_${_pie_out}.cu")
+endforeach()
 
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/third_party/marlin/marlin.cu" _pie_marlin_src)
+string(REGEX MATCHALL "sm80_kernel_[A-Za-z0-9_]+\\.cu"
+  _pie_marlin_actual "${_pie_marlin_src}")
+list(SORT _pie_marlin_expected)
+list(SORT _pie_marlin_actual)
+if(NOT _pie_marlin_expected STREQUAL _pie_marlin_actual)
+  message(FATAL_ERROR
+    "marlin shape drift.\n"
+    "  kernels.def: ${_pie_marlin_expected}\n"
+    "  marlin.cu:   ${_pie_marlin_actual}\n"
+    "Update the #include block in third_party/marlin/marlin.cu to match "
+    "${PIE_KERNELS_DEF}.")
+endif()
+
+if(PIE_CUDA_BUILD_MARLIN)
   # CUDA 13 generates __global__ template stubs with static linkage,
   # breaking cross-TU explicit instantiations. marlin.cu #includes the
   # sm80_kernel_*.cu files directly so instantiation and selection share a

@@ -40,6 +40,9 @@
 #ifndef PIE_MOE_ACTIVATION
 #define PIE_MOE_ACTIVATION(name)
 #endif
+#ifndef PIE_AR_FUSION_PATTERN
+#define PIE_AR_FUSION_PATTERN(name)
+#endif
 
 // ---- attention: head_dim --------------------------------------------------
 // Checkpoint-derived, and pie accepts arbitrary HuggingFace repos
@@ -106,7 +109,34 @@ PIE_MARLIN_SHAPE(bfloat16, fe2m1f, bfloat16)  // MXFP4 (gpt_oss)
 // or it throws at run time.
 PIE_MOE_ACTIVATION(Relu2)  // nemotron_h
 
+// ---- all-reduce: fused residual+RMSNorm epilogue --------------------------
+// flashinfer's allreduce_fusion_op() turns four runtime values into one
+// compile-time cross product:
+//
+//   switch (nranks) {2,4,8,16} x switch (pattern) {10} x fp32_acc {2}
+//     x (oneshot x trigger_completion_at_end {2}, or twoshot {1})
+//
+// which is 240 kernels -- 96% of every kernel in custom_all_reduce.cu, and
+// the reason that translation unit cost 111s (40s cicc + 44s ptxas).
+//
+// pie reaches exactly one pattern: kernels/custom_all_reduce.cu sets
+// kARResidualRMSNorm and nothing else. The other nine are FP8/FP4 quant
+// epilogues that no pie call site can select. As with marlin and MoE, pie's
+// own code fixes this rather than the checkpoint, so pruning is safe.
+//
+// Unlike marlin, this needs no vendored header and no CMake reconciliation:
+// allreduce_fusion_kernel_launcher is public, so custom_all_reduce.cu expands
+// the list below into its own dispatch switch and simply never calls
+// flashinfer's. That also means a missing entry surfaces as a runtime throw,
+// not a link error -- adding a pattern to a call site requires adding it here.
+//
+// nranks stays hand-written and fully instantiated: TP world size is a
+// deployment choice, not a checkpoint property, and {2,4,8,16} is upstream's
+// supported set rather than a pie-owned axis.
+PIE_AR_FUSION_PATTERN(kARResidualRMSNorm)
+
 #undef PIE_ATTN_HEAD_DIM
 #undef PIE_ATTN_DECODE_GQA
 #undef PIE_MARLIN_SHAPE
 #undef PIE_MOE_ACTIVATION
+#undef PIE_AR_FUSION_PATTERN
