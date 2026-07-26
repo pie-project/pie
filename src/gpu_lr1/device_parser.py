@@ -91,11 +91,14 @@ def _mask_kernel(
     stack_ptr,
     stack_depth_ptr,
     config_count_ptr,
+    widest_ptr,
     scratch_ptr,
     admitted_ptr,
     mask_ptr,
+    overflow_ptr,
     mask_words,
     LIVE,
+    BATCH: tl.constexpr,
     CONFIGS: tl.constexpr,
     MAX_GROUPS: tl.constexpr,
     STACK_STRIDE: tl.constexpr,
@@ -117,12 +120,17 @@ def _mask_kernel(
     """
     launched = tl.program_id(0)
     slot = tl.program_id(1)
-    sequence = launched // LIVE
-    config = launched % LIVE
+    sequence = launched % BATCH
+    config = launched // BATCH
+    if config >= tl.load(widest_ptr):
+        return
     if config >= tl.load(config_count_ptr + sequence):
         return
-    # The grid covers only the configurations in use; the arrays are strided by
-    # the batch's ceiling, so the two indices are not the same.
+    # Sequence varies fastest. The grid is sized for the configuration ceiling
+    # because the real width lives on the device and asking for it would be a
+    # synchronisation, so most of the grid is programs that exit at once - and
+    # laying them out this way puts those exits in whole blocks rather than
+    # scattering one live program among fifteen dead ones in every block.
     row_index = sequence * CONFIGS + config
     state = tl.load(lexer_state_ptr + row_index)
     depth = tl.load(stack_depth_ptr + row_index)
@@ -338,6 +346,7 @@ def _scatter_kernel(
     mask_ptr,
     mask_words,
     LIVE,
+    BATCH: tl.constexpr,
     CONFIGS: tl.constexpr,
     MAX_GROUPS: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -347,8 +356,8 @@ def _scatter_kernel(
     slot = tl.program_id(1)
     if tl.load(admitted_ptr + launched * MAX_GROUPS + slot) == 0:
         return
-    sequence = launched // LIVE
-    row_index = sequence * CONFIGS + launched % LIVE
+    sequence = launched % BATCH
+    row_index = sequence * CONFIGS + launched // BATCH
     state = tl.load(lexer_state_ptr + row_index)
     group = tl.load(group_offsets_ptr + state) + slot
     kind = tl.load(group_set_kind_ptr + group)
@@ -435,6 +444,7 @@ def _candidate_kernel(
     stack_ptr,
     stack_depth_ptr,
     config_count_ptr,
+    widest_ptr,
     token_ptr,
     scratch_ptr,
     cand_valid_ptr,
@@ -444,6 +454,7 @@ def _candidate_kernel(
     overflow_ptr,
     mask_words,
     LIVE,
+    BATCH: tl.constexpr,
     CONFIGS: tl.constexpr,
     GROUP_BLOCK: tl.constexpr,
     SEARCH_STEPS: tl.constexpr,
@@ -467,8 +478,10 @@ def _candidate_kernel(
     """
     launched = tl.program_id(0)
     block = tl.program_id(1)
-    sequence = launched // LIVE
-    config = launched % LIVE
+    sequence = launched % BATCH
+    config = launched // BATCH
+    if config >= tl.load(widest_ptr):
+        return
     if config >= tl.load(config_count_ptr + sequence):
         return
     row_index = sequence * CONFIGS + config
@@ -696,6 +709,7 @@ def _commit_kernel(
     cand_depth_ptr,
     cand_stack_ptr,
     terminated_ptr,
+    widest_ptr,
     CONFIGS: tl.constexpr,
     MAX_READINGS: tl.constexpr,
     STACK_STRIDE: tl.constexpr,
@@ -783,6 +797,11 @@ def _commit_kernel(
         tl.store(terminated_ptr + sequence, 1)
     else:
         tl.store(config_count_ptr + sequence, written)
+    # The widest set in the batch, maintained on the device. The fill's grid is
+    # sized for the ceiling because the host may not ask, but every program can
+    # read this and return at once - which turns the ceiling from work into a
+    # launch.
+    tl.atomic_max(widest_ptr, written)
 
 
 class DeviceGrammar:
@@ -924,6 +943,7 @@ class DeviceBatch:
         # which would be the synchronisation this is all avoiding.
         self.terminated = torch.zeros(batch, dtype=torch.int32, device="cuda")
         self.overflow = torch.zeros(batch, dtype=torch.int32, device="cuda")
+        self.widest = torch.ones(1, dtype=torch.int32, device="cuda")
         self.token = torch.zeros(batch, dtype=torch.int32, device="cuda")
         rows = batch * self.configs
         self.lexer_state = torch.zeros(rows, dtype=torch.int32, device="cuda")
@@ -937,6 +957,7 @@ class DeviceBatch:
             (batch, grammar.mask_words), dtype=torch.int32, device="cuda"
         )
         self.max_groups = grammar.max_groups_per_state
+        self.advance_blocks = (self.max_groups + _GROUP_BLOCK - 1) // _GROUP_BLOCK
         self.admitted = torch.zeros(
             rows * grammar.max_groups_per_state, dtype=torch.int32, device="cuda"
         )
@@ -945,6 +966,15 @@ class DeviceBatch:
         # probing what a pending lexeme could still become.
         self.scratch = torch.zeros(
             (rows * self.max_groups, 2 * grammar.max_stack),
+            dtype=torch.int32,
+            device="cuda",
+        )
+        # The advance indexes its scratch by block, not by group - it sweeps
+        # sixty-four groups per program where the fill takes one - so the two
+        # cannot share a buffer. Sharing it had them writing over each other's
+        # replays, which cost far more than the memory saved.
+        self.advance_scratch = torch.zeros(
+            (rows * self.advance_blocks, 2 * grammar.max_stack),
             dtype=torch.int32,
             device="cuda",
         )
@@ -1027,8 +1057,7 @@ class DeviceBatch:
         self.old_lexer.copy_(self.lexer_state)
         self.old_count.copy_(self.config_count)
         live = self.live
-        blocks = (self.max_groups + _GROUP_BLOCK - 1) // _GROUP_BLOCK
-        _candidate_kernel[(self.batch * live, blocks)](
+        _candidate_kernel[(self.batch * live, self.advance_blocks)](
             grammar.group_offsets,
             grammar.group_set_kind,
             grammar.group_set_offset,
@@ -1052,8 +1081,9 @@ class DeviceBatch:
             self.stack,
             self.depth,
             self.config_count,
+            self.widest,
             self.token,
-            self.scratch,
+            self.advance_scratch,
             self.cand_valid,
             self.cand_lexer,
             self.cand_depth,
@@ -1061,6 +1091,7 @@ class DeviceBatch:
             self.overflow,
             grammar.mask_words,
             live,
+            BATCH=self.batch,
             CONFIGS=self.configs,
             GROUP_BLOCK=_GROUP_BLOCK,
             SEARCH_STEPS=grammar.search_steps,
@@ -1080,14 +1111,32 @@ class DeviceBatch:
             self.cand_depth,
             self.cand_stack,
             self.terminated,
+            self.widest,
             CONFIGS=self.configs,
             MAX_READINGS=self.max_readings,
             STACK_STRIDE=grammar.max_stack,
             num_warps=1,
         )
-        # The set may have widened. The fill launches for the widest in the
-        # batch, and that number now lives on the device, so the host takes the
-        # ceiling rather than asking.
+        # How wide the configuration sets may now be.
+        #
+        # The fill's grid is sized by this, and it is not a small matter: the
+        # sets are almost always a single configuration on a real document, and
+        # launching for the ceiling of sixteen instead took the fill from
+        # 476 us to 4,329 us. The programs past the real width exit on their
+        # first instruction, but the launch is the cost.
+        #
+        # Reading the real width would be a device-to-host synchronisation,
+        # which is forbidden here. What the host can do without asking is
+        # bound it: one advance widens a set by at most the readings of the
+        # group the token fell in, so the width after `n` advances is bounded
+        # by the width before times that, capped at the ceiling. Starting from
+        # the width the host itself uploaded, the bound stays at one for as
+        # long as the parse is unambiguous - which, in these grammars, is
+        # almost always.
+        # The width is on the device and stays there. The grid is the ceiling,
+        # and every program past the real width reads that width and returns -
+        # so the ceiling costs a launch rather than sixteen times the work, and
+        # nothing has to come back to the host to decide it.
         self.live = self.configs
 
     def configurations(self, sequence: int) -> list[tuple[int, list[int]]]:
@@ -1171,11 +1220,14 @@ class DeviceBatch:
             self.stack,
             self.depth,
             self.config_count,
+            self.widest,
             self.scratch,
             self.admitted,
             self.mask,
+            self.overflow,
             grammar.mask_words,
             live,
+            BATCH=self.batch,
             CONFIGS=self.configs,
             MAX_GROUPS=self.max_groups,
             STACK_STRIDE=grammar.max_stack,
@@ -1194,6 +1246,7 @@ class DeviceBatch:
             self.mask,
             grammar.mask_words,
             live,
+            BATCH=self.batch,
             CONFIGS=self.configs,
             MAX_GROUPS=self.max_groups,
             BLOCK=128,
