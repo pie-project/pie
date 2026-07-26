@@ -454,6 +454,31 @@ async def test_quest_attention(client, args):
     scores = [float(s) for s in report["page_scores"][:-1]]
     assert scores[0] == max(scores), report
 
+    # Everything above is about the RANKING, and a ranking the driver computes
+    # and then discards looks exactly like one it honours. This is the part
+    # that separates them: with a budget of one page the continuation has to
+    # change, and with a budget of everything it has to be the unmasked answer
+    # verbatim. `test_mask_enforced.py` covers the same ground in isolation;
+    # keeping a version here means the matrix cannot go green on a build where
+    # `attn_page_mask` silently stopped being applied.
+    common = {"prompt": _QUEST_PROMPT, "max_tokens": 8, "temperature": 0.1,
+              "seed": 4242}
+    wide = await _report(
+        client, args, "quest-attention", {**common, "page_budget": 4096})
+    tight = await _report(
+        client, args, "quest-attention", {**common, "page_budget": 1})
+    base = await _report(client, args, "naive-baseline", common)
+    assert tight["pages_nan"] == 0, tight
+    assert wide["text"] != tight["text"], (
+        "attn_page_mask is not enforced: a 1-page budget produced the same "
+        f"continuation as a {wide['page_budget']}-page one"
+    )
+    assert wide["text"] == base["text"], (
+        "an all-keep page mask perturbed the output; compaction is not "
+        f"equivalent to the original page table\n  {wide['text']!r}\n"
+        f"  {base['text']!r}"
+    )
+
 
 _TOVA_PROMPT = (
     "The capital of France is Paris. "
