@@ -51,7 +51,8 @@ void LlamaLikeModel::prepare(AttentionWorkspace& attn_ws,
         in.total_tokens,
         in.num_requests,
         in.is_pure_decode,
-        in.have_custom_mask);
+        in.have_custom_mask,
+        in.attn_score_window);
 }
 
 void LlamaLikeModel::body(Workspace& ws,
