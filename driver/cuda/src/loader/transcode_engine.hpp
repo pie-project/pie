@@ -240,7 +240,7 @@ private:
                         "sources is not implemented");
                 }
                 copy_strided_extent_to_device(
-                    loader_, instr, source.data(), full_shape);
+                    loader_, instr, source.data(), source.nbytes());
             } else {
                 const std::uint64_t elem = dtype_bytes(source_dtype);
                 const std::uint64_t row_bytes =
@@ -833,7 +833,7 @@ private:
                 copy_strided_extent_to_device(
                     loader_, instr,
                     scratch.data(),
-                    pie_loader::extent_shape(instr.source.stride));
+                    scratch.nbytes());
             } else {
                 copy_engine_.queue(
                     instr.source.file_id,
