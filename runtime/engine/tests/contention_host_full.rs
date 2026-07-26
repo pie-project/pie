@@ -1,4 +1,6 @@
-//! Host-swap exhaustion policy: kill a victim and let the fleet progress.
+//! Host-swap exhaustion policy (Project Rainer): with no swap room and no
+//! fire in flight anywhere, the starvation predicate fails the YOUNGEST
+//! parked ask loud — computed, never timed — and the fleet progresses.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,7 +17,6 @@ use pie_engine::inferlet::program::ProgramName;
 #[test]
 fn host_swap_exhaustion_kills_a_victim_without_wedging_the_fleet() {
     unsafe {
-        std::env::set_var("PIE_KV_EXHAUSTION_MS", "2000");
         std::env::set_var("PIE_KV_CACHE_ROOTS_MAX", "0");
     }
     inferlets::build_inferlets();
@@ -88,10 +89,10 @@ fn host_swap_exhaustion_kills_a_victim_without_wedging_the_fleet() {
         .await
         .expect("host-full fleet must tear down");
     });
-    let diagnostics = pie_engine::store::reclaim::contention()
-        .expect("contention orchestrator")
+    let diagnostics = pie_engine::planner::planner()
+        .expect("residency planner")
         .diagnostics();
-    assert!(diagnostics.host_swap_exhaustions_total > 0);
+    assert!(diagnostics.starvations_total > 0);
     assert_eq!(
         diagnostics.device_pages_free,
         diagnostics.device_pages_total

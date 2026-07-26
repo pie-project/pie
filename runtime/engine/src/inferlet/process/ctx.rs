@@ -19,7 +19,7 @@ use wasmtime_wasi_http::p3::{
 
 use super::ProcessId;
 use super::output::LogStream;
-use super::residency::{ProcessResidency, ResidencySnapshot};
+use super::residency::ProcessResidency;
 use crate::inferlet::sandbox::InstancePolicy;
 use crate::store::kv::page_table::WorkingSetId;
 use crate::store::rs::RsWorkingSetId;
@@ -108,7 +108,7 @@ impl Drop for ProcessCtx {
         let bind_permit = self.bind_permit.take();
         self.execution_admitted = false;
         self.bind_admitted = false;
-        super::preemption::defer_resource_teardown(
+        super::teardown::defer_resource_teardown(
             self.id,
             resources,
             self.residency.clone(),
@@ -367,30 +367,17 @@ impl ProcessCtx {
         self.network_allowed
     }
 
-    pub(crate) fn residency_handle(&self) -> Arc<Mutex<ProcessResidency>> {
-        self.residency.clone()
-    }
-
-    pub(crate) fn residency_snapshot(&self) -> ResidencySnapshot {
-        self.residency.lock().unwrap().snapshot()
-    }
-
     /// Just the live pipeline queues — for the per-prologue hot paths.
     pub(crate) fn residency_pipelines(&self) -> Vec<crate::pipeline::fire::PendingFires> {
         self.residency.lock().unwrap().pipelines()
     }
 
-    pub(crate) fn register_kv_working_set(
-        &self,
-        model: usize,
-        driver: crate::driver::DriverId,
-        id: WorkingSetId,
-    ) {
+    pub(crate) fn register_kv_working_set(&self, ws: &crate::store::kv::working_set::KvWorkingSet) {
         self.residency
             .lock()
             .unwrap()
             .kv_working_sets
-            .insert((model, driver, id));
+            .insert((ws.model, ws.driver, ws.id), ws.suspend_handle());
     }
 
     pub(crate) fn unregister_kv_working_set(

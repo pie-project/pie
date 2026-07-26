@@ -1541,24 +1541,38 @@ __device__ __forceinline__ void ptir_m1_execute(
               !m1_isnan(value) && (m1_u32)greater < k);
         }
       } else if (p.pred_tag == 1) {
+        // Descending selection with the LAST PICK's total-order key as the
+        // availability threshold (the k_pivot_cummassle technique) instead
+        // of an already-picked rescan: the rescan made this O(len^3) on ONE
+        // thread — a de-facto hang at LM vocab sizes (>10^15 steps at
+        // 151,936). Bit-identical picks and keep bits: m1_sort_better is a
+        // strict total order, so "strictly after the previous pick" visits
+        // the same elements in the same order, and once `exclusive` clears
+        // the threshold (or goes NaN) every later keep is false — they are
+        // pre-stored and the loop stops early.
         const float threshold =
             m1_load_f(a1, m1_pick(d1.len, row), d1.dtype);
+        for (m1_u32 i = 0; i < d0.last; ++i)
+          m1_store_b(o0, base + i, false);
         float exclusive = 0.0f;
-        for (m1_u32 position = 0; position < d0.last; ++position) {
+        float prev_value = 0.0f;
+        m1_u32 prev_index = 0;
+        bool have_prev = false;
+        for (m1_u32 position = 0;
+             position < d0.last && exclusive < threshold;
+             ++position) {
           m1_u32 best_index = 0;
           float best_value = m1_nan();
           bool found = false;
           for (m1_u32 candidate = 0;
                candidate < d0.last;
                ++candidate) {
-            bool used = false;
-            for (m1_u32 prior = 0; prior < position; ++prior)
-              if (reinterpret_cast<m1_u32*>(temporary)[prior] ==
-                  candidate)
-                used = true;
-            if (used) continue;
             const float value =
                 m1_load_f(a0, base + candidate, d0.dtype);
+            if (have_prev &&
+                !m1_sort_better(
+                    prev_value, prev_index, value, candidate))
+              continue;
             if (!found ||
                 m1_sort_better(
                     value, candidate, best_value, best_index)) {
@@ -1567,9 +1581,12 @@ __device__ __forceinline__ void ptir_m1_execute(
               best_index = candidate;
             }
           }
-          reinterpret_cast<m1_u32*>(temporary)[position] = best_index;
+          if (!found) break;
           m1_store_b(o0, base + best_index, exclusive < threshold);
           exclusive += best_value;
+          prev_value = best_value;
+          prev_index = best_index;
+          have_prev = true;
         }
       } else {
         const float threshold =

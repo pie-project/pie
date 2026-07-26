@@ -2,13 +2,15 @@
 //!
 //! Each Process is a ServiceMap actor that manages a single WASM instance.
 //! Processes are registered in a global registry and receive messages via
-//! Direct Addressing. Process-owned KV quiesce/suspend/restore lives in the
-//! `preemption` submodule; WIT host modules only delegate into it.
+//! Direct Addressing. KV residency (Project Rainer) touches the guest only
+//! through the `gate` submodule's prologue; eviction and restore are
+//! planner-owned (`crate::planner`).
 
 mod ctx;
+pub(crate) mod gate;
 mod output;
-pub(crate) mod preemption;
 pub(crate) mod residency;
+pub(crate) mod teardown;
 
 pub(crate) use ctx::OutputMode;
 pub use ctx::ProcessCtx;
@@ -356,8 +358,8 @@ pub fn spawn(
             "spawned_unix_us": crate::scheduler::fire_timing_unix_us(),
         }));
     }
-    if let Some(orchestrator) = crate::store::reclaim::contention() {
-        orchestrator.register(id);
+    if let Some(planner) = crate::planner::planner() {
+        planner.register(id);
     }
     let process = Process::new(
         id,
@@ -369,8 +371,8 @@ pub fn spawn(
         result_tx,
     );
     if let Err(error) = SERVICES.spawn(id, || process) {
-        if let Some(orchestrator) = crate::store::reclaim::contention() {
-            orchestrator.unregister(id);
+        if let Some(planner) = crate::planner::planner() {
+            planner.unregister(id);
         }
         return Err(error);
     }
@@ -407,10 +409,7 @@ pub fn terminate(process_id: ProcessId, result: Result<String, String>) {
         .send(&process_id, Message::Terminate { result })
         .is_ok()
     {
-        crate::scheduler::worker::notify_pipeline_leave(
-            process_id,
-            crate::scheduler::worker::LeaveKind::Terminate,
-        );
+        crate::scheduler::worker::post_process_terminate(process_id);
     }
 }
 
@@ -755,12 +754,12 @@ impl Process {
         // actor could land after the teardown's ProcessQuiesced and mint a
         // tombstone nothing retires.)
 
-        // Contention: unregister from the orchestrator (purges its queue
-        // entries, wakes a parked task for teardown, and drains — the exiting
-        // process's KV frees follow via the WS-drop hook). Single exit funnel:
-        // covers natural completion AND external terminate.
-        if let Some(o) = crate::store::reclaim::contention() {
-            o.unregister(self.process_id);
+        // Residency: unregister from the planner (purges its queue entries,
+        // wakes gate waiters for teardown, and re-plans — the exiting
+        // process's KV frees follow via the WS-drop hook). Single exit
+        // funnel: covers natural completion AND external terminate.
+        if let Some(planner) = crate::planner::planner() {
+            planner.unregister(self.process_id);
         }
         residency::unregister_residency(self.process_id);
     }

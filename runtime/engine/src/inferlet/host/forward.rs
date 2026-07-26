@@ -112,8 +112,6 @@ enum ChannelPoll {
     Pending {
         cell: Arc<Mutex<ChannelCell>>,
         fires: Option<crate::pipeline::fire::PendingFires>,
-        process_id: uuid::Uuid,
-        residency: Arc<Mutex<crate::inferlet::process::ProcessResidency>>,
     },
 }
 
@@ -145,12 +143,7 @@ fn poll_channel(
                 }
             }
             Ok(_) => {
-                return Ok(ChannelPoll::Pending {
-                    cell,
-                    fires,
-                    process_id: ctx.id(),
-                    residency: ctx.residency_handle(),
-                });
+                return Ok(ChannelPoll::Pending { cell, fires });
             }
             Err(ChannelError::Empty) => {}
             Err(error) => return Ok(ChannelPoll::Ready(Err(error.to_string()))),
@@ -176,12 +169,7 @@ fn poll_channel(
         return Ok(ChannelPoll::Finalize(op));
     }
 
-    Ok(ChannelPoll::Pending {
-        cell,
-        fires,
-        process_id: ctx.id(),
-        residency: ctx.residency_handle(),
-    })
+    Ok(ChannelPoll::Pending { cell, fires })
 }
 
 async fn materialize_channel(
@@ -189,6 +177,12 @@ async fn materialize_channel(
     this: Resource<Channel>,
     mode: ChannelReadMode,
 ) -> Anyhow<Result<Vec<u8>, String>> {
+    // Contention-probe: pid resolved once, only when tracing.
+    let trace_pid = if crate::planner::trace_enabled() {
+        Some(accessor.with(|mut access| access.get().id()))
+    } else {
+        None
+    };
     let mut settle_ready_take = true;
     loop {
         let state = accessor
@@ -203,6 +197,9 @@ async fn materialize_channel(
                 })?;
                 match state {
                     ChannelPoll::Finalize(op) => {
+                        if let Some(pid) = trace_pid {
+                            crate::planner::trace_mark!("build", pid, "rx-finalize");
+                        }
                         let finalized = crate::pipeline::fire::finalize_op_await(op).await?;
                         accessor.with(|mut access| {
                             crate::pipeline::fire::complete_finalize(access.get(), finalized);
@@ -219,23 +216,17 @@ async fn materialize_channel(
         match state {
             ChannelPoll::Ready(value) => return Ok(value),
             ChannelPoll::Finalize(_) => unreachable!("finalizer gate required before FIFO pop"),
-            ChannelPoll::Pending {
-                cell,
-                fires,
-                process_id,
-                residency,
-            } => {
+            ChannelPoll::Pending { cell, fires, .. } => {
                 settle_ready_take = true;
+                // A plain await: an idle channel wait holds no pooled
+                // state, so the planner can evict around it freely.
                 if let Err(error) =
-                    crate::inferlet::process::preemption::await_channel_progress_idle(
-                        process_id,
-                        residency,
-                        &cell,
-                        fires.as_ref(),
-                    )
-                    .await
+                    crate::pipeline::fire::await_channel_progress(&cell, fires.as_ref()).await
                 {
                     return Ok(Err(error));
+                }
+                if let Some(pid) = trace_pid {
+                    crate::planner::trace_mark!("build", pid, "rx-wake");
                 }
             }
         }
@@ -260,7 +251,7 @@ impl pie::inferlet::forward::Host for ProcessCtx {
             let _ = self.ctx().table.get(&fwd)?;
         }
         crate::inferlet::process::ensure_execution_admitted(self).await;
-        crate::inferlet::process::preemption::serialize_under_contention(self).await?;
+        crate::inferlet::process::gate::residency_gate(self).await?;
         crate::pipeline::fire::submit_frame(self, on, slot_reps).await
     }
 }
@@ -272,7 +263,7 @@ impl pie::inferlet::forward::HostChannel for ProcessCtx {
         dtype: pie::inferlet::types::Dtype,
         capacity: u32,
     ) -> Anyhow<Resource<Channel>> {
-        crate::inferlet::process::preemption::yield_point(self).await?;
+        crate::inferlet::process::gate::residency_gate(self).await?;
         // Pure host bookkeeping — never fails at construction (the WIT
         // constructor cannot carry a result; a channel/decl mismatch instead
         // errors at forward-pass.new / submit).
@@ -288,7 +279,7 @@ impl pie::inferlet::forward::HostChannel for ProcessCtx {
     }
 
     async fn put(&mut self, this: Resource<Channel>, value: Vec<u8>) -> Anyhow<Result<(), String>> {
-        crate::inferlet::process::preemption::serialize_under_contention(self).await?;
+        crate::inferlet::process::gate::residency_gate(self).await?;
         let cell = self.ctx().table.get(&this)?.cell.clone();
         loop {
             let result = cell.lock().unwrap().put_ref(&value);
@@ -301,20 +292,14 @@ impl pie::inferlet::forward::HostChannel for ProcessCtx {
             let Some((endpoint, observed_head)) = wait else {
                 return Ok(Err(ChannelError::Full.to_string()));
             };
-            if let Err(error) = crate::inferlet::process::preemption::await_writer_progress(
-                self,
-                &endpoint,
-                observed_head,
-            )
-            .await
-            {
+            if let Err(error) = endpoint.wait_for_writer_change(observed_head).await {
                 return Ok(Err(error.to_string()));
             }
         }
     }
 
     async fn set(&mut self, this: Resource<Channel>, value: Vec<u8>) -> Anyhow<Result<(), String>> {
-        crate::inferlet::process::preemption::serialize_under_contention(self).await?;
+        crate::inferlet::process::gate::residency_gate(self).await?;
         let cell = self.ctx().table.get(&this)?.cell.clone();
         let result = cell
             .lock()
@@ -358,7 +343,7 @@ impl pie::inferlet::forward::HostChannelWithStore<ProcessCtx> for HasSelf<Proces
 
 impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
     async fn new(&mut self) -> Anyhow<Resource<ForwardPass>> {
-        crate::inferlet::process::preemption::yield_point(self).await?;
+        crate::inferlet::process::gate::residency_gate(self).await?;
         Ok(self.ctx().table.push(ForwardPass::new())?)
     }
 
@@ -1062,14 +1047,7 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
             .ok()
             .and_then(|pass| pass.fires.clone());
         if let Some(fires) = fires {
-            let _finalize_guard = fires.finalize_guard().await;
-            loop {
-                let op = fires.lock().unwrap().pop_front();
-                match op {
-                    Some(op) => crate::pipeline::fire::finalize_op(self, op).await?,
-                    None => break,
-                }
-            }
+            crate::pipeline::fire::finalize_all(self, &fires, false).await?;
         }
 
         // Native teardown (close the driver instance, detach every bound

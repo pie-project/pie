@@ -204,9 +204,9 @@ pub async fn bootstrap_with_listener(
 }
 
 async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
-    // The bootstrap edge is the ONLY place contention knobs leave the
+    // The bootstrap edge is the ONLY place planner knobs leave the
     // environment; everything downstream receives this value explicitly.
-    let contention_config = crate::store::reclaim::ContentionConfig::from_env();
+    let planner_config = crate::planner::PlannerConfig::from_env();
     verify_config(&config)?;
     let mut active_guard = ActiveRuntimeGuard::acquire()?;
 
@@ -336,38 +336,78 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         &arena_rs_slots,
     );
 
-    // Contention orchestrator — ALWAYS installed: KV pool exhaustion is
-    // FCFS preempt/restore, never an inferlet error; there is no legacy
-    // mode. `max_concurrent_processes` stays a physical safety cap only.
-    // The suspend rung arms by CAPABILITY, not policy: a driver that
-    // advertises D2H+H2D KV copies gets active self-suspend; one that
-    // cannot move KV bytes (no host swap transport) degrades to pool-only
-    // orchestration — waiters ride idle reclaim and natural frees.
-    crate::store::reclaim::init_contention(
+    // Residency planner (Project Rainer) — ALWAYS installed: KV pool
+    // exhaustion is FCFS eviction/restore, never an inferlet error; there
+    // is no legacy mode. `max_concurrent_processes` stays a physical safety
+    // cap only. Eviction arms by CAPABILITY, not policy: a driver that
+    // advertises D2H+H2D KV copies gets planner-driven eviction; one that
+    // cannot move KV bytes degrades to pool-only planning — parked asks
+    // ride idle reclaim and natural frees. Uncontended fires never touch
+    // the planner beyond two atomic loads.
+    crate::planner::init_planner(
         arena_model_idx,
         0,
-        crate::store::reclaim::ContentionOrchestrator::new(
-            std::sync::Arc::new(crate::store::reclaim::RegistryPool::new(
+        crate::planner::ResidencyPlanner::new(
+            std::sync::Arc::new(crate::planner::RegistryPool::new(
                 arena_model_idx,
                 0,
                 kv_swap_capable,
             )),
-            contention_config,
+            planner_config,
         ),
     );
-    if let Some(orchestrator) =
-        crate::store::reclaim::contention_for(arena_model_idx, 0)
+    // Opt-in stall sampler: `PIE_CONTENTION_TRACE_MS=500` emits one line
+    // per tick while anything is queued, so a stalling run reports whether
+    // pages are MOVING (churn) or FROZEN (liveness). Off by default.
+    if let Some(period) = std::env::var("PIE_CONTENTION_TRACE_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        && let Some(planner) = crate::planner::planner_for(arena_model_idx, 0)
     {
-        // D7's kill rung: runtime-level terminate (quiesce-first, GPU
-        // lifetime respected, transactions unwound by the RAII guards) —
-        // never an OS signal, never a cleanup bypass.
-        orchestrator.set_kill_hook(|pid, reason| {
-            crate::inferlet::process::terminate(pid, Err(reason));
-        });
-        // D6's cost figure: pages only the candidate's working sets can
-        // free — smallest-cover selection minimizes wasted copies.
-        orchestrator.set_footprint_probe(|pids, model, driver| {
-            crate::inferlet::process::residency::kv_exclusive_footprints(pids, model, driver)
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(period));
+            loop {
+                interval.tick().await;
+                let d = planner.diagnostics();
+                if d.queue.is_empty() && d.proc_states[1..].iter().all(|&n| n == 0) {
+                    continue;
+                }
+                // `println!`, not `tracing`: the embedded (pyo3) server
+                // boots with `skip_tracing` and installs no subscriber, so
+                // a tracing event here would go nowhere.
+                println!(
+                    "[planner-trace] queue={} head_pages={} head_kind={} accum={} \
+                     free={}/{} host_free={}/{} parks={} serves={} evictions={} \
+                     evict_rollbacks={} restores={} restore_failures={} gate_parks={} \
+                     hogs={} d2h_pages={} h2d_pages={} d2h_ms={} h2d_ms={} \
+                     resident={} evicting={} evicted={} restoring={}",
+                    d.queue.len(),
+                    d.queue.first().map_or(0, |w| w.pages),
+                    d.queue.first().map_or("-", |w| w.kind),
+                    d.accumulation,
+                    d.device_pages_free,
+                    d.device_pages_total,
+                    d.host_slots_free,
+                    d.host_slots_total,
+                    d.parks_total,
+                    d.serves_total,
+                    d.evictions_total,
+                    d.eviction_rollbacks_total,
+                    d.restores_total,
+                    d.restore_failures_total,
+                    d.gate_parks_total,
+                    d.hog_failures_total,
+                    d.d2h_pages_total,
+                    d.h2d_pages_total,
+                    d.d2h_copy_us_total / 1000,
+                    d.h2d_copy_us_total / 1000,
+                    d.proc_states[0],
+                    d.proc_states[1],
+                    d.proc_states[2],
+                    d.proc_states[3],
+                );
+            }
         });
     }
 
@@ -462,25 +502,10 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             })
         });
 
-    // M-A1/M-A2 wait-all quorum lifecycle wiring. Both scheduler-side hooks
-    // are plain-closure seams (see their doc comments) so `store`/`scheduler`
-    // never import the higher layers that `bootstrap` is free to wire here:
-    //  - `store::reclaim`'s suspend/restore ladder sits below `scheduler` in
-    //    the layering, so its leave notifications reach each driver's
-    //    `WaitAllPolicy` only via this installed subscription (the natural
-    //    terminate path calls `scheduler::worker::notify_pipeline_leave`
-    //    directly from `inferlet::process`, which needs no such hook).
-    crate::store::reclaim::set_pipeline_leave_hook(|pid, kind| {
-        let kind = match kind {
-            crate::store::reclaim::LeaveKind::AllocationWait => {
-                crate::scheduler::worker::LeaveKind::Close
-            }
-            crate::store::reclaim::LeaveKind::Suspend => {
-                crate::scheduler::worker::LeaveKind::Suspend
-            }
-        };
-        crate::scheduler::worker::notify_pipeline_leave(pid, kind);
-    });
+    // (The old reclaim-ladder leave/kill/probe hook seams are gone: the
+    // planner lives ABOVE both `store` and `scheduler` and calls
+    // `scheduler::worker::notify_pipeline_leave_owned` and the residency
+    // registry directly.)
     active_guard.disarm();
     Ok(BootstrapHandle {
         port: bound_port,

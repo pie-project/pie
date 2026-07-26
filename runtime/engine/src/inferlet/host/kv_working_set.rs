@@ -50,24 +50,24 @@ fn scoped_working_set(
 
 impl pie::inferlet::working_set::HostKvWorkingSet for ProcessCtx {
     async fn new(&mut self) -> Result<Resource<KvWorkingSet>> {
-        crate::inferlet::process::preemption::yield_point(self).await?;
+        crate::inferlet::process::gate::residency_gate(self).await?;
         // Single-model runtime: bind the one model (index 0), driver 0.
         let stores = store_registry::get(0, 0);
         let id = store_registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
             kv.create_working_set()
         });
         let ws = KvWorkingSet::new(0, 0, id, stores.kv_page_size);
-        self.register_kv_working_set(0, 0, id);
+        self.register_kv_working_set(&ws);
         Ok(self.ctx().table.push(ws)?)
     }
 
     async fn page_size(&mut self, this: Resource<KvWorkingSet>) -> Result<u32> {
-        crate::inferlet::process::preemption::yield_point(self).await?;
+        crate::inferlet::process::gate::residency_gate(self).await?;
         Ok(self.ctx().table.get(&this)?.page_size)
     }
 
     async fn page_len(&mut self, this: Resource<KvWorkingSet>) -> Result<u32> {
-        crate::inferlet::process::preemption::yield_point(self).await?;
+        crate::inferlet::process::gate::residency_gate(self).await?;
         let ws = self.ctx().table.get(&this)?.clone();
         let stores = store_registry::get(ws.model, ws.driver as usize);
         let len =
@@ -81,9 +81,9 @@ impl pie::inferlet::working_set::HostKvWorkingSet for ProcessCtx {
         pages: u32,
     ) -> Result<Result<WitRange, String>> {
         // Strict admission: even a logical page claim counts as pooled
-        // demand the contention orchestrator reasons about.
+        // demand the residency planner reasons about.
         crate::inferlet::process::ensure_bind_admitted(self).await;
-        crate::inferlet::process::preemption::yield_point(self).await?;
+        crate::inferlet::process::gate::residency_gate(self).await?;
         let ws = self.ctx().table.get(&this)?.clone();
         let stores = store_registry::get(ws.model, ws.driver as usize);
         let range = store_registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
@@ -102,7 +102,7 @@ impl pie::inferlet::working_set::HostKvWorkingSet for ProcessCtx {
         this: Resource<KvWorkingSet>,
         key: Vec<u8>,
     ) -> Result<Result<(), String>> {
-        crate::inferlet::process::preemption::yield_point(self).await?;
+        crate::inferlet::process::gate::residency_gate(self).await?;
         let ws = self.ctx().table.get(&this)?.clone();
         if !ws.is_settled() {
             return Ok(Err(
@@ -116,9 +116,9 @@ impl pie::inferlet::working_set::HostKvWorkingSet for ProcessCtx {
         match result {
             Ok(freed) => {
                 if freed != 0
-                    && let Some(orchestrator) = crate::store::reclaim::contention()
+                    && let Some(planner) = crate::planner::planner()
                 {
-                    orchestrator.on_blocks_freed();
+                    planner.pages_freed();
                 }
                 Ok(Ok(()))
             }
@@ -130,14 +130,14 @@ impl pie::inferlet::working_set::HostKvWorkingSet for ProcessCtx {
         &mut self,
         key: Vec<u8>,
     ) -> Result<Result<Option<Resource<KvWorkingSet>>, String>> {
-        crate::inferlet::process::preemption::yield_point(self).await?;
+        crate::inferlet::process::gate::residency_gate(self).await?;
         let stores = store_registry::get(0, 0);
         let indexed =
             store_registry::with_kv_lock(&stores.kv, "host-working-set", |kv| kv.from_index(&key));
         match indexed {
             Ok(Some(id)) => {
                 let ws = KvWorkingSet::new(0, 0, id, stores.kv_page_size);
-                self.register_kv_working_set(0, 0, id);
+                self.register_kv_working_set(&ws);
                 Ok(Ok(Some(self.ctx().table.push(ws)?)))
             }
             Ok(None) => Ok(Ok(None)),
@@ -146,7 +146,7 @@ impl pie::inferlet::working_set::HostKvWorkingSet for ProcessCtx {
     }
 
     async fn remove_index(&mut self, key: Vec<u8>) -> Result<Result<bool, String>> {
-        crate::inferlet::process::preemption::yield_point(self).await?;
+        crate::inferlet::process::gate::residency_gate(self).await?;
         let stores = store_registry::get(0, 0);
         let removed = store_registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
             kv.remove_index(&key)
@@ -154,9 +154,9 @@ impl pie::inferlet::working_set::HostKvWorkingSet for ProcessCtx {
         match removed {
             Ok((removed, freed)) => {
                 if freed != 0
-                    && let Some(orchestrator) = crate::store::reclaim::contention()
+                    && let Some(planner) = crate::planner::planner()
                 {
-                    orchestrator.on_blocks_freed();
+                    planner.pages_freed();
                 }
                 Ok(Ok(removed))
             }
@@ -170,7 +170,7 @@ impl pie::inferlet::working_set::HostKvWorkingSet for ProcessCtx {
         on: Resource<Pipeline>,
         ranges: Vec<WitRange>,
     ) -> Result<Result<(), String>> {
-        crate::inferlet::process::preemption::serialize_under_contention(self).await?;
+        crate::inferlet::process::gate::residency_gate(self).await?;
         let ws = match scoped_working_set(self, &this, &on)? {
             Ok(ws) => ws,
             Err(error) => return Ok(Err(error)),
@@ -185,10 +185,10 @@ impl pie::inferlet::working_set::HostKvWorkingSet for ProcessCtx {
             let out = kv.discard(ws.id, &ranges, epoch).map_err(|e| e.to_string());
             kv.retire_idle();
             out
-        }); // store lock released before the contention drain re-locks pools.
+        }); // store lock released before the planner's drain re-locks pools.
         if out.is_ok() {
-            if let Some(orchestrator) = crate::store::reclaim::contention() {
-                orchestrator.on_blocks_freed();
+            if let Some(planner) = crate::planner::planner() {
+                planner.pages_freed();
             }
         }
         Ok(out)
@@ -199,7 +199,7 @@ impl pie::inferlet::working_set::HostKvWorkingSet for ProcessCtx {
         this: Resource<KvWorkingSet>,
         on: Resource<Pipeline>,
     ) -> Result<Result<Resource<KvWorkingSet>, String>> {
-        crate::inferlet::process::preemption::serialize_under_contention(self).await?;
+        crate::inferlet::process::gate::residency_gate(self).await?;
         let ws = match scoped_working_set(self, &this, &on)? {
             Ok(ws) => ws,
             Err(error) => return Ok(Err(error)),
@@ -214,7 +214,7 @@ impl pie::inferlet::working_set::HostKvWorkingSet for ProcessCtx {
                 // release-once guard for an unrelated id and (b) release the
                 // WRONG working set when the last clone drops.
                 let child = ws.forked(id);
-                self.register_kv_working_set(ws.model, ws.driver, id);
+                self.register_kv_working_set(&child);
                 Ok(Ok(self.ctx().table.push(child)?))
             }
             Err(e) => Ok(Err(e.to_string())),
@@ -227,7 +227,7 @@ impl pie::inferlet::working_set::HostKvWorkingSet for ProcessCtx {
         on: Resource<Pipeline>,
         range: WitRange,
     ) -> Result<Result<Resource<KvWorkingSet>, String>> {
-        crate::inferlet::process::preemption::serialize_under_contention(self).await?;
+        crate::inferlet::process::gate::residency_gate(self).await?;
         let ws = match scoped_working_set(self, &this, &on)? {
             Ok(ws) => ws,
             Err(error) => return Ok(Err(error)),
@@ -243,7 +243,7 @@ impl pie::inferlet::working_set::HostKvWorkingSet for ProcessCtx {
             Ok(id) => {
                 // See `fork`: a fresh id always gets a fresh lifecycle.
                 let child = ws.forked(id);
-                self.register_kv_working_set(ws.model, ws.driver, id);
+                self.register_kv_working_set(&child);
                 Ok(Ok(self.ctx().table.push(child)?))
             }
             Err(e) => Ok(Err(e.to_string())),
@@ -259,7 +259,7 @@ impl pie::inferlet::working_set::HostKvWorkingSet for ProcessCtx {
         src_page_ids: Vec<u32>,
         src_tok_idx: Vec<u32>,
     ) -> Result<Result<(), String>> {
-        crate::inferlet::process::preemption::serialize_under_contention(self).await?;
+        crate::inferlet::process::gate::residency_gate(self).await?;
         crate::pipeline::fire::working_set_copy_into(
             self,
             this,
@@ -273,7 +273,7 @@ impl pie::inferlet::working_set::HostKvWorkingSet for ProcessCtx {
     }
 
     async fn drop(&mut self, this: Resource<KvWorkingSet>) -> Result<()> {
-        crate::inferlet::process::preemption::yield_point(self).await?;
+        crate::inferlet::process::gate::residency_gate(self).await?;
         // `release` performs the exact release/retire/contention-drain
         // sequence and marks the shared
         // lifecycle done; `ws`'s own drop just below (and the fallback

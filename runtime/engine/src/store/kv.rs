@@ -40,7 +40,7 @@ use std::sync::{Arc, RwLock};
 use hash::Hash256;
 use page_table::{
     HostKvSlotId, IndexedWorkingSet, KvPageBacking, KvPageTable, KvTableError, NodeId,
-    PhysicalKvPageId, PublishedPage, TriePageLocation, WorkingSetId,
+    PhysicalKvPageId, PublishedPage, ReclaimQuote, TriePageLocation, WorkingSetId,
 };
 use write::{KvPreparedWrite, PageCommit, PreparedTarget};
 
@@ -696,7 +696,7 @@ impl KvStore {
         self.finish_prepare_write(ws, classification, allocated)
     }
 
-    /// Prepare using concrete ids reserved by the contention orchestrator.
+    /// Prepare using concrete ids reserved by the residency planner.
     pub fn prepare_write_granted(
         &mut self,
         ws: WorkingSetId,
@@ -1264,11 +1264,12 @@ impl KvStore {
         Ok(page_count)
     }
 
-    /// Contention-ladder rung 2 victim sizing: pages reachable only from
-    /// `ws`'s terminal (its private trie suffix) — what releasing this
-    /// WorkingSet would actually free.
-    pub fn exclusive_footprint(&self, ws: WorkingSetId) -> Result<u64, KvStoreError> {
-        Ok(self.table.exclusive_footprint(ws)?)
+    /// Victim sizing for the residency planner: what suspending each group
+    /// of WorkingSets would ACTUALLY free, answered by the same rule
+    /// `prepare_suspend` applies — with a typed reason when the answer is
+    /// zero. Batched: the shared exclusions cost one pass for the whole set.
+    pub fn reclaim_quotes(&self, groups: &[HashSet<WorkingSetId>]) -> Vec<ReclaimQuote> {
+        self.table.reclaim_quotes(groups)
     }
 
     pub fn reserve_device_pages(&mut self, count: usize) -> Option<Vec<PhysicalKvPageId>> {

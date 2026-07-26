@@ -2193,7 +2193,25 @@ int Context::Impl::copy_kv(const PieKvCopyDesc& copy, PieCompletion completion) 
             keep_async_value(keepalive, std::move(d_src_page));
             keep_async_value(keepalive, std::move(d_src_off));
         }
-        if (has_page_copies && (!keepalive.empty() || completion.wait_id != 0)) {
+        if (copy.cells.len == 0) {
+            // Standalone page copies (suspend D2H / restore H2D / graft
+            // D2D): complete on the SWAP stream. Routing the completion
+            // through the compute stream — and making the compute stream
+            // WAIT on the swap event — turned every transfer into a wave
+            // stall: all launches posted after this point queued behind
+            // PCIe (CONTENTION_FOLLOWUP.md §17.1). No stream
+            // join is needed for visibility: the pages move only while
+            // grant-pinned or suspend-fenced, and the fires that read
+            // them are posted only after the engine observes this
+            // completion (ledger commit first) — host-side
+            // happens-before covers the device.
+            enqueue_completion(swap_pool_->stream(), completion);
+            return PIE_STATUS_OK;
+        }
+        if (has_page_copies) {
+            // Mixed descriptor (page copies + cell moves): the compute-
+            // stream cell kernels must observe the swap-stream page
+            // copies — keep the join.
             cudaEvent_t swap_done = nullptr;
             CUDA_CHECK(cudaEventCreateWithFlags(&swap_done, cudaEventDisableTiming));
             CUDA_CHECK(cudaEventRecord(swap_done, swap_pool_->stream()));

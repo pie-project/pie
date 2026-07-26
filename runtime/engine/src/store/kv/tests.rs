@@ -4,8 +4,8 @@ use std::collections::HashSet;
 
 use super::hash::{self, Hash256};
 use super::page_table::{
-    KvPageBacking, KvPageTable, KvTableError, PhysicalKvPageId, PublishedPage, TriePageLocation,
-    WorkingSetId,
+    KvPageBacking, KvPageTable, KvTableError, NoReclaim, PhysicalKvPageId, PublishedPage,
+    ReclaimQuote, TriePageLocation, WorkingSetId,
 };
 use super::write::{PageCommit, PreparedTarget};
 use super::{KvStore, KvStoreError};
@@ -430,7 +430,8 @@ fn drop_unused_cache_leases_reclaims_lease_only_prefixes() {
 }
 
 #[test]
-fn exclusive_footprint_counts_only_the_private_suffix() {
+fn reclaim_quotes_count_only_the_private_resident_suffix() {
+    let group = |ws| HashSet::from([ws]);
     let mut t = KvPageTable::new();
     let a = t.create_working_set();
     publish(&mut t, a, 0..5);
@@ -438,20 +439,40 @@ fn exclusive_footprint_counts_only_the_private_suffix() {
     publish(&mut t, a, 5..10); // a's private suffix
     publish(&mut t, b, 10..12); // b's private suffix
 
-    assert_eq!(t.exclusive_footprint(a).unwrap(), 5);
-    assert_eq!(t.exclusive_footprint(b).unwrap(), 2);
+    // The 0..5 prefix is shared, so neither sharer can free it alone.
+    assert_eq!(
+        t.reclaim_quotes(&[group(a), group(b)]),
+        vec![ReclaimQuote::Pages(5), ReclaimQuote::Pages(2)]
+    );
+    // Sharing WITHIN one group is not sharing outward: quoted together, the
+    // prefix belongs to the group and counts once.
+    assert_eq!(
+        t.reclaim_quotes(&[HashSet::from([a, b])]),
+        vec![ReclaimQuote::Pages(12)]
+    );
 
-    // A pinned terminal (in-flight fire) is not reclaimable by preemption.
+    // A pinned terminal (in-flight fire) defers the whole suspend, and says so
+    // — distinct from "holds nothing", because it clears on a different event.
     let term_a = t.terminal(a).unwrap().unwrap();
     t.pin(term_a);
-    assert_eq!(t.exclusive_footprint(a).unwrap(), 0);
+    assert_eq!(
+        t.reclaim_quotes(&[group(a)]),
+        vec![ReclaimQuote::Nothing(NoReclaim::Pinned)]
+    );
     t.unpin(term_a);
-    assert_eq!(t.exclusive_footprint(a).unwrap(), 5);
+    assert_eq!(t.reclaim_quotes(&[group(a)]), vec![ReclaimQuote::Pages(5)]);
 
     // Releasing b makes the shared prefix a's alone.
     let freed = t.release_working_set(b);
     assert_eq!(sorted(freed), vec![10, 11]);
-    assert_eq!(t.exclusive_footprint(a).unwrap(), 10);
+    assert_eq!(t.reclaim_quotes(&[group(a)]), vec![ReclaimQuote::Pages(10)]);
+
+    // The case that livelocked victim selection: a candidate holding nothing
+    // reports it, so selection can rule it out instead of re-picking it.
+    assert_eq!(
+        t.reclaim_quotes(&[HashSet::new()]),
+        vec![ReclaimQuote::Nothing(NoReclaim::HoldsNothing)]
+    );
 }
 
 #[test]

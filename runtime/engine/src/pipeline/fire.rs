@@ -75,6 +75,14 @@ impl PendingFireQueue {
     pub(crate) async fn finalize_guard(&self) -> tokio::sync::OwnedMutexGuard<()> {
         Arc::clone(&self.finalizer).lock_owned().await
     }
+
+    /// Non-blocking [`Self::finalize_guard`], for the planner's eviction
+    /// drain: the guard may be held indefinitely by the owner's guest task
+    /// (e.g. a channel materialize awaiting a peer), and an eviction must
+    /// abort rather than wait out another task's await.
+    pub(crate) fn try_finalize_guard(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        Arc::clone(&self.finalizer).try_lock_owned().ok()
+    }
 }
 
 pub type PendingFires = Arc<PendingFireQueue>;
@@ -214,9 +222,9 @@ impl Drop for KvTxnGuard {
         crate::store::registry::with_kv_lock(&stores.kv, "host-other", |store| {
             kv::abandon(store, txn);
         });
-        // The abort recycled pages; parked allocators may fit now.
-        if let Some(orchestrator) = crate::store::reclaim::contention_for(self.model, self.driver) {
-            orchestrator.on_blocks_freed();
+        // The abort recycled pages; parked asks may fit now.
+        if let Some(planner) = crate::planner::planner_for(self.model, self.driver) {
+            planner.pages_freed();
         }
     }
 }
@@ -253,9 +261,9 @@ impl Drop for RsTxnsGuard {
             let mut store = stores.rs.lock().unwrap();
             rs::abandon_many(&mut store, std::mem::take(&mut self.txns));
         }
-        // The abort recycled slots; parked acquisitions may fit now.
-        if let Some(orchestrator) = crate::store::reclaim::contention_for(self.model, self.driver) {
-            orchestrator.on_blocks_freed();
+        // The abort recycled slots; parked asks may fit now.
+        if let Some(planner) = crate::planner::planner_for(self.model, self.driver) {
+            planner.pages_freed();
         }
     }
 }
@@ -294,59 +302,59 @@ fn host_kv_demand(
 }
 
 /// Acquire this fire's grant (KV pages and RS slots together — a fire never
-/// half-succeeds) from the contention orchestrator. Zero demand yields an
-/// empty grant so the build path stays uniform — every fire shape goes
-/// through prefix lending against one owned grant.
+/// half-succeeds) from the residency planner. Zero demand yields an empty
+/// grant so the build path stays uniform — every fire shape goes through
+/// prefix lending against one owned grant.
 ///
-/// The wait inside `acquire` is a STANDING safe point (D2): the requester
-/// holds nothing, so this races the acquire against the process's park
-/// signal exactly like every idle host await does. When a park request
-/// lands — including when the requester itself is the selected victim (D3)
-/// — the acquire future is cancelled (rank is the spawn clock, so retry
-/// never loses queue position), the request is honored through the one
-/// yield point, and the acquire re-issues.
+/// Uncontended (no waiters, everyone resident) this is two free-list pops
+/// with no planner lock. Under pressure the ask parks FCFS at the process's
+/// spawn position; the parked task holds no lease, no pins, and no open
+/// transaction, so the planner is free to evict around (or through) it.
+/// On [`crate::planner::Acquired::Yield`] the process was chosen for
+/// eviction (or is already out of the set): settle its tail HERE — the ask
+/// holds no lease, no pins, and no open transaction, so this is the one
+/// safe point — then wait out the eviction and re-ask.
 async fn acquire_grant<C: FireContext>(
     ctx: &mut C,
     pipeline_id: uuid::Uuid,
-    demand: crate::store::reclaim::Demand,
-) -> Result<crate::store::reclaim::AllocationGrant, String> {
+    demand: crate::planner::Demand,
+) -> Result<crate::planner::AllocationGrant, String> {
     if demand.is_zero() {
-        return Ok(crate::store::reclaim::AllocationGrant::empty());
+        return Ok(crate::planner::AllocationGrant::empty());
     }
-    let Some(orchestrator) = crate::store::reclaim::contention() else {
-        return Err("pipeline: KV contention orchestrator is not installed".to_string());
+    let Some(planner) = crate::planner::planner() else {
+        return Err("pipeline: KV residency planner is not installed".to_string());
     };
     let pid = ctx.process_id();
     loop {
-        {
-            let acquire = orchestrator.acquire(pid, pipeline_id, demand);
-            let Some(signal) = ctx.preemption_signal() else {
-                return acquire
-                    .await
-                    .map_err(|error| format!("pipeline: KV contention: {error}"));
-            };
-            tokio::pin!(acquire);
-            let notified = signal.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            // Lost-wakeup guard: a park request that landed BEFORE the
-            // waiter armed (e.g. between honor and re-acquire under rapid
-            // escalation) would otherwise strand the acquire in its
-            // wait-until-running while nothing ever wakes this select.
-            if !orchestrator.should_park(pid) {
-                tokio::select! {
-                    result = &mut acquire => {
-                        return result
-                            .map_err(|error| format!("pipeline: KV contention: {error}"));
-                    }
-                    _ = &mut notified => {}
-                }
-            }
-        }
-        ctx.honor_preemption()
+        match planner
+            .acquire(pid, pipeline_id, demand)
             .await
-            .map_err(|error| format!("pipeline: KV preemption: {error:#}"))?;
+            .map_err(|error| format!("pipeline: KV capacity: {error}"))?
+        {
+            crate::planner::Acquired::Granted(grant) => return Ok(grant),
+            crate::planner::Acquired::Yield => settle_and_wait_resident(ctx).await?,
+        }
     }
+}
+
+/// Back off for THIS process's eviction: settle its pipeline tails (the
+/// parked task must hold no pins, and those finalizations release the fire
+/// leases the eviction's quiescence waits on), then wait out the eviction.
+/// `wait_resident` re-posts the process-wide leave before parking (the
+/// lane-resurrection seal wedge, CONTENTION_FOLLOWUP.md §15.2). One owner
+/// for the back-off protocol — every fire-submit park site calls this.
+async fn settle_and_wait_resident<C: FireContext>(ctx: &mut C) -> Result<(), String> {
+    let Some(planner) = crate::planner::planner() else {
+        return Err("pipeline: KV working set is suspend-fenced".to_string());
+    };
+    ctx.settle_pipeline_tail()
+        .await
+        .map_err(|error| format!("pipeline: settle for eviction: {error:#}"))?;
+    planner
+        .wait_resident(ctx.process_id())
+        .await
+        .map_err(|error| format!("pipeline: KV residency: {error}"))
 }
 
 /// Resolve the bound RS working sets for demand sizing (phase A: validation
@@ -397,7 +405,7 @@ fn prepare_host_kv_reserved(
     ws: &KvWorkingSet,
     writable: std::ops::Range<u64>,
     declaration_realized: bool,
-    grant: &mut crate::store::reclaim::AllocationGrant,
+    grant: &mut crate::planner::AllocationGrant,
 ) -> Result<PreparedHostKv, ReservedError> {
     crate::store::registry::with_kv_lock(&stores.kv, "host-other", |store| {
         let required = host_kv_demand_locked(store, ws, writable.clone(), declaration_realized)
@@ -431,7 +439,7 @@ fn prepare_explicit_kv_reserved(
     stores: &crate::store::registry::Stores,
     ws: &KvWorkingSet,
     write_indexes: &[u64],
-    grant: &mut crate::store::reclaim::AllocationGrant,
+    grant: &mut crate::planner::AllocationGrant,
 ) -> Result<PreparedExplicitKv, ReservedError> {
     crate::store::registry::with_kv_lock(&stores.kv, "host-other", |store| {
         let required =
@@ -458,7 +466,7 @@ pub enum PendingOp {
 
 impl PendingOp {
     /// Non-blocking probe: whether the op's completion has settled.
-    fn is_settled(&self) -> bool {
+    pub(crate) fn is_settled(&self) -> bool {
         match self {
             PendingOp::Fire(fire) => fire.completion.is_settled(),
             #[cfg(test)]
@@ -487,11 +495,6 @@ impl PendingOp {
         )
     }
 
-    pub(crate) fn preemption_signal(
-        &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-        Box::pin(self.completion_signal())
-    }
 }
 
 enum FinalizeAction {
@@ -591,7 +594,7 @@ fn prepare_bound_rs<C: FireContext>(
     rs_reps: &[u32],
     qo_indptr: &[u32],
     pipeline_scope: &crate::store::PipelineScope,
-    grant: &mut crate::store::reclaim::AllocationGrant,
+    grant: &mut crate::planner::AllocationGrant,
 ) -> Anyhow<Result<PreparedRs, ReservedError>> {
     let has_recurrent_state = pie_model::model().rs_caps().state_size > 0;
     if let Err(error) = rs::validate_count(rs_reps.len(), qo_indptr, has_recurrent_state) {
@@ -659,26 +662,12 @@ pub(crate) async fn drain_rs_predecessors<C: FireContext>(
             .unwrap()
             .front()
             .map(PendingOp::completion_signal);
-        let Some(mut completion) = completion else {
+        let Some(completion) = completion else {
             return Ok(());
         };
-        if let Some(preemption) = ctx.preemption_signal() {
-            // Honor a request that landed before this waiter arms (the
-            // notified below only observes signals from here on).
-            ctx.honor_preemption().await?;
-            let notified = preemption.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            tokio::select! {
-                _ = &mut completion => {}
-                _ = &mut notified => {
-                    ctx.honor_preemption().await?;
-                    continue;
-                }
-            }
-        } else {
-            completion.await;
-        }
+        // Predecessor fires retire with their frames regardless of this
+        // process's residency, so a plain await cannot deadlock the planner.
+        completion.await;
 
         let _finalize_guard = fires.finalize_guard().await;
         let op = {
@@ -812,6 +801,10 @@ pub async fn submit_pass_stamped<C: FireContext>(
         if ctx.resources().get(&fwd)?.devgeo.is_some() {
             return fire_device_geometry(ctx, this, fwd, frame).await;
         }
+        // Contention-probe marker: when the guest's WIT call reached the
+        // host (vs `hp-acquire` below — the delta is the build preamble,
+        // including the settlement drain).
+        crate::planner::trace_mark!("build", ctx.process_id(), "hp-enter");
         // W3.1: the PIPELINE owns the in-flight FIFO. Point each of this
         // pass's channels at this pipeline's queue so their `take`/`read`
         // await the right FIFO — enforcing the same-pipeline constraint
@@ -1019,8 +1012,9 @@ pub async fn submit_pass_stamped<C: FireContext>(
             Ok(ids) => ids,
             Err(error) => return Ok(Err(error)),
         };
+        crate::planner::trace_mark!("build", pid, "hp-acquire");
         let mut attempts = 0;
-        let ((copy_src, copy_dst), kvtxn, rs_prepared) = loop {
+        let (ws_guard, (copy_src, copy_dst), kvtxn, rs_prepared) = loop {
             let kv_demand = match host_kv_demand(
                 &stores,
                 &ws,
@@ -1032,20 +1026,36 @@ pub async fn submit_pass_stamped<C: FireContext>(
             };
             let Ok(kv_demand) = u32::try_from(kv_demand) else {
                 return Ok(Err(
-                    "pipeline: KV demand exceeds the contention ABI".to_string()
+                    "pipeline: KV demand exceeds the planner ABI".to_string()
                 ));
             };
             let rs_demand = match rs_slot_demand(&stores, &rs_ws_ids) {
                 Ok(demand) => demand,
                 Err(error) => return Ok(Err(error)),
             };
-            let demand = crate::store::reclaim::Demand {
+            let demand = crate::planner::Demand {
                 kv_pages: kv_demand,
                 rs_slots: rs_demand,
             };
             let mut grant = match acquire_grant(ctx, quorum_pipeline_id, demand).await {
                 Ok(grant) => grant,
                 Err(error) => return Ok(Err(error)),
+            };
+            // The lease is the suspend seal: acquired AFTER any park (a
+            // parked ask must hold no lease, or the planner could never
+            // quiesce it) and BEFORE the prepare (so an eviction either
+            // sees this fire's lease and waits it out, or fenced first and
+            // this fire backs off to wait out the eviction).
+            let ws_guard = match ws.fire_lease() {
+                Ok(lease) => lease,
+                Err(crate::store::kv::working_set::FireLeaseError::Fenced) => {
+                    drop(grant); // the pages fund the eviction's head
+                    if let Err(error) = settle_and_wait_resident(ctx).await {
+                        return Ok(Err(error));
+                    }
+                    continue;
+                }
+                Err(error) => return Ok(Err(format!("pipeline: KV working set: {error}"))),
             };
             let (copies, kvtxn) = match prepare_host_kv_reserved(
                 &stores,
@@ -1077,7 +1087,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 &pipeline_scope,
                 &mut grant,
             )? {
-                Ok(prepared) => break (copies, kvtxn, prepared),
+                Ok(prepared) => break (ws_guard, copies, kvtxn, prepared),
                 Err(ReservedError::Stale) if attempts < STALE_DEMAND_ATTEMPTS => {
                     attempts += 1;
                     // kvtxn's guard aborts the prepared KV write on drop.
@@ -1089,10 +1099,6 @@ pub async fn submit_pass_stamped<C: FireContext>(
         };
         let (rs_slot_ids, rs_slot_flags, rs_copy_src, rs_copy_dst, rstxns) = rs_prepared;
         let rstxns = RsTxnsGuard::new(model, driver, rstxns);
-        let ws_guard = match ws.fire_lease() {
-            Ok(lease) => lease,
-            Err(error) => return Ok(Err(format!("pipeline: KV working set: {error}"))),
-        };
         req.rs_slot_ids = rs_slot_ids;
         req.rs_slot_flags = rs_slot_flags;
         let (translation_version, translation) = match ws.translation() {
@@ -1487,9 +1493,31 @@ pub async fn copy_into_inner<C: FireContext>(
             },
         )
         .collect::<Vec<_>>();
-    let lease = match ws_handle.fire_lease() {
-        Ok(lease) => lease,
-        Err(error) => return Ok(Err(format!("pipeline copy_into: {error}"))),
+    let lease = loop {
+        match ws_handle.fire_lease() {
+            Ok(lease) => break lease,
+            Err(crate::store::kv::working_set::FireLeaseError::Fenced) => {
+                // The planner is suspending this working set; wait out the
+                // eviction and retry against the restored pages
+                // (`wait_resident` posts the leave before parking).
+                //
+                // DIVERGENCE, kept deliberately un-"fixed": unlike the
+                // fire-submit back-off (`settle_and_wait_resident`), this
+                // park does not settle the process's pipeline tails first.
+                // An unsettled fire elsewhere keeps its lease, and the
+                // eviction's quiescence then depends on another finalizer —
+                // a liveness question under watch (CONTENTION_FOLLOWUP.md
+                // §16.2), not a cleanup-pass alignment.
+                let pid = ctx.process_id();
+                let Some(planner) = crate::planner::planner() else {
+                    return Ok(Err("pipeline copy_into: working set is suspend-fenced".into()));
+                };
+                if let Err(error) = planner.wait_resident(pid).await {
+                    return Ok(Err(format!("pipeline copy_into: {error}")));
+                }
+            }
+            Err(error) => return Ok(Err(format!("pipeline copy_into: {error}"))),
+        }
     };
     let completion = match crate::scheduler::copy_kv_cells(0, cells).await {
         Ok(completion) => completion,
@@ -1539,10 +1567,7 @@ async fn pipeline_close_inner<C: FireContext>(
             if crate::inferlet::process::execution_admission_is_capped() {
                 crate::scheduler::worker::notify_pipeline_close(pipeline_id).await;
             } else {
-                crate::scheduler::worker::notify_pipeline_leave(
-                    pipeline_id,
-                    crate::scheduler::worker::LeaveKind::Close,
-                );
+                crate::scheduler::worker::notify_lane_close(pipeline_id, None);
             }
         }
         drain_settled(ctx, Some(&fires)).await?;
@@ -1604,6 +1629,36 @@ pub async fn drain_settled<C: FireContext>(
                 drained = true;
             }
             None => return Ok(drained),
+        }
+    }
+}
+
+/// Pop and finalize EVERY pending op of one pipeline FIFO, in submit order,
+/// under the queue's finalize guard — the full-drain sibling of
+/// [`drain_settled`], shared by the residency gate, forward-pass drop, and
+/// process teardown. `continue_on_error` is the teardown policy (log and
+/// keep draining — the table is about to drop); the strict form propagates
+/// the first failure.
+pub(crate) async fn finalize_all<C: FireContext>(
+    ctx: &mut C,
+    fires: &PendingFires,
+    continue_on_error: bool,
+) -> Anyhow<()> {
+    let _finalize_guard = fires.finalize_guard().await;
+    loop {
+        let op = fires.lock().unwrap().pop_front();
+        let Some(op) = op else {
+            return Ok(());
+        };
+        if let Err(error) = finalize_op(ctx, op).await {
+            if !continue_on_error {
+                return Err(error);
+            }
+            tracing::error!(
+                pid = %ctx.process_id(),
+                %error,
+                "failed to finalize a pending pipeline operation"
+            );
         }
     }
 }
@@ -1738,10 +1793,11 @@ async fn finalize_fire_await(fire: PendingFire) -> Anyhow<FinalizeOutcome> {
     }; // store locks released before the contention drain re-locks pools
 
     // The fire's sequence retired: recycled slots (aborts, CoW'd tails,
-    // collected suffixes) are allocatable now — wake parked allocators
-    // and drain-gated lanes.
-    if let Some(orch) = crate::store::reclaim::contention() {
-        orch.on_blocks_freed();
+    // collected suffixes) are allocatable now — wake parked asks. This is
+    // also the planner's per-fire quiescence event: the lease this fire
+    // held has just released.
+    if let Some(planner) = crate::planner::planner() {
+        planner.pages_freed();
     }
 
     // Values are already visible through the release-published tail words
@@ -1829,6 +1885,10 @@ async fn fire_device_geometry<C: FireContext>(
     fwd: Resource<ForwardPass>,
     frame: Option<crate::scheduler::FrameStamp>,
 ) -> Anyhow<Result<(), String>> {
+    // Contention-probe marker: when the guest's WIT call reached the host
+    // (vs when its build reaches `acquire` — the delta is the build
+    // preamble, including the settlement drain below).
+    crate::planner::trace_mark!("build", ctx.process_id(), "dg-enter");
     // Wire each of this pass's channels at this pipeline's FIFO (§3.4: all
     // passes binding a channel must submit on ONE pipeline — the entire
     // ordering/FIFO correctness argument).
@@ -1928,8 +1988,9 @@ async fn fire_device_geometry<C: FireContext>(
     // Phase B: acquire the one grant (KV pages + RS slots) — the only
     // awaits in this build; nothing physical is held. Phase C: prepare from
     // it; on stale demand recompute both figures and re-acquire, bounded.
+    crate::planner::trace_mark!("build", pid, "dg-acquire");
     let mut attempts = 0;
-    let (pages, (copy_src, copy_dst), kv_translation, kvtxn, rs_prepared) = loop {
+    let (ws_guard, pages, (copy_src, copy_dst), kv_translation, kvtxn, rs_prepared) = loop {
         let kv_demand =
             match crate::store::registry::with_kv_lock(&stores.kv, "host-other", |store| {
                 kv::prepare_explicit_demand(store, ws.id, &write_indexes)
@@ -1943,7 +2004,7 @@ async fn fire_device_geometry<C: FireContext>(
         let Ok(kv_demand) = u32::try_from(kv_demand) else {
             reclaim_pending_device_grant(ctx, &fwd);
             return Ok(Err(
-                "pipeline: KV demand exceeds the contention ABI".to_string()
+                "pipeline: KV demand exceeds the planner ABI".to_string()
             ));
         };
         let rs_demand = match rs_slot_demand(&stores, &rs_ws_ids) {
@@ -1953,7 +2014,7 @@ async fn fire_device_geometry<C: FireContext>(
                 return Ok(Err(error));
             }
         };
-        let demand = crate::store::reclaim::Demand {
+        let demand = crate::planner::Demand {
             kv_pages: kv_demand,
             rs_slots: rs_demand,
         };
@@ -1962,6 +2023,23 @@ async fn fire_device_geometry<C: FireContext>(
             Err(error) => {
                 reclaim_pending_device_grant(ctx, &fwd);
                 return Ok(Err(error));
+            }
+        };
+        // The suspend seal — see the host path: lease after any park,
+        // before the prepare.
+        let ws_guard = match ws.fire_lease() {
+            Ok(lease) => lease,
+            Err(crate::store::kv::working_set::FireLeaseError::Fenced) => {
+                drop(grant);
+                if let Err(error) = settle_and_wait_resident(ctx).await {
+                    reclaim_pending_device_grant(ctx, &fwd);
+                    return Ok(Err(error));
+                }
+                continue;
+            }
+            Err(error) => {
+                reclaim_pending_device_grant(ctx, &fwd);
+                return Ok(Err(format!("pipeline: KV working set: {error}")));
             }
         };
         let (pages, copies, kv_translation, kvtxn) =
@@ -1991,7 +2069,7 @@ async fn fire_device_geometry<C: FireContext>(
             &pipeline_scope,
             &mut grant,
         ) {
-            Ok(Ok(prepared)) => break (pages, copies, kv_translation, kvtxn, prepared),
+            Ok(Ok(prepared)) => break (ws_guard, pages, copies, kv_translation, kvtxn, prepared),
             Ok(Err(ReservedError::Stale)) if attempts < STALE_DEMAND_ATTEMPTS => {
                 attempts += 1;
                 // kvtxn's guard aborts the prepared KV write on drop.
@@ -2016,13 +2094,6 @@ async fn fire_device_geometry<C: FireContext>(
     };
     let (rs_slot_ids, rs_slot_flags, rs_copy_src, rs_copy_dst, rstxns) = rs_prepared;
     let rstxns = RsTxnsGuard::new(ws.model, ws.driver, rstxns);
-    let ws_guard = match ws.fire_lease() {
-        Ok(lease) => lease,
-        Err(error) => {
-            reclaim_pending_device_grant(ctx, &fwd);
-            return Ok(Err(format!("pipeline: KV working set: {error}")));
-        }
-    };
 
     // Deliver the fresh grant to the program as a direct put on its `fresh`
     // channel — a shared-ring write the driver pulls before the pass (plan
@@ -2237,14 +2308,6 @@ mod lifecycle_tests {
 
         fn process_id(&self) -> uuid::Uuid {
             self.id
-        }
-
-        async fn honor_preemption(&mut self) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        fn preemption_signal(&self) -> Option<Arc<tokio::sync::Notify>> {
-            None
         }
     }
 

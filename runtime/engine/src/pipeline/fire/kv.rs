@@ -207,7 +207,10 @@ fn declaration_overlap(
 /// Realize the mapped overlap of one writable declaration exactly once.
 /// Shared pages rebase through the existing COW protocol; private pages only
 /// lose transitional implicit-cache identity. Fresh backing is handled
-/// separately by [`KvStore::ensure_backed`].
+/// separately by [`KvStore::ensure_backed`]. Production goes through
+/// [`realize_declaration_reserved`] (grant-funded); this store-allocating
+/// form survives for the store tests only.
+#[cfg(test)]
 pub fn realize_declaration(
     store: &mut KvStore,
     ws: WorkingSetId,
