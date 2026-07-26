@@ -95,6 +95,7 @@ pub fn fold_stage(
         hidden: None,
         value_head: None,
         query: Vec::new(),
+        attn_score: Vec::new(),
     };
 
     let mut fold = StageFold::default();

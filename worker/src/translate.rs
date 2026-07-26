@@ -114,6 +114,7 @@ fn build_model(
                 has_mtp_drafts: g.caps.has_mtp_drafts,
                 has_value_head: g.caps.has_value_head,
                 has_kv_envelopes: g.caps.has_kv_envelopes,
+                has_attn_score: g.caps.has_attn_score,
                 device_geometry_port_mask: g.caps.device_geometry_port_mask,
                 limits: pie_engine::driver::SchedulerLimits {
                     max_forward_requests: g.caps.max_forward_requests as usize,
@@ -167,6 +168,7 @@ mod tests {
             has_mtp_drafts: false,
             has_value_head: false,
             has_kv_envelopes: false,
+            has_attn_score: false,
             device_geometry_port_mask: pie_driver_abi::PIE_DEVICE_GEOMETRY_PORTS,
             kv_handle: None,
         }
@@ -188,6 +190,7 @@ mod tests {
             has_mtp_logits: caps.has_mtp_logits,
             has_mtp_drafts: caps.has_mtp_drafts,
             has_value_head: caps.has_value_head,
+            has_attn_score: caps.has_attn_score,
             callback_delay_ms: 0,
             reject_launches: false,
             reject_launches_remaining: 0,

@@ -202,6 +202,7 @@ fn register_dummy_driver(
         has_mtp_logits: true,
         has_mtp_drafts: true,
         has_value_head: true,
+        has_attn_score: true,
         callback_delay_ms: 0,
         reject_launches: false,
         reject_launches_remaining: 0,

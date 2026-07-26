@@ -392,6 +392,7 @@ pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTra
                     let ok = match intr {
                         IntrinsicId::MtpLogits => profile.has_mtp_logits,
                         IntrinsicId::MtpDrafts => profile.has_mtp_drafts,
+                        IntrinsicId::AttnScore => profile.has_attn_score,
                         IntrinsicId::ValueHead => profile.has_value_head,
                         _ => true,
                     };
@@ -587,6 +588,10 @@ fn intrinsic_type_ok(
         IntrinsicId::Layer => dtype == DType::U32 && shape.is_scalar(),
         // `[k]` I32 draft tokens (k = row count, trace-known).
         IntrinsicId::MtpDrafts => dtype == DType::I32 && shape.rank() == 1 && shape.dims()[0] >= 1,
+        // `[num_heads, kv_len]`. Both dims are backend-shaped — `kv_len` is
+        // the request's live length, which is not trace-known — so like
+        // `query` this only pins rank and dtype.
+        IntrinsicId::AttnScore => dtype == DType::F32 && shape.rank() == 2,
     }
 }
 
@@ -1153,6 +1158,131 @@ mod tests {
                 stage: Stage::Prologue
             })
         ));
+    }
+
+    /// `attn_score` only exists after the layer's attention has run, so
+    /// `OnAttnProj` — which fires *before* it — must be rejected. Accepting it
+    /// there would hand a policy the previous layer's scores (or an unwritten
+    /// buffer) with no diagnostic.
+    #[test]
+    fn attn_score_rejected_before_attention_runs() {
+        let c = TraceContainer {
+            names: vec![],
+            channels: vec![chan(Shape::vector(4), DType::I32, HostRole::Reader, false)],
+            ports: vec![],
+            stages: vec![StageProgram {
+                stage: Stage::OnAttnProj,
+                ops: vec![
+                    Op::IntrinsicVal {
+                        intr: IntrinsicId::AttnScore,
+                        shape: Shape::matrix(4, 32),
+                        dtype: DType::F32,
+                    },
+                    Op::ReduceArgmax(0),
+                    Op::ChanPut { chan: 0, value: 1 },
+                ],
+            }],
+            externs: alloc::vec::Vec::new(),
+        };
+        assert!(matches!(
+            bind(c, ModelProfile::dummy()),
+            Err(ValidateError::IntrinsicWrongStage {
+                intr: IntrinsicId::AttnScore,
+                stage: Stage::OnAttnProj
+            })
+        ));
+    }
+
+    #[test]
+    fn attn_score_accepted_at_on_attn() {
+        let c = TraceContainer {
+            names: vec![],
+            channels: vec![chan(Shape::vector(4), DType::I32, HostRole::Reader, false)],
+            ports: vec![],
+            stages: vec![StageProgram {
+                stage: Stage::OnAttn,
+                ops: vec![
+                    Op::IntrinsicVal {
+                        intr: IntrinsicId::AttnScore,
+                        shape: Shape::matrix(4, 32),
+                        dtype: DType::F32,
+                    },
+                    Op::ReduceArgmax(0),
+                    Op::ChanPut { chan: 0, value: 1 },
+                ],
+            }],
+            externs: alloc::vec::Vec::new(),
+        };
+        assert!(bind(c, ModelProfile::dummy()).is_ok());
+    }
+
+    /// A driver without the capture path must make the program fail at BIND.
+    /// The buffer is otherwise simply never written, and a policy reading it
+    /// would silently rank on garbage.
+    #[test]
+    fn attn_score_rejected_when_driver_lacks_capture() {
+        let mut profile = ModelProfile::dummy();
+        profile.has_attn_score = false;
+        let c = TraceContainer {
+            names: vec![],
+            channels: vec![chan(Shape::vector(4), DType::I32, HostRole::Reader, false)],
+            ports: vec![],
+            stages: vec![StageProgram {
+                stage: Stage::OnAttn,
+                ops: vec![
+                    Op::IntrinsicVal {
+                        intr: IntrinsicId::AttnScore,
+                        shape: Shape::matrix(4, 32),
+                        dtype: DType::F32,
+                    },
+                    Op::ReduceArgmax(0),
+                    Op::ChanPut { chan: 0, value: 1 },
+                ],
+            }],
+            externs: alloc::vec::Vec::new(),
+        };
+        assert!(matches!(
+            bind(c, profile),
+            Err(ValidateError::IntrinsicUnavailable {
+                intr: IntrinsicId::AttnScore
+            })
+        ));
+    }
+
+    /// The score row is `[num_heads, kv_len]`; a rank-1 or non-F32 read is a
+    /// different tensor and must not bind.
+    #[test]
+    fn attn_score_type_rule_pins_rank_and_dtype() {
+        for (shape, dtype, chan_shape) in [
+            (Shape::new(&[4, 8, 4]).unwrap(), DType::F32, Shape::matrix(4, 8)),
+            (Shape::matrix(4, 32), DType::I32, Shape::vector(4)),
+        ] {
+            let c = TraceContainer {
+                names: vec![],
+                channels: vec![chan(chan_shape, DType::I32, HostRole::Reader, false)],
+                ports: vec![],
+                stages: vec![StageProgram {
+                    stage: Stage::OnAttn,
+                    ops: vec![
+                        Op::IntrinsicVal {
+                            intr: IntrinsicId::AttnScore,
+                            shape,
+                            dtype,
+                        },
+                        Op::ReduceArgmax(0),
+                        Op::ChanPut { chan: 0, value: 1 },
+                    ],
+                }],
+                externs: alloc::vec::Vec::new(),
+            };
+            assert!(matches!(
+                bind(c, ModelProfile::dummy()),
+                Err(ValidateError::IntrinsicTypeRule {
+                    intr: IntrinsicId::AttnScore,
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]

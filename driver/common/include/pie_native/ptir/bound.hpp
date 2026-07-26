@@ -364,6 +364,7 @@ inline bool map_intrinsic(std::uint16_t intr, Intrinsic& out) {
         case PTIR_INTR_VALUE_HEAD: out = Intrinsic::ValueHead; return true;
         case PTIR_INTR_LAYER: out = Intrinsic::Layer; return true;
         case PTIR_INTR_MTP_DRAFTS: out = Intrinsic::MtpDrafts; return true;
+        case PTIR_INTR_ATTN_SCORE: out = Intrinsic::AttnScore; return true;
         default: return false;
     }
 }

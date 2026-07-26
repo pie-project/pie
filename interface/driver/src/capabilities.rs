@@ -81,6 +81,13 @@ pub struct DriverCapabilities {
     /// post-rope, so the score compares against the keys as cached.
     #[serde(default)]
     pub has_kv_envelopes: bool,
+    /// The driver can observe per-position softmax attention weights at an
+    /// `OnAttn` tap (`IntrinsicId::AttnScore`), for H2O/TOVA-style eviction.
+    /// Requires a score-observing attention kernel, and is refused for
+    /// soft-capped or sliding-window attention, where the captured row is not
+    /// the softmax those policies are defined over.
+    #[serde(default)]
+    pub has_attn_score: bool,
     /// Descriptor-port tags the driver can resolve on-device for decode envelopes.
     #[serde(default)]
     pub device_geometry_port_mask: u32,

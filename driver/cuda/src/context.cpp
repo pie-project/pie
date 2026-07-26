@@ -792,6 +792,7 @@ int Context::Impl::load_model(
             {"has_mtp_drafts", false},
             {"has_value_head", false},
             {"has_kv_envelopes", false},
+            {"has_attn_score", false},
             {"max_forward_tokens",
              static_cast<std::uint32_t>(std::max(1, c.max_model_len))},
             {"max_forward_requests", 256},
@@ -1749,6 +1750,12 @@ int Context::Impl::load_model(
         {"has_mtp_drafts", false},
         {"has_value_head", false},
         {"has_kv_envelopes", has_kv_envelopes},
+        // Track B layer 2: the AttnScore intrinsic exists in the ABI but this
+        // driver does not yet materialize scores at OnAttn, so the capability
+        // stays false and `bind_program` rejects such a program loudly
+        // (dispatch.cu stage/intrinsic gate) instead of binding a program that
+        // would read an unwritten buffer.
+        {"has_attn_score", false},
         // RV-26: PIE_DEVICE_PORT_ATTN_MASK is deliberately NOT advertised.
         // The runtime classifies masked device-carried decode into the
         // DecodeEnvelope class exactly when this mask claims the port, but

@@ -74,6 +74,7 @@ pub struct DummyDriverOptions {
     pub has_mtp_logits: bool,
     pub has_mtp_drafts: bool,
     pub has_value_head: bool,
+    pub has_attn_score: bool,
     pub callback_delay_ms: u64,
     pub reject_launches: bool,
     pub reject_launches_remaining: u32,
@@ -105,6 +106,7 @@ impl Default for DummyDriverOptions {
             has_mtp_logits: true,
             has_mtp_drafts: true,
             has_value_head: true,
+            has_attn_score: true,
             callback_delay_ms: 0,
             reject_launches: false,
             reject_launches_remaining: 0,
@@ -134,6 +136,7 @@ struct ProgramIntrinsics {
     query: Option<ValueType>,
     value_head: Option<ValueType>,
     mtp_drafts: Option<ValueType>,
+    attn_score: Option<ValueType>,
 }
 
 #[derive(Debug, Clone)]
@@ -326,6 +329,7 @@ impl DummyDriver {
                 has_mtp_logits: options.has_mtp_logits,
                 has_mtp_drafts: options.has_mtp_drafts,
                 has_value_head: options.has_value_head,
+                has_attn_score: options.has_attn_score,
                 // The dummy driver has no real KV keys, so it can never honour
                 // the `envelope_dot` contract.
                 has_kv_envelopes: false,
@@ -1126,6 +1130,7 @@ impl DummyDriver {
             has_mtp_logits: self.capabilities.has_mtp_logits,
             has_mtp_drafts: self.capabilities.has_mtp_drafts,
             has_value_head: self.capabilities.has_value_head,
+            has_attn_score: self.capabilities.has_attn_score,
             kernels: vec![KernelInfo {
                 name: "boom".to_string(),
                 sink_scope: None,
@@ -1662,6 +1667,7 @@ fn collect_intrinsics(bound: &BoundTrace) -> ProgramIntrinsics {
                 IntrinsicId::Query => &mut out.query,
                 IntrinsicId::ValueHead => &mut out.value_head,
                 IntrinsicId::MtpDrafts => &mut out.mtp_drafts,
+                IntrinsicId::AttnScore => &mut out.attn_score,
                 IntrinsicId::Layer => continue,
             };
             target.get_or_insert(ValueType::new(*shape, *dtype));
@@ -1701,6 +1707,16 @@ fn build_pass_inputs(
                 .collect()
         })
         .unwrap_or_default();
+    let attn_score = intrinsics
+        .attn_score
+        .map(|ty| {
+            (0..2)
+                .map(|layer| {
+                    deterministic_attn_score(ty, base.wrapping_add(layer as u64 * 29))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     PassInputs {
         logits,
         mtp_logits,
@@ -1708,6 +1724,7 @@ fn build_pass_inputs(
         hidden,
         value_head,
         query,
+        attn_score,
     }
 }
 
@@ -1753,8 +1770,27 @@ fn deterministic_value(ty: ValueType, base: u64) -> Value {
     }
 }
 
-fn deterministic_drafts(ty: ValueType, base: u64, vocab: u32) -> Value {
-    let len = ty.shape.numel().max(1) as usize;
+/// `[num_heads, kv_len]` attention weights. Rows are normalised because the
+/// real intrinsic is a softmax output, and an eviction policy that reads a
+/// row summing to something other than 1 would behave differently here than
+/// on hardware — the dummy driver exists to catch exactly that class of drift.
+fn deterministic_attn_score(ty: ValueType, base: u64) -> Value {
+    let cols = ty.shape.dims().last().copied().unwrap_or(1).max(1) as usize;
+    let rows = (ty.shape.numel().max(1) as usize).div_ceil(cols);
+    let mut out = Vec::with_capacity(rows * cols);
+    for row in 0..rows {
+        let raw: Vec<f32> = (0..cols)
+            .map(|col| ((base.wrapping_add((row * cols + col) as u64) % 17) as f32) * 0.25)
+            .collect();
+        let max = raw.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = raw.iter().map(|v| (v - max).exp()).collect();
+        let total: f32 = exps.iter().sum();
+        out.extend(exps.into_iter().map(|v| v / total));
+    }
+    Value::F32(out)
+}
+
+fn deterministic_drafts(ty: ValueType, base: u64, vocab: u32) -> Value {    let len = ty.shape.numel().max(1) as usize;
     let mut drafts = Vec::with_capacity(len);
     for idx in 0..len {
         drafts.push(((base as u32 + idx as u32) % vocab.max(2)) as i32);
