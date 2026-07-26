@@ -827,6 +827,43 @@ Substitution happens on the decode call only, and only after
 non-split path. A split-KV plan derives its tile indices *from* the page counts,
 so a shorter list would silently attend over the wrong tiles.
 
+### 10.3b Compaction cost, and the two things that dominated it
+
+Compaction runs once per **layer** per fire, so unlike a host-side setup step it
+is not amortised over the model. As first built it cost 12 us/call at a 2K
+context, which is 336 us on a 28-layer model -- around 5% of a decode step, all
+of it overhead. Two things were responsible, and neither was the actual work:
+
+1. **A `cudaMallocAsync`/`cudaFreeAsync` pair per call** for the per-request
+   survivor counts. At decode batch sizes that allocation cost more than both
+   kernels together. The buffer is now caller-owned: `FirePageMask` already
+   allocates four device buffers once per fire, so a fifth is free and is reused
+   by every layer.
+2. **Three kernel launches** (count, scan, scatter) where two suffice. The only
+   thing the scatter needed from the scan was its own output base -- the
+   exclusive prefix of the per-request counts -- and with one block per request
+   that prefix is at most `num_requests` values long. Each block now sums it
+   itself. Recomputing an O(R) sum per block is far cheaper than the launch it
+   replaces.
+
+Measured in isolation with CUDA events (`PIE_PAGE_COMPACT_BENCH=1
+./bin/test_page_compact`), L40S, page_size 16:
+
+| pages/request | context | before | after | speedup |
+|---:|---:|---:|---:|---:|
+| 128 | 2K | 12.0 us | 5.0 us | 2.4x |
+| 1024 | 16K | 12.1-14.1 us | 6.4-7.5 us | ~1.9x |
+| 8192 | 128K | 29.8-31.0 us | 24.1-25.5 us | 1.24x |
+
+The speedup shrinks as the context grows because the long-context case is
+genuinely work-bound -- which is the right shape. Per decode step at 2K context
+this recovers roughly 200 us.
+
+Layers that emit no mask pay none of this: `compact` is gated on
+`written_for(L)`, so a program that taps a subset of layers is charged only for
+those. Quest and H2O write on every layer, so the figures above are their real
+per-fire cost divided by the layer count.
+
 ### 10.4 A latent DSL bug: the name table was emitted in first-use order
 
 `intern_name` assigns indices in first-use order; the container requires the

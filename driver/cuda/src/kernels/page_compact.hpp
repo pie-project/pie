@@ -45,6 +45,10 @@ void launch_compact_page_csr(
     const std::uint32_t* page_indptr_in,
     const std::uint32_t* last_page_lens_in,
     const std::uint8_t* keep,
+    // Caller-owned scratch, at least `num_requests` uint32. Owned by the caller
+    // because this runs once per LAYER per fire, and a cudaMallocAsync/FreeAsync
+    // pair costs more than both kernels put together at decode batch sizes.
+    std::uint32_t* scratch_counts,
     std::uint32_t keep_stride,
     int num_requests,
     std::uint32_t* page_indices_out,
