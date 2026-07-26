@@ -451,8 +451,27 @@ inline TranslateResult container_to_trace(const container::Container& c, const B
                     stage.puts.push_back({(ChannelId)op.chan, gid(op.args[0])});
                     break;   // defines 0 ids
                 }
-                case PTIR_OP_SINK_CALL:
-                    break;   // no result; tier-0 without kernels ignores the sink effect
+                case PTIR_OP_SINK_CALL: {
+                    // Defines 0 ids, but it is NOT free to drop: the sink is
+                    // how a mask value reaches the forward pass, so dropping it
+                    // here would silently turn a program that configures
+                    // attention into one that does not. Carry it through and
+                    // let the backend decide, exactly as for KernelCall — a
+                    // host with no sinks refuses at bind (`dispatch.cu`), and
+                    // tier-0's `launch_op` has no arm for the tag.
+                    //
+                    // The name index rides in `imm`; `Trace::names` resolves it.
+                    if (op.name_idx >= c.names.size()) {
+                        return fail("sink_call names an out-of-range sink");
+                    }
+                    Op o;
+                    o.code = OpCode::SinkCall;
+                    o.result_count = 0;
+                    o.imm = op.name_idx;
+                    for (std::uint32_t a : op.args) o.args.push_back(gid(a));
+                    stage.ops.push_back(std::move(o));
+                    break;
+                }
                 case PTIR_OP_KERNEL_CALL: {
                     // A second-party kernel is opaque to this lowering: it
                     // defines one SSA id of a declared type and names a kernel

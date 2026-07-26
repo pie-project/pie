@@ -140,12 +140,20 @@ pub mod kernel {
     }
 
     /// `attn_page_mask(mask)` — a configuration sink (overview §6.1): this
-    /// layer's attention consumes the page mask. Returns nothing. Recorded for
-    /// T11 precedence (must precede this layer's attention).
+    /// layer's attention consumes the page mask. Returns nothing.
+    ///
+    /// `mask` is `[p_max]`, one entry per page of the request's page list in
+    /// order; a nonzero entry keeps the page. It is recorded twice on purpose:
+    /// as an `Op::SinkCall` so the mask VALUE reaches the backend, and in the
+    /// session's sink list so T11 can check this call precedes the layer's
+    /// attention. Dropping the argument (as this did before it had a lowering)
+    /// makes the sink a no-op that still type-checks.
     #[track_caller]
     pub fn attn_page_mask(mask: impl AsTensor) {
         let span = Span::here();
-        let _ = mask.to_arg();
+        let (mask, _) = mask.to_arg().materialize();
+        let name = intern_name("attn_page_mask");
+        emit(Op::SinkCall { name, args: vec![mask] }, &[]);
         record_sink(String::from("attn_page_mask"), span, SinkScope::Attention);
     }
 }
