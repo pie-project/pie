@@ -928,6 +928,18 @@ int Context::Impl::load_model(
     const auto kv_format = kv_cache_format_from_string(
         cfg.batching.kv_cache_dtype, cfg.model.dtype);
     const bool use_cuda_graphs = true;
+    // Diagnostic escape hatch, replay only. Decode normally replays from a
+    // captured graph, and a capturing stream forbids the event syncs that
+    // every in-engine profiler and tensor dump needs — so the path that
+    // dominates throughput is the one path that cannot be measured. This
+    // drops only the replay cache; the decode PLAN stays in its graph-safe
+    // mode and the upfront lattice still runs, because turning those off
+    // changes what the two TP ranks each decide to do and wedges the group.
+    // Costs throughput; it is for measurement, not for serving.
+    const bool graph_replay_enabled = [] {
+        const char* v = std::getenv("PIE_CUDA_PREFILL_DECODE_NOGRAPHS");
+        return !(v != nullptr && v[0] != '\0' && v[0] != '0');
+    }();
     const auto runtime_quant_scratch_base =
         runtime_quant_scratch_spec(engine, /*max_tokens=*/0);
 
@@ -1364,7 +1376,10 @@ int Context::Impl::load_model(
 
     ForwardFn forward_fn;
     NativeSystemDrafter system_drafter;
-    auto* graph_cache_p = use_cuda_graphs ? own_emplace<ForwardGraphCache>() : nullptr;
+    auto* graph_cache_p =
+        (use_cuda_graphs && graph_replay_enabled)
+            ? own_emplace<ForwardGraphCache>()
+            : nullptr;
 
     model::DsV4Workspace* dsv4_ws_p = nullptr;
     model::KimiWorkspace* kimi_ws_p = nullptr;
