@@ -2,6 +2,7 @@
 name = "pie-dsl"
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
 authors = ["In Gim <in.gim@icloud.com>"]
 description = "The PTIR embedded DSL: a Tensor / Channel eDSL plus the neutral trace Builder that lowers stage closures into a canonical PTIR trace container. Tracing is its implementation strategy, not its identity; the author-facing ForwardPass/Pipeline/WorkingSet surface lives in `inferlet`."
 license = "Apache-2.0"

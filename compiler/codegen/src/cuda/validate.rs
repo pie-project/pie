@@ -1,17 +1,16 @@
 //! The region ABI checks the CUDA fused emitter gates on.
 //!
-//! Ported from `fused_codegen.hpp`; `validate_generated_region` is what decides
-//! whether a region can be emitted at all, and `second_party_region_supported`
-//! names the one second-party kernel this backend launches.
+//! `validate_generated_region` is what decides whether a region can be emitted
+//! at all, and `second_party_region_supported` names the one second-party
+//! kernel this backend launches.
 
-use alloc::string::{String, ToString};
+use crate::error::{EmitError, RegionForm};
+use crate::wellformed::{region_ranges_valid, value_types_valid};
 
 use pie_ir::op::Op;
 use pie_ir::registry::Stage;
 use pie_ir::types::DType;
-use pie_plan::{
-    CompiledStage, NodeIndex, Region, RegionKind, ScheduleTemplate, library_op_for_tag,
-};
+use pie_plan::{CompiledStage, Region, RegionKind, ScheduleTemplate, library_op_for_tag};
 
 /// `second_party_region_supported` — `envelope_dot` is the only second-party
 /// kernel this backend launches, so anything else fails at bind rather than
@@ -71,19 +70,21 @@ pub fn second_party_region_supported(stage: &CompiledStage, region: &Region) -> 
 }
 
 /// `validate_generated_region`.
-pub fn validate_generated_region(stage: &CompiledStage, region: &Region) -> Result<(), String> {
+///
+/// Also the gate `region_analysis` asks before declaring a region bindable, so
+/// everything emission refuses has to be refused here too — a region that
+/// passes analysis and then fails emission reaches the driver as an error
+/// kernel instead of a tier-0 fallback.
+pub fn validate_generated_region(stage: &CompiledStage, region: &Region) -> Result<(), EmitError> {
     if matches!(region.kind, RegionKind::Library(_))
         || region.schedule == ScheduleTemplate::Library
         || region.nodes.is_empty()
     {
-        return Err("fused CUDA emitter requires a non-library generated region".to_string());
+        return Err(EmitError::FusedRequiresGeneratedRegion);
     }
-    let mut previous = NodeIndex(0);
-    let mut have_previous = false;
+    value_types_valid(stage)?;
+    region_ranges_valid(stage, region, RegionForm::Fused)?;
     for &node in &region.nodes {
-        if node.index() >= stage.normalized.ops.len() || (have_previous && node <= previous) {
-            return Err("generated region nodes are invalid or unordered".to_string());
-        }
         let op = &stage.normalized.ops[node.index()];
         // Asked through the same classifier `region_kind_for_node` used to
         // build the region, so the check cannot disagree with the decision it
@@ -92,10 +93,8 @@ pub fn validate_generated_region(stage: &CompiledStage, region: &Region) -> Resu
         // `cumsum`, `cumprod` or `matmul` through to an emitter with no arm
         // for it.
         if library_op_for_tag(op.tag()).is_some() {
-            return Err("generated region contains a non-generated boundary".to_string());
+            return Err(EmitError::GeneratedRegionHasBoundary);
         }
-        previous = node;
-        have_previous = true;
     }
     Ok(())
 }

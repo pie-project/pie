@@ -22,14 +22,13 @@ pub fn generate_c_header() -> String {
     s.push_str(
         "// DO NOT EDIT. Regenerate: PTIR_REGEN=1 cargo test -p pie-compiler-tests --test ptir_header\n",
     );
-    s.push_str("// Container layout: interface/sampling-ir/PTIR-CONTAINER.md\n");
     s.push_str("#pragma once\n#include <stdint.h>\n\n");
 
     s.push_str(&format!(
         "#define PTIR_MAGIC \"PTIR\"\n#define PTIR_VERSION {PTIR_VERSION}\n"
     ));
     s.push_str(&format!(
-        "// v1.1 extern channels (PTIR-CONTAINER.md section 6b): wire-version 2 iff externs\n#define PTIR_VERSION_EXTERN {}\nenum PtirExternDir : uint8_t {{ PTIR_EXTERN_IMPORT = 0, PTIR_EXTERN_EXPORT = 1 }};\n\n",
+        "// v1.1 extern channels: wire-version 2 iff the container declares externs\n#define PTIR_VERSION_EXTERN {}\nenum PtirExternDir : uint8_t {{ PTIR_EXTERN_IMPORT = 0, PTIR_EXTERN_EXPORT = 1 }};\n\n",
         pie_ir::PTIR_VERSION_EXTERN
     ));
     s.push_str(&format!(

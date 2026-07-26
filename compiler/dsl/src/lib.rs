@@ -7,12 +7,12 @@
 //!
 //! This crate is the boundary-agnostic authoring core: the `Tensor`/`Channel`
 //! eDSL, the trace-recording session, the SDK span lints, and the neutral
-//! [`Builder`](builder::Builder) that lowers stage closures + descriptor-port
+//! [`Builder`] that lowers stage closures + descriptor-port
 //! bindings into the IR's canonical
 //! [`TraceContainer`](pie_ir::container::TraceContainer). Tracing is its
 //! *implementation strategy*, not its identity — hence `pie-dsl`.
 //!
-//! It does **not** bind (D6: the guest does not bind; `forward-pass.program` is the
+//! It does **not** bind (the guest does not bind; `forward-pass.program` is the
 //! authoritative gate) and knows nothing of WIT. The author-facing lifetime
 //! objects (`ForwardPass`, `Pipeline`, `WorkingSet`, host `Channel` transport)
 //! live in `inferlet`, which wraps the WIT resources and drives this builder.
@@ -45,7 +45,7 @@
 //! assert_ne!(traced.identity_hash(), 0);
 //! ```
 //!
-//! ## Deviations from the overview (Rust limitations; flagged, manager-approved)
+//! ## Deviations from the spec (Rust limitations; flagged, manager-approved)
 //! - Model constants are functions (`intrinsics::vocab()`), not bare paths.
 //! - Bare integer-literal operands (`add(x, 1)`) resolve to `u32`; explicit
 //!   `i32` constants use `Tensor::constant(-1i32)`.
@@ -77,7 +77,7 @@ pub use pie_ir as ptir;
 pub use pie_ir::registry::{Port, Stage};
 pub use pie_ir::types::{DType, Shape, ValueType};
 
-/// Glob-import surface for the DSL eDSL: the verbatim overview op/value names.
+/// Glob-import surface for the DSL eDSL op/value names.
 /// The author-facing `ForwardPass`/`Pipeline`/`WorkingSet` surface lives in
 /// `inferlet::ptir::prelude`, which re-exports this plus those wrapper types.
 pub mod prelude {

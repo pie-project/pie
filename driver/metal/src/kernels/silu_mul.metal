@@ -34,6 +34,34 @@ template <typename T>
   out[tid] = T(float(sil) * float(up[tid]));
 }
 
+// Prefill variant: rows are a uniform `row_pitch` elements apart, so the whole
+// prompt runs as one dispatch.  tid.y selects the row; the arithmetic is identical.
+template <typename T>
+[[kernel]] void silu_mul_strided(
+    const device T* gate [[buffer(0)]],
+    const device T* up   [[buffer(1)]],
+    device T* out        [[buffer(2)]],
+    const constant int& width [[buffer(3)]],
+    const constant int& row_pitch [[buffer(4)]],
+    uint2 tid [[thread_position_in_grid]]) {
+  (void)width;
+  const size_t i = size_t(tid.y) * size_t(row_pitch) + size_t(tid.x);
+  T g   = gate[i];
+  T sg  = sigmoid_mlx(g);
+  T sil = T(float(g) * float(sg));
+  out[i] = T(float(sil) * float(up[i]));
+}
+
+#define instantiate_silu_mul_strided(name, itype)                 \
+  template [[host_name("silu_mul_strided_" #name)]]               \
+  [[kernel]] void silu_mul_strided<itype>(                        \
+      const device itype*, const device itype*, device itype*,    \
+      const constant int&, const constant int&, uint2);
+
+instantiate_silu_mul_strided(float32, float)
+instantiate_silu_mul_strided(float16, half)
+instantiate_silu_mul_strided(bfloat16, bfloat)
+
 #define instantiate_silu_mul(name, itype)                         \
   template [[host_name("silu_mul_" #name)]]                       \
   [[kernel]] void silu_mul<itype>(                                \

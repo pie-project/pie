@@ -1,9 +1,10 @@
-//! Stage-signature identity, formerly asserted through the `stage_key` shim.
+//! Stage-signature identity, asserted against the planner directly rather
+//! than through any wrapper that forwards to
+//! `compile_stage_at(..).signature`.
 //!
-//! The shim only forwarded to `compile_stage_at(..).signature`, so it is gone;
-//! these checks now exercise the planner directly. They pin the property the
-//! scheduler depends on: the signature is stable across passes that share an
-//! epilogue and discriminating when the program or its channels differ.
+//! These pin the property the scheduler depends on: the signature is stable
+//! across passes that share an epilogue, and discriminating when the program
+//! or its channels differ.
 
 use pie_ir::registry::Stage;
 use pie_ir::validate::BoundTrace;
@@ -112,7 +113,7 @@ fn same_epilogue_two_passes_same_key() {
         externs: vec![],
     });
 
-    assert_ne!(a.hash, b.hash, "the two passes are different programs (C3)");
+    assert_ne!(a.hash, b.hash, "the two passes are different programs");
     let ka = stage_key(&a, Stage::Epilogue).unwrap();
     let kb = stage_key(&b, Stage::Epilogue).unwrap();
     assert_eq!(

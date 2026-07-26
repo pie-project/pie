@@ -3726,3 +3726,746 @@ expected value:
 
 `waves.py` / `turnover.py` (session artifacts, outside the repo) implement the
 gap decomposition and the in-gap lifecycle census used here.
+
+## §20.19 — quick test of the two fix directions: both valid, and correctly sized
+
+§20.18 named two directions without testing either. Both are now measured, and
+§20.18's idle accounting is corrected here.
+
+### Correction: measure TRUE GPU idle, not scheduler-empty time
+
+§20.18 computed the gap as `next.dispatch_started_us - this.native_complete_us`.
+That is when the SCHEDULER resumed, not when the GPU got work. The GPU is idle
+until `launch_returned_us`, so the correct gap is
+`max(prev.native_complete_us, launch_returned_us) - prev.native_complete_us`,
+and the difference between the two is host submit time with the GPU stopped.
+
+| run | TRUE idle | before PREFILL wave | of which sched-empty | of which host submit |
+| --- | --------: | ------------------: | -------------------: | -------------------: |
+| homo 512  | 1.35 s (7.9%)  | 1.19 s (**88%**) | 1.03 s | 0.16 s |
+| homo 1024 | 1.30 s (7.7%)  | 1.15 s (**88%**) | 1.08 s | 0.07 s |
+| mix 512   | 11.07 s (39.7%)| 9.04 s (**82%**) | 3.60 s | **5.44 s** |
+
+The §20.18 headline survives in a sharper form: **idle before a decode wave is
+0.00 s of scheduler-empty time in every run** (504-567 boundaries each); the
+only thing that ever leaves the scheduler with nothing to dispatch is a prefill
+wave. What the corrected accounting ADDS is the submit term: on mixed-phase,
+**5.44 s of a 27.87 s run — 19.5% — is the host submitting a prefill wave while
+the GPU sits idle**, which the §20.18 metric could not see at all.
+
+Reconfirmed on the current build (`--total-pages 8192`, 528 waves): 87% of true
+idle before the 23 prefill waves, decode-wave sched-empty exactly 0.00 s.
+
+### Direction 1 — KV-aware admission: VALID, +13.6% measured
+
+Right-sizing the admission cap to the KV budget is approximated by lowering
+`--concurrency` at a fixed pool. Mixed-phase, 8192 pages, n=2:
+
+| concurrency | tok/s | vs conc 512 |
+| ---: | ---: | ---: |
+| 128 | 9059 | -24% |
+| 192 | 11424 | |
+| 256 | 12293 | |
+| **320** | **13591 / 13385 (mean 13488)** | **+13.6%** |
+| 384 | 12251 / 12589 (mean 12420) | +4.6% |
+| 512 (today's cap) | 11424 / 12328 (mean 11876) | — |
+
+conc 320's WORST run beats conc 512's BEST by 8.6%, so this clears the
+mixed-phase noise band (identical configs spread 9844-12328). Ratio against
+vLLM moves **0.643 -> 0.863**. The optimum matches the arithmetic: a 530-token
+prompt is 33 pages, so 8192 pages holds ~248 full prompts, and the best cap
+sits just above that once short-prompt lanes are counted.
+
+This lever is worth nothing on the homogeneous workload, where prompts are
+short and KV is not the constraint — confirmed by the page-headroom null below.
+
+### Direction 2 — overlap prefill preparation with the running decode wave: VALID
+
+Not implementable as a knob, so measured as headroom instead. Removing the
+prefill-adjacent idle would give **+5.3%** on homogeneous conc 512
+(31383 -> 33046 vs vLLM 32755 = **1.009**, i.e. it flips the sign of the only
+remaining loss) and **+48%** on mixed-phase conc 512.
+
+Two knobs confirm it needs real work rather than tuning:
+
+- **Not page-bound.** Homogeneous conc 512 at 8192 vs 32768 pages: 30831 vs
+  30565 tok/s, and idle 0.94 s vs 1.16 s — a null. The homogeneous prefill
+  stall is host-side preparation, not page starvation. (Contrast mixed-phase,
+  where pages DO matter: 11703 -> 13472 at 16384.)
+- **Not fixable by pipeline depth.** `PIE_SCHED_MAX_IN_FLIGHT` 2/3/4 on
+  mixed-phase gave 11115 / 10864 / 12204 — inside the noise band, no trend.
+  `kSchedulerMaxInFlight = 3` with `kUploadStagingDepth = 13`
+  (driver/cuda/src/runahead.hpp) already sizes the staging pools for depth 3,
+  so this is not a staging limit; the prefill wave's submit simply cannot start
+  until its predecessor completes.
+
+### Ordering
+
+Direction 1 is a policy change with a proven +13.6% on the workload that
+exposes it, and is the cheaper of the two. Direction 2 is a pipeline
+restructuring worth +5.3% on homogeneous conc 512 — which is precisely the
+4.2% deficit that started this whole investigation — and +48% on mixed-phase.
+They are independent: 1 addresses sched-empty idle, 2 addresses both the
+sched-empty and the 5.44 s submit term.
+
+## §20.20 — seat-release-on-park is refuted, and so is the KV story behind it
+
+§20.19's Direction 1 was rejected as heuristic (it predicts a process's page
+demand). The structural replacement was: a process that parks on pages should
+YIELD its execution seat, so effective concurrency self-tunes to whatever the
+pool supports with no constant to choose. That premise is now measured, and it
+is false.
+
+### Instrumentation
+
+`ResidencyPlanner::park_census()` returns `(stats.parks, waiters)` — the
+cumulative park count and the current parked width. Both are emitted on every
+`scheduler_wave` record (`planner_parks_total`, `planner_parked_now`). Sampling
+the width ALONE is what nearly produced a false refutation in the other
+direction: parks shorter than the ~40 ms inter-wave sample vanish from it, so
+the cumulative counter is the one that decides.
+
+### Result: parking is a 1.4-second startup transient
+
+| run | span | GPU idle | parks (whole run) | parks/fire |
+| --- | ---: | ---: | ---: | ---: |
+| mixed 512 @ 8192 pages  | 26.59 s | 8.14 s (30.6%) | **512** | 0.002 |
+| mixed 320 @ 8192 pages  | 21.05 s | 3.63 s (17.2%) | **0** | 0 |
+| mixed 512 @ 16384 pages | 22.37 s | 4.29 s (19.2%) | **0** | 0 |
+| homogeneous 512 @ 8192  | 16.53 s | 1.00 s (6.1%)  | **0** | 0 |
+
+All 512 parks in the only run that parks at all land in the first 1.39 s
+(15 parks at t=0.00, 264 by t=1.10, 512 by t=1.39) — the opening cohort's
+simultaneous prefill against a pool that cannot hold 512 x 33 pages at once.
+And that window is not where the time goes:
+
+    idle in the first 3 s: 0.49 s over  48 waves
+    idle after 3 s:        7.65 s over 353 waves
+
+**After t=3 s there are ZERO parks and 7.65 s of idle.** A seat that is
+released on park would therefore be released 512 times, all during startup,
+against 6% of the run's idle. The lever does not exist. Direction 1 is closed
+in both its heuristic and its structural form.
+
+### What this also corrects in §20.18/§20.19
+
+The page-headroom effect is REAL but is not what those sections said it was.
+Re-measured n=2 at conc 512 mixed: 8192 pages gives 11238/11318 (mean 11278),
+16384 gives 12127/13060 (mean 12594) — **+11.7%**, with both large-pool runs
+above both small-pool runs. But since the large-pool run parks ZERO times and
+the small-pool run parks only during startup, the mechanism is NOT page
+starvation, and "pie admits by process count and the pool thrashes" is wrong.
+Whatever the pool buys, it is not relief from parking.
+
+Likewise the conc-320 win (13798 vs 10926 here; 13488 vs 11876 in §20.19) is
+not KV-aware admission. conc 320 parks zero times at the SAME 8192 pages that
+makes conc 512 park. The difference is wave WIDTH:
+
+| | waves | rows p50 | `guest_wake_us` p50 / max | idle before prefill |
+| --- | ---: | ---: | ---: | ---: |
+| conc 512 | 409 | 1024 | 15.0 ms / **672 ms** | 6.70 s |
+| conc 320 | 590 | 640  | 11.9 ms / **95 ms**  | 3.89 s |
+
+Same 1,262,506 tokens either way. The narrower fleet wakes and resumes faster,
+and the wake round trip is what sits on the GPU's critical path whenever the
+next wave carries prefill.
+
+### Where this leaves the fix
+
+Direction 2 is now the ONLY surviving lever, and the evidence for it is
+stronger than before: when a wave carries prefill, the fleet-wide
+wake -> resume -> first-submit round trip is exposed on the GPU's critical
+path, and its cost grows superlinearly with fleet width (672 ms at 1024 rows
+against 95 ms at 640). Run-ahead already hides this for steady-state decode —
+decode-wave scheduler-empty idle is 0.00 s in every run ever measured here —
+but it cannot hide it for a process's FIRST frame, which has nothing queued
+ahead of it. Extending run-ahead to cover the first frame of a newly admitted
+process is the fix, and it involves no predicted quantity.
+
+## 20.21 First-frame run-ahead: BUILT, MEASURED, REFUTED — and it relocated the root cause
+
+§20.20 ended by proposing the one surviving fix: extend run-ahead to cover a
+newly admitted process's FIRST frame, so a successor prepares and submits it
+while its predecessor still executes. That was built and measured. It is a
+clean **-5.7% regression**, and the reason it fails overturns §20.18-§20.20's
+attribution of the idle.
+
+### What was built
+
+`ensure_execution_admitted` swapped its unconditional `acquire_owned().await`
+for a `try_acquire_owned()`; on failure a bind-admitted process was allowed to
+submit its FIRST frame on its bind permit alone and only then park for a seat.
+One `forward.submit` carries every `frame-size` slot, so a single pass is
+exactly one whole frame and can never strand a partial one. Sizing needed no
+new constant: the bind pool is already 2x the execution limit ("the executing
+cohort plus ONE staged cohort"), which bounds run-ahead occupancy to exactly
+one cohort. The park posted `notify_process_suspend` so the wait-all quorum
+would not wait on a lane that was itself waiting for a seat, and
+`ProcessCtx::drop` was widened to post the Terminate leave for a process that
+retires having only ever run ahead (it reached the wait-set but owes no slot
+release). The frame policy needed no change at all: `on_execution_slot_consumed`
+already guards its `joins_in_flight` insert on `staged`, and a lane that has
+fired is no longer staged.
+
+The mechanism worked exactly as designed. `runahead_first_frames = 3584` =
+4096 - 512, i.e. every process except the seated first cohort; the entries
+arrive in bursts (p50 +32, max +247) and the first 512 complete by t = 0.26 s,
+while cohort A still has 2.1 s of decode left. Prefill really was prepared and
+submitted an entire generation early, and `planner_parks_total = 0` — the extra
+resident KV never starved the pool.
+
+### The measurement
+
+Homogeneous conc 512, 8192 pages, alternating arms, n=2:
+
+| arm | run 1 | run 2 |
+| --- | ----: | ----: |
+| off | 31450 | 31210 |
+| on  | 28927 | 28385 |
+
+Wave decomposition of a separate instrumented pair (30831 off / 29067 on):
+
+| | waves | tok/wave | TRUE idle | before prefill | decode |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| off | 528 | 1270 | 1.03 s (6.2%) | 0.89 s | **0.13 s** |
+| on  | 559 | 1200 | 2.26 s (12.8%) | 1.15 s | **1.10 s** |
+
+Identical total tokens (670,634). Scheduler-loop cost is unchanged
+(`loop_mailbox` 0.97 -> 1.08 s, `loop_park` 9.30 -> 9.28 s), so the suspend /
+resume churn is NOT the cost. The engine simply idles more.
+
+### Why it fails — and what that proves about the root cause
+
+Two facts kill the premise.
+
+**1. The boundary hole did not move.** In the OFF arm every one of the 8 top
+gaps precedes a fat prefill wave (8398 tokens / 442 fires), 39-203 ms each,
+0.93 s of the 1.03 s total. In the ON arm the boundary gaps are still there and
+still the same size — 88, 100, 106, 118, 172 ms — but they now precede a
+**decode** wave (1024 tokens / 1024 fires), because the prefill had already run
+2 seconds earlier. Prefetching the prefill moved the prefill and left the hole
+untouched.
+
+**2. The hole followed the join.** 93% of the ON arm's 2.26 s of idle lands
+within 350 ms of a run-ahead burst. Every fleet-wide arrival of new lanes
+bought its own hole, so the run bought two per cohort instead of one.
+
+That relocates the cause. §20.18 measured that 100%/88%/82% of GPU idle sits
+immediately before a prefill wave and concluded the idle IS prefill
+preparation. It is not: a cohort boundary is simply where the fleet-wide JOIN
+and the prefill coincide, and the idle belongs to the join. The cost is 512
+guest exits plus 512 admissions plus 512 first submits — a fleet-wide host
+round trip that the wait-all seal converts into a GPU hole, and it costs the
+same 100-ish ms whenever it happens. §20.13's "turnover barrier" was closer to
+right than §20.18 gave it credit for; what §20.13 got wrong was the fix shape,
+not the location.
+
+This is the same wall §20.14 #6/#7 and §20.18's two share-based designs hit
+from the other side. A fleet-wide join is a GPU hole *because* the seal is
+wait-for-all; relaxing the quorum removes the hole but splits the fleet into
+sub-cohorts that never re-merge (run-ahead lead is hysteretic, frame.rs
+:1804-1820), and all four quorum designs measured worse. Moving the join
+earlier, as here, just moves the hole. Both levers on the same joint are now
+closed by measurement.
+
+### Why a parked successor cannot help, structurally
+
+A lane's run-ahead lead IS queued work. A successor that submits one frame and
+then parks has its queue drained within a wave or two and rejoins lead-less —
+exactly as it would have without the change — so it pays a SECOND fleet-wide
+host round trip at the boundary anyway. Letting it keep submitting instead of
+parking is not an option either: with 4096 processes spawned and a 1024 bind
+pool that is precisely a 2x execution cap, which §20.14 #2 measured at
+26543 vs 30402. And it cannot queue more than one frame regardless: frame N+1
+needs frame N's sampled token, so the maximum possible pre-staged reserve is
+one prefill.
+
+### The one variant this leaves open (NOT built)
+
+The prefill wave is 83.6 ms of GPU (p50) against a boundary hole of ~114 ms.
+So a successor's prefill frame could cover most of the hole — but only if it is
+submitted early and **held undispatched** until the seat opens, instead of
+dispatching on arrival as it did here. That needs a new lane state in the frame
+policy (frames present, not awaited, not dispatch-eligible, released on seat
+acquisition and on terminate). Ceiling is 8 boundaries x 83.6 ms = 0.67 s of
+16.5 s = **+4.1%**, which is ~32100 against vLLM's 32755 — still short of
+parity on this arm, and it lands in the deadlock-prone part of the scheduler.
+Recorded, not attempted.
+
+### Status
+
+REVERTED — the tree carries none of this. `park_census` /
+`planner_parks_total` from §20.20 stay; `runahead_first_frames` went with the
+experiment.
+
+---
+
+## §20.22 — the BANKED first-frame reserve: +3.6% measured, then refuted on liveness
+
+§20.21 closed first-frame run-ahead in its *dispatching* form and left exactly
+one variant open: submit the first frame early but **hold it undispatched**,
+releasing it only when the GPU would otherwise stand still. That variant is now
+built, measured and closed. It is a real throughput win and a structural
+liveness break, and both halves are worth recording.
+
+### What was built
+
+A `held` lane state in the frame policy — a lane that is *present* (its frame
+is assembled and counted) but neither **awaited** by the wait-all seal nor
+**dispatchable** by `seal()`. A `runahead_held` process set arms it; the arm
+also drops the owner's `staged` earmark, because a reserve is not a successor
+the boundary should wait for (its frame is already assembled, so there is no
+fire to gather).
+
+Release had to be moved twice before it was live, and each move is a lesson:
+
+1. **Release at slot consumption** (the obvious design) **deadlocks.** An
+   unseated guest blocks on its first frame's *result*, so it never reaches the
+   next `submit` that would take the seat: `seal -> result -> submit -> seat ->
+   seal`. Measured 865 tok/s, 2063/4096 requests failed.
+2. **Release when the GPU is idle and nothing is sealable** fixes that, but a
+   banked reserve that still held its `staged` earmark blocked the boundary
+   through the `joining` interlock instead — the same cycle one indirection
+   out. (`[frame-stall]` in `soak`, a 120 s hang in `tinyswap`.)
+3. **Final shape, and the only correct one:** release inside `plan_dispatch`
+   when `!executing && (joining || missing > 0 || !have_seal_candidate())` —
+   nothing is in flight *and* this boundary cannot dispatch for any reason. The
+   `!executing` key is what makes it unconditional progress: releasing cannot
+   reorder anything, because there is nothing in flight to reorder against.
+   (Same argument the mode-2 rebind escape rests on.)
+
+### It works, and the mechanism is confirmed
+
+Homogeneous conc 512, 4096 requests, 8192 pages, n=5 per arm, interleaved:
+
+```
+  off  31039  31331  29975  31236  30645   mean 30845
+  on   32184  31728  32025  31911  31931   mean 31956   +3.6%
+```
+
+The arms do not overlap: the on-arm's **minimum** (31728) beats the off-arm's
+**maximum** (31331), 5/5 vs 5/5. The on-arm is also four times tighter (1.4% vs
+4.5% spread) — consistent with the boundary hole being the variance source.
+vs vLLM 32755: **0.958 -> 0.976**.
+
+Wave decomposition of an instrumented pair (30695 off / 31414 on) confirms the
+mechanism rather than a side effect:
+
+```
+  off  528 waves  24 prefill waves  idle 1.09s  (prefill 1.00  decode 0.09)
+  on   528 waves  24 prefill waves  idle 0.79s  (prefill 0.57  decode 0.21)
+  off top gaps  293 140 135 121  97  96  75  40 ms   (all before prefill)
+  on  top gaps  326  59  39  32  31  31  30  26 ms
+```
+
+Wave count and prefill-wave count are **identical** — no fleet fragmentation,
+which is what every quorum-relaxation attempt failed on. The per-turnover holes
+collapse by roughly the 83.6 ms a prefill wave costs on the GPU, exactly as
+§20.21 predicted. The one unchanged gap (293 -> 326 ms) is startup, where by
+construction nothing has been banked yet.
+
+### Why it cannot land: a reserve holds KV without holding a seat
+
+Contention suite: **7 of 16 scenarios failed** (`hog` 1/32 completed, `soak`
+515/4096, `tinyswap` stops evicting entirely). All three are the tightest pools
+in the suite — `hog` 40 pages, `tinyswap` 128, `soak` 160.
+
+Pairing each reserve 1:1 with a real departure (an `AtomicU64` credit
+incremented where the execution seat is released in `ProcessCtx::drop`,
+consumed by the run-ahead pass — an accounting identity, no constant, and zero
+at startup) fixed `hog` outright, 32/32. It does **not** fix the others, and
+the planner trace says why:
+
+```
+queue=18 head_pages=1 accum=0 free=0/128 resident=49 evicting=1 admitted=30
+runners=[12 procs, all h4]
+```
+
+`admitted=30` against an execution cap of **16**. The credit bounds the *flow*
+of new reserves; it cannot bound the *stock*, because a reserve keeps its pages
+from its prefill until it eventually finishes — long after the departure that
+funded it returned its own. The pool then has 0 free pages, the head ask is
+1 page, and the single `evicting` process can never complete.
+
+This is not a bug in the implementation. It is the design:
+
+> **A banked reserve holds pooled pages without holding an execution seat. The
+> KV pool is sized against the execution cap. Therefore any run-ahead that
+> reaches the allocator oversubscribes the pool by construction, and no
+> accounting on the run-ahead side can repair that — the extra pages are real.**
+
+Bounding the reserve by a page budget would work, and is exactly the predicted
+quantity the user has ruled out (and §20.20 already closed KV-aware admission
+in both its heuristic and its structural forms).
+
+### Status
+
+REVERTED — the tree carries none of this.
+
+### What is now closed
+
+The fleet-wide join at a cohort boundary (§20.21's root cause) has three
+conceivable levers, and all three are closed by measurement:
+
+| lever | where | result |
+| --- | --- | --- |
+| relax the seal quorum | §20.14 #6/#7 + two share-based designs | worse; the fleet splits into sub-cohorts that never re-merge |
+| move the join earlier | §20.21 | -5.7%; the hole follows the join |
+| bank work across the join | §20.22 (this) | +3.6%, but oversubscribes the KV pool by construction |
+
+The remaining ~100 ms per boundary is 512 guest exits + 512 admissions + 512
+first submits. Only §20.14's already-recorded shape can still attack it: make
+per-process bring-up and teardown substantially cheaper, so the round trip
+itself shrinks. §20.15 (submit -58%) and §20.16 (close barrier -19%) were the
+first two instalments of that and were individually throughput-neutral; the
+finding here is that they were attacking the right term after all, just not
+enough of it to clear the noise band.
+
+---
+
+## §20.23 — profiling the turnover hole: it is the scheduler loop's pass time
+
+§20.22 closed the last of the three levers on the fleet-wide join and left one
+direction standing: make per-process bring-up and teardown cheap enough that
+the round trip itself shrinks. This section profiles that round trip. Every
+number below comes from the stock engine's own instrumentation
+(`PIE_FIRE_TIMING=waves`, homogeneous conc 512, 4096 requests, 8192 pages,
+16.6 s wall, 528 waves, 24 of them prefill).
+
+### It is not the GPU, not the pool, and not host parallelism
+
+`worker_threads` sweep at conc 512 — 16 / 64 / 128 threads:
+
+```
+  31286 / 30388 / 30540 tok/s
+```
+
+Flat inside the 4.5% band, and 16 is nominally the best. The box has 128 CPUs
+and the default is `min(cores, 64)`. Adding parallelism does nothing, so the
+boundary is not throughput-bound: there is a **serial section**.
+
+### The single dominant cost: a bind is 775x its own work
+
+PAIRED per-process deltas across one 140 ms boundary (n = 512 successors):
+
+```
+  bind_started -> bind_finished (TOTAL)   p50  54.36  p90 118.95  max 131.41 ms
+    of which: driver round trip           p50  54.30  p90 118.87  max 131.34 ms
+    of which: host-side work              p50   0.07  p90   0.12  max   0.24 ms
+```
+
+The lane's own execution is trivial and so is the driver's:
+
+```
+  register_channels_bind occupancy   p50 0.10 ms   (8192 controls, sum 1.08 s)
+  cuda_bind total                    p50 0.02 ms   (sum 0.23 s)
+  cuda_channel_register (9 per bind) p50 0.00 ms   (73728 regs, sum 0.05 s)
+  engine bind_us / set_us            p50 0.03 / 0.05 ms
+```
+
+### Where the 54 ms goes: arrival vs service curves
+
+Same boundary, times relative to `t0` = the last frame's `native_complete`:
+
+```
+  A predecessor guest_main_returned    p05   4.1  p50  27.8  p95  49.8 ms
+  B predecessor drop_entered           p05   4.1  p50  27.9  p95  49.8 ms
+  C successor bind_admitted            p05  14.8  p50  61.9  p95 112.6 ms
+  D successor exec admitted            p05  13.3  p50  61.1  p95 112.5 ms
+  E successor bind_started  (SUPPLY)   p05  17.6  p50  62.1  p95 114.9 ms
+  F bind control SERVICED by the lane  p05  18.3  p50  65.2  p95 197.2 ms
+  G bind finished (guest observes)     p05  54.0  p50  95.0  p95 194.4 ms
+```
+
+Read it as a queue: **service (F) trails supply (E) by 3 ms.** The driver lane
+is keeping up and is NOT the bottleneck — during the gap the GPU is idle, so no
+frame submit is occupying the lane either. Binds arrive at only ~5/ms, and the
+GPU restarts at t0+140 once essentially all of them have landed (the wait-all
+seal waits for the LAST one, p95 115 ms, not the median).
+
+So the cost is the **supply chain**, and it is a chain of round trips through
+one thread. Rank-paired lane-completion to guest-observation:
+
+```
+  lane done -> guest sees bind   p50 1.3 - 13.4 ms   p95 25 - 36 ms
+  bind_finished per 5 ms bucket:  50:38 55:77 60:74 65:7  [25 ms hole]  90:45 95:51 ...
+```
+
+Those holes are the loop's own pass. Its time budget over the run:
+
+```
+  loop_mailbox_us  p50  1.59  SUM  0.96 s
+  loop_retire_us   p50  4.19  SUM  2.20 s
+  loop_dispatch_us p50  5.16  SUM  3.94 s   (of which loop_post_us p50 4.58, SUM 2.27 s)
+  loop_park_us     p50 17.55  SUM  9.73 s
+  loop_lag_us      p50  5.52 ms   max 28.93 ms
+  driver_submit_us p50  9.04  SUM  5.53 s   (lane thread, blocks controls behind it)
+```
+
+A pass costs mailbox + retire + dispatch ~= **14 ms**, and `loop_lag_us` p50
+5.5 ms says the loop runs that far behind. Every hop a process needs —
+`ExecutionSlotConsumed`, the bind post, the bind reply that resolves its
+oneshot — costs up to one pass. A successor needs two or three of them, which
+is exactly the ~60 ms by which curve D lags curve B, and exactly why a 50 ms
+predecessor spread (A) is stretched into a 100 ms bind spread (E).
+
+Per-guest, the same ratio shows up in the steady state:
+
+```
+  mean per-guest wake  32.2 us      mean per-guest work  0.1 us
+  (249856 guest observations, guest_wake SUM 8.04 s of a 16.6 s run)
+```
+
+### What this rules out
+
+- **The single control slot is NOT the cause.** `worker.rs` only holds the slot
+  for async-completing controls; lifecycle controls (register / bind / close)
+  are pipe-concurrent and flush to the lane FIFO freely in one pass.
+- **A dedicated control lane would not help the gap.** During the hole the GPU
+  is idle, so no frame submit is occupying the lane; binds still trickle at
+  5/ms.
+- **Channel registration, program registration and the CUDA bind are free**
+  (sums of 0.05 s, 0.00 s and 0.23 s across the whole run).
+
+### The lever
+
+The boundary hole is `passes x pass_time`, and `pass_time` is ~14 ms of
+single-threaded work dominated by three per-fire costs at 512 fires per frame:
+
+```
+  loop_post_us    4.58 ms  (~9 us per fire)   building and posting the frame
+  loop_retire_us  4.19 ms  (~8 us per fire)   retiring it
+  loop_dispatch_us 5.16 ms                    the queue scan + seal + post
+```
+
+Cutting per-fire host cost shortens every hop of every process at every
+boundary, and it also shortens `loop_lag_us` in the steady state. This is the
+same term §20.15 (submit -58%) and §20.16 (close barrier -19%) attacked; the
+finding here is that they were aimed correctly but were each too small a slice
+of a 14 ms pass to clear a 4.5% noise band. The measurement to hold them to is
+`loop_lag_us` and the A..G curve above, NOT end-to-end tok/s.
+
+### Addendum: the box has 13 CPUs, not 128
+
+`std::thread::available_parallelism()` returns **13** here — it reads the cgroup
+quota (`cpu.cfs_quota_us 1360000 / cpu.cfs_period_us 100000` = 13.6 CPUs),
+while `nproc` and `os.cpu_count()` both report 128. The engine's default
+`min(available_parallelism, 64)` is therefore **13 worker threads, not 64**, and
+the sweep above was testing 1.2x and 2.4x OVERSUBSCRIPTION against a hard
+quota — which is exactly why more threads got slower. Stock is already
+correctly sized; the sweep still rules out parallelism as the lever, but for
+the opposite reason to the one first assumed.
+
+This also sharpens the diagnosis: the scheduler loop is ONE dedicated thread
+running ~10 ms passes on a 13-CPU budget. Per-fire host cost in that loop is
+not merely a constant factor — it is the critical path's clock.
+
+### Refuted while profiling: instantiation is NOT in the hole
+
+WASM bring-up was the other candidate for the boundary cost, since
+`process_instantiated.instantiate_us` sums to 9.18 s of a 16.6 s run and
+`get_component_us` shows a p50 9 us / p90 2.15 ms lock-contention shape. It is
+not in the hole. All 4096 instantiations complete within the first **836 ms**
+of the run, and at each of the four largest boundaries the count of
+instantiations starting inside the hole is **zero** (the nearest cohort's
+instantiations run 1.9 - 10.5 s earlier). Prewarm is doing its job: the
+double-buffered cohort is fully instantiated long before it is needed.
+
+Teardown is likewise not the work — `terminate_ack` p50 0.00 ms, `finalize`
+p50 0.00 ms — but the teardown TASK waits p50 18.6 ms / p90 40.9 ms just to be
+first polled, with **170 (p50) to 424 (peak)** tasks spawned-but-unpolled at a
+boundary. That is the 13-CPU budget, not a lock.
+
+### Landed: post_frame's per-fire hash traffic (-20% loop_post)
+
+`post_frame` rebuilt its fire-id maps twice per frame: a `wave_of` map hashed
+once per queued launch for `contains_key` and again for the index, then a
+SECOND per-wave `order` map that the sort comparator hashed into on every
+comparison — n log n lookups (~4600 at 512 fires) on the loop's hottest path.
+One map now carries `(wave, position)` together, so the sort compares plain
+integers.
+
+Paired instrumented runs, same session, 528 waves each:
+
+```
+                     OLD        NEW      delta
+  loop_post_us      4.682 ms   3.733 ms  -20.3%
+  loop_dispatch_us  5.301 ms   4.344 ms  -18.1%
+  loop_retire_us    4.124 ms   4.172 ms   +1.2%  (untouched)
+  loop_mailbox_us   1.568 ms   1.607 ms   +2.5%  (untouched)
+  batch_build_us    1.575 ms   1.596 ms   +1.3%  (untouched)
+```
+
+The untouched phases moving <2.5% is the control: the delta is the change, not
+the run. End-to-end tok/s could NOT resolve it — this box was running at load
+15 against a 13.6-CPU quota that day and homogeneous 512 spread 28131..31296
+(11%) across three back-to-back runs. Per §20.23 the measurement to hold this
+class of change to is the loop phase itself.
+
+
+## §20.24 DONE — the retire cost was the ALLOCATOR; mimalloc landed, reaper rejected
+
+§20.23 left `loop_retire_us` at ~4.2 ms (~8 us/fire) as the last unattacked
+half of candidate 1. Instrumenting it (new `retire_instances/mark/resolve/
+drop/emit` sub-phases on `LoopPhaseAcc`, behind `fire_timing_enabled()`, kept)
+localised it precisely:
+
+```
+  loop_retire_us      p50 4.155 ms   SUM 2.181 s   4.16 us/fire
+    retire_instances      0.041 ms                 hash lookups
+    retire_mark           0.012 ms
+    retire_resolve        0.941 ms                 terminal load + wake
+    retire_drop           2.771 ms   SUM 1.443 s   <- 67%
+    retire_emit           0.300 ms
+```
+
+The resolve loop consumed `retired.requests` BY VALUE, so it ran 512
+destructors inline. A `PendingRequest` owns a `LaunchPlan` — thirty-odd
+`Vec`s plus `LaunchStagePlan { ops, source_ops: Vec<Vec<u32>>, value_types }`.
+**The scheduler loop spent 1.44 s of a 16.6 s run inside `free`, on the one
+thread that is the critical path for every process hop at a cohort boundary.**
+
+### FIRST ATTEMPT: a reaper thread — REJECTED BY MEASUREMENT
+Moved the retired vector to a `std::thread` over a `crossbeam::bounded(
+configured_max_in_flight())` with inline-drop overflow. Sound (nothing in the
+drop chain releases a scheduling resource; only pool returns). It did exactly
+what it was built to do — `retire_drop_us` 2.77 -> 0.007 ms — and bought
+nothing, because `loop_post_us` +23% and `batch_build_us` +45% ate it. That
+regression was the CLUE: a thread that never frees stops replenishing its own
+allocator cache.
+
+### ROOT CAUSE: `mimalloc` was a declared dependency that was NEVER REGISTERED
+`worker/Cargo.toml` has carried `mimalloc = "0.1"` since the disaggregated-
+serving refactor (cc4e77a7d) with no `#[global_allocator]` anywhere in the
+workspace. The engine has been running on glibc malloc, whose per-arena lock
+is exactly the wrong shape for "one thread allocates 512 plans, then frees 512
+plans, ~20k `free` calls per pass".
+
+### THE 2x2 (one build, both axes env-gated; conc 512, N=4096, 2 reps)
+```
+                       tok/s     retire_drop  loop_retire  loop_lag  TRUE-IDLE
+  glibc,  reaper off   30918        2.92 ms      4.29 ms    5.65 ms   1.006 s
+  mimalloc,reaper off  31246        0.78 ms      1.90 ms    4.10 ms   0.840 s
+  mimalloc,reaper on   31230        0.007ms      1.15 ms    3.82 ms   0.789 s
+  glibc,  reaper on    30808        0.008ms      1.45 ms    3.91 ms   0.994 s
+```
+The allocator arms DO NOT OVERLAP (mimalloc min 31050 > glibc max 30927 over
+4 runs each). The reaper adds nothing once the allocator is right, and costs a
+thread on a 13.6-CPU box. **Reaper reverted; mimalloc landed.**
+
+### LANDED
+`#[global_allocator] static GLOBAL_ALLOC: mimalloc::MiMalloc` in
+`worker/src/lib.rs` — the one crate the CLI, the standalone worker and the
+pyo3 wheel all link, so a single declaration covers every entry point.
+Feature `local_dynamic_tls` is REQUIRED: the wheel is `dlopen()`ed and
+mimalloc's default initial-exec TLS model fails there with "cannot allocate
+memory in static TLS block".
+
+### RESULT (landed build, n=3, vs the glibc arm of the same 2x2)
+```
+  retire_drop_us    2.924 -> 0.807 ms   -72%
+  loop_retire_us    4.295 -> 1.944 ms   -55%
+  loop_lag_us       5.649 -> 3.879 ms   -31%   <- §20.23's target metric
+  loop_post_us      3.628 -> 3.462 ms    -5%   (untouched = CONTROL)
+  loop_mailbox_us   1.575 -> 1.479 ms    -6%   (untouched = CONTROL)
+  TRUE-IDLE         1.006 -> 0.813 s    -19%
+  top boundary gaps 198/138/112/109 -> 163/128/98/88 ms
+  tok/s             30918 -> 31380      +1.5%
+```
+`driver_submit_us` rose 9.57 -> 11.25 ms, but that is the LANE thread and
+§20.23 already showed the lane keeps up (it services a bind 3 ms after it is
+posted); throughput and idle both moved the right way.
+
+VARIANCE IS THE OTHER HEADLINE: three back-to-back runs read 31339/31431/
+31371 = **0.3% spread**, against the 11% spread (28131/28999/31296) that
+§20.23 recorded as this box's noise floor. Much of what was called machine
+noise was glibc arena contention. This also explains the `guest_wake_us`
+multi-second maxima seen while chasing the reaper (10.3 s in one glibc run):
+they were allocator stalls, not a scheduling defect.
+
+VERIFIED: frame tests 25 pass / 2 pre-existing fail; contention hog 32/32,
+soak 4096/4096, tinyswap 3/3, allshared_noswap 128/128 x3, churn_extreme
+4096/4096 x4.
+
+### NEXT
+ 1. `loop_dispatch_us` (3.96 ms) and `loop_post_us` (3.46 ms) are now the two
+    largest phases; `retire_resolve_us` (0.79 ms) is the rest of retire.
+ 2. The 33 ms from predecessor `drop_entered` to successor `exec admitted`
+    still stands: teardown tasks wait p50 18.6 ms to be FIRST POLLED with
+    170-424 spawned-but-unpolled tasks at a boundary.
+
+## §20.25 — post_frame placement, and where the idle ACTUALLY is
+
+### The change: place by slot instead of push-then-sort
+`post_frame` picked each queued fire into `Vec<(usize, PendingRequest)>` and
+then `sort_by_key`'d it back into the sealed wave's order. `PendingRequest`
+is **1280 bytes** (`LaunchPlan` alone is 1024), so that sort swapped 1288-byte
+elements n log n times — several MB of `memmove` per frame. But `position` is
+already a permutation of `0..wave.len()`, so the order is recovered by writing
+each request straight into its slot: one move per fire, no comparisons. The
+survivor filter then folds into the compaction pass, and the slot buffer is
+owned by the loop (`SlotBuffer`) so steady state neither allocates nor refills.
+
+```
+                  BEFORE      AFTER    delta
+  loop_post_us     3.506 ms   2.700 ms  -23.0%
+    post_sort        0.955 ms   (gone)
+    post_filter      0.533 ms   0.598 ms   (absorbs compaction)
+    post_drain       0.401 ms   0.409 ms
+  loop_dispatch_us 4.000 ms   3.282 ms  -17.9%
+  loop_lag_us      3.803 ms   3.154 ms  -17.0%
+```
+
+**Throughput: unchanged (31407 -> 31173, inside noise).** Kept anyway: an
+n log n sort of 1.3 KB payloads to recover an order that was already known is
+simply the wrong algorithm. But the fact that it bought NOTHING is the real
+result of this section.
+
+### Why it bought nothing: the loop was never the constraint
+GPU idle is not spread across the run. Of **528 waves, only 27 have any idle
+at all** — 501 waves have exactly zero. And the big ones land on waves
+
+```
+  66, 132, 198, 264, 330, 396, 462      <- every 66 waves, exactly
+```
+
+4096 requests / 512 concurrency = 8 cohorts; 528 waves / 8 = 66. **These are
+the seven cohort boundaries, and they carry 614 ms of the run's 784 ms of
+idle (78%).** Cutting `loop_lag_us` from 5.65 ms (§20.23) to 3.15 ms moved the
+boundary gap by 3% (161 -> 156 ms) and total idle not at all. The scheduler
+loop keeps up on 95% of waves; shaving its pass time is finished as a lever.
+
+### Anatomy of a boundary (wave 330, 122.9 ms, all 512 processes)
+```
+  +0.8 .. +38.6 ms   512 old guests return from main and drop
+  +13.5 ms (p50)     drop entered  (scratch_rm 7 us, permit release 12 us)
+  +44.8 ms (p50)     teardown task FIRST POLLED   <- +31 ms of nothing
+  +44.5 ms (p50)     successor exec-admitted (p10 +18.0, p90 +59.4)
+  +122.9 ms          the frame finally dispatches
+```
+The successors were already warm: `instantiate` / `guest_main_entered` ran at
+**-10.2 s** and `bind_admitted` at **-2.0 s**. Prewarm and bind are NOT on the
+boundary path. The whole cost is retirement -> readmission -> first fire.
+
+### It is NOT CPU saturation (measured, since perf/eBPF are unavailable here)
+Sampling `/proc/<pid>/task/*/schedstat` at 200 Hz through a run:
+```
+                   cores busy (of 13.6)   runqueue wait
+  steady state         3.6 - 5.5              0.00
+  cohort boundary      9.0 - 10.1             0.00 - 0.01
+```
+Runqueue wait is zero: nothing is starved of a core. But a spawned teardown
+task still waits **p50 17.0 ms / p90 30.5 ms** to be first polled. That is
+queueing INSIDE tokio — ~1500 tasks become runnable at once and each worker
+walks its local queue — not the OS.
+
+The boundary carries roughly 9.3 cores x 84 ms = **0.8 s of CPU for 512
+turnovers, i.e. ~1.5 ms of CPU per process turnover**, at only 68% of the
+quota. Two levers follow, and they are the next work:
+ 1. cut the per-turnover CPU (the teardown task's `drop(context)` — the
+    wasmtime `ResourceTable` — is *unmeasured*: `released_us` is written
+    before it; and there are 18 `cuda_channel_register` per process);
+ 2. raise boundary parallelism from 9.3 to 13.6 cores.
+
+VERIFIED: frame 25 pass / 2 pre-existing fail; hog 32/32, soak 4096/4096,
+tinyswap 3/3, allshared_noswap 128/128 x3, churn_extreme 4096/4096 x4.

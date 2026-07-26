@@ -1,7 +1,6 @@
-//! `Tensor` — an SSA value (overview §1) — plus the free-function op surface that
-//! matches the overview §3/§6 examples verbatim. Ops emit the IR's canonical
-//! [`ptir::op::Op`](pie_ir::op::Op); composed ops (`gumbel`,
-//! `mask_apply`, `softmax`, …) inline the IR's [`expand`](pie_ir::expand)
+//! `Tensor` — an SSA value — plus the free-function op surface. Ops emit the
+//! IR's canonical [`ptir::op::Op`](pie_ir::op::Op); composed ops (`gumbel`,
+//! `mask_apply`, `softmax`, …) inline the IR's [`expand`]
 //! expansions so a backend that fuses the core fuses these for free.
 
 use alloc::vec::Vec;
@@ -11,7 +10,8 @@ use pie_ir::expand;
 use pie_ir::op::{IntrinsicId, Op};
 use pie_ir::types::{DType, Literal, Predicate, RngKind, Shape, ValueId, ValueType};
 
-use crate::context::emit;
+use crate::context::{self, emit};
+use crate::error::Span;
 
 /// An SSA value: a node in the current stage, or a deferred trace-known constant.
 #[derive(Clone, Debug)]
@@ -32,26 +32,29 @@ impl Tensor {
         }
     }
 
-    /// A trace-known constant value (overview §1). Accepts a scalar
+    /// A trace-known constant value. Accepts a scalar
     /// (`Tensor::constant(-1i32)`) or an array (`Tensor::constant([0u32, 1])`).
     /// A body constant materializes to `Const` (scalar), `Broadcast` (uniform
     /// vector), or `Iota`/affine (a sequence) — the closed op set has no general
-    /// vector-const op (overview §1: small consts fold to immediates).
+    /// vector-const op (small consts fold to immediates).
     pub fn constant(v: impl IntoConst) -> Tensor {
         Tensor {
             inner: TensorInner::Const(v.into_const()),
         }
     }
 
+    /// The value's static [`ValueType`] (shape and dtype).
     pub fn ty(&self) -> ValueType {
         match &self.inner {
             TensorInner::Node { ty, .. } => *ty,
             TensorInner::Const(c) => ValueType::new(c.shape, c.dtype),
         }
     }
+    /// The value's element [`DType`].
     pub fn dtype(&self) -> DType {
         self.ty().dtype
     }
+    /// The value's [`Shape`].
     pub fn shape(&self) -> Shape {
         self.ty().shape
     }
@@ -60,7 +63,9 @@ impl Tensor {
 /// A trace-known constant value: a typed scalar/vector immediate.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ConstData {
+    /// Logical shape; its `numel` must match the element count in `bytes`.
     pub shape: Shape,
+    /// Element dtype the `bytes` are decoded as.
     pub dtype: DType,
     /// Raw little-endian element bytes (4 bytes/element; `bool` = one byte).
     pub bytes: Vec<u8>,
@@ -132,6 +137,57 @@ impl AsTensor for f32 {
 // Constant → IR op materialization
 // ---------------------------------------------------------------------------
 
+/// Record an authoring mistake and return a well-typed stand-in value.
+///
+/// The recorder keeps going on a poison rather than unwinding, so one
+/// `build()` reports every authoring mistake in the pass instead of the first.
+/// The stand-in is a real `Const`/`Broadcast` pair of the requested type, so
+/// ops downstream of the mistake still type and still get recorded — their
+/// diagnostics are about them, not about the recovery. `build()` refuses the
+/// trace before any of it reaches the wire.
+///
+/// Record an authoring mistake and stand in for the value it was supposed to
+/// produce, so the recorder keeps going and one `build()` reports every
+/// mistake instead of the first.
+///
+/// The stand-in is fully typed, which is what lets the rest of the trace keep
+/// type-checking against it rather than cascading.
+///
+/// `#[track_caller]` here and on every op that can reach it is load-bearing:
+/// the span is the whole value of the report, and without an unbroken chain of
+/// it back to the author, the error names a line inside this file.
+#[track_caller]
+pub(crate) fn poison(detail: alloc::string::String, ty: ValueType) -> Tensor {
+    Tensor::node(poison_id(detail, ty), ty)
+}
+
+/// [`poison`] as a raw value id, for the recorders that deal in ids.
+#[track_caller]
+fn poison_id(detail: alloc::string::String, ty: ValueType) -> ValueId {
+    context::record_error(detail, Span::here());
+    let scalar = emit(
+        Op::Const(scalar_literal(ty.dtype, &[0; 8])),
+        &[ValueType::scalar(ty.dtype)],
+    );
+    if ty.shape.is_scalar() {
+        return scalar;
+    }
+    emit(
+        Op::Broadcast {
+            value: scalar,
+            shape: ty.shape,
+        },
+        &[ty],
+    )
+}
+
+/// Record an authoring mistake whose recovery is a shape rather than a value.
+#[track_caller]
+fn poison_shape(detail: alloc::string::String, fallback: Shape) -> Shape {
+    context::record_error(detail, Span::here());
+    fallback
+}
+
 fn scalar_literal(dtype: DType, bytes: &[u8]) -> Literal {
     let w = |i: usize| bytes.get(i).copied().unwrap_or(0);
     let word = [w(0), w(1), w(2), w(3)];
@@ -154,6 +210,7 @@ fn elem_at(dtype: DType, bytes: &[u8], i: usize) -> f64 {
 }
 
 /// Lower a trace-known constant to IR ops (see [`Tensor::constant`]).
+#[track_caller]
 fn materialize_const(c: ConstData) -> (ValueId, ValueType) {
     let ty = ValueType::new(c.shape, c.dtype);
     if c.shape.is_scalar() {
@@ -163,7 +220,22 @@ fn materialize_const(c: ConstData) -> (ValueId, ValueType) {
         );
         return (id, ty);
     }
-    let n = c.shape.numel() as usize;
+    // `usize` is 32 bits in the wasm guest this crate traces in, so a
+    // declared shape wider than that would wrap to a short element count and
+    // materialize a constant that quietly disagrees with its own type.
+    let Ok(n) = usize::try_from(c.shape.numel()) else {
+        return (
+            poison_id(
+                alloc::format!(
+                    "constant of shape {:?} has {} elements, more than this target can address",
+                    c.shape,
+                    c.shape.numel()
+                ),
+                ty,
+            ),
+            ty,
+        );
+    };
     let vals: Vec<f64> = (0..n).map(|i| elem_at(c.dtype, &c.bytes, i)).collect();
 
     // uniform ⇒ broadcast(scalar).
@@ -208,11 +280,15 @@ fn materialize_const(c: ConstData) -> (ValueId, ValueType) {
             return (cur, ty);
         }
     }
-    panic!(
-        "general vector constant {vals:?} (dtype {:?}) is not representable in the closed op set; \
-         use iota/broadcast, an arithmetic expression, or feed it through a channel",
-        c.dtype
+    let poisoned = poison_id(
+        alloc::format!(
+            "general vector constant {vals:?} (dtype {:?}) is not representable in the closed \
+             op set; use iota/broadcast, an arithmetic expression, or feed it through a channel",
+            c.dtype
+        ),
+        ty,
     );
+    (poisoned, ty)
 }
 
 // ---------------------------------------------------------------------------
@@ -222,6 +298,7 @@ fn materialize_const(c: ConstData) -> (ValueId, ValueType) {
 /// Anything convertible to a trace-known [`ConstData`]: scalars and arrays of
 /// `f32` / `i32` / `u32` / `bool`.
 pub trait IntoConst {
+    /// Encodes `self` into a typed [`ConstData`].
     fn into_const(self) -> ConstData;
 }
 
@@ -313,6 +390,8 @@ impl IntoConst for Vec<bool> {
 
 /// Anything usable as a shape argument: a `[u32; N]` dim array or a [`Shape`].
 pub trait IntoShape {
+    /// Resolves `self` into a [`Shape`]; an unexpressible rank or a zero
+    /// dimension records an authoring error and falls back to a scalar.
     fn into_shape(self) -> Shape;
 }
 impl IntoShape for Shape {
@@ -321,8 +400,19 @@ impl IntoShape for Shape {
     }
 }
 impl<const N: usize> IntoShape for [u32; N] {
+    #[track_caller]
     fn into_shape(self) -> Shape {
-        Shape::new(&self).expect("shape rank exceeds MAX_RANK")
+        match Shape::new(&self) {
+            Some(shape) => shape,
+            None => poison_shape(
+                alloc::format!(
+                    "shape {self:?} is not expressible: rank must be at most {} and no dimension \
+                     may be zero",
+                    pie_ir::types::MAX_RANK
+                ),
+                Shape::SCALAR,
+            ),
+        }
     }
 }
 
@@ -396,10 +486,11 @@ fn push(op: Op, tys: &[ValueType]) -> ValueId {
 }
 
 // ---------------------------------------------------------------------------
-// The free-function op surface (overview appendix; matches §3/§6 verbatim)
+// The free-function op surface
 // ---------------------------------------------------------------------------
 
 // -- map: unary --
+/// `-x` elementwise; numeric dtypes only (not `bool`), shape and dtype preserved.
 pub fn neg(x: impl AsTensor) -> Tensor {
     emit_unary(&x, Op::Neg, |t| t)
 }
@@ -411,16 +502,19 @@ pub fn abs(x: impl AsTensor) -> Tensor {
 pub fn sign(x: impl AsTensor) -> Tensor {
     emit_unary(&x, Op::Sign, |t| t)
 }
-/// `1 / x` elementwise.
+/// `1 / x` elementwise, F32 only.
 pub fn recip(x: impl AsTensor) -> Tensor {
     emit_unary(&x, Op::Recip, |t| t)
 }
+/// `e^x` elementwise; `F32` only, shape preserved.
 pub fn exp(x: impl AsTensor) -> Tensor {
     emit_unary(&x, Op::Exp, |t| t)
 }
+/// Natural logarithm elementwise; `F32` only, shape preserved.
 pub fn log(x: impl AsTensor) -> Tensor {
     emit_unary(&x, Op::Log, |t| t)
 }
+/// `x` converted elementwise to dtype `to`, shape preserved.
 pub fn cast(x: impl AsTensor, to: DType) -> Tensor {
     emit_unary(
         &x,
@@ -433,58 +527,81 @@ pub fn cast(x: impl AsTensor, to: DType) -> Tensor {
 }
 
 // -- map: binary --
+/// `a + b` elementwise; operands share one numeric dtype and equal shapes (a
+/// scalar broadcasts against a vector), and the result takes that shape and dtype.
 pub fn add(a: impl AsTensor, b: impl AsTensor) -> Tensor {
     emit_binary(&a, &b, Op::Add, |d| d)
 }
+/// `a - b` elementwise; same dtype/shape rule as [`add`].
 pub fn sub(a: impl AsTensor, b: impl AsTensor) -> Tensor {
     emit_binary(&a, &b, Op::Sub, |d| d)
 }
+/// `a * b` elementwise; same dtype/shape rule as [`add`].
 pub fn mul(a: impl AsTensor, b: impl AsTensor) -> Tensor {
     emit_binary(&a, &b, Op::Mul, |d| d)
 }
+/// `a / b` elementwise (`F32` divide, or truncating integer divide that yields
+/// `0` on divide-by-zero); same dtype/shape rule as [`add`].
 pub fn div(a: impl AsTensor, b: impl AsTensor) -> Tensor {
     emit_binary(&a, &b, Op::Div, |d| d)
 }
+/// `a % b` elementwise; same dtype/shape rule as [`add`].
 pub fn rem(a: impl AsTensor, b: impl AsTensor) -> Tensor {
     emit_binary(&a, &b, Op::Rem, |d| d)
 }
+/// Elementwise maximum of `a` and `b`; same dtype/shape rule as [`add`].
 pub fn max_elem(a: impl AsTensor, b: impl AsTensor) -> Tensor {
     emit_binary(&a, &b, Op::MaxElem, |d| d)
 }
+/// Elementwise minimum of `a` and `b`; same dtype/shape rule as [`add`].
 pub fn min_elem(a: impl AsTensor, b: impl AsTensor) -> Tensor {
     emit_binary(&a, &b, Op::MinElem, |d| d)
 }
 
 // -- compare / logic (bool results) --
+/// `a == b` elementwise → `Bool`; numeric operands sharing a dtype, equal
+/// shapes (a scalar broadcasts against a vector).
 pub fn eq(a: impl AsTensor, b: impl AsTensor) -> Tensor {
     emit_binary(&a, &b, Op::Eq, |_| DType::Bool)
 }
+/// `a != b` elementwise → `Bool`; same operand rule as [`eq`].
 pub fn ne(a: impl AsTensor, b: impl AsTensor) -> Tensor {
     emit_binary(&a, &b, Op::Ne, |_| DType::Bool)
 }
+/// `a < b` elementwise → `Bool`; same operand rule as [`eq`].
 pub fn lt(a: impl AsTensor, b: impl AsTensor) -> Tensor {
     emit_binary(&a, &b, Op::Lt, |_| DType::Bool)
 }
+/// `a <= b` elementwise → `Bool`; same operand rule as [`eq`].
 pub fn le(a: impl AsTensor, b: impl AsTensor) -> Tensor {
     emit_binary(&a, &b, Op::Le, |_| DType::Bool)
 }
+/// `a > b` elementwise → `Bool`; same operand rule as [`eq`].
 pub fn gt(a: impl AsTensor, b: impl AsTensor) -> Tensor {
     emit_binary(&a, &b, Op::Gt, |_| DType::Bool)
 }
+/// `a >= b` elementwise → `Bool`; same operand rule as [`eq`].
 pub fn ge(a: impl AsTensor, b: impl AsTensor) -> Tensor {
     emit_binary(&a, &b, Op::Ge, |_| DType::Bool)
 }
+/// `a && b` elementwise; both operands `Bool`, equal shapes (a scalar
+/// broadcasts), result `Bool`.
 pub fn and(a: impl AsTensor, b: impl AsTensor) -> Tensor {
     emit_binary(&a, &b, Op::And, |_| DType::Bool)
 }
+/// `a || b` elementwise; same operand rule as [`and`].
 pub fn or(a: impl AsTensor, b: impl AsTensor) -> Tensor {
     emit_binary(&a, &b, Op::Or, |_| DType::Bool)
 }
+/// `!x` elementwise; `x` must be `Bool`, shape preserved.
 pub fn not(x: impl AsTensor) -> Tensor {
     emit_unary(&x, Op::Not, |t| ValueType::new(t.shape, DType::Bool))
 }
 
 // -- choice --
+/// `cond ? a : b` elementwise; `cond` is `Bool`, `a` and `b` share a dtype,
+/// and the three shapes broadcast together (a scalar broadcasts). Result takes
+/// that dtype.
 pub fn select(cond: impl AsTensor, a: impl AsTensor, b: impl AsTensor) -> Tensor {
     let (ca, _) = cond.to_arg().materialize();
     let (aa, bb) = reconcile(a.to_arg(), b.to_arg());
@@ -506,6 +623,8 @@ pub fn select(cond: impl AsTensor, a: impl AsTensor, b: impl AsTensor) -> Tensor
 }
 
 // -- shape --
+/// `x` reinterpreted with `shape`; the element count must be unchanged, dtype
+/// preserved.
 pub fn reshape(x: impl AsTensor, shape: impl IntoShape) -> Tensor {
     let s = shape.into_shape();
     emit_unary(
@@ -517,6 +636,9 @@ pub fn reshape(x: impl AsTensor, shape: impl IntoShape) -> Tensor {
         move |t| ValueType::new(s, t.dtype),
     )
 }
+/// `x` broadcast up to `shape`; `x` left-aligns against `shape` (trailing axes
+/// padded with `1`) and each of its axes must equal the target or be `1`. Dtype
+/// preserved.
 pub fn broadcast(x: impl AsTensor, shape: impl IntoShape) -> Tensor {
     let s = shape.into_shape();
     emit_unary(
@@ -542,18 +664,30 @@ pub fn transpose(x: impl AsTensor) -> Tensor {
 }
 
 // -- index --
+/// The `U32` vector `[0, 1, …, len-1]`; `len` must be nonzero.
 pub fn iota(len: u32) -> Tensor {
     let ty = ValueType::new(Shape::vector(len), DType::U32);
     Tensor::node(emit(Op::Iota { len }, &[ty]), ty)
 }
 /// Axis-0 generalized gather: `gather(src[n, rest..], idx[S..]) -> [S.., rest..]`.
+#[track_caller]
 pub fn gather(src: impl AsTensor, idx: impl AsTensor) -> Tensor {
     let (is, tys) = src.to_arg().materialize();
     let (ii, tyi) = idx.to_arg().materialize();
     let mut dims: Vec<u32> = tyi.shape.dims().to_vec();
     let src_rest = &tys.shape.dims()[tys.shape.rank().min(1)..];
     dims.extend_from_slice(src_rest);
-    let rshape = Shape::new(&dims).expect("gather result rank");
+    let Some(rshape) = Shape::new(&dims) else {
+        return poison(
+            alloc::format!(
+                "gather of {:?} by {:?} has result shape {dims:?}, whose rank exceeds {}",
+                tys.shape,
+                tyi.shape,
+                pie_ir::types::MAX_RANK
+            ),
+            ValueType::new(tyi.shape, tys.dtype),
+        );
+    };
     let rty = ValueType::new(rshape, tys.dtype);
     Tensor::node(emit(Op::Gather { src: is, idx: ii }, &[rty]), rty)
 }
@@ -565,6 +699,9 @@ pub fn gather_row(src: impl AsTensor, idx: impl AsTensor) -> Tensor {
     let rty = ValueType::new(Shape::vector(m), tys.dtype);
     Tensor::node(emit(Op::GatherRow { src: is, idx: ii }, &[rty]), rty)
 }
+/// `base` with axis-0 rows `idx` overwritten by `vals`; result keeps `base`'s
+/// shape and dtype. `idx` is an integer index and `vals` has shape
+/// `idx ++ base[1..]` (or is a scalar) sharing `base`'s dtype.
 pub fn scatter_set(base: impl AsTensor, idx: impl AsTensor, vals: impl AsTensor) -> Tensor {
     let (ib, tyb) = base.to_arg().materialize();
     let (ii, _) = idx.to_arg().materialize();
@@ -581,6 +718,8 @@ pub fn scatter_set(base: impl AsTensor, idx: impl AsTensor, vals: impl AsTensor)
         tyb,
     )
 }
+/// Like [`scatter_set`], but adds `vals` into the `idx` rows instead of
+/// overwriting; `base` must be numeric.
 pub fn scatter_add(base: impl AsTensor, idx: impl AsTensor, vals: impl AsTensor) -> Tensor {
     let (ib, tyb) = base.to_arg().materialize();
     let (ii, _) = idx.to_arg().materialize();
@@ -599,16 +738,20 @@ pub fn scatter_add(base: impl AsTensor, idx: impl AsTensor, vals: impl AsTensor)
 }
 
 // -- reduce / scan --
+/// Sum over the last axis: `[.., n] → [..]` (a `[n]` vector reduces to a
+/// scalar); numeric, dtype preserved.
 pub fn reduce_sum(x: impl AsTensor) -> Tensor {
     emit_unary(&x, Op::ReduceSum, |t| {
         ValueType::new(reduce_shape(t.shape), t.dtype)
     })
 }
+/// Maximum over the last axis: `[.., n] → [..]`; numeric, dtype preserved.
 pub fn reduce_max(x: impl AsTensor) -> Tensor {
     emit_unary(&x, Op::ReduceMax, |t| {
         ValueType::new(reduce_shape(t.shape), t.dtype)
     })
 }
+/// Minimum over the last axis: `[.., n] → [..]`; numeric, dtype preserved.
 pub fn reduce_min(x: impl AsTensor) -> Tensor {
     emit_unary(&x, Op::ReduceMin, |t| {
         ValueType::new(reduce_shape(t.shape), t.dtype)
@@ -620,9 +763,11 @@ pub fn reduce_argmax(x: impl AsTensor) -> Tensor {
         ValueType::new(reduce_shape(t.shape), DType::I32)
     })
 }
+/// Inclusive prefix sum along the last axis; `F32` only, shape preserved.
 pub fn cumsum(x: impl AsTensor) -> Tensor {
     emit_unary(&x, Op::CumSum, |t| t)
 }
+/// Inclusive prefix product along the last axis; `F32` only, shape preserved.
 pub fn cumprod(x: impl AsTensor) -> Tensor {
     emit_unary(&x, Op::CumProd, |t| t)
 }
@@ -634,7 +779,8 @@ pub fn cumprod(x: impl AsTensor) -> Tensor {
 ///
 /// The op order lives in `pie_ir::expand`; this only knows how to name the
 /// three shapes an expansion step can have. Adding a step there needs no edit
-/// here, which is the point — the two used to be transcriptions of each other.
+/// here, which is the point — the two are deliberately separate so a new
+/// expansion step is a single-crate change that cannot be half-done.
 struct Traced {
     row: ValueType,
     reduced: ValueType,
@@ -672,18 +818,24 @@ fn expanded(x: impl AsTensor, seq: impl FnOnce(&mut Traced, ValueId, Shape) -> V
     Tensor::node(seq(&mut sink, xid, ty.shape), row)
 }
 
+/// Row-wise softmax over the last axis; result matches `x`'s shape with dtype
+/// `F32`.
 pub fn softmax(x: impl AsTensor) -> Tensor {
     expanded(x, expand::softmax)
 }
+/// Row-wise log-softmax over the last axis; result matches `x`'s shape with
+/// dtype `F32`.
 pub fn log_softmax(x: impl AsTensor) -> Tensor {
     expanded(x, expand::log_softmax)
 }
+/// Row-wise L2 normalization (`x / sqrt(sum(x²))`) over the last axis; result
+/// matches `x`'s shape with dtype `F32`.
 pub fn l2norm(x: impl AsTensor) -> Tensor {
     expanded(x, expand::l2norm)
 }
 
 // -- order --
-/// `top_k(x, k)` → `(values, indices)`. `k` is a trace-known immediate (§5.1).
+/// `top_k(x, k)` → `(values, indices)`. `k` is a trace-known immediate.
 /// `values` keep `x`'s dtype; `indices` are `U32`; last axis becomes length `k`.
 pub fn top_k(x: impl AsTensor, k: u32) -> (Tensor, Tensor) {
     let (ix, tyx) = x.to_arg().materialize();
@@ -713,9 +865,14 @@ pub fn sort_desc(x: impl AsTensor) -> (Tensor, Tensor) {
 pub fn rank_le(k: impl AsTensor) -> PredicateArg {
     PredicateArg(PredKind::RankLe(k.to_arg()))
 }
+/// The top-p (nucleus) predicate (`pivot_threshold(probs, cummass_le(p))`):
+/// keeps the inclusive nucleus whose descending cumulative probability mass
+/// reaches `p`.
 pub fn cummass_le(p: impl AsTensor) -> PredicateArg {
     PredicateArg(PredKind::CummassLe(p.to_arg()))
 }
+/// The min-p predicate (`pivot_threshold(probs, prob_ge(thr))`): keeps entries
+/// whose probability is `>= thr`.
 pub fn prob_ge(thr: impl AsTensor) -> PredicateArg {
     PredicateArg(PredKind::ProbGe(thr.to_arg()))
 }
@@ -746,6 +903,8 @@ pub fn pivot_threshold(input: impl AsTensor, predicate: PredicateArg) -> Tensor 
 }
 
 // -- linear --
+/// Matrix product `[m, k] · [k, n] → [m, n]`; both operands `F32`, and the
+/// inner dimensions must agree.
 pub fn matmul(a: impl AsTensor, b: impl AsTensor) -> Tensor {
     let (ia, tya) = a.to_arg().materialize();
     let (ib, tyb) = b.to_arg().materialize();
@@ -757,7 +916,7 @@ pub fn matmul(a: impl AsTensor, b: impl AsTensor) -> Tensor {
 
 // -- sampling (the IR's expand: gumbel = RngKeyed; mask_apply = select(mask, x, -inf)) --
 /// `gumbel(state, shape)` — Gumbel noise, a pure function of the `[2]` U32 rng
-/// `state` (`[key, ctr]`) + element index (overview §3; replay-deterministic T8).
+/// `state` (`[key, ctr]`) + element index (replay-deterministic T8).
 pub fn gumbel(state: impl AsTensor, shape: impl IntoShape) -> Tensor {
     rng_noise(state, shape, RngKind::Gumbel)
 }
@@ -790,18 +949,34 @@ pub fn mask_apply(logits: impl AsTensor, mask: impl AsTensor) -> Tensor {
     Tensor::node(expand::mask_apply(&mut sink, il, im), tyl)
 }
 
+#[track_caller]
 fn append_mask_axis(shape: Shape, len: u32) -> Shape {
     let mut dims = shape.dims().to_vec();
     dims.push(len);
-    Shape::new(&dims).expect("structured mask rank")
+    match Shape::new(&dims) {
+        Some(shape) => shape,
+        None => poison_shape(
+            alloc::format!(
+                "a structured mask over {shape:?} with length {len} has shape {dims:?}, whose \
+                 rank exceeds {}",
+                pie_ir::types::MAX_RANK
+            ),
+            shape,
+        ),
+    }
 }
 
+/// Boolean causal attention mask over query `positions` (`U32`): appends a
+/// length-`len` key axis (`[..] → [.., len]`), `true` where `key <= position`.
 pub fn causal_mask(positions: impl AsTensor, len: u32) -> Tensor {
     let (positions, ty) = positions.to_arg().materialize();
     let result = ValueType::new(append_mask_axis(ty.shape, len), DType::Bool);
     Tensor::node(emit(Op::CausalMask { positions, len }, &[result]), result)
 }
 
+/// Boolean causal sliding-window mask; like [`causal_mask`], but a key is
+/// visible only within `window` positions back (`key <= position && key +
+/// window > position`).
 pub fn sliding_window_mask(positions: impl AsTensor, len: u32, window: u32) -> Tensor {
     let (positions, ty) = positions.to_arg().materialize();
     let result = ValueType::new(append_mask_axis(ty.shape, len), DType::Bool);
@@ -818,6 +993,9 @@ pub fn sliding_window_mask(positions: impl AsTensor, len: u32, window: u32) -> T
     )
 }
 
+/// Boolean causal mask keeping a recent `window` plus the first `sink` keys
+/// (attention sinks); like [`sliding_window_mask`], but leading `sink`
+/// positions stay visible regardless of distance.
 pub fn sink_window_mask(positions: impl AsTensor, len: u32, sink: u32, window: u32) -> Tensor {
     let (positions, ty) = positions.to_arg().materialize();
     let result = ValueType::new(append_mask_axis(ty.shape, len), DType::Bool);
@@ -837,32 +1015,69 @@ pub fn sink_window_mask(positions: impl AsTensor, len: u32, sink: u32, window: u
 
 /// For every row and key, report whether the key occurs anywhere in the row.
 /// This is ordinary SSA composition; it introduces no wire opcode.
+#[track_caller]
 pub fn row_membership(rows: impl AsTensor, keys: impl AsTensor) -> Tensor {
     let rows = rows.to_arg();
     let keys = keys.to_arg();
     let row_type = rows.ty();
     let key_type = keys.ty();
+    // The result is [R, K] whatever goes wrong, so every recovery below is a
+    // poison of that shape once `row_count`/`key_count` are known, and of the
+    // key shape while they are not.
     let [row_count, depth] = *row_type.shape.dims() else {
-        panic!("row_membership rows must have shape [R,D]");
+        return poison(
+            alloc::format!(
+                "row_membership rows must have shape [R, D], got {:?}",
+                row_type.shape
+            ),
+            key_type,
+        );
     };
     let [key_count] = *key_type.shape.dims() else {
-        panic!("row_membership keys must have shape [K]");
+        return poison(
+            alloc::format!(
+                "row_membership keys must have shape [K], got {:?}",
+                key_type.shape
+            ),
+            ValueType::new(Shape::vector(row_count), DType::Bool),
+        );
     };
-    assert_eq!(
-        row_type.dtype, key_type.dtype,
-        "row_membership rows and keys must have the same dtype"
-    );
+    let result_type = match Shape::new(&[row_count, key_count]) {
+        Some(shape) => ValueType::new(shape, DType::Bool),
+        None => ValueType::new(Shape::SCALAR, DType::Bool),
+    };
+    if row_type.dtype != key_type.dtype {
+        return poison(
+            alloc::format!(
+                "row_membership rows and keys must have the same dtype, got {:?} and {:?}",
+                row_type.dtype,
+                key_type.dtype
+            ),
+            result_type,
+        );
+    }
 
-    let row_stride = key_count
+    // The walk below indexes a [R, K, D] cross product flattened to one axis,
+    // so the extents multiply. `u32` is the wire's dim type: a product that
+    // leaves it would index a tensor the container cannot describe.
+    let extents = key_count
         .checked_mul(depth)
-        .expect("row_membership shape overflow");
-    let row_flat_len = row_count
-        .checked_mul(depth)
-        .expect("row_membership shape overflow");
-    let flat_len = row_count
-        .checked_mul(key_count)
-        .and_then(|value| value.checked_mul(depth))
-        .expect("row_membership shape overflow");
+        .zip(row_count.checked_mul(depth))
+        .zip(
+            row_count
+                .checked_mul(key_count)
+                .and_then(|value| value.checked_mul(depth)),
+        );
+    let Some(((row_stride, row_flat_len), flat_len)) = extents else {
+        return poison(
+            alloc::format!(
+                "row_membership over {row_count} rows x {key_count} keys x depth {depth} needs a \
+                 {}-element intermediate, which overflows the wire's u32 extents",
+                u64::from(row_count) * u64::from(key_count) * u64::from(depth)
+            ),
+            result_type,
+        );
+    };
     let (rows, _) = rows.materialize();
     let (keys, _) = keys.materialize();
     let rows = Tensor::node(rows, row_type);
@@ -952,23 +1167,39 @@ pub fn entropy_from_logprobs(
 }
 
 /// Compiler-visible gather of the scalar selected by a token/index result.
+#[track_caller]
 pub fn scalar_gather(src: impl AsTensor, index: impl AsTensor) -> Tensor {
     let (src, src_type) = src.to_arg().materialize();
     let (index, index_type) = index.to_arg().materialize();
     let (op, result_shape) = if let [rows, _] = src_type.shape.dims() {
-        assert_eq!(
-            index_type.shape.dims(),
-            &[*rows],
-            "scalar_gather over a matrix requires one index per row"
-        );
+        if index_type.shape.dims() != [*rows] {
+            return poison(
+                alloc::format!(
+                    "scalar_gather over a {:?} matrix requires one index per row ([{rows}]), got \
+                     {:?}",
+                    src_type.shape,
+                    index_type.shape
+                ),
+                ValueType::new(Shape::vector(*rows), src_type.dtype),
+            );
+        }
         (Op::GatherRow { src, idx: index }, Shape::vector(*rows))
     } else {
         let mut dimensions: Vec<u32> = index_type.shape.dims().to_vec();
         dimensions.extend_from_slice(&src_type.shape.dims()[src_type.shape.rank().min(1)..]);
-        (
-            Op::Gather { src, idx: index },
-            Shape::new(&dimensions).expect("scalar gather result rank"),
-        )
+        let Some(shape) = Shape::new(&dimensions) else {
+            return poison(
+                alloc::format!(
+                    "scalar_gather of {:?} by {:?} has result shape {dimensions:?}, whose rank \
+                     exceeds {}",
+                    src_type.shape,
+                    index_type.shape,
+                    pie_ir::types::MAX_RANK
+                ),
+                ValueType::new(index_type.shape, src_type.dtype),
+            );
+        };
+        (Op::Gather { src, idx: index }, shape)
     };
     let result_type = ValueType::new(result_shape, src_type.dtype);
     let result = emit(op, &[result_type]);

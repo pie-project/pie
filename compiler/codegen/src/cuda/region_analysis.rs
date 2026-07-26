@@ -8,9 +8,8 @@
 //! (`runtime/engine/src/driver/backend.rs`, `codegen_backend == Some("cuda")`)
 //! and no Metal path reads a [`RegionAnalysis`].
 //!
-//! `ptir-refactor.md` §4.2 lists five per-program fields the launch package
-//! still has to absorb. Two of them live in one C++ file,
-//! `driver/cuda/src/pipeline/region_support.hpp`:
+//! Two per-program analyses the launch package has yet to absorb still live
+//! in one C++ file, `driver/cuda/src/pipeline/region_support.hpp`:
 //!
 //! * the **bind-time region gates** — `second_party_region_supported` and
 //!   `validate_generated_region`, which decide whether a region can be bound
@@ -69,10 +68,15 @@ pub struct DirectArgmaxRecord {
 /// Every decision about one region that the driver derives for itself today.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RegionAnalysis {
+    /// Index of the stage this region belongs to, matching `emit_program`'s
+    /// numbering so the two tables join on `(stage_index, region_index)`.
     pub stage_index: u32,
+    /// Index of this region within its stage, matching `emit_program`'s.
     pub region_index: u32,
     /// `REGION_*` bits.
     pub flags: u32,
+    /// The [`DirectArgmaxRecord`]s for this region's `argmax` nodes that read a
+    /// logits intrinsic's buffer directly; empty when none qualify.
     pub direct_argmax: Vec<DirectArgmaxRecord>,
     /// Nodes made redundant by the rewrites above, ascending. The driver's
     /// dense `skipped` array is exactly this set.

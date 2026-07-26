@@ -22,7 +22,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::interp::{Evaled, PassInputs, StepError, Value, const_value, eval_op};
+use crate::interp::{Evaled, PassInputs, Value, const_value, eval_op};
 use pie_ir::container::PortSource;
 use pie_ir::op::{Op, ValueSource};
 use pie_ir::registry::{Port, Stage};
@@ -66,6 +66,8 @@ impl core::fmt::Display for EvalBlocker {
 /// last wins), the concrete value or the blocker its derivation hit.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct StageFold {
+    /// Keyed by channel index: the [`Value`] the stage put there, or the
+    /// [`EvalBlocker`] its derivation hit. A double-put keeps the last.
     pub puts: BTreeMap<u32, Result<Value, EvalBlocker>>,
 }
 
@@ -177,13 +179,14 @@ pub fn fold_stage(
                 // would come back host-derivable — a pass scheduled that
                 // cannot run.
                 //
-                // The guard asks [`Op::value_source`], which is exhaustive
-                // over `Op` and answers exactly this question. It used to ask
-                // `is_effectful`, which answers a different one — whether DCE
-                // and CSE must leave the op alone — and deliberately calls
-                // `Rng` pure. So `Rng` passed the assertion and was folded
-                // against a stand-in seed, while `stage_taint` fifty lines
-                // below already called it device-decided.
+                // The guard asks `Op::value_source`, which is exhaustive
+                // over `Op` and answers exactly this question. The tempting
+                // alternative is `is_effectful`, but that answers a different
+                // question — whether DCE and CSE must leave the op alone —
+                // and deliberately calls `Rng` pure. Under that predicate,
+                // `Rng` passes the assertion and gets folded against a
+                // stand-in seed, while `stage_taint` fifty lines below
+                // already calls it device-decided.
                 debug_assert!(
                     matches!(op.value_source(), ValueSource::Operands),
                     "{op:?} reached the fold's general arm, which evaluates it \
@@ -201,11 +204,11 @@ pub fn fold_stage(
                     continue;
                 }
                 let ty_of = |id: pie_ir::types::ValueId| types[id as usize];
-                let evaled =
-                    eval_op(op, &dense, &ty_of, &inputs, 0).map_err(|error| match error {
-                        StepError::Fault(message) => EvalBlocker::Fault(message),
-                        other => EvalBlocker::Fault(format_step_error(&other)),
-                    })?;
+                // `StepError`'s `Display` is the one rendering of a step
+                // failure; re-matching the variants here would be a second
+                // vocabulary for the same fault.
+                let evaled = eval_op(op, &dense, &ty_of, &inputs, 0)
+                    .map_err(|error| EvalBlocker::Fault(alloc::format!("{error}")))?;
                 match evaled {
                     Evaled::One(value) => push(&mut slots, &mut dense, next_id, Ok(value)),
                     Evaled::Two(a, b) => {
@@ -238,24 +241,6 @@ fn placeholder(ty: pie_ir::types::ValueType) -> Value {
         pie_ir::types::DType::I32 => Value::I32(alloc::vec::Vec::new()),
         pie_ir::types::DType::U32 => Value::U32(alloc::vec::Vec::new()),
         pie_ir::types::DType::Bool => Value::Bool(alloc::vec::Vec::new()),
-    }
-}
-
-fn format_step_error(error: &StepError) -> String {
-    match error {
-        StepError::Fault(message) => message.clone(),
-        StepError::KernelFault { name, message } => {
-            let mut s = String::from("kernel ");
-            s.push_str(name);
-            s.push_str(": ");
-            s.push_str(message);
-            s
-        }
-        other => {
-            // Remaining variants (poison, readiness, intrinsics) cannot arise
-            // from a pure fold; format defensively rather than panic.
-            alloc::format!("{other:?}")
-        }
     }
 }
 
@@ -334,11 +319,11 @@ fn stage_taint(ops: &[Op], device_decided: &BTreeSet<u32>) -> (BTreeMap<u32, boo
             }
 
             // Every other op is classified by `Op::value_source`, which is
-            // exhaustive over `Op` and is the only copy of this judgement --
-            // `fold_stage` above reads the same answer. This arm used to
-            // restate it as two variant lists, and the copy it was keeping in
-            // step with was the wrong one: the fold called `Rng` pure while
-            // this list called it device-decided.
+            // exhaustive over `Op` and is the only copy of this judgement —
+            // `fold_stage` above reads the same answer. Restating it as two
+            // variant lists is tempting, but a copy kept in step with the
+            // wrong predicate (`is_effectful` instead of `value_source`)
+            // would call `Rng` pure here while the fold correctly blocks it.
             other => match other.value_source() {
                 ValueSource::Device => true,
                 ValueSource::Operands => arg_tainted,
@@ -660,10 +645,10 @@ mod tests {
     }
 
     /// `Rng` draws from an ambient per-fire seed, so its result is a device
-    /// fact even though the op has no value operands. It used to reach
-    /// `stage_taint`'s catch-all and inherit `arg_tainted` — vacuously
-    /// `false` for an operand-free op — which told the scheduler it could
-    /// derive a descriptor whose width came out of the device's noise.
+    /// fact even though the op has no value operands. Were the taint analysis
+    /// to fall through to the general arm, it would inherit `arg_tainted` —
+    /// vacuously `false` for an operand-free op — telling the scheduler it
+    /// could derive a descriptor whose width came out of the device's noise.
     #[test]
     fn ambient_rng_taints_what_it_reaches() {
         use Op::*;
@@ -696,8 +681,8 @@ mod tests {
     }
 
     /// The keyed form is the opposite case and must stay untainted:
-    /// PTIR-CONTAINER.md §5 pins it as a pure function of its `state`
-    /// operand, so a host holding the state replays the same noise.
+    /// `RngKeyed` is a pure function of its `state` operand, so a host
+    /// holding the state replays the same noise.
     #[test]
     fn keyed_rng_is_only_as_tainted_as_its_state() {
         use Op::*;
@@ -740,12 +725,11 @@ mod tests {
     /// The other half of `ambient_rng_taints_what_it_reaches`: the fold has
     /// to refuse the op the taint analysis refuses.
     ///
-    /// It did not. `eval_op` answers `Op::Rng` with `rng_ambient(0, ..)`, the
-    /// reference interpreter's stand-in for a seed it does not have, and the
-    /// fold's general arm evaluated it -- so `fold_stage` handed back a
-    /// concrete tensor for a value the device draws per fire, while
-    /// `geometry_taint` fifty lines away already called the same op
-    /// device-decided.
+    /// Were `Op::Rng` to fall through, `eval_op` would answer with
+    /// `rng_ambient(0, ..)` — the reference interpreter's stand-in for a
+    /// seed it does not have — and `fold_stage` would hand back a concrete
+    /// tensor for a value the device draws per fire, while `geometry_taint`
+    /// fifty lines away already calls the same op device-decided.
     #[test]
     fn the_fold_refuses_what_the_taint_refuses() {
         use Op::*;
@@ -796,11 +780,12 @@ mod tests {
     /// something `value_source` calls pure, which no trace would reveal
     /// because the fold would simply be conservative.
     ///
-    /// It used to be pinned against `is_effectful`, and that is how `Rng` got
-    /// through: `is_effectful` answers whether DCE and CSE must leave an op
-    /// alone, and deliberately calls `Rng` pure. Asking it here did not make
-    /// the test weaker, it made it wrong — it asserted the fold *must not*
-    /// name the one op it most needed to.
+    /// This list must be pinned against `Op::value_source`, not
+    /// `is_effectful`. `is_effectful` answers whether DCE and CSE must leave
+    /// an op alone, and deliberately calls `Rng` pure — so pinning against
+    /// it would assert the fold *must not* name the one op it most needs to
+    /// (because `Rng`'s ambient seed is a device fact the host cannot
+    /// replay).
     #[test]
     fn the_fold_only_generalises_over_pure_ops() {
         let mut checked = 0usize;

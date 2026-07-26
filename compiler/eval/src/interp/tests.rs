@@ -57,7 +57,7 @@ fn ping_pong_commits_and_back_pressures() {
         .unwrap();
     assert!(r.committed);
     // Third step: out (cap 1) still full ⇒ leading-put NeedsEmpty fails ⇒
-    // dummy-run, no commit, counter unchanged (§1 back-pressure).
+    // dummy-run, no commit, counter unchanged (back-pressure).
     let r = inst
         .step(&b, &PassInputs::default(), &mut NoKernels)
         .unwrap();
@@ -436,9 +436,9 @@ fn numeric_contract_argmax_and_topk() {
 }
 
 /// The two axes of [`extremum`], every combination, on the inputs IEEE
-/// leaves to the caller. Four hand-written copies used to encode this; one
-/// mis-copied `&&` or identity would have been invisible in every
-/// comparison and wrong only in the bits.
+/// leaves to the caller. A single table makes mis-copying an `&&` or
+/// identity visible in the test output instead of hiding it behind a
+/// comparison that happened to agree for a different reason.
 #[test]
 fn the_extremum_rule_pins_nan_and_signed_zero() {
     const NAN: f32 = f32::NAN;

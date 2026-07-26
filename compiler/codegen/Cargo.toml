@@ -2,6 +2,7 @@
 name = "pie-codegen"
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
 authors = ["In Gim <in.gim@yale.edu>"]
 description = "Backend source emission for PTIR: the deterministic C ABI header and the CUDA/C++ and MSL projections of the RNG contract, generated from the IR tables so host and device cannot drift."
 license = "Apache-2.0"

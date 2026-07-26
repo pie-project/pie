@@ -14,10 +14,10 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec;
 use alloc::vec::Vec;
 
-use pie_ir::op::{ChannelIndex, Family, Op};
+use pie_ir::op::{Family, Op};
 use pie_ir::types::ValueId;
 
-use super::normalize::{NodeIndex, NormalizedStage, result_layout};
+use super::normalize::{ChannelSlot, NodeIndex, NormalizedStage, result_layout};
 use super::nucleus::LibraryMatch;
 use super::symbolic::Dimension;
 
@@ -26,9 +26,14 @@ pie_ir::declare_tagged_enum! {
     ///
     /// Enumerated into the C header as `PtirScheduleTemplate`.
     pub enum ScheduleTemplate {
+        /// The region only moves channel traffic and emits no arithmetic.
         Effects = 0, "effects";
+        /// One cooperative thread array per row — the default for compute.
         OneCtaPerRow = 1, "one_cta_per_row";
+        /// A row reduction wide enough (last dim > 32768) to split
+        /// hierarchically across blocks.
         HierarchicalRow = 2, "hierarchical_row";
+        /// The region is a library call, scheduled by that kernel.
         Library = 3, "library";
     }
 }
@@ -39,30 +44,49 @@ pie_ir::declare_tagged_enum! {
     ///
     /// Enumerated into the C header as `PtirLibraryOp`.
     pub enum LibraryOp {
+        /// Fused nucleus (top-p) sampling: softmax, top-p mask, Gumbel noise,
+        /// then argmax.
         NucleusSample = 0, "nucleus_sample";
+        /// Top-k selection ([`Op::TopK`]).
         TopK = 1, "top_k";
+        /// Descending sort ([`Op::SortDesc`]).
         Sort = 2, "sort";
+        /// A prefix scan — [`Op::CumSum`] or [`Op::CumProd`].
         Scan = 3, "scan";
+        /// Matrix multiply ([`Op::MatMul`]).
         MatMul = 4, "matmul";
+        /// A second-party kernel or sink call ([`Op::KernelCall`] /
+        /// [`Op::SinkCall`]).
         SecondParty = 5, "second_party";
     }
 }
 
+/// Whether a region is emitted as generated code or dispatched to a library.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RegionKind {
+    /// Emitted as generated device code.
     Generated,
+    /// Dispatched to the named [`LibraryOp`] kernel.
     Library(LibraryOp),
 }
 
+/// A channel write performed by a region.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChannelSink {
-    pub channel_slot: ChannelIndex,
+    /// The stage-local channel slot written, indexing
+    /// [`NormalizedStage::channel_bindings`].
+    pub channel_slot: ChannelSlot,
+    /// The value whose contents are put into the channel.
     pub value: ValueId,
 }
 
+/// One schedulable unit of a partition: a set of ops, its device schedule, and
+/// the values crossing its boundary.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Region {
+    /// Whether the region is generated or a library call.
     pub kind: RegionKind,
+    /// The device schedule chosen for the region.
     pub schedule: ScheduleTemplate,
     /// Positions in the stage's op list.
     pub nodes: Vec<NodeIndex>,
@@ -70,20 +94,26 @@ pub struct Region {
     pub inputs: Vec<ValueId>,
     /// Values the region defines that something outside it reads.
     pub outputs: Vec<ValueId>,
+    /// Channel writes ([`Op::ChanPut`]) performed inside the region.
     pub sinks: Vec<ChannelSink>,
 }
 
-
+/// Which of a stage's two partitions a [`RegionPartition`] is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PartitionKind {
+    /// One region per op; always correct, never fused.
     Singleton = 0,
+    /// Ops grouped by schedule with library dataflows lifted out.
     Fused = 1,
 }
 
+/// A stage partitioned into regions.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RegionPartition {
+    /// Which partition this is.
     pub kind: PartitionKind,
+    /// The regions, in stage op order.
     pub regions: Vec<Region>,
     /// Legacy wire bit retained for decoder compatibility. Revision 6 plans
     /// never request whole-stage fallback.
@@ -114,6 +144,10 @@ pub(crate) fn fused_partition(
     let matches_by_end: BTreeMap<NodeIndex, &LibraryMatch> = library_matches
         .iter()
         .map(|candidate| {
+            // Invariant: a `LibraryMatch` is only ever built by
+            // `recognize_library_dataflows` from a matched pattern, and every
+            // pattern names at least one node — an empty match would describe
+            // a library call over no ops.
             (
                 *candidate.nodes.last().expect("library match has nodes"),
                 candidate,
@@ -138,13 +172,14 @@ pub(crate) fn fused_partition(
             continue;
         }
 
-        // Nothing else can break the run. `compatible_schedule` used to sit
-        // here, refusing to fuse cumsum/cumprod/sort_desc/top_k/matmul with a
-        // neighbour -- but every one of those five is a `library_op_for_tag`
-        // op, so the branch above took them and `continue`d before this line
-        // could see one. It was provably `true`, and read as a scheduling
-        // policy the planner did not have. If a *generated* op ever needs its
-        // own run, the check comes back here, against a table, not a list.
+        // Nothing else can break the run, and a per-op schedule check here
+        // would be dead code: the only ops worth refusing to fuse --
+        // cumsum, cumprod, sort_desc, top_k, matmul -- are all
+        // `library_op_for_tag` ops, so the branch above takes them and
+        // `continue`s before this line can see one. Such a check reads as a
+        // scheduling policy the planner does not have while being provably
+        // `true`. If a *generated* op ever needs a run of its own, the check
+        // belongs here and must be driven by a table, not a hand-kept list.
         generated.push(node);
     }
     flush_generated_region(stage, index, &mut regions, &mut generated);
@@ -221,21 +256,23 @@ pub(crate) fn region_kind_for_node(stage: &NormalizedStage, node: NodeIndex) -> 
 
 /// A stage's SSA layout and consumer map, computed once.
 ///
-/// `build_region` used to recompute `result_layout` and rebuild the whole
-/// consumer map on every call, and `singleton_partition` calls it once per op
-/// — so partitioning an N-op stage did N passes over N ops. That is a clean
-/// quadratic: 128 ops planned in 1.2 ms, 1024 in 65 ms, 4096 in 1.1 s, with
-/// `singleton_partition` accounting for >95% of it. Since a stage body is
-/// bounded only by the container length, and the container is guest-supplied,
-/// the curve was reachable from untrusted input. Hoisting the two tables out
-/// of the loop makes partitioning linear.
+/// Computed once per stage and shared, which is what keeps partitioning
+/// linear. `singleton_partition` calls `build_region` once per op, so a
+/// `build_region` that recomputed the result layout and consumer map itself
+/// would do N passes over N ops — a clean quadratic, measured at 1.2 ms for
+/// 128 ops, 65 ms for 1024 and 1.1 s for 4096, with `singleton_partition`
+/// accounting for over 95% of it. A stage body is bounded only by the
+/// container length and the container is guest-supplied, so that curve is
+/// reachable from untrusted input rather than being a benchmark curiosity.
+/// Anything derived from the whole stage belongs here, not inside a per-op
+/// call.
 ///
 /// It is also the only place the node space and the value space meet: every
-/// table here is keyed by one and yields the other, and the accessors are
-/// what make that direction checkable. `recognize_library_dataflows` used to
-/// rebuild all three by hand and pass them down as three bare slices, so the
-/// nucleus matcher took `bases`, `producer` and `consumers` next to each
-/// other and had to cast on every use.
+/// table here is keyed by one and yields the other, and the accessors are what
+/// make that direction checkable. Passing `bases`, `producer` and `consumers`
+/// down as three bare slices instead puts three same-shaped `Vec`s next to
+/// each other with nothing but argument order distinguishing a node index from
+/// a value id, and every use needs a cast.
 pub(crate) struct StageIndex {
     /// First SSA id each op defines.
     bases: Vec<ValueId>,
@@ -299,8 +336,10 @@ pub(crate) fn build_region(
             }
         }
         if let Op::ChanPut { chan, value } = *op {
+            // `chan` is already stage-local: `localize_stage` rewrote it
+            // before regions were formed.
             sinks.push(ChannelSink {
-                channel_slot: chan,
+                channel_slot: ChannelSlot(chan),
                 value,
             });
         }

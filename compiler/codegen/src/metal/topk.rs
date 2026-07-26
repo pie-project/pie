@@ -5,7 +5,8 @@
 //! index results. The `top_k` op defines two results, so the emitter needs the
 //! node's result base as well as its argument.
 
-use alloc::string::{String, ToString};
+use crate::error::{EmitError, RegionForm};
+use alloc::string::String;
 use core::fmt::Write as _;
 use pie_ir::op::tags;
 
@@ -153,18 +154,18 @@ pub fn emit_grouped_topk(
     function_name: &str,
     stage: &CompiledStage,
     region: &Region,
-) -> Result<String, String> {
+) -> Result<String, EmitError> {
     if !is_library(region)
         || library_op_byte(region) != LibraryOp::TopK as u8
         || !library_region_valid(stage, region)
     {
-        return Err("invalid grouped TopK library region".to_string());
+        return Err(EmitError::LibraryRegionAbiInvalid(RegionForm::GroupedTopK));
     }
     let ops: alloc::vec::Vec<OpView> = OpView::of_all(&stage.normalized.ops);
     let bases = result_bases(&ops);
     let topk_node = region.nodes[0].index();
     if topk_node >= ops.len() {
-        return Err("TopK library node is out of range".to_string());
+        return Err(EmitError::RegionNodeOutOfRange(RegionForm::GroupedTopK));
     }
     let topk = &ops[topk_node];
     if topk.tag != tags::TOP_K
@@ -172,7 +173,7 @@ pub fn emit_grouped_topk(
         || topk.results != 2
         || bases[topk_node] as usize + 1 >= stage.normalized.value_types.len()
     {
-        return Err("TopK library node is invalid".to_string());
+        return Err(EmitError::RegionNodesUnordered(RegionForm::GroupedTopK));
     }
 
     let mut source = String::new();

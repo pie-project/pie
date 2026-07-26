@@ -8,14 +8,16 @@
 //! ([`DType`] likewise), and `"unsupported singleton op <name>"`
 //! ([`Op`](pie_ir::op::Op) only names known tags).
 
-use alloc::string::{String, ToString};
+use crate::error::{EmitError, RegionForm, ValueLayoutSite};
+use crate::wellformed::{region_ranges_valid, value_types_valid};
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use pie_ir::op::{OP_TABLE, VARIADIC, intrinsic_tags, tags};
-use pie_ir::types::{DType, MAX_RANK};
+use pie_ir::types::DType;
 use pie_plan::{
     CompiledStage, Dimension, LibraryOp, PartitionKind, Region, RegionKind, RegionPartition,
-    ScheduleTemplate, SymbolicType,
+    ScheduleTemplate,
 };
 
 use super::M1OpMeta;
@@ -60,24 +62,23 @@ pub fn metal_intrinsic_supported(intr: u16) -> bool {
 /// Scoped to the region's own nodes: a sibling region in the same stage may
 /// legitimately read `logits`, and rejecting the whole stage for that would
 /// refuse plans the backend can emit.
-pub fn intrinsics_bindable(ops: &[OpView], region: &Region) -> Result<(), String> {
+pub fn intrinsics_bindable(ops: &[OpView], region: &Region) -> Result<(), EmitError> {
     for &node in &region.nodes {
         let Some(op) = ops.get(node.index()) else {
             continue;
         };
         if op.tag == tags::INTRINSIC_VAL && !metal_intrinsic_supported(op.intr) {
-            return Err(unbindable_intrinsic(op.intr));
+            return Err(EmitError::UnbindableIntrinsic { intrinsic: op.intr });
         }
     }
     Ok(())
 }
 
-fn unbindable_intrinsic(intr: u16) -> String {
-    alloc::format!(
-        "Metal binds only the logits buffer for intrinsics; intrinsic id {intr} has no binding"
-    )
-}
-
+/// Whether `region` is a well-formed grouped nucleus-sampling library region.
+///
+/// Accepts both arities the planner emits: the plain `[logits, top_p, state]`,
+/// and the temperature-scaled `[raw_logits, scale, logits, top_p, state]` left
+/// when the dividing `Div` stays outside the region.
 pub fn nucleus_library_region_valid(stage: &CompiledStage, region: &Region) -> bool {
     let value_types = &stage.normalized.value_types;
     // Two arities are legal, and this only knew one. The plain form is
@@ -171,57 +172,13 @@ pub fn used_channel_slots(ops: &[OpView]) -> usize {
     count
 }
 
-fn value_type_valid(value_type: &SymbolicType) -> Result<(), String> {
-    if value_type.dims.len() > MAX_RANK {
-        return Err("invalid normalized value type".to_string());
-    }
-    let mut product: u64 = 1;
-    for dimension in &value_type.dims {
-        let Dimension::Static(extent) = *dimension else {
-            continue;
-        };
-        if extent == 0 || product > u64::from(u32::MAX) / u64::from(extent) {
-            return Err("normalized value shape product exceeds u32".to_string());
-        }
-        product *= u64::from(extent);
-    }
-    Ok(())
-}
-
-fn partition_valid(stage: &CompiledStage, partition: &RegionPartition) -> Result<(), String> {
-    let ops = &stage.normalized.ops;
-    let value_types = &stage.normalized.value_types;
-    let channel_bindings = &stage.normalized.channel_bindings;
+/// Well-formedness, plus the one rule that is Metal's own: a library region
+/// must match the ABI of the tier-0 kernel this backend will dispatch for it.
+fn partition_valid(stage: &CompiledStage, partition: &RegionPartition) -> Result<(), EmitError> {
     for region in &partition.regions {
-        if region.nodes.iter().any(|node| node.index() >= ops.len()) {
-            return Err("region node out of range".to_string());
-        }
-        if region.nodes.windows(2).any(|pair| pair[0] >= pair[1]) {
-            return Err("region node indices are not strictly ordered".to_string());
-        }
-        if region
-            .inputs
-            .iter()
-            .any(|value| *value as usize >= value_types.len())
-        {
-            return Err("region input out of range".to_string());
-        }
-        if region
-            .outputs
-            .iter()
-            .any(|value| *value as usize >= value_types.len())
-        {
-            return Err("region output out of range".to_string());
-        }
-        for sink in &region.sinks {
-            if sink.channel_slot as usize >= channel_bindings.len()
-                || sink.value as usize >= value_types.len()
-            {
-                return Err("region sink out of range".to_string());
-            }
-        }
+        region_ranges_valid(stage, region, RegionForm::Unnamed)?;
         if !library_region_valid(stage, region) {
-            return Err("library region ABI is invalid".to_string());
+            return Err(EmitError::LibraryRegionAbiInvalid(RegionForm::Unnamed));
         }
     }
     Ok(())
@@ -229,7 +186,7 @@ fn partition_valid(stage: &CompiledStage, partition: &RegionPartition) -> Result
 
 /// `validate_singleton_plan` — accept a stage for the one-op-per-dispatch
 /// tier, returning the per-op metadata the driver dispatches from.
-pub fn validate_singleton_plan(stage: &CompiledStage) -> Result<Vec<M1OpMeta>, String> {
+pub fn validate_singleton_plan(stage: &CompiledStage) -> Result<Vec<M1OpMeta>, EmitError> {
     let (operations, result) = validate_singleton_plan_partial(stage);
     result.map(|()| operations)
 }
@@ -243,13 +200,13 @@ pub fn validate_singleton_plan(stage: &CompiledStage) -> Result<Vec<M1OpMeta>, S
 /// pin *where* validation gave up, not just that it did.
 pub fn validate_singleton_plan_partial(
     stage: &CompiledStage,
-) -> (Vec<M1OpMeta>, Result<(), String>) {
+) -> (Vec<M1OpMeta>, Result<(), EmitError>) {
     let mut operations = Vec::new();
     let result = validate_into(stage, &mut operations);
     (operations, result)
 }
 
-fn validate_into(stage: &CompiledStage, operations: &mut Vec<M1OpMeta>) -> Result<(), String> {
+fn validate_into(stage: &CompiledStage, operations: &mut Vec<M1OpMeta>) -> Result<(), EmitError> {
     let normalized = &stage.normalized;
     let value_types = &normalized.value_types;
     let names = &normalized.names;
@@ -259,24 +216,22 @@ fn validate_into(stage: &CompiledStage, operations: &mut Vec<M1OpMeta>) -> Resul
         || pie_ir::fnv1a64(&stage.signature.canonical_bytes) != stage.signature.hash
         || stage.singleton.kind != PartitionKind::Singleton
     {
-        return Err("invalid singleton plan identity".to_string());
+        return Err(EmitError::SingletonPlanIdentityInvalid);
     }
-    for value_type in value_types {
-        value_type_valid(value_type)?;
-    }
+    value_types_valid(stage)?;
     partition_valid(stage, &stage.singleton)?;
     partition_valid(stage, &stage.fused)?;
 
     let ops = OpView::of_all(&normalized.ops);
     if stage.singleton.regions.len() != ops.len() {
-        return Err("singleton partition must contain one region per normalized op".to_string());
+        return Err(EmitError::SingletonPartitionArityMismatch);
     }
     operations.reserve(ops.len());
     let mut result_base: u32 = 0;
     for (node, op) in ops.iter().enumerate() {
         let region = &stage.singleton.regions[node];
         if region.nodes.len() != 1 || region.nodes[0].index() != node {
-            return Err("singleton region/node ordering mismatch".to_string());
+            return Err(EmitError::SingletonRegionOrderingMismatch);
         }
         // The C++ rejects an unknown tag here; `Op` has none.
         let spec = OP_TABLE
@@ -295,14 +250,14 @@ fn validate_into(stage: &CompiledStage, operations: &mut Vec<M1OpMeta>) -> Resul
                     .get(op.args[0] as usize)
                     .is_some_and(|argument| *argument == value_types[result_base as usize]);
             if !identity {
-                return Err("unsupported Metal semantic kernel boundary".to_string());
+                return Err(EmitError::UnsupportedKernelBoundary);
             }
         } else if op.tag == tags::SINK_CALL
             && names.get(op.name_idx as usize).map(String::as_str) != Some("metal.discard")
         {
-            return Err("unsupported Metal semantic sink boundary".to_string());
+            return Err(EmitError::UnsupportedSinkBoundary);
         } else if op.tag == tags::INTRINSIC_VAL && !metal_intrinsic_supported(op.intr) {
-            return Err(unbindable_intrinsic(op.intr));
+            return Err(EmitError::UnbindableIntrinsic { intrinsic: op.intr });
         }
         let expected_arity = if op.tag == tags::PIVOT_THRESHOLD {
             1
@@ -310,26 +265,26 @@ fn validate_into(stage: &CompiledStage, operations: &mut Vec<M1OpMeta>) -> Resul
             spec.val_operands
         };
         if expected_arity != VARIADIC && op.args.len() != expected_arity as usize {
-            return Err("normalized op arity mismatch".to_string());
+            return Err(EmitError::NormalizedOpArityMismatch);
         }
         if op.results != u32::from(spec.results)
             || result_base > u32::MAX - op.results
             || (result_base + op.results) as usize > value_types.len()
         {
-            return Err("normalized op result range is invalid".to_string());
+            return Err(EmitError::NormalizedOpResultRangeInvalid);
         }
         if op.args.iter().any(|argument| *argument >= result_base) {
-            return Err("normalized SSA operand is not a prior value".to_string());
+            return Err(EmitError::NormalizedOperandNotPriorValue);
         }
         if op.tag == tags::PIVOT_THRESHOLD && (op.pred_tag > 2 || op.pred_payload >= result_base) {
-            return Err("pivot predicate payload is out of range".to_string());
+            return Err(EmitError::PivotPredicatePayloadOutOfRange);
         }
         let channel_op =
             op.tag == tags::CHAN_TAKE || op.tag == tags::CHAN_READ || op.tag == tags::CHAN_PUT;
         if (channel_op && (op.chan < 0 || op.chan as usize >= channel_bindings.len()))
             || (!channel_op && op.chan >= 0)
         {
-            return Err("normalized channel slot is invalid".to_string());
+            return Err(EmitError::NormalizedChannelSlotInvalid);
         }
         operations.push(M1OpMeta {
             node: node as u32,
@@ -339,13 +294,12 @@ fn validate_into(stage: &CompiledStage, operations: &mut Vec<M1OpMeta>) -> Resul
         result_base += op.results;
     }
     if stage.singleton.whole_stage_fallback {
-        return Err(
-            "singleton plan requests whole-stage fallback without an identifiable unsupported op"
-                .to_string(),
-        );
+        return Err(EmitError::WholeStageFallbackWithoutCause);
     }
     if result_base as usize != value_types.len() {
-        return Err("normalized value layout does not match op results".to_string());
+        return Err(EmitError::NormalizedValueLayoutMismatch(
+            ValueLayoutSite::MetalNormalized,
+        ));
     }
     Ok(())
 }

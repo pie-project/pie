@@ -1789,6 +1789,12 @@ struct ScanCache {
     taken_at: Option<(u64, bool)>,
 }
 
+/// Reused across frames: `post_frame` places each picked fire into its
+/// sealed slot, and a fresh `Vec` per frame would be a ~650 KB allocation on
+/// the loop's critical path. Compaction `take()`s every slot, so the buffer
+/// comes back empty and only ever grows.
+type SlotBuffer = Vec<Vec<Option<PendingRequest>>>;
+
 struct SchedulerControl {
     tx: crossbeam::channel::Sender<SchedulerItem>,
     active_senders: AtomicUsize,
@@ -2214,6 +2220,7 @@ impl BatchScheduler {
         let mut instances = HashMap::new();
         let mut pending = PendingQueue::default();
         let mut scan_cache = ScanCache::default();
+        let mut slot_buffer = SlotBuffer::new();
         let mut terminated_processes: HashSet<ProcessId> = HashSet::new();
         let mut in_flight_launches = VecDeque::new();
         let mut in_flight_control = None;
@@ -2332,6 +2339,7 @@ impl BatchScheduler {
                 &stats,
                 &mut frame_policy,
                 &mut scan_cache,
+                &mut slot_buffer,
                 stopping,
             );
             progress |= dispatched;
@@ -3159,10 +3167,12 @@ impl BatchScheduler {
         stats: &Arc<SchedulerStats>,
         frame_policy: &mut FramePolicy,
         scan_cache: &mut ScanCache,
+        slot_buffer: &mut SlotBuffer,
         stopping: bool,
     ) -> (bool, Option<Duration>) {
         let (mut progress, wait_hint) = Self::dispatch_frame_work(
             scan_cache,
+            slot_buffer,
             frame_policy,
             driver_lane,
             lane_inflight,
@@ -3596,6 +3606,7 @@ impl BatchScheduler {
     #[allow(clippy::too_many_arguments)]
     fn dispatch_frame_work(
         scan_cache: &mut ScanCache,
+        slot_buffer: &mut SlotBuffer,
         frame_policy: &mut FramePolicy,
         driver_lane: &DriverLane,
         lane_inflight: &mut u64,
@@ -3681,6 +3692,7 @@ impl BatchScheduler {
             let post_started = probe.then(Instant::now);
             #[allow(clippy::let_and_return)]
             let (frame_progress, posted) = Self::post_frame(
+                slot_buffer,
                 driver_lane,
                 lane_inflight,
                 lane_token,
@@ -3715,7 +3727,32 @@ impl BatchScheduler {
     /// settled/stale, assemble the v14 frame submission, and post it as ONE
     /// launch. Returns (progress, posted-a-frame).
     #[allow(clippy::too_many_arguments)]
+    /// Whether a queued fire still belongs in the frame being built; settles
+    /// it with a rejection if not.
+    fn admits_to_frame(
+        request: &PendingRequest,
+        instances: &HashMap<u64, TrackedInstance>,
+    ) -> bool {
+        if request.completion.is_settled() || request.completion.cancel_requested() {
+            if !request.completion.is_settled() {
+                request
+                    .completion
+                    .reject_unsubmitted("logical fire cancelled before native launch");
+            }
+            return false;
+        }
+        if !instances.contains_key(&request.instance_id) {
+            request.completion.reject_unsubmitted(format!(
+                "instance {} is unknown or stale",
+                request.instance_id
+            ));
+            return false;
+        }
+        true
+    }
+
     fn post_frame(
+        slot_buffer: &mut SlotBuffer,
         driver_lane: &DriverLane,
         lane_inflight: &mut u64,
         lane_token: &mut u64,
@@ -3728,62 +3765,99 @@ impl BatchScheduler {
         waves: &[Vec<u64>],
     ) -> (bool, bool) {
         let mut progress = false;
-        let mut wave_of: HashMap<u64, usize> = HashMap::new();
+        let sub = super::fire_timing_enabled().then(Instant::now);
+        // One map, carrying BOTH the wave and the in-wave position: the
+        // position is the sealed wave's id order (lane admission order), so
+        // carrying it here lets the sort below compare plain integers. The
+        // previous shape hashed twice per queued launch (`contains_key` then
+        // index) and rebuilt a second id->position map per wave that the sort
+        // comparator then hashed into once per comparison — n log n hash
+        // lookups on the loop's hottest per-fire path at 512 fires a frame.
+        let mut slot_of: HashMap<u64, (usize, usize)> =
+            HashMap::with_capacity(waves.iter().map(Vec::len).sum());
         for (index, wave) in waves.iter().enumerate() {
-            for &fire_id in wave {
-                wave_of.insert(fire_id, index);
+            for (position, &fire_id) in wave.iter().enumerate() {
+                slot_of.insert(fire_id, (index, position));
             }
         }
+        let t_drain = sub.map(|t| {
+            super::LOOP_PHASES
+                .post_map_ns
+                .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            Instant::now()
+        });
         let mut kept: VecDeque<QueuedItem> = VecDeque::with_capacity(pending.len());
-        let mut picked_waves: Vec<Vec<PendingRequest>> =
-            (0..waves.len()).map(|_| Vec::new()).collect();
+        let drained = pending.len() as u64;
+        // Place by slot rather than push-then-sort. `position` is already a
+        // permutation of `0..wave.len()`, so the sealed order is recovered by
+        // writing each request straight into its slot: one move per fire,
+        // against the n log n swaps of a 1288-byte element that sorting cost.
+        // The buffer is caller-owned and comes back empty from the last
+        // frame, so steady state neither allocates nor refills.
+        slot_buffer.resize_with(waves.len(), Vec::new);
+        for (slots, wave) in slot_buffer.iter_mut().zip(waves) {
+            debug_assert!(slots.iter().all(Option::is_none));
+            if slots.len() < wave.len() {
+                slots.resize_with(wave.len(), || None);
+            }
+        }
+        // A fire id repeated across the queue cannot be placed twice; it is
+        // degenerate, but it must still be dispatched rather than dropped.
+        let mut collisions: Vec<(usize, PendingRequest)> = Vec::new();
         while let Some(item) = pending.pop_front() {
             match item {
-                QueuedItem::Launch(request) if wave_of.contains_key(&request.logical_fire_id) => {
-                    picked_waves[wave_of[&request.logical_fire_id]].push(request);
-                }
+                QueuedItem::Launch(request) => match slot_of.get(&request.logical_fire_id) {
+                    Some(&(wave, position)) => {
+                        let slot = &mut slot_buffer[wave][position];
+                        if slot.is_none() {
+                            *slot = Some(request);
+                        } else {
+                            collisions.push((wave, request));
+                        }
+                    }
+                    None => kept.push_back(QueuedItem::Launch(request)),
+                },
                 item => kept.push_back(item),
             }
         }
         pending.replace(kept);
-        // In-wave order: the sealed wave's id order (lane admission order).
-        for (wave, ids) in picked_waves.iter_mut().zip(waves) {
-            let order: HashMap<u64, usize> = ids
-                .iter()
-                .enumerate()
-                .map(|(index, &fire_id)| (fire_id, index))
-                .collect();
-            wave.sort_by_key(|request| order[&request.logical_fire_id]);
-        }
-        // Drop settled/cancelled/stale fires — the frame posts without them.
-        let mut survivors: Vec<Vec<PendingRequest>> = Vec::with_capacity(picked_waves.len());
-        for wave in picked_waves {
-            let mut kept_wave = Vec::with_capacity(wave.len());
-            for request in wave {
-                if request.completion.is_settled() || request.completion.cancel_requested() {
-                    if !request.completion.is_settled() {
-                        request
-                            .completion
-                            .reject_unsubmitted("logical fire cancelled before native launch");
-                    }
+        let t_filter = t_drain.map(|t| {
+            let acc = &super::LOOP_PHASES;
+            acc.post_drain_ns
+                .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            acc.post_drain_n.fetch_add(drained, Ordering::Relaxed);
+            Instant::now()
+        });
+        // Compact the slots and drop settled/cancelled/stale fires in one
+        // pass — the frame posts without them.
+        let mut survivors: Vec<Vec<PendingRequest>> = Vec::with_capacity(waves.len());
+        for slots in slot_buffer.iter_mut() {
+            let mut kept_wave = Vec::with_capacity(slots.len());
+            for request in slots.iter_mut().filter_map(Option::take) {
+                if Self::admits_to_frame(&request, instances) {
+                    kept_wave.push(request);
+                } else {
                     progress = true;
-                    continue;
                 }
-                if !instances.contains_key(&request.instance_id) {
-                    request.completion.reject_unsubmitted(format!(
-                        "instance {} is unknown or stale",
-                        request.instance_id
-                    ));
-                    progress = true;
-                    continue;
-                }
-                kept_wave.push(request);
             }
             survivors.push(kept_wave);
+        }
+        for (wave, request) in collisions {
+            if Self::admits_to_frame(&request, instances) {
+                survivors[wave].push(request);
+            } else {
+                progress = true;
+            }
+        }
+        if let Some(t) = t_filter {
+            super::LOOP_PHASES
+                .post_filter_ns
+                .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
         if survivors.iter().all(Vec::is_empty) {
             return (progress, false);
         }
+        let t_tail = sub.map(|_| Instant::now());
         let timing_enabled = super::fire_timing_enabled();
         let dispatch_started_us = timing_enabled.then(super::fire_timing_now_us);
         if let Some(now_us) = dispatch_started_us {
@@ -3822,6 +3896,12 @@ impl BatchScheduler {
             deferred_pipelines: 0,
             depth_capped_pipelines: 0,
         });
+        if let Some(t) = t_tail {
+            super::LOOP_PHASES
+                .post_tail_ns
+                .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+        let t_tail = sub.map(|_| Instant::now());
         for request in &requests {
             if let Some(instance) = instances.get_mut(&request.instance_id) {
                 instance.in_flight += 1;
@@ -3848,6 +3928,11 @@ impl BatchScheduler {
                 pending.len(),
                 in_flight_launches.len(),
             ));
+        }
+        if let Some(t) = t_tail {
+            super::LOOP_PHASES
+                .post_tail_ns
+                .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
         (true, true)
     }
@@ -3878,16 +3963,24 @@ impl BatchScheduler {
                 }
                 _ => None,
             };
-            let retired = in_flight_launches.pop_front().expect("front batch exists");
+            let mut retired = in_flight_launches.pop_front().expect("front batch exists");
             let native_complete_us = retired.timing.as_ref().map(|_| super::fire_timing_now_us());
             let timing_snapshots = retired
                 .timing
                 .as_ref()
                 .map(|_| Self::fire_timing_snapshots(&retired.requests));
+            let sub = super::fire_timing_enabled().then(Instant::now);
             for request in &retired.requests {
                 if let Some(instance) = instances.get_mut(&request.instance_id) {
                     instance.in_flight = instance.in_flight.saturating_sub(1);
                 }
+            }
+            if let Some(mark) = sub {
+                let acc = &super::LOOP_PHASES;
+                acc.retire_instances_ns
+                    .fetch_add(mark.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                acc.retire_n
+                    .fetch_add(retired.requests.len() as u64, Ordering::Relaxed);
             }
             if let Some(message) = launch_failure {
                 if let (Some(timing), Some(native_complete_us), Some(snapshots)) =
@@ -3917,16 +4010,24 @@ impl BatchScheduler {
             let result = result.expect("accepted batch carries a settled result");
             match result {
                 Ok(()) => {
+                    let t_mark = sub.map(|_| Instant::now());
                     for request in &retired.requests {
                         request.completion.mark_native_retired();
                     }
+                    let t_resolve = t_mark.map(|t| {
+                        super::LOOP_PHASES
+                            .retire_mark_ns
+                            .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        Instant::now()
+                    });
                     if retired.timing.is_some() {
                         super::LAST_RESOLVE_US
                             .store(super::fire_timing_now_us(), Ordering::Relaxed);
                     }
-                    let mut outcomes = Vec::with_capacity(retired.requests.len());
+                    let requests = std::mem::take(&mut retired.requests);
+                    let mut outcomes = Vec::with_capacity(requests.len());
                     let mut token_instance_ids = Vec::new();
-                    for request in retired.requests {
+                    for request in &requests {
                         match request.completion.resolve_from_terminal() {
                             Ok(WorkItemAttemptOutcome::Committed) => {
                                 outcomes.push("committed");
@@ -3963,6 +4064,19 @@ impl BatchScheduler {
                             }
                         }
                     }
+                    let t_drop = t_resolve.map(|t| {
+                        super::LOOP_PHASES
+                            .retire_resolve_ns
+                            .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        Instant::now()
+                    });
+                    drop(requests);
+                    let t_emit = t_drop.map(|t| {
+                        super::LOOP_PHASES
+                            .retire_drop_ns
+                            .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        Instant::now()
+                    });
                     if let (Some(timing), Some(native_complete_us), Some(snapshots)) =
                         (retired.timing, native_complete_us, timing_snapshots)
                     {
@@ -3979,6 +4093,11 @@ impl BatchScheduler {
                             Self::queued_untracked_riders(pending),
                             &token_instance_ids,
                         );
+                    }
+                    if let Some(t) = t_emit {
+                        super::LOOP_PHASES
+                            .retire_emit_ns
+                            .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
                     }
                     stats::record_fire_stats(
                         stats,
@@ -4121,16 +4240,37 @@ impl BatchScheduler {
             take(&gacc.work_max_ns) / 1_000,
             take(&gacc.n),
         );
+        let (retire_instances, retire_mark, retire_resolve, retire_drop, retire_emit, retire_n) = (
+            take(&acc.retire_instances_ns) / 1_000,
+            take(&acc.retire_mark_ns) / 1_000,
+            take(&acc.retire_resolve_ns) / 1_000,
+            take(&acc.retire_drop_ns) / 1_000,
+            take(&acc.retire_emit_ns) / 1_000,
+            take(&acc.retire_n),
+        );
         let (loop_scan, loop_plan, loop_post, loop_scans) = (
             take(&acc.scan_ns) / 1_000,
             take(&acc.plan_ns) / 1_000,
             take(&acc.post_ns) / 1_000,
             take(&acc.scans),
         );
+        let (post_map, post_drain, post_filter, post_tail, post_drain_n) = (
+            take(&acc.post_map_ns) / 1_000,
+            take(&acc.post_drain_ns) / 1_000,
+            take(&acc.post_filter_ns) / 1_000,
+            take(&acc.post_tail_ns) / 1_000,
+            take(&acc.post_drain_n),
+        );
         let mut record = serde_json::json!({
             "schema": 1,
             "source": "scheduler",
             "event": "scheduler_wave",
+            "planner_parks_total": crate::planner::planner()
+                .map(|planner| planner.park_census().0)
+                .unwrap_or(0),
+            "planner_parked_now": crate::planner::planner()
+                .map(|planner| planner.park_census().1)
+                .unwrap_or(0),
             "wave_id": timing.wave_id,
             "membership_hash": timing.membership_hash,
             "cuda_submitted": cuda_submitted,
@@ -4176,6 +4316,17 @@ impl BatchScheduler {
                 ("loop_scan_us", loop_scan),
                 ("loop_plan_us", loop_plan),
                 ("loop_post_us", loop_post),
+                ("post_map_us", post_map),
+                ("post_drain_us", post_drain),
+                ("post_filter_us", post_filter),
+                ("post_tail_us", post_tail),
+                ("post_drain_n", post_drain_n),
+                ("retire_instances_us", retire_instances),
+                ("retire_mark_us", retire_mark),
+                ("retire_resolve_us", retire_resolve),
+                ("retire_drop_us", retire_drop),
+                ("retire_emit_us", retire_emit),
+                ("retire_n", retire_n),
                 ("loop_scans", loop_scans),
                 (
                     "loop_lag_us",
@@ -5870,6 +6021,7 @@ mod tests {
             &stats,
             &mut frame_policy,
             &mut ScanCache::default(),
+            &mut SlotBuffer::new(),
             false,
         );
         assert!(progress);
@@ -6951,6 +7103,7 @@ mod tests {
         completion.request_cancel();
 
         let (progress, posted) = BatchScheduler::post_frame(
+            &mut SlotBuffer::new(),
             &lane,
             &mut lane_inflight,
             &mut lane_token,
@@ -7051,6 +7204,7 @@ mod tests {
             &stats,
             &mut frame_policy,
             &mut ScanCache::default(),
+            &mut SlotBuffer::new(),
             false,
         );
         assert!(progress, "the copy dispatch is progress");
@@ -7283,6 +7437,7 @@ mod tests {
                 &stats,
                 &mut frame_policy,
                 &mut ScanCache::default(),
+                &mut SlotBuffer::new(),
                 false,
             );
             pending.len()

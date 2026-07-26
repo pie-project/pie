@@ -13,11 +13,12 @@
 //! * **reshape aliasing** — a `reshape` whose result never leaves the region is
 //!   not emitted at all; its result id is aliased to its input's, so the copy
 //!   never exists rather than being generated and skipped.
-//! * **direct argmax** ([`analyze_direct_argmax`]) — an `argmax` fed by a
+//! * **direct argmax** (`analyze_direct_argmax`) — an `argmax` fed by a
 //!   logits intrinsic through nothing but reshapes reads the intrinsic's device
 //!   buffer straight, which makes both the intrinsic materialisation and the
 //!   reshapes redundant.
 
+use crate::error::{EmitError, EmitterKind, ValueLayoutSite};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
@@ -58,10 +59,12 @@ const DT_F32: u8 = 0;
 /// a clean status word. The single-thread path this competes with ends in
 /// `m1_fault(status, p.tag)`, so being wrong in the other direction is loud.
 ///
-/// Hence the explicit list (it used to be `EXP..=CAST` and `ADD..=SELECT`,
-/// which would absorb any tag allocated into a gap) and hence
-/// `parallel_elementwise_matches_the_cuda_runtime`, which reads the arms back
-/// out of the `.cuh` and fails if the two sides disagree either way.
+/// Hence the explicit list rather than tag ranges. A range like `EXP..=CAST`
+/// absorbs every tag later allocated into a gap inside it, which is precisely
+/// how a new op acquires the silent-wrong-answer behaviour instead of the loud
+/// one. And hence `parallel_elementwise_matches_the_cuda_runtime`, which reads
+/// the arms back out of the `.cuh` and fails if the two sides disagree in
+/// either direction.
 fn parallel_elementwise(tag: u8) -> bool {
     matches!(
         tag,
@@ -147,10 +150,11 @@ fn row_shape(dims: &[Dimension]) -> Option<RowShape> {
 /// which nodes that makes redundant.
 ///
 /// `source_value` and `requires_single_row` are not used by emission — the
-/// emitted kernel only needs to know *that* the rewrite applies. They exist
-/// because the driver's launch packer needs them, and shipping them from here
-/// is what keeps this the only implementation of the analysis
-/// (`ptir-refactor.md` §4.2).
+/// emitted kernel only needs to know *that* the rewrite applies. They are
+/// carried anyway because the driver's launch packer needs them, and shipping
+/// them from here is what keeps this the only implementation of the analysis.
+/// A driver that recomputed them would be a second implementation of a rule
+/// that has to match this one exactly.
 pub(crate) struct DirectArgmax {
     pub(crate) intrinsic: Vec<u16>,
     pub(crate) skipped: Vec<u8>,
@@ -238,21 +242,14 @@ pub(crate) fn analyze_direct_argmax(
     analysis
 }
 
-fn resolve_alias(aliases: &[u32], mut value: u32) -> u32 {
-    while aliases[value as usize] != value {
-        value = aliases[value as usize];
-    }
-    value
-}
-
 /// `emit_fused_region_cuda`.
 pub fn emit_fused_region(
     entry_name: &str,
     stage: &CompiledStage,
     region: &Region,
-) -> Result<String, String> {
+) -> Result<String, EmitError> {
     if !valid_identifier(entry_name) {
-        return Err("CUDA fused entry name is not a C identifier".to_string());
+        return Err(EmitError::EntryNameNotCIdentifier(EmitterKind::CudaFused));
     }
     validate_generated_region(stage, region)?;
 
@@ -260,10 +257,12 @@ pub fn emit_fused_region(
     let bases = result_bases(&ops);
     let next_value: u32 = ops.iter().map(|op| op.results).sum();
     if next_value as usize != stage.normalized.value_types.len() {
-        return Err("fused stage value layout does not match normalized ops".to_string());
+        return Err(EmitError::NormalizedValueLayoutMismatch(
+            ValueLayoutSite::CudaFusedStage,
+        ));
     }
 
-    let mut aliases: Vec<u32> = (0..next_value).collect();
+    let mut aliases = crate::alias::AliasTable::new();
     let direct = analyze_direct_argmax(stage, region, &bases);
     let mut skipped = direct.skipped;
 
@@ -381,14 +380,14 @@ pub fn emit_fused_region(
             && !region.outputs.contains(&base)
             && crate::alias::covers(&stage.normalized.value_types, op.args[0], base)
         {
-            aliases[base as usize] = resolve_alias(&aliases, op.args[0]);
+            aliases.elide(base, op.args[0]);
             continue;
         }
 
         // CUDA resolves reshape aliases before indexing the offsets table;
         // which value lands in which slot is shared with Metal.
         let mut slots = Slots::of(op, base, |value| {
-            format!("scratch + offsets[{}]", resolve_alias(&aliases, value))
+            format!("scratch + offsets[{}]", aliases.resolve(value))
         });
 
         source.push_str("  {\n");

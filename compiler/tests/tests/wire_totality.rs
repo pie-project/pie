@@ -1,21 +1,18 @@
 //! The container decoder, against every prefix and every bit-flip of real bytes.
 //!
-//! A hand-written list of malformed inputs — which this directory used to keep
-//! in `malformed_wire_corpus.txt` — is a good thing to have and it caught real
-//! count bombs, but a list only rejects the inputs on it. This file is the
-//! other half: it takes the encodings the compiler actually produces and
-//! mutates all of them, so the decoder answers to a property instead of to a
-//! set of examples. (That list went with the formats it described; all 27 of
-//! its cases were `PTRP` or `PTIB`.)
+//! A hand-written corpus of malformed inputs catches real count bombs, but a
+//! list only rejects the inputs on it — and it ages into a description of
+//! formats nobody parses any more. This file is the other half: it takes the
+//! encodings the compiler actually produces and mutates all of them, so the
+//! decoder answers to a property instead of to a set of examples.
 //!
 //! The seeds are every container the compiler can build — the golden corpus and
 //! the extended corpus both. That is the whole live surface: `PTIR` is the only
 //! byte format anything outside this directory parses
 //! (`runtime/engine/src/pipeline/program.rs` on program registration,
-//! `pipeline/fire/kv.rs`, `driver/dummy`). Two sibling formats used to be swept
-//! here as well, `PTRP` region plans and the `PTIB` bound-trace sidecar; both
-//! were deleted once it was established that nothing had ever decoded them, and
-//! sweeping them had amounted to fuzzing bytes this crate produced for itself.
+//! `pipeline/fire/kv.rs`, `driver/dummy`). Nothing else belongs in this sweep:
+//! fuzzing a format that only this crate writes and only this crate reads is
+//! fuzzing a round-trip, and it will pass no matter what either side does.
 //!
 //! Two claims are ratchets here:
 //!

@@ -1,4 +1,4 @@
-//! `Channel` — GPU-resident ordered memory (overview §1): a bounded queue of
+//! `Channel` — GPU-resident ordered memory: a bounded queue of
 //! cells with full/empty bits. Inside a traced stage, `take`/`read`/`put` record
 //! the IR's `ChanTake`/`ChanRead`/`ChanPut` ops; on the host they take the async
 //! path.
@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use pie_ir::types::{DType, Shape};
+use pie_ir::types::{DType, Shape, ValueType};
 
 use crate::context::{self, ChannelRef, ChannelState};
 use crate::error::Span;
@@ -18,7 +18,7 @@ use crate::value::{AsTensor, ConstData, IntoConst, IntoShape, Tensor, reshape_id
 
 static NEXT_GID: AtomicU64 = AtomicU64::new(1);
 
-/// A handle to a channel's shared state (overview §1). Cheap to clone; captured
+/// A handle to a channel's shared state. Cheap to clone; captured
 /// by both host code and the stage closures that read/write it.
 #[derive(Clone)]
 pub struct Channel {
@@ -26,35 +26,45 @@ pub struct Channel {
 }
 
 impl Channel {
-    /// `Channel::new([shape], dtype)` — a capacity-1 channel (overview §1).
+    /// `Channel::new([shape], dtype)` — a capacity-1 channel.
     pub fn new(shape: impl IntoShape, dtype: DType) -> Channel {
         Channel::build(shape.into_shape(), dtype, 1, None)
     }
 
     /// `Channel::from(v)` — sugar for `new` + `put`: a channel seeded full with
-    /// `v` (overview §1). `v` may be per-instance *data* (a request seed); the
-    /// seed is instance state, never in the container (D2).
+    /// `v`. `v` may be per-instance *data* (a request seed); the
+    /// seed is instance state, never in the container.
     pub fn from(v: impl IntoConst) -> Channel {
         let data = v.into_const();
         Channel::build(data.shape, data.dtype, 1, Some(data))
     }
 
-    /// `Channel::from_shaped([shape], v)` — like [`from`], but reinterprets the
+    /// `Channel::from_shaped([shape], v)` — like `from`, but reinterprets the
     /// flat seed data `v` with the explicit multi-dim `shape` (element counts
     /// must match). `IntoConst` only produces flat 1-D seeds, so use this for a
     /// concrete multi-dim seed (e.g. a `[B, POOL]` bool attention mask) that
     /// downstream ops (`gather`/`or`) type against as rank-2.
+    #[track_caller]
     pub fn from_shaped(shape: impl IntoShape, v: impl IntoConst) -> Channel {
         let mut data = v.into_const();
         let shape = shape.into_shape();
-        assert_eq!(
-            shape.numel(),
-            data.shape.numel(),
-            "from_shaped: element count mismatch ({:?} vs seed {:?})",
-            shape,
-            data.shape,
-        );
-        data.shape = shape;
+        if shape.numel() == data.shape.numel() {
+            data.shape = shape;
+        } else {
+            // Keep the seed's own shape. Reinterpreting under a shape of a
+            // different extent would either read past the seed or leave a tail
+            // of it unaddressable, and the resulting channel would then type
+            // downstream ops against a length its data cannot supply.
+            context::record_error(
+                alloc::format!(
+                    "Channel::from_shaped: {:?} holds {} elements but the seed holds {}",
+                    shape,
+                    shape.numel(),
+                    data.shape.numel()
+                ),
+                Span::here(),
+            );
+        }
         Channel::build(data.shape, data.dtype, 1, Some(data))
     }
 
@@ -70,11 +80,52 @@ impl Channel {
 
     /// Resolve a channel handle from its global id (the registry is
     /// thread-local, like the trace session). A guest-facing Copy token
-    /// (F9) stores only the gid; every op resolves through here.
+    /// stores only the gid; every op resolves through here.
     pub fn by_gid(gid: u64) -> Option<Channel> {
         context::channel_state_by_gid(gid).map(|state| Channel { state })
     }
 
+    /// Drop this channel's state from the registry, returning whether an
+    /// entry was there to drop.
+    ///
+    /// The counterpart to construction. Because the guest-facing handle is a
+    /// `Copy` token holding only a gid, the registry cannot learn from a
+    /// `Drop` that a channel is finished — so a frontend that creates
+    /// channels dynamically must say so here, at the point where it knows no
+    /// token survives. Everything a released gid names is gone: a later
+    /// [`Channel::by_gid`] returns `None`, and the SDK's resolve — which
+    /// `expect`s a hit, correctly, since an unregistered token is a frontend
+    /// bug — would panic.
+    ///
+    /// Do not call this for a channel still reachable from a stage closure or
+    /// a pending host `put`/`take`. Releasing mid-trace is the one way to
+    /// turn this registry's design into the failure a `Weak` would have made
+    /// routine.
+    ///
+    /// Inferlets as written today declare their channels once at setup and
+    /// never need this; it exists so that a guest with per-request channels
+    /// has a bounded option, and so that the retention is a stated policy
+    /// rather than an accident.
+    pub fn release(gid: u64) -> bool {
+        context::release_channel_state(gid)
+    }
+
+    /// How many channels the registry currently holds.
+    ///
+    /// The retention documented on [`Channel::release`] is otherwise
+    /// invisible: nothing observable changes as the map grows. A frontend
+    /// that creates channels dynamically can watch this to check its own
+    /// release discipline instead of discovering the growth as memory.
+    pub fn registered_count() -> usize {
+        context::registered_channel_count()
+    }
+
+    /// Returns whether the channel starts full with a seed value, so its
+    /// first `take` needs no producer.
+    ///
+    /// True for channels built by [`Channel::from`] or [`Channel::seeded`];
+    /// the seed is per-instance state supplied at instantiation, never part
+    /// of the container.
     pub fn is_seeded(&self) -> bool {
         self.state.borrow().seeded
     }
@@ -103,7 +154,7 @@ impl Channel {
         Channel { state }
     }
 
-    /// Widen the ring to `n` cells (deeper run-ahead; overview §1/§3).
+    /// Widen the ring to `n` cells (deeper run-ahead).
     pub fn capacity(self, n: u32) -> Channel {
         self.state.borrow_mut().capacity = n;
         self
@@ -118,9 +169,11 @@ impl Channel {
     pub(crate) fn state(&self) -> &ChannelRef {
         &self.state
     }
+    /// The scalar [`DType`] of the channel's cells.
     pub fn dtype(&self) -> DType {
         self.state.borrow().dtype
     }
+    /// The [`Shape`] of one cell (a single queue slot's tensor).
     pub fn shape(&self) -> Shape {
         self.state.borrow().shape
     }
@@ -142,12 +195,12 @@ impl Channel {
 
     /// Record a descriptor endpoint claim (take vs read per the port's
     /// consumption discipline) WITHOUT binding a port. The `inferlet` bridge
-    /// claims EAGERLY at pass construction (F8): with claims on the shared
+    /// claims EAGERLY at pass construction: with claims on the shared
     /// state before any pass's build, a channel consumed by a
     /// later-constructed sibling pass never misinfers as a terminal output —
     /// cross-pass handoffs need construction order, not an annotation. The
-    /// bridge's build then binds with [`Builder::bind_port_recorded`]
-    /// (crate::builder) so the claim is not double-counted.
+    /// bridge's build then binds with [`crate::builder::Builder::bind_port_recorded`]
+    /// so the claim is not double-counted.
     #[track_caller]
     pub fn note_desc_claim(&self, consumes: bool) {
         let span = Span::here();
@@ -174,7 +227,7 @@ impl Channel {
     }
 
     /// `read()` — full ⇒ copy, stays full; empty ⇒ block. A peek (does not claim
-    /// the consumer endpoint; overview §1/§3 `len`).
+    /// the consumer endpoint).
     #[track_caller]
     pub fn read(&self) -> Taken {
         let span = Span::here();
@@ -207,7 +260,7 @@ impl Channel {
                 // edge is decided at assembly (seed ⇔ a stage also produces it).
                 let mut st = self.state.borrow_mut();
                 st.host_puts.push(span);
-                let _ = data; // seed *values* are instance data (D2), not needed here
+                let _ = data; // seed *values* are instance data, not needed here
                 Put::done()
             }
         }
@@ -236,32 +289,57 @@ impl Taken {
             inner: TakenInner::Host { chan, consume },
         }
     }
-    /// The in-program `Tensor` (panics if this is a host take — a frontend bug).
+    /// The in-program `Tensor`.
+    ///
+    /// A host take has no in-program value: its bytes cross the driver
+    /// boundary and only exist after the program has run. Asking for one is
+    /// recorded as an authoring error and answered with a stand-in, so
+    /// [`Builder::build`] reports it with the rest.
+    ///
+    /// [`Builder::build`]: crate::builder::Builder::build
+    #[track_caller]
     pub fn tensor(self) -> Tensor {
         match self.inner {
             TakenInner::InProgram(t) => t,
-            TakenInner::Host { .. } => panic!("host channel take used as an in-program Tensor"),
+            TakenInner::Host { chan, .. } => host_take_poison(&chan),
         }
     }
 }
 
+/// Stand-in for a host take asked to act as an in-program value, typed as the
+/// channel it came from so the rest of the trace still checks.
+#[track_caller]
+fn host_take_poison(chan: &ChannelRef) -> Tensor {
+    let st = chan.borrow();
+    crate::value::poison(
+        alloc::format!(
+            "channel {} is a host channel: its take crosses the driver boundary and has no \
+             in-program value",
+            st.name
+        ),
+        ValueType::new(st.shape, st.dtype),
+    )
+}
+
 impl AsTensor for Taken {
+    #[track_caller]
     fn to_arg(&self) -> crate::value::Arg {
         match &self.inner {
             TakenInner::InProgram(t) => t.to_arg(),
-            TakenInner::Host { .. } => panic!("host channel take used as an in-program Tensor"),
+            TakenInner::Host { chan, .. } => host_take_poison(chan).to_arg(),
         }
     }
 }
 impl AsTensor for &Taken {
+    #[track_caller]
     fn to_arg(&self) -> crate::value::Arg {
         (*self).to_arg()
     }
 }
 
-// Host-side await surface (P3 wires real async over the driver channel).
+// Host-side await surface (wires real async over the driver channel).
 impl Taken {
-    /// Await the host value (P3). Consumes the cell for `take`, copies for `read`.
+    /// Await the host value. Consumes the cell for `take`, copies for `read`.
     pub async fn get<T: HostElem>(self) -> Result<Vec<T>, HostError> {
         match self.inner {
             TakenInner::Host { chan, consume } => {
@@ -273,11 +351,16 @@ impl Taken {
     }
 }
 
-/// Host errors surfaced by a blocked `take`/`read` (poison; overview §1).
+/// Host errors surfaced by a blocked `take`/`read` (poison).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum HostError {
+    /// The `take`/`read` resolved to poison instead of a value.
     Poisoned,
+    /// The channel has no host transport bound yet, so there is nothing to await.
     NotBound,
+    /// `get` was called on an in-program take, which has no host value: its
+    /// tensor lives in the trace, not across the driver boundary.
     InProgram,
 }
 
@@ -288,7 +371,7 @@ impl HostElem for u32 {}
 impl HostElem for f32 {}
 
 /// The (fire-and-forget) result of a `put`. Host puts coalesce before the next
-/// submit (D1); the handle exists so back-pressure can be awaited in P3.
+/// submit; the handle exists so back-pressure can be awaited.
 pub struct Put(());
 impl Put {
     fn done() -> Put {
@@ -302,12 +385,17 @@ impl Put {
 
 /// A value handed to `Channel::put`.
 pub enum PutValue {
+    /// An in-program value: a [`Tensor`] recorded into the trace.
     Tensor(Tensor),
+    /// Host bytes: a [`ConstData`] seed or host-writer payload staged across
+    /// the driver.
     Data(ConstData),
 }
 
 /// Anything puttable: a `Tensor` (in-program) or host data (arrays / vecs / scalars).
 pub trait IntoPut {
+    /// Coerces `self` into a [`PutValue`] — an in-program [`Tensor`] or host
+    /// [`ConstData`].
     fn into_put(self) -> PutValue;
 }
 
@@ -349,5 +437,49 @@ impl<const N: usize> IntoPut for [f32; N] {
 impl<const N: usize> IntoPut for [bool; N] {
     fn into_put(self) -> PutValue {
         PutValue::Data(self.into_const())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Construction registers and [`Channel::release`] unregisters — the
+    /// round trip the registry's ownership rests on.
+    #[test]
+    fn a_released_channel_stops_resolving() {
+        let before = Channel::registered_count();
+        let channel = Channel::new([4], DType::F32);
+        let gid = channel.gid();
+        assert_eq!(Channel::registered_count(), before + 1);
+        assert!(Channel::by_gid(gid).is_some());
+
+        assert!(Channel::release(gid), "the first release finds the entry");
+        assert_eq!(Channel::registered_count(), before);
+        assert!(
+            Channel::by_gid(gid).is_none(),
+            "a released gid no longer resolves"
+        );
+        assert!(
+            !Channel::release(gid),
+            "releasing twice is a no-op, not a panic"
+        );
+    }
+
+    /// The retention this documents: a channel outlives every handle to it,
+    /// because the handle is not what owns it. Dropping the DSL-side
+    /// `Channel` must leave the state resolvable, or the SDK's gid tokens
+    /// would dangle.
+    #[test]
+    fn dropping_a_handle_does_not_release_the_state() {
+        let gid = {
+            let channel = Channel::new([2], DType::F32);
+            channel.gid()
+        };
+        assert!(
+            Channel::by_gid(gid).is_some(),
+            "the registry owns the state, not the handle"
+        );
+        Channel::release(gid);
     }
 }

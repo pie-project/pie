@@ -2,6 +2,7 @@
 name = "pie-eval"
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
 authors = ["In Gim <in.gim@yale.edu>"]
 description = "The PTIR semantics oracle: the tier-0 reference interpreter every backend diffs against, and the host partial evaluator the engine folds stage prologues with (prefix-cache fire evidence, capability-less execution, geometry classification)."
 license = "Apache-2.0"

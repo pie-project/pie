@@ -12,7 +12,9 @@
 //! drivers' own emitters over the same plans (`compiler/tests/oracle/`, since
 //! deleted with those emitters). What survives is `golden-{msl,cuda}/`: 2,838
 //! cases that now serve as the Rust emitters' regression net. Bless with
-//! `PTIR_REGEN=1` only after reading `ptir-refactor.md` §3.2.
+//! `PTIR_REGEN=1` only when the emitted change is the point of the commit —
+//! a blanket re-bless turns this net into a transcript of whatever the
+//! emitters happen to do today.
 
 use pie_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use pie_ir::op::{IntrinsicId, Op};
@@ -335,10 +337,11 @@ fn staged(stage: Stage, channels: Vec<ChannelDecl>, ops: Vec<Op>) -> TraceContai
 /// `HierarchicalRow` schedule, and `Stage::OnAttn`.
 ///
 /// Kept apart from [`corpus_stages`] on purpose. That corpus is the input to
-/// `golden-{msl,cuda}/`, which are dumps of a C++ oracle that no longer exists;
-/// adding cases there would change the case list of files whose expected column
-/// can never be re-derived. These are pinned separately, against this
-/// compiler's own output, and their goldens say so.
+/// `golden-{msl,cuda}/`, whose expected columns were produced by an external
+/// oracle and cannot be re-derived here; adding cases there would change the
+/// case list of files nothing in this repository can regenerate. These are
+/// pinned separately, against this compiler's own output, and their goldens
+/// say so.
 pub fn extended_traces() -> Vec<(&'static str, TraceContainer, ModelProfile)> {
     let mut small = ModelProfile::dummy();
     small.vocab = 8;

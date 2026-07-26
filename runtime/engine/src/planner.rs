@@ -901,6 +901,16 @@ impl ResidencyPlanner {
     /// parks FCFS at the process's spawn position and is served out of the
     /// head-first accumulation. [`Acquired::Yield`] hands control back to
     /// the fire path when this process must settle its own tail (eviction).
+    /// Instrumentation: cumulative parks and the current parked width.
+    /// Sampling the width alone misses parks shorter than the sample
+    /// interval, which is what made an oversubscribed pool look idle.
+    pub fn park_census(&self) -> (u64, usize) {
+        (
+            self.stats.parks.load(Ordering::Relaxed),
+            self.waiters.load(Ordering::Acquire),
+        )
+    }
+
     pub async fn acquire(
         self: &Arc<Self>,
         pid: ProcessId,
