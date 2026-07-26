@@ -93,7 +93,15 @@ struct Output {
     /// Layers whose envelope tap actually fired, counted on-device.
     layers_observed: u32,
     /// Per-page criticality, max-reduced over layers, from the last step.
-    page_scores: Vec<f32>,
+    /// Non-finite bounds are meaningful here — `+inf` is an in-flight page and
+    /// `-inf` is a page outside the request — and JSON has no encoding for
+    /// them, so they are rendered as strings.
+    page_scores: Vec<String>,
+    /// How the last step's bounds broke down. `nan` is always a bug.
+    pages_finite: usize,
+    pages_pinned: usize,
+    pages_absent: usize,
+    pages_nan: usize,
     /// The pages Quest would have kept at the last step.
     kept_pages: Vec<u32>,
     /// True when at least one page carried a finite (i.e. genuinely scored)
@@ -342,7 +350,27 @@ async fn main(input: Input) -> Result<Output> {
         page_budget: budget,
         layers_observed,
         scored_any_page: last_scores.iter().any(|s| s.is_finite()),
-        page_scores: last_scores,
+        pages_finite: last_scores.iter().filter(|s| s.is_finite()).count(),
+        pages_pinned: last_scores.iter().filter(|s| **s == f32::INFINITY).count(),
+        pages_absent: last_scores
+            .iter()
+            .filter(|s| **s == f32::NEG_INFINITY)
+            .count(),
+        pages_nan: last_scores.iter().filter(|s| s.is_nan()).count(),
+        page_scores: last_scores
+            .iter()
+            .map(|s| {
+                if s.is_nan() {
+                    "nan".to_string()
+                } else if *s == f32::INFINITY {
+                    "inf".to_string()
+                } else if *s == f32::NEG_INFINITY {
+                    "-inf".to_string()
+                } else {
+                    format!("{s:.4}")
+                }
+            })
+            .collect(),
         kept_pages: kept,
     })
 }

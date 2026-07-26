@@ -169,7 +169,38 @@ __global__ void envelope_dot_kernel(
     if (threadIdx.x == 0) *out = buf[0];
 }
 
+// One thread per (page, kv_head, dim) triple of the empty envelope.
+__global__ void envelope_seed_empty_kernel(
+    float* __restrict__ env_min,
+    float* __restrict__ env_max,
+    std::size_t n)
+{
+    const std::size_t i =
+        static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    env_min[i] = INFINITY;
+    env_max[i] = -INFINITY;
+}
+
 }  // namespace
+
+void launch_envelope_seed_empty_f32(
+    float* env_min,
+    float* env_max,
+    int num_pages,
+    int num_kv_heads,
+    int head_dim,
+    cudaStream_t stream)
+{
+    if (num_pages <= 0 || num_kv_heads <= 0 || head_dim <= 0) return;
+    const std::size_t n = static_cast<std::size_t>(num_pages) *
+                          static_cast<std::size_t>(num_kv_heads) *
+                          static_cast<std::size_t>(head_dim);
+    const int threads = 256;
+    const std::size_t blocks = (n + threads - 1) / threads;
+    envelope_seed_empty_kernel<<<static_cast<unsigned>(blocks), threads, 0,
+                                 stream>>>(env_min, env_max, n);
+}
 
 void launch_envelope_recompute_bf16(
     const std::uint16_t* k_pages,

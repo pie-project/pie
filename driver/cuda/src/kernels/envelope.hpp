@@ -32,6 +32,18 @@
 
 namespace pie_cuda_driver::kernels {
 
+// Seed every page to the EMPTY envelope (`+inf`, `-inf`). Used once, when the
+// envelopes are allocated alongside a fresh KV pool: no page holds a key yet,
+// so the empty envelope is the exact answer, and every subsequent append
+// refreshes the pages it touched.
+void launch_envelope_seed_empty_f32(
+    float* env_min,
+    float* env_max,
+    int num_pages,
+    int num_kv_heads,
+    int head_dim,
+    cudaStream_t stream);
+
 // Maintenance: reduce each page's live keys to its min/max envelope.
 // `k_pages` is `[num_pages, page_size, num_kv_heads, head_dim]` bf16 (NHD, as
 // `std::uint16_t`); `page_live_lens[p]` is the number of live tokens in page p

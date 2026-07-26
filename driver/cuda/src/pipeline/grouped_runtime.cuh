@@ -1440,6 +1440,22 @@ struct GroupedStageStaticPlan {
         }
         for (std::size_t node = 0; node < stage.ops.size(); ++node) {
             const container::COp& op = stage.ops[node].op;
+            // A second-party kernel is deliberately NOT in
+            // `grouped_supported_tag`. That predicate is the "can a generic
+            // CUDA op cover this tag" question, and the answer for a named
+            // kernel is no — only the fused path can launch it. But this static
+            // plan is the shared lane-binding metadata the FUSED path resolves
+            // through too, so it must describe the op rather than reject it.
+            // Execution coverage is enforced twice elsewhere: once at
+            // registration (`Dispatch::register_program` name+capability gate)
+            // and once per execution group (`generated_stage_supported`).
+            // `requires_query` is set because the kernel consumes the lane's
+            // post-rope query row.
+            if (op.tag == PTIR_OP_KERNEL_CALL) {
+                requires_query = true;
+                requires_kernel_call = true;
+                continue;
+            }
             if (!grouped_supported_tag(op.tag)) {
                 fail("stage contains an unsupported grouped op");
                 return;
@@ -1514,6 +1530,11 @@ struct GroupedStageStaticPlan {
     std::size_t channel_count = 0;
     bool requires_query = false;
     bool requires_layer = false;
+    // The stage names a second-party kernel. Only the fused path can launch
+    // one; `Dispatch::register_program` refuses any name the backend cannot
+    // launch, and `generated_stage_supported` is re-checked per execution
+    // group, so this is descriptive rather than a gate.
+    bool requires_kernel_call = false;
     bool requires_mtp_rows = false;
     std::size_t mtp_rows = 0;
     std::vector<std::uint8_t> used_extents;

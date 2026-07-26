@@ -1514,11 +1514,18 @@ int Context::Impl::load_model(
         family != model::Family::Kimi && family != model::Family::Qwen3_5 &&
         family != model::Family::Qwen3_5Moe &&
         family != model::Family::NemotronH;
+    //
+    // The fourth gate is the operator's. Envelopes cost `2/page_size` of the KV
+    // pool and have to be allocated WITH the pages (see `kv_cache.cpp`), so
+    // they are opt-in via `PIE_CUDA_KV_ENVELOPES=1`. Advertising the capability
+    // without them would let a Quest program bind and then fail at its first
+    // fire; gating on `envelopes_enabled()` makes it fail at bind instead.
     const bool has_kv_envelopes = family_query_is_post_rope &&
                                   local_tp_size == 1 &&
                                   kv_cache_p != nullptr &&
                                   kv_cache_p->format().is_native_bf16() &&
-                                  !kv_cache_p->hnd_layout();
+                                  !kv_cache_p->hnd_layout() &&
+                                  kv_cache_p->envelopes_enabled();
     registry_->dispatch().set_kv_envelopes_available(
         has_kv_envelopes,
         has_kv_envelopes

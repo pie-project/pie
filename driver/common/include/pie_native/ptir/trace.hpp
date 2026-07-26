@@ -243,6 +243,9 @@ inline bool port_consumes(std::uint8_t port) {
 struct Trace {
     std::vector<Value>       values;    // SSA value table (indexed by ValueId)
     std::vector<Channel>     channels;
+    // Container-wide name table for second-party kernels and sinks. An
+    // `OpCode::KernelCall` carries its index here in `Op::imm`.
+    std::vector<std::string> names;
     std::vector<PortBinding> ports;     // descriptor-port channel bindings
     std::vector<Stage>       stages;    // in attachment order
 

@@ -1,3 +1,4 @@
+#include <cstdio>
 #include "kv_cache.hpp"
 
 #include <algorithm>
@@ -23,6 +24,20 @@ bool env_requests_hnd_kv_layout() {
     if (value == nullptr) return false;
     const std::string layout(value);
     return layout == "HND" || layout == "hnd";
+}
+
+// Quest key envelopes cost `2 * 4 * kv_heads * head_dim` bytes per page per
+// layer — `8 / (page_size * 2)` of the KV cache itself, i.e. 25% at
+// `page_size = 16`. The KV pool is sized to consume the device, so that memory
+// cannot be found after the fact: it has to come out of the page count, which
+// means the memory planner has to know before it picks one. Hence an explicit
+// operator opt-in rather than an implicit capability. `memory_planner.cpp`
+// reads the same switch when it computes per-page bytes; the two MUST agree.
+bool env_requests_kv_envelopes() {
+    const char* value = std::getenv("PIE_CUDA_KV_ENVELOPES");
+    if (value == nullptr || value[0] == '\0') return false;
+    const std::string request(value);
+    return request == "1" || request == "true" || request == "on";
 }
 
 std::vector<std::int64_t> kv_storage_shape(
@@ -110,6 +125,9 @@ KvCache KvCache::allocate(int num_layers,
             c.v_bf16_layers_.push_back(DeviceTensor::allocate(
                 DType::BF16, {num_pages, page_size, num_kv_heads, head_dim}));
         }
+    }
+    if (envelopes_requested()) {
+        c.allocate_envelopes_();
     }
     return c;
 }
@@ -228,6 +246,9 @@ KvCache KvCache::allocate_per_layer(int num_layers,
             c.v_bf16_layers_.emplace_back();
         }
     }
+    if (envelopes_requested()) {
+        c.allocate_envelopes_();
+    }
     return c;
 }
 
@@ -275,47 +296,83 @@ const void* KvCache::v_for_attention(int layer) const {
                                     : v_bf16_layers_[src].data();
 }
 
+bool KvCache::envelopes_requested() { return env_requests_kv_envelopes(); }
+
 void KvCache::enable_envelopes() {
     if (envelopes_enabled_) return;
+    // Envelopes are allocated with the pages, at construction, because the page
+    // count itself was chosen to leave room for them (`memory_planner.cpp`).
+    // Reaching here means a program asked for envelopes on a cache that was
+    // sized without them: there is no memory to grow into, so say so instead of
+    // failing at `cudaMalloc` under an unrelated stack.
+    throw std::runtime_error(
+        "kv envelopes are not enabled on this cache; set "
+        "PIE_CUDA_KV_ENVELOPES=1 so the memory planner reserves them "
+        "(costs 2/page_size of the KV pool)");
+}
+
+void KvCache::allocate_envelopes_() {
     // Envelopes describe BF16 keys. Quantized formats keep their dequantized
     // mirror in k_bf16_layers_, but the append path writes the storage tier, so
     // restrict to native BF16 rather than silently envelope stale mirrors.
-    if (!format_.is_native_bf16()) {
-        throw std::runtime_error(
-            "kv envelopes require a native bf16 kv cache");
-    }
-    if (hnd_layout_) {
-        throw std::runtime_error(
-            "kv envelopes require the NHD page layout");
-    }
+    if (!format_.is_native_bf16() || hnd_layout_) return;
+
+    // Escape the KV arena. It is elastic (`commit_on_allocate = false`): an
+    // allocation returns virtual address space that only becomes backed when
+    // `ensure_pages` commits a fraction of it, so seeding the whole envelope
+    // range here would fault on uncommitted VA. Envelopes are also not elastic
+    // in nature — they are needed for every page the pool can hold — so they
+    // are plain device allocations. The planner already made room by charging
+    // `envelope_bytes_per_page` into the page count.
+    const DeviceMemoryAllocatorBinding saved =
+        set_device_memory_allocator(nullptr, nullptr);
+    struct RestoreAllocator {
+        DeviceMemoryAllocatorBinding saved;
+        ~RestoreAllocator() {
+            set_device_memory_allocator(saved.allocate, saved.context);
+        }
+    } restore{saved};
+
     const int slots = static_cast<int>(k_layers_.size());
     k_env_min_layers_.reserve(slots);
     k_env_max_layers_.reserve(slots);
-    // Envelopes are maintained INCREMENTALLY: only a page a fire appends to is
-    // refreshed. Pages already resident when envelopes are switched on would
-    // therefore keep whatever the fresh allocation happened to contain, so seed
-    // every page to the empty envelope (+inf, -inf). That is the fail-safe
-    // direction: `envelope_dot` scores an empty envelope +inf, so an unseen
-    // page is always KEPT rather than silently dropped. Reusing the recompute
-    // launcher with an all-zero live-length vector is exactly that seed, and it
-    // is the same code path `test_envelope_dot` covers.
-    DeviceTensor zero_lens =
-        DeviceTensor::allocate(DType::INT32, {num_pages_});
-    CUDA_CHECK(cudaMemset(zero_lens.data(), 0,
-                          static_cast<std::size_t>(num_pages_) * sizeof(std::int32_t)));
+    // Seed every page to the EMPTY envelope (+inf, -inf). That is exact here:
+    // the cache is freshly allocated, so no page holds a key yet, and from this
+    // point on every append refreshes the pages it touched
+    // (`envelope_update_appended_kernel`, which fully recomputes a touched page
+    // over its live range rather than folding into the old value). So a page
+    // recycled from a retired request is correct after its first append too.
+    //
+    // This is why envelopes must be allocated WITH the pool and not on demand:
+    // switching them on later would leave every already-written page at the
+    // empty seed, which `envelope_dot` scores +inf — "always keep" — forever.
     for (int i = 0; i < slots; ++i) {
+        // A layer whose KV aliases another (`kv_source_layer`) has an EMPTY
+        // storage tensor; `layer_view` resolves through to the source. Give it
+        // an empty envelope pair so the indices stay aligned, and never hand a
+        // null page pointer to the maintenance kernels.
+        if (k_layers_[i].empty()) {
+            k_env_min_layers_.emplace_back();
+            k_env_max_layers_.emplace_back();
+            continue;
+        }
         const int hd = head_dim_at(i);
         const int kvh = num_kv_heads_at(i);
+        const std::size_t expected =
+            static_cast<std::size_t>(num_pages_) * page_size_ * kvh * hd;
+        if (k_layers_[i].numel() != expected) {
+            throw std::runtime_error(
+                "kv envelopes require a [pages, page_size, kv_heads, head_dim] "
+                "key layer");
+        }
         k_env_min_layers_.push_back(DeviceTensor::allocate(
             DType::FP32, {num_pages_, kvh, hd}));
         k_env_max_layers_.push_back(DeviceTensor::allocate(
             DType::FP32, {num_pages_, kvh, hd}));
-        kernels::launch_envelope_recompute_bf16(
-            static_cast<const std::uint16_t*>(k_layers_[i].data()),
-            static_cast<const std::int32_t*>(zero_lens.data()),
+        kernels::launch_envelope_seed_empty_f32(
             static_cast<float*>(k_env_min_layers_[i].data()),
             static_cast<float*>(k_env_max_layers_[i].data()),
-            num_pages_, page_size_, kvh, hd, nullptr);
+            num_pages_, kvh, hd, nullptr);
     }
     CUDA_CHECK(cudaStreamSynchronize(nullptr));
     envelopes_enabled_ = true;

@@ -11,8 +11,17 @@ sampling, the reported divergence must be exactly zero.
 """
 
 import json
+import os
 
-from conftest import run_inferlet, run_tests
+# `quest-attention` needs the per-page key envelopes, which are an operator
+# opt-in because they cost `2/page_size` of the KV pool and have to be
+# allocated with the pages (driver/cuda/src/store/kv_cache.cpp). Set it before
+# the engine boots — the driver reads it while sizing the cache. Enabling it
+# for the whole run is deliberate: it also proves the envelope maintenance that
+# now rides every KV append does not perturb the other inferlets.
+os.environ.setdefault("PIE_CUDA_KV_ENVELOPES", "1")
+
+from conftest import run_inferlet, run_tests  # noqa: E402
 
 
 async def _nonempty(client, args, name: str, inputs: dict) -> str:
@@ -414,6 +423,38 @@ async def test_token_healing(client, args):
     assert report["prefix_candidates"] >= 1, report
 
 
+# Long enough to fill several pages, so the tap has something to rank. The
+# answer sits in the FIRST page, which is what makes the score meaningful:
+# Quest must rank that page above the filler that follows it.
+_QUEST_PROMPT = (
+    "The capital of France is Paris. "
+    + "Paris is a large European city with a long history. " * 24
+)
+
+
+async def test_quest_attention(client, args):
+    report = await _report(
+        client, args, "quest-attention",
+        {"prompt": _QUEST_PROMPT, "max_tokens": 8, "page_budget": 4},
+    )
+    # The tap has to fire once per layer, on every layer.
+    assert report["layers_observed"] > 0, report
+    # Every page the request has already filled must carry a real bound. Only
+    # the in-flight last page is allowed to be pinned (+inf, "always keep"),
+    # and nothing may be NaN or missing.
+    assert report["pages_finite"] == report["max_pages"] - 1, report
+    assert report["pages_pinned"] == 1, report
+    assert report["pages_absent"] == 0, report
+    assert report["pages_nan"] == 0, report
+    # The budget must be honoured and the in-flight page force-kept.
+    assert len(report["kept_pages"]) == report["page_budget"], report
+    assert report["max_pages"] - 1 in report["kept_pages"], report
+    # The criticality bound must actually discriminate: the page holding the
+    # answer outranks the repeated filler.
+    scores = [float(s) for s in report["page_scores"][:-1]]
+    assert scores[0] == max(scores), report
+
+
 async def test_naive_baseline(client, args):
     report = await _report(client, args, "naive-baseline", {"max_tokens": 4})
     assert report["sampler"] == "naive-baseline", report
@@ -472,6 +513,7 @@ def tests():
         test_asap_grammar_aligned_decoding,
         test_token_healing,
         test_naive_baseline,
+        test_quest_attention,
     ]
 
 

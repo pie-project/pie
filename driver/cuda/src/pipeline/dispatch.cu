@@ -3483,6 +3483,20 @@ GroupedLaneEnvelope resolve_lane_envelope(
             kv_after >= qo_len ? kv_after - qo_len : 0u;
         scored_pages = std::min(kv_before / page_size, page_count);
     }
+    if (const char* dbg = std::getenv("PIE_QUEST_DEBUG"); dbg && *dbg == '1') {
+        static std::atomic<int> shots{0};
+        if (shots.fetch_add(1) < 4) {
+            std::fprintf(stderr,
+                "[quest] req=%d layer=%u tok_start=%u tok_count=%u "
+                "page_begin=%u page_count=%u page_size=%u last_len=%u "
+                "qo=[%u,%u] scored=%u kv_heads=%d head_dim=%d qcols=%u\n",
+                request, layer, lane.token_start, lane.token_count,
+                page_begin, page_count, page_size,
+                obs->kv_last_page_lens_h[request],
+                obs->qo_indptr_h[request], obs->qo_indptr_h[request + 1],
+                scored_pages, view.num_kv_heads, view.head_dim, query_columns);
+        }
+    }
 
     return GroupedLaneEnvelope{
         .env_min = view.k_env_min,

@@ -139,16 +139,23 @@ public:
     void trim_pages(int pages);
     std::size_t committed_bytes() const noexcept;
 
-    // Allocate the Quest per-page key envelopes (min/max over each page's live
-    // keys), [num_pages, num_kv_heads, head_dim] f32 per layer per bound. Not
-    // done at construction: at page_size 16 this is 25% of the KV cache. Safe
-    // to call repeatedly; the second call is a no-op. Envelopes only describe
-    // pages written after they exist, which is correct because a program that
-    // asks for them installs them before its first fire.
+    // True when the operator asked for the Quest per-page key envelopes
+    // (min/max over each page's live keys), [num_pages, num_kv_heads, head_dim]
+    // f32 per layer. They cost `2/page_size` of the KV cache — 25% at page_size
+    // 8, 12.5% at 16 — and the pool is sized to consume the device, so this
+    // switch has to be visible to the memory planner BEFORE it picks a page
+    // count. `memory_planner.cpp` reads the same environment variable.
+    static bool envelopes_requested();
+
+    // Throws unless envelopes were allocated at construction. They cannot be
+    // added later: pages written before they existed would keep the empty seed
+    // and score +inf forever.
     void enable_envelopes();
     bool envelopes_enabled() const noexcept { return envelopes_enabled_; }
 
 private:
+    void allocate_envelopes_();
+
     int resolve_(int layer) const noexcept {
         return kv_source_layer_.empty() ? layer : kv_source_layer_[layer];
     }

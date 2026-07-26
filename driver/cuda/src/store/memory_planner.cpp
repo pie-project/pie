@@ -1,5 +1,6 @@
 #include "memory_planner.hpp"
 #include "recurrent_state_cache.hpp"
+#include "kv_cache.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -552,9 +553,25 @@ CudaMemoryPlan plan_cuda_memory(
     }
     uniq_clip_desc(Ns, prefill_cap);
     uniq_clip_desc(Rs, 4096);
+    // Quest key envelopes are `[num_pages, kv_heads, head_dim]` f32 x2 per
+    // layer, i.e. per PAGE rather than per token, so they do not scale with
+    // `kv_page_size`. They live in the same arena as the pages and must be
+    // charged here: the pool is sized to consume the device, so a page count
+    // picked without them leaves nothing to allocate them from.
+    // `KvCache::envelopes_requested()` reads the same switch, and the two MUST
+    // agree or the cache will overrun its budget.
+    const std::size_t envelope_bytes_per_page =
+        pie_cuda_driver::KvCache::envelopes_requested()
+            ? 2ull * sizeof(float) *
+                  static_cast<std::size_t>(hf.num_hidden_layers) *
+                  static_cast<std::size_t>(
+                      std::max(1, hf.num_key_value_heads / std::max(1, tp_size))) *
+                  static_cast<std::size_t>(hf.head_dim_kernel)
+            : 0ull;
     for (int kv_page_size : kv_page_sizes) {
         const std::size_t per_page_bytes =
-            per_kv_token_bytes * static_cast<std::size_t>(kv_page_size);
+            per_kv_token_bytes * static_cast<std::size_t>(kv_page_size) +
+            envelope_bytes_per_page;
         if (per_page_bytes == 0) continue;
         for (int N : Ns) {
             for (int R0 : Rs) {
