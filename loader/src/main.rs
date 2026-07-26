@@ -25,15 +25,16 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use pie_loader::checkpoint::CheckpointMetadata;
+use pie_loader::checkpoint::read::{parse_checkpoint_metadata, parse_model_config};
 use pie_loader::contract::ModelContract;
 use pie_loader::dump::dump_load_plan_json;
 use pie_loader::error::CompileError;
-use pie_loader::ffi::inproc::{parse_checkpoint_metadata, parse_model_config};
 use pie_loader::load_plan::{
-    CUDA_TILE_MAP_MASK, HOST_TILE_MAP_MASK, LoadPlan, METAL_TILE_MAP_MASK, StorageTarget,
+    CUDA_TILE_MAP_MASK, FUSION_FP8_TO_MXFP4, HOST_TILE_MAP_MASK, LoadPlan, METAL_TILE_MAP_MASK,
+    StorageTarget,
 };
 use pie_loader::planner::compile_load_plan;
-use pie_loader::types::{BackendKind, Mxfp4MoePolicy};
+use pie_loader::types::{BackendKind, DType, Mxfp4MoePolicy};
 use pie_loader::verify::{ContractView, PlanView, verify};
 
 const USAGE: &str = "\
@@ -190,7 +191,16 @@ impl Options {
             },
             mxfp4_moe: self.mxfp4_moe,
             native_mxfp4_moe: self.mxfp4_moe == Mxfp4MoePolicy::NativeGemm,
-            fused_transcode: self.fused_transcode,
+            fusion_mask: if self.fused_transcode {
+                FUSION_FP8_TO_MXFP4
+            } else {
+                0
+            },
+            // The two device constants a CLI has to stand in for. They are
+            // CUDA's, because a tool that reproduces a driver's plan has to
+            // reproduce the driver's target, and no other backend states any.
+            encode_scratch_dtype: DType::BF16,
+            block_scale_rows: 128,
         }
     }
 }

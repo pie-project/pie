@@ -366,6 +366,7 @@ threads byte spans across the FFI, and it costs one `Vec<i64>` per tensor.
 | `RuntimeTensorSource::SelectContract` | an `Out` ref — a DAG edge                               |
 | `RuntimeByteSpan` in the contract | now the compiler's *output*, not a driver's input           |
 | `consumed: HashSet` + pass order  | a declaration has no evaluation order                       |
+| `shape: Vec<i64>` → `Option`   | **done** — not a removal but a weakening, and the more useful one. A driver genuinely cannot predict the on-disk extents of a packed AWQ or GPTQ weight, which is why `contract_detail::LogicalShape` erased the shape whenever `hf.quant_method` was non-empty. Not stating it is now expressible, so the workaround is deleted and the check is `Some(declared)`-conditional rather than skipped by family. |
 
 ### 4.3 The DAG makes bank-and-view stop being a pattern
 

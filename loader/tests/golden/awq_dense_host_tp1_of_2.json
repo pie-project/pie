@@ -10,7 +10,9 @@
     "tile_map_mask": 17,
     "mxfp4_moe": "RoutedDecode",
     "native_mxfp4_moe": false,
-    "fused_transcode": false
+    "fusion_mask": 0,
+    "encode_scratch_dtype": "BF16",
+    "block_scale_rows": 128
   },
   "optimizer": {
     "passes": [

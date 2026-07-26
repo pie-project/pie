@@ -104,7 +104,7 @@ fn metal_qwen35_schema_emits_canonical_affine_u4_arena() {
     };
     assert_eq!(spec.scheme, QuantScheme::MlxAffineU4);
     assert_eq!(spec.group_size, 64);
-    assert_eq!(shared.shape, vec![2, 64]);
+    assert_eq!(shared.shape, Some(vec![2, 64]));
 
     let alias_config = ModelConfig {
         model_type: "qwen3_next".to_string(),
@@ -655,21 +655,21 @@ fn nemotron_h_default_abi_packs_experts_and_exposes_views() {
 
     assert!(contract.tensors.iter().any(|contract| {
         contract.name == "language_model.backbone.layers.0.mixer.experts.up_proj.packed.weight"
-            && contract.shape == vec![4, 3]
+            && contract.shape.as_deref() == Some(&[4, 3][..])
     }));
     assert!(contract.tensors.iter().any(|contract| {
         contract.name
             == "language_model.backbone.layers.0.mixer.experts.down_proj.packed.weight"
-            && contract.shape == vec![6, 2]
+            && contract.shape.as_deref() == Some(&[6, 2][..])
             && matches!(&contract.expr, pie_loader::contract::Expr::Shard { axis, .. } if *axis == Axis(1))
     }));
     assert!(contract.tensors.iter().any(|contract| {
         contract.name == "language_model.backbone.layers.0.mixer.experts.0.up_proj.weight"
-            && contract.shape == vec![2, 3]
+            && contract.shape.as_deref() == Some(&[2, 3][..])
     }));
     assert!(contract.tensors.iter().any(|contract| {
         contract.name == "language_model.backbone.layers.0.mixer.experts.1.down_proj.weight"
-            && contract.shape == vec![3, 2]
+            && contract.shape.as_deref() == Some(&[3, 2][..])
     }));
 
     let program = compile_load_plan(&metadata, &contract, target).unwrap();
@@ -768,8 +768,8 @@ fn a_contract_whose_declared_shape_is_wrong_is_rejected() {
     let error = compile_load_plan(&metadata(), &contract, StorageTarget::default())
         .unwrap_err()
         .to_string();
-    assert!(error.contains("declared shape [4]"), "{error}");
-    assert!(error.contains("source shape [2]"), "{error}");
+    assert!(error.contains("declares shape [4]"), "{error}");
+    assert!(error.contains("yields [2]"), "{error}");
 }
 
 fn metadata() -> CheckpointMetadata {

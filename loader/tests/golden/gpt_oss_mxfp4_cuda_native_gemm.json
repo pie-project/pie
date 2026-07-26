@@ -10,7 +10,9 @@
     "tile_map_mask": 117,
     "mxfp4_moe": "NativeGemm",
     "native_mxfp4_moe": true,
-    "fused_transcode": true
+    "fusion_mask": 1,
+    "encode_scratch_dtype": "BF16",
+    "block_scale_rows": 128
   },
   "optimizer": {
     "passes": [

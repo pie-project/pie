@@ -161,10 +161,14 @@ impl Frontend<'_> {
             &contract.name,
         )?;
         let ty = self.resolver.infer(&expr)?;
-        if ty.shape != contract.shape {
+        // A declaration that declined to predict the shape has nothing to check
+        // here; one that predicted is held to it.
+        if let Some(declared) = &contract.shape
+            && ty.shape != *declared
+        {
             return Err(CompileError::InvalidInput(format!(
-                "declared shape {:?} does not match source shape {:?}",
-                contract.shape, ty.shape
+                "'{}' declares shape {declared:?} but its expression yields {:?}",
+                contract.name, ty.shape
             )));
         }
 

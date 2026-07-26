@@ -49,6 +49,20 @@ impl DType {
             Self::F32 | Self::F16 | Self::BF16 | Self::F8E4M3 | Self::F8E5M2
         )
     }
+
+    /// Whether a checkpoint storing this dtype ships a separate block-scale
+    /// tensor alongside it.
+    ///
+    /// A *format* fact, not a device one: DeepSeek- and GLM-style FP8
+    /// checkpoints carry one scale per `[B, B]` tile of the weight, so an FP8
+    /// tensor is never self-describing. The block size `B` is what the
+    /// consuming kernel fixes, and that is on the target
+    /// ([`crate::load_plan::StorageTarget::block_scale_rows`]); which dtypes
+    /// arrive that way is here, because it is true of the file no matter who
+    /// reads it.
+    pub fn is_block_scaled(self) -> bool {
+        matches!(self, Self::F8E4M3 | Self::F8E5M2)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

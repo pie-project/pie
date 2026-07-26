@@ -26,7 +26,9 @@ fn target() -> StorageTarget {
         tile_map_mask: CUDA_TILE_MAP_MASK,
         mxfp4_moe: Mxfp4MoePolicy::NativeGemm,
         native_mxfp4_moe: true,
-        fused_transcode: true,
+        fusion_mask: FUSION_FP8_TO_MXFP4,
+        encode_scratch_dtype: DType::BF16,
+        block_scale_rows: 128,
     }
 }
 
@@ -291,7 +293,9 @@ fn header_carries_target_and_versions() {
         assert_eq!(header.target.tile_map_mask, CUDA_TILE_MAP_MASK);
         assert_eq!(header.target.mxfp4_moe, PieLoaderMxfp4MoePolicy::NativeGemm);
         assert!(header.target.native_mxfp4_moe);
-        assert!(header.target.fused_transcode);
+        assert_eq!(header.target.fusion_mask, FUSION_FP8_TO_MXFP4);
+        assert_eq!(header.target.encode_scratch_dtype, PieLoaderDType::BF16);
+        assert_eq!(header.target.block_scale_rows, 128);
         assert_eq!(header.memory.persistent_bytes, 1 << 30);
         assert_eq!(header.memory.checkpoint_read_bytes, 1 << 31);
     });
@@ -779,7 +783,9 @@ fn request(dir: &str) -> PieLoaderRequest {
             tile_map_mask: CUDA_TILE_MAP_MASK,
             fp8_native: false,
             native_mxfp4_moe: false,
-            fused_transcode: true,
+            fusion_mask: FUSION_FP8_TO_MXFP4,
+            encode_scratch_dtype: PieLoaderDType::BF16 as u32,
+            block_scale_rows: 128,
         },
         model: PieLoaderModelSpec {
             model_type: bytes("llama"),
@@ -992,12 +998,12 @@ fn verify_rejects_a_plan_compiled_with_a_different_fusion_setting() {
     req.target.tp_size = 4;
     req.target.native_mxfp4_moe = true;
     req.mxfp4_moe = PieLoaderMxfp4MoeRequest::NativeGemm as u32;
-    req.target.fused_transcode = false;
+    req.target.fusion_mask = 0;
 
     let mut diags: *mut PieLoaderDiagnostics = std::ptr::null_mut();
     let status = unsafe { super::pie_loader_verify(pod, &req, &mut diags) };
     assert_eq!(status, PieLoaderStatus::ContractViolation);
-    assert!(first_message(diags).contains("fused_transcode"));
+    assert!(first_message(diags).contains("fusion_mask"));
     unsafe { super::pie_loader_release_diagnostics(diags) };
 
     unsafe { super::pie_loader_release(pod) };
@@ -1247,8 +1253,9 @@ fn a_declared_contract_matches_a_real_plan() {
         "the declared contract must depend on tp_size"
     );
 
-    let cfg_model = crate::ffi::inproc::parse_model_config(std::path::Path::new(&snapshot), "")
-        .expect("snapshot has a readable config.json");
+    let cfg_model =
+        crate::checkpoint::read::parse_model_config(std::path::Path::new(&snapshot), "")
+            .expect("snapshot has a readable config.json");
 
     for (tp_size, tp_rank) in [(1, 0), (2, 1), (4, 3)] {
         let declared = read(tp_size);
@@ -1313,7 +1320,7 @@ fn a_real_checkpoint_compiles_to_a_plan_that_verifies() {
     let runtime_quant = std::env::var("PIE_TEST_RUNTIME_QUANT").unwrap_or_default();
     // A driver would state these; a test holding only a snapshot directory
     // reads them the way the CLI does.
-    let cfg = crate::ffi::inproc::parse_model_config(std::path::Path::new(&snapshot), "")
+    let cfg = crate::checkpoint::read::parse_model_config(std::path::Path::new(&snapshot), "")
         .expect("snapshot has a readable config.json");
     for (tp_size, tp_rank) in [(1, 0), (2, 0), (2, 1), (4, 3)] {
         let mut req = request(&snapshot);
@@ -1474,4 +1481,217 @@ fn quant_scheme_survives_the_c_boundary() {
         let round_tripped: QuantScheme = PieLoaderQuantScheme::from(scheme).into();
         assert_eq!(round_tripped, scheme);
     }
+}
+
+// ---------------------------------------------------------------------------
+// The contract entry point, end to end.
+//
+// `pie_loader_compile` is checked above against a request that names a model
+// and lets the loader guess; these drive the path that has no model in it at
+// all. What is being tested is the whole chain — open a real checkpoint, state
+// a program over the tensors it reports, get a plan — because each half is
+// already covered on its own and the failure mode that is left is the two
+// halves disagreeing about what a name refers to.
+// ---------------------------------------------------------------------------
+
+/// Write a two-tensor safetensors file and return its directory.
+///
+/// A real file, not a sized placeholder: `pie_loader_open_checkpoint` parses
+/// the header, so a fixture whose header did not exist would test nothing.
+fn contract_fixture() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("pie_loader_contract_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create fixture directory");
+    let path = dir.join("model.safetensors");
+    // Two BF16 [2, 4] tensors, 16 bytes each, laid out back to back.
+    let header = r#"{"a.weight":{"dtype":"BF16","shape":[2,4],"data_offsets":[0,16]},"b.weight":{"dtype":"BF16","shape":[2,4],"data_offsets":[16,32]}}"#;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(header.as_bytes());
+    bytes.extend_from_slice(&[0u8; 32]);
+    // Published by rename so a parallel reader never sees a partial header.
+    let staging = dir.join(format!("model.{:?}.partial", std::thread::current().id()));
+    std::fs::write(&staging, &bytes).expect("write fixture checkpoint");
+    std::fs::rename(&staging, &path).expect("publish fixture checkpoint");
+    dir
+}
+
+fn open_checkpoint(dir: &std::path::Path) -> *mut super::checkpoint::PieLoaderCheckpoint {
+    let text = dir.to_string_lossy().into_owned();
+    let mut handle = std::ptr::null_mut();
+    let mut diags: *mut PieLoaderDiagnostics = std::ptr::null_mut();
+    let status =
+        unsafe { super::entry::pie_loader_open_checkpoint(bytes(&text), &mut handle, &mut diags) };
+    let message = drain(diags);
+    assert_eq!(status, PieLoaderStatus::Ok, "open failed: {message}");
+    assert!(!handle.is_null());
+    handle
+}
+
+/// Take the first diagnostic and release the array.
+fn drain(diags: *mut PieLoaderDiagnostics) -> String {
+    if diags.is_null() {
+        return String::new();
+    }
+    let items = unsafe { std::slice::from_raw_parts((*diags).items, (*diags).len) };
+    let first = items
+        .first()
+        .map(|d| {
+            let raw = unsafe { std::slice::from_raw_parts(d.message.ptr, d.message.len) };
+            String::from_utf8_lossy(raw).into_owned()
+        })
+        .unwrap_or_default();
+    unsafe { super::entry::pie_loader_release_diagnostics(diags) };
+    first
+}
+
+fn contract_request(
+    checkpoint: *const super::checkpoint::PieLoaderCheckpoint,
+    contract: super::contract::PieLoaderModelContractView,
+) -> super::entry::PieLoaderContractRequest {
+    super::entry::PieLoaderContractRequest {
+        checkpoint,
+        target: request("").target,
+        contract,
+    }
+}
+
+/// A contract that fuses the fixture's two tensors along axis 0.
+fn fused_contract() -> crate::contract::ModelContract {
+    use crate::contract::{Expr, ModelContract, TensorContract};
+    ModelContract {
+        abi_version: 1,
+        alignment: 256,
+        tensors: vec![TensorContract::new(
+            "ab.weight",
+            Expr::Cat {
+                axis: Axis(0),
+                parts: vec![
+                    Expr::Src("a.weight".to_string()),
+                    Expr::Src("b.weight".to_string()),
+                ],
+            },
+            vec![4, 4],
+            Encoding::Raw(DType::BF16),
+        )],
+    }
+}
+
+#[test]
+fn an_opened_checkpoint_reports_the_tensors_a_contract_can_name() {
+    let dir = contract_fixture();
+    let handle = open_checkpoint(&dir);
+    let view = unsafe { &*handle };
+    assert_eq!(view.files.len, 1);
+    let tensors = unsafe { std::slice::from_raw_parts(view.tensors.ptr, view.tensors.len) };
+    let names: Vec<String> = tensors
+        .iter()
+        .map(|t| {
+            let raw = unsafe { std::slice::from_raw_parts(t.name.ptr, t.name.len) };
+            String::from_utf8_lossy(raw).into_owned()
+        })
+        .collect();
+    assert_eq!(names, vec!["a.weight".to_string(), "b.weight".to_string()]);
+    let shape = unsafe { std::slice::from_raw_parts(tensors[0].shape.ptr, tensors[0].shape.len) };
+    assert_eq!(shape, &[2, 4]);
+    assert_eq!(tensors[0].span_bytes, 16);
+    assert_eq!(tensors[1].file_offset - tensors[0].file_offset, 16);
+    unsafe { super::entry::pie_loader_close_checkpoint(handle) };
+}
+
+#[test]
+fn a_contract_compiles_and_verifies_without_naming_a_model() {
+    let dir = contract_fixture();
+    let handle = open_checkpoint(&dir);
+    let owned = super::contract::write_contract(&fused_contract());
+    let req = contract_request(handle, owned.view());
+
+    let mut plan: *mut PieLoaderPlan = std::ptr::null_mut();
+    let mut diags: *mut PieLoaderDiagnostics = std::ptr::null_mut();
+    let status = unsafe { super::entry::pie_loader_compile_contract(&req, &mut plan, &mut diags) };
+    assert_eq!(
+        status,
+        PieLoaderStatus::Ok,
+        "compile failed: {}",
+        drain(diags)
+    );
+    assert!(!plan.is_null());
+
+    let declared = unsafe { std::slice::from_raw_parts((*plan).tensors.ptr, (*plan).tensors.len) };
+    assert_eq!(declared.len(), 1);
+    let name = unsafe { std::slice::from_raw_parts(declared[0].name.ptr, declared[0].name.len) };
+    assert_eq!(std::str::from_utf8(name).unwrap(), "ab.weight");
+    // Coverage is measured against the contract itself on this path, so a
+    // fully-delivered contract is the only shape that can be reported.
+    assert_eq!(unsafe { (*plan).coverage.demanded }, 1);
+    assert_eq!(unsafe { (*plan).coverage.covered }, 1);
+
+    let mut vdiags: *mut PieLoaderDiagnostics = std::ptr::null_mut();
+    let verified = unsafe { super::entry::pie_loader_verify_contract(plan, &req, &mut vdiags) };
+    assert_eq!(
+        verified,
+        PieLoaderStatus::Ok,
+        "verify failed: {}",
+        drain(vdiags)
+    );
+
+    unsafe { super::pie_loader_release(plan) };
+    unsafe { super::entry::pie_loader_close_checkpoint(handle) };
+}
+
+#[test]
+fn a_contract_naming_a_tensor_the_checkpoint_lacks_is_a_message_not_a_crash() {
+    let dir = contract_fixture();
+    let handle = open_checkpoint(&dir);
+    let mut model = fused_contract();
+    model.tensors[0].expr = crate::contract::Expr::Src("missing.weight".to_string());
+    let owned = super::contract::write_contract(&model);
+    let req = contract_request(handle, owned.view());
+
+    let mut plan: *mut PieLoaderPlan = std::ptr::null_mut();
+    let mut diags: *mut PieLoaderDiagnostics = std::ptr::null_mut();
+    let status = unsafe { super::entry::pie_loader_compile_contract(&req, &mut plan, &mut diags) };
+    assert_ne!(status, PieLoaderStatus::Ok);
+    assert!(plan.is_null());
+    assert!(
+        drain(diags).contains("missing.weight"),
+        "the message should name the tensor that is not there"
+    );
+    unsafe { super::entry::pie_loader_close_checkpoint(handle) };
+}
+
+#[test]
+fn a_contract_whose_declared_shape_is_wrong_fails_to_compile() {
+    let dir = contract_fixture();
+    let handle = open_checkpoint(&dir);
+    let mut model = fused_contract();
+    model.tensors[0].shape = Some(vec![8, 4]);
+    let owned = super::contract::write_contract(&model);
+    let req = contract_request(handle, owned.view());
+
+    let mut plan: *mut PieLoaderPlan = std::ptr::null_mut();
+    let mut diags: *mut PieLoaderDiagnostics = std::ptr::null_mut();
+    let status = unsafe { super::entry::pie_loader_compile_contract(&req, &mut plan, &mut diags) };
+    assert_ne!(status, PieLoaderStatus::Ok);
+    let message = drain(diags);
+    assert!(
+        message.contains("[8, 4]") && message.contains("[4, 4]"),
+        "the message should show both the claim and the truth: {message}"
+    );
+    unsafe { super::entry::pie_loader_close_checkpoint(handle) };
+}
+
+#[test]
+fn a_contract_request_with_no_checkpoint_is_rejected() {
+    let owned = super::contract::write_contract(&fused_contract());
+    let req = contract_request(std::ptr::null(), owned.view());
+    let mut plan: *mut PieLoaderPlan = std::ptr::null_mut();
+    let mut diags: *mut PieLoaderDiagnostics = std::ptr::null_mut();
+    let status = unsafe { super::entry::pie_loader_compile_contract(&req, &mut plan, &mut diags) };
+    assert_eq!(status, PieLoaderStatus::InvalidRequest);
+    assert!(drain(diags).contains("checkpoint is null"));
+}
+
+#[test]
+fn closing_a_null_checkpoint_is_a_no_op() {
+    unsafe { super::entry::pie_loader_close_checkpoint(std::ptr::null_mut()) };
 }

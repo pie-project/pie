@@ -1,5 +1,6 @@
 pub mod gguf;
 pub mod header;
+pub mod read;
 
 use crate::types::{CheckpointFormat, Encoding, FileId, TensorId};
 

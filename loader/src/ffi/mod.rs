@@ -10,6 +10,8 @@
 //! actually has (§10).
 
 pub mod arena;
+pub mod checkpoint;
+pub mod contract;
 pub mod entry;
 pub mod inproc;
 pub mod types;
@@ -22,10 +24,9 @@ pub use entry::{
 pub use types::*;
 
 use crate::config::ModelConfig;
-use crate::contract::ModelContract;
 use crate::error::CompileError;
 use crate::load_plan::StorageTarget;
-use crate::types::{BackendKind, Mxfp4MoePolicy};
+use crate::types::{BackendKind, DType, Mxfp4MoePolicy};
 
 /// Take the model facts from the request.
 ///
@@ -96,6 +97,18 @@ fn storage_target(
     mxfp4_moe: PieLoaderMxfp4MoeRequest,
 ) -> Result<StorageTarget, String> {
     let mxfp4_moe = resolve_mxfp4_moe(mxfp4_moe, spec.native_mxfp4_moe)?;
+    // A target that reports no tile budget is not saying "no limit"; it is
+    // saying it did not measure one, and the loader used to guess 64 MiB on its
+    // behalf. Guessing a device constant is exactly what §9 forbids: the number
+    // decided how much scratch every Encode allocated, so the guess was a
+    // silent performance contract nobody had signed.
+    if spec.max_tile_bytes == 0 {
+        return Err(
+            "request.target.max_tile_bytes is 0; the driver must state its tile \
+             budget (there is no safe default for a device the loader cannot measure)"
+                .to_string(),
+        );
+    }
     let kind = match backend {
         PieLoaderBackendKind::Cuda => BackendKind::Cuda,
         PieLoaderBackendKind::Metal => BackendKind::Metal,
@@ -130,41 +143,11 @@ fn storage_target(
         tile_map_mask: spec.tile_map_mask,
         mxfp4_moe,
         native_mxfp4_moe: spec.native_mxfp4_moe,
-        fused_transcode: spec.fused_transcode,
-    })
-}
-
-/// Narrow the ABI to the requested component.
-///
-/// `Full` and `Text` keep everything. `Encode` retains only the multimodal
-/// towers, so an encoder-only rank never materializes the language model. The
-/// guards below are the ones the worker applied before the boundary moved; they
-/// live here now because this is where the request arrives.
-fn scope_to_component(
-    contract: ModelContract,
-    component: PieLoaderComponent,
-    model: &ModelConfig,
-    target: &StorageTarget,
-) -> Result<ModelContract, CompileError> {
-    if component != PieLoaderComponent::Encode || target.backend != BackendKind::Cuda {
-        return Ok(contract);
-    }
-    if target.tp_size != 1 {
-        return Err(CompileError::InvalidInput(
-            "encode-scoped CUDA loading does not support tensor parallelism".to_string(),
-        ));
-    }
-    if !matches!(model.model_type.as_str(), "gemma4" | "gemma4_text") {
-        return Err(CompileError::InvalidInput(format!(
-            "encode-scoped CUDA loading currently supports Gemma-4, got {}",
-            model.model_type
-        )));
-    }
-    contract.retain_outputs(|name| {
-        name.starts_with("model.vision_tower.")
-            || name.starts_with("model.embed_vision.")
-            || name.starts_with("model.audio_tower.")
-            || name.starts_with("model.embed_audio.")
+        fusion_mask: spec.fusion_mask,
+        encode_scratch_dtype: PieLoaderDType::try_from(spec.encode_scratch_dtype)
+            .map(DType::from)
+            .map_err(|v| format!("request.target.encode_scratch_dtype: {v} is not a dtype"))?,
+        block_scale_rows: spec.block_scale_rows,
     })
 }
 

@@ -2,6 +2,7 @@ use crate::checkpoint::{CheckpointMetadata, RawTensor};
 use crate::config::ModelConfig;
 use crate::contract::{Expr, ModelContract, TensorContract};
 use crate::error::CompileError;
+use crate::ffi::PieLoaderComponent;
 use crate::load_plan::StorageTarget;
 use crate::types::{
     Axis, BackendKind, DType, Encoding, Mxfp4MoePolicy, QuantScheme, QuantSpec, RepackLayout,
@@ -136,7 +137,7 @@ pub fn coalesce_direct_row_shards(
             target,
             &format!("the row count of '{}'", tensor.name),
         )?;
-        if tensor.shape != [local_rows, raw.shape[1]] {
+        if tensor.shape.as_deref() != Some(&[local_rows, raw.shape[1]][..]) {
             continue;
         }
         let row_bytes =
@@ -671,4 +672,41 @@ fn checked_mul_i64(lhs: i64, rhs: u64, context: &str) -> Result<u64, CompileErro
 fn checked_mul_u64(lhs: u64, rhs: u64, context: &str) -> Result<u64, CompileError> {
     lhs.checked_mul(rhs)
         .ok_or_else(|| CompileError::InvalidInput(format!("{context}: byte overflow")))
+}
+
+/// Narrow the ABI to the requested component.
+///
+/// `Full` and `Text` keep everything. `Encode` retains only the multimodal
+/// towers, so an encoder-only rank never materializes the language model. The
+/// This is family knowledge, so it lives beside the rest of it: the guard
+/// names a model type, and the prefixes name the tensors *that* family calls a
+/// tower. Under a driver-authored contract none of it is needed — a rank that
+/// should not materialize the language model simply does not declare it — so
+/// this function is deleted by `p4-delete-arch` along with its caller.
+pub fn scope_to_component(
+    contract: ModelContract,
+    component: PieLoaderComponent,
+    model: &ModelConfig,
+    target: &StorageTarget,
+) -> Result<ModelContract, CompileError> {
+    if component != PieLoaderComponent::Encode || target.backend != BackendKind::Cuda {
+        return Ok(contract);
+    }
+    if target.tp_size != 1 {
+        return Err(CompileError::InvalidInput(
+            "encode-scoped CUDA loading does not support tensor parallelism".to_string(),
+        ));
+    }
+    if !matches!(model.model_type.as_str(), "gemma4" | "gemma4_text") {
+        return Err(CompileError::InvalidInput(format!(
+            "encode-scoped CUDA loading currently supports Gemma-4, got {}",
+            model.model_type
+        )));
+    }
+    contract.retain_outputs(|name| {
+        name.starts_with("model.vision_tower.")
+            || name.starts_with("model.embed_vision.")
+            || name.starts_with("model.audio_tower.")
+            || name.starts_with("model.embed_audio.")
+    })
 }

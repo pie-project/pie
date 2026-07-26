@@ -181,11 +181,17 @@ pub struct TensorDemand<'a> {
 }
 
 impl<'a> TensorDemand<'a> {
-    /// A demand that pins all three fields. Used for a contract `arch/` authored.
-    pub fn exact(name: &'a str, shape: &[i64], encoding: &Encoding) -> Self {
+    /// A demand read off a contract the loader itself is about to execute.
+    ///
+    /// The encoding is always pinned: a contract states the encoding of every
+    /// tensor it defines, so an authored demand can check it. The shape is
+    /// pinned only when the contract declared one — a contract may decline to
+    /// predict a shape (`TensorContract::inferred`), and inventing one here
+    /// would turn the loader's own inference into the thing being verified.
+    pub fn authored(name: &'a str, shape: Option<&[i64]>, encoding: &Encoding) -> Self {
         Self {
             name,
-            shape: Some(shape.to_vec()),
+            shape: shape.map(<[i64]>::to_vec),
             encoding: Some(crate::types::normalize_encoding(encoding)),
             optional: false,
         }
@@ -210,7 +216,11 @@ impl<'a> ContractView<'a> {
                 .tensors
                 .iter()
                 .map(|tensor| {
-                    TensorDemand::exact(tensor.name.as_str(), &tensor.shape, &tensor.encoding)
+                    TensorDemand::authored(
+                        tensor.name.as_str(),
+                        tensor.shape.as_deref(),
+                        &tensor.encoding,
+                    )
                 })
                 .collect(),
         }
@@ -658,7 +668,11 @@ mod tests {
             tensors: tensors
                 .iter()
                 .map(|(name, shape, encoding)| {
-                    TensorDemand::exact(name, Box::leak(shape.clone().into_boxed_slice()), encoding)
+                    TensorDemand::authored(
+                        name,
+                        Some(Box::leak(shape.clone().into_boxed_slice())),
+                        encoding,
+                    )
                 })
                 .collect(),
         }

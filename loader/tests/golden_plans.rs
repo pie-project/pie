@@ -27,8 +27,11 @@ use std::path::PathBuf;
 use pie_loader::arch::default_contract;
 use pie_loader::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
 use pie_loader::config::ModelConfig;
+use pie_loader::contract::ModelContract;
+use pie_loader::ffi::contract::{read_contract, write_contract};
 use pie_loader::load_plan::{
-    CUDA_TILE_MAP_MASK, HOST_TILE_MAP_MASK, LoadPlan, StorageTarget, compiler_version,
+    CUDA_TILE_MAP_MASK, FUSION_FP8_TO_MXFP4, HOST_TILE_MAP_MASK, LoadPlan, StorageTarget,
+    compiler_version,
 };
 use pie_loader::planner::compile_load_plan;
 use pie_loader::types::{
@@ -331,7 +334,13 @@ fn target(backend: BackendKind, tp_rank: u32, tp_size: u32) -> StorageTarget {
         },
         mxfp4_moe: Mxfp4MoePolicy::RoutedDecode,
         native_mxfp4_moe: false,
-        fused_transcode: backend == BackendKind::Cuda,
+        fusion_mask: if backend == BackendKind::Cuda {
+            FUSION_FP8_TO_MXFP4
+        } else {
+            0
+        },
+        encode_scratch_dtype: DType::BF16,
+        block_scale_rows: 128,
     }
 }
 
@@ -384,6 +393,7 @@ fn check_stats_render(name: &str, plan: &LoadPlan) {
 fn check(name: &str, metadata: &CheckpointMetadata, cfg: &ModelConfig, target: StorageTarget) {
     let contract = default_contract(metadata, cfg, &target)
         .unwrap_or_else(|err| panic!("{name}: building the contract failed: {err}"));
+    check_contract_survives_the_ffi(name, &contract);
     let plan = compile_load_plan(metadata, &contract, target)
         .unwrap_or_else(|err| panic!("{name}: compiling failed: {err}"));
 
@@ -433,6 +443,32 @@ fn check(name: &str, metadata: &CheckpointMetadata, cfg: &ModelConfig, target: S
          If the change is intended, regenerate with UPDATE_GOLDEN=1 and review \
          the diff to {}.",
         path.display()
+    );
+}
+
+/// Round-trip the contract through the POD form the C++ builder emits.
+///
+/// This is the safety net for moving authorship out of `arch/` and into the
+/// drivers. The migration's claim is that a family's contract can be written by
+/// hand in C++ and produce the identical plan; that claim is only checkable if
+/// the FFI representation is known to be lossless for every construct the real
+/// families use. Asserting it here, on every golden, means each family covers
+/// its own constructs — the MXFP4 repacks, the fused QKV `Cat`, the `Out`
+/// aliases into a bank, the strided GPTQ slices — instead of on a synthetic
+/// expression that happens to use the ones someone thought of.
+///
+/// Equality is on the whole `ModelContract`, not on the plan it compiles to. A
+/// weaker check would pass for a lossy encoding whose loss happened not to
+/// change this particular plan.
+fn check_contract_survives_the_ffi(name: &str, contract: &ModelContract) {
+    let owned = write_contract(contract);
+    let read = unsafe { read_contract(&owned.view()) }
+        .unwrap_or_else(|err| panic!("{name}: the contract does not read back: {err}"));
+    assert_eq!(
+        &read,
+        contract,
+        "{name}: the contract changed crossing the FFI ({} nodes)",
+        owned.node_count()
     );
 }
 

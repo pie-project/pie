@@ -7,6 +7,7 @@ use crate::types::{
 };
 
 pub use crate::ffi::types::{
+    PIE_LOADER_FUSION_FP8_TO_MXFP4 as FUSION_FP8_TO_MXFP4,
     PIE_LOADER_PLAN_VERSION as LOAD_PLAN_VERSION, PIE_LOADER_TILE_MAP_CAST as TILE_MAP_CAST,
     PIE_LOADER_TILE_MAP_DECODE as TILE_MAP_DECODE, PIE_LOADER_TILE_MAP_ENCODE as TILE_MAP_ENCODE,
     PIE_LOADER_TILE_MAP_REBLOCK as TILE_MAP_REBLOCK,
@@ -44,14 +45,30 @@ pub struct StorageTarget {
     pub tile_map_mask: u32,
     pub mxfp4_moe: Mxfp4MoePolicy,
     pub native_mxfp4_moe: bool,
-    /// Whether the backend may fuse transform chains that have a direct kernel.
+    /// Which fused transform chains the backend has kernels for.
     ///
     /// A capability, not a preference: the driver both knows whether the fused
     /// kernels are built and owns the opt-out that used to be
     /// `PIE_CUDA_DISABLE_FUSED_TRANSCODE`. Reading it here rather than in the
     /// executor is what makes the choice part of the plan, and therefore part of
     /// the plan hash (§8.1).
-    pub fused_transcode: bool,
+    pub fusion_mask: u32,
+    /// The dtype this target's encode kernels dequantize *through*.
+    ///
+    /// An Encode that does not have a direct kernel goes source → scratch →
+    /// destination, and the scratch width is what decides how many rows fit in
+    /// the tile budget. CUDA's is BF16. It is a device fact — it is which
+    /// kernels were compiled — so it is stated, not assumed.
+    pub encode_scratch_dtype: DType,
+    /// Row granularity of the block scales this target's encode path consumes,
+    /// or `0` if it has none.
+    ///
+    /// A block-scaled source carries one scale per `[block_scale_rows, N]`
+    /// tile, so slicing the dequant by an arbitrary row count would cut a scale
+    /// block in half. Rather than round the tile down to a multiple — which
+    /// would be a second rule to keep in sync with the kernel — such a source is
+    /// simply not tiled.
+    pub block_scale_rows: u32,
 }
 
 impl Default for StorageTarget {
@@ -65,7 +82,9 @@ impl Default for StorageTarget {
             tile_map_mask: HOST_TILE_MAP_MASK,
             mxfp4_moe: Mxfp4MoePolicy::RoutedDecode,
             native_mxfp4_moe: false,
-            fused_transcode: false,
+            fusion_mask: 0,
+            encode_scratch_dtype: DType::BF16,
+            block_scale_rows: 0,
         }
     }
 }

@@ -8,7 +8,8 @@
 
 use super::*;
 use crate::load_plan::{
-    BufferDecl, DimSpec, LoadPlan, SourceTensorDecl, StorageInstr, TileSpec, TransformSpec,
+    BufferDecl, DimSpec, FUSION_FP8_TO_MXFP4, LoadPlan, SourceTensorDecl, StorageInstr, TileSpec,
+    TransformSpec,
 };
 use crate::types::{FileId, InstrId, QuantSpec, TensorId};
 
@@ -27,13 +28,20 @@ fn facts(source_dtype: DType, rows: u64, cols: u64, max_tile_bytes: u64) -> Tile
     }
 }
 
-fn cuda_lower(facts: &TileMapFacts, fused_transcode: bool) -> TileLowering {
-    let target = StorageTarget {
+/// A CUDA target with the two constants that used to be hardcoded in
+/// `backend/cuda.rs` now stated the way the driver states them.
+fn cuda_target(fused: bool) -> StorageTarget {
+    StorageTarget {
         backend: BackendKind::Cuda,
-        fused_transcode,
+        fusion_mask: if fused { FUSION_FP8_TO_MXFP4 } else { 0 },
+        encode_scratch_dtype: DType::BF16,
+        block_scale_rows: 128,
         ..StorageTarget::default()
-    };
-    cuda::Cuda.lower_tile_map(facts, &target)
+    }
+}
+
+fn cuda_lower(facts: &TileMapFacts, fused: bool) -> TileLowering {
+    cuda::Cuda.lower_tile_map(facts, &cuda_target(fused))
 }
 
 fn rows_per_tile(facts: &TileMapFacts) -> u32 {
@@ -80,12 +88,38 @@ fn a_budget_that_covers_the_tensor_reports_untiled() {
 }
 
 #[test]
-fn an_unmeasured_budget_falls_back_rather_than_meaning_unlimited() {
-    // `max_tile_bytes == 0` is "the driver did not measure one", so the 64 MiB
-    // fallback applies. At 64 KiB per row that is 1024 rows, not all 65536.
-    let facts = facts(DType::BF16, 65536, 32768, 0);
-    assert_eq!(rows_per_tile(&facts), 1024);
-    assert_eq!(cuda::FALLBACK_TILE_BYTES, 64 * MIB);
+fn a_target_with_no_block_scale_layout_tiles_an_fp8_source() {
+    // The refusal above is not a fact about FP8; it is a fact about a device
+    // whose kernels consume `[128, 128]` scale blocks. A target that declares
+    // none has no block to cut, and the ordinary budget applies: FP8 is read
+    // (1 byte) and written as BF16 (2), so 4 MiB / 12 KiB is 341 rows.
+    let target = StorageTarget {
+        block_scale_rows: 0,
+        ..cuda_target(false)
+    };
+    let facts = facts(DType::F8E4M3, 4096, 4096, 4 * MIB);
+    assert_eq!(
+        cuda::Cuda.lower_tile_map(&facts, &target).rows_per_tile,
+        341
+    );
+}
+
+#[test]
+fn the_scratch_dtype_is_the_targets_to_state() {
+    // Same tensor, same budget, two devices: one dequants through BF16 (2 bytes
+    // per element on top of the 2-byte F16 source, so 4 MiB / 16 KiB = 256
+    // rows), one through F32 (4 + 2 = 6 bytes, so 170). Neither number is the
+    // loader's to know.
+    let facts = facts(DType::F16, 4096, 4096, 4 * MIB);
+    let through = |dtype| {
+        let target = StorageTarget {
+            encode_scratch_dtype: dtype,
+            ..cuda_target(false)
+        };
+        cuda::Cuda.lower_tile_map(&facts, &target).rows_per_tile
+    };
+    assert_eq!(through(DType::BF16), 256);
+    assert_eq!(through(DType::F32), 170);
 }
 
 #[test]
@@ -171,7 +205,9 @@ fn backends_without_transform_kernels_decide_nothing() {
     assert_eq!(metal::TILE_MAP_MASK, 0);
     let target = StorageTarget {
         backend: BackendKind::Metal,
-        fused_transcode: true,
+        fusion_mask: FUSION_FP8_TO_MXFP4,
+        encode_scratch_dtype: DType::BF16,
+        block_scale_rows: 128,
         ..StorageTarget::default()
     };
     let facts = facts(DType::F8E4M3, 4096, 4096, 4 * MIB);
@@ -187,7 +223,9 @@ fn the_reference_backend_declines_every_optimization() {
     // the budget at run time and has no fused kernels, so a difference between
     // `cuda` and `host` output is always a backend rule and never an accident.
     let target = StorageTarget {
-        fused_transcode: true,
+        fusion_mask: FUSION_FP8_TO_MXFP4,
+        encode_scratch_dtype: DType::BF16,
+        block_scale_rows: 128,
         ..StorageTarget::default()
     };
     let facts = facts(DType::F8E4M3, 4096, 4096, 4 * MIB);
@@ -238,7 +276,9 @@ fn encode_plan(encoding: Encoding, rows: i64, cols: i64) -> LoadPlan {
     let mut plan = LoadPlan::empty(StorageTarget {
         backend: BackendKind::Cuda,
         max_tile_bytes: 4 * MIB,
-        fused_transcode: true,
+        fusion_mask: FUSION_FP8_TO_MXFP4,
+        encode_scratch_dtype: DType::BF16,
+        block_scale_rows: 128,
         ..StorageTarget::default()
     });
     plan.sources.push(SourceTensorDecl {

@@ -19,13 +19,15 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 
 use crate::artifact::{ArtifactInputs, artifact_cache_key};
+use crate::checkpoint::read::parse_checkpoint_metadata;
 use crate::error::CompileError;
-use crate::ffi::inproc::parse_checkpoint_metadata;
 use crate::load_plan::LoadPlan;
 use crate::planner::compile_load_plan;
 use crate::verify::ContractCoverage;
 
 use super::arena;
+use super::checkpoint::PieLoaderCheckpoint;
+use super::contract::PieLoaderModelContractView;
 use super::types::*;
 
 #[repr(u32)]
@@ -234,13 +236,27 @@ pub struct PieLoaderTargetSpec {
     pub tile_map_mask: u32,
     pub fp8_native: bool,
     pub native_mxfp4_moe: bool,
-    /// Whether this build has the fused transform kernels and wants them used.
+    /// Which fused transform chains this build has kernels for
+    /// (`PIE_LOADER_FUSION_*`).
     ///
     /// The opt-out that used to be `PIE_CUDA_DISABLE_FUSED_TRANSCODE`, read
     /// inside the executor. As a request field it changes the *plan*, so two
     /// settings produce two artifacts instead of one plan that runs two ways
-    /// (§8.1). Backends with no fused kernels pass `false`.
-    pub fused_transcode: bool,
+    /// (§8.1). Backends with no fused kernels pass `0`.
+    pub fusion_mask: u32,
+    /// The dtype this target's encode kernels dequantize through. Decides how
+    /// many rows of scratch fit in `max_tile_bytes`.
+    ///
+    /// A `u32` for the reason [`PieLoaderTargetSpec::backend`] is: this is an
+    /// *input*, so the value is whatever C++ wrote, and a Rust enum with a
+    /// value outside its variants is undefined behaviour before any check can
+    /// run. The output side, `PieLoaderTargetView`, keeps the enum — the loader
+    /// wrote that one.
+    pub encode_scratch_dtype: u32,
+    /// Row granularity of this target's block scales, or `0` for none. A
+    /// block-scaled source is not tiled, because a tile boundary would cut a
+    /// scale block.
+    pub block_scale_rows: u32,
 }
 
 /// The model facts the storage compile keys off.
@@ -397,7 +413,7 @@ fn compile_request(
         .map_err(|err| (compile_error_status(&err), err.to_string()))?;
     let contract = crate::arch::default_contract(&metadata, &model, &target)
         .map_err(|err| (compile_error_status(&err), err.to_string()))?;
-    let contract = super::scope_to_component(contract, checked.component, &model, &target)
+    let contract = crate::arch::scope_to_component(contract, checked.component, &model, &target)
         .map_err(|err| (compile_error_status(&err), err.to_string()))?;
     compile_load_plan(&metadata, &contract, target)
         .map_err(|err| (compile_error_status(&err), err.to_string()))
@@ -435,6 +451,316 @@ fn compile_request(
                 },
             )
         })
+}
+
+/// A compile request that carries its own contract.
+///
+/// This is [`PieLoaderRequest`] with every field that exists only to let the
+/// loader *guess* a contract removed. There is no `model`, because the loader
+/// no longer infers anything from `model_type`; no `runtime_quant`, because
+/// every tensor states the encoding it wants; no `mxfp4_moe`, because a
+/// contract either declares an MXFP4 expert weight or it does not; no
+/// `component`, because a contract that should not load the vision tower simply
+/// does not declare it; and no `demands`, because the contract already names
+/// every tensor it will produce and may declare the shape of each.
+///
+/// What remains is exactly the north-star signature: the facts read off the
+/// checkpoint, the program stated over them, and the device to build for.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PieLoaderContractRequest {
+    /// The checkpoint, already open. Not a directory: the driver had to read
+    /// the tensor table to write the contract, and compiling against the same
+    /// handle is what makes the contract and the plan provably about one parse.
+    pub checkpoint: *const PieLoaderCheckpoint,
+    pub target: PieLoaderTargetSpec,
+    /// What to build. Borrowed for the call; the loader copies what it keeps.
+    pub contract: PieLoaderModelContractView,
+}
+
+/// Compile a contract into a plan. See [`compile_request`] for the
+/// contract-guessing sibling this replaces.
+///
+/// # Safety
+///
+/// `req` and everything its pointers reach must be live for the call.
+unsafe fn compile_contract_request(
+    req: &PieLoaderContractRequest,
+) -> Result<(LoadPlan, arena::PlanExtras), (PieLoaderStatus, String)> {
+    let checked = unsafe { read_contract_request(req) }?;
+    let source = unsafe { super::checkpoint::arena_of(req.checkpoint) };
+
+    compile_load_plan(&source.metadata, &checked.model, checked.target)
+        .map_err(|err| (compile_error_status(&err), err.to_string()))
+        .map(|plan| {
+            // The contract names exactly the tensors the plan will produce, so
+            // coverage is measured against it directly. A shortfall here is a
+            // compiler bug, not a driver one — which is why it is measured
+            // anyway (§9).
+            let coverage = ContractCoverage::measure(
+                plan.tensors.iter().map(|tensor| tensor.name.as_str()),
+                checked
+                    .model
+                    .tensors
+                    .iter()
+                    .map(|tensor| (tensor.name.as_str(), false)),
+            );
+            // `runtime_quant` and `component` are empty because neither exists
+            // on this path, and neither is missing information: the contract
+            // decides both, and the contract is entirely observable in the plan
+            // that is hashed alongside them.
+            let cache_key = artifact_cache_key(
+                &plan,
+                &ArtifactInputs {
+                    snapshot_dir: &source.snapshot_dir,
+                    runtime_quant: "",
+                    component: 0,
+                },
+            );
+            (
+                plan,
+                arena::PlanExtras {
+                    coverage,
+                    cache_key,
+                },
+            )
+        })
+}
+
+/// A contract request with its target resolved and its contract materialized.
+struct CheckedContractRequest {
+    model: crate::contract::ModelContract,
+    target: crate::load_plan::StorageTarget,
+}
+
+/// Validate a contract request without touching the filesystem.
+///
+/// Split out so that compiling and verifying resolve the target the same way;
+/// a second copy of these rules is a second thing to keep in step.
+///
+/// # Safety
+///
+/// `req` and everything its pointers reach must be live for the call.
+unsafe fn read_contract_request(
+    req: &PieLoaderContractRequest,
+) -> Result<CheckedContractRequest, (PieLoaderStatus, String)> {
+    let bad = |err: String| (PieLoaderStatus::InvalidRequest, err);
+    if req.checkpoint.is_null() {
+        return Err(bad(
+            "request.checkpoint is null; open one with pie_loader_open_checkpoint".to_string(),
+        ));
+    }
+    let backend = PieLoaderBackendKind::try_from(req.target.backend).map_err(|v| {
+        bad(format!(
+            "request.target.backend: {v} is not a PieLoaderBackendKind"
+        ))
+    })?;
+    if req.target.tp_size == 0 || req.target.tp_rank >= req.target.tp_size {
+        return Err(bad(format!(
+            "request.target: tp_rank {} is not a rank of a {}-way group",
+            req.target.tp_rank, req.target.tp_size
+        )));
+    }
+    // The MoE lowering is a property of the contract now, so the target is
+    // resolved with the request that asks for nothing: an expert weight is
+    // MXFP4 because a node says so, not because a flag on the side said the
+    // model was one of the ones that should be.
+    let target =
+        super::storage_target(&req.target, backend, PieLoaderMxfp4MoeRequest::Auto).map_err(bad)?;
+    let model = unsafe { super::contract::read_contract(&req.contract) }.map_err(bad)?;
+    Ok(CheckedContractRequest { model, target })
+}
+
+/// Open a checkpoint and read its tensor table.
+///
+/// The only entry point that touches the filesystem before a plan executes.
+/// On success `*out` receives a handle the caller must free with
+/// [`pie_loader_close_checkpoint`].
+///
+/// # Safety
+///
+/// `snapshot_dir` is a valid [`PieLoaderBytes`] live for the call. `out` is a
+/// writable slot. `out_diags` is null or a writable slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pie_loader_open_checkpoint(
+    snapshot_dir: PieLoaderBytes,
+    out: *mut *mut PieLoaderCheckpoint,
+    out_diags: *mut *mut PieLoaderDiagnostics,
+) -> PieLoaderStatus {
+    never_unwind(|| {
+        if !out_diags.is_null() {
+            unsafe { *out_diags = std::ptr::null_mut() };
+        }
+        if out.is_null() {
+            return PieLoaderStatus::InvalidRequest;
+        }
+        unsafe { *out = std::ptr::null_mut() };
+
+        let mut sink = DiagnosticSink::default();
+        let status = match catch_unwind(AssertUnwindSafe(|| {
+            let dir = unsafe { as_str(&snapshot_dir, "snapshot_dir") }
+                .map_err(|err| (PieLoaderStatus::InvalidRequest, err))?;
+            if dir.is_empty() {
+                return Err((
+                    PieLoaderStatus::InvalidRequest,
+                    "snapshot_dir is empty".to_string(),
+                ));
+            }
+            let dir = PathBuf::from(dir);
+            parse_checkpoint_metadata(&dir)
+                .map(|metadata| (metadata, dir))
+                .map_err(|err| (compile_error_status(&err), err.to_string()))
+        })) {
+            Ok(Ok((metadata, dir))) => {
+                unsafe { *out = super::checkpoint::build(metadata, dir) };
+                PieLoaderStatus::Ok
+            }
+            Ok(Err((status, message))) => {
+                sink.error(message);
+                status
+            }
+            Err(payload) => {
+                sink.error(format!(
+                    "pie_loader_open_checkpoint panicked: {}",
+                    panic_text(&payload)
+                ));
+                PieLoaderStatus::Panic
+            }
+        };
+        unsafe { emit(out_diags, sink.publish()) };
+        status
+    })
+}
+
+/// Free a checkpoint handle.
+///
+/// # Safety
+///
+/// `checkpoint` is null, or a handle from [`pie_loader_open_checkpoint`] that
+/// has not already been closed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pie_loader_close_checkpoint(checkpoint: *mut PieLoaderCheckpoint) {
+    let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
+        super::checkpoint::release(checkpoint)
+    }));
+}
+
+/// Compile a driver-authored contract into a plan.
+///
+/// The contract path and [`pie_loader_compile`] produce the same kind of plan
+/// and are freed the same way; they differ only in who decides what to build.
+///
+/// # Safety
+///
+/// `req` must point at a valid [`PieLoaderContractRequest`] whose borrowed
+/// memory is live for the call. `out_plan` must be a writable slot. `out_diags`
+/// is either null or a writable slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pie_loader_compile_contract(
+    req: *const PieLoaderContractRequest,
+    out_plan: *mut *mut PieLoaderPlan,
+    out_diags: *mut *mut PieLoaderDiagnostics,
+) -> PieLoaderStatus {
+    never_unwind(|| {
+        if !out_diags.is_null() {
+            unsafe { *out_diags = std::ptr::null_mut() };
+        }
+        if out_plan.is_null() {
+            return PieLoaderStatus::InvalidRequest;
+        }
+        unsafe { *out_plan = std::ptr::null_mut() };
+        if req.is_null() {
+            let mut sink = DiagnosticSink::default();
+            sink.error("pie_loader_compile_contract: request is null");
+            unsafe { emit(out_diags, sink.publish()) };
+            return PieLoaderStatus::InvalidRequest;
+        }
+
+        let mut sink = DiagnosticSink::default();
+        let status = match catch_unwind(AssertUnwindSafe(|| unsafe {
+            compile_contract_request(&*req)
+        })) {
+            Ok(Ok((plan, extras))) => {
+                unsafe { *out_plan = arena::build(&plan, &extras) };
+                PieLoaderStatus::Ok
+            }
+            Ok(Err((status, message))) => {
+                sink.error(message);
+                status
+            }
+            Err(payload) => {
+                sink.error(format!(
+                    "pie_loader_compile_contract panicked: {}",
+                    panic_text(&payload)
+                ));
+                PieLoaderStatus::Panic
+            }
+        };
+        unsafe { emit(out_diags, sink.publish()) };
+        status
+    })
+}
+
+/// Check a plan against the contract it was compiled from.
+///
+/// The contract is read a second time here rather than carried over from the
+/// compile, and the plan is read back out of the C arena rather than out of the
+/// Rust value it was built from. Both are deliberate: it makes this a check of
+/// two independently-derived answers, with the marshalling in scope, instead of
+/// a comparison of the compiler with itself.
+///
+/// # Safety
+///
+/// As [`pie_loader_verify`], with a [`PieLoaderContractRequest`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pie_loader_verify_contract(
+    plan: *const PieLoaderPlan,
+    req: *const PieLoaderContractRequest,
+    out_diags: *mut *mut PieLoaderDiagnostics,
+) -> PieLoaderStatus {
+    never_unwind(|| {
+        if !out_diags.is_null() {
+            unsafe { *out_diags = std::ptr::null_mut() };
+        }
+        if plan.is_null() || req.is_null() {
+            let mut sink = DiagnosticSink::default();
+            sink.error("pie_loader_verify_contract: plan or request is null");
+            unsafe { emit(out_diags, sink.publish()) };
+            return PieLoaderStatus::InvalidRequest;
+        }
+
+        let mut sink = DiagnosticSink::default();
+        let panicked = catch_unwind(AssertUnwindSafe(|| {
+            let plan = unsafe { &*plan };
+            let req = unsafe { &*req };
+            match unsafe { read_contract_request(req) } {
+                Ok(checked) => {
+                    verify_plan_contract(
+                        plan,
+                        || Ok(Some(crate::verify::ContractView::of(&checked.model))),
+                        &mut sink,
+                    );
+                }
+                Err((_, message)) => sink.error(message),
+            }
+            // A contract request states no MoE policy, so `Auto` is what the
+            // compile resolved and `Auto` is what verification must resolve.
+            verify_target_compat(plan, &req.target, PieLoaderMxfp4MoeRequest::Auto, &mut sink);
+        }));
+        let status = match panicked {
+            Ok(()) if sink.is_empty() => PieLoaderStatus::Ok,
+            Ok(()) => PieLoaderStatus::ContractViolation,
+            Err(payload) => {
+                sink.error(format!(
+                    "pie_loader_verify_contract panicked: {}",
+                    panic_text(&payload)
+                ));
+                PieLoaderStatus::Panic
+            }
+        };
+        unsafe { emit(out_diags, sink.publish()) };
+        status
+    })
 }
 
 /// Compile a checkpoint into a plan.
@@ -598,95 +924,118 @@ pub unsafe extern "C" fn pie_loader_release_diagnostics(diags: *mut PieLoaderDia
 /// request: was this plan compiled *for the caller*? Rank divergence is the
 /// motivating case (§6.2), and no amount of internal consistency detects it.
 fn verify_plan(plan: &PieLoaderPlan, req: &PieLoaderRequest, sink: &mut DiagnosticSink) {
-    match unsafe { plan_view(plan) } {
-        Ok(view) => {
-            // The contract is whatever the driver declared. An empty `demands`
-            // is not an error — it means this driver has not adopted the
-            // declaration yet, and only the plan's internal consistency can be
-            // checked. See `PieLoaderTensorDemand`.
-            match unsafe { contract_view(req) } {
-                Ok(contract) => {
-                    let result = match &contract {
-                        Some(contract) => crate::verify::verify(&view, Some(contract)),
-                        None => crate::verify::verify(&view, None),
-                    };
-                    if let Err(violations) = result {
-                        for violation in violations {
-                            sink.error(violation.to_string());
-                        }
-                    }
+    verify_plan_contract(plan, || unsafe { contract_view(req) }, sink);
+    match CheckedRequest::new(req) {
+        Ok(checked) => verify_target_compat(plan, &req.target, checked.mxfp4_moe, sink),
+        Err(err) => sink.error(err),
+    }
+}
+
+/// Check the plan against whatever the caller declared it should deliver.
+fn verify_plan_contract<'a>(
+    plan: &PieLoaderPlan,
+    demanded: impl FnOnce() -> Result<Option<crate::verify::ContractView<'a>>, String>,
+    sink: &mut DiagnosticSink,
+) {
+    let view = match unsafe { plan_view(plan) } {
+        Ok(view) => view,
+        Err(err) => {
+            sink.error(err);
+            return;
+        }
+    };
+    // The contract is whatever the driver declared. An empty `demands` is not
+    // an error — it means this driver has not adopted the declaration yet, and
+    // only the plan's internal consistency can be checked. See
+    // `PieLoaderTensorDemand`.
+    match demanded() {
+        Ok(contract) => {
+            if let Err(violations) = crate::verify::verify(&view, contract.as_ref()) {
+                for violation in violations {
+                    sink.error(violation.to_string());
                 }
-                Err(err) => sink.error(err),
             }
         }
         Err(err) => sink.error(err),
     }
-    match CheckedRequest::new(req) {
-        Ok(checked) => {
-            if plan.target.backend != checked.backend {
+}
+
+/// Check that the plan was compiled for *this* caller's device.
+///
+/// Shared by both entry points because the question does not depend on who
+/// authored the contract: a plan built for another rank, another alignment or
+/// another fusion set is wrong for this driver either way.
+fn verify_target_compat(
+    plan: &PieLoaderPlan,
+    target: &PieLoaderTargetSpec,
+    mxfp4_moe: PieLoaderMxfp4MoeRequest,
+    sink: &mut DiagnosticSink,
+) {
+    match PieLoaderBackendKind::try_from(target.backend) {
+        Ok(backend) if plan.target.backend != backend => sink.error(format!(
+            "plan backend {:?} does not match requested {:?}",
+            plan.target.backend, backend
+        )),
+        Ok(_) => {}
+        Err(value) => sink.error(format!(
+            "request.target.backend: {value} is not a PieLoaderBackendKind"
+        )),
+    }
+    // The plan records the *resolved* policy, so comparing it against the raw
+    // request would report a false mismatch for `Auto`. Resolve the request the
+    // same way the compile did and compare the answers; otherwise a plan built
+    // under one policy verifies happily against a request that asked for
+    // another.
+    match super::resolve_mxfp4_moe(mxfp4_moe, target.native_mxfp4_moe) {
+        Ok(policy) => {
+            let policy = PieLoaderMxfp4MoePolicy::from(policy);
+            if plan.target.mxfp4_moe != policy {
                 sink.error(format!(
-                    "plan backend {:?} does not match requested {:?}",
-                    plan.target.backend, checked.backend
+                    "plan mxfp4_moe {:?} does not match the request's resolved {policy:?}",
+                    plan.target.mxfp4_moe
                 ));
             }
-            // The plan records the *resolved* policy, so comparing it against
-            // the raw request would report a false mismatch for `Auto`. Resolve
-            // the request the same way the compile did and compare the answers;
-            // otherwise a plan built under one policy verifies happily against a
-            // request that asked for another.
-            match super::resolve_mxfp4_moe(checked.mxfp4_moe, req.target.native_mxfp4_moe) {
-                Ok(policy) => {
-                    let policy = PieLoaderMxfp4MoePolicy::from(policy);
-                    if plan.target.mxfp4_moe != policy {
-                        sink.error(format!(
-                            "plan mxfp4_moe {:?} does not match the request's resolved {policy:?}",
-                            plan.target.mxfp4_moe
-                        ));
-                    }
-                }
-                Err(err) => sink.error(err),
-            }
         }
         Err(err) => sink.error(err),
     }
-    if plan.target.tp_rank != req.target.tp_rank || plan.target.tp_size != req.target.tp_size {
+    if plan.target.tp_rank != target.tp_rank || plan.target.tp_size != target.tp_size {
         sink.error(format!(
             "plan is rank {}/{} but the caller is rank {}/{}",
-            plan.target.tp_rank, plan.target.tp_size, req.target.tp_rank, req.target.tp_size
+            plan.target.tp_rank, plan.target.tp_size, target.tp_rank, target.tp_size
         ));
     }
-    if plan.target.tile_map_mask & !req.target.tile_map_mask != 0 {
+    if plan.target.tile_map_mask & !target.tile_map_mask != 0 {
         sink.error(format!(
             "plan requires tile maps {:#x} the target does not implement (target mask {:#x})",
-            plan.target.tile_map_mask & !req.target.tile_map_mask,
-            req.target.tile_map_mask
+            plan.target.tile_map_mask & !target.tile_map_mask,
+            target.tile_map_mask
         ));
     }
-    if plan.target.preferred_alignment != req.target.preferred_alignment {
+    if plan.target.preferred_alignment != target.preferred_alignment {
         sink.error(format!(
             "plan alignment {} does not match target {}",
-            plan.target.preferred_alignment, req.target.preferred_alignment
+            plan.target.preferred_alignment, target.preferred_alignment
         ));
     }
-    if plan.target.max_tile_bytes != req.target.max_tile_bytes {
+    if plan.target.max_tile_bytes != target.max_tile_bytes {
         sink.error(format!(
             "plan max_tile_bytes {} does not match target {}",
-            plan.target.max_tile_bytes, req.target.max_tile_bytes
+            plan.target.max_tile_bytes, target.max_tile_bytes
         ));
     }
-    if plan.target.native_mxfp4_moe != req.target.native_mxfp4_moe {
+    if plan.target.native_mxfp4_moe != target.native_mxfp4_moe {
         sink.error(format!(
             "plan native_mxfp4_moe {} does not match target {}",
-            plan.target.native_mxfp4_moe, req.target.native_mxfp4_moe
+            plan.target.native_mxfp4_moe, target.native_mxfp4_moe
         ));
     }
     // Not a formality: a plan compiled with fusion on names a different kernel
     // sequence, so running it on a driver that has fusion off would execute
     // something the plan does not describe.
-    if plan.target.fused_transcode != req.target.fused_transcode {
+    if plan.target.fusion_mask != target.fusion_mask {
         sink.error(format!(
-            "plan fused_transcode {} does not match target {}",
-            plan.target.fused_transcode, req.target.fused_transcode
+            "plan fusion_mask {:#x} does not match target {:#x}",
+            plan.target.fusion_mask, target.fusion_mask
         ));
     }
 }

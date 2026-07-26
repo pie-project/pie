@@ -137,15 +137,23 @@ impl TensorType {
 
 /// One declared tensor.
 ///
-/// `shape` and `encoding` are derivable from `expr`; they are declared anyway
-/// and checked, so that a contract is simultaneously a request and a proof
-/// obligation. A driver whose model of the checkpoint is wrong fails to compile
-/// instead of silently binding a plausible-looking buffer.
+/// `encoding` is what the driver wants the tensor to *be*, and the loader
+/// inserts whatever cast, decode or encode reaches it. `shape` is different: it
+/// is a *prediction*, checked against what the expression actually yields, so
+/// that a driver whose model of the checkpoint is wrong fails to compile instead
+/// of silently binding a plausible-looking buffer.
+///
+/// A prediction may be declined. `shape: None` says "I do not claim to know",
+/// which is the honest answer for a packed quantized weight whose on-disk
+/// extents are a property of the quantizer that produced the file rather than of
+/// the model. Forcing a claim there is what produced `LogicalShape` in
+/// `model_contracts.hpp`: a helper whose only job was to erase a shape the
+/// driver had been made to state and could not stand behind.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TensorContract {
     pub name: String,
     pub expr: Expr,
-    pub shape: Vec<i64>,
+    pub shape: Option<Vec<i64>>,
     pub encoding: Encoding,
 }
 
@@ -154,16 +162,19 @@ impl TensorContract {
         Self {
             name: name.into(),
             expr,
-            shape,
+            shape: Some(shape),
             encoding,
         }
     }
 
-    /// The type this contract claims to have.
-    pub fn declared(&self) -> TensorType {
-        TensorType {
-            shape: self.shape.clone(),
-            encoding: self.encoding.clone(),
+    /// A declaration that states the encoding it wants and declines to predict
+    /// the shape.
+    pub fn inferred(name: impl Into<String>, expr: Expr, encoding: Encoding) -> Self {
+        Self {
+            name: name.into(),
+            expr,
+            shape: None,
+            encoding,
         }
     }
 }
@@ -1284,11 +1295,22 @@ mod tests {
             .collect()
     }
 
+    /// The type a contract that declares its shape claims to have.
+    fn declared(contract: &TensorContract) -> TensorType {
+        TensorType {
+            shape: contract
+                .shape
+                .clone()
+                .expect("test contract declares a shape"),
+            encoding: contract.encoding.clone(),
+        }
+    }
+
     #[test]
     fn a_contract_resolves_to_what_it_declares() {
         let tensors = vec![qkv_contract(vec![4096, 2048])];
         let found = resolve(&tensors, &qwen3()).unwrap();
-        assert_eq!(found[0], tensors[0].declared());
+        assert_eq!(found[0], declared(&tensors[0]));
     }
 
     #[test]
@@ -1378,7 +1400,7 @@ mod tests {
         )]);
         assert_eq!(
             resolve(&contract.tensors, &qwen3()).unwrap()[0],
-            contract.tensors[0].declared()
+            declared(&contract.tensors[0])
         );
     }
 }
