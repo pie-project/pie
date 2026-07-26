@@ -588,6 +588,18 @@ __device__ __forceinline__ float m1_bits_f32(m1_u32 value) {
   return __uint_as_float(value);
 }
 
+// Monotone map float -> m1_u32 that REVERSES value order: a larger float yields
+// a smaller key, so a plain unsigned radix select over the keys walks the values
+// in descending order. NaN maps to the maximum key (sorts last), and no finite
+// float can collide with that sentinel.
+__device__ __forceinline__ m1_u32 m1_desc_key(float value) {
+  if (m1_isnan(value)) return 0xFFFFFFFFu;
+  if (value == 0.0f) value = 0.0f;   // -0.0 compares equal to +0.0
+  const m1_u32 u = __float_as_uint(value);
+  const m1_u32 ascending = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+  return ~ascending;
+}
+
 __device__ __forceinline__ int m1_float_to_i32(float value) {
   if (m1_isnan(value)) return 0;
   if (value >= 2147483647.0f) return 2147483647;
@@ -1526,19 +1538,44 @@ __device__ __forceinline__ void ptir_m1_execute(
           k = m1_load_u(a1, m1_pick(d1.len, row), d1.dtype);
         }
         if (k > d0.last) k = d0.last;
-        for (m1_u32 i = 0; i < d0.last; ++i) {
-          const float value = m1_load_f(a0, base + i, d0.dtype);
-          int greater = 0;
-          if (!m1_isnan(value)) {
+        if (k == 0u) {
+          for (m1_u32 i = 0; i < d0.last; ++i) m1_store_b(o0, base + i, false);
+        } else {
+          // 4-pass 8-bit MSB radix select on `m1_desc_key`. The earlier form
+          // rescanned the whole row per element, i.e. O(len^2) on a single
+          // thread -- ~2.3e10 visits at a 151936-token vocabulary, which never
+          // returns. `greater(i) < k` holds exactly when `key(i) <= K_k` for
+          // `K_k` the k-th smallest key counting multiplicity, so ties survive
+          // or fall together exactly as the reference has them.
+          m1_u32 histogram[256];
+          m1_u32 prefix = 0u;
+          m1_u32 target = k;
+          for (int pass = 0; pass < 4; ++pass) {
+            const int shift = 24 - 8 * pass;
+            const m1_u32 high_mask =
+                (pass == 0) ? 0u : (0xFFFFFFFFu << (shift + 8));
+            for (m1_u32 bucket = 0u; bucket < 256u; ++bucket)
+              histogram[bucket] = 0u;
             for (m1_u32 j = 0; j < d0.last; ++j) {
-              const float other = m1_load_f(a0, base + j, d0.dtype);
-              if (!m1_isnan(other) && other > value) ++greater;
+              const m1_u32 key =
+                  m1_desc_key(m1_load_f(a0, base + j, d0.dtype));
+              if ((key & high_mask) == (prefix & high_mask))
+                ++histogram[(key >> shift) & 0xFFu];
             }
+            m1_u32 run = 0u;
+            m1_u32 chosen = 255u;
+            for (m1_u32 bucket = 0u; bucket < 256u; ++bucket) {
+              if (run + histogram[bucket] >= target) { chosen = bucket; break; }
+              run += histogram[bucket];
+            }
+            target -= run;
+            prefix |= chosen << shift;
           }
-          m1_store_b(
-              o0,
-              base + i,
-              !m1_isnan(value) && (m1_u32)greater < k);
+          for (m1_u32 i = 0; i < d0.last; ++i) {
+            const float value = m1_load_f(a0, base + i, d0.dtype);
+            m1_store_b(o0, base + i,
+                       !m1_isnan(value) && m1_desc_key(value) <= prefix);
+          }
         }
       } else if (p.pred_tag == 1) {
         // Descending selection that carries the previous pick as a total-order

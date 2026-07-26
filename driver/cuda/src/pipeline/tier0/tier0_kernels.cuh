@@ -673,31 +673,99 @@ __device__ __forceinline__ bool t0_desc_before(float av, std::uint32_t ai, bool 
     return !a_nan;   // non-NaN always sorts before NaN
 }
 
+// Monotone map float → uint32 that REVERSES value order: a larger float yields a
+// smaller key, so "descending by value" becomes "ascending by key" and a plain
+// unsigned radix select works directly. NaN maps to the maximum key, which is
+// exactly where the tie/NaN contract wants it (last), and no finite float can
+// collide with that sentinel (it would require the bit pattern 0xFFFFFFFF, which
+// is itself a NaN).
+__device__ __forceinline__ std::uint32_t t0_desc_key(float v) {
+    if (isnan(v)) return 0xFFFFFFFFu;
+    if (v == 0.0f) v = 0.0f;   // canonicalise -0.0, which compares equal to +0.0
+    const std::uint32_t u = __float_as_uint(v);
+    const std::uint32_t asc = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+    return ~asc;
+}
+
 // rank_le predicate inside pivot_threshold: `k` is a dynamic (scalar or
 // per-row) I32/U32 trace value — NOT a host immediate (unlike the standalone
 // `rank_le` op above). Ties/NaN contract mirrors interp.rs exactly: a NaN
 // element is NEVER selected (interp.rs `if xi.is_nan() { continue; }` leaves
 // its `keep` bit at the default false), and NaN elements never count toward
 // another element's `greater` tally. One CTA per row.
+//
+// Implemented as a 4-pass 8-bit MSB radix select on `t0_desc_key` rather than
+// the literal `len`-way per-element rank pass, which costs O(len^2) — ~2.3e10
+// element visits at the 151936-token vocab this must stay practical for, and
+// the reason `mirostat-v2-sampling` took minutes per request. The select costs
+// 4 histogram passes plus one marking pass, i.e. O(5*len) regardless of `k`.
+//
+// Equivalence to the rank formulation: `greater(i)` (the count of strictly
+// larger values) equals the count of strictly smaller *keys*, which is monotone
+// in the key, so `greater(i) < k` holds exactly when `key(i) <= K_k`, where
+// `K_k` is the k-th smallest key counting multiplicity. Ties therefore all
+// survive or all fall together — matching the reference, which can keep more
+// than `k` elements when the boundary value repeats. NaN keys sort last, so
+// they never displace a real element from the ranking; they are excluded from
+// the output by the explicit `isnan` test in the marking pass.
 template <class KT>
 __global__ void k_pivot_rankle(const float* __restrict__ in, std::uint8_t* __restrict__ out,
                                std::uint32_t rows, std::uint32_t len,
                                const KT* __restrict__ k_buf, std::uint32_t k_numel) {
+    __shared__ std::uint32_t sh_hist[256];
+    __shared__ std::uint32_t sh_prefix;
+    __shared__ std::uint32_t sh_target;
+
     const std::uint32_t row = blockIdx.x;
     if (row >= rows) return;
     const float* r = in + (std::uint64_t)row * len;
     std::uint8_t* o = out + (std::uint64_t)row * len;
     const std::int64_t k_raw = (std::int64_t)k_buf[(k_numel <= 1) ? 0u : row];
     const std::int64_t kk = k_raw < 0 ? 0 : (k_raw > (std::int64_t)len ? (std::int64_t)len : k_raw);
+
+    if (kk == 0) {
+        for (std::uint32_t i = threadIdx.x; i < len; i += blockDim.x) o[i] = 0u;
+        return;
+    }
+
+    if (threadIdx.x == 0) {
+        sh_prefix = 0u;
+        sh_target = (std::uint32_t)kk;
+    }
+    __syncthreads();
+
+    for (int pass = 0; pass < 4; ++pass) {
+        const int shift = 24 - 8 * pass;
+        // Bits fixed by earlier passes. `pass == 0` is special-cased because
+        // `1u << 32` is undefined, not zero.
+        const std::uint32_t hi_mask = (pass == 0) ? 0u : (0xFFFFFFFFu << (shift + 8));
+        for (std::uint32_t b = threadIdx.x; b < 256u; b += blockDim.x) sh_hist[b] = 0u;
+        __syncthreads();
+        const std::uint32_t prefix = sh_prefix;
+        for (std::uint32_t i = threadIdx.x; i < len; i += blockDim.x) {
+            const std::uint32_t key = t0_desc_key(r[i]);
+            if ((key & hi_mask) == (prefix & hi_mask))
+                atomicAdd(&sh_hist[(key >> shift) & 0xFFu], 1u);
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            const std::uint32_t target = sh_target;
+            std::uint32_t run = 0u;
+            std::uint32_t bucket = 255u;
+            for (std::uint32_t t = 0; t < 256u; ++t) {
+                if (run + sh_hist[t] >= target) { bucket = t; break; }
+                run += sh_hist[t];
+            }
+            sh_target = target - run;
+            sh_prefix = prefix | (bucket << shift);
+        }
+        __syncthreads();
+    }
+
+    const std::uint32_t thr = sh_prefix;
     for (std::uint32_t i = threadIdx.x; i < len; i += blockDim.x) {
         const float v = r[i];
-        if (isnan(v)) { o[i] = 0u; continue; }
-        std::int64_t greater = 0;
-        for (std::uint32_t j = 0; j < len; ++j) {
-            const float y = r[j];
-            if (!isnan(y) && y > v) ++greater;
-        }
-        o[i] = (greater < kk) ? 1u : 0u;
+        o[i] = (!isnan(v) && t0_desc_key(v) <= thr) ? 1u : 0u;
     }
 }
 

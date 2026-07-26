@@ -1056,6 +1056,36 @@ cutoff. `sampling-primitives` pins it with a keep-mask published in a shape that
 contract without depending on float summation order: 37 tokens, 0.901134 mass at
 `top_p = 0.9`, in 0.2 s.
 
+Its sibling predicate had the same disease one order milder. `rank_le` — the
+top-k truncation `mirostat-v2-sampling` uses — was spelled as a literal rank
+computation in all three implementations (tier-0's `k_pivot_rankle`, the
+generated fused emitter, and the M1 singleton reference): for each element,
+rescan the row and count the strictly-greater values. That is O(len²)
+unconditionally, ~2.3e10 element visits per row per token at this vocabulary,
+and the single-threaded singleton copy was effectively another hang.
+
+All three now run a 4-pass 8-bit MSB radix select over a monotone key
+```
+key(v) = ~( (u & 0x80000000) ? ~u : (u | 0x80000000) )    where u = bits(v)
+```
+which reverses value order (larger float ⇒ smaller key), sends NaN to
+`0xFFFFFFFF` so it sorts last exactly as the tie contract wants, and cannot
+collide with a finite float. `greater(i)` is the count of strictly smaller keys,
+which is monotone in the key, so `greater(i) < k` holds precisely when
+`key(i) <= K_k` for `K_k` the k-th smallest key counting multiplicity — ties
+therefore all survive or all fall together, which is what the reference does and
+is why it can legitimately keep more than `k` elements. The cost is O(5·len)
+regardless of `k`. Measured at the 151936-token width: **0.48 ms**, against an
+O(len²) form that would need ~30000× more element visits. Two tier-0 tests pin
+it — a randomised parity case covering ties, both signed zeros, NaN and `k` at
+both clamp bounds, and a production-width case checked against an O(len)
+`nth_element` cut with a timing gate.
+
+The general shape is the same as the nucleus hang and worth naming: **a
+predicate whose reference spelling is quadratic will pass every small-fixture
+test and fail only at production width**, which is the one width the unit tests
+did not use.
+
 ### Four inferlet authoring contracts, discovered the hard way
 
 All of these fail **silently** — no error, no exception, just a wrong or empty
