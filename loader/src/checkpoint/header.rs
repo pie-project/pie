@@ -16,8 +16,9 @@
 //! tags are mapped onto `U8` storage for parity with the C++
 //! `dtype_from_safetensors` (`driver/cuda/src/tensor.cpp`).
 //!
-//! The 64-bit dtypes (`F64`/`I64`/`U64`) have no device representation here and
-//! are rejected.
+//! The 64-bit float dtype (`F64`) has no device representation here and is
+//! rejected; `I64`/`U64` are carried through untouched for integer index
+//! tables such as DeepSeek-V4's `ffn.gate.tid2eid`.
 //!
 //! Offset convention matches the C++ loader
 //! (`driver/cuda/src/loader/safetensors.cpp`):
@@ -52,8 +53,8 @@ pub struct SafetensorsEntry {
 /// `dtype_from_safetensors` (`driver/cuda/src/tensor.cpp`).
 ///
 /// MXFP4 storage tags (`F4_E2M1` blocks, `F8_E8M0` scales) map onto `U8` — the
-/// scheme is recognised later by *name* in the storage compiler. 64-bit dtypes
-/// have no device representation here and are rejected.
+/// scheme is recognised later by *name* in the storage compiler. `F64` has no
+/// device representation here and is rejected; `I64`/`U64` pass through.
 pub fn dtype_from_safetensors(s: &str) -> Result<DType, CompileError> {
     Ok(match s {
         "F32" => DType::F32,
@@ -73,9 +74,15 @@ pub fn dtype_from_safetensors(s: &str) -> Result<DType, CompileError> {
         // the storage compiler. Real gpt-oss checkpoints already declare these
         // as `U8`; the packed tags are accepted for C++ parity.
         "F4_E2M1" | "F8_E8M0" => DType::U8,
-        // LoadPlan v4 has no 64-bit runtime dtype or executor contract.
-        // Reject explicitly rather than narrowing checkpoint metadata.
-        "F64" | "I64" | "U64" => {
+        // Integer index tables ride through untouched: DeepSeek-V4's hash
+        // router ships `ffn.gate.tid2eid` as `[vocab, K]` I64 and the kernel
+        // reads it as `const int64_t*`. The loader never interprets these
+        // values, it only has to account for their width.
+        "I64" => DType::I64,
+        "U64" => DType::U64,
+        // No 64-bit float runtime dtype or executor contract. Reject
+        // explicitly rather than narrowing checkpoint metadata.
+        "F64" => {
             return Err(CompileError::InvalidInput(format!(
                 "safetensors 64-bit dtype {s} is unsupported by the header parser"
             )));
@@ -415,13 +422,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_64bit_dtypes() {
-        for wide in ["F64", "I64", "U64"] {
-            assert!(
-                dtype_from_safetensors(wide).is_err(),
-                "{wide} should be rejected"
-            );
-        }
+    fn rejects_64bit_float_dtype() {
+        assert!(dtype_from_safetensors("F64").is_err(), "F64 should be rejected");
+    }
+
+    #[test]
+    fn accepts_64bit_integer_index_tables() {
+        assert_eq!(dtype_from_safetensors("I64").unwrap(), DType::I64);
+        assert_eq!(dtype_from_safetensors("U64").unwrap(), DType::U64);
+        assert_eq!(DType::I64.bytes(), 8);
+        assert_eq!(DType::U64.bytes(), 8);
     }
 
     #[test]

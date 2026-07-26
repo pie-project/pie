@@ -1,14 +1,14 @@
 # Model Contract Specification
 
-> **Status: implemented in Rust; the C++ half is not.** This specifies the
-> declaration format a driver hands to the loader. The algebra, its type
-> checker, its lowering, and all six of `loader/src/arch/`'s passes now run on
-> it; `RuntimeTensorSource` and the hand-computed byte spans it carried are
-> deleted. What has not moved is *authorship*: `arch/` still infers the
-> declaration from `model_type` rather than being handed one. See §9.
+> **Status: implemented, both halves.** This specifies the declaration format a
+> driver hands to the loader. The algebra, its type checker and its lowering run
+> on it, and as of `architecture.md` §12 row 12 phase 4 so does *authorship*:
+> `driver/common/include/pie_driver/model_contracts.hpp` writes the contract and
+> `loader/src/arch/` is deleted. The loader infers nothing from `model_type`
+> because it is never told one. See §9.
 >
-> This is the spec for step 7b of `architecture.md` §12. It is expected to
-> change as it is implemented; amend it in place rather than writing errata.
+> This is the spec for step 7b of `architecture.md` §12. Amend it in place rather
+> than writing errata.
 >
 > Citations of the form `path:line` refer to the current tree and exist to
 > ground each claim in evidence.
@@ -28,10 +28,11 @@ There is exactly one question that decides where this boundary goes:
 | **loader** | file layout, storage bandwidth, memory budget, DMA engine     | *how* the bytes get there    |
 | **either** | —                                                             | **neither needs the model family** |
 
-The last row is the load-bearing one. Today `loader/src/abi/arch.rs` carries a
-13-field `ArchProfile` keyed by `model_type`, and every field exists because one
-side had to guess something the other side knew. If the driver declares what it
-wants, there is nothing left to infer, and the table deletes.
+The last row is the load-bearing one. `loader/src/abi/arch.rs` used to carry a
+13-field `ArchProfile` keyed by `model_type`, and every field existed because one
+side had to guess something the other side knew. The driver declares what it
+wants now, so there is nothing left to infer, and the table is deleted — along
+with the rest of `arch/`.
 
 Two corollaries that fall out of the principle and are worth stating up front,
 because they kill concepts that look load-bearing:
@@ -437,7 +438,7 @@ TensorContract::new("…v_proj.weight", Expr::src("…qkv_proj.weight").slice(0,
 
 | Deleted                                                       | Lines | Why                                                        |
 | ------------------------------------------------------------- | ----: | ---------------------------------------------------------- |
-| `loader/src/abi/arch.rs` — `ArchProfile`, 13 fields            |   174 | nothing left to infer from `model_type`                     |
+| `loader/src/abi/arch.rs` — `ArchProfile`, 13 fields            |   174 | **done** — nothing left to infer from `model_type`; `arch.rs` + `arch/` are deleted whole (2,110 lines) |
 | `skip_dense_qkv_fusion`                                        |     — | a C++ binder gap encoded as an architecture property        |
 | `phi3_fused_splits`                                            |    94 | the same declaration in the opposite direction              |
 | `bind_projection_or_fused_view` (C++)                          |    32 | views are published by the loader for free                  |
@@ -521,38 +522,39 @@ leaving only the `layout` enum.
 | The cost model and the DMA-vs-gather choice | **done** — `Lowering::cost`; `compile`'s `max_runs` is a compile-time guard, not the cost |
 | The HIGH IR node the fragment lowers to | **done** — `ir::LayoutExpr::Gather`; eight affine variants deleted with it |
 | Wiring the loader's frontend, optimizer, type checker, planner and evaluator onto it | **done** — `loader/tests/algebra.rs`, 13 tests |
-| Porting `arch/`'s six passes onto declarations | **done** — all six emit `Expr`; `RuntimeTensorSource`, `RuntimeByteSpan`, `SelectContract` and `frontend::bridge_expr` deleted |
-| Retiring the loader's `config.json` read | **done** — `PieLoaderModelSpec` on the request; both drivers fill it |
+| Porting `arch/`'s six passes onto declarations | **done** — all six emitted `Expr`, and then all six were deleted: with the contract stated, each was a way of computing an expression the contract already contains |
+| Retiring the loader's `config.json` read | **done** — the driver states the facts it needs as arguments to `author_model_contract`; `config.rs` and `parse_model_config` are deleted |
+| Moving *authorship* to C++ | **done** — `driver/common/include/pie_driver/model_contracts.hpp`; checked by diffing 2,240 plans and cache keys against the Rust author, 0 differences |
 | Checking a plan against the contract | **done** — `loader/src/verify.rs`, `verify(&PlanView, Option<&ContractView>)` |
 | Golden plans | **done** — `loader/tests/golden_plans.rs`, 10 plans across 4 architectures, 2 backends, 3 TP configs |
 | The loader as a tool | **done** — `loader/src/main.rs`: `dump · verify · diff · replay` |
-| C++ builder façade and the FFI shape | not started — see §9.2 |
+| C++ builder façade and the FFI shape | **done** — `loader/include/pie_loader/{model_contract,source_checkpoint}.hpp`; the contract crosses the ABI as a flat node arena, both ways (§9.2) |
 
-The record and the algebra are expected to keep moving while the remaining
-pieces are written. Amend this document in place.
+Amend this document in place.
 
-### 9.2 What the C++ façade is still for
+### 9.2 What the C++ façade is for
 
-With the passes ported and `config.json` retired, the loader no longer reads
-anything about the model from disk: the driver states the five facts it needs
-(`PieLoaderModelSpec`). What has *not* moved is the declaration itself. `arch/`
-still decides, from `model_type`, which tensors a model wants and in what shape,
-and that decision belongs to whoever knows which kernels will read them.
+The driver authors. `pie_loader::ModelContract`
+(`loader/include/pie_loader/model_contract.hpp`) is the builder —
+`define(name, expr).expect(shape)` plus a constructor per node — and
+`pie_driver::author_model_contract`
+(`driver/common/include/pie_driver/model_contracts.hpp`) is where the families
+live. The loader is handed the result and lowers it.
 
-The remaining evidence that this is the right end state is `ArchProfile`'s four
-layer-3 gates — `skip_dense_qkv_fusion`, `stack_per_expert_moe`,
-`phi3_fused_splits`, `metal_qwen35`. Each exists because a pass guesses at what
-the driver wants and the guess is wrong for some architecture. `fusion.rs`
-invents the name `...self_attn.qkv_proj.fused.weight` and hopes something binds
-it; `skip_dense_qkv_fusion` is the list of models where hoping failed. None of
-these survive a world where the driver names the tensor it intends to bind.
+`ArchProfile`'s four layer-3 gates are the evidence that this was the right end
+state, and they are gone with the rest of `arch/`. Each existed because a pass
+guessed at what the driver wanted and the guess was wrong for some architecture:
+`fusion.rs` invented the name `...self_attn.qkv_proj.fused.weight` and hoped
+something would bind it, and `skip_dense_qkv_fusion` was the list of models where
+hoping failed. None of them survive a world where the author names the tensor it
+intends to bind.
 
-Until then, the contract the loader authors is still a contract *someone*
-authored separately from the plan, which is why `verify`'s contract check is
-already worth running (§7): `arch/` and the `frontend → optimizer → planner`
-pipeline are different code, and a bug in the second cannot hide in the first.
-What it cannot yet catch is `arch/` and the driver disagreeing, because only one
-of them currently speaks.
+`verify`'s contract check keeps its meaning, and gains one. It was always worth
+running because the author and the `frontend → optimizer → planner` pipeline are
+different code, so a bug in the second cannot hide in the first. Now the two are
+in different *languages* and on opposite sides of the ABI — and the case it
+newly covers is §6.2's: a plan restored from an artifact another rank or another
+build wrote, checked against the contract this one authored.
 
 ### 9.1 How the lowering is trusted
 

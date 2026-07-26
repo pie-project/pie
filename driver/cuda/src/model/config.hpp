@@ -193,6 +193,13 @@ struct HfConfig {
     float rope_beta_fast        = 32.f;
     float rope_beta_slow        = 1.f;
     float rope_attention_factor = 1.f;
+    // DeepSeek/Kimi-style MLA folds the YaRN `mscale_all_dim` factor into
+    // the attention softmax scale (`scaling *= mscale * mscale`) instead of
+    // into the RoPE embedding — see vLLM `deepseek_v2.py`
+    // `DeepseekV2MLAAttention.__init__`. This is that `mscale`; it is 1.0
+    // whenever the ckpt has no YaRN scaling or no `mscale_all_dim` key, so
+    // multiplying by it unconditionally is safe.
+    float rope_mla_softmax_mscale = 1.f;
     // Backwards-compatible accessor: `has_rope_scaling` is true iff the
     // ckpt uses Llama-3 YaRN (the only variant that took the YaRN code
     // path before the OriginalYaRN dispatch was added). Per-arch code

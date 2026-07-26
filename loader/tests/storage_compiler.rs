@@ -1,12 +1,27 @@
-use pie_loader::arch::default_contract;
+/// A contract stored next to the test that compiles it.
+///
+/// The families these exercise — GPT-OSS's native MXFP4 expert groups,
+/// Nemotron-H's packed experts, Kimi's MLA joins — are authored by the driver
+/// now, so there is no function in this crate that could rebuild one. That is
+/// the point: what these tests are about is the *plan* the compiler produces
+/// for a contract shaped like that, and the contract is an input like any
+/// other.
+fn stored_contract(name: &str) -> ModelContract {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden/contracts")
+        .join(format!("{name}.json"));
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("{name}: cannot read {}: {err}", path.display()));
+    serde_json::from_str(&text).unwrap_or_else(|err| panic!("{name}: parsing: {err}"))
+}
 use pie_loader::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
-use pie_loader::config::ModelConfig;
+use pie_loader::contract::{Expr, ModelContract, TensorContract};
 use pie_loader::ir::{GatherPiece, LayoutExpr, LayoutPlan};
 use pie_loader::load_plan::{StorageInstr, StorageTarget, TileMapKind};
 use pie_loader::planner::{compile_load_plan, lower_layout_plan};
 use pie_loader::types::{
-    Axis, BackendKind, CheckpointFormat, DType, Encoding, FileId, Mxfp4MoePolicy, QuantScheme,
-    QuantSpec, RepackLayout, RowMap, TensorDecl, TensorId,
+    Axis, BackendKind, CheckpointFormat, DType, Encoding, FileId, QuantScheme, QuantSpec,
+    RepackLayout, RowMap, TensorDecl, TensorId,
 };
 
 #[test]
@@ -67,11 +82,6 @@ fn metal_qwen35_schema_emits_canonical_affine_u4_arena() {
         }],
         tensors,
     };
-    let config = ModelConfig {
-        model_type: "qwen3_5".to_string(),
-        num_hidden_layers: 1,
-        ..ModelConfig::default()
-    };
     let target = StorageTarget {
         backend: BackendKind::Metal,
         tile_map_mask: pie_loader::load_plan::METAL_TILE_MAP_MASK,
@@ -79,53 +89,60 @@ fn metal_qwen35_schema_emits_canonical_affine_u4_arena() {
         preferred_alignment: 256,
         ..StorageTarget::default()
     };
-    let contract = default_contract(&metadata, &config, &target).unwrap();
-    let names = contract
-        .tensors
-        .iter()
-        .map(|tensor| tensor.name.as_str())
-        .collect::<Vec<_>>();
-    assert!(names.contains(&"shared_embedding.weight"));
-    assert!(names.contains(&"final_norm.weight"));
-    assert!(names.contains(&"layers.0.self_attn.q_proj.weight"));
-    assert!(names.contains(&"layers.0.linear_attn.in_proj_a.weight"));
-    assert!(
-        !names
-            .iter()
-            .any(|name| name.contains("visual") || name.contains("mtp"))
-    );
-    let shared = contract
-        .tensors
-        .iter()
-        .find(|tensor| tensor.name == "shared_embedding.weight")
-        .unwrap();
-    let Encoding::Quant(spec) = &shared.encoding else {
-        panic!("shared embedding should carry MLX affine-U4 encoding");
+    // The MLX schema states 4-bit weights that the checkpoint packs eight to a
+    // u32 word: a bitcast to the logical shape and an affine-U4 encoding, with
+    // the scales and biases named as the tensors they are. The driver authors
+    // this; the test states it directly, because what is under test here is the
+    // arena the compiler builds from it, not who wrote it down.
+    let affine_u4 = |group_size: u32| {
+        Encoding::Quant(
+            QuantSpec {
+                scheme: QuantScheme::MlxAffineU4,
+                logical_dtype: DType::BF16,
+                bits_per_element: 4,
+                group_size,
+                channel_axis: Some(Axis(1)),
+                scale_dtype: Some(DType::BF16),
+                zero_point_dtype: Some(DType::BF16),
+                block_shape: vec![i64::from(group_size)],
+            }
+            .normalized(),
+        )
     };
-    assert_eq!(spec.scheme, QuantScheme::MlxAffineU4);
-    assert_eq!(spec.group_size, 64);
-    assert_eq!(shared.shape, Some(vec![2, 64]));
-
-    let alias_config = ModelConfig {
-        model_type: "qwen3_next".to_string(),
-        ..config.clone()
+    let packed = |source: &str, output: &str, rows: i64, cols: i64| {
+        let ty = pie_loader::contract::TensorType::new(vec![rows, cols], affine_u4(64));
+        TensorContract::new(
+            output.to_string(),
+            Expr::src(source.to_string()).bitcast(ty),
+            vec![rows, cols],
+            affine_u4(64),
+        )
     };
-    assert!(default_contract(&metadata, &alias_config, &target).is_ok());
-
-    let mut unexpected = metadata.clone();
-    unexpected.tensors.push(RawTensor {
-        id: TensorId(unexpected.tensors.len() as u32),
-        name: "model.unmapped.weight".to_string(),
-        file_id: FileId(0),
-        file_offset: offset,
-        span_bytes: 2,
-        shape: vec![1],
-        encoding: Encoding::Raw(DType::BF16),
-    });
-    let error = default_contract(&unexpected, &config, &target)
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("no declared mapping or skip"));
+    let contract = ModelContract {
+        abi_version: 1,
+        alignment: 256,
+        tensors: vec![
+            packed("lm_head.weight", "lm_head.weight", 2, 64),
+            TensorContract::new(
+                "final_norm.weight",
+                Expr::src("model.language_model.norm.weight"),
+                vec![64],
+                Encoding::Raw(DType::BF16),
+            ),
+            packed(
+                "model.language_model.layers.0.self_attn.q_proj.weight",
+                "layers.0.self_attn.q_proj.weight",
+                64,
+                64,
+            ),
+            TensorContract::new(
+                "layers.0.linear_attn.in_proj_a.weight",
+                Expr::src("model.language_model.layers.0.linear_attn.in_proj_a.weight"),
+                vec![16, 64],
+                Encoding::Raw(DType::BF16),
+            ),
+        ],
+    };
 
     let program = compile_load_plan(&metadata, &contract, target).unwrap();
     assert!(
@@ -440,23 +457,14 @@ fn packed_quant_source_requires_exact_affine_size() {
 
 #[test]
 fn gpt_oss_native_mxfp4_default_abi_lowers_to_repack_tile_maps() {
-    let cfg = pie_loader::config::ModelConfig {
-        model_type: "gpt_oss".to_string(),
-        quant_method: String::new(),
-        runtime_quant: String::new(),
-        num_hidden_layers: 1,
-        num_experts: 2,
-        num_experts_per_tok: 2,
-    };
     let target = StorageTarget {
         backend: BackendKind::Cuda,
         tile_map_mask: pie_loader::load_plan::CUDA_TILE_MAP_MASK,
-        mxfp4_moe: Mxfp4MoePolicy::NativeGemm,
         native_mxfp4_moe: true,
         ..StorageTarget::default()
     };
     let metadata = gpt_oss_mxfp4_metadata();
-    let contract = default_contract(&metadata, &cfg, &target).unwrap();
+    let contract = stored_contract("gpt_oss_native_mxfp4");
     let program = compile_load_plan(&metadata, &contract, target).unwrap();
 
     let repacks: Vec<_> = program
@@ -501,25 +509,16 @@ fn gpt_oss_native_mxfp4_default_abi_lowers_to_repack_tile_maps() {
 
 #[test]
 fn gpt_oss_native_mxfp4_tp_uses_row_and_column_offset_repack_contracts() {
-    let cfg = pie_loader::config::ModelConfig {
-        model_type: "gpt_oss".to_string(),
-        quant_method: String::new(),
-        runtime_quant: String::new(),
-        num_hidden_layers: 1,
-        num_experts: 2,
-        num_experts_per_tok: 2,
-    };
     let target = StorageTarget {
         backend: BackendKind::Cuda,
         tile_map_mask: pie_loader::load_plan::CUDA_TILE_MAP_MASK,
         tp_rank: 1,
         tp_size: 2,
-        mxfp4_moe: Mxfp4MoePolicy::NativeGemm,
         native_mxfp4_moe: true,
         ..StorageTarget::default()
     };
     let metadata = gpt_oss_mxfp4_metadata_with_intermediate(128);
-    let contract = default_contract(&metadata, &cfg, &target).unwrap();
+    let contract = stored_contract("gpt_oss_native_mxfp4_tp1_of_2");
     let abi_repacks = contract
         .tensors
         .iter()
@@ -634,14 +633,6 @@ fn gpt_oss_native_mxfp4_tp_uses_row_and_column_offset_repack_contracts() {
 
 #[test]
 fn nemotron_h_default_abi_packs_experts_and_exposes_views() {
-    let cfg = pie_loader::config::ModelConfig {
-        model_type: "nemotron_h".to_string(),
-        quant_method: String::new(),
-        runtime_quant: String::new(),
-        num_hidden_layers: 1,
-        num_experts: 2,
-        num_experts_per_tok: 2,
-    };
     let target = StorageTarget {
         backend: BackendKind::Cuda,
         tile_map_mask: pie_loader::load_plan::CUDA_TILE_MAP_MASK,
@@ -651,7 +642,7 @@ fn nemotron_h_default_abi_packs_experts_and_exposes_views() {
         ..StorageTarget::default()
     };
     let metadata = nemotron_h_expert_metadata();
-    let contract = default_contract(&metadata, &cfg, &target).unwrap();
+    let contract = stored_contract("nemotron_h_packed_experts_tp1_of_2");
 
     assert!(contract.tensors.iter().any(|contract| {
         contract.name == "language_model.backbone.layers.0.mixer.experts.up_proj.packed.weight"
@@ -1196,7 +1187,6 @@ fn raw_big(id: u32, name: &str, offset: u64, span_bytes: u64, dtype: DType) -> R
 
 #[test]
 fn mla_q_kv_a_fusion_produces_joined_tensor() {
-    use pie_loader::config::ModelConfig;
     use pie_loader::planner::compile_load_plan;
 
     let h = 128i64;
@@ -1260,17 +1250,12 @@ fn mla_q_kv_a_fusion_produces_joined_tensor() {
         }],
         tensors,
     };
-    let cfg = ModelConfig {
-        model_type: "kimi_k2".to_string(),
-        num_hidden_layers: 1,
-        ..ModelConfig::default()
-    };
     let target = StorageTarget {
         backend: BackendKind::Cuda,
         tile_map_mask: pie_loader::load_plan::CUDA_TILE_MAP_MASK,
         ..StorageTarget::default()
     };
-    let contract = default_contract(&meta, &cfg, &target).unwrap();
+    let contract = stored_contract("kimi_k2_mla_fusion");
     let program = compile_load_plan(&meta, &contract, target).unwrap();
     let summary = program.summary();
 

@@ -124,9 +124,9 @@ fn map_tensor_type(ty: GgmlType, tensor_name: &str) -> Result<GgufTensorType, Co
         GgmlType::Bf16 => dense(DType::BF16, 2),
         GgmlType::I8 => dense(DType::I8, 1),
         GgmlType::I32 => dense(DType::I32, 4),
-        // The Rust loader dtype set has no 64-bit integer; GGUF `I64` tensors
-        // are metadata-only (token types), never weights. Reject with the same
-        // 64-bit rationale as the safetensors parser.
+        // GGUF `I64` tensors are metadata-only (token types), never weights,
+        // and no driver binds them — so they are rejected here even though the
+        // loader dtype set does carry `I64` for safetensors index tables.
         GgmlType::I64 => {
             return Err(CompileError::InvalidInput(format!(
                 "gguf: tensor '{tensor_name}' is I64 (64-bit), unsupported by the loader dtype set"

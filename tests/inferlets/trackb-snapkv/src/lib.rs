@@ -82,6 +82,14 @@ struct Input {
     /// top of this, as is the request's last page (the backend force-keeps it).
     #[serde(default = "default_page_budget")]
     page_budget: u32,
+    /// Pins the reserved page count so it does not move with `max_tokens`.
+    /// `p_max` sets the width of the score row folded and ranked every layer,
+    /// so a benchmark that differences two `max_tokens` would otherwise be
+    /// comparing two different per-step workloads and would charge the policy
+    /// for the difference. Setting this to the larger of the two endpoints
+    /// makes the per-step cost identical. Defaults to `max_tokens`.
+    #[serde(default)]
+    reserve_tokens: Option<usize>,
 }
 
 fn default_prompt() -> String {
@@ -194,7 +202,8 @@ async fn main(input: Input) -> Result<Output> {
         prompt.push(0);
     }
     let n = prompt.len() as u32;
-    let max_pages = (n + max_tokens as u32 + 1).div_ceil(page_size).max(1);
+    let reserve = input.reserve_tokens.unwrap_or(max_tokens).max(max_tokens);
+    let max_pages = (n + reserve as u32 + 1).div_ceil(page_size).max(1);
     // Like Quest's `p_max` and H2O's, the program declares a static ceiling for
     // the score row; the backend refuses (rather than truncates) a request that
     // outgrows it. Sized off `max_pages` so it is an exact multiple of the page

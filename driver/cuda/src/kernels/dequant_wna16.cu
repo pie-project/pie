@@ -56,6 +56,11 @@ __device__ __forceinline__ float wna16_load_int4b8(
     return q * s;
 }
 
+// One warp per output row for both halves of the fused gate/up projection.
+//
+// A block-per-row version spends eight `__syncthreads()` on the tree
+// reduction for a handful of iterations of actual work; a warp reduces in
+// five shuffles with no barrier at all.
 __global__ void wna16_gate_up_decode_kernel(
     const __nv_bfloat16* __restrict__ act,
     const std::int32_t* __restrict__ topk_idx,
@@ -71,7 +76,10 @@ __global__ void wna16_gate_up_decode_kernel(
     int group_size)
 {
     const int route = blockIdx.x;
-    const int row = blockIdx.y;
+    const int warp_in_block = threadIdx.x >> 5;
+    const int lane_id = threadIdx.x & 31;
+    const int row = blockIdx.y * (blockDim.x >> 5) + warp_in_block;
+    if (row >= intermediate) return;
     const int token = route / top_k;
     const int expert = topk_idx[route];
 
@@ -89,8 +97,7 @@ __global__ void wna16_gate_up_decode_kernel(
     const int scales_per_row = hidden / group_size;
     const long long row_base = static_cast<long long>(row) * words_per_row;
     const long long scale_base = static_cast<long long>(row) * scales_per_row;
-    for (int word_col = threadIdx.x; word_col < words_per_row;
-         word_col += DECODE_BLOCK) {
+    for (int word_col = lane_id; word_col < words_per_row; word_col += 32) {
         const int gate_word = gate_packed[row_base + word_col];
         const int up_word = up_packed[row_base + word_col];
         const float gate_s = __bfloat162float(
@@ -107,24 +114,16 @@ __global__ void wna16_gate_up_decode_kernel(
             up_acc += xv * (static_cast<float>(up_nibble - 8) * up_s);
         }
     }
-
-    __shared__ float gate_s[DECODE_BLOCK];
-    __shared__ float up_s[DECODE_BLOCK];
-    gate_s[threadIdx.x] = gate_acc;
-    up_s[threadIdx.x] = up_acc;
-    __syncthreads();
-    for (int off = DECODE_BLOCK / 2; off > 0; off >>= 1) {
-        if (threadIdx.x < off) {
-            gate_s[threadIdx.x] += gate_s[threadIdx.x + off];
-            up_s[threadIdx.x] += up_s[threadIdx.x + off];
-        }
-        __syncthreads();
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        gate_acc += __shfl_xor_sync(0xffffffffu, gate_acc, off);
+        up_acc += __shfl_xor_sync(0xffffffffu, up_acc, off);
     }
-    if (threadIdx.x == 0) {
+    if (lane_id == 0) {
         const long long out_idx =
             static_cast<long long>(route) * intermediate + row;
-        gate_out[out_idx] = __float2bfloat16(gate_s[0]);
-        up_out[out_idx] = __float2bfloat16(up_s[0]);
+        gate_out[out_idx] = __float2bfloat16(gate_acc);
+        up_out[out_idx] = __float2bfloat16(up_acc);
     }
 }
 
@@ -140,7 +139,9 @@ __global__ void wna16_down_decode_kernel(
     int group_size)
 {
     const int route = blockIdx.y;
-    const int h = blockIdx.x * blockDim.x + threadIdx.x;
+    const int warp_in_block = threadIdx.x >> 5;
+    const int lane_id = threadIdx.x & 31;
+    const int h = blockIdx.x * (blockDim.x >> 5) + warp_in_block;
     if (h >= hidden) return;
     const int expert = topk_idx[route];
     const auto* down_packed = down_packed_ptrs[expert];
@@ -153,7 +154,7 @@ __global__ void wna16_down_decode_kernel(
     const int scales_per_row = intermediate / group_size;
     const long long row_base = static_cast<long long>(h) * words_per_row;
     const long long scale_base = static_cast<long long>(h) * scales_per_row;
-    for (int word_col = 0; word_col < words_per_row; ++word_col) {
+    for (int word_col = lane_id; word_col < words_per_row; word_col += 32) {
         const int word = down_packed[row_base + word_col];
         const float s = __bfloat162float(
             down_scale[scale_base + (word_col * 8) / group_size]);
@@ -165,7 +166,13 @@ __global__ void wna16_down_decode_kernel(
             acc += __bfloat162float(x[i]) * (q * s);
         }
     }
-    out[static_cast<long long>(route) * hidden + h] = __float2bfloat16(acc);
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_xor_sync(0xffffffffu, acc, off);
+    }
+    if (lane_id == 0) {
+        out[static_cast<long long>(route) * hidden + h] = __float2bfloat16(acc);
+    }
 }
 
 }  // namespace
@@ -212,7 +219,8 @@ void launch_wna16_gate_up_decode_bf16(
     const int routes = num_tokens * top_k;
     if (routes <= 0 || hidden <= 0 || intermediate <= 0) return;
     if (hidden % 8 != 0 || hidden % group_size != 0) return;
-    const dim3 grid(routes, intermediate);
+    constexpr int GU_WARPS = DECODE_BLOCK / 32;
+    const dim3 grid(routes, (intermediate + GU_WARPS - 1) / GU_WARPS);
     wna16_gate_up_decode_kernel<<<grid, DECODE_BLOCK, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(act_bf16),
         topk_idx,
@@ -240,7 +248,8 @@ void launch_wna16_down_decode_bf16(
     if (routes <= 0 || hidden <= 0 || intermediate <= 0) return;
     if (intermediate % 8 != 0 || intermediate % group_size != 0) return;
     constexpr int BS = 256;
-    const dim3 grid((hidden + BS - 1) / BS, routes);
+    constexpr int WARPS = BS / 32;
+    const dim3 grid((hidden + WARPS - 1) / WARPS, routes);
     wna16_down_decode_kernel<<<grid, BS, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(act_bf16),
         topk_idx,

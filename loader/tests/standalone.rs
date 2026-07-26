@@ -184,30 +184,22 @@ fn a_plan_compiles_from_a_value_with_no_checkpoint_anywhere() {
 /// this GPU's block scales" and lives here, the loader has an opinion about
 /// hardware it cannot see.
 ///
-/// `arch/` and `config.rs` are the two modules that still hold family
-/// knowledge, and they are exempt *by name* so that deleting them is what turns
-/// this test from a lint into a proof. `p4-delete-arch` removes the exemption
-/// and the modules together; until then the exemption records the debt instead
-/// of hiding it.
+/// There is no exemption. `arch.rs`, `arch/` and `config.rs` used to be exempt
+/// *by name*, which is what made deleting them turn this test from a lint into
+/// a proof: the moment the exemption had nothing left to cover, the property
+/// held over the whole crate rather than over the part of it nobody had
+/// finished migrating.
 #[test]
-fn nothing_outside_arch_knows_what_a_model_is() {
+fn nothing_in_the_compiler_knows_what_a_model_is() {
     // Real families the loader currently dispatches on, plus the vendor
     // vocabularies that are the same mistake in a different spelling.
     const MODEL_NAMES: &[&str] = &[
         "llama", "qwen", "gpt_oss", "gpt-oss", "nemotron", "phi3", "gemma", "mistral", "deepseek",
         "mixtral", "granite",
     ];
-    // `arch/` is the module whose entire job is this knowledge, `config.rs` is
-    // the struct it reads, and `policy.rs` is its quantization table. All three
-    // die together in `p4-delete-arch`.
-    const KNOWS_MODELS: &[&str] = &["arch.rs", "config.rs"];
-
     let mut offences = Vec::new();
     for (rel, body) in sources() {
-        if KNOWS_MODELS.contains(&rel.as_str())
-            || rel.starts_with("arch/")
-            || rel.ends_with("tests.rs")
-        {
+        if rel.ends_with("tests.rs") {
             continue;
         }
         for (line_no, line) in production_lines(&body) {

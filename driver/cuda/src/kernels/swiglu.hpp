@@ -49,6 +49,23 @@ void launch_gpt_oss_glu_bf16(
     float limit,
     float alpha = 1.702f);
 
+// DeepSeek-V4 expert / shared-expert activation — vLLM's
+// `SiluAndMulWithClamp(swiglu_limit, alpha=1.0, beta=0.0)`:
+//
+//     gate' = min(gate, +limit)
+//     up'   = clamp(up, -limit, +limit)
+//     y     = gate' * sigmoid(gate') * up'
+//
+// Same clamping as `launch_gpt_oss_glu_bf16` but with the plain SiLU
+// sigmoid slope and no `+1` shift on the up branch.
+void launch_swiglu_clamp_bf16(
+    const void* gate,
+    const void* up,
+    void* y,
+    int num_elements,
+    float limit,
+    cudaStream_t stream);
+
 // Elementwise `x[i] *= sigmoid(gate[i])`. Used by Qwen3.5 full-
 // attention's per-token output gate (a' = a * σ(g)).
 void launch_sigmoid_gate_inplace_bf16(
@@ -69,6 +86,15 @@ void launch_chunked_swiglu_bf16(
     const void* packed,  // [N, 2*I] bf16 (gate first, up second)
     void*       y,       // [N, I]   bf16
     int N, int I,
+    cudaStream_t stream);
+
+// Clamped variant of `chunked_swiglu_bf16`, matching `swiglu_clamp_bf16`:
+// the gate is capped above at `limit` and the up branch is clamped to
+// [-limit, limit] before the product. DeepSeek-V4 ships `swiglu_limit`.
+void launch_chunked_swiglu_clamp_bf16(
+    const void* packed,  // [N, 2*I] bf16 (gate first, up second)
+    void*       y,       // [N, I]   bf16
+    int N, int I, float limit,
     cudaStream_t stream);
 
 void launch_chunked_swiglu_strided_bf16(

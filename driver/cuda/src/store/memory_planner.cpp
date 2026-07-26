@@ -29,6 +29,7 @@
 #include "../model/config.hpp"
 #include "../model/gemma4/gemma4.hpp"
 #include "../model/deepseek_v4/deepseek_v4_forward.hpp"
+#include "dsv4_compress_cache.hpp"
 #include "../model/glm5/glm5_forward.hpp"
 #include "../model/kimi/kimi_forward.hpp"
 #include "../model/loaded_model.hpp"
@@ -393,7 +394,8 @@ CudaMemoryPlan plan_cuda_memory(
         deepseek_v4_selected
             ? static_cast<std::size_t>(hf.num_hidden_layers) *
                   pie_cuda_driver::kv_cache_device_bytes_per_page(
-                      kv_format, 1, 1, hf.head_dim)
+                      kv_format, 1, 1, hf.head_dim) +
+                  pie_cuda_driver::dsv4_compress_bytes_per_token(hf)
             : (kimi_selected || glm5_selected)
             ? static_cast<std::size_t>(hf.num_hidden_layers) *
                   (static_cast<std::size_t>(hf.kv_lora_rank) +
@@ -553,7 +555,7 @@ CudaMemoryPlan plan_cuda_memory(
     }
     uniq_clip_desc(Ns, prefill_cap);
     uniq_clip_desc(Rs, 4096);
-    // Quest key envelopes are `[num_pages, kv_heads, head_dim]` f32 x2 per
+    // Quest key envelopes are `[num_pages, kv_heads, head_dim]` bf16 x2 per
     // layer, i.e. per PAGE rather than per token, so they do not scale with
     // `kv_page_size`. They live in the same arena as the pages and must be
     // charged here: the pool is sized to consume the device, so a page count
@@ -562,7 +564,7 @@ CudaMemoryPlan plan_cuda_memory(
     // agree or the cache will overrun its budget.
     const std::size_t envelope_bytes_per_page =
         pie_cuda_driver::KvCache::envelopes_requested()
-            ? 2ull * sizeof(float) *
+            ? 2ull * sizeof(std::uint16_t) *
                   static_cast<std::size_t>(hf.num_hidden_layers) *
                   static_cast<std::size_t>(
                       std::max(1, hf.num_key_value_heads / std::max(1, tp_size))) *

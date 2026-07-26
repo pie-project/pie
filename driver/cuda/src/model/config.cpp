@@ -153,19 +153,27 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
             cfg.rope_factor           = optional<float>(s, "factor", 1.0f);
             cfg.rope_beta_fast        = optional<float>(s, "beta_fast", 32.0f);
             cfg.rope_beta_slow        = optional<float>(s, "beta_slow", 1.0f);
-            // DeepSeek/Kimi models use `mscale_all_dim` (typically 1.0)
-            // as the attention factor. OLMo-3 uses `attention_factor`
-            // directly. Fall back to `0.1 * ln(factor) + 1` if neither
-            // is present.
+            // vLLM `rotary_embedding.py` `yarn_get_mscale(scale, mscale)`.
+            const auto yarn_mscale = [&](float m) {
+                return cfg.rope_factor <= 1.f
+                    ? 1.0f
+                    : 0.1f * m * std::log(cfg.rope_factor) + 1.0f;
+            };
+            // `mscale` / `mscale_all_dim` default to 1 / 0 in HF's DeepSeek
+            // configs, matching vLLM's `.get("mscale_all_dim", False)`.
+            const float mscale = optional<float>(s, "mscale", 1.0f);
             const float mscale_all_dim =
                 optional<float>(s, "mscale_all_dim", 0.0f);
-            const float default_mscale = mscale_all_dim > 0.f
-                ? mscale_all_dim
-                : (cfg.rope_factor > 1.f
-                    ? 0.1f * std::log(cfg.rope_factor) + 1.0f
-                    : 1.0f);
+            // DeepseekScalingRotaryEmbedding scales cos/sin by
+            //   yarn_get_mscale(f, mscale) / yarn_get_mscale(f, mscale_all_dim)
+            //     * attention_factor
+            // and the MLA softmax scale by yarn_get_mscale(f, mscale_all_dim)^2.
+            // OLMo-3 instead ships an explicit `attention_factor`.
+            const float default_attn_factor =
+                yarn_mscale(mscale) / yarn_mscale(mscale_all_dim);
             cfg.rope_attention_factor = optional<float>(
-                s, "attention_factor", default_mscale);
+                s, "attention_factor", default_attn_factor);
+            cfg.rope_mla_softmax_mscale = yarn_mscale(mscale_all_dim);
             cfg.rope_original_max_position =
                 optional<int>(s, "original_max_position_embeddings",
                               cfg.max_position_embeddings);

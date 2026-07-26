@@ -20,7 +20,6 @@ use std::path::{Path, PathBuf};
 use crate::checkpoint::CheckpointMetadata;
 use crate::checkpoint::gguf::parse_gguf_checkpoint;
 use crate::checkpoint::header::parse_safetensors_checkpoint;
-use crate::config::ModelConfig;
 use crate::error::CompileError;
 
 /// Discover the safetensors shard files for a snapshot directory, matching the
@@ -125,99 +124,6 @@ pub fn parse_checkpoint_metadata(snapshot_dir: &Path) -> Result<CheckpointMetada
     }
 }
 
-/// Parse the coarse [`ModelConfig`] fields the storage compiler needs from a
-/// snapshot's `config.json`.
-///
-/// **Not on the load path.** A driver states these facts in
-/// [`PieLoaderModelSpec`](crate::ffi::entry::PieLoaderModelSpec); this exists
-/// for tools that are handed a snapshot directory and no driver — the CLI, the
-/// examples, and the real-checkpoint tests. It mirrors the HF-key precedence in
-/// the C++
-/// `parse_hf_config` (`driver/cuda/src/loader/hf_config.cpp`):
-///
-/// * `model_type` — top-level `model_type` (nested multimodal towers keep the
-///   outer type here, which is all the storage compile needs);
-/// * `num_hidden_layers` — required;
-/// * `num_experts` — first of `num_local_experts`, `num_experts`,
-///   `n_routed_experts`, else 0 (dense);
-/// * `num_experts_per_tok` — `num_experts_per_tok`, else 0;
-/// * `quant_method` — `quantization_config.quant_method` (checked on the text
-///   config then the root), else empty.
-///
-/// `runtime_quant` is the runtime's own quantization request (e.g. `"fp8"`),
-/// not a checkpoint field; the caller passes it through from boot config.
-pub fn parse_model_config(
-    snapshot_dir: &Path,
-    runtime_quant: impl Into<String>,
-) -> Result<ModelConfig, CompileError> {
-    if snapshot_dir.is_file()
-        && snapshot_dir
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
-    {
-        return Err(CompileError::InvalidInput(format!(
-            "GGUF model-config compilation is deferred; use a Hugging Face \
-             safetensors snapshot directory instead of {}",
-            snapshot_dir.display()
-        )));
-    }
-    let path = snapshot_dir.join("config.json");
-    let text = std::fs::read_to_string(&path).map_err(|err| {
-        CompileError::InvalidInput(format!("cannot read {}: {err}", path.display()))
-    })?;
-    let root: serde_json::Value = serde_json::from_str(&text).map_err(|err| {
-        CompileError::InvalidInput(format!("{} is not valid JSON: {err}", path.display()))
-    })?;
-
-    // Some multimodal checkpoints nest the language-model config under
-    // `text_config`; the storage compile keys off the text tower's structure.
-    let text_cfg = root.get("text_config").filter(|v| v.is_object());
-    let cfg = text_cfg.unwrap_or(&root);
-
-    let model_type = cfg
-        .get("model_type")
-        .or_else(|| root.get("model_type"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-
-    let num_hidden_layers = cfg
-        .get("num_hidden_layers")
-        .and_then(serde_json::Value::as_i64)
-        .ok_or_else(|| {
-            CompileError::InvalidInput(format!("{} lacks num_hidden_layers", path.display()))
-        })?;
-
-    let first_i64 = |keys: &[&str]| -> i64 {
-        for k in keys {
-            if let Some(v) = cfg.get(*k).and_then(serde_json::Value::as_i64) {
-                return v;
-            }
-        }
-        0
-    };
-    let num_experts = first_i64(&["num_local_experts", "num_experts", "n_routed_experts"]);
-    let num_experts_per_tok = first_i64(&["num_experts_per_tok"]);
-
-    let quant_method = cfg
-        .get("quantization_config")
-        .filter(|v| v.is_object())
-        .or_else(|| root.get("quantization_config").filter(|v| v.is_object()))
-        .and_then(|q| q.get("quant_method"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-
-    Ok(ModelConfig {
-        model_type,
-        quant_method,
-        runtime_quant: runtime_quant.into(),
-        num_hidden_layers: num_hidden_layers.max(0) as u32,
-        num_experts: num_experts.max(0) as u32,
-        num_experts_per_tok: num_experts_per_tok.max(0) as u32,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,59 +169,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_dense_model_config() {
-        let dir = tmpdir("cfg_dense");
-        write(
-            &dir,
-            "config.json",
-            r#"{"model_type":"qwen3","num_hidden_layers":28}"#,
-        );
-        let cfg = parse_model_config(&dir, "").unwrap();
-        assert_eq!(cfg.model_type, "qwen3");
-        assert_eq!(cfg.num_hidden_layers, 28);
-        assert_eq!(cfg.num_experts, 0);
-        assert_eq!(cfg.quant_method, "");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn parses_moe_and_quant_config() {
-        let dir = tmpdir("cfg_moe");
-        write(
-            &dir,
-            "config.json",
-            r#"{"model_type":"gpt_oss","num_hidden_layers":24,"num_local_experts":32,"num_experts_per_tok":4,"quantization_config":{"quant_method":"mxfp4"}}"#,
-        );
-        let cfg = parse_model_config(&dir, "fp8").unwrap();
-        assert_eq!(cfg.model_type, "gpt_oss");
-        assert_eq!(cfg.num_experts, 32);
-        assert_eq!(cfg.num_experts_per_tok, 4);
-        assert_eq!(cfg.quant_method, "mxfp4");
-        assert_eq!(cfg.runtime_quant, "fp8");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn model_config_num_experts_fallbacks() {
-        let dir = tmpdir("cfg_fallback");
-        write(
-            &dir,
-            "config.json",
-            r#"{"model_type":"deepseek_v3","num_hidden_layers":4,"n_routed_experts":8}"#,
-        );
-        let cfg = parse_model_config(&dir, "").unwrap();
-        assert_eq!(cfg.num_experts, 8);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn direct_gguf_paths_are_discovered_but_model_compile_is_explicitly_deferred() {
+    fn direct_gguf_paths_are_discovered() {
         let dir = tmpdir("direct_gguf");
         let path = dir.join("model.gguf");
         std::fs::write(&path, b"GGUF").unwrap();
         assert_eq!(discover_gguf_file(&path), Some(path.clone()));
-        let error = parse_model_config(&path, "").unwrap_err().to_string();
-        assert!(error.contains("GGUF model-config compilation is deferred"));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

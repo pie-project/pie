@@ -33,6 +33,7 @@ pub mod worker;
 pub use frame::FrameStamp;
 
 use std::collections::HashMap;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use anyhow::{Result, anyhow};
@@ -238,6 +239,89 @@ pub(crate) fn fire_timing_full() -> bool {
         std::env::var("PIE_FIRE_TIMING").is_ok_and(|value| !value.is_empty() && value != "0")
     })
 }
+
+/// `PIE_FIRE_TIMING=waves` keeps the per-wave and per-pass records but drops
+/// the per-fire ones. The per-fire stream emits one JSON line per request from
+/// inside `retire_ready_launches`, which at 128-request waves costs a
+/// millisecond or two of the very pass it is measuring — enough to make the
+/// scheduler look like the bottleneck it is being used to find.
+pub(crate) fn fire_timing_per_fire() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !std::env::var("PIE_FIRE_TIMING").is_ok_and(|value| value == "waves")
+    })
+}
+
+/// Worker-loop phase accumulators, in nanoseconds, summed across every pass
+/// since the last wave dispatch and drained into that wave's record. The
+/// per-wave `settled -> next dispatch` gap is the throughput lever at high
+/// concurrency, and these say whether it is the scheduler thread burning CPU
+/// (mailbox/retire/dispatch) or parked waiting on the guest lanes.
+pub(crate) struct LoopPhaseAcc {
+    pub mailbox_ns: AtomicU64,
+    pub retire_ns: AtomicU64,
+    pub dispatch_ns: AtomicU64,
+    pub park_ns: AtomicU64,
+    pub passes: AtomicU64,
+    pub mailbox_items: AtomicU64,
+    pub scan_ns: AtomicU64,
+    pub plan_ns: AtomicU64,
+    pub post_ns: AtomicU64,
+    pub scans: AtomicU64,
+    pub lag_ns: AtomicU64,
+    pub lag_max_ns: AtomicU64,
+    pub lag_n: AtomicU64,
+    pub pass_max_ns: AtomicU64,
+}
+
+/// Guest-side turnaround probe: how long an inferlet lane takes between
+/// being woken with its sampled token and submitting the successor fire.
+/// `wake` = driver wake -> `take` returned a value; `work` = that return ->
+/// `forward.submit`. Aggregated (not per-fire) to stay off the critical path.
+pub(crate) struct GuestPhaseAcc {
+    pub wake_woken: AtomicU64,
+    pub wake_empty: AtomicU64,
+    pub resume_ns: AtomicU64,
+    pub resume_max_ns: AtomicU64,
+    pub resume_n: AtomicU64,
+    pub wake_ns: AtomicU64,
+    pub work_ns: AtomicU64,
+    pub work_max_ns: AtomicU64,
+    pub n: AtomicU64,
+}
+
+/// `fire_timing_now_us` of the most recent scheduler retire resolve, used to
+/// measure how long a woken lane takes to actually resume on the runtime.
+pub(crate) static LAST_RESOLVE_US: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) static GUEST_PHASES: GuestPhaseAcc = GuestPhaseAcc {
+    wake_woken: AtomicU64::new(0),
+    wake_empty: AtomicU64::new(0),
+    resume_ns: AtomicU64::new(0),
+    resume_max_ns: AtomicU64::new(0),
+    resume_n: AtomicU64::new(0),
+    wake_ns: AtomicU64::new(0),
+    work_ns: AtomicU64::new(0),
+    work_max_ns: AtomicU64::new(0),
+    n: AtomicU64::new(0),
+};
+
+pub(crate) static LOOP_PHASES: LoopPhaseAcc = LoopPhaseAcc {
+    mailbox_ns: AtomicU64::new(0),
+    retire_ns: AtomicU64::new(0),
+    dispatch_ns: AtomicU64::new(0),
+    park_ns: AtomicU64::new(0),
+    passes: AtomicU64::new(0),
+    mailbox_items: AtomicU64::new(0),
+    scan_ns: AtomicU64::new(0),
+    plan_ns: AtomicU64::new(0),
+    post_ns: AtomicU64::new(0),
+    scans: AtomicU64::new(0),
+    lag_ns: AtomicU64::new(0),
+    lag_max_ns: AtomicU64::new(0),
+    lag_n: AtomicU64::new(0),
+    pass_max_ns: AtomicU64::new(0),
+};
 
 pub(crate) fn ledger_timing_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();

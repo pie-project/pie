@@ -1164,3 +1164,478 @@ matches SnapKV, and the earlier firings are well-defined observations of earlier
 windows — so a policy that acts on the most recent firing gets SnapKV's semantics
 without special-casing. The mixed prefill+decode plan deliberately does not
 capture, and the PTIR side fails loudly there rather than returning a zero row.
+
+## 13. Two silent Quest bugs found by exact-census testing
+
+Both bugs below produced fluent text, no NaNs, no crashes, and a page ranking
+that looked entirely plausible. Neither was reachable by any test that checked
+Quest "works". They were found by asserting the *exact* slot census —
+how many pages carry a real bound, how many are pinned at `+inf`, how many are
+`-inf` past the end — against arithmetic derived independently from the fire's
+own `kv_len`. That is the assertion shape this section is really arguing for.
+
+### 13.1 `envelope_dot` sliced the device page array with the host CSR
+
+Same hazard as §9.3 and §10.2, in a third place. Under decode envelopes the
+host's `plan_kv_page_indptr` is a prefix sum of the page channel's *declared*
+capacity (`envelope_plan_page_bounds`), while the device array is packed by
+real per-request counts. `resolve_lane_envelope` took `page_begin`/`page_count`
+from the host copy, so:
+
+* the **offset** was wrong whenever an earlier request in the fire held fewer
+  pages than it declared — request `r` scored against request `r-1`'s keys;
+* the **count** was wrong whenever this request did — surplus slots were
+  scored as real instead of getting the `-inf` that keeps a top-k consumer out
+  of a neighbour's pages.
+
+`kv_last_page_lens_h` is *also* substituted with a uniform `page_size` under
+envelopes, so `scored_pages` was wrong on top of that.
+
+The fix moves the whole resolution on-device. The host now contributes only a
+slot **bound** — the grid extent and the result-row width — which is safe to
+over-estimate precisely because surplus slots then correctly resolve to `-inf`:
+
+```
+begin       = page_indptr[request];  end = page_indptr[request + 1]
+page_count  = end >= begin ? end - begin : 0
+slot >= page_count                       -> -inf   (not ours)
+kv_after    = (page_count-1)*page_size + last_page_lens[request]
+kv_before   = kv_after >= qo_len ? kv_after - qo_len : 0
+scored      = min(kv_before / page_size, page_count)
+slot >= scored                           -> +inf   (in flight, cannot bound)
+page        = page_ids[begin + slot]
+```
+
+The rule this is the third instance of: **a host-side copy of a page CSR is a
+bound; only the device copy is exact.** Anything a kernel *addresses* with must
+come from the device copy. Host copies may size allocations and grids, nothing
+else.
+
+Why no earlier test caught it: at small `max_tokens` the declared bound and the
+real page count coincide, and with one request in the fire the offset is 0
+either way. The curated test used `max_tokens=8`. It now uses 64 and asserts
+the census, with an explicit guard that fails if `pages_absent == 0` — i.e. if
+the case has drifted back to one where both CSRs would agree.
+
+### 13.2 The explicit-descriptor KV write never maintained envelopes
+
+`llama_like.cpp` has three KV-write branches: the fused decode QKV path
+(disabled whenever stage hooks are bound, so Quest never reaches it),
+`has_write_desc` → `launch_write_kv_explicit_bf16`, and otherwise the CSR path
+`launch_write_kv_to_pages`. Envelope maintenance was hooked into the CSR path
+only.
+
+Quest supplies WSlot/WOff, so `has_write_desc` is true for its **decode** fires
+and false for its prefill. Prompt pages therefore had real envelopes and every
+page written during decoding kept the empty `(+inf, -inf)` seed. An empty
+envelope makes `Σ max(q·kmin, q·kmax)` equal `+inf` for any nonzero `q`, so the
+newest — most recently attended, most likely to matter — pages all scored
+"always keep", silently destroying the ranking.
+
+The symptom was **non-deterministic**, which is what made it interesting: a
+recycled physical page carries a stale but *finite* envelope from a previous
+tenant, so the number of visibly-empty pages depended on pool state. Cold runs
+looked worse than warm ones.
+
+**Merge, not recompute.** The explicit path has no page list and no live
+length, so a recompute keyed on the descriptor's offset would shrink a page to
+a prefix and could drop a key that is still live — and rewriting a cell
+mid-page is exactly why the explicit path exists (beam fork/freeze). Merging
+only ever widens, which for an upper bound is the safe direction to be wrong
+in, and for append-only pages it is *equal* to a full recompute. A page being
+entered at `w_off == 0` is being started, so its envelope is reset first;
+without that, a recycled page accumulates every request that ever used it and
+converges on "keep everything".
+
+`test_envelope_dot` proves the equality directly: it replays a prefill fire
+plus a run of one-token decode fires through the merge and compares against
+`envelope_recompute` over the final live lengths — after planting a previous
+tenant's `[-1e30, 1e30]` on every page the sequence will touch. The comparison
+is exact, so a missing reset cannot pass.
+
+**Cost, and why the reset is folded in.** The two kernels are trivial at decode
+widths — the fire carries `R` tokens — so their cost is entirely launch
+overhead: ~4.6 us per layer, ~129 us per 28-layer pass, on the critical path of
+every step. A single fused kernel elects one writer block per (page, kv_head) —
+the first valid token naming that page — which owns the page outright, gathers
+its own fire's keys, and stores once. Sole ownership removes the atomics *and*
+makes the reset safe to fold in: the race the two-kernel split exists to avoid
+(a reset erasing a key another token of the same fire already merged) cannot
+arise when one block does both, in order, for every token on the page. Measured
+on an L40S: **129 us → ~82 us per 28-layer pass, flat from N=1 to N=128.** Above
+128 tokens the two-launch form is kept, since there the kernels are doing real
+work and the shared-memory gather list would not fit.
+
+## 14. From what context does Quest pay for itself?
+
+Quest trades work for work: an `envelope_dot` per layer, a top-k, and a page
+table compaction, in exchange for an attention that reads fewer pages. Below
+some context the overhead exceeds the saving. That crossover is the only number
+that decides whether to enable it, and no kernel microbenchmark yields it,
+because the overhead is per-layer-per-step while the saving is proportional to
+the pages the budget removes. `tests/inferlets/bench_quest.py` measures it.
+
+### 14.1 Two things had to be fixed before the number meant anything
+
+**The instrumentation was being timed.** The inferlet drained per-page scores,
+a layer count and `kv_len` to the host on every step so tests could assert the
+census. None of that is the policy — the ranking, the threshold and the mask
+are computed and consumed on device — but it costs a per-layer fold over
+`p_max` plus three device-to-host drains per step that a runahead pipeline has
+to wait on. It is now behind `report` (default on, so every test is unchanged),
+and the benchmark turns it off. At 6144 tokens with a quarter budget this alone
+moved the result from 1.01x to 0.76x.
+
+**The difference method was charging Quest for its own endpoint.** Decode cost
+is measured by differencing two runs that differ only in `max_tokens`, which
+cancels prefill and all fixed overhead. But `p_max` — the number of slots
+`envelope_dot` scores per layer — is derived from `max_tokens`, so the long
+endpoint was doing more per-step work than the short one and the difference
+absorbed it. `reserve_tokens` now pins `p_max` to the long endpoint for both.
+
+Two further method notes, both learned by getting them wrong: minimise the two
+endpoints **independently** before differencing (minimising the differences
+pairs the luckiest long run with the unluckiest short one, which produced
+negative times), and **interleave** the configurations rather than running each
+to completion, so a drifting shared host does not land entirely on one of them.
+
+### 14.2 The measurement
+
+Qwen3-0.6B, 28 layers, page size 16, L40S. ms/token, min of 7 interleaved
+rounds, `report=false`:
+
+| ctx | pages | baseline | budget=100% | budget=50% | budget=25% |
+|---|---|---|---|---|---|
+| 1024 | 80 | 3.76 ms | 1.65x | 1.45x | 1.35x |
+| 2048 | 158 | 4.83 ms | 1.50x | 1.24x | 1.16x |
+| 4096 | 314 | 6.84 ms | 1.33x | 1.04x | **0.87x** |
+| 6144 | 471 | 8.70 ms | 1.32x | 0.98x | **0.77x** |
+
+Monotone in every direction: the baseline grows with context, every row
+improves as the budget tightens, and every column improves as context grows.
+
+**Quest becomes a net win at ~4K context with a quarter budget, and is 23%
+faster at 6K.**
+
+### 14.3 The overhead is constant, so the crossover is set by the baseline
+
+The `budget=100%` column is Quest with nothing evicted — pure overhead. In
+absolute terms it is 2.46, 2.41, 2.29, 2.76 ms across the four contexts: **flat
+at ~2.5 ms/step regardless of context.** The ratio falls from 1.65x to 1.32x
+only because the baseline grows underneath it.
+
+That is ~89 us per layer, and it is *not* the kernels: envelope maintenance is
+~3 us/layer (§13.2) and compaction 5-10 us/layer at these contexts (§10.3b).
+The remainder is the per-layer hook dispatch itself — `envelope_dot`,
+`pivot_threshold`, `rank_le` and `attn_page_mask` are four separate launches
+plus the grouped-dispatch machinery around them, 28 times per step. That, not
+any individual kernel, is where a further Quest speedup would come from.
+
+It also means this table is a **worst case for the ratio**. A 0.6B model has a
+small decode step, so a constant 2.5 ms is a large fraction of it. On a
+production-sized model the same 2.5 ms is a much smaller share and the
+crossover moves substantially earlier.
+
+### 14.4 Where the 2.5 ms actually goes: the hook takes the request off CUDA graphs
+
+§14.3 attributed the constant overhead to "per-layer hook dispatch". Profiling
+says what that means, but only after a methodology trap that is worth recording
+because it produced a confident and completely wrong answer first.
+
+**The trap.** `nsys profile -t cuda` traces CUDA graphs at *graph* granularity
+by default: a replayed graph appears as a single entry, and the kernels inside
+it are not listed at all. The baseline's decode step therefore showed up as one
+174 us kernel, and the natural reading -- "the baseline fuses the whole
+28-layer step into one megakernel and the hook opts out of it" -- is wrong. The
+tell was arithmetic, not tooling: 28 layers of this model read ~860 MB of KV
+and ~1.2 GB of weights, which cannot happen in 174 us on a device with 864 GB/s
+of bandwidth. **A profile that implies a kernel exceeded the memory bandwidth
+of the machine is not a discovery, it is a measurement artifact.** Re-running
+with `--cuda-graph-trace=node` resolved it.
+
+**What is actually true.** 104 decode tokens at ~6.1K context, identical
+workload, node-level tracing:
+
+| | baseline | quest |
+|---|---|---|
+| kernels executed | 27 361 | 58 982 |
+| of which inside a CUDA graph | 26 368 (96%) | **0** |
+| host-visible launches | 993 | 58 982 |
+| host launches per decode step | ~9 | ~573 |
+| GPU time | 989.1 ms | 1090.9 ms |
+
+The two programs run *the same model kernels*, in the same counts:
+`BatchDecodeWithPagedKVCacheKernel` 2884 (= 103 steps x 28 layers) in both,
+`gemv_bf16` 5872 in both, `gemvx` 5768 in both, `rmsnorm` 5928 in both. Nothing
+about the model forward is unfused by the hook. What the hook costs is that the
+request stops being replayed from a captured graph and starts being launched
+kernel by kernel from the host.
+
+So the ~2.5 ms/step splits in two:
+
+* **~1.0 ms/step on the GPU** (989.1 -> 1090.9 ms over 103 steps). Quest's own
+  kernels are most of it: `envelope_dot` 2884 x 12.0 us = 0.34 ms/step, the
+  threshold/mask program 2884 x 8.6 us = 0.24 ms/step, the explicit KV write
+  2884 x 2.5 us = 0.07 ms/step. The remainder is per-layer variant differences
+  -- the baseline fuses split+qk-norm+rope into one `qkv_decode_qk_norm_rope`
+  (2.2 us) where the hook path runs `split_qkv` and `qk_rmsnorm_rope`
+  separately (2.4 + 3.5 us).
+* **~1.5 ms/step on the host**, which is 564 extra eager launches per step at a
+  few microseconds each. This is the part that does not show up in any kernel
+  timing and is why §14.3's stage breakdown only ever saw a blocking wait.
+
+**This reorders the optimisation targets.** The largest single lever is not any
+kernel in this document -- it is making a hook-bearing request graph-capturable
+again. The exclusion is one clause, `!has_stage_hooks`, at the end of
+`forward_graph_replay_eligible` (`driver/cuda/src/batch/forward.cpp`), and it is
+worth being clear that it is **structurally necessary rather than merely
+conservative**:
+
+* `execute_declared_phase` is host work that runs once per layer per fire. It
+  rebuilds the task/binding/group vectors, sizes and uploads the lane table,
+  and acquires workspaces. A replayed graph runs no host code, so the recorded
+  kernels would address the workspace and lane-table contents of whichever step
+  was captured.
+* `Dispatch::finish` asserts `phase_invocations[phase] == model_layers` -- the
+  hook must be observed to have run at every layer. Under replay it would be
+  observed zero times and every hook-bearing fire would fail that check.
+
+Neither is a property of the *policy*: everything Quest does per layer is
+already device-side (`envelope_dot`, a PTIR threshold program, a mask write).
+They are properties of how the PTIR stage phase is currently driven. Lifting
+them means giving the phase stable device-resident state that device kernels
+update, instead of host-rebuilt state, and moving the invocation accounting to
+the device. That is an engine project in PTIR dispatch rather than a Quest
+change, and it would benefit every Track A and Track B policy identically,
+since they all bind the same per-layer hook.
+
+Ranked, per decode step at ~6K context:
+
+| | cost | owner |
+|---|---|---|
+| lost CUDA-graph replay | ~1.5 ms | engine (PTIR dispatch) |
+| `envelope_dot` | 0.34 ms | this document |
+| threshold + mask program | 0.24 ms | this document |
+| unfused split/rope variant | ~0.3 ms | engine |
+| explicit KV write + envelope merge | ~0.15 ms | this document |
+
+The three rows this document owns total ~0.73 ms against ~1.8 ms owned by the
+engine. Tuning them further has a low ceiling until the graph question is
+addressed.
+
+One further engine-level observation, flagged rather than attributed because it
+affects both programs equally and so cancels out of every comparison here:
+`cudaGraphInstantiate` was called 51 times at ~2.2 ms each in a 31-step run, in
+*both* programs. Re-instantiating an executable graph rather than updating one
+is expensive enough to dominate the host side of a decode step.
+
+## 15. Track B: where each eviction policy pays for itself
+
+§14 measured Quest. `tests/inferlets/bench_trackb.py` applies the identical
+method -- differenced endpoints, independently minimised, interleaved across
+rounds, `reserve_tokens` pinned, `report` off -- to the two Track B policies
+that enforce. Qwen3-0.6B, 28 layers, page size 16, L40S, min of 7 rounds.
+Ratios are baseline ms/token over policy ms/token, so >1.00x is a net win.
+
+| ctx | pages | baseline | h2o@1 | h2o@0.5 | h2o@0.25 | snapkv@1 | snapkv@0.5 | snapkv@0.25 |
+|---|---|---|---|---|---|---|---|---|
+| 1024 | 70 | 3.54 ms | 0.52x | 0.58x | 0.61x | 0.65x | 0.73x | 0.74x |
+| 2048 | 134 | 4.66 ms | 0.58x | 0.70x | 0.76x | 0.73x | 0.88x | 0.95x |
+| 4096 | 262 | 6.92 ms | 0.62x | 0.85x | 0.99x | 0.80x | 1.10x | 1.16x |
+| 6144 | 390 | 10.68 ms | 0.72x | 1.13x | 1.22x | 0.89x | 1.44x | **1.79x** |
+
+Monotone in every direction: in the context, in the aggressiveness of the
+budget, and between the two policies at every cell.
+
+### 15.1 SnapKV is at the floor, and that is the point
+
+The `@1` columns keep every page, so they price the policy with its benefit
+removed. At 6144 that is **+4.15 ms/step for H2O and +1.32 ms/step for
+SnapKV**, and the gap between those two numbers is the whole argument of §14.4
+restated from the other end.
+
+SnapKV does almost nothing per layer. Its keep-set was decided once, during
+prefill; every decode step afterwards re-applies a mask that is already
+resident on the device. There is no score to compute, no row to fold, no
+ranking. Its 1.32 ms/step is therefore very close to a direct measurement of
+what binding a per-layer hook costs by itself -- and §14.4 put that at ~1.5
+ms/step from an entirely different instrument (kernel launch counts under
+`nsys`). Two independent measurements landing on the same constant is the
+reason to believe either of them.
+
+The consequence is that **SnapKV's per-step cost cannot be optimised from
+within this document**. It is already doing the minimum. Only the engine-level
+graph-capture change described in §14.4 would move it.
+
+H2O's extra ~2.8 ms/step over SnapKV is its own work, and it is per-layer work
+proportional to the context: `on_attn` folds a `[kv_max]` score row into a
+cumulative accumulator at every layer, and the epilogue reduces that row into
+page masses once per step. That is a real cost with a real justification --
+H2O's statistic is the accumulated history, which is exactly what SnapKV's
+fixed keep-set gives up -- but it is the part worth attacking if H2O's
+crossover needs to move earlier.
+
+### 15.2 How the three policies compare
+
+Ranked by where each becomes a net win on this model:
+
+| policy | decides | per-layer decode work | crossover (quarter budget) |
+|---|---|---|---|
+| SnapKV | once, at prefill | apply a fixed mask | **~2.3K** |
+| H2O | every step | fold + rank a `[kv_max]` row | ~4.1K |
+| Quest | every step | `envelope_dot` over all pages, then rank | ~4.4K (§14) |
+
+The ordering is the ordering of how much each recomputes. SnapKV commits to a
+decision and never revisits it, so it pays once; H2O revisits it with a
+statistic it already has; Quest recomputes the statistic itself from the key
+envelopes every layer. Each step up that ladder buys adaptivity -- Quest can
+change its mind about a page whose relevance depends on the current query,
+which SnapKV structurally cannot -- and each costs a later crossover.
+
+None of this is an argument that SnapKV is the best policy. It is an argument
+that on a 0.6B model the crossovers are close together and all of them are
+dominated by a constant that belongs to the engine. On a production-sized model
+the baseline per-step cost grows while that constant does not, so every one of
+these crossovers moves earlier, and the ordering between them -- which is set
+by real per-layer work rather than by the constant -- is what survives.
+
+## 16. Envelopes cost half of what they did, for free
+
+Quest's key envelopes were stored as fp32 `[num_pages, kv_heads, head_dim]`
+pairs, which is **12.5% of the key tier and 25% of the KV pool's key half** --
+the largest single memory cost this document adds, and the one that decides
+whether Quest is affordable on a device where KV capacity is the binding
+constraint.
+
+### 16.1 The narrowing is exact, not a tradeoff
+
+The usual framing for a precision reduction is a memory-vs-accuracy trade. Here
+there is nothing to trade, because of what an envelope *is*:
+
+> An envelope entry is the min or the max of a set of **bf16 keys**. It is
+> therefore already, exactly, some bf16 value. Storing it in fp32 stores the
+> same number in twice the space.
+
+The seeds are exact too: `+inf` and `-inf` are representable in bf16 (bf16 is
+the top 16 bits of fp32, so it inherits the exponent range verbatim -- which is
+also why the sign-magnitude ordering argument behind the `atomicCAS` min/max
+carries over unchanged). And `envelope_dot` widens `bf16 -> fp32` exactly before
+multiplying, keeping the accumulate in f32, so **every arithmetic result is
+bit-identical to the fp32-storage version.**
+
+This is checkable rather than merely arguable, and `test_envelope_dot`'s 13
+checks -- including the exact merge/recompute equality of §13.2 and the golden
+vector -- all pass **unchanged**, with no tolerance loosened. If the narrowing
+were lossy, the merge-equals-recompute check would be the first to break, since
+it compares two different orders of arriving at the same bound.
+
+Directed rounding (`__float2bfloat16_rd` for min, `_ru` for max) is applied
+anyway. It is a no-op on every value the current code stores, and it is there so
+that a future caller merging a value that did *not* originate as a bf16 key --
+a quantized tier, a fused dequantize, a synthetic bound -- cannot round a bound
+*inwards*. An envelope that is too tight drops a live key from the score and
+Quest evicts a page it should have kept; an envelope that is too loose only
+costs a page it did not need. Only one of those directions is safe to be wrong
+in, and the rounding mode is what pins it.
+
+### 16.2 The saving, measured
+
+The planner (`memory_planner.cpp`) and the cache (`kv_cache.cpp`) both charge
+`2 * sizeof(uint16_t) * layers * kv_heads * head_dim` per page and **must
+agree**, or the cache overruns the budget the planner sized. Running the planner
+on this L40S with the switch off and on:
+
+| `PIE_CUDA_KV_ENVELOPES` | logical KV pages | KV tokens |
+|---|---|---|
+| 0 | 22 084 | 353 344 |
+| 1 | 20 785 | 332 560 |
+
+22084/20785 = **1.0625 exactly** -- envelopes are 6.25% of a KV page, as the
+accounting says. Under fp32 the same ratio was 1.125, which would have left
+19 630 pages. **The narrowing hands back 1 155 pages -- 18 480 tokens of KV
+capacity -- for zero numeric change.**
+
+Kernel cost is unchanged at decode widths: the merge bench reports 82.3 us per
+28-layer pass at N=1 and 78.5 us at N=16, matching §13.2's fp32 numbers, because
+at those widths the kernels are pure launch overhead and touch too little memory
+for the halving to show. It shows only in the memory table, which is the point.
+
+End to end, `bench_quest.py` re-run after the change reproduces §14.2's crossover
+unchanged -- net win from 4K, quarter-budget 0.85x at 4096 and 0.60x at 6144
+against a 11.90 ms baseline -- with an identical reserved page count at every
+context. The narrowing is invisible to every measurement except the memory one.
+
+## 17. The one-shot prefill was a ceiling under the crossover
+
+Every measurement above stops at 6144 tokens. That was not a choice about what
+was interesting -- it was the largest context the benchmark could reach, because
+both endpoints prefilled the whole prompt in **one fire**, and a fire cannot
+exceed the driver's structural per-launch token capacity (`max_embed_length()`,
+8192 on this CUDA driver).
+
+That ceiling sat in a bad place. §14.3 shows Quest's overhead is a constant
+~2.5 ms/step while the saving grows with context, so the ratio only improves as
+the context does. Capping the measurement at 6144 therefore capped it just past
+the crossover, where Quest had barely started to win -- and worse, it capped the
+*feature*, not just the benchmark. A policy whose entire purpose is long context
+could not be run at long context.
+
+### 17.1 Chunking, and what has to be true of it
+
+`quest-attention` and `naive-baseline` now split the prompt into `ceil(n/C)`
+chunks. Chunk `i` attends over the whole prefix written so far -- `kv_len` is
+cumulative and `page_indptr` covers every page up to the chunk's end -- and
+writes only its own tokens. That is what makes the concatenation equal the
+one-shot fire: the causal offset each chunk's queries see is `kv_len - qo_len`,
+which is exactly the chunk's base. When the prompt fits in one chunk the loop
+runs once and builds the pass it always built, so nothing below the ceiling
+moves.
+
+**Testing the equivalence needed a correction that is worth recording.** The
+obvious test -- run the same prompt at a forced-small chunk width and compare
+the text -- fails, and the first version of it did. Chunking changes the
+attention kernel's tile decomposition (28 fires of 37 tokens do not reduce in
+the same order as one fire of 1024), so the prompt's hidden states differ in
+their last bits and those bits are written into the KV cache. This is §11.4's
+observation arriving from a new direction, and near-greedy decoding amplifies it
+into completely different, equally coherent text.
+
+The fix is not a tolerance. It is to pin the assertion to a prompt whose
+continuation is **decisive**: on an ambiguous prompt the next-token distribution
+is nearly flat and a 1-ulp difference flips the argmax, but on a prompt whose
+answer the model is sure of the argmax has a real margin and cannot be flipped.
+`test_quest_chunked_prefill` uses such a prompt and asserts **exact text
+equality over 32 tokens** at chunk widths 37, 128 and 999 -- all deliberately
+not multiples of the 16-token KV page, so every boundary lands mid-page and the
+write offsets have to be right. The single-token argmax was checked separately
+across three contexts and four widths and is identical in every case, which
+isolates the prefill's own output from any downstream amplification.
+
+### 17.2 The measurement the ceiling was hiding
+
+Same method as §14.2 -- Qwen3-0.6B, 28 layers, page size 16, L40S, ms/token,
+min of 7 interleaved rounds, `report=false`. Ratios are quest/baseline, so
+**below 1.00 is a win**:
+
+| ctx | pages | baseline | budget=100% | budget=50% | budget=25% |
+|---|---|---|---|---|---|
+| 1024 | 80 | 4.61 ms | 1.36x | 1.19x | 1.19x |
+| 2048 | 158 | 4.84 ms | 1.43x | 1.19x | 1.11x |
+| 4096 | 314 | 6.91 ms | 1.37x | 0.93x | **0.80x** |
+| 6144 | 471 | 9.70 ms | 1.23x | 0.86x | **0.67x** |
+| 8192 | 627 | 10.91 ms | 1.23x | 0.85x | **0.66x** |
+| 12288 | 940 | 15.19 ms | 1.31x | 0.76x | **0.75x** |
+| 16384 | 1253 | 19.74 ms | 1.13x | 0.70x | **0.49x** |
+
+**At 16K context and a quarter budget Quest is 2.04x faster than the baseline.**
+The crossover is unchanged at ~4K -- lifting the ceiling did not move it, which
+is the right outcome, since the ceiling was an artifact of the harness and not a
+property of the policy.
+
+The `budget=100%` column is still the constant: in absolute terms the overhead
+is 1.65, 2.08, 2.58, 2.19, 2.48, 4.77 and 2.54 ms across the seven contexts --
+flat at ~2.5 ms with one outlier at 12288 that the shared host explains (the
+same row's 0.76x/0.75x pair is visibly noisier than its neighbours in both
+directions). Seven contexts spanning 16x now say what four spanning 6x could
+only suggest: **the overhead does not scale with context and the saving does**,
+so the ratio improves without bound as the context grows.

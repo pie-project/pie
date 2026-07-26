@@ -122,16 +122,19 @@ class LoadPlan {
         }
     }
 
-    /// Compile a checkpoint for this device.
+    /// Compile a contract the caller authored.
     ///
-    /// This is the call that replaces the old `deserialize`: instead of the
-    /// worker compiling a plan and the driver parsing it back, the driver — the
-    /// only party that knows the device — asks for the plan it needs.
-    static LoadPlan compile(const PieLoaderRequest& request) {
+    /// The only way in, and the argument list is the architecture: what is in
+    /// the files, what the caller wants out, and what the device can do. Nothing
+    /// here is a model's name, so a family this build has never heard of loads
+    /// exactly as well as one it has. This is also the call that replaced the
+    /// old `deserialize`, where the worker compiled a plan and the driver parsed
+    /// it back.
+    static LoadPlan compile(const PieLoaderContractRequest& request) {
         PieLoaderPlan* raw = nullptr;
         LoadPlanDiagnostics diags;
         const PieLoaderStatus status =
-            pie_loader_compile(&request, &raw, diags.slot());
+            pie_loader_compile_contract(&request, &raw, diags.slot());
         if (status != PieLoaderStatus::Ok) {
             throw std::runtime_error(
                 "load plan: compile failed (" + status_name(status) + "): " +
@@ -143,11 +146,14 @@ class LoadPlan {
         return LoadPlan(raw);
     }
 
-    /// Re-check the plan against the request it was compiled from.
-    void verify(const PieLoaderRequest& request) const {
+    /// Re-check the plan against the contract it was compiled from.
+    ///
+    /// Not a tautology across a process or a cache: the plan may have come from
+    /// an artifact another rank, or another build, wrote (§6.2).
+    void verify(const PieLoaderContractRequest& request) const {
         LoadPlanDiagnostics diags;
         const PieLoaderStatus status =
-            pie_loader_verify(plan_, &request, diags.slot());
+            pie_loader_verify_contract(plan_, &request, diags.slot());
         if (status != PieLoaderStatus::Ok) {
             throw std::runtime_error(
                 "load plan: verification failed (" + status_name(status) +
@@ -163,7 +169,6 @@ class LoadPlan {
     }
 
     PieLoaderBackendKind backend() const { return view().target.backend; }
-    PieLoaderMxfp4MoePolicy mxfp4_moe() const { return view().target.mxfp4_moe; }
     bool native_mxfp4_moe() const { return view().target.native_mxfp4_moe; }
     std::uint32_t preferred_alignment() const {
         return view().target.preferred_alignment;

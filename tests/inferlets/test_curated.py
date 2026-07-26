@@ -448,25 +448,45 @@ _COHERENCE_TAU = 0.001
 
 
 async def test_quest_attention(client, args):
+    # `max_tokens` is deliberately large relative to the prompt so the page
+    # channel's DECLARED capacity runs ahead of the pages the request actually
+    # holds. The two coincide at small `max_tokens`, and while they coincided
+    # this test could not tell a correct page slice from one taken with the
+    # host's bound instead of the device's real counts.
     report = await _report(
         client, args, "quest-attention",
-        {"prompt": _QUEST_PROMPT, "max_tokens": 8, "page_budget": 4},
+        {"prompt": _QUEST_PROMPT, "max_tokens": 64, "page_budget": 4},
     )
     # The tap has to fire once per layer, on every layer.
     assert report["layers_observed"] > 0, report
-    # Every page the request has already filled must carry a real bound. Only
-    # the in-flight last page is allowed to be pinned (+inf, "always keep"),
-    # and nothing may be NaN or missing.
-    assert report["pages_finite"] == report["max_pages"] - 1, report
-    assert report["pages_pinned"] == 1, report
-    assert report["pages_absent"] == 0, report
+
+    # The exact slot census, derived from the fire's own kv_len rather than
+    # assumed. `envelope_dot` has three outcomes per slot: a real bound for a
+    # page the envelopes already describe, `+inf` for a page still being
+    # filled (never evict what we cannot bound), and `-inf` for a slot past
+    # the end of the request. Every page must land in exactly one of them.
+    page_size = report["page_size"]
+    kv_len = report["kv_len_last"]
+    real_pages = -(-kv_len // page_size)
+    scored = min((kv_len - 1) // page_size, real_pages)  # qo_len == 1
+    assert report["pages_absent"] == report["max_pages"] - real_pages, report
+    assert report["pages_absent"] > 0, (
+        "test is vacuous: the declared page bound equals the real page count, "
+        f"so a slice taken with either CSR would agree\n{report}"
+    )
+    assert report["pages_finite"] == scored, report
+    assert report["pages_pinned"] == real_pages - scored, report
     assert report["pages_nan"] == 0, report
+
     # The budget must be honoured and the in-flight page force-kept.
     assert len(report["kept_pages"]) == report["page_budget"], report
-    assert report["max_pages"] - 1 in report["kept_pages"], report
+    assert real_pages - 1 in report["kept_pages"], report
+    # A kept page must belong to this request; the slots past the end score
+    # `-inf` precisely so a top-k consumer cannot reach into a neighbour's.
+    assert max(report["kept_pages"]) < real_pages, report
     # The criticality bound must actually discriminate: the page holding the
     # answer outranks the repeated filler.
-    scores = [float(s) for s in report["page_scores"][:-1]]
+    scores = [float(s) for s in report["page_scores"][:scored]]
     assert scores[0] == max(scores), report
 
     # Everything above is about the RANKING, and a ranking the driver computes

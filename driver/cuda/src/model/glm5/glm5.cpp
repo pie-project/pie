@@ -205,14 +205,46 @@ Glm5Weights bind_glm5(const LoadedModel& engine) {
         L.is_moe = li >= cfg.first_k_dense_replace;
         const std::string mp = lp + "mlp.";
         if (!L.is_moe) {
-            L.dense_gate_proj = &must(engine, mp + "gate_proj.weight");
-            L.dense_up_proj   = &must(engine, mp + "up_proj.weight");
+            // On a BF16 checkpoint at tp=1 the loader joins gate+up into a
+            // single `[2*I, H]` buffer and consumes the originals
+            // (`add_dense_fused_projection_joins`). Bind non-owning row views
+            // into it so the forward path is layout-agnostic; nothing else in
+            // this binder has to know the join happened.
+            if (!engine.has(mp + "gate_proj.weight")) {
+                const DeviceTensor& fused =
+                    must(engine, mp + "gate_up_proj.fused.weight");
+                require_rank2(fused, mp + "gate_up_proj.fused.weight");
+                const std::int64_t rows = fused.shape()[0];
+                const std::int64_t cols = fused.shape()[1];
+                if (rows % 2 != 0 || fused.dtype() != DType::BF16) {
+                    throw std::runtime_error(
+                        "glm5: fused weight '" + mp +
+                        "gate_up_proj.fused.weight' must be BF16 with an even "
+                        "row count");
+                }
+                const std::int64_t half = rows / 2;
+                auto* base = static_cast<std::uint8_t*>(
+                    const_cast<void*>(fused.data()));
+                const std::size_t half_bytes =
+                    static_cast<std::size_t>(half) *
+                    static_cast<std::size_t>(cols) * dtype_bytes(fused.dtype());
+                L.dense_gate_view = std::make_unique<DeviceTensor>(
+                    DeviceTensor::view(base, fused.dtype(), {half, cols}));
+                L.dense_up_view = std::make_unique<DeviceTensor>(
+                    DeviceTensor::view(base + half_bytes, fused.dtype(),
+                                       {half, cols}));
+                L.dense_gate_proj = L.dense_gate_view.get();
+                L.dense_up_proj = L.dense_up_view.get();
+            } else {
+                L.dense_gate_proj = &must(engine, mp + "gate_proj.weight");
+                L.dense_up_proj   = &must(engine, mp + "up_proj.weight");
+                L.dense_gate_quant = engine.quant_meta(mp + "gate_proj.weight");
+                L.dense_up_quant   = engine.quant_meta(mp + "up_proj.weight");
+                require_rank2(*L.dense_gate_proj, mp + "gate_proj.weight");
+                require_rank2(*L.dense_up_proj, mp + "up_proj.weight");
+            }
             L.dense_down_proj = &must(engine, mp + "down_proj.weight");
-            L.dense_gate_quant = engine.quant_meta(mp + "gate_proj.weight");
-            L.dense_up_quant   = engine.quant_meta(mp + "up_proj.weight");
             L.dense_down_quant = engine.quant_meta(mp + "down_proj.weight");
-            require_rank2(*L.dense_gate_proj, mp + "gate_proj.weight");
-            require_rank2(*L.dense_up_proj, mp + "up_proj.weight");
             require_rank2(*L.dense_down_proj, mp + "down_proj.weight");
             continue;
         }
@@ -222,8 +254,21 @@ Glm5Weights bind_glm5(const LoadedModel& engine) {
         L.e_score_correction_bias =
             maybe(engine, mp + "gate.e_score_correction_bias");
 
-        L.experts.resize(static_cast<std::size_t>(cfg.num_experts));
-        for (int e = 0; e < cfg.num_experts; ++e) {
+        L.moe_gate_up_proj = maybe(engine, mp + "experts.gate_up_proj");
+        L.moe_down_proj    = maybe(engine, mp + "experts.down_proj");
+        const bool stacked_experts =
+            L.moe_gate_up_proj != nullptr && L.moe_down_proj != nullptr;
+        if (stacked_experts && (L.moe_gate_up_proj->dtype() != DType::BF16 ||
+                                L.moe_down_proj->dtype() != DType::BF16)) {
+            throw std::runtime_error("glm5: stacked MoE experts must be BF16");
+        }
+
+        // Stacked experts consume the per-expert tensors in the contract, so
+        // `experts` stays empty and the forward takes the aligned MoE path.
+        L.experts.resize(stacked_experts
+                             ? 0
+                             : static_cast<std::size_t>(cfg.num_experts));
+        for (int e = 0; e < static_cast<int>(L.experts.size()); ++e) {
             const std::string ep =
                 mp + "experts." + std::to_string(e) + ".";
             auto& Ew = L.experts[static_cast<std::size_t>(e)];

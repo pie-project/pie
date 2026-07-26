@@ -649,26 +649,6 @@ static __global__ void k_generated_scan_u32(
     }
 }
 
-// `envelope_dot` — Quest page criticality (Tang et al., arXiv:2406.10774).
-//
-// One block per (lane, page slot). The block reduces the per-head Quest bound
-// over the GQA group and then takes the MAX over kv heads.
-//
-// The max-over-heads is a DELIBERATE deviation from the paper, forced by the
-// consumer: Quest selects pages per head, but FlashInfer's paged layout carries
-// ONE page list shared by every head of a request, so a per-head selection has
-// no way to be expressed downstream. Reducing with max is the union of the
-// per-head selections, which keeps a page any head considers critical. That is
-// strictly more conservative than Quest: quality >= Quest, speedup <= Quest.
-//
-// Slot semantics, in the order the branches test them:
-//   slot >= page_count   -> -inf. Not a page of this request at all; a
-//                           top-k consumer must never choose it.
-//   slot >= scored_pages -> +inf. A page this fire is still writing, so its
-//                           envelope predates the tokens in it. Always keep.
-//                           This is both the fail-safe direction and Quest's
-//                           own "keep the local window" rule.
-//   otherwise            -> the bound.
 // `attn_page_mask(mask)` — the write side of the attention hook. Threshold the
 // program's per-page mask row into the model-owned keep buffer for this lane.
 //
@@ -699,6 +679,33 @@ static __global__ void k_generated_attn_page_mask(
     }
 }
 
+// `envelope_dot` — Quest page criticality (Tang et al., arXiv:2406.10774).
+//
+// One block per (lane, page slot). The block reduces the per-head Quest bound
+// over the GQA group and then takes the MAX over kv heads.
+//
+// The max-over-heads is a DELIBERATE deviation from the paper, forced by the
+// consumer: Quest selects pages per head, but FlashInfer's paged layout carries
+// ONE page list shared by every head of a request, so a per-head selection has
+// no way to be expressed downstream. Reducing with max is the union of the
+// per-head selections, which keeps a page any head considers critical. That is
+// strictly more conservative than Quest: quality >= Quest, speedup <= Quest.
+//
+// The slice of the fire's page list belonging to this lane is resolved HERE,
+// from the device CSR, not on the host. `max_pages` is a host-declared bound on
+// the slot count, so the grid is wide enough for any lane; the real count comes
+// from `page_indptr`. Under decode envelopes the host CSR is only an upper
+// bound, so slicing with it would both start at the wrong page and score more
+// slots than the request owns. See `GroupedLaneEnvelope`.
+//
+// Slot semantics, in the order the branches test them:
+//   slot >= page_count   -> -inf. Not a page of this request at all; a
+//                           top-k consumer must never choose it.
+//   slot >= scored_pages -> +inf. A page this fire is still writing, so its
+//                           envelope predates the tokens in it. Always keep.
+//                           This is both the fail-safe direction and Quest's
+//                           own "keep the local window" rule.
+//   otherwise            -> the bound.
 template <int BLOCK>
 static __global__ void k_generated_envelope_dot(
     const PtirLaneTableHeader* header,
@@ -717,16 +724,32 @@ static __global__ void k_generated_envelope_dot(
     float* out = grouped_value<float>(values, value_count, lane, output_value);
     if (out == nullptr || e.env_min == nullptr) return;
 
-    if (slot >= e.page_count) {
+    const std::uint32_t begin = e.page_indptr[e.request];
+    const std::uint32_t end = e.page_indptr[e.request + 1];
+    const std::uint32_t page_count = end >= begin ? end - begin : 0u;
+
+    if (slot >= page_count) {
         if (threadIdx.x == 0) out[slot] = -CUDART_INF_F;
         return;
     }
-    if (slot >= e.scored_pages) {
+
+    // `kv_last_page_lens` is POST-append (see `write_kv_kernel`), so the KV
+    // length this fire will END at is derivable, and subtracting the fire's own
+    // tokens gives the length the envelopes currently describe. Only pages
+    // entirely below that are final.
+    const std::uint32_t kv_after =
+        (page_count - 1u) * e.page_size + e.last_page_lens[e.request];
+    const std::uint32_t kv_before =
+        kv_after >= e.qo_len ? kv_after - e.qo_len : 0u;
+    const std::uint32_t scored_pages =
+        min(e.page_size == 0u ? 0u : kv_before / e.page_size, page_count);
+
+    if (slot >= scored_pages) {
         if (threadIdx.x == 0) out[slot] = CUDART_INF_F;
         return;
     }
 
-    const int page = static_cast<int>(e.page_ids[slot]);
+    const int page = static_cast<int>(e.page_ids[begin + slot]);
     const int num_kv_heads = static_cast<int>(e.num_kv_heads);
     const int head_dim = static_cast<int>(e.head_dim);
     const int group = static_cast<int>(e.num_q_heads) / num_kv_heads;
@@ -2041,21 +2064,26 @@ inline GroupedLaunchResult run_generated_stage(
                     const auto& e = lanes[lane].envelope;
                     if (e.env_min == nullptr || e.env_max == nullptr ||
                         e.query == nullptr || e.page_ids == nullptr ||
+                        e.page_indptr == nullptr ||
+                        e.last_page_lens == nullptr || e.page_size == 0 ||
                         e.num_kv_heads == 0 || e.head_dim == 0 ||
                         e.num_q_heads % e.num_kv_heads != 0) {
                         throw std::runtime_error(
                             "envelope_dot lane has no resolved kv envelope");
                     }
-                    if (e.page_count > max_pages) {
+                    // The host page CSR is an upper bound on the device one, so
+                    // a result row that fits the bound fits the truth. The
+                    // kernel writes -inf to the surplus slots.
+                    if (e.page_bound > max_pages) {
                         throw std::runtime_error(
                             "envelope_dot result is narrower than the lane's "
                             "page list");
                     }
                     host_envelopes[lane] = GroupedLaneEnvelopeDevice{
-                        e.env_min,      e.env_max,      e.query,
-                        e.page_ids,     e.page_count,   e.scored_pages,
-                        e.num_q_heads,  e.num_kv_heads, e.head_dim,
-                        0u};
+                        e.env_min,        e.env_max,      e.query,
+                        e.page_ids,       e.page_indptr,  e.last_page_lens,
+                        e.request,        e.qo_len,       e.page_size,
+                        e.num_q_heads,    e.num_kv_heads, e.head_dim};
                 }
                 GroupedLaneEnvelopeDevice* device_envelopes = nullptr;
                 const std::size_t envelope_bytes =

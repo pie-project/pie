@@ -283,4 +283,24 @@ void maybe_bench_lm_head_algos(
     const void* act, const void* W, void* y,
     int M, int N, int K);
 
+// ── MLA weight absorption ────────────────────────────────────────────────
+// `kv_b_proj` is [heads, qk_nope_dim + v_head_dim, kv_lora_rank] BF16.
+//
+//   q_latent[n, h, l] = sum_d q_nope[n, h, d] * kv_b[h, d, l]
+//   attn_v  [n, h, v] = sum_l latent[n, h, l] * kv_b[h, qk_nope_dim + v, l]
+//
+// Both are per-head GEMMs over a strided batch, so they run as a single
+// `cublasGemmStridedBatchedEx` instead of the scalar one-thread-per-output
+// kernels they replace (those stride the inner loop by `kv_lora_rank` and
+// reach a small fraction of HBM bandwidth).
+void mla_absorb_q_to_latent_bf16(
+    cublasHandle_t handle,
+    const void* q_nope, const void* kv_b_proj, void* q_latent,
+    int tokens, int heads, int qk_nope_dim, int v_head_dim, int kv_lora_rank);
+
+void mla_absorb_latent_to_v_bf16(
+    cublasHandle_t handle,
+    const void* attn_latent, const void* kv_b_proj, void* attn_v,
+    int tokens, int heads, int qk_nope_dim, int v_head_dim, int kv_lora_rank);
+
 }  // namespace pie_cuda_driver::ops

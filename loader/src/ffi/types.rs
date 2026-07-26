@@ -14,7 +14,7 @@
 //!   `has_*: bool` companion, matching the C++ views this replaces, so the
 //!   layout is legible from C without knowing Rust's niche rules.
 
-use crate::types::{BackendKind, DType, Mxfp4MoePolicy, QuantScheme, RepackLayout, RowMap};
+use crate::types::{BackendKind, DType, QuantScheme, RepackLayout, RowMap};
 
 /// Sentinel for "no buffer", mirroring the C++ `numeric_limits<uint32_t>::max()`
 /// defaults on `PieLoaderStorageInstrView::buffer_id` and `slab_file_id`.
@@ -96,6 +96,10 @@ pub enum PieLoaderDType {
     U16 = 9,
     U8 = 10,
     Bool = 11,
+    // Appended after `Bool` so existing discriminants keep their values: the
+    // enum is an ABI, not a declaration order.
+    I64 = 12,
+    U64 = 13,
 }
 
 impl From<DType> for PieLoaderDType {
@@ -113,6 +117,8 @@ impl From<DType> for PieLoaderDType {
             DType::U16 => Self::U16,
             DType::U8 => Self::U8,
             DType::Bool => Self::Bool,
+            DType::I64 => Self::I64,
+            DType::U64 => Self::U64,
         }
     }
 }
@@ -134,6 +140,8 @@ impl From<PieLoaderDType> for DType {
             PieLoaderDType::U16 => Self::U16,
             PieLoaderDType::U8 => Self::U8,
             PieLoaderDType::Bool => Self::Bool,
+            PieLoaderDType::I64 => Self::I64,
+            PieLoaderDType::U64 => Self::U64,
         }
     }
 }
@@ -143,24 +151,6 @@ impl From<PieLoaderDType> for DType {
 pub enum PieLoaderEncodingKind {
     Raw = 0,
     Quant = 1,
-}
-
-#[repr(u32)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PieLoaderMxfp4MoePolicy {
-    RoutedDecode = 0,
-    NativeGemm = 1,
-    EagerBf16 = 2,
-}
-
-impl From<Mxfp4MoePolicy> for PieLoaderMxfp4MoePolicy {
-    fn from(value: Mxfp4MoePolicy) -> Self {
-        match value {
-            Mxfp4MoePolicy::RoutedDecode => Self::RoutedDecode,
-            Mxfp4MoePolicy::NativeGemm => Self::NativeGemm,
-            Mxfp4MoePolicy::EagerBf16 => Self::EagerBf16,
-        }
-    }
 }
 
 /// Discriminants follow `crate::types::QuantScheme` declaration order, which is
@@ -310,6 +300,8 @@ impl TryFrom<u32> for PieLoaderDType {
             9 => Self::U16,
             10 => Self::U8,
             11 => Self::Bool,
+            12 => Self::I64,
+            13 => Self::U64,
             other => return Err(other),
         })
     }
@@ -975,7 +967,6 @@ pub struct PieLoaderTargetView {
     pub max_tile_bytes: u64,
     pub preferred_alignment: u32,
     pub tile_map_mask: u32,
-    pub mxfp4_moe: PieLoaderMxfp4MoePolicy,
     pub native_mxfp4_moe: bool,
     pub fusion_mask: u32,
     pub encode_scratch_dtype: PieLoaderDType,
@@ -991,7 +982,6 @@ impl From<&crate::load_plan::StorageTarget> for PieLoaderTargetView {
             max_tile_bytes: value.max_tile_bytes,
             preferred_alignment: value.preferred_alignment,
             tile_map_mask: value.tile_map_mask,
-            mxfp4_moe: value.mxfp4_moe.into(),
             native_mxfp4_moe: value.native_mxfp4_moe,
             fusion_mask: value.fusion_mask,
             encode_scratch_dtype: value.encode_scratch_dtype.into(),
@@ -1005,7 +995,7 @@ impl From<&crate::load_plan::StorageTarget> for PieLoaderTargetView {
 /// The leading members reproduce the old `LoadPlanView` in order, so an executor
 /// written against that view compiles unchanged against this struct. `target`
 /// and `compiler_version` fold in the accessors `loaded_model.cpp` reached
-/// through `LoadPlan` methods (`backend()`, `mxfp4_moe()`, `native_mxfp4_moe()`,
+/// through `LoadPlan` methods (`backend()`, `native_mxfp4_moe()`,
 /// `preferred_alignment()`, `max_tile_bytes()`, `tile_map_mask()`,
 /// `compiler_version()`), which have no method syntax to hide behind once the
 /// type is POD.

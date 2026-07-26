@@ -83,6 +83,8 @@ enum class PieLoaderDType : uint32_t {
   U16 = 9,
   U8 = 10,
   Bool = 11,
+  I64 = 12,
+  U64 = 13,
 };
 
 enum class PieLoaderEncodingKind : uint32_t {
@@ -168,12 +170,6 @@ enum class PieLoaderBackendKind : uint32_t {
   Unknown = 255,
 };
 
-enum class PieLoaderMxfp4MoePolicy : uint32_t {
-  RoutedDecode = 0,
-  NativeGemm = 1,
-  EagerBf16 = 2,
-};
-
 /// How a scale tensor's entries map onto the tensor they scale.
 enum class PieLoaderQuantGranularity : uint32_t {
   PerChannel = 0,
@@ -192,17 +188,6 @@ enum class PieLoaderScaleForm : uint32_t {
   F32Factors = 1,
 };
 
-/// Which part of a multimodal checkpoint to load.
-///
-/// `Full` and `Text` load every tensor the ABI declares; `Encode` narrows the
-/// plan to the vision/audio towers so an encoder-only rank does not materialize
-/// the language model.
-enum class PieLoaderComponent : uint32_t {
-  Full = 0,
-  Text = 1,
-  Encode = 2,
-};
-
 /// Which constructor a node is. Mirrors [`crate::contract::Expr`] exactly; a
 /// variant added there without a variant here is a compile error in
 /// [`read_expr`].
@@ -217,14 +202,6 @@ enum class PieLoaderExprKind : uint32_t {
   Repack = 7,
   Quantize = 8,
   Bitcast = 9,
-};
-
-enum class PieLoaderMxfp4MoeRequest : uint32_t {
-  /// Let the loader pick from the target's capabilities.
-  Auto = 0,
-  RoutedDecode = 1,
-  NativeGemm = 2,
-  EagerBf16 = 3,
 };
 
 /// A borrowed UTF-8 string. Not NUL-terminated: plan strings come from Rust
@@ -353,8 +330,8 @@ struct PieLoaderDiagnostics {
 /// loader never guesses any of it, which is what makes a plan reproducible from
 /// a recorded spec on a machine with no GPU (§2 P2).
 ///
-/// `backend` is a plain `uint32_t` rather than `PieLoaderBackendKind`, and the
-/// same goes for the enum-valued fields of [`PieLoaderRequest`]. C++ lets a
+/// `backend` and `encode_scratch_dtype` are plain `uint32_t` rather than their
+/// enum types, and the same goes for every enum-valued *input* field. C++ lets a
 /// caller store any integer in an enum-typed field, and reading such a field as
 /// a Rust enum is undefined behaviour that happens *before* any check could
 /// reject it. Assign `static_cast<uint32_t>(PieLoaderBackendKind::Cuda)`; the
@@ -499,17 +476,17 @@ struct PieLoaderModelContractView {
 
 /// A compile request that carries its own contract.
 ///
-/// This is [`PieLoaderRequest`] with every field that exists only to let the
-/// loader *guess* a contract removed. There is no `model`, because the loader
-/// no longer infers anything from `model_type`; no `runtime_quant`, because
-/// every tensor states the encoding it wants; no `mxfp4_moe`, because a
-/// contract either declares an MXFP4 expert weight or it does not; no
-/// `component`, because a contract that should not load the vision tower simply
-/// does not declare it; and no `demands`, because the contract already names
-/// every tensor it will produce and may declare the shape of each.
+/// Exactly the north-star signature: the facts read off the checkpoint, the
+/// program stated over them, and the device to build for. None of the three is
+/// a model's name.
 ///
-/// What remains is exactly the north-star signature: the facts read off the
-/// checkpoint, the program stated over them, and the device to build for.
+/// There is no `model`, because the loader infers nothing from `model_type`; no
+/// `runtime_quant`, because every tensor states the encoding it wants; no
+/// `mxfp4_moe`, because a contract either declares an MXFP4 expert weight or it
+/// does not; no `component`, because a contract that should not load the vision
+/// tower simply does not declare it; and no `demands`, because the contract
+/// already names every tensor it will produce and may declare the shape of
+/// each.
 struct PieLoaderContractRequest {
   /// The checkpoint, already open. Not a directory: the driver had to read
   /// the tensor table to write the contract, and compiling against the same
@@ -702,7 +679,6 @@ struct PieLoaderTargetView {
   uint64_t max_tile_bytes;
   uint32_t preferred_alignment;
   uint32_t tile_map_mask;
-  PieLoaderMxfp4MoePolicy mxfp4_moe;
   bool native_mxfp4_moe;
   uint32_t fusion_mask;
   PieLoaderDType encode_scratch_dtype;
@@ -749,7 +725,7 @@ struct PieLoaderContractCoverageView {
 /// The leading members reproduce the old `LoadPlanView` in order, so an executor
 /// written against that view compiles unchanged against this struct. `target`
 /// and `compiler_version` fold in the accessors `loaded_model.cpp` reached
-/// through `LoadPlan` methods (`backend()`, `mxfp4_moe()`, `native_mxfp4_moe()`,
+/// through `LoadPlan` methods (`backend()`, `native_mxfp4_moe()`,
 /// `preferred_alignment()`, `max_tile_bytes()`, `tile_map_mask()`,
 /// `compiler_version()`), which have no method syntax to hide behind once the
 /// type is POD.
@@ -782,78 +758,6 @@ struct PieLoaderPlan {
   /// instruction names to fall out of step with this one.
   PieLoaderBytes stats_json;
   void *owner;
-};
-
-/// The model facts the storage compile keys off.
-///
-/// The driver has already parsed `config.json` to build its own model, so the
-/// loader reading it a second time was duplicated work that could disagree.
-/// The driver states these; the loader never opens the file.
-struct PieLoaderModelSpec {
-  /// HF `model_type`, from the text tower when the checkpoint nests one.
-  PieLoaderBytes model_type;
-  /// `quantization_config.quant_method`, or empty for an unquantized
-  /// checkpoint.
-  PieLoaderBytes quant_method;
-  uint32_t num_hidden_layers;
-  /// HF `num_local_experts` / `num_experts` / `n_routed_experts`. Zero on a
-  /// dense model.
-  uint32_t num_experts;
-  uint32_t num_experts_per_tok;
-};
-
-/// One tensor the driver promises to bind after the load.
-///
-/// This is the driver's half of the contract (§10.2.1). Today the loader's
-/// `arch/` passes decide *both* what the model needs and how to build it, so a
-/// pass that invents an output name the driver never binds — or computes a shape
-/// the driver disagrees with — is caught by nothing. Declaring the demand makes
-/// `pie_loader_verify` a real check rather than a self-comparison.
-///
-/// State only what you know. `shape.len == 0` means "do not check the shape",
-/// which is the honest answer for a tensor whose runtime layout the driver reads
-/// off the loaded tensor rather than predicting. The encoding is deliberately
-/// absent from this struct: it is the loader's choice under the runtime quant
-/// policy, and binders probe it afterwards.
-struct PieLoaderTensorDemand {
-  PieLoaderBytes name;
-  /// The shape *this rank* expects, already divided by the TP size. Empty to
-  /// demand presence without a shape.
-  PieLoaderI64Slice shape;
-  /// Absence is not a violation, e.g. `lm_head.weight` under
-  /// `tie_word_embeddings`.
-  bool optional;
-};
-
-struct PieLoaderTensorDemandSlice {
-  const PieLoaderTensorDemand *ptr;
-  size_t len;
-};
-
-/// A compile request.
-///
-/// Strings are pointer + length and are borrowed for the duration of the call;
-/// the loader copies anything it keeps.
-struct PieLoaderRequest {
-  PieLoaderBytes snapshot_dir;
-  PieLoaderTargetSpec target;
-  PieLoaderModelSpec model;
-  /// The runtime's own quantization request (e.g. `"fp8"`), not a checkpoint
-  /// fact. Empty means "whatever the checkpoint is". Ignored when the target
-  /// reports no native support for the requested format.
-  PieLoaderBytes runtime_quant;
-  /// A `PieLoaderMxfp4MoeRequest` value, as `uint32_t`. See
-  /// [`PieLoaderTargetSpec::backend`] for why this is not the enum type.
-  uint32_t mxfp4_moe;
-  /// A `PieLoaderComponent` value, as `uint32_t`.
-  uint32_t component;
-  /// What the driver promises to bind. Borrowed for the call.
-  ///
-  /// Empty means the driver declares nothing, and `pie_loader_verify` checks
-  /// only the plan's internal consistency — which is where every caller
-  /// started. A driver that fills this in gets its shapes checked against the
-  /// plan by code that did not compute them.
-  PieLoaderTensorDemandSlice demands;
 };
 
 constexpr static const PieLoaderOptDType PIE_LOADER_NO_DTYPE = -1;
@@ -911,40 +815,11 @@ PieLoaderStatus pie_loader_verify_contract(const PieLoaderPlan *plan,
                                            const PieLoaderContractRequest *req,
                                            PieLoaderDiagnostics **out_diags);
 
-/// Compile a checkpoint into a plan.
-///
-/// On success `*out_plan` receives a plan the caller must free with
-/// [`pie_loader_release`]. On failure `*out_plan` is left null.
+/// Free a plan returned by [`pie_loader_compile_contract`].
 ///
 /// # Safety
 ///
-/// `req` must point at a valid [`PieLoaderRequest`] whose borrowed strings are
-/// live for the call. `out_plan` must be a writable slot. `out_diags` is either
-/// null or a writable slot.
-PieLoaderStatus pie_loader_compile(const PieLoaderRequest *req,
-                                   PieLoaderPlan **out_plan,
-                                   PieLoaderDiagnostics **out_diags);
-
-/// Check a plan against the contract it claims to satisfy.
-///
-/// Verification reports *every* violation it finds rather than the first, so the
-/// diagnostics array is the result and the status only says whether the array is
-/// empty.
-///
-/// # Safety
-///
-/// `plan` must point at a live plan from [`pie_loader_compile`]. `req` must point
-/// at the request the plan was compiled from. `out_diags` is either null or a
-/// writable slot.
-PieLoaderStatus pie_loader_verify(const PieLoaderPlan *plan,
-                                  const PieLoaderRequest *req,
-                                  PieLoaderDiagnostics **out_diags);
-
-/// Free a plan returned by [`pie_loader_compile`].
-///
-/// # Safety
-///
-/// `plan` is null or a pointer from [`pie_loader_compile`] that has not already
+/// `plan` is null or a pointer from [`pie_loader_compile_contract`] that has not already
 /// been released.
 void pie_loader_release(PieLoaderPlan *plan);
 

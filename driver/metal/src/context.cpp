@@ -447,7 +447,7 @@ class Context::Impl {
         runtime_quant_.assign(
             reinterpret_cast<const char*>(load.runtime_quant.ptr),
             load.runtime_quant.len);
-        mxfp4_moe_ = static_cast<pie_loader::PieLoaderMxfp4MoeRequest>(
+        mxfp4_moe_ = static_cast<pie_driver::Mxfp4MoeRequest>(
             load.mxfp4_moe);
         facts_ = read_model_facts(cfg_.model.hf_path);
         std::string error;
@@ -2089,8 +2089,8 @@ class Context::Impl {
     std::string caps_json_;
     std::string device_facts_json_;
     std::string runtime_quant_;
-    pie_loader::PieLoaderMxfp4MoeRequest mxfp4_moe_ =
-        pie_loader::PieLoaderMxfp4MoeRequest::Auto;
+    pie_driver::Mxfp4MoeRequest mxfp4_moe_ =
+        pie_driver::Mxfp4MoeRequest::Auto;
     bool load_attempted_ = false;
     std::uint32_t storage_page_size_ = 1;
     PieRuntimeCallbacks runtime_{};

@@ -20,6 +20,7 @@ mod arena;
 mod extents;
 mod memory;
 mod passes;
+mod rewrite;
 
 use arena::{assign_persistent_offsets, validate_persistent_layout};
 use extents::{
@@ -38,7 +39,7 @@ pub fn compile_load_plan(
     contract: &ModelContract,
     target: StorageTarget,
 ) -> Result<LoadPlan, CompileError> {
-    let contract = crate::arch::coalesce_direct_row_shards(contract, metadata, &target)?;
+    let contract = rewrite::coalesce_direct_row_shards(contract, metadata, &target)?;
     let plan = plan_from_contracts(metadata, &contract, &target)?;
     let optimized = optimize_with_report(plan)?;
     let mut program = lower_layout_plan(metadata, &optimized.plan, target)?;

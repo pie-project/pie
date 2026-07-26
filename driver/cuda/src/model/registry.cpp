@@ -282,6 +282,7 @@ public:
 
     DsV4Weights weights;
     PlanInfo info;
+    bool eager_bf16_experts = true;
 };
 
 class Glm5Plan final : public ModelPlan {
@@ -428,7 +429,10 @@ std::unique_ptr<ModelPlan> bind_row_nemotron_h(LoadedModel& engine, bool) {
     return std::make_unique<NemotronHPlan>(bind_nemotron_h(engine));
 }
 std::unique_ptr<ModelPlan> bind_row_deepseek_v4(LoadedModel& engine, bool) {
-    return std::make_unique<DeepSeekV4Plan>(bind_deepseek_v4(engine));
+    auto plan = std::make_unique<DeepSeekV4Plan>(bind_deepseek_v4(engine));
+    plan->eager_bf16_experts = engine.mxfp4_moe_request() !=
+        pie_driver::Mxfp4MoeRequest::RoutedDecode;
+    return plan;
 }
 std::unique_ptr<ModelPlan> bind_row_kimi(LoadedModel& engine, bool) {
     return std::make_unique<KimiPlan>(bind_kimi(engine));
@@ -532,8 +536,10 @@ std::unique_ptr<IModel> create_deepseek_v4_model(
     std::unique_ptr<ModelPlan> plan_base, ModelResources& res) {
     auto& plan = plan_cast<DeepSeekV4Plan>(*plan_base, "deepseek_v4");
     return std::make_unique<DsV4Model>(
-        std::move(plan.weights), *res.hf_config, *res.dsv4_ws, res.tp_size,
-        res.tp_rank, res.tp_comm, /*emit_logits=*/true);
+        std::move(plan.weights), *res.hf_config, *res.dsv4_ws,
+        *res.dsv4_comp_cache, *res.kv_cache, res.tp_size,
+        res.tp_rank, res.tp_comm, /*emit_logits=*/true,
+        plan.eager_bf16_experts);
 }
 
 std::unique_ptr<IModel> create_kimi_model(
