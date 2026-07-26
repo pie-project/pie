@@ -93,6 +93,7 @@ def _mask_kernel(
     stack_depth_ptr,
     config_count_ptr,
     widest_ptr,
+    representative_ptr,
     scratch_ptr,
     admitted_ptr,
     mask_ptr,
@@ -132,6 +133,11 @@ def _mask_kernel(
     # synchronisation, so most of the grid is programs that exit at once - and
     # laying them out this way puts those exits in whole blocks rather than
     # scattering one live program among fifteen dead ones in every block.
+    # A sequence whose parse state an earlier one already holds does no work;
+    # its mask is copied afterwards. In a serving batch that is 93% to 95% of
+    # them, because there are only so many places to be in one grammar.
+    if tl.load(representative_ptr + sequence) != sequence:
+        return
     row_index = sequence * CONFIGS + config
     state = tl.load(lexer_state_ptr + row_index)
     depth = tl.load(stack_depth_ptr + row_index)
@@ -836,6 +842,120 @@ def _commit_kernel(
     tl.atomic_max(widest_ptr, written)
 
 
+@triton.jit
+def _hash_kernel(
+    lexer_state_ptr,
+    stack_ptr,
+    stack_depth_ptr,
+    config_count_ptr,
+    hash_ptr,
+    CONFIGS: tl.constexpr,
+    STACK_STRIDE: tl.constexpr,
+):
+    """A fingerprint of one sequence's parse state.
+
+    A serving batch runs many sequences against the same grammar at different
+    points of their own documents, and there are only so many places to be: on
+    this corpus a batch of 512 holds 24 to 34 distinct parse states, so 93% to
+    95% of the fill recomputes an answer it already has. Finding the duplicates
+    needs a cheap comparison first, which is what this is - the exact check
+    follows, because a mask that is wrong is worse than a mask that is slow.
+    """
+    sequence = tl.program_id(0)
+    count = tl.load(config_count_ptr + sequence)
+    digest = 2166136261
+    digest = (digest ^ count) * 16777619
+    for config in range(0, CONFIGS):
+        if config < count:
+            row = sequence * CONFIGS + config
+            depth = tl.load(stack_depth_ptr + row)
+            digest = (digest ^ tl.load(lexer_state_ptr + row)) * 16777619
+            digest = (digest ^ depth) * 16777619
+            lane = tl.arange(0, STACK_STRIDE)
+            values = tl.load(
+                stack_ptr + row * STACK_STRIDE + lane, mask=lane < depth, other=0
+            )
+            # Order matters, so fold with a position-dependent weight rather
+            # than a plain sum.
+            digest = (digest ^ tl.sum(values * (lane + 1))) * 16777619
+    tl.store(hash_ptr + sequence, digest)
+
+
+@triton.jit
+def _dedup_kernel(
+    lexer_state_ptr,
+    stack_ptr,
+    stack_depth_ptr,
+    config_count_ptr,
+    hash_ptr,
+    representative_ptr,
+    BATCH: tl.constexpr,
+    CONFIGS: tl.constexpr,
+    STACK_STRIDE: tl.constexpr,
+):
+    """The lowest-numbered sequence holding the same parse state.
+
+    The fingerprint narrows the search; this confirms it exactly, because two
+    different parse states that happen to hash alike would otherwise share a
+    mask and one of them would be wrong.
+    """
+    sequence = tl.program_id(0)
+    mine = tl.load(hash_ptr + sequence)
+    count = tl.load(config_count_ptr + sequence)
+    found = sequence
+    for other in range(0, BATCH):
+        if other < sequence and found == sequence:
+            if tl.load(hash_ptr + other) == mine:
+                if tl.load(config_count_ptr + other) == count:
+                    same = 1
+                    for config in range(0, CONFIGS):
+                        if config < count:
+                            a = sequence * CONFIGS + config
+                            b = other * CONFIGS + config
+                            depth = tl.load(stack_depth_ptr + a)
+                            if tl.load(lexer_state_ptr + a) != tl.load(
+                                lexer_state_ptr + b
+                            ):
+                                same = 0
+                            if depth != tl.load(stack_depth_ptr + b):
+                                same = 0
+                            lane = tl.arange(0, STACK_STRIDE)
+                            left = tl.load(
+                                stack_ptr + a * STACK_STRIDE + lane,
+                                mask=lane < depth,
+                                other=0,
+                            )
+                            right = tl.load(
+                                stack_ptr + b * STACK_STRIDE + lane,
+                                mask=lane < depth,
+                                other=0,
+                            )
+                            if tl.sum(tl.where(left != right, 1, 0)) != 0:
+                                same = 0
+                    if same == 1:
+                        found = other
+    tl.store(representative_ptr + sequence, found)
+
+
+@triton.jit
+def _broadcast_kernel(
+    representative_ptr,
+    mask_ptr,
+    mask_words,
+    BLOCK: tl.constexpr,
+):
+    """Copy each duplicate's mask from the sequence that computed it."""
+    sequence = tl.program_id(0)
+    source = tl.load(representative_ptr + sequence)
+    if source == sequence:
+        return
+    for start in range(0, mask_words, BLOCK):
+        lane = start + tl.arange(0, BLOCK)
+        live = lane < mask_words
+        value = tl.load(mask_ptr + source * mask_words + lane, mask=live, other=0)
+        tl.store(mask_ptr + sequence * mask_words + lane, value, mask=live)
+
+
 class DeviceGrammar:
     """A compiled grammar, resident on the GPU."""
 
@@ -980,6 +1100,8 @@ class DeviceBatch:
         # The configuration width, copied back asynchronously and read one step
         # late so that no step ever synchronises to learn it.
         self.width_host = torch.ones(1, dtype=torch.int32).pin_memory()
+        self.state_hash = torch.zeros(batch, dtype=torch.int32, device="cuda")
+        self.representative = torch.arange(batch, dtype=torch.int32, device="cuda")
         self.pending_width = 1
         self.token = torch.zeros(batch, dtype=torch.int32, device="cuda")
         rows = batch * self.configs
@@ -1246,6 +1368,28 @@ class DeviceBatch:
         grammar = self.grammar
         self.mask.zero_()
         self.admitted.zero_()
+        _hash_kernel[(self.batch,)](
+            self.lexer_state,
+            self.stack,
+            self.depth,
+            self.config_count,
+            self.state_hash,
+            CONFIGS=self.configs,
+            STACK_STRIDE=grammar.max_stack,
+            num_warps=1,
+        )
+        _dedup_kernel[(self.batch,)](
+            self.lexer_state,
+            self.stack,
+            self.depth,
+            self.config_count,
+            self.state_hash,
+            self.representative,
+            BATCH=self.batch,
+            CONFIGS=self.configs,
+            STACK_STRIDE=grammar.max_stack,
+            num_warps=1,
+        )
         live = self.live
         _mask_kernel[(self.batch * live, self.max_groups)](
             grammar.group_offsets,
@@ -1273,6 +1417,7 @@ class DeviceBatch:
             self.depth,
             self.config_count,
             self.widest,
+            self.representative,
             self.scratch,
             self.admitted,
             self.mask,
@@ -1303,6 +1448,13 @@ class DeviceBatch:
             MAX_GROUPS=self.max_groups,
             BLOCK=128,
             num_warps=1,
+        )
+        _broadcast_kernel[(self.batch,)](
+            self.representative,
+            self.mask,
+            grammar.mask_words,
+            BLOCK=128,
+            num_warps=4,
         )
         # A complement sets the last word whole, so the bits past the final
         # token have to go: nothing may be allowed that is not a token.
