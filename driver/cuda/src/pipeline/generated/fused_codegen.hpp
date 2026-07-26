@@ -723,6 +723,212 @@ __device__ __forceinline__ void ptir_parallel_gather(
   }
 }
 
+// cummass_le (top-p / nucleus): keep the DESCENDING prefix whose EXCLUSIVE
+// cumulative mass stays below `p` (interp.rs `Predicate::CummassLe`: sort the
+// row descending, then `k[i] = excl < p; excl += row[i]`). The input is NOT
+// sorted, so this is a block-cooperative selection loop -- one block-wide
+// "next largest still-unpicked element" pick per iteration, carrying the
+// previous pick as a total-order threshold instead of a visited set (the same
+// technique as tier0's `k_pivot_cummassle`). It stops as soon as the running
+// mass clears `p`, so a peaked LM row costs a handful of passes.
+//
+// This replaces the single-threaded M1 reference, which was O(len^3) on
+// thread 0 alone (a selection sort with a linear "already picked" rescan per
+// candidate) and therefore never returned at a 151936-token vocabulary --
+// every hand-written top-p sampler that failed to match
+// `LibraryOp::NucleusSample` wedged the GPU here.
+__device__ __forceinline__ void ptir_parallel_pivot_cummass(
+    const m1_u8* input,
+    const m1_u8* threshold,
+    m1_u8* output,
+    const M1ValueDesc input_desc,
+    const M1ValueDesc threshold_desc) {
+  __shared__ float pivot_share_value[32];
+  __shared__ m1_u32 pivot_share_index[32];
+  __shared__ float pivot_previous_value;
+  __shared__ m1_u32 pivot_previous_index;
+  __shared__ float pivot_exclusive;
+  __shared__ m1_u32 pivot_stop;
+  const m1_u32 none = 0xFFFFFFFFu;
+  const m1_u32 len = input_desc.last;
+  const m1_u32 rows = input_desc.rows;
+  for (m1_u32 flat = threadIdx.x;
+       flat < input_desc.len;
+       flat += blockDim.x)
+    m1_store_b(output, flat, false);
+  __syncthreads();
+  if (len == 0u) return;
+  for (m1_u32 row = 0; row < rows; ++row) {
+    const m1_u32 base = row * len;
+    const float cutoff = m1_load_f(
+        threshold,
+        m1_pick(threshold_desc.len, row),
+        threshold_desc.dtype);
+    if (threadIdx.x == 0u) {
+      // Sentinel sorts before every real element, so the first pick is free.
+      pivot_previous_value = m1_pos_inf();
+      pivot_previous_index = 0u;
+      pivot_exclusive = 0.0f;
+      pivot_stop = 0u;
+    }
+    __syncthreads();
+    for (m1_u32 pick = 0; pick < len; ++pick) {
+      if (pivot_stop != 0u) break;
+      const float previous_value = pivot_previous_value;
+      const m1_u32 previous_index = pivot_previous_index;
+      float best_value = 0.0f;
+      m1_u32 best_index = none;
+      for (m1_u32 i = threadIdx.x; i < len; i += blockDim.x) {
+        const float value = m1_load_f(input, base + i, input_desc.dtype);
+        if (!m1_sort_better(previous_value, previous_index, value, i))
+          continue;
+        if (best_index == none ||
+            m1_sort_better(value, i, best_value, best_index)) {
+          best_value = value;
+          best_index = i;
+        }
+      }
+      for (m1_u32 offset = 16u; offset > 0u; offset >>= 1) {
+        const float other_value =
+            __shfl_down_sync(0xFFFFFFFFu, best_value, offset);
+        const m1_u32 other_index =
+            __shfl_down_sync(0xFFFFFFFFu, best_index, offset);
+        if (other_index != none &&
+            (best_index == none ||
+             m1_sort_better(
+                 other_value, other_index, best_value, best_index))) {
+          best_value = other_value;
+          best_index = other_index;
+        }
+      }
+      if ((threadIdx.x & 31u) == 0u) {
+        pivot_share_value[threadIdx.x >> 5] = best_value;
+        pivot_share_index[threadIdx.x >> 5] = best_index;
+      }
+      __syncthreads();
+      if (threadIdx.x == 0u) {
+        const m1_u32 warps = (blockDim.x + 31u) >> 5;
+        float value = pivot_share_value[0];
+        m1_u32 index = pivot_share_index[0];
+        for (m1_u32 warp = 1u; warp < warps; ++warp) {
+          if (pivot_share_index[warp] != none &&
+              (index == none ||
+               m1_sort_better(
+                   pivot_share_value[warp],
+                   pivot_share_index[warp],
+                   value,
+                   index))) {
+            value = pivot_share_value[warp];
+            index = pivot_share_index[warp];
+          }
+        }
+        // Descending order ⇒ once the mass condition fails it fails for every
+        // remaining element, so the zero-initialised tail is already correct.
+        if (index == none || !(pivot_exclusive < cutoff)) {
+          pivot_stop = 1u;
+        } else {
+          m1_store_b(output, base + index, true);
+          pivot_exclusive += value;
+          pivot_previous_value = value;
+          pivot_previous_index = index;
+        }
+      }
+      __syncthreads();
+    }
+    __syncthreads();
+  }
+}
+
+// rank_le (top-k by rank): keep the elements whose count of strictly-greater
+// values is below `k` (interp.rs `Predicate::RankLe`).
+//
+// This replaces a literal per-element rank pass, which re-scanned the whole row
+// for every element and so cost O(len^2) unconditionally -- ~2.3e10 element
+// visits per row at a 151936-token vocabulary, which is what made
+// `mirostat-v2-sampling` take minutes per request. Instead: a block-cooperative
+// 4-pass 8-bit MSB radix select on `m1_desc_key`, O(5*len) regardless of `k`.
+//
+// Equivalence: `greater(i)` equals the count of strictly smaller keys, which is
+// monotone in the key, so `greater(i) < k` holds exactly when `key(i) <= K_k`
+// for `K_k` the k-th smallest key counting multiplicity. Ties therefore all
+// survive or all fall together, which is what the reference does (it can keep
+// more than `k` elements when the boundary value repeats). NaN keys sort last
+// so they never displace a real element, and the marking pass excludes them.
+__device__ __forceinline__ void ptir_parallel_pivot_rank(
+    const m1_u8* input,
+    const m1_u8* threshold,
+    m1_u8* output,
+    const M1ValueDesc input_desc,
+    const M1ValueDesc threshold_desc) {
+  __shared__ m1_u32 rank_hist[256];
+  __shared__ m1_u32 rank_prefix;
+  __shared__ m1_u32 rank_target;
+  const m1_u32 len = input_desc.last;
+  const m1_u32 rows = input_desc.rows;
+  if (len == 0u) return;
+  for (m1_u32 row = 0u; row < rows; ++row) {
+    const m1_u32 base = row * len;
+    m1_u32 k;
+    if (threshold_desc.dtype == 1u) {
+      const int signed_k = m1_load_i(
+          threshold, m1_pick(threshold_desc.len, row), threshold_desc.dtype);
+      k = signed_k <= 0 ? 0u : (m1_u32)signed_k;
+    } else {
+      k = m1_load_u(
+          threshold, m1_pick(threshold_desc.len, row), threshold_desc.dtype);
+    }
+    if (k > len) k = len;
+    if (k == 0u) {
+      for (m1_u32 i = threadIdx.x; i < len; i += blockDim.x)
+        m1_store_b(output, base + i, false);
+      __syncthreads();
+      continue;
+    }
+    if (threadIdx.x == 0u) {
+      rank_prefix = 0u;
+      rank_target = k;
+    }
+    __syncthreads();
+    for (int pass = 0; pass < 4; ++pass) {
+      const int shift = 24 - 8 * pass;
+      // Bits fixed by earlier passes; `pass == 0` is special-cased because
+      // shifting a 32-bit value by 32 is undefined, not zero.
+      const m1_u32 high_mask =
+          (pass == 0) ? 0u : (0xFFFFFFFFu << (shift + 8));
+      for (m1_u32 bucket = threadIdx.x; bucket < 256u; bucket += blockDim.x)
+        rank_hist[bucket] = 0u;
+      __syncthreads();
+      const m1_u32 prefix = rank_prefix;
+      for (m1_u32 i = threadIdx.x; i < len; i += blockDim.x) {
+        const m1_u32 key =
+            m1_desc_key(m1_load_f(input, base + i, input_desc.dtype));
+        if ((key & high_mask) == (prefix & high_mask))
+          atomicAdd(&rank_hist[(key >> shift) & 0xFFu], 1u);
+      }
+      __syncthreads();
+      if (threadIdx.x == 0u) {
+        const m1_u32 target = rank_target;
+        m1_u32 run = 0u;
+        m1_u32 chosen = 255u;
+        for (m1_u32 bucket = 0u; bucket < 256u; ++bucket) {
+          if (run + rank_hist[bucket] >= target) { chosen = bucket; break; }
+          run += rank_hist[bucket];
+        }
+        rank_target = target - run;
+        rank_prefix = prefix | (chosen << shift);
+      }
+      __syncthreads();
+    }
+    const m1_u32 cutoff_key = rank_prefix;
+    for (m1_u32 i = threadIdx.x; i < len; i += blockDim.x) {
+      const float value = m1_load_f(input, base + i, input_desc.dtype);
+      m1_store_b(output, base + i,
+                 !m1_isnan(value) && m1_desc_key(value) <= cutoff_key);
+    }
+    __syncthreads();
+  }
+}
+
 __device__ __forceinline__ void ptir_parallel_pivot(
     const m1_u8* input,
     const m1_u8* threshold,
@@ -730,61 +936,22 @@ __device__ __forceinline__ void ptir_parallel_pivot(
     const M1ValueDesc input_desc,
     const M1ValueDesc threshold_desc,
     const M1OpParams p) {
+  if (p.pred_tag == 0u) {
+    ptir_parallel_pivot_rank(
+        input, threshold, output, input_desc, threshold_desc);
+    return;
+  }
   for (m1_u32 flat = threadIdx.x;
        flat < input_desc.len;
        flat += blockDim.x) {
     const m1_u32 row =
         input_desc.last == 0u ? 0u : flat / input_desc.last;
-    const m1_u32 column =
-        input_desc.last == 0u ? 0u : flat % input_desc.last;
-    const m1_u32 base = row * input_desc.last;
     const float value = m1_load_f(input, flat, input_desc.dtype);
-    bool keep = false;
-    if (p.pred_tag == 0u) {
-      m1_u32 k;
-      if (threshold_desc.dtype == 1u) {
-        const int signed_k = m1_load_i(
-            threshold,
-            m1_pick(threshold_desc.len, row),
-            threshold_desc.dtype);
-        k = signed_k <= 0 ? 0u : (m1_u32)signed_k;
-      } else {
-        k = m1_load_u(
-            threshold,
-            m1_pick(threshold_desc.len, row),
-            threshold_desc.dtype);
-      }
-      if (k > input_desc.last) k = input_desc.last;
-      m1_u32 greater = 0;
-      if (!m1_isnan(value)) {
-        for (m1_u32 other_column = 0;
-             other_column < input_desc.last;
-             ++other_column) {
-          const float other = m1_load_f(
-              input, base + other_column, input_desc.dtype);
-          if (!m1_isnan(other) && other > value) ++greater;
-        }
-      }
-      keep = !m1_isnan(value) && greater < k;
-    } else if (p.pred_tag == 2u) {
-      const float cutoff = m1_load_f(
-          threshold,
-          m1_pick(threshold_desc.len, row),
-          threshold_desc.dtype);
-      keep = value >= cutoff;
-    } else {
-      // CummassLe consumes sorted inputs; preserve increasing-index prefix order.
-      const float cutoff = m1_load_f(
-          threshold,
-          m1_pick(threshold_desc.len, row),
-          threshold_desc.dtype);
-      float exclusive = 0.0f;
-      for (m1_u32 prior = 0; prior < column; ++prior)
-        exclusive += m1_load_f(
-            input, base + prior, input_desc.dtype);
-      keep = exclusive < cutoff;
-    }
-    m1_store_b(output, flat, keep);
+    const float cutoff = m1_load_f(
+        threshold,
+        m1_pick(threshold_desc.len, row),
+        threshold_desc.dtype);
+    m1_store_b(output, flat, value >= cutoff);
   }
 }
 
@@ -1512,7 +1679,12 @@ extern "C" __global__ void )PTIR_CUDA"
                    "descriptors[p.a2]);\n";
         } else if (
             op.tag == PTIR_OP_PIVOT_THRESHOLD &&
-            op.pred_tag != 1) {
+            op.pred_tag == 1) {
+            source
+                << "    ptir_parallel_pivot_cummass(" << a0 << ", " << a1
+                << ", " << o0
+                << ", descriptors[p.a0], descriptors[p.a1]);\n";
+        } else if (op.tag == PTIR_OP_PIVOT_THRESHOLD) {
             source
                 << "    ptir_parallel_pivot(" << a0 << ", " << a1
                 << ", " << o0

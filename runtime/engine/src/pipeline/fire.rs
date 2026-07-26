@@ -1819,7 +1819,9 @@ async fn fire_device_geometry<C: FireContext>(
         // reserves. Purely logical — this can never exhaust the pool, so
         // it runs ONCE; only the physical prepare below retries under
         // contention.
-        let grant_slots =
+        let grant_slots = if devgeo.pooled {
+            Vec::new()
+        } else {
             crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv_store| {
                 devgeo.lease.grant(|| {
                     kv_store
@@ -1827,8 +1829,32 @@ async fn fire_device_geometry<C: FireContext>(
                         .map(|r| r.start as u32)
                         .unwrap_or(0)
                 })
-            });
-        let mut write_indexes: Vec<u64> = grant_slots.iter().map(|&slot| u64::from(slot)).collect();
+            })
+        };
+        // A pool-owned pass resolves its own write targets in-graph, so the
+        // host cannot name them: materialize the program's declared WRITABLE
+        // span and let the translation cover every slot the device might pick.
+        // The declaration is the containment promise — preparing outside it
+        // would copy-on-write a shared prefix the program never touches.
+        let mut write_indexes: Vec<u64> = if devgeo.pooled {
+            let writable = ctx.resources().get(&fwd)?.kv_declaration.writable;
+            let reserved =
+                crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv_store| {
+                    kv_store.page_len(ws.id)
+                });
+            let span = reserved
+                .map_err(|error| error.to_string())
+                .and_then(|page_len| writable.resolve(page_len));
+            match span {
+                Ok(span) => span.collect(),
+                Err(error) => {
+                    ctx.resources().get_mut(&fwd)?.devgeo = Some(devgeo);
+                    return Ok(Err(format!("pipeline: pool-owned device geometry: {error}")));
+                }
+            }
+        } else {
+            grant_slots.iter().map(|&slot| u64::from(slot)).collect()
+        };
         write_indexes.sort_unstable();
         write_indexes.dedup();
         let demand = match crate::store::registry::with_kv_lock(&stores.kv, "host-other", |store| {
@@ -1915,12 +1941,17 @@ async fn fire_device_geometry<C: FireContext>(
         // prepared write above backs physically). This also matches the
         // bind-time seed (`reserve(b)`), which was already logical.
         let fresh_dense = devgeo.fresh_dense;
+        let pooled = devgeo.pooled;
         let fresh_error = {
             let p = ctx.resources().get_mut(&fwd)?;
             let bytes: Vec<u8> = grant_slots.iter().flat_map(|s| s.to_le_bytes()).collect();
-            let error = match p.cells.get(fresh_dense) {
-                Some(cell) => cell.lock().unwrap().put(bytes).err(),
-                None => Some(ChannelError::Empty),
+            let error = if pooled {
+                None
+            } else {
+                match p.cells.get(fresh_dense) {
+                    Some(cell) => cell.lock().unwrap().put(bytes).err(),
+                    None => Some(ChannelError::Empty),
+                }
             };
             p.devgeo = Some(devgeo);
             error

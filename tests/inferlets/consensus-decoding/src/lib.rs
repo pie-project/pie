@@ -14,9 +14,6 @@ use serde::Deserialize;
 use std::time::Instant;
 
 const PAGE_T: u32 = 16; // tokens per pool page
-// Qwen3-0.6B
-const TEMPERATURE: f32 = 0.6;
-const TOP_P: f32 = 0.95;
 
 #[derive(Deserialize)]
 struct Input {
@@ -26,6 +23,12 @@ struct Input {
     num_candidates: usize,
     #[serde(default = "default_max_tokens")]
     max_tokens: usize,
+    /// Sampling temperature. Self-consistency needs genuinely diverse samples;
+    /// too low a value collapses every candidate onto the same greedy chain.
+    #[serde(default = "default_temperature")]
+    temperature: f32,
+    #[serde(default = "default_top_p")]
+    top_p: f32,
 }
 
 fn default_question() -> String {
@@ -36,6 +39,12 @@ fn default_num_candidates() -> usize {
 }
 fn default_max_tokens() -> usize {
     1024
+}
+fn default_temperature() -> f32 {
+    0.9
+}
+fn default_top_p() -> f32 {
+    0.95
 }
 
 const SYSTEM_PROMPT: &str = "\
@@ -60,6 +69,8 @@ fn decode_text(tokens: &[u32]) -> Result<String> {
 async fn main(input: Input) -> Result<String> {
     let question = input.question;
     let num_candidates = input.num_candidates;
+    let temperature = input.temperature.max(1e-4);
+    let top_p = input.top_p.clamp(0.0, 1.0);
     let max_tokens = input.max_tokens;
     if num_candidates == 0 {
         return Err("num_candidates must be at least 1".into());
@@ -113,7 +124,13 @@ async fn main(input: Input) -> Result<String> {
         let w_off_p = Channel::from(w_off_pv).named("w_off_p");
         let klen_p = Channel::from(vec![n; 1]).named("klen_p");
         let pages_p = Channel::from(pool_ids.clone()).named("pages_p");
-        let page_indptr_p = Channel::from_shaped([2], vec![0u32, pool_pages]).named("pidx_p");
+        // The page CSR is the wire's source of truth for kv_len: the driver derives
+        // `last_page_len = ((kv_len-1) % PAGE_T) + 1` and reads back a span of
+        // `(page_count-1)*PAGE_T + last_page_len` cells. A pool-wide constant count
+        // inflates that span past the live prefix and attends uninitialized KV, so
+        // the count must track `kv_len` exactly.
+        let page_indptr_p =
+            Channel::from_shaped([2], vec![0u32, n.div_ceil(PAGE_T)]).named("pidx_p");
 
         // Causal prefill mask [N, POOL]: query row i attends KV cols j <= i.
         let mask_pv: Vec<bool> = (0..n)
@@ -121,7 +138,7 @@ async fn main(input: Input) -> Result<String> {
             .collect();
         let mask_p = Channel::from_shaped([n, pool], mask_pv).named("mask_p");
         let rng_p = Channel::from(vec![0x51ed_u32, 0]).named("rng_p");
-        let g0s_ch = Channel::new([b], dtype::i32).named("g0s");
+        let g0s_ch = Channel::new([1], dtype::i32).named("g0s");
 
         let fwd_p = ForwardPass::new();
         fwd_p.embed(&toks_p, &embed_indptr_p)?;
@@ -139,16 +156,26 @@ async fn main(input: Input) -> Result<String> {
         )?;
         fwd_p.epilogue(move || {
             let r = rng_p.take();
-            // Shared nucleus keep-mask over the read-out row, then B independent
-            // Gumbel draws → B distinct first tokens.
-            let logits = intrinsics::logits(); // [vocab] (single read-out row)
-            let scaled = div(&logits, TEMPERATURE.max(1e-4));
+            // Nucleus sample the single read-out row. The B candidates all start
+            // from this same token; divergence comes from the decode loop, whose
+            // logits really are [B, vocab] and therefore carry B independent
+            // Gumbel draws.
+            //
+            // Do NOT `broadcast` the read-out row to [B, vocab] here. The
+            // compiler still matches `LibraryOp::NucleusSample` on the widened
+            // form, but the driver's library fast path assumes its logits input
+            // is the logits intrinsic (behind at most a reshape) and elides the
+            // scratch for it (`fused_runtime.cuh` nucleus prep). A `broadcast`
+            // producer still executes and writes a full [B, vocab] tensor into
+            // that elided 4-byte slot, corrupting the sampler's scratch — the
+            // failure is silent and yields plausible-looking junk tokens.
+            let logits = intrinsics::logits(); // [1, vocab] (single read-out row)
+            let scaled = div(&reshape(&logits, [1, vocab]), temperature);
             let probs = softmax(&scaled);
-            let keep = pivot_threshold(&probs, cummass_le(TOP_P));
-            let masked = mask_apply(&scaled, &keep); // [vocab]
-            let wide = broadcast(reshape(&masked, [1, vocab]), [b, vocab]); // [B, vocab]
-            let g = gumbel(&r, [b, vocab]); // independent per-lane noise
-            let toks0 = reduce_argmax(add(&wide, &g)); // [B] i32
+            let keep = pivot_threshold(&probs, cummass_le(top_p));
+            let masked = mask_apply(&scaled, &keep); // [1, vocab]
+            let g = gumbel(&r, [1, vocab]);
+            let toks0 = reduce_argmax(add(&masked, &g)); // [1] i32
             let r_next = add(&r, iota(2)); // advance ctr: [key, ctr+1]
             g0s_ch.put(&toks0);
             rng_p.put(&r_next);
@@ -167,6 +194,9 @@ async fn main(input: Input) -> Result<String> {
             .get::<i32>()
             .await
             .map_err(|e| format!("g0s take: {e}"))?;
+        // All B candidates share the prefill's token; they diverge in the decode
+        // loop, where each lane draws its own Gumbel noise.
+        let g0s: Vec<i32> = vec![g0s[0]; num_candidates];
 
         let mut done = vec![false; num_candidates];
         for (c, &t) in g0s.iter().enumerate().take(num_candidates) {
@@ -198,9 +228,14 @@ async fn main(input: Input) -> Result<String> {
             .flat_map(|c| (0..pool).map(move |j| j < n || j == n + c))
             .collect();
         let mask = Channel::from_shaped([b, pool], seed_mask).named("mask");
-        let tiled: Vec<u32> = (0..b).flat_map(|_| pool_ids.iter().copied()).collect();
+        // Lane stride is the LIVE page count, not the pool size; `pages` keeps its
+        // [B*POOL_PAGES] capacity but only the first `b * pc0` entries are read.
+        let pc0 = (n + b).div_ceil(PAGE_T);
+        let tiled: Vec<u32> = (0..b * pool_pages)
+            .map(|i| pool_ids[(i % pc0) as usize])
+            .collect();
         let pages = Channel::from(tiled).named("pages"); // [B*POOL_PAGES]
-        let pidx_v: Vec<u32> = (0..=b).map(|c| c * pool_pages).collect();
+        let pidx_v: Vec<u32> = (0..=b).map(|c| c * pc0).collect();
         let page_indptr = Channel::from_shaped([b + 1], pidx_v).named("page_indptr");
         let pool_ids_ch = Channel::from(pool_ids.clone()).named("pool_ids");
         let out = Channel::new([b], dtype::i32)
@@ -232,9 +267,9 @@ async fn main(input: Input) -> Result<String> {
             // Per-lane top-p + temperature sample over [B, vocab] logits
             // (row-wise nucleus, independent Gumbel noise per lane).
             let logits = intrinsics::logits(); // [B, vocab]
-            let scaled = div(&logits, TEMPERATURE.max(1e-4));
+            let scaled = div(&logits, temperature);
             let probs = softmax(&scaled);
-            let keep = pivot_threshold(&probs, cummass_le(TOP_P));
+            let keep = pivot_threshold(&probs, cummass_le(top_p));
             let masked = mask_apply(&scaled, &keep);
             let g = gumbel(&r, [b, vocab]);
             let toks = reduce_argmax(add(&masked, &g)); // [B] i32
@@ -256,16 +291,23 @@ async fn main(input: Input) -> Result<String> {
             let filled = add(&base, b); // [1] span after the next fire's appends
             let klen_n = broadcast(reshape(&filled, [1]), [b]);
             let pos_n = add(pos.take(), 1u32);
-            let pages_n = reshape(
-                broadcast(reshape(&pids, [1, pool_pages]), [b, pool_pages]),
-                [b * pool_pages],
+            let page_count = div(add(&filled, PAGE_T - 1), PAGE_T);
+            let pages_n = gather(
+                &pids,
+                rem(iota(b * pool_pages), broadcast(&page_count, [b * pool_pages])),
             );
-            let pidx_n = mul(iota(b + 1), pool_pages);
+            let pidx_n = mul(iota(b + 1), broadcast(&page_count, [b + 1]));
 
+            // Device-resolved geometry is loop-carried: the host never drains
+            // these rings, so the graph has to take before it puts or the
+            // readiness check sees a full ring and refuses to commit the pass.
+            tok_in.take();
             tok_in.put(&toks);
             out.put(&toks);
             mask.put(&new_mask);
+            w_slot.take();
             w_slot.put(&w_slot_n);
+            w_off.take();
             w_off.put(&w_off_n);
             klen.take();
             klen.put(&klen_n);

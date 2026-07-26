@@ -208,6 +208,20 @@ __device__ __forceinline__ float grouped_direct_bf16_load(
         static_cast<std::uint32_t>(source[column]) << 16);
 }
 
+// The `sampled_rows` bound exists to keep direct bf16 reads inside the lane's
+// read-out rows. When the logits come from the value table the tensor is
+// materialized at `[launch.rows, launch.len]`, so every row the launch geometry
+// declares is in bounds — and bounding those by `sampled_rows` silently leaves
+// the surplus outputs unwritten instead of sampling them.
+__device__ __forceinline__ bool grouped_nucleus_row_out_of_range(
+    const PtirLaneRecord* lanes,
+    std::uint32_t lane,
+    std::uint32_t row,
+    const GroupedNucleusLaunch& launch) {
+    if (launch.logits_kind == 0) return false;
+    return row >= lanes[lane].sampled_rows;
+}
+
 __device__ __forceinline__ float grouped_nucleus_logit_scale(
     const std::uint64_t* values,
     std::uint32_t value_count,
@@ -229,7 +243,8 @@ static __global__ void k_grouped_stage_readiness(
     const std::uint8_t* full,
     const std::uint32_t* head,
     const std::uint32_t* tail,
-    const std::uint32_t* cap1) {
+    const std::uint32_t* cap1,
+    std::uint32_t diagnose) {
     const std::uint32_t lane =
         blockIdx.x * static_cast<std::uint32_t>(blockDim.x) + threadIdx.x;
     if (lane >= header->lane_count) return;
@@ -237,12 +252,26 @@ static __global__ void k_grouped_stage_readiness(
     bool ready = true;
     for (std::uint32_t index = 0; index < descriptor.full_count; ++index) {
         const std::uint32_t slot = slots[descriptor.full_offset + index];
-        ready = ready &&
+        const bool slot_ready =
             full[static_cast<std::size_t>(slot) * kMaxRing + head[slot]] != 0;
+        if (!slot_ready && diagnose != 0) {
+            printf(
+                "[pie-driver-cuda] stage-readiness reject: lane=%u slot=%u "
+                "reason=empty-cell head=%u\n",
+                lane, slot, head[slot]);
+        }
+        ready = ready && slot_ready;
     }
     for (std::uint32_t index = 0; index < descriptor.empty_count; ++index) {
         const std::uint32_t slot = slots[descriptor.empty_offset + index];
-        ready = ready && ((tail[slot] + 1) % cap1[slot]) != head[slot];
+        const bool slot_ready = ((tail[slot] + 1) % cap1[slot]) != head[slot];
+        if (!slot_ready && diagnose != 0) {
+            printf(
+                "[pie-driver-cuda] stage-readiness reject: lane=%u slot=%u "
+                "reason=full-ring head=%u tail=%u cap1=%u\n",
+                lane, slot, head[slot], tail[slot], cap1[slot]);
+        }
+        ready = ready && slot_ready;
     }
     if (!ready) atomicAnd(grouped_commit(lanes, lane), 0u);
 }
@@ -271,6 +300,26 @@ static __global__ void k_materialize_bf16_rows(
     }
 }
 
+// Value accessor for `t0_block_topk_fast`: a grouped top_k row is either a
+// plain float span or a BF16 read-out that has to be decoded per element.
+struct GroupedTopkValue {
+    const float* source;
+    const PtirLaneRecord* lanes;
+    const std::uint64_t* mtp_rows;
+    const std::uint32_t* mtp_offsets;
+    std::uint32_t lane;
+    std::uint64_t row_base;
+    std::uint32_t vocab;
+    std::uint8_t input_kind;
+    __device__ __forceinline__ float operator()(std::uint32_t i) const {
+        return input_kind == 0
+            ? source[i]
+            : grouped_direct_bf16_load(
+                  lanes, mtp_rows, mtp_offsets, lane, row_base + i, vocab,
+                  input_kind);
+    }
+};
+
 static __global__ void k_grouped_topk(
     const PtirLaneTableHeader* header,
     const PtirLaneRecord* lanes,
@@ -296,6 +345,10 @@ static __global__ void k_grouped_topk(
     __shared__ std::uint32_t previous_index;
     __shared__ std::uint8_t previous_nan;
     __shared__ std::uint8_t previous_valid;
+    __shared__ std::uint64_t shared_pair[kTopkFastMaxK];
+    __shared__ std::uint32_t shared_hist[256];
+    __shared__ std::uint32_t shared_state[2];
+    __shared__ std::uint32_t shared_count;
     const std::uint32_t grouped_row = blockIdx.x;
     const std::uint32_t lane = grouped_row / row_shape.max_rows;
     const std::uint32_t row = grouped_row % row_shape.max_rows;
@@ -325,6 +378,17 @@ static __global__ void k_grouped_topk(
         grouped_value<std::uint32_t>(
             values, value_count, lane, output_indices) +
         static_cast<std::uint64_t>(row) * k;
+    // Same total order as the selection loop below, but O(8*len + k*log^2 k)
+    // instead of O(k*len). This is the kernel `top_k`-based truncation samplers
+    // actually dispatch to, so it is where the cost cliff lived.
+    const GroupedTopkValue value_of{
+        source, lanes, mtp_rows, mtp_offsets, lane,
+        static_cast<std::uint64_t>(row) * len, vocab, input_kind};
+    if (t0_block_topk_fast(value_of, len, k, output_value, output_index,
+                           shared_pair, shared_hist, shared_state,
+                           &shared_count)) {
+        return;
+    }
     if (threadIdx.x == 0) {
         previous_value = 0.0f;
         previous_index = 0;
@@ -536,7 +600,7 @@ static __global__ void k_grouped_nucleus_max_chunks(
     const std::uint32_t lane = segment / launch.rows;
     const std::uint32_t row = segment % launch.rows;
     if (lane >= header->lane_count ||
-        row >= lanes[lane].sampled_rows ||
+        grouped_nucleus_row_out_of_range(lanes, lane, row, launch) ||
         *grouped_commit(lanes, lane) == 0) {
         return;
     }
@@ -586,7 +650,7 @@ static __global__ void k_grouped_nucleus_weight_chunks(
     const std::uint32_t lane = segment / launch.rows;
     const std::uint32_t row = segment % launch.rows;
     if (lane >= header->lane_count ||
-        row >= lanes[lane].sampled_rows ||
+        grouped_nucleus_row_out_of_range(lanes, lane, row, launch) ||
         *grouped_commit(lanes, lane) == 0) {
         return;
     }
@@ -658,7 +722,7 @@ static __global__ void k_grouped_nucleus_inverse_sample(
     const std::uint32_t lane = segment / launch.rows;
     const std::uint32_t row = segment % launch.rows;
     if (lane >= header->lane_count ||
-        row >= lanes[lane].sampled_rows ||
+        grouped_nucleus_row_out_of_range(lanes, lane, row, launch) ||
         *grouped_commit(lanes, lane) == 0) {
         return;
     }
@@ -855,7 +919,7 @@ static __global__ void k_grouped_nucleus_sample(
     const std::uint32_t lane = grouped_row / launch.rows;
     const std::uint32_t row = grouped_row % launch.rows;
     if (lane >= header->lane_count ||
-        row >= lanes[lane].sampled_rows ||
+        grouped_nucleus_row_out_of_range(lanes, lane, row, launch) ||
         *grouped_commit(lanes, lane) == 0) {
         return;
     }

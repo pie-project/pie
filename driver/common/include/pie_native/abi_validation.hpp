@@ -253,7 +253,7 @@ inline int validate_instance_desc(const PieInstanceDesc* desc,
     if (desc->reserved0 != 0 ||
         desc->reserved1 != 0 ||
         desc->geometry_class >
-            PIE_GEOMETRY_CLASS_DECODE_ENVELOPE ||
+            PIE_GEOMETRY_CLASS_DEVICE_GEOMETRY ||
         binding == nullptr) {
         return PIE_STATUS_INVALID_ARGUMENT;
     }

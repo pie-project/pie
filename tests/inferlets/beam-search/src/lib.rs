@@ -14,7 +14,6 @@ use inferlet::ptir::prelude::*;
 use inferlet::{Result, model as wit_model};
 use serde::Deserialize;
 
-const B: u32 = 2; // beams
 const PAGE_T: u32 = 16; // tokens per pool page
 const POOL_PAGES: u32 = 8; // shared pool pages (over-allocated; compaction bounds this)
 const POOL: u32 = POOL_PAGES * PAGE_T; // flat pool token positions
@@ -25,19 +24,34 @@ const BOS: i32 = 1;
 struct Input {
     #[serde(default = "default_max_tokens")]
     max_tokens: usize,
+    /// Beam width. `1` degenerates to greedy decoding (the beam identity).
+    #[serde(default = "default_beams")]
+    beams: u32,
 }
 
 fn default_max_tokens() -> usize {
     16
 }
 
+fn default_beams() -> u32 {
+    2
+}
+
+/// Per-step disagreements between the beam pick and the raw-logit argmax.
+fn count_greedy_mismatches(picked: &[i32], greedy: &[i32], beams: u32) -> usize {
+    (0..beams as usize)
+        .filter(|&lane| picked.get(lane) != greedy.get(lane))
+        .count()
+}
+
 fn advance_hypotheses(
     hypotheses: &[Vec<u32>],
     picked: &[i32],
     parents: &[u32],
+    beams: u32,
 ) -> Result<Vec<Vec<u32>>> {
-    let mut next = Vec::with_capacity(B as usize);
-    for lane in 0..B as usize {
+    let mut next = Vec::with_capacity(beams as usize);
+    for lane in 0..beams as usize {
         let parent = *parents
             .get(lane)
             .ok_or_else(|| format!("missing parent for beam {lane}"))?
@@ -58,6 +72,17 @@ fn advance_hypotheses(
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
     let max_steps = input.max_tokens;
+    let b = input.beams;
+    if b == 0 {
+        return Err("beams must be at least 1".into());
+    }
+    if b > POOL - 1 {
+        return Err(format!("beams exceeds the fixed pool ({} positions)", POOL - 1));
+    }
+    // Bind the width once so the epilogue closure captures a plain `u32`
+    // exactly where the old `const B` was substituted.
+    #[allow(non_snake_case)]
+    let B = b;
     let capacity = ((POOL - 1) / B) as usize;
     if max_steps > capacity {
         return Err(format!(
@@ -78,7 +103,12 @@ async fn main(input: Input) -> Result<String> {
         .reserve(POOL_PAGES)
         .map_err(|e| format!("ws.reserve pool: {e}"))?;
     let pool_ids = pool.ids().to_vec();
-    let tiled: Vec<u32> = (0..B).flat_map(|_| pool_ids.iter().copied()).collect(); // [B*POOL_PAGES]
+    // Seeded at klen = 1 ⇒ one live page per lane, so lane b's single page sits at
+    // flat slot b. `pages` keeps its [B*POOL_PAGES] capacity; only the first
+    // `B * page_count` entries are read.
+    let tiled: Vec<u32> = (0..B * POOL_PAGES)
+        .map(|i| pool_ids[(i % 1) as usize])
+        .collect(); // [B*POOL_PAGES]
     let pool0 = pool_ids[0];
 
     // Shared BOS prompt at pool position 0: both beams attend it (mask), and the
@@ -107,7 +137,13 @@ async fn main(input: Input) -> Result<String> {
     // kv_page_indptr. Feeding page_indptr through a channel (re-put each fire with
     // the same constant) keeps every descriptor port channel-bound (the
     // device-geometry-fire wire-form).
-    let pidx_const: Vec<u32> = (0..=B).map(|b| b * POOL_PAGES).collect();
+    // The page CSR is the wire's source of truth for kv_len: the driver derives
+    // `last_page_len = ((kv_len-1) % PAGE_T) + 1` and then reads back a span of
+    // `(page_count-1)*PAGE_T + last_page_len` cells per lane. Declaring all
+    // POOL_PAGES here would inflate that span past the live prefix and attend
+    // uninitialized KV, so the per-lane page count must track `klen` exactly and
+    // `pages` must be tiled at THAT stride, not at POOL_PAGES.
+    let pidx_const: Vec<u32> = (0..=B).map(|b| b).collect();
     let page_indptr = Channel::from_shaped([B + 1], pidx_const.clone()).named("page_indptr");
     let lanes_b = Channel::from((0u32..=B).collect::<Vec<_>>()).named("embed_indptr");
 
@@ -121,6 +157,17 @@ async fn main(input: Input) -> Result<String> {
     let out_scr = Channel::new([B], dtype::f32)
         .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
         .named("out_scr");
+    // Independent per-lane greedy argmax over the RAW logits, published beside
+    // the beam pick. At `beams == 1` the beam identity says the two must agree
+    // on every step: top-1 over the flattened [1*V] candidate block is
+    // `argmax(log_softmax(logits) + score)`, and both `log_softmax` and adding
+    // a per-row constant are monotone, so it reduces to `argmax(logits)`. The
+    // comparison therefore exercises log_softmax, the score accumulator, the
+    // [B*V] flatten, `top_k`, and the `idx / v` / `idx % v` decomposition
+    // against an operator that shares none of that machinery.
+    let out_greedy = Channel::new([B], dtype::i32)
+        .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+        .named("out_greedy");
 
     let pipeline = Pipeline::new();
     let mut rs_working_sets = if wit_model::rs_state_size() > 0 {
@@ -149,9 +196,13 @@ async fn main(input: Input) -> Result<String> {
     )?;
     fwd.epilogue(move || {
         // 1. top-B over the flattened [B,V] cand block.
+        // `intrinsics::logits()` squeezes to rank-1 `[v]` when the fire has a
+        // single read-out row, so a width-1 beam has to be reshaped back to
+        // `[B, v]` before it can meet the `[B, 1]`-broadcast score column.
+        let logits = reshape(intrinsics::logits(), [B, v]);
         let cand = add(
             broadcast(reshape(scores.take(), [B, 1]), [B, v]),
-            log_softmax(intrinsics::logits()),
+            log_softmax(&logits),
         );
         let (s, i) = top_k(reshape(cand, [B * v]), B);
         let parent = div(&i, v);
@@ -176,7 +227,12 @@ async fn main(input: Input) -> Result<String> {
         let logical_slot = div(&wpos, PAGE_T); // [B] index into the pool
         let w_slot_v = gather(&pids, &logical_slot);
         let w_off_v = rem(&wpos, PAGE_T);
+        // Device-resolved geometry is loop-carried: the host never drains
+        // these rings, so the graph has to take before it puts or the
+        // readiness check sees a full ring and refuses to commit the pass.
+        w_slot.take();
         w_slot.put(&w_slot_v);
+        w_off.take();
         w_off.put(&w_off_v);
 
         // KV span after this step's appends (the mask restricts attention).
@@ -187,26 +243,28 @@ async fn main(input: Input) -> Result<String> {
         pos.put(add(pos.take(), 1u32));
         fill.put(&filled);
         scores.put(&s);
+        toks.take();
         toks.put(&tok_i);
         // Re-emit the fixed Pages port each fire: the pool ids tiled B
         // times (every beam references all POOL_PAGES pool pages; the mask does
         // the per-beam selection). Built in-graph from the host-fed pids.
-        let pages_ig = reshape(
-            broadcast(reshape(&pids, [1, POOL_PAGES]), [B, POOL_PAGES]),
-            [B * POOL_PAGES],
+        // Live page count for the NEXT fire, from that fire's klen.
+        let page_count = div(add(&filled, PAGE_T - 1), PAGE_T);
+        let pages_ig = gather(
+            &pids,
+            rem(iota(B * POOL_PAGES), broadcast(&page_count, [B * POOL_PAGES])),
         );
         pages.take();
         pages.put(&pages_ig);
         // Re-emit the constant page_indptr each fire (channel-bound; peeked ports
         // still want a fresh value each pass). [0, POOL_PAGES, 2*POOL_PAGES].
         page_indptr.take();
-        page_indptr.put(Tensor::constant(
-            (0..=B).map(|b| b * POOL_PAGES).collect::<Vec<_>>(),
-        ));
+        page_indptr.put(mul(iota(B + 1), broadcast(&page_count, [B + 1])));
 
         out.put(&tok_i);
         out_par.put(&parent);
         out_scr.put(&s);
+        out_greedy.put(&reshape(cast(reduce_argmax(&logits), DType::I32), [B]));
         pool_ids_ch.put(&pids);
     });
 
@@ -214,6 +272,7 @@ async fn main(input: Input) -> Result<String> {
     // hypothesis from the parent permutation emitted by the device.
     let mut hypotheses = vec![Vec::<u32>::new(); B as usize];
     let mut final_scores = vec![f32::NEG_INFINITY; B as usize];
+    let mut greedy_mismatches = 0usize;
     if rs_working_sets.is_empty() {
         let mut submitted = 0usize;
         let mut in_flight = 0usize;
@@ -239,8 +298,14 @@ async fn main(input: Input) -> Result<String> {
                 .get::<f32>()
                 .await
                 .map_err(|e| format!("out_scr.take @{step}: {e}"))?;
+            let greedy = out_greedy
+                .take()
+                .get::<i32>()
+                .await
+                .map_err(|e| format!("out_greedy.take @{step}: {e}"))?;
+            greedy_mismatches += count_greedy_mismatches(&picked, &greedy, B);
             in_flight -= 1;
-            hypotheses = advance_hypotheses(&hypotheses, &picked, &parents)?;
+            hypotheses = advance_hypotheses(&hypotheses, &picked, &parents, B)?;
             if submitted < max_steps {
                 fwd.submit(&pipeline)
                     .map_err(|e| format!("submit @{submitted}: {e}"))?;
@@ -268,6 +333,12 @@ async fn main(input: Input) -> Result<String> {
                 .get::<f32>()
                 .await
                 .map_err(|e| format!("out_scr.take @{step}: {e}"))?;
+            let greedy = out_greedy
+                .take()
+                .get::<i32>()
+                .await
+                .map_err(|e| format!("out_greedy.take @{step}: {e}"))?;
+            greedy_mismatches += count_greedy_mismatches(&picked, &greedy, B);
             let mut next_rs = Vec::with_capacity(B as usize);
             for lane in 0..B as usize {
                 let parent = *parents
@@ -283,7 +354,7 @@ async fn main(input: Input) -> Result<String> {
                         .map_err(|e| format!("rs fork beam {lane} from parent {parent}: {e}"))?,
                 );
             }
-            hypotheses = advance_hypotheses(&hypotheses, &picked, &parents)?;
+            hypotheses = advance_hypotheses(&hypotheses, &picked, &parents, B)?;
             fwd.rs_working_sets(&next_rs)
                 .map_err(|e| format!("rebind recurrent states @{step}: {e}"))?;
             rs_working_sets = next_rs;
@@ -297,9 +368,21 @@ async fn main(input: Input) -> Result<String> {
         .max_by(|(_, a), (_, b)| a.total_cmp(b))
         .map(|(index, _)| index)
         .ok_or("beam search produced no hypotheses")?;
+    // The beam identity is only an identity at width 1; at B > 1 the top-B
+    // block legitimately picks non-argmax continuations for the lower lanes.
+    if B == 1 && greedy_mismatches != 0 {
+        return Err(format!(
+            "beam identity violated: width-1 beam search disagreed with greedy \
+             argmax on {greedy_mismatches} of {max_steps} steps"
+        ));
+    }
     eprintln!(
         "beam-search: width={B} steps={max_steps} best_score={:.4}",
         final_scores[best_lane]
     );
-    wit_model::decode(&hypotheses[best_lane])
+    let text = wit_model::decode(&hypotheses[best_lane])?;
+    Ok(format!(
+        "{text}\n[beam] width={B} steps={max_steps} best_score={:.4} greedy_mismatches={greedy_mismatches}",
+        final_scores[best_lane]
+    ))
 }

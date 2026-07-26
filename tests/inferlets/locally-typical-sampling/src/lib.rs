@@ -20,17 +20,27 @@
 //! top_k(-score, k_max) -> gather(probs) -> cumsum -> lt(mass) -> scatter_set
 //! ```
 //!
-//! `k_max` is a *bound*, not a detail. The tier-0 `k_topk_rows` kernel is an
-//! incremental-threshold selection that rescans the row once per pick, so it
-//! costs `O(k · vocab)`. A full sort (`k = vocab`) is `O(vocab²)` — about
-//! 6.9e10 operations at this model's 262144-token vocabulary, which stalls the
-//! driver. Capping the candidate set keeps the cost at `O(k_max · vocab)` and
-//! matches what production samplers do anyway.
+//! `k_max` is a *bound*, not a detail. `top_k` is a schedule barrier, so a
+//! ranking always costs a region break. The kernel itself is a radix select of
+//! the cut followed by a bitonic sort of the `k` survivors, so its cost is
+//! `O(vocab + k·log²k)` — effectively flat in `k_max`. (It was not always: the
+//! kernel used to rescan the row once per pick, `O(k · vocab)`, which made
+//! `k_max` a performance knob with teeth. See the runtime-cost section of
+//! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.)
 //!
-//! The cap is a real semantic bound: at most `k_max` tokens can be retained. If
-//! the `k_max` most typical tokens do not carry `mass` probability, the set is
-//! truncated there. `mass_reached` in the output reports whether that happened,
-//! so the approximation is observable rather than silent.
+//! The cap remains a real semantic bound: at most `k_max` tokens can be
+//! retained. If the `k_max` most typical tokens do not carry `mass`
+//! probability, the set is truncated there. `mass_reached` in the output
+//! reports whether that happened, so the approximation is observable rather
+//! than silent.
+//!
+//! ## Source
+//!
+//! Meister et al., *Locally Typical Sampling* —
+//! <https://arxiv.org/abs/2202.00666> (§3, Eq. 6).
+//!
+//! Faithfulness: **Exact**. See
+//! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 use inferlet::ptir::prelude::*;
 use inferlet::{Result, model as wit_model};
@@ -104,8 +114,7 @@ fn typical_keep(logits: &Tensor, vocab: u32, k_max: u32, mass: f32) -> (Tensor, 
     let h = entropy_from_logprobs(&probs, &logprobs);
     // deviation = log p(x) + H, i.e. signed typicality.
     let deviation = add(&logprobs, broadcast(&h, [vocab]));
-    // |deviation| without an abs op: max(d, -d).
-    let score = max_elem(&deviation, neg(&deviation));
+    let score = abs(&deviation);
 
     // Ascending typicality == descending (-score), capped at k_max candidates.
     let (_sorted_score, order) = top_k(neg(&score), k_max);

@@ -177,68 +177,29 @@ async fn main(input: Input) -> Result<String> {
             token_out.put(&token);
         });
 
+        // The grammar mask for fire k+1 is only known once fire k's token has
+        // advanced the matcher, so this loop is inherently depth-1. Running
+        // ahead would reuse a stale mask and silently drop the constraint.
         let budget = input.max_tokens.saturating_sub(generated.len());
         let mut submitted = 0usize;
-        let mut supplied = 0usize;
-        let mut in_flight = 0usize;
 
-        grammar_mask.put(unpack_mask(&constraint.mask(), vocab));
-        supplied += 1;
-        decode
-            .submit(&pipeline)
-            .map_err(|e| format!("JSON-schema decode: {e}"))?;
-        submitted += 1;
-        in_flight += 1;
-        while in_flight < DEFAULT_RUNAHEAD_DEPTH && submitted < budget {
+        while submitted < budget {
+            grammar_mask.put(unpack_mask(&constraint.mask(), vocab));
             decode
                 .submit(&pipeline)
                 .map_err(|e| format!("JSON-schema decode: {e}"))?;
             submitted += 1;
-            in_flight += 1;
-        }
-        // Budget spent inside the burst: the last submit ends the stream —
-        // finish() right after it (F7).
-
-        let mut done = false;
-        while in_flight > 0 {
             let token = token_out
                 .take()
                 .get::<i32>()
                 .await
                 .map_err(|e| format!("read constrained token: {e}"))?[0]
                 as u32;
-            in_flight -= 1;
             generated.push(token);
             constraint.advance(&[token]);
-
-            done = constraint.is_terminated() || generated.len() == input.max_tokens;
-            if done {
+            if constraint.is_terminated() || generated.len() == input.max_tokens {
                 break;
             }
-            if supplied < submitted {
-                grammar_mask.put(unpack_mask(&constraint.mask(), vocab));
-                supplied += 1;
-            }
-            if submitted < budget {
-                decode
-                    .submit(&pipeline)
-                    .map_err(|e| format!("JSON-schema decode: {e}"))?;
-                submitted += 1;
-                in_flight += 1;
-            }
-        }
-
-        while done && in_flight > 0 {
-            if supplied < submitted {
-                grammar_mask.put(vec![true; vocab as usize]);
-                supplied += 1;
-            }
-            token_out
-                .take()
-                .get::<i32>()
-                .await
-                .map_err(|e| format!("drain constrained run-ahead token: {e}"))?;
-            in_flight -= 1;
         }
     }
     pipeline.close();

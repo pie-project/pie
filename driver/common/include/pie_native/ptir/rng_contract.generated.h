@@ -39,7 +39,10 @@ PTIR_RNG_INLINE float ptir_rng_hash_uniform(
       0x9E3779B97F4A7C15ULL * ((uint64_t)index + 1ULL);
   const uint32_t bits =
       (uint32_t)(ptir_rng_splitmix64(x) >> 40);
-  return ((float)bits + 0.5f) * (1.0f / 16777216.0f);
+  const float raw = ((float)bits + 0.5f) * (1.0f / 16777216.0f);
+  /* clamp off the one draw in 2^24 that rounds to exactly 1.0f, which would
+     make gumbel = -log(-log(u)) evaluate to +inf and hijack every argmax */
+  return raw < 0.99999994f ? raw : 0.99999994f;
 }
 
 #undef PTIR_RNG_INLINE
@@ -76,7 +79,10 @@ __device__ __forceinline__ float ptir_rng_hash_uniform(
       0x9E3779B97F4A7C15ULL * ((unsigned long long)index + 1ULL);
   const unsigned int bits =
       (unsigned int)(ptir_rng_splitmix64(x) >> 40);
-  return ((float)bits + 0.5f) * (1.0f / 16777216.0f);
+  const float raw = ((float)bits + 0.5f) * (1.0f / 16777216.0f);
+  /* clamp off the one draw in 2^24 that rounds to exactly 1.0f, which would
+     make gumbel = -log(-log(u)) evaluate to +inf and hijack every argmax */
+  return raw < 0.99999994f ? raw : 0.99999994f;
 }
 
 )PTIR_RNG_CUDA";

@@ -115,7 +115,12 @@ async fn main(input: Input) -> Result<String> {
         let w_off_p = Channel::from(w_off_pv).named("w_off_p");
         let klen_p = Channel::from(vec![n; 1]).named("klen_p");
         let pages_p = Channel::from(pool_ids.clone()).named("pages_p");
-        let page_indptr_p = Channel::from_shaped([2], vec![0u32, pool_pages]).named("pidx_p");
+        // The page CSR is the SOURCE OF TRUTH for kv_len on the wire: the driver
+        // derives `kv_len = (page_count-1)*PAGE_T + last_page_len`. Declaring the
+        // whole pool here would claim a kv length the pass does not have and
+        // silently corrupt attention — the count must track `kv_len` exactly.
+        let page_indptr_p =
+            Channel::from_shaped([2], vec![0u32, n.div_ceil(PAGE_T)]).named("pidx_p");
 
         // Causal prefill mask [N, POOL]: query row i attends KV cols j <= i.
         let mask_pv: Vec<bool> = (0..n)
@@ -187,7 +192,8 @@ async fn main(input: Input) -> Result<String> {
     let seed_mask: Vec<bool> = (0..pool).map(|j| j <= n).collect();
     let mask = Channel::from_shaped([1, pool], seed_mask).named("mask");
     let pages = Channel::from(pool_ids.clone()).named("pages");
-    let page_indptr = Channel::from_shaped([2], vec![0u32, pool_pages]).named("page_indptr");
+    let page_indptr =
+        Channel::from_shaped([2], vec![0u32, (n + 1).div_ceil(PAGE_T)]).named("page_indptr");
     let pool_ids_ch = Channel::from(pool_ids.clone()).named("pool_ids");
     let out = Channel::new([1], dtype::i32)
         .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
@@ -229,16 +235,25 @@ async fn main(input: Input) -> Result<String> {
         let klen_v = add(&base, 1u32);
         let next_free = add(&base, 1u32);
         let pages_v = reshape(&pids, [pool_pages]);
-        let pidx_v = mul(iota(2), pool_pages);
+        // Page count tracks the new kv length, never the pool size.
+        let page_count = div(add(&klen_v, PAGE_T - 1), PAGE_T);
+        let pidx_v = mul(iota(2), broadcast(&page_count, [2]));
 
+        // Device-resolved geometry is loop-carried: the host never drains
+        // these rings, so the graph has to take before it puts or the
+        // readiness check sees a full ring and refuses to commit the pass.
+        tok_in.take();
         tok_in.put(&tok);
         out.put(&tok);
         mask.take();
         mask.put(&new_mask);
+        w_slot.take();
         w_slot.put(&w_slot_v);
+        w_off.take();
         w_off.put(&w_off_v);
         klen.take();
         klen.put(&klen_v);
+        pos.take();
         pos.put(&base);
         fill.put(&next_free);
         pages.take();

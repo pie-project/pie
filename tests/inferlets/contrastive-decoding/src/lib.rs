@@ -120,7 +120,11 @@ async fn main(input: Input) -> Result<String> {
         Channel::from((0..n).map(|position| position % PAGE_T).collect::<Vec<_>>());
     let amateur_prefill_klen = Channel::from(vec![n]);
     let amateur_prefill_pages = Channel::from(amateur_ids.clone());
-    let amateur_prefill_indptr = Channel::from_shaped([2], vec![0u32, pool_pages]);
+    // The page CSR is the wire's source of truth for kv_len: the driver derives
+    // `kv_len = (page_count-1)*PAGE_T + last_page_len`. A pool-wide constant page
+    // count claims a kv length the pass does not have and silently corrupts
+    // attention, so the count must track `kv_len` exactly (as the expert pass does).
+    let amateur_prefill_indptr = Channel::from_shaped([2], vec![0u32, n.div_ceil(PAGE_T)]);
     let amateur_prefill_mask = Channel::from_shaped(
         [n, pool_len],
         (0..n)
@@ -149,18 +153,19 @@ async fn main(input: Input) -> Result<String> {
         amateur_prefill_out.put(intrinsics::logits());
     });
 
-    // The amateur and expert are genuinely concurrent streams, so each
-    // prefill keeps its own pipeline and closes after its output is taken.
-    let amateur_prefill_pipeline = Pipeline::new();
+    // ONE PIPELINE for the whole inferlet: a KV working set is scoped to the
+    // first pipeline that fires it, so the amateur's prefill and its decode
+    // must share a FIFO (and likewise the expert's). The two streams are
+    // sequential anyway — the expert prefill consumes the amateur's logits.
+    let pipeline = Pipeline::new();
     amateur_prefill
-        .submit(&amateur_prefill_pipeline)
+        .submit(&pipeline)
         .map_err(|error| format!("amateur prefill: {error}"))?;
     let first_amateur_logits = amateur_prefill_out
         .take()
         .get::<f32>()
         .await
         .map_err(|error| format!("read amateur prefill logits: {error}"))?;
-    amateur_prefill_pipeline.close();
 
     // The expert keeps the complete context and consumes the amateur logits in
     // its epilogue to perform the contrastive token selection on-device.
@@ -206,14 +211,11 @@ async fn main(input: Input) -> Result<String> {
         first_out.put(token);
     });
 
-    // Same shape as the amateur prefill: its own stream's only submission.
     expert_prefill_amateur.put(first_amateur_logits);
-    let expert_prefill_pipeline = Pipeline::new();
     expert_prefill
-        .submit(&expert_prefill_pipeline)
+        .submit(&pipeline)
         .map_err(|error| format!("expert prefill: {error}"))?;
     let first = read_expert_token(&first_out).await?;
-    expert_prefill_pipeline.close();
 
     let mut generated = Vec::with_capacity(input.max_tokens);
     if !stop_tokens.contains(&first) {
@@ -236,7 +238,8 @@ async fn main(input: Input) -> Result<String> {
             .collect::<Vec<_>>(),
     );
     let amateur_pages = Channel::from(amateur_ids.clone());
-    let amateur_page_indptr = Channel::from_shaped([2], vec![0u32, pool_pages]);
+    let amateur_page_indptr =
+        Channel::from_shaped([2], vec![0u32, (n + 1).div_ceil(PAGE_T)]);
     let amateur_ids_input = Channel::from(amateur_ids.clone()).named("amateur_pool_ids");
     let amateur_logits_out = Channel::new([vocab], dtype::f32)
         .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
@@ -283,7 +286,8 @@ async fn main(input: Input) -> Result<String> {
         amateur_pages.take();
         amateur_pages.put(reshape(&ids, [pool_pages]));
         amateur_page_indptr.take();
-        amateur_page_indptr.put(mul(iota(2), pool_pages));
+        let amateur_page_count = div(add(&next, PAGE_T - 1), PAGE_T);
+        amateur_page_indptr.put(mul(iota(2), broadcast(&amateur_page_count, [2])));
         amateur_ids_input.put(&ids);
     });
 
@@ -331,20 +335,15 @@ async fn main(input: Input) -> Result<String> {
         expert_token_out.put(&token);
     });
 
-    let pipeline = Pipeline::new();
+    // No run-ahead is available here: the expert's pick for step k needs the
+    // amateur's logits for step k, and the amateur's input for step k+1 is
+    // that very pick. Every submit is therefore preceded by the host put of
+    // the Writer channel the fire takes.
     let budget = input.max_tokens.saturating_sub(generated.len());
     amateur_token.put(vec![first as i32]);
     amateur_decode
         .submit(&pipeline)
         .map_err(|error| format!("amateur decode: {error}"))?;
-    expert_decode
-        .submit(&pipeline)
-        .map_err(|error| format!("expert decode: {error}"))?;
-    if budget > 1 {
-        amateur_decode
-            .submit(&pipeline)
-            .map_err(|error| format!("amateur decode: {error}"))?;
-    }
 
     for step in 0..budget {
         let amateur_logits = amateur_logits_out
@@ -354,32 +353,22 @@ async fn main(input: Input) -> Result<String> {
             .map_err(|error| format!("read amateur logits: {error}"))?;
 
         expert_amateur.put(amateur_logits);
+        expert_decode
+            .submit(&pipeline)
+            .map_err(|error| format!("expert decode: {error}"))?;
         let token = read_expert_token(&expert_token_out).await?;
         if stop_tokens.contains(&token) {
-            if step + 1 < budget {
-                amateur_token.put(vec![token as i32]);
-                amateur_logits_out
-                    .take()
-                    .get::<f32>()
-                    .await
-                    .map_err(|error| format!("drain amateur run-ahead logits: {error}"))?;
-            }
             break;
         }
         generated.push(token);
         if step + 1 < budget {
             amateur_token.put(vec![token as i32]);
-            expert_decode
+            amateur_decode
                 .submit(&pipeline)
-                .map_err(|error| format!("expert decode: {error}"))?;
-            if step + 2 < budget {
-                amateur_decode
-                    .submit(&pipeline)
-                    .map_err(|error| format!("amateur decode: {error}"))?;
-            }
+                .map_err(|error| format!("amateur decode: {error}"))?;
         }
     }
-    // Every fire, including the run-ahead amateur, was drained above.
+    // Every submitted fire was drained above.
     pipeline.close();
 
     wit_model::decode(&generated)

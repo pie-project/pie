@@ -624,3 +624,68 @@ fn test_bitmask_larger_vocab_size() {
         assert!(!bitmask::get_bit(&bm, i), "token {} should be rejected", i);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Fork
+// ---------------------------------------------------------------------------
+
+/// A fork must start where its parent is and then diverge freely. This is what
+/// lets beam search keep one grammar state per beam without replaying prefixes.
+#[test]
+fn test_fork_starts_at_parent_state_and_then_diverges() {
+    let ebnf = r#"root ::= "a" ("b" | "c")"#;
+    let mut parent = make_matcher(ebnf, "root", &["a", "b", "c"]);
+    assert!(parent.accept_token(0)); // "a"
+
+    let mut child = parent.fork();
+    assert_eq!(child.fill_next_token_mask(), parent.fill_next_token_mask());
+
+    // Each side takes a different branch; neither observes the other's move.
+    assert!(parent.accept_token(1)); // "b"
+    assert!(child.accept_token(2)); // "c"
+    assert!(parent.can_terminate());
+    assert!(child.can_terminate());
+
+    // The parent is not on the "c" branch and the child is not on "b".
+    let mut reparent = parent.fork();
+    assert!(!reparent.accept_token(2));
+    let mut rechild = child.fork();
+    assert!(!rechild.accept_token(1));
+}
+
+/// A fork carries its own rollback history, so undoing on one side cannot
+/// resurrect state on the other. This is the speculative-decoding reject path.
+#[test]
+fn test_fork_has_independent_rollback_history() {
+    let ebnf = r#"root ::= "abcd""#;
+    let mut parent = make_matcher(ebnf, "root", &["a", "b", "c", "d"]);
+    assert!(parent.accept_token(0)); // "a"
+
+    let mut draft = parent.fork();
+    assert!(draft.accept_token(1)); // "b"
+    assert!(draft.accept_token(2)); // "c"
+    assert_eq!(draft.rollback_capacity(), 3);
+    assert_eq!(parent.rollback_capacity(), 1);
+
+    // Verifier rejects the last two drafted tokens.
+    draft.rollback(2);
+    assert_eq!(draft.rollback_capacity(), 1);
+    assert_eq!(draft.fill_next_token_mask(), parent.fill_next_token_mask());
+
+    // The parent never saw them at all.
+    assert!(parent.accept_token(1)); // "b"
+    assert!(parent.accept_token(2)); // "c"
+    assert!(parent.accept_token(3)); // "d"
+    assert!(parent.can_terminate());
+}
+
+/// Forking a terminated matcher preserves termination rather than silently
+/// rewinding it.
+#[test]
+fn test_fork_preserves_termination() {
+    let mut m = make_matcher(r#"root ::= "ab""#, "root", &["a", "b"]);
+    assert!(m.accept_token(0));
+    assert!(m.accept_token(1));
+    assert!(m.can_terminate());
+    assert!(m.fork().can_terminate());
+}

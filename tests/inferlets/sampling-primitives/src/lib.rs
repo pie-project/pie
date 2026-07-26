@@ -1,12 +1,24 @@
 //! Reads the core sampling measurements from one forward pass.
 //!
 //! A single PTIR epilogue publishes the greedy token, raw logits, entropy,
-//! probabilities, and log-probabilities. The host then cross-checks that the
-//! independently useful outputs agree.
+//! probabilities, log-probabilities, and a top-p nucleus keep-mask. The host
+//! then cross-checks that the independently useful outputs agree.
+//!
+//! The keep-mask is deliberately published as a standalone value rather than
+//! consumed by a `select`/`gumbel`/`argmax` tail, so it CANNOT match
+//! `LibraryOp::NucleusSample` (compiler.rs:1305) and must be lowered through
+//! the generated `pivot_threshold` implementation. That path had no coverage:
+//! its `cummass_le` arm ran the M1 reference on thread 0 alone, an O(len^3)
+//! selection sort that never returned at a 151936-token vocabulary and hung
+//! the GPU. The host assertions below pin the exact nucleus contract
+//! (interp.rs `Predicate::CummassLe`) without depending on float summation
+//! order.
 
 use inferlet::ptir::prelude::*;
 use inferlet::{Result, model as wit_model};
 use serde::Deserialize;
+
+const TOP_P: f32 = 0.9;
 
 #[derive(Deserialize, Default)]
 struct Input {}
@@ -48,6 +60,7 @@ async fn main(_input: Input) -> Result<String> {
     let entropy_out = Channel::new([1], dtype::f32).named("entropy");
     let probs_out = Channel::new([vocab], dtype::f32).named("probabilities");
     let logprobs_out = Channel::new([vocab], dtype::f32).named("log_probabilities");
+    let keep_out = Channel::new([vocab], dtype::i32).named("nucleus_keep");
 
     let fwd = ForwardPass::new();
     fwd.embed(&toks, &embed_indptr)?;
@@ -69,7 +82,12 @@ async fn main(_input: Input) -> Result<String> {
         let probabilities = exp(&logprobs);
         let entropy = reshape(entropy_from_logprobs(&probabilities, &logprobs), [1]);
         let token = reshape(reduce_argmax(&logits), [1]);
+        // Generated-path `pivot_threshold`: no gumbel/argmax tail follows, so
+        // the library nucleus pattern cannot claim it.
+        let keep = pivot_threshold(&probabilities, cummass_le(TOP_P));
+        let keep_mask = reshape(cast(&keep, dtype::i32), [vocab]);
 
+        keep_out.put(&keep_mask);
         token_out.put(&token);
         logits_out.put(&logits);
         entropy_out.put(&entropy);
@@ -106,6 +124,11 @@ async fn main(_input: Input) -> Result<String> {
         .get::<f32>()
         .await
         .map_err(|e| format!("read log-probabilities: {e}"))?;
+    let keep_mask = keep_out
+        .take()
+        .get::<i32>()
+        .await
+        .map_err(|e| format!("read nucleus keep-mask: {e}"))?;
     pipeline.close();
 
     if token != argmax(&logits) || token != argmax(&probabilities) {
@@ -122,8 +145,56 @@ async fn main(_input: Input) -> Result<String> {
         return Err("probability and log-probability outputs disagree".into());
     }
 
+    let kept: Vec<usize> = keep_mask
+        .iter()
+        .enumerate()
+        .filter(|&(_, &m)| m != 0)
+        .map(|(index, _)| index)
+        .collect();
+    if keep_mask.len() != vocab as usize {
+        return Err("nucleus keep-mask has the wrong vocabulary dimension".into());
+    }
+    if kept.is_empty() {
+        return Err("nucleus keep-mask is empty".into());
+    }
+    if keep_mask.iter().any(|&m| m != 0 && m != 1) {
+        return Err("nucleus keep-mask is not boolean-valued".into());
+    }
+    // The nucleus is exactly a descending prefix, so the smallest kept
+    // probability must dominate every dropped one.
+    let min_kept = kept
+        .iter()
+        .map(|&i| probabilities[i])
+        .fold(f32::INFINITY, f32::min);
+    let max_dropped = (0..vocab as usize)
+        .filter(|i| keep_mask[*i] == 0)
+        .map(|i| probabilities[i])
+        .fold(f32::NEG_INFINITY, f32::max);
+    if max_dropped > min_kept {
+        return Err(format!(
+            "nucleus keep-mask is not a descending prefix: dropped {max_dropped:.9} > kept {min_kept:.9}"
+        ));
+    }
+    // `cummass_le` keeps the maximal prefix whose EXCLUSIVE mass stays below p
+    // (interp.rs), so the kept mass must reach p while the mass excluding the
+    // last-admitted element must not.
+    let kept_mass: f32 = kept.iter().map(|&i| probabilities[i]).sum();
+    let tolerance = 1e-4_f32;
+    if kept.len() < vocab as usize && kept_mass + tolerance < TOP_P {
+        return Err(format!(
+            "nucleus keep-mask retains only {kept_mass:.6} mass, below top_p={TOP_P}"
+        ));
+    }
+    if kept.len() > 1 && kept_mass - min_kept - tolerance > TOP_P {
+        return Err(format!(
+            "nucleus keep-mask is not minimal: {:.6} already exceeds top_p={TOP_P}",
+            kept_mass - min_kept
+        ));
+    }
+
     Ok(format!(
-        "token={token} probability={:.6} log_probability={token_logprob:.6} entropy={entropy:.6}",
-        probabilities[token]
+        "token={token} probability={:.6} log_probability={token_logprob:.6} entropy={entropy:.6} nucleus_kept={} nucleus_mass={kept_mass:.6}",
+        probabilities[token],
+        kept.len()
     ))
 }

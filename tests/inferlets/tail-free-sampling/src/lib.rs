@@ -18,12 +18,24 @@
 //!
 //! ## Why `k_max`
 //!
-//! The same bound as `locally-typical-sampling`. The tier-0 `k_topk_rows`
-//! kernel is an incremental-threshold selection that rescans the row once per
-//! pick, so it costs `O(k · vocab)` and a full sort over a 262144-token
-//! vocabulary stalls the driver. The curvature cut is therefore computed over
-//! the `k_max` most likely tokens — which is where essentially all of the
-//! curvature lives, since the tail is flat by construction.
+//! The same bound as `locally-typical-sampling`: `top_k` is a schedule barrier,
+//! so a ranking costs a region break regardless of `k`. The kernel itself is a
+//! radix select plus a bitonic sort of the survivors, so it is effectively flat
+//! in `k_max`. The curvature cut is computed over the `k_max` most likely
+//! tokens — which is where essentially all of the curvature lives, since the
+//! tail is flat by construction.
+//!
+//! ## Source
+//!
+//! Trenton Bricken, *Tail Free Sampling* (2019) —
+//! <https://github.com/TrentBrick/TailFreeSampling>. Reference implementations:
+//! llama.cpp `src/llama-sampler.cpp` and oobabooga/text-generation-webui
+//! `modules/sampler_hijack.py`.
+//!
+//! Faithfulness: **Exact (equivalent form)**. This keeps ranks `0..j`, the
+//! oobabooga convention, rather than the original gist's `0..j+1`; the gist
+//! also indexes unsorted logits with a sorted rank, which is a plain bug. See
+//! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 use inferlet::ptir::prelude::*;
 use inferlet::{Result, model as wit_model};

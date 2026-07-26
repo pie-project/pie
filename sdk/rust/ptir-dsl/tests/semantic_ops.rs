@@ -226,3 +226,84 @@ fn top_k_bytes_and_signature_have_no_beam_distinction() {
             .signature
     );
 }
+
+/// `Abs`/`Sign`/`Recip`/`SortDesc` were reachable in the IR, the validator, the
+/// interpreter and the encoder, but no DSL function emitted them, so no guest
+/// could ask for them. Pin the behaviour now that they are exposed.
+#[test]
+fn newly_exposed_unary_ops_evaluate() {
+    let input = Channel::seeded([4], dtype::f32);
+    let a = Channel::new([4], dtype::f32);
+    let s = Channel::new([4], dtype::f32);
+    let r = Channel::new([4], dtype::f32);
+    let mut builder = Builder::new(32_000, 16);
+    builder.stage(Stage::Epilogue, || {
+        let x = input.take().tensor();
+        a.put(abs(&x));
+        s.put(sign(&x));
+        r.put(recip(&x));
+    });
+    let traced = builder.build().unwrap();
+    let bound = bind(traced.container().clone(), ModelProfile::dummy()).unwrap();
+    let mut instance =
+        Instance::new(&bound, &[(0, Value::F32(vec![-2.0, -0.5, 0.5, 4.0]))]).unwrap();
+    assert!(
+        instance
+            .step(&bound, &PassInputs::default(), &mut NoKernels)
+            .unwrap()
+            .committed
+    );
+    assert_eq!(
+        instance.host_take(&bound, 1).unwrap(),
+        Value::F32(vec![2.0, 0.5, 0.5, 4.0])
+    );
+    assert_eq!(
+        instance.host_take(&bound, 2).unwrap(),
+        Value::F32(vec![-1.0, -1.0, 1.0, 1.0])
+    );
+    assert_eq!(
+        instance.host_take(&bound, 3).unwrap(),
+        Value::F32(vec![-0.5, -2.0, 2.0, 0.25])
+    );
+}
+
+#[test]
+fn sort_desc_returns_values_and_original_indices() {
+    let input = Channel::seeded([4], dtype::f32);
+    let values = Channel::new([4], dtype::f32);
+    let indices = Channel::new([4], dtype::u32);
+    let mut builder = Builder::new(32_000, 16);
+    builder.stage(Stage::Epilogue, || {
+        let (v, i) = sort_desc(input.take());
+        values.put(v);
+        indices.put(i);
+    });
+    let traced = builder.build().unwrap();
+    let bound = bind(traced.container().clone(), ModelProfile::dummy()).unwrap();
+    let mut instance =
+        Instance::new(&bound, &[(0, Value::F32(vec![1.0, 4.0, -2.0, 3.0]))]).unwrap();
+    assert!(
+        instance
+            .step(&bound, &PassInputs::default(), &mut NoKernels)
+            .unwrap()
+            .committed
+    );
+    assert_eq!(
+        instance.host_take(&bound, 1).unwrap(),
+        Value::F32(vec![4.0, 3.0, 1.0, -2.0])
+    );
+    assert_eq!(
+        instance.host_take(&bound, 2).unwrap(),
+        Value::U32(vec![1, 3, 0, 2])
+    );
+
+    // SortDesc is a hard fusion barrier: it always lands in its own region.
+    let plan = compile_stage(&bound, Stage::Epilogue).unwrap();
+    assert!(
+        plan.fused
+            .regions
+            .iter()
+            .any(|r| matches!(r.kind, RegionKind::Library(LibraryOp::Sort))),
+        "SortDesc should compile to its own library region"
+    );
+}

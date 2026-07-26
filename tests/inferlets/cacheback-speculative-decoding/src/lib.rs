@@ -5,10 +5,25 @@
 //! target-model forward verifies the whole draft and supplies a correction or
 //! bonus token. This reference implementation rebuilds the target KV for each
 //! verification window so rejected draft state can never leak into later steps.
+//!
+//! ## The correctness property, and how to test it
+//!
+//! Verification is greedy (`reduce_argmax`), and a draft token is kept only
+//! when it equals what the target model would itself have produced. So
+//! speculation here is a pure latency optimization: it must change *how many
+//! forward passes* run and nothing else about the output.
+//!
+//! `draft_length = 0` makes that testable without a second inferlet.
+//! `draft_from_cache` returns empty immediately, `verify` reduces to a
+//! one-row readout, and the loop degenerates to sequential greedy decoding —
+//! through the same prompt, the same stop tokens and the same `verify()`.
+//! Setting it to 0 versus 4 is therefore a controlled A/B in which the token
+//! sequence must come out **identical**. If the per-window KV rebuild ever
+//! stopped isolating rejected drafts, the two would diverge.
 
 use inferlet::ptir::prelude::*;
 use inferlet::{Result, chat, model as wit_model};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
 struct Input {
@@ -36,6 +51,27 @@ fn default_draft_length() -> usize {
 
 fn default_max_ngram() -> usize {
     8
+}
+
+#[derive(Serialize)]
+struct Output {
+    sampler: &'static str,
+    text: String,
+    /// Generated token ids. Reported so an equivalence test can compare the
+    /// exact sequence rather than its detokenization, since distinct token
+    /// sequences can render to the same string.
+    tokens: Vec<u32>,
+    prompt_tokens: usize,
+    count: usize,
+    draft_length: usize,
+    /// Target-model forward passes actually run. At `draft_length = 0` this
+    /// equals `count`, which is precisely what makes that setting a sequential
+    /// greedy control: same prompt, same stop tokens, same `verify()`, no
+    /// speculation. Below `count` means speculation is paying off.
+    verification_steps: usize,
+    drafted: usize,
+    accepted: usize,
+    acceptance_rate: f64,
 }
 
 fn draft_from_cache(tokens: &[u32], draft_length: usize, max_ngram: usize) -> Vec<u32> {
@@ -123,9 +159,20 @@ async fn verify(committed: &[u32], draft: &[u32], page_size: u32) -> Result<Vec<
 }
 
 #[inferlet::main]
-async fn main(input: Input) -> Result<String> {
+async fn main(input: Input) -> Result<Output> {
     if input.max_tokens == 0 {
-        return Ok(String::new());
+        return Ok(Output {
+            sampler: "cacheback-speculative",
+            text: String::new(),
+            tokens: Vec::new(),
+            prompt_tokens: 0,
+            count: 0,
+            draft_length: input.draft_length,
+            verification_steps: 0,
+            drafted: 0,
+            accepted: 0,
+            acceptance_rate: 0.0,
+        });
     }
 
     let probe_ws = WorkingSet::new();
@@ -192,10 +239,16 @@ async fn main(input: Input) -> Result<String> {
     } else {
         total_accepted as f64 / total_drafted as f64
     };
-    eprintln!(
-        "cacheback: prompt_tokens={prompt_len} generated={} verification_steps={verification_steps} \
-         drafted={total_drafted} accepted={total_accepted} acceptance_rate={acceptance_rate:.3}",
-        generated.len()
-    );
-    wit_model::decode(&generated)
+    Ok(Output {
+        sampler: "cacheback-speculative",
+        text: wit_model::decode(&generated)?,
+        prompt_tokens: prompt_len,
+        count: generated.len(),
+        draft_length: input.draft_length,
+        verification_steps,
+        drafted: total_drafted,
+        accepted: total_accepted,
+        acceptance_rate,
+        tokens: generated,
+    })
 }

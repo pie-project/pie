@@ -11,6 +11,7 @@ use crate::compiled_grammar::CompiledGrammar;
 use crate::fsm::StateId;
 use pie_tokenizer::Tokenizer;
 
+#[derive(Clone)]
 pub(super) struct SingleDfaEngine {
     pub(super) rule_idx: usize,
     pub(super) state: u16,

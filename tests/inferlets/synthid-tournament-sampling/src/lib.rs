@@ -39,6 +39,19 @@
 //! Every `g` is a keyed fair coin, so the null mean is exactly ½ and
 //! `z = 2·(mean − ½)·sqrt(depth · n)` is a standard normal. A decoy secret is
 //! scored alongside to give the empirical null on the same text.
+//!
+//! ## Source
+//!
+//! Dathathri et al., *Scalable watermarking for identifying large language
+//! model outputs*, *Nature* **634**, 818–823 (2024) —
+//! <https://doi.org/10.1038/s41586-024-08025-4>.
+//!
+//! Faithfulness: **Exact (equivalent form)**. The paper specifies a knockout
+//! tournament over `2^depth` sampled candidates; this implements the closed
+//! form `P(w) = p(w)·(1 + g(w) − m)` with `m = E_p[g]`, which is that
+//! tournament's exact per-round win probability and composes across layers
+//! because round-ℓ winners are i.i.d. from `p_ℓ`. Derivation in
+//! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 use inferlet::ptir::prelude::*;
 use inferlet::{Result, chat, model as wit_model};

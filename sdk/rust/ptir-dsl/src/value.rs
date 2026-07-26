@@ -411,6 +411,18 @@ fn push(op: Op, tys: &[ValueType]) -> ValueId {
 pub fn neg(x: impl AsTensor) -> Tensor {
     emit_unary(&x, Op::Neg, |t| t)
 }
+/// `|x|` elementwise.
+pub fn abs(x: impl AsTensor) -> Tensor {
+    emit_unary(&x, Op::Abs, |t| t)
+}
+/// `signum(x)` elementwise: `-1`, `0` or `+1`, same dtype as `x`.
+pub fn sign(x: impl AsTensor) -> Tensor {
+    emit_unary(&x, Op::Sign, |t| t)
+}
+/// `1 / x` elementwise.
+pub fn recip(x: impl AsTensor) -> Tensor {
+    emit_unary(&x, Op::Recip, |t| t)
+}
 pub fn exp(x: impl AsTensor) -> Tensor {
     emit_unary(&x, Op::Exp, |t| t)
 }
@@ -700,6 +712,18 @@ pub fn top_k(x: impl AsTensor, k: u32) -> (Tensor, Tensor) {
     let val_ty = ValueType::new(out_shape, tyx.dtype);
     let idx_ty = ValueType::new(out_shape, DType::U32);
     let base = emit(Op::TopK { input: ix, k }, &[val_ty, idx_ty]);
+    (Tensor::node(base, val_ty), Tensor::node(base + 1, idx_ty))
+}
+/// Descending sort of a 1-D row: `(values, original_indices)`.
+///
+/// Like [`top_k`], this is a library region in the compiler and therefore a
+/// hard fusion barrier — prefer a threshold or reduction when one suffices.
+pub fn sort_desc(x: impl AsTensor) -> (Tensor, Tensor) {
+    let (ix, tyx) = x.to_arg().materialize();
+    let n = tyx.shape.dims().last().copied().unwrap_or(0);
+    let val_ty = ValueType::vector(n, DType::F32);
+    let idx_ty = ValueType::vector(n, DType::U32);
+    let base = emit(Op::SortDesc(ix), &[val_ty, idx_ty]);
     (Tensor::node(base, val_ty), Tensor::node(base + 1, idx_ty))
 }
 /// The top-k rank predicate (`pivot_threshold(x, rank_le(k))`).

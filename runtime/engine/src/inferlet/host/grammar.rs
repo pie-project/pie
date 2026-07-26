@@ -103,6 +103,9 @@ impl pie::inferlet::grammar::HostGrammar for ProcessCtx {
 // Matcher resource
 // =============================================================================
 
+/// How many accepted tokens a matcher retains for `rollback`.
+const MAX_ROLLBACK_TOKENS: usize = 64;
+
 /// Stateful matcher that walks the grammar automaton, producing token masks.
 pub struct Matcher {
     pub(crate) inner: GrammarMatcher,
@@ -119,7 +122,11 @@ impl pie::inferlet::grammar::HostMatcher for ProcessCtx {
         let model = pie_model::model();
         let stop_tokens = model.instruct().seal();
         let compiled = self.ctx().table.get(&grammar)?.compiled.clone();
-        let inner = GrammarMatcher::with_compiled(compiled, stop_tokens, 10);
+        // Rollback history depth. Deep enough for the draft lengths that
+        // speculative decoding and tree drafting actually use; a token of
+        // history costs a `usize` plus a `u16`, so the bound is about
+        // memory hygiene, not a real constraint.
+        let inner = GrammarMatcher::with_compiled(compiled, stop_tokens, MAX_ROLLBACK_TOKENS);
 
         let matcher = Matcher { inner };
         Ok(self.ctx().table.push(matcher)?)
@@ -156,6 +163,22 @@ impl pie::inferlet::grammar::HostMatcher for ProcessCtx {
         let matcher = self.ctx().table.get_mut(&this)?;
         matcher.inner.reset();
         Ok(())
+    }
+
+    async fn fork(&mut self, this: Resource<Matcher>) -> Result<Resource<Matcher>> {
+        let inner = self.ctx().table.get(&this)?.inner.fork();
+        Ok(self.ctx().table.push(Matcher { inner })?)
+    }
+
+    async fn rollback(&mut self, this: Resource<Matcher>, num_tokens: u32) -> Result<()> {
+        let matcher = self.ctx().table.get_mut(&this)?;
+        matcher.inner.rollback(num_tokens as usize);
+        Ok(())
+    }
+
+    async fn rollback_capacity(&mut self, this: Resource<Matcher>) -> Result<u32> {
+        let matcher = self.ctx().table.get(&this)?;
+        Ok(matcher.inner.rollback_capacity() as u32)
     }
 
     async fn drop(&mut self, this: Resource<Matcher>) -> Result<()> {

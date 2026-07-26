@@ -449,6 +449,7 @@ fn normalize_stage(bound: &BoundTrace, stage_index: usize) -> NormalizedStage {
     let original_types = &bound.stage_types[stage_index];
     let (result_bases, producer) = result_layout(&stage_program.ops);
     let keep = live_ops(stage_program, &result_bases, &producer);
+    let redundant = redundant_select_broadcasts(stage_program, original_types, &result_bases);
 
     let mut value_map = vec![u32::MAX; original_types.len()];
     let mut normalized_ops: Vec<Op> = Vec::new();
@@ -462,6 +463,18 @@ fn normalize_stage(bound: &BoundTrace, stage_index: usize) -> NormalizedStage {
         let base = result_bases[op_index] as usize;
         let result_count = original_op.result_count() as usize;
         if !keep[op_index] {
+            continue;
+        }
+        // A scalar broadcast feeding only `Op::Select` is a no-op: `Select`
+        // already broadcasts its operands (`infer.rs`), so the broadcast
+        // materializes a whole row to say what the scalar already said. Alias
+        // it away so both spellings of a masked sampler normalize to the same
+        // ops — otherwise the spelling decides whether pattern recognition
+        // (e.g. the nucleus library) can see the dataflow at all.
+        if redundant[op_index]
+            && let Op::Broadcast { value, .. } = original_op
+        {
+            value_map[base] = value_map[*value as usize];
             continue;
         }
 
@@ -555,6 +568,53 @@ fn result_layout(ops: &[Op]) -> (Vec<u32>, Vec<usize>) {
         }
     }
     (bases, producer)
+}
+
+/// A `Broadcast` of a scalar whose every consumer is an `Op::Select` operand
+/// (not the condition) is redundant: `Select`'s type inference broadcasts its
+/// operands, so the broadcast only costs a materialized row. Removing it in
+/// normalization means `select(m, x, -inf)` and
+/// `select(m, x, broadcast(-inf, [n]))` produce identical normalized ops, and
+/// therefore identical signatures and identical plans.
+fn redundant_select_broadcasts(
+    stage_program: &crate::container::StageProgram,
+    original_types: &[ValueType],
+    result_bases: &[u32],
+) -> Vec<bool> {
+    let mut redundant = vec![false; stage_program.ops.len()];
+    let mut consumers: Vec<Vec<(usize, usize)>> = vec![Vec::new(); original_types.len()];
+    for (node, op) in stage_program.ops.iter().enumerate() {
+        for (slot, operand) in op.operands().into_iter().enumerate() {
+            if let Some(entry) = consumers.get_mut(operand as usize) {
+                entry.push((node, slot));
+            }
+        }
+    }
+    for (node, op) in stage_program.ops.iter().enumerate() {
+        let Op::Broadcast { value, .. } = op else {
+            continue;
+        };
+        let Some(source_type) = original_types.get(*value as usize) else {
+            continue;
+        };
+        if source_type.shape.rank() != 0 {
+            continue;
+        }
+        let result = result_bases[node] as usize;
+        let Some(uses) = consumers.get(result) else {
+            continue;
+        };
+        // `Op::Select` operand order is `[cond, a, b]`; slot 0 is the condition,
+        // which must keep its own shape.
+        if !uses.is_empty()
+            && uses.iter().all(|(consumer, slot)| {
+                matches!(stage_program.ops[*consumer], Op::Select { .. }) && *slot != 0
+            })
+        {
+            redundant[node] = true;
+        }
+    }
+    redundant
 }
 
 fn live_ops(
@@ -2209,9 +2269,16 @@ fn scan_partition(
                 return Err(PlanDecodeError::InvalidRecord);
             }
         }
+        // The nucleus region's shape is a wire ABI. Two forms exist: the plain
+        // `(logits, top_p, rng)` recipe and the scaled one, which additionally
+        // carries the temperature divisor and the pre-scale logits. Both are
+        // 13 nodes; they differ only in arity. Accepting only the plain form
+        // would reject plans this crate's own encoder produces and every CUDA
+        // backend accepts (`grouped_nucleus_region_supported`,
+        // `singleton_codegen`, `program_runtime`).
         if region_kind == 1
             && library == LibraryOp::NucleusSample as u8
-            && (nodes != 13 || inputs != 3 || outputs != 1 || sinks != 0)
+            && (nodes != 13 || (inputs != 3 && inputs != 5) || outputs != 1 || sinks != 0)
         {
             return Err(PlanDecodeError::InvalidRecord);
         }
@@ -2877,6 +2944,123 @@ mod tests {
         bind(container, ModelProfile::dummy()).unwrap()
     }
 
+    fn scaled_nucleus_program_with_broadcast_ninf() -> BoundTrace {
+        let shape = Shape::matrix(2, 8);
+        let container = TraceContainer {
+            channels: vec![
+                channel(Shape::vector(2), DType::U32, HostRole::None, true),
+                channel(Shape::vector(2), DType::F32, HostRole::None, true),
+                channel(shape, DType::F32, HostRole::None, true),
+                channel(Shape::vector(2), DType::I32, HostRole::Reader, false),
+            ],
+            stages: vec![StageProgram {
+                stage: Stage::Epilogue,
+                ops: vec![
+                    Op::ChanRead(0),
+                    Op::ChanRead(1),
+                    Op::ChanTake(2),
+                    Op::Reshape { value: 2, shape },
+                    Op::Const(Literal::F32(0.8)),
+                    Op::Div(3, 4),
+                    Op::ReduceMax(5),
+                    Op::Broadcast { value: 6, shape },
+                    Op::Sub(5, 7),
+                    Op::Exp(8),
+                    Op::ReduceSum(9),
+                    Op::Broadcast { value: 10, shape },
+                    Op::Div(9, 11),
+                    Op::PivotThreshold {
+                        input: 12,
+                        predicate: Predicate::CummassLe(1),
+                    },
+                    Op::Const(Literal::F32(f32::NEG_INFINITY)),
+                    Op::Broadcast { value: 14, shape },
+                    Op::Select {
+                        cond: 13,
+                        a: 5,
+                        b: 15,
+                    },
+                    Op::RngKeyed {
+                        state: 0,
+                        shape,
+                        kind: RngKind::Gumbel,
+                    },
+                    Op::Add(16, 17),
+                    Op::ReduceArgmax(18),
+                    Op::ChanPut { chan: 3, value: 19 },
+                ],
+            }],
+            ..TraceContainer::default()
+        };
+        bind(container, ModelProfile::dummy()).unwrap()
+    }
+
+    /// `Op::Select` broadcasts its operands, so passing `-inf` as a bare scalar
+    /// and passing it already broadcast to the row shape are the same program.
+    /// Normalization must erase that difference: otherwise the spelling decides
+    /// whether the nucleus library is reachable at all, and the fast path is
+    /// available only by calling `nucleus_sample` by name — which is how the
+    /// repo's own `text-completion-bench` came to miss it.
+    #[test]
+    fn broadcast_neg_inf_normalizes_to_the_same_nucleus_plan() {
+        let broadcast = compile_stage(
+            &scaled_nucleus_program_with_broadcast_ninf(),
+            Stage::Epilogue,
+        )
+        .unwrap();
+        let bare = compile_stage(&scaled_nucleus_program(), Stage::Epilogue).unwrap();
+        for compiled in [&broadcast, &bare] {
+            let nucleus = compiled
+                .fused
+                .regions
+                .iter()
+                .find(|region| region.kind == RegionKind::Library(LibraryOp::NucleusSample))
+                .expect("nucleus library region");
+            // The 13-node/5-input shape is the wire ABI every backend asserts
+            // (e.g. `grouped_nucleus_region_supported` in the CUDA driver).
+            assert_eq!(nucleus.nodes.len(), 13);
+            assert_eq!(nucleus.inputs.len(), 5);
+        }
+        assert_eq!(broadcast.normalized.ops, bare.normalized.ops);
+        assert_eq!(broadcast.signature, bare.signature);
+        assert_eq!(broadcast.fused.regions, bare.fused.regions);
+    }
+
+    /// The rewrite must not touch a broadcast that some consumer actually needs
+    /// at full width, nor one feeding a `Select` condition.
+    #[test]
+    fn scalar_broadcast_is_kept_when_a_non_select_consumer_needs_it() {
+        let shape = Shape::vector(8);
+        let container = TraceContainer {
+            channels: vec![
+                channel(shape, DType::F32, HostRole::None, true),
+                channel(shape, DType::F32, HostRole::Reader, false),
+            ],
+            stages: vec![StageProgram {
+                stage: Stage::Epilogue,
+                ops: vec![
+                    Op::ChanTake(0),
+                    Op::Const(Literal::F32(2.0)),
+                    Op::Broadcast { value: 1, shape },
+                    Op::Add(0, 2),
+                    Op::ChanPut { chan: 1, value: 3 },
+                ],
+            }],
+            ..TraceContainer::default()
+        };
+        let compiled =
+            compile_stage(&bind(container, ModelProfile::dummy()).unwrap(), Stage::Epilogue)
+                .unwrap();
+        assert!(
+            compiled
+                .normalized
+                .ops
+                .iter()
+                .any(|op| matches!(op, Op::Broadcast { .. })),
+            "a broadcast feeding Add must survive normalization"
+        );
+    }
+
     fn interleaved_nucleus_program() -> BoundTrace {
         let shape = Shape::matrix(2, 8);
         bind(
@@ -2995,6 +3179,24 @@ mod tests {
         assert_eq!(nucleus.nodes, (6..=18).collect::<Vec<_>>());
         assert_eq!(nucleus.inputs, vec![2, 4, 5, 1, 0]);
         assert_eq!(nucleus.outputs, vec![18]);
+    }
+
+    /// The scaled nucleus carries 5 inputs, not 3. Every CUDA site accepts
+    /// both arities; the structural decoder used to accept only 3, so it
+    /// rejected a plan this crate's own encoder had just produced.
+    #[test]
+    fn a_scaled_nucleus_plan_survives_its_own_structural_decoder() {
+        let compiled = compile_stage(&scaled_nucleus_program(), Stage::Epilogue).unwrap();
+        let nucleus = compiled
+            .fused
+            .regions
+            .iter()
+            .find(|region| region.kind == RegionKind::Library(LibraryOp::NucleusSample))
+            .expect("scaled nucleus library region");
+        assert_eq!(nucleus.inputs.len(), 5);
+        let bytes = encode_stage_plan(&compiled);
+        let header = decode_plan_header(&bytes).expect("scaled nucleus plan must decode");
+        assert_eq!(header.signature_hash, compiled.signature.hash);
     }
 
     #[test]
