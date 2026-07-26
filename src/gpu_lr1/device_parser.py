@@ -368,6 +368,352 @@ def _scatter_kernel(
             tl.atomic_or(row + lane, value, mask=live)
 
 
+@triton.jit
+def _contains(kind, offset, length, payload_ptr, token):
+    """Is `token` in this group's set?
+
+    The three storages are the three shapes a set of tokens takes when it is
+    stored exactly: a sorted list, a sorted list of exclusions, or a bitset.
+
+    One exit, deliberately. A `return` inside a runtime branch of a jitted
+    helper does not reliably do what it reads as - the branch is a predicate,
+    not a jump - and written that way this silently reported that no group held
+    the token, which stalls the parser instead of failing.
+    """
+    inside = 0
+    if kind == _DENSE:
+        word = tl.load(payload_ptr + offset + token // 32)
+        inside = (word >> (token % 32)) & 1
+    else:
+        found = _search(payload_ptr, offset, offset + length, token)
+        if kind == _COMPLEMENT:
+            if found < 0:
+                inside = 1
+        else:
+            if found >= 0:
+                inside = 1
+    return inside
+
+
+@triton.jit
+def _candidate_kernel(
+    group_offsets_ptr,
+    group_set_kind_ptr,
+    group_set_offset_ptr,
+    group_set_length_ptr,
+    set_payload_ptr,
+    reading_offsets_ptr,
+    reading_next_state_ptr,
+    reading_term_offsets_ptr,
+    reading_terminals_ptr,
+    action_offsets_ptr,
+    action_terminals_ptr,
+    action_values_ptr,
+    goto_offsets_ptr,
+    goto_nonterminals_ptr,
+    goto_targets_ptr,
+    production_lhs_ptr,
+    production_arity_ptr,
+    pending_offsets_ptr,
+    pending_terminals_ptr,
+    lexer_state_ptr,
+    stack_ptr,
+    stack_depth_ptr,
+    config_count_ptr,
+    token_ptr,
+    scratch_ptr,
+    cand_valid_ptr,
+    cand_lexer_ptr,
+    cand_depth_ptr,
+    cand_stack_ptr,
+    mask_words,
+    LIVE,
+    CONFIGS: tl.constexpr,
+    MAX_GROUPS: tl.constexpr,
+    MAX_READINGS: tl.constexpr,
+    STACK_STRIDE: tl.constexpr,
+    MAX_REDUCTIONS: tl.constexpr,
+):
+    """Where each configuration lands if the sampled token is accepted.
+
+    The same replay the mask kernel runs, with two differences. It starts from
+    the one group that holds the sampled token rather than sweeping all of
+    them, and it keeps going after the first reading that survives: the mask
+    only needed to know *whether* a token was admissible, while an advance
+    needs every state the token could have led to, since each is a distinct
+    parse that stays alive.
+
+    The token arrives as a device pointer and is never read on the host. That
+    is the whole point - a value the host has to see is a synchronisation, and
+    a decode loop that synchronises once per token is the thing this design
+    exists to remove.
+    """
+    launched = tl.program_id(0)
+    slot = tl.program_id(1)
+    sequence = launched // LIVE
+    config = launched % LIVE
+    if config >= tl.load(config_count_ptr + sequence):
+        return
+    row_index = sequence * CONFIGS + config
+    state = tl.load(lexer_state_ptr + row_index)
+    depth = tl.load(stack_depth_ptr + row_index)
+    first = tl.load(group_offsets_ptr + state)
+    last = tl.load(group_offsets_ptr + state + 1)
+    group = first + slot
+    if group >= last:
+        return
+
+    token = tl.load(token_ptr + sequence)
+    kind = tl.load(group_set_kind_ptr + group)
+    offset = tl.load(group_set_offset_ptr + group)
+    length = tl.load(group_set_length_ptr + group)
+    if _contains(kind, offset, length, set_payload_ptr, token) == 0:
+        return
+
+    scratch = (launched * tl.num_programs(1) + slot) * 2 * STACK_STRIDE
+    probe = scratch + STACK_STRIDE
+    base = row_index * STACK_STRIDE
+    out_base = row_index * MAX_READINGS
+
+    reading = tl.load(reading_offsets_ptr + group)
+    reading_end = tl.load(reading_offsets_ptr + group + 1)
+    index = 0
+    while reading < reading_end and index < MAX_READINGS:
+        term = tl.load(reading_term_offsets_ptr + reading)
+        term_end = tl.load(reading_term_offsets_ptr + reading + 1)
+        top = tl.load(stack_ptr + base + depth - 1)
+        alive = 1
+        lane = tl.arange(0, STACK_STRIDE)
+        tl.store(
+            scratch_ptr + scratch + lane,
+            tl.load(stack_ptr + base + lane, mask=lane < depth, other=0),
+            mask=lane < depth,
+        )
+        copy_depth = depth
+        while term < term_end and alive == 1:
+            terminal = tl.load(reading_terminals_ptr + term)
+            settled = 0
+            for _ in range(0, MAX_REDUCTIONS):
+                if settled == 0 and alive == 1:
+                    row = tl.load(action_offsets_ptr + top)
+                    row_end = tl.load(action_offsets_ptr + top + 1)
+                    entry = _search(action_terminals_ptr, row, row_end, terminal)
+                    if entry < 0:
+                        alive = 0
+                    else:
+                        value = tl.load(action_values_ptr + entry)
+                        if value == _ACCEPT:
+                            alive = 0
+                        elif value > 0:
+                            tl.store(scratch_ptr + scratch + copy_depth, value - 1)
+                            copy_depth = copy_depth + 1
+                            top = value - 1
+                            settled = 1
+                        else:
+                            production = -value - 1
+                            arity = tl.load(production_arity_ptr + production)
+                            if copy_depth <= arity:
+                                alive = 0
+                            else:
+                                copy_depth = copy_depth - arity
+                                exposed = tl.load(scratch_ptr + scratch + copy_depth - 1)
+                                lhs = tl.load(production_lhs_ptr + production)
+                                grow = tl.load(goto_offsets_ptr + exposed)
+                                grow_end = tl.load(goto_offsets_ptr + exposed + 1)
+                                target = _search(
+                                    goto_nonterminals_ptr, grow, grow_end, lhs
+                                )
+                                if target < 0:
+                                    alive = 0
+                                else:
+                                    top = tl.load(goto_targets_ptr + target)
+                                    tl.store(scratch_ptr + scratch + copy_depth, top)
+                                    copy_depth = copy_depth + 1
+            if settled == 0:
+                alive = 0
+            term = term + 1
+
+        next_state = tl.load(reading_next_state_ptr + reading)
+        if alive == 1:
+            pend = tl.load(pending_offsets_ptr + next_state)
+            pend_end = tl.load(pending_offsets_ptr + next_state + 1)
+            if pend < pend_end:
+                any_ok = 0
+                while pend < pend_end and any_ok == 0:
+                    terminal = tl.load(pending_terminals_ptr + pend)
+                    lane = tl.arange(0, STACK_STRIDE)
+                    tl.store(
+                        scratch_ptr + probe + lane,
+                        tl.load(
+                            scratch_ptr + scratch + lane,
+                            mask=lane < copy_depth,
+                            other=0,
+                        ),
+                        mask=lane < copy_depth,
+                    )
+                    probe_depth = copy_depth
+                    probe_top = top
+                    probe_alive = 1
+                    probe_settled = 0
+                    for _ in range(0, MAX_REDUCTIONS):
+                        if probe_settled == 0 and probe_alive == 1:
+                            row = tl.load(action_offsets_ptr + probe_top)
+                            row_end = tl.load(action_offsets_ptr + probe_top + 1)
+                            entry = _search(action_terminals_ptr, row, row_end, terminal)
+                            if entry < 0:
+                                probe_alive = 0
+                            else:
+                                value = tl.load(action_values_ptr + entry)
+                                if value == _ACCEPT:
+                                    probe_settled = 1
+                                elif value > 0:
+                                    probe_settled = 1
+                                else:
+                                    production = -value - 1
+                                    arity = tl.load(production_arity_ptr + production)
+                                    if probe_depth <= arity:
+                                        probe_alive = 0
+                                    else:
+                                        probe_depth = probe_depth - arity
+                                        exposed = tl.load(
+                                            scratch_ptr + probe + probe_depth - 1
+                                        )
+                                        lhs = tl.load(production_lhs_ptr + production)
+                                        grow = tl.load(goto_offsets_ptr + exposed)
+                                        grow_end = tl.load(goto_offsets_ptr + exposed + 1)
+                                        target = _search(
+                                            goto_nonterminals_ptr, grow, grow_end, lhs
+                                        )
+                                        if target < 0:
+                                            probe_alive = 0
+                                        else:
+                                            probe_top = tl.load(goto_targets_ptr + target)
+                                            tl.store(
+                                                scratch_ptr + probe + probe_depth,
+                                                probe_top,
+                                            )
+                                            probe_depth = probe_depth + 1
+                    if probe_alive == 1 and probe_settled == 1:
+                        any_ok = 1
+                    pend = pend + 1
+                alive = any_ok
+
+        if alive == 1:
+            tl.store(cand_valid_ptr + out_base + index, 1)
+            tl.store(cand_lexer_ptr + out_base + index, next_state)
+            tl.store(cand_depth_ptr + out_base + index, copy_depth)
+            lane = tl.arange(0, STACK_STRIDE)
+            tl.store(
+                cand_stack_ptr + (out_base + index) * STACK_STRIDE + lane,
+                tl.load(scratch_ptr + scratch + lane, mask=lane < copy_depth, other=0),
+                mask=lane < copy_depth,
+            )
+            index = index + 1
+        reading = reading + 1
+
+
+@triton.jit
+def _commit_kernel(
+    lexer_state_ptr,
+    stack_ptr,
+    stack_depth_ptr,
+    config_count_ptr,
+    old_lexer_ptr,
+    old_count_ptr,
+    cand_valid_ptr,
+    cand_lexer_ptr,
+    cand_depth_ptr,
+    cand_stack_ptr,
+    terminated_ptr,
+    CONFIGS: tl.constexpr,
+    MAX_READINGS: tl.constexpr,
+    STACK_STRIDE: tl.constexpr,
+):
+    """Collect the surviving candidates into the next configuration set.
+
+    Serial, one program per sequence, and deliberately so. The reference
+    matcher deduplicates in a particular order and stops at its configuration
+    ceiling, so a parallel collection that produced the same *set* could still
+    produce a different *prefix* once the ceiling bites. Reproducing the order
+    is what lets the two be compared for equality rather than for similarity.
+    """
+    sequence = tl.program_id(0)
+    count = tl.load(old_count_ptr + sequence)
+    lane = tl.arange(0, STACK_STRIDE)
+    written = 0
+
+    for state_slot in range(0, CONFIGS):
+        if state_slot < count and written < CONFIGS:
+            state = tl.load(old_lexer_ptr + sequence * CONFIGS + state_slot)
+            # Only the first configuration carrying a lexer state introduces
+            # it; a later one would repeat every candidate the first produced.
+            seen = 0
+            for earlier in range(0, CONFIGS):
+                if earlier < state_slot:
+                    if tl.load(old_lexer_ptr + sequence * CONFIGS + earlier) == state:
+                        seen = 1
+            if seen == 0:
+                for source in range(0, CONFIGS):
+                    if source < count and written < CONFIGS:
+                        if tl.load(old_lexer_ptr + sequence * CONFIGS + source) == state:
+                            base = (sequence * CONFIGS + source) * MAX_READINGS
+                            for index in range(0, MAX_READINGS):
+                                if written < CONFIGS:
+                                    if tl.load(cand_valid_ptr + base + index) == 1:
+                                        next_state = tl.load(cand_lexer_ptr + base + index)
+                                        depth = tl.load(cand_depth_ptr + base + index)
+                                        values = tl.load(
+                                            cand_stack_ptr
+                                            + (base + index) * STACK_STRIDE
+                                            + lane,
+                                            mask=lane < depth,
+                                            other=0,
+                                        )
+                                        duplicate = 0
+                                        for done in range(0, CONFIGS):
+                                            if done < written:
+                                                out = sequence * CONFIGS + done
+                                                if (
+                                                    tl.load(lexer_state_ptr + out)
+                                                    == next_state
+                                                ) and (
+                                                    tl.load(stack_depth_ptr + out)
+                                                    == depth
+                                                ):
+                                                    held = tl.load(
+                                                        stack_ptr + out * STACK_STRIDE + lane,
+                                                        mask=lane < depth,
+                                                        other=0,
+                                                    )
+                                                    if tl.sum(
+                                                        tl.where(
+                                                            (lane < depth)
+                                                            & (held != values),
+                                                            1,
+                                                            0,
+                                                        )
+                                                    ) == 0:
+                                                        duplicate = 1
+                                        if duplicate == 0:
+                                            out = sequence * CONFIGS + written
+                                            tl.store(lexer_state_ptr + out, next_state)
+                                            tl.store(stack_depth_ptr + out, depth)
+                                            tl.store(
+                                                stack_ptr + out * STACK_STRIDE + lane,
+                                                values,
+                                                mask=lane < depth,
+                                            )
+                                            written = written + 1
+
+    # No candidate survived: the token was refused. The set is left as it was
+    # and the sequence is marked, because a mask filled from an empty set would
+    # silently allow everything.
+    if written == 0:
+        tl.store(terminated_ptr + sequence, 1)
+    else:
+        tl.store(config_count_ptr + sequence, written)
+
+
 class DeviceGrammar:
     """A compiled grammar, resident on the GPU."""
 
@@ -375,7 +721,7 @@ class DeviceGrammar:
         self,
         compiled,
         max_stack: int = 64,
-        max_reductions: int = 16,
+        max_reductions: int | None = None,
         max_configs: int = 16,
     ):
         arrays = compiled.device_arrays()
@@ -385,8 +731,22 @@ class DeviceGrammar:
         offsets = np.frombuffer(arrays["group_offsets"], dtype=np.uint32)
         self.max_groups_per_state = int(np.diff(offsets).max()) if offsets.size > 1 else 1
         self.max_stack = max_stack
-        self.max_reductions = max_reductions
+        # How many reductions a single terminal may take before the parser is
+        # declared stuck. Sixteen was a guess, and it was wrong: a `}` closing
+        # a document nested thirty-seven deep needs more, and a reading that
+        # runs out is treated as dead, so the mask silently refused a token the
+        # reference matcher allowed. It took a corpus document 137 bytes long
+        # to reach; the earlier check stopped at 31.
+        #
+        # A settle is a shift. Every step before it either pops or replaces the
+        # top, so a chain longer than the stack can hold is not making progress
+        # towards one.
+        self.max_reductions = max_reductions if max_reductions is not None else max_stack
         self.max_configs = max_configs
+        readings = np.frombuffer(arrays["reading_offsets"], dtype=np.uint32)
+        # An advance keeps every reading that survives, not just the first, so
+        # the candidate buffers are sized by the widest group in the grammar.
+        self.max_readings = int(np.diff(readings).max()) if readings.size > 1 else 1
 
         def upload(name: str, dtype=torch.int32) -> torch.Tensor:
             return torch.frombuffer(bytearray(arrays[name]), dtype=dtype).cuda()
@@ -454,6 +814,26 @@ class DeviceBatch:
         self.live = 1
         self.graph: torch.cuda.CUDAGraph | None = None
         self.captured_live = 0
+        self.advance_graph: torch.cuda.CUDAGraph | None = None
+
+        readings = grammar.max_readings
+        self.max_readings = readings
+        slots = batch * self.configs * readings
+        self.cand_valid = torch.zeros(slots, dtype=torch.int32, device="cuda")
+        self.cand_lexer = torch.zeros(slots, dtype=torch.int32, device="cuda")
+        self.cand_depth = torch.zeros(slots, dtype=torch.int32, device="cuda")
+        self.cand_stack = torch.zeros(
+            slots * grammar.max_stack, dtype=torch.int32, device="cuda"
+        )
+        self.old_lexer = torch.zeros(
+            batch * self.configs, dtype=torch.int32, device="cuda"
+        )
+        self.old_count = torch.ones(batch, dtype=torch.int32, device="cuda")
+        # One flag per sequence rather than one for the batch: a refusal is a
+        # property of the sequence that hit it, and reading it back to find out
+        # which would be the synchronisation this is all avoiding.
+        self.terminated = torch.zeros(batch, dtype=torch.int32, device="cuda")
+        self.token = torch.zeros(batch, dtype=torch.int32, device="cuda")
         rows = batch * self.configs
         self.lexer_state = torch.zeros(rows, dtype=torch.int32, device="cuda")
         self.stack = torch.zeros(
@@ -522,6 +902,117 @@ class DeviceBatch:
         self.stack[: rows * self.configs].copy_(torch.from_numpy(stacks))
         self.depth[: rows * self.configs].copy_(torch.from_numpy(depths))
         self.config_count[:rows].copy_(torch.from_numpy(counts))
+
+    def advance(self, tokens: torch.Tensor) -> None:
+        """Take one sampled token per sequence, entirely on device.
+
+        `tokens` is a device tensor and its values are never read on the host.
+        That is the requirement the rest of the design is in service of: a
+        decode loop that has to look at a sampled token to advance its parser
+        pays a device-to-host round trip per token, and no amount of making the
+        parser itself faster removes it.
+        """
+        self.token.copy_(tokens.to(torch.int32).reshape(-1)[: self.batch])
+        if self.advance_graph is not None:
+            self.advance_graph.replay()
+            return
+        self._advance()
+
+    def capture_advance(self) -> None:
+        """Record the advance too, so a decode step launches two graphs."""
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                self._advance()
+        torch.cuda.current_stream().wait_stream(stream)
+        self.advance_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.advance_graph):
+            self._advance()
+
+    def _advance(self) -> None:
+        grammar = self.grammar
+        self.cand_valid.zero_()
+        self.old_lexer.copy_(self.lexer_state)
+        self.old_count.copy_(self.config_count)
+        live = self.live
+        _candidate_kernel[(self.batch * live, self.max_groups)](
+            grammar.group_offsets,
+            grammar.group_set_kind,
+            grammar.group_set_offset,
+            grammar.group_set_length,
+            grammar.set_payload,
+            grammar.reading_offsets,
+            grammar.reading_next_state,
+            grammar.reading_term_offsets,
+            grammar.reading_terminals,
+            grammar.action_offsets,
+            grammar.action_terminals,
+            grammar.action_values,
+            grammar.goto_offsets,
+            grammar.goto_nonterminals,
+            grammar.goto_targets,
+            grammar.production_lhs,
+            grammar.production_arity,
+            grammar.pending_offsets,
+            grammar.pending_terminals,
+            self.lexer_state,
+            self.stack,
+            self.depth,
+            self.config_count,
+            self.token,
+            self.scratch,
+            self.cand_valid,
+            self.cand_lexer,
+            self.cand_depth,
+            self.cand_stack,
+            grammar.mask_words,
+            live,
+            CONFIGS=self.configs,
+            MAX_GROUPS=self.max_groups,
+            MAX_READINGS=self.max_readings,
+            STACK_STRIDE=grammar.max_stack,
+            MAX_REDUCTIONS=grammar.max_reductions,
+            num_warps=1,
+        )
+        _commit_kernel[(self.batch,)](
+            self.lexer_state,
+            self.stack,
+            self.depth,
+            self.config_count,
+            self.old_lexer,
+            self.old_count,
+            self.cand_valid,
+            self.cand_lexer,
+            self.cand_depth,
+            self.cand_stack,
+            self.terminated,
+            CONFIGS=self.configs,
+            MAX_READINGS=self.max_readings,
+            STACK_STRIDE=grammar.max_stack,
+            num_warps=1,
+        )
+        # The set may have widened. The fill launches for the widest in the
+        # batch, and that number now lives on the device, so the host takes the
+        # ceiling rather than asking.
+        self.live = self.configs
+
+    def configurations(self, sequence: int) -> list[tuple[int, list[int]]]:
+        """Read one sequence's parse state back. For tests only.
+
+        Nothing in the decode loop calls this: it is a device-to-host copy, and
+        the point of the loop is that it does not make one.
+        """
+        count = int(self.config_count[sequence])
+        rows = []
+        for index in range(count):
+            row = sequence * self.configs + index
+            depth = int(self.depth[row])
+            stack = self.stack.reshape(-1)[
+                row * self.grammar.max_stack : row * self.grammar.max_stack + depth
+            ].tolist()
+            rows.append((int(self.lexer_state[row]), stack))
+        return rows
 
     def capture(self) -> None:
         """Record the fill as a CUDA graph and replay it thereafter.
