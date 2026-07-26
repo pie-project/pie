@@ -56,8 +56,9 @@ if(NOT DEFINED CMAKE_CUDA_COMPILER_LAUNCHER)
   endif()
 endif()
 
-if(NOT CMAKE_BUILD_TYPE)
-  set(CMAKE_BUILD_TYPE Release)
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING
+    "Build type (Debug, Release, RelWithDebInfo, MinSizeRel)" FORCE)
 endif()
 
 # ---- kernels.def ----------------------------------------------------------
@@ -101,9 +102,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/bin)
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/lib)
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/lib)
 
 find_package(CUDAToolkit REQUIRED)
 find_package(Threads REQUIRED)
@@ -138,7 +139,7 @@ endif()
 # flashinfer ships no top-level CMakeLists.txt since v0.3.0; fetch
 # DOWNLOAD_ONLY for headers/csrc and compile only the launchers we need
 # directly into the driver (see the generated-MoE and Hopper/FA3 blocks below).
-cpmaddpackage(
+CPMAddPackage(
   NAME flashinfer
   GITHUB_REPOSITORY flashinfer-ai/flashinfer
   GIT_TAG v0.6.15
@@ -161,10 +162,39 @@ foreach(_fi_cccl_include IN LISTS PIE_CCCL_INCLUDE_DIRS)
 endforeach()
 message(STATUS "Using FlashInfer vendored CCCL: ${_FI_CCCL_ROOT}")
 
-# v0.6.15 has a narrowing-conversion warning nvcc escalates to an error
-# (`state_stride_batch`, signed long, brace-initialized into a uint64_t
-# field). Patch once after fetch; a sentinel file avoids re-patching every
-# fresh build-hash dir.
+# Upstream bug: `state_stride_batch` is an int64_t stride everywhere else in
+# FlashInfer, but buildNdDescriptor() takes `std::vector<uint64_t> const&`, so
+# the two brace-initialized call sites narrow. Narrowing an initializer_list
+# element is ill-formed, not a warning, so nvcc hard-errors:
+#
+#   error: invalid narrowing conversion from "signed long" to "unsigned long"
+#
+# and no -Wno-* or --diag-suppress can demote it. (Were the parameter an
+# ordinary aggregate this would be warning #2361-D and nothing to fix.)
+#
+# Only sm_90+ builds see it: both sites live inside the header's
+# FLASHINFER_MAMBA_ENABLE_SM90 block, which is exactly the macro the
+# Hopper/Blackwell Mamba gate below defines. Upstream's own builds do not
+# compile that path, which is why the bug has survived unnoticed -- as of
+# v0.6.15 both sites are still unfixed on main and on today's nightly, and
+# v0.6.15.post1 is the newest release, so there is no version to bump to.
+# Reported upstream as flashinfer-ai/flashinfer#4155; drop this whole block
+# once a release carrying that fix lands and GIT_TAG moves past it.
+#
+# Upstream has two more identical sites in invoke_selective_state_update_mtp.cuh
+# guarded by FLASHINFER_MAMBA_ENABLE_SM100. We do not patch those because we
+# never define that macro; enabling sm_100 Mamba means extending this patch.
+#
+# Patching the fetched source in place is deliberate but not free: it mutates
+# the CPM source cache that every build directory on the machine shares, and
+# CPM notices ("Cache for flashinfer ... is dirty"). It is kept because the
+# alternative is worse -- vendoring cannot shadow this header alone, since its
+# only includer reaches it through a relative `#include "..."` that resolves
+# next to the includer before any -I path, so a vendored copy would have to
+# carry both files (~1460 lines) to fix one cast.
+#
+# The sentinel avoids re-patching every fresh build-hash dir; the FATAL_ERROR
+# fires if a FlashInfer bump ever makes the patch stop applying.
 set(_FI_PATCH_SENTINEL "${flashinfer_SOURCE_DIR}/.pie_narrowing_patched")
 set(_FI_PATCH_FILE
   "${flashinfer_SOURCE_DIR}/include/flashinfer/mamba/kernel_selective_state_update_stp.cuh")
@@ -217,9 +247,9 @@ if(NOT _PIE_CCCL_HAS_FAST_MOD_DIV)
     "CCCL at ${_PIE_FI_CCCL}")
 endif()
 
-cpmaddpackage(URI "gh:marzer/tomlplusplus@3.4.0")
-cpmaddpackage(URI "gh:CLIUtils/CLI11@2.5.0")
-cpmaddpackage(URI "gh:nlohmann/json@3.12.0" OPTIONS "JSON_BuildTests OFF")
+CPMAddPackage(URI "gh:marzer/tomlplusplus@3.4.0")
+CPMAddPackage(URI "gh:CLIUtils/CLI11@2.5.0")
+CPMAddPackage(URI "gh:nlohmann/json@3.12.0" OPTIONS "JSON_BuildTests OFF")
 
 # ---- Helper functions ------------------------------------------------------
 
@@ -383,7 +413,7 @@ set(PIE_CUDA_MODEL_SOURCES
 # Native CUDA backend. `pie_driver_cuda_lib` is linked in-process by the Rust
 # worker; `pie_driver_cuda` below is a thin direct-create diagnostic shim.
 # Every production translation unit under src/ is listed exactly once, grouped
-# to match the module tree (see README.md).
+# to match the module tree.
 
 # One attention translation unit per head_dim in kernels.def. These cannot be
 # generated -- a macro cannot expand to a source file -- so they are checked in
@@ -401,7 +431,9 @@ foreach(_pie_hd IN LISTS PIE_ATTN_HEAD_DIMS)
 endforeach()
 # ...and the reverse: a stub with no kernels.def entry would silently compile
 # nothing, since the header only declares the head_dims kernels.def lists.
-file(GLOB _pie_hd_stubs RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}"
+# CONFIGURE_DEPENDS so that dropping in a new stub re-runs the check instead of
+# passing until someone happens to reconfigure.
+file(GLOB _pie_hd_stubs CONFIGURE_DEPENDS RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/ops/attention_flashinfer_hd*.cu")
 foreach(_pie_hd_src IN LISTS _pie_hd_stubs)
   if(NOT _pie_hd_src IN_LIST PIE_ATTENTION_HEAD_DIM_SOURCES)
@@ -737,9 +769,9 @@ enable_testing()
 # TEST_ARGS), the load-parity harness (tests/load_parity/run.py, driven
 # manually against a live GPU + recipe), the qwen3.5 multi-request parity
 # script, and the tier0/tier1/masked-attention host reference headers
-# (#include-only, no standalone translation unit). Grouped into one
-# SOURCES-only custom target so `check-structure.sh` rule 6 sees them as
-# part of the build graph without compiling them.
+# (#include-only, no standalone translation unit). Listed as a SOURCES-only
+# custom target so IDE-generating generators surface them in the project tree
+# and so a reader can tell "not compiled" from "forgotten".
 add_custom_target(pie_driver_cuda_test_fixtures SOURCES
   tests/support/host_eval.hpp
   tests/support/tier1_codegen.hpp
