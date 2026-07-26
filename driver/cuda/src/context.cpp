@@ -29,7 +29,7 @@
 #include <cuda_runtime.h>
 #include <nlohmann/json.hpp>
 
-#include "pie_native/load_plan.hpp"
+#include "loader/load_plan.hpp"
 #include "batch/workspace.hpp"
 #include "config.hpp"
 #include "distributed.hpp"
@@ -705,9 +705,9 @@ int Context::Impl::initialize(
         {"unified_memory", false},
         {"fp8_native", fp8_native},
         {"native_mxfp4_moe", native_mxfp4_moe},
-        {"storage_alignment", 256},
-        {"storage_max_tile_bytes", 64ull * 1024ull * 1024ull},
-        {"storage_tile_map_mask", pie_load_planner::kCudaTileMapMask},
+        {"storage_alignment", kCudaPreferredAlignment},
+        {"storage_max_tile_bytes", kCudaMaxTileBytes},
+        {"storage_tile_map_mask", kCudaTileMapMask},
         {"page_size", 0},
     };
     device_facts_json_ = facts.dump();
@@ -727,11 +727,19 @@ int Context::Impl::load_model(
     cfg.model.snapshot_dir.assign(
         reinterpret_cast<const char*>(load.snapshot_dir.ptr),
         load.snapshot_dir.len);
-    const std::span<const std::uint8_t> load_plan_bytes(
-        load.load_plan_bytes.ptr, load.load_plan_bytes.len);
+    const std::string_view runtime_quant =
+        load.runtime_quant.ptr == nullptr
+            ? std::string_view{}
+            : std::string_view(
+                  reinterpret_cast<const char*>(load.runtime_quant.ptr),
+                  load.runtime_quant.len);
 
     auto* engine_p = own_value(LoadedModel::load(
-        cfg, tp_comm_, load_plan_bytes, load.compiler_version));
+        cfg,
+        tp_comm_,
+        runtime_quant,
+        static_cast<pie_loader::PieLoaderMxfp4MoeRequest>(load.mxfp4_moe),
+        static_cast<pie_loader::PieLoaderComponent>(load.component)));
     auto& engine = *engine_p;
     media_hidden_size_ = engine.hf_config().hidden_size;
 
@@ -793,6 +801,7 @@ int Context::Impl::load_model(
             {"has_value_head", false},
             {"has_kv_envelopes", false},
             {"has_attn_score", false},
+            {"has_attn_page_mask", false},
             {"max_forward_tokens",
              static_cast<std::uint32_t>(std::max(1, c.max_model_len))},
             {"max_forward_requests", 256},
@@ -853,9 +862,21 @@ int Context::Impl::load_model(
     case model::Family::Gemma4:
         for (int v : plan_info.per_layer_intermediate)
             max_mlp_intermediate = std::max(max_mlp_intermediate, v);
-        for (int d : plan_info.per_layer_head_dim) {
+        // Gemma-4 varies BOTH the head dim and the KV head count per layer
+        // (full-attention layers can use `num_global_key_value_heads`), so
+        // the K/V staging buffers must be sized from the widest layer's
+        // OWN (kv_heads x head_dim), pairwise. Folding only the per-layer
+        // head dim while taking the KV head count from the model-level
+        // config undersizes `ws.k`/`ws.v` for any layer that is wider than
+        // the config scalar. Sharded, because the forward produces exactly
+        // `layer.num_kv_heads / tp_size` heads into these buffers.
+        for (std::size_t i = 0; i < plan_info.per_layer_head_dim.size(); ++i) {
+            const int d = plan_info.per_layer_head_dim[i];
+            const int kvh = i < plan_info.per_layer_num_kv_heads.size()
+                                ? plan_info.per_layer_num_kv_heads[i] / local_tp_size
+                                : local_kv_heads;
             max_Hq = std::max(max_Hq, local_q_heads * d);
-            max_Hk = std::max(max_Hk, local_kv_heads * d);
+            max_Hk = std::max(max_Hk, kvh * d);
         }
         break;
     case model::Family::Gemma3n:
@@ -873,6 +894,19 @@ int Context::Impl::load_model(
     default:
         break;
     }
+
+    // The KV cache stores only THIS rank's heads, so the per-layer override
+    // must be sharded exactly like the `local_kv_heads` scalar it overrides.
+    // Unsharded, the cache reports a 2x-wide layer to `write_kv_kernel`,
+    // which then strides the (correctly sharded) `ws.k`/`ws.v` staging
+    // buffers by the full width and reads past their end from token
+    // `max_workspace_tokens / tp_size` on. Reads below that point silently
+    // pick up a neighbouring allocation.
+    std::vector<int> gemma4_local_per_layer_kv_heads;
+    gemma4_local_per_layer_kv_heads.reserve(
+        plan_info.per_layer_num_kv_heads.size());
+    for (int kvh : plan_info.per_layer_num_kv_heads)
+        gemma4_local_per_layer_kv_heads.push_back(kvh / local_tp_size);
 
     // Recurrent/linear-attention layer maps come straight from the bound
     // plan's pre-construction surface (populated once at bind time from
@@ -1044,7 +1078,7 @@ int Context::Impl::load_model(
                 local_kv_heads,
                 plan_info.per_layer_head_dim,
                 plan_info.kv_source_layer,
-                plan_info.per_layer_num_kv_heads,
+                gemma4_local_per_layer_kv_heads,
                 kv_format);
         case model::Family::NemotronH:
             return KvCache::allocate(
@@ -1527,6 +1561,43 @@ int Context::Impl::load_model(
                                   kv_cache_p->format().is_native_bf16() &&
                                   !kv_cache_p->hnd_layout() &&
                                   kv_cache_p->envelopes_enabled();
+    // Track B: `AttnScore` reads the attention probabilities the decode kernel
+    // actually computed. Only the plain paged-decode path carries the capture
+    // variant, so the capability is exactly the set of models whose every
+    // decode fire lands there:
+    //   * llama_like family -- the only family whose body is wired for capture.
+    //   * no sliding window -- the row would describe a truncated context while
+    //     claiming to describe the whole one.
+    //   * `use_prefill_decode_plan` off -- SM90+ routes decode through the
+    //     prefill kernel, which has no capture variant.
+    //   * native bf16, non-HND KV and TP 1 -- the capture dispatch dequants to
+    //     bf16, and a TP rank holds only its slice of the query heads, so the
+    //     head fold would average a subset while claiming to average all.
+    // Anything false here makes `bind_program` reject the program at bind
+    // instead of letting it read a buffer nobody wrote.
+    const bool has_attn_score =
+        family == model::Family::LlamaLike && local_tp_size == 1 &&
+        kv_cache_p != nullptr && kv_cache_p->format().is_native_bf16() &&
+        !kv_cache_p->hnd_layout() && fwd_cfg.sliding_window < 0 &&
+        fwd_cfg.per_layer_window_left.empty() &&
+        !fwd_cfg.use_prefill_decode_plan;
+
+    // Track A/B consumption: `attn_page_mask` is honoured by gathering the
+    // fire's page table down to the kept pages before the attention call. That
+    // substitution is only sound on the plain paged-decode path with a
+    // page-count-independent plan, which is the same set of models
+    // `has_attn_score` describes -- plus one runtime condition the model
+    // rechecks per fire, because a fire that plans split-KV is only knowable at
+    // plan time.
+    //
+    // The remaining condition -- that the fire's HOST page CSR is its real
+    // geometry rather than the decode-envelope bound -- is also per-fire, and
+    // is enforced in `FirePageMask`'s constructor. Capability here is the
+    // static half of the contract; both halves fail loudly.
+    const bool has_attn_page_mask = has_attn_score;
+
+    registry_->dispatch().set_attn_page_mask_available(has_attn_page_mask);
+
     registry_->dispatch().set_kv_envelopes_available(
         has_kv_envelopes,
         has_kv_envelopes
@@ -1750,12 +1821,8 @@ int Context::Impl::load_model(
         {"has_mtp_drafts", false},
         {"has_value_head", false},
         {"has_kv_envelopes", has_kv_envelopes},
-        // Track B layer 2: the AttnScore intrinsic exists in the ABI but this
-        // driver does not yet materialize scores at OnAttn, so the capability
-        // stays false and `bind_program` rejects such a program loudly
-        // (dispatch.cu stage/intrinsic gate) instead of binding a program that
-        // would read an unwritten buffer.
-        {"has_attn_score", false},
+        {"has_attn_score", has_attn_score},
+        {"has_attn_page_mask", has_attn_page_mask},
         // RV-26: PIE_DEVICE_PORT_ATTN_MASK is deliberately NOT advertised.
         // The runtime classifies masked device-carried decode into the
         // DecodeEnvelope class exactly when this mask claims the port, but

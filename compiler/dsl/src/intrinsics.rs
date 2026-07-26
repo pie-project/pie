@@ -76,6 +76,40 @@ pub fn value_head() -> Tensor {
 pub fn layer() -> Tensor {
     intrinsic_val(IntrinsicId::Layer, Shape::SCALAR, DType::U32)
 }
+/// `intrinsics::attn_score(kv_max)` — how much attention THIS layer paid to
+/// each live KV position, `[kv_max]` F32. Readable only at `on_attn` (the
+/// scores do not exist until the layer's attention has run) and model-gated on
+/// `has_attn_score`.
+///
+/// The value is the attention probability the request's MOST RECENT query
+/// token assigned to KV position `i`, averaged over the query heads. That is
+/// TOVA's quantity exactly (Oren et al., arXiv:2401.06104), H2O's per-step
+/// increment (Zhang et al., arXiv:2306.14048), and SnapKV's observation window
+/// at width 1.
+///
+/// Heads are folded by the backend, not by the program, for the same reason
+/// Quest's `envelope_dot` folds them: the paged KV layout carries ONE page list
+/// per request, so eviction is a per-request decision and a per-head score has
+/// no representable consumer. Folding in the kernel also avoids materialising
+/// `[num_heads, kv_max]` per layer.
+///
+/// Slot semantics:
+///   - `i < kv_len` -> the mean attention probability at that position; the
+///     live prefix sums to 1;
+///   - `kv_len <= i < kv_max` -> `0.0`. A position that does not exist received
+///     no attention, so it sorts to the bottom of every eviction ranking
+///     without a sentinel.
+///
+/// `kv_max` is the program's own ceiling (`prompt + max_tokens`, mirroring
+/// `envelope_dot`'s `p_max`); the backend refuses a request longer than it
+/// rather than truncating.
+pub fn attn_score(kv_max: u32) -> Tensor {
+    intrinsic_val(
+        IntrinsicId::AttnScore,
+        Shape::vector(kv_max.max(1)),
+        DType::F32,
+    )
+}
 
 /// Reshape a `[1, vocab]` logits matrix to `[vocab]` for the single-row case
 /// (matches echo's §3 golden). Multi-row passes keep the matrix.

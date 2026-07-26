@@ -200,13 +200,12 @@ def build_config(args: argparse.Namespace):
         TelemetryConfig,
     )
 
-    # PIE derives BOTH parallelism degrees from the device list: it needs
-    # one device per rank, and splits world_size / tensor_parallel_size
-    # into replica groups. So the list has to cover tp * dp whenever
-    # either exceeds 1. An explicit `--device` still wins.
-    world = max(1, args.tp_size) * max(1, args.dp_size)
-    if args.device == PIE_BENCH_DEFAULT_DEVICE and world > 1:
-        args.device = ",".join(f"cuda:{i}" for i in range(world))
+    # One device per TP rank. Data parallelism is NOT an engine shape — a
+    # worker serves one replica — so `--dp-size` spawns workers (see
+    # `run_data_parallel`) and never widens this list. An explicit
+    # `--device` still wins.
+    if args.device == PIE_BENCH_DEFAULT_DEVICE and args.tp_size > 1:
+        args.device = ",".join(f"cuda:{i}" for i in range(args.tp_size))
     device = [d.strip() for d in args.device.split(",")] if "," in args.device else [args.device]
     driver_options: dict[str, Any]
     if args.driver == "cuda_native":
@@ -299,12 +298,14 @@ def build_config(args: argparse.Namespace):
     else:
         driver_options = {}
 
-    # Concurrency 0 means "no admission cap" (all submitted inferlets run wasm
-    # immediately; the inference scheduler still caps via max_forward_requests).
+    # Concurrency 0 means "no explicit cap": the engine then defaults its
+    # admission cap to the driver's max_forward_requests (R). Admitting more
+    # than R processes cannot widen a batch (one fire per process per forward),
+    # it only makes batches ragged -- see bootstrap.rs.
     if args.mode == "latency":
         max_concurrent_processes: int | None = 1
     elif args.concurrency == 0:
-        max_concurrent_processes = None  # serializer drops field → unlimited
+        max_concurrent_processes = None  # serializer drops field → engine default
     else:
         max_concurrent_processes = args.concurrency
     requested_scheduler_kwargs = {
@@ -1324,9 +1325,91 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def run_data_parallel(args):
+    """Fan the request set out over `dp_size` single-replica workers.
+
+    A replica is a worker, not a driver inside one engine, so measuring DP
+    means running that many engines. Each child gets its own slice of the
+    devices through CUDA_VISIBLE_DEVICES and its own server port. Wall
+    clock is the slowest child's own measured window — they run
+    concurrently, so that is the wall the merged request set saw, and it
+    excludes the minutes each spends loading weights.
+
+    This mirrors `vllm_bench.run_data_parallel` exactly, so both engines
+    are measured the same way.
+    """
+    import subprocess
+    import tempfile
+
+    total = args.requests if args.mode == "latency" else args.num_requests
+    per = [total // args.dp_size] * args.dp_size
+    for i in range(total % args.dp_size):
+        per[i] += 1
+
+    rewritten = {"--dp-size", "--json-out", "--requests", "--num-requests",
+                 "--device"}
+    forwarded, skip_next = [], False
+    for token in sys.argv[1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        if token in rewritten:
+            skip_next = True
+            continue
+        if any(token.startswith(f"{flag}=") for flag in rewritten):
+            continue
+        forwarded.append(token)
+
+    procs, outs = [], []
+    tmpdir = tempfile.mkdtemp(prefix="pie-dp-")
+    for replica, count in enumerate(per):
+        if count == 0:
+            continue
+        devices = ",".join(
+            str(replica * args.tp_size + i) for i in range(args.tp_size))
+        out = os.path.join(tmpdir, f"replica{replica}.json")
+        outs.append(out)
+        # `forwarded` already carries the mode: it is argv[1].
+        argv = [sys.executable, os.path.abspath(__file__),
+                *forwarded, "--json-out", out]
+        argv += (["--requests", str(count)] if args.mode == "latency"
+                 else ["--num-requests", str(count)])
+        env = {**os.environ, "CUDA_VISIBLE_DEVICES": devices}
+        procs.append(subprocess.Popen(argv, env=env))
+    failures = [p.wait() for p in procs]
+    if any(rc != 0 for rc in failures):
+        raise RuntimeError(f"pie data-parallel replica failed: {failures}")
+
+    merged: list = []
+    wall = 0.0
+    for path in outs:
+        with open(path) as fh:
+            payload = json.load(fh)
+        wall = max(wall, float(payload["summary"]["wall_s"]))
+        for record in payload["requests"]:
+            merged.append(RequestResult(**record))
+    summary = summarize(
+        mode=args.mode,
+        engine="pie",
+        model=args.model,
+        results=merged,
+        wall_s=wall,
+        config={
+            "data_parallel_size": args.dp_size,
+            "tensor_parallel_size": args.tp_size,
+            "dp_replica_requests": per,
+            "max_tokens": args.max_tokens,
+        },
+    )
+    return summary, merged
+
+
 def main() -> None:
     args = build_parser().parse_args()
-    summary, results = asyncio.run(run(args))
+    if args.dp_size > 1:
+        summary, results = run_data_parallel(args)
+    else:
+        summary, results = asyncio.run(run(args))
     finish(summary, results, args.json_out)
 
 

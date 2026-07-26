@@ -29,7 +29,7 @@
 #include <toml++/toml.hpp>
 
 #include "pie_native/launch_view.hpp"
-#include "pie_native/load_plan.hpp"
+#include "loader/load_plan.hpp"
 #include "pie_native/ptir_channels.hpp"
 #include "pipeline/interp.hpp"
 #include "pipeline/descriptor_resolve.hpp"
@@ -183,6 +183,14 @@ struct ModelFacts {
     std::uint32_t max_model_len = 8192;
     std::string arch_name = "llama";
     bool has_linear_attn = false;
+    // What the loader's storage compile keys off. Parsed here because this is
+    // already the driver's one read of `config.json`; the loader no longer
+    // opens it (`loader/architecture.md` §10.4).
+    std::string model_type;
+    std::string quant_method;
+    std::uint32_t num_hidden_layers = 0;
+    std::uint32_t num_experts = 0;
+    std::uint32_t num_experts_per_tok = 0;
 };
 
 // Phase 1a (metal_ptir_plan.md §5.4, §12 "Caps honesty"): the Metal forward
@@ -247,6 +255,34 @@ ModelFacts read_model_facts(const std::string& hf_path) {
                 }
             }
         }
+        const auto str_of = [](const nlohmann::json& obj, const char* key) {
+            return obj.contains(key) && obj[key].is_string()
+                       ? obj[key].get<std::string>()
+                       : std::string{};
+        };
+        const auto uint_of = [](const nlohmann::json& obj,
+                                std::initializer_list<const char*> keys) {
+            for (const char* key : keys) {
+                if (obj.contains(key) && obj[key].is_number_integer()) {
+                    const auto v = obj[key].get<std::int64_t>();
+                    if (v > 0) return static_cast<std::uint32_t>(v);
+                }
+            }
+            return 0u;
+        };
+        facts.model_type = str_of(tc, "model_type");
+        if (facts.model_type.empty()) facts.model_type = str_of(j, "model_type");
+        facts.num_hidden_layers = uint_of(tc, {"num_hidden_layers"});
+        facts.num_experts =
+            uint_of(tc, {"num_local_experts", "num_experts", "n_routed_experts"});
+        facts.num_experts_per_tok = uint_of(tc, {"num_experts_per_tok"});
+        const nlohmann::json* quant = nullptr;
+        if (tc.contains("quantization_config") && tc["quantization_config"].is_object()) {
+            quant = &tc["quantization_config"];
+        } else if (j.contains("quantization_config") && j["quantization_config"].is_object()) {
+            quant = &j["quantization_config"];
+        }
+        if (quant != nullptr) facts.quant_method = str_of(*quant, "quant_method");
     } catch (const std::exception& e) {
         std::cerr << "[pie-driver-metal] warning: failed to parse "
                   << cfg.string() << ": " << e.what() << "\n";
@@ -382,8 +418,8 @@ class Context::Impl {
             {"fp8_native", false},
             {"native_mxfp4_moe", false},
             {"storage_alignment", alignment},
-            {"storage_max_tile_bytes", 64ull * 1024ull * 1024ull},
-            {"storage_tile_map_mask", pie_load_planner::kMetalTileMapMask},
+            {"storage_max_tile_bytes", kMetalMaxTileBytes},
+            {"storage_tile_map_mask", kMetalTileMapMask},
             {"page_size", page_size},
         }.dump();
         storage_page_size_ = page_size;
@@ -408,10 +444,11 @@ class Context::Impl {
         cfg_.model.hf_path.assign(
             reinterpret_cast<const char*>(load.snapshot_dir.ptr),
             load.snapshot_dir.len);
-        load_plan_bytes_.assign(
-            load.load_plan_bytes.ptr,
-            load.load_plan_bytes.ptr + load.load_plan_bytes.len);
-        compiler_version_ = load.compiler_version;
+        runtime_quant_.assign(
+            reinterpret_cast<const char*>(load.runtime_quant.ptr),
+            load.runtime_quant.len);
+        mxfp4_moe_ = static_cast<pie_loader::PieLoaderMxfp4MoeRequest>(
+            load.mxfp4_moe);
         facts_ = read_model_facts(cfg_.model.hf_path);
         std::string error;
         if (!ensure_executor(error)) {
@@ -1844,8 +1881,14 @@ class Context::Impl {
         setup_cfg.kv_page_size = cfg_.batching.kv_page_size;
         setup_cfg.max_forward_tokens = cfg_.batching.max_forward_tokens;
         setup_cfg.max_forward_requests = cfg_.batching.max_forward_requests;
-        setup_cfg.load_plan = load_plan_bytes_;
-        setup_cfg.compiler_version = compiler_version_;
+        setup_cfg.snapshot_dir = cfg_.model.hf_path;
+        setup_cfg.runtime_quant = runtime_quant_;
+        setup_cfg.model_type = facts_.model_type;
+        setup_cfg.quant_method = facts_.quant_method;
+        setup_cfg.num_hidden_layers = facts_.num_hidden_layers;
+        setup_cfg.num_experts = facts_.num_experts;
+        setup_cfg.num_experts_per_tok = facts_.num_experts_per_tok;
+        setup_cfg.mxfp4_moe = mxfp4_moe_;
         setup_cfg.storage_page_size = storage_page_size_;
         // Create + `setup()` the executor ON THE WORKER THREAD (Phase 3, §7):
         // MetalExecutor::setup builds the Metal device/heap/PSOs, which must
@@ -2045,8 +2088,9 @@ class Context::Impl {
     ModelFacts facts_{};
     std::string caps_json_;
     std::string device_facts_json_;
-    std::vector<std::uint8_t> load_plan_bytes_;
-    std::uint64_t compiler_version_ = 0;
+    std::string runtime_quant_;
+    pie_loader::PieLoaderMxfp4MoeRequest mxfp4_moe_ =
+        pie_loader::PieLoaderMxfp4MoeRequest::Auto;
     bool load_attempted_ = false;
     std::uint32_t storage_page_size_ = 1;
     PieRuntimeCallbacks runtime_{};

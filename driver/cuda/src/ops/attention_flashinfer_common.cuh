@@ -293,6 +293,15 @@ struct DecodePlanCache {
     bool full_attention_variant = false;
     bool hnd_layout = false;
     bool valid = false;
+    // True when the plan was built by `plan_static_nonsplit_decode`, whose
+    // descriptor is `request_indices[r] = r`, `kv_tile_indices = 0`,
+    // `o_indptr[r] = r`, `split_kv = false` -- a schedule that does NOT depend
+    // on the page counts it was planned with. That independence is what lets a
+    // caller hand the *launch* a different (compacted) page list than the one
+    // it planned against, which is how `attn_page_mask` restricts a layer's
+    // attention without a replan. Under any other plan the arrays ARE derived
+    // from page counts, and substituting a shorter list is silently wrong.
+    bool page_count_independent = false;
     int static_nonsplit_num_requests = 0;
     std::vector<IdType> static_request_indices;
     std::vector<IdType> static_kv_tile_indices;

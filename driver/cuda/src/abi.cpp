@@ -104,7 +104,13 @@ extern "C" int32_t pie_cuda_bind_instance(PieDriver* driver,
     if (driver == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
     try {
         return as_context(driver)->bind_instance(*instance, binding);
+    } catch (const std::exception& e) {
+        std::cerr << "[pie-driver-cuda] bind_instance threw: " << e.what()
+                  << "\n";
+        return PIE_STATUS_DRIVER_ERROR;
     } catch (...) {
+        std::cerr << "[pie-driver-cuda] bind_instance threw a non-standard "
+                     "exception\n";
         return PIE_STATUS_DRIVER_ERROR;
     }
 }

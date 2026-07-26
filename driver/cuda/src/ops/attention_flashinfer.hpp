@@ -45,6 +45,12 @@ PrefillPlanCachePtr make_prefill_plan();
 std::uint32_t decode_plan_graph_layout(const DecodePlanCache& cache);
 std::uint32_t prefill_plan_graph_layout(const PrefillPlanCache& cache);
 
+// Whether this plan's schedule is independent of the page counts it was
+// planned against, and therefore whether the launch may be handed a different
+// (compacted) page list than the plan saw. Only the static non-split decode
+// plan qualifies. See `DecodePlanCache::page_count_independent`.
+bool decode_plan_is_page_count_independent(const DecodePlanCache& cache);
+
 // Compute decode plan once per fire. Stores results in `cache` and the
 // workspace's int/float buffers (so per-layer dispatch can read them).
 void plan_attention_flashinfer_decode_bf16(
@@ -194,6 +200,44 @@ void dispatch_attention_flashinfer_decode(
     float logits_soft_cap = 0.f,
     float sm_scale = -1.f,
     float* lse_out = nullptr);
+
+// As `dispatch_attention_flashinfer_decode`, but also records the attention
+// probability each live KV position received. Same refusals as the `_bf16`
+// entry point above.
+void dispatch_attention_flashinfer_decode_capture(
+    const DecodePlanCache& cache,
+    const void* q,
+    KvCacheLayerView kv_layer,
+    void* o,
+    const std::uint32_t* kv_page_indices_d,
+    const std::uint32_t* kv_page_indptr_d,
+    const std::uint32_t* kv_last_page_lens_d,
+    AttentionWorkspace& workspace,
+    cudaStream_t stream,
+    float* score_out,
+    const std::int32_t* score_indptr_d,
+    int window_left = -1,
+    float logits_soft_cap = 0.f,
+    float sm_scale = -1.f,
+    float* lse_out = nullptr);
+
+// Average the `[num_q_heads, kv_len(r)]` probability rows `score_out` holds
+// into one `[kv_len(r)]` row per request, written at
+// `folded + score_indptr[r] / num_q_heads`.
+//
+// Folding is not a convenience: the paged layout carries one page list per
+// request, so an eviction policy cannot act on a per-head keep-set. Averaging
+// (not summing) keeps the result a distribution over the live prefix.
+void launch_attn_score_fold_heads(
+    const float* scores,
+    const std::int32_t* score_indptr_d,
+    const std::uint32_t* kv_page_indptr_d,
+    const std::uint32_t* kv_last_page_lens_d,
+    int page_size,
+    int num_requests,
+    int num_q_heads,
+    float* folded,
+    cudaStream_t stream);
 
 void dispatch_attention_flashinfer_prefill_bf16(
     const PrefillPlanCache& cache,

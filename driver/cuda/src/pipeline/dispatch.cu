@@ -46,6 +46,8 @@
 #include "pipeline/page_translation.hpp"
 #include "batch/rs_metadata.hpp"
 #include "model/attn_observation.hpp"
+#include "model/attn_page_mask.hpp"
+#include "model/attn_score.hpp"
 #include "store/kv_cache.hpp"
 
 namespace pie_cuda_driver::pipeline {
@@ -1290,6 +1292,7 @@ struct Dispatch::Impl {
     bool attention_hook_coverage = false;
     std::uint32_t model_layers = 0;
     bool kv_envelopes_available = false;
+    bool attn_page_mask_available = false;
     std::function<void()> enable_kv_envelopes;
 };
 
@@ -2220,6 +2223,20 @@ bool stage_calls_kernel(
     return false;
 }
 
+bool stage_calls_sink(
+    const plan::StagePlan& stage,
+    std::string_view name) {
+    for (const auto& normalized : stage.ops) {
+        const auto& op = normalized.op;
+        if (op.tag != PTIR_OP_SINK_CALL) continue;
+        if (op.name_idx < stage.names.size() &&
+            stage.names[op.name_idx] == name) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool stage_uses_intrinsic(
     const plan::StagePlan& stage,
     std::uint16_t intrinsic) {
@@ -2833,11 +2850,43 @@ int Dispatch::register_program(std::uint64_t program_hash,
         for (const plan::NormalizedOp& normalized : stage.ops) {
             const auto& op = normalized.op;
             if (op.tag == PTIR_OP_SINK_CALL) {
-                if (err) {
-                    *err =
-                        "ptir model sinks are not implemented by the active CUDA model";
+                // Sinks are named like second-party kernels, and the same rule
+                // applies: a name the backend cannot honour has to be refused
+                // at bind rather than silently skipped, because a skipped
+                // configuration sink is a program whose selection never took
+                // effect while every test still passes.
+                const std::string& name =
+                    op.name_idx < stage.names.size()
+                        ? stage.names[op.name_idx]
+                        : std::string();
+                if (name != "attn_page_mask") {
+                    if (err) {
+                        *err =
+                            "ptir model sinks are not implemented by the active CUDA model";
+                    }
+                    return PIE_STATUS_UNSUPPORTED;
                 }
-                return PIE_STATUS_UNSUPPORTED;
+                if (stage.stage != PTIR_STAGE_ON_ATTN_PROJ) {
+                    // `SinkScope::Attention` also admits `Prologue`, but a
+                    // prologue mask cannot name a layer, and this consumer is
+                    // per-layer. Refusing is better than honouring it for
+                    // layer 0 only.
+                    if (err) {
+                        *err =
+                            "attn_page_mask is only available at the "
+                            "on_attn_proj stage";
+                    }
+                    return PIE_STATUS_UNSUPPORTED;
+                }
+                if (!impl_->attn_page_mask_available) {
+                    if (err) {
+                        *err =
+                            "attn_page_mask requires a decode attention path "
+                            "whose plan does not depend on the page count";
+                    }
+                    return PIE_STATUS_UNSUPPORTED;
+                }
+                continue;
             }
             if (op.tag == PTIR_OP_KERNEL_CALL) {
                 // Second-party kernels are named, not generic: the fused
@@ -2892,7 +2941,9 @@ int Dispatch::register_program(std::uint64_t program_hash,
                 ((stage.stage == PTIR_STAGE_ON_ATTN_PROJ ||
                   stage.stage == PTIR_STAGE_ON_ATTN) &&
                  (op.intr == PTIR_INTR_QUERY ||
-                  op.intr == PTIR_INTR_LAYER));
+                  op.intr == PTIR_INTR_LAYER)) ||
+                (stage.stage == PTIR_STAGE_ON_ATTN &&
+                 op.intr == PTIR_INTR_ATTN_SCORE);
             if (!valid) {
                 if (err) {
                     *err =
@@ -3220,6 +3271,10 @@ void Dispatch::set_kv_envelopes_available(
     impl_->enable_kv_envelopes = available ? std::move(enable) : nullptr;
 }
 
+void Dispatch::set_attn_page_mask_available(bool available) {
+    impl_->attn_page_mask_available = available;
+}
+
 void Dispatch::set_attention_hook_coverage(
     bool supported,
     std::uint32_t model_layers) {
@@ -3242,6 +3297,47 @@ bool Dispatch::launch_has_attention_stages(
                         stage.stage == PTIR_STAGE_ON_ATTN;
                 })) {
             return true;
+        }
+    }
+    return false;
+}
+
+bool Dispatch::launch_wants_attn_score(
+    const pie_native::LaunchView& view) const {
+    for (std::size_t program = 0;
+         program < view.ptir_program_hashes.size();
+         ++program) {
+        const auto* plans =
+            impl_->cache.plans(view.ptir_program_hashes.data()[program]);
+        if (plans == nullptr) continue;
+        for (const plan::StagePlan& stage : *plans) {
+            if (stage.stage != PTIR_STAGE_ON_ATTN) continue;
+            if (stage_uses_intrinsic(stage, PTIR_INTR_ATTN_SCORE)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool Dispatch::launch_wants_page_mask(
+    const pie_native::LaunchView& view) const {
+    for (std::size_t program = 0;
+         program < view.ptir_program_hashes.size();
+         ++program) {
+        const auto* plans =
+            impl_->cache.plans(view.ptir_program_hashes.data()[program]);
+        if (plans == nullptr) continue;
+        for (const plan::StagePlan& stage : *plans) {
+            if (stage.stage != PTIR_STAGE_ON_ATTN_PROJ) continue;
+            for (const plan::NormalizedOp& normalized : stage.ops) {
+                if (normalized.op.tag != PTIR_OP_SINK_CALL) continue;
+                const std::uint32_t name_idx = normalized.op.name_idx;
+                if (name_idx < stage.names.size() &&
+                    stage.names[name_idx] == "attn_page_mask") {
+                    return true;
+                }
+            }
         }
     }
     return false;
@@ -3514,6 +3610,142 @@ GroupedLaneEnvelope resolve_lane_envelope(
     };
 }
 
+// Materialize one lane's `[declared_kv_max]` attention-probability row from the
+// layer capture published by the model body.
+//
+// The capture is ragged and exactly `kv_len` wide; the program declared a static
+// ceiling (it cannot know `kv_len` at compile time, exactly like `envelope_dot`'s
+// `p_max`). So this pads to the declared width with zeros -- a position that does
+// not exist received no attention, which is already the correct value and sorts
+// to the bottom of every eviction ranking without needing a sentinel.
+//
+// Every disagreement here throws. Truncating a row that overflows the ceiling
+// would silently make the tail of the context un-evictable, and a zero row would
+// be indistinguishable from "evict everything": both are the class of failure
+// this driver's unchecked-contract list exists to prevent.
+// Resolve where this lane's `attn_page_mask` sink should write. Unlike every
+// other lane resolution this hands back a *mutable* slice: the buffer belongs
+// to the model body, which allocated it for the whole fire and re-seeds it to
+// "keep everything" before each layer's hook.
+GroupedLanePageMask resolve_lane_page_mask(
+    const StagedLane& lane,
+    std::uint32_t layer) {
+    model::AttentionMaskSink* sink = model::active_attention_mask_sink();
+    if (sink == nullptr || !sink->usable()) {
+        throw std::runtime_error(
+            "attn_page_mask ran on a fire with no page-mask destination");
+    }
+    const model::AttentionObservation* obs =
+        model::active_attention_observation();
+    if (obs == nullptr || !obs->usable()) {
+        throw std::runtime_error(
+            "attn_page_mask ran outside a model body with kv geometry");
+    }
+    if (static_cast<std::uint32_t>(obs->num_requests) != sink->num_requests) {
+        throw std::runtime_error(
+            "attn_page_mask destination and kv geometry disagree on request "
+            "count");
+    }
+
+    int request = -1;
+    for (int r = 0; r < obs->num_requests; ++r) {
+        if (obs->qo_indptr_h[r] == lane.token_start) {
+            request = r;
+            break;
+        }
+    }
+    if (request < 0) {
+        throw std::runtime_error(
+            "attn_page_mask lane does not start at a request boundary");
+    }
+
+    // Row base is the request index times a fixed stride -- never the page
+    // CSR. The lane's mask has to line up with the scores the lane read, and
+    // those are indexed "slot p of request r" too; going through a CSR would
+    // make both depend on a host table that the decode-envelope path only
+    // bounds. See `AttentionMaskSink`.
+    const std::uint32_t begin =
+        static_cast<std::uint32_t>(request) * sink->stride;
+
+    // Tag here rather than after the launch: the sink kernel is enqueued on the
+    // same stream immediately below, so by the time the model body's decode
+    // call reads the buffer the write has happened. Tagging on the host is what
+    // lets the consumer distinguish "this layer wrote a mask" from "a previous
+    // layer did" without a device round trip.
+    sink->written_layer = static_cast<int>(layer);
+    return GroupedLanePageMask{sink->keep + begin, sink->stride};
+}
+
+const float* resolve_lane_attn_score(
+    const StagedLane& lane,
+    std::uint32_t layer,
+    std::uint64_t declared_kv_max,
+    cudaStream_t stream,
+    std::vector<void*>& temporaries) {
+    const model::AttentionScores* scores = model::active_attention_scores();
+    if (scores == nullptr || !scores->usable()) {
+        throw std::runtime_error(
+            "attn_score ran on a fire that captured no attention scores");
+    }
+    if (scores->layer != layer) {
+        throw std::runtime_error(
+            "attn_score saw a capture from a different layer");
+    }
+    const model::AttentionObservation* obs =
+        model::active_attention_observation();
+    if (obs == nullptr || !obs->usable()) {
+        throw std::runtime_error(
+            "attn_score ran outside a model body with kv geometry");
+    }
+    if (static_cast<std::uint32_t>(obs->num_requests) !=
+        scores->num_requests) {
+        throw std::runtime_error(
+            "attn_score capture and kv geometry disagree on request count");
+    }
+    if (declared_kv_max == 0) {
+        throw std::runtime_error("attn_score declares an empty row");
+    }
+
+    int request = -1;
+    for (int r = 0; r < obs->num_requests; ++r) {
+        if (obs->qo_indptr_h[r] == lane.token_start) {
+            request = r;
+            break;
+        }
+    }
+    if (request < 0) {
+        throw std::runtime_error(
+            "attn_score lane does not start at a request boundary");
+    }
+
+    const std::uint32_t begin = scores->offsets_h[request];
+    const std::uint32_t end = scores->offsets_h[request + 1];
+    if (end < begin) {
+        throw std::runtime_error("attn_score saw a malformed capture CSR");
+    }
+    const std::uint32_t kv_len = end - begin;
+    if (static_cast<std::uint64_t>(kv_len) > declared_kv_max) {
+        throw std::runtime_error(
+            "attn_score declared kv_max " + std::to_string(declared_kv_max) +
+            " but the request holds " + std::to_string(kv_len) +
+            " kv positions; raise the program's ceiling");
+    }
+
+    float* row = nullptr;
+    CUDA_CHECK(cudaMallocAsync(
+        &row, declared_kv_max * sizeof(float), stream));
+    temporaries.push_back(row);
+    CUDA_CHECK(cudaMemsetAsync(
+        row, 0, declared_kv_max * sizeof(float), stream));
+    if (kv_len > 0) {
+        CUDA_CHECK(cudaMemcpyAsync(
+            row, scores->values + begin,
+            static_cast<std::size_t>(kv_len) * sizeof(float),
+            cudaMemcpyDeviceToDevice, stream));
+    }
+    return row;
+}
+
 GroupedLaneBinding make_staged_binding(
     StagedLane& lane,
     const plan::StagePlan& stage,
@@ -3635,6 +3867,18 @@ void execute_declared_phase(
         max_occurrences = std::max(
             max_occurrences, (*lane->phase_plans)[phase].size());
     }
+    // Per-lane intrinsic rows materialized below. Freed stream-ordered after
+    // every occurrence has been launched and every side stream rejoined, so
+    // the frees cannot outrun the kernels that read them.
+    struct PhaseTemporaries {
+        std::vector<void*> pointers;
+        cudaStream_t stream = nullptr;
+        ~PhaseTemporaries() {
+            for (void* pointer : pointers) {
+                cudaFreeAsync(pointer, stream);
+            }
+        }
+    } phase_temporaries{{}, stream};
     for (std::size_t occurrence = 0;
          occurrence < max_occurrences;
          ++occurrence) {
@@ -3682,6 +3926,10 @@ void execute_declared_phase(
                 binding.envelope = resolve_lane_envelope(
                     lane, query_base, query_columns, layer);
             }
+            if (stage_calls_sink(stage, "attn_page_mask")) {
+                binding.page_mask = resolve_lane_page_mask(lane, layer);
+            }
+            std::uint64_t attn_score_kv_max = 0;
             std::uint32_t value_base = 0;
             for (const auto& normalized : stage.ops) {
                 if (normalized.op.tag == PTIR_OP_INTRINSIC_VAL &&
@@ -3696,7 +3944,30 @@ void execute_declared_phase(
                             "program query tensor");
                     }
                 }
+                if (normalized.op.tag == PTIR_OP_INTRINSIC_VAL &&
+                    normalized.op.intr == PTIR_INTR_ATTN_SCORE) {
+                    if (value_base >= stage.value_types.size()) {
+                        throw std::runtime_error(
+                            "AttnScore intrinsic has no declared value type");
+                    }
+                    const std::uint64_t declared = grouped_numel(
+                        stage.value_types[value_base], binding);
+                    // One occurrence per stage may declare several reads; they
+                    // must agree, since one buffer backs them all.
+                    if (attn_score_kv_max != 0 &&
+                        attn_score_kv_max != declared) {
+                        throw std::runtime_error(
+                            "AttnScore is read at two different widths in one "
+                            "stage");
+                    }
+                    attn_score_kv_max = declared;
+                }
                 value_base += normalized.op.results;
+            }
+            if (attn_score_kv_max != 0) {
+                binding.attn_score_base = resolve_lane_attn_score(
+                    lane, layer, attn_score_kv_max, stream,
+                    phase_temporaries.pointers);
             }
             tasks.push_back(Task{
                 .lane = &lane,

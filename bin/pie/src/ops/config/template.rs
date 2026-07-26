@@ -62,7 +62,9 @@ port = 8080
 verbose = false
 registry = "https://registry.pie-project.org/"
 python_snapshot = true
-# max_concurrent_processes = 64           # global cap on in-flight inferlets
+# max_concurrent_processes = 64           # cap on in-flight inferlets
+                                          # (default: the driver's max forward
+                                          # requests, which is what fills a batch)
 
 [auth]
 enabled = false

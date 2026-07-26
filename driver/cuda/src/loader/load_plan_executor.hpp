@@ -12,7 +12,7 @@
 #include <utility>
 #include <vector>
 
-#include "pie_native/load_plan.hpp"
+#include "pie_loader/plan.hpp"
 #include "loader_config.hpp"
 #include "loader_helpers.hpp"
 #include "loader/dtype_map.hpp"
@@ -36,18 +36,17 @@
 #include "kernels/slab_scatter.hpp"  // slab_scatter() — the transcode kernels moved to transcode_engine.hpp
 #endif
 #include "loader/rust_quant_attachment.hpp"
-#include "loader/checkpoint_source.hpp"
+#include "pie_loader/checkpoint_source.hpp"
 #include "model/weight_store.hpp"
 #include "tensor.hpp"
 
 namespace pie_cuda_driver {
 
-namespace lp_cpp = pie_load_planner::cpp;
 
 class LoadPlanExecutor {
 public:
     LoadPlanExecutor(
-        CheckpointSource& loader,
+        pie_loader::CheckpointSource& loader,
         WeightStoreBuilder& weights,
         std::vector<RustQuantAttachment> quant_attachments)
         : loader_(loader),
@@ -63,7 +62,7 @@ public:
     }
 
     LoadExecutionStats execute(
-        const pie_load_planner::LoadPlanView& plan)
+        const pie_loader::LoadPlanView& plan)
     {
         LoadExecutionStats stats;
         stats.planned_tensor_count = plan.tensors.len;
@@ -85,14 +84,14 @@ public:
             const std::uint32_t instr_id = plan.schedule.ptr[i];
             const auto& instr = plan_index_.instruction(instr_id);
             if (trace_executor && (i < 128 || i % 1000 == 0 ||
-                    instr.kind != pie_load_planner::PieLoaderStorageInstrKind::Allocate)) {
+                    instr.kind != pie_loader::PieLoaderStorageInstrKind::Allocate)) {
                 std::cerr << "[pie-driver-cuda] storage executor instr[" << i
                           << "] id=" << instr.id
                           << " kind=" << static_cast<int>(instr.kind)
                           << " buffer=" << instr.buffer_id << "\n";
             }
             switch (instr.kind) {
-            case pie_load_planner::PieLoaderStorageInstrKind::Allocate:
+            case pie_loader::PieLoaderStorageInstrKind::Allocate:
                 if (allocate_requires_copy_flush(instr)) {
                     copy_engine_.flush();
                 }
@@ -105,41 +104,41 @@ public:
                               << instr.buffer_id << "\n";
                 }
                 break;
-            case pie_load_planner::PieLoaderStorageInstrKind::ExtentWrite:
+            case pie_loader::PieLoaderStorageInstrKind::ExtentWrite:
                 extent_write(instr, stats);
                 break;
-            case pie_load_planner::PieLoaderStorageInstrKind::BulkExtentWrite:
+            case pie_loader::PieLoaderStorageInstrKind::BulkExtentWrite:
                 bulk_extent_write(instr, stats);
                 break;
-            case pie_load_planner::PieLoaderStorageInstrKind::SlabScatter:
+            case pie_loader::PieLoaderStorageInstrKind::SlabScatter:
                 copy_engine_.flush();
                 {
                     PhaseTimer _pt(&stats.phase_transform_ms);
                     slab_scatter(instr, stats);
                 }
                 break;
-            case pie_load_planner::PieLoaderStorageInstrKind::Finalize:
+            case pie_loader::PieLoaderStorageInstrKind::Finalize:
                 {
                     PhaseTimer _pt(&stats.phase_transform_ms);
                     finalize(plan, instr, stats);
                 }
                 break;
-            case pie_load_planner::PieLoaderStorageInstrKind::TileMap:
+            case pie_loader::PieLoaderStorageInstrKind::TileMap:
                 copy_engine_.flush();
                 {
                     PhaseTimer _pt(&stats.phase_transform_ms);
                     transcode_.tile_map(instr, stats);
                 }
                 break;
-            case pie_load_planner::PieLoaderStorageInstrKind::CreateView:
+            case pie_loader::PieLoaderStorageInstrKind::CreateView:
                 copy_engine_.flush();
                 create_view(plan, instr);
                 break;
-            case pie_load_planner::PieLoaderStorageInstrKind::Release:
+            case pie_loader::PieLoaderStorageInstrKind::Release:
                 copy_engine_.flush();
                 buffers_.erase(instr.buffer_id);
                 break;
-            case pie_load_planner::PieLoaderStorageInstrKind::Attach:
+            case pie_loader::PieLoaderStorageInstrKind::Attach:
                 copy_engine_.flush();
                 break;
             }
@@ -153,8 +152,8 @@ public:
 
 private:
     void allocate(
-        const pie_load_planner::LoadPlanView& plan,
-        const pie_load_planner::PieLoaderStorageInstrView& instr)
+        const pie_loader::LoadPlanView& plan,
+        const pie_loader::PieLoaderStorageInstrView& instr)
     {
         const auto& buffer = plan_index_.buffer(instr.buffer_id);
         if (try_allocate_persistent_arena_view(buffer)) {
@@ -170,14 +169,14 @@ private:
         }
         const auto& tensor = plan_index_.tensor(buffer.tensor_id);
         if (tensor.encoding_kind ==
-            pie_load_planner::PieLoaderEncodingKind::Quant) {
+            pie_loader::PieLoaderEncodingKind::Quant) {
             const DType physical = quant_physical_dtype(tensor);
             if (physical == DType::FP8_E4M3 || physical == DType::INT8) {
                 buffers_.emplace(
                     buffer.id,
                     DeviceTensor::allocate(
                         physical,
-                        lp_cpp::i64_slice_to_vector(tensor.shape)));
+                        pie_loader::i64_slice_to_vector(tensor.shape)));
                 return;
             }
             buffers_.emplace(
@@ -191,18 +190,18 @@ private:
             buffer.id,
             DeviceTensor::allocate(
                 dtype_from_rust(tensor.dtype),
-                lp_cpp::i64_slice_to_vector(tensor.shape)));
+                pie_loader::i64_slice_to_vector(tensor.shape)));
     }
 
     bool allocate_requires_copy_flush(
-        const pie_load_planner::PieLoaderStorageInstrView& instr) const
+        const pie_loader::PieLoaderStorageInstrView& instr) const
     {
         const auto& buffer = plan_index_.buffer(instr.buffer_id);
         return !can_allocate_persistent_arena_view(buffer);
     }
 
     void init_persistent_arena(
-        const pie_load_planner::LoadPlanView& plan)
+        const pie_loader::LoadPlanView& plan)
     {
         if (loader_config::env_truthy("PIE_CUDA_DISABLE_WEIGHT_ARENA")) {
             return;
@@ -220,14 +219,12 @@ private:
         spec.name = persistent_arena_name_;
         spec.dtype = DType::UINT8;
         spec.shape = {static_cast<std::int64_t>(persistent_arena_bytes_)};
-        spec.layout = TensorLayoutKind::Dense;
         spec.ownership = TensorOwnershipKind::Owned;
-        spec.parallel = TensorParallelKind::Replicated;
         weights_.insert(persistent_arena_name_, std::move(arena), std::move(spec));
     }
 
     bool try_allocate_persistent_arena_view(
-        const pie_load_planner::PieLoaderBufferDeclView& buffer)
+        const pie_loader::PieLoaderBufferDeclView& buffer)
     {
         if (!can_allocate_persistent_arena_view(buffer)) {
             return false;
@@ -247,18 +244,18 @@ private:
         DType dtype = DType::UINT8;
         std::vector<std::int64_t> shape;
         if (tensor.encoding_kind ==
-            pie_load_planner::PieLoaderEncodingKind::Quant) {
+            pie_loader::PieLoaderEncodingKind::Quant) {
             const DType physical = quant_physical_dtype(tensor);
             if (physical == DType::FP8_E4M3 || physical == DType::INT8) {
                 dtype = physical;
-                shape = lp_cpp::i64_slice_to_vector(tensor.shape);
+                shape = pie_loader::i64_slice_to_vector(tensor.shape);
             } else {
                 dtype = DType::UINT8;
                 shape = {static_cast<std::int64_t>(buffer.bytes)};
             }
         } else {
             dtype = dtype_from_rust(tensor.dtype);
-            shape = lp_cpp::i64_slice_to_vector(tensor.shape);
+            shape = pie_loader::i64_slice_to_vector(tensor.shape);
         }
         buffers_.emplace(
             buffer.id,
@@ -268,14 +265,14 @@ private:
     }
 
     bool can_allocate_persistent_arena_view(
-        const pie_load_planner::PieLoaderBufferDeclView& buffer) const
+        const pie_loader::PieLoaderBufferDeclView& buffer) const
     {
         return persistent_arena_base_ != nullptr && buffer.has_tensor &&
             !buffer.temporary && buffer.bytes != 0;
     }
 
     void extent_write(
-        const pie_load_planner::PieLoaderStorageInstrView& instr,
+        const pie_loader::PieLoaderStorageInstrView& instr,
         LoadExecutionStats& stats)
     {
         if (!instr.has_source || !instr.has_dest) {
@@ -289,16 +286,19 @@ private:
         }
         auto* dst = static_cast<std::uint8_t*>(dst_it->second.data()) +
             instr.dest.offset + instr.dest.stride.base_offset;
-        if (!lp_cpp::compact_extent(instr.dest.stride)) {
+        if (!pie_loader::compact_extent(instr.dest.stride)) {
             throw std::runtime_error(
                 "rust storage executor: non-compact ExtentWrite destination is not "
                 "implemented");
         }
-        if (!lp_cpp::compact_extent(instr.source.stride)) {
+        if (!pie_loader::compact_extent(instr.source.stride)) {
+            const std::uint64_t dst_offset =
+                instr.dest.offset + instr.dest.stride.base_offset;
+            const std::uint64_t dst_total = dst_it->second.nbytes();
             copy_strided_extent_to_device(
                 loader_, instr,
                 dst,
-                lp_cpp::extent_shape(instr.dest.stride));
+                dst_offset > dst_total ? 0 : dst_total - dst_offset);
             return;
         }
         copy_engine_.queue(
@@ -311,7 +311,7 @@ private:
     }
 
     void bulk_extent_write(
-        const pie_load_planner::PieLoaderStorageInstrView& instr,
+        const pie_loader::PieLoaderStorageInstrView& instr,
         LoadExecutionStats& stats)
     {
         if (persistent_arena_base_ == nullptr) {
@@ -341,7 +341,7 @@ private:
     }
 
     void slab_scatter(
-        const pie_load_planner::PieLoaderStorageInstrView& instr,
+        const pie_loader::PieLoaderStorageInstrView& instr,
         LoadExecutionStats& stats)
     {
 #if PIE_CUDA_RUST_STORAGE_EXECUTOR_HAS_CUDA
@@ -378,7 +378,7 @@ private:
         }
 
         cudaStream_t stream = copy_engine_.acquire_stream();
-        loader_.copy_storage_bytes_to_device_async(
+        copy_engine_.copy_span_to_device(
             instr.slab_file_id,
             instr.slab_file_offset,
             instr.slab_span_bytes,
@@ -459,13 +459,13 @@ private:
 #endif
 
     void create_view(
-        const pie_load_planner::LoadPlanView& plan,
-        const pie_load_planner::PieLoaderStorageInstrView& instr)
+        const pie_loader::LoadPlanView& plan,
+        const pie_loader::PieLoaderStorageInstrView& instr)
     {
         const auto inputs =
-            lp_cpp::buffer_id_slice_to_vector(instr.input_buffers);
+            pie_loader::buffer_id_slice_to_vector(instr.input_buffers);
         const auto outputs =
-            lp_cpp::buffer_id_slice_to_vector(instr.output_buffers);
+            pie_loader::buffer_id_slice_to_vector(instr.output_buffers);
         if (inputs.size() != 1 || outputs.size() != 1 || !instr.has_dest) {
             throw std::runtime_error(
                 "rust storage executor: CreateView expects one input, one "
@@ -481,7 +481,7 @@ private:
                 "tensor declaration");
         }
         const auto& tensor = plan_index_.tensor(output_buffer.tensor_id);
-        const auto shape = lp_cpp::i64_slice_to_vector(tensor.shape);
+        const auto shape = pie_loader::i64_slice_to_vector(tensor.shape);
         const auto* input_base =
             static_cast<const std::uint8_t*>(input.data()) + instr.dest.offset +
             instr.dest.stride.base_offset;
@@ -500,7 +500,7 @@ private:
             const auto& input_buffer = plan_index_.buffer(input_id);
             if (input_buffer.has_tensor) {
                 backing_name =
-                    lp_cpp::bytes_to_string(
+                    pie_loader::bytes_to_string(
                         plan_index_.tensor(input_buffer.tensor_id).name);
             }
         }
@@ -510,8 +510,8 @@ private:
     }
 
     void finalize(
-        const pie_load_planner::LoadPlanView& plan,
-        const pie_load_planner::PieLoaderStorageInstrView& instr,
+        const pie_loader::LoadPlanView& plan,
+        const pie_loader::PieLoaderStorageInstrView& instr,
         LoadExecutionStats& stats)
     {
         auto buffer = buffers_.extract(instr.buffer_id);
@@ -522,37 +522,33 @@ private:
         const auto& buffer_info = plan_index_.buffer(instr.buffer_id);
         const auto& tensor = plan_index_.tensor(buffer_info.tensor_id);
         TensorDecl spec;
-        spec.name = lp_cpp::bytes_to_string(tensor.name);
+        spec.name = pie_loader::bytes_to_string(tensor.name);
         if (tensor.encoding_kind ==
-            pie_load_planner::PieLoaderEncodingKind::Quant) {
+            pie_loader::PieLoaderEncodingKind::Quant) {
             const DType physical = quant_physical_dtype(tensor);
             if (physical == DType::FP8_E4M3 || physical == DType::INT8) {
                 spec.dtype = physical;
-                spec.shape = lp_cpp::i64_slice_to_vector(tensor.shape);
+                spec.shape = pie_loader::i64_slice_to_vector(tensor.shape);
             } else {
                 spec.dtype = DType::UINT8;
                 spec.shape = {static_cast<std::int64_t>(buffer.mapped().nbytes())};
             }
         } else {
             spec.dtype = dtype_from_rust(tensor.dtype);
-            spec.shape = lp_cpp::i64_slice_to_vector(tensor.shape);
+            spec.shape = pie_loader::i64_slice_to_vector(tensor.shape);
         }
-        spec.layout = TensorLayoutKind::Dense;
         spec.ownership = TensorOwnershipKind::Owned;
-        spec.parallel = TensorParallelKind::Replicated;
         if (auto backing = view_backing_names_.find(instr.buffer_id);
             backing != view_backing_names_.end()) {
-            spec.layout = TensorLayoutKind::View;
             spec.ownership = TensorOwnershipKind::BorrowedView;
             spec.backing_tensor = backing->second;
         } else if (auto backing = arena_backing_names_.find(instr.buffer_id);
                    backing != arena_backing_names_.end()) {
-            spec.layout = TensorLayoutKind::View;
             spec.ownership = TensorOwnershipKind::BorrowedView;
             spec.backing_tensor = backing->second;
         }
         stats.loaded_bytes += buffer.mapped().nbytes();
-        const std::string runtime_name = lp_cpp::bytes_to_string(instr.name);
+        const std::string runtime_name = pie_loader::bytes_to_string(instr.name);
         weights_.insert(
             runtime_name,
             std::move(buffer.mapped()),
@@ -618,14 +614,16 @@ private:
                     attachment.scale_tensor_name + "' for '" +
                     attachment.tensor_name + "' was not finalized");
             }
-            // MXFP4 (group_size 32) keeps its raw E8M0 byte scale: the
-            // MXFP4 GEMM / dequant kernels and make_expert_weight_view all
-            // require U8 E8M0 bytes (gemm.cpp asserts scale_dtype==UINT8).
-            // Only the block-scaled FP8 path (e.g. DeepSeek-V4, group 128)
-            // wants the E8M0 bytes expanded to F32 2^(b-127) factors.
-            const bool is_mxfp4_scale = (attachment.group_size == 32);
+            // Some kernels want the scale bytes as they are — the MXFP4 GEMM,
+            // the dequant kernels and make_expert_weight_view all require U8
+            // E8M0 and gemm.cpp asserts on it — while the block-scaled FP8 path
+            // wants them expanded to F32 2^(b-127) factors. The plan says which
+            // (`load_plan.rs`, `ScaleForm`); this used to be inferred from
+            // `group_size == 32`, which held only because MXFP4 happens to be
+            // the one scheme with that group size.
             std::string scale_name = attachment.scale_tensor_name;
-            if (!is_mxfp4_scale) {
+            if (attachment.scale_form ==
+                pie_loader::PieLoaderScaleForm::F32Factors) {
                 convert_block_scale_to_f32(attachment.scale_tensor_name);
                 const std::string f32_name =
                     attachment.scale_tensor_name + ".f32";
@@ -643,7 +641,7 @@ private:
         }
     }
 
-    CheckpointSource& loader_;
+    pie_loader::CheckpointSource& loader_;
     WeightStoreBuilder& weights_;
     std::vector<RustQuantAttachment> quant_attachments_;
     std::unordered_map<std::uint32_t, DeviceTensor> buffers_;
@@ -663,7 +661,7 @@ private:
     std::vector<SlabScatterPlacement> slab_placement_host_;
 
 #endif
-    lp_cpp::LoadPlanIndex plan_index_{"load plan executor"};
+    pie_loader::LoadPlanIndex plan_index_{"load plan executor"};
     BufferResolver resolver_{buffers_, finalized_buffer_names_, weights_};
     TranscodeEngine transcode_{loader_, copy_engine_, plan_index_, resolver_};
 };

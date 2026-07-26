@@ -32,6 +32,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "loader/load_plan.hpp"
 #include "pie_native/ptir/fire_geometry.hpp"
 
 namespace pie::metal {
@@ -185,8 +186,20 @@ struct SetupConfig {
     std::uint32_t kv_page_size = 0;
     std::uint32_t max_forward_tokens = 1;
     std::uint32_t max_forward_requests = 1;
-    std::vector<std::uint8_t> load_plan;
-    std::uint64_t compiler_version = 0;
+    // The load *request*, not a compiled plan: `setup()` calls the loader
+    // itself, because only the driver knows the device
+    // (`loader/architecture.md` §3).
+    std::string snapshot_dir;
+    std::string runtime_quant;
+    // The model facts the loader's storage compile keys off; the driver states
+    // them so the loader never opens `config.json` (§10.4).
+    std::string model_type;
+    std::string quant_method;
+    std::uint32_t num_hidden_layers = 0;
+    std::uint32_t num_experts = 0;
+    std::uint32_t num_experts_per_tok = 0;
+    pie_loader::PieLoaderMxfp4MoeRequest mxfp4_moe =
+        pie_loader::PieLoaderMxfp4MoeRequest::Auto;
     std::uint32_t storage_page_size = 1;
 };
 

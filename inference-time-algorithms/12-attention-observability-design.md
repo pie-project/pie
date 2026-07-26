@@ -487,7 +487,7 @@ applied. It is also fixed per layer, whereas Quest's saving grows with context,
 so the number to beat is not 24% but 24% measured at a context long enough for
 attention to dominate. This should be re-measured at 8K-128K once §8.6 lands.
 
-### 8.6 What remains: mask consumption
+### 8.6 Mask consumption: the design (built; see §10)
 
 The one piece of Track A not built. The design is now fully determined by two
 findings, both verified against the sources:
@@ -547,3 +547,304 @@ question should be settled first, against `fused_runtime.cuh:1901`,
    has no settled envelope, so it is pinned rather than scored from partial
    data. Fail-safe, and it coincides with Quest's "keep the local window".
 3. **Selection is observed, not enforced** (§8.6).
+
+---
+
+## 9. Track B as built (implementation record)
+
+### 9.1 What runs
+
+`tova-attention` reads the real softmax attention weights, at **all 28 layers**,
+on real hardware, for every decode fire. `test_curated.py` is **37/37**.
+
+The row is self-validating and the test exploits that: each layer contributes a
+distribution over the live prefix, so the folded row must sum to exactly
+`layers_observed`. Measured: `score_mass = 27.99999` against 28 layers.
+
+The scores discriminate. On a prompt whose answer sits at the front, TOVA's
+keep-set comes out as `[0..7, 12, 17, 97..102]` — the attention sink plus a
+recency window — and the first eviction is position 48, mid-filler. That is the
+published behaviour of the algorithm, not merely a well-formed buffer.
+
+| Commit | Content |
+|---|---|
+| `1a8f62d65` | Layer 1 — observe attention scores through a FlashInfer variant |
+| `800fe40b6` | Layer 2 — the `AttnScore` intrinsic in the PTIR ABI |
+| (this) | Layer 3 — capture wired into the forward, bound at `OnAttn` |
+
+### 9.2 The intrinsic table stride was hardcoded at 7, and `AttnScore` is 7
+
+`fused_runtime.cuh` sized the per-lane intrinsic side tables (bases / modes /
+widths / strides / offsets) at `lane_count * 7`, and `fused_codegen.hpp` emitted
+`dispatch_lane * 7u + p.intr` into the **generated device source**. `AttnScore`
+is id 7. The read would not have faulted — it would have returned
+`intrinsic_bases[lane*7 + 7]`, which is the **next lane's `Logits` base**.
+
+Two things make this worth recording. First, the constant lived in two places,
+one of them a string literal inside a code generator, so a reader checking the
+host packer would have seen nothing wrong. Second, the emitted source is cached
+as cubins on disk keyed by `kCudaGeneratedEmitterVersion`, so widening the
+stride without bumping that version would have left every existing machine
+replaying the old stride against the new host layout.
+
+Both sites now derive from one `kPtirIntrinsicSlots = PTIR_INTR_ATTN_SCORE + 1`
+with a `static_assert`, and the emitter version went 18 -> 19.
+
+This is contract-family #4's shape: a fast path indexed by an id that the id
+space quietly outgrew.
+
+### 9.3 The host page CSR is an upper bound; the device CSR is exact
+
+**This is the bug that cost the most, and it is a new instance of contract #3.**
+
+`AttentionObservation` carries the fire's host-side page CSR. `frame.cpp` is
+free to replace that CSR with a *conservative* one before the body runs — graph
+lattice padding (`:1869`) and the decode-envelope KV bound (`:1818`, which
+assigns `kv_last_page_lens = page_size` for every request) both do. The **device**
+CSR the attention kernel reads stays exact.
+
+So `LayerScoreCapture` sized its ragged buffers from the host CSR (an upper
+bound), while the capture and fold kernels wrote exactly `kv_len` entries as
+derived from the device CSR. The slack between the two was never written, and
+`cudaMallocAsync` hands back recently-freed memory: the tail of the score row
+was **live garbage from a previous fire**.
+
+The failure signature is worth remembering:
+
+- It was **not** deterministic. Three runs in five were clean.
+- It was **not** wrong from the start. The first three or four fires of a run
+  were exact, then the observed length pinned to the bound and stuck.
+- It was **not** loud. The garbage was ~1e-5 in magnitude, so the row still
+  summed to 28 and still looked like a distribution.
+
+An eviction policy fed that row keeps positions that do not exist and drops real
+ones — silently, and only sometimes.
+
+The fix is to `cudaMemsetAsync` the folded buffer at allocation. That is not
+papering over the gap: `0.0` is the intrinsic's *defined* value for a position
+past `kv_len`, because a position that does not exist received no attention.
+
+The general rule this reinforces: **a host-side CSR handed to a model body is a
+bound, not a measurement.** Anything sized from it must zero the slack, and
+anything that needs the true length must derive it from the device CSR — which
+is what `k_attn_score_normalize` and `k_attn_score_fold_heads` already do.
+
+The regression test asserts the declared and observed lengths agree on **every**
+fire, not just the last one, because the first fires were clean.
+
+### 9.4 `GroupedStageStaticPlan` is a hard gate at registration, not routing
+
+`GroupedStageStaticPlan::valid == false` reads like a "cannot go grouped, fall
+back to fused" routing decision, and inside `try_add` it is exactly that. But
+`Dispatch::register_program` (`dispatch.cu:2971`) constructs the same plan and
+**refuses the whole program** when it is invalid. A stage reading a new
+intrinsic therefore has to be described there even though only the fused path
+can serve it — the same status `requires_kernel_call` already has for
+`envelope_dot`.
+
+### 9.5 Prefill needs no capture path
+
+The concern was that real inferlets prefill first, so a decode-only capture
+would throw on the first fire. It does not arise: the repo's own pattern is a
+**separate tap-free `ForwardPass` for prefill** (`quest-attention` does this,
+and `tova-attention` follows it). That is also correct on the algorithm's terms
+— TOVA ranks by the most recent query token, and during prefill "most recent" is
+still moving.
+
+### 9.6 Capability gating
+
+`has_attn_score` is true only where every decode fire lands on the plain paged
+decode path: llama-like family, `tp == 1`, native bf16 non-HND pages, no sliding
+window, and `use_prefill_decode_plan` off (SM90+ routes decode through the
+prefill kernel, which has no capture variant). A windowed layer additionally
+passes `capturable = false` so the capture is never constructed — a row that
+described a truncated context while claiming to describe all of it would be
+wrong in exactly the way §9.3 is about.
+
+### 9.7 Deviations from the papers, as built
+
+1. **Heads are folded by the backend.** TOVA ranks per head; one page list per
+   request means a per-head keep-set has no representable consumer. The backend
+   returns the mean over query heads. Identical collapse, identical reason, as
+   Quest (§8.7.1).
+2. **Layers are folded by the program.** TOVA keeps a cache per layer; the
+   inferlet sums the per-layer rows and ranks the sum. This is the
+   layer-uniform variant TOVA itself evaluates, and it is monotone-equivalent
+   to the mean.
+3. **Selection is observed, not enforced.** As with Quest, the mask does not yet
+   reach attention, so output is bit-identical to `naive-baseline` — which is
+   what makes the tap testable.
+
+### 9.8 Measured cost, and what the tap actually costs
+
+The `LogitsTransform` capture is the one part of Track B that touches a tuned
+kernel, so it was measured in isolation rather than inferred from end-to-end
+timings. `test_attn_score_capture` gained a `PIE_ATTN_SCORE_BENCH=1` mode that
+runs both decode entry points against an *identical plan* behind CUDA events —
+the only way to attribute cost to the kernel rather than to the PTIR stage
+machinery wrapped around it.
+
+L40S, head_dim 128, 16 query heads over 8 KV heads, one request:
+
+| `kv_len` | plain | capture (initial) | capture (after §9.8 fix) |
+|---:|---:|---:|---:|
+| 512 | 0.0179 ms | 1.49x | **1.34x** |
+| 2048 | 0.0646 ms | 1.39x | **1.23x** |
+| 6400 | 0.1971 ms | 1.37x | **1.21x** |
+| 16384 | 0.5005 ms | 1.36x | **1.20x** |
+
+**The fix was one hoisted load.** The hook dereferenced
+`params.score_indptr[batch_idx]` on *every* invocation — a global load on the
+kernel's innermost loop, sitting on the dependency path of the store address.
+It is loop-invariant per CTA, so it moved into the variant's constructor beside
+the inherited `kv_len`, and the store became `score_row[qo_head * len + kv]`.
+That removed roughly 44% of the capture overhead. The residual ~1.20x is the
+scattered 4-byte store itself: only `threadIdx.x == 0` writes, so a warp
+contributes two active lanes writing addresses `kv_len` floats apart, which is
+one memory sector per useful 4 bytes. Coalescing it would require restructuring
+the kernel's thread mapping, which is exactly what using a supported extension
+point buys us out of.
+
+**Why the residual is acceptable, and why it is not the number to optimise.**
+The tap's cost is proportional to `kv_len`, and so is the attention it rides on
+— but H2O and TOVA *bound* `kv_len` by construction. Once §8.6-style mask
+consumption lands, a TOVA run with `cache_size = 64` keeps 64 positions
+resident no matter how long the context is, so the 1.20x multiplies a base that
+has itself collapsed. Measuring the tap before eviction exists measures the
+worst case the design can ever exhibit.
+
+This contrasts sharply with Quest, and the contrast is the useful result:
+
+| | ctx ~408 | ctx ~6408 |
+|---|---:|---:|
+| `quest-attention` | +14.6% | **+11.8%** |
+| `tova-attention` (pre-fix) | +20.5% | **+32.0%** |
+
+Quest's tap is a *fixed* per-layer cost — it reads page envelopes, whose count
+is `kv_len / page_size` — so it amortises as context grows. Track B's is
+`O(kv_len)` because it observes every position, so it does not. That asymmetry
+is inherent to what the two algorithms need to know, not an artefact.
+
+**A measurement caveat worth recording.** End-to-end `ms/token` on this host is
+host-bound (§8.5) and the host is shared; a run taken at load average ~28
+reported `naive-baseline` at 8.08 ms/token against 6.34 ms/token an hour
+earlier, and showed `tova-attention` as *faster* than the baseline it strictly
+dominates. Kernel-level claims in this document come from the CUDA-event
+harness, which measures device time and is immune to that.
+
+---
+
+## 10. Mask consumption as built (implementation record)
+
+The last piece of both tracks, and the one that turns observation into
+enforcement. Until this landed, every Quest test passed *whether or not the
+mask was applied* — the program ranked pages, the driver read the ranking, and
+attention then ignored it. The cost was real and the benefit was zero.
+
+### 10.1 What runs
+
+`quest-attention` on Qwen3-0.6B / L40S, `PIE_CUDA_KV_ENVELOPES=1`:
+
+| budget | continuation |
+|---|---|
+| 18 (= all pages) | ` (This is a list of statements about Paris. Please answer` |
+| 1 | ` (Question: What is the probability that a randomly selected person` |
+| `naive-baseline` | ` (This is a list of statements about Paris. Please answer` |
+
+Both halves matter and they pull in opposite directions:
+
+- **Enforcement** — budget 1 diverges. Attention really is confined to the
+  pages the policy kept.
+- **Coherence** — budget 18 reproduces the unmasked baseline *token for token*.
+  An all-keep mask is a no-op, so the compaction does not reorder pages, drop
+  the wrong one, or desynchronise `last_page_len` from the list it belongs to.
+
+`tests/inferlets/test_mask_enforced.py` asserts exactly this pair. The curated
+matrix is 37/37 with the sink live.
+
+### 10.2 The mask must not be addressed by the page CSR
+
+This is the whole difficulty, and the first design was wrong about it.
+
+The obvious layout is one mask byte per page, sliced per request by the fire's
+`kv_page_indptr` — the same CSR everything else in the fire uses. It cannot
+work, for the reason §9.3 gives: **the host page CSR is a bound, the device CSR
+is exact.** The mask is written from the host (that is where the lane table and
+the program's value live) and consumed by a device kernel walking the real page
+table. Under decode envelopes those two CSRs disagree — `frame.cpp` substitutes
+`plan_kv_page_indptr` and a uniform `page_size` for the host copies while the
+device resolves the true geometry itself — so request *r*'s mask row and
+request *r*'s page list start at different offsets. Every eviction after the
+first request lands on another request's pages.
+
+That is not a hypothetical path. It is *the* path: Quest's `page_indptr` is
+device-computed, so `has_decode_envelopes` is true for exactly the fires the
+feature exists to serve. An earlier revision detected the hazard and threw,
+which was correct but left the feature unreachable.
+
+**The fix is to delete the shared dependency rather than reconcile it.** The
+mask is `[num_requests, stride]`, row-major, addressed by *request index times a
+fixed stride* — the page CSR appears nowhere in it. `stride` is the widest
+request's page count taken from the host CSR, so a conservative host CSR only
+over-allocates; it never mis-addresses. The single fact the writer and the
+reader must agree on is "slot *p* of request *r*", which is precisely what the
+program means when it writes `mask[p]` from `scores[p]`, and precisely what
+`envelope_dot` meant when it produced `scores[p]`.
+
+Two consequences fall out, both in the safe direction:
+
+- A slot past the end of a row keeps its page (`page_survives`). Under the
+  stride invariant this is unreachable, but the stride comes from a host table
+  and the count from device geometry, so the check is what makes a disagreement
+  an over-attend rather than an out-of-bounds read.
+- Rows are seeded to 1 before every layer, and the sink writes only
+  `min(stride, declared)` entries. A page no policy examined is kept. The
+  alternative — evicting a page nothing scored — is not recoverable.
+
+`test_page_compact` case 7/8 pin this: they run the compaction with rows
+deliberately wider than any request needs, which is what the driver actually
+produces. A kernel that recovered the row base from `page_indptr_in` passes
+every other case in the file and fails these two.
+
+### 10.3 The compaction
+
+`launch_compact_page_csr` (`driver/cuda/src/kernels/page_compact.cu`) rewrites
+the fire's paged-KV CSR down to the kept pages, in three launches: count
+(`cub::BlockReduce`), exclusive-scan the per-request counts
+(`cub::BlockScan`, tiled with a `running` aggregate), scatter (tiled, order
+preserving). Three invariants:
+
+1. **Order is preserved.** FlashInfer's page list is positional; permuting it
+   permutes the KV it reads.
+2. **The last page always survives**, unconditionally. It holds the token this
+   fire is writing, and keeping it last is what lets `last_page_len` — and the
+   `kv_len = (pages-1)*page_size + last_page_len` identity built on it — carry
+   over from the original CSR untouched.
+3. **A request never drops to zero pages.**
+
+Substitution happens on the decode call only, and only after
+`decode_plan_is_page_count_independent` confirms the fire planned the static
+non-split path. A split-KV plan derives its tile indices *from* the page counts,
+so a shorter list would silently attend over the wrong tiles.
+
+### 10.4 A latent DSL bug: the name table was emitted in first-use order
+
+`intern_name` assigns indices in first-use order; the container requires the
+name table to be strictly sorted and unique. No program had ever used two
+second-party names, so nothing noticed. Quest using both `envelope_dot` and
+`attn_page_mask` — where the one used second sorts first — produced a container
+the loader rejected outright.
+
+Fixed in `builder.rs::build()` by sorting the table and remapping every
+`KernelCall`/`SinkCall` `name_idx`, mirroring the channel-gid remap directly
+above it. The remap is the half worth testing: sorting alone still loads, and
+silently invokes the wrong kernel.
+
+### 10.5 Capability gating
+
+`attn_page_mask` is a *first-party* sink in `KNOWN_SINKS`, so the validator
+never gated it — a program would bind on any backend and no-op on the ones that
+cannot enforce. `has_attn_page_mask` now travels from the CUDA context through
+`PtirCaps` to `ModelProfile`, and `validate.rs` refuses the bind where it is
+false. Backends that only observe now say so at bind time rather than at
+runtime, or worse, never.

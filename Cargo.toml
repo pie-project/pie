@@ -47,7 +47,10 @@ members = [
     "compiler/codegen",
     "compiler/tests",
     "driver/dummy",
-    "runtime/load-planner",
+    # Weight loader: checkpoints -> verified device-memory layouts. Consumed by
+    # drivers at cold start, not by the serving runtime (see loader/architecture.md).
+    "loader",
+    "loader/cbindgen",
     "sdk/python-server",
     # Thin binary shells composing the `startup` skeleton + role lib(s). `bin/pie` is the
     # composition root (deps all three role libs; the standalone).

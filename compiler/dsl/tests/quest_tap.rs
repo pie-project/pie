@@ -202,3 +202,71 @@ fn the_tap_folds_over_layers_and_reseeds() {
         "the tap must fire exactly once per layer per fire"
     );
 }
+
+/// The name table is emitted SORTED, and every `name_idx` follows it.
+///
+/// `intern_name` hands out indices in first-use order, but the container's
+/// name table must be strictly sorted and unique — the loader rejects it
+/// otherwise. Nothing caught this until a program used two second-party names
+/// whose use order disagreed with their sort order, which is exactly what
+/// Quest does once it both scores pages (`envelope_dot`) and acts on the score
+/// (`attn_page_mask`): `attn_page_mask` is used second and sorts first.
+///
+/// The interesting half is the REMAP. Sorting the table while leaving the
+/// indices alone would still load, and would silently invoke the wrong kernel.
+#[test]
+fn the_name_table_is_sorted_and_indices_are_remapped() {
+    let mut b = Builder::new(V, PAGE_T);
+    b.stage(Stage::OnAttnProj, || {
+        // Used first, sorts second.
+        let scores = intrinsics::kernel::envelope_dot(PAGES);
+        // Used second, sorts first.
+        intrinsics::kernel::attn_page_mask(&gt(&scores, 0.0f32));
+    });
+    let t = b.build().expect("two second-party names trace");
+    let c = t.container();
+
+    assert_eq!(
+        c.names,
+        vec!["attn_page_mask".to_string(), "envelope_dot".to_string()],
+        "the name table must be sorted, not in first-use order"
+    );
+    let mut sorted = c.names.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(
+        c.names, sorted,
+        "the table must be strictly sorted and unique"
+    );
+
+    let tap = c
+        .stages
+        .iter()
+        .find(|s| s.stage == Stage::OnAttnProj)
+        .expect("OnAttnProj stage");
+    let kernel = tap
+        .ops
+        .iter()
+        .find_map(|op| match op {
+            Op::KernelCall { name, .. } => Some(*name),
+            _ => None,
+        })
+        .expect("envelope_dot lowers to Op::KernelCall");
+    let sink = tap
+        .ops
+        .iter()
+        .find_map(|op| match op {
+            Op::SinkCall { name, .. } => Some(*name),
+            _ => None,
+        })
+        .expect("attn_page_mask lowers to Op::SinkCall");
+
+    assert_eq!(
+        c.names[kernel as usize], "envelope_dot",
+        "the kernel call must still resolve to envelope_dot after the remap"
+    );
+    assert_eq!(
+        c.names[sink as usize], "attn_page_mask",
+        "the sink call must still resolve to attn_page_mask after the remap"
+    );
+}

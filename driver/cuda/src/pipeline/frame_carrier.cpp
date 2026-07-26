@@ -6,6 +6,8 @@
 // the tensor_io.cpp substrate it mirrors.
 
 #include "pipeline/frame_carrier.hpp"
+#include <mutex>
+#include <unordered_map>
 
 #include "pipeline/frame_carrier_kernels.hpp"
 
@@ -40,9 +42,37 @@ constexpr std::size_t kWordBytes = 64;  // 8 u64 ring-index words
 
 #define FC_CK(x) ck((x), #x)
 
+// One engine per process: the instance map has to be global, because an
+// instance is looked up by id from calls that may run with either device
+// current, and splitting the map by device makes those lookups miss.
+// Only the copy STREAM is device-owned — see `copy_stream()`.
 FrameCarrierEngine& FrameCarrierEngine::instance() {
     static FrameCarrierEngine engine;
     return engine;
+}
+
+// The copy stream for the CURRENT device, created on first use.
+//
+// A stream belongs to the device that was current when it was created, and
+// CUDA rejects an event recorded on one device against a stream from
+// another with "invalid resource handle". One process-wide stream is fine
+// under tensor parallelism (only the leader binds, so only one device ever
+// asks) but breaks the moment two data-parallel replicas share a process.
+//
+// The constructor's invariant is preserved where it matters: there is
+// still exactly ONE copy stream per device, so an instance's carries —
+// which all run on that instance's own device — still commit in enqueue
+// order, and `close_instance` still drains them with one sync.
+cudaStream_t FrameCarrierEngine::copy_stream() const {
+    int device = 0;
+    FC_CK(cudaGetDevice(&device));
+    std::lock_guard<std::mutex> guard(stream_mutex_);
+    auto it = streams_.find(device);
+    if (it != streams_.end()) return it->second;
+    cudaStream_t stream = nullptr;
+    FC_CK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    streams_.emplace(device, stream);
+    return stream;
 }
 
 FrameCarrierEngine::FrameCarrierEngine() {
@@ -53,10 +83,10 @@ FrameCarrierEngine::FrameCarrierEngine() {
     // + fires) runs on. Its FIFO ordering is what makes an instance's carries commit
     // in enqueue order → the monotonic head lands monotonically (no regression) AND
     // the D2H mirror stays fresh, even under X4 depth-2 run-ahead; and it's what
-    // `close_instance`'s single `cudaStreamSynchronize(stream_)` drains. If this ever
+    // `close_instance`'s single `cudaStreamSynchronize(copy_stream())` drains. If this ever
     // becomes multi-stream-per-instance (for D2H parallelism), the head publish must
     // switch to a monotonic-max store and close must drain per-instance events.
-    FC_CK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
+    // The stream itself is created lazily, per device, by `copy_stream()`.
 }
 
 FrameCarrierEngine::~FrameCarrierEngine() {
@@ -68,7 +98,9 @@ FrameCarrierEngine::~FrameCarrierEngine() {
         if (fi->host_words) cudaFreeHost(fi->host_words);
         delete fi;
     }
-    if (stream_) cudaStreamDestroy(stream_);
+    for (auto& entry : streams_) {
+        if (entry.second) cudaStreamDestroy(entry.second);
+    }
 }
 
 std::uint64_t FrameCarrierEngine::register_program(const std::uint8_t* /*trace*/,
@@ -244,11 +276,11 @@ void FrameCarrierEngine::publish_device(std::uint64_t instance, std::uint32_t n_
         if (src[c] != nullptr && fc.cell_bytes > 0) {
             const std::size_t slot = static_cast<std::size_t>(ring_index[c]) * fc.cell_bytes;
             FC_CK(cudaMemcpyAsync(static_cast<char*>(fi->host_mirror) + fc.mirror_off + slot,
-                                  src[c], fc.cell_bytes, cudaMemcpyDeviceToHost, stream_));
+                                  src[c], fc.cell_bytes, cudaMemcpyDeviceToHost, copy_stream()));
         }
     }
     launch_publish_words_if_committed(
-        fi->words_dev, commit_dev, n_channels, head, tail, pacing, stream_);
+        fi->words_dev, commit_dev, n_channels, head, tail, pacing, copy_stream());
 }
 
 std::uint32_t FrameCarrierEngine::layout(std::uint64_t instance, std::uint32_t n_channels,
@@ -282,7 +314,7 @@ void FrameCarrierEngine::close_instance(std::uint64_t instance) {
     // is engine-global + stable, so we sync OUTSIDE the registry lock (B1: never hold
     // a lock across a GPU wait). The runtime's InFlightTracker close-gate is the
     // higher-level B6 grace; this makes the carrier UAF-safe standalone too.
-    FC_CK(cudaStreamSynchronize(stream_));
+    FC_CK(cudaStreamSynchronize(copy_stream()));
     std::lock_guard<std::mutex> guard(mu_);
     FrameInstance* fi = lookup(instance);
     if (fi == nullptr) {
@@ -313,7 +345,7 @@ void FrameCarrierEngine::carry_in(std::uint64_t instance, const void* host_src,
         std::abort();
     }
     FC_CK(cudaMemcpyAsync(static_cast<char*>(fi->device_frame) + frame_offset, host_src,
-                          n_bytes, cudaMemcpyHostToDevice, stream_));
+                          n_bytes, cudaMemcpyHostToDevice, copy_stream()));
 }
 
 std::size_t FrameCarrierEngine::live_instances() const {

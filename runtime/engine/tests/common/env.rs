@@ -114,6 +114,7 @@ impl MockEnv {
                 has_mtp_drafts: true,
                 has_value_head: true,
                 has_kv_envelopes: false,
+                has_attn_page_mask: false,
                 has_attn_score: false,
                 device_geometry_port_mask: pie_driver_abi::PIE_DEVICE_GEOMETRY_PORTS,
                 limits: SchedulerLimits {

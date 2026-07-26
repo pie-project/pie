@@ -1,0 +1,15 @@
+[package]
+name = "tova-attention"
+version = "0.1.0"
+description = "TOVA token omission via attention — per-layer attention score observability"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", optional = true, description = "Prompt to send to the model"}
+temperature = {type = "float", optional = true, description = "Temperature applied before the Gumbel-max draw (default: 1.0)"}
+max_tokens = {type = "int", optional = true, description = "Number of generated tokens (default: 32)"}
+seed = {type = "int", optional = true, description = "RNG key for Gumbel-max sampling"}
+cache_size = {type = "int", optional = true, description = "KV positions TOVA would keep (default: 16)"}

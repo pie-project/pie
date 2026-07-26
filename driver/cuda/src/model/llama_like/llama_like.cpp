@@ -22,6 +22,8 @@
 #include "kernels/split_packed.hpp"
 #include "kernels/swiglu.hpp"
 #include "model/qwen3_vl/qwen3_vl_vision_forward.hpp"
+#include "model/attn_page_mask.hpp"
+#include "model/attn_score.hpp"
 #include "model/stage_hooks.hpp"
 #include "ops/attention_flashinfer.hpp"
 #include "ops/gemm.hpp"
@@ -420,6 +422,15 @@ void llama_like_forward_paged(
             stream);
     }
 
+    // Track A: the fire's page mask. Allocated once for the whole layer loop
+    // because page geometry belongs to the fire, not to the layer. The
+    // constructor is where a fire that cannot safely honour a mask is refused
+    // -- loudly, before any layer runs, rather than by quietly attending over
+    // the wrong pages.
+    const model::StageHooks* fire_hooks = model::active_stage_hooks;
+    model::FirePageMask page_mask(
+        fire_hooks != nullptr && fire_hooks->wants_page_mask, stream);
+
     const bool post_norm = fwd_cfg.norm_placement == NormPlacement::Post;
     bool have_next_attn_norm = false;
     bool have_final_norm = false;
@@ -591,6 +602,11 @@ void llama_like_forward_paged(
         // observer scoring it against the cached keys -- which are stored
         // post-rope -- compares in the same space. Placing it on the raw
         // projection instead would silently mis-rank pages for Quest.
+        // Re-seed to "keep everything" before the hook that may narrow it. A
+        // layer whose program writes no mask must attend over its full page
+        // list, and must never inherit the previous layer's selection.
+        page_mask.begin_layer(stream);
+
         invoke_stage_hook(
             StageHookPoint::OnAttnProj,
             ws.q.data(),
@@ -660,6 +676,54 @@ void llama_like_forward_paged(
                ? fwd_cfg.per_layer_window_left[L]
                : fwd_cfg.sliding_window;
 
+        // Track B: observe the attention this layer is about to compute, when
+        // the fire's PTIR programs read `AttnScore`. `LayerScoreCapture` is a
+        // no-op otherwise, and the substitution below is the whole cost --
+        // the scores come out of the kernel's own logits, so nothing is
+        // recomputed and nothing can drift from what attention actually used.
+        //
+        // Only the plain decode path is capture-capable. The other branches
+        // capture nothing, and the PTIR side then throws at the hook rather
+        // than handing a program a buffer nobody wrote.
+        // Track A: honour the page mask this layer's program wrote. The
+        // selection is applied by *gathering the page table* -- FlashInfer
+        // already takes the page list as a launch argument, so there is no
+        // kernel change and no replan. The fire's own CSR is left untouched:
+        // it remains the source of truth for the KV append and for `kv_len`,
+        // and compacting it in place would corrupt the cache.
+        const std::uint32_t* attn_page_indices = kv_page_indices;
+        const std::uint32_t* attn_page_indptr = kv_page_indptr;
+        const std::uint32_t* attn_last_page_lens = kv_last_page_lens;
+        if (page_mask.written_for(static_cast<std::uint32_t>(L))) {
+            if (!use_decode_path || decode_plan == nullptr) {
+                throw std::runtime_error(
+                    "attn_page_mask was written but this layer does not take "
+                    "the paged decode path, which is the only one whose page "
+                    "list can be substituted");
+            }
+            // A split-KV plan derives its request/tile indices FROM the page
+            // counts, so handing it a shorter list silently attends over the
+            // wrong tiles. The static non-split plan does not, which is why
+            // substitution is legal there and nowhere else.
+            if (!ops::decode_plan_is_page_count_independent(*decode_plan)) {
+                throw std::runtime_error(
+                    "attn_page_mask requires a page-count-independent decode "
+                    "plan; this fire planned split-KV");
+            }
+            page_mask.compact(
+                kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                static_cast<std::uint32_t>(R), stream);
+            attn_page_indices = page_mask.page_indices();
+            attn_page_indptr = page_mask.page_indptr();
+            attn_last_page_lens = page_mask.last_page_lens();
+        }
+
+        model::LayerScoreCapture score_capture(
+            static_cast<std::uint32_t>(L),
+            static_cast<std::uint32_t>(num_q_heads_local),
+            /*capturable=*/layer_window_left < 0,
+            stream);
+
         if (use_xqa_decode_path) {
             ops::launch_attention_xqa_decode_bf16_prepared(
                 attn_q, kv_view.k_bf16_pages, kv_view.v_bf16_pages, attn_out_buf,
@@ -676,12 +740,29 @@ void llama_like_forward_paged(
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 attn_ws, stream, /*logits_soft_cap=*/0.f, sm_scale_override);
         } else if (use_decode_path) {
-            ops::dispatch_attention_flashinfer_decode(
-                *decode_plan,
-                attn_q, kv_view, attn_out_buf,
-                kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                attn_ws, stream, layer_window_left,
-                /*logits_soft_cap=*/0.f, sm_scale_override);
+            if (score_capture.active()) {
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *decode_plan,
+                    attn_q, kv_view, attn_out_buf,
+                    attn_page_indices, attn_page_indptr, attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture.raw(), score_capture.indptr_d(),
+                    layer_window_left,
+                    /*logits_soft_cap=*/0.f, sm_scale_override);
+                // Scores are indexed by the list attention actually used, so
+                // the capture is published against the same (possibly
+                // compacted) CSR. A program then reads exactly as many scores
+                // as there were keys.
+                score_capture.publish(
+                    attn_page_indptr, attn_last_page_lens, cache.page_size());
+            } else {
+                ops::dispatch_attention_flashinfer_decode(
+                    *decode_plan,
+                    attn_q, kv_view, attn_out_buf,
+                    attn_page_indices, attn_page_indptr, attn_last_page_lens,
+                    attn_ws, stream, layer_window_left,
+                    /*logits_soft_cap=*/0.f, sm_scale_override);
+            }
         } else if (custom_mask_d) {
             if (!plan_state.use_prefill_plan || prefill_plan == nullptr) {
                 throw std::runtime_error(

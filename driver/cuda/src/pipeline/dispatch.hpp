@@ -262,6 +262,24 @@ class Dispatch {
     bool launch_has_attention_stages(
         const pie_native::LaunchView& view) const;
 
+    // Whether any program in this launch reads `AttnScore`. Capture is opt-in
+    // per fire because it costs an extra `[num_q_heads, kv_len]` write inside
+    // the attention kernel; a launch that does not observe scores must pay
+    // nothing.
+    bool launch_wants_attn_score(
+        const pie_native::LaunchView& view) const;
+
+    // Whether any program in this launch writes the `attn_page_mask` sink. The
+    // model body allocates the keep buffer only when true, and only then does
+    // it pay the per-layer compaction.
+    bool launch_wants_page_mask(
+        const pie_native::LaunchView& view) const;
+
+    // Whether this model's decode path can honour a page mask: the plan must
+    // not depend on the page counts it was planned against, or substituting a
+    // compacted list at launch is silently wrong.
+    void set_attn_page_mask_available(bool available);
+
     // Whether this model + cache can honour the `envelope_dot` contract.
     // Mirrors the `has_kv_envelopes` driver capability; a program that names
     // the kernel is refused at bind when false.

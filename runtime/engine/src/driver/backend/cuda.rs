@@ -75,10 +75,10 @@ impl CudaDriverHandle {
         let raw = PieModelLoadDesc {
             abi_version: pie_driver_abi::PIE_DRIVER_ABI_VERSION,
             component: desc.component as u32,
-            compiler_version: desc.compiler_version,
-            load_plan_bytes: PieBytes {
-                ptr: desc.load_plan_bytes.as_ptr(),
-                len: desc.load_plan_bytes.len(),
+            mxfp4_moe: desc.mxfp4_moe as u32,
+            runtime_quant: PieBytes {
+                ptr: desc.runtime_quant.as_ptr(),
+                len: desc.runtime_quant.len(),
             },
             snapshot_dir: PieBytes {
                 ptr: snapshot.as_ptr(),

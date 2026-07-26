@@ -134,8 +134,8 @@ fn rust_layout_matches_committed_header_contract() {
         8,
         abi_version => 0,
         component => 4,
-        compiler_version => 8,
-        load_plan_bytes => 16,
+        mxfp4_moe => 8,
+        runtime_quant => 16,
         snapshot_dir => 32
     );
     assert_layout!(

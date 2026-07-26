@@ -34,8 +34,11 @@ std::uint32_t decode_plan_graph_layout(const DecodePlanCache& cache) {
         (cache.hnd_layout ? 8u : 0u));
 }
 
-std::uint32_t prefill_plan_graph_layout(const PrefillPlanCache& cache) {
-    if (!cache.valid) return 0;
+bool decode_plan_is_page_count_independent(const DecodePlanCache& cache) {
+    return cache.valid && cache.page_count_independent;
+}
+
+std::uint32_t prefill_plan_graph_layout(const PrefillPlanCache& cache) {    if (!cache.valid) return 0;
     if (cache.use_sm90) {
         return 0x00800000u |
                static_cast<std::uint32_t>(
@@ -197,8 +200,10 @@ void plan_attention_flashinfer_decode_bf16(
             cache, kv_page_indptr_h, num_requests, num_q_heads, num_kv_heads,
             head_dim, page_size, workspace, stream, enable_cuda_graph,
             full_attention_variant, hnd_layout);
+        cache.page_count_independent = true;
         return;
     }
+    cache.page_count_independent = false;
 
     cache.indptr_h_buf.resize(num_requests + 1);
     for (int r = 0; r <= num_requests; ++r) {
@@ -565,6 +570,106 @@ void dispatch_attention_flashinfer_decode_capture_bf16(
         score_out, score_indptr_d, kv_page_indptr_d, kv_last_page_lens_d,
         cache.page_size);
     CUDA_CHECK(cudaGetLastError());
+}
+
+// Fold the per-head probability rows into one row per request.
+//
+// Eviction here is necessarily a per-REQUEST decision: the paged KV layout
+// carries a single page list per request, so a per-head keep-set has nowhere to
+// live. Quest already makes (and documents) the same collapse. Averaging rather
+// than summing keeps the folded row a probability distribution -- it sums to 1
+// over the live prefix -- so a policy can threshold it in absolute terms.
+//
+// The folded CSR is not a second array: `score_indptr[r]` counts
+// `num_q_heads * kv_len(r')` elements for every earlier request, so dividing it
+// by `num_q_heads` is exactly the folded offset. Deriving it removes the chance
+// of two CSRs disagreeing.
+__global__ void k_attn_score_fold_heads(
+    const float* __restrict__ scores,
+    const std::int32_t* __restrict__ score_indptr,
+    const std::uint32_t* __restrict__ kv_page_indptr,
+    const std::uint32_t* __restrict__ kv_last_page_lens,
+    int page_size,
+    int num_q_heads,
+    float* __restrict__ folded)
+{
+    const int request = static_cast<int>(blockIdx.x);
+    const int pages = static_cast<int>(kv_page_indptr[request + 1]) -
+                      static_cast<int>(kv_page_indptr[request]);
+    if (pages <= 0 || num_q_heads <= 0) return;
+    const int kv_len =
+        (pages - 1) * page_size + static_cast<int>(kv_last_page_lens[request]);
+    if (kv_len <= 0) return;
+
+    const std::size_t base = static_cast<std::size_t>(score_indptr[request]);
+    const float* rows = scores + base;
+    float* out = folded + base / static_cast<std::size_t>(num_q_heads);
+    const float inv_heads = 1.f / static_cast<float>(num_q_heads);
+
+    for (int i = static_cast<int>(threadIdx.x) +
+                 static_cast<int>(blockIdx.y) * static_cast<int>(blockDim.x);
+         i < kv_len;
+         i += static_cast<int>(blockDim.x) * static_cast<int>(gridDim.y)) {
+        float total = 0.f;
+        for (int h = 0; h < num_q_heads; ++h) {
+            total += rows[static_cast<std::size_t>(h) *
+                              static_cast<std::size_t>(kv_len) +
+                          static_cast<std::size_t>(i)];
+        }
+        out[i] = total * inv_heads;
+    }
+}
+
+void launch_attn_score_fold_heads(
+    const float* scores,
+    const std::int32_t* score_indptr_d,
+    const std::uint32_t* kv_page_indptr_d,
+    const std::uint32_t* kv_last_page_lens_d,
+    int page_size,
+    int num_requests,
+    int num_q_heads,
+    float* folded,
+    cudaStream_t stream)
+{
+    if (num_requests <= 0) return;
+    if (scores == nullptr || folded == nullptr || score_indptr_d == nullptr) {
+        throw std::invalid_argument(
+            "launch_attn_score_fold_heads: null score buffer");
+    }
+    const dim3 grid(static_cast<unsigned>(num_requests), 64u);
+    k_attn_score_fold_heads<<<grid, 256, 0, stream>>>(
+        scores, score_indptr_d, kv_page_indptr_d, kv_last_page_lens_d,
+        page_size, num_q_heads, folded);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void dispatch_attention_flashinfer_decode_capture(
+    const DecodePlanCache& cache,
+    const void* q,
+    KvCacheLayerView kv_layer,
+    void* o,
+    const std::uint32_t* kv_page_indices_d,
+    const std::uint32_t* kv_page_indptr_d,
+    const std::uint32_t* kv_last_page_lens_d,
+    AttentionWorkspace& workspace,
+    cudaStream_t stream,
+    float* score_out,
+    const std::int32_t* score_indptr_d,
+    int window_left,
+    float logits_soft_cap,
+    float sm_scale,
+    float* lse_out)
+{
+    kernels::launch_dequant_kv_cache_layer_to_bf16_active(
+        kv_layer, kv_page_indices_d, cache.num_pages_in_batch, stream);
+    dispatch_attention_flashinfer_decode_capture_bf16(
+        cache, q,
+        kv_layer.k_bf16_pages,
+        kv_layer.v_bf16_pages,
+        o,
+        kv_page_indices_d, kv_page_indptr_d, kv_last_page_lens_d,
+        workspace, stream, score_out, score_indptr_d,
+        window_left, logits_soft_cap, sm_scale, lse_out);
 }
 
 void dispatch_attention_flashinfer_decode(

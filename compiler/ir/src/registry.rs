@@ -231,12 +231,17 @@ pub struct ModelProfile {
     /// a model with an MTP head serving device-resident spec-decode drafts.
     pub has_mtp_drafts: bool,
     pub has_value_head: bool,
-    /// `[num_heads, kv_len]` F32 attention weights ([`IntrinsicId::AttnScore`])
-    /// available. Unlike the MTP flags this is a *backend* property as much as
+    /// `[kv_max]` F32 head-folded attention weights
+    /// ([`IntrinsicId::AttnScore`]) available. Unlike the MTP flags this is a *backend* property as much as
     /// a model one: it needs a score-observing attention kernel, and it is
     /// refused for soft-capped or sliding-window attention, where the captured
     /// row would not be the softmax the eviction papers define.
     pub has_attn_score: bool,
+    /// The backend honours an `attn_page_mask` sink. `attn_page_mask` is a
+    /// first-party name, so without this flag a program would validate against
+    /// every backend and then fail at its first fire on the ones that cannot
+    /// enforce it -- the opposite of the bind-time contract.
+    pub has_attn_page_mask: bool,
     /// Available second-party kernels + sinks, by name.
     pub kernels: Vec<KernelInfo>,
 }
@@ -257,6 +262,7 @@ impl ModelProfile {
             has_mtp_drafts: true,
             has_value_head: true,
             has_attn_score: true,
+            has_attn_page_mask: true,
             kernels: Vec::new(),
         }
     }

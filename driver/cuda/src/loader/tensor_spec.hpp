@@ -8,15 +8,11 @@
 
 namespace pie_cuda_driver {
 
-enum class TensorLayoutKind {
-    Dense,
-    RowPacked,
-    AxisConcatenated,
-    Grouped,
-    QuantPacked,
-    View,
-};
-
+/// How the store must treat a tensor's memory when it is erased or replaced.
+///
+/// The one piece of per-tensor bookkeeping the tensor itself cannot answer:
+/// `DeviceTensor::owns_memory()` says whether *this* handle frees the block,
+/// but not whether some other entry is still viewing it.
 enum class TensorOwnershipKind {
     Owned,
     BorrowedView,
@@ -24,53 +20,21 @@ enum class TensorOwnershipKind {
     Temporary,
 };
 
-enum class TensorParallelKind {
-    Replicated,
-    Column,
-    Row,
-    Expert,
-    Custom,
-};
-
-enum class QuantFormat {
-    None,
-    RuntimeFp8E4M3,
-    RuntimeInt8,
-    GptqInt4,
-    AwqInt4,
-    CompressedFp8E4M3,
-    CompressedInt8,
-    Mxfp4E2M1E8M0,
-};
-
-enum class QuantGranularity {
-    None,
-    PerTensor,
-    PerChannel,
-    PerGroup,
-};
-
-struct QuantSpec {
-    QuantFormat format = QuantFormat::None;
-    QuantGranularity granularity = QuantGranularity::None;
-    int group_size = 0;
-    int channel_axis = 0;
-    std::string scale_tensor;
-    std::string zero_point_tensor;
-};
-
+/// What the store knows about a resident tensor beyond its bytes.
+///
+/// Deliberately small. Everything here has a reader: `dtype`/`shape` are the
+/// plan's claim, checked against the tensor on insert and re-checked by
+/// `validate_invariants`; `ownership` and `backing_tensor` drive erase and
+/// alias resolution. Fields that only ever round-tripped through the artifact
+/// codec (layout, tensor-parallel kind, a second quantization description)
+/// were removed — the live quant metadata is `ops::QuantMeta`, which the GEMM
+/// path actually reads.
 struct TensorDecl {
     std::string name;
     DType dtype = DType::BF16;
     std::vector<std::int64_t> shape;
-    TensorLayoutKind layout = TensorLayoutKind::Dense;
     TensorOwnershipKind ownership = TensorOwnershipKind::Owned;
-    TensorParallelKind parallel = TensorParallelKind::Replicated;
-    QuantSpec quant;
     std::string backing_tensor;
-    int view_axis = -1;
-    std::int64_t view_start = 0;
-    std::int64_t view_length = 0;
 };
 
 struct LoadExecutionStats {

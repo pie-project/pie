@@ -238,7 +238,7 @@ enum PreparedCallback {
 pub struct DummyDriver {
     device_facts: DeviceFacts,
     capabilities: DriverCapabilities,
-    load_storage: Option<pie_load_planner::host_executor::HostStorage>,
+    model_loaded: bool,
     state: Arc<Mutex<DummyState>>,
     next_program_id: AtomicU64,
     next_instance_id: AtomicU64,
@@ -305,7 +305,7 @@ impl DummyDriver {
                 native_mxfp4_moe: false,
                 storage_alignment: std::mem::align_of::<usize>() as u32,
                 storage_max_tile_bytes: 64 * 1024 * 1024,
-                storage_tile_map_mask: pie_load_planner::load_plan::HOST_TILE_MAP_MASK,
+                storage_tile_map_mask: 0,
                 page_size: 1,
             },
             capabilities: DriverCapabilities {
@@ -331,8 +331,10 @@ impl DummyDriver {
                 has_value_head: options.has_value_head,
                 has_attn_score: options.has_attn_score,
                 // The dummy driver has no real KV keys, so it can never honour
-                // the `envelope_dot` contract.
+                // the `envelope_dot` contract, nor act on a page selection made
+                // over keys it does not have.
                 has_kv_envelopes: false,
+                has_attn_page_mask: false,
                 device_geometry_port_mask: pie_driver_abi::PIE_DEVICE_GEOMETRY_PORTS
                     | pie_driver_abi::PIE_DEVICE_PORT_ATTN_MASK,
                 max_forward_tokens: options.max_forward_tokens,
@@ -347,7 +349,7 @@ impl DummyDriver {
                 snapshot_dir: options.snapshot_dir,
                 kv_handle: None,
             },
-            load_storage: None,
+            model_loaded: false,
             state,
             next_program_id: AtomicU64::new(1),
             next_instance_id: AtomicU64::new(1),
@@ -442,21 +444,12 @@ impl DummyDriver {
     }
 
     pub fn load_model(&mut self, desc: &ModelLoadDesc) -> Result<DriverCapabilities> {
-        ensure!(self.load_storage.is_none(), "dummy model is already loaded");
-        ensure!(
-            desc.compiler_version == pie_load_planner::load_plan::compiler_version(),
-            "dummy compiler version mismatch"
-        );
+        ensure!(!self.model_loaded, "dummy model is already loaded");
         self.record_op("load_model");
-        let storage = pie_load_planner::host_executor::execute_serialized_plan(
-            &desc.load_plan_bytes,
-            &desc.snapshot_dir,
-        )
-        .map_err(|err| anyhow!("dummy LoadPlan execution failed: {err}"))?;
         self.capabilities.snapshot_dir = desc.snapshot_dir.display().to_string();
         self.capabilities.supports_media_encode =
             desc.component != pie_driver_abi::ModelComponent::Text;
-        self.load_storage = Some(storage);
+        self.model_loaded = true;
         Ok(self.capabilities.clone())
     }
 
@@ -1131,6 +1124,7 @@ impl DummyDriver {
             has_mtp_drafts: self.capabilities.has_mtp_drafts,
             has_value_head: self.capabilities.has_value_head,
             has_attn_score: self.capabilities.has_attn_score,
+            has_attn_page_mask: false,
             kernels: vec![KernelInfo {
                 name: "boom".to_string(),
                 sink_scope: None,
@@ -1768,7 +1762,7 @@ fn deterministic_value(ty: ValueType, base: u64) -> Value {
     }
 }
 
-/// `[num_heads, kv_len]` attention weights. Rows are normalised because the
+/// `[kv_max]` head-folded attention weights. The row is normalised because the
 /// real intrinsic is a softmax output, and an eviction policy that reads a
 /// row summing to something other than 1 would behave differently here than
 /// on hardware — the dummy driver exists to catch exactly that class of drift.

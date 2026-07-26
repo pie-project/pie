@@ -61,8 +61,8 @@ MixtralWeights bind_gpt_oss(const LoadedModel& engine) {
             "gpt_oss: intermediate_size must be divisible by tp_size");
     }
     const int I = I_full / T;
-    const bool native_mxfp4 =
-        engine.mxfp4_moe_lowering() == Mxfp4MoeLowering::NativeGemm;
+    const bool native_mxfp4 = engine.mxfp4_moe_policy() ==
+        pie_loader::PieLoaderMxfp4MoePolicy::NativeGemm;
     const int I_native = native_mxfp4 ? align_up_int(I, 128) : I;
     const int L = cfg.num_hidden_layers;
     const int Hq = (cfg.num_attention_heads * cfg.head_dim) / T;
