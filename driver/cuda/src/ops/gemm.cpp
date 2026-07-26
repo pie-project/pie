@@ -638,6 +638,42 @@ void gemm_bf16_impl(
         /*C=*/y,   CUDA_R_16BF, /*ldc=*/N,
         bf16_compute_type(),
         CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (status == CUBLAS_STATUS_NOT_SUPPORTED) {
+        // `CUBLAS_GEMM_DEFAULT_TENSOR_OP` pins the tensor-core kernel family,
+        // and cuBLAS has no member of it for some skinny shapes: the packed
+        // q/k/v projection at TP=2 (N = Hq/T + 2*Hk/T = 2048, K = 1024) is
+        // rejected at M=1, while the same M=1 succeeds at the TP=1 width
+        // (N=4096) and at the packed gate/up width (N=3072). M=1 is not a
+        // serving shape — it is the R=1 rung of the graph lattice, so this
+        // surfaces only during upfront capture, and under TP it surfaced as a
+        // HANG rather than an error: rank 0 threw out of capture while the
+        // follower sat in `tp_graph_capture_barrier` waiting for a peer that
+        // was never going to arrive.
+        //
+        // Retry without the tensor-op pin. cuBLAS then picks whatever kernel
+        // fits; at M=1 there is no tensor-core throughput to lose anyway.
+        const auto retry = cublasGemmEx(
+            handle,
+            /*transa=*/CUBLAS_OP_T, /*transb=*/CUBLAS_OP_N,
+            /*m=*/N, /*n=*/M, /*k=*/K,
+            &alpha,
+            /*A=*/W,   CUDA_R_16BF, /*lda=*/K,
+            /*B=*/act, CUDA_R_16BF, /*ldb=*/K,
+            &beta,
+            /*C=*/y,   CUDA_R_16BF, /*ldc=*/N,
+            bf16_compute_type(),
+            CUBLAS_GEMM_DEFAULT);
+        if (retry == CUBLAS_STATUS_SUCCESS) return;
+        // Neither GemmEx algorithm family covers the shape. cuBLASLt does —
+        // it is normally skipped here by the `min_m`/`min_n` heuristics, which
+        // exist to pick the FASTER path, not the only working one.
+        if (gemm_bf16_lt_impl(handle, act, W, y, M, N, K, beta)) return;
+        throw std::runtime_error(
+            "cuBLAS error (" + std::to_string(static_cast<int>(retry)) +
+            ") after non-tensor-op and cuBLASLt retries: cublasGemmEx[bf16] M=" +
+            std::to_string(M) + " N=" + std::to_string(N) +
+            " K=" + std::to_string(K));
+    }
     if (status != CUBLAS_STATUS_SUCCESS) {
         throw std::runtime_error(
             "cuBLAS error (" + std::to_string(static_cast<int>(status)) +

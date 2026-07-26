@@ -106,12 +106,19 @@ int tp_fire_runahead_depth() {
             const int parsed = std::atoi(v);
             if (parsed >= 0 && parsed <= 8) return parsed;
         }
-        // OFF by default: the deadlock this once worked around is fixed at
-        // its source (the follower now claims an attention plan-staging slot,
-        // see `tp_follower_serve`). Unbounded run-ahead is measured stable
-        // across k=2 and k=4 at 512-wide. Kept only as a bisection lever for
-        // any future TP hang of the same family.
-        return 0;
+        // Depth 1 (one TP fire in flight on the device).
+        //
+        // The follower's missing attention plan-staging slot was ONE cause of
+        // the k>1 TP deadlock and is fixed at its source, but it was not the
+        // only one: with bind-time projection packing enabled the hang comes
+        // back at k=1 and k=2 (and not at k=4), which is the signature of a
+        // second overlap hazard that packing's different timing exposes. Until
+        // that one is found too, keep the bound.
+        //
+        // Cost measured at 1.9% (39,182 vs 39,941 tok/s at 448-wide, k=4),
+        // small because rank 0 is the rank with slack — the follower is
+        // reactive and already waits inside the payload broadcast.
+        return 1;
     }();
     return depth;
 }
