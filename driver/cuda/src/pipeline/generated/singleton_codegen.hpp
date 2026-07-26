@@ -449,13 +449,26 @@ inline bool validate_singleton_plan(
             const bool envelope_dot =
                 op.name_idx < plan.names.size() &&
                 plan.names[op.name_idx] == "envelope_dot";
-            if (op.name_idx >= plan.names.size() ||
-                (!identity && !envelope_dot) ||
-                op.args.size() != 1 ||
-                result_base >= plan.value_types.size() ||
-                !detail::same_type(
-                    plan.value_types[op.args[0]],
-                    plan.value_types[result_base])) {
+            // `cuda.identity` is a pass-through, so its result must match
+            // its argument. `envelope_dot` is not: it maps a query
+            // (`[num_q_heads * head_dim]`) to a per-page score (`[P_MAX]`).
+            // Demanding `same_type` of it would only ever be satisfiable by a
+            // program whose query happens to be P_MAX wide, which is a test
+            // artefact rather than a real shape.
+            const bool arity_ok =
+                op.name_idx < plan.names.size() && (identity || envelope_dot) &&
+                op.args.size() == 1 &&
+                op.args[0] < plan.value_types.size() &&
+                result_base < plan.value_types.size();
+            const bool boundary_types_ok =
+                arity_ok &&
+                (envelope_dot
+                     ? (plan.value_types[result_base].dtype == PTIR_DT_F32 &&
+                        plan.value_types[result_base].dims.size() == 1)
+                     : detail::same_type(
+                           plan.value_types[op.args[0]],
+                           plan.value_types[result_base]));
+            if (!boundary_types_ok) {
                 error =
                     "unsupported CUDA semantic kernel boundary " +
                     (op.name_idx < plan.names.size()

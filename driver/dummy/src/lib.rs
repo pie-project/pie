@@ -326,6 +326,9 @@ impl DummyDriver {
                 has_mtp_logits: options.has_mtp_logits,
                 has_mtp_drafts: options.has_mtp_drafts,
                 has_value_head: options.has_value_head,
+                // The dummy driver has no real KV keys, so it can never honour
+                // the `envelope_dot` contract.
+                has_kv_envelopes: false,
                 device_geometry_port_mask: pie_driver_abi::PIE_DEVICE_GEOMETRY_PORTS
                     | pie_driver_abi::PIE_DEVICE_PORT_ATTN_MASK,
                 max_forward_tokens: options.max_forward_tokens,

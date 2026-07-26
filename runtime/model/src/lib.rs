@@ -138,6 +138,8 @@ pub struct PtirCaps {
     pub has_mtp_logits: bool,
     pub has_mtp_drafts: bool,
     pub has_value_head: bool,
+    /// Backend can execute the `envelope_dot` second-party kernel (Quest).
+    pub has_kv_envelopes: bool,
 }
 
 impl std::fmt::Debug for Model {

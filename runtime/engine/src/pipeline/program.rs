@@ -294,7 +294,18 @@ pub fn model_profile() -> ModelProfile {
         has_mtp_logits: ptir.has_mtp_logits,
         has_mtp_drafts: ptir.has_mtp_drafts,
         has_value_head: ptir.has_value_head,
-        kernels: Vec::new(),
+        // Second-party kernels the backend advertises. `envelope_dot` is
+        // replayable (a pure function of the query and the page envelopes) and
+        // has no sink scope: it produces a value, it does not consume one.
+        kernels: if ptir.has_kv_envelopes {
+            vec![pie_ptir::registry::KernelInfo {
+                name: "envelope_dot".into(),
+                sink_scope: None,
+                replayable: true,
+            }]
+        } else {
+            Vec::new()
+        },
     }
 }
 

@@ -45,6 +45,8 @@
 #include "pipeline/frame_carrier.hpp"
 #include "pipeline/page_translation.hpp"
 #include "batch/rs_metadata.hpp"
+#include "model/attn_observation.hpp"
+#include "store/kv_cache.hpp"
 
 namespace pie_cuda_driver::pipeline {
 
@@ -52,6 +54,13 @@ namespace pie_cuda_driver::pipeline {
 // fire-geometry) now lives in pie_native::ptir (driver/common); bring it into
 // scope so the CUDA-side tier-0/1 code below can use it unqualified.
 using namespace pie_native::ptir;
+
+// `store/kv_cache.hpp` (pulled in for the `envelope_dot` KV geometry) declares
+// its own `pie_cuda_driver::DType`, which sits closer in the lookup chain than
+// the using-directive above and would silently retarget every unqualified
+// `DType` in this file. Pin the PTIR one explicitly; the cache's own dtype is
+// spelled `pie_cuda_driver::DType` where it is needed.
+using DType = pie_native::ptir::DType;
 
 struct CallbackFence {
     std::atomic<std::uint32_t> pending{0};
@@ -1280,6 +1289,8 @@ struct Dispatch::Impl {
     cudaStream_t signature_streams[kSignatureStreamCount] = {};
     bool attention_hook_coverage = false;
     std::uint32_t model_layers = 0;
+    bool kv_envelopes_available = false;
+    std::function<void()> enable_kv_envelopes;
 };
 
 struct StagedLane {
@@ -2192,6 +2203,23 @@ std::uint32_t stage_logits_vocab(
     return logical_vocab;
 }
 
+// Does this stage name a second-party kernel? Used to decide whether the fire's
+// KV geometry has to be resolved for the lane at all: resolving it is cheap but
+// it THROWS when unavailable, so it must only run for stages that need it.
+bool stage_calls_kernel(
+    const plan::StagePlan& stage,
+    std::string_view name) {
+    for (const auto& normalized : stage.ops) {
+        const auto& op = normalized.op;
+        if (op.tag != PTIR_OP_KERNEL_CALL) continue;
+        if (op.name_idx < stage.names.size() &&
+            stage.names[op.name_idx] == name) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool stage_uses_intrinsic(
     const plan::StagePlan& stage,
     std::uint16_t intrinsic) {
@@ -2791,6 +2819,7 @@ int Dispatch::register_program(std::uint64_t program_hash,
         if (err) *err = "ptir program has no compiler region plans";
         return PIE_STATUS_INVALID_ARGUMENT;
     }
+    bool needs_kv_envelopes = false;
     for (const plan::StagePlan& stage : *plans) {
         if ((stage.stage == PTIR_STAGE_ON_ATTN_PROJ ||
              stage.stage == PTIR_STAGE_ON_ATTN) &&
@@ -2809,6 +2838,44 @@ int Dispatch::register_program(std::uint64_t program_hash,
                         "ptir model sinks are not implemented by the active CUDA model";
                 }
                 return PIE_STATUS_UNSUPPORTED;
+            }
+            if (op.tag == PTIR_OP_KERNEL_CALL) {
+                // Second-party kernels are named, not generic: the fused
+                // runtime dispatches them by name, so a name it cannot launch
+                // has to be refused at bind rather than silently skipped.
+                // `grouped_supported_tag` deliberately still excludes the tag —
+                // the grouped interpreter has no arm for it.
+                const std::string& name =
+                    op.name_idx < stage.names.size()
+                        ? stage.names[op.name_idx]
+                        : std::string();
+                if (name != "envelope_dot") {
+                    if (err) {
+                        *err =
+                            "ptir second-party kernel is not implemented by "
+                            "the active CUDA model";
+                    }
+                    return PIE_STATUS_UNSUPPORTED;
+                }
+                if (!impl_->kv_envelopes_available) {
+                    if (err) {
+                        *err =
+                            "envelope_dot requires a native bf16 NHD kv cache "
+                            "and a post-rope query on this model";
+                    }
+                    return PIE_STATUS_UNSUPPORTED;
+                }
+                needs_kv_envelopes = true;
+                if (stage.stage != PTIR_STAGE_ON_ATTN_PROJ &&
+                    stage.stage != PTIR_STAGE_ON_ATTN) {
+                    if (err) {
+                        *err =
+                            "envelope_dot is only available at an attention "
+                            "stage";
+                    }
+                    return PIE_STATUS_UNSUPPORTED;
+                }
+                continue;
             }
             if (!grouped_supported_tag(op.tag)) {
                 if (err) {
@@ -2833,6 +2900,21 @@ int Dispatch::register_program(std::uint64_t program_hash,
                 }
                 return PIE_STATUS_UNSUPPORTED;
             }
+        }
+    }
+    if (needs_kv_envelopes && impl_->enable_kv_envelopes) {
+        // Envelopes cost 4/page_size of the KV cache, so they are allocated
+        // LAZILY: the first program that names `envelope_dot` pays for them and
+        // every model that never observes attention pays nothing. Registration
+        // is a control-plane call, so allocating + seeding here (which
+        // synchronizes) does not race a fire.
+        try {
+            impl_->enable_kv_envelopes();
+        } catch (const std::exception& e) {
+            if (err) {
+                *err = std::string("kv envelopes are unavailable: ") + e.what();
+            }
+            return PIE_STATUS_UNSUPPORTED;
         }
     }
     generated::CompileFailureKind compile_failure =
@@ -3131,6 +3213,13 @@ int Dispatch::validate_launch(
     return PIE_STATUS_OK;
 }
 
+void Dispatch::set_kv_envelopes_available(
+    bool available,
+    std::function<void()> enable) {
+    impl_->kv_envelopes_available = available;
+    impl_->enable_kv_envelopes = available ? std::move(enable) : nullptr;
+}
+
 void Dispatch::set_attention_hook_coverage(
     bool supported,
     std::uint32_t model_layers) {
@@ -3323,6 +3412,94 @@ std::uint64_t sample_output_channel_mask(
     return mask;
 }
 
+// Resolve one lane's slice of the fire's KV geometry so `envelope_dot` can
+// score the pages this lane's request actually owns.
+//
+// The lane->request mapping goes through `qo_indptr_h`: `make_staged_binding`
+// already offsets the query by `token_start * query_columns`, and
+// `qo_indptr_h[r]` IS request r's token start, so the two agree by
+// construction. A lane whose token start is not a request boundary is a wiring
+// bug and throws rather than scoring another request's pages.
+GroupedLaneEnvelope resolve_lane_envelope(
+    const StagedLane& lane,
+    const float* query_base,
+    std::uint32_t query_columns,
+    std::uint32_t layer) {
+    const model::AttentionObservation* obs =
+        model::active_attention_observation();
+    if (obs == nullptr || !obs->usable()) {
+        throw std::runtime_error(
+            "envelope_dot ran outside a model body with kv geometry");
+    }
+    if (query_base == nullptr || query_columns == 0 ||
+        lane.token_count == kUnavailableGroupedExtent ||
+        lane.token_count == 0) {
+        throw std::runtime_error("envelope_dot has no query to score with");
+    }
+    const KvCacheLayerView view =
+        obs->kv->layer_view(static_cast<int>(layer));
+    if (!view.has_envelopes()) {
+        throw std::runtime_error(
+            "envelope_dot ran on a layer without kv envelopes");
+    }
+    if (view.head_dim <= 0 || view.num_kv_heads <= 0 ||
+        query_columns % static_cast<std::uint32_t>(view.head_dim) != 0) {
+        throw std::runtime_error(
+            "envelope_dot query width is not a multiple of head_dim");
+    }
+
+    int request = -1;
+    for (int r = 0; r < obs->num_requests; ++r) {
+        if (obs->qo_indptr_h[r] == lane.token_start) {
+            request = r;
+            break;
+        }
+    }
+    if (request < 0) {
+        throw std::runtime_error(
+            "envelope_dot lane does not start at a request boundary");
+    }
+
+    const std::uint32_t page_begin = obs->kv_page_indptr_h[request];
+    const std::uint32_t page_end = obs->kv_page_indptr_h[request + 1];
+    if (page_end < page_begin) {
+        throw std::runtime_error("envelope_dot saw a malformed kv page CSR");
+    }
+    const std::uint32_t page_count = page_end - page_begin;
+    const std::uint32_t page_size =
+        static_cast<std::uint32_t>(view.page_size);
+
+    // `kv_last_page_lens` is POST-append (see `write_kv_kernel`), so the KV
+    // length this fire will END at is derivable, and subtracting the fire's own
+    // tokens gives the length the envelopes currently describe. Only pages
+    // entirely below that are final.
+    std::uint32_t scored_pages = 0;
+    if (page_count > 0) {
+        const std::uint32_t kv_after =
+            (page_count - 1) * page_size + obs->kv_last_page_lens_h[request];
+        const std::uint32_t qo_len =
+            obs->qo_indptr_h[request + 1] - obs->qo_indptr_h[request];
+        const std::uint32_t kv_before =
+            kv_after >= qo_len ? kv_after - qo_len : 0u;
+        scored_pages = std::min(kv_before / page_size, page_count);
+    }
+
+    return GroupedLaneEnvelope{
+        .env_min = view.k_env_min,
+        .env_max = view.k_env_max,
+        .query = query_base +
+            static_cast<std::size_t>(lane.token_start + lane.token_count - 1) *
+                query_columns,
+        .page_ids = obs->kv_page_indices_d + page_begin,
+        .page_count = page_count,
+        .scored_pages = scored_pages,
+        .num_q_heads =
+            query_columns / static_cast<std::uint32_t>(view.head_dim),
+        .num_kv_heads = static_cast<std::uint32_t>(view.num_kv_heads),
+        .head_dim = static_cast<std::uint32_t>(view.head_dim),
+    };
+}
+
 GroupedLaneBinding make_staged_binding(
     StagedLane& lane,
     const plan::StagePlan& stage,
@@ -3487,6 +3664,10 @@ void execute_declared_phase(
             GroupedLaneBinding binding = make_staged_binding(
                 lane, stage, logits_base, logits_stride,
                 query_base, query_columns, launch.device_layer);
+            if (stage_calls_kernel(stage, "envelope_dot")) {
+                binding.envelope = resolve_lane_envelope(
+                    lane, query_base, query_columns, layer);
+            }
             std::uint32_t value_base = 0;
             for (const auto& normalized : stage.ops) {
                 if (normalized.op.tag == PTIR_OP_INTRINSIC_VAL &&

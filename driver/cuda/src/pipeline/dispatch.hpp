@@ -13,6 +13,7 @@
 // (`registry.hpp`), which is the single construction site.
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -260,6 +261,16 @@ class Dispatch {
 
     bool launch_has_attention_stages(
         const pie_native::LaunchView& view) const;
+
+    // Whether this model + cache can honour the `envelope_dot` contract.
+    // Mirrors the `has_kv_envelopes` driver capability; a program that names
+    // the kernel is refused at bind when false.
+    // `enable` is invoked once, lazily, when a program that names
+    // `envelope_dot` is registered — envelopes cost 4/page_size of the KV
+    // cache, so a model no program observes must not pay for them.
+    void set_kv_envelopes_available(
+        bool available,
+        std::function<void()> enable = nullptr);
 
     void set_attention_hook_coverage(
         bool supported,

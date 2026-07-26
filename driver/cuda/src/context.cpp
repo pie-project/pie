@@ -791,6 +791,7 @@ int Context::Impl::load_model(
             {"has_mtp_logits", false},
             {"has_mtp_drafts", false},
             {"has_value_head", false},
+            {"has_kv_envelopes", false},
             {"max_forward_tokens",
              static_cast<std::uint32_t>(std::max(1, c.max_model_len))},
             {"max_forward_requests", 256},
@@ -1485,6 +1486,47 @@ int Context::Impl::load_model(
     const bool has_usable_mtp_logits =
         has_mtp_logits && static_cast<bool>(executor_p->system_drafter);
 
+    // `envelope_dot` (Quest) scores a page by q . [k_min, k_max] over the keys
+    // AS CACHED. Three things must hold or the score is silently wrong rather
+    // than merely approximate, so each one is a hard gate rather than a
+    // fallback:
+    //
+    //  1. Native BF16 NHD pages. `KvCache::enable_envelopes` throws otherwise:
+    //     a quantized cache keeps its BF16 mirror separate from the tier the
+    //     append path writes, so the envelope would track stale keys.
+    //  2. A post-rope query. Standard-GQA families apply q-norm and rope in
+    //     place on `ws.q` before the KV write, so the `OnAttnProj` hook (moved
+    //     below rope) observes exactly the space the cached keys live in. The
+    //     MLA families (DeepSeek-V4, GLM-5, Kimi) split q into nope/pe halves,
+    //     rotate only the pe half into a separate buffer, and never rejoin —
+    //     their hook is still pre-rope and their latent KV is not a key page
+    //     at all. Qwen3.5's gated-delta layers keep no KV pages.
+    //  3. One rank. Envelopes are per-rank over that rank's own KV heads, but
+    //     an attention page mask selects from the SHARED page list, so ranks
+    //     would have to agree on a selection they scored differently.
+    //
+    // Refusing here means a Quest program fails to BIND on an unsupported
+    // model, which is the whole point: PTIR's model profile is the bind-time
+    // contract, and a silently mis-ranked page mask is exactly the class of
+    // failure this repo already documents as unacceptable.
+    const bool family_query_is_post_rope =
+        family != model::Family::DeepSeekV4 && family != model::Family::Glm5 &&
+        family != model::Family::Kimi && family != model::Family::Qwen3_5 &&
+        family != model::Family::Qwen3_5Moe &&
+        family != model::Family::NemotronH;
+    const bool has_kv_envelopes = family_query_is_post_rope &&
+                                  local_tp_size == 1 &&
+                                  kv_cache_p != nullptr &&
+                                  kv_cache_p->format().is_native_bf16() &&
+                                  !kv_cache_p->hnd_layout();
+    registry_->dispatch().set_kv_envelopes_available(
+        has_kv_envelopes,
+        has_kv_envelopes
+            ? std::function<void()>([kv_cache_p]() {
+                  kv_cache_p->enable_envelopes();
+              })
+            : std::function<void()>());
+
     // Custom P2P all-reduce. The per-layer attn-O / MLP-down reductions are
     // small enough that NCCL is launch-latency bound; the NVLink kernel is
     // several times faster in that regime. Attaching it here lets
@@ -1699,6 +1741,7 @@ int Context::Impl::load_model(
         {"has_mtp_logits", has_usable_mtp_logits},
         {"has_mtp_drafts", false},
         {"has_value_head", false},
+        {"has_kv_envelopes", has_kv_envelopes},
         // RV-26: PIE_DEVICE_PORT_ATTN_MASK is deliberately NOT advertised.
         // The runtime classifies masked device-carried decode into the
         // DecodeEnvelope class exactly when this mask claims the port, but

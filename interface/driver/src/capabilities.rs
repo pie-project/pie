@@ -75,6 +75,12 @@ pub struct DriverCapabilities {
     /// The loaded model exposes a scalar value-head result to PTIR.
     #[serde(default)]
     pub has_value_head: bool,
+    /// The driver can maintain per-page KV key envelopes and execute the
+    /// `envelope_dot` second-party kernel at an attention stage (Quest).
+    /// Requires a native-bf16 NHD paged KV cache AND a query hook that fires
+    /// post-rope, so the score compares against the keys as cached.
+    #[serde(default)]
+    pub has_kv_envelopes: bool,
     /// Descriptor-port tags the driver can resolve on-device for decode envelopes.
     #[serde(default)]
     pub device_geometry_port_mask: u32,

@@ -1,4 +1,5 @@
 #include "kernels/envelope.hpp"
+#include "kernels/envelope_device.cuh"
 
 #include <cstdint>
 
@@ -153,18 +154,10 @@ __global__ void envelope_dot_kernel(
     const int group = num_q_heads / num_kv_heads;
     const long env_base =
         (static_cast<long>(p) * num_kv_heads + kh) * head_dim;
-    const int terms = group * head_dim;
 
-    float local = 0.f;
-    for (int i = threadIdx.x; i < terms; i += BLOCK) {
-        const int g = i / head_dim;
-        const int d = i - g * head_dim;
-        const int qh = kh * group + g;
-        const float qd = q[static_cast<long>(qh) * head_dim + d];
-        const float lo = qd * env_min[env_base + d];
-        const float hi = qd * env_max[env_base + d];
-        local += (lo > hi) ? lo : hi;
-    }
+    const float local = envelope_dot_thread_partial(
+        q, env_min, env_max, env_base, kh * group, group, head_dim,
+        static_cast<int>(threadIdx.x), BLOCK);
 
     __shared__ float buf[BLOCK];
     buf[threadIdx.x] = local;

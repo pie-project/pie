@@ -40,6 +40,48 @@ inline constexpr std::uint32_t kMaxExactNucleusLibraryVocab = 4096;
 inline constexpr std::uint32_t kFastNucleusThreads = 256;
 inline constexpr std::uint32_t kFastNucleusChunks = 4;
 
+// Device-side mirror of `GroupedLaneEnvelope`, uploaded as a per-lane side
+// table. It is a SEPARATE array rather than extra `PtirLaneRecord` fields
+// because that record is a pinned 96-byte ABI: it is static_asserted, emitted
+// verbatim into the NVRTC source of every generated region, and the on-disk
+// module cache is keyed on the plan bytes that produced it. Widening it would
+// invalidate every cached module for a field only one kernel reads.
+struct GroupedLaneEnvelopeDevice {
+    const float* env_min;
+    const float* env_max;
+    const float* query;
+    const std::uint32_t* page_ids;
+    std::uint32_t page_count;
+    std::uint32_t scored_pages;
+    std::uint32_t num_q_heads;
+    std::uint32_t num_kv_heads;
+    std::uint32_t head_dim;
+    std::uint32_t reserved;
+};
+
+// Per-lane resolution of the fire's KV geometry, for the `envelope_dot`
+// second-party kernel. Populated only at an attention stage of a program that
+// actually calls it; every other lane leaves `env_min`/`env_max` null and the
+// runtime refuses to launch rather than scoring garbage.
+struct GroupedLaneEnvelope {
+    const float* env_min = nullptr;   // [num_pages, num_kv_heads, head_dim]
+    const float* env_max = nullptr;
+    // This lane's query row to score with: the LAST token of the lane, which is
+    // the token whose attention the mask will govern.
+    const float* query = nullptr;
+    // Device slice of the fire's `kv_page_indices` belonging to this lane.
+    const std::uint32_t* page_ids = nullptr;
+    std::uint32_t page_count = 0;
+    // Pages whose envelope is FINAL as of this hook: the hook fires before the
+    // layer's KV append, so a page the fire is still filling has a stale
+    // envelope. Those pages score +inf (always kept), which is both fail-safe
+    // and exactly Quest's "keep the local window" rule.
+    std::uint32_t scored_pages = 0;
+    std::uint32_t num_q_heads = 0;
+    std::uint32_t num_kv_heads = 0;
+    std::uint32_t head_dim = 0;
+};
+
 struct GroupedLaneBinding {
     PtirInstance* instance = nullptr;
     const plan::StagePlan* plan = nullptr;
@@ -71,6 +113,7 @@ struct GroupedLaneBinding {
     std::uint32_t vocab = 0;          // PTIR-visible logical vocabulary
     std::uint32_t logits_stride = 0; // physical model row stride
     std::uint32_t program_index = 0;
+    GroupedLaneEnvelope envelope{};
 };
 
 struct GroupedExecutionOptions {

@@ -677,8 +677,11 @@ class ModuleCache {
                 return false;
             }
             if (region.library_op == PTIR_LIBRARY_SECOND_PARTY) {
-                error = "CUDA second-party library is unavailable";
-                return false;
+                if (!second_party_region_supported(plan, region)) {
+                    error = "CUDA second-party library is unavailable";
+                    return false;
+                }
+                continue;
             }
             if (region.library_op == PTIR_LIBRARY_NUCLEUS_SAMPLE) {
                 const auto& logits =

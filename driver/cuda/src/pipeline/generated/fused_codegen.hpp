@@ -12,6 +12,37 @@
 
 namespace pie_cuda_driver::pipeline::generated {
 
+// The only second-party kernel this backend launches. Everything else stays
+// unsupported, so a plan naming an unknown kernel fails loudly at bind instead
+// of reaching a runtime `throw` mid-fire.
+//
+// `envelope_dot` is deliberately NOT type-checked with `same_type(arg, result)`
+// the way `cuda.identity` is: its argument is the query
+// (`[num_q_heads * head_dim]`) and its result is a per-page score (`[P_MAX]`).
+// Those shapes are unrelated by construction, so the only structural claim that
+// holds is arity.
+inline bool second_party_region_supported(
+    const pie_native::ptir::plan::StagePlan& stage,
+    const pie_native::ptir::plan::Region& region) {
+    if (region.nodes.size() != 1) return false;
+    const std::uint32_t node = region.nodes.front();
+    if (node >= stage.ops.size()) return false;
+    const auto& op = stage.ops[node].op;
+    if (op.tag != PTIR_OP_KERNEL_CALL) return false;
+    if (op.name_idx >= stage.names.size()) return false;
+    if (stage.names[op.name_idx] != "envelope_dot") return false;
+    if (op.args.size() != 1 || op.results != 1) return false;
+    // The score is a per-page f32 vector. A different rank or dtype means the
+    // program disagrees with the kernel's ABI.
+    if (region.outputs.size() != 1) return false;
+    const auto& result_type = stage.value_types[region.outputs.front()];
+    if (result_type.dtype != PTIR_DT_F32 || result_type.dims.size() != 1) {
+        return false;
+    }
+    return stage.stage == PTIR_STAGE_ON_ATTN_PROJ ||
+           stage.stage == PTIR_STAGE_ON_ATTN;
+}
+
 inline constexpr std::uint16_t kCudaGeneratedEmitterVersion = 18;
 
 inline bool validate_generated_region(

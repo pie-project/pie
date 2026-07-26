@@ -112,6 +112,7 @@ impl MockEnv {
                 has_mtp_logits: true,
                 has_mtp_drafts: true,
                 has_value_head: true,
+                has_kv_envelopes: false,
                 device_geometry_port_mask: pie_driver_abi::PIE_DEVICE_GEOMETRY_PORTS,
                 limits: SchedulerLimits {
                     max_forward_requests: 32,

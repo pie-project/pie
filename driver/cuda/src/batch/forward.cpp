@@ -34,6 +34,7 @@
 #include "store/recurrent_state_cache.hpp"
 #include "model/imodel.hpp"
 #include "model/stage_hooks.hpp"
+#include "model/attn_observation.hpp"
 #include "model/llama_like/qwen3.hpp"
 #include "model/workspace.hpp"
 #include "ops/gemm.hpp"
@@ -60,6 +61,30 @@ void ForwardFn::invoke_prepare(AttentionWorkspace& aws,
     if (model) model->prepare(aws, in);
 }
 
+namespace {
+
+thread_local const model::AttentionObservation* g_attention_observation = nullptr;
+
+}  // namespace
+
+namespace model {
+
+const AttentionObservation* active_attention_observation() noexcept {
+    return g_attention_observation;
+}
+
+ScopedAttentionObservation::ScopedAttentionObservation(
+    const AttentionObservation* observation) noexcept
+    : previous_(g_attention_observation) {
+    g_attention_observation = observation;
+}
+
+ScopedAttentionObservation::~ScopedAttentionObservation() noexcept {
+    g_attention_observation = previous_;
+}
+
+}  // namespace model
+
 void ForwardFn::invoke_body(model::Workspace& ws,
                             KvCache& kv,
                             AttentionWorkspace& aws,
@@ -67,6 +92,21 @@ void ForwardFn::invoke_body(model::Workspace& ws,
                             const ForwardInputs& in) {
     if (model) {
         model::ScopedStageHooks hooks(in.stage_hooks);
+        // Publish the fire's KV geometry for the duration of the body so an
+        // attention-stage PTIR program can score the cache it is about to
+        // attend over. Scoped to the body, so a stage hook can never observe a
+        // page table from a different fire.
+        const model::AttentionObservation observation{
+            .kv = &kv,
+            .kv_page_indices_d = in.kv_page_indices_d,
+            .qo_indptr_h = in.qo_indptr_h,
+            .kv_page_indptr_h = in.kv_page_indptr_h,
+            .kv_last_page_lens_h = in.kv_last_page_lens_h,
+            .num_requests = in.num_requests,
+            .total_tokens = in.total_tokens,
+        };
+        model::ScopedAttentionObservation observed(
+            in.stage_hooks != nullptr ? &observation : nullptr);
         model->body(ws, kv, aws, cublas, in);
     }
 }
