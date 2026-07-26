@@ -541,6 +541,83 @@ a finished document could be followed by the opening of a second one, which is
 exactly what the model did. Groups now carry the terminals a pending lexeme
 could still become, and admissibility requires one of them to be acceptable.
 
+## Answering the reviewer, with measurements
+
+Twenty questions a referee would ask, and a benchmark for each, in
+`src/gpu_lr1/rigor/`. The rules are deliberately inconvenient: warm up before
+timing, report distributions rather than means, run each baseline in its best
+documented configuration, and report a benchmark that could not run as
+unanswered rather than dropping it. Results below are on one A100 80GB against
+XGrammar 0.2.3 with the same tokenizer and the same documents.
+
+**Is the mask sound (q01, q02)?** Walk the grammar - at every step choose only
+among the bytes the mask admits - and hand what comes out to a real JSON Schema
+validator. Anything invalid is a byte the mask should have refused. Over 1,653
+generated documents from 200 schemas, **97.0% validate**, and every one of the
+50 failures is attributable:
+
+| cause | count |
+|---|---|
+| schema uses `dependencies`, which the front end does not lower | 17 |
+| schema uses `not`, likewise | 16 |
+| the `Branches` fallback, which discards the keywords a branch sits next to | 17 |
+
+There is no unattributed failure. Split by lowering level the picture is
+sharper, and less comfortable:
+
+| level | valid | of |
+|---|---|---|
+| `Unordered` | 98.9% | 1,591 |
+| `Ordered` | 62.2% | 45 |
+| `Branches` | 5.9% | 17 |
+
+The last-resort level buys coverage with a mask that is mostly wrong. Two
+schemas use it. A deployment that would rather be refused than misled should be
+able to cap the search, and reporting the level a schema compiled at is the
+minimum honesty.
+
+**Two host costs were hiding in our own fill.** Awkward, for a design whose
+argument is that host costs on the critical path are the problem. `fill_mask`
+read the live configuration count back *from the device* every step, a
+synchronisation that bought nothing because the kernel already guards on it and
+the host had put the counts there. And two Triton launches cost about 110us of
+host time to *issue* - argument marshalling, not arithmetic - which on a small
+schema was the whole measurement. Removing the sync is what makes the fill
+capturable as a CUDA graph, which takes batch 1 from 107us to 12us with
+bit-identical masks.
+
+**Per-step cost (q10, q11, q15).** Median over four schemas, charging both the
+fill and the advance:
+
+| batch | 1 | 8 | 32 | 128 | 512 |
+|---|---|---|---|---|---|
+| ratio, whole step | 0.96x | 0.66x | 3.13x | 8.01x | **15.06x** |
+| ratio, only what cannot overlap | 1.19x | 1.31x | 1.53x | 1.51x | 1.48x |
+
+The second row is the one to believe. XGrammar's fill can be hidden behind the
+forward pass by a worker thread; the advance cannot, because it follows the
+sampled token. The tail is ours: at batch 512 on one schema we are p50 2,550us
+and p99 2,561us against 11,487us and 12,342us - a 10us spread against 855us.
+
+**Compile time (q18).** Cold, no cache on either side: **82 ms p50 against
+XGrammar's 16 ms**, p99 6.5 s against 0.6 s. It was 916 ms and 71 s until
+vocabulary grouping was parallelised - it scans all 151,669 tokens from every
+lexer state, no state depends on another, and it was using one core of
+twenty-four. Being 5x slower cold is the honest number, and it matters because
+schemas arrive per request.
+
+**Memory (q16).** The median schema costs 0.94 MB resident, about seven tokens
+of KV cache for a 7B model. This is not comparable to XGrammar's 52 KB cache
+and should not be printed beside it: XGrammar keeps an automaton on the host
+and recomputes the token mapping every step, and buying out that recomputation
+is what the memory is for.
+
+**Still unanswered.** End-to-end serving with error bars (q08), grammar cost as
+a fraction of a real forward pass (q09), whether XGrammar can be made to accept
+any property order (q06), non-JSON grammars (q07), speculative decoding in a
+serving path (q13), depth scaling (q14), llguidance and outlines as baselines
+(q19), and the per-mechanism ablation (q20).
+
 **Threats that remain.** Table construction is still excluded — rows are
 replayed, while XGrammar computes masks online from a compact automaton, so
 compile time and incremental admission (C7) must be measured before any
