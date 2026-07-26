@@ -294,8 +294,15 @@ inline constexpr std::uint16_t kCudaGeneratedEmitterVersion = 19;
 // (`fused_runtime.cuh`) and the emitted device source below index with it, and
 // `module_cache.hpp` keys the disk cache on `kCudaGeneratedEmitterVersion`, so
 // widening it must bump that version or stale cubins keep the old stride.
-inline constexpr std::uint32_t kPtirIntrinsicSlots =
-    static_cast<std::uint32_t>(PTIR_INTR_ATTN_SCORE) + 1u;
-static_assert(kPtirIntrinsicSlots == 8u);
+//
+// Projected from `ptir_abi.h`, which the compiler generates from the same
+// `declare_intrinsics!` rows the enum comes from -- the emitter writes this
+// stride into the device source it hands us, so a locally derived second
+// answer is a second answer. The assertion below keeps the local knowledge as
+// a check on the projection rather than as its source.
+inline constexpr std::uint32_t kPtirIntrinsicSlots = PTIR_INTRINSIC_SLOTS;
+static_assert(
+    kPtirIntrinsicSlots == static_cast<std::uint32_t>(PTIR_INTR_ATTN_SCORE) + 1u,
+    "PTIR_INTRINSIC_SLOTS must be one past the largest PtirIntrinsic id");
 
 }  // namespace pie_cuda_driver::pipeline::generated

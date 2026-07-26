@@ -280,10 +280,10 @@ async fn main(input: Input) -> Result<Output> {
         let pages_p = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages_p");
         let page_indptr_p =
             Channel::from(vec![0u32, end.div_ceil(page_size)]).named("page_indptr_p");
-        let w_slot_p = Channel::from((base..end).map(|p| p / page_size).collect::<Vec<_>>())
-            .named("w_slot_p");
-        let w_off_p = Channel::from((base..end).map(|p| p % page_size).collect::<Vec<_>>())
-            .named("w_off_p");
+        let w_slot_p =
+            Channel::from((base..end).map(|p| p / page_size).collect::<Vec<_>>()).named("w_slot_p");
+        let w_off_p =
+            Channel::from((base..end).map(|p| p % page_size).collect::<Vec<_>>()).named("w_off_p");
         let kv_len_p = Channel::from(vec![end]).named("kv_len_p");
         let rng_p = Channel::from(vec![input.seed, 0]).named("rng_p");
         let tok_out_p = Channel::new([1], dtype::i32).named("tok_out_p");
@@ -319,7 +319,6 @@ async fn main(input: Input) -> Result<Output> {
             .get::<i32>()
             .await
             .map_err(|e| format!("g0 take @{base}: {e}"))?[0];
-
     }
     generated.push(g0 as u32);
 
@@ -340,7 +339,7 @@ async fn main(input: Input) -> Result<Output> {
         // reasons that have nothing to do with attention.
         let rng = Channel::from(vec![input.seed ^ 0x5bd1, 0]).named("rng");
         let tok_out = Channel::new([1], dtype::i32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+            .capacity(channel_capacity() as u32)
             .named("tok_out");
         let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
         let positions = Channel::from(vec![n]).named("positions");
@@ -378,12 +377,12 @@ async fn main(input: Input) -> Result<Output> {
         // fold feeds `page_mass_epi`, which IS the policy.
         let scores_out = report.then(|| {
             Channel::new([kv_max], dtype::f32)
-                .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+                .capacity(channel_capacity() as u32)
                 .named("h2o_scores")
         });
         let layers_out = report.then(|| {
             Channel::new([1], dtype::u32)
-                .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+                .capacity(channel_capacity() as u32)
                 .named("h2o_layer_count")
         });
 
@@ -430,10 +429,7 @@ async fn main(input: Input) -> Result<Output> {
         //    fire is writing -- which doubles as H2O's local window. ──
         fwd.on_attn_proj(move || {
             let mass = page_mass.take().tensor();
-            intrinsics::kernel::attn_page_mask(&pivot_threshold(
-                &mass,
-                rank_le(page_budget),
-            ));
+            intrinsics::kernel::attn_page_mask(&pivot_threshold(&mass, rank_le(page_budget)));
             page_mass.put(&mass);
         });
 
@@ -494,15 +490,7 @@ async fn main(input: Input) -> Result<Output> {
         });
 
         let budget_n = max_tokens - 1;
-        let mut submitted = 0usize;
-        let mut in_flight = 0usize;
-        while in_flight < DEFAULT_RUNAHEAD_DEPTH && submitted < budget_n {
-            fwd.submit(&pipe)
-                .map_err(|e| format!("decode submit @{}: {e}", submitted + 1))?;
-            submitted += 1;
-            in_flight += 1;
-        }
-        while in_flight > 0 {
+        run_ahead(&pipe, &fwd, budget_n as usize, async || {
             let t = tok_out
                 .take()
                 .get::<i32>()
@@ -519,9 +507,7 @@ async fn main(input: Input) -> Result<Output> {
                     .take()
                     .get::<u32>()
                     .await
-                    .map_err(|e| {
-                        format!("h2o_layer_count.take @{}: {e}", generated.len())
-                    })?[0];
+                    .map_err(|e| format!("h2o_layer_count.take @{}: {e}", generated.len()))?[0];
                 // The fire that produced this row had `n + generated.len()` KV
                 // positions live: the prompt plus every token committed before it.
                 last_kv_len = n + generated.len() as u32;
@@ -529,18 +515,16 @@ async fn main(input: Input) -> Result<Output> {
                 mass_trace.push(last_scores.iter().filter(|s| s.is_finite()).sum());
                 trace.push((
                     last_kv_len,
-                    last_scores.iter().rposition(|s| *s != 0.0).map_or(0, |i| i + 1),
+                    last_scores
+                        .iter()
+                        .rposition(|s| *s != 0.0)
+                        .map_or(0, |i| i + 1),
                 ));
             }
-            in_flight -= 1;
             generated.push(t as u32);
-            if submitted < budget_n {
-                fwd.submit(&pipe)
-                    .map_err(|e| format!("decode submit @{}: {e}", submitted + 1))?;
-                submitted += 1;
-                in_flight += 1;
-            }
-        }
+            Ok(ControlFlow::Continue(()))
+        })
+        .await?;
     }
     pipe.close();
 

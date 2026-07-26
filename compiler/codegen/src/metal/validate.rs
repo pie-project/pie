@@ -11,7 +11,7 @@
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use pie_ir::op::{OP_TABLE, VARIADIC};
+use pie_ir::op::{OP_TABLE, VARIADIC, intrinsic_tags, tags};
 use pie_ir::types::{DType, MAX_RANK};
 use pie_plan::{
     CompiledStage, Dimension, LibraryOp, PartitionKind, Region, RegionKind, RegionPartition,
@@ -20,18 +20,6 @@ use pie_plan::{
 
 use super::M1OpMeta;
 use crate::op_view::OpView;
-
-const OP_PIVOT_THRESHOLD: u8 = 0x58;
-const OP_KERNEL_CALL: u8 = 0xA1;
-const OP_SINK_CALL: u8 = 0xA2;
-const OP_CHAN_TAKE: u8 = 0x90;
-const OP_CHAN_READ: u8 = 0x91;
-const OP_CHAN_PUT: u8 = 0x92;
-pub(crate) const OP_TOP_K: u8 = 0x51;
-const OP_SORT_DESC: u8 = 0x50;
-const OP_CUMSUM: u8 = 0x40;
-const OP_CUMPROD: u8 = 0x41;
-const OP_MATMUL: u8 = 0x55;
 
 /// The library kind of a region as the wire encodes it: a `Generated` region
 /// still carries a `library_op` byte, and it is zero. Two C++ guards read that
@@ -48,6 +36,48 @@ pub(crate) fn is_library(region: &Region) -> bool {
 }
 
 /// `nucleus_library_region_valid` — the 3-input/1-output nucleus ABI.
+/// The intrinsics this backend can actually bind.
+///
+/// `ptir_m1_runtime.metal` handles op tag `0xA0` by reinterpreting its `a0`
+/// slot as `bfloat*` logits, and the only id it branches on is `MtpDrafts`.
+/// The driver (`m1_runtime.cpp`) likewise binds nothing but `logits_bf16` to
+/// that buffer. Any other id therefore reads the logits rows *as if* they were
+/// the requested intrinsic: no fault, no bounds violation (`hidden()` is
+/// declared `[rows, vocab]`, so the length even matches), just the wrong
+/// tensor. CUDA has a per-intrinsic slot table and raises
+/// `"generated fused intrinsic is unavailable"`; this is the Metal equivalent,
+/// and it belongs in the compiler because the mis-binding is not observable
+/// downstream.
+pub fn metal_intrinsic_supported(intr: u16) -> bool {
+    matches!(
+        intr,
+        intrinsic_tags::LOGITS | intrinsic_tags::MTP_LOGITS | intrinsic_tags::MTP_DRAFTS
+    )
+}
+
+/// `Err` naming the offending id when `region` reads an unbindable intrinsic.
+///
+/// Scoped to the region's own nodes: a sibling region in the same stage may
+/// legitimately read `logits`, and rejecting the whole stage for that would
+/// refuse plans the backend can emit.
+pub fn intrinsics_bindable(ops: &[OpView], region: &Region) -> Result<(), String> {
+    for &node in &region.nodes {
+        let Some(op) = ops.get(node.index()) else {
+            continue;
+        };
+        if op.tag == tags::INTRINSIC_VAL && !metal_intrinsic_supported(op.intr) {
+            return Err(unbindable_intrinsic(op.intr));
+        }
+    }
+    Ok(())
+}
+
+fn unbindable_intrinsic(intr: u16) -> String {
+    alloc::format!(
+        "Metal binds only the logits buffer for intrinsics; intrinsic id {intr} has no binding"
+    )
+}
+
 pub fn nucleus_library_region_valid(stage: &CompiledStage, region: &Region) -> bool {
     let value_types = &stage.normalized.value_types;
     // Two arities are legal, and this only knew one. The plain form is
@@ -114,16 +144,18 @@ pub fn library_region_valid(stage: &CompiledStage, region: &Region) -> bool {
         return nucleus_library_region_valid(stage, region);
     }
     let ops = &stage.normalized.ops;
-    if region.nodes.len() != 1 || region.nodes[0] as usize >= ops.len() {
+    if region.nodes.len() != 1 || region.nodes[0].index() >= ops.len() {
         return false;
     }
-    let tag = ops[region.nodes[0] as usize].tag();
+    let tag = ops[region.nodes[0].index()].tag();
     match region.kind {
-        RegionKind::Library(LibraryOp::TopK) => tag == OP_TOP_K,
-        RegionKind::Library(LibraryOp::Sort) => tag == OP_SORT_DESC,
-        RegionKind::Library(LibraryOp::Scan) => tag == OP_CUMSUM || tag == OP_CUMPROD,
-        RegionKind::Library(LibraryOp::MatMul) => tag == OP_MATMUL,
-        RegionKind::Library(LibraryOp::SecondParty) => tag == OP_KERNEL_CALL || tag == OP_SINK_CALL,
+        RegionKind::Library(LibraryOp::TopK) => tag == tags::TOP_K,
+        RegionKind::Library(LibraryOp::Sort) => tag == tags::SORT_DESC,
+        RegionKind::Library(LibraryOp::Scan) => tag == tags::CUMSUM || tag == tags::CUMPROD,
+        RegionKind::Library(LibraryOp::MatMul) => tag == tags::MATMUL,
+        RegionKind::Library(LibraryOp::SecondParty) => {
+            tag == tags::KERNEL_CALL || tag == tags::SINK_CALL
+        }
         _ => false,
     }
 }
@@ -161,7 +193,7 @@ fn partition_valid(stage: &CompiledStage, partition: &RegionPartition) -> Result
     let value_types = &stage.normalized.value_types;
     let channel_bindings = &stage.normalized.channel_bindings;
     for region in &partition.regions {
-        if region.nodes.iter().any(|node| *node as usize >= ops.len()) {
+        if region.nodes.iter().any(|node| node.index() >= ops.len()) {
             return Err("region node out of range".to_string());
         }
         if region.nodes.windows(2).any(|pair| pair[0] >= pair[1]) {
@@ -224,7 +256,7 @@ fn validate_into(stage: &CompiledStage, operations: &mut Vec<M1OpMeta>) -> Resul
     let channel_bindings = &normalized.channel_bindings;
 
     if stage.signature.hash == 0
-        || pie_ir::program_hash(&stage.signature.canonical_bytes) != stage.signature.hash
+        || pie_ir::fnv1a64(&stage.signature.canonical_bytes) != stage.signature.hash
         || stage.singleton.kind != PartitionKind::Singleton
     {
         return Err("invalid singleton plan identity".to_string());
@@ -243,7 +275,7 @@ fn validate_into(stage: &CompiledStage, operations: &mut Vec<M1OpMeta>) -> Resul
     let mut result_base: u32 = 0;
     for (node, op) in ops.iter().enumerate() {
         let region = &stage.singleton.regions[node];
-        if region.nodes.len() != 1 || region.nodes[0] as usize != node {
+        if region.nodes.len() != 1 || region.nodes[0].index() != node {
             return Err("singleton region/node ordering mismatch".to_string());
         }
         // The C++ rejects an unknown tag here; `Op` has none.
@@ -251,7 +283,7 @@ fn validate_into(stage: &CompiledStage, operations: &mut Vec<M1OpMeta>) -> Resul
             .iter()
             .find(|spec| spec.tag == op.tag)
             .expect("every Op tag is in OP_TABLE");
-        if op.tag == OP_KERNEL_CALL {
+        if op.tag == tags::KERNEL_CALL {
             // The C++ indexes `value_types[args[0]]` before it has checked
             // `args[0] < result_base`; the `get` below is that read made safe.
             let identity = names
@@ -265,12 +297,14 @@ fn validate_into(stage: &CompiledStage, operations: &mut Vec<M1OpMeta>) -> Resul
             if !identity {
                 return Err("unsupported Metal semantic kernel boundary".to_string());
             }
-        } else if op.tag == OP_SINK_CALL
+        } else if op.tag == tags::SINK_CALL
             && names.get(op.name_idx as usize).map(String::as_str) != Some("metal.discard")
         {
             return Err("unsupported Metal semantic sink boundary".to_string());
+        } else if op.tag == tags::INTRINSIC_VAL && !metal_intrinsic_supported(op.intr) {
+            return Err(unbindable_intrinsic(op.intr));
         }
-        let expected_arity = if op.tag == OP_PIVOT_THRESHOLD {
+        let expected_arity = if op.tag == tags::PIVOT_THRESHOLD {
             1
         } else {
             spec.val_operands
@@ -287,10 +321,11 @@ fn validate_into(stage: &CompiledStage, operations: &mut Vec<M1OpMeta>) -> Resul
         if op.args.iter().any(|argument| *argument >= result_base) {
             return Err("normalized SSA operand is not a prior value".to_string());
         }
-        if op.tag == OP_PIVOT_THRESHOLD && (op.pred_tag > 2 || op.pred_payload >= result_base) {
+        if op.tag == tags::PIVOT_THRESHOLD && (op.pred_tag > 2 || op.pred_payload >= result_base) {
             return Err("pivot predicate payload is out of range".to_string());
         }
-        let channel_op = op.tag == OP_CHAN_TAKE || op.tag == OP_CHAN_READ || op.tag == OP_CHAN_PUT;
+        let channel_op =
+            op.tag == tags::CHAN_TAKE || op.tag == tags::CHAN_READ || op.tag == tags::CHAN_PUT;
         if (channel_op && (op.chan < 0 || op.chan as usize >= channel_bindings.len()))
             || (!channel_op && op.chan >= 0)
         {

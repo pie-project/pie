@@ -40,6 +40,11 @@ struct BatchStepInputs {
     std::vector<std::uint8_t> attention_mask;
     std::vector<std::uint8_t> attention_mask_enabled;
     std::uint32_t attention_mask_stride = 0;
+    // One byte per token row: whether anything will read that row's logits.
+    // Only the fire's sampling indices do, so on a prompt prefill this is a
+    // single row out of N and the rest never need the lm_head projection.
+    // Empty means "unknown, materialize every row".
+    std::vector<std::uint8_t> row_needs_logits;
 };
 
 // Per-request spans, precomputed once per fire so the dispatch + read-walk avoid re-deriving.

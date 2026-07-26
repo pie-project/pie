@@ -19,21 +19,29 @@ The one-line placement:
 |---|---|---|
 | `dsl/` | `pie-dsl` | **authoring** — Tensor/Channel eDSL + the neutral trace `Builder` that lowers stage closures into a container |
 | `ir/` | `pie-ir` | **representation** — types, ops, registry, container + wire format, shape/dtype inference, the bind-time validator, the RNG contract |
-| `plan/` | `pie-plan` | **analysis** — normalization, stage signatures, value domains, region partitioning, lane-table ABI → the region plan (`PTRP`) and bound sidecar (`PTIB`) |
+| `plan/` | `pie-plan` | **analysis** — normalization, stage signatures, value domains, region partitioning, lane-table ABI → a `CompiledStage` handed straight to emission (nothing is serialized on the way out) |
 | `eval/` | `pie-eval` | **semantics** — the tier-0 reference interpreter and the host partial evaluator |
-| `codegen/` | `pie-codegen` | **emission** — the C ABI header, the RNG projections, and (landing next) the CUDA/Metal region emitters |
-| `tests/` | `pie-compiler-tests` | **conformance** — golden traces, the malformed-wire corpus, generated-artifact drift checks, cross-implementation parity |
+| `codegen/` | `pie-codegen` | **emission** — the C ABI header, the RNG projections, the CUDA/Metal region emitters, and the launch package the drivers execute |
+| `tests/` | `pie-compiler-tests` | **conformance** — golden traces, container mutation sweeps, generated-artifact drift checks, cross-implementation parity |
 
 ```
    dsl ──┐
          ├──> ir <──┬── eval
-                    └── plan <── codegen
+                    │
+                    └── plan <── codegen ──> pie-driver-abi
+                                             (interface/driver)
 ```
 
 `ir` is the dependency floor. `plan`, `eval`, and `codegen` are siblings above it;
 `plan` and `eval` never depend on each other, because they answer different
 questions about the same bound trace — *how do we execute this* versus *what does
 it produce*.
+
+`codegen` is the only crate here that reaches outside `compiler/`, and only for
+the launch package: it builds one out of `pie-driver-abi`, the same declarations
+the drivers read it back with. That crate is a contract, not a driver — it
+depends on nothing but serde — so the two ends of the host→driver ABI are one
+declaration rather than two copies kept in step by hand.
 
 ## Two terms that are easy to misread
 

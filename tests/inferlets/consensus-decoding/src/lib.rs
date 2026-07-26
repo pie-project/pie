@@ -239,7 +239,7 @@ async fn main(input: Input) -> Result<String> {
         let page_indptr = Channel::from_shaped([b + 1], pidx_v).named("page_indptr");
         let pool_ids_ch = Channel::from(pool_ids.clone()).named("pool_ids");
         let out = Channel::new([b], dtype::i32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+            .capacity(channel_capacity() as u32)
             .named("out");
         let rng = Channel::from(vec![0x9e37_u32, 0]).named("rng");
         let lanes = Channel::from((0..=b).collect::<Vec<u32>>()).named("embed_indptr");
@@ -294,7 +294,10 @@ async fn main(input: Input) -> Result<String> {
             let page_count = div(add(&filled, PAGE_T - 1), PAGE_T);
             let pages_n = gather(
                 &pids,
-                rem(iota(b * pool_pages), broadcast(&page_count, [b * pool_pages])),
+                rem(
+                    iota(b * pool_pages),
+                    broadcast(&page_count, [b * pool_pages]),
+                ),
             );
             let pidx_n = mul(iota(b + 1), broadcast(&page_count, [b + 1]));
 
@@ -325,21 +328,12 @@ async fn main(input: Input) -> Result<String> {
         } else {
             0
         };
-        let mut submitted = 0usize;
-        let mut in_flight = 0usize;
-        while in_flight < DEFAULT_RUNAHEAD_DEPTH && submitted < budget {
-            fwd.submit(&pipe)
-                .map_err(|e| format!("decode submit: {e}"))?;
-            submitted += 1;
-            in_flight += 1;
-        }
-        while in_flight > 0 && done.iter().any(|d| !d) {
+        run_ahead(&pipe, &fwd, budget, async || {
             let step: Vec<i32> = out
                 .take()
                 .get::<i32>()
                 .await
                 .map_err(|e| format!("out.take: {e}"))?;
-            in_flight -= 1;
             for (c, &t) in step.iter().enumerate().take(num_candidates) {
                 if done[c] {
                     continue; // lane keeps firing; its output is ignored
@@ -351,21 +345,14 @@ async fn main(input: Input) -> Result<String> {
                     cand_tokens[c].push(t);
                 }
             }
-            if submitted < budget && done.iter().any(|d| !d) {
-                fwd.submit(&pipe)
-                    .map_err(|e| format!("decode submit: {e}"))?;
-                submitted += 1;
-                in_flight += 1;
+            if done.iter().all(|d| *d) {
+                return Ok(ControlFlow::Break(()));
             }
-        }
-        while in_flight > 0 {
-            out.take()
-                .get::<i32>()
-                .await
-                .map_err(|e| format!("drain run-ahead candidates: {e}"))?;
-            in_flight -= 1;
-        }
-        // Fully drained above, so close only releases the scheduler wait-set.
+            Ok(ControlFlow::Continue(()))
+        })
+        .await?;
+        // Any fire still in flight after an early stop is left untaken; close
+        // releases the scheduler wait-set and reclaims them.
         pipe.close();
     }
 

@@ -15,6 +15,7 @@
 // the result back into the residual stream. Top-K and renormalization
 // happen on-device via `launch_topk_softmax_bf16`.
 
+#include "device_buffer.hpp"
 #include <cstdint>
 #include <vector>
 
@@ -93,6 +94,20 @@ struct MixtralLayerWeights {
     const DeviceTensor* router      = nullptr;   // [num_experts, hidden]
     const DeviceTensor* router_bias = nullptr;   // [num_experts] (gpt-oss)
     std::vector<MixtralExpertWeights> experts;   // size = num_experts
+
+    // Device-resident per-expert pointer arrays for the fused MXFP4 decode
+    // GEMV. Populated only when every expert on the layer is
+    // `Mxfp4RoutedDequant`; empty otherwise, which is also the runtime's
+    // signal that the fused path is unavailable. Having the routing indirect
+    // through device memory is what lets the decode MoE run without a D2H
+    // readback of `topk_idx`.
+    DeviceBuffer<const std::uint8_t*> expert_gate_up_packed_ptrs;
+    DeviceBuffer<const std::uint8_t*> expert_gate_up_scale_ptrs;
+    DeviceBuffer<const void*>         expert_gate_bias_ptrs;
+    DeviceBuffer<const void*>         expert_up_bias_ptrs;
+    DeviceBuffer<const std::uint8_t*> expert_down_packed_ptrs;
+    DeviceBuffer<const std::uint8_t*> expert_down_scale_ptrs;
+    DeviceBuffer<const void*>         expert_down_bias_ptrs;
 };
 
 struct MixtralWeights {
@@ -115,6 +130,11 @@ struct MixtralWeights {
     mutable DeviceTensor mxfp4_up_bf16_scratch;
     mutable DeviceTensor mxfp4_down_bf16_scratch;
     int mxfp4_intermediate_padded = 0;
+
+    // Route cap for the fused MXFP4 decode GEMV; 0 = not yet resolved.
+    // Scratch is allocated per call from the arena alongside the rest of
+    // the MoE workspace, so it always matches the live frame's geometry.
+    mutable int mxfp4_decode_max_routes = 0;
 };
 
 MixtralWeights bind_mixtral(const LoadedModel& engine);
@@ -140,7 +160,10 @@ void mixtral_forward_paged(
     int total_tokens,
     int num_requests,
     bool is_pure_decode,
+    const std::int32_t* logit_row_indices_d = nullptr,
+    int num_logit_rows = 0,
     const std::uint8_t* custom_mask_d = nullptr,
-    const std::int32_t* custom_mask_indptr_d = nullptr);
+    const std::int32_t* custom_mask_indptr_d = nullptr,
+    const std::uint8_t* row_valid_d = nullptr);
 
 }  // namespace pie_cuda_driver::model

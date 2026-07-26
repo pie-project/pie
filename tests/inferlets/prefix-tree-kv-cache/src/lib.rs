@@ -125,7 +125,7 @@ async fn generate(
     let w_slot = Channel::from(vec![seq_len / page_size]).named("w_slot");
     let w_off = Channel::from(vec![seq_len % page_size]).named("w_off");
     let token_out = Channel::new([1], dtype::i32)
-        .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+        .capacity(channel_capacity() as u32)
         .named("token_out");
 
     let fwd = ForwardPass::new();
@@ -160,40 +160,19 @@ async fn generate(
     });
 
     let budget = max_tokens.saturating_sub(generated.len());
-    let mut submitted = 0usize;
-    let mut in_flight = 0usize;
-    while in_flight < DEFAULT_RUNAHEAD_DEPTH && submitted < budget {
-        fwd.submit(&pipeline)
-            .map_err(|e| format!("generate leaf: {e}"))?;
-        submitted += 1;
-        in_flight += 1;
-    }
-    while in_flight > 0 {
+    run_ahead(&pipeline, &fwd, budget as usize, async || {
         let token = token_out
             .take()
             .get::<i32>()
             .await
             .map_err(|e| format!("read leaf token: {e}"))?[0] as u32;
-        in_flight -= 1;
         if stop_tokens.contains(&token) {
-            break;
+            return Ok(ControlFlow::Break(()));
         }
         generated.push(token);
-        if submitted < budget {
-            fwd.submit(&pipeline)
-                .map_err(|e| format!("generate leaf: {e}"))?;
-            submitted += 1;
-            in_flight += 1;
-        }
-    }
-    while in_flight > 0 {
-        token_out
-            .take()
-            .get::<i32>()
-            .await
-            .map_err(|e| format!("drain leaf run-ahead token: {e}"))?;
-        in_flight -= 1;
-    }
+        Ok(ControlFlow::Continue(()))
+    })
+    .await?;
     Ok(generated)
 }
 

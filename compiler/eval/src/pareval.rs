@@ -24,7 +24,7 @@ use alloc::vec::Vec;
 
 use crate::interp::{Evaled, PassInputs, StepError, Value, const_value, eval_op};
 use pie_ir::container::PortSource;
-use pie_ir::op::Op;
+use pie_ir::op::{Op, ValueSource};
 use pie_ir::registry::{Port, Stage};
 use pie_ir::validate::BoundTrace;
 
@@ -38,6 +38,10 @@ pub enum EvalBlocker {
     Kernel(String),
     /// A device intrinsic value (logits, hidden, ...).
     Intrinsic(&'static str),
+    /// An ambient-seed `Rng` draw. The seed is a per-fire device fact, so the
+    /// host cannot replay the noise — unlike `RngKeyed`, which is a pure
+    /// function of a state operand the host may well know.
+    AmbientSeed,
     /// The trace faulted under evaluation — a real bug, not a capability gap.
     Fault(String),
 }
@@ -50,6 +54,9 @@ impl core::fmt::Display for EvalBlocker {
             }
             EvalBlocker::Kernel(name) => write!(f, "kernel {name} is device-only"),
             EvalBlocker::Intrinsic(name) => write!(f, "intrinsic {name} is device-only"),
+            EvalBlocker::AmbientSeed => {
+                write!(f, "rng draws the ambient seed, which is decided per fire")
+            }
             EvalBlocker::Fault(message) => write!(f, "evaluation fault: {message}"),
         }
     }
@@ -147,10 +154,41 @@ pub fn fold_stage(
                     Err(blocked.unwrap_or(EvalBlocker::Intrinsic(intr.name()))),
                 );
             }
+            // `eval_op` answers this one with `rng_ambient(0, ..)` — the
+            // reference interpreter's stand-in seed, not the seed the device
+            // will draw. Folding it would hand the caller a concrete tensor
+            // that the real fire does not produce.
+            Op::Rng { .. } => {
+                push(
+                    &mut slots,
+                    &mut dense,
+                    next_id,
+                    Err(blocked.unwrap_or(EvalBlocker::AmbientSeed)),
+                );
+            }
             // Sinks carry no value results and configure the forward — the
             // fold is value-only, so they are inert here.
             Op::SinkCall { .. } => {}
             _ => {
+                // Everything reaching here is folded as a pure function of its
+                // operands, so the arms above have to name every op that is
+                // not one. An op that slipped out of them would be folded as
+                // if the host could perform it, and a device-carried value
+                // would come back host-derivable — a pass scheduled that
+                // cannot run.
+                //
+                // The guard asks [`Op::value_source`], which is exhaustive
+                // over `Op` and answers exactly this question. It used to ask
+                // `is_effectful`, which answers a different one — whether DCE
+                // and CSE must leave the op alone — and deliberately calls
+                // `Rng` pure. So `Rng` passed the assertion and was folded
+                // against a stand-in seed, while `stage_taint` fifty lines
+                // below already called it device-decided.
+                debug_assert!(
+                    matches!(op.value_source(), ValueSource::Operands),
+                    "{op:?} reached the fold's general arm, which evaluates it \
+                     as a pure function of its operands"
+                );
                 if let Some(blocker) = blocked {
                     for offset in 0..op.result_count() as usize {
                         push(
@@ -185,13 +223,21 @@ pub fn fold_stage(
     Ok(fold)
 }
 
+/// A dtype-correct stand-in for a blocked value.
+///
+/// Blocked operands short-circuit before `eval_op` (the `if let Some(blocker)
+/// = blocked` arm returns early), so nothing ever reads a placeholder —
+/// `dense` only needs an entry to stay index-aligned with `slots`. It is
+/// therefore empty on purpose: materialising the declared `numel()` zeroed a
+/// whole tensor per blocked op, and in a decode epilogue (where every kernel
+/// and intrinsic is blocked) that dominated the host cost of a forward
+/// submit.
 fn placeholder(ty: pie_ir::types::ValueType) -> Value {
-    let n = ty.shape.numel().max(1) as usize;
     match ty.dtype {
-        pie_ir::types::DType::F32 => Value::F32(alloc::vec![0.0; n]),
-        pie_ir::types::DType::I32 => Value::I32(alloc::vec![0; n]),
-        pie_ir::types::DType::U32 => Value::U32(alloc::vec![0; n]),
-        pie_ir::types::DType::Bool => Value::Bool(alloc::vec![false; n]),
+        pie_ir::types::DType::F32 => Value::F32(alloc::vec::Vec::new()),
+        pie_ir::types::DType::I32 => Value::I32(alloc::vec::Vec::new()),
+        pie_ir::types::DType::U32 => Value::U32(alloc::vec::Vec::new()),
+        pie_ir::types::DType::Bool => Value::Bool(alloc::vec::Vec::new()),
     }
 }
 
@@ -272,7 +318,8 @@ fn stage_taint(ops: &[Op], device_decided: &BTreeSet<u32>) -> (BTreeMap<u32, boo
     for op in ops {
         let arg_tainted = op.operands().iter().any(|&arg| tainted[arg as usize]);
         let out = match op {
-            Op::KernelCall { .. } | Op::IntrinsicVal { .. } => true,
+            // A read inherits whatever this stage already put, else whatever
+            // an earlier stage proved.
             Op::ChanTake(chan) | Op::ChanRead(chan) => match pending.get(chan) {
                 Some(&t) => t,
                 None => device_decided.contains(chan),
@@ -285,7 +332,20 @@ fn stage_taint(ops: &[Op], device_decided: &BTreeSet<u32>) -> (BTreeMap<u32, boo
                 }
                 false
             }
-            _ => arg_tainted,
+
+            // Every other op is classified by `Op::value_source`, which is
+            // exhaustive over `Op` and is the only copy of this judgement --
+            // `fold_stage` above reads the same answer. This arm used to
+            // restate it as two variant lists, and the copy it was keeping in
+            // step with was the wrong one: the fold called `Rng` pure while
+            // this list called it device-decided.
+            other => match other.value_source() {
+                ValueSource::Device => true,
+                ValueSource::Operands => arg_tainted,
+                // The channel ops are the only `Channel` rows and both are
+                // matched above.
+                ValueSource::Channel => unreachable!("channel ops matched above"),
+            },
         };
         for _ in 0..op.result_count() {
             tainted.push(out);
@@ -352,7 +412,7 @@ mod tests {
     };
     use pie_ir::op::IntrinsicId;
     use pie_ir::registry::ModelProfile;
-    use pie_ir::types::{DType, Literal, Shape};
+    use pie_ir::types::{DType, Literal, RngKind, Shape};
     use pie_ir::validate::bind;
 
     fn chan(shape: Shape, dtype: DType, capacity: u32) -> ChannelDecl {
@@ -599,11 +659,174 @@ mod tests {
         );
     }
 
+    /// `Rng` draws from an ambient per-fire seed, so its result is a device
+    /// fact even though the op has no value operands. It used to reach
+    /// `stage_taint`'s catch-all and inherit `arg_tainted` — vacuously
+    /// `false` for an operand-free op — which told the scheduler it could
+    /// derive a descriptor whose width came out of the device's noise.
+    #[test]
+    fn ambient_rng_taints_what_it_reaches() {
+        use Op::*;
+        let mut trace = sdk_geometry_trace();
+        trace.stages.push(StageProgram {
+            stage: Stage::Epilogue,
+            ops: vec![
+                Rng {
+                    stream: 0,
+                    shape: Shape::vector(3),
+                    kind: RngKind::Uniform,
+                }, // 0 F32 [3]
+                Cast {
+                    value: 0,
+                    dtype: DType::U32,
+                }, // 1
+                Cast {
+                    value: 1,
+                    dtype: DType::I32,
+                }, // 2
+                ChanPut { chan: 0, value: 2 },
+            ],
+        });
+        let bound = bind(trace, ModelProfile::dummy()).unwrap();
+        let taint = geometry_taint(&bound);
+        assert!(taint.device_decided.contains(&0), "rng-fed tokens");
+        assert!(taint.device_dependent_ports.contains(&Port::EmbedTokens));
+        assert!(taint.device_dependent_ports.contains(&Port::Positions));
+        assert!(!taint.host_derivable());
+    }
+
+    /// The keyed form is the opposite case and must stay untainted:
+    /// PTIR-CONTAINER.md §5 pins it as a pure function of its `state`
+    /// operand, so a host holding the state replays the same noise.
+    #[test]
+    fn keyed_rng_is_only_as_tainted_as_its_state() {
+        use Op::*;
+        let mut trace = sdk_geometry_trace();
+        trace.channels.push(chan(Shape::vector(2), DType::U32, 1));
+        trace.stages.push(StageProgram {
+            stage: Stage::Epilogue,
+            ops: vec![
+                ChanRead(8), // 0 state [2] U32, seeded ⇒ host-known
+                RngKeyed {
+                    state: 0,
+                    shape: Shape::vector(3),
+                    kind: RngKind::Uniform,
+                }, // 1
+                Cast {
+                    value: 1,
+                    dtype: DType::I32,
+                }, // 2
+                ChanPut { chan: 0, value: 2 },
+            ],
+        });
+        let bound = bind(trace, ModelProfile::dummy()).unwrap();
+        let taint = geometry_taint(&bound);
+        assert!(taint.host_derivable(), "keyed noise is replayable");
+    }
+
     #[test]
     fn seeded_prefill_is_host_derivable() {
         let bound = bind(sdk_geometry_trace(), ModelProfile::dummy()).unwrap();
         let taint = geometry_taint(&bound);
         assert!(taint.device_decided.is_empty());
         assert!(taint.host_derivable());
+    }
+
+    /// The `_` arm of the fold hands its op to `eval_op` as a pure function of
+    /// already-evaluated operands. That is right for everything the arms above
+    /// do not name — and the arms above name exactly the effectful ops plus
+    /// `IntrinsicVal`.
+    ///
+    /// The other half of `ambient_rng_taints_what_it_reaches`: the fold has
+    /// to refuse the op the taint analysis refuses.
+    ///
+    /// It did not. `eval_op` answers `Op::Rng` with `rng_ambient(0, ..)`, the
+    /// reference interpreter's stand-in for a seed it does not have, and the
+    /// fold's general arm evaluated it -- so `fold_stage` handed back a
+    /// concrete tensor for a value the device draws per fire, while
+    /// `geometry_taint` fifty lines away already called the same op
+    /// device-decided.
+    #[test]
+    fn the_fold_refuses_what_the_taint_refuses() {
+        use Op::*;
+        let mut trace = sdk_geometry_trace();
+        trace.stages.push(StageProgram {
+            stage: Stage::Epilogue,
+            ops: vec![
+                Rng {
+                    stream: 0,
+                    shape: Shape::vector(3),
+                    kind: RngKind::Uniform,
+                }, // 0
+                Cast {
+                    value: 0,
+                    dtype: DType::U32,
+                }, // 1
+                Cast {
+                    value: 1,
+                    dtype: DType::I32,
+                }, // 2
+                ChanPut { chan: 0, value: 2 },
+            ],
+        });
+        let bound = bind(trace, ModelProfile::dummy()).unwrap();
+        let seeds = seeds();
+        let fold = fold_stage(&bound, Stage::Epilogue, &mut known_from(&seeds)).unwrap();
+
+        assert_eq!(
+            fold.puts.get(&0),
+            Some(&Err(EvalBlocker::AmbientSeed)),
+            "the fold produced a value for an ambient-seed draw"
+        );
+        assert!(
+            geometry_taint(&bound).device_decided.contains(&0),
+            "the taint analysis is the other half of this and must agree"
+        );
+    }
+
+    /// The set of ops the fold names, pinned against [`Op::value_source`].
+    ///
+    /// This is a *transcription* of the match arms, not a call into the fold,
+    /// and on its own it is blind to an edit of the fold itself — a mutation
+    /// that deleted `Op::ChanRead` from the match passed this test. The
+    /// behavioural half lives in the fold: its general arm carries a
+    /// `debug_assert!` on `value_source`, so an op that slips out of the arms
+    /// fails the moment any trace folds it, with a message naming the op.
+    /// What this test adds is the other direction — that the arms do not name
+    /// something `value_source` calls pure, which no trace would reveal
+    /// because the fold would simply be conservative.
+    ///
+    /// It used to be pinned against `is_effectful`, and that is how `Rng` got
+    /// through: `is_effectful` answers whether DCE and CSE must leave an op
+    /// alone, and deliberately calls `Rng` pure. Asking it here did not make
+    /// the test weaker, it made it wrong — it asserted the fold *must not*
+    /// name the one op it most needed to.
+    #[test]
+    fn the_fold_only_generalises_over_pure_ops() {
+        let mut checked = 0usize;
+        for op in pie_ir::op::representatives() {
+            let named_by_the_fold = matches!(
+                op,
+                Op::ChanTake(..)
+                    | Op::ChanRead(..)
+                    | Op::ChanPut { .. }
+                    | Op::KernelCall { .. }
+                    | Op::SinkCall { .. }
+                    | Op::IntrinsicVal { .. }
+                    | Op::Rng { .. }
+            );
+            let must_be_named = op.value_source() != ValueSource::Operands;
+            assert_eq!(
+                named_by_the_fold, must_be_named,
+                "{op:?} disagrees: the fold names it {named_by_the_fold}, \
+                 but its value source says {must_be_named}"
+            );
+            checked += 1;
+        }
+        assert_eq!(
+            checked,
+            pie_ir::op::OP_TABLE.len(),
+            "representatives() stopped covering the table"
+        );
     }
 }

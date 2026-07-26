@@ -1,6 +1,6 @@
 //! `Channel` — GPU-resident ordered memory (overview §1): a bounded queue of
 //! cells with full/empty bits. Inside a traced stage, `take`/`read`/`put` record
-//! echo's `ChanTake`/`ChanRead`/`ChanPut` ops; on the host they take the async
+//! the IR's `ChanTake`/`ChanRead`/`ChanPut` ops; on the host they take the async
 //! path.
 
 use alloc::format;

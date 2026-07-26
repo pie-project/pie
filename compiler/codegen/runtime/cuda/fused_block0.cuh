@@ -1103,17 +1103,36 @@ __device__ __forceinline__ void ptir_fast_argmax_intrinsic(
   const m1_u32 warp = threadIdx.x >> 5u;
   const m1_u32 warps = blockDim.x >> 5u;
   for (m1_u32 row = 0; row < input_desc.rows; ++row) {
+    const m1_u8* row_base = m1_intrinsic_row_base(
+        input, (m1_u64)row_offset + row, stride, mode);
+    const m1_u32 last = input_desc.last;
     M1ArgmaxCandidate candidate{
         m1_neg_inf(), 0u, 0u, 0u};
-    for (m1_u32 index = threadIdx.x;
-         index < input_desc.last;
+    // `m1_argmax_combine` takes the max and breaks ties toward the lower
+    // index, so it is commutative and associative: widening each thread's scan
+    // to a 16-byte load changes how many instructions the scan costs, not what
+    // it answers.
+    const m1_u32 vectors =
+        (mode != 0u &&
+         ((m1_u64)row_base & 15ull) == 0ull)
+            ? (last >> 3)
+            : 0u;
+    for (m1_u32 v = threadIdx.x; v < vectors; v += blockDim.x) {
+      const M1U32x4 packed = reinterpret_cast<const M1U32x4*>(row_base)[v];
+      const m1_u32 words[4] = {packed.x, packed.y, packed.z, packed.w};
+#pragma unroll
+      for (m1_u32 k = 0; k < 8u; ++k) {
+        const float value =
+            __uint_as_float((words[k >> 1] >> ((k & 1u) * 16u)) << 16);
+        const M1ArgmaxCandidate next{
+            value, v * 8u + k, m1_isnan(value) ? 0u : 1u, 0u};
+        candidate = m1_argmax_combine(candidate, next);
+      }
+    }
+    for (m1_u32 index = (vectors << 3) + threadIdx.x;
+         index < last;
          index += blockDim.x) {
-      const float value = m1_intrinsic_row_load(
-          input,
-          (m1_u64)row_offset + row,
-          index,
-          stride,
-          mode);
+      const float value = m1_intrinsic_column_load(row_base, index, mode);
       const M1ArgmaxCandidate next{
           value, index, m1_isnan(value) ? 0u : 1u, 0u};
       candidate = m1_argmax_combine(candidate, next);

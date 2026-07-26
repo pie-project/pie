@@ -2888,3 +2888,841 @@ loss: a larger window reserves more KV ahead per lane (`reserve_to_tokens`
 covers every submitted fire) and lengthens the queue the scheduler scans each
 seal. Cover 3 is simultaneously the maximum the sweep requires and the optimum
 at the point that requires it.
+
+## §20.12 The run-ahead window belongs to the engine: `channel-capacity()` (2026-07-28)
+
+§20.11 fixed one guest's window. This makes the fix structural: the engine
+computes the window and hands it to every guest over WIT, and the SDK provides
+the loop that consumes it.
+
+### The quantity
+
+```
+R = HOST_TURNAROUND_WAVES = 3       host resubmit turnaround, k-INDEPENDENT
+F = 1 + ceil(R / k)                 frames a lane keeps outstanding
+W = F * k + 1                       model.channel-capacity(), in CELLS
+```
+
+| k | F | W | window (fires) | cover (waves) |
+| --- | --- | --- | --- | --- |
+| 1 | 4 | 5 | 4 | 3 |
+| 2 | 3 | 7 | 6 | 4 |
+| 3 | 2 | 7 | 6 | 3 |
+| 4 | 2 | 9 | 8 | 4 |
+
+`R` is in waves because that is what §20.10 showed the seal actually consumes:
+the wait-for-ALL quorum's binding term is the slowest lane's resubmit, and a
+frame does not make that turnaround any shorter. Sizing in frames is what gave
+k=1 a single wave of runway from the same line of code that gave k=2 two.
+
+The `+1` is structural, not empirical. At zero margin the producer needs the
+consumer's ack to be visible at publish time, and that visibility delay *is*
+the host round trip run-ahead exists to hide.
+
+`PIE_TURNAROUND_WAVES` overrides `R`. Swept at conc 256 (Qwen3-0.6B / L40S,
+medians of 3-4):
+
+| k | R=3 | R=5 | R=6 | R=8 | R=10 |
+| --- | --- | --- | --- | --- | --- |
+| 1 | **29031** | 28874 | - | 28472 | - |
+| 2 | **28847** | - | 28635 | - | 28369 |
+
+Monotonically decreasing above 3 at both frame sizes, for the reason §20.11
+already gave: a deeper window reserves more KV per lane and lengthens the queue
+the scheduler scans each seal. R=3 is measured, not assumed.
+
+Larger models may want more — upstream's bench default was 6 FRAMES, tuned at
+c=128 on Kimi K2.6 — which is what the env override is for.
+
+### Why the guest cannot be trusted with it
+
+At k=1 there is no diagnostic of any kind. `fire.rs:1217` short-circuits to
+`submit_pass_stamped` before `validate_frame`, and every capacity check
+(`fire.rs:1327-1406`) lives inside `validate_frame`. An undersized k=1 ring
+serialises the lane silently, forever. That is exactly the §20.10 collapse, and
+it took three investigations to find because nothing reported it.
+
+### Top-up discipline (a real defect this surfaced)
+
+Refill only while a WHOLE frame still fits:
+
+```rust
+let s = (budget - submitted).min(live_slots);
+if submitted - drained + s > window_fires { break; }
+```
+
+Testing `submitted - drained < window_fires` instead lets a frame START one
+below the window and finish `live_slots - 1` above it, so the true peak is
+`window_fires + live_slots - 1`. The bench's old ring was oversized enough to
+hide this; against a right-sized ring it is a hard submit rejection at k >= 3:
+`frame would need 8 reader cell(s) (capacity 7)`. `ptir::run_ahead` uses the
+same rule, which is what makes the single spare cell the correct margin.
+
+### Migration
+
+- 69 `.capacity(DEFAULT_RUNAHEAD_DEPTH)` sites -> `.capacity(channel_capacity())`
+- 24 pipelined inferlets -> `ptir::run_ahead`, ~430 lines of duplicated
+  prime-then-refill boilerplate deleted
+- `DEFAULT_RUNAHEAD_DEPTH` deleted. It had silently served as three different
+  quantities — window depth in frames, ring capacity in cells, and mtp's KV
+  extent in tokens — which only ever agreed because `submit()` pads every frame
+  to one live slot.
+- The 5 host-in-the-loop inferlets (`json-schema-constrained-decoding`,
+  `greenlist-watermarking`, `classifier-free-guidance`, `context-aware-decoding`,
+  `contrastive-decoding`) are depth-1 BY DESIGN — running ahead would reuse a
+  stale mask or a stale host pick — and keep their lockstep loops. For them
+  F=1, r=1, so `channel-capacity()` returns the 2 they already had.
+
+### Results (Qwen3-0.6B / L40S, medians; vLLM 0.26.0 at matched KV pages)
+
+| conc | PIE k=1 | PIE k=2 | vLLM | k=1 ratio | k=2 ratio |
+| --- | --- | --- | --- | --- | --- |
+| 64 | **16326** | 16150 | 15475 | **1.055** | 1.044 |
+| 128 | **23241** | 22712 | 22133 | **1.050** | 1.026 |
+| 256 | 29031 | 28840 | 29439 | 0.986 | 0.980 |
+| 512 | 30530 | 30578 | 32453 | 0.941 | 0.942 |
+
+conc 256 at every frame size: k=1 29031, k=2 28840, k=3 28677, k=4 28392.
+
+### The high-concurrency gap is pre-existing and is NOT this window
+
+pie wins at 64 and 128 and trails at 256 and 512. Everything below was swept to
+see whether run-ahead sizing explains the trailing half. None of it does:
+
+| lever | conc 512 k=2 median |
+| --- | --- |
+| default (R=3, worker threads auto) | **30578** |
+| `--worker-threads 16` | 30524 |
+| `--worker-threads 32` | 30264 |
+| `--worker-threads 64` | 29546 |
+| 4096 requests instead of 1024 (8 cohorts, not 2) | 30314 (vLLM 32676) |
+
+The long run is the informative one: with four times the cohorts the ratio does
+not move (0.942 -> 0.928), so the gap is steady-state throughput, not prefill
+ramp. §20.13 profiles it and finds the mechanism is NOT the seal quorum.
+
+What this work did move: conc 256 went 0.962 (§20.9) -> 0.979 (§20.11) ->
+0.986, and conc 128 went from behind to 1.050.
+
+conc 64 k=2 is 16150 against the 16145-16153 baseline — the migration is
+neutral where it should be, and the gain at 128/256 is the window.
+
+**k=1 now measures at or above k=2 at every concurrency**, which reverses
+§20.8's premise: that default was raised to 2 only because k=1 collapsed above
+conc 64, and the collapse was the guest window all along (§20.11). k=1 also
+costs less — 5 ring cells against 7, and a smaller KV run-ahead reservation.
+`PIE_FRAME_SIZE` is LEFT AT 2 here because reversing §20.8 deserves its own
+decision and its own contention evidence; the numbers above are that evidence
+when someone wants to take it.
+
+### Verification
+
+- contention suite 16/16 at k=1, k=2 (default) and k=3
+- `cargo test -p pie-engine --test inferlet_canary`: 2 passed, 3 ignored
+- all 29 inferlets build for `wasm32-wasip2`
+
+### Also fixed: embedded engine boot was broken on dev
+
+`pie.Config.to_toml()` emits the role-sectioned standalone document
+(`[controller]` / `[gateway]` / `[worker.*]`) that `pie serve --config` reads,
+and `server.py` fed that same string to `_engine.bootstrap`. The embedded wheel
+IS the worker and deserializes a flat `ServeConfig`, so it rejected
+`[controller]` outright — every embedded-engine bench failed at startup with
+`unknown field 'controller'`. Split out `to_engine_toml()`; both shapes are now
+emitted from one place so they cannot drift apart again.
+
+### §20.13 The conc-512 gap is the request-turnover barrier, not the seal quorum (2026-08-04)
+
+§20.12 blamed §20.10's wait-for-ALL seal for the 256/512 deficit. **That was
+wrong.** Direct profiling refutes it and names two independent, measured terms.
+
+#### Refuting the seal hypothesis: pie is GPU-bound
+
+`PIE_FIRE_TIMING=waves` at conc 512, k=2. GPU busy is reconstructed from
+consecutive waves — `start = max(prev.native_complete_us, w.launch_returned_us)`
+— because waves overlap two deep and `native_inflight_us` alone sums to 127% of
+the span.
+
+| conc | span | GPU busy | prefill share |
+| --- | --- | --- | --- |
+| 128 | 6140 ms | 93.3% | — |
+| 256 | 4950 ms | 91.6% | — |
+| 512 | 17770 ms | 92.7% | 3.4% |
+
+A seal that waits on the slowest of N lanes' resubmit would show up as GPU idle
+scattered through the run. It does not: idle is 7.3% and, as shown below, it is
+concentrated in a handful of gaps whose position and size are fully explained by
+something else. Raising `PIE_SCHED_MAX_IN_FLIGHT` 2 -> 3 also does nothing
+(30582 vs 30578); depth 1 costs 27% (22169). The pipeline is not depth-starved.
+
+#### Term 1: request turnover is a global barrier (~4.8% of wall)
+
+The idle is not scattered. At conc 512 / 4096 requests there is exactly one
+startup gap plus **`cohorts - 1` turnover gaps**, and each one lands precisely on
+a fleet-wide process retirement:
+
+| gap | size | lifecycle events within +/-40 ms |
+| --- | --- | --- |
+| startup | 418 ms | `guest_main_entered` = 1024 (whole fleet instantiating) |
+| turnover | 77-141 ms | `process_teardown` start = 512, `released` = 512 |
+
+Inside a turnover gap the successor's admission tracks its predecessor's release
+at every quantile, within 0.3 ms:
+
+| quantile | teardown start | permit released | successor admitted |
+| --- | --- | --- | --- |
+| p10 | 162086.9 | 162105.3 | 162105.6 |
+| p50 | 162108.0 | 162120.1 | **162120.2** |
+| p90 | 162132.6 | 162135.1 | 162135.4 |
+
+The code says why. In `process/teardown.rs` the execution permit lives inside
+`context` and is only released by `drop(context)` — which runs *after* the
+awaited `notify_process_terminate` reference fence (`terminate_ack_us` p50
+**8.5 ms**) and after `finalize_all`. The fence's own comment concedes the
+pacing: *"serializes each retirement behind a scheduler pass"*. So a lane's seat
+is not freed when it stops producing tokens; it is freed when its predecessor has
+fully torn down. Because every lane runs the same prompt for the same
+`max_tokens`, all `concurrency` lanes retire in the same wave, and the retirement
+herd is serialized with the GPU idle.
+
+That predicts the gap should scale with herd size, and it does — linearly:
+
+| conc | turnover gap (mean) | startup gap | gap / (gap + cohort GPU time) |
+| --- | --- | --- | --- |
+| 128 | 35.4 ms | 136 ms | 4.7% |
+| 256 | 57.4 ms | 202 ms | 4.8% |
+| 512 | **106.7 ms** | 418 ms | **4.9%** |
+
+Both the gap and the work per cohort scale with concurrency, so **the turnover
+tax is a near-constant ~4.8% at every concurrency** — it is not a defect that
+appears at 512. vLLM pays none of it: its marginal wall per cohort is flat to
+three digits (2.00 / 2.01 / 2.00 s) while pie's grows (2.09 / 2.145 / 2.24 s).
+
+A finished vLLM sequence is dropped from the batch and replaced on the very next
+scheduler step. A finished pie request must tear down a WASM process first.
+
+#### Term 2: pie's per-step advantage decays with batch width
+
+Dividing tokens by GPU-busy time isolates pie's decode rate from the turnover
+tax (corrected for instrumentation's 3.6%):
+
+| conc | pie decode rate | vLLM end-to-end | raw advantage | measured e2e ratio |
+| --- | --- | --- | --- | --- |
+| 128 | 23702 | 22133 | **+7.1%** | 1.050 |
+| 256 | 29949 | 29439 | +1.7% | 0.986 |
+| 512 | 32973 | 32613 | **+1.1%** | 0.916 |
+
+pie's kernels are at or ahead of vLLM's at every width — at conc 512 its decode
+rate (32973) matches vLLM's own steady-state generation throughput
+(33013-33043). But the margin collapses from +7.1% to +1.1% as the batch widens.
+
+**The two terms together are the whole story.** A flat ~4.8% turnover tax against
+an advantage that decays from +7% to +1%: the sign flips between conc 128 and
+conc 256, exactly where the measured ratio does.
+
+#### Corroboration: the deficit is per-request, not per-token
+
+Holding conc at 512 and varying output length moves the ratio monotonically,
+which is the signature of a fixed per-request cost:
+
+| max_tokens | pie | vLLM | ratio |
+| --- | --- | --- | --- |
+| 32 | 28128 | 31925 | 0.881 |
+| 64 | 31934 | 34948 | 0.914 |
+| 128 | 30594 | 32453 | 0.942 |
+| 256 | 24291 | 24958 | 0.973 |
+| 512 | 12334 | 15771 | 0.782 (KV-confounded, discard) |
+
+The 512 row is not comparable: Qwen3-0.6B is 112 KiB/token, so 512 lanes x 548
+tokens does not fit in 12288 pages and both engines thrash.
+
+Ruled out by measurement: in-flight depth, `--worker-threads` (16/32/64 all at or
+below default), prefill share (3.4%), kernel efficiency, and run length.
+
+#### Prize
+
+Removing the process-lifecycle idle — 1165 ms of a 17770 ms run at conc 512 —
+would take the ratio from 0.916 to **~0.979**. The fix is to stop holding the
+execution permit across teardown: release the seat when the guest stops
+producing, and let the terminate fence, finalize and resource drop run behind the
+successor rather than in front of it. The startup gap is a one-time fleet
+instantiation and amortizes away on a long-lived server; the per-turnover gap
+does not. Tracked as an open finding — the change touches the same permit
+accounting that §20.4's forfeit path depends on and needs its own contention
+evidence.
+
+## 20.14 The turnover barrier: one fix landed, eight levers closed
+
+§20.13 named the cost. This section is the attempt to remove it. One change
+landed; every other lever that could plausibly have removed the remaining gap
+was implemented or configured and then **measured worse or neutral**, so they
+are recorded here as closed rather than as future work.
+
+### The change that landed: free the execution seat at `ProcessCtx::drop`
+
+`TeardownFireContext` declared `_execution_permit` after `resources` so it
+dropped last, deliberately: "strict admission advances only after pooled
+resources are released". The consequence was that a seat was freed when the
+predecessor finished *tearing down*, not when it stopped producing tokens.
+
+Measured cost of that ordering (conc 512, 4096 requests, p50):
+
+| interval | before | after |
+| --- | ---: | ---: |
+| guest return -> `Drop` entered | 0.04 ms | 0.04 ms |
+| `Drop` -> permit released | — | **0.011 ms** |
+| `Drop` -> teardown task starts | 16.29 ms | 27.37 ms *(now off the critical path)* |
+| teardown task -> finalize | 11.51 ms | 0.00 ms |
+| **guest return -> permit released** | **27.84 ms** | **~0.05 ms** |
+
+The permit is already in hand inside `Drop`, so no new liveness signal was
+needed. `ProcessCtx::drop` now posts the Terminate leave with a per-driver
+oneshot, broadcasts the release, drops the permit, and hands the *fences* to
+`defer_resource_teardown`; the fence wait, `finalize_all` and the page recycle
+run behind the successor instead of in front of it. Leave-before-release
+ordering is preserved (same producer, FIFO), which is what `departing` relies
+on.
+
+This also **deletes a failure mode**. The old no-runtime error path
+`mem::forget`-ed the context and therefore destroyed the seat, which is why
+`ExecutionSlotForfeited` existed at all. With the permit out of the context the
+permit can no longer leak, so the forfeit item, its handler
+(`on_execution_slot_forfeited`), its dispatch arm and its test are gone.
+
+Effect on the boundary is exactly as intended and is visible per herd
+(conc 512, 8 cohorts, retirement herds detected by a 200 ms gap):
+
+| herd | retirements | ret span | admits | admit span | first admit − first retire | last admit − last retire |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 512 | 43.9 ms | 512 | 74.5 ms | **0.7 ms** | 31.3 ms |
+| 3 | 512 | 41.4 ms | 512 | 83.1 ms | **0.4 ms** | 42.1 ms |
+| 6 | 512 | 49.7 ms | 512 | 92.3 ms | **0.4 ms** | 43.0 ms |
+
+The handoff is now immediate. **It does not convert to throughput** — the
+4-point cohort sweep moved +0.30 / +1.01 / −0.34 / +1.86 %, i.e. noise, and the
+turnover gap itself did not shrink (106.7 -> 112.7 ms). The bottleneck moved,
+it did not disappear: 512 admissions still take ~80 ms to drain at ~156 us
+each. Retirement and bring-up are **host-CPU bound** and contend for the same
+tokio runtime while the GPU idles.
+
+The change is kept anyway: it is a strict improvement in ordering, it removes
+the leak-destroys-a-seat path, and any future overlap of the swap depends on
+seats genuinely freeing early.
+
+### Closed by measurement (conc 512, 4096 requests, `--max-tokens 128`)
+
+| # | lever | result |
+| --- | --- | ---: |
+| 1 | execution admission cap x2 / x4 (pre-§20.14) | +0.85 % / −1.2 % |
+| 2 | execution admission cap x1.25 / x1.5 (**re-tested after the seat fix**) | **26543 / 29674** vs 30402 |
+| 3 | `PIE_SCHED_MAX_IN_FLIGHT` 1 / 3 | 22169 / 30582 vs 30578 |
+| 4 | `--worker-threads` 16 / 32 / 64 | all <= default |
+| 5 | bind staging depth `STAGED_COHORTS` 2 / 3 | 30054 / 30109 vs 30443 |
+| 6 | bounded swap hold, 2 ms (early seal during a swap) | **18852** vs 30008 (−38 %) |
+| 7 | bounded swap hold, 32 ms | 30627 vs 30443 (noise) |
+| 8 | prioritise launches over controls on the driver lane | already implemented |
+
+Four of these are worth their own paragraph, because each kills a *theory*, not
+just a setting.
+
+**Cohort overlap is not available through the cap (#1, #2).** The obvious fix
+for a swap is to let the successor cohort start decoding before the predecessor
+finishes retiring, which needs more execution seats than the offered
+concurrency. It was re-tested after the seat fix, because the original test ran
+while releases were still 27.8 ms late and could have been confounded. It is
+not: x1.25 costs 13 %. Admitting more than the driver's `max_forward_requests`
+worth of processes cannot widen a batch — one fire per process per forward — it
+only makes batches ragged, and `init_admission` already predicted the outcome
+("without an earmarked taker the stall just moves into mid-generation seals").
+
+**The seal is not the lever (#6, #7) — third independent confirmation.** The
+wait-all gate holds when `joining` is true even with the GPU idle, so bounding
+that hold and dispatching whoever is ready looks like free throughput. It is
+the opposite: at conc 512 the *entire cohort* swaps at once, so the ready set
+during the gap is the handful of successors that happen to have arrived. The
+seal fires a ~20-row wave instead of a 1024-row one, and those 20 lanes are then
+a token ahead of the other 492, so every subsequent boundary pays to re-merge
+them (run-ahead lead is hysteretic). Wave count and p50 rows were unchanged
+(592 -> 614 waves, p50 1024 both) while wall doubled — the damage is idle, not
+fragmentation. A 32 ms bound is harmless only because it almost never fires.
+`joining` exists precisely to keep a turnover in one dense epoch, and the
+measurement says it earns its keep.
+
+**Bind staging is already deep enough (#5).** The bind pool is
+`concurrency * (1 + STAGED_COHORTS)`, and at saturation it is exactly full, so
+a staged process can only take its permit once a retiring one closes its
+instance — the staging burst is synchronised to the turnover by construction.
+Raising the depth to 2 or 3 removes that synchronisation and changes nothing,
+because the binds were never late: per-process, **both** driver binds finish
+~2.0 s before that process is admitted (p50 −2043 ms and −1984 ms). Only the
+first cohort binds at its own admission, which is the startup gap.
+
+**The driver control storm is a symptom, not a cause (#8).** During a turnover
+window the driver lane is 38–57 % occupied by control ops, dominated by 400–600
+`register_channels_bind` at ~120 us each (`set_us` 53 us in the engine's
+`register_channel_set`, `bind_us` 29 us in `bind_instance`, of which the actual
+per-channel work is ~1 %: 73746 channel registrations sum to 12 ms of
+alloc+init+mirror). That looks like the launch thread being stolen at the worst
+moment, and it is not: `DriverLane::next_request` already polls the launch queue
+first and only falls through to controls, so a pending launch preempts within
+one op. The lane is draining staged binds *because* the seal has nothing to
+launch, not the other way round.
+
+### Where the cost actually is
+
+Everything above is elimination. What survives is the §20.13 decomposition,
+now with the seat-handoff term removed:
+
+```
+last decode settle -> first guest return    5.9 ms
+guest exit spread (512 WASM guests)        45.5 ms   <- dominant
+seat handoff                               ~0.05 ms  <- was 27.8 ms
+successor admission drain                  ~80 ms, overlapping the above
+```
+
+512 guests returning from `main` and 512 successors running to their first
+submit are real host work on the same runtime, and the wait-all seal cannot
+start until the last of them lands. No configuration removes it; the only
+shapes that could are (a) making per-process bring-up and teardown
+substantially cheaper, or (b) a seal quorum that tolerates a partial fleet
+*without* letting the admitted subset run ahead — which is a different and much
+larger design than the bounded hold tried in #6.
+
+The tax is ~4.8 % of wall at every concurrency (§20.13). It is only *visible* at
+256 and above because pie's per-step advantage over vLLM decays with batch width
+(+7.1 % at 128, +1.7 % at 256, +1.1 % at 512), so a flat tax flips the sign
+exactly where the measured ratio flips.
+
+## §20.15 — (A) profiled: the forward submit spends 77% of its host time
+## symbolically re-evaluating the trace, and process exit is 100% one
+## mailbox round trip
+
+§20.14 closed with two remaining shapes: (a) make per-process bring-up and
+teardown substantially cheaper, or (b) a partial-fleet seal quorum. This is
+(a), profiled end to end with per-phase probes (`PIE_FIRE_TIMING=waves`,
+conc 512, N=4096, mt 128, Qwen3-0.6B / 28 layers).
+
+### EXIT: it is entirely `notify_pipeline_close`
+
+| component of the guest exit | p50 | p90 | sum over run |
+| --------------------------- | ---:| ---:| ------------:|
+| `notify_pipeline_close` (scheduler round trip) | **25.40 ms** | **40.20 ms** | 101.45 s |
+| `drain_settled`                                | 0.01 ms | 0.01 ms | 0.03 s |
+| close -> `guest_main_returned` (guest epilogue) | 0.26 ms | 0.40 ms | 1.13 s |
+
+The ~45 ms guest-exit spread §20.14 measured is 100% one call. Chain:
+`HostPipeline::close` -> `pipeline_close_inner` -> `notify_pipeline_close`
+-> `notify_pipeline_leave_and_wait(pid, LeaveKind::Close)` (worker.rs:132).
+That posts **one `SchedulerItem::PipelineLeave` plus one oneshot per process
+per driver** and awaits every ack.
+
+The handler (worker.rs:2650) replies *immediately* — it does no waiting of
+its own. So the 25 ms is **pure queueing**: 512 items land at once and each
+waits roughly one worker pass. This is exactly §20.14's un-implemented
+"Step 2" (batch `PipelineLeave` into one item per driver carrying a pid set,
+mirroring the channel-close batching already in `teardown.rs`); its value is
+now measured at 25-40 ms per turnover rather than the +0.5% first guessed.
+NOT YET FIXED.
+
+### BRING-UP: nothing is waiting; it is all CPU inside `submit`
+
+| component | value |
+| --------- | ----- |
+| `residency_gate` (admission -> first fire) | 0 us |
+| `acquire_grant` (planner KV/RS) | **mean 0 us, max 24 us — hypothesis rejected** |
+| `submit_frame`, steady-state | 136-157 us per submit |
+| `submit_frame`, turnover | 169-190 us per submit |
+| submits per wave | steady 441, turnover **1565** |
+
+`ensure_execution_admitted` lives *inside* `forward::submit`, so a staged
+process runs its whole guest prologue and parks on the admission semaphore
+in its first submit; "admitted -> first fire" is only the gate plus one
+submit. Neither is a wait. The turnover is expensive because it pays 3x the
+submits at once with no previous wave to hide behind (steady-state waves
+overlap: inter-wave gap p50 = -24.9 ms).
+
+### The submit decomposed (conc 512, steady waves, per submit)
+
+| phase | us | % of submit |
+| ----- | --:| -----------:|
+| validate + wire channels + geometry/mask build | 11.5 | 7.3% |
+| KV/RS reserve | 3.1 | 2.0% |
+| KV translate | 0.7 | 0.4% |
+| scheduler submit | 11.0 | 7.0% |
+| fire-timing + ticket commit | 1.1 | 0.7% |
+| **`HostShadow::advance`** | **121.6** | **77.6%** |
+| push `PendingFire` | 0.5 | 0.3% |
+
+`HostShadow::advance` folds the bound trace's stage programs through
+`pie_eval::pareval::fold_stage` on **every forward pass** to mirror what each
+host channel now holds (the value oracle behind evaluated fire geometry and
+attention masks). At 441 submits/wave and one wave per ~30 ms this is ~54 ms
+of host CPU per wave — about 1.8 cores, continuously, and ~200 ms of CPU in
+one burst at each turnover.
+
+### Two exact fixes, both landed
+
+**1. Skip channel-inert stages (`fire/shadow.rs`).** `advance` folded
+`2 * num_layers + 2` phases — 58 for this model — but `fold_stage`'s only
+consumed output is `fold.puts`, and its fault path shadows exactly the
+stage's `ChanPut` channels. **A stage program with no `ChanPut` is therefore
+a provable no-op.** Filtering them (once, cached on the shadow: the bound
+trace never changes for an instance) takes the fold from 58 phases to a
+measured **1.61** per fire.
+
+**2. Blocked-value placeholders are now empty (`compiler/eval/pareval.rs`).**
+This is where the time actually was. `placeholder()` allocated and zeroed a
+`numel()`-sized dense vector for **every blocked SSA value**, and in a decode
+prologue/epilogue every kernel and intrinsic is blocked. The vectors are
+never read — `pareval.rs`'s own comment says so, and the `if let Some(blocker)
+= blocked { ...; continue; }` arm enforces it: `eval_op` runs only when every
+operand is a real value. `dense` needs the entry only to stay index-aligned
+with `slots`.
+
+Measured, same build, same run shape:
+
+| | submit | `advance` | fold loop | phases/fire |
+| - | -----:| ---------:| ---------:| -----------:|
+| baseline                | 157.2 us | 121.8 us |  —       | 58 |
+| + stage filter          | 151.0 us | 115.5 us | 109.8 us | 1.61 |
+| + empty placeholders    | **66.3 us** | **28.1 us** | **21.7 us** | 1.63 |
+
+**Per-submit host cost -58%; `HostShadow::advance` -77%.** Turnover idle over
+an 8-cohort run fell 750 ms -> 642 ms (-14%); total dark time 1214 -> 1078 ms.
+
+### Throughput: NEUTRAL, and that is the finding
+
+True A/B, same machine session, fix stashed and rebuilt:
+
+| | baseline | with fix |
+| - | -------:| --------:|
+| conc 64 (N=512)   | 15896 / 15947 / 15786 | 15926 / 15828 / 15965 |
+| conc 512 (N=4096) | 30199 / 30261         | 30267 / 29798 / 30190 |
+
+At conc 512 on an L40S the engine is GPU-bound at 92.7% busy (§20.13), so the
+freed host CPU (~2.7 core-seconds over a 17.7 s run) has nothing to convert
+into. The change is kept because it is provably exact, strictly removes work,
+and the cost it removes scales with lanes x layers — i.e. with everything that
+gets bigger.
+
+MEASUREMENT TRAP RECORDED: this session's machine baseline is ~2.7% below
+§20.14's (conc 64: 15896 vs 16336). A cross-session number is not a control.
+Three consecutive runs looked like a -2.5% regression and were not; only the
+stash-and-rebuild A/B settled it. Also, the first bench run after the
+contention suite read 28386 at conc 512 and was a pure outlier (next three:
+30267 / 29798 / 30190).
+
+VERIFIED: contention suite 16/16; `cargo test -p pie-eval` 17 passed;
+inferlet_canary 2 passed / 3 ignored; conc 256 28494 / 28522 / 28578 and
+conc 128 22575, both inside the drifted baseline band.
+
+REMAINING, MEASURED, NOT FIXED:
+ - `notify_pipeline_close` 25-40 ms per turnover -> batch the leave.
+ - `fold_stage` still re-walks the prologue/epilogue op list every fire
+   (21.7 us). The trace is identical every pass; only a few input channel
+   values change. Compiling each channel-writing stage once into a closure
+   over its live inputs would remove the rest.
+
+## §20.16 — the capped close barrier deleted, and what the `allshared_noswap`
+## flake actually is
+
+### `close()` no longer waits for a scheduler ack
+
+`pipeline_close_inner` branched: under a capped execution admission it called
+`notify_pipeline_close(pid).await`, otherwise the fire-and-forget
+`notify_lane_close(pid, None)`. The two send the **identical**
+`SchedulerItem::PipelineLeave(pid, None, Close, ..)` — the only difference is
+a oneshot the caller then awaits. The policy effect is the same, and the
+handler (worker.rs:2650) replies immediately, so the await was a pure
+synchronisation barrier, measured in §20.15 at 25.40 ms p50 / 40.20 ms p90
+per process.
+
+It also contradicted the function's own contract, three lines above it:
+"Close is the sole end-of-stream verb: it rejects later submissions and
+releases the scheduler wait-set *immediately* ... close never waits for an
+unsettled fire."
+
+Deleted; both modes now take the fire-and-forget path. Ordering is unchanged
+— Close is posted on the same per-driver channel ahead of the Terminate that
+`ProcessCtx::drop` posts, so leave-then-release still holds.
+
+Measured (conc 512, N=4096, `PIE_FIRE_TIMING=waves`):
+
+| | per-turnover gap | startup gap |
+| - | ---------------:| -----------:|
+| awaited close   | 91.7 ms (mean of 7) | 435.6 ms |
+| fire-and-forget | **74.3 ms** (-19%)  | **377.4 ms** |
+
+Throughput is at the noise floor as expected (29894 / 30347 / 29897 vs
+30267 / 29798 / 30190): 17 ms x 7 turnovers is 0.7% of a 17.7 s run. Kept
+because it restores the documented contract, deletes a branch, and the
+barrier had no demonstrable purpose. `churn_extreme` 4/4 PASS — that is the
+regression test of `20060e93e "Fix extreme contention teardown"`, the commit
+that introduced the barrier.
+
+### `allshared_noswap` is bistable, and always has been
+
+The suite came back 15/16 with `allshared_noswap` failing `completed 7 < 8`.
+A/B, same machine session, 6 repeats each:
+
+| build | completions per run | fails |
+| ----- | ------------------- | ----: |
+| without this change | 6, 128, 128, 5, 9, 13 | 2/6 |
+| with this change    | 10, 128, 128, 128, 128, 5 | 1/6 |
+
+Not a regression — pre-existing, and if anything less frequent. The
+distribution is **bimodal**, not noisy: a run either completes 128/128 in
+~8.8 s or dies at ~0.9 s with 5-13 completions.
+
+Root cause of the two modes, from the failing run's own errors: 116 of 128
+requests fail `first frame submit: ... KV pool starved: 61 pages asked, 0
+free of 256`. The 900-word shared prefix costs **61 pages**, so a 256-page
+pool funds four of them. The good mode is not "everyone fits" — it is
+requests PARKING and being served ~4 at a time (which is exactly the 8.8 s).
+The bad mode is the same requests being **destroyed** by the starvation rung
+instead of parking.
+
+So the bistability is the wedge predicate, `ResidencyPlanner::is_wedged`
+(planner.rs:1552), firing at cold start. It reports wedged when no process
+is `Resident && admitted && !parked` — i.e. it takes "nobody is admitted
+yet" as proof that "no completion can ever arrive". At t=0 the whole fleet
+is registered, four asks consume the pool, and the rest park; whether an
+admitted-and-unparked process exists at the instant the predicate runs is a
+sub-millisecond race, which is exactly the 1-in-3 shape observed.
+
+This is NOT what the frame/run-ahead work addressed, and it was never fixed:
+§20.7 records `allshared_noswap` at "128/128, 0 failed under mode 2", but
+§20.3's calibration note in the same document records mode 2 completing
+"31-59, distributions that touch" and concludes "that scenario asserts
+liveness only". The contract was therefore set to `min_completed=8`, which
+is why the suite has never flagged the bad mode — 5 < 8 catches it only when
+the kill is unusually thorough.
+
+OPEN, newly localised: the wedge predicate needs to distinguish "no fire can
+ever complete" from "no fire has started yet" — e.g. require that some lane
+has been admitted-and-unparked at least once since the head parked, rather
+than reading the instantaneous set. Until then `allshared_noswap` will keep
+flaking and, more importantly, a real cold-start fleet can be destroyed
+instead of queued.
+
+## §20.17 DONE — the wedge was HEAD-OF-LINE HOARDING, not a cold-start race
+
+§20.16's fix shape was WRONG and the evidence refuted it. The hypothesis was
+"at t=0 nobody is admitted yet, so `is_wedged` reads 'nobody is running' as
+'no completion can ever arrive'". `is_wedged`'s own doc already argues that
+exclusion is deliberate (counting an unadmitted process as relief is what let
+a `num_requests > max_concurrent_processes` fleet deadlock silently — the
+thing `admission_tail` guards), and the WEDGE-KILL post-mortem shows the
+opposite state entirely.
+
+EVIDENCE (PIE_CONTENTION_TRACE_MS on 4 runs of allshared_noswap; 3 failed
+with 116/116/117 kills, 1 passed with 0):
+
+  procs = 128 x Resident:prog=true          <- nothing unadmitted, nothing cold
+  queue = 64 waiters:  4 x need=1 , 60 x need=61
+  reclaim quotes: the 4 need=1 waiters are Some(Pages(61)) -- they are the
+                  page HOLDERS; the other 60 hold Nothing(HoldsNothing)
+  the 4 lines immediately before the kill are their parks, 576 us earlier:
+     park key=(2,60) kv=1 / (5,61) kv=1 / (3,63) kv=1 / (12,62) kv=1
+
+MECHANISM. 900-word shared prefix = 61 pages, so a 256-page pool funds FOUR
+of the 64-wide fleet: 244 used, 12 free. The four holders decode until each
+needs ONE more page and park. The instant the last one parks, no process is
+`admitted && !parked`, so `is_wedged` is TRUE -- and it is right that nothing
+is running. What it cannot see is that the queue is fundable:
+
+  `plan` accumulates HEAD-FIRST. The head (seq 1, need=61) pulls all 12 free
+  pages into `accum` and sits on them, still 49 short. The pool now reports
+  ZERO free -- which is why the error text reads "61 pages asked, 0 free of
+  256" -- so `salvage_free_pages` (which also only ever salvages FOR THE
+  HEAD) finds nothing, and the youngest parked ask is destroyed. 115 of 128
+  requests died to this cascade.
+
+  Those hoarded 12 pages are EXACTLY what the four 1-page asks needed. Serve
+  any one of them and that holder finishes and returns 61 pages, which funds
+  the head and unwedges the fleet. The queue was blocked by FCFS alone.
+
+FIX: a new last rung, `serve_from_hoard`, placed AFTER the final salvage and
+immediately BEFORE destruction in `check_starvation`. It serves the oldest
+unmet allocation, other than the head, whose device ask the hoard already
+covers in full, and returns. Strict FCFS is worth an unbounded wait; it is
+not worth a destroyed request, so the inversion is admitted here and nowhere
+else. Restores are not bypassable (boarding one is a multi-step handoff and
+the measured wedge is an allocation wedge).
+
+WHY IT IS SAFE, structurally:
+ - The only path it can divert is one that today unconditionally returns
+   `PlannerError::Starved`. Every earlier rung is untouched, and if no ask is
+   covered by the hoard it returns false and destruction proceeds verbatim.
+   `impossible` (16 pages, asks larger than the pool) and `admission_tail`
+   both still destroy exactly as before -- verified below.
+ - It cannot spin. Each bypass moves one waiter to SERVED, which strictly
+   shrinks `accum` and also makes `is_wedged` FALSE until the grant is
+   collected; at most `accum.len()` asks can be diverted before the rung
+   stops finding one. A served waiter runs, completes and returns at least
+   what it took.
+ - It mirrors `Step::ServeAllocation` exactly: RS reserved outside the
+   planner lock, re-validated under it, and a rejected RS reservation handed
+   back OUT so its Drop takes the store lock outside the planner lock.
+ - New counter `hoard_bypasses` (PlannerDiagnostics.hoard_bypasses_total).
+
+DIRECT CAUSAL PROOF, not just a green run: on a traced run the rung fires
+exactly 3 times, each serving a kv=1 ask, and WEDGE-KILL goes 116 -> 0.
+
+  hoard-bypass serve key=(51, 257) kv=1
+  hoard-bypass serve key=(51, 261) kv=1
+  hoard-bypass serve key=(51, 262) kv=1
+
+RESULTS
+  allshared_noswap x6:  128/128 completed, 0 failed, every run (8.4-9.2 s)
+  baseline x6 (§20.16): 6, 128, 128, 5, 9, 13   <- 1-in-3 lost 115 requests
+  contention suite 16/16, incl. impossible 0/16-destroyed and admission_tail
+    11 completed / 501 destroyed -- the rung is NOT disarmed
+  pie-eval 17 passed; inferlet_canary 2 passed / 3 ignored
+  conc 512: 30326 / 30297 / 29894 / 29733 (baseline ~30200) -- no regression,
+    and structurally there cannot be one: the rung is unreachable unless the
+    fleet is already wedged.
+
+CONTRACT TIGHTENED. allshared_noswap was `min_completed=8`, justified by a
+comment claiming the fleet "cannot fit in 256, and killing most of it is the
+CORRECT outcome". That is now disproven: the fleet does not fit, but the
+correct behaviour is that 60 processes PARK and are served in waves as
+holders retire -- the whole 128 completes in ~8.5 s. Raised to
+`min_completed=128, max_failed=0, repeat=3`, which makes it a real regression
+test for this rung (the bug reproduced ~1 run in 3).
+
+This also resolves the §20.7 / §20.3 contradiction noted in §20.16: §20.7's
+"128/128" was the good mode of a bistable scenario, §20.3's "31-59" was a mix
+of modes, and neither was a fix.
+
+## §20.18 — the "turnover gap" is PREFILL PREPARATION, and nothing else
+
+Re-opened at the user's request ("512, even 1024"). The result overturns three
+earlier claims in §20.13/§20.14 and identifies a single mechanism behind all of
+them. NO CODE CHANGE — this section is the root cause, measured.
+
+### The one measurement that settles it
+
+Decompose a `PIE_FIRE_TIMING=waves` log into per-wave GPU gaps
+(`gap = next.dispatch_started_us - this.native_complete_us`) and split the gaps
+by whether the wave that follows carries prefill (`tokens > 2 * fire_count`):
+
+| run | waves | prefill waves | idle before PREFILL wave | idle before DECODE wave |
+| --- | ----: | ------------: | -----------------------: | ----------------------: |
+| homogeneous conc 512  | 592 | 24  | 1.03 s (**100%**) p90 90.8 ms  | **0.00 s** p50/p90/max = 0.0 |
+| homogeneous conc 1024 | 588 | 20  | 1.08 s (**100%**) p90 132.8 ms | **0.00 s** p50/p90/max = 0.0 |
+| mixed-phase conc 512  | 473 | 164 | 3.60 s (79%) p90 52.9 ms       | 0.95 s p90 9.5 ms |
+
+**pie's GPU never idles during decode. Every microsecond of idle is spent
+getting a prefill wave ready.** On the homogeneous runs that is not an
+approximation — decode-only gaps are exactly 0.0 ms at p50, p90 AND max, for
+567 of 591 wave boundaries in both runs.
+
+### What this corrects
+
+1. **§20.13's "turnover barrier" is misnamed and its fix shape was wrong.**
+   The gap is not teardown, not the terminate fence, not the seat handoff and
+   not the admission drain. Those all land in the gap because a cohort boundary
+   is where retirement AND prefill coincide — correlation, not cause. This is
+   why every lever aimed at turnover failed to buy throughput: §20.14's seat
+   release (0.05 ms, throughput unchanged), §20.16's close barrier (-19% gap,
+   throughput at the noise floor), §20.15's submit cost (-58%, throughput
+   neutral). They were all shrinking terms that were never on the critical path.
+
+2. **§20.13 Term 2 ("pie's per-step advantage decays with batch width") is an
+   artifact.** conc 512 and conc 1024 produce identical wave structure: 592 vs
+   588 waves, rows p50 1024 (max 1024) both, GPU busy 92.1% vs 92.3%,
+   decode-rate-on-busy 42876 vs 42890 tok/s. At conc 512, `fire_count` p50 is
+   already 1024 with only 512 processes — run-ahead k=2 saturates the 1024-row
+   cap, so both widths run the same batch shape.
+
+3. **§20.13's "the gap scales linearly with herd size" is wrong.** Measured mean
+   gap is ~110 ms at conc 512 and ~118 ms at conc 1024 — flat. Doubling
+   concurrency doubles the cohort's wall (2.1 s -> 4.2 s), so the same fixed
+   stall halves as a fraction. That, plus vLLM's own 4% degradation at 1024, is
+   the whole of the sign flip below.
+
+### Headline numbers (n=5 pie / n=2 vLLM, this machine)
+
+| workload | pie | vLLM | ratio |
+| --- | ---: | ---: | ---: |
+| conc 512 homogeneous  | 31383 +/- 510 | 32755 | 0.958 |
+| conc 1024 homogeneous | 32110 +/- 260 | 31367 | **1.024** (pie wins) |
+| conc 512 mixed-phase  | 10051 | 15637 | **0.643** |
+
+The deficit is NOT monotonic in concurrency; it is a dip at 512. Corroborated
+independently by a per-cohort marginal-cost regression (n = 512/1024/2048/4096):
+pie **2.0989 s/cohort** vs vLLM **1.9983 s/cohort** = **+100.6 ms per cohort**,
+matching the wave-log gap mean of 110 ms. Intercepts: pie 5 ms, vLLM 73 ms —
+pie's startup is the better of the two.
+
+### Mixed-phase: same mechanism, 7x the exposure
+
+`--mixed-phase` (even requests 400-word prompt / 16 tokens out, odd short
+prompt / 128 out) is the worst case because it makes prefill CONTINUOUS instead
+of confining it to cohort boundaries: 164 prefill waves instead of 24.
+
+Both engines do byte-identical work — 971,696 prompt + 294,912 output =
+1,266,608 tokens — so this is not a token-accounting artifact:
+
+    pie   1,266,608 tok / 28.75 s = 44,057 tok/s
+    vLLM  1,266,608 tok / 18.89 s = 67,053 tok/s
+
+But pie's rate WHILE THE GPU IS BUSY is **75,193 tok/s**, above vLLM's overall
+rate. The kernels are not the problem; the idle is the whole of it.
+
+Two properties of this workload compound the stall, both measured:
+
+- **KV oversubscription.** A 400-word prompt is ~530 tokens = 33 pages, so 512
+  concurrent lanes need ~16,896 pages against a pool of 8,192. pie admits by
+  PROCESS COUNT, not by KV (Open finding #1), so it admits 512 regardless.
+  Raising the pool to 16384 pages: 11703 -> **13472 tok/s (+15.1%)**, wall
+  25.2 -> 21.9 s.
+- **Over-admission.** At the same 8192 pages, conc 256 beats conc 512
+  (**12293** vs 11703, +5.0%); conc 128 is under-utilised (9059). pie's own
+  admission cap is above its optimum for this KV budget.
+
+### Ruled out this round (all measured, all negative)
+
+- **The wait-all seal quorum — four independent designs, all worse.** Adding
+  `PIE_SCHED_JOIN_RELIEF_PCT` (fire when the not-ready set is a small SHARE of
+  the awaited fleet, rather than §20.14 #6's bound-by-TIME) measured
+  10549 -> 9616 at 10%, and after correcting the guard to also escape idle
+  lanes and bypass the `joining` interlock: baseline 11098 vs 10323 at 5% vs
+  10574 at 20%. This is the THIRD and FOURTH confirmation that the seal is not
+  the lever; the experiment was reverted rather than landed.
+- `--max-forward-requests 4096` does not raise the observed batch above 1024;
+  the real limiter was not found. This matters because it is probably why
+  §20.14 #2's admission-oversubscription levers measured worse — extra
+  processes overflow a 1024-row cap and only make batches ragged.
+- `--run-ahead-frames 3` is harmless (31704); **`4` is a liveness bug** —
+  1090 tok/s with 1536 requests hitting `TimeoutError` and the wall pinned to
+  the 300 s cap. Not the default. Recorded, not investigated.
+
+### Two false trails worth recording
+
+- **`frame_wait_watchdog` never fires, and that proves nothing.**
+  `STRICT_WATCHDOG_US = 1_000_000` (frame.rs:132) while every gap measured here
+  is 40-439 ms. Its absence was briefly read as "the seal never holds"; it only
+  means no hold reached one second.
+- **Per-event timestamp fields differ** (`at_us`, `admitted_us`, `returned_us`,
+  `entered_us`, `pass_started_us`, `dispatch_started_us`). A census keyed on
+  `at_us` alone silently drops every process-lifecycle record and makes a busy
+  gap look like total engine silence. Select any `*_us` value above 1e12.
+
+### Fix shape (not done)
+
+The stall is the serial chain `predecessor retires -> pages free -> successor
+admitted -> guest tokenises and submits its first frame -> wave dispatches`,
+none of which overlaps the running decode wave. Two directions, in order of
+expected value:
+
+1. **KV-aware admission** (Open finding #1, now quantified for the first time:
+   +15% on the workload that exposes it). Admit against the page budget rather
+   than a process count, so the pool stops thrashing.
+2. **Overlap prefill preparation with the running decode wave** — prepare and
+   dispatch a successor's first frame while its predecessor is still executing.
+   This needs page headroom for both, which is why (1) comes first.
+
+`waves.py` / `turnover.py` (session artifacts, outside the repo) implement the
+gap decomposition and the in-gap lifecycle census used here.

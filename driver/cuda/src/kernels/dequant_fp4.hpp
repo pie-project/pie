@@ -29,4 +29,47 @@ void launch_dequant_mxfp4_to_bf16(
     int                 in_dim,        // must be a multiple of 32
     cudaStream_t        stream);
 
+// ── Fused MXFP4 MoE decode GEMVs ────────────────────────────────────────
+//
+// GPT-OSS's expert weights are MXFP4, and the only path that existed for
+// them materialized each routed expert's full bf16 weight matrix before
+// handing it to cuBLAS. At decode that is 63% of the whole step: every
+// token rewrites ~1.6 GiB of bf16 it reads exactly once. These GEMVs read
+// the packed nibbles directly, so the traffic is the 4-bit weight and
+// nothing else.
+//
+// Routing is taken from `topk_idx` on the device, so the caller needs no
+// D2H round trip and the whole MoE block stays enqueue-only.
+//
+// `gate_up` rows are interleaved as HF ships them: row 2i is gate row i,
+// row 2i+1 is up row i (see `deinterleave_rows_bf16_kernel`).
+
+void launch_mxfp4_moe_gate_up_decode_bf16(
+    const void*          act_fp16,      // [num_tokens, hidden] fp16
+    const std::int32_t*  topk_idx,      // [num_tokens * top_k]
+    const std::uint8_t* const* gate_up_packed,  // per-expert [2I, H/2]
+    const std::uint8_t* const* gate_up_scales,  // per-expert [2I, H/32]
+    const void* const*   gate_bias,     // per-expert [I] bf16, or null
+    const void* const*   up_bias,       // per-expert [I] bf16
+    void*                gate_out_bf16, // [routes, I]
+    void*                up_out_bf16,   // [routes, I]
+    int                  num_tokens,
+    int                  top_k,
+    int                  hidden,
+    int                  intermediate,
+    cudaStream_t         stream);
+
+void launch_mxfp4_moe_down_decode_bf16(
+    const void*          act_fp16,      // [routes, intermediate] fp16
+    const std::int32_t*  topk_idx,      // [num_tokens * top_k]
+    const std::uint8_t* const* down_packed,  // per-expert [H, I/2]
+    const std::uint8_t* const* down_scales,  // per-expert [H, I/32]
+    const void* const*   down_bias,     // per-expert [H] bf16, or null
+    void*                out_bf16,      // [routes, hidden]
+    int                  num_tokens,
+    int                  top_k,
+    int                  hidden,
+    int                  intermediate,
+    cudaStream_t         stream);
+
 }  // namespace pie_cuda_driver::kernels

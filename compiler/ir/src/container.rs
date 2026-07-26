@@ -16,7 +16,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
-use super::op::{ChannelIndex, IntrinsicId, Op};
+use super::op::{ChannelIndex, IntrinsicId, Op, tags};
+use super::read::{ReadError, Reader};
 use super::registry::{Port, Stage};
 use crate::types::{DType, Literal, MAX_RANK, Predicate, RngKind, Shape};
 use crate::{PTIR_MAGIC, PTIR_VERSION, PTIR_VERSION_EXTERN};
@@ -466,10 +467,14 @@ pub fn put_u32(w: &mut Vec<u8>, v: u32) {
 }
 
 /// Bytes per element of a const-port payload.
+///
+/// Exhaustive on purpose: a `_ => 4` arm answers "4 bytes" for an F16 or E8M0
+/// dtype the day one is added, and the result is a mis-sized payload rather
+/// than a compile error.
 pub fn const_elem_size(dtype: DType) -> usize {
     match dtype {
         DType::Bool => 1,
-        _ => 4,
+        DType::F32 | DType::I32 | DType::U32 => 4,
     }
 }
 
@@ -515,59 +520,37 @@ impl fmt::Display for ContainerDecodeError {
 #[cfg(feature = "std")]
 impl std::error::Error for ContainerDecodeError {}
 
-struct Reader<'a> {
-    buf: &'a [u8],
-    pos: usize,
+impl From<ReadError> for ContainerDecodeError {
+    fn from(error: ReadError) -> Self {
+        match error {
+            ReadError::UnexpectedEof => ContainerDecodeError::UnexpectedEof,
+            ReadError::CountTooLarge(table) => ContainerDecodeError::CountTooLarge(table),
+        }
+    }
 }
 
-impl<'a> Reader<'a> {
-    fn u8(&mut self) -> Result<u8, ContainerDecodeError> {
-        let b = *self
-            .buf
-            .get(self.pos)
-            .ok_or(ContainerDecodeError::UnexpectedEof)?;
-        self.pos += 1;
-        Ok(b)
-    }
-    fn u16(&mut self) -> Result<u16, ContainerDecodeError> {
-        let s = self.take(2)?;
-        Ok(u16::from_le_bytes([s[0], s[1]]))
-    }
-    fn u32(&mut self) -> Result<u32, ContainerDecodeError> {
-        let s = self.take(4)?;
-        Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
-    }
-    fn take(&mut self, n: usize) -> Result<&'a [u8], ContainerDecodeError> {
-        let end = self
-            .pos
-            .checked_add(n)
-            .ok_or(ContainerDecodeError::UnexpectedEof)?;
-        let s = self
-            .buf
-            .get(self.pos..end)
-            .ok_or(ContainerDecodeError::UnexpectedEof)?;
-        self.pos = end;
-        Ok(s)
-    }
-    fn bounded_count(
-        &self,
-        count: u32,
-        minimum_record_bytes: usize,
-        table: &'static str,
-    ) -> Result<usize, ContainerDecodeError> {
-        let count = count as usize;
-        if minimum_record_bytes == 0
-            || count > self.buf.len().saturating_sub(self.pos) / minimum_record_bytes
-        {
-            return Err(ContainerDecodeError::CountTooLarge(table));
-        }
-        Ok(count)
-    }
-}
+/// Decoder ceilings.
+///
+/// These are resource limits, not semantic ones: a container within them can
+/// still be rejected by `bind`, and the numbers are chosen to bound work and
+/// memory for input we did not write, not to express what a sampling pass is
+/// allowed to say. They sit far above anything a traced pass produces -- the
+/// whole test corpus is three orders of magnitude below `MAX_OPS`.
+///
+/// `MAX_STAGES` is different in kind: a container carries at most one program
+/// per stage, so `Stage::ALL.len()` is a structural fact rather than a budget.
+pub const MAX_STAGES: usize = Stage::ALL.len();
+/// Per-stage op ceiling. Planning is linear in this, so it bounds compile time
+/// as well as memory.
+pub const MAX_OPS: usize = 1 << 16;
+pub const MAX_CHANNELS: usize = 1 << 12;
+pub const MAX_NAMES: usize = 1 << 12;
+pub const MAX_PORTS: usize = 1 << 8;
+pub const MAX_EXTERNS: usize = MAX_CHANNELS;
 
 /// Parse container bytes back into the model. Does not validate (bind does).
 pub fn decode(bytes: &[u8]) -> Result<TraceContainer, ContainerDecodeError> {
-    let mut r = Reader { buf: bytes, pos: 0 };
+    let mut r = Reader::new(bytes);
     if r.take(4)? != PTIR_MAGIC {
         return Err(ContainerDecodeError::BadMagic);
     }
@@ -586,14 +569,15 @@ pub fn decode(bytes: &[u8]) -> Result<TraceContainer, ContainerDecodeError> {
         0
     };
 
-    let mut names = Vec::with_capacity(r.bounded_count(n_names, 2, "name table")?);
+    let mut names = Vec::with_capacity(r.bounded_count(n_names, 2, MAX_NAMES, "name table")?);
     for _ in 0..n_names {
         let len = r.u16()? as usize;
         let bytes = r.take(len)?;
         names.push(String::from_utf8(bytes.to_vec()).map_err(|_| ContainerDecodeError::BadUtf8)?);
     }
 
-    let mut channels = Vec::with_capacity(r.bounded_count(n_channels, 8, "channel table")?);
+    let mut channels =
+        Vec::with_capacity(r.bounded_count(n_channels, 8, MAX_CHANNELS, "channel table")?);
     for _ in 0..n_channels {
         let dt = r.u8()?;
         let dtype = ChanDType::from_tag(dt).ok_or(ContainerDecodeError::UnknownTag {
@@ -617,7 +601,7 @@ pub fn decode(bytes: &[u8]) -> Result<TraceContainer, ContainerDecodeError> {
         });
     }
 
-    let mut ports = Vec::with_capacity(r.bounded_count(n_ports, 4, "port table")?);
+    let mut ports = Vec::with_capacity(r.bounded_count(n_ports, 4, MAX_PORTS, "port table")?);
     for _ in 0..n_ports {
         let pt = r.u8()?;
         let port = Port::from_u8(pt).ok_or(ContainerDecodeError::UnknownTag {
@@ -651,7 +635,7 @@ pub fn decode(bytes: &[u8]) -> Result<TraceContainer, ContainerDecodeError> {
         ports.push(PortBinding { port, source });
     }
 
-    let mut stages = Vec::with_capacity(r.bounded_count(n_stages, 5, "stage table")?);
+    let mut stages = Vec::with_capacity(r.bounded_count(n_stages, 5, MAX_STAGES, "stage table")?);
     for _ in 0..n_stages {
         let st = r.u8()?;
         let stage = Stage::from_u8(st).ok_or(ContainerDecodeError::UnknownTag {
@@ -659,13 +643,14 @@ pub fn decode(bytes: &[u8]) -> Result<TraceContainer, ContainerDecodeError> {
             tag: st,
         })?;
         let n_ops = r.u32()?;
-        let mut ops = Vec::with_capacity(r.bounded_count(n_ops, 1, "operation table")?);
+        let mut ops = Vec::with_capacity(r.bounded_count(n_ops, 1, MAX_OPS, "operation table")?);
         for _ in 0..n_ops {
             ops.push(decode_op(&mut r)?);
         }
         stages.push(StageProgram { stage, ops });
     }
-    let mut externs = Vec::with_capacity(r.bounded_count(n_externs, 7, "extern table")?);
+    let mut externs =
+        Vec::with_capacity(r.bounded_count(n_externs, 7, MAX_EXTERNS, "extern table")?);
     for _ in 0..n_externs {
         let name = r.u16()?;
         let d = r.u8()?;
@@ -676,7 +661,7 @@ pub fn decode(bytes: &[u8]) -> Result<TraceContainer, ContainerDecodeError> {
         let chan = r.u32()?;
         externs.push(ExternDecl { name, dir, chan });
     }
-    if r.pos != bytes.len() {
+    if r.offset() != bytes.len() {
         return Err(ContainerDecodeError::TrailingBytes);
     }
     let container = TraceContainer {
@@ -695,59 +680,59 @@ pub fn decode(bytes: &[u8]) -> Result<TraceContainer, ContainerDecodeError> {
 fn decode_op(r: &mut Reader<'_>) -> Result<Op, ContainerDecodeError> {
     let tag = r.u8()?;
     let op = match tag {
-        0x01 => Op::Exp(r.u32()?),
-        0x02 => Op::Log(r.u32()?),
-        0x03 => Op::Neg(r.u32()?),
-        0x04 => Op::Recip(r.u32()?),
-        0x05 => Op::Abs(r.u32()?),
-        0x06 => Op::Sign(r.u32()?),
-        0x07 => Op::Cast {
+        tags::EXP => Op::Exp(r.u32()?),
+        tags::LOG => Op::Log(r.u32()?),
+        tags::NEG => Op::Neg(r.u32()?),
+        tags::RECIP => Op::Recip(r.u32()?),
+        tags::ABS => Op::Abs(r.u32()?),
+        tags::SIGN => Op::Sign(r.u32()?),
+        tags::CAST => Op::Cast {
             value: r.u32()?,
             dtype: decode_dtype(r.u8()?)?,
         },
-        0x10 => Op::Add(r.u32()?, r.u32()?),
-        0x11 => Op::Sub(r.u32()?, r.u32()?),
-        0x12 => Op::Mul(r.u32()?, r.u32()?),
-        0x13 => Op::Div(r.u32()?, r.u32()?),
-        0x14 => Op::MaxElem(r.u32()?, r.u32()?),
-        0x15 => Op::MinElem(r.u32()?, r.u32()?),
-        0x16 => Op::Gt(r.u32()?, r.u32()?),
-        0x17 => Op::Ge(r.u32()?, r.u32()?),
-        0x18 => Op::Eq(r.u32()?, r.u32()?),
-        0x19 => Op::Ne(r.u32()?, r.u32()?),
-        0x1A => Op::Lt(r.u32()?, r.u32()?),
-        0x1B => Op::Le(r.u32()?, r.u32()?),
-        0x1C => Op::And(r.u32()?, r.u32()?),
-        0x1D => Op::Or(r.u32()?, r.u32()?),
-        0x1E => Op::Not(r.u32()?),
-        0x1F => Op::Rem(r.u32()?, r.u32()?),
-        0x20 => Op::Select {
+        tags::ADD => Op::Add(r.u32()?, r.u32()?),
+        tags::SUB => Op::Sub(r.u32()?, r.u32()?),
+        tags::MUL => Op::Mul(r.u32()?, r.u32()?),
+        tags::DIV => Op::Div(r.u32()?, r.u32()?),
+        tags::MAX_ELEM => Op::MaxElem(r.u32()?, r.u32()?),
+        tags::MIN_ELEM => Op::MinElem(r.u32()?, r.u32()?),
+        tags::GT => Op::Gt(r.u32()?, r.u32()?),
+        tags::GE => Op::Ge(r.u32()?, r.u32()?),
+        tags::EQ => Op::Eq(r.u32()?, r.u32()?),
+        tags::NE => Op::Ne(r.u32()?, r.u32()?),
+        tags::LT => Op::Lt(r.u32()?, r.u32()?),
+        tags::LE => Op::Le(r.u32()?, r.u32()?),
+        tags::AND => Op::And(r.u32()?, r.u32()?),
+        tags::OR => Op::Or(r.u32()?, r.u32()?),
+        tags::NOT => Op::Not(r.u32()?),
+        tags::REM => Op::Rem(r.u32()?, r.u32()?),
+        tags::SELECT => Op::Select {
             cond: r.u32()?,
             a: r.u32()?,
             b: r.u32()?,
         },
-        0x30 => Op::ReduceSum(r.u32()?),
-        0x31 => Op::ReduceMax(r.u32()?),
-        0x32 => Op::ReduceMin(r.u32()?),
-        0x33 => Op::ReduceArgmax(r.u32()?),
-        0x38 => Op::Broadcast {
+        tags::REDUCE_SUM => Op::ReduceSum(r.u32()?),
+        tags::REDUCE_MAX => Op::ReduceMax(r.u32()?),
+        tags::REDUCE_MIN => Op::ReduceMin(r.u32()?),
+        tags::REDUCE_ARGMAX => Op::ReduceArgmax(r.u32()?),
+        tags::BROADCAST => Op::Broadcast {
             value: r.u32()?,
             shape: decode_shape(r)?,
         },
-        0x39 => Op::Reshape {
+        tags::RESHAPE => Op::Reshape {
             value: r.u32()?,
             shape: decode_shape(r)?,
         },
-        0x3A => Op::Transpose(r.u32()?),
-        0x40 => Op::CumSum(r.u32()?),
-        0x41 => Op::CumProd(r.u32()?),
-        0x50 => Op::SortDesc(r.u32()?),
-        0x51 => Op::TopK {
+        tags::TRANSPOSE => Op::Transpose(r.u32()?),
+        tags::CUMSUM => Op::CumSum(r.u32()?),
+        tags::CUMPROD => Op::CumProd(r.u32()?),
+        tags::SORT_DESC => Op::SortDesc(r.u32()?),
+        tags::TOP_K => Op::TopK {
             input: r.u32()?,
             k: r.u32()?,
         },
-        0x55 => Op::MatMul(r.u32()?, r.u32()?),
-        0x58 => {
+        tags::MATMUL => Op::MatMul(r.u32()?, r.u32()?),
+        tags::PIVOT_THRESHOLD => {
             let input = r.u32()?;
             let predicate = match r.u8()? {
                 0 => Predicate::RankLe(r.u32()?),
@@ -762,55 +747,55 @@ fn decode_op(r: &mut Reader<'_>) -> Result<Op, ContainerDecodeError> {
             };
             Op::PivotThreshold { input, predicate }
         }
-        0x60 => Op::Gather {
+        tags::GATHER => Op::Gather {
             src: r.u32()?,
             idx: r.u32()?,
         },
-        0x61 => Op::GatherRow {
+        tags::GATHER_ROW => Op::GatherRow {
             src: r.u32()?,
             idx: r.u32()?,
         },
-        0x62 => Op::ScatterAdd {
+        tags::SCATTER_ADD => Op::ScatterAdd {
             base: r.u32()?,
             idx: r.u32()?,
             vals: r.u32()?,
         },
-        0x63 => Op::ScatterSet {
+        tags::SCATTER_SET => Op::ScatterSet {
             base: r.u32()?,
             idx: r.u32()?,
             vals: r.u32()?,
         },
-        0x64 => Op::Iota { len: r.u32()? },
-        0x65 => Op::MaskApply {
+        tags::IOTA => Op::Iota { len: r.u32()? },
+        tags::MASK_APPLY_PACKED => Op::MaskApply {
             logits: r.u32()?,
             mask: r.u32()?,
         },
-        0x66 => Op::CausalMask {
+        tags::CAUSAL_MASK => Op::CausalMask {
             positions: r.u32()?,
             len: r.u32()?,
         },
-        0x67 => Op::SlidingWindowMask {
+        tags::SLIDING_WINDOW_MASK => Op::SlidingWindowMask {
             positions: r.u32()?,
             len: r.u32()?,
             window: r.u32()?,
         },
-        0x68 => Op::SinkWindowMask {
+        tags::SINK_WINDOW_MASK => Op::SinkWindowMask {
             positions: r.u32()?,
             len: r.u32()?,
             sink: r.u32()?,
             window: r.u32()?,
         },
-        0x70 => Op::Rng {
+        tags::RNG => Op::Rng {
             stream: r.u32()?,
             shape: decode_shape(r)?,
             kind: decode_rng_kind(r.u8()?)?,
         },
-        0x71 => Op::RngKeyed {
+        tags::RNG_KEYED => Op::RngKeyed {
             state: r.u32()?,
             shape: decode_shape(r)?,
             kind: decode_rng_kind(r.u8()?)?,
         },
-        0x81 => {
+        tags::CONST => {
             let dt = r.u8()?;
             let bits = r.u32()?;
             Op::Const(match dt {
@@ -826,13 +811,13 @@ fn decode_op(r: &mut Reader<'_>) -> Result<Op, ContainerDecodeError> {
                 }
             })
         }
-        0x90 => Op::ChanTake(r.u32()?),
-        0x91 => Op::ChanRead(r.u32()?),
-        0x92 => Op::ChanPut {
+        tags::CHAN_TAKE => Op::ChanTake(r.u32()?),
+        tags::CHAN_READ => Op::ChanRead(r.u32()?),
+        tags::CHAN_PUT => Op::ChanPut {
             chan: r.u32()?,
             value: r.u32()?,
         },
-        0xA0 => {
+        tags::INTRINSIC_VAL => {
             let iv = r.u16()?;
             let intr = IntrinsicId::from_u16(iv).ok_or(ContainerDecodeError::UnknownTag {
                 what: "intrinsic",
@@ -842,7 +827,7 @@ fn decode_op(r: &mut Reader<'_>) -> Result<Op, ContainerDecodeError> {
             let shape = decode_shape(r)?;
             Op::IntrinsicVal { intr, shape, dtype }
         }
-        0xA1 => {
+        tags::KERNEL_CALL => {
             let name = r.u16()?;
             let dtype = decode_dtype(r.u8()?)?;
             let shape = decode_shape(r)?;
@@ -858,7 +843,7 @@ fn decode_op(r: &mut Reader<'_>) -> Result<Op, ContainerDecodeError> {
                 dtype,
             }
         }
-        0xA2 => {
+        tags::SINK_CALL => {
             let name = r.u16()?;
             let n = r.u8()? as usize;
             let mut args = Vec::with_capacity(n);
@@ -1006,122 +991,31 @@ mod tests {
 
     #[test]
     fn round_trip_every_op() {
-        let ops = vec![
-            Op::Const(Literal::F32(0.5)),
+        // `representatives()` is one op per `declare_ops!` row, so the wire
+        // sweep cannot fall behind the table. The extra `Const` literals are
+        // payload variation, not table coverage: `Literal` has four arms and
+        // the row can only carry one.
+        let mut ops = alloc::vec![
             Op::Const(Literal::I32(-1)),
             Op::Const(Literal::U32(7)),
             Op::Const(Literal::Bool(true)),
-            Op::Exp(0),
-            Op::Log(0),
-            Op::Neg(0),
-            Op::Recip(0),
-            Op::Abs(0),
-            Op::Sign(0),
-            Op::Cast {
-                value: 0,
-                dtype: DType::U32,
-            },
-            Op::Add(0, 1),
-            Op::Sub(0, 1),
-            Op::Mul(0, 1),
-            Op::Div(0, 1),
-            Op::MaxElem(0, 1),
-            Op::MinElem(0, 1),
-            Op::Rem(0, 1),
-            Op::Gt(0, 1),
-            Op::Ge(0, 1),
-            Op::Eq(0, 1),
-            Op::Ne(0, 1),
-            Op::Lt(0, 1),
-            Op::Le(0, 1),
-            Op::And(4, 5),
-            Op::Or(4, 5),
-            Op::Not(4),
-            Op::Select {
-                cond: 4,
-                a: 0,
-                b: 1,
-            },
-            Op::ReduceSum(0),
-            Op::ReduceMax(0),
-            Op::ReduceMin(0),
-            Op::ReduceArgmax(0),
-            Op::Broadcast {
-                value: 0,
-                shape: Shape::matrix(2, 3),
-            },
-            Op::Reshape {
-                value: 0,
-                shape: Shape::vector(6),
-            },
-            Op::Transpose(0),
-            Op::CumSum(0),
-            Op::CumProd(0),
-            Op::SortDesc(0),
-            Op::TopK { input: 0, k: 3 },
-            Op::MatMul(0, 1),
-            Op::PivotThreshold {
-                input: 0,
-                predicate: Predicate::CummassLe(2),
-            },
-            Op::Gather { src: 0, idx: 1 },
-            Op::GatherRow { src: 0, idx: 1 },
-            Op::ScatterAdd {
-                base: 0,
-                idx: 1,
-                vals: 2,
-            },
-            Op::ScatterSet {
-                base: 0,
-                idx: 1,
-                vals: 2,
-            },
-            Op::Iota { len: 5 },
-            Op::MaskApply { logits: 0, mask: 1 },
-            Op::CausalMask {
-                positions: 0,
-                len: 8,
-            },
-            Op::SlidingWindowMask {
-                positions: 0,
-                len: 8,
-                window: 4,
-            },
-            Op::SinkWindowMask {
-                positions: 0,
-                len: 8,
-                sink: 2,
-                window: 4,
-            },
-            Op::Rng {
-                stream: 2,
-                shape: Shape::vector(4),
-                kind: RngKind::Uniform,
-            },
-            Op::RngKeyed {
-                state: 0,
-                shape: Shape::vector(4),
-                kind: RngKind::Gumbel,
-            },
-            Op::ChanTake(0),
-            Op::ChanRead(1),
-            Op::ChanPut { chan: 0, value: 0 },
-            Op::IntrinsicVal {
-                intr: IntrinsicId::Layer,
-                shape: Shape::SCALAR,
-                dtype: DType::U32,
-            },
-            Op::KernelCall {
-                name: 0,
-                args: vec![0, 1, 2],
-                shape: Shape::vector(9),
-                dtype: DType::F32,
-            },
-            Op::SinkCall {
-                name: 0,
-                args: vec![0],
-            },
         ];
+        ops.extend(crate::op::representatives());
+        // `table_matches_op_metadata` pins the table's metadata; this pins
+        // the *wire* path, and nothing else does. Without the sweep a new op
+        // could land in `declare_ops!` with an `encode_op` arm and no
+        // `decode_op` arm, and the first thing to read the missing half back
+        // would be a driver.
+        let missing: Vec<&str> = crate::op::OP_TABLE
+            .iter()
+            .filter(|spec| !ops.iter().any(|op| op.tag() == spec.tag))
+            .map(|spec| spec.name)
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{} op(s) never round-trip through the container: {missing:?}",
+            missing.len()
+        );
         let c = TraceContainer {
             names: vec!["k".to_string()],
             channels: vec![
@@ -1151,6 +1045,61 @@ mod tests {
         assert_eq!(decode(&bytes).expect("decode"), c);
     }
 
+    /// Every byte an op encodes is a byte its decoder reads.
+    ///
+    /// `round_trip_every_op` puts exactly one value through each field, so a
+    /// decoder that ignores what was written and substitutes a constant still
+    /// round-trips whenever that constant is the value the representative
+    /// happened to carry. A mutation proved it: dropping `sink` from
+    /// `SinkWindowMask`'s encoding while decode hardcoded `2` — the
+    /// representative's own value — passed all three round-trip tests, and
+    /// only the byte goldens noticed.
+    ///
+    /// Flipping each byte in turn closes the decode half without needing a
+    /// second value per field: an ignored byte is one whose mutation changes
+    /// nothing. The encode half — a field never written at all — leaves no
+    /// byte to flip and is still held only by the byte goldens and the C++
+    /// mirror in `op_table_drift`.
+    #[test]
+    fn no_byte_of_an_op_encoding_is_ignored_by_its_decoder() {
+        let mut ignored: Vec<String> = Vec::new();
+        let mut flipped = 0usize;
+        for op in crate::op::representatives() {
+            let mut bytes = alloc::vec::Vec::new();
+            encode_op(&mut bytes, &op);
+            // Byte 0 is the tag, which selects the decoder arm rather than
+            // feeding it; `decode_rejects_every_tag_the_table_does_not_declare`
+            // is what holds that byte.
+            for index in 1..bytes.len() {
+                for mask in [0x01u8, 0x80, 0xff] {
+                    let mut mutant = bytes.clone();
+                    mutant[index] ^= mask;
+                    flipped += 1;
+                    let mut r = Reader::new(&mutant);
+                    if let Ok(decoded) = decode_op(&mut r)
+                        && decoded == op
+                        && r.remaining() == 0
+                    {
+                        ignored.push(format!(
+                            "{}: byte {index} ^ {mask:#04x} decodes back to \
+                             the same op",
+                            op.tag()
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            flipped > 500,
+            "only {flipped} flips; the representatives stopped carrying payload"
+        );
+        assert!(
+            ignored.is_empty(),
+            "{} encoded byte(s) do not reach the op they encode: {ignored:?}",
+            ignored.len()
+        );
+    }
+
     #[test]
     fn rejects_bad_magic_version_and_truncation() {
         let mut b = encode(&sample());
@@ -1171,14 +1120,32 @@ mod tests {
 
     #[test]
     fn retired_nucleus_opcode_is_unknown() {
-        let mut reader = Reader {
-            buf: &[0x59],
-            pos: 0,
-        };
+        let mut reader = Reader::new(&[0x59]);
         assert_eq!(
             decode_op(&mut reader),
             Err(ContainerDecodeError::UnknownOpcode(0x59))
         );
+    }
+
+    /// The dual of `round_trip_every_op`: the 201 byte values `declare_ops!`
+    /// does not allocate must all come back as `UnknownOpcode`, not as a
+    /// neighbouring op that happens to share a decode arm. `0x59` above pins
+    /// one of them by hand; a retired tag is only the case anyone thinks to
+    /// write down.
+    #[test]
+    fn decode_rejects_every_tag_the_table_does_not_declare() {
+        for tag in 0u8..=u8::MAX {
+            if crate::op::OP_TABLE.iter().any(|spec| spec.tag == tag) {
+                continue;
+            }
+            let bytes = [tag];
+            let mut reader = Reader::new(&bytes);
+            assert_eq!(
+                decode_op(&mut reader),
+                Err(ContainerDecodeError::UnknownOpcode(tag)),
+                "tag {tag:#04x} is not in OP_TABLE but decode_op accepted it"
+            );
+        }
     }
 
     #[test]

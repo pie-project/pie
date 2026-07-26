@@ -173,13 +173,11 @@ impl DriverBackend {
                     .and_then(|program| program.emitted(backend))
             });
 
-
         // The region analysis is the other half of the CUDA emitter's own
         // contract -- which regions bind, and how the kernel's intrinsic side
         // tables are laid out -- so it only means anything to a driver running
         // those kernels.
-        let region_analysis = if desc.region_analysis.is_empty()
-            && codegen_backend == Some("cuda")
+        let region_analysis = if desc.region_analysis.is_empty() && codegen_backend == Some("cuda")
         {
             registered
                 .as_ref()

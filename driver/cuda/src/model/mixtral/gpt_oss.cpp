@@ -487,6 +487,53 @@ MixtralWeights bind_gpt_oss(const LoadedModel& engine) {
         }
     }
 
+    if (use_mxfp4_packed_experts && !has_native_mxfp4_experts) {
+        // Device-resident routing tables for the fused decode GEMV. Built
+        // once here rather than per-step: the arrays are tiny, but staging
+        // them from the host every layer would reintroduce exactly the
+        // synchronisation the fused path exists to remove.
+        for (auto& L : w.layers) {
+            const std::size_t E = L.experts.size();
+            std::vector<const std::uint8_t*> gu_packed(E), gu_scale(E);
+            std::vector<const std::uint8_t*> dn_packed(E), dn_scale(E);
+            std::vector<const void*> gb(E), ub(E), db(E);
+            bool ok = true;
+            for (std::size_t e = 0; e < E; ++e) {
+                const auto& Ew = L.experts[e];
+                if (Ew.format != MixtralExpertWeightFormat::Mxfp4RoutedDequant ||
+                    !Ew.w_gate_up || !Ew.w_gate_up_scale ||
+                    !Ew.w_down_packed || !Ew.w_down_scale ||
+                    !Ew.b_gate || !Ew.b_up || !Ew.b_down) {
+                    ok = false;
+                    break;
+                }
+                gu_packed[e] = static_cast<const std::uint8_t*>(
+                    Ew.w_gate_up->data());
+                gu_scale[e] = static_cast<const std::uint8_t*>(
+                    Ew.w_gate_up_scale->data());
+                dn_packed[e] = static_cast<const std::uint8_t*>(
+                    Ew.w_down_packed->data());
+                dn_scale[e] = static_cast<const std::uint8_t*>(
+                    Ew.w_down_scale->data());
+                gb[e] = Ew.b_gate->data();
+                ub[e] = Ew.b_up->data();
+                db[e] = Ew.b_down->data();
+            }
+            if (!ok) continue;
+            L.expert_gate_up_packed_ptrs =
+                DeviceBuffer<const std::uint8_t*>::from_host(gu_packed);
+            L.expert_gate_up_scale_ptrs =
+                DeviceBuffer<const std::uint8_t*>::from_host(gu_scale);
+            L.expert_down_packed_ptrs =
+                DeviceBuffer<const std::uint8_t*>::from_host(dn_packed);
+            L.expert_down_scale_ptrs =
+                DeviceBuffer<const std::uint8_t*>::from_host(dn_scale);
+            L.expert_gate_bias_ptrs = DeviceBuffer<const void*>::from_host(gb);
+            L.expert_up_bias_ptrs = DeviceBuffer<const void*>::from_host(ub);
+            L.expert_down_bias_ptrs = DeviceBuffer<const void*>::from_host(db);
+        }
+    }
+
     if (use_mxfp4_packed_experts) {
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());

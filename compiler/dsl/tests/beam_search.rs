@@ -1,4 +1,4 @@
-//! Design B beam goldens (host-side, pie-dsl + CPU reference interp).
+//! Beam search goldens (host-side, pie-dsl + CPU reference interp).
 //!
 //! **Design B: logical mask-out + lazy compaction** (supersedes Design A's eager
 //! freeze / designated-heir / fresh-page-per-fork scheme). The KV cache is a
@@ -18,11 +18,12 @@
 //!      OR the new position (`eq(col, wpos)`), and
 //!   4. the explicit write descriptor `w_slot = wpos / PAGE_T`, `w_off = wpos %
 //!      PAGE_T` (consumed by B2's `write_kv_explicit`).
+//!
 //! `Pages`/`PageIndptr` are CONSTANT (the shared pool is fixed between
 //! compactions) — the mask does all the per-beam selection.
 //!
 //! These goldens assert the mask evolution across a fork step and the write
-//! descriptor, on echo's reference interpreter. They are the Design B contract;
+//! descriptor, on the IR's reference interpreter. They are the Design B contract;
 //! they replaced the retired Design A `ptir_beam.rs`/`beam_goldens` vectors (B5).
 
 use pie_eval::interp::{Instance, NoKernels, PassInputs, Value};

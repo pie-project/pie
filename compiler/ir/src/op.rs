@@ -5,7 +5,7 @@
 //!
 //! ## Relation to PSIR v4
 //!
-//! Where an op coincides with a [`crate::types::Op`] variant, the **wire tag is
+//! Where an op coincides with a PSIR v4 op, the **wire tag is
 //! identical** (e.g. `Add` = 0x10, `Gather` = 0x60), so a driver-side decoder
 //! extends its v4 table instead of forking. New tags occupy previously free
 //! space; tag `0x80` (`Input`) is *reserved-unused* — PTIR stage bodies have no
@@ -41,64 +41,92 @@ pub type ChannelIndex = u32;
 /// Index into the container's name table (second-party kernel / sink names).
 pub type NameIndex = u16;
 
-/// First-party stage-scoped value intrinsics (overview §4, §5.3).
-/// Wire tags are stable `u16` constants — see [`crate::registry`] for
-/// scope + gating rules.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[repr(u16)]
-pub enum IntrinsicId {
+/// Declares the first-party value intrinsics once and derives the enum, the
+/// [`intrinsic_tags`] wire constants, [`IntrinsicId::ALL`], `from_u16` and
+/// `name` from it.
+///
+/// Same rule as [`declare_ops`]: an intrinsic's id is spelled as a number on
+/// exactly one line. `from_u16`, the name table and the generated C++ header's
+/// `PtirIntrinsic` enum used to be three hand-kept copies of this list, and a
+/// missed entry there is an intrinsic the driver never learns about.
+macro_rules! declare_intrinsics {
+    ($($(#[$doc:meta])* $variant:ident = $id:literal, $konst:ident, $name:literal;)*) => {
+        /// First-party stage-scoped value intrinsics (overview §4, §5.3).
+        /// Wire tags are stable `u16` constants — see [`crate::registry`] for
+        /// scope + gating rules.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+        #[repr(u16)]
+        pub enum IntrinsicId {
+            $($(#[$doc])* $variant = $id,)*
+        }
+
+        /// The wire id of every intrinsic, by name — the `u16` counterpart of
+        /// [`tags`], for downstream `match` arms that see a raw payload id.
+        pub mod intrinsic_tags {
+            $(pub const $konst: u16 = $id;)*
+        }
+
+        impl IntrinsicId {
+            /// Every intrinsic, in wire-id order. Anything that must cover the
+            /// whole set (the generated C++ header, a driver dispatch table)
+            /// iterates this instead of repeating the list.
+            pub const ALL: &'static [IntrinsicId] = &[$(IntrinsicId::$variant,)*];
+
+            /// One past the largest wire id — the per-lane stride of a table
+            /// indexed by [`IntrinsicId`].
+            ///
+            /// One past the largest id, not `ALL.len()`: the two agree only
+            /// while the ids are contiguous, and an id that overflows the
+            /// stride does not fault, it silently reads the next lane's slot
+            /// zero. Backends and the generated C header project this rather
+            /// than counting the rows themselves.
+            pub const SLOTS: u32 = {
+                let mut max = 0u32;
+                $(if $id as u32 > max { max = $id as u32; })*
+                max + 1
+            };
+
+            pub fn from_u16(v: u16) -> Option<Self> {
+                Some(match v {
+                    $($id => IntrinsicId::$variant,)*
+                    _ => return None,
+                })
+            }
+
+            pub fn name(self) -> &'static str {
+                match self {
+                    $(IntrinsicId::$variant => $name,)*
+                }
+            }
+        }
+    };
+}
+
+declare_intrinsics! {
     /// `[n_out, vocab]` F32 — epilogue only.
-    Logits = 0,
+    Logits = 0, LOGITS, "logits";
     /// `[K, vocab]` F32 — epilogue only; model-gated.
-    MtpLogits = 1,
+    MtpLogits = 1, MTP_LOGITS, "mtp_logits";
     /// `[n_out, d]` F32 — epilogue only.
-    Hidden = 2,
+    Hidden = 2, HIDDEN, "hidden";
     /// This layer's projected query — attn taps only.
-    Query = 3,
+    Query = 3, QUERY, "query";
     /// `[n_out]` F32 — epilogue only; model-gated.
-    ValueHead = 4,
+    ValueHead = 4, VALUE_HEAD, "value_head";
     /// Scalar U32 — the invocation's layer index; attn taps only. Replayable
     /// per-invocation value, not a register read (overview §5.3).
-    Layer = 5,
+    Layer = 5, LAYER, "layer";
     /// `[k]` I32 — epilogue only; model-gated. The MTP head's `k` draft token
     /// ids for the prior fire (device-resident spec-decode drafts channel).
     /// APPENDED (id 6) — existing ids 0..5 unchanged so every prior program's
     /// bytecode + identity hash stays byte-stable.
-    MtpDrafts = 6,
+    MtpDrafts = 6, MTP_DRAFTS, "mtp_drafts";
     /// `[num_heads, kv_len]` F32 — `OnAttn` only; model-gated. This layer's
     /// softmax attention weights over the request's live KV, the quantity
     /// H2O (arXiv:2306.14048) and TOVA (arXiv:2305.19370) evict on.
     /// Backend-shaped like `Query`, so the type rule stays loose.
     /// APPENDED (id 7) — ids 0..6 unchanged, same byte-stability contract.
-    AttnScore = 7,
-}
-
-impl IntrinsicId {
-    pub fn from_u16(v: u16) -> Option<Self> {
-        Some(match v {
-            0 => IntrinsicId::Logits,
-            1 => IntrinsicId::MtpLogits,
-            2 => IntrinsicId::Hidden,
-            3 => IntrinsicId::Query,
-            4 => IntrinsicId::ValueHead,
-            5 => IntrinsicId::Layer,
-            6 => IntrinsicId::MtpDrafts,
-            7 => IntrinsicId::AttnScore,
-            _ => return None,
-        })
-    }
-    pub fn name(self) -> &'static str {
-        match self {
-            IntrinsicId::Logits => "logits",
-            IntrinsicId::MtpLogits => "mtp_logits",
-            IntrinsicId::Hidden => "hidden",
-            IntrinsicId::Query => "query",
-            IntrinsicId::ValueHead => "value_head",
-            IntrinsicId::Layer => "layer",
-            IntrinsicId::MtpDrafts => "mtp_drafts",
-            IntrinsicId::AttnScore => "attn_score",
-        }
-    }
+    AttnScore = 7, ATTN_SCORE, "attn_score";
 }
 
 /// A PTIR stage-body op. See the module docs for the SSA model and the
@@ -302,13 +330,252 @@ pub enum Op {
     },
 }
 
+/// How an op touches a channel. See [`Op::channel_use`].
+///
+/// An enum rather than a bool because the three uses are not interchangeable:
+/// readiness needs a full slot for `Take`/`Read` and an empty one for `Put`,
+/// and SPSC endpoint counting treats `Take` and `Read` as consumers. Every
+/// consumer matches this exhaustively, so a fourth channel op cannot be added
+/// without each of them being asked what it means.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ChannelUse {
+    /// Consuming read (`chan_take`) — empties the slot.
+    Take,
+    /// Non-consuming read (`chan_read`) — requires a full slot, leaves it full.
+    Read,
+    /// Write (`chan_put`) — requires an empty slot.
+    Put,
+}
+
 impl Op {
-    /// Number of SSA ids this op defines.
-    pub fn result_count(&self) -> u32 {
+    /// How this op uses a channel, and which one, or `None` if it uses none.
+    ///
+    /// The single answer to "is this a channel op?". It replaced six separate
+    /// `match op { Op::ChanTake(c) | Op::ChanRead(c) => .., Op::ChanPut { .. }
+    /// => .., _ => {} }` scans across the planner, the validator and the DSL
+    /// builder. Six copies is six chances to miss a new channel op, and the
+    /// failure is not a crash: two of those scans rewrite channel ids, so a
+    /// missed op keeps a stale id and reads the wrong channel.
+    ///
+    /// `table_matches_op_metadata` pins this to `Family::Channel`, so the op
+    /// table and this accessor cannot disagree about what a channel op is.
+    pub fn channel_use(&self) -> Option<(ChannelUse, ChannelIndex)> {
         match self {
-            Op::SortDesc(_) | Op::TopK { .. } => 2,
-            Op::ChanPut { .. } | Op::SinkCall { .. } => 0,
-            _ => 1,
+            Op::ChanTake(chan) => Some((ChannelUse::Take, *chan)),
+            Op::ChanRead(chan) => Some((ChannelUse::Read, *chan)),
+            Op::ChanPut { chan, .. } => Some((ChannelUse::Put, *chan)),
+            _ => None,
+        }
+    }
+
+    /// The channel id this op names, for rewriting it. See [`Op::channel_use`].
+    pub fn channel_mut(&mut self) -> Option<&mut ChannelIndex> {
+        match self {
+            Op::ChanTake(chan) | Op::ChanRead(chan) | Op::ChanPut { chan, .. } => Some(chan),
+            _ => None,
+        }
+    }
+
+    /// The name-table index this op names, for rewriting it when a stage's
+    /// name table is localized. `intrinsic_val` shares `Family::Intrinsic`
+    /// with these two but carries no name, so this set is pinned by tag rather
+    /// than by family.
+    pub fn name_index_mut(&mut self) -> Option<&mut NameIndex> {
+        match self {
+            Op::KernelCall { name, .. } | Op::SinkCall { name, .. } => Some(name),
+            _ => None,
+        }
+    }
+
+    /// Number of SSA ids this op defines.
+    ///
+    /// Read from [`OP_TABLE`] rather than re-derived here. The catch-all this
+    /// replaces answered `1` for anything it did not recognise, so an op
+    /// declared with two results but omitted from the match would define one
+    /// id and **shift every later value id in the trace** — silently, because
+    /// `Recorder::push` and the encoders all trust this number.
+    pub fn result_count(&self) -> u32 {
+        match spec(self.tag()) {
+            Some(row) => u32::from(row.results),
+            // `tag()` is exhaustive over `Op` and `declare_ops!` is the only
+            // place a tag exists, so a variant whose tag has no row cannot be
+            // built without also failing `table_matches_op_metadata`, which
+            // pins one representative per row.
+            None => unreachable!("op tag has no OP_TABLE row"),
+        }
+    }
+
+    /// This op's [`Family`], read from [`OP_TABLE`].
+    ///
+    /// The family is a fact about the op's shape on the wire, so a pass that
+    /// keys on "is this a channel op" should ask here rather than restate a
+    /// variant list that can fall behind the table.
+    pub fn family(&self) -> Family {
+        match family_of(self.tag()) {
+            Some(family) => family,
+            // Same argument as `result_count`: `tag()` is exhaustive over
+            // `Op`, and every tag has a row.
+            None => unreachable!("op tag has no OP_TABLE row"),
+        }
+    }
+
+    /// True when the op must survive dead-code elimination even if nothing
+    /// reads its results, and must never be merged with an identical
+    /// neighbour by CSE.
+    ///
+    /// Two things qualify: touching a channel (`take` pops; `read` and `put`
+    /// order against its contents) and calling second-party code.
+    ///
+    /// `IntrinsicVal` is deliberately absent — it names a device-provided
+    /// value such as the logits, so two of them *are* the same value and
+    /// merging them is correct. So is `Rng`: within one fire it is a function
+    /// of its stream and shape, which is why `pareval` can call it
+    /// device-decided (the host does not know the ambient seed) while CSE
+    /// still merges it. Taint and purity are different questions.
+    ///
+    /// Exhaustive on purpose. `fold::cse_candidate` and `normalize::live_ops`
+    /// each carried this list; a new channel or call op missing from either
+    /// would be quietly deleted by DCE or folded away by CSE.
+    pub fn is_effectful(&self) -> bool {
+        match self {
+            Op::ChanTake(..)
+            | Op::ChanRead(..)
+            | Op::ChanPut { .. }
+            | Op::KernelCall { .. }
+            | Op::SinkCall { .. } => true,
+
+            Op::Const(..)
+            | Op::Exp(..)
+            | Op::Log(..)
+            | Op::Neg(..)
+            | Op::Recip(..)
+            | Op::Abs(..)
+            | Op::Sign(..)
+            | Op::Cast { .. }
+            | Op::Add(..)
+            | Op::Sub(..)
+            | Op::Mul(..)
+            | Op::Div(..)
+            | Op::MaxElem(..)
+            | Op::MinElem(..)
+            | Op::Rem(..)
+            | Op::Gt(..)
+            | Op::Ge(..)
+            | Op::Eq(..)
+            | Op::Ne(..)
+            | Op::Lt(..)
+            | Op::Le(..)
+            | Op::And(..)
+            | Op::Or(..)
+            | Op::Not(..)
+            | Op::Select { .. }
+            | Op::ReduceSum(..)
+            | Op::ReduceMax(..)
+            | Op::ReduceMin(..)
+            | Op::ReduceArgmax(..)
+            | Op::Broadcast { .. }
+            | Op::Reshape { .. }
+            | Op::Transpose(..)
+            | Op::CumSum(..)
+            | Op::CumProd(..)
+            | Op::SortDesc(..)
+            | Op::TopK { .. }
+            | Op::PivotThreshold { .. }
+            | Op::MatMul(..)
+            | Op::Gather { .. }
+            | Op::GatherRow { .. }
+            | Op::ScatterAdd { .. }
+            | Op::ScatterSet { .. }
+            | Op::Iota { .. }
+            | Op::MaskApply { .. }
+            | Op::CausalMask { .. }
+            | Op::SlidingWindowMask { .. }
+            | Op::SinkWindowMask { .. }
+            | Op::Rng { .. }
+            | Op::RngKeyed { .. }
+            | Op::IntrinsicVal { .. } => false,
+        }
+    }
+
+    /// Where this op's result comes from — the question host partial
+    /// evaluation asks, and **not** the question [`Self::is_effectful`]
+    /// answers.
+    ///
+    /// The two disagree, on purpose, about [`Op::Rng`]: within one fire it is
+    /// a function of its stream and shape, so CSE may merge two of them and
+    /// `is_effectful` says `false`; but the ambient seed it draws from is a
+    /// per-fire *device* fact, so the host cannot produce its value and this
+    /// says [`ValueSource::Device`]. Purity and derivability are different
+    /// properties and an op can have either without the other.
+    ///
+    /// Exhaustive on purpose, and the only copy. A pass that decides "can the
+    /// host compute this?" must ask here rather than restate the variant list:
+    /// a wrong answer does not fail to compile, it schedules a pass that
+    /// cannot run, or refuses one that can.
+    pub fn value_source(&self) -> ValueSource {
+        match self {
+            // The device decides these at their source, whatever their
+            // operands. `SinkCall` defines no results, so nothing reads its
+            // answer; it is grouped here because it is likewise not something
+            // the host can perform.
+            Op::KernelCall { .. }
+            | Op::IntrinsicVal { .. }
+            | Op::SinkCall { .. }
+            | Op::Rng { .. } => ValueSource::Device,
+
+            Op::ChanTake(..) | Op::ChanRead(..) | Op::ChanPut { .. } => ValueSource::Channel,
+
+            // `RngKeyed` is here on purpose: PTIR-CONTAINER.md pins it as a
+            // pure function of its `state` operand, so replaying the state
+            // replays the noise.
+            Op::Const(..)
+            | Op::Exp(..)
+            | Op::Log(..)
+            | Op::Neg(..)
+            | Op::Recip(..)
+            | Op::Abs(..)
+            | Op::Sign(..)
+            | Op::Cast { .. }
+            | Op::Add(..)
+            | Op::Sub(..)
+            | Op::Mul(..)
+            | Op::Div(..)
+            | Op::MaxElem(..)
+            | Op::MinElem(..)
+            | Op::Rem(..)
+            | Op::Gt(..)
+            | Op::Ge(..)
+            | Op::Eq(..)
+            | Op::Ne(..)
+            | Op::Lt(..)
+            | Op::Le(..)
+            | Op::And(..)
+            | Op::Or(..)
+            | Op::Not(..)
+            | Op::Select { .. }
+            | Op::ReduceSum(..)
+            | Op::ReduceMax(..)
+            | Op::ReduceMin(..)
+            | Op::ReduceArgmax(..)
+            | Op::Broadcast { .. }
+            | Op::Reshape { .. }
+            | Op::Transpose(..)
+            | Op::CumSum(..)
+            | Op::CumProd(..)
+            | Op::SortDesc(..)
+            | Op::TopK { .. }
+            | Op::PivotThreshold { .. }
+            | Op::MatMul(..)
+            | Op::Gather { .. }
+            | Op::GatherRow { .. }
+            | Op::ScatterAdd { .. }
+            | Op::ScatterSet { .. }
+            | Op::Iota { .. }
+            | Op::MaskApply { .. }
+            | Op::CausalMask { .. }
+            | Op::SlidingWindowMask { .. }
+            | Op::SinkWindowMask { .. }
+            | Op::RngKeyed { .. } => ValueSource::Operands,
         }
     }
 
@@ -475,63 +742,76 @@ impl Op {
     /// This op's wire tag (see [`OP_TABLE`]).
     pub fn tag(&self) -> u8 {
         match self {
-            Op::Exp(_) => 0x01,
-            Op::Log(_) => 0x02,
-            Op::Neg(_) => 0x03,
-            Op::Recip(_) => 0x04,
-            Op::Abs(_) => 0x05,
-            Op::Sign(_) => 0x06,
-            Op::Cast { .. } => 0x07,
-            Op::Add(..) => 0x10,
-            Op::Sub(..) => 0x11,
-            Op::Mul(..) => 0x12,
-            Op::Div(..) => 0x13,
-            Op::MaxElem(..) => 0x14,
-            Op::MinElem(..) => 0x15,
-            Op::Gt(..) => 0x16,
-            Op::Ge(..) => 0x17,
-            Op::Eq(..) => 0x18,
-            Op::Ne(..) => 0x19,
-            Op::Lt(..) => 0x1A,
-            Op::Le(..) => 0x1B,
-            Op::And(..) => 0x1C,
-            Op::Or(..) => 0x1D,
-            Op::Not(_) => 0x1E,
-            Op::Rem(..) => 0x1F,
-            Op::Select { .. } => 0x20,
-            Op::ReduceSum(_) => 0x30,
-            Op::ReduceMax(_) => 0x31,
-            Op::ReduceMin(_) => 0x32,
-            Op::ReduceArgmax(_) => 0x33,
-            Op::Broadcast { .. } => 0x38,
-            Op::Reshape { .. } => 0x39,
-            Op::Transpose(_) => 0x3A,
-            Op::CumSum(_) => 0x40,
-            Op::CumProd(_) => 0x41,
-            Op::SortDesc(_) => 0x50,
-            Op::TopK { .. } => 0x51,
-            Op::MatMul(..) => 0x55,
-            Op::PivotThreshold { .. } => 0x58,
-            Op::Gather { .. } => 0x60,
-            Op::GatherRow { .. } => 0x61,
-            Op::ScatterAdd { .. } => 0x62,
-            Op::ScatterSet { .. } => 0x63,
-            Op::Iota { .. } => 0x64,
-            Op::MaskApply { .. } => 0x65,
-            Op::CausalMask { .. } => 0x66,
-            Op::SlidingWindowMask { .. } => 0x67,
-            Op::SinkWindowMask { .. } => 0x68,
-            Op::Rng { .. } => 0x70,
-            Op::RngKeyed { .. } => 0x71,
-            Op::Const(_) => 0x81,
-            Op::ChanTake(_) => 0x90,
-            Op::ChanRead(_) => 0x91,
-            Op::ChanPut { .. } => 0x92,
-            Op::IntrinsicVal { .. } => 0xA0,
-            Op::KernelCall { .. } => 0xA1,
-            Op::SinkCall { .. } => 0xA2,
+            Op::Exp(_) => tags::EXP,
+            Op::Log(_) => tags::LOG,
+            Op::Neg(_) => tags::NEG,
+            Op::Recip(_) => tags::RECIP,
+            Op::Abs(_) => tags::ABS,
+            Op::Sign(_) => tags::SIGN,
+            Op::Cast { .. } => tags::CAST,
+            Op::Add(..) => tags::ADD,
+            Op::Sub(..) => tags::SUB,
+            Op::Mul(..) => tags::MUL,
+            Op::Div(..) => tags::DIV,
+            Op::MaxElem(..) => tags::MAX_ELEM,
+            Op::MinElem(..) => tags::MIN_ELEM,
+            Op::Gt(..) => tags::GT,
+            Op::Ge(..) => tags::GE,
+            Op::Eq(..) => tags::EQ,
+            Op::Ne(..) => tags::NE,
+            Op::Lt(..) => tags::LT,
+            Op::Le(..) => tags::LE,
+            Op::And(..) => tags::AND,
+            Op::Or(..) => tags::OR,
+            Op::Not(_) => tags::NOT,
+            Op::Rem(..) => tags::REM,
+            Op::Select { .. } => tags::SELECT,
+            Op::ReduceSum(_) => tags::REDUCE_SUM,
+            Op::ReduceMax(_) => tags::REDUCE_MAX,
+            Op::ReduceMin(_) => tags::REDUCE_MIN,
+            Op::ReduceArgmax(_) => tags::REDUCE_ARGMAX,
+            Op::Broadcast { .. } => tags::BROADCAST,
+            Op::Reshape { .. } => tags::RESHAPE,
+            Op::Transpose(_) => tags::TRANSPOSE,
+            Op::CumSum(_) => tags::CUMSUM,
+            Op::CumProd(_) => tags::CUMPROD,
+            Op::SortDesc(_) => tags::SORT_DESC,
+            Op::TopK { .. } => tags::TOP_K,
+            Op::MatMul(..) => tags::MATMUL,
+            Op::PivotThreshold { .. } => tags::PIVOT_THRESHOLD,
+            Op::Gather { .. } => tags::GATHER,
+            Op::GatherRow { .. } => tags::GATHER_ROW,
+            Op::ScatterAdd { .. } => tags::SCATTER_ADD,
+            Op::ScatterSet { .. } => tags::SCATTER_SET,
+            Op::Iota { .. } => tags::IOTA,
+            Op::MaskApply { .. } => tags::MASK_APPLY_PACKED,
+            Op::CausalMask { .. } => tags::CAUSAL_MASK,
+            Op::SlidingWindowMask { .. } => tags::SLIDING_WINDOW_MASK,
+            Op::SinkWindowMask { .. } => tags::SINK_WINDOW_MASK,
+            Op::Rng { .. } => tags::RNG,
+            Op::RngKeyed { .. } => tags::RNG_KEYED,
+            Op::Const(_) => tags::CONST,
+            Op::ChanTake(_) => tags::CHAN_TAKE,
+            Op::ChanRead(_) => tags::CHAN_READ,
+            Op::ChanPut { .. } => tags::CHAN_PUT,
+            Op::IntrinsicVal { .. } => tags::INTRINSIC_VAL,
+            Op::KernelCall { .. } => tags::KERNEL_CALL,
+            Op::SinkCall { .. } => tags::SINK_CALL,
         }
     }
+}
+
+/// Where an op's result comes from, as [`Op::value_source`] answers it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ValueSource {
+    /// The device decides it: a second-party kernel, a device intrinsic, or
+    /// the ambient RNG seed. No amount of host-known input produces it.
+    Device,
+    /// A channel's contents decide it, so the answer depends on what the host
+    /// knows about that channel rather than on the op.
+    Channel,
+    /// A pure function of its operands: host-derivable exactly when they are.
+    Operands,
 }
 
 /// Op family (the overview appendix's row grouping).
@@ -551,10 +831,10 @@ pub enum Family {
     Intrinsic,
 }
 
-/// One op-table row: the declarative identity charlie's C++ tables are
-/// generated from. `operand layout` is documented per-op in
-/// PTIR-CONTAINER.md §4; `val_operands` counts value-id operands
-/// (`0xFF` = variadic, count byte on the wire).
+/// One op-table row: the declarative identity the generated C++ tables are
+/// built from. `operand layout` is documented per-op in PTIR-CONTAINER.md §4;
+/// `val_operands` counts value-id operands (`0xFF` = variadic, count byte on
+/// the wire).
 #[derive(Clone, Copy, Debug)]
 pub struct OpSpec {
     pub tag: u8,
@@ -567,395 +847,139 @@ pub struct OpSpec {
 /// Variadic marker for [`OpSpec::val_operands`].
 pub const VARIADIC: u8 = 0xFF;
 
-/// The op table — one row per wire tag, sorted by tag. The generated C++
-/// header and any driver-side dispatch table MUST be derived from this list.
-pub const OP_TABLE: &[OpSpec] = &[
-    OpSpec {
-        tag: 0x01,
-        name: "exp",
-        family: Family::Map,
-        val_operands: 1,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x02,
-        name: "log",
-        family: Family::Map,
-        val_operands: 1,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x03,
-        name: "neg",
-        family: Family::Map,
-        val_operands: 1,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x04,
-        name: "recip",
-        family: Family::Map,
-        val_operands: 1,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x05,
-        name: "abs",
-        family: Family::Map,
-        val_operands: 1,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x06,
-        name: "sign",
-        family: Family::Map,
-        val_operands: 1,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x07,
-        name: "cast",
-        family: Family::Map,
-        val_operands: 1,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x10,
-        name: "add",
-        family: Family::Map,
-        val_operands: 2,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x11,
-        name: "sub",
-        family: Family::Map,
-        val_operands: 2,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x12,
-        name: "mul",
-        family: Family::Map,
-        val_operands: 2,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x13,
-        name: "div",
-        family: Family::Map,
-        val_operands: 2,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x14,
-        name: "max_elem",
-        family: Family::Map,
-        val_operands: 2,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x15,
-        name: "min_elem",
-        family: Family::Map,
-        val_operands: 2,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x16,
-        name: "gt",
-        family: Family::CompareLogic,
-        val_operands: 2,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x17,
-        name: "ge",
-        family: Family::CompareLogic,
-        val_operands: 2,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x18,
-        name: "eq",
-        family: Family::CompareLogic,
-        val_operands: 2,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x19,
-        name: "ne",
-        family: Family::CompareLogic,
-        val_operands: 2,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x1A,
-        name: "lt",
-        family: Family::CompareLogic,
-        val_operands: 2,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x1B,
-        name: "le",
-        family: Family::CompareLogic,
-        val_operands: 2,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x1C,
-        name: "and",
-        family: Family::CompareLogic,
-        val_operands: 2,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x1D,
-        name: "or",
-        family: Family::CompareLogic,
-        val_operands: 2,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x1E,
-        name: "not",
-        family: Family::CompareLogic,
-        val_operands: 1,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x1F,
-        name: "rem",
-        family: Family::Map,
-        val_operands: 2,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x20,
-        name: "select",
-        family: Family::Choice,
-        val_operands: 3,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x30,
-        name: "reduce_sum",
-        family: Family::ReduceScan,
-        val_operands: 1,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x31,
-        name: "reduce_max",
-        family: Family::ReduceScan,
-        val_operands: 1,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x32,
-        name: "reduce_min",
-        family: Family::ReduceScan,
-        val_operands: 1,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x33,
-        name: "reduce_argmax",
-        family: Family::ReduceScan,
-        val_operands: 1,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x38,
-        name: "broadcast",
-        family: Family::Shape,
-        val_operands: 1,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x39,
-        name: "reshape",
-        family: Family::Shape,
-        val_operands: 1,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x3A,
-        name: "transpose",
-        family: Family::Shape,
-        val_operands: 1,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x40,
-        name: "cumsum",
-        family: Family::ReduceScan,
-        val_operands: 1,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x41,
-        name: "cumprod",
-        family: Family::ReduceScan,
-        val_operands: 1,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x50,
-        name: "sort_desc",
-        family: Family::Order,
-        val_operands: 1,
-        results: 2,
-    },
-    OpSpec {
-        tag: 0x51,
-        name: "top_k",
-        family: Family::Order,
-        val_operands: 1,
-        results: 2,
-    },
-    OpSpec {
-        tag: 0x55,
-        name: "matmul",
-        family: Family::Linear,
-        val_operands: 2,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x58,
-        name: "pivot_threshold",
-        family: Family::Order,
-        val_operands: 2,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x60,
-        name: "gather",
-        family: Family::Index,
-        val_operands: 2,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x61,
-        name: "gather_row",
-        family: Family::Index,
-        val_operands: 2,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x62,
-        name: "scatter_add",
-        family: Family::Index,
-        val_operands: 3,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x63,
-        name: "scatter_set",
-        family: Family::Index,
-        val_operands: 3,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x64,
-        name: "iota",
-        family: Family::Index,
-        val_operands: 0,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x65,
-        name: "mask_apply_packed",
-        family: Family::Sampling,
-        val_operands: 2,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x66,
-        name: "causal_mask",
-        family: Family::Index,
-        val_operands: 1,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x67,
-        name: "sliding_window_mask",
-        family: Family::Index,
-        val_operands: 1,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x68,
-        name: "sink_window_mask",
-        family: Family::Index,
-        val_operands: 1,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x70,
-        name: "rng",
-        family: Family::Sampling,
-        val_operands: 0,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x71,
-        name: "rng_keyed",
-        family: Family::Sampling,
-        val_operands: 1,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x81,
-        name: "const",
-        family: Family::Leaf,
-        val_operands: 0,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x90,
-        name: "chan_take",
-        family: Family::Channel,
-        val_operands: 0,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x91,
-        name: "chan_read",
-        family: Family::Channel,
-        val_operands: 0,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x92,
-        name: "chan_put",
-        family: Family::Channel,
-        val_operands: 1,
-        results: 0,
-    },
-    OpSpec {
-        tag: 0xA0,
-        name: "intrinsic_val",
-        family: Family::Intrinsic,
-        val_operands: 0,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0xA1,
-        name: "kernel_call",
-        family: Family::Intrinsic,
-        val_operands: VARIADIC,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0xA2,
-        name: "sink_call",
-        family: Family::Intrinsic,
-        val_operands: VARIADIC,
-        results: 0,
-    },
-];
+/// Declares the op set once and derives [`tags`] and [`OP_TABLE`] from it.
+///
+/// A wire tag, its name, family, value-operand count and result count appear
+/// on exactly one line each. Nothing downstream may re-spell a tag literal —
+/// it imports [`tags`] instead.
+macro_rules! declare_ops {
+    ($($konst:ident = $tag:literal, $name:literal, $family:ident, $operands:expr, $results:expr, $rep:expr;)*) => {
+        /// The wire tag of every op, by name. **The only place a PTIR op tag
+        /// is spelled as a number.** Downstream crates (`pie-plan`,
+        /// `pie-codegen`, and drivers via the generated header) import these
+        /// instead of keeping their own copies: a hand-copied tag that drifts
+        /// by one hex digit is a silently wrong kernel, and nothing but a
+        /// single definition can rule that out.
+        pub mod tags {
+            $(pub const $konst: u8 = $tag;)*
+        }
+
+        /// The op table — one row per wire tag, sorted by tag. The generated
+        /// C++ header and any driver-side dispatch table MUST be derived from
+        /// this list.
+        pub const OP_TABLE: &[OpSpec] = &[
+            $(OpSpec {
+                tag: tags::$konst,
+                name: $name,
+                family: Family::$family,
+                val_operands: $operands,
+                results: $results,
+            },)*
+        ];
+
+        /// One constructible [`Op`] per [`OP_TABLE`] row, in table order.
+        ///
+        /// Two tests used to keep hand-written lists of these — one in this
+        /// file, one in `container.rs` — each guarded by nothing better than
+        /// `len() == OP_TABLE.len()`. A variant that reused an existing tag
+        /// slipped past both. The constructor now lives in the row it
+        /// describes, so "is there an op for this tag" is answered by the
+        /// declaration rather than by a list somewhere else agreeing to stay
+        /// the same length.
+        ///
+        /// Not `#[cfg(test)]`: any crate that wants to say "for every op" can
+        /// say it here instead of writing a fifty-five-line vec of its own.
+        pub fn representatives() -> alloc::vec::Vec<Op> {
+            alloc::vec![$($rep,)*]
+        }
+    };
+}
+
+declare_ops! {
+    EXP = 0x01, "exp", Map, 1, 1, Op::Exp(0);
+    LOG = 0x02, "log", Map, 1, 1, Op::Log(0);
+    NEG = 0x03, "neg", Map, 1, 1, Op::Neg(0);
+    RECIP = 0x04, "recip", Map, 1, 1, Op::Recip(0);
+    ABS = 0x05, "abs", Map, 1, 1, Op::Abs(0);
+    SIGN = 0x06, "sign", Map, 1, 1, Op::Sign(0);
+    CAST = 0x07, "cast", Map, 1, 1, Op::Cast { value: 0, dtype: DType::I32, };
+    ADD = 0x10, "add", Map, 2, 1, Op::Add(0, 1);
+    SUB = 0x11, "sub", Map, 2, 1, Op::Sub(0, 1);
+    MUL = 0x12, "mul", Map, 2, 1, Op::Mul(0, 1);
+    DIV = 0x13, "div", Map, 2, 1, Op::Div(0, 1);
+    MAX_ELEM = 0x14, "max_elem", Map, 2, 1, Op::MaxElem(0, 1);
+    MIN_ELEM = 0x15, "min_elem", Map, 2, 1, Op::MinElem(0, 1);
+    GT = 0x16, "gt", CompareLogic, 2, 1, Op::Gt(0, 1);
+    GE = 0x17, "ge", CompareLogic, 2, 1, Op::Ge(0, 1);
+    EQ = 0x18, "eq", CompareLogic, 2, 1, Op::Eq(0, 1);
+    NE = 0x19, "ne", CompareLogic, 2, 1, Op::Ne(0, 1);
+    LT = 0x1A, "lt", CompareLogic, 2, 1, Op::Lt(0, 1);
+    LE = 0x1B, "le", CompareLogic, 2, 1, Op::Le(0, 1);
+    AND = 0x1C, "and", CompareLogic, 2, 1, Op::And(0, 1);
+    OR = 0x1D, "or", CompareLogic, 2, 1, Op::Or(0, 1);
+    NOT = 0x1E, "not", CompareLogic, 1, 1, Op::Not(0);
+    REM = 0x1F, "rem", Map, 2, 1, Op::Rem(0, 1);
+    SELECT = 0x20, "select", Choice, 3, 1, Op::Select { cond: 0, a: 1, b: 2, };
+    REDUCE_SUM = 0x30, "reduce_sum", ReduceScan, 1, 1, Op::ReduceSum(0);
+    REDUCE_MAX = 0x31, "reduce_max", ReduceScan, 1, 1, Op::ReduceMax(0);
+    REDUCE_MIN = 0x32, "reduce_min", ReduceScan, 1, 1, Op::ReduceMin(0);
+    REDUCE_ARGMAX = 0x33, "reduce_argmax", ReduceScan, 1, 1, Op::ReduceArgmax(0);
+    BROADCAST = 0x38, "broadcast", Shape, 1, 1, Op::Broadcast { value: 0, shape: Shape::vector(4), };
+    RESHAPE = 0x39, "reshape", Shape, 1, 1, Op::Reshape { value: 0, shape: Shape::vector(4), };
+    TRANSPOSE = 0x3A, "transpose", Shape, 1, 1, Op::Transpose(0);
+    CUMSUM = 0x40, "cumsum", ReduceScan, 1, 1, Op::CumSum(0);
+    CUMPROD = 0x41, "cumprod", ReduceScan, 1, 1, Op::CumProd(0);
+    SORT_DESC = 0x50, "sort_desc", Order, 1, 2, Op::SortDesc(0);
+    TOP_K = 0x51, "top_k", Order, 1, 2, Op::TopK { input: 0, k: 4 };
+    MATMUL = 0x55, "matmul", Linear, 2, 1, Op::MatMul(0, 1);
+    PIVOT_THRESHOLD = 0x58, "pivot_threshold", Order, 2, 1, Op::PivotThreshold { input: 0, predicate: Predicate::RankLe(1), };
+    GATHER = 0x60, "gather", Index, 2, 1, Op::Gather { src: 0, idx: 1 };
+    GATHER_ROW = 0x61, "gather_row", Index, 2, 1, Op::GatherRow { src: 0, idx: 1 };
+    SCATTER_ADD = 0x62, "scatter_add", Index, 3, 1, Op::ScatterAdd { base: 0, idx: 1, vals: 2, };
+    SCATTER_SET = 0x63, "scatter_set", Index, 3, 1, Op::ScatterSet { base: 0, idx: 1, vals: 2, };
+    IOTA = 0x64, "iota", Index, 0, 1, Op::Iota { len: 8 };
+    MASK_APPLY_PACKED = 0x65, "mask_apply_packed", Sampling, 2, 1, Op::MaskApply { logits: 0, mask: 1 };
+    CAUSAL_MASK = 0x66, "causal_mask", Index, 1, 1, Op::CausalMask { positions: 0, len: 8, };
+    SLIDING_WINDOW_MASK = 0x67, "sliding_window_mask", Index, 1, 1, Op::SlidingWindowMask { positions: 0, len: 8, window: 4, };
+    SINK_WINDOW_MASK = 0x68, "sink_window_mask", Index, 1, 1, Op::SinkWindowMask { positions: 0, len: 8, sink: 2, window: 4, };
+    RNG = 0x70, "rng", Sampling, 0, 1, Op::Rng { stream: 0, shape: Shape::vector(4), kind: RngKind::Gumbel, };
+    RNG_KEYED = 0x71, "rng_keyed", Sampling, 1, 1, Op::RngKeyed { state: 0, shape: Shape::vector(4), kind: RngKind::Uniform, };
+    CONST = 0x81, "const", Leaf, 0, 1, Op::Const(Literal::F32(1.0));
+    CHAN_TAKE = 0x90, "chan_take", Channel, 0, 1, Op::ChanTake(0);
+    CHAN_READ = 0x91, "chan_read", Channel, 0, 1, Op::ChanRead(0);
+    CHAN_PUT = 0x92, "chan_put", Channel, 1, 0, Op::ChanPut { chan: 0, value: 0 };
+    INTRINSIC_VAL = 0xA0, "intrinsic_val", Intrinsic, 0, 1, Op::IntrinsicVal { intr: IntrinsicId::Logits, shape: Shape::matrix(1, 8), dtype: DType::F32, };
+    KERNEL_CALL = 0xA1, "kernel_call", Intrinsic, VARIADIC, 1, Op::KernelCall { name: 0, args: vec![0, 1], shape: Shape::vector(4), dtype: DType::F32, };
+    SINK_CALL = 0xA2, "sink_call", Intrinsic, VARIADIC, 0, Op::SinkCall { name: 0, args: vec![0], };
+}
+
+/// The table row for a wire tag, or `None` when the tag is not a PTIR op.
+///
+/// [`OP_TABLE`] is sorted by tag, so this is a binary search. Downstream
+/// dispatch asks this instead of matching hex ranges: a range literal silently
+/// swallows any tag landing in one of its gaps, and the gaps are where new ops
+/// go.
+pub fn spec(tag: u8) -> Option<&'static OpSpec> {
+    let mut lo = 0usize;
+    let mut hi = OP_TABLE.len();
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let row = &OP_TABLE[mid];
+        if row.tag == tag {
+            return Some(row);
+        } else if row.tag < tag {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    None
+}
+
+/// The family of a wire tag, or `None` when the tag is not a PTIR op.
+pub fn family_of(tag: u8) -> Option<Family> {
+    spec(tag).map(|row| row.family)
+}
 
 #[cfg(test)]
 mod tests {
@@ -970,135 +994,57 @@ mod tests {
 
     #[test]
     fn table_matches_op_metadata() {
-        // One representative per variant; table row must agree with tag(),
-        // result_count(), and operands().len().
-        let reps: Vec<Op> = vec![
-            Op::Exp(0),
-            Op::Log(0),
-            Op::Neg(0),
-            Op::Recip(0),
-            Op::Abs(0),
-            Op::Sign(0),
-            Op::Cast {
-                value: 0,
-                dtype: DType::I32,
-            },
-            Op::Add(0, 1),
-            Op::Sub(0, 1),
-            Op::Mul(0, 1),
-            Op::Div(0, 1),
-            Op::MaxElem(0, 1),
-            Op::MinElem(0, 1),
-            Op::Gt(0, 1),
-            Op::Ge(0, 1),
-            Op::Eq(0, 1),
-            Op::Ne(0, 1),
-            Op::Lt(0, 1),
-            Op::Le(0, 1),
-            Op::And(0, 1),
-            Op::Or(0, 1),
-            Op::Not(0),
-            Op::Rem(0, 1),
-            Op::Select {
-                cond: 0,
-                a: 1,
-                b: 2,
-            },
-            Op::ReduceSum(0),
-            Op::ReduceMax(0),
-            Op::ReduceMin(0),
-            Op::ReduceArgmax(0),
-            Op::Broadcast {
-                value: 0,
-                shape: Shape::vector(4),
-            },
-            Op::Reshape {
-                value: 0,
-                shape: Shape::vector(4),
-            },
-            Op::Transpose(0),
-            Op::CumSum(0),
-            Op::CumProd(0),
-            Op::SortDesc(0),
-            Op::TopK { input: 0, k: 4 },
-            Op::MatMul(0, 1),
-            Op::PivotThreshold {
-                input: 0,
-                predicate: Predicate::RankLe(1),
-            },
-            Op::Gather { src: 0, idx: 1 },
-            Op::GatherRow { src: 0, idx: 1 },
-            Op::ScatterAdd {
-                base: 0,
-                idx: 1,
-                vals: 2,
-            },
-            Op::ScatterSet {
-                base: 0,
-                idx: 1,
-                vals: 2,
-            },
-            Op::Iota { len: 8 },
-            Op::MaskApply { logits: 0, mask: 1 },
-            Op::CausalMask {
-                positions: 0,
-                len: 8,
-            },
-            Op::SlidingWindowMask {
-                positions: 0,
-                len: 8,
-                window: 4,
-            },
-            Op::SinkWindowMask {
-                positions: 0,
-                len: 8,
-                sink: 2,
-                window: 4,
-            },
-            Op::Rng {
-                stream: 0,
-                shape: Shape::vector(4),
-                kind: RngKind::Gumbel,
-            },
-            Op::RngKeyed {
-                state: 0,
-                shape: Shape::vector(4),
-                kind: RngKind::Uniform,
-            },
-            Op::Const(Literal::F32(1.0)),
-            Op::ChanTake(0),
-            Op::ChanRead(0),
-            Op::ChanPut { chan: 0, value: 0 },
-            Op::IntrinsicVal {
-                intr: IntrinsicId::Logits,
-                shape: Shape::matrix(1, 8),
-                dtype: DType::F32,
-            },
-            Op::KernelCall {
-                name: 0,
-                args: vec![0, 1],
-                shape: Shape::vector(4),
-                dtype: DType::F32,
-            },
-            Op::SinkCall {
-                name: 0,
-                args: vec![0],
-            },
-        ];
+        let reps = representatives();
         assert_eq!(
             reps.len(),
             OP_TABLE.len(),
-            "one representative per table row"
+            "one representative per row, or the zip below compares a prefix"
         );
+        for (op, spec) in reps.iter().zip(OP_TABLE) {
+            assert_eq!(
+                op.tag(),
+                spec.tag,
+                "the {} row constructs an op with tag {:#04x}",
+                spec.name,
+                op.tag()
+            );
+        }
         for op in &reps {
             let spec = OP_TABLE
                 .iter()
                 .find(|s| s.tag == op.tag())
                 .unwrap_or_else(|| panic!("no table row for {op:?}"));
+
+            // `results` is deliberately not checked here. `Op::result_count`
+            // reads `spec(self.tag()).results`, so asserting the two agree
+            // compares a field with itself — it passed when a row's result
+            // count was mutated, and only the C++ mirror noticed. Result count
+            // has one declaration in this crate, which is the point; its
+            // witness is necessarily outside it, in
+            // `op_table_drift::driver_rows_agree_on_arity_and_result_count`.
+            //
+            // Operand count below is different: `operands()` derives from the
+            // enum's own fields, so this really is two sources meeting.
+
+            // The channel accessors and the table must agree on what a
+            // channel op is; six scans across three crates depend on it.
+            let is_channel = spec.family == Family::Channel;
             assert_eq!(
-                spec.results as u32,
-                op.result_count(),
-                "results for {}",
+                op.channel_use().is_some(),
+                is_channel,
+                "channel_use for {}",
+                spec.name
+            );
+            assert_eq!(
+                op.clone().channel_mut().is_some(),
+                is_channel,
+                "channel_mut for {}",
+                spec.name
+            );
+            assert_eq!(
+                op.clone().name_index_mut().is_some(),
+                spec.tag == tags::KERNEL_CALL || spec.tag == tags::SINK_CALL,
+                "name_index_mut for {}",
                 spec.name
             );
             if spec.val_operands != VARIADIC {

@@ -1,11 +1,13 @@
 //! `Tensor` — an SSA value (overview §1) — plus the free-function op surface that
-//! matches the overview §3/§6 examples verbatim. Ops emit echo's canonical
+//! matches the overview §3/§6 examples verbatim. Ops emit the IR's canonical
 //! [`ptir::op::Op`](pie_ir::op::Op); composed ops (`gumbel`,
-//! `mask_apply`, `softmax`, …) inline echo's [`expand`](pie_ir::expand)
+//! `mask_apply`, `softmax`, …) inline the IR's [`expand`](pie_ir::expand)
 //! expansions so a backend that fuses the core fuses these for free.
 
 use alloc::vec::Vec;
 
+use pie_ir::container::const_elem_size;
+use pie_ir::expand;
 use pie_ir::op::{IntrinsicId, Op};
 use pie_ir::types::{DType, Literal, Predicate, RngKind, Shape, ValueId, ValueType};
 
@@ -79,7 +81,7 @@ impl Arg {
             Arg::Const(c) => ValueType::new(c.shape, c.dtype),
         }
     }
-    /// Materialize into the current stage as echo ops, yielding an SSA id + type.
+    /// Materialize into the current stage as IR ops, yielding an SSA id + type.
     pub(crate) fn materialize(self) -> (ValueId, ValueType) {
         match self {
             Arg::Node { id, ty } => (id, ty),
@@ -127,7 +129,7 @@ impl AsTensor for f32 {
 }
 
 // ---------------------------------------------------------------------------
-// Constant → echo op materialization
+// Constant → IR op materialization
 // ---------------------------------------------------------------------------
 
 fn scalar_literal(dtype: DType, bytes: &[u8]) -> Literal {
@@ -142,29 +144,16 @@ fn scalar_literal(dtype: DType, bytes: &[u8]) -> Literal {
 }
 
 fn elem_at(dtype: DType, bytes: &[u8], i: usize) -> f64 {
+    let word = |o: usize| [bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]];
     match dtype {
         DType::Bool => (bytes.get(i).copied().unwrap_or(0) != 0) as u8 as f64,
-        _ => {
-            let o = i * 4;
-            let word = [bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]];
-            match dtype {
-                DType::F32 => f32::from_le_bytes(word) as f64,
-                DType::I32 => i32::from_le_bytes(word) as f64,
-                DType::U32 => u32::from_le_bytes(word) as f64,
-                DType::Bool => unreachable!(),
-            }
-        }
+        DType::F32 => f32::from_le_bytes(word(i * 4)) as f64,
+        DType::I32 => i32::from_le_bytes(word(i * 4)) as f64,
+        DType::U32 => u32::from_le_bytes(word(i * 4)) as f64,
     }
 }
 
-fn elem_size(d: DType) -> usize {
-    match d {
-        DType::Bool => 1,
-        _ => 4,
-    }
-}
-
-/// Lower a trace-known constant to echo ops (see [`Tensor::constant`]).
+/// Lower a trace-known constant to IR ops (see [`Tensor::constant`]).
 fn materialize_const(c: ConstData) -> (ValueId, ValueType) {
     let ty = ValueType::new(c.shape, c.dtype);
     if c.shape.is_scalar() {
@@ -180,7 +169,10 @@ fn materialize_const(c: ConstData) -> (ValueId, ValueType) {
     // uniform ⇒ broadcast(scalar).
     if !vals.is_empty() && vals.iter().all(|&v| v == vals[0]) {
         let s = emit(
-            Op::Const(scalar_literal(c.dtype, &c.bytes[..elem_size(c.dtype)])),
+            Op::Const(scalar_literal(
+                c.dtype,
+                &c.bytes[..const_elem_size(c.dtype)],
+            )),
             &[ValueType::scalar(c.dtype)],
         );
         let id = emit(
@@ -635,68 +627,59 @@ pub fn cumprod(x: impl AsTensor) -> Tensor {
     emit_unary(&x, Op::CumProd, |t| t)
 }
 
-// -- normalize (echo's expand.rs expansions, type-tracked) --
-pub fn softmax(x: impl AsTensor) -> Tensor {
+// -- normalize (pie_ir::expand sequences, type-tracked) --
+
+/// Records [`pie_ir::expand`] steps into the trace, attaching the result type
+/// each step lands in.
+///
+/// The op order lives in `pie_ir::expand`; this only knows how to name the
+/// three shapes an expansion step can have. Adding a step there needs no edit
+/// here, which is the point — the two used to be transcriptions of each other.
+struct Traced {
+    row: ValueType,
+    reduced: ValueType,
+}
+
+impl Traced {
+    fn over(row: ValueType) -> Self {
+        Self {
+            row,
+            reduced: ValueType::new(reduce_shape(row.shape), row.dtype),
+        }
+    }
+}
+
+impl expand::Sink for Traced {
+    fn push(&mut self, op: Op, shape: expand::StepShape) -> ValueId {
+        let ty = match shape {
+            expand::StepShape::Row => self.row,
+            expand::StepShape::Reduced => self.reduced,
+            // The expansions' only scalars are `Literal::F32` constants, so
+            // the declared type follows the literal, not the row.
+            expand::StepShape::Scalar => ValueType::scalar(DType::F32),
+            expand::StepShape::RowMask => ValueType::new(self.row.shape, DType::Bool),
+            expand::StepShape::ReducedIndex => ValueType::new(self.reduced.shape, DType::I32),
+        };
+        emit(op, &[ty])
+    }
+}
+
+/// Runs one `pie_ir::expand` sequence over `x` and returns its typed result.
+fn expanded(x: impl AsTensor, seq: impl FnOnce(&mut Traced, ValueId, Shape) -> ValueId) -> Tensor {
     let (xid, ty) = x.to_arg().materialize();
-    let (s, red) = (ty.shape, reduce_shape(ty.shape));
-    let m = push(Op::ReduceMax(xid), &[ValueType::new(red, DType::F32)]);
-    let mb = push(
-        Op::Broadcast { value: m, shape: s },
-        &[ValueType::new(s, DType::F32)],
-    );
-    let c = push(Op::Sub(xid, mb), &[ValueType::new(s, DType::F32)]);
-    let e = push(Op::Exp(c), &[ValueType::new(s, DType::F32)]);
-    let sum = push(Op::ReduceSum(e), &[ValueType::new(red, DType::F32)]);
-    let sb = push(
-        Op::Broadcast {
-            value: sum,
-            shape: s,
-        },
-        &[ValueType::new(s, DType::F32)],
-    );
-    let out = push(Op::Div(e, sb), &[ValueType::new(s, DType::F32)]);
-    Tensor::node(out, ValueType::new(s, DType::F32))
+    let row = ValueType::new(ty.shape, DType::F32);
+    let mut sink = Traced::over(row);
+    Tensor::node(seq(&mut sink, xid, ty.shape), row)
+}
+
+pub fn softmax(x: impl AsTensor) -> Tensor {
+    expanded(x, expand::softmax)
 }
 pub fn log_softmax(x: impl AsTensor) -> Tensor {
-    let (xid, ty) = x.to_arg().materialize();
-    let (s, red) = (ty.shape, reduce_shape(ty.shape));
-    let m = push(Op::ReduceMax(xid), &[ValueType::new(red, DType::F32)]);
-    let mb = push(
-        Op::Broadcast { value: m, shape: s },
-        &[ValueType::new(s, DType::F32)],
-    );
-    let c = push(Op::Sub(xid, mb), &[ValueType::new(s, DType::F32)]);
-    let e = push(Op::Exp(c), &[ValueType::new(s, DType::F32)]);
-    let sum = push(Op::ReduceSum(e), &[ValueType::new(red, DType::F32)]);
-    let l = push(Op::Log(sum), &[ValueType::new(red, DType::F32)]);
-    let lb = push(
-        Op::Broadcast { value: l, shape: s },
-        &[ValueType::new(s, DType::F32)],
-    );
-    let out = push(Op::Sub(c, lb), &[ValueType::new(s, DType::F32)]);
-    Tensor::node(out, ValueType::new(s, DType::F32))
+    expanded(x, expand::log_softmax)
 }
 pub fn l2norm(x: impl AsTensor) -> Tensor {
-    let (xid, ty) = x.to_arg().materialize();
-    let (s, red) = (ty.shape, reduce_shape(ty.shape));
-    let sq = push(Op::Mul(xid, xid), &[ValueType::new(s, DType::F32)]);
-    let sum = push(Op::ReduceSum(sq), &[ValueType::new(red, DType::F32)]);
-    let lg = push(Op::Log(sum), &[ValueType::new(red, DType::F32)]);
-    let half = push(
-        Op::Const(Literal::F32(0.5)),
-        &[ValueType::scalar(DType::F32)],
-    );
-    let h = push(Op::Mul(lg, half), &[ValueType::new(red, DType::F32)]);
-    let rt = push(Op::Exp(h), &[ValueType::new(red, DType::F32)]);
-    let rb = push(
-        Op::Broadcast {
-            value: rt,
-            shape: s,
-        },
-        &[ValueType::new(s, DType::F32)],
-    );
-    let out = push(Op::Div(xid, rb), &[ValueType::new(s, DType::F32)]);
-    Tensor::node(out, ValueType::new(s, DType::F32))
+    expanded(x, expand::l2norm)
 }
 
 // -- order --
@@ -772,7 +755,7 @@ pub fn matmul(a: impl AsTensor, b: impl AsTensor) -> Tensor {
     Tensor::node(emit(Op::MatMul(ia, ib), &[rty]), rty)
 }
 
-// -- sampling (echo's expand: gumbel = RngKeyed; mask_apply = select(mask, x, -inf)) --
+// -- sampling (the IR's expand: gumbel = RngKeyed; mask_apply = select(mask, x, -inf)) --
 /// `gumbel(state, shape)` — Gumbel noise, a pure function of the `[2]` U32 rng
 /// `state` (`[key, ctr]`) + element index (overview §3; replay-deterministic T8).
 pub fn gumbel(state: impl AsTensor, shape: impl IntoShape) -> Tensor {
@@ -799,25 +782,12 @@ fn rng_noise(state: impl AsTensor, shape: impl IntoShape, kind: RngKind) -> Tens
     )
 }
 /// `mask_apply(logits, mask)` — bool-mask over logits (allowed → pass, else −∞),
-/// expanded to `select(mask, logits, -inf)` (echo's composed form).
+/// expanded to `select(mask, logits, -inf)` (the IR's composed form).
 pub fn mask_apply(logits: impl AsTensor, mask: impl AsTensor) -> Tensor {
     let (il, tyl) = logits.to_arg().materialize();
     let (im, _) = mask.to_arg().materialize();
-    let ninf = push(
-        Op::Const(Literal::F32(f32::NEG_INFINITY)),
-        &[ValueType::scalar(DType::F32)],
-    );
-    Tensor::node(
-        emit(
-            Op::Select {
-                cond: im,
-                a: il,
-                b: ninf,
-            },
-            &[tyl],
-        ),
-        tyl,
-    )
+    let mut sink = Traced::over(tyl);
+    Tensor::node(expand::mask_apply(&mut sink, il, im), tyl)
 }
 
 fn append_mask_axis(shape: Shape, len: u32) -> Shape {
@@ -1007,61 +977,16 @@ pub fn scalar_gather(src: impl AsTensor, index: impl AsTensor) -> Tensor {
 
 /// Exact nucleus sampler expressed entirely as ordinary composable SSA.
 /// Temperature scaling remains an ordinary preceding operation.
+///
+/// The op sequence is [`expand::nucleus_sample`], shared with the region
+/// matcher that has to recognize it again on the way to a fused kernel.
 pub fn nucleus_sample(logits: impl AsTensor, top_p: impl AsTensor, state: impl AsTensor) -> Tensor {
     let (logits, logits_type) = logits.to_arg().materialize();
     let (top_p, _) = top_p.to_arg().materialize();
     let (state, _) = state.to_arg().materialize();
-    let row_type = ValueType::new(reduce_shape(logits_type.shape), DType::F32);
+    let mut sink = Traced::over(logits_type);
     let token_type = ValueType::new(reduce_shape(logits_type.shape), DType::I32);
-
-    let maximum = push(Op::ReduceMax(logits), &[row_type]);
-    let maximum = push(
-        Op::Broadcast {
-            value: maximum,
-            shape: logits_type.shape,
-        },
-        &[logits_type],
-    );
-    let centered = push(Op::Sub(logits, maximum), &[logits_type]);
-    let exponentials = push(Op::Exp(centered), &[logits_type]);
-    let sum = push(Op::ReduceSum(exponentials), &[row_type]);
-    let sum = push(
-        Op::Broadcast {
-            value: sum,
-            shape: logits_type.shape,
-        },
-        &[logits_type],
-    );
-    let probabilities = push(Op::Div(exponentials, sum), &[logits_type]);
-    let keep = push(
-        Op::PivotThreshold {
-            input: probabilities,
-            predicate: Predicate::CummassLe(top_p),
-        },
-        &[ValueType::new(logits_type.shape, DType::Bool)],
-    );
-    let negative_infinity = push(
-        Op::Const(Literal::F32(f32::NEG_INFINITY)),
-        &[ValueType::scalar(DType::F32)],
-    );
-    let masked = push(
-        Op::Select {
-            cond: keep,
-            a: logits,
-            b: negative_infinity,
-        },
-        &[logits_type],
-    );
-    let noise = push(
-        Op::RngKeyed {
-            state,
-            shape: logits_type.shape,
-            kind: RngKind::Gumbel,
-        },
-        &[logits_type],
-    );
-    let perturbed = push(Op::Add(masked, noise), &[logits_type]);
-    let result = push(Op::ReduceArgmax(perturbed), &[token_type]);
+    let result = expand::nucleus_sample(&mut sink, logits, top_p, state, logits_type.shape);
     Tensor::node(result, token_type)
 }
 

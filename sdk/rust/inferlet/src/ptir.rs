@@ -125,11 +125,6 @@ pub struct Channel {
     dtype: DType,
 }
 
-/// Default number of decode fires kept submitted ahead of host consumption.
-/// Matches the engine scheduler's run-ahead depth (`MAX_IN_FLIGHT` in
-/// quorum.rs) so a single pipeline can keep every scheduler wave slot fed.
-pub const DEFAULT_RUNAHEAD_DEPTH: usize = 2;
-
 /// In-band validity sentinel: a token slot holding `-1` does not exist —
 /// it embeds nothing, appends no KV, and advances no position. Envelope
 /// shapes stay fixed while `-1` decides which slots are real (shape decides
@@ -925,11 +920,19 @@ impl ForwardPass {
         }
     }
 
-    /// Enqueue this pass as a SINGLE-SLOT FRAME on `on` (slot 0; the other
-    /// k−1 slots are no-ops). At the default deployment (`frame_size() == 1`)
-    /// this is exactly the classic per-pass run-ahead submit. At k > 1 it
-    /// costs one whole frame per pass — k times fewer tokens per boundary —
-    /// so hot loops should fill all k slots via [`submit_frame`].
+    /// Enqueue this pass as a SINGLE-SLOT FRAME on `on`: slot 0 is this pass,
+    /// the other k−1 slots pad to no-ops.
+    ///
+    /// This is the ONE-SHOT path — a prefill chunk, a partial trailing frame,
+    /// or a fire the runtime submits solo (a `buffer` / `fold-buffered`
+    /// recurrent pass). The padding
+    /// is unconditional, not a fallback when slots run out, so at k > 1 this
+    /// spends a whole frame on a single pass: exactly as many frame boundaries
+    /// per token as k = 1, with none of k's batching benefit.
+    ///
+    /// A decode loop should NOT call this. Use [`run_ahead`], which fills
+    /// [`live_slots`] per frame and sizes its window from
+    /// [`channel_capacity`], or [`submit_frame`] to drive frames by hand.
     pub fn submit(&self, on: &Pipeline) -> Result<(), String> {
         submit_frame(on, &[Some(self)])
     }
@@ -1002,6 +1005,35 @@ pub fn frame_size() -> usize {
         static FRAME_SIZE: std::cell::OnceCell<usize> = const { std::cell::OnceCell::new() };
     }
     FRAME_SIZE.with(|k| *k.get_or_init(|| crate::model::frame_size().max(1) as usize))
+}
+
+/// Host-reader channel capacity, in cells, that sustains the engine's
+/// run-ahead for one lane. Size every host-reader channel to at least this.
+///
+/// Deliberately NOT cached, unlike [`frame_size`]: `frame-size` is promised to
+/// be a static deployment constant, this one is not — it derives from the host
+/// resubmit turnaround, which the runtime may later adapt.
+pub fn channel_capacity() -> usize {
+    (crate::model::channel_capacity() as usize).max(2)
+}
+
+/// Live slots per frame for the bound model: how many of the k slots a lane
+/// can actually fill with work.
+///
+/// Always k. A recurrent-state (linear) model used to get 1 whatever k was,
+/// because its mapping published at FINALIZE: slot i+1's prepare read a stale
+/// mapping unless slot i had already settled, which a frame can never reach.
+/// RS now publishes at prepare, in slot order, so a linear lane fills a frame
+/// exactly like a dense one.
+///
+/// Kept as its own query rather than folded into [`frame_size`]: it answers
+/// "how much can this lane submit per frame", which is a model property that
+/// has diverged from k before and may again. It is NOT the place to encode
+/// per-PASS restrictions — a `buffer` / `fold-buffered` fire is submitted solo
+/// by the runtime because it picks the RS execution mode for the whole
+/// composed batch, and that is a property of the fire, not of the model.
+pub fn live_slots() -> usize {
+    frame_size()
 }
 
 /// Max embed tokens in a single pass (C) — the guest-side prefill chunk
@@ -1094,6 +1126,87 @@ pub fn submit_frame(on: &Pipeline, slots: &[Option<&ForwardPass>]) -> Result<(),
     wit::submit(&on.wit, &borrows)
 }
 
+/// Keeps the engine's run-ahead window full while `on_token` consumes results,
+/// submitting `pass` on `on` until `budget` fires have been submitted or
+/// `on_token` returns [`ControlFlow::Break`].
+///
+/// Nothing here is hidden — it is the loop you would otherwise hand-write:
+///
+/// ```ignore
+/// let r      = ptir::live_slots();
+/// let frames = (ptir::channel_capacity() - 1) / r;
+/// // prime `frames` frames of `r` slots; refill one frame per `r` results
+/// ```
+///
+/// with the two mistakes that loop invites removed:
+///
+/// - the window is counted in FRAMES, not fires. A fire-counted window
+///   overshoots by a whole frame, and — worse — shrinks in real work as k
+///   shrinks, which is the unit error that collapsed k = 1 throughput.
+/// - `budget` bounds submission, so stopping early does not strand a full
+///   window of already-submitted fires.
+///
+/// `on_token` is called once per completed fire, in submission order; it is
+/// where the guest takes its channels and does its host-side work. Returning
+/// `Break` stops submission immediately. Up to one window of fires may still
+/// be in flight at that point — their cells are simply never taken, and
+/// [`Pipeline::close`] reclaims them.
+///
+/// Returns the number of times `on_token` ran.
+pub async fn run_ahead(
+    on: &Pipeline,
+    pass: &ForwardPass,
+    budget: usize,
+    mut on_token: impl AsyncFnMut() -> Result<std::ops::ControlFlow<()>, String>,
+) -> Result<usize, String> {
+    use std::ops::ControlFlow;
+
+    if budget == 0 {
+        return Ok(0);
+    }
+    let r = live_slots();
+    // `channel_capacity()` carries the staging margin, so the window is what
+    // remains once that margin is set aside — in FRAMES of `r` live slots.
+    // Dividing by `r` rather than assuming k keeps the ring just as full for
+    // any lane whose live width has been narrowed below k.
+    let window_frames = ((channel_capacity() - 1) / r.max(1)).max(1);
+
+    let mut submitted = 0usize;
+    let mut consumed = 0usize;
+
+    // One frame of up to `r` live slots, never past `budget`.
+    let submit_one_frame = |submitted: &mut usize| -> Result<(), String> {
+        let live = r.min(budget - *submitted);
+        if live == 0 {
+            return Ok(());
+        }
+        let slots: Vec<Option<&ForwardPass>> = vec![Some(pass); live];
+        submit_frame(on, &slots)?;
+        *submitted += live;
+        Ok(())
+    };
+
+    for _ in 0..window_frames {
+        if submitted >= budget {
+            break;
+        }
+        submit_one_frame(&mut submitted)?;
+    }
+
+    while consumed < submitted {
+        if on_token().await? == ControlFlow::Break(()) {
+            return Ok(consumed + 1);
+        }
+        consumed += 1;
+        // Refill a whole frame at a time: `submit_frame` is the only way to
+        // publish, and a partial frame cannot be topped up after the fact.
+        if submitted < budget && submitted - consumed <= (window_frames - 1) * r {
+            submit_one_frame(&mut submitted)?;
+        }
+    }
+    Ok(consumed)
+}
+
 // ---------------------------------------------------------------------------
 // Pipeline
 // ---------------------------------------------------------------------------
@@ -1148,10 +1261,11 @@ impl Default for Pipeline {
 /// four author-facing wrapper types.
 pub mod prelude {
     pub use super::{
-        Channel, DEFAULT_RUNAHEAD_DEPTH, ForwardPass, PageGrant, Pipeline, RsWorkingSet, TOKEN_PAD,
-        WorkingSet, frame_size, max_embed_length, pad_tokens, prefill_chunks, submit_frame,
-        unpad_tokens,
+        Channel, ForwardPass, PageGrant, Pipeline, RsWorkingSet, TOKEN_PAD,
+        WorkingSet, channel_capacity, frame_size, live_slots, max_embed_length, pad_tokens,
+        prefill_chunks, run_ahead, submit_frame, unpad_tokens,
     };
+    pub use std::ops::ControlFlow;
     pub use pie_dsl::dtype;
     pub use pie_dsl::intrinsics;
     pub use pie_dsl::value::{

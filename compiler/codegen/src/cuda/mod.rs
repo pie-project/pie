@@ -17,8 +17,11 @@
 //! * [`validate`] — the region ABI checks the fused emitter gates on.
 //! * [`singleton`] — the one-op-per-launch kernel.
 //! * [`fused`] — the whole-region kernel.
+//! * [`region_analysis`] — the per-region bind gates and intrinsic side-table
+//!   analysis this backend's driver would otherwise re-derive.
 
 pub mod fused;
+pub mod region_analysis;
 pub mod runtime;
 pub mod singleton;
 pub mod validate;

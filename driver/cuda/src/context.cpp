@@ -1045,6 +1045,7 @@ int Context::Impl::load_model(
          family == model::Family::NemotronH ||
          family == model::Family::Kimi ||
          family == model::Family::Glm5 ||
+         family == model::Family::Mixtral ||
          family == model::Family::DeepSeekV4);
     const int physical_kv_pages =
         runtime_kv_pages +
@@ -1544,6 +1545,32 @@ int Context::Impl::load_model(
         static_cast<std::uint32_t>(
             std::max(0, engine.hf_config().num_hidden_layers)));
 
+    // The pad page/slot give CUDA-graph padding rows *and* device-composed
+    // padding rows a sacrificial KV destination. Both require the model to
+    // leave invalid rows alone, which is `graph_padding_kv_write_safe`; a
+    // model that cannot promise that has no use for the reservation, and
+    // keeping it is actively harmful. When page 0 cannot be aliased the pad
+    // page is the *last* page of the KV arena, so `required_kv_pages()`
+    // raises every frame's demand to `graph_pad_page + 1` and the arena
+    // commits a prefix -- pinning each commit to full capacity. Any model
+    // whose logical page count outruns the physical budget is then rejected
+    // on its first frame with "frame commit impossible", however short the
+    // request.
+    //
+    // `page_zero_dummy_safe` is decided from the family before the model
+    // exists, so cross-check it against what the model actually claims
+    // rather than letting the two drift into silent KV corruption.
+    if (page_zero_dummy_safe && !forward_fn.graph_padding_kv_write_safe) {
+        std::cerr << "[pie-driver-cuda] family aliases KV page 0 for padding "
+                     "rows but the model does not gate KV writes on "
+                     "row_valid\n";
+        return PIE_STATUS_UNSUPPORTED;
+    }
+    const int effective_graph_pad_page =
+        forward_fn.graph_padding_kv_write_safe ? graph_pad_page : -1;
+    const int effective_graph_pad_slot =
+        forward_fn.graph_padding_kv_write_safe ? graph_pad_slot : -1;
+
     BatchEngine* executor_p = nullptr;
     {
         ScopedCudaArenaAllocator arena(*workspace_allocator_);
@@ -1551,8 +1578,8 @@ int Context::Impl::load_model(
             engine, ws, kv_cache, attn_ws, cublas,
             max_workspace_tokens,
             mem_plan.max_requests,
-            graph_pad_page,
-            graph_pad_slot,
+            effective_graph_pad_page,
+            effective_graph_pad_slot,
             persistent_inputs,
             verbose,
             std::move(forward_fn),

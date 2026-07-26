@@ -17,15 +17,17 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+use pie_ir::op::tags;
 use pie_ir::validate::BoundTrace;
 use pie_plan::{CompiledStage, LibraryOp, Region, RegionKind};
 
-/// Kind discriminants, matching `PIE_KERNEL_*` in the driver ABI.
-pub const KERNEL_SINGLETON: u32 = 0;
-pub const KERNEL_FUSED: u32 = 1;
-pub const KERNEL_GROUPED: u32 = 2;
-pub const KERNEL_READINESS: u32 = 3;
-pub const KERNEL_COMMIT: u32 = 4;
+/// Kind discriminants. Re-exported from the driver ABI rather than restated:
+/// [`EmittedKernel::kind`] is handed straight to the driver, so a second
+/// spelling of these numbers here would be a second thing to keep right.
+pub use pie_driver_abi::local::{
+    PIE_KERNEL_COMMIT, PIE_KERNEL_FUSED, PIE_KERNEL_GROUPED, PIE_KERNEL_READINESS,
+    PIE_KERNEL_SINGLETON,
+};
 
 /// One emitted kernel, or the reason it could not be emitted.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,6 +76,15 @@ pub enum Backend {
 }
 
 impl Backend {
+    /// Every backend, for callers that mean "all of them".
+    ///
+    /// A test that wants both backends would otherwise write the pair out,
+    /// and a third backend would leave that test quietly covering two of
+    /// three. `every_backend_is_in_all` keeps this honest against [`parse`].
+    ///
+    /// [`parse`]: Backend::parse
+    pub const ALL: &'static [Backend] = &[Backend::Cuda, Backend::Metal];
+
     /// Parse a driver's advertised backend. Unknown names mean "no host code
     /// generation", never a guess.
     pub fn parse(name: &str) -> Option<Self> {
@@ -81,6 +92,14 @@ impl Backend {
             "cuda" => Some(Backend::Cuda),
             "metal" => Some(Backend::Metal),
             _ => None,
+        }
+    }
+
+    /// The name a driver advertises. Inverse of [`Backend::parse`].
+    pub fn name(self) -> &'static str {
+        match self {
+            Backend::Cuda => "cuda",
+            Backend::Metal => "metal",
         }
     }
 
@@ -94,20 +113,33 @@ impl Backend {
 }
 
 /// Emit every kernel a driver needs for `stages`, in stage then region order.
+///
+/// One `match` owns the whole backend decision. The program-level effect
+/// kernels used to be reached by an `if backend == Backend::Metal` *after* the
+/// loop, which meant a third backend would compile, run, and quietly emit no
+/// readiness or commit kernels at all. Everything a backend does is now in its
+/// arm, so adding one is a compile error here rather than a missing kernel in
+/// a driver.
 pub fn emit_program(
     backend: Backend,
     stages: &[CompiledStage],
     bound: &BoundTrace,
 ) -> Vec<EmittedKernel> {
     let mut kernels = Vec::new();
-    for (stage_index, stage) in stages.iter().enumerate() {
-        match backend {
-            Backend::Cuda => emit_cuda_stage(stage, stage_index, &mut kernels),
-            Backend::Metal => emit_metal_stage(stage, stage_index, &mut kernels),
+    match backend {
+        Backend::Cuda => {
+            for (stage_index, stage) in stages.iter().enumerate() {
+                emit_cuda_stage(stage, stage_index, &mut kernels);
+            }
+            // No program-level effect kernels: the CUDA driver's readiness and
+            // commit are prebuilt tier-0 kernels, not generated ones.
         }
-    }
-    if backend == Backend::Metal {
-        emit_metal_program_effects(bound, &mut kernels);
+        Backend::Metal => {
+            for (stage_index, stage) in stages.iter().enumerate() {
+                emit_metal_stage(stage, stage_index, &mut kernels);
+            }
+            emit_metal_program_effects(bound, &mut kernels);
+        }
     }
     kernels
 }
@@ -125,7 +157,7 @@ fn emit_cuda_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<Emit
         let entry = format!("ptir_fused_{signature}_r{region_index}");
         let emitted = crate::cuda::emit_fused_region(&entry, stage, region);
         out.push(EmittedKernel::new(
-            KERNEL_FUSED,
+            PIE_KERNEL_FUSED,
             stage_index,
             region_index,
             entry,
@@ -144,7 +176,7 @@ fn emit_metal_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<Emi
                 let entry = format!("ptir_m1_{signature}_r{region_index}");
                 let source = crate::metal::emit_singleton_region(&entry, meta.op.tag);
                 out.push(EmittedKernel::new(
-                    KERNEL_SINGLETON,
+                    PIE_KERNEL_SINGLETON,
                     stage_index,
                     region_index,
                     entry,
@@ -156,7 +188,7 @@ fn emit_metal_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<Emi
             // The whole stage is unrepresentable on the singleton path; say so
             // once rather than per region.
             out.push(EmittedKernel::new(
-                KERNEL_SINGLETON,
+                PIE_KERNEL_SINGLETON,
                 stage_index,
                 0,
                 String::new(),
@@ -178,7 +210,7 @@ fn emit_metal_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<Emi
             Err("fused region exceeds the 12-channel direct-binding limit".to_string())
         };
         out.push(EmittedKernel::new(
-            KERNEL_FUSED,
+            PIE_KERNEL_FUSED,
             stage_index,
             region_index,
             entry,
@@ -193,7 +225,7 @@ fn emit_metal_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<Emi
         let entry = format!("ptir_m3s_{signature}_r{region_index}");
         let emitted = crate::metal::emit_grouped_fused_region(&entry, stage, region);
         out.push(EmittedKernel::new(
-            KERNEL_GROUPED,
+            PIE_KERNEL_GROUPED,
             stage_index,
             region_index,
             entry,
@@ -210,7 +242,7 @@ fn emit_metal_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<Emi
             _ => crate::metal::emit_grouped_fused_region(&entry, stage, region),
         };
         out.push(EmittedKernel::new(
-            KERNEL_GROUPED,
+            PIE_KERNEL_GROUPED,
             stage_index,
             stage.singleton.regions.len() + region_index,
             entry,
@@ -227,7 +259,7 @@ fn emit_metal_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<Emi
     let ready = format!("ptir_m3_generic_ready_v{version}");
     let source = crate::metal::emit_grouped_readiness(&ready);
     out.push(EmittedKernel::new(
-        KERNEL_READINESS,
+        PIE_KERNEL_READINESS,
         stage_index,
         0,
         ready,
@@ -236,7 +268,7 @@ fn emit_metal_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<Emi
     let commit = format!("ptir_m3_generic_commit_v{version}");
     let source = crate::metal::emit_grouped_commit(&commit);
     out.push(EmittedKernel::new(
-        KERNEL_COMMIT,
+        PIE_KERNEL_COMMIT,
         stage_index,
         0,
         commit,
@@ -255,10 +287,16 @@ fn emit_metal_program_effects(bound: &BoundTrace, out: &mut Vec<EmittedKernel>) 
     let signature = format!("{:016x}", bound.hash);
     let ready = format!("ptir_m1_{signature}_ready");
     let source = crate::metal::emit_readiness(&ready, &effects);
-    out.push(EmittedKernel::new(KERNEL_READINESS, 0, 1, ready, source));
+    out.push(EmittedKernel::new(
+        PIE_KERNEL_READINESS,
+        0,
+        1,
+        ready,
+        source,
+    ));
     let commit = format!("ptir_m1_{signature}_commit");
     let source = crate::metal::emit_commit(&commit, &effects);
-    out.push(EmittedKernel::new(KERNEL_COMMIT, 0, 1, commit, source));
+    out.push(EmittedKernel::new(PIE_KERNEL_COMMIT, 0, 1, commit, source));
 }
 
 /// Which library kernel a grouped region should use, reproducing the driver's
@@ -273,11 +311,52 @@ fn grouped_library(stage: &CompiledStage, region: &Region) -> Option<LibraryOp> 
             // The driver additionally checks the node really is a `top_k`, so a
             // mislabelled region falls to the generic emitter instead of a
             // kernel that would read the wrong operands.
-            let node = *region.nodes.first()? as usize;
+            let node = region.nodes.first()?.index();
             let op = stage.normalized.ops.get(node)?;
-            (crate::op_view::OpView::of(op).tag == crate::metal::validate::OP_TOP_K)
-                .then_some(LibraryOp::TopK)
+            (crate::op_view::OpView::of(op).tag == tags::TOP_K).then_some(LibraryOp::TopK)
         }
-        _ => None,
+        // Listed rather than caught by `_`: a new library op has no grouped
+        // kernel until someone writes one, and it should be this match that
+        // says so.
+        LibraryOp::Sort | LibraryOp::Scan | LibraryOp::MatMul | LibraryOp::SecondParty => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec::Vec;
+
+    /// Walk the enum by successor. Odd on purpose: the `match` is exhaustive,
+    /// so a new variant does not compile until it is given a place in the
+    /// order, and the walk that place produces is what [`Backend::ALL`] is
+    /// then required to equal. A plain `for backend in Backend::ALL` cannot do
+    /// that — it only ever visits what the list already contains, which is the
+    /// thing in question.
+    fn walk() -> Vec<Backend> {
+        let mut out = Vec::new();
+        let mut next = Some(Backend::Cuda);
+        while let Some(backend) = next {
+            out.push(backend);
+            next = match backend {
+                Backend::Cuda => Some(Backend::Metal),
+                Backend::Metal => None,
+            };
+        }
+        out
+    }
+
+    /// [`Backend::ALL`] is the whole enum, and every entry round-trips through
+    /// the two string conversions beside it. Without this, a third backend
+    /// could reach `name`, `emitter_version` and `emit_program` — all three of
+    /// which the compiler does insist on — and still quietly halve every "for
+    /// both backends" test that iterates `ALL`.
+    #[test]
+    fn all_is_the_whole_enum_and_round_trips() {
+        assert_eq!(Backend::ALL, walk().as_slice());
+        for backend in Backend::ALL {
+            assert_eq!(Backend::parse(backend.name()), Some(*backend));
+        }
+        assert_eq!(Backend::parse("vulkan"), None);
     }
 }

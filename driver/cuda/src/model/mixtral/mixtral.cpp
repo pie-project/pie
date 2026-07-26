@@ -1,6 +1,7 @@
 #include "model/mixtral/mixtral.hpp"
 #include "model/stage_hooks.hpp"
 
+#include <cstdlib>
 #include <algorithm>
 #include <cstdint>
 #include <stdexcept>
@@ -14,6 +15,7 @@
 #include "kernels/add_bias.hpp"
 #include "kernels/attn_sink.hpp"
 #include "kernels/dequant_fp4.hpp"
+#include "kernels/dequant_wna16.hpp"
 #include "kernels/deinterleave.hpp"
 #include "kernels/embed.hpp"
 #include "kernels/gather_rows.hpp"
@@ -138,8 +140,11 @@ void mixtral_forward_paged(
     int N,
     int R,
     bool is_pure_decode,
+    const std::int32_t* logit_row_indices_d,
+    int num_logit_rows,
     const std::uint8_t* custom_mask_d,
-    const std::int32_t* custom_mask_indptr_d)
+    const std::int32_t* custom_mask_indptr_d,
+    const std::uint8_t* row_valid_d)
 {
     // TP-local dims. tp_size == 1 keeps the original single-GPU shapes.
     // For Mixtral we shard *within* each expert (per-expert TP), not
@@ -217,6 +222,55 @@ void mixtral_forward_paged(
     auto d_expert_idx   = DeviceBuffer<std::int32_t>::alloc(max_routed);
     auto d_expert_w     = DeviceBuffer<float>::alloc(max_routed);
 
+    // Fused MXFP4 decode GEMV admission. The kernel reads one copy of an
+    // expert's packed weights per *route*; the materializing path reads one
+    // per *distinct expert*, but then writes and re-reads a 4x-larger bf16
+    // expansion and pays a cuBLAS launch per expert, so it needs routes to
+    // run many times ahead of num_experts before it catches up. Measured on
+    // gpt-oss (H=I=2880, top_k=4, E=8), fused vs materializing:
+    //
+    //     routes    4     32    128    256    512
+    //     speedup  4.8x  4.4x  1.9x   1.1x   0.7x
+    //
+    // so the crossover sits near 32x num_experts, and the threshold scales
+    // with E because the materializing path's cost scales with the number
+    // of *distinct* experts touched. It also keeps prefill out: a frame of
+    // more than a few dozen tokens is far past the cap, and there the
+    // tensor-core GEMM the materializing path feeds is the right kernel.
+    // PIE_MXFP4_DECODE_ROUTES overrides it for tuning.
+    const bool mxfp4_decode_gemv_available =
+        !w.layers.empty() &&
+        !w.layers[0].expert_gate_up_packed_ptrs.empty() &&
+        H % 32 == 0 && I % 32 == 0;
+    if (mxfp4_decode_gemv_available && w.mxfp4_decode_max_routes == 0) {
+        int cap = 32 * num_experts;
+        if (const char* ov = std::getenv("PIE_MXFP4_DECODE_ROUTES")) {
+            cap = std::atoi(ov);
+        }
+        w.mxfp4_decode_max_routes = std::max(0, cap);
+    }
+    const bool use_mxfp4_decode_gemv =
+        mxfp4_decode_gemv_available &&
+        N * top_k <= w.mxfp4_decode_max_routes;
+    // Sized from the live frame, never from the cap: the cap is an
+    // admission threshold that can legitimately exceed any frame's routes,
+    // and sizing scratch by it would either waste an arena or -- if a later
+    // frame grew -- read out of bounds.
+    const std::size_t gemv_routes =
+        use_mxfp4_decode_gemv ? max_routed : 0;
+    auto d_mxfp4_act_fp16 = DeviceBuffer<std::uint16_t>::alloc(
+        use_mxfp4_decode_gemv ? static_cast<std::size_t>(N) * H : 0);
+    auto d_mxfp4_route_gate =
+        DeviceBuffer<std::uint16_t>::alloc(gemv_routes * I);
+    auto d_mxfp4_route_up =
+        DeviceBuffer<std::uint16_t>::alloc(gemv_routes * I);
+    auto d_mxfp4_route_act_fp16 =
+        DeviceBuffer<std::uint16_t>::alloc(gemv_routes * I);
+    auto d_mxfp4_route_out =
+        DeviceBuffer<std::uint16_t>::alloc(gemv_routes * H);
+    auto d_mxfp4_moe_out = DeviceBuffer<std::uint16_t>::alloc(
+        use_mxfp4_decode_gemv ? static_cast<std::size_t>(N) * H : 0);
+
     for (int L = 0; L < cfg.num_hidden_layers; ++L) {
         const auto& layer = w.layers[L];
 
@@ -231,18 +285,21 @@ void mixtral_forward_paged(
         kernels::launch_rmsnorm_bf16(
             ws.y.data(), layer.attn_norm->data(), ws.norm_x.data(),
             N, H, eps, stream);
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            ws.norm_x.data(), layer.q_proj->data(), ws.q.data(), N, Hq, H);
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            ws.norm_x.data(), layer.k_proj->data(), ws.k.data(), N, Hk, H);
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            ws.norm_x.data(), layer.v_proj->data(), ws.v.data(), N, Hk, H);
-        if (layer.q_bias) kernels::launch_add_bias_bf16(
-            ws.q.data(), layer.q_bias->data(), N, Hq, stream);
-        if (layer.k_bias) kernels::launch_add_bias_bf16(
-            ws.k.data(), layer.k_bias->data(), N, Hk, stream);
-        if (layer.v_bias) kernels::launch_add_bias_bf16(
-            ws.v.data(), layer.v_bias->data(), N, Hk, stream);
+        // Bias folded into the projection: at decode these route to the
+        // warp-per-row GEMV, whose epilogue absorbs it for free. gpt-oss
+        // biases all three, so this is 3 launches per layer removed.
+        ops::gemm_act_x_wt_bias_bf16(cublas.handle(),
+            ws.norm_x.data(), layer.q_proj->data(),
+            layer.q_bias ? layer.q_bias->data() : nullptr,
+            ws.q.data(), N, Hq, H, stream);
+        ops::gemm_act_x_wt_bias_bf16(cublas.handle(),
+            ws.norm_x.data(), layer.k_proj->data(),
+            layer.k_bias ? layer.k_bias->data() : nullptr,
+            ws.k.data(), N, Hk, H, stream);
+        ops::gemm_act_x_wt_bias_bf16(cublas.handle(),
+            ws.norm_x.data(), layer.v_proj->data(),
+            layer.v_bias ? layer.v_bias->data() : nullptr,
+            ws.v.data(), N, Hk, H, stream);
 
         kernels::launch_rope_bf16(
             ws.q.data(), ws.k.data(), positions,
@@ -263,7 +320,7 @@ void mixtral_forward_paged(
         kernels::launch_write_kv_to_pages(
             kv_view, ws.k.data(), ws.v.data(),
             qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            N, R, stream);
+            N, R, stream, row_valid_d);
 
         // Only ask flashinfer for lse on layers that actually use sinks.
         // Saves a per-layer kernel write on plain Mixtral, and on
@@ -325,13 +382,10 @@ void mixtral_forward_paged(
             if (layer.o_bias) kernels::launch_add_bias_bf16(
                 ws.y.data(), layer.o_bias->data(), N, H, stream);
         } else {
-            ops::gemm_act_x_wt_bf16(cublas.handle(),
-                ws.attn_out.data(), layer.o_proj->data(), ws.norm_x.data(),
-                N, H, Hq, /*beta=*/0.f);
-            if (layer.o_bias && tp_is_leader) {
-                kernels::launch_add_bias_bf16(
-                    ws.norm_x.data(), layer.o_bias->data(), N, H, stream);
-            }
+            ops::gemm_act_x_wt_bias_bf16(cublas.handle(),
+                ws.attn_out.data(), layer.o_proj->data(),
+                (layer.o_bias && tp_is_leader) ? layer.o_bias->data() : nullptr,
+                ws.norm_x.data(), N, H, Hq, stream);
             tp->all_reduce_bf16(ws.norm_x.data(),
                 static_cast<std::size_t>(N) * H, ncclSum, stream);
             kernels::launch_residual_add_bf16(
@@ -348,14 +402,77 @@ void mixtral_forward_paged(
         // — its allocation is `[max_tokens, intermediate]` which is
         // always ≥ [N, num_experts] for any production config (E ≤ 64,
         // I ≥ 4096).
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            ws.norm_y.data(), layer.router->data(), ws.gate.data(),
-            N, num_experts, H);
-        if (layer.router_bias) kernels::launch_add_bias_bf16(
-            ws.gate.data(), layer.router_bias->data(), N, num_experts, stream);
+        ops::gemm_act_x_wt_bias_bf16(cublas.handle(),
+            ws.norm_y.data(), layer.router->data(),
+            layer.router_bias ? layer.router_bias->data() : nullptr,
+            ws.gate.data(), N, num_experts, H, stream);
         kernels::launch_topk_softmax_bf16(
             ws.gate.data(), d_topk_idx.data(), d_topk_w.data(),
             N, num_experts, top_k, stream);
+
+        // 1b. Fused MXFP4 decode GEMV.
+        //
+        // The generic path below materializes every routed expert's bf16
+        // weights before calling cuBLAS. At decode that dominates the step
+        // (63% of GPU time on gpt-oss): each token rewrites hundreds of MiB
+        // of bf16 that is read exactly once. The fused GEMV reads the packed
+        // nibbles straight out of HBM instead, so the traffic is the 4-bit
+        // weight and nothing else -- and because it takes `topk_idx` on the
+        // device, the D2H sync in step 2 disappears with it.
+        //
+        // It is a *per-route* kernel, so its weight traffic grows with
+        // routes while the materializing path's grows with distinct experts.
+        // Below `mxfp4_decode_max_routes` the fused path reads strictly
+        // less; above it the materializing path amortises better and wins.
+        if (use_mxfp4_decode_gemv &&
+            !layer.expert_gate_up_packed_ptrs.empty()) {
+            const int routes = N * top_k;
+            kernels::launch_bf16_to_fp16(
+                ws.norm_y.data(), d_mxfp4_act_fp16.data(),
+                static_cast<std::size_t>(N) * H, stream);
+            kernels::launch_mxfp4_moe_gate_up_decode_bf16(
+                d_mxfp4_act_fp16.data(), d_topk_idx.data(),
+                layer.expert_gate_up_packed_ptrs.data(),
+                layer.expert_gate_up_scale_ptrs.data(),
+                layer.expert_gate_bias_ptrs.data(),
+                layer.expert_up_bias_ptrs.data(),
+                d_mxfp4_route_gate.data(), d_mxfp4_route_up.data(),
+                N, top_k, H, I, stream);
+            if (cfg.swiglu_limit > 0.f) {
+                kernels::launch_gpt_oss_glu_bf16(
+                    d_mxfp4_route_gate.data(), d_mxfp4_route_up.data(),
+                    d_mxfp4_route_gate.data(),
+                    static_cast<int>(static_cast<std::size_t>(routes) * I),
+                    stream, /*limit=*/cfg.swiglu_limit);
+            } else {
+                kernels::launch_swiglu_bf16(
+                    d_mxfp4_route_gate.data(), d_mxfp4_route_up.data(),
+                    d_mxfp4_route_gate.data(),
+                    static_cast<std::size_t>(routes) * I, stream);
+            }
+            kernels::launch_bf16_to_fp16(
+                d_mxfp4_route_gate.data(), d_mxfp4_route_act_fp16.data(),
+                static_cast<std::size_t>(routes) * I, stream);
+            // b_down is replicated across ranks, so only the leader adds it;
+            // the all-reduce below would otherwise sum it T times.
+            kernels::launch_mxfp4_moe_down_decode_bf16(
+                d_mxfp4_route_act_fp16.data(), d_topk_idx.data(),
+                layer.expert_down_packed_ptrs.data(),
+                layer.expert_down_scale_ptrs.data(),
+                tp_is_leader ? layer.expert_down_bias_ptrs.data() : nullptr,
+                d_mxfp4_route_out.data(), N, top_k, H, I, stream);
+            kernels::launch_token_batched_weighted_sum_bf16(
+                d_mxfp4_moe_out.data(), d_mxfp4_route_out.data(),
+                static_cast<const float*>(d_topk_w.data()),
+                N, top_k, H, stream);
+            if (T > 1) {
+                tp->all_reduce_bf16(d_mxfp4_moe_out.data(),
+                    static_cast<std::size_t>(N) * H, ncclSum, stream);
+            }
+            kernels::launch_residual_add_bf16(
+                ws.y.data(), d_mxfp4_moe_out.data(), N * H, stream);
+            continue;
+        }
 
         // 2. D2H copy of routing decisions; build per-expert lists.
         std::vector<std::int32_t> topk_idx_h(static_cast<std::size_t>(N) * top_k);
@@ -542,6 +659,31 @@ void mixtral_forward_paged(
         }
     }
 
+    if (!fwd_cfg.emit_logits) {
+        return;
+    }
+    // Compact logits: gather only the rows that will be sampled before the
+    // lm_head, instead of materializing [N, vocab]. Every other family already
+    // declares this; without it the batch engine hands the device-side sampler
+    // an empty row list and its descriptor channel is never produced.
+    const bool compact_logits =
+        logit_row_indices_d != nullptr && num_logit_rows > 0 &&
+        num_logit_rows < N;
+    const int lm_head_rows = compact_logits ? num_logit_rows : N;
+    if (compact_logits) {
+        kernels::launch_gather_bf16_rows(
+            static_cast<const std::uint16_t*>(ws.y.data()),
+            logit_row_indices_d,
+            static_cast<std::uint16_t*>(ws.norm_x.data()),
+            num_logit_rows, H, stream);
+        kernels::launch_rmsnorm_bf16(
+            ws.norm_x.data(), w.final_norm->data(), ws.norm_y.data(),
+            num_logit_rows, H, eps, stream);
+        ops::gemm_act_x_wt_bf16(cublas.handle(),
+            ws.norm_y.data(), w.lm_head->data(), ws.logits.data(),
+            lm_head_rows, V, H);
+        return;
+    }
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), w.final_norm->data(), ws.norm_x.data(),
         N, H, eps, stream);

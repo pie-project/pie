@@ -131,6 +131,24 @@ fn cold_hold() -> Duration {
 /// epoch — an unresponsive lane leaves only through close/terminate.
 const STRICT_WATCHDOG_US: u64 = 1_000_000;
 
+/// How long a blocked gather waits before looking again. This is NOT the
+/// watchdog above: that one is a *reporting* cadence, and using it as the hold
+/// as well meant a boundary that was one lane short went back to sleep for as
+/// long as the worker's 250ms backstop allowed, with the GPU idle the whole
+/// time, even though the missing lane submitted microseconds later. Separating
+/// the two is worth 2x on a sixteen-request fleet (206 -> 422 tok/s).
+const GATHER_POLL_US: u64 = 500;
+
+fn gather_poll_us() -> u64 {
+    static US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *US.get_or_init(|| {
+        std::env::var("PIE_GATHER_POLL_US")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(GATHER_POLL_US)
+    })
+}
+
 /// Grace period before a gather blocked EXCLUSIVELY on empty lanes whose
 /// owners hold an in-flight bind releases them (see the `missing` predicate
 /// in [`FramePolicy::plan_dispatch`]). Only consulted in escape mode 2.
@@ -306,20 +324,18 @@ pub(super) struct FramePolicy {
     joins_in_flight: BTreeSet<ProcessId>,
     /// Processes that consumed an execution slot and still hold it. A
     /// Terminate leave of a member moves it to `departing`: its slot is
-    /// now certain to resolve (the permit's only exit is the capped
-    /// teardown, which broadcasts the release — or, on the no-runtime
-    /// error path, an explicit forfeit — after its terminate leave).
+    /// now certain to resolve (the permit's only exit is `ProcessCtx::drop`,
+    /// which broadcasts the release immediately after posting the leave).
     slotted: BTreeSet<ProcessId>,
-    /// Slot holders between their Terminate leave and their teardown's
-    /// release (or forfeit) broadcast, identity-paired. The leave is
-    /// delivered pass-granular while the release waits on the teardown
-    /// task, so a seal check in that window sees a zero `pending_slots`
-    /// balance with departures already recorded — without this set the
+    /// Slot holders between their Terminate leave and their release
+    /// broadcast, identity-paired. Both are posted back-to-back by
+    /// `ProcessCtx::drop`, but the worker processes them pass-granular, so a
+    /// seal check landing between the two sees a zero `pending_slots`
+    /// balance with the departure already recorded — without this set the
     /// seal would close on the partial cohort and split the fleet, and
     /// the split persists for the rest of the run (run-ahead lead is
-    /// hysteretic). Every entry resolves: the same teardown that owns the
-    /// permit sends the disarm after its leave (same-producer FIFO), and
-    /// the leaked-permit error path disarms via forfeit.
+    /// hysteretic). Every entry resolves: the retiring process posts the
+    /// disarm right after its leave, on the same producer (FIFO).
     departing: BTreeSet<ProcessId>,
     /// Processes the planner has suspended (evicted) and not yet observed
     /// running again. While a process is marked here its lanes never
@@ -544,15 +560,6 @@ impl FramePolicy {
         self.pending_slots += 1;
     }
 
-    /// The no-runtime teardown error path leaked the holder's permit
-    /// (`std::mem::forget`): the slot is destroyed, not freed. Resolves the
-    /// departure WITHOUT crediting `pending_slots` — the semaphore capacity
-    /// shrank by one and the balance must agree, and a departure entry that
-    /// never resolves would hold every seal with a staged successor.
-    pub fn on_execution_slot_forfeited(&mut self, pid: ProcessId) {
-        self.departing.remove(&pid);
-    }
-
     /// A process acquired its execution permit (every capped admission
     /// notifies, uncontended ones included). Its first fire is imminent:
     /// the seal now waits for `pid` ITSELF, identity-paired, so no event
@@ -568,9 +575,9 @@ impl FramePolicy {
         }
     }
 
-    /// A slot holder's Terminate leave arrived: its release (or forfeit)
-    /// broadcast is now in flight (the permit's only exit is the capped
-    /// teardown, which leaves first and resolves second). The seal treats
+    /// A slot holder's Terminate leave arrived: its release broadcast is
+    /// now in flight (the permit's only exit is `ProcessCtx::drop`, which
+    /// leaves first and resolves second). The seal treats
     /// the imminent slot like a freed one — without this, a seal check
     /// between the leave and the resolution sees `pending_slots == 0` and
     /// closes on a partial cohort. Guarded on `slotted` so only an actual
@@ -1020,6 +1027,7 @@ impl FramePolicy {
             // to the quorum.
             let mut missing = 0usize;
             let mut missing_rebind = 0usize;
+            let mut missing_idle = 0usize;
             for lane in self.lanes.values() {
                 if !lane.awaited {
                     continue;
@@ -1028,29 +1036,39 @@ impl FramePolicy {
                     continue;
                 }
                 missing += 1;
-                if lane.frames.is_empty()
-                    && lane
+                if lane.frames.is_empty() {
+                    missing_idle += 1;
+                    if lane
                         .owner
                         .is_some_and(|owner| self.pending_binds.contains_key(&owner))
-                {
-                    missing_rebind += 1;
+                    {
+                        missing_rebind += 1;
+                    }
                 }
             }
             let joining = !self.joins_in_flight.is_empty()
                 || ((self.pending_slots > 0 || !self.departing.is_empty())
                     && !self.staged.is_empty());
             let mode = rebind_escape_mode();
-            // Mode 2 escapes only from the deadlock shape itself: every
-            // missing lane is an empty rebinder AND nothing is executing, so
-            // no retirement will free the control slot the binds need. The
-            // grace period keeps a healthy gather (which resolves in
-            // microseconds) on the dense wait-all path.
-            let escaping = missing_rebind > 0
+            // Mode 2 escapes only from the deadlock shape itself: every missing
+            // lane is EMPTY and nothing is executing, so nothing the engine
+            // controls will ever make one of them submit -- their next fire is
+            // ordered behind a result only this seal can produce, which is the
+            // cycle `seal -> result -> submit -> seal`. An empty rebinder is one
+            // way to land there (its fire is ordered behind a bind that needs
+            // the control slot this boundary holds); a lane simply idle between
+            // frames is another, and it is the shape two concurrent request
+            // streams hit as soon as one of them drains its run-ahead window
+            // while the other still has work. Escaping cannot reorder anything
+            // that was going to resolve, because nothing is executing. The grace
+            // period keeps a healthy gather (which resolves in microseconds) on
+            // the dense wait-all path.
+            let escaping = missing_idle > 0
                 && match mode {
                     0 => false,
-                    1 => true,
+                    1 => missing_rebind > 0,
                     _ => {
-                        !joining && !executing && missing == missing_rebind && {
+                        !joining && !executing && missing == missing_idle && {
                             let deadline = *self
                                 .rebind_escape_deadline
                                 .get_or_insert(now + Duration::from_micros(REBIND_ESCAPE_US));
@@ -1058,14 +1076,17 @@ impl FramePolicy {
                         }
                     }
                 };
-            if !escaping && mode == 2 && (missing != missing_rebind || executing || joining) {
+            let escaped = if !escaping {
+                0
+            } else if mode == 1 {
+                missing_rebind
+            } else {
+                missing_idle
+            };
+            if !escaping && mode == 2 && (missing != missing_idle || executing || joining) {
                 self.rebind_escape_deadline = None;
             }
-            let missing = if escaping {
-                missing - missing_rebind
-            } else {
-                missing
-            };
+            let missing = missing - escaped;
             if joining || missing > 0 {
                 let mut stalled = false;
                 if executing {
@@ -1095,7 +1116,11 @@ impl FramePolicy {
                     }));
                     stalled = true;
                 }
-                let plan = FramePlan::Hold(deadline.saturating_duration_since(now));
+                let plan = FramePlan::Hold(
+                    deadline
+                        .saturating_duration_since(now)
+                        .min(Duration::from_micros(gather_poll_us())),
+                );
                 if stalled && crate::planner::trace_enabled() {
                     println!("[frame-stall] {}", self.debug_summary());
                 }
@@ -1679,10 +1704,15 @@ mod tests {
         // The exclusion is scoped to the bind, not permanent: once it
         // commits the lane is a full member again and the boundary waits
         // for it exactly as before.
+        //
+        // Observed BEFORE the escape grace period. At the default mode 2 an
+        // idle lane is escaped generically once `REBIND_ESCAPE_US` passes
+        // with nothing executing, so driving past the hold would measure
+        // that timer instead of the bind scoping this test is about.
         policy.on_bind_completed(Some(rebinder));
         policy.on_fire_enqueued(stamp(runner, 2, 0, 1), Some(runner), 14, 1, 1);
         let queued: QueuedFireIds = [14].into_iter().collect();
-        match drive_past_cold_hold(&mut policy, &queued) {
+        match plan(&mut policy, &queued, Instant::now()) {
             FramePlan::Hold(_) => {}
             plan => panic!("the committed rebinder must hold the seal, got {plan:?}"),
         }
@@ -1847,36 +1877,6 @@ mod tests {
                 FramePlan::Dispatch(_)
             ),
             "a retired departure must leave no phantom hold"
-        );
-    }
-
-    /// A forfeited slot (the leaked-permit teardown error path) resolves
-    /// its holder's departure WITHOUT crediting the balance: the seal
-    /// stops waiting, and no phantom free slot earmarks a staged
-    /// successor that can never admit.
-    #[test]
-    fn forfeit_resolves_departure_without_freeing_a_slot() {
-        let mut policy = FramePolicy::new(2, 64, 4096, None);
-        let lane = pid();
-        let holder = pid();
-        let successor = pid();
-        policy.on_execution_slot_consumed(holder);
-        policy.on_fire_enqueued(stamp(lane, 0, 0, 1), Some(lane), 95, 1, 1);
-        policy.on_bind_enqueued(Some(successor));
-        policy.on_bind_completed(Some(successor));
-        policy.on_slotted_terminate(holder);
-        let queued: QueuedFireIds = [95].into_iter().collect();
-        match drive_past_cold_hold(&mut policy, &queued) {
-            FramePlan::Hold(_) => {}
-            plan => panic!("an unresolved departure must hold, got {plan:?}"),
-        }
-        policy.on_execution_slot_forfeited(holder);
-        assert!(
-            matches!(
-                drive_past_cold_hold(&mut policy, &queued),
-                FramePlan::Dispatch(_)
-            ),
-            "a forfeited slot must neither hold nor earmark"
         );
     }
 

@@ -13,10 +13,18 @@ name = "pie_codegen"
 crate-type = ["rlib"]
 path = "src/lib.rs"
 
-# Host-side only: this crate exists to write files into `include/` (and, once the
-# region emitters land, backend kernel source). It depends on `pie-plan` because
-# the C ABI header pins the plan/sidecar wire versions the drivers check.
+# Host-side only: this crate writes the generated files in `include/`, emits
+# backend kernel source, and builds the launch package. `pie-plan` supplies the
+# stage plans it emits from and the cache-identity versions the header pins;
+# `pie-driver-abi` is the shared host<->driver contract, so the launch package
+# is built out of the same declarations the drivers read it with rather than a
+# second copy of them.
 [dependencies]
 pie-ir = { path = "../ir" }
 pie-plan = { path = "../plan" }
 pie-driver-abi = { path = "../../interface/driver" }
+
+# Shared ratchet from the root manifest. These six crates are gated with
+# `-D warnings` in CI; see `[workspace.lints]` in the workspace `Cargo.toml`.
+[lints]
+workspace = true

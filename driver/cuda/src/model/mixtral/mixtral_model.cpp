@@ -13,7 +13,15 @@ MixtralModel::MixtralModel(MixtralWeights weights,
       hf_config_(hf_config),
       fwd_cfg_(fwd_cfg),
       num_experts_(num_experts),
-      top_k_(top_k) {}
+      top_k_(top_k) {
+    // The lm_head reads only the sampled rows; see `mixtral_forward_paged`.
+    caps_.supports_compact_logits = true;
+    // Every KV write is gated on `row_valid`, so padded rows from a
+    // device-composed descriptor set cannot touch the cache. This is what
+    // lets the family use device composition; CUDA-graph capture is a
+    // separate, stronger claim the host-side MoE routing cannot make.
+    caps_.graph_padding_kv_write_safe = true;
+}
 
 void MixtralModel::body(Workspace& ws,
                         KvCache& kv,
@@ -29,7 +37,9 @@ void MixtralModel::body(Workspace& ws,
         in.kv_page_indptr_d, in.kv_last_page_lens_d,
         in.qo_indptr_h, in.kv_page_indptr_h,
         in.total_tokens, in.num_requests, in.is_pure_decode,
-        in.custom_mask_d, in.custom_mask_indptr_d);
+        in.logit_row_indices_d, in.num_logit_rows,
+        in.custom_mask_d, in.custom_mask_indptr_d,
+        in.row_valid_d);
 }
 
 }  // namespace pie_cuda_driver::model

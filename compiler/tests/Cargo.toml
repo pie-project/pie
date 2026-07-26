@@ -6,13 +6,14 @@ description = "Conformance suite for the PTIR toolchain: golden traces, the malf
 license = "Apache-2.0"
 publish = false
 
-[lib]
-name = "pie_compiler_tests"
-path = "src/lib.rs"
-
 [dev-dependencies]
 pie-ir = { path = "../ir" }
 pie-plan = { path = "../plan" }
 pie-eval = { path = "../eval" }
 pie-codegen = { path = "../codegen" }
 pie-driver-abi = { path = "../../interface/driver" }
+
+# Shared ratchet from the root manifest. These six crates are gated with
+# `-D warnings` in CI; see `[workspace.lints]` in the workspace `Cargo.toml`.
+[lints]
+workspace = true

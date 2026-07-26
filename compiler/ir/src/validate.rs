@@ -10,15 +10,15 @@
 //! returns a [`BoundTrace`] — the validated, typed artifact the reference
 //! interpreter ([`super::interp`]) and the CUDA tiers execute.
 
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
 use super::container::{ChannelDecl, ExternDir, HostRole, PortSource, TraceContainer};
-use super::infer::{BodyCtx, BodyError, body_types};
-use super::op::{IntrinsicId, Op};
+use super::infer::{BodyCtx, BodyError, BodyErrorKind, body_types};
+use super::op::{ChannelUse, IntrinsicId, Op};
 use super::registry::{
-    KNOWN_SINKS, ModelProfile, Phase, Port, SinkScope, Stage, intrinsic_model_gated,
-    intrinsic_stages,
+    KNOWN_SINKS, ModelProfile, Phase, Port, SinkScope, Stage, intrinsic_available, intrinsic_stages,
 };
 use crate::types::{DType, Shape, ValueType};
 
@@ -288,13 +288,74 @@ impl fmt::Display for ValidateError {
 impl std::error::Error for ValidateError {}
 
 /// Program-side view of a channel's element type.
-pub fn channel_value_type(decl: &ChannelDecl) -> ValueType {
+pub(crate) fn channel_value_type(decl: &ChannelDecl) -> ValueType {
     ValueType::new(decl.shape, decl.dtype.program_dtype())
 }
 
 /// Validate a container against a profile; returns the typed, bound trace.
 pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTrace, ValidateError> {
-    // ── container-level structure ────────────────────────────────────────
+    // One pass per rule group, in the order the rules depend on each other.
+    // The order is not cosmetic: `check_spsc_endpoints` reads a channel decl by
+    // the index an op carries, and `check_bodies` is what proved that index is
+    // in range. That used to be a bare `container.channels[chan as usize]`
+    // three hundred lines below the check that made it safe, with nothing
+    // saying so; the accessor it uses now returns the same error `check_bodies`
+    // would have, so a reordering is a wrong *message*, not a panic on decoded
+    // bytes.
+    check_structure(&container)?;
+    check_externs(&container)?;
+    let channel_types: Vec<ValueType> = container.channels.iter().map(channel_value_type).collect();
+    let stage_types = check_bodies(&container, &channel_types)?;
+    check_intrinsics(&container, &profile)?;
+    check_second_party_names(&container, &profile)?;
+    check_spsc_endpoints(&container)?;
+
+    let readiness = readiness_table(&container);
+    let classes = classify_channels(&container, &readiness);
+
+    let hash = container.hash();
+    Ok(BoundTrace {
+        container,
+        profile,
+        hash,
+        channel_types,
+        stage_types,
+        readiness,
+        classes,
+    })
+}
+
+/// The channel decl an op names, or the error [`check_bodies`] would have
+/// raised for it.
+///
+/// Every caller runs after [`check_bodies`], so the `None` arm is unreachable —
+/// but it is the arm that used to be a raw index, and "unreachable because a
+/// different function ran first" is not something the reader of a slice index
+/// can see. Total instead, at the cost of one `match`.
+fn channel_decl(
+    container: &TraceContainer,
+    chan: u32,
+    stage: Stage,
+    op_index: u32,
+) -> Result<&ChannelDecl, ValidateError> {
+    container
+        .channels
+        .get(chan as usize)
+        .ok_or(ValidateError::Body {
+            stage,
+            err: BodyError {
+                op_index,
+                kind: BodyErrorKind::ChannelOutOfRange(chan),
+            },
+        })
+}
+
+/// Container-level shape: sorted/unique tables, non-zero capacities, port
+/// sources in range, and the geometry ports `embed_tokens` implies.
+///
+/// Establishes that every `PortSource::Channel` index is in range, which
+/// [`check_spsc_endpoints`] relies on.
+fn check_structure(container: &TraceContainer) -> Result<(), ValidateError> {
     if container.names.windows(2).any(|names| names[0] >= names[1]) {
         return Err(ValidateError::NamesUnsortedOrDuplicate);
     }
@@ -362,8 +423,12 @@ pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTra
             }
         }
     }
+    Ok(())
+}
 
-    // ── v1.1 extern channels: structure + decl constraints ──────────────
+/// v1.1 extern channels: sorted and unique, and each one declared in a way that
+/// leaves the endpoint free for its peer.
+fn check_externs(container: &TraceContainer) -> Result<(), ValidateError> {
     for w in container.externs.windows(2) {
         if w[0].chan >= w[1].chan {
             return Err(ValidateError::ExternsUnsortedOrDup);
@@ -380,11 +445,19 @@ pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTra
             return Err(ValidateError::ExternNameOutOfRange { chan: e.chan });
         }
     }
+    Ok(())
+}
 
-    // ── per-stage bodies: SSA + shape/dtype ──────────────────────────────
-    let channel_types: Vec<ValueType> = container.channels.iter().map(channel_value_type).collect();
+/// Per-stage bodies: SSA numbering, shapes and dtypes.
+///
+/// Establishes that every channel and name index an op carries is in range —
+/// the precondition the passes below are written against.
+fn check_bodies(
+    container: &TraceContainer,
+    channel_types: &[ValueType],
+) -> Result<Vec<Vec<ValueType>>, ValidateError> {
     let ctx = BodyCtx {
-        channel_types: &channel_types,
+        channel_types,
         n_names: container.names.len() as u16,
     };
     let mut stage_types = Vec::with_capacity(container.stages.len());
@@ -395,8 +468,14 @@ pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTra
         })?;
         stage_types.push(types);
     }
+    Ok(stage_types)
+}
 
-    // ── intrinsics: stage scope, model gating, registry type rules ──────
+/// Intrinsics: stage scope, model gating, and the registry's type rules.
+fn check_intrinsics(
+    container: &TraceContainer,
+    profile: &ModelProfile,
+) -> Result<(), ValidateError> {
     for sp in &container.stages {
         for op in &sp.ops {
             if let Op::IntrinsicVal { intr, shape, dtype } = *op {
@@ -406,19 +485,10 @@ pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTra
                         stage: sp.stage,
                     });
                 }
-                if intrinsic_model_gated(intr) {
-                    let ok = match intr {
-                        IntrinsicId::MtpLogits => profile.has_mtp_logits,
-                        IntrinsicId::MtpDrafts => profile.has_mtp_drafts,
-                        IntrinsicId::AttnScore => profile.has_attn_score,
-                        IntrinsicId::ValueHead => profile.has_value_head,
-                        _ => true,
-                    };
-                    if !ok {
-                        return Err(ValidateError::IntrinsicUnavailable { intr });
-                    }
+                if !intrinsic_available(intr, profile) {
+                    return Err(ValidateError::IntrinsicUnavailable { intr });
                 }
-                if !intrinsic_type_ok(intr, shape, dtype, &profile) {
+                if !intrinsic_type_ok(intr, shape, dtype, profile) {
                     return Err(ValidateError::IntrinsicTypeRule {
                         intr,
                         stage: sp.stage,
@@ -427,19 +497,29 @@ pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTra
             }
         }
     }
+    Ok(())
+}
 
-    // ── second-party names: availability, T10, sink/kernel kind + T11 ───
+/// Second-party names: availability, T10 replayability, and the sink/kernel
+/// kind and placement rules (T11).
+///
+/// Runs after [`check_bodies`], which is what puts every `name` index in range.
+fn check_second_party_names(
+    container: &TraceContainer,
+    profile: &ModelProfile,
+) -> Result<(), ValidateError> {
     for sp in &container.stages {
         for op in &sp.ops {
             match op {
                 Op::KernelCall { name, .. } => {
-                    let n = resolve_name(&container, *name);
-                    let info = profile
-                        .kernel(n)
-                        .ok_or_else(|| ValidateError::KernelUnavailable {
-                            name_index: *name,
-                            name: n.into(),
-                        })?;
+                    let n = resolve_name(container, *name);
+                    let info =
+                        profile
+                            .kernel(n)
+                            .ok_or_else(|| ValidateError::KernelUnavailable {
+                                name_index: *name,
+                                name: n.into(),
+                            })?;
                     if info.sink_scope.is_some() {
                         return Err(ValidateError::SinkKernelKindMismatch {
                             name_index: *name,
@@ -454,7 +534,7 @@ pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTra
                     }
                 }
                 Op::SinkCall { name, .. } => {
-                    let n = resolve_name(&container, *name);
+                    let n = resolve_name(container, *name);
                     // First-party sinks have spec-owned scopes; second-party
                     // sinks come from the profile.
                     // A first-party sink name always type-checks, so the
@@ -479,12 +559,12 @@ pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTra
                         Some(s) => s,
                         None => {
                             // Unknown name: available? (bind-time rule)
-                            let info = profile
-                                .kernel(n)
-                                .ok_or_else(|| ValidateError::KernelUnavailable {
-                            name_index: *name,
-                            name: n.into(),
-                        })?;
+                            let info = profile.kernel(n).ok_or_else(|| {
+                                ValidateError::KernelUnavailable {
+                                    name_index: *name,
+                                    name: n.into(),
+                                }
+                            })?;
                             match info.sink_scope {
                                 Some(s) => s,
                                 None => {
@@ -515,8 +595,15 @@ pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTra
             }
         }
     }
+    Ok(())
+}
 
-    // ── SPSC endpoints (T2; v1.1 extends across the extern pair) ─────────
+/// SPSC endpoints (T2), extended across the extern pair in v1.1: at most one
+/// producer and one consumer per channel, counting the host role and the
+/// descriptor ports as endpoints.
+///
+/// Runs after [`check_structure`] and [`check_bodies`]; see [`channel_decl`].
+fn check_spsc_endpoints(container: &TraceContainer) -> Result<(), ValidateError> {
     let extern_dir = |chan: u32| -> Option<ExternDir> {
         container
             .externs
@@ -525,87 +612,66 @@ pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTra
             .map(|e| e.dir)
     };
     for sp in &container.stages {
-        for op in &sp.ops {
-            match *op {
-                Op::ChanPut { chan, .. } => {
-                    if container.channels[chan as usize].host_role == HostRole::Writer {
-                        return Err(ValidateError::SecondProducer {
-                            chan,
-                            stage: sp.stage,
-                        });
+        for (op_index, op) in sp.ops.iter().enumerate() {
+            let Some((use_, chan)) = op.channel_use() else {
+                continue;
+            };
+            // Which endpoint a local op occupies, and therefore which peer it
+            // would be a second copy of.
+            let (local_role, peer_dir) = match use_ {
+                ChannelUse::Put => (HostRole::Writer, ExternDir::Import),
+                // A non-consuming read still occupies the consumer endpoint.
+                ChannelUse::Take | ChannelUse::Read => (HostRole::Reader, ExternDir::Export),
+            };
+            let decl = channel_decl(container, chan, sp.stage, op_index as u32)?;
+            if decl.host_role == local_role {
+                return Err(if use_ == ChannelUse::Put {
+                    ValidateError::SecondProducer {
+                        chan,
+                        stage: sp.stage,
                     }
-                    if extern_dir(chan) == Some(ExternDir::Import) {
-                        // The peer instance is the producer — a local put is a
-                        // second producer endpoint.
-                        return Err(ValidateError::ExternDirViolation {
-                            chan,
-                            stage: sp.stage,
-                        });
+                } else {
+                    ValidateError::SecondConsumer {
+                        chan,
+                        stage: sp.stage,
                     }
-                }
-                Op::ChanTake(chan) | Op::ChanRead(chan) => {
-                    if container.channels[chan as usize].host_role == HostRole::Reader {
-                        return Err(ValidateError::SecondConsumer {
-                            chan,
-                            stage: sp.stage,
-                        });
-                    }
-                    if extern_dir(chan) == Some(ExternDir::Export) {
-                        // The peer instance is the consumer — a local take/read
-                        // is a second consumer endpoint.
-                        return Err(ValidateError::ExternDirViolation {
-                            chan,
-                            stage: sp.stage,
-                        });
-                    }
-                }
-                _ => {}
+                });
+            }
+            if extern_dir(chan) == Some(peer_dir) {
+                return Err(ValidateError::ExternDirViolation {
+                    chan,
+                    stage: sp.stage,
+                });
             }
         }
     }
     // Ports consume too: an Export channel bound to a port would make this
     // pass a second consumer of its own export.
     for p in &container.ports {
-        if let PortSource::Channel(c) = p.source {
-            if extern_dir(c) == Some(ExternDir::Export) {
-                return Err(ValidateError::ExternDirViolation {
-                    chan: c,
-                    stage: Stage::Prologue,
-                });
-            }
+        if let PortSource::Channel(c) = p.source
+            && extern_dir(c) == Some(ExternDir::Export)
+        {
+            return Err(ValidateError::ExternDirViolation {
+                chan: c,
+                stage: Stage::Prologue,
+            });
         }
     }
     // Ports are pass-side consumers too.
     for p in &container.ports {
-        if let PortSource::Channel(c) = p.source {
-            if container.channels[c as usize].host_role == HostRole::Reader {
-                // Attribute to the descriptor; report with the epilogue tag
-                // absent a stage — use Prologue? Keep a dedicated message via
-                // SecondConsumer with the earliest stage marker.
-                return Err(ValidateError::SecondConsumer {
-                    chan: c,
-                    stage: Stage::Prologue,
-                });
-            }
+        if let PortSource::Channel(c) = p.source
+            && channel_decl(container, c, Stage::Prologue, 0)?.host_role == HostRole::Reader
+        {
+            // Attribute to the descriptor; report with the epilogue tag
+            // absent a stage — use Prologue? Keep a dedicated message via
+            // SecondConsumer with the earliest stage marker.
+            return Err(ValidateError::SecondConsumer {
+                chan: c,
+                stage: Stage::Prologue,
+            });
         }
     }
-
-    // ── readiness: per-channel first-op direction (§7.1) ─────────────────
-    let readiness = readiness_table(&container);
-
-    // ── §7.1 channel classes ─────────────────────────────────────────────
-    let classes = classify_channels(&container, &readiness);
-
-    let hash = container.hash();
-    Ok(BoundTrace {
-        container,
-        profile,
-        hash,
-        channel_types,
-        stage_types,
-        readiness,
-        classes,
-    })
+    Ok(())
 }
 
 fn resolve_name(c: &TraceContainer, idx: u16) -> &str {
@@ -645,7 +711,7 @@ fn intrinsic_type_ok(
 /// Walk the pass's phases in execution order (prologue → descriptor →
 /// attn-proj → attn → epilogue) and record, per channel, the FIRST op's
 /// required bit. Take/read ⇒ full; put ⇒ empty (§7.1).
-pub fn readiness_table(c: &TraceContainer) -> Vec<ReadinessEntry> {
+pub(crate) fn readiness_table(c: &TraceContainer) -> Vec<ReadinessEntry> {
     let mut seen: Vec<bool> = alloc::vec![false; c.channels.len()];
     let mut out = Vec::new();
     let mut visit = |chan: u32, phase: Phase, dir: Direction, seen: &mut Vec<bool>| {
@@ -675,14 +741,12 @@ pub fn readiness_table(c: &TraceContainer) -> Vec<ReadinessEntry> {
                 };
                 if let Some(sp) = stage_prog(stage) {
                     for op in &sp.ops {
-                        match *op {
-                            Op::ChanTake(chan) | Op::ChanRead(chan) => {
-                                visit(chan, phase, Direction::NeedsFull, &mut seen)
-                            }
-                            Op::ChanPut { chan, .. } => {
-                                visit(chan, phase, Direction::NeedsEmpty, &mut seen)
-                            }
-                            _ => {}
+                        if let Some((use_, chan)) = op.channel_use() {
+                            let direction = match use_ {
+                                ChannelUse::Take | ChannelUse::Read => Direction::NeedsFull,
+                                ChannelUse::Put => Direction::NeedsEmpty,
+                            };
+                            visit(chan, phase, direction, &mut seen);
                         }
                     }
                 }
@@ -701,7 +765,7 @@ pub fn readiness_table(c: &TraceContainer) -> Vec<ReadinessEntry> {
 /// A stage is *fallible* here when it owns the first op of a host-coupled
 /// channel (a late host edge — the only readiness fire time cannot settle;
 /// §7.1). The descriptor phase inherits fallibility from host-fed ports.
-pub fn classify_channels(c: &TraceContainer, readiness: &[ReadinessEntry]) -> Vec<ChannelClass> {
+pub(crate) fn classify_channels(c: &TraceContainer, readiness: &[ReadinessEntry]) -> Vec<ChannelClass> {
     // Fallible phases: first-use of a host-coupled OR extern channel (an
     // extern edge crosses pipelines — fire time cannot settle it, like a
     // late host edge; §7.1).
@@ -730,21 +794,27 @@ pub fn classify_channels(c: &TraceContainer, readiness: &[ReadinessEntry]) -> Ve
         for (si, sp) in c.stages.iter().enumerate() {
             let mut next_id = 0u32;
             for (oi, op) in sp.ops.iter().enumerate() {
-                match *op {
-                    Op::ChanTake(ch) if ch == ci => {
-                        if take.is_some() {
-                            extra = true;
+                if let Some((use_, ch)) = op.channel_use()
+                    && ch == ci
+                {
+                    match use_ {
+                        ChannelUse::Take => {
+                            if take.is_some() {
+                                extra = true;
+                            }
+                            take = Some((si, oi, next_id));
                         }
-                        take = Some((si, oi, next_id));
-                    }
-                    Op::ChanRead(ch) if ch == ci => extra = true,
-                    Op::ChanPut { chan, value } if chan == ci => {
-                        if put.is_some() {
-                            extra = true;
+                        // A peek is a second reader, so never linear.
+                        ChannelUse::Read => extra = true,
+                        ChannelUse::Put => {
+                            if put.is_some() {
+                                extra = true;
+                            }
+                            if let Op::ChanPut { value, .. } = *op {
+                                put = Some((si, oi, value));
+                            }
                         }
-                        put = Some((si, oi, value));
                     }
-                    _ => {}
                 }
                 next_id += op.result_count();
             }
@@ -811,548 +881,76 @@ pub fn classify_channels(c: &TraceContainer, readiness: &[ReadinessEntry]) -> Ve
 
 #[cfg(test)]
 mod tests {
+    //! The one check that has to see inside.
+    //!
+    //! Everything reachable through [`bind`] is tested from outside, in
+    //! `tests/validate.rs`. This stays here because it calls a pass directly,
+    //! which is the whole point of it.
+
     use super::*;
     use crate::container::{ChanDType, ChannelDecl, PortBinding, StageProgram};
-    use crate::types::Literal;
-    use alloc::string::ToString;
     use alloc::vec;
 
-    fn chan(shape: Shape, dtype: DType, host_role: HostRole, seeded: bool) -> ChannelDecl {
-        ChannelDecl {
-            shape,
-            dtype: ChanDType::Concrete(dtype),
-            capacity: 1,
-            host_role,
-            seeded,
-        }
-    }
-
-    fn u32_port(port: Port, shape: Shape, values: &[u32]) -> PortBinding {
-        PortBinding {
-            port,
-            source: PortSource::Const {
-                dtype: DType::U32,
-                shape,
-                data: values
-                    .iter()
-                    .flat_map(|value| value.to_le_bytes())
-                    .collect(),
-            },
-        }
-    }
-
-    /// The overview §3 shape: tok (loop), out (host-read), mask (host-fed,
-    /// bool), len (counter), rng (state) + greedy-gumbel epilogue.
-    fn section3() -> TraceContainer {
-        let vocab = 32u32;
-        let channels = vec![
-            chan(Shape::vector(1), DType::I32, HostRole::None, true), // 0 tok
-            chan(Shape::vector(1), DType::I32, HostRole::Reader, false), // 1 out
-            chan(Shape::vector(vocab), DType::Bool, HostRole::Writer, false), // 2 mask
-            chan(Shape::vector(1), DType::U32, HostRole::None, true), // 3 len
-            chan(Shape::vector(2), DType::U32, HostRole::None, true), // 4 rng
-        ];
-        let mut ops: Vec<Op> = vec![
-            Op::IntrinsicVal {
-                intr: IntrinsicId::Logits,
-                shape: Shape::matrix(1, vocab),
-                dtype: DType::F32,
-            }, // 0
-            Op::Reshape {
-                value: 0,
-                shape: Shape::vector(vocab),
-            }, // 1
-            Op::ChanTake(4), // 2 r = rng.take()
-            Op::ChanTake(2), // 3 m = mask.take()
-        ];
-        let g = crate::expand::gumbel(&mut ops, 2, Shape::vector(vocab)); // 4
-        let masked = crate::expand::mask_apply(&mut ops, 1, 3); // 5,6
-        let sum = crate::expand::next_id(&ops);
-        ops.push(Op::Add(masked, g)); // sum
-        ops.push(Op::ReduceArgmax(sum)); // t = sum+1
-        let t = sum + 1;
-        // rng.put(add(r, CTR1)) — CTR1 = [0,1] not expressible as a scalar
-        // const; use iota(2) (=[0,1]) as the counter increment.
-        ops.push(Op::Iota { len: 2 }); // t+1
-        ops.push(Op::Cast {
-            value: t + 1,
-            dtype: DType::U32,
-        }); // t+2 (identity; keeps ids readable)
-        ops.push(Op::Add(2, t + 2)); // t+3
-        ops.push(Op::ChanPut {
-            chan: 4,
-            value: t + 3,
-        });
-        // tok.put(t) — argmax over [vocab] gives scalar; reshape to [1].
-        ops.push(Op::Reshape {
-            value: t,
-            shape: Shape::vector(1),
-        }); // t+4
-        ops.push(Op::ChanPut {
-            chan: 0,
-            value: t + 4,
-        });
-        // len.put(len.take() + 1)
-        ops.push(Op::ChanTake(3)); // t+5
-        ops.push(Op::Const(Literal::U32(1))); // t+6
-        ops.push(Op::Add(t + 5, t + 6)); // t+7
-        ops.push(Op::ChanPut {
-            chan: 3,
-            value: t + 7,
-        });
-        // out.put(t)
-        ops.push(Op::ChanPut {
-            chan: 1,
-            value: t + 4,
-        });
-
-        TraceContainer {
+    /// A `ChanPut` naming a channel that does not exist.
+    ///
+    /// `check_bodies` rejects it, so `check_spsc_endpoints` never sees one in
+    /// production. This asks for the other half: that the pass which *would*
+    /// have indexed the table blind also answers, and answers the same thing.
+    /// Before the split that was `container.channels[chan as usize]` three
+    /// hundred lines below the check that made it safe — a panic waiting on
+    /// whoever moved the blocks around.
+    #[test]
+    fn a_pass_that_runs_second_still_answers_when_run_first() {
+        let mut container = TraceContainer {
             names: vec![],
-            channels,
-            ports: vec![
-                PortBinding {
-                    port: Port::EmbedTokens,
-                    source: PortSource::Channel(0),
-                },
-                PortBinding {
-                    port: Port::EmbedIndptr,
-                    source: PortSource::Const {
-                        dtype: DType::U32,
-                        shape: Shape::vector(2),
-                        data: [0u32, 1].iter().flat_map(|v| v.to_le_bytes()).collect(),
-                    },
-                },
-                u32_port(Port::Positions, Shape::vector(1), &[0]),
-                u32_port(Port::Pages, Shape::vector(1), &[0]),
-                u32_port(Port::PageIndptr, Shape::vector(2), &[0, 1]),
-                PortBinding {
-                    port: Port::KvLen,
-                    source: PortSource::Channel(3),
-                },
-                u32_port(Port::WSlot, Shape::vector(1), &[0]),
-                u32_port(Port::WOff, Shape::vector(1), &[0]),
-            ],
-            stages: vec![StageProgram {
-                stage: Stage::Epilogue,
-                ops,
+            channels: vec![ChannelDecl {
+                shape: Shape::vector(1),
+                dtype: ChanDType::Concrete(DType::I32),
+                capacity: 1,
+                host_role: HostRole::None,
+                seeded: true,
             }],
-            externs: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn section3_binds_and_hashes_stably() {
-        let c = section3();
-        let h1 = c.hash();
-        let bound = bind(c.clone(), ModelProfile::dummy()).expect("bind");
-        assert_eq!(bound.hash, h1);
-        assert_eq!(bind(c, ModelProfile::dummy()).unwrap().hash, h1);
-    }
-
-    #[test]
-    fn embed_tokens_requires_kv_len() {
-        let mut c = section3();
-        c.ports.retain(|binding| binding.port != Port::KvLen);
-        assert!(matches!(
-            bind(c, ModelProfile::dummy()),
-            Err(ValidateError::EmbedTokensWithoutKvLen)
-        ));
-    }
-
-    #[test]
-    fn embed_tokens_requires_complete_geometry() {
-        let mut c = section3();
-        c.ports.retain(|binding| binding.port != Port::Pages);
-        assert!(matches!(
-            bind(c, ModelProfile::dummy()),
-            Err(ValidateError::EmbedTokensWithoutGeometry { port: Port::Pages })
-        ));
-    }
-
-    #[test]
-    fn section3_readiness_table() {
-        let c = section3();
-        let b = bind(c, ModelProfile::dummy()).unwrap();
-        // tok: first op = descriptor take (embed) → NeedsFull @ Descriptor.
-        // out: first op = epilogue put → NeedsEmpty (back-pressure).
-        // mask: epilogue take → NeedsFull. len: descriptor peek → NeedsFull.
-        // rng: epilogue take → NeedsFull.
-        let get = |ch: u32| b.readiness.iter().find(|e| e.chan == ch).copied().unwrap();
-        assert_eq!(get(0).phase, Phase::Descriptor);
-        assert_eq!(get(0).dir, Direction::NeedsFull);
-        assert_eq!(get(1).dir, Direction::NeedsEmpty);
-        assert_eq!(get(1).phase, Phase::Epilogue);
-        assert_eq!(get(2).dir, Direction::NeedsFull);
-        assert_eq!(get(3).phase, Phase::Descriptor);
-        assert_eq!(get(4).dir, Direction::NeedsFull);
-    }
-
-    #[test]
-    fn section3_channel_classes() {
-        let c = section3();
-        let b = bind(c, ModelProfile::dummy()).unwrap();
-        // tok: taken by descriptor (embed) + put by epilogue → not linear in
-        // one stage → FullRing. out/mask host-visible → FullRing.
-        // len: descriptor peek + epilogue take→put → extra consumer → FullRing.
-        // rng: pure epilogue take→put ping-pong, epilogue is last stage and
-        // the epilogue itself is the only fallible stage (mask) → InPlace.
-        assert_eq!(b.classes[0], ChannelClass::FullRing);
-        assert_eq!(b.classes[1], ChannelClass::FullRing);
-        assert_eq!(b.classes[2], ChannelClass::FullRing);
-        assert_eq!(b.classes[3], ChannelClass::FullRing);
-        assert_eq!(b.classes[4], ChannelClass::InPlace);
-    }
-
-    #[test]
-    fn spsc_second_producer_rejected() {
-        let mut c = section3();
-        // Host writes `mask` (chan 2); a stage put to it is a bind error.
-        c.stages[0].ops.push(Op::Const(Literal::Bool(true)));
-        let id = crate::expand::next_id(&c.stages[0].ops) - 1;
-        c.stages[0].ops.push(Op::Broadcast {
-            value: id,
-            shape: Shape::vector(32),
-        });
-        c.stages[0].ops.push(Op::ChanPut {
-            chan: 2,
-            value: id + 1,
-        });
-        assert!(matches!(
-            bind(c, ModelProfile::dummy()),
-            Err(ValidateError::SecondProducer { chan: 2, .. })
-        ));
-    }
-
-    #[test]
-    fn spsc_second_consumer_rejected() {
-        let mut c = section3();
-        // Host reads `out` (chan 1); a stage read of it is a bind error.
-        c.stages[0].ops.push(Op::ChanRead(1));
-        assert!(matches!(
-            bind(c, ModelProfile::dummy()),
-            Err(ValidateError::SecondConsumer { chan: 1, .. })
-        ));
-    }
-
-    #[test]
-    fn sink_precedence_t11() {
-        let mut profile = ModelProfile::dummy();
-        profile.kernels.push(crate::registry::KernelInfo {
-            name: "lora".to_string(),
-            sink_scope: Some(SinkScope::PassWide),
-            replayable: true,
-        });
-        // lora (pass-wide) in the prologue: OK.
-        let mk = |stage: Stage| TraceContainer {
-            names: vec!["lora".to_string()],
-            channels: vec![chan(Shape::vector(4), DType::F32, HostRole::None, true)],
-            ports: vec![],
-            stages: vec![StageProgram {
-                stage,
-                ops: vec![
-                    Op::ChanRead(0),
-                    Op::SinkCall {
-                        name: 0,
-                        args: vec![0],
-                    },
-                ],
-            }],
-            externs: alloc::vec::Vec::new(),
-        };
-        assert!(bind(mk(Stage::Prologue), profile.clone()).is_ok());
-        // lora at the epilogue: nothing after it consumes → T11 error.
-        assert!(matches!(
-            bind(mk(Stage::Epilogue), profile),
-            Err(ValidateError::SinkMisplaced { .. })
-        ));
-        // attn_page_mask allowed at attn-proj (that layer)…
-        let apm = TraceContainer {
-            names: vec!["attn_page_mask".to_string()],
-            channels: vec![chan(Shape::vector(4), DType::F32, HostRole::None, true)],
-            ports: vec![],
-            stages: vec![StageProgram {
-                stage: Stage::OnAttnProj,
-                ops: vec![
-                    Op::ChanRead(0),
-                    Op::PivotThreshold {
-                        input: 0,
-                        predicate: crate::types::Predicate::ProbGe(1),
-                    },
-                    Op::SinkCall {
-                        name: 0,
-                        args: vec![2],
-                    },
-                ],
-            }],
-            externs: alloc::vec::Vec::new(),
-        };
-        // needs a threshold operand: insert const before pivot — rebuild:
-        let apm = {
-            let mut c = apm;
-            c.stages[0].ops = vec![
-                Op::ChanRead(0),              // 0
-                Op::Const(Literal::F32(0.5)), // 1
-                Op::PivotThreshold {
-                    input: 0,
-                    predicate: crate::types::Predicate::ProbGe(1),
-                }, // 2
-                Op::SinkCall {
-                    name: 0,
-                    args: vec![2],
-                },
-            ];
-            c
-        };
-        assert!(bind(apm.clone(), ModelProfile::dummy()).is_ok());
-        // …but not at on_attn (post-attention).
-        let mut late = apm;
-        late.stages[0].stage = Stage::OnAttn;
-        assert!(matches!(
-            bind(late, ModelProfile::dummy()),
-            Err(ValidateError::SinkMisplaced { .. })
-        ));
-    }
-
-    #[test]
-    fn t10_non_replayable_kernel_rejected() {
-        let mut profile = ModelProfile::dummy();
-        profile.kernels.push(crate::registry::KernelInfo {
-            name: "gpu_load".to_string(),
-            sink_scope: None,
-            replayable: false,
-        });
-        let c = TraceContainer {
-            names: vec!["gpu_load".to_string()],
-            channels: vec![chan(Shape::vector(1), DType::F32, HostRole::None, true)],
-            ports: vec![],
-            stages: vec![StageProgram {
-                stage: Stage::Epilogue,
-                ops: vec![
-                    Op::KernelCall {
-                        name: 0,
-                        args: vec![],
-                        shape: Shape::vector(1),
-                        dtype: DType::F32,
-                    },
-                    Op::ChanTake(0),
-                    Op::Add(0, 1),
-                    Op::ChanPut { chan: 0, value: 2 },
-                ],
-            }],
-            externs: alloc::vec::Vec::new(),
-        };
-        // The resolved name, not just the index, is what makes this diagnosable
-        // by an operator who has a container but not its name table.
-        assert!(matches!(
-            bind(c, profile),
-            Err(ValidateError::NotReplayable { name_index: 0, ref name })
-                if name == "gpu_load"
-        ));
-    }
-
-    #[test]
-    fn model_gated_intrinsic_rejected_when_absent() {
-        let mut profile = ModelProfile::dummy();
-        profile.has_mtp_logits = false;
-        let c = TraceContainer {
-            names: vec![],
-            channels: vec![chan(Shape::vector(4), DType::I32, HostRole::Reader, false)],
-            ports: vec![],
-            stages: vec![StageProgram {
-                stage: Stage::Epilogue,
-                ops: vec![
-                    Op::IntrinsicVal {
-                        intr: IntrinsicId::MtpLogits,
-                        shape: Shape::matrix(4, 32),
-                        dtype: DType::F32,
-                    },
-                    Op::ReduceArgmax(0),
-                    Op::ChanPut { chan: 0, value: 1 },
-                ],
-            }],
-            externs: alloc::vec::Vec::new(),
-        };
-        assert!(matches!(
-            bind(c, profile),
-            Err(ValidateError::IntrinsicUnavailable {
-                intr: IntrinsicId::MtpLogits
-            })
-        ));
-    }
-
-    #[test]
-    fn intrinsic_stage_scope_enforced() {
-        // logits at the prologue is out of scope.
-        let c = TraceContainer {
-            names: vec![],
-            channels: vec![chan(Shape::vector(1), DType::I32, HostRole::Reader, false)],
             ports: vec![],
             stages: vec![StageProgram {
                 stage: Stage::Prologue,
-                ops: vec![
-                    Op::IntrinsicVal {
-                        intr: IntrinsicId::Logits,
-                        shape: Shape::matrix(1, 32),
-                        dtype: DType::F32,
-                    },
-                    Op::ReduceArgmax(0),
-                    Op::ChanPut { chan: 0, value: 1 },
-                ],
+                ops: vec![Op::Iota { len: 1 }, Op::ChanPut { chan: 7, value: 0 }],
             }],
-            externs: alloc::vec::Vec::new(),
+            externs: vec![],
         };
-        assert!(matches!(
-            bind(c, ModelProfile::dummy()),
-            Err(ValidateError::IntrinsicWrongStage {
-                intr: IntrinsicId::Logits,
-                stage: Stage::Prologue
-            })
-        ));
-    }
 
-    /// `attn_score` only exists after the layer's attention has run, so
-    /// `OnAttnProj` — which fires *before* it — must be rejected. Accepting it
-    /// there would hand a policy the previous layer's scores (or an unwritten
-    /// buffer) with no diagnostic.
-    #[test]
-    fn attn_score_rejected_before_attention_runs() {
-        let c = TraceContainer {
-            names: vec![],
-            channels: vec![chan(Shape::SCALAR, DType::I32, HostRole::Reader, false)],
-            ports: vec![],
-            stages: vec![StageProgram {
-                stage: Stage::OnAttnProj,
-                ops: vec![
-                    Op::IntrinsicVal {
-                        intr: IntrinsicId::AttnScore,
-                        shape: Shape::vector(32),
-                        dtype: DType::F32,
-                    },
-                    Op::ReduceArgmax(0),
-                    Op::ChanPut { chan: 0, value: 1 },
-                ],
-            }],
-            externs: alloc::vec::Vec::new(),
-        };
-        assert!(matches!(
-            bind(c, ModelProfile::dummy()),
-            Err(ValidateError::IntrinsicWrongStage {
-                intr: IntrinsicId::AttnScore,
-                stage: Stage::OnAttnProj
-            })
-        ));
-    }
-
-    #[test]
-    fn attn_score_accepted_at_on_attn() {
-        let c = TraceContainer {
-            names: vec![],
-            channels: vec![chan(Shape::SCALAR, DType::I32, HostRole::Reader, false)],
-            ports: vec![],
-            stages: vec![StageProgram {
-                stage: Stage::OnAttn,
-                ops: vec![
-                    Op::IntrinsicVal {
-                        intr: IntrinsicId::AttnScore,
-                        shape: Shape::vector(32),
-                        dtype: DType::F32,
-                    },
-                    Op::ReduceArgmax(0),
-                    Op::ChanPut { chan: 0, value: 1 },
-                ],
-            }],
-            externs: alloc::vec::Vec::new(),
-        };
-        assert!(bind(c, ModelProfile::dummy()).is_ok());
-    }
-
-    /// A driver without the capture path must make the program fail at BIND.
-    /// The buffer is otherwise simply never written, and a policy reading it
-    /// would silently rank on garbage.
-    #[test]
-    fn attn_score_rejected_when_driver_lacks_capture() {
-        let mut profile = ModelProfile::dummy();
-        profile.has_attn_score = false;
-        let c = TraceContainer {
-            names: vec![],
-            channels: vec![chan(Shape::SCALAR, DType::I32, HostRole::Reader, false)],
-            ports: vec![],
-            stages: vec![StageProgram {
-                stage: Stage::OnAttn,
-                ops: vec![
-                    Op::IntrinsicVal {
-                        intr: IntrinsicId::AttnScore,
-                        shape: Shape::vector(32),
-                        dtype: DType::F32,
-                    },
-                    Op::ReduceArgmax(0),
-                    Op::ChanPut { chan: 0, value: 1 },
-                ],
-            }],
-            externs: alloc::vec::Vec::new(),
-        };
-        assert!(matches!(
-            bind(c, profile),
-            Err(ValidateError::IntrinsicUnavailable {
-                intr: IntrinsicId::AttnScore
-            })
-        ));
-    }
-
-    /// The score row is `[num_heads, kv_len]`; a rank-1 or non-F32 read is a
-    /// different tensor and must not bind.
-    #[test]
-    fn attn_score_type_rule_pins_rank_and_dtype() {
-        for (shape, dtype, chan_shape) in [
-            (Shape::matrix(4, 32), DType::F32, Shape::vector(4)),
-            (Shape::vector(32), DType::I32, Shape::SCALAR),
-        ] {
-            let c = TraceContainer {
-                names: vec![],
-                channels: vec![chan(chan_shape, DType::I32, HostRole::Reader, false)],
-                ports: vec![],
-                stages: vec![StageProgram {
-                    stage: Stage::OnAttn,
-                    ops: vec![
-                        Op::IntrinsicVal {
-                            intr: IntrinsicId::AttnScore,
-                            shape,
-                            dtype,
+        let direct = check_spsc_endpoints(&container).unwrap_err();
+        let whole = bind(container.clone(), ModelProfile::dummy()).unwrap_err();
+        for err in [&direct, &whole] {
+            assert!(
+                matches!(
+                    err,
+                    ValidateError::Body {
+                        err: BodyError {
+                            kind: BodyErrorKind::ChannelOutOfRange(7),
+                            ..
                         },
-                        Op::ReduceArgmax(0),
-                        Op::ChanPut { chan: 0, value: 1 },
-                    ],
-                }],
-                externs: alloc::vec::Vec::new(),
-            };
-            assert!(matches!(
-                bind(c, ModelProfile::dummy()),
-                Err(ValidateError::IntrinsicTypeRule {
-                    intr: IntrinsicId::AttnScore,
-                    ..
-                })
-            ));
+                        ..
+                    }
+                ),
+                "out-of-range channel should read the same from either pass, got {err:?}"
+            );
         }
-    }
 
-    #[test]
-    fn name_table_must_be_strictly_sorted_and_unique() {
-        let unsorted = TraceContainer {
-            names: vec!["z".into(), "a".into()],
-            ..TraceContainer::default()
-        };
+        // And the same for a descriptor port, which is the second raw index.
+        container.stages[0].ops.pop();
+        container.ports = vec![PortBinding {
+            port: Port::EmbedTokens,
+            source: PortSource::Channel(7),
+        }];
         assert!(matches!(
-            bind(unsorted, ModelProfile::dummy()),
-            Err(ValidateError::NamesUnsortedOrDuplicate)
-        ));
-
-        let duplicate = TraceContainer {
-            names: vec!["a".into(), "a".into()],
-            ..TraceContainer::default()
-        };
-        assert!(matches!(
-            bind(duplicate, ModelProfile::dummy()),
-            Err(ValidateError::NamesUnsortedOrDuplicate)
+            check_spsc_endpoints(&container).unwrap_err(),
+            ValidateError::Body {
+                err: BodyError {
+                    kind: BodyErrorKind::ChannelOutOfRange(7),
+                    ..
+                },
+                ..
+            }
         ));
     }
 }

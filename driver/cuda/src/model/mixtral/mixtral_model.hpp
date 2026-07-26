@@ -24,7 +24,7 @@ public:
               ops::CublasHandle& cublas,
               const ForwardFn::ForwardInputs& in) override;
 
-    ModelCapabilities capabilities() const override { return {}; }
+    ModelCapabilities capabilities() const override { return caps_; }
 
 private:
     MixtralWeights weights_;
@@ -32,6 +32,7 @@ private:
     LlamaLikeForwardCfg fwd_cfg_;
     int num_experts_;
     int top_k_;
+    ModelCapabilities caps_{};
 };
 
 }  // namespace pie_cuda_driver::model

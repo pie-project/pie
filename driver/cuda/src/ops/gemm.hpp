@@ -254,6 +254,26 @@ void gemm_act_x_wt_bf16_out_fp32(
     int N,
     int K);
 
+// Dense bf16 linear with a broadcast row bias: y[m][n] = sum_k act[m][k] *
+// W[n][k] + bias[n]. `bias` may be null, in which case this is exactly
+// `gemm_act_x_wt_bf16`.
+//
+// At M=1 -- the decode shape -- the bias is folded into the GEMV epilogue,
+// which removes an entire kernel launch per biased projection. gpt-oss-20b
+// has five of them per layer, so at 24 layers that was 120 launches per
+// decode step at ~3.6 us each against a 2.2 us empty-launch floor: 11.9% of
+// decode GPU time spent re-reading and re-writing a few KB. The fold is
+// bit-identical (see `launch_gemv_bf16`).
+//
+// The fold only happens when the dense autotuner has *already* chosen the
+// GEMV for this shape, so a shape where cuBLAS wins is never forced onto a
+// slower kernel just to save a launch. Set PIE_GEMV_FUSED_BIAS=0 to disable.
+void gemm_act_x_wt_bias_bf16(
+    cublasHandle_t handle,
+    const void* act, const void* W, const void* bias, void* y,
+    int M, int N, int K,
+    cudaStream_t stream);
+
 // Same math as `gemm_act_x_wt_bf16`, but bypasses the cuBLASLt BF16
 // dispatcher. This is useful for a few skinny-M packed projections where
 // Lt's heuristic is slower than cuBLAS GEMMEx.

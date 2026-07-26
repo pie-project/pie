@@ -2,7 +2,7 @@
 //!
 //! Two layers: the SDK **span lints** (double-endpoint, readiness-direction,
 //! sink misplacement) caught during assembly with `#[track_caller]` source
-//! spans (overview P1.3), and the authoritative **bind** verdict wrapping echo's
+//! spans (overview P1.3), and the authoritative **bind** verdict wrapping the IR's
 //! [`ValidateError`](pie_ir::validate::ValidateError) on the
 //! canonical container.
 
@@ -66,7 +66,7 @@ impl fmt::Display for Endpoint {
 }
 
 /// A trace-time error. SDK span lints carry the source [`Span`](s); the bind
-/// verdict carries echo's authoritative [`ValidateError`].
+/// verdict carries the IR's authoritative [`ValidateError`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum TraceError {
     /// A channel got a second distinct producer or consumer endpoint (SPSC, T2).
@@ -90,7 +90,7 @@ pub enum TraceError {
         stage: Stage,
         span: Span,
     },
-    /// The authoritative bind verdict (echo's validator on the canonical bytes).
+    /// The authoritative bind verdict (the IR's validator on the canonical bytes).
     Bind(ValidateError),
 }
 

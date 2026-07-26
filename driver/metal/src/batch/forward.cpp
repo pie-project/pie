@@ -547,7 +547,7 @@ struct MetalExecutor::Impl {
     // with byte-identical output.
     static constexpr bool fuse_residual_ = true;
     static constexpr bool force_barriers_ = false;
-    static constexpr int max_ctx_ = 4096;
+    static constexpr int max_ctx_ = int(kMetalMaxCtxTokens);
 
     // No checkpoint directory: since §6 the plan declares the files it reads,
     // so staging weights needs the plan and nothing else.
@@ -630,6 +630,7 @@ struct MetalExecutor::Impl {
     bool bind_paged_dag(std::string* error);
     bool run_prefill_step(
         const BatchSchedule& schedule,
+        const BatchStepInputs& in,
         std::string* error,
         const std::vector<PtirCommandCallbacks>* ptir);
 };
@@ -1552,7 +1553,7 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
         seq_len[size_t(t)] = schedule.spans[schedule.req_of_token[size_t(t)]].seqlen;
     copy_to(IoSlot::SeqLen, seq_len);
 
-    if (!schedule.is_pure_decode) return run_prefill_step(schedule, err, ptir);
+    if (!schedule.is_pure_decode) return run_prefill_step(schedule, in, err, ptir);
 
     std::vector<uint32_t> active_slots;
     active_slots.reserve(size_t(schedule.R));
@@ -1634,6 +1635,7 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
 
 bool MetalExecutor::Impl::run_prefill_step(
     const BatchSchedule& schedule,
+    const BatchStepInputs& in,
     std::string* err,
     const std::vector<PtirCommandCallbacks>* ptir) {
     auto fail = [&](const std::string& why) {
@@ -1664,9 +1666,8 @@ bool MetalExecutor::Impl::run_prefill_step(
             for (const auto& callbacks : *ptir)
                 if (callbacks.pre_forward) callbacks.pre_forward(se);
         }
-        for (int t = 0; t < schedule.N; ++t)
-            encode_decode_step_mb(se, prefill_dags_[size_t(t)], psos_, mb_psos_,
-                                  force_barriers_);
+        encode_prefill_dags_mb(se, prefill_dags_, schedule.N, psos_, mb_psos_,
+                               force_barriers_, in.row_needs_logits);
         if (ptir != nullptr) {
             for (const auto& callbacks : *ptir)
                 if (callbacks.post_forward) callbacks.post_forward(se);
@@ -2522,6 +2523,10 @@ bool MetalExecutor::run_paged_batch_forward(const std::vector<MemberForwardDesc>
         }
     }
     if (in.token_ids.empty()) return false;
+    in.row_needs_logits.assign(in.token_ids.size(), 0);
+    for (const auto& rows : member_readout_rows)
+        for (const std::uint32_t row : rows)
+            if (row < in.row_needs_logits.size()) in.row_needs_logits[row] = 1;
     in.qo_indptr.push_back(static_cast<uint32_t>(in.token_ids.size()));
     in.kv_page_indptr.push_back(static_cast<uint32_t>(in.kv_page_indices.size()));
 

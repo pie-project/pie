@@ -22,9 +22,11 @@
 
 namespace pie::metal::pipeline {
 
-// Threads a grouped generated region gets per lane. Must equal
-// `METAL_M3_REGION_THREADS` in compiler/codegen/src/metal/fused.rs.
-inline constexpr std::uint32_t kM3RegionThreads = 256;
+// Threads a grouped generated region gets per lane. Taken from the generated
+// header rather than retyped: the emitter sizes the threadgroup argmax buffer
+// for exactly this many, and the two values already drifted once (they were 256
+// here against a 1024 buffer) with nothing to notice.
+inline constexpr std::uint32_t kM3RegionThreads = PTIR_METAL_M3_REGION_THREADS;
 
 std::string encode_m1_cache_identity(
     std::uint64_t device,

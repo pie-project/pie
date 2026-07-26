@@ -1,15 +1,14 @@
 //! Deferred process-resource teardown: finalizes a departing process's
-//! pending pipeline operations off the guest task, releases its capped
-//! execution slot in event order, and batches its channel closes.
+//! pending pipeline operations off the guest task and batches its channel
+//! closes. The capped execution slot is NOT released here — `ProcessCtx::drop`
+//! frees it synchronously, ahead of this task, and hands down the terminate
+//! fences it posted (see `post_process_terminate_fenced`).
 
 use std::sync::{Arc, Mutex};
 
 pub(crate) struct TeardownFireContext {
     process_id: uuid::Uuid,
     resources: wasmtime::component::ResourceTable,
-    // Dropped after `resources` (field declaration order), so strict
-    // admission advances only after pooled resources are released.
-    _execution_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     _bind_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
@@ -27,15 +26,14 @@ pub(crate) fn defer_resource_teardown(
     process_id: uuid::Uuid,
     resources: wasmtime::component::ResourceTable,
     residency: Arc<Mutex<crate::inferlet::process::ProcessResidency>>,
-    execution_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    terminate_fences: Option<Vec<crate::scheduler::worker::TerminateFence>>,
     bind_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) {
-    let capped_execution = execution_permit.is_some();
+    let capped_execution = terminate_fences.is_some();
     let snapshot = residency.lock().unwrap().teardown_snapshot();
     let mut context = TeardownFireContext {
         process_id,
         resources,
-        _execution_permit: execution_permit,
         _bind_permit: bind_permit,
     };
     if !capped_execution
@@ -55,15 +53,13 @@ pub(crate) fn defer_resource_teardown(
              ResourceTable to avoid recycling pages under native work"
         );
         std::mem::forget(context);
-        // The leaked permit shrank the execution pool by one; tell the
-        // policy the departure resolves as a FORFEIT so its seal neither
-        // waits forever for a release that cannot come nor credits a free
-        // slot the semaphore no longer has. (Sync send — no runtime
-        // needed.) The terminate tombstone stays: with the pending fires
+        // Only POOLED RESOURCES leak here, not the seat: `ProcessCtx::drop`
+        // already released the execution permit and broadcast the release, so
+        // the semaphore's capacity is intact and the policy's departure is
+        // resolved. (Before the permit moved out of this context the leak took
+        // the seat with it, which is what the forfeit broadcast existed to
+        // announce.) The terminate tombstone stays: with the pending fires
         // forgotten, late items for this pid remain possible.
-        if capped_execution {
-            crate::scheduler::worker::notify_execution_slot_forfeited(process_id);
-        }
         return;
     };
     runtime.spawn(async move {
@@ -78,10 +74,13 @@ pub(crate) fn defer_resource_teardown(
             // every driver's scheduler has purged the pid's queued work and
             // cancelled its protected in-flight control, so the finalize
             // loop below and the resource drop at the end run with no
-            // scheduler-side reference to the pages they recycle. (The
-            // fence also serializes each retirement behind a scheduler
-            // pass; that pacing is a side effect, not the contract.)
-            crate::scheduler::worker::notify_process_terminate(process_id).await;
+            // scheduler-side reference to the pages they recycle. The leave
+            // itself was POSTED by `ProcessCtx::drop` (ahead of the slot
+            // release, preserving leave-then-release); only the await is
+            // deferred here, so a retirement no longer holds its successor's
+            // seat hostage to this task's spawn latency.
+            crate::scheduler::worker::await_terminate_fences(terminate_fences.unwrap_or_default())
+                .await;
         } else {
             for pipeline_id in snapshot.departed_pipeline_ids {
                 crate::scheduler::worker::notify_pipeline_close(pipeline_id).await;
@@ -118,16 +117,6 @@ pub(crate) fn defer_resource_teardown(
         // then keeps the driver's instance-before-channel close order.
         let channel_close_batches =
             crate::pipeline::channel::detach_channel_close_notifications(&mut context.resources);
-        if capped_execution {
-            // Announce the slot BEFORE the permit drops (with `context`
-            // below): the successor can only acquire after the drop, so its
-            // slot-consumed event always enters the scheduler mailbox after
-            // this release — the policy's slot balance never sees a consume
-            // for a release it hasn't counted. (The terminate notification
-            // above already removed this process's own lane: leave first,
-            // release second, successor's admission and fire after.)
-            crate::scheduler::worker::notify_execution_slot_released(process_id);
-        }
         drop(context);
         for (driver_id, ids) in channel_close_batches {
             if let Err(error) = crate::scheduler::close_channels(driver_id, ids) {

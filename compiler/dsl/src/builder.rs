@@ -3,7 +3,7 @@
 //! [`Builder`] is the boundary-agnostic half of what used to be `ForwardPass`:
 //! it takes descriptor-port bindings ([`bind_port`](Builder::bind_port)) and
 //! stage closures ([`stage`](Builder::stage)), traces the closures once into
-//! echo's canonical [`TraceContainer`], and runs the SDK span lints. It does
+//! the IR's canonical [`TraceContainer`], and runs the SDK span lints. It does
 //! **not** bind (D6: the guest does not bind — `forward-pass.program` is the
 //! authoritative gate); the author-facing `ForwardPass`/`Pipeline`/`WorkingSet`
 //! lifetime objects live in `inferlet`, wrap the WIT resources, and drive this
@@ -21,7 +21,6 @@ use alloc::vec::Vec;
 use pie_ir::container::{
     ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
 };
-use pie_ir::op::Op;
 use pie_ir::registry::{Port, Stage};
 
 use crate::channel::Channel;
@@ -149,10 +148,8 @@ impl<'a> Builder<'a> {
             .into_iter()
             .map(|mut r| {
                 for op in &mut r.ops {
-                    match op {
-                        Op::ChanTake(c) | Op::ChanRead(c) => *c = remap[*c as usize],
-                        Op::ChanPut { chan, .. } => *chan = remap[*chan as usize],
-                        _ => {}
+                    if let Some(chan) = op.channel_mut() {
+                        *chan = remap[*chan as usize];
                     }
                 }
                 r
@@ -184,11 +181,8 @@ impl<'a> Builder<'a> {
             .into_iter()
             .map(|mut r| {
                 for op in &mut r.ops {
-                    match op {
-                        Op::KernelCall { name, .. } | Op::SinkCall { name, .. } => {
-                            *name = name_remap[*name as usize];
-                        }
-                        _ => {}
+                    if let Some(name) = op.name_index_mut() {
+                        *name = name_remap[*name as usize];
                     }
                 }
                 r
@@ -201,7 +195,7 @@ impl<'a> Builder<'a> {
             .flat_map(|r| r.sinks.iter().map(move |s| (r.stage, s.clone())))
             .collect();
 
-        // Build echo's channel declarations with derived HostRole + seeded.
+        // Build the IR's channel declarations with derived HostRole + seeded.
         let channel_decls: Vec<ChannelDecl> = channels
             .iter()
             .map(|c| {
@@ -266,7 +260,7 @@ impl<'a> Builder<'a> {
             stages,
         };
 
-        // SDK span lints (friendly, spans). Echo's authoritative bind lives on
+        // SDK span lints (friendly, spans). The IR's authoritative bind lives on
         // the host at `forward-pass.program` (D6); native parity tests bind explicitly.
         let mut errs: Vec<TraceError> = Vec::new();
         crate::lint::lint(&channels, &sinks, &mut errs);
@@ -283,46 +277,6 @@ impl<'a> Builder<'a> {
         })
     }
 
-    /// Assemble the raw container WITHOUT lint — for debugging emission.
-    #[doc(hidden)]
-    pub fn debug_container(&self) -> TraceContainer {
-        let rows = self.rows();
-        let (result, channels, names) =
-            crate::model::with_constants(self.vocab, self.page_size, || {
-                context::with_session(|| self.record(rows))
-            });
-        let (stage_results, ports) = result;
-        let channel_decls: Vec<ChannelDecl> = channels
-            .iter()
-            .map(|c| {
-                let st = c.borrow();
-                ChannelDecl {
-                    shape: st.shape,
-                    dtype: ChanDType::Concrete(st.dtype),
-                    capacity: st.capacity,
-                    host_role: HostRole::None,
-                    seeded: st.seeded,
-                }
-            })
-            .collect();
-        let stages = stage_results
-            .into_iter()
-            .map(|r| StageProgram {
-                stage: r.stage,
-                ops: r.ops,
-            })
-            .collect();
-        let mut ports = ports;
-        ports.sort_by_key(|p| p.port as u8);
-        TraceContainer {
-            externs: Vec::new(),
-            names,
-            channels: channel_decls,
-            ports,
-            stages,
-        }
-    }
-
     /// Intern descriptor-port channels + trace each present stage (inside a session).
     fn record(&self, rows: u32) -> (Vec<context::StageResult>, Vec<PortBinding>) {
         let mut ports: Vec<PortBinding> = Vec::new();
@@ -336,12 +290,7 @@ impl<'a> Builder<'a> {
 
         // Trace stages in canonical stage order (byte-stable container.stages).
         let mut results = Vec::new();
-        for stage in [
-            Stage::Prologue,
-            Stage::OnAttnProj,
-            Stage::OnAttn,
-            Stage::Epilogue,
-        ] {
+        for &stage in Stage::ALL {
             let Some((_, body)) = self.stages.iter().find(|(s, _)| *s == stage) else {
                 continue;
             };
@@ -352,7 +301,7 @@ impl<'a> Builder<'a> {
     }
 }
 
-/// A traced, linted forward pass: echo's canonical [`TraceContainer`] plus the
+/// A traced, linted forward pass: the IR's canonical [`TraceContainer`] plus the
 /// dense-order channel identities (gids) and names. Identity is the C3 hash
 /// (FNV-1a over the canonical container bytes); binding is the host's job (D6).
 #[derive(Debug)]

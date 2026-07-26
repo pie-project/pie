@@ -199,3 +199,93 @@ pub fn result_bases(ops: &[OpView]) -> Vec<u32> {
     }
     bases
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pie_ir::container::{StageProgram, TraceContainer};
+    use pie_ir::registry::Stage;
+
+    /// How many bytes the container spends on one op.
+    fn encoded_len(ops: Vec<Op>) -> usize {
+        TraceContainer {
+            names: alloc::vec::Vec::new(),
+            channels: alloc::vec::Vec::new(),
+            ports: alloc::vec::Vec::new(),
+            stages: alloc::vec![StageProgram {
+                stage: Stage::Prologue,
+                ops
+            }],
+            externs: alloc::vec::Vec::new(),
+        }
+        .encode()
+        .len()
+    }
+
+    /// The `_` arm of [`OpView::of`] sets `args` and leaves every other wire
+    /// field at its default, so an op that reaches it and *does* carry a
+    /// channel, a name, an immediate, a shape or a dtype hands the driver
+    /// zeros where the payload should be.
+    ///
+    /// "Carries a payload" is not asked of this file — it is measured against
+    /// the container, the other reader of the same format: an op whose
+    /// encoding is exactly a tag plus one word per operand has nothing beyond
+    /// its operands, and anything longer does. Those must project to a view
+    /// that differs from the bare one, which is only possible from a named
+    /// arm. A new op with an immediate therefore fails here rather than in a
+    /// kernel.
+    #[test]
+    fn only_ops_that_are_nothing_but_operands_may_reach_the_general_arm() {
+        let empty = encoded_len(alloc::vec::Vec::new());
+        let mut asserted = 0usize;
+        let mut skipped_effectful = 0usize;
+        let mut skipped_bare = 0usize;
+        for op in pie_ir::op::representatives() {
+            // A channel index or a name index of zero is a legal payload that
+            // is byte-identical to the default, so these cannot be told apart
+            // this way. They are the effectful ops, and `pareval`'s
+            // `the_fold_only_generalises_over_pure_ops` is what holds that set
+            // to `Op::is_effectful`.
+            if op.is_effectful() {
+                skipped_effectful += 1;
+                continue;
+            }
+            let payload = encoded_len(alloc::vec![op.clone()]) - empty;
+            let operands_only = 1 + 4 * op.operands().len();
+            let view = OpView::of(&op);
+            let bare = OpView {
+                tag: view.tag,
+                chan: -1,
+                results: view.results,
+                args: op.operands(),
+                ..OpView::default()
+            };
+            if payload == operands_only {
+                skipped_bare += 1;
+                continue;
+            }
+            assert_ne!(
+                view, bare,
+                "{op:?} encodes {payload} bytes where its operands need \
+                 {operands_only}, but projects the same view the general arm \
+                 would build; the extra payload reaches the driver as zeros"
+            );
+            asserted += 1;
+        }
+        // Both `continue`s above are unconditional, so without this the whole
+        // test would pass having compared nothing — which is exactly what
+        // would happen if `encoded_len` ever started returning the same number
+        // for every op.
+        assert_eq!(
+            asserted + skipped_effectful + skipped_bare,
+            pie_ir::op::OP_TABLE.len(),
+            "representatives() stopped covering the table"
+        );
+        assert!(
+            asserted >= 13,
+            "only {asserted} of the table's ops carry payload beyond their \
+             operands (13 did when this was written); the length measurement \
+             has stopped distinguishing anything"
+        );
+    }
+}

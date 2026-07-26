@@ -12,8 +12,12 @@
 //! (`emit_fused_region_cuda_verbatim`) so a failure can be read, not just
 //! detected.
 
+#[path = "common/device_text.rs"]
+mod device_text;
 #[path = "common/msl_corpus.rs"]
 mod msl_corpus;
+#[path = "common/provenance.rs"]
+mod provenance;
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -23,33 +27,38 @@ use pie_codegen::cuda::{
     second_party_region_supported, singleton_runtime_source, validate_generated_region,
 };
 
+use device_text::OracleInputs;
 use msl_corpus::{corpus_bound, corpus_stages, region_shape};
 
 fn golden_cuda_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("golden-cuda")
 }
 
-fn fnv1a64(text: &str) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in text.bytes() {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
+/// The live CUDA device source and the oracle-era copy of whichever part of it
+/// has moved since the dump was taken. See `common/device_text.rs`.
+fn oracle_inputs() -> OracleInputs {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    OracleInputs::load(
+        manifest.join("../codegen/runtime/cuda"),
+        golden_cuda_dir().join("oracle-inputs"),
+    )
 }
 
 struct Dump {
     emitter: &'static str,
     body: String,
     runtime: String,
+    inputs: OracleInputs,
 }
 
 impl Dump {
     fn new(emitter: &'static str) -> Self {
+        let inputs = oracle_inputs();
         Self {
             emitter,
             body: String::new(),
-            runtime: singleton_runtime_source(),
+            runtime: inputs.rewrite(&singleton_runtime_source()),
+            inputs,
         }
     }
 
@@ -91,7 +100,8 @@ impl Dump {
             self.end();
             return;
         };
-        let (prefix, tail) = self.split(source);
+        let source = self.inputs.rewrite(source);
+        let (prefix, tail) = self.split(&source);
         let _ = writeln!(
             self.body,
             "source: bytes={} prefix={prefix} tail_bytes={}",
@@ -115,13 +125,14 @@ impl Dump {
         );
         let _ = writeln!(self.body, "entry_name: {entry_name}");
         if let Ok(source) = emitted {
-            let (prefix, tail) = self.split(source);
+            let source = self.inputs.rewrite(source);
+            let (prefix, tail) = self.split(&source);
             let _ = writeln!(
                 self.body,
                 "source: bytes={} prefix={prefix} tail_bytes={} fnv1a64=0x{:016x}",
                 source.len(),
                 tail.len(),
-                fnv1a64(tail)
+                pie_ir::fnv1a64(tail.as_bytes())
             );
         }
         self.end();
@@ -130,40 +141,16 @@ impl Dump {
 
 fn compare(dump: &Dump) {
     let path = golden_cuda_dir().join(format!("{}.txt", dump.emitter));
-    let oracle = std::fs::read_to_string(&path)
-        .unwrap_or_else(|error| panic!("{} missing ({error})", path.display()));
-    let header: String = oracle
-        .lines()
-        .take_while(|line| line.starts_with('#'))
-        .map(|line| format!("{line}\n"))
-        .collect();
-    let expected = &oracle[header.len()..];
-
-    if std::env::var("PTIR_REGEN").is_ok() {
-        std::fs::write(&path, header.clone() + &dump.body).unwrap();
+    let Some(expected) =
+        provenance::body_to_diff(&path, &dump.body, provenance::Regenerate::Foreign)
+    else {
         return;
-    }
-    if expected == dump.body {
-        return;
-    }
-    let mut case = String::from("<before the first case>");
-    for (index, (mine, theirs)) in dump.body.lines().zip(expected.lines()).enumerate() {
-        if let Some(id) = theirs.strip_prefix("=== ") {
-            case = id.to_string();
-        }
-        assert_eq!(
-            mine,
-            theirs,
-            "{} diverged from the C++ oracle at line {} (case `{case}`)",
-            dump.emitter,
-            index + 1
-        );
-    }
-    assert_eq!(
-        dump.body.lines().count(),
-        expected.lines().count(),
-        "{} emitted a different number of lines than the C++ oracle",
-        dump.emitter
+    };
+    provenance::assert_same_lines(
+        &dump.body,
+        &expected,
+        &format!("{} against the C++ oracle", dump.emitter),
+        &format!("\n{}", dump.inputs.hint()),
     );
 }
 
@@ -172,12 +159,62 @@ fn compare(dump: &Dump) {
 #[test]
 fn runtime_matches_oracle() {
     let mut dump = Dump::new("singleton_runtime_cuda_source");
-    let runtime = singleton_runtime_source();
+    let runtime = dump.runtime.clone();
     dump.open_case("runtime");
     dump.field("bytes", &runtime.len().to_string());
-    dump.field("fnv1a64", &format!("0x{:016x}", fnv1a64(&runtime)));
+    dump.field(
+        "fnv1a64",
+        &format!("0x{:016x}", pie_ir::fnv1a64(runtime.as_bytes())),
+    );
     dump.end();
     compare(&dump);
+}
+
+/// What makes the oracle-era rewrite safe: the emitter splices each device file
+/// in whole and verbatim, so putting the oracle-era text back can only ever
+/// restore bytes the kernel side owns. An emitter that started editing, folding
+/// or regenerating one of these blocks would fail here first, and the rewrite
+/// would stop firing for it rather than quietly cover the change up.
+#[test]
+fn every_live_device_file_is_spliced_into_a_kernel_verbatim() {
+    let inputs = oracle_inputs();
+    let runtime = singleton_runtime_source();
+    let singleton = emit_singleton_region("ptir_singleton_probe", 0x10)
+        .expect("the singleton emitter accepts op tag 0x10");
+    let stages = corpus_stages();
+    let fused =
+        stages
+            .iter()
+            .flat_map(|stage| {
+                stage.plan.fused.regions.iter().map(move |region| {
+                    emit_fused_region("ptir_fused_probe_r0", &stage.plan, region)
+                })
+            })
+            .find_map(Result::ok)
+            .expect("at least one corpus region emits a fused CUDA kernel");
+
+    let files = inputs.live_files();
+    assert_eq!(
+        files.len(),
+        6,
+        "compiler/codegen/runtime/cuda/ holds six device files; a new one needs \
+         a home in this assertion and, once it moves, in golden-cuda/oracle-inputs/"
+    );
+    for (name, text) in files {
+        let hosts = [&runtime, &singleton, &fused];
+        assert!(
+            hosts.iter().any(|host| host.contains(&text)),
+            "{name} is include_str!d into the emitters but no emitted kernel \
+             contains it verbatim, so the oracle-era rewrite cannot stand in \
+             for it"
+        );
+    }
+}
+
+/// A copy that no longer differs from its live file stands in for nothing.
+#[test]
+fn oracle_inputs_are_live_files_that_moved() {
+    oracle_inputs().assert_entries_are_live_files_that_moved();
 }
 
 /// Entry names the emitters must accept or reject on their own terms.
@@ -293,7 +330,7 @@ fn emitter_version_matches_oracle() {
 /// recorded rather than dropped.
 #[test]
 fn emit_program_covers_every_region() {
-    use pie_codegen::program::{Backend, KERNEL_FUSED, emit_program};
+    use pie_codegen::program::{Backend, PIE_KERNEL_FUSED, emit_program};
 
     let stages: Vec<_> = corpus_stages()
         .into_iter()
@@ -308,7 +345,7 @@ fn emit_program_covers_every_region() {
         "CUDA emission must produce one kernel per fused region"
     );
     for kernel in &kernels {
-        assert_eq!(kernel.kind, KERNEL_FUSED);
+        assert_eq!(kernel.kind, PIE_KERNEL_FUSED);
         // Exactly one of source/error is set: a kernel is either emitted or
         // explained, never silently absent.
         assert_ne!(
@@ -338,8 +375,8 @@ fn emit_program_covers_every_region() {
 #[test]
 fn emit_program_metal_covers_every_family() {
     use pie_codegen::program::{
-        Backend, KERNEL_COMMIT, KERNEL_FUSED, KERNEL_GROUPED, KERNEL_READINESS, KERNEL_SINGLETON,
-        emit_program,
+        Backend, PIE_KERNEL_COMMIT, PIE_KERNEL_FUSED, PIE_KERNEL_GROUPED, PIE_KERNEL_READINESS,
+        PIE_KERNEL_SINGLETON, emit_program,
     };
 
     let stages: Vec<_> = corpus_stages()
@@ -348,11 +385,11 @@ fn emit_program_metal_covers_every_family() {
         .collect();
     let kernels = emit_program(Backend::Metal, &stages, &corpus_bound());
     for kind in [
-        KERNEL_SINGLETON,
-        KERNEL_FUSED,
-        KERNEL_GROUPED,
-        KERNEL_READINESS,
-        KERNEL_COMMIT,
+        PIE_KERNEL_SINGLETON,
+        PIE_KERNEL_FUSED,
+        PIE_KERNEL_GROUPED,
+        PIE_KERNEL_READINESS,
+        PIE_KERNEL_COMMIT,
     ] {
         assert!(
             kernels.iter().any(|kernel| kernel.kind == kind),
@@ -378,21 +415,22 @@ fn emit_program_metal_covers_every_family() {
     }
 }
 
-/// `pie_plan::stage_identity` must equal the CUDA driver's
-/// `compiled_stage_identity` byte for byte.
+/// `pie_plan::stage_identity` is a cache key, so it must not move by accident.
 ///
-/// The driver keys its CUDA-graph cache on this value, and a wrong key is
-/// silent: it does not fail, it reuses the wrong graph. So the two
-/// implementations are pinned here while both exist, the same way the emitters
-/// were pinned by `golden-{msl,cuda}/` (`ptir-refactor.md` §3.2). The expected
-/// column was produced by compiling `driver/cuda/src/pipeline/program_identity.hpp`
-/// on the host and running it over `corpus_stages()`; regenerate with
-/// `PTIR_REGEN=1` only after re-deriving it the same way.
+/// A driver keys its graph cache on this value and a wrong key is silent: it
+/// does not fail, it reuses the wrong graph. The expected column was produced
+/// by compiling `driver/cuda/src/pipeline/program_identity.hpp` on the host and
+/// running it over `corpus_stages()`, which is why the file still names it —
+/// but nothing recomputes the value today. That header is gone, and Metal is
+/// *handed* the bytes (`m1_runtime.cpp:1089`, from `interface/driver/src/plan.rs`'s
+/// `identity`). So this is no longer a differential check against C++; it is
+/// the weaker but still necessary thing, a tripwire that an edit to
+/// normalization, signatures, or region partitioning changed a published cache
+/// key. Bump `pie_plan::COMPILER_VERSION` when regenerating, or deployed
+/// devices will keep serving graphs built for the old planner.
 #[test]
-fn stage_identity_matches_the_driver() {
+fn stage_identity_is_pinned() {
     let mut rendered = String::new();
-    rendered.push_str("# GENERATED from driver/cuda/src/pipeline/program_identity.hpp\n");
-    rendered.push_str("# <golden>#<stage_index> <compiled_stage_identity as hex>\n");
     for stage in corpus_stages() {
         let _ = writeln!(
             rendered,
@@ -402,33 +440,15 @@ fn stage_identity_matches_the_driver() {
         );
     }
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("golden-stage-identity.txt");
-    if std::env::var("PTIR_REGEN").is_ok() {
-        std::fs::write(&path, &rendered).unwrap();
-        return;
+    if let Some(expected) =
+        provenance::body_to_diff(&path, &rendered, provenance::Regenerate::Foreign)
+    {
+        assert_eq!(
+            rendered, expected,
+            "pie_plan::stage_identity moved: a published graph-cache key changed, \
+             so pie_plan::COMPILER_VERSION must move with it"
+        );
     }
-    let expected = std::fs::read_to_string(&path).expect("golden-stage-identity.txt");
-    assert_eq!(
-        rendered, expected,
-        "pie_plan::stage_identity has diverged from the CUDA driver's \
-         compiled_stage_identity"
-    );
-}
-
-/// Escape hatch for re-deriving `golden-stage-identity.txt` against the C++
-/// driver: `PTIR_DUMP_PLANS=<path> cargo test -p pie-compiler-tests --test
-/// cuda_golden dump_corpus_plans` writes the PTRP wire bytes the host oracle
-/// in `program_identity.hpp` decodes. Not a check; it fails nothing.
-#[test]
-fn dump_corpus_plans() {
-    let Ok(path) = std::env::var("PTIR_DUMP_PLANS") else {
-        return;
-    };
-    let mut out = String::new();
-    for stage in corpus_stages() {
-        let hex: String = stage.wire.iter().map(|b| format!("{b:02x}")).collect();
-        let _ = writeln!(out, "id={} bytes={hex}", stage.id());
-    }
-    std::fs::write(path, out).unwrap();
 }
 
 /// Emit the CUDA kernel table for the traces the driver's own tests register.
@@ -497,7 +517,11 @@ fn emit_driver_test_kernel_fixtures() {
                 kernel.kind,
                 kernel.stage_index,
                 kernel.region_index,
-                if kernel.entry_name.is_empty() { "-" } else { &kernel.entry_name },
+                if kernel.entry_name.is_empty() {
+                    "-"
+                } else {
+                    &kernel.entry_name
+                },
                 kernel.source.len()
             );
             body.push_str(&kernel.source);
@@ -523,7 +547,7 @@ fn emit_driver_test_kernel_fixtures() {
         //   `region <stage> <region> <flags> <argmax-count> <skipped...>`
         //   `argmax <node> <source_value> <intrinsic> <requires_single_row>`
         let mut regions = String::new();
-        for region in pie_codegen::region_analysis::analyze_program(&stages) {
+        for region in pie_codegen::cuda::region_analysis::analyze_program(&stages) {
             let mut header = format!(
                 "region {} {} {} {}",
                 region.stage_index,
@@ -557,7 +581,12 @@ fn emit_driver_test_kernel_fixtures() {
         .filter(|reason| !reason.starts_with("neg_"))
         .collect();
     for reason in &drifted {
-        eprintln!("[driver kernel fixtures] skipped {reason}");
+        // The one stream write the compiler crates allow: the assert below
+        // only reports a count, and the count is useless without the names.
+        #[allow(clippy::print_stderr, reason = "names the fixtures the assert counts")]
+        {
+            eprintln!("[driver kernel fixtures] skipped {reason}");
+        }
     }
     // Zero, not a tolerance. The last survivor was `staged_dispatch`, and it
     // had not drifted at all -- `golden_profile` was guessing vocab 8 for a
@@ -569,4 +598,3 @@ fn emit_driver_test_kernel_fixtures() {
         "vendored driver traces no longer bind: {drifted:?}"
     );
 }
-

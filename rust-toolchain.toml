@@ -1,0 +1,20 @@
+# Pins the toolchain so `edition = "2024"`, the lint set the CI clippy gate
+# enforces, and rustfmt's output are the same on every machine. Without this
+# file the workspace silently tracks whatever `stable` happens to be, which
+# means a clippy release can turn a green CI red on an unchanged tree — and
+# the compiler crates' `-D warnings` gate makes that failure blocking.
+#
+# Bumping: change `channel`, run
+# `cargo clippy --no-deps -p pie-ir -p pie-plan -p pie-eval -p pie-codegen \
+#   -p pie-dsl -p pie-compiler-tests --all-targets -- -D warnings`
+# and fix whatever the new release found in the same commit.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]
+# `bin/pie/tests/*` shell out to `cargo build --target wasm32-wasip2` for the
+# inferlet fixtures. Those nested invocations run inside the repo, so rustup
+# resolves them through THIS file rather than through whatever the CI action
+# installed — declaring the target here is what makes them work. CI's
+# `targets: wasm32-wasip2` input installs it for the action's own toolchain,
+# which is not the one that ends up compiling anything.
+targets = ["wasm32-wasip2"]

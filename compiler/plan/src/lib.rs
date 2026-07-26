@@ -8,22 +8,34 @@
 //! generation and library implementations.
 //!
 //! "Plan" here is the cuDNN/FFTW sense — a reusable, shape-parameterized
-//! execution strategy keyed by [`ExecutableCacheKey`] — **not** an LLVM-style
+//! execution strategy keyed by a [`StageSignature`] — **not** an LLVM-style
 //! optimization pass pipeline. Runtime-varying extents stay symbolic
 //! ([`SymbolicExtent`]) so one plan serves many batch shapes.
 //!
-//! Two wire formats leave this crate:
-//!
-//! * the **region plan** (`PTRP`, [`encode_stage_plan`]) — per-stage regions,
-//!   schedules, and lane records;
-//! * the **bound-trace sidecar** (`PTIB`, [`sidecar`]) — the typed lowering that
-//!   carries those plans, so a driver never re-infers shapes.
+//! Nothing is serialized on the way out. A [`CompiledStage`] is handed to
+//! `pie-codegen` as a Rust value and reaches a driver as generated source plus
+//! the launch package's typed records ([`LaneRecord`]); the driver is told what
+//! to run rather than given bytes to parse. [`debug_stage_plan`] renders a plan
+//! for humans, and [`stage_identity`] hashes one for cache keys, but neither is
+//! a format anything decodes.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
 extern crate alloc;
 
 mod compile;
-pub mod sidecar;
+pub mod lane_table;
 
-pub use compile::*;
+// Spelled out rather than `pub use compile::*`. The glob made every `pub` item
+// anywhere under `compile` part of this crate's API whether or not anything
+// called it, so the surface grew silently and nothing ever shrank it.
+pub use compile::{
+    COMPILER_VERSION, ChannelSink, CompiledStage, Dimension, LibraryOp, NodeIndex,
+    NormalizedStage, PartitionKind, PlanMetrics, REGION_PLAN_VERSION, Region, RegionKind,
+    RegionPartition, ScheduleTemplate, StageSignature, SymbolicExtent, SymbolicType, ValueDomain,
+    compile_bound, compile_stage, compile_stage_at, debug_stage_plan, library_op_for_tag,
+    stage_identity,
+};
+pub use lane_table::{
+    LANE_TABLE_ABI_VERSION, LaneChannelSlot, LaneRecord, LaneTableHeader, RuntimeExtents,
+};

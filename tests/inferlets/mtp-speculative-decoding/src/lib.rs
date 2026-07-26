@@ -74,8 +74,11 @@ async fn main(input: Input) -> Result<String> {
     // prompt, every token the host may keep, and the transient overshoot of
     // in-flight windows (each fire may write up to `w` slots above the
     // committed length before a rejection rolls the length back over them).
+    // `channel_capacity() - 1` is the run-ahead window in fires — one cell per
+    // fire, with the staging margin set aside — plus the same 2-fire headroom
+    // the hand-rolled window carried.
     let ws = WorkingSet::new();
-    let max_extent = n + input.max_tokens as u32 + (DEFAULT_RUNAHEAD_DEPTH as u32 + 2) * w;
+    let max_extent = n + input.max_tokens as u32 + (channel_capacity() as u32 + 1) * w;
     let max_pages = max_extent.div_ceil(PAGE_T);
     ws.reserve(max_pages)
         .map_err(|e| format!("reserve KV: {e}"))?;
@@ -153,7 +156,7 @@ async fn main(input: Input) -> Result<String> {
     let readout = Channel::from((0..w).collect::<Vec<_>>()).named("readout");
     let stopped = Channel::from_shaped([1u32], vec![false]).named("stopped");
     let committed_out = Channel::new([w], dtype::i32)
-        .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+        .capacity(channel_capacity() as u32)
         .named("committed");
 
     let fwd = ForwardPass::new();
@@ -255,44 +258,34 @@ async fn main(input: Input) -> Result<String> {
     let mut drafted = 0usize;
     let mut accepted = 0usize;
     let mut rounds = 0usize;
-    let mut done = false;
-    let mut in_flight = 0usize;
 
-    while in_flight < DEFAULT_RUNAHEAD_DEPTH {
-        fwd.submit(&pipeline)
-            .map_err(|e| format!("submit verify round: {e}"))?;
-        in_flight += 1;
-    }
-    while !done || in_flight > 0 {
+    // Every verify round commits at least one token, so `max_tokens` bounds
+    // the number of rounds.
+    run_ahead(&pipeline, &fwd, input.max_tokens, async || {
         let round = committed_out
             .take()
             .get::<i32>()
             .await
             .map_err(|e| format!("read committed round: {e}"))?;
-        in_flight -= 1;
         let live = unpad_tokens(&round);
-        if !done && !live.is_empty() {
-            rounds += 1;
-            drafted += k as usize;
-            accepted += live.len() - 1;
-            for token in live {
-                if stop_tokens.contains(&token) {
-                    done = true;
-                    break;
-                }
-                generated.push(token);
-                if generated.len() == input.max_tokens {
-                    done = true;
-                    break;
-                }
+        if live.is_empty() {
+            return Ok(ControlFlow::Continue(()));
+        }
+        rounds += 1;
+        drafted += k as usize;
+        accepted += live.len() - 1;
+        for token in live {
+            if stop_tokens.contains(&token) {
+                return Ok(ControlFlow::Break(()));
+            }
+            generated.push(token);
+            if generated.len() == input.max_tokens {
+                return Ok(ControlFlow::Break(()));
             }
         }
-        if !done {
-            fwd.submit(&pipeline)
-                .map_err(|e| format!("submit verify round: {e}"))?;
-            in_flight += 1;
-        }
-    }
+        Ok(ControlFlow::Continue(()))
+    })
+    .await?;
     pipeline.close();
 
     let acceptance_rate = if drafted == 0 {

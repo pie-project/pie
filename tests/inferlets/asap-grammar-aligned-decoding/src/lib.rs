@@ -147,7 +147,9 @@ fn unpack_mask(packed: &[u32], vocab: u32) -> Vec<bool> {
     if packed.is_empty() {
         return vec![true; vocab as usize];
     }
-    (0..vocab as usize).map(|t| bit_allowed(packed, t)).collect()
+    (0..vocab as usize)
+        .map(|t| bit_allowed(packed, t))
+        .collect()
 }
 
 /// The explored prefix trie. `alpha[node]` is the current over-approximation of
@@ -334,8 +336,8 @@ async fn main(input: Input) -> Result<Output> {
             let mask_ch = Channel::new([vocab], dtype::bool).named("mask");
             let alpha_idx = Channel::new([pairs as u32], dtype::u32).named("alpha_idx");
             let alpha_val = Channel::new([pairs as u32], dtype::f32).named("alpha_val");
-            let rng = Channel::from(vec![input.seed ^ (round as u32 * 0x9E37) ^ 0x5bd1, 0])
-                .named("rng");
+            let rng =
+                Channel::from(vec![input.seed ^ (round as u32 * 0x9E37) ^ 0x5bd1, 0]).named("rng");
             let token_out = Channel::new([1], dtype::i32).named("token_out");
             let mass_out = Channel::new([1], dtype::f32).named("mass_out");
             let prob_out = Channel::new([1], dtype::f32).named("prob_out");
@@ -418,7 +420,8 @@ async fn main(input: Input) -> Result<Output> {
         for step in (0..masses.len()).rev() {
             let parent = path_nodes[step];
             trie.mass[parent] = masses[step];
-            trie.edge_prob.insert((parent, generated[step]), probs[step]);
+            trie.edge_prob
+                .insert((parent, generated[step]), probs[step]);
             trie.recompute(parent);
         }
 

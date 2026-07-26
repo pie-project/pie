@@ -287,8 +287,7 @@ async fn main(input: Input) -> Result<Output> {
         let counts = counts_p.take().tensor();
         let present = present_p.take().tensor();
         let logits = intrinsics::logits();
-        let (token, counts_next, n_pen, peak) =
-            step(logits, vocab, cfg, &counts, &present, &r);
+        let (token, counts_next, n_pen, peak) = step(logits, vocab, cfg, &counts, &present, &r);
         let r_next = add(&r, iota(2));
         tok_out_p.put(&token);
         pen_out_p.put(&n_pen);
@@ -336,13 +335,13 @@ async fn main(input: Input) -> Result<Output> {
         let counts_c = Channel::from(counts0).named("counts");
         let present_c = Channel::from(present).named("present");
         let tok_out = Channel::new([1], dtype::i32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+            .capacity(channel_capacity() as u32)
             .named("tok_out");
         let pen_out = Channel::new([1], dtype::f32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+            .capacity(channel_capacity() as u32)
             .named("pen_out");
         let peak_out = Channel::new([1], dtype::f32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+            .capacity(channel_capacity() as u32)
             .named("peak_out");
         let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
         let positions = Channel::from(vec![n]).named("positions");
@@ -374,8 +373,7 @@ async fn main(input: Input) -> Result<Output> {
             let counts = counts_c.take().tensor();
             let present = present_c.take().tensor();
             let logits = intrinsics::logits();
-            let (token, counts_next, n_pen, peak) =
-                step(logits, vocab, cfg, &counts, &present, &r);
+            let (token, counts_next, n_pen, peak) = step(logits, vocab, cfg, &counts, &present, &r);
 
             let r_next = add(&r, iota(2));
             let next_length = add(&length, 1u32);
@@ -397,15 +395,7 @@ async fn main(input: Input) -> Result<Output> {
         });
 
         let budget = max_tokens - 1;
-        let mut submitted = 0usize;
-        let mut in_flight = 0usize;
-        while in_flight < DEFAULT_RUNAHEAD_DEPTH && submitted < budget {
-            fwd.submit(&pipe)
-                .map_err(|e| format!("decode submit @{}: {e}", submitted + 1))?;
-            submitted += 1;
-            in_flight += 1;
-        }
-        while in_flight > 0 {
+        run_ahead(&pipe, &fwd, budget as usize, async || {
             let t = tok_out
                 .take()
                 .get::<i32>()
@@ -421,17 +411,12 @@ async fn main(input: Input) -> Result<Output> {
                 .get::<f32>()
                 .await
                 .map_err(|e| format!("peak_out.take @{}: {e}", generated.len()))?[0];
-            in_flight -= 1;
             generated.push(t as u32);
             penalized.push(p);
             peaks.push(k);
-            if submitted < budget {
-                fwd.submit(&pipe)
-                    .map_err(|e| format!("decode submit @{}: {e}", submitted + 1))?;
-                submitted += 1;
-                in_flight += 1;
-            }
-        }
+            Ok(ControlFlow::Continue(()))
+        })
+        .await?;
     }
     pipe.close();
 

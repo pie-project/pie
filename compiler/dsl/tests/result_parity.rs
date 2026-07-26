@@ -1,8 +1,10 @@
-//! Tier-0 result-parity tests (the semantic correctness gate): the SDK-emitted
-//! §3 / greedy container, bound and run on echo's reference interpreter
-//! (`ptir::interp`, `eval` feature), yields the SAME TOKEN RESULTS as echo's
+//! Result parity with the IR's own fixtures — the semantic correctness gate.
+//!
+//! The SDK-emitted
+//! §3 / greedy container, bound and run on the IR's reference interpreter
+//! (`ptir::interp`, `eval` feature), yields the SAME TOKEN RESULTS as the IR's
 //! golden `greedy_argmax` / `section3_masked_gumbel` fixtures — and encode→decode
-//! round-trips. This is the correctness contract (NOT hash-equality with echo's
+//! round-trips. This is the correctness contract (NOT hash-equality with the IR's
 //! hand-built containers; emission order may differ, results may not).
 //!
 //! The guest does not bind (D6): [`Builder::build`] lowers + lints only, and
@@ -237,7 +239,7 @@ fn section3_tier0_matches_golden() {
         *traced.container()
     );
 
-    // Per-instance seeds (D2): tok=BOS, len=1, rng=[1234,0] (echo's golden seeds).
+    // Per-instance seeds (D2): tok=BOS, len=1, rng=[1234,0] (the IR's golden seeds).
     let mut inst = Instance::new(
         &bound,
         &[
