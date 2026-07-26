@@ -3,7 +3,7 @@ name = "pie-bin"
 version = "0.1.0"
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
-description = "The pie standalone composition root: multi-call CLI (local/serve + ops) composing bootstrap + the controller/gateway/worker role libs in-proc."
+description = "The pie standalone composition root: multi-call CLI (local/serve + ops) composing the startup skeleton + the controller/gateway/worker role libs in-proc."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
@@ -28,8 +28,9 @@ driver-dummy = ["pie-worker/driver-dummy"]
 profile-fire = ["pie-worker/profile-fire"]
 
 [dependencies]
-# Shared process skeleton (CLI flags, paths, tracing, signals, /metrics, banner).
-pie-bootstrap = { path = "../../bootstrap" }
+# Shared process skeleton (imports as `startup`): CLI flags, paths, tracing,
+# signals, /metrics, banner.
+pie-env = { path = "../env" }
 # The three role libs — bin/pie is the ONE crate that deps all three (Seam 4).
 pie-controller = { path = "../../controller" }
 pie-gateway = { path = "../../gateway" }

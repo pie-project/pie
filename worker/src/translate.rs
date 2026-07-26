@@ -5,7 +5,7 @@
 //! constructs through the pyo3 `pie._runtime.Config` builder. We do
 //! the same construction here in pure Rust, sourcing:
 //!   * scalars from the user TOML
-//!   * dirs (cache/log/runtime) from `bootstrap::paths::pie_home()` (`~/.pie/...`)
+//!   * dirs (cache/log/runtime) from [`crate::paths::pie_home`] (`~/.pie/...`)
 //!   * capability/backend bundles collected before bootstrap.
 
 use std::path::PathBuf;
@@ -39,7 +39,7 @@ pub fn build(
         );
     }
 
-    let pie_home = bootstrap::paths::pie_home();
+    let pie_home = crate::paths::pie_home();
     let cache_dir = pie_home.join("programs");
     let log_dir = Some(pie_home.join("logs"));
 
@@ -71,7 +71,7 @@ pub fn build(
             py_runtime_dir: pie_home.join("py-runtime"),
         },
         model,
-        // The `bootstrap` lib (Seam 2) installs the global tracing subscriber;
+        // The `startup` lib (Seam 2) installs the global tracing subscriber;
         // the runtime must NOT re-init it (double global-init panics on boot).
         skip_tracing: true,
         max_concurrent_processes: user.server.max_concurrent_processes,

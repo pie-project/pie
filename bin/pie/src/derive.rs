@@ -9,7 +9,7 @@
 use anyhow::{Context, Result};
 
 /// Read the combined standalone config file (the `[controller]/[gateway]/[worker]`
-/// TOML the CLI ops operate on). A bin/pie concern: bootstrap sources config for
+/// TOML the CLI ops operate on). A bin/pie concern: the skeleton sources config for
 /// the daemon boot path; ops read it directly here.
 pub fn read_config_file(path: &std::path::Path) -> Result<String> {
     std::fs::read_to_string(path).with_context(|| format!("reading config file {}", path.display()))
@@ -28,7 +28,7 @@ pub fn load_worker_config(path: &std::path::Path) -> Result<pie_worker::Config> 
 /// standalone TOML string (its contents promoted to top level, e.g.
 /// `[worker.driver]` → `[driver]`). A **missing** section yields an empty string
 /// — the role lib then applies its own defaults (matching
-/// `bootstrap::config::source`'s empty-on-missing contract). A present section
+/// `startup::config::source`'s empty-on-missing contract). A present section
 /// that isn't a table is a config error.
 pub fn extract_section(combined: &str, section: &str) -> Result<String> {
     let root: toml::Table = combined.parse().context("parsing standalone config TOML")?;

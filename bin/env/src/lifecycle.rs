@@ -2,8 +2,8 @@
 //! wait-for-signal-then-drain loop behind [`Ctx::run_until_signal`].
 //!
 //! Ruling R1: the shutdown seam is a *future* (a closure the bin builds from its
-//! role `Handle`), never a bootstrap-defined trait — so role libs take no
-//! dependency on bootstrap.
+//! role `Handle`), never a skeleton-defined trait — so role libs take no
+//! dependency on the skeleton.
 
 use std::net::SocketAddr;
 

@@ -1,7 +1,9 @@
-//! `pie-bootstrap` — the shared process skeleton for the pie bins.
+//! `pie-env` — the shared process skeleton for the pie bins, imported as
+//! `startup`, plus the `pie-env` command that reports what that skeleton would
+//! resolve.
 //!
 //! Every bin (`bin/{worker,gateway,controller,pie}`) is a thin shell that
-//! composes `bootstrap` with one or more role libraries. `bootstrap` owns the
+//! composes `startup` with one or more role libraries. `startup` owns the
 //! cross-cutting, domain-agnostic concerns so each role lib stays a pure library:
 //!
 //! - the shared CLI flags as [`GlobalArgs`] (a `clap::Args` the bin flattens into
@@ -9,18 +11,18 @@
 //! - path/dir resolution ([`paths`]);
 //! - config *sourcing* — locate + read the config file into a **String**
 //!   ([`Ctx::config_str`]); the role lib's `Config::parse(&str)` owns all domain
-//!   parsing (bootstrap never sees a typed `Config`);
+//!   parsing (the skeleton never sees a typed `Config`);
 //! - observability — `tracing` init + a minimal Prometheus-text `/metrics`
 //!   endpoint (ruling R2);
 //! - lifecycle — signal/panic handling, the boot banner, and the unified
 //!   wait-for-signal-then-drain loop ([`Ctx::run_until_signal`]).
 //!
-//! Dependency rule (Seam 2): `bootstrap` depends on **no role library**, and no
-//! role library depends on `bootstrap`. It is **runtime-agnostic** — the *bin*
-//! owns the tokio runtime (`#[tokio::main]`); bootstrap only `spawn`s onto the
+//! Dependency rule (Seam 2): `startup` depends on **no role library**, and no
+//! role library depends on `startup`. It is **runtime-agnostic** — the *bin*
+//! owns the tokio runtime (`#[tokio::main]`); the skeleton only `spawn`s onto the
 //! ambient one and its async surface is `.await`ed by the bin. The shutdown seam
 //! is a future, not a trait (ruling R1), so role `Handle`s never depend on
-//! bootstrap.
+//! the skeleton.
 //!
 //! ## The bin shape (Seam 3) — identical across all four but the middle lines
 //!
@@ -31,7 +33,7 @@
 //! #[command(version)]
 //! struct Cli {
 //!     #[command(flatten)]
-//!     global: bootstrap::GlobalArgs,
+//!     global: startup::GlobalArgs,
 //!     // role-specific flags, read directly off `cli` (typed):
 //!     #[arg(long)]
 //!     listen: Option<String>,
@@ -40,8 +42,8 @@
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<std::process::ExitCode> {
 //!     let cli = Cli::parse();
-//!     let ctx = bootstrap::init(
-//!         bootstrap::BootSpec::controller()
+//!     let ctx = startup::init(
+//!         startup::BootSpec::controller()
 //!             .version(env!("CARGO_PKG_VERSION")),
 //!         cli.global,
 //!     )?;
@@ -55,11 +57,21 @@
 //! `spawn`s the `/metrics` task. `--version`/`--help` are handled by the bin's
 //! own `clap::Parser`. The `?`→`ExitCode` plumbing is just
 //! `-> anyhow::Result<ExitCode>` (both `Termination`), so no wrapper is needed.
+//!
+//! ## The `pie-env` binary
+//!
+//! Everything above happens *inside* a daemon that is about to start listening.
+//! `pie-env` runs the same resolution ([`report::resolve`]) and prints it
+//! instead — which config file a given role will actually read, where each value
+//! came from (flag / env / default), and whether the boot preconditions hold. It
+//! shares the resolution code with [`init`], so it cannot disagree with the
+//! daemons.
 
 mod config;
 mod lifecycle;
 mod observe;
 pub mod paths;
+pub mod report;
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -167,6 +179,22 @@ impl BootSpec {
     pub fn pie() -> Self {
         Self::new("pie").default_config_filename("config.toml")
     }
+
+    /// Every role name a spec exists for, in report order.
+    pub const ROLES: [&'static str; 4] = ["worker", "gateway", "controller", "pie"];
+
+    /// The spec for a role name from [`BootSpec::ROLES`]. Lets `pie-env` (and
+    /// anything else driven by a `--role` string) reach the exact same
+    /// per-role defaults the daemons compile in, instead of restating them.
+    pub fn for_role(role: &str) -> Option<Self> {
+        match role {
+            "worker" => Some(Self::worker()),
+            "gateway" => Some(Self::gateway()),
+            "controller" => Some(Self::controller()),
+            "pie" => Some(Self::pie()),
+            _ => None,
+        }
+    }
 }
 
 /// The initialised process context: the sourced config string and the component
@@ -187,7 +215,7 @@ impl Ctx {
     /// `async move { handle.shutdown().await }`) and return an [`ExitCode`].
     ///
     /// The shutdown seam is a future, not a trait (R1). `.await` this from the
-    /// bin's `#[tokio::main]` body — bootstrap owns no runtime.
+    /// bin's `#[tokio::main]` body — the skeleton owns no runtime.
     pub async fn run_until_signal(self, shutdown: impl Future<Output = ()>) -> ExitCode {
         lifecycle::wait_for_signal().await;
         tracing::info!("{}: shutdown signal received, draining", self.name);
@@ -306,7 +334,7 @@ mod tests {
     #[test]
     fn config_source_reads_explicit_and_errors_on_missing() {
         let spec = BootSpec::worker();
-        let path = std::env::temp_dir().join(format!("pie-bootstrap-{}.toml", std::process::id()));
+        let path = std::env::temp_dir().join(format!("pie-env-{}.toml", std::process::id()));
         std::fs::write(&path, "key = 1\n").unwrap();
         let present = GlobalArgs {
             config: Some(path.to_string_lossy().into_owned()),
@@ -319,7 +347,7 @@ mod tests {
         // An explicitly requested but missing file is an error (vs a missing
         // default, which yields an empty string for role defaults).
         let missing = GlobalArgs {
-            config: Some("/nonexistent/pie-bootstrap-missing.toml".into()),
+            config: Some("/nonexistent/pie-env-missing.toml".into()),
             log_level: "info".into(),
             metrics_addr: None,
         };

@@ -4,8 +4,8 @@
 //! (`model`/`doctor`/...). The only crate that depends on all three role libs.
 //!
 //! Process model (Model A): `#[tokio::main]` owns the one runtime; every
-//! subcommand runs on it. `local`/`serve` use the full daemon `bootstrap::init`
-//! + `run_until_signal`; one-shot ops use the light `bootstrap::init_cli`.
+//! subcommand runs on it. `local`/`serve` use the full daemon `startup::init`
+//! + `run_until_signal`; one-shot ops use the light `startup::init_cli`.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -13,7 +13,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use pie_bin::{compose, derive, ops};
 /// Top-level `pie` invocation. The shared global flags (`--config`,
-/// `--log-level`, `--metrics-addr`) are flattened from `bootstrap`.
+/// `--log-level`, `--metrics-addr`) are flattened from `startup`.
 #[derive(Parser, Debug)]
 #[command(
     name = "pie",
@@ -23,7 +23,7 @@ use pie_bin::{compose, derive, ops};
 )]
 struct Cli {
     #[command(flatten)]
-    global: bootstrap::GlobalArgs,
+    global: startup::GlobalArgs,
     #[command(subcommand)]
     command: Command,
 }
@@ -119,14 +119,14 @@ async fn main() -> anyhow::Result<ExitCode> {
         Command::Serve => serve(cli.global, compose::Mode::Serve).await,
 
         Command::Model { cmd } => {
-            bootstrap::init_cli(&cli.global)?;
+            startup::init_cli(&cli.global)?;
             // `model::run` is synchronous + blocking (HF download); keep it off
             // the async reactor.
             tokio::task::spawn_blocking(move || ops::model::run(cmd)).await??;
             Ok(ExitCode::SUCCESS)
         }
         Command::Runtime { cmd } => {
-            bootstrap::init_cli(&cli.global)?;
+            startup::init_cli(&cli.global)?;
             match cmd {
                 RuntimeCmd::Install => {
                     let dir =
@@ -146,47 +146,47 @@ async fn main() -> anyhow::Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Doctor => {
-            bootstrap::init_cli(&cli.global)?;
+            startup::init_cli(&cli.global)?;
             ops::doctor::doctor()?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Auth { cmd } => {
-            bootstrap::init_cli(&cli.global)?;
+            startup::init_cli(&cli.global)?;
             ops::auth::run(cmd)?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Config { cmd } => {
-            bootstrap::init_cli(&cli.global)?;
+            startup::init_cli(&cli.global)?;
             ops::config::run(cmd)?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Inferlet { cmd } => {
-            bootstrap::init_cli(&cli.global)?;
+            startup::init_cli(&cli.global)?;
             ops::inferlet::run(cmd).await?;
             Ok(ExitCode::SUCCESS)
         }
         Command::New(args) => {
-            bootstrap::init_cli(&cli.global)?;
+            startup::init_cli(&cli.global)?;
             ops::bakery::run_new(args)?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Build(args) => {
-            bootstrap::init_cli(&cli.global)?;
+            startup::init_cli(&cli.global)?;
             ops::bakery::run_build(args)?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Driver { cmd } => {
-            bootstrap::init_cli(&cli.global)?;
+            startup::init_cli(&cli.global)?;
             ops::driver::run(cmd)?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Check { config, debug } => {
-            bootstrap::init_cli(&cli.global)?;
+            startup::init_cli(&cli.global)?;
             ops::diag::check(&config, debug)?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Smoke { rpc, flavor } => {
-            bootstrap::init_cli(&cli.global)?;
+            startup::init_cli(&cli.global)?;
             ops::diag::smoke(rpc, flavor.as_deref())?;
             Ok(ExitCode::SUCCESS)
         }
@@ -196,9 +196,9 @@ async fn main() -> anyhow::Result<ExitCode> {
 /// The `local`/`serve` path: full daemon `init` → derive the three typed role
 /// Configs from the standalone TOML → boot the in-proc cluster (golf's compose)
 /// → run until SIGINT/SIGTERM, then drain. One boot path, parameterized by mode.
-async fn serve(global: bootstrap::GlobalArgs, mode: compose::Mode) -> anyhow::Result<ExitCode> {
-    let ctx = bootstrap::init(
-        bootstrap::BootSpec::pie().version(env!("CARGO_PKG_VERSION")),
+async fn serve(global: startup::GlobalArgs, mode: compose::Mode) -> anyhow::Result<ExitCode> {
+    let ctx = startup::init(
+        startup::BootSpec::pie().version(env!("CARGO_PKG_VERSION")),
         global,
     )?;
     // Provision the embedded Python-WASM runtime before booting — the worker

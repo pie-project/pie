@@ -45,7 +45,7 @@ pub struct Config {
 impl Config {
     /// Parse a TOML config string into a validated [`Config`]. **Pure**: no file
     /// IO, no env, no clap — sourcing the string (file locate/read + env merge)
-    /// is the bootstrap/bin layer's job (Seam 2). The role lib owns only the
+    /// is the bin layer's job (Seam 2). The role lib owns only the
     /// domain parse + validation.
     pub fn parse(s: &str) -> Result<Self> {
         let cfg: Config = toml::from_str(s).map_err(|e| {
