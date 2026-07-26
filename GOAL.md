@@ -40,10 +40,13 @@ on batch size:
 
 Three consequences follow, and none of them are latency arguments:
 
-- **Speculative decoding breaks.** Verifying `k` drafts is `k` times the grammar
-  work, and it lands *after* the draft, on the critical path, with nothing to
-  overlap. Measured at batch 512, k=8: XGrammar 33,367 µs against 56 µs. That
-  ratio does not shrink as CPUs get faster; it grows as `k` does.
+- **Speculative decoding is not yet an argument.** An earlier version of this
+  document claimed 33,367 µs against 56 µs at batch 512, k=8. That measured
+  XGrammar filling a bitmask per draft position, which is not the API it offers
+  for this: `traverse_draft_tree` walks the whole draft tree in one call and is
+  flat in `k` - 1,218 µs at batch 512 whether `k` is 1, 4 or 8. The per-position
+  path costs 56,323 µs at `k`=8, so the old comparison overstated the gap by
+  about 46x. It has been withdrawn.
 - **Sampler fusion becomes possible.** If the allowed set is on device, sampling
   reads 400 candidates instead of 151,669. Measured at batch 512: unconstrained
   FlashInfer 3,457 µs, fused constrained sampling 198 µs. *Constraining makes
@@ -139,20 +142,41 @@ Context: a 7B decode step at batch 512 is ~8.5 ms (weight streaming lower bound,
 measured 1,648 GB/s). Today's constrained path adds 8.97 ms — it more than
 doubles the step. The fused path adds 0.198 ms, or 2.3%.
 
-### Example 2: speculative decoding breaks CPU grammar execution
+### Example 2: speculative decoding, withdrawn and re-measured
 
-A CPU matcher must fill a mask and accept a token serially for each draft
-position, then roll back. Grammar cost per outer step (median wall, µs):
+This section used to report XGrammar at 33 ms per outer step against 56 µs, a
+594x ratio. It measured the wrong thing on both sides.
 
-| batch | k | XGrammar | gpugrammar | ratio |
+On XGrammar's side it filled a bitmask once per draft position, which is not
+how XGrammar verifies drafts. `traverse_draft_tree` takes the whole tree in one
+call, and it is flat in `k`:
+
+| batch | k | `traverse_draft_tree` | per-position | overstatement |
 |---:|---:|---:|---:|---:|
-| 512 | 1 | 4,155.6 | 13.3 | 312× |
-| 512 | 4 | 16,500.7 | 31.9 | 518× |
-| 512 | 8 | **33,366.7** | 56.2 | **594×** |
+| 512 | 1 | 1,200 µs | 1,400 µs | 1.2x |
+| 512 | 4 | 1,213 µs | 4,901 µs | 4.0x |
+| 512 | 8 | 1,218 µs | 56,323 µs | **46.2x** |
 
-At batch 512 with 8 draft tokens XGrammar spends 33 ms of CPU per outer step —
-about 4× a 7B decode step. Constrained speculative decoding at scale is not
-slow today; it is infeasible.
+On our side the number was unreproducible, and it could not have been real:
+`DeviceBatch` has no device-side advance. It fills a mask from a configuration
+set the *host* uploads, and after every sampled token the host parser runs and
+the whole set is uploaded again. Verifying `k` drafts on device is therefore
+not something the implementation can do at all.
+
+That gap is also the largest single cost in our own decode loop. Charging every
+component at batch 512:
+
+| schema | device fill | host advance | host->device upload | total | XGrammar | end to end |
+|---:|---:|---:|---:|---:|---:|---:|
+| 2 | 2,538 | 1,134 | 2,099 | 5,771 | 11,729 | 1.21x |
+| 3 | 430 | 453 | 1,007 | 1,889 | 12,261 | 1.43x |
+| 8 | 31 | 195 | 875 | 1,101 | 2,067 | 1.04x |
+
+The upload is 53% to 79% of what we spend, and it exists only because the
+advance is on the host. A device-side advance would delete both columns - on
+schema 3 the step goes from 1,889 µs to 430 µs and end-to-end from 1.43x to
+1.63x - and it is the prerequisite for verifying drafts without leaving the
+device. It is the single highest-value piece of work remaining.
 
 ## Grammar class decision
 
