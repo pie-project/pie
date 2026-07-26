@@ -158,6 +158,7 @@ pub struct DriverConfig {
     pub has_value_head: bool,
     pub has_kv_envelopes: bool,
     pub has_attn_score: bool,
+    pub has_attn_page_mask: bool,
     pub device_geometry_port_mask: u32,
     pub limits: crate::driver::SchedulerLimits,
     pub driver_backend: crate::driver::DriverBackend,
@@ -301,6 +302,8 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             && driver_configs.iter().all(|d| d.has_kv_envelopes),
         has_attn_score: !driver_configs.is_empty()
             && driver_configs.iter().all(|d| d.has_attn_score),
+        has_attn_page_mask: !driver_configs.is_empty()
+            && driver_configs.iter().all(|d| d.has_attn_page_mask),
     };
     model::register(
         name.clone(),

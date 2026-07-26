@@ -487,7 +487,7 @@ applied. It is also fixed per layer, whereas Quest's saving grows with context,
 so the number to beat is not 24% but 24% measured at a context long enough for
 attention to dominate. This should be re-measured at 8K-128K once §8.6 lands.
 
-### 8.6 What remains: mask consumption
+### 8.6 Mask consumption: the design (built; see §10)
 
 The one piece of Track A not built. The design is now fully determined by two
 findings, both verified against the sources:
@@ -731,3 +731,120 @@ reported `naive-baseline` at 8.08 ms/token against 6.34 ms/token an hour
 earlier, and showed `tova-attention` as *faster* than the baseline it strictly
 dominates. Kernel-level claims in this document come from the CUDA-event
 harness, which measures device time and is immune to that.
+
+---
+
+## 10. Mask consumption as built (implementation record)
+
+The last piece of both tracks, and the one that turns observation into
+enforcement. Until this landed, every Quest test passed *whether or not the
+mask was applied* — the program ranked pages, the driver read the ranking, and
+attention then ignored it. The cost was real and the benefit was zero.
+
+### 10.1 What runs
+
+`quest-attention` on Qwen3-0.6B / L40S, `PIE_CUDA_KV_ENVELOPES=1`:
+
+| budget | continuation |
+|---|---|
+| 18 (= all pages) | ` (This is a list of statements about Paris. Please answer` |
+| 1 | ` (Question: What is the probability that a randomly selected person` |
+| `naive-baseline` | ` (This is a list of statements about Paris. Please answer` |
+
+Both halves matter and they pull in opposite directions:
+
+- **Enforcement** — budget 1 diverges. Attention really is confined to the
+  pages the policy kept.
+- **Coherence** — budget 18 reproduces the unmasked baseline *token for token*.
+  An all-keep mask is a no-op, so the compaction does not reorder pages, drop
+  the wrong one, or desynchronise `last_page_len` from the list it belongs to.
+
+`tests/inferlets/test_mask_enforced.py` asserts exactly this pair. The curated
+matrix is 37/37 with the sink live.
+
+### 10.2 The mask must not be addressed by the page CSR
+
+This is the whole difficulty, and the first design was wrong about it.
+
+The obvious layout is one mask byte per page, sliced per request by the fire's
+`kv_page_indptr` — the same CSR everything else in the fire uses. It cannot
+work, for the reason §9.3 gives: **the host page CSR is a bound, the device CSR
+is exact.** The mask is written from the host (that is where the lane table and
+the program's value live) and consumed by a device kernel walking the real page
+table. Under decode envelopes those two CSRs disagree — `frame.cpp` substitutes
+`plan_kv_page_indptr` and a uniform `page_size` for the host copies while the
+device resolves the true geometry itself — so request *r*'s mask row and
+request *r*'s page list start at different offsets. Every eviction after the
+first request lands on another request's pages.
+
+That is not a hypothetical path. It is *the* path: Quest's `page_indptr` is
+device-computed, so `has_decode_envelopes` is true for exactly the fires the
+feature exists to serve. An earlier revision detected the hazard and threw,
+which was correct but left the feature unreachable.
+
+**The fix is to delete the shared dependency rather than reconcile it.** The
+mask is `[num_requests, stride]`, row-major, addressed by *request index times a
+fixed stride* — the page CSR appears nowhere in it. `stride` is the widest
+request's page count taken from the host CSR, so a conservative host CSR only
+over-allocates; it never mis-addresses. The single fact the writer and the
+reader must agree on is "slot *p* of request *r*", which is precisely what the
+program means when it writes `mask[p]` from `scores[p]`, and precisely what
+`envelope_dot` meant when it produced `scores[p]`.
+
+Two consequences fall out, both in the safe direction:
+
+- A slot past the end of a row keeps its page (`page_survives`). Under the
+  stride invariant this is unreachable, but the stride comes from a host table
+  and the count from device geometry, so the check is what makes a disagreement
+  an over-attend rather than an out-of-bounds read.
+- Rows are seeded to 1 before every layer, and the sink writes only
+  `min(stride, declared)` entries. A page no policy examined is kept. The
+  alternative — evicting a page nothing scored — is not recoverable.
+
+`test_page_compact` case 7/8 pin this: they run the compaction with rows
+deliberately wider than any request needs, which is what the driver actually
+produces. A kernel that recovered the row base from `page_indptr_in` passes
+every other case in the file and fails these two.
+
+### 10.3 The compaction
+
+`launch_compact_page_csr` (`driver/cuda/src/kernels/page_compact.cu`) rewrites
+the fire's paged-KV CSR down to the kept pages, in three launches: count
+(`cub::BlockReduce`), exclusive-scan the per-request counts
+(`cub::BlockScan`, tiled with a `running` aggregate), scatter (tiled, order
+preserving). Three invariants:
+
+1. **Order is preserved.** FlashInfer's page list is positional; permuting it
+   permutes the KV it reads.
+2. **The last page always survives**, unconditionally. It holds the token this
+   fire is writing, and keeping it last is what lets `last_page_len` — and the
+   `kv_len = (pages-1)*page_size + last_page_len` identity built on it — carry
+   over from the original CSR untouched.
+3. **A request never drops to zero pages.**
+
+Substitution happens on the decode call only, and only after
+`decode_plan_is_page_count_independent` confirms the fire planned the static
+non-split path. A split-KV plan derives its tile indices *from* the page counts,
+so a shorter list would silently attend over the wrong tiles.
+
+### 10.4 A latent DSL bug: the name table was emitted in first-use order
+
+`intern_name` assigns indices in first-use order; the container requires the
+name table to be strictly sorted and unique. No program had ever used two
+second-party names, so nothing noticed. Quest using both `envelope_dot` and
+`attn_page_mask` — where the one used second sorts first — produced a container
+the loader rejected outright.
+
+Fixed in `builder.rs::build()` by sorting the table and remapping every
+`KernelCall`/`SinkCall` `name_idx`, mirroring the channel-gid remap directly
+above it. The remap is the half worth testing: sorting alone still loads, and
+silently invokes the wrong kernel.
+
+### 10.5 Capability gating
+
+`attn_page_mask` is a *first-party* sink in `KNOWN_SINKS`, so the validator
+never gated it — a program would bind on any backend and no-op on the ones that
+cannot enforce. `has_attn_page_mask` now travels from the CUDA context through
+`PtirCaps` to `ModelProfile`, and `validate.rs` refuses the bind where it is
+false. Backends that only observe now say so at bind time rather than at
+runtime, or worse, never.

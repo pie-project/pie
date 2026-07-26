@@ -2252,6 +2252,8 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
         .context = &stage_hook_context,
         .wants_attn_score =
             engine.dispatch->launch_wants_attn_score(s.dispatch_view),
+        .wants_page_mask =
+            engine.dispatch->launch_wants_page_mask(s.dispatch_view),
         .execute = [](
             void* opaque,
             model::StageHookPoint point,

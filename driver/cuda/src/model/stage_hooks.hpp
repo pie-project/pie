@@ -23,6 +23,11 @@ struct StageHooks {
     // buffer nobody wrote.
     bool wants_attn_score = false;
 
+    // The fire's PTIR programs write `attn_page_mask` at `OnAttnProj`, and the
+    // model is expected to honour it by compacting its page table before the
+    // attention call.
+    bool wants_page_mask = false;
+
     void (*execute)(
         void* context,
         StageHookPoint point,

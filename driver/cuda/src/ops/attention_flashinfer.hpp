@@ -45,6 +45,12 @@ PrefillPlanCachePtr make_prefill_plan();
 std::uint32_t decode_plan_graph_layout(const DecodePlanCache& cache);
 std::uint32_t prefill_plan_graph_layout(const PrefillPlanCache& cache);
 
+// Whether this plan's schedule is independent of the page counts it was
+// planned against, and therefore whether the launch may be handed a different
+// (compacted) page list than the plan saw. Only the static non-split decode
+// plan qualifies. See `DecodePlanCache::page_count_independent`.
+bool decode_plan_is_page_count_independent(const DecodePlanCache& cache);
+
 // Compute decode plan once per fire. Stores results in `cache` and the
 // workspace's int/float buffers (so per-layer dispatch can read them).
 void plan_attention_flashinfer_decode_bf16(

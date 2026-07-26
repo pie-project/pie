@@ -669,6 +669,36 @@ static __global__ void k_generated_scan_u32(
 //                           This is both the fail-safe direction and Quest's
 //                           own "keep the local window" rule.
 //   otherwise            -> the bound.
+// `attn_page_mask(mask)` — the write side of the attention hook. Threshold the
+// program's per-page mask row into the model-owned keep buffer for this lane.
+//
+// The mask is read as "nonzero keeps", matching the DSL's documented contract.
+// Anything the program did not rank cannot reach here: the host arm refuses a
+// lane whose page list is longer than the declared mask, rather than letting
+// the tail default either way. Defaulting to keep would silently disable the
+// policy; defaulting to drop would silently evict real context.
+template <typename T>
+static __global__ void k_generated_attn_page_mask(
+    const PtirLaneTableHeader* header,
+    const PtirLaneRecord* lanes,
+    const GroupedLanePageMaskDevice* dests,
+    const std::uint64_t* values,
+    std::uint32_t value_count,
+    std::uint32_t mask_value) {
+    const std::uint32_t lane = blockIdx.x;
+    if (lane >= header->lane_count) return;
+    if (*grouped_commit(lanes, lane) == 0) return;
+
+    const GroupedLanePageMaskDevice d = dests[lane];
+    if (d.out == nullptr) return;
+    const T* mask = grouped_value<T>(values, value_count, lane, mask_value);
+    if (mask == nullptr) return;
+
+    for (std::uint32_t p = threadIdx.x; p < d.pages; p += blockDim.x) {
+        d.out[p] = mask[p] != static_cast<T>(0) ? std::uint8_t{1} : std::uint8_t{0};
+    }
+}
+
 template <int BLOCK>
 static __global__ void k_generated_envelope_dot(
     const PtirLaneTableHeader* header,
@@ -1910,6 +1940,88 @@ inline GroupedLaunchResult run_generated_stage(
             const std::uint32_t node = planned_region.nodes.front();
             const auto& op = stage.ops[node].op;
             if (planned_region.library_op == PTIR_LIBRARY_SECOND_PARTY) {
+                if (op.tag == PTIR_OP_SINK_CALL) {
+                    // `second_party_region_supported` already proved this is
+                    // `attn_page_mask` at `OnAttnProj` with a rank-1 argument.
+                    // What is left is that the model published a destination
+                    // for every lane -- a sink with nowhere to write is a
+                    // program whose selection silently never happened, so it
+                    // throws rather than becoming a no-op.
+                    const auto mask_shape = grouped_row_shape(
+                        stage.value_types[op.args[0]], lanes);
+                    const std::uint32_t declared = mask_shape.max_columns;
+                    std::vector<GroupedLanePageMaskDevice> host_dests(
+                        lane_count);
+                    for (std::uint32_t lane = 0; lane < lane_count; ++lane) {
+                        const auto& m = lanes[lane].page_mask;
+                        if (m.out == nullptr) {
+                            throw std::runtime_error(
+                                "attn_page_mask lane has no resolved page "
+                                "mask destination");
+                        }
+                        // The row is sized by the fire (widest request), the
+                        // mask by the program, and neither bounds the other.
+                        // Write the overlap: rows are pre-seeded to "keep", so
+                        // a slot the program did not speak for keeps its page.
+                        // That is the same direction the in-flight page pinning
+                        // already errs in, and the only alternative -- evicting
+                        // a page no policy examined -- is not recoverable.
+                        const std::uint32_t writable =
+                            m.pages < declared ? m.pages : declared;
+                        if (writable == 0) {
+                            throw std::runtime_error(
+                                "attn_page_mask has no page to write; the "
+                                "program's mask and the fire's page list do "
+                                "not overlap");
+                        }
+                        host_dests[lane] =
+                            GroupedLanePageMaskDevice{m.out, writable, 0u};
+                    }
+                    GroupedLanePageMaskDevice* device_dests = nullptr;
+                    const std::size_t dest_bytes =
+                        host_dests.size() * sizeof(GroupedLanePageMaskDevice);
+                    CUDA_CHECK(cudaMallocAsync(
+                        reinterpret_cast<void**>(&device_dests), dest_bytes,
+                        stream));
+                    allocations.values.push_back(device_dests);
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        device_dests, host_dests.data(), dest_bytes,
+                        cudaMemcpyHostToDevice, stream));
+
+                    const std::uint8_t mask_dtype =
+                        stage.value_types[op.args[0]].dtype;
+                    if (mask_dtype == PTIR_DT_F32) {
+                        k_generated_attn_page_mask<float><<<
+                            lane_count, kTier0Block, 0, stream>>>(
+                            device_header, device_lanes, device_dests,
+                            device_value_pointers, value_count, op.args[0]);
+                    } else if (mask_dtype == PTIR_DT_I32) {
+                        k_generated_attn_page_mask<std::int32_t><<<
+                            lane_count, kTier0Block, 0, stream>>>(
+                            device_header, device_lanes, device_dests,
+                            device_value_pointers, value_count, op.args[0]);
+                    } else if (mask_dtype == PTIR_DT_U32) {
+                        k_generated_attn_page_mask<std::uint32_t><<<
+                            lane_count, kTier0Block, 0, stream>>>(
+                            device_header, device_lanes, device_dests,
+                            device_value_pointers, value_count, op.args[0]);
+                    } else if (mask_dtype == PTIR_DT_BOOL) {
+                        // A predicate is what a policy naturally produces
+                        // (`ge(scores, threshold)`), and bool values are stored
+                        // one byte per element here -- so this is the narrow
+                        // instantiation, not a reinterpretation of the u32 one.
+                        k_generated_attn_page_mask<std::uint8_t><<<
+                            lane_count, kTier0Block, 0, stream>>>(
+                            device_header, device_lanes, device_dests,
+                            device_value_pointers, value_count, op.args[0]);
+                    } else {
+                        throw std::runtime_error(
+                            "attn_page_mask has an unsupported mask dtype");
+                    }
+                    CUDA_CHECK(cudaGetLastError());
+                    ++result.body_op_launches;
+                    continue;
+                }
                 // `generated_stage_supported` already proved this is
                 // `envelope_dot` at an attention stage with an f32 vector
                 // result; what is left is that the caller actually resolved the

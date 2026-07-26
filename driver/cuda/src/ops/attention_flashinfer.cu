@@ -34,8 +34,11 @@ std::uint32_t decode_plan_graph_layout(const DecodePlanCache& cache) {
         (cache.hnd_layout ? 8u : 0u));
 }
 
-std::uint32_t prefill_plan_graph_layout(const PrefillPlanCache& cache) {
-    if (!cache.valid) return 0;
+bool decode_plan_is_page_count_independent(const DecodePlanCache& cache) {
+    return cache.valid && cache.page_count_independent;
+}
+
+std::uint32_t prefill_plan_graph_layout(const PrefillPlanCache& cache) {    if (!cache.valid) return 0;
     if (cache.use_sm90) {
         return 0x00800000u |
                static_cast<std::uint32_t>(
@@ -197,8 +200,10 @@ void plan_attention_flashinfer_decode_bf16(
             cache, kv_page_indptr_h, num_requests, num_q_heads, num_kv_heads,
             head_dim, page_size, workspace, stream, enable_cuda_graph,
             full_attention_variant, hnd_layout);
+        cache.page_count_independent = true;
         return;
     }
+    cache.page_count_independent = false;
 
     cache.indptr_h_buf.resize(num_requests + 1);
     for (int r = 0; r <= num_requests; ++r) {

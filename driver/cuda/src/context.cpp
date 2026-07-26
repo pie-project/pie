@@ -801,6 +801,7 @@ int Context::Impl::load_model(
             {"has_value_head", false},
             {"has_kv_envelopes", false},
             {"has_attn_score", false},
+            {"has_attn_page_mask", false},
             {"max_forward_tokens",
              static_cast<std::uint32_t>(std::max(1, c.max_model_len))},
             {"max_forward_requests", 256},
@@ -1581,6 +1582,22 @@ int Context::Impl::load_model(
         fwd_cfg.per_layer_window_left.empty() &&
         !fwd_cfg.use_prefill_decode_plan;
 
+    // Track A/B consumption: `attn_page_mask` is honoured by gathering the
+    // fire's page table down to the kept pages before the attention call. That
+    // substitution is only sound on the plain paged-decode path with a
+    // page-count-independent plan, which is the same set of models
+    // `has_attn_score` describes -- plus one runtime condition the model
+    // rechecks per fire, because a fire that plans split-KV is only knowable at
+    // plan time.
+    //
+    // The remaining condition -- that the fire's HOST page CSR is its real
+    // geometry rather than the decode-envelope bound -- is also per-fire, and
+    // is enforced in `FirePageMask`'s constructor. Capability here is the
+    // static half of the contract; both halves fail loudly.
+    const bool has_attn_page_mask = has_attn_score;
+
+    registry_->dispatch().set_attn_page_mask_available(has_attn_page_mask);
+
     registry_->dispatch().set_kv_envelopes_available(
         has_kv_envelopes,
         has_kv_envelopes
@@ -1805,6 +1822,7 @@ int Context::Impl::load_model(
         {"has_value_head", false},
         {"has_kv_envelopes", has_kv_envelopes},
         {"has_attn_score", has_attn_score},
+        {"has_attn_page_mask", has_attn_page_mask},
         // RV-26: PIE_DEVICE_PORT_ATTN_MASK is deliberately NOT advertised.
         // The runtime classifies masked device-carried decode into the
         // DecodeEnvelope class exactly when this mask claims the port, but

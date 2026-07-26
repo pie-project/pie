@@ -46,6 +46,21 @@ inline constexpr std::uint32_t kFastNucleusChunks = 4;
 // verbatim into the NVRTC source of every generated region, and the on-disk
 // module cache is keyed on the plan bytes that produced it. Widening it would
 // invalidate every cached module for a field only one kernel reads.
+// Per-lane destination for the `attn_page_mask` sink. The buffer is owned by
+// the model body (`model/attn_page_mask.hpp`), which is why this carries a
+// mutable pointer where every other lane view carries const inputs: the sink
+// is the one place a PTIR stage writes *out* to the model.
+struct GroupedLanePageMaskDevice {
+    std::uint8_t* out;
+    std::uint32_t pages;
+    std::uint32_t reserved;
+};
+
+struct GroupedLanePageMask {
+    std::uint8_t* out = nullptr;
+    std::uint32_t pages = 0;
+};
+
 struct GroupedLaneEnvelopeDevice {
     const float* env_min;
     const float* env_max;
@@ -114,6 +129,7 @@ struct GroupedLaneBinding {
     std::uint32_t logits_stride = 0; // physical model row stride
     std::uint32_t program_index = 0;
     GroupedLaneEnvelope envelope{};
+    GroupedLanePageMask page_mask{};
     // Per-lane `[kv_max]` f32 attention-probability row, materialized by
     // `resolve_lane_attn_score` from the layer capture. Null when the stage
     // does not read `AttnScore`; reading it while null is a hard error rather
@@ -1462,6 +1478,14 @@ struct GroupedStageStaticPlan {
                 requires_kernel_call = true;
                 continue;
             }
+            // `attn_page_mask` is in `grouped_supported_tag` (the grouped
+            // interpreter can walk past a sink) but only the fused path can
+            // *execute* it. Same status as `requires_kernel_call`: described
+            // here so the shared lane binding resolves a destination, with
+            // execution coverage enforced at registration and per group.
+            if (op.tag == PTIR_OP_SINK_CALL) {
+                requires_page_mask = true;
+            }
             if (!grouped_supported_tag(op.tag)) {
                 fail("stage contains an unsupported grouped op");
                 return;
@@ -1549,6 +1573,9 @@ struct GroupedStageStaticPlan {
     // launch, and `generated_stage_supported` is re-checked per execution
     // group, so this is descriptive rather than a gate.
     bool requires_kernel_call = false;
+    // The stage writes the `attn_page_mask` sink. Descriptive for the same
+    // reason as `requires_kernel_call`.
+    bool requires_page_mask = false;
     bool requires_mtp_rows = false;
     std::size_t mtp_rows = 0;
     std::vector<std::uint8_t> used_extents;
@@ -1762,6 +1789,10 @@ class GroupedStageAccumulator {
         if (static_plan_->requires_attn_score &&
             lane.attn_score_base == nullptr) {
             return fail("AttnScore intrinsic is unavailable");
+        }
+        if (static_plan_->requires_page_mask &&
+            lane.page_mask.out == nullptr) {
+            return fail("attn_page_mask destination is unavailable");
         }
         if (static_plan_->requires_mtp_rows &&
             (lane.mtp_logits_bf16_rows == nullptr ||

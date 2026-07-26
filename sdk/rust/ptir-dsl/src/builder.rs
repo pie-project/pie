@@ -168,6 +168,33 @@ impl<'a> Builder<'a> {
             })
             .collect();
 
+        // Same story for the NAME table. `intern_name` assigns indices in
+        // first-USE order, but the container requires the table to be strictly
+        // sorted and unique -- so a program naming `envelope_dot` before
+        // `attn_page_mask` emitted a table the loader rejects. This went
+        // unnoticed while every program used at most one second-party name.
+        let mut name_order: Vec<usize> = (0..names.len()).collect();
+        name_order.sort_by(|&a, &b| names[a].cmp(&names[b]));
+        let mut name_remap = vec![0u16; names.len()];
+        for (new_idx, &old_idx) in name_order.iter().enumerate() {
+            name_remap[old_idx] = new_idx as u16;
+        }
+        let names: Vec<String> = name_order.iter().map(|&i| names[i].clone()).collect();
+        let stage_results: Vec<_> = stage_results
+            .into_iter()
+            .map(|mut r| {
+                for op in &mut r.ops {
+                    match op {
+                        Op::KernelCall { name, .. } | Op::SinkCall { name, .. } => {
+                            *name = name_remap[*name as usize];
+                        }
+                        _ => {}
+                    }
+                }
+                r
+            })
+            .collect();
+
         // Sink lint input (stage, sink).
         let sinks: Vec<(Stage, SinkCall)> = stage_results
             .iter()

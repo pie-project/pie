@@ -356,8 +356,10 @@ set(PIE_CUDA_MODEL_SOURCES
   src/kernels/kimi_mla.cu
   src/kernels/mla_paged.cu
   src/kernels/nemotron_h.cu
+  src/kernels/page_compact.cu
   src/kernels/scalar_mul.cu
   src/kernels/softcap.cu
+  src/model/attn_page_mask.cu
   src/model/attn_score.cu
   src/model/config.cpp
   src/model/csm/csm.cpp
@@ -850,6 +852,9 @@ pie_add_cuda_target(test_envelope_dot
   LIBS CUDA::cudart)
 pie_add_cuda_target(test_kv_len_geometry
   SOURCES tests/test_kv_len_geometry.cu src/kernels/geometry.cu
+  LIBS CUDA::cudart)
+pie_add_cuda_target(test_page_compact
+  SOURCES tests/test_page_compact.cu src/kernels/page_compact.cu
   LIBS CUDA::cudart)
 pie_add_cuda_target(test_brle SOURCES tests/test_brle.cpp src/batch/brle.cpp)
 # Host oracle: fork geometry -> BRLE decode -> masking == prefix truncation.
