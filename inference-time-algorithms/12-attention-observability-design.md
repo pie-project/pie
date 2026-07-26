@@ -674,3 +674,60 @@ wrong in exactly the way §9.3 is about.
 3. **Selection is observed, not enforced.** As with Quest, the mask does not yet
    reach attention, so output is bit-identical to `naive-baseline` — which is
    what makes the tap testable.
+
+### 9.8 Measured cost, and what the tap actually costs
+
+The `LogitsTransform` capture is the one part of Track B that touches a tuned
+kernel, so it was measured in isolation rather than inferred from end-to-end
+timings. `test_attn_score_capture` gained a `PIE_ATTN_SCORE_BENCH=1` mode that
+runs both decode entry points against an *identical plan* behind CUDA events —
+the only way to attribute cost to the kernel rather than to the PTIR stage
+machinery wrapped around it.
+
+L40S, head_dim 128, 16 query heads over 8 KV heads, one request:
+
+| `kv_len` | plain | capture (initial) | capture (after §9.8 fix) |
+|---:|---:|---:|---:|
+| 512 | 0.0179 ms | 1.49x | **1.34x** |
+| 2048 | 0.0646 ms | 1.39x | **1.23x** |
+| 6400 | 0.1971 ms | 1.37x | **1.21x** |
+| 16384 | 0.5005 ms | 1.36x | **1.20x** |
+
+**The fix was one hoisted load.** The hook dereferenced
+`params.score_indptr[batch_idx]` on *every* invocation — a global load on the
+kernel's innermost loop, sitting on the dependency path of the store address.
+It is loop-invariant per CTA, so it moved into the variant's constructor beside
+the inherited `kv_len`, and the store became `score_row[qo_head * len + kv]`.
+That removed roughly 44% of the capture overhead. The residual ~1.20x is the
+scattered 4-byte store itself: only `threadIdx.x == 0` writes, so a warp
+contributes two active lanes writing addresses `kv_len` floats apart, which is
+one memory sector per useful 4 bytes. Coalescing it would require restructuring
+the kernel's thread mapping, which is exactly what using a supported extension
+point buys us out of.
+
+**Why the residual is acceptable, and why it is not the number to optimise.**
+The tap's cost is proportional to `kv_len`, and so is the attention it rides on
+— but H2O and TOVA *bound* `kv_len` by construction. Once §8.6-style mask
+consumption lands, a TOVA run with `cache_size = 64` keeps 64 positions
+resident no matter how long the context is, so the 1.20x multiplies a base that
+has itself collapsed. Measuring the tap before eviction exists measures the
+worst case the design can ever exhibit.
+
+This contrasts sharply with Quest, and the contrast is the useful result:
+
+| | ctx ~408 | ctx ~6408 |
+|---|---:|---:|
+| `quest-attention` | +14.6% | **+11.8%** |
+| `tova-attention` (pre-fix) | +20.5% | **+32.0%** |
+
+Quest's tap is a *fixed* per-layer cost — it reads page envelopes, whose count
+is `kv_len / page_size` — so it amortises as context grows. Track B's is
+`O(kv_len)` because it observes every position, so it does not. That asymmetry
+is inherent to what the two algorithms need to know, not an artefact.
+
+**A measurement caveat worth recording.** End-to-end `ms/token` on this host is
+host-bound (§8.5) and the host is shared; a run taken at load average ~28
+reported `naive-baseline` at 8.08 ms/token against 6.34 ms/token an hour
+earlier, and showed `tova-attention` as *faster* than the baseline it strictly
+dominates. Kernel-level claims in this document come from the CUDA-event
+harness, which measures device time and is immune to that.

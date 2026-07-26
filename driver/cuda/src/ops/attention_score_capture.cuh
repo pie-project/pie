@@ -24,6 +24,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
 
 #include <flashinfer/attention/variants.cuh>
 
@@ -78,10 +79,21 @@ struct PieScoreParams : Base {
 /// register compare rather than a reload.
 template <class Base>
 struct PieScoreCapture : Base {
+    // Resolved once per CTA. `score_indptr[batch_idx]` is a *global* load, and
+    // leaving it in the hook put one on the kernel's innermost loop, on the
+    // dependency path of the store address. `kv_len` is inherited and already
+    // cached by `DefaultAttention`; this gives the base the same treatment.
+    float* score_row = nullptr;
+
     template <typename Params>
     __device__ __host__ PieScoreCapture(
         const Params& params, uint32_t batch_idx, uint8_t* smem_ptr)
-        : Base(params, batch_idx, smem_ptr) {}
+        : Base(params, batch_idx, smem_ptr) {
+        if (params.score_out != nullptr && params.score_indptr != nullptr) {
+            score_row = params.score_out +
+                        static_cast<std::size_t>(params.score_indptr[batch_idx]);
+        }
+    }
 
     REGISTER_LOGITS_TRANSFORM(
         params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
@@ -89,15 +101,13 @@ struct PieScoreCapture : Base {
                 params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx,
                 kv_head_idx);
             const uint32_t len = this->kv_len;
-            if (threadIdx.x == 0 && kv_idx < len &&
-                params.score_out != nullptr) {
+            if (threadIdx.x == 0 && kv_idx < len && this->score_row != nullptr) {
                 // The scale the kernel is about to apply is
                 // `sm_scale * log2e` (it runs softmax in base 2). Record the
                 // natural-log-space scaled logit -- what the paper calls the
                 // pre-softmax score -- and leave the base change to the
                 // normalisation kernel.
-                params.score_out[params.score_indptr[batch_idx] +
-                                 qo_head_idx * len + kv_idx] =
+                this->score_row[qo_head_idx * len + kv_idx] =
                     static_cast<float>(out) * params.sm_scale;
             }
             return out;

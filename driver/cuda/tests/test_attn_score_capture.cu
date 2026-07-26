@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -88,6 +89,13 @@ struct Run {
     std::vector<float> out;     // [R, HQ, D]
     std::vector<float> scores;  // ragged, [sum_r HQ*kv_len_r]
 };
+
+// When non-zero, `run_batch` re-launches its dispatch this many times behind
+// CUDA events and reports the mean. Isolating the two entry points against an
+// identical plan is the only way to attribute tap cost to the kernel rather
+// than to the PTIR stage machinery wrapped around it.
+int g_bench_iters = 0;
+double g_bench_ms = 0.0;
 
 // `capture` selects the entry point; both take the identical plan.
 Run run_batch(const std::vector<Req>& reqs, bool full_attn, bool capture) {
@@ -183,6 +191,43 @@ Run run_batch(const std::vector<Req>& reqs, bool full_attn, bool capture) {
     }
     RT(cudaDeviceSynchronize());
 
+    if (g_bench_iters > 0) {
+        cudaEvent_t beg = nullptr, end = nullptr;
+        RT(cudaEventCreate(&beg));
+        RT(cudaEventCreate(&end));
+        for (int warm = 0; warm < 3; ++warm) {
+            if (capture) {
+                ops::dispatch_attention_flashinfer_decode_capture_bf16(
+                    *plan, d_q, d_k, d_v, d_o, d_kpi, d_kpp, d_klpl, ws,
+                    nullptr, d_scores, d_sindptr);
+            } else {
+                ops::dispatch_attention_flashinfer_decode_bf16(
+                    *plan, d_q, d_k, d_v, d_o, d_kpi, d_kpp, d_klpl, ws,
+                    nullptr);
+            }
+        }
+        RT(cudaDeviceSynchronize());
+        RT(cudaEventRecord(beg));
+        for (int it = 0; it < g_bench_iters; ++it) {
+            if (capture) {
+                ops::dispatch_attention_flashinfer_decode_capture_bf16(
+                    *plan, d_q, d_k, d_v, d_o, d_kpi, d_kpp, d_klpl, ws,
+                    nullptr, d_scores, d_sindptr);
+            } else {
+                ops::dispatch_attention_flashinfer_decode_bf16(
+                    *plan, d_q, d_k, d_v, d_o, d_kpi, d_kpp, d_klpl, ws,
+                    nullptr);
+            }
+        }
+        RT(cudaEventRecord(end));
+        RT(cudaEventSynchronize(end));
+        float ms = 0.f;
+        RT(cudaEventElapsedTime(&ms, beg, end));
+        g_bench_ms = static_cast<double>(ms) / g_bench_iters;
+        cudaEventDestroy(beg);
+        cudaEventDestroy(end);
+    }
+
     Run result;
     std::vector<std::uint16_t> o_bf(static_cast<std::size_t>(R) * HQ * D);
     RT(cudaMemcpy(o_bf.data(), d_o, o_bf.size() * 2, cudaMemcpyDeviceToHost));
@@ -247,6 +292,24 @@ void check(bool ok, const char* what) {
 }  // namespace
 
 int main() {
+    if (std::getenv("PIE_ATTN_SCORE_BENCH") != nullptr) {
+        g_bench_iters = 50;
+        std::printf("%8s %12s %12s %8s\n", "kv_len", "plain_ms", "capture_ms",
+                    "ratio");
+        for (const int kv : {512, 2048, 6400, 16384}) {
+            std::mt19937 rng(0x5C0DEu);
+            std::vector<Req> reqs{make_req(rng, kv)};
+            run_batch(reqs, /*full_attn=*/false, /*capture=*/false);
+            const double plain_ms = g_bench_ms;
+            run_batch(reqs, /*full_attn=*/false, /*capture=*/true);
+            const double cap_ms = g_bench_ms;
+            std::printf("%8d %12.5f %12.5f %8.2fx\n", kv, plain_ms, cap_ms,
+                        cap_ms / plain_ms);
+        }
+        g_bench_iters = 0;
+        return 0;
+    }
+
     // Mixed lengths, page boundaries, and a length long enough that the
     // scheduler may choose to split KV across CTAs — the case where "each
     // (head, kv_idx) is written exactly once" has to hold across blocks.
