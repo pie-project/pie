@@ -229,6 +229,14 @@ def build_config(args: argparse.Namespace):
             driver_options["mtp_num_drafts"] = args.mtp_num_drafts
         if args.enable_system_speculation:
             driver_options["enable_system_speculation"] = True
+        # `gpu_mem_utilization` sizes only the memory planner's *logical* KV
+        # budget; the runtime is free to exceed it, so it cannot create KV
+        # pressure. `total_pages` is the one binding cap, and `swap_pool_size`
+        # is what arms the suspend/restore rung (it defaults to 0, i.e. off).
+        if getattr(args, "total_pages", 0):
+            driver_options["total_pages"] = args.total_pages
+        if getattr(args, "swap_pool_size", 0):
+            driver_options["swap_pool_size"] = args.swap_pool_size
     elif args.driver == "vllm":
         driver_options = {
             "gpu_memory_utilization": args.gpu_mem_util,
@@ -1178,7 +1186,28 @@ def build_parser() -> argparse.ArgumentParser:
             default="auto",
             choices=["auto", "latency", "balanced", "throughput", "capacity"],
         )
-        sp.add_argument("--kv-pages", type=int, default=2048)
+        sp.add_argument(
+            "--kv-pages", type=int, default=2048,
+            help="DEAD for cuda_native: never reaches driver_options, so it "
+                 "silently does nothing. Use --total-pages to cap KV.",
+        )
+        sp.add_argument(
+            "--total-pages",
+            type=int,
+            default=0,
+            help="HARD cap on resident KV pages (cuda_native driver option). "
+                 "0 leaves the driver to derive its own budget. This is the "
+                 "only knob that actually bounds KV residency — --gpu-mem-util "
+                 "sizes the planner's logical budget only.",
+        )
+        sp.add_argument(
+            "--swap-pool-size",
+            type=int,
+            default=0,
+            help="Host-side swap pages (cuda_native driver option). Must be "
+                 ">0 to arm the suspend/restore rung; 0 leaves the residency "
+                 "planner with pool-only reclaim.",
+        )
         sp.add_argument("--kv-cache-dtype", choices=KV_CACHE_DTYPES, default="auto")
         sp.add_argument("--max-forward-tokens", type=int, default=10240)
         sp.add_argument("--max-forward-requests", type=int, default=512)

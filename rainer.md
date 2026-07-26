@@ -4,6 +4,17 @@ Part I below is the v1 design as landed (+ the 2026-07-25 revisions);
 **Part II (§11–§17) is Rainer v2 — the single-writer boundary pass**,
 the redesign the phase-2 measurements point at.
 
+**See also `rainer_v3.md` (2026-07-26).** v3 does not replace v2 — it
+re-founds v2's justification (correctness, not throughput: three
+request-destroying defects in one session all lived in the seam v2
+deletes) and adds the three things v2 leaves untouched: a typed
+liveness/policy boundary so hysteresis like E6 cannot become
+liveness-bearing, the `ReclaimQuote` holdings/reclaimability conflation
+that silently disarms the hog predicate, and divisible residency — the
+unit mismatch that §18.4 identifies as where the contended gap physically
+is. v3 also records what this session did NOT reproduce: §15's claim that
+the boundary pass prices above vLLM.
+
 Date: 2026-07-25 (perf standing updated 2026-07-26)
 Status: **v1 + E5/E6 IMPLEMENTED, contended 0.96x vLLM** — after the
 CONTENTION_FOLLOWUP.md §17 mechanism fixes (lease-quiescent victim
@@ -334,7 +345,7 @@ member, the seal does not wait for it, and no park/wake machinery exists.
 |---|---|
 | FCFS registry | the single priority key |
 | swap engine (D2H/H2D channel) | unchanged |
-| E6 | one line of membership hysteresis: a restored member stays a member until one fire completes |
+| E6 | one line of membership hysteresis: a restored member stays a member until one fire completes — but hysteresis ONLY, never in the liveness path: it yields to the wedge predicate rather than let the starvation rung destroy a request (CONTENTION_FOLLOWUP.md §18.9) |
 | hog endgame, residency gate (one atomic) | unchanged |
 | declaration-based demand (§2 as revised) | the only information source |
 

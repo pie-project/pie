@@ -408,7 +408,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     "[planner-trace] queue={} head_pages={} head_kind={} accum={} \
                      free={}/{} host_free={}/{} parks={} serves={} evictions={} \
                      evict_rollbacks={} restores={} restore_failures={} gate_parks={} \
-                     hogs={} d2h_pages={} h2d_pages={} d2h_ms={} h2d_ms={} \
+                     hogs={} starved={} e6_relax={} d2h_pages={} h2d_pages={} d2h_ms={} h2d_ms={} \
                      resident={} evicting={} evicted={} restoring={}",
                     d.queue.len(),
                     d.queue.first().map_or(0, |w| w.pages),
@@ -426,6 +426,8 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     d.restore_failures_total,
                     d.gate_parks_total,
                     d.hog_failures_total,
+                    d.starvations_total,
+                    d.e6_relaxations_total,
                     d.d2h_pages_total,
                     d.h2d_pages_total,
                     d.d2h_copy_us_total / 1000,
