@@ -977,6 +977,10 @@ class DeviceBatch:
         self.terminated = torch.zeros(batch, dtype=torch.int32, device="cuda")
         self.overflow = torch.zeros(batch, dtype=torch.int32, device="cuda")
         self.widest = torch.ones(1, dtype=torch.int32, device="cuda")
+        # The configuration width, copied back asynchronously and read one step
+        # late so that no step ever synchronises to learn it.
+        self.width_host = torch.ones(1, dtype=torch.int32).pin_memory()
+        self.pending_width = 1
         self.token = torch.zeros(batch, dtype=torch.int32, device="cuda")
         rows = batch * self.configs
         self.lexer_state = torch.zeros(rows, dtype=torch.int32, device="cuda")
@@ -1151,27 +1155,28 @@ class DeviceBatch:
             STACK_STRIDE=grammar.max_stack,
             num_warps=1,
         )
-        # How wide the configuration sets may now be.
+        # How wide the configuration sets now are, carried back one step late.
         #
-        # The fill's grid is sized by this, and it is not a small matter: the
-        # sets are almost always a single configuration on a real document, and
-        # launching for the ceiling of sixteen instead took the fill from
-        # 476 us to 4,329 us. The programs past the real width exit on their
-        # first instruction, but the launch is the cost.
+        # The fill's grid is (sequence x configuration, group), so this number
+        # is the whole cost of the fill: at batch 512 it is 291 us with a width
+        # of one and 4,317 us with sixteen, in a straight line. A program past
+        # the real width exits on its first instruction, having read the count
+        # from device memory, but a launch that returns immediately is still a
+        # launch. Real parses hold one or two configurations; the ceiling has
+        # to be sixteen only because some documents reach it.
         #
-        # Reading the real width would be a device-to-host synchronisation,
-        # which is forbidden here. What the host can do without asking is
-        # bound it: one advance widens a set by at most the readings of the
-        # group the token fell in, so the width after `n` advances is bounded
-        # by the width before times that, capped at the ceiling. Starting from
-        # the width the host itself uploaded, the bound stays at one for as
-        # long as the parse is unambiguous - which, in these grammars, is
-        # almost always.
-        # The width is on the device and stays there. The grid is the ceiling,
-        # and every program past the real width reads that width and returns -
-        # so the ceiling costs a launch rather than sixteen times the work, and
-        # nothing has to come back to the host to decide it.
+        # Reading the width now would be a device-to-host synchronisation,
+        # which is the one thing this design forbids. It does not have to be
+        # read now. The copy is issued here and the host picks it up at the
+        # start of the next fill, by which time it has long since landed - an
+        # asynchronous copy into pinned memory costs about 4 us and saves four
+        # thousand.
+        #
+        # Until then the ceiling is the only safe grid, because a stale width
+        # is unsafe in exactly one direction: too small.
+        self.width_host.copy_(self.config_count.max().reshape(1), non_blocking=True)
         self.live = self.configs
+        self.pending_width = None
 
     def configurations(self, sequence: int) -> list[tuple[int, list[int]]]:
         """Read one sequence's parse state back. For tests only.
@@ -1217,6 +1222,18 @@ class DeviceBatch:
         self.captured_live = self.live
 
     def fill_mask(self) -> torch.Tensor:
+        # Pick up the width the last advance measured. The copy was issued
+        # then and has landed by now, so this reads pinned host memory rather
+        # than synchronising with the device.
+        if self.pending_width is None:
+            self.pending_width = max(1, int(self.width_host[0]))
+            live = min(self.configs, self.pending_width)
+            if live != self.live:
+                self.live = live
+                if self.graph is not None:
+                    self.graph = None
+                    self._fill()
+                    self.capture()
         # The graph baked in a configuration count. If the batch has since grown
         # a wider one the recording no longer covers it, so fall back rather
         # than silently mask too little.
