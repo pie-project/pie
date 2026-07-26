@@ -124,6 +124,14 @@ impl Matcher {
         })
     }
 
+    /// Every live configuration, as a lexer state and the stack it produced.
+    pub fn configurations(&self) -> Vec<(u32, Vec<u32>)> {
+        self.configs
+            .iter()
+            .map(|config| (config.lexer_state, config.stack.clone()))
+            .collect()
+    }
+
     /// The parser stack of the first live configuration.
     pub fn stack(&self) -> &[u32] {
         self.configs

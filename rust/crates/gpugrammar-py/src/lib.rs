@@ -206,7 +206,10 @@ impl CompiledGrammar {
         out.set_item("reading_term_offsets", words(python, &reading_term_offsets))?;
         out.set_item("reading_terminals", words(python, &reading_terminals))?;
         out.set_item("action_offsets", words(python, &artifact.action_offsets))?;
-        out.set_item("action_terminals", words(python, &artifact.action_terminals))?;
+        out.set_item(
+            "action_terminals",
+            words(python, &artifact.action_terminals),
+        )?;
         out.set_item("action_values", signed(python, &artifact.action_values))?;
         out.set_item("goto_offsets", words(python, &artifact.goto_offsets))?;
         out.set_item(
@@ -215,7 +218,10 @@ impl CompiledGrammar {
         )?;
         out.set_item("goto_targets", words(python, &artifact.goto_targets))?;
         out.set_item("production_lhs", words(python, &artifact.production_lhs))?;
-        out.set_item("production_arity", words(python, &artifact.production_arity))?;
+        out.set_item(
+            "production_arity",
+            words(python, &artifact.production_arity),
+        )?;
         out.set_item("pending_offsets", words(python, &artifact.pending_offsets))?;
         out.set_item(
             "pending_terminals",
@@ -328,6 +334,18 @@ impl Matcher {
     #[getter]
     fn num_configs(&self) -> usize {
         self.inner.num_configs()
+    }
+
+    /// The parser stack of the first live configuration, so a caller can put a
+    /// device matcher into the same state.
+    fn stack(&self) -> Vec<u32> {
+        self.inner.stack().to_vec()
+    }
+
+    /// Every live configuration as `(lexer_state, stack)`, which is the whole
+    /// parse state a device matcher has to be given.
+    fn configurations(&self) -> Vec<(u32, Vec<u32>)> {
+        self.inner.configurations()
     }
 
     #[getter]

@@ -6,19 +6,19 @@
   "measurements": [
     {
       "batch_size": 1,
-      "device_fill_us": 44.33920085430145
+      "device_fill_us": 156.56960010528564
     },
     {
       "batch_size": 32,
-      "device_fill_us": 52.58240103721619
+      "device_fill_us": 149.60639476776123
     },
     {
       "batch_size": 128,
-      "device_fill_us": 112.53759860992432
+      "device_fill_us": 169.01119947433472
     },
     {
       "batch_size": 512,
-      "device_fill_us": 318.668794631958
+      "device_fill_us": 380.8255910873413
     }
   ]
 }
