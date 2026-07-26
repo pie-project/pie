@@ -987,7 +987,7 @@ it samples via `reduce_argmax(add(scaled, gumbel(keyed, [vocab])))`, and with
 | `gumbel_max(...)` | 3.60 |
 | `naive-baseline` | 3.51 |
 
-These are **the same program**. `gumbel_max` (`sdk/rust/ptir-dsl/src/value.rs:912-927`)
+These are **the same program**. `gumbel_max` (`compiler/dsl/src/value.rs:912-927`)
 emits exactly `RngKeyed{Gumbel}`, `Add`, `ReduceArgmax`; `gumbel()` (ibid. `:754`)
 emits the `RngKeyed` and the caller writes the other two. `PIE_PTIR_DUMP_PLAN=1`
 confirms both compile to a single fused region with no library regions. So the

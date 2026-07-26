@@ -5,7 +5,7 @@
 // M0 keeps this interpreter as the behavior oracle while moving its channel
 // authority into device-bindable Shared storage. This is a C++ mirror of the
 // canonical interpreter
-// (interface/ptir/src/interp.rs, the dummy driver's engine). Behavior is
+// (compiler/eval/src/interp.rs, the dummy driver's engine). Behavior is
 // pinned to that oracle: same readiness rule, same register-semantics commit
 // (take pops once, last put wins), same op semantics (argmax tie-break,
 // sort_desc NaN order, left-aligned broadcast, splitmix64/hash_uniform RNG).
@@ -868,7 +868,7 @@ inline std::size_t canonical_rows(const cptir::Shape& shape) {
     return rows;
 }
 
-// Canonical logical width-32 tree shared with interface/ptir's reference.
+// Canonical logical width-32 tree shared with compiler/eval's reference.
 // Physical launch dimensions must never affect this order.
 template <class T, class Combine>
 inline T canonical_reduce(
@@ -1541,7 +1541,7 @@ inline bool eval_op(const cptir::Op& op, const Trace& trace, std::vector<Value>&
             const std::size_t len = rows == 0 ? 0 : x.size() / rows;
             std::vector<std::uint8_t> keep(x.size(), 0);
             // Predicate payloads are VALUE IDS on the wire for all three tags
-            // (interface/ptir container.rs decode) — RankLe included. Already
+            // (compiler/ir/src/container.rs decode) — RankLe included. Already
             // mapped to a global trace id by container_to_trace (bound.hpp
             // gid()), same as any other op operand — no stage-local rebasing
             // needed here.

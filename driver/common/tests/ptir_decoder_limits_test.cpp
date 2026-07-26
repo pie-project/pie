@@ -137,7 +137,7 @@ bool validate_golden_sidecar(const std::string& path) {
 int main(int argc, char** argv) {
     const std::string path = argc > 1
         ? argv[1]
-        : "interface/ptir/tests/malformed_wire_corpus.txt";
+        : "compiler/tests/malformed_wire_corpus.txt";
     const std::vector<Case> cases = read_corpus(path);
     std::size_t short_bombs = 0;
     for (const Case& test : cases) {

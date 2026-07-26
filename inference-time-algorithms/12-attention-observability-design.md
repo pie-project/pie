@@ -272,7 +272,7 @@ driver/metal/src/pipeline/interp.hpp  reject
 Two granularities are needed, and one already exists.
 
 **Page granularity (Quest).** `attn_page_mask` is fully declared —
-`ptir-dsl/src/intrinsics.rs:92`, `registry.rs:172` (`SinkScope::Attention`),
+`compiler/dsl/src/intrinsics.rs:92`, `registry.rs:172` (`SinkScope::Attention`),
 `ptir_abi.h:246`, T11 stage-precedence enforced in `validate.rs:458`, and the
 interpreter golden `pentathlon_iter.txt:47` shows it firing per layer.
 `singleton_codegen.hpp:449` already whitelists it as a legal CUDA sink boundary.
@@ -400,7 +400,7 @@ The selection is **reported, not applied** — see §8.5.
 
 ### 8.2 The DSL had no way to emit a KernelCall
 
-The plan assumed the authoring surface existed. It did not: `ptir-dsl` could
+The plan assumed the authoring surface existed. It did not: `compiler/dsl` could
 name a kernel but not emit `Op::KernelCall`, and `attn_page_mask` *discarded its
 argument* (`let _ = mask.to_arg()`), recording only a name for T11 precedence.
 So a program that configured attention and one that did not lowered to the same

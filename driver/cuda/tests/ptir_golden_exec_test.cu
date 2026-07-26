@@ -783,7 +783,7 @@ void run_pivot_predicates(const std::string& dir) {
     runner.arena().host_take(2, mask_p, sizeof(mask_p));
     runner.arena().host_take(3, mask_t, sizeof(mask_t));
 
-    // golden (interface/ptir/tests/golden-ptir/pivot_predicates_multistage.txt):
+    // golden (compiler/tests/golden/pivot_predicates_multistage.txt):
     //   take chan=2 = Bool([false,false,true,true,false,false,false,true])   (CummassLe 0.999)
     //   take chan=3 = Bool([false,true,true,true,false,false,false,true])    (ProbGe 0.0003)
     const std::uint8_t want_p[8] = {0, 0, 1, 1, 0, 0, 0, 1};

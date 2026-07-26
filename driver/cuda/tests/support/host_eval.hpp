@@ -312,7 +312,7 @@ inline void sort_desc(const std::vector<float>& in, std::uint32_t rows, std::uin
     }
 }
 
-// ── pivot_threshold's three DYNAMIC predicates (interface/ptir interp.rs
+// ── pivot_threshold's three DYNAMIC predicates (compiler/eval/src/interp.rs
 // Op::PivotThreshold) — the payload is ALWAYS a scalar/per-row trace value,
 // never an immediate. `*_numel == 1` broadcasts index 0 to every row (mirrors
 // interp.rs `pick(len, r)`), else one value per row. These mirror interp.rs's

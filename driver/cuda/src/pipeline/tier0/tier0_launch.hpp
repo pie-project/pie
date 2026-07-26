@@ -56,7 +56,7 @@ struct LaunchOp {
     const void*   bcast_meta = nullptr;  // general broadcast: [tdims(4), sstride(4)] device buf
     std::uint32_t bcast_rank = 0;        // general broadcast: target rank
 
-    // pivot_threshold predicate (interface/ptir interp.rs Op::PivotThreshold):
+    // pivot_threshold predicate (compiler/eval/src/interp.rs Op::PivotThreshold):
     // the payload is ALWAYS a resolved trace value (scalar or per-row
     // [rows] vector) — never a host immediate. The runner resolves it to a
     // device pointer + its dtype + element count before launch (tier0_runner.hpp
@@ -437,7 +437,7 @@ inline bool launch_op(const LaunchOp& o) {
         case OpCode::PivotThreshold:
             // Container pivot_threshold(input, predicate) → bool selection
             // mask. The predicate payload is a resolved trace value (scalar
-            // or per-row), never an immediate (interface/ptir interp.rs).
+            // or per-row), never an immediate (compiler/eval/src/interp.rs).
             switch (o.pred_tag) {
                 case PredTag::RankLe:
                     switch (o.pred_dtype) {

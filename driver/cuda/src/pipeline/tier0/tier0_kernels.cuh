@@ -659,7 +659,7 @@ __global__ void k_structured_position_mask(
 // ────────────────────────────── order family ─────────────────────────────
 
 // ──────────────────── pivot_threshold predicates (dynamic) ───────────────
-// The three `pivot_threshold` predicates (interface/ptir interp.rs eval_op,
+// The three `pivot_threshold` predicates (compiler/eval/src/interp.rs eval_op,
 // Op::PivotThreshold): the payload is ALWAYS a trace value (scalar or
 // per-row [rows] vector), never a host immediate — resolved by the runner to
 // a device buffer + dtype + numel (tier0_runner.hpp build_launch) and read

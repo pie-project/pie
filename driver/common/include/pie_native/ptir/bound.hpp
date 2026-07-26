@@ -520,7 +520,7 @@ inline TranslateResult container_to_trace(const container::Container& c, const B
                     o.predicate.tag = (PredTag)op.pred_tag;
                     // Only PivotThreshold populates pred_tag/pred_payload
                     // (container.hpp decode); its payload is a stage-local
-                    // ValueId on the wire (interface/ptir container.rs — all
+                    // ValueId on the wire (compiler/ir/src/container.rs — all
                     // three PredTag variants carry a ValueId, RankLe included),
                     // so it must be remapped through gid() exactly like any
                     // other op operand — NOT treated as an immediate.

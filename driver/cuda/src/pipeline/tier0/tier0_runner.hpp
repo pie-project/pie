@@ -498,8 +498,9 @@ class Tier0Runner {
             for (ValueId a : op.args)
                 if (!resolve_root(a, in, scratch, err)) return false;
             // pivot_threshold's predicate payload is a trace value (scalar or
-            // per-row), not an op arg — resolve it the same way (interface/ptir
-            // interp.rs: RankLe/CummassLe/ProbGe all carry a ValueId).
+            // per-row), not an op arg — resolve it the same way
+            // (compiler/eval/src/interp.rs: RankLe/CummassLe/ProbGe all carry a
+            // ValueId).
             if (op.code == OpCode::PivotThreshold)
                 if (!resolve_root(op.predicate.payload, in, scratch, err)) return false;
 
@@ -828,7 +829,7 @@ class Tier0Runner {
         }
         if (op.code == OpCode::PivotThreshold) {
             // The predicate payload is a resolved trace value (scalar or
-            // per-row [rows]) — never an immediate (interface/ptir interp.rs
+            // per-row [rows]) — never an immediate (compiler/eval/src/interp.rs
             // Op::PivotThreshold; all three PredTag variants carry a ValueId).
             // Resolved above in run_stage via resolve_root before build_launch
             // is called, so it must already be in val_ptr_ here.

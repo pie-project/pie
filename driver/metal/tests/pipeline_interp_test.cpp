@@ -6,7 +6,7 @@
 // Two halves:
 //   1. Injected-logits golden-vector replay: decodes echo's ACTUAL container
 //      + PTIB sidecar bytes (the same cross-language vectors the CUDA driver
-//      pins against, interface/ptir/tests/golden-ptir/*.txt — vendored
+//      pins against, compiler/tests/golden/*.txt — vendored
 //      inline as hex, transcribed byte-for-byte from those files) and drives
 //      them through `pie::metal::pipeline::step()` with a `PassInputs`
 //      binding real logits, matching interp.rs's canonical `take`/`committed`

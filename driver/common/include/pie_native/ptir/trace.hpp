@@ -69,7 +69,7 @@ enum class PredTag : std::uint8_t { RankLe = 0, CummassLe = 1, ProbGe = 2 };
 // pivot_threshold predicate (§ order family). The payload is ALWAYS a global
 // trace ValueId (never an immediate) for all three tags — RankLe's `k` is a
 // U32 scalar/per-row value id, CummassLe/ProbGe's threshold is an F32
-// scalar/per-row value id (interface/ptir types.rs `Predicate`, container.rs
+// scalar/per-row value id (compiler/ir/src/types.rs `Predicate`, container.rs
 // decode). container_to_trace (bound.hpp) remaps the wire's stage-local id
 // through gid() before storing it here, same as any other op operand.
 struct Predicate {
