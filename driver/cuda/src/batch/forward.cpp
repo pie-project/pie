@@ -5,6 +5,7 @@
 #include <atomic>
 #include <barrier>
 #include <chrono>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -637,6 +638,13 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
         };
         cudaGraphExec_t exec = engine.graph_cache->get(key);
         if (exec == nullptr) {
+            if (step_profile_enabled()) {
+                std::fprintf(stderr,
+                             "[step-profile] graph capture R=%d N=%d variant=%u"
+                             " (cache size %zu)\n",
+                             key.num_requests, key.num_tokens, key.variant,
+                             engine.graph_cache->size());
+            }
             exec = capture_forward_graph_exec(
                 engine,
                 in.h_qo_forward,

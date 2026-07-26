@@ -15,7 +15,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use crate::load_plan::LoadPlan;
+use crate::plan::LoadPlan;
 
 /// The request-side inputs that decide the bytes but are not visible in a plan.
 pub struct ArtifactInputs<'a> {
@@ -166,7 +166,7 @@ impl Write for Fnv1a {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::load_plan::{CheckpointFileDecl, StorageTarget};
+    use crate::plan::{CheckpointFileDecl, StorageTarget};
     use crate::types::{CheckpointFormat, FileId};
 
     /// A directory of its own per test.
@@ -302,7 +302,7 @@ mod tests {
     /// change lands here and nowhere else.
     #[test]
     fn a_different_source_is_a_different_key() {
-        use crate::load_plan::SourceTensorDecl;
+        use crate::plan::SourceTensorDecl;
         use crate::types::{DType, Encoding, TensorId};
 
         let source = |offset| SourceTensorDecl {

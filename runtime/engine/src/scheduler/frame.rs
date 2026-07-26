@@ -3,7 +3,7 @@
 //! until every awaited lane's next FRAME is fully submitted, then seal the
 //! dense epoch and dispatch its k waves in slot order.
 //!
-//! Every deployment routes here, including the default `PIE_FRAME_SIZE=1`:
+//! Every deployment routes here, including `PIE_FRAME_SIZE=1`:
 //! a 1-slot frame IS a wave, so k = 1 reproduces the per-wave wait-all
 //! barrier (each tracked fire arrives as its own single-fire frame; a seal
 //! boundary is a wave boundary). The former per-wave `WaitAllPolicy`
@@ -131,6 +131,46 @@ fn cold_hold() -> Duration {
 /// epoch — an unresponsive lane leaves only through close/terminate.
 const STRICT_WATCHDOG_US: u64 = 1_000_000;
 
+/// How long a blocked gather waits before looking again. This is NOT the
+/// watchdog above: that one is a *reporting* cadence, and using it as the hold
+/// as well meant a boundary that was one lane short went back to sleep for as
+/// long as the worker's 250ms backstop allowed, with the GPU idle the whole
+/// time, even though the missing lane submitted microseconds later. Separating
+/// the two is worth 2x on a sixteen-request fleet (206 -> 422 tok/s).
+const GATHER_POLL_US: u64 = 500;
+
+fn gather_poll_us() -> u64 {
+    static US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *US.get_or_init(|| {
+        std::env::var("PIE_GATHER_POLL_US")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(GATHER_POLL_US)
+    })
+}
+
+/// Grace period before a gather blocked EXCLUSIVELY on empty lanes whose
+/// owners hold an in-flight bind releases them (see the `missing` predicate
+/// in [`FramePolicy::plan_dispatch`]). Only consulted in escape mode 2.
+const REBIND_ESCAPE_US: u64 = 2_000;
+
+/// A/B toggle for the rebind escape (CONTENTION_FOLLOWUP §20.3):
+/// `0` = never escape (pre-fix; deadlocks), `1` = escape unconditionally
+/// (correct, but costs epoch density — measured -16% on a roomy
+/// decode-heavy fleet), `2` = escape only after [`REBIND_ESCAPE_US`] with
+/// nothing executing and every missing lane an empty rebinder. `2` is the
+/// default: it keeps the dense wait-all path for healthy gathers (which
+/// resolve in microseconds) and only releases the deadlock shape itself.
+fn rebind_escape_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        std::env::var("PIE_FRAME_REBIND_ESCAPE")
+            .ok()
+            .and_then(|value| value.parse::<u8>().ok())
+            .unwrap_or(2)
+    })
+}
+
 struct ArrivedFire {
     slot: u32,
     /// `None` when the fire was rejected at scheduler admission — it counts
@@ -145,6 +185,11 @@ struct PendingFrame {
     /// Fires this frame is declared to hold (host-adjusted down on a
     /// mid-frame submit failure via [`FramePolicy::on_frame_truncated`]).
     expected: u32,
+    /// Cut short at what had ARRIVED, so it is sealable as-is. Set by the
+    /// host's mid-submit failure and by every path that takes the lane out
+    /// of the wait-set mid-frame; once set, later arrivals for this frame
+    /// keep it self-completing instead of re-raising `expected`.
+    truncated: bool,
     fires: Vec<ArrivedFire>,
 }
 
@@ -279,23 +324,39 @@ pub(super) struct FramePolicy {
     joins_in_flight: BTreeSet<ProcessId>,
     /// Processes that consumed an execution slot and still hold it. A
     /// Terminate leave of a member moves it to `departing`: its slot is
-    /// now certain to resolve (the permit's only exit is the capped
-    /// teardown, which broadcasts the release — or, on the no-runtime
-    /// error path, an explicit forfeit — after its terminate leave).
+    /// now certain to resolve (the permit's only exit is `ProcessCtx::drop`,
+    /// which broadcasts the release immediately after posting the leave).
     slotted: BTreeSet<ProcessId>,
-    /// Slot holders between their Terminate leave and their teardown's
-    /// release (or forfeit) broadcast, identity-paired. The leave is
-    /// delivered pass-granular while the release waits on the teardown
-    /// task, so a seal check in that window sees a zero `pending_slots`
-    /// balance with departures already recorded — without this set the
+    /// Slot holders between their Terminate leave and their release
+    /// broadcast, identity-paired. Both are posted back-to-back by
+    /// `ProcessCtx::drop`, but the worker processes them pass-granular, so a
+    /// seal check landing between the two sees a zero `pending_slots`
+    /// balance with the departure already recorded — without this set the
     /// seal would close on the partial cohort and split the fleet, and
     /// the split persists for the rest of the run (run-ahead lead is
-    /// hysteretic). Every entry resolves: the same teardown that owns the
-    /// permit sends the disarm after its leave (same-producer FIFO), and
-    /// the leaked-permit error path disarms via forfeit.
+    /// hysteretic). Every entry resolves: the retiring process posts the
+    /// disarm right after its leave, on the same producer (FIFO).
     departing: BTreeSet<ProcessId>,
+    /// Processes the planner has suspended (evicted) and not yet observed
+    /// running again. While a process is marked here its lanes never
+    /// (re-)enter the wait-set, so an arrival that races the suspend cannot
+    /// resurrect the fleet's obligation to wait for a process that is being
+    /// swapped out. Self-healing: the mark clears the moment one of its
+    /// lanes presents a COMPLETE frame, which only a running process can do
+    /// (CONTENTION_FOLLOWUP §20.8).
+    suspended: BTreeSet<ProcessId>,
+    /// Per-lane: the frame seq cut short when the lane last left the
+    /// wait-set mid-frame. The slots that truncation cut off may still
+    /// arrive (the guest resumes inside its submit loop) and must not
+    /// re-form an unsatisfiable frame under a seq whose earlier slots have
+    /// already sealed. Kept OUTSIDE `lanes` because a truncated lane is
+    /// normally dropped the moment its frames drain, well before the late
+    /// slot lands.
+    truncated_seqs: BTreeMap<ProcessId, u64>,
     /// Liveness-only deadline for the current blocked-gather episode.
     strict_watchdog_deadline: Option<Instant>,
+    /// Deadline for the escape-mode-2 rebind grace period.
+    rebind_escape_deadline: Option<Instant>,
     cold_hold_deadline: Option<Instant>,
     ever_sealed: bool,
     /// Probe sink (`profile-fire` wave counters); `None` in unit tests.
@@ -321,7 +382,10 @@ impl FramePolicy {
             joins_in_flight: BTreeSet::new(),
             slotted: BTreeSet::new(),
             departing: BTreeSet::new(),
+            suspended: BTreeSet::new(),
+            truncated_seqs: BTreeMap::new(),
             strict_watchdog_deadline: None,
+            rebind_escape_deadline: None,
             cold_hold_deadline: None,
             ever_sealed: false,
             stats,
@@ -382,9 +446,31 @@ impl FramePolicy {
             self.staged.remove(&owner);
             self.joins_in_flight.remove(&owner);
         }
+        // A fire can overtake the planner's suspend broadcast (both are
+        // queued, and the eviction fence stops LEASES, not an arrival
+        // already past it). At k = 1 that is harmless — a 1-fire frame is
+        // complete on arrival, so it seals and drains. At k > 1 the first
+        // slot alone would resurrect the wait-set membership the suspend
+        // just dropped, and the remaining slots sit behind the eviction:
+        // the half-arrived frame then holds the whole fleet's seal forever
+        // (CONTENTION_FOLLOWUP §20.8). So while the owner is suspended its
+        // lane records fires without joining the wait-set.
+        let lane_owner = owner.or_else(|| self.lanes.get(&stamp.lane).and_then(|lane| lane.owner));
+        let suspended = lane_owner.is_some_and(|owner| self.suspended.contains(&owner));
+        // A slot arriving under a seq this lane already truncated is the
+        // tail of a frame whose earlier slots have sealed; it stands alone.
+        // A newer seq means the guest moved on, so the cut is spent.
+        let late = match self.truncated_seqs.get(&stamp.lane).copied() {
+            Some(seq) if seq == stamp.seq => true,
+            Some(seq) if seq < stamp.seq => {
+                self.truncated_seqs.remove(&stamp.lane);
+                false
+            }
+            _ => false,
+        };
         let lane = self.lanes.entry(stamp.lane).or_insert_with(|| LaneState {
             owner,
-            awaited: true,
+            awaited: !suspended,
             frames: VecDeque::new(),
         });
         if lane.owner.is_none() {
@@ -396,13 +482,25 @@ impl FramePolicy {
                 lane.frames.push_back(PendingFrame {
                     seq: stamp.seq,
                     expected: stamp.fires,
+                    truncated: false,
                     fires: Vec::with_capacity(stamp.fires as usize),
                 });
                 lane.frames.back_mut().expect("frame just pushed")
             }
         };
-        frame.expected = frame.expected.max(stamp.fires);
+        frame.truncated |= late || suspended;
         frame.fires.push(fire);
+        frame.expected = if frame.truncated {
+            frame.fires.len() as u32
+        } else {
+            frame.expected.max(stamp.fires)
+        };
+        // Cut below what the guest declared: the slots still to come belong
+        // to a frame that has already sealed, so remember the seq.
+        let cut = frame.truncated && frame.expected < stamp.fires;
+        if cut {
+            self.truncated_seqs.insert(stamp.lane, stamp.seq);
+        }
     }
 
     /// The host failed a frame mid-submit: only `submitted` fires exist.
@@ -411,6 +509,7 @@ impl FramePolicy {
             && let Some(frame) = lane.frames.iter_mut().find(|frame| frame.seq == seq)
         {
             frame.expected = submitted;
+            frame.truncated = true;
         }
     }
 
@@ -428,11 +527,10 @@ impl FramePolicy {
             // wait-set through its lane, and staging it again makes the
             // seal wait for a fire it cannot issue: its next fire may be
             // ordered behind the settlement of the frame the seal is
-            // holding. A recurrent-state pass is exactly that — it
-            // serializes behind every earlier fire — so a guest that
-            // binds a second program after its first fire (prefill then
-            // decode, the ordinary shape) deadlocked the whole gather
-            // whenever the execution pool was capped.
+            // holding — a guest that binds a second program after its
+            // first fire (prefill then decode, the ordinary shape)
+            // deadlocked the whole gather whenever the execution pool was
+            // capped.
             if !self.lanes.values().any(|lane| lane.owner == Some(pid)) {
                 self.staged.insert(pid);
             }
@@ -462,15 +560,6 @@ impl FramePolicy {
         self.pending_slots += 1;
     }
 
-    /// The no-runtime teardown error path leaked the holder's permit
-    /// (`std::mem::forget`): the slot is destroyed, not freed. Resolves the
-    /// departure WITHOUT crediting `pending_slots` — the semaphore capacity
-    /// shrank by one and the balance must agree, and a departure entry that
-    /// never resolves would hold every seal with a staged successor.
-    pub fn on_execution_slot_forfeited(&mut self, pid: ProcessId) {
-        self.departing.remove(&pid);
-    }
-
     /// A process acquired its execution permit (every capped admission
     /// notifies, uncontended ones included). Its first fire is imminent:
     /// the seal now waits for `pid` ITSELF, identity-paired, so no event
@@ -486,9 +575,9 @@ impl FramePolicy {
         }
     }
 
-    /// A slot holder's Terminate leave arrived: its release (or forfeit)
-    /// broadcast is now in flight (the permit's only exit is the capped
-    /// teardown, which leaves first and resolves second). The seal treats
+    /// A slot holder's Terminate leave arrived: its release broadcast is
+    /// now in flight (the permit's only exit is `ProcessCtx::drop`, which
+    /// leaves first and resolves second). The seal treats
     /// the imminent slot like a freed one — without this, a seal check
     /// between the leave and the resolution sees `pending_slots == 0` and
     /// closes on a partial cohort. Guarded on `slotted` so only an actual
@@ -540,9 +629,15 @@ impl FramePolicy {
         let owner = owner.or_else(|| self.lanes.get(&lane).and_then(|state| state.owner));
         if purge_queued {
             self.lanes.remove(&lane);
+            self.truncated_seqs.remove(&lane);
         } else if let Some(state) = self.lanes.get_mut(&lane) {
             state.awaited = false;
-            if state.frames.is_empty() {
+            self.truncate_incomplete(lane);
+            let drained = self
+                .lanes
+                .get(&lane)
+                .is_some_and(|state| state.frames.is_empty());
+            if drained {
                 self.lanes.remove(&lane);
             }
         }
@@ -555,8 +650,18 @@ impl FramePolicy {
 
     /// Every scope owned by `owner` left (process terminate/suspend).
     pub fn on_process_leave(&mut self, owner: ProcessId) {
+        let owned: Vec<ProcessId> = self
+            .lanes
+            .iter()
+            .filter(|(_, lane)| lane.owner == Some(owner))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in owned {
+            self.truncated_seqs.remove(&id);
+        }
         self.lanes.retain(|_, lane| lane.owner != Some(owner));
         self.pending_binds.remove(&owner);
+        self.suspended.remove(&owner);
         self.forget_staged(owner);
         self.maybe_reset_episode();
     }
@@ -570,16 +675,72 @@ impl FramePolicy {
     /// eviction. Rejoin is implicit: post-restore, the lane's next arrival
     /// recreates it awaited.
     pub fn on_process_suspend(&mut self, owner: ProcessId) {
-        self.lanes.retain(|_, lane| {
-            if lane.owner != Some(owner) {
-                return true;
+        self.suspended.insert(owner);
+        let owned: Vec<ProcessId> = self
+            .lanes
+            .iter()
+            .filter(|(_, lane)| lane.owner == Some(owner))
+            .map(|(id, _)| *id)
+            .collect();
+        for lane_id in owned {
+            if let Some(lane) = self.lanes.get_mut(&lane_id) {
+                lane.awaited = false;
             }
-            lane.awaited = false;
-            !lane.frames.is_empty()
-        });
+            self.truncate_incomplete(lane_id);
+            let drained = self
+                .lanes
+                .get(&lane_id)
+                .is_some_and(|lane| lane.frames.is_empty());
+            if drained {
+                self.lanes.remove(&lane_id);
+            }
+        }
         self.pending_binds.remove(&owner);
         self.forget_staged(owner);
         self.maybe_reset_episode();
+    }
+
+    /// The planner concluded `owner` is runnable again — a restore
+    /// committed, or an eviction attempt rolled back. Clearing the suspend
+    /// mark lets its lanes rejoin the wait-set (naturally: the drained lane
+    /// is dropped and its next arrival recreates it awaited) and restores
+    /// full-frame batching for it. A missed resume is fail-safe — the fleet
+    /// simply stops waiting for that process — so this is posted from the
+    /// planner's runnable-again chokepoints rather than trusted as the only
+    /// path back.
+    pub fn on_process_resume(&mut self, owner: ProcessId) {
+        self.suspended.remove(&owner);
+    }
+
+    /// Make every unfinished frame on `lane` sealable at what has ARRIVED.
+    ///
+    /// A lane that leaves the wait-set mid-frame (KV allocation park,
+    /// graceful close, planner suspend) cannot finish that frame: the guest
+    /// is blocked on exactly the progress the frame is holding up. Its
+    /// submitted slots must still seal and drain, because their fire leases
+    /// are what an eviction's quiescence wait blocks on — leave them
+    /// stranded and the eviction never completes, the planner head never
+    /// advances, and the whole fleet starves behind it
+    /// (CONTENTION_FOLLOWUP §20.8). k = 1 can never reach this: a 1-slot
+    /// frame is complete the moment it arrives.
+    fn truncate_incomplete(&mut self, lane_id: ProcessId) {
+        let Some(lane) = self.lanes.get_mut(&lane_id) else {
+            return;
+        };
+        let mut cut = None;
+        for frame in &mut lane.frames {
+            if frame.is_complete() {
+                continue;
+            }
+            frame.expected = frame.fires.len() as u32;
+            frame.truncated = true;
+            // Only the newest frame can be unfinished — a guest submits a
+            // frame's slots in order — so one seq covers the cut.
+            cut = Some(frame.seq);
+        }
+        if let Some(seq) = cut {
+            self.truncated_seqs.insert(lane_id, seq);
+        }
     }
 
     /// A staged or joining successor departed before its first fire: the
@@ -598,6 +759,7 @@ impl FramePolicy {
         self.ever_sealed = false;
         self.cold_hold_deadline = None;
         self.strict_watchdog_deadline = None;
+        self.rebind_escape_deadline = None;
     }
 
     fn have_seal_candidate(&self) -> bool {
@@ -838,19 +1000,95 @@ impl FramePolicy {
             if !self.lanes.values().any(|lane| !lane.frames.is_empty()) {
                 // Nothing queued anywhere: no gather episode is running.
                 self.strict_watchdog_deadline = None;
+                self.rebind_escape_deadline = None;
                 return FramePlan::Park;
             }
-            let missing = self
-                .lanes
-                .values()
-                .filter(|lane| {
-                    lane.awaited && !lane.frames.front().is_some_and(PendingFrame::is_complete)
-                })
-                .count();
+            // `missing` counts awaited lanes whose next frame is not fully
+            // submitted; `missing_rebind` is the subset that is EMPTY and
+            // whose owner holds an in-flight bind.
+            //
+            // Such a lane is not a member that is about to submit: its next
+            // fire is ordered behind the bind, and a bind completes through
+            // the driver lane's control slot — behind the dispatch this
+            // boundary is holding. Waiting for it closes the cycle
+            // `bind -> dispatch -> seal -> bind`, which wedges the whole
+            // fleet permanently once the KV pool is oversubscribed enough
+            // that the boundary has nothing else executing to re-decide it
+            // (CONTENTION_FOLLOWUP §20.3: `awaited=24` with
+            // `pending_binds=8` and eight zero-frame lanes,
+            // `joins_in_flight=0`).
+            //
+            // This is the same hazard `on_bind_enqueued` avoids for
+            // successors it declines to re-stage; reached here through the
+            // lane's own wait-set membership instead. Restricting it to
+            // EMPTY lanes is what keeps the epoch dense: a lane with queued
+            // frames is genuinely mid-submission and is still waited for.
+            // Rejoin is implicit — the lane's next accepted fire restores it
+            // to the quorum.
+            let mut missing = 0usize;
+            let mut missing_rebind = 0usize;
+            let mut missing_idle = 0usize;
+            for lane in self.lanes.values() {
+                if !lane.awaited {
+                    continue;
+                }
+                if lane.frames.front().is_some_and(PendingFrame::is_complete) {
+                    continue;
+                }
+                missing += 1;
+                if lane.frames.is_empty() {
+                    missing_idle += 1;
+                    if lane
+                        .owner
+                        .is_some_and(|owner| self.pending_binds.contains_key(&owner))
+                    {
+                        missing_rebind += 1;
+                    }
+                }
+            }
             let joining = !self.joins_in_flight.is_empty()
                 || ((self.pending_slots > 0 || !self.departing.is_empty())
                     && !self.staged.is_empty());
+            let mode = rebind_escape_mode();
+            // Mode 2 escapes only from the deadlock shape itself: every missing
+            // lane is EMPTY and nothing is executing, so nothing the engine
+            // controls will ever make one of them submit -- their next fire is
+            // ordered behind a result only this seal can produce, which is the
+            // cycle `seal -> result -> submit -> seal`. An empty rebinder is one
+            // way to land there (its fire is ordered behind a bind that needs
+            // the control slot this boundary holds); a lane simply idle between
+            // frames is another, and it is the shape two concurrent request
+            // streams hit as soon as one of them drains its run-ahead window
+            // while the other still has work. Escaping cannot reorder anything
+            // that was going to resolve, because nothing is executing. The grace
+            // period keeps a healthy gather (which resolves in microseconds) on
+            // the dense wait-all path.
+            let escaping = missing_idle > 0
+                && match mode {
+                    0 => false,
+                    1 => missing_rebind > 0,
+                    _ => {
+                        !joining && !executing && missing == missing_idle && {
+                            let deadline = *self
+                                .rebind_escape_deadline
+                                .get_or_insert(now + Duration::from_micros(REBIND_ESCAPE_US));
+                            now >= deadline
+                        }
+                    }
+                };
+            let escaped = if !escaping {
+                0
+            } else if mode == 1 {
+                missing_rebind
+            } else {
+                missing_idle
+            };
+            if !escaping && mode == 2 && (missing != missing_idle || executing || joining) {
+                self.rebind_escape_deadline = None;
+            }
+            let missing = missing - escaped;
             if joining || missing > 0 {
+                let mut stalled = false;
                 if executing {
                     // An epoch is executing: its retirements re-decide and
                     // the gather continues in the background.
@@ -876,10 +1114,20 @@ impl FramePolicy {
                         "awaited_lanes":
                             self.lanes.values().filter(|lane| lane.awaited).count(),
                     }));
+                    stalled = true;
                 }
-                return FramePlan::Hold(deadline.saturating_duration_since(now));
+                let plan = FramePlan::Hold(
+                    deadline
+                        .saturating_duration_since(now)
+                        .min(Duration::from_micros(gather_poll_us())),
+                );
+                if stalled && crate::planner::trace_enabled() {
+                    println!("[frame-stall] {}", self.debug_summary());
+                }
+                return plan;
             }
             self.strict_watchdog_deadline = None;
+            self.rebind_escape_deadline = None;
             // EARLY seal: the gate held (every awaited lane's next frame is
             // fully submitted, no earmarked successor assembling), so seal NOW — normally
             // while the previous frame still executes. Sealing early is
@@ -901,7 +1149,7 @@ impl FramePolicy {
         use std::fmt::Write as _;
         let mut out = format!(
             "frame k={} lanes={} awaited={} sealed={} pending_binds={} \
-staged={} joins_in_flight={} departing={} pending_slots={} \
+staged={} joins_in_flight={} departing={} suspended={} pending_slots={} \
 ever_sealed={} watchdog={:?}",
             self.k,
             self.lanes.len(),
@@ -911,10 +1159,20 @@ ever_sealed={} watchdog={:?}",
             self.staged.len(),
             self.joins_in_flight.len(),
             self.departing.len(),
+            self.suspended.len(),
             self.pending_slots,
             self.ever_sealed,
             self.strict_watchdog_deadline
                 .map(|deadline| deadline.saturating_duration_since(Instant::now())),
+        );
+        let _ = write!(
+            out,
+            "\n  pending_bind_pids=[{}]",
+            self.pending_binds
+                .keys()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
         );
         for (pid, lane) in &self.lanes {
             let front_complete = lane.frames.front().is_some_and(PendingFrame::is_complete);
@@ -1177,7 +1435,7 @@ mod tests {
             panic!("expected the whole frame");
         };
         assert_eq!(waves, vec![vec![20], vec![21]]);
-        let queued: QueuedFireIds = HashSet::new();
+        let queued = QueuedFireIds::default();
         assert_eq!(plan(&mut policy, &queued, Instant::now()), FramePlan::Park);
         assert_eq!(policy.sealed.len(), 0, "frame popped at dispatch");
         assert!(
@@ -1191,6 +1449,95 @@ mod tests {
             !policy.ever_sealed,
             "an emptied wait-set re-arms the gather"
         );
+    }
+
+    /// CONTENTION_FOLLOWUP §20.8, half A: a fire can overtake the planner's
+    /// suspend broadcast. At k > 1 the first slot alone used to resurrect the
+    /// lane's wait-set membership while the rest of the frame sat behind the
+    /// eviction, so the half-arrived frame held the fleet's seal forever.
+    /// Half B: that slot must still SEAL, or its fire lease is never
+    /// released and the eviction's quiescence wait wedges instead.
+    #[test]
+    fn a_fire_racing_the_suspend_seals_alone_without_rejoining_the_wait_set() {
+        let mut policy = FramePolicy::new(2, 64, 4096, None);
+        let (victim, healthy) = {
+            let (x, y) = (pid(), pid());
+            if x < y { (x, y) } else { (y, x) }
+        };
+        // Steady state: both lanes complete a frame, so both are awaited.
+        policy.on_fire_enqueued(stamp(victim, 0, 0, 2), Some(victim), 100, 1, 1);
+        policy.on_fire_enqueued(stamp(victim, 0, 1, 2), Some(victim), 101, 1, 1);
+        policy.on_fire_enqueued(stamp(healthy, 0, 0, 2), Some(healthy), 102, 1, 1);
+        policy.on_fire_enqueued(stamp(healthy, 0, 1, 2), Some(healthy), 103, 1, 1);
+        let queued: QueuedFireIds = [100, 101, 102, 103].into_iter().collect();
+        assert!(matches!(
+            drive_past_cold_hold(&mut policy, &queued),
+            FramePlan::Dispatch(_)
+        ));
+
+        // The planner evicts the victim, then its slot 0 for the NEXT frame
+        // lands (already past the eviction fence). Slot 1 cannot follow: the
+        // guest is parked behind the very eviction that is waiting on this
+        // fire's lease.
+        policy.on_process_suspend(victim);
+        policy.on_fire_enqueued(stamp(victim, 1, 0, 2), Some(victim), 200, 1, 1);
+        policy.on_fire_enqueued(stamp(healthy, 1, 0, 2), Some(healthy), 300, 1, 1);
+        policy.on_fire_enqueued(stamp(healthy, 1, 1, 2), Some(healthy), 301, 1, 1);
+        assert!(
+            !policy.lanes[&victim].awaited,
+            "a suspended owner's arrival must not rejoin the wait-set"
+        );
+
+        let queued: QueuedFireIds = [200, 300, 301].into_iter().collect();
+        let FramePlan::Dispatch(waves) = plan(&mut policy, &queued, Instant::now()) else {
+            panic!("the boundary must seal without waiting for the victim");
+        };
+        assert_eq!(
+            waves[0],
+            vec![200, 300],
+            "the victim's stranded slot seals too — that lease has to drain"
+        );
+        assert_eq!(waves[1], vec![301]);
+
+        // Post-restore the guest resumes inside its submit loop and sends the
+        // slot the truncation cut off. It stands alone rather than re-forming
+        // an unsatisfiable 2-slot frame under a seq that already sealed.
+        policy.on_process_resume(victim);
+        policy.on_fire_enqueued(stamp(victim, 1, 1, 2), Some(victim), 201, 1, 1);
+        policy.on_fire_enqueued(stamp(healthy, 2, 0, 2), Some(healthy), 302, 1, 1);
+        policy.on_fire_enqueued(stamp(healthy, 2, 1, 2), Some(healthy), 303, 1, 1);
+        let queued: QueuedFireIds = [201, 302, 303].into_iter().collect();
+        let FramePlan::Dispatch(waves) = plan(&mut policy, &queued, Instant::now()) else {
+            panic!("the late slot must seal");
+        };
+        assert_eq!(waves[1], vec![201, 303], "the late slot keeps its wave");
+
+        // Fully rejoined: the next boundary waits for the victim again.
+        policy.on_fire_enqueued(stamp(victim, 2, 0, 2), Some(victim), 400, 1, 1);
+        policy.on_fire_enqueued(stamp(victim, 2, 1, 2), Some(victim), 401, 1, 1);
+        assert!(
+            policy.lanes[&victim].awaited,
+            "a resumed process rejoins on its next frame"
+        );
+    }
+
+    /// The same stranding reachable WITHOUT the planner: a KV allocation park
+    /// posts a lane close mid-frame, and the guest cannot finish that frame
+    /// until it is served — which needs the fleet to advance. The submitted
+    /// slot must seal so the circle never forms.
+    #[test]
+    fn a_lane_parked_mid_frame_seals_what_it_submitted() {
+        let mut policy = FramePolicy::new(2, 64, 4096, None);
+        let lane = pid();
+        policy.on_fire_enqueued(stamp(lane, 0, 0, 2), Some(lane), 10, 1, 1);
+        // Parked before slot 1: the allocation wait posts a lane close.
+        policy.on_lane_leave(lane, Some(lane), false);
+        let queued: QueuedFireIds = [10].into_iter().collect();
+        let FramePlan::Dispatch(waves) = drive_past_cold_hold(&mut policy, &queued) else {
+            panic!("a parked lane's submitted slot must still seal");
+        };
+        assert_eq!(waves[0], vec![10]);
+        assert!(waves[1].is_empty());
     }
 
     #[test]
@@ -1236,7 +1583,7 @@ mod tests {
         };
         assert_eq!(frame_b[0], vec![41]);
         // Round closed at b's seal: the next epoch awaits BOTH lanes again.
-        let queued: QueuedFireIds = HashSet::new();
+        let queued = QueuedFireIds::default();
         assert_eq!(plan(&mut policy, &queued, Instant::now()), FramePlan::Park);
     }
 
@@ -1314,6 +1661,66 @@ mod tests {
         let queued: QueuedFireIds = [95].into_iter().collect();
         let sealed = drive_past_cold_hold(&mut policy, &queued);
         assert_eq!(fires(&sealed), vec![95]);
+    }
+
+    /// REGRESSION (the rebind-seal wedge, CONTENTION_FOLLOWUP.md §20).
+    /// A process whose lane has drained to empty and that has a bind in
+    /// flight must not hold the boundary: its next fire is ordered behind
+    /// the bind, and the bind completes through the driver lane's control
+    /// slot — behind the very dispatch the seal is holding. Waiting for it
+    /// closes `bind -> dispatch -> seal -> bind` and wedges the fleet
+    /// permanently (observed at 32x KV oversubscription: `awaited=24`,
+    /// `pending_binds=8`, eight zero-frame lanes, `joins_in_flight=0`,
+    /// nothing executing, ~10% of runs).
+    #[test]
+    fn an_empty_lane_awaiting_its_own_rebind_does_not_hold_the_seal() {
+        let mut policy = FramePolicy::new(2, 64, 4096, None);
+        let runner = pid();
+        let rebinder = pid();
+
+        // Both lanes fire once and the epoch dispatches.
+        policy.on_fire_enqueued(stamp(runner, 0, 0, 1), Some(runner), 10, 1, 1);
+        policy.on_fire_enqueued(stamp(rebinder, 0, 0, 1), Some(rebinder), 11, 1, 1);
+        let queued: QueuedFireIds = [10, 11].into_iter().collect();
+        let mut wave0 = fires(&drive_past_cold_hold(&mut policy, &queued));
+        wave0.sort_unstable();
+        assert_eq!(wave0, vec![10, 11]);
+
+        // The runner submits its next frame. The rebinder's lane drained
+        // empty and it is waiting on a bind (prefill -> decode, the
+        // ordinary shape), so it cannot submit until the bind commits.
+        policy.on_fire_enqueued(stamp(runner, 1, 0, 1), Some(runner), 12, 1, 1);
+        policy.on_bind_enqueued(Some(rebinder));
+
+        let queued: QueuedFireIds = [12].into_iter().collect();
+        let sealed = drive_past_cold_hold(&mut policy, &queued);
+        assert_eq!(
+            fires(&sealed),
+            vec![12],
+            "the boundary must seal without the rebinder, whose fire cannot \
+             arrive until this dispatch releases the control slot"
+        );
+
+        // The exclusion is scoped to the bind, not permanent: once it
+        // commits the lane is a full member again and the boundary waits
+        // for it exactly as before.
+        //
+        // Observed BEFORE the escape grace period. At the default mode 2 an
+        // idle lane is escaped generically once `REBIND_ESCAPE_US` passes
+        // with nothing executing, so driving past the hold would measure
+        // that timer instead of the bind scoping this test is about.
+        policy.on_bind_completed(Some(rebinder));
+        policy.on_fire_enqueued(stamp(runner, 2, 0, 1), Some(runner), 14, 1, 1);
+        let queued: QueuedFireIds = [14].into_iter().collect();
+        match plan(&mut policy, &queued, Instant::now()) {
+            FramePlan::Hold(_) => {}
+            plan => panic!("the committed rebinder must hold the seal, got {plan:?}"),
+        }
+        policy.on_fire_enqueued(stamp(rebinder, 1, 0, 1), Some(rebinder), 13, 1, 1);
+        let queued: QueuedFireIds = [13, 14].into_iter().collect();
+        let mut wave = fires(&drive_past_cold_hold(&mut policy, &queued));
+        wave.sort_unstable();
+        assert_eq!(wave, vec![13, 14], "the rebinder gathered back in");
     }
 
     /// A freed slot with a staged taker holds the seal; the successor's
@@ -1470,36 +1877,6 @@ mod tests {
                 FramePlan::Dispatch(_)
             ),
             "a retired departure must leave no phantom hold"
-        );
-    }
-
-    /// A forfeited slot (the leaked-permit teardown error path) resolves
-    /// its holder's departure WITHOUT crediting the balance: the seal
-    /// stops waiting, and no phantom free slot earmarks a staged
-    /// successor that can never admit.
-    #[test]
-    fn forfeit_resolves_departure_without_freeing_a_slot() {
-        let mut policy = FramePolicy::new(2, 64, 4096, None);
-        let lane = pid();
-        let holder = pid();
-        let successor = pid();
-        policy.on_execution_slot_consumed(holder);
-        policy.on_fire_enqueued(stamp(lane, 0, 0, 1), Some(lane), 95, 1, 1);
-        policy.on_bind_enqueued(Some(successor));
-        policy.on_bind_completed(Some(successor));
-        policy.on_slotted_terminate(holder);
-        let queued: QueuedFireIds = [95].into_iter().collect();
-        match drive_past_cold_hold(&mut policy, &queued) {
-            FramePlan::Hold(_) => {}
-            plan => panic!("an unresolved departure must hold, got {plan:?}"),
-        }
-        policy.on_execution_slot_forfeited(holder);
-        assert!(
-            matches!(
-                drive_past_cold_hold(&mut policy, &queued),
-                FramePlan::Dispatch(_)
-            ),
-            "a forfeited slot must neither hold nor earmark"
         );
     }
 

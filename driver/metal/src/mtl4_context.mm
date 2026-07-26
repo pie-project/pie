@@ -16,7 +16,7 @@
 
 #include "mtl4_context.hpp"
 #include "observability.hpp"
-#include "pie_driver/elastic.hpp"
+#include "elastic.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -90,7 +90,10 @@ struct RawMetalContext::Impl {
     NSMutableArray*           retained = nil;  // keeps PSOs / sub-buffers alive
     std::unordered_set<void*> retained_psos;
     NSMutableDictionary*      argtables = nil;  // NSNumber(argkey) -> id<MTL4ArgumentTable>
-    std::unordered_set<uint64_t> bound_arg_slots;
+    // Key is (ordinal << 8) | bind_index -> the address bound there. One
+    // container, not two: the set that used to sit beside this was exactly its
+    // key set, so every bind paid two hashes and every released ordinal paid two
+    // erases per probe, over a table the prefill grows to ~123k entries.
     std::unordered_map<uint64_t, uint64_t> bound_arg_addresses;
     std::unordered_map<void*, size_t> external_allocations;
     bool saw_ptir_compile = false;
@@ -927,8 +930,18 @@ void RawMetalContext::recycle_transient_buffer(const SlotHandle& h) {
     ++I.transient_stats.recycles;
 
     auto& bucket = I.transient_free[allocation->second.size_class];
-    constexpr size_t kMaxCachedPerSizeClass = 8;
-    if (bucket.size() < kMaxCachedPerSizeClass &&
+    // Cache depth by size class rather than a flat 8. One M3 fire acquires ~13
+    // buffers and most of them land in the smallest classes, so a flat 8
+    // overflowed every fire -- and the overflow path is not cheap: releasing a
+    // buffer commits the residency set and linear-scans the retained array, and
+    // the next fire then re-allocates. It cost 0.375ms of a ~1.2ms gap between
+    // two forwards, for buffers a few hundred bytes wide. The byte budget below
+    // is what actually bounds this; the depth only stops one class hoarding it.
+    const size_t size_class = allocation->second.size_class;
+    const size_t cache_depth =
+        std::clamp<size_t>((size_t{1} << 20) / std::max<size_t>(size_class, 1),
+                           8, 64);
+    if (bucket.size() < cache_depth &&
         I.transient_stats.resident_bytes <=
             I.transient_stats.capacity_bytes) {
         bucket.push_back(h);
@@ -1049,13 +1062,12 @@ void RawMetalContext::arg_bind_ordinal(int ordinal, uint8_t bind_index, SlotHand
     if (t == nil) return;
     [t setAddress:(slot.gpu_address + offset) atIndex:bind_index];
     const uint64_t key = (uint64_t(uint32_t(ordinal)) << 8) | bind_index;
-    I.bound_arg_slots.insert(key);
     I.bound_arg_addresses[key] = slot.gpu_address + offset;
 }
 
 bool RawMetalContext::arg_slot_is_bound(int ordinal, uint8_t bind_index) const {
     const auto key = (uint64_t(uint32_t(ordinal)) << 8) | bind_index;
-    return impl_->bound_arg_slots.find(key) != impl_->bound_arg_slots.end();
+    return impl_->bound_arg_addresses.find(key) != impl_->bound_arg_addresses.end();
 }
 
 uint64_t RawMetalContext::arg_slot_address(int ordinal, uint8_t bind_index) const {
@@ -1067,15 +1079,16 @@ uint64_t RawMetalContext::arg_slot_address(int ordinal, uint8_t bind_index) cons
 void RawMetalContext::release_argtable_ordinal(int ordinal) {
     auto& I = *impl_;
     [I.argtables removeObjectForKey:@(argkey(ordinal))];
-    for (auto iterator = I.bound_arg_slots.begin();
-         iterator != I.bound_arg_slots.end();) {
-        if (static_cast<std::uint32_t>(*iterator >> 8) ==
-            static_cast<std::uint32_t>(ordinal)) {
-            I.bound_arg_addresses.erase(*iterator);
-            iterator = I.bound_arg_slots.erase(iterator);
-        } else {
-            ++iterator;
-        }
+    // A key is (ordinal << 8) | bind_index and bind_index is a uint8_t, so an
+    // ordinal owns at most 256 keys and they can be probed directly. Scanning
+    // the whole set instead was O(all bound slots) per released ordinal, and
+    // the prefill alone binds ~123k of them (34 token DAGs x 363 dispatches x
+    // their slots) -- 2.7ms per fire, which was the entire remaining host gap
+    // between two forwards.
+    for (std::uint32_t bind = 0; bind < 256u; ++bind) {
+        const std::uint64_t key =
+            (static_cast<std::uint64_t>(static_cast<std::uint32_t>(ordinal)) << 8) | bind;
+        I.bound_arg_addresses.erase(key);
     }
 }
 
@@ -1299,6 +1312,12 @@ std::uint64_t RawMetalContext::device_cache_id() const {
         hash *= 0x100000001b3ULL;
     }
     return hash;
+}
+
+uint32_t RawMetalContext::pso_max_threads(Pso pso) const {
+    if (pso.obj == nullptr) return 0;
+    auto p = (__bridge id<MTLComputePipelineState>)pso.obj;
+    return static_cast<uint32_t>(p.maxTotalThreadsPerThreadgroup);
 }
 
 void* RawMetalContext::create_timestamp_heap(uint32_t count) {

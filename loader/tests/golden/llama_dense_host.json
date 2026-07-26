@@ -1,5 +1,4 @@
 {
-  "version": 5,
   "compiler_version": 0,
   "target": {
     "backend": "Unknown",
@@ -13,16 +12,62 @@
     "encode_scratch_dtype": "BF16",
     "block_scale_rows": 128
   },
-  "optimizer": {
-    "passes": [
-      {
-        "name": "live-normalization",
-        "exprs_before": 63,
-        "exprs_after": 63,
-        "rewrites": 0
-      }
-    ]
-  },
+  "passes": [
+    {
+      "pass": "assign-persistent-offsets",
+      "instrs_before": 63,
+      "instrs_after": 63,
+      "rewrites": 21
+    },
+    {
+      "pass": "coalesce-persistent-arena-writes",
+      "instrs_before": 63,
+      "instrs_after": 63,
+      "rewrites": 0
+    },
+    {
+      "pass": "hoist-bulk-arena-writes",
+      "instrs_before": 63,
+      "instrs_after": 43,
+      "rewrites": 20
+    },
+    {
+      "pass": "group-shared-source-reads",
+      "instrs_before": 43,
+      "instrs_after": 43,
+      "rewrites": 0
+    },
+    {
+      "pass": "merge-adjacent-extent-writes",
+      "instrs_before": 43,
+      "instrs_after": 43,
+      "rewrites": 0
+    },
+    {
+      "pass": "recompute-memory-plan",
+      "instrs_before": 43,
+      "instrs_after": 43,
+      "rewrites": 0
+    },
+    {
+      "pass": "validate-fill-order",
+      "instrs_before": 43,
+      "instrs_after": 43,
+      "rewrites": 0
+    },
+    {
+      "pass": "validate-target-support",
+      "instrs_before": 43,
+      "instrs_after": 43,
+      "rewrites": 0
+    },
+    {
+      "pass": "validate-persistent-layout",
+      "instrs_before": 43,
+      "instrs_after": 43,
+      "rewrites": 0
+    }
+  ],
   "files": [
     {
       "id": 0,
@@ -886,7 +931,8 @@
                 "dst_stride": 1
               }
             ]
-          }
+          },
+          "dtype": "BF16"
         },
         "dest_offset": 0
       }

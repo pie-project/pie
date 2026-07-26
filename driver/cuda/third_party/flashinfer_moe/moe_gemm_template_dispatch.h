@@ -675,6 +675,20 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::getTmaWarpSpec
         tma_ws_configs.end());
   }
 
+  // pie: the TMA epilogue schedule only has a working instantiation when the FINALIZE fusion is
+  // used -- with NONE fusion the launcher feeds `alpha_scale_ptr_array` into a plain
+  // LinearCombination whose Arguments take a scalar alpha, which does not compile. Upstream never
+  // generates that combination, so drop it here instead of instantiating dead kernels.
+  tma_ws_configs.erase(
+      std::remove_if(
+          tma_ws_configs.begin(), tma_ws_configs.end(),
+          [](auto& config) {
+            return config.epilogue_fusion_type ==
+                       cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::NONE &&
+                   config.epilogue_schedule != cutlass_extensions::EpilogueScheduleType::NO_SMEM;
+          }),
+      tma_ws_configs.end());
+
   auto swap_ab_configs = tma_ws_configs;
   std::transform(swap_ab_configs.begin(), swap_ab_configs.end(), std::back_inserter(tma_ws_configs),
                  [](auto& config) {

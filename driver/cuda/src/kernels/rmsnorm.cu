@@ -1,10 +1,43 @@
 #include "kernels/rmsnorm.hpp"
 
 #include <cuda_bf16.h>
+#include <cstdint>
+#include <cstdlib>
 
 namespace pie_cuda_driver::kernels {
 
 namespace {
+
+// Block reduction that reproduces the shared-memory tree
+// `for (off = BLOCK/2; off; off >>= 1) buf[t] += buf[t+off]` **exactly**, but
+// runs the last five levels on warp shuffles. Those levels only ever touch
+// threads 0..31, so the pairing is identical and the fp32 rounding is
+// unchanged -- what goes away is five block-wide barriers, which at decode
+// (one block per token, eight blocks on 148 SMs) were a third of the kernel.
+template <int BLOCK>
+__device__ __forceinline__ float block_reduce_sum_exact(float local, float* buf)
+{
+    static_assert(BLOCK >= 32 && (BLOCK & (BLOCK - 1)) == 0,
+                  "block_reduce_sum_exact needs a power-of-two BLOCK >= 32");
+    const int tid = threadIdx.x;
+    buf[tid] = local;
+    __syncthreads();
+#pragma unroll
+    for (int off = BLOCK / 2; off >= 32; off >>= 1) {
+        if (tid < off) buf[tid] += buf[tid + off];
+        __syncthreads();
+    }
+    if (tid < 32) {
+        float v = buf[tid];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            v += __shfl_down_sync(0xffffffffu, v, off);
+        }
+        if (tid == 0) buf[0] = v;
+    }
+    __syncthreads();
+    return buf[0];
+}
 
 // One block per row. `BLOCK` threads cooperate on the L2-norm reduction;
 // each thread handles `hidden / BLOCK` elements. We always launch with
@@ -17,13 +50,15 @@ __global__ void rmsnorm_bf16_kernel(
     const __nv_bfloat16* __restrict__ weight,
     __nv_bfloat16* __restrict__ y,
     int hidden,
+    int x_row_stride,
+    int y_row_stride,
     float eps)
 {
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
 
-    const __nv_bfloat16* xr = x + row * hidden;
-    __nv_bfloat16* yr = y + row * hidden;
+    const __nv_bfloat16* xr = x + static_cast<long long>(row) * x_row_stride;
+    __nv_bfloat16* yr = y + static_cast<long long>(row) * y_row_stride;
 
     // L2 norm across the row, accumulated in fp32.
     float local = 0.f;
@@ -35,21 +70,78 @@ __global__ void rmsnorm_bf16_kernel(
     // Block-wide reduction via shared memory. CUB would be cleaner, but this
     // avoids a heavy header for the M1.2.2 build.
     __shared__ float buf[BLOCK];
-    buf[tid] = local;
-    __syncthreads();
+    const float buf_sum = block_reduce_sum_exact<BLOCK>(local, buf);
 
-    for (int off = BLOCK / 2; off > 0; off >>= 1) {
-        if (tid < off) buf[tid] += buf[tid + off];
-        __syncthreads();
-    }
-
-    const float inv_rms = rsqrtf(buf[0] / static_cast<float>(hidden) + eps);
+    const float inv_rms = rsqrtf(buf_sum / static_cast<float>(hidden) + eps);
 
     for (int i = tid; i < hidden; i += BLOCK) {
         const float xv = __bfloat162float(xr[i]);
         float wv = __bfloat162float(weight[i]);
         if constexpr (WEIGHT_PLUS_ONE) wv += 1.f;
         yr[i] = __float2bfloat16(xv * inv_rms * wv);
+    }
+}
+
+// Same math as `rmsnorm_bf16_kernel`, but each thread owns 8 contiguous bf16
+// (one 16-byte load) instead of one. At decode `num_rows` is 1, so the kernel
+// is a single block on a 148-SM GPU and its cost is entirely the length of the
+// per-thread dependent load chain: at hidden=7168 the scalar form walked 28
+// loads per thread, twice. Vectorized it is 4 (BLOCK=512), and measured device
+// time drops ~7x (3.48 -> 2.38 us against a 2.20 us empty-launch floor).
+//
+// Requires hidden % 8 == 0 and 16-byte-aligned rows; the launcher falls back to
+// the scalar kernel otherwise.
+template <int BLOCK, bool WEIGHT_PLUS_ONE>
+__global__ void rmsnorm_bf16_vec8_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ weight,
+    __nv_bfloat16* __restrict__ y,
+    int hidden,
+    int x_row_stride,
+    int y_row_stride,
+    float eps)
+{
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int nvec = hidden / 8;
+
+    const float4* xr =
+        reinterpret_cast<const float4*>(x + static_cast<long long>(row) * x_row_stride);
+    float4* yr =
+        reinterpret_cast<float4*>(y + static_cast<long long>(row) * y_row_stride);
+    const float4* wr = reinterpret_cast<const float4*>(weight);
+
+    float local = 0.f;
+    for (int i = tid; i < nvec; i += BLOCK) {
+        float4 v = xr[i];
+        const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&v);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float2 f = __bfloat1622float2(h[j]);
+            local += f.x * f.x + f.y * f.y;
+        }
+    }
+
+    __shared__ float buf[BLOCK];
+    const float buf_sum = block_reduce_sum_exact<BLOCK>(local, buf);
+    const float inv_rms = rsqrtf(buf_sum / static_cast<float>(hidden) + eps);
+
+    for (int i = tid; i < nvec; i += BLOCK) {
+        float4 v = xr[i];
+        float4 g = wr[i];
+        float4 o;
+        const __nv_bfloat162* hv = reinterpret_cast<const __nv_bfloat162*>(&v);
+        const __nv_bfloat162* hg = reinterpret_cast<const __nv_bfloat162*>(&g);
+        __nv_bfloat162* ho = reinterpret_cast<__nv_bfloat162*>(&o);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float2 a = __bfloat1622float2(hv[j]);
+            float2 b = __bfloat1622float2(hg[j]);
+            if constexpr (WEIGHT_PLUS_ONE) { b.x += 1.f; b.y += 1.f; }
+            ho[j] = __floats2bfloat162_rn(a.x * inv_rms * b.x,
+                                          a.y * inv_rms * b.y);
+        }
+        yr[i] = o;
     }
 }
 
@@ -79,16 +171,10 @@ __global__ void residual_add_rmsnorm_bf16_kernel(
     }
 
     __shared__ float buf[BLOCK];
-    buf[tid] = local;
-    __syncthreads();
-
-    for (int off = BLOCK / 2; off > 0; off >>= 1) {
-        if (tid < off) buf[tid] += buf[tid + off];
-        __syncthreads();
-    }
+    const float buf_sum = block_reduce_sum_exact<BLOCK>(local, buf);
 
     const float inv_rms =
-        rsqrtf(buf[0] / static_cast<float>(hidden_size) + eps);
+        rsqrtf(buf_sum / static_cast<float>(hidden_size) + eps);
 
     for (int i = tid; i < hidden_size; i += BLOCK) {
         const float xv = __bfloat162float(hr[i]);
@@ -127,16 +213,10 @@ __global__ void residual_add_scale_rmsnorm_bf16_kernel(
     }
 
     __shared__ float buf[BLOCK];
-    buf[tid] = local;
-    __syncthreads();
-
-    for (int off = BLOCK / 2; off > 0; off >>= 1) {
-        if (tid < off) buf[tid] += buf[tid + off];
-        __syncthreads();
-    }
+    const float buf_sum = block_reduce_sum_exact<BLOCK>(local, buf);
 
     const float inv_rms =
-        rsqrtf(buf[0] / static_cast<float>(hidden_size) + eps);
+        rsqrtf(buf_sum / static_cast<float>(hidden_size) + eps);
 
     for (int i = tid; i < hidden_size; i += BLOCK) {
         const float xv = __bfloat162float(hr[i]);
@@ -165,15 +245,10 @@ __global__ void rmsnorm_residual_add_bf16_kernel(
     }
 
     __shared__ float buf[BLOCK];
-    buf[tid] = local;
-    __syncthreads();
-    for (int off = BLOCK / 2; off > 0; off >>= 1) {
-        if (tid < off) buf[tid] += buf[tid + off];
-        __syncthreads();
-    }
+    const float buf_sum = block_reduce_sum_exact<BLOCK>(local, buf);
 
     const float inv_rms =
-        rsqrtf(buf[0] / static_cast<float>(hidden_size) + eps);
+        rsqrtf(buf_sum / static_cast<float>(hidden_size) + eps);
     for (int i = tid; i < hidden_size; i += BLOCK) {
         const __nv_bfloat16 norm = __float2bfloat16(
             __bfloat162float(xr[i]) * inv_rms *
@@ -207,15 +282,10 @@ __global__ void rmsnorm_residual_add_scale_rmsnorm_bf16_kernel(
     }
 
     __shared__ float buf[BLOCK];
-    buf[tid] = local;
-    __syncthreads();
-    for (int off = BLOCK / 2; off > 0; off >>= 1) {
-        if (tid < off) buf[tid] += buf[tid + off];
-        __syncthreads();
-    }
+    const float buf_sum = block_reduce_sum_exact<BLOCK>(local, buf);
 
     const float inv_rms =
-        rsqrtf(buf[0] / static_cast<float>(hidden_size) + eps);
+        rsqrtf(buf_sum / static_cast<float>(hidden_size) + eps);
     const float scale_rounded = __bfloat162float(__float2bfloat16(scale));
     float local_next = 0.f;
     for (int i = tid; i < hidden_size; i += BLOCK) {
@@ -231,20 +301,38 @@ __global__ void rmsnorm_residual_add_scale_rmsnorm_bf16_kernel(
         local_next += v * v;
     }
 
-    buf[tid] = local_next;
-    __syncthreads();
-    for (int off = BLOCK / 2; off > 0; off >>= 1) {
-        if (tid < off) buf[tid] += buf[tid + off];
-        __syncthreads();
-    }
+    __shared__ float buf_next[BLOCK];
+    const float buf_next_sum = block_reduce_sum_exact<BLOCK>(local_next, buf_next);
 
     const float inv_next =
-        rsqrtf(buf[0] / static_cast<float>(hidden_size) + eps);
+        rsqrtf(buf_next_sum / static_cast<float>(hidden_size) + eps);
     for (int i = tid; i < hidden_size; i += BLOCK) {
         nr[i] = __float2bfloat16(
             __bfloat162float(hr[i]) * inv_next *
             __bfloat162float(next_weight[i]));
     }
+}
+
+// True when every row of a [num_rows, hidden] bf16 view starts on a 16-byte
+// boundary and is a whole number of 8-element vectors.
+inline bool rmsnorm_vec8_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_RMSNORM_VEC8");
+        if (v == nullptr || v[0] == '\0') return true;
+        return v[0] != '0';
+    }();
+    return enabled;
+}
+
+inline bool rmsnorm_vec8_ok(const void* x, const void* y, const void* weight,
+                            int hidden, int x_row_stride, int y_row_stride)
+{
+    auto aligned = [](const void* p) {
+        return (reinterpret_cast<std::uintptr_t>(p) & 15u) == 0;
+    };
+    return rmsnorm_vec8_enabled() &&
+           hidden % 8 == 0 && x_row_stride % 8 == 0 && y_row_stride % 8 == 0 &&
+           aligned(x) && aligned(y) && aligned(weight);
 }
 
 }  // namespace
@@ -253,14 +341,33 @@ void launch_rmsnorm_bf16(
     const void* x, const void* weight, void* y,
     int num_rows, int hidden, float eps, cudaStream_t stream)
 {
+    launch_rmsnorm_strided_bf16(
+        x, weight, y, num_rows, hidden, hidden, hidden, eps, stream);
+}
+
+void launch_rmsnorm_strided_bf16(
+    const void* x, const void* weight, void* y,
+    int num_rows, int hidden, int x_row_stride, int y_row_stride,
+    float eps, cudaStream_t stream)
+{
     constexpr int BLOCK = 256;
     dim3 grid(num_rows);
+    if (rmsnorm_vec8_ok(x, y, weight, hidden, x_row_stride, y_row_stride)) {
+        constexpr int VBLOCK = 512;
+        rmsnorm_bf16_vec8_kernel<VBLOCK, /*WEIGHT_PLUS_ONE=*/false>
+            <<<grid, VBLOCK, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(x),
+                static_cast<const __nv_bfloat16*>(weight),
+                static_cast<__nv_bfloat16*>(y),
+                hidden, x_row_stride, y_row_stride, eps);
+        return;
+    }
     dim3 block(BLOCK);
     rmsnorm_bf16_kernel<BLOCK, /*WEIGHT_PLUS_ONE=*/false><<<grid, block, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x),
         static_cast<const __nv_bfloat16*>(weight),
         static_cast<__nv_bfloat16*>(y),
-        hidden, eps);
+        hidden, x_row_stride, y_row_stride, eps);
 }
 
 void launch_residual_add_rmsnorm_bf16(
@@ -358,12 +465,22 @@ void launch_rmsnorm_gemma_bf16(
 {
     constexpr int BLOCK = 256;
     dim3 grid(num_rows);
+    if (rmsnorm_vec8_ok(x, y, weight, hidden, hidden, hidden)) {
+        constexpr int VBLOCK = 512;
+        rmsnorm_bf16_vec8_kernel<VBLOCK, /*WEIGHT_PLUS_ONE=*/true>
+            <<<grid, VBLOCK, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(x),
+                static_cast<const __nv_bfloat16*>(weight),
+                static_cast<__nv_bfloat16*>(y),
+                hidden, hidden, hidden, eps);
+        return;
+    }
     dim3 block(BLOCK);
     rmsnorm_bf16_kernel<BLOCK, /*WEIGHT_PLUS_ONE=*/true><<<grid, block, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x),
         static_cast<const __nv_bfloat16*>(weight),
         static_cast<__nv_bfloat16*>(y),
-        hidden, eps);
+        hidden, hidden, hidden, eps);
 }
 
 namespace {
@@ -389,13 +506,8 @@ __global__ void rmsnorm_no_scale_bf16_kernel(
     }
 
     __shared__ float buf[BLOCK];
-    buf[tid] = local;
-    __syncthreads();
-    for (int off = BLOCK / 2; off > 0; off >>= 1) {
-        if (tid < off) buf[tid] += buf[tid + off];
-        __syncthreads();
-    }
-    const float inv_rms = rsqrtf(buf[0] / static_cast<float>(hidden) + eps);
+    const float buf_sum = block_reduce_sum_exact<BLOCK>(local, buf);
+    const float inv_rms = rsqrtf(buf_sum / static_cast<float>(hidden) + eps);
 
     for (int i = tid; i < hidden; i += BLOCK) {
         yr[i] = __float2bfloat16(__bfloat162float(xr[i]) * inv_rms);
@@ -447,13 +559,8 @@ __global__ void rmsnorm_gated_bf16_kernel(
     }
 
     __shared__ float buf[BLOCK];
-    buf[tid] = local;
-    __syncthreads();
-    for (int off = BLOCK / 2; off > 0; off >>= 1) {
-        if (tid < off) buf[tid] += buf[tid + off];
-        __syncthreads();
-    }
-    const float inv_rms = rsqrtf(buf[0] / static_cast<float>(hidden) + eps);
+    const float buf_sum = block_reduce_sum_exact<BLOCK>(local, buf);
+    const float inv_rms = rsqrtf(buf_sum / static_cast<float>(hidden) + eps);
 
     for (int i = tid; i < hidden; i += BLOCK) {
         const float xv = __bfloat162float(xr[i]) * inv_rms;
@@ -495,13 +602,8 @@ __global__ void rmsnorm_gated_fp32_in_bf16_kernel(
     }
 
     __shared__ float buf[BLOCK];
-    buf[tid] = local;
-    __syncthreads();
-    for (int off = BLOCK / 2; off > 0; off >>= 1) {
-        if (tid < off) buf[tid] += buf[tid + off];
-        __syncthreads();
-    }
-    const float inv_rms = rsqrtf(buf[0] / static_cast<float>(hidden) + eps);
+    const float buf_sum = block_reduce_sum_exact<BLOCK>(local, buf);
+    const float inv_rms = rsqrtf(buf_sum / static_cast<float>(hidden) + eps);
 
     for (int i = tid; i < hidden; i += BLOCK) {
         const float xv = xr[i] * inv_rms;

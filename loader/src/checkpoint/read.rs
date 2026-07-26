@@ -19,8 +19,8 @@ use std::path::{Path, PathBuf};
 
 use crate::checkpoint::CheckpointMetadata;
 use crate::checkpoint::gguf::parse_gguf_checkpoint;
-use crate::checkpoint::header::parse_safetensors_checkpoint;
-use crate::error::CompileError;
+use crate::checkpoint::safetensors::parse_safetensors_checkpoint;
+use crate::error::Error;
 
 /// Discover the safetensors shard files for a snapshot directory, matching the
 /// C++ `discover_safetensors_manifest` with a `SingleFile` layout preference.
@@ -28,7 +28,7 @@ use crate::error::CompileError;
 /// Returns the shard paths in the order the C++ loader assigns file ids:
 /// a lone `model.safetensors`, otherwise the sorted unique shard names from
 /// `model.safetensors.index.json`'s `weight_map`.
-pub fn discover_safetensors_files(snapshot_dir: &Path) -> Result<Vec<PathBuf>, CompileError> {
+pub fn discover_safetensors_files(snapshot_dir: &Path) -> Result<Vec<PathBuf>, Error> {
     let single = snapshot_dir.join("model.safetensors");
     let index = snapshot_dir.join("model.safetensors.index.json");
 
@@ -39,23 +39,22 @@ pub fn discover_safetensors_files(snapshot_dir: &Path) -> Result<Vec<PathBuf>, C
     }
 
     if index.is_file() {
-        let text = std::fs::read_to_string(&index).map_err(|err| {
-            CompileError::InvalidInput(format!("cannot read {}: {err}", index.display()))
-        })?;
+        let text = std::fs::read_to_string(&index)
+            .map_err(|err| Error::Checkpoint(format!("cannot read {}: {err}", index.display())))?;
         let value: serde_json::Value = serde_json::from_str(&text).map_err(|err| {
-            CompileError::InvalidInput(format!("{} is not valid JSON: {err}", index.display()))
+            Error::Checkpoint(format!("{} is not valid JSON: {err}", index.display()))
         })?;
         let weight_map = value
             .get("weight_map")
             .and_then(serde_json::Value::as_object)
             .ok_or_else(|| {
-                CompileError::InvalidInput(format!("{} missing 'weight_map'", index.display()))
+                Error::Checkpoint(format!("{} missing 'weight_map'", index.display()))
             })?;
         // Unique shard names, sorted — a BTreeSet reproduces the C++ dedup+sort.
         let mut shard_names = BTreeSet::new();
         for shard in weight_map.values() {
             let shard = shard.as_str().ok_or_else(|| {
-                CompileError::InvalidInput(format!(
+                Error::Checkpoint(format!(
                     "{} weight_map has a non-string shard",
                     index.display()
                 ))
@@ -68,7 +67,7 @@ pub fn discover_safetensors_files(snapshot_dir: &Path) -> Result<Vec<PathBuf>, C
             .collect());
     }
 
-    Err(CompileError::InvalidInput(format!(
+    Err(Error::Checkpoint(format!(
         "no model.safetensors[.index.json] in {}",
         snapshot_dir.display()
     )))
@@ -104,7 +103,7 @@ fn discover_gguf_file(snapshot_dir: &Path) -> Option<PathBuf> {
 /// Parse a checkpoint directory's headers into a [`CheckpointMetadata`],
 /// picking the on-disk format (safetensors, else GGUF). Only headers are read;
 /// bulk tensor bytes are never mapped.
-pub fn parse_checkpoint_metadata(snapshot_dir: &Path) -> Result<CheckpointMetadata, CompileError> {
+pub fn parse_checkpoint_metadata(snapshot_dir: &Path) -> Result<CheckpointMetadata, Error> {
     if let Some(gguf) = discover_gguf_file(snapshot_dir)
         && snapshot_dir.is_file()
     {

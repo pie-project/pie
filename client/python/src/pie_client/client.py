@@ -65,12 +65,18 @@ class PieClient:
     This client is designed to be used as an async context manager.
     """
 
-    def __init__(self, server_uri: str):
+    def __init__(self, server_uri: str, identity: str = "default/bench"):
         """
         Initialize the client.
         :param server_uri: The WebSocket server URI (e.g., "ws://127.0.0.1:8080").
+            A URI with no path gets the gateway's `/v1/ws` upgrade path appended.
+        :param identity: Value for the `x-pie-identity` trust-edge header the
+            gateway requires (`gateway/src/ingress/identity.rs`). A deployment
+            terminates identity at an edge proxy; a direct client must supply it
+            or the upgrade is rejected before the socket opens.
         """
         self.server_uri = server_uri
+        self.identity = identity
         self.ws = None
         self.listener_task = None
         self.corr_id_counter = 0
@@ -97,7 +103,12 @@ class PieClient:
 
     async def connect(self):
         """Establish a WebSocket connection and start the background listener."""
-        self.ws = await websockets.connect(self.server_uri)
+        from urllib.parse import urlsplit
+        uri = self.server_uri
+        if not urlsplit(uri).path.strip("/"):
+            uri = uri.rstrip("/") + "/v1/ws"
+        self.ws = await websockets.connect(
+            uri, additional_headers={"x-pie-identity": self.identity})
         self.listener_task = asyncio.create_task(self._listen_to_server())
 
     async def _listen_to_server(self):

@@ -3,7 +3,7 @@
 //!
 //! The engine mirrors, per bound pass, what each channel's committed cells
 //! hold: seeds at bind, then per fire the net effect of folding the trace's
-//! stage programs through [`pie_ptir::pareval`] (a device-decided value —
+//! stage programs through [`pie_eval::pareval`] (a device-decided value —
 //! sampler output, kernel result — shadows as *unknown* rather than a wrong
 //! guess). A fire's submission-time value for a channel is the Writer put
 //! staged for that fire, else the shadow's front cell.
@@ -15,12 +15,12 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use pie_ptir::container::PortSource;
-use pie_ptir::interp::Value;
-use pie_ptir::op::Op;
-use pie_ptir::pareval::{EvalBlocker, fold_stage};
-use pie_ptir::registry::Stage;
-use pie_ptir::validate::BoundTrace;
+use pie_eval::interp::Value;
+use pie_eval::pareval::{EvalBlocker, fold_stage};
+use pie_ir::container::PortSource;
+use pie_ir::op::Op;
+use pie_ir::registry::Stage;
+use pie_ir::validate::BoundTrace;
 
 use crate::pipeline::channel::{BoundCells, staged_put_bytes};
 use crate::pipeline::instance::ChannelSeed;
@@ -33,6 +33,10 @@ pub struct HostShadow {
     /// Channels the trace net-takes each pass: any stage `ChanTake` plus
     /// consuming descriptor ports bound to channels.
     taken_per_pass: BTreeSet<u32>,
+    /// [`Self::advance`]'s phase order with the channel-inert stages already
+    /// dropped (see the fold loop). Derived from the bound trace, which never
+    /// changes for an instance, so it is built once and reused every fire.
+    phases: Option<Vec<Stage>>,
 }
 
 impl HostShadow {
@@ -45,7 +49,7 @@ impl HostShadow {
                 .get(seed.channel as usize)
                 .map(|decl| decl.dtype)
             {
-                Some(pie_ptir::container::ChanDType::Concrete(dtype)) => dtype,
+                Some(pie_ir::container::ChanDType::Concrete(dtype)) => dtype,
                 _ => continue,
             };
             let value = Value::from_le_bytes(dtype, &seed.data);
@@ -69,6 +73,7 @@ impl HostShadow {
         HostShadow {
             queues,
             taken_per_pass,
+            phases: None,
         }
     }
 
@@ -87,7 +92,7 @@ impl HostShadow {
             && let Some(bytes) = staged_put_bytes(cell)
         {
             let dtype = match bound.container.channels.get(chan as usize)?.dtype {
-                pie_ptir::container::ChanDType::Concrete(dtype) => dtype,
+                pie_ir::container::ChanDType::Concrete(dtype) => dtype,
                 _ => return None,
             };
             return Value::from_le_bytes(dtype, &bytes);
@@ -96,7 +101,7 @@ impl HostShadow {
             && let Some(bytes) = cell.lock().unwrap().front_override()
         {
             let dtype = match bound.container.channels.get(chan as usize)?.dtype {
-                pie_ptir::container::ChanDType::Concrete(dtype) => dtype,
+                pie_ir::container::ChanDType::Concrete(dtype) => dtype,
                 _ => return None,
             };
             return Value::from_le_bytes(dtype, &bytes);
@@ -111,12 +116,40 @@ impl HostShadow {
         // Cross-stage pass overlay: pending puts (Ok = known value, Err =
         // committed-but-unknown), visible to later stages' reads.
         let mut pending: BTreeMap<u32, Result<Value, EvalBlocker>> = BTreeMap::new();
-        let layers = bound.profile.num_layers;
-        let phases: Vec<Stage> = core::iter::once(Stage::Prologue)
-            .chain((0..layers).flat_map(|_| [Stage::OnAttnProj, Stage::OnAttn]))
-            .chain(core::iter::once(Stage::Epilogue))
-            .collect();
-        for stage in phases {
+        if self.phases.is_none() {
+            self.phases = Some({
+                // A stage program with no `ChanPut` cannot change `pending`: the
+                // fold's only consumed output is `fold.puts`, and the fault path
+                // shadows exactly that stage's `ChanPut` channels. Dropping those
+                // stages is therefore exact, and it is worth a lot — the layer
+                // stages repeat `2 * num_layers` times per fire and a transformer
+                // decode trace writes host channels only in the prologue and
+                // epilogue, so this turns 2*L+2 whole-trace evaluations into 2.
+                let puts = |stage: Stage| {
+                    bound
+                        .container
+                        .stages
+                        .iter()
+                        .filter(|program| program.stage == stage)
+                        .any(|program| {
+                            program
+                                .ops
+                                .iter()
+                                .any(|op| matches!(op, Op::ChanPut { .. }))
+                        })
+                };
+                let layers = bound.profile.num_layers;
+                core::iter::once(Stage::Prologue)
+                    .chain((0..layers).flat_map(|_| [Stage::OnAttnProj, Stage::OnAttn]))
+                    .chain(core::iter::once(Stage::Epilogue))
+                    .filter(|stage| puts(*stage))
+                    .collect()
+            });
+        }
+        // Indexed so the cached list stays borrowed immutably alongside the
+        // `known` closure's `&self` read of the shadow.
+        for index in 0..self.phases.as_ref().map_or(0, Vec::len) {
+            let stage = self.phases.as_ref().expect("primed above")[index];
             let fold = {
                 let mut known = |chan: u32| match pending.get(&chan) {
                     Some(Ok(value)) => Some(value.clone()),
@@ -164,12 +197,12 @@ impl HostShadow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pie_ptir::container::{
+    use pie_ir::container::{
         ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
     };
-    use pie_ptir::op::{IntrinsicId, Op};
-    use pie_ptir::registry::{ModelProfile, Port, Stage};
-    use pie_ptir::types::{DType, Shape};
+    use pie_ir::op::{IntrinsicId, Op};
+    use pie_ir::registry::{ModelProfile, Port, Stage};
+    use pie_ir::types::{DType, Shape};
 
     fn channel(shape: Shape, dtype: DType) -> ChannelDecl {
         ChannelDecl {
@@ -269,7 +302,7 @@ mod tests {
                 ],
             }],
         };
-        let bound = pie_ptir::validate::bind(container, profile).unwrap();
+        let bound = pie_ir::validate::bind(container, profile).unwrap();
         let seeds = vec![
             ChannelSeed {
                 channel: 0,

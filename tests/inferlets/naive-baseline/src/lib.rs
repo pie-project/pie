@@ -1,8 +1,9 @@
 //! Naive text completion — the performance control for the algorithm inferlets.
 //!
 //! Structurally identical to every truncation/penalty inferlet in this
-//! directory: one N-wide prefill fire, then a 1-wide device-carried decode
-//! loop kept `DEFAULT_RUNAHEAD_DEPTH` fires ahead of the host drain. The only
+//! directory: one N-wide prefill fire, then a device-carried decode loop
+//! driven by `ptir::run_ahead`, which keeps the engine's run-ahead window
+//! (`model.channel-capacity()`) full ahead of the host drain. The only
 //! difference is the epilogue, which does nothing but temperature-scale the
 //! logits and draw a Gumbel-max sample. Whatever an algorithm inferlet costs
 //! above this number is the algorithm.
@@ -104,14 +105,17 @@ async fn main(input: Input) -> Result<Output> {
     // policy measured against it. When the prompt fits in one chunk the loop
     // runs once and builds exactly the pass this used to build.
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-    let chunk = (max_embed_length().max(1) as u32).min(n).max(1);
+    // The split is `prefill_chunks` (SDK), which spreads the remainder over the
+    // FIRST chunks so the last one is never a sliver. Every inferlet in this
+    // tree uses it, which is what makes their chunk boundaries identical: a
+    // text difference above the ceiling is then a policy difference, not a
+    // difference in the attention tile decomposition (§11.4).
+    let spans = prefill_chunks(n, None);
     let pipe = Pipeline::new();
 
     let mut g0 = 0i32;
-    let mut base = 0u32;
-    while base < n {
-        let len = chunk.min(n - base);
-        let end = base + len;
+    for &(base, end) in &spans {
+        let len = end - base;
 
         let toks_p =
             Channel::from(prompt_i32[base as usize..end as usize].to_vec()).named("toks_p");
@@ -120,10 +124,10 @@ async fn main(input: Input) -> Result<Output> {
         let pages_p = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages_p");
         let page_indptr_p =
             Channel::from(vec![0u32, end.div_ceil(page_size)]).named("page_indptr_p");
-        let w_slot_p = Channel::from((base..end).map(|p| p / page_size).collect::<Vec<_>>())
-            .named("w_slot_p");
-        let w_off_p = Channel::from((base..end).map(|p| p % page_size).collect::<Vec<_>>())
-            .named("w_off_p");
+        let w_slot_p =
+            Channel::from((base..end).map(|p| p / page_size).collect::<Vec<_>>()).named("w_slot_p");
+        let w_off_p =
+            Channel::from((base..end).map(|p| p % page_size).collect::<Vec<_>>()).named("w_off_p");
         let kv_len_p = Channel::from(vec![end]).named("kv_len_p");
         let rng_p = Channel::from(vec![input.seed, 0]).named("rng_p");
         let tok_out_p = Channel::new([1], dtype::i32).named("tok_out_p");
@@ -182,8 +186,6 @@ async fn main(input: Input) -> Result<Output> {
                 .await
                 .map_err(|e| format!("s2 take @{base}: {e}"))?;
         }
-
-        base = end;
     }
     generated.push(g0 as u32);
 
@@ -192,13 +194,13 @@ async fn main(input: Input) -> Result<Output> {
         let tok_in = Channel::from(vec![g0; 1]).named("tok_in");
         let rng = Channel::from(vec![input.seed ^ 0x5bd1, 0]).named("rng");
         let tok_out = Channel::new([1], dtype::i32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+            .capacity(channel_capacity() as u32)
             .named("tok_out");
         let s1_out = Channel::new([1], dtype::f32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+            .capacity(channel_capacity() as u32)
             .named("s1_out");
         let s2_out = Channel::new([1], dtype::f32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+            .capacity(channel_capacity() as u32)
             .named("s2_out");
         let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
         let positions = Channel::from(vec![n]).named("positions");
@@ -250,15 +252,7 @@ async fn main(input: Input) -> Result<Output> {
         });
 
         let budget = max_tokens - 1;
-        let mut submitted = 0usize;
-        let mut in_flight = 0usize;
-        while in_flight < DEFAULT_RUNAHEAD_DEPTH && submitted < budget {
-            fwd.submit(&pipe)
-                .map_err(|e| format!("decode submit @{}: {e}", submitted + 1))?;
-            submitted += 1;
-            in_flight += 1;
-        }
-        while in_flight > 0 {
+        run_ahead(&pipe, &fwd, budget, async || {
             let t = tok_out
                 .take()
                 .get::<i32>()
@@ -276,15 +270,10 @@ async fn main(input: Input) -> Result<Output> {
                     .await
                     .map_err(|e| format!("s2_out.take @{}: {e}", generated.len()))?;
             }
-            in_flight -= 1;
             generated.push(t as u32);
-            if submitted < budget {
-                fwd.submit(&pipe)
-                    .map_err(|e| format!("decode submit @{}: {e}", submitted + 1))?;
-                submitted += 1;
-                in_flight += 1;
-            }
-        }
+            Ok(ControlFlow::Continue(()))
+        })
+        .await?;
     }
     pipe.close();
 

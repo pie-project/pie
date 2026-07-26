@@ -38,15 +38,15 @@
 
 #include "batch/fire_timing.hpp"
 #include "pipeline/channels.hpp"  // kMaxRing + the (unchanged) ring kernels
-#include "pie_native/ptir/trace.hpp"
+#include "pie_native/launch/program.hpp"
 #include "cuda_check.hpp"
 
 namespace pie_cuda_driver::pipeline {
 
 // Shared pure-host PTIR decode model (trace/op-table/container/bound/
-// fire-geometry) now lives in pie_native::ptir (driver/common); bring it into
+// fire-geometry) now lives in pie_native::launch (driver/common); bring it into
 // scope so the CUDA-side tier-0/1 code below can use it unqualified.
-using namespace pie_native::ptir;
+using namespace pie_native::launch;
 
 // Registry device-array capacity in SLOTS (grows on demand). One inferlet's
 // live channel count is small; this is a generous initial reservation.

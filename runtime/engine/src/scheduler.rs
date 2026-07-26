@@ -158,18 +158,86 @@ pub async fn debug_dump(driver_id: usize) -> Result<String> {
 /// Waves per frame (k): a static deployment constant, fixed at engine start
 /// exactly like the KV page size — never renegotiated per frame and never
 /// adapted from runtime timing. Guests query it via `model.frame-size()` and
-/// size their frames/channels to it. 1 (the default) keeps the per-wave
-/// wait-all scheduling path byte-identical to today; k > 1 enables sealed
-/// frame scheduling ([`worker`]'s frame policy).
+/// size their frames/channels to it.
+///
+/// The default is 2. At k = 1 the wait-all quorum runs once per token, and
+/// above ~64 concurrent processes the fleet stops overlapping batches
+/// entirely — measured duty (forward batches in flight) collapses from 1.7
+/// to 1.0 and becomes bimodal, costing 29% throughput and 28% latency at
+/// concurrency 256. k = 2 halves the number of quorum boundaries and holds
+/// duty at 1.6 with no regression at any lower concurrency. k = 3 and k = 4
+/// measure the same as k = 2 while costing more driver staging depth, so 2
+/// is the setting (CONTENTION_FOLLOWUP §20.8). Set `PIE_FRAME_SIZE=1` to
+/// restore the per-wave path.
 pub fn configured_frame_size() -> usize {
     static CONFIGURED: OnceLock<usize> = OnceLock::new();
     *CONFIGURED.get_or_init(|| {
         std::env::var("PIE_FRAME_SIZE")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(1)
+            .unwrap_or(2)
             .clamp(1, 64)
     })
+}
+
+// =============================================================================
+// Guest run-ahead sizing (`PIE_TURNAROUND_WAVES`)
+// =============================================================================
+
+/// How many waves of work a lane must keep submitted to cover one host
+/// resubmit turnaround: the guest takes a result, does its host-side work, and
+/// submits again, and the device must have something to run for that whole
+/// interval or the pipeline collapses to lockstep.
+///
+/// This is a property of the HOST round trip, so it is counted in waves and is
+/// independent of k. Sizing it in frames instead is the unit error that
+/// collapsed k = 1 throughput (CONTENTION_FOLLOWUP §20.11): a frame-counted
+/// window shrinks in real work as k shrinks, exactly when each frame covers
+/// less time.
+///
+/// Fixed at 3 for now. The value is a candidate for adaptation from observed
+/// turnaround, which is why guests read it through `model.channel-capacity()`
+/// rather than baking a constant — unlike `frame-size`, this MAY change.
+const HOST_TURNAROUND_WAVES: usize = 3;
+
+fn turnaround_waves() -> usize {
+    static CONFIGURED: OnceLock<usize> = OnceLock::new();
+    *CONFIGURED.get_or_init(|| {
+        std::env::var("PIE_TURNAROUND_WAVES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(HOST_TURNAROUND_WAVES)
+            .clamp(1, 64)
+    })
+}
+
+/// Frames a lane should keep outstanding: one for the frame currently running,
+/// plus enough to cover the host turnaround. `ceil` because a partial frame
+/// still costs a whole frame of submission.
+pub fn frames_in_flight() -> usize {
+    let k = configured_frame_size();
+    1 + turnaround_waves().div_ceil(k)
+}
+
+/// Host-reader channel capacity, in cells, that lets a lane sustain
+/// `frames_in_flight()` without the ring becoming the bottleneck.
+///
+/// The trailing `+ 1` is structural, not empirical. A ring sized to exactly the
+/// peak occupancy requires the consumer's take to be visible to the producer at
+/// the moment it publishes — and that visibility delay IS the host round trip
+/// run-ahead exists to hide. Zero margin therefore re-imports the round trip
+/// into the critical path: a 3k-1 ring measured 28.0k vs 34.3k tok/s against
+/// the same guest at 3k (text-completion-bench).
+///
+/// At k = 1 an undersized ring is silent: `fire::submit_pass_stamped`
+/// short-circuits before `validate_frame`, so every capacity check is k >= 2
+/// only and a k = 1 guest serialises with no diagnostic at all.
+///
+/// Sized for a fully live frame (r = k). A lane the engine forces to one live
+/// slot per frame — a recurrent-state model — needs strictly less, so this is
+/// a safe bound for every guest.
+pub fn channel_capacity() -> usize {
+    frames_in_flight() * configured_frame_size() + 1
 }
 
 // =============================================================================
@@ -247,9 +315,7 @@ pub(crate) fn fire_timing_full() -> bool {
 /// scheduler look like the bottleneck it is being used to find.
 pub(crate) fn fire_timing_per_fire() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        !std::env::var("PIE_FIRE_TIMING").is_ok_and(|value| value == "waves")
-    })
+    *ENABLED.get_or_init(|| !std::env::var("PIE_FIRE_TIMING").is_ok_and(|value| value == "waves"))
 }
 
 /// Worker-loop phase accumulators, in nanoseconds, summed across every pass

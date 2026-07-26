@@ -165,7 +165,7 @@ bool build_member_forward_desc(
     std::size_t member_count,
     bool has_linear_attn,
     std::uint32_t page_size,
-    const pie_native::ptir::FireGeometry* resolved,
+    const pie_native::launch::FireGeometry* resolved,
     MemberForwardDesc& desc,
     std::string& error) {
     page_size = std::max<std::uint32_t>(page_size, 1);
@@ -269,6 +269,20 @@ bool build_member_forward_desc(
                 desc.kv_last_page_len =
                     view.kv_last_page_lens.data()[member];
             }
+            // A wire fire that names KV pages is paged, exactly as a resolved
+            // one is. The sealed M=1 ring path used to claim every wire fire,
+            // so a prefill posted on the wire landed in the ring while the
+            // decode that continues it -- device-resolved, therefore paged --
+            // could not find its history. The two halves of one sequence have
+            // to agree on where the KV lives.
+            if (!desc.kv_pages.empty()) {
+                desc.requires_paged = true;
+                desc.qo_indptr = {
+                    0u, static_cast<std::uint32_t>(desc.token_ids.size())};
+                desc.kv_page_indptr = {
+                    0u, static_cast<std::uint32_t>(desc.kv_pages.size())};
+                desc.kv_last_page_lens = {desc.kv_last_page_len};
+            }
         }
     }
 
@@ -278,23 +292,38 @@ bool build_member_forward_desc(
             : 1;
     if (has_linear_attn) {
         if (resolved != nullptr) {
-            if (view.rs_slot_ids.size() != request_count ||
-                view.rs_slot_flags.size() != request_count) {
+            // The launch's recurrent-state arrays are indexed one of two ways
+            // and the difference only shows up once a batch carries more than
+            // one member: either they are already scoped to this member's
+            // requests, or they are launch-wide with one entry per member --
+            // which is what the host branch below has always assumed. Reading
+            // the launch-wide form from index 0 gave member 1 member 0's slot
+            // and rejected any batch whose member count differed from one
+            // member's request count, so two concurrent decodes could never
+            // share a forward.
+            const std::uint32_t* rs_ids = nullptr;
+            const std::uint8_t* rs_flags = nullptr;
+            if (view.rs_slot_ids.size() == request_count &&
+                view.rs_slot_flags.size() == request_count) {
+                rs_ids = view.rs_slot_ids.data();
+                rs_flags = view.rs_slot_flags.data();
+            } else if (request_count == 1 &&
+                       view.rs_slot_ids.size() == member_count &&
+                       view.rs_slot_flags.size() == member_count) {
+                rs_ids = view.rs_slot_ids.data() + member;
+                rs_flags = view.rs_slot_flags.data() + member;
+            } else {
                 error =
                     "resolved hybrid geometry requires exactly one folded "
                     "recurrent-state slot and flag per request";
                 return false;
             }
-            desc.request_rs_slot_ids.assign(
-                view.rs_slot_ids.data(),
-                view.rs_slot_ids.data() + request_count);
+            desc.request_rs_slot_ids.assign(rs_ids, rs_ids + request_count);
             for (std::size_t request = 0;
                  request < request_count;
                  ++request) {
-                const std::uint8_t flag =
-                    view.rs_slot_flags.data()[request];
                 desc.request_rs_reset.push_back(
-                    (flag & kRsFlagReset) != 0);
+                    (rs_flags[request] & kRsFlagReset) != 0);
             }
         } else if (
             view.rs_slot_ids.size() == member_count &&

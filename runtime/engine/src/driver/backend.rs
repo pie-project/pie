@@ -141,7 +141,78 @@ impl DriverBackend {
         }
     }
 
+    /// The backend whose kernels this driver wants the host to generate, or
+    /// `None` when it generates its own (or needs none). The variant already
+    /// says which native backend it is, so this needs no capability round-trip.
+    fn codegen_backend(&self) -> Option<&'static str> {
+        match self {
+            #[cfg(feature = "driver-cuda")]
+            Self::Cuda(_) => Some("cuda"),
+            #[cfg(feature = "driver-metal")]
+            Self::Metal(_) => Some("metal"),
+            // The dummy driver interprets PTIR, and a remote driver's own
+            // backend does its generation on the far side.
+            _ => None,
+        }
+    }
+
     pub fn register_program(&mut self, desc: &ProgramRegistration) -> Result<u64> {
+        // Attach whatever this driver reads and the caller did not already
+        // supply. Generation is memoised per program per backend, so a
+        // re-registration costs a lookup.
+        let registered = crate::pipeline::program::lookup(desc.program_hash);
+        let codegen_backend = self.codegen_backend();
+
+        // The driver no longer carries an emitter, so a fused region with no
+        // host source is a registration failure rather than a slower path.
+        let emitted = codegen_backend
+            .filter(|_| desc.emitted_kernels.is_empty())
+            .and_then(|backend| {
+                registered
+                    .as_ref()
+                    .and_then(|program| program.emitted(backend))
+            });
+
+        // The region analysis is the other half of the CUDA emitter's own
+        // contract -- which regions bind, and how the kernel's intrinsic side
+        // tables are laid out -- so it only means anything to a driver running
+        // those kernels.
+        let region_analysis = if desc.region_analysis.is_empty() && codegen_backend == Some("cuda")
+        {
+            registered
+                .as_ref()
+                .map(|program| program.region_analysis())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        let owned;
+        let desc = if emitted.is_some() || !region_analysis.is_empty() {
+            let mut next = desc.clone();
+            if let Some(emitted) = emitted {
+                next.emitter_version = emitted.emitter_version;
+                next.emitted_kernels = emitted
+                    .kernels
+                    .iter()
+                    .map(|kernel| pie_driver_abi::EmittedKernel {
+                        kind: kernel.kind,
+                        stage_index: kernel.stage_index,
+                        region_index: kernel.region_index,
+                        entry_name: kernel.entry_name.clone(),
+                        source: kernel.source.clone(),
+                        error: kernel.error.clone(),
+                    })
+                    .collect();
+            }
+            if !region_analysis.is_empty() {
+                next.region_analysis = region_analysis;
+            }
+            owned = next;
+            &owned
+        } else {
+            desc
+        };
         match self {
             Self::Dummy(driver) => driver.register_program(desc),
             #[cfg(feature = "driver-cuda")]

@@ -1,5 +1,5 @@
 //! THE forward path: guest-programmed pipelines. The wire format (the IR
-//! itself) lives in the `pie_ptir` crate; this module is the runtime domain
+//! itself) lives in the `pie_ir` crate; this module is the runtime domain
 //! that binds/instantiates/fires it.
 //!
 //! - [`program`]: container bytes -> bind -> price -> cache; absorbs
@@ -15,7 +15,7 @@
 //!   `geometry`/`kv`/`rs`/`lease`.
 //!
 //! Layering: this module imports only `scheduler`/`store`/`driver` (strictly
-//! below it) plus the `pie_ptir` IR crate and other external leaf crates
+//! below it) plus the `pie_ir` IR crate and other external leaf crates
 //! (`wasmtime::component::ResourceTable`, `uuid`) — never `inferlet`/
 //! `server`. The WIT resource *types* (`Channel`, `ForwardPass`,
 //! `Pipeline`) live here because they hold domain state (cells, FIFO,

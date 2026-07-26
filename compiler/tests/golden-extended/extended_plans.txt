@@ -1,0 +1,77 @@
+# A pin of the extended corpus (`msl_corpus::extended_traces`) -- the traces
+# added to reach the ops, intrinsics, schedules and stages that
+# `corpus_stages()` never compiles.
+#
+# Source of truth: THIS COMPILER. Unlike `golden-{msl,cuda}/`, no C++ oracle
+# ever produced or reviewed these bytes -- they were never cross-checked against
+# a second implementation. They pin *what the emitters do today*, so that a
+# change to it shows up as a diff instead of passing unnoticed.
+#
+# A mismatch here is a question, not a verdict: decide whether the new output is
+# right, then re-pin with `PTIR_REGEN=1 cargo test -p pie-compiler-tests`.
+#
+# Where a kernel is digested, `bytes` and the hash cover what the *compiler*
+# generated: the hand-written device text under `compiler/codegen/runtime/` is
+# dropped first, so tuning a kernel does not re-pin every case. That the
+# emitters still splice those blocks in whole is
+# `every_live_device_file_is_spliced_into_a_kernel_verbatim`.
+=== extended_unary#0
+stage_tag: 0x03
+signature: 73b900a6023e5811
+plan: lines=16 fnv1a64=0x7dc1df81690c7e45
+fused#0: library=0 library_op=0 schedule=1 nodes=6 inputs=0 outputs=0 sinks=1
+=== extended_minmax#0
+stage_tag: 0x03
+signature: bad41330c6565406
+plan: lines=18 fnv1a64=0x4a62b96ec48fd3d5
+fused#0: library=0 library_op=0 schedule=1 nodes=7 inputs=0 outputs=0 sinks=2
+=== extended_predicates#0
+stage_tag: 0x03
+signature: a3180d84d3a0b0a2
+plan: lines=22 fnv1a64=0xef02eae38212e9db
+fused#0: library=0 library_op=0 schedule=1 nodes=9 inputs=0 outputs=0 sinks=1
+=== extended_transpose_cumsum#0
+stage_tag: 0x03
+signature: 33a1e6bac94bd661
+plan: lines=18 fnv1a64=0x1ff62bde662880af
+fused#0: library=0 library_op=0 schedule=1 nodes=4 inputs=0 outputs=1 sinks=1
+fused#1: library=1 library_op=3 schedule=3 nodes=1 inputs=1 outputs=1 sinks=0
+fused#2: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+=== extended_gather_scatter#0
+stage_tag: 0x03
+signature: 47cd877f69b3db71
+plan: lines=18 fnv1a64=0x136e7e5d75df6528
+fused#0: library=0 library_op=0 schedule=1 nodes=7 inputs=0 outputs=0 sinks=2
+=== extended_rng_stream#0
+stage_tag: 0x03
+signature: c5334e7e4cff1020
+plan: lines=8 fnv1a64=0xf366111b84b142b5
+fused#0: library=0 library_op=0 schedule=1 nodes=2 inputs=0 outputs=0 sinks=1
+=== extended_hierarchical#0
+stage_tag: 0x03
+signature: 0f2776c5a4dd6d79
+plan: lines=10 fnv1a64=0x97ac29b5f715a8f8
+fused#0: library=0 library_op=0 schedule=2 nodes=3 inputs=0 outputs=0 sinks=1
+=== extended_hidden#0
+stage_tag: 0x03
+signature: 606306b9d45d7b17
+plan: lines=10 fnv1a64=0x35bf552fd4ea663a
+fused#0: library=0 library_op=0 schedule=1 nodes=3 inputs=0 outputs=0 sinks=1
+=== extended_on_attn#0
+stage_tag: 0x02
+signature: f295aab2cb6146e8
+plan: lines=12 fnv1a64=0x392967c20a6a49e4
+fused#0: library=0 library_op=0 schedule=1 nodes=4 inputs=0 outputs=0 sinks=2
+=== extended_metal_identity#0
+stage_tag: 0x03
+signature: aa86c48194c2c4d0
+plan: lines=12 fnv1a64=0x7420cdd203418529
+fused#0: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+fused#1: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=1 sinks=0
+fused#2: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+=== extended_metal_discard#0
+stage_tag: 0x00
+signature: 3dfafd36e271f128
+plan: lines=9 fnv1a64=0xa580563d943e6097
+fused#0: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+fused#1: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=0 sinks=0

@@ -15,6 +15,8 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <sstream>
+#include <utility>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -87,14 +89,30 @@ struct Gemma4ForwardProfile {
 
     cudaEvent_t total_start = nullptr;
     cudaEvent_t total_stop = nullptr;
-    cudaEvent_t stage_start = nullptr;
-    cudaEvent_t stage_stop = nullptr;
+
+    // One event pair per timed stage, read back only once the step is over.
+    // Synchronizing per stage instead drains the pipeline on every stage
+    // boundary, so each stage is charged a launch latency it does not pay in
+    // production and the small ones read several times their true cost.
+    std::vector<cudaEvent_t> pool;
+    std::size_t pool_used = 0;
+    std::vector<std::pair<float*, std::size_t>> pending;
 
     ~Gemma4ForwardProfile() {
         if (total_start != nullptr) cudaEventDestroy(total_start);
         if (total_stop != nullptr) cudaEventDestroy(total_stop);
-        if (stage_start != nullptr) cudaEventDestroy(stage_start);
-        if (stage_stop != nullptr) cudaEventDestroy(stage_stop);
+        for (cudaEvent_t e : pool) cudaEventDestroy(e);
+    }
+
+    std::size_t acquire_pair() {
+        const std::size_t idx = pool_used;
+        while (pool.size() < idx + 2) {
+            cudaEvent_t e = nullptr;
+            CUDA_CHECK(cudaEventCreate(&e));
+            pool.push_back(e);
+        }
+        pool_used = idx + 2;
+        return idx;
     }
 
     void begin(cudaStream_t stream) {
@@ -108,8 +126,6 @@ struct Gemma4ForwardProfile {
         seq = current;
         CUDA_CHECK(cudaEventCreate(&total_start));
         CUDA_CHECK(cudaEventCreate(&total_stop));
-        CUDA_CHECK(cudaEventCreate(&stage_start));
-        CUDA_CHECK(cudaEventCreate(&stage_stop));
         CUDA_CHECK(cudaEventRecord(total_start, stream));
     }
 
@@ -119,6 +135,16 @@ struct Gemma4ForwardProfile {
         CUDA_CHECK(cudaEventRecord(total_stop, stream));
         CUDA_CHECK(cudaEventSynchronize(total_stop));
         CUDA_CHECK(cudaEventElapsedTime(&total_gpu_ms, total_start, total_stop));
+        // Every stage event is complete now that `total_stop` is, so the
+        // whole step reads back without another synchronization.
+        for (const auto& entry : pending) {
+            float ms = 0.f;
+            CUDA_CHECK(cudaEventElapsedTime(
+                &ms, pool[entry.second], pool[entry.second + 1]));
+            *entry.first += ms;
+        }
+        pending.clear();
+        pool_used = 0;
     }
 };
 
@@ -133,14 +159,11 @@ void profile_gemma4_cuda_stage(
         fn();
         return;
     }
-    CUDA_CHECK(cudaEventRecord(profile.stage_start, stream));
+    const std::size_t idx = profile.acquire_pair();
+    CUDA_CHECK(cudaEventRecord(profile.pool[idx], stream));
     fn();
-    CUDA_CHECK(cudaEventRecord(profile.stage_stop, stream));
-    CUDA_CHECK(cudaEventSynchronize(profile.stage_stop));
-    float ms = 0.f;
-    CUDA_CHECK(cudaEventElapsedTime(&ms, profile.stage_start,
-                                    profile.stage_stop));
-    dst += ms;
+    CUDA_CHECK(cudaEventRecord(profile.pool[idx + 1], stream));
+    profile.pending.emplace_back(&dst, idx);
 }
 
 void maybe_print_gemma4_forward_profile(
@@ -154,7 +177,11 @@ void maybe_print_gemma4_forward_profile(
         p.attn_out_ms + p.mlp_ms + p.ple_residual_ms + p.final_norm_ms +
         p.lm_head_ms + p.softcap_ms;
     const float other = p.total_gpu_ms - named;
-    std::cerr
+    // One buffered line, one write. TP ranks profile concurrently and a
+    // chain of `std::cerr <<` interleaves their fields mid-number, which
+    // silently corrupts anything reading the output.
+    std::ostringstream os;
+    os
         << "[pie-gemma4-forward-profile]"
         << " seq=" << p.seq
         << " N=" << p.N
@@ -178,6 +205,7 @@ void maybe_print_gemma4_forward_profile(
         << " softcap_ms=" << p.softcap_ms
         << " other_gpu_ms=" << other
         << "\n";
+    std::cerr << os.str() << std::flush;
 }
 
 const DeviceTensor& must(const LoadedModel& e, const std::string& name) {
@@ -185,6 +213,10 @@ const DeviceTensor& must(const LoadedModel& e, const std::string& name) {
         throw std::runtime_error("gemma4: missing weight '" + name + "'");
     }
     return e.get(name);
+}
+
+const DeviceTensor* optional_tensor(const LoadedModel& e, const std::string& name) {
+    return e.has(name) ? &e.get(name) : nullptr;
 }
 
 float read_bf16_scalar_once(const DeviceTensor& t) {
@@ -290,59 +322,6 @@ int gemma4_plan_debug_limit() {
         return std::max(0, std::atoi(v));
     }();
     return limit;
-}
-
-DeviceTensor make_gate_up_fused_weight(const DeviceTensor& gate,
-                                       const DeviceTensor& up)
-{
-    if (gate.dtype() != DType::BF16 || up.dtype() != DType::BF16 ||
-        gate.shape().size() != 2 || up.shape().size() != 2 ||
-        gate.shape()[0] != up.shape()[0] ||
-        gate.shape()[1] != up.shape()[1]) {
-        throw std::runtime_error(
-            "gemma4: cannot fuse gate/up projections with mismatched shapes");
-    }
-    const std::int64_t I = gate.shape()[0];
-    const std::int64_t H = gate.shape()[1];
-    DeviceTensor fused = DeviceTensor::allocate(DType::BF16, {2 * I, H});
-    const std::size_t bytes =
-        static_cast<std::size_t>(I) * static_cast<std::size_t>(H) *
-        sizeof(std::uint16_t);
-    auto* dst = static_cast<std::uint8_t*>(fused.data());
-    CUDA_CHECK(cudaMemcpy(dst, gate.data(), bytes, cudaMemcpyDeviceToDevice));
-    CUDA_CHECK(cudaMemcpy(dst + bytes, up.data(), bytes, cudaMemcpyDeviceToDevice));
-    return fused;
-}
-
-DeviceTensor make_qkv_fused_weight(const DeviceTensor& q,
-                                   const DeviceTensor& k,
-                                   const DeviceTensor& v)
-{
-    if (q.dtype() != DType::BF16 || k.dtype() != DType::BF16 ||
-        v.dtype() != DType::BF16 || q.shape().size() != 2 ||
-        k.shape().size() != 2 || v.shape().size() != 2 ||
-        q.shape()[1] != k.shape()[1] || q.shape()[1] != v.shape()[1] ||
-        k.shape()[0] != v.shape()[0]) {
-        throw std::runtime_error(
-            "gemma4: cannot fuse q/k/v projections with mismatched shapes");
-    }
-    const std::int64_t Hq = q.shape()[0];
-    const std::int64_t Hk = k.shape()[0];
-    const std::int64_t H = q.shape()[1];
-    DeviceTensor fused = DeviceTensor::allocate(DType::BF16, {Hq + 2 * Hk, H});
-    const std::size_t q_bytes =
-        static_cast<std::size_t>(Hq) * static_cast<std::size_t>(H) *
-        sizeof(std::uint16_t);
-    const std::size_t kv_bytes =
-        static_cast<std::size_t>(Hk) * static_cast<std::size_t>(H) *
-        sizeof(std::uint16_t);
-    auto* dst = static_cast<std::uint8_t*>(fused.data());
-    CUDA_CHECK(cudaMemcpy(dst, q.data(), q_bytes, cudaMemcpyDeviceToDevice));
-    CUDA_CHECK(cudaMemcpy(dst + q_bytes, k.data(), kv_bytes,
-                          cudaMemcpyDeviceToDevice));
-    CUDA_CHECK(cudaMemcpy(dst + q_bytes + kv_bytes, v.data(), kv_bytes,
-                          cudaMemcpyDeviceToDevice));
-    return fused;
 }
 
 bool prepare_row_decode_kv_table(
@@ -792,14 +771,6 @@ Gemma4Weights bind_gemma4(const LoadedModel& engine) {
     const bool fuse_dense_gate_up = gemma4_dense_gate_up_fused_enabled(cfg);
     const bool fuse_dense_qkv =
         !cfg.gemma4_enable_moe && gemma4_dense_qkv_fused_enabled();
-    if (fuse_dense_gate_up) {
-        w.owned_gate_up_fused.reserve(
-            static_cast<std::size_t>(cfg.num_hidden_layers));
-    }
-    if (fuse_dense_qkv) {
-        w.owned_qkv_fused.reserve(
-            static_cast<std::size_t>(cfg.num_hidden_layers));
-    }
     const std::string p = kPrefix;
     w.embed           = &must(engine, p + "embed_tokens.weight");
     // PLE (Per-Layer Embeddings) machinery is optional — Gemma-4 E2B /
@@ -966,11 +937,14 @@ Gemma4Weights bind_gemma4(const LoadedModel& engine) {
             Lw.k_norm = &engine.get(lp + "self_attn.k_norm.weight");
         }
         Lw.o_proj = &must(engine, lp + "self_attn.o_proj.weight");
+        // The contract publishes the fused bank and views of it under the
+        // original names, so binding q/k/v above is unaffected by whether the
+        // join happened. A shared layer reads its K/V from another layer and
+        // must not run a fused QKV gemm, so it declines the bank.
         if (fuse_dense_qkv && !is_shared && !Lw.use_k_as_v &&
             Lw.k_proj != nullptr && Lw.v_proj != nullptr) {
-            w.owned_qkv_fused.push_back(
-                make_qkv_fused_weight(*Lw.q_proj, *Lw.k_proj, *Lw.v_proj));
-            Lw.qkv_proj_fused = &w.owned_qkv_fused.back();
+            Lw.qkv_proj_fused =
+                optional_tensor(engine, lp + "self_attn.qkv_proj.fused.weight");
         }
 
         // MLP (intermediate may be 2× when use_double_wide_mlp + shared).
@@ -980,9 +954,8 @@ Gemma4Weights bind_gemma4(const LoadedModel& engine) {
         Lw.intermediate = static_cast<int>(Lw.gate_proj->shape()[0]);
         w.per_layer_intermediate[i] = Lw.intermediate;
         if (fuse_dense_gate_up) {
-            w.owned_gate_up_fused.push_back(
-                make_gate_up_fused_weight(*Lw.gate_proj, *Lw.up_proj));
-            Lw.gate_up_proj_fused = &w.owned_gate_up_fused.back();
+            Lw.gate_up_proj_fused =
+                optional_tensor(engine, lp + "mlp.gate_up_proj.fused.weight");
         }
 
         // PLE per-layer triple. HF names match `per_layer_input_gate`,
@@ -2042,6 +2015,10 @@ void gemma4_forward_paged(
             layer.gate_up_proj_fused != nullptr &&
             !ws.gate_up_fused.empty();
         if (use_gate_up_fused) {
+            // Pinned to classic cuBLAS on purpose: routing this shape
+            // (M=N_tokens, N=2*I, K=H) through the cuBLASLt dispatcher was
+            // measured 15% slower on E4B tp2 -- mlp 4.71 -> 5.44 ms at
+            // N=128 -- so the Lt heuristic loses here.
             ops::gemm_act_x_wt_bf16_cublas(cublas.handle(),
                 ws.norm_x.data(), layer.gate_up_proj_fused->data(),
                 ws.gate_up_fused.data(), N, 2 * I, H);

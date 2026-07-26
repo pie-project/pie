@@ -1,0 +1,2489 @@
+# oracle dump: pie::metal::pipeline::emit_commit_msl
+# source of truth: compiler/codegen/src/metal/ (the C++ oracle this was dumped from is deleted)
+# emitter_version: 33
+# @runtime: bytes=39611 fnv1a64=0x310a2f7d72f22fd5
+# @grouped: bytes=970 fnv1a64=0xa8ab9e1ebf8714d9
+# cases: 45
+# re-blessed: the C++ oracle (driver/metal/src/pipeline/m1_codegen.cpp) is
+#   deleted, so these bytes can no longer be re-derived from it. Three cases
+#   below were re-blessed from Rust in the change that made the emitted corpus
+#   compile: `driver/metal/tests/msl_compile_test.cpp` put every kernel here
+#   through Apple's shader compiler for the first time and found two rejections
+#   the byte comparison could never see, because the oracle had them too.
+#     * readiness/commit `wide_30` emitted `[[buffer(31)]]`, one past Metal's
+#       highest buffer index; `METAL_M1_MAX_CHANNELS` now rejects it by name.
+#     * three grouped fused regions passed the `const device bfloat*` logits
+#       pointer into `ptir_m1_execute`'s `const device uchar*` parameter, which
+#       MSL will not convert. They now cast.
+#   Nothing else in this directory moved, and `msl_compile_test` is the standing
+#   check that took over from the oracle for the question it could not answer.
+#   re-blessed again (emitter 27): `m1_reduce_argmax` no longer materializes one
+#   16-byte candidate per element into device `temporary` and tree-reduces it in
+#   passes -- `m1_argmax_combine` is a strict total order, so a fold gives the
+#   same answer -- and the bf16 logits intrinsic copies unrolled. Both loops run
+#   on the single thread that owns a lane, so at a 248320 vocab they were ~250ms
+#   per decode step against a ~4ms model forward. Only @runtime bytes moved.
+#   re-blessed again (emitter 29): a generated region now gets a threadgroup per
+#   lane instead of a thread, and the three things that walked a vocabulary-wide
+#   row -- the logits gather, argmax, and the typed copy behind a reshape -- are
+#   split across it. m1_copy_typed also moved from one device access per BYTE to
+#   one per word. Between them a decode step's GPU time went 89ms -> 6.5ms.
+#   re-blessed again (emitter 31): a same-footprint reshape is a view, so the
+#   grouped emitter elides its copy and points the consumers at the source
+#   value's offset. The runtime executed it as a byte-for-byte copy of the whole
+#   value, which in the sampler's graph was a vocabulary-wide round trip through
+#   device memory for nothing.
+# REGENERATED: the body below is this compiler's output, not the recorded output of the source of truth above
+#   reason: reshape elision now recognises a prefix view, so the sampler's vocabulary-wide reshape and its logits gather both fuse away
+=== empty
+function_name: ptir_m1_empty_commit
+channels: 0
+ok: true
+source: bytes=1132 prefix=none tail_bytes=1132
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_empty_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  status->state = 4;
+}
+=== end
+=== flags_0
+function_name: ptir_m1_flags_0_commit
+channels: 1
+ok: true
+source: bytes=1257 prefix=none tail_bytes=1257
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_flags_0_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], device ulong* words_0 [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  {
+    const ulong old_head = words_0[0];
+    const ulong old_tail = words_0[1];
+  }
+  status->state = 4;
+}
+=== end
+=== flags_1
+function_name: ptir_m1_flags_1_commit
+channels: 1
+ok: true
+source: bytes=1257 prefix=none tail_bytes=1257
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_flags_1_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], device ulong* words_0 [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  {
+    const ulong old_head = words_0[0];
+    const ulong old_tail = words_0[1];
+  }
+  status->state = 4;
+}
+=== end
+=== flags_2
+function_name: ptir_m1_flags_2_commit
+channels: 1
+ok: true
+source: bytes=1257 prefix=none tail_bytes=1257
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_flags_2_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], device ulong* words_0 [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  {
+    const ulong old_head = words_0[0];
+    const ulong old_tail = words_0[1];
+  }
+  status->state = 4;
+}
+=== end
+=== flags_3
+function_name: ptir_m1_flags_3_commit
+channels: 1
+ok: true
+source: bytes=1257 prefix=none tail_bytes=1257
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_flags_3_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], device ulong* words_0 [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  {
+    const ulong old_head = words_0[0];
+    const ulong old_tail = words_0[1];
+  }
+  status->state = 4;
+}
+=== end
+=== flags_4
+function_name: ptir_m1_flags_4_commit
+channels: 1
+ok: true
+source: bytes=1315 prefix=none tail_bytes=1315
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_flags_4_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], device ulong* words_0 [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  {
+    const ulong old_head = words_0[0];
+    const ulong old_tail = words_0[1];
+    if (old_tail > old_head) words_0[0] = old_head + 1ul;
+  }
+  status->state = 4;
+}
+=== end
+=== flags_5
+function_name: ptir_m1_flags_5_commit
+channels: 1
+ok: true
+source: bytes=1315 prefix=none tail_bytes=1315
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_flags_5_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], device ulong* words_0 [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  {
+    const ulong old_head = words_0[0];
+    const ulong old_tail = words_0[1];
+    if (old_tail > old_head) words_0[0] = old_head + 1ul;
+  }
+  status->state = 4;
+}
+=== end
+=== flags_6
+function_name: ptir_m1_flags_6_commit
+channels: 1
+ok: true
+source: bytes=1315 prefix=none tail_bytes=1315
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_flags_6_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], device ulong* words_0 [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  {
+    const ulong old_head = words_0[0];
+    const ulong old_tail = words_0[1];
+    if (old_tail > old_head) words_0[0] = old_head + 1ul;
+  }
+  status->state = 4;
+}
+=== end
+=== flags_7
+function_name: ptir_m1_flags_7_commit
+channels: 1
+ok: true
+source: bytes=1315 prefix=none tail_bytes=1315
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_flags_7_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], device ulong* words_0 [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  {
+    const ulong old_head = words_0[0];
+    const ulong old_tail = words_0[1];
+    if (old_tail > old_head) words_0[0] = old_head + 1ul;
+  }
+  status->state = 4;
+}
+=== end
+=== flags_8
+function_name: ptir_m1_flags_8_commit
+channels: 1
+ok: true
+source: bytes=1290 prefix=none tail_bytes=1290
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_flags_8_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], device ulong* words_0 [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  {
+    const ulong old_head = words_0[0];
+    const ulong old_tail = words_0[1];
+    words_0[1] = old_tail + 1ul;
+  }
+  status->state = 4;
+}
+=== end
+=== flags_9
+function_name: ptir_m1_flags_9_commit
+channels: 1
+ok: true
+source: bytes=1290 prefix=none tail_bytes=1290
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_flags_9_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], device ulong* words_0 [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  {
+    const ulong old_head = words_0[0];
+    const ulong old_tail = words_0[1];
+    words_0[1] = old_tail + 1ul;
+  }
+  status->state = 4;
+}
+=== end
+=== flags_10
+function_name: ptir_m1_flags_10_commit
+channels: 1
+ok: true
+source: bytes=1291 prefix=none tail_bytes=1291
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_flags_10_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], device ulong* words_0 [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  {
+    const ulong old_head = words_0[0];
+    const ulong old_tail = words_0[1];
+    words_0[1] = old_tail + 1ul;
+  }
+  status->state = 4;
+}
+=== end
+=== flags_11
+function_name: ptir_m1_flags_11_commit
+channels: 1
+ok: true
+source: bytes=1291 prefix=none tail_bytes=1291
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_flags_11_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], device ulong* words_0 [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  {
+    const ulong old_head = words_0[0];
+    const ulong old_tail = words_0[1];
+    words_0[1] = old_tail + 1ul;
+  }
+  status->state = 4;
+}
+=== end
+=== flags_12
+function_name: ptir_m1_flags_12_commit
+channels: 1
+ok: true
+source: bytes=1349 prefix=none tail_bytes=1349
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_flags_12_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], device ulong* words_0 [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  {
+    const ulong old_head = words_0[0];
+    const ulong old_tail = words_0[1];
+    if (old_tail > old_head) words_0[0] = old_head + 1ul;
+    words_0[1] = old_tail + 1ul;
+  }
+  status->state = 4;
+}
+=== end
+=== flags_13
+function_name: ptir_m1_flags_13_commit
+channels: 1
+ok: true
+source: bytes=1349 prefix=none tail_bytes=1349
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_flags_13_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], device ulong* words_0 [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  {
+    const ulong old_head = words_0[0];
+    const ulong old_tail = words_0[1];
+    if (old_tail > old_head) words_0[0] = old_head + 1ul;
+    words_0[1] = old_tail + 1ul;
+  }
+  status->state = 4;
+}
+=== end
+=== flags_14
+function_name: ptir_m1_flags_14_commit
+channels: 1
+ok: true
+source: bytes=1349 prefix=none tail_bytes=1349
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_flags_14_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], device ulong* words_0 [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  {
+    const ulong old_head = words_0[0];
+    const ulong old_tail = words_0[1];
+    if (old_tail > old_head) words_0[0] = old_head + 1ul;
+    words_0[1] = old_tail + 1ul;
+  }
+  status->state = 4;
+}
+=== end
+=== flags_15
+function_name: ptir_m1_flags_15_commit
+channels: 1
+ok: true
+source: bytes=1349 prefix=none tail_bytes=1349
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_flags_15_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], device ulong* words_0 [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  {
+    const ulong old_head = words_0[0];
+    const ulong old_tail = words_0[1];
+    if (old_tail > old_head) words_0[0] = old_head + 1ul;
+    words_0[1] = old_tail + 1ul;
+  }
+  status->state = 4;
+}
+=== end
+=== capacity_0
+function_name: ptir_m1_capacity_0_commit
+channels: 1
+ok: true
+source: bytes=1351 prefix=none tail_bytes=1351
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_capacity_0_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], device ulong* words_0 [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  {
+    const ulong old_head = words_0[0];
+    const ulong old_tail = words_0[1];
+    if (old_tail > old_head) words_0[0] = old_head + 1ul;
+    words_0[1] = old_tail + 1ul;
+  }
+  status->state = 4;
+}
+=== end
+=== capacity_1
+function_name: ptir_m1_capacity_1_commit
+channels: 1
+ok: true
+source: bytes=1351 prefix=none tail_bytes=1351
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_capacity_1_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], device ulong* words_0 [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  {
+    const ulong old_head = words_0[0];
+    const ulong old_tail = words_0[1];
+    if (old_tail > old_head) words_0[0] = old_head + 1ul;
+    words_0[1] = old_tail + 1ul;
+  }
+  status->state = 4;
+}
+=== end
+=== capacity_2
+function_name: ptir_m1_capacity_2_commit
+channels: 1
+ok: true
+source: bytes=1351 prefix=none tail_bytes=1351
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_capacity_2_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], device ulong* words_0 [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  {
+    const ulong old_head = words_0[0];
+    const ulong old_tail = words_0[1];
+    if (old_tail > old_head) words_0[0] = old_head + 1ul;
+    words_0[1] = old_tail + 1ul;
+  }
+  status->state = 4;
+}
+=== end
+=== capacity_3
+function_name: ptir_m1_capacity_3_commit
+channels: 1
+ok: true
+source: bytes=1351 prefix=none tail_bytes=1351
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_capacity_3_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], device ulong* words_0 [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  {
+    const ulong old_head = words_0[0];
+    const ulong old_tail = words_0[1];
+    if (old_tail > old_head) words_0[0] = old_head + 1ul;
+    words_0[1] = old_tail + 1ul;
+  }
+  status->state = 4;
+}
+=== end
+=== capacity_7
+function_name: ptir_m1_capacity_7_commit
+channels: 1
+ok: true
+source: bytes=1351 prefix=none tail_bytes=1351
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_capacity_7_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], device ulong* words_0 [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  {
+    const ulong old_head = words_0[0];
+    const ulong old_tail = words_0[1];
+    if (old_tail > old_head) words_0[0] = old_head + 1ul;
+    words_0[1] = old_tail + 1ul;
+  }
+  status->state = 4;
+}
+=== end
+=== capacity_64
+function_name: ptir_m1_capacity_64_commit
+channels: 1
+ok: true
+source: bytes=1352 prefix=none tail_bytes=1352
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_capacity_64_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], device ulong* words_0 [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  {
+    const ulong old_head = words_0[0];
+    const ulong old_tail = words_0[1];
+    if (old_tail > old_head) words_0[0] = old_head + 1ul;
+    words_0[1] = old_tail + 1ul;
+  }
+  status->state = 4;
+}
+=== end
+=== capacity_65535
+function_name: ptir_m1_capacity_65535_commit
+channels: 1
+ok: true
+source: bytes=1355 prefix=none tail_bytes=1355
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_capacity_65535_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], device ulong* words_0 [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  {
+    const ulong old_head = words_0[0];
+    const ulong old_tail = words_0[1];
+    if (old_tail > old_head) words_0[0] = old_head + 1ul;
+    words_0[1] = old_tail + 1ul;
+  }
+  status->state = 4;
+}
+=== end
+=== capacity_4294967295
+function_name: ptir_m1_capacity_4294967295_commit
+channels: 1
+ok: true
+source: bytes=1360 prefix=none tail_bytes=1360
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_capacity_4294967295_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], device ulong* words_0 [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  {
+    const ulong old_head = words_0[0];
+    const ulong old_tail = words_0[1];
+    if (old_tail > old_head) words_0[0] = old_head + 1ul;
+    words_0[1] = old_tail + 1ul;
+  }
+  status->state = 4;
+}
+=== end
+=== pair_0
+function_name: ptir_m1_pair_0_commit
+channels: 2
+ok: true
+source: bytes=1470 prefix=none tail_bytes=1470
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_pair_0_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], device ulong* words_0 [[buffer(2)]], device ulong* words_1 [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  {
+    const ulong old_head = words_0[0];
+    const ulong old_tail = words_0[1];
+  }
+  {
+    const ulong old_head = words_1[0];
+    const ulong old_tail = words_1[1];
+    if (old_tail > old_head) words_1[0] = old_head + 1ul;
+    words_1[1] = old_tail + 1ul;
+  }
+  status->state = 4;
+}
+=== end
+=== pair_1
+function_name: ptir_m1_pair_1_commit
+channels: 2
+ok: true
+source: bytes=1470 prefix=none tail_bytes=1470
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_pair_1_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], device ulong* words_0 [[buffer(2)]], device ulong* words_1 [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  {
+    const ulong old_head = words_0[0];
+    const ulong old_tail = words_0[1];
+  }
+  {
+    const ulong old_head = words_1[0];
+    const ulong old_tail = words_1[1];
+    if (old_tail > old_head) words_1[0] = old_head + 1ul;
+    words_1[1] = old_tail + 1ul;
+  }
+  status->state = 4;
+}
+=== end
+=== pair_2
+function_name: ptir_m1_pair_2_commit
+channels: 2
+ok: true
+source: bytes=1470 prefix=none tail_bytes=1470
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_pair_2_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], device ulong* words_0 [[buffer(2)]], device ulong* words_1 [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  {
+    const ulong old_head = words_0[0];
+    const ulong old_tail = words_0[1];
+  }
+  {
+    const ulong old_head = words_1[0];
+    const ulong old_tail = words_1[1];
+    if (old_tail > old_head) words_1[0] = old_head + 1ul;
+    words_1[1] = old_tail + 1ul;
+  }
+  status->state = 4;
+}
+=== end
+=== pair_3
+function_name: ptir_m1_pair_3_commit
+channels: 2
+ok: true
+source: bytes=1470 prefix=none tail_bytes=1470
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_pair_3_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], device ulong* words_0 [[buffer(2)]], device ulong* words_1 [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  {
+    const ulong old_head = words_0[0];
+    const ulong old_tail = words_0[1];
+  }
+  {
+    const ulong old_head = words_1[0];
+    const ulong old_tail = words_1[1];
+    if (old_tail > old_head) words_1[0] = old_head + 1ul;
+    words_1[1] = old_tail + 1ul;
+  }
+  status->state = 4;
+}
+=== end
+=== pair_4
+function_name: ptir_m1_pair_4_commit
+channels: 2
+ok: true
+source: bytes=1470 prefix=none tail_bytes=1470
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_pair_4_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], device ulong* words_0 [[buffer(2)]], device ulong* words_1 [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  {
+    const ulong old_head = words_0[0];
+    const ulong old_tail = words_0[1];
+    if (old_tail > old_head) words_0[0] = old_head + 1ul;
+  }
+  {
+    const ulong old_head = words_1[0];
+    const ulong old_tail = words_1[1];
+    words_1[1] = old_tail + 1ul;
+  }
+  status->state = 4;
+}
+=== end
+=== pair_5
+function_name: ptir_m1_pair_5_commit
+channels: 2
+ok: true
+source: bytes=1470 prefix=none tail_bytes=1470
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_pair_5_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], device ulong* words_0 [[buffer(2)]], device ulong* words_1 [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  {
+    const ulong old_head = words_0[0];
+    const ulong old_tail = words_0[1];
+    if (old_tail > old_head) words_0[0] = old_head + 1ul;
+  }
+  {
+    const ulong old_head = words_1[0];
+    const ulong old_tail = words_1[1];
+    words_1[1] = old_tail + 1ul;
+  }
+  status->state = 4;
+}
+=== end
+=== pair_6
+function_name: ptir_m1_pair_6_commit
+channels: 2
+ok: true
+source: bytes=1470 prefix=none tail_bytes=1470
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_pair_6_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], device ulong* words_0 [[buffer(2)]], device ulong* words_1 [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  {
+    const ulong old_head = words_0[0];
+    const ulong old_tail = words_0[1];
+    if (old_tail > old_head) words_0[0] = old_head + 1ul;
+  }
+  {
+    const ulong old_head = words_1[0];
+    const ulong old_tail = words_1[1];
+    words_1[1] = old_tail + 1ul;
+  }
+  status->state = 4;
+}
+=== end
+=== pair_7
+function_name: ptir_m1_pair_7_commit
+channels: 2
+ok: true
+source: bytes=1470 prefix=none tail_bytes=1470
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_pair_7_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], device ulong* words_0 [[buffer(2)]], device ulong* words_1 [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  {
+    const ulong old_head = words_0[0];
+    const ulong old_tail = words_0[1];
+    if (old_tail > old_head) words_0[0] = old_head + 1ul;
+  }
+  {
+    const ulong old_head = words_1[0];
+    const ulong old_tail = words_1[1];
+    words_1[1] = old_tail + 1ul;
+  }
+  status->state = 4;
+}
+=== end
+=== pair_8
+function_name: ptir_m1_pair_8_commit
+channels: 2
+ok: true
+source: bytes=1470 prefix=none tail_bytes=1470
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_pair_8_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], device ulong* words_0 [[buffer(2)]], device ulong* words_1 [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  {
+    const ulong old_head = words_0[0];
+    const ulong old_tail = words_0[1];
+    words_0[1] = old_tail + 1ul;
+  }
+  {
+    const ulong old_head = words_1[0];
+    const ulong old_tail = words_1[1];
+    if (old_tail > old_head) words_1[0] = old_head + 1ul;
+  }
+  status->state = 4;
+}
+=== end
+=== pair_9
+function_name: ptir_m1_pair_9_commit
+channels: 2
+ok: true
+source: bytes=1470 prefix=none tail_bytes=1470
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_pair_9_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], device ulong* words_0 [[buffer(2)]], device ulong* words_1 [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  {
+    const ulong old_head = words_0[0];
+    const ulong old_tail = words_0[1];
+    words_0[1] = old_tail + 1ul;
+  }
+  {
+    const ulong old_head = words_1[0];
+    const ulong old_tail = words_1[1];
+    if (old_tail > old_head) words_1[0] = old_head + 1ul;
+  }
+  status->state = 4;
+}
+=== end
+=== pair_10
+function_name: ptir_m1_pair_10_commit
+channels: 2
+ok: true
+source: bytes=1471 prefix=none tail_bytes=1471
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_pair_10_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], device ulong* words_0 [[buffer(2)]], device ulong* words_1 [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  {
+    const ulong old_head = words_0[0];
+    const ulong old_tail = words_0[1];
+    words_0[1] = old_tail + 1ul;
+  }
+  {
+    const ulong old_head = words_1[0];
+    const ulong old_tail = words_1[1];
+    if (old_tail > old_head) words_1[0] = old_head + 1ul;
+  }
+  status->state = 4;
+}
+=== end
+=== pair_11
+function_name: ptir_m1_pair_11_commit
+channels: 2
+ok: true
+source: bytes=1471 prefix=none tail_bytes=1471
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_pair_11_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], device ulong* words_0 [[buffer(2)]], device ulong* words_1 [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  {
+    const ulong old_head = words_0[0];
+    const ulong old_tail = words_0[1];
+    words_0[1] = old_tail + 1ul;
+  }
+  {
+    const ulong old_head = words_1[0];
+    const ulong old_tail = words_1[1];
+    if (old_tail > old_head) words_1[0] = old_head + 1ul;
+  }
+  status->state = 4;
+}
+=== end
+=== pair_12
+function_name: ptir_m1_pair_12_commit
+channels: 2
+ok: true
+source: bytes=1471 prefix=none tail_bytes=1471
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_pair_12_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], device ulong* words_0 [[buffer(2)]], device ulong* words_1 [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  {
+    const ulong old_head = words_0[0];
+    const ulong old_tail = words_0[1];
+    if (old_tail > old_head) words_0[0] = old_head + 1ul;
+    words_0[1] = old_tail + 1ul;
+  }
+  {
+    const ulong old_head = words_1[0];
+    const ulong old_tail = words_1[1];
+  }
+  status->state = 4;
+}
+=== end
+=== pair_13
+function_name: ptir_m1_pair_13_commit
+channels: 2
+ok: true
+source: bytes=1471 prefix=none tail_bytes=1471
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_pair_13_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], device ulong* words_0 [[buffer(2)]], device ulong* words_1 [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  {
+    const ulong old_head = words_0[0];
+    const ulong old_tail = words_0[1];
+    if (old_tail > old_head) words_0[0] = old_head + 1ul;
+    words_0[1] = old_tail + 1ul;
+  }
+  {
+    const ulong old_head = words_1[0];
+    const ulong old_tail = words_1[1];
+  }
+  status->state = 4;
+}
+=== end
+=== pair_14
+function_name: ptir_m1_pair_14_commit
+channels: 2
+ok: true
+source: bytes=1471 prefix=none tail_bytes=1471
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_pair_14_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], device ulong* words_0 [[buffer(2)]], device ulong* words_1 [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  {
+    const ulong old_head = words_0[0];
+    const ulong old_tail = words_0[1];
+    if (old_tail > old_head) words_0[0] = old_head + 1ul;
+    words_0[1] = old_tail + 1ul;
+  }
+  {
+    const ulong old_head = words_1[0];
+    const ulong old_tail = words_1[1];
+  }
+  status->state = 4;
+}
+=== end
+=== pair_15
+function_name: ptir_m1_pair_15_commit
+channels: 2
+ok: true
+source: bytes=1471 prefix=none tail_bytes=1471
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_pair_15_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], device ulong* words_0 [[buffer(2)]], device ulong* words_1 [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  {
+    const ulong old_head = words_0[0];
+    const ulong old_tail = words_0[1];
+    if (old_tail > old_head) words_0[0] = old_head + 1ul;
+    words_0[1] = old_tail + 1ul;
+  }
+  {
+    const ulong old_head = words_1[0];
+    const ulong old_tail = words_1[1];
+  }
+  status->state = 4;
+}
+=== end
+=== mix5
+function_name: ptir_m1_mix5_commit
+channels: 5
+ok: true
+source: bytes=1961 prefix=none tail_bytes=1961
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_mix5_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], device ulong* words_0 [[buffer(2)]], device ulong* words_1 [[buffer(3)]], device ulong* words_2 [[buffer(4)]], device ulong* words_3 [[buffer(5)]], device ulong* words_4 [[buffer(6)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  {
+    const ulong old_head = words_0[0];
+    const ulong old_tail = words_0[1];
+  }
+  {
+    const ulong old_head = words_1[0];
+    const ulong old_tail = words_1[1];
+    words_1[1] = old_tail + 1ul;
+  }
+  {
+    const ulong old_head = words_2[0];
+    const ulong old_tail = words_2[1];
+    if (old_tail > old_head) words_2[0] = old_head + 1ul;
+    words_2[1] = old_tail + 1ul;
+  }
+  {
+    const ulong old_head = words_3[0];
+    const ulong old_tail = words_3[1];
+  }
+  {
+    const ulong old_head = words_4[0];
+    const ulong old_tail = words_4[1];
+    if (old_tail > old_head) words_4[0] = old_head + 1ul;
+    words_4[1] = old_tail + 1ul;
+  }
+  status->state = 4;
+}
+=== end
+=== wide_28
+function_name: ptir_m1_wide_28_commit
+channels: 28
+ok: true
+source: bytes=5945 prefix=none tail_bytes=5945
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_wide_28_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], device ulong* words_0 [[buffer(2)]], device ulong* words_1 [[buffer(3)]], device ulong* words_2 [[buffer(4)]], device ulong* words_3 [[buffer(5)]], device ulong* words_4 [[buffer(6)]], device ulong* words_5 [[buffer(7)]], device ulong* words_6 [[buffer(8)]], device ulong* words_7 [[buffer(9)]], device ulong* words_8 [[buffer(10)]], device ulong* words_9 [[buffer(11)]], device ulong* words_10 [[buffer(12)]], device ulong* words_11 [[buffer(13)]], device ulong* words_12 [[buffer(14)]], device ulong* words_13 [[buffer(15)]], device ulong* words_14 [[buffer(16)]], device ulong* words_15 [[buffer(17)]], device ulong* words_16 [[buffer(18)]], device ulong* words_17 [[buffer(19)]], device ulong* words_18 [[buffer(20)]], device ulong* words_19 [[buffer(21)]], device ulong* words_20 [[buffer(22)]], device ulong* words_21 [[buffer(23)]], device ulong* words_22 [[buffer(24)]], device ulong* words_23 [[buffer(25)]], device ulong* words_24 [[buffer(26)]], device ulong* words_25 [[buffer(27)]], device ulong* words_26 [[buffer(28)]], device ulong* words_27 [[buffer(29)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  {
+    const ulong old_head = words_0[0];
+    const ulong old_tail = words_0[1];
+  }
+  {
+    const ulong old_head = words_1[0];
+    const ulong old_tail = words_1[1];
+    words_1[1] = old_tail + 1ul;
+  }
+  {
+    const ulong old_head = words_2[0];
+    const ulong old_tail = words_2[1];
+    if (old_tail > old_head) words_2[0] = old_head + 1ul;
+    words_2[1] = old_tail + 1ul;
+  }
+  {
+    const ulong old_head = words_3[0];
+    const ulong old_tail = words_3[1];
+    if (old_tail > old_head) words_3[0] = old_head + 1ul;
+  }
+  {
+    const ulong old_head = words_4[0];
+    const ulong old_tail = words_4[1];
+    if (old_tail > old_head) words_4[0] = old_head + 1ul;
+    words_4[1] = old_tail + 1ul;
+  }
+  {
+    const ulong old_head = words_5[0];
+    const ulong old_tail = words_5[1];
+    if (old_tail > old_head) words_5[0] = old_head + 1ul;
+  }
+  {
+    const ulong old_head = words_6[0];
+    const ulong old_tail = words_6[1];
+    words_6[1] = old_tail + 1ul;
+  }
+  {
+    const ulong old_head = words_7[0];
+    const ulong old_tail = words_7[1];
+  }
+  {
+    const ulong old_head = words_8[0];
+    const ulong old_tail = words_8[1];
+    words_8[1] = old_tail + 1ul;
+  }
+  {
+    const ulong old_head = words_9[0];
+    const ulong old_tail = words_9[1];
+  }
+  {
+    const ulong old_head = words_10[0];
+    const ulong old_tail = words_10[1];
+    if (old_tail > old_head) words_10[0] = old_head + 1ul;
+  }
+  {
+    const ulong old_head = words_11[0];
+    const ulong old_tail = words_11[1];
+    if (old_tail > old_head) words_11[0] = old_head + 1ul;
+    words_11[1] = old_tail + 1ul;
+  }
+  {
+    const ulong old_head = words_12[0];
+    const ulong old_tail = words_12[1];
+    if (old_tail > old_head) words_12[0] = old_head + 1ul;
+  }
+  {
+    const ulong old_head = words_13[0];
+    const ulong old_tail = words_13[1];
+    if (old_tail > old_head) words_13[0] = old_head + 1ul;
+    words_13[1] = old_tail + 1ul;
+  }
+  {
+    const ulong old_head = words_14[0];
+    const ulong old_tail = words_14[1];
+  }
+  {
+    const ulong old_head = words_15[0];
+    const ulong old_tail = words_15[1];
+    words_15[1] = old_tail + 1ul;
+  }
+  {
+    const ulong old_head = words_16[0];
+    const ulong old_tail = words_16[1];
+  }
+  {
+    const ulong old_head = words_17[0];
+    const ulong old_tail = words_17[1];
+    words_17[1] = old_tail + 1ul;
+  }
+  {
+    const ulong old_head = words_18[0];
+    const ulong old_tail = words_18[1];
+    if (old_tail > old_head) words_18[0] = old_head + 1ul;
+    words_18[1] = old_tail + 1ul;
+  }
+  {
+    const ulong old_head = words_19[0];
+    const ulong old_tail = words_19[1];
+    if (old_tail > old_head) words_19[0] = old_head + 1ul;
+  }
+  {
+    const ulong old_head = words_20[0];
+    const ulong old_tail = words_20[1];
+    if (old_tail > old_head) words_20[0] = old_head + 1ul;
+    words_20[1] = old_tail + 1ul;
+  }
+  {
+    const ulong old_head = words_21[0];
+    const ulong old_tail = words_21[1];
+    if (old_tail > old_head) words_21[0] = old_head + 1ul;
+  }
+  {
+    const ulong old_head = words_22[0];
+    const ulong old_tail = words_22[1];
+    words_22[1] = old_tail + 1ul;
+  }
+  {
+    const ulong old_head = words_23[0];
+    const ulong old_tail = words_23[1];
+  }
+  {
+    const ulong old_head = words_24[0];
+    const ulong old_tail = words_24[1];
+    words_24[1] = old_tail + 1ul;
+  }
+  {
+    const ulong old_head = words_25[0];
+    const ulong old_tail = words_25[1];
+  }
+  {
+    const ulong old_head = words_26[0];
+    const ulong old_tail = words_26[1];
+    if (old_tail > old_head) words_26[0] = old_head + 1ul;
+  }
+  {
+    const ulong old_head = words_27[0];
+    const ulong old_tail = words_27[1];
+    if (old_tail > old_head) words_27[0] = old_head + 1ul;
+    words_27[1] = old_tail + 1ul;
+  }
+  status->state = 4;
+}
+=== end
+=== wide_29
+function_name: ptir_m1_wide_29_commit
+channels: 29
+ok: true
+source: bytes=6131 prefix=none tail_bytes=6131
+
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M1LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M1LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+kernel void ptir_m1_wide_29_commit(device M1Status* status [[buffer(0)]], const device uchar* lane_bytes [[buffer(1)]], device ulong* words_0 [[buffer(2)]], device ulong* words_1 [[buffer(3)]], device ulong* words_2 [[buffer(4)]], device ulong* words_3 [[buffer(5)]], device ulong* words_4 [[buffer(6)]], device ulong* words_5 [[buffer(7)]], device ulong* words_6 [[buffer(8)]], device ulong* words_7 [[buffer(9)]], device ulong* words_8 [[buffer(10)]], device ulong* words_9 [[buffer(11)]], device ulong* words_10 [[buffer(12)]], device ulong* words_11 [[buffer(13)]], device ulong* words_12 [[buffer(14)]], device ulong* words_13 [[buffer(15)]], device ulong* words_14 [[buffer(16)]], device ulong* words_15 [[buffer(17)]], device ulong* words_16 [[buffer(18)]], device ulong* words_17 [[buffer(19)]], device ulong* words_18 [[buffer(20)]], device ulong* words_19 [[buffer(21)]], device ulong* words_20 [[buffer(22)]], device ulong* words_21 [[buffer(23)]], device ulong* words_22 [[buffer(24)]], device ulong* words_23 [[buffer(25)]], device ulong* words_24 [[buffer(26)]], device ulong* words_25 [[buffer(27)]], device ulong* words_26 [[buffer(28)]], device ulong* words_27 [[buffer(29)]], device ulong* words_28 [[buffer(30)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0 || status->state != 1) return;
+  const device M1LaneChannelSlot* slots = reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + sizeof(M1LaneHeader) + sizeof(M1LaneRecord));
+  {
+    const ulong old_head = words_0[0];
+    const ulong old_tail = words_0[1];
+  }
+  {
+    const ulong old_head = words_1[0];
+    const ulong old_tail = words_1[1];
+    words_1[1] = old_tail + 1ul;
+  }
+  {
+    const ulong old_head = words_2[0];
+    const ulong old_tail = words_2[1];
+    if (old_tail > old_head) words_2[0] = old_head + 1ul;
+    words_2[1] = old_tail + 1ul;
+  }
+  {
+    const ulong old_head = words_3[0];
+    const ulong old_tail = words_3[1];
+    if (old_tail > old_head) words_3[0] = old_head + 1ul;
+  }
+  {
+    const ulong old_head = words_4[0];
+    const ulong old_tail = words_4[1];
+    if (old_tail > old_head) words_4[0] = old_head + 1ul;
+    words_4[1] = old_tail + 1ul;
+  }
+  {
+    const ulong old_head = words_5[0];
+    const ulong old_tail = words_5[1];
+    if (old_tail > old_head) words_5[0] = old_head + 1ul;
+  }
+  {
+    const ulong old_head = words_6[0];
+    const ulong old_tail = words_6[1];
+    words_6[1] = old_tail + 1ul;
+  }
+  {
+    const ulong old_head = words_7[0];
+    const ulong old_tail = words_7[1];
+  }
+  {
+    const ulong old_head = words_8[0];
+    const ulong old_tail = words_8[1];
+    words_8[1] = old_tail + 1ul;
+  }
+  {
+    const ulong old_head = words_9[0];
+    const ulong old_tail = words_9[1];
+  }
+  {
+    const ulong old_head = words_10[0];
+    const ulong old_tail = words_10[1];
+    if (old_tail > old_head) words_10[0] = old_head + 1ul;
+  }
+  {
+    const ulong old_head = words_11[0];
+    const ulong old_tail = words_11[1];
+    if (old_tail > old_head) words_11[0] = old_head + 1ul;
+    words_11[1] = old_tail + 1ul;
+  }
+  {
+    const ulong old_head = words_12[0];
+    const ulong old_tail = words_12[1];
+    if (old_tail > old_head) words_12[0] = old_head + 1ul;
+  }
+  {
+    const ulong old_head = words_13[0];
+    const ulong old_tail = words_13[1];
+    if (old_tail > old_head) words_13[0] = old_head + 1ul;
+    words_13[1] = old_tail + 1ul;
+  }
+  {
+    const ulong old_head = words_14[0];
+    const ulong old_tail = words_14[1];
+  }
+  {
+    const ulong old_head = words_15[0];
+    const ulong old_tail = words_15[1];
+    words_15[1] = old_tail + 1ul;
+  }
+  {
+    const ulong old_head = words_16[0];
+    const ulong old_tail = words_16[1];
+  }
+  {
+    const ulong old_head = words_17[0];
+    const ulong old_tail = words_17[1];
+    words_17[1] = old_tail + 1ul;
+  }
+  {
+    const ulong old_head = words_18[0];
+    const ulong old_tail = words_18[1];
+    if (old_tail > old_head) words_18[0] = old_head + 1ul;
+    words_18[1] = old_tail + 1ul;
+  }
+  {
+    const ulong old_head = words_19[0];
+    const ulong old_tail = words_19[1];
+    if (old_tail > old_head) words_19[0] = old_head + 1ul;
+  }
+  {
+    const ulong old_head = words_20[0];
+    const ulong old_tail = words_20[1];
+    if (old_tail > old_head) words_20[0] = old_head + 1ul;
+    words_20[1] = old_tail + 1ul;
+  }
+  {
+    const ulong old_head = words_21[0];
+    const ulong old_tail = words_21[1];
+    if (old_tail > old_head) words_21[0] = old_head + 1ul;
+  }
+  {
+    const ulong old_head = words_22[0];
+    const ulong old_tail = words_22[1];
+    words_22[1] = old_tail + 1ul;
+  }
+  {
+    const ulong old_head = words_23[0];
+    const ulong old_tail = words_23[1];
+  }
+  {
+    const ulong old_head = words_24[0];
+    const ulong old_tail = words_24[1];
+    words_24[1] = old_tail + 1ul;
+  }
+  {
+    const ulong old_head = words_25[0];
+    const ulong old_tail = words_25[1];
+  }
+  {
+    const ulong old_head = words_26[0];
+    const ulong old_tail = words_26[1];
+    if (old_tail > old_head) words_26[0] = old_head + 1ul;
+  }
+  {
+    const ulong old_head = words_27[0];
+    const ulong old_tail = words_27[1];
+    if (old_tail > old_head) words_27[0] = old_head + 1ul;
+    words_27[1] = old_tail + 1ul;
+  }
+  {
+    const ulong old_head = words_28[0];
+    const ulong old_tail = words_28[1];
+    if (old_tail > old_head) words_28[0] = old_head + 1ul;
+  }
+  status->state = 4;
+}
+=== end
+=== wide_30
+function_name: ptir_m1_wide_30_commit
+channels: 30
+ok: false
+error: commit kernel exceeds the 29-channel direct-binding limit
+=== end

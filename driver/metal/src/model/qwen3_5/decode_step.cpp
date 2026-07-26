@@ -69,10 +69,13 @@ std::vector<Dispatch> build_decode_dag(const DecodeGeometry& g, bool with_argmax
             // Full-attn (20): attn_norm, q_proj(4096), q_split, k_proj, v_proj, q_norm,
             // k_norm, rope_q, rope_k, kv_append, sdpa, attn_gate, o_proj, attn_resid + MLP(6).
             emit(Kernel::Rms,    L, rms(g.hidden, 1));
+            // q/k/v adjacent so they form one concurrent run: all three read the
+            // block norm's output and write disjoint scratch. QSplit consumes
+            // q_proj, so it follows the run rather than splitting it in half.
             emit(Kernel::QmvQ,   L, qmv(qg_dim));                       // 2×-wide [query|gate]
-            { LD l; q_split_dispatch(g.head_dim, g.n_q_heads, l.grid, l.tg); emit(Kernel::QSplit, L, l); }
             emit(Kernel::QmvK,   L, qmv(kv_dim));
             emit(Kernel::QmvV,   L, qmv(kv_dim));
+            { LD l; q_split_dispatch(g.head_dim, g.n_q_heads, l.grid, l.tg); emit(Kernel::QSplit, L, l); }
             emit(Kernel::QNorm,  L, rms(g.head_dim, g.n_q_heads));
             emit(Kernel::KNorm,  L, rms(g.head_dim, g.n_kv_heads));
             emit(Kernel::Rope,   L, rope(g.n_q_heads));
@@ -123,19 +126,63 @@ std::vector<Dispatch> build_decode_dag(const DecodeGeometry& g, bool with_argmax
     return dag;
 }
 
+// Kinds that may run together inside a layer. Each group reads only activations
+// produced before the group starts and writes a distinct scratch value, so the
+// members are mutually independent -- not merely pairwise-adjacent-independent,
+// which is what lets a whole group drop its internal barriers.
+//
+//   * the GDN in-projections and the attention q/k/v projections all read the
+//     block norm's output;
+//   * gate/up both read the FFN norm's output;
+//   * q_norm/k_norm rewrite their own heads in place.
+//
+// Nothing here touches KV pages or GDN recurrent state, which the scratch
+// dataflow does not model; that is why this is an explicit list rather than a
+// derivation from the scratch schedule alone.
+static int concurrency_group(Kernel k) {
+    switch (k) {
+        case Kernel::QmvIn:
+        case Kernel::QmvInZ:
+        case Kernel::GdnInA:
+        case Kernel::GdnInB:   return 1;
+        case Kernel::QmvQ:
+        case Kernel::QmvK:
+        case Kernel::QmvV:     return 2;
+        case Kernel::QmvGate:
+        case Kernel::QmvUp:    return 3;
+        case Kernel::QNorm:
+        case Kernel::KNorm:    return 4;
+        default:               return 0;  // runs alone
+    }
+}
+
+std::vector<int> concurrent_run_ends(const std::vector<Dispatch>& dag) {
+    std::vector<int> ends(dag.size());
+    for (std::size_t i = 0; i < dag.size(); ++i) ends[i] = int(i);
+    std::size_t i = 0;
+    while (i < dag.size()) {
+        const int group = concurrency_group(dag[i].kind);
+        std::size_t j = i;
+        if (group != 0) {
+            while (j + 1 < dag.size() &&
+                   dag[j + 1].layer == dag[i].layer &&
+                   concurrency_group(dag[j + 1].kind) == group) {
+                ++j;
+            }
+        }
+        for (std::size_t k = i; k <= j; ++k) ends[k] = int(j);
+        i = j + 1;
+    }
+    return ends;
+}
+
 // Barrier flags: false = this dispatch runs concurrently with the next (no barrier).
 // Only adjacent independent pairs that read an already-produced common input and write
 // disjoint outputs. Conservative; the gate localizes any over-/under-sync as a port bug.
-static bool barrier_after(const std::vector<Dispatch>& dag, size_t i) {
+static bool barrier_after(const std::vector<Dispatch>& dag, size_t i,
+                          const std::vector<int>& run_ends) {
     if (i + 1 >= dag.size()) return true;
-    const Dispatch& a = dag[i]; const Dispatch& b = dag[i + 1];
-    if (a.layer != b.layer) return true;
-    if (a.kind == Kernel::QmvK    && b.kind == Kernel::QmvV) return false;  // k_proj ‖ v_proj
-    if (a.kind == Kernel::QNorm   && b.kind == Kernel::KNorm) return false; // q_norm ‖ k_norm
-    if (a.kind == Kernel::QmvGate && b.kind == Kernel::QmvUp) return false; // gate_proj ‖ up_proj
-    if (a.kind == Kernel::QmvIn   && b.kind == Kernel::QmvInZ) return false; // gdn_in_qkv ‖ gdn_in_z
-    if (a.kind == Kernel::GdnInA  && b.kind == Kernel::GdnInB) return false; // gdn_in_a ‖ gdn_in_b
-    return true;
+    return run_ends[i] == int(i);
 }
 
 void encode_decode_step(StepEncoder& se,
@@ -143,13 +190,14 @@ void encode_decode_step(StepEncoder& se,
                         const DecodeStepPsos& psos,
                         bool force_barriers,
                         const StepTimingHook* timing) {
+    const std::vector<int> run_ends = concurrent_run_ends(dag);
     for (size_t i = 0; i < dag.size(); ++i) {
         const Dispatch& d = dag[i];
         if (timing && timing->mark) timing->mark(static_cast<int>(i));  // boundary i
         se.set_pso(d.fuse_residual ? psos.qmv_residual : psos[d.kind]);
         se.set_argtable(d.kind, d.ordinal);  // ordinal-keyed (unique, token-stable)
         se.dispatch(d.grid, d.tg);
-        if (force_barriers || barrier_after(dag, i)) se.barrier();
+        if (force_barriers || barrier_after(dag, i, run_ends)) se.barrier();
     }
     if (timing && timing->mark) timing->mark(static_cast<int>(dag.size()));  // final boundary
 }

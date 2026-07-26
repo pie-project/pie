@@ -42,80 +42,23 @@
 #include <string>
 #include <vector>
 
-#include "pie_native/ptir/descriptor.hpp"
-#include "pie_native/ptir/fire_geometry.hpp"
+#include "pie_native/fire/descriptor.hpp"
+#include "pie_native/fire/fire_geometry.hpp"
+#include "pie_native/launch/trace_query.hpp"
 #include "pipeline/interp.hpp"
 
 namespace pie::metal::pipeline {
 
-using namespace pie_native::ptir::descriptor;
+using namespace pie_native::launch::descriptor;
 
 enum class GeometryResolveStatus { Ready, NotReady, Failed };
 
 struct GeometryResolveResult {
     GeometryResolveStatus status = GeometryResolveStatus::Ready;
-    cptir::ChannelId channel = 0;
+    launch::ChannelId channel = 0;
 };
 
 namespace detail {
-
-inline const cptir::Op* producer(
-    const Trace& trace, cptir::ValueId value) {
-    for (const cptir::Stage& stage : trace.stages) {
-        for (const cptir::Op& op : stage.ops) {
-            if (value >= op.result_id &&
-                value < op.result_id + op.result_count) {
-                return &op;
-            }
-        }
-    }
-    return nullptr;
-}
-
-inline cptir::StructuredMaskDescriptor structured_mask_descriptor(
-    const Trace& trace,
-    cptir::ChannelId mask_channel) {
-    const cptir::ChannelPut* selected = nullptr;
-    for (const cptir::Stage& stage : trace.stages) {
-        for (const cptir::ChannelPut& put : stage.puts) {
-            if (put.channel == mask_channel) selected = &put;
-        }
-    }
-    if (selected == nullptr) return {};
-    cptir::ValueId value = selected->value;
-    for (std::size_t depth = 0; depth <= trace.values.size(); ++depth) {
-        const cptir::Op* op = producer(trace, value);
-        if (op == nullptr) break;
-        if (op->code == OpCode::Reshape && !op->args.empty()) {
-            value = op->args[0];
-            continue;
-        }
-        cptir::StructuredMaskDescriptor descriptor;
-        switch (op->code) {
-            case OpCode::CausalMask:
-                descriptor.kind =
-                    cptir::StructuredMaskKind::Causal;
-                descriptor.key_len = op->imm;
-                return descriptor;
-            case OpCode::SlidingWindowMask:
-                descriptor.kind =
-                    cptir::StructuredMaskKind::SlidingWindow;
-                descriptor.key_len = op->imm;
-                descriptor.window = op->imm2;
-                return descriptor;
-            case OpCode::SinkWindowMask:
-                descriptor.kind =
-                    cptir::StructuredMaskKind::SinkWindow;
-                descriptor.key_len = op->imm;
-                descriptor.sink = op->imm2;
-                descriptor.window = op->imm3;
-                return descriptor;
-            default:
-                return {};
-        }
-    }
-    return {};
-}
 
 // Bit-reinterpret a Value's lanes as u32, mirroring CUDA's raw-byte
 // `as_u32` (a straight little-endian reinterpretation of the wire bytes,
@@ -145,7 +88,7 @@ inline bool value_as_u32(const Value& v, std::vector<std::uint32_t>& out) {
 // never dummy-run.
 inline GeometryResolveResult read_port_cell(
     InterpInstance& inst,
-    cptir::ChannelId channel,
+    launch::ChannelId channel,
     std::vector<std::uint32_t>& out,
     std::string* err) {
     ChannelState& st = *inst.channels[channel];
@@ -172,7 +115,7 @@ inline GeometryResolveResult read_port_cell(
 // ::mask` documents). Same not-ready/W1.6 contract as `read_port_cell`.
 inline GeometryResolveResult read_mask_cell(
     InterpInstance& inst,
-    cptir::ChannelId channel,
+    launch::ChannelId channel,
     std::vector<std::uint8_t>& out,
     std::string* err) {
     ChannelState& st = *inst.channels[channel];
@@ -206,14 +149,14 @@ inline GeometryResolveResult resolve_fire_geometry_typed(
     const std::vector<ConstPortValue>& const_ports,
     InterpInstance& inst,
     std::uint32_t page_size,
-    cptir::FireGeometry& out,
+    launch::FireGeometry& out,
     std::string* err) {
-    out = cptir::FireGeometry{};
-    cptir::ChannelId ch[10] = {0};
+    out = launch::FireGeometry{};
+    launch::ChannelId ch[10] = {0};
     bool has[10] = {false};
     bool channel_bound[10] = {false};
     const Value* constant[10] = {nullptr};
-    for (const cptir::PortBinding& pb : trace.ports) {
+    for (const launch::PortBinding& pb : trace.ports) {
         if (pb.port > kPortAttnMask) continue;
         has[pb.port] = true;
         if (pb.is_const) {
@@ -379,7 +322,7 @@ inline GeometryResolveResult resolve_fire_geometry_typed(
     if (has[kPortAttnMask]) {
         if (channel_bound[kPortAttnMask]) {
             out.structured_mask =
-                detail::structured_mask_descriptor(
+                launch::structured_mask_descriptor(
                     trace, ch[kPortAttnMask]);
         }
         const auto result =
@@ -402,7 +345,7 @@ inline GeometryResolveResult resolve_fire_geometry_typed(
     const Trace& trace,
     InterpInstance& inst,
     std::uint32_t page_size,
-    cptir::FireGeometry& out,
+    launch::FireGeometry& out,
     std::string* err) {
     return resolve_fire_geometry_typed(
         trace, {}, inst, page_size, out, err);
@@ -412,7 +355,7 @@ inline bool resolve_fire_geometry(
     const Trace& trace,
     InterpInstance& inst,
     std::uint32_t page_size,
-    cptir::FireGeometry& out,
+    launch::FireGeometry& out,
     std::string* err) {
     return resolve_fire_geometry_typed(
                trace, {}, inst, page_size, out, err).status ==
@@ -423,7 +366,7 @@ inline GeometryResolveResult resolve_fire_geometry_typed(
     const ExecPlan& plan,
     InterpInstance& inst,
     std::uint32_t page_size,
-    cptir::FireGeometry& out,
+    launch::FireGeometry& out,
     std::string* err) {
     return resolve_fire_geometry_typed(
         plan.trace,
@@ -445,7 +388,7 @@ inline GeometryResolveResult resolve_fire_geometry_typed(
 // Callers must skip calling this entirely for an EMPTY segment (that is the
 // legacy/pass-through case — ids already physical, not relative).
 inline void translate_kv_pages(const std::uint32_t* tr, std::size_t tr_len,
-                               cptir::FireGeometry& fg) {
+                               launch::FireGeometry& fg) {
     auto translate = [&](std::vector<std::uint32_t>& ids) {
         for (std::uint32_t& v : ids) v = v < tr_len ? tr[v] : 0u;
     };

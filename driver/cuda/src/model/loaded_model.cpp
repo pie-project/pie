@@ -15,6 +15,7 @@
 #include "ops/gemm.hpp"
 #include "loader/load_plan_bridge.hpp"
 #include "loader/load_plan_executor.hpp"
+#include "model/registry.hpp"
 #include "model/weight_artifact_cache.hpp"
 #include "tensor.hpp"
 
@@ -75,8 +76,8 @@ LoadedModel LoadedModel::load(
     const Config& boot_cfg,
     NcclComm* tp_comm,
     std::string_view runtime_quant,
-    pie_driver::Mxfp4MoeRequest mxfp4_moe,
-    pie_driver::Component component) {
+    model::Mxfp4MoeRequest mxfp4_moe,
+    model::Component component) {
     (void)tp_comm;
 
     if (boot_cfg.model.snapshot_dir.empty()) {
@@ -142,7 +143,6 @@ LoadedModel LoadedModel::load(
         auto target = cuda_device_target();
         target.tp_rank = static_cast<std::uint32_t>(boot_cfg.distributed.tp_rank);
         target.tp_size = static_cast<std::uint32_t>(boot_cfg.distributed.tp_size);
-        target.fp8_native = fp8_native;
         target.native_mxfp4_moe = mxfp4_native_gemm;
         return target;
     }();
@@ -157,20 +157,34 @@ LoadedModel LoadedModel::load(
         throw std::runtime_error("engine: failed to read checkpoint: " + open_error);
     }
 
-    // What this driver will bind, stated before anything is loaded. The loader
-    // type-checks it against what the files actually contain and lowers it; it
-    // does not decide *what* to build, which is why a family it has never heard
-    // of loads exactly as well as one it has (§12 row 12).
+    // What this driver will bind, stated before anything is loaded. The row is
+    // the same one `Context` will later call `bind` on, so the contract and the
+    // binder cannot be about different models; the loader type-checks the
+    // contract against what the files contain and lowers it, but does not
+    // decide *what* to build, which is why a family it has never heard of loads
+    // exactly as well as one it has (§12 row 12).
+    const model::ArchEntry* arch = model::find_arch_entry(e.hf_.model_type);
+    if (arch == nullptr || !arch->author_contract) {
+        throw std::runtime_error("engine: unsupported model_type '" + e.hf_.model_type +
+                                 "'; no row in the arch table declares what it binds");
+    }
+    const model::ModelFacts facts{
+        .model_type = e.hf_.model_type,
+        .quant_method = e.hf_.quant_method,
+        .num_hidden_layers = static_cast<std::uint32_t>(std::max(0, e.hf_.num_hidden_layers)),
+        .num_experts = static_cast<std::uint32_t>(std::max(0, e.hf_.num_experts)),
+        .head_dim = static_cast<std::uint32_t>(std::max(0, e.hf_.head_dim)),
+    };
     pie_loader::ModelContract contract;
-    pie_driver::author_model_contract(
-        checkpoint,
-        pie_driver::ModelFacts{
-            .model_type = e.hf_.model_type,
-            .quant_method = e.hf_.quant_method,
-            .num_hidden_layers = static_cast<std::uint32_t>(std::max(0, e.hf_.num_hidden_layers)),
-            .num_experts = static_cast<std::uint32_t>(std::max(0, e.hf_.num_experts)),
-        },
-        device_target, runtime_quant, mxfp4_moe, component, contract);
+    {
+        model::ContractBuilder builder(
+            checkpoint, facts, device_target,
+            model::resolve_runtime_quant(runtime_quant, fp8_native),
+            model::resolve_mxfp4_moe(mxfp4_moe, device_target.native_mxfp4_moe), component,
+            contract);
+        arch->author_contract(builder);
+        builder.finish();
+    }
 
     // The policy is the *author's* answer, not the plan's. It used to be read
     // back off `plan.target`, which meant the loader had to carry a field it
@@ -179,7 +193,7 @@ LoadedModel LoadedModel::load(
     // written from.
     e.mxfp4_moe_request_ = mxfp4_moe;
     e.mxfp4_moe_policy_ =
-        pie_driver::resolve_mxfp4_moe(mxfp4_moe, device_target.native_mxfp4_moe);
+        model::resolve_mxfp4_moe(mxfp4_moe, device_target.native_mxfp4_moe);
 
     LoadPlanResult planned_load = prepare_load_plan(checkpoint, contract, device_target);
     log_stage("compile LoadPlan done");
@@ -231,23 +245,6 @@ LoadedModel LoadedModel::load(
         std::cerr << "[pie-driver-cuda] rust loader compiler: "
                   << pie_loader::bytes_to_string(load_view.summary) << "\n";
     }
-    // Real as of §12 row 7b-4b: both counts used to be `view.tensors.len`, so
-    // this compared the plan with itself. `runtime_tensor_count` is now what the
-    // *driver* declared through `pie_loader::TensorContract` and
-    // `covered_contract_count` is how much of that the loader built. A family
-    // that has not adopted the declaration declares nothing, and zero == zero
-    // still passes — the check is opt-in per family, not a flag day.
-    if (planned_load.covered_contract_count != planned_load.runtime_tensor_count) {
-        throw std::runtime_error(
-            "engine: Rust loader did not cover the contract this model declared; "
-            "covered " +
-            std::to_string(planned_load.covered_contract_count) + "/" +
-            std::to_string(planned_load.runtime_tensor_count) +
-            " demanded tensors (the plan produced " +
-            std::to_string(planned_load.planned_tensor_count) +
-            "). Add loader coverage before enabling this model.");
-    }
-
     // Materialized-weight artifact cache (WEIGHT_LOADER_TODO.md A3.1). The
     // materialized weights are a deterministic function of the load-plan cache key,
     // so on a hit we reload them straight into device memory and skip the
@@ -390,19 +387,11 @@ LoadedModel LoadedModel::load(
                   << " bulk_copies=" << materialized.h2d_bulk_copy_count
                   << " pinned_copies="
                   << materialized.h2d_pinned_copy_count
-                  << " slab_scatter="
-                  << materialized.slab_scatter_count
-                  << " slab_placements="
-                  << materialized.slab_scatter_placements
                   << " h2d_bytes=" << to_mib(materialized.h2d_copy_bytes)
                   << " MiB bulk_bytes="
                   << to_mib(materialized.h2d_bulk_copy_bytes)
                   << " MiB pinned_bytes="
                   << to_mib(materialized.h2d_pinned_copy_bytes)
-                  << " MiB slab_source_bytes="
-                  << to_mib(materialized.slab_scatter_source_bytes)
-                  << " MiB slab_payload_bytes="
-                  << to_mib(materialized.slab_scatter_payload_bytes)
                   << " MiB copy_flushes="
                   << materialized.copy_stream_flushes
                   << " batch_calls="

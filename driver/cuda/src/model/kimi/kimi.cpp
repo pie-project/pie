@@ -1,10 +1,31 @@
 #include "model/kimi/kimi.hpp"
 
+#include <cstdlib>
+
 #include <algorithm>
 #include <stdexcept>
 #include <string>
 
 namespace pie_cuda_driver::model {
+
+// Stack the routed experts' fc1 as [up; gate] instead of [gate; up], which is
+// the order flashinfer's fused CUTLASS grouped GEMM expects. Off by default:
+// the fused runner is a real GPU-time win (Kimi decode inflight 5.3 -> 3.9 ms)
+// and wins at c=32/64/96/256, but at c=128 it reproducibly drops end-to-end
+// throughput from ~44.6k to ~27.2k tok/s. That is a runtime pipelining
+// bistability rather than a kernel defect -- the unfused path hits the same
+// ~10 ms wave plateau at c=160 -- but until the scheduler stops resonating,
+// making the GPU faster here costs throughput. Enable with
+// `PIE_KIMI_MOE_FLASHINFER=1`.
+bool kimi_moe_gate_up_swapped() {
+    static const bool swapped = [] {
+        const char* v = std::getenv("PIE_KIMI_MOE_FLASHINFER");
+        if (v == nullptr || v[0] == '\0') return false;
+        return v[0] != '0';
+    }();
+    return swapped;
+}
+
 
 namespace {
 
@@ -131,9 +152,13 @@ KimiWeights bind_kimi(const LoadedModel& engine) {
         L.kv_b_proj = &must(engine, ap + "kv_b_proj.weight");
         L.o_proj    = &must(engine, ap + "o_proj.weight");
 
-        require_rank2(*L.q_a_proj, ap + "q_a_proj.weight");
+        if (L.q_kv_a_fused != nullptr) {
+            require_rank2(*L.q_kv_a_fused, ap + "q_kv_a_proj.fused.weight");
+        } else {
+            require_rank2(*L.q_a_proj, ap + "q_a_proj.weight");
+            require_rank2(*L.kv_a_proj_with_mqa, ap + "kv_a_proj_with_mqa.weight");
+        }
         require_rank2(*L.q_b_proj, ap + "q_b_proj.weight");
-        require_rank2(*L.kv_a_proj_with_mqa, ap + "kv_a_proj_with_mqa.weight");
         require_rank2(*L.kv_b_proj, ap + "kv_b_proj.weight");
         require_rank2(*L.o_proj, ap + "o_proj.weight");
 

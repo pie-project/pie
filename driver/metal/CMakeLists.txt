@@ -87,9 +87,9 @@ if(APPLE)
   set(PIE_METAL_LIVE_SOURCES
     src/mtl4_context.mm
     src/pipeline/shared_storage.mm
-    src/pipeline/m1_codegen.cpp
     src/pipeline/m1_runtime.cpp
     src/batch/decode_timing.cpp
+    src/batch/golden_tap.cpp
     src/batch/scratch.cpp
     src/model/qwen3_5/decode_consts.cpp
     src/model/qwen3_5/decode_step.cpp
@@ -117,12 +117,11 @@ target_include_directories(pie_driver_metal_lib
     ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels
     ${CMAKE_CURRENT_SOURCE_DIR}/src/store
     ${CMAKE_CURRENT_SOURCE_DIR}/src/loader
-    # ../common/include also carries the shared pure-host PTIR decode headers
-    # (pie_native/ptir/{container,bound,trace,op_table,fire_geometry}.hpp —
-    # CUDA-free, namespace pie_native::ptir). The host interpreter
-    # (src/pipeline/interp.hpp) consumes them; Metal no longer reaches into
+    # ../abi/include carries the shared launch-package view headers
+    # (pie_native/launch/{program,plan,op_table,fire_geometry}.hpp — CUDA-free,
+    # namespace pie_native::launch). Metal no longer reaches into
     # driver/cuda/src for anything.
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include
     ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR})
 
 target_compile_options(pie_driver_metal_lib PRIVATE
@@ -135,6 +134,19 @@ target_compile_options(pie_driver_metal_lib PRIVATE
 # which drives an independent MetalExecutor::setup outside Context) sees
 # the same default when PIE_METAL_KERNELS_DIR is unset. Installed packaging
 # of the kernels dir is a follow-up.
+#
+# ptir_rng.generated.metal is owned by pie-codegen and staged here at configure
+# time rather than checked in twice. The host emitter now embeds the M1 runtime
+# template into every emitted MSL source itself, but the RNG preamble still
+# needs to sit beside the checked-in .metal kernels so a build-time
+# `configure_file` (below) keeps them in lockstep -- the driver splices it in
+# at compile time because Metal's runtime shader compiler does no filesystem
+# include lookup.
+configure_file(
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include/ptir_rng.generated.metal
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/ptir_rng.generated.metal
+  COPYONLY)
+
 if(APPLE)
   target_compile_definitions(pie_driver_metal_lib PUBLIC
     PIE_METAL_KERNELS_DIR_DEFAULT="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
@@ -219,12 +231,36 @@ if(PIE_METAL_BUILD_METALLIB)
   add_dependencies(pie_driver_metal_lib pie_driver_metal_shaders)
 endif()
 
+# ---- the loader archive ----------------------------------------------------
+#
+# `src/batch/forward.cpp` compiles a LoadPlan, which means calling into
+# `pie-loader` — an rlib the *worker* links, not something a C++ binary can
+# pull in. `cargo rustc -p pie-loader --lib --crate-type staticlib` emits an
+# archive that does link. Anything that links `pie_driver_metal_lib` into an
+# executable needs it; the archive target itself does not, which is why
+# `worker/build.rs` (it builds only `pie_driver_metal_lib`) never noticed.
+# Mirrors driver/cuda: when the archive is absent those targets are skipped
+# rather than failing the build for everyone who has not run that command.
+if(NOT PIE_LOADER_STATICLIB)
+  find_library(PIE_LOADER_STATICLIB
+    NAMES pie_loader
+    PATHS ${CMAKE_CURRENT_SOURCE_DIR}/../../target/debug
+    NO_DEFAULT_PATH)
+endif()
+
 # -----------------------------------------------------------------------------
 # Standalone executable — thin shim around the lib's entry point. Consumed
 # for build/config self-checks and local driver development.
 # -----------------------------------------------------------------------------
-add_executable(pie_driver_metal src/main.cpp)
-target_link_libraries(pie_driver_metal PRIVATE pie_driver_metal_lib)
+if(PIE_LOADER_STATICLIB)
+  add_executable(pie_driver_metal src/main.cpp)
+  target_link_libraries(pie_driver_metal PRIVATE pie_driver_metal_lib
+    ${PIE_LOADER_STATICLIB})
+else()
+  message(STATUS
+    "pie_driver_metal: skipped (no libpie_loader.a; build one with "
+    "`cargo rustc -p pie-loader --lib --crate-type staticlib`)")
+endif()
 
 # The `--features driver-metal` build in worker/build.rs consumes
 # `pie_driver_metal_lib` directly.
@@ -246,48 +282,112 @@ endif()
 
 option(PIE_METAL_BUILD_STUB_TESTS "Build Linux/non-MLX direct-surface tests" OFF)
 if(PIE_METAL_BUILD_STUB_TESTS AND NOT PIE_METAL_WITH_MLX)
-  add_executable(metal_direct_stub_test tests/direct_stub_test.cpp)
-  target_link_libraries(metal_direct_stub_test PRIVATE pie_driver_metal_lib)
-  add_test(NAME metal_direct_stub_test COMMAND metal_direct_stub_test)
-  set_tests_properties(metal_direct_stub_test PROPERTIES
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+  message(STATUS "Metal direct stub tests are disabled after launch-package migration")
+endif()
+
+# The Apple-only translation units, checked where there is no Apple.
+#
+# `PIE_METAL_LIVE_SOURCES` is empty off macOS, so `src/loader/heap_bind.cpp` —
+# the file that walks the loader's `StorageInstr` switch — is not compiled at
+# all on Linux. That is exactly how the loader v2 refactor shipped a
+# `case K::Release:` for a variant it had deleted and a `QuantSpec` field that
+# was gone: the whole CUDA suite passed, because none of it names this file.
+# A syntax check against the real generated headers costs seconds, needs no
+# Apple hardware, and is the only thing keeping the Metal ABI surface honest
+# between Mac builds.
+if(NOT APPLE)
+  add_test(NAME metal_loader_abi_syntax
+    COMMAND ${CMAKE_CXX_COMPILER} -std=c++20 -fsyntax-only
+      -I${CMAKE_CURRENT_SOURCE_DIR}/src
+      -I${CMAKE_CURRENT_SOURCE_DIR}/src/batch
+      -I${CMAKE_CURRENT_SOURCE_DIR}/src/model/qwen3_5
+      -I${CMAKE_CURRENT_SOURCE_DIR}/src/kernels
+      -I${CMAKE_CURRENT_SOURCE_DIR}/src/store
+      -I${CMAKE_CURRENT_SOURCE_DIR}/src/loader
+      -I${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+      -I${CMAKE_CURRENT_SOURCE_DIR}/../abi/include
+      -I${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include
+      -I${PIE_DRIVER_ABI_INCLUDE_DIR}
+      -I${PIE_LOADER_INCLUDE_DIR}
+      ${CMAKE_CURRENT_SOURCE_DIR}/src/loader/heap_bind.cpp)
 endif()
 
 function(add_metal_host_test target source)
   add_executable(${target} ${source})
+  # `${PIE_DRIVER_ABI_INCLUDE_DIR}` carries the generated `pie_driver_abi.h`,
+  # which `interp.hpp` and `launch/program.hpp` both include. Every other target
+  # here lists it; without it these two do not compile.
   target_include_directories(${target} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include
+    ${PIE_DRIVER_ABI_INCLUDE_DIR})
   add_test(NAME ${target} COMMAND ${target})
 endfunction()
 
+# Tests that link the archive. Whether a given one drags in `forward.cpp`'s
+# loader calls is a link-time detail that moves, so the archive is offered to
+# all of them when it exists; `NEEDS_LOADER` marks the ones that provably need
+# it, and those are skipped when it does not — the same trade driver/cuda makes.
 function(add_metal_linked_test target source)
+  cmake_parse_arguments(ARG "NEEDS_LOADER" "" "" ${ARGN})
+  if(ARG_NEEDS_LOADER AND NOT PIE_LOADER_STATICLIB)
+    message(STATUS
+      "${target}: skipped (no libpie_loader.a; build one with "
+      "`cargo rustc -p pie-loader --lib --crate-type staticlib`)")
+    return()
+  endif()
   add_executable(${target} ${source})
   target_link_libraries(${target} PRIVATE pie_driver_metal_lib)
+  if(PIE_LOADER_STATICLIB)
+    target_link_libraries(${target} PRIVATE ${PIE_LOADER_STATICLIB})
+  endif()
   add_test(NAME ${target} COMMAND ${target})
 endfunction()
 
-file(GLOB PIE_PTIR_CANONICAL_GOLDENS CONFIGURE_DEPENDS
-  ${CMAKE_CURRENT_SOURCE_DIR}/../../interface/ptir/tests/golden-ptir/*.txt)
-add_executable(
-  ptir_decoder_limits_test
-  ${CMAKE_CURRENT_SOURCE_DIR}/../common/tests/ptir_decoder_limits_test.cpp)
-target_include_directories(ptir_decoder_limits_test PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/../common/include)
-target_compile_features(ptir_decoder_limits_test PRIVATE cxx_std_20)
-add_test(
-  NAME ptir_decoder_limits_test
-  COMMAND ptir_decoder_limits_test
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../interface/ptir/tests/malformed_wire_corpus.txt
-    ${PIE_PTIR_CANONICAL_GOLDENS})
-
-add_metal_host_test(pipeline_interp_test tests/pipeline_interp_test.cpp)
 add_metal_host_test(
   pipeline_channel_storage_test
   tests/pipeline_channel_storage_test.cpp)
 add_metal_host_test(
   pipeline_descriptor_resolve_test
   tests/pipeline_descriptor_resolve_test.cpp)
+
+# The only host-runnable coverage of `interp.hpp`, which is live code
+# (`context.cpp` reaches `pipeline::step`). It replays the same relocatable
+# launch-package images the CUDA driver tests register -- the image is an ABI
+# record dump, so it is backend-neutral, which is why the fixtures live at
+# `driver/fixtures/` and not under either driver.
+add_executable(pipeline_launch_conformance_test
+  tests/pipeline_launch_conformance_test.cpp)
+target_include_directories(pipeline_launch_conformance_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../interface/driver/include)
+# The fixture directory is generated, so it is passed as an absolute path
+# rather than relied on as a working directory that may not exist yet.
+add_test(NAME pipeline_launch_conformance_test
+  COMMAND pipeline_launch_conformance_test
+    ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures)
+
+# What this driver declares, and what `push_mlx_affine_u4` owes the qmv kernels
+# after the loader v2 `QuantSpec` field removal. Deliberately does NOT link
+# `pie_driver_metal_lib`: the schema is a header and the loader archive is
+# CUDA-free and Metal-free, so this runs on Linux too — which is what stops the
+# Metal *contract* layer from depending on someone owning a Mac.
+if(PIE_LOADER_STATICLIB)
+  add_executable(model_contract_test tests/model_contract_test.cpp)
+  target_compile_features(model_contract_test PRIVATE cxx_std_20)
+  target_include_directories(model_contract_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${PIE_LOADER_INCLUDE_DIR})
+  target_link_libraries(model_contract_test PRIVATE
+    ${PIE_LOADER_STATICLIB} Threads::Threads ${CMAKE_DL_LIBS})
+  add_test(NAME model_contract_test COMMAND model_contract_test)
+else()
+  message(STATUS
+    "model_contract_test: skipped (no libpie_loader.a; build one with "
+    "`cargo rustc -p pie-loader --lib --crate-type staticlib`)")
+endif()
 
 add_executable(heap_layout_slot_test tests/heap_layout_slot_test.cpp)
 target_include_directories(heap_layout_slot_test PRIVATE
@@ -296,20 +396,27 @@ target_include_directories(heap_layout_slot_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src/loader)
 add_test(NAME heap_layout_slot_test COMMAND heap_layout_slot_test)
 
-add_executable(paged_batch_validation_test tests/paged_batch_validation_test.cpp)
-target_include_directories(paged_batch_validation_test PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/src
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/batch)
-target_link_libraries(paged_batch_validation_test PRIVATE pie_driver_metal_lib)
-add_test(NAME paged_batch_validation_test COMMAND paged_batch_validation_test)
+if(PIE_LOADER_STATICLIB)
+  add_executable(paged_batch_validation_test tests/paged_batch_validation_test.cpp)
+  target_include_directories(paged_batch_validation_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/batch)
+  target_link_libraries(paged_batch_validation_test PRIVATE pie_driver_metal_lib
+    ${PIE_LOADER_STATICLIB})
+  add_test(NAME paged_batch_validation_test COMMAND paged_batch_validation_test)
+else()
+  message(STATUS
+    "paged_batch_validation_test: skipped (no libpie_loader.a; build one with "
+    "`cargo rustc -p pie-loader --lib --crate-type staticlib`)")
+endif()
 
-add_metal_linked_test(
-  pipeline_device_geometry_e2e_test
-  tests/pipeline_device_geometry_e2e_test.cpp)
-add_metal_linked_test(pipeline_copy_ops_test tests/pipeline_copy_ops_test.cpp)
-add_metal_linked_test(caps_honesty_test tests/caps_honesty_test.cpp)
-add_metal_linked_test(executor_geometry_test tests/executor_geometry_test.cpp)
-add_metal_linked_test(batch_schedule_plan_test tests/batch_schedule_plan_test.cpp)
+add_metal_linked_test(pipeline_copy_ops_test tests/pipeline_copy_ops_test.cpp
+  NEEDS_LOADER)
+add_metal_linked_test(caps_honesty_test tests/caps_honesty_test.cpp NEEDS_LOADER)
+add_metal_linked_test(executor_geometry_test tests/executor_geometry_test.cpp
+  NEEDS_LOADER)
+add_metal_linked_test(batch_schedule_plan_test tests/batch_schedule_plan_test.cpp
+  NEEDS_LOADER)
 
 add_executable(executor_worker_test tests/executor_worker_test.cpp)
 target_include_directories(executor_worker_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -317,12 +424,20 @@ target_link_libraries(executor_worker_test PRIVATE Threads::Threads)
 add_test(NAME executor_worker_test COMMAND executor_worker_test)
 
 if(APPLE)
-  add_metal_linked_test(m1_generated_test tests/m1_generated_test.cpp)
-  target_compile_definitions(m1_generated_test PRIVATE
-    PIE_PTIR_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../interface/ptir/tests/golden-ptir")
   add_metal_linked_test(ptir_m0_device_test tests/ptir_m0_device_test.cpp)
-  add_metal_linked_test(ptir_checkpoint_e2e_test tests/ptir_checkpoint_e2e_test.cpp)
   add_metal_linked_test(kv_append_paged_pso_test tests/kv_append_paged_pso_test.cpp)
   add_metal_linked_test(decode_step_mb_test tests/decode_step_mb_test.cpp)
   add_metal_linked_test(kv_pool_lifecycle_test tests/kv_pool_lifecycle_test.cpp)
+  # `heap_bind.cpp`'s `case K::Fill` on a real heap.
+  add_metal_linked_test(loader_fill_test tests/loader_fill_test.cpp NEEDS_LOADER)
+  # The host MSL emitter's whole corpus, through Apple's shader compiler. The
+  # goldens are the emitter's own bytes (`compiler/tests/tests/metal_msl_golden.rs`
+  # pins Rust == golden); this pins golden == compilable, which nothing did
+  # while the driver still carried an emitter of its own.
+  add_metal_linked_test(msl_compile_test tests/msl_compile_test.cpp)
+  target_compile_definitions(msl_compile_test PRIVATE
+    PIE_MSL_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/tests/golden-msl"
+    PIE_MSL_RUNTIME_TEMPLATE="${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/runtime/metal/ptir_m1_runtime.metal"
+    PIE_MSL_GROUPED_PREAMBLE="${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/runtime/metal/ptir_m1_grouped.metal"
+    PIE_MSL_RNG_PREAMBLE="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/ptir_rng.generated.metal")
 endif()

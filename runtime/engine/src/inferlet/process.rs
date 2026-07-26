@@ -237,9 +237,11 @@ pub fn init_admission(max_concurrent: Option<usize>) {
     // (see FramePolicy::on_execution_slot_released) — extra permits
     // beyond that are neutral because without an earmarked taker the
     // stall just moves into mid-generation seals.
+    //
+    // Depth 2 and 3 were measured at conc 512 (30054 / 30109 tok/s vs
+    // 30443 at depth 1): no gain, so the structural depth stands.
     const STAGED_COHORTS: usize = 1;
-    let bind_ahead =
-        limit.map(|n| Arc::new(Semaphore::new(n.saturating_mul(1 + STAGED_COHORTS))));
+    let bind_ahead = limit.map(|n| Arc::new(Semaphore::new(n.saturating_mul(1 + STAGED_COHORTS))));
     EXECUTION_SLOT_CAPACITY
         .set(limit)
         .expect("execution slot capacity already initialized");
@@ -326,6 +328,13 @@ pub(crate) async fn ensure_execution_admitted(ctx: &mut ProcessCtx) {
         None => None,
     };
     ctx.admit_execution(permit, duration_us(started.elapsed()));
+    // The planner registers at spawn (registration order is the FCFS clock),
+    // but only from here on can this process hold pooled pages. Its wedge
+    // predicate needs that distinction: an unadmitted process is neither
+    // running nor able to free anything.
+    if let Some(planner) = crate::planner::planner() {
+        planner.note_admitted(ctx.id());
+    }
     if crate::scheduler::fire_timing_enabled() {
         crate::scheduler::fire_timing_write(&serde_json::json!({
             "schema": 1,

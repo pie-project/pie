@@ -130,17 +130,6 @@ struct Gemma4Weights {
     // Empty on dense Gemma-4 ckpts; one tensor per layer when MoE is on.
     std::vector<DeviceTensor> owned_router_combined_scales;
 
-    // Dense Gemma4 ships gate/up as separate tensors. Decode/spec batches are
-    // small enough that launching two narrow GEMMs per layer is expensive, so
-    // dense variants can materialize a packed [gate; up] tensor once at bind
-    // time and issue a single wide GEMM in the hot path.
-    std::vector<DeviceTensor> owned_gate_up_fused;
-
-    // Dense non-shared Gemma4 layers can likewise materialize [q; k; v]
-    // projection weights. This avoids two extra small-M GEMM launches on the
-    // layers that actually write K/V.
-    std::vector<DeviceTensor> owned_qkv_fused;
-
     // Cached per-layer arrays for the forward / KV-cache allocator.
     std::vector<int> per_layer_head_dim;
     std::vector<int> per_layer_intermediate;

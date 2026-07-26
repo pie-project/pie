@@ -23,9 +23,23 @@
 //!   the fully covered head buffer pages. No rollback across a committed
 //!   fold: the pre-fold state survives only through a fork taken before it.
 //!
-//! Like `KvStore`, prepare computes targets without mutating the mapping and
-//! commit applies them; at most one prepared write may be in flight per
-//! WorkingSet (the sequencer's same-WorkingSet batching rule).
+//! Like `KvStore`, the mapping is published in guest SUBMISSION order, not
+//! completion order: `prepare` classifies and allocates, `publish_batch`
+//! folds the result into the committed mapping while still holding the store
+//! lock the prepare ran under, and only pool retirement (`settle`) waits for
+//! the device. Physical content arrives later on the same pipeline stream.
+//!
+//! That seam is what makes RS run-ahead safe. A successor fire prepared
+//! before its predecessor completes still classifies against a mapping that
+//! already contains the predecessor's decision, so it cannot RESET a slot
+//! twice or re-CoW an already-privatized one — no host barrier required.
+//! Correctness of the *contents* comes from stream order, exactly as it
+//! already does for the CoW pre-launch copy.
+//!
+//! A failed fire is fail-stop, not rolled back (`KvStore` is identical):
+//! its published mapping stays authoritative, the pipeline fails, and the
+//! pre-failure state survives only through a fork taken before it — the same
+//! rule this store already documents for a committed fold.
 //!
 //! Complete typed-store API (kv_refact.md): some methods here are not yet
 //! called by the live single-model fire path (only a subset of the typed
@@ -45,7 +59,7 @@ use std::collections::HashMap;
 
 use crate::store::genmap::{GenKey, GenMap};
 use crate::store::pool::{Pool, PoolId};
-use write::{RsBufferTarget, RsPreparedWrite, RsStateTarget};
+use write::{RsBufferTarget, RsPreparedWrite, RsPublished, RsStateTarget};
 
 /// Marker for RS WorkingSet ids.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -159,9 +173,14 @@ impl RsStore {
     }
 
     /// Retire everything immediately when no prepared write is in flight.
+    ///
+    /// Nothing in flight means no device operation can still reference a
+    /// recycled slot, so every pending epoch is releasable — the bound is the
+    /// in-flight count, never the epoch value (host ops such as
+    /// `release_working_set` tag frees with caller-supplied epochs).
     pub fn retire_idle(&mut self) {
         if self.in_flight == 0 {
-            self.pool.retire_through(self.seq);
+            self.pool.retire_through(u64::MAX);
         }
     }
 
@@ -349,15 +368,46 @@ impl RsStore {
 
     /// Prepare a folded-state write from caller-owned reserved slots,
     /// consuming exactly the required prefix of `granted` (lend semantics:
-    /// failure consumes nothing, surplus stays caller-owned). Always a
-    /// `write_state` prepare — the reserved path exists only for the fire's
-    /// folded-slot write.
+    /// failure consumes nothing, surplus stays caller-owned).
     pub fn prepare_write_reserved(
         &mut self,
         ws: RsWorkingSetId,
         granted: &mut Vec<RsSlotId>,
     ) -> Result<RsPreparedWrite, RsError> {
         self.prepare(ws, true, None, None, Some(granted))
+    }
+
+    /// The general prepare: any combination of a folded-state write, an
+    /// explicit fold, and a buffered-page write, allocating from the pool.
+    /// A fold is validated against the granularity and buffered capacity
+    /// before anything is allocated.
+    pub fn prepare_general(
+        &mut self,
+        ws: RsWorkingSetId,
+        write_state: bool,
+        fold_tokens: Option<u32>,
+        buffer_tokens: Option<(u32, u32)>,
+    ) -> Result<RsPreparedWrite, RsError> {
+        if let Some(tokens) = fold_tokens {
+            self.validate_fold(ws, tokens)?;
+        }
+        self.prepare(ws, write_state, fold_tokens, buffer_tokens, None)
+    }
+
+    /// [`prepare_general`] from caller-owned reserved slots (the acquisition
+    /// grant), consuming exactly the required prefix of `granted`.
+    pub fn prepare_reserved(
+        &mut self,
+        ws: RsWorkingSetId,
+        write_state: bool,
+        fold_tokens: Option<u32>,
+        buffer_tokens: Option<(u32, u32)>,
+        granted: &mut Vec<RsSlotId>,
+    ) -> Result<RsPreparedWrite, RsError> {
+        if let Some(tokens) = fold_tokens {
+            self.validate_fold(ws, tokens)?;
+        }
+        self.prepare(ws, write_state, fold_tokens, buffer_tokens, Some(granted))
     }
 
     /// Phase-A demand: slots a folded-state write for `ws` would allocate
@@ -369,6 +419,35 @@ impl RsStore {
             Some(id) if self.ref_count(id) > 1 => 1,
             Some(_) => 0,
         })
+    }
+
+    /// Phase-A demand for a whole prepared write, folded target plus buffered
+    /// pages: exactly what [`RsStore::prepare`] would allocate. A buffered
+    /// page costs a slot when it is still reserved (first write materializes
+    /// it) or shared after a fork (copy-on-write). Pure.
+    pub fn write_demand(
+        &self,
+        ws: RsWorkingSetId,
+        write_state: bool,
+        buffer_tokens: Option<(u32, u32)>,
+    ) -> Result<usize, RsError> {
+        let state = if write_state {
+            self.write_state_demand(ws)?
+        } else {
+            0
+        };
+        let Some((start, len)) = buffer_tokens.filter(|(_, len)| *len > 0) else {
+            return Ok(state);
+        };
+        let entry = self.entry(ws)?;
+        let (first, last) = page_span(entry, start, len)?;
+        let buffers = (first..=last)
+            .filter(|&index| match entry.buffer[index] {
+                None => true,
+                Some(id) => self.ref_count(id) > 1,
+            })
+            .count();
+        Ok(state + buffers)
     }
 
     /// Prepare an explicit `fold(tokens)`: validated against the fold
@@ -489,23 +568,23 @@ impl RsStore {
         })
     }
 
-    /// Commit after driver success at `epoch`: adopt the folded slot, apply
-    /// buffer repoints, advance the fold boundary, release displaced slots
-    /// after the epoch retires.
-    pub fn commit(&mut self, prepared: RsPreparedWrite, epoch: u64) -> Result<(), RsError> {
-        self.commit_batch(vec![prepared], epoch)
+    /// Publish one guest-ordered prepared write into the committed mapping:
+    /// adopt the folded slot, apply buffer repoints, advance the fold
+    /// boundary, release displaced slots. Physical content arrives later on
+    /// the same pipeline stream; only pool retirement waits for the device.
+    pub fn publish_prepared(&mut self, prepared: RsPreparedWrite) -> Result<RsPublished, RsError> {
+        self.publish_batch(vec![prepared])
     }
 
-    /// Atomically commit every recurrent-state row of one forward fire.
+    /// Atomically publish every recurrent-state row of one forward fire.
     ///
     /// All working sets are validated before any mapping is changed. If a
     /// handle was released or the batch aliases one working set twice, every
-    /// prepared target is aborted and no row is adopted.
-    pub fn commit_batch(
+    /// prepared target is cancelled and no row is adopted.
+    pub fn publish_batch(
         &mut self,
         prepared: Vec<RsPreparedWrite>,
-        epoch: u64,
-    ) -> Result<(), RsError> {
+    ) -> Result<RsPublished, RsError> {
         let validation = (|| {
             let mut seen = Vec::with_capacity(prepared.len());
             for write in &prepared {
@@ -518,17 +597,27 @@ impl RsStore {
             Ok(())
         })();
         if let Err(error) = validation {
-            self.abort_batch(prepared, epoch);
+            self.cancel_batch(prepared);
             return Err(error);
         }
+        let rows = prepared.len();
+        let seq = prepared
+            .iter()
+            .map(RsPreparedWrite::seq)
+            .max()
+            .unwrap_or(self.seq);
         for write in prepared {
-            self.commit_prevalidated(write, epoch);
+            self.publish_prevalidated(write);
         }
-        Ok(())
+        Ok(RsPublished::new(seq, rows))
     }
 
-    fn commit_prevalidated(&mut self, prepared: RsPreparedWrite, epoch: u64) {
+    fn publish_prevalidated(&mut self, prepared: RsPreparedWrite) {
         let ws = prepared.ws;
+        // Displaced slots are recycled against the current submission
+        // sequence; `retire_idle` is what actually hands them back, and it
+        // only fires while nothing is in flight.
+        let epoch = self.seq;
         if let Some(state) = &prepared.state {
             let old = self.entry(ws).expect("batch prevalidated").folded;
             if old != Some(state.slot) {
@@ -559,24 +648,38 @@ impl RsStore {
                 RsBufferTarget::InPlace { .. } => {}
             }
         }
-        self.in_flight = self.in_flight.saturating_sub(1);
     }
 
-    /// Driver failure/poison/dummy-run: release pending slots; the committed
-    /// state stays authoritative.
-    pub fn abort(&mut self, prepared: RsPreparedWrite, epoch: u64) {
-        self.pool.recycle_after_epoch(prepared.allocated, epoch);
-        self.in_flight = self.in_flight.saturating_sub(1);
+    /// Settle a published write after its fire resolves, successfully or not.
+    /// The mapping is already authoritative (fail-stop, as in `KvStore`); all
+    /// that remains is releasing the in-flight hold on pool retirement.
+    pub fn settle(&mut self, published: RsPublished) {
+        self.in_flight = self.in_flight.saturating_sub(published.rows() as u64);
+        self.retire_idle();
     }
 
-    pub fn abort_batch(&mut self, prepared: Vec<RsPreparedWrite>, epoch: u64) {
+    /// Roll back a prepare that never published — a lowering or submission
+    /// failure between `prepare` and `publish_batch`. The committed mapping
+    /// was never touched, so only the allocation is returned.
+    pub fn cancel_prepared(&mut self, prepared: RsPreparedWrite) {
+        self.pool
+            .recycle_after_epoch(prepared.allocated, prepared.seq);
+        self.in_flight = self.in_flight.saturating_sub(1);
+        self.retire_idle();
+    }
+
+    pub fn cancel_batch(&mut self, prepared: Vec<RsPreparedWrite>) {
         for write in prepared {
-            self.abort(write, epoch);
+            self.cancel_prepared(write);
         }
     }
 
-    pub fn retire_through(&mut self, epoch: u64) {
-        self.pool.retire_through(epoch);
+    /// Retire completion epochs `<= epoch`, making recycled slots
+    /// allocatable. Like `KvStore::retire_through`, retirement is gated on
+    /// the global in-flight count rather than the epoch: no recycled slot is
+    /// ever handed out while any prepared write is still outstanding.
+    pub fn retire_through(&mut self, _epoch: u64) {
+        self.retire_idle();
     }
 
     /// Advance the folded boundary after a committed fold: drop the head

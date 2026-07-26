@@ -90,6 +90,12 @@ struct Input {
     /// makes the per-step cost identical. Defaults to `max_tokens`.
     #[serde(default)]
     reserve_tokens: Option<usize>,
+    /// Prefill chunk width, clamped to the driver's `max_embed_length()`.
+    /// Defaults to that limit, i.e. the fewest chunks the driver allows.
+    /// Forcing it down runs the multi-chunk path on a short prompt, which is
+    /// the only way to test chunk equivalence without a 16K-token prompt.
+    #[serde(default)]
+    prefill_chunk: Option<u32>,
 }
 
 fn default_prompt() -> String {
@@ -133,6 +139,15 @@ struct Output {
     page_budget: u32,
     /// Pages the prompt occupies. Only these compete for the budget.
     prompt_pages: u32,
+    /// How many fires the prefill was split into, and how many tokens the
+    /// FINAL (observed) one carried. Reported because the observation window
+    /// is the last `window` rows *of that chunk*: if `prefill_final` drops
+    /// below the driver's window the observation is silently truncated, and a
+    /// truncated window still produces a plausible-looking ranking. With even
+    /// chunking `prefill_final == prompt_len / prefill_chunks`, the largest a
+    /// last chunk can be.
+    prefill_chunks: u32,
+    prefill_final: u32,
     /// KV page size, reported so a consumer can convert the driver's
     /// observation window (a token count) into the page span it covers.
     page_size: u32,
@@ -217,20 +232,96 @@ async fn main(input: Input) -> Result<Output> {
 
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
 
-    // ── PREFILL FIRE (N-wide), WITH the tap. ──
+    // ── PREFILL (chunked), WITH the tap on the FINAL chunk. ──
     //
     // This is the inversion that defines SnapKV: every other Track B policy
     // taps the decode fire and leaves prefill alone. Here prefill is the only
-    // fire that is observed at all.
+    // fire that is observed at all -- which is exactly what makes chunking it
+    // delicate, and why the tap is attached where it is.
+    //
+    // The capture records the last `window` query rows OF THE FIRE. For a
+    // one-shot prefill that is the last `window` tokens of the prompt, which is
+    // SnapKV's definition. Under chunking only the FINAL chunk's window is the
+    // prompt's tail; an earlier chunk's window is a well-defined observation of
+    // an earlier position, but it is not the quantity SnapKV selects on. So the
+    // tap goes on the final chunk alone, and the earlier chunks run the plain
+    // prefill -- which also means they do not pay the capture variant's cost.
+    //
+    // The split is `prefill_chunks`, whose docs explain why it spreads the
+    // remainder over the FIRST chunks: a "C tokens at a time until the
+    // remainder" split can leave a final chunk of one token, and a final chunk
+    // shorter than `window` silently truncates SnapKV's observation to whatever
+    // was left over. That produces a plausible ranking, which is worse than an
+    // implausible one. Using the shared helper also guarantees this inferlet
+    // picks the SAME chunk boundaries as the baseline it is compared against,
+    // so a text difference above the ceiling means a policy difference and not
+    // a difference in the attention tile decomposition (§11.4).
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-    let toks_p = Channel::from(prompt_i32).named("toks_p");
-    let embed_indptr_p = Channel::from(vec![0u32, n]).named("embed_indptr_p");
-    let positions_p = Channel::from((0..n).collect::<Vec<_>>()).named("positions_p");
+    let spans = prefill_chunks(n, input.prefill_chunk);
+    let k = spans.len() as u32;
+    let pipe = Pipeline::new();
+
+    // Non-final chunks: plain prefill, no tap, sampled token discarded.
+    for &(base, end) in &spans[..spans.len() - 1] {
+        let chunk = end - base;
+        let toks_c =
+            Channel::from(prompt_i32[base as usize..end as usize].to_vec()).named("toks_c");
+        let embed_indptr_c = Channel::from(vec![0u32, chunk]).named("embed_indptr_c");
+        let positions_c = Channel::from((base..end).collect::<Vec<_>>()).named("positions_c");
+        let pages_c = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages_c");
+        let page_indptr_c =
+            Channel::from(vec![0u32, end.div_ceil(page_size)]).named("page_indptr_c");
+        let w_slot_c =
+            Channel::from((base..end).map(|p| p / page_size).collect::<Vec<_>>()).named("w_slot_c");
+        let w_off_c =
+            Channel::from((base..end).map(|p| p % page_size).collect::<Vec<_>>()).named("w_off_c");
+        let kv_len_c = Channel::from(vec![end]).named("kv_len_c");
+        let rng_c = Channel::from(vec![input.seed ^ 0x5bd1, 0]).named("rng_c");
+        let tok_out_c = Channel::new([1], dtype::i32).named("tok_out_c");
+
+        let fwd_c = ForwardPass::new();
+        fwd_c.embed(&toks_c, &embed_indptr_c)?;
+        fwd_c.attention(
+            &ws,
+            ..,
+            ..,
+            &kv_len_c,
+            &pages_c,
+            &page_indptr_c,
+            &w_slot_c,
+            &w_off_c,
+            &positions_c,
+            None,
+        )?;
+        fwd_c.epilogue(move || {
+            let r = rng_c.take();
+            let logits = intrinsics::logits();
+            let token = step(logits, temperature, &r);
+            tok_out_c.put(&token);
+            rng_c.put(&add(&r, iota(2)));
+        });
+        fwd_c
+            .submit(&pipe)
+            .map_err(|e| format!("prefill chunk submit @{base}: {e}"))?;
+        tok_out_c
+            .take()
+            .get::<i32>()
+            .await
+            .map_err(|e| format!("prefill chunk take @{base}: {e}"))?;
+    }
+
+    // ── FINAL CHUNK `[base, n)`: the observed one. ──
+    let base = spans[spans.len() - 1].0;
+    let tail = n - base;
+    let toks_p = Channel::from(prompt_i32[base as usize..n as usize].to_vec()).named("toks_p");
+    let embed_indptr_p = Channel::from(vec![0u32, tail]).named("embed_indptr_p");
+    let positions_p = Channel::from((base..n).collect::<Vec<_>>()).named("positions_p");
     let pages_p = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages_p");
     let page_indptr_p = Channel::from(vec![0u32, n.div_ceil(page_size)]).named("page_indptr_p");
     let w_slot_p =
-        Channel::from((0..n).map(|p| p / page_size).collect::<Vec<_>>()).named("w_slot_p");
-    let w_off_p = Channel::from((0..n).map(|p| p % page_size).collect::<Vec<_>>()).named("w_off_p");
+        Channel::from((base..n).map(|p| p / page_size).collect::<Vec<_>>()).named("w_slot_p");
+    let w_off_p =
+        Channel::from((base..n).map(|p| p % page_size).collect::<Vec<_>>()).named("w_off_p");
     let kv_len_p = Channel::from(vec![n]).named("kv_len_p");
     // Same salt as `naive-baseline`. The coherence test asks whether a keep-set
     // that keeps everything changes what the model produces, and that question
@@ -303,10 +394,9 @@ async fn main(input: Input) -> Result<Output> {
         layer_ct.put(&layers);
     });
 
-    let pipe = Pipeline::new();
     fwd_p
         .submit(&pipe)
-        .map_err(|e| format!("prefill submit: {e}"))?;
+        .map_err(|e| format!("prefill submit @{base}: {e}"))?;
 
     let g0 = tok_out_p
         .take()
@@ -336,7 +426,7 @@ async fn main(input: Input) -> Result<Output> {
         let tok_in = Channel::from(vec![g0; 1]).named("tok_in");
         let rng = Channel::from(vec![input.seed ^ 0x5bd1, 2]).named("rng");
         let tok_out = Channel::new([1], dtype::i32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+            .capacity(channel_capacity() as u32)
             .named("tok_out");
         let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
         let positions = Channel::from(vec![n]).named("positions");
@@ -390,10 +480,7 @@ async fn main(input: Input) -> Result<Output> {
         //    whatever this says -- it holds the token this fire is writing. ──
         fwd.on_attn_proj(move || {
             let mass = page_mass.take().tensor();
-            intrinsics::kernel::attn_page_mask(&pivot_threshold(
-                &mass,
-                rank_le(effective_budget),
-            ));
+            intrinsics::kernel::attn_page_mask(&pivot_threshold(&mass, rank_le(effective_budget)));
             page_mass.put(&mass);
         });
 
@@ -418,29 +505,16 @@ async fn main(input: Input) -> Result<Output> {
         });
 
         let budget_n = max_tokens - 1;
-        let mut submitted = 0usize;
-        let mut in_flight = 0usize;
-        while in_flight < DEFAULT_RUNAHEAD_DEPTH && submitted < budget_n {
-            fwd.submit(&pipe)
-                .map_err(|e| format!("decode submit @{}: {e}", submitted + 1))?;
-            submitted += 1;
-            in_flight += 1;
-        }
-        while in_flight > 0 {
+        run_ahead(&pipe, &fwd, budget_n as usize, async || {
             let t = tok_out
                 .take()
                 .get::<i32>()
                 .await
                 .map_err(|e| format!("tok_out.take @{}: {e}", generated.len()))?[0];
-            in_flight -= 1;
             generated.push(t as u32);
-            if submitted < budget_n {
-                fwd.submit(&pipe)
-                    .map_err(|e| format!("decode submit @{}: {e}", submitted + 1))?;
-                submitted += 1;
-                in_flight += 1;
-            }
-        }
+            Ok(ControlFlow::Continue(()))
+        })
+        .await?;
     }
     pipe.close();
 
@@ -486,6 +560,8 @@ async fn main(input: Input) -> Result<Output> {
         prompt_len: n,
         page_budget,
         prompt_pages,
+        prefill_chunks: k,
+        prefill_final: tail,
         page_size,
         layers_observed,
         live_scored: prefill_scores[..live]

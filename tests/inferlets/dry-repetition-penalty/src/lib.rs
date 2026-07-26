@@ -221,7 +221,10 @@ fn dry_penalty(hist: &Tensor, hlen: &Tensor, vocab: u32, cfg: Cfg) -> (Tensor, T
         add(cast(iota(l), DType::I32), Tensor::constant(1i32)),
         broadcast(Tensor::constant(l as i32 - 1), [l]),
     );
-    let next_tok = max_elem(gather(hist, &next_idx), broadcast(Tensor::constant(0i32), [l]));
+    let next_tok = max_elem(
+        gather(hist, &next_idx),
+        broadcast(Tensor::constant(0i32), [l]),
+    );
 
     let vocab_zero = broadcast(Tensor::constant(0.0f32), [vocab]);
     let mut penalty = broadcast(Tensor::constant(0.0f32), [vocab]);
@@ -352,8 +355,8 @@ async fn main(input: Input) -> Result<Output> {
     let mut peaks: Vec<f32> = Vec::with_capacity(max_tokens);
 
     // ── PREFILL FIRE (N-wide): first sampled token comes off the prompt. ──
-    let toks_p = Channel::from(history.iter().take(n as usize).copied().collect::<Vec<_>>())
-        .named("toks_p");
+    let toks_p =
+        Channel::from(history.iter().take(n as usize).copied().collect::<Vec<_>>()).named("toks_p");
     let embed_indptr_p = Channel::from(vec![0u32, n]).named("embed_indptr_p");
     let positions_p = Channel::from((0..n).collect::<Vec<_>>()).named("positions_p");
     let pages_p = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages_p");
@@ -433,13 +436,13 @@ async fn main(input: Input) -> Result<Output> {
         let hist_c = Channel::from(history.clone()).named("hist");
         let hlen_c = Channel::from(vec![n + 1]).named("hlen");
         let tok_out = Channel::new([1], dtype::i32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+            .capacity(channel_capacity() as u32)
             .named("tok_out");
         let cnt_out = Channel::new([1], dtype::f32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+            .capacity(channel_capacity() as u32)
             .named("cnt_out");
         let peak_out = Channel::new([1], dtype::f32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+            .capacity(channel_capacity() as u32)
             .named("peak_out");
         let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
         let positions = Channel::from(vec![n]).named("positions");
@@ -493,15 +496,7 @@ async fn main(input: Input) -> Result<Output> {
         });
 
         let budget = max_tokens - 1;
-        let mut submitted = 0usize;
-        let mut in_flight = 0usize;
-        while in_flight < DEFAULT_RUNAHEAD_DEPTH && submitted < budget {
-            fwd.submit(&pipe)
-                .map_err(|e| format!("decode submit @{}: {e}", submitted + 1))?;
-            submitted += 1;
-            in_flight += 1;
-        }
-        while in_flight > 0 {
+        run_ahead(&pipe, &fwd, budget as usize, async || {
             let t = tok_out
                 .take()
                 .get::<i32>()
@@ -517,17 +512,12 @@ async fn main(input: Input) -> Result<Output> {
                 .get::<f32>()
                 .await
                 .map_err(|e| format!("peak_out.take @{}: {e}", generated.len()))?[0];
-            in_flight -= 1;
             generated.push(t as u32);
             counts.push(c);
             peaks.push(k);
-            if submitted < budget {
-                fwd.submit(&pipe)
-                    .map_err(|e| format!("decode submit @{}: {e}", submitted + 1))?;
-                submitted += 1;
-                in_flight += 1;
-            }
-        }
+            Ok(ControlFlow::Continue(()))
+        })
+        .await?;
     }
     pipe.close();
 
@@ -535,7 +525,10 @@ async fn main(input: Input) -> Result<Output> {
     // stuck `hist` channel no suffix could ever grow and the penalty would stay
     // pinned at its prompt-only value forever.
     let peak = peaks.iter().fold(0.0f32, |a, &b| a.max(b));
-    if cfg.multiplier > 0.0 && generated.len() > 8 && peak == 0.0 && counts.iter().all(|&c| c == 0.0)
+    if cfg.multiplier > 0.0
+        && generated.len() > 8
+        && peak == 0.0
+        && counts.iter().all(|&c| c == 0.0)
     {
         return Err(
             "no token was ever penalized — the history channel is not advancing".to_string(),

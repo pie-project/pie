@@ -141,7 +141,7 @@ async fn main(input: Input) -> Result<String> {
     let decode_embed_indptr = Channel::from(vec![0u32, 1]);
     let pool_ids_input = Channel::from(pool_ids.clone()).named("pool_ids");
     let token_out = Channel::new([1], dtype::i32)
-        .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+        .capacity(channel_capacity() as u32)
         .named("token_out");
 
     let decode = ForwardPass::new();
@@ -192,49 +192,19 @@ async fn main(input: Input) -> Result<String> {
     });
 
     let budget = input.max_tokens.saturating_sub(generated.len());
-    let mut submitted = 0usize;
-    let mut in_flight = 0usize;
-    while in_flight < DEFAULT_RUNAHEAD_DEPTH && submitted < budget {
-        decode
-            .submit(&pipeline)
-            .map_err(|e| format!("sliding-window decode: {e}"))?;
-        submitted += 1;
-        in_flight += 1;
-    }
-    if submitted == budget {
-        pipeline.close();
-    }
-    while in_flight > 0 {
+    run_ahead(&pipeline, &decode, budget as usize, async || {
         let token = token_out
             .take()
             .get::<i32>()
             .await
             .map_err(|e| format!("read generated token: {e}"))?[0] as u32;
-        in_flight -= 1;
         if stop_tokens.contains(&token) {
-            pipeline.close();
-            break;
+            return Ok(ControlFlow::Break(()));
         }
         generated.push(token);
-        if submitted < budget {
-            decode
-                .submit(&pipeline)
-                .map_err(|e| format!("sliding-window decode: {e}"))?;
-            submitted += 1;
-            in_flight += 1;
-            if submitted == budget {
-                pipeline.close();
-            }
-        }
-    }
-    while in_flight > 0 {
-        token_out
-            .take()
-            .get::<i32>()
-            .await
-            .map_err(|e| format!("drain run-ahead token: {e}"))?;
-        in_flight -= 1;
-    }
+        Ok(ControlFlow::Continue(()))
+    })
+    .await?;
     pipeline.close();
     wit_model::decode(&generated)
 }

@@ -166,7 +166,7 @@ async fn main(input: Input) -> Result<Output> {
     if max_tokens == 0 {
         return Ok(Output {
             sampler: "truncation",
-        mode: input.mode.clone(),
+            mode: input.mode.clone(),
             text: String::new(),
             count: 0,
             epsilon,
@@ -259,13 +259,13 @@ async fn main(input: Input) -> Result<Output> {
         let tok_in = Channel::from(vec![g0; 1]).named("tok_in");
         let rng = Channel::from(vec![input.seed ^ 0x5bd1, 0]).named("rng");
         let tok_out = Channel::new([1], dtype::i32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+            .capacity(channel_capacity() as u32)
             .named("tok_out");
         let kept_out = Channel::new([1], dtype::f32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+            .capacity(channel_capacity() as u32)
             .named("kept_out");
         let mass_out = Channel::new([1], dtype::f32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+            .capacity(channel_capacity() as u32)
             .named("mass_out");
         let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
         let positions = Channel::from(vec![n]).named("positions");
@@ -295,7 +295,8 @@ async fn main(input: Input) -> Result<Output> {
             let length = kv_len.take().tensor();
             let r = rng.take();
             let logits = intrinsics::logits();
-            let (token, kept, kmass) = truncation_step(logits, vocab, mode, temperature, epsilon, &r);
+            let (token, kept, kmass) =
+                truncation_step(logits, vocab, mode, temperature, epsilon, &r);
 
             let r_next = add(&r, iota(2));
             let next_length = add(&length, 1u32);
@@ -315,15 +316,7 @@ async fn main(input: Input) -> Result<Output> {
         });
 
         let budget = max_tokens - 1;
-        let mut submitted = 0usize;
-        let mut in_flight = 0usize;
-        while in_flight < DEFAULT_RUNAHEAD_DEPTH && submitted < budget {
-            fwd.submit(&pipe)
-                .map_err(|e| format!("decode submit @{}: {e}", submitted + 1))?;
-            submitted += 1;
-            in_flight += 1;
-        }
-        while in_flight > 0 {
+        run_ahead(&pipe, &fwd, budget as usize, async || {
             let t = tok_out
                 .take()
                 .get::<i32>()
@@ -339,17 +332,12 @@ async fn main(input: Input) -> Result<Output> {
                 .get::<f32>()
                 .await
                 .map_err(|e| format!("mass_out.take @{}: {e}", generated.len()))?[0];
-            in_flight -= 1;
             generated.push(t as u32);
             kept_sizes.push(k);
             kept_mass.push(m);
-            if submitted < budget {
-                fwd.submit(&pipe)
-                    .map_err(|e| format!("decode submit @{}: {e}", submitted + 1))?;
-                submitted += 1;
-                in_flight += 1;
-            }
-        }
+            Ok(ControlFlow::Continue(()))
+        })
+        .await?;
     }
     pipe.close();
 

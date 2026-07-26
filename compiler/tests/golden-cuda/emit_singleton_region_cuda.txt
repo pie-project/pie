@@ -1,0 +1,2832 @@
+# oracle dump: pie_cuda_driver::pipeline::generated::emit_singleton_region_cuda
+# source of truth: driver/cuda/src/pipeline/generated/ (transitional; the Rust port is compiler/codegen/src/cuda/)
+# emitter_version: 19
+# @runtime: bytes=45277 fnv1a64=0x41b1d45aaef71184
+# cases: 263
+=== tag_0x00
+entry_name: ptir_singleton_0x00
+ok: false
+error: unsupported CUDA singleton opcode tag 0
+entry_name: ptir_singleton_0x00
+op_tag: 0x00
+=== end
+=== tag_0x01
+entry_name: ptir_singleton_0x01
+ok: true
+error: 
+entry_name: ptir_singleton_0x01
+op_tag: 0x01
+source: bytes=45755 prefix=@runtime tail_bytes=478
+
+extern "C" __global__ void ptir_singleton_0x01(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(1u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x02
+entry_name: ptir_singleton_0x02
+ok: true
+error: 
+entry_name: ptir_singleton_0x02
+op_tag: 0x02
+source: bytes=45755 prefix=@runtime tail_bytes=478
+
+extern "C" __global__ void ptir_singleton_0x02(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(2u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x03
+entry_name: ptir_singleton_0x03
+ok: true
+error: 
+entry_name: ptir_singleton_0x03
+op_tag: 0x03
+source: bytes=45755 prefix=@runtime tail_bytes=478
+
+extern "C" __global__ void ptir_singleton_0x03(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(3u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x04
+entry_name: ptir_singleton_0x04
+ok: true
+error: 
+entry_name: ptir_singleton_0x04
+op_tag: 0x04
+source: bytes=45755 prefix=@runtime tail_bytes=478
+
+extern "C" __global__ void ptir_singleton_0x04(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(4u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x05
+entry_name: ptir_singleton_0x05
+ok: true
+error: 
+entry_name: ptir_singleton_0x05
+op_tag: 0x05
+source: bytes=45755 prefix=@runtime tail_bytes=478
+
+extern "C" __global__ void ptir_singleton_0x05(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(5u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x06
+entry_name: ptir_singleton_0x06
+ok: true
+error: 
+entry_name: ptir_singleton_0x06
+op_tag: 0x06
+source: bytes=45755 prefix=@runtime tail_bytes=478
+
+extern "C" __global__ void ptir_singleton_0x06(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(6u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x07
+entry_name: ptir_singleton_0x07
+ok: true
+error: 
+entry_name: ptir_singleton_0x07
+op_tag: 0x07
+source: bytes=45755 prefix=@runtime tail_bytes=478
+
+extern "C" __global__ void ptir_singleton_0x07(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(7u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x08
+entry_name: ptir_singleton_0x08
+ok: false
+error: unsupported CUDA singleton opcode tag 8
+entry_name: ptir_singleton_0x08
+op_tag: 0x08
+=== end
+=== tag_0x09
+entry_name: ptir_singleton_0x09
+ok: false
+error: unsupported CUDA singleton opcode tag 9
+entry_name: ptir_singleton_0x09
+op_tag: 0x09
+=== end
+=== tag_0x0a
+entry_name: ptir_singleton_0x0a
+ok: false
+error: unsupported CUDA singleton opcode tag 10
+entry_name: ptir_singleton_0x0a
+op_tag: 0x0a
+=== end
+=== tag_0x0b
+entry_name: ptir_singleton_0x0b
+ok: false
+error: unsupported CUDA singleton opcode tag 11
+entry_name: ptir_singleton_0x0b
+op_tag: 0x0b
+=== end
+=== tag_0x0c
+entry_name: ptir_singleton_0x0c
+ok: false
+error: unsupported CUDA singleton opcode tag 12
+entry_name: ptir_singleton_0x0c
+op_tag: 0x0c
+=== end
+=== tag_0x0d
+entry_name: ptir_singleton_0x0d
+ok: false
+error: unsupported CUDA singleton opcode tag 13
+entry_name: ptir_singleton_0x0d
+op_tag: 0x0d
+=== end
+=== tag_0x0e
+entry_name: ptir_singleton_0x0e
+ok: false
+error: unsupported CUDA singleton opcode tag 14
+entry_name: ptir_singleton_0x0e
+op_tag: 0x0e
+=== end
+=== tag_0x0f
+entry_name: ptir_singleton_0x0f
+ok: false
+error: unsupported CUDA singleton opcode tag 15
+entry_name: ptir_singleton_0x0f
+op_tag: 0x0f
+=== end
+=== tag_0x10
+entry_name: ptir_singleton_0x10
+ok: true
+error: 
+entry_name: ptir_singleton_0x10
+op_tag: 0x10
+source: bytes=45756 prefix=@runtime tail_bytes=479
+
+extern "C" __global__ void ptir_singleton_0x10(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(16u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x11
+entry_name: ptir_singleton_0x11
+ok: true
+error: 
+entry_name: ptir_singleton_0x11
+op_tag: 0x11
+source: bytes=45756 prefix=@runtime tail_bytes=479
+
+extern "C" __global__ void ptir_singleton_0x11(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(17u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x12
+entry_name: ptir_singleton_0x12
+ok: true
+error: 
+entry_name: ptir_singleton_0x12
+op_tag: 0x12
+source: bytes=45756 prefix=@runtime tail_bytes=479
+
+extern "C" __global__ void ptir_singleton_0x12(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(18u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x13
+entry_name: ptir_singleton_0x13
+ok: true
+error: 
+entry_name: ptir_singleton_0x13
+op_tag: 0x13
+source: bytes=45756 prefix=@runtime tail_bytes=479
+
+extern "C" __global__ void ptir_singleton_0x13(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(19u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x14
+entry_name: ptir_singleton_0x14
+ok: true
+error: 
+entry_name: ptir_singleton_0x14
+op_tag: 0x14
+source: bytes=45756 prefix=@runtime tail_bytes=479
+
+extern "C" __global__ void ptir_singleton_0x14(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(20u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x15
+entry_name: ptir_singleton_0x15
+ok: true
+error: 
+entry_name: ptir_singleton_0x15
+op_tag: 0x15
+source: bytes=45756 prefix=@runtime tail_bytes=479
+
+extern "C" __global__ void ptir_singleton_0x15(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(21u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x16
+entry_name: ptir_singleton_0x16
+ok: true
+error: 
+entry_name: ptir_singleton_0x16
+op_tag: 0x16
+source: bytes=45756 prefix=@runtime tail_bytes=479
+
+extern "C" __global__ void ptir_singleton_0x16(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(22u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x17
+entry_name: ptir_singleton_0x17
+ok: true
+error: 
+entry_name: ptir_singleton_0x17
+op_tag: 0x17
+source: bytes=45756 prefix=@runtime tail_bytes=479
+
+extern "C" __global__ void ptir_singleton_0x17(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(23u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x18
+entry_name: ptir_singleton_0x18
+ok: true
+error: 
+entry_name: ptir_singleton_0x18
+op_tag: 0x18
+source: bytes=45756 prefix=@runtime tail_bytes=479
+
+extern "C" __global__ void ptir_singleton_0x18(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(24u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x19
+entry_name: ptir_singleton_0x19
+ok: true
+error: 
+entry_name: ptir_singleton_0x19
+op_tag: 0x19
+source: bytes=45756 prefix=@runtime tail_bytes=479
+
+extern "C" __global__ void ptir_singleton_0x19(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(25u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x1a
+entry_name: ptir_singleton_0x1a
+ok: true
+error: 
+entry_name: ptir_singleton_0x1a
+op_tag: 0x1a
+source: bytes=45756 prefix=@runtime tail_bytes=479
+
+extern "C" __global__ void ptir_singleton_0x1a(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(26u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x1b
+entry_name: ptir_singleton_0x1b
+ok: true
+error: 
+entry_name: ptir_singleton_0x1b
+op_tag: 0x1b
+source: bytes=45756 prefix=@runtime tail_bytes=479
+
+extern "C" __global__ void ptir_singleton_0x1b(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(27u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x1c
+entry_name: ptir_singleton_0x1c
+ok: true
+error: 
+entry_name: ptir_singleton_0x1c
+op_tag: 0x1c
+source: bytes=45756 prefix=@runtime tail_bytes=479
+
+extern "C" __global__ void ptir_singleton_0x1c(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(28u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x1d
+entry_name: ptir_singleton_0x1d
+ok: true
+error: 
+entry_name: ptir_singleton_0x1d
+op_tag: 0x1d
+source: bytes=45756 prefix=@runtime tail_bytes=479
+
+extern "C" __global__ void ptir_singleton_0x1d(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(29u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x1e
+entry_name: ptir_singleton_0x1e
+ok: true
+error: 
+entry_name: ptir_singleton_0x1e
+op_tag: 0x1e
+source: bytes=45756 prefix=@runtime tail_bytes=479
+
+extern "C" __global__ void ptir_singleton_0x1e(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(30u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x1f
+entry_name: ptir_singleton_0x1f
+ok: true
+error: 
+entry_name: ptir_singleton_0x1f
+op_tag: 0x1f
+source: bytes=45756 prefix=@runtime tail_bytes=479
+
+extern "C" __global__ void ptir_singleton_0x1f(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(31u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x20
+entry_name: ptir_singleton_0x20
+ok: true
+error: 
+entry_name: ptir_singleton_0x20
+op_tag: 0x20
+source: bytes=45756 prefix=@runtime tail_bytes=479
+
+extern "C" __global__ void ptir_singleton_0x20(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(32u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x21
+entry_name: ptir_singleton_0x21
+ok: false
+error: unsupported CUDA singleton opcode tag 33
+entry_name: ptir_singleton_0x21
+op_tag: 0x21
+=== end
+=== tag_0x22
+entry_name: ptir_singleton_0x22
+ok: false
+error: unsupported CUDA singleton opcode tag 34
+entry_name: ptir_singleton_0x22
+op_tag: 0x22
+=== end
+=== tag_0x23
+entry_name: ptir_singleton_0x23
+ok: false
+error: unsupported CUDA singleton opcode tag 35
+entry_name: ptir_singleton_0x23
+op_tag: 0x23
+=== end
+=== tag_0x24
+entry_name: ptir_singleton_0x24
+ok: false
+error: unsupported CUDA singleton opcode tag 36
+entry_name: ptir_singleton_0x24
+op_tag: 0x24
+=== end
+=== tag_0x25
+entry_name: ptir_singleton_0x25
+ok: false
+error: unsupported CUDA singleton opcode tag 37
+entry_name: ptir_singleton_0x25
+op_tag: 0x25
+=== end
+=== tag_0x26
+entry_name: ptir_singleton_0x26
+ok: false
+error: unsupported CUDA singleton opcode tag 38
+entry_name: ptir_singleton_0x26
+op_tag: 0x26
+=== end
+=== tag_0x27
+entry_name: ptir_singleton_0x27
+ok: false
+error: unsupported CUDA singleton opcode tag 39
+entry_name: ptir_singleton_0x27
+op_tag: 0x27
+=== end
+=== tag_0x28
+entry_name: ptir_singleton_0x28
+ok: false
+error: unsupported CUDA singleton opcode tag 40
+entry_name: ptir_singleton_0x28
+op_tag: 0x28
+=== end
+=== tag_0x29
+entry_name: ptir_singleton_0x29
+ok: false
+error: unsupported CUDA singleton opcode tag 41
+entry_name: ptir_singleton_0x29
+op_tag: 0x29
+=== end
+=== tag_0x2a
+entry_name: ptir_singleton_0x2a
+ok: false
+error: unsupported CUDA singleton opcode tag 42
+entry_name: ptir_singleton_0x2a
+op_tag: 0x2a
+=== end
+=== tag_0x2b
+entry_name: ptir_singleton_0x2b
+ok: false
+error: unsupported CUDA singleton opcode tag 43
+entry_name: ptir_singleton_0x2b
+op_tag: 0x2b
+=== end
+=== tag_0x2c
+entry_name: ptir_singleton_0x2c
+ok: false
+error: unsupported CUDA singleton opcode tag 44
+entry_name: ptir_singleton_0x2c
+op_tag: 0x2c
+=== end
+=== tag_0x2d
+entry_name: ptir_singleton_0x2d
+ok: false
+error: unsupported CUDA singleton opcode tag 45
+entry_name: ptir_singleton_0x2d
+op_tag: 0x2d
+=== end
+=== tag_0x2e
+entry_name: ptir_singleton_0x2e
+ok: false
+error: unsupported CUDA singleton opcode tag 46
+entry_name: ptir_singleton_0x2e
+op_tag: 0x2e
+=== end
+=== tag_0x2f
+entry_name: ptir_singleton_0x2f
+ok: false
+error: unsupported CUDA singleton opcode tag 47
+entry_name: ptir_singleton_0x2f
+op_tag: 0x2f
+=== end
+=== tag_0x30
+entry_name: ptir_singleton_0x30
+ok: true
+error: 
+entry_name: ptir_singleton_0x30
+op_tag: 0x30
+source: bytes=45756 prefix=@runtime tail_bytes=479
+
+extern "C" __global__ void ptir_singleton_0x30(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(48u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x31
+entry_name: ptir_singleton_0x31
+ok: true
+error: 
+entry_name: ptir_singleton_0x31
+op_tag: 0x31
+source: bytes=45756 prefix=@runtime tail_bytes=479
+
+extern "C" __global__ void ptir_singleton_0x31(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(49u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x32
+entry_name: ptir_singleton_0x32
+ok: true
+error: 
+entry_name: ptir_singleton_0x32
+op_tag: 0x32
+source: bytes=45756 prefix=@runtime tail_bytes=479
+
+extern "C" __global__ void ptir_singleton_0x32(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(50u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x33
+entry_name: ptir_singleton_0x33
+ok: true
+error: 
+entry_name: ptir_singleton_0x33
+op_tag: 0x33
+source: bytes=45756 prefix=@runtime tail_bytes=479
+
+extern "C" __global__ void ptir_singleton_0x33(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(51u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x34
+entry_name: ptir_singleton_0x34
+ok: false
+error: unsupported CUDA singleton opcode tag 52
+entry_name: ptir_singleton_0x34
+op_tag: 0x34
+=== end
+=== tag_0x35
+entry_name: ptir_singleton_0x35
+ok: false
+error: unsupported CUDA singleton opcode tag 53
+entry_name: ptir_singleton_0x35
+op_tag: 0x35
+=== end
+=== tag_0x36
+entry_name: ptir_singleton_0x36
+ok: false
+error: unsupported CUDA singleton opcode tag 54
+entry_name: ptir_singleton_0x36
+op_tag: 0x36
+=== end
+=== tag_0x37
+entry_name: ptir_singleton_0x37
+ok: false
+error: unsupported CUDA singleton opcode tag 55
+entry_name: ptir_singleton_0x37
+op_tag: 0x37
+=== end
+=== tag_0x38
+entry_name: ptir_singleton_0x38
+ok: true
+error: 
+entry_name: ptir_singleton_0x38
+op_tag: 0x38
+source: bytes=45756 prefix=@runtime tail_bytes=479
+
+extern "C" __global__ void ptir_singleton_0x38(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(56u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x39
+entry_name: ptir_singleton_0x39
+ok: true
+error: 
+entry_name: ptir_singleton_0x39
+op_tag: 0x39
+source: bytes=45756 prefix=@runtime tail_bytes=479
+
+extern "C" __global__ void ptir_singleton_0x39(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(57u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x3a
+entry_name: ptir_singleton_0x3a
+ok: true
+error: 
+entry_name: ptir_singleton_0x3a
+op_tag: 0x3a
+source: bytes=45756 prefix=@runtime tail_bytes=479
+
+extern "C" __global__ void ptir_singleton_0x3a(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(58u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x3b
+entry_name: ptir_singleton_0x3b
+ok: false
+error: unsupported CUDA singleton opcode tag 59
+entry_name: ptir_singleton_0x3b
+op_tag: 0x3b
+=== end
+=== tag_0x3c
+entry_name: ptir_singleton_0x3c
+ok: false
+error: unsupported CUDA singleton opcode tag 60
+entry_name: ptir_singleton_0x3c
+op_tag: 0x3c
+=== end
+=== tag_0x3d
+entry_name: ptir_singleton_0x3d
+ok: false
+error: unsupported CUDA singleton opcode tag 61
+entry_name: ptir_singleton_0x3d
+op_tag: 0x3d
+=== end
+=== tag_0x3e
+entry_name: ptir_singleton_0x3e
+ok: false
+error: unsupported CUDA singleton opcode tag 62
+entry_name: ptir_singleton_0x3e
+op_tag: 0x3e
+=== end
+=== tag_0x3f
+entry_name: ptir_singleton_0x3f
+ok: false
+error: unsupported CUDA singleton opcode tag 63
+entry_name: ptir_singleton_0x3f
+op_tag: 0x3f
+=== end
+=== tag_0x40
+entry_name: ptir_singleton_0x40
+ok: true
+error: 
+entry_name: ptir_singleton_0x40
+op_tag: 0x40
+source: bytes=45756 prefix=@runtime tail_bytes=479
+
+extern "C" __global__ void ptir_singleton_0x40(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(64u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x41
+entry_name: ptir_singleton_0x41
+ok: true
+error: 
+entry_name: ptir_singleton_0x41
+op_tag: 0x41
+source: bytes=45756 prefix=@runtime tail_bytes=479
+
+extern "C" __global__ void ptir_singleton_0x41(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(65u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x42
+entry_name: ptir_singleton_0x42
+ok: false
+error: unsupported CUDA singleton opcode tag 66
+entry_name: ptir_singleton_0x42
+op_tag: 0x42
+=== end
+=== tag_0x43
+entry_name: ptir_singleton_0x43
+ok: false
+error: unsupported CUDA singleton opcode tag 67
+entry_name: ptir_singleton_0x43
+op_tag: 0x43
+=== end
+=== tag_0x44
+entry_name: ptir_singleton_0x44
+ok: false
+error: unsupported CUDA singleton opcode tag 68
+entry_name: ptir_singleton_0x44
+op_tag: 0x44
+=== end
+=== tag_0x45
+entry_name: ptir_singleton_0x45
+ok: false
+error: unsupported CUDA singleton opcode tag 69
+entry_name: ptir_singleton_0x45
+op_tag: 0x45
+=== end
+=== tag_0x46
+entry_name: ptir_singleton_0x46
+ok: false
+error: unsupported CUDA singleton opcode tag 70
+entry_name: ptir_singleton_0x46
+op_tag: 0x46
+=== end
+=== tag_0x47
+entry_name: ptir_singleton_0x47
+ok: false
+error: unsupported CUDA singleton opcode tag 71
+entry_name: ptir_singleton_0x47
+op_tag: 0x47
+=== end
+=== tag_0x48
+entry_name: ptir_singleton_0x48
+ok: false
+error: unsupported CUDA singleton opcode tag 72
+entry_name: ptir_singleton_0x48
+op_tag: 0x48
+=== end
+=== tag_0x49
+entry_name: ptir_singleton_0x49
+ok: false
+error: unsupported CUDA singleton opcode tag 73
+entry_name: ptir_singleton_0x49
+op_tag: 0x49
+=== end
+=== tag_0x4a
+entry_name: ptir_singleton_0x4a
+ok: false
+error: unsupported CUDA singleton opcode tag 74
+entry_name: ptir_singleton_0x4a
+op_tag: 0x4a
+=== end
+=== tag_0x4b
+entry_name: ptir_singleton_0x4b
+ok: false
+error: unsupported CUDA singleton opcode tag 75
+entry_name: ptir_singleton_0x4b
+op_tag: 0x4b
+=== end
+=== tag_0x4c
+entry_name: ptir_singleton_0x4c
+ok: false
+error: unsupported CUDA singleton opcode tag 76
+entry_name: ptir_singleton_0x4c
+op_tag: 0x4c
+=== end
+=== tag_0x4d
+entry_name: ptir_singleton_0x4d
+ok: false
+error: unsupported CUDA singleton opcode tag 77
+entry_name: ptir_singleton_0x4d
+op_tag: 0x4d
+=== end
+=== tag_0x4e
+entry_name: ptir_singleton_0x4e
+ok: false
+error: unsupported CUDA singleton opcode tag 78
+entry_name: ptir_singleton_0x4e
+op_tag: 0x4e
+=== end
+=== tag_0x4f
+entry_name: ptir_singleton_0x4f
+ok: false
+error: unsupported CUDA singleton opcode tag 79
+entry_name: ptir_singleton_0x4f
+op_tag: 0x4f
+=== end
+=== tag_0x50
+entry_name: ptir_singleton_0x50
+ok: true
+error: 
+entry_name: ptir_singleton_0x50
+op_tag: 0x50
+source: bytes=45756 prefix=@runtime tail_bytes=479
+
+extern "C" __global__ void ptir_singleton_0x50(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(80u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x51
+entry_name: ptir_singleton_0x51
+ok: true
+error: 
+entry_name: ptir_singleton_0x51
+op_tag: 0x51
+source: bytes=45756 prefix=@runtime tail_bytes=479
+
+extern "C" __global__ void ptir_singleton_0x51(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(81u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x52
+entry_name: ptir_singleton_0x52
+ok: false
+error: unsupported CUDA singleton opcode tag 82
+entry_name: ptir_singleton_0x52
+op_tag: 0x52
+=== end
+=== tag_0x53
+entry_name: ptir_singleton_0x53
+ok: false
+error: unsupported CUDA singleton opcode tag 83
+entry_name: ptir_singleton_0x53
+op_tag: 0x53
+=== end
+=== tag_0x54
+entry_name: ptir_singleton_0x54
+ok: false
+error: unsupported CUDA singleton opcode tag 84
+entry_name: ptir_singleton_0x54
+op_tag: 0x54
+=== end
+=== tag_0x55
+entry_name: ptir_singleton_0x55
+ok: true
+error: 
+entry_name: ptir_singleton_0x55
+op_tag: 0x55
+source: bytes=45756 prefix=@runtime tail_bytes=479
+
+extern "C" __global__ void ptir_singleton_0x55(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(85u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x56
+entry_name: ptir_singleton_0x56
+ok: false
+error: unsupported CUDA singleton opcode tag 86
+entry_name: ptir_singleton_0x56
+op_tag: 0x56
+=== end
+=== tag_0x57
+entry_name: ptir_singleton_0x57
+ok: false
+error: unsupported CUDA singleton opcode tag 87
+entry_name: ptir_singleton_0x57
+op_tag: 0x57
+=== end
+=== tag_0x58
+entry_name: ptir_singleton_0x58
+ok: true
+error: 
+entry_name: ptir_singleton_0x58
+op_tag: 0x58
+source: bytes=45756 prefix=@runtime tail_bytes=479
+
+extern "C" __global__ void ptir_singleton_0x58(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(88u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x59
+entry_name: ptir_singleton_0x59
+ok: false
+error: unsupported CUDA singleton opcode tag 89
+entry_name: ptir_singleton_0x59
+op_tag: 0x59
+=== end
+=== tag_0x5a
+entry_name: ptir_singleton_0x5a
+ok: false
+error: unsupported CUDA singleton opcode tag 90
+entry_name: ptir_singleton_0x5a
+op_tag: 0x5a
+=== end
+=== tag_0x5b
+entry_name: ptir_singleton_0x5b
+ok: false
+error: unsupported CUDA singleton opcode tag 91
+entry_name: ptir_singleton_0x5b
+op_tag: 0x5b
+=== end
+=== tag_0x5c
+entry_name: ptir_singleton_0x5c
+ok: false
+error: unsupported CUDA singleton opcode tag 92
+entry_name: ptir_singleton_0x5c
+op_tag: 0x5c
+=== end
+=== tag_0x5d
+entry_name: ptir_singleton_0x5d
+ok: false
+error: unsupported CUDA singleton opcode tag 93
+entry_name: ptir_singleton_0x5d
+op_tag: 0x5d
+=== end
+=== tag_0x5e
+entry_name: ptir_singleton_0x5e
+ok: false
+error: unsupported CUDA singleton opcode tag 94
+entry_name: ptir_singleton_0x5e
+op_tag: 0x5e
+=== end
+=== tag_0x5f
+entry_name: ptir_singleton_0x5f
+ok: false
+error: unsupported CUDA singleton opcode tag 95
+entry_name: ptir_singleton_0x5f
+op_tag: 0x5f
+=== end
+=== tag_0x60
+entry_name: ptir_singleton_0x60
+ok: true
+error: 
+entry_name: ptir_singleton_0x60
+op_tag: 0x60
+source: bytes=45756 prefix=@runtime tail_bytes=479
+
+extern "C" __global__ void ptir_singleton_0x60(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(96u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x61
+entry_name: ptir_singleton_0x61
+ok: true
+error: 
+entry_name: ptir_singleton_0x61
+op_tag: 0x61
+source: bytes=45756 prefix=@runtime tail_bytes=479
+
+extern "C" __global__ void ptir_singleton_0x61(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(97u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x62
+entry_name: ptir_singleton_0x62
+ok: true
+error: 
+entry_name: ptir_singleton_0x62
+op_tag: 0x62
+source: bytes=45756 prefix=@runtime tail_bytes=479
+
+extern "C" __global__ void ptir_singleton_0x62(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(98u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x63
+entry_name: ptir_singleton_0x63
+ok: true
+error: 
+entry_name: ptir_singleton_0x63
+op_tag: 0x63
+source: bytes=45756 prefix=@runtime tail_bytes=479
+
+extern "C" __global__ void ptir_singleton_0x63(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(99u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x64
+entry_name: ptir_singleton_0x64
+ok: true
+error: 
+entry_name: ptir_singleton_0x64
+op_tag: 0x64
+source: bytes=45757 prefix=@runtime tail_bytes=480
+
+extern "C" __global__ void ptir_singleton_0x64(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(100u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x65
+entry_name: ptir_singleton_0x65
+ok: true
+error: 
+entry_name: ptir_singleton_0x65
+op_tag: 0x65
+source: bytes=45757 prefix=@runtime tail_bytes=480
+
+extern "C" __global__ void ptir_singleton_0x65(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(101u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x66
+entry_name: ptir_singleton_0x66
+ok: true
+error: 
+entry_name: ptir_singleton_0x66
+op_tag: 0x66
+source: bytes=45757 prefix=@runtime tail_bytes=480
+
+extern "C" __global__ void ptir_singleton_0x66(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(102u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x67
+entry_name: ptir_singleton_0x67
+ok: true
+error: 
+entry_name: ptir_singleton_0x67
+op_tag: 0x67
+source: bytes=45757 prefix=@runtime tail_bytes=480
+
+extern "C" __global__ void ptir_singleton_0x67(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(103u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x68
+entry_name: ptir_singleton_0x68
+ok: true
+error: 
+entry_name: ptir_singleton_0x68
+op_tag: 0x68
+source: bytes=45757 prefix=@runtime tail_bytes=480
+
+extern "C" __global__ void ptir_singleton_0x68(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(104u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x69
+entry_name: ptir_singleton_0x69
+ok: false
+error: unsupported CUDA singleton opcode tag 105
+entry_name: ptir_singleton_0x69
+op_tag: 0x69
+=== end
+=== tag_0x6a
+entry_name: ptir_singleton_0x6a
+ok: false
+error: unsupported CUDA singleton opcode tag 106
+entry_name: ptir_singleton_0x6a
+op_tag: 0x6a
+=== end
+=== tag_0x6b
+entry_name: ptir_singleton_0x6b
+ok: false
+error: unsupported CUDA singleton opcode tag 107
+entry_name: ptir_singleton_0x6b
+op_tag: 0x6b
+=== end
+=== tag_0x6c
+entry_name: ptir_singleton_0x6c
+ok: false
+error: unsupported CUDA singleton opcode tag 108
+entry_name: ptir_singleton_0x6c
+op_tag: 0x6c
+=== end
+=== tag_0x6d
+entry_name: ptir_singleton_0x6d
+ok: false
+error: unsupported CUDA singleton opcode tag 109
+entry_name: ptir_singleton_0x6d
+op_tag: 0x6d
+=== end
+=== tag_0x6e
+entry_name: ptir_singleton_0x6e
+ok: false
+error: unsupported CUDA singleton opcode tag 110
+entry_name: ptir_singleton_0x6e
+op_tag: 0x6e
+=== end
+=== tag_0x6f
+entry_name: ptir_singleton_0x6f
+ok: false
+error: unsupported CUDA singleton opcode tag 111
+entry_name: ptir_singleton_0x6f
+op_tag: 0x6f
+=== end
+=== tag_0x70
+entry_name: ptir_singleton_0x70
+ok: true
+error: 
+entry_name: ptir_singleton_0x70
+op_tag: 0x70
+source: bytes=45757 prefix=@runtime tail_bytes=480
+
+extern "C" __global__ void ptir_singleton_0x70(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(112u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x71
+entry_name: ptir_singleton_0x71
+ok: true
+error: 
+entry_name: ptir_singleton_0x71
+op_tag: 0x71
+source: bytes=45757 prefix=@runtime tail_bytes=480
+
+extern "C" __global__ void ptir_singleton_0x71(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(113u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x72
+entry_name: ptir_singleton_0x72
+ok: false
+error: unsupported CUDA singleton opcode tag 114
+entry_name: ptir_singleton_0x72
+op_tag: 0x72
+=== end
+=== tag_0x73
+entry_name: ptir_singleton_0x73
+ok: false
+error: unsupported CUDA singleton opcode tag 115
+entry_name: ptir_singleton_0x73
+op_tag: 0x73
+=== end
+=== tag_0x74
+entry_name: ptir_singleton_0x74
+ok: false
+error: unsupported CUDA singleton opcode tag 116
+entry_name: ptir_singleton_0x74
+op_tag: 0x74
+=== end
+=== tag_0x75
+entry_name: ptir_singleton_0x75
+ok: false
+error: unsupported CUDA singleton opcode tag 117
+entry_name: ptir_singleton_0x75
+op_tag: 0x75
+=== end
+=== tag_0x76
+entry_name: ptir_singleton_0x76
+ok: false
+error: unsupported CUDA singleton opcode tag 118
+entry_name: ptir_singleton_0x76
+op_tag: 0x76
+=== end
+=== tag_0x77
+entry_name: ptir_singleton_0x77
+ok: false
+error: unsupported CUDA singleton opcode tag 119
+entry_name: ptir_singleton_0x77
+op_tag: 0x77
+=== end
+=== tag_0x78
+entry_name: ptir_singleton_0x78
+ok: false
+error: unsupported CUDA singleton opcode tag 120
+entry_name: ptir_singleton_0x78
+op_tag: 0x78
+=== end
+=== tag_0x79
+entry_name: ptir_singleton_0x79
+ok: false
+error: unsupported CUDA singleton opcode tag 121
+entry_name: ptir_singleton_0x79
+op_tag: 0x79
+=== end
+=== tag_0x7a
+entry_name: ptir_singleton_0x7a
+ok: false
+error: unsupported CUDA singleton opcode tag 122
+entry_name: ptir_singleton_0x7a
+op_tag: 0x7a
+=== end
+=== tag_0x7b
+entry_name: ptir_singleton_0x7b
+ok: false
+error: unsupported CUDA singleton opcode tag 123
+entry_name: ptir_singleton_0x7b
+op_tag: 0x7b
+=== end
+=== tag_0x7c
+entry_name: ptir_singleton_0x7c
+ok: false
+error: unsupported CUDA singleton opcode tag 124
+entry_name: ptir_singleton_0x7c
+op_tag: 0x7c
+=== end
+=== tag_0x7d
+entry_name: ptir_singleton_0x7d
+ok: false
+error: unsupported CUDA singleton opcode tag 125
+entry_name: ptir_singleton_0x7d
+op_tag: 0x7d
+=== end
+=== tag_0x7e
+entry_name: ptir_singleton_0x7e
+ok: false
+error: unsupported CUDA singleton opcode tag 126
+entry_name: ptir_singleton_0x7e
+op_tag: 0x7e
+=== end
+=== tag_0x7f
+entry_name: ptir_singleton_0x7f
+ok: false
+error: unsupported CUDA singleton opcode tag 127
+entry_name: ptir_singleton_0x7f
+op_tag: 0x7f
+=== end
+=== tag_0x80
+entry_name: ptir_singleton_0x80
+ok: false
+error: unsupported CUDA singleton opcode tag 128
+entry_name: ptir_singleton_0x80
+op_tag: 0x80
+=== end
+=== tag_0x81
+entry_name: ptir_singleton_0x81
+ok: true
+error: 
+entry_name: ptir_singleton_0x81
+op_tag: 0x81
+source: bytes=45757 prefix=@runtime tail_bytes=480
+
+extern "C" __global__ void ptir_singleton_0x81(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(129u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x82
+entry_name: ptir_singleton_0x82
+ok: false
+error: unsupported CUDA singleton opcode tag 130
+entry_name: ptir_singleton_0x82
+op_tag: 0x82
+=== end
+=== tag_0x83
+entry_name: ptir_singleton_0x83
+ok: false
+error: unsupported CUDA singleton opcode tag 131
+entry_name: ptir_singleton_0x83
+op_tag: 0x83
+=== end
+=== tag_0x84
+entry_name: ptir_singleton_0x84
+ok: false
+error: unsupported CUDA singleton opcode tag 132
+entry_name: ptir_singleton_0x84
+op_tag: 0x84
+=== end
+=== tag_0x85
+entry_name: ptir_singleton_0x85
+ok: false
+error: unsupported CUDA singleton opcode tag 133
+entry_name: ptir_singleton_0x85
+op_tag: 0x85
+=== end
+=== tag_0x86
+entry_name: ptir_singleton_0x86
+ok: false
+error: unsupported CUDA singleton opcode tag 134
+entry_name: ptir_singleton_0x86
+op_tag: 0x86
+=== end
+=== tag_0x87
+entry_name: ptir_singleton_0x87
+ok: false
+error: unsupported CUDA singleton opcode tag 135
+entry_name: ptir_singleton_0x87
+op_tag: 0x87
+=== end
+=== tag_0x88
+entry_name: ptir_singleton_0x88
+ok: false
+error: unsupported CUDA singleton opcode tag 136
+entry_name: ptir_singleton_0x88
+op_tag: 0x88
+=== end
+=== tag_0x89
+entry_name: ptir_singleton_0x89
+ok: false
+error: unsupported CUDA singleton opcode tag 137
+entry_name: ptir_singleton_0x89
+op_tag: 0x89
+=== end
+=== tag_0x8a
+entry_name: ptir_singleton_0x8a
+ok: false
+error: unsupported CUDA singleton opcode tag 138
+entry_name: ptir_singleton_0x8a
+op_tag: 0x8a
+=== end
+=== tag_0x8b
+entry_name: ptir_singleton_0x8b
+ok: false
+error: unsupported CUDA singleton opcode tag 139
+entry_name: ptir_singleton_0x8b
+op_tag: 0x8b
+=== end
+=== tag_0x8c
+entry_name: ptir_singleton_0x8c
+ok: false
+error: unsupported CUDA singleton opcode tag 140
+entry_name: ptir_singleton_0x8c
+op_tag: 0x8c
+=== end
+=== tag_0x8d
+entry_name: ptir_singleton_0x8d
+ok: false
+error: unsupported CUDA singleton opcode tag 141
+entry_name: ptir_singleton_0x8d
+op_tag: 0x8d
+=== end
+=== tag_0x8e
+entry_name: ptir_singleton_0x8e
+ok: false
+error: unsupported CUDA singleton opcode tag 142
+entry_name: ptir_singleton_0x8e
+op_tag: 0x8e
+=== end
+=== tag_0x8f
+entry_name: ptir_singleton_0x8f
+ok: false
+error: unsupported CUDA singleton opcode tag 143
+entry_name: ptir_singleton_0x8f
+op_tag: 0x8f
+=== end
+=== tag_0x90
+entry_name: ptir_singleton_0x90
+ok: true
+error: 
+entry_name: ptir_singleton_0x90
+op_tag: 0x90
+source: bytes=45757 prefix=@runtime tail_bytes=480
+
+extern "C" __global__ void ptir_singleton_0x90(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(144u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x91
+entry_name: ptir_singleton_0x91
+ok: true
+error: 
+entry_name: ptir_singleton_0x91
+op_tag: 0x91
+source: bytes=45757 prefix=@runtime tail_bytes=480
+
+extern "C" __global__ void ptir_singleton_0x91(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(145u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x92
+entry_name: ptir_singleton_0x92
+ok: true
+error: 
+entry_name: ptir_singleton_0x92
+op_tag: 0x92
+source: bytes=45757 prefix=@runtime tail_bytes=480
+
+extern "C" __global__ void ptir_singleton_0x92(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(146u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x93
+entry_name: ptir_singleton_0x93
+ok: false
+error: unsupported CUDA singleton opcode tag 147
+entry_name: ptir_singleton_0x93
+op_tag: 0x93
+=== end
+=== tag_0x94
+entry_name: ptir_singleton_0x94
+ok: false
+error: unsupported CUDA singleton opcode tag 148
+entry_name: ptir_singleton_0x94
+op_tag: 0x94
+=== end
+=== tag_0x95
+entry_name: ptir_singleton_0x95
+ok: false
+error: unsupported CUDA singleton opcode tag 149
+entry_name: ptir_singleton_0x95
+op_tag: 0x95
+=== end
+=== tag_0x96
+entry_name: ptir_singleton_0x96
+ok: false
+error: unsupported CUDA singleton opcode tag 150
+entry_name: ptir_singleton_0x96
+op_tag: 0x96
+=== end
+=== tag_0x97
+entry_name: ptir_singleton_0x97
+ok: false
+error: unsupported CUDA singleton opcode tag 151
+entry_name: ptir_singleton_0x97
+op_tag: 0x97
+=== end
+=== tag_0x98
+entry_name: ptir_singleton_0x98
+ok: false
+error: unsupported CUDA singleton opcode tag 152
+entry_name: ptir_singleton_0x98
+op_tag: 0x98
+=== end
+=== tag_0x99
+entry_name: ptir_singleton_0x99
+ok: false
+error: unsupported CUDA singleton opcode tag 153
+entry_name: ptir_singleton_0x99
+op_tag: 0x99
+=== end
+=== tag_0x9a
+entry_name: ptir_singleton_0x9a
+ok: false
+error: unsupported CUDA singleton opcode tag 154
+entry_name: ptir_singleton_0x9a
+op_tag: 0x9a
+=== end
+=== tag_0x9b
+entry_name: ptir_singleton_0x9b
+ok: false
+error: unsupported CUDA singleton opcode tag 155
+entry_name: ptir_singleton_0x9b
+op_tag: 0x9b
+=== end
+=== tag_0x9c
+entry_name: ptir_singleton_0x9c
+ok: false
+error: unsupported CUDA singleton opcode tag 156
+entry_name: ptir_singleton_0x9c
+op_tag: 0x9c
+=== end
+=== tag_0x9d
+entry_name: ptir_singleton_0x9d
+ok: false
+error: unsupported CUDA singleton opcode tag 157
+entry_name: ptir_singleton_0x9d
+op_tag: 0x9d
+=== end
+=== tag_0x9e
+entry_name: ptir_singleton_0x9e
+ok: false
+error: unsupported CUDA singleton opcode tag 158
+entry_name: ptir_singleton_0x9e
+op_tag: 0x9e
+=== end
+=== tag_0x9f
+entry_name: ptir_singleton_0x9f
+ok: false
+error: unsupported CUDA singleton opcode tag 159
+entry_name: ptir_singleton_0x9f
+op_tag: 0x9f
+=== end
+=== tag_0xa0
+entry_name: ptir_singleton_0xa0
+ok: true
+error: 
+entry_name: ptir_singleton_0xa0
+op_tag: 0xa0
+source: bytes=45757 prefix=@runtime tail_bytes=480
+
+extern "C" __global__ void ptir_singleton_0xa0(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(160u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xa1
+entry_name: ptir_singleton_0xa1
+ok: true
+error: 
+entry_name: ptir_singleton_0xa1
+op_tag: 0xa1
+source: bytes=45757 prefix=@runtime tail_bytes=480
+
+extern "C" __global__ void ptir_singleton_0xa1(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(161u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xa2
+entry_name: ptir_singleton_0xa2
+ok: true
+error: 
+entry_name: ptir_singleton_0xa2
+op_tag: 0xa2
+source: bytes=45757 prefix=@runtime tail_bytes=480
+
+extern "C" __global__ void ptir_singleton_0xa2(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(162u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xa3
+entry_name: ptir_singleton_0xa3
+ok: false
+error: unsupported CUDA singleton opcode tag 163
+entry_name: ptir_singleton_0xa3
+op_tag: 0xa3
+=== end
+=== tag_0xa4
+entry_name: ptir_singleton_0xa4
+ok: false
+error: unsupported CUDA singleton opcode tag 164
+entry_name: ptir_singleton_0xa4
+op_tag: 0xa4
+=== end
+=== tag_0xa5
+entry_name: ptir_singleton_0xa5
+ok: false
+error: unsupported CUDA singleton opcode tag 165
+entry_name: ptir_singleton_0xa5
+op_tag: 0xa5
+=== end
+=== tag_0xa6
+entry_name: ptir_singleton_0xa6
+ok: false
+error: unsupported CUDA singleton opcode tag 166
+entry_name: ptir_singleton_0xa6
+op_tag: 0xa6
+=== end
+=== tag_0xa7
+entry_name: ptir_singleton_0xa7
+ok: false
+error: unsupported CUDA singleton opcode tag 167
+entry_name: ptir_singleton_0xa7
+op_tag: 0xa7
+=== end
+=== tag_0xa8
+entry_name: ptir_singleton_0xa8
+ok: false
+error: unsupported CUDA singleton opcode tag 168
+entry_name: ptir_singleton_0xa8
+op_tag: 0xa8
+=== end
+=== tag_0xa9
+entry_name: ptir_singleton_0xa9
+ok: false
+error: unsupported CUDA singleton opcode tag 169
+entry_name: ptir_singleton_0xa9
+op_tag: 0xa9
+=== end
+=== tag_0xaa
+entry_name: ptir_singleton_0xaa
+ok: false
+error: unsupported CUDA singleton opcode tag 170
+entry_name: ptir_singleton_0xaa
+op_tag: 0xaa
+=== end
+=== tag_0xab
+entry_name: ptir_singleton_0xab
+ok: false
+error: unsupported CUDA singleton opcode tag 171
+entry_name: ptir_singleton_0xab
+op_tag: 0xab
+=== end
+=== tag_0xac
+entry_name: ptir_singleton_0xac
+ok: false
+error: unsupported CUDA singleton opcode tag 172
+entry_name: ptir_singleton_0xac
+op_tag: 0xac
+=== end
+=== tag_0xad
+entry_name: ptir_singleton_0xad
+ok: false
+error: unsupported CUDA singleton opcode tag 173
+entry_name: ptir_singleton_0xad
+op_tag: 0xad
+=== end
+=== tag_0xae
+entry_name: ptir_singleton_0xae
+ok: false
+error: unsupported CUDA singleton opcode tag 174
+entry_name: ptir_singleton_0xae
+op_tag: 0xae
+=== end
+=== tag_0xaf
+entry_name: ptir_singleton_0xaf
+ok: false
+error: unsupported CUDA singleton opcode tag 175
+entry_name: ptir_singleton_0xaf
+op_tag: 0xaf
+=== end
+=== tag_0xb0
+entry_name: ptir_singleton_0xb0
+ok: false
+error: unsupported CUDA singleton opcode tag 176
+entry_name: ptir_singleton_0xb0
+op_tag: 0xb0
+=== end
+=== tag_0xb1
+entry_name: ptir_singleton_0xb1
+ok: false
+error: unsupported CUDA singleton opcode tag 177
+entry_name: ptir_singleton_0xb1
+op_tag: 0xb1
+=== end
+=== tag_0xb2
+entry_name: ptir_singleton_0xb2
+ok: false
+error: unsupported CUDA singleton opcode tag 178
+entry_name: ptir_singleton_0xb2
+op_tag: 0xb2
+=== end
+=== tag_0xb3
+entry_name: ptir_singleton_0xb3
+ok: false
+error: unsupported CUDA singleton opcode tag 179
+entry_name: ptir_singleton_0xb3
+op_tag: 0xb3
+=== end
+=== tag_0xb4
+entry_name: ptir_singleton_0xb4
+ok: false
+error: unsupported CUDA singleton opcode tag 180
+entry_name: ptir_singleton_0xb4
+op_tag: 0xb4
+=== end
+=== tag_0xb5
+entry_name: ptir_singleton_0xb5
+ok: false
+error: unsupported CUDA singleton opcode tag 181
+entry_name: ptir_singleton_0xb5
+op_tag: 0xb5
+=== end
+=== tag_0xb6
+entry_name: ptir_singleton_0xb6
+ok: false
+error: unsupported CUDA singleton opcode tag 182
+entry_name: ptir_singleton_0xb6
+op_tag: 0xb6
+=== end
+=== tag_0xb7
+entry_name: ptir_singleton_0xb7
+ok: false
+error: unsupported CUDA singleton opcode tag 183
+entry_name: ptir_singleton_0xb7
+op_tag: 0xb7
+=== end
+=== tag_0xb8
+entry_name: ptir_singleton_0xb8
+ok: false
+error: unsupported CUDA singleton opcode tag 184
+entry_name: ptir_singleton_0xb8
+op_tag: 0xb8
+=== end
+=== tag_0xb9
+entry_name: ptir_singleton_0xb9
+ok: false
+error: unsupported CUDA singleton opcode tag 185
+entry_name: ptir_singleton_0xb9
+op_tag: 0xb9
+=== end
+=== tag_0xba
+entry_name: ptir_singleton_0xba
+ok: false
+error: unsupported CUDA singleton opcode tag 186
+entry_name: ptir_singleton_0xba
+op_tag: 0xba
+=== end
+=== tag_0xbb
+entry_name: ptir_singleton_0xbb
+ok: false
+error: unsupported CUDA singleton opcode tag 187
+entry_name: ptir_singleton_0xbb
+op_tag: 0xbb
+=== end
+=== tag_0xbc
+entry_name: ptir_singleton_0xbc
+ok: false
+error: unsupported CUDA singleton opcode tag 188
+entry_name: ptir_singleton_0xbc
+op_tag: 0xbc
+=== end
+=== tag_0xbd
+entry_name: ptir_singleton_0xbd
+ok: false
+error: unsupported CUDA singleton opcode tag 189
+entry_name: ptir_singleton_0xbd
+op_tag: 0xbd
+=== end
+=== tag_0xbe
+entry_name: ptir_singleton_0xbe
+ok: false
+error: unsupported CUDA singleton opcode tag 190
+entry_name: ptir_singleton_0xbe
+op_tag: 0xbe
+=== end
+=== tag_0xbf
+entry_name: ptir_singleton_0xbf
+ok: false
+error: unsupported CUDA singleton opcode tag 191
+entry_name: ptir_singleton_0xbf
+op_tag: 0xbf
+=== end
+=== tag_0xc0
+entry_name: ptir_singleton_0xc0
+ok: false
+error: unsupported CUDA singleton opcode tag 192
+entry_name: ptir_singleton_0xc0
+op_tag: 0xc0
+=== end
+=== tag_0xc1
+entry_name: ptir_singleton_0xc1
+ok: false
+error: unsupported CUDA singleton opcode tag 193
+entry_name: ptir_singleton_0xc1
+op_tag: 0xc1
+=== end
+=== tag_0xc2
+entry_name: ptir_singleton_0xc2
+ok: false
+error: unsupported CUDA singleton opcode tag 194
+entry_name: ptir_singleton_0xc2
+op_tag: 0xc2
+=== end
+=== tag_0xc3
+entry_name: ptir_singleton_0xc3
+ok: false
+error: unsupported CUDA singleton opcode tag 195
+entry_name: ptir_singleton_0xc3
+op_tag: 0xc3
+=== end
+=== tag_0xc4
+entry_name: ptir_singleton_0xc4
+ok: false
+error: unsupported CUDA singleton opcode tag 196
+entry_name: ptir_singleton_0xc4
+op_tag: 0xc4
+=== end
+=== tag_0xc5
+entry_name: ptir_singleton_0xc5
+ok: false
+error: unsupported CUDA singleton opcode tag 197
+entry_name: ptir_singleton_0xc5
+op_tag: 0xc5
+=== end
+=== tag_0xc6
+entry_name: ptir_singleton_0xc6
+ok: false
+error: unsupported CUDA singleton opcode tag 198
+entry_name: ptir_singleton_0xc6
+op_tag: 0xc6
+=== end
+=== tag_0xc7
+entry_name: ptir_singleton_0xc7
+ok: false
+error: unsupported CUDA singleton opcode tag 199
+entry_name: ptir_singleton_0xc7
+op_tag: 0xc7
+=== end
+=== tag_0xc8
+entry_name: ptir_singleton_0xc8
+ok: false
+error: unsupported CUDA singleton opcode tag 200
+entry_name: ptir_singleton_0xc8
+op_tag: 0xc8
+=== end
+=== tag_0xc9
+entry_name: ptir_singleton_0xc9
+ok: false
+error: unsupported CUDA singleton opcode tag 201
+entry_name: ptir_singleton_0xc9
+op_tag: 0xc9
+=== end
+=== tag_0xca
+entry_name: ptir_singleton_0xca
+ok: false
+error: unsupported CUDA singleton opcode tag 202
+entry_name: ptir_singleton_0xca
+op_tag: 0xca
+=== end
+=== tag_0xcb
+entry_name: ptir_singleton_0xcb
+ok: false
+error: unsupported CUDA singleton opcode tag 203
+entry_name: ptir_singleton_0xcb
+op_tag: 0xcb
+=== end
+=== tag_0xcc
+entry_name: ptir_singleton_0xcc
+ok: false
+error: unsupported CUDA singleton opcode tag 204
+entry_name: ptir_singleton_0xcc
+op_tag: 0xcc
+=== end
+=== tag_0xcd
+entry_name: ptir_singleton_0xcd
+ok: false
+error: unsupported CUDA singleton opcode tag 205
+entry_name: ptir_singleton_0xcd
+op_tag: 0xcd
+=== end
+=== tag_0xce
+entry_name: ptir_singleton_0xce
+ok: false
+error: unsupported CUDA singleton opcode tag 206
+entry_name: ptir_singleton_0xce
+op_tag: 0xce
+=== end
+=== tag_0xcf
+entry_name: ptir_singleton_0xcf
+ok: false
+error: unsupported CUDA singleton opcode tag 207
+entry_name: ptir_singleton_0xcf
+op_tag: 0xcf
+=== end
+=== tag_0xd0
+entry_name: ptir_singleton_0xd0
+ok: false
+error: unsupported CUDA singleton opcode tag 208
+entry_name: ptir_singleton_0xd0
+op_tag: 0xd0
+=== end
+=== tag_0xd1
+entry_name: ptir_singleton_0xd1
+ok: false
+error: unsupported CUDA singleton opcode tag 209
+entry_name: ptir_singleton_0xd1
+op_tag: 0xd1
+=== end
+=== tag_0xd2
+entry_name: ptir_singleton_0xd2
+ok: false
+error: unsupported CUDA singleton opcode tag 210
+entry_name: ptir_singleton_0xd2
+op_tag: 0xd2
+=== end
+=== tag_0xd3
+entry_name: ptir_singleton_0xd3
+ok: false
+error: unsupported CUDA singleton opcode tag 211
+entry_name: ptir_singleton_0xd3
+op_tag: 0xd3
+=== end
+=== tag_0xd4
+entry_name: ptir_singleton_0xd4
+ok: false
+error: unsupported CUDA singleton opcode tag 212
+entry_name: ptir_singleton_0xd4
+op_tag: 0xd4
+=== end
+=== tag_0xd5
+entry_name: ptir_singleton_0xd5
+ok: false
+error: unsupported CUDA singleton opcode tag 213
+entry_name: ptir_singleton_0xd5
+op_tag: 0xd5
+=== end
+=== tag_0xd6
+entry_name: ptir_singleton_0xd6
+ok: false
+error: unsupported CUDA singleton opcode tag 214
+entry_name: ptir_singleton_0xd6
+op_tag: 0xd6
+=== end
+=== tag_0xd7
+entry_name: ptir_singleton_0xd7
+ok: false
+error: unsupported CUDA singleton opcode tag 215
+entry_name: ptir_singleton_0xd7
+op_tag: 0xd7
+=== end
+=== tag_0xd8
+entry_name: ptir_singleton_0xd8
+ok: false
+error: unsupported CUDA singleton opcode tag 216
+entry_name: ptir_singleton_0xd8
+op_tag: 0xd8
+=== end
+=== tag_0xd9
+entry_name: ptir_singleton_0xd9
+ok: false
+error: unsupported CUDA singleton opcode tag 217
+entry_name: ptir_singleton_0xd9
+op_tag: 0xd9
+=== end
+=== tag_0xda
+entry_name: ptir_singleton_0xda
+ok: false
+error: unsupported CUDA singleton opcode tag 218
+entry_name: ptir_singleton_0xda
+op_tag: 0xda
+=== end
+=== tag_0xdb
+entry_name: ptir_singleton_0xdb
+ok: false
+error: unsupported CUDA singleton opcode tag 219
+entry_name: ptir_singleton_0xdb
+op_tag: 0xdb
+=== end
+=== tag_0xdc
+entry_name: ptir_singleton_0xdc
+ok: false
+error: unsupported CUDA singleton opcode tag 220
+entry_name: ptir_singleton_0xdc
+op_tag: 0xdc
+=== end
+=== tag_0xdd
+entry_name: ptir_singleton_0xdd
+ok: false
+error: unsupported CUDA singleton opcode tag 221
+entry_name: ptir_singleton_0xdd
+op_tag: 0xdd
+=== end
+=== tag_0xde
+entry_name: ptir_singleton_0xde
+ok: false
+error: unsupported CUDA singleton opcode tag 222
+entry_name: ptir_singleton_0xde
+op_tag: 0xde
+=== end
+=== tag_0xdf
+entry_name: ptir_singleton_0xdf
+ok: false
+error: unsupported CUDA singleton opcode tag 223
+entry_name: ptir_singleton_0xdf
+op_tag: 0xdf
+=== end
+=== tag_0xe0
+entry_name: ptir_singleton_0xe0
+ok: false
+error: unsupported CUDA singleton opcode tag 224
+entry_name: ptir_singleton_0xe0
+op_tag: 0xe0
+=== end
+=== tag_0xe1
+entry_name: ptir_singleton_0xe1
+ok: false
+error: unsupported CUDA singleton opcode tag 225
+entry_name: ptir_singleton_0xe1
+op_tag: 0xe1
+=== end
+=== tag_0xe2
+entry_name: ptir_singleton_0xe2
+ok: false
+error: unsupported CUDA singleton opcode tag 226
+entry_name: ptir_singleton_0xe2
+op_tag: 0xe2
+=== end
+=== tag_0xe3
+entry_name: ptir_singleton_0xe3
+ok: false
+error: unsupported CUDA singleton opcode tag 227
+entry_name: ptir_singleton_0xe3
+op_tag: 0xe3
+=== end
+=== tag_0xe4
+entry_name: ptir_singleton_0xe4
+ok: false
+error: unsupported CUDA singleton opcode tag 228
+entry_name: ptir_singleton_0xe4
+op_tag: 0xe4
+=== end
+=== tag_0xe5
+entry_name: ptir_singleton_0xe5
+ok: false
+error: unsupported CUDA singleton opcode tag 229
+entry_name: ptir_singleton_0xe5
+op_tag: 0xe5
+=== end
+=== tag_0xe6
+entry_name: ptir_singleton_0xe6
+ok: false
+error: unsupported CUDA singleton opcode tag 230
+entry_name: ptir_singleton_0xe6
+op_tag: 0xe6
+=== end
+=== tag_0xe7
+entry_name: ptir_singleton_0xe7
+ok: false
+error: unsupported CUDA singleton opcode tag 231
+entry_name: ptir_singleton_0xe7
+op_tag: 0xe7
+=== end
+=== tag_0xe8
+entry_name: ptir_singleton_0xe8
+ok: false
+error: unsupported CUDA singleton opcode tag 232
+entry_name: ptir_singleton_0xe8
+op_tag: 0xe8
+=== end
+=== tag_0xe9
+entry_name: ptir_singleton_0xe9
+ok: false
+error: unsupported CUDA singleton opcode tag 233
+entry_name: ptir_singleton_0xe9
+op_tag: 0xe9
+=== end
+=== tag_0xea
+entry_name: ptir_singleton_0xea
+ok: false
+error: unsupported CUDA singleton opcode tag 234
+entry_name: ptir_singleton_0xea
+op_tag: 0xea
+=== end
+=== tag_0xeb
+entry_name: ptir_singleton_0xeb
+ok: false
+error: unsupported CUDA singleton opcode tag 235
+entry_name: ptir_singleton_0xeb
+op_tag: 0xeb
+=== end
+=== tag_0xec
+entry_name: ptir_singleton_0xec
+ok: false
+error: unsupported CUDA singleton opcode tag 236
+entry_name: ptir_singleton_0xec
+op_tag: 0xec
+=== end
+=== tag_0xed
+entry_name: ptir_singleton_0xed
+ok: false
+error: unsupported CUDA singleton opcode tag 237
+entry_name: ptir_singleton_0xed
+op_tag: 0xed
+=== end
+=== tag_0xee
+entry_name: ptir_singleton_0xee
+ok: false
+error: unsupported CUDA singleton opcode tag 238
+entry_name: ptir_singleton_0xee
+op_tag: 0xee
+=== end
+=== tag_0xef
+entry_name: ptir_singleton_0xef
+ok: false
+error: unsupported CUDA singleton opcode tag 239
+entry_name: ptir_singleton_0xef
+op_tag: 0xef
+=== end
+=== tag_0xf0
+entry_name: ptir_singleton_0xf0
+ok: false
+error: unsupported CUDA singleton opcode tag 240
+entry_name: ptir_singleton_0xf0
+op_tag: 0xf0
+=== end
+=== tag_0xf1
+entry_name: ptir_singleton_0xf1
+ok: false
+error: unsupported CUDA singleton opcode tag 241
+entry_name: ptir_singleton_0xf1
+op_tag: 0xf1
+=== end
+=== tag_0xf2
+entry_name: ptir_singleton_0xf2
+ok: false
+error: unsupported CUDA singleton opcode tag 242
+entry_name: ptir_singleton_0xf2
+op_tag: 0xf2
+=== end
+=== tag_0xf3
+entry_name: ptir_singleton_0xf3
+ok: false
+error: unsupported CUDA singleton opcode tag 243
+entry_name: ptir_singleton_0xf3
+op_tag: 0xf3
+=== end
+=== tag_0xf4
+entry_name: ptir_singleton_0xf4
+ok: false
+error: unsupported CUDA singleton opcode tag 244
+entry_name: ptir_singleton_0xf4
+op_tag: 0xf4
+=== end
+=== tag_0xf5
+entry_name: ptir_singleton_0xf5
+ok: false
+error: unsupported CUDA singleton opcode tag 245
+entry_name: ptir_singleton_0xf5
+op_tag: 0xf5
+=== end
+=== tag_0xf6
+entry_name: ptir_singleton_0xf6
+ok: false
+error: unsupported CUDA singleton opcode tag 246
+entry_name: ptir_singleton_0xf6
+op_tag: 0xf6
+=== end
+=== tag_0xf7
+entry_name: ptir_singleton_0xf7
+ok: false
+error: unsupported CUDA singleton opcode tag 247
+entry_name: ptir_singleton_0xf7
+op_tag: 0xf7
+=== end
+=== tag_0xf8
+entry_name: ptir_singleton_0xf8
+ok: false
+error: unsupported CUDA singleton opcode tag 248
+entry_name: ptir_singleton_0xf8
+op_tag: 0xf8
+=== end
+=== tag_0xf9
+entry_name: ptir_singleton_0xf9
+ok: false
+error: unsupported CUDA singleton opcode tag 249
+entry_name: ptir_singleton_0xf9
+op_tag: 0xf9
+=== end
+=== tag_0xfa
+entry_name: ptir_singleton_0xfa
+ok: false
+error: unsupported CUDA singleton opcode tag 250
+entry_name: ptir_singleton_0xfa
+op_tag: 0xfa
+=== end
+=== tag_0xfb
+entry_name: ptir_singleton_0xfb
+ok: false
+error: unsupported CUDA singleton opcode tag 251
+entry_name: ptir_singleton_0xfb
+op_tag: 0xfb
+=== end
+=== tag_0xfc
+entry_name: ptir_singleton_0xfc
+ok: false
+error: unsupported CUDA singleton opcode tag 252
+entry_name: ptir_singleton_0xfc
+op_tag: 0xfc
+=== end
+=== tag_0xfd
+entry_name: ptir_singleton_0xfd
+ok: false
+error: unsupported CUDA singleton opcode tag 253
+entry_name: ptir_singleton_0xfd
+op_tag: 0xfd
+=== end
+=== tag_0xfe
+entry_name: ptir_singleton_0xfe
+ok: false
+error: unsupported CUDA singleton opcode tag 254
+entry_name: ptir_singleton_0xfe
+op_tag: 0xfe
+=== end
+=== tag_0xff
+entry_name: ptir_singleton_0xff
+ok: false
+error: unsupported CUDA singleton opcode tag 255
+entry_name: ptir_singleton_0xff
+op_tag: 0xff
+=== end
+=== entry_name[ptir_fused_0123456789abcdef_r0]
+entry_name: ptir_fused_0123456789abcdef_r0
+ok: true
+error: 
+entry_name: ptir_fused_0123456789abcdef_r0
+op_tag: 0x10
+source: bytes=45767 prefix=@runtime tail_bytes=490
+
+extern "C" __global__ void ptir_fused_0123456789abcdef_r0(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(16u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== entry_name[]
+entry_name: 
+ok: false
+error: CUDA singleton entry name is not a C identifier
+entry_name: 
+op_tag: 0x10
+=== end
+=== entry_name[0starts_with_digit]
+entry_name: 0starts_with_digit
+ok: false
+error: CUDA singleton entry name is not a C identifier
+entry_name: 0starts_with_digit
+op_tag: 0x10
+=== end
+=== entry_name[has-a-dash]
+entry_name: has-a-dash
+ok: false
+error: CUDA singleton entry name is not a C identifier
+entry_name: has-a-dash
+op_tag: 0x10
+=== end
+=== entry_name[has space]
+entry_name: has space
+ok: false
+error: CUDA singleton entry name is not a C identifier
+entry_name: has space
+op_tag: 0x10
+=== end
+=== entry_name[_underscore_start]
+entry_name: _underscore_start
+ok: true
+error: 
+entry_name: _underscore_start
+op_tag: 0x10
+source: bytes=45754 prefix=@runtime tail_bytes=477
+
+extern "C" __global__ void _underscore_start(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(16u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== entry_name[A]
+entry_name: A
+ok: true
+error: 
+entry_name: A
+op_tag: 0x10
+source: bytes=45738 prefix=@runtime tail_bytes=461
+
+extern "C" __global__ void A(
+    M1Status* status,
+    const M1ValueDesc* descriptors,
+    const m1_u8* a0,
+    const m1_u8* a1,
+    const m1_u8* a2,
+    m1_u8* o0,
+    m1_u8* o1,
+    m1_u8* temporary,
+    const M1OpParams* params) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
+    return;
+  ptir_m1_execute(16u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end

@@ -5,10 +5,11 @@
 
 use pie_driver_abi::{
     PIE_DRIVER_ABI_VERSION, PieBytes, PieChannelDesc, PieChannelValueDesc,
-    PieChannelValueDescSlice, PieEncodeDesc, PieInstanceDesc, PieKvCopyDesc, PieKvMoveCellSlice,
+    PieChannelValueDescSlice, PieDirectArgmax, PieDirectArgmaxSlice, PieEmittedKernel,
+    PieEmittedKernelSlice, PieEncodeDesc, PieInstanceDesc, PieKvCopyDesc, PieKvMoveCellSlice,
     PieMaskWordsDesc, PieMutBytes, PiePoolRangeSlice, PiePoolResizeDesc, PieProgramDesc,
-    PieStateCopyDesc, PieStateCopyRangeSlice, PieTerminalCellPtrSlice, PieU8Slice, PieU32MutSlice,
-    PieU32Slice, PieU64Slice,
+    PieRegionAnalysis, PieRegionAnalysisSlice, PieStateCopyDesc, PieStateCopyRangeSlice,
+    PieTerminalCellPtrSlice, PieU8Slice, PieU32MutSlice, PieU32Slice, PieU64Slice,
 };
 
 use super::command::{
@@ -16,6 +17,7 @@ use super::command::{
     StateCopyPlan,
 };
 use super::instance::InstanceBindingPlan;
+use super::launch_abi::LaunchPackageBorrow;
 use super::submission::{FrameSubmission, StepSubmission};
 
 fn bytes_slice(bytes: &[u8]) -> PieBytes {
@@ -109,21 +111,94 @@ impl MaskWordsStorage {
 }
 
 pub struct ProgramDescBorrow<'a> {
-    _bytes: &'a [u8],
-    _sidecar: &'a [u8],
+    // The ABI slice points into this vector's heap buffer, which a move of the
+    // struct does not relocate. It must never be mutated after `raw` is built.
+    _kernels: Vec<PieEmittedKernel>,
+    _launch: LaunchPackageBorrow<'a>,
+    // Two levels, same rule: `_regions` holds the pointers into `_direct_argmax`'s
+    // inner buffers, and moving either vector moves headers, not heap.
+    _direct_argmax: Vec<Vec<PieDirectArgmax>>,
+    _regions: Vec<PieRegionAnalysis>,
     raw: PieProgramDesc,
 }
 impl<'a> ProgramDescBorrow<'a> {
     pub fn new(program: &'a ProgramRegistration) -> Self {
+        // The driver no longer carries an emitter, so a fused region with no
+        // host source is a registration failure rather than a slower path.
+        // Dropping the table here left every fused program unregisterable.
+        let kernels: Vec<PieEmittedKernel> = program
+            .emitted_kernels
+            .iter()
+            .map(|kernel| PieEmittedKernel {
+                kind: kernel.kind,
+                stage_index: kernel.stage_index,
+                region_index: kernel.region_index,
+                reserved0: 0,
+                entry_name: bytes_slice(kernel.entry_name.as_bytes()),
+                source: bytes_slice(kernel.source.as_bytes()),
+                error: bytes_slice(kernel.error.as_bytes()),
+            })
+            .collect();
+        let emitted_kernels = PieEmittedKernelSlice {
+            ptr: kernels.as_ptr(),
+            len: kernels.len(),
+        };
+
+        let direct_argmax: Vec<Vec<PieDirectArgmax>> = program
+            .region_analysis
+            .iter()
+            .map(|region| {
+                region
+                    .direct_argmax
+                    .iter()
+                    .map(|record| PieDirectArgmax {
+                        node: record.node,
+                        source_value: record.source_value,
+                        intrinsic: record.intrinsic,
+                        requires_single_row: record.requires_single_row,
+                        reserved0: 0,
+                    })
+                    .collect()
+            })
+            .collect();
+        let regions: Vec<PieRegionAnalysis> = program
+            .region_analysis
+            .iter()
+            .zip(direct_argmax.iter())
+            .map(|(region, records)| PieRegionAnalysis {
+                stage_index: region.stage_index,
+                region_index: region.region_index,
+                flags: region.flags,
+                reserved0: 0,
+                direct_argmax: PieDirectArgmaxSlice {
+                    ptr: records.as_ptr(),
+                    len: records.len(),
+                },
+                skipped: u32_slice(&region.skipped),
+            })
+            .collect();
+        let region_analysis = PieRegionAnalysisSlice {
+            ptr: regions.as_ptr(),
+            len: regions.len(),
+        };
+
+        let launch = LaunchPackageBorrow::new(&program.launch);
+        let raw_launch = launch.as_raw();
+
         Self {
-            _bytes: &program.canonical_bytes,
-            _sidecar: &program.sidecar_bytes,
+            _kernels: kernels,
+            _launch: launch,
+            _direct_argmax: direct_argmax,
+            _regions: regions,
             raw: PieProgramDesc {
                 abi_version: PIE_DRIVER_ABI_VERSION,
                 reserved0: 0,
                 program_hash: program.program_hash,
-                canonical_bytes: bytes_slice(&program.canonical_bytes),
-                sidecar_bytes: bytes_slice(&program.sidecar_bytes),
+                emitter_version: program.emitter_version,
+                reserved1: 0,
+                emitted_kernels,
+                region_analysis,
+                launch: raw_launch,
             },
         }
     }
@@ -206,7 +281,10 @@ impl<'a> InstanceDescBorrow<'a> {
     }
 }
 
-fn step_desc<'a>(step: &'a StepSubmission, masks: &'a MaskWordsStorage) -> pie_driver_abi::PieStepDesc {
+fn step_desc<'a>(
+    step: &'a StepSubmission,
+    masks: &'a MaskWordsStorage,
+) -> pie_driver_abi::PieStepDesc {
     let plan = &step.plan;
     pie_driver_abi::PieStepDesc {
         roster_rows: u32_slice(&step.roster_rows),

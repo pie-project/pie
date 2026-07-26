@@ -8,7 +8,7 @@
 #include <cuda_runtime.h>
 
 #include "../cuda_check.hpp"
-#include "../kernels/slab_scatter.hpp"
+#include "../kernels/slot_ops.hpp"
 
 namespace pie_cuda_driver {
 

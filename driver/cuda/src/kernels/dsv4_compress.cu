@@ -532,6 +532,33 @@ __device__ __forceinline__ long long paged_slot(
     return static_cast<long long>(page) * page_size + (pos % page_size);
 }
 
+// Device-side boundary metadata for the pure-decode path.
+//
+// The host path scans `positions` on the CPU and emits a compacted boundary
+// list, which needs a D2H copy plus a stream sync and so makes the whole
+// forward ineligible for CUDA graph capture. In pure decode every request
+// contributes exactly one token, so instead we emit one *fixed* slot per
+// token and mark non-boundaries with `pos = -1`; the consumers skip those.
+// Nothing is read back to the host, so the layer is capturable.
+__global__ void dsv4_boundary_meta_decode_kernel(
+    const std::int32_t* __restrict__ positions,
+    std::int32_t* __restrict__ out_pos,
+    std::int32_t* __restrict__ out_req,
+    std::int32_t* __restrict__ out_rope,
+    int n,
+    int ratio,
+    const std::uint8_t* __restrict__ row_valid) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= n) return;
+    const int p = positions[t];
+    // CUDA-graph padding rows must never emit a compressed entry.
+    const bool valid = (row_valid == nullptr) || (row_valid[t] != 0);
+    const bool is_boundary = valid && (((p + 1) % ratio) == 0);
+    out_pos[t] = is_boundary ? p : -1;
+    out_req[t] = t;                              // one token per request
+    out_rope[t] = is_boundary ? (p / ratio) * ratio : 0;
+}
+
 __global__ void dsv4_compress_gather_paged_kernel(
     const __nv_bfloat16* __restrict__ state_kv,
     const __nv_bfloat16* __restrict__ state_score,
@@ -550,6 +577,17 @@ __global__ void dsv4_compress_gather_paged_kernel(
     const int width = coff * head_dim;
     const int bpos = boundary_pos[c];
     const int req = boundary_req[c];
+    // `bpos < 0` marks a padding row: the CUDA-graph-safe decode path emits a
+    // fixed-length boundary list (one slot per token) instead of a host-
+    // compacted one, so slots for tokens that are not window boundaries have
+    // to fall through as zeros rather than shrink the launch.
+    if (bpos < 0) {
+        __nv_bfloat16* z = out + static_cast<long long>(c) * head_dim;
+        for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+            z[d] = __float2bfloat16(0.f);
+        }
+        return;
+    }
 
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
         float max_s = -INFINITY;
@@ -600,6 +638,7 @@ __global__ void dsv4_store_comp_entries_kernel(
     int head_dim,
     int page_size) {
     const int c = blockIdx.x;
+    if (boundary_pos[c] < 0) return;   // padding row (see gather kernel)
     const long long slot = paged_slot(kv_page_indices, kv_page_indptr,
                                       boundary_req[c], boundary_pos[c], page_size);
     const __nv_bfloat16* src = entries + static_cast<long long>(c) * head_dim;
@@ -741,6 +780,23 @@ void launch_dsv4_compress_gather_paged_bf16(
         ape, boundary_pos, boundary_req, kv_page_indices, kv_page_indptr,
         static_cast<__nv_bfloat16*>(out),
         head_dim, ratio, coff, page_size);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_dsv4_boundary_meta_decode(
+    const std::int32_t* positions,
+    std::int32_t* out_pos,
+    std::int32_t* out_req,
+    std::int32_t* out_rope,
+    int n,
+    int ratio,
+    cudaStream_t stream,
+    const std::uint8_t* row_valid) {
+    if (n <= 0 || ratio <= 0) return;
+    const int threads = 128;
+    const int blocks = (n + threads - 1) / threads;
+    dsv4_boundary_meta_decode_kernel<<<blocks, threads, 0, stream>>>(
+        positions, out_pos, out_req, out_rope, n, ratio, row_valid);
     CUDA_CHECK(cudaGetLastError());
 }
 

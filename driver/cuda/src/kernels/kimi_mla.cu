@@ -62,12 +62,11 @@ __global__ void split_kv_a_norm_kernel(
     const __nv_bfloat16* __restrict__ norm_weight,
     __nv_bfloat16* __restrict__ kv_c,
     __nv_bfloat16* __restrict__ k_pe,
-    int kv_lora, int rope, float eps)
+    int kv_lora, int rope, int src_row_stride, float eps)
 {
     const int n = blockIdx.x;
     const int tid = threadIdx.x;
-    const int per = kv_lora + rope;
-    const __nv_bfloat16* row = kv_a + static_cast<long long>(n) * per;
+    const __nv_bfloat16* row = kv_a + static_cast<long long>(n) * src_row_stride;
 
     // Copy k_pe (no normalization)
     for (int d = tid; d < rope; d += BLOCK_DIM) {
@@ -193,16 +192,19 @@ void launch_kimi_split_kv_a_norm_bf16(
     int kv_lora_rank,
     int qk_rope_dim,
     float eps,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    int src_row_stride)
 {
     if (tokens <= 0) return;
     constexpr int BS = 256;
+    const int stride =
+        src_row_stride > 0 ? src_row_stride : kv_lora_rank + qk_rope_dim;
     split_kv_a_norm_kernel<BS><<<tokens, BS, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(kv_a),
         static_cast<const __nv_bfloat16*>(norm_weight),
         static_cast<__nv_bfloat16*>(kv_c),
         static_cast<__nv_bfloat16*>(k_pe),
-        kv_lora_rank, qk_rope_dim, eps);
+        kv_lora_rank, qk_rope_dim, stride, eps);
 }
 
 void launch_topk_sigmoid_bf16(

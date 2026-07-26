@@ -55,7 +55,7 @@ pub mod audio;
 pub mod http;
 pub mod mask;
 /// The author-facing PTIR bridge (overview §3/§5): `ForwardPass`/`Pipeline`/
-/// `WorkingSet`/`Channel` over the WIT `ptir` resources, driving the `ptir-dsl`
+/// `WorkingSet`/`Channel` over the WIT `ptir` resources, driving the `pie-dsl`
 /// trace `Builder`. The single home of the PTIR authoring surface.
 pub mod ptir;
 
@@ -96,8 +96,8 @@ pub use tools::Tool;
 /// around — call `model::encode`, `model::name`, etc. directly.
 pub mod model {
     pub use crate::pie::inferlet::model::{
-        architecture, arena_block_size, default_system_speculation, frame_size, is_linear,
-        kv_page_size, max_embed_length, name, output_vocab_size, rs_buffer_page_size,
+        architecture, arena_block_size, channel_capacity, default_system_speculation, frame_size,
+        is_linear, kv_page_size, max_embed_length, name, output_vocab_size, rs_buffer_page_size,
         rs_fold_granularity, rs_state_size,
     };
     // Tokenizer functions split into the `tokenizer` interface (§2.2); re-exported

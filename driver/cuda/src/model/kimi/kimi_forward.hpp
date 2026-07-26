@@ -23,6 +23,11 @@ struct KimiWorkspace {
     DeviceTensor y;                 // [N, H]
     DeviceTensor norm_x;            // [N, H]
     DeviceTensor q_a;               // [N, q_lora_rank]
+    // [N, q_lora_rank + kv_lora_rank + qk_rope], the landing buffer for the
+    // fused q_a + kv_a projection. The GEMM is row-major, so each token's row
+    // holds its q half followed by its kv half; the two consumers read their
+    // half in place with a row pitch rather than the halves being split out.
+    DeviceTensor qkv_a;
     DeviceTensor q_b;               // [N, local_heads*(qk_nope+qk_rope)]
     DeviceTensor q_nope;            // [N, local_heads*qk_nope]
     DeviceTensor kv_a_mqa;          // [N, kv_lora_rank+qk_rope]
@@ -49,6 +54,10 @@ struct KimiWorkspace {
     DeviceTensor expert_up;         // [N*top_k, routed_I]
     DeviceTensor expert_out;        // [N*top_k, H]
     DeviceTensor moe_out;           // [N, H]
+    // fp16 staging for the W4A16 decode GEMVs, whose inner loop is pure
+    // `__hfma2` and so wants its activation already in fp16.
+    DeviceTensor norm_y_fp16;       // [N, H]
+    DeviceTensor expert_act_fp16;   // [N*top_k, routed_I]
     // Device-side aligned MoE scratch (batched-GEMM path).
     DeviceTensor aligned_route_ids;
     DeviceTensor aligned_expert_ids;
@@ -64,6 +73,12 @@ struct KimiWorkspace {
     DeviceTensor c_dn_ptrs;
     int aligned_block_size = 0;
     int aligned_max_blocks = 0;
+    // flashinfer CUTLASS fused-MoE scratch. The runner permutes, runs both
+    // grouped GEMMs, applies SwiGLU and finalises the top-k weighted sum in one
+    // call, replacing the whole gather/batched-GEMM/scatter chain above.
+    DeviceTensor cutlass_ws;        // opaque runner workspace (uint8)
+    DeviceTensor cutlass_row_map;   // [cutlass_max_rows * top_k] int32
+    int cutlass_max_rows = 0;
     DeviceTensor shared_gate;       // [N, shared_I]
     DeviceTensor shared_up;         // [N, shared_I]
     DeviceTensor shared_act;        // [N, shared_I]

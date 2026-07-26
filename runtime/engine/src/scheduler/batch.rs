@@ -102,7 +102,6 @@ impl AdmissionLimits {
         }
         None
     }
-
 }
 
 pub(crate) fn build_batch_request(
@@ -309,17 +308,14 @@ pub(crate) fn build_frame_submission(
         }
         let build = build_batch_request(&group, page_size, stats);
         let mut roster_rows: Vec<u32> = Vec::with_capacity(build.instance_ids.len());
-        for (member_index, (member, req)) in
-            build.instance_ids.iter().zip(&group).enumerate()
-        {
+        for (member_index, (member, req)) in build.instance_ids.iter().zip(&group).enumerate() {
             let row = *roster_index.entry(*member).or_insert_with(|| {
                 roster.push(*member);
                 lane_translation.push(Vec::new());
                 (roster.len() - 1) as u32
             });
             roster_rows.push(row);
-            let segment = &build.kv_translation[build.kv_translation_indptr[member_index]
-                as usize
+            let segment = &build.kv_translation[build.kv_translation_indptr[member_index] as usize
                 ..build.kv_translation_indptr[member_index + 1] as usize];
             if !segment.is_empty() {
                 lane_translation[row as usize] = segment.to_vec();

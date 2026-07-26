@@ -16,6 +16,7 @@ pub mod channel;
 pub mod command;
 pub mod completion;
 pub mod instance;
+pub mod launch_abi;
 pub mod submission;
 
 pub use pie_waker as waker;

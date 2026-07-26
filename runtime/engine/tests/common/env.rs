@@ -39,6 +39,7 @@ fn dummy_driver_backend(
     num_pages: usize,
     behavior: Arc<dyn Behavior>,
     operation_log: Arc<std::sync::Mutex<Vec<String>>>,
+    callback_delay_ms: u64,
 ) -> DriverBackend {
     let (backend, _) = DriverBackend::dummy(pie_driver_dummy_lib::DummyDriverOptions {
         total_pages: num_pages as u32,
@@ -56,7 +57,7 @@ fn dummy_driver_backend(
         has_mtp_drafts: true,
         has_value_head: true,
         has_attn_score: true,
-        callback_delay_ms: 0,
+        callback_delay_ms,
         reject_launches: false,
         reject_launches_remaining: 0,
         fail_launches_after_accept: false,
@@ -78,6 +79,17 @@ pub struct MockEnv {
     num_pages: usize,
     behavior: Arc<dyn Behavior>,
     temp_cache: TempDir,
+    /// Recurrent-state pool the model reports (`rs_cache_slots` /
+    /// `rs_cache_slot_bytes`). Zero — the default — makes the mock a
+    /// pure-attention model; non-zero makes `model.is-linear()` true and
+    /// gives the engine an `RsStore` to bind, which is what the GDN/linear
+    /// inferlets need.
+    rs_slots: usize,
+    rs_slot_bytes: u64,
+    /// Simulated device latency: the dummy driver notifies each launch's
+    /// completion from its own worker thread after this delay, so concurrent
+    /// launches overlap exactly as far as the engine lets them run ahead.
+    callback_delay_ms: u64,
     /// Dummy-driver operation log (shared across every device driver): op
     /// names plus `launch-shape tokens=N programs=P per=[..]` entries (batch
     /// totals plus per-program token spans) for geometry
@@ -86,6 +98,23 @@ pub struct MockEnv {
 }
 
 impl MockEnv {
+    /// Report a recurrent-state pool, turning the mock into a linear/hybrid
+    /// model. Must be called before [`MockEnv::config`].
+    #[allow(dead_code)]
+    pub fn with_recurrent_state(mut self, slots: usize, slot_bytes: u64) -> Self {
+        self.rs_slots = slots;
+        self.rs_slot_bytes = slot_bytes;
+        self
+    }
+
+    /// Stand in for device execution time. Must be called before
+    /// [`MockEnv::config`].
+    #[allow(dead_code)]
+    pub fn with_callback_delay_ms(mut self, delay: u64) -> Self {
+        self.callback_delay_ms = delay;
+        self
+    }
+
     /// Snapshot of the dummy-driver operation log.
     #[allow(dead_code)]
     pub fn operations(&self) -> Vec<String> {
@@ -106,8 +135,8 @@ impl MockEnv {
                     | pie_driver_abi::KV_COPY_HOST_TO_HOST,
                 backend_kind: "dummy".to_string(),
                 rs_cache_required: false,
-                rs_cache_slots: 0,
-                rs_cache_slot_bytes: 0,
+                rs_cache_slots: self.rs_slots,
+                rs_cache_slot_bytes: self.rs_slot_bytes,
                 elastic_page_bytes: 0,
                 elastic_budget_pages: 0,
                 has_mtp_logits: true,
@@ -126,6 +155,7 @@ impl MockEnv {
                     self.num_pages,
                     self.behavior.clone(),
                     Arc::clone(&self.operation_log),
+                    self.callback_delay_ms,
                 ),
             })
             .collect();
@@ -191,6 +221,9 @@ pub fn create_mock_env(
         num_pages,
         behavior,
         temp_cache: TempDir::new().expect("Failed to create temp cache dir"),
+        rs_slots: 0,
+        rs_slot_bytes: 0,
+        callback_delay_ms: 0,
         operation_log,
     }
 }

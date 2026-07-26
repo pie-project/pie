@@ -1,0 +1,4632 @@
+# oracle dump: pie::metal::pipeline::emit_singleton_region_msl
+# source of truth: compiler/codegen/src/metal/ (the C++ oracle this was dumped from is deleted)
+# emitter_version: 33
+# @runtime: bytes=39611 fnv1a64=0x310a2f7d72f22fd5
+# @grouped: bytes=970 fnv1a64=0xa8ab9e1ebf8714d9
+# cases: 256
+#   re-blessed again (emitter 27): `m1_reduce_argmax` no longer materializes one
+#   16-byte candidate per element into device `temporary` and tree-reduces it in
+#   passes -- `m1_argmax_combine` is a strict total order, so a fold gives the
+#   same answer -- and the bf16 logits intrinsic copies unrolled. Both loops run
+#   on the single thread that owns a lane, so at a 248320 vocab they were ~250ms
+#   per decode step against a ~4ms model forward. Only @runtime bytes moved.
+#   re-blessed again (emitter 29): a generated region now gets a threadgroup per
+#   lane instead of a thread, and the three things that walked a vocabulary-wide
+#   row -- the logits gather, argmax, and the typed copy behind a reshape -- are
+#   split across it. m1_copy_typed also moved from one device access per BYTE to
+#   one per word. Between them a decode step's GPU time went 89ms -> 6.5ms.
+#   re-blessed again (emitter 31): a same-footprint reshape is a view, so the
+#   grouped emitter elides its copy and points the consumers at the source
+#   value's offset. The runtime executed it as a byte-for-byte copy of the whole
+#   value, which in the sampler's graph was a vocabulary-wide round trip through
+#   device memory for nothing.
+# REGENERATED: the body below is this compiler's output, not the recorded output of the source of truth above
+#   reason: reshape elision now recognises a prefix view, so the sampler's vocabulary-wide reshape and its logits gather both fuse away
+=== tag_0x00
+function_name: ptir_m1_feedfacecafebeef_r0
+ok: true
+source: bytes=40187 prefix=@runtime tail_bytes=576
+kernel void ptir_m1_feedfacecafebeef_r0(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(0u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x01
+function_name: ptir_m1_feedfacecafebeef_r1
+ok: true
+source: bytes=40187 prefix=@runtime tail_bytes=576
+kernel void ptir_m1_feedfacecafebeef_r1(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(1u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x02
+function_name: ptir_m1_feedfacecafebeef_r2
+ok: true
+source: bytes=40187 prefix=@runtime tail_bytes=576
+kernel void ptir_m1_feedfacecafebeef_r2(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(2u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x03
+function_name: ptir_m1_feedfacecafebeef_r3
+ok: true
+source: bytes=40187 prefix=@runtime tail_bytes=576
+kernel void ptir_m1_feedfacecafebeef_r3(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(3u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x04
+function_name: ptir_m1_feedfacecafebeef_r4
+ok: true
+source: bytes=40187 prefix=@runtime tail_bytes=576
+kernel void ptir_m1_feedfacecafebeef_r4(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(4u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x05
+function_name: ptir_m1_feedfacecafebeef_r5
+ok: true
+source: bytes=40187 prefix=@runtime tail_bytes=576
+kernel void ptir_m1_feedfacecafebeef_r5(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(5u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x06
+function_name: ptir_m1_feedfacecafebeef_r6
+ok: true
+source: bytes=40187 prefix=@runtime tail_bytes=576
+kernel void ptir_m1_feedfacecafebeef_r6(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(6u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x07
+function_name: ptir_m1_feedfacecafebeef_r7
+ok: true
+source: bytes=40187 prefix=@runtime tail_bytes=576
+kernel void ptir_m1_feedfacecafebeef_r7(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(7u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x08
+function_name: ptir_m1_feedfacecafebeef_r8
+ok: true
+source: bytes=40187 prefix=@runtime tail_bytes=576
+kernel void ptir_m1_feedfacecafebeef_r8(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(8u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x09
+function_name: ptir_m1_feedfacecafebeef_r9
+ok: true
+source: bytes=40187 prefix=@runtime tail_bytes=576
+kernel void ptir_m1_feedfacecafebeef_r9(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(9u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x0a
+function_name: ptir_m1_feedfacecafebeef_r10
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r10(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(10u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x0b
+function_name: ptir_m1_feedfacecafebeef_r11
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r11(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(11u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x0c
+function_name: ptir_m1_feedfacecafebeef_r12
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r12(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(12u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x0d
+function_name: ptir_m1_feedfacecafebeef_r13
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r13(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(13u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x0e
+function_name: ptir_m1_feedfacecafebeef_r14
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r14(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(14u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x0f
+function_name: ptir_m1_feedfacecafebeef_r15
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r15(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(15u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x10
+function_name: ptir_m1_feedfacecafebeef_r16
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r16(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(16u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x11
+function_name: ptir_m1_feedfacecafebeef_r17
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r17(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(17u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x12
+function_name: ptir_m1_feedfacecafebeef_r18
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r18(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(18u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x13
+function_name: ptir_m1_feedfacecafebeef_r19
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r19(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(19u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x14
+function_name: ptir_m1_feedfacecafebeef_r20
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r20(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(20u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x15
+function_name: ptir_m1_feedfacecafebeef_r21
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r21(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(21u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x16
+function_name: ptir_m1_feedfacecafebeef_r22
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r22(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(22u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x17
+function_name: ptir_m1_feedfacecafebeef_r23
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r23(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(23u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x18
+function_name: ptir_m1_feedfacecafebeef_r24
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r24(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(24u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x19
+function_name: ptir_m1_feedfacecafebeef_r25
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r25(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(25u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x1a
+function_name: ptir_m1_feedfacecafebeef_r26
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r26(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(26u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x1b
+function_name: ptir_m1_feedfacecafebeef_r27
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r27(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(27u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x1c
+function_name: ptir_m1_feedfacecafebeef_r28
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r28(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(28u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x1d
+function_name: ptir_m1_feedfacecafebeef_r29
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r29(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(29u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x1e
+function_name: ptir_m1_feedfacecafebeef_r30
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r30(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(30u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x1f
+function_name: ptir_m1_feedfacecafebeef_r31
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r31(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(31u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x20
+function_name: ptir_m1_feedfacecafebeef_r32
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r32(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(32u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x21
+function_name: ptir_m1_feedfacecafebeef_r33
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r33(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(33u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x22
+function_name: ptir_m1_feedfacecafebeef_r34
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r34(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(34u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x23
+function_name: ptir_m1_feedfacecafebeef_r35
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r35(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(35u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x24
+function_name: ptir_m1_feedfacecafebeef_r36
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r36(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(36u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x25
+function_name: ptir_m1_feedfacecafebeef_r37
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r37(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(37u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x26
+function_name: ptir_m1_feedfacecafebeef_r38
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r38(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(38u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x27
+function_name: ptir_m1_feedfacecafebeef_r39
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r39(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(39u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x28
+function_name: ptir_m1_feedfacecafebeef_r40
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r40(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(40u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x29
+function_name: ptir_m1_feedfacecafebeef_r41
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r41(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(41u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x2a
+function_name: ptir_m1_feedfacecafebeef_r42
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r42(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(42u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x2b
+function_name: ptir_m1_feedfacecafebeef_r43
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r43(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(43u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x2c
+function_name: ptir_m1_feedfacecafebeef_r44
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r44(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(44u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x2d
+function_name: ptir_m1_feedfacecafebeef_r45
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r45(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(45u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x2e
+function_name: ptir_m1_feedfacecafebeef_r46
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r46(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(46u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x2f
+function_name: ptir_m1_feedfacecafebeef_r47
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r47(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(47u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x30
+function_name: ptir_m1_feedfacecafebeef_r48
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r48(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(48u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x31
+function_name: ptir_m1_feedfacecafebeef_r49
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r49(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(49u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x32
+function_name: ptir_m1_feedfacecafebeef_r50
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r50(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(50u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x33
+function_name: ptir_m1_feedfacecafebeef_r51
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r51(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(51u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x34
+function_name: ptir_m1_feedfacecafebeef_r52
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r52(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(52u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x35
+function_name: ptir_m1_feedfacecafebeef_r53
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r53(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(53u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x36
+function_name: ptir_m1_feedfacecafebeef_r54
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r54(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(54u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x37
+function_name: ptir_m1_feedfacecafebeef_r55
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r55(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(55u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x38
+function_name: ptir_m1_feedfacecafebeef_r56
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r56(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(56u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x39
+function_name: ptir_m1_feedfacecafebeef_r57
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r57(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(57u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x3a
+function_name: ptir_m1_feedfacecafebeef_r58
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r58(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(58u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x3b
+function_name: ptir_m1_feedfacecafebeef_r59
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r59(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(59u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x3c
+function_name: ptir_m1_feedfacecafebeef_r60
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r60(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(60u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x3d
+function_name: ptir_m1_feedfacecafebeef_r61
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r61(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(61u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x3e
+function_name: ptir_m1_feedfacecafebeef_r62
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r62(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(62u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x3f
+function_name: ptir_m1_feedfacecafebeef_r63
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r63(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(63u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x40
+function_name: ptir_m1_feedfacecafebeef_r64
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r64(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(64u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x41
+function_name: ptir_m1_feedfacecafebeef_r65
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r65(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(65u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x42
+function_name: ptir_m1_feedfacecafebeef_r66
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r66(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(66u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x43
+function_name: ptir_m1_feedfacecafebeef_r67
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r67(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(67u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x44
+function_name: ptir_m1_feedfacecafebeef_r68
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r68(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(68u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x45
+function_name: ptir_m1_feedfacecafebeef_r69
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r69(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(69u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x46
+function_name: ptir_m1_feedfacecafebeef_r70
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r70(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(70u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x47
+function_name: ptir_m1_feedfacecafebeef_r71
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r71(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(71u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x48
+function_name: ptir_m1_feedfacecafebeef_r72
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r72(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(72u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x49
+function_name: ptir_m1_feedfacecafebeef_r73
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r73(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(73u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x4a
+function_name: ptir_m1_feedfacecafebeef_r74
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r74(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(74u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x4b
+function_name: ptir_m1_feedfacecafebeef_r75
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r75(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(75u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x4c
+function_name: ptir_m1_feedfacecafebeef_r76
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r76(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(76u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x4d
+function_name: ptir_m1_feedfacecafebeef_r77
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r77(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(77u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x4e
+function_name: ptir_m1_feedfacecafebeef_r78
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r78(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(78u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x4f
+function_name: ptir_m1_feedfacecafebeef_r79
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r79(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(79u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x50
+function_name: ptir_m1_feedfacecafebeef_r80
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r80(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(80u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x51
+function_name: ptir_m1_feedfacecafebeef_r81
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r81(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(81u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x52
+function_name: ptir_m1_feedfacecafebeef_r82
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r82(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(82u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x53
+function_name: ptir_m1_feedfacecafebeef_r83
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r83(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(83u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x54
+function_name: ptir_m1_feedfacecafebeef_r84
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r84(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(84u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x55
+function_name: ptir_m1_feedfacecafebeef_r85
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r85(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(85u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x56
+function_name: ptir_m1_feedfacecafebeef_r86
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r86(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(86u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x57
+function_name: ptir_m1_feedfacecafebeef_r87
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r87(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(87u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x58
+function_name: ptir_m1_feedfacecafebeef_r88
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r88(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(88u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x59
+function_name: ptir_m1_feedfacecafebeef_r89
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r89(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(89u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x5a
+function_name: ptir_m1_feedfacecafebeef_r90
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r90(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(90u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x5b
+function_name: ptir_m1_feedfacecafebeef_r91
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r91(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(91u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x5c
+function_name: ptir_m1_feedfacecafebeef_r92
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r92(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(92u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x5d
+function_name: ptir_m1_feedfacecafebeef_r93
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r93(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(93u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x5e
+function_name: ptir_m1_feedfacecafebeef_r94
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r94(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(94u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x5f
+function_name: ptir_m1_feedfacecafebeef_r95
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r95(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(95u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x60
+function_name: ptir_m1_feedfacecafebeef_r96
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r96(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(96u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x61
+function_name: ptir_m1_feedfacecafebeef_r97
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r97(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(97u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x62
+function_name: ptir_m1_feedfacecafebeef_r98
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r98(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(98u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x63
+function_name: ptir_m1_feedfacecafebeef_r99
+ok: true
+source: bytes=40189 prefix=@runtime tail_bytes=578
+kernel void ptir_m1_feedfacecafebeef_r99(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(99u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x64
+function_name: ptir_m1_feedfacecafebeef_r100
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r100(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(100u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x65
+function_name: ptir_m1_feedfacecafebeef_r101
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r101(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(101u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x66
+function_name: ptir_m1_feedfacecafebeef_r102
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r102(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(102u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x67
+function_name: ptir_m1_feedfacecafebeef_r103
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r103(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(103u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x68
+function_name: ptir_m1_feedfacecafebeef_r104
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r104(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(104u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x69
+function_name: ptir_m1_feedfacecafebeef_r105
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r105(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(105u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x6a
+function_name: ptir_m1_feedfacecafebeef_r106
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r106(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(106u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x6b
+function_name: ptir_m1_feedfacecafebeef_r107
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r107(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(107u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x6c
+function_name: ptir_m1_feedfacecafebeef_r108
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r108(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(108u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x6d
+function_name: ptir_m1_feedfacecafebeef_r109
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r109(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(109u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x6e
+function_name: ptir_m1_feedfacecafebeef_r110
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r110(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(110u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x6f
+function_name: ptir_m1_feedfacecafebeef_r111
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r111(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(111u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x70
+function_name: ptir_m1_feedfacecafebeef_r112
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r112(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(112u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x71
+function_name: ptir_m1_feedfacecafebeef_r113
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r113(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(113u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x72
+function_name: ptir_m1_feedfacecafebeef_r114
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r114(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(114u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x73
+function_name: ptir_m1_feedfacecafebeef_r115
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r115(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(115u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x74
+function_name: ptir_m1_feedfacecafebeef_r116
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r116(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(116u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x75
+function_name: ptir_m1_feedfacecafebeef_r117
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r117(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(117u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x76
+function_name: ptir_m1_feedfacecafebeef_r118
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r118(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(118u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x77
+function_name: ptir_m1_feedfacecafebeef_r119
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r119(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(119u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x78
+function_name: ptir_m1_feedfacecafebeef_r120
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r120(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(120u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x79
+function_name: ptir_m1_feedfacecafebeef_r121
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r121(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(121u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x7a
+function_name: ptir_m1_feedfacecafebeef_r122
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r122(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(122u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x7b
+function_name: ptir_m1_feedfacecafebeef_r123
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r123(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(123u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x7c
+function_name: ptir_m1_feedfacecafebeef_r124
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r124(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(124u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x7d
+function_name: ptir_m1_feedfacecafebeef_r125
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r125(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(125u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x7e
+function_name: ptir_m1_feedfacecafebeef_r126
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r126(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(126u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x7f
+function_name: ptir_m1_feedfacecafebeef_r127
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r127(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(127u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x80
+function_name: ptir_m1_feedfacecafebeef_r128
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r128(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(128u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x81
+function_name: ptir_m1_feedfacecafebeef_r129
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r129(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(129u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x82
+function_name: ptir_m1_feedfacecafebeef_r130
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r130(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(130u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x83
+function_name: ptir_m1_feedfacecafebeef_r131
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r131(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(131u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x84
+function_name: ptir_m1_feedfacecafebeef_r132
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r132(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(132u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x85
+function_name: ptir_m1_feedfacecafebeef_r133
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r133(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(133u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x86
+function_name: ptir_m1_feedfacecafebeef_r134
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r134(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(134u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x87
+function_name: ptir_m1_feedfacecafebeef_r135
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r135(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(135u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x88
+function_name: ptir_m1_feedfacecafebeef_r136
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r136(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(136u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x89
+function_name: ptir_m1_feedfacecafebeef_r137
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r137(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(137u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x8a
+function_name: ptir_m1_feedfacecafebeef_r138
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r138(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(138u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x8b
+function_name: ptir_m1_feedfacecafebeef_r139
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r139(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(139u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x8c
+function_name: ptir_m1_feedfacecafebeef_r140
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r140(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(140u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x8d
+function_name: ptir_m1_feedfacecafebeef_r141
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r141(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(141u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x8e
+function_name: ptir_m1_feedfacecafebeef_r142
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r142(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(142u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x8f
+function_name: ptir_m1_feedfacecafebeef_r143
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r143(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(143u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x90
+function_name: ptir_m1_feedfacecafebeef_r144
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r144(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(144u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x91
+function_name: ptir_m1_feedfacecafebeef_r145
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r145(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(145u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x92
+function_name: ptir_m1_feedfacecafebeef_r146
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r146(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(146u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x93
+function_name: ptir_m1_feedfacecafebeef_r147
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r147(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(147u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x94
+function_name: ptir_m1_feedfacecafebeef_r148
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r148(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(148u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x95
+function_name: ptir_m1_feedfacecafebeef_r149
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r149(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(149u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x96
+function_name: ptir_m1_feedfacecafebeef_r150
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r150(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(150u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x97
+function_name: ptir_m1_feedfacecafebeef_r151
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r151(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(151u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x98
+function_name: ptir_m1_feedfacecafebeef_r152
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r152(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(152u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x99
+function_name: ptir_m1_feedfacecafebeef_r153
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r153(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(153u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x9a
+function_name: ptir_m1_feedfacecafebeef_r154
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r154(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(154u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x9b
+function_name: ptir_m1_feedfacecafebeef_r155
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r155(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(155u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x9c
+function_name: ptir_m1_feedfacecafebeef_r156
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r156(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(156u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x9d
+function_name: ptir_m1_feedfacecafebeef_r157
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r157(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(157u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x9e
+function_name: ptir_m1_feedfacecafebeef_r158
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r158(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(158u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0x9f
+function_name: ptir_m1_feedfacecafebeef_r159
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r159(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(159u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xa0
+function_name: ptir_m1_feedfacecafebeef_r160
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r160(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(160u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xa1
+function_name: ptir_m1_feedfacecafebeef_r161
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r161(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(161u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xa2
+function_name: ptir_m1_feedfacecafebeef_r162
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r162(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(162u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xa3
+function_name: ptir_m1_feedfacecafebeef_r163
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r163(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(163u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xa4
+function_name: ptir_m1_feedfacecafebeef_r164
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r164(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(164u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xa5
+function_name: ptir_m1_feedfacecafebeef_r165
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r165(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(165u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xa6
+function_name: ptir_m1_feedfacecafebeef_r166
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r166(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(166u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xa7
+function_name: ptir_m1_feedfacecafebeef_r167
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r167(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(167u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xa8
+function_name: ptir_m1_feedfacecafebeef_r168
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r168(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(168u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xa9
+function_name: ptir_m1_feedfacecafebeef_r169
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r169(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(169u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xaa
+function_name: ptir_m1_feedfacecafebeef_r170
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r170(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(170u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xab
+function_name: ptir_m1_feedfacecafebeef_r171
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r171(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(171u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xac
+function_name: ptir_m1_feedfacecafebeef_r172
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r172(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(172u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xad
+function_name: ptir_m1_feedfacecafebeef_r173
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r173(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(173u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xae
+function_name: ptir_m1_feedfacecafebeef_r174
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r174(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(174u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xaf
+function_name: ptir_m1_feedfacecafebeef_r175
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r175(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(175u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xb0
+function_name: ptir_m1_feedfacecafebeef_r176
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r176(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(176u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xb1
+function_name: ptir_m1_feedfacecafebeef_r177
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r177(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(177u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xb2
+function_name: ptir_m1_feedfacecafebeef_r178
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r178(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(178u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xb3
+function_name: ptir_m1_feedfacecafebeef_r179
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r179(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(179u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xb4
+function_name: ptir_m1_feedfacecafebeef_r180
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r180(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(180u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xb5
+function_name: ptir_m1_feedfacecafebeef_r181
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r181(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(181u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xb6
+function_name: ptir_m1_feedfacecafebeef_r182
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r182(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(182u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xb7
+function_name: ptir_m1_feedfacecafebeef_r183
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r183(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(183u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xb8
+function_name: ptir_m1_feedfacecafebeef_r184
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r184(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(184u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xb9
+function_name: ptir_m1_feedfacecafebeef_r185
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r185(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(185u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xba
+function_name: ptir_m1_feedfacecafebeef_r186
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r186(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(186u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xbb
+function_name: ptir_m1_feedfacecafebeef_r187
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r187(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(187u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xbc
+function_name: ptir_m1_feedfacecafebeef_r188
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r188(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(188u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xbd
+function_name: ptir_m1_feedfacecafebeef_r189
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r189(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(189u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xbe
+function_name: ptir_m1_feedfacecafebeef_r190
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r190(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(190u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xbf
+function_name: ptir_m1_feedfacecafebeef_r191
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r191(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(191u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xc0
+function_name: ptir_m1_feedfacecafebeef_r192
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r192(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(192u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xc1
+function_name: ptir_m1_feedfacecafebeef_r193
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r193(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(193u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xc2
+function_name: ptir_m1_feedfacecafebeef_r194
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r194(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(194u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xc3
+function_name: ptir_m1_feedfacecafebeef_r195
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r195(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(195u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xc4
+function_name: ptir_m1_feedfacecafebeef_r196
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r196(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(196u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xc5
+function_name: ptir_m1_feedfacecafebeef_r197
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r197(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(197u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xc6
+function_name: ptir_m1_feedfacecafebeef_r198
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r198(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(198u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xc7
+function_name: ptir_m1_feedfacecafebeef_r199
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r199(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(199u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xc8
+function_name: ptir_m1_feedfacecafebeef_r200
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r200(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(200u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xc9
+function_name: ptir_m1_feedfacecafebeef_r201
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r201(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(201u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xca
+function_name: ptir_m1_feedfacecafebeef_r202
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r202(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(202u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xcb
+function_name: ptir_m1_feedfacecafebeef_r203
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r203(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(203u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xcc
+function_name: ptir_m1_feedfacecafebeef_r204
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r204(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(204u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xcd
+function_name: ptir_m1_feedfacecafebeef_r205
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r205(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(205u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xce
+function_name: ptir_m1_feedfacecafebeef_r206
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r206(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(206u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xcf
+function_name: ptir_m1_feedfacecafebeef_r207
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r207(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(207u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xd0
+function_name: ptir_m1_feedfacecafebeef_r208
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r208(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(208u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xd1
+function_name: ptir_m1_feedfacecafebeef_r209
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r209(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(209u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xd2
+function_name: ptir_m1_feedfacecafebeef_r210
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r210(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(210u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xd3
+function_name: ptir_m1_feedfacecafebeef_r211
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r211(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(211u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xd4
+function_name: ptir_m1_feedfacecafebeef_r212
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r212(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(212u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xd5
+function_name: ptir_m1_feedfacecafebeef_r213
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r213(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(213u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xd6
+function_name: ptir_m1_feedfacecafebeef_r214
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r214(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(214u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xd7
+function_name: ptir_m1_feedfacecafebeef_r215
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r215(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(215u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xd8
+function_name: ptir_m1_feedfacecafebeef_r216
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r216(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(216u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xd9
+function_name: ptir_m1_feedfacecafebeef_r217
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r217(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(217u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xda
+function_name: ptir_m1_feedfacecafebeef_r218
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r218(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(218u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xdb
+function_name: ptir_m1_feedfacecafebeef_r219
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r219(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(219u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xdc
+function_name: ptir_m1_feedfacecafebeef_r220
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r220(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(220u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xdd
+function_name: ptir_m1_feedfacecafebeef_r221
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r221(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(221u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xde
+function_name: ptir_m1_feedfacecafebeef_r222
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r222(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(222u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xdf
+function_name: ptir_m1_feedfacecafebeef_r223
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r223(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(223u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xe0
+function_name: ptir_m1_feedfacecafebeef_r224
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r224(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(224u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xe1
+function_name: ptir_m1_feedfacecafebeef_r225
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r225(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(225u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xe2
+function_name: ptir_m1_feedfacecafebeef_r226
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r226(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(226u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xe3
+function_name: ptir_m1_feedfacecafebeef_r227
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r227(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(227u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xe4
+function_name: ptir_m1_feedfacecafebeef_r228
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r228(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(228u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xe5
+function_name: ptir_m1_feedfacecafebeef_r229
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r229(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(229u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xe6
+function_name: ptir_m1_feedfacecafebeef_r230
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r230(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(230u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xe7
+function_name: ptir_m1_feedfacecafebeef_r231
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r231(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(231u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xe8
+function_name: ptir_m1_feedfacecafebeef_r232
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r232(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(232u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xe9
+function_name: ptir_m1_feedfacecafebeef_r233
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r233(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(233u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xea
+function_name: ptir_m1_feedfacecafebeef_r234
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r234(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(234u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xeb
+function_name: ptir_m1_feedfacecafebeef_r235
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r235(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(235u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xec
+function_name: ptir_m1_feedfacecafebeef_r236
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r236(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(236u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xed
+function_name: ptir_m1_feedfacecafebeef_r237
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r237(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(237u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xee
+function_name: ptir_m1_feedfacecafebeef_r238
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r238(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(238u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xef
+function_name: ptir_m1_feedfacecafebeef_r239
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r239(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(239u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xf0
+function_name: ptir_m1_feedfacecafebeef_r240
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r240(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(240u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xf1
+function_name: ptir_m1_feedfacecafebeef_r241
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r241(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(241u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xf2
+function_name: ptir_m1_feedfacecafebeef_r242
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r242(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(242u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xf3
+function_name: ptir_m1_feedfacecafebeef_r243
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r243(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(243u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xf4
+function_name: ptir_m1_feedfacecafebeef_r244
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r244(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(244u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xf5
+function_name: ptir_m1_feedfacecafebeef_r245
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r245(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(245u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xf6
+function_name: ptir_m1_feedfacecafebeef_r246
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r246(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(246u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xf7
+function_name: ptir_m1_feedfacecafebeef_r247
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r247(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(247u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xf8
+function_name: ptir_m1_feedfacecafebeef_r248
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r248(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(248u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xf9
+function_name: ptir_m1_feedfacecafebeef_r249
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r249(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(249u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xfa
+function_name: ptir_m1_feedfacecafebeef_r250
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r250(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(250u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xfb
+function_name: ptir_m1_feedfacecafebeef_r251
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r251(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(251u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xfc
+function_name: ptir_m1_feedfacecafebeef_r252
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r252(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(252u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xfd
+function_name: ptir_m1_feedfacecafebeef_r253
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r253(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(253u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xfe
+function_name: ptir_m1_feedfacecafebeef_r254
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r254(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(254u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end
+=== tag_0xff
+function_name: ptir_m1_feedfacecafebeef_r255
+ok: true
+source: bytes=40191 prefix=@runtime tail_bytes=580
+kernel void ptir_m1_feedfacecafebeef_r255(
+    device M1Status* status [[buffer(0)]],
+    const device M1ValueDesc* descriptors [[buffer(1)]],
+    const device uchar* a0 [[buffer(2)]],
+    const device uchar* a1 [[buffer(3)]],
+    const device uchar* a2 [[buffer(4)]],
+    device uchar* o0 [[buffer(5)]],
+    device uchar* o1 [[buffer(6)]],
+    device uchar* temporary [[buffer(7)]],
+    const device M1OpParams* params [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid == 0) ptir_m1_execute(255u, status, descriptors, params, a0, a1, a2, o0, o1, temporary);
+}
+=== end

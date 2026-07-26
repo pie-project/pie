@@ -33,7 +33,7 @@
 #include <vector>
 
 #include "loader/load_plan.hpp"
-#include "pie_native/ptir/fire_geometry.hpp"
+#include "pie_native/fire/fire_geometry.hpp"
 
 namespace pie::metal {
 
@@ -100,7 +100,7 @@ struct MemberForwardDesc {
     bool has_attention_mask = false;
     std::uint32_t attention_mask_stride = 0;
     std::vector<std::uint8_t> attention_mask;
-    pie_native::ptir::StructuredMaskDescriptor structured_mask;
+    pie_native::launch::StructuredMaskDescriptor structured_mask;
 
     // Local indices into `token_ids` (NOT global) whose logits must be
     // materialized — the fire's `sampling_indices` slice, member-relative
@@ -164,7 +164,23 @@ bool validate_request_local_positions(
 // idle memory.  The paged command path uses these four slots concurrently;
 // caps report exactly this value — never a larger, aspirational one — via
 // `MetalExecutor::rs_slots()`.
-inline constexpr std::uint32_t kPhase1bRsSlots = 4;
+// Tokens the resident KV/GDN ring holds, across the WHOLE fleet -- it is one
+// linear ring, not a per-request allocation, so sixteen concurrent requests
+// share it. At 4096 that ceiling was reached by sixteen requests generating
+// ~230 tokens each, and the planner failed them all with `NoSwapRoom`; a
+// concurrent fleet could not run a normal-length generation at all.
+//
+// The KV region is `n_full_attn * 2 * n_kv_heads * max_ctx * head_dim * 2B`,
+// which is ~100MB for this checkpoint at 4096 and ~800MB at 32768 -- worth it
+// against a 405MB weight set on a machine with tens of GB, and it buys sixteen
+// requests 2048 tokens each.
+//
+// ADVERTISED and ENFORCED from here: `context.cpp` builds the capabilities page
+// count from this and `validate_fire_geometry` bounds page ids by the same
+// number, so the two can never drift (they were separate 4096 literals).
+inline constexpr std::uint32_t kMetalMaxCtxTokens = 32768;
+
+inline constexpr std::uint32_t kPhase1bRsSlots = 16;
 inline constexpr std::uint32_t kPagedMaxForwardRequests = kPhase1bRsSlots;
 // Paged prompts run one correct N=1 GDN recurrence DAG per token inside one
 // command buffer.  This bounds IO/scratch/logits allocation independently of
@@ -190,16 +206,15 @@ struct SetupConfig {
     // itself, because only the driver knows the device
     // (`loader/architecture.md` §3).
     std::string snapshot_dir;
-    std::string runtime_quant;
-    // The model facts the loader's storage compile keys off; the driver states
-    // them so the loader never opens `config.json` (§10.4).
+    // Which storage schema to author against. It selects a contract on this
+    // side of the loader call and never crosses it (§10.4).
     std::string model_type;
-    std::string quant_method;
-    std::uint32_t num_hidden_layers = 0;
-    std::uint32_t num_experts = 0;
-    std::uint32_t num_experts_per_tok = 0;
-    pie_driver::Mxfp4MoeRequest mxfp4_moe =
-        pie_driver::Mxfp4MoeRequest::Auto;
+    // `config.json`'s RoPE hyperparameters, read out of the nested
+    // `rope_parameters` object this family uses (context.cpp). The defaults
+    // below are Qwen3.5's, so a checkpoint that omits them still lands on the
+    // values the reference implementation applies.
+    float rope_theta = 1.0e7f;
+    float partial_rotary_factor = 0.25f;
     std::uint32_t storage_page_size = 1;
 };
 

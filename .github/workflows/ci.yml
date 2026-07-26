@@ -1,5 +1,13 @@
 name: CI
 
+# Toolchain note: the `dtolnay/rust-toolchain@<rev>` steps below only decide
+# what the action downloads. `rust-toolchain.toml` at the repo root is what
+# cargo actually resolves to (1.97.1), and rustup auto-installs it — with the
+# components and targets that file declares — on the first cargo invocation.
+# The one exception is `schema-header-drift`, which needs a different compiler
+# for deterministic cbindgen output and gets it by setting `RUSTUP_TOOLCHAIN`,
+# which outranks the toolchain file.
+
 on:
   push:
     branches: [main]
@@ -42,6 +50,42 @@ jobs:
         run: |
           cargo test -p pie --lib
           cargo test -p pie-client --lib
+
+      # `pie-ir` and `pie-plan` declare `#![no_std]` behind `not(feature =
+      # "std")` and the wasm SDK depends on them that way, but nothing ever
+      # built that configuration -- the `std` prelude was covering a missing
+      # `alloc::string::String` import, so `--no-default-features` had been
+      # broken without failing anything. A declared `no_std` that is never
+      # compiled is not a `no_std` crate.
+      - name: cargo check (compiler IR core, no_std)
+        run: |
+          cargo check -p pie-ir --no-default-features
+          cargo check -p pie-plan --no-default-features
+
+      # The compiler crates are at zero clippy warnings, so they are the only
+      # part of the workspace that can be gated. The rest still carries ~240
+      # warnings (167 in runtime/engine alone); widen the `-p` list as crates
+      # are cleaned rather than switching this to `--workspace` and reaching
+      # for `-A` to hold it up.
+      #
+      # `--no-deps` matters: cargo drives clippy through
+      # RUSTC_WORKSPACE_WRAPPER, which lints every *path* dependency that gets
+      # built, not just the selected packages. Without it this step fails on
+      # pie-driver-abi's 13 warnings, which are not the compiler's to fix.
+      - name: cargo clippy (compiler crates, deny warnings)
+        run: |
+          cargo clippy --no-deps --all-targets \
+            -p pie-ir -p pie-plan -p pie-eval \
+            -p pie-codegen -p pie-dsl -p pie-compiler-tests \
+            -- -D warnings
+
+      # Same scope, same reason: these six crates are rustfmt-clean, the rest
+      # of the workspace is not.
+      - name: cargo fmt (compiler crates)
+        run: |
+          cargo fmt --check \
+            -p pie-ir -p pie-plan -p pie-eval \
+            -p pie-codegen -p pie-dsl -p pie-compiler-tests
 
   # Full-workspace verification — the guardrail + anti-bitrot net. Closes the
   # gap that let the runtime benches rot unseen: the dedicated jobs only build a
@@ -235,8 +279,21 @@ jobs:
       - name: cargo build (driver-metal)
         run: cargo build -p pie-worker --no-default-features --features driver-metal
 
+      # `src/batch/forward.cpp` compiles a LoadPlan, so every Metal target that
+      # links the archive into an executable needs `pie-loader` as a staticlib
+      # (the rlib the worker links is not linkable from C++). Without this the
+      # cmake steps below silently skip the loader-reaching targets — including
+      # the two that cover the loader surface — and the Metal driver's only real
+      # check would be that its archive compiles. Built before `cargo test` so a
+      # test failure cannot hide the cmake+link coverage behind it.
+      - name: Build the loader staticlib
+        run: cargo rustc -p pie-loader --lib --crate-type staticlib
+
+      # `pie-worker` is a library; the `pie` command lives in `bin/pie`. The old
+      # `--bin pie` here named a target this package has never had, so the step
+      # could only ever fail.
       - name: cargo test (pie-worker)
-        run: cargo test -p pie-worker --bin pie --no-default-features --features driver-metal
+        run: cargo test -p pie-worker --no-default-features --features driver-metal
 
       - name: Native Metal entrypoint validation
         run: |

@@ -230,20 +230,13 @@ ScratchSchedule build_scratch_schedule(const std::vector<Dispatch>& dag,
         }
     }
 
-    // Concurrency: dispatch i runs concurrently with i+1 (no barrier between) for the few
-    // independent ‖-pairs (k‖v proj, q‖k norm, gate‖up proj). A buffer last-read at ordinal
-    // i must NOT be rewritten by a dispatch concurrent with i, so we extend such a value's
-    // interval by one ordinal to forbid that reuse (otherwise read@i races write@i+1).
-    auto concurrent_after = [&](int i) -> bool {
-        if (i + 1 >= (int)dag.size()) return false;
-        const Dispatch& a = dag[i]; const Dispatch& b = dag[i + 1];
-        if (a.layer != b.layer) return false;
-        return (a.kind == Kernel::QmvK && b.kind == Kernel::QmvV) ||
-               (a.kind == Kernel::QNorm && b.kind == Kernel::KNorm) ||
-               (a.kind == Kernel::QmvGate && b.kind == Kernel::QmvUp) ||
-               (a.kind == Kernel::QmvIn && b.kind == Kernel::QmvInZ) ||
-               (a.kind == Kernel::GdnInA && b.kind == Kernel::GdnInB);
-    };
+    // Concurrency: the encoders drop the barriers inside a run of mutually
+    // independent dispatches (decode_step.cpp::concurrent_run_ends), so a buffer
+    // last read at ordinal i must not be rewritten by anything still running
+    // alongside i. Extend such a value's interval to the END of i's run -- with
+    // runs of more than two that is what "one ordinal" used to approximate, and
+    // the approximation would now be wrong.
+    const std::vector<int> run_ends = concurrent_run_ends(dag);
 
     // Live intervals per value.
     int nval = next_value;
@@ -253,7 +246,7 @@ ScratchSchedule build_scratch_schedule(const std::vector<Dispatch>& dag,
         if (u.ordinal > last[u.value]) last[u.value] = u.ordinal;
     }
     for (int v = 0; v < nval; ++v)
-        if (last[v] >= 0 && concurrent_after(last[v])) last[v] += 1;  // forbid concurrent reuse
+        if (last[v] >= 0) last[v] = std::max(last[v], run_ends[last[v]]);
 
     // Linear-scan coloring: values sorted by def; free a buffer once its holder's last
     // use has passed. Inclusive overlap => same-dispatch WAR + concurrent ‖-pair outputs

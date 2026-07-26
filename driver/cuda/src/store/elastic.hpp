@@ -11,8 +11,49 @@
 
 #include <cuda.h>
 
-#include "pie_driver/elastic.hpp"
 #include "../tensor.hpp"
+
+/// The page abstraction the elastic allocator is written against.
+///
+/// Deliberately backend-local. Metal's allocator reaches the same conclusion
+/// about page size but reserves through a `MTLHeap` rather than a CUDA virtual
+/// address range, so it shares the constant and none of the interface; a common
+/// header would have made the two allocators look like one that they are not.
+namespace pie::elastic {
+
+inline constexpr std::size_t kLogicalPageBytes = 2ull * 1024 * 1024;
+
+inline constexpr std::size_t pages_for_bytes(
+    std::size_t bytes,
+    std::size_t page_bytes = kLogicalPageBytes) noexcept {
+    return bytes == 0 ? 0 : (bytes + page_bytes - 1) / page_bytes;
+}
+
+/// A budgeted supply of physical pages. Reservation is the whole point: a
+/// caller that cannot get pages must be told so rather than fail on commit.
+class PhysicalPool {
+  public:
+    virtual ~PhysicalPool() = default;
+
+    virtual bool try_reserve(std::size_t pages) = 0;
+    virtual void unreserve(std::size_t pages) noexcept = 0;
+    virtual std::size_t page_bytes() const noexcept = 0;
+    virtual std::size_t budget_pages() const noexcept = 0;
+    virtual std::size_t committed_pages() const noexcept = 0;
+};
+
+/// A contiguous virtual range whose backing can grow and shrink underneath it.
+class Arena {
+  public:
+    virtual ~Arena() = default;
+
+    virtual std::uint64_t base() const noexcept = 0;
+    virtual std::size_t committed_bytes() const noexcept = 0;
+    virtual void ensure_committed(std::size_t bytes) = 0;
+    virtual void trim_committed(std::size_t bytes) = 0;
+};
+
+}  // namespace pie::elastic
 
 namespace pie_cuda_driver {
 

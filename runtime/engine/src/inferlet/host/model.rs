@@ -49,6 +49,13 @@ impl pie::inferlet::model::Host for ProcessCtx {
         Ok(crate::scheduler::configured_frame_size() as u32)
     }
 
+    /// Host-reader channel capacity, in cells, that sustains the engine's
+    /// run-ahead for one lane. Includes the staging margin; see
+    /// `scheduler::channel_capacity`.
+    async fn channel_capacity(&mut self) -> Result<u32> {
+        Ok(crate::scheduler::channel_capacity() as u32)
+    }
+
     /// Max embed tokens in a single pass (C) — the guest-side prefill chunk
     /// budget, sourced from the bound driver's structural per-launch token
     /// capacity.

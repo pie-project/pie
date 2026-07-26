@@ -3,9 +3,12 @@
 //! The driver calls in here; nothing calls out. Three rules hold for every
 //! function in this module:
 //!
-//! * **Never unwind.** A panic crossing into C++ is undefined behaviour, so every
-//!   body is wrapped in [`catch_unwind`](std::panic::catch_unwind) and a panic is
-//!   reported as [`PieLoaderStatus::Panic`] with the payload as a diagnostic.
+//! * **Never unwind.** A panic crossing into C++ is not something the driver can
+//!   act on, and Rust already handles it: an unwind out of an `extern "C"`
+//!   function prints the panic and aborts. That is the honest outcome — a panic
+//!   here is a loader bug, and the shipping profile is `panic = "abort"`
+//!   (`Cargo.toml` `[profile.release-min]`) so no unwinding happens at all.
+//!   Nothing in this module tries to convert one into a status code.
 //! * **Never hold global state.** Ranks compile in parallel
 //!   (`runtime/engine/src/driver/backend/cuda.rs:331-345` runs one thread per
 //!   rank), so two `pie_loader_compile` calls can be in flight at once. Every
@@ -15,15 +18,13 @@
 //!   collapsing the two would throw away the thing that makes verification worth
 //!   running.
 
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 
 use crate::artifact::{ArtifactInputs, artifact_cache_key};
 use crate::checkpoint::read::parse_checkpoint_metadata;
-use crate::error::CompileError;
-use crate::load_plan::LoadPlan;
-use crate::planner::compile_load_plan;
-use crate::verify::ContractCoverage;
+use crate::error::Error;
+use crate::plan::LoadPlan;
+use crate::plan::compile as compile_load_plan;
 
 use super::arena;
 use super::checkpoint::PieLoaderCheckpoint;
@@ -44,10 +45,6 @@ pub enum PieLoaderStatus {
     ContractViolation = 3,
     /// The compiler failed on input it should have handled. A bug in the loader.
     Internal = 4,
-    /// A panic was caught at the boundary. Also a bug in the loader, but
-    /// distinguished because the diagnostic is a panic payload rather than a
-    /// structured error.
-    Panic = 5,
 }
 
 #[repr(u32)]
@@ -184,7 +181,6 @@ pub struct PieLoaderTargetSpec {
     pub max_tile_bytes: u64,
     pub preferred_alignment: u32,
     pub tile_map_mask: u32,
-    pub fp8_native: bool,
     pub native_mxfp4_moe: bool,
     /// Which fused transform chains this build has kernels for
     /// (`PIE_LOADER_FUSION_*`).
@@ -227,10 +223,24 @@ pub(super) unsafe fn as_str<'a>(value: &'a PieLoaderBytes, field: &str) -> Resul
     std::str::from_utf8(bytes).map_err(|err| format!("{field}: not valid UTF-8: {err}"))
 }
 
-fn compile_error_status(err: &CompileError) -> PieLoaderStatus {
+/// How a compile failure crosses the ABI.
+///
+/// Every variant that used to be `InvalidInput` still answers
+/// `InvalidCheckpoint`, so this is behaviour-preserving: the status enum is
+/// coarser than [`Error`] on purpose, because a C caller acts on "retry with a
+/// different checkpoint" versus "file a bug" and nothing finer. The full
+/// distinction travels in the diagnostic message and in [`Error::code`].
+///
+/// Written exhaustively rather than with a wildcard so that adding a variant to
+/// [`Error`] forces this decision to be made again.
+fn compile_error_status(err: &Error) -> PieLoaderStatus {
     match err {
-        CompileError::InvalidInput(_) => PieLoaderStatus::InvalidCheckpoint,
-        CompileError::Internal(_) => PieLoaderStatus::Internal,
+        Error::Contract(_)
+        | Error::Shard(_)
+        | Error::Checkpoint(_)
+        | Error::Unsupported(_)
+        | Error::Overflow(_) => PieLoaderStatus::InvalidCheckpoint,
+        Error::Internal(_) => PieLoaderStatus::Internal,
     }
 }
 
@@ -266,25 +276,13 @@ pub struct PieLoaderContractRequest {
 /// `req` and everything its pointers reach must be live for the call.
 unsafe fn compile_contract_request(
     req: &PieLoaderContractRequest,
-) -> Result<(LoadPlan, arena::PlanExtras), (PieLoaderStatus, String)> {
+) -> Result<(LoadPlan, String), (PieLoaderStatus, String)> {
     let checked = unsafe { read_contract_request(req) }?;
     let source = unsafe { super::checkpoint::arena_of(req.checkpoint) };
 
     compile_load_plan(&source.metadata, &checked.model, checked.target)
         .map_err(|err| (compile_error_status(&err), err.to_string()))
         .map(|plan| {
-            // The contract names exactly the tensors the plan will produce, so
-            // coverage is measured against it directly. A shortfall here is a
-            // compiler bug, not a driver one — which is why it is measured
-            // anyway (§9).
-            let coverage = ContractCoverage::measure(
-                plan.tensors.iter().map(|tensor| tensor.name.as_str()),
-                checked
-                    .model
-                    .tensors
-                    .iter()
-                    .map(|tensor| (tensor.name.as_str(), false)),
-            );
             // `runtime_quant` and `component` are empty because neither exists
             // on this path, and neither is missing information: the contract
             // decides both, and the contract is entirely observable in the plan
@@ -297,20 +295,14 @@ unsafe fn compile_contract_request(
                     component: 0,
                 },
             );
-            (
-                plan,
-                arena::PlanExtras {
-                    coverage,
-                    cache_key,
-                },
-            )
+            (plan, cache_key)
         })
 }
 
 /// A contract request with its target resolved and its contract materialized.
 struct CheckedContractRequest {
     model: crate::contract::ModelContract,
-    target: crate::load_plan::StorageTarget,
+    target: crate::plan::StorageTarget,
 }
 
 /// Validate a contract request without touching the filesystem.
@@ -366,49 +358,41 @@ pub unsafe extern "C" fn pie_loader_open_checkpoint(
     out: *mut *mut PieLoaderCheckpoint,
     out_diags: *mut *mut PieLoaderDiagnostics,
 ) -> PieLoaderStatus {
-    never_unwind(|| {
-        if !out_diags.is_null() {
-            unsafe { *out_diags = std::ptr::null_mut() };
-        }
-        if out.is_null() {
-            return PieLoaderStatus::InvalidRequest;
-        }
-        unsafe { *out = std::ptr::null_mut() };
+    if !out_diags.is_null() {
+        unsafe { *out_diags = std::ptr::null_mut() };
+    }
+    if out.is_null() {
+        return PieLoaderStatus::InvalidRequest;
+    }
+    unsafe { *out = std::ptr::null_mut() };
 
-        let mut sink = DiagnosticSink::default();
-        let status = match catch_unwind(AssertUnwindSafe(|| {
-            let dir = unsafe { as_str(&snapshot_dir, "snapshot_dir") }
-                .map_err(|err| (PieLoaderStatus::InvalidRequest, err))?;
-            if dir.is_empty() {
-                return Err((
-                    PieLoaderStatus::InvalidRequest,
-                    "snapshot_dir is empty".to_string(),
-                ));
-            }
-            let dir = PathBuf::from(dir);
-            parse_checkpoint_metadata(&dir)
-                .map(|metadata| (metadata, dir))
-                .map_err(|err| (compile_error_status(&err), err.to_string()))
-        })) {
-            Ok(Ok((metadata, dir))) => {
-                unsafe { *out = super::checkpoint::build(metadata, dir) };
-                PieLoaderStatus::Ok
-            }
-            Ok(Err((status, message))) => {
-                sink.error(message);
-                status
-            }
-            Err(payload) => {
-                sink.error(format!(
-                    "pie_loader_open_checkpoint panicked: {}",
-                    panic_text(&payload)
-                ));
-                PieLoaderStatus::Panic
-            }
-        };
-        unsafe { emit(out_diags, sink.publish()) };
-        status
-    })
+    let mut sink = DiagnosticSink::default();
+    let result = (|| {
+        let dir = unsafe { as_str(&snapshot_dir, "snapshot_dir") }
+            .map_err(|err| (PieLoaderStatus::InvalidRequest, err))?;
+        if dir.is_empty() {
+            return Err((
+                PieLoaderStatus::InvalidRequest,
+                "snapshot_dir is empty".to_string(),
+            ));
+        }
+        let dir = PathBuf::from(dir);
+        parse_checkpoint_metadata(&dir)
+            .map(|metadata| (metadata, dir))
+            .map_err(|err| (compile_error_status(&err), err.to_string()))
+    })();
+    let status = match result {
+        Ok((metadata, dir)) => {
+            unsafe { *out = super::checkpoint::build(metadata, dir) };
+            PieLoaderStatus::Ok
+        }
+        Err((status, message)) => {
+            sink.error(message);
+            status
+        }
+    };
+    unsafe { emit(out_diags, sink.publish()) };
+    status
 }
 
 /// Free a checkpoint handle.
@@ -419,9 +403,7 @@ pub unsafe extern "C" fn pie_loader_open_checkpoint(
 /// has not already been closed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pie_loader_close_checkpoint(checkpoint: *mut PieLoaderCheckpoint) {
-    let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
-        super::checkpoint::release(checkpoint)
-    }));
+    unsafe { super::checkpoint::release(checkpoint) }
 }
 
 /// Compile a driver-authored contract into a plan.
@@ -440,44 +422,33 @@ pub unsafe extern "C" fn pie_loader_compile_contract(
     out_plan: *mut *mut PieLoaderPlan,
     out_diags: *mut *mut PieLoaderDiagnostics,
 ) -> PieLoaderStatus {
-    never_unwind(|| {
-        if !out_diags.is_null() {
-            unsafe { *out_diags = std::ptr::null_mut() };
-        }
-        if out_plan.is_null() {
-            return PieLoaderStatus::InvalidRequest;
-        }
-        unsafe { *out_plan = std::ptr::null_mut() };
-        if req.is_null() {
-            let mut sink = DiagnosticSink::default();
-            sink.error("pie_loader_compile_contract: request is null");
-            unsafe { emit(out_diags, sink.publish()) };
-            return PieLoaderStatus::InvalidRequest;
-        }
+    if !out_diags.is_null() {
+        unsafe { *out_diags = std::ptr::null_mut() };
+    }
+    if out_plan.is_null() {
+        return PieLoaderStatus::InvalidRequest;
+    }
+    unsafe { *out_plan = std::ptr::null_mut() };
 
-        let mut sink = DiagnosticSink::default();
-        let status = match catch_unwind(AssertUnwindSafe(|| unsafe {
-            compile_contract_request(&*req)
-        })) {
-            Ok(Ok((plan, extras))) => {
-                unsafe { *out_plan = arena::build(&plan, &extras) };
-                PieLoaderStatus::Ok
-            }
-            Ok(Err((status, message))) => {
-                sink.error(message);
-                status
-            }
-            Err(payload) => {
-                sink.error(format!(
-                    "pie_loader_compile_contract panicked: {}",
-                    panic_text(&payload)
-                ));
-                PieLoaderStatus::Panic
-            }
-        };
+    let mut sink = DiagnosticSink::default();
+    if req.is_null() {
+        sink.error("pie_loader_compile_contract: request is null");
         unsafe { emit(out_diags, sink.publish()) };
-        status
-    })
+        return PieLoaderStatus::InvalidRequest;
+    }
+
+    let status = match unsafe { compile_contract_request(&*req) } {
+        Ok((plan, cache_key)) => {
+            unsafe { *out_plan = arena::build(&plan, &cache_key) };
+            PieLoaderStatus::Ok
+        }
+        Err((status, message)) => {
+            sink.error(message);
+            status
+        }
+    };
+    unsafe { emit(out_diags, sink.publish()) };
+    status
 }
 
 /// Check a plan against the contract it was compiled from.
@@ -497,65 +468,39 @@ pub unsafe extern "C" fn pie_loader_verify_contract(
     req: *const PieLoaderContractRequest,
     out_diags: *mut *mut PieLoaderDiagnostics,
 ) -> PieLoaderStatus {
-    never_unwind(|| {
-        if !out_diags.is_null() {
-            unsafe { *out_diags = std::ptr::null_mut() };
-        }
-        if plan.is_null() || req.is_null() {
-            let mut sink = DiagnosticSink::default();
-            sink.error("pie_loader_verify_contract: plan or request is null");
-            unsafe { emit(out_diags, sink.publish()) };
-            return PieLoaderStatus::InvalidRequest;
-        }
-
-        let mut sink = DiagnosticSink::default();
-        let panicked = catch_unwind(AssertUnwindSafe(|| {
-            let plan = unsafe { &*plan };
-            let req = unsafe { &*req };
-            match unsafe { read_contract_request(req) } {
-                Ok(checked) => {
-                    verify_plan_contract(
-                        plan,
-                        || Ok(Some(crate::verify::ContractView::of(&checked.model))),
-                        &mut sink,
-                    );
-                }
-                Err((_, message)) => sink.error(message),
-            }
-            // A contract request states no MoE policy, so `Auto` is what the
-            // compile resolved and `Auto` is what verification must resolve.
-            verify_target_compat(plan, &req.target, &mut sink);
-        }));
-        let status = match panicked {
-            Ok(()) if sink.is_empty() => PieLoaderStatus::Ok,
-            Ok(()) => PieLoaderStatus::ContractViolation,
-            Err(payload) => {
-                sink.error(format!(
-                    "pie_loader_verify_contract panicked: {}",
-                    panic_text(&payload)
-                ));
-                PieLoaderStatus::Panic
-            }
-        };
-        unsafe { emit(out_diags, sink.publish()) };
-        status
-    })
-}
-
-/// Run `body`, converting any unwind into [`PieLoaderStatus::Panic`].
-///
-/// The payload is deliberately leaked rather than dropped: running an unknown
-/// `Drop` here could itself unwind, and this frame is the last one that can
-/// still turn an unwind into a return value. A panicking compile is already an
-/// aborted cold start, so the leak is bounded and never repeats in a loop.
-fn never_unwind(body: impl FnOnce() -> PieLoaderStatus) -> PieLoaderStatus {
-    match catch_unwind(AssertUnwindSafe(body)) {
-        Ok(status) => status,
-        Err(payload) => {
-            std::mem::forget(payload);
-            PieLoaderStatus::Panic
-        }
+    if !out_diags.is_null() {
+        unsafe { *out_diags = std::ptr::null_mut() };
     }
+    let mut sink = DiagnosticSink::default();
+    if plan.is_null() || req.is_null() {
+        sink.error("pie_loader_verify_contract: plan or request is null");
+        unsafe { emit(out_diags, sink.publish()) };
+        return PieLoaderStatus::InvalidRequest;
+    }
+
+    let plan = unsafe { &*plan };
+    let req = unsafe { &*req };
+    match unsafe { read_contract_request(req) } {
+        Ok(checked) => {
+            verify_plan_contract(
+                plan,
+                &crate::verify::ContractView::of(&checked.model),
+                &mut sink,
+            );
+        }
+        Err((_, message)) => sink.error(message),
+    }
+    // A contract request states no MoE policy, so `Auto` is what the compile
+    // resolved and `Auto` is what verification must resolve.
+    verify_target_compat(plan, &req.target, &mut sink);
+
+    let status = if sink.is_empty() {
+        PieLoaderStatus::Ok
+    } else {
+        PieLoaderStatus::ContractViolation
+    };
+    unsafe { emit(out_diags, sink.publish()) };
+    status
 }
 
 /// Free a plan returned by [`pie_loader_compile_contract`].
@@ -566,7 +511,7 @@ fn never_unwind(body: impl FnOnce() -> PieLoaderStatus) -> PieLoaderStatus {
 /// been released.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pie_loader_release(plan: *mut PieLoaderPlan) {
-    let _ = catch_unwind(AssertUnwindSafe(|| unsafe { arena::release(plan) }));
+    unsafe { arena::release(plan) }
 }
 
 /// Free diagnostics returned through an out-param.
@@ -577,7 +522,7 @@ pub unsafe extern "C" fn pie_loader_release(plan: *mut PieLoaderPlan) {
 /// released.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pie_loader_release_diagnostics(diags: *mut PieLoaderDiagnostics) {
-    let _ = catch_unwind(AssertUnwindSafe(|| unsafe { release_diagnostics(diags) }));
+    unsafe { release_diagnostics(diags) }
 }
 
 /// The plan-level invariants a driver can check without re-running the compiler.
@@ -593,31 +538,22 @@ pub unsafe extern "C" fn pie_loader_release_diagnostics(diags: *mut PieLoaderDia
 /// The second is specific to this boundary and cannot be asked without the
 /// request: was this plan compiled *for the caller*? Rank divergence is the
 /// motivating case (§6.2), and no amount of internal consistency detects it.
-fn verify_plan_contract<'a>(
+fn verify_plan_contract(
     plan: &PieLoaderPlan,
-    demanded: impl FnOnce() -> Result<Option<crate::verify::ContractView<'a>>, String>,
+    contract: &crate::verify::ContractView<'_>,
     sink: &mut DiagnosticSink,
 ) {
-    let view = match unsafe { plan_view(plan) } {
+    let view = match unsafe { super::view::plan_view(plan) } {
         Ok(view) => view,
         Err(err) => {
             sink.error(err);
             return;
         }
     };
-    // The contract is whatever the driver declared. An empty `demands` is not
-    // an error — it means this driver has not adopted the declaration yet, and
-    // only the plan's internal consistency can be checked. See
-    // `PieLoaderTensorDemand`.
-    match demanded() {
-        Ok(contract) => {
-            if let Err(violations) = crate::verify::verify(&view, contract.as_ref()) {
-                for violation in violations {
-                    sink.error(violation.to_string());
-                }
-            }
+    if let Err(violations) = crate::verify::verify(&view, Some(contract)) {
+        for violation in violations {
+            sink.error(violation.to_string());
         }
-        Err(err) => sink.error(err),
     }
 }
 
@@ -680,130 +616,6 @@ fn verify_target_compat(
             "plan fusion_mask {:#x} does not match target {:#x}",
             plan.target.fusion_mask, target.fusion_mask
         ));
-    }
-}
-
-/// Borrow a POD slice, treating a null pointer as empty.
-///
-/// # Safety
-///
-/// `ptr` is null, or valid for `len` elements for the lifetime `'a`.
-unsafe fn slice_of<'a, T>(ptr: *const T, len: usize) -> &'a [T] {
-    if ptr.is_null() {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(ptr, len) }
-    }
-}
-
-/// Reconstruct the safe view [`crate::verify`] works on from the POD plan.
-///
-/// This is the only place that dereferences the plan's slice pointers, so it is
-/// where a malformed handle is caught rather than propagated. Names are decoded
-/// here too: a non-UTF-8 name is reported once, as itself, instead of silently
-/// failing to match later.
-///
-/// # Safety
-///
-/// `plan`'s slices are null or valid for their stated lengths, which is true of
-/// any plan produced by [`pie_loader_compile`].
-unsafe fn plan_view(plan: &PieLoaderPlan) -> Result<crate::verify::PlanView<'_>, String> {
-    let instrs = unsafe { slice_of(plan.instrs.ptr, plan.instrs.len) };
-    let mut files = Vec::with_capacity(plan.files.len);
-    for file in unsafe { slice_of(plan.files.ptr, plan.files.len) } {
-        files.push(crate::verify::FileView {
-            id: file.id,
-            path: unsafe { as_str(&file.path, "file.path") }
-                .map_err(|err| format!("file {}: {err}", file.id))?,
-            size_bytes: file.size_bytes,
-        });
-    }
-    let mut sources = Vec::with_capacity(plan.sources.len);
-    for source in unsafe { slice_of(plan.sources.ptr, plan.sources.len) } {
-        sources.push(crate::verify::SourceView {
-            name: unsafe { as_str(&source.name, "source.name") }
-                .map_err(|err| format!("source tensor {}: {err}", source.id))?,
-            file_id: source.file_id,
-            offset_bytes: source.file_offset,
-            span_bytes: source.span_bytes,
-        });
-    }
-    let mut tensors = Vec::with_capacity(plan.tensors.len);
-    for tensor in unsafe { slice_of(plan.tensors.ptr, plan.tensors.len) } {
-        tensors.push(crate::verify::TensorView::new(
-            unsafe { as_str(&tensor.name, "tensor.name") }
-                .map_err(|err| format!("tensor {}: {err}", tensor.id))?,
-            unsafe { slice_of(tensor.shape.ptr, tensor.shape.len) },
-            &join_encoding(tensor),
-        ));
-    }
-
-    let mut finalized = Vec::new();
-    let mut reads = Vec::new();
-    for instr in instrs {
-        match instr.kind {
-            PieLoaderStorageInstrKind::Finalize => finalized.push(
-                unsafe { as_str(&instr.name, "instr.name") }
-                    .map_err(|err| format!("instruction {}: {err}", instr.id))?,
-            ),
-            // Only the reading instructions carry a meaningful `source`; the
-            // rest leave it at its zero default, which would look like a valid
-            // reference to file 0.
-            PieLoaderStorageInstrKind::ExtentWrite
-            | PieLoaderStorageInstrKind::BulkExtentWrite
-            | PieLoaderStorageInstrKind::TileMap => reads.push(crate::verify::ReadView {
-                instr: instr.id,
-                file_id: instr.source.file_id,
-            }),
-            _ => {}
-        }
-        if instr.slab_file_id != PIE_LOADER_NO_BUFFER {
-            reads.push(crate::verify::ReadView {
-                instr: instr.id,
-                file_id: instr.slab_file_id,
-            });
-        }
-    }
-
-    Ok(crate::verify::PlanView {
-        version: plan.version,
-        compiler_version: plan.compiler_version,
-        files,
-        sources,
-        tensors,
-        instr_count: instrs.len(),
-        schedule: unsafe { slice_of(plan.schedule.ptr, plan.schedule.len) }.to_vec(),
-        finalized,
-        reads,
-    })
-}
-
-/// The inverse of `arena::split_encoding`: rebuild an [`Encoding`] from the flat
-/// fields a POD view carries, so a marshalled tensor can be compared against
-/// one the loader still holds in typed form.
-fn join_encoding(tensor: &PieLoaderTensorDeclView) -> crate::types::Encoding {
-    match tensor.encoding_kind {
-        PieLoaderEncodingKind::Quant => crate::types::Encoding::Quant(crate::types::QuantSpec {
-            scheme: tensor.quant_scheme.into(),
-            logical_dtype: tensor.dtype.into(),
-            bits_per_element: tensor.quant_bits_per_element,
-            group_size: tensor.quant_group_size,
-            channel_axis: None,
-            scale_dtype: None,
-            zero_point_dtype: None,
-            block_shape: Vec::new(),
-        }),
-        _ => crate::types::Encoding::Raw(tensor.dtype.into()),
-    }
-}
-
-fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(text) = payload.downcast_ref::<&str>() {
-        (*text).to_string()
-    } else if let Some(text) = payload.downcast_ref::<String>() {
-        text.clone()
-    } else {
-        "non-string panic payload".to_string()
     }
 }
 

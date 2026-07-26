@@ -1,0 +1,30 @@
+[package]
+name = "pie-eval"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "The PTIR semantics oracle: the tier-0 reference interpreter every backend diffs against, and the host partial evaluator the engine folds stage prologues with (prefix-cache fire evidence, capability-less execution, geometry classification)."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+keywords = ["pie", "tensor", "ir", "ptir", "interpreter"]
+
+[lib]
+name = "pie_eval"
+crate-type = ["rlib"]
+path = "src/lib.rs"
+
+# Host-side only (the interpreter's extern channels are `std::sync::{Arc, Mutex}`),
+# so unlike `pie-ir` / `pie-plan` this crate has no `no_std` mode.
+[dependencies]
+pie-ir = { path = "../ir" }
+
+# Tier-0 parity tests check the interpreter against planner-partitioned regions.
+# Dev-only, so the production edge stays `eval -> ir` and the two siblings above
+# `ir` remain independent of each other.
+[dev-dependencies]
+pie-plan = { path = "../plan" }
+
+# Shared ratchet from the root manifest. These six crates are gated with
+# `-D warnings` in CI; see `[workspace.lints]` in the workspace `Cargo.toml`.
+[lints]
+workspace = true

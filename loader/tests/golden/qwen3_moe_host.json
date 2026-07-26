@@ -1,5 +1,4 @@
 {
-  "version": 5,
   "compiler_version": 0,
   "target": {
     "backend": "Unknown",
@@ -13,16 +12,62 @@
     "encode_scratch_dtype": "BF16",
     "block_scale_rows": 128
   },
-  "optimizer": {
-    "passes": [
-      {
-        "name": "live-normalization",
-        "exprs_before": 46,
-        "exprs_after": 46,
-        "rewrites": 0
-      }
-    ]
-  },
+  "passes": [
+    {
+      "pass": "assign-persistent-offsets",
+      "instrs_before": 46,
+      "instrs_after": 46,
+      "rewrites": 12
+    },
+    {
+      "pass": "coalesce-persistent-arena-writes",
+      "instrs_before": 46,
+      "instrs_after": 42,
+      "rewrites": 4
+    },
+    {
+      "pass": "hoist-bulk-arena-writes",
+      "instrs_before": 42,
+      "instrs_after": 32,
+      "rewrites": 10
+    },
+    {
+      "pass": "group-shared-source-reads",
+      "instrs_before": 32,
+      "instrs_after": 32,
+      "rewrites": 0
+    },
+    {
+      "pass": "merge-adjacent-extent-writes",
+      "instrs_before": 32,
+      "instrs_after": 32,
+      "rewrites": 0
+    },
+    {
+      "pass": "recompute-memory-plan",
+      "instrs_before": 32,
+      "instrs_after": 32,
+      "rewrites": 0
+    },
+    {
+      "pass": "validate-fill-order",
+      "instrs_before": 32,
+      "instrs_after": 32,
+      "rewrites": 0
+    },
+    {
+      "pass": "validate-target-support",
+      "instrs_before": 32,
+      "instrs_after": 32,
+      "rewrites": 0
+    },
+    {
+      "pass": "validate-persistent-layout",
+      "instrs_before": 32,
+      "instrs_after": 32,
+      "rewrites": 0
+    }
+  ],
   "files": [
     {
       "id": 0,
@@ -672,7 +717,8 @@
                 "dst_stride": 1
               }
             ]
-          }
+          },
+          "dtype": "BF16"
         },
         "dest_offset": 0
       }
@@ -695,7 +741,8 @@
                 "dst_stride": 1
               }
             ]
-          }
+          },
+          "dtype": "BF16"
         },
         "dest_offset": 689664
       }
@@ -718,7 +765,8 @@
                 "dst_stride": 1
               }
             ]
-          }
+          },
+          "dtype": "BF16"
         },
         "dest_offset": 296448
       }
@@ -741,7 +789,8 @@
                 "dst_stride": 1
               }
             ]
-          }
+          },
+          "dtype": "BF16"
         },
         "dest_offset": 755200
       }
@@ -764,7 +813,8 @@
                 "dst_stride": 1
               }
             ]
-          }
+          },
+          "dtype": "BF16"
         },
         "dest_offset": 427520
       }
@@ -787,7 +837,8 @@
                 "dst_stride": 1
               }
             ]
-          }
+          },
+          "dtype": "BF16"
         },
         "dest_offset": 820736
       }
@@ -810,7 +861,8 @@
                 "dst_stride": 1
               }
             ]
-          }
+          },
+          "dtype": "BF16"
         },
         "dest_offset": 558592
       }
@@ -833,7 +885,8 @@
                 "dst_stride": 1
               }
             ]
-          }
+          },
+          "dtype": "BF16"
         },
         "dest_offset": 886272
       }

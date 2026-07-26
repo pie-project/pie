@@ -37,10 +37,17 @@ members = [
     "interface/controller",
     "interface/worker",
     "interface/client",
-    # PTIR — the Pie Tensor IR: the cross-language seam for programmable dataflow
-    # (stage-tagged trace container + validation + versioned wire format).
-    # `no_std` core; the wasm SDK depends on it with `default-features = false`.
-    "interface/ptir",
+    # The tensor-program toolchain: authoring eDSL -> PTIR -> planning ->
+    # CUDA/Metal codegen, plus the reference interpreter every backend diffs
+    # against. See `compiler/README.md`. `compiler/dsl` targets wasm inside an
+    # inferlet but has no wasm-only dependencies, so unlike `sdk/rust/*` it can
+    # be a member — which is what puts its tests in the CI battery.
+    "compiler/ir",
+    "compiler/plan",
+    "compiler/eval",
+    "compiler/codegen",
+    "compiler/dsl",
+    "compiler/tests",
     "driver/dummy",
     # Weight loader: checkpoints -> verified device-memory layouts. Consumed by
     # drivers at cold start, not by the serving runtime (see loader/architecture.md).
@@ -63,6 +70,38 @@ exclude = [
     # excludes it, so the walk continues up to here).
     ".claude",
 ]
+
+# Shared lint table. Opt in per crate with `[lints] workspace = true`; today
+# only the `compiler/*` crates do, because they are the only ones at zero
+# clippy warnings and therefore the only ones CI can gate with `-D warnings`
+# (`.github/workflows/ci.yml`). The rest of the workspace still carries ~240
+# warnings; wire a crate in here once it is clean rather than all at once.
+#
+# Everything below is at zero occurrences across the compiler crates as of this
+# commit, so each is a ratchet that costs nothing today and blocks a
+# regression tomorrow. Lints that would need a cleanup first are deliberately
+# absent — notably `clippy::wildcard_enum_match_arm`, the lint that would have
+# caught the catch-all `_ =>` arms that silently absorbed new ops. Down from 38
+# sites to 26; the survivors were each read and are fail-safe (`_ => None`,
+# `_ => {}`, "skip this optimization") or delegate to a match that *is*
+# exhaustive, so a new variant inherits a conservative answer rather than a
+# confident wrong one. Turning the lint on would now mean 26 `#[allow]`s or 26
+# hand-written variant lists that drift, which buys less than it costs.
+[workspace.lints.rust]
+# Promoted from `compiler/dsl`, which was the only crate carrying it. There is
+# no `unsafe` anywhere under `compiler/`, so this extends that crate's existing
+# guarantee to the other five at zero cost.
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+mem_forget = "deny"
+# A compiler crate that writes to a stream is either debugging scaffolding left
+# behind or a diagnostic that belongs behind an explicit, annotated `allow`.
+print_stdout = "deny"
+print_stderr = "deny"
 
 # Distribution profile for `pie-worker`. Use
 # `cargo build --profile release-min -p pie-worker`. The regular

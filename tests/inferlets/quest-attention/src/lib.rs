@@ -215,32 +215,29 @@ async fn main(input: Input) -> Result<Output> {
     // chunks equal to the one-shot fire. When the prompt fits in one chunk the
     // loop runs once and builds exactly the pass this used to build.
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-    let chunk = input
-        .prefill_chunk
-        .unwrap_or(u32::MAX)
-        .min(max_embed_length().max(1) as u32)
-        .min(n)
-        .max(1);
+    // The split is `prefill_chunks` (SDK), which spreads the remainder over the
+    // FIRST chunks so the last one is never a sliver. Every inferlet in this
+    // tree uses it, which is what makes their chunk boundaries identical: a
+    // text difference above the ceiling is then a policy difference, not a
+    // difference in the attention tile decomposition (§11.4).
+    let spans = prefill_chunks(n, input.prefill_chunk);
     let pipe = Pipeline::new();
 
     let mut g0 = 0i32;
-    let mut base = 0u32;
-    while base < n {
-        let len = chunk.min(n - base);
-        let end = base + len;
+    for &(base, end) in &spans {
+        let len = end - base;
 
-        let toks_p = Channel::from(prompt_i32[base as usize..end as usize].to_vec())
-            .named("toks_p");
+        let toks_p =
+            Channel::from(prompt_i32[base as usize..end as usize].to_vec()).named("toks_p");
         let embed_indptr_p = Channel::from(vec![0u32, len]).named("embed_indptr_p");
         let positions_p = Channel::from((base..end).collect::<Vec<_>>()).named("positions_p");
         let pages_p = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages_p");
         let page_indptr_p =
             Channel::from(vec![0u32, end.div_ceil(page_size)]).named("page_indptr_p");
         let w_slot_p =
-            Channel::from((base..end).map(|p| p / page_size).collect::<Vec<_>>())
-                .named("w_slot_p");
-        let w_off_p = Channel::from((base..end).map(|p| p % page_size).collect::<Vec<_>>())
-            .named("w_off_p");
+            Channel::from((base..end).map(|p| p / page_size).collect::<Vec<_>>()).named("w_slot_p");
+        let w_off_p =
+            Channel::from((base..end).map(|p| p % page_size).collect::<Vec<_>>()).named("w_off_p");
         let kv_len_p = Channel::from(vec![end]).named("kv_len_p");
         let rng_p = Channel::from(vec![input.seed, 0]).named("rng_p");
         let tok_out_p = Channel::new([1], dtype::i32).named("tok_out_p");
@@ -279,8 +276,6 @@ async fn main(input: Input) -> Result<Output> {
             .get::<i32>()
             .await
             .map_err(|e| format!("g0 take @{base}: {e}"))?[0];
-
-        base = end;
     }
     generated.push(g0 as u32);
 
@@ -293,7 +288,7 @@ async fn main(input: Input) -> Result<Output> {
         let tok_in = Channel::from(vec![g0; 1]).named("tok_in");
         let rng = Channel::from(vec![input.seed ^ 0x5bd1, 0]).named("rng");
         let tok_out = Channel::new([1], dtype::i32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+            .capacity(channel_capacity() as u32)
             .named("tok_out");
         let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
         let positions = Channel::from(vec![n]).named("positions");
@@ -312,26 +307,25 @@ async fn main(input: Input) -> Result<Output> {
         //
         // Report-only: nothing in the policy reads it, so it is absent when the
         // caller did not ask for a report.
-        let acc = report.then(|| {
-            Channel::from(vec![f32::NEG_INFINITY; p_max as usize]).named("quest_acc")
-        });
+        let acc = report
+            .then(|| Channel::from(vec![f32::NEG_INFINITY; p_max as usize]).named("quest_acc"));
         let layer_ct = report.then(|| Channel::from(vec![0u32]).named("quest_layers"));
 
         // Host drains. Present only when the caller asked to be told what
         // happened; see `Input::report`.
         let scores_out = report.then(|| {
             Channel::new([p_max], dtype::f32)
-                .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+                .capacity(channel_capacity() as u32)
                 .named("quest_scores")
         });
         let layers_out = report.then(|| {
             Channel::new([1], dtype::u32)
-                .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+                .capacity(channel_capacity() as u32)
                 .named("quest_layer_count")
         });
         let kvlen_out = report.then(|| {
             Channel::new([1], dtype::u32)
-                .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+                .capacity(channel_capacity() as u32)
                 .named("quest_kv_len")
         });
 
@@ -367,10 +361,7 @@ async fn main(input: Input) -> Result<Output> {
             //    The backend keeps the request's last page whatever this says
             //    -- it holds the token this fire is writing -- which is also
             //    Quest's own rule that the local window is never evicted.
-            intrinsics::kernel::attn_page_mask(&pivot_threshold(
-                &scores,
-                rank_le(budget),
-            ));
+            intrinsics::kernel::attn_page_mask(&pivot_threshold(&scores, rank_le(budget)));
 
             // Everything below is the report, not the policy: the mask above
             // has already been applied to this layer.
@@ -405,9 +396,12 @@ async fn main(input: Input) -> Result<Output> {
             rng.put(&add(&r, iota(2)));
 
             // Publish the layer fold, then re-seed it for the next fire.
-            if let (Some(acc), Some(layer_ct), Some(scores_out), Some(layers_out)) =
-                (acc.as_ref(), layer_ct.as_ref(), scores_out.as_ref(), layers_out.as_ref())
-            {
+            if let (Some(acc), Some(layer_ct), Some(scores_out), Some(layers_out)) = (
+                acc.as_ref(),
+                layer_ct.as_ref(),
+                scores_out.as_ref(),
+                layers_out.as_ref(),
+            ) {
                 let folded = acc.take().tensor();
                 let layers = layer_ct.take().tensor();
                 scores_out.put(&folded);
@@ -418,28 +412,19 @@ async fn main(input: Input) -> Result<Output> {
         });
 
         let budget_n = max_tokens - 1;
-        let mut submitted = 0usize;
-        let mut in_flight = 0usize;
-        while in_flight < DEFAULT_RUNAHEAD_DEPTH && submitted < budget_n {
-            fwd.submit(&pipe)
-                .map_err(|e| format!("decode submit @{}: {e}", submitted + 1))?;
-            submitted += 1;
-            in_flight += 1;
-        }
-        while in_flight > 0 {
+        run_ahead(&pipe, &fwd, budget_n as usize, async || {
             let t = tok_out
                 .take()
                 .get::<i32>()
                 .await
                 .map_err(|e| format!("tok_out.take @{}: {e}", generated.len()))?[0];
-            last_scores = match scores_out.as_ref() {
-                Some(ch) => ch
+            if let Some(ch) = scores_out.as_ref() {
+                last_scores = ch
                     .take()
                     .get::<f32>()
                     .await
-                    .map_err(|e| format!("quest_scores.take @{}: {e}", generated.len()))?,
-                None => last_scores,
-            };
+                    .map_err(|e| format!("quest_scores.take @{}: {e}", generated.len()))?;
+            }
             layers_observed = match layers_out.as_ref() {
                 Some(ch) => ch
                     .take()
@@ -456,15 +441,10 @@ async fn main(input: Input) -> Result<Output> {
                     .map_err(|e| format!("quest_kv_len.take @{}: {e}", generated.len()))?[0],
                 None => kv_len_last,
             };
-            in_flight -= 1;
             generated.push(t as u32);
-            if submitted < budget_n {
-                fwd.submit(&pipe)
-                    .map_err(|e| format!("decode submit @{}: {e}", submitted + 1))?;
-                submitted += 1;
-                in_flight += 1;
-            }
-        }
+            Ok(ControlFlow::Continue(()))
+        })
+        .await?;
     }
     pipe.close();
 

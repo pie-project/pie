@@ -1,0 +1,122 @@
+//! Per-region decisions the host makes and the driver currently re-derives.
+//!
+//! `ptir-refactor.md` §4.2 lists five per-program fields the launch package
+//! still has to absorb. Two of them live in one C++ file,
+//! `driver/cuda/src/pipeline/region_support.hpp`:
+//!
+//! * the **bind-time region gates** — `second_party_region_supported` and
+//!   `validate_generated_region`, which decide whether a region can be bound
+//!   and whether it can be emitted;
+//! * the **intrinsic side-table analysis** — `analyze_direct_argmax`, which
+//!   decides which `argmax` reads a logits intrinsic's device buffer straight
+//!   and which nodes that makes redundant.
+//!
+//! All three already exist here, because the emitter needs the same answers to
+//! generate the kernel. That is the problem: the emitted kernel and the host
+//! packer that fills its side tables are two ends of one contract, and today
+//! they are decided by two implementations in two languages. A disagreement
+//! does not fail to compile — it produces a kernel that reads a slot the packer
+//! never wrote.
+//!
+//! So the answers ship. The driver keeps its derivation while both exist,
+//! compares, and counts divergence; the copy goes when the counter is zero
+//! *and* the host-supplied counter is not (`e50769003` — a comparison that
+//! never ran reports the same zero as one that always agreed).
+
+use alloc::vec::Vec;
+
+use pie_plan::CompiledStage;
+
+use crate::cuda::fused::analyze_direct_argmax;
+use crate::cuda::validate::{second_party_region_supported, validate_generated_region};
+use crate::op_view::{OpView, result_bases};
+
+/// The region can be bound as a second-party (non-generated) region — today
+/// `envelope_dot` and the `attn_page_mask` sink.
+pub const REGION_SECOND_PARTY_SUPPORTED: u32 = 1 << 0;
+/// The region is a well-formed generated region, so the fused emitter accepts
+/// it. Mutually exclusive with the flag above in practice, but derived
+/// independently, so recorded independently.
+pub const REGION_GENERATED_VALID: u32 = 1 << 1;
+
+/// One `argmax` that reads a logits intrinsic's buffer directly.
+///
+/// Sparse on purpose: the driver's form is four arrays as long as the stage's
+/// op list, and almost every entry is the "does not apply" sentinel. What the
+/// packer actually consumes is this handful of records.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectArgmaxRecord {
+    /// The `argmax` node, in stage op order.
+    pub node: u32,
+    /// The value id of the intrinsic buffer it reads instead.
+    pub source_value: u32,
+    /// `IntrinsicId` of that buffer — `Logits` or `MtpLogits`.
+    pub intrinsic: u16,
+    /// The rewrite is only valid if the source has exactly one runtime row,
+    /// which is a per-fire check the driver makes against the lane's
+    /// descriptors.
+    pub requires_single_row: u8,
+}
+
+/// Every decision about one region that the driver derives for itself today.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegionAnalysis {
+    pub stage_index: u32,
+    pub region_index: u32,
+    /// `REGION_*` bits.
+    pub flags: u32,
+    pub direct_argmax: Vec<DirectArgmaxRecord>,
+    /// Nodes made redundant by the rewrites above, ascending. The driver's
+    /// dense `skipped` array is exactly this set.
+    pub skipped: Vec<u32>,
+}
+
+/// Analyse every fused region of every stage, in stage then region order.
+///
+/// Indices match `emit_program`'s, so a driver can join the two tables on
+/// `(stage_index, region_index)` without knowing what a plan is.
+pub fn analyze_program(stages: &[CompiledStage]) -> Vec<RegionAnalysis> {
+    let mut out = Vec::new();
+    for (stage_index, stage) in stages.iter().enumerate() {
+        let ops: Vec<OpView> = OpView::of_all(&stage.normalized.ops);
+        let bases = result_bases(&ops);
+        for (region_index, region) in stage.fused.regions.iter().enumerate() {
+            let mut flags = 0u32;
+            if second_party_region_supported(stage, region) {
+                flags |= REGION_SECOND_PARTY_SUPPORTED;
+            }
+            if validate_generated_region(stage, region).is_ok() {
+                flags |= REGION_GENERATED_VALID;
+            }
+
+            let direct = analyze_direct_argmax(stage, region, &bases);
+            let mut records = Vec::new();
+            for node in 0..direct.intrinsic.len() {
+                if direct.intrinsic[node] != u16::MAX {
+                    records.push(DirectArgmaxRecord {
+                        node: node as u32,
+                        source_value: direct.source_value[node],
+                        intrinsic: direct.intrinsic[node],
+                        requires_single_row: direct.requires_single_row[node],
+                    });
+                }
+            }
+            let skipped: Vec<u32> = direct
+                .skipped
+                .iter()
+                .enumerate()
+                .filter(|&(_, &flag)| flag != 0)
+                .map(|(node, _)| node as u32)
+                .collect();
+
+            out.push(RegionAnalysis {
+                stage_index: stage_index as u32,
+                region_index: region_index as u32,
+                flags,
+                direct_argmax: records,
+                skipped,
+            });
+        }
+    }
+    out
+}

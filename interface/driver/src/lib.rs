@@ -13,6 +13,7 @@
 
 pub mod capabilities;
 pub mod geometry;
+pub mod image;
 pub mod local;
 pub mod plan;
 pub mod remote;
@@ -23,15 +24,15 @@ pub use capabilities::{
     KV_COPY_HOST_TO_DEVICE, KV_COPY_HOST_TO_HOST, ModelLoadDesc, Mxfp4MoeRequest,
 };
 pub use geometry::{
-    GeometryClass, PIE_DECODE_ENVELOPE_PORTS, PIE_DEVICE_GEOMETRY_PORTS,
-    PIE_DEVICE_PORT_ATTN_MASK, PIE_DEVICE_PORT_EMBED_TOKENS, PIE_DEVICE_PORT_KV_LEN,
-    PIE_DEVICE_PORT_PAGE_INDPTR, PIE_DEVICE_PORT_PAGES, PIE_DEVICE_PORT_POSITIONS,
-    PIE_DEVICE_PORT_W_OFF, PIE_DEVICE_PORT_W_SLOT,
+    GeometryClass, PIE_DECODE_ENVELOPE_PORTS, PIE_DEVICE_GEOMETRY_PORTS, PIE_DEVICE_PORT_ATTN_MASK,
+    PIE_DEVICE_PORT_EMBED_TOKENS, PIE_DEVICE_PORT_KV_LEN, PIE_DEVICE_PORT_PAGE_INDPTR,
+    PIE_DEVICE_PORT_PAGES, PIE_DEVICE_PORT_POSITIONS, PIE_DEVICE_PORT_W_OFF,
+    PIE_DEVICE_PORT_W_SLOT,
 };
 pub use local::*;
 pub use plan::{
-    CHANNEL_TICKET_NONE, ChannelRegistrationPlan, EncodedMask, KvCopyPlan, LaunchPlan,
-    MediaEncodePlan, PoolResizePlan, ProgramRegistration, RS_FLAG_FOLD, RS_FLAG_RESET,
+    CHANNEL_TICKET_NONE, ChannelRegistrationPlan, EmittedKernel, EncodedMask, KvCopyPlan,
+    LaunchPlan, MediaEncodePlan, PoolResizePlan, ProgramRegistration, RS_FLAG_FOLD, RS_FLAG_RESET,
     StateCopyPlan,
 };
 pub use remote::*;

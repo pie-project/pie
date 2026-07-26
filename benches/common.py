@@ -413,7 +413,8 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
         default=None,
         help="Decode frames each pie lane keeps queued in the engine. "
              "The wave quorum waits for every lane, so deeper queues hide "
-             "guest turnaround. pie only; default 2 (inferlet default).",
+             "guest turnaround. pie only; unset means the engine sizes the "
+             "window itself via model.channel-capacity().",
     )
 
 

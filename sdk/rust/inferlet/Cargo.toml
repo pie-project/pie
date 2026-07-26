@@ -22,7 +22,7 @@ pico-args = "0.5"
 # wasm-buildable, no wit-bindgen (the single `wit_bindgen::generate!` stays here
 # in `inferlet`). The `inferlet::ptir` bridge wraps the WIT ptir resources and
 # drives this crate's `Builder`.
-ptir-dsl = { path = "../ptir-dsl" }
+pie-dsl = { path = "../../../compiler/dsl" }
 
 [features]
 # A1/A4 transitional gate. The programmable-sampler authoring surface — the

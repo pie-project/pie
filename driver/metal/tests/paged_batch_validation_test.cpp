@@ -108,7 +108,7 @@ int main() {
            "over-cap (>64 token) paged prompt rejects before command encoding");
 
     {
-        pie_native::ptir::FireGeometry geometry;
+        pie_native::launch::FireGeometry geometry;
         geometry.token_ids = {1, 2};
         geometry.position_ids = {0, 1};
         geometry.qo_indptr = {0, 2};
@@ -124,7 +124,7 @@ int main() {
         geometry.has_mask = true;
         geometry.structured_mask = {
             .kind =
-                pie_native::ptir::StructuredMaskKind::SlidingWindow,
+                pie_native::launch::StructuredMaskKind::SlidingWindow,
             .key_len = 4,
             .window = 2,
         };
@@ -138,7 +138,7 @@ int main() {
                 desc.attention_mask_stride == 4 &&
                 desc.attention_mask == geometry.mask &&
                 desc.structured_mask.kind ==
-                    pie_native::ptir::StructuredMaskKind::SlidingWindow,
+                    pie_native::launch::StructuredMaskKind::SlidingWindow,
             "resolved dense/structured fallback mask survives member "
             "composition exactly (" +
                 err + ")");
@@ -152,7 +152,7 @@ int main() {
             "structured masks without a dense fallback reject explicitly");
     }
     {
-        pie_native::ptir::FireGeometry geometry;
+        pie_native::launch::FireGeometry geometry;
         geometry.token_ids = {3, 5};
         geometry.position_ids = {7, 7};
         geometry.qo_indptr = {0, 1, 2};
@@ -174,7 +174,7 @@ int main() {
         };
         const std::uint32_t buffered_activation_slots[] = {3, 2};
         const std::uint32_t buffered_activation_indptr[] = {0, 2};
-        PieLaunchDesc launch{};
+        pie_native::StepLaunch launch{};
         launch.rs_slot_ids = {
             .ptr = folded_slots,
             .len = 2,
@@ -208,7 +208,7 @@ int main() {
         const std::uint32_t missing_folded_slots[] = {0};
         const std::uint8_t missing_folded_flags[] = {
             PIE_RS_FLAG_RESET};
-        PieLaunchDesc missing_folded_launch = launch;
+        pie_native::StepLaunch missing_folded_launch = launch;
         missing_folded_launch.rs_slot_ids = {
             .ptr = missing_folded_slots,
             .len = 1,

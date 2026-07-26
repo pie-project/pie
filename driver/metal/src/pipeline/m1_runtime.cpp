@@ -5,6 +5,7 @@
 #include <bit>
 #include <chrono>
 #include <cstdlib>
+#include <iostream>
 #include <cstring>
 #include <filesystem>
 #include <iomanip>
@@ -15,11 +16,17 @@
 #include <unordered_set>
 #include <utility>
 
-#include "pie_native/ptir/ptir_abi.h"
+#include <ptir_abi.h>
 #include "observability.hpp"
-#include "pipeline/m1_codegen.hpp"
+#include "pipeline/region_support.hpp"
 
 namespace pie::metal::pipeline {
+
+// Threads a grouped generated region gets per lane. Taken from the generated
+// header rather than retyped: the emitter sizes the threadgroup argmax buffer
+// for exactly this many, and the two values already drifted once (they were 256
+// here against a 1024 buffer) with nothing to notice.
+inline constexpr std::uint32_t kM3RegionThreads = PTIR_METAL_M3_REGION_THREADS;
 
 std::string encode_m1_cache_identity(
     std::uint64_t device,
@@ -115,6 +122,73 @@ std::size_t align_up(std::size_t value, std::size_t alignment = 256) {
     return (value + alignment - 1) / alignment * alignment;
 }
 
+// The `#include` line the host-embedded runtime template carries verbatim.
+// `compiler/codegen/src/metal/preamble.rs` embeds the full
+// `ptir_m1_runtime.metal` into every emitted MSL source but leaves this
+// include untouched, because expanding it is a driver concern — the RNG
+// preamble is generated from `compiler/ir/src/rng.rs` and lives beside the
+// driver's other kernel sources so a build-system `configure_file` keeps
+// them in lockstep. The Metal shader compiler resolves nothing from the
+// filesystem, so we splice the preamble in ourselves here.
+constexpr std::string_view kPtirRngInclude =
+    "#include \"ptir_rng.generated.metal\"";
+
+void inline_ptir_rng_preamble(
+    std::string& source, const std::string& preamble) {
+    if (preamble.empty()) return;
+    std::size_t position = source.find(kPtirRngInclude);
+    while (position != std::string::npos) {
+        source.replace(position, kPtirRngInclude.size(), preamble);
+        position = source.find(
+            kPtirRngInclude, position + preamble.size());
+    }
+}
+
+// (kind, stage, region) → host-emitted source. An entry the host recorded
+// with an empty `source` and a populated `error` is a *deliberate* refusal
+// to emit — see the type-level comment on `PieEmittedKernel` — so it is
+// indexed here too, and callers check `error` before `source` to preserve
+// the fallback that the old `emit_*_msl(...) == false` return took.
+class HostEmittedKernels {
+  public:
+    explicit HostEmittedKernels(
+        std::span<const HostEmittedKernel> kernels) {
+        entries_.reserve(kernels.size());
+        for (const auto& kernel : kernels) {
+            entries_.emplace(
+                Key{kernel.kind, kernel.stage_index, kernel.region_index},
+                &kernel);
+        }
+    }
+
+    const HostEmittedKernel* find(
+        std::uint32_t kind,
+        std::uint32_t stage_index,
+        std::uint32_t region_index) const {
+        const auto found =
+            entries_.find(Key{kind, stage_index, region_index});
+        return found == entries_.end() ? nullptr : found->second;
+    }
+
+  private:
+    struct Key {
+        std::uint32_t kind;
+        std::uint32_t stage;
+        std::uint32_t region;
+        bool operator==(const Key&) const = default;
+    };
+    struct KeyHash {
+        std::size_t operator()(const Key& key) const {
+            const std::uint64_t packed =
+                (static_cast<std::uint64_t>(key.kind) << 56) ^
+                (static_cast<std::uint64_t>(key.stage) << 24) ^
+                key.region;
+            return static_cast<std::size_t>(packed);
+        }
+    };
+    std::unordered_map<Key, const HostEmittedKernel*, KeyHash> entries_;
+};
+
 SlotHandle subhandle(
     const SlotHandle& base,
     std::size_t offset,
@@ -184,7 +258,7 @@ std::uint32_t symbolic_extent(
 }
 
 bool describe_value(
-    const pie_native::ptir::plan::ValueType& type,
+    const pie_native::launch::plan::ValueType& type,
     const M1RuntimeExtents& extents,
     DeviceValueDesc& descriptor) {
     descriptor = {};
@@ -243,7 +317,7 @@ std::size_t wire_value_bytes(const DeviceValueDesc& descriptor) {
 }
 
 std::uint64_t combined_signature(
-    const std::vector<pie_native::ptir::plan::StagePlan>& plans) {
+    const std::vector<pie_native::launch::plan::StagePlan>& plans) {
     std::vector<std::uint8_t> bytes;
     bytes.reserve(plans.size() * sizeof(std::uint64_t));
     for (const auto& plan : plans) {
@@ -259,7 +333,7 @@ std::uint64_t combined_signature(
 }  // namespace
 
 M1ResolvedShape resolve_m1_shape_for_test(
-    const pie_native::ptir::plan::ValueType& type,
+    const pie_native::launch::plan::ValueType& type,
     const M1RuntimeExtents& extents) {
     DeviceValueDesc descriptor;
     if (!describe_value(type, extents, descriptor)) return {};
@@ -316,13 +390,13 @@ struct M1RegionExecutable {
 };
 
 struct M2FusedRegionExecutable {
-    pie_native::ptir::plan::Region region;
+    pie_native::launch::plan::Region region;
     Pso pso{};
     int ordinal = -1;
 };
 
 struct M3GroupedRegionExecutable {
-    pie_native::ptir::plan::Region region;
+    pie_native::launch::plan::Region region;
     Pso pso{};
     bool parallel_nucleus = false;
     bool parallel_topk = false;
@@ -338,17 +412,16 @@ struct M1StageExecutable {
     std::string fused_reason;
     std::string grouped_reason;
     std::string cache_identity;
-    std::vector<std::uint8_t> canonical_signature;
+    std::vector<std::uint8_t> stage_identity;
 };
 
 struct M1ProgramStage {
     std::shared_ptr<M1StageExecutable> executable;
-    pie_native::ptir::plan::StagePlan plan;
+    pie_native::launch::plan::StagePlan plan;
 };
 
 struct M1ProgramExecutable {
     std::uint64_t program_hash = 0;
-    std::vector<std::uint8_t> canonical_bytes;
     std::vector<M1ProgramStage> stages;
     std::vector<M1ChannelEffect> effects;
     Pso readiness{};
@@ -521,19 +594,25 @@ std::uint8_t m3_schedule_bucket(const M1RuntimeExtents& extents) {
                      32 - std::countl_zero(rows - 1));
 }
 
+std::vector<std::uint8_t> identity_bytes(std::uint64_t identity) {
+    std::vector<std::uint8_t> bytes(sizeof(identity));
+    std::memcpy(bytes.data(), &identity, sizeof(identity));
+    return bytes;
+}
+
 std::string m3_stage_key(
     const M1ProgramStage& stage,
     const M1RuntimeExtents& extents) {
-    if (stage.plan.signature.empty()) return {};
+    if (stage.plan.identity == 0) return {};
     std::string key(
-        reinterpret_cast<const char*>(stage.plan.signature.data()),
-        stage.plan.signature.size());
+        reinterpret_cast<const char*>(&stage.plan.identity),
+        sizeof(stage.plan.identity));
     key.push_back(static_cast<char>(m3_schedule_bucket(extents)));
     return key;
 }
 
 std::size_t m3_used_channel_slots(
-    const pie_native::ptir::plan::StagePlan& stage) {
+    const pie_native::launch::plan::StagePlan& stage) {
     std::size_t count = 0;
     for (const auto& normalized : stage.ops) {
         if (normalized.op.chan >= 0) {
@@ -653,7 +732,7 @@ struct M1Runtime::Impl {
 
     std::unique_ptr<RawMetalContext> context;
     std::filesystem::path cache_dir;
-    std::string runtime_template;
+    std::string ptir_rng_preamble;
     int next_ordinal = 100000;
     std::unordered_map<std::string, std::shared_ptr<M1StageExecutable>>
         stage_cache;
@@ -756,11 +835,18 @@ std::unique_ptr<M1Runtime> M1Runtime::create(
     impl->context->make_resident();
     impl->cache_dir =
         cache_dir.empty() ? default_m1_cache_dir() : cache_dir;
-    const std::filesystem::path runtime_path =
-        std::filesystem::path(kernels_dir) / "ptir_m1_runtime.metal";
+    // The host emitter embeds the M1 runtime template into every emitted
+    // source (`compiler/codegen/src/metal/preamble.rs`), so the driver no
+    // longer keeps its own copy on disk. But that template still carries
+    // `#include "ptir_rng.generated.metal"` — the RNG preamble is emitted
+    // once from `compiler/ir/src/rng.rs` and staged into `kernels_dir` by
+    // CMake's `configure_file`, and Metal's runtime shader compiler does
+    // no filesystem include lookup, so we splice it in ourselves later.
+    const std::filesystem::path rng_path =
+        std::filesystem::path(kernels_dir) / "ptir_rng.generated.metal";
     if (!read_ptir_msl_source(
-            runtime_path.string(), impl->runtime_template, &error) ||
-        impl->runtime_template.empty()) {
+            rng_path.string(), impl->ptir_rng_preamble, &error) ||
+        impl->ptir_rng_preamble.empty()) {
         return nullptr;
     }
     if (const char* injected =
@@ -779,28 +865,14 @@ std::unique_ptr<M1Runtime> M1Runtime::create(
 std::shared_ptr<M1ProgramExecutable> M1Runtime::compile_program(
     std::uint64_t program_hash,
     const ExecPlan& plan,
+    std::span<const HostEmittedKernel> emitted_kernels,
     std::string& error,
-    std::span<const std::uint8_t> canonical_bytes,
     M1CompileFailureKind* failure_kind) {
     if (failure_kind != nullptr) {
         *failure_kind = M1CompileFailureKind::None;
     }
     if (const auto found = impl_->programs.find(program_hash);
         found != impl_->programs.end()) {
-        if (!canonical_bytes.empty() &&
-            (found->second->canonical_bytes.empty() ||
-             found->second->canonical_bytes.size() !=
-                 canonical_bytes.size() ||
-             !std::equal(
-                 canonical_bytes.begin(),
-                 canonical_bytes.end(),
-                 found->second->canonical_bytes.begin()))) {
-            error = "Metal M1 program hash collision";
-            if (failure_kind != nullptr) {
-                *failure_kind = M1CompileFailureKind::Deterministic;
-            }
-            return nullptr;
-        }
         ++impl_->stats.memory_hits;
         return found->second;
     }
@@ -834,10 +906,8 @@ std::shared_ptr<M1ProgramExecutable> M1Runtime::compile_program(
                 ? "Metal M1 plan is not executable"
                 : plan.reject_reason);
     }
-    if (plan.bound.version < 2 ||
-        (plan.region_plans.empty() && !plan.trace.stages.empty())) {
-        return reject_deterministic(
-            "Metal M1 requires PTIB v2 with PTRP v4/compiler v3 plans");
+    if (plan.region_plans.empty() && !plan.trace.stages.empty()) {
+        return reject_deterministic("Metal M1 requires launch stage plans");
     }
     if (plan.region_plans.size() != plan.trace.stages.size()) {
         return reject_deterministic("Metal M1 plan/stage count mismatch");
@@ -891,8 +961,6 @@ std::shared_ptr<M1ProgramExecutable> M1Runtime::compile_program(
 
     auto executable = std::make_shared<M1ProgramExecutable>();
     executable->program_hash = program_hash;
-    executable->canonical_bytes.assign(
-        canonical_bytes.begin(), canonical_bytes.end());
     executable->requires_m2_placement = requires_m2_placement;
     executable->effects.resize(plan.trace.channels.size());
     for (std::size_t channel = 0; channel < plan.trace.channels.size();
@@ -901,30 +969,45 @@ std::shared_ptr<M1ProgramExecutable> M1Runtime::compile_program(
         effect.capacity = plan.trace.channels[channel].capacity;
         effect.take = plan.takes_channel(static_cast<std::uint32_t>(channel));
         effect.put = plan.puts_channel(static_cast<std::uint32_t>(channel));
-        const auto readiness = std::find_if(
-            plan.bound.readiness.begin(),
-            plan.bound.readiness.end(),
-            [channel](const auto& entry) {
-                return entry.chan == channel;
-            });
-        if (readiness != plan.bound.readiness.end()) {
-            effect.requires_full =
-                readiness->dir ==
-                pie_native::ptir::container::Direction::NeedsFull;
-            effect.requires_empty =
-                readiness->dir ==
-                pie_native::ptir::container::Direction::NeedsEmpty;
-        }
+        // First-touch, as shipped. Not `takes || reads` vs `puts`: an
+        // in-place channel is in both sets and would gate on a ring that is
+        // at once non-empty and non-full.
+        const launch::Readiness readiness = plan.trace.channels[channel].readiness;
+        effect.requires_full = readiness == launch::Readiness::NeedsFull;
+        effect.requires_empty = readiness == launch::Readiness::NeedsEmpty;
     }
+
+    HostEmittedKernels host_kernels(emitted_kernels);
 
     std::size_t total_regions = 0;
     std::vector<std::vector<M1OpMeta>> validated_operations;
     validated_operations.reserve(plan.region_plans.size());
-    for (const auto& stage_plan : plan.region_plans) {
+    for (std::size_t stage_index = 0;
+         stage_index < plan.region_plans.size();
+         ++stage_index) {
+        const auto& stage_plan = plan.region_plans[stage_index];
         for (const std::uint32_t binding : stage_plan.channel_bindings) {
             if (binding >= plan.trace.channels.size()) {
                 return reject_deterministic(
                     "Metal M1 stage channel binding is out of range");
+            }
+        }
+        // Every channel op's local slot, checked once here so the encode and
+        // placement paths can index `channel_bindings` directly. `chan` is
+        // signed and -1 means "no channel", which converts to SIZE_MAX at the
+        // subscript -- so an unchecked op is an out-of-bounds read, not a
+        // wrong answer.
+        for (const auto& meta : stage_plan.ops) {
+            const auto& op = meta.op;
+            if (op.tag != PTIR_OP_CHAN_TAKE && op.tag != PTIR_OP_CHAN_READ &&
+                op.tag != PTIR_OP_CHAN_PUT) {
+                continue;
+            }
+            if (op.chan < 0 ||
+                static_cast<std::size_t>(op.chan) >=
+                    stage_plan.channel_bindings.size()) {
+                return reject_deterministic(
+                    "Metal M1 stage channel op has no binding slot");
             }
         }
         if (stage_plan.singleton.regions.size() > kMaxRegionsPerStage ||
@@ -934,13 +1017,27 @@ std::shared_ptr<M1ProgramExecutable> M1Runtime::compile_program(
                 "Metal M1 singleton executable exceeds the bounded region cache");
         }
         total_regions += stage_plan.singleton.regions.size();
-        std::vector<M1OpMeta> operations;
-        std::string validation_error;
-        if (!validate_singleton_plan(
-                stage_plan, operations, validation_error)) {
-            return reject_deterministic(validation_error);
+        // Singleton validation is the host's job now; if the whole stage
+        // is unrepresentable, `compiler/codegen/src/program.rs` pushes a
+        // single KERNEL_SINGLETON entry at region 0 with a populated
+        // `error` and an empty `source` (see `emit_metal_stage`). That is
+        // the same deterministic reject the C++ `validate_singleton_plan`
+        // used to raise -- distinguishable from a successful emission at
+        // region 0 because the latter always carries source and never
+        // carries error. On success the walker below is a deterministic
+        // prefix sum over `op.results`, the same walk the host runs
+        // before it emits.
+        if (const auto* stage_signal =
+                host_kernels.find(PIE_KERNEL_SINGLETON,
+                                  static_cast<std::uint32_t>(stage_index),
+                                  0);
+            stage_signal != nullptr &&
+            stage_signal->source.empty() &&
+            !stage_signal->error.empty()) {
+            return reject_deterministic(stage_signal->error);
         }
-        validated_operations.push_back(std::move(operations));
+        validated_operations.push_back(
+            collect_singleton_metadata(stage_plan));
     }
 
     PsoCompileTransaction transaction(
@@ -960,8 +1057,8 @@ std::shared_ptr<M1ProgramExecutable> M1Runtime::compile_program(
             stage_plan.signature_hash);
         if (const auto found = impl_->stage_cache.find(identity);
             found != impl_->stage_cache.end()) {
-            if (found->second->canonical_signature !=
-                stage_plan.signature) {
+            if (found->second->stage_identity !=
+                identity_bytes(stage_plan.identity)) {
                 return reject_deterministic(
                     "Metal M1 stage signature hash collision");
             }
@@ -972,8 +1069,8 @@ std::shared_ptr<M1ProgramExecutable> M1Runtime::compile_program(
         }
         if (const auto found = pending_stages.find(identity);
             found != pending_stages.end()) {
-            if (found->second->canonical_signature !=
-                stage_plan.signature) {
+            if (found->second->stage_identity !=
+                identity_bytes(stage_plan.identity)) {
                 return reject_deterministic(
                     "Metal M1 stage signature hash collision");
             }
@@ -989,29 +1086,43 @@ std::shared_ptr<M1ProgramExecutable> M1Runtime::compile_program(
         }
         auto stage = std::make_shared<M1StageExecutable>();
         stage->cache_identity = identity;
-        stage->canonical_signature = stage_plan.signature;
+        stage->stage_identity = identity_bytes(stage_plan.identity);
         const std::filesystem::path directory =
             impl_->cache_dir / identity;
         for (std::size_t region = 0; region < operations.size(); ++region) {
-            const std::string function =
-                "ptir_m1_" + hex64(stage_plan.signature_hash) + "_r" +
-                std::to_string(region);
-            const std::string source = emit_singleton_region_msl(
-                impl_->runtime_template,
-                function,
-                operations[region].op.tag);
+            // The whole-stage singleton reject was already caught above via
+            // the KERNEL_SINGLETON entry at region 0; any per-region miss or
+            // error past that gate is an ABI bug (the host validated the
+            // stage but declined to emit one of its regions), so it is
+            // reported deterministically -- reject_retryable would loop.
+            const auto* entry = host_kernels.find(
+                PIE_KERNEL_SINGLETON,
+                static_cast<std::uint32_t>(stage_index),
+                static_cast<std::uint32_t>(region));
+            if (entry == nullptr || entry->source.empty()) {
+                return reject_deterministic(
+                    "Metal M1 host emitter missing singleton kernel for "
+                    "stage " +
+                    std::to_string(stage_index) + " region " +
+                    std::to_string(region) +
+                    (entry != nullptr && !entry->error.empty()
+                         ? ": " + entry->error
+                         : std::string{}));
+            }
+            std::string source = entry->source;
+            inline_ptir_rng_preamble(source, impl_->ptir_rng_preamble);
             Pso pso;
             if (!impl_->compile_cached(
                     source,
-                    function,
+                    entry->entry_name,
                     directory / ("region-" + std::to_string(region) + ".mtl4archive"),
                     pso,
                     error,
                     transaction)) {
                 return reject_retryable(
                     "Metal M1 compile failed for " +
-                    std::string(pie_native::ptir::op_name(
-                        static_cast<pie_native::ptir::OpCode>(
+                    std::string(pie_native::launch::op_name(
+                        static_cast<pie_native::launch::OpCode>(
                             operations[region].op.tag))) +
                     ": " + error);
             }
@@ -1028,27 +1139,36 @@ std::shared_ptr<M1ProgramExecutable> M1Runtime::compile_program(
             for (std::size_t region = 0;
                  region < stage_plan.fused.regions.size();
                  ++region) {
-                const std::string function =
-                    "ptir_m2_" + hex64(stage_plan.signature_hash) + "_r" +
-                    std::to_string(region);
-                std::string source;
-                std::string emit_error;
-                if (!emit_fused_region_msl(
-                        impl_->runtime_template,
-                        function,
-                        stage_plan,
-                        stage_plan.fused.regions[region],
-                        source,
-                        emit_error)) {
+                // "Failure is data" for M2: the host records the same
+                // 12-channel refusal (and any other emission failure) as a
+                // KERNEL_FUSED entry with empty source + populated error.
+                // The old bool-returning emitter surfaced identical text
+                // through `emit_error`; treat the two shapes uniformly and
+                // drop this stage to the singleton fallback exactly as
+                // before.
+                const auto* entry = host_kernels.find(
+                    PIE_KERNEL_FUSED,
+                    static_cast<std::uint32_t>(stage_index),
+                    static_cast<std::uint32_t>(region));
+                if (entry == nullptr) {
+                    return reject_deterministic(
+                        "Metal M2 host emitter missing fused kernel for "
+                        "stage " +
+                        std::to_string(stage_index) + " region " +
+                        std::to_string(region));
+                }
+                if (entry->source.empty()) {
                     stage->fused_supported = false;
-                    stage->fused_reason = emit_error;
+                    stage->fused_reason = entry->error;
                     stage->fused_regions.clear();
                     break;
                 }
+                std::string source = entry->source;
+                inline_ptir_rng_preamble(source, impl_->ptir_rng_preamble);
                 Pso pso;
                 if (!impl_->compile_cached(
                         source,
-                        function,
+                        entry->entry_name,
                         directory /
                             ("fused-" + std::to_string(region) +
                              ".mtl4archive"),
@@ -1068,26 +1188,33 @@ std::shared_ptr<M1ProgramExecutable> M1Runtime::compile_program(
         for (std::size_t region = 0;
              region < stage_plan.singleton.regions.size();
              ++region) {
-            const std::string function =
-                "ptir_m3s_" + hex64(stage_plan.signature_hash) + "_r" +
-                std::to_string(region);
-            std::string source;
-            std::string emit_error;
-            if (!emit_grouped_fused_region_msl(
-                    impl_->runtime_template,
-                    function,
-                    stage_plan,
-                    stage_plan.singleton.regions[region],
-                    source,
-                    emit_error)) {
+            // Grouped-singleton (M3s) sits at region indices
+            // [0, singleton.regions.size()) inside KERNEL_GROUPED; grouped
+            // fused shares the same kind but starts at
+            // singleton.regions.size(). Emission failure here is a
+            // deterministic reject because the driver has no other grouped
+            // path for a singleton stage -- matching the old grouped-
+            // singleton emitter's false return.
+            const auto* entry = host_kernels.find(
+                PIE_KERNEL_GROUPED,
+                static_cast<std::uint32_t>(stage_index),
+                static_cast<std::uint32_t>(region));
+            if (entry == nullptr || entry->source.empty()) {
                 return reject_deterministic(
                     "Metal M3 grouped singleton emission failed: " +
-                    emit_error);
+                    (entry != nullptr && !entry->error.empty()
+                         ? entry->error
+                         : std::string(
+                               "host emitter produced no source for stage " +
+                               std::to_string(stage_index) + " region " +
+                               std::to_string(region))));
             }
+            std::string source = entry->source;
+            inline_ptir_rng_preamble(source, impl_->ptir_rng_preamble);
             Pso pso;
             if (!impl_->compile_cached(
                     source,
-                    function,
+                    entry->entry_name,
                     directory /
                         ("grouped-singleton-" + std::to_string(region) +
                          ".mtl4archive"),
@@ -1120,45 +1247,37 @@ std::shared_ptr<M1ProgramExecutable> M1Runtime::compile_program(
                 !region_plan.nodes.empty() &&
                 stage_plan.ops[region_plan.nodes.front()].op.tag ==
                     PTIR_OP_TOP_K;
-            const std::string function =
-                "ptir_m3_" + hex64(stage_plan.signature_hash) + "_r" +
-                std::to_string(region);
-            std::string source;
-            std::string emit_error;
-            const bool emitted =
-                parallel_nucleus
-                    ? emit_grouped_nucleus_msl(
-                          impl_->runtime_template,
-                          function,
-                          stage_plan,
-                          region_plan,
-                          source,
-                          emit_error)
-                    : parallel_topk
-                    ? emit_grouped_topk_msl(
-                          impl_->runtime_template,
-                          function,
-                          stage_plan,
-                          region_plan,
-                          source,
-                          emit_error)
-                    : emit_grouped_fused_region_msl(
-                          impl_->runtime_template,
-                          function,
-                          stage_plan,
-                          region_plan,
-                          source,
-                          emit_error);
-            if (!emitted) {
+            // Grouped fused (and its nucleus/top-k specialisations) occupy
+            // the tail of KERNEL_GROUPED, offset past the M3s block; the
+            // dispatch on parallel_nucleus/parallel_topk is now the
+            // host's, so the driver just receives the right source under
+            // this key. A host-recorded error is data: it drops the stage
+            // to singleton fallback, exactly like the old
+            // emit_*_msl(false) branch.
+            const auto* entry = host_kernels.find(
+                PIE_KERNEL_GROUPED,
+                static_cast<std::uint32_t>(stage_index),
+                static_cast<std::uint32_t>(
+                    stage_plan.singleton.regions.size() + region));
+            if (entry == nullptr) {
+                return reject_deterministic(
+                    "Metal M3 host emitter missing grouped kernel for "
+                    "stage " +
+                    std::to_string(stage_index) + " fused region " +
+                    std::to_string(region));
+            }
+            if (entry->source.empty()) {
                 stage->grouped_supported = false;
-                stage->grouped_reason = emit_error;
+                stage->grouped_reason = entry->error;
                 stage->grouped_regions.clear();
                 break;
             }
+            std::string source = entry->source;
+            inline_ptir_rng_preamble(source, impl_->ptir_rng_preamble);
             Pso pso;
             if (!impl_->compile_cached(
                     source,
-                    function,
+                    entry->entry_name,
                     directory /
                         ("grouped-" + std::to_string(region) +
                          ".mtl4archive"),
@@ -1195,13 +1314,51 @@ std::shared_ptr<M1ProgramExecutable> M1Runtime::compile_program(
         impl_->context->device_cache_id(), effect_signature);
     const std::filesystem::path effect_dir =
         impl_->cache_dir / effect_identity;
-    const std::string readiness_name =
-        "ptir_m1_" + hex64(effect_signature) + "_ready";
-    const std::string commit_name =
-        "ptir_m1_" + hex64(effect_signature) + "_commit";
+    // Two distinct effect-kernel families, and they are not interchangeable:
+    // the M1/M2 launch paths bind the single-lane form with this program's
+    // channel effects baked in, while the M3 grouped path binds the generic
+    // form that reads the same decisions out of a per-channel flag word. They
+    // take different buffer shapes, so compiling one from the other's source
+    // links but cannot run.
+    //
+    // The host emits both: the grouped pair at (stage 0, region 0), named by
+    // emitter version because it is shared across programs, and the per-program
+    // pair at (stage 0, region 1). See `emit_metal_program_effects` in
+    // `compiler/codegen/src/program.rs`.
+    const auto* readiness_entry =
+        host_kernels.find(PIE_KERNEL_READINESS, 0, 1);
+    if (readiness_entry == nullptr || readiness_entry->source.empty()) {
+        return reject_deterministic(
+            "Metal readiness kernel missing from host emission" +
+            (readiness_entry != nullptr && !readiness_entry->error.empty()
+                 ? ": " + readiness_entry->error
+                 : std::string{}));
+    }
+    const auto* commit_entry =
+        host_kernels.find(PIE_KERNEL_COMMIT, 0, 1);
+    if (commit_entry == nullptr || commit_entry->source.empty()) {
+        return reject_deterministic(
+            "Metal commit kernel missing from host emission" +
+            (commit_entry != nullptr && !commit_entry->error.empty()
+                 ? ": " + commit_entry->error
+                 : std::string{}));
+    }
+    const auto* grouped_readiness_entry =
+        host_kernels.find(PIE_KERNEL_READINESS, 0, 0);
+    const auto* grouped_commit_entry =
+        host_kernels.find(PIE_KERNEL_COMMIT, 0, 0);
+    if (grouped_readiness_entry == nullptr ||
+        grouped_readiness_entry->source.empty() ||
+        grouped_commit_entry == nullptr ||
+        grouped_commit_entry->source.empty()) {
+        return reject_deterministic(
+            "Metal grouped effect kernels missing from host emission");
+    }
+    std::string readiness_source = readiness_entry->source;
+    inline_ptir_rng_preamble(readiness_source, impl_->ptir_rng_preamble);
     if (!impl_->compile_cached(
-            emit_readiness_msl(readiness_name, executable->effects),
-            readiness_name,
+            readiness_source,
+            readiness_entry->entry_name,
             effect_dir / "readiness.mtl4archive",
             executable->readiness,
             error,
@@ -1209,9 +1366,11 @@ std::shared_ptr<M1ProgramExecutable> M1Runtime::compile_program(
         return reject_retryable(
             "Metal M1 readiness compile failed: " + error);
     }
+    std::string commit_source = commit_entry->source;
+    inline_ptir_rng_preamble(commit_source, impl_->ptir_rng_preamble);
     if (!impl_->compile_cached(
-            emit_commit_msl(commit_name, executable->effects),
-            commit_name,
+            commit_source,
+            commit_entry->entry_name,
             effect_dir / "commit.mtl4archive",
             executable->commit,
             error,
@@ -1219,14 +1378,12 @@ std::shared_ptr<M1ProgramExecutable> M1Runtime::compile_program(
         return reject_retryable(
             "Metal M1 commit compile failed: " + error);
     }
-    const std::string grouped_ready_name =
-        "ptir_m3_generic_ready_v" +
-        std::to_string(kMetalM1EmitterVersion);
-    const std::string grouped_commit_name =
-        "ptir_m3_generic_commit_v" +
-        std::to_string(kMetalM1EmitterVersion);
+    // The grouped readiness/commit share the emitter-version identity rather
+    // than the per-program effect signature, so they get their own archive
+    // directory.
     const std::string grouped_effect_identity =
-        grouped_ready_name + "|" + grouped_commit_name;
+        grouped_readiness_entry->entry_name + "|" +
+        grouped_commit_entry->entry_name;
     const std::filesystem::path grouped_effect_dir =
         impl_->cache_dir /
         encode_cache_identity(
@@ -1237,10 +1394,13 @@ std::shared_ptr<M1ProgramExecutable> M1Runtime::compile_program(
                 grouped_effect_identity.size()));
     Pso grouped_readiness = impl_->grouped_readiness;
     Pso grouped_commit = impl_->grouped_commit;
+    std::string grouped_readiness_source = grouped_readiness_entry->source;
+    inline_ptir_rng_preamble(
+        grouped_readiness_source, impl_->ptir_rng_preamble);
     if (!grouped_readiness.valid() &&
         !impl_->compile_cached(
-            emit_grouped_readiness_msl(grouped_ready_name),
-            grouped_ready_name,
+            grouped_readiness_source,
+            grouped_readiness_entry->entry_name,
             grouped_effect_dir / "readiness.mtl4archive",
             grouped_readiness,
             error,
@@ -1248,10 +1408,12 @@ std::shared_ptr<M1ProgramExecutable> M1Runtime::compile_program(
         return reject_retryable(
             "Metal M3 grouped readiness compile failed: " + error);
     }
+    std::string grouped_commit_source = grouped_commit_entry->source;
+    inline_ptir_rng_preamble(grouped_commit_source, impl_->ptir_rng_preamble);
     if (!grouped_commit.valid() &&
         !impl_->compile_cached(
-            emit_grouped_commit_msl(grouped_commit_name),
-            grouped_commit_name,
+            grouped_commit_source,
+            grouped_commit_entry->entry_name,
             grouped_effect_dir / "commit.mtl4archive",
             grouped_commit,
             error,
@@ -2232,6 +2394,15 @@ M1ExecuteOutcome M1Runtime::finish_m2_command(
     return M1ExecuteOutcome::Failed;
 }
 
+// `PIE_METAL_M3_GPU_TIMESTAMPS=1` re-enables the per-fire GPU counter sampling.
+static bool m3_gpu_timestamps_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("PIE_METAL_M3_GPU_TIMESTAMPS");
+        return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
+    return on;
+}
+
 bool M1Runtime::prepare_m3_group(
     const std::vector<M3LaneCandidate>& candidates,
     RawMetalContext& target,
@@ -2306,7 +2477,14 @@ bool M1Runtime::prepare_m3_group(
     group->commit = impl_->grouped_commit;
     group->readiness_ordinal = impl_->next_ordinal++;
     group->commit_ordinal = impl_->next_ordinal++;
-    group->timestamp_heap = target.create_timestamp_heap(2);
+    // GPU counter sampling for the M3 epilogue, off unless asked for. It buys
+    // one diagnostic stat (post_forward_critical_ns) and costs a counter-heap
+    // create, a resolveCounterRange and a release on EVERY fire --- measured at
+    // 5.0ms of a ~13ms token, which is the entire host gap between two forwards
+    // and, because the GPU is idle across it, most of the reason the clock
+    // drops. The host-clock fallback below reports the same span for free.
+    if (m3_gpu_timestamps_enabled())
+        group->timestamp_heap = target.create_timestamp_heap(2);
     const std::size_t lane_count = candidates.size();
     const std::size_t lane_bytes =
         sizeof(PtirLaneTableHeader) +
@@ -2864,13 +3042,35 @@ bool M1Runtime::prepare_m3_group(
                 };
                 encoded.threadgroup = {256, 1, 1};
             } else {
+                // A generated region used to get one thread per lane, which put
+                // every vocabulary-wide op in a PTIR program on a single lane of
+                // the GPU: ~155ms of a ~159ms decode step against a ~3ms model
+                // forward. It gets a threadgroup per lane instead.
+                //
+                // Take the widest threadgroup this pipeline actually allows,
+                // rounded down to a multiple of the simd width, and never more
+                // than the threadgroup buffer the kernel declares. The region's
+                // vocabulary-wide ops are latency-bound inside one threadgroup,
+                // so width is throughput.
+                std::uint32_t width = std::min<std::uint32_t>(
+                    kM3RegionThreads,
+                    std::max<std::uint32_t>(
+                        32u, context().pso_max_threads(region.pso)));
+                width = std::max<std::uint32_t>(32u, (width / 32u) * 32u);
+                const std::uint64_t threads =
+                    static_cast<std::uint64_t>(stage_lane_count) * width;
+                if (threads > std::numeric_limits<std::uint32_t>::max()) {
+                    error = "Metal M3 region launch exceeds u32 grid";
+                    group->stages.push_back(std::move(stage));
+                    release_group();
+                    return false;
+                }
                 encoded.grid = {
-                    static_cast<std::uint32_t>(
-                        stage_lane_count),
+                    static_cast<std::uint32_t>(threads),
                     1,
                     1,
                 };
-                encoded.threadgroup = {1, 1, 1};
+                encoded.threadgroup = {width, 1, 1};
             }
             stage.regions.push_back(encoded);
         }
@@ -2959,17 +3159,84 @@ std::vector<M1ExecuteOutcome> M1Runtime::finish_m3_group(
     const auto* statuses =
         static_cast<const DeviceStatus*>(command->statuses.contents());
     outcomes.reserve(command->candidates.size());
+    // The lane status is written by the kernel, and on the failure path it is
+    // the only account of what happened: `m1_fault` stores the op tag it could
+    // not execute in `fault`, and the lane-table guard stores the ABI version
+    // and the (lane_count, channel_count) it saw. Dropping it left the driver
+    // printing "launch failed:" with nothing after the colon.
+    std::string faults;
     for (std::size_t lane = 0; lane < command->candidates.size(); ++lane) {
-        if (statuses[lane].state == 4)
+        if (statuses[lane].state == 4) {
             outcomes.push_back(M1ExecuteOutcome::Committed);
-        else if (statuses[lane].state == 2)
+            continue;
+        }
+        if (statuses[lane].state == 2) {
             outcomes.push_back(M1ExecuteOutcome::Retry);
-        else
-            outcomes.push_back(M1ExecuteOutcome::Failed);
+            continue;
+        }
+        outcomes.push_back(M1ExecuteOutcome::Failed);
+        if (!faults.empty()) faults += "; ";
+        // `m1_fault_op` packs the guard site into the top byte of reserved1
+        // and the immediate into the rest; `reserved0` is the intrinsic id.
+        // The lane-table guard (fault 0x100) uses the same fields differently,
+        // so it is reported raw.
+        const std::uint32_t site = statuses[lane].reserved1 >> 24;
+        const char* site_name =
+            site == 1   ? "channel sink narrower than the value"
+            : site == 2 ? "MtpDrafts with a zero row width"
+            : site == 3 ? "no arm claimed this op tag"
+                        : "unknown";
+        faults += "lane " + std::to_string(lane) + " state=" +
+                  std::to_string(statuses[lane].state) + " op_tag=0x" +
+                  hex64(statuses[lane].fault) + " intr=" +
+                  std::to_string(statuses[lane].reserved0) + " imm=" +
+                  std::to_string(statuses[lane].reserved1 & 0x00ffffffu) +
+                  " guard=" + site_name;
+    }
+    // The emitted regions guard on the group layout the host wrote, so a fault
+    // there is usually a layout the host got wrong rather than a bad op. Report
+    // it alongside, or the next reader is back to reading the emitter.
+    if (!faults.empty()) {
+        for (const auto& stage : command->stages) {
+            if (!stage.layout.valid() || stage.layout.contents() == nullptr) continue;
+            const auto* layout =
+                static_cast<const M3GroupLayout*>(stage.layout.contents());
+            faults += "; stage layout lanes=" + std::to_string(layout->lane_count) +
+                      " values=" + std::to_string(layout->value_count) +
+                      " vocab=" + std::to_string(layout->vocab) +
+                      " scratch_stride=" + std::to_string(layout->scratch_stride);
+            if (stage.descriptors.valid() &&
+                stage.descriptors.contents() != nullptr) {
+                const auto* descs = static_cast<const DeviceValueDesc*>(
+                    stage.descriptors.contents());
+                faults += " desc_len=[";
+                for (std::uint32_t i = 0; i < layout->value_count; ++i) {
+                    if (i != 0) faults += ",";
+                    faults += std::to_string(descs[i].len);
+                }
+                faults += "]";
+            }
+            break;
+        }
+    }
+    if (!faults.empty() && command->row_meta.valid() &&
+        command->row_meta.contents() != nullptr) {
+        const auto* meta =
+            static_cast<const M3RowMeta*>(command->row_meta.contents());
+        faults += "; row_meta[0] offset=" + std::to_string(meta[0].offset) +
+                  " count=" + std::to_string(meta[0].count) +
+                  " mtp_offset=" + std::to_string(meta[0].mtp_offset);
+    }
+    if (!faults.empty() && error.empty()) {
+        error = "Metal M3 group reported a device fault (" + faults +
+                "); fault 0x100 is the lane-table ABI/shape guard, any other "
+                "value is the PTIR op tag the runtime could not execute";
     }
     std::uint64_t timestamps[2] = {0, 0};
-    command->target->resolve_timestamps(
-        command->timestamp_heap, 2, timestamps);
+    if (command->timestamp_heap != nullptr) {
+        command->target->resolve_timestamps(
+            command->timestamp_heap, 2, timestamps);
+    }
     if (timestamps[1] > timestamps[0]) {
         command->stats.post_forward_critical_ns =
             timestamps[1] - timestamps[0];
@@ -3090,12 +3357,12 @@ std::string M1Runtime::m3_stage_group_key(
 
 void M1Runtime::inject_stage_cache_entry_for_test(
     std::uint64_t signature_hash,
-    std::vector<std::uint8_t> canonical_signature) {
+    std::vector<std::uint8_t> stage_identity) {
     const std::string identity = encode_cache_identity(
         impl_->context->device_cache_id(), signature_hash);
     auto stage = std::make_shared<M1StageExecutable>();
     stage->cache_identity = identity;
-    stage->canonical_signature = std::move(canonical_signature);
+    stage->stage_identity = std::move(stage_identity);
     impl_->stage_cache[identity] = std::move(stage);
 }
 
