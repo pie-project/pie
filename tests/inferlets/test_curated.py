@@ -21,6 +21,25 @@ async def _nonempty(client, args, name: str, inputs: dict) -> str:
     return output
 
 
+# A non-empty continuation proves the plumbing carried tokens; it does NOT prove
+# the pass attended the prompt. A decode loop that over-declares its page CSR (or
+# otherwise reads uninitialised KV) still emits fluent-looking garbage, so any
+# inferlet whose job is "continue this prompt" gets an attention gate as well.
+ATTENDS_PROMPT = "The capital of France is"
+
+
+async def _attends_prompt(client, args, name: str, inputs: dict) -> str:
+    output = await _nonempty(
+        client, args, name, {"prompt": ATTENDS_PROMPT, **inputs}
+    )
+    lowered = output.lower()
+    assert "france" in lowered or "paris" in lowered, (
+        f"{name} did not attend the prompt {ATTENDS_PROMPT!r} "
+        f"(reads uninitialised KV?): {output[:200]!r}"
+    )
+    return output
+
+
 async def _report(client, args, name: str, inputs: dict, *, expect_text: bool = True) -> dict:
     """Run an inferlet whose `Output` struct is serialized to JSON."""
     output = await _nonempty(client, args, name, inputs)
@@ -400,6 +419,22 @@ async def test_naive_baseline(client, args):
     assert report["sampler"] == "naive-baseline", report
 
 
+async def test_chat_completion_attends_prompt(client, args):
+    await _attends_prompt(client, args, "chat-completion", {"max_tokens": 14, "temperature": 0.0})
+
+
+async def test_attention_sink_attends_prompt(client, args):
+    await _attends_prompt(
+        client, args, "attention-sink", {"max_tokens": 14, "sink_size": 4, "window_size": 64}
+    )
+
+
+async def test_sliding_window_attention_attends_prompt(client, args):
+    await _attends_prompt(
+        client, args, "sliding-window-attention", {"max_tokens": 14, "window_size": 64}
+    )
+
+
 def tests():
     return [
         test_chat_completion,
@@ -409,6 +444,9 @@ def tests():
         test_json_schema_constrained_decoding,
         test_attention_sink,
         test_sliding_window_attention,
+        test_chat_completion_attends_prompt,
+        test_attention_sink_attends_prompt,
+        test_sliding_window_attention_attends_prompt,
         test_prefix_tree_kv_cache,
         test_cacheback_speculative_decoding,
         test_constrained_speculative_decoding,

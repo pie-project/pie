@@ -113,7 +113,13 @@ async fn main(input: Input) -> Result<String> {
         let w_off_p = Channel::from(w_off_pv).named("w_off_p");
         let klen_p = Channel::from(vec![n; 1]).named("klen_p");
         let pages_p = Channel::from(pool_ids.clone()).named("pages_p");
-        let page_indptr_p = Channel::from_shaped([2], vec![0u32, pool_pages]).named("pidx_p");
+        // The page CSR is the wire's source of truth for kv_len: the driver derives
+        // `last_page_len = ((kv_len-1) % PAGE_T) + 1` and reads back a span of
+        // `(page_count-1)*PAGE_T + last_page_len` cells. A pool-wide constant count
+        // inflates that span past the live prefix and attends uninitialized KV, so
+        // the count must track `kv_len` exactly.
+        let page_indptr_p =
+            Channel::from_shaped([2], vec![0u32, n.div_ceil(PAGE_T)]).named("pidx_p");
 
         // Causal prefill mask [N, POOL]: query row i attends KV cols j <= i.
         let mask_pv: Vec<bool> = (0..n)
@@ -205,9 +211,14 @@ async fn main(input: Input) -> Result<String> {
             .flat_map(|c| (0..pool).map(move |j| j < n || j == n + c))
             .collect();
         let mask = Channel::from_shaped([b, pool], seed_mask).named("mask");
-        let tiled: Vec<u32> = (0..b).flat_map(|_| pool_ids.iter().copied()).collect();
+        // Lane stride is the LIVE page count, not the pool size; `pages` keeps its
+        // [B*POOL_PAGES] capacity but only the first `b * pc0` entries are read.
+        let pc0 = (n + b).div_ceil(PAGE_T);
+        let tiled: Vec<u32> = (0..b * pool_pages)
+            .map(|i| pool_ids[(i % pc0) as usize])
+            .collect();
         let pages = Channel::from(tiled).named("pages"); // [B*POOL_PAGES]
-        let pidx_v: Vec<u32> = (0..=b).map(|c| c * pool_pages).collect();
+        let pidx_v: Vec<u32> = (0..=b).map(|c| c * pc0).collect();
         let page_indptr = Channel::from_shaped([b + 1], pidx_v).named("page_indptr");
         let pool_ids_ch = Channel::from(pool_ids.clone()).named("pool_ids");
         let out = Channel::new([b], dtype::i32)
@@ -263,11 +274,12 @@ async fn main(input: Input) -> Result<String> {
             let filled = add(&base, b); // [1] span after the next fire's appends
             let klen_n = broadcast(reshape(&filled, [1]), [b]);
             let pos_n = add(pos.take(), 1u32);
-            let pages_n = reshape(
-                broadcast(reshape(&pids, [1, pool_pages]), [b, pool_pages]),
-                [b * pool_pages],
+            let page_count = div(add(&filled, PAGE_T - 1), PAGE_T);
+            let pages_n = gather(
+                &pids,
+                rem(iota(b * pool_pages), broadcast(&page_count, [b * pool_pages])),
             );
-            let pidx_n = mul(iota(b + 1), pool_pages);
+            let pidx_n = mul(iota(b + 1), broadcast(&page_count, [b + 1]));
 
             // Device-resolved geometry is loop-carried: the host never drains
             // these rings, so the graph has to take before it puts or the

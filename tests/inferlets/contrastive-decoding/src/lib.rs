@@ -120,7 +120,11 @@ async fn main(input: Input) -> Result<String> {
         Channel::from((0..n).map(|position| position % PAGE_T).collect::<Vec<_>>());
     let amateur_prefill_klen = Channel::from(vec![n]);
     let amateur_prefill_pages = Channel::from(amateur_ids.clone());
-    let amateur_prefill_indptr = Channel::from_shaped([2], vec![0u32, pool_pages]);
+    // The page CSR is the wire's source of truth for kv_len: the driver derives
+    // `kv_len = (page_count-1)*PAGE_T + last_page_len`. A pool-wide constant page
+    // count claims a kv length the pass does not have and silently corrupts
+    // attention, so the count must track `kv_len` exactly (as the expert pass does).
+    let amateur_prefill_indptr = Channel::from_shaped([2], vec![0u32, n.div_ceil(PAGE_T)]);
     let amateur_prefill_mask = Channel::from_shaped(
         [n, pool_len],
         (0..n)
@@ -234,7 +238,8 @@ async fn main(input: Input) -> Result<String> {
             .collect::<Vec<_>>(),
     );
     let amateur_pages = Channel::from(amateur_ids.clone());
-    let amateur_page_indptr = Channel::from_shaped([2], vec![0u32, pool_pages]);
+    let amateur_page_indptr =
+        Channel::from_shaped([2], vec![0u32, (n + 1).div_ceil(PAGE_T)]);
     let amateur_ids_input = Channel::from(amateur_ids.clone()).named("amateur_pool_ids");
     let amateur_logits_out = Channel::new([vocab], dtype::f32)
         .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
@@ -281,7 +286,8 @@ async fn main(input: Input) -> Result<String> {
         amateur_pages.take();
         amateur_pages.put(reshape(&ids, [pool_pages]));
         amateur_page_indptr.take();
-        amateur_page_indptr.put(mul(iota(2), pool_pages));
+        let amateur_page_count = div(add(&next, PAGE_T - 1), PAGE_T);
+        amateur_page_indptr.put(mul(iota(2), broadcast(&amateur_page_count, [2])));
         amateur_ids_input.put(&ids);
     });
 

@@ -150,7 +150,7 @@ reason `reshape(&x, [1, vocab])` incantations are scattered through the
 inferlets. The defensive spelling, `reshape(intrinsics::logits(), [B, v])`, is
 something every author must learn by being bitten.
 
-### Two unchecked contracts that fail silently
+### Three unchecked contracts that fail silently
 
 Neither of these is expressible in the type system, and both produce a wrong
 answer rather than an error:
@@ -161,12 +161,32 @@ answer rather than an error:
    fire into a **dummy run**.
 2. **Every host-`Writer` channel a fire takes must be `put` before that fire's
    `submit`.** Otherwise the fire silently consumes a stale value.
+3. **The KV page CSR — not the `KvLen` port — is the wire's source of truth for
+   how much KV a lane attends.** `derive_kv_len_kernel`
+   (`driver/cuda/src/kernels/geometry.cu:14`) computes
+   `kv_len = (page_count - 1) * page_size + last_page_len`, where `page_count`
+   comes from `kv_page_indptr` and `last_page_len` is all that survives of the
+   `KvLen` port (`descriptor_resolve.hpp:15`:
+   `last_page_len = ((len - 1) % page) + 1`). An author who declares
+   `page_indptr = [0, reserved_pool_pages]` — the natural reading of "these are
+   my pages" — makes attention read every uninitialised cell between the true
+   length and the pool boundary.
 
 Between them these cost more debugging time than every genuine algorithm
-question in this project combined. Both are mechanically checkable — the first
-from the geometry class and the port's loop-carried status, the second by
-comparing the takes of a submitted fire against the puts issued before it — and
-neither is checked.
+question in this project combined. All three are mechanically checkable — the
+first from the geometry class and the port's loop-carried status, the second by
+comparing the takes of a submitted fire against the puts issued before it, the
+third by asserting `page_indptr` spans agree with the `KvLen` the same fire
+declares — and none is checked.
+
+The third is the worst of the three, because it is the only one whose failure
+mode is *plausible output*. The other two produce a dummy run or a stale
+constant, which shows up immediately. Over-declared pages produce grammatical,
+confidently-wrong text — six of the thirty inferlets shipped with it, passing a
+green test suite, until an end-to-end test that asserted on *content* rather
+than on liveness caught it. Nor does the attention mask save you: `pack_dense_mask.cu`
+packs mask cells over the lane's *derived physical* span, so a correctly-sized
+mask is simply laid out against the wrong geometry.
 
 ### The missing intrinsic sets a hard boundary
 
@@ -204,4 +224,4 @@ the orchestration layer instead.
 | **Fusion** | Strong. 27/30 inferlets compile with zero barriers. The barrier set is small and its cost is exactly where the cliffs are. |
 | **Fusion — risk** | The one library pattern is an exact match, and a miss dropped to an asymptotically worse implementation. Fixed; the class of defect is not. |
 | **Performance** | Overhead is marginal, never fixed. The real limit is lost run-ahead for any host-dependent step — architectural, not incidental. |
-| **Expressiveness** | Algorithms read close to their equations. Two silent-failure contracts and one leaking shape rule are the sharp edges; the missing attention-score intrinsic is the one hard wall. |
+| **Expressiveness** | Algorithms read close to their equations. Three silent-failure contracts and one leaking shape rule are the sharp edges; the missing attention-score intrinsic is the one hard wall. |

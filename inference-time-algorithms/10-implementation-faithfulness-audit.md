@@ -1056,7 +1056,7 @@ cutoff. `sampling-primitives` pins it with a keep-mask published in a shape that
 contract without depending on float summation order: 37 tokens, 0.901134 mass at
 `top_p = 0.9`, in 0.2 s.
 
-### Two inferlet authoring contracts, discovered the hard way
+### Three inferlet authoring contracts, discovered the hard way
 
 Both of these fail **silently** — no error, no exception, just a wrong or empty
 result — which is why they cost the most debugging time.
@@ -1069,6 +1069,10 @@ result — which is why they cost the most debugging time.
 - **Every host-`Writer` channel a fire takes must be `put` before that fire's
   `submit`.** Three inferlets submitted `DEFAULT_RUNAHEAD_DEPTH` fires while
   supplying a single value.
+- **The KV page CSR is the wire's source of truth for `kv_len`, not the `KvLen`
+  port.** Six inferlets over-declared it and read uninitialised KV. This one gets
+  its own section below, because it is the most serious defect this project
+  found and the test suite was structurally incapable of catching it.
 
 ### Three algorithms are structurally depth-1
 
@@ -1104,6 +1108,77 @@ that shares none of that machinery.
 The identity holds exactly at width 1, and the search demonstrably leaves the
 greedy path — and improves the score — as the width grows. Width alone would not
 have shown the first; the identity alone would not have shown the second.
+
+### The defect the test suite could not see
+
+`cuda_chat_completion_e2e` asserts that a continuation of "The capital of France
+is" contains "Paris". It had been `#[ignore]`d. When it was finally run, the
+inferlet returned:
+
+```
+" worellerllerllerllerller..."
+```
+
+The engine was not at fault. Under the same engine, `naive-baseline` returned
+`" Paris, and it's a country in eastern Europe"` and `text-completion-bench`
+returned `"<think>\nOkay, the user is asking about the capital of France. I
+know"`. Bisecting on token count localised it precisely: `max_tokens = 1`
+produced the *correct* first token, `max_tokens = 4` produced garbage. Prefill
+was fine; the **decode loop** was broken.
+
+Instrumenting the inferlet with host-readable debug channels showed every input
+was correct — `pos = 28, 29, 30 ...`, `kv_len = 29, 30, 31 ...`, a dense mask of
+exactly the right width with exactly the right maximum. Correct inputs, wrong
+output.
+
+The mechanism is in the driver. `derive_kv_len_kernel`
+(`driver/cuda/src/kernels/geometry.cu:14`) reconstructs the attended span from
+the page CSR:
+
+```
+kv_len[r] = (page_count - 1) * page_size + last_page_len[r]
+page_count = kv_page_indptr[r + 1] - kv_page_indptr[r]
+```
+
+and `last_page_len` is the *only* thing that survives of the `KvLen` port
+(`descriptor_resolve.hpp:15`: `last_page_len = ((len - 1) % page) + 1`). The
+kernel comment states this is bit-identical to the host formula in
+`request.rs::append_request_with_options` — it is a deliberate handshake
+invariant, and it means the CSR wins.
+
+`chat-completion` declared `page_indptr = [0, pool_pages] = [0, 3]` — "these are
+the pages I reserved" — with `kv_len = 29`. The driver derived
+`last_page_len = 13` and a span of `2 * 16 + 13 = 45`. Attention read **16 cells
+of uninitialised KV** on every decode step. Correcting the CSR to track the true
+length made the token stream match `text-completion-bench` exactly.
+
+An audit of every `page_indptr` binding found six inferlets with the same defect:
+`chat-completion`, `attention-sink`, `sliding-window-attention`,
+`contrastive-decoding` (amateur pass only), `consensus-decoding` and
+`beam-search`. Roughly twenty others already used the correct idiom
+(`page_count = ceil(kv_len / page_size)`), which is why the failure looked
+sporadic rather than systemic. For multi-lane fires the `pages` array must
+additionally be tiled at stride *page_count*, not pool size, because
+`page_indptr[c] = c * page_count` indexes into it; since channel shapes are
+static the fix is to keep the pool-sized capacity and rebuild the contents with
+`gather(&pids, rem(iota(N), broadcast(&page_count, [N])))`.
+
+Two things about this are worth more than the fix itself.
+
+**The mask does not save you.** `pack_dense_mask.cu` packs the dense
+`[TOTAL_Q, STRIDE]` mask page-major over each lane's live pages, and the `klen`
+it uses is the *derived physical* span. A perfectly-sized mask is laid out
+against the wrong geometry, so it cannot suppress what the geometry invented.
+
+**The suite was built to miss this.** `test_curated.py`'s `_nonempty` asserts
+the output is non-empty. Six inferlets produced fluent-looking garbage and passed
+for the entire project. Even `test_beam_search_greedy_identity` could not catch
+it: it compares the beam pick against `reduce_argmax` of *the same corrupt
+logits*, so it validates the beam machinery while being blind to model quality.
+A liveness assertion cannot detect a corruption that preserves liveness. The
+suite now carries `_attends_prompt`, which runs the fixed prompt "The capital of
+France is" and requires the continuation to mention France or Paris — a
+content assertion, cheap, and the pre-fix binaries fail it.
 
 ---
 

@@ -103,7 +103,12 @@ async fn main(input: Input) -> Result<String> {
         .reserve(POOL_PAGES)
         .map_err(|e| format!("ws.reserve pool: {e}"))?;
     let pool_ids = pool.ids().to_vec();
-    let tiled: Vec<u32> = (0..B).flat_map(|_| pool_ids.iter().copied()).collect(); // [B*POOL_PAGES]
+    // Seeded at klen = 1 ⇒ one live page per lane, so lane b's single page sits at
+    // flat slot b. `pages` keeps its [B*POOL_PAGES] capacity; only the first
+    // `B * page_count` entries are read.
+    let tiled: Vec<u32> = (0..B * POOL_PAGES)
+        .map(|i| pool_ids[(i % 1) as usize])
+        .collect(); // [B*POOL_PAGES]
     let pool0 = pool_ids[0];
 
     // Shared BOS prompt at pool position 0: both beams attend it (mask), and the
@@ -132,7 +137,13 @@ async fn main(input: Input) -> Result<String> {
     // kv_page_indptr. Feeding page_indptr through a channel (re-put each fire with
     // the same constant) keeps every descriptor port channel-bound (the
     // device-geometry-fire wire-form).
-    let pidx_const: Vec<u32> = (0..=B).map(|b| b * POOL_PAGES).collect();
+    // The page CSR is the wire's source of truth for kv_len: the driver derives
+    // `last_page_len = ((kv_len-1) % PAGE_T) + 1` and then reads back a span of
+    // `(page_count-1)*PAGE_T + last_page_len` cells per lane. Declaring all
+    // POOL_PAGES here would inflate that span past the live prefix and attend
+    // uninitialized KV, so the per-lane page count must track `klen` exactly and
+    // `pages` must be tiled at THAT stride, not at POOL_PAGES.
+    let pidx_const: Vec<u32> = (0..=B).map(|b| b).collect();
     let page_indptr = Channel::from_shaped([B + 1], pidx_const.clone()).named("page_indptr");
     let lanes_b = Channel::from((0u32..=B).collect::<Vec<_>>()).named("embed_indptr");
 
@@ -237,18 +248,18 @@ async fn main(input: Input) -> Result<String> {
         // Re-emit the fixed Pages port each fire: the pool ids tiled B
         // times (every beam references all POOL_PAGES pool pages; the mask does
         // the per-beam selection). Built in-graph from the host-fed pids.
-        let pages_ig = reshape(
-            broadcast(reshape(&pids, [1, POOL_PAGES]), [B, POOL_PAGES]),
-            [B * POOL_PAGES],
+        // Live page count for the NEXT fire, from that fire's klen.
+        let page_count = div(add(&filled, PAGE_T - 1), PAGE_T);
+        let pages_ig = gather(
+            &pids,
+            rem(iota(B * POOL_PAGES), broadcast(&page_count, [B * POOL_PAGES])),
         );
         pages.take();
         pages.put(&pages_ig);
         // Re-emit the constant page_indptr each fire (channel-bound; peeked ports
         // still want a fresh value each pass). [0, POOL_PAGES, 2*POOL_PAGES].
         page_indptr.take();
-        page_indptr.put(Tensor::constant(
-            (0..=B).map(|b| b * POOL_PAGES).collect::<Vec<_>>(),
-        ));
+        page_indptr.put(mul(iota(B + 1), broadcast(&page_count, [B + 1])));
 
         out.put(&tok_i);
         out_par.put(&parent);
