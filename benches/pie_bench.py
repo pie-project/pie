@@ -298,12 +298,14 @@ def build_config(args: argparse.Namespace):
     else:
         driver_options = {}
 
-    # Concurrency 0 means "no admission cap" (all submitted inferlets run wasm
-    # immediately; the inference scheduler still caps via max_forward_requests).
+    # Concurrency 0 means "no explicit cap": the engine then defaults its
+    # admission cap to the driver's max_forward_requests (R). Admitting more
+    # than R processes cannot widen a batch (one fire per process per forward),
+    # it only makes batches ragged -- see bootstrap.rs.
     if args.mode == "latency":
         max_concurrent_processes: int | None = 1
     elif args.concurrency == 0:
-        max_concurrent_processes = None  # serializer drops field → unlimited
+        max_concurrent_processes = None  # serializer drops field → engine default
     else:
         max_concurrent_processes = args.concurrency
     requested_scheduler_kwargs = {

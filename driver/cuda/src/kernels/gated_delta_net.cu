@@ -2,7 +2,10 @@
 
 #include <cuda_bf16.h>
 #include <cstdlib>
+#include <map>
+#include <mutex>
 #include <stdexcept>
+#include <utility>
 
 namespace pie_cuda_driver::kernels {
 
@@ -109,6 +112,31 @@ bool qwen_gdn_fused_step_enabled() {
 // bf16 V-last decode shape (V_d==K_d==128, !k_last); everything else
 // falls back to the legacy kernel. Set PIE_QWEN35_GDN_SMEM_STEP=0 to
 // force the fallback.
+// `cudaFuncSetAttribute` configures a kernel's dynamic shared-memory cap
+// PER DEVICE. A process-global "already configured" flag therefore lies to
+// every device but the first: under tensor parallelism rank 0 raises the
+// cap on device 0, sets the flag, and rank 1 skips the call — then launches
+// the same kernel on device 1 asking for more shared memory than that
+// device allows. Track the high-water mark per device instead.
+bool gdn_raise_shmem_cap(const void* func, int shmem_bytes) {
+    if (shmem_bytes <= 48 * 1024) return true;
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) return false;
+    static std::mutex mutex;
+    static std::map<std::pair<int, const void*>, int> configured;
+    std::lock_guard<std::mutex> guard(mutex);
+    int& high_water = configured[{device, func}];
+    if (shmem_bytes <= high_water) return true;
+    const cudaError_t status = cudaFuncSetAttribute(
+        func, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_bytes);
+    if (status != cudaSuccess) {
+        static_cast<void>(cudaGetLastError());
+        return false;
+    }
+    high_water = shmem_bytes;
+    return true;
+}
+
 bool qwen_gdn_smem_step_enabled() {
     static const bool enabled = [] {
         const char* v = std::getenv("PIE_QWEN35_GDN_SMEM_STEP");
@@ -2394,22 +2422,13 @@ void launch_chunk_gated_delta_prefill_batched_cached(
     dim3 grid(R, V_h);
     dim3 block(BLOCK);
     const int shmem_bytes = K_d * V_d * static_cast<int>(sizeof(float));
-    static int configured_shmem_bytes = 0;
     const bool k_last = qwen_gdn_k_last_state_enabled();
-    if (shmem_bytes > 48 * 1024 && shmem_bytes > configured_shmem_bytes) {
-        if (k_last) {
-            cudaFuncSetAttribute(
-                chunk_gated_delta_prefill_batched_cached_kernel<float, true>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize,
-                shmem_bytes);
-        } else {
-            cudaFuncSetAttribute(
-                chunk_gated_delta_prefill_batched_cached_kernel<float, false>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize,
-                shmem_bytes);
-        }
-        configured_shmem_bytes = shmem_bytes;
-    }
+    gdn_raise_shmem_cap(
+        k_last ? reinterpret_cast<const void*>(
+                     chunk_gated_delta_prefill_batched_cached_kernel<float, true>)
+               : reinterpret_cast<const void*>(
+                     chunk_gated_delta_prefill_batched_cached_kernel<float, false>),
+        shmem_bytes);
     if (k_last) {
         chunk_gated_delta_prefill_batched_cached_kernel<float, true><<<
             grid, block, shmem_bytes, stream>>>(
@@ -2441,22 +2460,13 @@ void launch_chunk_gated_delta_prefill_batched_cached_state_bf16(
     dim3 grid(R, V_h);
     dim3 block(BLOCK);
     const int shmem_bytes = K_d * V_d * static_cast<int>(sizeof(float));
-    static int configured_shmem_bytes = 0;
     const bool k_last = qwen_gdn_k_last_state_enabled();
-    if (shmem_bytes > 48 * 1024 && shmem_bytes > configured_shmem_bytes) {
-        if (k_last) {
-            cudaFuncSetAttribute(
-                chunk_gated_delta_prefill_batched_cached_kernel<__nv_bfloat16, true>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize,
-                shmem_bytes);
-        } else {
-            cudaFuncSetAttribute(
-                chunk_gated_delta_prefill_batched_cached_kernel<__nv_bfloat16, false>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize,
-                shmem_bytes);
-        }
-        configured_shmem_bytes = shmem_bytes;
-    }
+    gdn_raise_shmem_cap(
+        k_last ? reinterpret_cast<const void*>(
+                     chunk_gated_delta_prefill_batched_cached_kernel<__nv_bfloat16, true>)
+               : reinterpret_cast<const void*>(
+                     chunk_gated_delta_prefill_batched_cached_kernel<__nv_bfloat16, false>),
+        shmem_bytes);
     if (k_last) {
         chunk_gated_delta_prefill_batched_cached_kernel<__nv_bfloat16, true><<<
             grid, block, shmem_bytes, stream>>>(
