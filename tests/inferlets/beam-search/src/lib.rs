@@ -37,6 +37,13 @@ fn default_beams() -> u32 {
     2
 }
 
+/// Per-step disagreements between the beam pick and the raw-logit argmax.
+fn count_greedy_mismatches(picked: &[i32], greedy: &[i32], beams: u32) -> usize {
+    (0..beams as usize)
+        .filter(|&lane| picked.get(lane) != greedy.get(lane))
+        .count()
+}
+
 fn advance_hypotheses(
     hypotheses: &[Vec<u32>],
     picked: &[i32],
@@ -139,6 +146,17 @@ async fn main(input: Input) -> Result<String> {
     let out_scr = Channel::new([B], dtype::f32)
         .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
         .named("out_scr");
+    // Independent per-lane greedy argmax over the RAW logits, published beside
+    // the beam pick. At `beams == 1` the beam identity says the two must agree
+    // on every step: top-1 over the flattened [1*V] candidate block is
+    // `argmax(log_softmax(logits) + score)`, and both `log_softmax` and adding
+    // a per-row constant are monotone, so it reduces to `argmax(logits)`. The
+    // comparison therefore exercises log_softmax, the score accumulator, the
+    // [B*V] flatten, `top_k`, and the `idx / v` / `idx % v` decomposition
+    // against an operator that shares none of that machinery.
+    let out_greedy = Channel::new([B], dtype::i32)
+        .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+        .named("out_greedy");
 
     let pipeline = Pipeline::new();
     let mut rs_working_sets = if wit_model::rs_state_size() > 0 {
@@ -167,9 +185,13 @@ async fn main(input: Input) -> Result<String> {
     )?;
     fwd.epilogue(move || {
         // 1. top-B over the flattened [B,V] cand block.
+        // `intrinsics::logits()` squeezes to rank-1 `[v]` when the fire has a
+        // single read-out row, so a width-1 beam has to be reshaped back to
+        // `[B, v]` before it can meet the `[B, 1]`-broadcast score column.
+        let logits = reshape(intrinsics::logits(), [B, v]);
         let cand = add(
             broadcast(reshape(scores.take(), [B, 1]), [B, v]),
-            log_softmax(intrinsics::logits()),
+            log_softmax(&logits),
         );
         let (s, i) = top_k(reshape(cand, [B * v]), B);
         let parent = div(&i, v);
@@ -231,6 +253,7 @@ async fn main(input: Input) -> Result<String> {
         out.put(&tok_i);
         out_par.put(&parent);
         out_scr.put(&s);
+        out_greedy.put(&reshape(cast(reduce_argmax(&logits), DType::I32), [B]));
         pool_ids_ch.put(&pids);
     });
 
@@ -238,6 +261,7 @@ async fn main(input: Input) -> Result<String> {
     // hypothesis from the parent permutation emitted by the device.
     let mut hypotheses = vec![Vec::<u32>::new(); B as usize];
     let mut final_scores = vec![f32::NEG_INFINITY; B as usize];
+    let mut greedy_mismatches = 0usize;
     if rs_working_sets.is_empty() {
         let mut submitted = 0usize;
         let mut in_flight = 0usize;
@@ -263,6 +287,12 @@ async fn main(input: Input) -> Result<String> {
                 .get::<f32>()
                 .await
                 .map_err(|e| format!("out_scr.take @{step}: {e}"))?;
+            let greedy = out_greedy
+                .take()
+                .get::<i32>()
+                .await
+                .map_err(|e| format!("out_greedy.take @{step}: {e}"))?;
+            greedy_mismatches += count_greedy_mismatches(&picked, &greedy, B);
             in_flight -= 1;
             hypotheses = advance_hypotheses(&hypotheses, &picked, &parents, B)?;
             if submitted < max_steps {
@@ -292,6 +322,12 @@ async fn main(input: Input) -> Result<String> {
                 .get::<f32>()
                 .await
                 .map_err(|e| format!("out_scr.take @{step}: {e}"))?;
+            let greedy = out_greedy
+                .take()
+                .get::<i32>()
+                .await
+                .map_err(|e| format!("out_greedy.take @{step}: {e}"))?;
+            greedy_mismatches += count_greedy_mismatches(&picked, &greedy, B);
             let mut next_rs = Vec::with_capacity(B as usize);
             for lane in 0..B as usize {
                 let parent = *parents
@@ -321,9 +357,21 @@ async fn main(input: Input) -> Result<String> {
         .max_by(|(_, a), (_, b)| a.total_cmp(b))
         .map(|(index, _)| index)
         .ok_or("beam search produced no hypotheses")?;
+    // The beam identity is only an identity at width 1; at B > 1 the top-B
+    // block legitimately picks non-argmax continuations for the lower lanes.
+    if B == 1 && greedy_mismatches != 0 {
+        return Err(format!(
+            "beam identity violated: width-1 beam search disagreed with greedy \
+             argmax on {greedy_mismatches} of {max_steps} steps"
+        ));
+    }
     eprintln!(
         "beam-search: width={B} steps={max_steps} best_score={:.4}",
         final_scores[best_lane]
     );
-    wit_model::decode(&hypotheses[best_lane])
+    let text = wit_model::decode(&hypotheses[best_lane])?;
+    Ok(format!(
+        "{text}\n[beam] width={B} steps={max_steps} best_score={:.4} greedy_mismatches={greedy_mismatches}",
+        final_scores[best_lane]
+    ))
 }

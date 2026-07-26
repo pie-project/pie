@@ -207,7 +207,22 @@ async def test_mirostat_v2_sampling(client, args):
 
 
 async def test_beam_search(client, args):
-    await _nonempty(client, args, "beam-search", {"max_tokens": 2})
+    output = await _nonempty(client, args, "beam-search", {"max_tokens": 2})
+    assert "[beam] width=2" in output, output
+
+
+async def test_beam_search_greedy_identity(client, args):
+    """Width 1 is exactly greedy, so no step may diverge from the raw argmax."""
+    output = await _nonempty(client, args, "beam-search", {"max_tokens": 6, "beams": 1})
+    assert "greedy_mismatches=0" in output, output
+
+
+async def test_beam_search_width_explores(client, args):
+    """Width 3 must actually leave the greedy path, or the search is a no-op."""
+    output = await _nonempty(client, args, "beam-search", {"max_tokens": 6, "beams": 3})
+    assert "[beam] width=3" in output, output
+    mismatches = int(output.split("greedy_mismatches=")[1].split()[0])
+    assert mismatches > 0, output
 
 
 async def test_contrastive_decoding(client, args):
@@ -399,6 +414,8 @@ def tests():
         test_constrained_speculative_decoding,
         test_mirostat_v2_sampling,
         test_beam_search,
+        test_beam_search_greedy_identity,
+        test_beam_search_width_explores,
         test_contrastive_decoding,
         test_locally_typical_sampling,
         test_eta_epsilon_sampling,
