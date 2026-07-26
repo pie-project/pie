@@ -24,6 +24,7 @@ pub mod regular;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 
 use gpugrammar_ir::fsm::{Automaton, FsmEdge, NfaGraph, StateId};
+use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Identifies a terminal of the context-free skeleton.
@@ -587,29 +588,35 @@ pub fn group_state(lexer: &Lexer, vocabulary: &[Vec<u8>], state: LexState) -> (V
 
 /// Group every token of `vocabulary`, from every lexer state.
 pub fn group_vocabulary(lexer: &Lexer, vocabulary: &[Vec<u8>]) -> VocabularyGroups {
-    let mut per_state = Vec::with_capacity(lexer.num_states());
-    let mut rejected = vec![0u32; lexer.num_states()];
-
-    for state in 0..lexer.num_states() {
-        let from = LexState(state as u32);
-        let mut buckets: FxHashMap<Scan, Vec<u32>> = FxHashMap::default();
-        for (token_id, bytes) in vocabulary.iter().enumerate() {
-            if bytes.is_empty() {
-                rejected[state] += 1;
-                continue;
+    // Every lexer state scans the whole vocabulary, and no state's answer
+    // depends on another's, so this is the one stage of compilation that is
+    // embarrassingly parallel - and the one that dominates it. It is also
+    // where residency is paid for: this is precisely the work a host-side
+    // matcher repeats at every decode step instead of doing once.
+    let (per_state, rejected): (Vec<Vec<Group>>, Vec<u32>) = (0..lexer.num_states())
+        .into_par_iter()
+        .map(|state| {
+            let from = LexState(state as u32);
+            let mut refused = 0u32;
+            let mut buckets: FxHashMap<Scan, Vec<u32>> = FxHashMap::default();
+            for (token_id, bytes) in vocabulary.iter().enumerate() {
+                if bytes.is_empty() {
+                    refused += 1;
+                    continue;
+                }
+                match lexer.scan(bytes, from) {
+                    Some(scan) => buckets.entry(scan).or_default().push(token_id as u32),
+                    None => refused += 1,
+                }
             }
-            match lexer.scan(bytes, from) {
-                Some(scan) => buckets.entry(scan).or_default().push(token_id as u32),
-                None => rejected[state] += 1,
-            }
-        }
-        let mut groups: Vec<Group> = buckets
-            .into_iter()
-            .map(|(scan, tokens)| Group { scan, tokens })
-            .collect();
-        groups.sort_by(|a, b| b.tokens.len().cmp(&a.tokens.len()));
-        per_state.push(groups);
-    }
+            let mut groups: Vec<Group> = buckets
+                .into_iter()
+                .map(|(scan, tokens)| Group { scan, tokens })
+                .collect();
+            groups.sort_by(|a, b| b.tokens.len().cmp(&a.tokens.len()));
+            (groups, refused)
+        })
+        .unzip();
 
     VocabularyGroups {
         per_state,

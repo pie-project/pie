@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+rayon = "1"
 anyhow.workspace = true
 gpugrammar-ir = { path = "../gpugrammar-ir" }
 rustc-hash.workspace = true
