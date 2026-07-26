@@ -25,4 +25,5 @@
 extern crate alloc;
 
 pub mod header;
+pub mod metal;
 pub mod rng;

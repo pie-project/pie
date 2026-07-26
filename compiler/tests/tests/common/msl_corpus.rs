@@ -1,0 +1,330 @@
+//! The shared corpus the Metal MSL emitters are exercised over — the same
+//! cases the transitional C++ oracle (`compiler/tests/oracle/`) dumps, so the
+//! two dumps can be compared byte for byte.
+//!
+//! The plan-taking emitters are driven from **real plans**: every golden in
+//! `compiler/tests/golden/` is decoded from its `container:` hex, bound, and
+//! planned by `pie_plan::compile_bound`. The resulting stage plans are written
+//! (wire form) to `compiler/tests/oracle/corpus/stage_plans.txt` when blessing,
+//! which is what the C++ harness decodes with `pie_native::ptir::plan::decode`
+//! — that file is the contract that both sides saw the *same* plans.
+//!
+//! (The goldens' own `sidecar:` blobs are not used as the plan source: three
+//! of them are stale on this branch relative to today's `pie-plan`, and the
+//! C++ oracle has to see exactly what the Rust emitters see.)
+#![allow(dead_code)]
+
+use pie_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
+use pie_ir::op::{IntrinsicId, Op};
+use pie_ir::registry::{KernelInfo, ModelProfile, SinkScope, Stage};
+use pie_ir::types::{DType, Shape};
+use pie_ir::validate::bind;
+use pie_plan::{CompiledStage, compile_bound, encode_stage_plan};
+
+/// Golden names in the order the corpus enumerates them.
+pub const GOLDEN_NAMES: &[&str] = &[
+    "beam_epilogue",
+    "counter_pingpong",
+    "dfa_ingraph",
+    "extern_contrastive",
+    "greedy_argmax",
+    "matrix_mask_apply_packed",
+    "matrix_select_mask",
+    "mtp_verify_tail",
+    "neg_body_type_error",
+    "neg_intrinsic_wrong_stage",
+    "neg_model_gated_missing",
+    "neg_sink_at_epilogue",
+    "neg_spsc_second_producer",
+    "neg_t10_nonreplayable",
+    "nucleus_sample",
+    "pentathlon_iter",
+    "pivot_predicates_multistage",
+    "section3_masked_gumbel",
+    "structured_masks",
+];
+
+pub fn golden_dir() -> String {
+    concat!(env!("CARGO_MANIFEST_DIR"), "/golden").into()
+}
+
+pub fn corpus_path() -> String {
+    concat!(env!("CARGO_MANIFEST_DIR"), "/oracle/corpus/stage_plans.txt").into()
+}
+
+pub fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+pub fn unhex(text: &str) -> Vec<u8> {
+    (0..text.len() / 2)
+        .map(|index| u8::from_str_radix(&text[index * 2..index * 2 + 2], 16).unwrap())
+        .collect()
+}
+
+/// The `container:` hex line of a golden.
+pub fn golden_container(name: &str) -> TraceContainer {
+    let path = format!("{}/{name}.txt", golden_dir());
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("{path} missing"));
+    let line = text
+        .lines()
+        .find_map(|line| line.strip_prefix("container: "))
+        .unwrap_or_else(|| panic!("{path} has no container line"));
+    pie_ir::container::decode(&unhex(line)).unwrap_or_else(|e| panic!("{name}: {e:?}"))
+}
+
+/// The bind-time profile each golden was authored against (mirrors the
+/// `ptir_golden.rs` case that produced it — the goldens do not carry it).
+pub fn golden_profile(name: &str) -> ModelProfile {
+    let mut profile = ModelProfile::dummy();
+    match name {
+        // `ModelProfile::dummy()` verbatim (vocab 32).
+        "counter_pingpong"
+        | "neg_body_type_error"
+        | "neg_intrinsic_wrong_stage"
+        | "neg_sink_at_epilogue"
+        | "neg_spsc_second_producer"
+        | "section3_masked_gumbel"
+        | "structured_masks" => {}
+        "beam_epilogue" => {
+            profile.vocab = 8;
+            profile.page_size = 4;
+        }
+        "neg_model_gated_missing" => profile.has_mtp_logits = false,
+        "neg_t10_nonreplayable" => profile.kernels.push(KernelInfo {
+            name: "envelope_dot".into(),
+            sink_scope: None,
+            replayable: false,
+        }),
+        "pentathlon_iter" => {
+            profile.vocab = 8;
+            profile.kernels.push(KernelInfo {
+                name: "envelope_dot".into(),
+                sink_scope: None,
+                replayable: true,
+            });
+        }
+        _ => profile.vocab = 8,
+    }
+    profile
+}
+
+fn chan(shape: Shape, dtype: DType, host_role: HostRole, seeded: bool) -> ChannelDecl {
+    ChannelDecl {
+        shape,
+        dtype: ChanDType::Concrete(dtype),
+        capacity: 1,
+        host_role,
+        seeded,
+    }
+}
+
+fn epilogue(channels: Vec<ChannelDecl>, ops: Vec<Op>) -> TraceContainer {
+    TraceContainer {
+        names: Vec::new(),
+        channels,
+        ports: Vec::new(),
+        stages: vec![StageProgram {
+            stage: Stage::Epilogue,
+            ops,
+        }],
+        externs: Vec::new(),
+    }
+}
+
+/// Library ops and intrinsics no golden reaches: `sort_desc`, `matmul`, the
+/// `mtp_drafts` intrinsic (its own emission path in the grouped emitter), and
+/// a second-party `sink_call` (the Metal sink-boundary check).
+pub fn synthetic_traces() -> Vec<(&'static str, TraceContainer, ModelProfile)> {
+    let mut small = ModelProfile::dummy();
+    small.vocab = 8;
+    let mut with_sink = small.clone();
+    with_sink.kernels.push(KernelInfo {
+        name: "lora".into(),
+        sink_scope: Some(SinkScope::PassWide),
+        replayable: true,
+    });
+    vec![
+        (
+            "synthetic_sort_desc",
+            epilogue(
+                vec![
+                    chan(Shape::vector(8), DType::F32, HostRole::None, true),
+                    chan(Shape::vector(8), DType::F32, HostRole::Reader, false),
+                    chan(Shape::vector(8), DType::U32, HostRole::Reader, false),
+                ],
+                vec![
+                    Op::ChanRead(0),
+                    Op::SortDesc(0),
+                    Op::ChanPut { chan: 1, value: 1 },
+                    Op::ChanPut { chan: 2, value: 2 },
+                ],
+            ),
+            small.clone(),
+        ),
+        (
+            "synthetic_matmul",
+            epilogue(
+                vec![
+                    chan(Shape::matrix(2, 3), DType::F32, HostRole::None, true),
+                    chan(Shape::matrix(3, 4), DType::F32, HostRole::None, true),
+                    chan(Shape::matrix(2, 4), DType::F32, HostRole::Reader, false),
+                ],
+                vec![
+                    Op::ChanRead(0),
+                    Op::ChanRead(1),
+                    Op::MatMul(0, 1),
+                    Op::ChanPut { chan: 2, value: 2 },
+                ],
+            ),
+            small.clone(),
+        ),
+        (
+            "synthetic_mtp_drafts",
+            epilogue(
+                vec![chan(Shape::vector(3), DType::I32, HostRole::Reader, false)],
+                vec![
+                    Op::IntrinsicVal {
+                        intr: IntrinsicId::MtpDrafts,
+                        shape: Shape::vector(3),
+                        dtype: DType::I32,
+                    },
+                    Op::IntrinsicVal {
+                        intr: IntrinsicId::MtpLogits,
+                        shape: Shape::matrix(3, 8),
+                        dtype: DType::F32,
+                    },
+                    Op::ReduceArgmax(1),
+                    Op::Cast {
+                        value: 2,
+                        dtype: DType::I32,
+                    },
+                    Op::Add(0, 3),
+                    Op::ChanPut { chan: 0, value: 4 },
+                ],
+            ),
+            small,
+        ),
+        (
+            "synthetic_sink_call",
+            TraceContainer {
+                names: vec!["lora".into()],
+                channels: vec![chan(Shape::vector(4), DType::F32, HostRole::None, true)],
+                ports: Vec::new(),
+                stages: vec![StageProgram {
+                    stage: Stage::Prologue,
+                    ops: vec![
+                        Op::ChanRead(0),
+                        Op::SinkCall {
+                            name: 0,
+                            args: vec![0],
+                        },
+                    ],
+                }],
+                externs: Vec::new(),
+            },
+            with_sink,
+        ),
+    ]
+}
+
+/// One corpus entry: a stage plan and where it came from.
+pub struct CorpusStage {
+    pub golden: String,
+    pub stage_index: usize,
+    pub stage_tag: u8,
+    pub plan: CompiledStage,
+    pub wire: Vec<u8>,
+}
+
+impl CorpusStage {
+    /// The stable case id both dumps print.
+    pub fn id(&self) -> String {
+        format!("{}#{}", self.golden, self.stage_index)
+    }
+}
+
+/// Compile every golden that binds, then the synthetic fill-in traces; goldens
+/// whose bind fails contribute no stages (the `neg_*` cases).
+pub fn corpus_stages() -> Vec<CorpusStage> {
+    let mut stages = Vec::new();
+    let mut push = |name: &str, container: TraceContainer, profile: ModelProfile| {
+        let Ok(bound) = bind(container, profile) else {
+            return;
+        };
+        for (stage_index, plan) in compile_bound(&bound).into_iter().enumerate() {
+            let wire = encode_stage_plan(&plan);
+            stages.push(CorpusStage {
+                golden: name.into(),
+                stage_index,
+                stage_tag: plan.normalized.stage as u8,
+                plan,
+                wire,
+            });
+        }
+    };
+    for name in GOLDEN_NAMES {
+        push(name, golden_container(name), golden_profile(name));
+    }
+    for (name, container, profile) in synthetic_traces() {
+        push(name, container, profile);
+    }
+    stages
+}
+
+/// The corpus file the C++ oracle reads. One `plan:` line per stage.
+pub fn render_corpus(stages: &[CorpusStage]) -> String {
+    let mut out = String::new();
+    out.push_str(
+        "# GENERATED — bless with `PTIR_REGEN=1 cargo test -p pie-compiler-tests --test metal_msl_golden`.\n",
+    );
+    out.push_str("# Stage plans (PTRP wire form) for every golden that binds, in corpus order.\n");
+    out.push_str(
+        "# Transitional: the input side of the C++ emitter oracle. See oracle/README.md.\n",
+    );
+    for stage in stages {
+        out.push_str(&format!(
+            "plan: id={} golden={} stage_index={} stage_tag={} bytes={}\n",
+            stage.id(),
+            stage.golden,
+            stage.stage_index,
+            stage.stage_tag,
+            hex(&stage.wire),
+        ));
+    }
+    out
+}
+
+/// The op tag byte at `node`, the way the C++ oracle reads
+/// `stage.ops[node].op.tag`.
+pub fn op_tag(stage: &CompiledStage, node: u32) -> u8 {
+    pie_codegen::metal::OpView::of(&stage.normalized.ops[node as usize]).tag
+}
+
+/// Whether the region is a library region — the C++ `region.library` bit.
+pub fn is_library(region: &pie_plan::Region) -> bool {
+    matches!(region.kind, pie_plan::RegionKind::Library(_))
+}
+
+/// The C++ `region.library_op` byte. Generated regions encode `0`, which
+/// happens to collide with `PTIR_LIBRARY_NUCLEUS_SAMPLE`.
+pub fn library_op_byte(region: &pie_plan::Region) -> u8 {
+    match region.kind {
+        pie_plan::RegionKind::Library(op) => op as u8,
+        _ => 0,
+    }
+}
+
+/// The `region: ...` line the oracle prints for each case.
+pub fn region_shape(region: &pie_plan::Region) -> String {
+    format!(
+        "library={} library_op={} schedule={} nodes={} inputs={} outputs={} sinks={}",
+        is_library(region) as u8,
+        library_op_byte(region),
+        region.schedule as u8,
+        region.nodes.len(),
+        region.inputs.len(),
+        region.outputs.len(),
+        region.sinks.len()
+    )
+}

@@ -1,0 +1,3657 @@
+# oracle dump: pie::metal::pipeline::validate_singleton_plan
+# source of truth: driver/metal/src/pipeline/m1_codegen.cpp (transitional; the Rust port is compiler/codegen/src/metal/)
+# emitter_version: 23
+# @runtime: bytes=33947 fnv1a64=0x87250720781b2a8f
+# @grouped: bytes=970 fnv1a64=0xa8ab9e1ebf8714d9
+# cases: 456
+=== beam_epilogue#0 none
+applicable: true
+ok: true
+error: 
+operations: 82
+op: node=0 result_base=0 tag=0x90 results=1 chan=0 args=0
+op: node=1 result_base=1 tag=0xa0 results=1 chan=-1 args=0
+op: node=2 result_base=2 tag=0x31 results=1 chan=-1 args=1
+op: node=3 result_base=3 tag=0x38 results=1 chan=-1 args=1
+op: node=4 result_base=4 tag=0x11 results=1 chan=-1 args=2
+op: node=5 result_base=5 tag=0x01 results=1 chan=-1 args=1
+op: node=6 result_base=6 tag=0x30 results=1 chan=-1 args=1
+op: node=7 result_base=7 tag=0x02 results=1 chan=-1 args=1
+op: node=8 result_base=8 tag=0x38 results=1 chan=-1 args=1
+op: node=9 result_base=9 tag=0x11 results=1 chan=-1 args=2
+op: node=10 result_base=10 tag=0x39 results=1 chan=-1 args=1
+op: node=11 result_base=11 tag=0x38 results=1 chan=-1 args=1
+op: node=12 result_base=12 tag=0x10 results=1 chan=-1 args=2
+op: node=13 result_base=13 tag=0x39 results=1 chan=-1 args=1
+op: node=14 result_base=14 tag=0x51 results=2 chan=-1 args=1
+op: node=15 result_base=16 tag=0x81 results=1 chan=-1 args=0
+op: node=16 result_base=17 tag=0x13 results=1 chan=-1 args=2
+op: node=17 result_base=18 tag=0x90 results=1 chan=1 args=0
+op: node=18 result_base=19 tag=0x60 results=1 chan=-1 args=2
+op: node=19 result_base=20 tag=0x90 results=1 chan=2 args=0
+op: node=20 result_base=21 tag=0x60 results=1 chan=-1 args=2
+op: node=21 result_base=22 tag=0x90 results=1 chan=3 args=0
+op: node=22 result_base=23 tag=0x60 results=1 chan=-1 args=2
+op: node=23 result_base=24 tag=0x90 results=1 chan=4 args=0
+op: node=24 result_base=25 tag=0x60 results=1 chan=-1 args=2
+op: node=25 result_base=26 tag=0x64 results=1 chan=-1 args=0
+op: node=26 result_base=27 tag=0x63 results=1 chan=-1 args=3
+op: node=27 result_base=28 tag=0x60 results=1 chan=-1 args=2
+op: node=28 result_base=29 tag=0x18 results=1 chan=-1 args=2
+op: node=29 result_base=30 tag=0x81 results=1 chan=-1 args=0
+op: node=30 result_base=31 tag=0x1a results=1 chan=-1 args=2
+op: node=31 result_base=32 tag=0x1c results=1 chan=-1 args=2
+op: node=32 result_base=33 tag=0x90 results=1 chan=5 args=0
+op: node=33 result_base=34 tag=0x60 results=1 chan=-1 args=2
+op: node=34 result_base=35 tag=0x90 results=1 chan=6 args=0
+op: node=35 result_base=36 tag=0x20 results=1 chan=-1 args=3
+op: node=36 result_base=37 tag=0x81 results=1 chan=-1 args=0
+op: node=37 result_base=38 tag=0x20 results=1 chan=-1 args=3
+op: node=38 result_base=39 tag=0x81 results=1 chan=-1 args=0
+op: node=39 result_base=40 tag=0x10 results=1 chan=-1 args=2
+op: node=40 result_base=41 tag=0x20 results=1 chan=-1 args=3
+op: node=41 result_base=42 tag=0x81 results=1 chan=-1 args=0
+op: node=42 result_base=43 tag=0x11 results=1 chan=-1 args=2
+op: node=43 result_base=44 tag=0x12 results=1 chan=-1 args=2
+op: node=44 result_base=45 tag=0x10 results=1 chan=-1 args=2
+op: node=45 result_base=46 tag=0x39 results=1 chan=-1 args=1
+op: node=46 result_base=47 tag=0x63 results=1 chan=-1 args=3
+op: node=47 result_base=48 tag=0x39 results=1 chan=-1 args=1
+op: node=48 result_base=49 tag=0x92 results=0 chan=1 args=1
+op: node=49 result_base=49 tag=0x10 results=1 chan=-1 args=2
+op: node=50 result_base=50 tag=0x39 results=1 chan=-1 args=1
+op: node=51 result_base=51 tag=0x63 results=1 chan=-1 args=3
+op: node=52 result_base=52 tag=0x39 results=1 chan=-1 args=1
+op: node=53 result_base=53 tag=0x92 results=0 chan=2 args=1
+op: node=54 result_base=53 tag=0x12 results=1 chan=-1 args=2
+op: node=55 result_base=54 tag=0x10 results=1 chan=-1 args=2
+op: node=56 result_base=55 tag=0x90 results=1 chan=7 args=0
+op: node=57 result_base=56 tag=0x92 results=0 chan=7 args=1
+op: node=58 result_base=56 tag=0x64 results=1 chan=-1 args=0
+op: node=59 result_base=57 tag=0x39 results=1 chan=-1 args=1
+op: node=60 result_base=58 tag=0x38 results=1 chan=-1 args=1
+op: node=61 result_base=59 tag=0x39 results=1 chan=-1 args=1
+op: node=62 result_base=60 tag=0x38 results=1 chan=-1 args=1
+op: node=63 result_base=61 tag=0x1a results=1 chan=-1 args=2
+op: node=64 result_base=62 tag=0x39 results=1 chan=-1 args=1
+op: node=65 result_base=63 tag=0x90 results=1 chan=8 args=0
+op: node=66 result_base=64 tag=0x92 results=0 chan=8 args=1
+op: node=67 result_base=64 tag=0x90 results=1 chan=9 args=0
+op: node=68 result_base=65 tag=0x10 results=1 chan=-1 args=2
+op: node=69 result_base=66 tag=0x92 results=0 chan=9 args=1
+op: node=70 result_base=66 tag=0x92 results=0 chan=3 args=1
+op: node=71 result_base=66 tag=0x92 results=0 chan=5 args=1
+op: node=72 result_base=66 tag=0x92 results=0 chan=4 args=1
+op: node=73 result_base=66 tag=0x92 results=0 chan=10 args=1
+op: node=74 result_base=66 tag=0x92 results=0 chan=11 args=1
+op: node=75 result_base=66 tag=0x1f results=1 chan=-1 args=2
+op: node=76 result_base=67 tag=0x07 results=1 chan=-1 args=1
+op: node=77 result_base=68 tag=0x92 results=0 chan=12 args=1
+op: node=78 result_base=68 tag=0x92 results=0 chan=0 args=1
+op: node=79 result_base=68 tag=0x92 results=0 chan=13 args=1
+op: node=80 result_base=68 tag=0x92 results=0 chan=14 args=1
+op: node=81 result_base=68 tag=0x92 results=0 chan=15 args=1
+=== end
+=== beam_epilogue#0 zero_signature_hash
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== beam_epilogue#0 flip_signature_byte
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== beam_epilogue#0 singleton_kind
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== beam_epilogue#0 whole_stage_fallback
+applicable: true
+ok: false
+error: singleton plan requests whole-stage fallback without an identifiable unsupported op
+operations: 82
+op: node=0 result_base=0 tag=0x90 results=1 chan=0 args=0
+op: node=1 result_base=1 tag=0xa0 results=1 chan=-1 args=0
+op: node=2 result_base=2 tag=0x31 results=1 chan=-1 args=1
+op: node=3 result_base=3 tag=0x38 results=1 chan=-1 args=1
+op: node=4 result_base=4 tag=0x11 results=1 chan=-1 args=2
+op: node=5 result_base=5 tag=0x01 results=1 chan=-1 args=1
+op: node=6 result_base=6 tag=0x30 results=1 chan=-1 args=1
+op: node=7 result_base=7 tag=0x02 results=1 chan=-1 args=1
+op: node=8 result_base=8 tag=0x38 results=1 chan=-1 args=1
+op: node=9 result_base=9 tag=0x11 results=1 chan=-1 args=2
+op: node=10 result_base=10 tag=0x39 results=1 chan=-1 args=1
+op: node=11 result_base=11 tag=0x38 results=1 chan=-1 args=1
+op: node=12 result_base=12 tag=0x10 results=1 chan=-1 args=2
+op: node=13 result_base=13 tag=0x39 results=1 chan=-1 args=1
+op: node=14 result_base=14 tag=0x51 results=2 chan=-1 args=1
+op: node=15 result_base=16 tag=0x81 results=1 chan=-1 args=0
+op: node=16 result_base=17 tag=0x13 results=1 chan=-1 args=2
+op: node=17 result_base=18 tag=0x90 results=1 chan=1 args=0
+op: node=18 result_base=19 tag=0x60 results=1 chan=-1 args=2
+op: node=19 result_base=20 tag=0x90 results=1 chan=2 args=0
+op: node=20 result_base=21 tag=0x60 results=1 chan=-1 args=2
+op: node=21 result_base=22 tag=0x90 results=1 chan=3 args=0
+op: node=22 result_base=23 tag=0x60 results=1 chan=-1 args=2
+op: node=23 result_base=24 tag=0x90 results=1 chan=4 args=0
+op: node=24 result_base=25 tag=0x60 results=1 chan=-1 args=2
+op: node=25 result_base=26 tag=0x64 results=1 chan=-1 args=0
+op: node=26 result_base=27 tag=0x63 results=1 chan=-1 args=3
+op: node=27 result_base=28 tag=0x60 results=1 chan=-1 args=2
+op: node=28 result_base=29 tag=0x18 results=1 chan=-1 args=2
+op: node=29 result_base=30 tag=0x81 results=1 chan=-1 args=0
+op: node=30 result_base=31 tag=0x1a results=1 chan=-1 args=2
+op: node=31 result_base=32 tag=0x1c results=1 chan=-1 args=2
+op: node=32 result_base=33 tag=0x90 results=1 chan=5 args=0
+op: node=33 result_base=34 tag=0x60 results=1 chan=-1 args=2
+op: node=34 result_base=35 tag=0x90 results=1 chan=6 args=0
+op: node=35 result_base=36 tag=0x20 results=1 chan=-1 args=3
+op: node=36 result_base=37 tag=0x81 results=1 chan=-1 args=0
+op: node=37 result_base=38 tag=0x20 results=1 chan=-1 args=3
+op: node=38 result_base=39 tag=0x81 results=1 chan=-1 args=0
+op: node=39 result_base=40 tag=0x10 results=1 chan=-1 args=2
+op: node=40 result_base=41 tag=0x20 results=1 chan=-1 args=3
+op: node=41 result_base=42 tag=0x81 results=1 chan=-1 args=0
+op: node=42 result_base=43 tag=0x11 results=1 chan=-1 args=2
+op: node=43 result_base=44 tag=0x12 results=1 chan=-1 args=2
+op: node=44 result_base=45 tag=0x10 results=1 chan=-1 args=2
+op: node=45 result_base=46 tag=0x39 results=1 chan=-1 args=1
+op: node=46 result_base=47 tag=0x63 results=1 chan=-1 args=3
+op: node=47 result_base=48 tag=0x39 results=1 chan=-1 args=1
+op: node=48 result_base=49 tag=0x92 results=0 chan=1 args=1
+op: node=49 result_base=49 tag=0x10 results=1 chan=-1 args=2
+op: node=50 result_base=50 tag=0x39 results=1 chan=-1 args=1
+op: node=51 result_base=51 tag=0x63 results=1 chan=-1 args=3
+op: node=52 result_base=52 tag=0x39 results=1 chan=-1 args=1
+op: node=53 result_base=53 tag=0x92 results=0 chan=2 args=1
+op: node=54 result_base=53 tag=0x12 results=1 chan=-1 args=2
+op: node=55 result_base=54 tag=0x10 results=1 chan=-1 args=2
+op: node=56 result_base=55 tag=0x90 results=1 chan=7 args=0
+op: node=57 result_base=56 tag=0x92 results=0 chan=7 args=1
+op: node=58 result_base=56 tag=0x64 results=1 chan=-1 args=0
+op: node=59 result_base=57 tag=0x39 results=1 chan=-1 args=1
+op: node=60 result_base=58 tag=0x38 results=1 chan=-1 args=1
+op: node=61 result_base=59 tag=0x39 results=1 chan=-1 args=1
+op: node=62 result_base=60 tag=0x38 results=1 chan=-1 args=1
+op: node=63 result_base=61 tag=0x1a results=1 chan=-1 args=2
+op: node=64 result_base=62 tag=0x39 results=1 chan=-1 args=1
+op: node=65 result_base=63 tag=0x90 results=1 chan=8 args=0
+op: node=66 result_base=64 tag=0x92 results=0 chan=8 args=1
+op: node=67 result_base=64 tag=0x90 results=1 chan=9 args=0
+op: node=68 result_base=65 tag=0x10 results=1 chan=-1 args=2
+op: node=69 result_base=66 tag=0x92 results=0 chan=9 args=1
+op: node=70 result_base=66 tag=0x92 results=0 chan=3 args=1
+op: node=71 result_base=66 tag=0x92 results=0 chan=5 args=1
+op: node=72 result_base=66 tag=0x92 results=0 chan=4 args=1
+op: node=73 result_base=66 tag=0x92 results=0 chan=10 args=1
+op: node=74 result_base=66 tag=0x92 results=0 chan=11 args=1
+op: node=75 result_base=66 tag=0x1f results=1 chan=-1 args=2
+op: node=76 result_base=67 tag=0x07 results=1 chan=-1 args=1
+op: node=77 result_base=68 tag=0x92 results=0 chan=12 args=1
+op: node=78 result_base=68 tag=0x92 results=0 chan=0 args=1
+op: node=79 result_base=68 tag=0x92 results=0 chan=13 args=1
+op: node=80 result_base=68 tag=0x92 results=0 chan=14 args=1
+op: node=81 result_base=68 tag=0x92 results=0 chan=15 args=1
+=== end
+=== beam_epilogue#0 drop_last_singleton_region
+applicable: true
+ok: false
+error: singleton partition must contain one region per normalized op
+operations: 0
+=== end
+=== beam_epilogue#0 singleton_region_node
+applicable: true
+ok: false
+error: region node out of range
+operations: 0
+=== end
+=== beam_epilogue#0 swap_singleton_region_nodes
+applicable: true
+ok: false
+error: singleton region/node ordering mismatch
+operations: 0
+=== end
+=== beam_epilogue#0 unordered_region_nodes
+applicable: true
+ok: false
+error: region node indices are not strictly ordered
+operations: 0
+=== end
+=== beam_epilogue#0 region_input_out_of_range
+applicable: true
+ok: false
+error: region input out of range
+operations: 0
+=== end
+=== beam_epilogue#0 region_output_out_of_range
+applicable: true
+ok: false
+error: region output out of range
+operations: 0
+=== end
+=== beam_epilogue#0 region_sink_out_of_range
+applicable: true
+ok: false
+error: region sink out of range
+operations: 0
+=== end
+=== beam_epilogue#0 library_scan_claim
+applicable: true
+ok: false
+error: library region ABI is invalid
+operations: 0
+=== end
+=== beam_epilogue#0 extra_value_type
+applicable: true
+ok: false
+error: normalized value layout does not match op results
+operations: 82
+op: node=0 result_base=0 tag=0x90 results=1 chan=0 args=0
+op: node=1 result_base=1 tag=0xa0 results=1 chan=-1 args=0
+op: node=2 result_base=2 tag=0x31 results=1 chan=-1 args=1
+op: node=3 result_base=3 tag=0x38 results=1 chan=-1 args=1
+op: node=4 result_base=4 tag=0x11 results=1 chan=-1 args=2
+op: node=5 result_base=5 tag=0x01 results=1 chan=-1 args=1
+op: node=6 result_base=6 tag=0x30 results=1 chan=-1 args=1
+op: node=7 result_base=7 tag=0x02 results=1 chan=-1 args=1
+op: node=8 result_base=8 tag=0x38 results=1 chan=-1 args=1
+op: node=9 result_base=9 tag=0x11 results=1 chan=-1 args=2
+op: node=10 result_base=10 tag=0x39 results=1 chan=-1 args=1
+op: node=11 result_base=11 tag=0x38 results=1 chan=-1 args=1
+op: node=12 result_base=12 tag=0x10 results=1 chan=-1 args=2
+op: node=13 result_base=13 tag=0x39 results=1 chan=-1 args=1
+op: node=14 result_base=14 tag=0x51 results=2 chan=-1 args=1
+op: node=15 result_base=16 tag=0x81 results=1 chan=-1 args=0
+op: node=16 result_base=17 tag=0x13 results=1 chan=-1 args=2
+op: node=17 result_base=18 tag=0x90 results=1 chan=1 args=0
+op: node=18 result_base=19 tag=0x60 results=1 chan=-1 args=2
+op: node=19 result_base=20 tag=0x90 results=1 chan=2 args=0
+op: node=20 result_base=21 tag=0x60 results=1 chan=-1 args=2
+op: node=21 result_base=22 tag=0x90 results=1 chan=3 args=0
+op: node=22 result_base=23 tag=0x60 results=1 chan=-1 args=2
+op: node=23 result_base=24 tag=0x90 results=1 chan=4 args=0
+op: node=24 result_base=25 tag=0x60 results=1 chan=-1 args=2
+op: node=25 result_base=26 tag=0x64 results=1 chan=-1 args=0
+op: node=26 result_base=27 tag=0x63 results=1 chan=-1 args=3
+op: node=27 result_base=28 tag=0x60 results=1 chan=-1 args=2
+op: node=28 result_base=29 tag=0x18 results=1 chan=-1 args=2
+op: node=29 result_base=30 tag=0x81 results=1 chan=-1 args=0
+op: node=30 result_base=31 tag=0x1a results=1 chan=-1 args=2
+op: node=31 result_base=32 tag=0x1c results=1 chan=-1 args=2
+op: node=32 result_base=33 tag=0x90 results=1 chan=5 args=0
+op: node=33 result_base=34 tag=0x60 results=1 chan=-1 args=2
+op: node=34 result_base=35 tag=0x90 results=1 chan=6 args=0
+op: node=35 result_base=36 tag=0x20 results=1 chan=-1 args=3
+op: node=36 result_base=37 tag=0x81 results=1 chan=-1 args=0
+op: node=37 result_base=38 tag=0x20 results=1 chan=-1 args=3
+op: node=38 result_base=39 tag=0x81 results=1 chan=-1 args=0
+op: node=39 result_base=40 tag=0x10 results=1 chan=-1 args=2
+op: node=40 result_base=41 tag=0x20 results=1 chan=-1 args=3
+op: node=41 result_base=42 tag=0x81 results=1 chan=-1 args=0
+op: node=42 result_base=43 tag=0x11 results=1 chan=-1 args=2
+op: node=43 result_base=44 tag=0x12 results=1 chan=-1 args=2
+op: node=44 result_base=45 tag=0x10 results=1 chan=-1 args=2
+op: node=45 result_base=46 tag=0x39 results=1 chan=-1 args=1
+op: node=46 result_base=47 tag=0x63 results=1 chan=-1 args=3
+op: node=47 result_base=48 tag=0x39 results=1 chan=-1 args=1
+op: node=48 result_base=49 tag=0x92 results=0 chan=1 args=1
+op: node=49 result_base=49 tag=0x10 results=1 chan=-1 args=2
+op: node=50 result_base=50 tag=0x39 results=1 chan=-1 args=1
+op: node=51 result_base=51 tag=0x63 results=1 chan=-1 args=3
+op: node=52 result_base=52 tag=0x39 results=1 chan=-1 args=1
+op: node=53 result_base=53 tag=0x92 results=0 chan=2 args=1
+op: node=54 result_base=53 tag=0x12 results=1 chan=-1 args=2
+op: node=55 result_base=54 tag=0x10 results=1 chan=-1 args=2
+op: node=56 result_base=55 tag=0x90 results=1 chan=7 args=0
+op: node=57 result_base=56 tag=0x92 results=0 chan=7 args=1
+op: node=58 result_base=56 tag=0x64 results=1 chan=-1 args=0
+op: node=59 result_base=57 tag=0x39 results=1 chan=-1 args=1
+op: node=60 result_base=58 tag=0x38 results=1 chan=-1 args=1
+op: node=61 result_base=59 tag=0x39 results=1 chan=-1 args=1
+op: node=62 result_base=60 tag=0x38 results=1 chan=-1 args=1
+op: node=63 result_base=61 tag=0x1a results=1 chan=-1 args=2
+op: node=64 result_base=62 tag=0x39 results=1 chan=-1 args=1
+op: node=65 result_base=63 tag=0x90 results=1 chan=8 args=0
+op: node=66 result_base=64 tag=0x92 results=0 chan=8 args=1
+op: node=67 result_base=64 tag=0x90 results=1 chan=9 args=0
+op: node=68 result_base=65 tag=0x10 results=1 chan=-1 args=2
+op: node=69 result_base=66 tag=0x92 results=0 chan=9 args=1
+op: node=70 result_base=66 tag=0x92 results=0 chan=3 args=1
+op: node=71 result_base=66 tag=0x92 results=0 chan=5 args=1
+op: node=72 result_base=66 tag=0x92 results=0 chan=4 args=1
+op: node=73 result_base=66 tag=0x92 results=0 chan=10 args=1
+op: node=74 result_base=66 tag=0x92 results=0 chan=11 args=1
+op: node=75 result_base=66 tag=0x1f results=1 chan=-1 args=2
+op: node=76 result_base=67 tag=0x07 results=1 chan=-1 args=1
+op: node=77 result_base=68 tag=0x92 results=0 chan=12 args=1
+op: node=78 result_base=68 tag=0x92 results=0 chan=0 args=1
+op: node=79 result_base=68 tag=0x92 results=0 chan=13 args=1
+op: node=80 result_base=68 tag=0x92 results=0 chan=14 args=1
+op: node=81 result_base=68 tag=0x92 results=0 chan=15 args=1
+=== end
+=== beam_epilogue#0 drop_last_value_type
+applicable: true
+ok: false
+error: region output out of range
+operations: 0
+=== end
+=== beam_epilogue#0 drop_last_value_type_and_refs
+applicable: true
+ok: false
+error: normalized op result range is invalid
+operations: 76
+op: node=0 result_base=0 tag=0x90 results=1 chan=0 args=0
+op: node=1 result_base=1 tag=0xa0 results=1 chan=-1 args=0
+op: node=2 result_base=2 tag=0x31 results=1 chan=-1 args=1
+op: node=3 result_base=3 tag=0x38 results=1 chan=-1 args=1
+op: node=4 result_base=4 tag=0x11 results=1 chan=-1 args=2
+op: node=5 result_base=5 tag=0x01 results=1 chan=-1 args=1
+op: node=6 result_base=6 tag=0x30 results=1 chan=-1 args=1
+op: node=7 result_base=7 tag=0x02 results=1 chan=-1 args=1
+op: node=8 result_base=8 tag=0x38 results=1 chan=-1 args=1
+op: node=9 result_base=9 tag=0x11 results=1 chan=-1 args=2
+op: node=10 result_base=10 tag=0x39 results=1 chan=-1 args=1
+op: node=11 result_base=11 tag=0x38 results=1 chan=-1 args=1
+op: node=12 result_base=12 tag=0x10 results=1 chan=-1 args=2
+op: node=13 result_base=13 tag=0x39 results=1 chan=-1 args=1
+op: node=14 result_base=14 tag=0x51 results=2 chan=-1 args=1
+op: node=15 result_base=16 tag=0x81 results=1 chan=-1 args=0
+op: node=16 result_base=17 tag=0x13 results=1 chan=-1 args=2
+op: node=17 result_base=18 tag=0x90 results=1 chan=1 args=0
+op: node=18 result_base=19 tag=0x60 results=1 chan=-1 args=2
+op: node=19 result_base=20 tag=0x90 results=1 chan=2 args=0
+op: node=20 result_base=21 tag=0x60 results=1 chan=-1 args=2
+op: node=21 result_base=22 tag=0x90 results=1 chan=3 args=0
+op: node=22 result_base=23 tag=0x60 results=1 chan=-1 args=2
+op: node=23 result_base=24 tag=0x90 results=1 chan=4 args=0
+op: node=24 result_base=25 tag=0x60 results=1 chan=-1 args=2
+op: node=25 result_base=26 tag=0x64 results=1 chan=-1 args=0
+op: node=26 result_base=27 tag=0x63 results=1 chan=-1 args=3
+op: node=27 result_base=28 tag=0x60 results=1 chan=-1 args=2
+op: node=28 result_base=29 tag=0x18 results=1 chan=-1 args=2
+op: node=29 result_base=30 tag=0x81 results=1 chan=-1 args=0
+op: node=30 result_base=31 tag=0x1a results=1 chan=-1 args=2
+op: node=31 result_base=32 tag=0x1c results=1 chan=-1 args=2
+op: node=32 result_base=33 tag=0x90 results=1 chan=5 args=0
+op: node=33 result_base=34 tag=0x60 results=1 chan=-1 args=2
+op: node=34 result_base=35 tag=0x90 results=1 chan=6 args=0
+op: node=35 result_base=36 tag=0x20 results=1 chan=-1 args=3
+op: node=36 result_base=37 tag=0x81 results=1 chan=-1 args=0
+op: node=37 result_base=38 tag=0x20 results=1 chan=-1 args=3
+op: node=38 result_base=39 tag=0x81 results=1 chan=-1 args=0
+op: node=39 result_base=40 tag=0x10 results=1 chan=-1 args=2
+op: node=40 result_base=41 tag=0x20 results=1 chan=-1 args=3
+op: node=41 result_base=42 tag=0x81 results=1 chan=-1 args=0
+op: node=42 result_base=43 tag=0x11 results=1 chan=-1 args=2
+op: node=43 result_base=44 tag=0x12 results=1 chan=-1 args=2
+op: node=44 result_base=45 tag=0x10 results=1 chan=-1 args=2
+op: node=45 result_base=46 tag=0x39 results=1 chan=-1 args=1
+op: node=46 result_base=47 tag=0x63 results=1 chan=-1 args=3
+op: node=47 result_base=48 tag=0x39 results=1 chan=-1 args=1
+op: node=48 result_base=49 tag=0x92 results=0 chan=1 args=1
+op: node=49 result_base=49 tag=0x10 results=1 chan=-1 args=2
+op: node=50 result_base=50 tag=0x39 results=1 chan=-1 args=1
+op: node=51 result_base=51 tag=0x63 results=1 chan=-1 args=3
+op: node=52 result_base=52 tag=0x39 results=1 chan=-1 args=1
+op: node=53 result_base=53 tag=0x92 results=0 chan=2 args=1
+op: node=54 result_base=53 tag=0x12 results=1 chan=-1 args=2
+op: node=55 result_base=54 tag=0x10 results=1 chan=-1 args=2
+op: node=56 result_base=55 tag=0x90 results=1 chan=7 args=0
+op: node=57 result_base=56 tag=0x92 results=0 chan=7 args=1
+op: node=58 result_base=56 tag=0x64 results=1 chan=-1 args=0
+op: node=59 result_base=57 tag=0x39 results=1 chan=-1 args=1
+op: node=60 result_base=58 tag=0x38 results=1 chan=-1 args=1
+op: node=61 result_base=59 tag=0x39 results=1 chan=-1 args=1
+op: node=62 result_base=60 tag=0x38 results=1 chan=-1 args=1
+op: node=63 result_base=61 tag=0x1a results=1 chan=-1 args=2
+op: node=64 result_base=62 tag=0x39 results=1 chan=-1 args=1
+op: node=65 result_base=63 tag=0x90 results=1 chan=8 args=0
+op: node=66 result_base=64 tag=0x92 results=0 chan=8 args=1
+op: node=67 result_base=64 tag=0x90 results=1 chan=9 args=0
+op: node=68 result_base=65 tag=0x10 results=1 chan=-1 args=2
+op: node=69 result_base=66 tag=0x92 results=0 chan=9 args=1
+op: node=70 result_base=66 tag=0x92 results=0 chan=3 args=1
+op: node=71 result_base=66 tag=0x92 results=0 chan=5 args=1
+op: node=72 result_base=66 tag=0x92 results=0 chan=4 args=1
+op: node=73 result_base=66 tag=0x92 results=0 chan=10 args=1
+op: node=74 result_base=66 tag=0x92 results=0 chan=11 args=1
+op: node=75 result_base=66 tag=0x1f results=1 chan=-1 args=2
+=== end
+=== beam_epilogue#0 rank5_value_type
+applicable: true
+ok: false
+error: invalid normalized value type
+operations: 0
+=== end
+=== beam_epilogue#0 zero_static_dim
+applicable: true
+ok: false
+error: normalized value shape product exceeds u32
+operations: 0
+=== end
+=== beam_epilogue#0 overflow_static_dims
+applicable: true
+ok: false
+error: normalized value shape product exceeds u32
+operations: 0
+=== end
+=== beam_epilogue#0 reverse_ops
+applicable: true
+ok: false
+error: library region ABI is invalid
+operations: 0
+=== end
+=== beam_epilogue#0 bad_channel_slot
+applicable: true
+ok: false
+error: normalized channel slot is invalid
+operations: 0
+=== end
+=== beam_epilogue#0 pivot_payload_out_of_range
+applicable: false
+=== end
+=== beam_epilogue#0 rename_names
+applicable: false
+=== end
+=== beam_epilogue#0 clear_names
+applicable: false
+=== end
+=== counter_pingpong#0 none
+applicable: true
+ok: true
+error: 
+operations: 5
+op: node=0 result_base=0 tag=0x90 results=1 chan=0 args=0
+op: node=1 result_base=1 tag=0x81 results=1 chan=-1 args=0
+op: node=2 result_base=2 tag=0x10 results=1 chan=-1 args=2
+op: node=3 result_base=3 tag=0x92 results=0 chan=0 args=1
+op: node=4 result_base=3 tag=0x92 results=0 chan=1 args=1
+=== end
+=== counter_pingpong#0 zero_signature_hash
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== counter_pingpong#0 flip_signature_byte
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== counter_pingpong#0 singleton_kind
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== counter_pingpong#0 whole_stage_fallback
+applicable: true
+ok: false
+error: singleton plan requests whole-stage fallback without an identifiable unsupported op
+operations: 5
+op: node=0 result_base=0 tag=0x90 results=1 chan=0 args=0
+op: node=1 result_base=1 tag=0x81 results=1 chan=-1 args=0
+op: node=2 result_base=2 tag=0x10 results=1 chan=-1 args=2
+op: node=3 result_base=3 tag=0x92 results=0 chan=0 args=1
+op: node=4 result_base=3 tag=0x92 results=0 chan=1 args=1
+=== end
+=== counter_pingpong#0 drop_last_singleton_region
+applicable: true
+ok: false
+error: singleton partition must contain one region per normalized op
+operations: 0
+=== end
+=== counter_pingpong#0 singleton_region_node
+applicable: true
+ok: false
+error: region node out of range
+operations: 0
+=== end
+=== counter_pingpong#0 swap_singleton_region_nodes
+applicable: true
+ok: false
+error: singleton region/node ordering mismatch
+operations: 0
+=== end
+=== counter_pingpong#0 unordered_region_nodes
+applicable: true
+ok: false
+error: region node indices are not strictly ordered
+operations: 0
+=== end
+=== counter_pingpong#0 region_input_out_of_range
+applicable: true
+ok: false
+error: region input out of range
+operations: 0
+=== end
+=== counter_pingpong#0 region_output_out_of_range
+applicable: true
+ok: false
+error: region output out of range
+operations: 0
+=== end
+=== counter_pingpong#0 region_sink_out_of_range
+applicable: true
+ok: false
+error: region sink out of range
+operations: 0
+=== end
+=== counter_pingpong#0 library_scan_claim
+applicable: true
+ok: false
+error: library region ABI is invalid
+operations: 0
+=== end
+=== counter_pingpong#0 extra_value_type
+applicable: true
+ok: false
+error: normalized value layout does not match op results
+operations: 5
+op: node=0 result_base=0 tag=0x90 results=1 chan=0 args=0
+op: node=1 result_base=1 tag=0x81 results=1 chan=-1 args=0
+op: node=2 result_base=2 tag=0x10 results=1 chan=-1 args=2
+op: node=3 result_base=3 tag=0x92 results=0 chan=0 args=1
+op: node=4 result_base=3 tag=0x92 results=0 chan=1 args=1
+=== end
+=== counter_pingpong#0 drop_last_value_type
+applicable: true
+ok: false
+error: region output out of range
+operations: 0
+=== end
+=== counter_pingpong#0 drop_last_value_type_and_refs
+applicable: true
+ok: false
+error: normalized op result range is invalid
+operations: 2
+op: node=0 result_base=0 tag=0x90 results=1 chan=0 args=0
+op: node=1 result_base=1 tag=0x81 results=1 chan=-1 args=0
+=== end
+=== counter_pingpong#0 rank5_value_type
+applicable: true
+ok: false
+error: invalid normalized value type
+operations: 0
+=== end
+=== counter_pingpong#0 zero_static_dim
+applicable: true
+ok: false
+error: normalized value shape product exceeds u32
+operations: 0
+=== end
+=== counter_pingpong#0 overflow_static_dims
+applicable: true
+ok: false
+error: normalized value shape product exceeds u32
+operations: 0
+=== end
+=== counter_pingpong#0 reverse_ops
+applicable: true
+ok: false
+error: normalized SSA operand is not a prior value
+operations: 0
+=== end
+=== counter_pingpong#0 bad_channel_slot
+applicable: true
+ok: false
+error: normalized channel slot is invalid
+operations: 0
+=== end
+=== counter_pingpong#0 pivot_payload_out_of_range
+applicable: false
+=== end
+=== counter_pingpong#0 rename_names
+applicable: false
+=== end
+=== counter_pingpong#0 clear_names
+applicable: false
+=== end
+=== dfa_ingraph#0 none
+applicable: true
+ok: true
+error: 
+operations: 15
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0x91 results=1 chan=0 args=0
+op: node=2 result_base=2 tag=0x91 results=1 chan=1 args=0
+op: node=3 result_base=3 tag=0x90 results=1 chan=2 args=0
+op: node=4 result_base=4 tag=0x60 results=1 chan=-1 args=2
+op: node=5 result_base=5 tag=0x81 results=1 chan=-1 args=0
+op: node=6 result_base=6 tag=0x20 results=1 chan=-1 args=3
+op: node=7 result_base=7 tag=0x33 results=1 chan=-1 args=1
+op: node=8 result_base=8 tag=0x92 results=0 chan=3 args=1
+op: node=9 result_base=8 tag=0x81 results=1 chan=-1 args=0
+op: node=10 result_base=9 tag=0x12 results=1 chan=-1 args=2
+op: node=11 result_base=10 tag=0x07 results=1 chan=-1 args=1
+op: node=12 result_base=11 tag=0x10 results=1 chan=-1 args=2
+op: node=13 result_base=12 tag=0x60 results=1 chan=-1 args=2
+op: node=14 result_base=13 tag=0x92 results=0 chan=2 args=1
+=== end
+=== dfa_ingraph#0 zero_signature_hash
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== dfa_ingraph#0 flip_signature_byte
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== dfa_ingraph#0 singleton_kind
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== dfa_ingraph#0 whole_stage_fallback
+applicable: true
+ok: false
+error: singleton plan requests whole-stage fallback without an identifiable unsupported op
+operations: 15
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0x91 results=1 chan=0 args=0
+op: node=2 result_base=2 tag=0x91 results=1 chan=1 args=0
+op: node=3 result_base=3 tag=0x90 results=1 chan=2 args=0
+op: node=4 result_base=4 tag=0x60 results=1 chan=-1 args=2
+op: node=5 result_base=5 tag=0x81 results=1 chan=-1 args=0
+op: node=6 result_base=6 tag=0x20 results=1 chan=-1 args=3
+op: node=7 result_base=7 tag=0x33 results=1 chan=-1 args=1
+op: node=8 result_base=8 tag=0x92 results=0 chan=3 args=1
+op: node=9 result_base=8 tag=0x81 results=1 chan=-1 args=0
+op: node=10 result_base=9 tag=0x12 results=1 chan=-1 args=2
+op: node=11 result_base=10 tag=0x07 results=1 chan=-1 args=1
+op: node=12 result_base=11 tag=0x10 results=1 chan=-1 args=2
+op: node=13 result_base=12 tag=0x60 results=1 chan=-1 args=2
+op: node=14 result_base=13 tag=0x92 results=0 chan=2 args=1
+=== end
+=== dfa_ingraph#0 drop_last_singleton_region
+applicable: true
+ok: false
+error: singleton partition must contain one region per normalized op
+operations: 0
+=== end
+=== dfa_ingraph#0 singleton_region_node
+applicable: true
+ok: false
+error: region node out of range
+operations: 0
+=== end
+=== dfa_ingraph#0 swap_singleton_region_nodes
+applicable: true
+ok: false
+error: singleton region/node ordering mismatch
+operations: 0
+=== end
+=== dfa_ingraph#0 unordered_region_nodes
+applicable: true
+ok: false
+error: region node indices are not strictly ordered
+operations: 0
+=== end
+=== dfa_ingraph#0 region_input_out_of_range
+applicable: true
+ok: false
+error: region input out of range
+operations: 0
+=== end
+=== dfa_ingraph#0 region_output_out_of_range
+applicable: true
+ok: false
+error: region output out of range
+operations: 0
+=== end
+=== dfa_ingraph#0 region_sink_out_of_range
+applicable: true
+ok: false
+error: region sink out of range
+operations: 0
+=== end
+=== dfa_ingraph#0 library_scan_claim
+applicable: true
+ok: false
+error: library region ABI is invalid
+operations: 0
+=== end
+=== dfa_ingraph#0 extra_value_type
+applicable: true
+ok: false
+error: normalized value layout does not match op results
+operations: 15
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0x91 results=1 chan=0 args=0
+op: node=2 result_base=2 tag=0x91 results=1 chan=1 args=0
+op: node=3 result_base=3 tag=0x90 results=1 chan=2 args=0
+op: node=4 result_base=4 tag=0x60 results=1 chan=-1 args=2
+op: node=5 result_base=5 tag=0x81 results=1 chan=-1 args=0
+op: node=6 result_base=6 tag=0x20 results=1 chan=-1 args=3
+op: node=7 result_base=7 tag=0x33 results=1 chan=-1 args=1
+op: node=8 result_base=8 tag=0x92 results=0 chan=3 args=1
+op: node=9 result_base=8 tag=0x81 results=1 chan=-1 args=0
+op: node=10 result_base=9 tag=0x12 results=1 chan=-1 args=2
+op: node=11 result_base=10 tag=0x07 results=1 chan=-1 args=1
+op: node=12 result_base=11 tag=0x10 results=1 chan=-1 args=2
+op: node=13 result_base=12 tag=0x60 results=1 chan=-1 args=2
+op: node=14 result_base=13 tag=0x92 results=0 chan=2 args=1
+=== end
+=== dfa_ingraph#0 drop_last_value_type
+applicable: true
+ok: false
+error: region output out of range
+operations: 0
+=== end
+=== dfa_ingraph#0 drop_last_value_type_and_refs
+applicable: true
+ok: false
+error: normalized op result range is invalid
+operations: 13
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0x91 results=1 chan=0 args=0
+op: node=2 result_base=2 tag=0x91 results=1 chan=1 args=0
+op: node=3 result_base=3 tag=0x90 results=1 chan=2 args=0
+op: node=4 result_base=4 tag=0x60 results=1 chan=-1 args=2
+op: node=5 result_base=5 tag=0x81 results=1 chan=-1 args=0
+op: node=6 result_base=6 tag=0x20 results=1 chan=-1 args=3
+op: node=7 result_base=7 tag=0x33 results=1 chan=-1 args=1
+op: node=8 result_base=8 tag=0x92 results=0 chan=3 args=1
+op: node=9 result_base=8 tag=0x81 results=1 chan=-1 args=0
+op: node=10 result_base=9 tag=0x12 results=1 chan=-1 args=2
+op: node=11 result_base=10 tag=0x07 results=1 chan=-1 args=1
+op: node=12 result_base=11 tag=0x10 results=1 chan=-1 args=2
+=== end
+=== dfa_ingraph#0 rank5_value_type
+applicable: true
+ok: false
+error: invalid normalized value type
+operations: 0
+=== end
+=== dfa_ingraph#0 zero_static_dim
+applicable: true
+ok: false
+error: normalized value shape product exceeds u32
+operations: 0
+=== end
+=== dfa_ingraph#0 overflow_static_dims
+applicable: true
+ok: false
+error: normalized value shape product exceeds u32
+operations: 0
+=== end
+=== dfa_ingraph#0 reverse_ops
+applicable: true
+ok: false
+error: normalized SSA operand is not a prior value
+operations: 0
+=== end
+=== dfa_ingraph#0 bad_channel_slot
+applicable: true
+ok: false
+error: normalized channel slot is invalid
+operations: 1
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+=== end
+=== dfa_ingraph#0 pivot_payload_out_of_range
+applicable: false
+=== end
+=== dfa_ingraph#0 rename_names
+applicable: false
+=== end
+=== dfa_ingraph#0 clear_names
+applicable: false
+=== end
+=== extern_contrastive#0 none
+applicable: true
+ok: true
+error: 
+operations: 2
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0x92 results=0 chan=0 args=1
+=== end
+=== extern_contrastive#0 zero_signature_hash
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== extern_contrastive#0 flip_signature_byte
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== extern_contrastive#0 singleton_kind
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== extern_contrastive#0 whole_stage_fallback
+applicable: true
+ok: false
+error: singleton plan requests whole-stage fallback without an identifiable unsupported op
+operations: 2
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0x92 results=0 chan=0 args=1
+=== end
+=== extern_contrastive#0 drop_last_singleton_region
+applicable: true
+ok: false
+error: singleton partition must contain one region per normalized op
+operations: 0
+=== end
+=== extern_contrastive#0 singleton_region_node
+applicable: true
+ok: false
+error: region node out of range
+operations: 0
+=== end
+=== extern_contrastive#0 swap_singleton_region_nodes
+applicable: true
+ok: false
+error: singleton region/node ordering mismatch
+operations: 0
+=== end
+=== extern_contrastive#0 unordered_region_nodes
+applicable: true
+ok: false
+error: region node indices are not strictly ordered
+operations: 0
+=== end
+=== extern_contrastive#0 region_input_out_of_range
+applicable: true
+ok: false
+error: region input out of range
+operations: 0
+=== end
+=== extern_contrastive#0 region_output_out_of_range
+applicable: true
+ok: false
+error: region output out of range
+operations: 0
+=== end
+=== extern_contrastive#0 region_sink_out_of_range
+applicable: true
+ok: false
+error: region sink out of range
+operations: 0
+=== end
+=== extern_contrastive#0 library_scan_claim
+applicable: true
+ok: false
+error: library region ABI is invalid
+operations: 0
+=== end
+=== extern_contrastive#0 extra_value_type
+applicable: true
+ok: false
+error: normalized value layout does not match op results
+operations: 2
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0x92 results=0 chan=0 args=1
+=== end
+=== extern_contrastive#0 drop_last_value_type
+applicable: true
+ok: false
+error: region output out of range
+operations: 0
+=== end
+=== extern_contrastive#0 drop_last_value_type_and_refs
+applicable: true
+ok: false
+error: normalized op result range is invalid
+operations: 0
+=== end
+=== extern_contrastive#0 rank5_value_type
+applicable: true
+ok: false
+error: invalid normalized value type
+operations: 0
+=== end
+=== extern_contrastive#0 zero_static_dim
+applicable: true
+ok: false
+error: normalized value shape product exceeds u32
+operations: 0
+=== end
+=== extern_contrastive#0 overflow_static_dims
+applicable: true
+ok: false
+error: normalized value shape product exceeds u32
+operations: 0
+=== end
+=== extern_contrastive#0 reverse_ops
+applicable: true
+ok: false
+error: normalized SSA operand is not a prior value
+operations: 0
+=== end
+=== extern_contrastive#0 bad_channel_slot
+applicable: true
+ok: false
+error: normalized channel slot is invalid
+operations: 1
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+=== end
+=== extern_contrastive#0 pivot_payload_out_of_range
+applicable: false
+=== end
+=== extern_contrastive#0 rename_names
+applicable: false
+=== end
+=== extern_contrastive#0 clear_names
+applicable: false
+=== end
+=== greedy_argmax#0 none
+applicable: true
+ok: true
+error: 
+operations: 6
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0x39 results=1 chan=-1 args=1
+op: node=2 result_base=2 tag=0x33 results=1 chan=-1 args=1
+op: node=3 result_base=3 tag=0x39 results=1 chan=-1 args=1
+op: node=4 result_base=4 tag=0x92 results=0 chan=0 args=1
+op: node=5 result_base=4 tag=0x92 results=0 chan=1 args=1
+=== end
+=== greedy_argmax#0 zero_signature_hash
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== greedy_argmax#0 flip_signature_byte
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== greedy_argmax#0 singleton_kind
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== greedy_argmax#0 whole_stage_fallback
+applicable: true
+ok: false
+error: singleton plan requests whole-stage fallback without an identifiable unsupported op
+operations: 6
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0x39 results=1 chan=-1 args=1
+op: node=2 result_base=2 tag=0x33 results=1 chan=-1 args=1
+op: node=3 result_base=3 tag=0x39 results=1 chan=-1 args=1
+op: node=4 result_base=4 tag=0x92 results=0 chan=0 args=1
+op: node=5 result_base=4 tag=0x92 results=0 chan=1 args=1
+=== end
+=== greedy_argmax#0 drop_last_singleton_region
+applicable: true
+ok: false
+error: singleton partition must contain one region per normalized op
+operations: 0
+=== end
+=== greedy_argmax#0 singleton_region_node
+applicable: true
+ok: false
+error: region node out of range
+operations: 0
+=== end
+=== greedy_argmax#0 swap_singleton_region_nodes
+applicable: true
+ok: false
+error: singleton region/node ordering mismatch
+operations: 0
+=== end
+=== greedy_argmax#0 unordered_region_nodes
+applicable: true
+ok: false
+error: region node indices are not strictly ordered
+operations: 0
+=== end
+=== greedy_argmax#0 region_input_out_of_range
+applicable: true
+ok: false
+error: region input out of range
+operations: 0
+=== end
+=== greedy_argmax#0 region_output_out_of_range
+applicable: true
+ok: false
+error: region output out of range
+operations: 0
+=== end
+=== greedy_argmax#0 region_sink_out_of_range
+applicable: true
+ok: false
+error: region sink out of range
+operations: 0
+=== end
+=== greedy_argmax#0 library_scan_claim
+applicable: true
+ok: false
+error: library region ABI is invalid
+operations: 0
+=== end
+=== greedy_argmax#0 extra_value_type
+applicable: true
+ok: false
+error: normalized value layout does not match op results
+operations: 6
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0x39 results=1 chan=-1 args=1
+op: node=2 result_base=2 tag=0x33 results=1 chan=-1 args=1
+op: node=3 result_base=3 tag=0x39 results=1 chan=-1 args=1
+op: node=4 result_base=4 tag=0x92 results=0 chan=0 args=1
+op: node=5 result_base=4 tag=0x92 results=0 chan=1 args=1
+=== end
+=== greedy_argmax#0 drop_last_value_type
+applicable: true
+ok: false
+error: region output out of range
+operations: 0
+=== end
+=== greedy_argmax#0 drop_last_value_type_and_refs
+applicable: true
+ok: false
+error: normalized op result range is invalid
+operations: 3
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0x39 results=1 chan=-1 args=1
+op: node=2 result_base=2 tag=0x33 results=1 chan=-1 args=1
+=== end
+=== greedy_argmax#0 rank5_value_type
+applicable: true
+ok: false
+error: invalid normalized value type
+operations: 0
+=== end
+=== greedy_argmax#0 zero_static_dim
+applicable: true
+ok: false
+error: normalized value shape product exceeds u32
+operations: 0
+=== end
+=== greedy_argmax#0 overflow_static_dims
+applicable: true
+ok: false
+error: normalized value shape product exceeds u32
+operations: 0
+=== end
+=== greedy_argmax#0 reverse_ops
+applicable: true
+ok: false
+error: normalized SSA operand is not a prior value
+operations: 0
+=== end
+=== greedy_argmax#0 bad_channel_slot
+applicable: true
+ok: false
+error: normalized channel slot is invalid
+operations: 4
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0x39 results=1 chan=-1 args=1
+op: node=2 result_base=2 tag=0x33 results=1 chan=-1 args=1
+op: node=3 result_base=3 tag=0x39 results=1 chan=-1 args=1
+=== end
+=== greedy_argmax#0 pivot_payload_out_of_range
+applicable: false
+=== end
+=== greedy_argmax#0 rename_names
+applicable: false
+=== end
+=== greedy_argmax#0 clear_names
+applicable: false
+=== end
+=== matrix_mask_apply_packed#0 none
+applicable: true
+ok: true
+error: 
+operations: 6
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0x81 results=1 chan=-1 args=0
+op: node=2 result_base=2 tag=0x39 results=1 chan=-1 args=1
+op: node=3 result_base=3 tag=0x65 results=1 chan=-1 args=2
+op: node=4 result_base=4 tag=0x33 results=1 chan=-1 args=1
+op: node=5 result_base=5 tag=0x92 results=0 chan=0 args=1
+=== end
+=== matrix_mask_apply_packed#0 zero_signature_hash
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== matrix_mask_apply_packed#0 flip_signature_byte
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== matrix_mask_apply_packed#0 singleton_kind
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== matrix_mask_apply_packed#0 whole_stage_fallback
+applicable: true
+ok: false
+error: singleton plan requests whole-stage fallback without an identifiable unsupported op
+operations: 6
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0x81 results=1 chan=-1 args=0
+op: node=2 result_base=2 tag=0x39 results=1 chan=-1 args=1
+op: node=3 result_base=3 tag=0x65 results=1 chan=-1 args=2
+op: node=4 result_base=4 tag=0x33 results=1 chan=-1 args=1
+op: node=5 result_base=5 tag=0x92 results=0 chan=0 args=1
+=== end
+=== matrix_mask_apply_packed#0 drop_last_singleton_region
+applicable: true
+ok: false
+error: singleton partition must contain one region per normalized op
+operations: 0
+=== end
+=== matrix_mask_apply_packed#0 singleton_region_node
+applicable: true
+ok: false
+error: region node out of range
+operations: 0
+=== end
+=== matrix_mask_apply_packed#0 swap_singleton_region_nodes
+applicable: true
+ok: false
+error: singleton region/node ordering mismatch
+operations: 0
+=== end
+=== matrix_mask_apply_packed#0 unordered_region_nodes
+applicable: true
+ok: false
+error: region node indices are not strictly ordered
+operations: 0
+=== end
+=== matrix_mask_apply_packed#0 region_input_out_of_range
+applicable: true
+ok: false
+error: region input out of range
+operations: 0
+=== end
+=== matrix_mask_apply_packed#0 region_output_out_of_range
+applicable: true
+ok: false
+error: region output out of range
+operations: 0
+=== end
+=== matrix_mask_apply_packed#0 region_sink_out_of_range
+applicable: true
+ok: false
+error: region sink out of range
+operations: 0
+=== end
+=== matrix_mask_apply_packed#0 library_scan_claim
+applicable: true
+ok: false
+error: library region ABI is invalid
+operations: 0
+=== end
+=== matrix_mask_apply_packed#0 extra_value_type
+applicable: true
+ok: false
+error: normalized value layout does not match op results
+operations: 6
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0x81 results=1 chan=-1 args=0
+op: node=2 result_base=2 tag=0x39 results=1 chan=-1 args=1
+op: node=3 result_base=3 tag=0x65 results=1 chan=-1 args=2
+op: node=4 result_base=4 tag=0x33 results=1 chan=-1 args=1
+op: node=5 result_base=5 tag=0x92 results=0 chan=0 args=1
+=== end
+=== matrix_mask_apply_packed#0 drop_last_value_type
+applicable: true
+ok: false
+error: region output out of range
+operations: 0
+=== end
+=== matrix_mask_apply_packed#0 drop_last_value_type_and_refs
+applicable: true
+ok: false
+error: normalized op result range is invalid
+operations: 4
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0x81 results=1 chan=-1 args=0
+op: node=2 result_base=2 tag=0x39 results=1 chan=-1 args=1
+op: node=3 result_base=3 tag=0x65 results=1 chan=-1 args=2
+=== end
+=== matrix_mask_apply_packed#0 rank5_value_type
+applicable: true
+ok: false
+error: invalid normalized value type
+operations: 0
+=== end
+=== matrix_mask_apply_packed#0 zero_static_dim
+applicable: true
+ok: false
+error: normalized value shape product exceeds u32
+operations: 0
+=== end
+=== matrix_mask_apply_packed#0 overflow_static_dims
+applicable: true
+ok: false
+error: normalized value shape product exceeds u32
+operations: 0
+=== end
+=== matrix_mask_apply_packed#0 reverse_ops
+applicable: true
+ok: false
+error: normalized SSA operand is not a prior value
+operations: 0
+=== end
+=== matrix_mask_apply_packed#0 bad_channel_slot
+applicable: true
+ok: false
+error: normalized channel slot is invalid
+operations: 5
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0x81 results=1 chan=-1 args=0
+op: node=2 result_base=2 tag=0x39 results=1 chan=-1 args=1
+op: node=3 result_base=3 tag=0x65 results=1 chan=-1 args=2
+op: node=4 result_base=4 tag=0x33 results=1 chan=-1 args=1
+=== end
+=== matrix_mask_apply_packed#0 pivot_payload_out_of_range
+applicable: false
+=== end
+=== matrix_mask_apply_packed#0 rename_names
+applicable: false
+=== end
+=== matrix_mask_apply_packed#0 clear_names
+applicable: false
+=== end
+=== matrix_select_mask#0 none
+applicable: true
+ok: true
+error: 
+operations: 6
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0x90 results=1 chan=0 args=0
+op: node=2 result_base=2 tag=0x81 results=1 chan=-1 args=0
+op: node=3 result_base=3 tag=0x20 results=1 chan=-1 args=3
+op: node=4 result_base=4 tag=0x33 results=1 chan=-1 args=1
+op: node=5 result_base=5 tag=0x92 results=0 chan=1 args=1
+=== end
+=== matrix_select_mask#0 zero_signature_hash
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== matrix_select_mask#0 flip_signature_byte
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== matrix_select_mask#0 singleton_kind
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== matrix_select_mask#0 whole_stage_fallback
+applicable: true
+ok: false
+error: singleton plan requests whole-stage fallback without an identifiable unsupported op
+operations: 6
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0x90 results=1 chan=0 args=0
+op: node=2 result_base=2 tag=0x81 results=1 chan=-1 args=0
+op: node=3 result_base=3 tag=0x20 results=1 chan=-1 args=3
+op: node=4 result_base=4 tag=0x33 results=1 chan=-1 args=1
+op: node=5 result_base=5 tag=0x92 results=0 chan=1 args=1
+=== end
+=== matrix_select_mask#0 drop_last_singleton_region
+applicable: true
+ok: false
+error: singleton partition must contain one region per normalized op
+operations: 0
+=== end
+=== matrix_select_mask#0 singleton_region_node
+applicable: true
+ok: false
+error: region node out of range
+operations: 0
+=== end
+=== matrix_select_mask#0 swap_singleton_region_nodes
+applicable: true
+ok: false
+error: singleton region/node ordering mismatch
+operations: 0
+=== end
+=== matrix_select_mask#0 unordered_region_nodes
+applicable: true
+ok: false
+error: region node indices are not strictly ordered
+operations: 0
+=== end
+=== matrix_select_mask#0 region_input_out_of_range
+applicable: true
+ok: false
+error: region input out of range
+operations: 0
+=== end
+=== matrix_select_mask#0 region_output_out_of_range
+applicable: true
+ok: false
+error: region output out of range
+operations: 0
+=== end
+=== matrix_select_mask#0 region_sink_out_of_range
+applicable: true
+ok: false
+error: region sink out of range
+operations: 0
+=== end
+=== matrix_select_mask#0 library_scan_claim
+applicable: true
+ok: false
+error: library region ABI is invalid
+operations: 0
+=== end
+=== matrix_select_mask#0 extra_value_type
+applicable: true
+ok: false
+error: normalized value layout does not match op results
+operations: 6
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0x90 results=1 chan=0 args=0
+op: node=2 result_base=2 tag=0x81 results=1 chan=-1 args=0
+op: node=3 result_base=3 tag=0x20 results=1 chan=-1 args=3
+op: node=4 result_base=4 tag=0x33 results=1 chan=-1 args=1
+op: node=5 result_base=5 tag=0x92 results=0 chan=1 args=1
+=== end
+=== matrix_select_mask#0 drop_last_value_type
+applicable: true
+ok: false
+error: region output out of range
+operations: 0
+=== end
+=== matrix_select_mask#0 drop_last_value_type_and_refs
+applicable: true
+ok: false
+error: normalized op result range is invalid
+operations: 4
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0x90 results=1 chan=0 args=0
+op: node=2 result_base=2 tag=0x81 results=1 chan=-1 args=0
+op: node=3 result_base=3 tag=0x20 results=1 chan=-1 args=3
+=== end
+=== matrix_select_mask#0 rank5_value_type
+applicable: true
+ok: false
+error: invalid normalized value type
+operations: 0
+=== end
+=== matrix_select_mask#0 zero_static_dim
+applicable: true
+ok: false
+error: normalized value shape product exceeds u32
+operations: 0
+=== end
+=== matrix_select_mask#0 overflow_static_dims
+applicable: true
+ok: false
+error: normalized value shape product exceeds u32
+operations: 0
+=== end
+=== matrix_select_mask#0 reverse_ops
+applicable: true
+ok: false
+error: normalized SSA operand is not a prior value
+operations: 0
+=== end
+=== matrix_select_mask#0 bad_channel_slot
+applicable: true
+ok: false
+error: normalized channel slot is invalid
+operations: 1
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+=== end
+=== matrix_select_mask#0 pivot_payload_out_of_range
+applicable: false
+=== end
+=== matrix_select_mask#0 rename_names
+applicable: false
+=== end
+=== matrix_select_mask#0 clear_names
+applicable: false
+=== end
+=== mtp_verify_tail#0 none
+applicable: true
+ok: true
+error: 
+operations: 25
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0xa0 results=1 chan=-1 args=0
+op: node=2 result_base=2 tag=0x90 results=1 chan=0 args=0
+op: node=3 result_base=3 tag=0x81 results=1 chan=-1 args=0
+op: node=4 result_base=4 tag=0x20 results=1 chan=-1 args=3
+op: node=5 result_base=5 tag=0x33 results=1 chan=-1 args=1
+op: node=6 result_base=6 tag=0x90 results=1 chan=1 args=0
+op: node=7 result_base=7 tag=0x64 results=1 chan=-1 args=0
+op: node=8 result_base=8 tag=0x60 results=1 chan=-1 args=2
+op: node=9 result_base=9 tag=0x18 results=1 chan=-1 args=2
+op: node=10 result_base=10 tag=0x81 results=1 chan=-1 args=0
+op: node=11 result_base=11 tag=0x81 results=1 chan=-1 args=0
+op: node=12 result_base=12 tag=0x20 results=1 chan=-1 args=3
+op: node=13 result_base=13 tag=0x41 results=1 chan=-1 args=1
+op: node=14 result_base=14 tag=0x30 results=1 chan=-1 args=1
+op: node=15 result_base=15 tag=0x07 results=1 chan=-1 args=1
+op: node=16 result_base=16 tag=0x38 results=1 chan=-1 args=1
+op: node=17 result_base=17 tag=0x64 results=1 chan=-1 args=0
+op: node=18 result_base=18 tag=0x17 results=1 chan=-1 args=2
+op: node=19 result_base=19 tag=0x81 results=1 chan=-1 args=0
+op: node=20 result_base=20 tag=0x20 results=1 chan=-1 args=3
+op: node=21 result_base=21 tag=0x92 results=0 chan=2 args=1
+op: node=22 result_base=21 tag=0x33 results=1 chan=-1 args=1
+op: node=23 result_base=22 tag=0x92 results=0 chan=1 args=1
+op: node=24 result_base=22 tag=0x92 results=0 chan=3 args=1
+=== end
+=== mtp_verify_tail#0 zero_signature_hash
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== mtp_verify_tail#0 flip_signature_byte
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== mtp_verify_tail#0 singleton_kind
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== mtp_verify_tail#0 whole_stage_fallback
+applicable: true
+ok: false
+error: singleton plan requests whole-stage fallback without an identifiable unsupported op
+operations: 25
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0xa0 results=1 chan=-1 args=0
+op: node=2 result_base=2 tag=0x90 results=1 chan=0 args=0
+op: node=3 result_base=3 tag=0x81 results=1 chan=-1 args=0
+op: node=4 result_base=4 tag=0x20 results=1 chan=-1 args=3
+op: node=5 result_base=5 tag=0x33 results=1 chan=-1 args=1
+op: node=6 result_base=6 tag=0x90 results=1 chan=1 args=0
+op: node=7 result_base=7 tag=0x64 results=1 chan=-1 args=0
+op: node=8 result_base=8 tag=0x60 results=1 chan=-1 args=2
+op: node=9 result_base=9 tag=0x18 results=1 chan=-1 args=2
+op: node=10 result_base=10 tag=0x81 results=1 chan=-1 args=0
+op: node=11 result_base=11 tag=0x81 results=1 chan=-1 args=0
+op: node=12 result_base=12 tag=0x20 results=1 chan=-1 args=3
+op: node=13 result_base=13 tag=0x41 results=1 chan=-1 args=1
+op: node=14 result_base=14 tag=0x30 results=1 chan=-1 args=1
+op: node=15 result_base=15 tag=0x07 results=1 chan=-1 args=1
+op: node=16 result_base=16 tag=0x38 results=1 chan=-1 args=1
+op: node=17 result_base=17 tag=0x64 results=1 chan=-1 args=0
+op: node=18 result_base=18 tag=0x17 results=1 chan=-1 args=2
+op: node=19 result_base=19 tag=0x81 results=1 chan=-1 args=0
+op: node=20 result_base=20 tag=0x20 results=1 chan=-1 args=3
+op: node=21 result_base=21 tag=0x92 results=0 chan=2 args=1
+op: node=22 result_base=21 tag=0x33 results=1 chan=-1 args=1
+op: node=23 result_base=22 tag=0x92 results=0 chan=1 args=1
+op: node=24 result_base=22 tag=0x92 results=0 chan=3 args=1
+=== end
+=== mtp_verify_tail#0 drop_last_singleton_region
+applicable: true
+ok: false
+error: singleton partition must contain one region per normalized op
+operations: 0
+=== end
+=== mtp_verify_tail#0 singleton_region_node
+applicable: true
+ok: false
+error: region node out of range
+operations: 0
+=== end
+=== mtp_verify_tail#0 swap_singleton_region_nodes
+applicable: true
+ok: false
+error: singleton region/node ordering mismatch
+operations: 0
+=== end
+=== mtp_verify_tail#0 unordered_region_nodes
+applicable: true
+ok: false
+error: region node indices are not strictly ordered
+operations: 0
+=== end
+=== mtp_verify_tail#0 region_input_out_of_range
+applicable: true
+ok: false
+error: region input out of range
+operations: 0
+=== end
+=== mtp_verify_tail#0 region_output_out_of_range
+applicable: true
+ok: false
+error: region output out of range
+operations: 0
+=== end
+=== mtp_verify_tail#0 region_sink_out_of_range
+applicable: true
+ok: false
+error: region sink out of range
+operations: 0
+=== end
+=== mtp_verify_tail#0 library_scan_claim
+applicable: true
+ok: false
+error: library region ABI is invalid
+operations: 0
+=== end
+=== mtp_verify_tail#0 extra_value_type
+applicable: true
+ok: false
+error: normalized value layout does not match op results
+operations: 25
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0xa0 results=1 chan=-1 args=0
+op: node=2 result_base=2 tag=0x90 results=1 chan=0 args=0
+op: node=3 result_base=3 tag=0x81 results=1 chan=-1 args=0
+op: node=4 result_base=4 tag=0x20 results=1 chan=-1 args=3
+op: node=5 result_base=5 tag=0x33 results=1 chan=-1 args=1
+op: node=6 result_base=6 tag=0x90 results=1 chan=1 args=0
+op: node=7 result_base=7 tag=0x64 results=1 chan=-1 args=0
+op: node=8 result_base=8 tag=0x60 results=1 chan=-1 args=2
+op: node=9 result_base=9 tag=0x18 results=1 chan=-1 args=2
+op: node=10 result_base=10 tag=0x81 results=1 chan=-1 args=0
+op: node=11 result_base=11 tag=0x81 results=1 chan=-1 args=0
+op: node=12 result_base=12 tag=0x20 results=1 chan=-1 args=3
+op: node=13 result_base=13 tag=0x41 results=1 chan=-1 args=1
+op: node=14 result_base=14 tag=0x30 results=1 chan=-1 args=1
+op: node=15 result_base=15 tag=0x07 results=1 chan=-1 args=1
+op: node=16 result_base=16 tag=0x38 results=1 chan=-1 args=1
+op: node=17 result_base=17 tag=0x64 results=1 chan=-1 args=0
+op: node=18 result_base=18 tag=0x17 results=1 chan=-1 args=2
+op: node=19 result_base=19 tag=0x81 results=1 chan=-1 args=0
+op: node=20 result_base=20 tag=0x20 results=1 chan=-1 args=3
+op: node=21 result_base=21 tag=0x92 results=0 chan=2 args=1
+op: node=22 result_base=21 tag=0x33 results=1 chan=-1 args=1
+op: node=23 result_base=22 tag=0x92 results=0 chan=1 args=1
+op: node=24 result_base=22 tag=0x92 results=0 chan=3 args=1
+=== end
+=== mtp_verify_tail#0 drop_last_value_type
+applicable: true
+ok: false
+error: region output out of range
+operations: 0
+=== end
+=== mtp_verify_tail#0 drop_last_value_type_and_refs
+applicable: true
+ok: false
+error: normalized op result range is invalid
+operations: 22
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0xa0 results=1 chan=-1 args=0
+op: node=2 result_base=2 tag=0x90 results=1 chan=0 args=0
+op: node=3 result_base=3 tag=0x81 results=1 chan=-1 args=0
+op: node=4 result_base=4 tag=0x20 results=1 chan=-1 args=3
+op: node=5 result_base=5 tag=0x33 results=1 chan=-1 args=1
+op: node=6 result_base=6 tag=0x90 results=1 chan=1 args=0
+op: node=7 result_base=7 tag=0x64 results=1 chan=-1 args=0
+op: node=8 result_base=8 tag=0x60 results=1 chan=-1 args=2
+op: node=9 result_base=9 tag=0x18 results=1 chan=-1 args=2
+op: node=10 result_base=10 tag=0x81 results=1 chan=-1 args=0
+op: node=11 result_base=11 tag=0x81 results=1 chan=-1 args=0
+op: node=12 result_base=12 tag=0x20 results=1 chan=-1 args=3
+op: node=13 result_base=13 tag=0x41 results=1 chan=-1 args=1
+op: node=14 result_base=14 tag=0x30 results=1 chan=-1 args=1
+op: node=15 result_base=15 tag=0x07 results=1 chan=-1 args=1
+op: node=16 result_base=16 tag=0x38 results=1 chan=-1 args=1
+op: node=17 result_base=17 tag=0x64 results=1 chan=-1 args=0
+op: node=18 result_base=18 tag=0x17 results=1 chan=-1 args=2
+op: node=19 result_base=19 tag=0x81 results=1 chan=-1 args=0
+op: node=20 result_base=20 tag=0x20 results=1 chan=-1 args=3
+op: node=21 result_base=21 tag=0x92 results=0 chan=2 args=1
+=== end
+=== mtp_verify_tail#0 rank5_value_type
+applicable: true
+ok: false
+error: invalid normalized value type
+operations: 0
+=== end
+=== mtp_verify_tail#0 zero_static_dim
+applicable: true
+ok: false
+error: normalized value shape product exceeds u32
+operations: 0
+=== end
+=== mtp_verify_tail#0 overflow_static_dims
+applicable: true
+ok: false
+error: normalized value shape product exceeds u32
+operations: 0
+=== end
+=== mtp_verify_tail#0 reverse_ops
+applicable: true
+ok: false
+error: library region ABI is invalid
+operations: 0
+=== end
+=== mtp_verify_tail#0 bad_channel_slot
+applicable: true
+ok: false
+error: normalized channel slot is invalid
+operations: 2
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0xa0 results=1 chan=-1 args=0
+=== end
+=== mtp_verify_tail#0 pivot_payload_out_of_range
+applicable: false
+=== end
+=== mtp_verify_tail#0 rename_names
+applicable: false
+=== end
+=== mtp_verify_tail#0 clear_names
+applicable: false
+=== end
+=== nucleus_sample#0 none
+applicable: true
+ok: true
+error: 
+operations: 17
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0x90 results=1 chan=0 args=0
+op: node=2 result_base=2 tag=0x91 results=1 chan=1 args=0
+op: node=3 result_base=3 tag=0x31 results=1 chan=-1 args=1
+op: node=4 result_base=4 tag=0x38 results=1 chan=-1 args=1
+op: node=5 result_base=5 tag=0x11 results=1 chan=-1 args=2
+op: node=6 result_base=6 tag=0x01 results=1 chan=-1 args=1
+op: node=7 result_base=7 tag=0x30 results=1 chan=-1 args=1
+op: node=8 result_base=8 tag=0x38 results=1 chan=-1 args=1
+op: node=9 result_base=9 tag=0x13 results=1 chan=-1 args=2
+op: node=10 result_base=10 tag=0x58 results=1 chan=-1 args=1
+op: node=11 result_base=11 tag=0x81 results=1 chan=-1 args=0
+op: node=12 result_base=12 tag=0x20 results=1 chan=-1 args=3
+op: node=13 result_base=13 tag=0x71 results=1 chan=-1 args=1
+op: node=14 result_base=14 tag=0x10 results=1 chan=-1 args=2
+op: node=15 result_base=15 tag=0x33 results=1 chan=-1 args=1
+op: node=16 result_base=16 tag=0x92 results=0 chan=2 args=1
+=== end
+=== nucleus_sample#0 zero_signature_hash
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== nucleus_sample#0 flip_signature_byte
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== nucleus_sample#0 singleton_kind
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== nucleus_sample#0 whole_stage_fallback
+applicable: true
+ok: false
+error: singleton plan requests whole-stage fallback without an identifiable unsupported op
+operations: 17
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0x90 results=1 chan=0 args=0
+op: node=2 result_base=2 tag=0x91 results=1 chan=1 args=0
+op: node=3 result_base=3 tag=0x31 results=1 chan=-1 args=1
+op: node=4 result_base=4 tag=0x38 results=1 chan=-1 args=1
+op: node=5 result_base=5 tag=0x11 results=1 chan=-1 args=2
+op: node=6 result_base=6 tag=0x01 results=1 chan=-1 args=1
+op: node=7 result_base=7 tag=0x30 results=1 chan=-1 args=1
+op: node=8 result_base=8 tag=0x38 results=1 chan=-1 args=1
+op: node=9 result_base=9 tag=0x13 results=1 chan=-1 args=2
+op: node=10 result_base=10 tag=0x58 results=1 chan=-1 args=1
+op: node=11 result_base=11 tag=0x81 results=1 chan=-1 args=0
+op: node=12 result_base=12 tag=0x20 results=1 chan=-1 args=3
+op: node=13 result_base=13 tag=0x71 results=1 chan=-1 args=1
+op: node=14 result_base=14 tag=0x10 results=1 chan=-1 args=2
+op: node=15 result_base=15 tag=0x33 results=1 chan=-1 args=1
+op: node=16 result_base=16 tag=0x92 results=0 chan=2 args=1
+=== end
+=== nucleus_sample#0 drop_last_singleton_region
+applicable: true
+ok: false
+error: singleton partition must contain one region per normalized op
+operations: 0
+=== end
+=== nucleus_sample#0 singleton_region_node
+applicable: true
+ok: false
+error: region node out of range
+operations: 0
+=== end
+=== nucleus_sample#0 swap_singleton_region_nodes
+applicable: true
+ok: false
+error: singleton region/node ordering mismatch
+operations: 0
+=== end
+=== nucleus_sample#0 unordered_region_nodes
+applicable: true
+ok: false
+error: region node indices are not strictly ordered
+operations: 0
+=== end
+=== nucleus_sample#0 region_input_out_of_range
+applicable: true
+ok: false
+error: region input out of range
+operations: 0
+=== end
+=== nucleus_sample#0 region_output_out_of_range
+applicable: true
+ok: false
+error: region output out of range
+operations: 0
+=== end
+=== nucleus_sample#0 region_sink_out_of_range
+applicable: true
+ok: false
+error: region sink out of range
+operations: 0
+=== end
+=== nucleus_sample#0 library_scan_claim
+applicable: true
+ok: false
+error: library region ABI is invalid
+operations: 0
+=== end
+=== nucleus_sample#0 extra_value_type
+applicable: true
+ok: false
+error: normalized value layout does not match op results
+operations: 17
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0x90 results=1 chan=0 args=0
+op: node=2 result_base=2 tag=0x91 results=1 chan=1 args=0
+op: node=3 result_base=3 tag=0x31 results=1 chan=-1 args=1
+op: node=4 result_base=4 tag=0x38 results=1 chan=-1 args=1
+op: node=5 result_base=5 tag=0x11 results=1 chan=-1 args=2
+op: node=6 result_base=6 tag=0x01 results=1 chan=-1 args=1
+op: node=7 result_base=7 tag=0x30 results=1 chan=-1 args=1
+op: node=8 result_base=8 tag=0x38 results=1 chan=-1 args=1
+op: node=9 result_base=9 tag=0x13 results=1 chan=-1 args=2
+op: node=10 result_base=10 tag=0x58 results=1 chan=-1 args=1
+op: node=11 result_base=11 tag=0x81 results=1 chan=-1 args=0
+op: node=12 result_base=12 tag=0x20 results=1 chan=-1 args=3
+op: node=13 result_base=13 tag=0x71 results=1 chan=-1 args=1
+op: node=14 result_base=14 tag=0x10 results=1 chan=-1 args=2
+op: node=15 result_base=15 tag=0x33 results=1 chan=-1 args=1
+op: node=16 result_base=16 tag=0x92 results=0 chan=2 args=1
+=== end
+=== nucleus_sample#0 drop_last_value_type
+applicable: true
+ok: false
+error: region output out of range
+operations: 0
+=== end
+=== nucleus_sample#0 drop_last_value_type_and_refs
+applicable: true
+ok: false
+error: library region ABI is invalid
+operations: 0
+=== end
+=== nucleus_sample#0 rank5_value_type
+applicable: true
+ok: false
+error: invalid normalized value type
+operations: 0
+=== end
+=== nucleus_sample#0 zero_static_dim
+applicable: true
+ok: false
+error: normalized value shape product exceeds u32
+operations: 0
+=== end
+=== nucleus_sample#0 overflow_static_dims
+applicable: true
+ok: false
+error: normalized value shape product exceeds u32
+operations: 0
+=== end
+=== nucleus_sample#0 reverse_ops
+applicable: true
+ok: false
+error: normalized SSA operand is not a prior value
+operations: 0
+=== end
+=== nucleus_sample#0 bad_channel_slot
+applicable: true
+ok: false
+error: normalized channel slot is invalid
+operations: 1
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+=== end
+=== nucleus_sample#0 pivot_payload_out_of_range
+applicable: true
+ok: false
+error: pivot predicate payload is out of range
+operations: 10
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0x90 results=1 chan=0 args=0
+op: node=2 result_base=2 tag=0x91 results=1 chan=1 args=0
+op: node=3 result_base=3 tag=0x31 results=1 chan=-1 args=1
+op: node=4 result_base=4 tag=0x38 results=1 chan=-1 args=1
+op: node=5 result_base=5 tag=0x11 results=1 chan=-1 args=2
+op: node=6 result_base=6 tag=0x01 results=1 chan=-1 args=1
+op: node=7 result_base=7 tag=0x30 results=1 chan=-1 args=1
+op: node=8 result_base=8 tag=0x38 results=1 chan=-1 args=1
+op: node=9 result_base=9 tag=0x13 results=1 chan=-1 args=2
+=== end
+=== nucleus_sample#0 rename_names
+applicable: false
+=== end
+=== nucleus_sample#0 clear_names
+applicable: false
+=== end
+=== pentathlon_iter#0 none
+applicable: true
+ok: false
+error: unsupported Metal semantic kernel boundary
+operations: 1
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+=== end
+=== pentathlon_iter#0 zero_signature_hash
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== pentathlon_iter#0 flip_signature_byte
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== pentathlon_iter#0 singleton_kind
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== pentathlon_iter#0 whole_stage_fallback
+applicable: true
+ok: false
+error: unsupported Metal semantic kernel boundary
+operations: 1
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+=== end
+=== pentathlon_iter#0 drop_last_singleton_region
+applicable: true
+ok: false
+error: singleton partition must contain one region per normalized op
+operations: 0
+=== end
+=== pentathlon_iter#0 singleton_region_node
+applicable: true
+ok: false
+error: region node out of range
+operations: 0
+=== end
+=== pentathlon_iter#0 swap_singleton_region_nodes
+applicable: true
+ok: false
+error: library region ABI is invalid
+operations: 0
+=== end
+=== pentathlon_iter#0 unordered_region_nodes
+applicable: false
+=== end
+=== pentathlon_iter#0 region_input_out_of_range
+applicable: true
+ok: false
+error: region input out of range
+operations: 0
+=== end
+=== pentathlon_iter#0 region_output_out_of_range
+applicable: true
+ok: false
+error: region output out of range
+operations: 0
+=== end
+=== pentathlon_iter#0 region_sink_out_of_range
+applicable: true
+ok: false
+error: region sink out of range
+operations: 0
+=== end
+=== pentathlon_iter#0 library_scan_claim
+applicable: true
+ok: false
+error: library region ABI is invalid
+operations: 0
+=== end
+=== pentathlon_iter#0 extra_value_type
+applicable: true
+ok: false
+error: unsupported Metal semantic kernel boundary
+operations: 1
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+=== end
+=== pentathlon_iter#0 drop_last_value_type
+applicable: true
+ok: false
+error: region output out of range
+operations: 0
+=== end
+=== pentathlon_iter#0 drop_last_value_type_and_refs
+applicable: true
+ok: false
+error: unsupported Metal semantic kernel boundary
+operations: 1
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+=== end
+=== pentathlon_iter#0 rank5_value_type
+applicable: true
+ok: false
+error: invalid normalized value type
+operations: 0
+=== end
+=== pentathlon_iter#0 zero_static_dim
+applicable: true
+ok: false
+error: normalized value shape product exceeds u32
+operations: 0
+=== end
+=== pentathlon_iter#0 overflow_static_dims
+applicable: true
+ok: false
+error: normalized value shape product exceeds u32
+operations: 0
+=== end
+=== pentathlon_iter#0 reverse_ops
+applicable: true
+ok: false
+error: library region ABI is invalid
+operations: 0
+=== end
+=== pentathlon_iter#0 bad_channel_slot
+applicable: true
+ok: false
+error: unsupported Metal semantic kernel boundary
+operations: 1
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+=== end
+=== pentathlon_iter#0 pivot_payload_out_of_range
+applicable: true
+ok: false
+error: unsupported Metal semantic kernel boundary
+operations: 1
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+=== end
+=== pentathlon_iter#0 rename_names
+applicable: true
+ok: false
+error: unsupported Metal semantic kernel boundary
+operations: 1
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+=== end
+=== pentathlon_iter#0 clear_names
+applicable: true
+ok: false
+error: unsupported Metal semantic kernel boundary
+operations: 1
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+=== end
+=== pentathlon_iter#1 none
+applicable: true
+ok: true
+error: 
+operations: 38
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0x90 results=1 chan=0 args=0
+op: node=2 result_base=2 tag=0x90 results=1 chan=1 args=0
+op: node=3 result_base=3 tag=0x31 results=1 chan=-1 args=1
+op: node=4 result_base=4 tag=0x38 results=1 chan=-1 args=1
+op: node=5 result_base=5 tag=0x11 results=1 chan=-1 args=2
+op: node=6 result_base=6 tag=0x01 results=1 chan=-1 args=1
+op: node=7 result_base=7 tag=0x30 results=1 chan=-1 args=1
+op: node=8 result_base=8 tag=0x02 results=1 chan=-1 args=1
+op: node=9 result_base=9 tag=0x38 results=1 chan=-1 args=1
+op: node=10 result_base=10 tag=0x11 results=1 chan=-1 args=2
+op: node=11 result_base=11 tag=0x31 results=1 chan=-1 args=1
+op: node=12 result_base=12 tag=0x38 results=1 chan=-1 args=1
+op: node=13 result_base=13 tag=0x11 results=1 chan=-1 args=2
+op: node=14 result_base=14 tag=0x01 results=1 chan=-1 args=1
+op: node=15 result_base=15 tag=0x30 results=1 chan=-1 args=1
+op: node=16 result_base=16 tag=0x02 results=1 chan=-1 args=1
+op: node=17 result_base=17 tag=0x38 results=1 chan=-1 args=1
+op: node=18 result_base=18 tag=0x11 results=1 chan=-1 args=2
+op: node=19 result_base=19 tag=0x81 results=1 chan=-1 args=0
+op: node=20 result_base=20 tag=0x12 results=1 chan=-1 args=2
+op: node=21 result_base=21 tag=0x11 results=1 chan=-1 args=2
+op: node=22 result_base=22 tag=0x81 results=1 chan=-1 args=0
+op: node=23 result_base=23 tag=0x20 results=1 chan=-1 args=3
+op: node=24 result_base=24 tag=0x31 results=1 chan=-1 args=1
+op: node=25 result_base=25 tag=0x39 results=1 chan=-1 args=1
+op: node=26 result_base=26 tag=0x38 results=1 chan=-1 args=1
+op: node=27 result_base=27 tag=0x81 results=1 chan=-1 args=0
+op: node=28 result_base=28 tag=0x10 results=1 chan=-1 args=2
+op: node=29 result_base=29 tag=0x17 results=1 chan=-1 args=2
+op: node=30 result_base=30 tag=0x20 results=1 chan=-1 args=3
+op: node=31 result_base=31 tag=0x51 results=2 chan=-1 args=1
+op: node=32 result_base=33 tag=0x39 results=1 chan=-1 args=1
+op: node=33 result_base=34 tag=0x39 results=1 chan=-1 args=1
+op: node=34 result_base=35 tag=0x92 results=0 chan=2 args=1
+op: node=35 result_base=35 tag=0x92 results=0 chan=3 args=1
+op: node=36 result_base=35 tag=0xa0 results=1 chan=-1 args=0
+op: node=37 result_base=36 tag=0x92 results=0 chan=4 args=1
+=== end
+=== pentathlon_iter#1 zero_signature_hash
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== pentathlon_iter#1 flip_signature_byte
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== pentathlon_iter#1 singleton_kind
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== pentathlon_iter#1 whole_stage_fallback
+applicable: true
+ok: false
+error: singleton plan requests whole-stage fallback without an identifiable unsupported op
+operations: 38
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0x90 results=1 chan=0 args=0
+op: node=2 result_base=2 tag=0x90 results=1 chan=1 args=0
+op: node=3 result_base=3 tag=0x31 results=1 chan=-1 args=1
+op: node=4 result_base=4 tag=0x38 results=1 chan=-1 args=1
+op: node=5 result_base=5 tag=0x11 results=1 chan=-1 args=2
+op: node=6 result_base=6 tag=0x01 results=1 chan=-1 args=1
+op: node=7 result_base=7 tag=0x30 results=1 chan=-1 args=1
+op: node=8 result_base=8 tag=0x02 results=1 chan=-1 args=1
+op: node=9 result_base=9 tag=0x38 results=1 chan=-1 args=1
+op: node=10 result_base=10 tag=0x11 results=1 chan=-1 args=2
+op: node=11 result_base=11 tag=0x31 results=1 chan=-1 args=1
+op: node=12 result_base=12 tag=0x38 results=1 chan=-1 args=1
+op: node=13 result_base=13 tag=0x11 results=1 chan=-1 args=2
+op: node=14 result_base=14 tag=0x01 results=1 chan=-1 args=1
+op: node=15 result_base=15 tag=0x30 results=1 chan=-1 args=1
+op: node=16 result_base=16 tag=0x02 results=1 chan=-1 args=1
+op: node=17 result_base=17 tag=0x38 results=1 chan=-1 args=1
+op: node=18 result_base=18 tag=0x11 results=1 chan=-1 args=2
+op: node=19 result_base=19 tag=0x81 results=1 chan=-1 args=0
+op: node=20 result_base=20 tag=0x12 results=1 chan=-1 args=2
+op: node=21 result_base=21 tag=0x11 results=1 chan=-1 args=2
+op: node=22 result_base=22 tag=0x81 results=1 chan=-1 args=0
+op: node=23 result_base=23 tag=0x20 results=1 chan=-1 args=3
+op: node=24 result_base=24 tag=0x31 results=1 chan=-1 args=1
+op: node=25 result_base=25 tag=0x39 results=1 chan=-1 args=1
+op: node=26 result_base=26 tag=0x38 results=1 chan=-1 args=1
+op: node=27 result_base=27 tag=0x81 results=1 chan=-1 args=0
+op: node=28 result_base=28 tag=0x10 results=1 chan=-1 args=2
+op: node=29 result_base=29 tag=0x17 results=1 chan=-1 args=2
+op: node=30 result_base=30 tag=0x20 results=1 chan=-1 args=3
+op: node=31 result_base=31 tag=0x51 results=2 chan=-1 args=1
+op: node=32 result_base=33 tag=0x39 results=1 chan=-1 args=1
+op: node=33 result_base=34 tag=0x39 results=1 chan=-1 args=1
+op: node=34 result_base=35 tag=0x92 results=0 chan=2 args=1
+op: node=35 result_base=35 tag=0x92 results=0 chan=3 args=1
+op: node=36 result_base=35 tag=0xa0 results=1 chan=-1 args=0
+op: node=37 result_base=36 tag=0x92 results=0 chan=4 args=1
+=== end
+=== pentathlon_iter#1 drop_last_singleton_region
+applicable: true
+ok: false
+error: singleton partition must contain one region per normalized op
+operations: 0
+=== end
+=== pentathlon_iter#1 singleton_region_node
+applicable: true
+ok: false
+error: region node out of range
+operations: 0
+=== end
+=== pentathlon_iter#1 swap_singleton_region_nodes
+applicable: true
+ok: false
+error: singleton region/node ordering mismatch
+operations: 0
+=== end
+=== pentathlon_iter#1 unordered_region_nodes
+applicable: true
+ok: false
+error: region node indices are not strictly ordered
+operations: 0
+=== end
+=== pentathlon_iter#1 region_input_out_of_range
+applicable: true
+ok: false
+error: region input out of range
+operations: 0
+=== end
+=== pentathlon_iter#1 region_output_out_of_range
+applicable: true
+ok: false
+error: region output out of range
+operations: 0
+=== end
+=== pentathlon_iter#1 region_sink_out_of_range
+applicable: true
+ok: false
+error: region sink out of range
+operations: 0
+=== end
+=== pentathlon_iter#1 library_scan_claim
+applicable: true
+ok: false
+error: library region ABI is invalid
+operations: 0
+=== end
+=== pentathlon_iter#1 extra_value_type
+applicable: true
+ok: false
+error: normalized value layout does not match op results
+operations: 38
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0x90 results=1 chan=0 args=0
+op: node=2 result_base=2 tag=0x90 results=1 chan=1 args=0
+op: node=3 result_base=3 tag=0x31 results=1 chan=-1 args=1
+op: node=4 result_base=4 tag=0x38 results=1 chan=-1 args=1
+op: node=5 result_base=5 tag=0x11 results=1 chan=-1 args=2
+op: node=6 result_base=6 tag=0x01 results=1 chan=-1 args=1
+op: node=7 result_base=7 tag=0x30 results=1 chan=-1 args=1
+op: node=8 result_base=8 tag=0x02 results=1 chan=-1 args=1
+op: node=9 result_base=9 tag=0x38 results=1 chan=-1 args=1
+op: node=10 result_base=10 tag=0x11 results=1 chan=-1 args=2
+op: node=11 result_base=11 tag=0x31 results=1 chan=-1 args=1
+op: node=12 result_base=12 tag=0x38 results=1 chan=-1 args=1
+op: node=13 result_base=13 tag=0x11 results=1 chan=-1 args=2
+op: node=14 result_base=14 tag=0x01 results=1 chan=-1 args=1
+op: node=15 result_base=15 tag=0x30 results=1 chan=-1 args=1
+op: node=16 result_base=16 tag=0x02 results=1 chan=-1 args=1
+op: node=17 result_base=17 tag=0x38 results=1 chan=-1 args=1
+op: node=18 result_base=18 tag=0x11 results=1 chan=-1 args=2
+op: node=19 result_base=19 tag=0x81 results=1 chan=-1 args=0
+op: node=20 result_base=20 tag=0x12 results=1 chan=-1 args=2
+op: node=21 result_base=21 tag=0x11 results=1 chan=-1 args=2
+op: node=22 result_base=22 tag=0x81 results=1 chan=-1 args=0
+op: node=23 result_base=23 tag=0x20 results=1 chan=-1 args=3
+op: node=24 result_base=24 tag=0x31 results=1 chan=-1 args=1
+op: node=25 result_base=25 tag=0x39 results=1 chan=-1 args=1
+op: node=26 result_base=26 tag=0x38 results=1 chan=-1 args=1
+op: node=27 result_base=27 tag=0x81 results=1 chan=-1 args=0
+op: node=28 result_base=28 tag=0x10 results=1 chan=-1 args=2
+op: node=29 result_base=29 tag=0x17 results=1 chan=-1 args=2
+op: node=30 result_base=30 tag=0x20 results=1 chan=-1 args=3
+op: node=31 result_base=31 tag=0x51 results=2 chan=-1 args=1
+op: node=32 result_base=33 tag=0x39 results=1 chan=-1 args=1
+op: node=33 result_base=34 tag=0x39 results=1 chan=-1 args=1
+op: node=34 result_base=35 tag=0x92 results=0 chan=2 args=1
+op: node=35 result_base=35 tag=0x92 results=0 chan=3 args=1
+op: node=36 result_base=35 tag=0xa0 results=1 chan=-1 args=0
+op: node=37 result_base=36 tag=0x92 results=0 chan=4 args=1
+=== end
+=== pentathlon_iter#1 drop_last_value_type
+applicable: true
+ok: false
+error: region output out of range
+operations: 0
+=== end
+=== pentathlon_iter#1 drop_last_value_type_and_refs
+applicable: true
+ok: false
+error: normalized op result range is invalid
+operations: 36
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0x90 results=1 chan=0 args=0
+op: node=2 result_base=2 tag=0x90 results=1 chan=1 args=0
+op: node=3 result_base=3 tag=0x31 results=1 chan=-1 args=1
+op: node=4 result_base=4 tag=0x38 results=1 chan=-1 args=1
+op: node=5 result_base=5 tag=0x11 results=1 chan=-1 args=2
+op: node=6 result_base=6 tag=0x01 results=1 chan=-1 args=1
+op: node=7 result_base=7 tag=0x30 results=1 chan=-1 args=1
+op: node=8 result_base=8 tag=0x02 results=1 chan=-1 args=1
+op: node=9 result_base=9 tag=0x38 results=1 chan=-1 args=1
+op: node=10 result_base=10 tag=0x11 results=1 chan=-1 args=2
+op: node=11 result_base=11 tag=0x31 results=1 chan=-1 args=1
+op: node=12 result_base=12 tag=0x38 results=1 chan=-1 args=1
+op: node=13 result_base=13 tag=0x11 results=1 chan=-1 args=2
+op: node=14 result_base=14 tag=0x01 results=1 chan=-1 args=1
+op: node=15 result_base=15 tag=0x30 results=1 chan=-1 args=1
+op: node=16 result_base=16 tag=0x02 results=1 chan=-1 args=1
+op: node=17 result_base=17 tag=0x38 results=1 chan=-1 args=1
+op: node=18 result_base=18 tag=0x11 results=1 chan=-1 args=2
+op: node=19 result_base=19 tag=0x81 results=1 chan=-1 args=0
+op: node=20 result_base=20 tag=0x12 results=1 chan=-1 args=2
+op: node=21 result_base=21 tag=0x11 results=1 chan=-1 args=2
+op: node=22 result_base=22 tag=0x81 results=1 chan=-1 args=0
+op: node=23 result_base=23 tag=0x20 results=1 chan=-1 args=3
+op: node=24 result_base=24 tag=0x31 results=1 chan=-1 args=1
+op: node=25 result_base=25 tag=0x39 results=1 chan=-1 args=1
+op: node=26 result_base=26 tag=0x38 results=1 chan=-1 args=1
+op: node=27 result_base=27 tag=0x81 results=1 chan=-1 args=0
+op: node=28 result_base=28 tag=0x10 results=1 chan=-1 args=2
+op: node=29 result_base=29 tag=0x17 results=1 chan=-1 args=2
+op: node=30 result_base=30 tag=0x20 results=1 chan=-1 args=3
+op: node=31 result_base=31 tag=0x51 results=2 chan=-1 args=1
+op: node=32 result_base=33 tag=0x39 results=1 chan=-1 args=1
+op: node=33 result_base=34 tag=0x39 results=1 chan=-1 args=1
+op: node=34 result_base=35 tag=0x92 results=0 chan=2 args=1
+op: node=35 result_base=35 tag=0x92 results=0 chan=3 args=1
+=== end
+=== pentathlon_iter#1 rank5_value_type
+applicable: true
+ok: false
+error: invalid normalized value type
+operations: 0
+=== end
+=== pentathlon_iter#1 zero_static_dim
+applicable: true
+ok: false
+error: normalized value shape product exceeds u32
+operations: 0
+=== end
+=== pentathlon_iter#1 overflow_static_dims
+applicable: true
+ok: false
+error: normalized value shape product exceeds u32
+operations: 0
+=== end
+=== pentathlon_iter#1 reverse_ops
+applicable: true
+ok: false
+error: library region ABI is invalid
+operations: 0
+=== end
+=== pentathlon_iter#1 bad_channel_slot
+applicable: true
+ok: false
+error: normalized channel slot is invalid
+operations: 1
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+=== end
+=== pentathlon_iter#1 pivot_payload_out_of_range
+applicable: false
+=== end
+=== pentathlon_iter#1 rename_names
+applicable: false
+=== end
+=== pentathlon_iter#1 clear_names
+applicable: false
+=== end
+=== pivot_predicates_multistage#0 none
+applicable: true
+ok: true
+error: 
+operations: 0
+=== end
+=== pivot_predicates_multistage#0 zero_signature_hash
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== pivot_predicates_multistage#0 flip_signature_byte
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== pivot_predicates_multistage#0 singleton_kind
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== pivot_predicates_multistage#0 whole_stage_fallback
+applicable: true
+ok: false
+error: singleton plan requests whole-stage fallback without an identifiable unsupported op
+operations: 0
+=== end
+=== pivot_predicates_multistage#0 drop_last_singleton_region
+applicable: false
+=== end
+=== pivot_predicates_multistage#0 singleton_region_node
+applicable: false
+=== end
+=== pivot_predicates_multistage#0 swap_singleton_region_nodes
+applicable: false
+=== end
+=== pivot_predicates_multistage#0 unordered_region_nodes
+applicable: false
+=== end
+=== pivot_predicates_multistage#0 region_input_out_of_range
+applicable: false
+=== end
+=== pivot_predicates_multistage#0 region_output_out_of_range
+applicable: false
+=== end
+=== pivot_predicates_multistage#0 region_sink_out_of_range
+applicable: false
+=== end
+=== pivot_predicates_multistage#0 library_scan_claim
+applicable: false
+=== end
+=== pivot_predicates_multistage#0 extra_value_type
+applicable: true
+ok: false
+error: normalized value layout does not match op results
+operations: 0
+=== end
+=== pivot_predicates_multistage#0 drop_last_value_type
+applicable: false
+=== end
+=== pivot_predicates_multistage#0 drop_last_value_type_and_refs
+applicable: false
+=== end
+=== pivot_predicates_multistage#0 rank5_value_type
+applicable: false
+=== end
+=== pivot_predicates_multistage#0 zero_static_dim
+applicable: false
+=== end
+=== pivot_predicates_multistage#0 overflow_static_dims
+applicable: false
+=== end
+=== pivot_predicates_multistage#0 reverse_ops
+applicable: false
+=== end
+=== pivot_predicates_multistage#0 bad_channel_slot
+applicable: false
+=== end
+=== pivot_predicates_multistage#0 pivot_payload_out_of_range
+applicable: false
+=== end
+=== pivot_predicates_multistage#0 rename_names
+applicable: false
+=== end
+=== pivot_predicates_multistage#0 clear_names
+applicable: false
+=== end
+=== pivot_predicates_multistage#1 none
+applicable: true
+ok: true
+error: 
+operations: 14
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0x31 results=1 chan=-1 args=1
+op: node=2 result_base=2 tag=0x38 results=1 chan=-1 args=1
+op: node=3 result_base=3 tag=0x11 results=1 chan=-1 args=2
+op: node=4 result_base=4 tag=0x01 results=1 chan=-1 args=1
+op: node=5 result_base=5 tag=0x30 results=1 chan=-1 args=1
+op: node=6 result_base=6 tag=0x38 results=1 chan=-1 args=1
+op: node=7 result_base=7 tag=0x13 results=1 chan=-1 args=2
+op: node=8 result_base=8 tag=0x91 results=1 chan=0 args=0
+op: node=9 result_base=9 tag=0x91 results=1 chan=1 args=0
+op: node=10 result_base=10 tag=0x58 results=1 chan=-1 args=1
+op: node=11 result_base=11 tag=0x58 results=1 chan=-1 args=1
+op: node=12 result_base=12 tag=0x92 results=0 chan=2 args=1
+op: node=13 result_base=12 tag=0x92 results=0 chan=3 args=1
+=== end
+=== pivot_predicates_multistage#1 zero_signature_hash
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== pivot_predicates_multistage#1 flip_signature_byte
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== pivot_predicates_multistage#1 singleton_kind
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== pivot_predicates_multistage#1 whole_stage_fallback
+applicable: true
+ok: false
+error: singleton plan requests whole-stage fallback without an identifiable unsupported op
+operations: 14
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0x31 results=1 chan=-1 args=1
+op: node=2 result_base=2 tag=0x38 results=1 chan=-1 args=1
+op: node=3 result_base=3 tag=0x11 results=1 chan=-1 args=2
+op: node=4 result_base=4 tag=0x01 results=1 chan=-1 args=1
+op: node=5 result_base=5 tag=0x30 results=1 chan=-1 args=1
+op: node=6 result_base=6 tag=0x38 results=1 chan=-1 args=1
+op: node=7 result_base=7 tag=0x13 results=1 chan=-1 args=2
+op: node=8 result_base=8 tag=0x91 results=1 chan=0 args=0
+op: node=9 result_base=9 tag=0x91 results=1 chan=1 args=0
+op: node=10 result_base=10 tag=0x58 results=1 chan=-1 args=1
+op: node=11 result_base=11 tag=0x58 results=1 chan=-1 args=1
+op: node=12 result_base=12 tag=0x92 results=0 chan=2 args=1
+op: node=13 result_base=12 tag=0x92 results=0 chan=3 args=1
+=== end
+=== pivot_predicates_multistage#1 drop_last_singleton_region
+applicable: true
+ok: false
+error: singleton partition must contain one region per normalized op
+operations: 0
+=== end
+=== pivot_predicates_multistage#1 singleton_region_node
+applicable: true
+ok: false
+error: region node out of range
+operations: 0
+=== end
+=== pivot_predicates_multistage#1 swap_singleton_region_nodes
+applicable: true
+ok: false
+error: singleton region/node ordering mismatch
+operations: 0
+=== end
+=== pivot_predicates_multistage#1 unordered_region_nodes
+applicable: true
+ok: false
+error: region node indices are not strictly ordered
+operations: 0
+=== end
+=== pivot_predicates_multistage#1 region_input_out_of_range
+applicable: true
+ok: false
+error: region input out of range
+operations: 0
+=== end
+=== pivot_predicates_multistage#1 region_output_out_of_range
+applicable: true
+ok: false
+error: region output out of range
+operations: 0
+=== end
+=== pivot_predicates_multistage#1 region_sink_out_of_range
+applicable: true
+ok: false
+error: region sink out of range
+operations: 0
+=== end
+=== pivot_predicates_multistage#1 library_scan_claim
+applicable: true
+ok: false
+error: library region ABI is invalid
+operations: 0
+=== end
+=== pivot_predicates_multistage#1 extra_value_type
+applicable: true
+ok: false
+error: normalized value layout does not match op results
+operations: 14
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0x31 results=1 chan=-1 args=1
+op: node=2 result_base=2 tag=0x38 results=1 chan=-1 args=1
+op: node=3 result_base=3 tag=0x11 results=1 chan=-1 args=2
+op: node=4 result_base=4 tag=0x01 results=1 chan=-1 args=1
+op: node=5 result_base=5 tag=0x30 results=1 chan=-1 args=1
+op: node=6 result_base=6 tag=0x38 results=1 chan=-1 args=1
+op: node=7 result_base=7 tag=0x13 results=1 chan=-1 args=2
+op: node=8 result_base=8 tag=0x91 results=1 chan=0 args=0
+op: node=9 result_base=9 tag=0x91 results=1 chan=1 args=0
+op: node=10 result_base=10 tag=0x58 results=1 chan=-1 args=1
+op: node=11 result_base=11 tag=0x58 results=1 chan=-1 args=1
+op: node=12 result_base=12 tag=0x92 results=0 chan=2 args=1
+op: node=13 result_base=12 tag=0x92 results=0 chan=3 args=1
+=== end
+=== pivot_predicates_multistage#1 drop_last_value_type
+applicable: true
+ok: false
+error: region output out of range
+operations: 0
+=== end
+=== pivot_predicates_multistage#1 drop_last_value_type_and_refs
+applicable: true
+ok: false
+error: normalized op result range is invalid
+operations: 11
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0x31 results=1 chan=-1 args=1
+op: node=2 result_base=2 tag=0x38 results=1 chan=-1 args=1
+op: node=3 result_base=3 tag=0x11 results=1 chan=-1 args=2
+op: node=4 result_base=4 tag=0x01 results=1 chan=-1 args=1
+op: node=5 result_base=5 tag=0x30 results=1 chan=-1 args=1
+op: node=6 result_base=6 tag=0x38 results=1 chan=-1 args=1
+op: node=7 result_base=7 tag=0x13 results=1 chan=-1 args=2
+op: node=8 result_base=8 tag=0x91 results=1 chan=0 args=0
+op: node=9 result_base=9 tag=0x91 results=1 chan=1 args=0
+op: node=10 result_base=10 tag=0x58 results=1 chan=-1 args=1
+=== end
+=== pivot_predicates_multistage#1 rank5_value_type
+applicable: true
+ok: false
+error: invalid normalized value type
+operations: 0
+=== end
+=== pivot_predicates_multistage#1 zero_static_dim
+applicable: true
+ok: false
+error: normalized value shape product exceeds u32
+operations: 0
+=== end
+=== pivot_predicates_multistage#1 overflow_static_dims
+applicable: true
+ok: false
+error: normalized value shape product exceeds u32
+operations: 0
+=== end
+=== pivot_predicates_multistage#1 reverse_ops
+applicable: true
+ok: false
+error: normalized SSA operand is not a prior value
+operations: 0
+=== end
+=== pivot_predicates_multistage#1 bad_channel_slot
+applicable: true
+ok: false
+error: normalized channel slot is invalid
+operations: 8
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0x31 results=1 chan=-1 args=1
+op: node=2 result_base=2 tag=0x38 results=1 chan=-1 args=1
+op: node=3 result_base=3 tag=0x11 results=1 chan=-1 args=2
+op: node=4 result_base=4 tag=0x01 results=1 chan=-1 args=1
+op: node=5 result_base=5 tag=0x30 results=1 chan=-1 args=1
+op: node=6 result_base=6 tag=0x38 results=1 chan=-1 args=1
+op: node=7 result_base=7 tag=0x13 results=1 chan=-1 args=2
+=== end
+=== pivot_predicates_multistage#1 pivot_payload_out_of_range
+applicable: true
+ok: false
+error: pivot predicate payload is out of range
+operations: 10
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0x31 results=1 chan=-1 args=1
+op: node=2 result_base=2 tag=0x38 results=1 chan=-1 args=1
+op: node=3 result_base=3 tag=0x11 results=1 chan=-1 args=2
+op: node=4 result_base=4 tag=0x01 results=1 chan=-1 args=1
+op: node=5 result_base=5 tag=0x30 results=1 chan=-1 args=1
+op: node=6 result_base=6 tag=0x38 results=1 chan=-1 args=1
+op: node=7 result_base=7 tag=0x13 results=1 chan=-1 args=2
+op: node=8 result_base=8 tag=0x91 results=1 chan=0 args=0
+op: node=9 result_base=9 tag=0x91 results=1 chan=1 args=0
+=== end
+=== pivot_predicates_multistage#1 rename_names
+applicable: false
+=== end
+=== pivot_predicates_multistage#1 clear_names
+applicable: false
+=== end
+=== section3_masked_gumbel#0 none
+applicable: true
+ok: true
+error: 
+operations: 19
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0x39 results=1 chan=-1 args=1
+op: node=2 result_base=2 tag=0x90 results=1 chan=0 args=0
+op: node=3 result_base=3 tag=0x90 results=1 chan=1 args=0
+op: node=4 result_base=4 tag=0x71 results=1 chan=-1 args=1
+op: node=5 result_base=5 tag=0x81 results=1 chan=-1 args=0
+op: node=6 result_base=6 tag=0x20 results=1 chan=-1 args=3
+op: node=7 result_base=7 tag=0x10 results=1 chan=-1 args=2
+op: node=8 result_base=8 tag=0x33 results=1 chan=-1 args=1
+op: node=9 result_base=9 tag=0x64 results=1 chan=-1 args=0
+op: node=10 result_base=10 tag=0x10 results=1 chan=-1 args=2
+op: node=11 result_base=11 tag=0x92 results=0 chan=0 args=1
+op: node=12 result_base=11 tag=0x39 results=1 chan=-1 args=1
+op: node=13 result_base=12 tag=0x92 results=0 chan=2 args=1
+op: node=14 result_base=12 tag=0x90 results=1 chan=3 args=0
+op: node=15 result_base=13 tag=0x81 results=1 chan=-1 args=0
+op: node=16 result_base=14 tag=0x10 results=1 chan=-1 args=2
+op: node=17 result_base=15 tag=0x92 results=0 chan=3 args=1
+op: node=18 result_base=15 tag=0x92 results=0 chan=4 args=1
+=== end
+=== section3_masked_gumbel#0 zero_signature_hash
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== section3_masked_gumbel#0 flip_signature_byte
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== section3_masked_gumbel#0 singleton_kind
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== section3_masked_gumbel#0 whole_stage_fallback
+applicable: true
+ok: false
+error: singleton plan requests whole-stage fallback without an identifiable unsupported op
+operations: 19
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0x39 results=1 chan=-1 args=1
+op: node=2 result_base=2 tag=0x90 results=1 chan=0 args=0
+op: node=3 result_base=3 tag=0x90 results=1 chan=1 args=0
+op: node=4 result_base=4 tag=0x71 results=1 chan=-1 args=1
+op: node=5 result_base=5 tag=0x81 results=1 chan=-1 args=0
+op: node=6 result_base=6 tag=0x20 results=1 chan=-1 args=3
+op: node=7 result_base=7 tag=0x10 results=1 chan=-1 args=2
+op: node=8 result_base=8 tag=0x33 results=1 chan=-1 args=1
+op: node=9 result_base=9 tag=0x64 results=1 chan=-1 args=0
+op: node=10 result_base=10 tag=0x10 results=1 chan=-1 args=2
+op: node=11 result_base=11 tag=0x92 results=0 chan=0 args=1
+op: node=12 result_base=11 tag=0x39 results=1 chan=-1 args=1
+op: node=13 result_base=12 tag=0x92 results=0 chan=2 args=1
+op: node=14 result_base=12 tag=0x90 results=1 chan=3 args=0
+op: node=15 result_base=13 tag=0x81 results=1 chan=-1 args=0
+op: node=16 result_base=14 tag=0x10 results=1 chan=-1 args=2
+op: node=17 result_base=15 tag=0x92 results=0 chan=3 args=1
+op: node=18 result_base=15 tag=0x92 results=0 chan=4 args=1
+=== end
+=== section3_masked_gumbel#0 drop_last_singleton_region
+applicable: true
+ok: false
+error: singleton partition must contain one region per normalized op
+operations: 0
+=== end
+=== section3_masked_gumbel#0 singleton_region_node
+applicable: true
+ok: false
+error: region node out of range
+operations: 0
+=== end
+=== section3_masked_gumbel#0 swap_singleton_region_nodes
+applicable: true
+ok: false
+error: singleton region/node ordering mismatch
+operations: 0
+=== end
+=== section3_masked_gumbel#0 unordered_region_nodes
+applicable: true
+ok: false
+error: region node indices are not strictly ordered
+operations: 0
+=== end
+=== section3_masked_gumbel#0 region_input_out_of_range
+applicable: true
+ok: false
+error: region input out of range
+operations: 0
+=== end
+=== section3_masked_gumbel#0 region_output_out_of_range
+applicable: true
+ok: false
+error: region output out of range
+operations: 0
+=== end
+=== section3_masked_gumbel#0 region_sink_out_of_range
+applicable: true
+ok: false
+error: region sink out of range
+operations: 0
+=== end
+=== section3_masked_gumbel#0 library_scan_claim
+applicable: true
+ok: false
+error: library region ABI is invalid
+operations: 0
+=== end
+=== section3_masked_gumbel#0 extra_value_type
+applicable: true
+ok: false
+error: normalized value layout does not match op results
+operations: 19
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0x39 results=1 chan=-1 args=1
+op: node=2 result_base=2 tag=0x90 results=1 chan=0 args=0
+op: node=3 result_base=3 tag=0x90 results=1 chan=1 args=0
+op: node=4 result_base=4 tag=0x71 results=1 chan=-1 args=1
+op: node=5 result_base=5 tag=0x81 results=1 chan=-1 args=0
+op: node=6 result_base=6 tag=0x20 results=1 chan=-1 args=3
+op: node=7 result_base=7 tag=0x10 results=1 chan=-1 args=2
+op: node=8 result_base=8 tag=0x33 results=1 chan=-1 args=1
+op: node=9 result_base=9 tag=0x64 results=1 chan=-1 args=0
+op: node=10 result_base=10 tag=0x10 results=1 chan=-1 args=2
+op: node=11 result_base=11 tag=0x92 results=0 chan=0 args=1
+op: node=12 result_base=11 tag=0x39 results=1 chan=-1 args=1
+op: node=13 result_base=12 tag=0x92 results=0 chan=2 args=1
+op: node=14 result_base=12 tag=0x90 results=1 chan=3 args=0
+op: node=15 result_base=13 tag=0x81 results=1 chan=-1 args=0
+op: node=16 result_base=14 tag=0x10 results=1 chan=-1 args=2
+op: node=17 result_base=15 tag=0x92 results=0 chan=3 args=1
+op: node=18 result_base=15 tag=0x92 results=0 chan=4 args=1
+=== end
+=== section3_masked_gumbel#0 drop_last_value_type
+applicable: true
+ok: false
+error: region output out of range
+operations: 0
+=== end
+=== section3_masked_gumbel#0 drop_last_value_type_and_refs
+applicable: true
+ok: false
+error: normalized op result range is invalid
+operations: 16
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0x39 results=1 chan=-1 args=1
+op: node=2 result_base=2 tag=0x90 results=1 chan=0 args=0
+op: node=3 result_base=3 tag=0x90 results=1 chan=1 args=0
+op: node=4 result_base=4 tag=0x71 results=1 chan=-1 args=1
+op: node=5 result_base=5 tag=0x81 results=1 chan=-1 args=0
+op: node=6 result_base=6 tag=0x20 results=1 chan=-1 args=3
+op: node=7 result_base=7 tag=0x10 results=1 chan=-1 args=2
+op: node=8 result_base=8 tag=0x33 results=1 chan=-1 args=1
+op: node=9 result_base=9 tag=0x64 results=1 chan=-1 args=0
+op: node=10 result_base=10 tag=0x10 results=1 chan=-1 args=2
+op: node=11 result_base=11 tag=0x92 results=0 chan=0 args=1
+op: node=12 result_base=11 tag=0x39 results=1 chan=-1 args=1
+op: node=13 result_base=12 tag=0x92 results=0 chan=2 args=1
+op: node=14 result_base=12 tag=0x90 results=1 chan=3 args=0
+op: node=15 result_base=13 tag=0x81 results=1 chan=-1 args=0
+=== end
+=== section3_masked_gumbel#0 rank5_value_type
+applicable: true
+ok: false
+error: invalid normalized value type
+operations: 0
+=== end
+=== section3_masked_gumbel#0 zero_static_dim
+applicable: true
+ok: false
+error: normalized value shape product exceeds u32
+operations: 0
+=== end
+=== section3_masked_gumbel#0 overflow_static_dims
+applicable: true
+ok: false
+error: normalized value shape product exceeds u32
+operations: 0
+=== end
+=== section3_masked_gumbel#0 reverse_ops
+applicable: true
+ok: false
+error: normalized SSA operand is not a prior value
+operations: 0
+=== end
+=== section3_masked_gumbel#0 bad_channel_slot
+applicable: true
+ok: false
+error: normalized channel slot is invalid
+operations: 2
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0x39 results=1 chan=-1 args=1
+=== end
+=== section3_masked_gumbel#0 pivot_payload_out_of_range
+applicable: false
+=== end
+=== section3_masked_gumbel#0 rename_names
+applicable: false
+=== end
+=== section3_masked_gumbel#0 clear_names
+applicable: false
+=== end
+=== structured_masks#0 none
+applicable: true
+ok: true
+error: 
+operations: 29
+op: node=0 result_base=0 tag=0x90 results=1 chan=0 args=0
+op: node=1 result_base=1 tag=0x90 results=1 chan=1 args=0
+op: node=2 result_base=2 tag=0x90 results=1 chan=2 args=0
+op: node=3 result_base=3 tag=0x66 results=1 chan=-1 args=1
+op: node=4 result_base=4 tag=0x92 results=0 chan=3 args=1
+op: node=5 result_base=4 tag=0x67 results=1 chan=-1 args=1
+op: node=6 result_base=5 tag=0x92 results=0 chan=4 args=1
+op: node=7 result_base=5 tag=0x68 results=1 chan=-1 args=1
+op: node=8 result_base=6 tag=0x92 results=0 chan=5 args=1
+op: node=9 result_base=6 tag=0x39 results=1 chan=-1 args=1
+op: node=10 result_base=7 tag=0x64 results=1 chan=-1 args=0
+op: node=11 result_base=8 tag=0x81 results=1 chan=-1 args=0
+op: node=12 result_base=9 tag=0x13 results=1 chan=-1 args=2
+op: node=13 result_base=10 tag=0x81 results=1 chan=-1 args=0
+op: node=14 result_base=11 tag=0x1f results=1 chan=-1 args=2
+op: node=15 result_base=12 tag=0x12 results=1 chan=-1 args=2
+op: node=16 result_base=13 tag=0x10 results=1 chan=-1 args=2
+op: node=17 result_base=14 tag=0x60 results=1 chan=-1 args=2
+op: node=18 result_base=15 tag=0x13 results=1 chan=-1 args=2
+op: node=19 result_base=16 tag=0x81 results=1 chan=-1 args=0
+op: node=20 result_base=17 tag=0x1f results=1 chan=-1 args=2
+op: node=21 result_base=18 tag=0x60 results=1 chan=-1 args=2
+op: node=22 result_base=19 tag=0x39 results=1 chan=-1 args=1
+op: node=23 result_base=20 tag=0x39 results=1 chan=-1 args=1
+op: node=24 result_base=21 tag=0x18 results=1 chan=-1 args=2
+op: node=25 result_base=22 tag=0x07 results=1 chan=-1 args=1
+op: node=26 result_base=23 tag=0x31 results=1 chan=-1 args=1
+op: node=27 result_base=24 tag=0x07 results=1 chan=-1 args=1
+op: node=28 result_base=25 tag=0x92 results=0 chan=6 args=1
+=== end
+=== structured_masks#0 zero_signature_hash
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== structured_masks#0 flip_signature_byte
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== structured_masks#0 singleton_kind
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== structured_masks#0 whole_stage_fallback
+applicable: true
+ok: false
+error: singleton plan requests whole-stage fallback without an identifiable unsupported op
+operations: 29
+op: node=0 result_base=0 tag=0x90 results=1 chan=0 args=0
+op: node=1 result_base=1 tag=0x90 results=1 chan=1 args=0
+op: node=2 result_base=2 tag=0x90 results=1 chan=2 args=0
+op: node=3 result_base=3 tag=0x66 results=1 chan=-1 args=1
+op: node=4 result_base=4 tag=0x92 results=0 chan=3 args=1
+op: node=5 result_base=4 tag=0x67 results=1 chan=-1 args=1
+op: node=6 result_base=5 tag=0x92 results=0 chan=4 args=1
+op: node=7 result_base=5 tag=0x68 results=1 chan=-1 args=1
+op: node=8 result_base=6 tag=0x92 results=0 chan=5 args=1
+op: node=9 result_base=6 tag=0x39 results=1 chan=-1 args=1
+op: node=10 result_base=7 tag=0x64 results=1 chan=-1 args=0
+op: node=11 result_base=8 tag=0x81 results=1 chan=-1 args=0
+op: node=12 result_base=9 tag=0x13 results=1 chan=-1 args=2
+op: node=13 result_base=10 tag=0x81 results=1 chan=-1 args=0
+op: node=14 result_base=11 tag=0x1f results=1 chan=-1 args=2
+op: node=15 result_base=12 tag=0x12 results=1 chan=-1 args=2
+op: node=16 result_base=13 tag=0x10 results=1 chan=-1 args=2
+op: node=17 result_base=14 tag=0x60 results=1 chan=-1 args=2
+op: node=18 result_base=15 tag=0x13 results=1 chan=-1 args=2
+op: node=19 result_base=16 tag=0x81 results=1 chan=-1 args=0
+op: node=20 result_base=17 tag=0x1f results=1 chan=-1 args=2
+op: node=21 result_base=18 tag=0x60 results=1 chan=-1 args=2
+op: node=22 result_base=19 tag=0x39 results=1 chan=-1 args=1
+op: node=23 result_base=20 tag=0x39 results=1 chan=-1 args=1
+op: node=24 result_base=21 tag=0x18 results=1 chan=-1 args=2
+op: node=25 result_base=22 tag=0x07 results=1 chan=-1 args=1
+op: node=26 result_base=23 tag=0x31 results=1 chan=-1 args=1
+op: node=27 result_base=24 tag=0x07 results=1 chan=-1 args=1
+op: node=28 result_base=25 tag=0x92 results=0 chan=6 args=1
+=== end
+=== structured_masks#0 drop_last_singleton_region
+applicable: true
+ok: false
+error: singleton partition must contain one region per normalized op
+operations: 0
+=== end
+=== structured_masks#0 singleton_region_node
+applicable: true
+ok: false
+error: region node out of range
+operations: 0
+=== end
+=== structured_masks#0 swap_singleton_region_nodes
+applicable: true
+ok: false
+error: singleton region/node ordering mismatch
+operations: 0
+=== end
+=== structured_masks#0 unordered_region_nodes
+applicable: true
+ok: false
+error: region node indices are not strictly ordered
+operations: 0
+=== end
+=== structured_masks#0 region_input_out_of_range
+applicable: true
+ok: false
+error: region input out of range
+operations: 0
+=== end
+=== structured_masks#0 region_output_out_of_range
+applicable: true
+ok: false
+error: region output out of range
+operations: 0
+=== end
+=== structured_masks#0 region_sink_out_of_range
+applicable: true
+ok: false
+error: region sink out of range
+operations: 0
+=== end
+=== structured_masks#0 library_scan_claim
+applicable: true
+ok: false
+error: library region ABI is invalid
+operations: 0
+=== end
+=== structured_masks#0 extra_value_type
+applicable: true
+ok: false
+error: normalized value layout does not match op results
+operations: 29
+op: node=0 result_base=0 tag=0x90 results=1 chan=0 args=0
+op: node=1 result_base=1 tag=0x90 results=1 chan=1 args=0
+op: node=2 result_base=2 tag=0x90 results=1 chan=2 args=0
+op: node=3 result_base=3 tag=0x66 results=1 chan=-1 args=1
+op: node=4 result_base=4 tag=0x92 results=0 chan=3 args=1
+op: node=5 result_base=4 tag=0x67 results=1 chan=-1 args=1
+op: node=6 result_base=5 tag=0x92 results=0 chan=4 args=1
+op: node=7 result_base=5 tag=0x68 results=1 chan=-1 args=1
+op: node=8 result_base=6 tag=0x92 results=0 chan=5 args=1
+op: node=9 result_base=6 tag=0x39 results=1 chan=-1 args=1
+op: node=10 result_base=7 tag=0x64 results=1 chan=-1 args=0
+op: node=11 result_base=8 tag=0x81 results=1 chan=-1 args=0
+op: node=12 result_base=9 tag=0x13 results=1 chan=-1 args=2
+op: node=13 result_base=10 tag=0x81 results=1 chan=-1 args=0
+op: node=14 result_base=11 tag=0x1f results=1 chan=-1 args=2
+op: node=15 result_base=12 tag=0x12 results=1 chan=-1 args=2
+op: node=16 result_base=13 tag=0x10 results=1 chan=-1 args=2
+op: node=17 result_base=14 tag=0x60 results=1 chan=-1 args=2
+op: node=18 result_base=15 tag=0x13 results=1 chan=-1 args=2
+op: node=19 result_base=16 tag=0x81 results=1 chan=-1 args=0
+op: node=20 result_base=17 tag=0x1f results=1 chan=-1 args=2
+op: node=21 result_base=18 tag=0x60 results=1 chan=-1 args=2
+op: node=22 result_base=19 tag=0x39 results=1 chan=-1 args=1
+op: node=23 result_base=20 tag=0x39 results=1 chan=-1 args=1
+op: node=24 result_base=21 tag=0x18 results=1 chan=-1 args=2
+op: node=25 result_base=22 tag=0x07 results=1 chan=-1 args=1
+op: node=26 result_base=23 tag=0x31 results=1 chan=-1 args=1
+op: node=27 result_base=24 tag=0x07 results=1 chan=-1 args=1
+op: node=28 result_base=25 tag=0x92 results=0 chan=6 args=1
+=== end
+=== structured_masks#0 drop_last_value_type
+applicable: true
+ok: false
+error: region output out of range
+operations: 0
+=== end
+=== structured_masks#0 drop_last_value_type_and_refs
+applicable: true
+ok: false
+error: normalized op result range is invalid
+operations: 27
+op: node=0 result_base=0 tag=0x90 results=1 chan=0 args=0
+op: node=1 result_base=1 tag=0x90 results=1 chan=1 args=0
+op: node=2 result_base=2 tag=0x90 results=1 chan=2 args=0
+op: node=3 result_base=3 tag=0x66 results=1 chan=-1 args=1
+op: node=4 result_base=4 tag=0x92 results=0 chan=3 args=1
+op: node=5 result_base=4 tag=0x67 results=1 chan=-1 args=1
+op: node=6 result_base=5 tag=0x92 results=0 chan=4 args=1
+op: node=7 result_base=5 tag=0x68 results=1 chan=-1 args=1
+op: node=8 result_base=6 tag=0x92 results=0 chan=5 args=1
+op: node=9 result_base=6 tag=0x39 results=1 chan=-1 args=1
+op: node=10 result_base=7 tag=0x64 results=1 chan=-1 args=0
+op: node=11 result_base=8 tag=0x81 results=1 chan=-1 args=0
+op: node=12 result_base=9 tag=0x13 results=1 chan=-1 args=2
+op: node=13 result_base=10 tag=0x81 results=1 chan=-1 args=0
+op: node=14 result_base=11 tag=0x1f results=1 chan=-1 args=2
+op: node=15 result_base=12 tag=0x12 results=1 chan=-1 args=2
+op: node=16 result_base=13 tag=0x10 results=1 chan=-1 args=2
+op: node=17 result_base=14 tag=0x60 results=1 chan=-1 args=2
+op: node=18 result_base=15 tag=0x13 results=1 chan=-1 args=2
+op: node=19 result_base=16 tag=0x81 results=1 chan=-1 args=0
+op: node=20 result_base=17 tag=0x1f results=1 chan=-1 args=2
+op: node=21 result_base=18 tag=0x60 results=1 chan=-1 args=2
+op: node=22 result_base=19 tag=0x39 results=1 chan=-1 args=1
+op: node=23 result_base=20 tag=0x39 results=1 chan=-1 args=1
+op: node=24 result_base=21 tag=0x18 results=1 chan=-1 args=2
+op: node=25 result_base=22 tag=0x07 results=1 chan=-1 args=1
+op: node=26 result_base=23 tag=0x31 results=1 chan=-1 args=1
+=== end
+=== structured_masks#0 rank5_value_type
+applicable: true
+ok: false
+error: invalid normalized value type
+operations: 0
+=== end
+=== structured_masks#0 zero_static_dim
+applicable: true
+ok: false
+error: normalized value shape product exceeds u32
+operations: 0
+=== end
+=== structured_masks#0 overflow_static_dims
+applicable: true
+ok: false
+error: normalized value shape product exceeds u32
+operations: 0
+=== end
+=== structured_masks#0 reverse_ops
+applicable: true
+ok: false
+error: normalized SSA operand is not a prior value
+operations: 0
+=== end
+=== structured_masks#0 bad_channel_slot
+applicable: true
+ok: false
+error: normalized channel slot is invalid
+operations: 0
+=== end
+=== structured_masks#0 pivot_payload_out_of_range
+applicable: false
+=== end
+=== structured_masks#0 rename_names
+applicable: false
+=== end
+=== structured_masks#0 clear_names
+applicable: false
+=== end
+=== synthetic_sort_desc#0 none
+applicable: true
+ok: true
+error: 
+operations: 4
+op: node=0 result_base=0 tag=0x91 results=1 chan=0 args=0
+op: node=1 result_base=1 tag=0x50 results=2 chan=-1 args=1
+op: node=2 result_base=3 tag=0x92 results=0 chan=1 args=1
+op: node=3 result_base=3 tag=0x92 results=0 chan=2 args=1
+=== end
+=== synthetic_sort_desc#0 zero_signature_hash
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== synthetic_sort_desc#0 flip_signature_byte
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== synthetic_sort_desc#0 singleton_kind
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== synthetic_sort_desc#0 whole_stage_fallback
+applicable: true
+ok: false
+error: singleton plan requests whole-stage fallback without an identifiable unsupported op
+operations: 4
+op: node=0 result_base=0 tag=0x91 results=1 chan=0 args=0
+op: node=1 result_base=1 tag=0x50 results=2 chan=-1 args=1
+op: node=2 result_base=3 tag=0x92 results=0 chan=1 args=1
+op: node=3 result_base=3 tag=0x92 results=0 chan=2 args=1
+=== end
+=== synthetic_sort_desc#0 drop_last_singleton_region
+applicable: true
+ok: false
+error: singleton partition must contain one region per normalized op
+operations: 0
+=== end
+=== synthetic_sort_desc#0 singleton_region_node
+applicable: true
+ok: false
+error: region node out of range
+operations: 0
+=== end
+=== synthetic_sort_desc#0 swap_singleton_region_nodes
+applicable: true
+ok: false
+error: library region ABI is invalid
+operations: 0
+=== end
+=== synthetic_sort_desc#0 unordered_region_nodes
+applicable: false
+=== end
+=== synthetic_sort_desc#0 region_input_out_of_range
+applicable: true
+ok: false
+error: region input out of range
+operations: 0
+=== end
+=== synthetic_sort_desc#0 region_output_out_of_range
+applicable: true
+ok: false
+error: region output out of range
+operations: 0
+=== end
+=== synthetic_sort_desc#0 region_sink_out_of_range
+applicable: true
+ok: false
+error: region sink out of range
+operations: 0
+=== end
+=== synthetic_sort_desc#0 library_scan_claim
+applicable: true
+ok: false
+error: library region ABI is invalid
+operations: 0
+=== end
+=== synthetic_sort_desc#0 extra_value_type
+applicable: true
+ok: false
+error: normalized value layout does not match op results
+operations: 4
+op: node=0 result_base=0 tag=0x91 results=1 chan=0 args=0
+op: node=1 result_base=1 tag=0x50 results=2 chan=-1 args=1
+op: node=2 result_base=3 tag=0x92 results=0 chan=1 args=1
+op: node=3 result_base=3 tag=0x92 results=0 chan=2 args=1
+=== end
+=== synthetic_sort_desc#0 drop_last_value_type
+applicable: true
+ok: false
+error: region output out of range
+operations: 0
+=== end
+=== synthetic_sort_desc#0 drop_last_value_type_and_refs
+applicable: true
+ok: false
+error: normalized op result range is invalid
+operations: 1
+op: node=0 result_base=0 tag=0x91 results=1 chan=0 args=0
+=== end
+=== synthetic_sort_desc#0 rank5_value_type
+applicable: true
+ok: false
+error: invalid normalized value type
+operations: 0
+=== end
+=== synthetic_sort_desc#0 zero_static_dim
+applicable: true
+ok: false
+error: normalized value shape product exceeds u32
+operations: 0
+=== end
+=== synthetic_sort_desc#0 overflow_static_dims
+applicable: true
+ok: false
+error: normalized value shape product exceeds u32
+operations: 0
+=== end
+=== synthetic_sort_desc#0 reverse_ops
+applicable: true
+ok: false
+error: library region ABI is invalid
+operations: 0
+=== end
+=== synthetic_sort_desc#0 bad_channel_slot
+applicable: true
+ok: false
+error: normalized channel slot is invalid
+operations: 0
+=== end
+=== synthetic_sort_desc#0 pivot_payload_out_of_range
+applicable: false
+=== end
+=== synthetic_sort_desc#0 rename_names
+applicable: false
+=== end
+=== synthetic_sort_desc#0 clear_names
+applicable: false
+=== end
+=== synthetic_matmul#0 none
+applicable: true
+ok: true
+error: 
+operations: 4
+op: node=0 result_base=0 tag=0x91 results=1 chan=0 args=0
+op: node=1 result_base=1 tag=0x91 results=1 chan=1 args=0
+op: node=2 result_base=2 tag=0x55 results=1 chan=-1 args=2
+op: node=3 result_base=3 tag=0x92 results=0 chan=2 args=1
+=== end
+=== synthetic_matmul#0 zero_signature_hash
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== synthetic_matmul#0 flip_signature_byte
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== synthetic_matmul#0 singleton_kind
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== synthetic_matmul#0 whole_stage_fallback
+applicable: true
+ok: false
+error: singleton plan requests whole-stage fallback without an identifiable unsupported op
+operations: 4
+op: node=0 result_base=0 tag=0x91 results=1 chan=0 args=0
+op: node=1 result_base=1 tag=0x91 results=1 chan=1 args=0
+op: node=2 result_base=2 tag=0x55 results=1 chan=-1 args=2
+op: node=3 result_base=3 tag=0x92 results=0 chan=2 args=1
+=== end
+=== synthetic_matmul#0 drop_last_singleton_region
+applicable: true
+ok: false
+error: singleton partition must contain one region per normalized op
+operations: 0
+=== end
+=== synthetic_matmul#0 singleton_region_node
+applicable: true
+ok: false
+error: region node out of range
+operations: 0
+=== end
+=== synthetic_matmul#0 swap_singleton_region_nodes
+applicable: true
+ok: false
+error: singleton region/node ordering mismatch
+operations: 0
+=== end
+=== synthetic_matmul#0 unordered_region_nodes
+applicable: true
+ok: false
+error: region node indices are not strictly ordered
+operations: 0
+=== end
+=== synthetic_matmul#0 region_input_out_of_range
+applicable: true
+ok: false
+error: region input out of range
+operations: 0
+=== end
+=== synthetic_matmul#0 region_output_out_of_range
+applicable: true
+ok: false
+error: region output out of range
+operations: 0
+=== end
+=== synthetic_matmul#0 region_sink_out_of_range
+applicable: true
+ok: false
+error: region sink out of range
+operations: 0
+=== end
+=== synthetic_matmul#0 library_scan_claim
+applicable: true
+ok: false
+error: library region ABI is invalid
+operations: 0
+=== end
+=== synthetic_matmul#0 extra_value_type
+applicable: true
+ok: false
+error: normalized value layout does not match op results
+operations: 4
+op: node=0 result_base=0 tag=0x91 results=1 chan=0 args=0
+op: node=1 result_base=1 tag=0x91 results=1 chan=1 args=0
+op: node=2 result_base=2 tag=0x55 results=1 chan=-1 args=2
+op: node=3 result_base=3 tag=0x92 results=0 chan=2 args=1
+=== end
+=== synthetic_matmul#0 drop_last_value_type
+applicable: true
+ok: false
+error: region output out of range
+operations: 0
+=== end
+=== synthetic_matmul#0 drop_last_value_type_and_refs
+applicable: true
+ok: false
+error: normalized op result range is invalid
+operations: 2
+op: node=0 result_base=0 tag=0x91 results=1 chan=0 args=0
+op: node=1 result_base=1 tag=0x91 results=1 chan=1 args=0
+=== end
+=== synthetic_matmul#0 rank5_value_type
+applicable: true
+ok: false
+error: invalid normalized value type
+operations: 0
+=== end
+=== synthetic_matmul#0 zero_static_dim
+applicable: true
+ok: false
+error: normalized value shape product exceeds u32
+operations: 0
+=== end
+=== synthetic_matmul#0 overflow_static_dims
+applicable: true
+ok: false
+error: normalized value shape product exceeds u32
+operations: 0
+=== end
+=== synthetic_matmul#0 reverse_ops
+applicable: true
+ok: false
+error: library region ABI is invalid
+operations: 0
+=== end
+=== synthetic_matmul#0 bad_channel_slot
+applicable: true
+ok: false
+error: normalized channel slot is invalid
+operations: 0
+=== end
+=== synthetic_matmul#0 pivot_payload_out_of_range
+applicable: false
+=== end
+=== synthetic_matmul#0 rename_names
+applicable: false
+=== end
+=== synthetic_matmul#0 clear_names
+applicable: false
+=== end
+=== synthetic_mtp_drafts#0 none
+applicable: true
+ok: true
+error: 
+operations: 6
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0xa0 results=1 chan=-1 args=0
+op: node=2 result_base=2 tag=0x33 results=1 chan=-1 args=1
+op: node=3 result_base=3 tag=0x07 results=1 chan=-1 args=1
+op: node=4 result_base=4 tag=0x10 results=1 chan=-1 args=2
+op: node=5 result_base=5 tag=0x92 results=0 chan=0 args=1
+=== end
+=== synthetic_mtp_drafts#0 zero_signature_hash
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== synthetic_mtp_drafts#0 flip_signature_byte
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== synthetic_mtp_drafts#0 singleton_kind
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== synthetic_mtp_drafts#0 whole_stage_fallback
+applicable: true
+ok: false
+error: singleton plan requests whole-stage fallback without an identifiable unsupported op
+operations: 6
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0xa0 results=1 chan=-1 args=0
+op: node=2 result_base=2 tag=0x33 results=1 chan=-1 args=1
+op: node=3 result_base=3 tag=0x07 results=1 chan=-1 args=1
+op: node=4 result_base=4 tag=0x10 results=1 chan=-1 args=2
+op: node=5 result_base=5 tag=0x92 results=0 chan=0 args=1
+=== end
+=== synthetic_mtp_drafts#0 drop_last_singleton_region
+applicable: true
+ok: false
+error: singleton partition must contain one region per normalized op
+operations: 0
+=== end
+=== synthetic_mtp_drafts#0 singleton_region_node
+applicable: true
+ok: false
+error: region node out of range
+operations: 0
+=== end
+=== synthetic_mtp_drafts#0 swap_singleton_region_nodes
+applicable: true
+ok: false
+error: singleton region/node ordering mismatch
+operations: 0
+=== end
+=== synthetic_mtp_drafts#0 unordered_region_nodes
+applicable: true
+ok: false
+error: region node indices are not strictly ordered
+operations: 0
+=== end
+=== synthetic_mtp_drafts#0 region_input_out_of_range
+applicable: true
+ok: false
+error: region input out of range
+operations: 0
+=== end
+=== synthetic_mtp_drafts#0 region_output_out_of_range
+applicable: true
+ok: false
+error: region output out of range
+operations: 0
+=== end
+=== synthetic_mtp_drafts#0 region_sink_out_of_range
+applicable: true
+ok: false
+error: region sink out of range
+operations: 0
+=== end
+=== synthetic_mtp_drafts#0 library_scan_claim
+applicable: true
+ok: false
+error: library region ABI is invalid
+operations: 0
+=== end
+=== synthetic_mtp_drafts#0 extra_value_type
+applicable: true
+ok: false
+error: normalized value layout does not match op results
+operations: 6
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0xa0 results=1 chan=-1 args=0
+op: node=2 result_base=2 tag=0x33 results=1 chan=-1 args=1
+op: node=3 result_base=3 tag=0x07 results=1 chan=-1 args=1
+op: node=4 result_base=4 tag=0x10 results=1 chan=-1 args=2
+op: node=5 result_base=5 tag=0x92 results=0 chan=0 args=1
+=== end
+=== synthetic_mtp_drafts#0 drop_last_value_type
+applicable: true
+ok: false
+error: region output out of range
+operations: 0
+=== end
+=== synthetic_mtp_drafts#0 drop_last_value_type_and_refs
+applicable: true
+ok: false
+error: normalized op result range is invalid
+operations: 4
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0xa0 results=1 chan=-1 args=0
+op: node=2 result_base=2 tag=0x33 results=1 chan=-1 args=1
+op: node=3 result_base=3 tag=0x07 results=1 chan=-1 args=1
+=== end
+=== synthetic_mtp_drafts#0 rank5_value_type
+applicable: true
+ok: false
+error: invalid normalized value type
+operations: 0
+=== end
+=== synthetic_mtp_drafts#0 zero_static_dim
+applicable: true
+ok: false
+error: normalized value shape product exceeds u32
+operations: 0
+=== end
+=== synthetic_mtp_drafts#0 overflow_static_dims
+applicable: true
+ok: false
+error: normalized value shape product exceeds u32
+operations: 0
+=== end
+=== synthetic_mtp_drafts#0 reverse_ops
+applicable: true
+ok: false
+error: normalized SSA operand is not a prior value
+operations: 0
+=== end
+=== synthetic_mtp_drafts#0 bad_channel_slot
+applicable: true
+ok: false
+error: normalized channel slot is invalid
+operations: 5
+op: node=0 result_base=0 tag=0xa0 results=1 chan=-1 args=0
+op: node=1 result_base=1 tag=0xa0 results=1 chan=-1 args=0
+op: node=2 result_base=2 tag=0x33 results=1 chan=-1 args=1
+op: node=3 result_base=3 tag=0x07 results=1 chan=-1 args=1
+op: node=4 result_base=4 tag=0x10 results=1 chan=-1 args=2
+=== end
+=== synthetic_mtp_drafts#0 pivot_payload_out_of_range
+applicable: false
+=== end
+=== synthetic_mtp_drafts#0 rename_names
+applicable: false
+=== end
+=== synthetic_mtp_drafts#0 clear_names
+applicable: false
+=== end
+=== synthetic_sink_call#0 none
+applicable: true
+ok: false
+error: unsupported Metal semantic sink boundary
+operations: 1
+op: node=0 result_base=0 tag=0x91 results=1 chan=0 args=0
+=== end
+=== synthetic_sink_call#0 zero_signature_hash
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== synthetic_sink_call#0 flip_signature_byte
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== synthetic_sink_call#0 singleton_kind
+applicable: true
+ok: false
+error: invalid singleton plan identity
+operations: 0
+=== end
+=== synthetic_sink_call#0 whole_stage_fallback
+applicable: true
+ok: false
+error: unsupported Metal semantic sink boundary
+operations: 1
+op: node=0 result_base=0 tag=0x91 results=1 chan=0 args=0
+=== end
+=== synthetic_sink_call#0 drop_last_singleton_region
+applicable: true
+ok: false
+error: singleton partition must contain one region per normalized op
+operations: 0
+=== end
+=== synthetic_sink_call#0 singleton_region_node
+applicable: true
+ok: false
+error: region node out of range
+operations: 0
+=== end
+=== synthetic_sink_call#0 swap_singleton_region_nodes
+applicable: true
+ok: false
+error: library region ABI is invalid
+operations: 0
+=== end
+=== synthetic_sink_call#0 unordered_region_nodes
+applicable: false
+=== end
+=== synthetic_sink_call#0 region_input_out_of_range
+applicable: true
+ok: false
+error: region input out of range
+operations: 0
+=== end
+=== synthetic_sink_call#0 region_output_out_of_range
+applicable: true
+ok: false
+error: region output out of range
+operations: 0
+=== end
+=== synthetic_sink_call#0 region_sink_out_of_range
+applicable: true
+ok: false
+error: region sink out of range
+operations: 0
+=== end
+=== synthetic_sink_call#0 library_scan_claim
+applicable: true
+ok: false
+error: library region ABI is invalid
+operations: 0
+=== end
+=== synthetic_sink_call#0 extra_value_type
+applicable: true
+ok: false
+error: unsupported Metal semantic sink boundary
+operations: 1
+op: node=0 result_base=0 tag=0x91 results=1 chan=0 args=0
+=== end
+=== synthetic_sink_call#0 drop_last_value_type
+applicable: true
+ok: false
+error: region output out of range
+operations: 0
+=== end
+=== synthetic_sink_call#0 drop_last_value_type_and_refs
+applicable: true
+ok: false
+error: normalized op result range is invalid
+operations: 0
+=== end
+=== synthetic_sink_call#0 rank5_value_type
+applicable: true
+ok: false
+error: invalid normalized value type
+operations: 0
+=== end
+=== synthetic_sink_call#0 zero_static_dim
+applicable: true
+ok: false
+error: normalized value shape product exceeds u32
+operations: 0
+=== end
+=== synthetic_sink_call#0 overflow_static_dims
+applicable: true
+ok: false
+error: normalized value shape product exceeds u32
+operations: 0
+=== end
+=== synthetic_sink_call#0 reverse_ops
+applicable: true
+ok: false
+error: library region ABI is invalid
+operations: 0
+=== end
+=== synthetic_sink_call#0 bad_channel_slot
+applicable: true
+ok: false
+error: normalized channel slot is invalid
+operations: 0
+=== end
+=== synthetic_sink_call#0 pivot_payload_out_of_range
+applicable: false
+=== end
+=== synthetic_sink_call#0 rename_names
+applicable: true
+ok: false
+error: unsupported Metal semantic sink boundary
+operations: 1
+op: node=0 result_base=0 tag=0x91 results=1 chan=0 args=0
+=== end
+=== synthetic_sink_call#0 clear_names
+applicable: true
+ok: false
+error: unsupported Metal semantic sink boundary
+operations: 1
+op: node=0 result_base=0 tag=0x91 results=1 chan=0 args=0
+=== end
