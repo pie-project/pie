@@ -12,12 +12,47 @@ pub const KV_COPY_DEVICE_TO_HOST: u32 = 1 << 1;
 pub const KV_COPY_HOST_TO_DEVICE: u32 = 1 << 2;
 pub const KV_COPY_HOST_TO_HOST: u32 = 1 << 3;
 
+/// The runtime's MXFP4 MoE lowering request.
+///
+/// `Auto` lets the loader pick from what the driver says the device can do;
+/// the explicit variants pin a lowering and fail the load if the device cannot
+/// provide it. Mirrors `PieLoaderMxfp4MoeRequest` and must keep the same
+/// discriminants — the value is forwarded to the loader unchanged.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum Mxfp4MoeRequest {
+    #[default]
+    Auto = 0,
+    RoutedDecode = 1,
+    NativeGemm = 2,
+    EagerBf16 = 3,
+}
+
+impl Mxfp4MoeRequest {
+    /// Parse the spelling used in worker config and CLI flags.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "" | "auto" => Some(Self::Auto),
+            "routed_dequant" | "packed" | "routed_decode" => Some(Self::RoutedDecode),
+            "bf16" | "dequant" | "eager_bf16" => Some(Self::EagerBf16),
+            "native" | "native_gemm" => Some(Self::NativeGemm),
+            _ => None,
+        }
+    }
+}
+
 /// Runtime-owned payload for the blocking model-load boot call.
+///
+/// Carries the *request*, not a compiled plan: the driver compiles the load
+/// plan itself, because only the driver can measure the device it will run on
+/// (`loader/architecture.md` §3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelLoadDesc {
-    pub load_plan_bytes: Vec<u8>,
     pub snapshot_dir: PathBuf,
-    pub compiler_version: u64,
+    /// The runtime's own quantization request (e.g. `"fp8"`), not a checkpoint
+    /// fact. Empty means "whatever the checkpoint is".
+    pub runtime_quant: String,
+    pub mxfp4_moe: Mxfp4MoeRequest,
     pub component: crate::ModelComponent,
 }
 

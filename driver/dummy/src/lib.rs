@@ -238,7 +238,7 @@ enum PreparedCallback {
 pub struct DummyDriver {
     device_facts: DeviceFacts,
     capabilities: DriverCapabilities,
-    load_storage: Option<pie_load_planner::host_executor::HostStorage>,
+    model_loaded: bool,
     state: Arc<Mutex<DummyState>>,
     next_program_id: AtomicU64,
     next_instance_id: AtomicU64,
@@ -305,7 +305,7 @@ impl DummyDriver {
                 native_mxfp4_moe: false,
                 storage_alignment: std::mem::align_of::<usize>() as u32,
                 storage_max_tile_bytes: 64 * 1024 * 1024,
-                storage_tile_map_mask: pie_load_planner::load_plan::HOST_TILE_MAP_MASK,
+                storage_tile_map_mask: 0,
                 page_size: 1,
             },
             capabilities: DriverCapabilities {
@@ -347,7 +347,7 @@ impl DummyDriver {
                 snapshot_dir: options.snapshot_dir,
                 kv_handle: None,
             },
-            load_storage: None,
+            model_loaded: false,
             state,
             next_program_id: AtomicU64::new(1),
             next_instance_id: AtomicU64::new(1),
@@ -442,21 +442,12 @@ impl DummyDriver {
     }
 
     pub fn load_model(&mut self, desc: &ModelLoadDesc) -> Result<DriverCapabilities> {
-        ensure!(self.load_storage.is_none(), "dummy model is already loaded");
-        ensure!(
-            desc.compiler_version == pie_load_planner::load_plan::compiler_version(),
-            "dummy compiler version mismatch"
-        );
+        ensure!(!self.model_loaded, "dummy model is already loaded");
         self.record_op("load_model");
-        let storage = pie_load_planner::host_executor::execute_serialized_plan(
-            &desc.load_plan_bytes,
-            &desc.snapshot_dir,
-        )
-        .map_err(|err| anyhow!("dummy LoadPlan execution failed: {err}"))?;
         self.capabilities.snapshot_dir = desc.snapshot_dir.display().to_string();
         self.capabilities.supports_media_encode =
             desc.component != pie_driver_abi::ModelComponent::Text;
-        self.load_storage = Some(storage);
+        self.model_loaded = true;
         Ok(self.capabilities.clone())
     }
 

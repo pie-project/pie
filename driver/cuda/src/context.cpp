@@ -29,7 +29,7 @@
 #include <cuda_runtime.h>
 #include <nlohmann/json.hpp>
 
-#include "pie_native/load_plan.hpp"
+#include "loader/load_plan.hpp"
 #include "batch/workspace.hpp"
 #include "config.hpp"
 #include "distributed.hpp"
@@ -705,9 +705,9 @@ int Context::Impl::initialize(
         {"unified_memory", false},
         {"fp8_native", fp8_native},
         {"native_mxfp4_moe", native_mxfp4_moe},
-        {"storage_alignment", 256},
-        {"storage_max_tile_bytes", 64ull * 1024ull * 1024ull},
-        {"storage_tile_map_mask", pie_load_planner::kCudaTileMapMask},
+        {"storage_alignment", kCudaPreferredAlignment},
+        {"storage_max_tile_bytes", kCudaMaxTileBytes},
+        {"storage_tile_map_mask", kCudaTileMapMask},
         {"page_size", 0},
     };
     device_facts_json_ = facts.dump();
@@ -727,11 +727,19 @@ int Context::Impl::load_model(
     cfg.model.snapshot_dir.assign(
         reinterpret_cast<const char*>(load.snapshot_dir.ptr),
         load.snapshot_dir.len);
-    const std::span<const std::uint8_t> load_plan_bytes(
-        load.load_plan_bytes.ptr, load.load_plan_bytes.len);
+    const std::string_view runtime_quant =
+        load.runtime_quant.ptr == nullptr
+            ? std::string_view{}
+            : std::string_view(
+                  reinterpret_cast<const char*>(load.runtime_quant.ptr),
+                  load.runtime_quant.len);
 
     auto* engine_p = own_value(LoadedModel::load(
-        cfg, tp_comm_, load_plan_bytes, load.compiler_version));
+        cfg,
+        tp_comm_,
+        runtime_quant,
+        static_cast<pie_loader::PieLoaderMxfp4MoeRequest>(load.mxfp4_moe),
+        static_cast<pie_loader::PieLoaderComponent>(load.component)));
     auto& engine = *engine_p;
     media_hidden_size_ = engine.hf_config().hidden_size;
 

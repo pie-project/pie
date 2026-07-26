@@ -2,14 +2,13 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <iomanip>
-#include <map>
-#include <sstream>
-#include <span>
 #include <stdexcept>
 #include <string>
-#include <unordered_set>
+#include <string_view>
+#include <unordered_map>
 #include <vector>
+
+#include "pie_loader/tensor_contract.hpp"
 
 #include "loader/rust_quant_attachment.hpp"
 #include "loader/load_plan.hpp"
@@ -18,218 +17,116 @@
 
 namespace pie_cuda_driver {
 
-inline std::string rust_loader_bytes_to_string(
-    pie_load_planner::PieLoaderBytes bytes) {
-    return pie_load_planner::cpp::bytes_to_string(bytes);
-}
-
 struct LoadPlanResult {
     LoadPlan plan;
     std::vector<RustQuantAttachment> quant_attachments;
     std::size_t source_tensor_count = 0;
+    /// Demanded tensors the plan delivers, and demanded tensors in total.
+    ///
+    /// These used to be two names for `view.tensors.len`, which made the check
+    /// downstream `if (x != x)`. They are now counted against the contract the
+    /// *driver* declared (§12 row 7b-4b), so they differ exactly when the loader
+    /// did not build something this model asked for. A family that has not
+    /// adopted `TensorContract` yet declares nothing and both are zero.
     std::size_t covered_contract_count = 0;
     std::size_t runtime_tensor_count = 0;
+    /// Tensors the plan produces, whether or not anything demanded them.
+    std::size_t planned_tensor_count = 0;
     std::string cache_key;
 };
 
-inline bool rust_loader_ends_with(
-    const std::string& value,
-    const std::string& suffix) {
-    return value.size() >= suffix.size() &&
-           value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
-}
-
-inline std::vector<RustQuantAttachment> infer_rust_quant_attachments(
-    const HfConfig& hf,
-    const pie_load_planner::LoadPlanView& view) {
-    (void)hf;
-    std::unordered_set<std::string> present;
-    present.reserve(view.tensors.len);
+/// Resolve the plan's quant attachments into the name-keyed form the executor's
+/// `WeightStore` is addressed by.
+///
+/// Only a translation. The pairing itself used to be *inferred* here by matching
+/// name suffixes over the plan's tensor list — guessing at something the loader
+/// already knew, since it is what named the scale tensor in the first place. The
+/// plan now states it (`loader/src/load_plan.rs`, `derive_quant_attachments`).
+inline std::vector<RustQuantAttachment> resolve_quant_attachments(
+    const pie_loader::LoadPlanView& view) {
+    std::unordered_map<std::uint32_t, pie_loader::PieLoaderBytes> names;
+    names.reserve(view.tensors.len);
     for (std::size_t i = 0; i < view.tensors.len; ++i) {
-        present.insert(rust_loader_bytes_to_string(view.tensors.ptr[i].name));
+        names.emplace(view.tensors.ptr[i].id, view.tensors.ptr[i].name);
     }
 
-    std::vector<RustQuantAttachment> attachments;
-    for (std::size_t i = 0; i < view.tensors.len; ++i) {
-        const auto& tensor = view.tensors.ptr[i];
-        const std::string name = rust_loader_bytes_to_string(tensor.name);
-        auto attach = [&](const std::string& scale,
-                          QuantGranularity granularity,
-                          int group_size,
-                          int channel_axis) {
-            if (!present.contains(scale)) return false;
-            attachments.push_back({
-                .tensor_name = name,
-                .scale_tensor_name = scale,
-                .granularity = granularity,
-                .group_size = group_size,
-                .channel_axis = channel_axis,
-            });
-            return true;
-        };
-
-        if (tensor.encoding_kind == pie_load_planner::PieLoaderEncodingKind::Quant) {
-            if (tensor.quant_scheme ==
-                    pie_load_planner::PieLoaderQuantScheme::Fp8E4M3 ||
-                tensor.quant_scheme ==
-                    pie_load_planner::PieLoaderQuantScheme::Int8Symmetric) {
-                attach(name + "_scale_inv", QuantGranularity::PerChannel, 0, 0);
-            } else if (tensor.quant_scheme ==
-                       pie_load_planner::PieLoaderQuantScheme::Mxfp4E2M1E8M0) {
-                if (!attach(name + "_scale", QuantGranularity::PerGroup, 32, 1) &&
-                    rust_loader_ends_with(name, ".weight")) {
-                    attach(
-                        name.substr(0, name.size() - 7) + ".weight_scale",
-                        QuantGranularity::PerGroup,
-                        32,
-                        1);
-                }
-            }
-            continue;
+    std::vector<RustQuantAttachment> out;
+    out.reserve(view.attachments.len);
+    for (std::size_t i = 0; i < view.attachments.len; ++i) {
+        const auto& attachment = view.attachments.ptr[i];
+        const auto tensor = names.find(attachment.tensor_id);
+        const auto scale = names.find(attachment.scale_tensor_id);
+        if (tensor == names.end() || scale == names.end()) {
+            // Both ids index the same table the loader built this from, so a
+            // miss is a marshalling fault rather than a model that lacks scales.
+            throw std::runtime_error(
+                "engine: Rust loader attached a quant scale to a tensor id the "
+                "plan does not declare");
         }
-        if (tensor.dtype != pie_load_planner::PieLoaderDType::F8E4M3 ||
-            !rust_loader_ends_with(name, ".weight")) {
-            continue;
-        }
-        if (attach(name + "_scale_inv", QuantGranularity::PerGroup, 128, 0)) {
-            continue;
-        }
-        attach(
-            name.substr(0, name.size() - 7) + ".scale",
-            QuantGranularity::PerGroup,
-            128,
-            0);
+        out.push_back({
+            .tensor_name = pie_loader::bytes_to_string(tensor->second),
+            .scale_tensor_name = pie_loader::bytes_to_string(scale->second),
+            .granularity = attachment.granularity,
+            .group_size = static_cast<int>(attachment.group_size),
+            .channel_axis = static_cast<int>(attachment.channel_axis),
+            .scale_form = attachment.scale_form,
+        });
     }
-    return attachments;
+    return out;
 }
 
-inline std::string load_plan_cache_key(std::span<const std::uint8_t> bytes) {
-    std::uint64_t hash = 1469598103934665603ull;
-    for (const std::uint8_t byte : bytes) {
-        hash ^= byte;
-        hash *= 1099511628211ull;
-    }
-    std::ostringstream out;
-    out << std::hex << std::setw(16) << std::setfill('0') << hash;
-    return out.str();
-}
-
+/// Compile the plan for this device and derive everything the load path needs
+/// from it.
+///
+/// The checks this used to run after the fact — that the plan is for CUDA, that
+/// its compiler version matches, that its tile-map transforms are ones we
+/// implement — are gone. They re-derived facts the driver itself now states in
+/// the request, and the loader refuses a target it cannot satisfy
+/// (`loader/architecture.md` §9).
 inline LoadPlanResult prepare_load_plan(
     const HfConfig& hf,
-    LoadPlan plan,
-    std::span<const std::uint8_t> load_plan_bytes,
-    std::uint64_t compiler_version) {
-    if (plan.compiler_version() != compiler_version) {
-        throw std::runtime_error("engine: LoadPlan compiler version mismatch");
-    }
-    if (plan.backend() != pie_load_planner::PieLoaderBackendKind::Cuda) {
-        throw std::runtime_error("engine: CUDA received a non-CUDA LoadPlan");
-    }
-    if ((plan.tile_map_mask() & ~pie_load_planner::kCudaTileMapMask) != 0) {
-        throw std::runtime_error(
-            "engine: CUDA LoadPlan advertises unsupported TileMap transforms");
-    }
+    std::string_view snapshot_dir,
+    const pie_loader::DeviceTarget& target,
+    std::string_view runtime_quant,
+    pie_loader::PieLoaderMxfp4MoeRequest mxfp4_moe,
+    pie_loader::PieLoaderComponent component,
+    const pie_loader::TensorContract& contract = {}) {
+    // The driver already parsed `config.json` into `hf`; the loader is told
+    // what it needs instead of opening the file again (§10.4).
+    const pie_loader::ModelFacts model{
+        .model_type = hf.model_type,
+        .quant_method = hf.quant_method,
+        .num_hidden_layers = static_cast<std::uint32_t>(std::max(0, hf.num_hidden_layers)),
+        .num_experts = static_cast<std::uint32_t>(std::max(0, hf.num_experts)),
+        .num_experts_per_tok = static_cast<std::uint32_t>(std::max(0, hf.num_experts_per_tok)),
+    };
+    pie_loader::PieLoaderRequest request = pie_loader::build_request(
+        snapshot_dir, target, model, runtime_quant, mxfp4_moe, component);
+    request.demands = contract.slice();
+    LoadPlan plan = LoadPlan::compile(request);
+
+    // Re-check the plan the loader just produced against the request it came
+    // from. Compiling and verifying share no code, so this is a second opinion
+    // rather than a restatement: it walks the plan's internal invariants and —
+    // since §6 gave the plan a file table — stats each declared checkpoint file
+    // to catch one that changed between compile and load. When the caller
+    // declared a contract, it also checks the plan against that, which is the
+    // only one of these checks the loader could not have made on its own.
+    plan.verify(request);
+
     const auto view = plan.view();
-    const std::size_t runtime_tensor_count = view.tensors.len;
     return {
         .plan = std::move(plan),
-        .quant_attachments = infer_rust_quant_attachments(hf, view),
+        .quant_attachments = resolve_quant_attachments(view),
         .source_tensor_count = view.sources.len,
-        .covered_contract_count = runtime_tensor_count,
-        .runtime_tensor_count = runtime_tensor_count,
-        .cache_key = load_plan_cache_key(load_plan_bytes),
+        // `verify` already rejected any shortfall, so reaching here means every
+        // demand is met. Carrying the numbers rather than asserting keeps them
+        // available for the diagnostic dump.
+        .covered_contract_count = view.coverage.covered,
+        .runtime_tensor_count = view.coverage.demanded,
+        .planned_tensor_count = view.tensors.len,
+        .cache_key = pie_loader::bytes_to_string(view.cache_key),
     };
-}
-
-inline std::string describe_load_plan(
-    const pie_load_planner::LoadPlanView& view,
-    std::size_t source_tensor_count,
-    std::size_t covered_contract_count,
-    std::size_t runtime_tensor_count) {
-    std::uint64_t optimizer_rewrites = 0;
-    for (std::size_t i = 0; i < view.optimizer.passes.len; ++i) {
-        optimizer_rewrites += view.optimizer.passes.ptr[i].rewrites;
-    }
-    std::ostringstream out;
-    out << "load_plan(version=" << view.version
-        << ", source_tensors=" << source_tensor_count
-        << ", contracts=" << covered_contract_count << "/" << runtime_tensor_count
-        << ", tensors=" << view.tensors.len
-        << ", buffers=" << view.buffers.len
-        << ", instrs=" << view.instrs.len
-        << ", schedule=" << view.schedule.len
-        << ", optimizer_passes=" << view.optimizer.passes.len
-        << ", optimizer_rewrites=" << optimizer_rewrites
-        << ", persistent_bytes=" << view.memory.persistent_bytes
-        << ", read_bytes=" << view.memory.checkpoint_read_bytes
-        << ", write_bytes=" << view.memory.device_write_bytes
-        << ")";
-    return out.str();
-}
-
-inline const char* load_instr_kind_name(
-    pie_load_planner::PieLoaderStorageInstrKind kind) noexcept {
-    using K = pie_load_planner::PieLoaderStorageInstrKind;
-    switch (kind) {
-    case K::Allocate: return "Allocate";
-    case K::ExtentWrite: return "ExtentWrite";
-    case K::TileMap: return "TileMap";
-    case K::CreateView: return "CreateView";
-    case K::Attach: return "Attach";
-    case K::Release: return "Release";
-    case K::Finalize: return "Finalize";
-    case K::BulkExtentWrite: return "BulkExtentWrite";
-    case K::SlabScatter: return "SlabScatter";
-    }
-    return "Unknown";
-}
-
-inline const char* rust_tile_map_kind_name(
-    pie_load_planner::PieLoaderTileMapKind kind) noexcept {
-    using K = pie_load_planner::PieLoaderTileMapKind;
-    switch (kind) {
-    case K::Cast: return "Cast";
-    case K::Decode: return "Decode";
-    case K::Encode: return "Encode";
-    case K::Transcode: return "Transcode";
-    case K::Reblock: return "Reblock";
-    case K::Reorder: return "Reorder";
-    case K::Repack: return "Repack";
-    case K::None: return "None";
-    }
-    return "Unknown";
-}
-
-inline std::string dump_load_plan_json(
-    const pie_load_planner::LoadPlanView& view,
-    std::size_t source_tensor_count,
-    std::size_t covered_contract_count,
-    std::size_t runtime_tensor_count) {
-    std::map<std::string, std::size_t> instruction_kinds;
-    std::map<std::string, std::size_t> tile_map_kinds;
-    for (std::size_t i = 0; i < view.instrs.len; ++i) {
-        const auto& instr = view.instrs.ptr[i];
-        ++instruction_kinds[load_instr_kind_name(instr.kind)];
-        if (instr.kind == pie_load_planner::PieLoaderStorageInstrKind::TileMap) {
-            ++tile_map_kinds[rust_tile_map_kind_name(instr.tile_kind)];
-        }
-    }
-    nlohmann::json out = {
-        {"summary", describe_load_plan(
-            view, source_tensor_count, covered_contract_count,
-            runtime_tensor_count)},
-        {"version", view.version},
-        {"source_tensor_count", source_tensor_count},
-        {"covered_contract_count", covered_contract_count},
-        {"runtime_tensor_count", runtime_tensor_count},
-        {"tensor_count", view.tensors.len},
-        {"buffer_count", view.buffers.len},
-        {"instruction_count", view.instrs.len},
-        {"schedule_count", view.schedule.len},
-        {"instruction_kinds", instruction_kinds},
-        {"tile_map_kinds", tile_map_kinds},
-    };
-    return out.dump(2);
 }
 
 }  // namespace pie_cuda_driver

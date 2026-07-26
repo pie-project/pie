@@ -13,13 +13,20 @@
 //! the Tier-1 plane/addr checks and the ping-through-ingress check sequentially. (The same
 //! constraint applies to the `run` follow-on: one standalone per process.)
 //!
-//! Fixture: `tests/fixtures/smoke-model-ascii/tokenizer.json` — a real **128-token byte-level-BPE** tokenizer
-//! (charlie's pure-stdlib generator replicating `model/tokenizer/bpe.rs build_byte_to_unicode` exactly;
-//! `model.type=BPE`, `pre_tokenizer.type=ByteLevel`, empty `merges` → each ASCII byte = 1 token). **Boot-validated**
-//! (booted `bin/worker` → exit 0). The runtime parses the tokenizer at boot unconditionally
+//! Fixture: `tests/fixtures/smoke-model-ascii/tokenizer.json` — a real **256-token byte-level-BPE**
+//! tokenizer whose vocab is exactly `runtime/tokenizer/src/bpe.rs::build_byte_to_unicode`, id `n` =
+//! byte `n` (`model.type=BPE`, empty `merges` → each byte = 1 token). **Boot-validated** (booted
+//! `bin/worker` → exit 0). The runtime parses the tokenizer at boot unconditionally
 //! (`model::register` → `Tokenizer::from_file`), so it must be valid — this is. The direct-channel
 //! and chat-completion inferlets use the fixture's single-byte token range and verify the actual
 //! dummy-driver PTIR path.
+//!
+//! Two loader requirements the fixture must satisfy, both checked at boot:
+//! `compile_profile` (`runtime/tokenizer/src/loader/huggingface.rs`) only accepts the *explicit*
+//! byte-level layout — a `Sequence` of `Split(Regex, Isolated)` + `ByteLevel{use_regex:false}` — not
+//! the classic GPT-2 bare `ByteLevel{use_regex:true}`; and `has_all_byte_atoms` requires all **256**
+//! byte atoms, not just ASCII. `[worker.model.driver.options] vocab_size` must agree, or the
+//! registry rejects the `logits` intrinsic at bind time.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -61,7 +68,7 @@ fn standalone_toml(snapshot: &str) -> String {
          device = [\"cpu\"]\n\
          \n\
          [worker.model.driver.options]\n\
-         vocab_size = 128\n\
+         vocab_size = 256\n\
          arch_name = \"qwen3\"\n"
     )
 }

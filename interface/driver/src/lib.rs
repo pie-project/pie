@@ -20,7 +20,7 @@ pub mod transfer;
 
 pub use capabilities::{
     DeviceFacts, DriverCapabilities, KV_COPY_DEVICE_TO_DEVICE, KV_COPY_DEVICE_TO_HOST,
-    KV_COPY_HOST_TO_DEVICE, KV_COPY_HOST_TO_HOST, ModelLoadDesc,
+    KV_COPY_HOST_TO_DEVICE, KV_COPY_HOST_TO_HOST, ModelLoadDesc, Mxfp4MoeRequest,
 };
 pub use geometry::{
     GeometryClass, PIE_DECODE_ENVELOPE_PORTS, PIE_DEVICE_GEOMETRY_PORTS,

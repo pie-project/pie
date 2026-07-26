@@ -1,0 +1,669 @@
+//! The arena that keeps a [`PieLoaderPlan`]'s slices alive.
+//!
+//! Every pointer the driver reads points into buffers owned here. The C++ side
+//! this replaces used `std::deque` for its backing stores specifically because
+//! `push_back` must not invalidate addresses already handed out; the Rust
+//! equivalent is to allocate each run as its own boxed slice, which is stable by
+//! construction and needs no growth discipline at all.
+//!
+//! [`PlanArena`] is built once, then frozen: [`PlanArena::finish`] leaks it into
+//! a raw pointer stored in `PieLoaderPlan::owner`, and `pie_loader_release`
+//! reclaims it. Between those two points nothing mutates, so handing the plan to
+//! another thread is sound.
+
+use crate::load_plan::{
+    DestExtent, LoadPlan, QuantGranularity, ScaleForm, SourceExtent, StorageInstr, StridedExtent,
+};
+use crate::types::{Encoding, QuantScheme};
+use crate::verify::ContractCoverage;
+
+use super::types::*;
+
+/// Owns the backing storage for one plan.
+///
+/// Field order matters only in that `plan_*` vectors are the ones the exported
+/// slices point at; the scalar vectors below them back the nested slices inside
+/// those views.
+#[derive(Default)]
+pub struct PlanArena {
+    strings: Vec<Box<[u8]>>,
+    u32_runs: Vec<Box<[u32]>>,
+    i64_runs: Vec<Box<[i64]>>,
+    dim_runs: Vec<Box<[PieLoaderDimSpecView]>>,
+    slab_runs: Vec<Box<[PieLoaderSlabPlacementView]>>,
+    files: Vec<PieLoaderCheckpointFileView>,
+    sources: Vec<PieLoaderSourceTensorView>,
+    tensors: Vec<PieLoaderTensorDeclView>,
+    buffers: Vec<PieLoaderBufferDeclView>,
+    instrs: Vec<PieLoaderStorageInstrView>,
+    schedule: Vec<u32>,
+    passes: Vec<PieLoaderOptimizerPassStatsView>,
+    attachments: Vec<PieLoaderQuantAttachmentView>,
+}
+
+impl PlanArena {
+    fn store_str(&mut self, value: &str) -> PieLoaderBytes {
+        let boxed: Box<[u8]> = value.as_bytes().to_vec().into_boxed_slice();
+        let view = PieLoaderBytes {
+            ptr: boxed.as_ptr(),
+            len: boxed.len(),
+        };
+        self.strings.push(boxed);
+        view
+    }
+
+    fn store_u32(&mut self, values: impl IntoIterator<Item = u32>) -> PieLoaderU32Slice {
+        let boxed: Box<[u32]> = values.into_iter().collect::<Vec<_>>().into_boxed_slice();
+        let view = PieLoaderU32Slice {
+            ptr: boxed.as_ptr(),
+            len: boxed.len(),
+        };
+        self.u32_runs.push(boxed);
+        view
+    }
+
+    fn store_i64(&mut self, values: &[i64]) -> PieLoaderI64Slice {
+        let boxed: Box<[i64]> = values.to_vec().into_boxed_slice();
+        let view = PieLoaderI64Slice {
+            ptr: boxed.as_ptr(),
+            len: boxed.len(),
+        };
+        self.i64_runs.push(boxed);
+        view
+    }
+
+    fn store_dims(
+        &mut self,
+        values: impl IntoIterator<Item = PieLoaderDimSpecView>,
+    ) -> PieLoaderDimSpecSlice {
+        let boxed: Box<[PieLoaderDimSpecView]> =
+            values.into_iter().collect::<Vec<_>>().into_boxed_slice();
+        let view = PieLoaderDimSpecSlice {
+            ptr: boxed.as_ptr(),
+            len: boxed.len(),
+        };
+        self.dim_runs.push(boxed);
+        view
+    }
+
+    fn store_slab(
+        &mut self,
+        values: impl IntoIterator<Item = PieLoaderSlabPlacementView>,
+    ) -> PieLoaderSlabPlacementSlice {
+        let boxed: Box<[PieLoaderSlabPlacementView]> =
+            values.into_iter().collect::<Vec<_>>().into_boxed_slice();
+        let view = PieLoaderSlabPlacementSlice {
+            ptr: boxed.as_ptr(),
+            len: boxed.len(),
+        };
+        self.slab_runs.push(boxed);
+        view
+    }
+
+    fn stride(&mut self, stride: &StridedExtent) -> PieLoaderStridedExtentView {
+        let dims = self.store_dims(stride.dims.iter().map(|dim| PieLoaderDimSpecView {
+            count: dim.count,
+            src_stride: dim.src_stride,
+            dst_stride: dim.dst_stride,
+        }));
+        PieLoaderStridedExtentView {
+            base_offset: stride.base_offset,
+            element_bytes: stride.element_bytes,
+            dims,
+        }
+    }
+
+    fn source_extent(&mut self, source: &SourceExtent) -> PieLoaderSourceExtentView {
+        let stride = self.stride(&source.stride);
+        PieLoaderSourceExtentView {
+            file_id: source.file_id.0,
+            tensor_id: source.tensor_id.0,
+            file_offset: source.file_offset,
+            span_bytes: source.span_bytes,
+            stride,
+        }
+    }
+
+    fn dest_extent(&mut self, dest: &DestExtent) -> PieLoaderDestExtentView {
+        let stride = self.stride(&dest.stride);
+        PieLoaderDestExtentView {
+            buffer_id: dest.buffer.0,
+            offset: dest.offset,
+            stride,
+        }
+    }
+
+    /// Freeze the arena and publish the plan header.
+    ///
+    /// The returned `PieLoaderPlan` is itself boxed so the driver holds a stable
+    /// pointer; `owner` points at the arena. Both are reclaimed together by
+    /// [`release`].
+    fn finish(self, plan: &LoadPlan, extras: &PlanExtras) -> *mut PieLoaderPlan {
+        let files = PieLoaderCheckpointFileSlice {
+            ptr: self.files.as_ptr(),
+            len: self.files.len(),
+        };
+        let sources = PieLoaderSourceTensorSlice {
+            ptr: self.sources.as_ptr(),
+            len: self.sources.len(),
+        };
+        let tensors = PieLoaderTensorDeclSlice {
+            ptr: self.tensors.as_ptr(),
+            len: self.tensors.len(),
+        };
+        let buffers = PieLoaderBufferDeclSlice {
+            ptr: self.buffers.as_ptr(),
+            len: self.buffers.len(),
+        };
+        let instrs = PieLoaderStorageInstrSlice {
+            ptr: self.instrs.as_ptr(),
+            len: self.instrs.len(),
+        };
+        let schedule = PieLoaderU32Slice {
+            ptr: self.schedule.as_ptr(),
+            len: self.schedule.len(),
+        };
+        let passes = PieLoaderOptimizerPassStatsSlice {
+            ptr: self.passes.as_ptr(),
+            len: self.passes.len(),
+        };
+        let attachments = PieLoaderQuantAttachmentSlice {
+            ptr: self.attachments.as_ptr(),
+            len: self.attachments.len(),
+        };
+        // Rendered here rather than driver-side so the loader stays the only
+        // place that knows how to name its own instructions.
+        let mut arena = self;
+        let cache_key = arena.store_str(&extras.cache_key);
+        let summary = arena.store_str(&crate::dump::describe(plan, extras.coverage));
+        let stats_json = arena.store_str(&crate::dump::plan_stats_json(plan, extras.coverage));
+        let owner = Box::into_raw(Box::new(arena)).cast::<std::ffi::c_void>();
+        Box::into_raw(Box::new(PieLoaderPlan {
+            version: plan.version,
+            files,
+            sources,
+            tensors,
+            buffers,
+            instrs,
+            schedule,
+            memory: PieLoaderMemoryPlanView {
+                persistent_bytes: plan.memory.persistent_bytes,
+                temporary_peak_bytes: plan.memory.temporary_peak_bytes,
+                transform_scratch_peak_bytes: plan.memory.transform_scratch_peak_bytes,
+                checkpoint_read_bytes: plan.memory.checkpoint_read_bytes,
+                device_write_bytes: plan.memory.device_write_bytes,
+            },
+            optimizer: PieLoaderOptimizerReportView { passes },
+            compiler_version: plan.compiler_version,
+            target: (&plan.target).into(),
+            attachments,
+            coverage: PieLoaderContractCoverageView {
+                covered: extras.coverage.covered,
+                demanded: extras.coverage.demanded,
+            },
+            cache_key,
+            summary,
+            stats_json,
+            owner,
+        }))
+    }
+}
+
+/// Split an [`Encoding`] into the three flat fields the POD views carry.
+///
+/// Mirrors the C++ `encoding()` helper: `Raw` leaves the quant fields at their
+/// resting values rather than filling in scheme defaults, so a reader can tell
+/// "unquantized" from "quantized at 8 bits" without consulting `encoding_kind`.
+fn split_encoding(
+    encoding: &Encoding,
+) -> (
+    PieLoaderEncodingKind,
+    PieLoaderDType,
+    PieLoaderQuantScheme,
+    u8,
+    u32,
+) {
+    match encoding {
+        Encoding::Raw(dtype) => (
+            PieLoaderEncodingKind::Raw,
+            (*dtype).into(),
+            PieLoaderQuantScheme::None,
+            0,
+            0,
+        ),
+        Encoding::Quant(spec) => (
+            PieLoaderEncodingKind::Quant,
+            spec.logical_dtype.into(),
+            spec.scheme.into(),
+            spec.bits_per_element,
+            spec.group_size,
+        ),
+    }
+}
+
+fn quant_or_none(scheme: Option<QuantScheme>) -> PieLoaderQuantScheme {
+    scheme.map_or(PieLoaderQuantScheme::None, Into::into)
+}
+
+/// Flatten one [`StorageInstr`] into the union view.
+///
+/// The synthesized fields below are not incidental — they are the contract the
+/// C++ executor already reads, so they are reproduced verbatim from the parser
+/// that is being deleted:
+///
+/// * `ExtentWrite` republishes `dest.buffer_id` as the instruction's
+///   `buffer_id`, so a scheduler can find the written buffer without branching
+///   on `kind`.
+/// * `BulkExtentWrite` has no `DestExtent` in the Rust IR — only a raw offset —
+///   so one is synthesized as a single flat byte run (`element_bytes = 1`, one
+///   dim of `span_bytes`) against the sentinel buffer, which is what makes the
+///   arena-relative write representable in the same struct as a buffer-relative
+///   one.
+/// * `CreateView`, `Attach`, and `Finalize` publish their scalar operands as
+///   one-element `input_buffers`/`output_buffers` runs, so a consumer walking
+///   dataflow edges never has to special-case them.
+fn flatten_instr(arena: &mut PlanArena, instr: &StorageInstr) -> PieLoaderStorageInstrView {
+    let mut out = PieLoaderStorageInstrView::default();
+    match instr {
+        StorageInstr::Allocate { id, buffer } => {
+            out.id = id.0;
+            out.kind = PieLoaderStorageInstrKind::Allocate;
+            out.buffer_id = buffer.0;
+        }
+        StorageInstr::ExtentWrite { id, source, dest } => {
+            out.id = id.0;
+            out.kind = PieLoaderStorageInstrKind::ExtentWrite;
+            out.source = arena.source_extent(source);
+            out.has_source = true;
+            out.dest = arena.dest_extent(dest);
+            out.has_dest = true;
+            out.buffer_id = out.dest.buffer_id;
+        }
+        StorageInstr::BulkExtentWrite {
+            id,
+            source,
+            dest_offset,
+        } => {
+            out.id = id.0;
+            out.kind = PieLoaderStorageInstrKind::BulkExtentWrite;
+            out.source = arena.source_extent(source);
+            out.has_source = true;
+            let dims = arena.store_dims([PieLoaderDimSpecView {
+                count: out.source.span_bytes as i64,
+                src_stride: 1,
+                dst_stride: 1,
+            }]);
+            out.dest = PieLoaderDestExtentView {
+                buffer_id: PIE_LOADER_NO_BUFFER,
+                offset: *dest_offset,
+                stride: PieLoaderStridedExtentView {
+                    base_offset: 0,
+                    element_bytes: 1,
+                    dims,
+                },
+            };
+            out.has_dest = true;
+        }
+        StorageInstr::SlabScatter {
+            id,
+            file_id,
+            file_offset,
+            span_bytes,
+            placements,
+        } => {
+            out.id = id.0;
+            out.kind = PieLoaderStorageInstrKind::SlabScatter;
+            out.slab_file_id = file_id.0;
+            out.slab_file_offset = *file_offset;
+            out.slab_span_bytes = *span_bytes;
+            out.slab_placements =
+                arena.store_slab(placements.iter().map(|p| PieLoaderSlabPlacementView {
+                    src_offset: p.src_offset,
+                    dest_offset: p.dest_offset,
+                    bytes: p.bytes,
+                }));
+        }
+        StorageInstr::TileMap {
+            id,
+            kind,
+            source,
+            dest,
+            inputs,
+            outputs,
+            tile,
+            transform,
+        } => {
+            out.id = id.0;
+            out.kind = PieLoaderStorageInstrKind::TileMap;
+            out.tile_kind = (*kind).into();
+            if let Some(source) = source {
+                out.source = arena.source_extent(source);
+                out.has_source = true;
+            }
+            if let Some(dest) = dest {
+                out.dest = arena.dest_extent(dest);
+                out.has_dest = true;
+            }
+            out.input_buffers = arena.store_u32(inputs.iter().map(|b| b.0));
+            out.output_buffers = arena.store_u32(outputs.iter().map(|b| b.0));
+            if let Some(first) = outputs.first() {
+                out.buffer_id = first.0;
+            }
+            out.rows_per_tile = tile.rows_per_tile;
+            out.transform_fusion = transform.fusion.into();
+            out.transform_from = quant_or_none(transform.from);
+            out.transform_to = quant_or_none(transform.to);
+            let repack = &transform.repack;
+            out.repack_layout = repack.layout.into();
+            out.row_map = repack.row_map.into();
+            out.transform_batch = repack.batch;
+            out.transform_source_rows = repack.source_rows;
+            out.transform_source_row_offset = repack.source_row_offset;
+            out.transform_target_rows = repack.target_rows;
+            out.transform_valid_rows = repack.valid_rows;
+            out.transform_source_stride_cols = repack.source_stride_cols;
+            out.transform_source_col_offset = repack.source_col_offset;
+            out.transform_source_cols = repack.source_cols;
+            out.transform_target_cols = repack.target_cols;
+            out.transform_scratch_bytes = transform.scratch_bytes;
+        }
+        StorageInstr::CreateView {
+            id,
+            input,
+            output,
+            view,
+            layout: _,
+        } => {
+            out.id = id.0;
+            out.kind = PieLoaderStorageInstrKind::CreateView;
+            out.input_buffers = arena.store_u32([input.0]);
+            out.output_buffers = arena.store_u32([output.0]);
+            out.buffer_id = output.0;
+            out.dest = arena.dest_extent(view);
+            out.has_dest = true;
+        }
+        StorageInstr::Attach {
+            id,
+            tensor,
+            metadata,
+            spec: _,
+        } => {
+            out.id = id.0;
+            out.kind = PieLoaderStorageInstrKind::Attach;
+            out.buffer_id = tensor.0;
+            out.input_buffers = arena.store_u32(metadata.iter().map(|b| b.0));
+            out.output_buffers = arena.store_u32([tensor.0]);
+        }
+        StorageInstr::Release { id, buffer } => {
+            out.id = id.0;
+            out.kind = PieLoaderStorageInstrKind::Release;
+            out.buffer_id = buffer.0;
+        }
+        StorageInstr::Finalize { id, tensor, name } => {
+            out.id = id.0;
+            out.kind = PieLoaderStorageInstrKind::Finalize;
+            out.buffer_id = tensor.0;
+            out.output_buffers = arena.store_u32([tensor.0]);
+            out.name = arena.store_str(name);
+        }
+    }
+    out
+}
+
+/// The facts a driver needs that a plan alone cannot state.
+///
+/// Both are derived from the plan *and the request it came from*: coverage needs
+/// the caller's demands, and the cache key needs the snapshot path and the
+/// component. Computing them once at compile time and shipping them with the
+/// plan is what keeps two drivers from each growing their own version.
+pub struct PlanExtras {
+    pub coverage: ContractCoverage,
+    pub cache_key: String,
+}
+
+impl Default for PlanExtras {
+    /// What a plan compiled for a caller that declared nothing looks like. The
+    /// key is still a key: an empty one would collide across every model.
+    fn default() -> Self {
+        Self {
+            coverage: ContractCoverage::default(),
+            cache_key: "0000000000000000".to_string(),
+        }
+    }
+}
+
+/// Convert a compiled [`LoadPlan`] into the POD form the driver walks.
+///
+/// The caller owns the result and must hand it to [`release`].
+pub fn build(plan: &LoadPlan, extras: &PlanExtras) -> *mut PieLoaderPlan {
+    let mut arena = PlanArena::default();
+
+    arena.tensors.reserve(plan.tensors.len());
+    for tensor in &plan.tensors {
+        let name = arena.store_str(&tensor.name);
+        let shape = arena.store_i64(&tensor.shape);
+        let (encoding_kind, dtype, quant_scheme, quant_bits_per_element, quant_group_size) =
+            split_encoding(&tensor.encoding);
+        arena.tensors.push(PieLoaderTensorDeclView {
+            dtype,
+            id: tensor.id.0,
+            name,
+            encoding_kind,
+            quant_scheme,
+            quant_bits_per_element,
+            quant_group_size,
+            shape,
+            alignment: tensor.alignment,
+        });
+    }
+
+    arena.files.reserve(plan.files.len());
+    for file in &plan.files {
+        let path = arena.store_str(&file.path);
+        arena.files.push(PieLoaderCheckpointFileView {
+            id: file.id.0,
+            path,
+            size_bytes: file.size_bytes,
+            format: file.format.into(),
+        });
+    }
+
+    arena.sources.reserve(plan.sources.len());
+    for source in &plan.sources {
+        let name = arena.store_str(&source.name);
+        let shape = arena.store_i64(&source.shape);
+        let (encoding_kind, dtype, quant_scheme, quant_bits_per_element, quant_group_size) =
+            split_encoding(&source.encoding);
+        arena.sources.push(PieLoaderSourceTensorView {
+            dtype,
+            id: source.id.0,
+            name,
+            file_id: source.file_id.0,
+            file_offset: source.file_offset,
+            span_bytes: source.span_bytes,
+            encoding_kind,
+            quant_scheme,
+            quant_bits_per_element,
+            quant_group_size,
+            shape,
+        });
+    }
+
+    arena.buffers.reserve(plan.buffers.len());
+    for buffer in &plan.buffers {
+        arena.buffers.push(PieLoaderBufferDeclView {
+            id: buffer.id.0,
+            tensor_id: buffer.tensor.map_or(PIE_LOADER_NO_BUFFER, |t| t.0),
+            has_tensor: buffer.tensor.is_some(),
+            bytes: buffer.bytes,
+            alignment: buffer.alignment,
+            temporary: buffer.temporary,
+            has_persistent_offset: buffer.persistent_offset.is_some(),
+            persistent_offset: buffer.persistent_offset.unwrap_or(0),
+        });
+    }
+
+    arena.instrs.reserve(plan.instrs.len());
+    for instr in &plan.instrs {
+        let view = flatten_instr(&mut arena, instr);
+        arena.instrs.push(view);
+    }
+
+    arena.schedule = plan.schedule.iter().map(|id| id.0).collect();
+
+    arena.passes.reserve(plan.optimizer.passes.len());
+    for pass in &plan.optimizer.passes {
+        let name = arena.store_str(&pass.name);
+        arena.passes.push(PieLoaderOptimizerPassStatsView {
+            name,
+            exprs_before: pass.exprs_before as u64,
+            exprs_after: pass.exprs_after as u64,
+            rewrites: pass.rewrites as u64,
+        });
+    }
+
+    arena.attachments.reserve(plan.attachments.len());
+    for attachment in &plan.attachments {
+        arena.attachments.push(PieLoaderQuantAttachmentView {
+            tensor_id: attachment.tensor.0,
+            scale_tensor_id: attachment.scale_tensor.0,
+            granularity: match attachment.granularity {
+                QuantGranularity::PerChannel => PieLoaderQuantGranularity::PerChannel,
+                QuantGranularity::PerGroup => PieLoaderQuantGranularity::PerGroup,
+            },
+            group_size: attachment.group_size,
+            channel_axis: attachment.channel_axis,
+            scale_form: match attachment.scale_form {
+                ScaleForm::RawE8M0 => PieLoaderScaleForm::RawE8M0,
+                ScaleForm::F32Factors => PieLoaderScaleForm::F32Factors,
+            },
+        });
+    }
+
+    arena.finish(plan, extras)
+}
+
+/// Reclaim a plan produced by [`build`].
+///
+/// # Safety
+///
+/// `plan` must be a pointer returned by [`build`] and not yet released.
+pub unsafe fn release(plan: *mut PieLoaderPlan) {
+    if plan.is_null() {
+        return;
+    }
+    let boxed = unsafe { Box::from_raw(plan) };
+    if !boxed.owner.is_null() {
+        drop(unsafe { Box::from_raw(boxed.owner.cast::<PlanArena>()) });
+    }
+}
+
+/// The arena is immutable once published, and every pointer it hands out is into
+/// storage it exclusively owns, so a plan can be read from any thread and freed
+/// from a thread other than the one that built it. Ranks load in parallel
+/// (`runtime/engine/src/driver/backend/cuda.rs:331-345`), so this is a
+/// requirement, not a convenience.
+unsafe impl Send for PlanArena {}
+unsafe impl Sync for PlanArena {}
+unsafe impl Send for PieLoaderPlan {}
+unsafe impl Sync for PieLoaderPlan {}
+
+/// Read a plan's contents back as safe Rust slices, for tests that assert the
+/// POD form reproduces the plan it was built from.
+#[cfg(test)]
+pub(crate) mod view {
+    use super::*;
+
+    pub unsafe fn instrs(plan: *const PieLoaderPlan) -> &'static [PieLoaderStorageInstrView] {
+        let plan = unsafe { &*plan };
+        if plan.instrs.ptr.is_null() {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(plan.instrs.ptr, plan.instrs.len) }
+    }
+
+    pub unsafe fn tensors(plan: *const PieLoaderPlan) -> &'static [PieLoaderTensorDeclView] {
+        let plan = unsafe { &*plan };
+        if plan.tensors.ptr.is_null() {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(plan.tensors.ptr, plan.tensors.len) }
+    }
+
+    pub unsafe fn files(plan: *const PieLoaderPlan) -> &'static [PieLoaderCheckpointFileView] {
+        let plan = unsafe { &*plan };
+        if plan.files.ptr.is_null() {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(plan.files.ptr, plan.files.len) }
+    }
+
+    pub unsafe fn sources(plan: *const PieLoaderPlan) -> &'static [PieLoaderSourceTensorView] {
+        let plan = unsafe { &*plan };
+        if plan.sources.ptr.is_null() {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(plan.sources.ptr, plan.sources.len) }
+    }
+
+    pub unsafe fn buffers(plan: *const PieLoaderPlan) -> &'static [PieLoaderBufferDeclView] {
+        let plan = unsafe { &*plan };
+        if plan.buffers.ptr.is_null() {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(plan.buffers.ptr, plan.buffers.len) }
+    }
+
+    pub unsafe fn schedule(plan: *const PieLoaderPlan) -> &'static [u32] {
+        let plan = unsafe { &*plan };
+        if plan.schedule.ptr.is_null() {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(plan.schedule.ptr, plan.schedule.len) }
+    }
+
+    pub unsafe fn bytes(value: &PieLoaderBytes) -> &'static str {
+        if value.ptr.is_null() {
+            return "";
+        }
+        unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(value.ptr, value.len)) }
+    }
+
+    pub unsafe fn u32s(value: &PieLoaderU32Slice) -> &'static [u32] {
+        if value.ptr.is_null() {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(value.ptr, value.len) }
+    }
+
+    pub unsafe fn i64s(value: &PieLoaderI64Slice) -> &'static [i64] {
+        if value.ptr.is_null() {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(value.ptr, value.len) }
+    }
+
+    pub unsafe fn dims(value: &PieLoaderDimSpecSlice) -> &'static [PieLoaderDimSpecView] {
+        if value.ptr.is_null() {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(value.ptr, value.len) }
+    }
+
+    pub unsafe fn slabs(
+        value: &PieLoaderSlabPlacementSlice,
+    ) -> &'static [PieLoaderSlabPlacementView] {
+        if value.ptr.is_null() {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(value.ptr, value.len) }
+    }
+
+    pub unsafe fn passes(plan: *const PieLoaderPlan) -> &'static [PieLoaderOptimizerPassStatsView] {
+        let plan = unsafe { &*plan };
+        if plan.optimizer.passes.ptr.is_null() {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(plan.optimizer.passes.ptr, plan.optimizer.passes.len) }
+    }
+}

@@ -1,0 +1,33 @@
+[package]
+name = "pie-loader"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "Typed weight-loading compiler: checkpoints to verified device-memory layouts."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+# `links = "pie_loader"` lets downstream crates (e.g. `pie-worker`'s build.rs)
+# discover the generated C++ header directory via the `DEP_PIE_LOADER_INCLUDE`
+# env var, which is how the native drivers get `pie_loader.h` on their include
+# path (build script ↔ build script handoff).
+links = "pie_loader"
+
+[lib]
+name = "pie_loader"
+crate-type = ["rlib"]
+path = "src/lib.rs"
+
+# The loader as a tool: compile, inspect, check and replay a plan without a
+# GPU, a runtime, or a driver.
+[[bin]]
+name = "pie-loader"
+path = "src/main.rs"
+
+[dependencies]
+half = "2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+
+[dev-dependencies]

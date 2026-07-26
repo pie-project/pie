@@ -7,12 +7,13 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <utility>
 
 #include <config.hpp>
-#include "loader/backend_target.hpp"
+#include "loader/load_plan.hpp"
 #include "model/config.hpp"
-#include "loader/checkpoint_source.hpp"
+#include "pie_loader/checkpoint_source.hpp"
 #include "model/weight_store.hpp"
 #include "tensor.hpp"
 
@@ -40,8 +41,9 @@ public:
     ///
     static LoadedModel load(const Config& boot_cfg,
                             NcclComm* tp_comm,
-                            std::span<const std::uint8_t> load_plan_bytes,
-                            std::uint64_t compiler_version);
+                            std::string_view runtime_quant,
+                            pie_loader::PieLoaderMxfp4MoeRequest mxfp4_moe,
+                            pie_loader::PieLoaderComponent component);
 
     LoadedModel() = default;
     LoadedModel(const LoadedModel&) = delete;
@@ -52,8 +54,13 @@ public:
     const HfConfig& hf_config() const noexcept { return hf_; }
     const DistributedConfig& distributed() const noexcept { return boot_.distributed; }
     const WeightStore& weight_store() const noexcept { return weights_; }
-    Mxfp4MoeLowering mxfp4_moe_lowering() const noexcept {
-        return mxfp4_moe_lowering_;
+    /// How MXFP4 experts are executed, as the loader resolved it.
+    ///
+    /// Read back rather than re-decided: the plan already materialized the
+    /// weights in the layout this implies, so a second opinion here could only
+    /// disagree with the bytes on the device.
+    pie_loader::PieLoaderMxfp4MoePolicy mxfp4_moe_policy() const noexcept {
+        return mxfp4_moe_policy_;
     }
     LoadedModelCapabilities capabilities() const;
 
@@ -78,7 +85,8 @@ private:
     Config boot_;
     HfConfig hf_;
     WeightStore weights_;
-    Mxfp4MoeLowering mxfp4_moe_lowering_ = Mxfp4MoeLowering::Bf16Dequant;
+    pie_loader::PieLoaderMxfp4MoePolicy mxfp4_moe_policy_ =
+        pie_loader::PieLoaderMxfp4MoePolicy::EagerBf16;
 };
 
 namespace ops { struct RuntimeQuantScratchSpec; }

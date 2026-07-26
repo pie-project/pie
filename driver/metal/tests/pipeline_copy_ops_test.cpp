@@ -23,8 +23,8 @@
 //     with no terminal publish / no notify (there is no recurrent state to
 //     copy).
 //   * copy_state/resize_pool on a hybrid checkpoint whose directory has no
-//     real weights fail driver-error-safely (the underlying
-//     SafetensorsView throws; the extern "C" boundary's catch(...)
+//     real weights fail driver-error-safely (the plan compile throws
+//     before CheckpointSource is reached; the extern "C" boundary's catch(...)
 //     converts it, it does not crash) — still no terminal publish / no
 //     notify.
 //   * the shared ABI completion validator (`validate_completion`) is
@@ -168,7 +168,7 @@ int main() {
     }
 
     // ── resize_pool on a hybrid checkpoint whose directory has no real
-    //    weights: the lazy executor setup throws inside SafetensorsView;
+    //    weights: the lazy executor setup throws while compiling the plan;
     //    the extern "C" boundary's catch(...) must convert this to
     //    PIE_STATUS_DRIVER_ERROR safely (no crash), matching copy_state's
     //    identical hybrid-no-checkpoint precedent. ──
@@ -220,7 +220,7 @@ int main() {
     }
 
     // ── copy_state on a hybrid checkpoint whose directory has no real
-    //    weights: the lazy executor setup throws inside SafetensorsView;
+    //    weights: the lazy executor setup throws while compiling the plan;
     //    the extern "C" boundary's catch(...) must convert this to
     //    PIE_STATUS_DRIVER_ERROR safely (no crash), still without ever
     //    publishing the terminal cell or notifying. ──

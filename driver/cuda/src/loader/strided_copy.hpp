@@ -13,15 +13,15 @@
 
 #include <cuda_runtime.h>
 
-#include "pie_native/load_plan.hpp"
+#include "pie_loader/plan.hpp"
 #include "tensor.hpp"
-#include "loader/checkpoint_source.hpp"
+#include "pie_loader/checkpoint_source.hpp"
 
 namespace pie_cuda_driver {
 
 inline void copy_strided_extent_to_device(
-    CheckpointSource& loader,
-    const pie_load_planner::PieLoaderStorageInstrView& instr,
+    pie_loader::CheckpointSource& loader,
+    const pie_loader::PieLoaderStorageInstrView& instr,
     void* dst,
     const std::vector<std::int64_t>& dst_shape) {
     const auto& extent = instr.source.stride;

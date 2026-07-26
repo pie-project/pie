@@ -33,11 +33,9 @@ TensorDecl WeightStore::default_spec_for(
     spec.name = name;
     spec.dtype = tensor.dtype();
     spec.shape = tensor.shape();
-    spec.layout = TensorLayoutKind::Dense;
     spec.ownership = tensor.owns_memory()
         ? TensorOwnershipKind::Owned
         : TensorOwnershipKind::BorrowedView;
-    spec.parallel = TensorParallelKind::Replicated;
     return spec;
 }
 

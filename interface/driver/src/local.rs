@@ -30,6 +30,13 @@ pub const PIE_MODEL_COMPONENT_FULL: u32 = 0;
 pub const PIE_MODEL_COMPONENT_TEXT: u32 = 1;
 pub const PIE_MODEL_COMPONENT_ENCODE: u32 = 2;
 
+/// MXFP4 MoE lowering request. Discriminants match `PieLoaderMxfp4MoeRequest`;
+/// the driver forwards the value to the loader unchanged.
+pub const PIE_MXFP4_MOE_AUTO: u32 = 0;
+pub const PIE_MXFP4_MOE_ROUTED_DECODE: u32 = 1;
+pub const PIE_MXFP4_MOE_NATIVE_GEMM: u32 = 2;
+pub const PIE_MXFP4_MOE_EAGER_BF16: u32 = 3;
+
 /// Success.
 pub const PIE_STATUS_OK: i32 = 0;
 /// Descriptor validation failed synchronously.
@@ -428,16 +435,21 @@ pub struct PieDriverCaps {
 }
 
 /// Blocking model-load descriptor.
+///
+/// This is a *request*, not a compiled artifact: the driver compiles the load
+/// plan itself from `snapshot_dir` plus the device it measured, so the runtime
+/// no longer ships plan bytes across the ABI (`loader/architecture.md` §3).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PieModelLoadDesc {
     pub abi_version: u32,
     /// One of `PIE_MODEL_COMPONENT_*`.
     pub component: u32,
-    /// Compiler source hash expected by this runtime.
-    pub compiler_version: u64,
-    /// Serialized, versioned LoadPlan. Empty plans are invalid.
-    pub load_plan_bytes: PieBytes,
+    /// One of `PIE_MXFP4_MOE_*`.
+    pub mxfp4_moe: u32,
+    /// The runtime's own quantization request (e.g. `"fp8"`), not a checkpoint
+    /// fact. Empty means "whatever the checkpoint is".
+    pub runtime_quant: PieBytes,
     /// UTF-8 path to the driver-local checkpoint payload root.
     pub snapshot_dir: PieBytes,
 }
@@ -447,8 +459,8 @@ impl Default for PieModelLoadDesc {
         Self {
             abi_version: PIE_DRIVER_ABI_VERSION,
             component: PIE_MODEL_COMPONENT_FULL,
-            compiler_version: 0,
-            load_plan_bytes: PieBytes::default(),
+            mxfp4_moe: PIE_MXFP4_MOE_AUTO,
+            runtime_quant: PieBytes::default(),
             snapshot_dir: PieBytes::default(),
         }
     }
@@ -1183,24 +1195,17 @@ pub fn validate_model_load_desc(desc: &PieModelLoadDesc) -> PieAbiValidationResu
     if desc.component > PIE_MODEL_COMPONENT_ENCODE {
         return Err(invalid_argument("model load component is invalid"));
     }
+    if desc.mxfp4_moe > PIE_MXFP4_MOE_EAGER_BF16 {
+        return Err(invalid_argument("model load mxfp4_moe is invalid"));
+    }
     validate_bytes(
-        desc.load_plan_bytes,
-        "model load load_plan_bytes ptr/len mismatch",
+        desc.runtime_quant,
+        "model load runtime_quant ptr/len mismatch",
     )?;
     validate_bytes(
         desc.snapshot_dir,
         "model load snapshot_dir ptr/len mismatch",
     )?;
-    if desc.load_plan_bytes.len == 0 {
-        return Err(invalid_argument(
-            "model load requires non-empty load_plan_bytes",
-        ));
-    }
-    if desc.compiler_version == 0 {
-        return Err(invalid_argument(
-            "model load requires a nonzero compiler_version",
-        ));
-    }
     if desc.snapshot_dir.len == 0 {
         return Err(invalid_argument(
             "model load requires non-empty snapshot_dir",
@@ -2617,22 +2622,19 @@ mod tests {
     }
 
     #[test]
-    fn model_load_validator_requires_program_and_snapshot() {
+    fn model_load_validator_requires_snapshot() {
         let mut desc = PieModelLoadDesc::default();
         assert!(validate_model_load_desc(&desc).is_err());
-        let program = [1u8];
         let snapshot = b"/tmp/model";
-        desc.load_plan_bytes = PieBytes {
-            ptr: program.as_ptr(),
-            len: program.len(),
-        };
         desc.snapshot_dir = PieBytes {
             ptr: snapshot.as_ptr(),
             len: snapshot.len(),
         };
-        desc.compiler_version = 1;
         validate_model_load_desc(&desc).unwrap();
         desc.component = PIE_MODEL_COMPONENT_ENCODE + 1;
+        assert!(validate_model_load_desc(&desc).is_err());
+        desc.component = PIE_MODEL_COMPONENT_FULL;
+        desc.mxfp4_moe = PIE_MXFP4_MOE_EAGER_BF16 + 1;
         assert!(validate_model_load_desc(&desc).is_err());
     }
 
@@ -3072,9 +3074,9 @@ mod tests {
         assert!(runtime.contains("uint32_t reserved0;"));
         assert!(runtime.contains("PieRuntimeNotifyFn notify;"));
         assert!(create.contains("uint32_t reserved0;"));
-        assert!(load.contains("struct PieBytes load_plan_bytes;"));
+        assert!(load.contains("struct PieBytes runtime_quant;"));
         assert!(load.contains("struct PieBytes snapshot_dir;"));
-        assert!(load.contains("uint64_t compiler_version;"));
+        assert!(load.contains("uint32_t mxfp4_moe;"));
         assert!(load.contains("uint32_t component;"));
         assert!(program.contains("uint64_t program_hash;"));
         assert!(program.contains("uint32_t reserved0;"));

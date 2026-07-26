@@ -68,6 +68,18 @@
 #define PIE_MODEL_COMPONENT_ENCODE 2
 
 /**
+ * MXFP4 MoE lowering request. Discriminants match `PieLoaderMxfp4MoeRequest`;
+ * the driver forwards the value to the loader unchanged.
+ */
+#define PIE_MXFP4_MOE_AUTO 0
+
+#define PIE_MXFP4_MOE_ROUTED_DECODE 1
+
+#define PIE_MXFP4_MOE_NATIVE_GEMM 2
+
+#define PIE_MXFP4_MOE_EAGER_BF16 3
+
+/**
  * Success.
  */
 #define PIE_STATUS_OK 0
@@ -259,6 +271,10 @@ typedef struct PieDriverCaps {
 
 /**
  * Blocking model-load descriptor.
+ *
+ * This is a *request*, not a compiled artifact: the driver compiles the load
+ * plan itself from `snapshot_dir` plus the device it measured, so the runtime
+ * no longer ships plan bytes across the ABI (`loader/architecture.md` §3).
  */
 typedef struct PieModelLoadDesc {
   uint32_t abi_version;
@@ -267,13 +283,14 @@ typedef struct PieModelLoadDesc {
    */
   uint32_t component;
   /**
-   * Compiler source hash expected by this runtime.
+   * One of `PIE_MXFP4_MOE_*`.
    */
-  uint64_t compiler_version;
+  uint32_t mxfp4_moe;
   /**
-   * Serialized, versioned LoadPlan. Empty plans are invalid.
+   * The runtime's own quantization request (e.g. `"fp8"`), not a checkpoint
+   * fact. Empty means "whatever the checkpoint is".
    */
-  struct PieBytes load_plan_bytes;
+  struct PieBytes runtime_quant;
   /**
    * UTF-8 path to the driver-local checkpoint payload root.
    */

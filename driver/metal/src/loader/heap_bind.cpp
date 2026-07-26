@@ -26,7 +26,7 @@
 #include "heap_layout.hpp"
 #include "decode_step.hpp"     // beta: Dispatch{kind,ordinal,layer,grid,tg} + build_decode_dag
 #include "mtl4_context.hpp"
-#include "safetensors_view.hpp"
+#include "pie_loader/checkpoint_source.hpp"
 
 namespace pie::metal {
 
@@ -64,18 +64,18 @@ SlotHandle alloc_zeroed(
 }
 
 std::uint64_t extent_bytes(
-    const pie_load_planner::PieLoaderStridedExtentView& extent) {
-    return pie_load_planner::cpp::extent_bytes(extent, "metal load executor");
+    const pie_loader::PieLoaderStridedExtentView& extent) {
+    return pie_loader::extent_bytes(extent, "metal load executor");
 }
 
 void copy_extent(
-    const SafetensorsView& source,
-    const pie_load_planner::PieLoaderSourceExtentView& src,
-    const pie_load_planner::PieLoaderDestExtentView& dst,
+    const pie_loader::CheckpointSource& source,
+    const pie_loader::PieLoaderSourceExtentView& src,
+    const pie_loader::PieLoaderDestExtentView& dst,
     const SlotHandle& target,
     std::uint64_t max_tile_bytes) {
-    if (!pie_load_planner::cpp::compact_extent(src.stride) ||
-        !pie_load_planner::cpp::compact_extent(dst.stride)) {
+    if (!pie_loader::compact_extent(src.stride) ||
+        !pie_loader::compact_extent(dst.stride)) {
         throw std::runtime_error(
             "metal storage executor: non-compact ExtentWrite is unsupported");
     }
@@ -101,8 +101,8 @@ void copy_extent(
 
 BoundDecode stage_decode_storage(
     RawMetalContext& ctx,
-    const SafetensorsView& view,
-    const pie_load_planner::LoadPlan& load,
+    const pie_loader::CheckpointSource& view,
+    const pie_loader::LoadPlan& load,
     const DecodeGeometry& g,
     const HeapPlan& heap_plan) {
     BoundDecode b;
@@ -110,18 +110,13 @@ BoundDecode stage_decode_storage(
     b.gdn.resize(g.n_layers);
     b.kv.resize(g.n_layers);
 
+    // Backend and tile-map transforms are no longer re-checked: this driver
+    // supplied both in the request it compiled from (`architecture.md` §9).
     const auto load_plan = load.view();
-    if (load.backend() != pie_load_planner::PieLoaderBackendKind::Metal) {
-        throw std::runtime_error("Metal load executor received a non-Metal plan");
-    }
-    if (load.tile_map_mask() != pie_load_planner::kMetalTileMapMask) {
-        throw std::runtime_error(
-            "Metal load plan advertises unsupported TileMap transforms");
-    }
     for (std::size_t i = 0; i < load_plan.tensors.len; ++i) {
         const auto& tensor = load_plan.tensors.ptr[i];
         if (tensor.quant_scheme ==
-                pie_load_planner::PieLoaderQuantScheme::MlxAffineU4 &&
+                pie_loader::PieLoaderQuantScheme::MlxAffineU4 &&
             (tensor.quant_bits_per_element != 4 ||
              tensor.quant_group_size != 64)) {
             throw std::runtime_error(
@@ -137,11 +132,11 @@ BoundDecode stage_decode_storage(
         throw std::runtime_error("heap_alloc failed for program-owned weights region");
     }
     std::unordered_map<std::uint32_t, SlotHandle> buffers;
-    pie_load_planner::cpp::LoadPlanIndex index("metal load executor");
+    pie_loader::LoadPlanIndex index("metal load executor");
     index.reset(load_plan);
     for (std::size_t step = 0; step < load_plan.schedule.len; ++step) {
         const auto& instr = index.instruction(load_plan.schedule.ptr[step]);
-        using K = pie_load_planner::PieLoaderStorageInstrKind;
+        using K = pie_loader::PieLoaderStorageInstrKind;
         switch (instr.kind) {
         case K::Allocate: {
             const auto& decl = index.buffer(instr.buffer_id);
@@ -238,7 +233,7 @@ BoundDecode stage_decode_storage(
                     "metal storage executor: finalized buffer is missing");
             }
             const std::string name =
-                pie_load_planner::cpp::bytes_to_string(instr.name);
+                pie_loader::bytes_to_string(instr.name);
             if (!b.weights.emplace(name, buffer->second).second) {
                 throw std::runtime_error(
                     "metal storage executor: duplicate runtime tensor " + name);
