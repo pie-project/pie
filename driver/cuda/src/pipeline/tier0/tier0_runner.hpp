@@ -47,8 +47,22 @@ namespace pie_cuda_driver::pipeline {
 // (CUDA teardown order makes static-destructor cudaFree unsafe).
 class BakedBufferPool {
   public:
+    // One pool PER DEVICE. The buffers below are device allocations, so a
+    // process-global pool hands rank 0's memory to rank 1 and the next
+    // kernel that touches it faults with an illegal memory access. Tensor
+    // parallelism already puts several devices in one process
+    // (`mode=same-process`), so this is not hypothetical: it presented as
+    // a rare, non-reproducible fault under TP=2.
     static BakedBufferPool& instance() {
-        static BakedBufferPool* pool = new BakedBufferPool();
+        int device = 0;
+        if (cudaGetDevice(&device) != cudaSuccess) device = 0;
+        static std::mutex registry_mutex;
+        static std::unordered_map<int, BakedBufferPool*> by_device;
+        std::lock_guard<std::mutex> guard(registry_mutex);
+        auto& pool = by_device[device];
+        // Never freed, deliberately: CUDA teardown order makes a
+        // static-destructor `cudaFree` unsafe (see the note above).
+        if (pool == nullptr) pool = new BakedBufferPool();
         return *pool;
     }
 

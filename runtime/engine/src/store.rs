@@ -9,15 +9,13 @@
 //! - `pool`/`genmap`: the physical-id free list and generational key map the
 //!   typed stores are built on.
 //! - `registry`: per-(model, driver) lookup of the owning `KvStore`/`RsStore`.
-//! - [`reclaim`]: the pressure ladder (idle-lease drop, preempt-youngest,
-//!   wait queue, restore-on-free) — the only submodule external tests reach
-//!   directly (`store::reclaim::contention()`), since it is this crate's
-//!   sole KV-contention diagnostic surface.
+//!
+//! KV-contention policy lives ABOVE this module in `crate::planner` (Project
+//! Rainer); the stores own only physics (pools, transactions, swap).
 
 pub(crate) mod genmap;
 pub(crate) mod kv;
 pub(crate) mod pool;
-pub mod reclaim;
 pub(crate) mod registry;
 pub(crate) mod rs;
 
@@ -94,8 +92,8 @@ impl std::fmt::LowerHex for PipelineScopeId {
 
 /// Coarse worker-routing signal derived from real KV residency and contention.
 pub fn kv_pressure_bucket() -> u8 {
-    if let Some(orchestrator) = reclaim::contention() {
-        return orchestrator.kv_pressure_bucket();
+    if let Some(planner) = crate::planner::planner() {
+        return planner.kv_pressure_bucket();
     }
     let Some(stores) = registry::try_get(0, 0) else {
         return 0;

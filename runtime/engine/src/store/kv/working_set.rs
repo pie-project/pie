@@ -21,10 +21,30 @@
 //! and ITS `Drop` performs the release — the process-teardown fallback.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use super::page_table::WorkingSetId;
 use crate::driver::DriverId;
+
+/// Why a fire lease was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FireLeaseError {
+    /// The working set's release has been requested — a permanent refusal.
+    Released,
+    /// The planner is suspending (or has suspended) this working set — a
+    /// transient refusal; the fire parks at the residency gate and retries
+    /// after the restore.
+    Fenced,
+}
+
+impl std::fmt::Display for FireLeaseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FireLeaseError::Released => f.write_str("working set release already requested"),
+            FireLeaseError::Fenced => f.write_str("working set is suspend-fenced"),
+        }
+    }
+}
 
 /// Idempotent release fallback shared by every clone of one [`KvWorkingSet`].
 #[derive(Debug)]
@@ -32,6 +52,16 @@ struct KvLifecycle {
     released: AtomicBool,
     release_requested: AtomicBool,
     active_fire_leases: AtomicUsize,
+    /// The planner's suspend fence (Project Rainer). Dekker-paired with
+    /// `active_fire_leases`: a fire increments the count then loads the
+    /// fence; the planner stores the fence then loads the count (both
+    /// SeqCst) — so either the fire sees the fence and backs out, or the
+    /// planner sees the fire's lease and waits for it. While fenced the
+    /// count is monotone non-increasing, which makes `quiesce` a finite
+    /// wait and the D2H copy race-free against launches.
+    suspend_fence: AtomicBool,
+    /// Notified whenever the lease count drops to zero under the fence.
+    quiesced: tokio::sync::Notify,
     model: usize,
     driver: DriverId,
     id: WorkingSetId,
@@ -56,23 +86,33 @@ impl KvLifecycle {
             let epoch = kv.current_epoch();
             kv.release_working_set(self.id, epoch);
             kv.retire_idle();
-        }); // store lock released before the contention drain re-locks pools.
-        // Freed pool space may unblock a preempted inferlet.
-        if let Some(orchestrator) = crate::store::reclaim::contention() {
-            orchestrator.on_blocks_freed();
+        }); // store lock released before the planner's drain re-locks pools.
+        // Freed pool space may unblock a parked ask.
+        if let Some(planner) = crate::planner::planner() {
+            planner.pages_freed();
         }
     }
 
-    fn acquire_fire_lease(this: &Arc<Self>) -> Result<KvFireLease, &'static str> {
+    fn acquire_fire_lease(this: &Arc<Self>) -> Result<KvFireLease, FireLeaseError> {
         if this.release_requested.load(Ordering::Acquire) {
-            return Err("working set release already requested");
+            return Err(FireLeaseError::Released);
         }
-        this.active_fire_leases.fetch_add(1, Ordering::AcqRel);
-        if this.release_requested.load(Ordering::Acquire) {
-            let previous = this.active_fire_leases.fetch_sub(1, Ordering::AcqRel);
+        this.active_fire_leases.fetch_add(1, Ordering::SeqCst);
+        let refused = if this.release_requested.load(Ordering::Acquire) {
+            Some(FireLeaseError::Released)
+        } else if this.suspend_fence.load(Ordering::SeqCst) {
+            Some(FireLeaseError::Fenced)
+        } else {
+            None
+        };
+        if let Some(refusal) = refused {
+            let previous = this.active_fire_leases.fetch_sub(1, Ordering::SeqCst);
             debug_assert!(previous > 0);
             this.maybe_release();
-            return Err("working set release raced fire preparation");
+            if previous == 1 {
+                this.quiesced.notify_waiters();
+            }
+            return Err(refusal);
         }
         Ok(KvFireLease {
             lifecycle: Arc::clone(this),
@@ -89,10 +129,72 @@ impl Drop for KvFireLease {
         let previous = self
             .lifecycle
             .active_fire_leases
-            .fetch_sub(1, Ordering::AcqRel);
+            .fetch_sub(1, Ordering::SeqCst);
         debug_assert!(previous > 0);
         if previous == 1 {
             self.lifecycle.maybe_release();
+            // The planner's quiesce wait (if any) is over.
+            self.lifecycle.quiesced.notify_waiters();
+        }
+    }
+}
+
+/// The planner's weak handle onto a working set's lifecycle — the suspend
+/// fence and quiescence wait live here, never keeping the set alive.
+#[derive(Clone)]
+pub struct KvSuspendHandle {
+    lifecycle: Weak<KvLifecycle>,
+}
+
+impl KvSuspendHandle {
+    /// Raise the suspend fence: every later [`KvWorkingSet::fire_lease`]
+    /// refuses with [`FireLeaseError::Fenced`].
+    pub fn fence(&self) {
+        if let Some(lifecycle) = self.lifecycle.upgrade() {
+            lifecycle.suspend_fence.store(true, Ordering::SeqCst);
+        }
+    }
+
+    pub fn unfence(&self) {
+        if let Some(lifecycle) = self.lifecycle.upgrade() {
+            lifecycle.suspend_fence.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// The current fire-lease count (0 when the lifecycle is gone). Two
+    /// consumers: the eviction executor's quiesce trace, and the planner's
+    /// victim-selection PREFERENCE (`kv_lease_quiescent` — a racy snapshot
+    /// that only reorders equally-eligible candidates; the fence + quiesce
+    /// wait remains the correctness seal). The starvation predicate
+    /// deliberately does NOT read lease snapshots: a guest between two
+    /// fires holds none for an instant but is very much alive — see
+    /// `check_starvation`.
+    pub fn active_leases(&self) -> usize {
+        self.lifecycle
+            .upgrade()
+            .map_or(0, |lifecycle| {
+                lifecycle.active_fire_leases.load(Ordering::SeqCst)
+            })
+    }
+
+    /// Await zero fire leases. Meaningful only under a raised fence, where
+    /// the count is monotone non-increasing. Returns immediately when the
+    /// lifecycle is already gone (released — nothing left to protect).
+    pub async fn quiesce(&self) {
+        loop {
+            let Some(lifecycle) = self.lifecycle.upgrade() else {
+                return;
+            };
+            if lifecycle.active_fire_leases.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            let notified = lifecycle.quiesced.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if lifecycle.active_fire_leases.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            notified.await;
         }
     }
 }
@@ -153,6 +255,8 @@ impl KvWorkingSet {
                 released: AtomicBool::new(false),
                 release_requested: AtomicBool::new(false),
                 active_fire_leases: AtomicUsize::new(0),
+                suspend_fence: AtomicBool::new(false),
+                quiesced: tokio::sync::Notify::new(),
                 model,
                 driver,
                 id,
@@ -182,8 +286,15 @@ impl KvWorkingSet {
         }
     }
 
-    pub fn fire_lease(&self) -> Result<KvFireLease, &'static str> {
+    pub fn fire_lease(&self) -> Result<KvFireLease, FireLeaseError> {
         KvLifecycle::acquire_fire_lease(&self.lifecycle)
+    }
+
+    /// The planner's weak handle for suspend fencing and quiescence.
+    pub fn suspend_handle(&self) -> KvSuspendHandle {
+        KvSuspendHandle {
+            lifecycle: Arc::downgrade(&self.lifecycle),
+        }
     }
 
     /// Whether no submitted fire still holds this WorkingSet's mapping.
@@ -237,7 +348,7 @@ mod tests {
     /// `reserve` alone is logical-only and never touches the pool).
     fn commit_fresh_pages(model: usize, id: WorkingSetId, n: u64, _epoch: u64) {
         let stores = registry::get(model, 0);
-        let mut kv = stores.kv.lock().unwrap();
+        let mut kv = stores.kv.lock();
         let start = kv.page_len(id).unwrap();
         kv.reserve(id, n).unwrap();
         let indexes: Vec<u64> = (start..start + n).collect();
@@ -257,10 +368,10 @@ mod tests {
     fn drop_without_explicit_release_reclaims_pool_capacity() {
         let model = fresh_model(4);
         let stores = registry::get(model, 0);
-        let id = stores.kv.lock().unwrap().create_working_set();
+        let id = stores.kv.lock().create_working_set();
         commit_fresh_pages(model, id, 4, 1);
         assert_eq!(
-            stores.kv.lock().unwrap().available_pages(),
+            stores.kv.lock().available_pages(),
             0,
             "the lane's fresh commit exhausts the 4-page pool"
         );
@@ -272,7 +383,7 @@ mod tests {
         drop(ws);
 
         assert_eq!(
-            stores.kv.lock().unwrap().available_pages(),
+            stores.kv.lock().available_pages(),
             4,
             "the Drop fallback released the working set's pages back to the pool"
         );
@@ -282,7 +393,7 @@ mod tests {
     fn explicit_release_is_idempotent_and_the_drop_fallback_does_not_double_free() {
         let model = fresh_model(4);
         let stores = registry::get(model, 0);
-        let id = stores.kv.lock().unwrap().create_working_set();
+        let id = stores.kv.lock().create_working_set();
         commit_fresh_pages(model, id, 4, 1);
 
         let ws = KvWorkingSet::new(model, 0, id, 16);
@@ -290,7 +401,7 @@ mod tests {
         ws.release();
         assert!(ws.is_released());
         assert_eq!(
-            stores.kv.lock().unwrap().available_pages(),
+            stores.kv.lock().available_pages(),
             4,
             "the explicit release reclaimed the pool"
         );
@@ -298,13 +409,13 @@ mod tests {
         // A second explicit release (e.g. a defensive extra call) must not
         // re-run the release logic against an already-torn-down id.
         ws.release();
-        assert_eq!(stores.kv.lock().unwrap().available_pages(), 4);
+        assert_eq!(stores.kv.lock().available_pages(), 4);
 
         // The value's own `Drop` (its lifecycle `Arc`'s last reference)
         // fires next — also a no-op, since `released` is already set.
         drop(ws);
         assert_eq!(
-            stores.kv.lock().unwrap().available_pages(),
+            stores.kv.lock().available_pages(),
             4,
             "no double release/free after the explicit release already ran"
         );
@@ -318,14 +429,14 @@ mod tests {
         // the LAST clone (here, the "table's own" original) may.
         let model = fresh_model(4);
         let stores = registry::get(model, 0);
-        let id = stores.kv.lock().unwrap().create_working_set();
+        let id = stores.kv.lock().create_working_set();
         commit_fresh_pages(model, id, 4, 1);
 
         let table_owned = KvWorkingSet::new(model, 0, id, 16);
         let temporary_clone = table_owned.clone();
         drop(temporary_clone);
         assert_eq!(
-            stores.kv.lock().unwrap().available_pages(),
+            stores.kv.lock().available_pages(),
             0,
             "a non-last clone's drop must not trigger release"
         );
@@ -333,7 +444,7 @@ mod tests {
 
         drop(table_owned);
         assert_eq!(
-            stores.kv.lock().unwrap().available_pages(),
+            stores.kv.lock().available_pages(),
             4,
             "the last clone's drop runs the release fallback"
         );
@@ -343,9 +454,9 @@ mod tests {
     fn fork_mints_an_independent_lifecycle_not_a_shared_clone() {
         let model = fresh_model(4);
         let stores = registry::get(model, 0);
-        let parent_id = stores.kv.lock().unwrap().create_working_set();
+        let parent_id = stores.kv.lock().create_working_set();
         commit_fresh_pages(model, parent_id, 2, 1);
-        let child_id = stores.kv.lock().unwrap().fork(parent_id).unwrap();
+        let child_id = stores.kv.lock().fork(parent_id).unwrap();
 
         let parent = KvWorkingSet::new(model, 0, parent_id, 16);
         let child = KvWorkingSet::new(model, 0, child_id, 16);
@@ -356,22 +467,22 @@ mod tests {
         child.release();
         assert!(!parent.is_released());
         assert_eq!(
-            stores.kv.lock().unwrap().available_pages(),
+            stores.kv.lock().available_pages(),
             2,
             "the fork shares the parent's 2 committed pages; releasing the \
              child alone doesn't reclaim them"
         );
 
         drop(parent);
-        assert_eq!(stores.kv.lock().unwrap().available_pages(), 4);
+        assert_eq!(stores.kv.lock().available_pages(), 4);
     }
 
     #[test]
     fn pipeline_scope_is_permanent_and_inherited_by_forks() {
         let model = fresh_model(4);
         let stores = registry::get(model, 0);
-        let parent_id = stores.kv.lock().unwrap().create_working_set();
-        let child_id = stores.kv.lock().unwrap().fork(parent_id).unwrap();
+        let parent_id = stores.kv.lock().create_working_set();
+        let child_id = stores.kv.lock().fork(parent_id).unwrap();
         let parent = KvWorkingSet::new(model, 0, parent_id, 16);
         let first = crate::store::PipelineScope::new(|| true);
         let second = crate::store::PipelineScope::new(|| true);

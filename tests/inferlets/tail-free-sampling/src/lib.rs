@@ -18,12 +18,12 @@
 //!
 //! ## Why `k_max`
 //!
-//! The same bound as `locally-typical-sampling`. The tier-0 `k_topk_rows`
-//! kernel is an incremental-threshold selection that rescans the row once per
-//! pick, so it costs `O(k · vocab)` and a full sort over a 262144-token
-//! vocabulary stalls the driver. The curvature cut is therefore computed over
-//! the `k_max` most likely tokens — which is where essentially all of the
-//! curvature lives, since the tail is flat by construction.
+//! The same bound as `locally-typical-sampling`: `top_k` is a schedule barrier,
+//! so a ranking costs a region break regardless of `k`. The kernel itself is a
+//! radix select plus a bitonic sort of the survivors, so it is effectively flat
+//! in `k_max`. The curvature cut is computed over the `k_max` most likely
+//! tokens — which is where essentially all of the curvature lives, since the
+//! tail is flat by construction.
 //!
 //! ## Source
 //!

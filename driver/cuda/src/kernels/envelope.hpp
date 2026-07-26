@@ -32,6 +32,18 @@
 
 namespace pie_cuda_driver::kernels {
 
+// Seed every page to the EMPTY envelope (`+inf`, `-inf`). Used once, when the
+// envelopes are allocated alongside a fresh KV pool: no page holds a key yet,
+// so the empty envelope is the exact answer, and every subsequent append
+// refreshes the pages it touched.
+void launch_envelope_seed_empty_f32(
+    float* env_min,
+    float* env_max,
+    int num_pages,
+    int num_kv_heads,
+    int head_dim,
+    cudaStream_t stream);
+
 // Maintenance: reduce each page's live keys to its min/max envelope.
 // `k_pages` is `[num_pages, page_size, num_kv_heads, head_dim]` bf16 (NHD, as
 // `std::uint16_t`); `page_live_lens[p]` is the number of live tokens in page p
@@ -63,6 +75,36 @@ void launch_envelope_dot_f32(
     int head_dim,
     int p_max,
     int live_pages,
+    cudaStream_t stream);
+
+// Maintenance: refresh the envelopes of exactly the pages a fire appended to,
+// deriving that set on-device from the same CSR arithmetic `write_kv_kernel`
+// uses (a request's post-append length is `(pages-1)*page_size +
+// last_page_len`, so its new tokens are the last `qo_len` of that span). The KV
+// write path only ever holds device pointers, which is why the touched set is
+// derived in-kernel rather than passed as an explicit host-built list.
+// Rescanning the whole page list instead would cost a full KV read per layer,
+// i.e. as much as attention itself.
+//
+// `max_touched` is the host's worst-case bound on the number of touched pages,
+// `ceil(total_tokens/page_size) + num_requests`; blocks past the true count exit
+// without writing. Pages are append-only, so recomputing a touched page in full
+// gives the same answer an incremental merge would. Shares its per-(page,
+// kv_head) reduction with `launch_envelope_recompute_bf16`, so the numerics are
+// the ones `test_envelope_dot` parity-checks. NHD layout only.
+void launch_envelope_update_appended_bf16(
+    const std::uint16_t* k_pages,
+    const std::uint32_t* qo_indptr,          // [num_requests + 1]
+    const std::uint32_t* kv_page_indices,    // [kv_page_indptr[num_requests]]
+    const std::uint32_t* kv_page_indptr,     // [num_requests + 1]
+    const std::uint32_t* kv_last_page_lens,  // [num_requests]
+    float* env_min,
+    float* env_max,
+    int num_requests,
+    int max_touched,
+    int page_size,
+    int num_kv_heads,
+    int head_dim,
     cudaStream_t stream);
 
 }  // namespace pie_cuda_driver::kernels

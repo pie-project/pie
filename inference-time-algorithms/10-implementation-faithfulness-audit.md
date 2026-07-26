@@ -802,15 +802,17 @@ a quality issue but a **falsification of the algorithm's headline property**:
 1.6 % of tokens were drawn from the uniform distribution rather than the model's,
 so the watermark was not distortion-free.
 
-**Deployment caveat.** The fix is committed as source plus regenerated contract
-artifacts, verified by the host-side contract tests. The CUDA engine **cannot be
-rebuilt in this environment**: the vendored flashinfer `fastdiv.cuh` requires
-`cuda::fast_mod_div`, which is absent from both installed toolkits (12.9 and
-13.0), so `pie-worker`'s build script fails before reaching any PTIR code. That
-failure predates this change and is unrelated to it. The GPU results reported
-throughout this effort were therefore produced by the **pre-fix** engine — which
-strengthens rather than weakens them, since every inferlet passed its assertions
-*despite* the 1.6 % corruption.
+**Deployment note (superseded).** This section originally recorded that the CUDA
+engine could not be rebuilt here — the vendored flashinfer `fastdiv.cuh` wanted
+`cuda::fast_mod_div`, absent from both installed toolkits — so the numbers below
+came from the **pre-fix** engine. That blocker has since been cleared and the
+engine is now rebuilt and redeployed routinely
+(`cargo build --release -p pie-server-py`, then copy `libpie_engine.so` over
+`sdk/python-server/python/pie/_engine.cpython-312-x86_64-linux-gnu.so`). The
+distributional results below were produced *before* the RNG fix, which
+strengthens rather than weakens them: every inferlet passed its assertions
+despite the 1.6 % corruption. Everything in **"What actually runs"** at the end
+of this document was measured on the post-fix engine.
 
 ---
 
@@ -832,8 +834,11 @@ Every other implementation is algebraically identical to its source.
 
 Every verdict above was re-confirmed end to end on an NVIDIA L40S
 (`Qwen/Qwen3-0.6B`, `cuda_native` driver) after the audit was written, so the
-document describes code that demonstrably runs. **14/14 pass.** Several runs
-double as numerical confirmations of the equations:
+document describes code that demonstrably runs. **14/14 of the algorithm
+inferlets pass**, and the full curated suite — which adds the search,
+speculative, KV-layout and composition inferlets — now stands at **29/29**; see
+**"What actually runs"** below. Several runs double as numerical confirmations
+of the equations:
 
 | # | Reported | Confirms |
 |---|---|---|
@@ -871,9 +876,12 @@ bits, so logit slots 151680–151935 read past the end of the slice.
 `pack_allowed`, which already drops ids it cannot represent — those slots decode
 to no token at all, so refusing them is both the safe answer and the correct
 one. This also repairs the first failure in the upstream
-`json-schema-constrained-decoding` inferlet, which shares the helper; that one
-still fails afterwards, but in the driver's fixed-decode lane composition, a
-separate pre-existing defect in a component this environment cannot rebuild.
+`json-schema-constrained-decoding` inferlet, which shares the helper. That one
+kept failing afterwards for an unrelated reason, since diagnosed and fixed: its
+decode loop submitted `DEFAULT_RUNAHEAD_DEPTH` fires but supplied only one
+grammar mask, and the run-ahead fires **silently reused a stale mask**, so the
+constraint was not actually enforced on those steps. See
+**"What actually runs"**.
 
 ---
 
@@ -912,11 +920,11 @@ directly comparable; the absolute baseline drifts about ±10 % between sessions.
 | A2 `eta-epsilon-sampling` | 4.31 | 1.31× | Entropy + two elementwise passes |
 | A5 `xtc-sampling` | 4.48 | 1.36× | Threshold scan + Bernoulli gate |
 | A6 `repetition-penalty` | 4.89 | 1.48× | Scatter over the seen-token vector |
+| A3 `tail-free-sampling` | 5.20 | 1.49× | `top_k(k_max=128)` over a 151936 vocab |
+| A1 `locally-typical-sampling` | 5.39 | 1.54× | `top_k(k_max=128)` over a 151936 vocab |
 | A7 `dry-repetition-penalty` | 7.08 | 2.15× | 8-deep n-gram match, unrolled on device |
 | D2 `context-aware-decoding` | 13.12 | 3.98× | **Two forward passes, serialized** |
 | D1 `classifier-free-guidance` | 13.87 | 4.21× | **Two forward passes, serialized** |
-| A3 `tail-free-sampling` | 17.47 | 5.30× | `top_k(k_max=128)` over a 262144 vocab |
-| A1 `locally-typical-sampling` | 17.71 | 5.37× | `top_k(k_max=128)` over a 262144 vocab |
 | A10 `synthid-tournament-sampling` | 33.55 | 10.2× | Nine knockout rounds per token |
 
 Three structural observations fall out of this table.
@@ -926,14 +934,38 @@ and 165 ms for every configuration including the baseline — that is install pl
 prefill, and no inferlet carries a heavy one-time setup. Cost scales with tokens
 generated, so it is predictable and it never surprises a short request.
 
-**The 5× cliff is `top_k`, not the algorithm.** A1 and A3 are the only two
-samplers that need a ranking, and they pay for it identically (17.7 and 17.5
-ms/token) despite computing entirely different statistics. The tier-0
-`k_topk_rows` kernel is an incremental-threshold selection that rescans the row
-once per pick, so it costs `O(k·vocab)` — 33.5 M element visits per token at
-`k_max = 128` and this model's 262144-token vocabulary. `k_max` is therefore a
-performance knob with teeth, and A4's sort-free design is why it sits at 1.15×
-while doing comparable work.
+**The `top_k` cliff was an implementation defect, and it is fixed.** A1 and A3
+originally measured 17.71 and 17.47 ms/token — a 5.3× cliff over the baseline —
+and they paid it *identically* despite computing entirely different statistics,
+which is what identified `top_k` rather than the algorithms as the cause. The
+kernel behind it was an incremental-threshold selection that rescans the whole
+row once per pick, costing `O(k · vocab)`: 19.4 M element visits per token at
+`k_max = 128` and this model's 151936-token vocabulary, executed by a *single*
+256-thread block. Replacing it with a radix select of the cut followed by a
+bitonic sort of the `k` survivors — `O(8·vocab + k·log²k)` — brings A1 to 5.39
+and A3 to 5.20 ms/token, and makes the cost **flat in `k`**:
+
+| `k_max` | before | after |
+| --- | --- | --- |
+| 8 | 5.92 | 5.64 |
+| 128 | 17.75 | 5.39 |
+| 1024 | 116.18 | 5.67 |
+
+The residual ~1.5× over the baseline is the barrier structure (`top_k` and
+`cum_sum` are hard schedule barriers), which is a real property of the language.
+The 5.3× was not.
+
+**Four copies of `top_k` is the story worth keeping.** The first fix targeted
+tier-0's `k_topk_rows` and moved the benchmark **not at all**, because `top_k`
+is an `L::Library` op: the fused runtime dispatches it to `k_grouped_topk` in
+`grouped_runtime.cuh`, and tier-0's copy only serves the standalone path. There
+were four independent implementations of the same total order — tier-0, grouped,
+the generated fused emitter, and the M1 singleton — and optimising the one named
+after the op was not optimising the one that runs. The fix now routes tier-0 and
+the grouped runtime through a single shared `t0_block_topk_fast` template
+parameterised on a value accessor, so the total order has one definition rather
+than four. *A benchmark that does not move after a fix is evidence about
+dispatch, not evidence that the fix was wrong.*
 
 **D1/D2's 4× is two effects, not one.** Both score every token under two
 prompts, which is 2× the forward-pass work by construction. The other 2× is lost
@@ -968,14 +1000,340 @@ practical counterpart of its distortion-freeness.
 
 ### A10 is bimodal
 
-`synthid-tournament-sampling` at a 160-token budget returned 1.50, 1.55 and
-6.19 s across sessions — two clearly separated modes, roughly 4× apart, with no
-input difference. The 33.55 ms/token above is the median of seven consecutive
-runs in the slow mode and should be read as an upper bound. The fast mode's
-slope is ≈2.4 ms/token. Nine sequential knockout rounds make this the deepest
-epilogue in the set, and the split most likely reflects a driver-side scheduling
-or pool interaction rather than the algorithm; the engine cannot be rebuilt in
-this environment, so the cause was not chased further.
+`synthid-tournament-sampling` at a 160-token budget returns either ~1.3 s or
+~5–6 s. The 33.55 ms/token above is a slow-mode figure and should be read as an
+upper bound; the fast mode's slope is ≈2.4 ms/token, which is the honest cost.
+
+The split was originally recorded as varying *across sessions*. It does not: a
+run of six consecutive calls inside one process alternates between the modes
+(6225, 1294, 5874, 5599, 4982, 1383 ms). The apparent session-stability was the
+NVRTC disk cache — a first-ever plan shape pays a 12–31 s compile, which
+dominated whatever came after it.
+
+What the split is not:
+
+- **Not a correctness problem.** The response is bit-identical in both modes —
+  same text, `mean_score = 0.5764`, `z_score = 3.1754`, `unique_contexts = 48`.
+- **Not device contention.** The GPU sits at ~25 % mean utilisation in *both*
+  modes at full SM clock, with no other process resident on it. A10 is
+  host-bound.
+- **Not run-ahead depth.** Run-ahead of 2, 4, 6, 8 and 12 are all bimodal.
+  Read-back ring capacity beyond the run-ahead window shifts the fast/slow ratio
+  slightly and fixes nothing.
+- **Not compiler nondeterminism.** `compiler.rs` contains no hash-ordered
+  iteration, and the emitted plan hashes to the same cache key every time.
+
+What it is: **a sharp knee in program size.** The identical inferlet at
+`depth = 1` and `depth = 3` is stable to ±3 % once warm (780–864 ms across six
+calls). Only the production `depth = 9` is bimodal. A10 is also the only
+inferlet in the set that reads back three channels per token instead of one. The
+working hypothesis is that at depth 9 its per-fire host cost reaches parity with
+its device time and it sits balanced on the pipelining knee — but a deeper
+run-ahead window does not rescue it, so that account is not yet complete.
+
+### The undocumented 30-second first call
+
+Fused regions are NVRTC-compiled on first use and cached on disk under
+`~/.cache/pie/ptir-cuda` — 537 modules, 176 MB, on the machine these numbers
+were taken on. A hit is invisible; a miss is a 12–31 s stall inside what looks
+like an ordinary request. Two consequences worth stating plainly:
+
+1. Every benchmark in this document is a **warm** number. The first call against
+   any new plan is one to two orders of magnitude slower.
+2. The cache key covers the plan bytes, so any shape change mints a new entry —
+   including a changed channel capacity or a changed `depth`, which an author
+   would reasonably regard as tuning rather than as a recompile.
+
+---
+
+## What actually runs
+
+Faithfulness on paper and faithfulness on a GPU are different claims. This
+section records the second one, measured with **one engine process per test**
+(`tests/inferlets/test_curated.py` boots a single engine for the whole suite, so
+one wedged inferlet poisons every test after it — the isolated runner is the
+only honest instrument).
+
+**Curated isolated matrix: 29/29.** Qwen3-0.6B, `cuda_native`, NVIDIA L40S.
+Before this pass it was 21/30 with nine failures in five classes, every one of
+which turned out to be a real defect rather than a test artefact.
+
+### Four engine and driver defects
+
+1. **The ABI validator rejected the geometry class it was supposed to admit.**
+   `abi_validation.hpp:255` bounded `geometry_class` at `DECODE_ENVELOPE`, so
+   every `DeviceGeometry` bind returned `INVALID_ARGUMENT` from the entry
+   wrapper — before `Context::Impl::bind_instance`, the only place that prints
+   the error. It presented as a silent `status -1`.
+2. **The engine only recognised one spelling of device geometry.** Classification
+   matched Design-A's 2-D `[B, P]` pages channel; every real inferlet uses a flat
+   `[B*P]` one, so they all fell back to `Host`, which cannot derive a
+   device-sampled token. `detect_pooled_device_geometry` now mirrors the driver's
+   `is_loop_carried_explicit_geometry_trace` contract instead.
+3. **The W1.6 commit gate read uninitialised device memory on a first fire.**
+   `prepare_step` resolves descriptors against the *previous* fire's commit cell;
+   a first-ever ring index has no predecessor and held raw `cudaMalloc` bytes.
+   Commit snapshots are now seeded `{1, 0}` at allocation **and on recycle**.
+4. **Prepare-time descriptor resolution raced its own bind-time seed upload.**
+   It never took the `init_done_` edge that `begin_enqueue` takes (RV-28).
+
+All four presented as the same opaque message, `ptir prologue or channel
+readiness did not commit`. Two env-gated diagnostics
+(`PIE_DEBUG_PULL_VALIDATE=1`, printing pull-validate ticket rejections and
+stage-readiness rejections with a reason) were added because without them the
+four are indistinguishable.
+
+### A GPU hang in the generated sampler path
+
+`consensus-decoding` pegged the GPU at 100 % with a launch that never settled.
+The cause is worth stating plainly, because it is a **correctness cliff hiding
+behind a fusion optimisation**.
+
+`pivot_threshold(probs, cummass_le(p))` — the top-p / nucleus truncation every
+sampler in this document depends on — only ever worked when the *entire*
+surrounding dataflow matched `LibraryOp::NucleusSample`
+(`interface/ptir/src/compiler.rs:1305`). That recognizer is an exact-shape match
+over softmax spelled as `exp(sub(l, max))/sum`, then `pivot_threshold`, then
+`select` against a `−∞` constant, then `add(gumbel)`, then `reduce_argmax`. One
+`broadcast` spliced between the mask and the argmax is enough to break it.
+
+When it broke, the compiler emitted the generated region — and the generated
+emitter deliberately routed `cummass_le` to the M1 reference, because its own
+parallel arm assumed a pre-sorted row (which the DSL never produces). The M1
+reference is a selection sort with a linear "already picked" rescan per
+candidate, executed by **thread 0 alone**: O(len³) at a 151936-token vocabulary.
+It never returns.
+
+Every other inferlet in the suite matched the library pattern by accident, so
+the path had no coverage at all. It now runs the block-cooperative selection
+loop that tier0's `k_pivot_cummassle` already used — one block-wide "next
+largest still-unpicked element" pick per iteration, carrying the previous pick
+as a total-order threshold, stopping as soon as the exclusive mass clears the
+cutoff. `sampling-primitives` pins it with a keep-mask published in a shape that
+*cannot* match the library pattern, asserting the exact `Predicate::CummassLe`
+contract without depending on float summation order: 37 tokens, 0.901134 mass at
+`top_p = 0.9`, in 0.2 s.
+
+Its sibling predicate had the same disease one order milder. `rank_le` — the
+top-k truncation `mirostat-v2-sampling` uses — was spelled as a literal rank
+computation in all three implementations (tier-0's `k_pivot_rankle`, the
+generated fused emitter, and the M1 singleton reference): for each element,
+rescan the row and count the strictly-greater values. That is O(len²)
+unconditionally, ~2.3e10 element visits per row per token at this vocabulary,
+and the single-threaded singleton copy was effectively another hang.
+
+All three now run a 4-pass 8-bit MSB radix select over a monotone key
+```
+key(v) = ~( (u & 0x80000000) ? ~u : (u | 0x80000000) )    where u = bits(v)
+```
+which reverses value order (larger float ⇒ smaller key), sends NaN to
+`0xFFFFFFFF` so it sorts last exactly as the tie contract wants, and cannot
+collide with a finite float. `greater(i)` is the count of strictly smaller keys,
+which is monotone in the key, so `greater(i) < k` holds precisely when
+`key(i) <= K_k` for `K_k` the k-th smallest key counting multiplicity — ties
+therefore all survive or all fall together, which is what the reference does and
+is why it can legitimately keep more than `k` elements. The cost is O(5·len)
+regardless of `k`. Measured at the 151936-token width: **0.48 ms**, against an
+O(len²) form that would need ~30000× more element visits. Two tier-0 tests pin
+it — a randomised parity case covering ties, both signed zeros, NaN and `k` at
+both clamp bounds, and a production-width case checked against an O(len)
+`nth_element` cut with a timing gate.
+
+The general shape is the same as the nucleus hang and worth naming: **a
+predicate whose reference spelling is quadratic will pass every small-fixture
+test and fail only at production width**, which is the one width the unit tests
+did not use.
+
+### Four inferlet authoring contracts, discovered the hard way
+
+All of these fail **silently** — no error, no exception, just a wrong or empty
+result — which is why they cost the most debugging time.
+
+- **Loop-carried geometry ports must `take()` before they `put()`.** Under
+  `Host` and `DecodeEnvelope` the host drains the geometry channel and frees the
+  ring; under `DeviceGeometry` it does not. `k_stage_readiness` treats a put into
+  a full ring as *not ready*, which clears `pass_commit` and turns the fire into
+  a **dummy run**. Four inferlets were affected.
+- **Every host-`Writer` channel a fire takes must be `put` before that fire's
+  `submit`.** Three inferlets submitted `DEFAULT_RUNAHEAD_DEPTH` fires while
+  supplying a single value.
+- **The KV page CSR is the wire's source of truth for `kv_len`, not the `KvLen`
+  port.** Six inferlets over-declared it and read uninitialised KV. This one gets
+  its own section below, because it is the most serious defect this project
+  found and the test suite was structurally incapable of catching it.
+- **Logits entering a `NucleusSample` must come from the logits intrinsic behind
+  at most a `reshape`.** One inferlet (`consensus-decoding`) fed the sampler a
+  `broadcast`; the compiler matched the pattern anyway and the driver's scratch
+  elision corrupted the sampler's own input. Also below.
+
+### Three algorithms are structurally depth-1
+
+`greenlist-watermarking`, `json-schema-constrained-decoding` and
+`contrastive-decoding` derive the host input each fire needs — the greenlist
+mask, the grammar mask, the amateur token — from the **previous fire's output
+token**. There is no run-ahead to be had; the pipelining those loops appeared to
+express was fictitious. The JSON-schema case was the damaging one: its
+run-ahead fires reused a stale grammar mask, so the constraint silently was not
+enforced on those steps. All three now submit one fire at a time, which is the
+honest shape and costs the run-ahead overlap the earlier ms/token tables assumed.
+
+### The beam identity, finally measurable
+
+`beam-search` at width 1 had never run: `intrinsics::logits()` squeezes to
+rank-1 `[v]` when a fire has a single read-out row, so the `[B, 1]`-broadcast
+score column could not meet it and the epilogue failed to bind.
+
+With that fixed, the epilogue publishes a per-lane `reduce_argmax` over the raw
+logits beside the beam pick. At width 1 the two must agree on every step: top-1
+over the flattened `[1*v]` candidate block is `argmax(log_softmax(l) + score)`,
+and both `log_softmax` and adding a per-row constant are monotone. The
+comparison therefore tests `log_softmax`, the score accumulator, the `[B*v]`
+flatten, `top_k` and the `idx / v` / `idx % v` decomposition against an operator
+that shares none of that machinery.
+
+| width | greedy mismatches (16 steps) | best score |
+|---|---|---|
+| 1 | **0** | −19.7988 |
+| 2 | 17 | −19.7520 |
+| 4 | 46 | −13.6841 |
+
+The identity holds exactly at width 1, and the search demonstrably leaves the
+greedy path — and improves the score — as the width grows. Width alone would not
+have shown the first; the identity alone would not have shown the second.
+
+### The defect the test suite could not see
+
+`cuda_chat_completion_e2e` asserts that a continuation of "The capital of France
+is" contains "Paris". It had been `#[ignore]`d. When it was finally run, the
+inferlet returned:
+
+```
+" worellerllerllerllerller..."
+```
+
+The engine was not at fault. Under the same engine, `naive-baseline` returned
+`" Paris, and it's a country in eastern Europe"` and `text-completion-bench`
+returned `"<think>\nOkay, the user is asking about the capital of France. I
+know"`. Bisecting on token count localised it precisely: `max_tokens = 1`
+produced the *correct* first token, `max_tokens = 4` produced garbage. Prefill
+was fine; the **decode loop** was broken.
+
+Instrumenting the inferlet with host-readable debug channels showed every input
+was correct — `pos = 28, 29, 30 ...`, `kv_len = 29, 30, 31 ...`, a dense mask of
+exactly the right width with exactly the right maximum. Correct inputs, wrong
+output.
+
+The mechanism is in the driver. `derive_kv_len_kernel`
+(`driver/cuda/src/kernels/geometry.cu:14`) reconstructs the attended span from
+the page CSR:
+
+```
+kv_len[r] = (page_count - 1) * page_size + last_page_len[r]
+page_count = kv_page_indptr[r + 1] - kv_page_indptr[r]
+```
+
+and `last_page_len` is the *only* thing that survives of the `KvLen` port
+(`descriptor_resolve.hpp:15`: `last_page_len = ((len - 1) % page) + 1`). The
+kernel comment states this is bit-identical to the host formula in
+`request.rs::append_request_with_options` — it is a deliberate handshake
+invariant, and it means the CSR wins.
+
+`chat-completion` declared `page_indptr = [0, pool_pages] = [0, 3]` — "these are
+the pages I reserved" — with `kv_len = 29`. The driver derived
+`last_page_len = 13` and a span of `2 * 16 + 13 = 45`. Attention read **16 cells
+of uninitialised KV** on every decode step. Correcting the CSR to track the true
+length made the token stream match `text-completion-bench` exactly.
+
+An audit of every `page_indptr` binding found six inferlets with the same defect:
+`chat-completion`, `attention-sink`, `sliding-window-attention`,
+`contrastive-decoding` (amateur pass only), `consensus-decoding` and
+`beam-search`. Roughly twenty others already used the correct idiom
+(`page_count = ceil(kv_len / page_size)`), which is why the failure looked
+sporadic rather than systemic. For multi-lane fires the `pages` array must
+additionally be tiled at stride *page_count*, not pool size, because
+`page_indptr[c] = c * page_count` indexes into it; since channel shapes are
+static the fix is to keep the pool-sized capacity and rebuild the contents with
+`gather(&pids, rem(iota(N), broadcast(&page_count, [N])))`.
+
+Two things about this are worth more than the fix itself.
+
+**The mask does not save you.** `pack_dense_mask.cu` packs the dense
+`[TOTAL_Q, STRIDE]` mask page-major over each lane's live pages, and the `klen`
+it uses is the *derived physical* span. A perfectly-sized mask is laid out
+against the wrong geometry, so it cannot suppress what the geometry invented.
+
+**The suite was built to miss this.** `test_curated.py`'s `_nonempty` asserts
+the output is non-empty. Six inferlets produced fluent-looking garbage and passed
+for the entire project. Even `test_beam_search_greedy_identity` could not catch
+it: it compares the beam pick against `reduce_argmax` of *the same corrupt
+logits*, so it validates the beam machinery while being blind to model quality.
+A liveness assertion cannot detect a corruption that preserves liveness. The
+suite now carries `_attends_prompt`, which runs the fixed prompt "The capital of
+France is" and requires the continuation to mention France or Paris — a
+content assertion, cheap, and the pre-fix binaries fail it.
+
+### A second silent corruption: the nucleus fast path's unstated precondition
+
+Fixing the page CSR left `consensus-decoding` with one residual symptom: every
+candidate's **first** token was junk (`"cumplir"`, `"!user"`, `"!human"`) even
+though the rest of the continuation was fluent and on-topic. The prefill and the
+decode loop use the same sampler expression, so the difference had to be
+geometric — and it was.
+
+`consensus-decoding` prefills the shared prompt once. That fire has **one**
+read-out row, so `intrinsics::logits()` is `[1, vocab]`. To give `B` candidates
+independent starting tokens the inferlet broadcast that row to `[B, vocab]`,
+applied the shared nucleus keep-mask, and added `B` independent Gumbel draws.
+This is textbook — it is exactly how you sample `B` times from one distribution —
+and every layer accepted it.
+
+The mechanism, established by bisection:
+
+1. The compiler's `match_nucleus_add_order`
+   (`interface/ptir/src/compiler.rs:1393`) matches a 13-node DAG **structurally**.
+   It never asks where the logits came from, so the broadcast form matches.
+2. The driver's nucleus prep
+   (`driver/cuda/src/pipeline/generated/fused_runtime.cuh`, ~L1007) then applies
+   an optimisation that is only sound for the intrinsic: it sets
+   `maximum_value_bytes[region.inputs[0]] = 4` and `temporary_elided[...] = 1`,
+   because the real logits live in the model's own buffer and the sampler reads
+   them directly. It applied the same elision to the scale-divide's numerator.
+3. Per-lane scratch offsets are assigned from `maximum_value_bytes` with **no
+   liveness reuse**, so a value whose slot was shrunk to 4 bytes sits immediately
+   adjacent to live neighbours.
+4. The `broadcast` is not elided-away — it still executes, and writes a full
+   `[B, vocab]` tensor into that 4-byte slot.
+5. `k_grouped_nucleus_*` (the three-kernel fast path taken because
+   `vocab > kMaxExactNucleusLibraryVocab = 4096`) additionally early-returned on
+   `row >= lanes[lane].sampled_rows`, leaving rows `1..B` of a broadcast fire
+   never written at all.
+
+The debugging lever worth recording: `wide`, the pre-divide value, is the one
+intermediate the pattern does **not** exact-consumer-check. Tapping it to a host
+channel therefore preserves the match, whereas tapping any other intermediate
+breaks the match and silently *fixes* the output by falling back to the generated
+path. "Adding a probe makes the bug disappear" was itself the diagnosis.
+
+Three driver narrowings landed — bound `sampled_rows` only for direct bf16 lane
+reads, gate both elisions on the input actually resolving to the logits
+intrinsic, and only absorb the scale-divide when the region is the single node
+the launch-time skip expects. They make the runtime conservative in exactly the
+cases the optimisation was not written for. They do **not** make the broadcast
+form correct: the compiler still claims a pattern whose precondition it does not
+verify, and closing that in the matcher destabilised six unrelated compiler
+fixtures. So the fix that shipped is at the inferlet: the prefill now nucleus-
+samples its single `[1, vocab]` row and all `B` lanes start from that token, with
+divergence coming from the decode loop, whose logits genuinely are `[B, vocab]`.
+Sampling diversity was then verified directly — at `temperature = 1.2` the three
+candidates diverge by the second sentence; at `0.6` they are identical because
+the keep-set is a single token, which is the distribution's fault and not the
+sampler's. `temperature` and `top_p` are now inferlet parameters rather than
+constants, so that distinction is testable rather than assumed.
+
+The general lesson generalises past this bug: **a fast path chosen by pattern
+match must validate every assumption it makes beyond the pattern.** The author's
+contract is the pattern; anything else the runtime relies on is a precondition
+nobody agreed to.
 
 ---
 

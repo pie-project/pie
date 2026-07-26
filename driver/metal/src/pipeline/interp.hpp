@@ -331,7 +331,8 @@ inline void classify_exec_plan(ExecPlan& out) {
                     out.executable = false;
                     out.reject_reason =
                         "program reads an unsupported model intrinsic "
-                        "(hidden/query/value-head/layer; Metal forward not wired)";
+                        "(hidden/query/value-head/layer/attn-score; Metal forward "
+                        "not wired)";
                     break;
             }
         } else if (v.source == cptir::ValueSource::HostInput) {

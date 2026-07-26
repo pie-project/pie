@@ -98,11 +98,13 @@ enum class Intrinsic : std::uint8_t {
     ValueHead = PTIR_INTR_VALUE_HEAD,
     Layer = PTIR_INTR_LAYER,
     MtpDrafts = PTIR_INTR_MTP_DRAFTS,
+    AttnScore = PTIR_INTR_ATTN_SCORE,
 };
 static_assert(static_cast<std::uint8_t>(Intrinsic::Query) == PTIR_INTR_QUERY);
 static_assert(static_cast<std::uint8_t>(Intrinsic::ValueHead) == PTIR_INTR_VALUE_HEAD);
 static_assert(static_cast<std::uint8_t>(Intrinsic::Layer) == PTIR_INTR_LAYER);
 static_assert(static_cast<std::uint8_t>(Intrinsic::MtpDrafts) == PTIR_INTR_MTP_DRAFTS);
+static_assert(static_cast<std::uint8_t>(Intrinsic::AttnScore) == PTIR_INTR_ATTN_SCORE);
 
 enum class HostAvailability : std::uint8_t { SubmitBound = 0, LateBound = 1 };
 
@@ -243,6 +245,9 @@ inline bool port_consumes(std::uint8_t port) {
 struct Trace {
     std::vector<Value>       values;    // SSA value table (indexed by ValueId)
     std::vector<Channel>     channels;
+    // Container-wide name table for second-party kernels and sinks. An
+    // `OpCode::KernelCall` carries its index here in `Op::imm`.
+    std::vector<std::string> names;
     std::vector<PortBinding> ports;     // descriptor-port channel bindings
     std::vector<Stage>       stages;    // in attachment order
 

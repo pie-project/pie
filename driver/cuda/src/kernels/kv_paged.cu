@@ -5,6 +5,7 @@
 #include <stdexcept>
 
 #include "cuda_check.hpp"
+#include "kernels/envelope.hpp"
 
 namespace pie_cuda_driver::kernels {
 
@@ -686,6 +687,18 @@ void launch_write_kv_to_pages(
             qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
             total_tokens, num_requests, page_size, num_kv_heads, head_dim,
             layer.hnd_layout, stream, row_valid);
+        // Quest maintenance rides the append: the pages this fire just grew are
+        // exactly the ones whose envelopes went stale, and the same stream
+        // orders the refresh after the write. Opt-in -- `has_envelopes()` is
+        // false unless a program declared it needs them.
+        if (layer.has_envelopes() && !layer.hnd_layout && total_tokens > 0) {
+            launch_envelope_update_appended_bf16(
+                static_cast<const std::uint16_t*>(layer.k_pages),
+                qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                layer.k_env_min, layer.k_env_max, num_requests,
+                (total_tokens + page_size - 1) / page_size + num_requests,
+                page_size, num_kv_heads, head_dim, stream);
+        }
         return;
     }
 

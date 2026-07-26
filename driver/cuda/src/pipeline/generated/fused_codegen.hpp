@@ -12,7 +12,64 @@
 
 namespace pie_cuda_driver::pipeline::generated {
 
-inline constexpr std::uint16_t kCudaGeneratedEmitterVersion = 18;
+// The only second-party kernel this backend launches. Everything else stays
+// unsupported, so a plan naming an unknown kernel fails loudly at bind instead
+// of reaching a runtime `throw` mid-fire.
+//
+// `envelope_dot` is deliberately NOT type-checked with `same_type(arg, result)`
+// the way `cuda.identity` is: its argument is the query
+// (`[num_q_heads * head_dim]`) and its result is a per-page score (`[P_MAX]`).
+// Those shapes are unrelated by construction, so the only structural claim that
+// holds is arity.
+inline bool second_party_region_supported(
+    const pie_native::ptir::plan::StagePlan& stage,
+    const pie_native::ptir::plan::Region& region) {
+    if (region.nodes.size() != 1) return false;
+    const std::uint32_t node = region.nodes.front();
+    if (node >= stage.ops.size()) return false;
+    const auto& op = stage.ops[node].op;
+    if (op.tag == PTIR_OP_SINK_CALL) {
+        // `attn_page_mask(mask)` -- a configuration sink. One argument, no
+        // result. The mask is a per-page vector over the request's page list,
+        // so the only structural claim that holds is rank 1; its extent is the
+        // program's own page ceiling, which the runtime checks against the
+        // lane's actual page count.
+        if (op.name_idx >= stage.names.size()) return false;
+        if (stage.names[op.name_idx] != "attn_page_mask") return false;
+        if (op.args.size() != 1 || op.results != 0) return false;
+        if (!region.outputs.empty()) return false;
+        if (region.inputs.size() != 1) return false;
+        const auto& mask_type = stage.value_types[region.inputs.front()];
+        if (mask_type.dims.size() != 1) return false;
+        return stage.stage == PTIR_STAGE_ON_ATTN_PROJ;
+    }
+    if (op.tag != PTIR_OP_KERNEL_CALL) return false;
+    if (op.name_idx >= stage.names.size()) return false;
+    if (stage.names[op.name_idx] != "envelope_dot") return false;
+    if (op.args.size() != 1 || op.results != 1) return false;
+    // The score is a per-page f32 vector. A different rank or dtype means the
+    // program disagrees with the kernel's ABI.
+    if (region.outputs.size() != 1) return false;
+    const auto& result_type = stage.value_types[region.outputs.front()];
+    if (result_type.dtype != PTIR_DT_F32 || result_type.dims.size() != 1) {
+        return false;
+    }
+    return stage.stage == PTIR_STAGE_ON_ATTN_PROJ ||
+           stage.stage == PTIR_STAGE_ON_ATTN;
+}
+
+inline constexpr std::uint16_t kCudaGeneratedEmitterVersion = 19;
+
+// Per-lane stride of the intrinsic side tables (bases / modes / widths /
+// strides / offsets), in slots. Indexed by `IntrinsicId`, so it must be one
+// past the largest id -- an id that overflows this stride does not fault, it
+// silently reads the NEXT lane's slot 0. Both the host packer
+// (`fused_runtime.cuh`) and the emitted device source below index with it, and
+// `module_cache.hpp` keys the disk cache on `kCudaGeneratedEmitterVersion`, so
+// widening it must bump that version or stale cubins keep the old stride.
+inline constexpr std::uint32_t kPtirIntrinsicSlots =
+    static_cast<std::uint32_t>(PTIR_INTR_ATTN_SCORE) + 1u;
+static_assert(kPtirIntrinsicSlots == 8u);
 
 inline bool validate_generated_region(
     const pie_native::ptir::plan::StagePlan& stage,
@@ -839,6 +896,96 @@ __device__ __forceinline__ void ptir_parallel_pivot_cummass(
   }
 }
 
+// rank_le (top-k by rank): keep the elements whose count of strictly-greater
+// values is below `k` (interp.rs `Predicate::RankLe`).
+//
+// This replaces a literal per-element rank pass, which re-scanned the whole row
+// for every element and so cost O(len^2) unconditionally -- ~2.3e10 element
+// visits per row at a 151936-token vocabulary, which is what made
+// `mirostat-v2-sampling` take minutes per request. Instead: a block-cooperative
+// 4-pass 8-bit MSB radix select on `m1_desc_key`, O(5*len) regardless of `k`.
+//
+// Equivalence: `greater(i)` equals the count of strictly smaller keys, which is
+// monotone in the key, so `greater(i) < k` holds exactly when `key(i) <= K_k`
+// for `K_k` the k-th smallest key counting multiplicity. Ties therefore all
+// survive or all fall together, which is what the reference does (it can keep
+// more than `k` elements when the boundary value repeats). NaN keys sort last
+// so they never displace a real element, and the marking pass excludes them.
+__device__ __forceinline__ void ptir_parallel_pivot_rank(
+    const m1_u8* input,
+    const m1_u8* threshold,
+    m1_u8* output,
+    const M1ValueDesc input_desc,
+    const M1ValueDesc threshold_desc) {
+  __shared__ m1_u32 rank_hist[256];
+  __shared__ m1_u32 rank_prefix;
+  __shared__ m1_u32 rank_target;
+  const m1_u32 len = input_desc.last;
+  const m1_u32 rows = input_desc.rows;
+  if (len == 0u) return;
+  for (m1_u32 row = 0u; row < rows; ++row) {
+    const m1_u32 base = row * len;
+    m1_u32 k;
+    if (threshold_desc.dtype == 1u) {
+      const int signed_k = m1_load_i(
+          threshold, m1_pick(threshold_desc.len, row), threshold_desc.dtype);
+      k = signed_k <= 0 ? 0u : (m1_u32)signed_k;
+    } else {
+      k = m1_load_u(
+          threshold, m1_pick(threshold_desc.len, row), threshold_desc.dtype);
+    }
+    if (k > len) k = len;
+    if (k == 0u) {
+      for (m1_u32 i = threadIdx.x; i < len; i += blockDim.x)
+        m1_store_b(output, base + i, false);
+      __syncthreads();
+      continue;
+    }
+    if (threadIdx.x == 0u) {
+      rank_prefix = 0u;
+      rank_target = k;
+    }
+    __syncthreads();
+    for (int pass = 0; pass < 4; ++pass) {
+      const int shift = 24 - 8 * pass;
+      // Bits fixed by earlier passes; `pass == 0` is special-cased because
+      // shifting a 32-bit value by 32 is undefined, not zero.
+      const m1_u32 high_mask =
+          (pass == 0) ? 0u : (0xFFFFFFFFu << (shift + 8));
+      for (m1_u32 bucket = threadIdx.x; bucket < 256u; bucket += blockDim.x)
+        rank_hist[bucket] = 0u;
+      __syncthreads();
+      const m1_u32 prefix = rank_prefix;
+      for (m1_u32 i = threadIdx.x; i < len; i += blockDim.x) {
+        const m1_u32 key =
+            m1_desc_key(m1_load_f(input, base + i, input_desc.dtype));
+        if ((key & high_mask) == (prefix & high_mask))
+          atomicAdd(&rank_hist[(key >> shift) & 0xFFu], 1u);
+      }
+      __syncthreads();
+      if (threadIdx.x == 0u) {
+        const m1_u32 target = rank_target;
+        m1_u32 run = 0u;
+        m1_u32 chosen = 255u;
+        for (m1_u32 bucket = 0u; bucket < 256u; ++bucket) {
+          if (run + rank_hist[bucket] >= target) { chosen = bucket; break; }
+          run += rank_hist[bucket];
+        }
+        rank_target = target - run;
+        rank_prefix = prefix | (chosen << shift);
+      }
+      __syncthreads();
+    }
+    const m1_u32 cutoff_key = rank_prefix;
+    for (m1_u32 i = threadIdx.x; i < len; i += blockDim.x) {
+      const float value = m1_load_f(input, base + i, input_desc.dtype);
+      m1_store_b(output, base + i,
+                 !m1_isnan(value) && m1_desc_key(value) <= cutoff_key);
+    }
+    __syncthreads();
+  }
+}
+
 __device__ __forceinline__ void ptir_parallel_pivot(
     const m1_u8* input,
     const m1_u8* threshold,
@@ -846,48 +993,22 @@ __device__ __forceinline__ void ptir_parallel_pivot(
     const M1ValueDesc input_desc,
     const M1ValueDesc threshold_desc,
     const M1OpParams p) {
+  if (p.pred_tag == 0u) {
+    ptir_parallel_pivot_rank(
+        input, threshold, output, input_desc, threshold_desc);
+    return;
+  }
   for (m1_u32 flat = threadIdx.x;
        flat < input_desc.len;
        flat += blockDim.x) {
     const m1_u32 row =
         input_desc.last == 0u ? 0u : flat / input_desc.last;
-    const m1_u32 base = row * input_desc.last;
     const float value = m1_load_f(input, flat, input_desc.dtype);
-    bool keep = false;
-    if (p.pred_tag == 0u) {
-      m1_u32 k;
-      if (threshold_desc.dtype == 1u) {
-        const int signed_k = m1_load_i(
-            threshold,
-            m1_pick(threshold_desc.len, row),
-            threshold_desc.dtype);
-        k = signed_k <= 0 ? 0u : (m1_u32)signed_k;
-      } else {
-        k = m1_load_u(
-            threshold,
-            m1_pick(threshold_desc.len, row),
-            threshold_desc.dtype);
-      }
-      if (k > input_desc.last) k = input_desc.last;
-      m1_u32 greater = 0;
-      if (!m1_isnan(value)) {
-        for (m1_u32 other_column = 0;
-             other_column < input_desc.last;
-             ++other_column) {
-          const float other = m1_load_f(
-              input, base + other_column, input_desc.dtype);
-          if (!m1_isnan(other) && other > value) ++greater;
-        }
-      }
-      keep = !m1_isnan(value) && greater < k;
-    } else {
-      const float cutoff = m1_load_f(
-          threshold,
-          m1_pick(threshold_desc.len, row),
-          threshold_desc.dtype);
-      keep = value >= cutoff;
-    }
-    m1_store_b(output, flat, keep);
+    const float cutoff = m1_load_f(
+        threshold,
+        m1_pick(threshold_desc.len, row),
+        threshold_desc.dtype);
+    m1_store_b(output, flat, value >= cutoff);
   }
 }
 
@@ -1445,7 +1566,8 @@ extern "C" __global__ void )PTIR_CUDA"
         } else if (op.tag == PTIR_OP_INTRINSIC_VAL) {
             source
                 << "    const m1_u32 intrinsic_index = "
-                   "dispatch_lane * 7u + p.intr;\n"
+                   "dispatch_lane * "
+                << kPtirIntrinsicSlots << "u + p.intr;\n"
                 << "    p.intrinsic_dtype = "
                    "intrinsic_modes[intrinsic_index];\n"
                 << "    p.imm = intrinsic_widths[intrinsic_index];\n"
@@ -1578,7 +1700,8 @@ extern "C" __global__ void )PTIR_CUDA"
                 std::numeric_limits<std::uint16_t>::max()) {
                 source
                     << "    const m1_u32 direct_intrinsic_index = "
-                       "dispatch_lane * 7u + "
+                       "dispatch_lane * "
+                    << kPtirIntrinsicSlots << "u + "
                     << direct_argmax_intrinsic[node] << "u;\n"
                     << "    ptir_fast_argmax_intrinsic(\n"
                     << "        reinterpret_cast<const m1_u8*>("

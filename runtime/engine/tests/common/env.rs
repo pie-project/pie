@@ -55,6 +55,7 @@ fn dummy_driver_backend(
         has_mtp_logits: true,
         has_mtp_drafts: true,
         has_value_head: true,
+        has_attn_score: true,
         callback_delay_ms: 0,
         reject_launches: false,
         reject_launches_remaining: 0,
@@ -112,6 +113,9 @@ impl MockEnv {
                 has_mtp_logits: true,
                 has_mtp_drafts: true,
                 has_value_head: true,
+                has_kv_envelopes: false,
+                has_attn_page_mask: false,
+                has_attn_score: false,
                 device_geometry_port_mask: pie_driver_abi::PIE_DEVICE_GEOMETRY_PORTS,
                 limits: SchedulerLimits {
                     max_forward_requests: 32,
@@ -146,7 +150,6 @@ impl MockEnv {
                 drivers,
                 scheduler: SchedulerConfig {
                     request_timeout_secs: 30,
-                    restore_pause_at_utilization: 0.85,
                 },
             },
             runtime: RuntimeConfig {

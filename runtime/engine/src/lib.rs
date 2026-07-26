@@ -33,6 +33,7 @@ pub mod offload {
         crate::store::registry::unregister_driver(model_idx, driver_idx)
     }
 }
+pub mod planner;
 pub mod scheduler;
 pub mod server;
 pub(crate) mod service;

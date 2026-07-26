@@ -15,11 +15,11 @@
 #include <unordered_map>
 #include <vector>
 
-#include "pie_native/load_plan.hpp"
+#include "pie_loader/plan.hpp"
 #include "loader_config.hpp"
 #include "loader_helpers.hpp"
 #include "tensor.hpp"
-#include "loader/checkpoint_source.hpp"
+#include "pie_loader/checkpoint_source.hpp"
 #include "loader/buffer_resolver.hpp"
 #include "loader/strided_copy.hpp"
 #include "loader/weight_copy_engine.hpp"
@@ -48,14 +48,13 @@
 
 namespace pie_cuda_driver {
 
-namespace lp = pie_load_planner;
-namespace lp_cpp = pie_load_planner::cpp;
+namespace lp = pie_loader;
 
 class TranscodeEngine {
 public:
-    TranscodeEngine(CheckpointSource& loader,
+    TranscodeEngine(pie_loader::CheckpointSource& loader,
                     WeightCopyEngine& copy_engine,
-                    const lp_cpp::LoadPlanIndex& plan_index,
+                    const pie_loader::LoadPlanIndex& plan_index,
                     BufferResolver& resolver)
         : loader_(loader), copy_engine_(copy_engine), plan_index_(plan_index),
           resolver_(resolver) {}
@@ -157,7 +156,7 @@ private:
         auto* dst = static_cast<std::uint8_t*>(out.data()) + dst_offset;
 
         if (instr.has_source) {
-            if (!lp_cpp::compact_extent(instr.source.stride)) {
+            if (!pie_loader::compact_extent(instr.source.stride)) {
                 throw std::runtime_error(
                     "rust storage executor: non-compact Cast source is not "
                     "implemented");
@@ -166,7 +165,7 @@ private:
             DeviceTensor scratch =
                 DeviceTensor::allocate(
                     dtype_from_rust(info.dtype),
-                    lp_cpp::extent_shape(instr.source.stride));
+                    pie_loader::extent_shape(instr.source.stride));
             if (scratch.nbytes() != instr.source.span_bytes) {
                 throw std::runtime_error(
                     "rust storage executor: Cast source byte size mismatch");
@@ -205,7 +204,7 @@ private:
         if (instr.has_source) {
             const auto& info = plan_index_.source(instr.source.tensor_id);
             const DType source_dtype = dtype_from_rust(info.dtype);
-            const bool compact = lp_cpp::compact_extent(instr.source.stride);
+            const bool compact = pie_loader::compact_extent(instr.source.stride);
 #if PIE_CUDA_TRANSCODE_ENGINE_HAS_CUDA
             // Reuse a persistent device tile buffer for compact sources — the
             // encode/dequant kernel consumes it then we move on, so per-tile
@@ -241,7 +240,7 @@ private:
                         "sources is not implemented");
                 }
                 copy_strided_extent_to_device(
-                    loader_, instr, source.data(), full_shape);
+                    loader_, instr, source.data(), source.nbytes());
             } else {
                 const std::uint64_t elem = dtype_bytes(source_dtype);
                 const std::uint64_t row_bytes =
@@ -399,7 +398,7 @@ private:
         }
         const auto& weight_info = plan_index_.source(instr.source.tensor_id);
         const std::string weight_name =
-            lp_cpp::bytes_to_string(weight_info.name);
+            pie_loader::bytes_to_string(weight_info.name);
         const std::string scale_name = weight_name + "_scale_inv";
         const auto* scale_info = plan_index_.find_source(scale_name);
         if (scale_info == nullptr) {
@@ -408,7 +407,7 @@ private:
                 "' has no '_scale_inv' sibling tensor");
         }
         const auto scale_shape =
-            lp_cpp::i64_slice_to_vector(scale_info->shape);
+            pie_loader::i64_slice_to_vector(scale_info->shape);
         if (scale_shape.size() != 2) {
             throw std::runtime_error(
                 "rust storage executor: FP8 Encode scale '" + scale_name +
@@ -418,7 +417,7 @@ private:
         // can compute the true group_size. The tile's `full_shape` may be
         // TP-sharded and not match the on-disk scale dimensions.
         const auto weight_shape =
-            lp_cpp::i64_slice_to_vector(weight_info.shape);
+            pie_loader::i64_slice_to_vector(weight_info.shape);
         if (weight_shape.size() != 2) {
             throw std::runtime_error(
                 "rust storage executor: FP8 Encode weight '" + weight_name +
@@ -572,57 +571,21 @@ private:
     }
 #endif
 
-    DType encode_source_dtype(
-        const lp::PieLoaderStorageInstrView& instr)
-    {
-        if (instr.has_source) {
-            return dtype_from_rust(
-                plan_index_.source(instr.source.tensor_id).dtype);
-        }
-        if (instr.input_buffers.len != 1) {
-            throw std::runtime_error(
-                "rust storage executor: Encode expects source or one input");
-        }
-        return resolver_.or_finalized(instr.input_buffers.ptr[0]).dtype();
-    }
-
-    bool can_tile_encode(
-        const lp::PieLoaderStorageInstrView& instr) const
-    {
-        return !instr.has_source || lp_cpp::compact_extent(instr.source.stride);
-    }
-
-    int encode_rows_per_tile(
+    // How many rows to transform per launch. The loader decided this in
+    // `backend::cuda` (loader/architecture.md §8.1) after weighing the source
+    // dtype, the extent's stride and the tile budget; 0 means "the whole tensor
+    // in one pass", which is both the untileable case and the case where one
+    // tile already covers everything. Clamped against `rows` so a malformed plan
+    // cannot turn the loop below into a spin.
+    static int encode_rows_per_tile(
         const lp::PieLoaderStorageInstrView& instr,
-        DType source_dtype,
-        int rows,
-        int cols) const
+        int rows)
     {
-        // FP8 Encode source needs a [rows/128, cols/128] block scale; tiling
-        // the dequant by an arbitrary row count would slice through the 128
-        // row block boundary. Disable tiling on FP8 sources — GLM-5.1 expert
-        // weights at [2048, 6144] fit comfortably (~50MB BF16 scratch).
-        if (source_dtype == DType::FP8_E4M3 ||
-            source_dtype == DType::FP8_E5M2) {
+        if (instr.rows_per_tile == 0) {
             return rows;
         }
-        const std::uint64_t max_tile_bytes =
-            instr.max_tile_bytes == 0 ? loader_config::kFallbackTileBytes : instr.max_tile_bytes;
-        const std::uint64_t source_row_bytes =
-            static_cast<std::uint64_t>(cols) * dtype_bytes(source_dtype);
-        const std::uint64_t bf16_row_bytes =
-            static_cast<std::uint64_t>(cols) * dtype_bytes(DType::BF16);
-        const std::uint64_t scratch_per_row =
-            source_dtype == DType::BF16
-                ? bf16_row_bytes
-                : source_row_bytes + bf16_row_bytes;
-        const std::uint64_t rows_per_tile = std::max<std::uint64_t>(
-            1,
-            max_tile_bytes / std::max<std::uint64_t>(1, scratch_per_row));
-        return static_cast<int>(
-            std::min<std::uint64_t>(
-                static_cast<std::uint64_t>(rows),
-                rows_per_tile));
+        return static_cast<int>(std::min<std::uint64_t>(
+            instr.rows_per_tile, static_cast<std::uint64_t>(rows)));
     }
 
     void launch_encode_tile(
@@ -721,11 +684,6 @@ private:
 #endif
     }
 
-    bool fused_transcode_enabled() const
-    {
-        return !loader_config::env_truthy("PIE_CUDA_DISABLE_FUSED_TRANSCODE");
-    }
-
     // Fused FP8->MXFP4 for one Encode tile: acquire the FP8 source tile and
     // transcode it straight into the MXFP4 packed/scale outputs at this tile's
     // row offset (same offsets as launch_encode_tile's MXFP4 case).
@@ -780,7 +738,7 @@ private:
             const auto& buf = plan_index_.buffer(instr.output_buffers.ptr[0]);
             if (buf.has_tensor) {
                 const auto& t = plan_index_.tensor(buf.tensor_id);
-                shape = lp_cpp::i64_slice_to_vector(t.shape);
+                shape = pie_loader::i64_slice_to_vector(t.shape);
             }
         }
         if (shape.size() != 2) {
@@ -798,7 +756,7 @@ private:
             const auto& sbuf = plan_index_.buffer(instr.output_buffers.ptr[1]);
             if (sbuf.has_tensor) {
                 const auto& st = plan_index_.tensor(sbuf.tensor_id);
-                scale_shape = lp_cpp::i64_slice_to_vector(st.shape);
+                scale_shape = pie_loader::i64_slice_to_vector(st.shape);
             }
             const std::vector<std::int64_t> want{shape[0], shape[1] / loader_config::kMxfp4Group};
             if (scale_shape != want) {
@@ -824,42 +782,26 @@ private:
                 resolver_.or_finalized(instr.input_buffers.ptr[0]).nbytes();
         }
 
-        // Fuse FP8 -> MXFP4 directly when possible, skipping the BF16 HBM
-        // round-trip. Bit-identical to the two-step (kernel parity-tested);
-        // opt out with PIE_CUDA_DISABLE_FUSED_TRANSCODE.
+        // Fusing FP8 -> MXFP4 skips the BF16 HBM round-trip and is bit-identical
+        // to the two-step path (kernel parity-tested). Whether to do it is the
+        // loader's call, not this executor's, so that the plan — and therefore
+        // the artifact cache key — records which kernel sequence ran.
         const bool fuse_fp8_mxfp4 =
-            fused_transcode_enabled()
-            && instr.transform_to ==
-                   lp::PieLoaderQuantScheme::Mxfp4E2M1E8M0
-            && instr.has_source
-            && encode_source_dtype(instr) == DType::FP8_E4M3;
+            instr.transform_fusion == lp::PieLoaderTransformFusion::Fp8ToMxfp4;
 
-        if (can_tile_encode(instr)) {
-            const DType source_dtype = encode_source_dtype(instr);
-            const int rows_per_tile =
-                encode_rows_per_tile(instr, source_dtype, rows, cols);
-            for (int row = 0; row < rows; row += rows_per_tile) {
-                const int tile_rows = std::min(rows_per_tile, rows - row);
-                if (fuse_fp8_mxfp4) {
-                    launch_fused_mxfp4_tile(
-                        instr, out, scale, shape, row, tile_rows, cols);
-                } else {
-                    DeviceTensor bf16_tile =
-                        materialize_encode_input_bf16_rows(
-                            instr, shape, row, tile_rows);
-                    launch_encode_tile(
-                        instr, bf16_tile, out, scale, row, tile_rows, cols);
-                }
+        const int rows_per_tile = encode_rows_per_tile(instr, rows);
+        for (int row = 0; row < rows; row += rows_per_tile) {
+            const int tile_rows = std::min(rows_per_tile, rows - row);
+            if (fuse_fp8_mxfp4) {
+                launch_fused_mxfp4_tile(
+                    instr, out, scale, shape, row, tile_rows, cols);
+            } else {
+                DeviceTensor bf16_tile =
+                    materialize_encode_input_bf16_rows(
+                        instr, shape, row, tile_rows);
+                launch_encode_tile(
+                    instr, bf16_tile, out, scale, row, tile_rows, cols);
             }
-            return;
-        }
-
-        if (fuse_fp8_mxfp4) {
-            launch_fused_mxfp4_tile(instr, out, scale, shape, 0, rows, cols);
-        } else {
-            DeviceTensor bf16 =
-                materialize_encode_input_bf16_rows(instr, shape, 0, rows);
-            launch_encode_tile(instr, bf16, out, scale, 0, rows, cols);
         }
     }
 
@@ -887,11 +829,11 @@ private:
             DeviceTensor scratch = DeviceTensor::allocate(
                 DType::UINT8,
                 {static_cast<std::int64_t>(instr.source.span_bytes)});
-            if (!lp_cpp::compact_extent(instr.source.stride)) {
+            if (!pie_loader::compact_extent(instr.source.stride)) {
                 copy_strided_extent_to_device(
                     loader_, instr,
                     scratch.data(),
-                    lp_cpp::extent_shape(instr.source.stride));
+                    scratch.nbytes());
             } else {
                 copy_engine_.queue(
                     instr.source.file_id,
@@ -1116,7 +1058,7 @@ private:
         const auto dst_offset =
             instr.has_dest ? instr.dest.offset + instr.dest.stride.base_offset : 0;
         const auto bytes = instr.has_dest
-            ? lp_cpp::extent_bytes(
+            ? pie_loader::extent_bytes(
                   instr.dest.stride,
                   "rust storage executor")
             : static_cast<std::uint64_t>(input.nbytes());
@@ -1140,9 +1082,9 @@ private:
     }
 
 
-    CheckpointSource& loader_;
+    pie_loader::CheckpointSource& loader_;
     WeightCopyEngine& copy_engine_;
-    const lp_cpp::LoadPlanIndex& plan_index_;
+    const pie_loader::LoadPlanIndex& plan_index_;
     BufferResolver& resolver_;
     void* fp8_bf16_scratch_ptr_ = nullptr;
     std::size_t fp8_bf16_scratch_bytes_ = 0;

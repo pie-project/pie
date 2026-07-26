@@ -14,6 +14,7 @@
 #include "distributed.hpp"
 #include "ops/gemm.hpp"
 #include "loader/load_plan_bridge.hpp"
+#include "loader/model_contracts.hpp"
 #include "loader/load_plan_executor.hpp"
 #include "model/weight_artifact_cache.hpp"
 #include "tensor.hpp"
@@ -21,39 +22,6 @@
 namespace pie_cuda_driver {
 
 namespace {
-
-// llama-like and assumes the standard name layout — gemma/mixtral/MoE need
-// their own plan (per-expert weights, dual-norm, etc.).
-bool supports_tp(const std::string& mt) {
-    return mt == "qwen3"
-        || mt == "qwen2"
-        || mt == "llama" || mt == "llama3"
-        || mt == "mistral" || mt == "mistral3" || mt == "ministral3"
-        || mt == "phi3"
-        || mt == "olmo2" || mt == "olmo3"
-        || mt == "gemma2"
-        || mt == "gemma3" || mt == "gemma3_text"
-        || mt == "gemma4" || mt == "gemma4_text"
-        || mt == "mixtral"
-        || mt == "gemma3n" || mt == "gemma3n_text"
-        || mt == "gpt_oss"
-        || mt == "qwen3_5" || mt == "qwen3_5_text"
-        || mt == "qwen3_5_moe" || mt == "qwen3_5_moe_text"
-        || mt == "qwen3_moe"
-        || mt == "nemotron_h"
-        || mt == "kimi_k2"
-        || mt == "deepseek_v2" || mt == "deepseek_v3" || mt == "deepseek_v4"
-        || mt == "glm_moe_dsa";
-}
-
-// True for any MoE model whose forward path lives in qwen3_5_moe_forward.
-// All members share an all-MoE MLP layout (no dense `intermediate_size`),
-// so the engine's TP divisibility checks on `intermediate_size` should
-// be skipped for them.
-bool model_type_is_qwen3_5_moe(const std::string& mt) {
-    return mt == "qwen3_5_moe" || mt == "qwen3_5_moe_text"
-        || mt == "qwen3_moe";
-}
 
 struct LoadMemorySampler {
     LoadExecutionStats* stats = nullptr;
@@ -107,8 +75,9 @@ private:
 LoadedModel LoadedModel::load(
     const Config& boot_cfg,
     NcclComm* tp_comm,
-    std::span<const std::uint8_t> load_plan_bytes,
-    std::uint64_t compiler_version) {
+    std::string_view runtime_quant,
+    pie_loader::PieLoaderMxfp4MoeRequest mxfp4_moe,
+    pie_loader::PieLoaderComponent component) {
     (void)tp_comm;
 
     if (boot_cfg.model.snapshot_dir.empty()) {
@@ -156,125 +125,54 @@ LoadedModel LoadedModel::load(
     const bool fp8_native = (dev_prop.major > 8) ||
                             (dev_prop.major == 8 && dev_prop.minor >= 9);
 #ifdef PIE_CUDA_HAS_MARLIN
-    const bool gptq_marlin_int4 = true;
     // Native MXFP4 expert execution requires a Blackwell-class FP4 path.
     // Older GPUs keep packed MXFP4 resident but use routed BF16 dequant
     // scratch for the selected experts.
     const bool mxfp4_native_gemm = dev_prop.major >= 10;
 #else
-    const bool gptq_marlin_int4 = false;
     const bool mxfp4_native_gemm = false;
 #endif
-    BackendTarget backend_target{
-        .device_major = dev_prop.major,
-        .device_minor = dev_prop.minor,
-        .fp8_native = fp8_native,
-        .gptq_marlin_int4 = gptq_marlin_int4,
-        .mxfp4_native_gemm = mxfp4_native_gemm,
-    };
-    LoadPlan load_plan =
-        deserialize_load_plan(load_plan_bytes, compiler_version);
-    switch (load_plan.mxfp4_moe()) {
-    case pie_load_planner::PieLoaderMxfp4MoePolicy::NativeGemm:
-        if (!backend_target.mxfp4_native_gemm) {
-            throw std::runtime_error(
-                "engine: LoadPlan requires native MXFP4 MoE, but this "
-                "device/build does not provide it");
-        }
-        backend_target.mxfp4_moe = Mxfp4MoeLowering::NativeGemm;
-        break;
-    case pie_load_planner::PieLoaderMxfp4MoePolicy::EagerBf16:
-        backend_target.mxfp4_moe = Mxfp4MoeLowering::Bf16Dequant;
-        break;
-    case pie_load_planner::PieLoaderMxfp4MoePolicy::RoutedDecode:
-        backend_target.mxfp4_moe = Mxfp4MoeLowering::RoutedDequant;
-        break;
-    }
-    e.mxfp4_moe_lowering_ = backend_target.mxfp4_moe;
+
+    // Compile the plan for *this* device. The driver states what the device can
+    // do and the loader answers with a plan that stays inside it, so there is
+    // nothing to re-validate afterwards: the mxfp4 lowering below is read back
+    // as the loader's decision, not checked against a second opinion
+    // (`loader/architecture.md` §9).
+    log_stage("compile LoadPlan begin");
+    LoadPlanResult planned_load = prepare_load_plan(
+        e.hf_,
+        boot_cfg.model.snapshot_dir,
+        [&] {
+            auto target = cuda_device_target();
+            target.tp_rank = static_cast<std::uint32_t>(boot_cfg.distributed.tp_rank);
+            target.tp_size = static_cast<std::uint32_t>(boot_cfg.distributed.tp_size);
+            target.fp8_native = fp8_native;
+            target.native_mxfp4_moe = mxfp4_native_gemm;
+            return target;
+        }(),
+        runtime_quant,
+        mxfp4_moe,
+        component,
+        // What this model promises to bind. Checked against the plan by
+        // `pie_loader_verify` inside `prepare_load_plan` (§12 row 7b-4b).
+        declare_model_contract(
+            e.hf_, static_cast<std::uint32_t>(boot_cfg.distributed.tp_size)));
+    log_stage("compile LoadPlan done");
+
+    e.mxfp4_moe_policy_ = planned_load.plan.mxfp4_moe();
 
     log_stage("open safetensors begin");
-    auto loader = CheckpointSource::open(snapshot);
+    pie_loader::CheckpointSource loader(planned_load.plan.view());
     log_stage("open safetensors done");
 
-    const int tp_size = boot_cfg.distributed.tp_size;
-    if (tp_size > 1 && !supports_tp(e.hf_.model_type)) {
-        throw std::runtime_error(
-            "engine: tensor-parallelism not yet supported for model_type='" +
-            e.hf_.model_type +
-            "'. Currently TP-enabled: qwen2/qwen3, llama/llama3, mistral/"
-            "mistral3, phi3, olmo2/olmo3, gemma2/gemma3.");
-    }
-    // Sharding along the head dim requires the head/expert counts and
-    // intermediate widths to all divide cleanly by tp_size. Reject early
-    // with a useful message instead of failing inside `load_to_device_sharded`
-    // (which sees only one tensor at a time and can't explain why).
-    if (tp_size > 1) {
-        const auto& hf = e.hf_;
-        auto require_divisible = [&](int v, const char* name) {
-            if (v <= 0 || v % tp_size != 0) {
-                throw std::runtime_error(
-                    std::string("engine: ") + name + "=" + std::to_string(v) +
-                    " is not divisible by tp_size=" + std::to_string(tp_size) +
-                    ". Sharding the head/intermediate axis requires this; "
-                    "use a smaller tp_size or run single-GPU.");
-            }
-        };
-        require_divisible(hf.num_attention_heads, "num_attention_heads");
-        // V4 has num_key_value_heads=1 (MQA) — the single KV head is
-        // replicated, not sharded. Skip the divisibility check.
-        if (hf.model_type != "deepseek_v4") {
-            require_divisible(hf.num_key_value_heads, "num_key_value_heads");
-        }
-        // Qwen3.5-MoE / Qwen3-MoE have no dense `intermediate_size`; the
-        // MLP lives entirely in `moe_intermediate_size` (+ `shared_expert_
-        // intermediate_size` for the 3.5/3.6 family — Qwen3-MoE has no
-        // shared expert).
-        const bool is_kimi_k2 = hf.model_type == "kimi_k2"
-            || hf.model_type == "deepseek_v2" || hf.model_type == "deepseek_v3"
-            || hf.model_type == "glm_moe_dsa";
-        const bool is_dsv4 = hf.model_type == "deepseek_v4";
-        const bool is_q35_moe = model_type_is_qwen3_5_moe(hf.model_type);
-        const bool is_nemotron_h = hf.model_type == "nemotron_h";
-        if (!is_q35_moe && !is_kimi_k2 && !is_dsv4) {
-            require_divisible(hf.intermediate_size, "intermediate_size");
-        }
-        if (is_kimi_k2) {
-            require_divisible(hf.q_lora_rank, "q_lora_rank");
-            require_divisible(hf.kv_lora_rank, "kv_lora_rank");
-            require_divisible(hf.moe_intermediate_size, "moe_intermediate_size");
-            if (hf.shared_expert_intermediate_size > 0) {
-                require_divisible(hf.shared_expert_intermediate_size,
-                                  "shared_expert_intermediate_size");
-            }
-        }
-        if (is_dsv4) {
-            require_divisible(hf.q_lora_rank, "q_lora_rank");
-            if (hf.dsv4_o_lora_rank > 0) {
-                require_divisible(hf.dsv4_o_lora_rank, "o_lora_rank");
-            }
-            require_divisible(hf.moe_intermediate_size, "moe_intermediate_size");
-        }
-        // Qwen3.5 / 3.6-MoE: linear-attention head counts must shard too.
-        // Qwen3-MoE has no linear-attn layers, so this check is skipped.
-        const bool has_linear_attn =
-            (hf.model_type == "qwen3_5" || hf.model_type == "qwen3_5_text" ||
-             hf.model_type == "qwen3_5_moe" ||
-             hf.model_type == "qwen3_5_moe_text");
-        if (has_linear_attn) {
-            require_divisible(hf.linear_num_key_heads, "linear_num_key_heads");
-            require_divisible(hf.linear_num_value_heads, "linear_num_value_heads");
-        }
-        if (is_q35_moe || is_nemotron_h) {
-            require_divisible(hf.moe_intermediate_size, "moe_intermediate_size");
-            // shared_expert_intermediate_size is 0 for Qwen3-MoE (no shared
-            // expert); only enforce divisibility when the family actually
-            // has one.
-            if (hf.shared_expert_intermediate_size > 0) {
-                require_divisible(hf.shared_expert_intermediate_size,
-                                  "shared_expert_intermediate_size");
-            }
-        }
-    }
+    // What used to sit here: `supports_tp()` — a list of twenty-odd model_type
+    // strings — followed by eighty lines of per-family divisibility rules read
+    // off `config.json`. Every one of them restated something the loader had
+    // already decided by the time this ran: it is the loader that partitions a
+    // tensor, so it is the loader that discovers an axis tp_size does not
+    // divide, and it names the tensor when it says so (`frontend.rs`,
+    // `arch.rs::local_range`). A family missing from the list got no check at
+    // all; a family in it got two.
 
     if (e.hf_.kv_cache_scheme_present) {
         std::cerr << "[pie-driver-cuda] WARNING: ckpt's "
@@ -287,15 +185,10 @@ LoadedModel LoadedModel::load(
 
     const auto t0 = std::chrono::steady_clock::now();
 
-    log_stage("decode LoadPlan begin");
-    LoadPlanResult planned_load =
-        prepare_load_plan(
-            e.hf_,
-            std::move(load_plan),
-            load_plan_bytes,
-            compiler_version);
-    log_stage("decode LoadPlan done");
-    WeightStoreBuilder(e.weights_).reserve(planned_load.runtime_tensor_count);
+    // The store holds what the plan *produces*, which is more than the contract
+    // demands: the declaration is a lower bound the loader must meet, not an
+    // inventory (an undeclared family demands nothing at all).
+    WeightStoreBuilder(e.weights_).reserve(planned_load.planned_tensor_count);
     const auto load_view = planned_load.plan.view();
     if (const char* dump_path =
             std::getenv("PIE_CUDA_RUST_LAYOUT_PLAN_DUMP");
@@ -306,31 +199,30 @@ LoadedModel LoadedModel::load(
                 "engine: failed to open PIE_CUDA_RUST_LAYOUT_PLAN_DUMP "
                 "path: " + std::string(dump_path));
         }
-        out << dump_load_plan_json(
-            load_view,
-            planned_load.source_tensor_count,
-            planned_load.covered_contract_count,
-            planned_load.runtime_tensor_count);
+        out << pie_loader::bytes_to_string(load_view.stats_json);
     }
     if (verbose) {
         std::cerr
             << "[pie-driver-cuda] layout compiler: rust RuntimeABI -> "
                "algebra -> LoadPlan\n";
         std::cerr << "[pie-driver-cuda] rust loader compiler: "
-                  << describe_load_plan(
-                         load_view,
-                         planned_load.source_tensor_count,
-                         planned_load.covered_contract_count,
-                         planned_load.runtime_tensor_count)
-                  << "\n";
+                  << pie_loader::bytes_to_string(load_view.summary) << "\n";
     }
+    // Real as of §12 row 7b-4b: both counts used to be `view.tensors.len`, so
+    // this compared the plan with itself. `runtime_tensor_count` is now what the
+    // *driver* declared through `pie_loader::TensorContract` and
+    // `covered_contract_count` is how much of that the loader built. A family
+    // that has not adopted the declaration declares nothing, and zero == zero
+    // still passes — the check is opt-in per family, not a flag day.
     if (planned_load.covered_contract_count != planned_load.runtime_tensor_count) {
         throw std::runtime_error(
-            "engine: Rust loader did not cover the full RuntimeABI; covered " +
+            "engine: Rust loader did not cover the contract this model declared; "
+            "covered " +
             std::to_string(planned_load.covered_contract_count) + "/" +
             std::to_string(planned_load.runtime_tensor_count) +
-            " runtime tensors. Add schema/RuntimeABI coverage before enabling "
-            "this model.");
+            " demanded tensors (the plan produced " +
+            std::to_string(planned_load.planned_tensor_count) +
+            "). Add loader coverage before enabling this model.");
     }
 
     // Materialized-weight artifact cache (WEIGHT_LOADER_TODO.md A3.1). The
@@ -513,7 +405,7 @@ LoadedModel LoadedModel::load(
     if (verbose) {
         std::cerr << "[pie-driver-cuda] loaded " << e.weights_.size() << " tensors ("
                   << static_cast<std::uint64_t>(mib) << " MiB on this rank, "
-                  << "tp=" << tp_size << ") in " << static_cast<int>(ms)
+                  << "tp=" << boot_cfg.distributed.tp_size << ") in " << static_cast<int>(ms)
                   << " ms; arch=" << e.hf_.arch_name << " (" << e.hf_.model_type << ")\n";
     }
 

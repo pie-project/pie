@@ -20,6 +20,27 @@ use crate::config::MetalDriverOptions;
 use crate::config::{CudaMemoryProfile, CudaNativeDriverOptions, DummyDriverOptions};
 use crate::driver_ffi::Flavor;
 
+/// Anchors `pie-loader`'s C entry points into the final binary.
+///
+/// `pie-loader` is an rlib and the only callers of `pie_loader_compile` and
+/// friends are the C++ drivers, which link *after* Rust. A linker never pulls an
+/// rlib member in on behalf of a C++ reference, so without a reference from
+/// reachable Rust the entry points are simply absent and the failure surfaces as
+/// an undefined symbol at final link (`loader/architecture.md` §3.4). The
+/// `#[used]` table inside `pie_loader::ffi::entry` keeps all four alive once the
+/// object is pulled in; this static is what pulls it in.
+///
+/// **Do not delete this when the worker stops compiling plans itself (§12 step
+/// 2).** That is precisely the change that makes it load-bearing: today the
+/// worker still calls into `pie-loader`, so the anchor is redundant. It stops
+/// being redundant the moment those calls go away.
+#[used]
+static PIE_LOADER_ENTRY_ANCHOR: unsafe extern "C" fn(
+    *const pie_loader::ffi::PieLoaderRequest,
+    *mut *mut pie_loader::ffi::PieLoaderPlan,
+    *mut *mut pie_loader::ffi::PieLoaderDiagnostics,
+) -> pie_loader::ffi::PieLoaderStatus = pie_loader::ffi::pie_loader_compile;
+
 #[cfg(feature = "driver-cuda")]
 #[repr(C)]
 struct NcclUniqueId {
@@ -142,7 +163,7 @@ fn write_toml_table(out_path: &Path, doc: toml::Table) -> Result<()> {
 /// but legal — different ports) don't clobber each other's TOML or
 /// aux sockets.
 pub fn launch_state_dir() -> PathBuf {
-    bootstrap::paths::pie_home()
+    crate::paths::pie_home()
         .join("standalone")
         .join(std::process::id().to_string())
 }
@@ -247,143 +268,24 @@ pub fn write_metal_startup_toml(
     write_toml_table(out_path, doc)
 }
 
-fn compile_load_plan_bytes(
-    snapshot_dir: &Path,
-    facts: &pie_driver_abi::DeviceFacts,
-    runtime_quant: &str,
-    mxfp4_moe: &str,
-    tp: Option<&TpLaunch>,
-    component: pie_driver_abi::ModelComponent,
-) -> Result<Vec<u8>> {
-    use pie_load_planner::abi::RuntimeAbi;
-    use pie_load_planner::inproc::{
-        compile_snapshot_to_plan_bytes, parse_checkpoint_metadata, parse_model_config,
-        serialize_load_plan,
-    };
-    use pie_load_planner::load_plan::StorageTarget;
-    use pie_load_planner::planner::compile_load_plan;
-    use pie_load_planner::types::{BackendKind, Mxfp4MoePolicy};
-
-    if facts.abi_version != pie_driver_abi::PIE_DRIVER_ABI_VERSION {
-        return Err(anyhow!(
-            "driver device facts ABI {} does not match runtime ABI {}",
-            facts.abi_version,
-            pie_driver_abi::PIE_DRIVER_ABI_VERSION
-        ));
-    }
-    let backend = match facts.backend.as_str() {
-        "cuda" => BackendKind::Cuda,
-        "metal" => BackendKind::Metal,
-        "dummy" => BackendKind::Unknown,
-        other => {
-            return Err(anyhow!(
-                "unsupported storage backend in device facts: {other}"
-            ));
-        }
-    };
-    let effective_runtime_quant = if runtime_quant == "fp8" && !facts.fp8_native {
-        tracing::info!(
-            "load-planner: runtime_quant='fp8' disabled because device facts report \
-             fp8_native=false"
-        );
-        ""
-    } else {
-        runtime_quant
-    };
-    let model = parse_model_config(snapshot_dir, effective_runtime_quant)
-        .map_err(|err| anyhow!("load-planner model config parse failed: {err}"))?;
-    let mxfp4_moe = match mxfp4_moe {
-        "" | "auto" => {
-            if facts.native_mxfp4_moe {
-                Mxfp4MoePolicy::NativeGemm
-            } else {
-                Mxfp4MoePolicy::RoutedDecode
-            }
-        }
-        "routed_dequant" | "packed" => Mxfp4MoePolicy::RoutedDecode,
-        "bf16" | "dequant" | "eager_bf16" => Mxfp4MoePolicy::EagerBf16,
-        "native" => {
-            if !facts.native_mxfp4_moe {
-                return Err(anyhow!(
-                    "mxfp4_moe='native' requested, but device facts report \
-                     native_mxfp4_moe=false"
-                ));
-            }
-            Mxfp4MoePolicy::NativeGemm
-        }
-        other => return Err(anyhow!("unknown mxfp4_moe policy '{other}'")),
-    };
-
-    let (tp_rank, tp_size) = tp.map(|t| (t.rank as u32, t.size as u32)).unwrap_or((0, 1));
-    let target = StorageTarget {
-        backend,
-        tp_rank,
-        tp_size,
-        max_tile_bytes: facts.storage_max_tile_bytes,
-        preferred_alignment: facts.storage_alignment.max(1),
-        tile_map_mask: facts.storage_tile_map_mask,
-        mxfp4_moe,
-        native_mxfp4_moe: facts.native_mxfp4_moe,
-    };
-
-    let bytes =
-        if component == pie_driver_abi::ModelComponent::Encode && backend == BackendKind::Cuda {
-            anyhow::ensure!(
-                tp_size == 1,
-                "encode-scoped CUDA loading does not support tensor parallelism"
-            );
-            anyhow::ensure!(
-                matches!(model.model_type.as_str(), "gemma4" | "gemma4_text"),
-                "encode-scoped CUDA loading currently supports Gemma-4, got {}",
-                model.model_type
-            );
-            let metadata = parse_checkpoint_metadata(snapshot_dir)
-                .map_err(|err| anyhow!("load-planner metadata parse failed: {err}"))?;
-            let abi = RuntimeAbi::default_for_target(&metadata, &model, &target)
-                .and_then(|abi| {
-                    abi.retain_outputs(|name| {
-                        name.starts_with("model.vision_tower.")
-                            || name.starts_with("model.embed_vision.")
-                            || name.starts_with("model.audio_tower.")
-                            || name.starts_with("model.embed_audio.")
-                    })
-                })
-                .map_err(|err| anyhow!("encode component ABI planning failed: {err}"))?;
-            let plan = compile_load_plan(&metadata, &model, &abi, target)
-                .map_err(|err| anyhow!("encode load planning failed: {err}"))?;
-            serialize_load_plan(&plan)
-                .map_err(|err| anyhow!("encode load-plan serialization failed: {err}"))?
-        } else {
-            compile_snapshot_to_plan_bytes(snapshot_dir, &model, target)
-                .map_err(|err| anyhow!("load planning failed: {err}"))?
-        };
-    tracing::info!(
-        "load-planner: compiled LoadPlan in-process ({} bytes); the driver \
-         will execute it from the boot call (bulk weights never cross)",
-        bytes.len()
-    );
-    Ok(bytes)
-}
-
+/// Build the model-load request the driver will compile from.
+///
+/// The runtime states *what* it wants loaded — the checkpoint, the quantization
+/// it would prefer, the MoE lowering, the component scope — and nothing about
+/// the device. The driver measures the device and calls the loader itself
+/// (`loader/architecture.md` §3).
 fn model_load_desc(
     snapshot_dir: &Path,
-    facts: &pie_driver_abi::DeviceFacts,
     runtime_quant: &str,
     mxfp4_moe: &str,
-    tp: Option<&TpLaunch>,
     component: pie_driver_abi::ModelComponent,
 ) -> Result<pie_driver_abi::ModelLoadDesc> {
+    let mxfp4_moe = pie_driver_abi::Mxfp4MoeRequest::parse(mxfp4_moe)
+        .ok_or_else(|| anyhow!("unknown mxfp4_moe policy '{mxfp4_moe}'"))?;
     Ok(pie_driver_abi::ModelLoadDesc {
-        load_plan_bytes: compile_load_plan_bytes(
-            snapshot_dir,
-            facts,
-            runtime_quant,
-            mxfp4_moe,
-            tp,
-            component,
-        )?,
         snapshot_dir: snapshot_dir.to_path_buf(),
-        compiler_version: pie_load_planner::load_plan::compiler_version(),
+        runtime_quant: runtime_quant.to_string(),
+        mxfp4_moe,
         component,
     })
 }
@@ -519,6 +421,7 @@ fn dummy_native_options(
         has_mtp_logits: true,
         has_mtp_drafts: true,
         has_value_head: true,
+        has_attn_score: true,
         callback_delay_ms: 0,
         reject_launches: false,
         reject_launches_remaining: 0,
@@ -598,20 +501,19 @@ pub(crate) fn create_driver_backend_group(
             rank_options.len()
         ));
     }
+    // Each rank's descriptor is identical: the per-rank facts (rank index, TP
+    // width, device capability) reach the loader through the driver's own
+    // startup TOML, not through the request.
     let descs = rank_options
         .iter()
-        .zip(tp_launches)
-        .zip(&facts)
-        .map(|((options, tp), facts)| {
+        .map(|options| {
             let DriverOptions::CudaNative(opts) = options else {
                 unreachable!("validated cuda options above");
             };
             model_load_desc(
                 snapshot_dir,
-                facts,
                 &opts.runtime_quant,
                 &opts.mxfp4_moe,
-                Some(tp),
                 component,
             )
         })
@@ -630,7 +532,7 @@ pub(crate) fn create_driver_backend(
     let _ = (group_id, tp);
     validate_snapshot_dir(snapshot_dir)?;
 
-    let (mut backend, facts, runtime_quant, mxfp4_moe) = match options {
+    let (mut backend, runtime_quant, mxfp4_moe) = match options {
         #[cfg(feature = "driver-cuda")]
         DriverOptions::CudaNative(opts) => {
             if !opts.mtp_assistant_snapshot_dir.is_empty() {
@@ -643,14 +545,9 @@ pub(crate) fn create_driver_backend(
             let toml_path = state_dir.join("driver.toml");
             write_cuda_startup_toml(&toml_path, opts, snapshot_dir, group_id, tp)?;
             let config_path = toml_path.to_string_lossy();
-            let (backend, facts) =
+            let (backend, _facts) =
                 pie_engine::driver::DriverBackend::cuda_create(config_path.as_bytes())?;
-            (
-                backend,
-                facts,
-                opts.runtime_quant.as_str(),
-                opts.mxfp4_moe.as_str(),
-            )
+            (backend, opts.runtime_quant.as_str(), opts.mxfp4_moe.as_str())
         }
         #[cfg(feature = "driver-metal")]
         DriverOptions::Metal(opts) => {
@@ -658,9 +555,9 @@ pub(crate) fn create_driver_backend(
             let toml_path = state_dir.join("driver.toml");
             write_metal_startup_toml(&toml_path, opts, snapshot_dir, group_id)?;
             let config_path = toml_path.to_string_lossy();
-            let (backend, facts) =
+            let (backend, _facts) =
                 pie_engine::driver::DriverBackend::metal_create(config_path.as_bytes())?;
-            (backend, facts, "", "auto")
+            (backend, "", "auto")
         }
         DriverOptions::Dummy {
             opts,
@@ -668,18 +565,14 @@ pub(crate) fn create_driver_backend(
             activation_dtype,
         } => {
             let options = dummy_native_options(opts, snapshot_dir, *random_seed, activation_dtype)?;
-            let (backend, facts) = pie_engine::driver::DriverBackend::dummy(options)?;
-            (backend, facts, "", "auto")
+            let (backend, _facts) = pie_engine::driver::DriverBackend::dummy(options)?;
+            (backend, "", "auto")
         }
     };
-    let desc = model_load_desc(
-        snapshot_dir,
-        &facts,
-        runtime_quant,
-        mxfp4_moe,
-        tp,
-        component,
-    )?;
+    // Uniform across backends now that the descriptor is a request rather than a
+    // compiled plan: the dummy driver simply ignores everything but the
+    // component scope (§10.3).
+    let desc = model_load_desc(snapshot_dir, runtime_quant, mxfp4_moe, component)?;
     let caps = backend.load_model(vec![desc])?;
 
     Ok(crate::translate::GroupDriver { caps, backend })
@@ -759,62 +652,6 @@ mod tests {
         assert_eq!(group.caps.arch_name, "qwen3");
         assert_eq!(group.caps.vocab_size, 32);
         assert_eq!(group.caps.snapshot_dir, snapshot.display().to_string());
-    }
-
-    #[test]
-    #[ignore = "requires PIE_TEST_GEMMA4_SNAPSHOT"]
-    fn gemma4_encode_plan_contains_only_encoder_tensors() {
-        let snapshot = std::env::var_os("PIE_TEST_GEMMA4_SNAPSHOT")
-            .map(PathBuf::from)
-            .expect("set PIE_TEST_GEMMA4_SNAPSHOT");
-        let facts = pie_driver_abi::DeviceFacts {
-            abi_version: pie_driver_abi::PIE_DRIVER_ABI_VERSION,
-            backend: "cuda".to_string(),
-            unified_memory: false,
-            fp8_native: true,
-            native_mxfp4_moe: false,
-            storage_alignment: 256,
-            storage_max_tile_bytes: 64 * 1024 * 1024,
-            storage_tile_map_mask: pie_load_planner::load_plan::CUDA_TILE_MAP_MASK,
-            page_size: 0,
-        };
-        let bytes = compile_load_plan_bytes(
-            &snapshot,
-            &facts,
-            "",
-            "auto",
-            None,
-            pie_driver_abi::ModelComponent::Encode,
-        )
-        .unwrap();
-        let plan = pie_load_planner::inproc::deserialize_load_plan(&bytes).unwrap();
-        let finalized = plan
-            .instrs
-            .iter()
-            .filter_map(|instruction| match instruction {
-                pie_load_planner::load_plan::StorageInstr::Finalize { name, .. } => {
-                    Some(name.as_str())
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert!(finalized.len() > 10);
-        assert!(
-            finalized
-                .iter()
-                .any(|name| name.starts_with("model.vision_tower."))
-        );
-        assert!(
-            finalized
-                .iter()
-                .any(|name| name.starts_with("model.audio_tower."))
-        );
-        assert!(finalized.iter().all(|name| {
-            name.starts_with("model.vision_tower.")
-                || name.starts_with("model.embed_vision.")
-                || name.starts_with("model.audio_tower.")
-                || name.starts_with("model.embed_audio.")
-        }));
     }
 
     #[cfg(feature = "driver-cuda")]

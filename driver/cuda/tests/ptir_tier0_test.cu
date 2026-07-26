@@ -7,6 +7,8 @@
 //
 //   nvcc -std=c++17 -I../src tests/ptir_tier0_test.cu -o ptir_tier0_test && ./ptir_tier0_test
 
+#include <algorithm>
+#include <functional>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -322,6 +324,82 @@ void test_pivot_predicates() {
         CUDA_OK(cudaDeviceSynchronize());
         check("pivot.rank_le (i32, scalar broadcast)", to_host(dout, x.size()),
               host_eval::pivot_rankle<std::int32_t>(x, rows, len, k, 1u));
+        CUDA_OK(cudaFree(dx)); CUDA_OK(cudaFree(dk)); CUDA_OK(cudaFree(dout));
+    }
+    // rank_le: randomized parity over the awkward cases the radix select has to
+    // get right — duplicates at the cut, negatives, both signed zeros, NaN, and
+    // k at both ends of its clamp range.
+    {
+        std::uint32_t rows = 6, len = 1024;
+        std::vector<float> x((std::size_t)rows * len);
+        std::uint32_t s = 0x9e3779b9u;
+        for (std::size_t i = 0; i < x.size(); ++i) {
+            s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+            switch (s % 16u) {
+                case 0: x[i] = std::nanf(""); break;
+                case 1: x[i] = 0.0f; break;
+                case 2: x[i] = -0.0f; break;
+                case 3: x[i] = (float)(s % 7u); break;   // heavy duplication
+                default: x[i] = (float)((std::int32_t)(s % 20001u) - 10000) * 1e-3f; break;
+            }
+        }
+        std::vector<std::uint32_t> k{0u, 1u, 2u, 37u, 1023u, 4096u};  // 4096 clamps to len
+        float* dx = dev_from(x);
+        std::uint32_t* dk = dev_from(k);
+        std::uint8_t* dout = dev_alloc<std::uint8_t>(x.size());
+        k_pivot_rankle<std::uint32_t><<<rows, kTier0Block>>>(dx, dout, rows, len, dk, (std::uint32_t)k.size());
+        CUDA_OK(cudaDeviceSynchronize());
+        check("pivot.rank_le (ties/±0/NaN, k at clamp bounds)", to_host(dout, x.size()),
+              host_eval::pivot_rankle<std::uint32_t>(x, rows, len, k, (std::uint32_t)k.size()));
+        CUDA_OK(cudaFree(dx)); CUDA_OK(cudaFree(dk)); CUDA_OK(cudaFree(dout));
+    }
+    // rank_le at the 151936-token vocab scale with a large k. The literal rank
+    // formulation is O(len^2) here — ~2.3e10 element visits per row, which is
+    // what made `mirostat-v2-sampling` take minutes per request. The radix
+    // select is O(5*len) regardless of k. The host reference is O(len^2) too,
+    // so parity is checked against an O(len) nth_element instead: `keep` iff
+    // the value is >= the k-th largest, which is the same predicate.
+    {
+        std::uint32_t rows = 1, len = 151936;
+        std::vector<float> x(len);
+        std::uint32_t s = 0x243f6a88u;
+        for (std::uint32_t i = 0; i < len; ++i) {
+            s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+            x[i] = (float)((std::int32_t)(s % 65536u) - 32768) * 1e-2f;
+        }
+        const std::uint32_t kk = 1024;
+        std::vector<std::uint32_t> k{kk};
+        float* dx = dev_from(x);
+        std::uint32_t* dk = dev_from(k);
+        std::uint8_t* dout = dev_alloc<std::uint8_t>(x.size());
+        cudaEvent_t start = nullptr;
+        cudaEvent_t stop = nullptr;
+        CUDA_OK(cudaEventCreate(&start));
+        CUDA_OK(cudaEventCreate(&stop));
+        CUDA_OK(cudaEventRecord(start));
+        k_pivot_rankle<std::uint32_t><<<rows, kTier0Block>>>(dx, dout, rows, len, dk, 1u);
+        CUDA_OK(cudaEventRecord(stop));
+        CUDA_OK(cudaEventSynchronize(stop));
+        float elapsed_ms = 0.0f;
+        CUDA_OK(cudaEventElapsedTime(&elapsed_ms, start, stop));
+        CUDA_OK(cudaDeviceSynchronize());
+        std::vector<float> sorted(x);
+        std::nth_element(sorted.begin(), sorted.begin() + (kk - 1), sorted.end(), std::greater<float>());
+        const float cut = sorted[kk - 1];
+        std::vector<std::uint8_t> want(len);
+        for (std::uint32_t i = 0; i < len; ++i) want[i] = x[i] >= cut ? 1u : 0u;
+        check("pivot.rank_le (151936-vocab, k=1024)", to_host(dout, x.size()), want);
+        if (elapsed_ms < 50.0f) {
+            ++g_pass;
+            std::printf("  PASS  production-vocab rank_le timing (%g ms)\n",
+                        static_cast<double>(elapsed_ms));
+        } else {
+            ++g_fail;
+            std::printf("  FAIL  production-vocab rank_le timing (%g ms)\n",
+                        static_cast<double>(elapsed_ms));
+        }
+        CUDA_OK(cudaEventDestroy(stop));
+        CUDA_OK(cudaEventDestroy(start));
         CUDA_OK(cudaFree(dx)); CUDA_OK(cudaFree(dk)); CUDA_OK(cudaFree(dout));
     }
     // prob_ge: per-row F32 threshold.
@@ -858,6 +936,72 @@ void test_new_ops() {
     CUDA_OK(cudaFree(adversarial_indices));
     CUDA_OK(cudaFree(adversarial_values));
     CUDA_OK(cudaFree(adversarial_device));
+
+    // top_k at the 151936-token vocab scale with k=128 — the configuration
+    // `locally-typical-sampling` and `tail-free-sampling` default to, and the
+    // one the incremental selection loop paid O(k*len) for.
+    {
+        const std::uint32_t rows_big = 2, len_big = 151936, k_big = 128;
+        std::vector<float> big((std::size_t)rows_big * len_big);
+        std::uint32_t seed = 0xb7e15163u;
+        for (std::size_t i = 0; i < big.size(); ++i) {
+            seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+            big[i] = (float)((std::int32_t)(seed % 40001u) - 20000) * 1e-3f;
+        }
+        big[12345] = std::nanf("");         // NaN must sort last, never into the top-k
+        big[999] = -0.0f;
+        big[1000] = 0.0f;
+        float* dbig = dev_from(big);
+        float* dbv = dev_alloc<float>((std::size_t)rows_big * k_big);
+        std::uint32_t* dbi = dev_alloc<std::uint32_t>((std::size_t)rows_big * k_big);
+        cudaEvent_t start = nullptr;
+        cudaEvent_t stop = nullptr;
+        CUDA_OK(cudaEventCreate(&start));
+        CUDA_OK(cudaEventCreate(&stop));
+        CUDA_OK(cudaEventRecord(start));
+        k_topk_rows<<<rows_big, kTier0Block>>>(dbig, dbv, dbi, rows_big, len_big, k_big);
+        CUDA_OK(cudaEventRecord(stop));
+        CUDA_OK(cudaEventSynchronize(stop));
+        float elapsed_ms = 0.0f;
+        CUDA_OK(cudaEventElapsedTime(&elapsed_ms, start, stop));
+        CUDA_OK(cudaDeviceSynchronize());
+        std::vector<float> want_v((std::size_t)rows_big * k_big);
+        std::vector<std::uint32_t> want_i((std::size_t)rows_big * k_big);
+        for (std::uint32_t r = 0; r < rows_big; ++r) {
+            std::vector<std::uint32_t> order(len_big);
+            for (std::uint32_t i = 0; i < len_big; ++i) order[i] = i;
+            const float* base = big.data() + (std::size_t)r * len_big;
+            std::partial_sort(
+                order.begin(), order.begin() + k_big, order.end(),
+                [&](std::uint32_t a, std::uint32_t b) {
+                    const bool na = std::isnan(base[a]), nb = std::isnan(base[b]);
+                    if (na != nb) return nb;
+                    if (na && nb) return a < b;
+                    if (base[a] != base[b]) return base[a] > base[b];
+                    return a < b;
+                });
+            for (std::uint32_t p = 0; p < k_big; ++p) {
+                want_i[(std::size_t)r * k_big + p] = order[p];
+                want_v[(std::size_t)r * k_big + p] = base[order[p]];
+            }
+        }
+        check("top_k (151936-vocab, k=128) values",
+              to_host(dbv, (std::size_t)rows_big * k_big), want_v);
+        check("top_k (151936-vocab, k=128) indices",
+              to_host(dbi, (std::size_t)rows_big * k_big), want_i);
+        if (elapsed_ms < 50.0f) {
+            ++g_pass;
+            std::printf("  PASS  production-vocab top_k timing (%g ms)\n",
+                        static_cast<double>(elapsed_ms));
+        } else {
+            ++g_fail;
+            std::printf("  FAIL  production-vocab top_k timing (%g ms)\n",
+                        static_cast<double>(elapsed_ms));
+        }
+        CUDA_OK(cudaEventDestroy(stop));
+        CUDA_OK(cudaEventDestroy(start));
+        CUDA_OK(cudaFree(dbig)); CUDA_OK(cudaFree(dbv)); CUDA_OK(cudaFree(dbi));
+    }
 
     // mask_apply_packed [2, 40] (2 mask words/row)
     std::uint32_t pr = 2, pl = 40, pw = (pl + 31) / 32;

@@ -13,11 +13,14 @@
 #include "decode_abi.hpp"
 #include "heap_layout.hpp"      // HeapPlan
 #include "mtl4_context.hpp"     // RawMetalContext, SlotHandle
-#include "pie_native/load_plan.hpp"
+#include "pie_loader/plan.hpp"
+
+namespace pie_loader {
+class CheckpointSource;
+}
 
 namespace pie::metal {
 
-class SafetensorsView;
 struct Dispatch;  // beta: decode_step.hpp
 
 // Every slot delta allocates: the bind pass + the beta scratch handoff read from this.
@@ -53,8 +56,8 @@ struct BoundDecode {
 // follows the region plan). The view must outlive nothing (zero-copy mmap is read here).
 BoundDecode stage_decode_storage(
     RawMetalContext& ctx,
-    const SafetensorsView& view,
-    const pie_load_planner::LoadPlan& load_plan,
+    const pie_loader::CheckpointSource& view,
+    const pie_loader::LoadPlan& load_plan,
     const DecodeGeometry& g,
     const HeapPlan& heap_plan);
 

@@ -81,7 +81,11 @@ async fn main(input: Input) -> Result<String> {
         Channel::from((0..n).map(|position| position % PAGE_T).collect::<Vec<_>>());
     let prefill_klen = Channel::from(vec![n]);
     let prefill_pages = Channel::from(pool_ids.clone());
-    let prefill_indptr = Channel::from_shaped([2], vec![0u32, pool_pages]);
+    // The page CSR is the wire's source of truth for kv_len: the driver derives
+    // `kv_len = (page_count-1)*PAGE_T + last_page_len`. A pool-wide constant page
+    // count claims a kv length the pass does not have and silently corrupts
+    // attention, so the count must track `kv_len` exactly.
+    let prefill_indptr = Channel::from_shaped([2], vec![0u32, n.div_ceil(PAGE_T)]);
     let causal = Channel::from_shaped(
         [n, pool_len],
         (0..n)
@@ -143,7 +147,7 @@ async fn main(input: Input) -> Result<String> {
         host_sink_window_mask(pool_len, n, sink, window),
     );
     let pages = Channel::from(pool_ids.clone());
-    let page_indptr = Channel::from_shaped([2], vec![0u32, pool_pages]);
+    let page_indptr = Channel::from_shaped([2], vec![0u32, (n + 1).div_ceil(PAGE_T)]);
     let pool_ids_input = Channel::from(pool_ids.clone()).named("pool_ids");
     let token_out = Channel::new([1], dtype::i32)
         .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
@@ -195,7 +199,8 @@ async fn main(input: Input) -> Result<String> {
         pages.take();
         pages.put(reshape(&ids, [pool_pages]));
         page_indptr.take();
-        page_indptr.put(mul(iota(2), pool_pages));
+        let page_count = div(add(&next, PAGE_T - 1), PAGE_T);
+        page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
         pool_ids_input.put(&ids);
     });
 

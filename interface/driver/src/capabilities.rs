@@ -12,12 +12,47 @@ pub const KV_COPY_DEVICE_TO_HOST: u32 = 1 << 1;
 pub const KV_COPY_HOST_TO_DEVICE: u32 = 1 << 2;
 pub const KV_COPY_HOST_TO_HOST: u32 = 1 << 3;
 
+/// The runtime's MXFP4 MoE lowering request.
+///
+/// `Auto` lets the loader pick from what the driver says the device can do;
+/// the explicit variants pin a lowering and fail the load if the device cannot
+/// provide it. Mirrors `PieLoaderMxfp4MoeRequest` and must keep the same
+/// discriminants — the value is forwarded to the loader unchanged.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum Mxfp4MoeRequest {
+    #[default]
+    Auto = 0,
+    RoutedDecode = 1,
+    NativeGemm = 2,
+    EagerBf16 = 3,
+}
+
+impl Mxfp4MoeRequest {
+    /// Parse the spelling used in worker config and CLI flags.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "" | "auto" => Some(Self::Auto),
+            "routed_dequant" | "packed" | "routed_decode" => Some(Self::RoutedDecode),
+            "bf16" | "dequant" | "eager_bf16" => Some(Self::EagerBf16),
+            "native" | "native_gemm" => Some(Self::NativeGemm),
+            _ => None,
+        }
+    }
+}
+
 /// Runtime-owned payload for the blocking model-load boot call.
+///
+/// Carries the *request*, not a compiled plan: the driver compiles the load
+/// plan itself, because only the driver can measure the device it will run on
+/// (`loader/architecture.md` §3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelLoadDesc {
-    pub load_plan_bytes: Vec<u8>,
     pub snapshot_dir: PathBuf,
-    pub compiler_version: u64,
+    /// The runtime's own quantization request (e.g. `"fp8"`), not a checkpoint
+    /// fact. Empty means "whatever the checkpoint is".
+    pub runtime_quant: String,
+    pub mxfp4_moe: Mxfp4MoeRequest,
     pub component: crate::ModelComponent,
 }
 
@@ -75,6 +110,26 @@ pub struct DriverCapabilities {
     /// The loaded model exposes a scalar value-head result to PTIR.
     #[serde(default)]
     pub has_value_head: bool,
+    /// The driver can maintain per-page KV key envelopes and execute the
+    /// `envelope_dot` second-party kernel at an attention stage (Quest).
+    /// Requires a native-bf16 NHD paged KV cache AND a query hook that fires
+    /// post-rope, so the score compares against the keys as cached.
+    #[serde(default)]
+    pub has_kv_envelopes: bool,
+    /// The driver can observe per-position softmax attention weights at an
+    /// `OnAttn` tap (`IntrinsicId::AttnScore`), for H2O/TOVA-style eviction.
+    /// Requires a score-observing attention kernel, and is refused for
+    /// soft-capped or sliding-window attention, where the captured row is not
+    /// the softmax those policies are defined over.
+    #[serde(default)]
+    pub has_attn_score: bool,
+    /// The driver can HONOUR an `attn_page_mask` sink: it compacts the fire's
+    /// page table to the kept pages before the layer's attention. Advertised
+    /// separately from `has_attn_score` because observing scores and enforcing
+    /// a selection are independent backend abilities -- a driver may well have
+    /// one without the other.
+    #[serde(default)]
+    pub has_attn_page_mask: bool,
     /// Descriptor-port tags the driver can resolve on-device for decode envelopes.
     #[serde(default)]
     pub device_geometry_port_mask: u32,

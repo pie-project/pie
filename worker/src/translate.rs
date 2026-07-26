@@ -5,7 +5,7 @@
 //! constructs through the pyo3 `pie._runtime.Config` builder. We do
 //! the same construction here in pure Rust, sourcing:
 //!   * scalars from the user TOML
-//!   * dirs (cache/log/runtime) from `bootstrap::paths::pie_home()` (`~/.pie/...`)
+//!   * dirs (cache/log/runtime) from [`crate::paths::pie_home`] (`~/.pie/...`)
 //!   * capability/backend bundles collected before bootstrap.
 
 use std::path::PathBuf;
@@ -39,7 +39,7 @@ pub fn build(
         );
     }
 
-    let pie_home = bootstrap::paths::pie_home();
+    let pie_home = crate::paths::pie_home();
     let cache_dir = pie_home.join("programs");
     let log_dir = Some(pie_home.join("logs"));
 
@@ -71,7 +71,7 @@ pub fn build(
             py_runtime_dir: pie_home.join("py-runtime"),
         },
         model,
-        // The `bootstrap` lib (Seam 2) installs the global tracing subscriber;
+        // The `startup` lib (Seam 2) installs the global tracing subscriber;
         // the runtime must NOT re-init it (double global-init panics on boot).
         skip_tracing: true,
         max_concurrent_processes: user.server.max_concurrent_processes,
@@ -113,6 +113,9 @@ fn build_model(
                 has_mtp_logits: g.caps.has_mtp_logits,
                 has_mtp_drafts: g.caps.has_mtp_drafts,
                 has_value_head: g.caps.has_value_head,
+                has_kv_envelopes: g.caps.has_kv_envelopes,
+                has_attn_page_mask: g.caps.has_attn_page_mask,
+                has_attn_score: g.caps.has_attn_score,
                 device_geometry_port_mask: g.caps.device_geometry_port_mask,
                 limits: pie_engine::driver::SchedulerLimits {
                     max_forward_requests: g.caps.max_forward_requests as usize,
@@ -132,7 +135,6 @@ fn build_model(
         drivers,
         scheduler: pie_engine::bootstrap::SchedulerConfig {
             request_timeout_secs: m.scheduler.request_timeout_secs,
-            restore_pause_at_utilization: m.scheduler.restore_pause_at_utilization,
         },
     })
 }
@@ -166,6 +168,9 @@ mod tests {
             has_mtp_logits: true,
             has_mtp_drafts: false,
             has_value_head: false,
+            has_kv_envelopes: false,
+            has_attn_page_mask: false,
+            has_attn_score: false,
             device_geometry_port_mask: pie_driver_abi::PIE_DEVICE_GEOMETRY_PORTS,
             kv_handle: None,
         }
@@ -187,6 +192,7 @@ mod tests {
             has_mtp_logits: caps.has_mtp_logits,
             has_mtp_drafts: caps.has_mtp_drafts,
             has_value_head: caps.has_value_head,
+            has_attn_score: caps.has_attn_score,
             callback_delay_ms: 0,
             reject_launches: false,
             reject_launches_remaining: 0,

@@ -250,7 +250,7 @@ inline bool scan_planned_op(
         case PTIR_OP_INTRINSIC_VAL: {
             std::uint16_t intrinsic = 0;
             std::uint8_t dtype = 0;
-            if (!reader.u16(intrinsic) || intrinsic > PTIR_INTR_MTP_DRAFTS ||
+            if (!reader.u16(intrinsic) || intrinsic > PTIR_INTR_ATTN_SCORE ||
                 !reader.u8(dtype) || dtype > PTIR_DT_BOOL ||
                 !scan_shape(reader)) {
                 return false;

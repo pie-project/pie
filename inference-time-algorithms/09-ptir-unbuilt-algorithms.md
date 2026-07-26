@@ -128,20 +128,46 @@ becomes a small inferlet, because the expensive half — paged KV plus a
 guest-bound attention mask — already exists. That makes this tier the highest
 leverage single ABI addition on the list: one tap, five algorithms.
 
-| # | Algorithm | Paper | What it needs | Why it's a gap |
-|---|---|---|---|---|
 | # | Algorithm | Paper | Signal it needs | Blocked because |
 |---|---|---|---|---|
-| B1 | **H2O — heavy-hitter KV eviction** | Zhang et al., [2306.14048](https://arxiv.org/abs/2306.14048) | attention mass accumulated per position | needs `softmax(QK^T)`; `K` unreadable |
-| B2 | **SnapKV** | Li et al., [2404.14469](https://arxiv.org/abs/2404.14469) | per-head attention over an observation window | same |
-| B3 | **TOVA** | Oren et al., [2401.06104](https://arxiv.org/abs/2401.06104) | the current step's attention score | same |
-| B4 | **Quest — query-aware page selection** | Tang et al., [2406.10774](https://arxiv.org/abs/2406.10774) | per-page elementwise min/max of `K`, scored against `Q` | needs `K` directly |
-| B5 | **RetrievalAttention** | Liu et al., [2409.10516](https://arxiv.org/abs/2409.10516) | an ANN index over `K` | needs `K` directly |
+| B1 | **H2O — heavy-hitter KV eviction** | Zhang et al., [2306.14048](https://arxiv.org/abs/2306.14048) | attention mass accumulated per position | score capture + per-position mask |
+| B2 | **SnapKV** | Li et al., [2404.14469](https://arxiv.org/abs/2404.14469) | per-head attention over an observation window | same, plus a pooling op |
+| B3 | **TOVA** | Oren et al., [2401.06104](https://arxiv.org/abs/2401.06104) | the current step's attention score | same, minus the accumulator |
+| B4 | **Quest — query-aware page selection** | Tang et al., [2406.10774](https://arxiv.org/abs/2406.10774) | per-page elementwise min/max of `K`, scored against `Q` | **plumbing only — both kernels already exist** |
+| B5 | **RetrievalAttention** | Liu et al., [2409.10516](https://arxiv.org/abs/2409.10516) | an ANN index over `K` | needs an ANN subsystem — out of scope |
+
+> **Correction (see [`12-attention-observability-design.md`](./12-attention-observability-design.md)).**
+> This table previously recorded the blocker for B1–B3 as "needs
+> `softmax(QK^T)`; `K` unreadable" and for B4–B5 as "needs `K` directly". **Both
+> claims were wrong**, and the "one intrinsic, five algorithms" framing above
+> oversells it — the five need different things.
+>
+> - `softmax(QK^T)` **is** reachable, through FlashInfer's supported
+>   `REGISTER_LOGITS_TRANSFORM` variant hook, which receives the raw `S = QK^T`
+>   element together with the exact `kv_idx` (`decode.cuh:91`). No fork: this
+>   driver already threads `class Variant` and `typename Params` through every
+>   dispatch. The maintainers endorse the route
+>   ([#838](https://github.com/flashinfer-ai/flashinfer/issues/838)) and their
+>   only objection — the `O(n²)` write — does not bind, because H2O and TOVA
+>   score at decode (`qo_len = 1`) and SnapKV is defined by an observation window.
+> - `K` is **not** unreadable. `driver/cuda/src/kernels/envelope.{hpp,cu}`
+>   already ships Quest's per-page min/max envelope builder *and* its criticality
+>   scorer, bit-parity tested against the reference in
+>   `driver/cuda/tests/test_envelope_dot.cu`. They are called from nothing but
+>   that test.
+> - The per-layer tap is **not** hypothetical: ten CUDA model families call
+>   `invoke_stage_hook(StageHookPoint::OnAttnProj/OnAttn, ...)` today. Only Metal
+>   rejects it.
+>
+> B1–B3 additionally need a *write* side (per-position masking) that this table
+> never mentioned. Masking reproduces the algorithms' quality behaviour; actual
+> page reclamation is separate and larger.
 
 **Still the best first build once unblocked: B4 (Quest).** Pie's KV is
 *already* paged and the attention mask is *already* a guest-bound channel, so
-Quest is closer to a natural expression here than in any other engine — the
-missing piece is purely the key summary, not the policy machinery.
+Quest is closer to a natural expression here than in any other engine — and the
+missing piece turns out to be neither the key summary nor the policy machinery,
+but the binding between them.
 
 ---
 

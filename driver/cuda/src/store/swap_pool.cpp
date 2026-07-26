@@ -138,6 +138,27 @@ inline void* page_addr(void* base, std::uint32_t page_idx, std::size_t page_byte
            static_cast<std::size_t>(page_idx) * page_bytes;
 }
 
+// One batched submission for a scattered page-copy set. The loop shape this
+// replaces issued one cudaMemcpyAsync per (layer, K/V buffer, page) — ~56
+// calls of ~32 KB for every KV page moved — and the per-call submission
+// overhead, not PCIe bandwidth, dominated the swap wall time under
+// contention (CONTENTION_FOLLOWUP.md §17: 2.7 ms/page H2D measured
+// end-to-end while pinned PCIe sustains ~0.07 ms/page). One
+// cudaMemcpyBatchAsync amortizes submission and lets the CUDA driver
+// coalesce the transfers.
+inline void submit_batch(const std::vector<void*>& dsts,
+                         const std::vector<const void*>& srcs,
+                         const std::vector<std::size_t>& sizes,
+                         cudaStream_t stream) {
+    if (dsts.empty()) return;
+    cudaMemcpyAttributes attrs{};
+    attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+    std::size_t attrs_index = 0;
+    CUDA_CHECK(cudaMemcpyBatchAsync(
+        const_cast<void* const*>(dsts.data()), srcs.data(), sizes.data(),
+        dsts.size(), &attrs, &attrs_index, 1, stream));
+}
+
 }  // namespace
 
 void SwapPool::copy_d2h(KvCache& cache,
@@ -153,18 +174,23 @@ void SwapPool::copy_d2h_async(KvCache& cache,
                               std::span<const std::uint32_t> dst_host)
 {
     check_pairs(src_gpu.size(), dst_host.size());
+    std::vector<void*> dsts;
+    std::vector<const void*> srcs;
+    std::vector<std::size_t> sizes;
     for (int layer = 0; layer < num_layers_; ++layer) {
         auto dev_buffers = cache.page_buffers(layer);
         auto& host_buffers = host_pools_[layer];
         for (std::size_t i = 0; i < src_gpu.size(); ++i) {
             for (std::size_t b = 0; b < dev_buffers.size(); ++b) {
-                CUDA_CHECK(cudaMemcpyAsync(
-                    page_addr(host_buffers[b].data, dst_host[i], host_buffers[b].page_bytes),
-                    page_addr(dev_buffers[b].data, src_gpu[i], dev_buffers[b].page_bytes),
-                    dev_buffers[b].page_bytes, cudaMemcpyDeviceToHost, stream_));
+                dsts.push_back(page_addr(
+                    host_buffers[b].data, dst_host[i], host_buffers[b].page_bytes));
+                srcs.push_back(page_addr(
+                    dev_buffers[b].data, src_gpu[i], dev_buffers[b].page_bytes));
+                sizes.push_back(dev_buffers[b].page_bytes);
             }
         }
     }
+    submit_batch(dsts, srcs, sizes, stream_);
 }
 
 void SwapPool::copy_h2d(KvCache& cache,
@@ -180,18 +206,23 @@ void SwapPool::copy_h2d_async(KvCache& cache,
                               std::span<const std::uint32_t> dst_gpu)
 {
     check_pairs(src_host.size(), dst_gpu.size());
+    std::vector<void*> dsts;
+    std::vector<const void*> srcs;
+    std::vector<std::size_t> sizes;
     for (int layer = 0; layer < num_layers_; ++layer) {
         auto dev_buffers = cache.page_buffers(layer);
         auto& host_buffers = host_pools_[layer];
         for (std::size_t i = 0; i < src_host.size(); ++i) {
             for (std::size_t b = 0; b < dev_buffers.size(); ++b) {
-                CUDA_CHECK(cudaMemcpyAsync(
-                    page_addr(dev_buffers[b].data, dst_gpu[i], dev_buffers[b].page_bytes),
-                    page_addr(host_buffers[b].data, src_host[i], host_buffers[b].page_bytes),
-                    dev_buffers[b].page_bytes, cudaMemcpyHostToDevice, stream_));
+                dsts.push_back(page_addr(
+                    dev_buffers[b].data, dst_gpu[i], dev_buffers[b].page_bytes));
+                srcs.push_back(page_addr(
+                    host_buffers[b].data, src_host[i], host_buffers[b].page_bytes));
+                sizes.push_back(dev_buffers[b].page_bytes);
             }
         }
     }
+    submit_batch(dsts, srcs, sizes, stream_);
 }
 
 void SwapPool::copy_d2d(KvCache& cache,

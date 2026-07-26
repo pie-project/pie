@@ -124,9 +124,10 @@ impl<'a> Builder<'a> {
     /// lints only; authoritative validation is `forward-pass.program`'s result (D6).
     pub fn build(&self) -> Result<Traced, TraceErrors> {
         let rows = self.rows();
-        let (result, channels) = crate::model::with_constants(self.vocab, self.page_size, || {
-            context::with_session(|| self.record(rows))
-        });
+        let (result, channels, names) =
+            crate::model::with_constants(self.vocab, self.page_size, || {
+                context::with_session(|| self.record(rows))
+            });
         let (stage_results, ports) = result;
 
         // The recorder interns channels in first-REFERENCE order (the order they
@@ -164,6 +165,33 @@ impl<'a> Builder<'a> {
                     *ci = remap[*ci as usize];
                 }
                 p
+            })
+            .collect();
+
+        // Same story for the NAME table. `intern_name` assigns indices in
+        // first-USE order, but the container requires the table to be strictly
+        // sorted and unique -- so a program naming `envelope_dot` before
+        // `attn_page_mask` emitted a table the loader rejects. This went
+        // unnoticed while every program used at most one second-party name.
+        let mut name_order: Vec<usize> = (0..names.len()).collect();
+        name_order.sort_by(|&a, &b| names[a].cmp(&names[b]));
+        let mut name_remap = vec![0u16; names.len()];
+        for (new_idx, &old_idx) in name_order.iter().enumerate() {
+            name_remap[old_idx] = new_idx as u16;
+        }
+        let names: Vec<String> = name_order.iter().map(|&i| names[i].clone()).collect();
+        let stage_results: Vec<_> = stage_results
+            .into_iter()
+            .map(|mut r| {
+                for op in &mut r.ops {
+                    match op {
+                        Op::KernelCall { name, .. } | Op::SinkCall { name, .. } => {
+                            *name = name_remap[*name as usize];
+                        }
+                        _ => {}
+                    }
+                }
+                r
             })
             .collect();
 
@@ -232,7 +260,7 @@ impl<'a> Builder<'a> {
 
         let container = TraceContainer {
             externs: Vec::new(),
-            names: Vec::new(),
+            names,
             channels: channel_decls,
             ports,
             stages,
@@ -259,9 +287,10 @@ impl<'a> Builder<'a> {
     #[doc(hidden)]
     pub fn debug_container(&self) -> TraceContainer {
         let rows = self.rows();
-        let (result, channels) = crate::model::with_constants(self.vocab, self.page_size, || {
-            context::with_session(|| self.record(rows))
-        });
+        let (result, channels, names) =
+            crate::model::with_constants(self.vocab, self.page_size, || {
+                context::with_session(|| self.record(rows))
+            });
         let (stage_results, ports) = result;
         let channel_decls: Vec<ChannelDecl> = channels
             .iter()
@@ -287,7 +316,7 @@ impl<'a> Builder<'a> {
         ports.sort_by_key(|p| p.port as u8);
         TraceContainer {
             externs: Vec::new(),
-            names: Vec::new(),
+            names,
             channels: channel_decls,
             ports,
             stages,

@@ -40,7 +40,7 @@ use std::sync::{Arc, RwLock};
 use hash::Hash256;
 use page_table::{
     HostKvSlotId, IndexedWorkingSet, KvPageBacking, KvPageTable, KvTableError, NodeId,
-    PhysicalKvPageId, PublishedPage, TriePageLocation, WorkingSetId,
+    PhysicalKvPageId, PublishedPage, ReclaimQuote, TriePageLocation, WorkingSetId,
 };
 use write::{KvPreparedWrite, PageCommit, PreparedTarget};
 
@@ -696,7 +696,7 @@ impl KvStore {
         self.finish_prepare_write(ws, classification, allocated)
     }
 
-    /// Prepare using concrete ids reserved by the contention orchestrator.
+    /// Prepare using concrete ids reserved by the residency planner.
     pub fn prepare_write_granted(
         &mut self,
         ws: WorkingSetId,
@@ -1264,11 +1264,12 @@ impl KvStore {
         Ok(page_count)
     }
 
-    /// Contention-ladder rung 2 victim sizing: pages reachable only from
-    /// `ws`'s terminal (its private trie suffix) — what releasing this
-    /// WorkingSet would actually free.
-    pub fn exclusive_footprint(&self, ws: WorkingSetId) -> Result<u64, KvStoreError> {
-        Ok(self.table.exclusive_footprint(ws)?)
+    /// Victim sizing for the residency planner: what suspending each group
+    /// of WorkingSets would ACTUALLY free, answered by the same rule
+    /// `prepare_suspend` applies — with a typed reason when the answer is
+    /// zero. Batched: the shared exclusions cost one pass for the whole set.
+    pub fn reclaim_quotes(&self, groups: &[HashSet<WorkingSetId>]) -> Vec<ReclaimQuote> {
+        self.table.reclaim_quotes(groups)
     }
 
     pub fn reserve_device_pages(&mut self, count: usize) -> Option<Vec<PhysicalKvPageId>> {
@@ -1410,31 +1411,24 @@ impl KvStore {
         Ok(self.table.swapped_pages(working_sets)?.len())
     }
 
+    /// Prepare a restore from caller-owned reserved pages, consuming exactly
+    /// the required prefix of `granted` (lend semantics: failure consumes
+    /// nothing, and surplus stays caller-owned — the caller's grant guard is
+    /// the single return path).
     pub fn prepare_restore(
         &mut self,
         working_sets: &HashSet<WorkingSetId>,
-        gpu_pages: Vec<PhysicalKvPageId>,
+        granted: &mut Vec<PhysicalKvPageId>,
     ) -> Result<KvRestoreTxn, KvStoreError> {
-        let swapped = match self.table.swapped_pages(working_sets) {
-            Ok(swapped) => swapped,
-            Err(error) => {
-                self.pool.release_reserved(gpu_pages);
-                return Err(error.into());
-            }
-        };
-        if swapped.len() != gpu_pages.len() {
-            let required = swapped.len();
-            let granted = gpu_pages.len();
-            self.pool.release_reserved(gpu_pages);
-            return Err(KvStoreError::GrantMismatch { required, granted });
+        let swapped = self.table.swapped_pages(working_sets)?;
+        if granted.len() < swapped.len() {
+            return Err(KvStoreError::GrantMismatch {
+                required: swapped.len(),
+                granted: granted.len(),
+            });
         }
-        let pinned = match self.table.pin_working_sets(working_sets) {
-            Ok(pinned) => pinned,
-            Err(error) => {
-                self.pool.release_reserved(gpu_pages);
-                return Err(error.into());
-            }
-        };
+        let pinned = self.table.pin_working_sets(working_sets)?;
+        let gpu_pages: Vec<PhysicalKvPageId> = granted.drain(..swapped.len()).collect();
         let pages: Vec<RestorePage> = swapped
             .into_iter()
             .zip(gpu_pages)

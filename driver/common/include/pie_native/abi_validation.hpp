@@ -169,11 +169,11 @@ inline int validate_model_load_desc(const PieModelLoadDesc* desc,
     int status = validate_version(desc->abi_version);
     if (status != PIE_STATUS_OK) return status;
     if (desc->component > PIE_MODEL_COMPONENT_ENCODE ||
-        desc->compiler_version == 0) {
+        desc->mxfp4_moe > PIE_MXFP4_MOE_EAGER_BF16) {
         return PIE_STATUS_INVALID_ARGUMENT;
     }
-    status = validate_bytes(desc->load_plan_bytes);
-    if (status != PIE_STATUS_OK || desc->load_plan_bytes.len == 0) {
+    status = validate_bytes(desc->runtime_quant);
+    if (status != PIE_STATUS_OK) {
         return PIE_STATUS_INVALID_ARGUMENT;
     }
     status = validate_bytes(desc->snapshot_dir);

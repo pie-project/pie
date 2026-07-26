@@ -8,14 +8,9 @@
 //! `kv_last_page_lens`). Unit-testable in isolation against the locked
 //! bound program contract — no driver decode, no GPU.
 //!
-//! Complete pipeline domain API: some methods here (relaxed geometry
-//! variants, per-channel introspection, the pure `instantiate`/registry
-//! probe entry points, device-geometry lease internals) are not yet
-//! called by the current single-model/mock-driver fire path, but are
-//! exercised by this module's own unit tests and reserved for upcoming
-//! wiring (multi-pass channels, device-geometry beams) — kept rather
-//! than deleted, allowed rather than silently masked.
-#![allow(dead_code)]
+//! Every item here is reachable from `pipeline::fire`, `pipeline::instance`,
+//! or `inferlet::host::forward` — there is no module-level `dead_code` allow.
+//! The two exceptions carry their own annotated `allow` at the field.
 
 use pie_grammar::brle::RunMask;
 use pie_ptir::container::{PortSource, TraceContainer};
@@ -26,8 +21,14 @@ use pie_ptir::types::DType;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DecodeEnvelope {
     pub token_count: u32,
+    /// Classifier output kept for test observability: `classify_decode_envelope`
+    /// derives it, but no production reader consumes it (the wire geometry uses
+    /// `token_indptr`).
+    #[allow(dead_code)]
     pub lane_count: u32,
     pub token_indptr: Vec<u32>,
+    /// Classifier output kept for test observability — see [`Self::lane_count`].
+    #[allow(dead_code)]
     pub loop_carried: bool,
     /// `Positions` binds a channel (device-carried) rather than a const —
     /// executing the class demands the positions device port.
@@ -779,50 +780,26 @@ pub(crate) fn compact_page_envelope(
     Ok(compact)
 }
 
-/// Map a container's ports to the forward geometry (P2c-fire, pure).
+/// Map a container's ports to the forward geometry (P2c-fire, pure). Every
+/// descriptor port must resolve to a host-known value here; the
+/// device-geometry path does not come through this function — the driver
+/// resolves its ports in-graph and the host maps the RESULT through
+/// [`map_geometry_evaluated`].
 pub fn map_geometry(
     container: &TraceContainer,
     values: ChannelValues<'_>,
     page_size: u32,
 ) -> Result<ReqGeometry, GeometryError> {
-    map_geometry_impl(container, values, page_size, false)
-}
-
-/// **Relaxed** geometry map for a DEVICE-GEOMETRY fire (plan W3.4): a descriptor
-/// port bound to a device-produced channel that has no host-known value at fire
-/// time leaves its wire field EMPTY instead of erroring
-/// ([`GeometryError::MissingChannelValue`]). The driver resolves those ports
-/// pre-forward from the channel cells (W1.1); the host still prefills whatever
-/// const / host-known ports it can. `NoEmbed` is likewise relaxed (empty
-/// tokens). `BadPayload` still errors — a malformed const is a real bug.
-pub fn map_geometry_relaxed(
-    container: &TraceContainer,
-    values: ChannelValues<'_>,
-    page_size: u32,
-) -> Result<ReqGeometry, GeometryError> {
-    map_geometry_impl(container, values, page_size, true)
-}
-
-fn map_geometry_impl(
-    container: &TraceContainer,
-    values: ChannelValues<'_>,
-    page_size: u32,
-    relaxed: bool,
-) -> Result<ReqGeometry, GeometryError> {
     let mut g = ReqGeometry::default();
 
     // -- token family --
-    // In relaxed mode a missing embed channel leaves tokens empty (the driver
-    // reads them pre-forward); strict mode errors as before.
-    let tokens = match resolve_opt(container, values, Port::EmbedTokens, relaxed)? {
+    let tokens = match resolve(container, values, Port::EmbedTokens)? {
         Some(t) => t,
-        None if relaxed => Vec::new(),
         None => return Err(GeometryError::NoEmbed),
     };
     g.token_ids = as_u32(Port::EmbedTokens, &tokens)?;
-    g.qo_indptr = match resolve_opt(container, values, Port::EmbedIndptr, relaxed)? {
+    g.qo_indptr = match resolve(container, values, Port::EmbedIndptr)? {
         Some(b) => as_u32(Port::EmbedIndptr, &b)?,
-        None if relaxed => Vec::new(),
         None => {
             return Err(GeometryError::BadCsr {
                 port: Port::EmbedIndptr,
@@ -831,14 +808,12 @@ fn map_geometry_impl(
     };
     let lanes = g.qo_indptr.len().saturating_sub(1);
 
-    let kv_len = match resolve_opt(container, values, Port::KvLen, relaxed)? {
-        Some(b) => Some(as_u32(Port::KvLen, &b)?),
-        None if relaxed => None,
+    let kv_len = match resolve(container, values, Port::KvLen)? {
+        Some(b) => as_u32(Port::KvLen, &b)?,
         None => return Err(GeometryError::BadCsr { port: Port::KvLen }),
     };
-    g.position_ids = match resolve_opt(container, values, Port::Positions, relaxed)? {
+    g.position_ids = match resolve(container, values, Port::Positions)? {
         Some(b) => as_u32(Port::Positions, &b)?,
-        None if relaxed => Vec::new(),
         None => {
             return Err(GeometryError::BadCsr {
                 port: Port::Positions,
@@ -847,7 +822,7 @@ fn map_geometry_impl(
     };
 
     // read-out: explicit positions, else the last token of each lane.
-    match resolve_opt(container, values, Port::Readout, relaxed)? {
+    match resolve(container, values, Port::Readout)? {
         Some(b) => {
             g.sampling_indices = as_u32(Port::Readout, &b)?;
             let n = g.sampling_indices.len() as u32;
@@ -861,10 +836,10 @@ fn map_geometry_impl(
         }
     }
 
-    let explicit_pages = resolve_opt(container, values, Port::Pages, relaxed)?
+    let explicit_pages = resolve(container, values, Port::Pages)?
         .map(|b| as_u32(Port::Pages, &b))
         .transpose()?;
-    let explicit_indptr = resolve_opt(container, values, Port::PageIndptr, relaxed)?
+    let explicit_indptr = resolve(container, values, Port::PageIndptr)?
         .map(|b| as_u32(Port::PageIndptr, &b))
         .transpose()?;
     match (explicit_pages, explicit_indptr) {
@@ -873,27 +848,17 @@ fn map_geometry_impl(
                 .map_err(|_| GeometryError::BadCsr { port: Port::Pages })?;
             g.kv_page_indptr = indptr;
         }
-        (Some(_), None) if !relaxed => {
+        (Some(_), None) => {
             return Err(GeometryError::BadCsr {
                 port: Port::PageIndptr,
             });
         }
-        (None, Some(_)) if !relaxed => {
-            return Err(GeometryError::BadCsr { port: Port::Pages });
-        }
-        (Some(pages), None) => g.kv_page_indices = pages,
-        (None, Some(indptr)) => g.kv_page_indptr = indptr,
-        (None, None) if !relaxed => {
-            return Err(GeometryError::BadCsr { port: Port::Pages });
-        }
-        (None, None) => {}
+        (None, _) => return Err(GeometryError::BadCsr { port: Port::Pages }),
     }
-    if let Some(kv_len) = kv_len {
-        g.kv_last_page_lens = kv_len
-            .iter()
-            .map(|&len| last_page_len(len, page_size))
-            .collect();
-    }
+    g.kv_last_page_lens = kv_len
+        .iter()
+        .map(|&len| last_page_len(len, page_size))
+        .collect();
 
     Ok(g)
 }
@@ -909,23 +874,13 @@ fn last_page_len(len: u32, page_size: u32) -> u32 {
 }
 
 /// Resolve a port's value: its const payload, or the current value of the
-/// channel it binds. `None` if the container has no such port.
+/// channel it binds. `None` if the container has no such port; a port bound
+/// to a channel with no host-known value is an error — the host never
+/// guesses a descriptor value.
 fn resolve(
     container: &TraceContainer,
     values: ChannelValues<'_>,
     port: Port,
-) -> Result<Option<Vec<u8>>, GeometryError> {
-    resolve_opt(container, values, port, false)
-}
-
-/// Like [`resolve`] but, in `relaxed` mode, a port bound to a channel with no
-/// host-known value returns `None` (the driver resolves it pre-forward, W1.1)
-/// instead of erroring [`GeometryError::MissingChannelValue`].
-fn resolve_opt(
-    container: &TraceContainer,
-    values: ChannelValues<'_>,
-    port: Port,
-    relaxed: bool,
 ) -> Result<Option<Vec<u8>>, GeometryError> {
     let Some(binding) = container.ports.iter().find(|p| p.port == port) else {
         return Ok(None);
@@ -934,7 +889,6 @@ fn resolve_opt(
         PortSource::Const { data, .. } => Ok(Some(data.clone())),
         PortSource::Channel(c) => match values.get(*c as usize).and_then(|v| v.clone()) {
             Some(v) => Ok(Some(v)),
-            None if relaxed => Ok(None),
             None => Err(GeometryError::MissingChannelValue { port, channel: *c }),
         },
     }
@@ -1319,28 +1273,16 @@ mod tests {
         );
     }
 
-    /// W3.4 relaxed gate: a device-geometry fire whose port channels are unfilled
-    /// leaves the wire fields EMPTY (the driver resolves them pre-forward, W1.1)
-    /// instead of erroring — but const/host-known ports still prefill.
+    /// A device-geometry container's ports are unfilled at host fire time;
+    /// the strict map refuses to invent them (the driver resolves them
+    /// in-graph and the host maps the result through `map_geometry_evaluated`).
     #[test]
-    fn relaxed_leaves_device_ports_empty() {
+    fn unfilled_device_ports_are_rejected() {
         let c = beam_container(2, 3);
-        // Nothing produced yet (all device channels unfilled).
         let values: Vec<Option<Vec<u8>>> = vec![None, None, None, None];
-        let g = map_geometry_relaxed(&c, &values, 16).unwrap();
-        assert!(g.token_ids.is_empty(), "device embed_tokens left empty");
-        assert!(g.kv_page_indices.is_empty(), "device pages left empty");
-        assert!(g.kv_last_page_lens.is_empty(), "device kv_len left empty");
-        // The const embed_indptr port ([0,1,2]) still prefills.
-        assert_eq!(
-            g.qo_indptr,
-            vec![0, 1, 2],
-            "const port prefilled even in relaxed mode"
-        );
-        // strict mode still errors on the same input.
         assert!(
             map_geometry(&c, &values, 16).is_err(),
-            "strict gate still errors"
+            "strict gate errors on device-resolved ports"
         );
     }
 

@@ -81,6 +81,48 @@ pub enum KvPageBacking {
     Swapped(HostKvSlotId),
 }
 
+/// What suspending one group of WorkingSets would ACTUALLY free, decided by
+/// the same rule [`PageTable::private_resident_pages`] applies at suspend
+/// time. Victim selection consumes this, so selection and execution cannot
+/// disagree about what a candidate is worth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReclaimQuote {
+    /// Suspending this group frees exactly this many resident pages.
+    Pages(u32),
+    /// It would free nothing — and this is why.
+    Nothing(NoReclaim),
+}
+
+/// Why a group would free nothing. These are NOT interchangeable: each is
+/// cleared by a different event, and victim selection has to know which.
+/// Collapsing them into one boolean is what allowed the reclaim ladder to
+/// re-pick a useless victim forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoReclaim {
+    /// Holds no pages at all. Cannot become reclaimable by waiting — only by
+    /// ALLOCATING. This is the case that livelocked the ladder.
+    HoldsNothing,
+    /// Holds pages, but every one is reachable from another WorkingSet or a
+    /// cache root. Cleared when the sharer releases.
+    AllShared,
+    /// Holds private pages, but none are resident — they are already on host
+    /// swap, so there is nothing left to move out.
+    AllSwapped,
+    /// An in-flight pin overlaps the group's residency. Cleared when this
+    /// process's own fires drain.
+    Pinned,
+}
+
+impl ReclaimQuote {
+    /// Pages this quote promises; zero for every `Nothing` variant.
+    pub fn pages(self) -> u32 {
+        match self {
+            ReclaimQuote::Pages(pages) => pages,
+            ReclaimQuote::Nothing(_) => 0,
+        }
+    }
+}
+
 /// Stable location of an owned page while a suspend/restore transaction pins
 /// the process's trie terminals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1546,34 +1588,73 @@ impl KvPageTable {
         (dropped.len(), freed)
     }
 
-    /// FCFS victim sizing (kv_refact.md, Scheduler): the pages reachable ONLY
-    /// from `ws`'s terminal — its private suffix. Shared prefixes are
-    /// excluded because preempting one sharer never frees them; a terminal
-    /// pinned by an in-flight fire counts as shared (nothing frees until the
-    /// fire finalizes).
-    pub fn exclusive_footprint(&self, ws: WorkingSetId) -> Result<u64, KvTableError> {
-        let Some(terminal) = self.entry(ws)?.terminal else {
-            return Ok(0);
-        };
-        let others = self.mark_chains(
-            self.working_sets
-                .iter()
-                .filter_map(|(id, e)| if id == ws { None } else { e.terminal })
-                .chain(self.cache_roots.keys().copied())
-                .chain(self.pins.keys().copied()),
-        );
-        let mut pages = 0u64;
-        let mut cursor = Some(terminal);
-        while let Some(node) = cursor {
-            if others.contains(&node) {
-                break; // everything above here is shared
+    /// Batched [`ReclaimQuote`] over several candidate groups.
+    ///
+    /// The shared exclusions — how many WorkingSets reach each location, which
+    /// locations a cache root anchors, which an in-flight pin holds — are
+    /// computed ONCE for the whole batch. Calling `private_resident_pages` per
+    /// candidate would recompute the union of every other WorkingSet each
+    /// time, which is quadratic in the fleet.
+    ///
+    /// Advisory by design: a WorkingSet that has vanished contributes no
+    /// locations rather than failing the batch. The authoritative decision is
+    /// still `private_resident_pages` at suspend time.
+    pub fn reclaim_quotes(&self, groups: &[HashSet<WorkingSetId>]) -> Vec<ReclaimQuote> {
+        // How many distinct WorkingSets reach each location. A location whose
+        // owner count exceeds the group's own references is shared outward.
+        let mut owners: HashMap<TriePageLocation, u32> = HashMap::new();
+        for (ws, _) in self.working_sets.iter() {
+            for location in self.working_set_locations(ws).unwrap_or_default() {
+                *owners.entry(location).or_insert(0) += 1;
             }
-            if let Pages::Owned { backings, .. } = &self.nodes.get(node).expect("live node").pages {
-                pages += backings.len() as u64;
-            }
-            cursor = self.nodes.get(node).expect("live node").parent;
         }
-        Ok(pages)
+        let mut cache_held: HashSet<TriePageLocation> = HashSet::new();
+        for &terminal in self.cache_roots.keys() {
+            cache_held.extend(self.anchor_locations(terminal));
+        }
+        let mut pinned: HashSet<TriePageLocation> = HashSet::new();
+        for &terminal in self.pins.keys() {
+            pinned.extend(self.anchor_locations(terminal));
+        }
+
+        groups
+            .iter()
+            .map(|group| {
+                // Sharing WITHIN the group is not sharing outward, so count
+                // the group's own references per location and compare.
+                let mut mine: HashMap<TriePageLocation, u32> = HashMap::new();
+                for &ws in group {
+                    for location in self.working_set_locations(ws).unwrap_or_default() {
+                        *mine.entry(location).or_insert(0) += 1;
+                    }
+                }
+                if mine.is_empty() {
+                    return ReclaimQuote::Nothing(NoReclaim::HoldsNothing);
+                }
+                if mine.keys().any(|location| pinned.contains(location)) {
+                    return ReclaimQuote::Nothing(NoReclaim::Pinned);
+                }
+                let (mut pages, mut shared, mut swapped) = (0u32, 0usize, 0usize);
+                for (location, held) in &mine {
+                    if cache_held.contains(location)
+                        || owners.get(location).copied().unwrap_or(0) > *held
+                    {
+                        shared += 1;
+                        continue;
+                    }
+                    match self.backing_at(location) {
+                        Ok(KvPageBacking::Resident(_)) => pages += 1,
+                        _ => swapped += 1,
+                    }
+                }
+                match (pages, shared, swapped) {
+                    (0, 0, 0) => ReclaimQuote::Nothing(NoReclaim::HoldsNothing),
+                    (0, shared, _) if shared > 0 => ReclaimQuote::Nothing(NoReclaim::AllShared),
+                    (0, _, _) => ReclaimQuote::Nothing(NoReclaim::AllSwapped),
+                    (pages, _, _) => ReclaimQuote::Pages(pages),
+                }
+            })
+            .collect()
     }
 
     /// Exact private resident pages reachable by `working_sets`. Sharing
@@ -1609,7 +1690,31 @@ impl KvPageTable {
             external.extend(self.anchor_locations(terminal));
         }
 
-        let pages = target
+        // DIAGNOSIS (PIE_CONTENTION_TRACE_MS): when the suspend path finds
+        // nothing to reclaim, report WHY — how many target pages were shared
+        // with another working set, held by a cache root, or already swapped.
+        let diagnose = crate::planner::trace_enabled();
+        let (target_len, mut shared_ws, mut shared_cache, mut swapped) =
+            (target.len(), 0usize, 0usize, 0usize);
+        if diagnose {
+            let mut cache_only = HashSet::new();
+            for &terminal in self.cache_roots.keys() {
+                cache_only.extend(self.anchor_locations(terminal));
+            }
+            for location in &target {
+                if cache_only.contains(location) {
+                    shared_cache += 1;
+                }
+                if external.contains(location) && !cache_only.contains(location) {
+                    shared_ws += 1;
+                }
+                if matches!(self.backing_at(location), Ok(KvPageBacking::Swapped(_))) {
+                    swapped += 1;
+                }
+            }
+        }
+
+        let pages: Vec<_> = target
             .into_iter()
             .filter(|location| !external.contains(location))
             .filter_map(|location| match self.backing_at(&location).ok()? {
@@ -1617,6 +1722,17 @@ impl KvPageTable {
                 KvPageBacking::Swapped(_) => None,
             })
             .collect();
+        if diagnose && pages.is_empty() && target_len > 0 {
+            println!(
+                "[nothing-reclaimable] working_sets={} target_pages={} \
+                 shared_with_other_ws={} held_by_cache_root={} swapped={}",
+                working_sets.len(),
+                target_len,
+                shared_ws,
+                shared_cache,
+                swapped,
+            );
+        }
         Ok((pages, false))
     }
 

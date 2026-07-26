@@ -18,6 +18,7 @@
 #include "cuda_check.hpp"
 #include "kernels/dequant_fp4.hpp"
 #include "kernels/dequant_fp8.hpp"
+#include "kernels/gemv.hpp"
 #include "kernels/quant_bf16_to_fp8.hpp"
 #include "kernels/residual_add.hpp"
 
@@ -103,14 +104,40 @@ std::size_t cublaslt_bf16_workspace_bytes() {
     return bytes;
 }
 
+// Lazily-created singleton keyed by the CALLING THREAD'S CURRENT DEVICE.
+//
+// Tensor parallelism runs every rank inside this one process, each bound to
+// its own device. A plain process-global would therefore hand rank 1 state
+// that belongs to rank 0's device: cuBLASLt would run both ranks' matmuls
+// against a single scratch buffer (a live data race), and any algorithm that
+// zeroes its workspace bakes a memset of that foreign pointer into the
+// captured decode graph, which makes `cudaGraphInstantiate` reject the graph
+// on every rank but rank 0.
+template <typename T>
+T& per_device_singleton() {
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    thread_local int cached_device = -1;
+    thread_local T* cached = nullptr;
+    if (cached != nullptr && cached_device == device) return *cached;
+
+    static std::mutex mu;
+    static std::unordered_map<int, std::unique_ptr<T>> by_device;
+    std::lock_guard<std::mutex> lock(mu);
+    auto& slot = by_device[device];
+    if (!slot) slot = std::make_unique<T>();
+    cached = slot.get();
+    cached_device = device;
+    return *cached;
+}
+
 struct Bf16LtCtx {
     cublasLtHandle_t handle = nullptr;
     void* workspace = nullptr;
     std::size_t workspace_bytes = cublaslt_bf16_workspace_bytes();
 
     static Bf16LtCtx& instance() {
-        static Bf16LtCtx ctx;
-        return ctx;
+        return per_device_singleton<Bf16LtCtx>();
     }
 
     void ensure() {
@@ -164,11 +191,28 @@ struct Bf16LtPlanCache {
     std::unordered_map<Bf16LtKey, std::shared_ptr<Bf16LtPlan>, Bf16LtKeyHash>
         plans;
 
+    // Per device: a cached `cublasLtMatmulAlgo_t` is selected by heuristics
+    // for one handle on one device and must not be replayed on another.
     static Bf16LtPlanCache& instance() {
-        static Bf16LtPlanCache cache;
-        return cache;
+        return per_device_singleton<Bf16LtPlanCache>();
     }
 };
+
+bool use_bf16_gemv() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_BF16_GEMV");
+        if (v == nullptr || v[0] == '\0') return true;
+        return v[0] != '0';
+    }();
+    return enabled;
+}
+
+// The handle's stream, or `false` if cuBLAS will not say. Never guess:
+// falling back to the null stream would run the GEMV outside the
+// caller's ordering and race whatever produced its input.
+bool cublas_stream(cublasHandle_t handle, cudaStream_t& stream) {
+    return cublasGetStream(handle, &stream) == CUBLAS_STATUS_SUCCESS;
+}
 
 bool use_cublaslt_bf16() {
     static const bool enabled = [] {
@@ -591,6 +635,17 @@ void gemm_bf16_impl(
     float beta)
 {
     const float alpha = 1.f;
+    // M=1 is the decode shape: a single activation row against the whole
+    // weight, so there is no reuse for a tiled GEMM to exploit and the
+    // call is a pure streaming read. cuBLAS picks kernels sized for an M
+    // worth filling and reaches roughly half of HBM bandwidth on these;
+    // a warp-per-row GEMV nearly doubles it (see `launch_gemv_bf16`).
+    cudaStream_t gemv_stream = nullptr;
+    if (M == 1 && beta == 0.f && use_bf16_gemv() &&
+        cublas_stream(handle, gemv_stream) &&
+        kernels::launch_gemv_bf16(W, act, y, N, K, gemv_stream)) {
+        return;
+    }
     const int lt_max_n = cublaslt_bf16_max_n();
     if (use_cublaslt_bf16() &&
         M >= cublaslt_bf16_min_m() &&
@@ -611,6 +666,42 @@ void gemm_bf16_impl(
         /*C=*/y,   CUDA_R_16BF, /*ldc=*/N,
         bf16_compute_type(),
         CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (status == CUBLAS_STATUS_NOT_SUPPORTED) {
+        // `CUBLAS_GEMM_DEFAULT_TENSOR_OP` pins the tensor-core kernel family,
+        // and cuBLAS has no member of it for some skinny shapes: the packed
+        // q/k/v projection at TP=2 (N = Hq/T + 2*Hk/T = 2048, K = 1024) is
+        // rejected at M=1, while the same M=1 succeeds at the TP=1 width
+        // (N=4096) and at the packed gate/up width (N=3072). M=1 is not a
+        // serving shape — it is the R=1 rung of the graph lattice, so this
+        // surfaces only during upfront capture, and under TP it surfaced as a
+        // HANG rather than an error: rank 0 threw out of capture while the
+        // follower sat in `tp_graph_capture_barrier` waiting for a peer that
+        // was never going to arrive.
+        //
+        // Retry without the tensor-op pin. cuBLAS then picks whatever kernel
+        // fits; at M=1 there is no tensor-core throughput to lose anyway.
+        const auto retry = cublasGemmEx(
+            handle,
+            /*transa=*/CUBLAS_OP_T, /*transb=*/CUBLAS_OP_N,
+            /*m=*/N, /*n=*/M, /*k=*/K,
+            &alpha,
+            /*A=*/W,   CUDA_R_16BF, /*lda=*/K,
+            /*B=*/act, CUDA_R_16BF, /*ldb=*/K,
+            &beta,
+            /*C=*/y,   CUDA_R_16BF, /*ldc=*/N,
+            bf16_compute_type(),
+            CUBLAS_GEMM_DEFAULT);
+        if (retry == CUBLAS_STATUS_SUCCESS) return;
+        // Neither GemmEx algorithm family covers the shape. cuBLASLt does —
+        // it is normally skipped here by the `min_m`/`min_n` heuristics, which
+        // exist to pick the FASTER path, not the only working one.
+        if (gemm_bf16_lt_impl(handle, act, W, y, M, N, K, beta)) return;
+        throw std::runtime_error(
+            "cuBLAS error (" + std::to_string(static_cast<int>(retry)) +
+            ") after non-tensor-op and cuBLASLt retries: cublasGemmEx[bf16] M=" +
+            std::to_string(M) + " N=" + std::to_string(N) +
+            " K=" + std::to_string(K));
+    }
     if (status != CUBLAS_STATUS_SUCCESS) {
         throw std::runtime_error(
             "cuBLAS error (" + std::to_string(static_cast<int>(status)) +
@@ -750,11 +841,39 @@ void gemm_batched_bf16_impl(
               bf16_compute_type(),
               CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     if (status != CUBLAS_STATUS_SUCCESS) {
+        // cuBLAS reports INTERNAL_ERROR for anything it cannot explain,
+        // including a CUDA error that was already sticky before the call.
+        // Report the surrounding CUDA state so the message names the real
+        // fault instead of the call that noticed it.
+        int device = -1;
+        static_cast<void>(cudaGetDevice(&device));
+        const cudaError_t pending = cudaPeekAtLastError();
+        cudaStream_t stream = nullptr;
+        std::string capture = "unknown";
+        if (cublasGetStream(handle, &stream) == CUBLAS_STATUS_SUCCESS) {
+            cudaStreamCaptureStatus capture_status =
+                cudaStreamCaptureStatusNone;
+            if (cudaStreamIsCapturing(stream, &capture_status) ==
+                cudaSuccess) {
+                capture = capture_status == cudaStreamCaptureStatusActive
+                    ? "active"
+                    : (capture_status ==
+                       cudaStreamCaptureStatusInvalidated)
+                        ? "INVALIDATED"
+                        : "none";
+            }
+        }
+        std::size_t free_bytes = 0, total_bytes = 0;
+        static_cast<void>(cudaMemGetInfo(&free_bytes, &total_bytes));
         throw std::runtime_error(
             "cuBLAS error (" + std::to_string(static_cast<int>(status)) +
             "): cublasGemmBatchedEx[bf16] M=" + std::to_string(M) +
             " N=" + std::to_string(N) + " K=" + std::to_string(K) +
-            " batch=" + std::to_string(batch_count));
+            " batch=" + std::to_string(batch_count) +
+            " device=" + std::to_string(device) +
+            " capture=" + capture +
+            " pending_cuda=" + cudaGetErrorName(pending) +
+            " free_mib=" + std::to_string(free_bytes >> 20));
     }
 }
 
@@ -925,50 +1044,58 @@ struct LtMatmulPref {
 };
 
 #ifdef PIE_CUDA_HAS_MARLIN
-// Per-process marlin workspace. Marlin's split-K reduce uses one int32
+// Per-DEVICE marlin workspace. Marlin's split-K reduce uses one int32
 // per SM as a barrier counter; we allocate generously (16 KiB) to cover
 // every realistic SM count without per-call allocation. Lazy-init on
-// first INT4_PACKED dispatch.
+// first INT4_PACKED dispatch. Keyed by device so an in-process TP rank
+// never barriers through another rank's memory.
+struct MarlinWorkspace {
+    void* ptr = nullptr;
+    std::size_t bytes = 0;
+};
+struct MarlinBarrierWs : MarlinWorkspace {};
+struct MarlinReduceWs : MarlinWorkspace {};
+struct MarlinResidualWs : MarlinWorkspace {};
+
 void* marlin_workspace_() {
-    static void* ws = nullptr;
-    static const std::size_t ws_bytes = 16 * 1024;
-    if (!ws) {
-        if (cudaMalloc(&ws, ws_bytes) != cudaSuccess) {
+    auto& ws = per_device_singleton<MarlinBarrierWs>();
+    if (!ws.ptr) {
+        ws.bytes = 16 * 1024;
+        if (cudaMalloc(&ws.ptr, ws.bytes) != cudaSuccess) {
             throw std::runtime_error("marlin: cudaMalloc workspace failed");
         }
-        cudaMemset(ws, 0, ws_bytes);
+        cudaMemset(ws.ptr, 0, ws.bytes);
     }
-    return ws;
+    return ws.ptr;
 }
 
 void* marlin_fp32_reduce_scratch_() {
-    static void* ws = nullptr;
-    static const std::size_t ws_bytes = 32 * 1024 * 1024;
-    if (!ws) {
-        if (cudaMalloc(&ws, ws_bytes) != cudaSuccess) {
+    auto& ws = per_device_singleton<MarlinReduceWs>();
+    if (!ws.ptr) {
+        ws.bytes = 32 * 1024 * 1024;
+        if (cudaMalloc(&ws.ptr, ws.bytes) != cudaSuccess) {
             throw std::runtime_error(
                 "marlin: cudaMalloc fp32 reduce scratch failed");
         }
     }
-    return ws;
+    return ws.ptr;
 }
 
-// Per-process bf16 residual scratch — used when the INT4 dispatcher is
+// Per-device bf16 residual scratch — used when the INT4 dispatcher is
 // called with beta=1 (the residual-add fusion the bf16/fp8 paths handle
 // natively via cuBLAS's beta param). Marlin overwrites C, so we run it
 // into a scratch and add into y in a second pass. Grows monotonically.
 void* marlin_residual_scratch_(std::size_t bytes) {
-    static void* buf = nullptr;
-    static std::size_t buf_bytes = 0;
-    if (bytes <= buf_bytes) return buf;
-    if (buf) cudaFree(buf);
-    if (cudaMalloc(&buf, bytes) != cudaSuccess) {
+    auto& ws = per_device_singleton<MarlinResidualWs>();
+    if (bytes <= ws.bytes) return ws.ptr;
+    if (ws.ptr) cudaFree(ws.ptr);
+    if (cudaMalloc(&ws.ptr, bytes) != cudaSuccess) {
         throw std::runtime_error(
             "marlin: cudaMalloc residual scratch failed (" +
             std::to_string(bytes) + " bytes)");
     }
-    buf_bytes = bytes;
-    return buf;
+    ws.bytes = bytes;
+    return ws.ptr;
 }
 #endif
 
@@ -1499,9 +1626,10 @@ void gemm_act_x_w(
         return;
 #else
         throw std::runtime_error(
-            "gemm_act_x_w[INT4_PACKED]: marlin is not compiled into this "
-            "build (PIE_CUDA_BUILD_MARLIN was OFF). Reconfigure cmake with "
-            "-DPIE_CUDA_BUILD_MARLIN=ON to enable W4A16 GEMM.");
+            "gemm_act_x_w[INT4_PACKED]: GPTQ/AWQ W4A16 needs the vendored "
+            "marlin kernels, which are not built by default because they "
+            "dominate CUDA build time. Reconfigure with "
+            "-DPIE_CUDA_BUILD_MARLIN=ON (or PIE_CUDA_BUILD_MARLIN=1).");
 #endif
     }
     if (act_dtype == DType::BF16 && w.dtype == DType::MXFP4_PACKED &&
@@ -1548,7 +1676,10 @@ void gemm_act_x_w(
             return;
 #else
             throw std::runtime_error(
-                "gemm_act_x_w[MXFP4]: marlin requested but not compiled in");
+                "gemm_act_x_w[MXFP4]: PIE_MXFP4_GEMM=marlin was requested, but "
+                "the vendored marlin kernels are not built (configure with "
+                "-DPIE_CUDA_BUILD_MARLIN=ON). Unset PIE_MXFP4_GEMM to use the "
+                "dequant fallback.");
 #endif
         }
 

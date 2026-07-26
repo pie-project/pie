@@ -11,10 +11,11 @@
 #include <algorithm>
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
-#include "loader/checkpoint_source.hpp"
+#include "pie_loader/checkpoint_source.hpp"
 #include "loader/tensor_spec.hpp"
 #include "loader/loader_config.hpp"
 #include "loader/loader_helpers.hpp"
@@ -33,7 +34,7 @@ namespace pie_cuda_driver {
 
 class WeightCopyEngine {
 public:
-    explicit WeightCopyEngine(CheckpointSource& loader)
+    explicit WeightCopyEngine(pie_loader::CheckpointSource& loader)
         : loader_(loader) {}
 
     ~WeightCopyEngine() { destroy_noexcept(); }
@@ -43,6 +44,29 @@ public:
 
     // Counter sink for the current load (set to nullptr between loads).
     void set_stats(LoadExecutionStats* stats) noexcept { stats_ = stats; }
+
+#if PIE_CUDA_WEIGHT_COPY_ENGINE_HAS_CUDA
+    // One checkpoint span, straight to the device, on the caller's stream.
+    //
+    // The mapping and the copy used to sit together inside the checkpoint
+    // source.
+    // They are separated because they answer to different owners: the span is
+    // valid because the plan named it, the copy is correct because this engine
+    // owns the stream it runs on. Keeping them apart also leaves the reader
+    // CUDA-free, which is the shape the Metal reader already had.
+    void copy_span_to_device(std::uint32_t shard_id, std::uint64_t file_offset,
+                             std::uint64_t span_bytes, void* dst,
+                             cudaStream_t stream)
+    {
+        if (dst == nullptr && span_bytes != 0) {
+            throw std::runtime_error("checkpoint destination is null");
+        }
+        const std::uint8_t* src =
+            loader_.storage_host_ptr(shard_id, file_offset, span_bytes);
+        CUDA_CHECK(cudaMemcpyAsync(
+            dst, src, span_bytes, cudaMemcpyHostToDevice, stream));
+    }
+#endif
 
     // Queue one copy: checkpoint file span -> device dst. Batched/pinned and
     // pipelined at flush(); may flush internally when the pending queue is full.
@@ -62,7 +86,7 @@ public:
             if (batched_copies_enabled()) {
                 enqueue_batched_copy(shard_id, file_offset, span_bytes, dst, stream);
             } else {
-                loader_.copy_storage_bytes_to_device_async(
+                copy_span_to_device(
                     shard_id, file_offset, span_bytes, dst, stream);
             }
             ++pending_copy_count_;
@@ -76,7 +100,24 @@ public:
             return;
         }
 #endif
-        loader_.copy_storage_bytes_to_device(shard_id, file_offset, span_bytes, dst);
+        copy_span_blocking(shard_id, file_offset, span_bytes, dst);
+    }
+
+    // The no-copy-stream path: the default stream, synchronised before returning.
+    void copy_span_blocking(std::uint32_t shard_id, std::uint64_t file_offset,
+                            std::uint64_t span_bytes, void* dst)
+    {
+#if PIE_CUDA_WEIGHT_COPY_ENGINE_HAS_CUDA
+        if (dst == nullptr && span_bytes != 0) {
+            throw std::runtime_error("checkpoint destination is null");
+        }
+        const std::uint8_t* src =
+            loader_.storage_host_ptr(shard_id, file_offset, span_bytes);
+        CUDA_CHECK(cudaMemcpy(dst, src, span_bytes, cudaMemcpyHostToDevice));
+#else
+        (void)shard_id; (void)file_offset; (void)span_bytes; (void)dst;
+        throw std::runtime_error("weight copy engine: built without CUDA");
+#endif
     }
 
 #if PIE_CUDA_WEIGHT_COPY_ENGINE_HAS_CUDA
@@ -86,8 +127,7 @@ public:
     void queue_on_stream(std::uint32_t shard_id, std::uint64_t file_offset,
                          std::uint64_t span_bytes, void* dst, cudaStream_t stream)
     {
-        loader_.copy_storage_bytes_to_device_async(
-            shard_id, file_offset, span_bytes, dst, stream);
+        copy_span_to_device(shard_id, file_offset, span_bytes, dst, stream);
     }
 
     // A round-robin copy stream for a caller that runs its own async ops on it
@@ -436,7 +476,7 @@ private:
 #endif
     }
 
-    CheckpointSource& loader_;
+    pie_loader::CheckpointSource& loader_;
     LoadExecutionStats* stats_ = nullptr;
     double transfer_ms_sink_ = 0.0;
     std::size_t pending_copy_count_ = 0;

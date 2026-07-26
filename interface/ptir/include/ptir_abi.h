@@ -235,6 +235,7 @@ enum PtirIntrinsic : uint16_t {
   PTIR_INTR_VALUE_HEAD = 4,
   PTIR_INTR_LAYER = 5,
   PTIR_INTR_MTP_DRAFTS = 6,
+  PTIR_INTR_ATTN_SCORE = 7,
 };
 
 // ── channel host roles / readiness direction / lowering classes ──

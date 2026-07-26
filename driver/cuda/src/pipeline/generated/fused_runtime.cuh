@@ -20,6 +20,7 @@
 #include <cuda_runtime.h>
 
 #include "batch/fire_timing.hpp"
+#include "kernels/envelope_device.cuh"
 #include "cuda_check.hpp"
 #include "pipeline/generated/module_cache.hpp"
 #include "pipeline/grouped_runtime.cuh"
@@ -648,6 +649,107 @@ static __global__ void k_generated_scan_u32(
     }
 }
 
+// `envelope_dot` — Quest page criticality (Tang et al., arXiv:2406.10774).
+//
+// One block per (lane, page slot). The block reduces the per-head Quest bound
+// over the GQA group and then takes the MAX over kv heads.
+//
+// The max-over-heads is a DELIBERATE deviation from the paper, forced by the
+// consumer: Quest selects pages per head, but FlashInfer's paged layout carries
+// ONE page list shared by every head of a request, so a per-head selection has
+// no way to be expressed downstream. Reducing with max is the union of the
+// per-head selections, which keeps a page any head considers critical. That is
+// strictly more conservative than Quest: quality >= Quest, speedup <= Quest.
+//
+// Slot semantics, in the order the branches test them:
+//   slot >= page_count   -> -inf. Not a page of this request at all; a
+//                           top-k consumer must never choose it.
+//   slot >= scored_pages -> +inf. A page this fire is still writing, so its
+//                           envelope predates the tokens in it. Always keep.
+//                           This is both the fail-safe direction and Quest's
+//                           own "keep the local window" rule.
+//   otherwise            -> the bound.
+// `attn_page_mask(mask)` — the write side of the attention hook. Threshold the
+// program's per-page mask row into the model-owned keep buffer for this lane.
+//
+// The mask is read as "nonzero keeps", matching the DSL's documented contract.
+// Anything the program did not rank cannot reach here: the host arm refuses a
+// lane whose page list is longer than the declared mask, rather than letting
+// the tail default either way. Defaulting to keep would silently disable the
+// policy; defaulting to drop would silently evict real context.
+template <typename T>
+static __global__ void k_generated_attn_page_mask(
+    const PtirLaneTableHeader* header,
+    const PtirLaneRecord* lanes,
+    const GroupedLanePageMaskDevice* dests,
+    const std::uint64_t* values,
+    std::uint32_t value_count,
+    std::uint32_t mask_value) {
+    const std::uint32_t lane = blockIdx.x;
+    if (lane >= header->lane_count) return;
+    if (*grouped_commit(lanes, lane) == 0) return;
+
+    const GroupedLanePageMaskDevice d = dests[lane];
+    if (d.out == nullptr) return;
+    const T* mask = grouped_value<T>(values, value_count, lane, mask_value);
+    if (mask == nullptr) return;
+
+    for (std::uint32_t p = threadIdx.x; p < d.pages; p += blockDim.x) {
+        d.out[p] = mask[p] != static_cast<T>(0) ? std::uint8_t{1} : std::uint8_t{0};
+    }
+}
+
+template <int BLOCK>
+static __global__ void k_generated_envelope_dot(
+    const PtirLaneTableHeader* header,
+    const PtirLaneRecord* lanes,
+    const GroupedLaneEnvelopeDevice* envelopes,
+    const std::uint64_t* values,
+    std::uint32_t value_count,
+    std::uint32_t output_value,
+    std::uint32_t max_pages) {
+    const std::uint32_t lane = blockIdx.x / max_pages;
+    const std::uint32_t slot = blockIdx.x - lane * max_pages;
+    if (lane >= header->lane_count) return;
+    if (*grouped_commit(lanes, lane) == 0) return;
+
+    const GroupedLaneEnvelopeDevice e = envelopes[lane];
+    float* out = grouped_value<float>(values, value_count, lane, output_value);
+    if (out == nullptr || e.env_min == nullptr) return;
+
+    if (slot >= e.page_count) {
+        if (threadIdx.x == 0) out[slot] = -CUDART_INF_F;
+        return;
+    }
+    if (slot >= e.scored_pages) {
+        if (threadIdx.x == 0) out[slot] = CUDART_INF_F;
+        return;
+    }
+
+    const int page = static_cast<int>(e.page_ids[slot]);
+    const int num_kv_heads = static_cast<int>(e.num_kv_heads);
+    const int head_dim = static_cast<int>(e.head_dim);
+    const int group = static_cast<int>(e.num_q_heads) / num_kv_heads;
+
+    __shared__ float buf[BLOCK];
+    float best = -CUDART_INF_F;
+    for (int kh = 0; kh < num_kv_heads; ++kh) {
+        const long env_base =
+            (static_cast<long>(page) * num_kv_heads + kh) * head_dim;
+        buf[threadIdx.x] = kernels::envelope_dot_thread_partial(
+            e.query, e.env_min, e.env_max, env_base, kh * group, group,
+            head_dim, static_cast<int>(threadIdx.x), BLOCK);
+        __syncthreads();
+        for (int off = BLOCK / 2; off > 0; off >>= 1) {
+            if (threadIdx.x < off) buf[threadIdx.x] += buf[threadIdx.x + off];
+            __syncthreads();
+        }
+        if (buf[0] > best) best = buf[0];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[slot] = best;
+}
+
 static __global__ void k_generated_matmul_f32(
     const PtirLaneTableHeader* header,
     const PtirLaneRecord* lanes,
@@ -730,8 +832,11 @@ inline bool generated_stage_supported(
         const auto& region = stage.fused.regions[index];
         if (region.library) {
             if (region.library_op == PTIR_LIBRARY_SECOND_PARTY) {
-                return fail(
-                    "fused stage still requires a second-party library");
+                if (!second_party_region_supported(stage, region)) {
+                    return fail(
+                        "fused stage still requires a second-party library");
+                }
+                continue;
             }
             if (region.library_op == PTIR_LIBRARY_NUCLEUS_SAMPLE) {
                 if (!grouped_nucleus_region_supported(stage, region)) {
@@ -1007,6 +1112,49 @@ inline GroupedLaunchResult run_generated_stage(
     std::vector<std::uint8_t> temporary_elided(value_count, 0);
     std::vector<std::uint8_t> absorbed_scale_nodes(
         stage.ops.size(), 0);
+    // The nucleus kernels can read the pre-scale logits straight out of the
+    // lane's bf16 rows, so that value need not be materialized. That only holds
+    // when the value really is the logits intrinsic, optionally reshaped --
+    // exactly what `direct_logits_kind` walks at the launch site. Any other
+    // producer (a broadcast of one read-out row across B sampling lanes, say)
+    // still runs and still writes a full tensor, so shrinking its slot to four
+    // bytes lets it overrun the values laid out after it.
+    auto produces_logits_intrinsic = [&](std::uint32_t value) {
+        for (std::size_t node = 0; node < stage.ops.size(); ++node) {
+            const auto& op = stage.ops[node].op;
+            if (value < bases[node] ||
+                value >= bases[node] + op.results) {
+                continue;
+            }
+            return op.tag == PTIR_OP_INTRINSIC_VAL &&
+                (op.intr == PTIR_INTR_LOGITS ||
+                 op.intr == PTIR_INTR_MTP_LOGITS);
+        }
+        return false;
+    };
+    auto resolves_to_logits_intrinsic = [&](std::uint32_t value) {
+        if (produces_logits_intrinsic(value)) return true;
+        for (std::size_t node = 0; node < stage.ops.size(); ++node) {
+            const auto& op = stage.ops[node].op;
+            if (value < bases[node] ||
+                value >= bases[node] + op.results) {
+                continue;
+            }
+            return op.tag == PTIR_OP_RESHAPE && !op.args.empty() &&
+                produces_logits_intrinsic(op.args[0]);
+        }
+        return false;
+    };
+    // The scale divide is only folded into the nucleus kernels when the driver
+    // actually skips it, and it skips it only when the divide is a region of its
+    // own. Fused into a larger generated region the divide still runs and still
+    // writes a full tensor, so its value has to keep a full slot.
+    std::vector<std::uint8_t> lone_generated_node(stage.ops.size(), 0);
+    for (const auto& region : stage.fused.regions) {
+        if (!region.library && region.nodes.size() == 1) {
+            lone_generated_node[region.nodes[0]] = 1;
+        }
+    }
     for (const auto& region : stage.fused.regions) {
         if (!region.library ||
             region.library_op != PTIR_LIBRARY_NUCLEUS_SAMPLE ||
@@ -1018,7 +1166,8 @@ inline GroupedLaunchResult run_generated_stage(
                 [](const auto& lane) {
                     return lane.logits_bf16_rows != nullptr;
                 });
-        if (direct_logits) {
+        if (direct_logits &&
+            resolves_to_logits_intrinsic(region.inputs[0])) {
             maximum_value_bytes[region.inputs[0]] = 4;
             temporary_elided[region.inputs[0]] = 1;
         }
@@ -1029,10 +1178,12 @@ inline GroupedLaunchResult run_generated_stage(
                 scaled_value >= bases[node] + op.results) {
                 continue;
             }
+            if (lone_generated_node[node] == 0) break;
             absorbed_scale_nodes[node] = 1;
             maximum_value_bytes[scaled_value] = 4;
             temporary_elided[scaled_value] = 1;
-            if (op.tag == PTIR_OP_DIV && !op.args.empty()) {
+            if (op.tag == PTIR_OP_DIV && !op.args.empty() &&
+                resolves_to_logits_intrinsic(op.args[0])) {
                 const std::uint32_t reshape_value = op.args[0];
                 maximum_value_bytes[reshape_value] = 4;
                 temporary_elided[reshape_value] = 1;
@@ -1230,11 +1381,11 @@ inline GroupedLaunchResult run_generated_stage(
                     static_cast<std::uint32_t>(op.chan)));
         }
     }
-    std::vector<std::uint64_t> host_intrinsic_bases(lane_count * 7, 0);
-    std::vector<std::uint32_t> host_intrinsic_modes(lane_count * 7, 0);
-    std::vector<std::uint32_t> host_intrinsic_widths(lane_count * 7, 0);
-    std::vector<std::uint32_t> host_intrinsic_strides(lane_count * 7, 0);
-    std::vector<std::uint32_t> host_intrinsic_offsets(lane_count * 7, 0);
+    std::vector<std::uint64_t> host_intrinsic_bases(lane_count * kPtirIntrinsicSlots, 0);
+    std::vector<std::uint32_t> host_intrinsic_modes(lane_count * kPtirIntrinsicSlots, 0);
+    std::vector<std::uint32_t> host_intrinsic_widths(lane_count * kPtirIntrinsicSlots, 0);
+    std::vector<std::uint32_t> host_intrinsic_strides(lane_count * kPtirIntrinsicSlots, 0);
+    std::vector<std::uint32_t> host_intrinsic_offsets(lane_count * kPtirIntrinsicSlots, 0);
     std::vector<std::uint64_t> host_bf16_rows;
     std::vector<std::uint32_t> bf16_row_offsets(lane_count, UINT32_MAX);
     std::vector<std::uint64_t> host_mtp_rows;
@@ -1283,7 +1434,8 @@ inline GroupedLaunchResult run_generated_stage(
             const auto& op = stage.ops[node].op;
             if (op.tag != PTIR_OP_INTRINSIC_VAL) continue;
             const std::size_t index =
-                static_cast<std::size_t>(lane) * 7 + op.intr;
+                static_cast<std::size_t>(lane) * kPtirIntrinsicSlots +
+                op.intr;
             const GeneratedValueDesc& descriptor =
                 host_descriptors[
                     static_cast<std::size_t>(lane) * value_count +
@@ -1334,6 +1486,16 @@ inline GroupedLaunchResult run_generated_stage(
                         lanes[lane].layer_base);
                 host_intrinsic_widths[index] = 1;
                 host_intrinsic_strides[index] = 1;
+            } else if (op.intr == PTIR_INTR_ATTN_SCORE) {
+                if (lanes[lane].attn_score_base == nullptr) {
+                    throw std::runtime_error(
+                        "generated fused AttnScore intrinsic has no capture "
+                        "buffer for this lane");
+                }
+                host_intrinsic_bases[index] =
+                    reinterpret_cast<std::uint64_t>(
+                        lanes[lane].attn_score_base);
+                host_intrinsic_strides[index] = descriptor.last;
             } else {
                 throw std::runtime_error(
                     "generated fused intrinsic is unavailable");
@@ -1777,6 +1939,150 @@ inline GroupedLaunchResult run_generated_stage(
             }
             const std::uint32_t node = planned_region.nodes.front();
             const auto& op = stage.ops[node].op;
+            if (planned_region.library_op == PTIR_LIBRARY_SECOND_PARTY) {
+                if (op.tag == PTIR_OP_SINK_CALL) {
+                    // `second_party_region_supported` already proved this is
+                    // `attn_page_mask` at `OnAttnProj` with a rank-1 argument.
+                    // What is left is that the model published a destination
+                    // for every lane -- a sink with nowhere to write is a
+                    // program whose selection silently never happened, so it
+                    // throws rather than becoming a no-op.
+                    const auto mask_shape = grouped_row_shape(
+                        stage.value_types[op.args[0]], lanes);
+                    const std::uint32_t declared = mask_shape.max_columns;
+                    std::vector<GroupedLanePageMaskDevice> host_dests(
+                        lane_count);
+                    for (std::uint32_t lane = 0; lane < lane_count; ++lane) {
+                        const auto& m = lanes[lane].page_mask;
+                        if (m.out == nullptr) {
+                            throw std::runtime_error(
+                                "attn_page_mask lane has no resolved page "
+                                "mask destination");
+                        }
+                        // The row is sized by the fire (widest request), the
+                        // mask by the program, and neither bounds the other.
+                        // Write the overlap: rows are pre-seeded to "keep", so
+                        // a slot the program did not speak for keeps its page.
+                        // That is the same direction the in-flight page pinning
+                        // already errs in, and the only alternative -- evicting
+                        // a page no policy examined -- is not recoverable.
+                        const std::uint32_t writable =
+                            m.pages < declared ? m.pages : declared;
+                        if (writable == 0) {
+                            throw std::runtime_error(
+                                "attn_page_mask has no page to write; the "
+                                "program's mask and the fire's page list do "
+                                "not overlap");
+                        }
+                        host_dests[lane] =
+                            GroupedLanePageMaskDevice{m.out, writable, 0u};
+                    }
+                    GroupedLanePageMaskDevice* device_dests = nullptr;
+                    const std::size_t dest_bytes =
+                        host_dests.size() * sizeof(GroupedLanePageMaskDevice);
+                    CUDA_CHECK(cudaMallocAsync(
+                        reinterpret_cast<void**>(&device_dests), dest_bytes,
+                        stream));
+                    allocations.values.push_back(device_dests);
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        device_dests, host_dests.data(), dest_bytes,
+                        cudaMemcpyHostToDevice, stream));
+
+                    const std::uint8_t mask_dtype =
+                        stage.value_types[op.args[0]].dtype;
+                    if (mask_dtype == PTIR_DT_F32) {
+                        k_generated_attn_page_mask<float><<<
+                            lane_count, kTier0Block, 0, stream>>>(
+                            device_header, device_lanes, device_dests,
+                            device_value_pointers, value_count, op.args[0]);
+                    } else if (mask_dtype == PTIR_DT_I32) {
+                        k_generated_attn_page_mask<std::int32_t><<<
+                            lane_count, kTier0Block, 0, stream>>>(
+                            device_header, device_lanes, device_dests,
+                            device_value_pointers, value_count, op.args[0]);
+                    } else if (mask_dtype == PTIR_DT_U32) {
+                        k_generated_attn_page_mask<std::uint32_t><<<
+                            lane_count, kTier0Block, 0, stream>>>(
+                            device_header, device_lanes, device_dests,
+                            device_value_pointers, value_count, op.args[0]);
+                    } else if (mask_dtype == PTIR_DT_BOOL) {
+                        // A predicate is what a policy naturally produces
+                        // (`ge(scores, threshold)`), and bool values are stored
+                        // one byte per element here -- so this is the narrow
+                        // instantiation, not a reinterpretation of the u32 one.
+                        k_generated_attn_page_mask<std::uint8_t><<<
+                            lane_count, kTier0Block, 0, stream>>>(
+                            device_header, device_lanes, device_dests,
+                            device_value_pointers, value_count, op.args[0]);
+                    } else {
+                        throw std::runtime_error(
+                            "attn_page_mask has an unsupported mask dtype");
+                    }
+                    CUDA_CHECK(cudaGetLastError());
+                    ++result.body_op_launches;
+                    continue;
+                }
+                // `generated_stage_supported` already proved this is
+                // `envelope_dot` at an attention stage with an f32 vector
+                // result; what is left is that the caller actually resolved the
+                // fire's KV geometry for every lane. A lane without it means
+                // the attention observation was missing, which is a wiring bug,
+                // not a data-dependent condition — so it throws.
+                const auto out_shape = grouped_row_shape(
+                    stage.value_types[bases[node]], lanes);
+                const std::uint32_t max_pages = out_shape.max_columns;
+                if (max_pages == 0) {
+                    throw std::runtime_error(
+                        "envelope_dot result has no page slots");
+                }
+                std::vector<GroupedLaneEnvelopeDevice> host_envelopes(
+                    lane_count);
+                for (std::uint32_t lane = 0; lane < lane_count; ++lane) {
+                    const auto& e = lanes[lane].envelope;
+                    if (e.env_min == nullptr || e.env_max == nullptr ||
+                        e.query == nullptr || e.page_ids == nullptr ||
+                        e.num_kv_heads == 0 || e.head_dim == 0 ||
+                        e.num_q_heads % e.num_kv_heads != 0) {
+                        throw std::runtime_error(
+                            "envelope_dot lane has no resolved kv envelope");
+                    }
+                    if (e.page_count > max_pages) {
+                        throw std::runtime_error(
+                            "envelope_dot result is narrower than the lane's "
+                            "page list");
+                    }
+                    host_envelopes[lane] = GroupedLaneEnvelopeDevice{
+                        e.env_min,      e.env_max,      e.query,
+                        e.page_ids,     e.page_count,   e.scored_pages,
+                        e.num_q_heads,  e.num_kv_heads, e.head_dim,
+                        0u};
+                }
+                GroupedLaneEnvelopeDevice* device_envelopes = nullptr;
+                const std::size_t envelope_bytes =
+                    host_envelopes.size() * sizeof(GroupedLaneEnvelopeDevice);
+                CUDA_CHECK(cudaMallocAsync(
+                    reinterpret_cast<void**>(&device_envelopes),
+                    envelope_bytes, stream));
+                allocations.values.push_back(device_envelopes);
+                CUDA_CHECK(cudaMemcpyAsync(
+                    device_envelopes, host_envelopes.data(), envelope_bytes,
+                    cudaMemcpyHostToDevice, stream));
+                k_generated_envelope_dot<kTier0Block><<<
+                    lane_count * max_pages,
+                    kTier0Block,
+                    0,
+                    stream>>>(
+                    device_header,
+                    device_lanes,
+                    device_envelopes,
+                    device_value_pointers,
+                    value_count,
+                    bases[node],
+                    max_pages);
+                CUDA_CHECK(cudaGetLastError());
+                ++result.body_op_launches;
+                continue;
+            }
             if (planned_region.library_op == PTIR_LIBRARY_SCAN) {
                 const auto shape = grouped_row_shape(
                     stage.value_types[op.args[0]], lanes);

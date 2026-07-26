@@ -13,6 +13,21 @@ enum class StageHookPoint : std::uint8_t {
 
 struct StageHooks {
     void* context = nullptr;
+
+    // The fire's PTIR programs read `AttnScore` at `OnAttn`. Carried on the
+    // hooks rather than as a separate thread-local because it is a property of
+    // the programs the dispatch is about to run, and the dispatch is what
+    // installs the hooks -- so the two can never disagree about which fire they
+    // describe. A model family that does not check it simply captures nothing,
+    // and the PTIR side then fails LOUDLY at the hook rather than reading a
+    // buffer nobody wrote.
+    bool wants_attn_score = false;
+
+    // The fire's PTIR programs write `attn_page_mask` at `OnAttnProj`, and the
+    // model is expected to honour it by compacting its page table before the
+    // attention call.
+    bool wants_page_mask = false;
+
     void (*execute)(
         void* context,
         StageHookPoint point,

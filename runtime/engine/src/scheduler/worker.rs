@@ -7,21 +7,24 @@ use std::time::{Duration, Instant};
 
 use crate::driver::{
     BoundInstance, ChannelRegistrationPlan, DriverBackend, DriverId, InstanceBindingPlan,
-    PoolResizePlan, ProgramRegistration, RegisteredChannel,
-    SchedulerLimits, StateCopyPlan, SubmissionCompletion, WorkItemAttemptOutcome,
-    WorkItemCompletion,
+    PoolResizePlan, ProgramRegistration, RegisteredChannel, SchedulerLimits, StateCopyPlan,
+    SubmissionCompletion, WorkItemAttemptOutcome, WorkItemCompletion,
 };
 use crate::scheduler::ProcessId;
 use anyhow::{Result, anyhow};
 
+use super::ControlCompletion;
 use super::batch::{self, AdmissionLimits};
 use super::frame::{self, FramePlan, FramePolicy, FrameStamp};
 use super::stats::{self, SchedulerStats};
-use super::ControlCompletion;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LeaveKind {
     Terminate,
+    /// The planner is evicting the process: its lanes stop being awaited
+    /// (boundaries seal without it) while already-submitted frames stay
+    /// sealable — the tail drains untracked and its fire leases release,
+    /// which the eviction's quiescence wait depends on. No purge.
     Suspend,
     /// A pipeline closed or dropped. Its wait-set row is released immediately,
     /// while every request already accepted by the scheduler continues
@@ -30,17 +33,43 @@ pub(crate) enum LeaveKind {
     Close,
 }
 
-/// A pipeline left the fleet (cancel / kill / exit / TASK-A terminate /
-/// TASK-B preempt). Broadcasts to EVERY registered driver's scheduler
-/// thread (a pipeline's requests may have landed on any of them) so each
-/// thread's local [`FramePolicy`] drops `pid` from its wait-set.
-/// Fire-and-forget: a shutting-down/closed scheduler channel is
-/// silently skipped (nothing left there to notify).
-pub(crate) fn notify_pipeline_leave(pid: ProcessId, _kind: LeaveKind) {
+/// Post one pipeline-leave to EVERY registered driver's scheduler thread (a
+/// pipeline's requests may have landed on any of them) so each thread's
+/// local [`FramePolicy`] drops the leaver from its wait-set. Fire-and-forget:
+/// a shutting-down/closed scheduler channel is silently skipped.
+///
+/// The `id` KEY SPACE DEPENDS ON `kind` — Close is lane-keyed (pipeline
+/// scope id), Suspend/Terminate are process-keyed. Callers use the typed
+/// wrappers below so the key space is fixed by the function name instead of
+/// per-call-site convention (the §15.2 seal-wedge bug class).
+fn post_pipeline_leave(id: ProcessId, owner: Option<ProcessId>, kind: LeaveKind) {
     let handles = super::handle_registry().read().unwrap();
     for handle in handles.iter().flatten() {
-        let _ = handle.send(SchedulerItem::PipelineLeave(pid, _kind, None));
+        let _ = handle.send(SchedulerItem::PipelineLeave(id, owner, kind, None));
     }
+}
+
+/// One LANE (pipeline scope) leaves the wait-all quorum gracefully; its
+/// accepted fires drain to settlement untracked. `owner` is the owning
+/// process when known — the KV allocation-wait park posts it, because the
+/// process may block before its first fire, and without the owner the
+/// policy cannot drop it from the process-keyed `staged` /
+/// `joins_in_flight` (the frame seal would wait forever for a join that
+/// cannot come).
+pub(crate) fn notify_lane_close(scope: ProcessId, owner: Option<ProcessId>) {
+    post_pipeline_leave(scope, owner, LeaveKind::Close);
+}
+
+/// EVERY lane `pid` owns leaves the wait-all quorum (planner suspend); the
+/// submitted tail stays sealable and drains untracked. Process-keyed.
+pub(crate) fn notify_process_suspend(pid: ProcessId) {
+    post_pipeline_leave(pid, Some(pid), LeaveKind::Suspend);
+}
+
+/// Terminate `pid`'s lanes, fire-and-forget (queued fires are rejected).
+/// Process-keyed. The waited sibling is [`notify_process_terminate`].
+pub(crate) fn post_process_terminate(pid: ProcessId) {
+    post_pipeline_leave(pid, None, LeaveKind::Terminate);
 }
 
 async fn notify_pipeline_leave_and_wait(pid: ProcessId, kind: LeaveKind) {
@@ -52,7 +81,12 @@ async fn notify_pipeline_leave_and_wait(pid: ProcessId, kind: LeaveKind) {
             .filter_map(|handle| {
                 let (response, received) = tokio::sync::oneshot::channel();
                 handle
-                    .send(SchedulerItem::PipelineLeave(pid, kind, Some(response)))
+                    .send(SchedulerItem::PipelineLeave(
+                        pid,
+                        None,
+                        kind,
+                        Some(response),
+                    ))
                     .ok()
                     .map(|_| received)
             })
@@ -129,9 +163,8 @@ pub(crate) fn notify_execution_slot_consumed(pid: ProcessId) {
 }
 
 /// No-op: wait-set rejoin is implicit on the pipeline's next scheduler
-/// submission, so a join event has
-/// nothing to do here (`store::reclaim` owns the join hook for its own
-/// suspend/restore callers, which is equally inert for the same reason).
+/// submission, so a join event has nothing to do here (the planner's
+/// restore path relies on the same implicit rejoin).
 #[allow(dead_code)] // no live caller — see doc.
 pub(crate) fn notify_pipeline_join(_pid: ProcessId) {}
 
@@ -146,8 +179,6 @@ static NEXT_LOGICAL_FIRE_ID: AtomicU64 = AtomicU64::new(1);
 pub(crate) fn backstop_retirements() -> u64 {
     BACKSTOP_RETIREMENTS.load(Ordering::Relaxed)
 }
-
-
 
 pub(crate) struct PendingRequest {
     pub(crate) logical_fire_id: u64,
@@ -248,8 +279,6 @@ impl PendingRequest {
         }
     }
 
-
-
     pub(crate) fn wire_row_count(&self) -> usize {
         self.request.qo_indptr.len().saturating_sub(1)
     }
@@ -262,7 +291,6 @@ impl PendingRequest {
     pub(crate) fn preserves_inner_rows(&self) -> bool {
         self.wire_row_count() > 1
     }
-
 }
 
 fn fire_membership_hash<'a>(logical_fire_ids: impl IntoIterator<Item = &'a u64>) -> u64 {
@@ -495,11 +523,6 @@ enum SchedulerItem {
     CloseChannels {
         ids: Vec<u64>,
     },
-    FreezePipeline {
-        pid: ProcessId,
-        response: tokio::sync::oneshot::Sender<()>,
-    },
-    ResumePipeline(ProcessId),
     /// Event-driven retirement wake: sent by [`NudgeWaker`] when an in-flight
     /// driver submission completion publishes. Carries no work; it only unblocks the
     /// scheduler's wait so the retire pass runs immediately.
@@ -509,8 +532,14 @@ enum SchedulerItem {
     /// only mutates the run-loop's local [`FramePolicy`] (and, for
     /// Terminate, rejects the pid's queued work), so it can't reorder
     /// control ops or launches.
+    /// `.0` is the leaving lane's PIPELINE SCOPE id; `.1` names the owning
+    /// PROCESS when the caller knows it. The two are different key spaces
+    /// (`FramePolicy::lanes` vs `staged`/`joins_in_flight`/`pending_binds`),
+    /// and a leaver that has not fired yet has no lane to recover the owner
+    /// from — so the owner must travel with the notification.
     PipelineLeave(
         ProcessId,
+        Option<ProcessId>,
         LeaveKind,
         Option<tokio::sync::oneshot::Sender<()>>,
     ),
@@ -654,7 +683,10 @@ enum LaneRequest {
     },
     /// A control `QueuedItem` (never `Launch`): the lane runs the driver
     /// half of the old `dispatch_ordered_item` arm.
-    Control { token: u64, item: QueuedItem },
+    Control {
+        token: u64,
+        item: QueuedItem,
+    },
     /// Drain marker: the lane replies with the driver and its channel set so
     /// the worker can run shutdown teardown with everything already quiesced.
     Shutdown {
@@ -862,9 +894,9 @@ impl DriverLane {
                             let mut attempts = 0u32;
                             loop {
                                 match driver.launch(&submission) {
-                                    Ok(crate::driver::FrameLaunchOutcome::Launched(
-                                        completion,
-                                    )) => break Ok(completion),
+                                    Ok(crate::driver::FrameLaunchOutcome::Launched(completion)) => {
+                                        break Ok(completion);
+                                    }
                                     Ok(crate::driver::FrameLaunchOutcome::Exhausted) => {
                                         attempts += 1;
                                         if attempts == 1 || attempts % 1000 == 0 {
@@ -874,10 +906,8 @@ impl DriverLane {
                                             );
                                         }
                                         if attempts > EXHAUSTED_RETRY_MAX {
-                                            break Err(
-                                                "frame admission exhausted beyond deadline"
-                                                    .to_string(),
-                                            );
+                                            break Err("frame admission exhausted beyond deadline"
+                                                .to_string());
                                         }
                                         std::thread::sleep(EXHAUSTED_RETRY_SLEEP);
                                     }
@@ -1246,9 +1276,7 @@ impl DriverLane {
                 let probe_t2 = bind_probe.then(Instant::now);
                 match driver.bind_instance(&bind) {
                     Ok(bound) => {
-                        if let (Some(t0), Some(t1), Some(t2)) =
-                            (probe_t0, probe_t1, probe_t2)
-                        {
+                        if let (Some(t0), Some(t1), Some(t2)) = (probe_t0, probe_t1, probe_t2) {
                             super::fire_timing_write(&serde_json::json!({
                                 "schema": 1,
                                 "source": "scheduler",
@@ -1609,6 +1637,29 @@ struct PendingControl {
     pipeline_id: Option<ProcessId>,
     tracked_completion: Option<ControlCompletion>,
     operation: &'static str,
+    /// Whether launches must wait for this control to settle. True for a
+    /// `PreLaunchCopy` (its consumer fire is queued right behind it) and a
+    /// pool resize (its pipe drain must not admit new frames under it);
+    /// false for standalone copies — their pages are grant-pinned and no
+    /// queued fire references them, so frames keep posting while
+    /// suspend/restore traffic settles.
+    holds_launches: bool,
+}
+
+/// What one pass over the pending queue tells the frame dispatcher — see
+/// [`BatchScheduler::scan_queue`].
+#[derive(Default)]
+struct QueueScan {
+    /// Stamped fire ids still in the queue (the frame policy resolves
+    /// sealed ids that vanished against this set).
+    queued_ids: HashSet<u64>,
+    /// Lanes a frame post must hold for: only lanes with a queued
+    /// `PreLaunchCopy` (order-coupled to its consumer fire).
+    blocked_lanes: HashSet<ProcessId>,
+    /// The oldest unstamped rider, dispatched as its own batch.
+    untracked: Option<u64>,
+    /// Every queued fire id in queue order, for the shutdown drain.
+    drain_eligible: Vec<u64>,
 }
 
 struct SchedulerControl {
@@ -1779,15 +1830,6 @@ impl SchedulerHandle {
 
     pub(crate) fn nudge(&self) -> Result<()> {
         self.send(SchedulerItem::Nudge)
-    }
-
-    pub(crate) async fn freeze_pipeline(&self, pid: ProcessId) -> Result<()> {
-        self.request(|response| SchedulerItem::FreezePipeline { pid, response })
-            .await
-    }
-
-    pub(crate) fn resume_pipeline(&self, pid: ProcessId) -> Result<()> {
-        self.send(SchedulerItem::ResumePipeline(pid))
     }
 
     pub async fn register_program(&self, plan: ProgramRegistration) -> Result<u64> {
@@ -2048,7 +2090,6 @@ impl BatchScheduler {
         let mut lane_token: u64 = 0;
         let mut instances = HashMap::new();
         let mut pending = VecDeque::new();
-        let mut frozen_pipelines = HashSet::new();
         let mut terminated_processes: HashSet<ProcessId> = HashSet::new();
         let mut in_flight_launches = VecDeque::new();
         let mut in_flight_control = None;
@@ -2065,9 +2106,8 @@ impl BatchScheduler {
             limits.max_forward_tokens,
             Some(Arc::clone(&stats)),
         );
-        frame_policy.preload_free_slots(
-            crate::inferlet::process::execution_slot_capacity().unwrap_or(0),
-        );
+        frame_policy
+            .preload_free_slots(crate::inferlet::process::execution_slot_capacity().unwrap_or(0));
         // Stall self-diagnosis: a scheduler that spins on the backstop with
         // queued or in-flight work and zero progress is deadlocked from the
         // caller's point of view, and every wait in this loop is silent. After
@@ -2110,7 +2150,6 @@ impl BatchScheduler {
                     SchedulerItem::DebugDump { response } => {
                         let _ = response.send(Self::render_debug_dump(
                             &pending,
-                            &frozen_pipelines,
                             &in_flight_launches,
                             &in_flight_control,
                             &instances,
@@ -2131,7 +2170,6 @@ impl BatchScheduler {
                     item => {
                         Self::enqueue_item(
                             &mut pending,
-                            &mut frozen_pipelines,
                             &mut terminated_processes,
                             &mut in_flight_control,
                             &instances,
@@ -2149,7 +2187,12 @@ impl BatchScheduler {
                 }
             }
             let mailbox_done = Instant::now();
-            progress |= Self::retire_ready_launches(&mut in_flight_launches, &mut instances, &mut pending, &stats);
+            progress |= Self::retire_ready_launches(
+                &mut in_flight_launches,
+                &mut instances,
+                &mut pending,
+                &stats,
+            );
             progress |= Self::retire_ready_control(&mut in_flight_control);
             let retire_done = Instant::now();
             let (dispatched, wait_hint) = Self::dispatch_ready_items(
@@ -2169,10 +2212,8 @@ impl BatchScheduler {
             progress |= dispatched;
             if probe {
                 let dispatch_us = retire_done.elapsed().as_micros() as u64;
-                let mailbox_us =
-                    mailbox_done.duration_since(pass_started).as_micros() as u64;
-                let retire_us =
-                    retire_done.duration_since(mailbox_done).as_micros() as u64;
+                let mailbox_us = mailbox_done.duration_since(pass_started).as_micros() as u64;
+                let retire_us = retire_done.duration_since(mailbox_done).as_micros() as u64;
                 if mailbox_us + retire_us + dispatch_us > 2_000 {
                     let census: serde_json::Map<String, serde_json::Value> = ITEM_CENSUS_KINDS
                         .iter()
@@ -2296,7 +2337,6 @@ impl BatchScheduler {
                                  (no progress, work queued or in flight); state:\n{}",
                                 Self::render_debug_dump(
                                     &pending,
-                                    &frozen_pipelines,
                                     &in_flight_launches,
                                     &in_flight_control,
                                     &instances,
@@ -2317,7 +2357,6 @@ impl BatchScheduler {
                 if let SchedulerItem::DebugDump { response } = item {
                     let _ = response.send(Self::render_debug_dump(
                         &pending,
-                        &frozen_pipelines,
                         &in_flight_launches,
                         &in_flight_control,
                         &instances,
@@ -2339,7 +2378,6 @@ impl BatchScheduler {
                 }
                 Self::enqueue_item(
                     &mut pending,
-                    &mut frozen_pipelines,
                     &mut terminated_processes,
                     &mut in_flight_control,
                     &instances,
@@ -2364,7 +2402,6 @@ impl BatchScheduler {
     #[allow(clippy::too_many_arguments)]
     fn render_debug_dump(
         pending: &VecDeque<QueuedItem>,
-        frozen_pipelines: &HashSet<ProcessId>,
         in_flight_launches: &VecDeque<PendingLaunchBatch>,
         in_flight_control: &Option<PendingControl>,
         instances: &HashMap<u64, TrackedInstance>,
@@ -2436,7 +2473,6 @@ impl BatchScheduler {
                 let _ = writeln!(out, "in_flight_control: none");
             }
         }
-        let _ = writeln!(out, "frozen: {:?}", frozen_pipelines);
         let _ = write!(out, "{}", frame_policy.debug_summary());
         out
     }
@@ -2444,7 +2480,6 @@ impl BatchScheduler {
     #[allow(clippy::too_many_arguments)]
     fn enqueue_item(
         pending: &mut VecDeque<QueuedItem>,
-        frozen_pipelines: &mut HashSet<ProcessId>,
         terminated_processes: &mut HashSet<ProcessId>,
         in_flight_control: &mut Option<PendingControl>,
         instances: &HashMap<u64, TrackedInstance>,
@@ -2466,13 +2501,6 @@ impl BatchScheduler {
             // A nudge only unblocks the wait; the retire pass at the top of
             // the loop does the work.
             SchedulerItem::Nudge => {}
-            SchedulerItem::FreezePipeline { pid, response } => {
-                frozen_pipelines.insert(pid);
-                let _ = response.send(());
-            }
-            SchedulerItem::ResumePipeline(pid) => {
-                frozen_pipelines.remove(&pid);
-            }
             // Immediate, not queued. Termination rejects queued work; graceful
             // pipeline close instead releases the wait-set and lets every
             // already-admitted request drain untracked.
@@ -2488,7 +2516,7 @@ impl BatchScheduler {
             SchedulerItem::ExecutionSlotConsumed(pid) => {
                 frame_policy.on_execution_slot_consumed(pid);
             }
-            SchedulerItem::PipelineLeave(pid, kind, response) => {
+            SchedulerItem::PipelineLeave(pid, owner, kind, response) => {
                 if kind == LeaveKind::Terminate {
                     if !terminated_processes.insert(pid) {
                         // Duplicate Terminate (the exit funnel notifies from
@@ -2513,16 +2541,24 @@ impl BatchScheduler {
                         completion.request_cancel();
                     }
                     Self::reject_pipeline_queued(pending, pid, protected.as_ref());
-                    frozen_pipelines.remove(&pid);
                 }
-                if kind == LeaveKind::Close {
-                    // Graceful close keeps queued frames: their accepted
-                    // fires drain to settlement like any submitted work.
-                    frame_policy.on_lane_leave(pid, false);
-                } else {
-                    // Terminate/Suspend rejected the lane's queued fires.
-                    frame_policy.on_lane_leave(pid, true);
-                    frame_policy.on_process_leave(pid);
+                match kind {
+                    LeaveKind::Close => {
+                        // Graceful close keeps queued frames: their accepted
+                        // fires drain to settlement like any submitted work.
+                        frame_policy.on_lane_leave(pid, owner, false);
+                    }
+                    LeaveKind::Suspend => {
+                        // Process-wide graceful leave (see the variant doc);
+                        // `pid` names the process here.
+                        frame_policy.on_process_suspend(pid);
+                    }
+                    LeaveKind::Terminate => {
+                        // Terminate rejected the lane's queued fires. Both
+                        // ids are the process here, so the owner is `pid`.
+                        frame_policy.on_lane_leave(pid, owner.or(Some(pid)), true);
+                        frame_policy.on_process_leave(pid);
+                    }
                 }
                 if let Some(response) = response {
                     let _ = response.send(());
@@ -2712,7 +2748,6 @@ impl BatchScheduler {
         }
     }
 
-
     fn reject_pipeline_queued(
         pending: &mut VecDeque<QueuedItem>,
         pid: ProcessId,
@@ -2811,10 +2846,14 @@ impl BatchScheduler {
     /// A standalone KV/state copy: suspend D2H, restore H2D, graft/CAS
     /// copies. These touch pages no queued fire references (suspend takes
     /// only unpinned drained pages; restore writes freshly reserved ones),
-    /// so a held wave must NEVER starve them — the preemption ladder is
-    /// what unsticks a held wave in the first place. `PreLaunchCopy` is
-    /// NOT in this class: it is order-coupled to its own launch (queued
-    /// directly in front of it) and must keep queue order.
+    /// so a held wave must NEVER starve them — the planner's eviction and
+    /// restore traffic is what unsticks a held wave in the first place. They therefore
+    /// dispatch out-of-band from any queue position once the control slot
+    /// frees (`dispatch_ready_items` tail sweep), never barrier a queued
+    /// fire, and never hold frame posting while they settle.
+    /// `PreLaunchCopy` is NOT in this class: it is order-coupled to its
+    /// own launch (queued directly in front of it) and must keep queue
+    /// order.
     const fn standalone_copy(item: &QueuedItem) -> bool {
         matches!(
             item,
@@ -3068,8 +3107,7 @@ impl BatchScheduler {
                         || !pending.iter().skip(1).any(|item| {
                             !matches!(
                                 item,
-                                QueuedItem::CloseInstance { .. }
-                                    | QueuedItem::CloseChannels { .. }
+                                QueuedItem::CloseInstance { .. } | QueuedItem::CloseChannels { .. }
                             )
                         })
                     {
@@ -3087,8 +3125,7 @@ impl BatchScheduler {
                         || !pending.iter().skip(1).any(|item| {
                             !matches!(
                                 item,
-                                QueuedItem::CloseInstance { .. }
-                                    | QueuedItem::CloseChannels { .. }
+                                QueuedItem::CloseInstance { .. } | QueuedItem::CloseChannels { .. }
                             )
                         })
                     {
@@ -3121,6 +3158,32 @@ impl BatchScheduler {
                     progress = true;
                 }
             }
+        }
+        // Standalone copies dispatch from ANY queue position once the
+        // control slot frees: nothing queued orders against them (their
+        // pages are grant-pinned — see the queue scan in
+        // `dispatch_frame_work`), while the queue front can be legitimately
+        // immovable for a long stretch (a gathering frame's fires, a resize
+        // waiting out the pipe). Under contention the suspend/restore
+        // copies ARE the residency planner's forward progress — leaving
+        // them positional starved the very traffic that unsticks a held
+        // frame (CONTENTION_FOLLOWUP.md §12).
+        if in_flight_control.is_none()
+            && let Some(index) = pending
+                .iter()
+                .position(|item| Self::standalone_copy(item))
+            && let Some(item) = pending.remove(index)
+        {
+            Self::post_control(
+                driver_lane,
+                lane_inflight,
+                lane_token,
+                instances,
+                in_flight_control,
+                frame_policy,
+                item,
+            );
+            progress = true;
         }
         (progress, wait_hint)
     }
@@ -3245,7 +3308,10 @@ impl BatchScheduler {
         let token = *lane_token;
         // Async-completing controls hold the single control slot from POST:
         // the copy's coupled consumer launch (and any later control) must
-        // not pass it, exactly as before the lane existed.
+        // not pass it, exactly as before the lane existed. Exactly the
+        // standalone copies do NOT hold launches — one classification,
+        // shared with the out-of-band dispatch that relies on it.
+        let holds_launches = !Self::standalone_copy(&item);
         match &item {
             QueuedItem::PreLaunchCopy {
                 plan,
@@ -3260,6 +3326,7 @@ impl BatchScheduler {
                     pipeline_id: *pipeline_id,
                     tracked_completion: None,
                     operation: plan.label(),
+                    holds_launches,
                 });
             }
             QueuedItem::CopyKv { .. } => {
@@ -3270,6 +3337,7 @@ impl BatchScheduler {
                     pipeline_id: None,
                     tracked_completion: None,
                     operation: "KV copy",
+                    holds_launches,
                 });
             }
             QueuedItem::CopyKvTracked { completion, .. } => {
@@ -3280,6 +3348,7 @@ impl BatchScheduler {
                     pipeline_id: None,
                     tracked_completion: Some(completion.clone()),
                     operation: "tracked KV copy",
+                    holds_launches,
                 });
             }
             QueuedItem::CopyState { .. } => {
@@ -3290,6 +3359,7 @@ impl BatchScheduler {
                     pipeline_id: None,
                     tracked_completion: None,
                     operation: "state copy",
+                    holds_launches,
                 });
             }
             QueuedItem::ResizePool { .. } => {
@@ -3300,12 +3370,51 @@ impl BatchScheduler {
                     pipeline_id: None,
                     tracked_completion: None,
                     operation: "pool resize",
+                    holds_launches,
                 });
             }
             _ => {}
         }
         *lane_inflight += 1;
         driver_lane.post(LaneRequest::Control { token, item });
+    }
+
+    /// One queue pass: the stamped ids still queued, the oldest unstamped
+    /// rider, and the lanes a frame post must hold for.
+    ///
+    /// Only a queued `PreLaunchCopy` blocks a lane — it is order-coupled to
+    /// its consumer fire by construction. Standalone copies and pool
+    /// resizes never barrier fires: reservations pin every page they touch
+    /// and no queued fire can reference those pages (the planner's eviction
+    /// fences and quiesces a victim's working sets before its D2H, and a
+    /// restored process is only readmitted after its H2D copy retired —
+    /// `planner::exec` awaits the tracked completion before the commit).
+    /// Resizes were exempted first, on the same pinning argument (~45x on
+    /// gen-boundary teardown); the copy barrier that remained composed with
+    /// frame atomicity and the resize rotation refusal into a three-party
+    /// queue-order deadlock under contention — a sealed frame straddling a
+    /// {resize, copy} pair never posted (CONTENTION_FOLLOWUP.md §12).
+    fn scan_queue(pending: &VecDeque<QueuedItem>) -> QueueScan {
+        let mut scan = QueueScan::default();
+        for item in pending.iter() {
+            match item {
+                QueuedItem::Launch(request) => {
+                    scan.drain_eligible.push(request.logical_fire_id);
+                    if request.frame.is_some() {
+                        scan.queued_ids.insert(request.logical_fire_id);
+                    } else if scan.untracked.is_none() {
+                        scan.untracked = Some(request.logical_fire_id);
+                    }
+                }
+                QueuedItem::PreLaunchCopy { pipeline_id, .. } => {
+                    if let Some(pipeline_id) = pipeline_id {
+                        scan.blocked_lanes.insert(*pipeline_id);
+                    }
+                }
+                _ => {}
+            }
+        }
+        scan
     }
 
     /// Launch dispatch: post WHOLE sealed frames to the driver lane at the
@@ -3334,10 +3443,16 @@ impl BatchScheduler {
             *hint = Some(hint.map_or(hold, |old| old.min(hold)));
         };
         loop {
-            // A settling copy/resize holds launches — the very next launch
-            // may be the copy's coupled consumer (same rule as the control
-            // path).
-            if in_flight_control.is_some() {
+            // A settling control holds launches only when a launch could
+            // depend on it: a `PreLaunchCopy`'s consumer fire is queued
+            // right behind it, and a resize's pipe drain must not admit new
+            // frames under it. A settling standalone copy holds nothing
+            // (`PendingControl::holds_launches`) — frames keep posting
+            // while suspend/restore traffic settles.
+            if in_flight_control
+                .as_ref()
+                .is_some_and(|control| control.holds_launches)
+            {
                 break;
             }
             // Run-ahead depth in FRAMES: the enqueue horizon. Retirement
@@ -3347,57 +3462,7 @@ impl BatchScheduler {
                 break;
             }
             let now = Instant::now();
-            // One queue pass: the stamped ids still queued, the oldest
-            // unstamped rider, and the lanes a frame post must hold for.
-            //
-            // A queued ASYNC control (standalone copy / pool resize) is a
-            // launch barrier: a fire enqueued behind it must not post until
-            // it dispatches and retires — its effect (pool geometry, page
-            // contents) is part of the state the later fire was submitted
-            // against. Frames are atomic, so a frame containing a barriered
-            // fire holds WHOLE (its lane joins `blocked_lanes`); pre-launch
-            // copies barrier their pipeline's lane the same way.
-            let mut queued_ids = HashSet::new();
-            let mut blocked_lanes: HashSet<ProcessId> = HashSet::new();
-            let mut untracked: Option<u64> = None;
-            let mut drain_eligible: Vec<u64> = Vec::new();
-            let mut barrier_seen = false;
-            for item in pending.iter() {
-                match item {
-                    QueuedItem::Launch(request) => {
-                        if !barrier_seen {
-                            drain_eligible.push(request.logical_fire_id);
-                        }
-                        if let Some(stamp) = &request.frame {
-                            queued_ids.insert(request.logical_fire_id);
-                            if barrier_seen {
-                                blocked_lanes.insert(stamp.lane);
-                            }
-                        } else if untracked.is_none() && !barrier_seen {
-                            untracked = Some(request.logical_fire_id);
-                        }
-                    }
-                    QueuedItem::PreLaunchCopy { pipeline_id, .. } => {
-                        if let Some(pipeline_id) = pipeline_id {
-                            blocked_lanes.insert(*pipeline_id);
-                        }
-                    }
-                    QueuedItem::CopyKv { .. }
-                    | QueuedItem::CopyKvTracked { .. }
-                    | QueuedItem::CopyState { .. } => {
-                        barrier_seen = true;
-                    }
-                    // ResizePool is a pure capacity operation: the driver's
-                    // quiescence gate (resize refuses while the stream is
-                    // busy) holds correctness, and engine grants make a trim
-                    // of live pages impossible — so fires never wait for a
-                    // queued resize. Barriering them paced gen-boundary
-                    // teardown (a resize per reclaim step) to one frame per
-                    // resize cycle and collapsed long-tail shapes ~45x.
-                    QueuedItem::ResizePool { .. } => {}
-                    _ => {}
-                }
-            }
+            let scan = Self::scan_queue(pending);
             let mut rider_batch = false;
             let waves: Vec<Vec<u64>> = if stopping {
                 // Shutdown drain: the boundary gate waits for arrivals that
@@ -3406,17 +3471,17 @@ impl BatchScheduler {
                 // lane's submission order, which the device tickets require);
                 // repeated instances and budget overflows split into
                 // successive steps at build.
-                if drain_eligible.is_empty() {
+                if scan.drain_eligible.is_empty() {
                     break;
                 }
-                vec![drain_eligible]
-            } else if let Some(untracked) = untracked {
+                vec![scan.drain_eligible]
+            } else if let Some(untracked) = scan.untracked {
                 rider_batch = true;
                 vec![vec![untracked]]
             } else {
                 match frame_policy.plan_dispatch(
-                    &queued_ids,
-                    &blocked_lanes,
+                    &scan.queued_ids,
+                    &scan.blocked_lanes,
                     !in_flight_launches.is_empty(),
                     now,
                 ) {
@@ -3483,9 +3548,7 @@ impl BatchScheduler {
             (0..waves.len()).map(|_| Vec::new()).collect();
         while let Some(item) = pending.pop_front() {
             match item {
-                QueuedItem::Launch(request)
-                    if wave_of.contains_key(&request.logical_fire_id) =>
-                {
+                QueuedItem::Launch(request) if wave_of.contains_key(&request.logical_fire_id) => {
                     picked_waves[wave_of[&request.logical_fire_id]].push(request);
                 }
                 item => kept.push_back(item),
@@ -3771,9 +3834,7 @@ impl BatchScheduler {
     fn queued_untracked_riders(pending: &VecDeque<QueuedItem>) -> usize {
         pending
             .iter()
-            .filter(|item| {
-                matches!(item, QueuedItem::Launch(request) if request.frame.is_none())
-            })
+            .filter(|item| matches!(item, QueuedItem::Launch(request) if request.frame.is_none()))
             .count()
     }
 
@@ -4892,14 +4953,13 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn impossible_admission_fails_without_parking() -> anyhow::Result<()> {
         let operation_log = Arc::new(Mutex::new(Vec::new()));
-        let (driver_id, scheduler, bound, _endpoints) =
+        let (driver_id, _scheduler, bound, _endpoints) =
             setup_scheduler_with_options(DummyDriverOptions {
                 prepare_impossible_above_kv_pages: 1,
                 operation_log: Some(operation_log.clone()),
                 ..DummyDriverOptions::default()
             })
             .await?;
-        let stats = Arc::clone(scheduler.stats());
         let mut launch = dummy_launch();
         launch.required_kv_pages = 2;
         let completion = bound.reserve_completion();
@@ -6142,7 +6202,7 @@ mod tests {
             Some(pid_a),
             second_a.clone(),
         )?;
-        notify_pipeline_leave(pid_b, LeaveKind::Terminate);
+        post_process_terminate(pid_b);
         timeout(Duration::from_secs(5), second_a).await??;
         assert!(
             started.elapsed() < Duration::from_millis(8),
@@ -6563,6 +6623,245 @@ mod tests {
             frame_policy.plan_dispatch(&HashSet::new(), &HashSet::new(), false, Instant::now()),
             FramePlan::Park,
             "the frame resolved without the fire; the lane stays awaited"
+        );
+    }
+
+    /// §12 regression, sweep half: a suspend/restore copy dispatches even
+    /// when the queue front cannot move — front is a stamped fire whose
+    /// frame is still gathering, behind it a ResizePool (not a valid
+    /// rotate target), and only then the copy. The front-only scan starved
+    /// the copy forever; the captured production wedge froze exactly here
+    /// for ~70 s (sealed=1, in-flight empty, 8 copies queued).
+    #[test]
+    fn standalone_copy_dispatches_out_of_band_past_an_immovable_front() {
+        let pid = ProcessId::new_v4();
+        let stamp = FrameStamp {
+            lane: pid,
+            seq: 1,
+            slot: 0,
+            fires: 2,
+        };
+        let request = PendingRequest::direct(
+            dummy_launch(),
+            7,
+            WorkItemCompletion::deferred_with_guard(None),
+            0,
+            Some(pid),
+            Some(pid),
+            false,
+            None,
+            None,
+            Some(stamp),
+            false,
+        );
+        let fire_id = request.logical_fire_id;
+        // fires=2 with one arrival: the frame is still gathering, so the
+        // front launch is immovable.
+        let mut frame_policy = FramePolicy::new(1, 2, 4096, None);
+        frame_policy.on_fire_enqueued(stamp, Some(pid), fire_id, 1, 1);
+
+        let (resize_tx, _resize_rx) = tokio::sync::oneshot::channel();
+        let mut pending = VecDeque::from([
+            QueuedItem::Launch(request),
+            QueuedItem::ResizePool {
+                plan: PoolResizePlan::default(),
+                response: resize_tx,
+            },
+            QueuedItem::CopyKvTracked {
+                plan: crate::driver::KvCopyPlan::default(),
+                completion: ControlCompletion::new(),
+            },
+        ]);
+        let (lane, _lane_rx) = test_lane(None);
+        let mut lane_inflight = 0u64;
+        let mut lane_token = 0u64;
+        let mut instances = HashMap::new();
+        let mut in_flight_launches = VecDeque::new();
+        let mut in_flight_control = None;
+        let limits = SchedulerLimits {
+            max_forward_requests: 64,
+            max_forward_tokens: 64,
+            max_page_refs: 64,
+        };
+        let stats = Arc::new(SchedulerStats::default());
+
+        let (progress, _) = BatchScheduler::dispatch_ready_items(
+            &lane,
+            &mut lane_inflight,
+            &mut lane_token,
+            &mut instances,
+            &mut pending,
+            &mut in_flight_launches,
+            &mut in_flight_control,
+            16,
+            limits,
+            &stats,
+            &mut frame_policy,
+            false,
+        );
+        assert!(progress, "the copy dispatch is progress");
+        assert!(
+            in_flight_launches.is_empty(),
+            "the gathering frame must not post"
+        );
+        assert_eq!(
+            in_flight_control.as_ref().map(|control| control.operation),
+            Some("tracked KV copy"),
+            "the copy dispatches out-of-band past the launch and the resize"
+        );
+        assert_eq!(pending.len(), 2, "launch and resize keep their positions");
+    }
+
+    /// §12 regression, barrier half: queued standalone copies and resizes
+    /// contribute NOTHING to `blocked_lanes` — a sealed frame straddling
+    /// them posts whole. Only a `PreLaunchCopy` blocks, and only its own
+    /// lane.
+    #[test]
+    fn queued_standalone_copies_and_resizes_never_block_lanes() {
+        let lane_a = ProcessId::new_v4();
+        let lane_b = ProcessId::new_v4();
+        let coupled = ProcessId::new_v4();
+        let stamped = |lane: ProcessId, instance: u64| {
+            PendingRequest::direct(
+                dummy_launch(),
+                instance,
+                WorkItemCompletion::deferred_with_guard(None),
+                0,
+                Some(lane),
+                Some(lane),
+                false,
+                None,
+                None,
+                Some(FrameStamp {
+                    lane,
+                    seq: 1,
+                    slot: 0,
+                    fires: 1,
+                }),
+                false,
+            )
+        };
+        let request_a = stamped(lane_a, 7);
+        let request_b = stamped(lane_b, 8);
+        let fire_a = request_a.logical_fire_id;
+        let fire_b = request_b.logical_fire_id;
+        let (resize_tx, _resize_rx) = tokio::sync::oneshot::channel();
+        let (copy_tx, _copy_rx) = tokio::sync::oneshot::channel();
+        let pending = VecDeque::from([
+            QueuedItem::Launch(request_a),
+            QueuedItem::ResizePool {
+                plan: PoolResizePlan::default(),
+                response: resize_tx,
+            },
+            QueuedItem::CopyKvTracked {
+                plan: crate::driver::KvCopyPlan::default(),
+                completion: ControlCompletion::new(),
+            },
+            QueuedItem::CopyKv {
+                plan: crate::driver::KvCopyPlan::default(),
+                response: copy_tx,
+            },
+            QueuedItem::Launch(request_b),
+            QueuedItem::PreLaunchCopy {
+                plan: PreLaunchCopy::Kv(crate::driver::KvCopyPlan::default()),
+                logical_completion: WorkItemCompletion::deferred_with_guard(None),
+                process_id: Some(coupled),
+                pipeline_id: Some(coupled),
+            },
+        ]);
+
+        let scan = BatchScheduler::scan_queue(&pending);
+        assert_eq!(
+            scan.queued_ids,
+            [fire_a, fire_b].into_iter().collect::<HashSet<u64>>()
+        );
+        assert_eq!(
+            scan.blocked_lanes,
+            [coupled].into_iter().collect::<HashSet<ProcessId>>(),
+            "only the pre-launch copy's lane blocks; the fire behind the \
+             resize/copy run stays dispatchable (the deadlock's broken edge)"
+        );
+        assert_eq!(scan.drain_eligible, vec![fire_a, fire_b]);
+        assert_eq!(scan.untracked, None);
+    }
+
+    /// A settling standalone copy does not hold frame posting; a settling
+    /// pre-launch copy or resize still does. Observable without a bound
+    /// instance: when frame work RUNS, the sealed fire is extracted from
+    /// the queue (and rejected as unknown-instance); when held, it stays
+    /// queued.
+    #[test]
+    fn a_settling_standalone_copy_does_not_hold_frame_posting() {
+        let run = |holds_launches: bool| {
+            let pid = ProcessId::new_v4();
+            let stamp = FrameStamp {
+                lane: pid,
+                seq: 1,
+                slot: 0,
+                fires: 1,
+            };
+            let request = PendingRequest::direct(
+                dummy_launch(),
+                7,
+                WorkItemCompletion::deferred_with_guard(None),
+                0,
+                Some(pid),
+                Some(pid),
+                false,
+                None,
+                None,
+                Some(stamp),
+                false,
+            );
+            let fire_id = request.logical_fire_id;
+            let mut frame_policy = FramePolicy::new(1, 1, 4096, None);
+            frame_policy.on_fire_enqueued(stamp, Some(pid), fire_id, 1, 1);
+            let mut pending = VecDeque::from([QueuedItem::Launch(request)]);
+            let (lane, _lane_rx) = test_lane(None);
+            let mut lane_inflight = 0u64;
+            let mut lane_token = 1u64;
+            let mut instances = HashMap::new();
+            let mut in_flight_launches = VecDeque::new();
+            let mut in_flight_control = Some(PendingControl {
+                state: ControlSlotState::Posted { token: 1 },
+                logical_completion: None,
+                process_id: None,
+                pipeline_id: None,
+                tracked_completion: None,
+                operation: "tracked KV copy",
+                holds_launches,
+            });
+            let limits = SchedulerLimits {
+                max_forward_requests: 64,
+                max_forward_tokens: 64,
+                max_page_refs: 64,
+            };
+            let stats = Arc::new(SchedulerStats::default());
+            BatchScheduler::dispatch_ready_items(
+                &lane,
+                &mut lane_inflight,
+                &mut lane_token,
+                &mut instances,
+                &mut pending,
+                &mut in_flight_launches,
+                &mut in_flight_control,
+                16,
+                limits,
+                &stats,
+                &mut frame_policy,
+                false,
+            );
+            pending.len()
+        };
+        assert_eq!(
+            run(false),
+            0,
+            "frame work proceeds past a settling standalone copy"
+        );
+        assert_eq!(
+            run(true),
+            1,
+            "a settling pre-launch copy or resize still holds launches"
         );
     }
 }

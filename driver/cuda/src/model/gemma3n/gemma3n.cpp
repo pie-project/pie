@@ -502,11 +502,6 @@ void gemma3n_forward_paged(
             ops::gemm_act_x_wt_bf16(cublas.handle(),
                 ws.norm_x.data(), layer.v_proj->data(), ws.v.data(), N, Hk, H);
         }
-        invoke_stage_hook(
-            StageHookPoint::OnAttnProj, ws.q.data(),
-            static_cast<std::uint32_t>(N),
-            static_cast<std::uint32_t>(Hq),
-            static_cast<std::uint32_t>(L), stream);
         kernels::launch_rmsnorm_bf16(
             ws.q.data(), layer.q_norm->data(), ws.q.data(),
             N * num_q_heads_local, d, eps, stream);
@@ -538,6 +533,16 @@ void gemma3n_forward_paged(
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 N, R, stream);
         }
+        // Fires POST-rope (and post q/k-norm): the query a PTIR program
+        // observes here is the one that actually enters attention, so an
+        // observer scoring it against the cached keys -- which are stored
+        // post-rope -- compares in the same space.
+        invoke_stage_hook(
+            StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            static_cast<std::uint32_t>(L), stream);
+
         auto kv_view = cache.layer_view(kv_layer);
 
         const int layer_window = w.per_layer_window_left[L];

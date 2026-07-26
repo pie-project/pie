@@ -21,6 +21,7 @@
 
 using pie_cuda_driver::kernels::launch_envelope_dot_f32;
 using pie_cuda_driver::kernels::launch_envelope_recompute_bf16;
+using pie_cuda_driver::kernels::launch_envelope_update_appended_bf16;
 
 namespace {
 
@@ -125,6 +126,146 @@ void check_recompute(const char* name, int num_pages, int page_size, int nkvh,
     cudaFree(dk); cudaFree(dlive); cudaFree(dmin); cudaFree(dmax);
 }
 
+// One request in a synthetic fire: how many tokens it appends, and the physical
+// pages its KV list points at. `last_page_len` is POST-append (that is the
+// invariant `write_kv_kernel` reads), so the pre-append length is
+// `(pages.size()-1)*page_size + last_page_len - qo_len`.
+struct FireRequest {
+    int qo_len;
+    int last_page_len;
+    std::vector<std::uint32_t> pages;  // physical page ids, deliberately scattered
+};
+
+// The incremental maintenance path must land on exactly the bytes a full
+// recompute would. A fire only appends, so it refreshes a subset of pages; the
+// kernel derives that subset on-device from the CSR arrays, so this builds real
+// CSR arrays (with scattered physical pages, so a mis-index is caught), asserts
+// the touched pages match the full recompute bit for bit, and asserts every
+// other page stays poisoned (so a bug that just rewrites everything fails).
+void check_update_appended(const char* name, int num_pages, int page_size,
+                           int nkvh, int hd,
+                           const std::vector<FireRequest>& reqs) {
+    const long tok = static_cast<long>(nkvh) * hd;
+    const long n = static_cast<long>(num_pages) * page_size * tok;
+    const long envn = static_cast<long>(num_pages) * nkvh * hd;
+    std::vector<std::uint16_t> k(n);
+    for (long g = 0; g < n; ++g)
+        k[g] = f2b(std::cos(0.017f * static_cast<float>(g)) * 3.0f);
+
+    // CSR mirrors, exactly as the KV write path holds them.
+    const int R = static_cast<int>(reqs.size());
+    std::vector<std::uint32_t> qo_indptr(R + 1, 0), kv_page_indptr(R + 1, 0);
+    std::vector<std::uint32_t> kv_page_indices, kv_last_page_lens(R, 0);
+    for (int r = 0; r < R; ++r) {
+        qo_indptr[r + 1] = qo_indptr[r] + static_cast<std::uint32_t>(reqs[r].qo_len);
+        kv_page_indptr[r + 1] =
+            kv_page_indptr[r] + static_cast<std::uint32_t>(reqs[r].pages.size());
+        kv_page_indices.insert(kv_page_indices.end(), reqs[r].pages.begin(),
+                               reqs[r].pages.end());
+        kv_last_page_lens[r] = static_cast<std::uint32_t>(reqs[r].last_page_len);
+    }
+
+    // Pool-wide live lengths for the full recompute, and the host's independent
+    // derivation of the touched set (same arithmetic, computed separately so a
+    // kernel that agrees with itself but not the spec still fails).
+    std::vector<int> live(num_pages, 0);
+    std::vector<bool> touched(num_pages, false);
+    for (const FireRequest& req : reqs) {
+        const int np = static_cast<int>(req.pages.size());
+        for (int i = 0; i < np; ++i)
+            live[req.pages[i]] = (i == np - 1) ? req.last_page_len : page_size;
+        const int total_after = (np - 1) * page_size + req.last_page_len;
+        const int first = (total_after - req.qo_len) / page_size;
+        const int last = (total_after - 1) / page_size;
+        for (int i = first; i <= last && i < np; ++i) touched[req.pages[i]] = true;
+    }
+
+    std::uint16_t* dk;
+    std::int32_t* dlive;
+    float *dmin_ref, *dmax_ref, *dmin_inc, *dmax_inc;
+    std::uint32_t *d_qo, *d_idx, *d_indptr, *d_lastlen;
+    RT(cudaMalloc(&dk, n * 2));
+    RT(cudaMalloc(&dlive, num_pages * sizeof(std::int32_t)));
+    RT(cudaMalloc(&dmin_ref, envn * sizeof(float)));
+    RT(cudaMalloc(&dmax_ref, envn * sizeof(float)));
+    RT(cudaMalloc(&dmin_inc, envn * sizeof(float)));
+    RT(cudaMalloc(&dmax_inc, envn * sizeof(float)));
+    RT(cudaMalloc(&d_qo, qo_indptr.size() * sizeof(std::uint32_t)));
+    RT(cudaMalloc(&d_idx, kv_page_indices.size() * sizeof(std::uint32_t)));
+    RT(cudaMalloc(&d_indptr, kv_page_indptr.size() * sizeof(std::uint32_t)));
+    RT(cudaMalloc(&d_lastlen, kv_last_page_lens.size() * sizeof(std::uint32_t)));
+    RT(cudaMemcpy(dk, k.data(), n * 2, cudaMemcpyHostToDevice));
+    RT(cudaMemcpy(dlive, live.data(), num_pages * sizeof(std::int32_t),
+                  cudaMemcpyHostToDevice));
+    RT(cudaMemcpy(d_qo, qo_indptr.data(),
+                  qo_indptr.size() * sizeof(std::uint32_t),
+                  cudaMemcpyHostToDevice));
+    RT(cudaMemcpy(d_idx, kv_page_indices.data(),
+                  kv_page_indices.size() * sizeof(std::uint32_t),
+                  cudaMemcpyHostToDevice));
+    RT(cudaMemcpy(d_indptr, kv_page_indptr.data(),
+                  kv_page_indptr.size() * sizeof(std::uint32_t),
+                  cudaMemcpyHostToDevice));
+    RT(cudaMemcpy(d_lastlen, kv_last_page_lens.data(),
+                  kv_last_page_lens.size() * sizeof(std::uint32_t),
+                  cudaMemcpyHostToDevice));
+
+    // Poison the incremental buffers so any page the fire does NOT touch stays
+    // poisoned -- only the touched ones may be compared against the golden.
+    RT(cudaMemset(dmin_inc, 0x7f, envn * sizeof(float)));
+    RT(cudaMemset(dmax_inc, 0x7f, envn * sizeof(float)));
+
+    // The host's worst-case bound, exactly as the KV write path will compute it.
+    const int total_tokens = static_cast<int>(qo_indptr[R]);
+    const int max_touched = (total_tokens + page_size - 1) / page_size + R;
+
+    launch_envelope_recompute_bf16(dk, dlive, dmin_ref, dmax_ref, num_pages,
+                                   page_size, nkvh, hd, nullptr);
+    launch_envelope_update_appended_bf16(dk, d_qo, d_idx, d_indptr, d_lastlen,
+                                         dmin_inc, dmax_inc, R, max_touched,
+                                         page_size, nkvh, hd, nullptr);
+    RT(cudaDeviceSynchronize());
+
+    std::vector<float> rmin(envn), rmax(envn), imin(envn), imax(envn);
+    RT(cudaMemcpy(rmin.data(), dmin_ref, envn * sizeof(float),
+                  cudaMemcpyDeviceToHost));
+    RT(cudaMemcpy(rmax.data(), dmax_ref, envn * sizeof(float),
+                  cudaMemcpyDeviceToHost));
+    RT(cudaMemcpy(imin.data(), dmin_inc, envn * sizeof(float),
+                  cudaMemcpyDeviceToHost));
+    RT(cudaMemcpy(imax.data(), dmax_inc, envn * sizeof(float),
+                  cudaMemcpyDeviceToHost));
+
+    float poison;
+    const std::uint32_t poison_bits = 0x7f7f7f7fu;
+    __builtin_memcpy(&poison, &poison_bits, sizeof(poison));
+
+    // The test is only meaningful if some page is deliberately left untouched.
+    int untouched_used = 0;
+    for (int p = 0; p < num_pages; ++p)
+        if (live[p] > 0 && !touched[p]) ++untouched_used;
+    bool ok = untouched_used > 0;
+    if (!ok) std::printf("       (degenerate case: every live page is touched)\n");
+
+    for (int p = 0; p < num_pages && ok; ++p) {
+        for (int kh = 0; kh < nkvh && ok; ++kh)
+            for (int d = 0; d < hd && ok; ++d) {
+                const long e = (static_cast<long>(p) * nkvh + kh) * hd + d;
+                ok = touched[p] ? (imin[e] == rmin[e] && imax[e] == rmax[e])
+                                : (imin[e] == poison && imax[e] == poison);
+            }
+        if (!ok)
+            std::printf("       (page %d: expected %s)\n", p,
+                        touched[p] ? "refreshed" : "untouched");
+    }
+    std::printf("[%s] %s\n", ok ? " ok " : "FAIL", name);
+    if (!ok) ++g_fail;
+    cudaFree(dk); cudaFree(dlive);
+    cudaFree(dmin_ref); cudaFree(dmax_ref);
+    cudaFree(dmin_inc); cudaFree(dmax_inc);
+    cudaFree(d_qo); cudaFree(d_idx); cudaFree(d_indptr); cudaFree(d_lastlen);
+}
+
 void check_dot(const char* name, int nqh, int nkvh, int hd, int p_max,
                int live) {
     const long envn = static_cast<long>(p_max) * nkvh * hd;
@@ -212,6 +353,21 @@ int main() {
     check_recompute("recompute: full + partial pages", 6, 16, 8, 128,
                     {16, 1, 9, 16, 5, 0});
     check_recompute("recompute: head_dim 64", 4, 16, 4, 64, {16, 3, 16, 8});
+
+    // Decode: every request appends 1 token, so each touches exactly its last
+    // page. Physical pages are scattered and interleaved between requests.
+    check_update_appended("update/decode: 3 requests, 1 token each",
+                          12, 16, 4, 64,
+                          {{1, 7, {9, 2, 5}}, {1, 16, {0, 11}}, {1, 1, {4, 8, 3, 6}}});
+    // A prefill that straddles a page boundary plus a partial last page, next to
+    // a decode step -- the two touched-span shapes in the same fire.
+    check_update_appended("update/mixed: straddling prefill + decode",
+                          10, 16, 8, 128,
+                          {{20, 4, {6, 1, 9}}, {1, 13, {3, 0}}});
+    // A request whose new tokens exactly fill the last page (pre_len on a page
+    // boundary), so `first == last` must NOT be off by one.
+    check_update_appended("update: append lands on a page boundary",
+                          8, 16, 4, 64, {{16, 16, {5, 2, 7}}, {1, 9, {1, 4}}});
 
     check_dot_golden_vector();
     check_dot("dot: GQA 16q/8kv, P_MAX 32", 16, 8, 128, 32, 20);

@@ -138,6 +138,13 @@ pub struct PtirCaps {
     pub has_mtp_logits: bool,
     pub has_mtp_drafts: bool,
     pub has_value_head: bool,
+    /// Backend can execute the `envelope_dot` second-party kernel (Quest).
+    pub has_kv_envelopes: bool,
+    /// Backend can observe per-position softmax attention weights at an
+    /// `OnAttn` tap (`IntrinsicId::AttnScore`) -- H2O/TOVA.
+    pub has_attn_score: bool,
+    /// Backend honours the `attn_page_mask` sink (page-granular eviction).
+    pub has_attn_page_mask: bool,
 }
 
 impl std::fmt::Debug for Model {

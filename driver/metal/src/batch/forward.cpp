@@ -24,7 +24,7 @@
 #include "heap_bind_metal.hpp"
 #include "heap_layout.hpp"
 #include "logits_convert.hpp"
-#include "safetensors_view.hpp"
+#include "pie_loader/checkpoint_source.hpp"
 #include "scratch.hpp"
 #include "store/kv_pool.hpp"
 #include "store/linear_state_slots.hpp"
@@ -501,11 +501,12 @@ struct MetalExecutor::Impl {
     static constexpr bool force_barriers_ = false;
     static constexpr int max_ctx_ = 4096;
 
+    // No checkpoint directory: since §6 the plan declares the files it reads,
+    // so staging weights needs the plan and nothing else.
     bool setup(
-        const std::string& checkpoint_dir,
         const std::string& kernels_dir,
         const DecodeGeometry& geometry,
-        const pie_load_planner::LoadPlan& load_plan,
+        const pie_loader::LoadPlan& load_plan,
         std::size_t storage_page_size,
         std::string* error);
     bool ready() const { return ctx_ != nullptr; }
@@ -602,17 +603,17 @@ void write_u32(const SlotHandle& s, uint32_t v) {
 
 }  // namespace
 
-bool MetalExecutor::Impl::setup(const std::string& ckpt_dir, const std::string& kernels_dir,
+bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
                             const DecodeGeometry& geom,
-                            const pie_load_planner::LoadPlan& load_plan,
+                            const pie_loader::LoadPlan& load_plan,
                             std::size_t storage_page_size,
                             std::string* err) {
     g_ = geom;
 
     // The mmap is transient: the LoadPlan copies each finalized tensor
     // once into the resident weights region.
-    SafetensorsView view(ckpt_dir);
     const auto storage = load_plan.view();
+    pie_loader::CheckpointSource view(storage);
     plan_ = plan_heap(
         g_,
         storage.memory.persistent_bytes,
@@ -1687,23 +1688,17 @@ bool MetalExecutor::setup_native(
     const std::string& kernels_dir,
     const DecodeGeometry& geometry,
     std::string* error) {
-    const char* plan_path = std::getenv("PIE_METAL_LOAD_PLAN");
-    if (plan_path == nullptr || plan_path[0] == '\0') {
+    if (checkpoint_dir.empty()) {
         if (error != nullptr) {
-            *error =
-                "native setup requires PIE_METAL_LOAD_PLAN=<compiled JSON>";
-        }
-        return false;
-    }
-    std::ifstream input(plan_path, std::ios::binary);
-    if (!input) {
-        if (error != nullptr) {
-            *error = std::string("cannot open LoadPlan: ") + plan_path;
+            *error = "native setup requires a checkpoint directory";
         }
         return false;
     }
     SetupConfig config;
     config.checkpoint_dir = checkpoint_dir;
+    // `setup()` compiles the plan itself, so the snapshot dir *is* the input.
+    // There is no serialized plan to hand in any more.
+    config.snapshot_dir = checkpoint_dir;
     config.kernels_dir = kernels_dir;
     config.arch_name = "qwen3_5";
     config.vocab_size = static_cast<std::uint32_t>(geometry.vocab);
@@ -1714,9 +1709,6 @@ bool MetalExecutor::setup_native(
         static_cast<std::uint32_t>(std::max(1, geometry.max_tokens));
     config.max_forward_requests =
         static_cast<std::uint32_t>(std::max(1, geometry.max_requests));
-    config.load_plan.assign(
-        std::istreambuf_iterator<char>(input),
-        std::istreambuf_iterator<char>());
     config.storage_page_size =
         static_cast<std::uint32_t>(std::max<long>(1, ::sysconf(_SC_PAGESIZE)));
     return setup(config, error);
@@ -1798,21 +1790,28 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
         return false;
     }
     auto impl = std::make_unique<Impl>();
-    pie_load_planner::LoadPlan load_plan;
+    // Compile for this device. The loader is told what Metal can do and answers
+    // with a plan that stays inside it, so there is nothing to re-check here
+    // (`loader/architecture.md` §9).
+    pie_loader::LoadPlan load_plan;
     try {
-        load_plan = pie_load_planner::LoadPlan::deserialize(
-            std::span<const std::uint8_t>(
-                cfg.load_plan.data(), cfg.load_plan.size()),
-            cfg.compiler_version);
+        load_plan = compile_load_plan(
+            cfg.snapshot_dir,
+            metal_device_target(),
+            pie_loader::ModelFacts{
+                .model_type = cfg.model_type,
+                .quant_method = cfg.quant_method,
+                .num_hidden_layers = cfg.num_hidden_layers,
+                .num_experts = cfg.num_experts,
+                .num_experts_per_tok = cfg.num_experts_per_tok,
+            },
+            cfg.runtime_quant,
+            cfg.mxfp4_moe,
+            pie_loader::PieLoaderComponent::Full);
     } catch (const std::exception& error) {
         if (err != nullptr) {
-            *err = std::string("LoadPlan decode failed: ") + error.what();
+            *err = std::string("LoadPlan compile failed: ") + error.what();
         }
-        return false;
-    }
-    if (load_plan.backend() !=
-        pie_load_planner::PieLoaderBackendKind::Metal) {
-        if (err != nullptr) *err = "LoadPlan target is not Metal";
         return false;
     }
     DecodeGeometry geom{};  // shipped qwen3.6 defaults
@@ -1848,7 +1847,6 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
     }
     std::string derr;
     if (!impl->setup(
-            cfg.checkpoint_dir,
             cfg.kernels_dir,
             geom,
             load_plan,

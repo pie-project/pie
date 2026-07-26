@@ -119,6 +119,9 @@ pub enum RsError {
     /// ladder, like `KvStoreError::OutOfPages`.
     #[error("rs pool exhausted: requested {requested}, available {available}")]
     OutOfSlots { requested: usize, available: usize },
+    /// A reserved-path prepare was handed fewer slots than it needs.
+    #[error("rs slot grant mismatch: required {required}, granted {granted}")]
+    GrantMismatch { required: usize, granted: usize },
 }
 
 struct RsEntry {
@@ -341,7 +344,31 @@ impl RsStore {
         write_state: bool,
         buffer_tokens: Option<(u32, u32)>,
     ) -> Result<RsPreparedWrite, RsError> {
-        self.prepare(ws, write_state, None, buffer_tokens)
+        self.prepare(ws, write_state, None, buffer_tokens, None)
+    }
+
+    /// Prepare a folded-state write from caller-owned reserved slots,
+    /// consuming exactly the required prefix of `granted` (lend semantics:
+    /// failure consumes nothing, surplus stays caller-owned). Always a
+    /// `write_state` prepare — the reserved path exists only for the fire's
+    /// folded-slot write.
+    pub fn prepare_write_reserved(
+        &mut self,
+        ws: RsWorkingSetId,
+        granted: &mut Vec<RsSlotId>,
+    ) -> Result<RsPreparedWrite, RsError> {
+        self.prepare(ws, true, None, None, Some(granted))
+    }
+
+    /// Phase-A demand: slots a folded-state write for `ws` would allocate
+    /// (1 for a fresh or CoW folded target, 0 for an in-place write). Pure —
+    /// no allocation, transaction, or refcount change.
+    pub fn write_state_demand(&self, ws: RsWorkingSetId) -> Result<usize, RsError> {
+        Ok(match self.entry(ws)?.folded {
+            None => 1,
+            Some(id) if self.ref_count(id) > 1 => 1,
+            Some(_) => 0,
+        })
     }
 
     /// Prepare an explicit `fold(tokens)`: validated against the fold
@@ -353,7 +380,7 @@ impl RsStore {
         tokens: u32,
     ) -> Result<RsPreparedWrite, RsError> {
         self.validate_fold(ws, tokens)?;
-        self.prepare(ws, true, Some(tokens), None)
+        self.prepare(ws, true, Some(tokens), None, None)
     }
 
     fn prepare(
@@ -362,6 +389,7 @@ impl RsStore {
         write_state: bool,
         fold_tokens: Option<u32>,
         buffer_tokens: Option<(u32, u32)>,
+        reserved: Option<&mut Vec<RsSlotId>>,
     ) -> Result<RsPreparedWrite, RsError> {
         let (folded, buffer_targets_src) = {
             let entry = self.entry(ws)?;
@@ -392,10 +420,21 @@ impl RsStore {
             .count();
 
         let need = usize::from(state_needs_alloc) + buffer_needs_alloc;
-        let allocated = self.pool.try_alloc_n(need).ok_or(RsError::OutOfSlots {
-            requested: need,
-            available: self.pool.available(),
-        })?;
+        let allocated = match reserved {
+            Some(granted) => {
+                if granted.len() < need {
+                    return Err(RsError::GrantMismatch {
+                        required: need,
+                        granted: granted.len(),
+                    });
+                }
+                granted.drain(..need).collect()
+            }
+            None => self.pool.try_alloc_n(need).ok_or(RsError::OutOfSlots {
+                requested: need,
+                available: self.pool.available(),
+            })?,
+        };
         let mut fresh_ids = allocated.iter().copied();
 
         let state = if write_state {
@@ -571,6 +610,21 @@ impl RsStore {
 
     pub fn available_slots(&self) -> usize {
         self.pool.available()
+    }
+
+    pub fn capacity_slots(&self) -> u32 {
+        self.pool.capacity()
+    }
+
+    /// Reserve concrete slot ids for one acquisition grant. The caller owns
+    /// them until consumed by a reserved-path prepare or released.
+    pub fn reserve_slots(&mut self, count: usize) -> Option<Vec<RsSlotId>> {
+        self.pool.try_alloc_n(count)
+    }
+
+    /// Return unconsumed reserved slot ids to the pool.
+    pub fn release_slot_reservation(&mut self, slots: Vec<RsSlotId>) {
+        self.pool.release_reserved(slots);
     }
 
     pub fn committed_high_water_slots(&self) -> u32 {

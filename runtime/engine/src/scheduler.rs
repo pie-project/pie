@@ -445,33 +445,6 @@ pub(crate) fn nudge(driver_idx: usize) {
     }
 }
 
-pub(crate) async fn freeze_pipeline(pid: ProcessId) -> Result<()> {
-    let handles: Vec<_> = handle_registry()
-        .read()
-        .unwrap()
-        .iter()
-        .flatten()
-        .cloned()
-        .collect();
-    for handle in handles {
-        handle.freeze_pipeline(pid).await?;
-    }
-    Ok(())
-}
-
-pub(crate) fn resume_pipeline(pid: ProcessId) {
-    let handles: Vec<_> = handle_registry()
-        .read()
-        .unwrap()
-        .iter()
-        .flatten()
-        .cloned()
-        .collect();
-    for handle in handles {
-        let _ = handle.resume_pipeline(pid);
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn submit_async_with_kv_copy(
     request: crate::driver::LaunchPlan,

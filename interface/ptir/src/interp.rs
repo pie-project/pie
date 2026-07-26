@@ -246,6 +246,10 @@ pub struct PassInputs {
     pub value_head: Option<Value>,
     /// One query value per layer (indexed by the tap's invocation layer).
     pub query: Vec<Value>,
+    /// One `[num_heads, kv_len]` attention-weight value per layer, indexed the
+    /// same way. Separate from `query` because it is only readable at
+    /// `OnAttn` — the scores do not exist until the layer's attention has run.
+    pub attn_score: Vec<Value>,
 }
 
 /// Second-party kernel provider. The dummy driver implements test kernels; a
@@ -1651,6 +1655,7 @@ pub(crate) fn eval_op(
                 IntrinsicId::Query => inputs.query.get(layer as usize).cloned(),
                 IntrinsicId::Layer => Some(Value::U32(vec![layer])),
                 IntrinsicId::MtpDrafts => inputs.mtp_drafts.clone(),
+                IntrinsicId::AttnScore => inputs.attn_score.get(layer as usize).cloned(),
             };
             match got {
                 Some(val) if value_matches(&val, want) => One(val),

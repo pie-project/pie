@@ -43,7 +43,7 @@
 namespace pie_cuda_driver::weight_codec {
 
 inline constexpr char kMagic[8] = {'P', 'I', 'E', 'W', 'S', 'T', 'O', 'R'};
-inline constexpr std::uint32_t kFormatVersion = 3;
+inline constexpr std::uint32_t kFormatVersion = 4;
 // Blob checksum fold granularity. Boundary-DEPENDENT (see blob_hash_update), so
 // serialize and restore MUST fold in identical chunks; both use this constant.
 inline constexpr std::uint64_t kChunkBytes = 64ull * 1024ull * 1024ull;
@@ -123,19 +123,8 @@ inline void put_spec(std::ostream& os, const TensorDecl& s)
     put_str(os, s.name);
     put_scalar<std::uint8_t>(os, static_cast<std::uint8_t>(s.dtype));
     put_shape(os, s.shape);
-    put_scalar<std::uint8_t>(os, static_cast<std::uint8_t>(s.layout));
     put_scalar<std::uint8_t>(os, static_cast<std::uint8_t>(s.ownership));
-    put_scalar<std::uint8_t>(os, static_cast<std::uint8_t>(s.parallel));
-    put_scalar<std::uint8_t>(os, static_cast<std::uint8_t>(s.quant.format));
-    put_scalar<std::uint8_t>(os, static_cast<std::uint8_t>(s.quant.granularity));
-    put_scalar<std::int32_t>(os, static_cast<std::int32_t>(s.quant.group_size));
-    put_scalar<std::int32_t>(os, static_cast<std::int32_t>(s.quant.channel_axis));
-    put_str(os, s.quant.scale_tensor);
-    put_str(os, s.quant.zero_point_tensor);
     put_str(os, s.backing_tensor);
-    put_scalar<std::int32_t>(os, static_cast<std::int32_t>(s.view_axis));
-    put_scalar<std::int64_t>(os, s.view_start);
-    put_scalar<std::int64_t>(os, s.view_length);
 }
 
 // --- seekable read-only stream over an in-memory buffer (the mmap'd file) ---
@@ -198,19 +187,8 @@ inline TensorDecl get_spec(std::istream& is)
     s.name = get_str(is);
     s.dtype = static_cast<DType>(get_scalar<std::uint8_t>(is));
     s.shape = get_shape(is);
-    s.layout = static_cast<TensorLayoutKind>(get_scalar<std::uint8_t>(is));
     s.ownership = static_cast<TensorOwnershipKind>(get_scalar<std::uint8_t>(is));
-    s.parallel = static_cast<TensorParallelKind>(get_scalar<std::uint8_t>(is));
-    s.quant.format = static_cast<QuantFormat>(get_scalar<std::uint8_t>(is));
-    s.quant.granularity = static_cast<QuantGranularity>(get_scalar<std::uint8_t>(is));
-    s.quant.group_size = get_scalar<std::int32_t>(is);
-    s.quant.channel_axis = get_scalar<std::int32_t>(is);
-    s.quant.scale_tensor = get_str(is);
-    s.quant.zero_point_tensor = get_str(is);
     s.backing_tensor = get_str(is);
-    s.view_axis = get_scalar<std::int32_t>(is);
-    s.view_start = get_scalar<std::int64_t>(is);
-    s.view_length = get_scalar<std::int64_t>(is);
     return s;
 }
 

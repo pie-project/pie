@@ -9,12 +9,12 @@ use crate::inferlet::host::pie;
 use crate::inferlet::process;
 use crate::inferlet::{ProcessCtx, ProcessEvent};
 use crate::server;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use wasmtime::component::{Accessor, HasSelf};
 
 impl pie::inferlet::session::Host for ProcessCtx {
     async fn send(&mut self, message: String) -> Result<()> {
-        crate::inferlet::process::preemption::honor(self).await?;
+        crate::inferlet::process::gate::residency_gate(self).await?;
         let process_id = self.id();
         if let Ok(Some(client_id)) = process::get_client_id(process_id).await {
             if let Err(err) =
@@ -32,7 +32,7 @@ impl pie::inferlet::session::Host for ProcessCtx {
     }
 
     async fn send_file(&mut self, data: Vec<u8>) -> Result<()> {
-        crate::inferlet::process::preemption::honor(self).await?;
+        crate::inferlet::process::gate::residency_gate(self).await?;
         let process_id = self.id();
         if let Ok(Some(client_id)) = process::get_client_id(process_id).await {
             server::send_file(client_id, process_id, data.into())?;
@@ -43,14 +43,32 @@ impl pie::inferlet::session::Host for ProcessCtx {
 
 impl pie::inferlet::session::HostWithStore<ProcessCtx> for HasSelf<ProcessCtx> {
     async fn receive(accessor: &Accessor<ProcessCtx, Self>) -> Result<Option<String>> {
-        let (process_id, residency) =
-            accessor.with(|mut access| (access.get().id(), access.get().residency_handle()));
-        crate::inferlet::process::preemption::receive_message(process_id, residency).await
+        let process_id = accessor.with(|mut access| access.get().id());
+        // A plain await: an idle receive holds no pooled state, so the
+        // planner can evict around it freely — no standing safe point
+        // needed. The residency gate re-engages on the next pooled call.
+        crate::server::inbox::receive(process_id.to_string())
+            .await
+            .with_context(|| format!("session.receive failed for process {process_id}"))
+            .map(Some)
     }
 
     async fn receive_file(accessor: &Accessor<ProcessCtx, Self>) -> Result<Option<Vec<u8>>> {
-        let (process_id, residency) =
-            accessor.with(|mut access| (access.get().id(), access.get().residency_handle()));
-        crate::inferlet::process::preemption::receive_file(process_id, residency).await
+        let process_id = accessor.with(|mut access| access.get().id());
+        let Some(client_id) = process::get_client_id(process_id).await.ok().flatten() else {
+            return Ok(None);
+        };
+        match crate::server::receive_file(client_id, process_id).await {
+            Ok(data) => Ok(Some(data.to_vec())),
+            Err(error) => {
+                tracing::warn!(
+                    client_id,
+                    process_id = %process_id,
+                    %error,
+                    "session.receive_file delivery failed"
+                );
+                Ok(None)
+            }
+        }
     }
 }

@@ -22,6 +22,10 @@
 #include "kernels/kv_paged.hpp"
 #include "kernels/moe_dispatch.hpp"
 #include "kernels/residual_add.hpp"
+#include <mutex>
+#include <set>
+#include <tuple>
+
 #include "kernels/rmsnorm.hpp"
 #include "kernels/rope.hpp"
 #include "kernels/slab_scatter.hpp"
@@ -106,13 +110,28 @@ int qwen35_gdn_warp_tiled_max_tokens() {
     return max_tokens;
 }
 
+bool moe_path_log_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_MOE_PATH_LOG");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
+// Every block is one entry of a batched GEMM and reads a whole expert
+// weight, and a block belongs to exactly one expert — so the row count
+// pads up to roughly `active_experts * block`. With 256 experts holding
+// only a few routes each, 16 padded 512 real routes to 4352 rows for the
+// same number of weight reads; 8 halves the padding. Measured on
+// Qwen3.6-35B-A3B, 128 requests x 256 tokens: 1197 tok/s at 8 against
+// 1107 at 16, and it falls off either side (921 at 32, 586 at 64).
 int qwen35_moe_aligned_decode_block_size() {
     static const int block = [] {
         const char* v = std::getenv("PIE_QWEN35_MOE_ALIGNED_DECODE_BLOCK");
-        if (v == nullptr || v[0] == '\0') return 16;
+        if (v == nullptr || v[0] == '\0') return 8;
         char* end = nullptr;
         long parsed_long = std::strtol(v, &end, 10);
-        if (end == v) return 16;
+        if (end == v) return 8;
         int parsed = static_cast<int>(parsed_long);
         if (parsed <= 1) return 0;
         if (parsed < 2) parsed = 2;
@@ -131,13 +150,43 @@ int qwen35_moe_aligned_decode_min_routes() {
     return min_routes;
 }
 
+// Row count above which a NON-pure-decode step leaves the device-side
+// MoE dispatch for the host-driven one. The host path resolves routing on
+// the CPU, which costs a device sync per layer and then walks all
+// `num_experts` slots issuing per-expert copies and GEMMs — 256 of them
+// on Qwen3.6, 40 times per step. It exists for prefill, where the per
+// expert row counts are large enough to amortise that; on a continuous
+// batching mixed step it is simply the wrong path, and the steps that
+// take it are the ones with the most rows to lose.
+//
+// No clamp: the cap is a tuning knob, not a safety bound, and clamping it
+// to 128 silently pinned mixed steps of 144-252 rows to the host path.
+//
+// The default follows rows per expert rather than rows: an N-token step
+// gives each expert about N*K/E rows, and the host path only earns its
+// per-layer sync and its `num_experts` dispatches once that is a
+// GEMM-sized number. At Qwen3.6's E=256, K=8, 1024 tokens is ~32 rows
+// per expert. A real bulk prefill (8192 tokens) still takes the host
+// path. Measured, 128 requests x 256 tokens: 64 gave 918-986 tok/s,
+// everything from 128 up gave 994-1116 (within run-to-run spread).
 int qwen35_moe_decode_fast_max_tokens() {
     static const int max_tokens = [] {
         const char* v = std::getenv("PIE_QWEN35_MOE_DECODE_FAST_N");
-        if (v == nullptr || v[0] == '\0') return 64;
-        return std::clamp(std::atoi(v), 0, 128);
+        if (v == nullptr || v[0] == '\0') return 1024;
+        return std::max(0, std::atoi(v));
     }();
     return max_tokens;
+}
+
+// The routed decode GEMMs are M=1 streaming reads. A dedicated GEMV beats
+// `cublasGemmBatchedEx` on them; see `moe_decode_gemv_bf16_kernel`.
+bool qwen35_moe_gemv_decode_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_QWEN35_MOE_GEMV_DECODE");
+        if (v == nullptr || v[0] == '\0') return true;
+        return v[0] != '0';
+    }();
+    return enabled;
 }
 
 bool qwen35_moe_wmma_decode_enabled() {
@@ -659,17 +708,16 @@ void linear_attn_body(
                 }
                 return;
             }
-            if (Lw.la_in_proj_qkvz != nullptr && Lw.la_in_proj_ba != nullptr) {
+            // The qkv/z and b/a fusions are independent: b/a is always
+            // fused (tiny weights, same per-GEMV floor), qkv/z only when
+            // the weight duplication fits.
+            if (Lw.la_in_proj_qkvz != nullptr) {
                 ops::gemm_act_x_wt_bf16(cublas.handle(),
                     ws.norm_x.data(), Lw.la_in_proj_qkvz->data(),
                     la.mixed_qkvz.data(), N, conv_dim + V_dim, H);
-                ops::gemm_act_x_wt_bf16(cublas.handle(),
-                    ws.norm_x.data(), Lw.la_in_proj_ba->data(),
-                    la.ba.data(), N, 2 * V_h, H);
-                kernels::launch_split_qwen_gdn_projections_bf16(
-                    la.mixed_qkvz.data(), la.ba.data(),
-                    la.mixed_qkv.data(), la.z.data(), la.b.data(), la.a.data(),
-                    N, conv_dim, V_dim, V_h, stream);
+                kernels::launch_split_bf16_rows(
+                    la.mixed_qkvz.data(), la.mixed_qkv.data(), la.z.data(),
+                    N, conv_dim, V_dim, stream);
             } else {
                 ops::gemm_act_x_wt_bf16(cublas.handle(),
                     ws.norm_x.data(), Lw.la_in_proj_qkv->data(),
@@ -677,6 +725,14 @@ void linear_attn_body(
                 ops::gemm_act_x_wt_bf16(cublas.handle(),
                     ws.norm_x.data(), Lw.la_in_proj_z->data(),
                     la.z.data(), N, V_dim, H);
+            }
+            if (Lw.la_in_proj_ba != nullptr) {
+                ops::gemm_act_x_wt_bf16(cublas.handle(),
+                    ws.norm_x.data(), Lw.la_in_proj_ba->data(),
+                    la.ba.data(), N, 2 * V_h, H);
+                kernels::launch_split_qwen_gdn_ba_bf16(
+                    la.ba.data(), la.b.data(), la.a.data(), N, V_h, stream);
+            } else {
                 ops::gemm_act_x_wt_bf16(cublas.handle(),
                     ws.norm_x.data(), Lw.la_in_proj_a->data(),
                     la.a.data(), N, V_h, H);
@@ -1170,11 +1226,6 @@ void full_attn_body(
     ops::gemm_act_x_w(cublas.handle(),
         ws.norm_x.data(), make_weight_view(Lw.fa_v_proj, Lw.fa_v_proj_quant),
         ws.v.data(), N, Hk, H);
-    invoke_stage_hook(
-        StageHookPoint::OnAttnProj, ws.q.data(),
-        static_cast<std::uint32_t>(N),
-        static_cast<std::uint32_t>(Hq),
-        static_cast<std::uint32_t>(model_layer), stream);
 
     rmsnorm_bf16_dispatch(cfg,
         ws.q.data(), Lw.fa_q_norm->data(), ws.q.data(),
@@ -1187,6 +1238,16 @@ void full_attn_body(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads_local, num_kv_heads_local,
         d, rotary_dim, cfg.rope_theta, stream);
+    // Fires POST-rope (and post q/k-norm): the query a PTIR program
+    // observes here is the one that actually enters attention, so an
+    // observer scoring it against the cached keys -- which are stored
+    // post-rope -- compares in the same space.
+    invoke_stage_hook(
+        StageHookPoint::OnAttnProj, ws.q.data(),
+        static_cast<std::uint32_t>(N),
+        static_cast<std::uint32_t>(Hq),
+        static_cast<std::uint32_t>(model_layer), stream);
+
     auto kv_view = cache.layer_view(kv_layer);
     if (has_write_desc) {
         kernels::launch_write_kv_explicit_bf16(
@@ -1294,6 +1355,24 @@ bool moe_block(
     const bool use_decode_fast_path =
         is_pure_decode ||
         (N > 0 && N <= qwen35_moe_decode_fast_max_tokens());
+    if (moe_path_log_enabled()) {
+        // One line per distinct (N, pure_decode, path) triple, so a whole
+        // run reports which shapes took which path without 40 lines per
+        // step drowning the log.
+        static std::mutex seen_mutex;
+        static std::set<std::tuple<int, bool, bool>> seen;
+        const auto key = std::make_tuple(N, is_pure_decode, use_decode_fast_path);
+        bool fresh = false;
+        {
+            std::lock_guard<std::mutex> lock(seen_mutex);
+            fresh = seen.insert(key).second;
+        }
+        if (fresh) {
+            std::fprintf(
+                stderr, "[pie-moe-path] N=%d pure_decode=%d fast_path=%d\n",
+                N, is_pure_decode ? 1 : 0, use_decode_fast_path ? 1 : 0);
+        }
+    }
     const bool add_to_residual = (T == 1) && use_decode_fast_path;
     void* moe_out = add_to_residual ? ws.y.data() : ws.norm_y.data();
 
@@ -1443,6 +1522,54 @@ bool moe_block(
                                 moe_ws.aligned_route_ids.data(),
                                 moe_ws.expert_out.data(),
                                 routes, aligned_rows, H, stream);
+                            if (add_to_residual) {
+                                kernels::launch_token_batched_weighted_sum_add_bf16(
+                                    moe_out, moe_ws.expert_out.data(),
+                                    moe_ws.topk_weights.data(),
+                                    N, K, H, stream);
+                            } else {
+                                kernels::launch_token_batched_weighted_sum_bf16(
+                                    moe_out, moe_ws.expert_out.data(),
+                                    moe_ws.topk_weights.data(),
+                                    N, K, H, stream);
+                            }
+                        });
+                } else if (qwen35_moe_gemv_decode_enabled() &&
+                           (H % 8) == 0 && (Im % 8) == 0) {
+                    profile_cuda_detail_stage(
+                        profile, profile ? &profile->moe_gate_up_ms : nullptr,
+                        stream, [&] {
+                            kernels::launch_moe_gate_up_decode_gemv_bf16(
+                                moe_ws.topk_idx.data(),
+                                ws.norm_x.data(),
+                                Lw.moe_gate_up_proj->data(),
+                                moe_ws.expert_gate_up.data(),
+                                N, K, H, Im, stream);
+                        });
+
+                    profile_cuda_detail_stage(
+                        profile, profile ? &profile->moe_act_ms : nullptr,
+                        stream, [&] {
+                            kernels::launch_chunked_swiglu_bf16(
+                                moe_ws.expert_gate_up.data(),
+                                moe_ws.expert_act.data(),
+                                routes, Im, stream);
+                        });
+
+                    profile_cuda_detail_stage(
+                        profile, profile ? &profile->moe_down_ms : nullptr,
+                        stream, [&] {
+                            kernels::launch_moe_down_decode_gemv_bf16(
+                                moe_ws.topk_idx.data(),
+                                moe_ws.expert_act.data(),
+                                Lw.moe_down_proj->data(),
+                                moe_ws.expert_out.data(),
+                                N, K, H, Im, stream);
+                        });
+
+                    profile_cuda_detail_stage(
+                        profile, profile ? &profile->moe_reduce_ms : nullptr,
+                        stream, [&] {
                             if (add_to_residual) {
                                 kernels::launch_token_batched_weighted_sum_add_bf16(
                                     moe_out, moe_ws.expert_out.data(),

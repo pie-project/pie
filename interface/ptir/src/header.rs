@@ -179,6 +179,7 @@ typedef struct PtirLaneChannelSlot {\n\
         IntrinsicId::ValueHead,
         IntrinsicId::Layer,
         IntrinsicId::MtpDrafts,
+        IntrinsicId::AttnScore,
     ] {
         s.push_str(&format!(
             "  PTIR_INTR_{} = {},\n",

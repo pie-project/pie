@@ -161,11 +161,6 @@ void gemma2_forward_paged(
             ws.norm_x.data(), layer.k_proj->data(), ws.k.data(), N, Hk, H);
         ops::gemm_act_x_wt_bf16(cublas.handle(),
             ws.norm_x.data(), layer.v_proj->data(), ws.v.data(), N, Hk, H);
-        invoke_stage_hook(
-            StageHookPoint::OnAttnProj, ws.q.data(),
-            static_cast<std::uint32_t>(N),
-            static_cast<std::uint32_t>(Hq),
-            static_cast<std::uint32_t>(L), stream);
 
         // Per-head q/k RMSNorm (Gemma-3+) — applied before the query
         // pre-scale and before RoPE, matching HF's
@@ -199,6 +194,17 @@ void gemma2_forward_paged(
             ws.q.data(), ws.k.data(), positions,
             N, num_q_heads_local, num_kv_heads_local, d,
             layer_rope_theta, stream);
+        // Fires POST-rope (and post q/k-norm): the query a PTIR program
+        // observes here is the one that actually enters attention, so an
+        // observer scoring it against the cached keys -- which are stored
+        // post-rope -- compares in the same space. Placing it on the raw
+        // projection instead would silently mis-rank pages for Quest.
+        invoke_stage_hook(
+            StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            static_cast<std::uint32_t>(L), stream);
+
         auto kv_view = cache.layer_view(L);
         kernels::launch_write_kv_to_pages(
             kv_view, ws.k.data(), ws.v.data(),

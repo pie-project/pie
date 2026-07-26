@@ -30,6 +30,8 @@ Pie itself: [arXiv:2510.24051](https://arxiv.org/abs/2510.24051), SOSP'25.
 | [`candidates.md`](./candidates.md) | The build queue: every algorithm scored for PTIR feasibility, with implementation status |
 | [`09-ptir-unbuilt-algorithms.md`](./09-ptir-unbuilt-algorithms.md) | What PTIR still cannot express, and the exact engine primitive each blocked algorithm is waiting on |
 | [`10-implementation-faithfulness-audit.md`](./10-implementation-faithfulness-audit.md) | **Every built inferlet checked line by line against its paper's published equation** |
+| [`11-ptir-limits.md`](./11-ptir-limits.md) | Where PTIR strains, measured from thirty built inferlets: fusion, performance, expressiveness |
+| [`12-attention-observability-design.md`](./12-attention-observability-design.md) | **Design** — how to unblock the five KV/attention algorithms, after finding that both recorded blockers were false |
 
 **Start with `08`** if you want the conclusion, `00` if you want the mechanism,
 `01` if you want the map of the field.

@@ -65,6 +65,12 @@ pub enum IntrinsicId {
     /// APPENDED (id 6) — existing ids 0..5 unchanged so every prior program's
     /// bytecode + identity hash stays byte-stable.
     MtpDrafts = 6,
+    /// `[num_heads, kv_len]` F32 — `OnAttn` only; model-gated. This layer's
+    /// softmax attention weights over the request's live KV, the quantity
+    /// H2O (arXiv:2306.14048) and TOVA (arXiv:2305.19370) evict on.
+    /// Backend-shaped like `Query`, so the type rule stays loose.
+    /// APPENDED (id 7) — ids 0..6 unchanged, same byte-stability contract.
+    AttnScore = 7,
 }
 
 impl IntrinsicId {
@@ -77,6 +83,7 @@ impl IntrinsicId {
             4 => IntrinsicId::ValueHead,
             5 => IntrinsicId::Layer,
             6 => IntrinsicId::MtpDrafts,
+            7 => IntrinsicId::AttnScore,
             _ => return None,
         })
     }
@@ -89,6 +96,7 @@ impl IntrinsicId {
             IntrinsicId::ValueHead => "value_head",
             IntrinsicId::Layer => "layer",
             IntrinsicId::MtpDrafts => "mtp_drafts",
+            IntrinsicId::AttnScore => "attn_score",
         }
     }
 }

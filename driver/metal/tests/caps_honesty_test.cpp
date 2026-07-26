@@ -5,7 +5,7 @@
 #include <nlohmann/json.hpp>
 #include <pie_driver_abi.h>
 
-#include "pie_native/load_plan.hpp"
+#include "loader/load_plan.hpp"
 
 namespace {
 
@@ -58,7 +58,7 @@ int main() {
         "storage alignment is device-derived and nonzero");
     failures += !expect(
         facts.at("storage_tile_map_mask").get<std::uint32_t>() ==
-            pie_load_planner::kMetalTileMapMask,
+            pie::metal::kMetalTileMapMask,
         "device facts match the Metal load executor transforms");
     failures += !expect(
         facts.at("page_size").get<std::uint32_t>() > 0,

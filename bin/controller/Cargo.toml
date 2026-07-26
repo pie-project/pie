@@ -3,11 +3,11 @@ name = "pie-controller-bin"
 version = "0.1.0"
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
-description = "Standalone control-plane daemon shell for Pie (bootstrap + pie-controller)."
+description = "Standalone control-plane daemon shell for Pie (startup + pie-controller)."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
-# Thin process shell (Seam 3): the shared `bootstrap` skeleton + the
+# Thin process shell (Seam 3): the shared `startup` skeleton + the
 # `pie-controller` role lib. The package is `-bin`-suffixed to avoid colliding
 # with the `pie-controller` library crate; the user-facing command stays
 # `pie-controller`.
@@ -17,8 +17,8 @@ path = "src/main.rs"
 
 [dependencies]
 # Shared process skeleton (global flags, config sourcing, tracing, /metrics,
-# signal/exit lifecycle). Imports as `bootstrap`.
-pie-bootstrap = { path = "../../bootstrap" }
+# signal/exit lifecycle). Imports as `startup`.
+pie-env = { path = "../env" }
 # The controller role library: `Config::parse` + async `run` + `shutdown`.
 pie-controller = { path = "../../controller" }
 clap = { version = "4.6", features = ["derive"] }
