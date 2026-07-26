@@ -1236,7 +1236,14 @@ inline void dbg_dump_bf16(const char* tag, const void* dev_ptr,
     static const char* dir = std::getenv("PIE_GEMMA4_DUMP_DIR");
     std::vector<std::uint16_t> tmp(numel);
     cudaMemcpy(tmp.data(), dev_ptr, numel * 2, cudaMemcpyDeviceToHost);
-    std::string path = std::string(dir) + "/" + tag + ".bin";
+    // Name the file by device. TP ranks share this process and run the same
+    // forward concurrently, so a rank-less name has every rank writing the
+    // SAME file: the result is a mix of both ranks' rows, which reads as a
+    // numerical divergence that does not exist. Cost a full debugging pass.
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) device = 0;
+    std::string path = std::string(dir) + "/" + tag + ".dev" +
+        std::to_string(device) + ".bin";
     std::ofstream out(path, std::ios::binary);
     if (!out) return;
     out.write(reinterpret_cast<const char*>(tmp.data()), numel * 2);
@@ -1684,6 +1691,24 @@ void gemma4_forward_paged(
         attn_norm_precomputed = false;
         dump_l0("attn_norm_pre", ws.norm_x.data(),
                 static_cast<std::size_t>(N) * H);
+        // Weight dumps: separates "wrong shard bytes" from "wrong GEMM" when
+        // a TP rank's projection output diverges from the tp=1 reference.
+        if (layer.q_proj != nullptr) {
+            dump_l0("w_q_proj", layer.q_proj->data(),
+                    static_cast<std::size_t>(Hq) * H);
+        }
+        if (layer.k_proj != nullptr) {
+            dump_l0("w_k_proj", layer.k_proj->data(),
+                    static_cast<std::size_t>(Hk) * H);
+        }
+        if (layer.o_proj != nullptr) {
+            dump_l0("w_o_proj", layer.o_proj->data(),
+                    static_cast<std::size_t>(H) * Hq);
+        }
+        if (layer.down_proj != nullptr) {
+            dump_l0("w_down_proj", layer.down_proj->data(),
+                    static_cast<std::size_t>(H) * I);
+        }
 
         // RoPE: partial rotary on full-attention layers
         // (`partial_rotary_factor < 1`), full rotation otherwise.
