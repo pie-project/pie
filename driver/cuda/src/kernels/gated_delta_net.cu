@@ -1573,9 +1573,35 @@ __global__ void recurrent_step_batched_gqa_smem_kernel(
     // Stage state HBM → SMEM. Adjacent threads at fixed k load
     // adjacent v indices → coalesced HBM reads; SMEM layout is
     // [k][v_local] → coalesced SMEM writes.
-    for (int k = 0; k < K_d; ++k) {
-        s_state[k * BV + threadIdx.x] =
-            state[(long long)k * V_d + v_idx];
+    //
+    // Load a tile into registers BEFORE storing any of it. Writing each
+    // element to SMEM as it arrives makes every load depend on the
+    // previous store's address computation, so only a couple of loads are
+    // ever in flight — fine at R=512 where thousands of blocks hide the
+    // latency for each other, ruinous at R=1 where 32 blocks are all the
+    // parallelism there is. Decoupling the two halves lets a whole tile
+    // of loads issue at once. Measured on A100 (V_h=32, K_d=V_d=128):
+    //   R=1   19.7 -> 10.8 us      R=8   29.6 -> 16.1 us
+    //   R=2   22.9 -> 11.7 us      R=64 138.0 -> 96.5 us
+    // bf16 stays bf16 the whole way, so the staged values are identical.
+    {
+        constexpr int kStageTile = 16;
+        __nv_bfloat16 staged[kStageTile];
+        int k = 0;
+        for (; k + kStageTile <= K_d; k += kStageTile) {
+            #pragma unroll
+            for (int u = 0; u < kStageTile; ++u) {
+                staged[u] = state[(long long)(k + u) * V_d + v_idx];
+            }
+            #pragma unroll
+            for (int u = 0; u < kStageTile; ++u) {
+                s_state[(k + u) * BV + threadIdx.x] = staged[u];
+            }
+        }
+        for (; k < K_d; ++k) {
+            s_state[k * BV + threadIdx.x] =
+                state[(long long)k * V_d + v_idx];
+        }
     }
     const float* q_h = q_norm_kh + qh;
     const float* k_h = k_norm_kh + qh;
