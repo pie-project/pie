@@ -37,6 +37,7 @@ import torch
 import triton
 import triton.language as tl
 
+_GROUP_BLOCK = 64
 ACCEPT = -(2**31)
 SPARSE, COMPLEMENT, DENSE = 0, 1, 2
 
@@ -389,7 +390,17 @@ def _contains(kind, offset, length, payload_ptr, token):
         word = tl.load(payload_ptr + offset + token // 32)
         inside = (word >> (token % 32)) & 1
     else:
-        found = _search(payload_ptr, offset, offset + length, token)
+        # The list is sorted, so its ends are its bounds. Almost every group of
+        # a lexer state fails on them, and two adjacent loads settle that far
+        # sooner than a search does - the search is a chain of dependent loads
+        # into scattered memory, and the cost of this kernel is exactly how
+        # many of those it performs.
+        low = tl.load(payload_ptr + offset)
+        high = tl.load(payload_ptr + offset + length - 1)
+        found = -1
+        if token >= low:
+            if token <= high:
+                found = _search(payload_ptr, offset, offset + length, token)
         if kind == _COMPLEMENT:
             if found < 0:
                 inside = 1
@@ -434,7 +445,8 @@ def _candidate_kernel(
     mask_words,
     LIVE,
     CONFIGS: tl.constexpr,
-    MAX_GROUPS: tl.constexpr,
+    GROUP_BLOCK: tl.constexpr,
+    SEARCH_STEPS: tl.constexpr,
     MAX_READINGS: tl.constexpr,
     STACK_STRIDE: tl.constexpr,
     MAX_REDUCTIONS: tl.constexpr,
@@ -454,7 +466,7 @@ def _candidate_kernel(
     exists to remove.
     """
     launched = tl.program_id(0)
-    slot = tl.program_id(1)
+    block = tl.program_id(1)
     sequence = launched // LIVE
     config = launched % LIVE
     if config >= tl.load(config_count_ptr + sequence):
@@ -464,18 +476,61 @@ def _candidate_kernel(
     depth = tl.load(stack_depth_ptr + row_index)
     first = tl.load(group_offsets_ptr + state)
     last = tl.load(group_offsets_ptr + state + 1)
-    group = first + slot
-    if group >= last:
-        return
 
+    # Find the group holding the token a block of groups at a time rather than
+    # one per program. A state can have hundreds of groups and only one of them
+    # holds any given token, so the search is nearly all rejection - and doing
+    # it one program per group turns three contiguous arrays into three
+    # scattered loads per group. Read as a block they are three coalesced
+    # loads for the whole block, which is the difference this kernel is made
+    # of: it is bound by how many scattered loads it issues, not by arithmetic.
     token = tl.load(token_ptr + sequence)
-    kind = tl.load(group_set_kind_ptr + group)
-    offset = tl.load(group_set_offset_ptr + group)
-    length = tl.load(group_set_length_ptr + group)
-    if _contains(kind, offset, length, set_payload_ptr, token) == 0:
-        return
+    glane = tl.arange(0, GROUP_BLOCK)
+    group = first + block * GROUP_BLOCK + glane
+    live_lane = group < last
+    kind = tl.load(group_set_kind_ptr + group, mask=live_lane, other=0)
+    offset = tl.load(group_set_offset_ptr + group, mask=live_lane, other=0)
+    length = tl.load(group_set_length_ptr + group, mask=live_lane, other=1)
 
-    scratch = (launched * tl.num_programs(1) + slot) * 2 * STACK_STRIDE
+    dense = kind == _DENSE
+    word = tl.load(
+        set_payload_ptr + offset + token // 32, mask=live_lane & dense, other=0
+    )
+    in_dense = ((word >> (token % 32)) & 1) == 1
+
+    # A sorted list's ends are its bounds, so most lanes are decided without a
+    # search at all.
+    listed = live_lane & (dense == 0)
+    low = tl.load(set_payload_ptr + offset, mask=listed, other=1)
+    high = tl.load(set_payload_ptr + offset + length - 1, mask=listed, other=0)
+    searching = listed & (token >= low) & (token <= high)
+    lo = offset
+    hi = offset + length
+    at = tl.zeros((GROUP_BLOCK,), tl.int32) - 1
+    for _ in range(0, SEARCH_STEPS):
+        active = searching & (lo < hi)
+        middle = (lo + hi) // 2
+        value = tl.load(set_payload_ptr + middle, mask=active, other=0)
+        hit = active & (value == token)
+        at = tl.where(hit, middle, at)
+        lo = tl.where(active & (value < token), middle + 1, lo)
+        hi = tl.where(hit, lo, tl.where(active & (value > token), middle, hi))
+    found = at >= 0
+    complement = kind == _COMPLEMENT
+    inside = tl.where(
+        dense, in_dense, tl.where(complement, found == 0, found)
+    ) & live_lane
+
+    if tl.sum(inside.to(tl.int32)) == 0:
+        return
+    # The *first* group holding the token, not any of them. A complement group
+    # excludes what the others hold, so they should be disjoint and the choice
+    # should not matter - but "should" is not a guarantee the emitter makes,
+    # and where two groups do overlap the reference matcher takes the earlier.
+    # Taking the later instead produced three configurations it did not have.
+    group = tl.min(tl.where(inside, group, last))
+
+    scratch = (launched * tl.num_programs(1) + block) * 2 * STACK_STRIDE
     probe = scratch + STACK_STRIDE
     base = row_index * STACK_STRIDE
     out_base = row_index * MAX_READINGS
@@ -764,6 +819,18 @@ class DeviceGrammar:
         # An advance keeps every reading that survives, not just the first, so
         # the candidate buffers are sized by the widest group in the grammar.
         self.max_readings = int(np.diff(readings).max()) if readings.size > 1 else 1
+        widest = int(np.diff(readings).max()) if readings.size > 1 else 1
+        lengths = np.frombuffer(arrays["group_set_length"], dtype=np.uint32)
+        longest = int(lengths.max()) if lengths.size else 1
+        # The lanes of a block search in lockstep, so the loop runs a fixed
+        # number of times and every lane must have finished by it. A scalar
+        # search over `n` needs ceil(log2(n)) steps, but a masked one is not
+        # a clean halving - a lane that has already found its answer still
+        # carries its bounds through the remaining iterations - and a bound
+        # tight enough for the scalar case left five schemas disagreeing with
+        # the reference matcher. The margin is cheap: the extra iterations are
+        # masked off for every lane that has finished.
+        self.search_steps = max(2, int(np.ceil(np.log2(longest + 2))) + 8)
 
         def upload(name: str, dtype=torch.int32) -> torch.Tensor:
             return torch.frombuffer(bytearray(arrays[name]), dtype=dtype).cuda()
@@ -954,7 +1021,8 @@ class DeviceBatch:
         self.old_lexer.copy_(self.lexer_state)
         self.old_count.copy_(self.config_count)
         live = self.live
-        _candidate_kernel[(self.batch * live, self.max_groups)](
+        blocks = (self.max_groups + _GROUP_BLOCK - 1) // _GROUP_BLOCK
+        _candidate_kernel[(self.batch * live, blocks)](
             grammar.group_offsets,
             grammar.group_set_kind,
             grammar.group_set_offset,
@@ -988,11 +1056,11 @@ class DeviceBatch:
             grammar.mask_words,
             live,
             CONFIGS=self.configs,
-            MAX_GROUPS=self.max_groups,
+            GROUP_BLOCK=_GROUP_BLOCK,
+            SEARCH_STEPS=grammar.search_steps,
             MAX_READINGS=self.max_readings,
             STACK_STRIDE=grammar.max_stack,
             MAX_REDUCTIONS=grammar.max_reductions,
-            num_warps=1,
         )
         _commit_kernel[(self.batch,)](
             self.lexer_state,
