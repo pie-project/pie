@@ -1651,6 +1651,15 @@ void gemma4_forward_paged(
         };
         // Per-layer dims sharded by tp_size on TP runs. The head/intermediate
         // counts must be divisible by tp_size — guarded at engine load.
+        //
+        // `num_attention_heads` and `num_kv_heads` come from the CONFIG, so
+        // they are model-wide totals and have to be divided here.
+        // `layer.intermediate` does NOT: it is read back from the bound
+        // `gate_proj` weight (`shape()[0]`), which the loader already
+        // row-sharded, so it is this rank's own width. Dividing it again gave
+        // each rank half the intermediate it owns — at tp=2 the GEGLU ran
+        // 2560 wide where the tensor is 5120, so the two ranks together
+        // computed a quarter of the MLP and the model emitted noise.
         const int T  = (fwd_cfg.tp_size > 0) ? fwd_cfg.tp_size : 1;
         const int d  = layer.head_dim;
         const int num_q_heads_local  = cfg.num_attention_heads / T;
@@ -1660,7 +1669,7 @@ void gemma4_forward_paged(
         const int num_kv_heads_local = layer.num_kv_heads / T;
         const int Hq = num_q_heads_local * d;
         const int Hk = num_kv_heads_local * d;
-        const int I  = layer.intermediate / T;
+        const int I  = layer.intermediate;
         NcclComm* tp = (T > 1) ? fwd_cfg.tp_comm : nullptr;
 
         // ── 3a. Attention block ─────────────────────────────────────────
