@@ -45,7 +45,22 @@ fn main() -> Result<()> {
     println!("=== schema ===\n{schema}\n");
 
     let grammar = json_schema_to_grammar(schema, &JsonSchemaOptions::default())?;
-    let lexicon = extract(&grammar, &analyze(&grammar));
+    let regularity = analyze(&grammar);
+    println!("=== rules ({}) ===", grammar.rules().len());
+    for (index, rule) in grammar.rules().iter().enumerate() {
+        let id = gpugrammar_ir::grammar::RuleId(index as u32);
+        println!(
+            "  {:<32} regular={} refs={:?}",
+            rule.name,
+            regularity.is_regular(id),
+            gpugrammar_lex::regular::references(&grammar, rule.body)
+                .iter()
+                .map(|r| grammar.get_rule(*r).name.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+    println!("  root = {}", grammar.get_rule(grammar.root_rule()).name);
+    let lexicon = extract(&grammar, &regularity);
     println!("=== terminals ({}) ===", lexicon.terminals.len());
     for (id, terminal) in lexicon.terminals.iter().enumerate() {
         println!("  t{id:<3} {}", terminal.name);

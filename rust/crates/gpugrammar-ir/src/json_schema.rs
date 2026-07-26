@@ -21,7 +21,13 @@ use crate::grammar::Grammar;
 pub struct JsonSchemaOptions {
     /// Allow arbitrary whitespace between JSON elements.
     pub any_whitespace: bool,
-    /// If true, disallow additional properties/items not in the schema.
+    /// If true, disallow properties and items the schema does not name.
+    ///
+    /// JSON Schema says the opposite: an absent `additionalProperties` permits
+    /// any additional property, and XGrammar lowers `{"type": "object"}` to a
+    /// generic object accordingly. Defaulting this on made every unconstrained
+    /// object accept `{}` and nothing else, which silently truncates the
+    /// language rather than reporting that it cannot be represented.
     pub strict_mode: bool,
 }
 
@@ -29,7 +35,7 @@ impl Default for JsonSchemaOptions {
     fn default() -> Self {
         Self {
             any_whitespace: true,
-            strict_mode: true,
+            strict_mode: false,
         }
     }
 }
