@@ -19,7 +19,7 @@ use gpugrammar_run::Matcher as RunMatcher;
 use gpugrammar_tables::{Artifact, emit};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyDict};
 
 fn compile(vocabulary: &[Vec<u8>], grammar: Grammar) -> PyResult<Artifact> {
     let lexicon = extract(&grammar, &analyze(&grammar));
@@ -142,6 +142,90 @@ impl CompiledGrammar {
             flags[state] = u8::from(to > from);
         }
         PyBytes::new(python, &flags)
+    }
+
+    /// Every array a device-side mask fill needs, as one dict of bytes.
+    ///
+    /// This is the artifact as the GPU sees it. Nothing here is per-request:
+    /// the tables are a pure function of the grammar and the vocabulary, so a
+    /// decode step reads them and writes only its own stack and mask.
+    fn device_arrays<'py>(&self, python: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let artifact = &self.artifact;
+        let out = PyDict::new(python);
+
+        fn words<'py>(python: Python<'py>, values: &[u32]) -> Bound<'py, PyBytes> {
+            let mut bytes = Vec::with_capacity(values.len() * 4);
+            for value in values {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            PyBytes::new(python, &bytes)
+        }
+        fn signed<'py>(python: Python<'py>, values: &[i32]) -> Bound<'py, PyBytes> {
+            let mut bytes = Vec::with_capacity(values.len() * 4);
+            for value in values {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            PyBytes::new(python, &bytes)
+        }
+
+        // Groups, flattened. A reading is a run of terminals plus the lexer
+        // state it leaves, and a group is a run of readings, so both are CSR.
+        let mut group_state = Vec::new();
+        let mut group_set_kind = Vec::new();
+        let mut group_set_offset = Vec::new();
+        let mut group_set_length = Vec::new();
+        let mut reading_offsets = vec![0u32];
+        let mut reading_next_state = Vec::new();
+        let mut reading_term_offsets = vec![0u32];
+        let mut reading_terminals = Vec::new();
+        for group in &artifact.groups {
+            group_state.push(group.lexer_state);
+            group_set_kind.push(match group.set.kind {
+                gpugrammar_tables::SetKind::Sparse => 0u32,
+                gpugrammar_tables::SetKind::Complement => 1,
+                gpugrammar_tables::SetKind::Dense => 2,
+            });
+            group_set_offset.push(group.set.offset);
+            group_set_length.push(group.set.length);
+            for reading in &group.readings {
+                reading_next_state.push(reading.next_lexer_state);
+                reading_terminals.extend(reading.terminals.iter().copied());
+                reading_term_offsets.push(reading_terminals.len() as u32);
+            }
+            reading_offsets.push(reading_next_state.len() as u32);
+        }
+
+        out.set_item("group_offsets", words(python, &artifact.group_offsets))?;
+        out.set_item("group_state", words(python, &group_state))?;
+        out.set_item("group_set_kind", words(python, &group_set_kind))?;
+        out.set_item("group_set_offset", words(python, &group_set_offset))?;
+        out.set_item("group_set_length", words(python, &group_set_length))?;
+        out.set_item("set_payload", words(python, &artifact.set_payload))?;
+        out.set_item("reading_offsets", words(python, &reading_offsets))?;
+        out.set_item("reading_next_state", words(python, &reading_next_state))?;
+        out.set_item("reading_term_offsets", words(python, &reading_term_offsets))?;
+        out.set_item("reading_terminals", words(python, &reading_terminals))?;
+        out.set_item("action_offsets", words(python, &artifact.action_offsets))?;
+        out.set_item("action_terminals", words(python, &artifact.action_terminals))?;
+        out.set_item("action_values", signed(python, &artifact.action_values))?;
+        out.set_item("goto_offsets", words(python, &artifact.goto_offsets))?;
+        out.set_item(
+            "goto_nonterminals",
+            words(python, &artifact.goto_nonterminals),
+        )?;
+        out.set_item("goto_targets", words(python, &artifact.goto_targets))?;
+        out.set_item("production_lhs", words(python, &artifact.production_lhs))?;
+        out.set_item("production_arity", words(python, &artifact.production_arity))?;
+        out.set_item("pending_offsets", words(python, &artifact.pending_offsets))?;
+        out.set_item(
+            "pending_terminals",
+            words(python, &artifact.pending_terminals),
+        )?;
+        out.set_item("eof_terminal", artifact.eof_terminal)?;
+        out.set_item("start_parser_state", artifact.start_parser_state)?;
+        out.set_item("vocab_size", artifact.vocab_size)?;
+        out.set_item("bitset_words", artifact.bitset_words)?;
+        Ok(out)
     }
 
     /// Every group's token set as a dense bitmask, for callers that want to

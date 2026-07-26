@@ -1,0 +1,24 @@
+{
+  "schema_index": 2,
+  "lexer_states": 81,
+  "groups": 10557,
+  "resident_bytes": 1394752,
+  "measurements": [
+    {
+      "batch_size": 1,
+      "device_fill_us": 44.33920085430145
+    },
+    {
+      "batch_size": 32,
+      "device_fill_us": 52.58240103721619
+    },
+    {
+      "batch_size": 128,
+      "device_fill_us": 112.53759860992432
+    },
+    {
+      "batch_size": 512,
+      "device_fill_us": 318.668794631958
+    }
+  ]
+}
