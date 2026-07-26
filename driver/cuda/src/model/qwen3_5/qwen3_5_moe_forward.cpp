@@ -140,6 +140,17 @@ int qwen35_moe_decode_fast_max_tokens() {
     return max_tokens;
 }
 
+// The routed decode GEMMs are M=1 streaming reads. A dedicated GEMV beats
+// `cublasGemmBatchedEx` on them; see `moe_decode_gemv_bf16_kernel`.
+bool qwen35_moe_gemv_decode_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_QWEN35_MOE_GEMV_DECODE");
+        if (v == nullptr || v[0] == '\0') return true;
+        return v[0] != '0';
+    }();
+    return enabled;
+}
+
 bool qwen35_moe_wmma_decode_enabled() {
     static const bool enabled = [] {
         const char* v = std::getenv("PIE_QWEN35_MOE_WMMA_DECODE");
@@ -1450,6 +1461,54 @@ bool moe_block(
                                 moe_ws.aligned_route_ids.data(),
                                 moe_ws.expert_out.data(),
                                 routes, aligned_rows, H, stream);
+                            if (add_to_residual) {
+                                kernels::launch_token_batched_weighted_sum_add_bf16(
+                                    moe_out, moe_ws.expert_out.data(),
+                                    moe_ws.topk_weights.data(),
+                                    N, K, H, stream);
+                            } else {
+                                kernels::launch_token_batched_weighted_sum_bf16(
+                                    moe_out, moe_ws.expert_out.data(),
+                                    moe_ws.topk_weights.data(),
+                                    N, K, H, stream);
+                            }
+                        });
+                } else if (qwen35_moe_gemv_decode_enabled() &&
+                           (H % 8) == 0 && (Im % 8) == 0) {
+                    profile_cuda_detail_stage(
+                        profile, profile ? &profile->moe_gate_up_ms : nullptr,
+                        stream, [&] {
+                            kernels::launch_moe_gate_up_decode_gemv_bf16(
+                                moe_ws.topk_idx.data(),
+                                ws.norm_x.data(),
+                                Lw.moe_gate_up_proj->data(),
+                                moe_ws.expert_gate_up.data(),
+                                N, K, H, Im, stream);
+                        });
+
+                    profile_cuda_detail_stage(
+                        profile, profile ? &profile->moe_act_ms : nullptr,
+                        stream, [&] {
+                            kernels::launch_chunked_swiglu_bf16(
+                                moe_ws.expert_gate_up.data(),
+                                moe_ws.expert_act.data(),
+                                routes, Im, stream);
+                        });
+
+                    profile_cuda_detail_stage(
+                        profile, profile ? &profile->moe_down_ms : nullptr,
+                        stream, [&] {
+                            kernels::launch_moe_down_decode_gemv_bf16(
+                                moe_ws.topk_idx.data(),
+                                moe_ws.expert_act.data(),
+                                Lw.moe_down_proj->data(),
+                                moe_ws.expert_out.data(),
+                                N, K, H, Im, stream);
+                        });
+
+                    profile_cuda_detail_stage(
+                        profile, profile ? &profile->moe_reduce_ms : nullptr,
+                        stream, [&] {
                             if (add_to_residual) {
                                 kernels::launch_token_batched_weighted_sum_add_bf16(
                                     moe_out, moe_ws.expert_out.data(),

@@ -159,6 +159,32 @@ void launch_build_moe_ptrs_decode_batched_bf16(
     int H, int I_moe,
     cudaStream_t stream);
 
+// Bandwidth-optimal decode GEMVs for the sparse MoE hot path. At M=1 the
+// routed GEMMs have no weight reuse, so they are pure streaming reads;
+// one warp per output row beats both the tensor-core kernels below and
+// `cublasGemmBatchedEx`, whose tiling assumes an M worth filling.
+void launch_moe_gate_up_decode_gemv_bf16(
+    const std::int32_t* topk_idx,
+    const void* norm_x,
+    const void* gate_up_base,
+    void* expert_gate_up,
+    int num_tokens,
+    int top_k,
+    int H,
+    int I_moe,
+    cudaStream_t stream);
+
+void launch_moe_down_decode_gemv_bf16(
+    const std::int32_t* topk_idx,
+    const void* expert_act,
+    const void* down_base,
+    void* expert_out,
+    int num_tokens,
+    int top_k,
+    int H,
+    int I_moe,
+    cudaStream_t stream);
+
 // Tensor-core decode kernels for the sparse MoE hot path. Each routed
 // token/expert pair is treated as a 1-row GEMM, but computed with BF16 WMMA
 // tiles to avoid the overhead of many tiny cuBLAS batched GEMMs.
