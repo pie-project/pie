@@ -18,6 +18,8 @@
 //! parser, so a vocabulary of a quarter million collapses into a few hundred
 //! entries and the per-step parser work stops depending on vocabulary size.
 
+pub mod pipeline;
+
 use std::collections::BTreeMap;
 
 use anyhow::{Result, bail};

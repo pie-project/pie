@@ -79,7 +79,21 @@ impl<'a> Converter<'a> {
         Ok(())
     }
 
+    /// A value, followed by whatever whitespace comes after it.
+    ///
+    /// JSON allows whitespace on both sides of every separator, but a grammar
+    /// that writes it on both sides puts two optionals next to each other -
+    /// `value ws? ws? ","` - and the parser cannot tell which one took it. LALR
+    /// reports that as a conflict, and resolving it is not free: it costs the
+    /// schemas that then fail to compile. Attaching the whitespace to the value
+    /// instead gives every position exactly one place to put it, so the same
+    /// language is described without the ambiguity.
     fn visit(&mut self, schema: &Value, hint: &str) -> Result<Expr> {
+        let value = self.visit_bare(schema, hint)?;
+        Ok(seq(vec![value, self.ws()]))
+    }
+
+    fn visit_bare(&mut self, schema: &Value, hint: &str) -> Result<Expr> {
         if let Some(accepts_all) = schema.as_bool() {
             return if accepts_all {
                 self.visit_any(hint)
@@ -124,11 +138,30 @@ impl<'a> Converter<'a> {
             let options = options
                 .as_array()
                 .ok_or_else(|| anyhow!("anyOf/oneOf must be an array"))?;
+            // `{"properties": {...}, "anyOf": [{"required": ["a"]},
+            // {"required": ["b"]}]}` means "this object, and it has a or b".
+            // Lowering the branches alone turns each into "any JSON value" and
+            // throws the object away, so the siblings have to come along.
+            //
+            // Distributing them one branch at a time - `(S and B1) or (S and
+            // B2)` - is exact but unparseable: both alternatives begin with the
+            // same property and differ only in which ones may be left out, so
+            // an LALR parser cannot tell them apart until far past one token of
+            // lookahead. Requiring only what every branch requires collapses
+            // them to a single object with no choice to resolve. That accepts
+            // documents satisfying none of the branches, which is the same
+            // direction the parser already errs in for `anyOf`, and it is the
+            // difference between a usable grammar and none at all.
+            if self.options.precision.merges_branches()
+                && let Some(merged) = merge_required_choice(schema, options)?
+            {
+                return self.visit(&merged, hint);
+            }
             return Ok(Expr::choice(
                 options
                     .iter()
                     .enumerate()
-                    .map(|(index, schema)| self.visit(schema, &format!("{}_{}", hint, index)))
+                    .map(|(index, branch)| self.visit(branch, &format!("{}_{}", hint, index)))
                     .collect::<Result<Vec<_>>>()?,
             ));
         }
@@ -213,7 +246,6 @@ impl<'a> Converter<'a> {
                 pair.clone(),
                 seq(vec![lit(","), self.ws(), pair]).repeat(0, None),
             ])),
-            self.ws(),
             lit("}"),
         ]);
         let array = seq(vec![
@@ -223,20 +255,26 @@ impl<'a> Converter<'a> {
                 value.clone(),
                 seq(vec![lit(","), self.ws(), value.clone()]).repeat(0, None),
             ])),
-            self.ws(),
             lit("]"),
         ]);
         self.define_named(
             name.clone(),
-            Expr::choice(vec![
-                object,
-                array,
-                string,
-                number,
-                lit("true"),
-                lit("false"),
-                lit("null"),
-            ]),
+            // Every alternative ends with the whitespace that follows it, so
+            // the separator that comes next needs none of its own.
+            Expr::choice(
+                [
+                    object,
+                    array,
+                    string,
+                    number,
+                    lit("true"),
+                    lit("false"),
+                    lit("null"),
+                ]
+                .into_iter()
+                .map(|alternative| seq(vec![alternative, self.ws()]))
+                .collect(),
+            ),
         )?;
         Ok(Expr::RuleRef(name))
     }
@@ -288,6 +326,29 @@ impl<'a> Converter<'a> {
             return self.lexeme("pattern", body);
         }
         self.json_string(min, max)
+    }
+
+    /// A property name that a regex has to accept.
+    ///
+    /// JSON Schema patterns are unanchored - `"ab"` matches the key
+    /// `"xaby"` - but the regex frontend reads them as anchored, so an
+    /// unanchored pattern has to be widened explicitly. The padding is the
+    /// JSON string body rather than `.`, because `.` includes the quote that
+    /// ends the key and the lexer would run straight through it.
+    fn pattern_key(&mut self, pattern: &str) -> Result<Expr> {
+        let anchored_start = pattern.starts_with('^');
+        let anchored_end = pattern.ends_with('$') && !pattern.ends_with("\\$");
+        let body = regex_to_expr(pattern)?;
+        let mut parts = vec![lit("\"")];
+        if !anchored_start {
+            parts.push(json_character().repeat(0, None));
+        }
+        parts.push(body);
+        if !anchored_end {
+            parts.push(json_character().repeat(0, None));
+        }
+        parts.push(lit("\""));
+        self.lexeme("key", seq(parts))
     }
 
     fn json_string(&mut self, min: u32, max: Option<u32>) -> Result<Expr> {
@@ -381,7 +442,6 @@ impl<'a> Converter<'a> {
                 lit("["),
                 self.ws(),
                 separated_items(item, min, max, self.ws()),
-                self.ws(),
                 lit("]"),
             ]));
         }
@@ -403,13 +463,7 @@ impl<'a> Converter<'a> {
         } else if min > prefix.len() as u32 || max.is_some_and(|max| max < prefix.len() as u32) {
             bail!("array bounds cannot be satisfied by prefixItems");
         }
-        Ok(seq(vec![
-            lit("["),
-            self.ws(),
-            seq(content),
-            self.ws(),
-            lit("]"),
-        ]))
+        Ok(seq(vec![lit("["), self.ws(), seq(content), lit("]")]))
     }
 
     fn visit_object(&mut self, schema: &Value, hint: &str) -> Result<Expr> {
@@ -483,21 +537,64 @@ impl<'a> Converter<'a> {
                 });
             }
         }
-        let additional_pair = match additional {
-            Some(value) => {
-                let name = self.json_string(0, None)?;
-                Some(seq(vec![name, self.ws(), lit(":"), self.ws(), value]))
-            }
-            None => None,
+        // `patternProperties` names its keys by a regex instead of literally,
+        // which is the one place a JSON Schema object says something a fixed
+        // list of properties cannot. It behaves like `additionalProperties`
+        // except that the key is constrained, so it lowers the same way: a
+        // pair that may repeat. A schema that pairs it with
+        // `additionalProperties: false` allows *only* these keys, which is why
+        // the pattern pairs have to survive `additional` being absent.
+        let mut repeatable = Vec::new();
+        for (pattern, sub) in object
+            .get("patternProperties")
+            .map(|value| {
+                value
+                    .as_object()
+                    .ok_or_else(|| anyhow!("patternProperties must be an object"))
+            })
+            .transpose()?
+            .into_iter()
+            .flatten()
+        {
+            let key = self.pattern_key(pattern)?;
+            let value = self.visit(sub, &format!("{}_pattern", hint))?;
+            repeatable.push(seq(vec![key, self.ws(), lit(":"), self.ws(), value]));
+        }
+        if let Some(value) = additional {
+            let name = self.json_string(0, None)?;
+            repeatable.push(seq(vec![name, self.ws(), lit(":"), self.ws(), value]));
+        }
+        let additional_pair = match repeatable.len() {
+            0 => None,
+            _ => Some(Expr::choice(repeatable)),
         };
         if known.is_empty() {
             return Ok(seq(vec![
                 lit("{"),
                 self.ws(),
                 additional_properties(additional_pair, min, max, self.ws())?,
-                self.ws(),
                 lit("}"),
             ]));
+        }
+
+        // A JSON object is a set, not a sequence, but a grammar can only
+        // describe a sequence. The usual answer - XGrammar's too - is to fix
+        // the order at the one the schema declares, which rejects every other
+        // permutation of a perfectly valid document.
+        //
+        // It can be done exactly. What the order was standing in for is the
+        // question "have the required properties appeared yet", and that is a
+        // subset of the required set, not an ordering of everything. Carrying
+        // the subset in the parser state makes the properties free to arrive in
+        // any order while `required` is still enforced. The cost is one rule
+        // per subset, so it is affordable exactly while the required set is
+        // small - which, in practice, is nearly always.
+        if min <= required.len() as u32
+            && max.is_none()
+            && self.options.precision.unordered()
+            && let Some(object) = self.build_unordered(hint, &known, &additional_pair)?
+        {
+            return Ok(object);
         }
 
         let content = if known.iter().all(|property| property.required) {
@@ -531,7 +628,106 @@ impl<'a> Converter<'a> {
             .ok_or_else(|| anyhow!("object property constraints are unsatisfiable"))?
         };
 
-        Ok(seq(vec![lit("{"), self.ws(), content, self.ws(), lit("}")]))
+        Ok(seq(vec![lit("{"), self.ws(), content, lit("}")]))
+    }
+
+    /// Objects whose properties may arrive in any order.
+    ///
+    /// Two rules per subset of the required properties: `item` picks the next
+    /// property, `tail` decides whether the object ends. A required property
+    /// moves to a larger subset, an optional or additional one stays put, and
+    /// only the full subset lets `tail` be empty, so the object closes exactly
+    /// when everything required has been seen.
+    ///
+    /// `None` when the required set is too large to enumerate - the caller
+    /// then falls back to the declared order.
+    fn build_unordered(
+        &mut self,
+        hint: &str,
+        known: &[Property],
+        additional: &Option<Expr>,
+    ) -> Result<Option<Expr>> {
+        let required: Vec<usize> = known
+            .iter()
+            .enumerate()
+            .filter(|(_, property)| property.required)
+            .map(|(index, _)| index)
+            .collect();
+        // A declared name also scans as a generic one, so where both are
+        // possible the matcher carries a configuration per reading. The
+        // readings differ only in the subset they claim to have completed, so
+        // the count is bounded by the number of subsets rather than by the
+        // number of properties - and it collapses to one as soon as the names
+        // are a closed set, because then there is no generic reading to fork
+        // on. The budget is therefore the matcher's configuration budget seen
+        // from the other side, and it is tighter when a generic key exists.
+        let budget = match additional {
+            Some(_) => UNORDERED_REQUIRED_BUDGET_OPEN,
+            None => UNORDERED_REQUIRED_BUDGET_CLOSED,
+        };
+        if required.len() > budget {
+            return Ok(None);
+        }
+        let full: u32 = (1u32 << required.len()) - 1;
+
+        // The rules refer to each other, so every name has to exist before any
+        // body can be written - and nothing may be committed until they all
+        // do, or a later refusal would leave the earlier rules pointing at
+        // names that never get defined.
+        let items: Vec<String> = (0..=full)
+            .map(|mask| self.fresh_name(&format!("{hint}_item_{mask}")))
+            .collect();
+        let tails: Vec<String> = (0..=full)
+            .map(|mask| self.fresh_name(&format!("{hint}_tail_{mask}")))
+            .collect();
+        let mut pending: Vec<(String, Expr)> = Vec::new();
+
+        for mask in 0..=full {
+            let more = seq(vec![
+                lit(","),
+                self.ws(),
+                Expr::RuleRef(items[mask as usize].clone()),
+            ]);
+            // Only the full subset may stop: anything less is an object still
+            // missing a property the schema requires.
+            let tail = if mask == full { optional(more) } else { more };
+            pending.push((tails[mask as usize].clone(), tail));
+
+            let mut item = Vec::new();
+            for (index, property) in known.iter().enumerate() {
+                let next = match required.iter().position(|&r| r == index) {
+                    Some(bit) if mask & (1 << bit) != 0 => continue,
+                    Some(bit) => mask | (1 << bit),
+                    None => mask,
+                };
+                item.push(seq(vec![
+                    property.pair.clone(),
+                    Expr::RuleRef(tails[next as usize].clone()),
+                ]));
+            }
+            if let Some(additional) = additional {
+                item.push(seq(vec![
+                    additional.clone(),
+                    Expr::RuleRef(tails[mask as usize].clone()),
+                ]));
+            }
+            if item.is_empty() {
+                return Ok(None);
+            }
+            pending.push((items[mask as usize].clone(), Expr::choice(item)));
+        }
+        for (name, body) in pending {
+            self.define_named(name, body)?;
+        }
+
+        let content = Expr::RuleRef(items[0].clone());
+        // With nothing required the object may also be empty.
+        let content = if full == 0 {
+            optional(content)
+        } else {
+            content
+        };
+        Ok(Some(seq(vec![lit("{"), self.ws(), content, lit("}")])))
     }
 
     fn ws(&self) -> Expr {
@@ -638,6 +834,16 @@ impl<'a> Converter<'a> {
         }
     }
 }
+
+/// How many required properties an order-free object will enumerate subsets
+/// of when `additionalProperties` leaves the names open. Each subset is a
+/// parse the matcher may have to carry at once, so this is bounded by its
+/// configuration budget; four covers 96% of the objects in JSONSchemaBench.
+const UNORDERED_REQUIRED_BUDGET_OPEN: usize = 4;
+
+/// The same, for objects whose property names are a closed set. Nothing forks
+/// there, so the only cost is grammar size and the budget can be looser.
+const UNORDERED_REQUIRED_BUDGET_CLOSED: usize = 6;
 
 #[derive(Clone)]
 struct Property {
@@ -753,6 +959,96 @@ fn length_range(expr: &Expr) -> (u64, Option<u64>) {
             )
         }
     }
+}
+
+/// Fold an `anyOf` whose branches only list required properties.
+///
+/// Returns `None` when the branches say anything else, since then they are
+/// real alternatives and have to stay a choice.
+fn merge_required_choice(schema: &Value, options: &[Value]) -> Result<Option<Value>> {
+    if options.is_empty() {
+        return Ok(None);
+    }
+    let mut shared: Option<Vec<Value>> = None;
+    for branch in options {
+        let Some(branch) = branch.as_object() else {
+            return Ok(None);
+        };
+        if branch.keys().any(|key| key != "required") {
+            return Ok(None);
+        }
+        let required = match branch.get("required") {
+            Some(value) => value
+                .as_array()
+                .ok_or_else(|| anyhow!("required must be an array"))?
+                .clone(),
+            None => Vec::new(),
+        };
+        shared = Some(match shared {
+            None => required,
+            Some(previous) => previous
+                .into_iter()
+                .filter(|name| required.contains(name))
+                .collect(),
+        });
+    }
+
+    let mut merged = strip_keys(schema, &["anyOf", "oneOf"]);
+    let object = merged.as_object_mut().expect("built from an object");
+    if !describes_shape(&Value::Object(object.clone())) {
+        return Ok(None);
+    }
+    let mut required = object
+        .get("required")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for name in shared.unwrap_or_default() {
+        if !required.contains(&name) {
+            required.push(name);
+        }
+    }
+    object.insert("required".to_string(), Value::Array(required));
+    Ok(Some(merged))
+}
+
+/// Does this schema constrain what a value looks like?
+///
+/// `required`, `minProperties` and friends restrict an object without saying
+/// it is one, so a schema built only from those admits every JSON value.
+fn describes_shape(schema: &Value) -> bool {
+    let Some(object) = schema.as_object() else {
+        return true;
+    };
+    const SHAPE: &[&str] = &[
+        "type",
+        "properties",
+        "patternProperties",
+        "items",
+        "prefixItems",
+        "enum",
+        "const",
+        "pattern",
+        "format",
+        "$ref",
+        "anyOf",
+        "oneOf",
+        "allOf",
+    ];
+    object.keys().any(|key| SHAPE.contains(&key.as_str()))
+}
+
+/// A schema with some keywords removed.
+fn strip_keys(schema: &Value, drop: &[&str]) -> Value {
+    Value::Object(
+        schema
+            .as_object()
+            .expect("checked by the caller")
+            .iter()
+            .filter(|(key, _)| !drop.contains(&key.as_str()))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    )
 }
 
 /// Combine `allOf` branches into one schema.

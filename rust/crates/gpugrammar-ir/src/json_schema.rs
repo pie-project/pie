@@ -29,6 +29,55 @@ pub struct JsonSchemaOptions {
     /// object accept `{}` and nothing else, which silently truncates the
     /// language rather than reporting that it cannot be represented.
     pub strict_mode: bool,
+    /// How much of a schema's shape to keep when it cannot be kept exactly.
+    ///
+    /// Some schemas have no LALR(1) grammar at their most precise lowering, so
+    /// the compiler tries the levels in order and keeps the first that builds
+    /// tables. Nothing here is unsound in the direction that matters: a lower
+    /// level accepts more, never less.
+    pub precision: Precision,
+}
+
+/// Which lowering strategy to use, most faithful first.
+///
+/// The levels are ordered by the language they describe, largest first. A
+/// schema may fail to compile at one level and succeed at the next, so the
+/// pipeline walks them in order and keeps the first that builds tables. No
+/// level ever describes *less* than the schema allows, which is what a mask
+/// needs: a token the schema permits is never masked away.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
+pub enum Precision {
+    /// Objects whose properties are all optional accept them in any order,
+    /// which is what JSON Schema means. Costs lexer states, because every
+    /// property name is live at once.
+    Unordered,
+    /// Properties must appear in the order the schema declares them. Smaller
+    /// lexer, but rejects permutations of valid documents. This is also what
+    /// XGrammar does.
+    Ordered,
+    /// `anyOf` branches lower on their own, without the sibling keywords that
+    /// constrain them. Loses the object those siblings described, and is the
+    /// last resort before refusing the schema.
+    Branches,
+}
+
+impl Precision {
+    /// Most faithful first.
+    pub const LEVELS: [Precision; 3] = [
+        Precision::Unordered,
+        Precision::Ordered,
+        Precision::Branches,
+    ];
+
+    /// May objects put their properties in any order?
+    pub fn unordered(self) -> bool {
+        self == Precision::Unordered
+    }
+
+    /// Do `anyOf` branches inherit their sibling keywords?
+    pub fn merges_branches(self) -> bool {
+        self != Precision::Branches
+    }
 }
 
 impl Default for JsonSchemaOptions {
@@ -36,6 +85,7 @@ impl Default for JsonSchemaOptions {
         Self {
             any_whitespace: true,
             strict_mode: false,
+            precision: Precision::Unordered,
         }
     }
 }

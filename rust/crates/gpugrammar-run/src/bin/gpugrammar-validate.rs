@@ -6,19 +6,22 @@
 //! that into an end-to-end check of lowering, terminal extraction, the lexer
 //! and the parser at once: a rejection is a bug in one of them, and the byte
 //! offset says where to look.
+//!
+//! The corpus was generated with a token budget, so 88 of the 533 instances
+//! stop in the middle of a document. Those are still evidence - every byte the
+//! model wrote had to be legal at the point it wrote it - but asking whether
+//! the parser can *finish* there is asking the wrong question, because the
+//! document does not finish either. A truncated instance therefore counts as
+//! accepted when the parser consumed all of it, and the two kinds of failure
+//! are reported apart: a byte the parser refused is always a bug, while a
+//! refusal to terminate is only a bug on a document that was complete.
 
 use std::fs;
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
-use gpugrammar_ir::json_schema::{JsonSchemaOptions, json_schema_to_grammar};
-use gpugrammar_lex::lexicon::{extract_within, terminal_automata_within};
-use gpugrammar_lex::regular::analyze;
-use gpugrammar_lex::{build_lexer_within, group_vocabulary};
-use gpugrammar_lr::cfg::flatten_within;
-use gpugrammar_lr::tables::build;
 use gpugrammar_run::Matcher;
-use gpugrammar_tables::emit;
+use gpugrammar_tables::pipeline::{Failure, Limits, compile_json_schema};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -50,72 +53,55 @@ fn main() -> Result<()> {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(20_000);
-    let mut lexer_states: Vec<usize> = Vec::new();
-    let mut oversized = 0usize;
+    let limits = Limits {
+        lexer_states: state_limit,
+        ..Default::default()
+    };
+    let report = std::env::var("GPUGRAMMAR_REPORT").is_ok();
+
     let mut compiled = 0usize;
     let mut accepted = 0usize;
     let mut rejected = 0usize;
     let mut reported = 0usize;
+    let mut truncated = 0usize;
+    let mut refused_byte = 0usize;
+    let mut refused_end = 0usize;
+    let mut levels: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut failures: Vec<Failure> = Vec::new();
 
     for (index, instance) in corpus.instances.iter().enumerate() {
-        let Ok(grammar) = json_schema_to_grammar(&instance.schema, &JsonSchemaOptions::default())
-        else {
-            if std::env::var("GPUGRAMMAR_REPORT").is_ok() {
-                println!("LOWERING {index}");
+        let artifact = match compile_json_schema(&instance.schema, &bytes, limits) {
+            Ok(result) => {
+                *levels.entry(format!("{:?}", result.precision)).or_default() += 1;
+                Arc::new(result.artifact)
             }
-            continue;
-        };
-        let budget: u64 = std::env::var("GPUGRAMMAR_TERMINAL_BUDGET")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(gpugrammar_lex::lexicon::DEFAULT_TERMINAL_BUDGET);
-        let lexicon = extract_within(&grammar, &analyze(&grammar), budget);
-        // A length bound is unrolled into the automaton, so refuse the schema
-        // from its declared bounds rather than after building.
-        let Some(automata) = terminal_automata_within(&grammar, &lexicon, state_limit as u64)
-        else {
-            oversized += 1;
-            if std::env::var("GPUGRAMMAR_REPORT").is_ok() {
-                println!("OVERSIZED_ESTIMATE {index}");
+            Err(failure) => {
+                failures.push(failure);
+                if report {
+                    println!("{failure:?} {index}");
+                }
+                continue;
             }
-            continue;
         };
-        let Some(lexer) = build_lexer_within(automata, state_limit) else {
-            oversized += 1;
-            if std::env::var("GPUGRAMMAR_REPORT").is_ok() {
-                println!("OVERSIZED_DFA {index}");
-            }
-            continue;
-        };
-        lexer_states.push(lexer.num_states());
-        let groups = group_vocabulary(&lexer, &bytes);
-        let Some(cfg) = flatten_within(&lexicon, gpugrammar_lr::cfg::DEFAULT_PRODUCTION_BUDGET)
-        else {
-            oversized += 1;
-            if std::env::var("GPUGRAMMAR_REPORT").is_ok() {
-                println!("OVERSIZED_CFG {index}");
-            }
-            continue;
-        };
-        let Ok(tables) = build(&cfg) else {
-            if std::env::var("GPUGRAMMAR_REPORT").is_ok() {
-                println!("LR_CONFLICT {index}");
-            }
-            continue;
-        };
-        let artifact = Arc::new(emit(&lexicon, &lexer, &groups, &cfg, &tables, bytes.len())?);
         compiled += 1;
+
+        let complete = serde_json::from_str::<serde_json::Value>(&instance.text).is_ok();
+        if !complete {
+            truncated += 1;
+        }
 
         let mut matcher = Matcher::new(artifact, 0);
         let mut failure = None;
         for (offset, byte) in instance.text.as_bytes().iter().enumerate() {
             if matcher.accept_token(*byte as u32).is_err() {
                 failure = Some(offset);
+                refused_byte += 1;
                 break;
             }
         }
-        if failure.is_none() && !matcher.can_terminate() {
+        if failure.is_none() && complete && !matcher.can_terminate() {
             failure = Some(instance.text.len());
+            refused_end += 1;
         }
 
         match failure {
@@ -139,19 +125,21 @@ fn main() -> Result<()> {
         }
     }
 
-    lexer_states.sort_unstable();
-    if !lexer_states.is_empty() {
-        println!(
-            "lexer states: median {} p90 {} max {}",
-            lexer_states[lexer_states.len() / 2],
-            lexer_states[lexer_states.len() * 9 / 10],
-            lexer_states[lexer_states.len() - 1]
-        );
+    let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
+    for failure in &failures {
+        *counts.entry(format!("{failure:?}")).or_default() += 1;
     }
-    println!("oversized : {oversized} (over {state_limit} lexer states)");
+    println!("schemas   : {}", corpus.instances.len());
     println!("compiled  : {compiled}");
+    for (level, count) in &levels {
+        println!("  lowered : {count} at {level}");
+    }
+    for (reason, count) in counts {
+        println!("  refused : {count} {reason}");
+    }
     println!("accepted  : {accepted}");
-    println!("rejected  : {rejected}");
+    println!("rejected  : {rejected} (byte {refused_byte}, end {refused_end})");
+    println!("truncated : {truncated} (checked as prefixes)");
     if compiled > 0 {
         println!(
             "acceptance: {:.1}%",

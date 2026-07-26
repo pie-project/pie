@@ -91,6 +91,22 @@ fn main() -> Result<()> {
         );
         if result.is_err() {
             println!("\nlexer scan was: {scanned:?}");
+            for (index, (lexer_state, stack)) in matcher.configurations().iter().enumerate() {
+                let top = *stack.last().unwrap() as usize;
+                let accepts: Vec<String> = tables
+                    .admissible(top)
+                    .map(|terminal| {
+                        if terminal == tables.eof {
+                            "<eof>".to_string()
+                        } else {
+                            name(terminal)
+                        }
+                    })
+                    .collect();
+                println!(
+                    "config {index}: lexer {lexer_state} stack {stack:?} top accepts {accepts:?}"
+                );
+            }
             let state = matcher.parser_state() as usize;
             let admissible: Vec<String> = tables
                 .admissible(state)

@@ -481,12 +481,57 @@ mask, and this path still fills a CPU bitmask because that is the only
 interface vLLM offers — Layer 3 of Decision 1, the fused sampling hook, does
 not exist upstream. Batch 16 is also far below where the CPU fill dominates.
 
-**Coverage on real schemas.** Of 533 JSONSchemaBench schemas, 461 lower to a
-grammar and **446 compile to LALR(1) tables (83.7%)**. Of the rest, 72 fail in
-the vendored JSON Schema front end — `allOf` with multiple schemas, `required`
-naming an undeclared property, `pattern` combined with length bounds — and 15
-hit genuine reduce/reduce conflicts that need investigation. XGrammar reaches
-about 98.5%, so this is the gap to close.
+**Coverage and acceptance on real schemas.** Of 533 JSONSchemaBench schemas,
+**431 compile to LALR(1) tables**. Feeding each schema's model-generated
+instance through the matcher one byte at a time accepts **416 of them**. The
+remaining refusals split into 37 lexers over budget (length bounds unrolled
+into the DFA), 35 the front end cannot lower, 21 genuine LALR conflicts and 9
+over the production budget.
+
+The acceptance figure is measured differently than it was: the corpus was
+generated with a 256-token budget, so 88 of its instances stop mid-document.
+Asking whether the parser can *terminate* there is the wrong question, because
+the document does not terminate either. A truncated instance now counts as
+accepted when every byte of it was legal, and the two kinds of failure are
+counted apart. Under the old rule the same code reports a lower number for a
+reason that has nothing to do with the parser.
+
+**Objects accept their properties in any order.** A JSON object is a set, but a
+grammar describes a sequence, so the standard answer - XGrammar's too - fixes
+the order at the one the schema declares and rejects every other permutation of
+a valid document. It can be done exactly: what the order stands in for is
+"which required properties have appeared", which is a *subset* of the required
+set, not an ordering of everything. Carrying that subset in the parser state
+costs one rule per subset, and required sets are small - 96% of the objects in
+JSONSchemaBench require at most four properties.
+
+Measured on the same corpus re-serialised with every object's keys reversed:
+
+| | in declared order | keys reversed |
+|---|---|---|
+| before | 348 / 416 | 130 / 361 (36.0%) |
+| after | 416 / 431 | 313 / 369 (**84.8%**) |
+
+The cost is memory. All property names being live at once enlarges the lexer,
+and the eight-schema resident total goes from 3.87 MB to **10.84 MB** - still
+60x below the 658 MB the first working version needed. It also costs a few
+documents in declared order (five, at the chosen budget), because a declared
+name also scans as a generic one and the matcher has to carry a configuration
+per reading; raising its budget from 64 to 128 recovered most of them, and 256
+recovered two more, which is where it stops paying.
+
+Order-freedom is free when `additionalProperties` is `false`: with a closed set
+of names there is no generic reading to fork on. It is bought when the names
+are open, which is why the two budgets differ.
+
+**The compiler searches rather than computes.** Lowering cannot know whether
+the grammar it produced is LALR(1) - finding out costs a table construction -
+so the pipeline lowers a schema as precisely as it can be expressed, tries to
+build tables, and drops to a coarser lowering only when the precise one has no
+parser. Every level accepts a superset of the one above, so a token the schema
+allows is never masked away. On this corpus 424 schemas compile at the most
+faithful level, 5 need declaration order, and 2 need `anyOf` branches lowered
+without their siblings.
 
 **Two bugs only end-to-end testing found.** A grammar with no recursion left an
 empty skeleton, which was treated as failure when it is the best case: the

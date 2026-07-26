@@ -39,10 +39,16 @@ struct Config {
     stack: Vec<u32>,
 }
 
-/// How many configurations to carry. Ambiguity in these grammars is local, so
-/// the set collapses within a token or two; the cap only bounds the worst case.
-/// Dropping configurations can only make the matcher stricter, never looser.
-const MAX_CONFIGS: usize = 64;
+/// How many configurations to carry.
+///
+/// Most ambiguity in these grammars is local and collapses within a token or
+/// two, but order-free objects keep one configuration per subset of required
+/// properties they might have completed, and nesting multiplies those. Raising
+/// the cap from 64 to 128 recovered documents that had been rejected purely
+/// because the set was truncated; 256 recovered two more, so this is where it
+/// stops paying. Dropping configurations can only make the matcher stricter,
+/// never looser.
+const MAX_CONFIGS: usize = 128;
 
 /// A parse in progress.
 #[derive(Debug, Clone)]
