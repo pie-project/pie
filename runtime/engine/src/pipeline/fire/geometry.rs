@@ -13,10 +13,10 @@
 //! The two exceptions carry their own annotated `allow` at the field.
 
 use pie_grammar::brle::RunMask;
-use pie_ptir::container::{PortSource, TraceContainer};
-use pie_ptir::op::Op;
-use pie_ptir::registry::Port;
-use pie_ptir::types::DType;
+use pie_ir::container::{PortSource, TraceContainer};
+use pie_ir::op::Op;
+use pie_ir::registry::Port;
+use pie_ir::types::DType;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DecodeEnvelope {
@@ -147,8 +147,8 @@ pub fn classify_decode_envelope(
         || token_dims[0] == 0
         || !matches!(
             token.dtype,
-            pie_ptir::container::ChanDType::Concrete(DType::I32)
-                | pie_ptir::container::ChanDType::Concrete(DType::U32)
+            pie_ir::container::ChanDType::Concrete(DType::I32)
+                | pie_ir::container::ChanDType::Concrete(DType::U32)
         )
     {
         return Err("decode envelope tokens must be a non-empty i32/u32 vector".to_string());
@@ -174,7 +174,7 @@ pub fn classify_decode_envelope(
             if declaration.shape.dims() != [token_count + 1]
                 || !matches!(
                     declaration.dtype,
-                    pie_ptir::container::ChanDType::Concrete(DType::U32)
+                    pie_ir::container::ChanDType::Concrete(DType::U32)
                 )
             {
                 return Err(format!(
@@ -199,7 +199,7 @@ pub fn classify_decode_envelope(
     if kv_len.shape.dims() != [lane_count]
         || !matches!(
             kv_len.dtype,
-            pie_ptir::container::ChanDType::Concrete(DType::U32)
+            pie_ir::container::ChanDType::Concrete(DType::U32)
         )
     {
         return Err(format!(
@@ -223,7 +223,7 @@ pub fn classify_decode_envelope(
                 if declaration.shape.dims() != [lane_count + 1]
                     || !matches!(
                         declaration.dtype,
-                        pie_ptir::container::ChanDType::Concrete(DType::U32)
+                        pie_ir::container::ChanDType::Concrete(DType::U32)
                     )
                 {
                     return Err("device EmbedIndptr must be a [lanes+1] u32 vector".to_string());
@@ -246,7 +246,7 @@ pub fn classify_decode_envelope(
                 if declaration.shape.dims().len() != 1
                     || !matches!(
                         declaration.dtype,
-                        pie_ptir::container::ChanDType::Concrete(DType::U32)
+                        pie_ir::container::ChanDType::Concrete(DType::U32)
                     )
                 {
                     return Err("device Readout must be a u32 vector".to_string());
@@ -264,7 +264,7 @@ pub fn classify_decode_envelope(
                 if declaration.shape.dims() != [token_count]
                     || !matches!(
                         declaration.dtype,
-                        pie_ptir::container::ChanDType::Concrete(DType::U32)
+                        pie_ir::container::ChanDType::Concrete(DType::U32)
                     )
                 {
                     return Err(format!(
@@ -286,7 +286,7 @@ pub fn classify_decode_envelope(
                 if !valid_shape
                     || !matches!(
                         declaration.dtype,
-                        pie_ptir::container::ChanDType::Concrete(DType::U32)
+                        pie_ir::container::ChanDType::Concrete(DType::U32)
                     )
                 {
                     return Err(
@@ -302,7 +302,7 @@ pub fn classify_decode_envelope(
                 if declaration.shape.dims() != [lane_count + 1]
                     || !matches!(
                         declaration.dtype,
-                        pie_ptir::container::ChanDType::Concrete(DType::U32)
+                        pie_ir::container::ChanDType::Concrete(DType::U32)
                     )
                 {
                     return Err("device PageIndptr must be a [lanes+1] u32 vector".to_string());
@@ -316,7 +316,7 @@ pub fn classify_decode_envelope(
                 if declaration.shape.dims() != [token_count]
                     || !matches!(
                         declaration.dtype,
-                        pie_ptir::container::ChanDType::Concrete(DType::U32)
+                        pie_ir::container::ChanDType::Concrete(DType::U32)
                     )
                 {
                     return Err("device WSlot/WOff must be a [tokens] u32 vector".to_string());
@@ -334,7 +334,7 @@ pub fn classify_decode_envelope(
                     .ok_or_else(|| "decode envelope mask channel is out of range".to_string())?;
                 if !matches!(
                     declaration.dtype,
-                    pie_ptir::container::ChanDType::Concrete(DType::Bool)
+                    pie_ir::container::ChanDType::Concrete(DType::Bool)
                 ) {
                     return Err("device attention mask must be a bool channel".to_string());
                 }
@@ -480,7 +480,7 @@ impl FireAttnMask {
 pub(crate) fn lower_attn_mask_evaluated(
     container: &TraceContainer,
     qo_indptr: &[u32],
-    evaluated: &[(Port, Result<pie_ptir::interp::Value, String>)],
+    evaluated: &[(Port, Result<pie_eval::interp::Value, String>)],
 ) -> Result<FireAttnMask, String> {
     let Some(binding) = container
         .ports
@@ -504,7 +504,7 @@ pub(crate) fn lower_attn_mask_evaluated(
             ));
         }
     };
-    let pie_ptir::interp::Value::Bool(dense) = value else {
+    let pie_eval::interp::Value::Bool(dense) = value else {
         return Err(format!(
             "attention-mask evaluated as {:?}, expected bool",
             value.dtype()
@@ -545,8 +545,8 @@ pub(crate) fn lower_attn_mask_evaluated(
 
 /// Evaluate and lower the mask against this fire's host-shadow value oracle.
 pub(crate) fn evaluate_attn_mask(
-    bound: &pie_ptir::validate::BoundTrace,
-    known: &mut dyn FnMut(u32) -> Option<pie_ptir::interp::Value>,
+    bound: &pie_ir::validate::BoundTrace,
+    known: &mut dyn FnMut(u32) -> Option<pie_eval::interp::Value>,
     qo_indptr: &[u32],
 ) -> Result<FireAttnMask, String> {
     if !bound
@@ -557,7 +557,7 @@ pub(crate) fn evaluate_attn_mask(
     {
         return Ok(FireAttnMask::Omitted);
     }
-    let evaluated = pie_ptir::pareval::eval_descriptor_ports(bound, known)
+    let evaluated = pie_eval::pareval::eval_descriptor_ports(bound, known)
         .map_err(|blocker| format!("attention-mask evaluation failed: {blocker}"))?
         .into_iter()
         .map(|(port, value)| (port, value.map_err(|blocker| blocker.to_string())))
@@ -608,7 +608,7 @@ fn port_dims(container: &TraceContainer, port: Port) -> Option<Vec<u32>> {
 }
 
 /// Map a pass's descriptor ports to forward geometry by **evaluating** the
-/// geometry prologue over host-known channel values (`pie_ptir::pareval`) —
+/// geometry prologue over host-known channel values (`pie_eval::pareval`) —
 /// the general form of [`map_geometry`], which reads only directly-present
 /// values and is its degenerate case. Returns the geometry plus every port's
 /// evaluated value (the canonical-KV gate verifies evidence against these).
@@ -617,20 +617,20 @@ fn port_dims(container: &TraceContainer, port: Port) -> Option<Vec<u32>> {
 /// the wire CSR by each lane's live page count from `PageIndptr`, mirroring
 /// the driver's descriptor resolution; rank-1 pages pass through flat.
 pub fn map_geometry_evaluated(
-    bound: &pie_ptir::validate::BoundTrace,
-    known: &mut dyn FnMut(u32) -> Option<pie_ptir::interp::Value>,
+    bound: &pie_ir::validate::BoundTrace,
+    known: &mut dyn FnMut(u32) -> Option<pie_eval::interp::Value>,
     page_size: u32,
 ) -> Result<
     (
         ReqGeometry,
-        Vec<(Port, Result<pie_ptir::interp::Value, String>)>,
+        Vec<(Port, Result<pie_eval::interp::Value, String>)>,
     ),
     EvaluatedGeometryError,
 > {
-    use pie_ptir::interp::Value;
+    use pie_eval::interp::Value;
 
     let container = &bound.container;
-    let ports = pie_ptir::pareval::eval_descriptor_ports(bound, known).map_err(|blocker| {
+    let ports = pie_eval::pareval::eval_descriptor_ports(bound, known).map_err(|blocker| {
         EvaluatedGeometryError::BadValue {
             port: Port::EmbedTokens,
             reason: blocker.to_string(),
@@ -731,8 +731,8 @@ pub fn map_geometry_evaluated(
 
 /// Reinterpret an evaluated value's lanes as `u32` (i32 tokens bit-cast, the
 /// driver's `token_ids` convention; bool as 0/1).
-pub(crate) fn value_as_u32(value: &pie_ptir::interp::Value) -> Vec<u32> {
-    use pie_ptir::interp::Value;
+pub(crate) fn value_as_u32(value: &pie_eval::interp::Value) -> Vec<u32> {
+    use pie_eval::interp::Value;
     match value {
         Value::U32(v) => v.clone(),
         Value::I32(v) => v.iter().map(|&x| x as u32).collect(),
@@ -912,12 +912,12 @@ fn as_u32(port: Port, bytes: &[u8]) -> Result<Vec<u32>, GeometryError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pie_ptir::container::{
+    use pie_ir::container::{
         ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
     };
-    use pie_ptir::op::Op;
-    use pie_ptir::registry::Stage;
-    use pie_ptir::types::{DType, Shape};
+    use pie_ir::op::Op;
+    use pie_ir::registry::Stage;
+    use pie_ir::types::{DType, Shape};
 
     fn u32_bytes(v: &[u32]) -> Vec<u8> {
         v.iter().flat_map(|w| w.to_le_bytes()).collect()
@@ -1336,7 +1336,7 @@ mod tests {
         let dense = vec![true, true, false, true, false, true, true, false];
         let evaluated = vec![(
             Port::AttnMask,
-            Ok(pie_ptir::interp::Value::Bool(dense.clone())),
+            Ok(pie_eval::interp::Value::Bool(dense.clone())),
         )];
         let lowered = lower_attn_mask_evaluated(&mask_container(), &[0, 1, 2], &evaluated).unwrap();
         let FireAttnMask::Host { masks, mask_indptr } = &lowered else {
@@ -1365,7 +1365,7 @@ mod tests {
         let container = mask_container();
         let host = vec![(
             Port::AttnMask,
-            Ok(pie_ptir::interp::Value::Bool(vec![true; 8])),
+            Ok(pie_eval::interp::Value::Bool(vec![true; 8])),
         )];
         assert!(matches!(
             lower_attn_mask_evaluated(&container, &[0, 1, 2], &host).unwrap(),

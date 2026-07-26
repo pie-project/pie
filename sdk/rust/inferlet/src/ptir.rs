@@ -3,16 +3,16 @@
 //! This is the only home of the overview §3/§5 author surface
 //! (`ForwardPass`/`Pipeline`/`WorkingSet`/`Channel`). It wraps the WIT
 //! resources (`channel`, `forward-pass`, `kv-working-set`, `pipeline`) and
-//! drives the neutral [`Builder`](ptir_dsl::Builder) from the `ptir-dsl`
+//! drives the neutral [`Builder`](pie_dsl::Builder) from the `pie-dsl`
 //! crate: the author writes stage closures + port bindings, the bridge lowers
 //! them to the canonical PTIR container, orders the WIT channel handles by the
 //! builder↔bridge contract
-//! ([`Traced::channel_order`](ptir_dsl::Traced::channel_order)), and calls
+//! ([`Traced::channel_order`](pie_dsl::Traced::channel_order)), and calls
 //! the empty `forward-pass` builder and attaches the traced program (which
 //! binds against the model — the guest does not bind, D6). Program identity,
 //! dedup, and validation happen host-side at program attachment.
 //!
-//! A [`Channel`] owns BOTH sides: the `ptir-dsl` trace declaration (its `take`/
+//! A [`Channel`] owns BOTH sides: the `pie-dsl` trace declaration (its `take`/
 //! `put`/`read` record ops inside a stage closure, and host `put`s record the
 //! host-role endpoint) and the WIT `channel` resource (the host transport). The
 //! two are constructed from the same `(shape, dtype, capacity)` so the decl
@@ -23,10 +23,10 @@ use std::collections::HashMap;
 use std::ops::{Bound, RangeBounds};
 use std::rc::Rc;
 
-use ptir_dsl::builder::Builder;
-use ptir_dsl::channel::PutValue;
-use ptir_dsl::value::{Arg, ConstData};
-use ptir_dsl::{
+use pie_dsl::builder::Builder;
+use pie_dsl::channel::PutValue;
+use pie_dsl::value::{Arg, ConstData};
+use pie_dsl::{
     AsTensor, Channel as DslChannel, DType, IntoConst, IntoPut, IntoShape, Port, Shape, Stage,
     Tensor,
 };
@@ -36,12 +36,12 @@ use crate::pie::inferlet::pipeline as wit_pipeline;
 use crate::pie::inferlet::types::Dtype as WitDtype;
 use crate::working_set::{KvWorkingSet, PageRange, PageSpan};
 
-pub use ptir_dsl::intrinsics;
+pub use pie_dsl::intrinsics;
 
 // Re-export the eDSL vocabulary so an author writes stage closures with a single
 // `use inferlet::ptir::prelude::*;` (mirrors the old `ptir::prelude`).
-pub use ptir_dsl::DType as Dtype;
-pub use ptir_dsl::{
+pub use pie_dsl::DType as Dtype;
+pub use pie_dsl::{
     abs, add, and, broadcast, cast, causal_mask, cummass_le, cumprod, cumsum, div, dtype, entropy,
     entropy_from_logprobs, eq, exp, gather, gather_row, ge, gt, gumbel, gumbel_max, iota, l2norm,
     le, log, log_softmax, lt, mask_apply, masked_argmax, matmul, max_elem, min_elem, mul, ne, neg,
@@ -106,7 +106,7 @@ fn claim_port(port: Port, ch: &Channel) -> DslChannel {
     dsl
 }
 
-/// A GPU-resident bounded queue (overview §1). Owns the `ptir-dsl` trace
+/// A GPU-resident bounded queue (overview §1). Owns the `pie-dsl` trace
 /// declaration and the WIT `channel` resource. In a stage closure `take`/`read`/
 /// `put` record IR ops; on the host `put` stages a value (seed / host-writer
 /// cell) and `Taken::get().await`/`Taken::bytes().await` materialize a committed value.
@@ -333,7 +333,7 @@ impl Channel {
 /// an in-program value (via [`AsTensor`]); on the host [`get`](Self::get) /
 /// [`bytes`](Self::bytes) await the committed value.
 pub struct Taken {
-    dsl: ptir_dsl::Taken,
+    dsl: pie_dsl::Taken,
     wit: Rc<wit::Channel>,
     mode: TakenMode,
     dtype: DType,
@@ -587,6 +587,26 @@ impl RsWorkingSet {
         self.rs.buffer_page_size()
     }
 
+    /// Append `n` reserved buffered page slots; returns the contiguous
+    /// range. Purely logical — a slot is materialized by the first
+    /// [`ForwardPass::buffer_recurrent`] fire that writes it.
+    pub fn alloc_buffer(&self, n: u32) -> Result<crate::working_set::PageRange, String> {
+        self.rs.alloc_buffer(n)
+    }
+
+    /// Drop the buffered slots at `indices` and densely compact. This is the
+    /// REJECT half of fold-commit: a speculative tail that was buffered but
+    /// never folded is abandoned by dropping its slots, and no folded state
+    /// was ever perturbed by it.
+    pub fn free_buffer(&self, indices: &[u32]) -> Result<(), String> {
+        self.rs.free_buffer(indices)
+    }
+
+    /// Reorder the buffered slots by the full bijection `perm`.
+    pub fn reorder_buffer(&self, perm: &[u32]) -> Result<(), String> {
+        self.rs.reorder_buffer(perm)
+    }
+
     /// Copy-on-write child sharing the current folded state and buffered
     /// suffix, ordered on `on`.
     pub fn fork(&self, on: &Pipeline) -> Result<RsWorkingSet, String> {
@@ -835,6 +855,35 @@ impl ForwardPass {
     }
 
     /// Bind readout indexes through a channel, separately from embedding.
+    /// Fold every token of this pass into the recurrent state, in-forward
+    /// and irreversibly. The default; call this only to undo an earlier
+    /// [`ForwardPass::buffer_recurrent`] or [`ForwardPass::fold_buffered`]
+    /// on a reused pass.
+    pub fn fold_recurrent(&self) -> Result<(), String> {
+        self.wit.set_rs_mode(&wit::RsMode::Fold)
+    }
+
+    /// Write this pass's pre-recurrence activations into the bound
+    /// recurrent-state working sets' buffered slots, starting at buffer
+    /// token `start_token`, and leave the folded state UNTOUCHED.
+    ///
+    /// This is what makes a linear model speculatable: tokens that are
+    /// buffered but never folded cost nothing to abandon. `start_token` must
+    /// be a multiple of `rs-buffer-page-size`, and the working set must
+    /// already carry a folded state (run the folding prefill first).
+    pub fn buffer_recurrent(&self, start_token: u32) -> Result<(), String> {
+        self.wit.set_rs_mode(&wit::RsMode::Buffer(start_token))
+    }
+
+    /// Replay `tokens[r]` buffered tokens of request row `r` into that row's
+    /// folded state, dropping the fully covered head slots. Runs only the
+    /// recurrent layers — no logits — so this is the COMMIT half of
+    /// fold-commit speculation.
+    pub fn fold_buffered(&self, tokens: &[u32]) -> Result<(), String> {
+        self.wit
+            .set_rs_mode(&wit::RsMode::FoldBuffered(tokens.to_vec()))
+    }
+
     pub fn readout(&self, indices: &Channel) -> Result<(), String> {
         self.ensure_ports_available(&[Port::Readout])?;
         let indices_wit = indices.wit();
@@ -956,12 +1005,66 @@ pub fn frame_size() -> usize {
 }
 
 /// Max embed tokens in a single pass (C) — the guest-side prefill chunk
-/// budget (cached). Split a prompt of L tokens into `ceil(L / C)` chunks.
+/// budget (cached). Split a prompt of L tokens into `ceil(L / C)` chunks, or
+/// let [`prefill_chunks`] do it, which is what you want.
 pub fn max_embed_length() -> usize {
     thread_local! {
         static MAX_EMBED: std::cell::OnceCell<usize> = const { std::cell::OnceCell::new() };
     }
     MAX_EMBED.with(|c| *c.get_or_init(|| crate::model::max_embed_length().max(1) as usize))
+}
+
+/// The `[start, end)` spans a prompt of `n` tokens must be prefilled in.
+///
+/// The driver's per-launch token capacity ([`max_embed_length`]) is a hard
+/// structural limit, so any prompt longer than it has to be split. This is the
+/// split to use, and the reason it is here rather than in each guest is that
+/// the obvious version is subtly wrong.
+///
+/// Chunking "C tokens at a time until the remainder" puts the entire remainder
+/// on the LAST chunk, which can leave it a single token. That is harmless for a
+/// policy that only writes KV, but it is not harmless for a policy that
+/// OBSERVES the prefill: an attention-score capture records the last `window`
+/// query rows of the fire it is attached to, and a final chunk shorter than
+/// `window` silently truncates the observation to whatever was left over. The
+/// resulting ranking is plausible and wrong, which is the worst combination.
+///
+/// So the remainder is spread over the FIRST chunks instead: with
+/// `k = ceil(n / C)`, chunk `i` gets `n/k + (i < n mod k)` tokens. The chunk
+/// count is identical, every chunk is within one token of every other, and the
+/// final chunk is `floor(n / k)` -- the largest a last chunk can be.
+///
+/// `cap` overrides the driver limit (clamped to it); pass `None` for the
+/// default. A smaller cap is useful in tests, where forcing the multi-chunk
+/// path on a short prompt is the only practical way to check that concatenating
+/// the chunks reproduces the one-shot fire.
+///
+/// Returns an empty vector for `n == 0`.
+pub fn prefill_chunks(n: u32, cap: Option<u32>) -> Vec<(u32, u32)> {
+    let cap = cap
+        .unwrap_or(u32::MAX)
+        .min(max_embed_length().max(1) as u32);
+    even_spans(n, cap)
+}
+
+/// The arithmetic of [`prefill_chunks`], with the driver limit already applied.
+/// Split out so it is testable off-device: `max_embed_length` reaches the host.
+fn even_spans(n: u32, cap: u32) -> Vec<(u32, u32)> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let cap = cap.min(n).max(1);
+    let k = n.div_ceil(cap).max(1);
+    let (q, r) = (n / k, n % k);
+    let mut out = Vec::with_capacity(k as usize);
+    let mut base = 0u32;
+    for i in 0..k {
+        let end = base + q + u32::from(i < r);
+        out.push((base, end));
+        base = end;
+    }
+    debug_assert_eq!(base, n);
+    out
 }
 
 /// Submit ONE FRAME on `on`: up to `frame_size()` ordered slots, slot i
@@ -985,10 +1088,8 @@ pub fn submit_frame(on: &Pipeline, slots: &[Option<&ForwardPass>]) -> Result<(),
         .iter()
         .map(|slot| slot.map(|pass| pass.wit.clone()))
         .collect();
-    let mut borrows: Vec<Option<&wit::ForwardPass>> = wits
-        .iter()
-        .map(|slot| slot.as_deref())
-        .collect();
+    let mut borrows: Vec<Option<&wit::ForwardPass>> =
+        wits.iter().map(|slot| slot.as_deref()).collect();
     borrows.resize(k, None);
     wit::submit(&on.wit, &borrows)
 }
@@ -1048,11 +1149,12 @@ impl Default for Pipeline {
 pub mod prelude {
     pub use super::{
         Channel, DEFAULT_RUNAHEAD_DEPTH, ForwardPass, PageGrant, Pipeline, RsWorkingSet, TOKEN_PAD,
-        WorkingSet, frame_size, max_embed_length, pad_tokens, submit_frame, unpad_tokens,
+        WorkingSet, frame_size, max_embed_length, pad_tokens, prefill_chunks, submit_frame,
+        unpad_tokens,
     };
-    pub use ptir_dsl::dtype;
-    pub use ptir_dsl::intrinsics;
-    pub use ptir_dsl::value::{
+    pub use pie_dsl::dtype;
+    pub use pie_dsl::intrinsics;
+    pub use pie_dsl::value::{
         AsTensor, Tensor, abs, add, and, broadcast, cast, causal_mask, cummass_le, cumprod, cumsum,
         div, entropy, entropy_from_logprobs, eq, exp, gather, gather_row, ge, gt, gumbel,
         gumbel_max, iota, l2norm, le, log, log_softmax, lt, mask_apply, masked_argmax, matmul,
@@ -1061,5 +1163,80 @@ pub mod prelude {
         row_membership, scalar_gather, scatter_add, scatter_set, select, sign, sink_window_mask,
         sliding_window_mask, softmax, sort_desc, sub, top_k, transpose,
     };
-    pub use ptir_dsl::{DType, Stage};
+    pub use pie_dsl::{DType, Stage};
+}
+
+#[cfg(test)]
+mod prefill_chunk_tests {
+    use super::even_spans;
+
+    fn lens(n: u32, cap: u32) -> Vec<u32> {
+        even_spans(n, cap).into_iter().map(|(a, b)| b - a).collect()
+    }
+
+    #[test]
+    fn covers_the_prompt_exactly_and_contiguously() {
+        for n in [1u32, 2, 7, 16, 37, 1302, 8192, 8193, 15032, 16385] {
+            for cap in [1u32, 3, 16, 37, 128, 999, 8192, u32::MAX] {
+                let spans = even_spans(n, cap);
+                assert_eq!(spans[0].0, 0, "n={n} cap={cap}");
+                assert_eq!(spans[spans.len() - 1].1, n, "n={n} cap={cap}");
+                for w in spans.windows(2) {
+                    assert_eq!(w[0].1, w[1].0, "gap/overlap at n={n} cap={cap}");
+                }
+                for &(a, b) in &spans {
+                    assert!(a < b, "empty chunk at n={n} cap={cap}");
+                    assert!(b - a <= cap.max(1), "over cap at n={n} cap={cap}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn uses_the_fewest_chunks_the_cap_allows() {
+        for n in [1u32, 37, 1302, 8192, 8193, 15032, 16385] {
+            for cap in [1u32, 16, 37, 8192] {
+                assert_eq!(
+                    even_spans(n, cap).len() as u32,
+                    n.div_ceil(cap.min(n).max(1)),
+                    "n={n} cap={cap}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_chunk_is_within_one_token_of_every_other() {
+        // The property SnapKV depends on: the last chunk is never a sliver,
+        // because a final chunk shorter than the capture window silently
+        // truncates the observation. Greedy chunking fails this -- n=1302,
+        // cap=37 gives 35 chunks of 37 and a final chunk of 7.
+        for n in [1u32, 7, 37, 1302, 8193, 15032, 16385, 65537] {
+            for cap in [1u32, 3, 16, 37, 128, 999, 8192] {
+                let l = lens(n, cap);
+                let (lo, hi) = (*l.iter().min().unwrap(), *l.iter().max().unwrap());
+                assert!(hi - lo <= 1, "n={n} cap={cap}: lengths span {lo}..={hi}");
+                assert_eq!(
+                    *l.last().unwrap(),
+                    lo,
+                    "n={n} cap={cap}: tail is not the min"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_greedy_sliver_is_the_case_this_exists_for() {
+        assert_eq!(*lens(1302, 37).last().unwrap(), 36);
+        assert_eq!(lens(1302, 37).len(), 36);
+        // Greedy would have been 35 chunks of 37 plus a final chunk of 7.
+        assert_eq!(1302 - 35 * 37, 7);
+    }
+
+    #[test]
+    fn a_prompt_within_the_cap_is_a_single_chunk() {
+        assert_eq!(even_spans(8192, 8192), vec![(0, 8192)]);
+        assert_eq!(even_spans(1, 8192), vec![(0, 1)]);
+        assert_eq!(even_spans(0, 8192), vec![]);
+    }
 }

@@ -24,7 +24,7 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
-use crate::error::CompileError;
+use crate::error::{Error, OrOverflow};
 use crate::types::{
     Axis, CheckpointFormat, DType, Encoding, FileId, QuantScheme, QuantSpec, TensorId,
 };
@@ -48,7 +48,7 @@ enum GgufValueType {
 }
 
 impl GgufValueType {
-    fn from_u32(v: u32) -> Result<Self, CompileError> {
+    fn from_u32(v: u32) -> Result<Self, Error> {
         Ok(match v {
             0 => Self::Uint8,
             1 => Self::Int8,
@@ -64,7 +64,7 @@ impl GgufValueType {
             11 => Self::Int64,
             12 => Self::Float64,
             other => {
-                return Err(CompileError::InvalidInput(format!(
+                return Err(Error::Checkpoint(format!(
                     "gguf: unknown metadata value type {other}"
                 )));
             }
@@ -85,7 +85,7 @@ enum GgmlType {
 }
 
 impl GgmlType {
-    fn from_u32(raw: u32, tensor_name: &str) -> Result<Self, CompileError> {
+    fn from_u32(raw: u32, tensor_name: &str) -> Result<Self, Error> {
         Ok(match raw {
             0 => Self::F32,
             1 => Self::F16,
@@ -95,7 +95,7 @@ impl GgmlType {
             27 => Self::I64,
             30 => Self::Bf16,
             other => {
-                return Err(CompileError::InvalidInput(format!(
+                return Err(Error::Checkpoint(format!(
                     "gguf: tensor '{tensor_name}' uses unsupported GGUF/GGML type id {other}. \
                      Add a GGUF quant dialect adapter before loading this type."
                 )));
@@ -117,7 +117,7 @@ struct GgufTensorType {
     block_bytes: u64,
 }
 
-fn map_tensor_type(ty: GgmlType, tensor_name: &str) -> Result<GgufTensorType, CompileError> {
+fn map_tensor_type(ty: GgmlType, tensor_name: &str) -> Result<GgufTensorType, Error> {
     Ok(match ty {
         GgmlType::F32 => dense(DType::F32, 4),
         GgmlType::F16 => dense(DType::F16, 2),
@@ -128,7 +128,7 @@ fn map_tensor_type(ty: GgmlType, tensor_name: &str) -> Result<GgufTensorType, Co
         // and no driver binds them — so they are rejected here even though the
         // loader dtype set does carry `I64` for safetensors index tables.
         GgmlType::I64 => {
-            return Err(CompileError::InvalidInput(format!(
+            return Err(Error::Checkpoint(format!(
                 "gguf: tensor '{tensor_name}' is I64 (64-bit), unsupported by the loader dtype set"
             )));
         }
@@ -142,9 +142,6 @@ fn map_tensor_type(ty: GgmlType, tensor_name: &str) -> Result<GgufTensorType, Co
                     bits_per_element: 4,
                     group_size: 32,
                     channel_axis: Some(Axis(0)),
-                    scale_dtype: Some(DType::F16),
-                    zero_point_dtype: None,
-                    block_shape: vec![32],
                 }
                 .normalized(),
             ),
@@ -174,14 +171,14 @@ struct GgufReader {
 }
 
 impl GgufReader {
-    fn open(path: &Path) -> Result<Self, CompileError> {
+    fn open(path: &Path) -> Result<Self, Error> {
         let file = File::open(path).map_err(|err| {
-            CompileError::InvalidInput(format!("gguf: cannot open {}: {err}", path.display()))
+            Error::Checkpoint(format!("gguf: cannot open {}: {err}", path.display()))
         })?;
         let len = file
             .metadata()
             .map_err(|err| {
-                CompileError::InvalidInput(format!("gguf: cannot stat {}: {err}", path.display()))
+                Error::Checkpoint(format!("gguf: cannot stat {}: {err}", path.display()))
             })?
             .len();
         Ok(Self {
@@ -191,64 +188,61 @@ impl GgufReader {
         })
     }
 
-    fn require(&self, bytes: u64, context: &str) -> Result<(), CompileError> {
+    fn require(&self, bytes: u64, context: &str) -> Result<(), Error> {
         if bytes > self.len || self.pos > self.len - bytes {
-            return Err(CompileError::InvalidInput(format!(
+            return Err(Error::Checkpoint(format!(
                 "gguf: truncated file while reading {context}"
             )));
         }
         Ok(())
     }
 
-    fn read_exact(&mut self, buf: &mut [u8], context: &str) -> Result<(), CompileError> {
+    fn read_exact(&mut self, buf: &mut [u8], context: &str) -> Result<(), Error> {
         self.require(buf.len() as u64, context)?;
-        self.inner.read_exact(buf).map_err(|err| {
-            CompileError::InvalidInput(format!("gguf: read failed for {context}: {err}"))
-        })?;
+        self.inner
+            .read_exact(buf)
+            .map_err(|err| Error::Checkpoint(format!("gguf: read failed for {context}: {err}")))?;
         self.pos += buf.len() as u64;
         Ok(())
     }
 
-    fn read_u32(&mut self, context: &str) -> Result<u32, CompileError> {
+    fn read_u32(&mut self, context: &str) -> Result<u32, Error> {
         let mut b = [0u8; 4];
         self.read_exact(&mut b, context)?;
         Ok(u32::from_le_bytes(b))
     }
 
-    fn read_u64(&mut self, context: &str) -> Result<u64, CompileError> {
+    fn read_u64(&mut self, context: &str) -> Result<u64, Error> {
         let mut b = [0u8; 8];
         self.read_exact(&mut b, context)?;
         Ok(u64::from_le_bytes(b))
     }
 
-    fn read_string(&mut self, context: &str) -> Result<String, CompileError> {
+    fn read_string(&mut self, context: &str) -> Result<String, Error> {
         let len = self.read_u64(context)?;
-        let len = usize::try_from(len).map_err(|_| {
-            CompileError::InvalidInput(format!("gguf: string too large while reading {context}"))
-        })?;
+        let len = usize::try_from(len)
+            .or_overflow(format!("gguf: string too large while reading {context}"))?;
         self.require(len as u64, context)?;
         let mut buf = vec![0u8; len];
-        self.inner.read_exact(&mut buf).map_err(|err| {
-            CompileError::InvalidInput(format!("gguf: read failed for {context}: {err}"))
-        })?;
+        self.inner
+            .read_exact(&mut buf)
+            .map_err(|err| Error::Checkpoint(format!("gguf: read failed for {context}: {err}")))?;
         self.pos += len as u64;
         String::from_utf8(buf)
-            .map_err(|_| CompileError::InvalidInput(format!("gguf: {context} is not valid UTF-8")))
+            .map_err(|_| Error::Checkpoint(format!("gguf: {context} is not valid UTF-8")))
     }
 
-    fn skip(&mut self, bytes: u64, context: &str) -> Result<(), CompileError> {
+    fn skip(&mut self, bytes: u64, context: &str) -> Result<(), Error> {
         self.require(bytes, context)?;
         self.inner
             .seek(SeekFrom::Current(bytes as i64))
-            .map_err(|err| {
-                CompileError::InvalidInput(format!("gguf: seek failed for {context}: {err}"))
-            })?;
+            .map_err(|err| Error::Checkpoint(format!("gguf: seek failed for {context}: {err}")))?;
         self.pos += bytes;
         Ok(())
     }
 }
 
-fn skip_value(r: &mut GgufReader, ty: GgufValueType) -> Result<(), CompileError> {
+fn skip_value(r: &mut GgufReader, ty: GgufValueType) -> Result<(), Error> {
     match ty {
         GgufValueType::Uint8 | GgufValueType::Int8 | GgufValueType::Bool => {
             r.skip(1, "metadata scalar")
@@ -265,7 +259,7 @@ fn skip_value(r: &mut GgufReader, ty: GgufValueType) -> Result<(), CompileError>
     }
 }
 
-fn skip_array(r: &mut GgufReader) -> Result<(), CompileError> {
+fn skip_array(r: &mut GgufReader) -> Result<(), Error> {
     let item_type = GgufValueType::from_u32(r.read_u32("metadata array type")?)?;
     let count = r.read_u64("metadata array length")?;
     for _ in 0..count {
@@ -274,19 +268,19 @@ fn skip_array(r: &mut GgufReader) -> Result<(), CompileError> {
     Ok(())
 }
 
-fn read_alignment(r: &mut GgufReader, ty: GgufValueType) -> Result<u64, CompileError> {
+fn read_alignment(r: &mut GgufReader, ty: GgufValueType) -> Result<u64, Error> {
     match ty {
         GgufValueType::Uint32 => Ok(u64::from(r.read_u32("general.alignment")?)),
         GgufValueType::Uint64 => r.read_u64("general.alignment"),
-        _ => Err(CompileError::InvalidInput(
+        _ => Err(Error::Checkpoint(
             "gguf: general.alignment must be uint32 or uint64".to_string(),
         )),
     }
 }
 
-fn align_up(value: u64, alignment: u64) -> Result<u64, CompileError> {
+fn align_up(value: u64, alignment: u64) -> Result<u64, Error> {
     if alignment == 0 {
-        return Err(CompileError::InvalidInput(
+        return Err(Error::Checkpoint(
             "gguf: alignment must be non-zero".to_string(),
         ));
     }
@@ -298,19 +292,17 @@ fn align_up(value: u64, alignment: u64) -> Result<u64, CompileError> {
     })
 }
 
-fn checked_mul(a: u64, b: u64, tensor_name: &str) -> Result<u64, CompileError> {
-    a.checked_mul(b).ok_or_else(|| {
-        CompileError::InvalidInput(format!(
-            "gguf: tensor byte size overflows for '{tensor_name}'"
-        ))
-    })
+fn checked_mul(a: u64, b: u64, tensor_name: &str) -> Result<u64, Error> {
+    a.checked_mul(b).or_overflow(format!(
+        "gguf: tensor byte size overflows for '{tensor_name}'"
+    ))
 }
 
-fn numel_for_shape(shape: &[i64], tensor_name: &str) -> Result<u64, CompileError> {
+fn numel_for_shape(shape: &[i64], tensor_name: &str) -> Result<u64, Error> {
     let mut out: u64 = 1;
     for &dim in shape {
         if dim < 0 {
-            return Err(CompileError::InvalidInput(format!(
+            return Err(Error::Checkpoint(format!(
                 "gguf: negative dimension for '{tensor_name}'"
             )));
         }
@@ -333,20 +325,20 @@ struct PendingTensor {
 
 /// Parse a single GGUF checkpoint file's header into a [`CheckpointMetadata`].
 /// Only the header region is read; tensor payloads are never mapped.
-pub fn parse_gguf_checkpoint(path: &Path) -> Result<CheckpointMetadata, CompileError> {
+pub fn parse_gguf_checkpoint(path: &Path) -> Result<CheckpointMetadata, Error> {
     let mut r = GgufReader::open(path)?;
 
     let mut magic = [0u8; 4];
     r.read_exact(&mut magic, "magic")?;
     if &magic != b"GGUF" {
-        return Err(CompileError::InvalidInput(format!(
+        return Err(Error::Checkpoint(format!(
             "gguf: {} is not a GGUF file",
             path.display()
         )));
     }
     let version = r.read_u32("version")?;
     if version != 2 && version != 3 {
-        return Err(CompileError::InvalidInput(format!(
+        return Err(Error::Checkpoint(format!(
             "gguf: unsupported GGUF version {version}"
         )));
     }
@@ -365,15 +357,16 @@ pub fn parse_gguf_checkpoint(path: &Path) -> Result<CheckpointMetadata, CompileE
         }
     }
 
-    let mut pending: Vec<PendingTensor> = Vec::with_capacity(
-        usize::try_from(tensor_count)
-            .map_err(|_| CompileError::InvalidInput("gguf: tensor count too large".to_string()))?,
-    );
+    // No `with_capacity`: `tensor_count` is a number the file claims, read
+    // before any of the tensors it describes. Reserving on it lets a twelve-byte
+    // header ask for an allocation the process cannot refuse politely. The loop
+    // is bounded by the bytes actually present.
+    let mut pending: Vec<PendingTensor> = Vec::new();
     for _ in 0..tensor_count {
         let name = r.read_string("tensor name")?;
         let dim_count = r.read_u32("tensor dimension count")?;
         if dim_count > 16 {
-            return Err(CompileError::InvalidInput(format!(
+            return Err(Error::Checkpoint(format!(
                 "gguf: tensor '{name}' has unreasonable rank {dim_count}"
             )));
         }
@@ -381,7 +374,7 @@ pub fn parse_gguf_checkpoint(path: &Path) -> Result<CheckpointMetadata, CompileE
         for _ in 0..dim_count {
             let dim = r.read_u64("tensor dimension")?;
             if dim > i64::MAX as u64 {
-                return Err(CompileError::InvalidInput(format!(
+                return Err(Error::Overflow(format!(
                     "gguf: dimension too large for '{name}'"
                 )));
             }
@@ -394,7 +387,7 @@ pub fn parse_gguf_checkpoint(path: &Path) -> Result<CheckpointMetadata, CompileE
         let logical_elements = numel_for_shape(&shape, &name)?;
         let nbytes = if ty.block_elements != 0 {
             if logical_elements % ty.block_elements != 0 {
-                return Err(CompileError::InvalidInput(format!(
+                return Err(Error::Checkpoint(format!(
                     "gguf: quantized tensor '{name}' element count {logical_elements} is not \
                      divisible by block size {}",
                     ty.block_elements
@@ -416,7 +409,7 @@ pub fn parse_gguf_checkpoint(path: &Path) -> Result<CheckpointMetadata, CompileE
 
     let data_base = align_up(r.pos, alignment)?;
     if data_base > r.len {
-        return Err(CompileError::InvalidInput(
+        return Err(Error::Checkpoint(
             "gguf: tensor data section is missing".to_string(),
         ));
     }
@@ -426,11 +419,11 @@ pub fn parse_gguf_checkpoint(path: &Path) -> Result<CheckpointMetadata, CompileE
 
     let mut tensors = Vec::with_capacity(pending.len());
     for (index, t) in pending.into_iter().enumerate() {
-        let absolute_offset = data_base.checked_add(t.relative_offset).ok_or_else(|| {
-            CompileError::InvalidInput(format!("gguf: tensor '{}' offset overflows", t.name))
-        })?;
+        let absolute_offset = data_base
+            .checked_add(t.relative_offset)
+            .or_overflow(format!("gguf: tensor '{}' offset overflows", t.name))?;
         if absolute_offset > r.len || t.nbytes > r.len - absolute_offset {
-            return Err(CompileError::InvalidInput(format!(
+            return Err(Error::Checkpoint(format!(
                 "gguf: tensor '{}' points outside the file",
                 t.name
             )));
@@ -460,9 +453,9 @@ pub fn parse_gguf_checkpoint(path: &Path) -> Result<CheckpointMetadata, CompileE
 /// Decode one GGUF `Q4_0` block (18 bytes → 32 f32 values), ported from the C++
 /// `decode_gguf_q4_0_block`. Kept for parity testing of the block geometry; the
 /// runtime materialization is the driver's job.
-pub fn decode_gguf_q4_0_block(block: &[u8]) -> Result<Vec<f32>, CompileError> {
+pub fn decode_gguf_q4_0_block(block: &[u8]) -> Result<Vec<f32>, Error> {
     if block.len() != 18 {
-        return Err(CompileError::InvalidInput(
+        return Err(Error::Checkpoint(
             "gguf: Q4_0 block decode expects exactly 18 bytes".to_string(),
         ));
     }

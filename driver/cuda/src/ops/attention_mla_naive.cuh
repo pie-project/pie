@@ -317,6 +317,12 @@ namespace mma_detail {
 #ifndef PIE_MLA_MMA_STAGES
 #define PIE_MLA_MMA_STAGES 1
 #endif
+// Occupancy hint. Shared memory (see `smem_bytes()`) already caps residency,
+// so asking for more blocks than that only tightens the register budget and
+// buys spills.
+#ifndef PIE_MLA_MMA_MINBLK
+#define PIE_MLA_MMA_MINBLK 2
+#endif
 
 constexpr int kBM = 16;                    // query rows per block == heads
 constexpr int kBK = PIE_MLA_MMA_BK;        // keys per tile
@@ -414,7 +420,7 @@ __device__ __forceinline__ void ld_b_v(std::uint32_t (&b)[2], const __nv_bfloat1
         : "r"(addr));
 }
 
-__global__ __launch_bounds__(kThreads, 3) void mla_mma_paged_kernel(
+__global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_kernel(
     const __nv_bfloat16* __restrict__ q_nope,
     const __nv_bfloat16* __restrict__ q_pe,
     const __nv_bfloat16* __restrict__ ckv_pages,
@@ -439,8 +445,13 @@ __global__ __launch_bounds__(kThreads, 3) void mla_mma_paged_kernel(
     const int tid = threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
-    const int t = blockIdx.x;
-    const int h0 = blockIdx.y * kBM;
+    // Head groups of the same token are adjacent in the grid so the blocks
+    // that share a KV sequence are co-resident: the sequence is then fetched
+    // from HBM once and the other groups hit in L2. With the token on x the
+    // co-resident blocks are all *different* requests, and at any real batch
+    // the union of their KV overflows L2.
+    const int t = blockIdx.y;
+    const int h0 = blockIdx.x * kBM;
 
     __shared__ int s_req;
     if (tid == 0) s_req = 0;
@@ -714,7 +725,7 @@ inline void launch_mla_mma_paged_raw(
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             static_cast<int>(smem)));
     });
-    dim3 grid(total_tokens, num_heads / kBM);
+    dim3 grid(num_heads / kBM, total_tokens);
     mla_mma_paged_kernel<<<grid, kThreads, smem, stream>>>(
         static_cast<const __nv_bfloat16*>(q_nope),
         static_cast<const __nv_bfloat16*>(q_pe),

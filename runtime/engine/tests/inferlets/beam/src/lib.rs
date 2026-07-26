@@ -1,6 +1,6 @@
 //! **Overview §6.2 beam search — the M3-G2 workload** (freeze / designated-child /
 //! compact). SDK-authored via the `inferlet::ptir` bridge: the beam trace is a
-//! faithful transcription of `sdk/rust/ptir-dsl/tests/p1_overview.rs::
+//! faithful transcription of `sdk/rust/pie-dsl/tests/p1_overview.rs::
 //! s6_2_beam_epilogue_binds` (the validated reference), authored via the overview
 //! surface (`ForwardPass`/`Channel`/`epilogue`), lowered to echo's canonical
 //! container inside `forward-pass.new`, then run submit→take over a `Pipeline`.

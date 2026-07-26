@@ -1,6 +1,8 @@
+
 #include "kernels/moe_dispatch.hpp"
 
 #include <cstdint>
+#include <cstdio>
 #include <cuda_bf16.h>
 #include <mma.h>
 
@@ -196,7 +198,73 @@ __global__ void token_batched_weighted_sum_add_bf16_kernel(
     out[out_idx] = __float2bfloat16(__bfloat162float(out[out_idx]) + acc);
 }
 
+// uint4 (8 bf16) per thread: these two stream `top_k * hidden` bf16 per
+// token, and one element per thread makes every warp issue a 64-byte
+// access -- half a cache line.
+__global__ void token_batched_weighted_sum_bf16_vec_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ src,
+    const float* __restrict__ weights,
+    int top_k, int hidden_vec)
+{
+    const int n = blockIdx.y;
+    const int hv = blockIdx.x * blockDim.x + threadIdx.x;
+    if (hv >= hidden_vec) return;
+    const long long base = static_cast<long long>(n) * top_k;
+    float acc[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) acc[j] = 0.f;
+    const uint4* sv = reinterpret_cast<const uint4*>(src);
+    for (int k = 0; k < top_k; ++k) {
+        const long long r = base + k;
+        const uint4 v = sv[r * hidden_vec + hv];
+        const auto* vh = reinterpret_cast<const __nv_bfloat16*>(&v);
+        const float w = weights[r];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) acc[j] += w * __bfloat162float(vh[j]);
+    }
+    uint4 o;
+    auto* oh = reinterpret_cast<__nv_bfloat16*>(&o);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) oh[j] = __float2bfloat16(acc[j]);
+    reinterpret_cast<uint4*>(out)[
+        static_cast<long long>(n) * hidden_vec + hv] = o;
+}
+
+__global__ void token_batched_weighted_sum_add_bf16_vec_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ src,
+    const float* __restrict__ weights,
+    int top_k, int hidden_vec)
+{
+    const int n = blockIdx.y;
+    const int hv = blockIdx.x * blockDim.x + threadIdx.x;
+    if (hv >= hidden_vec) return;
+    const long long base = static_cast<long long>(n) * top_k;
+    float acc[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) acc[j] = 0.f;
+    const uint4* sv = reinterpret_cast<const uint4*>(src);
+    for (int k = 0; k < top_k; ++k) {
+        const long long r = base + k;
+        const uint4 v = sv[r * hidden_vec + hv];
+        const auto* vh = reinterpret_cast<const __nv_bfloat16*>(&v);
+        const float w = weights[r];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) acc[j] += w * __bfloat162float(vh[j]);
+    }
+    const long long oi = static_cast<long long>(n) * hidden_vec + hv;
+    uint4 o = reinterpret_cast<uint4*>(out)[oi];
+    auto* oh = reinterpret_cast<__nv_bfloat16*>(&o);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        oh[j] = __float2bfloat16(__bfloat162float(oh[j]) + acc[j]);
+    }
+    reinterpret_cast<uint4*>(out)[oi] = o;
+}
+
 }  // namespace
+
 
 void launch_token_batched_weighted_sum_bf16(
     void* out, const void* src, const float* weights,
@@ -204,11 +272,22 @@ void launch_token_batched_weighted_sum_bf16(
 {
     if (num_tokens <= 0 || top_k <= 0 || hidden <= 0) return;
     constexpr int BS = 256;
+    const auto* srcp = static_cast<const __nv_bfloat16*>(src);
+    auto* dstp = static_cast<__nv_bfloat16*>(out);
+    const bool vectorizable =
+        (hidden % 8) == 0 &&
+        (reinterpret_cast<std::uintptr_t>(srcp) % 16) == 0 &&
+        (reinterpret_cast<std::uintptr_t>(dstp) % 16) == 0;
+    if (vectorizable) {
+        const int hidden_vec = hidden / 8;
+        const dim3 grid_v((hidden_vec + BS - 1) / BS, num_tokens);
+        token_batched_weighted_sum_bf16_vec_kernel<<<grid_v, BS, 0, stream>>>(
+            dstp, srcp, weights, top_k, hidden_vec);
+        return;
+    }
     const dim3 grid((hidden + BS - 1) / BS, num_tokens);
     token_batched_weighted_sum_bf16_kernel<<<grid, BS, 0, stream>>>(
-        static_cast<__nv_bfloat16*>(out),
-        static_cast<const __nv_bfloat16*>(src),
-        weights, top_k, hidden);
+        dstp, srcp, weights, top_k, hidden);
 }
 
 void launch_token_batched_weighted_sum_add_bf16(
@@ -217,11 +296,22 @@ void launch_token_batched_weighted_sum_add_bf16(
 {
     if (num_tokens <= 0 || top_k <= 0 || hidden <= 0) return;
     constexpr int BS = 256;
+    const auto* srcp = static_cast<const __nv_bfloat16*>(src);
+    auto* dstp = static_cast<__nv_bfloat16*>(out);
+    const bool vectorizable =
+        (hidden % 8) == 0 &&
+        (reinterpret_cast<std::uintptr_t>(srcp) % 16) == 0 &&
+        (reinterpret_cast<std::uintptr_t>(dstp) % 16) == 0;
+    if (vectorizable) {
+        const int hidden_vec = hidden / 8;
+        const dim3 grid_v((hidden_vec + BS - 1) / BS, num_tokens);
+        token_batched_weighted_sum_add_bf16_vec_kernel<<<grid_v, BS, 0, stream>>>(
+            dstp, srcp, weights, top_k, hidden_vec);
+        return;
+    }
     const dim3 grid((hidden + BS - 1) / BS, num_tokens);
     token_batched_weighted_sum_add_bf16_kernel<<<grid, BS, 0, stream>>>(
-        static_cast<__nv_bfloat16*>(out),
-        static_cast<const __nv_bfloat16*>(src),
-        weights, top_k, hidden);
+        dstp, srcp, weights, top_k, hidden);
 }
 
 namespace {
@@ -731,7 +821,16 @@ __global__ void moe_align_decode_kernel(
             }
             __syncthreads();
         }
-        if (threadIdx.x == 0) offsets[num_experts] = *block_base;
+        if (threadIdx.x == 0) {
+            offsets[num_experts] = *block_base;
+#if defined(PIE_MOE_ALIGN_REPORT)
+            // How many blocks the routing actually needs, against the
+            // worst-case `max_blocks` the batched GEMM always launches.
+            printf("[moe-align] used=%d max=%d routes=%d experts=%d\n",
+                   *block_base / block_size, max_blocks, num_routes,
+                   num_experts);
+#endif
+        }
     }
     __syncthreads();
     for (int e = threadIdx.x; e < num_experts; e += blockDim.x) {

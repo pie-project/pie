@@ -20,8 +20,8 @@
 #include <type_traits>
 #include <vector>
 
-#include "pie_native/ptir/op_table.hpp"
-#include "pie_native/ptir/rng_contract.generated.h"
+#include "pie_native/launch/op_table.hpp"
+#include <rng_contract.generated.h>
 #include "pipeline/tier0/tier0_kernels.cuh"  // for the BinKind/UnKind/... enums (host-safe)
 
 namespace pie_cuda_driver::pipeline::host_eval {
@@ -312,7 +312,7 @@ inline void sort_desc(const std::vector<float>& in, std::uint32_t rows, std::uin
     }
 }
 
-// ── pivot_threshold's three DYNAMIC predicates (interface/ptir interp.rs
+// ── pivot_threshold's three DYNAMIC predicates (compiler/eval/src/interp.rs
 // Op::PivotThreshold) — the payload is ALWAYS a scalar/per-row trace value,
 // never an immediate. `*_numel == 1` broadcasts index 0 to every row (mirrors
 // interp.rs `pick(len, r)`), else one value per row. These mirror interp.rs's

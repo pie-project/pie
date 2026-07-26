@@ -1,0 +1,4 @@
+[package]
+name = "generate-gdn-frame"
+version = "0.1.0"
+description = "Test inferlet: greedy decode on a GDN/hybrid model submitted as FULL k-slot frames — every slot binds the same recurrent-state working set"

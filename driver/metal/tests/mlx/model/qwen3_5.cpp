@@ -126,7 +126,7 @@ Tensor Qwen3_5Graph::full_attn_layer(std::int32_t il, Tensor hidden,
     const std::int32_t d    = cfg_.head_dim;
 
     Tensor residual = hidden;
-    Tensor cur = ops::rms_norm(hidden, *L.attn_norm, eps, /*plus_one=*/true);
+    Tensor cur = ops::rms_norm(hidden, *L.attn_norm, eps, /*plus_one=*/false);
     dump_kernel(il, "attn_norm", cur);
 
     // q_proj is 2x wide: per head the layout is [query(d) | gate(d)].
@@ -143,9 +143,10 @@ Tensor Qwen3_5Graph::full_attn_layer(std::int32_t il, Tensor hidden,
     dump_kernel(il, "k_proj", K);
     dump_kernel(il, "v_proj", V);
 
-    // Gemma-style (1+w) per-head Q/K RMSNorm, then partial RoPE.
-    Q = ops::rms_norm(Q, *L.q_norm, eps, /*plus_one=*/true);
-    K = ops::rms_norm(K, *L.k_norm, eps, /*plus_one=*/true);
+    // Plain per-head Q/K RMSNorm (raw weight, NOT Gemma (1+w) — qwen3.5 stores
+    // absolute norm weights, as mlx_lm.models.qwen3_next does), then partial RoPE.
+    Q = ops::rms_norm(Q, *L.q_norm, eps, /*plus_one=*/false);
+    K = ops::rms_norm(K, *L.k_norm, eps, /*plus_one=*/false);
     dump_kernel(il, "q_norm", Q);
     dump_kernel(il, "k_norm", K);
 
@@ -207,7 +208,7 @@ Tensor Qwen3_5Graph::linear_attn_layer(std::int32_t il, std::int32_t lin_ordinal
     }
 
     Tensor residual = hidden;
-    Tensor cur = ops::rms_norm(hidden, *L.attn_norm, eps, /*plus_one=*/true);
+    Tensor cur = ops::rms_norm(hidden, *L.attn_norm, eps, /*plus_one=*/false);
     dump_kernel(il, "attn_norm", cur);
 
     Tensor mixed_qkv = apply_linear(*L.la_in_proj_qkv, cur);  // [N, conv_dim] = [q|k|v]
@@ -258,7 +259,7 @@ Tensor Qwen3_5Graph::mlp_block(std::int32_t il, Tensor hidden) {
     const float eps = cfg_.rms_norm_eps;
 
     Tensor residual = hidden;
-    Tensor normed = ops::rms_norm(hidden, *L.ffn_norm, eps, /*plus_one=*/true);
+    Tensor normed = ops::rms_norm(hidden, *L.ffn_norm, eps, /*plus_one=*/false);
     dump_kernel(il, "ffn_norm", normed);
     Tensor gate = apply_linear(*L.gate_proj, normed);
     Tensor up   = apply_linear(*L.up_proj,   normed);
@@ -294,7 +295,7 @@ Tensor Qwen3_5Graph::forward(const ForwardBatch& batch, KvCacheView& kv) {
         maybe_dump_hidden(il + 1, hidden);  // HF output_hidden_states[il+1]
     }
 
-    hidden = ops::rms_norm(hidden, w_.final_norm, eps, /*plus_one=*/true);
+    hidden = ops::rms_norm(hidden, w_.final_norm, eps, /*plus_one=*/false);
     dump_kernel(-1, "final_norm", hidden);
     maybe_dump_hidden(-1, hidden);  // post-final-norm (pre-LM-head)
     Tensor sampled = ops::gather_rows(hidden, batch.logit_rows);

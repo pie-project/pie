@@ -1099,8 +1099,9 @@ async fn surrogate(
         driver_id,
         pie_driver_abi::ProgramRegistration {
             program_hash: program.hash,
-            canonical_bytes: program.bytes.clone(),
-            sidecar_bytes: program.sidecar.clone(),
+            launch: program.launch().clone(),
+            reference_ptir: program.bytes.clone(),
+            ..Default::default()
         },
     )
     .await?;
@@ -1132,15 +1133,9 @@ async fn surrogate(
         channel_ids.push(channel_id);
         channels.push(endpoint);
     }
-    let bound = crate::scheduler::bind_instance(
-        driver_id,
-        None,
-        program_id,
-        0,
-        channel_ids,
-        Vec::new(),
-    )
-    .await?;
+    let bound =
+        crate::scheduler::bind_instance(driver_id, None, program_id, 0, channel_ids, Vec::new())
+            .await?;
     let surrogate = Arc::new(Surrogate {
         bound,
         _channels: channels,
@@ -1166,10 +1161,10 @@ async fn surrogate(
 }
 
 fn context_extension_program(
-    profile: &pie_ptir::registry::ModelProfile,
+    profile: &pie_ir::registry::ModelProfile,
 ) -> Result<Arc<RegisteredProgram>> {
-    use pie_ptir::container::{StageProgram, TraceContainer};
-    use pie_ptir::registry::Stage;
+    use pie_ir::container::{StageProgram, TraceContainer};
+    use pie_ir::registry::Stage;
 
     static PROGRAM: std::sync::OnceLock<Arc<RegisteredProgram>> = std::sync::OnceLock::new();
     if let Some(program) = PROGRAM.get() {
@@ -1281,10 +1276,12 @@ async fn try_prefill_owned(
         COUNTERS.user_mask.fetch_add(1, Ordering::Relaxed);
         return None;
     }
-    let mutates_context =
-        program.bound.container.stages.iter().any(|stage| {
-            stage.stage != pie_ptir::registry::Stage::Epilogue && !stage.ops.is_empty()
-        });
+    let mutates_context = program
+        .bound
+        .container
+        .stages
+        .iter()
+        .any(|stage| stage.stage != pie_ir::registry::Stage::Epilogue && !stage.ops.is_empty());
     if mutates_context {
         COUNTERS.channels.fetch_add(1, Ordering::Relaxed);
         return None;
@@ -1338,8 +1335,7 @@ async fn try_prefill_owned(
             return None;
         }
     };
-    let surrogate =
-        match surrogate(partner.driver_id(), &remote_program, home_instance_id).await {
+    let surrogate = match surrogate(partner.driver_id(), &remote_program, home_instance_id).await {
         Ok(bound) => bound,
         Err(error) => {
             partner.mark_suspect();
@@ -1357,15 +1353,15 @@ async fn try_prefill_owned(
     let prefix_tokens = &canonical_tokens[..offload_rows];
     let prepared =
         crate::store::registry::with_kv_lock(&remote_stores.kv, "host-other", |remote| {
-        crate::pipeline::fire::kv::prepare(
-            remote,
-            scratch_ws,
-            0,
-            prefix_tokens,
-            page_size,
-            Some(prefix_tokens),
-        )
-    });
+            crate::pipeline::fire::kv::prepare(
+                remote,
+                scratch_ws,
+                0,
+                prefix_tokens,
+                page_size,
+                Some(prefix_tokens),
+            )
+        });
     let (projection, copies, translation, txn) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -1472,10 +1468,9 @@ async fn try_prefill_owned(
         tracing::debug!(%error, "prefill offload transfer failed");
         return None;
     }
-    let adopted =
-        crate::store::registry::with_kv_lock(&home_stores.kv, "host-other", |home| {
-            home.adopt_offloaded_prefix(home_ws, prefix_tokens, destination_pages, page_size)
-        });
+    let adopted = crate::store::registry::with_kv_lock(&home_stores.kv, "host-other", |home| {
+        home.adopt_offloaded_prefix(home_ws, prefix_tokens, destination_pages, page_size)
+    });
     release_scratch(model_idx, partner.driver_id(), scratch_ws);
     if let Err(error) = adopted {
         COUNTERS.transfer_failure.fetch_add(1, Ordering::Relaxed);
@@ -1518,8 +1513,8 @@ mod tests {
         KvLayoutKind, KvRegion, PIE_TERMINAL_OUTCOME_SUCCESS, RemoteBindResponse,
         RemoteChannelBinding, RemoteError, RemoteTerminal, ScratchGrant, TerminalCellState,
     };
-    use pie_ptir::container::{StageProgram, TraceContainer};
-    use pie_ptir::registry::{ModelProfile, Stage};
+    use pie_ir::container::{StageProgram, TraceContainer};
+    use pie_ir::registry::{ModelProfile, Stage};
     use std::sync::Mutex;
     use std::sync::atomic::AtomicU64;
     use tarpc::server::{BaseChannel, Channel};
@@ -1757,6 +1752,7 @@ mod tests {
             supports_media_encode: false,
             snapshot_dir: String::new(),
             kv_handle: None,
+            codegen_backend: String::new(),
         }
     }
 

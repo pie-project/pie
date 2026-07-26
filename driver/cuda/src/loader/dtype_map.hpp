@@ -31,6 +31,7 @@ inline DType dtype_from_rust(pie_loader::PieLoaderDType dtype)
     case pie_loader::PieLoaderDType::BF16: return DType::BF16;
     case pie_loader::PieLoaderDType::F8E4M3: return DType::FP8_E4M3;
     case pie_loader::PieLoaderDType::F8E5M2: return DType::FP8_E5M2;
+    case pie_loader::PieLoaderDType::E8M0: return DType::E8M0;
     case pie_loader::PieLoaderDType::I32: return DType::INT32;
     // 8-byte integer index tables (DeepSeek-V4 `tid2eid`). The driver has no
     // unsigned 64-bit tag; INT64 is the same width and the kernels reinterpret

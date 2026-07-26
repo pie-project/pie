@@ -1,22 +1,22 @@
-// PTIR cross-backend golden step-exec gate. The headline
-// conformance test: decode the ACTUAL golden container bytes + PTIB typed
-// sidecar (bound.hpp), translate to an executable Trace, run it through the
-// tier-0 stage-runner with canonical inputs/seeds, and match the expected
-// step/take results (committed flags + taken token values) byte-for-byte.
+// PTIR cross-backend golden step-exec gate. The headline conformance test:
+// adopt the launch package the host compiled from the golden trace, run it
+// through the tier-0 stage-runner with canonical inputs/seeds, and match the
+// expected step/take results (committed flags + taken token values)
+// byte-for-byte.
 //
-// Inputs + seeds are transcribed from the generator (interface/sampling-ir/
-// tests/ptir_golden.rs); the container/sidecar hex + expected hash come straight
-// from the vendored golden files, so this pins the same cross-language vectors.
+// Inputs + seeds are transcribed from the generator (compiler/tests/
+// tests/ptir_golden.rs). The packages come from the same corpus, written by
+// `cargo test -p pie-compiler-tests --test cuda_golden
+// emit_driver_test_kernel_fixtures`, so this pins the same cross-language
+// vectors -- one compile further down the pipeline than it used to.
 //
-//   nvcc -std=c++17 -arch=sm_89 --extended-lambda --expt-relaxed-constexpr \
-//        -Isrc tests/ptir_golden_exec_test.cu -o ptir_golden_exec_test
-//   ./ptir_golden_exec_test tests/golden-ptir
+//   ./ptir_golden_exec_test ../fixtures
 
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cmath>
-#include <fstream>
+#include <map>
 #include <limits>
 #include <sstream>
 #include <string>
@@ -24,7 +24,7 @@
 
 #include <cuda_runtime.h>
 
-#include "pie_native/ptir/bound.hpp"
+#include "pie_native/launch/image.hpp"
 #include "pipeline/program_runtime.hpp"
 #include "pipeline/grouped_runtime.cuh"
 #include "pipeline/tier0/tier0_runner.hpp"
@@ -38,45 +38,38 @@ void expect(bool ok, const std::string& what) {
     else    { ++g_fail; std::printf("  FAIL  %s\n", what.c_str()); }
 }
 
-std::vector<std::uint8_t> hex_to_bytes(const std::string& h) {
-    std::vector<std::uint8_t> b;
-    for (std::size_t i = 0; i + 1 < h.size(); i += 2)
-        b.push_back((std::uint8_t)std::stoul(h.substr(i, 2), nullptr, 16));
-    return b;
-}
-std::string trim(const std::string& s) {
-    std::size_t a = s.find_first_not_of(" \t\r\n");
-    if (a == std::string::npos) return "";
-    return s.substr(a, s.find_last_not_of(" \t\r\n") - a + 1);
-}
-// pull "container:" and "sidecar:" hex + "hash:" from a golden file.
-bool load_golden(const std::string& path, std::string& container_hex, std::string& sidecar_hex,
-                 std::uint64_t& hash) {
-    std::ifstream f(path); std::string line; bool got_c = false;
-    while (std::getline(f, line)) {
-        auto c = line.find(':'); if (c == std::string::npos) continue;
-        std::string k = trim(line.substr(0, c)), v = trim(line.substr(c + 1));
-        if (k == "container") { container_hex = v; got_c = true; }
-        else if (k == "sidecar") sidecar_hex = v;
-        else if (k == "hash") hash = std::stoull(v, nullptr, 16);
+// A registry key, nothing more: the driver no longer sees bytes to hash.
+std::uint64_t program_key(const std::string& name) {
+    std::uint64_t hash = 0xcbf29ce484222325ULL;
+    for (const char byte : name) {
+        hash = (hash ^ static_cast<std::uint8_t>(byte)) * 0x100000001b3ULL;
     }
-    return got_c;
+    return hash;
 }
 
-// Decode + translate a golden into an executable Trace, asserting the identity
-// chain (container hash == sidecar's inner hash == file's hash: line).
+// The launch packages are cached by name: `Trace` borrows nothing from the
+// image, but `PtirProgramCache::adopt` takes a reference, and several tests
+// register the same program twice.
+const PieLaunchPackage* load_package(
+    const std::string& dir, const std::string& name) {
+    static std::map<std::string, pie_native::launch::PackageImage> cache;
+    auto found = cache.find(name);
+    if (found == cache.end()) {
+        pie_native::launch::PackageImage image;
+        std::string error;
+        if (!image.load(dir + "/" + name + ".launch", &error)) {
+            expect(false, name + ": load launch package (" + error + ")");
+            return nullptr;
+        }
+        found = cache.emplace(name, std::move(image)).first;
+    }
+    return &found->second.package();
+}
+
 bool build_trace(const std::string& dir, const std::string& name, Trace& out) {
-    std::string chex, shex; std::uint64_t fhash = 0;
-    if (!load_golden(dir + "/" + name + ".txt", chex, shex, fhash)) { expect(false, name + ": load"); return false; }
-    auto cb = hex_to_bytes(chex), sb = hex_to_bytes(shex);
-    container::Container c; container::DecodeError e;
-    if (!container::decode(cb.data(), cb.size(), c, &e)) { expect(false, name + ": decode " + e.detail); return false; }
-    bound::Bound b; std::string se;
-    if (!bound::parse_sidecar(sb.data(), sb.size(), b, &se)) { expect(false, name + ": sidecar " + se); return false; }
-    expect(c.hash == fhash && b.container_hash == fhash, name + ": identity chain (container==sidecar==file hash)");
-    auto tr = bound::container_to_trace(c, b);
-    if (!tr.ok) { expect(false, name + ": translate " + tr.error); return false; }
-    out = std::move(tr.trace);
+    const PieLaunchPackage* package = load_package(dir, name);
+    if (package == nullptr) return false;
+    out = pie_native::launch::adopt(*package);
     return true;
 }
 
@@ -268,54 +261,26 @@ std::vector<std::uint64_t> register_trace_endpoints(
 
 void run_via_runtime(const std::string& dir) {
     std::printf("[program_runtime greedy_argmax]\n");
-    std::string chex, shex; std::uint64_t fhash = 0;
-    if (!load_golden(dir + "/greedy_argmax.txt", chex, shex, fhash)) { expect(false, "runtime: load"); return; }
-    auto cb = hex_to_bytes(chex), sb = hex_to_bytes(shex);
+    const std::uint64_t fhash = program_key("greedy_argmax");
+    const PieLaunchPackage* package = load_package(dir, "greedy_argmax");
+    if (package == nullptr) return;
 
     PtirProgramCache cache;
     std::string err;
-    // First fire of the hash ships container + sidecar → decode + cache.
-    const Trace* t = cache.get_or_decode(fhash, cb.data(), cb.size(), sb.data(), sb.size(), &err);
-    expect(t != nullptr, "runtime: first-fire decode+cache (" + err + ")");
+    // First registration of the hash adopts + caches the package.
+    const Trace* t = cache.adopt(fhash, *package, &err);
+    expect(t != nullptr, "runtime: first-fire adopt+cache (" + err + ")");
     if (!t) return;
     expect(cache.size() == 1 && cache.contains(fhash), "runtime: cached by hash");
-    // Steady state: empty bytes MUST hit the cache + return the SAME Trace.
-    const Trace* t2 = cache.get_or_decode(fhash, nullptr, 0, nullptr, 0, &err);
-    expect(t2 == t, "runtime: steady-state cache hit (same Trace, empty bytes)");
-    const Trace* t3 = cache.get_or_decode(
-        fhash, cb.data(), cb.size(), sb.data(), sb.size(), &err);
-    expect(t3 == t, "runtime: repeated canonical payload matches cache");
-    auto colliding_container = cb;
-    colliding_container.back() ^= 0x1u;
-    expect(
-        cache.get_or_decode(
-            fhash,
-            colliding_container.data(),
-            colliding_container.size(),
-            sb.data(),
-            sb.size(),
-            &err) == nullptr &&
-            err.find("payload mismatch") != std::string::npos,
-        "runtime: same hash with different container bytes is rejected");
-    auto colliding_sidecar = sb;
-    colliding_sidecar.back() ^= 0x1u;
-    expect(
-        cache.get_or_decode(
-            fhash,
-            cb.data(),
-            cb.size(),
-            colliding_sidecar.data(),
-            colliding_sidecar.size(),
-            &err) == nullptr &&
-            err.find("payload mismatch") != std::string::npos,
-        "runtime: same hash with different sidecar bytes is rejected");
-    expect(
-        cache.get_or_decode(
-            fhash, cb.data(), cb.size(), nullptr, 0, &err) == nullptr,
-        "runtime: partial payload on a hash hit is rejected");
-    // An uncached hash with empty bytes must FAIL loudly, never decode garbage.
-    const Trace* miss = cache.get_or_decode(fhash ^ 0x1ull, nullptr, 0, nullptr, 0, &err);
-    expect(miss == nullptr, "runtime: uncached hash + empty bytes → loud miss");
+    // Steady state: an empty package MUST hit the cache + return the SAME Trace.
+    const Trace* t2 = cache.adopt(fhash, PieLaunchPackage{}, &err);
+    expect(t2 == t, "runtime: steady-state cache hit (same Trace, empty package)");
+    const Trace* t3 = cache.adopt(fhash, *package, &err);
+    expect(t3 == t, "runtime: re-registration matches cache");
+    // An uncached hash with an empty package must FAIL loudly, never adopt
+    // garbage.
+    const Trace* miss = cache.adopt(fhash ^ 0x1ull, PieLaunchPackage{}, &err);
+    expect(miss == nullptr, "runtime: uncached hash + empty package → loud miss");
 
     // Instantiate with the D2 seed (chan0 token=[1], i32 LE) + fire the golden steps.
     // Seeds are keyed by GLOBAL channel id (dense 0 -> global 1).
@@ -344,29 +309,13 @@ void run_via_runtime(const std::string& dir) {
 
 void run_nucleus_generic_fallback(const std::string& dir) {
     std::printf("[program_runtime generic nucleus fallback]\n");
-    std::string container_hex;
-    std::string sidecar_hex;
-    std::uint64_t hash = 0;
-    if (!load_golden(
-            dir + "/nucleus_sample.txt",
-            container_hex,
-            sidecar_hex,
-            hash)) {
-        expect(false, "nucleus runtime: load");
-        return;
-    }
-    const auto container_bytes = hex_to_bytes(container_hex);
-    const auto sidecar_bytes = hex_to_bytes(sidecar_hex);
+    const PieLaunchPackage* package = load_package(dir, "nucleus_sample");
+    if (package == nullptr) return;
     PtirProgramCache cache;
     std::string error;
-    const Trace* trace = cache.get_or_decode(
-        hash,
-        container_bytes.data(),
-        container_bytes.size(),
-        sidecar_bytes.data(),
-        sidecar_bytes.size(),
-        &error);
-    expect(trace != nullptr, "nucleus runtime: decode (" + error + ")");
+    const Trace* trace =
+        cache.adopt(program_key("nucleus_sample"), *package, &error);
+    expect(trace != nullptr, "nucleus runtime: adopt (" + error + ")");
     if (trace == nullptr) return;
     const auto run = [&](const Trace& executable,
                          const std::vector<float>& logits,
@@ -436,94 +385,18 @@ void run_nucleus_generic_fallback(const std::string& dir) {
         0);
 }
 
-void region_plan_library_abi_validation(const std::string& dir) {
-    std::string container_hex;
-    std::string sidecar_hex;
-    std::uint64_t hash = 0;
-    if (!load_golden(
-            dir + "/nucleus_sample.txt",
-            container_hex,
-            sidecar_hex,
-            hash)) {
-        expect(false, "region plan: load nucleus golden");
-        return;
-    }
-    const auto sidecar_bytes = hex_to_bytes(sidecar_hex);
-    pie_native::ptir::bound::Bound bound;
-    std::string error;
-    if (!pie_native::ptir::bound::parse_sidecar(
-            sidecar_bytes.data(),
-            sidecar_bytes.size(),
-            bound,
-            &error) ||
-        bound.plans.empty()) {
-        expect(false, "region plan: parse sidecar");
-        return;
-    }
-    const auto& encoded = bound.plans.front().bytes;
-    pie_native::ptir::plan::StagePlan decoded;
-    if (!pie_native::ptir::plan::decode(
-            encoded.data(), encoded.size(), decoded, &error)) {
-        expect(false, "region plan: decode plan");
-        return;
-    }
-    const auto region = std::find_if(
-        decoded.fused.regions.begin(), decoded.fused.regions.end(),
-        [&](const auto& candidate) {
-            return candidate.library &&
-                candidate.library_op == PTIR_LIBRARY_NUCLEUS_SAMPLE;
-        });
-    expect(
-        encoded.size() >= 8 &&
-            encoded[4] == PTIR_REGION_PLAN_VERSION &&
-            encoded[6] == PTIR_COMPILER_VERSION &&
-            region != decoded.fused.regions.end() &&
-            region->nodes ==
-                std::vector<std::uint32_t>(
-                    {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}) &&
-            region->inputs == std::vector<std::uint32_t>({0, 2, 1}) &&
-            region->outputs == std::vector<std::uint32_t>({15}) &&
-            region->sinks.empty(),
-        "PTRP v4/compiler v3 carries the role-ordered generic nucleus ABI");
-    if (region == decoded.fused.regions.end()) return;
-    auto malformed_inputs = decoded;
-    auto malformed_region = std::find_if(
-        malformed_inputs.fused.regions.begin(),
-        malformed_inputs.fused.regions.end(),
-        [](const auto& candidate) {
-            return candidate.library &&
-                candidate.library_op == PTIR_LIBRARY_NUCLEUS_SAMPLE;
-        });
-    malformed_region->inputs.pop_back();
-    expect(
-        !validate_plan_structure(malformed_inputs, &error),
-        "region validator rejects a missing role-ordered input");
-    auto malformed_nodes = decoded;
-    auto nodes_region = std::find_if(
-        malformed_nodes.fused.regions.begin(),
-        malformed_nodes.fused.regions.end(),
-        [](const auto& candidate) {
-            return candidate.library &&
-                candidate.library_op == PTIR_LIBRARY_NUCLEUS_SAMPLE;
-        });
-    nodes_region->nodes.pop_back();
-    expect(
-        !validate_plan_structure(malformed_nodes, &error),
-        "region validator rejects a non-13-node nucleus region");
-}
-
 // ── program_runtime STATEFUL: counter_pingpong through PtirInstance proves the
 //    per-instance arena PERSISTS across fires (the counter 10→11→12 survives
 //    each fire's commit) — the "persistent instance" lifecycle (one instance,
 //    many fires, seeds applied ONCE at instantiation). ──
 void run_via_runtime_stateful(const std::string& dir) {
     std::printf("[program_runtime counter_pingpong (stateful persistence)]\n");
-    std::string chex, shex; std::uint64_t fhash = 0;
-    if (!load_golden(dir + "/counter_pingpong.txt", chex, shex, fhash)) { expect(false, "runtime-sf: load"); return; }
-    auto cb = hex_to_bytes(chex), sb = hex_to_bytes(shex);
+    const PieLaunchPackage* package = load_package(dir, "counter_pingpong");
+    if (package == nullptr) return;
     PtirProgramCache cache; std::string err;
-    const Trace* t = cache.get_or_decode(fhash, cb.data(), cb.size(), sb.data(), sb.size(), &err);
-    expect(t != nullptr, "runtime-sf: decode+cache (" + err + ")");
+    const Trace* t =
+        cache.adopt(program_key("counter_pingpong"), *package, &err);
+    expect(t != nullptr, "runtime-sf: adopt+cache (" + err + ")");
     if (!t) return;
 
     // Seed chan0 = 10 (u32) ONCE at instantiation; the arena persists across fires.
@@ -783,7 +656,7 @@ void run_pivot_predicates(const std::string& dir) {
     runner.arena().host_take(2, mask_p, sizeof(mask_p));
     runner.arena().host_take(3, mask_t, sizeof(mask_t));
 
-    // golden (interface/ptir/tests/golden-ptir/pivot_predicates_multistage.txt):
+    // golden (compiler/tests/golden/pivot_predicates_multistage.txt):
     //   take chan=2 = Bool([false,false,true,true,false,false,false,true])   (CummassLe 0.999)
     //   take chan=3 = Bool([false,true,true,true,false,false,false,true])    (ProbGe 0.0003)
     const std::uint8_t want_p[8] = {0, 0, 1, 1, 0, 0, 0, 1};
@@ -832,32 +705,14 @@ void run_async_writer_seed_pull() {
 }
 
 int main(int argc, char** argv) {
-    std::string dir = argc > 1 ? argv[1] : "tests/golden-ptir";
+    std::string dir = argc > 1 ? argv[1] : "../fixtures";
     cudaDeviceProp p{}; cudaGetDeviceProperties(&p, 0);
-    std::printf("PTIR cross-backend golden step-exec — device: %s (sm_%d%d), goldens: %s\n\n",
+    std::printf("PTIR cross-backend golden step-exec — device: %s (sm_%d%d), packages: %s\n\n",
                 p.name, p.major, p.minor, dir.c_str());
-    pie_native::ptir::Intrinsic mapped_intrinsic{};
-    expect(
-        pie_native::ptir::bound::map_intrinsic(
-            PTIR_INTR_MTP_DRAFTS, mapped_intrinsic) &&
-            mapped_intrinsic == pie_native::ptir::Intrinsic::MtpDrafts,
-        "MtpDrafts never aliases ordinary Logits during trace translation");
-    expect(
-        pie_native::ptir::bound::map_intrinsic(
-            PTIR_INTR_LAYER, mapped_intrinsic) &&
-            mapped_intrinsic == pie_native::ptir::Intrinsic::Layer,
-        "Layer intrinsic maps through the bool/out-param contract");
-    mapped_intrinsic = pie_native::ptir::Intrinsic::Logits;
-    expect(
-        !pie_native::ptir::bound::map_intrinsic(
-            std::numeric_limits<std::uint16_t>::max(),
-            mapped_intrinsic),
-        "unknown intrinsic tags are rejected");
     run_counter(dir);
     run_greedy(dir);
     run_via_runtime(dir);
     run_nucleus_generic_fallback(dir);
-    region_plan_library_abi_validation(dir);
     run_via_runtime_stateful(dir);
     run_section3(dir);
     run_beam(dir);

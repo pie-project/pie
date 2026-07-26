@@ -213,7 +213,7 @@ signature. **Two variant structs must be maintained.** Decode is unaffected.
 
 ### Layer 2 — PTIR: one appended intrinsic
 
-Follow the `MtpDrafts = 6` precedent exactly (`interface/ptir/src/op.rs:63-67`),
+Follow the `MtpDrafts = 6` precedent exactly (`compiler/ir/src/op.rs:63-67`),
 whose doc comment records the rule: *append, leave 0..6 byte-stable so every
 prior program's bytecode and identity hash is unchanged.*
 
@@ -254,12 +254,12 @@ Update surface, from the `MtpDrafts` precedent
 (`git log -S MtpDrafts`, head `c1e148ef`):
 
 ```
-interface/ptir/src/op.rs              enum + from_u16 + name
-interface/ptir/src/header.rs          generated C enum
-interface/ptir/src/registry.rs        intrinsic_stages()
-interface/ptir/src/validate.rs        scope check + type rule
-interface/ptir/src/interp.rs          PassInputs field + eval root
-interface/ptir/include/ptir_abi.h     PTIR_INTR_ATTN_SCORE = 7
+compiler/ir/src/op.rs              enum + from_u16 + name
+compiler/codegen/src/header.rs          generated C enum
+compiler/ir/src/registry.rs        intrinsic_stages()
+compiler/ir/src/validate.rs        scope check + type rule
+compiler/eval/src/interp.rs          PassInputs field + eval root
+compiler/codegen/include/ptir_abi.h     PTIR_INTR_ATTN_SCORE = 7
 driver/common/.../ptir_abi.h          mirror
 driver/common/.../trace.hpp           C++ mirror enum + static_asserts
 driver/common/.../bound.hpp           wire decode
@@ -272,7 +272,7 @@ driver/metal/src/pipeline/interp.hpp  reject
 Two granularities are needed, and one already exists.
 
 **Page granularity (Quest).** `attn_page_mask` is fully declared —
-`ptir-dsl/src/intrinsics.rs:92`, `registry.rs:172` (`SinkScope::Attention`),
+`compiler/dsl/src/intrinsics.rs:92`, `registry.rs:172` (`SinkScope::Attention`),
 `ptir_abi.h:246`, T11 stage-precedence enforced in `validate.rs:458`, and the
 interpreter golden `pentathlon_iter.txt:47` shows it firing per layer.
 `singleton_codegen.hpp:449` already whitelists it as a legal CUDA sink boundary.
@@ -400,7 +400,7 @@ The selection is **reported, not applied** — see §8.5.
 
 ### 8.2 The DSL had no way to emit a KernelCall
 
-The plan assumed the authoring surface existed. It did not: `ptir-dsl` could
+The plan assumed the authoring surface existed. It did not: `compiler/dsl` could
 name a kernel but not emit `Op::KernelCall`, and `attn_page_mask` *discarded its
 argument* (`let _ = mask.to_arg()`), recording only a name for T11 precedence.
 So a program that configured attention and one that did not lowered to the same
@@ -1431,6 +1431,15 @@ is expensive enough to dominate the host side of a decode step.
 
 ## 15. Track B: where each eviction policy pays for itself
 
+> **Superseded by §18.4 and §18.5.** The table below was measured with a page
+> count extrapolated from the target context length rather than probed, so its
+> `@1` columns were a ~80% budget that evicted rather than the zero-benefit
+> reference they are described as. The *shape* of every conclusion here holds;
+> the overhead numbers in §15.1 are understated and are corrected in §18.5,
+> where they turn out to agree better with §14.4 than the numbers below did.
+> §15.2's ordering is unaffected. Kept as written because the correction is
+> more instructive than the corrected text would be alone.
+
 §14 measured Quest. `tests/inferlets/bench_trackb.py` applies the identical
 method -- differenced endpoints, independently minimised, interleaved across
 rounds, `reserve_tokens` pinned, `report` off -- to the two Track B policies
@@ -1604,7 +1613,7 @@ The fix is not a tolerance. It is to pin the assertion to a prompt whose
 continuation is **decisive**: on an ambiguous prompt the next-token distribution
 is nearly flat and a 1-ulp difference flips the argmax, but on a prompt whose
 answer the model is sure of the argmax has a real margin and cannot be flipped.
-`test_quest_chunked_prefill` uses such a prompt and asserts **exact text
+`test_chunked_prefill` uses such a prompt and asserts **exact text
 equality over 32 tokens** at chunk widths 37, 128 and 999 -- all deliberately
 not multiples of the 16-token KV page, so every boundary lands mid-page and the
 write offsets have to be right. The single-token argmax was checked separately
@@ -1614,28 +1623,359 @@ isolates the prefill's own output from any downstream amplification.
 ### 17.2 The measurement the ceiling was hiding
 
 Same method as §14.2 -- Qwen3-0.6B, 28 layers, page size 16, L40S, ms/token,
-min of 7 interleaved rounds, `report=false`. Ratios are quest/baseline, so
-**below 1.00 is a win**:
+`report=false`. Ratios are quest/baseline, so **below 1.00 is a win**. Numbers
+below are the re-measurement described in §18.3: min of **15** rounds, with the
+page count probed rather than extrapolated (the first version of this table had
+a slightly short `budget=100%` and one visible outlier; both are gone).
+
+> §19.3 re-ran this at 25 rounds. **Quest's table barely moved** -- 0.51x ->
+> 0.50x at 16384, `budget=100%` overhead ~2.5 -> ~2.6 ms -- unlike Track B's,
+> which fell by ~0.4 ms everywhere. Quest is the policy with real per-layer
+> work, so its signal sits further above this host's noise floor. Treat the
+> crossover as ~3.2K rather than the ~4K interpolated here.
 
 | ctx | pages | baseline | budget=100% | budget=50% | budget=25% |
 |---|---|---|---|---|---|
-| 1024 | 80 | 4.61 ms | 1.36x | 1.19x | 1.19x |
-| 2048 | 158 | 4.84 ms | 1.43x | 1.19x | 1.11x |
-| 4096 | 314 | 6.91 ms | 1.37x | 0.93x | **0.80x** |
-| 6144 | 471 | 9.70 ms | 1.23x | 0.86x | **0.67x** |
-| 8192 | 627 | 10.91 ms | 1.23x | 0.85x | **0.66x** |
-| 12288 | 940 | 15.19 ms | 1.31x | 0.76x | **0.75x** |
-| 16384 | 1253 | 19.74 ms | 1.13x | 0.70x | **0.49x** |
+| 1024 | 86 | 3.59 ms | 1.61x | 1.54x | 1.34x |
+| 2048 | 164 | 4.57 ms | 1.52x | 1.28x | 1.18x |
+| 4096 | 320 | 6.87 ms | 1.37x | 1.01x | **0.87x** |
+| 6144 | 477 | 8.87 ms | 1.28x | 0.90x | **0.73x** |
+| 8192 | 633 | 11.20 ms | 1.21x | 0.84x | **0.65x** |
+| 12288 | 946 | 15.37 ms | 1.18x | 0.76x | **0.56x** |
+| 16384 | 1259 | 19.70 ms | 1.13x | 0.72x | **0.51x** |
 
-**At 16K context and a quarter budget Quest is 2.04x faster than the baseline.**
+**At 16K context and a quarter budget Quest is 1.96x faster than the baseline.**
 The crossover is unchanged at ~4K -- lifting the ceiling did not move it, which
 is the right outcome, since the ceiling was an artifact of the harness and not a
 property of the policy.
 
-The `budget=100%` column is still the constant: in absolute terms the overhead
-is 1.65, 2.08, 2.58, 2.19, 2.48, 4.77 and 2.54 ms across the seven contexts --
-flat at ~2.5 ms with one outlier at 12288 that the shared host explains (the
-same row's 0.76x/0.75x pair is visibly noisier than its neighbours in both
-directions). Seven contexts spanning 16x now say what four spanning 6x could
-only suggest: **the overhead does not scale with context and the saving does**,
-so the ratio improves without bound as the context grows.
+Every column is now strictly monotone in the context, which the seven-context
+table at 7 rounds was not. That is worth more than any single cell: the trend is
+the claim, and a monotone trend across a 16x span is not something host noise
+produces by accident.
+
+The `budget=100%` column is the constant: in absolute terms the overhead is
+2.20, 2.40, 2.52, 2.44, 2.31, 2.70 and 2.65 ms across the seven contexts --
+**flat at ~2.5 ms over a 16x range, with no outlier.** Seven contexts spanning
+16x say what four spanning 6x could only suggest: **the overhead does not scale
+with context and the saving does**, so the ratio improves without bound as the
+context grows. §18.5 measures the same constant a third way, from SnapKV.
+
+## 18. Track B past the ceiling, and a budget the benchmark did not have
+
+§17 lifted the one-shot prefill ceiling for Quest and the naive baseline. Track
+B had the identical ceiling and it mattered more there, because §15 put
+SnapKV's crossover at ~2.3K and H2O's at ~4.1K -- the entire range in which
+these policies pay was above the point at which they could be run.
+
+Propagating the fix was mechanical for H2O and TOVA, which observe the decode
+fire and leave prefill alone. SnapKV is the exception, and it is the reason
+this is a section rather than a footnote.
+
+### 18.1 SnapKV is the only policy for which chunking is not mechanical
+
+SnapKV is observed **during prefill**. The capture records the last `window`
+query rows *of the fire it is attached to* (§12.3), so under chunking only the
+final chunk's window is the prompt's tail. An earlier chunk's window is a
+perfectly well-defined observation -- of the wrong thing. `attn_score.hpp`
+already anticipated this and blessed the resolution: *"the final firing is the
+one whose window matches SnapKV, so a policy that simply acts on the most
+recent firing gets SnapKV's semantics for free."*
+
+So the tap goes on the final chunk alone. That is not only correct but cheaper:
+the earlier chunks run the plain prefill kernel and never pay the capture
+variant's 1.24-1.94x (§12.7).
+
+Which makes the final chunk's **size** load-bearing, and the obvious even split
+is not even enough. A fixed width of `ceil(n / ceil(n / C))` gives the right
+chunk *count*, but the remainder still lands entirely on the last chunk: at
+n=1302, C=37 it lays down 35 chunks of 37 and a final chunk of **seven**,
+truncating a 32-row window to 7 rows. The fix is to spread the remainder over
+the *first* chunks instead -- with `k = ceil(n / C)`, chunk `i` gets
+`n/k + (i < n mod k)` -- so every chunk is within one token of every other and
+the final chunk is `floor(n / k)`, the largest value a last chunk can take. At
+C = 8192 that is thousands of tokens and the window is never in danger.
+
+### 18.2 The discriminator, which took two tries to find
+
+A truncated window is invisible in the output: it still produces a plausible
+ranking and a coherent continuation. Testing it needs a quantity that moves.
+
+The first choice, the keep-set, barely moves at all. At a 24-page budget on a
+1302-token prompt, forcing the window down to **four** rows changed 2 of the 24
+kept pages -- while merely changing the chunk width with the window intact
+changed 1. No margin, and a test with no margin is a coin flip.
+
+`tail_page_share` -- observed mass on the prompt's last page over total
+observed mass -- separates cleanly, because a narrower window means fewer query
+rows and all of them sit near the end of the prompt, which inflates the last
+page's share:
+
+| final chunk | 36 | 127 | 635 | 19 | 9 | 4 |
+|---|---|---|---|---|---|---|
+| `tail_page_share` | .0507 | .0506 | .0507 | .0852 | .1801 | .2702 |
+| window | whole | whole | whole | cut | cut | cut |
+
+Whole-window noise is 0.2%; the smallest truncation signal is +68%. A 2% band
+sits two orders of magnitude clear of the noise and still trips on the mildest
+truncation. That is the assertion in `test_chunked_prefill.py`, along with
+`tail_page_share > 0`, which separately catches a tap attached to the wrong
+chunk entirely (an earlier chunk cannot see the last page at all, so it reports
+exactly zero).
+
+### 18.3 The benchmark was measuring a budget it did not have
+
+Re-running `bench_trackb.py` over seven contexts produced something that could
+not be true: `snapkv@1` at **1.05x**, a policy that evicts nothing running
+*faster* than not evicting anything.
+
+The cause was in the harness, not the policy. `bench_trackb` derived the page
+count as `(ctx + LONG_TOKENS) // PAGE_SIZE`. But `ctx` is a *target*:
+`_prompt_for` lays down `round(ctx / 9)` repetitions of a unit that tokenizes
+to slightly more than 9, so the real prompt runs about 25% long -- ctx=12288
+measures 15032 tokens. The estimate therefore under-counted pages by ~25%, and
+**`budget=1.0` was really a ~80% budget that evicted**.
+
+That is not a small error in a small place. The `@1` column is the column whose
+entire job is to price a policy with its benefit set to zero, and every
+overhead number in §15 was read off it. Those numbers were understated by an
+unintended benefit.
+
+Both benchmarks now probe the real page count, and both add the arithmetic the
+budget has to satisfy: the probe stops after `SHORT_TOKENS`, so the
+`LONG_TOKENS` the measured endpoint decodes have to be added back, which is 8%
+of the pages at ctx=1024. Two guards now assert the properties that would have
+caught this:
+
+- `assert_full_budget_is_overhead` -- a full budget cannot beat the baseline,
+  because the policy does everything the baseline does and then some. If it
+  wins, the budget is not full.
+- `assert_monotone_baseline` -- the baseline attends over the whole prefix, so
+  its per-token cost is necessarily increasing in the context. If the measured
+  baseline is not increasing, the run's noise floor is above its signal and
+  every ratio derived from it is meaningless. This one is not hypothetical
+  either: a 7-round sweep taken at host load 35 failed it (10.12 ms at 4096 vs
+  9.04 ms at 6144). `PIE_BENCH_REPS` exists so the answer is more rounds rather
+  than a wider tolerance.
+
+### 18.4 The corrected Track B table
+
+**Superseded by §18.7**, which re-ran this at 25 rounds. The shape below is
+right and every conclusion drawn from it survives; the absolute constants are
+about 0.4 ms too high and two cells flagged here as artifacts were exactly
+that. Kept because §18.7 is an argument about how far to trust it.
+
+Qwen3-0.6B, 28 layers, page size 16, L40S, ms/token, **min of 15** interleaved
+rounds, `report=false`, page counts probed. Ratios are baseline/policy, so
+**>1.00x is a win**.
+
+| ctx | pages | baseline | h2o@1 | h2o@.5 | h2o@.25 | snap@1 | snap@.5 | snap@.25 |
+|---|---|---|---|---|---|---|---|---|
+| 1024 | 86 | 3.51 ms | 0.51x | 0.55x | 0.59x | 0.60x | 0.72x | 0.76x |
+| 2048 | 165 | 4.32 ms | 0.47x | 0.61x | 0.66x | 0.65x | 0.76x | 0.83x |
+| 4096 | 321 | 7.03 ms | 0.61x | 0.81x | 0.59x | 0.71x | 1.02x | 1.24x |
+| 6144 | 478 | 8.64 ms | 0.59x | 0.84x | 1.01x | 0.79x | 1.16x | 1.38x |
+| 8192 | 634 | 11.16 ms | 0.62x | 0.93x | 1.25x | 0.85x | 1.23x | 1.50x |
+| 12288 | 946 | 15.31 ms | 0.65x | 0.96x | 1.37x | 0.88x | 1.22x | **1.81x** |
+| 16384 | 1259 | 19.85 ms | 0.65x | 1.05x | 1.47x | 0.90x | 1.31x | 1.63x |
+
+Every `@1` cell is now below 1.00x, as it must be. Crossovers at a quarter
+budget: **SnapKV ~2.9K, H2O ~6.1K**. (`h2o@.25` at 4096 reads 0.59x, below both
+its neighbours -- a residual noise artifact of the shared host, not a feature.
+`snapkv@.25` likewise loses a little between 12288 and 16384.)
+
+### 18.5 What the corrected numbers say, which is more than the wrong ones did
+
+> **Amended by §19.3.** The decomposition below is right; the claim that all
+> three instruments converge on *one* constant is not. At 25 rounds SnapKV's
+> floor (~1.9 ms) and Quest's (~2.6 ms) separate cleanly, and the ~1.5 ms of
+> lost graph replay is the part common to both. They agree on how the number
+> splits, which is stronger evidence than agreeing on the number.
+
+Converting the `@1` ratios to absolute per-step overhead is where the table
+stops being a benchmark and starts being an argument:
+
+| ctx | 1024 | 2048 | 4096 | 6144 | 8192 | 12288 | 16384 |
+|---|---|---|---|---|---|---|---|
+| SnapKV | 2.34 | 2.33 | 2.87 | 2.30 | 1.97 | 2.09 | 2.21 ms |
+| H2O | 3.37 | 4.87 | 4.49 | 6.00 | 6.84 | 8.24 | 10.69 ms |
+| H2O − SnapKV | 1.03 | 2.55 | 1.62 | 3.71 | 4.87 | 6.16 | 8.48 ms |
+
+**SnapKV's overhead is flat at ~2.3 ms/step across a 16x range of context.**
+H2O's grows roughly linearly, and the difference between them -- H2O's own
+work, the per-layer `[kv_max]` fold and rank -- is the part that grows.
+
+This separates the two costs cleanly, which the four-context table in §15 could
+only hint at. SnapKV decides its keep-set once during prefill and afterwards
+re-applies a mask that is already resident on the device: no score, no fold, no
+ranking, nothing per layer that depends on the context. What is left is the
+cost of *having a hook at all*.
+
+And that number now closes a loop that §15 left open. Three instruments:
+
+| instrument | what it measures | value |
+|---|---|---|
+| Quest `budget=100%` (§14.3, §17.2) | end-to-end, benefit removed | ~2.5 ms |
+| `nsys --cuda-graph-trace=node` (§14.4) | ~1.5 ms host launch + ~1.0 ms GPU | ~2.5 ms |
+| SnapKV `budget=100%` (here) | end-to-end, policy work ~0 | **~2.3 ms** |
+
+§15 reported SnapKV's overhead as 1.32 ms and called it agreement with §14.4.
+It was not: 1.32 ms matched only the *launch* component and was silently short
+of the total, because the budget was evicting. The corrected 2.3 ms agrees with
+both other instruments on the whole quantity. **The conclusion of §15.1
+survives and is strengthened: SnapKV is at the floor, and the floor is the CUDA
+graph replay the hook costs (§14.4), which cannot be moved from inside this
+document.**
+
+The practical consequence is unchanged in direction and larger in size than
+§15 estimated. On a 0.6B model a ~2.3 ms/step constant is most of the budget,
+which is why these crossovers sit where they do. That constant is set by the
+engine's launch path and does not grow with the model, while the baseline
+per-step cost does -- so on a production-sized model every crossover here moves
+earlier, and what survives is the ordering, which is set by real per-layer
+work: SnapKV (none) < H2O (a `[kv_max]` fold) < Quest (`envelope_dot` over
+every page).
+
+### 18.6 One chunking rule, in the SDK
+
+§18.1 arrived at even chunking for SnapKV. Leaving it there would have been a
+bug in waiting: the other four programs still chunked greedily, so above the
+one-shot ceiling they would lay their prompts down at **different boundaries
+than the baseline they are compared against**. At `n = 15032` with a ceiling of
+8192, greedy gives `8192 + 6840` and even gives `7516 + 7516`. Nothing about
+that is wrong numerically -- both cover the prompt -- but it means
+`test_policies_agree_with_the_baseline_past_the_ceiling` would have been
+comparing two different computations and calling their agreement a result.
+
+The rule now lives once, in the SDK, as
+`inferlet::ptir::prefill_chunks(n, cap) -> Vec<(u32, u32)>`, exported from
+`ptir::prelude`. All five inferlets call it. It resolves the ceiling from
+`max_embed_length()` unless the caller overrides it, so a test can force the
+multi-chunk path on a short prompt (`prefill_chunk` in every Track A/B
+inferlet's input) without knowing the driver's limit.
+
+The interesting part is the doc comment, because the obvious implementation is
+the wrong one. `chunk = ceil(n / ceil(n/cap))` gets the chunk *count* right and
+then piles the entire remainder onto the final chunk: with `n = qk + r` and
+`r > 0` the tail is `q + r - k + 1`, which can be as small as 1. The fix is
+variable-size chunks -- spread the remainder over the *first* `r` chunks, so
+chunk `i` gets `n/k + (i < n%k)` and the final chunk is `floor(n/k)`, provably
+the largest a last chunk can be. For SnapKV that is the difference between an
+observation window that sees 32 rows and one that sees 7.
+
+Five unit tests in `sdk/rust/inferlet/src/ptir.rs` pin the contract, over a
+grid of prompt lengths and ceilings: the spans tile `[0, n)` with no gap,
+overlap or empty chunk and none exceeds the cap; the count is the minimum the
+cap allows; **every chunk is within one token of every other, and the last
+chunk is always one of the shortest**; and the `n = 1302, cap = 37` case that
+motivated the rule produces a 36-token tail where greedy produced 7. The
+arithmetic is factored out of `prefill_chunks` into a private `even_spans` for
+exactly this reason -- `max_embed_length()` reaches the host, so the public
+function cannot run off-device, and a rule this easy to get subtly wrong should
+not be testable only through a GPU.
+
+## 19. How far these numbers can be trusted
+
+### 19.1 The same table at 25 rounds
+
+§18.4 flagged two cells as noise artifacts rather than features. That is an
+easy thing to assert and a cheap thing to check, so both benchmarks were re-run
+at `PIE_BENCH_REPS=25`.
+
+| ctx | pages | baseline | h2o@1 | h2o@.5 | h2o@.25 | snap@1 | snap@.5 | snap@.25 |
+|---|---|---|---|---|---|---|---|---|
+| 1024 | 86 | 3.60 ms | 0.52x | 0.58x | 0.63x | 0.70x | 0.76x | 0.80x |
+| 2048 | 165 | 4.78 ms | 0.56x | 0.68x | 0.73x | 0.69x | 0.87x | 0.98x |
+| 4096 | 321 | 6.73 ms | 0.60x | 0.78x | 0.93x | 0.77x | 1.02x | 1.25x |
+| 6144 | 478 | 8.76 ms | 0.61x | 0.87x | 1.11x | 0.82x | 1.14x | 1.44x |
+| 8192 | 634 | 11.13 ms | 0.64x | 0.94x | 1.26x | 0.86x | 1.31x | 1.48x |
+| 12288 | 946 | 15.33 ms | 0.66x | 1.02x | 1.35x | 0.90x | 1.21x | 1.69x |
+| 16384 | 1259 | 19.79 ms | 0.66x | 1.07x | 1.57x | 0.91x | 1.39x | 1.72x |
+
+Both flagged cells resolved as noise. `h2o@.25` at 4096 went 0.59x -> 0.93x and
+now sits between its neighbours. `snapkv@.25` went 1.63x -> 1.72x at 16384 and
+the 12288 -> 16384 dip is gone. **H2O's overhead column, which was not monotone
+at 15 rounds (3.37, 4.87, 4.49 ms), is monotone at 25 (3.32, 3.76, 4.49).**
+
+The noise did not disappear, though -- it moved. `snapkv@.5` now dips at 12288
+(1.31 -> 1.21 -> 1.39) where it did not before. **A wobble that relocates when
+you resample is host noise; a wobble that stays is a feature.** That is the only
+reliable way to tell them apart here, and it costs a second run.
+
+### 19.2 The overheads came in uniformly lower, which is expected
+
+| ctx | 1024 | 2048 | 4096 | 6144 | 8192 | 12288 | 16384 |
+|---|---|---|---|---|---|---|---|
+| SnapKV @15 | 2.34 | 2.33 | 2.87 | 2.30 | 1.97 | 2.09 | 2.21 ms |
+| SnapKV @25 | 1.54 | 2.15 | 2.01 | 1.92 | 1.81 | 1.70 | 1.96 ms |
+| H2O @15 | 3.37 | 4.87 | 4.49 | 6.00 | 6.84 | 8.24 | 10.69 ms |
+| H2O @25 | 3.32 | 3.76 | 4.49 | 5.60 | 6.26 | 7.90 | 10.19 ms |
+
+Every single cell fell. That is not a coincidence and not a bug: **min-of-N is
+a biased estimator of the minimum, biased upward, and the bias shrinks with N.**
+Both endpoints get faster as N grows, but the policy endpoint is the slower one
+and carries more absolute noise, so it gains more, and the *difference* -- which
+is what we report -- shrinks. An overhead figure derived from two independently
+minimised endpoints is therefore an upper bound, and quoting it to two
+significant figures is overclaiming.
+
+Two confounds, stated rather than hidden. Host load fell from ~29 to ~18 during
+the Track B re-run (it was back at ~29 for the Quest re-run), so rounds and
+quiet are not separable here. And the two benchmarks are separate programs run
+40 minutes apart: their independently measured baselines agree to ~1% at five of
+seven contexts (worst case +6.1% at 4096). **So ~1% is the reproducibility of
+the easy endpoint, and the honest quote for the constant is ~2 ms, not 2.3.**
+
+### 19.3 Quest's constant did not move, and that is the useful part
+
+| ctx | 1024 | 2048 | 4096 | 6144 | 8192 | 12288 | 16384 |
+|---|---|---|---|---|---|---|---|
+| baseline | 3.69 | 4.70 | 7.14 | 8.82 | 11.24 | 15.47 | 19.69 ms |
+| quest@1 | 1.57x | 1.54x | 1.30x | 1.32x | 1.25x | 1.17x | 1.15x |
+| quest@.5 | 1.54x | 1.31x | 1.01x | 0.96x | 0.87x | 0.78x | 0.72x |
+| quest@.25 | 1.43x | 1.17x | 0.87x | 0.76x | 0.66x | 0.56x | **0.50x** |
+
+(Quest's harness reports policy/baseline, so here **<1.00x is a win** -- the
+opposite convention to the Track B table above.)
+
+Quest's `@1` overhead is 2.09, 2.55, 2.13, 2.86, 2.76, 2.65, 3.01 ms: ~2.6 ms,
+against ~2.5 ms at 15 rounds. **It did not move, while SnapKV's fell from 2.3 to
+1.9.** So the two policies' floors are genuinely different, which §18.5 had
+blurred by calling them the same constant:
+
+- SnapKV ~1.9 ms. It decides once during prefill and reapplies a resident mask,
+  so it has essentially no per-layer work. This is the floor.
+- Quest ~2.6 ms. The extra ~0.7 ms is `envelope_dot` plus threshold and mask
+  over every page, every layer -- and §14.4 priced that at 0.34 + 0.24 ms.
+- nsys attributed ~1.5 ms/step to lost CUDA graph replay, which is the part
+  *common to both* and must therefore be below SnapKV's 1.9 ms. It is.
+
+The corrected arithmetic is more coherent than the claim it replaces. §18.5 said
+three instruments agreed on one number; they do not, and should not. They agree
+on a **decomposition**: ~1.5 ms of lost graph replay that every policy pays, plus
+~0.4 ms of SnapKV's mask reapplication, plus ~0.7 ms more of per-layer scoring
+if you are Quest. Three instruments agreeing on a single number would have been
+weaker evidence than three instruments agreeing on how the number splits.
+
+### 19.4 Crossovers, restated
+
+At a quarter budget, interpolating linearly between bracketing contexts:
+
+| policy | crossover | at 16384 |
+|---|---|---|
+| SnapKV | ~2.2K | 1.72x faster |
+| Quest | ~3.2K | 2.00x faster |
+| H2O | ~4.9K | 1.57x faster |
+
+All three moved earlier than §17.2/§18.4 reported, for the reason in §19.2: the
+overhead being amortised is smaller than the 15-round run could resolve. The
+**ordering is unchanged across every run at every round count**, and it is the
+part that does not depend on this host: SnapKV (no per-layer work) < Quest
+(`envelope_dot` per page per layer) < H2O (a `[kv_max]` fold per layer, whose
+cost grows with context -- which is why it is last despite being the cheapest
+per unit of work).
+
+Quest reaching exactly **2.00x at 16K** on a 0.6B model is the headline, and it
+is a floor rather than a ceiling: the ~2 ms constant belongs to the engine's
+launch path and does not grow with model size, while the baseline per-step cost
+does.

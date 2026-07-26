@@ -1,5 +1,4 @@
 {
-  "version": 5,
   "compiler_version": 0,
   "target": {
     "backend": "Cuda",
@@ -7,22 +6,68 @@
     "tp_size": 1,
     "max_tile_bytes": 67108864,
     "preferred_alignment": 256,
-    "tile_map_mask": 117,
+    "tile_map_mask": 85,
     "native_mxfp4_moe": true,
     "fusion_mask": 1,
     "encode_scratch_dtype": "BF16",
     "block_scale_rows": 128
   },
-  "optimizer": {
-    "passes": [
-      {
-        "name": "live-normalization",
-        "exprs_before": 18,
-        "exprs_after": 18,
-        "rewrites": 0
-      }
-    ]
-  },
+  "passes": [
+    {
+      "pass": "assign-persistent-offsets",
+      "instrs_before": 18,
+      "instrs_after": 18,
+      "rewrites": 6
+    },
+    {
+      "pass": "coalesce-persistent-arena-writes",
+      "instrs_before": 18,
+      "instrs_after": 18,
+      "rewrites": 0
+    },
+    {
+      "pass": "hoist-bulk-arena-writes",
+      "instrs_before": 18,
+      "instrs_after": 13,
+      "rewrites": 5
+    },
+    {
+      "pass": "group-shared-source-reads",
+      "instrs_before": 13,
+      "instrs_after": 13,
+      "rewrites": 0
+    },
+    {
+      "pass": "merge-adjacent-extent-writes",
+      "instrs_before": 13,
+      "instrs_after": 13,
+      "rewrites": 0
+    },
+    {
+      "pass": "recompute-memory-plan",
+      "instrs_before": 13,
+      "instrs_after": 13,
+      "rewrites": 0
+    },
+    {
+      "pass": "validate-fill-order",
+      "instrs_before": 13,
+      "instrs_after": 13,
+      "rewrites": 0
+    },
+    {
+      "pass": "validate-target-support",
+      "instrs_before": 13,
+      "instrs_after": 13,
+      "rewrites": 0
+    },
+    {
+      "pass": "validate-persistent-layout",
+      "instrs_before": 13,
+      "instrs_after": 13,
+      "rewrites": 0
+    }
+  ],
   "files": [
     {
       "id": 0,
@@ -304,7 +349,8 @@
                 "dst_stride": 1
               }
             ]
-          }
+          },
+          "dtype": "BF16"
         },
         "dest_offset": 0
       }

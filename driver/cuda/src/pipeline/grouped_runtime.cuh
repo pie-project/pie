@@ -28,7 +28,7 @@
 #include <cub/block/block_scan.cuh>
 
 #include "cuda_check.hpp"
-#include "pie_native/ptir/plan.hpp"
+#include "pie_native/launch/plan.hpp"
 #include "pipeline/channels.hpp"
 #include "pipeline/grouped_copy.hpp"
 #include "pipeline/library_region.hpp"
@@ -1374,204 +1374,50 @@ inline std::uint32_t grouped_rows(
         1, static_cast<std::uint32_t>(rows));
 }
 
-inline bool grouped_supported_tag(std::uint8_t tag) {
-    switch (tag) {
-        case PTIR_OP_CONST:
-        case PTIR_OP_CHAN_TAKE:
-        case PTIR_OP_CHAN_READ:
-        case PTIR_OP_CHAN_PUT:
-        case PTIR_OP_SINK_CALL:
-        case PTIR_OP_INTRINSIC_VAL:
-        case PTIR_OP_RESHAPE:
-        case PTIR_OP_BROADCAST:
-        case PTIR_OP_TRANSPOSE:
-        case PTIR_OP_CAST:
-        case PTIR_OP_IOTA:
-        case PTIR_OP_RNG:
-        case PTIR_OP_RNG_KEYED:
-        case PTIR_OP_ADD:
-        case PTIR_OP_SUB:
-        case PTIR_OP_MUL:
-        case PTIR_OP_DIV:
-        case PTIR_OP_REM:
-        case PTIR_OP_MAX_ELEM:
-        case PTIR_OP_MIN_ELEM:
-        case PTIR_OP_GT:
-        case PTIR_OP_GE:
-        case PTIR_OP_EQ:
-        case PTIR_OP_NE:
-        case PTIR_OP_LT:
-        case PTIR_OP_LE:
-        case PTIR_OP_AND:
-        case PTIR_OP_OR:
-        case PTIR_OP_NOT:
-        case PTIR_OP_NEG:
-        case PTIR_OP_EXP:
-        case PTIR_OP_LOG:
-        case PTIR_OP_RECIP:
-        case PTIR_OP_ABS:
-        case PTIR_OP_SIGN:
-        case PTIR_OP_SELECT:
-        case PTIR_OP_REDUCE_SUM:
-        case PTIR_OP_REDUCE_MAX:
-        case PTIR_OP_REDUCE_MIN:
-        case PTIR_OP_REDUCE_ARGMAX:
-        case PTIR_OP_CUMSUM:
-        case PTIR_OP_CUMPROD:
-        case PTIR_OP_GATHER:
-        case PTIR_OP_GATHER_ROW:
-        case PTIR_OP_SCATTER_SET:
-        case PTIR_OP_SCATTER_ADD:
-        case PTIR_OP_MASK_APPLY_PACKED:
-        case PTIR_OP_CAUSAL_MASK:
-        case PTIR_OP_SLIDING_WINDOW_MASK:
-        case PTIR_OP_SINK_WINDOW_MASK:
-        case PTIR_OP_MATMUL:
-        case PTIR_OP_SORT_DESC:
-        case PTIR_OP_TOP_K:
-        case PTIR_OP_PIVOT_THRESHOLD:
-            return true;
-        default:
-            return false;
-    }
-}
-
 struct GroupedStageStaticPlan {
     struct ChannelRule {
         std::uint32_t value = UINT32_MAX;
         std::uint32_t local = UINT32_MAX;
     };
 
+    // Every gate below is *shipped* in `stage.grouped`: the host emitter had to
+    // answer the same questions to generate the stage's kernel, so deriving
+    // them again here was a second implementation of one contract. The only
+    // thing still computed is `value_extents`, which is a re-index of
+    // `stage.value_types` (already typed data), not a re-derivation.
     explicit GroupedStageStaticPlan(const plan::StagePlan& stage)
-        : signature_hash(stage.signature_hash),
-          signature(stage.signature),
+        : valid(stage.grouped.valid),
+          error(stage.grouped.error),
+          signature_hash(stage.signature_hash),
           op_count(stage.ops.size()),
           value_count(stage.value_types.size()),
-          channel_count(stage.channel_bindings.size()) {
-        auto fail = [&](const char* message) {
-            valid = false;
-            error = message;
-        };
-        if (stage.stage > PTIR_STAGE_EPILOGUE) {
-            fail("missing executable stage plan");
-            return;
-        }
+          channel_count(stage.channel_bindings.size()),
+          requires_query(stage.grouped.requires_query()),
+          requires_layer(stage.grouped.requires_layer()),
+          requires_attn_score(stage.grouped.requires_attn_score()),
+          requires_kernel_call(stage.grouped.requires_kernel_call()),
+          requires_page_mask(stage.grouped.requires_page_mask()),
+          requires_mtp_rows(stage.grouped.requires_mtp_rows()),
+          mtp_rows(stage.grouped.mtp_rows),
+          used_extents(stage.grouped.used_extents) {
         value_extents.resize(stage.value_types.size());
-        std::array<bool, PTIR_EXTENT_KEY_LEN + 1> seen_extents{};
-        for (std::size_t value = 0;
-             value < stage.value_types.size();
-             ++value) {
+        for (std::size_t value = 0; value < stage.value_types.size(); ++value) {
             for (const plan::Dimension& dimension :
                  stage.value_types[value].dims) {
                 if (!dimension.symbolic) continue;
-                if (dimension.value > PTIR_EXTENT_KEY_LEN) {
-                    fail("stage uses unsupported runtime extents");
-                    return;
-                }
-                const auto extent =
-                    static_cast<std::uint8_t>(dimension.value);
-                value_extents[value].push_back(extent);
-                if (!seen_extents[extent]) {
-                    seen_extents[extent] = true;
-                    used_extents.push_back(extent);
-                }
+                value_extents[value].push_back(
+                    static_cast<std::uint8_t>(dimension.value));
             }
         }
-
-        std::vector<std::uint32_t> value_bases(stage.ops.size());
-        std::uint32_t next_value = 0;
-        for (std::size_t node = 0; node < stage.ops.size(); ++node) {
-            value_bases[node] = next_value;
-            next_value += stage.ops[node].op.results;
-        }
-        for (std::size_t node = 0; node < stage.ops.size(); ++node) {
-            const container::COp& op = stage.ops[node].op;
-            // A second-party kernel is deliberately NOT in
-            // `grouped_supported_tag`. That predicate is the "can a generic
-            // CUDA op cover this tag" question, and the answer for a named
-            // kernel is no — only the fused path can launch it. But this static
-            // plan is the shared lane-binding metadata the FUSED path resolves
-            // through too, so it must describe the op rather than reject it.
-            // Execution coverage is enforced twice elsewhere: once at
-            // registration (`Dispatch::register_program` name+capability gate)
-            // and once per execution group (`generated_stage_supported`).
-            // `requires_query` is set because the kernel consumes the lane's
-            // post-rope query row.
-            if (op.tag == PTIR_OP_KERNEL_CALL) {
-                requires_query = true;
-                requires_kernel_call = true;
-                continue;
-            }
-            // `attn_page_mask` is in `grouped_supported_tag` (the grouped
-            // interpreter can walk past a sink) but only the fused path can
-            // *execute* it. Same status as `requires_kernel_call`: described
-            // here so the shared lane binding resolves a destination, with
-            // execution coverage enforced at registration and per group.
-            if (op.tag == PTIR_OP_SINK_CALL) {
-                requires_page_mask = true;
-            }
-            if (!grouped_supported_tag(op.tag)) {
-                fail("stage contains an unsupported grouped op");
-                return;
-            }
-            if (op.tag == PTIR_OP_INTRINSIC_VAL) {
-                if (op.intr == PTIR_INTR_QUERY) {
-                    requires_query = true;
-                } else if (op.intr == PTIR_INTR_LAYER) {
-                    requires_layer = true;
-                } else if (op.intr == PTIR_INTR_MTP_LOGITS) {
-                    const std::uint32_t value = value_bases[node];
-                    if (value >= stage.value_types.size() ||
-                        stage.value_types[value].dims.size() != 2 ||
-                        stage.value_types[value].dims[0].symbolic) {
-                        fail("MtpLogits has no static draft-row layout");
-                        return;
-                    }
-                    const std::size_t required_rows =
-                        stage.value_types[value].dims[0].value;
-                    if (requires_mtp_rows &&
-                        mtp_rows != required_rows) {
-                        fail(
-                            "MtpLogits stages declare incompatible draft-row layouts");
-                        return;
-                    }
-                    requires_mtp_rows = true;
-                    mtp_rows = required_rows;
-                } else if (op.intr == PTIR_INTR_ATTN_SCORE) {
-                    requires_attn_score = true;
-                } else if (op.intr != PTIR_INTR_LOGITS) {
-                    fail("stage uses an unsupported intrinsic");
-                    return;
-                }
-            }
-
-            std::uint32_t value = UINT32_MAX;
-            if (op.tag == PTIR_OP_CHAN_TAKE ||
-                op.tag == PTIR_OP_CHAN_READ) {
-                value = value_bases[node];
-            } else if (op.tag == PTIR_OP_CHAN_PUT &&
-                       !op.args.empty()) {
-                value = op.args[0];
-            } else {
-                continue;
-            }
-            if (value >= stage.value_types.size() ||
-                op.chan < 0 ||
-                static_cast<std::size_t>(op.chan) >=
-                    stage.channel_bindings.size()) {
-                fail("channel value is outside the grouped plan");
-                return;
-            }
-            channel_rules.push_back(ChannelRule{
-                .value = value,
-                .local = static_cast<std::uint32_t>(op.chan),
-            });
+        channel_rules.reserve(stage.grouped.channel_rules.size());
+        for (const PieLaunchChannelRule& rule : stage.grouped.channel_rules) {
+            channel_rules.push_back(
+                ChannelRule{.value = rule.value, .local = rule.local});
         }
     }
 
     bool matches(const plan::StagePlan& stage) const {
         return stage.signature_hash == signature_hash &&
-            stage.signature == signature &&
             stage.ops.size() == op_count &&
             stage.value_types.size() == value_count &&
             stage.channel_bindings.size() == channel_count;
@@ -1580,7 +1426,6 @@ struct GroupedStageStaticPlan {
     bool valid = true;
     std::string error;
     std::uint64_t signature_hash = 0;
-    std::vector<std::uint8_t> signature;
     std::size_t op_count = 0;
     std::size_t value_count = 0;
     std::size_t channel_count = 0;

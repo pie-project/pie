@@ -15,7 +15,10 @@ path = "src/lib.rs"
 [dependencies]
 pie-driver-abi = { path = "../../interface/driver" }
 pie-driver-dummy = { path = "../../driver/dummy" }
-pie-ptir = { path = "../../interface/ptir", features = ["eval"] }
+pie-ir = { path = "../../compiler/ir" }
+pie-plan = { path = "../../compiler/plan" }
+pie-codegen = { path = "../../compiler/codegen" }
+pie-eval = { path = "../../compiler/eval" }
 pie-client = { path = "../../client/rust" }
 tokio = { version = "1.53", features = ["full"] }
 tokio-util = "0.7"
@@ -112,7 +115,7 @@ profile-all = ["profile-fire"]       # everything
 
 [dev-dependencies]
 tempfile = "3"
-pie-ptir = { path = "../../interface/ptir", features = ["eval"] }
+pie-ir = { path = "../../compiler/ir" }
 criterion = { version = "0.8", features = ["html_reports"] }
 
 [[bench]]

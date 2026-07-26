@@ -2,7 +2,7 @@
 //!
 //! These types are the loader's published vocabulary: the driver walks them in
 //! place, so every field here is part of the ABI. They replace the hand-written
-//! `PieLoader*` structs in `driver/common/include/pie_native/load_plan.hpp`,
+//! `PieLoader*` structs in `driver/{cuda,metal}/src/loader/load_plan.hpp`,
 //! which the generated header (`loader/include/pie_loader.h`) supersedes.
 //!
 //! Two rules govern this module:
@@ -17,12 +17,11 @@
 use crate::types::{BackendKind, DType, QuantScheme, RepackLayout, RowMap};
 
 /// Sentinel for "no buffer", mirroring the C++ `numeric_limits<uint32_t>::max()`
-/// defaults on `PieLoaderStorageInstrView::buffer_id` and `slab_file_id`.
+/// default on `PieLoaderStorageInstrView::buffer_id`.
 pub const PIE_LOADER_NO_BUFFER: u32 = u32::MAX;
 
-/// The LOW IR version. A driver that reads a plan with a different version is
-/// reading a layout it was not compiled against.
-pub const PIE_LOADER_PLAN_VERSION: u32 = 5;
+/// Sentinel for "no source tensor", on the optional tensor-id fields.
+pub const PIE_LOADER_NO_TENSOR: u32 = u32::MAX;
 
 // Tile-map capability bits. A driver ORs together the transforms its kernels
 // implement and passes the result as `PieLoaderTargetSpec::tile_map_mask`; the
@@ -30,14 +29,17 @@ pub const PIE_LOADER_PLAN_VERSION: u32 = 5;
 // producing a plan the device cannot run.
 //
 // These live here, in the module that owns the C surface, because the header is
-// where they have to be correct. `crate::load_plan` re-exports them under short
-// names for use inside the compiler.
+// where they have to be correct. `crate::plan` states the same six bits.
+// Restated here rather than aliased because cbindgen emits a literal and cannot
+// follow a path — and because the arrow used to run the other way, with the
+// compiler importing its own serialization format's constants. Two independent
+// statements, checked below, is the same shape as the loader/driver cross-check
+// in `ffi/mod.rs`.
 pub const PIE_LOADER_TILE_MAP_CAST: u32 = 1 << 0;
 pub const PIE_LOADER_TILE_MAP_DECODE: u32 = 1 << 1;
 pub const PIE_LOADER_TILE_MAP_ENCODE: u32 = 1 << 2;
 pub const PIE_LOADER_TILE_MAP_TRANSCODE: u32 = 1 << 3;
 pub const PIE_LOADER_TILE_MAP_REBLOCK: u32 = 1 << 4;
-pub const PIE_LOADER_TILE_MAP_REORDER: u32 = 1 << 5;
 pub const PIE_LOADER_TILE_MAP_REPACK: u32 = 1 << 6;
 
 // Fused-chain capability bits, on the same principle: the *loader* knows what a
@@ -82,8 +84,9 @@ impl TryFrom<u32> for PieLoaderBackendKind {
 }
 
 #[repr(u32)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PieLoaderDType {
+    #[default]
     F32 = 0,
     F16 = 1,
     BF16 = 2,
@@ -98,8 +101,9 @@ pub enum PieLoaderDType {
     Bool = 11,
     // Appended after `Bool` so existing discriminants keep their values: the
     // enum is an ABI, not a declaration order.
-    I64 = 12,
-    U64 = 13,
+    E8M0 = 12,
+    I64 = 13,
+    U64 = 14,
 }
 
 impl From<DType> for PieLoaderDType {
@@ -117,6 +121,7 @@ impl From<DType> for PieLoaderDType {
             DType::U16 => Self::U16,
             DType::U8 => Self::U8,
             DType::Bool => Self::Bool,
+            DType::E8M0 => Self::E8M0,
             DType::I64 => Self::I64,
             DType::U64 => Self::U64,
         }
@@ -140,6 +145,7 @@ impl From<PieLoaderDType> for DType {
             PieLoaderDType::U16 => Self::U16,
             PieLoaderDType::U8 => Self::U8,
             PieLoaderDType::Bool => Self::Bool,
+            PieLoaderDType::E8M0 => Self::E8M0,
             PieLoaderDType::I64 => Self::I64,
             PieLoaderDType::U64 => Self::U64,
         }
@@ -300,8 +306,9 @@ impl TryFrom<u32> for PieLoaderDType {
             9 => Self::U16,
             10 => Self::U8,
             11 => Self::Bool,
-            12 => Self::I64,
-            13 => Self::U64,
+            12 => Self::E8M0,
+            13 => Self::I64,
+            14 => Self::U64,
             other => return Err(other),
         })
     }
@@ -366,19 +373,6 @@ impl TryFrom<u32> for PieLoaderRowMap {
     }
 }
 
-#[repr(u32)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PieLoaderStorageInstrKind {
-    Allocate = 0,
-    ExtentWrite = 1,
-    TileMap = 2,
-    CreateView = 3,
-    Release = 4,
-    Finalize = 5,
-    BulkExtentWrite = 6,
-    SlabScatter = 7,
-}
-
 /// `None` is the resting value for instructions that carry no tile map, so it
 /// sorts last rather than first — matching the C++ enum and the default on
 /// `PieLoaderStorageInstrView::tile_kind`.
@@ -390,21 +384,19 @@ pub enum PieLoaderTileMapKind {
     Encode = 2,
     Transcode = 3,
     Reblock = 4,
-    Reorder = 5,
     Repack = 6,
     None = 7,
 }
 
-impl From<crate::load_plan::TileMapKind> for PieLoaderTileMapKind {
-    fn from(value: crate::load_plan::TileMapKind) -> Self {
-        use crate::load_plan::TileMapKind as K;
+impl From<crate::plan::TileMapKind> for PieLoaderTileMapKind {
+    fn from(value: crate::plan::TileMapKind) -> Self {
+        use crate::plan::TileMapKind as K;
         match value {
             K::Cast => Self::Cast,
             K::Decode => Self::Decode,
             K::Encode => Self::Encode,
             K::Transcode => Self::Transcode,
             K::Reblock => Self::Reblock,
-            K::Reorder => Self::Reorder,
             K::Repack => Self::Repack,
         }
     }
@@ -423,9 +415,9 @@ pub enum PieLoaderTransformFusion {
     Fp8ToMxfp4 = 1,
 }
 
-impl From<crate::load_plan::TransformFusion> for PieLoaderTransformFusion {
-    fn from(value: crate::load_plan::TransformFusion) -> Self {
-        use crate::load_plan::TransformFusion as F;
+impl From<crate::plan::TransformFusion> for PieLoaderTransformFusion {
+    fn from(value: crate::plan::TransformFusion) -> Self {
+        use crate::plan::TransformFusion as F;
         match value {
             F::None => Self::None,
             F::Fp8ToMxfp4 => Self::Fp8ToMxfp4,
@@ -452,78 +444,9 @@ impl Default for PieLoaderBytes {
     }
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct PieLoaderU32Slice {
-    pub ptr: *const u32,
-    pub len: usize,
-}
+pub type PieLoaderU32Slice = PieLoaderSlice<u32>;
 
-impl Default for PieLoaderU32Slice {
-    fn default() -> Self {
-        Self {
-            ptr: std::ptr::null(),
-            len: 0,
-        }
-    }
-}
-
-/// One tensor the driver promises to bind after the load.
-///
-/// This is the driver's half of the contract (§10.2.1). Today the loader's
-/// `arch/` passes decide *both* what the model needs and how to build it, so a
-/// pass that invents an output name the driver never binds — or computes a shape
-/// the driver disagrees with — is caught by nothing. Declaring the demand makes
-/// `pie_loader_verify` a real check rather than a self-comparison.
-///
-/// State only what you know. `shape.len == 0` means "do not check the shape",
-/// which is the honest answer for a tensor whose runtime layout the driver reads
-/// off the loaded tensor rather than predicting. The encoding is deliberately
-/// absent from this struct: it is the loader's choice under the runtime quant
-/// policy, and binders probe it afterwards.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct PieLoaderTensorDemand {
-    pub name: PieLoaderBytes,
-    /// The shape *this rank* expects, already divided by the TP size. Empty to
-    /// demand presence without a shape.
-    pub shape: PieLoaderI64Slice,
-    /// Absence is not a violation, e.g. `lm_head.weight` under
-    /// `tie_word_embeddings`.
-    pub optional: bool,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct PieLoaderTensorDemandSlice {
-    pub ptr: *const PieLoaderTensorDemand,
-    pub len: usize,
-}
-
-impl Default for PieLoaderTensorDemandSlice {
-    fn default() -> Self {
-        Self {
-            ptr: std::ptr::null(),
-            len: 0,
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct PieLoaderI64Slice {
-    pub ptr: *const i64,
-    pub len: usize,
-}
-
-impl Default for PieLoaderI64Slice {
-    fn default() -> Self {
-        Self {
-            ptr: std::ptr::null(),
-            len: 0,
-        }
-    }
-}
+pub type PieLoaderI64Slice = PieLoaderSlice<i64>;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -535,12 +458,14 @@ pub struct PieLoaderDimSpecView {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
-pub struct PieLoaderDimSpecSlice {
-    pub ptr: *const PieLoaderDimSpecView,
+pub struct PieLoaderSlice<T> {
+    pub ptr: *const T,
     pub len: usize,
 }
 
-impl Default for PieLoaderDimSpecSlice {
+pub type PieLoaderDimSpecSlice = PieLoaderSlice<PieLoaderDimSpecView>;
+
+impl<T> Default for PieLoaderSlice<T> {
     fn default() -> Self {
         Self {
             ptr: std::ptr::null(),
@@ -565,6 +490,12 @@ pub struct PieLoaderSourceExtentView {
     pub file_offset: u64,
     pub span_bytes: u64,
     pub stride: PieLoaderStridedExtentView,
+    /// The type these bytes are read as. Not necessarily
+    /// `PieLoaderPlan::sources[tensor_id].dtype`: a contract that reinterprets
+    /// a tensor with `Bitcast` -- DeepSeek-V4's E8M0 block scales are stored
+    /// as `U8` -- says so here, and an executor that consulted the source
+    /// table instead would undo the reinterpretation.
+    pub dtype: PieLoaderDType,
 }
 
 #[repr(C)]
@@ -589,26 +520,13 @@ pub struct PieLoaderTensorDeclView {
     pub alignment: u32,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct PieLoaderTensorDeclSlice {
-    pub ptr: *const PieLoaderTensorDeclView,
-    pub len: usize,
-}
-
-impl Default for PieLoaderTensorDeclSlice {
-    fn default() -> Self {
-        Self {
-            ptr: std::ptr::null(),
-            len: 0,
-        }
-    }
-}
+pub type PieLoaderTensorDeclSlice = PieLoaderSlice<PieLoaderTensorDeclView>;
 
 /// How a scale tensor's entries map onto the tensor they scale.
 #[repr(u32)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PieLoaderQuantGranularity {
+    #[default]
     PerChannel = 0,
     PerGroup = 1,
 }
@@ -619,9 +537,10 @@ pub enum PieLoaderQuantGranularity {
 /// not how the kernel wants them. The driver used to infer this from
 /// `group_size == 32`.
 #[repr(u32)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PieLoaderScaleForm {
     /// Raw E8M0 exponent bytes, consumed as-is.
+    #[default]
     RawE8M0 = 0,
     /// F32 multipliers; expand before the GEMM sees them.
     F32Factors = 1,
@@ -632,8 +551,7 @@ pub enum PieLoaderScaleForm {
 /// Both are entries in [`PieLoaderPlan::tensors`], named by `id`. The driver has
 /// to know the pairing in order to attach the quant metadata its kernels read;
 /// it used to rediscover it by matching name suffixes over the tensor list,
-/// which guessed at something the loader states here (`load_plan.rs`'s
-/// `derive_quant_attachments`).
+/// which guessed at something stated here.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct PieLoaderQuantAttachmentView {
@@ -645,37 +563,7 @@ pub struct PieLoaderQuantAttachmentView {
     pub scale_form: PieLoaderScaleForm,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct PieLoaderQuantAttachmentSlice {
-    pub ptr: *const PieLoaderQuantAttachmentView,
-    pub len: usize,
-}
-
-impl Default for PieLoaderQuantAttachmentSlice {
-    fn default() -> Self {
-        Self {
-            ptr: std::ptr::null(),
-            len: 0,
-        }
-    }
-}
-
-/// How much of the caller's declared contract the plan delivers.
-///
-/// `covered < demanded` means the loader did not build something the driver said
-/// it would bind. An absent *optional* demand is dropped from both counts rather
-/// than only from `covered`, so a tied-embedding checkpoint that legitimately
-/// has no `lm_head.weight` still reports full coverage.
-///
-/// A driver that declared nothing gets `0 / 0`, which passes — the declaration
-/// is opt-in per model family, not a flag day.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct PieLoaderContractCoverageView {
-    pub covered: usize,
-    pub demanded: usize,
-}
+pub type PieLoaderQuantAttachmentSlice = PieLoaderSlice<PieLoaderQuantAttachmentView>;
 
 /// Which on-disk format a checkpoint file uses.
 #[repr(u32)]
@@ -708,21 +596,7 @@ pub struct PieLoaderCheckpointFileView {
     pub format: PieLoaderCheckpointFormat,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct PieLoaderCheckpointFileSlice {
-    pub ptr: *const PieLoaderCheckpointFileView,
-    pub len: usize,
-}
-
-impl Default for PieLoaderCheckpointFileSlice {
-    fn default() -> Self {
-        Self {
-            ptr: std::ptr::null(),
-            len: 0,
-        }
-    }
-}
+pub type PieLoaderCheckpointFileSlice = PieLoaderSlice<PieLoaderCheckpointFileView>;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -740,21 +614,7 @@ pub struct PieLoaderSourceTensorView {
     pub shape: PieLoaderI64Slice,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct PieLoaderSourceTensorSlice {
-    pub ptr: *const PieLoaderSourceTensorView,
-    pub len: usize,
-}
-
-impl Default for PieLoaderSourceTensorSlice {
-    fn default() -> Self {
-        Self {
-            ptr: std::ptr::null(),
-            len: 0,
-        }
-    }
-}
+pub type PieLoaderSourceTensorSlice = PieLoaderSlice<PieLoaderSourceTensorView>;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -769,149 +629,113 @@ pub struct PieLoaderBufferDeclView {
     pub persistent_offset: u64,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct PieLoaderBufferDeclSlice {
-    pub ptr: *const PieLoaderBufferDeclView,
-    pub len: usize,
-}
+pub type PieLoaderBufferDeclSlice = PieLoaderSlice<PieLoaderBufferDeclView>;
 
-impl Default for PieLoaderBufferDeclSlice {
-    fn default() -> Self {
-        Self {
-            ptr: std::ptr::null(),
-            len: 0,
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PieLoaderSlabPlacementView {
-    pub src_offset: u64,
-    pub dest_offset: u64,
-    pub bytes: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct PieLoaderSlabPlacementSlice {
-    pub ptr: *const PieLoaderSlabPlacementView,
-    pub len: usize,
-}
-
-impl Default for PieLoaderSlabPlacementSlice {
-    fn default() -> Self {
-        Self {
-            ptr: std::ptr::null(),
-            len: 0,
-        }
-    }
-}
-
-/// The flattened instruction. Rust's `StorageInstr` is a sum type whose variants
-/// carry disjoint payloads; C has no such thing, so this is the union of all
-/// variants with `kind` as the tag and `has_source`/`has_dest` marking which
-/// optional members are live. Members a given `kind` does not use keep their
-/// resting values.
+/// One entry of the plan's instruction stream: an identity, and an operation.
+///
+/// `id` is the schedule's handle on this instruction and is the only thing every
+/// instruction has. Everything else belongs to one operation, and lives inside
+/// it.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct PieLoaderStorageInstrView {
     pub id: u32,
-    pub kind: PieLoaderStorageInstrKind,
-    pub buffer_id: u32,
-    pub source: PieLoaderSourceExtentView,
-    pub has_source: bool,
-    pub dest: PieLoaderDestExtentView,
-    pub has_dest: bool,
-    pub input_buffers: PieLoaderU32Slice,
-    pub output_buffers: PieLoaderU32Slice,
-    pub tile_kind: PieLoaderTileMapKind,
-    /// Rows of the output to transform per launch; `0` means the whole tensor in
-    /// one pass.
-    ///
-    /// This is where the driver's `max_tile_bytes` budget ends up. The budget
-    /// itself does not cross the boundary: the driver stated it in the request,
-    /// the loader answered with a row count in `backend::lower`, and sending the
-    /// question back alongside the answer would only invite the executor to
-    /// re-derive it (§8.1).
-    pub rows_per_tile: u32,
-    /// A transform chain the backend collapsed into one kernel.
-    pub transform_fusion: PieLoaderTransformFusion,
-    pub transform_from: PieLoaderQuantScheme,
-    pub transform_to: PieLoaderQuantScheme,
-    pub repack_layout: PieLoaderRepackLayout,
-    pub row_map: PieLoaderRowMap,
-    pub transform_batch: u32,
-    pub transform_source_rows: u32,
-    pub transform_source_row_offset: u32,
-    pub transform_target_rows: u32,
-    pub transform_valid_rows: u32,
-    pub transform_source_stride_cols: u32,
-    pub transform_source_col_offset: u32,
-    pub transform_source_cols: u32,
-    pub transform_target_cols: u32,
-    pub transform_scratch_bytes: u64,
-    pub name: PieLoaderBytes,
-    pub slab_file_id: u32,
-    pub slab_file_offset: u64,
-    pub slab_span_bytes: u64,
-    pub slab_placements: PieLoaderSlabPlacementSlice,
+    pub op: PieLoaderStorageOp,
 }
 
-impl Default for PieLoaderStorageInstrView {
-    fn default() -> Self {
-        Self {
-            id: 0,
-            kind: PieLoaderStorageInstrKind::Allocate,
-            buffer_id: PIE_LOADER_NO_BUFFER,
-            source: PieLoaderSourceExtentView::default(),
-            has_source: false,
-            dest: PieLoaderDestExtentView::default(),
-            has_dest: false,
-            input_buffers: PieLoaderU32Slice::default(),
-            output_buffers: PieLoaderU32Slice::default(),
-            tile_kind: PieLoaderTileMapKind::None,
-            rows_per_tile: 0,
-            transform_fusion: PieLoaderTransformFusion::None,
-            transform_from: PieLoaderQuantScheme::None,
-            transform_to: PieLoaderQuantScheme::None,
-            repack_layout: PieLoaderRepackLayout::None,
-            row_map: PieLoaderRowMap::Identity,
-            transform_batch: 0,
-            transform_source_rows: 0,
-            transform_source_row_offset: 0,
-            transform_target_rows: 0,
-            transform_valid_rows: 0,
-            transform_source_stride_cols: 0,
-            transform_source_col_offset: 0,
-            transform_source_cols: 0,
-            transform_target_cols: 0,
-            transform_scratch_bytes: 0,
-            name: PieLoaderBytes::default(),
-            slab_file_id: PIE_LOADER_NO_BUFFER,
-            slab_file_offset: 0,
-            slab_span_bytes: 0,
-            slab_placements: PieLoaderSlabPlacementSlice::default(),
-        }
-    }
-}
-
-#[repr(C)]
+/// What an instruction does, as a tagged union carrying only that operation's
+/// operands.
+///
+/// This mirrors `crate::plan::StorageInstr` variant for variant. It was a flat
+/// struct of 32 members with a `kind` tag until every reader had grown a
+/// defence against the members that tag left meaningless: `if (!instr.has_source
+/// || !instr.has_dest)` in three executors, `inputs.size() != 1` around a
+/// `CreateView` whose input count is one by construction, and a comment in
+/// `ffi::view` explaining that a resting `source` "would look like a valid
+/// reference to file 0". Those are invariants a union states and a product type
+/// can only apologise for.
+///
+/// The discriminants are the wire tag and are written out for the same reason
+/// the mirror enums' are — 4 and 7 are absent because retired instructions had
+/// them, and renumbering to close a gap would silently move every tag above it.
+#[repr(C, u32)]
 #[derive(Clone, Copy, Debug)]
-pub struct PieLoaderStorageInstrSlice {
-    pub ptr: *const PieLoaderStorageInstrView,
-    pub len: usize,
+pub enum PieLoaderStorageOp {
+    Allocate {
+        buffer_id: u32,
+    } = 0,
+    ExtentWrite {
+        source: PieLoaderSourceExtentView,
+        dest: PieLoaderDestExtentView,
+    } = 1,
+    TileMap {
+        tile_kind: PieLoaderTileMapKind,
+        /// A tile map reads a checkpoint tensor, or transforms a buffer already
+        /// on the device. `has_source` says which; the other seven operations no
+        /// longer have to carry the question.
+        source: PieLoaderSourceExtentView,
+        has_source: bool,
+        dest: PieLoaderDestExtentView,
+        has_dest: bool,
+        input_buffers: PieLoaderU32Slice,
+        output_buffers: PieLoaderU32Slice,
+        /// Rows of the output to transform per launch; `0` means the whole
+        /// tensor in one pass.
+        ///
+        /// This is where the driver's `max_tile_bytes` budget ends up. The
+        /// budget itself does not cross the boundary: the driver stated it in
+        /// the request, the loader answered with a row count in
+        /// `backend::lower`, and sending the question back alongside the answer
+        /// would only invite the executor to re-derive it (§8.1).
+        rows_per_tile: u32,
+        /// A transform chain the backend collapsed into one kernel.
+        transform_fusion: PieLoaderTransformFusion,
+        transform_from: PieLoaderQuantScheme,
+        transform_to: PieLoaderQuantScheme,
+        repack_layout: PieLoaderRepackLayout,
+        row_map: PieLoaderRowMap,
+        transform_batch: u32,
+        transform_source_rows: u32,
+        transform_source_row_offset: u32,
+        transform_target_rows: u32,
+        transform_valid_rows: u32,
+        transform_source_stride_cols: u32,
+        transform_source_col_offset: u32,
+        transform_source_cols: u32,
+        transform_target_cols: u32,
+        transform_scratch_bytes: u64,
+        /// Source tensor holding this transform's input block scales, or
+        /// [`PIE_LOADER_NO_TENSOR`].
+        ///
+        /// Index into `PieLoaderPlan::sources`, the same space
+        /// `source.tensor_id` uses, so the executor reaches the scales' name and
+        /// shape the way it reaches the payload's — instead of appending
+        /// `_scale_inv` to a name and hoping the checkpoint agrees.
+        transform_metadata_source: u32,
+    } = 2,
+    CreateView {
+        input_buffer: u32,
+        output_buffer: u32,
+        view: PieLoaderDestExtentView,
+    } = 3,
+    Finalize {
+        buffer_id: u32,
+        name: PieLoaderBytes,
+    } = 5,
+    /// The destination is an offset into the persistent arena, not a buffer.
+    /// The flat form had to fabricate a rank-1 `dest` extent per instruction —
+    /// an arena allocation whose only content the executor ever read was
+    /// `dest.offset`.
+    BulkExtentWrite {
+        source: PieLoaderSourceExtentView,
+        dest_offset: u64,
+    } = 6,
+    Fill {
+        buffer_id: u32,
+    } = 8,
 }
 
-impl Default for PieLoaderStorageInstrSlice {
-    fn default() -> Self {
-        Self {
-            ptr: std::ptr::null(),
-            len: 0,
-        }
-    }
-}
+pub type PieLoaderStorageInstrSlice = PieLoaderSlice<PieLoaderStorageInstrView>;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -921,37 +745,6 @@ pub struct PieLoaderMemoryPlanView {
     pub transform_scratch_peak_bytes: u64,
     pub checkpoint_read_bytes: u64,
     pub device_write_bytes: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct PieLoaderOptimizerPassStatsView {
-    pub name: PieLoaderBytes,
-    pub exprs_before: u64,
-    pub exprs_after: u64,
-    pub rewrites: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct PieLoaderOptimizerPassStatsSlice {
-    pub ptr: *const PieLoaderOptimizerPassStatsView,
-    pub len: usize,
-}
-
-impl Default for PieLoaderOptimizerPassStatsSlice {
-    fn default() -> Self {
-        Self {
-            ptr: std::ptr::null(),
-            len: 0,
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct PieLoaderOptimizerReportView {
-    pub passes: PieLoaderOptimizerPassStatsSlice,
 }
 
 /// The target the plan was compiled against. The driver reads it back to assert
@@ -973,8 +766,8 @@ pub struct PieLoaderTargetView {
     pub block_scale_rows: u32,
 }
 
-impl From<&crate::load_plan::StorageTarget> for PieLoaderTargetView {
-    fn from(value: &crate::load_plan::StorageTarget) -> Self {
+impl From<&crate::plan::StorageTarget> for PieLoaderTargetView {
+    fn from(value: &crate::plan::StorageTarget) -> Self {
         Self {
             backend: value.backend.into(),
             tp_rank: value.tp_rank,
@@ -1005,7 +798,6 @@ impl From<&crate::load_plan::StorageTarget> for PieLoaderTargetView {
 #[repr(C)]
 #[derive(Debug)]
 pub struct PieLoaderPlan {
-    pub version: u32,
     pub files: PieLoaderCheckpointFileSlice,
     pub sources: PieLoaderSourceTensorSlice,
     pub tensors: PieLoaderTensorDeclSlice,
@@ -1013,12 +805,9 @@ pub struct PieLoaderPlan {
     pub instrs: PieLoaderStorageInstrSlice,
     pub schedule: PieLoaderU32Slice,
     pub memory: PieLoaderMemoryPlanView,
-    pub optimizer: PieLoaderOptimizerReportView,
     pub compiler_version: u64,
     pub target: PieLoaderTargetView,
     pub attachments: PieLoaderQuantAttachmentSlice,
-    /// Measured against `PieLoaderRequest::demands` at compile time.
-    pub coverage: PieLoaderContractCoverageView,
     /// The name of the materialized weights this plan produces, as 16 hex
     /// digits. Stable for as long as nothing that decides the bytes changes, so
     /// a driver can use it to key an artifact cache.
@@ -1031,3 +820,19 @@ pub struct PieLoaderPlan {
     pub stats_json: PieLoaderBytes,
     pub owner: *mut std::ffi::c_void,
 }
+
+/// The ABI's bits and the plan's are the same bits.
+///
+/// A build error here means someone added a transform on one side only, which
+/// is the drift `PieLoaderTileMapKind::capability_bit` would otherwise turn
+/// into a mis-dispatched kernel.
+const _: () = {
+    use crate::plan as p;
+    assert!(PIE_LOADER_TILE_MAP_CAST == p::TILE_MAP_CAST);
+    assert!(PIE_LOADER_TILE_MAP_DECODE == p::TILE_MAP_DECODE);
+    assert!(PIE_LOADER_TILE_MAP_ENCODE == p::TILE_MAP_ENCODE);
+    assert!(PIE_LOADER_TILE_MAP_TRANSCODE == p::TILE_MAP_TRANSCODE);
+    assert!(PIE_LOADER_TILE_MAP_REBLOCK == p::TILE_MAP_REBLOCK);
+    assert!(PIE_LOADER_TILE_MAP_REPACK == p::TILE_MAP_REPACK);
+    assert!(PIE_LOADER_FUSION_FP8_TO_MXFP4 == p::FUSION_FP8_TO_MXFP4);
+};

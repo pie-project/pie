@@ -39,6 +39,22 @@ __global__ void cast_bf16_to_fp32_kernel(
     dst[i] = __bfloat162float(src[i]);
 }
 
+// E8M0 stores an exponent and nothing else: byte `b` denotes `2^(b - 127)`,
+// with `0xFF` reserved for NaN. That is the fp32 exponent field verbatim, so
+// the decode is a shift rather than any arithmetic -- `b << 23` *is* the
+// answer, and `exp2f` would be a slower way to write it.
+__global__ void cast_e8m0_to_fp32_kernel(
+    const std::uint8_t* __restrict__ src,
+    float*              __restrict__ dst,
+    std::size_t                      n)
+{
+    const std::size_t i = static_cast<std::size_t>(blockIdx.x) * BLOCK + threadIdx.x;
+    if (i >= n) return;
+    const std::uint32_t bits = static_cast<std::uint32_t>(src[i]);
+    dst[i] = bits == 0xFFu ? __int_as_float(0x7FFFFFFF)
+                           : __int_as_float(bits << 23);
+}
+
 }  // namespace
 
 void launch_cast_fp16_to_bf16(
@@ -71,6 +87,17 @@ void launch_cast_bf16_to_fp32(
     const auto blocks = static_cast<unsigned>((n + BLOCK - 1) / BLOCK);
     cast_bf16_to_fp32_kernel<<<blocks, BLOCK, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(src_bf16),
+        static_cast<float*>(dst_fp32), n);
+}
+
+void launch_cast_e8m0_to_fp32(
+    const void* src_e8m0, void* dst_fp32,
+    std::size_t n, cudaStream_t stream)
+{
+    if (n == 0) return;
+    const auto blocks = static_cast<unsigned>((n + BLOCK - 1) / BLOCK);
+    cast_e8m0_to_fp32_kernel<<<blocks, BLOCK, 0, stream>>>(
+        static_cast<const std::uint8_t*>(src_e8m0),
         static_cast<float*>(dst_fp32), n);
 }
 

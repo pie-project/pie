@@ -1,0 +1,4 @@
+[package]
+name = "gdn-foldcommit"
+version = "0.1.0"
+description = "Test inferlet: FOLD-COMMIT on a linear model — prefill folds, a chunk is buffered without folding, then the accepted prefix is folded from the buffer"

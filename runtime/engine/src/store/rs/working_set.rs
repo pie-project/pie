@@ -152,13 +152,14 @@ mod tests {
         registry::register_model(16, &[0], &[capacity])
     }
 
-    /// Prepare + commit a fresh folded-state write (mirrors
+    /// Prepare + publish a fresh folded-state write (mirrors
     /// `store::rs::tests::write_state`): consumes exactly one RS pool slot.
-    fn commit_state_write(model: usize, id: RsWorkingSetId, epoch: u64) {
+    fn commit_state_write(model: usize, id: RsWorkingSetId, _epoch: u64) {
         let stores = registry::get(model, 0);
         let mut rs = stores.rs.lock().unwrap();
         let prepared = rs.prepare_write(id, true, None).unwrap();
-        rs.commit(prepared, epoch).unwrap();
+        let published = rs.publish_prepared(prepared).unwrap();
+        rs.settle(published);
     }
 
     #[test]

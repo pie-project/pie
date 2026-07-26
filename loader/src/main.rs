@@ -13,7 +13,7 @@
 //!
 //! `CONTRACT` is a JSON [`ModelContract`] — what the tool holds instead of a
 //! model's name, because the loader does not have families any more. A driver
-//! authors one in C++ (`driver/common/include/pie_driver/model_contracts.hpp`);
+//! authors one in C++ (`driver/*/src/model/<family>/<family>_contract.hpp`);
 //! `loader/tests/golden/contracts/` holds the ones the tests use.
 //!
 //! `replay` is the strongest statement the loader can make about itself
@@ -33,17 +33,18 @@ use pie_loader::checkpoint::CheckpointMetadata;
 use pie_loader::checkpoint::read::parse_checkpoint_metadata;
 use pie_loader::contract::ModelContract;
 use pie_loader::dump::dump_load_plan_json;
-use pie_loader::error::CompileError;
-use pie_loader::load_plan::{
+use pie_loader::error::Error;
+use pie_loader::ffi::view::verify_marshalled;
+use pie_loader::plan::compile as compile_load_plan;
+use pie_loader::plan::{
     CUDA_TILE_MAP_MASK, FUSION_FP8_TO_MXFP4, HOST_TILE_MAP_MASK, LoadPlan, METAL_TILE_MAP_MASK,
     StorageTarget,
 };
-use pie_loader::planner::compile_load_plan;
 use pie_loader::types::{BackendKind, DType};
-use pie_loader::verify::{ContractView, PlanView, verify};
+use pie_loader::verify::ContractView;
 
 const USAGE: &str = "\
-usage: pie-loader <command> SNAPSHOT CONTRACT [BACKEND] [FUSION] [TP]
+usage: pie-loader <command> SNAPSHOT CONTRACT [BACKEND] [FUSION] [TP] [TARGET]
 
 commands:
   dump   SNAPSHOT CONTRACT          compile and print the plan as JSON
@@ -57,6 +58,10 @@ options (positional, all optional):
   BACKEND        cuda | metal | host             (default cuda)
   FUSION         fused | unfused                 (default: fused on cuda)
   TP             RANK/SIZE                       (default 0/1)
+  TARGET         a JSON StorageTarget            (default: a CUDA-shaped stand-in)
+
+Pass TARGET to reproduce one driver's plan exactly; the built-in default is a
+copy of CUDA's numbers that nothing keeps up to date.
 ";
 
 fn main() -> ExitCode {
@@ -79,8 +84,8 @@ enum Fail {
     Failed(String),
 }
 
-impl From<CompileError> for Fail {
-    fn from(error: CompileError) -> Self {
+impl From<Error> for Fail {
+    fn from(error: Error) -> Self {
         Fail::Failed(error.to_string())
     }
 }
@@ -136,6 +141,9 @@ struct Options {
     fused_transcode: bool,
     tp_rank: u32,
     tp_size: u32,
+    /// A driver's own `StorageTarget`, read from JSON, or none for the built-in
+    /// stand-in.
+    target: Option<StorageTarget>,
 }
 
 impl Options {
@@ -178,15 +186,42 @@ impl Options {
                 "TP {tp_rank}/{tp_size} is not a rank of a world"
             )));
         }
+        // The driver's own target, when the caller has one. Same argument as
+        // `read_contract_file`: a tool that reproduces a driver's plan has to
+        // reproduce the driver's *target*, and the only way to be sure is to be
+        // handed it rather than to keep a copy of it here.
+        let target =
+            match args.next() {
+                None => None,
+                Some(path) => {
+                    let text = std::fs::read_to_string(path)
+                        .map_err(|err| Fail::Failed(format!("cannot read target {path}: {err}")))?;
+                    Some(serde_json::from_str(&text).map_err(|err| {
+                        Fail::Failed(format!("cannot parse target {path}: {err}"))
+                    })?)
+                }
+            };
         Ok(Self {
             backend,
             fused_transcode,
             tp_rank,
             tp_size,
+            target,
         })
     }
 
+    /// The target to compile against.
+    ///
+    /// Without a target file this is a *stand-in*, not a claim: the numbers are
+    /// CUDA's as of writing, and nothing keeps them equal to
+    /// `driver/cuda/src/loader/load_plan.hpp`. They live here rather than in the
+    /// library because a device constant inside the compiler is the thing §9
+    /// removed, and `tests/standalone.rs` enforces that. Pass a target file to
+    /// reproduce a specific driver exactly.
     fn target(&self) -> StorageTarget {
+        if let Some(target) = &self.target {
+            return target.clone();
+        }
         StorageTarget {
             backend: self.backend,
             tp_rank: self.tp_rank,
@@ -204,9 +239,6 @@ impl Options {
             } else {
                 0
             },
-            // The two device constants a CLI has to stand in for. They are
-            // CUDA's, because a tool that reproduces a driver's plan has to
-            // reproduce the driver's target, and no other backend states any.
             encode_scratch_dtype: DType::BF16,
             block_scale_rows: 128,
         }
@@ -240,7 +272,7 @@ fn dump(snapshot: &Path, contract: &ModelContract, options: &Options) -> Result<
 
 fn run_verify(snapshot: &Path, contract: &ModelContract, options: &Options) -> Result<(), Fail> {
     let plan = compile(snapshot, contract, options)?;
-    match verify(&PlanView::from(&plan), Some(&ContractView::of(contract))) {
+    match verify_marshalled(&plan, Some(&ContractView::of(contract))) {
         Ok(certificate) => {
             println!("{certificate}");
             Ok(())
@@ -303,8 +335,8 @@ fn diff(
 fn replay(snapshot: &Path, contract: &ModelContract, options: &Options) -> Result<(), Fail> {
     let plan = compile(snapshot, contract, options)?;
     let started = Instant::now();
-    let storage = pie_loader::host::execute_plan(&plan, snapshot)?;
-    let bytes: usize = storage.tensors.values().map(|t| t.bytes.len()).sum();
+    let storage = pie_loader::host_executor::execute_plan(&plan, snapshot)?;
+    let bytes: usize = storage.tensors.values().map(Vec::len).sum();
     eprintln!(
         "replayed {} tensors ({bytes} bytes materialized, {} arena bytes) in {:?}",
         storage.tensors.len(),
@@ -316,11 +348,7 @@ fn replay(snapshot: &Path, contract: &ModelContract, options: &Options) -> Resul
     names.sort();
     for name in names {
         let tensor = &storage.tensors[name];
-        println!(
-            "{name}\t{}\t{:016x}",
-            tensor.bytes.len(),
-            checksum(&tensor.bytes)
-        );
+        println!("{name}\t{}\t{:016x}", tensor.len(), checksum(tensor));
     }
     Ok(())
 }

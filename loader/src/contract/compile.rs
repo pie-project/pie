@@ -13,8 +13,10 @@
 
 use std::collections::HashMap;
 
-use super::{Checked, Expr};
-use crate::error::CompileError;
+use super::infer::Checked;
+use super::{Expr, resolve_reshape};
+use crate::error::{Error, OrOverflow};
+use crate::extent::{Dim, Rect};
 use crate::types::Encoding;
 
 /// Maximum tensor rank the walker supports. GPT-OSS MXFP4 blocks are rank 4;
@@ -76,11 +78,20 @@ impl Lowering {
     ///
     /// Count [`Lowering::pieces`] instead when the executor can issue strided
     /// copies — a row shard is thousands of runs but one piece.
+    ///
+    /// Nothing on the load path reads this: [`Lowering::cost`] is what picks a
+    /// lowering. It is here so this module's own tests can state the shape they
+    /// expect — "a row shard of a fused bank is 2048 runs averaging 3072
+    /// elements" is a claim about the algebra, and asserting it directly is how
+    /// a regression in `compile` shows up as a failing number rather than as a
+    /// slower plan nobody times.
     pub fn run_count(&self) -> usize {
         self.runs.len()
     }
 
     /// Mean run length in elements, or 0 for an empty lowering.
+    ///
+    /// Test observability, as [`Lowering::run_count`] is.
     pub fn mean_run_elements(&self) -> i64 {
         if self.runs.is_empty() {
             0
@@ -95,7 +106,7 @@ impl Lowering {
     /// per row — thousands of them — but every row is the same length and the
     /// source and destination both advance by a fixed stride, so the whole
     /// thing is a single rectangular copy. That is exactly what the low IR's
-    /// `StridedExtent` expresses, and emitting the unfolded run list instead
+    /// `Extent` expresses, and emitting the unfolded run list instead
     /// would inflate the plan by three orders of magnitude for every sharded
     /// tensor in the model.
     ///
@@ -113,9 +124,21 @@ impl Lowering {
     ///
     /// This is the cost model of `spec.md` §3.3, and it is known before any I/O
     /// happens. A whole tensor, a row shard and a strided expert select all
-    /// cost 1; a fusion of three sources costs 3; an expression the affine
-    /// fragment cannot fold costs one copy per stretch, which is the signal
-    /// that a gather kernel is the right lowering.
+    /// cost 1; a fusion of three sources costs 3.
+    ///
+    /// `plan/build.rs` reads it to decide a lowering: cost 1 is one rectangle
+    /// covering the whole destination, so the tensor aliases the checkpoint
+    /// bytes or views a buffer instead of copying. That is the cheapest thing
+    /// the loader does and it is this number that selects it.
+    ///
+    /// It does *not* decide whether to slab-scatter. That choice weighs one
+    /// over-read against many small reads, so its inputs are the gaps between
+    /// source ranges and the ratio of span to payload — and it coalesces
+    /// *across tensors*, sorted by file offset. A `Lowering` is one tensor's
+    /// expression and has neither, which is why the decision lives in
+    /// `plan/passes/rewrite.rs` after the offsets are assigned, and why
+    /// `spec.md` §3.3 calls its thresholds a loader policy rather than a
+    /// function of the algebra.
     pub fn cost(&self) -> usize {
         self.copy_pieces().len() + usize::from(self.needs_zero_fill())
     }
@@ -123,10 +146,15 @@ impl Lowering {
     /// The pieces that actually move data.
     ///
     /// A hole is not produced by copying zeros into the destination; it is
-    /// produced by zeroing the destination once and then not writing there. So
-    /// padding costs one fill, not one copy per band — and dropping the holes
-    /// lets the data on either side of one fold together, which is the
-    /// difference between `2·n_heads` copies and one for a head-dim pad.
+    /// produced by zeroing the destination once and then not writing there, so
+    /// padding costs one fill rather than one copy per band. For a head-dim
+    /// pad that halves the piece count: `2·n_heads` alternating data and zero
+    /// runs become `n_heads` data runs and one fill.
+    ///
+    /// They do not fold further. The destination stride across a padded row is
+    /// wider than the row, and `fold` refuses a destination that skips — see
+    /// `spec.md` §3.3, whose cost table prices exactly this case (a `[4, 4]`
+    /// padded by one column) at 5.
     pub fn copy_pieces(&self) -> Vec<Piece> {
         fold(
             self.runs
@@ -144,7 +172,7 @@ impl Lowering {
     }
 
     /// Convert to byte offsets under `encoding`.
-    pub fn byte_runs(&self, encoding: &Encoding) -> Result<Vec<ByteRun>, CompileError> {
+    pub fn byte_runs(&self, encoding: &Encoding) -> Result<Vec<ByteRun>, Error> {
         let scale = ByteScale::of(encoding);
         self.runs
             .iter()
@@ -166,9 +194,9 @@ impl Lowering {
 
     /// The copy pieces with every offset, stride and extent converted to bytes.
     ///
-    /// This is the form the low IR wants: `load_plan::StridedExtent` addresses
+    /// This is the form the low IR wants: `load_plan::Extent` addresses
     /// bytes, and a sub-byte encoding has no element addresses to speak of.
-    pub fn byte_pieces(&self, encoding: &Encoding) -> Result<Vec<BytePiece>, CompileError> {
+    pub fn byte_pieces(&self, encoding: &Encoding) -> Result<Vec<Rect>, Error> {
         let scale = ByteScale::of(encoding);
         self.copy_pieces()
             .into_iter()
@@ -199,8 +227,8 @@ impl Lowering {
                             dst_stride: scale.stride(dim.dst_stride, "destination stride")?,
                         })
                     })
-                    .collect::<Result<Vec<_>, CompileError>>()?;
-                Ok(BytePiece {
+                    .collect::<Result<Vec<_>, Error>>()?;
+                Ok(Rect {
                     leaf,
                     src_offset: scale.offset(src_elem, "piece source")?,
                     dst_offset: scale.offset(piece.dst_elem, "piece destination")?,
@@ -209,15 +237,6 @@ impl Lowering {
             })
             .collect()
     }
-}
-
-/// One [`Piece`] with byte addresses. The innermost `dims` entry counts bytes.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BytePiece {
-    pub leaf: usize,
-    pub src_offset: u64,
-    pub dst_offset: u64,
-    pub dims: Vec<Dim>,
 }
 
 /// Element index to byte offset, for one encoding.
@@ -237,12 +256,12 @@ impl ByteScale {
         }
     }
 
-    fn scaled(&self, elems: i64, what: &str) -> Result<i64, CompileError> {
+    fn scaled(&self, elems: i64, what: &str) -> Result<i64, Error> {
         let total = elems
             .checked_mul(self.bits)
-            .ok_or_else(|| CompileError::InvalidInput("byte offset overflows".to_string()))?;
+            .or_overflow("byte offset overflows")?;
         if total % 8 != 0 {
-            return Err(CompileError::InvalidInput(format!(
+            return Err(Error::Contract(format!(
                 "{what} of {elems} elements is not byte-aligned under a {} -bit encoding",
                 self.bits
             )));
@@ -250,16 +269,19 @@ impl ByteScale {
         Ok(total / 8)
     }
 
-    fn offset(&self, elems: i64, what: &str) -> Result<u64, CompileError> {
-        u64::try_from(self.scaled(elems, what)?)
-            .map_err(|_| CompileError::InvalidInput("negative byte offset".to_string()))
+    fn offset(&self, elems: i64, what: &str) -> Result<u64, Error> {
+        u64::try_from(self.scaled(elems, what)?).map_err(|_| {
+            Error::Internal(format!(
+                "{what} lowered to a negative byte offset from {elems} elements"
+            ))
+        })
     }
 
-    fn extent(&self, elems: i64, what: &str) -> Result<u64, CompileError> {
+    fn extent(&self, elems: i64, what: &str) -> Result<u64, Error> {
         self.offset(elems, what)
     }
 
-    fn stride(&self, elems: i64, what: &str) -> Result<i64, CompileError> {
+    fn stride(&self, elems: i64, what: &str) -> Result<i64, Error> {
         self.scaled(elems, what)
     }
 }
@@ -284,7 +306,7 @@ pub enum ByteRunSource {
 /// `dst_elem + Σ iₖ·dst_strideₖ`. The innermost dimension always has unit
 /// strides, so every piece ends in a contiguous stretch.
 ///
-/// This is the shape `load_plan::StridedExtent` already carries, which is why
+/// This is the shape `load_plan::Extent` already carries, which is why
 /// the fold exists: it is the difference between one instruction and one
 /// instruction per row.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -292,13 +314,6 @@ pub struct Piece {
     pub source: RunSource,
     pub dst_elem: i64,
     pub dims: Vec<Dim>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Dim {
-    pub count: i64,
-    pub src_stride: i64,
-    pub dst_stride: i64,
 }
 
 impl Piece {
@@ -348,6 +363,14 @@ fn fold_once(items: &[Piece]) -> Option<Vec<Piece>> {
             // a scatter, and nothing below this layer can execute one. See
             // `spec.md` §3.3.
             && strides.1 == head.elements()
+            // The source must advance forward. A plan addresses its source as
+            // a span starting at `file_offset`, so a descending progression
+            // would read below that anchor. Such a run is a perfectly good
+            // rectangle — it just is not one this ABI can name, and the pieces
+            // are individually copyable, so leave them unfolded. `Cat` in
+            // descending source order (e.g. re-joining a fused gate/up weight
+            // as `[up | gate]`) is the case that reaches this.
+            && strides.0 >= 0
         {
             (src_stride, dst_stride) = strides;
             end = at + 2;
@@ -419,7 +442,7 @@ pub fn bits_per_element(encoding: &Encoding) -> u32 {
 /// cannot make the compiler allocate without limit. It is *not* the cost
 /// model — a row shard is thousands of runs and one copy. Ask
 /// [`Lowering::cost`] what the expression actually costs.
-pub fn compile(expr: &Expr, checked: &Checked, max_runs: usize) -> Result<Lowering, CompileError> {
+pub fn compile(expr: &Expr, checked: &Checked, max_runs: usize) -> Result<Lowering, Error> {
     let mut builder = Builder {
         checked,
         nodes: Vec::new(),
@@ -475,9 +498,9 @@ struct Builder<'a> {
 }
 
 impl Builder<'_> {
-    fn push(&mut self, kind: Kind, shape: Vec<i64>) -> Result<usize, CompileError> {
+    fn push(&mut self, kind: Kind, shape: Vec<i64>) -> Result<usize, Error> {
         if shape.len() > MAX_RANK {
-            return Err(CompileError::InvalidInput(format!(
+            return Err(Error::Contract(format!(
                 "rank {} exceeds the supported maximum of {MAX_RANK}",
                 shape.len()
             )));
@@ -486,12 +509,12 @@ impl Builder<'_> {
         for axis in (0..shape.len().saturating_sub(1)).rev() {
             strides[axis] = strides[axis + 1]
                 .checked_mul(shape[axis + 1])
-                .ok_or_else(|| CompileError::InvalidInput("shape overflows i64".to_string()))?;
+                .or_overflow("shape overflows i64")?;
         }
         let elements = match shape.first() {
-            Some(first) => first.checked_mul(strides[0]).ok_or_else(|| {
-                CompileError::InvalidInput("element count overflows i64".to_string())
-            })?,
+            Some(first) => first
+                .checked_mul(strides[0])
+                .or_overflow("element count overflows i64")?,
             None => 1,
         };
         self.nodes.push(Node {
@@ -514,14 +537,14 @@ impl Builder<'_> {
     }
 
     /// Flatten `expr` into `self.nodes`, returning the root index.
-    fn build(&mut self, expr: &Expr) -> Result<usize, CompileError> {
+    fn build(&mut self, expr: &Expr) -> Result<usize, Error> {
         match expr {
             Expr::Src(name) => {
                 let shape = self
                     .checked
                     .source(name)
                     .ok_or_else(|| {
-                        CompileError::InvalidInput(format!(
+                        Error::Contract(format!(
                             "checkpoint tensor '{name}' was not resolved by the type checker"
                         ))
                     })?
@@ -535,7 +558,7 @@ impl Builder<'_> {
                     .checked
                     .output(name)
                     .ok_or_else(|| {
-                        CompileError::InvalidInput(format!(
+                        Error::Contract(format!(
                             "contract '{name}' was not resolved by the type checker"
                         ))
                     })?
@@ -555,7 +578,7 @@ impl Builder<'_> {
                 let axis = usize::from(axis.0);
                 let mut shape = self.nodes[inner].shape.clone();
                 let operand_extent = *shape.get(axis).ok_or_else(|| {
-                    CompileError::Internal("Slice axis escaped the type checker".to_string())
+                    Error::Internal("Slice axis escaped the type checker".to_string())
                 })?;
                 shape[axis] = *len;
                 let whole = *step == 1 && *start == 0 && *len == operand_extent;
@@ -584,7 +607,7 @@ impl Builder<'_> {
                     offset += self.nodes[inner].shape[axis];
                 }
                 if placed.is_empty() {
-                    return Err(CompileError::Internal(
+                    return Err(Error::Internal(
                         "empty Cat escaped the type checker".to_string(),
                     ));
                 }
@@ -599,18 +622,7 @@ impl Builder<'_> {
             }
             Expr::Reshape { src, shape } => {
                 let inner = self.build(src)?;
-                let elements = self.nodes[inner].elements;
-                let known: i64 = shape.iter().filter(|dim| **dim > 0).product();
-                let resolved = shape
-                    .iter()
-                    .map(|dim| {
-                        if *dim == -1 {
-                            elements / known.max(1)
-                        } else {
-                            *dim
-                        }
-                    })
-                    .collect();
+                let resolved = resolve_reshape(shape, self.nodes[inner].elements)?;
                 self.push(Kind::Reshape { src: inner }, resolved)
             }
             Expr::Pad {
@@ -634,10 +646,10 @@ impl Builder<'_> {
                     shape,
                 )
             }
-            Expr::Repack { .. } => Err(CompileError::InvalidInput(
+            Expr::Repack { .. } => Err(Error::Contract(
                 "Repack needs a kernel and cannot be lowered to byte runs".to_string(),
             )),
-            Expr::Quantize { .. } => Err(CompileError::InvalidInput(
+            Expr::Quantize { .. } => Err(Error::Contract(
                 "Quantize needs a kernel and cannot be lowered to byte runs".to_string(),
             )),
             // Nothing moves: the leaf is simply read under its declared type.
@@ -649,14 +661,14 @@ impl Builder<'_> {
                     Expr::Src(name) => self.intern(Leaf::Checkpoint(name.clone())),
                     Expr::Out(name) => self.intern(Leaf::Contract(name.clone())),
                     _ => {
-                        return Err(CompileError::InvalidInput(
+                        return Err(Error::Contract(
                             "Bitcast may only reinterpret a whole tensor".to_string(),
                         ));
                     }
                 };
                 self.push(Kind::Leaf(leaf), out.shape.clone())
             }
-            Expr::Shard { .. } => Err(CompileError::Internal(
+            Expr::Shard { .. } => Err(Error::Internal(
                 "Shard must be specialized against a target before lowering".to_string(),
             )),
         }
@@ -664,7 +676,7 @@ impl Builder<'_> {
 
     /// Walk the output in flat order, emitting one run per maximal contiguous
     /// stretch.
-    fn walk(&mut self, root: usize, max_runs: usize) -> Result<Lowering, CompileError> {
+    fn walk(&mut self, root: usize, max_runs: usize) -> Result<Lowering, Error> {
         let total = self.nodes[root].elements;
         let mut runs: Vec<Run> = Vec::new();
         let mut flat = 0_i64;
@@ -684,7 +696,7 @@ impl Builder<'_> {
                 Some(last) if adjacent(last, source, flat) => last.len += span,
                 _ => {
                     if runs.len() >= max_runs {
-                        return Err(CompileError::InvalidInput(format!(
+                        return Err(Error::Contract(format!(
                             "expression breaks into more than {max_runs} contiguous \
                              stretches; it needs a gather lowering, not a copy list"
                         )));
@@ -712,7 +724,7 @@ impl Builder<'_> {
         index: usize,
         coord: &Coord,
         flat: i64,
-    ) -> Result<(Option<(usize, i64)>, i64), CompileError> {
+    ) -> Result<(Option<(usize, i64)>, i64), Error> {
         let node = &self.nodes[index];
         let remaining = node.elements - flat;
         match &node.kind {
@@ -753,7 +765,7 @@ impl Builder<'_> {
                     .find(|(offset, _)| *offset <= at)
                     .copied()
                     .ok_or_else(|| {
-                        CompileError::Internal(format!("Cat has no part covering index {at}"))
+                        Error::Internal(format!("Cat has no part covering index {at}"))
                     })?;
                 let mut inner = *coord;
                 inner.dims[*axis] = at - offset;
@@ -853,9 +865,8 @@ fn flatten(coord: &Coord, shape: &[i64]) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::{
-        Checked, CheckpointTypes, ModelContract, Resolver, TensorContract, TensorType, infer_type,
-    };
+    use crate::contract::infer::{Checked, CheckpointTypes, Resolver, infer_type};
+    use crate::contract::{ModelContract, TensorContract, TensorType};
     use crate::types::{Axis, DType, QuantScheme, QuantSpec};
 
     struct Fake(HashMap<String, TensorType>);
@@ -924,9 +935,6 @@ mod tests {
             bits_per_element: 4,
             group_size: 32,
             channel_axis: Some(Axis(1)),
-            scale_dtype: Some(DType::U8),
-            zero_point_dtype: None,
-            block_shape: vec![32],
         }
     }
 
@@ -1079,7 +1087,6 @@ mod tests {
     #[test]
     fn a_view_reads_from_the_contract_that_backs_it() {
         let contract = ModelContract {
-            abi_version: 1,
             alignment: 256,
             tensors: vec![
                 TensorContract::new(
@@ -1497,7 +1504,7 @@ mod tests {
     #[test]
     fn a_row_shard_folds_to_a_single_strided_copy() {
         // 2048 runs of 3072 elements, each advancing 6144 in the source and
-        // 3072 in the destination. That is one `StridedExtent`, and emitting
+        // 3072 in the destination. That is one `Extent`, and emitting
         // 2048 of anything instead would be the whole point missed.
         let ck = Fake::new(&[("w", &[2048, 6144])]);
         let out = lower(Expr::src("w").slice(1, 0, 3072), &ck);
@@ -1692,7 +1699,6 @@ mod tests {
         // check the one property that matters: a view of a bank reads exactly
         // the bank rows it names.
         let contract = ModelContract {
-            abi_version: 1,
             alignment: 256,
             tensors: vec![
                 TensorContract::new(

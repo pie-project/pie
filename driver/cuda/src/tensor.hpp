@@ -42,6 +42,9 @@ enum class DType : std::uint8_t {
     // stores the packed FP4 bytes in Marlin's tile layout; a QuantMeta /
     // WeightView side tensor carries the E8M0 per-32-K scales.
     MXFP4_PACKED = 10,
+    // OCP Microscaling's exponent-only scale byte: `b` denotes `2^(b - 127)`.
+    // Only ever a block-scale companion, never a weight.
+    E8M0 = 11,
 };
 
 inline std::size_t dtype_bytes(DType d) {
@@ -57,6 +60,7 @@ inline std::size_t dtype_bytes(DType d) {
         case DType::FP8_E5M2: return 1;
         case DType::INT4_PACKED: return 1;  // 1 byte holds 2 nibbles
         case DType::MXFP4_PACKED: return 1;
+        case DType::E8M0: return 1;
     }
     throw std::runtime_error("unknown dtype");
 }
@@ -74,6 +78,7 @@ inline const char* dtype_name(DType d) {
         case DType::FP8_E5M2: return "fp8e5m2";
         case DType::INT4_PACKED: return "int4-packed";
         case DType::MXFP4_PACKED: return "mxfp4-packed";
+        case DType::E8M0: return "e8m0";
     }
     return "?";
 }

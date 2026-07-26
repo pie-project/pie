@@ -122,7 +122,6 @@ void test_argmax_epilogue() {
 
     Op am; am.code = OpCode::ReduceArgmax; am.args = {0}; am.result_type = tok_ty; am.result_id = 1;
     Stage ep; ep.kind = StageKind::Epilogue; ep.ops = {am}; ep.puts = {{0, 1}};
-    ep.outputs = {{1, OutputKind::Token}};
     t.stages = {ep};
 
     Tier0Runner runner(t);

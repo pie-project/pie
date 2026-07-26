@@ -47,7 +47,7 @@ use crate::pipeline::channel::{BoundCells, Channel, ChannelError};
 use crate::pipeline::instance::ForwardPass;
 use crate::store::kv::working_set::{KvFireLease, KvWorkingSet};
 use crate::store::rs::working_set::RsWorkingSet;
-use pie_ptir::container::HostRole;
+use pie_ir::container::HostRole;
 
 /// A pass's in-flight fires, submit order. The queue mutex is never held across
 /// an await; the async finalizer gate serializes pop-through-finalize instead.
@@ -229,39 +229,36 @@ impl Drop for KvTxnGuard {
     }
 }
 
-/// Abort-on-drop guard for a fire's prepared RS transactions (which have no
-/// store-side Drop rollback of their own). Same protocol as [`KvTxnGuard`].
+/// Settle-on-drop guard for a fire's published RS transaction (which has no
+/// store-side Drop of its own). Same protocol as [`KvTxnGuard`]: the mapping
+/// is already authoritative, so dropping only releases the in-flight hold.
 struct RsTxnsGuard {
     model: usize,
     driver: usize,
-    txns: Vec<rs::RsTxn>,
+    txn: Option<rs::RsTxn>,
 }
 
 impl RsTxnsGuard {
-    fn new(model: usize, driver: usize, txns: Vec<rs::RsTxn>) -> Self {
-        Self {
-            model,
-            driver,
-            txns,
-        }
+    fn new(model: usize, driver: usize, txn: Option<rs::RsTxn>) -> Self {
+        Self { model, driver, txn }
     }
 
-    fn into_inner(mut self) -> Vec<rs::RsTxn> {
-        std::mem::take(&mut self.txns)
+    fn into_inner(mut self) -> Option<rs::RsTxn> {
+        self.txn.take()
     }
 }
 
 impl Drop for RsTxnsGuard {
     fn drop(&mut self) {
-        if self.txns.is_empty() {
+        let Some(txn) = self.txn.take() else {
             return;
-        }
+        };
         let stores = crate::store::registry::get(self.model, self.driver);
         {
             let mut store = stores.rs.lock().unwrap();
-            rs::abandon_many(&mut store, std::mem::take(&mut self.txns));
+            rs::settle(&mut store, Some(txn));
         }
-        // The abort recycled slots; parked asks may fit now.
+        // Settlement retired recycled slots; parked asks may fit now.
         if let Some(planner) = crate::planner::planner_for(self.model, self.driver) {
             planner.pages_freed();
         }
@@ -381,16 +378,54 @@ fn bound_rs_working_set_ids<C: FireContext>(
     Ok(Ok(ids))
 }
 
+/// Resolve the pass's declared RS mode into the per-row plan the lowering
+/// needs: a buffered write covers each row's own token span, and a fold
+/// replays the lengths the guest supplied.
+fn rs_plan_for(
+    mode: &crate::pipeline::instance::RsMode,
+    rows: usize,
+    qo_indptr: &[u32],
+) -> Result<rs::RsPlan, String> {
+    use crate::pipeline::instance::RsMode;
+    Ok(match mode {
+        RsMode::Fold => rs::RsPlan::Fold,
+        RsMode::Buffer { start_token } => rs::RsPlan::Buffer {
+            start_token: *start_token,
+            row_tokens: (0..rows)
+                .map(|row| {
+                    qo_indptr
+                        .get(row + 1)
+                        .zip(qo_indptr.get(row))
+                        .map(|(end, start)| end.saturating_sub(*start))
+                        .unwrap_or(0)
+                })
+                .collect(),
+        },
+        RsMode::FoldBuffered { tokens } => {
+            if tokens.len() != rows {
+                return Err(format!(
+                    "fold-buffered supplied {} length(s) for {rows} request row(s)",
+                    tokens.len()
+                ));
+            }
+            rs::RsPlan::FoldBuffered {
+                tokens: tokens.clone(),
+            }
+        }
+    })
+}
+
 /// Phase-A RS demand for the acquisition grant.
 fn rs_slot_demand(
     stores: &crate::store::registry::Stores,
     ids: &[crate::store::rs::RsWorkingSetId],
+    plan: &rs::RsPlan,
 ) -> Result<u32, String> {
     if ids.is_empty() {
         return Ok(0);
     }
     let store = stores.rs.lock().unwrap();
-    let demand = rs::demand(&store, ids)?;
+    let demand = rs::demand(&store, ids, plan)?;
     u32::try_from(demand).map_err(|_| "pipeline: RS demand exceeds the contention ABI".to_string())
 }
 
@@ -494,7 +529,6 @@ impl PendingOp {
             })
         )
     }
-
 }
 
 enum FinalizeAction {
@@ -567,12 +601,12 @@ enum FireKv {
 }
 
 /// One in-flight fire: the work item completion plus everything needed to
-/// finalize when it resolves — the open KV/RS txns (pins/CoW held until
-/// commit/abort) and the bound cells whose mirror epochs become visible.
+/// finalize when it resolves — the open KV/RS txns (pins held until
+/// settlement) and the bound cells whose mirror epochs become visible.
 pub struct PendingFire {
     completion: crate::driver::WorkItemCompletion,
     kv: FireKv,
-    rstxns: Vec<rs::RsTxn>,
+    rstxn: Option<rs::RsTxn>,
     ws_guard: KvFireLease,
     model: usize,
     driver: usize,
@@ -584,8 +618,6 @@ pub struct PendingFire {
     failure: PipelineFailure,
 }
 
-type PreparedRs = (Vec<u32>, Vec<u8>, Vec<u32>, Vec<u32>, Vec<rs::RsTxn>);
-
 fn prepare_bound_rs<C: FireContext>(
     ctx: &mut C,
     stores: &crate::store::registry::Stores,
@@ -594,8 +626,9 @@ fn prepare_bound_rs<C: FireContext>(
     rs_reps: &[u32],
     qo_indptr: &[u32],
     pipeline_scope: &crate::store::PipelineScope,
+    plan: &rs::RsPlan,
     grant: &mut crate::planner::AllocationGrant,
-) -> Anyhow<Result<PreparedRs, ReservedError>> {
+) -> Anyhow<Result<rs::PreparedRs, ReservedError>> {
     let has_recurrent_state = pie_model::model().rs_caps().state_size > 0;
     if let Err(error) = rs::validate_count(rs_reps.len(), qo_indptr, has_recurrent_state) {
         return Ok(Err(ReservedError::Fatal(format!(
@@ -603,13 +636,7 @@ fn prepare_bound_rs<C: FireContext>(
         ))));
     }
     if rs_reps.is_empty() {
-        return Ok(Ok((
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        )));
+        return Ok(Ok(rs::PreparedRs::empty()));
     }
 
     // Resolution + model/driver validation live in the phase-A resolver;
@@ -634,7 +661,7 @@ fn prepare_bound_rs<C: FireContext>(
         // Staleness gate under the same lock as the prepare: if the demand
         // grew while the requester awaited its grant, nothing is consumed
         // and the caller re-acquires.
-        let required = match rs::demand(&store, &working_sets) {
+        let required = match rs::demand(&store, &working_sets, plan) {
             Ok(required) => required,
             Err(error) => {
                 return Ok(Err(ReservedError::Fatal(format!(
@@ -645,14 +672,19 @@ fn prepare_bound_rs<C: FireContext>(
         if required > grant.remaining_rs() {
             return Ok(Err(ReservedError::Stale));
         }
-        rs::prepare_many_reserved(&mut store, &working_sets, grant.lend_rs())
+        rs::prepare_many_reserved(&mut store, &working_sets, plan, grant.lend_rs())
     };
-    Ok(prepared
-        .map(|(ids, flags, (copy_src, copy_dst), txns)| (ids, flags, copy_src, copy_dst, txns))
-        .map_err(|error| ReservedError::Fatal(format!("pipeline: rs prepare: {error}"))))
+    Ok(prepared.map_err(|error| ReservedError::Fatal(format!("pipeline: rs prepare: {error}"))))
 }
 
-pub(crate) async fn drain_rs_predecessors<C: FireContext>(
+/// Drain EVERY in-flight fire on this pipeline to settlement.
+///
+/// This is not an RS ordering rule (RS mappings publish at prepare, in
+/// submission order, so a recurrent-state fire never needs to wait for its
+/// predecessors). It is the host-side ordering seam for out-of-band ops that
+/// read committed physical ids and then act on them off the fire path —
+/// `copy_into`, whose page translation must not race a same-WS CoW rebase.
+pub(crate) async fn drain_pipeline_fires<C: FireContext>(
     ctx: &mut C,
     fires: &PendingFires,
 ) -> Anyhow<()> {
@@ -830,21 +862,16 @@ pub async fn submit_pass_stamped<C: FireContext>(
         if let Err(error) = wire_channels_to_pipeline(ctx, &fwd, &pipe_fires)? {
             return Ok(Err(error));
         }
-        if !ctx.resources().get(&fwd)?.rs_ws.is_empty() {
-            // RS mappings publish only at finalize. Correctness-first
-            // serialization prevents a later run-ahead fire from preparing
-            // against stale committed state (double RESET / repeated CoW).
-            drain_rs_predecessors(ctx, &pipe_fires).await?;
-            if let Some(error) = pipeline_failed(&pipeline_failure) {
-                return Ok(Err(error));
-            }
-        }
+        // An RS-binding pass needs no extra serialization here: its mapping
+        // publishes at prepare, in submission order, so it runs ahead like
+        // any other pass.
         let timing_enabled = ctx.fire_timing_requested();
         let (
             geometry,
             cells,
             ws_rep,
             rs_reps,
+            rs_mode,
             kv_declaration,
             kv_declaration_realized,
             fwd_rep,
@@ -924,6 +951,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 p.cells.clone(),
                 p.kv_ws,
                 p.rs_ws.clone(),
+                p.rs_mode.clone(),
                 p.kv_declaration,
                 p.kv_declaration_realized,
                 fwd.rep(),
@@ -1012,6 +1040,12 @@ pub async fn submit_pass_stamped<C: FireContext>(
             Ok(ids) => ids,
             Err(error) => return Ok(Err(error)),
         };
+        let rs_plan = match rs_plan_for(&rs_mode, rs_reps.len(), &req.qo_indptr) {
+            Ok(plan) => plan,
+            Err(error) => {
+                return Ok(Err(format!("pipeline: recurrent-state mode: {error}")));
+            }
+        };
         crate::planner::trace_mark!("build", pid, "hp-acquire");
         let mut attempts = 0;
         let (ws_guard, (copy_src, copy_dst), kvtxn, rs_prepared) = loop {
@@ -1029,7 +1063,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     "pipeline: KV demand exceeds the planner ABI".to_string()
                 ));
             };
-            let rs_demand = match rs_slot_demand(&stores, &rs_ws_ids) {
+            let rs_demand = match rs_slot_demand(&stores, &rs_ws_ids, &rs_plan) {
                 Ok(demand) => demand,
                 Err(error) => return Ok(Err(error)),
             };
@@ -1085,6 +1119,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 &rs_reps,
                 &req.qo_indptr,
                 &pipeline_scope,
+                &rs_plan,
                 &mut grant,
             )? {
                 Ok(prepared) => break (ws_guard, copies, kvtxn, prepared),
@@ -1097,10 +1132,9 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 Err(ReservedError::Fatal(error)) => return Ok(Err(error)),
             }
         };
-        let (rs_slot_ids, rs_slot_flags, rs_copy_src, rs_copy_dst, rstxns) = rs_prepared;
-        let rstxns = RsTxnsGuard::new(model, driver, rstxns);
-        req.rs_slot_ids = rs_slot_ids;
-        req.rs_slot_flags = rs_slot_flags;
+        rs_prepared.apply_to(&mut req);
+        let (rs_copy_src, rs_copy_dst) = rs_prepared.copies.clone();
+        let rstxns = RsTxnsGuard::new(model, driver, rs_prepared.txn);
         let (translation_version, translation) = match ws.translation() {
             Ok(translation) => translation,
             Err(error) => {
@@ -1163,7 +1197,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             .push_back(PendingOp::Fire(PendingFire {
                 completion,
                 kv: FireKv::Host(kvtxn.into_inner()),
-                rstxns: rstxns.into_inner(),
+                rstxn: rstxns.into_inner(),
                 ws_guard,
                 model,
                 driver,
@@ -1239,19 +1273,28 @@ pub async fn submit_frame<C: FireContext>(
         };
         let pipeline: Resource<Pipeline> = Resource::new_borrow(this.rep());
         let fwd: Resource<ForwardPass> = Resource::new_borrow(rep);
-        if let Err(error) = submit_pass_stamped(ctx, pipeline, fwd, Some(stamp)).await? {
+        let outcome = submit_pass_stamped(ctx, pipeline, fwd, Some(stamp)).await;
+        if !matches!(outcome, Ok(Ok(()))) && index > 0 {
             // Mid-frame failure: the fires already submitted stand and
             // execute as a truncated frame; tell the scheduler how many
-            // exist so the frame can still seal.
-            if index > 0 {
-                let first: Resource<ForwardPass> = Resource::new_borrow(fired[0].1);
-                if let Ok(pass) = ctx.resources().get(&first)
-                    && let Ok(bound) = pass.bound()
-                {
-                    let _ = bound.scheduler.frame_truncate(lane, seq, index as u32);
-                }
+            // exist so the frame can still seal. This must cover the host
+            // trap path too — returning through `?` without truncating
+            // strands the frame arrival-incomplete, and the wait-all gate
+            // then holds the whole fleet on a frame that can never
+            // complete (CONTENTION_FOLLOWUP §20.8).
+            let first: Resource<ForwardPass> = Resource::new_borrow(fired[0].1);
+            if let Ok(pass) = ctx.resources().get(&first)
+                && let Ok(bound) = pass.bound()
+            {
+                let _ = bound.scheduler.frame_truncate(lane, seq, index as u32);
             }
-            return Ok(Err(format!("pipeline: frame slot {slot}: {error}")));
+        }
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                return Ok(Err(format!("pipeline: frame slot {slot}: {error}")));
+            }
+            Err(error) => return Err(error),
         }
     }
     Ok(Ok(()))
@@ -1278,24 +1321,14 @@ fn validate_frame<C: FireContext>(
     let mut uses: std::collections::HashMap<usize, ChannelUse> = std::collections::HashMap::new();
     let mut device_rings: std::collections::HashMap<usize, DeviceRingUse> =
         std::collections::HashMap::new();
-    // A pass that binds recurrent state cannot share a frame with any
-    // other fire. `fire` serializes such a pass behind EVERY predecessor
-    // fire's settlement (`drain_rs_predecessors`) because RS mappings only
-    // publish at finalize — but a frame's fires cannot settle until all of
-    // them are submitted, and submitting the next one is what blocks. The
-    // two rules are structurally incompatible, and the result is a silent
-    // hang: the frame sits one fire short of sealing forever. Reject it
-    // here, where the frame's shape is known.
-    if fired.len() > 1 {
-        for &(slot, rep) in fired {
-            let fwd: Resource<ForwardPass> = Resource::new_borrow(rep);
-            if !ctx.resources().get(&fwd)?.rs_ws.is_empty() {
-                return Ok(Err(format!(
-                    "pipeline: frame slot {slot} binds recurrent state, so it                      serializes behind every earlier fire's settlement and                      cannot share a frame — give a recurrent-state pass a                      frame of its own (one live slot, the rest none)"
-                )));
-            }
-        }
-    }
+    // A pass that binds recurrent state needs NO frame restriction. RS
+    // mappings publish at prepare, in slot order, under the store lock — so
+    // slot i+1 classifies against slot i's decision without waiting for it to
+    // settle, and the advanced state's contents are ordered by the stream
+    // like any intra-frame dependency. The former rule (an RS pass had to own
+    // its frame) existed only because `fire` serialized such a pass behind
+    // every predecessor's settlement, which a frame can never reach: the
+    // frame seals one fire short forever. Both halves are gone.
     for &(_, rep) in fired {
         let fwd: Resource<ForwardPass> = Resource::new_borrow(rep);
         let pass = ctx.resources().get(&fwd)?;
@@ -1449,7 +1482,7 @@ pub async fn copy_into_inner<C: FireContext>(
             pipeline.failure.clone(),
         )
     };
-    drain_rs_predecessors(ctx, &pipe_fires).await?;
+    drain_pipeline_fires(ctx, &pipe_fires).await?;
     if let Some(error) = pipeline_failed(&pipeline_failure) {
         return Ok(Err(error));
     }
@@ -1528,7 +1561,9 @@ pub async fn copy_into_inner<C: FireContext>(
                 // §16.2), not a cleanup-pass alignment.
                 let pid = ctx.process_id();
                 let Some(planner) = crate::planner::planner() else {
-                    return Ok(Err("pipeline copy_into: working set is suspend-fenced".into()));
+                    return Ok(Err(
+                        "pipeline copy_into: working set is suspend-fenced".into()
+                    ));
                 };
                 if let Err(error) = planner.wait_resident(pid).await {
                     return Ok(Err(format!("pipeline copy_into: {error}")));
@@ -1770,7 +1805,7 @@ async fn finalize_fire_await(fire: PendingFire) -> Anyhow<FinalizeOutcome> {
     let PendingFire {
         completion,
         kv,
-        rstxns,
+        rstxn,
         ws_guard,
         model,
         driver,
@@ -1797,15 +1832,16 @@ async fn finalize_fire_await(fire: PendingFire) -> Anyhow<FinalizeOutcome> {
 
     let (kv_failure, rs_failure) = {
         let stores = crate::store::registry::get(model, driver);
-        // RS transactions have no Drop rollback. Retire them before the only
-        // await below so process cancellation cannot leak their slots.
-        let rs_failure = if rstxns.is_empty() {
+        // RS transactions have no Drop rollback. Settle them before the only
+        // await below so process cancellation cannot leak their slots. The
+        // mapping is already published (fail-stop either way), so settlement
+        // cannot fail and does not depend on `success`.
+        let rs_failure: Option<String> = if rstxn.is_some() {
+            let mut rs_store = stores.rs.lock().unwrap();
+            rs::settle(&mut rs_store, rstxn);
             None
         } else {
-            let mut rs_store = stores.rs.lock().unwrap();
-            rs::finalize_many(&mut rs_store, rstxns, success)
-                .err()
-                .map(|error| format!("pipeline: recurrent-state finalize failed: {error}"))
+            None
         };
         let kvtxn = match kv {
             FireKv::DeviceGeom { kvtxn } => Some(kvtxn),
@@ -1940,17 +1976,13 @@ async fn fire_device_geometry<C: FireContext>(
     if let Err(e) = wire_channels_to_pipeline(ctx, &fwd, &pipe_fires)? {
         return Ok(Err(e));
     }
-    if !ctx.resources().get(&fwd)?.rs_ws.is_empty() {
-        drain_rs_predecessors(ctx, &pipe_fires).await?;
-        if let Some(error) = pipeline_failed(&pipeline_failure) {
-            return Ok(Err(error));
-        }
-    }
+    // No RS serialization: the mapping publishes at prepare (submission
+    // order), so a recurrent-state device-geometry pass runs ahead too.
     let timing_enabled = ctx.fire_timing_requested();
 
-    let (ws_rep, rs_reps) = {
+    let (ws_rep, rs_reps, rs_mode) = {
         let pass = ctx.resources().get(&fwd)?;
-        (pass.kv_ws, pass.rs_ws.clone())
+        (pass.kv_ws, pass.rs_ws.clone(), pass.rs_mode.clone())
     };
     let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
     let ws = ctx.resources().get(&ws_res)?.clone();
@@ -1994,17 +2026,18 @@ async fn fire_device_geometry<C: FireContext>(
         .pooled;
     let pooled_write_indexes: Vec<u64> = if pooled {
         let writable = ctx.resources().get(&fwd)?.kv_declaration.writable;
-        let reserved =
-            crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv_store| {
-                kv_store.page_len(ws.id)
-            });
+        let reserved = crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv_store| {
+            kv_store.page_len(ws.id)
+        });
         let span = reserved
             .map_err(|error| error.to_string())
             .and_then(|page_len| writable.resolve(page_len));
         match span {
             Ok(span) => span.collect(),
             Err(error) => {
-                return Ok(Err(format!("pipeline: pool-owned device geometry: {error}")));
+                return Ok(Err(format!(
+                    "pipeline: pool-owned device geometry: {error}"
+                )));
             }
         }
     } else {
@@ -2080,7 +2113,14 @@ async fn fire_device_geometry<C: FireContext>(
                 "pipeline: KV demand exceeds the planner ABI".to_string()
             ));
         };
-        let rs_demand = match rs_slot_demand(&stores, &rs_ws_ids) {
+        let rs_plan = match rs_plan_for(&rs_mode, rs_reps.len(), &resolved_qo_indptr) {
+            Ok(plan) => plan,
+            Err(error) => {
+                reclaim_pending_device_grant(ctx, &fwd);
+                return Ok(Err(format!("pipeline: recurrent-state mode: {error}")));
+            }
+        };
+        let rs_demand = match rs_slot_demand(&stores, &rs_ws_ids, &rs_plan) {
             Ok(demand) => demand,
             Err(error) => {
                 reclaim_pending_device_grant(ctx, &fwd);
@@ -2140,6 +2180,7 @@ async fn fire_device_geometry<C: FireContext>(
             &rs_reps,
             &resolved_qo_indptr,
             &pipeline_scope,
+            &rs_plan,
             &mut grant,
         ) {
             Ok(Ok(prepared)) => break (ws_guard, pages, copies, kv_translation, kvtxn, prepared),
@@ -2165,8 +2206,9 @@ async fn fire_device_geometry<C: FireContext>(
             }
         }
     };
-    let (rs_slot_ids, rs_slot_flags, rs_copy_src, rs_copy_dst, rstxns) = rs_prepared;
-    let rstxns = RsTxnsGuard::new(ws.model, ws.driver, rstxns);
+    let (rs_copy_src, rs_copy_dst) = rs_prepared.copies.clone();
+    let mut rs_prepared = rs_prepared;
+    let rstxns = RsTxnsGuard::new(ws.model, ws.driver, rs_prepared.txn.take());
 
     // Deliver the fresh grant to the program as a direct put on its `fresh`
     // channel — a shared-ring write the driver pulls before the pass (plan
@@ -2237,8 +2279,7 @@ async fn fire_device_geometry<C: FireContext>(
     req.qo_indptr = resolved_qo_indptr;
     req.kv_translation = kv_translation;
     req.kv_translation_version = kv_translation_version;
-    req.rs_slot_ids = rs_slot_ids;
-    req.rs_slot_flags = rs_slot_flags;
+    rs_prepared.apply_to(&mut req);
     attn_mask.apply_to(&mut req);
     let ticket_reservation = TicketReservation::new(&cells, &accesses);
     ticket_reservation.apply_to(&mut req);
@@ -2291,7 +2332,7 @@ async fn fire_device_geometry<C: FireContext>(
                     .into_inner()
                     .expect("device-geometry fire always holds a KV transaction"),
             },
-            rstxns: rstxns.into_inner(),
+            rstxn: rstxns.into_inner(),
             ws_guard,
             model: ws.model,
             driver: ws.driver,
@@ -2431,13 +2472,16 @@ mod lifecycle_tests {
         Ok(())
     }
 
-    /// Same contract for RS: abandoned folded-slot prepares release their
-    /// slots through the guard, not a hand-written error path.
+    /// The RS contract under publish-at-prepare: the guard SETTLES rather
+    /// than rolls back. The folded slot the prepare adopted stays owned by
+    /// the working set (fail-stop, as for KV), the unconsumed reservation
+    /// returns immediately, and settling releases the in-flight hold so a
+    /// later release retires everything.
     #[tokio::test(flavor = "current_thread")]
-    async fn rs_txns_guard_drop_releases_prepared_slots() -> anyhow::Result<()> {
+    async fn rs_txns_guard_drop_settles_without_rolling_back_the_mapping() -> anyhow::Result<()> {
         let model = crate::store::registry::register_model(16, &[4], &[4]);
         let stores = crate::store::registry::get(model, 0);
-        let (txns, before) = {
+        let (txn, ws, before) = {
             let mut store = stores.rs.lock().unwrap();
             let ws = store.create_working_set(crate::store::rs::RsGeometry {
                 state_size: 64,
@@ -2446,18 +2490,34 @@ mod lifecycle_tests {
             });
             let before = store.available_slots();
             let mut granted = store.reserve_slots(2).expect("slots available");
-            let (_, _, _, txns) =
-                rs::prepare_many_reserved(&mut store, &[ws], &mut granted).expect("prepare");
+            let prepared =
+                rs::prepare_many_reserved(&mut store, &[ws], &rs::RsPlan::Fold, &mut granted)
+                    .expect("prepare");
+            let txn = prepared.txn;
             store.release_slot_reservation(granted);
-            (txns, before)
+            assert!(
+                store.folded_slot(ws).expect("live working set").is_some(),
+                "prepare publishes the folded slot before the fire is submitted"
+            );
+            (txn, ws, before)
         };
-        drop(RsTxnsGuard::new(model, 0, txns));
-        let store = stores.rs.lock().unwrap();
-        assert_eq!(
-            store.available_slots(),
-            before,
-            "every reserved slot released exactly once"
-        );
+        drop(RsTxnsGuard::new(model, 0, txn));
+        {
+            let mut store = stores.rs.lock().unwrap();
+            assert_eq!(
+                store.available_slots(),
+                before - 1,
+                "the published folded slot stays owned by the working set"
+            );
+            let epoch = store.current_epoch();
+            store.release_working_set(ws, epoch);
+            store.retire_idle();
+            assert_eq!(
+                store.available_slots(),
+                before,
+                "settling released the in-flight hold, so release retires everything"
+            );
+        }
         Ok(())
     }
 

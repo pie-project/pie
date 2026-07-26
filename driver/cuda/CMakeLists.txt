@@ -512,6 +512,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/kernels/head_dim_pad.cu
   src/kernels/kv_paged.cu
   src/kernels/moe_dispatch.cu
+  src/kernels/moe_grouped_gemm.cu
   src/kernels/mxfp4_marlin.cu
   src/kernels/pack_dense_mask.cu
   src/kernels/quant_bf16_to_fp8.cu
@@ -519,7 +520,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/kernels/residual_add.cu
   src/kernels/rmsnorm.cu
   src/kernels/rope.cu
-  src/kernels/slab_scatter.cu
+  src/kernels/slot_ops.cu
   src/kernels/split_packed.cu
   src/kernels/swiglu.cu
   src/kernels/topk_softmax.cu
@@ -539,7 +540,7 @@ target_compile_options(pie_driver_cuda_lib PRIVATE
 
 target_include_directories(pie_driver_cuda_lib
   PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR}
     # Ahead of NCCL: its header is located with ${CUDAToolkit_INCLUDE_DIRS} as
@@ -554,10 +555,34 @@ target_include_directories(pie_driver_cuda_lib
     ${flashinfer_SOURCE_DIR}/3rdparty/cutlass/tools/util/include
     ${flashinfer_SOURCE_DIR}/3rdparty/spdlog/include)
 
+# ---- the loader archive ----------------------------------------------------
+#
+# Authoring a contract reads the checkpoint's tensor table, which means calling
+# into `pie-loader` — and `pie-loader` is an rlib the *worker* links, not
+# something a C++ binary can pull in. `cargo rustc -p pie-loader --lib
+# --crate-type staticlib` emits an archive that does link. Anything reaching
+# `pie_driver_cuda_lib`'s `loaded_model.cpp` needs it. When it is there those
+# targets are built; when it is not they are skipped, because failing the whole
+# build for everyone who has not run that command would be worse than not
+# building a diagnostic tool and two structural tests.
+if(NOT PIE_LOADER_STATICLIB)
+  find_library(PIE_LOADER_STATICLIB
+    NAMES pie_loader
+    PATHS ${CMAKE_CURRENT_SOURCE_DIR}/../../target/debug
+    NO_DEFAULT_PATH)
+endif()
+
 # ---- pie_driver_cuda (standalone diagnostic executable) --------------------
 
-add_executable(pie_driver_cuda src/main.cpp)
-target_link_libraries(pie_driver_cuda PRIVATE pie_driver_cuda_lib)
+if(PIE_LOADER_STATICLIB)
+  add_executable(pie_driver_cuda src/main.cpp)
+  target_link_libraries(pie_driver_cuda PRIVATE pie_driver_cuda_lib
+    ${PIE_LOADER_STATICLIB} dl pthread)
+else()
+  message(STATUS
+    "pie_driver_cuda: skipped (no libpie_loader.a; build one with "
+    "`cargo rustc -p pie-loader --lib --crate-type staticlib`)")
+endif()
 
 # ---- FlashInfer generated CUTLASS MoE (vendored) ---------------------------
 # Pre-generated FlashInfer CUTLASS grouped-GEMM MoE launchers, vendored under
@@ -604,6 +629,29 @@ else()
     "FlashInfer fused MoE launchers omitted: no Silu/Gelu-class activation in kernels.def")
 endif()
 
+# Blackwell TMA warp-specialized grouped GEMMs. Without
+# COMPILE_BLACKWELL_TMA_GROUPED_GEMMS the launcher bodies collapse to a
+# "recompile with 100-real" throw, so on sm100 the CutlassMoeFCRunner has no
+# usable config at all and MoE falls back to cuBLAS batched GEMM over
+# worst-case-padded expert blocks. Requires the `a` architecture target for TMA
+# and tcgen05 -- see cmake/DetectCudaArchitecture.cmake.
+#
+# These come from third_party/flashinfer_generated/regenerate_sm100.sh, and
+# unlike the sm80 set they are needed whenever the runner is reachable at all,
+# independent of which activations kernels.def enables.
+if(PIE_HAS_SM100)
+  set(PIE_FLASHINFER_MOE_SM100_SOURCES)
+  foreach(_pie_moe_group RANGE 0 23)
+    list(APPEND PIE_FLASHINFER_MOE_SM100_SOURCES
+      "third_party/flashinfer_generated/gemm_grouped/100/cutlass_kernel_file_gemm_grouped_sm100_group${_pie_moe_group}.generated.cu")
+  endforeach()
+  list(LENGTH PIE_FLASHINFER_MOE_SM100_SOURCES PIE_FLASHINFER_MOE_SM100_COUNT)
+  message(STATUS
+    "Enabling Blackwell TMA warp-specialized MoE grouped GEMMs (${PIE_FLASHINFER_MOE_SM100_COUNT} generated units)")
+else()
+  set(PIE_FLASHINFER_MOE_SM100_SOURCES)
+endif()
+
 # FlashInfer/TensorRT-LLM CUTLASS MoE runner. Kept as a separate OBJECT
 # library because its dependency slice (nv_internal/) is large and should
 # stay a clear opt-in boundary for Nemotron experimentation.
@@ -623,7 +671,8 @@ add_library(pie_flashinfer_cutlass_moe OBJECT
   third_party/flashinfer_moe/moe_gemm_kernels_bf16_bf16.cu
   ${flashinfer_SOURCE_DIR}/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.cu
   ${flashinfer_SOURCE_DIR}/csrc/nv_internal/tensorrt_llm/kernels/lora/lora.cpp
-  ${PIE_FLASHINFER_MOE_GENERATED_SOURCES})
+  ${PIE_FLASHINFER_MOE_GENERATED_SOURCES}
+  ${PIE_FLASHINFER_MOE_SM100_SOURCES})
 target_include_directories(pie_flashinfer_cutlass_moe PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/flashinfer_moe
@@ -646,7 +695,8 @@ target_include_directories(pie_flashinfer_cutlass_moe PRIVATE
 target_compile_definitions(pie_flashinfer_cutlass_moe PRIVATE
   ENABLE_BF16=1
   ENABLE_FP8=1
-  USING_OSS_CUTLASS_MOE_GEMM=1)
+  USING_OSS_CUTLASS_MOE_GEMM=1
+  $<$<BOOL:${PIE_HAS_SM100}>:COMPILE_BLACKWELL_TMA_GROUPED_GEMMS=1>)
 target_compile_options(pie_flashinfer_cutlass_moe PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda --expt-relaxed-constexpr>)
 set_target_properties(pie_flashinfer_cutlass_moe PROPERTIES
@@ -783,11 +833,10 @@ enable_testing()
 # lib would duplicate those symbols) and test_ptir_grouped_dispatch_asan (it
 # must compile its own -fsanitize=address copies of what it exercises).
 
-# Runtime fixtures/scripts consumed by tests but not compiled: golden PTIR
-# containers (tests/golden-ptir, read by test_ptir_container/golden_exec via
-# TEST_ARGS), the load-parity harness (tests/load_parity/run.py, driven
-# manually against a live GPU + recipe), the qwen3.5 multi-request parity
-# script, and the tier0/tier1/masked-attention host reference headers
+# Runtime fixtures/scripts consumed by tests but not compiled: the load-parity
+# harness (tests/load_parity/run.py, driven manually against a live GPU +
+# recipe), the qwen3.5 multi-request parity script, and the
+# tier0/tier1/masked-attention host reference headers
 # (#include-only, no standalone translation unit). Listed as a SOURCES-only
 # custom target so IDE-generating generators surface them in the project tree
 # and so a reader can tell "not compiled" from "forgotten".
@@ -801,57 +850,22 @@ add_custom_target(pie_driver_cuda_test_fixtures SOURCES
   tests/load_parity/oracle.py
   tests/load_parity/parse_cache.py
   tests/load_parity/run.py
-  tests/load_parity/spec.py
-  tests/golden-ptir/beam_epilogue.txt
-  tests/golden-ptir/counter_pingpong.txt
-  tests/golden-ptir/dfa_ingraph.txt
-  tests/golden-ptir/greedy_argmax.txt
-  tests/golden-ptir/mtp_verify_tail.txt
-  tests/golden-ptir/nucleus_sample.txt
-  tests/golden-ptir/neg_body_type_error.txt
-  tests/golden-ptir/neg_intrinsic_wrong_stage.txt
-  tests/golden-ptir/neg_model_gated_missing.txt
-  tests/golden-ptir/neg_sink_at_epilogue.txt
-  tests/golden-ptir/neg_spsc_second_producer.txt
-  tests/golden-ptir/neg_t10_nonreplayable.txt
-  tests/golden-ptir/pivot_predicates_multistage.txt
-  tests/golden-ptir/section3_masked_gumbel.txt
-  tests/golden-ptir/staged_dispatch.txt
-  tests/golden-ptir/structured_masks.txt)
-
-file(GLOB PIE_PTIR_CANONICAL_GOLDENS CONFIGURE_DEPENDS
-  ${CMAKE_CURRENT_SOURCE_DIR}/../../interface/ptir/tests/golden-ptir/*.txt)
-pie_add_cuda_target(test_ptir_decoder_limits
-  SOURCES ../common/tests/ptir_decoder_limits_test.cpp
-  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
-  TEST_ARGS
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../interface/ptir/tests/malformed_wire_corpus.txt
-    ${PIE_PTIR_CANONICAL_GOLDENS})
+  tests/load_parity/spec.py)
 
 # The contract this driver authors (§12 row 12).
 # Set PIE_TEST_SNAPSHOT to also author it against a real checkpoint.
-#
-# Authoring reads the checkpoint's tensor table, which means calling into
-# `pie-loader` — and `pie-loader` is an rlib the *worker* links, not something a
-# C++ test binary can pull in. `cargo rustc -p pie-loader --lib --crate-type
-# staticlib` emits an archive that does link. When it is there this test is
-# built; when it is not the target is skipped, because failing the whole build
-# for everyone who has not run that command would be worse than not running one
-# test.
-if(NOT PIE_LOADER_STATICLIB)
-  find_library(PIE_LOADER_STATICLIB
-    NAMES pie_loader
-    PATHS ${CMAKE_CURRENT_SOURCE_DIR}/../../target/debug
-    NO_DEFAULT_PATH)
-endif()
 if(PIE_LOADER_STATICLIB)
+  # Links the driver lib: authoring is now the arch table's `author_contract`
+  # hook, so reaching a family's contract means reaching its registry row.
   pie_add_cuda_target(test_model_contract
-    SOURCES tests/model_contract_test.cpp src/model/config.cpp
+    SOURCES tests/model_contract_test.cpp
     INCLUDE_DIRS
-      ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+     
+      ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include
+      ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include
       ${PIE_DRIVER_ABI_INCLUDE_DIR}
       ${PIE_LOADER_INCLUDE_DIR}
-    LIBS nlohmann_json::nlohmann_json ${PIE_LOADER_STATICLIB} dl pthread)
+    LIBS pie_driver_cuda_lib nlohmann_json::nlohmann_json ${PIE_LOADER_STATICLIB} dl pthread)
 else()
   message(STATUS
     "test_model_contract: skipped (no libpie_loader.a; build one with "
@@ -992,26 +1006,23 @@ pie_add_cuda_target(test_flashinfer_decode_head_dim_guard
 pie_add_cuda_target(test_graph_variant SOURCES tests/graph_variant_test.cpp)
 pie_add_cuda_target(test_decode_envelope_contract
   SOURCES tests/decode_envelope_contract_test.cpp
-  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../common/include)
+  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include)
 pie_add_cuda_target(test_tp_gate
   SOURCES tests/tp_gate_test.cpp
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/src
   LIBS Threads::Threads)
-pie_add_cuda_target(test_program_identity
-  SOURCES tests/program_identity_test.cpp
-  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../common/include)
 pie_add_cuda_target(test_grouped_copy
   SOURCES tests/grouped_copy_test.cpp)
 pie_add_cuda_target(test_nucleus_region
   SOURCES tests/nucleus_region_test.cpp
-  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
-  TEST_ARGS ${CMAKE_CURRENT_SOURCE_DIR}/tests/golden-ptir)
+  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR}
+  TEST_ARGS ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures)
 pie_add_cuda_target(test_page_translation
   SOURCES tests/page_translation_test.cpp)
 pie_add_cuda_target(test_ptir_graph_key
   SOURCES tests/ptir_graph_key_test.cpp
   INCLUDE_DIRS
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include
     ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR}
   LIBS CUDA::cudart tomlplusplus::tomlplusplus)
 pie_add_cuda_target(test_frame_carrier_device
@@ -1029,45 +1040,37 @@ pie_add_cuda_target(test_pipeline_dispatch_race
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 pie_add_cuda_target(test_ptir_tier0
   SOURCES tests/ptir_tier0_test.cu
-  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/tests ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/tests ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR}
   LIBS CUDA::cudart)
 pie_add_cuda_target(test_ptir_runner
   SOURCES tests/ptir_runner_test.cu
   INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/tests
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include
     ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR}
   LIBS CUDA::cudart)
-pie_add_cuda_target(test_ptir_container
-  SOURCES tests/ptir_container_test.cpp
-  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
-  TEST_ARGS ${CMAKE_CURRENT_SOURCE_DIR}/tests/golden-ptir)
 # Emits + NVRTC-compiles a fused epilogue kernel; asserts tier-1 == tier-0.
 pie_add_cuda_target(test_ptir_tier1
   SOURCES tests/ptir_tier1_test.cu
   INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/tests
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include
     ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR}
   LIBS CUDA::cudart CUDA::cuda_driver CUDA::nvrtc)
-pie_add_cuda_target(test_ptir_generated_singleton
-  SOURCES tests/ptir_generated_singleton_test.cu
-  INCLUDE_DIRS
-    ${CMAKE_CURRENT_SOURCE_DIR}/tests
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
-    ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR}
-  LIBS CUDA::cudart CUDA::cuda_driver CUDA::nvrtc
-  TEST_ARGS
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../interface/ptir/tests/golden-ptir)
 pie_add_cuda_target(test_ptir_grouped_dispatch
   SOURCES tests/ptir_grouped_dispatch_test.cpp
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/tests
   LIBS pie_driver_cuda_lib
-  TEST_ARGS ${CMAKE_CURRENT_SOURCE_DIR}/tests/golden-ptir)
+  TEST_ARGS ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   # Keeps its own copies of the sources under test: -fsanitize=address below is
   # PRIVATE, so linking pie_driver_cuda_lib would hand it uninstrumented
   # objects and the sanitizer would see nothing of what this target exists for.
+  # The library is still linked, but only to resolve everything these three
+  # files call into. Listing that closure by hand does not converge -- it
+  # reaches `ops/attention_flashinfer.cu` in two hops -- and an explicit object
+  # already defines a symbol, so the archive member that would duplicate it is
+  # never pulled in.
   pie_add_cuda_target(test_ptir_grouped_dispatch_asan
     SOURCES
       tests/ptir_grouped_dispatch_test.cpp
@@ -1076,10 +1079,10 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
       src/pipeline/frame_carrier_kernels.cu
     INCLUDE_DIRS
       ${CMAKE_CURRENT_SOURCE_DIR}/tests
-      ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+      ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include
       ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR}
-    LIBS CUDA::cudart CUDA::cuda_driver CUDA::nvrtc
-    TEST_ARGS ${CMAKE_CURRENT_SOURCE_DIR}/tests/golden-ptir)
+    LIBS pie_driver_cuda_lib CUDA::cudart CUDA::cuda_driver CUDA::nvrtc
+    TEST_ARGS ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures)
   target_compile_options(test_ptir_grouped_dispatch_asan PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-fsanitize=address>
     $<$<COMPILE_LANGUAGE:CXX>:-fno-omit-frame-pointer>
@@ -1093,9 +1096,9 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 pie_add_cuda_target(test_ptir_golden_exec
   SOURCES tests/ptir_golden_exec_test.cu
-  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../common/include ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR}
+  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR}
   LIBS CUDA::cudart
-  TEST_ARGS ${CMAKE_CURRENT_SOURCE_DIR}/tests/golden-ptir)
+  TEST_ARGS ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures)
 pie_add_cuda_target(test_entry_validation
   SOURCES tests/entry_validation_test.cpp
   LIBS pie_driver_cuda_lib)
@@ -1103,17 +1106,25 @@ pie_add_cuda_target(test_rs_descriptor_validation
   SOURCES tests/rs_descriptor_validation_test.cpp
   INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include
     ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR})
 pie_add_cuda_target(test_precomputed_embeddings
   SOURCES tests/precomputed_embeddings_test.cpp
   INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include
     ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR}
   LIBS CUDA::cudart)
 # Structural proof for model/registry.{hpp,cpp}: every model_type resolves to its
-# intended family/binder; unrecognized archs are rejected. No GPU, no weights.
-pie_add_cuda_target(test_model_registry
-  SOURCES tests/model_registry_test.cpp
-  LIBS pie_driver_cuda_lib)
+# intended family/binder and declares what it binds; unrecognized archs are
+# rejected. No GPU, no weights — but `pie_driver_cuda_lib` reaches
+# `loaded_model.cpp`, which calls the loader, so it needs the staticlib.
+if(PIE_LOADER_STATICLIB)
+  pie_add_cuda_target(test_model_registry
+    SOURCES tests/model_registry_test.cpp
+    LIBS pie_driver_cuda_lib ${PIE_LOADER_STATICLIB} dl pthread)
+else()
+  message(STATUS
+    "test_model_registry: skipped (no libpie_loader.a; build one with "
+    "`cargo rustc -p pie-loader --lib --crate-type staticlib`)")
+endif()

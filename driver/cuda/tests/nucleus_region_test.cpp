@@ -1,60 +1,25 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
-#include <fstream>
 #include <string>
 #include <vector>
 
-#include "pie_native/ptir/bound.hpp"
-#include "pie_native/ptir/plan.hpp"
+#include "pie_native/launch/image.hpp"
+#include "pie_native/launch/plan.hpp"
 #include "pipeline/library_region.hpp"
-
-namespace {
-
-std::vector<std::uint8_t> decode_hex(const std::string& value) {
-    std::vector<std::uint8_t> bytes;
-    bytes.reserve(value.size() / 2);
-    for (std::size_t index = 0; index + 1 < value.size(); index += 2) {
-        bytes.push_back(static_cast<std::uint8_t>(
-            std::stoul(value.substr(index, 2), nullptr, 16)));
-    }
-    return bytes;
-}
-
-std::string field(const std::string& path, const std::string& name) {
-    std::ifstream input(path);
-    std::string line;
-    const std::string prefix = name + ": ";
-    while (std::getline(input, line)) {
-        if (line.rfind(prefix, 0) == 0) return line.substr(prefix.size());
-    }
-    return {};
-}
-
-}  // namespace
 
 int main(int argc, char** argv) {
     const std::string path =
-        (argc > 1 ? argv[1] : "tests/golden-ptir") +
-        std::string("/nucleus_sample.txt");
-    const auto sidecar = decode_hex(field(path, "sidecar"));
-    pie_native::ptir::bound::Bound bound;
+        (argc > 1 ? argv[1] : "../fixtures") +
+        std::string("/nucleus_sample.launch");
+    pie_native::launch::PackageImage image;
     std::string error;
-    if (!pie_native::ptir::bound::parse_sidecar(
-            sidecar.data(), sidecar.size(), bound, &error) ||
-        bound.plans.size() != 1) {
-        std::fprintf(stderr, "nucleus_region_test: sidecar: %s\n", error.c_str());
+    if (!image.load(path, &error) || image.package().plans.len != 1) {
+        std::fprintf(stderr, "nucleus_region_test: %s\n", error.c_str());
         return 1;
     }
-    pie_native::ptir::plan::StagePlan plan;
-    if (!pie_native::ptir::plan::decode(
-            bound.plans[0].bytes.data(),
-            bound.plans[0].bytes.size(),
-            plan,
-            &error)) {
-        std::fprintf(stderr, "nucleus_region_test: plan: %s\n", error.c_str());
-        return 1;
-    }
+    const pie_native::launch::plan::StagePlan plan =
+        pie_native::launch::plan::adopt(0, image.package().plans.ptr[0]);
     const auto region = std::find_if(
         plan.fused.regions.begin(),
         plan.fused.regions.end(),

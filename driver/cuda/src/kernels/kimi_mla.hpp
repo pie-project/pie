@@ -33,7 +33,11 @@ void launch_kimi_split_kv_a_norm_bf16(
     int kv_lora_rank,
     int qk_rope_dim,
     float eps,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    // Row pitch of `kv_a`, for reading the kv half straight out of Kimi's
+    // fused `q_a + kv_a` projection. 0 means the rows are exactly
+    // `kv_lora_rank + qk_rope_dim` wide.
+    int src_row_stride = 0);
 
 void launch_topk_sigmoid_bf16(
     const void* logits,

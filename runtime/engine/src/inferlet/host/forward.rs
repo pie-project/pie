@@ -25,12 +25,12 @@ use crate::pipeline::channel::{BoundCells, ChannelCell, ChannelError};
 use crate::pipeline::fire::lease::DevGeo;
 pub use crate::pipeline::instance::ForwardPass;
 use crate::pipeline::instance::Instance;
-use crate::pipeline::instance::{AttentionBinding, BoundForwardPass, EmbedBinding};
+use crate::pipeline::instance::{AttentionBinding, BoundForwardPass, EmbedBinding, RsMode};
 use crate::store::kv::working_set::KvWorkingSet;
 use crate::store::rs::working_set::RsWorkingSet;
 
-use pie_ptir::container::{HostRole, PortSource, TraceContainer};
-use pie_ptir::registry::Port;
+use pie_ir::container::{HostRole, PortSource, TraceContainer};
+use pie_ir::registry::Port;
 
 use super::pie;
 
@@ -275,10 +275,10 @@ impl pie::inferlet::forward::HostChannel for ProcessCtx {
         // errors at forward-pass.new / submit).
         use pie::inferlet::types::Dtype;
         let dtype = match dtype {
-            Dtype::F32 => pie_ptir::types::DType::F32,
-            Dtype::I32 => pie_ptir::types::DType::I32,
-            Dtype::U32 => pie_ptir::types::DType::U32,
-            Dtype::Bool => pie_ptir::types::DType::Bool,
+            Dtype::F32 => pie_ir::types::DType::F32,
+            Dtype::I32 => pie_ir::types::DType::I32,
+            Dtype::U32 => pie_ir::types::DType::U32,
+            Dtype::Bool => pie_ir::types::DType::Bool,
         };
         let cell = Arc::new(Mutex::new(ChannelCell::new(shape, dtype, capacity)));
         Ok(self.ctx().table.push(Channel { cell, fires: None })?)
@@ -456,7 +456,7 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
         container_bytes: Vec<u8>,
         channels: Vec<Resource<Channel>>,
     ) -> Anyhow<Result<(), String>> {
-        let (embed, attention, readout, rs_working_sets) = {
+        let (embed, attention, readout, rs_working_sets, rs_mode) = {
             let pass = self.ctx().table.get(&this)?;
             if pass.is_bound() {
                 return Ok(Err("forward pass program is already attached".to_string()));
@@ -481,6 +481,7 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
                     .copied()
                     .map(Resource::new_borrow)
                     .collect::<Vec<Resource<RsWorkingSet>>>(),
+                pass.bindings.rs_mode.clone(),
             )
         };
         let kv_working_set: Resource<KvWorkingSet> = Resource::new_borrow(attention.kv_ws);
@@ -676,8 +677,8 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
                     let mut lease = crate::pipeline::fire::lease::PageLease::new(b);
                     lease.seed(seed_pages);
                     let has_mask = prog.bound.container.ports.iter().any(|p| {
-                        matches!(p.port, pie_ptir::registry::Port::AttnMask)
-                            && matches!(p.source, pie_ptir::container::PortSource::Channel(_))
+                        matches!(p.port, pie_ir::registry::Port::AttnMask)
+                            && matches!(p.source, pie_ir::container::PortSource::Channel(_))
                     });
                     Some(DevGeo {
                         lease,
@@ -691,7 +692,7 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
                 None => None,
             };
 
-            let taint = pie_ptir::pareval::geometry_taint(&prog.bound);
+            let taint = pie_eval::pareval::geometry_taint(&prog.bound);
             let decode_envelope = if devgeo.is_some() || taint.host_derivable() {
                 None
             } else {
@@ -804,10 +805,10 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
                     seeded: decls[dense].seeded,
                     extern_dir: extern_binding
                         .map(|(_, dir)| match dir {
-                            pie_ptir::container::ExternDir::Import => {
+                            pie_ir::container::ExternDir::Import => {
                                 pie_driver_abi::PIE_CHANNEL_EXTERN_IMPORT
                             }
-                            pie_ptir::container::ExternDir::Export => {
+                            pie_ir::container::ExternDir::Export => {
                                 pie_driver_abi::PIE_CHANNEL_EXTERN_EXPORT
                             }
                         })
@@ -830,8 +831,9 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
             let channel_reps: Vec<u32> = channels.iter().map(|c| c.rep()).collect();
             let program_registration = crate::driver::ProgramRegistration {
                 program_hash: prog.hash,
-                canonical_bytes: prog.bytes.clone(),
-                sidecar_bytes: prog.sidecar.clone(),
+                launch: prog.launch().clone(),
+                reference_ptir: prog.bytes.clone(),
+                ..Default::default()
             };
             if bind_timing.is_some() {
                 bind_stages[2] = crate::scheduler::fire_timing_now_us();
@@ -928,8 +930,8 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
                 }
             }
             let dense_mask = instance.program.bound.container.ports.iter().any(|p| {
-                matches!(p.port, pie_ptir::registry::Port::AttnMask)
-                    && matches!(p.source, pie_ptir::container::PortSource::Channel(_))
+                matches!(p.port, pie_ir::registry::Port::AttnMask)
+                    && matches!(p.source, pie_ir::container::PortSource::Channel(_))
             });
             let host_shadow = crate::pipeline::fire::shadow::HostShadow::new(
                 &instance.program.bound,
@@ -945,6 +947,7 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
                 kv_ws: ws_rep,
                 kv_declaration: crate::pipeline::instance::KvDeclaration { readable, writable },
                 rs_ws: rs_reps,
+                rs_mode,
                 kv_declaration_realized: false,
                 failed: None,
                 devgeo,
@@ -978,6 +981,86 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
             }
             Ok(Ok(()))
         }
+    }
+
+    async fn set_rs_mode(
+        &mut self,
+        this: Resource<ForwardPass>,
+        mode: pie::inferlet::forward::RsMode,
+    ) -> Anyhow<Result<(), String>> {
+        let caps = pie_model::model().rs_caps();
+        let mode = match mode {
+            pie::inferlet::forward::RsMode::Fold => RsMode::Fold,
+            pie::inferlet::forward::RsMode::Buffer(start_token) => {
+                if caps.state_size == 0 {
+                    return Ok(Err(
+                        "pipeline: rs-mode: a pure-attention model has no recurrent state to \
+                         buffer"
+                            .to_string(),
+                    ));
+                }
+                let page = caps.buffer_page_size;
+                if page == 0 {
+                    return Ok(Err(
+                        "pipeline: rs-mode: this model reports no RS buffer page size".to_string(),
+                    ));
+                }
+                // The driver fills a request's slabs page-major FROM SLAB
+                // ZERO of the listed CSR span, so an unaligned start would
+                // silently shift every token within its slab.
+                if start_token % page != 0 {
+                    return Ok(Err(format!(
+                        "pipeline: rs-mode: buffered write starts at token {start_token}, which \
+                         is not a multiple of the RS buffer page size {page}"
+                    )));
+                }
+                RsMode::Buffer { start_token }
+            }
+            pie::inferlet::forward::RsMode::FoldBuffered(tokens) => {
+                if caps.state_size == 0 {
+                    return Ok(Err(
+                        "pipeline: rs-mode: a pure-attention model has no recurrent state to fold"
+                            .to_string(),
+                    ));
+                }
+                if tokens.is_empty() {
+                    return Ok(Err(
+                        "pipeline: rs-mode: fold-buffered needs one length per bound \
+                         recurrent-state working set"
+                            .to_string(),
+                    ));
+                }
+                RsMode::FoldBuffered { tokens }
+            }
+        };
+        let bound_rows = {
+            let pass = self.ctx().table.get(&this)?;
+            if pass.is_bound() {
+                pass.bound().map(|bound| bound.rs_ws.len()).unwrap_or(0)
+            } else {
+                pass.bindings.rs_ws.len()
+            }
+        };
+        if let RsMode::FoldBuffered { tokens } = &mode
+            && bound_rows != 0
+            && tokens.len() != bound_rows
+        {
+            return Ok(Err(format!(
+                "pipeline: rs-mode: fold-buffered supplied {} length(s) for {bound_rows} bound \
+                 recurrent-state working set(s)",
+                tokens.len()
+            )));
+        }
+        let pass = self.ctx().table.get_mut(&this)?;
+        if pass.is_bound() {
+            match pass.bound_mut() {
+                Ok(bound) => bound.rs_mode = mode,
+                Err(error) => return Ok(Err(error)),
+            }
+        } else {
+            pass.bindings.rs_mode = mode;
+        }
+        Ok(Ok(()))
     }
 
     async fn set_rs_working_sets(
@@ -1103,8 +1186,8 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
 #[cfg(test)]
 mod descriptor_binding_tests {
     use super::*;
-    use pie_ptir::container::PortBinding;
-    use pie_ptir::types::{DType, Shape};
+    use pie_ir::container::PortBinding;
+    use pie_ir::types::{DType, Shape};
 
     fn container(ports: Vec<PortBinding>) -> TraceContainer {
         TraceContainer {

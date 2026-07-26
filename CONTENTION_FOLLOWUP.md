@@ -1863,3 +1863,1028 @@ is worse than it looks — membership push alone deletes nothing, and the
 The contended **0.70-0.82x vs vLLM stands untouched** and is accepted cost
 (§17.1(c)). Nothing in this session's work was aimed at it, and §18.6
 showed the tuning branch tops out at 0.78x.
+
+## §20 Extreme stress test vs vLLM 0.26.0 — three liveness defects (2026-07-27)
+
+Scope: hunt every **deadlock / livelock / performance regression** corner
+case in the residency planner and the frame scheduler, with vLLM 0.26.0 as
+the control. L40S 46GB sm_89, CUDA 13.0 toolkit + compat driver,
+Qwen3-0.6B, tp=1, greedy, `ignore_eos`. Parity per §18.1: pie
+`--total-pages P` ⟷ vLLM `--num-gpu-blocks-override P --block-size 16`,
+both exactly 16P tokens; prefix caching off on both.
+
+Method: (a) 14 adversarial single-engine liveness probes aimed at the
+planner endgame, (b) a 35-cell pie-vs-vLLM parity matrix over 5 workload
+shapes × oversubscription X ∈ {0.5 … 32}.
+
+**Four** defects, all liveness, all independent, all reachable with
+**default** configuration: an admission-cap deadlock (§20.1), a starvation
+kill on a fundable pool (§20.2), a frame-seal/bind deadlock (§20.3), and a
+host-swap eviction livelock (§20.6).
+
+### §20.1 Defect 1 — the admission-cap wedge (permanent deadlock)
+
+Four probes (`noswap_4x`, `noswap_16x`, `tinyswap`, `allshared_noswap`)
+hung for the full 150 s deadline emitting one frozen trace 300 times:
+
+    queue=64 head_pages=1 accum=0 free=0/128 host_free=0/0
+    parks=64 serves=0 evictions=0 starved=0 e6_relax=0
+    resident=128 evicting=0 evicted=0 restoring=0
+
+Zero serves, zero evictions, zero starvation kills. The queue head wanted
+**one** page out of a 128-page pool and never got it.
+
+**Root cause.** `Planner::is_wedged()` required *every* `Residency::Resident`
+process to be parked before `check_starvation` would arm. But
+`planner.register()` runs at `spawn()` — registration order *is* the FCFS
+clock — while a process only touches pooled KV after **execution
+admission** (`ensure_execution_admitted`). So whenever
+`num_requests > max_concurrent_processes`:
+
+* the admitted cohort (64) parks on an exhausted pool;
+* the unadmitted remainder (64) sits in `procs` as `Resident` holding
+  **exactly zero pages**, waiting for a permit only a completion can free;
+* `is_wedged()` reads those 64 as "someone is still running" and returns
+  false forever, disarming the only rung that can break the cycle.
+
+A textbook circular wait: the parked hold the permits the unadmitted need,
+and the unadmitted disarm the rung that would free the parked. Note
+`swap_pool_size` defaults to 0, so this is reachable out of the box.
+
+**Fix.** `Proc::admitted`, set by `Planner::note_admitted()` called from
+`ensure_execution_admitted`. `is_wedged()` no longer counts an unadmitted
+process as relief, and `victim_set()` no longer quotes one. Soundness: the
+only `planner.acquire` call site is `pipeline/fire.rs`, reachable only
+downstream of `ensure_execution_admitted`, so an unadmitted process
+provably holds zero device pages. New `admitted=` field in the trace.
+
+**Test.** `runtime/engine/tests/contention_admission_wedge.rs` — 5 lanes,
+admission cap 2, `cpu_pages = 0`. Hangs on the pre-fix tree, passes on the
+fixed one. Live: 150 s hang → 3.7-4.7 s with real progress, on all four
+probes.
+
+### §20.2 Defect 2 — the starvation rung kills on a fundable pool
+
+The 35-cell matrix ran clean (zero deadlocks) except two cells that each
+destroyed exactly one request. `PlannerError::Starved` printed its own
+contradiction:
+
+    4 pages asked, 35 free of 69
+    42 pages asked, 49 free of 97
+
+**Root cause.** A drain only reaches `plan_eviction` when
+`reserve_device_up_to` comes back empty, but *everything after that* —
+`is_wedged`, the exhaustive `last_resort_evict` scan under the global KV
+lock, the trace dump — is a wide window in which a retiring process
+returns its pages. Worse, the window is *biased*: a process leaves `procs`
+at `unregister` **before** its page leases drop, so the wedge predicate
+goes true strictly **before** the pool refills. The kill site
+re-validated `accum` but never re-checked the pool.
+
+**Fix.** `salvage_free_pages()` — re-run the drain's own
+`reserve_device_up_to` primitive and absorb the result into `accum`, then
+poke. Called twice in `check_starvation`: once before `last_resort_evict`,
+once immediately before the kill. Deliberately a *reservation attempt*,
+not an `available_pages() > 0` counter comparison — the counter version can
+spin forever when pages are visible but unreservable, i.e. it trades a
+false kill for a livelock. New `salvages_total` diagnostic.
+
+**Test.** `mod starvation_race_tests` in `planner.rs` with a `RacePool`
+mock `PoolPort` that refills exactly inside the window; red before, green
+after. Live: probe `s64` (`--total-pages 8`, 512 requests, conc 64)
+→ `starved=0 salvaged=1 512/512`. Both matrix cells 3/3 at 256/256, and D
+X=32 throughput 867 → 888 tok/s.
+
+### §20.3 Defect 3 — the rebind/frame-seal deadlock (`bind → dispatch → seal → bind`)
+
+The `churn_extreme` cell collapsed 18x. First it had to be *cleared* of
+being a planner-scaling problem: the same shape with a 900 s client
+deadline recovers fully (238 → 3789 tok/s), so the engine is sound and the
+collapse is not throughput. It is an intermittent **permanent scheduler
+deadlock**, ~10-15% of runs (1 in 6-10).
+
+Repro: `--total-pages 96 --swap-pool-size 16384 --num-requests 4096
+--concurrency 1024 --max-tokens 16 --max-model-len 1536`. Timing-sensitive:
+`PIE_FIRE_TIMING=1` makes it vanish (8/8 clean), so it must be chased with
+`PIE_CONTENTION_TRACE_MS` alone.
+
+Frozen planner trace (new `runners` dump, added for this):
+
+    queue=1000 head_pages=4 accum=0 free=0/96 host_free=16384/16384
+    starved=0 salvaged=0 resident=1817 admitted=1024
+    runners=[2280:h4:ptrue, ...×24]
+
+24 consecutive spawn seqs each holding exactly 4 pages — the entire
+96-page pool, and every one marked `progressed`. Frame dump at the same
+instant (new `[frame-stall]` trace):
+
+    frame k=1 lanes=24 awaited=24 sealed=0 pending_binds=8 staged=793
+    joins_in_flight=0 departing=0 pending_slots=0 ever_sealed=true
+
+`joins_in_flight = 0` and `pending_slots = 0` ⇒ `joining` is false, so the
+seal was held **purely by `missing > 0`**. Exactly 8 lanes had
+`queued_frames=0 front_complete=false`, and **every one of their owners
+appears in `pending_bind_pids`** — perfect correlation across three
+reproductions (5-and-5, then 8-and-8, then 8-and-8).
+
+**Root cause.** A rebinding process's lane stays `awaited` with zero
+frames, so `missing > 0` and the boundary holds. But that process cannot
+submit its next fire until its bind commits, and a bind commits through
+the driver lane's single **control slot — downstream of the very dispatch
+the boundary is holding**. Cycle closed: `bind → dispatch → seal → bind`.
+The frame quorum's wait is infinite by design ("membership changes only
+through close/leave/first-fire events"), so nothing ever breaks it. 19
+lanes had complete frames ready, nothing was executing, and 8 binds stayed
+pending for 30+ s.
+
+`on_bind_enqueued`'s own doc-comment describes this exact hazard for the
+*staged* path and dismisses it with "a live rebinder is already wait-set-held
+through its lane". **That sentence was the bug** — being wait-set-held is
+precisely what deadlocks it.
+
+**Fix (first cut, superseded — see below).** In `plan_dispatch`'s `missing`
+predicate, exclude a lane that is **empty** *and* whose owner has a bind in
+flight. Narrowed to empty lanes on purpose: a lane with queued frames is
+genuinely mid-submission and must still be waited for, so no submitted work
+is ever dropped from an epoch. Rejoin is implicit — the lane's next accepted
+fire restores it to the quorum. Chosen over mutating membership inside
+`on_bind_enqueued` because the declarative predicate covers **both** event
+orderings (bind-then-drain and drain-then-bind) and cannot accidentally
+re-`staged` a live process.
+
+**That first cut closed the deadlock but cost up to 16% throughput.** It
+applied the exclusion on *every* gather, so a healthy boundary stopped
+waiting for lanes that were about to rejoin and sealed a thinner epoch.
+Caught by the full-matrix rerun (§20.5): pie's roomy decode-heavy cells lost
+5-16% while vLLM — the control, same machine, same session — reproduced to
+within 0.3%, which ruled out drift.
+
+**Fix (shipped): gate the escape on the deadlock shape itself.** The
+predicate now counts `missing` densely (pre-fix semantics) and separately
+counts `missing_rebind`, the subset that is empty-with-a-bind-in-flight. The
+rebinders are released only when **all** of:
+
+* `missing == missing_rebind` — every remaining member is an empty rebinder,
+* `!executing` — nothing is in flight, so no retirement will free the
+  driver-lane control slot the binds need (while an epoch executes the cycle
+  cannot close, and the pre-existing `return Park` already covers it),
+* `!joining`, and
+* the stall has persisted `REBIND_ESCAPE_US` (2 ms).
+
+A healthy gather resolves in microseconds and never reaches the grace, so it
+keeps the dense wait-all path; only the deadlock shape pays, and it pays 2 ms
+once. `PIE_FRAME_REBIND_ESCAPE` selects `0` (never escape — reproduces the
+deadlock), `1` (the unconditional first cut), `2` (default).
+
+**A/B, one binary, interleaved trials** (so thermal/clock drift hits every
+arm equally), pie tok/s, median of 3:
+
+| cell | mode 0 (pre-fix) | mode 1 (uncond.) | mode 2 (shipped) |
+| --- | --- | --- | --- |
+| D X=0.5 | 10378 | 8731 (**0.841**) | 10577 (**1.019**) |
+| D X=2   | 7212  | 6787 (0.941)     | 6990 (0.969)     |
+| D X=32  | 900   | —                | 900 (0.998)      |
+| S X=0.5 | 15310 | 13475            | 15714 (1.026)    |
+| X X=0.5 | 4380  | —                | 4466 (1.020)     |
+| M X=1   | 9350  | —                | 10501 (1.123)    |
+
+Mode 2 is neutral-to-positive against the pre-fix engine on every cell
+measured. It also removed a **starvation** side effect of mode 1: the
+`allshared_noswap` probe served `12/128 completed, 116 failed` under mode 1
+and `128/128, 0 failed` under mode 2 — the thinner epochs were driving the
+fleet into the starvation kill.
+
+**Test.** `an_empty_lane_awaiting_its_own_rebind_does_not_hold_the_seal` in
+`frame.rs`'s `mod tests`; asserts the seal proceeds without the rebinder
+*and* that the exclusion is scoped to the bind (once it commits the lane
+holds the boundary again). Red under mode 0, green under modes 1 and 2 —
+the toggle makes the regression test self-verifying.
+
+**Considered and deliberately not covered:** a lane with *queued* frames
+whose front is incomplete (a frame declares `stamp.fires = N` and only
+`k < N` have arrived) whose owner is simultaneously mid-bind. That would
+close the same cycle through a non-empty lane. It is left waited-for
+because (a) all three reproductions showed the stalled lanes at
+`queued_frames = 0`, matching `pending_binds` exactly, (b) excluding a
+partially-submitted lane would drop *already submitted* fires out of the
+epoch, which is a density and ordering regression, and (c) the strict
+watchdog is the existing backstop for a genuinely stuck partial frame.
+Both bind sites (`FrameTruncate`, `RegisterChannelsBind` in `worker.rs`)
+are whole-turn control ops, so a guest reaching them mid-frame would need
+to interleave a bind between fires of one declared frame.
+
+**Live verification.** 44 consecutive repro runs, all
+`4096/4096 failed=0`, zero `[frame-stall]` traces, throughput
+3700-3999 tok/s (σ ≈ 55). Against the ~10% pre-fix wedge rate that is
+`0.9^44 ≈ 0.9%` — i.e. >99% confidence the cycle is closed.
+
+### §20.4 Instrumentation kept
+
+All three defects were only diagnosable because of trace-gated dumps added
+during the hunt; all are bounded and all are kept:
+
+* `PlannerDiagnostics.runners` — the admitted-but-unparked cohort as
+  `(seq, held_pages, progressed)`, capped at `RUNNER_DUMP_CAP = 24`. This
+  is what proved the pool was fully held by *runnable* processes rather
+  than leaked. Computed outside the planner lock (lock order is
+  `RESIDENCIES` → KV store → `planner.inner`).
+* `salvages_total`, `admitted` in `[planner-trace]`.
+* `[frame-stall]` — `debug_summary()` printed once per strict-watchdog
+  expiry, gated on `planner::trace_enabled()`, now including
+  `pending_bind_pids`. The `pending_binds` ∩ zero-frame-lanes correlation
+  is the whole proof of §20.3.
+
+### §20.4b Two more benchmarking traps (cf. §18.11)
+
+* **Never touch a Rust source while a soak is running.** `pie_bench.py`'s
+  `embedded_engine_identity()` hard-fails when the embedded `.so` is older
+  than *any* file under `driver/`, `interface/`, `runtime/`,
+  `sdk/python-server/src/` with a `.rs/.c/.cc/.cpp/.cu/.cuh/.h/.hpp`
+  suffix. It does not care that the edit was a comment or a `rustfmt`
+  reflow, and it does not care that `git stash push` / `stash pop` only
+  restored the file — the mtime moved. This silently converted two 20-run
+  soaks into 20 one-second failures. Markdown is exempt, so the ledger can
+  be written mid-run.
+* **`tests/inferlets/text-completion-bench/target` is a load-bearing
+  symlink**, not build litter. It points at the shared
+  `tests/inferlets/target` holding the prebuilt
+  `wasm32-wasip2/release/text_completion_bench.wasm`; `PIE_BENCH_INFERLET_DIR`
+  resolves through it. Deleting it as "untracked junk" makes every bench
+  run die in `bench_inferlet_paths`.
+
+### §20.4c Throughput regression gate
+
+Three representative matrix cells re-run on the fixed tree, 2 trials each,
+against the §20.5 baseline ledger:
+
+| cell | pages/conc | baseline pie | all four fixes (2 trials) | verdict |
+|---|---|---|---|---|
+| S X=1.0 | 396/64 | 11062, 256/256 | 10495, 11291 (μ 10893) | in band |
+| D X=32 | 69/64 | 867, **255**/256 | 882, 881 (μ 882) | in band, **256/256** |
+| X X=32 | 97/64 | 556, **255**/256 | 551, 568 (μ 560) | in band, **256/256** |
+
+Both X=32 cells now complete every request — the §20.2 salvage holding on
+hardware. No cell regressed; neither the §20.3 seal exclusion nor the
+§20.6 victim block costs measurable epoch density.
+
+Final state: **349 lib + 45 integration** tests green; 14/14 probes with no
+hang and no livelock; 56 cumulative clean runs of the §20.3 deadlock
+repro. rustfmt diff counts at their pre-campaign baselines (`planner.rs` 7,
+`planner/exec.rs` 2, `frame.rs` 0, `bootstrap.rs` 0).
+
+Probe suite, start of campaign → end (completions / failures / wall):
+
+| probe | before | after |
+|---|---|---|
+| noswap_4x | HUNG 150 s | 27ok/101f 4.5 s |
+| noswap_16x | HUNG 150 s | 7ok/121f 3.9 s |
+| tinyswap | HUNG 150 s | 16ok/112f 4.3 s |
+| allshared_noswap | HUNG 150 s | 12ok/116f 3.9 s |
+| churn_extreme | 2284ok/**1812f** 185 s | **4096ok/0f** 48 s |
+| the other 9 | pass | pass, in band |
+
+### §20.6 Defect 4 — the host-swap eviction livelock
+
+Found by re-running the probe suite *after* the first three fixes: the
+`tinyswap` probe (`--total-pages 64 --swap-pool-size 8`, 128 requests,
+conc 64) went from 4 s to **152.7 s** and served 6 requests instead of 12.
+The trace named it immediately:
+
+    parks=1202800 serves=73 evictions=2 evict_rollbacks=1203865
+    gate_parks=1203560 starved=110 resident=10 evicting=1 admitted=12
+
+`evict_rollbacks` past **1.2 million** and climbing ~3.5k per interval
+while `serves` and `starved` were frozen. The `planner-exec` step trace
+carried **4,832,808** lines, all one pid:
+
+    pid=20e7768e evict start: 1 working set(s)
+    pid=20e7768e evict drained; quiescing leases
+    pid=20e7768e evict quiesced; preparing
+    pid=20e7768e evict rollback: host swap full      (×1.2M, ~7.5k/s)
+
+**Root cause.** `KvStoreError::HostSwapFull` routed to `eviction_failed`,
+which restores the victim to `Resident` and immediately `poke()`s. Victim
+selection is a *deterministic* FCFS scan, so the replan re-picks the same
+process and re-runs the entire fence-raise → `notify_process_suspend` →
+drain → lease-quiesce → `prepare_suspend` cycle only to fail identically.
+Nothing in the loop changes any input to the decision, which is the
+definition of a livelock. It also churned the frame policy through
+`notify_process_suspend` 7.5k times a second.
+
+Worse, it *disarmed* the rung that would have broken the jam: a
+perpetually in-flight eviction keeps `is_wedged()` false, and
+`last_resort_evict` kept reporting success (it did dispatch an eviction —
+which then rolled back), so `check_starvation` returned without killing
+and `starved` never advanced. Same shape as §20.1: a spurious "someone is
+making progress" signal.
+
+**Fix.** `Inner::host_swap_blocked: HashSet<ProcessId>`. `HostSwapFull`
+routes to a new `eviction_failed_host_swap_full`, which parks the victim
+there. Both victim scans consult it:
+
+* `victim_set()` — the routine path, and
+* **`last_resort_evict`'s own inline legal-victim scan** — a *separate*
+  scan built under the KV lock. Missing this one is why the first attempt
+  at the fix still livelocked in 2 of 8 runs with `swapfull=1012663`: the
+  block was being set and the routine path did skip it, but the endgame
+  rung re-picked the blocked victim anyway. E6 hysteresis is deliberately
+  waived in that scan; a host-swap block must NOT be, because it is a
+  physical impossibility rather than a preference.
+
+The poke is kept, so a *smaller* victim that still fits can be tried.
+Blocks clear wholesale when host room actually returns — `report_restored`
+(H2D returns slots) and `unregister` (teardown). When the block empties the
+legal set, `last_resort_evict` returns false and `check_starvation`
+proceeds to the kill: failing one request loudly is the designed terminal
+behaviour, and it is strictly better than spinning forever.
+
+**Test.** `a_host_swap_full_victim_is_parked_until_host_room_returns` in
+`mod starvation_race_tests` — asserts the blocked victim leaves
+`victim_set()` and that clearing re-arms it. Red before, green after.
+
+**Live.** `tinyswap` 12/12 runs at **3.7-4.6 s** (was 152.7 s), 11-22
+completions (was 4-6 livelocked, 12 pre-campaign). Two of the twelve
+engaged the new path and it **bounded them at 28 and 13 rollbacks** rather
+than 1,000,000+. `planner-exec` lines 4,832,808 → 22. New trace field
+`swapfull=<exhaustions>/<unblocks>`.
+
+**Methodological note.** This defect was only visible because the probe
+suite was re-run end-to-end after the earlier fixes. Defects 1-3 each
+changed which liveness signals are trusted, and that shifted `tinyswap`
+from "killed fast by the starvation rung" into the eviction-retry path
+where the pre-existing spin lived. Re-run the whole suite after every
+liveness change, not just the probes that were failing.
+
+### §20.5 Standing comparison and the open findings
+
+Final 40-cell parity matrix on the shipped engine (`PIE_FRAME_REBIND_ESCAPE`
+default 2). pie legs re-measured in `/root/matrix_m2`; vLLM legs reused from
+`/root/matrix_fixed` — page counts reproduce exactly and vLLM's whole D
+column re-measured to within 0.3%, which is what licensed the reuse.
+
+Throughput ratio pie/vLLM, `X = concurrency * (prompt + max_tokens) / (16P)`:
+
+| shape | X=0.5 | 1 | 2 | 4 | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|---|---|---|---|
+| S (short)   | **1.043** | 0.931 | 0.866 | 0.815 | 0.839 | 0.816 | 0.858 | 0.807 |
+| D (decode)  | 0.950 | 0.945 | 0.752 | 0.763 | 0.769 | 0.772 | 0.775 | vLLM died |
+| M (mixed)   | 0.978 | 0.872 | 0.782 | 0.809 | 0.816 | 0.841 | 0.867 | vLLM died |
+| X (extreme) | 0.837 | 0.821 | 0.747 | 0.813 | 0.896 | 0.934 | 0.888 | vLLM died |
+
+`N=29 min=0.747 p50=0.837 max=1.043 mean=0.848`. Against the same cells
+before §20.3's regression fix the roomy corner moved from 0.809-0.879 to
+0.950-1.043; nothing moved backwards. The campaign produced exactly one
+performance regression, its own (§20.3), and that one is closed.
+
+**X=64 is where the comparison stops being a comparison.** At 64x
+oversubscription vLLM was SIGKILLed at the case deadline in 4 of the 5
+shapes while pie completed every one of them, shedding load through the
+starvation rung instead of wedging. pie's X=64 numbers have no denominator.
+
+#### Uncontended parity (Qwen3-0.6B, 4096 pages, planner counters all zero)
+
+| case | pie tok/s | vLLM tok/s | ratio |
+|---|---|---|---|
+| latency, conc 1 | 407 | 371 | **1.100** |
+| tput, conc 1    | 407 | 372 | **1.092** |
+| tput, conc 8    | 2848 | 2665 | **1.069** |
+| tput, conc 32   | 9619 | 9333 | **1.031** |
+| tput, conc 64   | 15683 | 15390 | **1.019** |
+| tput, conc 128  | 21606 | 22681 | 0.953 |
+| tput, conc 256  | 22295 | 29664 | 0.752 |
+
+pie leads on both latency and throughput up to 64 concurrent processes and
+falls behind past it. Note these numbers are only meaningful because the
+planner trace was OFF on both engines — see §20.4b, it costs 2.08x.
+
+**Open finding: pie stops pipelining above 64 concurrent processes.**
+Duty cycle = `total_batches * avg_batch_latency_us / measured_seconds`, i.e.
+how many forward batches are in flight on average:
+
+| conc | batches | avg batch us | duty | batch size hist |
+|---|---|---|---|---|
+| 32  | 2048 | 5921 | **1.77** | all 2048 at 32 |
+| 64  | 1025 | 6987 | **1.69** | 1023 at 64 |
+| 128 | 518  | 7376 | **1.00** | 506 at 128 |
+| 256 | 516  | 12042 | **0.94** | 512 at 256 |
+
+Batches are *full* at every point, so this is not a batching-density
+problem — pie simply stops overlapping batches exactly where it starts
+losing to vLLM. A batch of 128 also costs barely more than a batch of 64
+(7376 vs 6987 us), so the GPU is not the limit either; recovering the 1.7x
+overlap at conc 128 would roughly double throughput there.
+
+This is **not** a contention defect and **not** a regression from this
+campaign: `PIE_FRAME_REBIND_ESCAPE=0` (pre-§20.3 behaviour) shows the same
+collapse (duty 0.98/0.96 at conc 128, 0.96/1.12 at 256), and the planner is
+completely idle in these runs (`evictions=starved=parks=restores=0`). It
+lives in the fire/quorum path, not in Rainer.
+
+**Open finding (not a defect, a design gap): pie has no KV-aware admission
+control.** pie admits by *process count*; vLLM admits by *KV block
+availability* with a WAITING queue and will simply not start a request it
+cannot fund. At a fixed 96 pages:
+
+| engine | concurrency | result |
+|---|---|---|
+| pie | 1024 | 238 tok/s, 1852 timeouts |
+| pie | 256 | 4290 tok/s, 4096/4096 |
+| pie | 1024, 900 s deadline | 3789 tok/s, 4096/4096 |
+| vLLM | 1024 | 5596 tok/s, 4096/4096 |
+
+The engine is sound — the work completes — but with concurrency far above
+what the pool can fund, pie spreads the pool thin and pays it entirely in
+tail latency, where vLLM converts the same oversubscription into queueing.
+Admission that consults free KV (rather than only
+`max_concurrent_processes`) is the natural follow-up and is the single
+largest remaining gap this campaign found.
+
+### §20.7 The scenario suite moved into the tree (2026-07-27)
+
+Everything this campaign used as a one-off probe now lives in
+`tests/contention/` as a declarative table plus a runner:
+
+    python tests/contention/run.py                  # every scenario
+    python tests/contention/run.py -k tinyswap,soak # a subset
+    python tests/contention/run.py --repeat 3       # override repetition
+    python tests/contention/run.py --list
+
+Each scenario names the planner endgame path it aims at and carries a
+`Contract`: a wall-clock ceiling (exceeding it is a hang), completion and
+failure bounds, `accounted` (completed + failed == requests, so nothing
+vanishes), `require_counters` (planner counters that must be non-zero, so a
+scenario cannot rot into a no-op when policy shifts underneath it),
+`max_counters` (this is how §20.6's 1.2M-rollback livelock is
+regression-tested) and forbidden log substrings (`[frame-stall]` is §20.3's
+tell). The exit status is non-zero if anything violates its contract, so it
+drops straight into the `[self-hosted, cuda]` CI job.
+
+Every scenario drives a **real** driver. There is no mock device anywhere in
+the suite, by design: all five defects lived in the interaction between the
+planner, the scheduler's frame boundary and the driver's copy engine, and a
+mock device reproduces none of it.
+
+Four things the first end-to-end run taught, all now encoded:
+
+* the runner has to put a **working** CUDA forward-compat directory on
+  `LD_LIBRARY_PATH` or the driver aborts with `pie_cuda_create returned
+  null`. Taking the highest-versioned `/usr/local/cuda-*/compat` is wrong on
+  a box carrying a toolkit newer than the kernel driver's ceiling — 13.3's
+  libcuda 610.43.02 loads happily and then fails `cuInit` against a 550
+  kernel module. The runner probes `cuInit` per candidate and takes the
+  first that actually initialises.
+* `PIE_CONTENTION_TRACE_MS` must be well under the shortest scenario's
+  runtime. The fast-fail scenarios finish in 0.9 s, so at the original
+  1000 ms sampling period **not one trace line was ever emitted** and every
+  `require_counters` assertion reported "never fired" — a false failure that
+  reads exactly like a real regression. The default is now 200 ms, and "no
+  trace line at all" is reported as its own distinct violation.
+* the prefix-sharing scenarios need `warmup=1`. Without a warmup request
+  nothing has published the shared prefix, so all 128 processes arrive with
+  a private copy of it and the fleet starves on arrival instead of
+  exercising `ReclaimQuote -> Nothing(AllShared)`.
+* a contract has to be calibrated against the defect it claims to guard, not
+  guessed. `tinyswap` at the original 64 pages / 8 swap pages never reached
+  `HostSwapFull` at all — the starvation rung killed the fleet first and
+  `swapfull` stayed 0. Re-sized to 128/16 at concurrency 16 it fires 10-58
+  swap-full hits on every run while the fleet still finishes 61-63 of 64.
+  Conversely `allshared_noswap` cannot gate on completion counts: measured
+  four runs per mode, `PIE_FRAME_REBIND_ESCAPE=1` completes 16-24 and mode 2
+  completes 31-59, distributions that touch. That scenario asserts liveness
+  only and §20.3's A/B harness pins the mode difference instead.
+
+### §20.8 `PIE_FRAME_SIZE=2` buys the high-concurrency gap back — and breaks contention liveness (2026-07-27)
+
+§20.5's open finding was that pie stops overlapping batches above 64
+concurrent processes. The frame constant k (`PIE_FRAME_SIZE`, waves per
+frame, default 1, driver-supported to 4) is the direct lever: at k = 1 the
+wait-all quorum runs once per token, so every lane must arrive before any
+lane advances.
+
+Uncontended, Qwen3-0.6B, 4096 pages, interleaved arms, best of two trials:
+
+| case | pie k=1 | pie k=2 | vLLM | k1/vLLM | k2/vLLM |
+|---|---|---|---|---|---|
+| latency, conc 1 | 397 | 395 | 371 | 1.069 | 1.066 |
+| tput, conc 1   | 409 | 399 | 372 | 1.098 | 1.072 |
+| tput, conc 8   | 2853 | 2873 | 2668 | 1.069 | 1.077 |
+| tput, conc 32  | 9650 | 9701 | 9399 | 1.027 | 1.032 |
+| tput, conc 64  | 15642 | 15675 | 15542 | 1.006 | 1.009 |
+| tput, conc 128 | 21656 | 22132 | 23199 | 0.933 | 0.954 |
+| tput, conc 256 | 21670 | **27955** | 29928 | 0.724 | **0.934** |
+
+k = 2 costs nothing anywhere and recovers most of the conc-256 gap
+(0.724 -> 0.934), with mean latency there falling 2408 -> 1748 ms. The
+mechanism is exactly the one §20.5 identified: duty (batches in flight)
+goes from a bimodal 0.80-1.33 at k = 1 to a stable 1.59-1.60 at k = 2.
+**k = 1 at conc 256 is not merely slower, it is unstable** — it drops out
+of pipelining entirely on roughly half the runs. k = 4 measured the same as
+k = 2, and raising `PIE_SCHED_MAX_IN_FLIGHT` 2 -> 3 changed nothing (the
+run-ahead depth was never the binding constraint).
+
+**But k = 2 is not contention-safe.** `tests/contention/run.py` under
+`PIE_FRAME_SIZE=2`: **12 of 16 scenarios fail**, against 16/16 at k = 1.
+
+| outcome | scenarios |
+|---|---|
+| HANG (killed at the ceiling) | `tinyswap` 3/3, `tinyswap_thrash`, `impossible`, `fwd1` |
+| **SIGSEGV** (rc = -11) | `mixed_head`, `soak` |
+| `[frame-stall]` + mass failure | `restore1` (9/256 completed) |
+| degraded | `hog` 0/32, `onefits` 25/64, `churn` 2047/2048 in 181 s (44 s at k = 1) |
+| pass | `noswap_4x`, `noswap_16x`, `allshared`, `allshared_noswap`, `churn_extreme` 4/4, `admission_tail` |
+
+The split is perfectly explained by eviction volume. Everything that passes
+does 0 or 1 evictions; everything that fails evicts continuously
+(`restore1` 33, `onefits` 36, `tinyswap` 5, `soak` 47).
+
+Root cause, read straight off the diagnostic — 11 of 12 lanes complete, one
+not:
+
+    [frame-stall] frame k=2 lanes=12 awaited=12 sealed=0 ... ever_sealed=true
+      lane ...0004 awaited=true queued_frames=1 front_complete=true
+      lane ...000b awaited=true queued_frames=1 front_complete=false   <- owner c96a0ef8
+      ... (ten more, all front_complete=true)
+    [planner-trace] ... evictions=33 gate_parks=33 evicting=1 evicted=15
+
+and for that same owner:
+
+    [planner-exec] pid=c96a0ef8... evict start: 1 working set(s)
+    [planner-exec] pid=c96a0ef8... evict drained; quiescing leases
+
+**The planner quiesces a lane mid-frame.** At k = 1 a fire *is* a frame, so
+a park/evict boundary is a frame boundary by construction and the wait-all
+gate can never see a half-arrived frame. At k > 1 an eviction that lands
+between slot 0 and slot 1 leaves the lane's frame permanently
+arrival-incomplete, and the infinite wait-all rule then holds the entire
+epoch behind it — the same failure shape as §20.3's rebind/frame-seal
+deadlock, but reached through the eviction path instead of the bind path,
+and not covered by that fix's escape (which keys on empty lanes awaiting
+their own rebind, whereas here the lane is non-empty and half-full).
+
+The two SIGSEGVs are a separate, harder failure: `mixed_head` and `soak`
+die with no panic message, i.e. in native driver code, which the
+half-drained frame state is presumably feeding.
+
+#### Defect 5 — a partial frame stranded by a mid-frame leave (FIXED)
+
+Two coupled faults, both invisible at k = 1 because a 1-slot frame is
+complete the instant it arrives:
+
+**5a — an arrival racing the suspend rejoined the wait-set.**
+`planner/exec.rs` broadcasts `notify_process_suspend` at evict step 3, and
+the fence raised at step 2 stops new *leases*, not a fire already past it.
+`record_arrival`'s `lanes.entry(...).or_insert_with(|| LaneState { awaited:
+true, .. })` therefore recreated the victim's lane as an awaited member
+holding a one-slot-of-two frame whose remaining slots sat behind the
+eviction. Fix: `FramePolicy::suspended`, a set the planner's suspend adds
+to and its runnable-again chokepoints (`report_restored`,
+`eviction_failed_inner`) clear through the new
+`worker::notify_process_resume` / `SchedulerItem::ProcessResume` /
+`FramePolicy::on_process_resume`. While marked, arrivals are recorded
+without joining the wait-set.
+
+**5b — the stranded slot never sealed, so its lease never released.**
+Un-awaiting the lane unblocks the *fleet*, but the victim's own half-frame
+still could not seal, and a queued fire holds a lease. Eviction step 5
+(`handle.quiesce().await`) waits on exactly those leases, so the eviction
+wedged mid-flight — `evicting=1` forever, the planner head stuck on
+`head_kind=allocation`, and the whole fleet starving behind it. The same
+circle is reachable with no planner at all: the KV allocation-wait park
+posts a lane close mid-frame, and the guest cannot finish the frame until
+it is served, which needs the fleet to advance, which the frame blocks.
+
+Fix: `LaneState`/`FramePolicy::truncate_incomplete` — every path that takes
+a lane out of the wait-set mid-frame (`on_lane_leave` non-purging,
+`on_process_suspend`) now cuts its unfinished frames down to what ARRIVED,
+so they seal, drain and release their leases. Arrivals under a suspended
+owner are self-completing for the same reason. The slots the cut discarded
+may still arrive (the guest resumes inside its submit loop), so
+`FramePolicy::truncated_seqs` remembers the cut seq per lane — kept outside
+`lanes` because a truncated lane is normally dropped the moment its frames
+drain, well before the late slot lands — and a late slot stands alone
+instead of re-forming an unsatisfiable frame. `PendingFrame::truncated`
+keeps `expected` from being re-raised by a later slot's `stamp.fires`.
+
+Also fixed in `pipeline/fire.rs`: the mid-frame truncation notice was only
+sent on the *logical* submit-error path; a host trap returned through `?`
+and left the frame arrival-incomplete forever.
+
+Regression tests: `a_fire_racing_the_suspend_seals_alone_without_rejoining_the_wait_set`
+and `a_lane_parked_mid_frame_seals_what_it_submitted` (`scheduler/frame.rs`).
+
+#### Post-fix: k = 2 is contention-clean, and k = 3/4 buy nothing
+
+`tests/contention/run.py` after the fix: **16/16 at k = 1, 2, 3 and 4**
+(from 12 failures at k = 2 before). `churn` returned to 43 s from 181 s.
+
+Uncontended sweep, best of two trials:
+
+| case | k=1 | k=2 | k=3 | k=4 | k2/k1 |
+|---|---|---|---|---|---|
+| lat, conc 1 | 396 | 410 | 412 | 409 | 1.036 |
+| tput, conc 8 | 2835 | 2865 | 2871 | 2884 | 1.011 |
+| tput, conc 32 | 9648 | 9654 | 9624 | 9657 | 1.001 |
+| tput, conc 64 | 15499 | 15629 | 15486 | 15508 | 1.008 |
+| tput, conc 128 | 21776 | 22042 | 22052 | 21960 | 1.012 |
+| tput, conc 256 | 21767 | **28050** | 27899 | 27615 | **1.289** |
+
+k = 3 and k = 4 are indistinguishable from k = 2 (0.98–1.00 of it) while
+costing more staging depth and a coarser truncation granularity under
+contention, so **k = 2 is the setting**: the whole win is the duty cycle
+(conc 256: 1.12 -> 1.62; conc 128: the bimodal 1.00/1.67 collapses to a
+stable 1.67), which is what §20.5's open finding predicted. Mean latency at
+conc 256 falls 3746 -> 2918 ms. `PIE_FRAME_SIZE` default raised 1 -> 2.
+
+Final parity against vLLM 0.26.0 on the shipped default, interleaved arms,
+best of two trials (4096 pages both sides):
+
+| case | pie k=1 | pie k=2 | vLLM | k1/vLLM | k2/vLLM |
+|---|---|---|---|---|---|
+| latency, conc 1 | 411 | 399 | 370 | 1.110 | 1.077 |
+| tput, conc 1 | 409 | 401 | 372 | 1.101 | 1.079 |
+| tput, conc 8 | 2823 | 2867 | 2669 | 1.058 | 1.074 |
+| tput, conc 32 | 9614 | 9701 | 9609 | 1.001 | 1.010 |
+| tput, conc 64 | 15663 | 15782 | 15619 | 1.003 | 1.010 |
+| tput, conc 128 | 21646 | 22084 | 22820 | 0.949 | 0.968 |
+| tput, conc 256 | 27110 | 28061 | 29664 | 0.914 | 0.946 |
+
+pie is ahead of vLLM at concurrency 1–64 and within 3–5% at 128/256 (from
+7%/28% behind). Note that k = 1 landed in its GOOD mode at conc 256 here
+(27110) where the sweep above caught its bad mode (21767): k = 1 is
+bimodal at that point and k = 2 is not — the run-to-run spread is the
+reason to take the default, independent of the mean.
+
+## §20.9 The settlement callback sat on the compute stream (2026-07-28)
+
+### Question
+
+With `PIE_FRAME_SIZE=2` the decode pipeline should be perfectly covered:
+frame *N+1* is submitted while frame *N* runs, the sampled token carries over
+**on device** through the channel, and no host round trip separates the two
+forward passes. Yet uncontended conc 256 still trailed vLLM by 3–7%, and
+raising *k* to 3 or 4 changed nothing. Why?
+
+Steady-state cycle, two-point `(wall@256tok − wall@128tok)/128`, 12288 pages,
+conc 256:
+
+| engine | cycle |
+| ------ | ----- |
+| pie k=1 | 13.835 ms |
+| pie k=2 | 13.407 ms |
+| vLLM    | 12.946 ms |
+
+k=2 is 1.036× vLLM, i.e. **+461 µs per wave** to account for.
+
+### First diagnosis — wrong
+
+`PIE_FIRE_TIMING=1` puts p50 host work at 1525 µs/wave, of which FrameSettle
+is 859 µs and `finish_epilogue` 709 µs (execute 286 / group 279 / assemble
+71). Tempting, but wrong: NVTX shows that work starting *mid* graph replay and
+the submitting thread idle ~70% of the wall. It is not GPU-visible. Rejecting
+it is what forced the real answer out.
+
+### Evidence chain
+
+Against a conc-256 k=2 nsys capture (`--cuda-graph-trace`, KERNEL ∪ MEMCPY ∪
+MEMSET ∪ GRAPH_TRACE merged — omitting any of those tables manufactures fake
+idle):
+
+1. The wave is 8205 µs: 7476 µs graph replay (91.1%) + 382 µs non-graph
+   device + **347 µs idle**. The single largest idle window sits between
+   `k_settle_host_channels_batch` and the next wave's
+   `k_pull_validate_host_channels_batch`, p50 224 µs.
+2. Not starvation. In 284 of 290 steady gaps the next wave's
+   `k_pull_validate` had *already been submitted*, p50 8673 µs **before** the
+   GPU went idle.
+3. Genuinely idle, not misattributed: p50 busy inside the window is 8.9 µs of
+   224.2 µs.
+4. Not a cross-stream wait. `STREAM_WAIT_EVENT` totals 1.1 µs over the whole
+   window set, and the last op on any non-main stream ends p50 2360 µs before
+   the window closes.
+5. **Zero host CUDA API calls occur during the window.** Whatever holds the
+   stream makes no CUDA calls — a driver-internal thread.
+6. Scaling control at conc 32 vs 256: 124.8 µs vs 224.2 µs, i.e.
+   **gap = 111 µs + 0.44 µs × lanes**.
+
+### Root cause
+
+`dispatch.cu` enqueued the settlement notification on the **compute stream**:
+
+```
+:4942  cudaStream_t callback_stream = stream;
+:5088  cudaStream_t settlement_stream = callback_stream;   // batch_copies == false here
+:5161  cudaLaunchHostFunc(settlement_stream, notify_runtime_callback, notify);
+```
+
+A host-function node holds its stream until the CUDA driver's callback thread
+wakes on the CPU and returns. Everything queued behind it — including the
+already-submitted next wave — cannot start. The 111 µs constant is the
+callback-thread wakeup; the 0.44 µs/lane term is `notify_runtime_callback`
+releasing each instance's `callback_fence`.
+
+This is precisely why *k* never helped: **k pre-queues wave N+1 behind the
+blocking node**, and a blocking node cannot be jumped by pre-queueing. k=2,
+3 and 4 all measured the same because they were all waiting on the same CPU
+thread.
+
+### Fix
+
+Move the host function to a dedicated `notify_stream`:
+
+* record `settlement_ready` on the settlement stream after
+  `launch_settle_host_channels_batch`, have `notify_stream` wait on it, and
+  launch `cudaLaunchHostFunc` there;
+* record both `notify->callback_done` and a new
+  `settlement_callbacks_done` on `notify_stream`.
+
+One hazard has to be handled. `commit_snapshot()` pools pinned host buffers
+per **(BoundInstance, occurrence-within-wave)** and reuses them every wave, so
+wave *N+1*'s D2H publications write the very buffers wave *N*'s callback
+reads. The on-compute-stream host func was providing that barrier by accident.
+It is restored explicitly with a `cudaStreamWaitEvent` on
+`settlement_callbacks_done` placed immediately **before** this wave's
+`enqueue_host_publish_copies` — a full forward pass downstream of the record,
+so it never blocks in the covered case, and no cycle is possible because the
+awaited record is always from a strictly earlier wave (`Dispatch::finish` is
+serialized by `settlement_mutex`). `NotifyContextLease` now drains
+`notify_stream` on the exception path as well.
+
+### Result (conc 256 unless noted, 4–8 trials each)
+
+| case | before | after | Δ |
+| ---- | ------ | ----- | - |
+| conc 64, k=1 | 15634 | 16243 | +3.9% |
+| conc 64, k=2 | 15758 | 16145 | +2.5% |
+| conc 256, k=2 | 27866 | **28497** | +2.3% |
+| conc 256, k=1 fast mode | 26981 | **28656** | +6.2% |
+| steady cycle vs vLLM | 1.0356× | **1.0154×** | gap halved |
+
+k=2 at conc 256 is now 8/8 trials inside 1% (28371–28656) against a vLLM
+reference of 29621–29688, i.e. 0.962× on throughput where it was 0.937×.
+Contention suite: 16/16.
+
+## §20.10 Why k=1 at conc 256 is multimodal (2026-07-28)
+
+k=1 lands anywhere in 18.8-29.0 k tok/s across process launches while k=2 does
+not. Ruled out first, all measured, none of them the cause:
+
+* **GPU clocks** — SM clock pinned at 2520 MHz in every mode, no throttle
+  reason asserted, temp <= 44 C.
+* **NUMA** — the GPU is local to node 1, but `taskset` onto node 1 *or* node 0
+  is equally multimodal.
+* **Host CPU frequency** — schedutil governor, but max / 8th / median core MHz
+  are identical (3250 / 2846 / 1500) in fast and slow runs.
+* **External contention** — GPU empty (1 MiB), load ~11 on 128 cores.
+* **Engine decisions** — memory planner output, 51 captured decode graphs,
+  batch count, batch-size histogram, `max forward requests: 256`, prompt and
+  output token counts are all identical across modes.
+
+### It is duty, and duty is quantised
+
+Duty = mean forward batches in flight = `avg batch latency / (wall / batches)`.
+Measured (conc 256, 12288-page-equivalent budget, 8 trials per arm):
+
+| arm | duty | tok/s |
+| --- | ---- | ----- |
+| k=2 (default), 8/8 | 1.56-1.60 | 28371-28656 |
+| k=1, fast | 1.54-1.58 | 26.8-29.0 k |
+| k=1, mid | 1.09-1.11 | 21.4-22.2 k |
+| k=1, slow | 0.82-0.85 | 18.7-18.8 k |
+| k=1 with `PIE_SCHED_MAX_IN_FLIGHT=1` | 0.84-0.85 | 19.8-20.2 k |
+
+Two things follow immediately.
+
+**k does not create the overlap.** A healthy k=1 run reaches duty 1.58 — the
+same as k=2. Frame overlap is structural and k-independent: `FramePolicy`
+seals the next frame the moment the wait-all gate holds, normally while the
+current frame is still executing, and posts its waves behind the executing
+frame's tail at the run-ahead depth. There is no launch-time barrier; the
+driver's device-side `pass_commit` tickets order dependent fires by stream
+order and a frame-boundary dependency is structurally identical to an
+intra-frame one. What k changes is how *often* the wait-all seal boundary
+occurs (once per k waves) and therefore how much GPU time is available to
+cover one host turn.
+
+**The slow mode is the run-ahead collapsing, not extra work.** Forcing
+`PIE_SCHED_MAX_IN_FLIGHT=1` reproduces the slowest mode exactly and, unlike
+the default, *stably* (sigma = 220 tok/s). Depth 3 does not help: the cap is
+not the limiter, arrival into the seal window is.
+
+### The mode is per COHORT, not per run
+
+512 requests at concurrency 256 is two cohorts of 256. Splitting each run in
+half (`cohort1 = 2*lat_mean - wall`):
+
+```
+k=1 fixed  28586 tok/s   cohort1 30.4k   cohort2 27.0k     fast, fast
+k=1 fixed  22225 tok/s   cohort1 29.5k   cohort2 17.8k     fast, slow
+k=1 fixed  22156 tok/s   cohort1 18.2k   cohort2 28.2k     slow, fast
+k=1 fixed  18779 tok/s   cohort1 18.2k   cohort2 19.4k     slow, slow
+k=2 fixed  (8 runs)      every cohort 28.0-29.0k
+```
+
+Each 256-process cohort independently settles into duty ~1.58 or ~0.83 when it
+forms, holds it for all 128 of its decode waves, and the run-level modes are
+just the two combinations: 28.5 k (fast+fast), ~22 k (mixed), 18.8 k
+(slow+slow). Matching duty levels 1.58 / 1.10 / 0.83 confirm the arithmetic.
+k=2 never collapses in any of its 16 observed cohorts.
+
+### Where the stall is
+
+nsys on a k=1 run, merged device-op gaps above 200 us by bracketing operation:
+
+```
+258  786 ms  avg 3046 us   k_settle_host_channels_batch -> MEMCPY
+149  461 ms  avg 3097 us   MEMCPY -> MEMCPY
+143   53 ms  avg  371 us   MEMCPY -> embed_bf16_kernel
+```
+
+258 is exactly the batch count: the stall is at the seal boundary, between one
+frame's settlement and the next frame's H2D upload. The idle *immediately*
+before a wave's `k_pull_validate` is p50 1.4 us, so nothing is waiting on
+batch construction once the frame has been sealed — the wait is for the seal.
+
+The seal is wait-for-ALL: it holds until every awaited lane's oldest queued
+frame is arrival-complete, so the binding term is the **slowest of 256** lanes'
+resubmit each frame. At k=1 that maximum is paid once per wave and has one
+wave of GPU time (~7.1 ms) to hide behind; at k=2 it is paid half as often and
+has two waves (~14.9 ms). The absolute cost of the turn scales with lane count,
+not with k — which is why k=2 is comfortably covered and k=1 sits on the edge.
+
+Two levers confirm the turn is the term that varies:
+
+* **Any added host cost pins k=1 slow.** `PIE_FIRE_TIMING=1` (65 664 per-fire
+  JSON records) parks it at 14.9-15.8 k, 4/4; nsys parks it at 17.0-21.7 k,
+  4/4. Neither perturbs k=2 comparably.
+* **Tokio worker count moves it.** conc 256, k=1, 4 trials each:
+  `--worker-threads 8` -> 27100/27084/26664/23177; `32` ->
+  18987/18677/19015/19079 (sigma = 179); 16 and the default 64 are multimodal.
+  (`default_worker_threads()` in `worker/src/config.rs` already caps at 64 for
+  exactly this class of variance on EPYC.)
+
+### Status
+
+**Open**: what decides a cohort's mode at formation is not yet identified. It
+is not any of the environmental or planner variables above, it is stable for
+the cohort's entire life, and it is independent between consecutive cohorts in
+one process.
+
+**Not on the default path.** k=2 has been the default since §20.8 precisely
+because it puts the seal boundary behind two waves of cover: on the fixed
+build conc 256 k=2 is 28371-28656 over 8 trials, a 1.0% spread, with no
+collapsed cohort observed. The §20.9 fix raises k=1's fast mode
+(26981 -> 28656, +6.2%) and leaves the collapsed mode where it was (baseline
+18.9-21.7 k, fixed 18.8-22.2 k) — a strict improvement that does not remove
+the bistability, because the residual stall is the seal turn rather than the
+callback node. If k=1 must be used at high concurrency, `--worker-threads 8`
+is the lever.
+
+## 20.11 The k = 1 collapse was a guest window-sizing bug, not a law
+
+§20.10 left one question open: what latches a cohort into the collapsed mode.
+The answer is that nothing latches it *in the engine* — the cohort simply never
+had enough queued work to absorb a straggler, and the shortfall was written
+into the **guest**, not the runtime.
+
+### The cover rule
+
+`tests/inferlets/text-completion-bench/src/lib.rs` kept a run-ahead window of
+`2 * live_slots` fires, i.e. exactly **two frames**, for every `k`. The engine's
+frame seal is wait-for-ALL: it holds until every awaited lane's oldest queued
+frame is arrival-complete, so the binding term is the slowest of `concurrency`
+lanes' resubmit. What buys that straggler its time is the work already queued
+*behind* the running frame:
+
+```
+cover_waves = window_fires - live_slots = (window_frames - 1) * k
+```
+
+A two-frame window therefore gives `k` waves of cover — **two** at k = 2, and
+**one** (~7.1 ms) at k = 1. The old rule sized the window in frames, but the
+quantity that has to cover a straggler is measured in waves. k = 1 was running
+with a third of the cover k = 2 got, from the same line of guest code.
+
+### Measurement (Qwen3-0.6B, L40S, conc 256, on the §20.9 build)
+
+| arm | cover | result | median |
+| --- | --- | --- | --- |
+| k=1, `2*k` (old) | 1 wave | multimodal 18.8k / 22k / 28.5k | 25184 |
+| k=1, 3 frames | 2 waves | 7/8 at 28.6-29.5k, 1/8 collapsed | 28687 |
+| k=1, 4 frames | 3 waves | **6/6 at 28663-29488** | **29044** |
+| k=2, `2*k` (old) | 2 waves | 8/8 at 28371-28656 | 28497 |
+| k=2, cover 3 | 3 waves | 6/6 at 28217-28795 | 28654 |
+
+Duty (mean forward batches in flight) confirms the mechanism directly: the
+k = 1 window-3 arm runs at **1.72-1.74**, up from 1.58 in the healthy old-rule
+runs and 0.83 in the collapsed ones. 15 of its 16 cohorts sit at 27.6-30.5k.
+
+Two conclusions:
+
+1. **The collapse is removable.** At three waves of cover k = 1 is unimodal
+   over 6/6 trials, and its median (29044) is *above* k = 2's (28497) — a
+   smaller frame with adequate cover beats a larger frame, because the seal
+   quantum is finer. Against vLLM's 29621-29688 that is a ratio of 0.979,
+   up from 0.961.
+2. **k >= 2 was already saturated.** Giving k = 2 a third wave of cover moves
+   nothing (28497 -> 28654, inside the noise), which is why the defect only
+   ever showed at k = 1 and why k = 2 has been a safe default.
+
+### Fix
+
+The window now takes the max of two independent floors:
+
+```rust
+let window_fires = live_slots + live_slots.max(3);
+```
+
+* `>= 1 whole extra frame` — frames settle atomically, so a window shorter
+  than two frames leaves zero queued frames while a k >= 2 frame runs.
+* `>= 3 waves of cover` — the straggler allowance, independent of `k`.
+
+At k = 1 this is 4 fires (was 2), at k = 2 it is 5 (was 4), and at k >= 3 the
+frame floor already dominates so the value is unchanged (k = 4: 8 either way).
+
+Verified: conc 64 k = 2 measures 16132-16200 (median 16153) against the §20.9
+baseline of 16145 — no regression on the default path — and the contention
+suite is 16/16.
+
+### What this does not change
+
+`PIE_FRAME_SIZE` stays at 2. k = 1 with a correctly sized window is marginally
+faster at conc 256, but k = 2 is within 2% there, is unimodal under the *old*
+guest rule as well, and costs less staging depth per lane; §20.8's reasons for
+the default are untouched. The finding's real content is that **run-ahead cover
+is a guest responsibility and must be sized in waves, not frames** — any
+inferlet that hard-codes a frame-count window inherits this bug at k = 1.
+
+### 20.11.1 Why the natural "two frames in flight" pattern is not enough
+
+The old rule is the obvious pipelining discipline: submit two frames, then top
+up one frame per frame that drains. It is correct in shape. What it gets wrong
+is the *runway* it leaves, which is easiest to see in steady state:
+
+* a lane holds `W = window_fires` submitted-but-undrained fires;
+* a whole guest frame settles atomically, so `k` fires drain at once and the
+  lane drops to `W - k` outstanding;
+* those `W - k` fires are the lane's runway — `(W - k) * T_wave` of already
+  queued work before the engine has nothing from this lane to seal with.
+
+`W = 2k` therefore leaves a runway of exactly `k` waves *whatever k is*, while
+the thing it has to hide — the host turnaround `H` from settlement to the
+guest's next `submit_frame` — does not shrink with `k` at all. At conc 256,
+`T_wave` is 8.76 ms, so k = 1 gets 8.8 ms of runway and k = 2 gets 17.5 ms.
+Measured `H_max` there is 17-26 ms: k = 2 clears it by a hair, k = 1 does not.
+That is the entire asymmetry.
+
+Note also that a lane running dry is not a lane-local slowdown. The seal is
+wait-for-ALL, so one dry lane stalls the whole cross-lane batch.
+
+### 20.11.2 Guest window vs engine depth — two different "frames"
+
+The word *frame* names two different objects and the distinction is what makes
+the accounting work:
+
+| | guest frame | engine frame (a "batch") |
+| --- | --- | --- |
+| what | `k` fires from ONE lane (`submit_frame`) | one guest frame from EVERY lane |
+| size | `k` waves | `k` waves x N lanes |
+| who caps it | the inferlet, via `window_fires` | the engine, via `configured_max_in_flight()` |
+
+`in_flight_launches` (`scheduler/worker.rs:2105`) is a single deque in the
+scheduler loop, so `configured_max_in_flight()` = 2 is a **global** cap of two
+cross-lane batches posted to the driver — not a per-lane depth. Confirmed by
+the batch arithmetic on 512 x 128 = 65536 output tokens at conc 256: k = 1
+reports 260 batches (252 tok/batch = 256 lanes x 1 wave), k = 2 reports 130
+(504 tok/batch = 256 lanes x 2 waves).
+
+The consequence is that widening the guest window does **not** deepen the
+device pipeline — the driver's depth is fixed by the engine and by
+`kSchedulerMaxInFlight`/`kUploadStagingDepth`. The extra fires simply wait in
+the engine's `pending` queue. That is precisely their job: what the seal gate
+needs is for every lane to *have a fire queued* when it evaluates, and a lane
+whose guest has not resubmitted yet has none.
+
+### 20.11.3 Cover sweep — why 3, and the cost of more
+
+Cover is a time budget (`cover * T_wave` must exceed `H_max`), so it was swept
+against both concurrency and cover. `T_wave` is the per-wave service period,
+`wall / batches / k`:
+
+| conc | `T_wave` | cover 1 | cover 2 | cover 3 | cover 6 |
+| --- | --- | --- | --- | --- | --- |
+| 64 | 3.97 ms | 16357 ok | - | 16276 ok | - |
+| 256 | 8.76 ms | 25184 **multimodal** | 28687 (7/8) | **29044 ok** | 28372 ok |
+| 512 | 16.9 ms | 23269 **collapsed** | 30280 ok | 30256 ok | - |
+
+Reading the failures as a time threshold: conc 64 clears at 3.97 ms of runway,
+conc 256 fails at 8.8 ms and clears at 26.3 ms, conc 512 fails at 16.9 ms and
+clears at 33.8 ms. So `H_max` grows with lane count but *sublinearly relative
+to* `T_wave`, which grows too — and the ratio peaks in the middle. **conc 256
+is the binding point**, needing 3 waves; 512 needs only 2 and 64 needs 1.
+
+More cover is not free, which is why the constant is 3 and not 8. At conc 256
+cover 6 is perfectly stable but measures 28372 against cover 3's 29044, a 2.3%
+loss: a larger window reserves more KV ahead per lane (`reserve_to_tokens`
+covers every submitted fire) and lengthens the queue the scheduler scans each
+seal. Cover 3 is simultaneously the maximum the sweep requires and the optimum
+at the point that requires it.

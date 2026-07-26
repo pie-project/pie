@@ -59,43 +59,31 @@ void bind_expert(
     ew.w3_scale = maybe(engine, prefix + "w3.scale");
 }
 
-// Persistent storage for converted FP32 scale tensors.
-// The DeviceTensors here outlive the bind call and are referenced via QuantMeta.
-std::vector<DeviceTensor> g_dsv4_f32_scales;
-
-// Convert an E8M0 block-scale tensor to FP32 and build a QuantMeta.
-// E8M0: each byte encodes scale as 2^(byte - 127).
-// The FP8 GEMM expects FP32 *inverse* scales (1/scale) for per-channel,
-// or direct scales for PerGroup depending on the implementation.
-// We store direct scales and let the dispatcher handle it.
+// Build a QuantMeta for a block-scaled FP8 weight.
+//
+// The scale arrives already decoded: `dsv4_block_scales_to_fp32` states in the
+// contract that the checkpoint's E8M0 bytes are read as fp32, so the loader
+// casts them on the device during the load. This used to download every scale,
+// run `ldexpf` over it on the host and upload the result -- into a global
+// vector whose `push_back` invalidated the pointers it had already handed out.
 std::optional<QuantMeta> make_block_fp8_quant(
     const DeviceTensor* weight,
-    const DeviceTensor* scale_e8m0,
+    const DeviceTensor* scale,
     int group_size = 128)
 {
-    if (!weight || !scale_e8m0) return std::nullopt;
+    if (!weight || !scale) return std::nullopt;
     if (weight->dtype() != DType::FP8_E4M3) return std::nullopt;
-
-    // Download E8M0 bytes, convert to FP32 on host, upload as new DeviceTensor
-    const std::size_t n = scale_e8m0->numel();
-    std::vector<std::uint8_t> e8m0_h(n);
-    CUDA_CHECK(cudaMemcpy(e8m0_h.data(), scale_e8m0->data(),
-                          n, cudaMemcpyDeviceToHost));
-
-    std::vector<float> f32_h(n);
-    for (std::size_t i = 0; i < n; ++i) {
-        f32_h[i] = ldexpf(1.0f, static_cast<int>(e8m0_h[i]) - 127);
+    if (scale->dtype() != DType::FP32) {
+        throw std::runtime_error(
+            std::string("deepseek_v4: block scale arrived as ") +
+            dtype_name(scale->dtype()) +
+            ", expected fp32 -- the contract should have declared the E8M0 "
+            "bytes as fp32");
     }
-
-    auto t = DeviceTensor::allocate(DType::FP32, {static_cast<int>(n)});
-    CUDA_CHECK(cudaMemcpy(t.data(), f32_h.data(), n * sizeof(float),
-                          cudaMemcpyHostToDevice));
-    g_dsv4_f32_scales.push_back(std::move(t));
-    const DeviceTensor* scale_ptr = &g_dsv4_f32_scales.back();
 
     QuantMeta meta;
     meta.kind = QuantMeta::Kind::PerGroup;
-    meta.scale = scale_ptr;
+    meta.scale = scale;
     meta.group_size = group_size;
     meta.channel_axis = 0;
     return meta;

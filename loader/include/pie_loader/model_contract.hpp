@@ -103,8 +103,6 @@ inline PieLoaderEncodingSpec raw(PieLoaderDType dtype) {
     spec.quant.scheme = static_cast<std::uint32_t>(PieLoaderQuantScheme::None);
     spec.quant.logical_dtype = static_cast<std::uint32_t>(PieLoaderDType::BF16);
     spec.quant.channel_axis = PIE_LOADER_NO_AXIS;
-    spec.quant.scale_dtype = PIE_LOADER_NO_DTYPE;
-    spec.quant.zero_point_dtype = PIE_LOADER_NO_DTYPE;
     return spec;
 }
 
@@ -120,8 +118,6 @@ inline PieLoaderQuantSpecView quant_spec(PieLoaderQuantScheme scheme, PieLoaderD
     spec.bits_per_element = 0;
     spec.group_size = 0;
     spec.channel_axis = PIE_LOADER_NO_AXIS;
-    spec.scale_dtype = PIE_LOADER_NO_DTYPE;
-    spec.zero_point_dtype = PIE_LOADER_NO_DTYPE;
     return spec;
 }
 
@@ -146,6 +142,29 @@ public:
         /// model-wide shape reports a mismatch on every sharded weight.
         Defined& expect(std::vector<std::int64_t> shape) {
             owner_->set_shape(index_, std::move(shape));
+            return *this;
+        }
+
+        /// Declare that this tensor holds the scales for `of`.
+        ///
+        /// Only for scales the checkpoint shipped. Scales the loader writes
+        /// while quantizing are paired at creation and need nothing here.
+        ///
+        /// The loader used to work this pairing out for itself, by matching
+        /// `{name}_scale_inv` and then `{base}.scale` over the finished tensor
+        /// table with `group_size` hardcoded to 128. `dsv4_block_scales_to_fp32`
+        /// had already found it properly -- it takes a `.scale` tensor, looks up
+        /// `<base>.weight`, and publishes only if that companion is really
+        /// FP8-E4M3 -- and then dropped it. This is where that finding is kept.
+        ///
+        /// `of` may name a declaration made later -- this pairs two published
+        /// tensors rather than feeding one into the other -- but the loader
+        /// rejects a contract whose scales name nothing at all.
+        Defined& scaling(std::string of, PieLoaderQuantGranularity granularity,
+                         std::uint32_t group_size, std::uint32_t channel_axis,
+                         PieLoaderScaleForm form) {
+            owner_->set_scales(index_, std::move(of), granularity, group_size, channel_axis,
+                               form);
             return *this;
         }
 
@@ -285,6 +304,7 @@ public:
             .root = expr.index_,
             .shape = {nullptr, 0},
             .encoding = encoding,
+            .scales = {},
         });
         return Defined(this, tensors_.size() - 1);
     }
@@ -296,28 +316,13 @@ public:
     /// Invalidated by any later call that mutates the builder.
     PieLoaderModelContractView view() const {
         PieLoaderModelContractView v{};
-        v.abi_version = kAbiVersion;
         v.alignment = alignment_;
         v.nodes = {nodes_.empty() ? nullptr : nodes_.data(), nodes_.size()};
         v.tensors = {tensors_.empty() ? nullptr : tensors_.data(), tensors_.size()};
         return v;
     }
 
-    /// Attach a block shape to `spec`, backed by this contract's storage.
-    ///
-    /// `PieLoaderQuantSpecView::block_shape` is a borrowed slice, so an author
-    /// cannot hand it a local: the contract has to own the numbers for as long
-    /// as the view is live. Everything else on the spec is a scalar the author
-    /// can just assign.
-    PieLoaderQuantSpecView with_block_shape(PieLoaderQuantSpecView spec,
-                                            std::vector<std::int64_t> block_shape) {
-        spec.block_shape = store_shape(std::move(block_shape));
-        return spec;
-    }
-
 private:
-    static constexpr std::uint32_t kAbiVersion = 1;
-
     static PieLoaderExprNode blank(PieLoaderExprKind kind) {
         PieLoaderExprNode node{};
         node.kind = static_cast<std::uint32_t>(kind);
@@ -337,6 +342,19 @@ private:
 
     void set_shape(std::size_t tensor, std::vector<std::int64_t> shape) {
         tensors_[tensor].shape = store_shape(std::move(shape));
+    }
+
+    void set_scales(std::size_t tensor, std::string of, PieLoaderQuantGranularity granularity,
+                    std::uint32_t group_size, std::uint32_t channel_axis,
+                    PieLoaderScaleForm form) {
+        const std::string& stored = names_.emplace_back(std::move(of));
+        tensors_[tensor].scales = PieLoaderScalesView{
+            .of = {reinterpret_cast<const std::uint8_t*>(stored.data()), stored.size()},
+            .granularity = granularity,
+            .group_size = group_size,
+            .channel_axis = channel_axis,
+            .form = form,
+        };
     }
 
     // `deque` rather than `vector` for the backing stores: the POD nodes point

@@ -247,7 +247,7 @@ impl Drop for ResidencyTxnGuard {
 /// Best-effort detachable drain of `pid`'s pipeline FIFOs — SETTLED host-KV
 /// ops only. The planner must NEVER await an unsettled fire completion: the
 /// waker table parks ONE waker per slot, and the owning guest may be (or
-/// later start) awaiting the same completion from `drain_rs_predecessors`
+/// later start) awaiting the same completion from `drain_pipeline_fires`
 /// or a channel materialize — the second registration would overwrite the
 /// first and strand whichever task lost (the lost-wakeup wedge behind the
 /// 2026-07-25 bench freezes). Finalizing a SETTLED op never registers a
@@ -284,8 +284,7 @@ async fn drain_detachable(pid: ProcessId) {
 
 async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
     let (model, driver) = planner.locus();
-    let handles =
-        crate::inferlet::process::residency::kv_suspend_handles(pid, model, driver);
+    let handles = crate::inferlet::process::residency::kv_suspend_handles(pid, model, driver);
     let working_sets: HashSet<WorkingSetId> =
         crate::inferlet::process::residency::kv_working_set_ids(pid, model, driver);
     if working_sets.is_empty() {
@@ -311,7 +310,11 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
     // Step 5: lease quiescence — the seal against mid-build stragglers.
     for (index, handle) in fence.handles.iter().enumerate() {
         if handle.active_leases() > 0 {
-            step!(pid, "quiesce: waiting on set {index} ({} lease(s))", handle.active_leases());
+            step!(
+                pid,
+                "quiesce: waiting on set {index} ({} lease(s))",
+                handle.active_leases()
+            );
         }
         handle.quiesce().await;
     }
@@ -329,12 +332,12 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
             return;
         }
         Err(error @ crate::store::kv::KvStoreError::HostSwapFull { .. }) => {
-            // No kill rung: without swap room this victim cannot move, and
-            // the head waits for completions instead.
-            planner.record_host_swap_exhaustion();
+            // No kill rung here: without swap room this victim cannot move,
+            // and the head waits for completions instead. Park the victim so
+            // the deterministic re-pick cannot spin on it (§20.6).
             step!(pid, "evict rollback: host swap full");
             tracing::warn!(pid = %pid, %error, "planner: eviction blocked on host swap");
-            planner.eviction_failed(pid);
+            planner.eviction_failed_host_swap_full(pid);
             return;
         }
         Err(error) => {

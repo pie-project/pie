@@ -783,7 +783,7 @@ logit plus `+∞` is `+∞`, which beat the legal maximum of `−0.0585`, and
 `gumbel_max` returned a token it had itself masked out — surfacing as
 `grammar rejected token 234061`.
 
-**Fixed** in `interface/ptir/src/rng.rs` by clamping at
+**Fixed** in `compiler/ir/src/rng.rs` by clamping at
 `UNIFORM_MAX = 1.0 − f32::EPSILON/2.0` (literal `0.99999994`). That file is the
 single source of truth for the RNG contract, so regenerating propagates the
 clamp to every device Gumbel site at once. Regression tests:
@@ -987,7 +987,7 @@ it samples via `reduce_argmax(add(scaled, gumbel(keyed, [vocab])))`, and with
 | `gumbel_max(...)` | 3.60 |
 | `naive-baseline` | 3.51 |
 
-These are **the same program**. `gumbel_max` (`sdk/rust/ptir-dsl/src/value.rs:912-927`)
+These are **the same program**. `gumbel_max` (`compiler/dsl/src/value.rs:912-927`)
 emits exactly `RngKeyed{Gumbel}`, `Add`, `ReduceArgmax`; `gumbel()` (ibid. `:754`)
 emits the `RngKeyed` and the caller writes the other two. `PIE_PTIR_DUMP_PLAN=1`
 confirms both compile to a single fused region with no library regions. So the
@@ -1092,7 +1092,7 @@ behind a fusion optimisation**.
 `pivot_threshold(probs, cummass_le(p))` — the top-p / nucleus truncation every
 sampler in this document depends on — only ever worked when the *entire*
 surrounding dataflow matched `LibraryOp::NucleusSample`
-(`interface/ptir/src/compiler.rs:1305`). That recognizer is an exact-shape match
+(`compiler/plan/src/compile.rs:1305`). That recognizer is an exact-shape match
 over softmax spelled as `exp(sub(l, max))/sum`, then `pivot_threshold`, then
 `select` against a `−∞` constant, then `add(gumbel)`, then `reduce_argmax`. One
 `broadcast` spliced between the mask and the argmax is enough to break it.
@@ -1290,7 +1290,7 @@ and every layer accepted it.
 The mechanism, established by bisection:
 
 1. The compiler's `match_nucleus_add_order`
-   (`interface/ptir/src/compiler.rs:1393`) matches a 13-node DAG **structurally**.
+   (`compiler/plan/src/compile.rs:1393`) matches a 13-node DAG **structurally**.
    It never asks where the logits came from, so the broadcast form matches.
 2. The driver's nucleus prep
    (`driver/cuda/src/pipeline/generated/fused_runtime.cuh`, ~L1007) then applies

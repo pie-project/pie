@@ -15,13 +15,12 @@ fn stored_contract(name: &str) -> ModelContract {
     serde_json::from_str(&text).unwrap_or_else(|err| panic!("{name}: parsing: {err}"))
 }
 use pie_loader::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
-use pie_loader::contract::{Expr, ModelContract, TensorContract};
-use pie_loader::ir::{GatherPiece, LayoutExpr, LayoutPlan};
-use pie_loader::load_plan::{StorageInstr, StorageTarget, TileMapKind};
-use pie_loader::planner::{compile_load_plan, lower_layout_plan};
+use pie_loader::contract::{Expr, ModelContract, Scales, TensorContract, TensorType};
+use pie_loader::plan::compile as compile_load_plan;
+use pie_loader::plan::{StorageInstr, StorageTarget, TileMapKind};
 use pie_loader::types::{
-    Axis, BackendKind, CheckpointFormat, DType, Encoding, FileId, QuantScheme, QuantSpec,
-    RepackLayout, RowMap, TensorDecl, TensorId,
+    Axis, BackendKind, CheckpointFormat, DType, Encoding, FileId, QuantGranularity, QuantScheme,
+    QuantSpec, RepackLayout, RowMap, ScaleForm, TensorId,
 };
 
 #[test]
@@ -84,7 +83,7 @@ fn metal_qwen35_schema_emits_canonical_affine_u4_arena() {
     };
     let target = StorageTarget {
         backend: BackendKind::Metal,
-        tile_map_mask: pie_loader::load_plan::METAL_TILE_MAP_MASK,
+        tile_map_mask: pie_loader::plan::METAL_TILE_MAP_MASK,
         max_tile_bytes: 64 << 20,
         preferred_alignment: 256,
         ..StorageTarget::default()
@@ -102,9 +101,6 @@ fn metal_qwen35_schema_emits_canonical_affine_u4_arena() {
                 bits_per_element: 4,
                 group_size,
                 channel_axis: Some(Axis(1)),
-                scale_dtype: Some(DType::BF16),
-                zero_point_dtype: Some(DType::BF16),
-                block_shape: vec![i64::from(group_size)],
             }
             .normalized(),
         )
@@ -119,7 +115,6 @@ fn metal_qwen35_schema_emits_canonical_affine_u4_arena() {
         )
     };
     let contract = ModelContract {
-        abi_version: 1,
         alignment: 256,
         tensors: vec![
             packed("lm_head.weight", "lm_head.weight", 2, 64),
@@ -163,44 +158,31 @@ fn metal_qwen35_schema_emits_canonical_affine_u4_arena() {
 
 #[test]
 fn buffer_join_tile_maps_carry_destination_offsets() {
-    let mut plan = LayoutPlan::new();
-    let a_decl = decl(0, "a", &[2], Encoding::Raw(DType::F32));
-    let b_decl = decl(1, "b", &[2], Encoding::Raw(DType::F32));
-    let a = plan.push(LayoutExpr::Source {
-        tensor: TensorId(0),
-        decl: a_decl.clone(),
-    });
-    let b = plan.push(LayoutExpr::Source {
-        tensor: TensorId(1),
-        decl: b_decl.clone(),
-    });
-    let a_cast_decl = decl(2, "a.cast", &[2], Encoding::Raw(DType::BF16));
-    let b_cast_decl = decl(3, "b.cast", &[2], Encoding::Raw(DType::BF16));
-    let a_cast = plan.push(LayoutExpr::Cast {
-        dtype: DType::BF16,
-        input: a,
-        decl: a_cast_decl,
-    });
-    let b_cast = plan.push(LayoutExpr::Cast {
-        dtype: DType::BF16,
-        input: b,
-        decl: b_cast_decl,
-    });
-    let joined_decl = decl(4, "joined", &[4], Encoding::Raw(DType::BF16));
-    let joined = plan.push(LayoutExpr::Gather {
-        inputs: vec![a_cast, b_cast],
-        pieces: vec![GatherPiece::span(0, 0, 0, 4), GatherPiece::span(1, 0, 4, 4)],
-        zero_fill: false,
-        decl: joined_decl.clone(),
-    });
-    let realized = plan.push(LayoutExpr::Realize {
-        input: joined,
-        runtime_name: "joined".to_string(),
-        decl: joined_decl,
-    });
-    plan.outputs.push(realized);
+    let contract = ModelContract {
+        alignment: 1,
+        tensors: vec![
+            TensorContract::new(
+                "a.cast",
+                Expr::src("a"),
+                vec![2],
+                Encoding::Raw(DType::BF16),
+            ),
+            TensorContract::new(
+                "b.cast",
+                Expr::src("b"),
+                vec![2],
+                Encoding::Raw(DType::BF16),
+            ),
+            TensorContract::new(
+                "joined",
+                Expr::cat(0, vec![Expr::out("a.cast"), Expr::out("b.cast")]),
+                vec![4],
+                Encoding::Raw(DType::BF16),
+            ),
+        ],
+    };
 
-    let program = lower_layout_plan(&metadata(), &plan, StorageTarget::default()).unwrap();
+    let program = compile_load_plan(&metadata(), &contract, StorageTarget::default()).unwrap();
     let reblocks: Vec<_> = program
         .instrs
         .iter()
@@ -220,26 +202,15 @@ fn buffer_join_tile_maps_carry_destination_offsets() {
     assert_eq!(reblocks[0].stride.element_bytes, 2);
     assert_eq!(reblocks[1].stride.element_bytes, 2);
     assert_eq!(program.memory.device_write_bytes, 16);
-    assert_eq!(program.memory.persistent_bytes, 8);
-    assert_eq!(program.memory.temporary_peak_bytes, 8);
+    // The public contract has no ephemeral declarations, so the two cast inputs
+    // to the join are now named tensors and count toward persistent memory
+    // instead of temporary peak.
+    assert_eq!(program.memory.persistent_bytes, 16);
+    assert_eq!(program.memory.temporary_peak_bytes, 0);
 }
 
 #[test]
 fn direct_copy_lowers_to_identity_extent_write() {
-    let mut plan = LayoutPlan::new();
-    let runtime_decl = decl(7, "runtime.weight", &[2, 2], Encoding::Raw(DType::BF16));
-    let source_decl = decl(0, "checkpoint.weight", &[2, 2], Encoding::Raw(DType::BF16));
-    let source = plan.push(LayoutExpr::Source {
-        tensor: TensorId(6),
-        decl: source_decl,
-    });
-    let realized = plan.push(LayoutExpr::Realize {
-        input: source,
-        runtime_name: "runtime.weight".to_string(),
-        decl: runtime_decl,
-    });
-    plan.outputs.push(realized);
-
     let metadata = CheckpointMetadata {
         files: vec![CheckpointFile {
             id: FileId(0),
@@ -258,7 +229,17 @@ fn direct_copy_lowers_to_identity_extent_write() {
         }],
     };
 
-    let program = lower_layout_plan(&metadata, &plan, StorageTarget::default()).unwrap();
+    let contract = ModelContract {
+        alignment: 1,
+        tensors: vec![TensorContract::new(
+            "runtime.weight",
+            Expr::src("checkpoint.weight"),
+            vec![2, 2],
+            Encoding::Raw(DType::BF16),
+        )],
+    };
+
+    let program = compile_load_plan(&metadata, &contract, StorageTarget::default()).unwrap();
     let writes: Vec<_> = program
         .instrs
         .iter()
@@ -290,38 +271,19 @@ fn direct_copy_lowers_to_identity_extent_write() {
 
 #[test]
 fn packed_quant_row_select_uses_byte_exact_offsets() {
-    let mut plan = LayoutPlan::new();
-    let q_decl = decl(
-        0,
-        "q",
-        &[4, 8],
-        Encoding::Quant(quant(QuantScheme::AwqInt4, DType::BF16)),
-    );
-    let q = plan.push(LayoutExpr::Source {
-        tensor: TensorId(2),
-        decl: q_decl,
-    });
-    let selected_decl = decl(
-        1,
-        "q.row",
-        &[1, 8],
-        Encoding::Quant(quant(QuantScheme::AwqInt4, DType::BF16)),
-    );
     // Row 2 of a [4, 8] int4 tensor: 8 elements at 4 bits is 4 bytes a row.
-    let selected = plan.push(LayoutExpr::Gather {
-        inputs: vec![q],
-        pieces: vec![GatherPiece::span(0, 8, 0, 4)],
-        zero_fill: false,
-        decl: selected_decl.clone(),
-    });
-    let realized = plan.push(LayoutExpr::Realize {
-        input: selected,
-        runtime_name: "q.row".to_string(),
-        decl: selected_decl,
-    });
-    plan.outputs.push(realized);
+    let contract = ModelContract {
+        alignment: 1,
+        tensors: vec![TensorContract::new(
+            "q.row",
+            Expr::src("q").slice(0, 2, 1),
+            vec![1, 8],
+            Encoding::Quant(quant(QuantScheme::AwqInt4, DType::BF16)),
+        )],
+    };
 
-    let program = lower_layout_plan(&quant_metadata(), &plan, StorageTarget::default()).unwrap();
+    let program =
+        compile_load_plan(&quant_metadata(), &contract, StorageTarget::default()).unwrap();
     let write = program
         .instrs
         .iter()
@@ -337,107 +299,62 @@ fn packed_quant_row_select_uses_byte_exact_offsets() {
     assert_eq!(program.memory.device_write_bytes, 4);
 }
 
+/// An expression bigger than the tensor it is declared for is refused.
+///
+/// This used to inject a gather whose byte offsets ran past its output, which a
+/// contract cannot author: every destination offset the builder emits is
+/// derived from a declared shape. The byte-level property did not go away, it
+/// moved down to where the offsets are actually produced —
+/// `reference::replay` refuses a lowering that writes outside its output, and
+/// `tests/algebra.rs` pins that. What is checkable *here* is the declaration
+/// that would have led to one.
 #[test]
-fn a_gather_may_not_write_past_its_output() {
-    // Sub-byte slicing alignment is settled in `contract.rs`, where elements
-    // still exist. All the storage compiler can still check is bytes.
-    let mut plan = LayoutPlan::new();
-    let q_decl = decl(
-        0,
-        "q",
-        &[4, 8],
-        Encoding::Quant(quant(QuantScheme::AwqInt4, DType::BF16)),
-    );
-    let q = plan.push(LayoutExpr::Source {
-        tensor: TensorId(2),
-        decl: q_decl,
-    });
-    let out_decl = decl(
-        1,
-        "q.bad",
-        &[1, 8],
-        Encoding::Quant(quant(QuantScheme::AwqInt4, DType::BF16)),
-    );
-    let gathered = plan.push(LayoutExpr::Gather {
-        inputs: vec![q],
-        pieces: vec![GatherPiece::span(0, 0, 2, 4)],
-        zero_fill: false,
-        decl: out_decl.clone(),
-    });
-    let realized = plan.push(LayoutExpr::Realize {
-        input: gathered,
-        runtime_name: "q.bad".to_string(),
-        decl: out_decl,
-    });
-    plan.outputs.push(realized);
+fn an_expression_may_not_outgrow_the_tensor_it_is_declared_for() {
+    let contract = ModelContract {
+        alignment: 1,
+        tensors: vec![TensorContract::new(
+            "q.bad",
+            Expr::src("q").slice(0, 0, 1),
+            vec![1, 4],
+            Encoding::Quant(quant(QuantScheme::AwqInt4, DType::BF16)),
+        )],
+    };
 
-    let err = lower_layout_plan(&quant_metadata(), &plan, StorageTarget::default())
+    let err = compile_load_plan(&quant_metadata(), &contract, StorageTarget::default())
         .unwrap_err()
         .to_string();
-    assert!(err.contains("writes past the end"), "{err}");
+    assert!(err.contains("declares shape [1, 4]"), "{err}");
+    assert!(err.contains("yields [1, 8]"), "{err}");
 }
 
 #[test]
 fn target_support_rejects_cuda_decode_at_compile_time() {
-    let mut plan = LayoutPlan::new();
-    let q_decl = decl(
-        0,
-        "q",
-        &[4],
-        Encoding::Quant(quant(QuantScheme::Fp8E4M3, DType::BF16)),
-    );
-    let q = plan.push(LayoutExpr::Source {
-        tensor: TensorId(3),
-        decl: q_decl,
-    });
-    let decoded_decl = decl(1, "decoded", &[4], Encoding::Raw(DType::BF16));
-    let decoded = plan.push(LayoutExpr::Decode {
-        metadata: Vec::new(),
-        scheme: QuantScheme::Fp8E4M3,
-        data: q,
-        decl: decoded_decl.clone(),
-    });
-    let realized = plan.push(LayoutExpr::Realize {
-        input: decoded,
-        runtime_name: "decoded".to_string(),
-        decl: decoded_decl,
-    });
-    plan.outputs.push(realized);
+    let contract = ModelContract {
+        alignment: 1,
+        tensors: vec![TensorContract::new(
+            "decoded",
+            Expr::src("fp8"),
+            vec![4],
+            Encoding::Raw(DType::BF16),
+        )],
+    };
 
-    let err = lower_layout_plan(
+    let err = compile_load_plan(
         &quant_metadata(),
-        &plan,
+        &contract,
         StorageTarget {
             backend: BackendKind::Cuda,
-            tile_map_mask: pie_loader::load_plan::CUDA_TILE_MAP_MASK,
+            tile_map_mask: pie_loader::plan::CUDA_TILE_MAP_MASK,
             ..StorageTarget::default()
         },
     )
     .unwrap_err()
     .to_string();
-    assert!(err.contains("does not support Decode"));
+    assert!(err.contains("does not support Decode"), "{err}");
 }
 
 #[test]
 fn packed_quant_source_requires_exact_affine_size() {
-    let mut plan = LayoutPlan::new();
-    let q_decl = decl(
-        0,
-        "blocked",
-        &[4, 8],
-        Encoding::Quant(quant(QuantScheme::GgufQ4_0, DType::BF16)),
-    );
-    let q = plan.push(LayoutExpr::Source {
-        tensor: TensorId(5),
-        decl: q_decl.clone(),
-    });
-    let realized = plan.push(LayoutExpr::Realize {
-        input: q,
-        runtime_name: "blocked".to_string(),
-        decl: q_decl,
-    });
-    plan.outputs.push(realized);
-
     let mut metadata = quant_metadata();
     metadata.tensors.push(RawTensor {
         id: TensorId(5),
@@ -449,7 +366,17 @@ fn packed_quant_source_requires_exact_affine_size() {
         encoding: Encoding::Quant(quant(QuantScheme::GgufQ4_0, DType::BF16)),
     });
 
-    let err = lower_layout_plan(&metadata, &plan, StorageTarget::default())
+    let contract = ModelContract {
+        alignment: 1,
+        tensors: vec![TensorContract::new(
+            "blocked",
+            Expr::src("blocked"),
+            vec![4, 8],
+            Encoding::Quant(quant(QuantScheme::GgufQ4_0, DType::BF16)),
+        )],
+    };
+
+    let err = compile_load_plan(&metadata, &contract, StorageTarget::default())
         .unwrap_err()
         .to_string();
     assert!(err.contains("non-affine physical size"));
@@ -459,7 +386,7 @@ fn packed_quant_source_requires_exact_affine_size() {
 fn gpt_oss_native_mxfp4_default_abi_lowers_to_repack_tile_maps() {
     let target = StorageTarget {
         backend: BackendKind::Cuda,
-        tile_map_mask: pie_loader::load_plan::CUDA_TILE_MAP_MASK,
+        tile_map_mask: pie_loader::plan::CUDA_TILE_MAP_MASK,
         native_mxfp4_moe: true,
         ..StorageTarget::default()
     };
@@ -507,11 +434,64 @@ fn gpt_oss_native_mxfp4_default_abi_lowers_to_repack_tile_maps() {
     assert!(program.memory.transform_scratch_peak_bytes > 0);
 }
 
+/// GPT-OSS reads one `gate_up_proj` block twice, once for the even rows and
+/// once for the odd ones. The compiler cannot fold the two reads into one, but
+/// it can schedule them back to back so an executor that keeps the block it just
+/// staged serves the second one without going back to the checkpoint.
+#[test]
+fn gpt_oss_native_mxfp4_schedules_shared_source_reads_together() {
+    let target = StorageTarget {
+        backend: BackendKind::Cuda,
+        tile_map_mask: pie_loader::plan::CUDA_TILE_MAP_MASK,
+        native_mxfp4_moe: true,
+        ..StorageTarget::default()
+    };
+    let program = compile_load_plan(
+        &gpt_oss_mxfp4_metadata(),
+        &stored_contract("gpt_oss_native_mxfp4"),
+        target,
+    )
+    .unwrap();
+
+    let reads: Vec<(FileId, u64, u64)> = program
+        .schedule
+        .iter()
+        .filter_map(|id| program.instrs.iter().find(|instr| instr_id(instr) == *id))
+        .filter_map(|instr| match instr {
+            StorageInstr::TileMap {
+                source: Some(source),
+                inputs,
+                ..
+            } if inputs.is_empty() => Some((source.file_id, source.file_offset, source.span_bytes)),
+            _ => None,
+        })
+        .collect();
+
+    let mut shared = 0;
+    for (position, read) in reads.iter().enumerate() {
+        let readers = reads.iter().filter(|other| *other == read).count();
+        if readers == 1 {
+            continue;
+        }
+        shared += 1;
+        let adjacent =
+            (position > 0 && reads[position - 1] == *read) || reads.get(position + 1) == Some(read);
+        assert!(
+            adjacent,
+            "read {read:?} at {position} is separated from the tile map that shares it: {reads:?}"
+        );
+    }
+    assert_eq!(
+        shared, 6,
+        "expected the three gate/up pairs to share a source"
+    );
+}
+
 #[test]
 fn gpt_oss_native_mxfp4_tp_uses_row_and_column_offset_repack_contracts() {
     let target = StorageTarget {
         backend: BackendKind::Cuda,
-        tile_map_mask: pie_loader::load_plan::CUDA_TILE_MAP_MASK,
+        tile_map_mask: pie_loader::plan::CUDA_TILE_MAP_MASK,
         tp_rank: 1,
         tp_size: 2,
         native_mxfp4_moe: true,
@@ -635,7 +615,7 @@ fn gpt_oss_native_mxfp4_tp_uses_row_and_column_offset_repack_contracts() {
 fn nemotron_h_default_abi_packs_experts_and_exposes_views() {
     let target = StorageTarget {
         backend: BackendKind::Cuda,
-        tile_map_mask: pie_loader::load_plan::CUDA_TILE_MAP_MASK,
+        tile_map_mask: pie_loader::plan::CUDA_TILE_MAP_MASK,
         tp_rank: 1,
         tp_size: 2,
         preferred_alignment: 256,
@@ -734,7 +714,6 @@ fn a_contract_that_declares_a_name_twice_is_rejected() {
         )
     };
     let contract = pie_loader::contract::ModelContract {
-        abi_version: 1,
         alignment: 256,
         tensors: vec![one("dup"), one("dup")],
     };
@@ -747,7 +726,6 @@ fn a_contract_that_declares_a_name_twice_is_rejected() {
 #[test]
 fn a_contract_whose_declared_shape_is_wrong_is_rejected() {
     let contract = pie_loader::contract::ModelContract {
-        abi_version: 1,
         alignment: 256,
         tensors: vec![pie_loader::contract::TensorContract::new(
             "a",
@@ -952,13 +930,17 @@ fn raw(id: u32, name: &str, offset: u64, shape: &[i64], dtype: DType) -> RawTens
     }
 }
 
-fn decl(id: u32, name: &str, shape: &[i64], encoding: Encoding) -> TensorDecl {
-    TensorDecl {
-        id: TensorId(id),
-        name: name.to_string(),
-        shape: shape.to_vec(),
-        encoding,
-        alignment: 1,
+fn sized_raw(
+    id: u32,
+    name: &str,
+    offset: u64,
+    span_bytes: u64,
+    shape: &[i64],
+    dtype: DType,
+) -> RawTensor {
+    RawTensor {
+        span_bytes,
+        ..raw(id, name, offset, shape, dtype)
     }
 }
 
@@ -969,9 +951,6 @@ fn quant(scheme: QuantScheme, dtype: DType) -> QuantSpec {
         bits_per_element: scheme.default_bits(),
         group_size: scheme.default_group_size(),
         channel_axis: None,
-        scale_dtype: Some(DType::F32),
-        zero_point_dtype: None,
-        block_shape: Vec::new(),
     }
 }
 
@@ -981,214 +960,10 @@ fn tensor_bytes(shape: &[i64], dtype: DType) -> u64 {
         .fold(dtype.bytes(), |acc, dim| acc * u64::try_from(*dim).unwrap())
 }
 
-// ── SlabScatter lowering tests ──────────────────────────────────────
-
-#[test]
-fn slab_scatter_merges_nearby_bulk_extent_writes() {
-    // Three tensors with small gaps in the file. The gaps prevent
-    // coalesce_persistent_arena_writes from merging them into a single
-    // BulkExtentWrite, but they're close enough for slab_scatter to
-    // group them (gap < 64 MiB, overread < 5/4).
-    let chunk = 2 * 1024 * 1024; // 2 MiB per tensor
-    let gap = 1024; // 1 KiB gap between tensors in the file
-    let file_size = chunk * 3 + gap * 2 + 4096;
-    let meta = CheckpointMetadata {
-        files: vec![CheckpointFile {
-            id: FileId(0),
-            path: "big.safetensors".to_string(),
-            size_bytes: file_size,
-            format: CheckpointFormat::Safetensors,
-        }],
-        tensors: vec![
-            raw_big(0, "t0", 0, chunk, DType::BF16),
-            raw_big(1, "t1", chunk + gap, chunk, DType::BF16),
-            raw_big(2, "t2", 2 * (chunk + gap), chunk, DType::BF16),
-        ],
-    };
-    let mut plan = LayoutPlan::new();
-    let mut ids = Vec::new();
-    for i in 0..3u32 {
-        let cols = (chunk / 2) as i64; // BF16 = 2 bytes
-        let src = plan.push(LayoutExpr::Source {
-            tensor: TensorId(i),
-            decl: decl(i, &format!("t{i}"), &[cols], Encoding::Raw(DType::BF16)),
-        });
-        let r = plan.push(LayoutExpr::Realize {
-            input: src,
-            runtime_name: format!("t{i}"),
-            decl: decl(i, &format!("t{i}"), &[cols], Encoding::Raw(DType::BF16)),
-        });
-        ids.push(r);
-    }
-    plan.outputs = ids;
-
-    let target = StorageTarget {
-        backend: BackendKind::Cuda,
-        tile_map_mask: pie_loader::load_plan::CUDA_TILE_MAP_MASK,
-        ..StorageTarget::default()
-    };
-    let program = lower_layout_plan(&meta, &plan, target).unwrap();
-
-    let slabs: Vec<_> = program
-        .instrs
-        .iter()
-        .filter(|i| matches!(i, StorageInstr::SlabScatter { .. }))
-        .collect();
-    assert!(
-        !slabs.is_empty(),
-        "expected at least one SlabScatter, got none; instrs: {:#?}",
-        program.instrs,
-    );
-    if let StorageInstr::SlabScatter {
-        placements,
-        span_bytes,
-        ..
-    } = slabs[0]
-    {
-        assert!(
-            placements.len() >= 2,
-            "slab must have at least 2 placements, got {}",
-            placements.len()
-        );
-        assert!(
-            *span_bytes >= chunk * 2,
-            "slab span_bytes {} should cover at least two chunks",
-            span_bytes,
-        );
-        for p in placements {
-            assert!(p.bytes > 0, "placement bytes must be non-zero");
-        }
-    }
-}
-
-#[test]
-fn slab_scatter_rejects_excessive_overread() {
-    // Two small tensors with a huge gap — overread exceeds 5/4 threshold.
-    let small = 1024 * 1024; // 1 MiB each
-    let gap = 256 * 1024 * 1024; // 256 MiB gap
-    let file_size = small + gap + small;
-    let meta = CheckpointMetadata {
-        files: vec![CheckpointFile {
-            id: FileId(0),
-            path: "sparse.safetensors".to_string(),
-            size_bytes: file_size,
-            format: CheckpointFormat::Safetensors,
-        }],
-        tensors: vec![
-            raw_big(0, "near", 0, small, DType::BF16),
-            raw_big(1, "far", small + gap, small, DType::BF16),
-        ],
-    };
-    let mut plan = LayoutPlan::new();
-    for i in 0..2u32 {
-        let cols = (small / 2) as i64;
-        let src = plan.push(LayoutExpr::Source {
-            tensor: TensorId(i),
-            decl: decl(i, &format!("t{i}"), &[cols], Encoding::Raw(DType::BF16)),
-        });
-        let r = plan.push(LayoutExpr::Realize {
-            input: src,
-            runtime_name: format!("t{i}"),
-            decl: decl(i, &format!("t{i}"), &[cols], Encoding::Raw(DType::BF16)),
-        });
-        plan.outputs.push(r);
-    }
-    let target = StorageTarget {
-        backend: BackendKind::Cuda,
-        tile_map_mask: pie_loader::load_plan::CUDA_TILE_MAP_MASK,
-        ..StorageTarget::default()
-    };
-    let program = lower_layout_plan(&meta, &plan, target).unwrap();
-    let slabs: Vec<_> = program
-        .instrs
-        .iter()
-        .filter(|i| matches!(i, StorageInstr::SlabScatter { .. }))
-        .collect();
-    assert!(
-        slabs.is_empty(),
-        "should NOT merge into SlabScatter when overread is excessive; got {:#?}",
-        slabs,
-    );
-}
-
-#[test]
-fn slab_scatter_placement_offsets_are_within_span() {
-    let chunk = 4 * 1024 * 1024;
-    let gap = 512 * 1024; // small gap
-    let file_size = chunk * 3 + gap * 2;
-    let meta = CheckpointMetadata {
-        files: vec![CheckpointFile {
-            id: FileId(0),
-            path: "layout.safetensors".to_string(),
-            size_bytes: file_size,
-            format: CheckpointFormat::Safetensors,
-        }],
-        tensors: vec![
-            raw_big(0, "a", 0, chunk, DType::BF16),
-            raw_big(1, "b", chunk + gap, chunk, DType::BF16),
-            raw_big(2, "c", 2 * (chunk + gap), chunk, DType::BF16),
-        ],
-    };
-    let mut plan = LayoutPlan::new();
-    for i in 0..3u32 {
-        let cols = (chunk / 2) as i64;
-        let src = plan.push(LayoutExpr::Source {
-            tensor: TensorId(i),
-            decl: decl(i, &format!("p{i}"), &[cols], Encoding::Raw(DType::BF16)),
-        });
-        let r = plan.push(LayoutExpr::Realize {
-            input: src,
-            runtime_name: format!("p{i}"),
-            decl: decl(i, &format!("p{i}"), &[cols], Encoding::Raw(DType::BF16)),
-        });
-        plan.outputs.push(r);
-    }
-    let target = StorageTarget {
-        backend: BackendKind::Cuda,
-        tile_map_mask: pie_loader::load_plan::CUDA_TILE_MAP_MASK,
-        ..StorageTarget::default()
-    };
-    let program = lower_layout_plan(&meta, &plan, target).unwrap();
-    for instr in &program.instrs {
-        if let StorageInstr::SlabScatter {
-            span_bytes,
-            placements,
-            ..
-        } = instr
-        {
-            for (idx, p) in placements.iter().enumerate() {
-                assert!(
-                    p.src_offset + p.bytes <= *span_bytes,
-                    "placement {idx}: src_offset {} + bytes {} exceeds span_bytes {}",
-                    p.src_offset,
-                    p.bytes,
-                    span_bytes,
-                );
-            }
-        }
-    }
-}
-
-fn raw_big(id: u32, name: &str, offset: u64, span_bytes: u64, dtype: DType) -> RawTensor {
-    let elem = dtype.bytes();
-    let count = (span_bytes / elem) as i64;
-    RawTensor {
-        id: TensorId(id),
-        name: name.to_string(),
-        file_id: FileId(0),
-        file_offset: offset,
-        span_bytes,
-        shape: vec![count],
-        encoding: Encoding::Raw(dtype),
-    }
-}
-
 // ── MLA weight fusion tests ─────────────────────────────────────────
 
 #[test]
 fn mla_q_kv_a_fusion_produces_joined_tensor() {
-    use pie_loader::planner::compile_load_plan;
-
     let h = 128i64;
     let q_lora = 32i64;
     let kv_lora_rope = 16i64;
@@ -1252,12 +1027,12 @@ fn mla_q_kv_a_fusion_produces_joined_tensor() {
     };
     let target = StorageTarget {
         backend: BackendKind::Cuda,
-        tile_map_mask: pie_loader::load_plan::CUDA_TILE_MAP_MASK,
+        tile_map_mask: pie_loader::plan::CUDA_TILE_MAP_MASK,
         ..StorageTarget::default()
     };
     let contract = stored_contract("kimi_k2_mla_fusion");
     let program = compile_load_plan(&meta, &contract, target).unwrap();
-    let summary = program.summary();
+    let summary = pie_loader::dump::describe(&program);
 
     // The fusion should have joined q_a_proj + kv_a_proj into one tensor
     let has_fused = program
@@ -1280,19 +1055,532 @@ fn mla_q_kv_a_fusion_produces_joined_tensor() {
     assert_eq!(fused.shape[1], h);
 
     // Summary should show the plan compiled successfully
-    assert!(summary.tensor_count > 0);
-    assert!(summary.finalize_count > 0);
+    assert!(!program.tensors.is_empty());
+    assert!(
+        program
+            .instrs
+            .iter()
+            .any(|instr| matches!(instr, StorageInstr::Finalize { .. })),
+        "{summary}"
+    );
 }
 
 fn instr_id(instr: &StorageInstr) -> pie_loader::types::InstrId {
     match instr {
         StorageInstr::Allocate { id, .. }
+        | StorageInstr::Fill { id, .. }
         | StorageInstr::ExtentWrite { id, .. }
         | StorageInstr::BulkExtentWrite { id, .. }
-        | StorageInstr::SlabScatter { id, .. }
         | StorageInstr::TileMap { id, .. }
         | StorageInstr::CreateView { id, .. }
-        | StorageInstr::Release { id, .. }
         | StorageInstr::Finalize { id, .. } => *id,
     }
+}
+
+/// A block-scaled FP8 source names its scale tensor on the instruction.
+///
+/// The executor used to rebuild the name by appending `_scale_inv` and looking
+/// it up (`driver/cuda/src/loader/transcode_engine.hpp`), which is the same
+/// guess-what-the-loader-decided pattern `attachments` removed from the output
+/// side. The loader has the tensor table, so it answers; this pins that the
+/// answer travels.
+#[test]
+fn a_block_scaled_fp8_source_carries_its_scale_tensor() {
+    let metadata = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "model.safetensors".to_string(),
+            size_bytes: 1 << 20,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors: vec![
+            sized_raw(0, "w.weight", 0, 4096, &[64, 64], DType::F8E4M3),
+            sized_raw(1, "w.weight_scale_inv", 4096, 4, &[1, 1], DType::F32),
+        ],
+    };
+
+    let target = StorageTarget {
+        backend: BackendKind::Cuda,
+        tile_map_mask: u32::MAX,
+        ..StorageTarget::default()
+    };
+    let contract = ModelContract {
+        alignment: 1,
+        tensors: vec![TensorContract::new(
+            "runtime.w",
+            Expr::src("w.weight"),
+            vec![64, 64],
+            Encoding::Quant(quant(QuantScheme::Mxfp4E2M1E8M0, DType::BF16)),
+        )],
+    };
+    let program = compile_load_plan(&metadata, &contract, target).unwrap();
+    let encodes: Vec<_> = program
+        .instrs
+        .iter()
+        .filter_map(|instr| match instr {
+            StorageInstr::TileMap {
+                kind: TileMapKind::Encode,
+                transform,
+                ..
+            } => Some(transform.metadata_source),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(encodes, vec![Some(TensorId(1))]);
+}
+
+/// ...and a source with no such sibling says so, rather than naming tensor 0.
+#[test]
+fn a_source_without_a_scale_sibling_names_none() {
+    let metadata = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "model.safetensors".to_string(),
+            size_bytes: 1 << 20,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors: vec![sized_raw(0, "w.weight", 0, 8192, &[64, 64], DType::BF16)],
+    };
+    let target = StorageTarget {
+        backend: BackendKind::Cuda,
+        tile_map_mask: u32::MAX,
+        ..StorageTarget::default()
+    };
+    let contract = ModelContract {
+        alignment: 1,
+        tensors: vec![TensorContract::new(
+            "runtime.w",
+            Expr::src("w.weight"),
+            vec![64, 64],
+            Encoding::Quant(quant(QuantScheme::Mxfp4E2M1E8M0, DType::BF16)),
+        )],
+    };
+    let program = compile_load_plan(&metadata, &contract, target).unwrap();
+    for instr in &program.instrs {
+        if let StorageInstr::TileMap { transform, .. } = instr {
+            assert_eq!(transform.metadata_source, None);
+        }
+    }
+}
+
+#[test]
+fn a_padded_head_dim_zeroes_the_buffer_before_it_writes_the_rows() {
+    // `driver/cuda/src/model/llama_like/llama_like.cpp:640` wants this: pad Q/K/V
+    // up to a head_dim the attention kernel takes. Until `Fill` existed the
+    // compiler priced the pad (spec.md §3.3) and then refused to build it.
+    let metadata = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "model.safetensors".to_string(),
+            size_bytes: 1024,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors: vec![RawTensor {
+            id: TensorId(0),
+            name: "q_proj.weight".to_string(),
+            file_id: FileId(0),
+            file_offset: 0,
+            span_bytes: 32,
+            shape: vec![4, 4],
+            encoding: Encoding::Raw(DType::BF16),
+        }],
+    };
+
+    let contract = ModelContract {
+        alignment: 1,
+        tensors: vec![TensorContract::new(
+            "q_proj.weight",
+            Expr::src("q_proj.weight").pad(1, 0, 1),
+            vec![4, 5],
+            Encoding::Raw(DType::BF16),
+        )],
+    };
+
+    let program = compile_load_plan(&metadata, &contract, StorageTarget::default()).unwrap();
+
+    let fills: Vec<_> = program
+        .instrs
+        .iter()
+        .filter_map(|instr| match instr {
+            StorageInstr::Fill { id, buffer } => Some((*id, *buffer)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(fills.len(), 1, "one fill, not one per band");
+    let (fill_id, filled) = fills[0];
+
+    // Four rows, because the destination stride is wider than the row and
+    // `fold` will not skip in the destination. spec.md §3.3 prices this at 5.
+    let writes: Vec<_> = program
+        .instrs
+        .iter()
+        .filter(|instr| {
+            matches!(
+                instr,
+                StorageInstr::ExtentWrite { .. } | StorageInstr::BulkExtentWrite { .. }
+            )
+        })
+        .collect();
+    assert_eq!(writes.len(), 4);
+
+    // The fill has to run before every one of them, or it erases what they wrote.
+    let at = |want| program.schedule.iter().position(|id| *id == want).unwrap();
+    let fill_at = at(fill_id);
+    for write in &writes {
+        assert!(fill_at < at(instr_id(write)), "the fill must come first");
+    }
+
+    // The padded column is real memory that no source covers.
+    assert_eq!(program.memory.checkpoint_read_bytes, 32);
+    assert_eq!(program.memory.device_write_bytes, 32);
+    assert_eq!(program.memory.persistent_bytes, 40);
+    assert_eq!(program.buffer(filled).unwrap().bytes, 40);
+}
+
+/// A block scale is bytes in the file and an exponent to the GEMM.
+///
+/// DeepSeek-V4 pairs FP8-E4M3 weights with OCP Microscaling E8M0 scales --
+/// a combination `QuantScheme::Mxfp4E2M1E8M0` cannot name, because that symbol
+/// bundles the element format together with the scale format. The driver used
+/// to bridge the gap by copying the scales to the host and running `ldexpf`
+/// over them at bind time.
+///
+/// No new expression is needed for this. `Bitcast` names the reading of the
+/// bytes and the declaration names the type wanted, so the existing
+/// dtype-mismatch rule inserts the cast -- which is the whole argument for
+/// `E8M0` being a dtype rather than an arithmetic escape hatch.
+#[test]
+fn an_e8m0_block_scale_read_as_fp32_lowers_to_a_cast() {
+    let metadata = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "model.safetensors".to_string(),
+            size_bytes: 1 << 20,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors: vec![sized_raw(0, "w.scale", 0, 64, &[8, 8], DType::U8)],
+    };
+    let target = StorageTarget {
+        backend: BackendKind::Cuda,
+        tile_map_mask: u32::MAX,
+        ..StorageTarget::default()
+    };
+    let contract = ModelContract {
+        alignment: 1,
+        tensors: vec![TensorContract::new(
+            "runtime.w.scale",
+            Expr::Bitcast {
+                src: Box::new(Expr::src("w.scale")),
+                out: TensorType {
+                    shape: vec![8, 8],
+                    encoding: Encoding::Raw(DType::E8M0),
+                },
+            },
+            vec![8, 8],
+            Encoding::Raw(DType::F32),
+        )],
+    };
+    let program = compile_load_plan(&metadata, &contract, target).unwrap();
+    let casts = program
+        .instrs
+        .iter()
+        .filter(|instr| {
+            matches!(
+                instr,
+                StorageInstr::TileMap {
+                    kind: TileMapKind::Cast,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(casts, 1, "expected exactly one Cast, got plan {program:#?}");
+}
+
+// ── quant attachments ──────────────────────────────────
+//
+// A quantized weight and its scales are two runtime tensors, and the driver has
+// to know they belong together. The loader used to work that out after the fact,
+// by matching `_scale_inv` / `.scale` suffixes over the finished tensor table
+// with the group size hardcoded to 128 beside them, in
+// `plan::derive_quant_attachments`. Every entry is now recorded by whoever
+// declared the scale tensor, at the point of declaring it — which is why these
+// exercise `compile` rather than a name-matching function: there is no longer
+// anything to call in between.
+
+fn scale_target() -> StorageTarget {
+    StorageTarget {
+        backend: BackendKind::Cuda,
+        tile_map_mask: u32::MAX,
+        ..StorageTarget::default()
+    }
+}
+
+/// The MXFP4 GEMM asserts its scale operand is U8, so a plan that asks the
+/// driver to expand these to F32 makes the kernel reject the load.
+#[test]
+fn scales_the_loader_writes_while_encoding_mxfp4_stay_raw_e8m0() {
+    let metadata = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "model.safetensors".to_string(),
+            size_bytes: 1 << 20,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors: vec![sized_raw(0, "w.weight", 0, 8192, &[64, 64], DType::BF16)],
+    };
+    let contract = ModelContract {
+        alignment: 1,
+        tensors: vec![TensorContract::new(
+            "runtime.w",
+            Expr::src("w.weight"),
+            vec![64, 64],
+            Encoding::Quant(quant(QuantScheme::Mxfp4E2M1E8M0, DType::BF16)),
+        )],
+    };
+    let program = compile_load_plan(&metadata, &contract, scale_target()).unwrap();
+    assert_eq!(program.attachments.len(), 1, "{:#?}", program.attachments);
+    let attach = program.attachments[0];
+    assert_eq!(attach.scale_form, ScaleForm::RawE8M0);
+    assert_eq!(attach.granularity, QuantGranularity::PerGroup);
+    assert_eq!(attach.group_size, 32);
+    // Both halves name real entries, which is the part the name matching could
+    // get wrong without anything noticing.
+    assert_eq!(program.tensors[attach.tensor.0 as usize].name, "runtime.w");
+    assert_eq!(
+        program.tensors[attach.scale_tensor.0 as usize].name,
+        "runtime.w_scale"
+    );
+}
+
+/// The same, for the per-channel schemes: one F32 factor per output row.
+#[test]
+fn scales_the_loader_writes_while_encoding_fp8_are_f32_factors() {
+    let metadata = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "model.safetensors".to_string(),
+            size_bytes: 1 << 20,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors: vec![sized_raw(0, "w.weight", 0, 8192, &[64, 64], DType::BF16)],
+    };
+    let contract = ModelContract {
+        alignment: 1,
+        tensors: vec![TensorContract::new(
+            "runtime.w",
+            Expr::src("w.weight"),
+            vec![64, 64],
+            Encoding::Quant(quant(QuantScheme::Fp8E4M3, DType::BF16)),
+        )],
+    };
+    let program = compile_load_plan(&metadata, &contract, scale_target()).unwrap();
+    assert_eq!(program.attachments.len(), 1, "{:#?}", program.attachments);
+    assert_eq!(program.attachments[0].scale_form, ScaleForm::F32Factors);
+    assert_eq!(
+        program.attachments[0].granularity,
+        QuantGranularity::PerChannel
+    );
+}
+
+/// Block-scaled FP8 (DeepSeek-V3 and its descendants) arrives already
+/// quantized: the loader writes no scales, so the contract states the pairing.
+///
+/// This is the case the suffix matching existed for, and the case it was worst
+/// at. It tried `{name}_scale_inv` and then `{base}.scale`, and hardcoded
+/// `group_size: 128` — while the only authoring site in the tree,
+/// `dsv4_block_scales_to_fp32`, publishes `<base>.scale` and knows the real
+/// block size. Note the 64 here: a checkpoint that blocks by anything other
+/// than 128 used to be silently mislabelled.
+#[test]
+fn scales_the_checkpoint_shipped_are_paired_by_the_contract() {
+    let metadata = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "model.safetensors".to_string(),
+            size_bytes: 1 << 20,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors: vec![
+            sized_raw(0, "w.weight", 0, 4096, &[64, 64], DType::F8E4M3),
+            sized_raw(1, "w.scale", 4096, 4, &[1, 1], DType::F32),
+        ],
+    };
+    let contract = ModelContract {
+        alignment: 1,
+        tensors: vec![
+            TensorContract::new(
+                "runtime.w",
+                Expr::src("w.weight"),
+                vec![64, 64],
+                Encoding::Raw(DType::F8E4M3),
+            ),
+            TensorContract::new(
+                "runtime.w_scale",
+                Expr::src("w.scale"),
+                vec![1, 1],
+                Encoding::Raw(DType::F32),
+            )
+            .scaling(Scales {
+                of: "runtime.w".to_string(),
+                granularity: QuantGranularity::PerGroup,
+                group_size: 64,
+                channel_axis: 0,
+                form: ScaleForm::F32Factors,
+            }),
+        ],
+    };
+    let program = compile_load_plan(&metadata, &contract, scale_target()).unwrap();
+    assert_eq!(program.attachments.len(), 1, "{:#?}", program.attachments);
+    let attach = program.attachments[0];
+    assert_eq!(attach.group_size, 64);
+    assert_eq!(attach.scale_form, ScaleForm::F32Factors);
+    assert_eq!(program.tensors[attach.tensor.0 as usize].name, "runtime.w");
+    assert_eq!(
+        program.tensors[attach.scale_tensor.0 as usize].name,
+        "runtime.w_scale"
+    );
+}
+
+/// A contract that names a tensor no earlier entry declares is rejected.
+///
+/// The suffix matching could not fail: a name that resolved to nothing produced
+/// no attachment, and the plan came out of the compiler silently missing the
+/// metadata its kernels would go looking for at bind time.
+#[test]
+fn scales_named_for_a_weight_the_loader_quantizes_are_a_contract_error() {
+    // The loader writes this weight's scales itself while encoding it, and
+    // states that pairing. A contract that names a second set would attach
+    // quant metadata to one weight twice, which the driver discovers only at
+    // load time.
+    let metadata = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "model.safetensors".to_string(),
+            size_bytes: 1 << 20,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors: vec![
+            sized_raw(0, "w.weight", 0, 8192, &[64, 64], DType::BF16),
+            sized_raw(1, "w.weight_scale_inv", 8192, 4, &[1, 1], DType::F32),
+        ],
+    };
+    let contract = ModelContract {
+        alignment: 1,
+        tensors: vec![
+            TensorContract::new(
+                "runtime.w",
+                Expr::src("w.weight"),
+                vec![64, 64],
+                Encoding::Quant(quant(QuantScheme::Fp8E4M3, DType::BF16)),
+            ),
+            TensorContract::new(
+                "runtime.w_shipped_scales",
+                Expr::src("w.weight_scale_inv"),
+                vec![1, 1],
+                Encoding::Raw(DType::F32),
+            )
+            .scaling(Scales {
+                of: "runtime.w".to_string(),
+                granularity: QuantGranularity::PerGroup,
+                group_size: 128,
+                channel_axis: 0,
+                form: ScaleForm::F32Factors,
+            }),
+        ],
+    };
+    let err = compile_load_plan(&metadata, &contract, scale_target())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("already has scales"), "{err}");
+}
+
+#[test]
+fn scales_naming_an_undeclared_tensor_are_a_contract_error() {
+    let metadata = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "model.safetensors".to_string(),
+            size_bytes: 1 << 20,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors: vec![sized_raw(0, "w.scale", 0, 4, &[1, 1], DType::F32)],
+    };
+    let contract = ModelContract {
+        alignment: 1,
+        tensors: vec![
+            TensorContract::new(
+                "runtime.w_scale",
+                Expr::src("w.scale"),
+                vec![1, 1],
+                Encoding::Raw(DType::F32),
+            )
+            .scaling(Scales {
+                of: "runtime.w".to_string(),
+                granularity: QuantGranularity::PerGroup,
+                group_size: 128,
+                channel_axis: 0,
+                form: ScaleForm::F32Factors,
+            }),
+        ],
+    };
+    let error = compile_load_plan(&metadata, &contract, scale_target())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("runtime.w"), "{error}");
+    assert!(error.contains("the contract does not declare"), "{error}");
+}
+
+/// Scales may be declared before the tensor they scale.
+///
+/// `dsv4_block_scales_to_fp32` runs before `author_dense_contract`, so the real
+/// contract declares every block scale ahead of its weight. Resolving `of`
+/// against earlier entries only — the rule `Expr::Out` follows — would reject
+/// every DeepSeek-V4 contract in the tree.
+#[test]
+fn scales_may_name_a_tensor_declared_after_them() {
+    let metadata = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "model.safetensors".to_string(),
+            size_bytes: 1 << 20,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors: vec![
+            sized_raw(0, "w.scale", 0, 4, &[1, 1], DType::F32),
+            sized_raw(1, "w.weight", 4096, 4096, &[64, 64], DType::F8E4M3),
+        ],
+    };
+    let contract = ModelContract {
+        alignment: 1,
+        tensors: vec![
+            TensorContract::new(
+                "runtime.w_scale",
+                Expr::src("w.scale"),
+                vec![1, 1],
+                Encoding::Raw(DType::F32),
+            )
+            .scaling(Scales {
+                of: "runtime.w".to_string(),
+                granularity: QuantGranularity::PerGroup,
+                group_size: 64,
+                channel_axis: 0,
+                form: ScaleForm::F32Factors,
+            }),
+            TensorContract::new(
+                "runtime.w",
+                Expr::src("w.weight"),
+                vec![64, 64],
+                Encoding::Raw(DType::F8E4M3),
+            ),
+        ],
+    };
+    let program = compile_load_plan(&metadata, &contract, scale_target()).unwrap();
+    assert_eq!(program.attachments.len(), 1, "{:#?}", program.attachments);
+    let attach = program.attachments[0];
+    assert_eq!(program.tensors[attach.tensor.0 as usize].name, "runtime.w");
+    assert_eq!(
+        program.tensors[attach.scale_tensor.0 as usize].name,
+        "runtime.w_scale"
+    );
 }

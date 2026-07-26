@@ -42,6 +42,9 @@ if str(SERVER_SDK) not in sys.path:
 
 EMBEDDED_CLI_DRIVERS: set[str] = {
     "dummy",
+    # Apple Silicon: the Metal driver is linked into the `pie` binary, and
+    # there is no maturin `pie._engine` built for it, so drive the CLI.
+    "metal",
     "vllm",
     "sglang",
     "tensorrt_llm",
@@ -238,6 +241,18 @@ def build_config(args: argparse.Namespace):
             driver_options["total_pages"] = args.total_pages
         if getattr(args, "swap_pool_size", 0):
             driver_options["swap_pool_size"] = args.swap_pool_size
+    elif args.driver == "metal":
+        # Apple Silicon. The Metal driver sizes its own heap from the
+        # checkpoint and exposes no memory-fraction knob, so the CUDA-shaped
+        # `gpu_mem_utilization` has nowhere to go; the batching caps are the
+        # only tunables it reads.
+        driver_options = {}
+        if getattr(args, "max_forward_tokens", 0):
+            driver_options["max_forward_tokens"] = args.max_forward_tokens
+        if getattr(args, "max_forward_requests", 0):
+            driver_options["max_forward_requests"] = args.max_forward_requests
+        if getattr(args, "total_pages", 0):
+            driver_options["total_pages"] = args.total_pages
     elif args.driver == "vllm":
         driver_options = {
             "gpu_memory_utilization": args.gpu_mem_util,
@@ -506,7 +521,9 @@ async def cli_pie_client(args: argparse.Namespace):
             if should_surface_server_line(text):
                 sys.stderr.write(text)
                 sys.stderr.flush()
-            if "Server ready at ws://" in text:
+            # The banner's scheme moved from `ws://` to `gateway://` when the
+            # gateway edge landed; match the phrase, not the scheme.
+            if "Server ready at " in text:
                 server_ready = True
                 break
             if proc.returncode is not None:
@@ -1182,7 +1199,7 @@ def build_parser() -> argparse.ArgumentParser:
         )
         sp.add_argument("--device", default=PIE_BENCH_DEFAULT_DEVICE)
         sp.add_argument("--driver", default="cuda_native",
-                        choices=["cuda_native", "vllm", "sglang", "tensorrt_llm", "dummy"])
+                        choices=["cuda_native", "metal", "vllm", "sglang", "tensorrt_llm", "dummy"])
         sp.add_argument("--default-token-limit", type=int, default=200_000)
         sp.add_argument("--default-endowment-pages", type=int, default=64)
         sp.add_argument("--admission-oversubscription-factor", type=float, default=4.0)

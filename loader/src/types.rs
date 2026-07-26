@@ -4,9 +4,6 @@ use serde::{Deserialize, Serialize};
 pub struct TensorId(pub u32);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ExprId(pub u32);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BufferId(pub u32);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -25,6 +22,13 @@ pub enum DType {
     BF16,
     F8E4M3,
     F8E5M2,
+    /// OCP Microscaling's 8-bit exponent-only scale format: the stored byte
+    /// `b` denotes `2^(b - 127)`. It carries no sign and no mantissa, so it
+    /// only ever appears as the scale beside a block-scaled tensor -- which is
+    /// why `QuantScheme` long knew it only as half of `Mxfp4E2M1E8M0`.
+    /// DeepSeek-V4 pairs it with FP8-E4M3 weights instead, a combination that
+    /// composite cannot name.
+    E8M0,
     I64,
     I32,
     I16,
@@ -42,15 +46,8 @@ impl DType {
             Self::I64 | Self::U64 => 8,
             Self::F32 | Self::I32 | Self::U32 => 4,
             Self::F16 | Self::BF16 | Self::I16 | Self::U16 => 2,
-            Self::F8E4M3 | Self::F8E5M2 | Self::I8 | Self::U8 | Self::Bool => 1,
+            Self::F8E4M3 | Self::F8E5M2 | Self::E8M0 | Self::I8 | Self::U8 | Self::Bool => 1,
         }
-    }
-
-    pub fn is_float(self) -> bool {
-        matches!(
-            self,
-            Self::F32 | Self::F16 | Self::BF16 | Self::F8E4M3 | Self::F8E5M2
-        )
     }
 
     /// Whether a checkpoint storing this dtype ships a separate block-scale
@@ -60,7 +57,7 @@ impl DType {
     /// checkpoints carry one scale per `[B, B]` tile of the weight, so an FP8
     /// tensor is never self-describing. The block size `B` is what the
     /// consuming kernel fixes, and that is on the target
-    /// ([`crate::load_plan::StorageTarget::block_scale_rows`]); which dtypes
+    /// ([`crate::plan::StorageTarget::block_scale_rows`]); which dtypes
     /// arrive that way is here, because it is true of the file no matter who
     /// reads it.
     pub fn is_block_scaled(self) -> bool {
@@ -80,20 +77,6 @@ pub enum BackendKind {
     Cuda,
     Metal,
     Unknown,
-}
-
-impl BackendKind {
-    /// Whether this backend loads weights into a single contiguous persistent
-    /// device arena. Arena backends (CUDA, and the generic test/`Unknown`
-    /// target) coalesce per-buffer `ExtentWrite`s into arena-relative
-    /// `BulkExtentWrite` / `SlabScatter` batched copies, so the arena/bulk
-    /// passes apply.
-    pub fn uses_persistent_arena(self) -> bool {
-        matches!(
-            self,
-            BackendKind::Cuda | BackendKind::Metal | BackendKind::Unknown
-        )
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -187,9 +170,6 @@ pub struct QuantSpec {
     pub bits_per_element: u8,
     pub group_size: u32,
     pub channel_axis: Option<Axis>,
-    pub scale_dtype: Option<DType>,
-    pub zero_point_dtype: Option<DType>,
-    pub block_shape: Vec<i64>,
 }
 
 impl QuantSpec {
@@ -235,6 +215,17 @@ pub enum Encoding {
     Quant(QuantSpec),
 }
 
+impl Encoding {
+    /// The type one element reads as. For a quantized encoding this is the
+    /// logical type the elements decode to, not their storage width.
+    pub fn dtype(&self) -> DType {
+        match self {
+            Encoding::Raw(dtype) => *dtype,
+            Encoding::Quant(spec) => spec.logical_dtype,
+        }
+    }
+}
+
 pub fn normalize_encoding(encoding: &Encoding) -> Encoding {
     match encoding {
         Encoding::Raw(dtype) => Encoding::Raw(*dtype),
@@ -252,24 +243,8 @@ pub struct TensorDecl {
 }
 
 impl TensorDecl {
-    pub fn same_runtime_contract(&self, other: &Self) -> bool {
-        self.shape == other.shape
-            && self.encoding == other.encoding
-            && self.alignment == other.alignment
-    }
-
     pub fn dtype(&self) -> DType {
-        match &self.encoding {
-            Encoding::Raw(dtype) => *dtype,
-            Encoding::Quant(spec) => spec.logical_dtype,
-        }
-    }
-
-    pub fn with_name_and_id(&self, id: TensorId, name: impl Into<String>) -> Self {
-        let mut out = self.clone();
-        out.id = id;
-        out.name = name.into();
-        out
+        self.encoding.dtype()
     }
 }
 
@@ -306,4 +281,30 @@ pub fn encoding_nbytes(shape: &[i64], encoding: &Encoding) -> Option<u64> {
             Some(bits.div_ceil(8))
         }
     }
+}
+
+/// How a scale tensor's entries map onto the tensor they scale.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QuantGranularity {
+    /// One scale per row of `channel_axis`.
+    PerChannel,
+    /// One scale per `group_size` elements along the axis after `channel_axis`.
+    PerGroup,
+}
+
+/// What the driver's kernels expect a scale tensor to hold by the time they read
+/// it.
+///
+/// Not derivable from the scale tensor itself — its dtype says how the bytes are
+/// stored, not how the kernel wants them — so whoever declared the scale states
+/// it. The driver used to infer it from `group_size == 32`, which was true only
+/// because MXFP4 is the one scheme with that group size today.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScaleForm {
+    /// Consumed as raw E8M0 exponent bytes. The MXFP4 GEMM, the dequant kernels
+    /// and `make_expert_weight_view` all require U8 and assert on anything else.
+    RawE8M0,
+    /// Consumed as F32 multipliers. Whatever the scales were stored as (E8M0
+    /// bytes, BF16, or F32 already) is expanded before the GEMM sees them.
+    F32Factors,
 }

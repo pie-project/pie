@@ -14,16 +14,16 @@
 
 #include <cuda_runtime.h>
 
-#include "pie_native/ptir/op_table.hpp"
+#include "pie_native/launch/op_table.hpp"
 #include "pipeline/tier0/tier0_kernels.cuh"
-#include "pie_native/ptir/trace.hpp"
+#include "pie_native/launch/program.hpp"
 
 namespace pie_cuda_driver::pipeline {
 
 // Shared pure-host PTIR decode model (trace/op-table/container/bound/
-// fire-geometry) now lives in pie_native::ptir (driver/common); bring it into
+// fire-geometry) now lives in pie_native::launch (driver/common); bring it into
 // scope so the CUDA-side tier-0/1 code below can use it unqualified.
-using namespace pie_native::ptir;
+using namespace pie_native::launch;
 
 // The runner-resolved launch descriptor for one op.
 struct LaunchOp {
@@ -56,7 +56,7 @@ struct LaunchOp {
     const void*   bcast_meta = nullptr;  // general broadcast: [tdims(4), sstride(4)] device buf
     std::uint32_t bcast_rank = 0;        // general broadcast: target rank
 
-    // pivot_threshold predicate (interface/ptir interp.rs Op::PivotThreshold):
+    // pivot_threshold predicate (compiler/eval/src/interp.rs Op::PivotThreshold):
     // the payload is ALWAYS a resolved trace value (scalar or per-row
     // [rows] vector) — never a host immediate. The runner resolves it to a
     // device pointer + its dtype + element count before launch (tier0_runner.hpp
@@ -437,7 +437,7 @@ inline bool launch_op(const LaunchOp& o) {
         case OpCode::PivotThreshold:
             // Container pivot_threshold(input, predicate) → bool selection
             // mask. The predicate payload is a resolved trace value (scalar
-            // or per-row), never an immediate (interface/ptir interp.rs).
+            // or per-row), never an immediate (compiler/eval/src/interp.rs).
             switch (o.pred_tag) {
                 case PredTag::RankLe:
                     switch (o.pred_dtype) {

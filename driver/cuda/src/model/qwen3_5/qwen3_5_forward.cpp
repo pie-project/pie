@@ -26,7 +26,7 @@
 #include "kernels/residual_add.hpp"
 #include "kernels/rmsnorm.hpp"
 #include "kernels/rope.hpp"
-#include "kernels/slab_scatter.hpp"
+#include "kernels/slot_ops.hpp"
 #include "kernels/split_packed.hpp"
 #include "kernels/swiglu.hpp"
 #include "ops/attention_naive.hpp"

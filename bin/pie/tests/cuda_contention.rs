@@ -639,9 +639,7 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
              victims must actively save (suspend) and restore their KV state. \
              Zero means the active path never ran."
         );
-        eprintln!(
-            "[contention] self-suspend engaged: suspends={suspends} restores={restores} ✓"
-        );
+        eprintln!("[contention] self-suspend engaged: suspends={suspends} restores={restores} ✓");
     }
 
     eprintln!(

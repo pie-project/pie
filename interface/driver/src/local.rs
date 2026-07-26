@@ -25,7 +25,12 @@ use crate::geometry::GeometryClass;
 /// hoisted out of the per-step sections. Admission is folded into the launch
 /// call itself ([`PIE_STATUS_EXHAUSTED`] / [`PIE_STATUS_IMPOSSIBLE`]); the
 /// v12 prepare/lease surface and the v13 `settle_defer` lever are deleted.
-pub const PIE_DRIVER_ABI_VERSION: u32 = 14;
+///
+/// v17 (phase 3′): `PieProgramDesc::region_analysis` — the per-region bind
+/// verdicts and intrinsic side-table analysis the CUDA driver derives for
+/// itself in `region_support.hpp`. Additive, and empty means "not supplied",
+/// but the struct grew, so drivers and workers ship together.
+pub const PIE_DRIVER_ABI_VERSION: u32 = 19;
 pub const PIE_MODEL_COMPONENT_FULL: u32 = 0;
 pub const PIE_MODEL_COMPONENT_TEXT: u32 = 1;
 pub const PIE_MODEL_COMPONENT_ENCODE: u32 = 2;
@@ -57,6 +62,9 @@ pub const PIE_STATUS_IMPOSSIBLE: i32 = -7;
 
 // Literal values so cbindgen emits plain macros; the assert pins them to the
 // Rust enum.
+/// Sentinel for [`PieLaunchOp::channel`] on ops that touch no channel.
+pub const PIE_NO_CHANNEL: u32 = u32::MAX;
+
 pub const PIE_GEOMETRY_CLASS_HOST: u32 = 0;
 pub const PIE_GEOMETRY_CLASS_DECODE_ENVELOPE: u32 = 1;
 pub const PIE_GEOMETRY_CLASS_DEVICE_GEOMETRY: u32 = 2;
@@ -466,6 +474,537 @@ impl Default for PieModelLoadDesc {
     }
 }
 
+/// What an emitted kernel is for. The driver switches on this to decide which
+/// launch path a compiled entry belongs to, so it never has to re-derive from
+/// the plan what the host already decided.
+pub const PIE_KERNEL_SINGLETON: u32 = 0;
+pub const PIE_KERNEL_FUSED: u32 = 1;
+pub const PIE_KERNEL_GROUPED: u32 = 2;
+pub const PIE_KERNEL_READINESS: u32 = 3;
+pub const PIE_KERNEL_COMMIT: u32 = 4;
+
+/// One host-emitted kernel: the backend source, its entry point, and where it
+/// belongs in the program.
+///
+/// The host runs the code generator (`compiler/codegen`) and ships the result;
+/// the driver compiles and launches it. `source.len == 0` means the host could
+/// not emit this kernel, and `error` says why — that is not fatal by itself,
+/// because a driver may have a slower path for the same region (a fused region
+/// that exceeds a channel-binding limit falls back to one launch per op). A
+/// driver MUST NOT treat a missing kernel as a reason to re-derive the source
+/// itself; the whole point is that only one implementation exists.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PieEmittedKernel {
+    /// `PIE_KERNEL_*`.
+    pub kind: u32,
+    /// Stage index in container order.
+    pub stage_index: u32,
+    /// Region index within the stage's partition for this `kind`.
+    pub region_index: u32,
+    /// Reserved; must be zero.
+    pub reserved0: u32,
+    /// Entry-point symbol, a C identifier. Empty when `source` is empty.
+    pub entry_name: PieBytes,
+    /// Backend source (CUDA C or MSL). Empty when emission failed.
+    pub source: PieBytes,
+    /// Why emission failed, when `source` is empty. Empty otherwise.
+    pub error: PieBytes,
+}
+
+impl Default for PieEmittedKernel {
+    fn default() -> Self {
+        Self {
+            kind: PIE_KERNEL_SINGLETON,
+            stage_index: 0,
+            region_index: 0,
+            reserved0: 0,
+            entry_name: PieBytes::default(),
+            source: PieBytes::default(),
+            error: PieBytes::default(),
+        }
+    }
+}
+
+/// Borrowed view of a host-emitted kernel table.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PieEmittedKernelSlice {
+    pub ptr: *const PieEmittedKernel,
+    pub len: usize,
+}
+
+/// One `argmax` in a generated region that reads a logits intrinsic's device
+/// buffer directly, skipping the intrinsic materialisation and the reshapes
+/// between them.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PieDirectArgmax {
+    /// The `argmax` node, in stage op order.
+    pub node: u32,
+    /// The value id of the intrinsic buffer it reads instead.
+    pub source_value: u32,
+    /// `PTIR_INTR_*` of that buffer.
+    pub intrinsic: u16,
+    /// Nonzero when the rewrite is only valid for a single runtime row, which
+    /// the driver checks per fire against the lane's descriptors.
+    pub requires_single_row: u8,
+    /// Reserved; must be zero.
+    pub reserved0: u8,
+}
+
+/// Borrowed view of a direct-argmax table.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PieDirectArgmaxSlice {
+    pub ptr: *const PieDirectArgmax,
+    pub len: usize,
+}
+
+/// The region can be bound as a second-party region.
+pub const PIE_REGION_SECOND_PARTY_SUPPORTED: u32 = 1 << 0;
+/// The region is a well-formed generated region.
+pub const PIE_REGION_GENERATED_VALID: u32 = 1 << 1;
+
+/// Every per-region decision the host made about one fused region.
+///
+/// Joins to `PieEmittedKernel` on `(stage_index, region_index)`. A driver that
+/// reads this table does not have to look at the plan to know whether a region
+/// binds, whether it can be emitted, or how its intrinsic side tables are laid
+/// out (`ptir-refactor.md` §4.2).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PieRegionAnalysis {
+    /// Stage index in container order.
+    pub stage_index: u32,
+    /// Region index within the stage's fused partition.
+    pub region_index: u32,
+    /// `PIE_REGION_*` bits.
+    pub flags: u32,
+    /// Reserved; must be zero.
+    pub reserved0: u32,
+    pub direct_argmax: PieDirectArgmaxSlice,
+    /// Nodes the rewrites above make redundant, ascending.
+    pub skipped: PieU32Slice,
+}
+
+/// Borrowed view of a per-region analysis table.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PieRegionAnalysisSlice {
+    pub ptr: *const PieRegionAnalysis,
+    pub len: usize,
+}
+
+// ── the launch package ──
+//
+// Everything below is the program itself, in the shape a driver executes it:
+// channels to allocate, ports to bind, per-stage op DAGs to launch, and the
+// per-region plan the emitted kernels were generated from.
+//
+// It is deliberately *not* PTIR. A driver reading this table never sees a
+// container, a sidecar, a hash to check, or a wire format to parse — those are
+// the compiler's business, and the compiler has already validated all of them
+// (`ptir-refactor.md` §2.3). Records are flat and POD; nested `Pie*Slice`
+// fields point at host-owned arrays that outlive the registration call.
+
+/// Where a value comes from. Mirrors `pie_ir` value sources.
+pub const PIE_VALUE_CONST: u8 = 0;
+pub const PIE_VALUE_INTRINSIC: u8 = 1;
+pub const PIE_VALUE_CHANNEL_TAKE: u8 = 2;
+pub const PIE_VALUE_CHANNEL_READ: u8 = 3;
+pub const PIE_VALUE_OP_RESULT: u8 = 4;
+
+/// One declared SSA value: its type and its producer.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PieLaunchValue {
+    /// Trace-global value id. The table is dense and ascending, so this is the
+    /// index, but it is carried explicitly so a driver never has to assume so.
+    pub id: u32,
+    /// `PIE_VALUE_*`.
+    pub source: u8,
+    /// Element dtype (`PTIR_DT_*`).
+    pub dtype: u8,
+    /// `PTIR_INTR_*` when `source` is `PIE_VALUE_INTRINSIC`.
+    pub intrinsic: u8,
+    /// Reserved; must be zero.
+    pub reserved1: u8,
+    /// Channel id when `source` is a channel take or read.
+    pub channel: u32,
+    /// Literal payload when `source` is `PIE_VALUE_CONST`, raw bits per dtype.
+    pub literal_bits: u32,
+    /// Reserved; must be zero.
+    pub reserved0: u32,
+    /// Row-major logical shape. Empty is scalar.
+    pub shape: PieU32Slice,
+}
+
+/// Borrowed view of a value table.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PieLaunchValueSlice {
+    pub ptr: *const PieLaunchValue,
+    pub len: usize,
+}
+
+/// One op in a stage DAG, in SSA order.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PieLaunchOp {
+    /// `PTIR_OP_*`.
+    pub code: u16,
+    /// SSA ids this op defines (`top_k`/`sort_desc` define two).
+    pub result_count: u16,
+    /// First SSA id this op defines.
+    pub result_id: u32,
+    /// `PTIR_INTR_*`, for `intrinsic_val`.
+    pub intrinsic: u16,
+    /// Literal dtype, for `const`.
+    pub lit_dtype: u8,
+    /// Element dtype (`PTIR_DT_*`) — the result's, or the target of a `cast`.
+    pub dtype: u8,
+    /// `pivot_threshold` predicate tag.
+    pub pred_tag: u8,
+    /// RNG kind (0 uniform, 1 gumbel).
+    pub rng_kind: u8,
+    /// Reserved; must be zero.
+    pub reserved0: u16,
+    /// Raw literal bits, for `const`.
+    pub lit_bits: u32,
+    /// `pivot_threshold` predicate payload — always a value id.
+    pub pred_payload: u32,
+    /// Channel slot for `chan_take`/`chan_read`/`chan_put`, else
+    /// [`PIE_NO_CHANNEL`].
+    pub channel: u32,
+    /// Name-table index for `kernel_call`/`sink_call`.
+    pub name_index: u32,
+    /// Op-specific immediates (`top_k` k, transpose axes, iota len, …).
+    pub imm: u32,
+    pub imm2: u32,
+    pub imm3: u32,
+    /// Reserved; must be zero.
+    pub reserved1: u32,
+    /// Operand value ids, in op-defined order.
+    pub args: PieU32Slice,
+    /// Trace-known result shape (or the target shape of a broadcast/reshape).
+    pub shape: PieU32Slice,
+}
+
+/// Borrowed view of an op table.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PieLaunchOpSlice {
+    pub ptr: *const PieLaunchOp,
+    pub len: usize,
+}
+
+/// The channel is pre-filled with a seed cell at instantiation.
+pub const PIE_CHANNEL_SEEDED: u8 = 1 << 0;
+/// The host reads or writes this channel.
+pub const PIE_CHANNEL_HOST_VISIBLE: u8 = 1 << 1;
+/// The host is the *reader* — the channel is a program output.
+pub const PIE_CHANNEL_HOST_READER: u8 = 1 << 2;
+
+/// No op in the pass touches this channel, so a fire has nothing to wait for.
+pub const PIE_READINESS_UNTOUCHED: u8 = 0;
+/// The first op to touch this channel in pass order takes or reads it, so a
+/// fire is ready only while the ring is non-empty.
+pub const PIE_READINESS_NEEDS_FULL: u8 = 1;
+/// The first op to touch this channel in pass order puts to it, so a fire is
+/// ready only while the ring is non-full.
+pub const PIE_READINESS_NEEDS_EMPTY: u8 = 2;
+
+/// One channel declaration: a bounded ring of `capacity + 1` typed cells.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PieLaunchChannel {
+    pub id: u32,
+    /// Logical capacity; the ring holds `capacity + 1` cells.
+    pub capacity: u32,
+    /// Cell element dtype (`PTIR_DT_*`).
+    pub dtype: u8,
+    /// `PIE_CHANNEL_*` bits.
+    pub flags: u8,
+    /// -1 private, 0 import, 1 export.
+    pub extern_dir: i8,
+    /// `PIE_READINESS_*` — the direction the *first* op to touch this channel
+    /// in pass order requires.
+    ///
+    /// Not derivable from the per-stage `takes`/`reads`/`puts` sets: a channel
+    /// that is both taken and put (the `InPlace` shape — a counter, a beam
+    /// state, a DFA cursor) appears in both, and only the order says which
+    /// gate a fire must clear. Deriving it from the sets yields
+    /// `full && empty`, which a `capacity == 1` ring can never satisfy.
+    pub readiness: u8,
+    /// Reserved; must be zero.
+    pub reserved1: u32,
+    /// Cell shape.
+    pub shape: PieU32Slice,
+    /// Rendezvous name when `extern_dir` is not -1.
+    pub extern_name: PieBytes,
+}
+
+/// Borrowed view of a channel table.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PieLaunchChannelSlice {
+    pub ptr: *const PieLaunchChannel,
+    pub len: usize,
+}
+
+/// One descriptor-port binding: a forward-pass input port fed by a channel.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PieLaunchPort {
+    /// `PTIR_PORT_*`.
+    pub port: u8,
+    /// Nonzero when the port was const-folded and consumes no channel.
+    pub is_const: u8,
+    /// Const payload dtype when `is_const`.
+    pub const_dtype: u8,
+    /// Reserved; must be zero.
+    pub reserved0: u8,
+    /// Channel id when not const-folded.
+    pub channel: u32,
+    /// Const payload shape when `is_const`.
+    pub const_shape: PieU32Slice,
+    /// Const payload bytes when `is_const`.
+    pub const_data: PieBytes,
+}
+
+/// Borrowed view of a port table.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PieLaunchPortSlice {
+    pub ptr: *const PieLaunchPort,
+    pub len: usize,
+}
+
+/// A `(channel, value)` pair — a stage effect or a region's direct sink.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PieLaunchPut {
+    pub channel: u32,
+    pub value: u32,
+}
+
+/// Borrowed view of a put table.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PieLaunchPutSlice {
+    pub ptr: *const PieLaunchPut,
+    pub len: usize,
+}
+
+/// The region is served by a generated kernel.
+pub const PIE_REGION_GENERATED: u8 = 0;
+/// The region is served by a vendor or second-party library call.
+pub const PIE_REGION_LIBRARY: u8 = 1;
+
+/// One region: a contiguous run of normalized ops served by one launch.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PieLaunchRegion {
+    /// `PIE_REGION_GENERATED` or `PIE_REGION_LIBRARY`.
+    pub kind: u8,
+    /// Which library call, when `kind` is `PIE_REGION_LIBRARY`: NucleusSample
+    /// 0, TopK 1, Sort 2, Scan 3, MatMul 4, SecondParty 5.
+    pub library: u8,
+    /// Launch shape the host chose: Effects 0, OneCtaPerRow 1,
+    /// HierarchicalRow 2, Library 3.
+    pub schedule: u8,
+    /// Reserved; must be zero.
+    pub reserved0: u8,
+    /// Reserved; must be zero.
+    pub reserved1: u32,
+    /// Normalized op indices in this region, ascending.
+    pub nodes: PieU32Slice,
+    /// Values the region reads from outside itself.
+    pub inputs: PieU32Slice,
+    /// Values the region publishes.
+    pub outputs: PieU32Slice,
+    /// Channel slots the region writes directly from the kernel.
+    pub sinks: PieLaunchPutSlice,
+}
+
+/// Borrowed view of a region table.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PieLaunchRegionSlice {
+    pub ptr: *const PieLaunchRegion,
+    pub len: usize,
+}
+
+/// A dimension is a literal extent, not a symbolic one.
+pub const PIE_EXTENT_STATIC: u8 = 0xff;
+
+/// One normalized value's type: a dtype plus a per-dimension extent, where each
+/// extent is either a literal or one of the runtime extents the lane supplies.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PieLaunchPlanValue {
+    /// Element dtype (`PTIR_DT_*`).
+    pub dtype: u8,
+    /// Reserved; must be zero.
+    pub reserved0: u8,
+    pub reserved1: u16,
+    /// Per-dimension extent kind: `PIE_EXTENT_STATIC`, or KvLen 0, PageCount
+    /// 1, RowCount 2, TokenCount 3, SampledRows 4, QueryLen 5, KeyLen 6.
+    pub extents: PieU8Slice,
+    /// Per-dimension literal extent; meaningful where `extents` is static.
+    pub dims: PieU32Slice,
+}
+
+/// Borrowed view of a normalized value-type table.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PieLaunchPlanValueSlice {
+    pub ptr: *const PieLaunchPlanValue,
+    pub len: usize,
+}
+
+/// One lane-binding rule: normalized value `value` is bound through local
+/// channel slot `local`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PieLaunchChannelRule {
+    pub value: u32,
+    pub local: u32,
+}
+
+/// Borrowed view of a channel-rule table.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PieLaunchChannelRuleSlice {
+    pub ptr: *const PieLaunchChannelRule,
+    pub len: usize,
+}
+
+/// The stage reads the `query` intrinsic.
+pub const PIE_STAGE_REQUIRES_QUERY: u32 = 1 << 0;
+/// The stage reads the `layer` intrinsic.
+pub const PIE_STAGE_REQUIRES_LAYER: u32 = 1 << 1;
+/// The stage reads the `attn_score` intrinsic.
+pub const PIE_STAGE_REQUIRES_ATTN_SCORE: u32 = 1 << 2;
+/// The stage names a second-party kernel.
+pub const PIE_STAGE_REQUIRES_KERNEL_CALL: u32 = 1 << 3;
+/// The stage writes the `attn_page_mask` sink.
+pub const PIE_STAGE_REQUIRES_PAGE_MASK: u32 = 1 << 4;
+/// The stage reads multi-token-prediction draft rows.
+pub const PIE_STAGE_REQUIRES_MTP_ROWS: u32 = 1 << 5;
+/// Every op in the stage is coverable by the grouped launch path, and its
+/// intrinsics and runtime extents are ones that path supports. When clear,
+/// `error` says why and the stage must take the fused path.
+pub const PIE_STAGE_GROUPED_VALID: u32 = 1 << 6;
+
+/// The per-program launch plan for one stage: the normalized program the
+/// emitted kernels were generated from, its region partitions, and the
+/// lane-binding metadata the driver used to derive itself.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PieLaunchStagePlan {
+    /// Canonical signature of the normalized stage.
+    pub signature_hash: u64,
+    /// Graph-cache identity — what the driver keys a captured CUDA graph on.
+    pub identity: u64,
+    /// `PIE_STAGE_REQUIRES_*` bits.
+    pub flags: u32,
+    /// Draft rows the stage reads when `PIE_STAGE_REQUIRES_MTP_ROWS` is set.
+    pub mtp_rows: u32,
+    /// Normalized ops, in SSA order. `channel` indexes `channel_bindings`.
+    pub ops: PieLaunchOpSlice,
+    /// One entry per normalized op, listing the source op positions it covers.
+    pub source_ops: PieU32Slice,
+    /// `source_ops` is a flattened ragged array; this is its per-op length.
+    pub source_op_counts: PieU32Slice,
+    /// One entry per normalized SSA value.
+    pub value_types: PieLaunchPlanValueSlice,
+    /// Local channel slot → program-global dense channel index.
+    pub channel_bindings: PieU32Slice,
+    /// Local name slot → canonical second-party kernel name.
+    pub names: PieBytesSlice,
+    /// One-launch-per-op partition.
+    pub singleton: PieLaunchRegionSlice,
+    /// Fused partition — what `emitted_kernels` was generated from.
+    pub fused: PieLaunchRegionSlice,
+    /// Runtime extents any value in the stage depends on, ascending.
+    pub used_extents: PieU8Slice,
+    /// Values bound through a channel, in normalized value order.
+    pub channel_rules: PieLaunchChannelRuleSlice,
+    /// Why `PIE_STAGE_GROUPED_VALID` is clear. Empty when it is set.
+    pub error: PieBytes,
+}
+
+/// Borrowed view of a per-stage launch plan table.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PieLaunchStagePlanSlice {
+    pub ptr: *const PieLaunchStagePlan,
+    pub len: usize,
+}
+
+/// One stage program: the op DAG the driver launches, its channel effects, and
+/// its declared outputs.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PieLaunchStage {
+    /// Attachment point: Prologue 0, OnAttnProj 1, OnAttn 2, Epilogue 3.
+    pub kind: u8,
+    /// Reserved; must be zero.
+    pub reserved0: u8,
+    pub reserved1: u16,
+    /// Reserved; must be zero.
+    pub reserved2: u32,
+    pub ops: PieLaunchOpSlice,
+    /// Channel effects committed at pass end, in order.
+    pub puts: PieLaunchPutSlice,
+    /// Channels this stage consumes — readiness needs them full.
+    pub takes: PieU32Slice,
+    /// Channels this stage peeks — readiness needs them full.
+    pub reads: PieU32Slice,
+}
+
+/// Borrowed view of a stage table.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PieLaunchStageSlice {
+    pub ptr: *const PieLaunchStage,
+    pub len: usize,
+}
+
+/// Borrowed view of a table of byte strings.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PieBytesSlice {
+    pub ptr: *const PieBytes,
+    pub len: usize,
+}
+
+/// **The launch package** — a program in the shape a driver executes it.
+///
+/// This is what replaced `canonical_bytes` + `sidecar_bytes`. The compiler
+/// owns what a program *is*; the driver owns firing it. Nothing here requires
+/// the driver to know PTIR: there is no container, no sidecar, no wire format,
+/// and no identity to re-check (`program_hash` on `PieProgramDesc` is the key).
+///
+/// `stages` and `plans` are parallel arrays in attachment order — `plans[i]` is
+/// the launch plan for `stages[i]`, and `(stage_index, region_index)` joins
+/// both to `emitted_kernels` and to `region_analysis`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PieLaunchPackage {
+    /// SSA value table, indexed by value id.
+    pub values: PieLaunchValueSlice,
+    pub channels: PieLaunchChannelSlice,
+    pub ports: PieLaunchPortSlice,
+    /// Program-wide name table for second-party kernels and sinks.
+    pub names: PieBytesSlice,
+    pub stages: PieLaunchStageSlice,
+    /// One launch plan per stage, in the same order as `stages`.
+    pub plans: PieLaunchStagePlanSlice,
+}
+
 /// Static program registration descriptor.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -473,10 +1012,24 @@ pub struct PieProgramDesc {
     pub abi_version: u32,
     /// Reserved; must be zero.
     pub reserved0: u32,
-    /// Stable C3 registration/cache key; canonical bytes are only needed on first registration.
+    /// Stable C3 registration/cache key.
     pub program_hash: u64,
-    pub canonical_bytes: PieBytes,
-    pub sidecar_bytes: PieBytes,
+    /// Kernels the host generated for this program, in the driver's own
+    /// backend. Empty for a driver that has no code generation (the dummy
+    /// driver interprets, and the native drivers ignore the table for stages
+    /// they run on a prebuilt path).
+    ///
+    /// The emitter version the host built these with, so a driver's compile
+    /// cache keys on it: a bump must miss, not silently reuse a stale cubin.
+    pub emitter_version: u32,
+    /// Reserved; must be zero.
+    pub reserved1: u32,
+    pub emitted_kernels: PieEmittedKernelSlice,
+    /// Per-region bind verdicts and intrinsic side-table analysis, joined to
+    /// `emitted_kernels` on `(stage_index, region_index)`.
+    pub region_analysis: PieRegionAnalysisSlice,
+    /// The program itself, in the shape the driver executes it.
+    pub launch: PieLaunchPackage,
 }
 
 impl Default for PieProgramDesc {
@@ -485,8 +1038,11 @@ impl Default for PieProgramDesc {
             abi_version: PIE_DRIVER_ABI_VERSION,
             reserved0: 0,
             program_hash: 0,
-            canonical_bytes: PieBytes::default(),
-            sidecar_bytes: PieBytes::default(),
+            emitter_version: 0,
+            reserved1: 0,
+            emitted_kernels: PieEmittedKernelSlice::default(),
+            region_analysis: PieRegionAnalysisSlice::default(),
+            launch: PieLaunchPackage::default(),
         }
     }
 }
@@ -1215,14 +1771,15 @@ pub fn validate_model_load_desc(desc: &PieModelLoadDesc) -> PieAbiValidationResu
 }
 
 /// Validates a program-registration descriptor.
+///
+/// The launch package's own tables are not walked here, for the same reason
+/// `emitted_kernels` is not: they are host-owned arrays whose shape the
+/// compiler guarantees, and the C++ side validates the pointer/length pairs it
+/// is about to dereference.
 pub fn validate_program_desc(desc: &PieProgramDesc) -> PieAbiValidationResult {
     validate_pie_abi_version(desc.abi_version)?;
     validate_reserved_zero("program reserved0 must be zero", desc.reserved0)?;
-    validate_bytes(
-        desc.canonical_bytes,
-        "program canonical_bytes ptr/len mismatch",
-    )?;
-    validate_bytes(desc.sidecar_bytes, "program sidecar_bytes ptr/len mismatch")
+    validate_reserved_zero("program reserved1 must be zero", desc.reserved1)
 }
 
 /// Validates an instance-bind descriptor.
@@ -1394,7 +1951,10 @@ pub unsafe fn validate_step_desc(desc: &PieStepDesc, roster_len: usize) -> PieAb
         desc.sub_batch_indptr,
         "step sub_batch_indptr ptr/len mismatch",
     )?;
-    validate_u32_slice(desc.sub_batch_class, "step sub_batch_class ptr/len mismatch")?;
+    validate_u32_slice(
+        desc.sub_batch_class,
+        "step sub_batch_class ptr/len mismatch",
+    )?;
     unsafe {
         validate_csr(
             desc.sub_batch_indptr,
@@ -1846,10 +2406,7 @@ pub unsafe fn validate_frame_desc(desc: &PieFrameDesc) -> PieAbiValidationResult
     validate_reserved_zero("frame reserved0 must be zero", desc.reserved0)?;
     validate_reserved_zero("frame reserved1 must be zero", desc.reserved1)?;
     validate_u64_slice(desc.instance_ids, "frame instance_ids ptr/len mismatch")?;
-    validate_u32_slice(
-        desc.kv_translation,
-        "frame kv_translation ptr/len mismatch",
-    )?;
+    validate_u32_slice(desc.kv_translation, "frame kv_translation ptr/len mismatch")?;
     validate_u32_slice(
         desc.kv_translation_indptr,
         "frame kv_translation_indptr ptr/len mismatch",
@@ -2903,10 +3460,7 @@ mod tests {
     #[test]
     fn frame_validator_rejects_missing_steps_dup_roster_and_translation_csr() {
         let step = PieStepDesc::default();
-        let steps = PieStepDescSlice {
-            ptr: &step,
-            len: 1,
-        };
+        let steps = PieStepDescSlice { ptr: &step, len: 1 };
 
         let empty = PieFrameDesc::default();
         let err = unsafe { validate_frame_desc(&empty) }.unwrap_err();

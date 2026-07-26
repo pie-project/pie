@@ -293,11 +293,11 @@ fn north_star_mtp_grammar_composition() {
 /// is exactly what this harness is for.
 #[test]
 fn north_star_quest_attention_sink() {
-    use pie_ptir::container::{StageProgram, TraceContainer};
-    use pie_ptir::op::{IntrinsicId, Op};
-    use pie_ptir::registry::{KernelInfo, ModelProfile, Stage};
-    use pie_ptir::types::{DType, Literal, Predicate, Shape};
-    use pie_ptir::validate::{bind, ValidateError};
+    use pie_ir::container::{StageProgram, TraceContainer};
+    use pie_ir::op::{IntrinsicId, Op};
+    use pie_ir::registry::{KernelInfo, ModelProfile, Stage};
+    use pie_ir::types::{DType, Literal, Predicate, Shape};
+    use pie_ir::validate::{bind, ValidateError};
 
     const PAGES: u32 = 8;
     const BUDGET: u32 = 3;

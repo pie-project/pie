@@ -116,18 +116,17 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
         on: Resource<Pipeline>,
     ) -> Result<Result<Resource<RsWorkingSet>, String>> {
         crate::inferlet::process::gate::residency_gate(self).await?;
-        // A channel value can become host-visible just before its fire's
-        // completion callback is drained. Fork must therefore retire every
-        // earlier operation on `on` before snapshotting the parent's committed
-        // folded mapping; this is the ordering guarantee carried by the
-        // pipeline argument.
-        let (fires, failure, scope) = {
+        // No drain: RS mappings publish at prepare, in submission order, so
+        // the committed mapping already carries every fire submitted on `on`
+        // before this call. Fork therefore snapshots exactly the state the
+        // guest's submission order asks for, and the shared slot's CONTENTS
+        // are ordered by the stream — a later CoW copy is issued behind the
+        // fires that wrote the parent. `KvWorkingSet::fork` takes the same
+        // lock-only path for the same reason. The pipeline argument remains
+        // the scope and ordering declaration.
+        let (failure, scope) = {
             let pipeline = self.ctx().table.get(&on)?;
-            (
-                pipeline.fires.clone(),
-                pipeline.failure.clone(),
-                pipeline.scope.clone(),
-            )
+            (pipeline.failure.clone(), pipeline.scope.clone())
         };
         let ws = self.ctx().table.get(&this)?.clone();
         if let Err(owner) = ws.claim_pipeline_scope(&scope) {
@@ -137,7 +136,6 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
                 scope.id()
             )));
         }
-        crate::pipeline::fire::drain_rs_predecessors(self, &fires).await?;
         if let Some(reason) = failure.lock().unwrap().clone() {
             return Ok(Err(format!(
                 "rs working set fork: pipeline failed: {reason}"

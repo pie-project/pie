@@ -757,8 +757,8 @@ int Context::Impl::load_model(
         cfg,
         tp_comm_,
         runtime_quant,
-        static_cast<pie_driver::Mxfp4MoeRequest>(load.mxfp4_moe),
-        static_cast<pie_driver::Component>(load.component)));
+        static_cast<model::Mxfp4MoeRequest>(load.mxfp4_moe),
+        static_cast<model::Component>(load.component)));
     auto& engine = *engine_p;
     media_hidden_size_ = engine.hf_config().hidden_size;
 
@@ -833,6 +833,11 @@ int Context::Impl::load_model(
              static_cast<std::uint32_t>(media_hidden_size_)},
             {"supports_media_encode", true},
             {"snapshot_dir", c.snapshot_dir},
+            // Ask the host to run PTIR code generation for us. The emitter it
+            // runs (`compiler/codegen/src/cuda/`) is the same one this driver
+            // carries, pinned byte-for-byte by `compiler/tests/golden-cuda/`;
+            // the in-driver copy stays as the fallback until it is deleted.
+            {"codegen_backend", "cuda"},
             {"kv_handle", nullptr},
         };
         caps_json_ = caps.dump();
@@ -1895,6 +1900,7 @@ int Context::Impl::load_model(
         {"hidden_size", static_cast<std::uint32_t>(engine.hf_config().hidden_size)},
         {"supports_media_encode", model_->capabilities().supports_media_encode},
         {"snapshot_dir", c.snapshot_dir},
+        {"codegen_backend", "cuda"},
         {"kv_handle", std::move(kv_handle)},
     };
     caps_json_ = caps.dump();
