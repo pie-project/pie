@@ -144,39 +144,34 @@ doubles the step. The fused path adds 0.198 ms, or 2.3%.
 
 ### Example 2: speculative decoding, withdrawn and re-measured
 
-This section used to report XGrammar at 33 ms per outer step against 56 µs, a
+This section used to report XGrammar at 33 ms per outer step against 56 us, a
 594x ratio. It measured the wrong thing on both sides.
 
 On XGrammar's side it filled a bitmask once per draft position, which is not
 how XGrammar verifies drafts. `traverse_draft_tree` takes the whole tree in one
-call, and it is flat in `k`:
+call, and it is flat in `k`. On our side the number was unreproducible and could
+not have been real, because `DeviceBatch` had no device-side advance at all.
 
-| batch | k | `traverse_draft_tree` | per-position | overstatement |
-|---:|---:|---:|---:|---:|
-| 512 | 1 | 1,200 µs | 1,400 µs | 1.2x |
-| 512 | 4 | 1,213 µs | 4,901 µs | 4.0x |
-| 512 | 8 | 1,218 µs | 56,323 µs | **46.2x** |
+Both now exist, so the comparison can be made. Batch 512, one schema, charging
+each engine for the mask at every draft position:
 
-On our side the number was unreproducible, and it could not have been real:
-`DeviceBatch` has no device-side advance. It fills a mask from a configuration
-set the *host* uploads, and after every sampled token the host parser runs and
-the whole set is uploaded again. Verifying `k` drafts on device is therefore
-not something the implementation can do at all.
+| k | gpugrammar (fill + advance per position) | XGrammar `traverse_draft_tree` |
+|---:|---:|---:|
+| 1 | 104 us | 1,196 us |
+| 4 | 416 us | 1,196 us |
+| 8 | 833 us | 1,232 us |
 
-That gap is also the largest single cost in our own decode loop. Charging every
-component at batch 512:
+The direction is the opposite of the withdrawn claim. **XGrammar is flat in `k`
+and we are linear**, because it walks the draft tree once with a shared prefix
+while we repeat a full fill and advance per position. We are 11.5x ahead at
+k=1 and 1.5x at k=8; extrapolating, XGrammar wins somewhere around k=12.
 
-| schema | device fill | host advance | host->device upload | total | XGrammar | end to end |
-|---:|---:|---:|---:|---:|---:|---:|
-| 2 | 2,538 | 1,134 | 2,099 | 5,771 | 11,729 | 1.21x |
-| 3 | 430 | 453 | 1,007 | 1,889 | 12,261 | 1.43x |
-| 8 | 31 | 195 | 875 | 1,101 | 2,067 | 1.04x |
-
-The upload is 53% to 79% of what we spend, and it exists only because the
-advance is on the host. A device-side advance would delete both columns - on
-schema 3 the step goes from 1,889 µs to 430 µs and end-to-end from 1.43x to
-1.63x - and it is the prerequisite for verifying drafts without leaving the
-device. It is the single highest-value piece of work remaining.
+Two things are missing before this is a serving result. There is no device-side
+rollback, so what is measured is the forward walk and not a complete
+verification - real speculative decoding accepts a prefix and rewinds the rest.
+And the shared-prefix structure XGrammar exploits is available to us too: the
+draft positions of one sequence differ by one token, so a tree walk would make
+our cost flat in `k` as well. Neither is done.
 
 ## Grammar class decision
 
