@@ -59,6 +59,19 @@ pub enum Expr {
         before: i64,
         after: i64,
     },
+    /// This rank's `1/world` partition of `src` along `axis`.
+    ///
+    /// The one node whose meaning depends on the target, and the reason
+    /// compilation has a *specialization* stage: a contract is authored once
+    /// and specialized once per rank, where [`Resolver::specialize`] rewrites
+    /// each `Shard` into the concrete [`Expr::Slice`] that rank reads. Nothing
+    /// below the frontend ever sees one.
+    ///
+    /// Stated as a node rather than a field beside the expression so that a
+    /// contract stays rank-independent — the author writes the partition, not
+    /// the arithmetic — and so that it composes: a shard of one leg of a
+    /// [`Expr::Cat`] is expressible, which a whole-expression flag cannot say.
+    Shard { src: Box<Expr>, axis: Axis },
     /// Escape hatch: a backend-specific layout swizzle. Opaque to the type
     /// checker, so it must declare its own output type.
     Repack {
@@ -291,6 +304,21 @@ impl<'a> Resolver<'a> {
         infer(expr, &mut self.scope)
     }
 
+    /// Rewrite `expr` for one rank of a `world`-way tensor-parallel split,
+    /// replacing every [`Expr::Shard`] with the slice that rank reads.
+    ///
+    /// `what` names the thing being specialized and appears in the divisibility
+    /// error, which is what a user sees when a tp_size does not fit the model.
+    pub fn specialize(
+        &mut self,
+        expr: Expr,
+        rank: u32,
+        world: u32,
+        what: &str,
+    ) -> Result<Expr, CompileError> {
+        specialize(expr, &mut self.scope, rank, world, what)
+    }
+
     /// Bring `name` into scope for later expressions.
     pub fn publish(&mut self, name: &str, ty: TensorType) {
         self.scope.resolved.outputs.insert(name.to_string(), ty);
@@ -377,7 +405,104 @@ fn infer(expr: &Expr, scope: &mut Scope<'_>) -> Result<TensorType, CompileError>
             }
             Ok(out.clone())
         }
+        Expr::Shard { .. } => Err(CompileError::Internal(
+            "Shard has no type until it is specialized against a target; call \
+             Resolver::specialize first"
+                .to_string(),
+        )),
     }
+}
+
+/// Rewrite every [`Expr::Shard`] in `expr` into the concrete slice `rank` reads,
+/// resolving extents through `scope`.
+///
+/// Children first, so that a shard over a shard — or over a [`Expr::Cat`] whose
+/// legs are themselves sharded — sees an operand it can already type.
+fn specialize(
+    expr: Expr,
+    scope: &mut Scope<'_>,
+    rank: u32,
+    world: u32,
+    what: &str,
+) -> Result<Expr, CompileError> {
+    macro_rules! go {
+        ($src:expr) => {
+            Box::new(specialize(*$src, scope, rank, world, what)?)
+        };
+    }
+    Ok(match expr {
+        Expr::Src(_) | Expr::Out(_) => expr,
+        Expr::Slice {
+            src,
+            axis,
+            start,
+            len,
+            step,
+        } => Expr::Slice {
+            src: go!(src),
+            axis,
+            start,
+            len,
+            step,
+        },
+        Expr::Reshape { src, shape } => Expr::Reshape {
+            src: go!(src),
+            shape,
+        },
+        Expr::Pad {
+            src,
+            axis,
+            before,
+            after,
+        } => Expr::Pad {
+            src: go!(src),
+            axis,
+            before,
+            after,
+        },
+        Expr::Repack { src, spec, out } => Expr::Repack {
+            src: go!(src),
+            spec,
+            out,
+        },
+        Expr::Quantize { src, spec } => Expr::Quantize {
+            src: go!(src),
+            spec,
+        },
+        Expr::Bitcast { src, out } => Expr::Bitcast { src: go!(src), out },
+        Expr::Cat { axis, parts } => Expr::Cat {
+            axis,
+            parts: parts
+                .into_iter()
+                .map(|part| specialize(part, scope, rank, world, what))
+                .collect::<Result<_, _>>()?,
+        },
+        Expr::Shard { src, axis } => {
+            let src = specialize(*src, scope, rank, world, what)?;
+            if world <= 1 {
+                // Not a degenerate one-rank slice but the operand itself, so
+                // that a single-GPU plan is identical to one compiled from a
+                // contract that never mentioned sharding.
+                return Ok(src);
+            }
+            let ty = infer(&src, scope)?;
+            let index = axis_index(axis, ty.shape.len(), what)?;
+            let extent = ty.shape[index];
+            if extent % i64::from(world) != 0 {
+                // Named, because this is the message a user gets for "tp_size
+                // does not divide this model". The driver used to pre-empt it
+                // with its own per-family divisibility table over `config.json`,
+                // which was the same fact checked twice and reachable only for
+                // the families someone had listed.
+                return Err(CompileError::InvalidInput(format!(
+                    "'{what}' has {extent} along axis {index}, which tp_size {world} does not \
+                     divide; use a tp_size that divides it or run single-GPU"
+                )));
+            }
+            let len = extent / i64::from(world);
+            src.slice(axis.0, i64::from(rank) * len, len)
+        }
+    })
 }
 
 /// Resolve an [`Axis`] against a rank, rejecting out-of-range axes.
@@ -714,6 +839,13 @@ impl Expr {
         }
     }
 
+    pub fn shard(self, axis: u8) -> Self {
+        Expr::Shard {
+            src: Box::new(self),
+            axis: Axis(axis),
+        }
+    }
+
     /// Whether this expression lies entirely in the affine fragment, and so
     /// compiles to byte spans with no kernel and no intermediate buffer.
     pub fn is_affine(&self) -> bool {
@@ -724,8 +856,17 @@ impl Expr {
             }
             Expr::Cat { parts, .. } => parts.iter().all(Expr::is_affine),
             Expr::Bitcast { .. } => true,
+            Expr::Shard { src, .. } => src.is_affine(),
             Expr::Repack { .. } | Expr::Quantize { .. } => false,
         }
+    }
+
+    /// Whether any part of this expression is partitioned across ranks, and so
+    /// means something different on each of them.
+    pub fn is_sharded(&self) -> bool {
+        let mut found = false;
+        self.visit(&mut |expr| found |= matches!(expr, Expr::Shard { .. }));
+        found
     }
 
     /// Names of the checkpoint tensors this expression reads, in traversal
@@ -765,6 +906,7 @@ impl Expr {
             | Expr::Pad { src, .. }
             | Expr::Repack { src, .. }
             | Expr::Bitcast { src, .. }
+            | Expr::Shard { src, .. }
             | Expr::Quantize { src, .. } => src.visit(seen),
             Expr::Cat { parts, .. } => {
                 for part in parts {
@@ -826,6 +968,60 @@ mod tests {
             zero_point_dtype: None,
             block_shape: Vec::new(),
         }
+    }
+
+    fn specialize_one(expr: Expr, rank: u32, world: u32) -> Result<Expr, CompileError> {
+        let checkpoint = qwen3();
+        Resolver::new(&checkpoint).specialize(expr, rank, world, "q")
+    }
+
+    #[test]
+    fn shard_has_no_type_until_it_is_specialized() {
+        let err = check_one(Expr::src("q_proj").shard(0), &qwen3()).unwrap_err();
+        assert!(format!("{err}").contains("specialize"), "{err}");
+    }
+
+    #[test]
+    fn shard_becomes_this_ranks_slice() {
+        let expr = specialize_one(Expr::src("q_proj").shard(0), 3, 4).unwrap();
+        assert_eq!(expr, Expr::src("q_proj").slice(0, 1536, 512));
+        assert_eq!(
+            check_one(expr, &qwen3()).unwrap(),
+            TensorType::raw(vec![512, 2048], DType::BF16)
+        );
+    }
+
+    #[test]
+    fn a_single_rank_shard_is_the_tensor_itself() {
+        // Not a degenerate full-width slice: a one-GPU plan must be identical
+        // to one compiled from a contract that never mentioned sharding.
+        let expr = specialize_one(Expr::src("q_proj").shard(0), 0, 1).unwrap();
+        assert_eq!(expr, Expr::src("q_proj"));
+    }
+
+    #[test]
+    fn shard_composes_under_the_affine_fragment() {
+        let expr = specialize_one(
+            Expr::cat(
+                0,
+                vec![Expr::src("k_proj").shard(0), Expr::src("v_proj").shard(0)],
+            ),
+            1,
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            check_one(expr, &qwen3()).unwrap(),
+            TensorType::raw(vec![1024, 2048], DType::BF16)
+        );
+    }
+
+    #[test]
+    fn an_indivisible_extent_is_rejected_by_name() {
+        let err = specialize_one(Expr::src("k_proj").shard(0), 0, 3).unwrap_err();
+        let message = format!("{err}");
+        assert!(message.contains("'q' has 1024 along axis 0"), "{message}");
+        assert!(message.contains("tp_size 3"), "{message}");
     }
 
     #[test]

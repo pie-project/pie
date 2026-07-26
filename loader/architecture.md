@@ -537,10 +537,12 @@ The sequence above is one rank. Tensor-parallel loads run it `tp_size` times,
 and almost nothing new is required, because both halves already exist.
 
 **The loader already shards.** `StorageTarget` carries `tp_rank` and `tp_size`
-(`loader/src/load_plan.rs:40-41`); `frontend.rs` divides the declared shape along
-the contract's shard axis and rejects a dimension that does not divide evenly,
-naming the tensor when it refuses. `TargetSpec` absorbs these two fields and the
-behaviour carries over unchanged.
+(`loader/src/load_plan.rs:40-41`); a partition is written into the contract as
+`Expr::Shard`, and `Resolver::specialize` rewrites each one into the slice that
+rank reads, rejecting a dimension that does not divide evenly and naming the
+tensor when it refuses. Below `frontend.rs` the expression means the same thing
+on every rank. `TargetSpec` absorbs these two fields and the behaviour carries
+over unchanged.
 
 **The ranks already load in parallel.**
 `runtime/engine/src/driver/backend/cuda.rs:331-345` spawns one thread per rank
@@ -960,7 +962,7 @@ loader/
 │   ├── types.rs             shared vocabulary: DType, Encoding, ids
 │   ├── checkpoint/          safetensors · gguf · headers
 │   │                          was checkpoint_header.rs + gguf.rs + source.rs
-│   ├── frontend.rs          contracts → HIGH IR; applies TP sharding (§6.3)
+│   ├── frontend.rs          contracts → HIGH IR; specializes TP shards (§6.3)
 │   │                          `plan_from_contracts`; semantic.rs, schema.rs and
 │   │                          schemas/ are deleted (step 7a, §10.2.1)
 │   ├── contract.rs          the declaration format and its type checker
@@ -1185,12 +1187,13 @@ would turn a correct plan into a violation. The same applies to shapes on
 AWQ/GPTQ/compressed checkpoints, where weights are packed and often transposed,
 so those families declare names alone.
 
-Second, **sharding must be in the declaration**. `RuntimeTensorContract.shape`
-is the model's shape and `TensorDecl.shape` is the rank's, so declaring the
-model-wide extent for a sharded weight would report a mismatch on every one of
-them. `declare_*_contract` therefore takes `tp_size`, and the real-checkpoint
-test asserts the declaration actually *changes* with it — otherwise a
-declaration that quietly dropped sharding would still pass, and check nothing.
+Second, **sharding must be in the declaration**. Both
+`RuntimeTensorContract.shape` and `TensorDecl.shape` are the *rank's* shape, so
+declaring the model-wide extent for a sharded weight would report a mismatch on
+every one of them. `declare_*_contract` therefore takes `tp_size`, and the
+real-checkpoint test asserts the declaration actually *changes* with it —
+otherwise a declaration that quietly dropped sharding would still pass, and
+check nothing.
 
 ### 10.3 `host` is not a production path
 
@@ -1300,6 +1303,7 @@ place to look at it.
 | `TensorDecl`'s write-only half (`TensorLayoutKind`, `TensorParallelKind`, `QuantFormat`, `QuantSpec`, the view triple) + `QuantGranularity` | ~60 | **done (step 11)** — assigned, serialized, restored, never read for a decision |
 | `LayoutExpr::Attach` + `StorageInstr::Attach` + `MetadataSpec` + both drivers' `case Attach` | ~70 | **done (step 12)** — an unreachable node: nothing ever constructed it, so the instruction was never emitted and both executors' arms were no-ops. §2 case 14 had already made it redundant by expressing a quant triplet as three contracts sharing an `Encoding::Quant` |
 | `types::Sharding` + `TensorDecl.sharding` + `RuntimeTensorContract.sharding` | ~80 | **done (step 12)** — carried through the whole compiler and serialized into every golden, but read by nothing except its own `PartialEq`. The rank's extent is already in `shape` |
+| `RuntimeTensorContract.shard_axis` + `runtime_shape()` + `frontend.rs`'s shard expansion | ~55 | **done (step 12)** — a field wearing a node's clothes. Replaced by `Expr::Shard`, which makes the partition part of what the tensor *is*, keeps the contract rank-independent, and composes inside a `Cat` — which a whole-expression flag cannot say. Two shape conventions collapsed into one: `shape` is now always the rank's |
 | `mxfp4_moe` post-hoc validation | ~15 | unrepresentable once `TargetSpec` is an input (§9.1) |
 | tautological coverage check | ~10 | replaced by a real one in step 8 (§8.2) |
 | dummy's loader path | ~30 | dead, write-only |
@@ -1352,7 +1356,7 @@ parity tests.
 | 9 | **done** — `src/main.rs`, the `dump · verify · diff · replay` CLI | The one item in §10's tree with no earlier step. `replay` is what settles `host.rs`'s fate: it **survives**, because it is the only way to check offline that a plan moves the *right* bytes rather than a well-formed number of them. That is not hypothetical — replaying Qwen3-1.7B produced 4,063,479,808 bytes across 311 tensors, and hashing 113 of them against an independent safetensors reader found no mismatch. `dump` absorbed and replaced `examples/plan_dump.rs`. |
 | 10 | **done** — the driver keeps only what only it can state | Not a numbered step originally; it followed from finishing the others. Once the loader hands back a driver-specific low IR, everything the driver still did *to* that IR was either computation the loader could have done or C++ vocabulary the loader could have shipped. `load_plan_bridge.hpp` went 464 → 105 lines. To Rust: the quant-attachment inference (`load_plan.rs::derive_quant_attachments` — the loader *named* the scale tensor, so C++ re-deriving the pairing by name suffix was guesswork about the loader's own decision), the artifact cache key (`artifact.rs`, which Metal had never had at all, and which now mixes the whole plan through serde rather than a hand-enumerated field list that a new field silently escapes), contract coverage (`verify.rs::ContractCoverage`), and both plan renderings (`dump.rs`), whose two enum-name tables were `default`-less switches returning `"Unknown"` for anything Rust added. All four ride on the plan itself, so no new FFI entry point exists. To the loader's C++ SDK: `pie_loader/{plan,request,tensor_contract}.hpp`. The namespace went with them: `pie_load_planner` was a name no file, directory or crate carried, so it is now `pie_loader`, matching the header, the directory and the crate. The `::cpp` sub-namespace under it was flattened at the same time — it had distinguished the hand-written helpers from a generated half that no longer exists. The two drivers' request builders were one file written twice and had already drifted — CUDA's grew an env-gated `fused_transcode` default Metal's never mentioned. `CheckpointSource` is now a pure mapper on both backends, with the H2D copy moved to the engine that owns the stream. Deleted: `shard_plan.hpp` (dead since §6.3), `load_plan_cache_key_test.cpp` (532 lines, replaced by `artifact.rs`'s nine tests). |
 | 11 | **done** — the second pass over the driver side | Step 10 asked what the driver still *computed*; this one asks what it still *knows*. Five answers, all of the same shape — a fact stated twice, in two languages, with no mechanism keeping the copies equal. (a) `checkpoint_source` was 408 lines of POSIX written once per driver, already drifted (`MAP_SHARED`/lazy on CUDA, `MAP_PRIVATE`/eager on Metal, different method names); merged into `loader/include/pie_loader/checkpoint_source.hpp`, taking the stricter option each time. (b) `loaded_model.cpp` carried a twenty-family `supports_tp()` list plus eighty lines of per-family divisibility rules read off `config.json` — but the loader computes the shard extents, so it is the loader that discovers an indivisible axis. Its message now names the tensor, the dimension and the axis (`"the row count of 'model.layers.0.self_attn.k_proj.weight' is 1024, which tp_size 3 does not divide"`), which is more than the driver's table could say; the table is deleted. A family missing from that list got no check at all, and a family in it got two. (c) The executor decided "keep these scale bytes as raw E8M0" from `group_size == 32` — the same class of inference as the name-suffix matching step 10 deleted. The loader chose the encoding, so it now states it: `ScaleForm::{RawE8M0, F32Factors}` on the attachment. (d) `TensorDecl` carried `TensorLayoutKind`, `TensorParallelKind`, `QuantFormat`, `QuantSpec` and a view triple that were assigned, serialized by the artifact codec, restored — and never read for any decision. The live quantization metadata is `ops::QuantMeta`, which `ops/gemm.cpp` reads; the codec version is bumped to 4. `QuantGranularity` went too: the driver was translating `PieLoaderQuantGranularity` into it only to translate it again into `QuantMeta::Kind`. (e) `BackendTarget` was a struct built in `loaded_model.cpp` and never passed anywhere; two of its three fields were write-only, and the third, `Mxfp4MoeLowering`, was a third spelling of a policy the plan already carries. `LoadedModel` stores `PieLoaderMxfp4MoePolicy` now. |
-| 12 | **in progress** — the loader as a standalone compile library | The remaining tensions in §13 reduce to one property: `compile` should be a function of exactly three inputs — what is in the file, what the caller wants out, and what the device can do — and none of them should be a model's name. Measured against that, everything else in `PieLoaderRequest` is authorship input that belongs to the driver: `ModelFacts`, `runtime_quant` and the three-way `mxfp4_moe` are read only inside `arch/`, and `component` is subsumed by the contract, since declaring only the outputs you want is what `retain_outputs` already does. Phase 0 is this row's first landing and is pure subtraction — two things that survived every earlier pass because nothing forced anyone to ask whether they were read. Next: `Expr::Shard` as a tenth node (`shard_axis` is a field wearing a node's clothes — `frontend.rs` expands it to exactly one `Slice`, and as a node it keeps the contract rank-independent and composes inside a `Cat`), then collapsing `ModelContract` and `RuntimeAbi`, which are two spellings of one concept where the type checker is attached to the spelling with no pipeline. |
+| 12 | **in progress** — the loader as a standalone compile library | The remaining tensions in §13 reduce to one property: `compile` should be a function of exactly three inputs — what is in the file, what the caller wants out, and what the device can do — and none of them should be a model's name. Measured against that, everything else in `PieLoaderRequest` is authorship input that belongs to the driver: `ModelFacts`, `runtime_quant` and the three-way `mxfp4_moe` are read only inside `arch/`, and `component` is subsumed by the contract, since declaring only the outputs you want is what `retain_outputs` already does. Phase 0 is this row's first landing and is pure subtraction — two things that survived every earlier pass because nothing forced anyone to ask whether they were read. Phase 1 is the algebra: `Expr::Shard` is now a tenth node and `shard_axis` is gone. A shard is not a property of a *contract*, it is a property of a *tensor* — so it belongs in the expression, where it stays rank-independent (the author writes the partition, not `rank * len`), composes inside a `Cat`, and confines rank-dependence to one pass, `Resolver::specialize`, which runs before inference and below which every rank sees the same expression. The proof that the rewrite is exactly what the old field-driven expansion did is that all fourteen golden plans are byte-identical without re-blessing. `shape` is now unconditionally the rank's shape, which is also what the C++ `declare_*_contract` has always meant by it (§10.2), so `runtime_shape()` — the function whose whole job was to say which of two conventions applied — has nothing left to disambiguate. Next: collapsing `ModelContract` and `RuntimeAbi`, which are two spellings of one concept where the type checker is attached to the spelling with no pipeline. |
 | — | **done** — golden plans | Implied by §10's tree, owned by no numbered step. `loader/tests/golden_plans.rs` pins fourteen whole compiled plans byte-exactly, across four synthetic architectures (dense llama, per-expert MoE, MXFP4 MoE, AWQ), two backends, three TP configurations and both MXFP4 policies. Each is verified against its contract *before* it is allowed to become golden, so a regenerated golden cannot lock in a broken compiler. `UPDATE_GOLDEN=1` regenerates. |
 
 Step 1 before step 2: the reverse binding is the one piece of this design with

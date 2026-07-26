@@ -34,31 +34,13 @@ pub struct RuntimeTensorContract {
     /// What this tensor *is*, in the algebra of [`crate::contract`].
     pub expr: Expr,
     pub encoding: Encoding,
+    /// What *this rank* holds, which for a sharded tensor is a fraction of what
+    /// the model describes. The partition lives in `expr`, so this is simply
+    /// the shape `expr` yields once specialized — declared here so that the
+    /// frontend has something to check the inference against.
     pub shape: Vec<i64>,
     pub layout: Layout,
     pub alignment: u32,
-    pub shard_axis: Option<Axis>,
-}
-
-impl RuntimeTensorContract {
-    /// The shape a driver will actually find, which is not always `shape`.
-    ///
-    /// `shape` is the tensor as the *model* describes it. When `shard_axis` is
-    /// set, each rank holds only its slice of that axis, so the declared shape
-    /// and the delivered shape differ by a factor of the world size. Keeping
-    /// both is what lets a pass describe a tensor once and have it sharded
-    /// consistently; this is the function that says which is which.
-    pub fn runtime_shape(&self, tp_size: u32) -> Vec<i64> {
-        let mut shape = self.shape.clone();
-        if tp_size > 1
-            && let Some(axis) = self.shard_axis
-            && let Some(dim) = shape.get_mut(usize::from(axis.0))
-            && *dim % i64::from(tp_size) == 0
-        {
-            *dim /= i64::from(tp_size);
-        }
-        shape
-    }
 }
 
 impl RuntimeAbi {
@@ -78,7 +60,7 @@ impl RuntimeAbi {
         let sharded = builder
             .tensors
             .iter()
-            .filter(|contract| contract.shard_axis.is_some())
+            .filter(|contract| contract.expr.is_sharded())
             .count();
         let (total_bytes, sharded_bytes) =
             builder
@@ -94,11 +76,7 @@ impl RuntimeAbi {
                     };
                     (
                         total.saturating_add(bytes),
-                        sharded.saturating_add(if contract.shard_axis.is_some() {
-                            bytes
-                        } else {
-                            0
-                        }),
+                        sharded.saturating_add(if contract.expr.is_sharded() { bytes } else { 0 }),
                     )
                 });
         if crate::planner_debug_enabled() {
@@ -202,20 +180,23 @@ impl RuntimeAbi {
         let mut buckets: Vec<(GroupKey, Vec<usize>)> = Vec::new();
         let mut local_bytes_by_index = vec![0_u64; self.tensors.len()];
         for (index, contract) in self.tensors.iter().enumerate() {
-            if contract.shard_axis != Some(Axis(0))
-                || contract.shape.len() != 2
-                || contract.shape[0] <= 0
-                || contract.shape[1] <= 0
-            {
+            // One pattern says everything the old flag-plus-match pair said:
+            // this tensor is a whole checkpoint tensor, split by row.
+            let Expr::Shard { src, axis: Axis(0) } = &contract.expr else {
                 continue;
-            }
-            let Expr::Src(name) = &contract.expr else {
+            };
+            let Expr::Src(name) = src.as_ref() else {
                 continue;
             };
             let Some(raw) = metadata.tensor_by_name(name) else {
                 continue;
             };
-            if raw.shape != contract.shape || raw.encoding != contract.encoding {
+            // Extents come off the checkpoint, because the contract's shape is
+            // already this rank's band and cannot say how wide the whole is.
+            if raw.shape.len() != 2 || raw.shape[0] <= 0 || raw.shape[1] <= 0 {
+                continue;
+            }
+            if raw.encoding != contract.encoding {
                 continue;
             }
             let elem = match dense_element_bytes(raw, "direct row shard coalescing") {
@@ -223,22 +204,22 @@ impl RuntimeAbi {
                 Err(_) => continue,
             };
             let (_, local_rows) = local_range(
-                contract.shape[0],
+                raw.shape[0],
                 target,
                 &format!("the row count of '{}'", contract.output_name),
             )?;
-            let row_bytes = checked_mul_i64(
-                contract.shape[1],
-                elem,
-                "direct row shard coalescing row bytes",
-            )?;
+            if contract.shape != [local_rows, raw.shape[1]] {
+                continue;
+            }
+            let row_bytes =
+                checked_mul_i64(raw.shape[1], elem, "direct row shard coalescing row bytes")?;
             local_bytes_by_index[index] = checked_mul_i64(
                 local_rows,
                 row_bytes,
                 "direct row shard coalescing local bytes",
             )?;
             let key = GroupKey {
-                shape: contract.shape.clone(),
+                shape: raw.shape.clone(),
                 encoding: contract.encoding.clone(),
                 layout: contract.layout.clone(),
                 alignment: contract.alignment,
@@ -337,9 +318,9 @@ impl RuntimeAbi {
         new_tensors: &mut Vec<RuntimeTensorContract>,
     ) -> Result<(), CompileError> {
         let first = &self.tensors[indices[0]];
-        let rows = first.shape[0];
-        let cols = first.shape[1];
         let first_raw = direct_raw(metadata, first)?;
+        let rows = first_raw.shape[0];
+        let cols = first_raw.shape[1];
         dense_element_bytes(first_raw, "direct row shard coalescing")?;
         let (local_start, local_rows) = local_range(
             rows,
@@ -363,7 +344,6 @@ impl RuntimeAbi {
             shape: vec![local_rows * indices.len() as i64, cols],
             layout: first.layout.clone(),
             alignment: first.alignment,
-            shard_axis: None,
         });
 
         for (slot, &old_index) in indices.iter().enumerate() {
@@ -376,7 +356,6 @@ impl RuntimeAbi {
                 shape: vec![local_rows, cols],
                 layout: original.layout.clone(),
                 alignment: original.alignment,
-                shard_axis: None,
             });
         }
         Ok(())
@@ -387,7 +366,7 @@ fn direct_raw<'a>(
     metadata: &'a CheckpointMetadata,
     contract: &RuntimeTensorContract,
 ) -> Result<&'a RawTensor, CompileError> {
-    let Expr::Src(name) = &contract.expr else {
+    let Some(name) = direct_src(&contract.expr) else {
         return Err(CompileError::InvalidInput(format!(
             "runtime tensor '{}' is not a direct tensor",
             contract.output_name
@@ -399,6 +378,16 @@ fn direct_raw<'a>(
             contract.output_name
         ))
     })
+}
+
+/// The checkpoint tensor a direct contract reads, seeing through the partition
+/// a sharded one wraps it in — a rank's band of a tensor is still that tensor.
+fn direct_src(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Src(name) => Some(name.as_str()),
+        Expr::Shard { src, .. } => direct_src(src),
+        _ => None,
+    }
 }
 
 struct DefaultAbiBuilder<'a> {
@@ -479,15 +468,40 @@ impl DefaultAbiBuilder<'_> {
     }
 
     fn push_direct(&mut self, raw: &RawTensor, output_name: String, shard_axis: Option<Axis>) {
+        let (expr, shape) = self.shard(Expr::src(raw.name.clone()), raw.shape.clone(), shard_axis);
         self.tensors.push(RuntimeTensorContract {
             output_name,
-            expr: Expr::src(raw.name.clone()),
+            expr,
             encoding: raw.encoding.clone(),
-            shape: raw.shape.clone(),
+            shape,
             layout: Layout::dense(self.alignment()),
             alignment: self.alignment(),
-            shard_axis,
         });
+    }
+
+    /// Partition an expression and its shape across ranks along `axis`.
+    ///
+    /// The expression records *that* the tensor is split; the shape records what
+    /// this rank ends up holding. Both are left alone when there is nothing to
+    /// split, so a single-GPU build is identical to one authored without
+    /// sharding, and a non-divisible extent is left for the frontend to reject
+    /// with a message that names the tensor.
+    pub(super) fn shard(
+        &self,
+        expr: Expr,
+        mut shape: Vec<i64>,
+        axis: Option<Axis>,
+    ) -> (Expr, Vec<i64>) {
+        let world = i64::from(self.target.tp_size);
+        let Some(axis) = axis.filter(|_| world > 1) else {
+            return (expr, shape);
+        };
+        if let Some(dim) = shape.get_mut(usize::from(axis.0))
+            && *dim % world == 0
+        {
+            *dim /= world;
+        }
+        (expr.shard(axis.0), shape)
     }
 
     fn push_runtime_quant(
@@ -571,14 +585,18 @@ impl DefaultAbiBuilder<'_> {
                 )));
             }
         };
+        let (expr, shape) = self.shard(
+            Expr::src(raw.name.clone()),
+            raw.shape.clone(),
+            self.shard_axis(&raw.name),
+        );
         self.tensors.push(RuntimeTensorContract {
             output_name,
-            expr: Expr::src(raw.name.clone()),
+            expr,
             encoding: Encoding::Quant(spec),
-            shape: raw.shape.clone(),
+            shape,
             layout: Layout::dense(self.alignment()),
             alignment: self.alignment(),
-            shard_axis: self.shard_axis(&raw.name),
         });
         Ok(())
     }
@@ -591,7 +609,6 @@ impl DefaultAbiBuilder<'_> {
             shape,
             layout: Layout::dense(self.alignment()),
             alignment: self.alignment(),
-            shard_axis: None,
         });
         self.consumed.insert(raw.id);
     }
@@ -615,7 +632,6 @@ impl DefaultAbiBuilder<'_> {
             shape,
             layout: Layout::dense(self.alignment()),
             alignment: self.alignment(),
-            shard_axis: None,
         });
     }
 
@@ -764,7 +780,6 @@ mod tests {
             shape: vec![1],
             layout: Layout::dense(1),
             alignment: 1,
-            shard_axis: None,
         }
     }
 

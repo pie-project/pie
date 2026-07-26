@@ -143,46 +143,21 @@ impl Frontend<'_> {
         contract: &RuntimeTensorContract,
         output_id: TensorId,
     ) -> Result<(ExprId, TensorDecl), CompileError> {
-        let base = contract.expr.clone();
-        let base_type = self.resolver.infer(&base)?;
-        if base_type.shape != contract.shape {
+        // Sharding is resolved here and nowhere else: below this line the
+        // expression means the same thing on every rank.
+        let expr = self.resolver.specialize(
+            contract.expr.clone(),
+            self.target.tp_rank,
+            self.target.tp_size,
+            &contract.output_name,
+        )?;
+        let ty = self.resolver.infer(&expr)?;
+        if ty.shape != contract.shape {
             return Err(CompileError::InvalidInput(format!(
                 "declared shape {:?} does not match source shape {:?}",
-                contract.shape, base_type.shape
+                contract.shape, ty.shape
             )));
         }
-
-        let (expr, ty) = match contract.shard_axis.filter(|_| self.target.tp_size > 1) {
-            Some(axis) => {
-                let index = usize::from(axis.0);
-                let world = i64::from(self.target.tp_size);
-                if index >= base_type.shape.len() {
-                    return Err(CompileError::InvalidInput(format!(
-                        "'{}' has rank {} and cannot be partitioned on axis {}",
-                        contract.output_name,
-                        base_type.shape.len(),
-                        axis.0
-                    )));
-                }
-                if base_type.shape[index] % world != 0 {
-                    // Named, because this is the message a user gets for
-                    // "tp_size does not divide this model". The driver used to
-                    // pre-empt it with its own per-family divisibility table
-                    // over `config.json`, which was the same fact checked twice
-                    // and reachable only for the families someone had listed.
-                    return Err(CompileError::InvalidInput(format!(
-                        "'{}' has {} along axis {}, which tp_size {} does not \
-                         divide; use a tp_size that divides it or run single-GPU",
-                        contract.output_name, base_type.shape[index], axis.0, self.target.tp_size
-                    )));
-                }
-                let len = base_type.shape[index] / world;
-                let sharded = base.slice(axis.0, i64::from(self.target.tp_rank) * len, len);
-                let ty = self.resolver.infer(&sharded)?;
-                (sharded, ty)
-            }
-            None => (base, base_type),
-        };
 
         let lowering = compile(&expr, self.resolver.checked(), MAX_RUNS)?;
         if lowering.needs_zero_fill() {

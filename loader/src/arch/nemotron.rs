@@ -120,21 +120,24 @@ impl DefaultAbiBuilder<'_> {
             shape: vec![expert_count * local_intermediate, hidden],
             layout: Layout::dense(self.alignment()),
             alignment: self.alignment(),
-            shard_axis: None,
         });
 
-        let down_name = format!("{base}.down_proj.packed.weight");
-        self.tensors.push(RuntimeTensorContract {
-            output_name: down_name.clone(),
-            expr: Expr::cat(
+        let (expr, shape) = self.shard(
+            Expr::cat(
                 0,
                 down.iter().map(|raw| Expr::src(raw.name.clone())).collect(),
             ),
+            vec![expert_count * hidden, full_intermediate],
+            Some(Axis(1)),
+        );
+        let down_name = format!("{base}.down_proj.packed.weight");
+        self.tensors.push(RuntimeTensorContract {
+            output_name: down_name.clone(),
+            expr,
             encoding: Encoding::Raw(DType::BF16),
-            shape: vec![expert_count * hidden, full_intermediate],
+            shape,
             layout: Layout::dense(self.alignment()),
             alignment: self.alignment(),
-            shard_axis: (self.target.tp_size > 1).then_some(Axis(1)),
         });
 
         for (expert, raw) in up.iter().enumerate() {
@@ -152,7 +155,6 @@ impl DefaultAbiBuilder<'_> {
                 shape: vec![local_intermediate, hidden],
                 layout: Layout::dense(self.alignment()),
                 alignment: self.alignment(),
-                shard_axis: None,
             });
             self.consumed.insert(raw.id);
         }
@@ -168,7 +170,6 @@ impl DefaultAbiBuilder<'_> {
                 shape: vec![hidden, local_intermediate],
                 layout: Layout::dense(self.alignment()),
                 alignment: self.alignment(),
-                shard_axis: None,
             });
             self.consumed.insert(raw.id);
         }

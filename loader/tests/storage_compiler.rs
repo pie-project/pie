@@ -665,8 +665,8 @@ fn nemotron_h_default_abi_packs_experts_and_exposes_views() {
     assert!(abi.tensors.iter().any(|contract| {
         contract.output_name
             == "language_model.backbone.layers.0.mixer.experts.down_proj.packed.weight"
-            && contract.shape == vec![6, 4]
-            && contract.shard_axis == Some(Axis(1))
+            && contract.shape == vec![6, 2]
+            && matches!(&contract.expr, pie_loader::contract::Expr::Shard { axis, .. } if *axis == Axis(1))
     }));
     assert!(abi.tensors.iter().any(|contract| {
         contract.output_name == "language_model.backbone.layers.0.mixer.experts.0.up_proj.weight"

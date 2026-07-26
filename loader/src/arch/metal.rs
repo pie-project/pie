@@ -116,7 +116,6 @@ impl DefaultAbiBuilder<'_> {
             shape: vec![rows, logical_cols],
             layout: Layout::dense(self.alignment()),
             alignment: self.alignment(),
-            shard_axis: None,
         });
         Ok(())
     }

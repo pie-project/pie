@@ -383,16 +383,12 @@ fn check_stats_render(name: &str, plan: &LoadPlan) {
 /// the file would faithfully record whatever came out. Requiring the plan to
 /// verify before it is allowed to become golden is what stops that.
 fn check(name: &str, metadata: &CheckpointMetadata, cfg: &ModelConfig, target: StorageTarget) {
-    let tp_size = target.tp_size;
     let abi = RuntimeAbi::default_for_target(metadata, cfg, &target)
         .unwrap_or_else(|err| panic!("{name}: building the contract failed: {err}"));
     let plan = compile_load_plan(metadata, &abi, target)
         .unwrap_or_else(|err| panic!("{name}: compiling failed: {err}"));
 
-    if let Err(violations) = verify(
-        &PlanView::from(&plan),
-        Some(&ContractView::of(&abi, tp_size)),
-    ) {
+    if let Err(violations) = verify(&PlanView::from(&plan), Some(&ContractView::of(&abi))) {
         let listed: Vec<String> = violations.iter().map(ToString::to_string).collect();
         panic!(
             "{name}: the plan does not honour its contract:\n  {}",

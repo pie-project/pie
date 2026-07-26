@@ -656,6 +656,9 @@ impl Builder<'_> {
                 };
                 self.push(Kind::Leaf(leaf), out.shape.clone())
             }
+            Expr::Shard { .. } => Err(CompileError::Internal(
+                "Shard must be specialized against a target before lowering".to_string(),
+            )),
         }
     }
 
@@ -1300,7 +1303,7 @@ mod tests {
                 oracle(src, &inner, ck)
             }
             Expr::Bitcast { src, .. } => oracle(src, coord, ck),
-            Expr::Out(_) | Expr::Repack { .. } | Expr::Quantize { .. } => {
+            Expr::Out(_) | Expr::Repack { .. } | Expr::Quantize { .. } | Expr::Shard { .. } => {
                 unreachable!("the oracle covers only Src-rooted affine expressions")
             }
         }

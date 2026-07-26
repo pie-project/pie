@@ -204,12 +204,7 @@ impl<'a> TensorDemand<'a> {
 
 impl<'a> ContractView<'a> {
     /// Read a contract as the rank that will execute it sees it.
-    ///
-    /// `tp_size` is required rather than defaulted because a sharded tensor's
-    /// declared shape is the *model's* shape, not the rank's; comparing the
-    /// undivided shape against a plan compiled for 4 ranks would report a
-    /// mismatch on every sharded weight.
-    pub fn of(abi: &'a crate::arch::RuntimeAbi, tp_size: u32) -> Self {
+    pub fn of(abi: &'a crate::arch::RuntimeAbi) -> Self {
         Self {
             tensors: abi
                 .tensors
@@ -217,7 +212,7 @@ impl<'a> ContractView<'a> {
                 .map(|contract| {
                     TensorDemand::exact(
                         contract.output_name.as_str(),
-                        &contract.runtime_shape(tp_size),
+                        &contract.shape,
                         &contract.encoding,
                     )
                 })

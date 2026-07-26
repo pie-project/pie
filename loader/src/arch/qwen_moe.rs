@@ -182,7 +182,6 @@ impl DefaultAbiBuilder<'_> {
                 shape: s.gate_up_shape,
                 layout: Layout::dense(align),
                 alignment: align,
-                shard_axis: None,
             });
             self.tensors.push(RuntimeTensorContract {
                 output_name: s.down_name,
@@ -191,7 +190,6 @@ impl DefaultAbiBuilder<'_> {
                 shape: s.down_shape,
                 layout: Layout::dense(align),
                 alignment: align,
-                shard_axis: None,
             });
             for id in s.consumed {
                 self.consumed.insert(id);

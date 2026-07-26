@@ -227,10 +227,7 @@ fn dump(snapshot: &Path, options: &Options) -> Result<(), Fail> {
 
 fn run_verify(snapshot: &Path, options: &Options) -> Result<(), Fail> {
     let (plan, abi) = compile(snapshot, options)?;
-    match verify(
-        &PlanView::from(&plan),
-        Some(&ContractView::of(&abi, options.tp_size)),
-    ) {
+    match verify(&PlanView::from(&plan), Some(&ContractView::of(&abi))) {
         Ok(certificate) => {
             println!("{certificate}");
             Ok(())
