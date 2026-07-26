@@ -595,6 +595,65 @@ async def test_h2o_attention(client, args):
     )
 
 
+async def test_snapkv_attention(client, args):
+    common = {"prompt": _QUEST_PROMPT, "max_tokens": 8,
+              "temperature": _COHERENCE_TAU, "seed": 4242}
+    report = await _report(
+        client, args, "trackb-snapkv", {**common, "page_budget": 4096})
+    # SnapKV reads a DIFFERENT TAP from every other policy here: the prefill
+    # capture, which records the last `window` rows of the prompt against the
+    # whole prefix, once, before any token is generated. So the row must
+    # describe the prompt -- not the decode step H2O and TOVA see.
+    assert report["observed_live"] == report["prompt_len"], (
+        f"the score row covers {report['observed_live']} positions but the "
+        f"prompt is {report['prompt_len']} tokens; the capture fired on a "
+        f"different kv length than the program thinks\n  {report}"
+    )
+    # Unlike H2O there is no cold-start seed ramp in this row -- the prefill
+    # capture writes exactly one entry per live kv position -- so slack past the
+    # prompt is a bug, not a policy choice, and the bar is exactly zero.
+    assert report["tail_nonzero"] == 0, report
+    assert report["scores_nan"] == 0, report
+    # Every layer folds one softmax distribution over the prefix, averaged over
+    # heads and over window rows but NOT over layers, so the total mass is the
+    # layer count. This pins the fold divisor: `heads * window` instead of
+    # `heads * rows` would scale a short window down, and no normalization at
+    # all would land at `heads * rows * layers`.
+    layers = report["layers_observed"]
+    assert layers > 0, report
+    assert abs(report["score_mass"] - layers) < 0.02 * layers, (
+        f"score mass {report['score_mass']} should equal the layer count "
+        f"{layers} -- one folded distribution per layer\n  {report}"
+    )
+    # The mass has to sit where SnapKV says it does. `test_snapkv.py` sweeps the
+    # window width to show the profile tracks it; here the cheap invariant is
+    # that the observation window's own pages outweigh the middle of the prompt,
+    # with the attention sink held out of both sides.
+    page_mass = [float(m) for m in report["page_mass"]]
+    win_lo = max(report["prompt_len"] - 32, 0) // report["page_size"]
+    mid, win = page_mass[1:win_lo], page_mass[win_lo:]
+    assert win and mid, report
+    assert min(win) > max(mid), (
+        f"the observation window {win} does not separate from the middle of "
+        f"the prompt (max {max(mid):.5f}); the capture is not describing an "
+        f"END-of-prompt window\n  {report['page_mass']}"
+    )
+    # ...and the policy must be ENFORCED, not merely computed. Same pair as
+    # Quest and H2O: a one-page budget has to change the continuation, and an
+    # all-keep budget has to reproduce the unmasked answer verbatim.
+    tight = await _report(
+        client, args, "trackb-snapkv", {**common, "page_budget": 1})
+    base = await _report(client, args, "naive-baseline", common)
+    assert report["text"] != tight["text"], (
+        "attn_page_mask is not enforced under SnapKV: a 1-page budget produced "
+        "the same continuation as an all-keep one"
+    )
+    assert report["text"] == base["text"], (
+        "an all-keep page mask perturbed the output\n"
+        f"  {report['text']!r}\n  {base['text']!r}"
+    )
+
+
 async def test_naive_baseline(client, args):
     report = await _report(client, args, "naive-baseline", {"max_tokens": 4})
     assert report["sampler"] == "naive-baseline", report
@@ -656,6 +715,7 @@ def tests():
         test_quest_attention,
         test_tova_attention,
         test_h2o_attention,
+        test_snapkv_attention,
     ]
 
 

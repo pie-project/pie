@@ -21,6 +21,7 @@ members = [
     "quest-attention",
     "tova-attention",
     "trackb-h2o",
+    "trackb-snapkv",
     "repetition-penalty",
     "dry-repetition-penalty",
     "gumbel-watermark",
