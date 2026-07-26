@@ -221,8 +221,19 @@ MtpMoeMode mtp_moe_mode() {
     return mode;
 }
 
+// Timing means synchronizing on an event, which CUDA forbids while the stream
+// is capturing a graph, and which under TP stalls one rank inside a collective
+// the other rank has already left. Either way the engine dies mid-run instead
+// of reporting numbers, so a capturing stream runs the work untimed.
+inline bool profile_stream_is_capturing(cudaStream_t stream) {
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &status) != cudaSuccess) return true;
+    return status != cudaStreamCaptureStatusNone;
+}
+
 struct Qwen35MoeForwardProfile {
     bool enabled = false;
+    bool timing_suspended = false;
     int tp_rank = 0;
     int N = 0;
     int R = 0;
@@ -301,11 +312,13 @@ struct Qwen35MoeForwardProfile {
         moe_reduce_ms = moe_shared_gate_up_ms = moe_shared_down_ms = 0.0;
         moe_shared_gate_ms = 0.0;
         residual_ms = lm_head_ms = forward_ms = 0.0;
+        timing_suspended = profile_stream_is_capturing(stream);
+        if (timing_suspended) return;
         CUDA_CHECK(cudaEventRecord(forward_start, stream));
     }
 
     void end(cudaStream_t stream) {
-        if (!enabled) return;
+        if (!enabled || timing_suspended) return;
         CUDA_CHECK(cudaEventRecord(forward_stop, stream));
         CUDA_CHECK(cudaEventSynchronize(forward_stop));
         float ms = 0.0f;
@@ -325,7 +338,8 @@ void profile_cuda_stage(
     cudaStream_t stream,
     F&& fn)
 {
-    if (profile == nullptr || !profile->enabled || dst == nullptr) {
+    if (profile == nullptr || !profile->enabled || dst == nullptr ||
+        profile_stream_is_capturing(stream)) {
         fn();
         return;
     }
@@ -345,7 +359,8 @@ void profile_cuda_detail_stage(
     cudaStream_t stream,
     F&& fn)
 {
-    if (profile == nullptr || !profile->enabled || dst == nullptr) {
+    if (profile == nullptr || !profile->enabled || dst == nullptr ||
+        profile_stream_is_capturing(stream)) {
         fn();
         return;
     }
