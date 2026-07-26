@@ -802,15 +802,17 @@ a quality issue but a **falsification of the algorithm's headline property**:
 1.6 % of tokens were drawn from the uniform distribution rather than the model's,
 so the watermark was not distortion-free.
 
-**Deployment caveat.** The fix is committed as source plus regenerated contract
-artifacts, verified by the host-side contract tests. The CUDA engine **cannot be
-rebuilt in this environment**: the vendored flashinfer `fastdiv.cuh` requires
-`cuda::fast_mod_div`, which is absent from both installed toolkits (12.9 and
-13.0), so `pie-worker`'s build script fails before reaching any PTIR code. That
-failure predates this change and is unrelated to it. The GPU results reported
-throughout this effort were therefore produced by the **pre-fix** engine — which
-strengthens rather than weakens them, since every inferlet passed its assertions
-*despite* the 1.6 % corruption.
+**Deployment note (superseded).** This section originally recorded that the CUDA
+engine could not be rebuilt here — the vendored flashinfer `fastdiv.cuh` wanted
+`cuda::fast_mod_div`, absent from both installed toolkits — so the numbers below
+came from the **pre-fix** engine. That blocker has since been cleared and the
+engine is now rebuilt and redeployed routinely
+(`cargo build --release -p pie-server-py`, then copy `libpie_engine.so` over
+`sdk/python-server/python/pie/_engine.cpython-312-x86_64-linux-gnu.so`). The
+distributional results below were produced *before* the RNG fix, which
+strengthens rather than weakens them: every inferlet passed its assertions
+despite the 1.6 % corruption. Everything in **"What actually runs"** at the end
+of this document was measured on the post-fix engine.
 
 ---
 
@@ -832,8 +834,11 @@ Every other implementation is algebraically identical to its source.
 
 Every verdict above was re-confirmed end to end on an NVIDIA L40S
 (`Qwen/Qwen3-0.6B`, `cuda_native` driver) after the audit was written, so the
-document describes code that demonstrably runs. **14/14 pass.** Several runs
-double as numerical confirmations of the equations:
+document describes code that demonstrably runs. **14/14 of the algorithm
+inferlets pass**, and the full curated suite — which adds the search,
+speculative, KV-layout and composition inferlets — now stands at **29/29**; see
+**"What actually runs"** below. Several runs double as numerical confirmations
+of the equations:
 
 | # | Reported | Confirms |
 |---|---|---|
@@ -871,9 +876,12 @@ bits, so logit slots 151680–151935 read past the end of the slice.
 `pack_allowed`, which already drops ids it cannot represent — those slots decode
 to no token at all, so refusing them is both the safe answer and the correct
 one. This also repairs the first failure in the upstream
-`json-schema-constrained-decoding` inferlet, which shares the helper; that one
-still fails afterwards, but in the driver's fixed-decode lane composition, a
-separate pre-existing defect in a component this environment cannot rebuild.
+`json-schema-constrained-decoding` inferlet, which shares the helper. That one
+kept failing afterwards for an unrelated reason, since diagnosed and fixed: its
+decode loop submitted `DEFAULT_RUNAHEAD_DEPTH` fires but supplied only one
+grammar mask, and the run-ahead fires **silently reused a stale mask**, so the
+constraint was not actually enforced on those steps. See
+**"What actually runs"**.
 
 ---
 
@@ -974,8 +982,128 @@ input difference. The 33.55 ms/token above is the median of seven consecutive
 runs in the slow mode and should be read as an upper bound. The fast mode's
 slope is ≈2.4 ms/token. Nine sequential knockout rounds make this the deepest
 epilogue in the set, and the split most likely reflects a driver-side scheduling
-or pool interaction rather than the algorithm; the engine cannot be rebuilt in
-this environment, so the cause was not chased further.
+or pool interaction rather than the algorithm. It remains unexplained: the
+barrier cost model that accounts for every other inferlet's slope does not
+predict a 4× split with no input difference.
+
+---
+
+## What actually runs
+
+Faithfulness on paper and faithfulness on a GPU are different claims. This
+section records the second one, measured with **one engine process per test**
+(`tests/inferlets/test_curated.py` boots a single engine for the whole suite, so
+one wedged inferlet poisons every test after it — the isolated runner is the
+only honest instrument).
+
+**Curated isolated matrix: 29/29.** Qwen3-0.6B, `cuda_native`, NVIDIA L40S.
+Before this pass it was 21/30 with nine failures in five classes, every one of
+which turned out to be a real defect rather than a test artefact.
+
+### Four engine and driver defects
+
+1. **The ABI validator rejected the geometry class it was supposed to admit.**
+   `abi_validation.hpp:255` bounded `geometry_class` at `DECODE_ENVELOPE`, so
+   every `DeviceGeometry` bind returned `INVALID_ARGUMENT` from the entry
+   wrapper — before `Context::Impl::bind_instance`, the only place that prints
+   the error. It presented as a silent `status -1`.
+2. **The engine only recognised one spelling of device geometry.** Classification
+   matched Design-A's 2-D `[B, P]` pages channel; every real inferlet uses a flat
+   `[B*P]` one, so they all fell back to `Host`, which cannot derive a
+   device-sampled token. `detect_pooled_device_geometry` now mirrors the driver's
+   `is_loop_carried_explicit_geometry_trace` contract instead.
+3. **The W1.6 commit gate read uninitialised device memory on a first fire.**
+   `prepare_step` resolves descriptors against the *previous* fire's commit cell;
+   a first-ever ring index has no predecessor and held raw `cudaMalloc` bytes.
+   Commit snapshots are now seeded `{1, 0}` at allocation **and on recycle**.
+4. **Prepare-time descriptor resolution raced its own bind-time seed upload.**
+   It never took the `init_done_` edge that `begin_enqueue` takes (RV-28).
+
+All four presented as the same opaque message, `ptir prologue or channel
+readiness did not commit`. Two env-gated diagnostics
+(`PIE_DEBUG_PULL_VALIDATE=1`, printing pull-validate ticket rejections and
+stage-readiness rejections with a reason) were added because without them the
+four are indistinguishable.
+
+### A GPU hang in the generated sampler path
+
+`consensus-decoding` pegged the GPU at 100 % with a launch that never settled.
+The cause is worth stating plainly, because it is a **correctness cliff hiding
+behind a fusion optimisation**.
+
+`pivot_threshold(probs, cummass_le(p))` — the top-p / nucleus truncation every
+sampler in this document depends on — only ever worked when the *entire*
+surrounding dataflow matched `LibraryOp::NucleusSample`
+(`interface/ptir/src/compiler.rs:1305`). That recognizer is an exact-shape match
+over softmax spelled as `exp(sub(l, max))/sum`, then `pivot_threshold`, then
+`select` against a `−∞` constant, then `add(gumbel)`, then `reduce_argmax`. One
+`broadcast` spliced between the mask and the argmax is enough to break it.
+
+When it broke, the compiler emitted the generated region — and the generated
+emitter deliberately routed `cummass_le` to the M1 reference, because its own
+parallel arm assumed a pre-sorted row (which the DSL never produces). The M1
+reference is a selection sort with a linear "already picked" rescan per
+candidate, executed by **thread 0 alone**: O(len³) at a 151936-token vocabulary.
+It never returns.
+
+Every other inferlet in the suite matched the library pattern by accident, so
+the path had no coverage at all. It now runs the block-cooperative selection
+loop that tier0's `k_pivot_cummassle` already used — one block-wide "next
+largest still-unpicked element" pick per iteration, carrying the previous pick
+as a total-order threshold, stopping as soon as the exclusive mass clears the
+cutoff. `sampling-primitives` pins it with a keep-mask published in a shape that
+*cannot* match the library pattern, asserting the exact `Predicate::CummassLe`
+contract without depending on float summation order: 37 tokens, 0.901134 mass at
+`top_p = 0.9`, in 0.2 s.
+
+### Two inferlet authoring contracts, discovered the hard way
+
+Both of these fail **silently** — no error, no exception, just a wrong or empty
+result — which is why they cost the most debugging time.
+
+- **Loop-carried geometry ports must `take()` before they `put()`.** Under
+  `Host` and `DecodeEnvelope` the host drains the geometry channel and frees the
+  ring; under `DeviceGeometry` it does not. `k_stage_readiness` treats a put into
+  a full ring as *not ready*, which clears `pass_commit` and turns the fire into
+  a **dummy run**. Four inferlets were affected.
+- **Every host-`Writer` channel a fire takes must be `put` before that fire's
+  `submit`.** Three inferlets submitted `DEFAULT_RUNAHEAD_DEPTH` fires while
+  supplying a single value.
+
+### Three algorithms are structurally depth-1
+
+`greenlist-watermarking`, `json-schema-constrained-decoding` and
+`contrastive-decoding` derive the host input each fire needs — the greenlist
+mask, the grammar mask, the amateur token — from the **previous fire's output
+token**. There is no run-ahead to be had; the pipelining those loops appeared to
+express was fictitious. The JSON-schema case was the damaging one: its
+run-ahead fires reused a stale grammar mask, so the constraint silently was not
+enforced on those steps. All three now submit one fire at a time, which is the
+honest shape and costs the run-ahead overlap the earlier ms/token tables assumed.
+
+### The beam identity, finally measurable
+
+`beam-search` at width 1 had never run: `intrinsics::logits()` squeezes to
+rank-1 `[v]` when a fire has a single read-out row, so the `[B, 1]`-broadcast
+score column could not meet it and the epilogue failed to bind.
+
+With that fixed, the epilogue publishes a per-lane `reduce_argmax` over the raw
+logits beside the beam pick. At width 1 the two must agree on every step: top-1
+over the flattened `[1*v]` candidate block is `argmax(log_softmax(l) + score)`,
+and both `log_softmax` and adding a per-row constant are monotone. The
+comparison therefore tests `log_softmax`, the score accumulator, the `[B*v]`
+flatten, `top_k` and the `idx / v` / `idx % v` decomposition against an operator
+that shares none of that machinery.
+
+| width | greedy mismatches (16 steps) | best score |
+|---|---|---|
+| 1 | **0** | −19.7988 |
+| 2 | 17 | −19.7520 |
+| 4 | 46 | −13.6841 |
+
+The identity holds exactly at width 1, and the search demonstrably leaves the
+greedy path — and improves the score — as the width grows. Width alone would not
+have shown the first; the identity alone would not have shown the second.
 
 ---
 
