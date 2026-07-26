@@ -657,33 +657,48 @@ system result, not a microbenchmark ratio.
 **Per-step cost, with the parser resident (2026-07-26).** Both engines charged
 for the fill *and* the advance, on a batch where each sequence sits at its own
 point in its document - which is what a serving batch looks like, and which
-matters because our fill deduplicates. Median over four schemas, against a
-CUDA-graph decode step:
+matters because our fill deduplicates. Median over four schemas, in isolation:
 
 | batch | 1 | 8 | 32 | 128 | 512 |
 |---|---|---|---|---|---|
-| whole step | 0.20x | 0.60x | 1.89x | 3.82x | **7.83x** |
-| only what cannot overlap | 0.01x | 0.11x | 0.23x | 0.21x | **0.18x** |
+| whole step, isolated | 0.20x | 0.60x | 1.89x | 3.82x | **7.83x** |
 
-The second row is new and it is bad news, so it is reported first. Our advance
-costs a flat 53 us however large the batch, while XGrammar's is 0.9 us at batch
-1 and 11 us at 512. Charging only the half that cannot be hidden behind the
-forward pass, we are five times *worse*, not one and a half times better as the
-earlier host-side measurement suggested.
+**Overlap inverts it (q10).** Earlier versions of this document said the
+advance "cannot overlap, because it follows the sampled token". That is wrong,
+and the error was ours in XGrammar's favour and then in our own. The forward
+pass follows the same token: a decode step embeds what was sampled at `t-1`,
+and so does the parser. Neither needs the other, and the mask is not wanted
+until the logits exist. So a step is
 
-The flatness is the diagnosis: 53 us that does not move with the batch is not
-work, it is two kernel launches and a set of buffer clears. The advance does
-genuinely little arithmetic - it replays one group per configuration - so it is
-entirely overhead, and overhead is what a decode loop pays 128 times a second.
-Both halves are already captured as CUDA graphs; the remaining cost is the
-clears, which scale with the configuration ceiling rather than with the width
-in use.
+    sample(t-1)  ->  forward pass       ->  apply mask  ->  sample(t)
+                 ->  advance + fill     ->
 
-So the honest summary of the device-resident parser today is: the fill is
-decisively better at batch (7.8x, and 19x on the widest schema), the advance is
-decisively worse, and the crossover for the two together is batch 32. The
-tail is ours by a wide margin - at batch 512 on one schema, p50 504 us and p99
-519 us against 12,009 us and 12,786 us.
+with the middle branches concurrent. Both engines can do this. Measured with
+the decode step and the grammar step each captured as a CUDA graph, on separate
+streams, schema 2:
+
+| batch | forward pass | ours alone | ours overlapped | XGrammar alone | XGrammar overlapped |
+|---:|---:|---:|---:|---:|---:|
+| 32 | 6,556 us | 326 | **+158** | 849 | **+54** |
+| 128 | 9,401 us | 911 | **+856** | 3,276 | **+112** |
+| 512 | 22,109 us | 3,381 | **+3,334** | 12,487 | **+510** |
+
+At batch 512 XGrammar's 12,487 us of host work costs 510 us of wall clock -
+96% of it disappears - while our 3,381 us of device work costs 3,334 us. Almost
+none of ours hides.
+
+The reason is structural and it is the thesis's own weak point. Host work
+overlaps with a forward pass because it uses a resource the forward pass is not
+using. Device work overlaps by sharing the very multiprocessors the forward
+pass is saturating, so there is nothing to hide inside. A device-resident
+parser is *cheaper in isolation* and *harder to hide*, and at batch 512 on this
+schema the second effect is larger than the first.
+
+This does not sink the argument, but it moves it. Being four times cheaper in
+absolute terms still matters where the host is contended, where the step is not
+GPU-bound, or where the parser must be inside a captured graph at all (q22).
+What it does sink is any claim that the per-step ratio translates to
+end-to-end: on this measurement it does the opposite.
 
 **The fill cannot be captured (q22).** This is the structural finding and it is
 binary rather than a matter of microseconds. A CUDA graph records device work;
