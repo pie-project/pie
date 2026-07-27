@@ -160,15 +160,28 @@ impl Builder {
         }
     }
 
-    /// `x{min,max}` becomes a right-recursive nonterminal, which keeps the LR
-    /// stack shallow in the unbounded case.
+    /// `x{min,max}` becomes a left-recursive nonterminal, which is what keeps
+    /// the LR stack shallow.
+    ///
+    /// This was right-recursive, with a comment claiming the same benefit. That
+    /// is the recursive-descent intuition and it is backwards here. An LR parser
+    /// shifts every symbol of `tail -> body tail` and can reduce none of them
+    /// until the repetition ends, so the stack grows by one per iteration and a
+    /// hundred-character run of whitespace is a hundred entries deep. Written
+    /// `tail -> tail body` each iteration reduces immediately and the stack does
+    /// not move.
+    ///
+    /// The depth is not a detail here. It sets the stack bound, the length of
+    /// the reduction chain that fires when a repetition finally ends, and the
+    /// size of the window a device-side replay needs - three limits that had
+    /// each been raised by hand after a document overran them.
     fn repeat(&mut self, inner: &SkeletonExpr, min: u32, max: Option<u32>) -> u32 {
         let body = self.sequence(inner);
         match max {
             None => {
                 let tail = self.fresh(format!("__star{}", self.names.len()));
-                let mut recursive = body.clone();
-                recursive.push(Symbol::Nonterminal(tail));
+                let mut recursive = vec![Symbol::Nonterminal(tail)];
+                recursive.extend(body.clone());
                 self.productions.push(Production {
                     lhs: tail,
                     rhs: recursive,
