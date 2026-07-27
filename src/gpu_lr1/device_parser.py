@@ -486,7 +486,7 @@ def _mask_kernel(
         )
         # Written whether or not the group is admitted, so the buffer never has
         # to be cleared - at batch 512 that clear was 13 MB a step.
-        tl.store(admitted_ptr + item, admitted)
+        tl.store(admitted_ptr + item, admitted.to(tl.int8))
         high_water = tl.maximum(high_water, reach)
         item = item + blocks
 
@@ -1324,6 +1324,142 @@ def _broadcast_kernel(
         tl.store(mask_ptr + sequence * mask_words + lane, value, mask=live)
 
 
+def _run_rise(arrays: dict, cap: int = 48) -> tuple[dict[int, int], set[int]]:
+    """How far a run of one terminal can push the stack above where it started.
+
+    The window bound used to count every terminal of a reading as a possible
+    push, which is what a reading may do in the worst case and is nowhere near
+    what one does. A reading is a token's worth of terminals, and a token that
+    is a hundred spaces is a hundred copies of one terminal - a *run*. What a
+    run does to the stack is a property of the terminal and the automaton, not
+    of how long the run is: with repetitions lowered left-recursively each copy
+    shifts and is reduced away, so the run costs a constant.
+
+    Simulated from every state a run can start in, with the window empty. A
+    reduction that pops past the floor ends the segment - the state it exposes
+    belongs to the sequence's stack and is unknown here - and the segment after
+    it starts from some other state, which is covered because this takes the
+    maximum over all of them. A terminal whose run is still growing when the cap
+    is reached is reported as growing, and its run is then charged its length.
+    """
+    action_offsets = np.frombuffer(arrays["action_offsets"], dtype=np.uint32)
+    action_terminals = np.frombuffer(arrays["action_terminals"], dtype=np.uint32)
+    action_values = np.frombuffer(arrays["action_values"], dtype=np.int32)
+    goto_offsets = np.frombuffer(arrays["goto_offsets"], dtype=np.uint32)
+    goto_nonterminals = np.frombuffer(arrays["goto_nonterminals"], dtype=np.uint32)
+    goto_targets = np.frombuffer(arrays["goto_targets"], dtype=np.uint32)
+    production_lhs = np.frombuffer(arrays["production_lhs"], dtype=np.uint32)
+    production_arity = np.frombuffer(arrays["production_arity"], dtype=np.uint32)
+
+    def action(state: int, terminal: int) -> int | None:
+        low, high = int(action_offsets[state]), int(action_offsets[state + 1])
+        row = action_terminals[low:high]
+        at = int(np.searchsorted(row, terminal))
+        if at >= row.size or row[at] != terminal:
+            return None
+        return int(action_values[low + at])
+
+    def goto(state: int, nonterminal: int) -> int | None:
+        low, high = int(goto_offsets[state]), int(goto_offsets[state + 1])
+        row = goto_nonterminals[low:high]
+        at = int(np.searchsorted(row, nonterminal))
+        if at >= row.size or row[at] != nonterminal:
+            return None
+        return int(goto_targets[low + at])
+
+    rise: dict[int, int] = {}
+    growing: set[int] = set()
+    for state in range(action_offsets.size - 1):
+        low, high = int(action_offsets[state]), int(action_offsets[state + 1])
+        for entry in range(low, high):
+            terminal = int(action_terminals[entry])
+            window: list[int] = []
+            best = 0
+            alive = True
+            step = 0
+            while alive and step < cap:
+                step += 1
+                settled = False
+                spins = 0
+                while not settled and alive and spins < cap:
+                    spins += 1
+                    top = window[-1] if window else state
+                    value = action(top, terminal)
+                    if value is None or value == ACCEPT:
+                        alive = False
+                    elif value > 0:
+                        window.append(value - 1)
+                        settled = True
+                    else:
+                        production = -value - 1
+                        arity = int(production_arity[production])
+                        if arity > len(window):
+                            # Past the floor: the exposed state is the
+                            # sequence's, not ours, and the segment ends.
+                            alive = False
+                        else:
+                            for _ in range(arity):
+                                window.pop()
+                            exposed = window[-1] if window else state
+                            target = goto(exposed, int(production_lhs[production]))
+                            if target is None:
+                                alive = False
+                            else:
+                                window.append(target)
+                    best = max(best, len(window))
+                if not settled:
+                    alive = False
+            if alive and step >= cap:
+                growing.add(terminal)
+            rise[terminal] = max(rise.get(terminal, 0), best)
+    return rise, growing
+
+
+def _window_bound(arrays: dict, nullable: int) -> int:
+    """How much window the widest reading of this grammar can need.
+
+    A reading is charged run by run: a run of a terminal that does not grow
+    costs what one run of it costs whatever its length, and a run of one that
+    does grow costs its length. Charging every terminal instead put three of
+    twelve schemas at the 256 cap while the deepest excursion a document made
+    was 27.
+    """
+    offsets = np.frombuffer(arrays["reading_term_offsets"], dtype=np.uint32)
+    terminals = np.frombuffer(arrays["reading_terminals"], dtype=np.uint32)
+    if terminals.size == 0:
+        return 2
+    rise, growing = _run_rise(arrays)
+
+    # Where a run begins: the first terminal of a reading, or a change of
+    # terminal within one.
+    starts = np.ones(terminals.size, dtype=bool)
+    starts[1:] = terminals[1:] != terminals[:-1]
+    # A reading always begins a run. An empty one has no terminal to mark, and
+    # its offset is the next reading's, so drop the ones that point past the end.
+    heads_at = offsets[:-1].astype(np.int64)
+    starts[heads_at[heads_at < terminals.size]] = True
+    at = np.flatnonzero(starts)
+    lengths = np.diff(np.append(at, terminals.size))
+    heads = terminals[at]
+
+    default = max(rise.values()) if rise else 1
+    per_run = np.array(
+        [rise.get(int(term), default) for term in heads], dtype=np.int64
+    )
+    grows = np.array([int(term) in growing for term in heads], dtype=bool)
+    # A run of `k` copies cannot push more than `k` shifts and their nullable
+    # reductions, whatever the saturated figure says: charging a run of one the
+    # rise a run of fifty reaches is what left one schema at 202 for an
+    # excursion of 27.
+    ceiling = lengths * (1 + nullable)
+    charge = np.minimum(np.where(grows, ceiling, per_run), ceiling)
+
+    # Which reading each run belongs to, so the runs of one reading add up.
+    owner = np.searchsorted(offsets, at, side="right") - 1
+    totals = np.bincount(owner, weights=charge, minlength=offsets.size - 1)
+    return int(totals.max()) + nullable + 2
+
+
 def _nullable_chain(arrays: dict) -> int:
     """Longest run of reductions that push without popping anything.
 
@@ -1474,7 +1610,7 @@ class DeviceGrammar:
         self.max_readings = max(widest(a, "reading_offsets") for a in every)
         self.max_reading_terms = max(widest(a, "reading_term_offsets") for a in every)
         self.nullable_chain = max(_nullable_chain(a) for a in every)
-        needed = self.max_reading_terms * (1 + self.nullable_chain) + 2
+        needed = max(_window_bound(a, self.nullable_chain) for a in every)
         # Capped at the stack: a window that large is no worse than the copy it
         # replaces, and the overflow flag makes a grammar that genuinely needs
         # more visible rather than silently mis-masked.
@@ -1596,9 +1732,10 @@ class DeviceBatch:
         # the sweep writes every item it enumerates, admitted or not. The
         # allocation is still the ceiling because the host cannot know the item
         # count without asking the device, but only the items that exist are
-        # ever touched.
+        # ever touched - and a byte says everything an admission has to say,
+        # which is 55 MB against 14 for a batch of 512 over ten grammars.
         self.admitted = torch.zeros(
-            rows * grammar.max_groups_per_state, dtype=torch.int32, device="cuda"
+            rows * grammar.max_groups_per_state, dtype=torch.int8, device="cuda"
         )
         self.counts = torch.zeros(rows, dtype=torch.int32, device="cuda")
         self.work_offsets = torch.zeros(rows + 1, dtype=torch.int32, device="cuda")
