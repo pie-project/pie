@@ -176,6 +176,10 @@ bool moe_grouped_gemm_enabled() {
 // under graph capture, and its grouped GEMM tiles M properly. Those are
 // exactly the two costs that keep PIE's MoE at ~700 GB/s against vLLM's
 // 1220 on the same bytes.
+// Decode batches are bounded by the scheduler's concurrency, so the fused
+// MoE workspace is sized for this rather than for a prefill's token count.
+constexpr int kFusedMoeMaxRows = 512;
+
 bool moe_flashinfer_enabled() {
     static const bool enabled = [] {
         const char* v = std::getenv("PIE_QWEN35_MOE_FLASHINFER");
@@ -714,12 +718,19 @@ Qwen3_5MoeMlpWorkspace Qwen3_5MoeMlpWorkspace::allocate(
             DeviceBuffer<std::uint16_t>::alloc(ws.aligned_rows_capacity * H);
     }
     if (moe_flashinfer_enabled() && ops::flashinfer_cutlass_moe_enabled()) {
+        // Sized for decode, not for the prefill high-water mark: the fused
+        // path only runs on the decode fast path, and its workspace scales
+        // with rows * top_k. At tp=1 the whole 68 GB model sits on one
+        // device and a prefill-sized workspace does not fit the budget.
+        ws.cutlass_max_rows = std::min(max_tokens, kFusedMoeMaxRows);
         const std::size_t bytes = ops::flashinfer_cutlass_moe_workspace_bytes(
-            ops::MoeActivation::Swiglu, max_tokens, hidden, moe_intermediate,
-            num_experts, top_k, /*tp_size=*/1, /*tp_rank=*/0);
+            ops::MoeActivation::Swiglu, ws.cutlass_max_rows, hidden,
+            moe_intermediate, num_experts, top_k,
+            /*tp_size=*/1, /*tp_rank=*/0);
         if (bytes > 0) {
             ws.cutlass_ws = DeviceBuffer<std::uint8_t>::alloc(bytes);
-            ws.cutlass_row_map = DeviceBuffer<std::int32_t>::alloc(maxR);
+            ws.cutlass_row_map = DeviceBuffer<std::int32_t>::alloc(
+                static_cast<std::size_t>(ws.cutlass_max_rows) * top_k);
         }
     }
     return ws;
@@ -1586,7 +1597,14 @@ bool moe_block(
                 const int routes = N * K;
                 // Weights are already sharded per rank, so the runner is told
                 // tp_size=1 and given this rank's own slice.
-                if (!moe_ws.cutlass_ws.empty() && !add_to_residual &&
+                // The runner overwrites its output, so when the caller
+                // wanted the residual folded in it writes to scratch and a
+                // separate add follows -- still far cheaper than the path
+                // this replaces, and it is what makes tp=1 (where
+                // `add_to_residual` is always set) reach this kernel.
+                void* fused_out = add_to_residual ? ws.norm_y.data() : moe_out;
+                if (!moe_ws.cutlass_ws.empty() &&
+                    N <= moe_ws.cutlass_max_rows &&
                     ops::flashinfer_cutlass_moe_bf16(
                         ops::MoeActivation::Swiglu,
                         static_cast<const std::uint16_t*>(ws.norm_x.data()),
@@ -1596,12 +1614,17 @@ bool moe_block(
                             Lw.moe_gate_up_proj->data()),
                         static_cast<const std::uint16_t*>(
                             Lw.moe_down_proj->data()),
-                        static_cast<std::uint16_t*>(moe_out),
+                        static_cast<std::uint16_t*>(fused_out),
                         moe_ws.cutlass_ws.data(),
                         moe_ws.cutlass_ws.size(),
                         moe_ws.cutlass_row_map.data(),
                         N, H, Im, E, K,
                         /*tp_size=*/1, /*tp_rank=*/0, stream)) {
+                    if (add_to_residual) {
+                        kernels::launch_residual_add_bf16(
+                            moe_out, ws.norm_y.data(),
+                            static_cast<std::size_t>(N) * H, stream);
+                    }
                     return;
                 }
                 const int block = moe_ws.aligned_block_size;

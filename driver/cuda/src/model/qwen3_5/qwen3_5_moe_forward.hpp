@@ -34,7 +34,8 @@ struct Qwen3_5MoeMlpWorkspace {
     // Scratch for the fused CUTLASS grouped-MoE path (flashinfer). Empty
     // unless that path is selected.
     DeviceBuffer<std::uint8_t>  cutlass_ws;         // opaque runner workspace
-    DeviceBuffer<std::int32_t>  cutlass_row_map;    // [N*K] i32
+    DeviceBuffer<std::int32_t>  cutlass_row_map;    // [rows*K] i32
+    int cutlass_max_rows = 0;                      // rows the ws is sized for
     DeviceBuffer<std::int32_t>  expert_idx;        // [N*K] i32 (dst row)
     DeviceBuffer<float>         expert_w;          // [N*K] fp32
 
