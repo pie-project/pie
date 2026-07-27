@@ -358,7 +358,9 @@ class PtirProgramCache {
     // exist, because a wrong graph key is silent: it does not fail, it reuses
     // the wrong CUDA graph. Deleting the driver's copy is gated on
     // `divergent == 0` over real workloads, which is the same evidence
-    // `ModuleCacheStats` gave before the emitters were deleted.
+    // `ModuleCacheStats` gave before the emitters were deleted. Read
+    // `host_supplied` alongside it: a comparison that never ran reports the
+    // same zero as one that always agreed.
     struct IdentityStats {
         std::uint64_t host_supplied = 0;
         std::uint64_t derived = 0;

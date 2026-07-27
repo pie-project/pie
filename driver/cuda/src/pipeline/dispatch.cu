@@ -2447,6 +2447,10 @@ DispatchStats Dispatch::stats() const {
     result.generated_stage_cache_entries = generated.stage_entries;
     result.generated_program_cache_entries = generated.program_entries;
     result.generated_negative_cache_entries = generated.negative_entries;
+    const auto identities = impl_->cache.identity_stats();
+    result.identity_host_supplied = identities.host_supplied;
+    result.identity_derived = identities.derived;
+    result.identity_divergent = identities.divergent;
     result.channel_slot_capacity = impl_->channels.capacity_slots();
     return result;
 }

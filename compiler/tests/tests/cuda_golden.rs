@@ -503,6 +503,18 @@ fn emit_driver_test_kernel_fixtures() {
             body.push('\n');
         }
         std::fs::write(out_dir.join(format!("{name}.kernels")), body).unwrap();
+
+        // The stage identities travel with the kernels for the same reason:
+        // the driver's C++ tests cannot run the host's planner, so anything
+        // the launch package carries has to be handed to them as a fixture.
+        // Without this the driver's own divergence counter is unreadable --
+        // no C++ caller supplies a table, so `divergent` stays zero because
+        // the comparison never happens.
+        let mut identities = String::new();
+        for stage in &stages {
+            let _ = writeln!(identities, "{:016x}", pie_plan::stage_identity(stage));
+        }
+        std::fs::write(out_dir.join(format!("{name}.identities")), identities).unwrap();
         written += 1;
     }
     assert!(written > 0, "no driver-test kernel fixtures were written");

@@ -97,6 +97,14 @@ struct DispatchStats {
     std::uint64_t generated_stage_cache_entries = 0;
     std::uint64_t generated_program_cache_entries = 0;
     std::uint64_t generated_negative_cache_entries = 0;
+    /// Stage identities the host shipped, versus ones this driver had to
+    /// derive because none arrived. Deleting `program_identity.hpp`'s copy is
+    /// gated on `identity_divergent == 0` -- but only once
+    /// `identity_host_supplied > 0`, because a comparison that never ran also
+    /// reports zero divergence.
+    std::uint64_t identity_host_supplied = 0;
+    std::uint64_t identity_derived = 0;
+    std::uint64_t identity_divergent = 0;
     std::uint64_t descriptor_readback_batches = 0;
     std::uint64_t descriptor_readback_cells = 0;
     std::uint64_t descriptor_readback_bytes = 0;

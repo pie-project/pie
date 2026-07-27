@@ -51,6 +51,42 @@ const pie_cuda_driver::tests::HostKernelFixture& load_host_kernels(
     return cache.emplace(name, std::move(fixture)).first->second;
 }
 
+// The stage identities the host would ship in the same launch package. Handed
+// over as a fixture for the same reason the kernels are: a C++ test cannot run
+// the host planner. Supplying them is what makes the driver's divergence
+// counter mean something -- with an empty slice the driver silently falls back
+// to its own derivation and `identity_divergent` stays zero because nothing
+// was ever compared.
+const std::vector<std::uint64_t>& load_host_stage_identities(
+    const std::string& golden_directory, const std::string& name) {
+    static std::map<std::string, std::vector<std::uint64_t>> cache;
+    auto found = cache.find(name);
+    if (found != cache.end()) return found->second;
+    const std::string path =
+        golden_directory + "-kernels/" + name + ".identities";
+    std::ifstream input(path);
+    if (!input) {
+        std::fprintf(
+            stderr, "host stage identity fixture: cannot open %s\n",
+            path.c_str());
+        std::abort();
+    }
+    std::vector<std::uint64_t> identities;
+    std::string line;
+    while (std::getline(input, line)) {
+        if (line.find_first_not_of(" \t\r\n") == std::string::npos) continue;
+        identities.push_back(std::stoull(line, nullptr, 16));
+    }
+    return cache.emplace(name, std::move(identities)).first->second;
+}
+
+PieU64Slice host_stage_identities(
+    const std::string& golden_directory, const std::string& name) {
+    const std::vector<std::uint64_t>& identities =
+        load_host_stage_identities(golden_directory, name);
+    return PieU64Slice{identities.data(), identities.size()};
+}
+
 int failures = 0;
 
 void expect_impl(bool condition, const std::string& message) {
@@ -180,7 +216,7 @@ std::uint64_t run_case(
             pie_native::ByteSlice{
                 sidecar_bytes.data(), sidecar_bytes.size()},
             load_host_kernels(golden_directory, "section3_masked_gumbel").slice(),
-            PieU64Slice{},
+            host_stage_identities(golden_directory, "section3_masked_gumbel"),
             &error) == PIE_STATUS_OK,
         "register grouped program: " + error);
     const DispatchStats registration_stats = dispatch.stats();
@@ -191,6 +227,17 @@ std::uint64_t run_case(
             registration_stats.generated_stage_cache_entries != 0 &&
             registration_stats.generated_program_cache_entries == 1,
         "registration compiles every generated fused region before publishing");
+    // The gate on deleting `program_identity.hpp`'s driver copy. Both halves
+    // matter: `divergent == 0` alone is also what a comparison that never ran
+    // reports, and until this fixture existed no C++ caller supplied a table.
+    expect(
+        registration_stats.identity_host_supplied != 0 &&
+            registration_stats.identity_divergent == 0,
+        "the driver derives the host's stage identities, and says so: "
+        "host_supplied=" +
+            std::to_string(registration_stats.identity_host_supplied) +
+            " divergent=" +
+            std::to_string(registration_stats.identity_divergent));
 
     std::vector<std::uint64_t> hashes(lane_count, hash);
     std::vector<std::uint64_t> instances(lane_count);
@@ -518,7 +565,7 @@ std::vector<std::int32_t> run_nucleus_case(
             {container_bytes.data(), container_bytes.size()},
             {sidecar_bytes.data(), sidecar_bytes.size()},
             load_host_kernels(golden_directory, "nucleus_sample").slice(),
-            PieU64Slice{},
+            host_stage_identities(golden_directory, "nucleus_sample"),
             &error) == PIE_STATUS_OK,
         "register nucleus program: " + error);
 
@@ -760,7 +807,7 @@ void run_structured_mask_golden(const std::string& golden_directory) {
             {container_bytes.data(), container_bytes.size()},
             {sidecar_bytes.data(), sidecar_bytes.size()},
             load_host_kernels(golden_directory, "structured_masks").slice(),
-            PieU64Slice{},
+            host_stage_identities(golden_directory, "structured_masks"),
             &error) == PIE_STATUS_OK,
         "register structured-mask golden: " + error);
     std::vector<std::uint64_t> hashes(lane_count, hash);
@@ -953,7 +1000,7 @@ void run_declared_phase_case(
                 {container_bytes.data(), container_bytes.size()},
                 {sidecar_bytes.data(), sidecar_bytes.size()},
                 load_host_kernels(golden_directory, "staged_dispatch").slice(),
-            PieU64Slice{},
+            host_stage_identities(golden_directory, "staged_dispatch"),
                 &error) == PIE_STATUS_UNSUPPORTED,
             "model without attention hook coverage rejects registration");
     }
@@ -966,7 +1013,7 @@ void run_declared_phase_case(
             {container_bytes.data(), container_bytes.size()},
             {sidecar_bytes.data(), sidecar_bytes.size()},
             load_host_kernels(golden_directory, "staged_dispatch").slice(),
-            PieU64Slice{},
+            host_stage_identities(golden_directory, "staged_dispatch"),
             &error) == PIE_STATUS_OK,
         "register staged program: " + error);
 
@@ -1485,7 +1532,7 @@ std::vector<std::uint8_t> run_beam_case(
             {container_bytes.data(), container_bytes.size()},
             {sidecar_bytes.data(), sidecar_bytes.size()},
             load_host_kernels(golden_directory, "beam_epilogue").slice(),
-            PieU64Slice{},
+            host_stage_identities(golden_directory, "beam_epilogue"),
             &error) == PIE_STATUS_OK,
         "register beam program: " + error);
     std::vector<std::uint64_t> hashes(lane_count, hash);
@@ -1749,7 +1796,7 @@ void run_mtp_direct_case(const std::string& golden_directory) {
             {container_bytes.data(), container_bytes.size()},
             {sidecar_bytes.data(), sidecar_bytes.size()},
             load_host_kernels(golden_directory, "mtp_verify_tail").slice(),
-            PieU64Slice{},
+            host_stage_identities(golden_directory, "mtp_verify_tail"),
             &error) == PIE_STATUS_OK,
         "register MtpLogits fixture: " + error);
 
@@ -1970,7 +2017,7 @@ void run_parallel_signature_case(const std::string& golden_directory) {
                 // program it is asked for, and handing it another program's
                 // kernel table publishes a kernel built for a different plan.
                 load_host_kernels(golden_directory, name).slice(),
-                PieU64Slice{},
+                host_stage_identities(golden_directory, name),
                 &error) == PIE_STATUS_OK,
             "parallel-signature program registration: " + error);
         result.instance = instance;
