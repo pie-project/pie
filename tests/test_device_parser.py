@@ -288,6 +288,94 @@ class MixedGrammarBatch(unittest.TestCase):
             )
 
 
+class RandomWalkAgreement(unittest.TestCase):
+    """Compare masks at every state a random walk reaches, not one document.
+
+    A fixed document visits one path. The serving path disagreed at a state that
+    path never reaches, because the model tokenises differently from the corpus
+    and so arrives by routes the corpus does not take. Choosing a random one of
+    the tokens the matcher admits at each step covers far more of what is
+    reachable, and it is driven by the mask, so a mask that is too narrow shrinks
+    the walk rather than hiding.
+    """
+
+    def setUp(self):
+        _requirements()
+        from gpu_lr1.device_parser import DeviceGrammar
+
+        self.DeviceGrammar = DeviceGrammar
+        self.compiler = gpugrammar.Compiler(VOCABULARY)
+
+    def _walk(self, schema, walks=8, length=25):
+        import random
+
+        compiled = self.compiler.compile_json_schema(json.dumps(schema))
+        pool = self.DeviceGrammar(compiled)
+        batch = pool.new_batch(1)
+        reference = torch.zeros(pool.mask_words, dtype=torch.int32)
+        rng = random.Random(20260727)
+        seen = set()
+        steps = 0
+        for _ in range(walks):
+            matcher = compiled.matcher(0)
+            for _ in range(length):
+                configurations = matcher.configurations()
+                if len(configurations) > pool.max_configs:
+                    break
+                seen.add(tuple(sorted((s, tuple(k)) for s, k in configurations)))
+                reference.zero_()
+                matcher.fill_bitmask(reference)
+                batch.set_configurations(0, configurations)
+                device = batch.fill_mask()[0].cpu()
+                self.assertTrue(
+                    torch.equal(device, reference),
+                    f"mask differs at {configurations}: "
+                    f"{int(((device & ~reference) != 0).sum())} words with extra "
+                    f"bits, {int(((reference & ~device) != 0).sum())} with missing",
+                )
+                choices = [
+                    token
+                    for token in range(pool.vocab_size)
+                    if (reference[token // 32] >> (token % 32)) & 1
+                ]
+                if not choices:
+                    break
+                if not matcher.accept_token(rng.choice(choices)):
+                    break
+                steps += 1
+        self.assertEqual(int(batch.overflow.sum()), 0)
+        self.assertGreater(steps, walks, "the walk barely moved")
+        return len(seen)
+
+    def test_open_object(self):
+        states = self._walk(
+            {
+                "type": "object",
+                "properties": {"name": {"type": "string"}, "id": {"type": "integer"}},
+                "required": ["name"],
+            }
+        )
+        self.assertGreater(states, 1)
+
+    def test_closed_object(self):
+        """`additionalProperties: false` is where the serving path disagreed."""
+        self._walk(
+            {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "age": {"type": "integer"},
+                    "active": {"type": "boolean"},
+                },
+                "required": ["name", "age", "active"],
+                "additionalProperties": False,
+            }
+        )
+
+    def test_array(self):
+        self._walk({"type": "array", "items": {"type": "integer"}})
+
+
 class GrammarPool(unittest.TestCase):
     """Grammars arrive with requests and leave when the request does.
 
