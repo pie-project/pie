@@ -235,8 +235,21 @@ jobs:
       - name: cargo build (driver-metal)
         run: cargo build -p pie-worker --no-default-features --features driver-metal
 
+      # `src/batch/forward.cpp` compiles a LoadPlan, so every Metal target that
+      # links the archive into an executable needs `pie-loader` as a staticlib
+      # (the rlib the worker links is not linkable from C++). Without this the
+      # cmake steps below silently skip the loader-reaching targets — including
+      # the two that cover the loader surface — and the Metal driver's only real
+      # check would be that its archive compiles. Built before `cargo test` so a
+      # test failure cannot hide the cmake+link coverage behind it.
+      - name: Build the loader staticlib
+        run: cargo rustc -p pie-loader --lib --crate-type staticlib
+
+      # `pie-worker` is a library; the `pie` command lives in `bin/pie`. The old
+      # `--bin pie` here named a target this package has never had, so the step
+      # could only ever fail.
       - name: cargo test (pie-worker)
-        run: cargo test -p pie-worker --bin pie --no-default-features --features driver-metal
+        run: cargo test -p pie-worker --no-default-features --features driver-metal
 
       - name: Native Metal entrypoint validation
         run: |

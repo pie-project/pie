@@ -261,7 +261,12 @@ pub fn emit_grouped_fused_region(
         } else if op.tag == OP_CHAN_PUT {
             slots.o0 = format!("pending_{}", op.chan);
         } else if op.tag == OP_INTRINSIC_VAL {
-            slots.a0 = "logits".to_string();
+            // `logits` is a `const device bfloat*` here because the gather and
+            // the draft argmax above index it as one; `ptir_m1_execute` takes a
+            // `const device uchar*`, and MSL will not convert between them. The
+            // singleton emitter has no cast because there `logits` arrives as a
+            // kernel parameter already typed `uchar*`.
+            slots.a0 = "reinterpret_cast<const device uchar*>(logits)".to_string();
         }
         let _ = writeln!(
             source,

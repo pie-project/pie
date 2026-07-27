@@ -5,6 +5,7 @@
 #include <bit>
 #include <chrono>
 #include <cstdlib>
+#include <iostream>
 #include <cstring>
 #include <filesystem>
 #include <iomanip>
@@ -3114,13 +3115,33 @@ std::vector<M1ExecuteOutcome> M1Runtime::finish_m3_group(
     const auto* statuses =
         static_cast<const DeviceStatus*>(command->statuses.contents());
     outcomes.reserve(command->candidates.size());
+    // The lane status is written by the kernel, and on the failure path it is
+    // the only account of what happened: `m1_fault` stores the op tag it could
+    // not execute in `fault`, and the lane-table guard stores the ABI version
+    // and the (lane_count, channel_count) it saw. Dropping it left the driver
+    // printing "launch failed:" with nothing after the colon.
+    std::string faults;
     for (std::size_t lane = 0; lane < command->candidates.size(); ++lane) {
-        if (statuses[lane].state == 4)
+        if (statuses[lane].state == 4) {
             outcomes.push_back(M1ExecuteOutcome::Committed);
-        else if (statuses[lane].state == 2)
+            continue;
+        }
+        if (statuses[lane].state == 2) {
             outcomes.push_back(M1ExecuteOutcome::Retry);
-        else
-            outcomes.push_back(M1ExecuteOutcome::Failed);
+            continue;
+        }
+        outcomes.push_back(M1ExecuteOutcome::Failed);
+        if (!faults.empty()) faults += "; ";
+        faults += "lane " + std::to_string(lane) + " state=" +
+                  std::to_string(statuses[lane].state) + " fault=0x" +
+                  hex64(statuses[lane].fault) + " reserved0=" +
+                  std::to_string(statuses[lane].reserved0) + " reserved1=0x" +
+                  hex64(statuses[lane].reserved1);
+    }
+    if (!faults.empty() && error.empty()) {
+        error = "Metal M3 group reported a device fault (" + faults +
+                "); fault 0x100 is the lane-table ABI/shape guard, any other "
+                "value is the PTIR op tag the runtime could not execute";
     }
     std::uint64_t timestamps[2] = {0, 0};
     command->target->resolve_timestamps(

@@ -89,6 +89,18 @@ inline std::optional<std::string> runtime_name(std::string_view raw_name) {
         return "shared_embedding." +
                std::string(raw_name.substr(std::string_view("lm_head.").size()));
     }
+    // The tied half of the same slot. `EmbedGather` and `QmvLmHead` both bind
+    // `shared_embedding.*`, and this family ships tied — so its checkpoint has
+    // an `embed_tokens` and no `lm_head` at all. Without this the driver could
+    // not name the embedding table of the one model it targets.
+    //
+    // A checkpoint carrying both would declare `shared_embedding` twice and be
+    // rejected as a duplicate, which is the truthful outcome: there is one
+    // shared slot here, not two.
+    constexpr std::string_view kEmbed = "model.language_model.embed_tokens.";
+    if (raw_name.rfind(kEmbed, 0) == 0) {
+        return "shared_embedding." + std::string(raw_name.substr(kEmbed.size()));
+    }
     if (raw_name == "model.language_model.norm.weight") {
         return std::string("final_norm.weight");
     }

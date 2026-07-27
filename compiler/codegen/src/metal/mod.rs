@@ -52,10 +52,12 @@ pub use validate::validate_singleton_plan;
 
 /// `kMetalM1EmitterVersion` — bumped whenever emitted MSL changes, so the
 /// driver's pipeline cache keys on it.
-pub const METAL_M1_EMITTER_VERSION: u16 = 23;
+pub const METAL_M1_EMITTER_VERSION: u16 = 24;
 
 /// `kMetalM1MaxChannels` — the single-lane readiness/commit kernels bind one
-/// `words_N` buffer per channel starting at buffer 2.
+/// `words_N` buffer per channel starting at buffer 2, and Metal's highest
+/// buffer index is 30. Enforced by `emit_readiness` / `emit_commit`; it used to
+/// be a comment, and a program with one channel more emitted `[[buffer(31)]]`.
 pub const METAL_M1_MAX_CHANNELS: usize = 29;
 
 /// `kMetalM2MaxFusedChannels` — a fused region binds committed/pending pairs

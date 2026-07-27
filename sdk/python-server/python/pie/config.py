@@ -115,24 +115,41 @@ class Config:
     model: ModelConfig = field(default_factory=ModelConfig)
 
     def to_toml(self) -> str:
-        """Serialize to the same TOML schema `pie serve --config` reads."""
+        """Serialize to the combined standalone TOML `pie serve --config` reads.
+
+        The standalone file is one document with a top-level section per role
+        (`bin/pie/src/derive.rs::extract_section`), so every worker-domain
+        table is written under `[worker.*]`. A flat `[model]` at the root — the
+        shape this emitted before the role split — parses as an *empty*
+        `[worker]` section and fails with `missing field \u0060model\u0060`.
+
+        `[gateway].listen` is the client-facing edge, so `server.host`/`port`
+        is mirrored there: that is the address the harness dials.
+        """
         buf = io.StringIO()
-        _emit_table(buf, "server", _block(self.server))
-        _emit_table(buf, "auth", _block(self.auth))
-        _emit_table(buf, "telemetry", _block(self.telemetry))
-        _emit_table(buf, "runtime", _block(self.runtime))
+        buf.write("[controller]\n")
+        host = self.server.host or "127.0.0.1"
+        port = self.server.port
+        buf.write("\n[gateway]\n")
+        if port is not None:
+            _emit_kv(buf, "listen", f"{host}:{port}")
+        _emit_table(buf, "worker", {}, leading_newline=True)
+        _emit_table(buf, "worker.server", _block(self.server))
+        _emit_table(buf, "worker.auth", _block(self.auth))
+        _emit_table(buf, "worker.telemetry", _block(self.telemetry))
+        _emit_table(buf, "worker.runtime", _block(self.runtime))
         m = self.model
-        buf.write("\n[model]\n")
+        buf.write("\n[worker.model]\n")
         _emit_kv(buf, "name", m.name)
         _emit_kv(buf, "hf_repo", m.hf_repo)
-        _emit_table(buf, "model.driver", _driver_block(m.driver),
+        _emit_table(buf, "worker.model.driver", _driver_block(m.driver),
                     leading_newline=True)
         if m.driver.options:
-            buf.write("\n[model.driver.options]\n")
+            buf.write("\n[worker.model.driver.options]\n")
             for k, v in m.driver.options.items():
                 _emit_kv(buf, k, v)
         if m.scheduler is not None:
-            _emit_table(buf, "model.scheduler", _block(m.scheduler),
+            _emit_table(buf, "worker.model.scheduler", _block(m.scheduler),
                         leading_newline=True)
         return buf.getvalue()
 

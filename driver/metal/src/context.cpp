@@ -215,12 +215,30 @@ ModelFacts read_model_facts(const std::string& hf_path) {
     try {
         nlohmann::json j;
         f >> j;
-        if (j.contains("vocab_size") && j["vocab_size"].is_number_integer()) {
-            facts.vocab_size = j["vocab_size"].get<std::uint32_t>();
+        // A multimodal release nests the text decoder's facts under
+        // `text_config` and leaves the root to the wrapper. `model_type` and
+        // the linear-attention probe below already read through that view;
+        // `vocab_size` and `max_position_embeddings` used to read the root
+        // only, so on the very family this driver targets they silently kept
+        // their defaults and the vocab cross-check rejected the checkpoint as
+        // "32000 != 248320".
+        const nlohmann::json& tc =
+            (j.contains("text_config") && j["text_config"].is_object())
+                ? j["text_config"]
+                : j;
+        const auto u32_of = [](const nlohmann::json& obj, const char* key,
+                               std::uint32_t& out) {
+            if (obj.contains(key) && obj[key].is_number_integer()) {
+                out = obj[key].get<std::uint32_t>();
+                return true;
+            }
+            return false;
+        };
+        if (!u32_of(tc, "vocab_size", facts.vocab_size)) {
+            u32_of(j, "vocab_size", facts.vocab_size);
         }
-        if (j.contains("max_position_embeddings") &&
-            j["max_position_embeddings"].is_number_integer()) {
-            facts.max_model_len = j["max_position_embeddings"].get<std::uint32_t>();
+        if (!u32_of(tc, "max_position_embeddings", facts.max_model_len)) {
+            u32_of(j, "max_position_embeddings", facts.max_model_len);
         }
         if (j.contains("architectures") && j["architectures"].is_array() &&
             !j["architectures"].empty()) {
@@ -233,10 +251,6 @@ ModelFacts read_model_facts(const std::string& hf_path) {
             }
             if (!a.empty()) facts.arch_name = a;
         }
-        const nlohmann::json& tc =
-            (j.contains("text_config") && j["text_config"].is_object())
-                ? j["text_config"]
-                : j;
         if (tc.contains("linear_num_value_heads") &&
             tc["linear_num_value_heads"].is_number_integer() &&
             tc["linear_num_value_heads"].get<int>() > 0) {
@@ -853,6 +867,12 @@ class Context::Impl {
         std::vector<std::shared_ptr<PendingM3Group>> m3_for_member(M);
         std::vector<pipeline::M1ExecuteOutcome> m3_outcomes(
             M, pipeline::M1ExecuteOutcome::Failed);
+        // Why, parallel to the outcome. The grouped path settles its lanes
+        // ahead of the settlement loop, so unlike the singleton and M2 paths it
+        // has no `failure` string in scope when it decides — and its reason used
+        // to be printed only under `verbose` and then dropped. A member that
+        // failed for a stated reason would report an empty one.
+        std::vector<std::string> m3_errors(M);
         std::vector<std::uint8_t> m3_active(M, 0);
         std::vector<std::shared_ptr<PendingM3Group>> m3_groups;
 #endif
@@ -1007,6 +1027,7 @@ class Context::Impl {
                      ++lane) {
                     m3_active[members[lane]] = 1;
                     m3_outcomes[members[lane]] = grouped[lane];
+                    m3_errors[members[lane]] = group_error;
                 }
             }
         }
@@ -1346,6 +1367,7 @@ class Context::Impl {
                  ++lane) {
                 m3_outcomes[group->accepted_members[lane]] =
                     group_outcomes[lane];
+                m3_errors[group->accepted_members[lane]] = group_error;
             }
             if (!group_error.empty() && cfg_.runtime.verbose) {
                 std::cerr << "[pie-driver-metal] M3 finish: "
@@ -1432,8 +1454,12 @@ class Context::Impl {
                         if (generated ==
                             pipeline::M1ExecuteOutcome::Retry) {
                             if (cfg_.runtime.verbose) {
+                                const std::string& why =
+                                    failure.empty() && m3_active[m] != 0
+                                        ? m3_errors[m]
+                                        : failure;
                                 std::cerr << "[pie-driver-metal] M1 retry: "
-                                          << failure << "\n";
+                                          << why << "\n";
                             }
                             outcomes[m] = PIE_TERMINAL_OUTCOME_RETRY;
                             m1_runtime_->release(prepared[m]);
@@ -1442,6 +1468,12 @@ class Context::Impl {
                         if (generated ==
                             pipeline::M1ExecuteOutcome::Failed) {
                             ok = false;
+                            if (failure.empty()) {
+                                failure = m3_active[m] != 0 && !m3_errors[m].empty()
+                                              ? m3_errors[m]
+                                              : "generated execution failed without "
+                                                "a stated reason";
+                            }
                         } else {
                             queue_channel_notifications(
                                 lm.tickets, notifications);

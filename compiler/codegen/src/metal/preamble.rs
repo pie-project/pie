@@ -15,6 +15,14 @@ use core::fmt::Write as _;
 /// the driver's job at library-build time, not the emitter's.
 pub const RUNTIME_TEMPLATE: &str = include_str!("../../runtime/metal/ptir_m1_runtime.metal");
 
+/// The grouped (M3) lane-table structs, in a file rather than a literal for the
+/// same reason `RUNTIME_TEMPLATE` is: a C++ reader needs them too. The Metal
+/// driver's `msl_compile_test` reconstructs the emitter's full sources from the
+/// golden dump plus these two prefixes, and a raw string literal in this crate
+/// is reachable from nothing but this crate.
+pub const GROUPED_PREAMBLE: &str =
+    include_str!("../../runtime/metal/ptir_m1_grouped.metal");
+
 /// `common_effect_preamble()` — the structs the single-lane readiness and
 /// commit kernels read out of the lane table.
 pub fn common_effect_preamble() -> &'static str {
@@ -66,54 +74,5 @@ pub fn emit_word_arguments(source: &mut String, count: usize) {
 
 /// `grouped_preamble()` — the M3 (grouped, multi-lane) lane-table structs.
 pub fn grouped_preamble() -> &'static str {
-    r#"
-struct M3LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
-struct M3LaneRecord {
-  ulong logits_base;
-  uint logits_row_offset;
-  uint logits_row_count;
-  uint kv_len;
-  uint page_count;
-  uint row_count;
-  uint token_count;
-  uint sampled_rows;
-  uint query_len;
-  uint key_len;
-  uint channel_slot_offset;
-  ulong rng_state;
-  ulong commit_slot;
-  ulong active_row_mask;
-  ulong sample_output_channel_mask;
-  ulong row_valid;
-  uint row_valid_offset;
-  uint reserved0;
-};
-struct M3LaneChannelSlot {
-  ulong committed_cell;
-  ulong pending_cell;
-  ulong expected_head;
-  ulong expected_tail;
-};
-struct M3ChannelMeta {
-  ulong words;
-  uint capacity;
-  uint flags;
-};
-struct M3GroupLayout {
-  uint lane_count;
-  uint value_count;
-  uint scratch_stride;
-  uint temporary_offset;
-  uint vocab;
-  uint reserved0;
-  uint reserved1;
-  uint reserved2;
-};
-struct M3RowMeta {
-  uint offset;
-  uint count;
-  uint mtp_offset;
-  uint reserved;
-};
-"#
+    GROUPED_PREAMBLE
 }

@@ -1,9 +1,22 @@
 # oracle dump: pie::metal::pipeline::emit_grouped_fused_region_msl
-# source of truth: driver/metal/src/pipeline/m1_codegen.cpp (transitional; the Rust port is compiler/codegen/src/metal/)
-# emitter_version: 23
+# source of truth: compiler/codegen/src/metal/ (the C++ oracle this was dumped from is deleted)
+# emitter_version: 24
 # @runtime: bytes=33947 fnv1a64=0x87250720781b2a8f
 # @grouped: bytes=970 fnv1a64=0xa8ab9e1ebf8714d9
 # cases: 192
+# re-blessed: the C++ oracle (driver/metal/src/pipeline/m1_codegen.cpp) is
+#   deleted, so these bytes can no longer be re-derived from it. Three cases
+#   below were re-blessed from Rust in the change that made the emitted corpus
+#   compile: `driver/metal/tests/msl_compile_test.cpp` put every kernel here
+#   through Apple's shader compiler for the first time and found two rejections
+#   the byte comparison could never see, because the oracle had them too.
+#     * readiness/commit `wide_30` emitted `[[buffer(31)]]`, one past Metal's
+#       highest buffer index; `METAL_M1_MAX_CHANNELS` now rejects it by name.
+#     * three grouped fused regions passed the `const device bfloat*` logits
+#       pointer into `ptir_m1_execute`'s `const device uchar*` parameter, which
+#       MSL will not convert. They now cast.
+#   Nothing else in this directory moved, and `msl_compile_test` is the standing
+#   check that took over from the oracle for the question it could not answer.
 === beam_epilogue#0 singleton#0
 function_name: ptir_m3s_b4fadd8446eb58dd_r0
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
@@ -7467,7 +7480,7 @@ kernel void ptir_m3_82921040f7bc2612_r2(
 function_name: ptir_m3s_14f667a41eb30669_r0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=37348 prefix=@runtime+@grouped tail_bytes=2431
+source: bytes=37387 prefix=@runtime+@grouped tail_bytes=2470
 kernel void ptir_m3s_14f667a41eb30669_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -7500,7 +7513,7 @@ kernel void ptir_m3s_14f667a41eb30669_r0(
   const uint pending_index_0 = lane.channel_slot_offset + dense_0;
   const device uchar* current_0 = reinterpret_cast<const device uchar*>(pending_flags[pending_index_0] != 0 ? channel_0.pending_cell : channel_0.committed_cell);
   device uchar* pending_0 = reinterpret_cast<device uchar*>(channel_0.pending_cell);
-  ptir_m1_execute(160u, status, descriptors, lane_params + 0, logits, scratch, scratch, scratch + offsets[0], scratch, temporary);
+  ptir_m1_execute(160u, status, descriptors, lane_params + 0, reinterpret_cast<const device uchar*>(logits), scratch, scratch, scratch + offsets[0], scratch, temporary);
   if (status->state != 1) return;
 }
 === end
@@ -7713,7 +7726,7 @@ kernel void ptir_m3s_14f667a41eb30669_r5(
 function_name: ptir_m3_14f667a41eb30669_r0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=37347 prefix=@runtime+@grouped tail_bytes=2430
+source: bytes=37386 prefix=@runtime+@grouped tail_bytes=2469
 kernel void ptir_m3_14f667a41eb30669_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -7746,7 +7759,7 @@ kernel void ptir_m3_14f667a41eb30669_r0(
   const uint pending_index_0 = lane.channel_slot_offset + dense_0;
   const device uchar* current_0 = reinterpret_cast<const device uchar*>(pending_flags[pending_index_0] != 0 ? channel_0.pending_cell : channel_0.committed_cell);
   device uchar* pending_0 = reinterpret_cast<device uchar*>(channel_0.pending_cell);
-  ptir_m1_execute(160u, status, descriptors, lane_params + 0, logits, scratch, scratch, scratch + offsets[0], scratch, temporary);
+  ptir_m1_execute(160u, status, descriptors, lane_params + 0, reinterpret_cast<const device uchar*>(logits), scratch, scratch, scratch + offsets[0], scratch, temporary);
   if (status->state != 1) return;
 }
 === end
@@ -9061,7 +9074,7 @@ kernel void ptir_m3_dff3bc6795a9dcdf_r1(
 function_name: ptir_m3_dff3bc6795a9dcdf_r2
 region: library=0 library_op=0 schedule=1 nodes=6 inputs=2 outputs=0 sinks=3
 ok: true
-source: bytes=40310 prefix=@runtime+@grouped tail_bytes=5393
+source: bytes=40349 prefix=@runtime+@grouped tail_bytes=5432
 kernel void ptir_m3_dff3bc6795a9dcdf_r2(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -9126,7 +9139,7 @@ kernel void ptir_m3_dff3bc6795a9dcdf_r2(
   if (status->state != 1) return;
   current_3 = pending_3;
   pending_flags[pending_index_3] = 1;
-  ptir_m1_execute(160u, status, descriptors, lane_params + 36, logits, scratch, scratch, scratch + offsets[35], scratch, temporary);
+  ptir_m1_execute(160u, status, descriptors, lane_params + 36, reinterpret_cast<const device uchar*>(logits), scratch, scratch, scratch + offsets[35], scratch, temporary);
   if (status->state != 1) return;
   ptir_m1_execute(146u, status, descriptors, lane_params + 37, scratch + offsets[35], scratch, scratch, pending_4, scratch, temporary);
   if (status->state != 1) return;

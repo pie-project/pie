@@ -174,6 +174,7 @@ mod tests {
             device_geometry_port_mask: pie_driver_abi::PIE_DEVICE_GEOMETRY_PORTS,
             codegen_backend: String::new(),
             kv_handle: None,
+            codegen_backend: String::new(),
         }
     }
 

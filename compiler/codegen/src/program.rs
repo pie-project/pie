@@ -255,10 +255,10 @@ fn emit_metal_program_effects(bound: &BoundTrace, out: &mut Vec<EmittedKernel>) 
     let signature = format!("{:016x}", bound.hash);
     let ready = format!("ptir_m1_{signature}_ready");
     let source = crate::metal::emit_readiness(&ready, &effects);
-    out.push(EmittedKernel::new(KERNEL_READINESS, 0, 1, ready, Ok(source)));
+    out.push(EmittedKernel::new(KERNEL_READINESS, 0, 1, ready, source));
     let commit = format!("ptir_m1_{signature}_commit");
     let source = crate::metal::emit_commit(&commit, &effects);
-    out.push(EmittedKernel::new(KERNEL_COMMIT, 0, 1, commit, Ok(source)));
+    out.push(EmittedKernel::new(KERNEL_COMMIT, 0, 1, commit, source));
 }
 
 /// Which library kernel a grouped region should use, reproducing the driver's
