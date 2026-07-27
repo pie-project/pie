@@ -363,19 +363,6 @@ impl TryFrom<u32> for PieLoaderRowMap {
     }
 }
 
-#[repr(u32)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PieLoaderStorageInstrKind {
-    Allocate = 0,
-    ExtentWrite = 1,
-    TileMap = 2,
-    CreateView = 3,
-    Finalize = 5,
-    BulkExtentWrite = 6,
-    SlabScatter = 7,
-    Fill = 8,
-}
-
 /// `None` is the resting value for instructions that carry no tile map, so it
 /// sorts last rather than first — matching the C++ enum and the default on
 /// `PieLoaderStorageInstrView::tile_kind`.
@@ -637,101 +624,114 @@ pub struct PieLoaderSlabPlacementView {
 
 pub type PieLoaderSlabPlacementSlice = PieLoaderSlice<PieLoaderSlabPlacementView>;
 
-/// The flattened instruction. Rust's `StorageInstr` is a sum type whose variants
-/// carry disjoint payloads; C has no such thing, so this is the union of all
-/// variants with `kind` as the tag and `has_source`/`has_dest` marking which
-/// optional members are live. Members a given `kind` does not use keep their
-/// resting values.
+/// One entry of the plan's instruction stream: an identity, and an operation.
+///
+/// `id` is the schedule's handle on this instruction and is the only thing every
+/// instruction has. Everything else belongs to one operation, and lives inside
+/// it.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct PieLoaderStorageInstrView {
     pub id: u32,
-    pub kind: PieLoaderStorageInstrKind,
-    pub buffer_id: u32,
-    pub source: PieLoaderSourceExtentView,
-    pub has_source: bool,
-    pub dest: PieLoaderDestExtentView,
-    pub has_dest: bool,
-    pub input_buffers: PieLoaderU32Slice,
-    pub output_buffers: PieLoaderU32Slice,
-    pub tile_kind: PieLoaderTileMapKind,
-    /// Rows of the output to transform per launch; `0` means the whole tensor in
-    /// one pass.
-    ///
-    /// This is where the driver's `max_tile_bytes` budget ends up. The budget
-    /// itself does not cross the boundary: the driver stated it in the request,
-    /// the loader answered with a row count in `backend::lower`, and sending the
-    /// question back alongside the answer would only invite the executor to
-    /// re-derive it (§8.1).
-    pub rows_per_tile: u32,
-    /// A transform chain the backend collapsed into one kernel.
-    pub transform_fusion: PieLoaderTransformFusion,
-    pub transform_from: PieLoaderQuantScheme,
-    pub transform_to: PieLoaderQuantScheme,
-    pub repack_layout: PieLoaderRepackLayout,
-    pub row_map: PieLoaderRowMap,
-    pub transform_batch: u32,
-    pub transform_source_rows: u32,
-    pub transform_source_row_offset: u32,
-    pub transform_target_rows: u32,
-    pub transform_valid_rows: u32,
-    pub transform_source_stride_cols: u32,
-    pub transform_source_col_offset: u32,
-    pub transform_source_cols: u32,
-    pub transform_target_cols: u32,
-    pub transform_scratch_bytes: u64,
-    /// Source tensor holding this transform's input block scales, or
-    /// [`PIE_LOADER_NO_TENSOR`].
-    ///
-    /// Index into `PieLoaderPlan::sources`, the same space `source.tensor_id`
-    /// uses, so the executor reaches the scales' name and shape the way it
-    /// reaches the payload's — instead of appending `_scale_inv` to a name and
-    /// hoping the checkpoint agrees.
-    pub transform_metadata_source: u32,
-    pub name: PieLoaderBytes,
-    pub slab_file_id: u32,
-    pub slab_file_offset: u64,
-    pub slab_span_bytes: u64,
-    pub slab_placements: PieLoaderSlabPlacementSlice,
+    pub op: PieLoaderStorageOp,
 }
 
-impl Default for PieLoaderStorageInstrView {
-    fn default() -> Self {
-        Self {
-            id: 0,
-            kind: PieLoaderStorageInstrKind::Allocate,
-            buffer_id: PIE_LOADER_NO_BUFFER,
-            source: PieLoaderSourceExtentView::default(),
-            has_source: false,
-            dest: PieLoaderDestExtentView::default(),
-            has_dest: false,
-            input_buffers: PieLoaderU32Slice::default(),
-            output_buffers: PieLoaderU32Slice::default(),
-            tile_kind: PieLoaderTileMapKind::None,
-            rows_per_tile: 0,
-            transform_fusion: PieLoaderTransformFusion::None,
-            transform_from: PieLoaderQuantScheme::None,
-            transform_to: PieLoaderQuantScheme::None,
-            repack_layout: PieLoaderRepackLayout::None,
-            row_map: PieLoaderRowMap::Identity,
-            transform_batch: 0,
-            transform_source_rows: 0,
-            transform_source_row_offset: 0,
-            transform_target_rows: 0,
-            transform_valid_rows: 0,
-            transform_source_stride_cols: 0,
-            transform_source_col_offset: 0,
-            transform_source_cols: 0,
-            transform_target_cols: 0,
-            transform_scratch_bytes: 0,
-            transform_metadata_source: PIE_LOADER_NO_TENSOR,
-            name: PieLoaderBytes::default(),
-            slab_file_id: PIE_LOADER_NO_BUFFER,
-            slab_file_offset: 0,
-            slab_span_bytes: 0,
-            slab_placements: PieLoaderSlabPlacementSlice::default(),
-        }
-    }
+/// What an instruction does, as a tagged union carrying only that operation's
+/// operands.
+///
+/// This mirrors `crate::plan::StorageInstr` variant for variant. It was a flat
+/// struct of 32 members with a `kind` tag until every reader had grown a
+/// defence against the members that tag left meaningless: `if (!instr.has_source
+/// || !instr.has_dest)` in three executors, `inputs.size() != 1` around a
+/// `CreateView` whose input count is one by construction, and a comment in
+/// `ffi::view` explaining that a resting `source` "would look like a valid
+/// reference to file 0". Those are invariants a union states and a product type
+/// can only apologise for.
+///
+/// The discriminants are the wire tag and are written out for the same reason
+/// the mirror enums' are — 4 is absent because a retired instruction had it, and
+/// renumbering to close the gap would silently move six others.
+#[repr(C, u32)]
+#[derive(Clone, Copy, Debug)]
+pub enum PieLoaderStorageOp {
+    Allocate {
+        buffer_id: u32,
+    } = 0,
+    ExtentWrite {
+        source: PieLoaderSourceExtentView,
+        dest: PieLoaderDestExtentView,
+    } = 1,
+    TileMap {
+        tile_kind: PieLoaderTileMapKind,
+        /// A tile map reads a checkpoint tensor, or transforms a buffer already
+        /// on the device. `has_source` says which; the other seven operations no
+        /// longer have to carry the question.
+        source: PieLoaderSourceExtentView,
+        has_source: bool,
+        dest: PieLoaderDestExtentView,
+        has_dest: bool,
+        input_buffers: PieLoaderU32Slice,
+        output_buffers: PieLoaderU32Slice,
+        /// Rows of the output to transform per launch; `0` means the whole
+        /// tensor in one pass.
+        ///
+        /// This is where the driver's `max_tile_bytes` budget ends up. The
+        /// budget itself does not cross the boundary: the driver stated it in
+        /// the request, the loader answered with a row count in
+        /// `backend::lower`, and sending the question back alongside the answer
+        /// would only invite the executor to re-derive it (§8.1).
+        rows_per_tile: u32,
+        /// A transform chain the backend collapsed into one kernel.
+        transform_fusion: PieLoaderTransformFusion,
+        transform_from: PieLoaderQuantScheme,
+        transform_to: PieLoaderQuantScheme,
+        repack_layout: PieLoaderRepackLayout,
+        row_map: PieLoaderRowMap,
+        transform_batch: u32,
+        transform_source_rows: u32,
+        transform_source_row_offset: u32,
+        transform_target_rows: u32,
+        transform_valid_rows: u32,
+        transform_source_stride_cols: u32,
+        transform_source_col_offset: u32,
+        transform_source_cols: u32,
+        transform_target_cols: u32,
+        transform_scratch_bytes: u64,
+        /// Source tensor holding this transform's input block scales, or
+        /// [`PIE_LOADER_NO_TENSOR`].
+        ///
+        /// Index into `PieLoaderPlan::sources`, the same space
+        /// `source.tensor_id` uses, so the executor reaches the scales' name and
+        /// shape the way it reaches the payload's — instead of appending
+        /// `_scale_inv` to a name and hoping the checkpoint agrees.
+        transform_metadata_source: u32,
+    } = 2,
+    CreateView {
+        input_buffer: u32,
+        output_buffer: u32,
+        view: PieLoaderDestExtentView,
+    } = 3,
+    Finalize {
+        buffer_id: u32,
+        name: PieLoaderBytes,
+    } = 5,
+    /// The destination is an offset into the persistent arena, not a buffer.
+    /// The flat form had to fabricate a rank-1 `dest` extent per instruction —
+    /// an arena allocation whose only content the executor ever read was
+    /// `dest.offset`.
+    BulkExtentWrite {
+        source: PieLoaderSourceExtentView,
+        dest_offset: u64,
+    } = 6,
+    SlabScatter {
+        file_id: u32,
+        file_offset: u64,
+        span_bytes: u64,
+        placements: PieLoaderSlabPlacementSlice,
+    } = 7,
+    Fill {
+        buffer_id: u32,
+    } = 8,
 }
 
 pub type PieLoaderStorageInstrSlice = PieLoaderSlice<PieLoaderStorageInstrView>;

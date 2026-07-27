@@ -33,54 +33,15 @@ exclude = [
   "HOST_TILE_MAP_MASK",
   "FUSION_FP8_TO_MXFP4",
 ]
-include = [
-  "PieLoaderBackendKind",
-  "PieLoaderBufferDeclSlice",
-  "PieLoaderBufferDeclView",
-  "PieLoaderBytes",
-  "PieLoaderCheckpoint",
-  "PieLoaderCheckpointFileSlice",
-  "PieLoaderCheckpointFileView",
-  "PieLoaderCheckpointFormat",
-  "PieLoaderContractRequest",
-  "PieLoaderDType",
-  "PieLoaderDestExtentView",
-  "PieLoaderDiagnostic",
-  "PieLoaderDiagnostics",
-  "PieLoaderDimSpecSlice",
-  "PieLoaderDimSpecView",
-  "PieLoaderEncodingKind",
-  "PieLoaderExprKind",
-  "PieLoaderI64Slice",
-  "PieLoaderMemoryPlanView",
-  "PieLoaderOptDType",
-  "PieLoaderOptimizerPassStatsSlice",
-  "PieLoaderOptimizerPassStatsView",
-  "PieLoaderOptimizerReportView",
-  "PieLoaderPlan",
-  "PieLoaderQuantScheme",
-  "PieLoaderRawTensorSlice",
-  "PieLoaderRawTensorView",
-  "PieLoaderRepackLayout",
-  "PieLoaderRowMap",
-  "PieLoaderSeverity",
-  "PieLoaderSlabPlacementSlice",
-  "PieLoaderSlabPlacementView",
-  "PieLoaderSourceExtentView",
-  "PieLoaderSourceTensorSlice",
-  "PieLoaderSourceTensorView",
-  "PieLoaderStatus",
-  "PieLoaderStorageInstrKind",
-  "PieLoaderStorageInstrSlice",
-  "PieLoaderStorageInstrView",
-  "PieLoaderStridedExtentView",
-  "PieLoaderTargetSpec",
-  "PieLoaderTargetView",
-  "PieLoaderTensorDeclSlice",
-  "PieLoaderTensorDeclView",
-  "PieLoaderTileMapKind",
-  "PieLoaderU32Slice",
-]
+# cbindgen's `export.include` is *additive*: it forces items into the header
+# that are not otherwise reachable. It is not a filter, and every type that some
+# exported struct has a field of arrives on its own. This list was 46 names, 45
+# of which said nothing — removing them leaves the header byte-identical.
+#
+# `PieLoaderExprKind` is the one that has to be named. It is the tag on a
+# contract node, which the *driver* writes and `ffi::contract::read_expr` reads,
+# so no exported struct holds one and cbindgen has no path to it.
+include = ["PieLoaderExprKind"]
 
 [enum]
 prefix_with_name = false

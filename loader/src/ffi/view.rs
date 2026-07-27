@@ -97,28 +97,40 @@ pub(super) unsafe fn plan_view(
 
     let mut finalized = Vec::new();
     let mut reads = Vec::new();
+    // Which instructions read a file used to be a question about resting
+    // values: `source` was present on all of them and meaningful on three, and
+    // `slab_file_id` was tested against a sentinel on every instruction because
+    // only one kind could ever set it. The operation now says so itself.
     for instr in instrs {
-        match instr.kind {
-            PieLoaderStorageInstrKind::Finalize => finalized.push(
-                unsafe { as_str(&instr.name, "instr.name") }
+        match &instr.op {
+            PieLoaderStorageOp::Finalize { name, .. } => finalized.push(
+                unsafe { as_str(name, "instr.name") }
                     .map_err(|err| format!("instruction {}: {err}", instr.id))?,
             ),
-            // Only the reading instructions carry a meaningful `source`; the
-            // rest leave it at its zero default, which would look like a valid
-            // reference to file 0.
-            PieLoaderStorageInstrKind::ExtentWrite
-            | PieLoaderStorageInstrKind::BulkExtentWrite
-            | PieLoaderStorageInstrKind::TileMap => reads.push(crate::verify::ReadView {
-                instr: instr.id,
-                file_id: instr.source.file_id,
-            }),
+            PieLoaderStorageOp::ExtentWrite { source, .. }
+            | PieLoaderStorageOp::BulkExtentWrite { source, .. } => {
+                reads.push(crate::verify::ReadView {
+                    instr: instr.id,
+                    file_id: source.file_id,
+                });
+            }
+            PieLoaderStorageOp::TileMap {
+                source, has_source, ..
+            } => {
+                if *has_source {
+                    reads.push(crate::verify::ReadView {
+                        instr: instr.id,
+                        file_id: source.file_id,
+                    });
+                }
+            }
+            PieLoaderStorageOp::SlabScatter { file_id, .. } => {
+                reads.push(crate::verify::ReadView {
+                    instr: instr.id,
+                    file_id: *file_id,
+                });
+            }
             _ => {}
-        }
-        if instr.slab_file_id != PIE_LOADER_NO_BUFFER {
-            reads.push(crate::verify::ReadView {
-                instr: instr.id,
-                file_id: instr.slab_file_id,
-            });
         }
     }
 

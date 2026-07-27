@@ -12,6 +12,23 @@ use super::types::*;
 use crate::plan::*;
 use crate::types::*;
 
+/// Bind an instruction's operands, asserting the operation it is.
+///
+/// The flat form let a test read `instr.transform_batch` on an `Allocate` and
+/// see 0; here that does not compile, so a test that names the wrong operation
+/// says so instead of quietly passing.
+macro_rules! operands {
+    ($instr:expr, $variant:ident { $($field:ident),* $(,)? }) => {
+        match &$instr.op {
+            PieLoaderStorageOp::$variant { $($field,)* .. } => ($($field,)*),
+            other => panic!(
+                "expected {}, found {other:?}",
+                stringify!($variant)
+            ),
+        }
+    };
+}
+
 fn target() -> StorageTarget {
     StorageTarget {
         backend: BackendKind::Cuda,
@@ -450,35 +467,28 @@ fn optional_buffer_fields_become_explicit_flags() {
 }
 
 #[test]
-fn allocate_and_release_carry_only_a_buffer() {
+fn allocate_carries_only_a_buffer() {
     let plan = plan_with_every_instr();
     with_plan(&plan, |pod| {
         let instrs = unsafe { view::instrs(pod) };
-        let alloc = &instrs[0];
-        assert_eq!(alloc.kind, PieLoaderStorageInstrKind::Allocate);
-        assert_eq!(alloc.buffer_id, 0);
-        assert!(!alloc.has_source);
-        assert!(!alloc.has_dest);
-        assert_eq!(alloc.tile_kind, PieLoaderTileMapKind::None);
+        let (buffer_id,) = operands!(&instrs[0], Allocate { buffer_id });
+        assert_eq!(*buffer_id, 0);
     });
 }
 
 #[test]
-fn extent_write_republishes_dest_buffer_as_instruction_buffer() {
+fn extent_write_carries_both_sides_unconditionally() {
     let plan = plan_with_every_instr();
     with_plan(&plan, |pod| {
         let write = &unsafe { view::instrs(pod) }[1];
-        assert_eq!(write.kind, PieLoaderStorageInstrKind::ExtentWrite);
-        assert!(write.has_source);
-        assert!(write.has_dest);
-        assert_eq!(write.dest.buffer_id, 9);
-        assert_eq!(write.buffer_id, 9);
-        assert_eq!(write.source.file_id, 0);
-        assert_eq!(write.source.tensor_id, 7);
-        assert_eq!(write.source.span_bytes, 4096);
-        assert_eq!(write.source.stride.element_bytes, 2);
+        let (source, dest) = operands!(write, ExtentWrite { source, dest });
+        assert_eq!(dest.buffer_id, 9);
+        assert_eq!(source.file_id, 0);
+        assert_eq!(source.tensor_id, 7);
+        assert_eq!(source.span_bytes, 4096);
+        assert_eq!(source.stride.element_bytes, 2);
         assert_eq!(
-            unsafe { view::dims(&write.source.stride.dims) },
+            unsafe { view::dims(&source.stride.dims) },
             &[PieLoaderDimSpecView {
                 count: 4,
                 src_stride: 8,
@@ -486,7 +496,7 @@ fn extent_write_republishes_dest_buffer_as_instruction_buffer() {
             }]
         );
         assert_eq!(
-            unsafe { view::dims(&write.dest.stride.dims) },
+            unsafe { view::dims(&dest.stride.dims) },
             &[PieLoaderDimSpecView {
                 count: 4,
                 src_stride: 16,
@@ -496,46 +506,50 @@ fn extent_write_republishes_dest_buffer_as_instruction_buffer() {
     });
 }
 
-/// The one conversion with no counterpart in the Rust IR: `BulkExtentWrite`
-/// carries a bare `dest_offset`, and the executor reads a `DestExtent`. The
-/// synthesized extent must be a flat byte run against the sentinel buffer, or an
-/// arena-relative write is silently reinterpreted as buffer-relative.
+/// A bulk write's destination is an arena offset, and now says so.
+///
+/// The flat form had no way to express that: every instruction carried a
+/// `DestExtent`, so this one fabricated a rank-1 byte run against the sentinel
+/// buffer — an arena allocation per instruction whose only field the executor
+/// read was `offset`. Getting the sentinel wrong would have reinterpreted an
+/// arena-relative write as buffer-relative, which is why that fabrication used
+/// to need a test of its own.
 #[test]
-fn bulk_extent_write_synthesizes_a_flat_arena_relative_dest() {
+fn bulk_extent_write_carries_a_bare_arena_offset() {
     let plan = plan_with_every_instr();
     with_plan(&plan, |pod| {
         let bulk = &unsafe { view::instrs(pod) }[2];
-        assert_eq!(bulk.kind, PieLoaderStorageInstrKind::BulkExtentWrite);
-        assert!(bulk.has_source);
-        assert!(bulk.has_dest);
-        assert_eq!(bulk.dest.buffer_id, PIE_LOADER_NO_BUFFER);
-        assert_eq!(bulk.buffer_id, PIE_LOADER_NO_BUFFER);
-        assert_eq!(bulk.dest.offset, 4096);
-        assert_eq!(bulk.dest.stride.base_offset, 0);
-        assert_eq!(bulk.dest.stride.element_bytes, 1);
-        assert_eq!(
-            unsafe { view::dims(&bulk.dest.stride.dims) },
-            &[PieLoaderDimSpecView {
-                count: 65536,
-                src_stride: 1,
-                dst_stride: 1,
-            }]
+        let (source, dest_offset) = operands!(
+            bulk,
+            BulkExtentWrite {
+                source,
+                dest_offset
+            }
         );
+        assert_eq!(*dest_offset, 4096);
+        assert_eq!(source.span_bytes, 65536);
     });
 }
 
 #[test]
-fn slab_scatter_carries_placements_and_no_buffer() {
+fn slab_scatter_carries_placements() {
     let plan = plan_with_every_instr();
     with_plan(&plan, |pod| {
         let slab = &unsafe { view::instrs(pod) }[3];
-        assert_eq!(slab.kind, PieLoaderStorageInstrKind::SlabScatter);
-        assert_eq!(slab.slab_file_id, 0);
-        assert_eq!(slab.slab_file_offset, 128);
-        assert_eq!(slab.slab_span_bytes, 2048);
-        assert_eq!(slab.buffer_id, PIE_LOADER_NO_BUFFER);
+        let (file_id, file_offset, span_bytes, placements) = operands!(
+            slab,
+            SlabScatter {
+                file_id,
+                file_offset,
+                span_bytes,
+                placements,
+            }
+        );
+        assert_eq!(*file_id, 0);
+        assert_eq!(*file_offset, 128);
+        assert_eq!(*span_bytes, 2048);
         assert_eq!(
-            unsafe { view::slabs(&slab.slab_placements) },
+            unsafe { view::slabs(placements) },
             &[
                 PieLoaderSlabPlacementView {
                     src_offset: 0,
@@ -553,37 +567,84 @@ fn slab_scatter_carries_placements_and_no_buffer() {
 }
 
 #[test]
-fn tile_map_flattens_transform_and_takes_first_output_as_buffer() {
+fn tile_map_carries_the_whole_transform() {
     let plan = plan_with_every_instr();
     with_plan(&plan, |pod| {
         let tile = &unsafe { view::instrs(pod) }[4];
-        assert_eq!(tile.kind, PieLoaderStorageInstrKind::TileMap);
-        assert_eq!(tile.tile_kind, PieLoaderTileMapKind::Repack);
-        assert_eq!(unsafe { view::u32s(&tile.input_buffers) }, &[1, 2]);
-        assert_eq!(unsafe { view::u32s(&tile.output_buffers) }, &[11, 12]);
-        assert_eq!(tile.buffer_id, 11);
-        assert_eq!(tile.rows_per_tile, 64);
-        assert_eq!(tile.transform_fusion, PieLoaderTransformFusion::Fp8ToMxfp4);
-        assert_eq!(tile.transform_from, PieLoaderQuantScheme::MlxAffineU4);
-        assert_eq!(tile.transform_to, PieLoaderQuantScheme::Mxfp4E2M1E8M0);
-        assert_eq!(tile.repack_layout, PieLoaderRepackLayout::MarlinMxfp4Weight);
-        assert_eq!(tile.row_map, PieLoaderRowMap::Odd);
-        assert_eq!(tile.transform_batch, 2);
-        assert_eq!(tile.transform_source_rows, 32);
-        assert_eq!(tile.transform_source_row_offset, 4);
-        assert_eq!(tile.transform_target_rows, 64);
-        assert_eq!(tile.transform_valid_rows, 30);
-        assert_eq!(tile.transform_source_stride_cols, 128);
-        assert_eq!(tile.transform_source_col_offset, 8);
-        assert_eq!(tile.transform_source_cols, 96);
-        assert_eq!(tile.transform_target_cols, 112);
-        assert_eq!(tile.transform_scratch_bytes, 8192);
-        assert_eq!(tile.transform_metadata_source, 2);
+        let (
+            tile_kind,
+            input_buffers,
+            output_buffers,
+            rows_per_tile,
+            transform_fusion,
+            transform_from,
+            transform_to,
+            repack_layout,
+            row_map,
+        ) = operands!(
+            tile,
+            TileMap {
+                tile_kind,
+                input_buffers,
+                output_buffers,
+                rows_per_tile,
+                transform_fusion,
+                transform_from,
+                transform_to,
+                repack_layout,
+                row_map,
+            }
+        );
+        assert_eq!(*tile_kind, PieLoaderTileMapKind::Repack);
+        assert_eq!(unsafe { view::u32s(input_buffers) }, &[1, 2]);
+        assert_eq!(unsafe { view::u32s(output_buffers) }, &[11, 12]);
+        assert_eq!(*rows_per_tile, 64);
+        assert_eq!(*transform_fusion, PieLoaderTransformFusion::Fp8ToMxfp4);
+        assert_eq!(*transform_from, PieLoaderQuantScheme::MlxAffineU4);
+        assert_eq!(*transform_to, PieLoaderQuantScheme::Mxfp4E2M1E8M0);
+        assert_eq!(*repack_layout, PieLoaderRepackLayout::MarlinMxfp4Weight);
+        assert_eq!(*row_map, PieLoaderRowMap::Odd);
+
+        let (batch, source_rows, row_offset, target_rows, valid_rows) = operands!(
+            tile,
+            TileMap {
+                transform_batch,
+                transform_source_rows,
+                transform_source_row_offset,
+                transform_target_rows,
+                transform_valid_rows,
+            }
+        );
+        assert_eq!((*batch, *source_rows, *row_offset), (2, 32, 4));
+        assert_eq!((*target_rows, *valid_rows), (64, 30));
+
+        let (stride_cols, col_offset, cols, target_cols, scratch, metadata) = operands!(
+            tile,
+            TileMap {
+                transform_source_stride_cols,
+                transform_source_col_offset,
+                transform_source_cols,
+                transform_target_cols,
+                transform_scratch_bytes,
+                transform_metadata_source,
+            }
+        );
+        assert_eq!((*stride_cols, *col_offset, *cols), (128, 8, 96));
+        assert_eq!((*target_cols, *scratch, *metadata), (112, 8192, 2));
     });
 }
 
+/// A tile map that transforms a buffer already on the device has no source, and
+/// the flag is the only thing that says so.
+///
+/// This is the one optional operand the union keeps, because it is genuinely
+/// optional for this operation and for no other. It used to be optional for all
+/// eight, which is how `ffi::view` came to record a checkpoint read of file 0
+/// for every device-side transform: the resting `SourceExtentView` has
+/// `file_id == 0`, and nothing distinguished that from a real read of the first
+/// file.
 #[test]
-fn tile_map_without_outputs_keeps_the_sentinel_buffer() {
+fn a_device_side_tile_map_has_no_source() {
     let mut plan = LoadPlan::empty(target());
     plan.instrs.push(StorageInstr::TileMap {
         id: InstrId(0),
@@ -601,35 +662,46 @@ fn tile_map_without_outputs_keeps_the_sentinel_buffer() {
     plan.schedule = vec![InstrId(0)];
     with_plan(&plan, |pod| {
         let tile = &unsafe { view::instrs(pod) }[0];
-        assert_eq!(tile.buffer_id, PIE_LOADER_NO_BUFFER);
-        assert!(!tile.has_source);
-        assert!(!tile.has_dest);
-        assert_eq!(unsafe { view::u32s(&tile.output_buffers) }, &[] as &[u32]);
-        assert_eq!(tile.transform_from, PieLoaderQuantScheme::None);
-        assert_eq!(tile.transform_to, PieLoaderQuantScheme::None);
+        let (has_source, has_dest, output_buffers, transform_from, transform_to) = operands!(
+            tile,
+            TileMap {
+                has_source,
+                has_dest,
+                output_buffers,
+                transform_from,
+                transform_to,
+            }
+        );
+        assert!(!has_source);
+        assert!(!has_dest);
+        assert_eq!(unsafe { view::u32s(output_buffers) }, &[] as &[u32]);
+        assert_eq!(*transform_from, PieLoaderQuantScheme::None);
+        assert_eq!(*transform_to, PieLoaderQuantScheme::None);
     });
 }
 
 #[test]
-fn scalar_operands_are_published_as_one_element_runs() {
+fn create_view_and_finalize_name_their_operands() {
     let plan = plan_with_every_instr();
     with_plan(&plan, |pod| {
         let instrs = unsafe { view::instrs(pod) };
 
-        let view_instr = &instrs[5];
-        assert_eq!(view_instr.kind, PieLoaderStorageInstrKind::CreateView);
-        assert_eq!(unsafe { view::u32s(&view_instr.input_buffers) }, &[0]);
-        assert_eq!(unsafe { view::u32s(&view_instr.output_buffers) }, &[13]);
-        assert_eq!(view_instr.buffer_id, 13);
-        assert!(view_instr.has_dest);
-        assert_eq!(view_instr.dest.buffer_id, 13);
+        let (input_buffer, output_buffer, view_extent) = operands!(
+            &instrs[5],
+            CreateView {
+                input_buffer,
+                output_buffer,
+                view,
+            }
+        );
+        assert_eq!(*input_buffer, 0);
+        assert_eq!(*output_buffer, 13);
+        assert_eq!(view_extent.buffer_id, 13);
 
-        let finalize = &instrs[6];
-        assert_eq!(finalize.kind, PieLoaderStorageInstrKind::Finalize);
-        assert_eq!(finalize.buffer_id, 0);
-        assert_eq!(unsafe { view::u32s(&finalize.output_buffers) }, &[0]);
+        let (buffer_id, name) = operands!(&instrs[6], Finalize { buffer_id, name });
+        assert_eq!(*buffer_id, 0);
         assert_eq!(
-            unsafe { view::bytes(&finalize.name) },
+            unsafe { view::bytes(name) },
             "model.layers.0.mlp.gate_proj.weight"
         );
     });
@@ -677,8 +749,9 @@ fn nested_slices_survive_arena_growth() {
         assert_eq!(instrs.len(), 256);
         for (i, instr) in instrs.iter().enumerate() {
             let i = i as u32;
-            assert_eq!(unsafe { view::bytes(&instr.name) }, format!("tensor.{i}"));
-            assert_eq!(unsafe { view::u32s(&instr.output_buffers) }, &[i]);
+            let (buffer_id, name) = operands!(instr, Finalize { buffer_id, name });
+            assert_eq!(unsafe { view::bytes(name) }, format!("tensor.{i}"));
+            assert_eq!(*buffer_id, i);
         }
     });
 }
@@ -1349,4 +1422,187 @@ fn a_contract_request_with_no_checkpoint_is_rejected() {
 #[test]
 fn closing_a_null_checkpoint_is_a_no_op() {
     unsafe { super::entry::pie_loader_close_checkpoint(std::ptr::null_mut()) };
+}
+
+/// The mirror enums exist to pin the C discriminants, and nothing checked that.
+///
+/// `PieLoaderDType` is not `DType` written twice. It is `DType`'s *wire
+/// numbering*, held still while the Rust enum is free to be reordered for
+/// reading. `766e9b029` is the proof: it inserted `E8M0` at position 5 of
+/// `DType`, next to the other float formats where it belongs, and appended it
+/// at 12 here, because 5 through 11 were already spoken for by drivers. The
+/// `From` impls map by *name*, so that divergence is not a bug; it is the
+/// mechanism.
+///
+/// The compiler already refuses a variant added to the Rust enum and not to the
+/// mirror — the `From` match stops being exhaustive. What it cannot see is
+/// someone tidying the mirror to match the original, which renumbers seven
+/// dtypes under every driver built against the old header and compiles
+/// perfectly. These assertions are the numbering itself, written down. A
+/// variant appended with the next free number needs a line added here; an
+/// existing line that has to *change* means the ABI broke.
+#[test]
+fn mirror_enum_discriminants_are_pinned() {
+    // PieLoaderBackendKind
+    assert_eq!(PieLoaderBackendKind::Cuda as u32, 0);
+    assert_eq!(PieLoaderBackendKind::Metal as u32, 1);
+    assert_eq!(PieLoaderBackendKind::Unknown as u32, 255);
+
+    // PieLoaderDType
+    assert_eq!(PieLoaderDType::F32 as u32, 0);
+    assert_eq!(PieLoaderDType::F16 as u32, 1);
+    assert_eq!(PieLoaderDType::BF16 as u32, 2);
+    assert_eq!(PieLoaderDType::F8E4M3 as u32, 3);
+    assert_eq!(PieLoaderDType::F8E5M2 as u32, 4);
+    assert_eq!(PieLoaderDType::I32 as u32, 5);
+    assert_eq!(PieLoaderDType::I16 as u32, 6);
+    assert_eq!(PieLoaderDType::I8 as u32, 7);
+    assert_eq!(PieLoaderDType::U32 as u32, 8);
+    assert_eq!(PieLoaderDType::U16 as u32, 9);
+    assert_eq!(PieLoaderDType::U8 as u32, 10);
+    assert_eq!(PieLoaderDType::Bool as u32, 11);
+    assert_eq!(PieLoaderDType::E8M0 as u32, 12);
+
+    // PieLoaderEncodingKind
+    assert_eq!(PieLoaderEncodingKind::Raw as u32, 0);
+    assert_eq!(PieLoaderEncodingKind::Quant as u32, 1);
+
+    // PieLoaderQuantScheme
+    assert_eq!(PieLoaderQuantScheme::None as u32, 0);
+    assert_eq!(PieLoaderQuantScheme::Fp8E4M3 as u32, 1);
+    assert_eq!(PieLoaderQuantScheme::Fp8E5M2 as u32, 2);
+    assert_eq!(PieLoaderQuantScheme::Int8Symmetric as u32, 3);
+    assert_eq!(PieLoaderQuantScheme::Int8Asymmetric as u32, 4);
+    assert_eq!(PieLoaderQuantScheme::AwqInt4 as u32, 5);
+    assert_eq!(PieLoaderQuantScheme::GptqInt4 as u32, 6);
+    assert_eq!(PieLoaderQuantScheme::Mxfp4E2M1E8M0 as u32, 7);
+    assert_eq!(PieLoaderQuantScheme::MlxAffineU4 as u32, 8);
+    assert_eq!(PieLoaderQuantScheme::GgufQ4_0 as u32, 9);
+    assert_eq!(PieLoaderQuantScheme::GgufQ4K as u32, 10);
+    assert_eq!(PieLoaderQuantScheme::GgufQ5_0 as u32, 11);
+    assert_eq!(PieLoaderQuantScheme::GgufQ5K as u32, 12);
+    assert_eq!(PieLoaderQuantScheme::GgufQ8_0 as u32, 13);
+
+    // PieLoaderRepackLayout
+    assert_eq!(PieLoaderRepackLayout::None as u32, 0);
+    assert_eq!(PieLoaderRepackLayout::MarlinMxfp4Weight as u32, 1);
+    assert_eq!(PieLoaderRepackLayout::MarlinMxfp4Scale as u32, 2);
+    assert_eq!(PieLoaderRepackLayout::DenseRowGather as u32, 3);
+
+    // PieLoaderRowMap
+    assert_eq!(PieLoaderRowMap::Identity as u32, 0);
+    assert_eq!(PieLoaderRowMap::Even as u32, 1);
+    assert_eq!(PieLoaderRowMap::Odd as u32, 2);
+
+    // PieLoaderTileMapKind
+    assert_eq!(PieLoaderTileMapKind::Cast as u32, 0);
+    assert_eq!(PieLoaderTileMapKind::Decode as u32, 1);
+    assert_eq!(PieLoaderTileMapKind::Encode as u32, 2);
+    assert_eq!(PieLoaderTileMapKind::Transcode as u32, 3);
+    assert_eq!(PieLoaderTileMapKind::Reblock as u32, 4);
+    assert_eq!(PieLoaderTileMapKind::Repack as u32, 6);
+    assert_eq!(PieLoaderTileMapKind::None as u32, 7);
+
+    // PieLoaderTransformFusion
+    assert_eq!(PieLoaderTransformFusion::None as u32, 0);
+    assert_eq!(PieLoaderTransformFusion::Fp8ToMxfp4 as u32, 1);
+
+    // PieLoaderQuantGranularity
+    assert_eq!(PieLoaderQuantGranularity::PerChannel as u32, 0);
+    assert_eq!(PieLoaderQuantGranularity::PerGroup as u32, 1);
+
+    // PieLoaderScaleForm
+    assert_eq!(PieLoaderScaleForm::RawE8M0 as u32, 0);
+    assert_eq!(PieLoaderScaleForm::F32Factors as u32, 1);
+
+    // PieLoaderCheckpointFormat
+    assert_eq!(PieLoaderCheckpointFormat::Safetensors as u32, 0);
+    assert_eq!(PieLoaderCheckpointFormat::Gguf as u32, 1);
+    assert_eq!(PieLoaderCheckpointFormat::Unknown as u32, 2);
+}
+
+/// The operation tag is the first four bytes of `PieLoaderStorageOp`, and this
+/// reads them rather than a second enum that claims to agree.
+///
+/// The old flat form had a separate `PieLoaderStorageInstrKind`, so a test could
+/// only assert that *it* was numbered as intended and trust the marshaller to
+/// write it. Here the numbering and the wire value are the same thing, so the
+/// assertion is against the bytes a driver will actually switch on.
+///
+/// 4 is missing on purpose. A retired instruction had it, and drivers built
+/// against a header that said `Finalize = 5` are the reason it stays missing.
+#[test]
+fn storage_op_tags_are_the_wire_values() {
+    fn tag(op: PieLoaderStorageOp) -> u32 {
+        // `#[repr(C, u32)]` puts the discriminant first, which is the whole
+        // reason the driver may switch on it.
+        unsafe { *(&raw const op).cast::<u32>() }
+    }
+    use PieLoaderStorageOp as Op;
+
+    let source = PieLoaderSourceExtentView::default();
+    let dest = PieLoaderDestExtentView::default();
+    assert_eq!(tag(Op::Allocate { buffer_id: 0 }), 0);
+    assert_eq!(tag(Op::ExtentWrite { source, dest }), 1);
+    assert_eq!(
+        tag(Op::TileMap {
+            tile_kind: PieLoaderTileMapKind::None,
+            source,
+            has_source: false,
+            dest,
+            has_dest: false,
+            input_buffers: PieLoaderU32Slice::default(),
+            output_buffers: PieLoaderU32Slice::default(),
+            rows_per_tile: 0,
+            transform_fusion: PieLoaderTransformFusion::None,
+            transform_from: PieLoaderQuantScheme::None,
+            transform_to: PieLoaderQuantScheme::None,
+            repack_layout: PieLoaderRepackLayout::None,
+            row_map: PieLoaderRowMap::Identity,
+            transform_batch: 0,
+            transform_source_rows: 0,
+            transform_source_row_offset: 0,
+            transform_target_rows: 0,
+            transform_valid_rows: 0,
+            transform_source_stride_cols: 0,
+            transform_source_col_offset: 0,
+            transform_source_cols: 0,
+            transform_target_cols: 0,
+            transform_scratch_bytes: 0,
+            transform_metadata_source: PIE_LOADER_NO_TENSOR,
+        }),
+        2
+    );
+    assert_eq!(
+        tag(Op::CreateView {
+            input_buffer: 0,
+            output_buffer: 0,
+            view: dest,
+        }),
+        3
+    );
+    assert_eq!(
+        tag(Op::Finalize {
+            buffer_id: 0,
+            name: PieLoaderBytes::default(),
+        }),
+        5
+    );
+    assert_eq!(
+        tag(Op::BulkExtentWrite {
+            source,
+            dest_offset: 0,
+        }),
+        6
+    );
+    assert_eq!(
+        tag(Op::SlabScatter {
+            file_id: 0,
+            file_offset: 0,
+            span_bytes: 0,
+            placements: PieLoaderSlabPlacementSlice::default(),
+        }),
+        7
+    );
+    assert_eq!(tag(Op::Fill { buffer_id: 0 }), 8);
 }
