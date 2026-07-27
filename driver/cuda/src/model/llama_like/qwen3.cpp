@@ -66,49 +66,6 @@ const DeviceTensor* bind_projection_or_fused_view(
 
 namespace {
 
-DeviceTensor pack_projections_dim0(
-    const std::vector<const DeviceTensor*>& parts)
-{
-    std::int64_t rows = 0;
-    const std::int64_t cols = parts.front()->shape()[1];
-    for (const DeviceTensor* t : parts) {
-        if (t->dtype() != DType::BF16 || t->shape().size() != 2 ||
-            t->shape()[1] != cols) {
-            throw std::runtime_error("qwen3: cannot pack mismatched projections");
-        }
-        rows += t->shape()[0];
-    }
-    DeviceTensor packed = DeviceTensor::allocate(DType::BF16, {rows, cols});
-    auto* dst = static_cast<std::uint8_t*>(packed.data());
-    for (const DeviceTensor* t : parts) {
-        const std::size_t bytes =
-            static_cast<std::size_t>(t->shape()[0]) *
-            static_cast<std::size_t>(cols) * sizeof(std::uint16_t);
-        CUDA_CHECK(cudaMemcpy(dst, t->data(), bytes, cudaMemcpyDeviceToDevice));
-        dst += bytes;
-    }
-    return packed;
-}
-
-// Bind-time projection packing.
-//
-// The load planner only emits packed projections when `tp_size == 1`
-// (`abi.rs: add_dense_fused_projection_joins`): its join concatenates the RAW
-// weights, and a naive row-shard of that concatenation would straddle the
-// q/k/v boundaries. Packing HERE is shard-then-pack instead — under TP the
-// bound q/k/v are already this rank's shards, so concatenating them yields
-// exactly `[Hq/T + 2*Hk/T, H]`. Verified byte-identical to the planner's join
-// at TP=1 (0 differing elements of 4,194,304).
-//
-// Without this every TP layer ran q/k/v as three narrow gemms and gate/up as
-// two, ~86k extra gemm launches per run at 512-wide, with the tile choice
-// dragged down to 64x64. Measured on Qwen3-0.6B, 2xA100, TP=2, 512-wide x 512
-// tokens: 42,276 -> 45,132 tok/s (+6.8%), which clears vLLM's 45,038.
-//
-// The wide gemm rounds differently from three narrow ones — measured max 1 ULP
-// of bf16 on <0.1% of elements, q bit-identical, only k/v move, a relative
-// error equal to bf16's own epsilon. That is decomposition noise, and TP=1 has
-// always taken the packed path anyway.
 }  // namespace
 
 Qwen3Weights bind_llama_like(const LoadedModel& engine, bool verbose) {
@@ -130,19 +87,20 @@ Qwen3Weights bind_llama_like(const LoadedModel& engine, bool verbose) {
     }
 
     w.layers.resize(static_cast<std::size_t>(cfg.num_hidden_layers));
-    w.owned_qkv_fused.reserve(static_cast<std::size_t>(cfg.num_hidden_layers));
-    w.owned_gate_up_fused.reserve(
-        static_cast<std::size_t>(cfg.num_hidden_layers));
     for (int i = 0; i < cfg.num_hidden_layers; ++i) {
         const std::string p = "model.layers." + std::to_string(i) + ".";
         auto& L = w.layers[i];
         L.attn_norm = &must(engine, p + "input_layernorm.weight");
         L.mlp_norm  = &must(engine, p + "post_attention_layernorm.weight");
 
+        // Row extents of this rank's share. The contract shards each
+        // projection before joining it, so the fused buffer holds local bands
+        // and the views carved out of it must be offset in local rows.
+        const int T = std::max(1, engine.distributed().tp_size);
         const int H = cfg.hidden_size;
-        const int Hq = cfg.num_attention_heads * cfg.head_dim;
-        const int Hk = cfg.num_key_value_heads * cfg.head_dim;
-        const int I = cfg.intermediate_size;
+        const int Hq = cfg.num_attention_heads * cfg.head_dim / T;
+        const int Hk = cfg.num_key_value_heads * cfg.head_dim / T;
+        const int I = cfg.intermediate_size / T;
         const std::string qkv_fused_name =
             p + "self_attn.qkv_proj.fused.weight";
         const std::string gate_up_fused_name =
@@ -195,45 +153,16 @@ Qwen3Weights bind_llama_like(const LoadedModel& engine, bool verbose) {
         L.down_proj_quant = engine.quant_meta(p + "mlp.down_proj.weight");
 
         // Use planned packed Q/K/V and gate/up projections when the loader
-        // installed them. Older/unplanned paths may still materialize them
-        // here when the memory guard allows it, so the forward path can issue
-        // one wide gemm per group instead of three or two narrow ones.
+        // installed them, so the forward path can issue one wide gemm per
+        // group instead of three or two narrow ones.
         //
-        // Skipped when any projection in the group is quantized (FP8 /
-        // INT4 paths carry per-weight scales that don't compose across a
-        // concat) or when bf16 is required for the post-load fuse memcpy
-        // and the projection isn't bf16. In both cases the forward path
-        // sees a null `*_fused` pointer and stays on the unfused branch.
-        const bool qkv_quantized =
-            L.q_proj_quant.has_value() || L.k_proj_quant.has_value() ||
-            L.v_proj_quant.has_value();
-        const bool gu_quantized =
-            L.gate_proj_quant.has_value() || L.up_proj_quant.has_value();
-        const bool qkv_bf16 =
-            L.q_proj->dtype() == DType::BF16 &&
-            L.k_proj->dtype() == DType::BF16 &&
-            L.v_proj->dtype() == DType::BF16;
-        const bool gu_bf16 =
-            L.gate_proj->dtype() == DType::BF16 &&
-            L.up_proj->dtype() == DType::BF16;
-        if (!qkv_quantized && qkv_bf16) {
-            if (qkv_fused != nullptr) {
-                L.qkv_proj_fused = qkv_fused;
-            } else {
-                w.owned_qkv_fused.push_back(
-                    pack_projections_dim0({L.q_proj, L.k_proj, L.v_proj}));
-                L.qkv_proj_fused = &w.owned_qkv_fused.back();
-            }
-        }
-        if (!gu_quantized && gu_bf16) {
-            if (gate_up_fused != nullptr) {
-                L.gate_up_proj_fused = gate_up_fused;
-            } else {
-                w.owned_gate_up_fused.push_back(
-                    pack_projections_dim0({L.gate_proj, L.up_proj}));
-                L.gate_up_proj_fused = &w.owned_gate_up_fused.back();
-            }
-        }
+        // Whether a group is fused at all is the contract's call
+        // (`contract.hpp::dense_fused_projection_joins`): it declines
+        // quantized and non-BF16 groups, because per-weight scales do not
+        // compose across a concat. When it declines, the tensor is absent and
+        // the forward path stays on the unfused branch.
+        L.qkv_proj_fused = qkv_fused;
+        L.gate_up_proj_fused = gate_up_fused;
     }
 
     return w;

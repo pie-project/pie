@@ -750,13 +750,21 @@ public:
         for (const FusedCandidate& candidate : candidates) {
             std::vector<Node> parts;
             parts.reserve(candidate.parts.size());
+            std::int64_t rows = 0;
             for (const SourceTensor* raw : candidate.parts) {
                 consumed_.insert(raw->id);
-                parts.push_back(contract_.src(std::string(raw->name)));
+                // Shard each part, then join: q/k/v have different row counts,
+                // so a row-shard of the *concatenation* would cut across the
+                // q/k boundary and hand a rank a mix of two projections.
+                // Sharding first gives every rank its own band of each, and
+                // their join is exactly this rank's fused weight.
+                check_head_granularity(raw->name, shape_of(*raw), ShardAxis{0});
+                parts.push_back(split(contract_.src(std::string(raw->name)), 0));
+                rows += local_extent(raw->shape[0]);
             }
             define(candidate.output_name, contract_.cat(parts, 0),
                    pie_loader::raw(PieLoaderDType::BF16),
-                   std::vector<std::int64_t>{candidate.rows, candidate.cols});
+                   std::vector<std::int64_t>{rows, candidate.cols});
         }
     }
 
@@ -767,7 +775,7 @@ public:
     /// projections separately. A family whose bind path reads q/k/v
     /// individually (Qwen3-MoE, GPT-OSS) simply does not call this.
     void dense_fused_projection_joins() {
-        if (target_.tp_size != 1 || runtime_quant_scheme().has_value()) {
+        if (runtime_quant_scheme().has_value()) {
             return;
         }
         std::vector<FusedCandidate> qkv;
@@ -795,11 +803,13 @@ public:
             return;
         }
 
-        // Fused dense projections replace the original TP1 BF16 tensors, and
-        // the unfused fallback binds non-owning views into the fused buffer, so
+        // Fused dense projections replace the original BF16 tensors, and the
+        // unfused fallback binds non-owning views into the fused buffer, so
         // this is not a persistent duplicate-memory budget. It selects which
         // groups get a fused GEMM: all groups through 8B-class Qwen models, and
-        // QKV-only above that, where gate/up fusion has regressed.
+        // QKV-only above that, where gate/up fusion has regressed. Measured on
+        // whole-checkpoint bytes so a model lands in the same class at every
+        // `tp_size` — it is a proxy for model class, not for device memory.
         constexpr std::uint64_t kBudgetBytes = 10ull * 1024 * 1024 * 1024;
         std::vector<FusedCandidate> chosen;
         if (qkv_bytes + gate_up_bytes <= kBudgetBytes) {
