@@ -142,36 +142,43 @@ Context: a 7B decode step at batch 512 is ~8.5 ms (weight streaming lower bound,
 measured 1,648 GB/s). Today's constrained path adds 8.97 ms — it more than
 doubles the step. The fused path adds 0.198 ms, or 2.3%.
 
-### Example 2: speculative decoding, withdrawn and re-measured
+### Example 2: speculative decoding, withdrawn, re-measured, and now possible
 
-This section used to report XGrammar at 33 ms per outer step against 56 us, a
-594x ratio. It measured the wrong thing on both sides.
+An earlier version of this document claimed 33,367 us against 56 us at batch
+512, k=8. That measured XGrammar filling a bitmask per draft position, which is
+not the API it offers: `traverse_draft_tree` walks the whole tree in one call
+and is flat in `k`. The claim was withdrawn.
 
-On XGrammar's side it filled a bitmask once per draft position, which is not
-how XGrammar verifies drafts. `traverse_draft_tree` takes the whole tree in one
-call, and it is flat in `k`. On our side the number was unreproducible and could
-not have been real, because `DeviceBatch` had no device-side advance at all.
+Until recently we could not do this at all. Verifying a draft means advancing
+through it and then keeping only the prefix the model accepted, and the device
+kept exactly one step of state - enough for the commit to read while overwriting
+it, and nothing beyond. Going back meant reloading from the host matcher, which
+is the round trip the design exists not to make.
 
-Both now exist, so the comparison can be made. Batch 512, one schema, charging
-each engine for the mask at every draft position:
+The advance now writes the state it replaces into a ring and `rollback(k)` puts
+an entry back, with the ring slot held on the device so the advance stays inside
+a CUDA graph - a graph records the arguments it was launched with, so a slot
+passed as a scalar would freeze at whatever it was when the recording was made.
+The history is off by default: one kept step is the size of the live state, 67
+MB at batch 512.
 
-| k | gpugrammar (fill + advance per position) | XGrammar `traverse_draft_tree` |
-|---:|---:|---:|
-| 1 | 104 us | 1,196 us |
-| 4 | 416 us | 1,196 us |
-| 8 | 833 us | 1,232 us |
+Measured against `traverse_draft_tree` on a linear draft, charging ourselves a
+fill and an advance per position and the rollback at the end:
 
-The direction is the opposite of the withdrawn claim. **XGrammar is flat in `k`
-and we are linear**, because it walks the draft tree once with a shared prefix
-while we repeat a full fill and advance per position. We are 11.5x ahead at
-k=1 and 1.5x at k=8; extrapolating, XGrammar wins somewhere around k=12.
+| batch | k=1 | k=4 | k=8 |
+|---:|---:|---:|---:|
+| 128 | 1.75x | 0.55x | 0.33x |
+| 512 | **4.94x** | 1.06x | 0.74x |
 
-Two things are missing before this is a serving result. There is no device-side
-rollback, so what is measured is the forward walk and not a complete
-verification - real speculative decoding accepts a prefix and rewinds the rest.
-And the shared-prefix structure XGrammar exploits is available to us too: the
-draft positions of one sequence differ by one token, so a tree walk would make
-our cost flat in `k` as well. Neither is done.
+We are far better where there is no draft to walk and lose as the draft grows,
+because every position is its own fill and advance while theirs is one walk. The
+crossover is near k=4 at batch 512 and below it at batch 128. Being flat in `k`
+would need the draft tree walked on the device in one launch; that is a real
+possibility and not what this does.
+
+So speculative decoding is not a killer example. It is a capability that was
+missing and now exists, with an honest cost curve that favours the other engine
+past a draft of four.
 
 ## Grammar class decision
 
