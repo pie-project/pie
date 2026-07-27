@@ -51,53 +51,47 @@ __global__ void k_count_kept(
     if (threadIdx.x == 0) counts[r] = total;
 }
 
-__global__ void k_scan_counts(
-    const std::uint32_t* __restrict__ counts,
-    const std::uint32_t* __restrict__ last_page_lens_in,
-    int num_requests,
-    std::uint32_t* __restrict__ page_indptr_out,
-    std::uint32_t* __restrict__ last_page_lens_out) {
-    using Scan = cub::BlockScan<std::uint32_t, kBlock>;
-    __shared__ typename Scan::TempStorage tmp;
-    __shared__ std::uint32_t running;
-    if (threadIdx.x == 0) {
-        running = 0;
-        page_indptr_out[0] = 0;
-    }
-    __syncthreads();
-
-    for (int base = 0; base < num_requests; base += kBlock) {
-        const int r = base + static_cast<int>(threadIdx.x);
-        const std::uint32_t v = (r < num_requests) ? counts[r] : 0u;
-        std::uint32_t excl = 0;
-        std::uint32_t aggregate = 0;
-        Scan(tmp).ExclusiveSum(v, excl, aggregate);
-        if (r < num_requests) {
-            page_indptr_out[r + 1] = running + excl + v;
-            // Invariant 2 keeps the last page last, so the tail length is
-            // carried through verbatim rather than recomputed.
-            last_page_lens_out[r] = last_page_lens_in[r];
-        }
-        __syncthreads();
-        if (threadIdx.x == 0) running += aggregate;
-        __syncthreads();
-    }
-}
-
-__global__ void k_scatter_kept(
+// Scan and scatter fused into one launch. The only thing block `r` needed from
+// the separate scan pass was its own output base -- the exclusive prefix sum of
+// the per-request counts -- and with one block per request that prefix is at
+// most `num_requests` values long, so the block can just add them up itself.
+// Recomputing an O(R) sum per block is far cheaper than the kernel launch it
+// replaces, because this runs once per LAYER per fire.
+__global__ void k_scan_and_scatter(
     const std::uint32_t* __restrict__ page_indices_in,
     const std::uint32_t* __restrict__ page_indptr_in,
+    const std::uint32_t* __restrict__ last_page_lens_in,
     const std::uint8_t* __restrict__ keep,
+    const std::uint32_t* __restrict__ counts,
     std::uint32_t keep_stride,
     int num_requests,
-    const std::uint32_t* __restrict__ page_indptr_out,
+    std::uint32_t* __restrict__ page_indptr_out,
+    std::uint32_t* __restrict__ last_page_lens_out,
     std::uint32_t* __restrict__ page_indices_out) {
     const int r = static_cast<int>(blockIdx.x);
     if (r >= num_requests) return;
     const std::uint32_t beg = page_indptr_in[r];
     const std::uint32_t pages = page_indptr_in[r + 1] - beg;
-    const std::uint32_t out_beg = page_indptr_out[r];
     const std::uint32_t row = static_cast<std::uint32_t>(r) * keep_stride;
+
+    using Reduce = cub::BlockReduce<std::uint32_t, kBlock>;
+    __shared__ typename Reduce::TempStorage red_tmp;
+    std::uint32_t partial = 0;
+    for (int i = static_cast<int>(threadIdx.x); i < r;
+         i += static_cast<int>(blockDim.x)) {
+        partial += counts[i];
+    }
+    const std::uint32_t base_sum = Reduce(red_tmp).Sum(partial);
+    __shared__ std::uint32_t out_beg;
+    if (threadIdx.x == 0) {
+        out_beg = base_sum;
+        if (r == 0) page_indptr_out[0] = 0;
+        page_indptr_out[r + 1] = base_sum + counts[r];
+        // Invariant 2 keeps the last page last, so the tail length is carried
+        // through verbatim rather than recomputed.
+        last_page_lens_out[r] = last_page_lens_in[r];
+    }
+    __syncthreads();
 
     using Scan = cub::BlockScan<std::uint32_t, kBlock>;
     __shared__ typename Scan::TempStorage tmp;
@@ -134,32 +128,21 @@ void launch_compact_page_csr(
     const std::uint32_t* page_indptr_in,
     const std::uint32_t* last_page_lens_in,
     const std::uint8_t* keep,
+    std::uint32_t* scratch_counts,
     std::uint32_t keep_stride,
     int num_requests,
     std::uint32_t* page_indices_out,
     std::uint32_t* page_indptr_out,
     std::uint32_t* last_page_lens_out,
     cudaStream_t stream) {
-    if (num_requests <= 0) return;
-
-    std::uint32_t* counts = nullptr;
-    const std::size_t counts_bytes =
-        static_cast<std::size_t>(num_requests) * sizeof(std::uint32_t);
-    if (cudaMallocAsync(reinterpret_cast<void**>(&counts), counts_bytes,
-                        stream) != cudaSuccess) {
-        return;
-    }
+    if (num_requests <= 0 || scratch_counts == nullptr) return;
 
     k_count_kept<<<num_requests, kBlock, 0, stream>>>(
-        page_indptr_in, keep, keep_stride, num_requests, counts);
-    k_scan_counts<<<1, kBlock, 0, stream>>>(
-        counts, last_page_lens_in, num_requests, page_indptr_out,
-        last_page_lens_out);
-    k_scatter_kept<<<num_requests, kBlock, 0, stream>>>(
-        page_indices_in, page_indptr_in, keep, keep_stride, num_requests,
-        page_indptr_out, page_indices_out);
-
-    cudaFreeAsync(counts, stream);
+        page_indptr_in, keep, keep_stride, num_requests, scratch_counts);
+    k_scan_and_scatter<<<num_requests, kBlock, 0, stream>>>(
+        page_indices_in, page_indptr_in, last_page_lens_in, keep,
+        scratch_counts, keep_stride, num_requests, page_indptr_out,
+        last_page_lens_out, page_indices_out);
 }
 
 }  // namespace pie_cuda_driver::kernels

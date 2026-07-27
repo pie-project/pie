@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cuda_bf16.h>
+
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -62,36 +64,58 @@ struct GroupedLanePageMask {
 };
 
 struct GroupedLaneEnvelopeDevice {
-    const float* env_min;
-    const float* env_max;
+    const __nv_bfloat16* env_min;
+    const __nv_bfloat16* env_max;
     const float* query;
+    // UNSLICED fire page list, plus the device CSR that slices it. See the
+    // comment on `GroupedLaneEnvelope` for why the host must not pre-slice.
     const std::uint32_t* page_ids;
-    std::uint32_t page_count;
-    std::uint32_t scored_pages;
+    const std::uint32_t* page_indptr;
+    const std::uint32_t* last_page_lens;
+    std::uint32_t request;
+    std::uint32_t qo_len;
+    std::uint32_t page_size;
     std::uint32_t num_q_heads;
     std::uint32_t num_kv_heads;
     std::uint32_t head_dim;
-    std::uint32_t reserved;
 };
 
 // Per-lane resolution of the fire's KV geometry, for the `envelope_dot`
 // second-party kernel. Populated only at an attention stage of a program that
 // actually calls it; every other lane leaves `env_min`/`env_max` null and the
 // runtime refuses to launch rather than scoring garbage.
+//
+// The page slice is deliberately NOT resolved here. Under decode envelopes --
+// which is *the* path Quest runs on, since its page table is device-composed --
+// the host page CSR is an upper bound while the device CSR is exact. Slicing on
+// the host would take the base from the bound, so request `r`'s scores would be
+// computed over request `r-1`'s pages; and it would take the count from the
+// bound too, so slots past the request's real page list would be scored as
+// though they were real instead of getting the `-inf` that keeps a top-k
+// consumer away from them. Both are silent. The kernel resolves the slice from
+// `page_indptr` instead, and the host contributes only the *declared slot
+// bound*, which is safe to over-estimate.
 struct GroupedLaneEnvelope {
-    const float* env_min = nullptr;   // [num_pages, num_kv_heads, head_dim]
-    const float* env_max = nullptr;
+    const __nv_bfloat16* env_min = nullptr;   // [num_pages, num_kv_heads, head_dim]
+    const __nv_bfloat16* env_max = nullptr;
     // This lane's query row to score with: the LAST token of the lane, which is
     // the token whose attention the mask will govern.
     const float* query = nullptr;
-    // Device slice of the fire's `kv_page_indices` belonging to this lane.
+    // The fire's whole `kv_page_indices`, and the device CSR that slices it.
     const std::uint32_t* page_ids = nullptr;
-    std::uint32_t page_count = 0;
-    // Pages whose envelope is FINAL as of this hook: the hook fires before the
-    // layer's KV append, so a page the fire is still filling has a stale
-    // envelope. Those pages score +inf (always kept), which is both fail-safe
-    // and exactly Quest's "keep the local window" rule.
-    std::uint32_t scored_pages = 0;
+    const std::uint32_t* page_indptr = nullptr;
+    // Device `kv_last_page_lens`, so the kernel can derive -- exactly -- which
+    // pages have a FINAL envelope. The hook fires before the layer's KV append,
+    // so a page the fire is still filling has a stale envelope; those score
+    // +inf (always kept), which is both fail-safe and exactly Quest's "keep the
+    // local window" rule.
+    const std::uint32_t* last_page_lens = nullptr;
+    std::uint32_t request = 0;
+    std::uint32_t qo_len = 0;
+    std::uint32_t page_size = 0;
+    // Host-declared upper bound on this lane's page count. Used only to check
+    // the result row is wide enough; never to address device memory.
+    std::uint32_t page_bound = 0;
     std::uint32_t num_q_heads = 0;
     std::uint32_t num_kv_heads = 0;
     std::uint32_t head_dim = 0;

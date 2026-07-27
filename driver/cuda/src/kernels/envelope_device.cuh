@@ -17,6 +17,7 @@
 // This header is CUDA-only. `kernels/envelope.hpp` is included by host
 // translation units and must stay free of `__device__` code.
 
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 namespace pie_cuda_driver {
@@ -30,10 +31,17 @@ namespace kernels {
 // `env_base` is the offset of this (page, kv_head)'s `head_dim` run inside the
 // envelope tensors, i.e. `(page * num_kv_heads + kv_head) * head_dim`. Callers
 // sum the returned partials across the block.
+//
+// The envelopes are stored bf16 and widened here. That is not an approximation:
+// an envelope entry is the min or max of a set of bf16 KEYS, so it is already
+// exactly a bf16 value, and the widening is exact. The multiply and the sum
+// stay in f32, so the arithmetic below is bit-identical to what it was when the
+// envelopes were stored f32 -- which is what lets the golden parity test keep
+// its tolerance. Storing them f32 only ever cost memory.
 __device__ __forceinline__ float envelope_dot_thread_partial(
     const float* __restrict__ q,
-    const float* __restrict__ env_min,
-    const float* __restrict__ env_max,
+    const __nv_bfloat16* __restrict__ env_min,
+    const __nv_bfloat16* __restrict__ env_max,
     long env_base,
     int qh_base,
     int group,
@@ -46,8 +54,8 @@ __device__ __forceinline__ float envelope_dot_thread_partial(
         const int g = i / head_dim;
         const int d = i - g * head_dim;
         const float qd = q[static_cast<long>(qh_base + g) * head_dim + d];
-        const float lo = qd * env_min[env_base + d];
-        const float hi = qd * env_max[env_base + d];
+        const float lo = qd * __bfloat162float(env_min[env_base + d]);
+        const float hi = qd * __bfloat162float(env_max[env_base + d]);
         local += (lo > hi) ? lo : hi;
     }
     return local;

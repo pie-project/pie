@@ -119,7 +119,8 @@ void prepare_llama_like_decode_plan(
     int total_tokens,
     int num_requests,
     bool is_pure_decode,
-    bool have_custom_mask)
+    bool have_custom_mask,
+    std::uint32_t attn_score_window)
 {
     // The prepare hook runs OUTSIDE any cuStreamCapture region. It updates
     // pinned/device buffers in `attn_ws` that the captured body reads via
@@ -129,6 +130,7 @@ void prepare_llama_like_decode_plan(
     state.xqa_max_pages_per_seq = 0;
     state.use_prefill_plan = false;
     state.use_prefill_decode_plan = false;
+    state.prefill_score_window = 0;
     if (have_custom_mask) {
         if (!state.prefill_plan) {
             state.prefill_plan = ops::make_prefill_plan();
@@ -184,6 +186,14 @@ void prepare_llama_like_decode_plan(
             const int T = (fwd_cfg.tp_size > 0) ? fwd_cfg.tp_size : 1;
             const int num_q_heads_local  = cfg.num_attention_heads / T;
             const int num_kv_heads_local = cfg.num_key_value_heads / T;
+            // SnapKV observes the tail of the prompt, so the capture has to
+            // be decided HERE: the planner picks SM90-vs-FA2, and only FA2 is
+            // instrumented. A sliding-window model is excluded for the same
+            // reason the decode capture excludes one -- `LogitsMask` runs
+            // after the hook, so the captured row would describe positions the
+            // softmax discards.
+            const std::uint32_t score_window =
+                (fwd_cfg.sliding_window < 0) ? attn_score_window : 0u;
             ops::plan_attention_flashinfer_prefill_bf16(
                 *state.prefill_plan,
                 qo_indptr_h,
@@ -201,8 +211,11 @@ void prepare_llama_like_decode_plan(
                 fwd_cfg.sliding_window,
                 /*full_attention_variant=*/false,
                 cache.hnd_layout(),
-                /*causal_mask=*/true);
+                /*causal_mask=*/true,
+                /*custom_mask=*/false,
+                /*wants_prefill_score=*/score_window > 0);
             state.use_prefill_plan = true;
+            state.prefill_score_window = score_window;
         }
         return;
     }
@@ -410,6 +423,15 @@ void llama_like_forward_paged(
         plan_state.prefill_decode_plan ? plan_state.prefill_decode_plan.get() : nullptr;
     const ops::PrefillPlanCache* prefill_plan =
         plan_state.prefill_plan ? plan_state.prefill_plan.get() : nullptr;
+    // SnapKV's observation window only exists on the true prefill branch: the
+    // prepare hook plans the score-capturing dispatch there and nowhere else,
+    // so the flag is a restatement of what that plan already committed to
+    // rather than an independent decision the body could get wrong.
+    const bool use_prefill_score_path =
+        plan_state.prefill_score_window > 0 &&
+        plan_state.use_prefill_plan && prefill_plan != nullptr &&
+        !use_decode_path && !has_custom_mask;
+
     if (use_xqa_decode_path) {
         ops::prepare_attention_xqa_decode_bf16(
             kv_page_indices,
@@ -718,10 +740,24 @@ void llama_like_forward_paged(
             attn_last_page_lens = page_mask.last_page_lens();
         }
 
+        // Exactly one of these can be active. The prefill capture is offered
+        // only on the branch its plan was built for -- the prepare hook is
+        // what decided FA2-vs-SM90, so the body cannot opt in on its own --
+        // and the decode capture stands down whenever the prefill one is
+        // eligible, because both publish through the same `OnAttn` binding and
+        // a second binding would shadow the first.
+        const bool prefill_capture_eligible =
+            use_prefill_score_path && layer_window_left < 0;
         model::LayerScoreCapture score_capture(
             static_cast<std::uint32_t>(L),
             static_cast<std::uint32_t>(num_q_heads_local),
-            /*capturable=*/layer_window_left < 0,
+            /*capturable=*/layer_window_left < 0 && !prefill_capture_eligible,
+            stream);
+        model::LayerPrefillScoreCapture prefill_score_capture(
+            static_cast<std::uint32_t>(L),
+            static_cast<std::uint32_t>(num_q_heads_local),
+            plan_state.prefill_score_window,
+            /*capturable=*/prefill_capture_eligible,
             stream);
 
         if (use_xqa_decode_path) {
@@ -778,11 +814,28 @@ void llama_like_forward_paged(
             const int num_pages_in_batch = kv_page_indptr_h[R];
             kernels::launch_dequant_kv_cache_layer_to_bf16_active(
                 kv_view, kv_page_indices, num_pages_in_batch, stream);
-            ops::dispatch_attention_flashinfer_prefill_bf16(
-                *prefill_plan,
-                attn_q, kv_view.k_bf16_pages, kv_view.v_bf16_pages, attn_out_buf,
-                qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                attn_ws, stream, /*logits_soft_cap=*/0.f, sm_scale_override);
+            if (prefill_score_capture.active()) {
+                ops::dispatch_attention_flashinfer_prefill_capture_bf16(
+                    *prefill_plan,
+                    attn_q, kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+                    attn_out_buf,
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, attn_ws, stream,
+                    prefill_score_capture.raw(),
+                    prefill_score_capture.folded(),
+                    prefill_score_capture.indptr_d(),
+                    prefill_score_capture.window(),
+                    /*logits_soft_cap=*/0.f, sm_scale_override);
+                prefill_score_capture.publish();
+            } else {
+                ops::dispatch_attention_flashinfer_prefill_bf16(
+                    *prefill_plan,
+                    attn_q, kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+                    attn_out_buf,
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens,
+                    attn_ws, stream, /*logits_soft_cap=*/0.f, sm_scale_override);
+            }
         } else {
             ops::launch_attention_flashinfer_prefill(
                 attn_q, kv_view, attn_out_buf,

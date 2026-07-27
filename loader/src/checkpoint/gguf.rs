@@ -26,7 +26,7 @@ use std::path::Path;
 use crate::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
 use crate::error::CompileError;
 use crate::types::{
-    Axis, CheckpointFormat, DType, Encoding, FileId, Layout, QuantScheme, QuantSpec, TensorId,
+    Axis, CheckpointFormat, DType, Encoding, FileId, QuantScheme, QuantSpec, TensorId,
 };
 
 /// GGUF metadata value type tags (`gguf_source.cpp` `GgufValueType`).
@@ -443,7 +443,6 @@ pub fn parse_gguf_checkpoint(path: &Path) -> Result<CheckpointMetadata, CompileE
             span_bytes: t.nbytes,
             shape: t.shape,
             encoding: t.encoding,
-            layout: Layout::dense(1),
         });
     }
 

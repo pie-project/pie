@@ -15,6 +15,8 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <sstream>
+#include <utility>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -87,14 +89,30 @@ struct Gemma4ForwardProfile {
 
     cudaEvent_t total_start = nullptr;
     cudaEvent_t total_stop = nullptr;
-    cudaEvent_t stage_start = nullptr;
-    cudaEvent_t stage_stop = nullptr;
+
+    // One event pair per timed stage, read back only once the step is over.
+    // Synchronizing per stage instead drains the pipeline on every stage
+    // boundary, so each stage is charged a launch latency it does not pay in
+    // production and the small ones read several times their true cost.
+    std::vector<cudaEvent_t> pool;
+    std::size_t pool_used = 0;
+    std::vector<std::pair<float*, std::size_t>> pending;
 
     ~Gemma4ForwardProfile() {
         if (total_start != nullptr) cudaEventDestroy(total_start);
         if (total_stop != nullptr) cudaEventDestroy(total_stop);
-        if (stage_start != nullptr) cudaEventDestroy(stage_start);
-        if (stage_stop != nullptr) cudaEventDestroy(stage_stop);
+        for (cudaEvent_t e : pool) cudaEventDestroy(e);
+    }
+
+    std::size_t acquire_pair() {
+        const std::size_t idx = pool_used;
+        while (pool.size() < idx + 2) {
+            cudaEvent_t e = nullptr;
+            CUDA_CHECK(cudaEventCreate(&e));
+            pool.push_back(e);
+        }
+        pool_used = idx + 2;
+        return idx;
     }
 
     void begin(cudaStream_t stream) {
@@ -108,8 +126,6 @@ struct Gemma4ForwardProfile {
         seq = current;
         CUDA_CHECK(cudaEventCreate(&total_start));
         CUDA_CHECK(cudaEventCreate(&total_stop));
-        CUDA_CHECK(cudaEventCreate(&stage_start));
-        CUDA_CHECK(cudaEventCreate(&stage_stop));
         CUDA_CHECK(cudaEventRecord(total_start, stream));
     }
 
@@ -119,6 +135,16 @@ struct Gemma4ForwardProfile {
         CUDA_CHECK(cudaEventRecord(total_stop, stream));
         CUDA_CHECK(cudaEventSynchronize(total_stop));
         CUDA_CHECK(cudaEventElapsedTime(&total_gpu_ms, total_start, total_stop));
+        // Every stage event is complete now that `total_stop` is, so the
+        // whole step reads back without another synchronization.
+        for (const auto& entry : pending) {
+            float ms = 0.f;
+            CUDA_CHECK(cudaEventElapsedTime(
+                &ms, pool[entry.second], pool[entry.second + 1]));
+            *entry.first += ms;
+        }
+        pending.clear();
+        pool_used = 0;
     }
 };
 
@@ -133,14 +159,11 @@ void profile_gemma4_cuda_stage(
         fn();
         return;
     }
-    CUDA_CHECK(cudaEventRecord(profile.stage_start, stream));
+    const std::size_t idx = profile.acquire_pair();
+    CUDA_CHECK(cudaEventRecord(profile.pool[idx], stream));
     fn();
-    CUDA_CHECK(cudaEventRecord(profile.stage_stop, stream));
-    CUDA_CHECK(cudaEventSynchronize(profile.stage_stop));
-    float ms = 0.f;
-    CUDA_CHECK(cudaEventElapsedTime(&ms, profile.stage_start,
-                                    profile.stage_stop));
-    dst += ms;
+    CUDA_CHECK(cudaEventRecord(profile.pool[idx + 1], stream));
+    profile.pending.emplace_back(&dst, idx);
 }
 
 void maybe_print_gemma4_forward_profile(
@@ -154,7 +177,11 @@ void maybe_print_gemma4_forward_profile(
         p.attn_out_ms + p.mlp_ms + p.ple_residual_ms + p.final_norm_ms +
         p.lm_head_ms + p.softcap_ms;
     const float other = p.total_gpu_ms - named;
-    std::cerr
+    // One buffered line, one write. TP ranks profile concurrently and a
+    // chain of `std::cerr <<` interleaves their fields mid-number, which
+    // silently corrupts anything reading the output.
+    std::ostringstream os;
+    os
         << "[pie-gemma4-forward-profile]"
         << " seq=" << p.seq
         << " N=" << p.N
@@ -178,6 +205,7 @@ void maybe_print_gemma4_forward_profile(
         << " softcap_ms=" << p.softcap_ms
         << " other_gpu_ms=" << other
         << "\n";
+    std::cerr << os.str() << std::flush;
 }
 
 const DeviceTensor& must(const LoadedModel& e, const std::string& name) {
@@ -2042,6 +2070,10 @@ void gemma4_forward_paged(
             layer.gate_up_proj_fused != nullptr &&
             !ws.gate_up_fused.empty();
         if (use_gate_up_fused) {
+            // Pinned to classic cuBLAS on purpose: routing this shape
+            // (M=N_tokens, N=2*I, K=H) through the cuBLASLt dispatcher was
+            // measured 15% slower on E4B tp2 -- mlp 4.71 -> 5.44 ms at
+            // N=128 -- so the Lt heuristic loses here.
             ops::gemm_act_x_wt_bf16_cublas(cublas.handle(),
                 ws.norm_x.data(), layer.gate_up_proj_fused->data(),
                 ws.gate_up_fused.data(), N, 2 * I, H);

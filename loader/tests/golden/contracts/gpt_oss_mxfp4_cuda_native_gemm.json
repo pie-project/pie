@@ -1,0 +1,88 @@
+{
+  "abi_version": 1,
+  "alignment": 256,
+  "tensors": [
+    {
+      "name": "model.layers.0.input_layernorm.weight",
+      "expr": {
+        "Src": "model.layers.0.input_layernorm.weight"
+      },
+      "shape": [
+        128
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      }
+    },
+    {
+      "name": "model.layers.0.mlp.experts.gate_up_proj_blocks",
+      "expr": {
+        "Src": "model.layers.0.mlp.experts.gate_up_proj_blocks"
+      },
+      "shape": [
+        2,
+        512,
+        4,
+        16
+      ],
+      "encoding": {
+        "Raw": "U8"
+      }
+    },
+    {
+      "name": "model.layers.0.mlp.experts.gate_up_proj_scales",
+      "expr": {
+        "Src": "model.layers.0.mlp.experts.gate_up_proj_scales"
+      },
+      "shape": [
+        2,
+        512,
+        4
+      ],
+      "encoding": {
+        "Raw": "U8"
+      }
+    },
+    {
+      "name": "model.layers.0.mlp.experts.down_proj_blocks",
+      "expr": {
+        "Src": "model.layers.0.mlp.experts.down_proj_blocks"
+      },
+      "shape": [
+        2,
+        128,
+        8,
+        16
+      ],
+      "encoding": {
+        "Raw": "U8"
+      }
+    },
+    {
+      "name": "model.layers.0.mlp.experts.down_proj_scales",
+      "expr": {
+        "Src": "model.layers.0.mlp.experts.down_proj_scales"
+      },
+      "shape": [
+        2,
+        128,
+        8
+      ],
+      "encoding": {
+        "Raw": "U8"
+      }
+    },
+    {
+      "name": "model.norm.weight",
+      "expr": {
+        "Src": "model.norm.weight"
+      },
+      "shape": [
+        128
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      }
+    }
+  ]
+}

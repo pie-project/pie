@@ -198,8 +198,8 @@ struct SetupConfig {
     std::uint32_t num_hidden_layers = 0;
     std::uint32_t num_experts = 0;
     std::uint32_t num_experts_per_tok = 0;
-    pie_loader::PieLoaderMxfp4MoeRequest mxfp4_moe =
-        pie_loader::PieLoaderMxfp4MoeRequest::Auto;
+    pie_driver::Mxfp4MoeRequest mxfp4_moe =
+        pie_driver::Mxfp4MoeRequest::Auto;
     std::uint32_t storage_page_size = 1;
 };
 

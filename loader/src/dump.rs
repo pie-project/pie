@@ -50,7 +50,6 @@ fn instr_name(instr: &StorageInstr) -> &'static str {
         StorageInstr::SlabScatter { .. } => "SlabScatter",
         StorageInstr::TileMap { .. } => "TileMap",
         StorageInstr::CreateView { .. } => "CreateView",
-        StorageInstr::Attach { .. } => "Attach",
         StorageInstr::Release { .. } => "Release",
         StorageInstr::Finalize { .. } => "Finalize",
     }

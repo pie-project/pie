@@ -76,10 +76,7 @@ fn eval_expr(
             retag(value(values, *data)?, decl)
         }
         LayoutExpr::Repack { input, decl, .. } => retag(value(values, *input)?, decl),
-        LayoutExpr::Attach { data, decl, .. }
-        | LayoutExpr::Realize {
-            input: data, decl, ..
-        } => retag(value(values, *data)?, decl),
+        LayoutExpr::Realize { input, decl, .. } => retag(value(values, *input)?, decl),
     }
 }
 

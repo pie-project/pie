@@ -26,9 +26,11 @@ bool env_requests_hnd_kv_layout() {
     return layout == "HND" || layout == "hnd";
 }
 
-// Quest key envelopes cost `2 * 4 * kv_heads * head_dim` bytes per page per
-// layer — `8 / (page_size * 2)` of the KV cache itself, i.e. 25% at
-// `page_size = 16`. The KV pool is sized to consume the device, so that memory
+// Quest key envelopes cost `2 * 2 * kv_heads * head_dim` bytes per page per
+// layer — `4 / (page_size * 2)` of the key tier, i.e. 12.5% at
+// `page_size = 16`, or 6.25% of K and V together. They are bf16 because an
+// envelope entry is the min or max of a set of bf16 keys and so is already
+// exactly representable; f32 storage bought nothing and cost double. The KV pool is sized to consume the device, so that memory
 // cannot be found after the fact: it has to come out of the page count, which
 // means the memory planner has to know before it picks one. Hence an explicit
 // operator opt-in rather than an implicit capability. `memory_planner.cpp`
@@ -366,12 +368,12 @@ void KvCache::allocate_envelopes_() {
                 "key layer");
         }
         k_env_min_layers_.push_back(DeviceTensor::allocate(
-            DType::FP32, {num_pages_, kvh, hd}));
+            DType::BF16, {num_pages_, kvh, hd}));
         k_env_max_layers_.push_back(DeviceTensor::allocate(
-            DType::FP32, {num_pages_, kvh, hd}));
-        kernels::launch_envelope_seed_empty_f32(
-            static_cast<float*>(k_env_min_layers_[i].data()),
-            static_cast<float*>(k_env_max_layers_[i].data()),
+            DType::BF16, {num_pages_, kvh, hd}));
+        kernels::launch_envelope_seed_empty_bf16(
+            static_cast<std::uint16_t*>(k_env_min_layers_[i].data()),
+            static_cast<std::uint16_t*>(k_env_max_layers_[i].data()),
             num_pages_, kvh, hd, nullptr);
     }
     CUDA_CHECK(cudaStreamSynchronize(nullptr));
@@ -403,10 +405,10 @@ KvCacheLayerView KvCache::layer_view(int layer) {    const int src = resolve_(la
         .v_bf16_pages = format_.is_native_bf16() ? v_layers_[src].data()
                                                  : v_bf16_layers_[src].data(),
         .k_env_min = envelopes_enabled_
-            ? static_cast<float*>(k_env_min_layers_[src].data())
+            ? static_cast<std::uint16_t*>(k_env_min_layers_[src].data())
             : nullptr,
         .k_env_max = envelopes_enabled_
-            ? static_cast<float*>(k_env_max_layers_[src].data())
+            ? static_cast<std::uint16_t*>(k_env_max_layers_[src].data())
             : nullptr,
         .hnd_layout = hnd_layout_,
         .native_bf16 = format_.is_native_bf16(),

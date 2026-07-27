@@ -76,7 +76,7 @@ fn host_swap_exhaustion_kills_a_victim_without_wedging_the_fleet() {
         results.iter().any(|result| {
             result
                 .as_ref()
-                .is_err_and(|error| error.contains("host swap exhaustion"))
+                .is_err_and(|error| error.contains("no host swap room to evict into"))
         }),
         "host-full victim reports the kill reason: {results:?}"
     );

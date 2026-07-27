@@ -70,6 +70,7 @@ struct Device {
     std::uint32_t* out_indices = nullptr;
     std::uint32_t* out_indptr = nullptr;
     std::uint32_t* out_last_lens = nullptr;
+    std::uint32_t* counts = nullptr;
 };
 
 // The mask the driver hands the kernel is `[R, stride]`, not CSR-laid-out.
@@ -138,9 +139,10 @@ Csr run_device(
     RT(cudaMemset(d.out_indptr, 0xEE, (R + 1) * 4));
     RT(cudaMemset(d.out_last_lens, 0xEE, std::max(R, 1) * 4));
 
-    launch_compact_page_csr(d.indices, d.indptr, d.last_lens, d.keep, stride,
-                            R, d.out_indices, d.out_indptr, d.out_last_lens,
-                            nullptr);
+    RT(cudaMalloc(&d.counts, std::max(R, 1) * 4));
+    launch_compact_page_csr(d.indices, d.indptr, d.last_lens, d.keep, d.counts,
+                            stride, R, d.out_indices, d.out_indptr,
+                            d.out_last_lens, nullptr);
     RT(cudaDeviceSynchronize());
 
     Csr got;
@@ -163,6 +165,7 @@ Csr run_device(
     cudaFree(d.out_indices);
     cudaFree(d.out_indptr);
     cudaFree(d.out_last_lens);
+    cudaFree(d.counts);
     return got;
 }
 
@@ -197,10 +200,82 @@ void check_against_reference(const char* name, const Csr& in,
     report(name, same(run_device(in, keep), host_compact(in, keep)));
 }
 
+// Compaction runs once per LAYER per fire, so its cost is not amortised over
+// the model the way a one-shot host operation would be. `PIE_PAGE_COMPACT_BENCH`
+// times it in isolation with CUDA events -- e2e wall-clock on a shared host is
+// worthless for a kernel this small (see the measurement caveat in the design
+// doc's section 9.8).
+void bench(int requests, int pages_per_request) {
+    std::mt19937 rng(0xBEEFu);
+    std::vector<std::uint32_t> counts(requests, pages_per_request);
+    const Csr in = make_csr(counts, 16, rng);
+    const std::uint32_t stride = widest_request(in);
+    const std::vector<std::uint8_t> keep(in.indices.size(), 1);
+    const std::vector<std::uint8_t> rows = to_strided(in, keep, stride);
+
+    Device d;
+    const std::size_t total = in.indices.size();
+    RT(cudaMalloc(&d.indices, total * 4));
+    RT(cudaMalloc(&d.indptr, (requests + 1) * 4));
+    RT(cudaMalloc(&d.last_lens, requests * 4));
+    RT(cudaMalloc(&d.keep, rows.size()));
+    RT(cudaMalloc(&d.out_indices, total * 4));
+    RT(cudaMalloc(&d.out_indptr, (requests + 1) * 4));
+    RT(cudaMalloc(&d.out_last_lens, requests * 4));
+    RT(cudaMalloc(&d.counts, requests * 4));
+    RT(cudaMemcpy(d.indices, in.indices.data(), total * 4, cudaMemcpyHostToDevice));
+    RT(cudaMemcpy(d.indptr, in.indptr.data(), (requests + 1) * 4, cudaMemcpyHostToDevice));
+    RT(cudaMemcpy(d.last_lens, in.last_lens.data(), requests * 4, cudaMemcpyHostToDevice));
+    RT(cudaMemcpy(d.keep, rows.data(), rows.size(), cudaMemcpyHostToDevice));
+
+    const int iters = 200;
+    for (int i = 0; i < 20; ++i) {
+        launch_compact_page_csr(d.indices, d.indptr, d.last_lens, d.keep,
+                                d.counts, stride, requests, d.out_indices,
+                                d.out_indptr, d.out_last_lens, nullptr);
+    }
+    RT(cudaDeviceSynchronize());
+
+    cudaEvent_t beg, end;
+    RT(cudaEventCreate(&beg));
+    RT(cudaEventCreate(&end));
+    RT(cudaEventRecord(beg, nullptr));
+    for (int i = 0; i < iters; ++i) {
+        launch_compact_page_csr(d.indices, d.indptr, d.last_lens, d.keep,
+                                d.counts, stride, requests, d.out_indices,
+                                d.out_indptr, d.out_last_lens, nullptr);
+    }
+    RT(cudaEventRecord(end, nullptr));
+    RT(cudaEventSynchronize(end));
+    float ms = 0.f;
+    RT(cudaEventElapsedTime(&ms, beg, end));
+    std::printf("[bench] R=%-3d pages/req=%-6d total=%-8zu  %8.2f us/call\n",
+                requests, pages_per_request, total,
+                static_cast<double>(ms) / iters * 1000.0);
+    cudaEventDestroy(beg);
+    cudaEventDestroy(end);
+    cudaFree(d.indices);
+    cudaFree(d.indptr);
+    cudaFree(d.last_lens);
+    cudaFree(d.keep);
+    cudaFree(d.out_indices);
+    cudaFree(d.out_indptr);
+    cudaFree(d.out_last_lens);
+    cudaFree(d.counts);
+}
+
 }  // namespace
 
 int main() {
     std::mt19937 rng(0xC0FFEEu);
+
+    if (std::getenv("PIE_PAGE_COMPACT_BENCH") != nullptr) {
+        // 128 pages = 2K context, 8192 = 128K context at page_size 16.
+        for (const int pages : {128, 1024, 8192}) {
+            for (const int r : {1, 8, 32}) bench(r, pages);
+        }
+        return 0;
+    }
 
     // 1. All-ones mask is the identity. This is the safety floor: a fire whose
     //    program writes no useful mask must attend over exactly what it would
@@ -268,6 +343,23 @@ int main() {
         std::vector<std::uint8_t> keep(in.indices.size(), 0);
         for (std::size_t i = 0; i < keep.size(); ++i) keep[i] = (i % 2);
         check_against_reference("empty and singleton requests", in, keep);
+    }
+
+    // 6b. More requests than a block has threads. The scatter kernel derives
+    //     its own output base by summing the counts of every earlier request,
+    //     and that loop strides by blockDim.x -- so a batch wider than the
+    //     block is the only shape that exercises more than one iteration of it.
+    //     Get this wrong and every request past the 256th writes to the wrong
+    //     offset, which is silent and looks like another request's cache.
+    {
+        std::uniform_int_distribution<std::uint32_t> npages(0, 9);
+        std::vector<std::uint32_t> shape(300);
+        for (auto& v : shape) v = npages(rng);
+        const Csr in = make_csr(shape, 16, rng);
+        std::bernoulli_distribution coin(0.5);
+        std::vector<std::uint8_t> keep(in.indices.size(), 0);
+        for (auto& k : keep) k = coin(rng) ? 1 : 0;
+        check_against_reference("more requests than block threads", in, keep);
     }
 
     // 6. Randomized soak across shapes and densities.

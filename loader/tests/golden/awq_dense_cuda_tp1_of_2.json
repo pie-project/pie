@@ -8,9 +8,10 @@
     "max_tile_bytes": 67108864,
     "preferred_alignment": 256,
     "tile_map_mask": 117,
-    "mxfp4_moe": "RoutedDecode",
     "native_mxfp4_moe": false,
-    "fused_transcode": true
+    "fusion_mask": 1,
+    "encode_scratch_dtype": "BF16",
+    "block_scale_rows": 128
   },
   "optimizer": {
     "passes": [
@@ -257,14 +258,6 @@
       "encoding": {
         "Raw": "BF16"
       },
-      "layout": {
-        "alignment": 256
-      },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
-      },
       "alignment": 256
     },
     {
@@ -275,14 +268,6 @@
       ],
       "encoding": {
         "Raw": "BF16"
-      },
-      "layout": {
-        "alignment": 256
-      },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
       },
       "alignment": 256
     },
@@ -305,14 +290,6 @@
           "block_shape": []
         }
       },
-      "layout": {
-        "alignment": 256
-      },
-      "sharding": {
-        "axis": 0,
-        "world": 2,
-        "rank": 1
-      },
       "alignment": 256
     },
     {
@@ -333,14 +310,6 @@
           "zero_point_dtype": null,
           "block_shape": []
         }
-      },
-      "layout": {
-        "alignment": 256
-      },
-      "sharding": {
-        "axis": 0,
-        "world": 2,
-        "rank": 1
       },
       "alignment": 256
     },
@@ -363,14 +332,6 @@
           "block_shape": []
         }
       },
-      "layout": {
-        "alignment": 256
-      },
-      "sharding": {
-        "axis": 0,
-        "world": 2,
-        "rank": 1
-      },
       "alignment": 256
     },
     {
@@ -391,14 +352,6 @@
           "zero_point_dtype": null,
           "block_shape": []
         }
-      },
-      "layout": {
-        "alignment": 256
-      },
-      "sharding": {
-        "axis": 1,
-        "world": 2,
-        "rank": 1
       },
       "alignment": 256
     },
@@ -421,14 +374,6 @@
           "block_shape": []
         }
       },
-      "layout": {
-        "alignment": 256
-      },
-      "sharding": {
-        "axis": 0,
-        "world": 2,
-        "rank": 1
-      },
       "alignment": 256
     },
     {
@@ -449,14 +394,6 @@
           "zero_point_dtype": null,
           "block_shape": []
         }
-      },
-      "layout": {
-        "alignment": 256
-      },
-      "sharding": {
-        "axis": 0,
-        "world": 2,
-        "rank": 1
       },
       "alignment": 256
     },
@@ -479,14 +416,6 @@
           "block_shape": []
         }
       },
-      "layout": {
-        "alignment": 256
-      },
-      "sharding": {
-        "axis": 1,
-        "world": 2,
-        "rank": 1
-      },
       "alignment": 256
     },
     {
@@ -498,14 +427,6 @@
       "encoding": {
         "Raw": "BF16"
       },
-      "layout": {
-        "alignment": 256
-      },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
-      },
       "alignment": 256
     },
     {
@@ -516,14 +437,6 @@
       ],
       "encoding": {
         "Raw": "BF16"
-      },
-      "layout": {
-        "alignment": 256
-      },
-      "sharding": {
-        "axis": null,
-        "world": 1,
-        "rank": 0
       },
       "alignment": 256
     }

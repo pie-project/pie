@@ -49,6 +49,20 @@ impl DType {
             Self::F32 | Self::F16 | Self::BF16 | Self::F8E4M3 | Self::F8E5M2
         )
     }
+
+    /// Whether a checkpoint storing this dtype ships a separate block-scale
+    /// tensor alongside it.
+    ///
+    /// A *format* fact, not a device one: DeepSeek- and GLM-style FP8
+    /// checkpoints carry one scale per `[B, B]` tile of the weight, so an FP8
+    /// tensor is never self-describing. The block size `B` is what the
+    /// consuming kernel fixes, and that is on the target
+    /// ([`crate::load_plan::StorageTarget::block_scale_rows`]); which dtypes
+    /// arrive that way is here, because it is true of the file no matter who
+    /// reads it.
+    pub fn is_block_scaled(self) -> bool {
+        matches!(self, Self::F8E4M3 | Self::F8E5M2)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -129,13 +143,6 @@ impl QuantScheme {
             | Self::None => 1,
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum Mxfp4MoePolicy {
-    RoutedDecode,
-    NativeGemm,
-    EagerBf16,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -233,41 +240,11 @@ pub fn normalize_encoding(encoding: &Encoding) -> Encoding {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Layout {
-    pub alignment: u32,
-}
-
-impl Layout {
-    pub fn dense(alignment: u32) -> Self {
-        Self { alignment }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Sharding {
-    pub axis: Option<Axis>,
-    pub world: u32,
-    pub rank: u32,
-}
-
-impl Sharding {
-    pub fn replicated() -> Self {
-        Self {
-            axis: None,
-            world: 1,
-            rank: 0,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TensorDecl {
     pub id: TensorId,
     pub name: String,
     pub shape: Vec<i64>,
     pub encoding: Encoding,
-    pub layout: Layout,
-    pub sharding: Sharding,
     pub alignment: u32,
 }
 
@@ -275,8 +252,6 @@ impl TensorDecl {
     pub fn same_runtime_contract(&self, other: &Self) -> bool {
         self.shape == other.shape
             && self.encoding == other.encoding
-            && self.layout == other.layout
-            && self.sharding == other.sharding
             && self.alignment == other.alignment
     }
 

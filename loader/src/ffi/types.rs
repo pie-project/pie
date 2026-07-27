@@ -14,7 +14,7 @@
 //!   `has_*: bool` companion, matching the C++ views this replaces, so the
 //!   layout is legible from C without knowing Rust's niche rules.
 
-use crate::types::{BackendKind, DType, Mxfp4MoePolicy, QuantScheme, RepackLayout, RowMap};
+use crate::types::{BackendKind, DType, QuantScheme, RepackLayout, RowMap};
 
 /// Sentinel for "no buffer", mirroring the C++ `numeric_limits<uint32_t>::max()`
 /// defaults on `PieLoaderStorageInstrView::buffer_id` and `slab_file_id`.
@@ -39,6 +39,16 @@ pub const PIE_LOADER_TILE_MAP_TRANSCODE: u32 = 1 << 3;
 pub const PIE_LOADER_TILE_MAP_REBLOCK: u32 = 1 << 4;
 pub const PIE_LOADER_TILE_MAP_REORDER: u32 = 1 << 5;
 pub const PIE_LOADER_TILE_MAP_REPACK: u32 = 1 << 6;
+
+// Fused-chain capability bits, on the same principle: the *loader* knows what a
+// fusion means — which two-step chain `PieLoaderTransformFusion::Fp8ToMxfp4`
+// collapses, and that the collapsed form is bit-identical — and the *driver*
+// knows whether it built the kernel. A bit set here says only the second thing.
+//
+// Before this was a bit, it was `fused_transcode: bool`, which conflated the two
+// and had no room for a second fusion. A mask does, and it makes adding one a
+// change to a table rather than to a signature.
+pub const PIE_LOADER_FUSION_FP8_TO_MXFP4: u32 = 1 << 0;
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,24 +145,6 @@ pub enum PieLoaderEncodingKind {
     Quant = 1,
 }
 
-#[repr(u32)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PieLoaderMxfp4MoePolicy {
-    RoutedDecode = 0,
-    NativeGemm = 1,
-    EagerBf16 = 2,
-}
-
-impl From<Mxfp4MoePolicy> for PieLoaderMxfp4MoePolicy {
-    fn from(value: Mxfp4MoePolicy) -> Self {
-        match value {
-            Mxfp4MoePolicy::RoutedDecode => Self::RoutedDecode,
-            Mxfp4MoePolicy::NativeGemm => Self::NativeGemm,
-            Mxfp4MoePolicy::EagerBf16 => Self::EagerBf16,
-        }
-    }
-}
-
 /// Discriminants follow `crate::types::QuantScheme` declaration order, which is
 /// *not* the order of the hand-written C++ enum this replaces (`MlxAffineU4` is
 /// eighth here and last there). The mismatch was invisible while the boundary
@@ -243,6 +235,17 @@ impl From<RepackLayout> for PieLoaderRepackLayout {
     }
 }
 
+impl From<PieLoaderRepackLayout> for RepackLayout {
+    fn from(value: PieLoaderRepackLayout) -> Self {
+        match value {
+            PieLoaderRepackLayout::None => Self::None,
+            PieLoaderRepackLayout::MarlinMxfp4Weight => Self::MarlinMxfp4Weight,
+            PieLoaderRepackLayout::MarlinMxfp4Scale => Self::MarlinMxfp4Scale,
+            PieLoaderRepackLayout::DenseRowGather => Self::DenseRowGather,
+        }
+    }
+}
+
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PieLoaderRowMap {
@@ -261,6 +264,98 @@ impl From<RowMap> for PieLoaderRowMap {
     }
 }
 
+impl From<PieLoaderRowMap> for RowMap {
+    fn from(value: PieLoaderRowMap) -> Self {
+        match value {
+            PieLoaderRowMap::Identity => Self::Identity,
+            PieLoaderRowMap::Even => Self::Even,
+            PieLoaderRowMap::Odd => Self::Odd,
+        }
+    }
+}
+
+/// Contract fields cross as `uint32_t`, so an out-of-range value is a
+/// diagnosable request rather than an invalid Rust enum. These are the inverses.
+impl TryFrom<u32> for PieLoaderDType {
+    type Error = u32;
+    fn try_from(value: u32) -> Result<Self, u32> {
+        Ok(match value {
+            0 => Self::F32,
+            1 => Self::F16,
+            2 => Self::BF16,
+            3 => Self::F8E4M3,
+            4 => Self::F8E5M2,
+            5 => Self::I32,
+            6 => Self::I16,
+            7 => Self::I8,
+            8 => Self::U32,
+            9 => Self::U16,
+            10 => Self::U8,
+            11 => Self::Bool,
+            other => return Err(other),
+        })
+    }
+}
+
+impl TryFrom<u32> for PieLoaderEncodingKind {
+    type Error = u32;
+    fn try_from(value: u32) -> Result<Self, u32> {
+        Ok(match value {
+            0 => Self::Raw,
+            1 => Self::Quant,
+            other => return Err(other),
+        })
+    }
+}
+
+impl TryFrom<u32> for PieLoaderQuantScheme {
+    type Error = u32;
+    fn try_from(value: u32) -> Result<Self, u32> {
+        Ok(match value {
+            0 => Self::None,
+            1 => Self::Fp8E4M3,
+            2 => Self::Fp8E5M2,
+            3 => Self::Int8Symmetric,
+            4 => Self::Int8Asymmetric,
+            5 => Self::AwqInt4,
+            6 => Self::GptqInt4,
+            7 => Self::Mxfp4E2M1E8M0,
+            8 => Self::MlxAffineU4,
+            9 => Self::GgufQ4_0,
+            10 => Self::GgufQ4K,
+            11 => Self::GgufQ5_0,
+            12 => Self::GgufQ5K,
+            13 => Self::GgufQ8_0,
+            other => return Err(other),
+        })
+    }
+}
+
+impl TryFrom<u32> for PieLoaderRepackLayout {
+    type Error = u32;
+    fn try_from(value: u32) -> Result<Self, u32> {
+        Ok(match value {
+            0 => Self::None,
+            1 => Self::MarlinMxfp4Weight,
+            2 => Self::MarlinMxfp4Scale,
+            3 => Self::DenseRowGather,
+            other => return Err(other),
+        })
+    }
+}
+
+impl TryFrom<u32> for PieLoaderRowMap {
+    type Error = u32;
+    fn try_from(value: u32) -> Result<Self, u32> {
+        Ok(match value {
+            0 => Self::Identity,
+            1 => Self::Even,
+            2 => Self::Odd,
+            other => return Err(other),
+        })
+    }
+}
+
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PieLoaderStorageInstrKind {
@@ -268,11 +363,10 @@ pub enum PieLoaderStorageInstrKind {
     ExtentWrite = 1,
     TileMap = 2,
     CreateView = 3,
-    Attach = 4,
-    Release = 5,
-    Finalize = 6,
-    BulkExtentWrite = 7,
-    SlabScatter = 8,
+    Release = 4,
+    Finalize = 5,
+    BulkExtentWrite = 6,
+    SlabScatter = 7,
 }
 
 /// `None` is the resting value for instructions that carry no tile map, so it
@@ -863,9 +957,10 @@ pub struct PieLoaderTargetView {
     pub max_tile_bytes: u64,
     pub preferred_alignment: u32,
     pub tile_map_mask: u32,
-    pub mxfp4_moe: PieLoaderMxfp4MoePolicy,
     pub native_mxfp4_moe: bool,
-    pub fused_transcode: bool,
+    pub fusion_mask: u32,
+    pub encode_scratch_dtype: PieLoaderDType,
+    pub block_scale_rows: u32,
 }
 
 impl From<&crate::load_plan::StorageTarget> for PieLoaderTargetView {
@@ -877,9 +972,10 @@ impl From<&crate::load_plan::StorageTarget> for PieLoaderTargetView {
             max_tile_bytes: value.max_tile_bytes,
             preferred_alignment: value.preferred_alignment,
             tile_map_mask: value.tile_map_mask,
-            mxfp4_moe: value.mxfp4_moe.into(),
             native_mxfp4_moe: value.native_mxfp4_moe,
-            fused_transcode: value.fused_transcode,
+            fusion_mask: value.fusion_mask,
+            encode_scratch_dtype: value.encode_scratch_dtype.into(),
+            block_scale_rows: value.block_scale_rows,
         }
     }
 }
@@ -889,7 +985,7 @@ impl From<&crate::load_plan::StorageTarget> for PieLoaderTargetView {
 /// The leading members reproduce the old `LoadPlanView` in order, so an executor
 /// written against that view compiles unchanged against this struct. `target`
 /// and `compiler_version` fold in the accessors `loaded_model.cpp` reached
-/// through `LoadPlan` methods (`backend()`, `mxfp4_moe()`, `native_mxfp4_moe()`,
+/// through `LoadPlan` methods (`backend()`, `native_mxfp4_moe()`,
 /// `preferred_alignment()`, `max_tile_bytes()`, `tile_map_mask()`,
 /// `compiler_version()`), which have no method syntax to hide behind once the
 /// type is POD.

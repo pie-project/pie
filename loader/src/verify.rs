@@ -181,11 +181,17 @@ pub struct TensorDemand<'a> {
 }
 
 impl<'a> TensorDemand<'a> {
-    /// A demand that pins all three fields. Used for a contract `arch/` authored.
-    pub fn exact(name: &'a str, shape: &[i64], encoding: &Encoding) -> Self {
+    /// A demand read off a contract the loader itself is about to execute.
+    ///
+    /// The encoding is always pinned: a contract states the encoding of every
+    /// tensor it defines, so an authored demand can check it. The shape is
+    /// pinned only when the contract declared one — a contract may decline to
+    /// predict a shape (`TensorContract::inferred`), and inventing one here
+    /// would turn the loader's own inference into the thing being verified.
+    pub fn authored(name: &'a str, shape: Option<&[i64]>, encoding: &Encoding) -> Self {
         Self {
             name,
-            shape: Some(shape.to_vec()),
+            shape: shape.map(<[i64]>::to_vec),
             encoding: Some(crate::types::normalize_encoding(encoding)),
             optional: false,
         }
@@ -204,21 +210,16 @@ impl<'a> TensorDemand<'a> {
 
 impl<'a> ContractView<'a> {
     /// Read a contract as the rank that will execute it sees it.
-    ///
-    /// `tp_size` is required rather than defaulted because a sharded tensor's
-    /// declared shape is the *model's* shape, not the rank's; comparing the
-    /// undivided shape against a plan compiled for 4 ranks would report a
-    /// mismatch on every sharded weight.
-    pub fn of(abi: &'a crate::arch::RuntimeAbi, tp_size: u32) -> Self {
+    pub fn of(contract: &'a crate::contract::ModelContract) -> Self {
         Self {
-            tensors: abi
+            tensors: contract
                 .tensors
                 .iter()
-                .map(|contract| {
-                    TensorDemand::exact(
-                        contract.output_name.as_str(),
-                        &contract.runtime_shape(tp_size),
-                        &contract.encoding,
+                .map(|tensor| {
+                    TensorDemand::authored(
+                        tensor.name.as_str(),
+                        tensor.shape.as_deref(),
+                        &tensor.encoding,
                     )
                 })
                 .collect(),
@@ -510,7 +511,7 @@ fn check_contract(plan: &PlanView<'_>, contract: &ContractView<'_>, found: &mut 
             ));
         }
         if let Some(encoding) = &demanded.encoding
-            && planned.encoding != *encoding
+            && !encoding_matches(&planned.encoding, encoding)
         {
             found.push(Violation::tensor(
                 demanded.name,
@@ -526,6 +527,32 @@ fn check_contract(plan: &PlanView<'_>, contract: &ContractView<'_>, found: &mut 
     // (`nemotron.rs` republishes packed experts under their original names) that
     // a given driver may never bind. Producing more than was demanded costs a
     // name, not correctness. Producing less is the failure.
+}
+
+/// Compare two encodings over the fields a plan can actually carry.
+///
+/// A [`PlanView`] can arrive two ways: from a plan the loader still holds in
+/// typed form, or rebuilt from the POD arena the driver received. The POD
+/// `TensorDecl` carries `scheme`, `dtype`, `bits_per_element` and `group_size`
+/// and nothing else, because the rest of [`QuantSpec`] had no reader on the far
+/// side — the scale tensor's axis, dtype and granularity are stated on the
+/// `QuantAttachment`, which is where the executor looks for them.
+///
+/// So verification compares what crossed the boundary. Holding a plan to a
+/// field that cannot be expressed in it would make the check fail for a
+/// contract that is in fact satisfied, and comparing the two representations
+/// asymmetrically would make the answer depend on which side of the FFI the
+/// caller stood on.
+fn encoding_matches(planned: &Encoding, demanded: &Encoding) -> bool {
+    match (planned, demanded) {
+        (Encoding::Quant(planned), Encoding::Quant(demanded)) => {
+            planned.scheme == demanded.scheme
+                && planned.logical_dtype == demanded.logical_dtype
+                && planned.bits_per_element == demanded.bits_per_element
+                && planned.group_size == demanded.group_size
+        }
+        _ => planned == demanded,
+    }
 }
 
 /// How much of a declared contract a plan delivers.
@@ -571,7 +598,7 @@ impl ContractCoverage {
 mod tests {
     use super::*;
     use crate::load_plan::{StorageTarget, compiler_version};
-    use crate::types::{BufferId, Encoding, InstrId, Layout, Sharding, TensorDecl, TensorId};
+    use crate::types::{BufferId, Encoding, InstrId, TensorDecl, TensorId};
 
     fn decl(name: &str) -> TensorDecl {
         TensorDecl {
@@ -579,8 +606,6 @@ mod tests {
             name: name.to_string(),
             shape: vec![1],
             encoding: Encoding::Raw(crate::types::DType::U8),
-            layout: Layout::dense(1),
-            sharding: Sharding::replicated(),
             alignment: 1,
         }
     }
@@ -669,7 +694,11 @@ mod tests {
             tensors: tensors
                 .iter()
                 .map(|(name, shape, encoding)| {
-                    TensorDemand::exact(name, Box::leak(shape.clone().into_boxed_slice()), encoding)
+                    TensorDemand::authored(
+                        name,
+                        Some(Box::leak(shape.clone().into_boxed_slice())),
+                        encoding,
+                    )
                 })
                 .collect(),
         }

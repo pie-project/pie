@@ -48,6 +48,20 @@ struct PieScoreParams : Base {
     const IdT* score_indptr = nullptr;
 };
 
+/// Prefill sink. Adds the observation-window width, which is what keeps the
+/// capture off the O(n^2) diagonal: only the last `score_window` query rows of
+/// each request are recorded, so the cost is `window x kv_len` rather than
+/// `qo_len x kv_len`.
+///
+///     score_out[score_indptr[b] + (head * window + w) * kv_len(b) + kv_idx]
+///
+/// with `w = qo_idx - (qo_len - window)`, i.e. 0 is the *oldest* row of the
+/// window and `window - 1` is the last query of the prompt.
+template <typename Base, typename IdT>
+struct PieScoreWindowParams : PieScoreParams<Base, IdT> {
+    std::uint32_t score_window = 0;
+};
+
 /// Wraps a stock `DefaultAttention` instantiation and records every score it
 /// transforms. Composition rather than replacement: the base hook still runs,
 /// so the *attention output* is bit-identical to the uncaptured path. Capture
@@ -108,6 +122,80 @@ struct PieScoreCapture : Base {
                 // pre-softmax score -- and leave the base change to the
                 // normalisation kernel.
                 this->score_row[qo_head_idx * len + kv_idx] =
+                    static_cast<float>(out) * params.sm_scale;
+            }
+            return out;
+        })
+};
+
+/// Prefill counterpart of `PieScoreCapture`, for SnapKV (arXiv:2404.14469).
+///
+/// SnapKV scores the prefix using only the last ~32 queries of the prompt --
+/// its "observation window" -- and that is not a cost compromise but the
+/// algorithm's defining device: the claim is that what the *end* of the prompt
+/// attends to predicts what the generation will attend to. So the predicate
+/// that makes the capture affordable and the predicate the paper specifies are
+/// the same one.
+///
+/// Three things differ from the decode capture, all of them consequences of
+/// the prefill kernel being MMA-based rather than reduction-based:
+///
+///  1. **No `threadIdx.x == 0` guard.** In decode, the `bdx` lanes hold
+///     identical scores after a butterfly reduction, so all but one write is
+///     redundant. In prefill each thread holds a *distinct* element of the
+///     `s_frag` MMA fragment -- `q_idx` and `qo_head_idx` come from
+///     `divmod(qo_packed_idx, group_size)` and `kv_idx` from the lane's
+///     position in the tile (`prefill.cuh:1305-1310`). Keeping the guard here
+///     would drop all but 1/32 of the scores.
+///
+///  2. **`q_idx` needs its own bounds check.** The last tile of a request is
+///     padded, so `q_idx` can run past `qo_len`; in decode there is only ever
+///     one query and the question does not arise.
+///
+///  3. **The hook's `batch_idx` argument is unusable** -- the prefill kernel
+///     passes a literal 0 (`prefill.cuh:2233-2234`). The real request index
+///     reaches the *constructor* (`prefill.cuh:2677`), so the row base is
+///     resolved there, which is what the decode capture already does for
+///     unrelated reasons.
+///
+/// Exactly-once still holds, so no atomics: each `(q_idx, qo_head_idx,
+/// kv_idx)` triple is owned by one register slot of one thread, and split-KV
+/// chunks are disjoint in `kv_idx` by construction.
+template <class Base>
+struct PieScoreCaptureWindow : Base {
+    float* score_row = nullptr;
+    // First query row that gets recorded, i.e. `qo_len - window` clamped at 0.
+    std::uint32_t first_qo = 0;
+    std::uint32_t window = 0;
+
+    template <typename Params>
+    __device__ __host__ PieScoreCaptureWindow(
+        const Params& params, uint32_t batch_idx, uint8_t* smem_ptr)
+        : Base(params, batch_idx, smem_ptr) {
+        if (params.score_out != nullptr && params.score_indptr != nullptr) {
+            score_row = params.score_out +
+                        static_cast<std::size_t>(params.score_indptr[batch_idx]);
+        }
+        window = params.score_window;
+        first_qo = (this->qo_len > window) ? (this->qo_len - window) : 0u;
+    }
+
+    REGISTER_LOGITS_TRANSFORM(
+        params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
+            const T out = this->Base::template LogitsTransform<Params, T>(
+                params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx,
+                kv_head_idx);
+            const uint32_t len = this->kv_len;
+            if (kv_idx < len && qo_idx < this->qo_len &&
+                qo_idx >= this->first_qo && this->score_row != nullptr) {
+                const std::size_t w = qo_idx - this->first_qo;
+                const std::size_t row =
+                    (static_cast<std::size_t>(qo_head_idx) * this->window + w) *
+                    len;
+                // Same convention as the decode capture: record the
+                // natural-log-space scaled logit and leave the base-2 change
+                // to the normalisation kernel.
+                this->score_row[row + kv_idx] =
                     static_cast<float>(out) * params.sm_scale;
             }
             return out;

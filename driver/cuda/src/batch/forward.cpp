@@ -99,6 +99,8 @@ void ForwardFn::invoke_body(model::Workspace& ws,
         const model::AttentionObservation observation{
             .kv = &kv,
             .kv_page_indices_d = in.kv_page_indices_d,
+            .kv_page_indptr_d = in.kv_page_indptr_d,
+            .kv_last_page_lens_d = in.kv_last_page_lens_d,
             .qo_indptr_h = in.qo_indptr_h,
             .kv_page_indptr_h = in.kv_page_indptr_h,
             .kv_last_page_lens_h = in.kv_last_page_lens_h,

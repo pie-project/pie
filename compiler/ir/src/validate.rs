@@ -119,21 +119,25 @@ pub enum ValidateError {
     /// (pass-wide ⇒ prologue-only; attention ⇒ prologue or attn-proj).
     SinkMisplaced {
         name_index: u16,
+        name: String,
         stage: Stage,
     },
     /// A `SinkCall` names something the profile knows as a value kernel, or
     /// a `KernelCall` names a sink.
     SinkKernelKindMismatch {
         name_index: u16,
+        name: String,
     },
     /// Bind-time availability (overview §4): the backend lacks this
     /// second-party name.
     KernelUnavailable {
         name_index: u16,
+        name: String,
     },
     /// T10: the named kernel returns a time-/load-varying value.
     NotReplayable {
         name_index: u16,
+        name: String,
     },
     /// Stage-scoped intrinsic used outside its stages (overview §5.3).
     IntrinsicWrongStage {
@@ -206,26 +210,40 @@ impl fmt::Display for ValidateError {
                 "channel {chan}: SPSC violation — host is the reader but stage {} consumes",
                 stage.name()
             ),
-            SinkMisplaced { name_index, stage } => write!(
+            SinkMisplaced {
+                name_index,
+                name,
+                stage,
+            } => write!(
                 f,
-                "sink (name #{name_index}) at stage {} does not precede its consumption point",
+                "sink `{name}` (name #{name_index}) at stage {} does not precede \
+                 its consumption point",
                 stage.name()
             ),
-            SinkKernelKindMismatch { name_index } => {
+            SinkKernelKindMismatch { name_index, name } => {
                 write!(
                     f,
-                    "name #{name_index}: sink/kernel kind mismatch with the profile"
+                    "`{name}` (name #{name_index}): sink/kernel kind mismatch with \
+                     the profile — the program calls it as one and the backend \
+                     declares it as the other"
                 )
             }
-            KernelUnavailable { name_index } => {
+            KernelUnavailable { name_index, name } => {
                 write!(
                     f,
-                    "name #{name_index}: backend does not provide this kernel/sink"
+                    "`{name}` (name #{name_index}): the backend's model profile does \
+                     not advertise this kernel/sink, so binding it would either \
+                     fail mid-fire or — far worse — run as a silent no-op. Either \
+                     the driver does not implement it for this model family, or it \
+                     is implemented but switched off (on the CUDA driver \
+                     `envelope_dot`, `attn_page_mask` and `attn_score` all require \
+                     PIE_CUDA_KV_ENVELOPES=1)"
                 )
             }
-            NotReplayable { name_index } => write!(
+            NotReplayable { name_index, name } => write!(
                 f,
-                "name #{name_index}: time-/load-varying return — a register read in disguise (T10)"
+                "`{name}` (name #{name_index}): time-/load-varying return — a \
+                 register read in disguise (T10)"
             ),
             IntrinsicWrongStage { intr, stage } => {
                 write!(
@@ -418,12 +436,21 @@ pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTra
                     let n = resolve_name(&container, *name);
                     let info = profile
                         .kernel(n)
-                        .ok_or(ValidateError::KernelUnavailable { name_index: *name })?;
+                        .ok_or_else(|| ValidateError::KernelUnavailable {
+                            name_index: *name,
+                            name: n.into(),
+                        })?;
                     if info.sink_scope.is_some() {
-                        return Err(ValidateError::SinkKernelKindMismatch { name_index: *name });
+                        return Err(ValidateError::SinkKernelKindMismatch {
+                            name_index: *name,
+                            name: n.into(),
+                        });
                     }
                     if !info.replayable {
-                        return Err(ValidateError::NotReplayable { name_index: *name });
+                        return Err(ValidateError::NotReplayable {
+                            name_index: *name,
+                            name: n.into(),
+                        });
                     }
                 }
                 Op::SinkCall { name, .. } => {
@@ -438,7 +465,10 @@ pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTra
                     // run as a silent no-op whose eviction policy never
                     // evicts anything.
                     if n == "attn_page_mask" && !profile.has_attn_page_mask {
-                        return Err(ValidateError::KernelUnavailable { name_index: *name });
+                        return Err(ValidateError::KernelUnavailable {
+                            name_index: *name,
+                            name: n.into(),
+                        });
                     }
                     let scope = KNOWN_SINKS
                         .iter()
@@ -451,12 +481,16 @@ pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTra
                             // Unknown name: available? (bind-time rule)
                             let info = profile
                                 .kernel(n)
-                                .ok_or(ValidateError::KernelUnavailable { name_index: *name })?;
+                                .ok_or_else(|| ValidateError::KernelUnavailable {
+                            name_index: *name,
+                            name: n.into(),
+                        })?;
                             match info.sink_scope {
                                 Some(s) => s,
                                 None => {
                                     return Err(ValidateError::SinkKernelKindMismatch {
                                         name_index: *name,
+                                        name: n.into(),
                                     });
                                 }
                             }
@@ -472,6 +506,7 @@ pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTra
                     if !ok {
                         return Err(ValidateError::SinkMisplaced {
                             name_index: *name,
+                            name: n.into(),
                             stage: sp.stage,
                         });
                     }
@@ -1106,9 +1141,12 @@ mod tests {
             }],
             externs: alloc::vec::Vec::new(),
         };
+        // The resolved name, not just the index, is what makes this diagnosable
+        // by an operator who has a container but not its name table.
         assert!(matches!(
             bind(c, profile),
-            Err(ValidateError::NotReplayable { name_index: 0 })
+            Err(ValidateError::NotReplayable { name_index: 0, ref name })
+                if name == "gpu_load"
         ));
     }
 

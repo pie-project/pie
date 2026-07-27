@@ -122,6 +122,9 @@ class FirePageMask {
     std::uint32_t* out_indices_ = nullptr;
     std::uint32_t* out_indptr_ = nullptr;
     std::uint32_t* out_last_lens_ = nullptr;
+    // Scratch for the compaction's per-request survivor counts. Allocated once
+    // per fire and reused by all 28-odd layers, rather than once per layer.
+    std::uint32_t* counts_ = nullptr;
     cudaStream_t stream_ = nullptr;
     bool active_ = false;
 };

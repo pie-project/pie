@@ -10,7 +10,7 @@
 //
 // Both drivers used to keep their own copy of this, differing only in which
 // backend enum and tile-map mask they passed. The copies had already drifted —
-// CUDA's grew an env-gated `fused_transcode` default that Metal's never
+// CUDA's grew an env-gated fused-transcode default that Metal's never
 // mentioned — so the merged version takes those three as ordinary fields the
 // caller states, and each driver keeps only its own constants.
 
@@ -40,24 +40,21 @@ struct DeviceTarget {
     std::uint32_t preferred_alignment = 0;
     bool fp8_native = false;
     bool native_mxfp4_moe = false;
-    /// Whether this build wants fused transform kernels where they exist. A
-    /// compile input rather than an execution-time switch, so it reaches the
+    /// Which fused transform chains this build has kernels for
+    /// (`PIE_LOADER_FUSION_*`), ORed together.
+    ///
+    /// A compile input rather than an execution-time switch, so it reaches the
     /// plan and the artifact key: flipping it mid-process would otherwise make
-    /// two different plans share one cache entry.
-    bool fused_transcode = false;
-};
-
-/// The model facts the storage compile keys off.
-///
-/// The driver has already parsed `config.json` to build its model; the loader
-/// does not read it a second time (`loader/architecture.md` §10.4). The string
-/// members are borrowed and must outlive the compile call.
-struct ModelFacts {
-    std::string_view model_type;
-    std::string_view quant_method;
-    std::uint32_t num_hidden_layers = 0;
-    std::uint32_t num_experts = 0;
-    std::uint32_t num_experts_per_tok = 0;
+    /// two different plans share one cache entry. The loader knows what each
+    /// fusion *means*; this says only which ones exist here.
+    std::uint32_t fusion_mask = 0;
+    /// The dtype this device's encode kernels dequantize through, which is what
+    /// decides how many rows of scratch fit in `max_tile_bytes`.
+    PieLoaderDType encode_scratch_dtype = PieLoaderDType::BF16;
+    /// Row granularity of the block scales this device's encode path consumes,
+    /// or `0` if it has none. A block-scaled source is not tiled, because a tile
+    /// boundary would cut a scale block in half.
+    std::uint32_t block_scale_rows = 0;
 };
 
 inline PieLoaderBytes borrow(std::string_view text) {
@@ -67,41 +64,30 @@ inline PieLoaderBytes borrow(std::string_view text) {
 
 /// Assemble the request for this device.
 ///
-/// Everything the request borrows — `snapshot_dir`, `runtime_quant`, and the
-/// strings in `model` — must outlive the `pie_loader_compile` call that
-/// consumes it.
-inline PieLoaderRequest build_request(
-    std::string_view snapshot_dir,
-    const DeviceTarget& target,
-    const ModelFacts& model,
-    std::string_view runtime_quant,
-    PieLoaderMxfp4MoeRequest mxfp4_moe,
-    PieLoaderComponent component) {
-    return PieLoaderRequest{
-        .snapshot_dir = borrow(snapshot_dir),
-        .target =
-            {
-                .backend = static_cast<std::uint32_t>(target.backend),
-                .tp_rank = target.tp_rank,
-                .tp_size = target.tp_size,
-                .max_tile_bytes = target.max_tile_bytes,
-                .preferred_alignment = target.preferred_alignment,
-                .tile_map_mask = target.tile_map_mask,
-                .fp8_native = target.fp8_native,
-                .native_mxfp4_moe = target.native_mxfp4_moe,
-                .fused_transcode = target.fused_transcode,
-            },
-        .model =
-            {
-                .model_type = borrow(model.model_type),
-                .quant_method = borrow(model.quant_method),
-                .num_hidden_layers = model.num_hidden_layers,
-                .num_experts = model.num_experts,
-                .num_experts_per_tok = model.num_experts_per_tok,
-            },
-        .runtime_quant = borrow(runtime_quant),
-        .mxfp4_moe = static_cast<std::uint32_t>(mxfp4_moe),
-        .component = static_cast<std::uint32_t>(component),
+/// Marshal a `DeviceTarget` into the POD the loader reads.
+///
+/// One function, in one place. The two copies this replaced — one per driver —
+/// had already disagreed once: a field added for the contract path was a compile
+/// error on one side and a silently stale value on the other.
+///
+/// The `static_cast`s are the ABI rule, not sloppiness. Every enum-valued field
+/// crosses as a `uint32_t` because these are *inputs*: the loader must be able
+/// to reject a value C++ made up, and a Rust enum holding a value outside its
+/// variants is undefined behaviour before any check can run. The plan's
+/// `PieLoaderTargetView` reads back as real enums, because the loader wrote it.
+inline PieLoaderTargetSpec target_spec(const DeviceTarget& target) {
+    return PieLoaderTargetSpec{
+        .backend = static_cast<std::uint32_t>(target.backend),
+        .tp_rank = target.tp_rank,
+        .tp_size = target.tp_size,
+        .max_tile_bytes = target.max_tile_bytes,
+        .preferred_alignment = target.preferred_alignment,
+        .tile_map_mask = target.tile_map_mask,
+        .fp8_native = target.fp8_native,
+        .native_mxfp4_moe = target.native_mxfp4_moe,
+        .fusion_mask = target.fusion_mask,
+        .encode_scratch_dtype = static_cast<std::uint32_t>(target.encode_scratch_dtype),
+        .block_scale_rows = target.block_scale_rows,
     };
 }
 

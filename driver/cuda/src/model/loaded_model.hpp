@@ -13,6 +13,7 @@
 #include <config.hpp>
 #include "loader/load_plan.hpp"
 #include "model/config.hpp"
+#include "pie_driver/model_contracts.hpp"
 #include "pie_loader/checkpoint_source.hpp"
 #include "model/weight_store.hpp"
 #include "tensor.hpp"
@@ -42,8 +43,8 @@ public:
     static LoadedModel load(const Config& boot_cfg,
                             NcclComm* tp_comm,
                             std::string_view runtime_quant,
-                            pie_loader::PieLoaderMxfp4MoeRequest mxfp4_moe,
-                            pie_loader::PieLoaderComponent component);
+                            pie_driver::Mxfp4MoeRequest mxfp4_moe,
+                            pie_driver::Component component);
 
     LoadedModel() = default;
     LoadedModel(const LoadedModel&) = delete;
@@ -59,7 +60,7 @@ public:
     /// Read back rather than re-decided: the plan already materialized the
     /// weights in the layout this implies, so a second opinion here could only
     /// disagree with the bytes on the device.
-    pie_loader::PieLoaderMxfp4MoePolicy mxfp4_moe_policy() const noexcept {
+    pie_driver::Mxfp4MoePolicy mxfp4_moe_policy() const noexcept {
         return mxfp4_moe_policy_;
     }
     LoadedModelCapabilities capabilities() const;
@@ -85,8 +86,8 @@ private:
     Config boot_;
     HfConfig hf_;
     WeightStore weights_;
-    pie_loader::PieLoaderMxfp4MoePolicy mxfp4_moe_policy_ =
-        pie_loader::PieLoaderMxfp4MoePolicy::EagerBf16;
+    pie_driver::Mxfp4MoePolicy mxfp4_moe_policy_ =
+        pie_driver::Mxfp4MoePolicy::EagerBf16;
 };
 
 namespace ops { struct RuntimeQuantScratchSpec; }

@@ -36,7 +36,7 @@ async def _quest(client, args, budget):
             "prompt": PROMPT,
             "max_tokens": 12,
             "page_budget": budget,
-            "temperature": 0.1,
+            "temperature": 0.001,
             "seed": 12345,
         },
         timeout=args.timeout,
@@ -52,7 +52,7 @@ async def _baseline(client, args):
         {
             "prompt": PROMPT,
             "max_tokens": 12,
-            "temperature": 0.1,
+            "temperature": 0.001,
             "seed": 12345,
         },
         timeout=args.timeout,

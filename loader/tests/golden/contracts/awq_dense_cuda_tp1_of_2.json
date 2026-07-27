@@ -1,0 +1,244 @@
+{
+  "abi_version": 1,
+  "alignment": 256,
+  "tensors": [
+    {
+      "name": "model.embed_tokens.weight",
+      "expr": {
+        "Src": "model.embed_tokens.weight"
+      },
+      "shape": [
+        256,
+        256
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      }
+    },
+    {
+      "name": "model.layers.0.input_layernorm.weight",
+      "expr": {
+        "Src": "model.layers.0.input_layernorm.weight"
+      },
+      "shape": [
+        256
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      }
+    },
+    {
+      "name": "model.layers.0.self_attn.q_proj.weight",
+      "expr": {
+        "Shard": {
+          "src": {
+            "Src": "model.layers.0.self_attn.q_proj.weight"
+          },
+          "axis": 0
+        }
+      },
+      "shape": [
+        128,
+        256
+      ],
+      "encoding": {
+        "Quant": {
+          "scheme": "AwqInt4",
+          "logical_dtype": "BF16",
+          "bits_per_element": 4,
+          "group_size": 32,
+          "channel_axis": null,
+          "scale_dtype": "BF16",
+          "zero_point_dtype": null,
+          "block_shape": []
+        }
+      }
+    },
+    {
+      "name": "model.layers.0.self_attn.k_proj.weight",
+      "expr": {
+        "Shard": {
+          "src": {
+            "Src": "model.layers.0.self_attn.k_proj.weight"
+          },
+          "axis": 0
+        }
+      },
+      "shape": [
+        32,
+        256
+      ],
+      "encoding": {
+        "Quant": {
+          "scheme": "AwqInt4",
+          "logical_dtype": "BF16",
+          "bits_per_element": 4,
+          "group_size": 32,
+          "channel_axis": null,
+          "scale_dtype": "BF16",
+          "zero_point_dtype": null,
+          "block_shape": []
+        }
+      }
+    },
+    {
+      "name": "model.layers.0.self_attn.v_proj.weight",
+      "expr": {
+        "Shard": {
+          "src": {
+            "Src": "model.layers.0.self_attn.v_proj.weight"
+          },
+          "axis": 0
+        }
+      },
+      "shape": [
+        32,
+        256
+      ],
+      "encoding": {
+        "Quant": {
+          "scheme": "AwqInt4",
+          "logical_dtype": "BF16",
+          "bits_per_element": 4,
+          "group_size": 32,
+          "channel_axis": null,
+          "scale_dtype": "BF16",
+          "zero_point_dtype": null,
+          "block_shape": []
+        }
+      }
+    },
+    {
+      "name": "model.layers.0.self_attn.o_proj.weight",
+      "expr": {
+        "Shard": {
+          "src": {
+            "Src": "model.layers.0.self_attn.o_proj.weight"
+          },
+          "axis": 1
+        }
+      },
+      "shape": [
+        256,
+        128
+      ],
+      "encoding": {
+        "Quant": {
+          "scheme": "AwqInt4",
+          "logical_dtype": "BF16",
+          "bits_per_element": 4,
+          "group_size": 32,
+          "channel_axis": null,
+          "scale_dtype": "BF16",
+          "zero_point_dtype": null,
+          "block_shape": []
+        }
+      }
+    },
+    {
+      "name": "model.layers.0.mlp.gate_proj.weight",
+      "expr": {
+        "Shard": {
+          "src": {
+            "Src": "model.layers.0.mlp.gate_proj.weight"
+          },
+          "axis": 0
+        }
+      },
+      "shape": [
+        256,
+        256
+      ],
+      "encoding": {
+        "Quant": {
+          "scheme": "AwqInt4",
+          "logical_dtype": "BF16",
+          "bits_per_element": 4,
+          "group_size": 32,
+          "channel_axis": null,
+          "scale_dtype": "BF16",
+          "zero_point_dtype": null,
+          "block_shape": []
+        }
+      }
+    },
+    {
+      "name": "model.layers.0.mlp.up_proj.weight",
+      "expr": {
+        "Shard": {
+          "src": {
+            "Src": "model.layers.0.mlp.up_proj.weight"
+          },
+          "axis": 0
+        }
+      },
+      "shape": [
+        256,
+        256
+      ],
+      "encoding": {
+        "Quant": {
+          "scheme": "AwqInt4",
+          "logical_dtype": "BF16",
+          "bits_per_element": 4,
+          "group_size": 32,
+          "channel_axis": null,
+          "scale_dtype": "BF16",
+          "zero_point_dtype": null,
+          "block_shape": []
+        }
+      }
+    },
+    {
+      "name": "model.layers.0.mlp.down_proj.weight",
+      "expr": {
+        "Shard": {
+          "src": {
+            "Src": "model.layers.0.mlp.down_proj.weight"
+          },
+          "axis": 1
+        }
+      },
+      "shape": [
+        256,
+        256
+      ],
+      "encoding": {
+        "Quant": {
+          "scheme": "AwqInt4",
+          "logical_dtype": "BF16",
+          "bits_per_element": 4,
+          "group_size": 32,
+          "channel_axis": null,
+          "scale_dtype": "BF16",
+          "zero_point_dtype": null,
+          "block_shape": []
+        }
+      }
+    },
+    {
+      "name": "model.layers.0.post_attention_layernorm.weight",
+      "expr": {
+        "Src": "model.layers.0.post_attention_layernorm.weight"
+      },
+      "shape": [
+        256
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      }
+    },
+    {
+      "name": "model.norm.weight",
+      "expr": {
+        "Src": "model.norm.weight"
+      },
+      "shape": [
+        256
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      }
+    }
+  ]
+}
