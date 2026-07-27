@@ -191,6 +191,18 @@ impl<'a> Converter<'a> {
             {
                 return self.visit(&merged, hint);
             }
+            // The same idea, applied to branches that differ in more than what
+            // they require. Two object branches are two productions that begin
+            // with the same brace and the same property names, and an LALR
+            // parser cannot tell which to reduce by - reduce/reduce conflicts
+            // are the largest single reason a schema has no parser here. One
+            // object naming every property any branch names, required only
+            // where every branch requires it, has no choice left to resolve.
+            if self.options.precision.merges_objects()
+                && let Some(merged) = merge_object_choice(schema, options)
+            {
+                return self.visit(&merged, hint);
+            }
             return Ok(Expr::choice(
                 options
                     .iter()
@@ -1152,6 +1164,89 @@ fn length_range(expr: &Expr) -> (u64, Option<u64>) {
             )
         }
     }
+}
+
+/// Fold branches that all describe objects into a single object.
+///
+/// The union of their properties, required only where every branch requires it,
+/// and closed only where every branch closes it. That accepts more than the
+/// branches do - a document may satisfy none of them exactly - which is the
+/// direction a mask is allowed to err in, and it is the difference between a
+/// grammar an LALR parser can build and no grammar at all.
+///
+/// Returns `None` when a branch is not an object, since then there is a real
+/// choice of shape and collapsing it would throw the other shapes away.
+fn merge_object_choice(parent: &Value, branches: &[Value]) -> Option<Value> {
+    let mut properties = serde_json::Map::new();
+    let mut required: Option<Vec<Value>> = None;
+    let mut closed = true;
+    let mut seen = 0;
+
+    for branch in branches {
+        let branch = branch.as_object()?;
+        let names = match branch.get("properties") {
+            Some(Value::Object(names)) => names,
+            // A branch with no properties of its own accepts any object, so
+            // the union is any object and there is nothing to gain.
+            _ => return None,
+        };
+        if branch
+            .get("type")
+            .is_some_and(|kind| kind != &Value::String("object".into()))
+        {
+            return None;
+        }
+        for (name, schema) in names {
+            match properties.get(name) {
+                // Branches that describe the same property differently are
+                // left unconstrained rather than intersected: the union of two
+                // property schemas is not something this front end can build,
+                // and accepting any value there is the safe direction.
+                Some(held) if held != schema => {
+                    properties.insert(name.clone(), Value::Object(Default::default()));
+                }
+                _ => {
+                    properties.insert(name.clone(), schema.clone());
+                }
+            }
+        }
+        let here: Vec<Value> = branch
+            .get("required")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        required = Some(match required {
+            None => here,
+            Some(so_far) => so_far.into_iter().filter(|name| here.contains(name)).collect(),
+        });
+        closed &= branch.get("additionalProperties") == Some(&Value::Bool(false));
+        seen += 1;
+    }
+    if seen < 2 {
+        return None;
+    }
+
+    let mut merged = serde_json::Map::new();
+    for (key, value) in parent.as_object()? {
+        if key != "anyOf" && key != "oneOf" {
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+    // The parent may name properties too, and they join the union.
+    if let Some(Value::Object(theirs)) = merged.get("properties") {
+        for (name, schema) in theirs {
+            properties.entry(name.clone()).or_insert(schema.clone());
+        }
+    }
+    merged.insert("type".into(), Value::String("object".into()));
+    merged.insert("properties".into(), Value::Object(properties));
+    merged.insert("required".into(), Value::Array(required.unwrap_or_default()));
+    if closed {
+        merged.insert("additionalProperties".into(), Value::Bool(false));
+    } else {
+        merged.remove("additionalProperties");
+    }
+    Some(Value::Object(merged))
 }
 
 /// Fold an `anyOf` whose branches only list required properties.

@@ -55,6 +55,13 @@ pub enum Precision {
     /// lexer, but rejects permutations of valid documents. This is also what
     /// XGrammar does.
     Ordered,
+    /// `oneOf` branches that all describe objects collapse into one object:
+    /// every property any branch names, required only where every branch
+    /// requires it. Accepts documents that satisfy no branch exactly, which is
+    /// the direction a mask may err in, and removes the k-way choice that a
+    /// parser cannot resolve - reduce/reduce conflicts are the largest single
+    /// reason a schema has no LALR(1) grammar, and `oneOf` is in 86% of them.
+    Merged,
     /// `anyOf` branches lower on their own, without the sibling keywords that
     /// constrain them. Loses the object those siblings described, and is the
     /// last resort before refusing the schema.
@@ -63,9 +70,10 @@ pub enum Precision {
 
 impl Precision {
     /// Most faithful first.
-    pub const LEVELS: [Precision; 3] = [
+    pub const LEVELS: [Precision; 4] = [
         Precision::Unordered,
         Precision::Ordered,
+        Precision::Merged,
         Precision::Branches,
     ];
 
@@ -77,6 +85,11 @@ impl Precision {
     /// Do `anyOf` branches inherit their sibling keywords?
     pub fn merges_branches(self) -> bool {
         self != Precision::Branches
+    }
+
+    /// May branches that all describe objects collapse into one object?
+    pub fn merges_objects(self) -> bool {
+        self == Precision::Merged
     }
 }
 
