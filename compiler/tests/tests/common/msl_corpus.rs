@@ -1,18 +1,17 @@
-//! The shared corpus the Metal MSL emitters are exercised over — the same
-//! cases the transitional C++ oracle (`compiler/tests/oracle/`) dumps, so the
-//! two dumps can be compared byte for byte.
+//! The shared corpus the Metal MSL emitters are exercised over.
 //!
 //! The plan-taking emitters are driven from **real plans**: every golden in
 //! `compiler/tests/golden/` is decoded from its `container:` hex, bound, and
-//! planned by `pie_plan::compile_bound`. The resulting stage plans are written
-//! (wire form) to `compiler/tests/oracle/corpus/stage_plans.txt` when blessing,
-//! which is what the C++ harness decodes with `pie_native::ptir::plan::decode`
-//! — that file is the contract that both sides saw the *same* plans.
+//! planned by `pie_plan::compile_bound`.
+//!
+//! These cases were originally pinned against a C++ oracle that ran the
+//! drivers' own emitters over the same plans (`compiler/tests/oracle/`, since
+//! deleted with those emitters). What survives is `golden-{msl,cuda}/`: 2,838
+//! cases that now serve as the Rust emitters' regression net. Bless with
+//! `PTIR_REGEN=1` only after reading `ptir-refactor.md` §3.2.
 //!
 //! (The goldens' own `sidecar:` blobs are not used as the plan source: three
-//! of them are stale on this branch relative to today's `pie-plan`, and the
-//! C++ oracle has to see exactly what the Rust emitters see.)
-#![allow(dead_code)]
+//! of them are stale on this branch relative to today's `pie-plan`.)
 
 use pie_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use pie_ir::op::{IntrinsicId, Op};
@@ -46,10 +45,6 @@ pub const GOLDEN_NAMES: &[&str] = &[
 
 pub fn golden_dir() -> String {
     concat!(env!("CARGO_MANIFEST_DIR"), "/golden").into()
-}
-
-pub fn corpus_path() -> String {
-    concat!(env!("CARGO_MANIFEST_DIR"), "/oracle/corpus/stage_plans.txt").into()
 }
 
 pub fn hex(bytes: &[u8]) -> String {
