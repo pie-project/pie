@@ -785,7 +785,15 @@ were last blessed at `c1e148ef2`, so the embedded region-plan (`PTRP`) bytes are
 stale. Container bytes and hashes still match; only the plan section differs.
 
 Reproduced on a pristine `origin/dev` worktree. **Do not re-bless them** — that
-would destroy the evidence that the planner changed. During the move, the panic
+would destroy the evidence that the planner changed.
+
+**This debt now blocks phase 3′.** `ptir_grouped_dispatch` registers
+`section3_masked_gumbel`, which is one of the 13. Its embedded `PTRP` bytes are
+stale, so the driver decodes no region plans and registration fails with "PTIR
+launch has no compiler region plans" — the test compiles and runs again (phase
+2′) but cannot pass until the goldens say something true. Two of the three
+drifted vendored copies were refreshed from `compiler/tests/golden/`; that fixed
+the drift and exposed this underneath it. During the move, the panic
 payloads were diffed against the old suite's: 13/13 byte-identical over 217,921
 bytes, which is what proved the consolidation was behaviour-preserving.
 
