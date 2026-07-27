@@ -258,6 +258,14 @@ void launch_moe_bucket_exact(
 
 // Gather `norm_x[route / top_k]` into aligned rows. Sentinel route ids become
 // zero rows so padded expert blocks are harmless GEMM work.
+//
+// Rows at or after `shared_row_begin` are the shared expert's region: it is
+// appended to the routed blocks as one more expert so its two projections
+// ride inside the routed batched GEMM instead of running as their own
+// 4-thread-block GEMMs. Those rows map straight to token `row -
+// shared_row_begin` (every token visits the shared expert exactly once) and
+// so are not described by `sorted_route_ids` at all. Pass
+// `shared_row_begin < 0` to disable.
 void launch_gather_moe_aligned_inputs_bf16(
     const void* norm_x,
     const std::int32_t* sorted_route_ids,
@@ -266,6 +274,8 @@ void launch_gather_moe_aligned_inputs_bf16(
     int aligned_rows,
     int top_k,
     int hidden,
+    int shared_row_begin,
+    int num_tokens,
     cudaStream_t stream);
 
 void launch_build_moe_ptrs_aligned_bf16(
@@ -286,10 +296,19 @@ void launch_build_moe_ptrs_aligned_bf16(
     int block_size,
     int H,
     int I_moe,
+    // Blocks at or after `routed_blocks` take the shared expert's weights
+    // instead of indexing the routed stack. Pass `routed_blocks == max_blocks`
+    // (or null bases) to disable.
+    int routed_blocks,
+    const void* shared_gate_up_base,
+    const void* shared_down_base,
     cudaStream_t stream);
 
 // Undo the expert-block permutation after down_proj: copies aligned rows back
 // to route order [num_tokens * top_k, hidden]. Sentinel rows are ignored.
+// Rows at or after `shared_row_begin` are the folded shared expert and go to
+// `shared_out[token]` instead, still unscaled — the caller applies the
+// sigmoid scalar gate exactly as it did for the standalone path.
 void launch_reorder_moe_aligned_output_bf16(
     const void* aligned_out,
     const std::int32_t* sorted_route_ids,
@@ -297,6 +316,9 @@ void launch_reorder_moe_aligned_output_bf16(
     int num_routes,
     int aligned_rows,
     int hidden,
+    int shared_row_begin,
+    int num_tokens,
+    void* shared_out,
     cudaStream_t stream);
 
 }  // namespace pie_cuda_driver::kernels

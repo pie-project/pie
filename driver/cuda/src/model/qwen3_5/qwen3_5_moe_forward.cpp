@@ -137,6 +137,39 @@ bool moe_path_log_enabled() {
 // at both. 8 is kept as the default because it is the safe choice across
 // topologies; set PIE_QWEN35_MOE_ALIGNED_DECODE_BLOCK=16 for a tp=2
 // throughput deployment.
+// The shared expert's two projections are dense GEMMs over N rows with
+// N_gemm = 2*Is and H. cuBLAS covers those with only a handful of thread
+// blocks (4 at Is=256), so they run at a few percent of the machine. When
+// Is == Im their weights have exactly the routed expert shapes, so they can
+// instead ride along as one more expert in the routed batched GEMM.
+//
+// MEASURED, AND IT DOES NOT PAY. Qwen3.6-35B-A3B tp2: the profiled decode
+// step at N=128 does improve (moe_shared 2.26 -> 0.85 ms, total 40.02 ->
+// 39.34), but end to end it is noise at 128 requests (3131 vs 3121 tok/s)
+// and a REGRESSION at 256 (4102 vs 4183, -1.9%).
+//
+// The reason is the useful part: the routed batched GEMM costs roughly in
+// proportion to its BLOCK COUNT, not to the distinct weight bytes it reads.
+// The folded shared blocks all point at one weight and hit L2, yet still
+// cost ~their share of the GEMM (+0.56 ms for 16 of 352 blocks at N=128).
+// The fold adds ceil(N/block) blocks, so its cost grows with N while the
+// standalone shared GEMM's is flat in N (weight-bound) -- hence the
+// crossover between 128 and 256 rows.
+//
+// Kept off by default, and kept at all because the same measurement says
+// the ~100 padded blocks of every routed GEMM (352 blocks for ~252 active
+// experts) are NOT free either. A MoE kernel that skips fully-padded blocks
+// the way vLLM's `fused_moe_kernel` does would recover far more than this,
+// and would want the shared expert folded in as well.
+bool shared_fold_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_QWEN35_MOE_FOLD_SHARED");
+        if (v == nullptr || v[0] == '\0') return false;
+        return v[0] != '0';
+    }();
+    return enabled;
+}
+
 int qwen35_moe_aligned_decode_block_size() {
     static const int block = [] {
         const char* v = std::getenv("PIE_QWEN35_MOE_ALIGNED_DECODE_BLOCK");
@@ -592,12 +625,16 @@ Qwen3_5MoeMlpWorkspace Qwen3_5MoeMlpWorkspace::allocate(
     ws.shared_gate_logit = DeviceBuffer<std::uint16_t>::alloc(N * 1);
 
     ws.moe_out = DeviceBuffer<std::uint16_t>::alloc(N * H);
-    ws.a_gu_ptrs     = DeviceBuffer<const std::uint16_t*>::alloc(maxR);
-    ws.b_gu_ptrs     = DeviceBuffer<const std::uint16_t*>::alloc(maxR);
-    ws.c_gu_ptrs     = DeviceBuffer<std::uint16_t*>::alloc(maxR);
-    ws.a_dn_ptrs     = DeviceBuffer<const std::uint16_t*>::alloc(maxR);
-    ws.b_dn_ptrs     = DeviceBuffer<const std::uint16_t*>::alloc(maxR);
-    ws.c_dn_ptrs     = DeviceBuffer<std::uint16_t*>::alloc(maxR);
+    ws.a_gu_ptrs     = DeviceBuffer<const std::uint16_t*>::alloc(3 * maxR + 8);
+    // Sized for the worst-case aligned block count, which exceeds maxR only
+    // if block_size is 1; `+ 2 * maxR` covers the routed padding plus the
+    // folded shared-expert blocks for every block size.
+    const std::size_t ptr_slots = 3 * maxR + 8;
+    ws.b_gu_ptrs     = DeviceBuffer<const std::uint16_t*>::alloc(ptr_slots);
+    ws.c_gu_ptrs     = DeviceBuffer<std::uint16_t*>::alloc(ptr_slots);
+    ws.a_dn_ptrs     = DeviceBuffer<const std::uint16_t*>::alloc(ptr_slots);
+    ws.b_dn_ptrs     = DeviceBuffer<const std::uint16_t*>::alloc(ptr_slots);
+    ws.c_dn_ptrs     = DeviceBuffer<std::uint16_t*>::alloc(ptr_slots);
     ws.batch_weights = DeviceBuffer<float>::alloc(maxR);
 
     ws.aligned_block_size = qwen35_moe_aligned_decode_block_size();
@@ -606,8 +643,13 @@ Qwen3_5MoeMlpWorkspace Qwen3_5MoeMlpWorkspace::allocate(
             std::min<std::size_t>(static_cast<std::size_t>(num_experts), maxR);
         const std::size_t block =
             static_cast<std::size_t>(ws.aligned_block_size);
-        const std::size_t max_blocks =
+        const std::size_t routed_blocks =
             (maxR + active_expert_cap * (block - 1) + block - 1) / block;
+        // The shared expert is folded in as one more expert, occupying
+        // ceil(N / block) blocks at the end. `maxR = maxN * top_k`, and top_k
+        // is at least 1, so maxR bounds maxN.
+        const std::size_t shared_blocks = (maxR + block - 1) / block;
+        const std::size_t max_blocks = routed_blocks + shared_blocks;
         ws.aligned_rows_capacity = max_blocks * block;
         ws.aligned_route_ids =
             DeviceBuffer<std::int32_t>::alloc(ws.aligned_rows_capacity);
@@ -1402,6 +1444,10 @@ bool moe_block(
     // covering both routed and shared partial sums.
     const int Im = cfg.moe_intermediate_size / T;            // routed: sharded
     const int Is = cfg.shared_expert_intermediate_size / T;  // shared: sharded
+    // Set by the decode fast path when the shared expert's projections were
+    // folded into the routed batched GEMM; the shared block below then only
+    // has to apply the sigmoid scalar gate.
+    bool moe_shared_folded = false;
     NcclComm* tp = (T > 1) ? fwd_cfg.tp_comm : nullptr;
     const bool use_decode_fast_path =
         is_pure_decode ||
@@ -1490,10 +1536,28 @@ bool moe_block(
                     !moe_ws.aligned_expert_in.empty();
                 if (use_aligned_decode) {
                     const int active_expert_cap = std::min(E, routes);
-                    const int max_blocks =
+                    const int routed_blocks =
                         (routes + active_expert_cap * (block - 1) +
                          block - 1) / block;
+                    // Fold the shared expert in as one more expert. Its
+                    // weights are [2*Is, H] and [H, Is], which are EXACTLY the
+                    // routed expert shapes when Is == Im, so the same batched
+                    // GEMM covers both. That replaces two GEMMs that cuBLAS
+                    // covers with only ~4 thread blocks (N=512 on 108 SMs)
+                    // with ceil(N/block) more blocks of an already-saturated
+                    // one.
+                    const bool fold_shared = shared_fold_enabled() &&
+                        Is > 0 && Is == Im &&
+                        Lw.shared_gate_up_proj != nullptr &&
+                        Lw.shared_down_proj != nullptr &&
+                        !Lw.shared_down_proj_quant.has_value();
+                    const int shared_blocks =
+                        fold_shared ? (N + block - 1) / block : 0;
+                    const int max_blocks = routed_blocks + shared_blocks;
                     const int aligned_rows = max_blocks * block;
+                    const int shared_row_begin =
+                        fold_shared ? routed_blocks * block : -1;
+                    moe_shared_folded = fold_shared;
                     if (static_cast<std::size_t>(aligned_rows) >
                         moe_ws.aligned_rows_capacity) {
                         throw std::runtime_error(
@@ -1511,7 +1575,7 @@ bool moe_block(
                                 moe_ws.aligned_route_ids.data(),
                                 moe_ws.aligned_expert_ids.data(),
                                 /*route_to_aligned_row=*/nullptr,
-                                routes, E, block, max_blocks, stream);
+                                routes, E, block, routed_blocks, stream);
                                 });
                             profile_cuda_detail_stage(
                                 profile, profile ? &profile->moe_gather_ms : nullptr,
@@ -1519,7 +1583,8 @@ bool moe_block(
                             kernels::launch_gather_moe_aligned_inputs_bf16(
                                 ws.norm_x.data(), moe_ws.aligned_route_ids.data(),
                                 moe_ws.aligned_expert_in.data(),
-                                routes, aligned_rows, K, H, stream);
+                                routes, aligned_rows, K, H,
+                                shared_row_begin, N, stream);
                                 });
                             profile_cuda_detail_stage(
                                 profile, profile ? &profile->moe_ptrs_ms : nullptr,
@@ -1538,7 +1603,13 @@ bool moe_block(
                                 reinterpret_cast<const void**>(moe_ws.a_dn_ptrs.data()),
                                 reinterpret_cast<const void**>(moe_ws.b_dn_ptrs.data()),
                                 reinterpret_cast<void**>(moe_ws.c_dn_ptrs.data()),
-                                max_blocks, block, H, Im, stream);
+                                max_blocks, block, H, Im,
+                                fold_shared ? routed_blocks : max_blocks,
+                                fold_shared ? Lw.shared_gate_up_proj->data()
+                                            : nullptr,
+                                fold_shared ? Lw.shared_down_proj->data()
+                                            : nullptr,
+                                stream);
                                 });
                         });
 
@@ -1584,7 +1655,11 @@ bool moe_block(
                                 moe_ws.aligned_out.data(),
                                 moe_ws.aligned_route_ids.data(),
                                 moe_ws.expert_out.data(),
-                                routes, aligned_rows, H, stream);
+                                routes, aligned_rows, H,
+                                shared_row_begin, N,
+                                fold_shared ? moe_ws.shared_out.data()
+                                            : nullptr,
+                                stream);
                             if (add_to_residual) {
                                 kernels::launch_token_batched_weighted_sum_add_bf16(
                                     moe_out, moe_ws.expert_out.data(),
@@ -1835,7 +1910,10 @@ bool moe_block(
             stream, [&] {
                 const bool fused_shared_scalar_gate =
                     Lw.shared_gate_up_gate_proj != nullptr;
-                if (fused_shared_scalar_gate) {
+                // Folded: the routed batched GEMM already produced
+                // `moe_ws.shared_out`, so only the scalar gate is left.
+                if (moe_shared_folded) {
+                } else if (fused_shared_scalar_gate) {
                     profile_cuda_detail_stage(
                         profile, profile ? &profile->moe_shared_gate_up_ms : nullptr,
                         stream, [&] {
@@ -1878,15 +1956,17 @@ bool moe_block(
                                 N * Is, stream);
                         });
                 }
-                profile_cuda_detail_stage(
-                    profile, profile ? &profile->moe_shared_down_ms : nullptr,
-                    stream, [&] {
-                        ops::gemm_act_x_w(cublas.handle(),
-                            moe_ws.shared_act.data(),
-                            make_weight_view(
-                                Lw.shared_down_proj, Lw.shared_down_proj_quant),
-                            moe_ws.shared_out.data(), N, H, Is);
-                    });
+                if (!moe_shared_folded) {
+                    profile_cuda_detail_stage(
+                        profile, profile ? &profile->moe_shared_down_ms : nullptr,
+                        stream, [&] {
+                            ops::gemm_act_x_w(cublas.handle(),
+                                moe_ws.shared_act.data(),
+                                make_weight_view(
+                                    Lw.shared_down_proj, Lw.shared_down_proj_quant),
+                                moe_ws.shared_out.data(), N, H, Is);
+                        });
+                }
 
                 // shared_gate logit [N, 1] = norm_x @ shared_gate.weight.T
                 profile_cuda_detail_stage(
