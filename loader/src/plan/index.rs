@@ -40,12 +40,54 @@ impl LoadPlan {
             .instrs
             .get(id.0 as usize)
             .ok_or_else(|| Error::Internal(format!("instruction {} is not in the plan", id.0)))?;
-        dense(
-            crate::plan::passes::instr_id_of(instr).0,
-            id.0,
-            "instruction",
-        )?;
+        dense(instr_id_of(instr).0, id.0, "instruction")?;
         Ok(instr)
+    }
+}
+
+/// Resolve a scheduled instruction by id, against a slice the caller owns.
+///
+/// The passes clone `instrs` before rewriting it, so they cannot go through
+/// [`LoadPlan::instr`]. Same invariant, same refusal: ids are dense, and a
+/// position that holds a different id means something built the plan wrong.
+pub(crate) fn instr_by_id(instrs: &[StorageInstr], id: InstrId) -> Result<&StorageInstr> {
+    let found = instrs
+        .get(id.0 as usize)
+        .ok_or_else(|| Error::Internal(format!("scheduled instr {} is missing", id.0)))?;
+    if instr_id_of(found) != id {
+        return Err(Error::Internal(format!(
+            "instruction ids are not dense: position {} holds {}",
+            id.0,
+            instr_id_of(found).0
+        )));
+    }
+    Ok(found)
+}
+
+/// The id every instruction carries, whichever variant it is.
+pub(crate) fn instr_id_of(instr: &StorageInstr) -> InstrId {
+    match instr {
+        StorageInstr::Allocate { id, .. }
+        | StorageInstr::Fill { id, .. }
+        | StorageInstr::ExtentWrite { id, .. }
+        | StorageInstr::BulkExtentWrite { id, .. }
+        | StorageInstr::SlabScatter { id, .. }
+        | StorageInstr::TileMap { id, .. }
+        | StorageInstr::CreateView { id, .. }
+        | StorageInstr::Finalize { id, .. } => *id,
+    }
+}
+
+pub(crate) fn set_instr_id(instr: &mut StorageInstr, new_id: InstrId) {
+    match instr {
+        StorageInstr::Allocate { id, .. }
+        | StorageInstr::Fill { id, .. }
+        | StorageInstr::ExtentWrite { id, .. }
+        | StorageInstr::BulkExtentWrite { id, .. }
+        | StorageInstr::SlabScatter { id, .. }
+        | StorageInstr::TileMap { id, .. }
+        | StorageInstr::CreateView { id, .. }
+        | StorageInstr::Finalize { id, .. } => *id = new_id,
     }
 }
 

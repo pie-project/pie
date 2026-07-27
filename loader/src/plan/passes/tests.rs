@@ -4,10 +4,14 @@
 //! contract, which is the point: a plan can be malformed in ways no contract
 //! can express, and the validators exist for exactly those.
 
-use super::arena::validate_persistent_layout;
-use super::rewrite::{try_merge_bulk_extent_write, validate_target_support};
-use super::*;
-use crate::types::{BackendKind, FileId, TensorId};
+use super::rewrite::try_merge_bulk_extent_write;
+use super::validate::{validate_persistent_layout, validate_target_support};
+use crate::extent::Extent;
+use crate::plan::{
+    BufferDecl, DestExtent, LoadPlan, SourceExtent, StorageInstr, StorageTarget, TileMapKind,
+    TileSpec, TransformSpec,
+};
+use crate::types::{BackendKind, BufferId, FileId, InstrId, TensorId};
 
 fn operand(id: u32, bytes: u64, alignment: u32, offset: Option<u64>) -> BufferDecl {
     BufferDecl {
@@ -65,7 +69,7 @@ fn rejects_view_escaping_backing() {
         view: DestExtent {
             buffer: BufferId(1),
             offset: 32,
-            stride: Extent::contiguous(64),
+            stride: Extent::byte_run(64),
         },
     });
     // Window [32, 96) escapes the 64-byte backing buffer.
@@ -81,7 +85,7 @@ fn bulk_merge_respects_target_tile_bound() {
             tensor_id: TensorId(id),
             file_offset,
             span_bytes: 8,
-            stride: Extent::contiguous(8),
+            stride: Extent::byte_run(8),
         },
         dest_offset,
     };

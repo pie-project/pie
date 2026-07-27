@@ -6,24 +6,25 @@
 //! `assign-persistent-offsets` has decided where the arena puts things, and
 //! nothing can be counted before the coalescing is done. Under v1 this order
 //! was seven consecutive statements in the middle of a 954-line file.
+//!
+//! The four modules split by what a pass *does*, not by what it touches:
+//! [`arena`] assigns the persistent offsets everything downstream reads,
+//! [`rewrite`] rewrites the schedule, [`memory`] recounts it, and [`validate`]
+//! only refuses. Nothing here is re-exported as a prelude — a pass names what
+//! it uses, so moving one is a matter of moving its imports with it.
 
-use crate::error::{Error, Result};
-use crate::extent::Extent;
-use crate::plan::geometry::*;
+use crate::error::Result;
+use crate::plan::LoadPlan;
 use crate::plan::pass::{FnPass, Pass};
-use crate::plan::*;
-use crate::types::{BufferId, InstrId, QuantScheme, RepackLayout};
-use std::collections::{HashMap, HashSet};
 
 mod arena;
 mod memory;
 mod rewrite;
 pub mod tile;
+mod validate;
 
 #[cfg(test)]
 mod tests;
-
-pub(crate) use rewrite::instr_id_of;
 
 /// The pipeline.
 ///
@@ -51,11 +52,11 @@ pub fn all() -> Vec<Box<dyn Pass>> {
             rewrite::merge_adjacent_extent_writes,
         ),
         boxed("recompute-memory-plan", memory::recompute_memory_plan),
-        boxed("validate-fill-order", rewrite::validate_fill_order),
-        boxed("validate-target-support", rewrite::validate_target_support),
+        boxed("validate-fill-order", validate::validate_fill_order),
+        boxed("validate-target-support", validate::validate_target_support),
         boxed(
             "validate-persistent-layout",
-            arena::validate_persistent_layout,
+            validate::validate_persistent_layout,
         ),
     ]
 }

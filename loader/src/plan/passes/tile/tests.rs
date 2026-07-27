@@ -8,8 +8,8 @@
 
 use super::*;
 use crate::plan::{
-    BufferDecl, Dim, Extent, FUSION_FP8_TO_MXFP4, LoadPlan, SourceTensorDecl, StorageInstr,
-    TileSpec, TransformSpec,
+    BufferDecl, Extent, FUSION_FP8_TO_MXFP4, LoadPlan, SourceTensorDecl, StorageInstr, TileSpec,
+    TransformSpec,
 };
 use crate::types::{FileId, InstrId, QuantSpec, TensorId};
 
@@ -233,26 +233,6 @@ fn each_backend_resolves_to_its_own_rules() {
 // Fact extraction: what the pass reads out of the plan before a backend sees it.
 // ---------------------------------------------------------------------------
 
-fn compact_extent(rows: i64, cols: i64, element_bytes: u32) -> Extent {
-    let eb = i64::from(element_bytes);
-    Extent {
-        base_offset: 0,
-        element_bytes,
-        dims: vec![
-            Dim {
-                count: rows,
-                src_stride: cols * eb,
-                dst_stride: cols * eb,
-            },
-            Dim {
-                count: cols,
-                src_stride: eb,
-                dst_stride: eb,
-            },
-        ],
-    }
-}
-
 /// A plan with one Encode reading tensor 0 into buffer 0, declared `[rows, cols]`
 /// but allocated flat as MXFP4 output is.
 fn encode_plan(encoding: Encoding, rows: i64, cols: i64) -> LoadPlan {
@@ -296,7 +276,7 @@ fn encode_plan(encoding: Encoding, rows: i64, cols: i64) -> LoadPlan {
             tensor_id: TensorId(0),
             file_offset: 0,
             span_bytes: 0,
-            stride: compact_extent(rows, cols, 2),
+            stride: Extent::dense(&[rows, cols], 2),
         }),
         dest: None,
         inputs: Vec::new(),

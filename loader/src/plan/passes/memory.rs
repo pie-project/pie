@@ -1,7 +1,12 @@
 //! Memory accounting: recompute the plan's persistent / temporary /
 //! scratch peaks and its checkpoint-read and device-write totals.
 
-use super::*;
+use std::collections::HashSet;
+
+use crate::error::{Error, Result};
+use crate::plan::geometry::extent_storage_bytes;
+use crate::plan::index::instr_by_id;
+use crate::plan::{LoadPlan, StorageInstr};
 
 pub(super) fn recompute_memory_plan(program: &mut LoadPlan) -> Result<usize> {
     let mut persistent_bytes = 0u64;
@@ -30,7 +35,7 @@ pub(super) fn recompute_memory_plan(program: &mut LoadPlan) -> Result<usize> {
         let instr = instr_by_id(&program.instrs, *instr_id)?;
         match instr {
             StorageInstr::Allocate { buffer, .. } => {
-                let bytes = buffer_bytes(program, *buffer)?;
+                let bytes = program.buffer(*buffer)?.bytes;
                 if live.insert(*buffer) {
                     live_bytes = live_bytes
                         .checked_add(bytes)
@@ -93,7 +98,7 @@ pub(super) fn recompute_memory_plan(program: &mut LoadPlan) -> Result<usize> {
                     let mut total = 0u64;
                     for output in outputs {
                         total = total
-                            .checked_add(buffer_bytes(program, *output)?)
+                            .checked_add(program.buffer(*output)?.bytes)
                             .ok_or_else(|| Error::Overflow("write byte overflow".to_string()))?;
                     }
                     total

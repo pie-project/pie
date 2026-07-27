@@ -18,6 +18,15 @@
 //!
 //! [`Rect::split`] is the only bridge, and it is where the dense-destination
 //! rule is enforced, once.
+//!
+//! The predicates live here for the same reason the type does. "Is this extent
+//! simple enough to merge" had four answers in three modules — `is_contiguous`,
+//! `is_byte_extent`, `compact_extent_for_copy` and a fourth `compact_extent`
+//! that asked only about the destination — and they were not the same question
+//! written four times, they were three different questions sharing two names.
+//! They are now [`Extent::is_dense`], [`Extent::has_dense_destination`] and
+//! [`Extent::is_byte_run`], strictly ordered, each paired with the constructor
+//! that produces the shape it recognises.
 
 use serde::{Deserialize, Serialize};
 
@@ -53,8 +62,9 @@ pub struct Extent {
 }
 
 impl Extent {
-    /// One unbroken run of `bytes` bytes.
-    pub fn contiguous(bytes: u64) -> Self {
+    /// One unbroken run of `bytes` bytes — the shape [`Extent::is_byte_run`]
+    /// recognises.
+    pub fn byte_run(bytes: u64) -> Self {
         Self {
             base_offset: 0,
             element_bytes: 1,
@@ -66,10 +76,68 @@ impl Extent {
         }
     }
 
-    /// Whether this addresses one unbroken block, and so could be aliased
-    /// rather than copied.
-    pub fn is_contiguous(&self) -> bool {
-        self.dims.len() == 1 && self.dims[0].src_stride == 1 && self.dims[0].dst_stride == 1
+    /// Whether neither side skips: walking from the innermost dimension out,
+    /// every stride is the running dense extent.
+    ///
+    /// This is the question a pass asks before merging two copies, because a
+    /// dense extent is one the merge can describe as a longer run.
+    pub fn is_dense(&self) -> bool {
+        self.walk_dense(|dim, stride| dim.src_stride == stride && dim.dst_stride == stride)
+    }
+
+    /// The same question, asked of the destination alone.
+    ///
+    /// An executor writing into an arena cares only that *its* side is packed;
+    /// the source may stride however the file does. `spec.md` §3.3's third fold
+    /// rule is this property stated over a [`Rect`] instead.
+    pub fn has_dense_destination(&self) -> bool {
+        self.walk_dense(|dim, stride| dim.dst_stride == stride)
+    }
+
+    /// Whether this is one unbroken run of bytes from offset zero — the shape
+    /// [`Extent::byte_run`] builds, and the only one a bulk or slab write can
+    /// carry.
+    ///
+    /// Stronger than [`Extent::is_dense`]: density is preserved by scaling, but
+    /// a bulk write also needs the base folded in and the elements byte-sized,
+    /// so that the whole extent is a `{offset, len}` pair.
+    pub fn is_byte_run(&self) -> bool {
+        self.base_offset == 0 && self.element_bytes == 1 && self.dims.len() == 1 && self.is_dense()
+    }
+
+    /// The dense row-major layout of `shape`, both sides packed — the shape
+    /// [`Extent::is_dense`] recognises.
+    pub fn dense(shape: &[i64], element_bytes: u64) -> Self {
+        let mut stride = i64::try_from(element_bytes).unwrap_or(i64::MAX);
+        let mut dims = Vec::with_capacity(shape.len());
+        for dim in shape.iter().rev() {
+            dims.push(Dim {
+                count: *dim,
+                src_stride: stride,
+                dst_stride: stride,
+            });
+            stride = stride.saturating_mul(*dim);
+        }
+        dims.reverse();
+        Self {
+            base_offset: 0,
+            element_bytes: u32::try_from(element_bytes).unwrap_or(u32::MAX),
+            dims,
+        }
+    }
+
+    fn walk_dense(&self, packed: impl Fn(&Dim, i64) -> bool) -> bool {
+        let mut stride = i64::from(self.element_bytes);
+        for dim in self.dims.iter().rev() {
+            if dim.count < 0 || !packed(dim, stride) {
+                return false;
+            }
+            match stride.checked_mul(dim.count) {
+                Some(next) => stride = next,
+                None => return false,
+            }
+        }
+        true
     }
 }
 
@@ -105,8 +173,10 @@ impl Rect {
         self.dims.iter().map(|dim| dim.count).product::<i64>() as u64
     }
 
-    /// Whether this moves one unbroken block.
-    pub fn is_contiguous(&self) -> bool {
+    /// Whether this moves one unbroken block. The same question
+    /// [`Extent::is_byte_run`] answers, minus the base offsets a [`Rect`]
+    /// carries separately.
+    pub fn is_byte_run(&self) -> bool {
         self.dims.len() == 1 && self.dims[0].src_stride == 1 && self.dims[0].dst_stride == 1
     }
 
@@ -120,8 +190,8 @@ impl Rect {
     /// wrong and the copy is rejected rather than silently mis-lowered.
     pub fn split(&self) -> Result<(Extent, Extent)> {
         let bytes = self.bytes();
-        if self.is_contiguous() {
-            return Ok((Extent::contiguous(bytes), Extent::contiguous(bytes)));
+        if self.is_byte_run() {
+            return Ok((Extent::byte_run(bytes), Extent::byte_run(bytes)));
         }
         let (inner, outer) = self
             .dims
@@ -172,5 +242,70 @@ impl Rect {
                 dims: dest_dims,
             },
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The three predicates order strictly, and the constructors land where
+    /// their names say. Written because the crate used to spell these four
+    /// different ways in three modules, and nothing checked they agreed.
+    #[test]
+    fn the_predicates_are_ordered_by_strength() {
+        let run = Extent::byte_run(64);
+        assert!(run.is_byte_run() && run.is_dense() && run.has_dense_destination());
+
+        let rows = Extent::dense(&[4, 8], 2);
+        assert!(rows.is_dense() && rows.has_dense_destination());
+        assert!(!rows.is_byte_run(), "two dims is not one run");
+    }
+
+    #[test]
+    fn a_strided_source_still_writes_a_dense_destination() {
+        let gathered = Extent {
+            base_offset: 0,
+            element_bytes: 2,
+            dims: vec![Dim {
+                count: 4,
+                src_stride: 64,
+                dst_stride: 2,
+            }],
+        };
+        assert!(gathered.has_dense_destination());
+        assert!(!gathered.is_dense(), "the source skips");
+    }
+
+    #[test]
+    fn a_byte_run_needs_its_base_folded_in() {
+        let offset = Extent {
+            base_offset: 512,
+            ..Extent::byte_run(64)
+        };
+        assert!(offset.is_dense(), "density says nothing about the base");
+        assert!(
+            !offset.is_byte_run(),
+            "a bulk write carries offset plus len"
+        );
+    }
+
+    #[test]
+    fn dense_is_the_layout_a_shape_gets() {
+        assert_eq!(
+            Extent::dense(&[3, 5], 4).dims,
+            vec![
+                Dim {
+                    count: 3,
+                    src_stride: 20,
+                    dst_stride: 20
+                },
+                Dim {
+                    count: 5,
+                    src_stride: 4,
+                    dst_stride: 4
+                },
+            ]
+        );
     }
 }

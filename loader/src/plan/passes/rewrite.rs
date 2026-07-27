@@ -2,7 +2,14 @@
 //! arena-relative bulk copies, batch them into slab scatters, merge adjacent
 //! extent writes, and check the target supports every emitted tile map.
 
-use super::*;
+use std::collections::HashSet;
+
+use crate::error::{Error, Result};
+use crate::extent::Extent;
+use crate::plan::geometry::extent_storage_bytes;
+use crate::plan::index::{instr_by_id, set_instr_id};
+use crate::plan::{LoadPlan, SlabPlacement, SourceExtent, StorageInstr};
+use crate::types::{BufferId, InstrId};
 
 pub(super) fn coalesce_persistent_arena_writes(program: &mut LoadPlan) -> Result<usize> {
     if program.schedule.is_empty() {
@@ -45,64 +52,14 @@ pub(super) fn non_bulk_compatible_persistent_write_buffers(
         if buffer.persistent_offset.is_none() {
             continue;
         }
-        if !compact_extent_for_copy(&source.stride)
-            || !compact_extent_for_copy(&dest.stride)
+        if !source.stride.is_dense()
+            || !dest.stride.is_dense()
             || source.span_bytes != extent_storage_bytes(&dest.stride)?
         {
             blocked.insert(dest.buffer);
         }
     }
     Ok(blocked)
-}
-
-/// Every `Fill` runs before every write to the buffer it zeroes.
-///
-/// A fill is the one instruction whose *absence of order* is silent: run it
-/// late and the plan still validates, still has the right instruction count,
-/// and hands back a tensor whose padded region has eaten real data. Passes
-/// that reorder are free to move fills as long as this holds.
-pub(super) fn validate_fill_order(program: &mut LoadPlan) -> Result<usize> {
-    let mut filled: HashMap<BufferId, usize> = HashMap::new();
-    for (at, id) in program.schedule.iter().enumerate() {
-        if let StorageInstr::Fill { buffer, .. } = instr_by_id(&program.instrs, *id)? {
-            filled.insert(*buffer, at);
-        }
-    }
-    if filled.is_empty() {
-        return Ok(0);
-    }
-    for (at, id) in program.schedule.iter().enumerate() {
-        let instr = instr_by_id(&program.instrs, *id)?;
-        let buffer = match instr {
-            StorageInstr::ExtentWrite { dest, .. } => dest.buffer,
-            StorageInstr::BulkExtentWrite { .. } | StorageInstr::SlabScatter { .. } => {
-                // Arena-relative: the destination is an offset, not a buffer,
-                // so any fill of a persistent buffer could overlap it.
-                match filled.keys().find(|buffer| {
-                    program
-                        .buffer(**buffer)
-                        .is_ok_and(|decl| decl.persistent_offset.is_some())
-                }) {
-                    Some(buffer) => *buffer,
-                    None => continue,
-                }
-            }
-            StorageInstr::TileMap { outputs, .. } => match outputs.first() {
-                Some(buffer) => *buffer,
-                None => continue,
-            },
-            _ => continue,
-        };
-        if let Some(fill_at) = filled.get(&buffer)
-            && *fill_at > at
-        {
-            return Err(Error::Internal(format!(
-                "buffer {} is written at step {at} but not zeroed until step {fill_at}",
-                buffer.0
-            )));
-        }
-    }
-    Ok(0)
 }
 
 pub(super) fn hoist_bulk_extent_writes(program: &mut LoadPlan) -> Result<usize> {
@@ -350,7 +307,7 @@ pub(super) fn slab_can_accept(
     let StorageInstr::BulkExtentWrite { source, .. } = next else {
         return Ok(false);
     };
-    if source.file_id != file_id || !is_byte_extent(&source.stride) {
+    if source.file_id != file_id || !source.stride.is_byte_run() {
         return Ok(false);
     }
     let start = source
@@ -474,8 +431,8 @@ pub(super) fn extent_write_as_bulk(
     let StorageInstr::ExtentWrite { id, source, dest } = instr else {
         return Ok(None);
     };
-    if !compact_extent_for_copy(&source.stride)
-        || !compact_extent_for_copy(&dest.stride)
+    if !source.stride.is_dense()
+        || !dest.stride.is_dense()
         || source.span_bytes != extent_storage_bytes(&dest.stride)?
     {
         return Ok(None);
@@ -500,7 +457,7 @@ pub(super) fn extent_write_as_bulk(
                 .checked_add(source.stride.base_offset)
                 .ok_or_else(|| Error::Overflow("source offset overflow".to_string()))?,
             span_bytes: source.span_bytes,
-            stride: Extent::contiguous(source.span_bytes),
+            stride: Extent::byte_run(source.span_bytes),
         },
         dest_offset,
     }))
@@ -528,8 +485,8 @@ pub(super) fn try_merge_bulk_extent_write(
     };
 
     if prev_source.file_id != cur_source.file_id
-        || !is_byte_extent(&prev_source.stride)
-        || !is_byte_extent(&cur_source.stride)
+        || !prev_source.stride.is_byte_run()
+        || !cur_source.stride.is_byte_run()
     {
         return Ok(false);
     }
@@ -555,62 +512,8 @@ pub(super) fn try_merge_bulk_extent_write(
     }
     prev_source.file_offset = prev_source_start;
     prev_source.span_bytes = span_bytes;
-    prev_source.stride = Extent::contiguous(span_bytes);
+    prev_source.stride = Extent::byte_run(span_bytes);
     Ok(true)
-}
-
-pub(super) fn compact_extent_for_copy(extent: &Extent) -> bool {
-    if extent.dims.iter().any(|dim| dim.count < 0) {
-        return false;
-    }
-    let mut stride = i64::from(extent.element_bytes);
-    for dim in extent.dims.iter().rev() {
-        if dim.src_stride != stride || dim.dst_stride != stride {
-            return false;
-        }
-        stride = match stride.checked_mul(dim.count) {
-            Some(value) => value,
-            None => return false,
-        };
-    }
-    true
-}
-
-pub(super) fn validate_target_support(program: &mut LoadPlan) -> Result<usize> {
-    for instr in &program.instrs {
-        let StorageInstr::TileMap {
-            kind, transform, ..
-        } = instr
-        else {
-            continue;
-        };
-        let advertised = program.target.tile_map_mask & kind.capability_bit() != 0;
-        let supported = advertised
-            && (matches!(kind, TileMapKind::Cast | TileMapKind::Reblock)
-                || (*kind == TileMapKind::Encode
-                    && matches!(
-                        transform.to,
-                        Some(
-                            QuantScheme::Fp8E4M3
-                                | QuantScheme::Int8Symmetric
-                                | QuantScheme::Mxfp4E2M1E8M0
-                        )
-                    ))
-                || (*kind == TileMapKind::Repack
-                    && (matches!(transform.repack.layout, RepackLayout::DenseRowGather)
-                        || (program.target.native_mxfp4_moe
-                            && matches!(
-                                transform.repack.layout,
-                                RepackLayout::MarlinMxfp4Weight | RepackLayout::MarlinMxfp4Scale
-                            )))));
-        if !supported {
-            return Err(Error::Unsupported(format!(
-                "{:?} target does not support {:?} TileMap ({:?}->{:?})",
-                program.target.backend, kind, transform.from, transform.to
-            )));
-        }
-    }
-    Ok(0)
 }
 
 pub(super) fn merge_adjacent_extent_writes(program: &mut LoadPlan) -> Result<usize> {
@@ -680,10 +583,10 @@ pub(super) fn try_merge_extent_write(
 
     if prev_source.file_id != cur_source.file_id
         || prev_dest.buffer != cur_dest.buffer
-        || !is_byte_extent(&prev_source.stride)
-        || !is_byte_extent(&cur_source.stride)
-        || !is_byte_extent(&prev_dest.stride)
-        || !is_byte_extent(&cur_dest.stride)
+        || !prev_source.stride.is_byte_run()
+        || !cur_source.stride.is_byte_run()
+        || !prev_dest.stride.is_byte_run()
+        || !cur_dest.stride.is_byte_run()
     {
         return Ok(false);
     }
@@ -723,43 +626,8 @@ pub(super) fn try_merge_extent_write(
         .ok_or_else(|| Error::Overflow("merged extent overflow".to_string()))?;
     prev_source.file_offset = prev_source_start;
     prev_source.span_bytes = span_bytes;
-    prev_source.stride = Extent::contiguous(span_bytes);
+    prev_source.stride = Extent::byte_run(span_bytes);
     prev_dest.offset = prev_dest_start;
-    prev_dest.stride = Extent::contiguous(span_bytes);
+    prev_dest.stride = Extent::byte_run(span_bytes);
     Ok(true)
-}
-
-pub(super) fn is_byte_extent(extent: &Extent) -> bool {
-    extent.base_offset == 0
-        && extent.element_bytes == 1
-        && extent.dims.len() == 1
-        && extent.dims[0].src_stride == 1
-        && extent.dims[0].dst_stride == 1
-        && extent.dims[0].count >= 0
-}
-
-pub(crate) fn instr_id_of(instr: &StorageInstr) -> InstrId {
-    match instr {
-        StorageInstr::Allocate { id, .. }
-        | StorageInstr::Fill { id, .. }
-        | StorageInstr::ExtentWrite { id, .. }
-        | StorageInstr::BulkExtentWrite { id, .. }
-        | StorageInstr::SlabScatter { id, .. }
-        | StorageInstr::TileMap { id, .. }
-        | StorageInstr::CreateView { id, .. }
-        | StorageInstr::Finalize { id, .. } => *id,
-    }
-}
-
-pub(super) fn set_instr_id(instr: &mut StorageInstr, new_id: InstrId) {
-    match instr {
-        StorageInstr::Allocate { id, .. }
-        | StorageInstr::Fill { id, .. }
-        | StorageInstr::ExtentWrite { id, .. }
-        | StorageInstr::BulkExtentWrite { id, .. }
-        | StorageInstr::SlabScatter { id, .. }
-        | StorageInstr::TileMap { id, .. }
-        | StorageInstr::CreateView { id, .. }
-        | StorageInstr::Finalize { id, .. } => *id = new_id,
-    }
 }

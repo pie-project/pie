@@ -299,7 +299,7 @@ impl HostExecutor<'_> {
         source_stride: &Extent,
     ) -> Result<(), Error> {
         require_same_byte_count(source_stride, &dest.stride)?;
-        if !compact_extent(&dest.stride) {
+        if !dest.stride.has_dense_destination() {
             return Err(invalid(
                 "non-compact ExtentWrite destinations are unsupported",
             ));
@@ -362,7 +362,7 @@ impl HostExecutor<'_> {
         if let Some(dest) = dest {
             let source_stride = source.map(|source| &source.stride).unwrap_or(&dest.stride);
             require_same_byte_count(source_stride, &dest.stride)?;
-            if !compact_extent(&dest.stride) {
+            if !dest.stride.has_dense_destination() {
                 return Err(invalid("non-compact TileMap destinations are unsupported"));
             }
             let base = checked_usize(dest.offset)?
@@ -594,20 +594,6 @@ fn require_same_byte_count(source: &Extent, dest: &Extent) -> Result<(), Error> 
         )));
     }
     Ok(())
-}
-
-fn compact_extent(extent: &Extent) -> bool {
-    let mut stride = i64::from(extent.element_bytes);
-    for dim in extent.dims.iter().rev() {
-        if dim.count < 0 || dim.dst_stride != stride {
-            return false;
-        }
-        let Some(next) = stride.checked_mul(dim.count) else {
-            return false;
-        };
-        stride = next;
-    }
-    true
 }
 
 fn unravel(mut linear: usize, shape: &[usize]) -> Vec<usize> {

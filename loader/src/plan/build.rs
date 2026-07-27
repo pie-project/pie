@@ -36,8 +36,8 @@ use crate::contract::{Expr, ModelContract, TensorContract, TensorType};
 use crate::error::{Error, Result};
 use crate::extent::Extent;
 use crate::plan::geometry::{
-    dtype_to_quant_marker, full_dest_extent, narrow_repack_source, repack_stage_bytes,
-    source_is_dense, storage_extent_for_shape, strided_physical_source_bytes,
+    full_dest_extent, narrow_repack_source, repack_stage_bytes, storage_extent_for_shape,
+    strided_physical_source_bytes,
 };
 use crate::plan::{
     BufferDecl, CheckpointFileDecl, DestExtent, LoadPlan, SourceExtent, SourceTensorDecl,
@@ -274,7 +274,7 @@ impl Builder<'_> {
                         stride,
                     }));
                 }
-                Value::Buffer(buffer) if rect.is_contiguous() => {
+                Value::Buffer(buffer) if rect.is_byte_run() => {
                     let out = self.declare_view_buffer(decl);
                     let instr = self.next_instr();
                     self.program.instrs.push(StorageInstr::CreateView {
@@ -330,7 +330,7 @@ impl Builder<'_> {
                 Value::Buffer(buffer) => {
                     let (shape, encoding) = self.leaf_type(lowering, rect.leaf)?;
                     let input_bytes = encoding_nbytes(&shape, &encoding);
-                    if !rect.is_contiguous()
+                    if !rect.is_byte_run()
                         || rect.src_offset != 0
                         || input_bytes != Some(rect.bytes())
                     {
@@ -891,4 +891,23 @@ fn annotate(err: Error, name: &str) -> Error {
         Error::Shard(msg) => Error::Shard(format!("'{name}': {msg}")),
         other => other,
     }
+}
+
+fn dtype_to_quant_marker(dtype: DType) -> QuantScheme {
+    match dtype {
+        DType::F8E4M3 => QuantScheme::Fp8E4M3,
+        DType::F8E5M2 => QuantScheme::Fp8E5M2,
+        DType::I8 | DType::U8 => QuantScheme::Int8Symmetric,
+        _ => QuantScheme::None,
+    }
+}
+
+/// Whether a lazy source view is a plain dense window on its checkpoint tensor.
+///
+/// Gather piece offsets and strides are expressed in the input's own dense
+/// layout, so they can be rebased onto a view that is itself dense — a shard of
+/// a shard stays lazy — but not onto one that already skips. A strided view has
+/// to be materialized before it can be gathered from again.
+fn source_is_dense(source: &SourceView) -> Result<bool> {
+    Ok(source.stride == storage_extent_for_shape(&source.shape, &source.encoding)?)
 }

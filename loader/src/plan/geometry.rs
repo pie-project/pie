@@ -1,14 +1,13 @@
 //! Strided-extent geometry: build, narrow and measure the source/dest
-//! extents that back every copy instruction, plus plan-wide id lookups.
+//! extents that back every copy instruction.
 
 use crate::error::{Error, Result};
 use crate::extent::{Dim, Extent};
+use crate::plan::DestExtent;
 use crate::plan::build::SourceView;
-use crate::plan::passes::instr_id_of;
-use crate::plan::{DestExtent, LoadPlan, StorageInstr};
 use crate::types::{
-    Axis, BufferId, DType, Encoding, InstrId, QuantScheme, RepackLayout, RepackSpec, TensorDecl,
-    encoding_dense_element_bytes, encoding_nbytes, tensor_nbytes,
+    Axis, BufferId, Encoding, RepackLayout, RepackSpec, TensorDecl, encoding_dense_element_bytes,
+    encoding_nbytes, tensor_nbytes,
 };
 
 pub(super) fn narrow_repack_source(
@@ -132,29 +131,6 @@ pub(super) fn narrow_repack_source(
     Ok((source, narrowed))
 }
 
-pub(super) fn buffer_bytes(program: &LoadPlan, id: BufferId) -> Result<u64> {
-    Ok(program.buffer(id)?.bytes)
-}
-
-/// Resolve a scheduled instruction by id, against a slice the caller owns.
-///
-/// The passes clone `instrs` before rewriting it, so they cannot go through
-/// [`LoadPlan::instr`]. Same invariant, same refusal: ids are dense, and a
-/// position that holds a different id means something built the plan wrong.
-pub(super) fn instr_by_id(instrs: &[StorageInstr], id: InstrId) -> Result<&StorageInstr> {
-    let found = instrs
-        .get(id.0 as usize)
-        .ok_or_else(|| Error::Internal(format!("scheduled instr {} is missing", id.0)))?;
-    if instr_id_of(found) != id {
-        return Err(Error::Internal(format!(
-            "instruction ids are not dense: position {} holds {}",
-            id.0,
-            instr_id_of(found).0
-        )));
-    }
-    Ok(found)
-}
-
 pub(super) fn repack_stage_bytes(spec: RepackSpec) -> Result<u64> {
     match spec.layout {
         RepackLayout::MarlinMxfp4Weight => {
@@ -203,37 +179,6 @@ pub(super) fn strided_physical_source_bytes(extent: &Extent) -> Result<u64> {
         .ok_or_else(|| Error::Overflow("source extent byte overflow".to_string()))
 }
 
-pub(super) fn compact_extent(shape: &[i64], element_bytes: u64) -> Extent {
-    let mut stride = i64::try_from(element_bytes).unwrap_or(i64::MAX);
-    let mut dims = Vec::with_capacity(shape.len());
-    for dim in shape.iter().rev() {
-        dims.push(Dim {
-            count: *dim,
-            src_stride: stride,
-            dst_stride: stride,
-        });
-        stride = stride.saturating_mul(*dim);
-    }
-    dims.reverse();
-    Extent {
-        base_offset: 0,
-        element_bytes: u32::try_from(element_bytes).unwrap_or(u32::MAX),
-        dims,
-    }
-}
-
-pub(super) fn byte_extent(bytes: u64) -> Extent {
-    Extent {
-        base_offset: 0,
-        element_bytes: 1,
-        dims: vec![Dim {
-            count: i64::try_from(bytes).unwrap_or(i64::MAX),
-            src_stride: 1,
-            dst_stride: 1,
-        }],
-    }
-}
-
 pub(super) fn full_dest_extent(buffer: BufferId, decl: &TensorDecl) -> Result<DestExtent> {
     Ok(DestExtent {
         buffer,
@@ -244,11 +189,12 @@ pub(super) fn full_dest_extent(buffer: BufferId, decl: &TensorDecl) -> Result<De
 
 pub(super) fn storage_extent_for_shape(shape: &[i64], encoding: &Encoding) -> Result<Extent> {
     if let Some(element_bytes) = encoding_dense_element_bytes(encoding) {
-        return Ok(compact_extent(shape, element_bytes));
+        return Ok(Extent::dense(shape, element_bytes));
     }
-    Ok(byte_extent(encoding_nbytes(shape, encoding).ok_or_else(
-        || Error::Overflow("packed extent byte size overflow".to_string()),
-    )?))
+    Ok(Extent::byte_run(
+        encoding_nbytes(shape, encoding)
+            .ok_or_else(|| Error::Overflow("packed extent byte size overflow".to_string()))?,
+    ))
 }
 
 fn selected_source_extent(source: &Extent, shape: &[i64], encoding: &Encoding) -> Result<Extent> {
@@ -262,7 +208,7 @@ fn selected_source_extent(source: &Extent, shape: &[i64], encoding: &Encoding) -
             shape.len()
         )));
     }
-    let dest = compact_extent(shape, element_bytes);
+    let dest = Extent::dense(shape, element_bytes);
     let dims = source
         .dims
         .iter()
@@ -361,23 +307,4 @@ fn dense_axis_stride_bytes(shape: &[i64], axis: Axis, encoding: &Encoding) -> Re
             Ok(bits / 8)
         }
     }
-}
-
-pub(super) fn dtype_to_quant_marker(dtype: DType) -> QuantScheme {
-    match dtype {
-        DType::F8E4M3 => QuantScheme::Fp8E4M3,
-        DType::F8E5M2 => QuantScheme::Fp8E5M2,
-        DType::I8 | DType::U8 => QuantScheme::Int8Symmetric,
-        _ => QuantScheme::None,
-    }
-}
-
-/// Whether a lazy source view is a plain dense window on its checkpoint tensor.
-///
-/// Gather piece offsets and strides are expressed in the input's own dense
-/// layout, so they can be rebased onto a view that is itself dense — a shard of
-/// a shard stays lazy — but not onto one that already skips. A strided view has
-/// to be materialized before it can be gathered from again.
-pub(super) fn source_is_dense(source: &SourceView) -> Result<bool> {
-    Ok(source.stride == storage_extent_for_shape(&source.shape, &source.encoding)?)
 }
