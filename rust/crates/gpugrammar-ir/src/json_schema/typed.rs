@@ -344,10 +344,16 @@ impl<'a> Converter<'a> {
             // says nothing the pattern does not already say.
             if has_length {
                 let expr = regex_to_expr(pattern)?;
-                let (shortest, longest) = length_range(&expr);
+                // The bound may already be implied by the pattern, in which
+                // case there is nothing to do; otherwise push it into the
+                // repeat it constrains, which is exact where it applies.
+                let (shortest, longest) = character_range(&expr);
                 let within_min = shortest >= u64::from(min);
                 let within_max = max.is_none_or(|max| longest.is_some_and(|l| l <= u64::from(max)));
                 if !(within_min && within_max) {
+                    if let Some(narrowed) = constrain_to_length(&expr, min, max) {
+                        return Ok(seq(vec![lit("\""), narrowed, lit("\"")]));
+                    }
                     bail!(
                         "pattern matches strings of length {shortest}..{} and the \
                          schema also bounds the length, which needs an intersection",
@@ -959,6 +965,159 @@ fn intersperse_properties(properties: Vec<Expr>, ws: Expr) -> Vec<Expr> {
 ///
 /// `None` for the longest means unbounded. Used to decide whether a length
 /// bound adds anything to a pattern that already constrains the length.
+/// A pattern's length in *characters*, exactly when it has one.
+///
+/// `length_range` answers in bytes, because that is what the lexer counts, and
+/// a character class spends one to four of them. A JSON Schema length bound is
+/// over characters, so narrowing a repeat against one needs this instead.
+fn character_range(expr: &Expr) -> (u64, Option<u64>) {
+    match expr {
+        Expr::Empty => (0, Some(0)),
+        Expr::Literal(bytes) => {
+            let count = String::from_utf8_lossy(bytes).chars().count() as u64;
+            (count, Some(count))
+        }
+        Expr::CharacterClass { .. } => (1, Some(1)),
+        Expr::RuleRef(_) => (0, None),
+        Expr::Group(inner) => character_range(inner),
+        Expr::Sequence(parts) => parts.iter().fold((0, Some(0)), |(low, high), part| {
+            let (part_low, part_high) = character_range(part);
+            (
+                low.saturating_add(part_low),
+                high.zip(part_high).map(|(a, b)| a.saturating_add(b)),
+            )
+        }),
+        Expr::Choice(alternatives) => alternatives
+            .iter()
+            .fold((u64::MAX, Some(0)), |(low, high), alternative| {
+                let (alt_low, alt_high) = character_range(alternative);
+                (low.min(alt_low), high.zip(alt_high).map(|(a, b)| a.max(b)))
+            }),
+        Expr::Repeat { expr, min, max } => {
+            let (inner_low, inner_high) = character_range(expr);
+            (
+                inner_low.saturating_mul(u64::from(*min)),
+                max.and_then(|max| inner_high.map(|high| high.saturating_mul(u64::from(max)))),
+            )
+        }
+    }
+}
+
+/// Narrow a pattern so that it only matches strings the length bound allows.
+///
+/// A grammar cannot intersect two languages in general, but it does not have to
+/// here: what a length bound constrains is how many times something repeats, and
+/// that is a number the repeat already carries. For `A x{p,q} B` with `A` and
+/// `B` of fixed length, the bound on the whole string is a bound on the count,
+/// so the two meet exactly by narrowing `p` and `q`. A pattern of fixed length
+/// needs no narrowing, only checking, and a choice distributes - the bound
+/// applies to each alternative and the ones it empties simply go.
+///
+/// Returns `None` where the shape is not one of those, which is the honest
+/// answer: refusing the schema is better than a mask that admits a string the
+/// bound forbids.
+fn constrain_to_length(expr: &Expr, min: u32, max: Option<u32>) -> Option<Expr> {
+    let min = u64::from(min);
+    let max = max.map(u64::from);
+    let fits = |low: u64, high: Option<u64>| {
+        low >= min && max.is_none_or(|max| high.is_some_and(|high| high <= max))
+    };
+
+    match expr {
+        Expr::Group(inner) => constrain_to_length(inner, min as u32, max.map(|m| m as u32)),
+        Expr::Choice(alternatives) => {
+            let kept: Vec<Expr> = alternatives
+                .iter()
+                .filter_map(|alternative| {
+                    constrain_to_length(alternative, min as u32, max.map(|m| m as u32))
+                })
+                .collect();
+            (!kept.is_empty()).then(|| Expr::choice(kept))
+        }
+        Expr::Repeat { .. } => narrow_repeat(std::slice::from_ref(expr), min, max),
+        Expr::Sequence(parts) => {
+            let (low, high) = character_range(expr);
+            if fits(low, high) {
+                return Some(expr.clone());
+            }
+            narrow_repeat(parts, min, max)
+        }
+        other => {
+            let (low, high) = character_range(other);
+            fits(low, high).then(|| other.clone())
+        }
+    }
+}
+
+/// Push a length bound into the one repeat of a sequence.
+fn narrow_repeat(parts: &[Expr], min: u64, max: Option<u64>) -> Option<Expr> {
+    let mut variable = None;
+    let mut fixed = 0u64;
+    for (index, part) in parts.iter().enumerate() {
+        let flat = match part {
+            Expr::Group(inner) => inner.as_ref(),
+            other => other,
+        };
+        if let Expr::Repeat {
+            expr,
+            min: low,
+            max: high,
+        } = flat
+        {
+            if Some(*low) != *high {
+                if variable.is_some() {
+                    // Two repeats share the budget between them, and which
+                    // split to pick is a choice rather than a computation.
+                    return None;
+                }
+                let (each_low, each_high) = character_range(expr);
+                if each_low == 0 || Some(each_low) != each_high {
+                    return None;
+                }
+                variable = Some((index, each_low, *low, *high));
+                continue;
+            }
+        }
+        let (low, high) = character_range(part);
+        if Some(low) != high {
+            return None;
+        }
+        fixed = fixed.saturating_add(low);
+    }
+
+    let (index, each, low, high) = variable?;
+    if fixed > max.unwrap_or(u64::MAX) {
+        return None;
+    }
+    // `count * each + fixed` has to land in the bound, so the count does too.
+    let wanted_low = min.saturating_sub(fixed).div_ceil(each);
+    let wanted_high = max.map(|max| (max - fixed) / each);
+    let new_low = u64::from(low).max(wanted_low);
+    let new_high = match (high, wanted_high) {
+        (Some(high), Some(wanted)) => Some(u64::from(high).min(wanted)),
+        (Some(high), None) => Some(u64::from(high)),
+        (None, wanted) => wanted,
+    };
+    if new_high.is_some_and(|high| high < new_low) {
+        return None;
+    }
+
+    let mut rebuilt = parts.to_vec();
+    let inner = match &parts[index] {
+        Expr::Group(boxed) => boxed.as_ref(),
+        other => other,
+    };
+    let Expr::Repeat { expr, .. } = inner else {
+        return None;
+    };
+    rebuilt[index] = Expr::Repeat {
+        expr: expr.clone(),
+        min: u32::try_from(new_low).ok()?,
+        max: new_high.map(|high| u32::try_from(high).unwrap_or(u32::MAX)),
+    };
+    Some(Expr::Sequence(rebuilt))
+}
+
 fn length_range(expr: &Expr) -> (u64, Option<u64>) {
     match expr {
         Expr::Empty => (0, Some(0)),
