@@ -218,7 +218,7 @@ impl<'a> Converter<'a> {
             if all_of.len() == 1 {
                 return self.visit(&all_of[0], hint);
             }
-            let merged = merge_all_of(schema, all_of)?;
+            let merged = merge_all_of(self.document, schema, all_of)?;
             return self.visit(&merged, hint);
         }
 
@@ -1369,7 +1369,7 @@ const ANNOTATIONS: &[&str] = &[
 /// tighter of the two, a set of types at its intersection, two property maps at
 /// their union with shared names merged in turn - so the merge computes it, and
 /// refuses only where it genuinely cannot.
-fn merge_all_of(parent: &Value, branches: &[Value]) -> Result<Value> {
+fn merge_all_of(document: &Value, parent: &Value, branches: &[Value]) -> Result<Value> {
     let mut merged = Value::Object(
         parent
             .as_object()
@@ -1380,13 +1380,29 @@ fn merge_all_of(parent: &Value, branches: &[Value]) -> Result<Value> {
             .collect(),
     );
     for branch in branches {
-        merged = meet(&merged, branch)?;
+        merged = meet(document, &merged, branch, 0)?;
     }
     Ok(merged)
 }
 
+/// How far `meet` will follow `$ref` before giving up.
+///
+/// A reference can point at a schema that refers back, and a conjunction of two
+/// mutually recursive schemas is not something this front end can build. The
+/// limit is what stops it looping rather than a claim about how deep is enough.
+const MEET_DEPTH: usize = 8;
+
 /// The conjunction of two schemas, or an error if it cannot be computed.
-fn meet(left: &Value, right: &Value) -> Result<Value> {
+fn meet(document: &Value, left: &Value, right: &Value, depth: usize) -> Result<Value> {
+    if depth > MEET_DEPTH {
+        bail!("allOf nests references too deeply to meet");
+    }
+    // A branch that is a reference is met by meeting what it points at. This is
+    // the commonest shape `allOf` takes - `[{"$ref": "#/definitions/base"},
+    // {"properties": {...}}]` - and refusing it was the single largest lowering
+    // failure left.
+    let left = &resolved(document, left);
+    let right = &resolved(document, right);
     let (Some(left_object), Some(right_object)) = (left.as_object(), right.as_object()) else {
         // `true` and `false` as schemas: one accepts everything, the other
         // nothing, and neither shape appears in the corpus.
@@ -1407,11 +1423,37 @@ fn meet(left: &Value, right: &Value) -> Result<Value> {
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect(),
         );
-        let mut folded = meet(&Value::Object(merged), &rest)?;
+        let mut folded = meet(document, &Value::Object(merged), &rest, depth + 1)?;
         for branch in inner {
-            folded = meet(&folded, branch)?;
+            folded = meet(document, &folded, branch, depth + 1)?;
         }
         return Ok(folded);
+    }
+
+    // A conjunction distributes over a disjunction, exactly:
+    // `A and (B or C)` is `(A and B) or (A and C)`. Both are expressible, so
+    // this needs no approximation.
+    if let Some(options) = right_object.get("anyOf").or_else(|| right_object.get("oneOf")) {
+        let options = options
+            .as_array()
+            .ok_or_else(|| anyhow!("anyOf/oneOf must be an array"))?;
+        let rest = Value::Object(
+            right_object
+                .iter()
+                .filter(|(key, _)| key.as_str() != "anyOf" && key.as_str() != "oneOf")
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        );
+        let base = meet(document, &Value::Object(merged), &rest, depth + 1)?;
+        let distributed = options
+            .iter()
+            .map(|option| meet(document, &base, option, depth + 1))
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(Value::Object(
+            [("anyOf".to_string(), Value::Array(distributed))]
+                .into_iter()
+                .collect(),
+        ));
     }
 
     for (key, value) in right_object {
@@ -1439,7 +1481,7 @@ fn meet(left: &Value, right: &Value) -> Result<Value> {
                 if existing == &Value::Bool(false) || value == &Value::Bool(false) {
                     Value::Bool(false)
                 } else {
-                    meet(existing, value)?
+                    meet(document, existing, value, depth + 1)?
                 }
             }
             "uniqueItems" => Value::Bool(
@@ -1487,7 +1529,7 @@ fn meet(left: &Value, right: &Value) -> Result<Value> {
                 for (name, schema) in right {
                     match into.get(name) {
                         Some(held) if held != schema => {
-                            let combined = meet(held, schema)?;
+                            let combined = meet(document, held, schema, depth + 1)?;
                             into.insert(name.clone(), combined);
                         }
                         _ => {
@@ -1512,7 +1554,7 @@ fn meet(left: &Value, right: &Value) -> Result<Value> {
                 }
                 Value::Array(into)
             }
-            "items" => meet(existing, value)?,
+            "items" => meet(document, existing, value, depth + 1)?,
 
             // `$ref` cannot be met without resolving it, and two different
             // patterns have no intersection expressible as a pattern.
@@ -1552,6 +1594,33 @@ fn intersect(left: &[String], right: &[String]) -> Vec<String> {
         .filter(|name| right.contains(name))
         .cloned()
         .collect()
+}
+
+/// A schema with its `$ref` replaced by what it points at, if it has one.
+///
+/// The reference's siblings are kept and win, which is what JSON Schema 2019-09
+/// onwards says and what schemas in the wild assume: `{"$ref": "#/x",
+/// "description": "..."}` is the referenced schema with that description.
+fn resolved(document: &Value, schema: &Value) -> Value {
+    let Some(object) = schema.as_object() else {
+        return schema.clone();
+    };
+    let Some(Value::String(reference)) = object.get("$ref") else {
+        return schema.clone();
+    };
+    let Some(pointer) = reference.strip_prefix('#') else {
+        return schema.clone();
+    };
+    let Some(Value::Object(target)) = resolve_pointer(document, pointer) else {
+        return schema.clone();
+    };
+    let mut merged = target.clone();
+    for (key, value) in object {
+        if key != "$ref" {
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+    Value::Object(merged)
 }
 
 /// Follow a JSON pointer into the document, unescaping as RFC 6901 says.
