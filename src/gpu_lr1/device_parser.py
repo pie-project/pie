@@ -762,7 +762,8 @@ def _candidate_kernel(
     cand_valid_ptr,
     cand_lexer_ptr,
     cand_depth_ptr,
-    cand_stack_ptr,
+    cand_floor_ptr,
+    cand_window_ptr,
     overflow_ptr,
     ROWS: tl.constexpr,
     CONFIGS: tl.constexpr,
@@ -976,27 +977,25 @@ def _candidate_kernel(
                         alive = any_ok
 
                 if alive == 1:
+                    # A candidate outlives the step that made it, so unlike a
+                    # replay it does have to be written down - but not as a
+                    # whole stack. It shares everything below its floor with the
+                    # configuration it came from, and the commit can read that
+                    # there, so what is stored is the floor and the window.
+                    # Whole stacks made this 151 MB at batch 512, four fifths of
+                    # everything a batch allocated.
                     tl.store(cand_valid_ptr + out_base + index, 1)
                     tl.store(cand_lexer_ptr + out_base + index, next_state)
                     tl.store(cand_depth_ptr + out_base + index, copy_depth)
-                    # A candidate becomes a parse state that outlives the step, so this
-                    # one does have to be materialised: the prefix the replay never
-                    # touched from the sequence's stack, and the rest from the window.
-                    lane = tl.arange(0, STACK_STRIDE)
-                    tl.store(
-                        cand_stack_ptr + (out_base + index) * STACK_STRIDE + lane,
-                        tl.load(stack_ptr + base + lane, mask=lane < floor, other=0),
-                        mask=lane < floor,
-                    )
+                    tl.store(cand_floor_ptr + out_base + index, floor)
                     top_lane = tl.arange(0, WINDOW)
-                    held = tl.load(
-                        scratch_ptr + scratch + top_lane,
-                        mask=top_lane < copy_depth - floor,
-                        other=0,
-                    )
                     tl.store(
-                        cand_stack_ptr + (out_base + index) * STACK_STRIDE + floor + top_lane,
-                        held,
+                        cand_window_ptr + (out_base + index) * WINDOW + top_lane,
+                        tl.load(
+                            scratch_ptr + scratch + top_lane,
+                            mask=top_lane < copy_depth - floor,
+                            other=0,
+                        ),
                         mask=top_lane < copy_depth - floor,
                     )
                     index = index + 1
@@ -1012,15 +1011,18 @@ def _commit_kernel(
     config_count_ptr,
     old_lexer_ptr,
     old_count_ptr,
+    old_stack_ptr,
     cand_valid_ptr,
     cand_lexer_ptr,
     cand_depth_ptr,
-    cand_stack_ptr,
+    cand_floor_ptr,
+    cand_window_ptr,
     terminated_ptr,
     widest_ptr,
     CONFIGS: tl.constexpr,
     MAX_READINGS: tl.constexpr,
     STACK_STRIDE: tl.constexpr,
+    WINDOW: tl.constexpr,
 ):
     """Collect the surviving candidates into the next configuration set.
 
@@ -1061,12 +1063,29 @@ def _commit_kernel(
                                     if tl.load(cand_valid_ptr + base + index) == 1:
                                         next_state = tl.load(cand_lexer_ptr + base + index)
                                         depth = tl.load(cand_depth_ptr + base + index)
-                                        values = tl.load(
-                                            cand_stack_ptr
-                                            + (base + index) * STACK_STRIDE
-                                            + lane,
-                                            mask=lane < depth,
-                                            other=0,
+                                        # The candidate's stack, put back
+                                        # together: everything below its floor
+                                        # is the source configuration's, which
+                                        # is read from the copy taken before
+                                        # this kernel began overwriting it.
+                                        floor = tl.load(cand_floor_ptr + base + index)
+                                        values = tl.where(
+                                            lane < floor,
+                                            tl.load(
+                                                old_stack_ptr
+                                                + (sequence * CONFIGS + source)
+                                                * STACK_STRIDE
+                                                + lane,
+                                                mask=lane < floor,
+                                                other=0,
+                                            ),
+                                            tl.load(
+                                                cand_window_ptr
+                                                + (base + index) * WINDOW
+                                                + tl.maximum(lane - floor, 0),
+                                                mask=(lane >= floor) & (lane < depth),
+                                                other=0,
+                                            ),
                                         )
                                         duplicate = 0
                                         done = 0
@@ -1460,13 +1479,21 @@ class DeviceBatch:
         self.cand_valid = torch.zeros(slots, dtype=torch.int32, device="cuda")
         self.cand_lexer = torch.zeros(slots, dtype=torch.int32, device="cuda")
         self.cand_depth = torch.zeros(slots, dtype=torch.int32, device="cuda")
-        self.cand_stack = torch.zeros(
-            slots * grammar.max_stack, dtype=torch.int32, device="cuda"
+        self.cand_floor = torch.zeros(slots, dtype=torch.int32, device="cuda")
+        self.cand_window = torch.zeros(
+            slots * grammar.window, dtype=torch.int32, device="cuda"
         )
         self.old_lexer = torch.zeros(
             batch * self.configs, dtype=torch.int32, device="cuda"
         )
         self.old_count = torch.ones(batch, dtype=torch.int32, device="cuda")
+        # The commit builds the next configuration set in place, and a candidate
+        # now names the stack it came from rather than carrying a copy, so the
+        # source has to survive being overwritten. One copy of the stacks a step
+        # against 131 MB of candidate stacks is the trade.
+        self.old_stack = torch.zeros(
+            batch * self.configs * grammar.max_stack, dtype=torch.int32, device="cuda"
+        )
         # One flag per sequence rather than one for the batch: a refusal is a
         # property of the sequence that hit it, and reading it back to find out
         # which would be the synchronisation this is all avoiding.
@@ -1622,6 +1649,7 @@ class DeviceBatch:
         self.found.fill_(_NO_GROUP)
         self.old_lexer.copy_(self.lexer_state)
         self.old_count.copy_(self.config_count)
+        self.old_stack.copy_(self.stack.reshape(-1))
         rows = self.batch * self.configs
         live = self.live
         _locate_kernel[(self.batch * live, self.advance_blocks)](
@@ -1665,7 +1693,8 @@ class DeviceBatch:
             self.cand_valid,
             self.cand_lexer,
             self.cand_depth,
-            self.cand_stack,
+            self.cand_floor,
+            self.cand_window,
             self.overflow,
             ROWS=rows,
             CONFIGS=self.configs,
@@ -1683,15 +1712,18 @@ class DeviceBatch:
             self.config_count,
             self.old_lexer,
             self.old_count,
+            self.old_stack,
             self.cand_valid,
             self.cand_lexer,
             self.cand_depth,
-            self.cand_stack,
+            self.cand_floor,
+            self.cand_window,
             self.terminated,
             self.widest,
             CONFIGS=self.configs,
             MAX_READINGS=self.max_readings,
             STACK_STRIDE=grammar.max_stack,
+            WINDOW=grammar.window,
             num_warps=1,
         )
         # How wide the configuration sets now are, carried back one step late.
