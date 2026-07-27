@@ -1254,9 +1254,12 @@ def _dedup_kernel(
     grammar_ptr,
     hash_ptr,
     representative_ptr,
+    mask_ptr,
+    mask_words,
     BATCH: tl.constexpr,
     CONFIGS: tl.constexpr,
     STACK_STRIDE: tl.constexpr,
+    BLOCK: tl.constexpr,
 ):
     """The lowest-numbered sequence holding the same parse state.
 
@@ -1269,40 +1272,70 @@ def _dedup_kernel(
     count = tl.load(config_count_ptr + sequence)
     grammar = tl.load(grammar_ptr + sequence)
     found = sequence
-    for other in range(0, BATCH):
-        if other < sequence and found == sequence:
-            if tl.load(hash_ptr + other) == mine:
-                if tl.load(config_count_ptr + other) == count and tl.load(
-                    grammar_ptr + other
-                ) == grammar:
-                    same = 1
-                    for config in range(0, CONFIGS):
-                        if config < count:
-                            a = sequence * CONFIGS + config
-                            b = other * CONFIGS + config
-                            depth = tl.load(stack_depth_ptr + a)
-                            if tl.load(lexer_state_ptr + a) != tl.load(
-                                lexer_state_ptr + b
-                            ):
-                                same = 0
-                            if depth != tl.load(stack_depth_ptr + b):
-                                same = 0
-                            lane = tl.arange(0, STACK_STRIDE)
-                            left = tl.load(
-                                stack_ptr + a * STACK_STRIDE + lane,
-                                mask=lane < depth,
-                                other=0,
-                            )
-                            right = tl.load(
-                                stack_ptr + b * STACK_STRIDE + lane,
-                                mask=lane < depth,
-                                other=0,
-                            )
-                            if tl.sum(tl.where(left != right, 1, 0)) != 0:
-                                same = 0
-                    if same == 1:
-                        found = other
+
+    # Scanned a block of candidates at a time rather than one at a time. Every
+    # sequence walks every earlier one, so this is quadratic in the batch and it
+    # showed: 36 us of a 182 us step at batch 512, second only to the replay.
+    # The scan itself is three loads a candidate and nothing else, which is
+    # exactly the shape a block does for free.
+    lane = tl.arange(0, BLOCK)
+    start = 0
+    while start < sequence and found == sequence:
+        index = start + lane
+        live = index < sequence
+        alike = live
+        alike = alike & (tl.load(hash_ptr + index, mask=live, other=0) == mine)
+        alike = alike & (
+            tl.load(config_count_ptr + index, mask=live, other=-1) == count
+        )
+        alike = alike & (tl.load(grammar_ptr + index, mask=live, other=-1) == grammar)
+        other = tl.min(tl.where(alike, index, BATCH))
+        if other >= BATCH:
+            start = start + BLOCK
+        else:
+            # The fingerprint only narrows it. Two different parse states that
+            # hash alike would otherwise share a mask and one would be wrong.
+            same = 1
+            for config in range(0, CONFIGS):
+                if config < count:
+                    a = sequence * CONFIGS + config
+                    b = other * CONFIGS + config
+                    depth = tl.load(stack_depth_ptr + a)
+                    if tl.load(lexer_state_ptr + a) != tl.load(lexer_state_ptr + b):
+                        same = 0
+                    if depth != tl.load(stack_depth_ptr + b):
+                        same = 0
+                    slot = tl.arange(0, STACK_STRIDE)
+                    left = tl.load(
+                        stack_ptr + a * STACK_STRIDE + slot,
+                        mask=slot < depth,
+                        other=0,
+                    )
+                    right = tl.load(
+                        stack_ptr + b * STACK_STRIDE + slot,
+                        mask=slot < depth,
+                        other=0,
+                    )
+                    if tl.sum(tl.where(left != right, 1, 0)) != 0:
+                        same = 0
+            if same == 1:
+                found = other
+            else:
+                start = other + 1
     tl.store(representative_ptr + sequence, found)
+
+    # Only a representative's row is built up by the scatter, and every other
+    # row is overwritten wholesale by the broadcast, so those are the only rows
+    # that have to start empty. Clearing all of them was 9.7 MB a step to make
+    # room for 0.6 MB of answers.
+    if found == sequence:
+        for start in range(0, mask_words, BLOCK):
+            slot = start + tl.arange(0, BLOCK)
+            tl.store(
+                mask_ptr + sequence * mask_words + slot,
+                tl.zeros((BLOCK,), tl.int32),
+                mask=slot < mask_words,
+            )
 
 
 @triton.jit
@@ -2041,7 +2074,9 @@ class DeviceBatch:
 
     def _fill(self) -> torch.Tensor:
         grammar = self.grammar
-        self.mask.zero_()
+        # The mask is not cleared here. Deduplication knows which rows the
+        # scatter will build up and clears only those; the rest are overwritten
+        # whole by the broadcast.
         _hash_kernel[(self.batch,)](
             self.lexer_state,
             self.stack,
@@ -2061,10 +2096,13 @@ class DeviceBatch:
             self.grammar_of,
             self.state_hash,
             self.representative,
+            self.mask,
+            grammar.mask_words,
             BATCH=self.batch,
             CONFIGS=self.configs,
             STACK_STRIDE=grammar.max_stack,
-            num_warps=1,
+            BLOCK=128,
+            num_warps=4,
         )
         rows = self.batch * self.configs
         _count_kernel[((rows + 255) // 256,)](
