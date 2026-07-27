@@ -17,17 +17,18 @@ inline void mla_fused_projection_joins(ContractBuilder& b) {
     std::vector<ContractBuilder::FusedCandidate> candidates;
     for (std::uint32_t layer = 0; layer < b.facts().num_hidden_layers; ++layer) {
         const std::string p = "model.layers." + std::to_string(layer) + ".";
+        const std::string s = b.source_name(p);
         // q_a_proj + kv_a_proj_with_mqa share an input (norm_x, unsharded).
         if (auto candidate = b.fused_join_candidate(
                 p + "self_attn.q_kv_a_proj.fused.weight",
-                {p + "self_attn.q_a_proj.weight", p + "self_attn.kv_a_proj_with_mqa.weight"})) {
+                {s + "self_attn.q_a_proj.weight", s + "self_attn.kv_a_proj_with_mqa.weight"})) {
             candidates.push_back(std::move(*candidate));
         }
         // Shared gate + up share an input (norm_y).
         if (auto candidate = b.fused_join_candidate(
                 p + "mlp.shared_experts.gate_up_proj.fused.weight",
-                {p + "mlp.shared_experts.gate_proj.weight",
-                 p + "mlp.shared_experts.up_proj.weight"})) {
+                {s + "mlp.shared_experts.gate_proj.weight",
+                 s + "mlp.shared_experts.up_proj.weight"})) {
             candidates.push_back(std::move(*candidate));
         }
     }

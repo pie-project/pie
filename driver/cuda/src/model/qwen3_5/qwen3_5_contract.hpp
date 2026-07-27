@@ -30,8 +30,12 @@ inline void qwen_moe_expert_stacks(ContractBuilder& b) {
         return;
     }
     for (std::uint32_t layer = 0; layer < b.facts().num_hidden_layers; ++layer) {
-        const std::string prefix =
+        // `bound` is the name the bind path uses; `prefix` is where the source
+        // tensors actually live, which is the same thing unless the family
+        // declared a `source_prefix`.
+        const std::string bound =
             "model.layers." + std::to_string(layer) + ".mlp.experts.";
+        const std::string prefix = b.source_name(bound);
         if (b.find(prefix + "gate_up_proj") != nullptr) {
             continue;  // already pre-fused; the direct and TP-slice paths take it.
         }
@@ -92,10 +96,10 @@ inline void qwen_moe_expert_stacks(ContractBuilder& b) {
             consumed.push_back(d->id);
         }
 
-        b.define(prefix + "gate_up_proj", b.contract().cat(gate_up_parts, 0),
+        b.define(bound + "gate_up_proj", b.contract().cat(gate_up_parts, 0),
                pie_loader::raw(dtype),
                std::vector<std::int64_t>{num_experts, 2 * inter, hidden});
-        b.define(prefix + "down_proj", b.contract().cat(down_parts, 0), pie_loader::raw(dtype),
+        b.define(bound + "down_proj", b.contract().cat(down_parts, 0), pie_loader::raw(dtype),
                std::vector<std::int64_t>{num_experts, hidden, inter});
         for (std::uint32_t id : consumed) {
             b.consume(id);

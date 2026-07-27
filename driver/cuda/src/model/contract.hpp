@@ -393,8 +393,37 @@ public:
 
     // -- knobs, each one a claim about this family ---------------------------
 
-    /// Source tensors live under this prefix; it is stripped from output names.
-    void source_prefix(std::string_view prefix) { source_prefix_ = prefix; }
+    /// Source tensors *may* live under this prefix; it is stripped from output
+    /// names, and every pass that goes looking for a source name by hand puts
+    /// it back through `source_name`.
+    ///
+    /// A prefix the checkpoint does not use is not a prefix. Kimi ships both
+    /// shapes -- the released text checkpoints name the decoder
+    /// `model.layers.*` and the multimodal ones nest it under
+    /// `language_model.` -- and one arch row covers both only if this is a
+    /// question asked of the checkpoint rather than a declaration about the
+    /// family. Declaring it unconditionally is what it was, and against a text
+    /// checkpoint it filtered every tensor out and failed authoring outright.
+    void source_prefix(std::string_view prefix) {
+        source_prefix_ = {};
+        for (const SourceTensor& raw : tensors_) {
+            if (raw.name.rfind(prefix, 0) == 0) {
+                source_prefix_ = prefix;
+                return;
+            }
+        }
+    }
+
+    /// The name a source tensor has in the checkpoint, given the prefix.
+    ///
+    /// A pass that goes looking for one specific tensor names it the way the
+    /// bind path does and lets this put the prefix back. A pass that instead
+    /// walks `tensors()` already has the raw name and publishes it through
+    /// `output_name`. Getting either half wrong is silent: `fused_join_candidate`
+    /// and friends return "no candidate" for a name that is not there.
+    std::string source_name(std::string_view bound_name) const {
+        return std::string(source_prefix_) + std::string(bound_name);
+    }
 
     /// Tensor-parallel shard-axis strategy, keyed by tensor name. Defaults to
     /// the HF convention; a family whose checkpoint names the same operator
@@ -563,6 +592,9 @@ public:
             return;
         }
         for (const SourceTensor& raw : tensors_) {
+            if (!source_name_allowed(raw.name)) {
+                continue;
+            }
             if (!ends_with(raw.name, ".experts.gate_up_proj") &&
                 !ends_with(raw.name, ".mlp.experts.gate_up_proj")) {
                 continue;
@@ -583,7 +615,7 @@ public:
             auto [gate, local_i] = band(src, 1, 0, full_i);
             auto [up, up_extent] = band(src, 1, full_i, full_i);
             (void)up_extent;
-            push_expr(std::string(raw.name), raw, {experts, 2 * local_i, hidden},
+            push_expr(output_name(raw.name), raw, {experts, 2 * local_i, hidden},
                       contract_.cat(std::vector<Node>{gate, up}, 1));
         }
     }
@@ -654,16 +686,17 @@ public:
         std::uint64_t gate_up_bytes = 0;
         for (std::uint32_t layer = 0; layer < facts_.num_hidden_layers; ++layer) {
             const std::string p = "model.layers." + std::to_string(layer) + ".";
+            const std::string s = source_name(p);
             if (auto candidate = fused_join_candidate(
                     p + "self_attn.qkv_proj.fused.weight",
-                    {p + "self_attn.q_proj.weight", p + "self_attn.k_proj.weight",
-                     p + "self_attn.v_proj.weight"})) {
+                    {s + "self_attn.q_proj.weight", s + "self_attn.k_proj.weight",
+                     s + "self_attn.v_proj.weight"})) {
                 qkv_bytes += candidate->bytes;
                 qkv.push_back(std::move(*candidate));
             }
             if (auto candidate = fused_join_candidate(
                     p + "mlp.gate_up_proj.fused.weight",
-                    {p + "mlp.gate_proj.weight", p + "mlp.up_proj.weight"})) {
+                    {s + "mlp.gate_proj.weight", s + "mlp.up_proj.weight"})) {
                 gate_up_bytes += candidate->bytes;
                 gate_up.push_back(std::move(*candidate));
             }
