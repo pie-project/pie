@@ -1164,3 +1164,104 @@ matches SnapKV, and the earlier firings are well-defined observations of earlier
 windows — so a policy that acts on the most recent firing gets SnapKV's semantics
 without special-casing. The mixed prefill+decode plan deliberately does not
 capture, and the PTIR side fails loudly there rather than returning a zero row.
+
+## 13. Two silent Quest bugs found by exact-census testing
+
+Both bugs below produced fluent text, no NaNs, no crashes, and a page ranking
+that looked entirely plausible. Neither was reachable by any test that checked
+Quest "works". They were found by asserting the *exact* slot census —
+how many pages carry a real bound, how many are pinned at `+inf`, how many are
+`-inf` past the end — against arithmetic derived independently from the fire's
+own `kv_len`. That is the assertion shape this section is really arguing for.
+
+### 13.1 `envelope_dot` sliced the device page array with the host CSR
+
+Same hazard as §9.3 and §10.2, in a third place. Under decode envelopes the
+host's `plan_kv_page_indptr` is a prefix sum of the page channel's *declared*
+capacity (`envelope_plan_page_bounds`), while the device array is packed by
+real per-request counts. `resolve_lane_envelope` took `page_begin`/`page_count`
+from the host copy, so:
+
+* the **offset** was wrong whenever an earlier request in the fire held fewer
+  pages than it declared — request `r` scored against request `r-1`'s keys;
+* the **count** was wrong whenever this request did — surplus slots were
+  scored as real instead of getting the `-inf` that keeps a top-k consumer out
+  of a neighbour's pages.
+
+`kv_last_page_lens_h` is *also* substituted with a uniform `page_size` under
+envelopes, so `scored_pages` was wrong on top of that.
+
+The fix moves the whole resolution on-device. The host now contributes only a
+slot **bound** — the grid extent and the result-row width — which is safe to
+over-estimate precisely because surplus slots then correctly resolve to `-inf`:
+
+```
+begin       = page_indptr[request];  end = page_indptr[request + 1]
+page_count  = end >= begin ? end - begin : 0
+slot >= page_count                       -> -inf   (not ours)
+kv_after    = (page_count-1)*page_size + last_page_lens[request]
+kv_before   = kv_after >= qo_len ? kv_after - qo_len : 0
+scored      = min(kv_before / page_size, page_count)
+slot >= scored                           -> +inf   (in flight, cannot bound)
+page        = page_ids[begin + slot]
+```
+
+The rule this is the third instance of: **a host-side copy of a page CSR is a
+bound; only the device copy is exact.** Anything a kernel *addresses* with must
+come from the device copy. Host copies may size allocations and grids, nothing
+else.
+
+Why no earlier test caught it: at small `max_tokens` the declared bound and the
+real page count coincide, and with one request in the fire the offset is 0
+either way. The curated test used `max_tokens=8`. It now uses 64 and asserts
+the census, with an explicit guard that fails if `pages_absent == 0` — i.e. if
+the case has drifted back to one where both CSRs would agree.
+
+### 13.2 The explicit-descriptor KV write never maintained envelopes
+
+`llama_like.cpp` has three KV-write branches: the fused decode QKV path
+(disabled whenever stage hooks are bound, so Quest never reaches it),
+`has_write_desc` → `launch_write_kv_explicit_bf16`, and otherwise the CSR path
+`launch_write_kv_to_pages`. Envelope maintenance was hooked into the CSR path
+only.
+
+Quest supplies WSlot/WOff, so `has_write_desc` is true for its **decode** fires
+and false for its prefill. Prompt pages therefore had real envelopes and every
+page written during decoding kept the empty `(+inf, -inf)` seed. An empty
+envelope makes `Σ max(q·kmin, q·kmax)` equal `+inf` for any nonzero `q`, so the
+newest — most recently attended, most likely to matter — pages all scored
+"always keep", silently destroying the ranking.
+
+The symptom was **non-deterministic**, which is what made it interesting: a
+recycled physical page carries a stale but *finite* envelope from a previous
+tenant, so the number of visibly-empty pages depended on pool state. Cold runs
+looked worse than warm ones.
+
+**Merge, not recompute.** The explicit path has no page list and no live
+length, so a recompute keyed on the descriptor's offset would shrink a page to
+a prefix and could drop a key that is still live — and rewriting a cell
+mid-page is exactly why the explicit path exists (beam fork/freeze). Merging
+only ever widens, which for an upper bound is the safe direction to be wrong
+in, and for append-only pages it is *equal* to a full recompute. A page being
+entered at `w_off == 0` is being started, so its envelope is reset first;
+without that, a recycled page accumulates every request that ever used it and
+converges on "keep everything".
+
+`test_envelope_dot` proves the equality directly: it replays a prefill fire
+plus a run of one-token decode fires through the merge and compares against
+`envelope_recompute` over the final live lengths — after planting a previous
+tenant's `[-1e30, 1e30]` on every page the sequence will touch. The comparison
+is exact, so a missing reset cannot pass.
+
+**Cost, and why the reset is folded in.** The two kernels are trivial at decode
+widths — the fire carries `R` tokens — so their cost is entirely launch
+overhead: ~4.6 us per layer, ~129 us per 28-layer pass, on the critical path of
+every step. A single fused kernel elects one writer block per (page, kv_head) —
+the first valid token naming that page — which owns the page outright, gathers
+its own fire's keys, and stores once. Sole ownership removes the atomics *and*
+makes the reset safe to fold in: the race the two-kernel split exists to avoid
+(a reset erasing a key another token of the same fire already merged) cannot
+arise when one block does both, in order, for every token on the page. Measured
+on an L40S: **129 us → ~82 us per 28-layer pass, flat from N=1 to N=128.** Above
+128 tokens the two-launch form is kept, since there the kernels are doing real
+work and the shared-memory gather list would not fit.
