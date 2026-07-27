@@ -159,6 +159,40 @@ class DeviceParserAgreement(unittest.TestCase):
         self.assertGreaterEqual(grammar.window, 8)
         self.assertLessEqual(grammar.window_bound, grammar.window)
 
+    def test_a_narrowed_mask_is_reported_not_absorbed(self):
+        """Running out of configuration room must not be silent.
+
+        The ceiling is a policy rather than a property of the grammar, and a
+        parse that outgrows it keeps a prefix of its states, which narrows the
+        mask. Narrowing is the one failure this engine must never do quietly,
+        so it is reported through the same flag as a replay that overran its
+        window.
+        """
+        schema = {
+            "type": "object",
+            "properties": {"name": {"type": "string"}, "id": {"type": "integer"}},
+            "required": ["name", "id"],
+        }
+        compiled = self.compiler.compile_json_schema(json.dumps(schema))
+        # One configuration is not enough for a grammar where a declared
+        # property name also scans as a generic string.
+        grammar = self.DeviceGrammar(compiled, max_configs=1)
+        batch = grammar.new_batch(1)
+        matcher = compiled.matcher(0)
+        batch.set_configurations(0, matcher.configurations())
+        for piece in (b'{"', b"name", b'":'):
+            token = VOCABULARY.index(piece)
+            batch.fill_mask()
+            batch.advance(torch.tensor([token], dtype=torch.int32, device="cuda"))
+            matcher.accept_token(token)
+        terminated, overflow = batch.problems()
+        self.assertEqual(terminated.numel(), 1)
+        self.assertEqual(
+            int(overflow.sum()),
+            1,
+            "a parse that outgrew one configuration should have said so",
+        )
+
 
 class MixedGrammarBatch(unittest.TestCase):
     """A batch whose sequences are under different grammars.

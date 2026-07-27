@@ -1184,6 +1184,7 @@ def _commit_kernel(
     cand_floor_ptr,
     cand_window_ptr,
     terminated_ptr,
+    overflow_ptr,
     widest_ptr,
     CONFIGS: tl.constexpr,
     MAX_READINGS: tl.constexpr,
@@ -1202,6 +1203,12 @@ def _commit_kernel(
     count = tl.load(old_count_ptr + sequence)
     lane = tl.arange(0, STACK_STRIDE)
     written = 0
+    # Set when a surviving candidate has to be dropped for want of room. The
+    # configuration ceiling is a policy, not a property of the grammar, and a
+    # parse that outgrows it keeps a prefix of its states - which narrows the
+    # mask. Narrowing is the failure this engine must never do quietly, so it
+    # is reported through the same flag as a window that overran.
+    saturated = 0
 
     # Bounded by the count, not by the ceiling. Running to 128 when the parse
     # holds one configuration made the advance cost 88 us instead of 27 - the
@@ -1225,6 +1232,9 @@ def _commit_kernel(
                         if tl.load(old_lexer_ptr + sequence * CONFIGS + source) == state:
                             base = (sequence * CONFIGS + source) * MAX_READINGS
                             for index in range(0, MAX_READINGS):
+                                if tl.load(cand_valid_ptr + base + index) == 1:
+                                    if written >= CONFIGS:
+                                        saturated = 1
                                 if written < CONFIGS:
                                     if tl.load(cand_valid_ptr + base + index) == 1:
                                         next_state = tl.load(cand_lexer_ptr + base + index)
@@ -1299,6 +1309,8 @@ def _commit_kernel(
         tl.store(terminated_ptr + sequence, 1)
     else:
         tl.store(config_count_ptr + sequence, written)
+    if saturated == 1:
+        tl.store(overflow_ptr + sequence, 1)
     # The widest set in the batch, maintained on the device. The fill's grid is
     # sized for the ceiling because the host may not ask, but every program can
     # read this and return at once - which turns the ceiling from work into a
@@ -1829,6 +1841,13 @@ class DeviceBatch:
         # One flag per sequence rather than one for the batch: a refusal is a
         # property of the sequence that hit it, and reading it back to find out
         # which would be the synchronisation this is all avoiding.
+        #
+        # `terminated` means the token was refused - the parse is over.
+        # `overflow` means this sequence's mask may be *narrower* than the
+        # grammar allows, from a replay that outran its window or a parse that
+        # outgrew the configuration ceiling. Neither is meant to happen; both
+        # are recorded rather than absorbed, because a narrow mask does not
+        # crash, it quietly forbids a legal token. See `problems()`.
         self.terminated = torch.zeros(batch, dtype=torch.int32, device="cuda")
         self.overflow = torch.zeros(batch, dtype=torch.int32, device="cuda")
         # The deepest excursion any replay in this batch has made above where it
@@ -2113,6 +2132,7 @@ class DeviceBatch:
             self.cand_floor,
             self.cand_window,
             self.terminated,
+            self.overflow,
             self.widest,
             CONFIGS=self.configs,
             MAX_READINGS=self.max_readings,
@@ -2130,6 +2150,18 @@ class DeviceBatch:
         # launch. Real parses hold one or two configurations; the ceiling has
         # to be sixteen only because some documents reach it.
         #
+
+    def problems(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """`(terminated, overflow)`, on the device, one entry per sequence.
+
+        Deliberately returns the tensors rather than their contents: reading
+        them is a device-to-host synchronisation, and the decode loop must not
+        make one. A serving engine already reads `terminated` on its own
+        schedule to retire sequences, and should read `overflow` on the same
+        one - it should always be zero, and a sequence where it is not has been
+        given a mask that may forbid something the grammar allows.
+        """
+        return self.terminated, self.overflow
 
     def configurations(self, sequence: int) -> list[tuple[int, list[int]]]:
         """Read one sequence's parse state back. For tests only.
