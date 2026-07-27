@@ -42,6 +42,13 @@
 //!    `+inf` and are unconditionally retained. This is fail-safe, and it
 //!    coincides with Quest's own rule that the local window is never evicted.
 //!    Pages outside the request's page list score `-inf`.
+//!
+//!    The request's page list is resolved by the kernel from the *device* page
+//!    CSR. Under decode envelopes — the path this program runs on, since its
+//!    page table is composed on device — the host CSR is only an upper bound
+//!    (the declared `pages` channel capacity), so a `p_max` sized for the whole
+//!    generation leaves genuinely-absent slots at every earlier step. Those
+//!    slots read `-inf`, and `pages_absent` counts them.
 
 use inferlet::ptir::prelude::*;
 use inferlet::{Result, model as wit_model};
@@ -89,6 +96,13 @@ struct Output {
     count: usize,
     /// Pages the program was allowed to score.
     max_pages: u32,
+    /// KV page size, so a test can convert token counts into page counts.
+    page_size: u32,
+    /// The fire's `kv_len` at the last decode step — i.e. the KV length the
+    /// driver derives its slot boundaries from. Reported so a test can predict
+    /// `pages_finite` / `pages_pinned` / `pages_absent` by independent host
+    /// arithmetic instead of asserting on whatever the driver happened to say.
+    kv_len_last: u32,
     page_budget: u32,
     /// Layers whose envelope tap actually fired, counted on-device.
     layers_observed: u32,
@@ -203,6 +217,7 @@ async fn main(input: Input) -> Result<Output> {
 
     let mut last_scores: Vec<f32> = Vec::new();
     let mut layers_observed = 0u32;
+    let mut kv_len_last = n;
 
     // ── DECODE LOOP (1-wide, run-ahead), with the Quest tap. ──
     if generated.len() < max_tokens {
@@ -235,6 +250,9 @@ async fn main(input: Input) -> Result<Output> {
         let layers_out = Channel::new([1], dtype::u32)
             .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
             .named("quest_layer_count");
+        let kvlen_out = Channel::new([1], dtype::u32)
+            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+            .named("quest_kv_len");
 
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &lane1)?;
@@ -281,6 +299,7 @@ async fn main(input: Input) -> Result<Output> {
 
         fwd.epilogue(move || {
             let length = kv_len.take().tensor();
+            kvlen_out.put(&length);
             let r = rng.take();
             let logits = intrinsics::logits();
             let token = step(logits, temperature, &r);
@@ -332,6 +351,11 @@ async fn main(input: Input) -> Result<Output> {
                 .get::<u32>()
                 .await
                 .map_err(|e| format!("quest_layer_count.take @{}: {e}", generated.len()))?[0];
+            kv_len_last = kvlen_out
+                .take()
+                .get::<u32>()
+                .await
+                .map_err(|e| format!("quest_kv_len.take @{}: {e}", generated.len()))?[0];
             in_flight -= 1;
             generated.push(t as u32);
             if submitted < budget_n {
@@ -365,6 +389,8 @@ async fn main(input: Input) -> Result<Output> {
         text: wit_model::decode(&generated)?,
         count: generated.len(),
         max_pages,
+        page_size,
+        kv_len_last,
         page_budget: budget,
         layers_observed,
         scored_any_page: last_scores.iter().any(|s| s.is_finite()),
