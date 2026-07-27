@@ -133,6 +133,17 @@ nlohmann::json shape_to_json(const pie_loader::PieLoaderI64Slice& s) {
     return out;
 }
 
+nlohmann::json quant_to_json(const pie_loader::PieLoaderQuantSpecView& q) {
+    return {{"scheme", q.scheme},
+            {"logical_dtype", q.logical_dtype},
+            {"bits_per_element", q.bits_per_element},
+            {"group_size", q.group_size},
+            {"channel_axis", q.channel_axis},
+            {"scale_dtype", q.scale_dtype},
+            {"zero_point_dtype", q.zero_point_dtype},
+            {"block_shape", shape_to_json(q.block_shape)}};
+}
+
 nlohmann::json contract_to_json(const pie_loader::PieLoaderModelContractView& v) {
     nlohmann::json nodes = nlohmann::json::array();
     for (std::size_t i = 0; i < v.nodes.len; ++i) {
@@ -150,7 +161,26 @@ nlohmann::json contract_to_json(const pie_loader::PieLoaderModelContractView& v)
                          {"before", n.before},
                          {"after", n.after},
                          {"shape", shape_to_json(n.shape)},
-                         {"out_shape", shape_to_json(n.out_shape)}});
+                         {"out_shape", shape_to_json(n.out_shape)},
+                         // A `Repack` carries its offsets as integers, so this
+                         // is where a `tp_rank` can still be baked into a
+                         // contract. Omitting it made the cross-rank diff below
+                         // blind to the one case it must not miss.
+                         {"repack", {{"layout", n.repack.layout},
+                                     {"row_map", n.repack.row_map},
+                                     {"batch", n.repack.batch},
+                                     {"source_rows", n.repack.source_rows},
+                                     {"source_row_offset", n.repack.source_row_offset},
+                                     {"target_rows", n.repack.target_rows},
+                                     {"valid_rows", n.repack.valid_rows},
+                                     {"source_stride_cols", n.repack.source_stride_cols},
+                                     {"source_col_offset", n.repack.source_col_offset},
+                                     {"source_cols", n.repack.source_cols},
+                                     {"target_cols", n.repack.target_cols}}},
+                         {"quant", quant_to_json(n.quant)},
+                         {"out_encoding", {{"kind", n.out_encoding.kind},
+                                           {"dtype", n.out_encoding.dtype},
+                                           {"quant", quant_to_json(n.out_encoding.quant)}}}});
     }
     nlohmann::json tensors = nlohmann::json::array();
     for (std::size_t i = 0; i < v.tensors.len; ++i) {
@@ -340,6 +370,11 @@ void author_real_contract(const std::string& snapshot, const char* dest) {
             auto target = pie_cuda_driver::cuda_device_target();
             target.tp_size = tp;
             target.tp_rank = rank;
+            // The native-MXFP4 repack path is the one place a rank cannot be
+            // deferred, so it needs reaching on a GPU that does not offer it.
+            if (std::getenv("PIE_TEST_NATIVE_MXFP4") != nullptr) {
+                target.native_mxfp4_moe = true;
+            }
 
             const std::string at =
                 " (tp " + std::to_string(tp) + " rank " + std::to_string(rank) + ")";
@@ -375,6 +410,31 @@ void author_real_contract(const std::string& snapshot, const char* dest) {
                 continue;
             }
             by_rank[std::to_string(rank)] = std::move(entry);
+        }
+        // §6.3 lets the leader own `TargetSpec` because it is the only per-rank
+        // input to compilation. That holds only if authoring is rank-blind, and
+        // for a while it was not: `local_range` put `tp_rank * local` into a
+        // `Slice` offset. `Expr::Shard` says the same thing without the rank, so
+        // every affine site can be written that way and the contract comes out
+        // identical on every rank.
+        //
+        // `Repack` is the exception and cannot be one of these by accident: it
+        // carries `source_row_offset` as an integer a kernel reads, so there is
+        // nowhere to hang a `Shard`. Naming the exception this precisely is the
+        // point — anything else that starts baking a rank fails here.
+        if (by_rank.size() > 1 && by_rank.contains("0")) {
+            const auto& first = by_rank["0"]["contract"];
+            bool repacks = false;
+            for (const auto& node : first["nodes"]) {
+                if (node["kind"] ==
+                    static_cast<std::uint32_t>(pie_loader::PieLoaderExprKind::Repack)) repacks = true;
+            }
+            for (const auto& [rank, entry] : by_rank.items()) {
+                const bool same = entry["contract"] == first;
+                check(same || repacks,
+                      "authoring does not read the rank: tp " + std::to_string(tp) +
+                          " rank " + rank + " authors what rank 0 does, or repacks");
+            }
         }
         by_tp[std::to_string(tp)] = std::move(by_rank);
     }
