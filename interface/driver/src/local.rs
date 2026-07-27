@@ -713,6 +713,15 @@ pub const PIE_CHANNEL_HOST_VISIBLE: u8 = 1 << 1;
 /// The host is the *reader* — the channel is a program output.
 pub const PIE_CHANNEL_HOST_READER: u8 = 1 << 2;
 
+/// No op in the pass touches this channel, so a fire has nothing to wait for.
+pub const PIE_READINESS_UNTOUCHED: u8 = 0;
+/// The first op to touch this channel in pass order takes or reads it, so a
+/// fire is ready only while the ring is non-empty.
+pub const PIE_READINESS_NEEDS_FULL: u8 = 1;
+/// The first op to touch this channel in pass order puts to it, so a fire is
+/// ready only while the ring is non-full.
+pub const PIE_READINESS_NEEDS_EMPTY: u8 = 2;
+
 /// One channel declaration: a bounded ring of `capacity + 1` typed cells.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -726,8 +735,15 @@ pub struct PieLaunchChannel {
     pub flags: u8,
     /// -1 private, 0 import, 1 export.
     pub extern_dir: i8,
-    /// Reserved; must be zero.
-    pub reserved0: u8,
+    /// `PIE_READINESS_*` — the direction the *first* op to touch this channel
+    /// in pass order requires.
+    ///
+    /// Not derivable from the per-stage `takes`/`reads`/`puts` sets: a channel
+    /// that is both taken and put (the `InPlace` shape — a counter, a beam
+    /// state, a DFA cursor) appears in both, and only the order says which
+    /// gate a fire must clear. Deriving it from the sets yields
+    /// `full && empty`, which a `capacity == 1` ring can never satisfy.
+    pub readiness: u8,
     /// Reserved; must be zero.
     pub reserved1: u32,
     /// Cell shape.

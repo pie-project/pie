@@ -25,7 +25,7 @@ use pie_driver_abi::plan::{
 use pie_ir::DType;
 use pie_ir::container::{ExternDir, HostRole, PortSource};
 use pie_ir::types::ValueType;
-use pie_ir::validate::BoundTrace;
+use pie_ir::validate::{BoundTrace, Direction};
 use pie_plan::{
     CompiledStage, Dimension, LibraryOp, Region, RegionKind, RegionPartition, SymbolicType,
     stage_identity,
@@ -61,6 +61,11 @@ const VALUE_OP_RESULT: u8 = 5;
 const CHANNEL_SEEDED: u8 = 1 << 0;
 const CHANNEL_HOST_VISIBLE: u8 = 1 << 1;
 const CHANNEL_HOST_READER: u8 = 1 << 2;
+
+/// Readiness directions, mirroring `PIE_READINESS_*`.
+const READINESS_UNTOUCHED: u8 = 0;
+const READINESS_NEEDS_FULL: u8 = 1;
+const READINESS_NEEDS_EMPTY: u8 = 2;
 
 /// Region kinds, mirroring `PIE_REGION_GENERATED` / `PIE_REGION_LIBRARY`.
 const REGION_GENERATED: u8 = 0;
@@ -200,6 +205,17 @@ fn lower_channels(bound: &BoundTrace) -> Vec<LaunchChannel> {
                 .externs
                 .iter()
                 .find(|entry| entry.chan as usize == index);
+            // First-touch, in pass order. The sets a stage ships say *whether*
+            // a channel is taken and put; only this says which one comes first,
+            // and an `InPlace` channel is both.
+            let readiness = bound
+                .readiness
+                .iter()
+                .find(|entry| entry.chan as usize == index)
+                .map_or(READINESS_UNTOUCHED, |entry| match entry.dir {
+                    Direction::NeedsFull => READINESS_NEEDS_FULL,
+                    Direction::NeedsEmpty => READINESS_NEEDS_EMPTY,
+                });
             LaunchChannel {
                 id: index as u32,
                 capacity: decl.capacity,
@@ -212,6 +228,7 @@ fn lower_channels(bound: &BoundTrace) -> Vec<LaunchChannel> {
                     ExternDir::Import => 0,
                     ExternDir::Export => 1,
                 }),
+                readiness,
                 shape: decl.shape.dims().to_vec(),
                 extern_name: extern_decl
                     .and_then(|entry| bound.container.names.get(entry.name as usize))

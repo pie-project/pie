@@ -99,7 +99,7 @@ fn contract_source() -> String {
     contract!(out, PieLaunchValueSlice, ptr, len);
     contract!(out, PieLaunchOp, code, result_count, result_id, intrinsic, lit_dtype, dtype, pred_tag, rng_kind, reserved0, lit_bits, pred_payload, channel, name_index, imm, imm2, imm3, reserved1, args, shape);
     contract!(out, PieLaunchOpSlice, ptr, len);
-    contract!(out, PieLaunchChannel, id, capacity, dtype, flags, extern_dir, reserved0, reserved1, shape, extern_name);
+    contract!(out, PieLaunchChannel, id, capacity, dtype, flags, extern_dir, readiness, reserved1, shape, extern_name);
     contract!(out, PieLaunchChannelSlice, ptr, len);
     contract!(out, PieLaunchPort, port, is_const, const_dtype, reserved0, channel, const_shape, const_data);
     contract!(out, PieLaunchPortSlice, ptr, len);

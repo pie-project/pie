@@ -151,6 +151,7 @@ struct Op {
     std::uint32_t imm = 0;          // TopK k, Transpose axis pair, Iota len, …
     std::uint32_t imm2 = 0;
     std::uint32_t imm3 = 0;
+    std::uint32_t name_index = 0;   // KernelCall / SinkCall → Trace::names
 
     ValueId       result_id = 0;    // first SSA id this op defines
     std::uint32_t result_count = 1; // top_k / sort_desc → 2 (value, index)
@@ -188,6 +189,20 @@ struct Stage {
     std::vector<ChannelId>  reads;
 };
 
+// Which way a fire's readiness gate points for one channel: the direction the
+// FIRST op to touch it in pass order requires.
+//
+// Shipped, not derived. A channel that is taken and then put back -- a counter,
+// a beam state, a DFA cursor -- appears in both a stage's `takes` and its
+// `puts`, so a driver that ORs the two sets asks for a ring that is at once
+// non-empty and non-full, which `capacity == 1` can never be. Only the order
+// resolves it, and the order is a fact about the program.
+enum class Readiness : std::uint8_t {
+    Untouched = PIE_READINESS_UNTOUCHED,
+    NeedsFull = PIE_READINESS_NEEDS_FULL,
+    NeedsEmpty = PIE_READINESS_NEEDS_EMPTY,
+};
+
 // A channel declaration: a bounded queue of `capacity + 1` cells (ring), each of
 // shape/dtype. `has_seed` marks a Channel::from(v) -- a cell pre-put full at
 // instantiation. `host_visible` channels always keep the full ring.
@@ -199,6 +214,7 @@ struct Channel {
     bool       host_visible = false;
     bool       host_reader = false; // host HARVESTS (output)
     std::int8_t extern_dir = -1;    // -1 private, 0 import, 1 export
+    Readiness  readiness = Readiness::Untouched;
     std::string extern_name;
 };
 
@@ -226,7 +242,8 @@ struct Trace {
     std::vector<Value>       values;    // SSA value table (indexed by ValueId)
     std::vector<Channel>     channels;
     // Program-wide name table for second-party kernels and sinks. An
-    // `OpCode::KernelCall` carries its index here in `Op::imm`.
+    // `OpCode::KernelCall` or `OpCode::SinkCall` carries its index here in
+    // `Op::name_index`.
     std::vector<std::string> names;
     std::vector<PortBinding> ports;     // descriptor-port channel bindings
     std::vector<Stage>       stages;    // in attachment order
@@ -289,6 +306,7 @@ inline Trace adopt(const PieLaunchPackage& package) {
         channel.host_visible = (src.flags & PIE_CHANNEL_HOST_VISIBLE) != 0;
         channel.host_reader = (src.flags & PIE_CHANNEL_HOST_READER) != 0;
         channel.extern_dir = src.extern_dir;
+        channel.readiness = static_cast<Readiness>(src.readiness);
         channel.extern_name = detail::string_from(src.extern_name);
         trace.channels.push_back(std::move(channel));
     }
@@ -331,6 +349,7 @@ inline Trace adopt(const PieLaunchPackage& package) {
             op.imm = raw.imm;
             op.imm2 = raw.imm2;
             op.imm3 = raw.imm3;
+            op.name_index = raw.name_index;
             op.result_id = raw.result_id;
             op.result_count = raw.result_count;
             stage.ops.push_back(std::move(op));

@@ -266,7 +266,7 @@ impl<'a> LaunchPackageBorrow<'a> {
                 dtype: channel.dtype,
                 flags: channel.flags,
                 extern_dir: channel.extern_dir,
-                reserved0: 0,
+                readiness: channel.readiness,
                 reserved1: 0,
                 shape: u32s(&channel.shape),
                 extern_name: bytes(&channel.extern_name),

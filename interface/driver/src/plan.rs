@@ -197,6 +197,8 @@ pub struct LaunchChannel {
     pub flags: u8,
     /// -1 private, 0 import, 1 export.
     pub extern_dir: i8,
+    /// `PIE_READINESS_*` — the direction this channel's first op requires.
+    pub readiness: u8,
     pub shape: Vec<u32>,
     pub extern_name: Vec<u8>,
 }

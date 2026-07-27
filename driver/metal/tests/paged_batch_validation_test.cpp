@@ -174,7 +174,7 @@ int main() {
         };
         const std::uint32_t buffered_activation_slots[] = {3, 2};
         const std::uint32_t buffered_activation_indptr[] = {0, 2};
-        PieLaunchDesc launch{};
+        pie_native::StepLaunch launch{};
         launch.rs_slot_ids = {
             .ptr = folded_slots,
             .len = 2,
@@ -208,7 +208,7 @@ int main() {
         const std::uint32_t missing_folded_slots[] = {0};
         const std::uint8_t missing_folded_flags[] = {
             PIE_RS_FLAG_RESET};
-        PieLaunchDesc missing_folded_launch = launch;
+        pie_native::StepLaunch missing_folded_launch = launch;
         missing_folded_launch.rs_slot_ids = {
             .ptr = missing_folded_slots,
             .len = 1,

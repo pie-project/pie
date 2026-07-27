@@ -962,11 +962,12 @@ std::shared_ptr<M1ProgramExecutable> M1Runtime::compile_program(
         effect.capacity = plan.trace.channels[channel].capacity;
         effect.take = plan.takes_channel(static_cast<std::uint32_t>(channel));
         effect.put = plan.puts_channel(static_cast<std::uint32_t>(channel));
-        effect.requires_full =
-            plan.takes_channel(static_cast<std::uint32_t>(channel)) ||
-            plan.reads_channel(static_cast<std::uint32_t>(channel));
-        effect.requires_empty =
-            plan.puts_channel(static_cast<std::uint32_t>(channel));
+        // First-touch, as shipped. Not `takes || reads` vs `puts`: an
+        // in-place channel is in both sets and would gate on a ring that is
+        // at once non-empty and non-full.
+        const launch::Readiness readiness = plan.trace.channels[channel].readiness;
+        effect.requires_full = readiness == launch::Readiness::NeedsFull;
+        effect.requires_empty = readiness == launch::Readiness::NeedsEmpty;
     }
 
     HostEmittedKernels host_kernels(emitted_kernels);
@@ -982,6 +983,24 @@ std::shared_ptr<M1ProgramExecutable> M1Runtime::compile_program(
             if (binding >= plan.trace.channels.size()) {
                 return reject_deterministic(
                     "Metal M1 stage channel binding is out of range");
+            }
+        }
+        // Every channel op's local slot, checked once here so the encode and
+        // placement paths can index `channel_bindings` directly. `chan` is
+        // signed and -1 means "no channel", which converts to SIZE_MAX at the
+        // subscript -- so an unchecked op is an out-of-bounds read, not a
+        // wrong answer.
+        for (const auto& meta : stage_plan.ops) {
+            const auto& op = meta.op;
+            if (op.tag != PTIR_OP_CHAN_TAKE && op.tag != PTIR_OP_CHAN_READ &&
+                op.tag != PTIR_OP_CHAN_PUT) {
+                continue;
+            }
+            if (op.chan < 0 ||
+                static_cast<std::size_t>(op.chan) >=
+                    stage_plan.channel_bindings.size()) {
+                return reject_deterministic(
+                    "Metal M1 stage channel op has no binding slot");
             }
         }
         if (stage_plan.singleton.regions.size() > kMaxRegionsPerStage ||

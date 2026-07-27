@@ -275,6 +275,23 @@
 #define PIE_CHANNEL_HOST_READER (1 << 2)
 
 /**
+ * No op in the pass touches this channel, so a fire has nothing to wait for.
+ */
+#define PIE_READINESS_UNTOUCHED 0
+
+/**
+ * The first op to touch this channel in pass order takes or reads it, so a
+ * fire is ready only while the ring is non-empty.
+ */
+#define PIE_READINESS_NEEDS_FULL 1
+
+/**
+ * The first op to touch this channel in pass order puts to it, so a fire is
+ * ready only while the ring is non-full.
+ */
+#define PIE_READINESS_NEEDS_EMPTY 2
+
+/**
  * The region is served by a generated kernel.
  */
 #define PIE_REGION_GENERATED 0
@@ -641,9 +658,16 @@ typedef struct PieLaunchChannel {
    */
   int8_t extern_dir;
   /**
-   * Reserved; must be zero.
+   * `PIE_READINESS_*` — the direction the *first* op to touch this channel
+   * in pass order requires.
+   *
+   * Not derivable from the per-stage `takes`/`reads`/`puts` sets: a channel
+   * that is both taken and put (the `InPlace` shape — a counter, a beam
+   * state, a DFA cursor) appears in both, and only the order says which
+   * gate a fire must clear. Deriving it from the sets yields
+   * `full && empty`, which a `capacity == 1` ring can never satisfy.
    */
-  uint8_t reserved0;
+  uint8_t readiness;
   /**
    * Reserved; must be zero.
    */

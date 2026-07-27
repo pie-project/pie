@@ -233,6 +233,11 @@ inline int validate_launch_package(const PieLaunchPackage& launch) noexcept {
         if (status != PIE_STATUS_OK) return status;
         status = validate_bytes(channel.extern_name);
         if (status != PIE_STATUS_OK) return status;
+        // An out-of-range readiness would read as `Untouched` after the cast
+        // and silently drop the channel's gate, so it is rejected here.
+        if (channel.readiness > PIE_READINESS_NEEDS_EMPTY) {
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
     }
     status = validate_slice(launch.ports.ptr, launch.ports.len);
     if (status != PIE_STATUS_OK) return status;

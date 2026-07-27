@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <unordered_set>
 #include <utility>
 
@@ -120,9 +121,16 @@ int Registry::register_channel(
     if (channels_.find(channel.channel_id) != channels_.end()) {
         return PIE_STATUS_INVALID_ARGUMENT;
     }
-    std::size_t numel = 1;
+    // Overflow rejects rather than truncates: the endpoint binding reports a
+    // `std::uint32_t` cell size, and a shape whose byte count wraps past that
+    // would hand the caller a stride the ring does not use.
+    std::uint64_t numel = 1;
     for (std::size_t i = 0; i < channel.shape.len; ++i) {
-        numel *= channel.shape.ptr[i];
+        const std::uint64_t dim = channel.shape.ptr[i];
+        if (dim == 0 || numel > std::numeric_limits<std::uint64_t>::max() / dim) {
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
+        numel *= dim;
     }
     DType endpoint_dtype = DType::F32;
     switch (channel.dtype) {
@@ -131,9 +139,15 @@ int Registry::register_channel(
         case PIE_CHANNEL_DTYPE_BOOL: endpoint_dtype = DType::Bool; break;
         default: endpoint_dtype = DType::F32; break;
     }
-    const std::uint32_t cell_bytes = static_cast<std::uint32_t>(
-        wire_cell_bytes(endpoint_dtype, numel));
-    if (cell_bytes == 0) return PIE_STATUS_INVALID_ARGUMENT;
+    if (numel > std::numeric_limits<std::uint32_t>::max()) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    const std::uint64_t wide_bytes =
+        wire_cell_bytes(endpoint_dtype, static_cast<std::size_t>(numel));
+    if (wide_bytes == 0 || wide_bytes > std::numeric_limits<std::uint32_t>::max()) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    const std::uint32_t cell_bytes = static_cast<std::uint32_t>(wide_bytes);
 
     ChannelRecord record;
     record.desc = channel;

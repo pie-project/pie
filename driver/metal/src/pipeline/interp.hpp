@@ -182,7 +182,8 @@ struct ExecPlan {
     }
 
     bool requires_channel_input(std::uint32_t c) const {
-        return takes_channel(c) || reads_channel(c);
+        return c < trace.channels.size() &&
+            trace.channels[c].readiness == launch::Readiness::NeedsFull;
     }
 
     bool needs_forward() const {
@@ -290,6 +291,24 @@ inline void rebuild_stage_indexes(ExecPlan& out) {
             for (std::uint32_t arg : op.args) mark(mark, arg);
         }
         for (const launch::ChannelPut& put : stage.puts) mark(mark, put.value);
+        // A take advances the ring whether or not anything reads the cell, so
+        // reachability from ops and puts is not enough: a take whose result is
+        // dead would be skipped here and never advance `head`, while the
+        // readiness gate went on requiring the channel non-empty. The stage's
+        // shipped `takes`/`reads` sets name exactly these -- which is why the
+        // package carries them separately from the value graph.
+        for (std::size_t v = 0; v < out.trace.values.size(); ++v) {
+            const launch::Value& root = out.trace.values[v];
+            const bool taken =
+                root.source == launch::ValueSource::ChannelTake &&
+                std::find(stage.takes.begin(), stage.takes.end(), root.channel) !=
+                    stage.takes.end();
+            const bool peeked =
+                root.source == launch::ValueSource::ChannelRead &&
+                std::find(stage.reads.begin(), stage.reads.end(), root.channel) !=
+                    stage.reads.end();
+            if (taken || peeked) ids.insert(static_cast<std::uint32_t>(v));
+        }
         plan.value_ids.assign(ids.begin(), ids.end());
         out.stages.push_back(std::move(plan));
     }
@@ -319,10 +338,17 @@ inline bool adopt_launch_package(const PieLaunchPackage& package, ExecPlan& out,
     classify_exec_plan(out);
     for (const auto& stage : out.trace.stages) {
         for (const auto& op : stage.ops) {
-            if ((op.code == OpCode::KernelCall || op.code == OpCode::SinkCall) &&
-                (op.imm >= out.trace.names.size() ||
-                 out.trace.names[op.imm] !=
-                     (op.code == OpCode::KernelCall ? "metal.identity" : "metal.discard"))) {
+            const bool boundary =
+                op.code == OpCode::KernelCall || op.code == OpCode::SinkCall;
+            const bool named =
+                op.name_index < out.trace.names.size() &&
+                out.trace.names[op.name_index] ==
+                    (op.code == OpCode::KernelCall ? "metal.identity" : "metal.discard");
+            // `kernel_call` lowers to a reshape of its single operand; any
+            // other arity is not the boundary this backend implements.
+            const bool shaped =
+                op.code != OpCode::KernelCall || op.args.size() == 1;
+            if (boundary && !(named && shaped)) {
                 out.executable = false;
                 out.needs_logits = false;
                 out.needs_mtp_logits = false;
@@ -1553,16 +1579,20 @@ inline StepResult step(InterpInstance& inst, const ExecPlan& plan, const PassInp
         return result;
     }
 
+    // The readiness gate: one direction per channel, the one its first op in
+    // pass order needs. Shipped in the package -- a channel that is taken and
+    // then put back is in both effect sets, and only the order says which gate
+    // a fire has to clear.
     for (std::size_t channel = 0; channel < inst.channels.size(); ++channel) {
         const ChannelState& st = *inst.channels[channel];
-        if ((plan.takes_channel(static_cast<std::uint32_t>(channel)) ||
-             plan.reads_channel(static_cast<std::uint32_t>(channel))) && st.empty()) {
-            result.ok = true;
-            result.committed = false;
-            result.missed_channel = static_cast<std::uint32_t>(channel);
-            return result;
-        }
-        if (plan.puts_channel(static_cast<std::uint32_t>(channel)) && st.full()) {
+        const launch::Readiness readiness =
+            channel < plan.trace.channels.size()
+                ? plan.trace.channels[channel].readiness
+                : launch::Readiness::Untouched;
+        const bool ready = readiness == launch::Readiness::NeedsFull    ? !st.empty()
+                         : readiness == launch::Readiness::NeedsEmpty   ? !st.full()
+                                                                        : true;
+        if (!ready) {
             result.ok = true;
             result.committed = false;
             result.missed_channel = static_cast<std::uint32_t>(channel);

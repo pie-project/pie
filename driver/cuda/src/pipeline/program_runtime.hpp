@@ -414,7 +414,12 @@ class PtirInstance {
             channel.extern_dir == 0) {
             return true;
         }
-        return fire_takes_channel(dense) && !puts_channel(dense);
+        // First-touch, as shipped. `fire_takes_channel && !puts_channel` was
+        // the same question asked of the effect sets, and it gets an in-place
+        // channel (taken, then put back) wrong in the one direction that
+        // matters: it reads as "no input needed" for a ring whose first op
+        // needs one.
+        return channel.readiness == Readiness::NeedsFull;
     }
     ChannelView& view() { return view_; }
 
