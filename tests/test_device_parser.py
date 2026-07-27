@@ -288,6 +288,120 @@ class MixedGrammarBatch(unittest.TestCase):
             )
 
 
+class GrammarPool(unittest.TestCase):
+    """Grammars arrive with requests and leave when the request does.
+
+    A pool handed a fixed list at construction is not something a serving engine
+    can use, so admission and release have to work while a batch is running -
+    including the part that is easy to get wrong, which is that a graph holds
+    the address it recorded and an array that grows is at a new one.
+    """
+
+    def setUp(self):
+        _requirements()
+        from gpu_lr1.device_parser import DeviceGrammar
+
+        self.DeviceGrammar = DeviceGrammar
+        self.compiler = gpugrammar.Compiler(VOCABULARY)
+        self.schemas = [
+            {"type": "object", "properties": {"a": {"type": "integer"}}, "required": ["a"]},
+            {"type": "array", "items": {"type": "integer"}},
+            {"type": "object", "properties": {"b": {"type": "string"}}, "required": ["b"]},
+            {"type": "array", "items": {"type": "boolean"}},
+        ]
+
+    def _compile(self, index):
+        return self.compiler.compile_json_schema(json.dumps(self.schemas[index]))
+
+    def _mask_matches(self, pool, batch, assignment, compiled):
+        matchers = [compiled[g].matcher(0) for g in assignment]
+        batch.set_grammars(assignment)
+        batch.set_batch_configurations(
+            {i: m.configurations() for i, m in enumerate(matchers)}
+        )
+        masks = batch.fill_mask().cpu()
+        reference = torch.zeros(pool.mask_words, dtype=torch.int32)
+        for index, matcher in enumerate(matchers):
+            reference.zero_()
+            matcher.fill_bitmask(reference)
+            if not torch.equal(masks[index], reference):
+                return False
+        return True
+
+    def test_admitting_after_construction(self):
+        pool = self.DeviceGrammar()
+        compiled = []
+        for index in range(len(self.schemas)):
+            item = self._compile(index)
+            self.assertEqual(pool.admit(item), index)
+            compiled.append(item)
+        batch = pool.new_batch(4)
+        self.assertTrue(self._mask_matches(pool, batch, [0, 1, 2, 3], compiled))
+
+    def test_a_graph_survives_admission_into_spare_capacity(self):
+        pool = self.DeviceGrammar()
+        compiled = [self._compile(0), self._compile(1)]
+        for item in compiled:
+            pool.admit(item)
+        batch = pool.new_batch(2)
+        batch.set_grammars([0, 1])
+        matchers = [compiled[i].matcher(0) for i in (0, 1)]
+        batch.set_batch_configurations({i: m.configurations() for i, m in enumerate(matchers)})
+        batch.fill_mask()
+        batch.capture()
+        before = pool.revision
+
+        compiled.append(self._compile(2))
+        pool.admit(compiled[2])
+        # Whether the arrays had room decides whether the graph is still valid.
+        # Either way the mask must be right, which is what this checks.
+        self.assertTrue(self._mask_matches(pool, batch, [0, 1], compiled))
+        if pool.revision != before:
+            self.assertNotEqual(batch.recorded, pool.revision)
+
+    def test_release_and_compact_renumber_and_keep_masks_right(self):
+        pool = self.DeviceGrammar()
+        compiled = [self._compile(index) for index in range(4)]
+        for item in compiled:
+            pool.admit(item)
+        used = pool.used_bytes()
+        pool.release(0)
+        pool.release(2)
+        self.assertGreater(pool.dead_fraction, 0.0)
+
+        remap = pool.compact()
+        self.assertEqual(set(remap), {1, 3})
+        self.assertLess(pool.used_bytes(), used)
+        self.assertEqual(pool.count, 2)
+        self.assertEqual(pool.dead_fraction, 0.0)
+
+        survivors = [compiled[1], compiled[3]]
+        batch = pool.new_batch(2)
+        self.assertTrue(
+            self._mask_matches(pool, batch, [remap[1], remap[3]], survivors)
+        )
+
+    def test_a_recorded_graph_is_not_replayed_after_compaction(self):
+        pool = self.DeviceGrammar()
+        compiled = [self._compile(index) for index in range(3)]
+        for item in compiled:
+            pool.admit(item)
+        batch = pool.new_batch(2)
+        batch.set_grammars([1, 2])
+        matchers = [compiled[i].matcher(0) for i in (1, 2)]
+        batch.set_batch_configurations({i: m.configurations() for i, m in enumerate(matchers)})
+        batch.fill_mask()
+        batch.capture()
+        self.assertEqual(batch.recorded, pool.revision)
+
+        pool.release(0)
+        remap = pool.compact()
+        self.assertNotEqual(batch.recorded, pool.revision)
+        self.assertTrue(
+            self._mask_matches(pool, batch, [remap[1], remap[2]], [compiled[1], compiled[2]])
+        )
+
+
 class CorpusAgreement(unittest.TestCase):
     """The same check on real schemas, if the corpus is present."""
 

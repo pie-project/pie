@@ -1756,98 +1756,255 @@ _SIGNED = {"action_values"}
 
 
 class DeviceGrammar:
-    """One or more compiled grammars, resident on the GPU as one arena.
+    """A pool of compiled grammars, resident on the GPU as one arena.
 
-    A serving batch does not hold one grammar. Requests arrive with their own
-    schemas, so the sequences in a step are under different grammars, and a
-    design whose kernels are shaped by one grammar's tables cannot serve them.
+    A serving batch does not hold one grammar, and it does not hold a fixed set
+    of them either. Requests arrive with their own schemas and leave when they
+    are done, so the pool has to admit and release grammars while the engine is
+    running - not be handed a list at construction.
 
-    The tables are therefore laid end to end and a sequence carries the index of
-    the grammar it is under. Every lookup a kernel makes is into a run that
-    starts at `bases[grammar, which array]`, so the arithmetic is one addition
-    and no branch; the replay itself does not know there is more than one
-    grammar. What has to be shared is the vocabulary, since the mask is a row
-    over it - which is what a serving engine has anyway.
+    The tables are laid end to end and a sequence carries the index of the
+    grammar it is under. Every lookup a kernel makes is into a run that starts
+    at `bases[grammar, which array]`, so the arithmetic is one addition and no
+    branch; the replay itself does not know there is more than one grammar. What
+    has to be shared is the vocabulary, since the mask is a row over it - which
+    is what a serving engine has anyway.
+
+    Admission appends, which is why the arrays are kept with spare capacity: a
+    tensor that has to grow is a new allocation at a new address, and a CUDA
+    graph holds the address it recorded. Growth therefore bumps `revision`, and
+    a batch re-records when it sees one it did not record against. Admitting
+    into spare capacity does not, so the ordinary case does not disturb a
+    running decode loop.
     """
 
     def __init__(
         self,
-        compiled,
+        compiled=None,
         max_stack: int = 256,
         max_reductions: int | None = None,
         max_configs: int = 16,
         window: int | None = None,
+        capacity: int = 16,
     ):
-        many = list(compiled) if isinstance(compiled, (list, tuple)) else [compiled]
-        self.count = len(many)
-        every = [item.device_arrays() for item in many]
-
-        self.vocab_size = int(every[0]["vocab_size"])
-        self.mask_words = int(every[0]["bitset_words"])
-        for arrays in every:
-            if int(arrays["vocab_size"]) != self.vocab_size:
-                raise ValueError("grammars in one batch must share a vocabulary")
-        self.start_parser_states = [int(a["start_parser_state"]) for a in every]
-        self.start_parser_state = self.start_parser_states[0]
-
-        # Ceilings are the maximum over the pool. They cost launch shape, not
-        # memory, now that the scratch is per block rather than per program.
+        # Ceilings are policy, not properties of any one grammar, so they are
+        # fixed here rather than derived from whatever the pool happens to hold.
+        # A grammar that needs more than the window allows is admitted anyway
+        # and its replays raise the overflow flag, which is the honest failure:
+        # visible rather than silent. See `problems()`.
         self.max_stack = max_stack
         self.max_reductions = (
             max_reductions if max_reductions is not None else max_stack
         )
         self.max_configs = max_configs
+        self._forced_window = window
 
-        def widest(arrays, name):
+        self.count = 0
+        self.revision = 0
+        self.vocab_size = 0
+        self.mask_words = 0
+        self.window = window or 8
+        self.window_bound = 0
+        self.search_steps = 2
+        self.max_groups_per_state = 1
+        self.max_readings = 1
+        self.max_reading_terms = 1
+        self.nullable_chain = 0
+        self.start_parser_states: list[int] = []
+        self._live: list[bool] = []
+        self._extent: list[dict[str, tuple[int, int]]] = []
+        self._dead_words = 0
+
+        self._capacity = max(1, capacity)
+        self._used = {name: 0 for name in _ARENA}
+        for name in _ARENA:
+            setattr(self, name, torch.zeros(1024, dtype=torch.int32, device="cuda"))
+        self.bases = torch.zeros(
+            self._capacity * int(_NBASES.value), dtype=torch.int32, device="cuda"
+        )
+
+        if compiled is not None:
+            for item in (
+                compiled if isinstance(compiled, (list, tuple)) else [compiled]
+            ):
+                self.admit(item)
+
+    @property
+    def start_parser_state(self) -> int:
+        return self.start_parser_states[0] if self.start_parser_states else 0
+
+    def _reserve(self, name: str, extra: int) -> int:
+        """Room for `extra` more words of `name`, growing if there is not."""
+        held = getattr(self, name)
+        at = self._used[name]
+        if at + extra > held.numel():
+            size = held.numel()
+            while size < at + extra:
+                size *= 2
+            grown = torch.zeros(size, dtype=torch.int32, device="cuda")
+            grown[:at] = held[:at]
+            setattr(self, name, grown)
+            self.revision += 1
+        self._used[name] = at + extra
+        return at
+
+    def admit(self, compiled) -> int:
+        """Add one compiled grammar to the pool and return the id to use for it."""
+        arrays = compiled.device_arrays()
+        if self.count == 0:
+            self.vocab_size = int(arrays["vocab_size"])
+            self.mask_words = int(arrays["bitset_words"])
+        elif int(arrays["vocab_size"]) != self.vocab_size:
+            raise ValueError("grammars in one pool must share a vocabulary")
+
+        identifier = self.count
+        if identifier >= self._capacity:
+            self._capacity *= 2
+            grown = torch.zeros(
+                self._capacity * int(_NBASES.value), dtype=torch.int32, device="cuda"
+            )
+            grown[: self.bases.numel()] = self.bases
+            self.bases = grown
+            self.revision += 1
+
+        rows = np.zeros(int(_NBASES.value), dtype=np.int32)
+        extent: dict[str, tuple[int, int]] = {}
+        for name, slot in _ARENA.items():
+            dtype = np.int32 if name in _SIGNED else np.uint32
+            run = np.frombuffer(arrays[name], dtype=dtype).astype(np.int32)
+            at = self._reserve(name, run.size)
+            getattr(self, name)[at : at + run.size] = torch.from_numpy(
+                run.copy()
+            ).cuda()
+            rows[int(slot.value)] = at
+            extent[name] = (at, run.size)
+        self.bases[
+            identifier * int(_NBASES.value) : (identifier + 1) * int(_NBASES.value)
+        ] = torch.from_numpy(rows).cuda()
+
+        def widest(name):
             values = np.frombuffer(arrays[name], dtype=np.uint32)
             return int(np.diff(values).max()) if values.size > 1 else 1
 
-        self.max_groups_per_state = max(widest(a, "group_offsets") for a in every)
-        self.max_readings = max(widest(a, "reading_offsets") for a in every)
-        self.max_reading_terms = max(widest(a, "reading_term_offsets") for a in every)
-        self.nullable_chain = max(_nullable_chain(a) for a in every)
-        needed = max(_window_bound(a, self.nullable_chain) for a in every)
-        # Capped at the stack: a window that large is no worse than the copy it
-        # replaces, and the overflow flag makes a grammar that genuinely needs
-        # more visible rather than silently mis-masked.
-        self.window = window or min(
-            max_stack, 1 << max(3, int(np.ceil(np.log2(max(needed, 2)))))
+        self.max_groups_per_state = max(self.max_groups_per_state, widest("group_offsets"))
+        self.max_readings = max(self.max_readings, widest("reading_offsets"))
+        self.max_reading_terms = max(
+            self.max_reading_terms, widest("reading_term_offsets")
         )
-        self.window_bound = needed
-
-        longest = 1
-        for arrays in every:
-            lengths = np.frombuffer(arrays["group_set_length"], dtype=np.uint32)
-            if lengths.size:
-                longest = max(longest, int(lengths.max()))
+        self.nullable_chain = max(self.nullable_chain, _nullable_chain(arrays))
+        self.window_bound = max(
+            self.window_bound, _window_bound(arrays, self.nullable_chain)
+        )
+        lengths = np.frombuffer(arrays["group_set_length"], dtype=np.uint32)
+        longest = int(lengths.max()) if lengths.size else 1
         # The lanes of a block search in lockstep, so the loop runs a fixed
         # number of times and every lane must have finished by it. A halving
         # over `n` needs ceil(log2(n)) steps; the margin covers the ends being
         # inclusive, and a bound tight enough for the scalar case left five
         # schemas disagreeing with the reference matcher.
-        self.search_steps = max(2, int(np.ceil(np.log2(longest + 2))) + 2)
+        steps = max(2, int(np.ceil(np.log2(longest + 2))) + 2)
+        if steps > self.search_steps:
+            self.search_steps = steps
+            self.revision += 1
+        if self._forced_window is None:
+            wanted = min(
+                self.max_stack,
+                1 << max(3, int(np.ceil(np.log2(max(self.window_bound, 2))))),
+            )
+            if wanted > self.window:
+                self.window = wanted
+                self.revision += 1
 
-        bases = np.zeros((self.count, int(_NBASES.value)), dtype=np.int32)
-        for name, slot in _ARENA.items():
-            dtype = np.int32 if name in _SIGNED else np.uint32
-            runs = [np.frombuffer(arrays[name], dtype=dtype) for arrays in every]
-            at = 0
-            for index, run in enumerate(runs):
-                bases[index, int(slot.value)] = at
-                at += run.size
-            joined = np.concatenate(runs) if runs else np.zeros(1, dtype=dtype)
+        self.start_parser_states.append(int(arrays["start_parser_state"]))
+        self._live.append(True)
+        self._extent.append(extent)
+        self.count += 1
+        return identifier
+
+    def release(self, identifier: int) -> None:
+        """Say that nothing is under this grammar any more.
+
+        The space is not reclaimed here: the runs of a pool are interleaved with
+        no gaps and moving one moves every base after it, which would be wrong
+        under a running batch. `compact` does that, when it is worth it.
+        """
+        if not self._live[identifier]:
+            return
+        self._live[identifier] = False
+        self._dead_words += sum(size for _, size in self._extent[identifier].values())
+
+    @property
+    def dead_fraction(self) -> float:
+        total = sum(self._used.values())
+        return self._dead_words / total if total else 0.0
+
+    def compact(self) -> dict[int, int]:
+        """Rebuild the arena around the grammars still in use.
+
+        Returns the new id of each surviving grammar, since compaction renumbers
+        them and whoever holds a `grammar_of` has to be told. Bumps `revision`,
+        so any recorded graph is re-recorded.
+        """
+        keep = [index for index in range(self.count) if self._live[index]]
+        remap = {old: new for new, old in enumerate(keep)}
+        held = {
+            name: getattr(self, name)[: self._used[name]].clone() for name in _ARENA
+        }
+        old_bases = self.bases.reshape(-1, int(_NBASES.value)).clone()
+        starts = [self.start_parser_states[index] for index in keep]
+        extents = [self._extent[index] for index in keep]
+
+        # Shrink to fit while rebuilding, with a little slack so the next few
+        # admissions do not immediately grow it back. Compaction is the only
+        # moment the capacity can come down: everywhere else a live batch may
+        # be reading the arrays.
+        for name in _ARENA:
+            wanted = sum(extent[name][1] for extent in extents)
+            self._used[name] = 0
             setattr(
                 self,
                 name,
-                torch.from_numpy(joined.astype(np.int32).copy()).cuda(),
+                torch.zeros(
+                    max(1024, int(wanted * 1.25)), dtype=torch.int32, device="cuda"
+                ),
             )
-        self.bases = torch.from_numpy(bases.reshape(-1).copy()).cuda()
-        self._resident = sum(
-            getattr(self, name).numel() * 4 for name in _ARENA
-        ) + self.bases.numel() * 4
+        self._dead_words = 0
+        rows = np.zeros((max(len(keep), 1), int(_NBASES.value)), dtype=np.int32)
+        for new, extent in enumerate(extents):
+            for name, slot in _ARENA.items():
+                at, size = extent[name]
+                to = self._reserve(name, size)
+                getattr(self, name)[to : to + size] = held[name][at : at + size]
+                rows[new, int(slot.value)] = to
+        if keep:
+            self.bases.reshape(-1, int(_NBASES.value))[: len(keep)] = torch.from_numpy(
+                rows
+            ).cuda()
+        del old_bases
+
+        self.count = len(keep)
+        self.start_parser_states = starts
+        self._live = [True] * len(keep)
+        self._extent = [
+            {
+                name: (int(rows[new, int(slot.value)]), extents[new][name][1])
+                for name, slot in _ARENA.items()
+            }
+            for new in range(len(keep))
+        ]
+        self.revision += 1
+        return remap
 
     def resident_bytes(self) -> int:
-        return self._resident
+        """What the pool's tables occupy, capacity and all."""
+        return (
+            sum(getattr(self, name).numel() * 4 for name in _ARENA)
+            + self.bases.numel() * 4
+        )
+
+    def used_bytes(self) -> int:
+        """What the grammars in the pool actually take up."""
+        return sum(self._used.values()) * 4
 
     def new_batch(self, batch: int) -> "DeviceBatch":
         return DeviceBatch(self, batch)
@@ -1862,6 +2019,12 @@ class DeviceBatch:
         self.configs = grammar.max_configs
         self.graph: torch.cuda.CUDAGraph | None = None
         self.advance_graph: torch.cuda.CUDAGraph | None = None
+        # Which shape of the pool the graphs were recorded against. Admitting a
+        # grammar into spare capacity leaves this alone, but one that makes an
+        # array grow moves it to a new address, and a graph holds the address it
+        # recorded. Replaying then reads freed memory, which is a wrong mask if
+        # it is anything at all.
+        self.recorded = -1
 
         readings = grammar.max_readings
         self.max_readings = readings
@@ -2047,7 +2210,7 @@ class DeviceBatch:
         parser itself faster removes it.
         """
         self.token.copy_(tokens.to(torch.int32).reshape(-1)[: self.batch])
-        if self.advance_graph is not None:
+        if self.advance_graph is not None and self.recorded == self.grammar.revision:
             self.advance_graph.replay()
             return
         self._advance()
@@ -2060,6 +2223,7 @@ class DeviceBatch:
             for _ in range(3):
                 self._advance()
         torch.cuda.current_stream().wait_stream(stream)
+        self.recorded = self.grammar.revision
         self.advance_graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.advance_graph):
             self._advance()
@@ -2256,8 +2420,14 @@ class DeviceBatch:
         self.graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.graph):
             self._fill()
+        self.recorded = self.grammar.revision
 
     def fill_mask(self) -> torch.Tensor:
+        if self.graph is not None and self.recorded != self.grammar.revision:
+            # The pool moved under us. Re-record rather than replay a graph that
+            # points at where the tables used to be.
+            self.graph = None
+            self.advance_graph = None
         if self.graph is not None:
             self.graph.replay()
             return self.mask
