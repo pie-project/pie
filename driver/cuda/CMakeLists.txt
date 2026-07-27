@@ -1060,6 +1060,11 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   # Keeps its own copies of the sources under test: -fsanitize=address below is
   # PRIVATE, so linking pie_driver_cuda_lib would hand it uninstrumented
   # objects and the sanitizer would see nothing of what this target exists for.
+  # The library is still linked, but only to resolve everything these three
+  # files call into. Listing that closure by hand does not converge -- it
+  # reaches `ops/attention_flashinfer.cu` in two hops -- and an explicit object
+  # already defines a symbol, so the archive member that would duplicate it is
+  # never pulled in.
   pie_add_cuda_target(test_ptir_grouped_dispatch_asan
     SOURCES
       tests/ptir_grouped_dispatch_test.cpp
@@ -1070,7 +1075,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
       ${CMAKE_CURRENT_SOURCE_DIR}/tests
       ${CMAKE_CURRENT_SOURCE_DIR}/../common/include ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include
       ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR}
-    LIBS CUDA::cudart CUDA::cuda_driver CUDA::nvrtc
+    LIBS pie_driver_cuda_lib CUDA::cudart CUDA::cuda_driver CUDA::nvrtc
     TEST_ARGS ${CMAKE_CURRENT_SOURCE_DIR}/tests/golden-ptir)
   target_compile_options(test_ptir_grouped_dispatch_asan PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-fsanitize=address>

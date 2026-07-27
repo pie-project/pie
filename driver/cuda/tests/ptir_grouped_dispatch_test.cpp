@@ -53,12 +53,23 @@ const pie_cuda_driver::tests::HostKernelFixture& load_host_kernels(
 
 int failures = 0;
 
-void expect(bool condition, const std::string& message) {
+void expect_impl(bool condition, const std::string& message) {
     if (!condition) {
         ++failures;
         std::fprintf(stderr, "FAIL: %s\n", message.c_str());
     }
 }
+
+// Almost every call site here reads `"...: " + error` for the message while
+// the condition is the very call that fills `error`. Function arguments are
+// unsequenced, so as a plain call the message is built from an `error` that is
+// still empty and every failure reports no reason at all. Sequencing the
+// condition first in a macro fixes all of them at once.
+#define expect(condition, message)             \
+    do {                                       \
+        const bool expect_ok_ = (condition);   \
+        expect_impl(expect_ok_, (message));    \
+    } while (0)
 
 std::string trim(const std::string& value) {
     const std::size_t first = value.find_first_not_of(" \t\r\n");
@@ -1955,8 +1966,11 @@ void run_parallel_signature_case(const std::string& golden_directory) {
                 result.hash,
                 {canonical.data(), canonical.size()},
                 {sidecar.data(), sidecar.size()},
-                load_host_kernels(golden_directory, "mtp_verify_tail").slice(),
-            PieU64Slice{},
+                // `name`, not a fixed golden: this lambda prepares whichever
+                // program it is asked for, and handing it another program's
+                // kernel table publishes a kernel built for a different plan.
+                load_host_kernels(golden_directory, name).slice(),
+                PieU64Slice{},
                 &error) == PIE_STATUS_OK,
             "parallel-signature program registration: " + error);
         result.instance = instance;
