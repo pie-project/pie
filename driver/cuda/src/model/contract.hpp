@@ -749,10 +749,11 @@ public:
     void publish_fused(const std::vector<FusedCandidate>& candidates) {
         for (const FusedCandidate& candidate : candidates) {
             std::vector<Node> parts;
+            std::vector<std::int64_t> local_rows;
             parts.reserve(candidate.parts.size());
+            local_rows.reserve(candidate.parts.size());
             std::int64_t rows = 0;
             for (const SourceTensor* raw : candidate.parts) {
-                consumed_.insert(raw->id);
                 // Shard each part, then join: q/k/v have different row counts,
                 // so a row-shard of the *concatenation* would cut across the
                 // q/k boundary and hand a rank a mix of two projections.
@@ -760,11 +761,29 @@ public:
                 // their join is exactly this rank's fused weight.
                 check_head_granularity(raw->name, shape_of(*raw), ShardAxis{0});
                 parts.push_back(split(contract_.src(std::string(raw->name)), 0));
-                rows += local_extent(raw->shape[0]);
+                local_rows.push_back(local_extent(raw->shape[0]));
+                rows += local_rows.back();
             }
             define(candidate.output_name, contract_.cat(parts, 0),
                    pie_loader::raw(PieLoaderDType::BF16),
                    std::vector<std::int64_t>{rows, candidate.cols});
+
+            // Re-publish each projection as a view into the bank. A bind path
+            // that reads q/k/v individually -- a shared Gemma-4 layer, an
+            // unfused GEMM -- then finds them under their own names at every
+            // `tp_size`, and the offset of a rank's band is stated once, here,
+            // instead of being recomputed in pointer arithmetic per family.
+            std::int64_t at = 0;
+            for (std::size_t part = 0; part < candidate.parts.size(); ++part) {
+                const SourceTensor* raw = candidate.parts[part];
+                define(output_name(raw->name),
+                       contract_.slice(contract_.out(candidate.output_name), 0, at,
+                                       local_rows[part]),
+                       pie_loader::raw(PieLoaderDType::BF16),
+                       std::vector<std::int64_t>{local_rows[part], candidate.cols});
+                consumed_.insert(raw->id);
+                at += local_rows[part];
+            }
         }
     }
 
