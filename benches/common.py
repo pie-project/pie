@@ -407,6 +407,14 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
              "WASM work — useful for measuring the wall-clock benefit "
              "of async chain firing on W>0 workloads. Default 0.",
     )
+    p.add_argument(
+        "--run-ahead-frames",
+        type=int,
+        default=None,
+        help="Decode frames each pie lane keeps queued in the engine. "
+             "The wave quorum waits for every lane, so deeper queues hide "
+             "guest turnaround. pie only; default 2 (inferlet default).",
+    )
 
 
 def gpu_clock_state() -> list[dict[str, Any]]:

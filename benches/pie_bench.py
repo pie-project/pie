@@ -582,6 +582,11 @@ async def run(args: argparse.Namespace):
                 "top_p": args.top_p,
                 "ignore_eos": args.ignore_eos,
                 "wasm_delay_us": args.wasm_delay_us,
+                **(
+                    {"run_ahead_frames": args.run_ahead_frames}
+                    if getattr(args, "run_ahead_frames", None)
+                    else {}
+                ),
                 "return_text": args.dump_first_text or args.dump_all_texts,
                 "report_timing": args.report_timing,
                 "report_arrivals": args.report_arrivals,

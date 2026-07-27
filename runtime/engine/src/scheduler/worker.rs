@@ -1652,13 +1652,14 @@ struct PendingControl {
 struct QueueScan {
     /// Stamped fire ids still in the queue (the frame policy resolves
     /// sealed ids that vanished against this set).
-    queued_ids: HashSet<u64>,
+    queued_ids: frame::QueuedFireIds,
     /// Lanes a frame post must hold for: only lanes with a queued
     /// `PreLaunchCopy` (order-coupled to its consumer fire).
     blocked_lanes: HashSet<ProcessId>,
     /// The oldest unstamped rider, dispatched as its own batch.
     untracked: Option<u64>,
-    /// Every queued fire id in queue order, for the shutdown drain.
+    /// Every queued fire id in queue order, for the shutdown drain. Only
+    /// filled while `stopping` — the steady-state scan never allocates it.
     drain_eligible: Vec<u64>,
 }
 
@@ -2224,6 +2225,8 @@ impl BatchScheduler {
                 acc.dispatch_ns
                     .fetch_add(dispatch_ns, Ordering::Relaxed);
                 acc.passes.fetch_add(1, Ordering::Relaxed);
+                acc.pass_max_ns
+                    .fetch_max(pass_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 acc.mailbox_items
                     .fetch_add(mailbox_items as u64, Ordering::Relaxed);
             }
@@ -2593,7 +2596,13 @@ impl BatchScheduler {
                 pending: mut launch,
             } => {
                 if let Some(timing) = launch.timing.as_mut() {
-                    timing.enqueued_us = Some(super::fire_timing_now_us());
+                    let now = super::fire_timing_now_us();
+                    timing.enqueued_us = Some(now);
+                    let lag = now.saturating_sub(timing.submitted_us) * 1_000;
+                    let acc = &super::LOOP_PHASES;
+                    acc.lag_ns.fetch_add(lag, Ordering::Relaxed);
+                    acc.lag_n.fetch_add(1, Ordering::Relaxed);
+                    acc.lag_max_ns.fetch_max(lag, Ordering::Relaxed);
                 }
                 let validation = AdmissionLimits::new(limits, page_size);
                 let rejection = if launch.completion.cancel_requested() {
@@ -3419,14 +3428,16 @@ impl BatchScheduler {
     /// frame atomicity and the resize rotation refusal into a three-party
     /// queue-order deadlock under contention — a sealed frame straddling a
     /// {resize, copy} pair never posted (CONTENTION_FOLLOWUP.md §12).
-    fn scan_queue(pending: &VecDeque<QueuedItem>) -> QueueScan {
+    fn scan_queue(pending: &VecDeque<QueuedItem>, stopping: bool) -> QueueScan {
         let mut scan = QueueScan::default();
         for item in pending.iter() {
             match item {
                 QueuedItem::Launch(request) => {
-                    scan.drain_eligible.push(request.logical_fire_id);
+                    if stopping {
+                        scan.drain_eligible.push(request.logical_fire_id);
+                    }
                     if request.frame.is_some() {
-                        scan.queued_ids.insert(request.logical_fire_id);
+                        scan.queued_ids.push(request.logical_fire_id);
                     } else if scan.untracked.is_none() {
                         scan.untracked = Some(request.logical_fire_id);
                     }
@@ -3439,6 +3450,7 @@ impl BatchScheduler {
                 _ => {}
             }
         }
+        scan.queued_ids.seal();
         scan
     }
 
@@ -3487,7 +3499,15 @@ impl BatchScheduler {
                 break;
             }
             let now = Instant::now();
-            let scan = Self::scan_queue(pending);
+            let probe = super::fire_timing_enabled();
+            let scan = Self::scan_queue(pending, stopping);
+            if probe {
+                let acc = &super::LOOP_PHASES;
+                acc.scan_ns
+                    .fetch_add(now.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                acc.scans.fetch_add(1, Ordering::Relaxed);
+            }
+            let plan_started = probe.then(Instant::now);
             let mut rider_batch = false;
             let waves: Vec<Vec<u64>> = if stopping {
                 // Shutdown drain: the boundary gate waits for arrivals that
@@ -3518,6 +3538,12 @@ impl BatchScheduler {
                     FramePlan::Park => break,
                 }
             };
+            if let Some(plan_started) = plan_started {
+                super::LOOP_PHASES
+                    .plan_ns
+                    .fetch_add(plan_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+            let post_started = probe.then(Instant::now);
             #[allow(clippy::let_and_return)]
             let (frame_progress, posted) = Self::post_frame(
                 driver_lane,
@@ -3531,6 +3557,11 @@ impl BatchScheduler {
                 stats,
                 &waves,
             );
+            if let Some(post_started) = post_started {
+                super::LOOP_PHASES
+                    .post_ns
+                    .fetch_add(post_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
             progress |= frame_progress;
             if !posted {
                 if stopping || !frame_progress {
@@ -3754,6 +3785,10 @@ impl BatchScheduler {
                     for request in &retired.requests {
                         request.completion.mark_native_retired();
                     }
+                    if retired.timing.is_some() {
+                        super::LAST_RESOLVE_US
+                            .store(super::fire_timing_now_us(), Ordering::Relaxed);
+                    }
                     let mut outcomes = Vec::with_capacity(retired.requests.len());
                     let mut token_instance_ids = Vec::new();
                     for request in retired.requests {
@@ -3910,6 +3945,53 @@ impl BatchScheduler {
             take(&acc.park_ns) / 1_000,
         );
         let (loop_passes, loop_items) = (take(&acc.passes), take(&acc.mailbox_items));
+        let (loop_lag, loop_lag_max, loop_lag_n, loop_pass_max) = (
+            take(&acc.lag_ns) / 1_000,
+            take(&acc.lag_max_ns) / 1_000,
+            take(&acc.lag_n),
+            take(&acc.pass_max_ns) / 1_000,
+        );
+        let mut subs: Vec<u64> = requests.iter().map(|r| r.timing.submitted_us).collect();
+        subs.sort_unstable();
+        let pick = |q: usize| subs.get(subs.len() * q / 100).copied().unwrap_or(0);
+        let sub_min = subs.first().copied().unwrap_or(0);
+        let sub_max = subs.last().copied().unwrap_or(0);
+        let (sub_p50, sub_p90) = (pick(50), pick(90));
+        let sub_lanes: Vec<serde_json::Value> = requests
+            .iter()
+            .map(|r| {
+                serde_json::json!([
+                    r.instance_id,
+                    timing
+                        .dispatch_started_us
+                        .saturating_sub(r.timing.submitted_us)
+                ])
+            })
+            .collect();
+        let enq_max = requests
+            .iter()
+            .filter_map(|r| r.timing.enqueued_us)
+            .max()
+            .unwrap_or(0);
+        let gacc = &super::GUEST_PHASES;
+        let (wake_woken, wake_empty) = (take(&gacc.wake_woken), take(&gacc.wake_empty));
+        let (guest_resume, guest_resume_max, guest_resume_n) = (
+            take(&gacc.resume_ns) / 1_000,
+            take(&gacc.resume_max_ns) / 1_000,
+            take(&gacc.resume_n),
+        );
+        let (guest_wake, guest_work, guest_work_max, guest_n) = (
+            take(&gacc.wake_ns) / 1_000,
+            take(&gacc.work_ns) / 1_000,
+            take(&gacc.work_max_ns) / 1_000,
+            take(&gacc.n),
+        );
+        let (loop_scan, loop_plan, loop_post, loop_scans) = (
+            take(&acc.scan_ns) / 1_000,
+            take(&acc.plan_ns) / 1_000,
+            take(&acc.post_ns) / 1_000,
+            take(&acc.scans),
+        );
         let mut record = serde_json::json!({
             "schema": 1,
             "source": "scheduler",
@@ -3924,12 +4006,6 @@ impl BatchScheduler {
             "retried": retried,
             "failed": failed,
             "dispatch_started_us": timing.dispatch_started_us,
-            "loop_mailbox_us": loop_mailbox,
-            "loop_retire_us": loop_retire,
-            "loop_dispatch_us": loop_dispatch,
-            "loop_park_us": loop_park,
-            "loop_passes": loop_passes,
-            "loop_items": loop_items,
             "batch_built_us": timing.batch_built_us,
             "driver_started_us": timing.driver_started_us,
             "launch_returned_us": timing.launch_returned_us,
@@ -3954,6 +4030,42 @@ impl BatchScheduler {
             // outside the sealed waves (0 in an all-tracked fleet).
             "untracked_ready": untracked_ready,
         });
+        if let Some(object) = record.as_object_mut() {
+            for (key, value) in [
+                ("loop_mailbox_us", loop_mailbox),
+                ("loop_retire_us", loop_retire),
+                ("loop_dispatch_us", loop_dispatch),
+                ("loop_park_us", loop_park),
+                ("loop_passes", loop_passes),
+                ("loop_items", loop_items),
+                ("loop_scan_us", loop_scan),
+                ("loop_plan_us", loop_plan),
+                ("loop_post_us", loop_post),
+                ("loop_scans", loop_scans),
+                ("loop_lag_us", if loop_lag_n > 0 { loop_lag / loop_lag_n } else { 0 }),
+                ("loop_lag_max_us", loop_lag_max),
+                ("loop_lag_n", loop_lag_n),
+                ("loop_pass_max_us", loop_pass_max),
+                ("sub_min_us", sub_min),
+                ("sub_max_us", sub_max),
+                ("guest_wake_us", if guest_n > 0 { guest_wake / guest_n } else { 0 }),
+                ("guest_work_us", if guest_n > 0 { guest_work / guest_n } else { 0 }),
+                ("guest_work_max_us", guest_work_max),
+                ("guest_n", guest_n),
+                ("guest_resume_us", if guest_resume_n > 0 { guest_resume / guest_resume_n } else { 0 }),
+                ("guest_resume_max_us", guest_resume_max),
+                ("wake_woken", wake_woken),
+                ("wake_empty", wake_empty),
+                ("sub_p50_us", sub_p50),
+                ("sub_p90_us", sub_p90),
+                ("enq_max_us", enq_max),
+            ] {
+                object.insert(key.to_string(), serde_json::json!(value));
+            }
+        }
+        if std::env::var_os("PIE_WAVE_LANES").is_some() {
+            record["sub_lanes"] = serde_json::Value::Array(sub_lanes);
+        }
         if super::ledger_timing_enabled() {
             record["token_instance_ids"] = serde_json::json!(token_instance_ids);
         }
@@ -6637,7 +6749,7 @@ mod tests {
         };
         let stats = Arc::new(SchedulerStats::default());
 
-        let queued: HashSet<u64> = [fire_id].into_iter().collect();
+        let queued: frame::QueuedFireIds = [fire_id].into_iter().collect();
         let FramePlan::Dispatch(waves) =
             frame_policy.plan_dispatch(&queued, &HashSet::new(), false, Instant::now())
         else {
@@ -6663,7 +6775,7 @@ mod tests {
         assert!(pending.is_empty());
         assert!(completion.is_settled(), "the cancelled fire must reject");
         assert_eq!(
-            frame_policy.plan_dispatch(&HashSet::new(), &HashSet::new(), false, Instant::now()),
+            frame_policy.plan_dispatch(&frame::QueuedFireIds::default(), &HashSet::new(), false, Instant::now()),
             FramePlan::Park,
             "the frame resolved without the fire; the lane stays awaited"
         );

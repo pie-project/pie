@@ -74,6 +74,25 @@ struct Input {
     /// the live `t0` message.
     #[serde(default)]
     report_arrivals: bool,
+    /// Frames of decode run-ahead each lane keeps queued in the engine. The
+    /// wave quorum waits for every lane, so a lane that drops to one queued
+    /// frame puts its whole guest turnaround on the fleet's critical path;
+    /// deeper queues buy slack for that turnaround.
+    #[serde(default = "default_run_ahead_frames")]
+    run_ahead_frames: usize,
+}
+
+fn default_run_ahead_frames() -> usize {
+    // Two frames only covers a guest turnaround shorter than one wave. Real
+    // wake latency at fleet scale is a large fraction of a wave, so a lane
+    // that queues only two frames intermittently drops to one and — under
+    // the wait-all wave quorum — puts its whole turnaround on the fleet's
+    // critical path. Measured at c=128 on Kimi K2.6: R <= 4 sits in a slow
+    // regime (wave-to-wave 7.6ms, settle->dispatch +3.0ms, i.e. the seal
+    // waits on guests), R >= 5 flips to a fully pipelined one (3.6ms,
+    // settle->dispatch -2.6ms) and stays flat out to R = 10. Six is the
+    // boundary plus margin.
+    6
 }
 
 fn default_max_tokens() -> usize {
@@ -257,16 +276,20 @@ async fn run_one(
     let k = frame_size();
     let tok_in = Channel::new([1], dtype::i32).named("tok_in");
     let g0_ch = Channel::new([1], dtype::i32).named("g0");
-    // Take-side ring ceiling under the two-frame window discipline: the
-    // window (`submitted - taken`) peaks at 3k - 1 — a top-up starting at
-    // window 2k - 1 adds one k-slot frame — and every outstanding fire can
+    // Take-side ring ceiling, tied to the run-ahead window depth R: the
+    // window (`submitted - taken`) peaks at (R+1)k - 1 — a top-up starting at
+    // window Rk - 1 adds one k-slot frame — and every outstanding fire can
     // settle before the host takes. The ring needs ONE MORE cell than that
-    // peak: 3k. Measured, not theoretical — at k=2 a 3k-1 ring throttled the
+    // peak: (R+1)k. Undersizing it does not merely throttle, it POISONS the
+    // channel ("work item completion published Failed terminal outcome") once
+    // a publish finds no free cell, so this must track `run_ahead_frames`.
+    // Measured, not theoretical — at k=2 and R=2 a 3k-1 ring throttled the
     // pipeline back to one frame in flight (28.0k vs 34.3k; the engine's
     // conservative ticket staging needs publish room for the next frame
     // before the host's takes are observable), while k=1 reproduces the
     // classic depth-2 ring either way.
-    let out_capacity = 3 * k;
+    let run_ahead_frames = input.run_ahead_frames.max(1);
+    let out_capacity = (run_ahead_frames + 1) * k;
     let out = Channel::new([1], dtype::i32)
         .capacity(out_capacity as u32)
         .named("out");
@@ -407,7 +430,7 @@ async fn run_one(
     // Decode geometry is device-carried (`tok_in`), so a successor never
     // waits on a sampled token.
     let submit_ahead = |mut submitted: usize, drained: usize| -> std::result::Result<usize, String> {
-        let window_fires = 2 * live_slots;
+        let window_fires = run_ahead_frames * live_slots;
         while submitted < budget && submitted - drained < window_fires {
             let s = (budget - submitted).min(live_slots);
             reserve_to_tokens(n + (submitted + s) as u32 + 1)

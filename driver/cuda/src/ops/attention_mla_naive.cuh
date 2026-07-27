@@ -13,6 +13,7 @@
 #include <string>
 
 #include <cuda_bf16.h>
+#include <cuda_pipeline.h>
 #include <cuda_runtime.h>
 #include <math_constants.h>
 
@@ -307,10 +308,21 @@ namespace mma_detail {
 #ifndef PIE_MLA_MMA_WARPS
 #define PIE_MLA_MMA_WARPS 8
 #endif
+// KV tiles are staged through shared memory with cp.async instead of a
+// global -> register -> shared round trip. Extra stages buy cross-tile overlap
+// but cost a full sK copy (73 KB) of shared memory, and on B200 that drops the
+// block occupancy from 2/SM to 1/SM, which loses more than the overlap wins:
+// at 128x64 heads, kv=1024, stages=1 is 0.275 ms and stages=2 is 0.428 ms.
+// Keep this at 1 unless sK gets small enough that two stages still fit twice.
+#ifndef PIE_MLA_MMA_STAGES
+#define PIE_MLA_MMA_STAGES 1
+#endif
 
 constexpr int kBM = 16;                    // query rows per block == heads
 constexpr int kBK = PIE_MLA_MMA_BK;        // keys per tile
 constexpr int kWarps = PIE_MLA_MMA_WARPS;
+constexpr int kStages = PIE_MLA_MMA_STAGES;
+static_assert(kStages >= 1, "kStages must be at least 1");
 constexpr int kThreads = kWarps * 32;
 constexpr int kCkv = 512;
 constexpr int kKpe = 64;
@@ -369,12 +381,23 @@ __device__ __forceinline__ void ld_b_k(std::uint32_t (&b)[2], const __nv_bfloat1
 }
 
 // B fragment for O = P.V: k = key (row of sK), n = dim (column of sK).
+// V is the transpose of what sK holds, so this is a transposed 8x8 fetch --
+// exactly `ldmatrix.trans`. Doing it by hand costs four strided 2-byte shared
+// loads per fragment (32 fragments per warp per KV tile) and hits bank
+// conflicts; the hardware path is one instruction and, with kLdD = kD + 8,
+// conflict-free: the eight row addresses land on banks 4*row mod 32.
 __device__ __forceinline__ void ld_b_v(std::uint32_t (&b)[2], const __nv_bfloat16* sK,
                                        int ld, int lane, int k0, int nbase) {
-    const int g = lane >> 2, p = (lane & 3) << 1;
-    const __nv_bfloat16* q = sK + static_cast<long long>(k0 + p) * ld + nbase + g;
-    b[0] = pack2(q[0], q[ld]);
-    b[1] = pack2(q[8 * ld], q[9 * ld]);
+    // Lanes 0-7 address matrix 0 (keys k0..k0+7), lanes 8-15 matrix 1
+    // (k0+8..k0+15); lanes 16-31 are ignored by ldmatrix.x2.
+    const __nv_bfloat16* q =
+        sK + static_cast<long long>(k0 + (lane & 15)) * ld + nbase;
+    const std::uint32_t addr =
+        static_cast<std::uint32_t>(__cvta_generic_to_shared(q));
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];\n"
+        : "=r"(b[0]), "=r"(b[1])
+        : "r"(addr));
 }
 
 __global__ __launch_bounds__(kThreads, 3) void mla_mma_paged_kernel(
@@ -392,8 +415,8 @@ __global__ __launch_bounds__(kThreads, 3) void mla_mma_paged_kernel(
 {
     extern __shared__ __align__(16) char smem_raw[];
     __nv_bfloat16* sQ = reinterpret_cast<__nv_bfloat16*>(smem_raw);
-    __nv_bfloat16* sK = sQ + kBM * kLdD;
-    __nv_bfloat16* sP = sK + kBK * kLdD;
+    __nv_bfloat16* sKbuf = sQ + kBM * kLdD;
+    __nv_bfloat16* sP = sKbuf + kStages * kBK * kLdD;
     float* sS = reinterpret_cast<float*>(sP + kBM * kLdP);
     float* sM = sS + kBM * kBK;
     float* sL = sM + kBM;
@@ -454,25 +477,51 @@ __global__ __launch_bounds__(kThreads, 3) void mla_mma_paged_kernel(
     const int g = lane >> 2, p = (lane & 3) << 1;
     const int dbase = warp * kDimsPerWarp;
 
-    for (int j0 = 0; j0 < j_end; j0 += kBK) {
-        __syncthreads();
+    // Stream KV tiles through `kStages` shared buffers: the cp.async group for
+    // tile s+kStages-1 is in flight while the mma pipeline chews on tile s.
+    auto issue_tile = [&](int j0, int stage) {
+        __nv_bfloat16* dst_base = sKbuf + stage * (kBK * kLdD);
         for (int c = tid; c < kBK * kChunksPerRow; c += kThreads) {
             const int row = c / kChunksPerRow;
             const int d = (c % kChunksPerRow) * 8;
             const int j = j0 + row;
-            int4 v = make_int4(0, 0, 0, 0);
+            __nv_bfloat16* dst = dst_base + row * kLdD + d;
             if (j < j_end) {
                 const long long page =
                     kv_page_indices[pages_first + j / page_size];
                 const long long slot = page * page_size + (j % page_size);
-                v = (d < kCkv)
-                    ? *reinterpret_cast<const int4*>(ckv_pages + slot * kCkv + d)
-                    : *reinterpret_cast<const int4*>(kpe_pages + slot * kKpe +
-                                                     (d - kCkv));
+                const void* src =
+                    (d < kCkv)
+                        ? static_cast<const void*>(ckv_pages + slot * kCkv + d)
+                        : static_cast<const void*>(kpe_pages + slot * kKpe +
+                                                   (d - kCkv));
+                __pipeline_memcpy_async(dst, src, 16);
+            } else {
+                *reinterpret_cast<int4*>(dst) = make_int4(0, 0, 0, 0);
             }
-            *reinterpret_cast<int4*>(sK + row * kLdD + d) = v;
         }
+        __pipeline_commit();
+    };
+
+    #pragma unroll
+    for (int s = 0; s < kStages - 1; ++s) {
+        const int j0 = s * kBK;
+        if (j0 < j_end) issue_tile(j0, s);
+    }
+
+    int stage = 0;
+    for (int j0 = 0; j0 < j_end; j0 += kBK, stage = (stage + 1) % kStages) {
+        // Everyone is done reading the buffer the prefetch below reuses.
         __syncthreads();
+        const int prefetch_j0 = j0 + (kStages - 1) * kBK;
+        if (prefetch_j0 < j_end) {
+            issue_tile(prefetch_j0, (stage + kStages - 1) % kStages);
+        } else {
+            __pipeline_commit();
+        }
+        __pipeline_wait_prior(kStages - 1);
+        __syncthreads();
+        const __nv_bfloat16* sK = sKbuf + stage * (kBK * kLdD);
 
         float sacc[kSNTiles][4];
         #pragma unroll
@@ -595,7 +644,8 @@ __global__ __launch_bounds__(kThreads, 3) void mla_mma_paged_kernel(
 }
 
 inline std::size_t smem_bytes() {
-    return static_cast<std::size_t>(kBM * kLdD + kBK * kLdD + kBM * kLdP) *
+    return static_cast<std::size_t>(kBM * kLdD + kStages * kBK * kLdD +
+                                    kBM * kLdP) *
                sizeof(__nv_bfloat16) +
            static_cast<std::size_t>(kBM * kBK + 3 * kBM) * sizeof(float);
 }

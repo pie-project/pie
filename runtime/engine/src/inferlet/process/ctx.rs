@@ -87,6 +87,9 @@ pub struct ProcessCtx {
     execution_admitted: bool,
     admission_wait_us: u64,
     ledger_fire_timing_claimed: bool,
+    /// Guest-turnaround probe: `fire_timing_now_us` when the lane's last
+    /// channel read returned a value. 0 = no read pending attribution.
+    pub(crate) last_take_us: u64,
 }
 
 impl Drop for ProcessCtx {
@@ -299,6 +302,7 @@ impl ProcessCtx {
             execution_admitted: false,
             admission_wait_us: 0,
             ledger_fire_timing_claimed: false,
+            last_take_us: 0,
         })
     }
 
@@ -343,6 +347,29 @@ impl ProcessCtx {
 
     pub(crate) fn admission_wait_us(&self) -> u64 {
         self.admission_wait_us
+    }
+
+    pub(crate) fn note_take_returned(&mut self, wake_us: u64) {
+        let now = crate::scheduler::fire_timing_now_us();
+        if wake_us > 0 {
+            crate::scheduler::GUEST_PHASES
+                .wake_ns
+                .fetch_add(now.saturating_sub(wake_us) * 1_000, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.last_take_us = now;
+    }
+
+    pub(crate) fn note_submit(&mut self) {
+        let last = std::mem::take(&mut self.last_take_us);
+        if last == 0 {
+            return;
+        }
+        let work = crate::scheduler::fire_timing_now_us().saturating_sub(last) * 1_000;
+        let acc = &crate::scheduler::GUEST_PHASES;
+        use std::sync::atomic::Ordering::Relaxed;
+        acc.work_ns.fetch_add(work, Relaxed);
+        acc.work_max_ns.fetch_max(work, Relaxed);
+        acc.n.fetch_add(1, Relaxed);
     }
 
     pub(crate) fn fire_timing_requested(&self) -> bool {

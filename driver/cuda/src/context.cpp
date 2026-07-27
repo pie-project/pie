@@ -73,6 +73,24 @@
 namespace pie::cuda {
 namespace {
 
+// Load every cubin when the CUDA runtime initializes rather than at each
+// kernel's first launch. CUDA defaults to lazy module loading, and the first
+// launch of nearly every kernel lands inside the very first (prefill) step —
+// squarely on the critical path. Measured on Kimi K2.6 at c=128, the prefill's
+// host-side driver submit cost 125ms and stalled the scheduler thread for a
+// whole extra wave; eager loading roughly halves it, for ~1s of extra startup
+// that is off the serving path.
+//
+// This must run before the first CUDA entry point in the process, because that
+// is when the runtime latches the variable — doing it in `Impl::initialize` is
+// already too late. A load-time initializer in the driver's own translation
+// unit runs at dlopen of the engine library, before any Rust code executes.
+// `overwrite = 0` so an explicit CUDA_MODULE_LOADING in the environment wins.
+const int kEagerCudaModuleLoading = [] {
+    ::setenv("CUDA_MODULE_LOADING", "EAGER", 0);
+    return 0;
+}();
+
 struct OwnedValue {
     void* ptr = nullptr;
     void (*deleter)(void*) = nullptr;
