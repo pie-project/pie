@@ -1,17 +1,21 @@
-# `compiler/tests/oracle/` — the transitional C++ emitter oracle
+# `compiler/tests/oracle/` — the transitional C++ emitter oracles
 
-**Delete this directory when `driver/metal/src/pipeline/m1_codegen.cpp` is
-deleted.** Nothing links it into a build.
+**Delete this directory when the C++ emitters are deleted.** Nothing links it
+into a build.
 
-The Metal MSL emitters were ported from C++ to Rust
-(`compiler/codegen/src/metal/`). This harness is how that port was proven, and
-how it stays proven while both copies exist: it links the C++ emitter, runs it
-over a fixed corpus, and writes the results to `compiler/tests/golden-msl/`.
-`compiler/tests/tests/metal_msl_golden.rs` drives the Rust port over the same
-corpus and requires the same bytes.
+Both backends' emitters were ported from C++ to Rust (`compiler/codegen/src/`).
+These harnesses are how the ports were proven, and how they stay proven while
+both copies exist: each links its C++ emitter, runs it over a fixed corpus, and
+writes the results to a golden directory that the Rust side must reproduce.
 
-There is no Metal SDK on Linux, but none is needed — the emitters are pure
-string builders whose `MTL`/`NS` mentions are all inside MSL literals.
+| harness | C++ under test | goldens | Rust comparison |
+|---|---|---|---|
+| `m1_codegen_dump.cpp` | `driver/metal/src/pipeline/m1_codegen.cpp` | `golden-msl/` | `tests/metal_msl_golden.rs` |
+| `cuda_codegen_dump.cpp` | `driver/cuda/src/pipeline/generated/` | `golden-cuda/` | `tests/cuda_golden.rs` |
+
+Neither a Metal SDK nor a CUDA toolkit is needed — the emitters are pure string
+builders, and the headers they include are device-free. Metal's `MTL`/`NS`
+mentions are all inside MSL literals.
 
 ## Re-deriving the goldens
 
@@ -21,7 +25,13 @@ g++ -std=c++20 -O1 -o /tmp/m1_codegen_dump \
   driver/metal/src/pipeline/m1_codegen.cpp \
   -I driver/metal/src -I driver/common/include -I compiler/codegen/include
 /tmp/m1_codegen_dump . compiler/tests/golden-msl
-git diff --stat compiler/tests/golden-msl   # expect empty
+
+g++ -std=c++20 -O1 -o /tmp/cuda_codegen_dump \
+  compiler/tests/oracle/cuda_codegen_dump.cpp \
+  -I driver/cuda/src -I driver/common/include
+/tmp/cuda_codegen_dump . compiler/tests/golden-cuda
+
+git diff --stat compiler/tests/golden-msl compiler/tests/golden-cuda  # expect empty
 ```
 
 A non-empty diff means the C++ emitter changed. Port the change to Rust, then
@@ -68,3 +78,20 @@ returns `reject_deterministic(error)` without reading it, so those entries are
 unobservable. The Rust signature is `Result<Vec<M1OpMeta>, String>`, which
 discards them; the comparison checks the verdict and message on every case and
 the operations only when the verdict is `ok`.
+
+## CUDA corpus
+
+Same corpus file, same argument: the plans come from `corpus/stage_plans.txt`.
+
+| emitter | cases |
+|---|---|
+| `emit_singleton_region_cuda` | 263 — every tag byte, plus seven entry-name cases |
+| `emit_fused_region_cuda` | 320 — every region of every stage, bodies pinned by hash |
+| `emit_fused_region_cuda_verbatim` | 36 — one region per stage, kept whole so a diff is readable |
+| `validate_generated_region` | 320 |
+| `second_party_region_supported` | 320 |
+| `singleton_runtime_cuda_source` | 1 — the 45 KB runtime, pinned by hash |
+
+A fused CUDA kernel is 40-70 KB, so checking in all 320 would be a 13 MB
+golden nobody reads. Hashing the body and keeping one per stage verbatim costs
+1.9 MB and still fails loudly on any change.

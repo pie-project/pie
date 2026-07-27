@@ -16,9 +16,9 @@ use core::fmt::Write as _;
 use pie_plan::{CompiledStage, Region};
 
 use super::METAL_M2_MAX_FUSED_CHANNELS;
-use super::op_view::{OpView, result_bases};
 use super::preamble::{RUNTIME_TEMPLATE, grouped_preamble};
 use super::validate::{library_region_valid, used_channel_slots};
+use crate::op_view::{OpView, result_bases};
 
 const OP_PIVOT_THRESHOLD: u8 = 0x58;
 const OP_CHAN_TAKE: u8 = 0x90;

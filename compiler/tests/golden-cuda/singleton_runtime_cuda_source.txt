@@ -1,0 +1,9 @@
+# oracle dump: pie_cuda_driver::pipeline::generated::singleton_runtime_cuda_source
+# source of truth: driver/cuda/src/pipeline/generated/ (transitional; the Rust port is compiler/codegen/src/cuda/)
+# emitter_version: 19
+# @runtime: bytes=45277 fnv1a64=0x41b1d45aaef71184
+# cases: 1
+=== runtime
+bytes: 45277
+fnv1a64: 0x41b1d45aaef71184
+=== end

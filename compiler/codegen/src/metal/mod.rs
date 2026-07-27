@@ -23,7 +23,6 @@
 //!
 //! ## Modules
 //!
-//! * [`op_view`] — the `COp` projection of a [`pie_ir::op::Op`].
 //! * [`preamble`] — the embedded runtime and the shared MSL struct preambles.
 //! * [`validate`] — `validate_singleton_plan` and the region ABI checks.
 //! * [`singleton`] — the one-op-per-dispatch kernel.
@@ -35,16 +34,15 @@
 pub mod effects;
 pub mod fused;
 pub mod nucleus;
-pub mod op_view;
 pub mod preamble;
 pub mod singleton;
 pub mod topk;
 pub mod validate;
 
+pub use crate::op_view::OpView;
 pub use effects::{emit_commit, emit_grouped_commit, emit_grouped_readiness, emit_readiness};
 pub use fused::{emit_fused_region, emit_grouped_fused_region};
 pub use nucleus::emit_grouped_nucleus;
-pub use op_view::OpView;
 pub use preamble::RUNTIME_TEMPLATE;
 pub use singleton::emit_singleton_region;
 pub use topk::emit_grouped_topk;

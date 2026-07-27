@@ -10,9 +10,9 @@ use core::fmt::Write as _;
 
 use pie_plan::{CompiledStage, LibraryOp, Region};
 
-use super::op_view::{OpView, result_bases};
 use super::preamble::{RUNTIME_TEMPLATE, grouped_preamble};
 use super::validate::{is_library, library_op_byte, library_region_valid};
+use crate::op_view::{OpView, result_bases};
 
 const OP_TOP_K: u8 = 0x51;
 

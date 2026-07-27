@@ -19,7 +19,7 @@ use pie_plan::{
 };
 
 use super::M1OpMeta;
-use super::op_view::OpView;
+use crate::op_view::OpView;
 
 const OP_PIVOT_THRESHOLD: u8 = 0x58;
 const OP_KERNEL_CALL: u8 = 0xA1;
