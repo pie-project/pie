@@ -128,15 +128,9 @@ bool moe_path_log_enabled() {
 // Qwen3.6-35B-A3B, 128 requests x 256 tokens: 1197 tok/s at 8 against
 // 1107 at 16, and it falls off either side (921 at 32, 586 at 64).
 //
-// The optimum tracks the per-expert weight size, so it is NOT the same at
-// every tp. Re-measured after the gather/scatter widening (128x256 again):
-// tp=1 still prefers 8 (1499 against 1432 at 16), but tp=2, where each
-// expert weight is half the size and the batch count matters more than the
-// padded rows, prefers 16 (3226 against 3184; the decode step itself goes
-// 41.2 -> 39.7 ms, gate_up 11.3 -> 10.3 and down 8.7 -> 7.8). 32 is worse
-// at both. 8 is kept as the default because it is the safe choice across
-// topologies; set PIE_QWEN35_MOE_ALIGNED_DECODE_BLOCK=16 for a tp=2
-// throughput deployment.
+// The optimum tracks the per-expert weight size, so a single constant is
+// wrong; see `qwen35_moe_aligned_decode_block_size` below for the rule and
+// the measurements behind it.
 // The shared expert's two projections are dense GEMMs over N rows with
 // N_gemm = 2*Is and H. cuBLAS covers those with only a handful of thread
 // blocks (4 at Is=256), so they run at a few percent of the machine. When
@@ -170,20 +164,38 @@ bool shared_fold_enabled() {
     return enabled;
 }
 
-int qwen35_moe_aligned_decode_block_size() {
-    static const int block = [] {
-        const char* v = std::getenv("PIE_QWEN35_MOE_ALIGNED_DECODE_BLOCK");
-        if (v == nullptr || v[0] == '\0') return 8;
+// Two forces pull opposite ways. A bigger block means fewer batch entries,
+// and the routed GEMM's cost scales with entry count (established by the
+// shared-expert fold measurement above: 16 extra entries out of 352 cost
+// +0.56 ms even though they all read one L2-resident weight). But a bigger
+// block also means more padded rows to gather and multiply. Fewer entries
+// wins while each expert's weight is small enough that the per-entry cost
+// is not amortised; once the weight is large, the padded rows dominate.
+//
+// Measured on Qwen3.6-35B-A3B (128 requests x 256 tokens), whose two
+// topologies straddle the crossover:
+//   tp=1, 4.2 MB per expert : 8 -> 1499 tok/s, 16 -> 1432
+//   tp=2, 2.1 MB per expert : 16 -> 3226 tok/s, 8 -> 3184
+//     and on the profiled step, 8 -> 40.60 ms, 12 -> 40.03, 16 -> 40.02,
+//     24 -> 41.21, the gain concentrated in the GEMMs (gate_up
+//     11.15 -> 10.64 ms, down 8.70 -> 7.88).
+// 32 and above is worse at both.
+int qwen35_moe_aligned_decode_block_size(int inter_local, int hidden) {
+    const char* v = std::getenv("PIE_QWEN35_MOE_ALIGNED_DECODE_BLOCK");
+    if (v != nullptr && v[0] != '\0') {
         char* end = nullptr;
         long parsed_long = std::strtol(v, &end, 10);
-        if (end == v) return 8;
-        int parsed = static_cast<int>(parsed_long);
-        if (parsed <= 1) return 0;
-        if (parsed < 2) parsed = 2;
-        if (parsed > 64) parsed = 64;
-        return parsed;
-    }();
-    return block;
+        if (end != v) {
+            int parsed = static_cast<int>(parsed_long);
+            if (parsed <= 1) return 0;
+            if (parsed > 64) parsed = 64;
+            return parsed;
+        }
+    }
+    if (inter_local <= 0 || hidden <= 0) return 8;
+    const std::size_t gate_up_bytes = static_cast<std::size_t>(2) *
+        inter_local * hidden * sizeof(std::uint16_t);
+    return gate_up_bytes <= (std::size_t{3} << 20) ? 16 : 8;
 }
 
 int qwen35_moe_aligned_decode_min_routes() {
@@ -637,7 +649,8 @@ Qwen3_5MoeMlpWorkspace Qwen3_5MoeMlpWorkspace::allocate(
     ws.c_dn_ptrs     = DeviceBuffer<std::uint16_t*>::alloc(ptr_slots);
     ws.batch_weights = DeviceBuffer<float>::alloc(maxR);
 
-    ws.aligned_block_size = qwen35_moe_aligned_decode_block_size();
+    ws.aligned_block_size =
+        qwen35_moe_aligned_decode_block_size(moe_intermediate, hidden);
     if (ws.aligned_block_size > 1 && maxR > 0 && num_experts > 0) {
         const std::size_t active_expert_cap =
             std::min<std::size_t>(static_cast<std::size_t>(num_experts), maxR);
