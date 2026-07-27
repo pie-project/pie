@@ -15,9 +15,9 @@
 // declaration is unique, and the node arena is topologically sorted.
 //
 // The last of those is the one that used to be impossible. The old test could
-// only compare `covered_contract_count` against `runtime_tensor_count`, which
-// were two names for `view.tensors.len`; it could not evaluate the contract
-// because the contract was a list of names with no expressions in it.
+// only compare a covered count against a demanded one, and both were names for
+// `view.tensors.len`; it could not evaluate the contract because the contract
+// was a list of names with no expressions in it.
 //
 // Under `PIE_TEST_CONTRACT_DUMP` the authored contract is written out as JSON.
 // These C++ test binaries cannot link the loader (it is an rlib the worker

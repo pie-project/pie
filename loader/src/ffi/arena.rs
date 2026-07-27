@@ -15,7 +15,6 @@ use crate::load_plan::{
     DestExtent, LoadPlan, QuantGranularity, ScaleForm, SourceExtent, StorageInstr, StridedExtent,
 };
 use crate::types::{Encoding, QuantScheme};
-use crate::verify::ContractCoverage;
 
 use super::types::*;
 
@@ -175,11 +174,10 @@ impl PlanArena {
         // place that knows how to name its own instructions.
         let mut arena = self;
         let cache_key = arena.store_str(&extras.cache_key);
-        let summary = arena.store_str(&crate::dump::describe(plan, extras.coverage));
-        let stats_json = arena.store_str(&crate::dump::plan_stats_json(plan, extras.coverage));
+        let summary = arena.store_str(&crate::dump::describe(plan));
+        let stats_json = arena.store_str(&crate::dump::plan_stats_json(plan));
         let owner = Box::into_raw(Box::new(arena)).cast::<std::ffi::c_void>();
         Box::into_raw(Box::new(PieLoaderPlan {
-            version: plan.version,
             files,
             sources,
             tensors,
@@ -197,10 +195,6 @@ impl PlanArena {
             compiler_version: plan.compiler_version,
             target: (&plan.target).into(),
             attachments,
-            coverage: PieLoaderContractCoverageView {
-                covered: extras.coverage.covered,
-                demanded: extras.coverage.demanded,
-            },
             cache_key,
             summary,
             stats_json,
@@ -366,6 +360,9 @@ fn flatten_instr(arena: &mut PlanArena, instr: &StorageInstr) -> PieLoaderStorag
             out.transform_source_cols = repack.source_cols;
             out.transform_target_cols = repack.target_cols;
             out.transform_scratch_bytes = transform.scratch_bytes;
+            out.transform_metadata_source = transform
+                .metadata_source
+                .map_or(PIE_LOADER_NO_TENSOR, |id| id.0);
         }
         StorageInstr::CreateView {
             id,
@@ -397,23 +394,20 @@ fn flatten_instr(arena: &mut PlanArena, instr: &StorageInstr) -> PieLoaderStorag
     out
 }
 
-/// The facts a driver needs that a plan alone cannot state.
+/// The fact a driver needs that a plan alone cannot state.
 ///
-/// Both are derived from the plan *and the request it came from*: coverage needs
-/// the caller's demands, and the cache key needs the snapshot path and the
-/// component. Computing them once at compile time and shipping them with the
-/// plan is what keeps two drivers from each growing their own version.
+/// Derived from the plan *and the request it came from*: the cache key needs the
+/// snapshot path, which is not in the plan. Computing it once at compile time
+/// and shipping it with the plan is what keeps two drivers from each growing
+/// their own version.
 pub struct PlanExtras {
-    pub coverage: ContractCoverage,
     pub cache_key: String,
 }
 
 impl Default for PlanExtras {
-    /// What a plan compiled for a caller that declared nothing looks like. The
-    /// key is still a key: an empty one would collide across every model.
+    /// The key is still a key: an empty one would collide across every model.
     fn default() -> Self {
         Self {
-            coverage: ContractCoverage::default(),
             cache_key: "0000000000000000".to_string(),
         }
     }

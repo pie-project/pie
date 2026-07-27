@@ -8,16 +8,17 @@
 //! that does not produce a declared tensor, nothing in `compile` would notice,
 //! because the same wrong belief produced both halves.
 //!
-//! The driver-side counterpart in `loaded_model.cpp` compares
-//! `covered_contract_count` against `runtime_tensor_count`, but both are
-//! assigned from `view.tensors.len` — it is literally `if (x != x)`. The real
-//! check lives here, where the two sides being compared were derived
-//! separately.
+//! There is no driver-side counterpart. `loaded_model.cpp` used to compare a
+//! covered count against a demanded one, which was `if (x != x)` twice over:
+//! first because both were assigned from `view.tensors.len`, and then, once the
+//! contract gave them separate origins, because [`check_contract`] below throws
+//! on the only way they could differ. A driver that calls `verify` has already
+//! been told; counting again on the far side of the FFI only looked like a
+//! check.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use crate::load_plan::{LoadPlan, StorageInstr};
 use crate::types::Encoding;
 
 /// The plan, reduced to what verification can read.
@@ -28,7 +29,6 @@ use crate::types::Encoding;
 /// marshalling is in scope, which it would not be if verification re-read the
 /// Rust plan the driver never sees.
 pub struct PlanView<'a> {
-    pub version: u32,
     pub compiler_version: u64,
     pub files: Vec<FileView<'a>>,
     pub sources: Vec<SourceView<'a>>,
@@ -79,75 +79,6 @@ impl<'a> TensorView<'a> {
     }
 }
 
-impl<'a> From<&'a LoadPlan> for PlanView<'a> {
-    fn from(plan: &'a LoadPlan) -> Self {
-        Self {
-            version: plan.version,
-            compiler_version: plan.compiler_version,
-            files: plan
-                .files
-                .iter()
-                .map(|file| FileView {
-                    id: file.id.0,
-                    path: file.path.as_str(),
-                    size_bytes: file.size_bytes,
-                })
-                .collect(),
-            sources: plan
-                .sources
-                .iter()
-                .map(|source| SourceView {
-                    name: source.name.as_str(),
-                    file_id: source.file_id.0,
-                    offset_bytes: source.file_offset,
-                    span_bytes: source.span_bytes,
-                })
-                .collect(),
-            tensors: plan
-                .tensors
-                .iter()
-                .map(|tensor| {
-                    TensorView::new(
-                        tensor.name.as_str(),
-                        tensor.shape.as_slice(),
-                        &tensor.encoding,
-                    )
-                })
-                .collect(),
-            instr_count: plan.instrs.len(),
-            schedule: plan.schedule.iter().map(|id| id.0).collect(),
-            finalized: plan
-                .instrs
-                .iter()
-                .filter_map(|instr| match instr {
-                    StorageInstr::Finalize { name, .. } => Some(name.as_str()),
-                    _ => None,
-                })
-                .collect(),
-            reads: plan
-                .instrs
-                .iter()
-                .filter_map(|instr| {
-                    let (instr, file_id) = match instr {
-                        StorageInstr::ExtentWrite { id, source, .. }
-                        | StorageInstr::BulkExtentWrite { id, source, .. } => {
-                            (id.0, source.file_id.0)
-                        }
-                        StorageInstr::SlabScatter { id, file_id, .. } => (id.0, file_id.0),
-                        StorageInstr::TileMap {
-                            id,
-                            source: Some(source),
-                            ..
-                        } => (id.0, source.file_id.0),
-                        _ => return None,
-                    };
-                    Some(ReadView { instr, file_id })
-                })
-                .collect(),
-        }
-    }
-}
-
 /// What the runtime demands, independently of how the plan proposes to deliver
 /// it: a name, a shape, and an encoding per tensor.
 ///
@@ -162,48 +93,30 @@ pub struct ContractView<'a> {
 
 /// One tensor the runtime demands.
 ///
-/// `shape` and `encoding` are optional because the two demanders know different
-/// amounts. `arch/` authored the tensor, so it states all three. A *driver*
-/// declaring what it will bind knows the name always and the shape usually, but
-/// generally not the encoding: which quantization a weight ends up in is the
-/// loader's decision under the runtime quant policy, and the binder probes
-/// `->dtype()` afterwards rather than demanding one. Demanding an encoding the
-/// driver merely guessed would turn a correct plan into a violation, so an
-/// unstated field is `None` and is not checked.
+/// Every demand is read off a contract the driver authored, so the encoding is
+/// always pinned: a contract states the encoding of every tensor it defines.
+/// The shape is pinned only when the contract declared one — a contract may
+/// decline to predict a shape (`TensorContract::inferred`), and inventing one
+/// here would turn the loader's own inference into the thing being verified.
+///
+/// There is no `optional`. It existed for a driver that declared the tensors it
+/// would bind without authoring them, and could only guess whether a weight it
+/// named would be present; a contract does not guess, because the author read
+/// the checkpoint's tensor table before writing it. A tied-embedding checkpoint
+/// yields a contract that does not declare `lm_head.weight` at all.
 pub struct TensorDemand<'a> {
     pub name: &'a str,
     pub shape: Option<Vec<i64>>,
     pub encoding: Option<Encoding>,
-    /// Absence is not a violation. Some weights are legitimately conditional —
-    /// `lm_head.weight` is dropped when `tie_word_embeddings` is set, and the
-    /// binder falls back to the embedding table.
-    pub optional: bool,
 }
 
 impl<'a> TensorDemand<'a> {
     /// A demand read off a contract the loader itself is about to execute.
-    ///
-    /// The encoding is always pinned: a contract states the encoding of every
-    /// tensor it defines, so an authored demand can check it. The shape is
-    /// pinned only when the contract declared one — a contract may decline to
-    /// predict a shape (`TensorContract::inferred`), and inventing one here
-    /// would turn the loader's own inference into the thing being verified.
     pub fn authored(name: &'a str, shape: Option<&[i64]>, encoding: &Encoding) -> Self {
         Self {
             name,
             shape: shape.map(<[i64]>::to_vec),
             encoding: Some(crate::types::normalize_encoding(encoding)),
-            optional: false,
-        }
-    }
-
-    /// A demand that pins only what the demander actually knows.
-    pub fn declared(name: &'a str, shape: Option<Vec<i64>>, optional: bool) -> Self {
-        Self {
-            name,
-            shape,
-            encoding: None,
-            optional,
         }
     }
 }
@@ -236,7 +149,7 @@ pub struct Violation {
 }
 
 impl Violation {
-    fn plan(message: impl Into<String>) -> Self {
+    pub(crate) fn plan(message: impl Into<String>) -> Self {
         Self {
             tensor: None,
             message: message.into(),
@@ -291,7 +204,7 @@ pub fn verify(
     contract: Option<&ContractView<'_>>,
 ) -> Result<Certificate, Vec<Violation>> {
     let mut found = Vec::new();
-    check_versions(plan, &mut found);
+    check_compiler_version(plan, &mut found);
     check_schedule(plan, &mut found);
     check_coverage(plan, &mut found);
     check_files(plan, &mut found);
@@ -309,14 +222,15 @@ pub fn verify(
     })
 }
 
-fn check_versions(plan: &PlanView<'_>, found: &mut Vec<Violation>) {
-    if plan.version != crate::load_plan::LOAD_PLAN_VERSION {
-        found.push(Violation::plan(format!(
-            "plan version {} does not match loader version {}",
-            plan.version,
-            crate::load_plan::LOAD_PLAN_VERSION
-        )));
-    }
+/// The plan was compiled by *this* build of the loader.
+///
+/// A tautology on the compile path — the plan came from the same library a
+/// moment ago — and kept anyway, because `compiler_version` is the field that
+/// stops being one the day a plan reaches `verify` from anywhere but a
+/// `compile` call in the same process. The `version` field that used to sit
+/// beside it was removed: a monotonic layout number cannot say anything a
+/// source hash does not, and it said it about a struct C++ reads by layout.
+fn check_compiler_version(plan: &PlanView<'_>, found: &mut Vec<Violation>) {
     let expected = crate::load_plan::compiler_version();
     if plan.compiler_version != expected {
         found.push(Violation::plan(format!(
@@ -491,12 +405,10 @@ fn check_contract(plan: &PlanView<'_>, contract: &ContractView<'_>, found: &mut 
 
     for demanded in &contract.tensors {
         let Some(planned) = planned.get(demanded.name) else {
-            if !demanded.optional {
-                found.push(Violation::tensor(
-                    demanded.name,
-                    "is demanded by the contract but the plan does not declare it",
-                ));
-            }
+            found.push(Violation::tensor(
+                demanded.name,
+                "is demanded by the contract but the plan does not declare it",
+            ));
             continue;
         };
         if let Some(shape) = &demanded.shape
@@ -555,49 +467,11 @@ fn encoding_matches(planned: &Encoding, demanded: &Encoding) -> bool {
     }
 }
 
-/// How much of a declared contract a plan delivers.
-///
-/// [`check_contract`] answers *is the plan wrong*; this answers *how much did it
-/// build*, which is what the driver reports and gates on. Splitting them keeps
-/// the count out of the violation path, where an early return would skew it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ContractCoverage {
-    pub covered: usize,
-    pub demanded: usize,
-}
-
-impl ContractCoverage {
-    /// Count demands the plan declares a tensor for.
-    ///
-    /// An optional demand the plan skipped is dropped from *both* sides rather
-    /// than only the numerator. Counting it in the denominator would reject
-    /// every tied-embedding checkpoint: `lm_head.weight` is optional precisely
-    /// because the binder falls back to the embedding table when HF omits it,
-    /// and the plan then rightly does not produce it.
-    pub fn measure<'a>(
-        planned: impl IntoIterator<Item = &'a str>,
-        demands: impl IntoIterator<Item = (&'a str, bool)>,
-    ) -> Self {
-        let planned: HashSet<&str> = planned.into_iter().collect();
-        let mut out = Self::default();
-        for (name, optional) in demands {
-            let present = planned.contains(name);
-            if !present && optional {
-                continue;
-            }
-            out.demanded += 1;
-            if present {
-                out.covered += 1;
-            }
-        }
-        out
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::load_plan::{StorageTarget, compiler_version};
+    use crate::ffi::view::verify_marshalled;
+    use crate::load_plan::{LoadPlan, StorageInstr, StorageTarget, compiler_version};
     use crate::types::{BufferId, Encoding, InstrId, TensorDecl, TensorId};
 
     fn decl(name: &str) -> TensorDecl {
@@ -632,7 +506,7 @@ mod tests {
     #[test]
     fn a_plan_that_finalizes_what_it_declares_verifies() {
         let plan = plan_with(vec![decl("w")], vec![finalize(0, "w")]);
-        let certificate = verify(&PlanView::from(&plan), None).expect("should verify");
+        let certificate = verify_marshalled(&plan, None).expect("should verify");
         assert_eq!(certificate.tensors, 1);
         assert_eq!(certificate.instructions, 1);
     }
@@ -640,7 +514,7 @@ mod tests {
     #[test]
     fn a_declared_tensor_that_is_never_finalized_is_a_violation() {
         let plan = plan_with(vec![decl("w")], Vec::new());
-        let violations = verify(&PlanView::from(&plan), None).unwrap_err();
+        let violations = verify_marshalled(&plan, None).unwrap_err();
         assert_eq!(violations[0].tensor.as_deref(), Some("w"));
         assert!(violations[0].message.contains("never finalized"));
     }
@@ -648,7 +522,7 @@ mod tests {
     #[test]
     fn finalizing_a_name_nobody_declared_is_a_violation() {
         let plan = plan_with(Vec::new(), vec![finalize(0, "ghost")]);
-        let violations = verify(&PlanView::from(&plan), None).unwrap_err();
+        let violations = verify_marshalled(&plan, None).unwrap_err();
         assert!(
             violations
                 .iter()
@@ -659,7 +533,7 @@ mod tests {
     #[test]
     fn finalizing_the_same_tensor_twice_is_a_violation() {
         let plan = plan_with(vec![decl("w")], vec![finalize(0, "w"), finalize(1, "w")]);
-        let violations = verify(&PlanView::from(&plan), None).unwrap_err();
+        let violations = verify_marshalled(&plan, None).unwrap_err();
         assert!(violations.iter().any(|v| v.message.contains("2 times")));
     }
 
@@ -667,7 +541,7 @@ mod tests {
     fn an_instruction_left_out_of_the_schedule_is_a_violation() {
         let mut plan = plan_with(vec![decl("w")], vec![finalize(0, "w")]);
         plan.schedule.clear();
-        let violations = verify(&PlanView::from(&plan), None).unwrap_err();
+        let violations = verify_marshalled(&plan, None).unwrap_err();
         assert!(
             violations
                 .iter()
@@ -679,7 +553,7 @@ mod tests {
     fn scheduling_an_instruction_twice_is_a_violation() {
         let mut plan = plan_with(vec![decl("w")], vec![finalize(0, "w")]);
         plan.schedule.push(InstrId(0));
-        let violations = verify(&PlanView::from(&plan), None).unwrap_err();
+        let violations = verify_marshalled(&plan, None).unwrap_err();
         assert!(
             violations
                 .iter()
@@ -708,7 +582,7 @@ mod tests {
     fn a_plan_that_delivers_the_contract_verifies() {
         let plan = plan_with(vec![decl("w")], vec![finalize(0, "w")]);
         let demanded = contract(&[("w", vec![1], Encoding::Raw(crate::types::DType::U8))]);
-        verify(&PlanView::from(&plan), Some(&demanded)).expect("should verify");
+        verify_marshalled(&plan, Some(&demanded)).expect("should verify");
     }
 
     #[test]
@@ -718,7 +592,7 @@ mod tests {
             ("w", vec![1], Encoding::Raw(crate::types::DType::U8)),
             ("bias", vec![1], Encoding::Raw(crate::types::DType::U8)),
         ]);
-        let violations = verify(&PlanView::from(&plan), Some(&demanded)).unwrap_err();
+        let violations = verify_marshalled(&plan, Some(&demanded)).unwrap_err();
         assert_eq!(violations[0].tensor.as_deref(), Some("bias"));
         assert!(violations[0].message.contains("does not declare it"));
     }
@@ -727,7 +601,7 @@ mod tests {
     fn a_plan_delivering_the_wrong_shape_is_a_violation() {
         let plan = plan_with(vec![decl("w")], vec![finalize(0, "w")]);
         let demanded = contract(&[("w", vec![2, 3], Encoding::Raw(crate::types::DType::U8))]);
-        let violations = verify(&PlanView::from(&plan), Some(&demanded)).unwrap_err();
+        let violations = verify_marshalled(&plan, Some(&demanded)).unwrap_err();
         assert!(violations[0].message.contains("contract demands [2, 3]"));
     }
 
@@ -735,7 +609,7 @@ mod tests {
     fn a_plan_delivering_the_wrong_encoding_is_a_violation() {
         let plan = plan_with(vec![decl("w")], vec![finalize(0, "w")]);
         let demanded = contract(&[("w", vec![1], Encoding::Raw(crate::types::DType::BF16))]);
-        let violations = verify(&PlanView::from(&plan), Some(&demanded)).unwrap_err();
+        let violations = verify_marshalled(&plan, Some(&demanded)).unwrap_err();
         assert!(violations[0].message.contains("BF16"));
     }
 
@@ -748,69 +622,14 @@ mod tests {
             vec![finalize(0, "w"), finalize(1, "view")],
         );
         let demanded = contract(&[("w", vec![1], Encoding::Raw(crate::types::DType::U8))]);
-        verify(&PlanView::from(&plan), Some(&demanded)).expect("should verify");
+        verify_marshalled(&plan, Some(&demanded)).expect("should verify");
     }
 
     #[test]
     fn a_stale_compiler_version_is_a_violation() {
         let mut plan = plan_with(vec![decl("w")], vec![finalize(0, "w")]);
         plan.compiler_version ^= 1;
-        let violations = verify(&PlanView::from(&plan), None).unwrap_err();
+        let violations = verify_marshalled(&plan, None).unwrap_err();
         assert!(violations[0].message.contains("compiler version"));
-    }
-
-    /// An optional demand the plan skipped must leave the coverage ratio whole.
-    /// Counting it in the denominator alone would reject every tied-embedding
-    /// checkpoint, where `lm_head.weight` is legitimately absent.
-    #[test]
-    fn an_absent_optional_demand_does_not_dent_coverage() {
-        let planned = ["model.embed_tokens.weight", "model.norm.weight"];
-        let demands = [
-            ("model.embed_tokens.weight", false),
-            ("lm_head.weight", true),
-            ("model.norm.weight", false),
-        ];
-        let coverage = ContractCoverage::measure(planned, demands);
-        assert_eq!(coverage.covered, 2);
-        assert_eq!(coverage.demanded, 2);
-    }
-
-    #[test]
-    fn a_present_optional_demand_counts_on_both_sides() {
-        let planned = [
-            "model.embed_tokens.weight",
-            "lm_head.weight",
-            "model.norm.weight",
-        ];
-        let demands = [
-            ("model.embed_tokens.weight", false),
-            ("lm_head.weight", true),
-            ("model.norm.weight", false),
-        ];
-        let coverage = ContractCoverage::measure(planned, demands);
-        assert_eq!(coverage.covered, 3);
-        assert_eq!(coverage.demanded, 3);
-    }
-
-    /// The shortfall this exists to report.
-    #[test]
-    fn a_missing_required_demand_is_a_shortfall() {
-        let planned = ["model.embed_tokens.weight"];
-        let demands = [
-            ("model.embed_tokens.weight", false),
-            ("model.layers.0.mlp.down_proj.weight", false),
-        ];
-        let coverage = ContractCoverage::measure(planned, demands);
-        assert_eq!(coverage.covered, 1);
-        assert_eq!(coverage.demanded, 2);
-    }
-
-    /// A driver that has not adopted the declaration reports `0 / 0`, which the
-    /// driver-side gate reads as "nothing to check" rather than as a shortfall.
-    #[test]
-    fn declaring_nothing_is_whole_coverage() {
-        let coverage = ContractCoverage::measure(["a", "b"], []);
-        assert_eq!(coverage.covered, 0);
-        assert_eq!(coverage.demanded, 0);
     }
 }

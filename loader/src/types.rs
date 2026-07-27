@@ -79,20 +79,6 @@ pub enum BackendKind {
     Unknown,
 }
 
-impl BackendKind {
-    /// Whether this backend loads weights into a single contiguous persistent
-    /// device arena. Arena backends (CUDA, and the generic test/`Unknown`
-    /// target) coalesce per-buffer `ExtentWrite`s into arena-relative
-    /// `BulkExtentWrite` / `SlabScatter` batched copies, so the arena/bulk
-    /// passes apply.
-    pub fn uses_persistent_arena(self) -> bool {
-        matches!(
-            self,
-            BackendKind::Cuda | BackendKind::Metal | BackendKind::Unknown
-        )
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum QuantScheme {
     None,

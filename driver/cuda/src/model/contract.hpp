@@ -204,7 +204,16 @@ inline bool contains(std::string_view value, std::string_view needle) {
 /// sharded" and "sharded on axis 0" are answers a bug can swap.
 using ShardAxis = std::optional<std::uint8_t>;
 
-inline ShardAxis llama_like_shard_axis(std::string_view name) {
+/// The axis tensor parallelism splits a tensor on, read off its name.
+///
+/// Not any one family's rule, despite the family-flavoured tails in the list.
+/// It is the HF naming convention's answer: a name ending `.q_proj.weight`
+/// denotes a column-parallel projection whatever model ships it, and `.sinks`,
+/// `.w1/.w2/.w3` and `.linear_attn.*` are conventions several families adopted,
+/// not identities. A family whose checkpoint uses a *different* convention for
+/// the same operator says so with `shard_axis_fn` — DeepSeek-V4 is the one such
+/// family, and its rule lives in its own header.
+inline ShardAxis hf_shard_axis(std::string_view name) {
     if (contains(name, ".mlp.experts.")) {
         if (ends_with_any(name, {".gate_proj.weight_packed", ".gate_proj.weight_scale",
                                  ".up_proj.weight_packed", ".up_proj.weight_scale"})) {
@@ -243,17 +252,21 @@ inline ShardAxis llama_like_shard_axis(std::string_view name) {
     return std::nullopt;
 }
 
-inline bool is_glm_expert_weight(std::string_view name) {
+/// A routed or shared expert's projection, under the HF MoE naming convention.
+inline bool is_expert_projection(std::string_view name) {
     return (contains(name, ".mlp.experts.") || contains(name, ".mlp.shared_experts.")) &&
            ends_with_any(name, {".gate_proj.weight", ".up_proj.weight", ".down_proj.weight"});
 }
 
+/// Which weights a runtime-quant request re-encodes, given the target scheme.
+///
+/// A statement about this driver's GEMMs, not about any model: the allowlist is
+/// exactly the projections a quantized kernel exists for.
 inline bool runtime_quantizable_name(std::string_view name, PieLoaderQuantScheme scheme) {
     if (scheme == PieLoaderQuantScheme::Mxfp4E2M1E8M0) {
-        // For FP4 only GLM-5.1's routed and shared experts are touched.
-        // Attention projections stay FP8-plus-scale (block-scaled GEMM) because
-        // there is no FP4 GEMM path for them on this hardware.
-        return is_glm_expert_weight(name);
+        // FP4 reaches experts only. Attention projections stay FP8-plus-scale
+        // (block-scaled GEMM) because this hardware has no FP4 GEMM for them.
+        return is_expert_projection(name);
     }
     return ends_with_any(name, {".self_attn.q_proj.weight", ".self_attn.k_proj.weight",
                                 ".self_attn.v_proj.weight", ".self_attn.o_proj.weight",
@@ -261,7 +274,7 @@ inline bool runtime_quantizable_name(std::string_view name, PieLoaderQuantScheme
                                 ".self_attn.kv_a_proj_with_mqa.weight",
                                 ".self_attn.kv_b_proj.weight", ".mlp.gate_proj.weight",
                                 ".mlp.up_proj.weight", ".mlp.down_proj.weight"}) ||
-           is_glm_expert_weight(name);
+           is_expert_projection(name);
 }
 
 // -- small arithmetic with a message ------------------------------------------
@@ -325,8 +338,10 @@ inline std::vector<std::int64_t> shape_of(const SourceTensor& raw) {
 /// Which tensors an encode-scoped rank materializes.
 ///
 /// The multimodal towers and nothing else, so an encoder rank never allocates
-/// the language model. Under a driver-authored contract this is not a filter
-/// applied to a finished contract — it is simply which tensors get declared.
+/// the language model. The four prefixes are the HF multimodal convention, so
+/// this reads as a rule rather than as a list of the families using it today.
+/// Under a driver-authored contract it is not a filter applied to a finished
+/// contract — it is simply which tensors get declared.
 inline bool is_tower_output(std::string_view name) {
     return name.rfind("model.vision_tower.", 0) == 0 ||
            name.rfind("model.embed_vision.", 0) == 0 ||
@@ -354,19 +369,13 @@ public:
     ContractBuilder(const Checkpoint& checkpoint, const ModelFacts& facts,
                     const pie_loader::DeviceTarget& target, std::string_view runtime_quant,
                     Mxfp4MoePolicy mxfp4_moe, Component component, ModelContract& out)
-        : checkpoint_(checkpoint),
-          facts_(facts),
+        : facts_(facts),
           target_(target),
-          // A runtime quantization request the device cannot execute is dropped
-          // rather than refused: it is a preference, and the checkpoint's own
-          // format is always a valid answer. The driver is where this belongs —
-          // `fp8_native` is something it measured.
-          runtime_quant_(runtime_quant == "fp8" && !target.fp8_native ? std::string_view()
-                                                                     : runtime_quant),
+          runtime_quant_(runtime_quant),
           mxfp4_moe_(mxfp4_moe),
           component_(component),
           tensors_(checkpoint.tensors()),
-          contract_(&out) {
+          contract_(out) {
         out.align(std::max<std::uint32_t>(1, target_.preferred_alignment));
         by_name_.reserve(tensors_.size());
         for (const SourceTensor& raw : tensors_) {
@@ -376,11 +385,10 @@ public:
 
     // -- what the family is authoring against --------------------------------
 
-    const Checkpoint& checkpoint() const noexcept { return checkpoint_; }
     const ModelFacts& facts() const noexcept { return facts_; }
     const pie_loader::DeviceTarget& target() const noexcept { return target_; }
     Mxfp4MoePolicy mxfp4_moe() const noexcept { return mxfp4_moe_; }
-    ModelContract& contract() noexcept { return *contract_; }
+    ModelContract& contract() noexcept { return contract_; }
     const std::vector<SourceTensor>& tensors() const noexcept { return tensors_; }
 
     // -- knobs, each one a claim about this family ---------------------------
@@ -389,8 +397,8 @@ public:
     void source_prefix(std::string_view prefix) { source_prefix_ = prefix; }
 
     /// Tensor-parallel shard-axis strategy, keyed by tensor name. Defaults to
-    /// the llama-family rules; a family with a different expert or attention
-    /// layout (DeepSeek-V4's native `.ffn.experts.w*`) registers its own.
+    /// the HF convention; a family whose checkpoint names the same operator
+    /// differently (DeepSeek-V4's native `.ffn.experts.w*`) registers its own.
     void shard_axis_fn(ShardAxis (*fn)(std::string_view)) { shard_axis_fn_ = fn; }
 
     /// Shard `embed_tokens` on axis 0 under TP, to save per-rank memory.
@@ -450,14 +458,14 @@ public:
         if (component_ == Component::Encode && !is_tower_output(name)) {
             return;
         }
-        auto defined = contract_->define(std::move(name), expr, encoding);
+        auto defined = contract_.define(std::move(name), expr, encoding);
         if (shape.has_value()) {
             defined.expect(std::move(*shape));
         }
     }
 
     void push_direct(const SourceTensor& raw, std::string output, ShardAxis axis) {
-        auto [expr, shape] = shard(contract_->src(std::string(raw.name)), shape_of(raw), axis);
+        auto [expr, shape] = shard(contract_.src(std::string(raw.name)), shape_of(raw), axis);
         define(std::move(output), expr, raw.encoding, std::move(shape));
     }
 
@@ -478,7 +486,7 @@ public:
         if (index < shape.size() && shape[index] % world == 0) {
             shape[index] /= world;
         }
-        return {contract_->shard(expr, *axis), std::move(shape)};
+        return {contract_.shard(expr, *axis), std::move(shape)};
     }
 
     ShardAxis shard_axis(std::string_view name) const {
@@ -495,18 +503,6 @@ public:
         return shard_axis_fn_(name);
     }
 
-    bool source_name_allowed(std::string_view raw_name) const {
-        return source_prefix_.empty() ||
-               raw_name.rfind(source_prefix_, 0) == 0;
-    }
-
-    std::string output_name(std::string_view raw_name) const {
-        if (!source_prefix_.empty() && raw_name.rfind(source_prefix_, 0) == 0) {
-            return std::string(raw_name.substr(source_prefix_.size()));
-        }
-        return std::string(raw_name);
-    }
-
     void push_expr(std::string output, const SourceTensor& raw, std::vector<std::int64_t> shape,
                    Node expr) {
         define(std::move(output), expr, pie_loader::raw(logical_dtype(raw.encoding)),
@@ -517,96 +513,8 @@ public:
     void push_repack(std::string output, const SourceTensor& raw, PieLoaderEncodingSpec encoding,
                      std::vector<std::int64_t> shape, PieLoaderRepackSpecView spec) {
         const Node node =
-            contract_->repack(contract_->src(std::string(raw.name)), spec, shape, encoding);
+            contract_.repack(contract_.src(std::string(raw.name)), spec, shape, encoding);
         define(std::move(output), node, encoding, std::move(shape));
-    }
-
-    // -- runtime quantization ------------------------------------------------
-
-    std::optional<PieLoaderQuantScheme> runtime_quant_scheme() const {
-        if (runtime_quant_.empty()) {
-            return std::nullopt;
-        }
-        PieLoaderQuantScheme scheme{};
-        if (runtime_quant_ == "fp8") {
-            scheme = PieLoaderQuantScheme::Fp8E4M3;
-        } else if (runtime_quant_ == "int8") {
-            scheme = PieLoaderQuantScheme::Int8Symmetric;
-        } else if (runtime_quant_ == "fp4" || runtime_quant_ == "mxfp4") {
-            scheme = PieLoaderQuantScheme::Mxfp4E2M1E8M0;
-        } else {
-            fail("unsupported runtime_quant '" + std::string(runtime_quant_) +
-                 "'; expected 'fp8', 'int8', or 'fp4'");
-        }
-        // For FP4 a pre-quantized checkpoint is accepted (GLM-5.1 ships FP8
-        // experts). For FP8/INT8 only BF16 weights are re-quantized, never an
-        // already-quantized checkpoint.
-        if (!facts_.quant_method.empty() && scheme != PieLoaderQuantScheme::Mxfp4E2M1E8M0) {
-            return std::nullopt;
-        }
-        if (!runtime_quant_allowed(scheme)) {
-            fail("runtime_quant=" + std::string(runtime_quant_) +
-                 " is not supported for model_type='" + facts_.model_type + "'");
-        }
-        return scheme;
-    }
-
-    void push_runtime_quant(const SourceTensor& raw, std::string output,
-                            PieLoaderQuantScheme scheme) {
-        if (raw.shape.size() != 2) {
-            fail("runtime_quant source '" + std::string(raw.name) + "' must be 2-D");
-        }
-        // Allowed sources are BF16/FP16/FP32 raw, handled by the executor's
-        // bf16 cast path, and FP8 (E4M3) raw, used by GLM-5.1 routed experts:
-        // those weights ship quantized, the executor dequants them to bf16 with
-        // a sibling `_scale_inv` at materialize time, then re-encodes to the
-        // target scheme. Only meaningful when the target is a smaller scheme.
-        if (!(is_raw(raw.encoding, PieLoaderDType::BF16) ||
-              is_raw(raw.encoding, PieLoaderDType::F16) ||
-              is_raw(raw.encoding, PieLoaderDType::F32) ||
-              is_raw(raw.encoding, PieLoaderDType::F8E4M3))) {
-            fail("runtime_quant source '" + std::string(raw.name) +
-                 "' must be BF16/FP16/FP32/F8E4M3");
-        }
-
-        PieLoaderQuantSpecView quant{};
-        switch (scheme) {
-            case PieLoaderQuantScheme::Fp8E4M3:
-                quant = pie_loader::quant_spec(scheme, PieLoaderDType::F8E4M3);
-                quant.bits_per_element = 8;
-                quant.group_size = 1;
-                quant.channel_axis = 0;
-                quant.scale_dtype = static_cast<std::uint32_t>(PieLoaderDType::F32);
-                break;
-            case PieLoaderQuantScheme::Int8Symmetric:
-                quant = pie_loader::quant_spec(scheme, PieLoaderDType::I8);
-                quant.bits_per_element = 8;
-                quant.group_size = 1;
-                quant.channel_axis = 0;
-                quant.scale_dtype = static_cast<std::uint32_t>(PieLoaderDType::F32);
-                break;
-            case PieLoaderQuantScheme::Mxfp4E2M1E8M0:
-                // The K dimension (columns, for a 2-D weight) must be a
-                // 32-multiple because an MXFP4 block scale covers 32
-                // contiguous elements.
-                if (raw.shape[1] % 32 != 0) {
-                    fail("runtime_quant Mxfp4 source '" + std::string(raw.name) + "' cols " +
-                         std::to_string(raw.shape[1]) + " must be a multiple of 32");
-                }
-                quant = pie_loader::quant_spec(scheme, PieLoaderDType::BF16);
-                quant.bits_per_element = 4;
-                quant.group_size = 32;
-                quant.channel_axis = 1;
-                quant.scale_dtype = static_cast<std::uint32_t>(PieLoaderDType::U8);
-                quant = contract_->with_block_shape(quant, {32});
-                break;
-            default:
-                fail("unsupported runtime_quant scheme");
-        }
-
-        auto [expr, shape] =
-            shard(contract_->src(std::string(raw.name)), shape_of(raw), shard_axis(raw.name));
-        define(std::move(output), expr, pie_loader::quantized(quant), std::move(shape));
     }
 
     // -- shared passes -------------------------------------------------------
@@ -635,19 +543,20 @@ public:
                 local_range(full_i, "the intermediate size of '" + std::string(raw.name) + "'");
             // Gate rows [0, I) and up rows [I, 2I) are sharded independently
             // and re-joined, so the local halves stay adjacent per expert.
-            const Node src = contract_->src(std::string(raw.name));
+            const Node src = contract_.src(std::string(raw.name));
             push_expr(std::string(raw.name), raw, {experts, 2 * local_i, hidden},
-                      contract_->cat(std::vector<Node>{
-                                         contract_->slice(src, 1, local_start, local_i),
-                                         contract_->slice(src, 1, full_i + local_start, local_i)},
+                      contract_.cat(std::vector<Node>{
+                                         contract_.slice(src, 1, local_start, local_i),
+                                         contract_.slice(src, 1, full_i + local_start, local_i)},
                                      1));
         }
     }
 
     struct FusedCandidate {
         std::string output_name;
-        std::vector<std::uint32_t> ids;
-        std::vector<std::string> names;
+        /// The source tensors, in join order. Borrowed from `tensors_`, which
+        /// outlives every candidate.
+        std::vector<const SourceTensor*> parts;
         std::int64_t rows = 0;
         std::int64_t cols = 0;
         std::uint64_t bytes = 0;
@@ -671,8 +580,7 @@ public:
                 return std::nullopt;
             }
             cols = raw->shape[1];
-            candidate.ids.push_back(raw->id);
-            candidate.names.emplace_back(raw->name);
+            candidate.parts.push_back(raw);
             candidate.rows += raw->shape[0];
             candidate.bytes += raw->span_bytes;
         }
@@ -682,15 +590,13 @@ public:
 
     void publish_fused(const std::vector<FusedCandidate>& candidates) {
         for (const FusedCandidate& candidate : candidates) {
-            for (std::uint32_t id : candidate.ids) {
-                consumed_.insert(id);
-            }
             std::vector<Node> parts;
-            parts.reserve(candidate.names.size());
-            for (const std::string& name : candidate.names) {
-                parts.push_back(contract_->src(name));
+            parts.reserve(candidate.parts.size());
+            for (const SourceTensor* raw : candidate.parts) {
+                consumed_.insert(raw->id);
+                parts.push_back(contract_.src(std::string(raw->name)));
             }
-            define(candidate.output_name, contract_->cat(parts, 0),
+            define(candidate.output_name, contract_.cat(parts, 0),
                    pie_loader::raw(PieLoaderDType::BF16),
                    std::vector<std::int64_t>{candidate.rows, candidate.cols});
         }
@@ -783,18 +689,133 @@ public:
             fail("encode-scoped loading is not supported for model_type='" + facts_.model_type +
                  "'");
         }
-        if (contract_->empty()) {
+        if (contract_.empty()) {
             fail("no contract was authored for model_type='" + facts_.model_type +
                  "'; the driver must declare what it binds");
         }
     }
 
 private:
+
+    // -- the source-prefix rule ----------------------------------------------
+    //
+    // A family that sets `source_prefix` is saying its checkpoint nests the
+    // decoder under a prefix the bind path does not use. Both halves of that
+    // rule are read only by `publish_remaining`; a family that wants a
+    // prefix-stripped name for one tensor states the name it wants.
+
+    bool source_name_allowed(std::string_view raw_name) const {
+        return source_prefix_.empty() ||
+               raw_name.rfind(source_prefix_, 0) == 0;
+    }
+
+    std::string output_name(std::string_view raw_name) const {
+        if (!source_prefix_.empty() && raw_name.rfind(source_prefix_, 0) == 0) {
+            return std::string(raw_name.substr(source_prefix_.size()));
+        }
+        return std::string(raw_name);
+    }
+
+    // -- runtime quantization ------------------------------------------------
+
+    /// The scheme this author's runtime-quant request resolves to, or none.
+    ///
+    /// Resolved on each call rather than once in the constructor, and it has to
+    /// stay that way: `runtime_quant_allowed` reads `allow_bf16_rq_` and
+    /// `allow_mxfp4_rq_`, which the *family* sets after construction. Caching
+    /// this at build time would answer with the knobs unset and silently refuse
+    /// a scheme the family goes on to allow.
+
+    std::optional<PieLoaderQuantScheme> runtime_quant_scheme() const {
+        if (runtime_quant_.empty()) {
+            return std::nullopt;
+        }
+        PieLoaderQuantScheme scheme{};
+        if (runtime_quant_ == "fp8") {
+            scheme = PieLoaderQuantScheme::Fp8E4M3;
+        } else if (runtime_quant_ == "int8") {
+            scheme = PieLoaderQuantScheme::Int8Symmetric;
+        } else if (runtime_quant_ == "fp4" || runtime_quant_ == "mxfp4") {
+            scheme = PieLoaderQuantScheme::Mxfp4E2M1E8M0;
+        } else {
+            fail("unsupported runtime_quant '" + std::string(runtime_quant_) +
+                 "'; expected 'fp8', 'int8', or 'fp4'");
+        }
+        // For FP4 a pre-quantized checkpoint is accepted (GLM-5.1 ships FP8
+        // experts). For FP8/INT8 only BF16 weights are re-quantized, never an
+        // already-quantized checkpoint.
+        if (!facts_.quant_method.empty() && scheme != PieLoaderQuantScheme::Mxfp4E2M1E8M0) {
+            return std::nullopt;
+        }
+        if (!runtime_quant_allowed(scheme)) {
+            fail("runtime_quant=" + std::string(runtime_quant_) +
+                 " is not supported for model_type='" + facts_.model_type + "'");
+        }
+        return scheme;
+    }
+
+    void push_runtime_quant(const SourceTensor& raw, std::string output,
+                            PieLoaderQuantScheme scheme) {
+        if (raw.shape.size() != 2) {
+            fail("runtime_quant source '" + std::string(raw.name) + "' must be 2-D");
+        }
+        // Allowed sources are BF16/FP16/FP32 raw, handled by the executor's
+        // bf16 cast path, and FP8 (E4M3) raw, used by GLM-5.1 routed experts:
+        // those weights ship quantized, the executor dequants them to bf16 with
+        // a sibling `_scale_inv` at materialize time, then re-encodes to the
+        // target scheme. Only meaningful when the target is a smaller scheme.
+        if (!(is_raw(raw.encoding, PieLoaderDType::BF16) ||
+              is_raw(raw.encoding, PieLoaderDType::F16) ||
+              is_raw(raw.encoding, PieLoaderDType::F32) ||
+              is_raw(raw.encoding, PieLoaderDType::F8E4M3))) {
+            fail("runtime_quant source '" + std::string(raw.name) +
+                 "' must be BF16/FP16/FP32/F8E4M3");
+        }
+
+        PieLoaderQuantSpecView quant{};
+        switch (scheme) {
+            case PieLoaderQuantScheme::Fp8E4M3:
+                quant = pie_loader::quant_spec(scheme, PieLoaderDType::F8E4M3);
+                quant.bits_per_element = 8;
+                quant.group_size = 1;
+                quant.channel_axis = 0;
+                quant.scale_dtype = static_cast<std::uint32_t>(PieLoaderDType::F32);
+                break;
+            case PieLoaderQuantScheme::Int8Symmetric:
+                quant = pie_loader::quant_spec(scheme, PieLoaderDType::I8);
+                quant.bits_per_element = 8;
+                quant.group_size = 1;
+                quant.channel_axis = 0;
+                quant.scale_dtype = static_cast<std::uint32_t>(PieLoaderDType::F32);
+                break;
+            case PieLoaderQuantScheme::Mxfp4E2M1E8M0:
+                // The K dimension (columns, for a 2-D weight) must be a
+                // 32-multiple because an MXFP4 block scale covers 32
+                // contiguous elements.
+                if (raw.shape[1] % 32 != 0) {
+                    fail("runtime_quant Mxfp4 source '" + std::string(raw.name) + "' cols " +
+                         std::to_string(raw.shape[1]) + " must be a multiple of 32");
+                }
+                quant = pie_loader::quant_spec(scheme, PieLoaderDType::BF16);
+                quant.bits_per_element = 4;
+                quant.group_size = 32;
+                quant.channel_axis = 1;
+                quant.scale_dtype = static_cast<std::uint32_t>(PieLoaderDType::U8);
+                quant = contract_.with_block_shape(quant, {32});
+                break;
+            default:
+                fail("unsupported runtime_quant scheme");
+        }
+
+        auto [expr, shape] =
+            shard(contract_.src(std::string(raw.name)), shape_of(raw), shard_axis(raw.name));
+        define(std::move(output), expr, pie_loader::quantized(quant), std::move(shape));
+    }
+
     bool runtime_quant_allowed(PieLoaderQuantScheme scheme) const {
         return scheme == PieLoaderQuantScheme::Mxfp4E2M1E8M0 ? allow_mxfp4_rq_ : allow_bf16_rq_;
     }
 
-    const Checkpoint& checkpoint_;
     const ModelFacts& facts_;
     const pie_loader::DeviceTarget& target_;
     std::string_view runtime_quant_;
@@ -803,10 +824,10 @@ private:
     std::vector<SourceTensor> tensors_;
     std::unordered_map<std::string_view, const SourceTensor*> by_name_;
     std::unordered_set<std::uint32_t> consumed_;
-    ModelContract* contract_ = nullptr;
+    ModelContract& contract_;
 
     std::string_view source_prefix_;
-    ShardAxis (*shard_axis_fn_)(std::string_view) = llama_like_shard_axis;
+    ShardAxis (*shard_axis_fn_)(std::string_view) = hf_shard_axis;
     bool shard_embed_tokens_ = false;
     bool replicate_lm_head_ = false;
     bool allow_bf16_rq_ = false;
@@ -819,6 +840,20 @@ private:
 using contract_detail::ContractBuilder;
 using contract_detail::ShardAxis;
 
+
+/// Resolve the caller's runtime-quantization request against what the device can
+/// execute.
+///
+/// A request the device cannot run is dropped rather than refused: it is a
+/// preference, and the checkpoint's own format is always a valid answer.
+///
+/// Resolved here, beside `resolve_mxfp4_moe`, because `fp8_native` is a fact
+/// *this driver measured* off `cudaDeviceProp` and nothing on the far side of
+/// the FFI ever read it. Sending it across so the answer could come back would
+/// be asking the loader a question only the asker can answer (§8.1).
+inline std::string_view resolve_runtime_quant(std::string_view request, bool fp8_native) {
+    return request == "fp8" && !fp8_native ? std::string_view() : request;
+}
 
 /// Resolve the caller's MoE request against what the device can do.
 ///

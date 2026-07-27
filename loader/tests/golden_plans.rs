@@ -26,7 +26,9 @@ use std::path::PathBuf;
 
 use pie_loader::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
 use pie_loader::contract::ModelContract;
-use pie_loader::ffi::contract::{read_contract, write_contract};
+use pie_loader::contract_writer::write_contract;
+use pie_loader::ffi::contract::read_contract;
+use pie_loader::ffi::view::verify_marshalled;
 use pie_loader::load_plan::{
     CUDA_TILE_MAP_MASK, FUSION_FP8_TO_MXFP4, HOST_TILE_MAP_MASK, LoadPlan, StorageTarget,
     compiler_version,
@@ -35,7 +37,7 @@ use pie_loader::planner::compile_load_plan;
 use pie_loader::types::{
     BackendKind, CheckpointFormat, DType, Encoding, FileId, QuantScheme, QuantSpec, TensorId,
 };
-use pie_loader::verify::{ContractCoverage, ContractView, PlanView, verify};
+use pie_loader::verify::ContractView;
 
 // ── the checkpoints ─────────────────────────────────────────────────
 
@@ -372,18 +374,14 @@ fn golden_path(name: &str) -> PathBuf {
 /// Checking that the histogram accounts for every instruction is what catches an
 /// instruction variant added without a name for it.
 fn check_stats_render(name: &str, plan: &LoadPlan) {
-    let coverage = ContractCoverage {
-        covered: 3,
-        demanded: 4,
-    };
-    let summary = pie_loader::dump::describe(plan, coverage);
+    let summary = pie_loader::dump::describe(plan);
     assert!(
-        summary.contains("contracts=3/4")
+        summary.contains(&format!("tensors={}", plan.tensors.len()))
             && summary.contains(&format!("instrs={}", plan.instrs.len())),
         "{name}: the boot-log line lost a field: {summary}"
     );
 
-    let rendered = pie_loader::dump::plan_stats_json(plan, coverage);
+    let rendered = pie_loader::dump::plan_stats_json(plan);
     let stats: serde_json::Value = serde_json::from_str(&rendered)
         .unwrap_or_else(|err| panic!("{name}: stats are not JSON: {err}"));
     let counted: u64 = stats["instruction_kinds"]
@@ -412,7 +410,7 @@ fn check(name: &str, metadata: &CheckpointMetadata, target: StorageTarget) {
     let plan = compile_load_plan(metadata, &contract, target)
         .unwrap_or_else(|err| panic!("{name}: compiling failed: {err}"));
 
-    if let Err(violations) = verify(&PlanView::from(&plan), Some(&ContractView::of(&contract))) {
+    if let Err(violations) = verify_marshalled(&plan, Some(&ContractView::of(&contract))) {
         let listed: Vec<String> = violations.iter().map(ToString::to_string).collect();
         panic!(
             "{name}: the plan does not honour its contract:\n  {}",

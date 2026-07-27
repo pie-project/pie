@@ -193,60 +193,6 @@ pub struct ModelContract {
     pub tensors: Vec<TensorContract>,
 }
 
-impl ModelContract {
-    /// Keep only the entries `retain` selects, plus everything they read.
-    ///
-    /// A contract is a DAG, so selecting an output selects its dependencies
-    /// too; the closure is taken until it stops growing. This is how a caller
-    /// asks for part of a model without authoring a second contract for it.
-    pub fn retain_outputs(
-        mut self,
-        mut retain: impl FnMut(&str) -> bool,
-    ) -> Result<Self, CompileError> {
-        let mut selected = self
-            .tensors
-            .iter()
-            .map(|contract| retain(&contract.name))
-            .collect::<Vec<_>>();
-        let by_name: std::collections::HashMap<&str, usize> = self
-            .tensors
-            .iter()
-            .enumerate()
-            .map(|(index, contract)| (contract.name.as_str(), index))
-            .collect();
-        loop {
-            let mut changed = false;
-            for index in 0..self.tensors.len() {
-                if !selected[index] {
-                    continue;
-                }
-                for name in self.tensors[index].expr.outputs() {
-                    let dep = *by_name.get(name).ok_or_else(|| {
-                        CompileError::InvalidInput(format!(
-                            "contract {index} reads missing contract '{name}'"
-                        ))
-                    })?;
-                    if !selected[dep] {
-                        selected[dep] = true;
-                        changed = true;
-                    }
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
-        if !selected.iter().any(|selected| *selected) {
-            return Err(CompileError::InvalidInput(
-                "the component filter selected no tensors".to_string(),
-            ));
-        }
-        let mut keep = selected.into_iter();
-        self.tensors.retain(|_| keep.next().unwrap_or(false));
-        Ok(self)
-    }
-}
-
 /// Resolves [`Expr::Src`] names against a checkpoint.
 pub trait CheckpointTypes {
     fn tensor_type(&self, name: &str) -> Option<TensorType>;
@@ -988,29 +934,6 @@ mod tests {
     fn specialize_one(expr: Expr, rank: u32, world: u32) -> Result<Expr, CompileError> {
         let checkpoint = qwen3();
         Resolver::new(&checkpoint).specialize(expr, rank, world, "q")
-    }
-
-    #[test]
-    fn a_component_filter_keeps_what_the_selection_reads() {
-        let one = |name: &str, expr: Expr| {
-            TensorContract::new(name, expr, vec![1], Encoding::Raw(DType::U8))
-        };
-        let contract = ModelContract {
-            abi_version: 1,
-            alignment: 1,
-            tensors: vec![
-                one("text.weight", Expr::src("text")),
-                one("vision.base", Expr::src("vision")),
-                one("vision.view", Expr::out("vision.base").slice(0, 0, 1)),
-            ],
-        };
-
-        let filtered = contract
-            .retain_outputs(|name| name == "vision.view")
-            .unwrap();
-        assert_eq!(filtered.tensors.len(), 2);
-        assert_eq!(filtered.tensors[0].name, "vision.base");
-        assert_eq!(filtered.tensors[1].name, "vision.view");
     }
 
     #[test]

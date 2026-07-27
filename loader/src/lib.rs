@@ -8,6 +8,7 @@ pub mod artifact;
 pub mod backend;
 pub mod checkpoint;
 pub mod contract;
+pub mod contract_writer;
 pub mod dump;
 pub mod error;
 pub mod ffi;

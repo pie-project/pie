@@ -143,7 +143,6 @@ LoadedModel LoadedModel::load(
         auto target = cuda_device_target();
         target.tp_rank = static_cast<std::uint32_t>(boot_cfg.distributed.tp_rank);
         target.tp_size = static_cast<std::uint32_t>(boot_cfg.distributed.tp_size);
-        target.fp8_native = fp8_native;
         target.native_mxfp4_moe = mxfp4_native_gemm;
         return target;
     }();
@@ -178,7 +177,8 @@ LoadedModel LoadedModel::load(
     pie_loader::ModelContract contract;
     {
         model::ContractBuilder builder(
-            checkpoint, facts, device_target, runtime_quant,
+            checkpoint, facts, device_target,
+            model::resolve_runtime_quant(runtime_quant, fp8_native),
             model::resolve_mxfp4_moe(mxfp4_moe, device_target.native_mxfp4_moe), component,
             contract);
         arch->author_contract(builder);
@@ -243,23 +243,6 @@ LoadedModel LoadedModel::load(
         std::cerr << "[pie-driver-cuda] rust loader compiler: "
                   << pie_loader::bytes_to_string(load_view.summary) << "\n";
     }
-    // Real as of §12 row 7b-4b: both counts used to be `view.tensors.len`, so
-    // this compared the plan with itself. `runtime_tensor_count` is now what the
-    // *driver* declared through `pie_loader::TensorContract` and
-    // `covered_contract_count` is how much of that the loader built. A family
-    // that has not adopted the declaration declares nothing, and zero == zero
-    // still passes — the check is opt-in per family, not a flag day.
-    if (planned_load.covered_contract_count != planned_load.runtime_tensor_count) {
-        throw std::runtime_error(
-            "engine: Rust loader did not cover the contract this model declared; "
-            "covered " +
-            std::to_string(planned_load.covered_contract_count) + "/" +
-            std::to_string(planned_load.runtime_tensor_count) +
-            " demanded tensors (the plan produced " +
-            std::to_string(planned_load.planned_tensor_count) +
-            "). Add loader coverage before enabling this model.");
-    }
-
     // Materialized-weight artifact cache (WEIGHT_LOADER_TODO.md A3.1). The
     // materialized weights are a deterministic function of the load-plan cache key,
     // so on a hit we reload them straight into device memory and skip the

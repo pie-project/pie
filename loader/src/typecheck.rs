@@ -4,7 +4,13 @@ use crate::types::{
     DType, Encoding, QuantScheme, RepackLayout, RepackSpec, RowMap, TensorDecl, encoding_nbytes,
 };
 
-pub fn typecheck(plan: &LayoutPlan) -> Result<Vec<TensorDecl>, CompileError> {
+/// Infer and check a declaration for every expression in the plan.
+///
+/// The inferred declarations are consumed as they are produced — each one is
+/// what the next expression's check reads — and nothing outside needs them: the
+/// planner re-derives what it needs from the plan it lowers. Returning them
+/// invited a caller to treat this as a second source of truth for shapes.
+pub fn typecheck(plan: &LayoutPlan) -> Result<(), CompileError> {
     let mut inferred = Vec::with_capacity(plan.exprs.len());
     for (index, expr) in plan.exprs.iter().enumerate() {
         let decl = infer_expr(plan, &inferred, index, expr)?;
@@ -18,7 +24,7 @@ pub fn typecheck(plan: &LayoutPlan) -> Result<Vec<TensorDecl>, CompileError> {
             )));
         }
     }
-    Ok(inferred)
+    Ok(())
 }
 
 fn infer_expr(

@@ -77,9 +77,6 @@ pub struct PieLoaderCheckpoint {
     pub files: PieLoaderCheckpointFileSlice,
     /// Every tensor in every file, in the order the reader found them.
     pub tensors: PieLoaderRawTensorSlice,
-    /// The directory this was opened from, echoed back so a driver need not
-    /// carry it alongside the handle.
-    pub snapshot_dir: PieLoaderBytes,
     owner: *mut std::ffi::c_void,
 }
 
@@ -134,9 +131,6 @@ pub(super) fn build(
         tensors: Vec::new(),
     };
 
-    let dir = arena.snapshot_dir.display().to_string();
-    let snapshot_dir = arena.store_str(&dir);
-
     let files = arena.metadata.files.clone();
     for file in &files {
         let path = arena.store_str(&file.path);
@@ -173,7 +167,6 @@ pub(super) fn build(
             ptr: arena.tensors.as_ptr(),
             len: arena.tensors.len(),
         },
-        snapshot_dir,
         owner: std::ptr::null_mut(),
     };
     let owner = Box::into_raw(Box::new(arena)).cast::<std::ffi::c_void>();

@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use half::{bf16, f16};
 
 use crate::error::CompileError;
-use crate::ffi::inproc::deserialize_load_plan;
 use crate::load_plan::{
     DestExtent, HOST_TILE_MAP_MASK, LoadPlan, SourceExtent, StorageInstr, StridedExtent,
     TileMapKind,
@@ -43,14 +42,6 @@ enum BufferLoc {
 enum Root {
     Arena,
     Owned(BufferId),
-}
-
-pub fn execute_serialized_plan(
-    bytes: &[u8],
-    snapshot_dir: &Path,
-) -> Result<HostStorage, CompileError> {
-    let plan = deserialize_load_plan(bytes)?;
-    execute_plan(&plan, snapshot_dir)
 }
 
 /// Execute a plan against the checkpoint it names.
@@ -760,7 +751,6 @@ fn invalid(message: impl Into<String>) -> CompileError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ffi::inproc::serialize_load_plan;
     use crate::load_plan::{
         BufferDecl, DestExtent, DimSpec, MemoryPlan, SourceTensorDecl, StorageTarget, TileSpec,
         TransformSpec,
@@ -909,8 +899,7 @@ mod tests {
     #[test]
     fn executes_place_strided_cast_and_tiled_writes() {
         let (dir, program) = fixture();
-        let bytes = serialize_load_plan(&program).unwrap();
-        let storage = execute_serialized_plan(&bytes, &dir).unwrap();
+        let storage = execute_plan(&program, &dir).unwrap();
         let values = storage.tensors["cast"]
             .bytes
             .chunks_exact(2)
@@ -929,10 +918,7 @@ mod tests {
             panic!("fixture instruction changed");
         };
         dest.stride = extent(0, 1, &[(2, 2, 3), (2, 1, 1)]);
-        let bytes = serialize_load_plan(&program).unwrap();
-        let error = execute_serialized_plan(&bytes, &dir)
-            .unwrap_err()
-            .to_string();
+        let error = execute_plan(&program, &dir).unwrap_err().to_string();
         assert!(error.contains("non-compact ExtentWrite destination"));
         std::fs::remove_dir_all(dir).ok();
     }
@@ -953,8 +939,7 @@ mod tests {
         source.stride = extent(0, 4, &[(1, 1, 1)]);
         assert_eq!(dest.stride.element_bytes, 1);
         assert_eq!(dest.stride.dims.iter().map(|d| d.count).sum::<i64>(), 4);
-        let bytes = serialize_load_plan(&program).unwrap();
-        execute_serialized_plan(&bytes, &dir).expect("equal byte counts should be accepted");
+        execute_plan(&program, &dir).expect("equal byte counts should be accepted");
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -965,10 +950,7 @@ mod tests {
             panic!("fixture instruction changed");
         };
         source.stride = extent(0, 1, &[(3, 1, 1)]);
-        let bytes = serialize_load_plan(&program).unwrap();
-        let error = execute_serialized_plan(&bytes, &dir)
-            .unwrap_err()
-            .to_string();
+        let error = execute_plan(&program, &dir).unwrap_err().to_string();
         assert!(
             error.contains("bytes but the destination spans"),
             "unexpected error: {error}"
@@ -991,8 +973,7 @@ mod tests {
             stride: extent(1, 1, &[(2, 3, 2), (2, 1, 1)]),
         });
         inputs.clear();
-        let bytes = serialize_load_plan(&plan).unwrap();
-        let storage = execute_serialized_plan(&bytes, &dir).unwrap();
+        let storage = execute_plan(&plan, &dir).unwrap();
         let values = storage.tensors["cast"]
             .bytes
             .chunks_exact(2)
@@ -1012,19 +993,6 @@ mod tests {
         let bf16_bytes = encode_values(&[f64::from(input)], DType::BF16).unwrap();
         let actual = u16::from_le_bytes(bf16_bytes.try_into().unwrap());
         assert_eq!(actual, bf16::from_f32(input).to_bits());
-    }
-
-    #[test]
-    fn rejects_plan_and_compiler_version_mismatches() {
-        let (dir, mut program) = fixture();
-        program.version += 1;
-        let bytes = serde_json::to_vec(&program).unwrap();
-        assert!(execute_serialized_plan(&bytes, &dir).is_err());
-        program.version = crate::load_plan::LOAD_PLAN_VERSION;
-        program.compiler_version ^= 1;
-        let bytes = serde_json::to_vec(&program).unwrap();
-        assert!(execute_serialized_plan(&bytes, &dir).is_err());
-        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
