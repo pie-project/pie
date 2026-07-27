@@ -240,9 +240,21 @@ BoundDecode stage_decode_storage(
             }
             break;
         }
-        case K::Release:
-            buffers.erase(instr.buffer_id);
+        case K::Fill: {
+            // The loader emits this when an expression pads: the padded region
+            // is memory no source covers, and the compiler prices it as one
+            // fill rather than one copy per band. It must precede every write
+            // to the same buffer, which `validate-fill-order` guarantees on
+            // the Rust side; the writes below are synchronous host stores into
+            // Shared storage, so program order is enough to preserve it here.
+            const auto target = buffers.find(instr.buffer_id);
+            if (target == buffers.end()) {
+                throw std::runtime_error(
+                    "metal storage executor: Fill buffer is missing");
+            }
+            std::memset(target->second.contents(), 0, target->second.size);
             break;
+        }
         case K::TileMap:
             throw std::runtime_error(
                 "metal storage executor: compiler emitted an unsupported load-time transform");
