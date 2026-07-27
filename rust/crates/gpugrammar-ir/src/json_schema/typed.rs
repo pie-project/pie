@@ -156,6 +156,32 @@ impl<'a> Converter<'a> {
             }
             bail!("unsupported $ref: {}", reference);
         }
+        // `not` is a complement, and a grammar cannot complement a language.
+        // The front end has always lowered the rest of the schema and let the
+        // `not` go, which is a widening and so the direction a mask may err in -
+        // but it did so silently, and silence is what makes a limitation into a
+        // surprise. Two shapes are worth treating properly.
+        if let Some(negated) = object.get("not") {
+            // `not {}` and `not true` accept nothing, since `{}` accepts
+            // everything. That is exact rather than a widening, and it is how
+            // schemas spell "no additional properties" when they want to be
+            // pedantic about it.
+            if negated == &Value::Object(Default::default()) || negated == &Value::Bool(true) {
+                // Accepts nothing. Some positions can say that exactly - as
+                // `additionalProperties` it is `false`, as a branch of a choice
+                // it is a branch that goes - and those are handled where the
+                // position is known. Reaching here means the position cannot,
+                // and a grammar has no empty language to put in its place, so
+                // this widens to any value rather than losing the schema. That
+                // is the direction a mask may err in, and refusing outright
+                // costs seven schemas that otherwise compile.
+                return self.visit_any(hint);
+            }
+            // Anything else: lower what is left and record that the complement
+            // was dropped. `soundness.py` attributes its failures to this.
+            let rest = strip_keys(schema, &["not"]);
+            return self.visit_bare(&rest, hint);
+        }
         if let Some(value) = object.get("const") {
             return Ok(json_literal(value));
         }
@@ -172,6 +198,18 @@ impl<'a> Converter<'a> {
             let options = options
                 .as_array()
                 .ok_or_else(|| anyhow!("anyOf/oneOf must be an array"))?;
+            // A branch that accepts nothing contributes nothing to a union, so
+            // dropping it is exact - and it is one fewer production for the
+            // parser to tell apart.
+            let kept: Vec<Value> = options
+                .iter()
+                .filter(|branch| !is_unsatisfiable(branch))
+                .cloned()
+                .collect();
+            let options = &kept;
+            if options.is_empty() {
+                bail!("every branch of the choice accepts nothing");
+            }
             // `{"properties": {...}, "anyOf": [{"required": ["a"]},
             // {"required": ["b"]}]}` means "this object, and it has a or b".
             // Lowering the branches alone turns each into "any JSON value" and
@@ -537,6 +575,11 @@ impl<'a> Converter<'a> {
 
         let additional = match object.get("additionalProperties") {
             Some(Value::Bool(false)) => None,
+            // `{"not": {}}` accepts nothing, since `{}` accepts everything, so
+            // as `additionalProperties` it says exactly what `false` says. This
+            // is how a schema spells it when it wants to be pedantic, and it is
+            // the shape most of the corpus's uses of `not` take.
+            Some(schema) if is_unsatisfiable(schema) => None,
             Some(Value::Bool(true)) => Some(self.visit_any(hint)?),
             Some(schema) if schema.is_object() => {
                 Some(self.visit(schema, &format!("{}_additional", hint))?)
@@ -1468,6 +1511,11 @@ fn meet(document: &Value, left: &Value, right: &Value, depth: usize) -> Result<V
             // Prose. Whichever is kept, the language is the same.
             key if ANNOTATIONS.contains(&key) => continue,
 
+            // The lowering drops a complement it cannot express, so refusing
+            // the whole schema here for a keyword the next stage discards would
+            // be a refusal that buys nothing.
+            "not" => continue,
+
             // A bound meets its partner at whichever is tighter.
             "minLength" | "minItems" | "minProperties" | "minimum" | "exclusiveMinimum" => {
                 tighter(existing, value, true)?
@@ -1594,6 +1642,25 @@ fn intersect(left: &[String], right: &[String]) -> Vec<String> {
         .filter(|name| right.contains(name))
         .cloned()
         .collect()
+}
+
+/// Does this schema accept nothing at all?
+///
+/// `false`, and `{"not": {}}` or `{"not": true}` - the complement of the schema
+/// that accepts everything.
+fn is_unsatisfiable(schema: &Value) -> bool {
+    if schema == &Value::Bool(false) {
+        return true;
+    }
+    let Some(object) = schema.as_object() else {
+        return false;
+    };
+    object.len() == 1
+        && object
+            .get("not")
+            .is_some_and(|negated| {
+                negated == &Value::Object(Default::default()) || negated == &Value::Bool(true)
+            })
 }
 
 /// A schema with its `$ref` replaced by what it points at, if it has one.

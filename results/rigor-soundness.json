@@ -3,26 +3,24 @@
   "answers": [
     {
       "question_id": "q01-sound",
-      "headline": "documents generated under the mask that validate: gpugrammar 1603/1653 valid (97.0%)",
+      "headline": "documents generated under the mask that validate: gpugrammar 498/528 valid (94.3%)",
       "detail": {
         "schemas": {
-          "gpugrammar": 200
+          "gpugrammar": 120
         },
-        "walks_per_schema": 20,
+        "walks_per_schema": 12,
         "per_engine": {
           "gpugrammar": {
-            "walks": 4000,
-            "valid": 1603,
-            "invalid": 50,
-            "unfinished": 2347
+            "walks": 1440,
+            "valid": 498,
+            "invalid": 30,
+            "unfinished": 912
           }
         },
         "causes": {
           "gpugrammar": {
-            "schema uses unlowered dependencies": 17,
-            "unexplained": 17,
-            "schema uses unlowered not": 11,
-            "unlowered keyword: not": 5
+            "unexplained": 19,
+            "schema uses unlowered dependencies": 11
           }
         },
         "note": "Every document was produced by choosing only bytes the mask admitted, so an invalid one is a byte the mask should have refused. Both engines walk the same schemas over the same 256-byte vocabulary."
@@ -31,20 +29,20 @@
     },
     {
       "question_id": "q02-superset",
-      "headline": "over-acceptance by precision level: Branches 5.9% valid of 17, Ordered 62.2% valid of 45, Unordered 98.9% valid of 1591",
+      "headline": "over-acceptance by precision level: Merged 71.0% valid of 31, Ordered 66.7% valid of 30, Unordered 97.6% valid of 467",
       "detail": {
         "per_level": {
           "Unordered": {
-            "valid": 1574,
-            "invalid": 17
+            "valid": 456,
+            "invalid": 11
           },
           "Ordered": {
-            "valid": 28,
-            "invalid": 17
+            "valid": 20,
+            "invalid": 10
           },
-          "Branches": {
-            "valid": 1,
-            "invalid": 16
+          "Merged": {
+            "valid": 22,
+            "invalid": 9
           }
         }
       },
@@ -57,9 +55,51 @@
       "unanswered": "skipped by request"
     }
   ],
-  "walks_per_schema": 20,
+  "walks_per_schema": 12,
   "seed": 20260726,
   "invalid_examples": [
+    {
+      "schema": 25,
+      "engine": "gpugrammar",
+      "cause": "unexplained",
+      "reason": "'op' is a required property",
+      "text": "[{ \t \t}\t\r]"
+    },
+    {
+      "schema": 25,
+      "engine": "gpugrammar",
+      "cause": "unexplained",
+      "reason": "'op' is a required property",
+      "text": "[\n{\n\"X\u015e+X]Z\ud772\u037eF~\u08aa\u13c8\u0896\uf4f8wX\u0cf6t\uac9b3K#\u068eNq3OS\u3238\u0408\u0897\ud0e3\u0615*3\ue3d4M=%\u05f92\u0e39gGy*QPq\ue8c1*\uda4a\udda8\u05d9B\u94b1i\u076eX\ud80b\udf5d,\ud970\udca1[\u07ea;N\u03e0a&la \u0499GM\u036c\u0169\u05b0Gv\u0214l>\u07d7\u04c9L\u9893 /\u007f\u02e5}t\"\t:false}\r\n] \t\t\t\n\t\t\t\t"
+    },
+    {
+      "schema": 25,
+      "engine": "gpugrammar",
+      "cause": "unexplained",
+      "reason": "'op' is a required property",
+      "text": "[   { }]\n"
+    },
+    {
+      "schema": 25,
+      "engine": "gpugrammar",
+      "cause": "unexplained",
+      "reason": "'op' is a required property",
+      "text": "[\t{ \n\t\"3G?\\/m\udbca\udd3dt\"\n\t\n :null} ]  \n\t "
+    },
+    {
+      "schema": 25,
+      "engine": "gpugrammar",
+      "cause": "unexplained",
+      "reason": "'op' is a required property",
+      "text": "[{\n\"L]#\u0469Wf\udbc5\udc6f\u53cb\ud63d4\ucaf8$\u05d1\u0257\ub25ew[\u02acl\u0758aF\u0198Xv\ub11f i*|2\ud8c2\ude00P\u6d72zB usvd(3\u6bcbF\"\r:\r[1  ]\t \n} \n\t\n] \t\t"
+    },
+    {
+      "schema": 25,
+      "engine": "gpugrammar",
+      "cause": "unexplained",
+      "reason": "'op' is a required property",
+      "text": "[{\t}\r\r\n,{\"\udb78\udc8fGGa\u06666\u07de;Tq6L\u04bc\u0437E\u0213G,O\u4508\u05cc})z\ud927\udd03iW\u9f40c\u0311Kz\u02c7\u509fdu.\u5959%\u2a13h~uA+\u071e\u078e#\u0582Q\u0466p\uca3e\u0224\u80f6yV\u6a1c\u55cc)\u0579\"\n \n\t \n\n\r \n \t\n\r:577\t}\r\n\n\t\t]\r\r\n\t"
+    },
     {
       "schema": 30,
       "engine": "gpugrammar",
@@ -138,46 +178,25 @@
       "text": "{\"dimensionName\" :\r\r\n\r\"e\u0559\u804e*-\u07ce\u0475[Adj\u0544\u25819\ud52evPG\u0522\u0642\u0492h\u00ebaw4\u0433 @2)(}%\ud373N\u0409|Q>\uf9ddP\uc69b_dFO7g\u076dOh;1pe\u0388\u2945\u0348~\ud8c9\uded7Oe=\u5b66vn\u061bZ\u0272\udbc9\uddd8C!\u790c\ubc3e\u553aC\u05d8rQ\u069avb\u2252d\u7ec6^n2\u06fek.\udb19\udef4y,H\u0556|\u6a66\u1d8aPAB \u07b4)\u033c\uae05\"}\t \n\n\t \r\n\r\t  \r\r  \n\n"
     },
     {
-      "schema": 30,
+      "schema": 68,
       "engine": "gpugrammar",
-      "cause": "schema uses unlowered dependencies",
-      "reason": "{} is not valid under any of the given schemas",
-      "text": "{ \n\n} \r"
+      "cause": "unexplained",
+      "reason": "[3.81e-07] is not of type 'string', 'null'",
+      "text": "{\"parent_id\":[381E-9 \r]\r \n }"
     },
     {
-      "schema": 30,
+      "schema": 68,
       "engine": "gpugrammar",
-      "cause": "schema uses unlowered dependencies",
-      "reason": "{'isSlice': True} is not valid under any of the given schemas",
-      "text": "{\t\n\t\r\r\t\r\"isSlice\"\r\t\t\r \n\n\t\t \t\r\n\r\n\t\r\n:true\t}\n\n\n"
+      "cause": "unexplained",
+      "reason": "4870000000.0 is not of type 'string', 'null'",
+      "text": "{\r\r\"parent_id\"\n\n\n :4.87e9\t\t \n\n \r\r,  \t\"endian\"\r:\t\t\r\"little\"\n \r,\t\n\"operations\"\r\t\n:2e101\n\n\r\n\t\t\n}\r\n\n\t\r\n\n"
     },
     {
-      "schema": 30,
+      "schema": 68,
       "engine": "gpugrammar",
-      "cause": "schema uses unlowered dependencies",
-      "reason": "{'isSlice': False} is not valid under any of the given schemas",
-      "text": "{\t\r\t\t\n\t\n\r \t\n\r\r \"isSlice\"\n\n \r\n\t\n: \nfalse\n\t}\t \n \t\t\r"
-    },
-    {
-      "schema": 30,
-      "engine": "gpugrammar",
-      "cause": "schema uses unlowered dependencies",
-      "reason": "'values' is a dependency of 'dimensionName'",
-      "text": "{\n\"dimensionName\":\r\n\r\t\n\n \r\"\u0633\u0744\u033bDle5\ue459L/`bj?N\u0563Q\u06fb\u01b9\u066dtrI.\uf777\\rJa\uedcaH'\u05faxjS\u0551P\u047cm%u6\u65fe7U\u0449\u9455\u0313I\ud99b\udef4\\f.f>#\uc20f@?\u0b0b\"\t\t }\r\n "
-    },
-    {
-      "schema": 30,
-      "engine": "gpugrammar",
-      "cause": "schema uses unlowered dependencies",
-      "reason": "{} is not valid under any of the given schemas",
-      "text": "{ \n\n\r}\n "
-    },
-    {
-      "schema": 30,
-      "engine": "gpugrammar",
-      "cause": "schema uses unlowered dependencies",
-      "reason": "{} is not valid under any of the given schemas",
-      "text": "{\n\r\n\t}\n \t\r  \t\n\n"
+      "cause": "unexplained",
+      "reason": "4 is not of type 'string', 'null'",
+      "text": "{\"parent_id\"\t\r:4\t\t\t\n}\t \r\r\n\r\t\t\n\t\r  "
     },
     {
       "schema": 87,
@@ -248,168 +267,7 @@
       "cause": "unexplained",
       "reason": "\"J\u0671\u04c8MV\u0110\u00c9ysf\u0273\ua137\u0515\u0524Xyx\u0256n\\x83T\\U0007d188E$o8il\u043b\u0180oW\u014d:\uaf5d\u0713G$\u0250\u03c1ZY\\U000d7b1ed6\u2d410\\u070f\u07ad\u0307\u02f5g\ud502\\U000e7e7e\u168b\\U0010f42cW\u07eb\u05c2Y*f\ud785;O~\\ue7541OEA@Q,E\u4933e\u0190HZ\u00d1~V\u9220Et|Paq",
       "text": "{\n\r\n \"detectors\"\n\r\n\n: null \t\t  \r\n\t\n\r\n\r ,\n\"name\"\n\n\r\r\r:43\t\t , \n\t\t\t\r  \n\t\"pages\"\t  \t:\"J\u0671\u04c8MV\u0110\u00c9ysf\u0273\ua137\u0515\u0524Xyx\u0256n\u0083T\ud9b4\udd88E$o8il\u043b\u0180oW\u014d:\uaf5d\u0713G$\u0250\u03c1ZY\udb1e\udf1ed6\u2d410\u070f\u07ad\u0307\u02f5g\ud502\udb5f\ude7e\u168b\udbfd\udc2cW\u07eb\u05c2Y*f\ud785;O~\ue7541OEA@Q,E\u4933e\u0190HZ\u00d1~V\u9220Et|PaqJ%\u6dc0EwNF\u0083$A~? gBJ\u2b2f\u60bc()Le\u07eewl=\u59f1\u0f16"
-    },
-    {
-      "schema": 87,
-      "engine": "gpugrammar",
-      "cause": "unexplained",
-      "reason": "False is not of type 'string'",
-      "text": "{\r\t\t\r\t\r\n\r\"extends\"\t\n:-51\t\r\n\r\n\r,\"name\"\n \n\n\r\r:false }\n  \n \r \n \r\t\r\n"
-    },
-    {
-      "schema": 87,
-      "engine": "gpugrammar",
-      "cause": "unexplained",
-      "reason": "39 is not of type 'string'",
-      "text": "{ \n\t\"extends\":58026.4\n,\"name\"\t \r\t\r  \n\t:39\t,\r\n\"--R;i*i\" \t\n:\t46409.6E6\n\r\r  \n \n\n \t}\n\r \t\n\r \t \r\t\t "
-    },
-    {
-      "schema": 87,
-      "engine": "gpugrammar",
-      "cause": "unexplained",
-      "reason": "0.0 is not of type 'object'",
-      "text": "{\"extends\" \r\n\t:7e-2087\t,\"name\"\r\r\r:\"8EGVGD7\u042csGve+(<|ph\u04d8u\u0172;$/0\ud1b3zi\u0cae\u06836\u00ec)$\u370b*oLRu?[\u03982gw{-8\u611f\u053e\u030dw\"\n, \r \"@\ud93e\udf8bP\u0680\u074eW;(v\u0144\ucd5d4\u0545\ud92d\udedcU\"\t \n :\n[null,37,0\n]\r }\n\r\r\t\r "
-    },
-    {
-      "schema": 87,
-      "engine": "gpugrammar",
-      "cause": "unexplained",
-      "reason": "'rbyua4*\u07c8\u06ab\u0324\u02c74\\U000bb9c0W\\U000b2a0b\u02fb\u44c6\u0265\u01d1Nm\u0520 DO4qD\u031f\u015aQ\uad9a]!Ne\u01b7\u01452:y\u0670\u7a1al1N\\U0003bc49\u0194\u01e6sN\\U000547ad\u07dc\u5bb7B(l 4\u3cf4DS\u86b6:3\u9606RNtL\u04e6S\\u0530;\u49b7P*\u06b9\u03d3h\u0628\ud418\u3664\u0710?-\u061blw;jT8OP\u7a498 ",
-      "text": "{\"detectors\":\n[27\t,[[\r]\n\r  \n\r \n\t]] \n \n\t\t\n\r \n\t\r ,\"name\"\t\t:{\r\n}\t \t\r\n  \n   \r\n\t\r \t, \"pages\" \t :\n\"rbyua4*\u07c8\u06ab\u0324\u02c74\udaae\uddc0W\uda8a\ude0b\u02fb\u44c6\u0265\u01d1Nm\u0520 DO4qD\u031f\u015aQ\uad9a]!Ne\u01b7\u01452:y\u0670\u7a1al1N\ud8af\udc49\u0194\u01e6sN\ud911\udfad\u07dc\u5bb7B(l 4\u3cf4DS\u86b6:3\u9606RNtL\u04e6S\u0530;\u49b7P*\u06b9\u03d3h\u0628\ud418\u3664\u0710?-\u061blw;jT8OP\u7a498 W\u0126B\u00e5\",\t\n\n"
-    },
-    {
-      "schema": 87,
-      "engine": "gpugrammar",
-      "cause": "unexplained",
-      "reason": "[-8529, 76.367] is not of type 'string'",
-      "text": "{  \r\r  \"extends\"\r\t \r\r\t\r :4\t\t \t,  \"name\"\t \t\r\t:[-8529,76.367\r\n]\r,\t\r\"\u5ef6\u04e1(\u06e5\u00c7\u753e\u0207\u00d2\udb81\udf96m`vU\u047b\u01d7(\udbd1\ude84E \u01b5Uu\u442e\u2672G/\u00de\u06c8\u0592L\u89f98!!N~k\u03baC\u04fd23#`P{\u0306N\ue989\u038f|aaG,\u0339/Hu\":985713}"
-    },
-    {
-      "schema": 87,
-      "engine": "gpugrammar",
-      "cause": "unexplained",
-      "reason": "'home' is a required property",
-      "text": "{\n\"detectors\" \n\n\n:\"\u0703Ab\u028d.!tk\u0127\u996c\ubaeb-qp\ud810\udc19}\u06f1W.mq\u0259HX\u07ca\u0640\\/\ua0c3ru(\u078eEW\u7c29~\",\t\"name\" :\"\u032fq_y(UP.(\u01b0)Gf\u02bfEAZ\u0e4c{\uafa1u=\ud931\udfb0\u6884a\ud86b\udd00+wG\u051c`Ed<|/t2K\u72b4p\" ,\n\r\t\"pages\"\t: {\"\ud7b4V\u011a\u224a/\u995a\u03fd\u9097\u1a18\u0459\u06f3\u0477d\u07d9\u0223`\ued59M0e#m\uab9a\u02e0@R\u00c9^\u01fe8\u01db\u53489i6?\u05a2\u01fb\u02f59$\u07fa\u00efF\"\t:null\n\r\t   }\t}"
-    },
-    {
-      "schema": 87,
-      "engine": "gpugrammar",
-      "cause": "unexplained",
-      "reason": "6.5 is not of type 'string'",
-      "text": "{\t\r\r\n \t\"extends\"\t\r:null\t\n,\"name\"\t:6.5\n\t,\n\n\"\uafa0z$\udb9a\udf13>g\u04ec>\"\n\r \t \r\t\t:\n2,\n \"\ud82c\udd85i+&5t\u0793y7v5q\u04b92\u00db\u0191#\uadc9\u0452pQ\u4dadi\u0667\u06ea\u5b3dxB]U\ud3cb\u068c\u606f\u07f4Q\u18190i\u05f1X6q\u0400J\u062dh\u105f\u0680d<\u04eaG\u050f\u0739{O0\u007f\u007f-re\u85a8\u9ad5O@6g8\u67a9.\u023a^\u0323pz6n0\u0319/z\u01e57Mr\udbec\udfddP\u052e\u0114\\/\u0471_\u0352\":0\r\t\n  }\r\t\n\t"
-    },
-    {
-      "schema": 221,
-      "engine": "gpugrammar",
-      "cause": "schema uses unlowered not",
-      "reason": "'filing_subject' is a required property",
-      "text": "{\r  \n \n   \n\"title\"\n:false \n\n}\t \n\t\t \r\n"
-    },
-    {
-      "schema": 221,
-      "engine": "gpugrammar",
-      "cause": "schema uses unlowered not",
-      "reason": "'filing_subject' is a required property",
-      "text": "{\t\"filing_type_name\":0.8E87\n\t \t} "
-    },
-    {
-      "schema": 221,
-      "engine": "gpugrammar",
-      "cause": "schema uses unlowered not",
-      "reason": "'filing_subject' is a required property",
-      "text": "{\r \n\r\n \"title\"\r\n :0}\n\n\n\r\r\n\n \t\t"
-    },
-    {
-      "schema": 221,
-      "engine": "gpugrammar",
-      "cause": "schema uses unlowered not",
-      "reason": "'filing_subject' is a required property",
-      "text": "{ \"description\":8}\r\t\n\n\r\n\n"
-    },
-    {
-      "schema": 221,
-      "engine": "gpugrammar",
-      "cause": "schema uses unlowered not",
-      "reason": "'filing_subject' is a required property",
-      "text": "{\n\n\"title\" :null\t  \r\r\n\n}\n\t\t\n"
-    },
-    {
-      "schema": 221,
-      "engine": "gpugrammar",
-      "cause": "schema uses unlowered not",
-      "reason": "'filing_subject' is a required property",
-      "text": "{\r\t\t\"description\"\n\t\r\t \n\n\t\n\r\r\r\n\t\r:\t924}\n\r\n    "
-    },
-    {
-      "schema": 221,
-      "engine": "gpugrammar",
-      "cause": "unlowered keyword: not",
-      "reason": "Additional properties are not allowed ('\\U00050175\u8d05q>;%J(\u00af\u04e71\u05c6 |o\u0397h\u0757d\u07ab*wz\u8e22Rr~l\\U00101b31L' was unexpected)",
-      "text": "{\t\r  \r\r\n\t\r\r\"title\"\t:-64e-328  \n,\r\"\ud900\udd75\u8d05q>;%J(\u00af\u04e71\u05c6 |o\u0397h\u0757d\u07ab*wz\u8e22Rr~l\udbc6\udf31L\"\t\r:36\r\r\n\r\r \t}\n\r\r \n "
-    },
-    {
-      "schema": 221,
-      "engine": "gpugrammar",
-      "cause": "schema uses unlowered not",
-      "reason": "'filing_subject' is a required property",
-      "text": "{ \"title\"\t\n:6\t\r\t \r}"
-    },
-    {
-      "schema": 221,
-      "engine": "gpugrammar",
-      "cause": "schema uses unlowered not",
-      "reason": "'filing_subject' is a required property",
-      "text": "{\"description\"\t  \r\r\n \n:\n0} \t\n"
-    },
-    {
-      "schema": 221,
-      "engine": "gpugrammar",
-      "cause": "schema uses unlowered not",
-      "reason": "'filing_subject' is a required property",
-      "text": "{\t\"description\"\n   \r\r\t :8.5e66182400}\n\t\r \n \t\n\t\n  \n\r\t\r \r\r\r\t\r \r\n\t\t\r\n\t  \r"
-    },
-    {
-      "schema": 221,
-      "engine": "gpugrammar",
-      "cause": "schema uses unlowered not",
-      "reason": "'filing_subject' is a required property",
-      "text": "{\n\n\"description\"\r\n:26 }\t\t"
-    },
-    {
-      "schema": 221,
-      "engine": "gpugrammar",
-      "cause": "unlowered keyword: not",
-      "reason": "Additional properties are not allowed ('7hyH\u05ef\u037e(' was unexpected)",
-      "text": "{ \r\n \"description\"\n\r\t\t\t\r:\r 0\t,\"7hyH\u05ef\u037e(\"\t:6 \r}\t\r\t\t\r    \n\t\r"
-    },
-    {
-      "schema": 221,
-      "engine": "gpugrammar",
-      "cause": "unlowered keyword: not",
-      "reason": "Additional properties are not allowed ('SrFk\u00f4~\u96b5\u3a76\u0388Mf2m\\U0005fe8e\u0610`\u08b0<\u03bc1l4\u053e\u00ffjrOs\u022e\u01ea:8`.7fp\u83e5\ud11c\u0768-W\u0391\ufe57OI3,\\U000d036b\u0431\u078cx~Em{j\u01d8\\U00068021O\u00f2xv#i\u054b\u01fc\u8edb\u2499\\t9s",
-      "text": "{ \t\n \r\r\"title\"\n:false\r\t,\r\t\"\ufd0d\uef6c-q;02\u0465\uc6ee\u031aPUk\u069c\u01c5C.\u0676\u016a\" :null \n\n ,\t\n\"SrFk\u00f4~\u96b5\u3a76\u0388Mf2m\ud93f\ude8e\u0610`\u08b0<\u03bc1l4\u053e\u00ffjrOs\u022e\u01ea:8`.7fp\u83e5\ud11c\u0768-W\u0391\ufe57OI3,\udb00\udf6b\u0431\u078cx~Em{j\u01d8\ud960\udc21O\u00f2xv#i\u054b\u01fc\u8edb\u2499\\t9s\u007f\u0371A\u6a7b\u025bb\u0428?w!J\u1b5d\u029a0\u03b9`H_;.\u007fHp\u071e9Z9Q\"\n:-7\t\r\r\r\t\r}\n"
-    },
-    {
-      "schema": 221,
-      "engine": "gpugrammar",
-      "cause": "unlowered keyword: not",
-      "reason": "Additional properties are not allowed ('03V\u035dK\u3562IY\u0303+L,D\u4e7fv1L\\U000ae90f}\u02bc2Z\u0538\u407dD)A-00Bq\u2a00:\\x7f', \"{nLtXJ<xT\u03f6Z5eJ\u02053\\U000469d05K\u0715Yb\u368f#\\u0600\u042e(\u01d5\ufd86\u021bQF\u04a31|",
-      "text": "{\n\"filing_type_name\" :\r 0E9\n\t,\"{nLtXJ<xT\u03f6Z5eJ\u02053\ud8da\uddd05K\u0715Yb\u368f#\u0600\u042e(\u01d5\ufd86\u021bQF\u04a31|<-oq\u05c5$[q`\u8e0fq\ub292'&%#\u034faq\ub087P\ud6549L\" :0E1,\r  \n\n\r\n\n\r\t\n \t\r\t\n\n\t\t  \n\r\t\r\n\"03V\u035dK\u3562IY\u0303+L,D\u4e7fv1L\uda7a\udd0f}\u02bc2Z\u0538\u407dD)A-00Bq\u2a00:\u007f\"\r\t\t\r\r\r\t: \t854\r}"
-    },
-    {
-      "schema": 221,
-      "engine": "gpugrammar",
-      "cause": "unlowered keyword: not",
-      "reason": "Additional properties are not allowed ('\u06f9' was unexpected)",
-      "text": "{\"filing_type_name\"\r \n   \t:8\r\t\r\r\r,\r\t \r\r\r\t\n\t\r \n\t\"\u06f9\"\t:null}\r\r"
-    },
-    {
-      "schema": 221,
-      "engine": "gpugrammar",
-      "cause": "schema uses unlowered not",
-      "reason": "'filing_subject' is a required property",
-      "text": "{\r \n\r\t\t\"description\"\n \r\t\n  \t:93\t}"
     }
   ],
-  "invalid_total": 50
+  "invalid_total": 30
 }
