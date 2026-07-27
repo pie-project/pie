@@ -1336,46 +1336,80 @@ small decode step, so a constant 2.5 ms is a large fraction of it. On a
 production-sized model the same 2.5 ms is a much smaller share and the
 crossover moves substantially earlier.
 
-### 14.4 Where the 2.5 ms actually goes: the hook takes the request off the fused decode path
+### 14.4 Where the 2.5 ms actually goes: the hook takes the request off CUDA graphs
 
-§14.3 attributed the constant overhead to "per-layer hook dispatch". An `nsys`
-profile of the two programs at ~6.8K context, 31 decode steps each, says
-precisely what that means:
+§14.3 attributed the constant overhead to "per-layer hook dispatch". Profiling
+says what that means, but only after a methodology trap that is worth recording
+because it produced a confident and completely wrong answer first.
+
+**The trap.** `nsys profile -t cuda` traces CUDA graphs at *graph* granularity
+by default: a replayed graph appears as a single entry, and the kernels inside
+it are not listed at all. The baseline's decode step therefore showed up as one
+174 us kernel, and the natural reading -- "the baseline fuses the whole
+28-layer step into one megakernel and the hook opts out of it" -- is wrong. The
+tell was arithmetic, not tooling: 28 layers of this model read ~860 MB of KV
+and ~1.2 GB of weights, which cannot happen in 174 us on a device with 864 GB/s
+of bandwidth. **A profile that implies a kernel exceeded the memory bandwidth
+of the machine is not a discovery, it is a measurement artifact.** Re-running
+with `--cuda-graph-trace=node` resolved it.
+
+**What is actually true.** 104 decode tokens at ~6.1K context, identical
+workload, node-level tracing:
 
 | | baseline | quest |
 |---|---|---|
-| GPU kernel launches, whole run | 561 | 18 014 |
-| launches per decode step | ~18 | ~580 |
-| GPU time per decode step | ~0.37 ms | ~5.5 ms |
+| kernels executed | 27 361 | 58 982 |
+| of which inside a CUDA graph | 26 368 (96%) | **0** |
+| host-visible launches | 993 | 58 982 |
+| host launches per decode step | ~9 | ~573 |
+| GPU time | 989.1 ms | 1090.9 ms |
 
-The baseline's entire 28-layer decode step is **one fused kernel**
-(`ptir_fused_…`, 205 us) plus plumbing — no separate attention, projection,
-norm or activation launches appear at all. With a stage hook bound, that
-fusion is off, and every layer's `gemv` (1768 launches), decode attention
-(868), `qk_rmsnorm_rope` (896), `split_qkv` (896), `swiglu` (896) and `rmsnorm`
-(1824) is launched individually.
+The two programs run *the same model kernels*, in the same counts:
+`BatchDecodeWithPagedKVCacheKernel` 2884 (= 103 steps x 28 layers) in both,
+`gemv_bf16` 5872 in both, `gemvx` 5768 in both, `rmsnorm` 5928 in both. Nothing
+about the model forward is unfused by the hook. What the hook costs is that the
+request stops being replayed from a captured graph and starts being launched
+kernel by kernel from the host.
 
-Quest's own kernels are a small part of this. Per layer:
-`k_generated_envelope_dot` 12.1 us and the threshold/mask program 8.9 us —
-21 us/layer, 0.59 ms/step. The other ~4.5 ms/step is the *unfusing*, which the
-policy pays simply for asking to be called once per layer.
+So the ~2.5 ms/step splits in two:
 
-So the ranking of things worth optimising in Quest is:
+* **~1.0 ms/step on the GPU** (989.1 -> 1090.9 ms over 103 steps). Quest's own
+  kernels are most of it: `envelope_dot` 2884 x 12.0 us = 0.34 ms/step, the
+  threshold/mask program 2884 x 8.6 us = 0.24 ms/step, the explicit KV write
+  2884 x 2.5 us = 0.07 ms/step. The remainder is per-layer variant differences
+  -- the baseline fuses split+qk-norm+rope into one `qkv_decode_qk_norm_rope`
+  (2.2 us) where the hook path runs `split_qkv` and `qk_rmsnorm_rope`
+  separately (2.4 + 3.5 us).
+* **~1.5 ms/step on the host**, which is 564 extra eager launches per step at a
+  few microseconds each. This is the part that does not show up in any kernel
+  timing and is why §14.3's stage breakdown only ever saw a blocking wait.
 
-1. **Restore fusion between hook points** (~4.5 ms/step). The hook needs to run
-   between layers, so the whole step cannot be one kernel — but the runs
-   *between* hooks could still fuse. This is an engine-level change to PTIR
-   dispatch, not a Quest change, and it would benefit every Track A and Track B
-   policy identically, since they all bind the same per-layer hook.
-2. `envelope_dot` itself (0.34 ms/step).
-3. The threshold/mask program (0.25 ms/step).
-4. Envelope maintenance (0.08 ms/step after §13.2).
+**This reorders the optimisation targets.** The largest single lever is not any
+kernel in this document -- it is making a hook-bearing request graph-capturable
+again. Everything Quest does per layer is already device-side (`envelope_dot`,
+a PTIR threshold program, a mask write), so there is no host round-trip in the
+policy itself that would inherently prevent capture; the request is excluded
+because binding a stage hook conservatively disables capture, not because the
+hook does anything uncapturable. That is engine-level work in PTIR dispatch
+rather than a Quest change, and it would benefit every Track A and Track B
+policy identically, since they all bind the same per-layer hook.
 
-Items 2-4 together are smaller than a quarter of item 1. Nothing further in
-this file's kernels is worth tuning until fusion is addressed.
+Ranked, per decode step at ~6K context:
 
-One engine-level observation, flagged rather than attributed because it affects
-both programs equally and so cancels out of every comparison here:
-`cudaGraphInstantiate` was called 51 times at ~2.2 ms in a 31-step run, in both
-programs. Re-instantiating an executable graph rather than updating one is
-expensive enough to dominate the host side of a decode step.
+| | cost | owner |
+|---|---|---|
+| lost CUDA-graph replay | ~1.5 ms | engine (PTIR dispatch) |
+| `envelope_dot` | 0.34 ms | this document |
+| threshold + mask program | 0.24 ms | this document |
+| unfused split/rope variant | ~0.3 ms | engine |
+| explicit KV write + envelope merge | ~0.15 ms | this document |
+
+The three rows this document owns total ~0.73 ms against ~1.8 ms owned by the
+engine. Tuning them further has a low ceiling until the graph question is
+addressed.
+
+One further engine-level observation, flagged rather than attributed because it
+affects both programs equally and so cancels out of every comparison here:
+`cudaGraphInstantiate` was called 51 times at ~2.2 ms each in a 31-step run, in
+*both* programs. Re-instantiating an executable graph rather than updating one
+is expensive enough to dominate the host side of a decode step.
