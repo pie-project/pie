@@ -167,6 +167,135 @@ pub fn build(cfg: &Cfg) -> Result<Tables> {
     })
 }
 
+/// Build canonical LR(1) tables, as a diagnostic rather than for the runtime.
+///
+/// Every conflict this corpus produces is reduce/reduce and none is
+/// shift/reduce, which is the signature of LALR's one weakness: it merges LR(1)
+/// states that share an LR(0) core, and merging their lookahead sets can create
+/// a reduce/reduce conflict the grammar does not really have. Canonical LR(1)
+/// never merges, so a grammar that builds here and not with `build` had an
+/// artefact rather than an ambiguity - and an artefact is what IELR(1) removes
+/// while keeping LALR's size.
+///
+/// Refused past `budget` states, because canonical state counts are what LALR
+/// exists to avoid and an unbounded build would hang rather than answer.
+pub fn build_canonical(cfg: &Cfg, budget: usize) -> Result<Tables> {
+    let augmented = augment(cfg);
+    let eof = cfg.num_terminals as u32;
+    let nullable = nullable_sets(&augmented);
+    let first = first_sets(&augmented, &nullable);
+
+    let closure = |kernel: &BTreeSet<(Item, u32)>| -> BTreeSet<(Item, u32)> {
+        let mut items: BTreeSet<(Item, u32)> = BTreeSet::new();
+        for (item, ahead) in kernel {
+            for entry in closure1(&augmented, &nullable, &first, *item, *ahead) {
+                items.insert(entry);
+            }
+        }
+        items
+    };
+
+    let start: BTreeSet<(Item, u32)> = BTreeSet::from([(
+        Item {
+            production: 0,
+            dot: 0,
+        },
+        eof,
+    )]);
+    let mut states = vec![start.clone()];
+    let mut index: FxHashMap<BTreeSet<(Item, u32)>, usize> = FxHashMap::default();
+    index.insert(start, 0);
+    let mut transitions: Vec<Vec<(Symbol, usize)>> = vec![Vec::new()];
+    let mut queue = VecDeque::from([0usize]);
+
+    while let Some(current) = queue.pop_front() {
+        let items = closure(&states[current]);
+        let mut moves: FxHashMap<Symbol, BTreeSet<(Item, u32)>> = FxHashMap::default();
+        for (item, ahead) in &items {
+            let production = &augmented[item.production as usize];
+            let Some(symbol) = production.rhs.get(item.dot as usize) else {
+                continue;
+            };
+            moves.entry(*symbol).or_default().insert((
+                Item {
+                    production: item.production,
+                    dot: item.dot + 1,
+                },
+                *ahead,
+            ));
+        }
+        let mut sorted: Vec<_> = moves.into_iter().collect();
+        sorted.sort_by_key(|(symbol, _)| *symbol);
+        for (symbol, kernel) in sorted {
+            let target = match index.get(&kernel) {
+                Some(&existing) => existing,
+                None => {
+                    if states.len() >= budget {
+                        bail!("canonical LR(1) exceeds {budget} states");
+                    }
+                    let fresh = states.len();
+                    states.push(kernel.clone());
+                    transitions.push(Vec::new());
+                    index.insert(kernel, fresh);
+                    queue.push_back(fresh);
+                    fresh
+                }
+            };
+            transitions[current].push((symbol, target));
+        }
+    }
+
+    let mut resolved = 0usize;
+    let mut action: Vec<FxHashMap<u32, i32>> = vec![FxHashMap::default(); states.len()];
+    let mut goto: Vec<FxHashMap<u32, u32>> = vec![FxHashMap::default(); states.len()];
+    for (state, kernel) in states.iter().enumerate() {
+        for (symbol, target) in &transitions[state] {
+            match symbol {
+                Symbol::Terminal(terminal) => set_action(
+                    &mut action,
+                    &mut resolved,
+                    state,
+                    terminal.0,
+                    encode_shift(*target),
+                )?,
+                Symbol::Nonterminal(nonterminal) => {
+                    goto[state].insert(*nonterminal, *target as u32);
+                }
+            }
+        }
+        for (item, ahead) in closure(kernel) {
+            let production = &augmented[item.production as usize];
+            if item.dot as usize != production.rhs.len() {
+                continue;
+            }
+            if item.production == 0 {
+                set_action(&mut action, &mut resolved, state, eof, ACCEPT)?;
+                continue;
+            }
+            set_action(
+                &mut action,
+                &mut resolved,
+                state,
+                ahead,
+                encode_reduce(item.production as usize),
+            )?;
+        }
+    }
+
+    Ok(Tables {
+        action,
+        goto,
+        productions: augmented
+            .iter()
+            .map(|production| (production.lhs, production.rhs.len() as u32))
+            .collect(),
+        num_terminals: cfg.num_terminals,
+        eof,
+        start_state: 0,
+        shift_reduce_resolved: resolved,
+    })
+}
+
 fn set_action(
     action: &mut [FxHashMap<u32, i32>],
     resolved: &mut usize,

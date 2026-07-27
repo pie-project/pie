@@ -105,6 +105,7 @@ dependencies = [
  "gpugrammar-lex",
  "gpugrammar-lr",
  "gpugrammar-tables",
+ "rayon",
  "rustc-hash",
  "serde",
  "serde_json",

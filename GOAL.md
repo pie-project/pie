@@ -182,16 +182,45 @@ past a draft of four.
 
 ## Grammar class decision
 
-Canonical LR(1) — what the prototype implements today — is verifiably correct
-(exhaustively cross-checked against an independent Earley recognizer, including
-ε-productions, unit chains, and an LR(1)-but-not-LALR(1) grammar) but its state
-count explodes on realistic grammars.
+**[settled by measurement, 2026-07-27]** IELR(1) was the target: it accepts the
+same grammars as canonical LR(1) at LALR(1)'s table size, and LALR(1) was the
+fallback. On this corpus it would buy nothing, and here is why.
 
-**IELR(1) is the target**: it accepts the same grammars as canonical LR(1) while
-producing tables the size of LALR(1). LALR(1) is the acceptable fallback if the
-IELR(1) construction cannot be made incremental. The choice must be justified in
-the paper with measured state counts and table sizes on real grammars (JSON,
-JSON Schema, a tool-call/DSL grammar, and a programming-language grammar).
+Every conflict the corpus produces is reduce/reduce; not one is shift/reduce.
+That is the signature of LALR's one weakness - it merges LR(1) states sharing an
+LR(0) core, and merging their lookahead sets can invent a reduce/reduce conflict
+the grammar does not have - so it looked as though most of them were artefacts
+and IELR(1) would take them. Building canonical LR(1) tables, which never merge,
+says otherwise:
+
+| of the 32 schemas with no LALR(1) parser at any precision level | |
+|---|---|
+| LALR artefacts, which IELR(1) would remove | **0** |
+| conflicting under canonical LR(1) too | **32** |
+| undecided within a 400,000-state budget | 0 |
+
+The control matters as much as the result: of the schemas LALR does accept,
+canonical LR(1) accepts 26 of 26 and refuses none, so the builder is answering
+rather than failing. A canonical builder that always failed would have produced
+the same headline.
+
+So these grammars are genuinely ambiguous - two derivations for one string -
+and no LR(1) construction of any kind will parse them. They come from `oneOf`
+branches that overlap, which is exactly what `oneOf` describes and what a union
+cannot distinguish.
+
+**Ambiguity is not a problem for a mask.** A parser that has to build a tree
+must choose a derivation; we never build one. The question is only whether
+*some* derivation admits the next token, and the union of what all of them admit
+is the answer. Carrying a set of parses is therefore not a compromise here but
+the right shape - and the engine already does it, because scanning a generated
+lexicon is ambiguous too and a sequence already carries a set of configurations.
+Letting an ACTION conflict fork one is the same mechanism on a second axis, over
+the same LALR tables, with the same ceiling and the same overflow flag.
+
+That is the decision: **LALR(1) tables, with conflicts forked at runtime rather
+than refused at construction.** IELR(1) is not needed for what it was wanted
+for, and the measurement above is why.
 
 Also required at this layer: precedence/associativity declarations for conflict
 resolution, and an EBNF front-end, since practical grammars are not written in
