@@ -1628,6 +1628,12 @@ below are the re-measurement described in §18.3: min of **15** rounds, with the
 page count probed rather than extrapolated (the first version of this table had
 a slightly short `budget=100%` and one visible outlier; both are gone).
 
+> §19.3 re-ran this at 25 rounds. **Quest's table barely moved** -- 0.51x ->
+> 0.50x at 16384, `budget=100%` overhead ~2.5 -> ~2.6 ms -- unlike Track B's,
+> which fell by ~0.4 ms everywhere. Quest is the policy with real per-layer
+> work, so its signal sits further above this host's noise floor. Treat the
+> crossover as ~3.2K rather than the ~4K interpolated here.
+
 | ctx | pages | baseline | budget=100% | budget=50% | budget=25% |
 |---|---|---|---|---|---|
 | 1024 | 86 | 3.59 ms | 1.61x | 1.54x | 1.34x |
@@ -1754,6 +1760,11 @@ caught this:
 
 ### 18.4 The corrected Track B table
 
+**Superseded by §18.7**, which re-ran this at 25 rounds. The shape below is
+right and every conclusion drawn from it survives; the absolute constants are
+about 0.4 ms too high and two cells flagged here as artifacts were exactly
+that. Kept because §18.7 is an argument about how far to trust it.
+
 Qwen3-0.6B, 28 layers, page size 16, L40S, ms/token, **min of 15** interleaved
 rounds, `report=false`, page counts probed. Ratios are baseline/policy, so
 **>1.00x is a win**.
@@ -1774,6 +1785,12 @@ its neighbours -- a residual noise artifact of the shared host, not a feature.
 `snapkv@.25` likewise loses a little between 12288 and 16384.)
 
 ### 18.5 What the corrected numbers say, which is more than the wrong ones did
+
+> **Amended by §19.3.** The decomposition below is right; the claim that all
+> three instruments converge on *one* constant is not. At 25 rounds SnapKV's
+> floor (~1.9 ms) and Quest's (~2.6 ms) separate cleanly, and the ~1.5 ms of
+> lost graph replay is the part common to both. They agree on how the number
+> splits, which is stronger evidence than agreeing on the number.
 
 Converting the `@1` ratios to absolute per-step overhead is where the table
 stops being a benchmark and starts being an argument:
@@ -1856,3 +1873,109 @@ arithmetic is factored out of `prefill_chunks` into a private `even_spans` for
 exactly this reason -- `max_embed_length()` reaches the host, so the public
 function cannot run off-device, and a rule this easy to get subtly wrong should
 not be testable only through a GPU.
+
+## 19. How far these numbers can be trusted
+
+### 19.1 The same table at 25 rounds
+
+§18.4 flagged two cells as noise artifacts rather than features. That is an
+easy thing to assert and a cheap thing to check, so both benchmarks were re-run
+at `PIE_BENCH_REPS=25`.
+
+| ctx | pages | baseline | h2o@1 | h2o@.5 | h2o@.25 | snap@1 | snap@.5 | snap@.25 |
+|---|---|---|---|---|---|---|---|---|
+| 1024 | 86 | 3.60 ms | 0.52x | 0.58x | 0.63x | 0.70x | 0.76x | 0.80x |
+| 2048 | 165 | 4.78 ms | 0.56x | 0.68x | 0.73x | 0.69x | 0.87x | 0.98x |
+| 4096 | 321 | 6.73 ms | 0.60x | 0.78x | 0.93x | 0.77x | 1.02x | 1.25x |
+| 6144 | 478 | 8.76 ms | 0.61x | 0.87x | 1.11x | 0.82x | 1.14x | 1.44x |
+| 8192 | 634 | 11.13 ms | 0.64x | 0.94x | 1.26x | 0.86x | 1.31x | 1.48x |
+| 12288 | 946 | 15.33 ms | 0.66x | 1.02x | 1.35x | 0.90x | 1.21x | 1.69x |
+| 16384 | 1259 | 19.79 ms | 0.66x | 1.07x | 1.57x | 0.91x | 1.39x | 1.72x |
+
+Both flagged cells resolved as noise. `h2o@.25` at 4096 went 0.59x -> 0.93x and
+now sits between its neighbours. `snapkv@.25` went 1.63x -> 1.72x at 16384 and
+the 12288 -> 16384 dip is gone. **H2O's overhead column, which was not monotone
+at 15 rounds (3.37, 4.87, 4.49 ms), is monotone at 25 (3.32, 3.76, 4.49).**
+
+The noise did not disappear, though -- it moved. `snapkv@.5` now dips at 12288
+(1.31 -> 1.21 -> 1.39) where it did not before. **A wobble that relocates when
+you resample is host noise; a wobble that stays is a feature.** That is the only
+reliable way to tell them apart here, and it costs a second run.
+
+### 19.2 The overheads came in uniformly lower, which is expected
+
+| ctx | 1024 | 2048 | 4096 | 6144 | 8192 | 12288 | 16384 |
+|---|---|---|---|---|---|---|---|
+| SnapKV @15 | 2.34 | 2.33 | 2.87 | 2.30 | 1.97 | 2.09 | 2.21 ms |
+| SnapKV @25 | 1.54 | 2.15 | 2.01 | 1.92 | 1.81 | 1.70 | 1.96 ms |
+| H2O @15 | 3.37 | 4.87 | 4.49 | 6.00 | 6.84 | 8.24 | 10.69 ms |
+| H2O @25 | 3.32 | 3.76 | 4.49 | 5.60 | 6.26 | 7.90 | 10.19 ms |
+
+Every single cell fell. That is not a coincidence and not a bug: **min-of-N is
+a biased estimator of the minimum, biased upward, and the bias shrinks with N.**
+Both endpoints get faster as N grows, but the policy endpoint is the slower one
+and carries more absolute noise, so it gains more, and the *difference* -- which
+is what we report -- shrinks. An overhead figure derived from two independently
+minimised endpoints is therefore an upper bound, and quoting it to two
+significant figures is overclaiming.
+
+Two confounds, stated rather than hidden. Host load fell from ~29 to ~18 during
+the Track B re-run (it was back at ~29 for the Quest re-run), so rounds and
+quiet are not separable here. And the two benchmarks are separate programs run
+40 minutes apart: their independently measured baselines agree to ~1% at five of
+seven contexts (worst case +6.1% at 4096). **So ~1% is the reproducibility of
+the easy endpoint, and the honest quote for the constant is ~2 ms, not 2.3.**
+
+### 19.3 Quest's constant did not move, and that is the useful part
+
+| ctx | 1024 | 2048 | 4096 | 6144 | 8192 | 12288 | 16384 |
+|---|---|---|---|---|---|---|---|
+| baseline | 3.69 | 4.70 | 7.14 | 8.82 | 11.24 | 15.47 | 19.69 ms |
+| quest@1 | 1.57x | 1.54x | 1.30x | 1.32x | 1.25x | 1.17x | 1.15x |
+| quest@.5 | 1.54x | 1.31x | 1.01x | 0.96x | 0.87x | 0.78x | 0.72x |
+| quest@.25 | 1.43x | 1.17x | 0.87x | 0.76x | 0.66x | 0.56x | **0.50x** |
+
+(Quest's harness reports policy/baseline, so here **<1.00x is a win** -- the
+opposite convention to the Track B table above.)
+
+Quest's `@1` overhead is 2.09, 2.55, 2.13, 2.86, 2.76, 2.65, 3.01 ms: ~2.6 ms,
+against ~2.5 ms at 15 rounds. **It did not move, while SnapKV's fell from 2.3 to
+1.9.** So the two policies' floors are genuinely different, which §18.5 had
+blurred by calling them the same constant:
+
+- SnapKV ~1.9 ms. It decides once during prefill and reapplies a resident mask,
+  so it has essentially no per-layer work. This is the floor.
+- Quest ~2.6 ms. The extra ~0.7 ms is `envelope_dot` plus threshold and mask
+  over every page, every layer -- and §14.4 priced that at 0.34 + 0.24 ms.
+- nsys attributed ~1.5 ms/step to lost CUDA graph replay, which is the part
+  *common to both* and must therefore be below SnapKV's 1.9 ms. It is.
+
+The corrected arithmetic is more coherent than the claim it replaces. §18.5 said
+three instruments agreed on one number; they do not, and should not. They agree
+on a **decomposition**: ~1.5 ms of lost graph replay that every policy pays, plus
+~0.4 ms of SnapKV's mask reapplication, plus ~0.7 ms more of per-layer scoring
+if you are Quest. Three instruments agreeing on a single number would have been
+weaker evidence than three instruments agreeing on how the number splits.
+
+### 19.4 Crossovers, restated
+
+At a quarter budget, interpolating linearly between bracketing contexts:
+
+| policy | crossover | at 16384 |
+|---|---|---|
+| SnapKV | ~2.2K | 1.72x faster |
+| Quest | ~3.2K | 2.00x faster |
+| H2O | ~4.9K | 1.57x faster |
+
+All three moved earlier than §17.2/§18.4 reported, for the reason in §19.2: the
+overhead being amortised is smaller than the 15-round run could resolve. The
+**ordering is unchanged across every run at every round count**, and it is the
+part that does not depend on this host: SnapKV (no per-layer work) < Quest
+(`envelope_dot` per page per layer) < H2O (a `[kv_max]` fold per layer, whose
+cost grows with context -- which is why it is last despite being the cheapest
+per unit of work).
+
+Quest reaching exactly **2.00x at 16K** on a 0.6B model is the headline, and it
+is a floor rather than a ceiling: the ~2 ms constant belongs to the engine's
+launch path and does not grow with model size, while the baseline per-step cost
+does.

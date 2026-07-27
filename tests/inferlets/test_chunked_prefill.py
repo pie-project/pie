@@ -319,6 +319,10 @@ async def test_policies_agree_with_the_baseline_past_the_ceiling(client, args):
     common = {"seed": 4242, "max_tokens": 24, "temperature": 0.0001}
     base = _parse(await run_inferlet(client, "naive-baseline", {**common, "prompt": prompt}))
     assert base["text"].strip(), "baseline produced nothing to compare against"
+    assert "Paris" in base["text"], (
+        "the baseline itself is incoherent past the ceiling, so agreeing with it "
+        f"would prove nothing: {base['text']!r}"
+    )
 
     for name in ("quest-attention", "trackb-h2o", "trackb-snapkv", "tova-attention"):
         r = await _policy(client, name, prompt=prompt, **common)
