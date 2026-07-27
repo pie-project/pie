@@ -3,6 +3,7 @@
 #include <cstdint>
 
 #include "ops/attention_workspace.hpp"
+#include "ops/attention_flashinfer.hpp"
 #include "distributed.hpp"
 #include "store/kv_cache.hpp"
 #include "store/dsv4_compress_cache.hpp"
@@ -21,6 +22,10 @@ struct DsV4ForwardCfg {
     // cached. Costs 2x the packed footprint per layer but removes a full
     // expert-bank dequant from every forward.
     bool eager_bf16_experts = true;
+    // Mirrors LlamaLikeForwardCfg: when CUDA graphs are on, the FlashInfer
+    // plan must be built in graph mode so the captured body re-reads the
+    // plan buffers on replay instead of baking first-fire metadata in.
+    bool decode_plan_cuda_graph = true;
 };
 
 struct DsV4Workspace {
@@ -76,6 +81,15 @@ struct DsV4Workspace {
     // Per-entry compressor metadata, four packed [max_comp_tokens] I32 slices:
     // boundary_tok | boundary_pos | window_lo | rope_pos
     DeviceTensor comp_meta;       // [4 * max_comp_tokens] I32
+
+    // FlashInfer plan for the per-layer sliding-window attention. Planned
+    // once per forward (the geometry is identical on every layer) and
+    // reused across layers.
+    // Built by DsV4Model::prepare(), consumed by the (capturable) body.
+    ops::PrefillPlanCachePtr swa_plan;
+    bool swa_plan_valid = false;
+    int swa_plan_tokens = -1;
+    int swa_plan_requests = -1;
 
     // Routed expert scratch
     DeviceTensor expert_in;      // [N, H] bf16 — gathered input rows
@@ -152,6 +166,7 @@ void dsv4_forward_paged(
     int total_tokens,
     int num_requests,
     bool is_pure_decode,
+    const std::uint8_t* row_valid_d,
     const std::int32_t* logit_row_indices_d = nullptr,
     int num_logit_rows = 0);
 

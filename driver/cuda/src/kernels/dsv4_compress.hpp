@@ -103,6 +103,21 @@ void launch_dsv4_compress_gather_paged_bf16(
 // Writes finished compressed entries into the paged compressed-KV cache at
 // their boundary token's own slot, so entry `c` of a request is always found
 // at absolute position `(c + 1) * ratio - 1`.
+/// CUDA-graph-safe boundary metadata for pure decode. Emits one slot per
+/// token (`n` == number of requests); tokens whose position is not a window
+/// boundary get `out_pos = -1`, which `launch_dsv4_compress_gather_paged_bf16`
+/// zero-fills and `launch_dsv4_store_comp_entries_bf16` skips. Replaces the
+/// host scan + compaction, which required a D2H sync and blocked graph capture.
+void launch_dsv4_boundary_meta_decode(
+    const std::int32_t* positions,
+    std::int32_t*       out_pos,
+    std::int32_t*       out_req,
+    std::int32_t*       out_rope,
+    int                 n,
+    int                 ratio,
+    cudaStream_t        stream,
+    const std::uint8_t* row_valid = nullptr);
+
 void launch_dsv4_store_comp_entries_bf16(
     const void* entries,                // [C, head_dim] BF16
     void* comp_kv_pages,                // [num_pages, page_size, head_dim] BF16

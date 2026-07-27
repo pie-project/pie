@@ -4,6 +4,8 @@
 #include "model/stage_hooks.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <iostream>
@@ -12,6 +14,7 @@
 #include <cublas_v2.h>
 
 #include "model/llama_like/qwen3.hpp"  // for make_weight_view
+#include "kernels/attn_sink.hpp"
 #include "kernels/dequant_fp4.hpp"
 #include "kernels/dequant_fp8.hpp"
 #include "kernels/embed.hpp"
@@ -33,7 +36,6 @@ namespace pie_cuda_driver::model {
 
 // Expert-block granularity for the device-side aligned MoE, and the token
 // count below which the per-route GEMV path beats a batched GEMM.
-static constexpr int kDsV4MoeAlignedBlock = 16;
 static constexpr int kDsV4MoeGemvMaxTokens = 8;
 
 inline void dsv4_chunked_swiglu(const void* packed, void* y, int rows, int I,
@@ -243,7 +245,10 @@ DsV4Workspace DsV4Workspace::allocate(
     ws.expert_down_w = DeviceTensor::allocate(DType::BF16,{H, local_moe_I_ws});
     ws.expert_gate   = DeviceTensor::allocate(DType::BF16,{N, local_moe_I_ws});
     ws.expert_up     = DeviceTensor::allocate(DType::BF16,{N, local_moe_I_ws});
-    ws.expert_out    = DeviceTensor::allocate(DType::BF16,{N, H});
+    // One row per route, not per token: both the aligned reorder and the
+    // decode GEMV scatter into row `token * K + k`.
+    ws.expert_out    = DeviceTensor::allocate(
+        DType::BF16, {static_cast<std::int64_t>(N) * K, H});
     ws.route_idx     = DeviceTensor::allocate(DType::INT32, {N * K});
     ws.route_w       = DeviceTensor::allocate(DType::FP32, {N * K});
 
@@ -251,11 +256,18 @@ DsV4Workspace DsV4Workspace::allocate(
     // expert block, each padded up to `block` rows.
     if (local_moe_I_ws > 0 && E > 0 && K > 0) {
         const int routes = N * K;
-        const int block = kDsV4MoeAlignedBlock;
+        // Sized for both extremes because the block is chosen per forward:
+        // the minimum block yields the most blocks, this one the most rows.
+        const int block = kernels::moe_aligned_block(routes, E);
         const int active_expert_cap = std::min(E, routes);
         const int max_blocks =
-            (routes + active_expert_cap * (block - 1) + block - 1) / block;
-        const int aligned_rows = max_blocks * block;
+            (routes + active_expert_cap * (kernels::kMoeAlignedBlockMin - 1) +
+             kernels::kMoeAlignedBlockMin - 1) /
+            kernels::kMoeAlignedBlockMin;
+        const int aligned_rows =
+            std::max(max_blocks * kernels::kMoeAlignedBlockMin,
+                     ((routes + active_expert_cap * (block - 1) + block - 1) /
+                      block) * block);
         ws.aligned_block_size = block;
         ws.aligned_max_blocks = max_blocks;
         ws.aligned_route_ids  = DeviceTensor::allocate(DType::INT32, {aligned_rows});
@@ -312,6 +324,7 @@ void dsv4_forward_paged(
     int total_tokens,
     int num_requests,
     bool is_pure_decode,
+    const std::uint8_t* row_valid_d,
     const std::int32_t* logit_row_indices_d,
     int num_logit_rows)
 {
@@ -345,9 +358,57 @@ void dsv4_forward_paged(
     const int swa_window_left =
         cfg.dsv4_sliding_window > 0 ? cfg.dsv4_sliding_window - 1 : -1;
 
-    cudaStream_t stream = nullptr;  // default stream
-    act_dump_step_begin();
+    // Must be cublas's stream, not the null stream: CUDA-graph capture runs on
+    // a private stream and only work enqueued there is recorded into the graph.
+    cudaStream_t stream = cublas.stream();
+    act_dump_step_begin(stream);
 
+    // Env-gated per-stage timer. `PIE_DSV4_PROFILE=1` records CUDA events
+    // and syncs at every probe, giving GPU time per stage. `=2` instead
+    // takes host wall-clock around each stage with no sync, giving the
+    // *submit* cost — the two answer different questions, and DSV4 decode
+    // is submit-bound, so both are needed.
+    static const int prof_mode = [] {
+        const char* v = std::getenv("PIE_DSV4_PROFILE");
+        return (v == nullptr || v[0] == '\0') ? 0 : std::atoi(v);
+    }();
+    const bool prof_on = prof_mode == 1;
+    const bool prof_host = prof_mode == 2;
+    static std::vector<std::pair<std::string, double>> prof_acc;
+    static int prof_steps = 0;
+    static std::chrono::steady_clock::time_point ph_a;
+    cudaEvent_t pe_a = nullptr, pe_b = nullptr;
+    if (prof_host) prof_acc.clear();
+    if (prof_on) {
+        CUDA_CHECK(cudaEventCreate(&pe_a));
+        CUDA_CHECK(cudaEventCreate(&pe_b));
+        prof_acc.clear();
+    }
+    auto prof_add = [&](const char* label, float ms) {
+        for (auto& kv : prof_acc) {
+            if (kv.first == label) { kv.second += ms; return; }
+        }
+        prof_acc.emplace_back(label, ms);
+    };
+    auto prof_beg = [&] {
+        if (prof_host) { ph_a = std::chrono::steady_clock::now(); return; }
+        if (prof_on) CUDA_CHECK(cudaEventRecord(pe_a, stream));
+    };
+    auto prof_end = [&](const char* label) {
+        if (prof_host) {
+            prof_add(label, std::chrono::duration<float, std::milli>(
+                std::chrono::steady_clock::now() - ph_a).count());
+            return;
+        }
+        if (!prof_on) return;
+        CUDA_CHECK(cudaEventRecord(pe_b, stream));
+        CUDA_CHECK(cudaEventSynchronize(pe_b));
+        float ms = 0.f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, pe_a, pe_b));
+        prof_add(label, ms);
+    };
+
+    prof_beg();
     // ── Compressor boundary bookkeeping ──────────────────────────────
     // Compressing layers all need the same three small per-entry index
     // arrays, which depend only on the compress ratio — so they are built
@@ -367,11 +428,47 @@ void dsv4_forward_paged(
         ws.comp_meta.empty() ? 0 : static_cast<int>(ws.comp_meta.shape()[0] / N);
     std::vector<std::int32_t> pos_h;
 
+    // Pure decode (one token per request) takes a fully device-side path: no
+    // D2H of `positions`, no host compaction, no blocking H2D — which is what
+    // makes the layer capturable into a CUDA graph. Everything else keeps the
+    // host path, where compaction is worth the sync because N can be large.
+    static const bool dev_boundary = [] {
+        const char* v = std::getenv("PIE_DSV4_DEV_BOUNDARY");
+        return v == nullptr || v[0] != '0';
+    }();
+    const bool decode_only = dev_boundary && (N == num_requests) && N > 0;
+
     auto comp_boundaries = [&](int ratio) -> const CompBoundaries& {
         for (auto& kv : comp_boundary_cache) {
             if (kv.first == ratio) return kv.second;
         }
         std::int32_t* meta_d = static_cast<std::int32_t*>(ws.comp_meta.data());
+
+        if (decode_only) {
+            if (req_of_token_d == nullptr) {
+                req_of_token_d =
+                    meta_d + static_cast<std::size_t>(comp_meta_stride - 1) * N;
+            }
+            CompBoundaries cb;
+            cb.count = N;
+            std::int32_t* base =
+                meta_d + static_cast<std::size_t>(comp_meta_slices_used) * N;
+            comp_meta_slices_used += 3;
+            kernels::launch_dsv4_boundary_meta_decode(
+                static_cast<const std::int32_t*>(positions),
+                base, base + N, base + 2 * N, N, ratio, stream, row_valid_d);
+            // The compressed attention wants a token->request map; in pure
+            // decode that is the identity, which the same kernel just wrote.
+            CUDA_CHECK(cudaMemcpyAsync(
+                const_cast<std::int32_t*>(req_of_token_d), base + N,
+                static_cast<std::size_t>(N) * sizeof(std::int32_t),
+                cudaMemcpyDeviceToDevice, stream));
+            cb.pos_d = base;
+            cb.req_d = base + N;
+            cb.rope_pos_d = base + 2 * N;
+            comp_boundary_cache.emplace_back(ratio, cb);
+            return comp_boundary_cache.back().second;
+        }
         if (pos_h.empty()) {
             pos_h.resize(static_cast<std::size_t>(N));
             CUDA_CHECK(cudaMemcpyAsync(pos_h.data(), positions,
@@ -430,6 +527,47 @@ void dsv4_forward_paged(
         return comp_boundary_cache.back().second;
     };
 
+    // Resolve every ratio up front. Each of the copies above is blocking on
+    // the default stream, so resolving lazily inside the layer loop drained
+    // the whole pipeline mid-forward — once per distinct ratio, each time
+    // waiting on every layer enqueued so far. Doing it here costs nothing:
+    // the positions D2H already synced, so the stream is empty.
+    if (comp_meta_stride > 0 && N > 0) {
+        bool any_compressing = false;
+        for (int li = 0; li < static_cast<int>(w.layers.size()); ++li) {
+            const auto& Lw = w.layers[li];
+            if (Lw.compress_ratio > 0 && Lw.compressor.wkv != nullptr &&
+                Lw.compressor.wgate != nullptr && comp_cache.has_layer(li)) {
+                any_compressing = true;
+                break;
+            }
+        }
+        if (any_compressing) {
+            for (int li = 0; li < static_cast<int>(w.layers.size()); ++li) {
+                const auto& Lw = w.layers[li];
+                if (Lw.compress_ratio > 0 && Lw.compressor.wkv != nullptr &&
+                    Lw.compressor.wgate != nullptr && comp_cache.has_layer(li)) {
+                    comp_boundaries(Lw.compress_ratio);
+                }
+            }
+        }
+    }
+
+    prof_end("comp_bnd");
+    prof_beg();
+    // ── Sliding-window attention ─────────────────────────────────────
+    // Every layer attends with the same geometry, so the FlashInfer plan is
+    // built once per fire — in DsV4Model::prepare(), which runs outside any
+    // CUDA-graph capture region. The naive fallback kernel this replaces
+    // walked the KV scalar-wise (one `load_kv_scalar` call per element per
+    // query head) and cost ~65% of the whole step.
+    static const bool swa_force_naive = [] {
+        const char* v = std::getenv("PIE_DSV4_NAIVE_SWA");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    const bool swa_use_flashinfer = !swa_force_naive && ws.swa_plan_valid;
+    prof_end("swa_plan");
+    prof_beg();
     // TP all-reduce helper (safe: no-op when tp_comm is null)
     auto tp_all_reduce = [&](void* buf, std::size_t count) {
         if (fwd_cfg.tp_comm != nullptr) {
@@ -538,6 +676,8 @@ void dsv4_forward_paged(
         act_dump_bf16(act_dump_layer_tag("norm_x", li).c_str(),
             ws.norm_x.data(), N, H, stream);
 
+        prof_end("pre_layers");
+        prof_beg();
         // Q path: wq_a → q_norm → wq_b
         ops::gemm_act_x_w(cublas.handle(),
             ws.norm_x.data(), make_weight_view(Lw.wq_a, Lw.wq_a_quant), ws.q_a.data(),
@@ -582,6 +722,8 @@ void dsv4_forward_paged(
             rope_theta_l, stream, /*inverse=*/false, /*interleaved=*/true,
             rope_yarn_factor, cfg.rope_beta_fast, cfg.rope_beta_slow,
             cfg.rope_original_max_position);
+            prof_end("qkv_proj");
+            prof_beg();
         {
             // SWA attention on ALL layers (every layer has a sliding window).
             auto lv = kv_cache.layer_view(li);
@@ -590,17 +732,34 @@ void dsv4_forward_paged(
                 ws.kv.data(), ws.kv.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 N, num_requests, lv.page_size,
-                1, head_dim, false, stream);
+                1, head_dim, false, stream, row_valid_d);
 
-            ops::launch_attention_naive_paged_bf16(
-                ws.q.data(), lv.k_pages, lv.v_pages,
-                ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                N, num_requests, num_heads, 1, head_dim, lv.page_size, stream,
-                /*window_left=*/swa_window_left, /*sm_scale=*/-1.f,
-                /*logits_soft_cap=*/0.f,
-                /*lse_out=*/static_cast<float*>(ws.attn_lse.data()));
+            if (swa_use_flashinfer) {
+                ops::dispatch_attention_flashinfer_prefill_bf16(
+                    *ws.swa_plan,
+                    ws.q.data(), lv.k_pages, lv.v_pages, ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, attn_ws, stream,
+                    /*logits_soft_cap=*/0.f, /*sm_scale=*/-1.f,
+                    static_cast<float*>(ws.attn_lse.data()));
+                // FlashInfer emits `m + log2(d)`; the compressed-attention
+                // LSE this is merged with is a natural log.
+                kernels::launch_lse_log2_to_ln(
+                    static_cast<float*>(ws.attn_lse.data()),
+                    N * num_heads, stream);
+            } else {
+                ops::launch_attention_naive_paged_bf16(
+                    ws.q.data(), lv.k_pages, lv.v_pages,
+                    ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    N, num_requests, num_heads, 1, head_dim, lv.page_size, stream,
+                    /*window_left=*/swa_window_left, /*sm_scale=*/-1.f,
+                    /*logits_soft_cap=*/0.f,
+                    /*lse_out=*/static_cast<float*>(ws.attn_lse.data()));
+            }
 
+            prof_end("swa_attn");
+            prof_beg();
             // ── Compressed attention (C4/C128 layers) ────────────────
             // Every compressing layer keeps two page-parallel caches alive
             // across forward passes: the per-token compressor state and the
@@ -636,7 +795,7 @@ void dsv4_forward_paged(
                     ws.comp_kv_proj.data(), ws.comp_score_proj.data(),
                     qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                     N, num_requests, comp_page_size,
-                    1, proj_dim, false, stream);
+                    1, proj_dim, false, stream, row_valid_d);
 
                 const CompBoundaries& cb = comp_boundaries(comp_ratio);
                 if (cb.count > 0) {
@@ -702,6 +861,8 @@ void dsv4_forward_paged(
                     N, num_heads, head_dim, stream);
             }
 
+            prof_end("comp_attn");
+            prof_beg();
             // Attention sink correction: o *= sigmoid(lse - sink_h)
             if (Lw.attn_sink != nullptr) {
                 kernels::launch_attn_sink_correction_bf16(
@@ -730,6 +891,8 @@ void dsv4_forward_paged(
             act_dump_bf16(act_dump_layer_tag("attn_irope", li).c_str(),
                 ws.attn_out.data(), N, num_heads * head_dim, stream);
 
+            prof_end("attn_epilogue");
+            prof_beg();
             // Grouped output projection: per-group GEMMs with strided I/O.
             //
             // attn_out is [N, num_heads*head_dim] BF16.  Conceptually
@@ -898,6 +1061,8 @@ void dsv4_forward_paged(
             // TODO: all-reduce wo_b output across TP ranks
         }
 
+        prof_end("o_proj");
+        prof_beg();
         // ── HC post (attention) ──────────────────────────────────────
         if (M > 1 && Lw.hc_attn_fn != nullptr) {
             kernels::launch_hc_post_bf16(
@@ -960,6 +1125,8 @@ void dsv4_forward_paged(
         act_dump_bf16(act_dump_layer_tag("ffn_in", li).c_str(),
             ws.norm_y.data(), N, H, stream);
 
+        prof_end("hc_attn");
+        prof_beg();
         // ── FFN (MoE) block ──────────────────────────────────────────
         // Router
         ops::gemm_act_x_w(cublas.handle(),
@@ -992,6 +1159,8 @@ void dsv4_forward_paged(
                 stream);
         }
 
+        prof_end("moe_router");
+        prof_beg();
         // Routed expert dispatch (MXFP4 weights, dequant to bf16)
         cudaMemsetAsync(ws.moe_out.data(), 0,
                         static_cast<std::size_t>(N) * H * 2, stream);
@@ -1031,12 +1200,14 @@ void dsv4_forward_paged(
                 // device and run two batched GEMMs. No host round-trip, no
                 // stream sync, and the reduction is deterministic.
                 const int routes = N * K;
-                const int block = ws.aligned_block_size;
+                const int block = std::min(ws.aligned_block_size,
+                                           kernels::moe_aligned_block(routes, E));
                 const int active_expert_cap = std::min(E, routes);
                 const int max_blocks =
                     (routes + active_expert_cap * (block - 1) + block - 1) / block;
                 const int aligned_rows = max_blocks * block;
-                if (max_blocks > ws.aligned_max_blocks) {
+                if (max_blocks > ws.aligned_max_blocks ||
+                    aligned_rows > static_cast<int>(ws.aligned_expert_in.shape()[0])) {
                     throw std::runtime_error("dsv4: aligned MoE scratch too small");
                 }
 
@@ -1191,6 +1362,8 @@ void dsv4_forward_paged(
         act_dump_bf16(act_dump_layer_tag("routed_out", li).c_str(),
             ws.moe_out.data(), N, H, stream);
 
+        prof_end("moe_experts");
+        prof_beg();
         // Shared expert (sharded by TP)
         if (Lw.shared_w1 != nullptr) {
             ops::gemm_act_x_w(cublas.handle(),
@@ -1227,6 +1400,8 @@ void dsv4_forward_paged(
                 ncclSum, stream);
         }
 
+        prof_end("moe_shared");
+        prof_beg();
         // ── HC post (FFN) ────────────────────────────────────────────
         act_dump_bf16(act_dump_layer_tag("ffn_out", li).c_str(),
             ws.moe_out.data(), N, H, stream);
@@ -1246,6 +1421,8 @@ void dsv4_forward_paged(
                       ws.hc_residual.data(), N, M * H, stream);
     }
 
+    prof_end("hc_ffn");
+    prof_beg();
     // ── HC head: collapse multi-stream → single-stream ───────────────
     if (M > 1 && w.hc_head_fn != nullptr) {
         kernels::launch_hc_rmsnorm_to_f32(
@@ -1304,6 +1481,23 @@ void dsv4_forward_paged(
             ws.norm_y.data(), ops::WeightView(*w.lm_head), logits_out,
             rows, local_vocab, H);
         act_dump_bf16("logits", logits_out, rows, local_vocab, stream);
+    }
+
+    if (prof_on || prof_host) {
+        prof_end("head");
+        double total = 0.0;
+        for (auto& kv : prof_acc) total += kv.second;
+        std::cerr << "[pie-dsv4-profile] step=" << prof_steps++
+                  << " tokens=" << N << " requests=" << num_requests
+                  << " total_ms=" << total;
+        for (auto& kv : prof_acc) {
+            std::cerr << " " << kv.first << "=" << kv.second;
+        }
+        std::cerr << "\n";
+        if (prof_on) {
+            CUDA_CHECK(cudaEventDestroy(pe_a));
+            CUDA_CHECK(cudaEventDestroy(pe_b));
+        }
     }
 }
 

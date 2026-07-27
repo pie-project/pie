@@ -537,7 +537,7 @@ std::unique_ptr<IModel> create_deepseek_v4_model(
     auto& plan = plan_cast<DeepSeekV4Plan>(*plan_base, "deepseek_v4");
     return std::make_unique<DsV4Model>(
         std::move(plan.weights), *res.hf_config, *res.dsv4_ws,
-        *res.dsv4_comp_cache, res.tp_size,
+        *res.dsv4_comp_cache, *res.kv_cache, res.tp_size,
         res.tp_rank, res.tp_comm, /*emit_logits=*/true,
         plan.eager_bf16_experts);
 }
