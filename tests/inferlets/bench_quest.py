@@ -46,9 +46,12 @@ SHORT_TOKENS = 8
 LONG_TOKENS = 104
 REPS = 7
 
-# Contexts to sweep. The 8192-token forward limit caps a one-shot prefill
-# somewhere below 10K, so the sweep stops where a single fire still fits.
-CONTEXTS = [1024, 2048, 4096, 6144]
+# Contexts to sweep. This used to stop at 6144, because both this benchmark's
+# endpoints prefilled in a single fire and a single fire cannot exceed the
+# driver's per-launch token capacity (8192 here). Both inferlets now chunk their
+# prefill, so the sweep reaches the range Quest actually exists for -- which is
+# the range where the constant overhead of section 14.3 stops dominating.
+CONTEXTS = [1024, 2048, 4096, 6144, 8192, 12288, 16384]
 # Fractions of the request's real page count to keep. 1.0 is "keep everything",
 # which isolates the cost of running Quest from the benefit of evicting.
 BUDGET_FRACTIONS = [1.0, 0.5, 0.25]

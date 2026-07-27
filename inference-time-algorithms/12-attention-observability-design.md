@@ -1564,3 +1564,78 @@ End to end, `bench_quest.py` re-run after the change reproduces §14.2's crossov
 unchanged -- net win from 4K, quarter-budget 0.85x at 4096 and 0.60x at 6144
 against a 11.90 ms baseline -- with an identical reserved page count at every
 context. The narrowing is invisible to every measurement except the memory one.
+
+## 17. The one-shot prefill was a ceiling under the crossover
+
+Every measurement above stops at 6144 tokens. That was not a choice about what
+was interesting -- it was the largest context the benchmark could reach, because
+both endpoints prefilled the whole prompt in **one fire**, and a fire cannot
+exceed the driver's structural per-launch token capacity (`max_embed_length()`,
+8192 on this CUDA driver).
+
+That ceiling sat in a bad place. §14.3 shows Quest's overhead is a constant
+~2.5 ms/step while the saving grows with context, so the ratio only improves as
+the context does. Capping the measurement at 6144 therefore capped it just past
+the crossover, where Quest had barely started to win -- and worse, it capped the
+*feature*, not just the benchmark. A policy whose entire purpose is long context
+could not be run at long context.
+
+### 17.1 Chunking, and what has to be true of it
+
+`quest-attention` and `naive-baseline` now split the prompt into `ceil(n/C)`
+chunks. Chunk `i` attends over the whole prefix written so far -- `kv_len` is
+cumulative and `page_indptr` covers every page up to the chunk's end -- and
+writes only its own tokens. That is what makes the concatenation equal the
+one-shot fire: the causal offset each chunk's queries see is `kv_len - qo_len`,
+which is exactly the chunk's base. When the prompt fits in one chunk the loop
+runs once and builds the pass it always built, so nothing below the ceiling
+moves.
+
+**Testing the equivalence needed a correction that is worth recording.** The
+obvious test -- run the same prompt at a forced-small chunk width and compare
+the text -- fails, and the first version of it did. Chunking changes the
+attention kernel's tile decomposition (28 fires of 37 tokens do not reduce in
+the same order as one fire of 1024), so the prompt's hidden states differ in
+their last bits and those bits are written into the KV cache. This is §11.4's
+observation arriving from a new direction, and near-greedy decoding amplifies it
+into completely different, equally coherent text.
+
+The fix is not a tolerance. It is to pin the assertion to a prompt whose
+continuation is **decisive**: on an ambiguous prompt the next-token distribution
+is nearly flat and a 1-ulp difference flips the argmax, but on a prompt whose
+answer the model is sure of the argmax has a real margin and cannot be flipped.
+`test_quest_chunked_prefill` uses such a prompt and asserts **exact text
+equality over 32 tokens** at chunk widths 37, 128 and 999 -- all deliberately
+not multiples of the 16-token KV page, so every boundary lands mid-page and the
+write offsets have to be right. The single-token argmax was checked separately
+across three contexts and four widths and is identical in every case, which
+isolates the prefill's own output from any downstream amplification.
+
+### 17.2 The measurement the ceiling was hiding
+
+Same method as §14.2 -- Qwen3-0.6B, 28 layers, page size 16, L40S, ms/token,
+min of 7 interleaved rounds, `report=false`. Ratios are quest/baseline, so
+**below 1.00 is a win**:
+
+| ctx | pages | baseline | budget=100% | budget=50% | budget=25% |
+|---|---|---|---|---|---|
+| 1024 | 80 | 4.61 ms | 1.36x | 1.19x | 1.19x |
+| 2048 | 158 | 4.84 ms | 1.43x | 1.19x | 1.11x |
+| 4096 | 314 | 6.91 ms | 1.37x | 0.93x | **0.80x** |
+| 6144 | 471 | 9.70 ms | 1.23x | 0.86x | **0.67x** |
+| 8192 | 627 | 10.91 ms | 1.23x | 0.85x | **0.66x** |
+| 12288 | 940 | 15.19 ms | 1.31x | 0.76x | **0.75x** |
+| 16384 | 1253 | 19.74 ms | 1.13x | 0.70x | **0.49x** |
+
+**At 16K context and a quarter budget Quest is 2.04x faster than the baseline.**
+The crossover is unchanged at ~4K -- lifting the ceiling did not move it, which
+is the right outcome, since the ceiling was an artifact of the harness and not a
+property of the policy.
+
+The `budget=100%` column is still the constant: in absolute terms the overhead
+is 1.65, 2.08, 2.58, 2.19, 2.48, 4.77 and 2.54 ms across the seven contexts --
+flat at ~2.5 ms with one outlier at 12288 that the shared host explains (the
+same row's 0.76x/0.75x pair is visibly noisier than its neighbours in both
+directions). Seven contexts spanning 16x now say what four spanning 6x could
+only suggest: **the overhead does not scale with context and the saving does**,
+so the ratio improves without bound as the context grows.
