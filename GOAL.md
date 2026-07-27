@@ -494,11 +494,35 @@ documents, the same as stock XGrammar. Compiling that schema against the full
 151,669-token vocabulary takes 83 ms and yields 88 groups; a mask fill takes
 19 µs.
 
-**It is not yet faster**: 571 tok/s against 692 for XGrammar at batch 16. That
-is expected and honest. The measured advantage lives in never materialising a
-mask, and this path still fills a CPU bitmask because that is the only
-interface vLLM offers — Layer 3 of Decision 1, the fused sampling hook, does
-not exist upstream. Batch 16 is also far below where the CPU fill dominates.
+**It is faster now, narrowly, and the number is noisy.** Qwen3-0.6B under three
+schemas at once, 64 prompts, median of five runs: **7,052 tok/s against
+XGrammar's 6,588**. The spread is wide - 3,972 to 7,104 for us and 4,644 to
+7,630 for them - so this is a 1.07x that should be read as parity rather than a
+win. It was 571 against 692 when this section was first written, and what closed
+it was not the kernels but the interface between them and the engine.
+
+**A batch under many schemas is one launch.** Every schema the engine has seen
+lives in one arena and a sequence carries the index of the one it is under, so a
+step holding a dozen different schemas is a single launch rather than a dozen.
+That is what a serving batch is: requests bring their own schemas and the
+mixture changes every step. A CUDA graph recorded on one assignment of grammars
+to sequences replays correctly on a different one, which is what makes the
+capture survive continuous batching.
+
+**Two bugs only the integration found**, and neither is visible with one schema.
+vLLM compiles grammars on a thread pool, so two requests with different schemas
+reach the backend at once; admission was a check-then-act, and two schemas took
+the same index, which masks one against the other's tables. And the copy into
+vLLM's bitmask assumed the two were the same width - vLLM's spans the model's
+padded vocabulary and ours the tokenizer's, 4,748 words against 4,740 - so the
+tail was left as whatever the row held.
+
+**Loading the batch's state cost more than every kernel it fed**: 2.3 ms at
+batch 512 against 84 us for the fill. It sent `rows x max_configs x max_stack`,
+8.45 MB to carry a few dozen words, and turned each matcher's state into Python
+objects on the way. Sending what the sequences hold is 65 kB, and packing it in
+Rust is 352 us. This is the shape of most of what was slow here: not arithmetic,
+but a ceiling paid for as if it were the work.
 
 **Coverage and acceptance on real schemas.** Of 533 JSONSchemaBench schemas,
 **431 compile to LALR(1) tables**. Feeding each schema's model-generated
