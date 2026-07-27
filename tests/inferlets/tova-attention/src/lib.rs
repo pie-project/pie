@@ -70,6 +70,12 @@ struct Input {
     /// KV positions TOVA would keep.
     #[serde(default = "default_cache_size")]
     cache_size: u32,
+    /// Prefill chunk width, clamped to the driver's `max_embed_length()`.
+    /// Defaults to that limit, i.e. the fewest chunks the driver allows.
+    /// Forcing it down runs the multi-chunk path on a short prompt, which is
+    /// the only way to test chunk equivalence without a 16K-token prompt.
+    #[serde(default)]
+    prefill_chunk: Option<u32>,
 }
 
 fn default_prompt() -> String {
@@ -167,56 +173,81 @@ async fn main(input: Input) -> Result<Output> {
 
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
 
-    // ── PREFILL FIRE (N-wide): no TOVA tap. ──
+    // ── PREFILL (chunked, C-wide): no TOVA tap. ──
     //
     // TOVA is defined on the decoding step: it ranks by the attention of the
     // most recent query token, and during prefill "most recent" is still
     // moving. The paper applies it from the first generated token onward.
+    //
+    // Split into `ceil(n / C)` chunks, `C = max_embed_length()`. A one-shot
+    // fire cannot exceed the driver's per-launch token capacity, which capped
+    // this policy at 8192 prompt tokens; chunk `i` attends over the whole
+    // prefix written so far and writes only its own tokens, so the
+    // concatenation equals the one-shot fire (section 17).
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-    let toks_p = Channel::from(prompt_i32).named("toks_p");
-    let embed_indptr_p = Channel::from(vec![0u32, n]).named("embed_indptr_p");
-    let positions_p = Channel::from((0..n).collect::<Vec<_>>()).named("positions_p");
-    let pages_p = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages_p");
-    let page_indptr_p = Channel::from(vec![0u32, n.div_ceil(page_size)]).named("page_indptr_p");
-    let w_slot_p =
-        Channel::from((0..n).map(|p| p / page_size).collect::<Vec<_>>()).named("w_slot_p");
-    let w_off_p = Channel::from((0..n).map(|p| p % page_size).collect::<Vec<_>>()).named("w_off_p");
-    let kv_len_p = Channel::from(vec![n]).named("kv_len_p");
-    let rng_p = Channel::from(vec![input.seed, 0]).named("rng_p");
-    let tok_out_p = Channel::new([1], dtype::i32).named("tok_out_p");
-
-    let fwd_p = ForwardPass::new();
-    fwd_p.embed(&toks_p, &embed_indptr_p)?;
-    fwd_p.attention(
-        &ws,
-        ..,
-        ..,
-        &kv_len_p,
-        &pages_p,
-        &page_indptr_p,
-        &w_slot_p,
-        &w_off_p,
-        &positions_p,
-        None,
-    )?;
-    fwd_p.epilogue(move || {
-        let r = rng_p.take();
-        let logits = intrinsics::logits();
-        let token = step(logits, temperature, &r);
-        tok_out_p.put(&token);
-        rng_p.put(&add(&r, iota(2)));
-    });
-
+    let chunk = input
+        .prefill_chunk
+        .unwrap_or(u32::MAX)
+        .min(max_embed_length().max(1) as u32)
+        .min(n)
+        .max(1);
     let pipe = Pipeline::new();
-    fwd_p
-        .submit(&pipe)
-        .map_err(|e| format!("prefill submit: {e}"))?;
 
-    let g0 = tok_out_p
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("g0 take: {e}"))?[0];
+    let mut g0 = 0i32;
+    let mut base = 0u32;
+    while base < n {
+        let len = chunk.min(n - base);
+        let end = base + len;
+
+        let toks_p =
+            Channel::from(prompt_i32[base as usize..end as usize].to_vec()).named("toks_p");
+        let embed_indptr_p = Channel::from(vec![0u32, len]).named("embed_indptr_p");
+        let positions_p = Channel::from((base..end).collect::<Vec<_>>()).named("positions_p");
+        let pages_p = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages_p");
+        let page_indptr_p =
+            Channel::from(vec![0u32, end.div_ceil(page_size)]).named("page_indptr_p");
+        let w_slot_p = Channel::from((base..end).map(|p| p / page_size).collect::<Vec<_>>())
+            .named("w_slot_p");
+        let w_off_p = Channel::from((base..end).map(|p| p % page_size).collect::<Vec<_>>())
+            .named("w_off_p");
+        let kv_len_p = Channel::from(vec![end]).named("kv_len_p");
+        let rng_p = Channel::from(vec![input.seed, 0]).named("rng_p");
+        let tok_out_p = Channel::new([1], dtype::i32).named("tok_out_p");
+
+        let fwd_p = ForwardPass::new();
+        fwd_p.embed(&toks_p, &embed_indptr_p)?;
+        fwd_p.attention(
+            &ws,
+            ..,
+            ..,
+            &kv_len_p,
+            &pages_p,
+            &page_indptr_p,
+            &w_slot_p,
+            &w_off_p,
+            &positions_p,
+            None,
+        )?;
+        fwd_p.epilogue(move || {
+            let r = rng_p.take();
+            let logits = intrinsics::logits();
+            let token = step(logits, temperature, &r);
+            tok_out_p.put(&token);
+            rng_p.put(&add(&r, iota(2)));
+        });
+
+        fwd_p
+            .submit(&pipe)
+            .map_err(|e| format!("prefill submit @{base}: {e}"))?;
+
+        g0 = tok_out_p
+            .take()
+            .get::<i32>()
+            .await
+            .map_err(|e| format!("g0 take @{base}: {e}"))?[0];
+
+        base = end;
+    }
     generated.push(g0 as u32);
 
     let mut last_scores: Vec<f32> = Vec::new();
