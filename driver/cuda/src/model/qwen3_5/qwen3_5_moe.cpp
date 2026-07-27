@@ -54,11 +54,6 @@ bool fused_gdn_projection_weights_enabled() {
 // Padding the fused weight up to a multiple of 8 would recover the saved
 // launch as well -- the swiglu and scalar-gate kernels already take the
 // row stride as an argument -- but is worth only ~0.3 ms more.
-bool env_on(const char* name) {
-    const char* v = std::getenv(name);
-    return v != nullptr && v[0] != '\0' && v[0] != '0';
-}
-
 bool fused_shared_scalar_gate_enabled() {
     static const bool enabled = [] {
         const char* v = std::getenv("PIE_QWEN35_FUSED_SHARED_SCALAR_GATE");
@@ -218,7 +213,11 @@ DeviceTensor concat_axis0_bf16(
 }  // namespace
 
 bool qwen35_moe_gate_up_swapped() {
-    static const bool swapped = env_on("PIE_QWEN35_MOE_FLASHINFER");
+    static const bool swapped = [] {
+        const char* v = std::getenv("PIE_QWEN35_MOE_FLASHINFER");
+        if (v == nullptr || v[0] == '\0') return true;
+        return v[0] != '0';
+    }();
     return swapped;
 }
 

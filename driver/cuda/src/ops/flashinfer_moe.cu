@@ -262,9 +262,11 @@ ck::MOEParallelismConfig parallelism_config(int tp_size, int tp_rank) {
 bool flashinfer_cutlass_moe_enabled() {
     // Two consumers, each with its own switch: nemotron_h (Relu2) and the
     // qwen3_5 MoE decode (Swiglu). Either one turns the runner on.
-    static const bool enabled =
-        env_truthy(std::getenv("PIE_NEMOTRON_FLASHINFER_MOE")) ||
-        env_truthy(std::getenv("PIE_QWEN35_MOE_FLASHINFER"));
+    static const bool enabled = [] {
+        if (env_truthy(std::getenv("PIE_NEMOTRON_FLASHINFER_MOE"))) return true;
+        const char* q = std::getenv("PIE_QWEN35_MOE_FLASHINFER");
+        return q == nullptr || q[0] == '\0' || q[0] != '0';
+    }();
     return enabled;
 }
 

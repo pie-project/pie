@@ -179,7 +179,7 @@ bool moe_grouped_gemm_enabled() {
 bool moe_flashinfer_enabled() {
     static const bool enabled = [] {
         const char* v = std::getenv("PIE_QWEN35_MOE_FLASHINFER");
-        if (v == nullptr || v[0] == '\0') return false;
+        if (v == nullptr || v[0] == '\0') return true;
         return v[0] != '0';
     }();
     return enabled;
