@@ -36,7 +36,6 @@ pub struct PlanArena {
     buffers: Vec<PieLoaderBufferDeclView>,
     instrs: Vec<PieLoaderStorageInstrView>,
     schedule: Vec<u32>,
-    passes: Vec<PieLoaderOptimizerPassStatsView>,
     attachments: Vec<PieLoaderQuantAttachmentView>,
 }
 
@@ -162,10 +161,6 @@ impl PlanArena {
             ptr: self.schedule.as_ptr(),
             len: self.schedule.len(),
         };
-        let passes = PieLoaderOptimizerPassStatsSlice {
-            ptr: self.passes.as_ptr(),
-            len: self.passes.len(),
-        };
         let attachments = PieLoaderQuantAttachmentSlice {
             ptr: self.attachments.as_ptr(),
             len: self.attachments.len(),
@@ -191,7 +186,6 @@ impl PlanArena {
                 checkpoint_read_bytes: plan.memory.checkpoint_read_bytes,
                 device_write_bytes: plan.memory.device_write_bytes,
             },
-            optimizer: PieLoaderOptimizerReportView { passes },
             compiler_version: plan.compiler_version,
             target: (&plan.target).into(),
             attachments,
@@ -492,17 +486,6 @@ pub fn build(plan: &LoadPlan, extras: &PlanExtras) -> *mut PieLoaderPlan {
 
     arena.schedule = plan.schedule.iter().map(|id| id.0).collect();
 
-    arena.passes.reserve(plan.optimizer.passes.len());
-    for pass in &plan.optimizer.passes {
-        let name = arena.store_str(&pass.name);
-        arena.passes.push(PieLoaderOptimizerPassStatsView {
-            name,
-            exprs_before: pass.exprs_before as u64,
-            exprs_after: pass.exprs_after as u64,
-            rewrites: pass.rewrites as u64,
-        });
-    }
-
     arena.attachments.reserve(plan.attachments.len());
     for attachment in &plan.attachments {
         arena.attachments.push(PieLoaderQuantAttachmentView {
@@ -638,13 +621,5 @@ pub(crate) mod view {
             return &[];
         }
         unsafe { std::slice::from_raw_parts(value.ptr, value.len) }
-    }
-
-    pub unsafe fn passes(plan: *const PieLoaderPlan) -> &'static [PieLoaderOptimizerPassStatsView] {
-        let plan = unsafe { &*plan };
-        if plan.optimizer.passes.ptr.is_null() {
-            return &[];
-        }
-        unsafe { std::slice::from_raw_parts(plan.optimizer.passes.ptr, plan.optimizer.passes.len) }
     }
 }

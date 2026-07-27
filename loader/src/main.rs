@@ -335,7 +335,7 @@ fn diff(
 fn replay(snapshot: &Path, contract: &ModelContract, options: &Options) -> Result<(), Fail> {
     let plan = compile(snapshot, contract, options)?;
     let started = Instant::now();
-    let storage = pie_loader::host::execute_plan(&plan, snapshot)?;
+    let storage = pie_loader::host_executor::execute_plan(&plan, snapshot)?;
     let bytes: usize = storage.tensors.values().map(|t| t.bytes.len()).sum();
     eprintln!(
         "replayed {} tensors ({bytes} bytes materialized, {} arena bytes) in {:?}",

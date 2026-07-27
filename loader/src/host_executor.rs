@@ -1,3 +1,16 @@
+//! Running a finished plan on the CPU, against the real checkpoint bytes.
+//!
+//! Not a production path (§10.3). It exists so a plan can be executed without
+//! a GPU and its output compared against `crate::reference`, which is the only
+//! offline check that can fail because the plan moved the *wrong* bytes rather
+//! than an ill-formed number of them.
+//!
+//! It is the one module below `lib.rs` that opens a file, which is why it is
+//! named for what it is rather than sharing a name with the backend whose
+//! plans it accepts: `crate::backend::host` decides how a plan is lowered, and
+//! this executes the result. The compiler is on the other side of that line —
+//! `tests/standalone.rs` pins it.
+
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};

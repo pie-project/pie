@@ -626,19 +626,6 @@ struct PieLoaderMemoryPlanView {
   uint64_t device_write_bytes;
 };
 
-struct PieLoaderOptimizerPassStatsView {
-  PieLoaderBytes name;
-  uint64_t exprs_before;
-  uint64_t exprs_after;
-  uint64_t rewrites;
-};
-
-using PieLoaderOptimizerPassStatsSlice = PieLoaderSlice<PieLoaderOptimizerPassStatsView>;
-
-struct PieLoaderOptimizerReportView {
-  PieLoaderOptimizerPassStatsSlice passes;
-};
-
 /// The target the plan was compiled against. The driver reads it back to assert
 /// the plan it received is the plan it asked for — the same fields it supplied
 /// in the request, plus the rank identity that makes a TP shard distinguishable
@@ -694,7 +681,6 @@ struct PieLoaderPlan {
   PieLoaderStorageInstrSlice instrs;
   PieLoaderU32Slice schedule;
   PieLoaderMemoryPlanView memory;
-  PieLoaderOptimizerReportView optimizer;
   uint64_t compiler_version;
   PieLoaderTargetView target;
   PieLoaderQuantAttachmentSlice attachments;

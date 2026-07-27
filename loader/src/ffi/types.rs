@@ -740,23 +740,6 @@ pub struct PieLoaderMemoryPlanView {
     pub device_write_bytes: u64,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct PieLoaderOptimizerPassStatsView {
-    pub name: PieLoaderBytes,
-    pub exprs_before: u64,
-    pub exprs_after: u64,
-    pub rewrites: u64,
-}
-
-pub type PieLoaderOptimizerPassStatsSlice = PieLoaderSlice<PieLoaderOptimizerPassStatsView>;
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct PieLoaderOptimizerReportView {
-    pub passes: PieLoaderOptimizerPassStatsSlice,
-}
-
 /// The target the plan was compiled against. The driver reads it back to assert
 /// the plan it received is the plan it asked for — the same fields it supplied
 /// in the request, plus the rank identity that makes a TP shard distinguishable
@@ -815,7 +798,6 @@ pub struct PieLoaderPlan {
     pub instrs: PieLoaderStorageInstrSlice,
     pub schedule: PieLoaderU32Slice,
     pub memory: PieLoaderMemoryPlanView,
-    pub optimizer: PieLoaderOptimizerReportView,
     pub compiler_version: u64,
     pub target: PieLoaderTargetView,
     pub attachments: PieLoaderQuantAttachmentSlice,

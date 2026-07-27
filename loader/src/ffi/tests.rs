@@ -10,7 +10,6 @@ use super::arena::{self, view};
 use super::entry::{PieLoaderDiagnostics, PieLoaderStatus, PieLoaderTargetSpec};
 use super::types::*;
 use crate::load_plan::*;
-use crate::optimizer::{OptimizerPassStats, OptimizerReport};
 use crate::types::*;
 
 fn target() -> StorageTarget {
@@ -255,14 +254,6 @@ fn plan_with_every_instr() -> LoadPlan {
         transform_scratch_peak_bytes: 8192,
         checkpoint_read_bytes: 1 << 31,
         device_write_bytes: 1 << 30,
-    };
-    plan.optimizer = OptimizerReport {
-        passes: vec![OptimizerPassStats {
-            name: "coalesce".to_string(),
-            exprs_before: 900,
-            exprs_after: 120,
-            rewrites: 41,
-        }],
     };
     plan
 }
@@ -661,19 +652,13 @@ fn scalar_operands_are_published_as_one_element_runs() {
 }
 
 #[test]
-fn schedule_and_optimizer_report_survive() {
+fn the_schedule_survives() {
     let plan = plan_with_every_instr();
     with_plan(&plan, |pod| {
         assert_eq!(
             unsafe { view::schedule(pod) },
             &[0, 1, 2, 3, 4, 5, 6, 7, 8][..]
         );
-        let passes = unsafe { view::passes(pod) };
-        assert_eq!(passes.len(), 1);
-        assert_eq!(unsafe { view::bytes(&passes[0].name) }, "coalesce");
-        assert_eq!(passes[0].exprs_before, 900);
-        assert_eq!(passes[0].exprs_after, 120);
-        assert_eq!(passes[0].rewrites, 41);
     });
 }
 
@@ -686,7 +671,6 @@ fn empty_plan_publishes_empty_slices_not_dangling_ones() {
         assert_eq!(unsafe { view::sources(pod) }.len(), 0);
         assert_eq!(unsafe { view::buffers(pod) }.len(), 0);
         assert_eq!(unsafe { view::schedule(pod) }.len(), 0);
-        assert_eq!(unsafe { view::passes(pod) }.len(), 0);
     });
 }
 
