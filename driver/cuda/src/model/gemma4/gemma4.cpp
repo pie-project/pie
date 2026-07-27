@@ -2070,6 +2070,10 @@ void gemma4_forward_paged(
             layer.gate_up_proj_fused != nullptr &&
             !ws.gate_up_fused.empty();
         if (use_gate_up_fused) {
+            // Pinned to classic cuBLAS on purpose: routing this shape
+            // (M=N_tokens, N=2*I, K=H) through the cuBLASLt dispatcher was
+            // measured 15% slower on E4B tp2 -- mlp 4.71 -> 5.44 ms at
+            // N=128 -- so the Lt heuristic loses here.
             ops::gemm_act_x_wt_bf16_cublas(cublas.handle(),
                 ws.norm_x.data(), layer.gate_up_proj_fused->data(),
                 ws.gate_up_fused.data(), N, 2 * I, H);
