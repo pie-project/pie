@@ -376,6 +376,153 @@ class RandomWalkAgreement(unittest.TestCase):
         self._walk({"type": "array", "items": {"type": "integer"}})
 
 
+class Rollback(unittest.TestCase):
+    """Undoing advances without asking the host to replay anything.
+
+    Speculative decoding advances through a draft and then keeps only the prefix
+    the model accepted, so the parser has to go back. Going back by replaying
+    the tokens on the host is the round trip the whole design exists not to
+    make, so the state is kept on the device and put back from there.
+    """
+
+    def setUp(self):
+        _requirements()
+        from gpu_lr1.device_parser import DeviceGrammar
+
+        self.DeviceGrammar = DeviceGrammar
+        self.compiler = gpugrammar.Compiler(VOCABULARY)
+        self.schema = {
+            "type": "object",
+            "properties": {"name": {"type": "string"}, "id": {"type": "integer"}},
+            "required": ["name", "id"],
+        }
+
+    def _tokens(self, document: bytes):
+        out, rest = [], document
+        while rest:
+            best = None
+            for identifier, piece in enumerate(VOCABULARY):
+                if piece and rest.startswith(piece):
+                    if best is None or len(piece) > len(VOCABULARY[best]):
+                        best = identifier
+            self.assertIsNotNone(best, f"no token spells {rest[:8]!r}")
+            out.append(best)
+            rest = rest[len(VOCABULARY[best]) :]
+        return out
+
+    def test_undoing_a_draft_restores_the_matcher_state(self):
+        compiled = self.compiler.compile_json_schema(json.dumps(self.schema))
+        pool = self.DeviceGrammar(compiled)
+        batch = pool.new_batch(1, rollback=4)
+        matcher = compiled.matcher(8)
+        tokens = self._tokens(b'{"name":"ab","id":12}')
+
+        batch.set_matchers([matcher])
+        for token in tokens[:3]:
+            matcher.accept_token(token)
+            batch.advance(torch.tensor([token], dtype=torch.int32, device="cuda"))
+        kept = sorted((s, tuple(k)) for s, k in matcher.configurations())
+        self.assertEqual(
+            sorted((s, tuple(k)) for s, k in batch.configurations(0)), kept
+        )
+
+        # Take three more, as a draft would, then reject them all.
+        for token in tokens[3:6]:
+            batch.advance(torch.tensor([token], dtype=torch.int32, device="cuda"))
+        self.assertNotEqual(
+            sorted((s, tuple(k)) for s, k in batch.configurations(0)), kept
+        )
+        batch.rollback(3)
+        self.assertEqual(
+            sorted((s, tuple(k)) for s, k in batch.configurations(0)),
+            kept,
+            "the parse state did not come back to where the matcher is",
+        )
+
+    def test_a_partly_accepted_draft(self):
+        """Keep two of three drafted tokens, which is the ordinary case."""
+        compiled = self.compiler.compile_json_schema(json.dumps(self.schema))
+        pool = self.DeviceGrammar(compiled)
+        batch = pool.new_batch(1, rollback=4)
+        matcher = compiled.matcher(8)
+        tokens = self._tokens(b'{"name":"ab","id":12}')
+
+        batch.set_matchers([matcher])
+        for token in tokens[:5]:
+            batch.advance(torch.tensor([token], dtype=torch.int32, device="cuda"))
+            matcher.accept_token(token)
+        batch.rollback(2)
+        for token in tokens[3:5]:
+            matcher.rollback(1)
+        self.assertEqual(
+            sorted((s, tuple(k)) for s, k in batch.configurations(0)),
+            sorted((s, tuple(k)) for s, k in matcher.configurations()),
+        )
+
+    def test_the_mask_after_a_rollback_is_the_matcher_s(self):
+        compiled = self.compiler.compile_json_schema(json.dumps(self.schema))
+        pool = self.DeviceGrammar(compiled)
+        batch = pool.new_batch(1, rollback=4)
+        matcher = compiled.matcher(8)
+        tokens = self._tokens(b'{"name":"ab","id":12}')
+
+        batch.set_matchers([matcher])
+        for token in tokens[:4]:
+            batch.advance(torch.tensor([token], dtype=torch.int32, device="cuda"))
+            matcher.accept_token(token)
+        batch.rollback(2)
+        matcher.rollback(2)
+
+        reference = torch.zeros(pool.mask_words, dtype=torch.int32)
+        matcher.fill_bitmask(reference)
+        self.assertTrue(torch.equal(batch.fill_mask()[0].cpu(), reference))
+
+    def test_the_history_survives_a_captured_advance(self):
+        """The advance keeps history from inside a CUDA graph.
+
+        A graph records the arguments it was launched with, so a ring slot
+        passed as a scalar would be frozen at whatever it was when the recording
+        was made and every step would overwrite the same entry. The slot lives
+        on the device for exactly this reason, and this is the test that says
+        so: capture, take several steps, and roll back through them.
+        """
+        compiled = self.compiler.compile_json_schema(json.dumps(self.schema))
+        pool = self.DeviceGrammar(compiled)
+        batch = pool.new_batch(1, rollback=4)
+        matcher = compiled.matcher(8)
+        tokens = self._tokens(b'{"name":"ab","id":12}')
+        batch.set_matchers([matcher])
+        batch.capture_advance()
+
+        for token in tokens[:2]:
+            batch.advance(torch.tensor([token], dtype=torch.int32, device="cuda"))
+            matcher.accept_token(token)
+        kept = sorted((s, tuple(k)) for s, k in matcher.configurations())
+        for token in tokens[2:5]:
+            batch.advance(torch.tensor([token], dtype=torch.int32, device="cuda"))
+        batch.rollback(3)
+        self.assertEqual(
+            sorted((s, tuple(k)) for s, k in batch.configurations(0)),
+            kept,
+            "a captured advance wrote every step to the same history slot",
+        )
+
+    def test_a_batch_without_history_refuses_to_roll_back(self):
+        compiled = self.compiler.compile_json_schema(json.dumps(self.schema))
+        batch = self.DeviceGrammar(compiled).new_batch(1)
+        with self.assertRaises(ValueError):
+            batch.rollback(1)
+
+    def test_rolling_back_further_than_is_kept_is_refused(self):
+        compiled = self.compiler.compile_json_schema(json.dumps(self.schema))
+        batch = self.DeviceGrammar(compiled).new_batch(1, rollback=2)
+        tokens = self._tokens(b'{"name"')
+        batch.set_matchers([compiled.matcher(8)])
+        batch.advance(torch.tensor([tokens[0]], dtype=torch.int32, device="cuda"))
+        with self.assertRaises(ValueError):
+            batch.rollback(2)
+
+
 class GrammarPool(unittest.TestCase):
     """Grammars arrive with requests and leave when the request does.
 

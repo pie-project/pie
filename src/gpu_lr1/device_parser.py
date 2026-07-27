@@ -552,6 +552,113 @@ def _count_kernel(
 
 
 @triton.jit
+def _history_kernel(
+    lexer_state_ptr,
+    stack_ptr,
+    stack_depth_ptr,
+    config_count_ptr,
+    slot_ptr,
+    hist_lexer_ptr,
+    hist_stack_ptr,
+    hist_depth_ptr,
+    hist_count_ptr,
+    ROWS: tl.constexpr,
+    CONFIGS: tl.constexpr,
+    STACK_STRIDE: tl.constexpr,
+    DEPTH: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Keep this step's parse state so a later one can be undone.
+
+    Speculative decoding advances through a draft and then keeps only the prefix
+    the model accepted, so the parser has to go back - and going back by asking
+    the host to replay the tokens is the round trip this design exists not to
+    make.
+
+    The slot to write is read from the device rather than passed in, which is
+    what lets the advance stay inside a CUDA graph: a graph records the
+    arguments it was given, so a slot that arrived as a scalar would be frozen
+    at whatever it was when the recording was made.
+    """
+    row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    live = row < ROWS
+    slot = tl.load(slot_ptr) % DEPTH
+    at = slot * ROWS
+    tl.store(
+        hist_lexer_ptr + at + row,
+        tl.load(lexer_state_ptr + row, mask=live, other=0),
+        mask=live,
+    )
+    tl.store(
+        hist_depth_ptr + at + row,
+        tl.load(stack_depth_ptr + row, mask=live, other=1),
+        mask=live,
+    )
+    counted = row < ROWS // CONFIGS
+    tl.store(
+        hist_count_ptr + slot * (ROWS // CONFIGS) + row,
+        tl.load(config_count_ptr + row, mask=counted, other=1),
+        mask=counted,
+    )
+    for start in range(0, STACK_STRIDE):
+        tl.store(
+            hist_stack_ptr + (at + row) * STACK_STRIDE + start,
+            tl.load(stack_ptr + row * STACK_STRIDE + start, mask=live, other=0),
+            mask=live,
+        )
+
+
+@triton.jit
+def _restore_kernel(
+    lexer_state_ptr,
+    stack_ptr,
+    stack_depth_ptr,
+    config_count_ptr,
+    widest_ptr,
+    hist_lexer_ptr,
+    hist_stack_ptr,
+    hist_depth_ptr,
+    hist_count_ptr,
+    slot,
+    ROWS: tl.constexpr,
+    CONFIGS: tl.constexpr,
+    STACK_STRIDE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Put a kept parse state back. The slot is known on the host here.
+
+    Unlike the advance, a rollback is not part of a captured decode step - it
+    happens when a draft is rejected, which the host already knows about - so
+    the slot may be an argument.
+    """
+    row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    live = row < ROWS
+    at = slot * ROWS
+    tl.store(
+        lexer_state_ptr + row,
+        tl.load(hist_lexer_ptr + at + row, mask=live, other=0),
+        mask=live,
+    )
+    tl.store(
+        stack_depth_ptr + row,
+        tl.load(hist_depth_ptr + at + row, mask=live, other=1),
+        mask=live,
+    )
+    counted = row < ROWS // CONFIGS
+    counts = tl.load(
+        hist_count_ptr + slot * (ROWS // CONFIGS) + row, mask=counted, other=1
+    )
+    tl.store(config_count_ptr + row, counts, mask=counted)
+    tl.atomic_max(widest_ptr, tl.max(tl.where(counted, counts, 1)))
+    for start in range(0, STACK_STRIDE):
+        tl.store(
+            stack_ptr + row * STACK_STRIDE + start,
+            tl.load(hist_stack_ptr + (at + row) * STACK_STRIDE + start, mask=live, other=0),
+            mask=live,
+        )
+
+
+@triton.jit
 def _snapshot_kernel(
     lexer_state_ptr,
     stack_ptr,
@@ -2013,14 +2120,14 @@ class DeviceGrammar:
         """What the grammars in the pool actually take up."""
         return sum(self._used.values()) * 4
 
-    def new_batch(self, batch: int) -> "DeviceBatch":
-        return DeviceBatch(self, batch)
+    def new_batch(self, batch: int, rollback: int = 0) -> "DeviceBatch":
+        return DeviceBatch(self, batch, rollback)
 
 
 class DeviceBatch:
     """Per-sequence parser state, in device memory."""
 
-    def __init__(self, grammar: DeviceGrammar, batch: int):
+    def __init__(self, grammar: DeviceGrammar, batch: int, rollback: int = 0):
         self.grammar = grammar
         self.batch = batch
         self.configs = grammar.max_configs
@@ -2133,6 +2240,71 @@ class DeviceBatch:
         self.found = torch.full(
             (rows,), _NO_GROUP, dtype=torch.int32, device="cuda"
         )
+
+        # How many steps of parse state to keep so they can be undone.
+        #
+        # Zero by default because it is not free: one kept step is the same size
+        # as the live state, which at batch 512 with 128 configurations is 67 MB.
+        # Speculative decoding is what needs it - advance through a draft, then
+        # keep only the prefix the model accepted - and a decode loop that does
+        # not speculate should not pay for it.
+        self.rollback_depth = rollback
+        self.history_length = 0
+        if rollback > 0:
+            self.hist_lexer = torch.zeros(
+                rollback * rows, dtype=torch.int32, device="cuda"
+            )
+            self.hist_depth = torch.ones(
+                rollback * rows, dtype=torch.int32, device="cuda"
+            )
+            self.hist_stack = torch.zeros(
+                rollback * rows * grammar.max_stack, dtype=torch.int32, device="cuda"
+            )
+            self.hist_count = torch.ones(
+                rollback * batch, dtype=torch.int32, device="cuda"
+            )
+            # On the device, so that a captured advance stays valid: a graph
+            # records the arguments it was launched with, and a slot passed as a
+            # scalar would be frozen at whatever it was when it was recorded.
+            self.hist_slot = torch.zeros(1, dtype=torch.int32, device="cuda")
+
+    def rollback(self, steps: int) -> None:
+        """Undo `steps` advances, putting the parse state back where it was.
+
+        The state comes from the ring the advance has been filling, so nothing
+        is replayed and the host says only how far to go - which it already
+        knows, since it is the one that decided the draft was rejected.
+        """
+        if steps <= 0:
+            return
+        if self.rollback_depth == 0:
+            raise ValueError(
+                "this batch keeps no history; construct it with rollback=k"
+            )
+        if steps > self.history_length:
+            raise ValueError(
+                f"cannot undo {steps} advances; only {self.history_length} are kept"
+            )
+        rows = self.batch * self.configs
+        slot = (int(self.hist_slot.item()) - steps) % self.rollback_depth
+        _restore_kernel[((rows + 255) // 256,)](
+            self.lexer_state,
+            self.stack,
+            self.depth,
+            self.config_count,
+            self.widest,
+            self.hist_lexer,
+            self.hist_stack,
+            self.hist_depth,
+            self.hist_count,
+            slot,
+            ROWS=rows,
+            CONFIGS=self.configs,
+            STACK_STRIDE=self.grammar.max_stack,
+            BLOCK=256,
+        )
+        self.hist_slot.fill_(slot)
+        self.history_length -= steps
 
     def set_grammars(self, ids) -> None:
         """Say which grammar each sequence is under, and reset it to that start.
@@ -2305,13 +2477,30 @@ class DeviceBatch:
         parser itself faster removes it.
         """
         self.token.copy_(tokens.to(torch.int32).reshape(-1)[: self.batch])
+        if self.rollback_depth > 0:
+            self.history_length = min(self.history_length + 1, self.rollback_depth)
         if self.advance_graph is not None and self.recorded == self.grammar.revision:
             self.advance_graph.replay()
             return
         self._advance()
 
     def capture_advance(self) -> None:
-        """Record the advance too, so a decode step launches two graphs."""
+        """Record the advance too, so a decode step launches two graphs.
+
+        Warming up and recording both *run* the advance, four times over, and an
+        advance moves the parse. Leaving that in place would mean capturing
+        silently consumed four tokens - which nothing noticed while callers
+        happened to load their state afterwards, and which is wrong the moment
+        one does not. The live state is put back afterwards, and the history the
+        rehearsal wrote is discarded with it.
+        """
+        held = (
+            self.lexer_state.clone(),
+            self.stack.clone(),
+            self.depth.clone(),
+            self.config_count.clone(),
+            self.widest.clone(),
+        )
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
@@ -2323,11 +2512,38 @@ class DeviceBatch:
         with torch.cuda.graph(self.advance_graph):
             self._advance()
 
+        self.lexer_state.copy_(held[0])
+        self.stack.copy_(held[1])
+        self.depth.copy_(held[2])
+        self.config_count.copy_(held[3])
+        self.widest.copy_(held[4])
+        if self.rollback_depth > 0:
+            self.hist_slot.zero_()
+            self.history_length = 0
+
     def _advance(self) -> None:
         grammar = self.grammar
         self.cand_valid.zero_()
         self.found.fill_(_NO_GROUP)
         rows = self.batch * self.configs
+        if self.rollback_depth > 0:
+            _history_kernel[((rows + 255) // 256,)](
+                self.lexer_state,
+                self.stack,
+                self.depth,
+                self.config_count,
+                self.hist_slot,
+                self.hist_lexer,
+                self.hist_stack,
+                self.hist_depth,
+                self.hist_count,
+                ROWS=rows,
+                CONFIGS=self.configs,
+                STACK_STRIDE=grammar.max_stack,
+                DEPTH=self.rollback_depth,
+                BLOCK=256,
+            )
+            self.hist_slot += 1
         # One entry per live configuration, enumerated the way the fill
         # enumerates its groups. Sizing the grid by the width instead meant a
         # recorded advance was only valid while the parse stayed that wide, and
