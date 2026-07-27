@@ -1350,3 +1350,110 @@ fn a_contract_request_with_no_checkpoint_is_rejected() {
 fn closing_a_null_checkpoint_is_a_no_op() {
     unsafe { super::entry::pie_loader_close_checkpoint(std::ptr::null_mut()) };
 }
+
+/// The mirror enums exist to pin the C discriminants, and nothing checked that.
+///
+/// `PieLoaderDType` is not `DType` written twice. It is `DType`'s *wire
+/// numbering*, held still while the Rust enum is free to be reordered for
+/// reading. `766e9b029` is the proof: it inserted `E8M0` at position 5 of
+/// `DType`, next to the other float formats where it belongs, and appended it
+/// at 12 here, because 5 through 11 were already spoken for by drivers. The
+/// `From` impls map by *name*, so that divergence is not a bug; it is the
+/// mechanism.
+///
+/// The compiler already refuses a variant added to the Rust enum and not to the
+/// mirror — the `From` match stops being exhaustive. What it cannot see is
+/// someone tidying the mirror to match the original, which renumbers seven
+/// dtypes under every driver built against the old header and compiles
+/// perfectly. These assertions are the numbering itself, written down. A
+/// variant appended with the next free number needs a line added here; an
+/// existing line that has to *change* means the ABI broke.
+#[test]
+fn mirror_enum_discriminants_are_pinned() {
+    // PieLoaderBackendKind
+    assert_eq!(PieLoaderBackendKind::Cuda as u32, 0);
+    assert_eq!(PieLoaderBackendKind::Metal as u32, 1);
+    assert_eq!(PieLoaderBackendKind::Unknown as u32, 255);
+
+    // PieLoaderDType
+    assert_eq!(PieLoaderDType::F32 as u32, 0);
+    assert_eq!(PieLoaderDType::F16 as u32, 1);
+    assert_eq!(PieLoaderDType::BF16 as u32, 2);
+    assert_eq!(PieLoaderDType::F8E4M3 as u32, 3);
+    assert_eq!(PieLoaderDType::F8E5M2 as u32, 4);
+    assert_eq!(PieLoaderDType::I32 as u32, 5);
+    assert_eq!(PieLoaderDType::I16 as u32, 6);
+    assert_eq!(PieLoaderDType::I8 as u32, 7);
+    assert_eq!(PieLoaderDType::U32 as u32, 8);
+    assert_eq!(PieLoaderDType::U16 as u32, 9);
+    assert_eq!(PieLoaderDType::U8 as u32, 10);
+    assert_eq!(PieLoaderDType::Bool as u32, 11);
+    assert_eq!(PieLoaderDType::E8M0 as u32, 12);
+
+    // PieLoaderEncodingKind
+    assert_eq!(PieLoaderEncodingKind::Raw as u32, 0);
+    assert_eq!(PieLoaderEncodingKind::Quant as u32, 1);
+
+    // PieLoaderQuantScheme
+    assert_eq!(PieLoaderQuantScheme::None as u32, 0);
+    assert_eq!(PieLoaderQuantScheme::Fp8E4M3 as u32, 1);
+    assert_eq!(PieLoaderQuantScheme::Fp8E5M2 as u32, 2);
+    assert_eq!(PieLoaderQuantScheme::Int8Symmetric as u32, 3);
+    assert_eq!(PieLoaderQuantScheme::Int8Asymmetric as u32, 4);
+    assert_eq!(PieLoaderQuantScheme::AwqInt4 as u32, 5);
+    assert_eq!(PieLoaderQuantScheme::GptqInt4 as u32, 6);
+    assert_eq!(PieLoaderQuantScheme::Mxfp4E2M1E8M0 as u32, 7);
+    assert_eq!(PieLoaderQuantScheme::MlxAffineU4 as u32, 8);
+    assert_eq!(PieLoaderQuantScheme::GgufQ4_0 as u32, 9);
+    assert_eq!(PieLoaderQuantScheme::GgufQ4K as u32, 10);
+    assert_eq!(PieLoaderQuantScheme::GgufQ5_0 as u32, 11);
+    assert_eq!(PieLoaderQuantScheme::GgufQ5K as u32, 12);
+    assert_eq!(PieLoaderQuantScheme::GgufQ8_0 as u32, 13);
+
+    // PieLoaderRepackLayout
+    assert_eq!(PieLoaderRepackLayout::None as u32, 0);
+    assert_eq!(PieLoaderRepackLayout::MarlinMxfp4Weight as u32, 1);
+    assert_eq!(PieLoaderRepackLayout::MarlinMxfp4Scale as u32, 2);
+    assert_eq!(PieLoaderRepackLayout::DenseRowGather as u32, 3);
+
+    // PieLoaderRowMap
+    assert_eq!(PieLoaderRowMap::Identity as u32, 0);
+    assert_eq!(PieLoaderRowMap::Even as u32, 1);
+    assert_eq!(PieLoaderRowMap::Odd as u32, 2);
+
+    // PieLoaderStorageInstrKind
+    assert_eq!(PieLoaderStorageInstrKind::Allocate as u32, 0);
+    assert_eq!(PieLoaderStorageInstrKind::ExtentWrite as u32, 1);
+    assert_eq!(PieLoaderStorageInstrKind::TileMap as u32, 2);
+    assert_eq!(PieLoaderStorageInstrKind::CreateView as u32, 3);
+    assert_eq!(PieLoaderStorageInstrKind::Finalize as u32, 5);
+    assert_eq!(PieLoaderStorageInstrKind::BulkExtentWrite as u32, 6);
+    assert_eq!(PieLoaderStorageInstrKind::SlabScatter as u32, 7);
+    assert_eq!(PieLoaderStorageInstrKind::Fill as u32, 8);
+
+    // PieLoaderTileMapKind
+    assert_eq!(PieLoaderTileMapKind::Cast as u32, 0);
+    assert_eq!(PieLoaderTileMapKind::Decode as u32, 1);
+    assert_eq!(PieLoaderTileMapKind::Encode as u32, 2);
+    assert_eq!(PieLoaderTileMapKind::Transcode as u32, 3);
+    assert_eq!(PieLoaderTileMapKind::Reblock as u32, 4);
+    assert_eq!(PieLoaderTileMapKind::Repack as u32, 6);
+    assert_eq!(PieLoaderTileMapKind::None as u32, 7);
+
+    // PieLoaderTransformFusion
+    assert_eq!(PieLoaderTransformFusion::None as u32, 0);
+    assert_eq!(PieLoaderTransformFusion::Fp8ToMxfp4 as u32, 1);
+
+    // PieLoaderQuantGranularity
+    assert_eq!(PieLoaderQuantGranularity::PerChannel as u32, 0);
+    assert_eq!(PieLoaderQuantGranularity::PerGroup as u32, 1);
+
+    // PieLoaderScaleForm
+    assert_eq!(PieLoaderScaleForm::RawE8M0 as u32, 0);
+    assert_eq!(PieLoaderScaleForm::F32Factors as u32, 1);
+
+    // PieLoaderCheckpointFormat
+    assert_eq!(PieLoaderCheckpointFormat::Safetensors as u32, 0);
+    assert_eq!(PieLoaderCheckpointFormat::Gguf as u32, 1);
+    assert_eq!(PieLoaderCheckpointFormat::Unknown as u32, 2);
+}
