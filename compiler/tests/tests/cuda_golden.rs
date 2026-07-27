@@ -477,9 +477,14 @@ fn emit_driver_test_kernel_fixtures() {
             unbindable.push(format!("{name}: container does not decode"));
             continue;
         };
-        let Ok(bound) = bind(container, msl_corpus::golden_profile(&name)) else {
-            unbindable.push(format!("{name}: does not bind against today's profile"));
-            continue;
+        let bound = match bind(container, msl_corpus::golden_profile(&name)) {
+            Ok(bound) => bound,
+            Err(error) => {
+                unbindable.push(format!(
+                    "{name}: does not bind against today's profile: {error:?}"
+                ));
+                continue;
+            }
         };
         let stages = pie_plan::compile_bound(&bound);
         let kernels = emit_program(Backend::Cuda, &stages, &bound);
@@ -504,9 +509,9 @@ fn emit_driver_test_kernel_fixtures() {
 
     // A vendored trace that no longer binds is drift, not a missing feature:
     // `driver/cuda/tests/golden-ptir/` is a partial copy of
-    // `compiler/tests/golden/` and the two have diverged. The C++ tests that
-    // register these will fail loudly for want of a fixture, which is the
-    // correct outcome -- but say so here, where the cause is visible.
+    // `compiler/tests/golden/` and the two can diverge. The C++ tests that
+    // register these fail for want of a fixture, which is the correct outcome
+    // -- but say so here, where the cause is visible.
     // `ptir-refactor.md` §4.3: the vendored copy should not survive as a second
     // source of truth for traces.
     // `neg_*` are the reject cases; not binding is what they are for.
@@ -517,8 +522,14 @@ fn emit_driver_test_kernel_fixtures() {
     for reason in &drifted {
         eprintln!("[driver kernel fixtures] skipped {reason}");
     }
+    // Zero, not a tolerance. The last survivor was `staged_dispatch`, and it
+    // had not drifted at all -- `golden_profile` was guessing vocab 8 for a
+    // trace whose `Logits` is `[1, 4]`. A tolerance let that read as decay for
+    // as long as the C++ test that needs the fixture was failing for other
+    // reasons.
     assert!(
-        drifted.len() <= 3,
-        "more vendored driver traces have drifted than the known set: {drifted:?}"
+        drifted.is_empty(),
+        "vendored driver traces no longer bind: {drifted:?}"
     );
 }
+

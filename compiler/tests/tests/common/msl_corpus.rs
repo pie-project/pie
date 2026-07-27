@@ -81,6 +81,10 @@ pub fn golden_profile(name: &str) -> ModelProfile {
         | "neg_spsc_second_producer"
         | "section3_masked_gumbel"
         | "structured_masks" => {}
+        // Vendored-only trace (no compiler golden): its `Logits` is `[1, 4]`,
+        // so it binds at vocab 4 and nowhere else. It did not "drift" -- the
+        // profile was being guessed at 8 by the catch-all below.
+        "staged_dispatch" => profile.vocab = 4,
         "beam_epilogue" => {
             profile.vocab = 8;
             profile.page_size = 4;
