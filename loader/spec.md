@@ -28,11 +28,13 @@ There is exactly one question that decides where this boundary goes:
 | **loader** | file layout, storage bandwidth, memory budget, DMA engine     | *how* the bytes get there    |
 | **either** | —                                                             | **neither needs the model family** |
 
-The last row is the load-bearing one. `loader/src/abi/arch.rs` used to carry a
-13-field `ArchProfile` keyed by `model_type`, and every field existed because one
-side had to guess something the other side knew. The driver declares what it
-wants now, so there is nothing left to infer, and the table is deleted — along
-with the rest of `arch/`.
+The last row is the load-bearing one. The historical `loader/src/abi/arch.rs`
+used to carry a 13-field `ArchProfile` keyed by `model_type`, and every field
+existed because one side had to guess something the other side knew. The
+driver declares what it wants now in
+`driver/{cuda,metal}/src/model/<family>/<family>_contract.hpp`, so there is
+nothing left to infer, and the table is deleted — along with the rest of
+`arch/`.
 
 Two corollaries that fall out of the principle and are worth stating up front,
 because they kill concepts that look load-bearing:
@@ -56,22 +58,22 @@ because they kill concepts that look load-bearing:
 Every transformation the current tree performs, enumerated. The design is only
 credible if it covers all of them.
 
-| #  | Case                                          | Where it lives today                              |
+| #  | Case                                          | Current owner / historical evidence               |
 | -- | --------------------------------------------- | ------------------------------------------------- |
-| 1  | Verbatim copy                                 | `RuntimeTensorSource::DirectTensor`               |
-| 2  | Rename                                        | `abi/metal.rs` `metal_qwen35_runtime_name`        |
-| 3  | Concat (q,k,v → qkv)                          | `abi/fusion.rs`, `Join { axis }`                  |
-| 4  | Split (qkv → q,k,v)                           | `abi/phi3.rs`, `ByteSpans`                        |
-| 5  | Tensor-parallel shard                         | `Shard` (was `Sharding` + `shard_axis`)           |
-| 6  | Expert stack (`[I,H]`×E → `[E,2I,H]`)         | `abi/qwen_moe.rs` `add_qwen_moe_expert_stacks`    |
-| 7  | Nested shard-inside-concat                    | `abi/qwen_moe.rs` `add_fused_moe_gate_up_tp_slices` |
-| 8  | Strided select (even/odd rows)                | `RowMap::{Even,Odd}`                              |
-| 9  | Zero pad to a kernel-friendly multiple        | `RepackSpec.valid_rows` vs `.target_rows`         |
-| 10 | View into another output (bank + views)       | `RuntimeTensorSource::SelectContract`             |
-| 11 | Alias (tied embedding / lm_head)              | ad-hoc                                            |
-| 12 | Hardware swizzle (Marlin MXFP4)               | `RepackSpec` (11 fields)                          |
-| 13 | Load-time quantization                        | `abi.rs` `push_runtime_quant`                     |
-| 14 | Quant triplet (weight / scale / bias)         | `abi/gpt_oss.rs`, `abi/metal.rs`                  |
+| 1  | Verbatim copy                                 | `Expr::Src` in `loader/src/contract.rs`           |
+| 2  | Rename                                        | family contract authors under `driver/{cuda,metal}/src/model/` |
+| 3  | Concat (q,k,v → qkv)                          | `driver/cuda/src/model/contract.hpp` `dense_fused_projection_joins` |
+| 4  | Split (qkv → q,k,v)                           | `driver/cuda/src/model/llama_like/llama_like_contract.hpp` `phi3_qkv_split` |
+| 5  | Tensor-parallel shard                         | `Expr::Shard` (was `Sharding` + `shard_axis`)     |
+| 6  | Expert stack (`[I,H]`×E → `[E,2I,H]`)         | family contract authors under `driver/cuda/src/model/` |
+| 7  | Nested shard-inside-concat                    | family contract authors under `driver/cuda/src/model/` |
+| 8  | Strided select (even/odd rows)                | `RowMap::{Even,Odd}` in `loader/src/types.rs`     |
+| 9  | Zero pad to a kernel-friendly multiple        | `Expr::Pad`; lowered with `StorageInstr::Fill`    |
+| 10 | View into another output (bank + views)       | `Expr::Out`                                      |
+| 11 | Alias (tied embedding / lm_head)              | `Expr::Out`                                      |
+| 12 | Hardware swizzle (Marlin MXFP4)               | `RepackSpec` in `loader/src/types.rs`             |
+| 13 | Load-time quantization                        | `driver/cuda/src/model/contract.hpp` `push_runtime_quant` |
+| 14 | Quant triplet (weight / scale / bias)         | `Encoding::Quant` contracts plus `QuantAttachment` |
 
 Two observations decide the shape of the algebra:
 
@@ -107,7 +109,8 @@ Eight constructors, plus two explicitly-labelled escape hatches.
 
 `Src` and `Out` are separate on purpose. A single `Ref` with a resolution order
 looks tidier, but contracts routinely re-publish checkpoint names — a bank plus
-views under the *original* names (`abi/nemotron.rs:154-172`) — so one namespace
+views under the *original* names (historical `abi/nemotron.rs:154-172`; now
+`driver/cuda/src/model/nemotron_h/nemotron_h_contract.hpp`) — so one namespace
 would make "the file's `q_proj`" versus "my `q_proj`" depend on declaration
 order. Making the distinction explicit costs one leaf variant and removes the
 whole class of question. Because `Out` may only name an *earlier* entry, the DAG
@@ -225,8 +228,9 @@ a `[2048, 6144]` weight — is one run per row, 2048 of them. Charging 2048 for
 it would be wrong by three orders of magnitude, because every row has the same
 length and both the source and the destination advance by a fixed stride. The
 executor issues that as **one** strided copy, and the low IR already says so:
-`load_plan::StridedExtent` carries a `DimSpec { count, src_stride, dst_stride }`
-per loop level.
+`crate::extent::Extent` carries `Dim { count, src_stride, dst_stride }` per
+loop level, and `Rect::split` is the single place that enforces the
+dense-destination rule.
 
 So the runs are folded back into loop nests before anything is counted. The
 fold is a repeated sweep over the run list: find maximal consecutive groups of
@@ -308,16 +312,18 @@ Cat_a   ∘ Slice_a     ≡  Slice_a ∘ Cat_a                            (when 
 Quantize_{axis=a} ∘ Cat_a  ≡  Cat_a ∘ Quantize_{axis=a}
 ```
 
-The third one is not academic. `abi.rs:592` sets `channel_axis: Some(Axis(0))`
-for both `Fp8E4M3` and `Int8Symmetric` — scales are per output channel, which is
-the same axis q/k/v are concatenated along. So quantization commutes with the
-fusion, meaning the loader may quantize *during* the read instead of staging
-BF16 first.
+The third one is not academic.
+`driver/cuda/src/model/contract.hpp::push_runtime_quant` states per-row
+quantization with `channel_axis: Some(Axis(0))` for FP8 and INT8 — scales are
+per output channel, which is the same axis q/k/v are concatenated along. So
+quantization commutes with the fusion, meaning the loader may quantize
+*during* the read instead of staging BF16 first.
 
-That in turn proves something about the current code: `abi/fusion.rs:28-33`
-bails out of fusion entirely when `runtime_quant_enabled`. That was never a
-correctness requirement — it is a **missed optimization**, and the present
-design has no vocabulary in which to even ask the question.
+That in turn proves something about the old code: historical
+`abi/fusion.rs:28-33` bailed out of fusion entirely when
+`runtime_quant_enabled`. That was never a correctness requirement — it is a
+**missed optimization**, and the present design has no vocabulary in which to
+even ask the question.
 
 ### 3.5 What is deliberately *not* in the algebra
 
@@ -399,13 +405,13 @@ tensor and the loader notices it can alias.
 
 Three places in the current tree independently invented this mechanism:
 
-- `abi/nemotron.rs:123-172` — a packed bank plus `SelectContract` views.
-- `abi.rs:392-424` `coalesce_direct_row_shards` — a row-shard bank plus views.
+- historical `abi/nemotron.rs:123-172` — a packed bank plus `SelectContract` views.
+- `loader/src/contract/rewrite.rs::coalesce_direct_row_shards` — a row-shard bank plus views.
 - `driver/cuda/src/loader/tensor_spec.hpp` — `TensorDecl` grew
   `backing_tensor` / `view_axis` / `view_start` / `view_length` on the C++ side.
 
 A fourth existed in the deleted `semantic.rs` (`SemanticGraph { tensors, groups }`).
-`abi/fusion.rs:105-119` is the outlier that pushes a `Join` and *no* views,
+historical `abi/fusion.rs:105-119` is the outlier that pushes a `Join` and *no* views,
 which is exactly why `bind_projection_or_fused_view`
 (`driver/cuda/src/model/llama_like/qwen3.cpp:24-56`, 32 lines) has to
 re-derive q/k/v offsets from `HfConfig` in C++.
@@ -434,10 +440,10 @@ TensorContract::new(
 )
 ```
 
-This combination is **impossible to express today**. `abi/fusion.rs:28-33`
-abandons fusion if *any* of `tp_size != 1`, `runtime_quant_enabled`, or
-`profile().skip_dense_qkv_fusion` holds. Three independent refusals, all of
-which are composition in the algebra.
+This combination used to be impossible to express. Historical `abi/fusion.rs:28-33`
+abandoned fusion if *any* of `tp_size != 1`, `runtime_quant_enabled`, or
+`profile().skip_dense_qkv_fusion` held. Three independent refusals became plain
+composition in the algebra.
 
 Phi-3 is the same declaration read in the other direction — the checkpoint ships
 one fused qkv and the driver wants three tensors:
@@ -450,7 +456,9 @@ TensorContract::new("…k_proj.weight", Expr::src("…qkv_proj.weight").slice(0,
 TensorContract::new("…v_proj.weight", Expr::src("…qkv_proj.weight").slice(0, Hq+Hk, Hk), vec![Hk, H], bf16)
 ```
 
-`abi/phi3.rs` and the `phi3_fused_splits` profile flag both evaporate.
+Historical `abi/phi3.rs` and the `phi3_fused_splits` profile flag both
+evaporated; the current split author is
+`driver/cuda/src/model/llama_like/llama_like_contract.hpp`.
 
 ---
 
@@ -458,7 +466,7 @@ TensorContract::new("…v_proj.weight", Expr::src("…qkv_proj.weight").slice(0,
 
 | Deleted                                                       | Lines | Why                                                        |
 | ------------------------------------------------------------- | ----: | ---------------------------------------------------------- |
-| `loader/src/abi/arch.rs` — `ArchProfile`, 13 fields            |   174 | **done** — nothing left to infer from `model_type`; `arch.rs` + `arch/` are deleted whole (2,110 lines) |
+| historical `loader/src/abi/arch.rs` — `ArchProfile`, 13 fields |   174 | **done** — nothing left to infer from `model_type`; `arch.rs` + `arch/` are deleted whole (2,110 lines) |
 | `skip_dense_qkv_fusion`                                        |     — | a C++ binder gap encoded as an architecture property        |
 | `phi3_fused_splits`                                            |    94 | the same declaration in the opposite direction              |
 | `bind_projection_or_fused_view` (C++)                          |    32 | views are published by the loader for free                  |
@@ -510,11 +518,10 @@ leaving only the `layout` enum.
   skip?
 - **`Pad`'s fill value.** Zero everywhere today. Parameterize, or fix at zero
   until something needs otherwise?
-- **`Pad` has no instruction to lower to.** The storage program has no `Fill`,
-  and no `BufferDecl` flag that says "hand me this zeroed", so the frontend
-  rejects any expression whose lowering needs one. Adding it touches the FFI
-  POD surface and both drivers' executors. Nothing in production pads today;
-  the algebra is ahead of the runtime here on purpose.
+- **`Pad` lowers to `StorageInstr::Fill`.** The storage program now has a
+  `Fill { id, buffer }` instruction (`loader/src/plan/mod.rs:421`), CUDA executes
+  it with `cudaMemsetAsync`, and `plan/passes/rewrite.rs::validate_fill_order`
+  guarantees it precedes every write to the buffer it zeroes.
 - **A copy that skips in the destination.** Both executors require a compact
   `dest.stride`, which is what forces §3.3's third folding rule. Teaching them
   a scattering write would let a padded tensor, and a concatenation on any axis
@@ -522,7 +529,7 @@ leaving only the `layout` enum.
 - **`Reshape` of a quantized tensor is rejected for now** (§3.2), on the grounds
   that no production case needs it and that a row-major reinterpretation is not
   a byte identity once elements are packed into blocks. If a case appears, the
-  rule to define is its interaction with `QuantSpec.block_shape`.
+  rule to define is its interaction with `QuantSpec::{group_size, channel_axis}`.
 - **Where the `-1` wildcard in `Reshape` belongs.** Implemented for ergonomics,
   but it weakens the "declaration is a proof obligation" property slightly: an
   inferred extent cannot disagree with anything. Possibly it should only be
@@ -540,8 +547,8 @@ leaving only the `layout` enum.
 | Lowering the affine fragment to runs | **done** — `loader/src/contract/compile.rs`, 26 tests |
 | Folding runs into strided loop nests (§3.3) | **done** — `Lowering::{pieces, copy_pieces, needs_zero_fill}` |
 | The cost model and the DMA-vs-gather choice | **done** — `Lowering::cost`; `compile`'s `max_runs` is a compile-time guard, not the cost |
-| The HIGH IR node the fragment lowers to | **done** — `ir::LayoutExpr::Gather`; eight affine variants deleted with it |
-| Wiring the loader's frontend, optimizer, type checker, planner and evaluator onto it | **done** — `loader/tests/algebra.rs`, 13 tests |
+| Direct lowering to instructions | **done** — `plan/build.rs` consumes `Lowering` directly; `LayoutExpr` / `LayoutPlan` are deleted |
+| Wiring the loader's compiler, pass pipeline and evaluator onto it | **done** — `loader/tests/algebra.rs`, 13 tests |
 | Porting `arch/`'s six passes onto declarations | **done** — all six emitted `Expr`, and then all six were deleted: with the contract stated, each was a way of computing an expression the contract already contains |
 | Retiring the loader's `config.json` read | **done** — the driver states the facts it needs as arguments to `author_model_contract`; `config.rs` and `parse_model_config` are deleted |
 | Moving *authorship* to C++ | **done** — per family, beside its forward pass, reached through the arch table's `author_contract` hook; checked by diffing 2,240 plans and cache keys against the Rust author, then 19,152 contracts against the single-header C++ author, 0 differences |
@@ -570,7 +577,7 @@ hoping failed. None of them survive a world where the author names the tensor it
 intends to bind.
 
 `verify`'s contract check keeps its meaning, and gains one. It was always worth
-running because the author and the `frontend → optimizer → planner` pipeline are
+running because the author and the `contract → plan/build → plan/passes` pipeline are
 different code, so a bug in the second cannot hide in the first. Now the two are
 in different *languages* and on opposite sides of the ABI — and the case it
 newly covers is §6.2's: a plan restored from an artifact another rank or another
@@ -603,9 +610,9 @@ expression in the oracle set goes through both.
 table, including the one that matters most — a 2048-run row shard costing 1.
 
 One layer down, the same expressions are checked again in *bytes*.
-`loader/tests/algebra.rs` compiles each one into a real `LayoutExpr::Gather`,
-runs the plan through the type checker and the optimizer, replays it with the
-reference evaluator, and compares against a hand-written per-coordinate model
+`loader/tests/algebra.rs` compiles each one into a real `LoadPlan`, runs the
+plan through the pass pipeline, replays it with `host_executor`, and compares
+against a hand-written per-coordinate model
 of the same expression. Everything above this point reasons in elements, so a
 scaling mistake at the element/byte boundary would otherwise survive every
 check in §9.1 — and one did, until this test found it.

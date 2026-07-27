@@ -81,7 +81,7 @@ impl<'a> Sources<'a> {
     }
 }
 
-impl crate::contract::CheckpointTypes for Sources<'_> {
+impl crate::contract::infer::CheckpointTypes for Sources<'_> {
     fn tensor_type(&self, name: &str) -> Option<crate::contract::TensorType> {
         self.by_name(name).map(|raw| crate::contract::TensorType {
             shape: raw.shape.clone(),
@@ -90,7 +90,7 @@ impl crate::contract::CheckpointTypes for Sources<'_> {
     }
 }
 
-impl crate::contract::CheckpointTypes for CheckpointMetadata {
+impl crate::contract::infer::CheckpointTypes for CheckpointMetadata {
     fn tensor_type(&self, name: &str) -> Option<crate::contract::TensorType> {
         self.tensor_by_name(name)
             .map(|raw| crate::contract::TensorType {

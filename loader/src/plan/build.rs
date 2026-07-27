@@ -31,7 +31,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::checkpoint::{CheckpointMetadata, RawTensor, Sources};
 use crate::contract::compile::{Leaf, Lowering, compile};
-use crate::contract::{Expr, ModelContract, Resolver, TensorContract, TensorType};
+use crate::contract::infer::Resolver;
+use crate::contract::{Expr, ModelContract, TensorContract, TensorType};
 use crate::error::{Error, Result};
 use crate::extent::Extent;
 use crate::plan::geometry::{

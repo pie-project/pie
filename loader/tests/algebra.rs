@@ -12,7 +12,8 @@
 use std::collections::HashMap;
 
 use pie_loader::contract::compile::{Leaf, Lowering, Run, RunSource, compile};
-use pie_loader::contract::{CheckpointTypes, Expr, TensorType, infer_type};
+use pie_loader::contract::infer::{CheckpointTypes, infer_type};
+use pie_loader::contract::{Expr, TensorType};
 use pie_loader::reference::{TensorValue, replay};
 use pie_loader::types::{DType, Encoding, TensorDecl, TensorId};
 

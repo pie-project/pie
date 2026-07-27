@@ -13,7 +13,8 @@
 
 use std::collections::HashMap;
 
-use super::{Checked, Expr};
+use super::Expr;
+use super::infer::Checked;
 use crate::error::Error;
 use crate::extent::{Dim, Rect};
 use crate::types::Encoding;
@@ -855,9 +856,8 @@ fn flatten(coord: &Coord, shape: &[i64]) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::{
-        Checked, CheckpointTypes, ModelContract, Resolver, TensorContract, TensorType, infer_type,
-    };
+    use crate::contract::infer::{Checked, CheckpointTypes, Resolver, infer_type};
+    use crate::contract::{ModelContract, TensorContract, TensorType};
     use crate::types::{Axis, DType, QuantScheme, QuantSpec};
 
     struct Fake(HashMap<String, TensorType>);
