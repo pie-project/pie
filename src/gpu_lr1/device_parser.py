@@ -557,6 +557,7 @@ def _history_kernel(
     stack_ptr,
     stack_depth_ptr,
     config_count_ptr,
+    live_offsets_ptr,
     slot_ptr,
     hist_lexer_ptr,
     hist_stack_ptr,
@@ -566,7 +567,6 @@ def _history_kernel(
     CONFIGS: tl.constexpr,
     STACK_STRIDE: tl.constexpr,
     DEPTH: tl.constexpr,
-    BLOCK: tl.constexpr,
 ):
     """Keep this step's parse state so a later one can be undone.
 
@@ -580,32 +580,42 @@ def _history_kernel(
     arguments it was given, so a slot that arrived as a scalar would be frozen
     at whatever it was when the recording was made.
     """
-    row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    live = row < ROWS
+    program = tl.program_id(0)
+    programs = tl.num_programs(0)
     slot = tl.load(slot_ptr) % DEPTH
     at = slot * ROWS
-    tl.store(
-        hist_lexer_ptr + at + row,
-        tl.load(lexer_state_ptr + row, mask=live, other=0),
-        mask=live,
-    )
-    tl.store(
-        hist_depth_ptr + at + row,
-        tl.load(stack_depth_ptr + row, mask=live, other=1),
-        mask=live,
-    )
-    counted = row < ROWS // CONFIGS
-    tl.store(
-        hist_count_ptr + slot * (ROWS // CONFIGS) + row,
-        tl.load(config_count_ptr + row, mask=counted, other=1),
-        mask=counted,
-    )
-    for start in range(0, STACK_STRIDE):
+    total = tl.load(live_offsets_ptr + ROWS)
+    lane = tl.arange(0, STACK_STRIDE)
+
+    # Only the configurations in play, and only as deep as they go. Writing
+    # every row to its full stack depth is 67 MB a step at batch 512 with 128
+    # configurations, to preserve the one or two configurations a sequence
+    # actually holds - which took the advance from 133 us to 1,200.
+    item = program
+    while item < total:
+        low = 0
+        high = ROWS - 1
+        while low < high:
+            middle = (low + high + 1) // 2
+            if tl.load(live_offsets_ptr + middle) <= item:
+                low = middle
+            else:
+                high = middle - 1
+        row_index = low
+        depth = tl.load(stack_depth_ptr + row_index)
+        tl.store(hist_lexer_ptr + at + row_index, tl.load(lexer_state_ptr + row_index))
+        tl.store(hist_depth_ptr + at + row_index, depth)
+        sequence = row_index // CONFIGS
         tl.store(
-            hist_stack_ptr + (at + row) * STACK_STRIDE + start,
-            tl.load(stack_ptr + row * STACK_STRIDE + start, mask=live, other=0),
-            mask=live,
+            hist_count_ptr + slot * (ROWS // CONFIGS) + sequence,
+            tl.load(config_count_ptr + sequence),
         )
+        tl.store(
+            hist_stack_ptr + (at + row_index) * STACK_STRIDE + lane,
+            tl.load(stack_ptr + row_index * STACK_STRIDE + lane, mask=lane < depth, other=0),
+            mask=lane < depth,
+        )
+        item = item + programs
 
 
 @triton.jit
@@ -2526,24 +2536,6 @@ class DeviceBatch:
         self.cand_valid.zero_()
         self.found.fill_(_NO_GROUP)
         rows = self.batch * self.configs
-        if self.rollback_depth > 0:
-            _history_kernel[((rows + 255) // 256,)](
-                self.lexer_state,
-                self.stack,
-                self.depth,
-                self.config_count,
-                self.hist_slot,
-                self.hist_lexer,
-                self.hist_stack,
-                self.hist_depth,
-                self.hist_count,
-                ROWS=rows,
-                CONFIGS=self.configs,
-                STACK_STRIDE=grammar.max_stack,
-                DEPTH=self.rollback_depth,
-                BLOCK=256,
-            )
-            self.hist_slot += 1
         # One entry per live configuration, enumerated the way the fill
         # enumerates its groups. Sizing the grid by the width instead meant a
         # recorded advance was only valid while the parse stayed that wide, and
@@ -2569,6 +2561,26 @@ class DeviceBatch:
         # running total across eight thousand words is one multiprocessor doing
         # what thirty could, and measured 16 us against 9.
         torch.cumsum(self.live_counts, 0, out=self.live_offsets[1:])
+        # After the running sum, so the history knows which configurations are
+        # in play: before it, `live_offsets` still describes the previous step.
+        if self.rollback_depth > 0:
+            _history_kernel[(self.sweep_blocks,)](
+                self.lexer_state,
+                self.stack,
+                self.depth,
+                self.config_count,
+                self.live_offsets,
+                self.hist_slot,
+                self.hist_lexer,
+                self.hist_stack,
+                self.hist_depth,
+                self.hist_count,
+                ROWS=rows,
+                CONFIGS=self.configs,
+                STACK_STRIDE=grammar.max_stack,
+                DEPTH=self.rollback_depth,
+            )
+            self.hist_slot += 1
         _snapshot_kernel[(self.sweep_blocks,)](
             self.lexer_state,
             self.stack,
