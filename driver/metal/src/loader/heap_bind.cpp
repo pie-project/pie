@@ -136,10 +136,10 @@ BoundDecode stage_decode_storage(
     index.reset(load_plan);
     for (std::size_t step = 0; step < load_plan.schedule.len; ++step) {
         const auto& instr = index.instruction(load_plan.schedule.ptr[step]);
-        using K = pie_loader::PieLoaderStorageInstrKind;
-        switch (instr.kind) {
-        case K::Allocate: {
-            const auto& decl = index.buffer(instr.buffer_id);
+        using Tag = pie_loader::PieLoaderStorageOp::Tag;
+        switch (instr.op.tag) {
+        case Tag::Allocate: {
+            const auto& decl = index.buffer(instr.op.allocate.buffer_id);
             if (!decl.has_persistent_offset || decl.temporary) {
                 throw std::runtime_error(
                     "metal storage executor requires arena-resident buffers");
@@ -152,47 +152,41 @@ BoundDecode stage_decode_storage(
                     decl.bytes));
             break;
         }
-        case K::ExtentWrite: {
-            if (!instr.has_source || !instr.has_dest) {
-                throw std::runtime_error(
-                    "metal storage executor: ExtentWrite missing source/dest");
-            }
-            const auto target = buffers.find(instr.dest.buffer_id);
+        case Tag::ExtentWrite: {
+            const auto& op = instr.op.extent_write;
+            const auto target = buffers.find(op.dest.buffer_id);
             if (target == buffers.end()) {
                 throw std::runtime_error(
                     "metal storage executor: destination buffer is missing");
             }
             copy_extent(
                 view,
-                instr.source,
-                instr.dest,
+                op.source,
+                op.dest,
                 target->second,
                 load.max_tile_bytes());
             break;
         }
-        case K::BulkExtentWrite: {
-            if (!instr.has_source || !instr.has_dest) {
-                throw std::runtime_error(
-                    "metal storage executor: BulkExtentWrite missing source/dest");
-            }
-            const std::uint64_t offset =
-                instr.dest.offset + instr.dest.stride.base_offset;
+        case Tag::BulkExtentWrite: {
+            const auto& op = instr.op.bulk_extent_write;
+            const std::uint64_t offset = op.dest_offset;
             if (offset > b.weights_region.size ||
-                instr.source.span_bytes > b.weights_region.size - offset) {
+                op.source.span_bytes > b.weights_region.size - offset) {
                 throw std::runtime_error(
                     "metal storage executor: bulk destination is out of bounds");
             }
             view.copy_storage_bytes(
-                instr.source.file_id,
-                instr.source.file_offset + instr.source.stride.base_offset,
-                instr.source.span_bytes,
+                op.source.file_id,
+                op.source.file_offset + op.source.stride.base_offset,
+                op.source.span_bytes,
                 static_cast<std::uint8_t*>(b.weights_region.contents()) + offset,
                 load.max_tile_bytes());
             break;
         }
-        case K::SlabScatter:
-            for (std::size_t i = 0; i < instr.slab_placements.len; ++i) {
-                const auto& placement = instr.slab_placements.ptr[i];
+        case Tag::SlabScatter: {
+            const auto& op = instr.op.slab_scatter;
+            for (std::size_t i = 0; i < op.placements.len; ++i) {
+                const auto& placement = op.placements.ptr[i];
                 if (placement.dest_offset > b.weights_region.size ||
                     placement.bytes >
                         b.weights_region.size - placement.dest_offset) {
@@ -200,54 +194,50 @@ BoundDecode stage_decode_storage(
                         "metal storage executor: slab destination is out of bounds");
                 }
                 view.copy_storage_bytes(
-                    instr.slab_file_id,
-                    instr.slab_file_offset + placement.src_offset,
+                    op.file_id,
+                    op.file_offset + placement.src_offset,
                     placement.bytes,
                     static_cast<std::uint8_t*>(b.weights_region.contents()) +
                         placement.dest_offset,
                     load.max_tile_bytes());
             }
             break;
-        case K::CreateView: {
-            if (instr.input_buffers.len != 1 ||
-                instr.output_buffers.len != 1 ||
-                !instr.has_dest) {
-                throw std::runtime_error(
-                    "metal storage executor: malformed CreateView");
-            }
-            const auto input = buffers.find(instr.input_buffers.ptr[0]);
+        }
+        case Tag::CreateView: {
+            const auto& op = instr.op.create_view;
+            const auto input = buffers.find(op.input_buffer);
             if (input == buffers.end()) {
                 throw std::runtime_error(
                     "metal storage executor: view input buffer is missing");
             }
-            buffers[instr.output_buffers.ptr[0]] = slice_slot(
+            buffers[op.output_buffer] = slice_slot(
                 input->second,
-                instr.dest.offset + instr.dest.stride.base_offset,
-                extent_bytes(instr.dest.stride));
+                op.view.offset + op.view.stride.base_offset,
+                extent_bytes(op.view.stride));
             break;
         }
-        case K::Finalize: {
-            const auto buffer = buffers.find(instr.buffer_id);
+        case Tag::Finalize: {
+            const auto buffer = buffers.find(instr.op.finalize.buffer_id);
             if (buffer == buffers.end()) {
                 throw std::runtime_error(
                     "metal storage executor: finalized buffer is missing");
             }
             const std::string name =
-                pie_loader::bytes_to_string(instr.name);
+                pie_loader::bytes_to_string(instr.op.finalize.name);
             if (!b.weights.emplace(name, buffer->second).second) {
                 throw std::runtime_error(
                     "metal storage executor: duplicate runtime tensor " + name);
             }
             break;
         }
-        case K::Fill: {
+        case Tag::Fill: {
             // The loader emits this when an expression pads: the padded region
             // is memory no source covers, and the compiler prices it as one
             // fill rather than one copy per band. It must precede every write
             // to the same buffer, which `validate-fill-order` guarantees on
             // the Rust side; the writes below are synchronous host stores into
             // Shared storage, so program order is enough to preserve it here.
-            const auto target = buffers.find(instr.buffer_id);
+            const auto target = buffers.find(instr.op.fill.buffer_id);
             if (target == buffers.end()) {
                 throw std::runtime_error(
                     "metal storage executor: Fill buffer is missing");
@@ -255,7 +245,7 @@ BoundDecode stage_decode_storage(
             std::memset(target->second.contents(), 0, target->second.size);
             break;
         }
-        case K::TileMap:
+        case Tag::TileMap:
             throw std::runtime_error(
                 "metal storage executor: compiler emitted an unsupported load-time transform");
         }

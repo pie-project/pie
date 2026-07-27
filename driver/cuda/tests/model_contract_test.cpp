@@ -284,26 +284,76 @@ nlohmann::json plan_to_json(const pie_loader::LoadPlanView& p) {
     nlohmann::json instrs = nlohmann::json::array();
     for (std::size_t i = 0; i < p.instrs.len; ++i) {
         const auto& in = p.instrs.ptr[i];
-        instrs.push_back({{"kind", static_cast<int>(in.kind)},
-                          {"id", in.id},
-                          {"buffer", in.buffer_id},
-                          {"tile_kind", static_cast<int>(in.tile_kind)},
-                          {"rows_per_tile", in.rows_per_tile},
-                          {"has_source", in.has_source},
-                          {"src_tensor", in.source.tensor_id},
-                          {"src_file", in.source.file_id},
-                          {"src_offset", in.source.file_offset},
-                          {"src_span", in.source.span_bytes},
-                          {"has_dest", in.has_dest},
-                          {"dest_buffer", in.dest.buffer_id},
-                          {"dest_offset", in.dest.offset},
-                          {"repack_layout", static_cast<int>(in.repack_layout)},
-                          {"t_batch", in.transform_batch},
-                          {"t_source_rows", in.transform_source_rows},
-                          {"t_source_row_offset", in.transform_source_row_offset},
-                          {"t_target_rows", in.transform_target_rows},
-                          {"t_valid_rows", in.transform_valid_rows},
-                          {"t_source_col_offset", in.transform_source_col_offset}});
+        using Tag = pie_loader::PieLoaderStorageOp::Tag;
+        nlohmann::json entry{{"tag", static_cast<int>(in.op.tag)}, {"id", in.id}};
+        switch (in.op.tag) {
+        case Tag::Allocate:
+            entry["buffer"] = in.op.allocate.buffer_id;
+            break;
+        case Tag::Fill:
+            entry["buffer"] = in.op.fill.buffer_id;
+            break;
+        case Tag::ExtentWrite: {
+            const auto& op = in.op.extent_write;
+            entry["src_tensor"] = op.source.tensor_id;
+            entry["src_file"] = op.source.file_id;
+            entry["src_offset"] = op.source.file_offset;
+            entry["src_span"] = op.source.span_bytes;
+            entry["dest_buffer"] = op.dest.buffer_id;
+            entry["dest_offset"] = op.dest.offset;
+            break;
+        }
+        case Tag::BulkExtentWrite: {
+            const auto& op = in.op.bulk_extent_write;
+            entry["src_tensor"] = op.source.tensor_id;
+            entry["src_file"] = op.source.file_id;
+            entry["src_offset"] = op.source.file_offset;
+            entry["src_span"] = op.source.span_bytes;
+            entry["dest_offset"] = op.dest_offset;
+            break;
+        }
+        case Tag::SlabScatter: {
+            const auto& op = in.op.slab_scatter;
+            entry["slab_file"] = op.file_id;
+            entry["slab_offset"] = op.file_offset;
+            entry["slab_span"] = op.span_bytes;
+            entry["slab_placements"] = op.placements.len;
+            break;
+        }
+        case Tag::TileMap: {
+            const auto& op = in.op.tile_map;
+            entry["tile_kind"] = static_cast<int>(op.tile_kind);
+            entry["rows_per_tile"] = op.rows_per_tile;
+            entry["has_source"] = op.has_source;
+            entry["src_tensor"] = op.source.tensor_id;
+            entry["src_file"] = op.source.file_id;
+            entry["src_offset"] = op.source.file_offset;
+            entry["src_span"] = op.source.span_bytes;
+            entry["has_dest"] = op.has_dest;
+            entry["dest_buffer"] = op.dest.buffer_id;
+            entry["dest_offset"] = op.dest.offset;
+            entry["repack_layout"] = static_cast<int>(op.repack_layout);
+            entry["t_batch"] = op.transform_batch;
+            entry["t_source_rows"] = op.transform_source_rows;
+            entry["t_source_row_offset"] = op.transform_source_row_offset;
+            entry["t_target_rows"] = op.transform_target_rows;
+            entry["t_valid_rows"] = op.transform_valid_rows;
+            entry["t_source_col_offset"] = op.transform_source_col_offset;
+            break;
+        }
+        case Tag::CreateView: {
+            const auto& op = in.op.create_view;
+            entry["input_buffer"] = op.input_buffer;
+            entry["output_buffer"] = op.output_buffer;
+            entry["dest_offset"] = op.view.offset;
+            break;
+        }
+        case Tag::Finalize:
+            entry["buffer"] = in.op.finalize.buffer_id;
+            entry["name"] = std::string(view_of(in.op.finalize.name));
+            break;
+        }
+        instrs.push_back(std::move(entry));
     }
     nlohmann::json buffers = nlohmann::json::array();
     for (std::size_t i = 0; i < p.buffers.len; ++i) {

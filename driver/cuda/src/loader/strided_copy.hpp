@@ -21,10 +21,10 @@ namespace pie_cuda_driver {
 
 inline void copy_strided_extent_to_device(
     pie_loader::CheckpointSource& loader,
-    const pie_loader::PieLoaderStorageInstrView& instr,
+    const pie_loader::PieLoaderSourceExtentView& src,
     void* dst,
     std::uint64_t dst_capacity_bytes) {
-    const auto& extent = instr.source.stride;
+    const auto& extent = src.stride;
     std::uint64_t physical_bytes = extent.element_bytes;
     std::uint64_t elements = 1;
     for (std::size_t axis = 0; axis < extent.dims.len; ++axis) {
@@ -47,7 +47,7 @@ inline void copy_strided_extent_to_device(
     }
     const std::uint64_t compact_bytes =
         elements * static_cast<std::uint64_t>(extent.element_bytes);
-    if (compact_bytes != instr.source.span_bytes) {
+    if (compact_bytes != src.span_bytes) {
         throw std::runtime_error(
             "storage executor: strided compact byte count mismatch");
     }
@@ -63,8 +63,8 @@ inline void copy_strided_extent_to_device(
             std::to_string(dst_capacity_bytes) + "-byte destination");
     }
     const auto* source = loader.storage_host_ptr(
-        instr.source.file_id,
-        instr.source.file_offset + extent.base_offset,
+        src.file_id,
+        src.file_offset + extent.base_offset,
         physical_bytes);
     std::vector<std::uint8_t> compact(
         static_cast<std::size_t>(compact_bytes));

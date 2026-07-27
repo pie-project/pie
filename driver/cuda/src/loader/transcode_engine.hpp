@@ -64,7 +64,7 @@ public:
     TranscodeEngine& operator=(const TranscodeEngine&) = delete;
 
     void tile_map(
-        const lp::PieLoaderStorageInstrView& instr,
+        const lp::PieLoaderStorageOp::TileMap_Body& instr,
         LoadExecutionStats& stats)
     {
         switch (instr.tile_kind) {
@@ -145,7 +145,7 @@ private:
     }
 
     void cast_tile_map(
-        const lp::PieLoaderStorageInstrView& instr)
+        const lp::PieLoaderStorageOp::TileMap_Body& instr)
     {
         if (instr.output_buffers.len != 1) {
             throw std::runtime_error(
@@ -192,7 +192,7 @@ private:
     // slice of an input buffer) WITHOUT dequantizing. Shared by the BF16
     // materialize path and the fused FP8->MXFP4 transcode path.
     DeviceTensor acquire_encode_source_tile(
-        const lp::PieLoaderStorageInstrView& instr,
+        const lp::PieLoaderStorageOp::TileMap_Body& instr,
         const std::vector<std::int64_t>& full_shape,
         int row_start,
         int rows)
@@ -242,7 +242,7 @@ private:
                         "sources is not implemented");
                 }
                 copy_strided_extent_to_device(
-                    loader_, instr, source.data(), source.nbytes());
+                    loader_, instr.source, source.data(), source.nbytes());
             } else {
                 const std::uint64_t elem = dtype_bytes(source_dtype);
                 const std::uint64_t row_bytes =
@@ -292,7 +292,7 @@ private:
     }
 
     DeviceTensor materialize_encode_input_bf16_rows(
-        const lp::PieLoaderStorageInstrView& instr,
+        const lp::PieLoaderStorageOp::TileMap_Body& instr,
         const std::vector<std::int64_t>& full_shape,
         int row_start,
         int rows)
@@ -386,7 +386,7 @@ private:
     // and offsets to the tile's first scale row. Shared by the BF16 dequant and
     // the fused FP8->MXFP4 paths so both see identical scale data.
     Fp8TileScale fp8_tile_scale(
-        const lp::PieLoaderStorageInstrView& instr,
+        const lp::PieLoaderStorageOp::TileMap_Body& instr,
         const std::vector<std::int64_t>& full_shape,
         int row_start,
         int rows)
@@ -520,7 +520,7 @@ private:
     }
 
     DeviceTensor dequant_fp8_tile_to_bf16(
-        const lp::PieLoaderStorageInstrView& instr,
+        const lp::PieLoaderStorageOp::TileMap_Body& instr,
         const DeviceTensor& fp8_tile,
         const std::vector<std::int64_t>& full_shape,
         int row_start,
@@ -555,7 +555,7 @@ private:
     // dequant_fp8_tile_to_bf16 + quantize_bf16_to_mxfp4 — the fused kernel
     // rounds through BF16; see tests/test_transcode_fused.cu.
     void transcode_fp8_tile_to_mxfp4(
-        const lp::PieLoaderStorageInstrView& instr,
+        const lp::PieLoaderStorageOp::TileMap_Body& instr,
         const DeviceTensor& fp8_tile,
         const std::vector<std::int64_t>& full_shape,
         int row_start,
@@ -586,7 +586,7 @@ private:
     // tile already covers everything. Clamped against `rows` so a malformed plan
     // cannot turn the loop below into a spin.
     static int encode_rows_per_tile(
-        const lp::PieLoaderStorageInstrView& instr,
+        const lp::PieLoaderStorageOp::TileMap_Body& instr,
         int rows)
     {
         if (instr.rows_per_tile == 0) {
@@ -597,7 +597,7 @@ private:
     }
 
     void launch_encode_tile(
-        const lp::PieLoaderStorageInstrView& instr,
+        const lp::PieLoaderStorageOp::TileMap_Body& instr,
         const DeviceTensor& bf16,
         DeviceTensor& out,
         DeviceTensor& scale,
@@ -696,7 +696,7 @@ private:
     // transcode it straight into the MXFP4 packed/scale outputs at this tile's
     // row offset (same offsets as launch_encode_tile's MXFP4 case).
     void launch_fused_mxfp4_tile(
-        const lp::PieLoaderStorageInstrView& instr,
+        const lp::PieLoaderStorageOp::TileMap_Body& instr,
         DeviceTensor& out,
         DeviceTensor& scale,
         const std::vector<std::int64_t>& shape,
@@ -728,7 +728,7 @@ private:
     }
 
     void encode_tile_map(
-        const lp::PieLoaderStorageInstrView& instr,
+        const lp::PieLoaderStorageOp::TileMap_Body& instr,
         LoadExecutionStats& stats)
     {
         if (instr.output_buffers.len != 2) {
@@ -831,7 +831,7 @@ private:
 #endif
 
     DeviceTensor materialize_repack_source(
-        const lp::PieLoaderStorageInstrView& instr)
+        const lp::PieLoaderStorageOp::TileMap_Body& instr)
     {
         if (instr.has_source) {
             DeviceTensor scratch = DeviceTensor::allocate(
@@ -839,7 +839,7 @@ private:
                 {static_cast<std::int64_t>(instr.source.span_bytes)});
             if (!pie_loader::compact_extent(instr.source.stride)) {
                 copy_strided_extent_to_device(
-                    loader_, instr,
+                    loader_, instr.source,
                     scratch.data(),
                     scratch.nbytes());
             } else {
@@ -875,7 +875,7 @@ private:
     }
 
     void repack_tile_map(
-        const lp::PieLoaderStorageInstrView& instr)
+        const lp::PieLoaderStorageOp::TileMap_Body& instr)
     {
 #if PIE_CUDA_TRANSCODE_ENGINE_HAS_CUDA
         if (instr.output_buffers.len != 1 || !instr.has_dest) {
@@ -1053,7 +1053,7 @@ private:
 #endif
 
     void reblock_tile_map(
-        const lp::PieLoaderStorageInstrView& instr)
+        const lp::PieLoaderStorageOp::TileMap_Body& instr)
     {
         if (instr.input_buffers.len != 1 || instr.output_buffers.len != 1) {
             throw std::runtime_error(

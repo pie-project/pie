@@ -11,6 +11,22 @@ meant to be deleted by whoever runs the Metal build and closes the list.
 
 ---
 
+## ABI change 5 — the instruction became a tagged union
+
+`PieLoaderStorageInstrView` is now `{ id, op }` where `op` is a
+`#[repr(C, u32)]` tagged union, and `PieLoaderStorageInstrKind` is gone.
+`heap_bind.cpp` switches on `instr.op.tag` and reads through the variant
+bodies. Three runtime guards went with it — `ExtentWrite` and
+`BulkExtentWrite` can no longer be missing a source or a destination, and
+`CreateView` can no longer have a number of inputs other than one — because
+the union states what the flat struct could only check for.
+
+Verified by the syntax sweep below, which is a strong check here: the tag
+values, the body layouts and the member names all come from one generated
+header, so a driver that disagrees with the loader fails to compile rather
+than misreading a union member at run time. Unverified: that the rewritten
+arms *behave*, which needs M1.
+
 ## What the refactor changed under Metal
 
 | # | Change | Metal surface |

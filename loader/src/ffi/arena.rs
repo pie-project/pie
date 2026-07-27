@@ -251,72 +251,62 @@ fn quant_or_none(scheme: Option<QuantScheme>) -> PieLoaderQuantScheme {
 ///   one-element `input_buffers`/`output_buffers` runs, so a consumer walking
 ///   dataflow edges never has to special-case them.
 fn flatten_instr(arena: &mut PlanArena, instr: &StorageInstr) -> PieLoaderStorageInstrView {
-    let mut out = PieLoaderStorageInstrView::default();
-    match instr {
-        StorageInstr::Allocate { id, buffer } => {
-            out.id = id.0;
-            out.kind = PieLoaderStorageInstrKind::Allocate;
-            out.buffer_id = buffer.0;
-        }
-        StorageInstr::Fill { id, buffer } => {
-            out.id = id.0;
-            out.kind = PieLoaderStorageInstrKind::Fill;
-            out.buffer_id = buffer.0;
-            out.output_buffers = arena.store_u32([buffer.0]);
-        }
+    use PieLoaderStorageOp as Op;
+    let (id, op) = match instr {
+        StorageInstr::Allocate { id, buffer } => (
+            id,
+            Op::Allocate {
+                buffer_id: buffer.0,
+            },
+        ),
+        StorageInstr::Fill { id, buffer } => (
+            id,
+            Op::Fill {
+                buffer_id: buffer.0,
+            },
+        ),
         StorageInstr::ExtentWrite { id, source, dest } => {
-            out.id = id.0;
-            out.kind = PieLoaderStorageInstrKind::ExtentWrite;
-            out.source = arena.source_extent(source);
-            out.has_source = true;
-            out.dest = arena.dest_extent(dest);
-            out.has_dest = true;
-            out.buffer_id = out.dest.buffer_id;
+            let source = arena.source_extent(source);
+            (
+                id,
+                Op::ExtentWrite {
+                    source,
+                    dest: arena.dest_extent(dest),
+                },
+            )
         }
         StorageInstr::BulkExtentWrite {
             id,
             source,
             dest_offset,
-        } => {
-            out.id = id.0;
-            out.kind = PieLoaderStorageInstrKind::BulkExtentWrite;
-            out.source = arena.source_extent(source);
-            out.has_source = true;
-            let dims = arena.store_dims([PieLoaderDimSpecView {
-                count: out.source.span_bytes as i64,
-                src_stride: 1,
-                dst_stride: 1,
-            }]);
-            out.dest = PieLoaderDestExtentView {
-                buffer_id: PIE_LOADER_NO_BUFFER,
-                offset: *dest_offset,
-                stride: PieLoaderStridedExtentView {
-                    base_offset: 0,
-                    element_bytes: 1,
-                    dims,
-                },
-            };
-            out.has_dest = true;
-        }
+        } => (
+            id,
+            Op::BulkExtentWrite {
+                source: arena.source_extent(source),
+                dest_offset: *dest_offset,
+            },
+        ),
         StorageInstr::SlabScatter {
             id,
             file_id,
             file_offset,
             span_bytes,
             placements,
-        } => {
-            out.id = id.0;
-            out.kind = PieLoaderStorageInstrKind::SlabScatter;
-            out.slab_file_id = file_id.0;
-            out.slab_file_offset = *file_offset;
-            out.slab_span_bytes = *span_bytes;
-            out.slab_placements =
-                arena.store_slab(placements.iter().map(|p| PieLoaderSlabPlacementView {
-                    src_offset: p.src_offset,
-                    dest_offset: p.dest_offset,
-                    bytes: p.bytes,
-                }));
-        }
+        } => (
+            id,
+            Op::SlabScatter {
+                file_id: file_id.0,
+                file_offset: *file_offset,
+                span_bytes: *span_bytes,
+                placements: arena.store_slab(placements.iter().map(|p| {
+                    PieLoaderSlabPlacementView {
+                        src_offset: p.src_offset,
+                        dest_offset: p.dest_offset,
+                        bytes: p.bytes,
+                    }
+                })),
+            },
+        ),
         StorageInstr::TileMap {
             id,
             kind,
@@ -327,66 +317,69 @@ fn flatten_instr(arena: &mut PlanArena, instr: &StorageInstr) -> PieLoaderStorag
             tile,
             transform,
         } => {
-            out.id = id.0;
-            out.kind = PieLoaderStorageInstrKind::TileMap;
-            out.tile_kind = (*kind).into();
-            if let Some(source) = source {
-                out.source = arena.source_extent(source);
-                out.has_source = true;
-            }
-            if let Some(dest) = dest {
-                out.dest = arena.dest_extent(dest);
-                out.has_dest = true;
-            }
-            out.input_buffers = arena.store_u32(inputs.iter().map(|b| b.0));
-            out.output_buffers = arena.store_u32(outputs.iter().map(|b| b.0));
-            if let Some(first) = outputs.first() {
-                out.buffer_id = first.0;
-            }
-            out.rows_per_tile = tile.rows_per_tile;
-            out.transform_fusion = transform.fusion.into();
-            out.transform_from = quant_or_none(transform.from);
-            out.transform_to = quant_or_none(transform.to);
+            let (source, has_source) = match source {
+                Some(source) => (arena.source_extent(source), true),
+                None => (PieLoaderSourceExtentView::default(), false),
+            };
+            let (dest, has_dest) = match dest {
+                Some(dest) => (arena.dest_extent(dest), true),
+                None => (PieLoaderDestExtentView::default(), false),
+            };
             let repack = &transform.repack;
-            out.repack_layout = repack.layout.into();
-            out.row_map = repack.row_map.into();
-            out.transform_batch = repack.batch;
-            out.transform_source_rows = repack.source_rows;
-            out.transform_source_row_offset = repack.source_row_offset;
-            out.transform_target_rows = repack.target_rows;
-            out.transform_valid_rows = repack.valid_rows;
-            out.transform_source_stride_cols = repack.source_stride_cols;
-            out.transform_source_col_offset = repack.source_col_offset;
-            out.transform_source_cols = repack.source_cols;
-            out.transform_target_cols = repack.target_cols;
-            out.transform_scratch_bytes = transform.scratch_bytes;
-            out.transform_metadata_source = transform
-                .metadata_source
-                .map_or(PIE_LOADER_NO_TENSOR, |id| id.0);
+            (
+                id,
+                Op::TileMap {
+                    tile_kind: (*kind).into(),
+                    source,
+                    has_source,
+                    dest,
+                    has_dest,
+                    input_buffers: arena.store_u32(inputs.iter().map(|b| b.0)),
+                    output_buffers: arena.store_u32(outputs.iter().map(|b| b.0)),
+                    rows_per_tile: tile.rows_per_tile,
+                    transform_fusion: transform.fusion.into(),
+                    transform_from: quant_or_none(transform.from),
+                    transform_to: quant_or_none(transform.to),
+                    repack_layout: repack.layout.into(),
+                    row_map: repack.row_map.into(),
+                    transform_batch: repack.batch,
+                    transform_source_rows: repack.source_rows,
+                    transform_source_row_offset: repack.source_row_offset,
+                    transform_target_rows: repack.target_rows,
+                    transform_valid_rows: repack.valid_rows,
+                    transform_source_stride_cols: repack.source_stride_cols,
+                    transform_source_col_offset: repack.source_col_offset,
+                    transform_source_cols: repack.source_cols,
+                    transform_target_cols: repack.target_cols,
+                    transform_scratch_bytes: transform.scratch_bytes,
+                    transform_metadata_source: transform
+                        .metadata_source
+                        .map_or(PIE_LOADER_NO_TENSOR, |id| id.0),
+                },
+            )
         }
         StorageInstr::CreateView {
             id,
             input,
             output,
             view,
-        } => {
-            out.id = id.0;
-            out.kind = PieLoaderStorageInstrKind::CreateView;
-            out.input_buffers = arena.store_u32([input.0]);
-            out.output_buffers = arena.store_u32([output.0]);
-            out.buffer_id = output.0;
-            out.dest = arena.dest_extent(view);
-            out.has_dest = true;
-        }
-        StorageInstr::Finalize { id, tensor, name } => {
-            out.id = id.0;
-            out.kind = PieLoaderStorageInstrKind::Finalize;
-            out.buffer_id = tensor.0;
-            out.output_buffers = arena.store_u32([tensor.0]);
-            out.name = arena.store_str(name);
-        }
-    }
-    out
+        } => (
+            id,
+            Op::CreateView {
+                input_buffer: input.0,
+                output_buffer: output.0,
+                view: arena.dest_extent(view),
+            },
+        ),
+        StorageInstr::Finalize { id, tensor, name } => (
+            id,
+            Op::Finalize {
+                buffer_id: tensor.0,
+                name: arena.store_str(name),
+            },
+        ),
+    };
+    PieLoaderStorageInstrView { id: id.0, op }
 }
 
 /// The fact a driver needs that a plan alone cannot state.
