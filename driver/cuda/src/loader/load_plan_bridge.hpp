@@ -8,7 +8,6 @@
 #include <unordered_map>
 #include <vector>
 
-#include "pie_driver/model_contracts.hpp"
 #include "pie_loader/source_checkpoint.hpp"
 
 #include "loader/rust_quant_attachment.hpp"
@@ -21,16 +20,8 @@ namespace pie_cuda_driver {
 struct LoadPlanResult {
     LoadPlan plan;
     std::vector<RustQuantAttachment> quant_attachments;
-    std::size_t source_tensor_count = 0;
-    /// Contract tensors the plan delivers, and contract tensors in total.
-    ///
-    /// These used to be two names for `view.tensors.len`, which made the check
-    /// downstream `if (x != x)`. The contract is now the *only* thing the plan
-    /// is built from, so they are equal by construction and a shortfall is a
-    /// compiler bug rather than a family nobody declared.
-    std::size_t covered_contract_count = 0;
-    std::size_t runtime_tensor_count = 0;
-    /// Tensors the plan produces, whether or not anything demanded them.
+    /// Tensors the plan produces. The only count anything reads: it sizes the
+    /// weight store's reservation.
     std::size_t planned_tensor_count = 0;
     std::string cache_key;
 };
@@ -115,12 +106,6 @@ inline LoadPlanResult prepare_load_plan(
     return {
         .plan = std::move(plan),
         .quant_attachments = resolve_quant_attachments(view),
-        .source_tensor_count = view.sources.len,
-        // `verify` already rejected any shortfall, so reaching here means every
-        // declaration is met. Carrying the numbers rather than asserting keeps
-        // them available for the diagnostic dump.
-        .covered_contract_count = view.coverage.covered,
-        .runtime_tensor_count = view.coverage.demanded,
         .planned_tensor_count = view.tensors.len,
         .cache_key = pie_loader::bytes_to_string(view.cache_key),
     };

@@ -62,7 +62,7 @@ MixtralWeights bind_gpt_oss(const LoadedModel& engine) {
     }
     const int I = I_full / T;
     const bool native_mxfp4 = engine.mxfp4_moe_policy() ==
-        pie_driver::Mxfp4MoePolicy::NativeGemm;
+        Mxfp4MoePolicy::NativeGemm;
     const int I_native = native_mxfp4 ? align_up_int(I, 128) : I;
     const int L = cfg.num_hidden_layers;
     const int Hq = (cfg.num_attention_heads * cfg.head_dim) / T;

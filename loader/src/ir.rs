@@ -26,10 +26,6 @@ impl LayoutPlan {
         self.exprs.get(id.0 as usize)
     }
 
-    pub fn expr_mut(&mut self, id: ExprId) -> Option<&mut LayoutExpr> {
-        self.exprs.get_mut(id.0 as usize)
-    }
-
     pub fn decl(&self, id: ExprId) -> Option<&TensorDecl> {
         Some(self.expr(id)?.decl())
     }
@@ -165,19 +161,6 @@ impl LayoutExpr {
     }
 
     pub fn decl(&self) -> &TensorDecl {
-        match self {
-            Self::Source { decl, .. }
-            | Self::Gather { decl, .. }
-            | Self::Cast { decl, .. }
-            | Self::Decode { decl, .. }
-            | Self::Encode { decl, .. }
-            | Self::Transcode { decl, .. }
-            | Self::Repack { decl, .. }
-            | Self::Realize { decl, .. } => decl,
-        }
-    }
-
-    pub fn decl_mut(&mut self) -> &mut TensorDecl {
         match self {
             Self::Source { decl, .. }
             | Self::Gather { decl, .. }

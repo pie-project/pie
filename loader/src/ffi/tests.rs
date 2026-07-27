@@ -10,7 +10,6 @@ use super::arena::{self, view};
 use super::entry::{PieLoaderDiagnostics, PieLoaderStatus, PieLoaderTargetSpec};
 use super::types::*;
 use crate::load_plan::*;
-use crate::optimizer::{OptimizerPassStats, OptimizerReport};
 use crate::types::*;
 
 fn target() -> StorageTarget {
@@ -221,6 +220,7 @@ fn plan_with_every_instr() -> LoadPlan {
                 },
                 scratch_bytes: 8192,
                 fusion: TransformFusion::Fp8ToMxfp4,
+                metadata_source: Some(TensorId(2)),
             },
         },
         StorageInstr::CreateView {
@@ -255,14 +255,6 @@ fn plan_with_every_instr() -> LoadPlan {
         checkpoint_read_bytes: 1 << 31,
         device_write_bytes: 1 << 30,
     };
-    plan.optimizer = OptimizerReport {
-        passes: vec![OptimizerPassStats {
-            name: "coalesce".to_string(),
-            exprs_before: 900,
-            exprs_after: 120,
-            rewrites: 41,
-        }],
-    };
     plan
 }
 
@@ -275,11 +267,10 @@ fn with_plan(plan: &LoadPlan, body: impl FnOnce(*mut PieLoaderPlan)) {
 }
 
 #[test]
-fn header_carries_target_and_versions() {
+fn header_carries_target_and_compiler_version() {
     let plan = plan_with_every_instr();
     with_plan(&plan, |pod| {
         let header = unsafe { &*pod };
-        assert_eq!(header.version, LOAD_PLAN_VERSION);
         assert_eq!(header.compiler_version, compiler_version());
         assert_eq!(header.target.backend, PieLoaderBackendKind::Cuda);
         assert_eq!(header.target.tp_rank, 1);
@@ -355,7 +346,7 @@ fn verify_diagnostics(plan: &LoadPlan) -> String {
     let pod = arena::build(plan, &arena::PlanExtras::default());
     let dir = contract_fixture();
     let handle = open_checkpoint(&dir);
-    let owned = super::contract::write_contract(&minimal_contract());
+    let owned = crate::contract_writer::write_contract(&minimal_contract());
     let mut req = contract_request(handle, owned.view());
     req.target.tp_rank = 1;
     req.target.tp_size = 4;
@@ -603,6 +594,7 @@ fn tile_map_flattens_transform_and_takes_first_output_as_buffer() {
         assert_eq!(tile.transform_source_cols, 96);
         assert_eq!(tile.transform_target_cols, 112);
         assert_eq!(tile.transform_scratch_bytes, 8192);
+        assert_eq!(tile.transform_metadata_source, 2);
     });
 }
 
@@ -660,19 +652,13 @@ fn scalar_operands_are_published_as_one_element_runs() {
 }
 
 #[test]
-fn schedule_and_optimizer_report_survive() {
+fn the_schedule_survives() {
     let plan = plan_with_every_instr();
     with_plan(&plan, |pod| {
         assert_eq!(
             unsafe { view::schedule(pod) },
             &[0, 1, 2, 3, 4, 5, 6, 7, 8][..]
         );
-        let passes = unsafe { view::passes(pod) };
-        assert_eq!(passes.len(), 1);
-        assert_eq!(unsafe { view::bytes(&passes[0].name) }, "coalesce");
-        assert_eq!(passes[0].exprs_before, 900);
-        assert_eq!(passes[0].exprs_after, 120);
-        assert_eq!(passes[0].rewrites, 41);
     });
 }
 
@@ -685,7 +671,6 @@ fn empty_plan_publishes_empty_slices_not_dangling_ones() {
         assert_eq!(unsafe { view::sources(pod) }.len(), 0);
         assert_eq!(unsafe { view::buffers(pod) }.len(), 0);
         assert_eq!(unsafe { view::schedule(pod) }.len(), 0);
-        assert_eq!(unsafe { view::passes(pod) }.len(), 0);
     });
 }
 
@@ -785,7 +770,6 @@ fn target_spec() -> PieLoaderTargetSpec {
         max_tile_bytes: 1 << 20,
         preferred_alignment: 256,
         tile_map_mask: CUDA_TILE_MAP_MASK,
-        fp8_native: false,
         native_mxfp4_moe: false,
         fusion_mask: FUSION_FP8_TO_MXFP4,
         encode_scratch_dtype: PieLoaderDType::BF16 as u32,
@@ -803,7 +787,7 @@ fn target_spec() -> PieLoaderTargetSpec {
 fn compile_with_target(mutate: impl FnOnce(&mut PieLoaderTargetSpec)) -> (PieLoaderStatus, String) {
     let dir = contract_fixture();
     let handle = open_checkpoint(&dir);
-    let owned = super::contract::write_contract(&fused_contract());
+    let owned = crate::contract_writer::write_contract(&fused_contract());
     let mut req = contract_request(handle, owned.view());
     mutate(&mut req.target);
 
@@ -910,7 +894,7 @@ fn null_arguments_never_dereference() {
 
     let dir = contract_fixture();
     let handle = open_checkpoint(&dir);
-    let owned = super::contract::write_contract(&fused_contract());
+    let owned = crate::contract_writer::write_contract(&fused_contract());
     let req = contract_request(handle, owned.view());
 
     let status = unsafe {
@@ -946,7 +930,7 @@ fn verify_rejects_a_plan_compiled_with_a_different_fusion_setting() {
     // wrote (§8.1).
     let dir = contract_fixture();
     let handle = open_checkpoint(&dir);
-    let owned = super::contract::write_contract(&fused_contract());
+    let owned = crate::contract_writer::write_contract(&fused_contract());
     let req = contract_request(handle, owned.view());
 
     let mut plan: *mut PieLoaderPlan = std::ptr::null_mut();
@@ -999,7 +983,7 @@ fn verify_against(
 ) -> (PieLoaderStatus, String) {
     let dir = contract_fixture();
     let handle = open_checkpoint(&dir);
-    let owned = super::contract::write_contract(contract);
+    let owned = crate::contract_writer::write_contract(contract);
     let req = contract_request(handle, owned.view());
     let mut diags: *mut PieLoaderDiagnostics = std::ptr::null_mut();
     let status = unsafe { super::entry::pie_loader_verify_contract(plan, &req, &mut diags) };
@@ -1013,7 +997,7 @@ fn verify_against(
 fn with_fixture_plan(body: impl FnOnce(*mut PieLoaderPlan)) {
     let dir = contract_fixture();
     let handle = open_checkpoint(&dir);
-    let owned = super::contract::write_contract(&fused_contract());
+    let owned = crate::contract_writer::write_contract(&fused_contract());
     let req = contract_request(handle, owned.view());
     let mut plan: *mut PieLoaderPlan = std::ptr::null_mut();
     let mut diags: *mut PieLoaderDiagnostics = std::ptr::null_mut();
@@ -1293,7 +1277,7 @@ fn an_opened_checkpoint_reports_the_tensors_a_contract_can_name() {
 fn a_contract_compiles_and_verifies_without_naming_a_model() {
     let dir = contract_fixture();
     let handle = open_checkpoint(&dir);
-    let owned = super::contract::write_contract(&fused_contract());
+    let owned = crate::contract_writer::write_contract(&fused_contract());
     let req = contract_request(handle, owned.view());
 
     let mut plan: *mut PieLoaderPlan = std::ptr::null_mut();
@@ -1311,10 +1295,6 @@ fn a_contract_compiles_and_verifies_without_naming_a_model() {
     assert_eq!(declared.len(), 1);
     let name = unsafe { std::slice::from_raw_parts(declared[0].name.ptr, declared[0].name.len) };
     assert_eq!(std::str::from_utf8(name).unwrap(), "ab.weight");
-    // Coverage is measured against the contract itself on this path, so a
-    // fully-delivered contract is the only shape that can be reported.
-    assert_eq!(unsafe { (*plan).coverage.demanded }, 1);
-    assert_eq!(unsafe { (*plan).coverage.covered }, 1);
 
     let mut vdiags: *mut PieLoaderDiagnostics = std::ptr::null_mut();
     let verified = unsafe { super::entry::pie_loader_verify_contract(plan, &req, &mut vdiags) };
@@ -1335,7 +1315,7 @@ fn a_contract_naming_a_tensor_the_checkpoint_lacks_is_a_message_not_a_crash() {
     let handle = open_checkpoint(&dir);
     let mut model = fused_contract();
     model.tensors[0].expr = crate::contract::Expr::Src("missing.weight".to_string());
-    let owned = super::contract::write_contract(&model);
+    let owned = crate::contract_writer::write_contract(&model);
     let req = contract_request(handle, owned.view());
 
     let mut plan: *mut PieLoaderPlan = std::ptr::null_mut();
@@ -1356,7 +1336,7 @@ fn a_contract_whose_declared_shape_is_wrong_fails_to_compile() {
     let handle = open_checkpoint(&dir);
     let mut model = fused_contract();
     model.tensors[0].shape = Some(vec![8, 4]);
-    let owned = super::contract::write_contract(&model);
+    let owned = crate::contract_writer::write_contract(&model);
     let req = contract_request(handle, owned.view());
 
     let mut plan: *mut PieLoaderPlan = std::ptr::null_mut();
@@ -1373,7 +1353,7 @@ fn a_contract_whose_declared_shape_is_wrong_fails_to_compile() {
 
 #[test]
 fn a_contract_request_with_no_checkpoint_is_rejected() {
-    let owned = super::contract::write_contract(&fused_contract());
+    let owned = crate::contract_writer::write_contract(&fused_contract());
     let req = contract_request(std::ptr::null(), owned.view());
     let mut plan: *mut PieLoaderPlan = std::ptr::null_mut();
     let mut diags: *mut PieLoaderDiagnostics = std::ptr::null_mut();

@@ -32,7 +32,7 @@
 use crate::contract::{Expr, ModelContract, TensorContract, TensorType};
 use crate::ffi::types::{
     PieLoaderBytes, PieLoaderDType, PieLoaderEncodingKind, PieLoaderI64Slice, PieLoaderQuantScheme,
-    PieLoaderRepackLayout, PieLoaderRowMap, PieLoaderU32Slice,
+    PieLoaderRepackLayout, PieLoaderRowMap, PieLoaderSlice, PieLoaderU32Slice,
 };
 use crate::types::{
     Axis, DType, Encoding, QuantScheme, QuantSpec, RepackLayout, RepackSpec, RowMap,
@@ -245,21 +245,7 @@ impl Default for PieLoaderExprNode {
     }
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct PieLoaderExprNodeSlice {
-    pub ptr: *const PieLoaderExprNode,
-    pub len: usize,
-}
-
-impl Default for PieLoaderExprNodeSlice {
-    fn default() -> Self {
-        Self {
-            ptr: std::ptr::null(),
-            len: 0,
-        }
-    }
-}
+pub type PieLoaderExprNodeSlice = PieLoaderSlice<PieLoaderExprNode>;
 
 /// One declared tensor: a name, the expression that produces it, and what the
 /// driver believes the result is.
@@ -283,21 +269,7 @@ pub struct PieLoaderTensorContractView {
     pub encoding: PieLoaderEncodingSpec,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct PieLoaderTensorContractSlice {
-    pub ptr: *const PieLoaderTensorContractView,
-    pub len: usize,
-}
-
-impl Default for PieLoaderTensorContractSlice {
-    fn default() -> Self {
-        Self {
-            ptr: std::ptr::null(),
-            len: 0,
-        }
-    }
-}
+pub type PieLoaderTensorContractSlice = PieLoaderSlice<PieLoaderTensorContractView>;
 
 /// Everything one driver rank declares.
 #[repr(C)]
@@ -540,190 +512,12 @@ pub unsafe fn read_contract(view: &PieLoaderModelContractView) -> Result<ModelCo
     })
 }
 
-// ── writing ─────────────────────────────────────────────────────────
-
-/// A contract flattened into the POD form, with its backing storage.
-///
-/// The loader is the *reader* of this format in production — C++ owns the
-/// arena and Rust borrows it. Being able to write one anyway buys two things
-/// that are worth the ~120 lines:
-///
-/// * every golden plan can round-trip its contract through the POD form and
-///   assert the result is unchanged, which is what makes moving a family's
-///   authorship from `arch/` to C++ a *checkable* refactor rather than a
-///   rewrite that is only as good as its reviewer;
-/// * `pie-loader contract` can print what the loader would have inferred, in
-///   the shape a driver author has to reproduce.
-///
-/// Handles are indices, so nothing here points into anything that moves; the
-/// `Box`ed backing stores exist because the POD views point into *them*.
-pub struct OwnedContract {
-    abi_version: u32,
-    alignment: u32,
-    nodes: Vec<PieLoaderExprNode>,
-    tensors: Vec<PieLoaderTensorContractView>,
-    names: Vec<Box<str>>,
-    shapes: Vec<Box<[i64]>>,
-    parts: Vec<Box<[u32]>>,
-}
-
-impl OwnedContract {
-    /// A borrowed POD view, exactly as a C++ `ModelContract::view()` produces.
-    pub fn view(&self) -> PieLoaderModelContractView {
-        PieLoaderModelContractView {
-            abi_version: self.abi_version,
-            alignment: self.alignment,
-            nodes: PieLoaderExprNodeSlice {
-                ptr: self.nodes.as_ptr(),
-                len: self.nodes.len(),
-            },
-            tensors: PieLoaderTensorContractSlice {
-                ptr: self.tensors.as_ptr(),
-                len: self.tensors.len(),
-            },
-        }
-    }
-
-    /// How many nodes the flattening produced. Shared subexpressions are *not*
-    /// deduplicated: the tree is written as a tree, so a round-trip compares
-    /// exactly what was written.
-    pub fn node_count(&self) -> usize {
-        self.nodes.len()
-    }
-
-    fn name(&mut self, value: &str) -> PieLoaderBytes {
-        self.names.push(value.into());
-        let stored = self.names.last().unwrap();
-        PieLoaderBytes {
-            ptr: stored.as_ptr(),
-            len: stored.len(),
-        }
-    }
-
-    fn shape(&mut self, value: &[i64]) -> PieLoaderI64Slice {
-        self.shapes.push(value.into());
-        let stored = self.shapes.last().unwrap();
-        PieLoaderI64Slice {
-            ptr: stored.as_ptr(),
-            len: stored.len(),
-        }
-    }
-
-    fn part_list(&mut self, value: &[u32]) -> PieLoaderU32Slice {
-        self.parts.push(value.into());
-        let stored = self.parts.last().unwrap();
-        PieLoaderU32Slice {
-            ptr: stored.as_ptr(),
-            len: stored.len(),
-        }
-    }
-
-    fn push(&mut self, node: PieLoaderExprNode) -> u32 {
-        self.nodes.push(node);
-        (self.nodes.len() - 1) as u32
-    }
-
-    /// Flatten one expression, returning the index of its root.
-    ///
-    /// Post-order, so every operand is already in the array when its parent is
-    /// pushed — which is the index discipline `read_expr` relies on, established
-    /// here by construction rather than checked afterwards.
-    fn write_expr(&mut self, expr: &Expr) -> u32 {
-        let mut node = PieLoaderExprNode::default();
-        match expr {
-            Expr::Src(name) => {
-                node.kind = PieLoaderExprKind::Src as u32;
-                node.name = self.name(name);
-            }
-            Expr::Out(name) => {
-                node.kind = PieLoaderExprKind::Out as u32;
-                node.name = self.name(name);
-            }
-            Expr::Slice {
-                src,
-                axis,
-                start,
-                len,
-                step,
-            } => {
-                let src = self.write_expr(src);
-                node.kind = PieLoaderExprKind::Slice as u32;
-                node.src = src;
-                node.axis = axis.0;
-                node.start = *start;
-                node.len = *len;
-                node.step = *step;
-            }
-            Expr::Cat { axis, parts } => {
-                let indices: Vec<u32> = parts.iter().map(|part| self.write_expr(part)).collect();
-                node.kind = PieLoaderExprKind::Cat as u32;
-                node.axis = axis.0;
-                node.parts = self.part_list(&indices);
-            }
-            Expr::Reshape { src, shape } => {
-                let src = self.write_expr(src);
-                node.kind = PieLoaderExprKind::Reshape as u32;
-                node.src = src;
-                node.shape = self.shape(shape);
-            }
-            Expr::Pad {
-                src,
-                axis,
-                before,
-                after,
-            } => {
-                let src = self.write_expr(src);
-                node.kind = PieLoaderExprKind::Pad as u32;
-                node.src = src;
-                node.axis = axis.0;
-                node.before = *before;
-                node.after = *after;
-            }
-            Expr::Shard { src, axis } => {
-                let src = self.write_expr(src);
-                node.kind = PieLoaderExprKind::Shard as u32;
-                node.src = src;
-                node.axis = axis.0;
-            }
-            Expr::Repack { src, spec, out } => {
-                let src = self.write_expr(src);
-                node.kind = PieLoaderExprKind::Repack as u32;
-                node.src = src;
-                node.repack = write_repack(spec);
-                node.out_shape = self.shape(&out.shape);
-                node.out_encoding = self.write_encoding(&out.encoding);
-            }
-            Expr::Quantize { src, spec } => {
-                let src = self.write_expr(src);
-                node.kind = PieLoaderExprKind::Quantize as u32;
-                node.src = src;
-                node.quant = self.write_quant(spec);
-            }
-            Expr::Bitcast { src, out } => {
-                let src = self.write_expr(src);
-                node.kind = PieLoaderExprKind::Bitcast as u32;
-                node.src = src;
-                node.out_shape = self.shape(&out.shape);
-                node.out_encoding = self.write_encoding(&out.encoding);
-            }
-        }
-        self.push(node)
-    }
-
-    fn write_quant(&mut self, spec: &QuantSpec) -> PieLoaderQuantSpecView {
-        write_quant(self, spec)
-    }
-
-    fn write_encoding(&mut self, encoding: &Encoding) -> PieLoaderEncodingSpec {
-        write_encoding(self, encoding)
-    }
-}
-
-impl ShapeStore for OwnedContract {
-    fn store_shape(&mut self, values: &[i64]) -> PieLoaderI64Slice {
-        self.shape(values)
-    }
-}
+// ── writing PODs the loader owns ───────────────────────
+//
+// The loader writes two of these formats in production: a checkpoint's tensor
+// table (`ffi::checkpoint`) and, in tests, a whole contract
+// (`crate::contract_writer`). Flattening a *contract* is not on the load path
+// and lives in the latter.
 
 /// Somewhere to keep the `i64` runs a POD encoding points into.
 ///
@@ -732,11 +526,11 @@ impl ShapeStore for OwnedContract {
 /// flattened and a checkpoint being opened — and they own their storage
 /// differently, so the writer takes the store rather than being a method on
 /// either.
-pub(super) trait ShapeStore {
+pub(crate) trait ShapeStore {
     fn store_shape(&mut self, values: &[i64]) -> PieLoaderI64Slice;
 }
 
-pub(super) fn write_quant<S: ShapeStore + ?Sized>(
+pub(crate) fn write_quant<S: ShapeStore + ?Sized>(
     store: &mut S,
     spec: &QuantSpec,
 ) -> PieLoaderQuantSpecView {
@@ -754,7 +548,7 @@ pub(super) fn write_quant<S: ShapeStore + ?Sized>(
     }
 }
 
-pub(super) fn write_encoding<S: ShapeStore + ?Sized>(
+pub(crate) fn write_encoding<S: ShapeStore + ?Sized>(
     store: &mut S,
     encoding: &Encoding,
 ) -> PieLoaderEncodingSpec {
@@ -776,53 +570,4 @@ fn write_opt_dtype(dtype: Option<DType>) -> PieLoaderOptDType {
     dtype.map_or(PIE_LOADER_NO_DTYPE, |dtype| {
         PieLoaderDType::from(dtype) as PieLoaderOptDType
     })
-}
-
-fn write_repack(spec: &RepackSpec) -> PieLoaderRepackSpecView {
-    PieLoaderRepackSpecView {
-        layout: PieLoaderRepackLayout::from(spec.layout) as u32,
-        row_map: PieLoaderRowMap::from(spec.row_map) as u32,
-        batch: spec.batch,
-        source_rows: spec.source_rows,
-        source_row_offset: spec.source_row_offset,
-        target_rows: spec.target_rows,
-        valid_rows: spec.valid_rows,
-        source_stride_cols: spec.source_stride_cols,
-        source_col_offset: spec.source_col_offset,
-        source_cols: spec.source_cols,
-        target_cols: spec.target_cols,
-    }
-}
-
-/// Flatten a contract into the POD form a driver would have written by hand.
-pub fn write_contract(contract: &ModelContract) -> OwnedContract {
-    let mut owned = OwnedContract {
-        abi_version: contract.abi_version,
-        alignment: contract.alignment,
-        nodes: Vec::new(),
-        tensors: Vec::new(),
-        names: Vec::new(),
-        shapes: Vec::new(),
-        parts: Vec::new(),
-    };
-    // Two passes over each tensor, because `name`, `shape` and the node array
-    // all borrow from `owned`: the borrow checker is enforcing the same rule
-    // the C++ side has to follow by hand, which is that nothing may point into
-    // a store while it is being appended to.
-    for tensor in &contract.tensors {
-        let root = owned.write_expr(&tensor.expr);
-        let name = owned.name(&tensor.name);
-        let shape = match &tensor.shape {
-            Some(shape) => owned.shape(shape),
-            None => PieLoaderI64Slice::default(),
-        };
-        let encoding = owned.write_encoding(&tensor.encoding);
-        owned.tensors.push(PieLoaderTensorContractView {
-            name,
-            root,
-            shape,
-            encoding,
-        });
-    }
-    owned
 }

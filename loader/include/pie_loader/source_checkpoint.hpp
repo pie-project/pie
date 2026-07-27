@@ -128,11 +128,6 @@ public:
 
     bool has(std::string_view name) const { return find(name).has_value(); }
 
-    /// The directory this was opened from.
-    std::string_view snapshot_dir() const {
-        return handle_ == nullptr ? std::string_view{} : text(handle_->snapshot_dir);
-    }
-
 private:
     explicit Checkpoint(PieLoaderCheckpoint* handle) : handle_(handle) {}
 

@@ -952,6 +952,20 @@ fn raw(id: u32, name: &str, offset: u64, shape: &[i64], dtype: DType) -> RawTens
     }
 }
 
+fn sized_raw(
+    id: u32,
+    name: &str,
+    offset: u64,
+    span_bytes: u64,
+    shape: &[i64],
+    dtype: DType,
+) -> RawTensor {
+    RawTensor {
+        span_bytes,
+        ..raw(id, name, offset, shape, dtype)
+    }
+}
+
 fn decl(id: u32, name: &str, shape: &[i64], encoding: Encoding) -> TensorDecl {
     TensorDecl {
         id: TensorId(id),
@@ -1257,7 +1271,7 @@ fn mla_q_kv_a_fusion_produces_joined_tensor() {
     };
     let contract = stored_contract("kimi_k2_mla_fusion");
     let program = compile_load_plan(&meta, &contract, target).unwrap();
-    let summary = program.summary();
+    let summary = pie_loader::dump::describe(&program);
 
     // The fusion should have joined q_a_proj + kv_a_proj into one tensor
     let has_fused = program
@@ -1280,8 +1294,14 @@ fn mla_q_kv_a_fusion_produces_joined_tensor() {
     assert_eq!(fused.shape[1], h);
 
     // Summary should show the plan compiled successfully
-    assert!(summary.tensor_count > 0);
-    assert!(summary.finalize_count > 0);
+    assert!(!program.tensors.is_empty());
+    assert!(
+        program
+            .instrs
+            .iter()
+            .any(|instr| matches!(instr, StorageInstr::Finalize { .. })),
+        "{summary}"
+    );
 }
 
 fn instr_id(instr: &StorageInstr) -> pie_loader::types::InstrId {
@@ -1294,5 +1314,129 @@ fn instr_id(instr: &StorageInstr) -> pie_loader::types::InstrId {
         | StorageInstr::CreateView { id, .. }
         | StorageInstr::Release { id, .. }
         | StorageInstr::Finalize { id, .. } => *id,
+    }
+}
+
+/// A block-scaled FP8 source names its scale tensor on the instruction.
+///
+/// The executor used to rebuild the name by appending `_scale_inv` and looking
+/// it up (`driver/cuda/src/loader/transcode_engine.hpp`), which is the same
+/// guess-what-the-loader-decided pattern `attachments` removed from the output
+/// side. The loader has the tensor table, so it answers; this pins that the
+/// answer travels.
+#[test]
+fn a_block_scaled_fp8_source_carries_its_scale_tensor() {
+    let mut plan = LayoutPlan::new();
+    let source = plan.push(LayoutExpr::Source {
+        tensor: TensorId(0),
+        decl: decl(0, "w.weight", &[64, 64], Encoding::Raw(DType::F8E4M3)),
+    });
+    let encoded = plan.push(LayoutExpr::Encode {
+        scheme: QuantScheme::Mxfp4E2M1E8M0,
+        input: source,
+        metadata_outputs: Vec::new(),
+        decl: decl(
+            1,
+            "runtime.w",
+            &[64, 64],
+            Encoding::Quant(quant(QuantScheme::Mxfp4E2M1E8M0, DType::BF16)),
+        ),
+    });
+    let realized = plan.push(LayoutExpr::Realize {
+        input: encoded,
+        runtime_name: "runtime.w".to_string(),
+        decl: decl(
+            1,
+            "runtime.w",
+            &[64, 64],
+            Encoding::Quant(quant(QuantScheme::Mxfp4E2M1E8M0, DType::BF16)),
+        ),
+    });
+    plan.outputs.push(realized);
+
+    let metadata = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "model.safetensors".to_string(),
+            size_bytes: 1 << 20,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors: vec![
+            sized_raw(0, "w.weight", 0, 4096, &[64, 64], DType::F8E4M3),
+            sized_raw(1, "w.weight_scale_inv", 4096, 4, &[1, 1], DType::F32),
+        ],
+    };
+
+    let target = StorageTarget {
+        backend: BackendKind::Cuda,
+        tile_map_mask: u32::MAX,
+        ..StorageTarget::default()
+    };
+    let program = lower_layout_plan(&metadata, &plan, target).unwrap();
+    let encodes: Vec<_> = program
+        .instrs
+        .iter()
+        .filter_map(|instr| match instr {
+            StorageInstr::TileMap {
+                kind: TileMapKind::Encode,
+                transform,
+                ..
+            } => Some(transform.metadata_source),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(encodes, vec![Some(TensorId(1))]);
+}
+
+/// ...and a source with no such sibling says so, rather than naming tensor 0.
+#[test]
+fn a_source_without_a_scale_sibling_names_none() {
+    let mut plan = LayoutPlan::new();
+    let source = plan.push(LayoutExpr::Source {
+        tensor: TensorId(0),
+        decl: decl(0, "w.weight", &[64, 64], Encoding::Raw(DType::BF16)),
+    });
+    let encoded = plan.push(LayoutExpr::Encode {
+        scheme: QuantScheme::Mxfp4E2M1E8M0,
+        input: source,
+        metadata_outputs: Vec::new(),
+        decl: decl(
+            1,
+            "runtime.w",
+            &[64, 64],
+            Encoding::Quant(quant(QuantScheme::Mxfp4E2M1E8M0, DType::BF16)),
+        ),
+    });
+    let realized = plan.push(LayoutExpr::Realize {
+        input: encoded,
+        runtime_name: "runtime.w".to_string(),
+        decl: decl(
+            1,
+            "runtime.w",
+            &[64, 64],
+            Encoding::Quant(quant(QuantScheme::Mxfp4E2M1E8M0, DType::BF16)),
+        ),
+    });
+    plan.outputs.push(realized);
+
+    let metadata = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "model.safetensors".to_string(),
+            size_bytes: 1 << 20,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors: vec![sized_raw(0, "w.weight", 0, 8192, &[64, 64], DType::BF16)],
+    };
+    let target = StorageTarget {
+        backend: BackendKind::Cuda,
+        tile_map_mask: u32::MAX,
+        ..StorageTarget::default()
+    };
+    let program = lower_layout_plan(&metadata, &plan, target).unwrap();
+    for instr in &program.instrs {
+        if let StorageInstr::TileMap { transform, .. } = instr {
+            assert_eq!(transform.metadata_source, None);
+        }
     }
 }

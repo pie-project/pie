@@ -71,8 +71,8 @@ fn production_lines(body: &str) -> impl Iterator<Item = (usize, &str)> {
 /// * `checkpoint/` — the reader. Turning a directory into a
 ///   `CheckpointMetadata` is precisely the step this test exists to keep
 ///   separate, so it has to live somewhere, and it lives in one module.
-/// * `host.rs` — the host *executor*. It runs a finished plan, which means
-///   copying weight bytes; that is its whole job.
+/// * `host_executor.rs` — it runs a finished plan, which means copying weight
+///   bytes; that is its whole job.
 /// * `artifact.rs` — the on-disk plan cache. It stats and writes files that are
 ///   outputs of compilation, never inputs to it.
 /// * `verify.rs` — staleness. `verify` is deliberately *not* `compile`: its
@@ -82,7 +82,7 @@ fn production_lines(body: &str) -> impl Iterator<Item = (usize, &str)> {
 /// * `main.rs` — the CLI, which is a caller, not the library.
 #[test]
 fn nothing_below_the_reader_opens_a_file() {
-    const ALLOWED: &[&str] = &["host.rs", "artifact.rs", "verify.rs", "main.rs"];
+    const ALLOWED: &[&str] = &["host_executor.rs", "artifact.rs", "verify.rs", "main.rs"];
     // `Path`/`PathBuf` are values and may be passed around freely; what must not
     // appear is anything that *touches* the filesystem.
     const FORBIDDEN: &[&str] = &[

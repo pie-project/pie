@@ -15,7 +15,6 @@ use crate::load_plan::{
     DestExtent, LoadPlan, QuantGranularity, ScaleForm, SourceExtent, StorageInstr, StridedExtent,
 };
 use crate::types::{Encoding, QuantScheme};
-use crate::verify::ContractCoverage;
 
 use super::types::*;
 
@@ -37,7 +36,6 @@ pub struct PlanArena {
     buffers: Vec<PieLoaderBufferDeclView>,
     instrs: Vec<PieLoaderStorageInstrView>,
     schedule: Vec<u32>,
-    passes: Vec<PieLoaderOptimizerPassStatsView>,
     attachments: Vec<PieLoaderQuantAttachmentView>,
 }
 
@@ -163,10 +161,6 @@ impl PlanArena {
             ptr: self.schedule.as_ptr(),
             len: self.schedule.len(),
         };
-        let passes = PieLoaderOptimizerPassStatsSlice {
-            ptr: self.passes.as_ptr(),
-            len: self.passes.len(),
-        };
         let attachments = PieLoaderQuantAttachmentSlice {
             ptr: self.attachments.as_ptr(),
             len: self.attachments.len(),
@@ -175,11 +169,10 @@ impl PlanArena {
         // place that knows how to name its own instructions.
         let mut arena = self;
         let cache_key = arena.store_str(&extras.cache_key);
-        let summary = arena.store_str(&crate::dump::describe(plan, extras.coverage));
-        let stats_json = arena.store_str(&crate::dump::plan_stats_json(plan, extras.coverage));
+        let summary = arena.store_str(&crate::dump::describe(plan));
+        let stats_json = arena.store_str(&crate::dump::plan_stats_json(plan));
         let owner = Box::into_raw(Box::new(arena)).cast::<std::ffi::c_void>();
         Box::into_raw(Box::new(PieLoaderPlan {
-            version: plan.version,
             files,
             sources,
             tensors,
@@ -193,14 +186,9 @@ impl PlanArena {
                 checkpoint_read_bytes: plan.memory.checkpoint_read_bytes,
                 device_write_bytes: plan.memory.device_write_bytes,
             },
-            optimizer: PieLoaderOptimizerReportView { passes },
             compiler_version: plan.compiler_version,
             target: (&plan.target).into(),
             attachments,
-            coverage: PieLoaderContractCoverageView {
-                covered: extras.coverage.covered,
-                demanded: extras.coverage.demanded,
-            },
             cache_key,
             summary,
             stats_json,
@@ -366,6 +354,9 @@ fn flatten_instr(arena: &mut PlanArena, instr: &StorageInstr) -> PieLoaderStorag
             out.transform_source_cols = repack.source_cols;
             out.transform_target_cols = repack.target_cols;
             out.transform_scratch_bytes = transform.scratch_bytes;
+            out.transform_metadata_source = transform
+                .metadata_source
+                .map_or(PIE_LOADER_NO_TENSOR, |id| id.0);
         }
         StorageInstr::CreateView {
             id,
@@ -397,23 +388,20 @@ fn flatten_instr(arena: &mut PlanArena, instr: &StorageInstr) -> PieLoaderStorag
     out
 }
 
-/// The facts a driver needs that a plan alone cannot state.
+/// The fact a driver needs that a plan alone cannot state.
 ///
-/// Both are derived from the plan *and the request it came from*: coverage needs
-/// the caller's demands, and the cache key needs the snapshot path and the
-/// component. Computing them once at compile time and shipping them with the
-/// plan is what keeps two drivers from each growing their own version.
+/// Derived from the plan *and the request it came from*: the cache key needs the
+/// snapshot path, which is not in the plan. Computing it once at compile time
+/// and shipping it with the plan is what keeps two drivers from each growing
+/// their own version.
 pub struct PlanExtras {
-    pub coverage: ContractCoverage,
     pub cache_key: String,
 }
 
 impl Default for PlanExtras {
-    /// What a plan compiled for a caller that declared nothing looks like. The
-    /// key is still a key: an empty one would collide across every model.
+    /// The key is still a key: an empty one would collide across every model.
     fn default() -> Self {
         Self {
-            coverage: ContractCoverage::default(),
             cache_key: "0000000000000000".to_string(),
         }
     }
@@ -497,17 +485,6 @@ pub fn build(plan: &LoadPlan, extras: &PlanExtras) -> *mut PieLoaderPlan {
     }
 
     arena.schedule = plan.schedule.iter().map(|id| id.0).collect();
-
-    arena.passes.reserve(plan.optimizer.passes.len());
-    for pass in &plan.optimizer.passes {
-        let name = arena.store_str(&pass.name);
-        arena.passes.push(PieLoaderOptimizerPassStatsView {
-            name,
-            exprs_before: pass.exprs_before as u64,
-            exprs_after: pass.exprs_after as u64,
-            rewrites: pass.rewrites as u64,
-        });
-    }
 
     arena.attachments.reserve(plan.attachments.len());
     for attachment in &plan.attachments {
@@ -644,13 +621,5 @@ pub(crate) mod view {
             return &[];
         }
         unsafe { std::slice::from_raw_parts(value.ptr, value.len) }
-    }
-
-    pub unsafe fn passes(plan: *const PieLoaderPlan) -> &'static [PieLoaderOptimizerPassStatsView] {
-        let plan = unsafe { &*plan };
-        if plan.optimizer.passes.ptr.is_null() {
-            return &[];
-        }
-        unsafe { std::slice::from_raw_parts(plan.optimizer.passes.ptr, plan.optimizer.passes.len) }
     }
 }

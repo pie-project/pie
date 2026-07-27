@@ -176,7 +176,6 @@ class LoadPlan {
     std::uint64_t max_tile_bytes() const { return view().target.max_tile_bytes; }
     std::uint32_t tile_map_mask() const { return view().target.tile_map_mask; }
     std::uint64_t compiler_version() const { return view().compiler_version; }
-    std::uint32_t version() const { return view().version; }
 
     static std::string status_name(PieLoaderStatus status) {
         switch (status) {
@@ -268,7 +267,6 @@ class LoadPlanIndex {
         buffer_by_id_.clear();
         tensor_by_id_.clear();
         source_by_id_.clear();
-        source_by_name_.clear();
         for (std::size_t i = 0; i < plan.instrs.len; ++i) {
             instr_by_id_.emplace(plan.instrs.ptr[i].id, &plan.instrs.ptr[i]);
         }
@@ -281,7 +279,6 @@ class LoadPlanIndex {
         for (std::size_t i = 0; i < plan.sources.len; ++i) {
             const auto* source = &plan.sources.ptr[i];
             source_by_id_.emplace(source->id, source);
-            source_by_name_.emplace(bytes_to_string(source->name), source);
         }
     }
 
@@ -313,10 +310,6 @@ class LoadPlanIndex {
         }
         return *it->second;
     }
-    const PieLoaderSourceTensorView* find_source(const std::string& name) const {
-        const auto it = source_by_name_.find(name);
-        return it == source_by_name_.end() ? nullptr : it->second;
-    }
 
   private:
     std::string context_;
@@ -324,7 +317,6 @@ class LoadPlanIndex {
     std::unordered_map<std::uint32_t, const PieLoaderBufferDeclView*> buffer_by_id_;
     std::unordered_map<std::uint32_t, const PieLoaderTensorDeclView*> tensor_by_id_;
     std::unordered_map<std::uint32_t, const PieLoaderSourceTensorView*> source_by_id_;
-    std::unordered_map<std::string, const PieLoaderSourceTensorView*> source_by_name_;
 };
 
 }  // namespace pie_loader
