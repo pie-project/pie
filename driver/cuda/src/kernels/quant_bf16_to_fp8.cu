@@ -13,6 +13,62 @@ constexpr int BLOCK = 256;
 constexpr float FP8_E4M3_MAX = 448.f;     // OCP MX spec: max representable
 constexpr float INT8_MAX_F   = 127.f;     // signed int8 symmetric range
 
+// ── Blockwise FP8 activation quantization (DeepSeek W8A8 block fp8) ──
+//
+// One CUDA block per (row, k-group).  `group_size` is 128 in every real
+// deployment, so a single warp-shuffle reduction over 128 lanes' worth of
+// values covers the group; we use a fixed 128-thread block and let each
+// thread own exactly one element when gs == 128.  Larger group sizes are
+// handled by striding.
+__global__ void quant_act_fp8_per_group_kernel(
+    const __nv_bfloat16* __restrict__ act,
+    __nv_fp8_storage_t*  __restrict__ out,
+    float*               __restrict__ scale_out,
+    int                               m,
+    int                               k,
+    int                               gs,
+    int                               n_groups)
+{
+    const int row = blockIdx.y;
+    const int g   = blockIdx.x;
+    if (row >= m || g >= n_groups) return;
+
+    const int   base  = g * gs;
+    const int   count = min(gs, k - base);
+    const std::size_t off = static_cast<std::size_t>(row) * k + base;
+
+    float amax = 0.f;
+    for (int i = threadIdx.x; i < count; i += blockDim.x) {
+        amax = fmaxf(amax, fabsf(__bfloat162float(act[off + i])));
+    }
+    __shared__ float warp_max[128 / 32];
+    const unsigned lane = threadIdx.x & 31;
+    const unsigned warp = threadIdx.x / 32;
+    for (int o = 16; o > 0; o >>= 1) {
+        amax = fmaxf(amax, __shfl_down_sync(0xffffffffu, amax, o));
+    }
+    if (lane == 0) warp_max[warp] = amax;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float v = warp_max[0];
+        for (unsigned w = 1; w < blockDim.x / 32; ++w) v = fmaxf(v, warp_max[w]);
+        warp_max[0] = v;
+    }
+    __syncthreads();
+    amax = warp_max[0];
+
+    // scale (multiplicative, matching cuBLASLt's contract: value = fp8 * scale)
+    const float scale     = (amax > 0.f) ? (amax / FP8_E4M3_MAX) : 1.f;
+    const float scale_rcp = (amax > 0.f) ? (FP8_E4M3_MAX / amax) : 0.f;
+    if (threadIdx.x == 0) {
+        scale_out[static_cast<std::size_t>(row) * n_groups + g] = scale;
+    }
+    for (int i = threadIdx.x; i < count; i += blockDim.x) {
+        const float v = __bfloat162float(act[off + i]) * scale_rcp;
+        out[off + i] = __nv_cvt_float_to_fp8(v, __NV_SATFINITE, __NV_E4M3);
+    }
+}
+
 // Block-wide absmax via warp shuffles + shared-mem reduction. We do the
 // final atomic into the device scalar (one atomic per block, not per
 // thread) so the kernel stays scale-free on `n`.
@@ -482,6 +538,25 @@ float quantize_bf16_to_fp8_e4m3_per_tensor(
     const float scale_inv        = FP8_E4M3_MAX / absmax;
     launch_quant_bf16_to_fp8_e4m3(W_bf16, W_fp8, scale_inv, n, stream);
     return weight_scale_inv;
+}
+
+void quantize_bf16_to_fp8_e4m3_per_token_group(
+    const void*    act_bf16,
+    std::uint8_t*  act_fp8,
+    float*         act_scale,
+    int            m,
+    int            k,
+    int            group_size,
+    cudaStream_t   stream)
+{
+    if (m <= 0 || k <= 0 || group_size <= 0) return;
+    const int n_groups = (k + group_size - 1) / group_size;
+    const dim3 grid(static_cast<unsigned>(n_groups), static_cast<unsigned>(m));
+    quant_act_fp8_per_group_kernel<<<grid, 128, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(act_bf16),
+        reinterpret_cast<__nv_fp8_storage_t*>(act_fp8),
+        act_scale, m, k, group_size, n_groups);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 }  // namespace pie_cuda_driver::kernels

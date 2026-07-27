@@ -360,24 +360,38 @@ __device__ __forceinline__ void mma_m16n8k16(float (&d)[4], const std::uint32_t 
 }
 
 // A fragment from a row-major [16][ld] tile.
+// A fragment (16x16) for both S = Q.K^T and O = P.V. One ldmatrix.x4 replaces
+// four 32-bit shared loads; the mma issue rate, not memory, is what limits this
+// kernel, so the instruction count per mma is the thing worth cutting.
+// ldmatrix.x4 wants lane l to address row (l & 15) of the k0 half for l < 16 and
+// of the k0+8 half for l >= 16, which is exactly the four 8x8 tiles the mma A
+// operand is made of.
 __device__ __forceinline__ void ld_a(std::uint32_t (&a)[4], const __nv_bfloat16* base,
                                      int ld, int lane, int k0) {
-    const int g = lane >> 2, p = (lane & 3) << 1;
-    const __nv_bfloat16* r0 = base + static_cast<long long>(g) * ld + k0 + p;
-    const __nv_bfloat16* r1 = base + static_cast<long long>(g + 8) * ld + k0 + p;
-    a[0] = *reinterpret_cast<const std::uint32_t*>(r0);
-    a[1] = *reinterpret_cast<const std::uint32_t*>(r1);
-    a[2] = *reinterpret_cast<const std::uint32_t*>(r0 + 8);
-    a[3] = *reinterpret_cast<const std::uint32_t*>(r1 + 8);
+    const __nv_bfloat16* r =
+        base + static_cast<long long>(lane & 15) * ld + k0 + ((lane & 16) ? 8 : 0);
+    const std::uint32_t addr =
+        static_cast<std::uint32_t>(__cvta_generic_to_shared(r));
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+        : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
+        : "r"(addr));
 }
 
 // B fragment for S = Q.K^T: n = key (row of sK), k = dim (contiguous).
+// Keys are rows of sK with the head dim contiguous, so the mma B operand is a
+// plain (untransposed) 8x8 pair: lanes 0-7 address the k0 half, lanes 8-15 the
+// k0+8 half. Two 32-bit shared loads collapse into one ldmatrix.x2.
 __device__ __forceinline__ void ld_b_k(std::uint32_t (&b)[2], const __nv_bfloat16* base,
                                        int ld, int lane, int k0) {
-    const int g = lane >> 2, p = (lane & 3) << 1;
-    const __nv_bfloat16* q = base + static_cast<long long>(g) * ld + k0 + p;
-    b[0] = *reinterpret_cast<const std::uint32_t*>(q);
-    b[1] = *reinterpret_cast<const std::uint32_t*>(q + 8);
+    const __nv_bfloat16* q =
+        base + static_cast<long long>(lane & 7) * ld + k0 + ((lane & 8) ? 8 : 0);
+    const std::uint32_t addr =
+        static_cast<std::uint32_t>(__cvta_generic_to_shared(q));
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
+        : "=r"(b[0]), "=r"(b[1])
+        : "r"(addr));
 }
 
 // B fragment for O = P.V: k = key (row of sK), n = dim (column of sK).
@@ -479,17 +493,31 @@ __global__ __launch_bounds__(kThreads, 3) void mla_mma_paged_kernel(
 
     // Stream KV tiles through `kStages` shared buffers: the cp.async group for
     // tile s+kStages-1 is in flight while the mma pipeline chews on tile s.
+    // Resolving a key's page costs an integer divide, an integer modulo and a
+    // dependent global load. Done per 16-byte chunk that is 72 times per key,
+    // and GPUs have no integer divide, so it dominated the whole kernel: ~90% of
+    // the runtime was here, not in the mma pipeline or the KV bandwidth. One
+    // lookup per key per tile instead, published through shared memory.
+    __shared__ long long s_slot[kBK];
     auto issue_tile = [&](int j0, int stage) {
+        for (int rr = tid; rr < kBK; rr += kThreads) {
+            const int j = j0 + rr;
+            s_slot[rr] =
+                (j < j_end)
+                    ? (static_cast<long long>(
+                           kv_page_indices[pages_first + j / page_size]) *
+                           page_size +
+                       (j % page_size))
+                    : -1;
+        }
+        __syncthreads();
         __nv_bfloat16* dst_base = sKbuf + stage * (kBK * kLdD);
         for (int c = tid; c < kBK * kChunksPerRow; c += kThreads) {
             const int row = c / kChunksPerRow;
             const int d = (c % kChunksPerRow) * 8;
-            const int j = j0 + row;
+            const long long slot = s_slot[row];
             __nv_bfloat16* dst = dst_base + row * kLdD + d;
-            if (j < j_end) {
-                const long long page =
-                    kv_page_indices[pages_first + j / page_size];
-                const long long slot = page * page_size + (j % page_size);
+            if (slot >= 0) {
                 const void* src =
                     (d < kCkv)
                         ? static_cast<const void*>(ckv_pages + slot * kCkv + d)
