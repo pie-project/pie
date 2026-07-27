@@ -26,7 +26,7 @@ pub fn verify_marshalled(
     plan: &LoadPlan,
     contract: Option<&ContractView<'_>>,
 ) -> Result<Certificate, Vec<Violation>> {
-    let pod = arena::build(plan, &arena::PlanExtras::default());
+    let pod = arena::build(plan, arena::UNKEYED);
     if pod.is_null() {
         return Err(vec![Violation::plan("plan could not be marshalled")]);
     }
@@ -130,7 +130,15 @@ pub(super) unsafe fn plan_view(
                     file_id: *file_id,
                 });
             }
-            _ => {}
+            // Named rather than left to a wildcard: `verify` decides a file is
+            // unread by finding no `ReadView` for it, so an operation that
+            // grows a source and is not added above would make the plan look
+            // like it never touched the checkpoint. That is not hypothetical —
+            // `TileMap` used to report file 0 for every device-side transform,
+            // because a flat struct left `source` at its zero default.
+            PieLoaderStorageOp::Allocate { .. }
+            | PieLoaderStorageOp::CreateView { .. }
+            | PieLoaderStorageOp::Fill { .. } => {}
         }
     }
 

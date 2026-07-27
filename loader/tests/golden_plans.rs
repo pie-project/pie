@@ -506,11 +506,11 @@ fn replay(name: &str, plan: &LoadPlan, metadata: &CheckpointMetadata) {
         let expected = pie_loader::types::encoding_nbytes(&tensor.shape, &tensor.encoding)
             .unwrap_or_else(|| panic!("{name}: '{}' has no size", tensor.name));
         assert_eq!(
-            materialized.bytes.len() as u64,
+            materialized.len() as u64,
             expected,
             "{name}: '{}' materialized {} bytes, but its declared type is {} bytes",
             tensor.name,
-            materialized.bytes.len(),
+            materialized.len(),
             expected
         );
     }

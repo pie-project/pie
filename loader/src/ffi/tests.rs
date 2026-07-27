@@ -267,7 +267,7 @@ fn plan_with_every_instr() -> LoadPlan {
 
 /// Runs `body` against a built plan and releases it afterwards.
 fn with_plan(plan: &LoadPlan, body: impl FnOnce(*mut PieLoaderPlan)) {
-    let pod = arena::build(plan, &arena::PlanExtras::default());
+    let pod = arena::build(plan, arena::UNKEYED);
     assert!(!pod.is_null());
     body(pod);
     unsafe { arena::release(pod) };
@@ -350,7 +350,7 @@ fn the_plan_declares_the_files_its_offsets_are_relative_to() {
 /// *internal* consistency under test — which is what every caller of this helper
 /// is mutating.
 fn verify_diagnostics(plan: &LoadPlan) -> String {
-    let pod = arena::build(plan, &arena::PlanExtras::default());
+    let pod = arena::build(plan, arena::UNKEYED);
     let dir = contract_fixture();
     let handle = open_checkpoint(&dir);
     let owned = crate::contract_writer::write_contract(&minimal_contract());
@@ -781,7 +781,7 @@ fn plans_can_be_built_and_released_from_other_threads() {
         .map(|_| {
             let plan = plan.clone();
             std::thread::spawn(move || {
-                let pod = arena::build(&plan, &arena::PlanExtras::default());
+                let pod = arena::build(&plan, arena::UNKEYED);
                 let count = unsafe { view::instrs(pod) }.len();
                 (pod as usize, count)
             })

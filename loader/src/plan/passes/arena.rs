@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use crate::error::{Error, Result};
+use crate::error::{OrOverflow, Result};
 use crate::plan::geometry::extent_storage_bytes;
 use crate::plan::{LoadPlan, StorageInstr};
 use crate::types::BufferId;
@@ -37,7 +37,7 @@ pub(super) fn assign_persistent_offsets(program: &mut LoadPlan) -> Result<usize>
         let offset = align_up_u64(next, alignment)?;
         next = offset
             .checked_add(buffer.bytes)
-            .ok_or_else(|| Error::Overflow("persistent arena overflow".to_string()))?;
+            .or_overflow("persistent arena overflow")?;
         buffer.persistent_offset = Some(offset);
         placed += 1;
     }
@@ -65,7 +65,7 @@ pub(super) fn persistent_source_order(
         let source_start = source
             .file_offset
             .checked_add(source.stride.base_offset)
-            .ok_or_else(|| Error::Overflow("source offset overflow".to_string()))?;
+            .or_overflow("source offset overflow")?;
         order
             .entry(dest.buffer)
             .or_insert((source.file_id.0, source_start, dest.buffer.0));
@@ -83,5 +83,5 @@ pub(super) fn align_up_u64(value: u64, alignment: u64) -> Result<u64> {
     }
     value
         .checked_add(alignment - rem)
-        .ok_or_else(|| Error::Overflow("alignment overflow".to_string()))
+        .or_overflow("alignment overflow")
 }

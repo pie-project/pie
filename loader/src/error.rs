@@ -76,3 +76,39 @@ impl Error {
 
 /// Every fallible step in the loader answers with this.
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Name what overflowed, without spelling out the `ok_or_else` each time.
+///
+/// The loader's arithmetic is all checked, which is right, but written out in
+/// full it reads as ceremony rather than as the calculation: three lines of
+/// `.checked_add(b).ok_or_else(|| Error::Overflow("…".to_string()))?` for one
+/// addition. `plan/passes/memory.rs` was a fifth error handling by line count.
+///
+/// The `checked_*` call stays visible on purpose — this shortens the failure
+/// arm, not the operation:
+///
+/// ```ignore
+/// let end = offset.checked_add(bytes).or_overflow("persistent byte overflow")?;
+/// ```
+pub trait OrOverflow<T> {
+    /// The message is passed through verbatim, so a site reads the same as the
+    /// `Error::Overflow` it replaced.
+    fn or_overflow(self, message: impl Into<String>) -> Result<T>;
+}
+
+impl<T> OrOverflow<T> for Option<T> {
+    fn or_overflow(self, message: impl Into<String>) -> Result<T> {
+        self.ok_or_else(|| Error::Overflow(message.into()))
+    }
+}
+
+/// Narrowing conversions answer with [`std::num::TryFromIntError`], not `None`.
+///
+/// Deliberately not implemented for every `Result`: [`Result<T>`] is the
+/// loader's own, and letting `or_overflow` swallow one would relabel a contract
+/// error as an overflow.
+impl<T> OrOverflow<T> for std::result::Result<T, std::num::TryFromIntError> {
+    fn or_overflow(self, message: impl Into<String>) -> Result<T> {
+        self.map_err(|_| Error::Overflow(message.into()))
+    }
+}

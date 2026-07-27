@@ -1,7 +1,7 @@
 //! Strided-extent geometry: build, narrow and measure the source/dest
 //! extents that back every copy instruction.
 
-use crate::error::{Error, Result};
+use crate::error::{Error, OrOverflow, Result};
 use crate::extent::{Dim, Extent};
 use crate::plan::DestExtent;
 use crate::plan::build::SourceView;
@@ -42,10 +42,10 @@ pub(super) fn narrow_repack_source(
             let start = narrowed
                 .source_row_offset
                 .checked_mul(2)
-                .ok_or_else(|| Error::Overflow("Repack row offset overflow".to_string()))?;
+                .or_overflow("Repack row offset overflow")?;
             let rows = valid_rows
                 .checked_mul(2)
-                .ok_or_else(|| Error::Overflow("Repack row count overflow".to_string()))?;
+                .or_overflow("Repack row count overflow")?;
             (start, rows)
         }
     };
@@ -136,7 +136,7 @@ pub(super) fn repack_stage_bytes(spec: RepackSpec) -> Result<u64> {
         RepackLayout::MarlinMxfp4Weight => {
             let elems = u64::from(spec.target_rows)
                 .checked_mul(u64::from(spec.target_cols))
-                .ok_or_else(|| Error::Overflow("MXFP4 repack stage size overflow".to_string()))?;
+                .or_overflow("MXFP4 repack stage size overflow")?;
             Ok(elems.div_ceil(2))
         }
         RepackLayout::MarlinMxfp4Scale | RepackLayout::DenseRowGather | RepackLayout::None => Ok(0),
@@ -148,7 +148,7 @@ pub(super) fn extent_storage_bytes(extent: &Extent) -> Result<u64> {
         &extent.dims.iter().map(|dim| dim.count).collect::<Vec<_>>(),
         u64::from(extent.element_bytes),
     )
-    .ok_or_else(|| Error::Overflow("extent byte size overflow".to_string()))
+    .or_overflow("extent byte size overflow")
 }
 
 pub(super) fn strided_physical_source_bytes(extent: &Extent) -> Result<u64> {
@@ -162,21 +162,19 @@ pub(super) fn strided_physical_source_bytes(extent: &Extent) -> Result<u64> {
         if dim.count == 0 {
             return Ok(0);
         }
-        let count = u64::try_from(dim.count - 1)
-            .map_err(|_| Error::Overflow("source extent count overflow".to_string()))?;
-        let stride = u64::try_from(dim.src_stride)
-            .map_err(|_| Error::Overflow("source extent stride overflow".to_string()))?;
+        let count = u64::try_from(dim.count - 1).or_overflow("source extent count overflow")?;
+        let stride = u64::try_from(dim.src_stride).or_overflow("source extent stride overflow")?;
         max_offset = max_offset
             .checked_add(
                 count
                     .checked_mul(stride)
-                    .ok_or_else(|| Error::Overflow("source extent byte overflow".to_string()))?,
+                    .or_overflow("source extent byte overflow")?,
             )
-            .ok_or_else(|| Error::Overflow("source extent byte overflow".to_string()))?;
+            .or_overflow("source extent byte overflow")?;
     }
     max_offset
         .checked_add(u64::from(extent.element_bytes))
-        .ok_or_else(|| Error::Overflow("source extent byte overflow".to_string()))
+        .or_overflow("source extent byte overflow")
 }
 
 pub(super) fn full_dest_extent(buffer: BufferId, decl: &TensorDecl) -> Result<DestExtent> {
@@ -192,8 +190,7 @@ pub(super) fn storage_extent_for_shape(shape: &[i64], encoding: &Encoding) -> Re
         return Ok(Extent::dense(shape, element_bytes));
     }
     Ok(Extent::byte_run(
-        encoding_nbytes(shape, encoding)
-            .ok_or_else(|| Error::Overflow("packed extent byte size overflow".to_string()))?,
+        encoding_nbytes(shape, encoding).or_overflow("packed extent byte size overflow")?,
     ))
 }
 
@@ -263,9 +260,9 @@ fn narrow_source_axis(
             u64::try_from(start)
                 .ok()
                 .and_then(|start| start.checked_mul(axis_stride_bytes))
-                .ok_or_else(|| Error::Overflow("source slice offset overflow".to_string()))?,
+                .or_overflow("source slice offset overflow")?,
         )
-        .ok_or_else(|| Error::Overflow("source slice offset overflow".to_string()))?;
+        .or_overflow("source slice offset overflow")?;
     source.shape[axis_index] = length;
     source.stride = if can_preserve_strides {
         selected_source_extent(&old_stride, &source.shape, &source.encoding)?
@@ -290,14 +287,13 @@ fn dense_axis_stride_bytes(shape: &[i64], axis: Axis, encoding: &Encoding) -> Re
     match encoding {
         Encoding::Raw(dtype) => suffix_elements
             .and_then(|elements| elements.checked_mul(dtype.bytes()))
-            .ok_or_else(|| Error::Overflow("dense stride overflow".to_string())),
+            .or_overflow("dense stride overflow"),
         Encoding::Quant(spec) => {
             let spec = spec.clone().normalized();
-            let suffix = suffix_elements
-                .ok_or_else(|| Error::Overflow("dense stride overflow".to_string()))?;
+            let suffix = suffix_elements.or_overflow("dense stride overflow")?;
             let bits = suffix
                 .checked_mul(u64::from(spec.bits_per_element))
-                .ok_or_else(|| Error::Overflow("packed stride overflow".to_string()))?;
+                .or_overflow("packed stride overflow")?;
             if bits % 8 != 0 {
                 return Err(Error::Contract(format!(
                     "packed {:?} select on axis {} is not byte-aligned",

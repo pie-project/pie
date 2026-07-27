@@ -29,7 +29,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
-use crate::error::Error;
+use crate::error::{Error, OrOverflow};
 use crate::types::{CheckpointFormat, DType, Encoding, FileId, TensorId, tensor_nbytes};
 
 /// Width of the safetensors little-endian header-length prefix.
@@ -118,10 +118,11 @@ pub fn parse_safetensors_index(prefix: &[u8]) -> Result<(u64, Vec<SafetensorsEnt
     }
     let header_size = u64::from_le_bytes(prefix[..SAFETENSORS_LEN_PREFIX].try_into().unwrap());
     let json_end = SAFETENSORS_LEN_PREFIX
-        .checked_add(usize::try_from(header_size).map_err(|_| {
-            Error::Overflow(format!("safetensors header size {header_size} too large"))
-        })?)
-        .ok_or_else(|| Error::Overflow("safetensors header size overflows usize".to_string()))?;
+        .checked_add(
+            usize::try_from(header_size)
+                .or_overflow(format!("safetensors header size {header_size} too large"))?,
+        )
+        .or_overflow("safetensors header size overflows usize")?;
     if prefix.len() < json_end {
         return Err(Error::Checkpoint(format!(
             "safetensors header truncated: need {json_end} bytes, have {}",
@@ -223,12 +224,10 @@ pub fn tensors_from_safetensors_entries(
         // `shape`, so `shape × dtype.bytes()` overstates the storage span; trust
         // the safetensors `data_offsets` span, matching the C++ loader.
         if !is_subbyte_packed(&entry.dtype) {
-            let expected = tensor_nbytes(&entry.shape, dtype.bytes()).ok_or_else(|| {
-                Error::Overflow(format!(
-                    "safetensors tensor {} has a shape whose byte size overflows",
-                    entry.name
-                ))
-            })?;
+            let expected = tensor_nbytes(&entry.shape, dtype.bytes()).or_overflow(format!(
+                "safetensors tensor {} has a shape whose byte size overflows",
+                entry.name
+            ))?;
             if expected != span_bytes {
                 return Err(Error::Checkpoint(format!(
                     "safetensors tensor {} byte-size mismatch: data_offsets span {span_bytes}, expected {expected} for shape {:?} × {:?}",
@@ -238,15 +237,13 @@ pub fn tensors_from_safetensors_entries(
         }
         let file_offset = data_section_offset
             .checked_add(entry.begin)
-            .ok_or_else(|| {
-                Error::Overflow(format!(
-                    "safetensors tensor {} file offset overflows",
-                    entry.name
-                ))
-            })?;
-        let id = id_base.checked_add(index as u32).ok_or_else(|| {
-            Error::Overflow("safetensors tensor id space overflows u32".to_string())
-        })?;
+            .or_overflow(format!(
+                "safetensors tensor {} file offset overflows",
+                entry.name
+            ))?;
+        let id = id_base
+            .checked_add(index as u32)
+            .or_overflow("safetensors tensor id space overflows u32")?;
         out.push(RawTensor {
             id: TensorId(id),
             name: entry.name.clone(),
@@ -273,12 +270,10 @@ pub fn read_safetensors_header_prefix(path: &Path) -> Result<Vec<u8>, Error> {
         ))
     })?;
     let header_size = u64::from_le_bytes(len_buf);
-    let header_size_usize = usize::try_from(header_size).map_err(|_| {
-        Error::Overflow(format!(
-            "safetensors header size {header_size} too large in {}",
-            path.display()
-        ))
-    })?;
+    let header_size_usize = usize::try_from(header_size).or_overflow(format!(
+        "safetensors header size {header_size} too large in {}",
+        path.display()
+    ))?;
     let mut prefix = len_buf.to_vec();
     prefix.resize(SAFETENSORS_LEN_PREFIX + header_size_usize, 0);
     file.read_exact(&mut prefix[SAFETENSORS_LEN_PREFIX..])
@@ -328,9 +323,8 @@ pub fn parse_safetensors_checkpoint(files: &[PathBuf]) -> Result<CheckpointMetad
     // driver's C++ `source_tensor_names` ordering across all shards.
     tensors.sort_by(|a, b| a.name.cmp(&b.name));
     for (index, tensor) in tensors.iter_mut().enumerate() {
-        tensor.id = TensorId(u32::try_from(index).map_err(|_| {
-            Error::Overflow("checkpoint tensor id space overflows u32".to_string())
-        })?);
+        tensor.id =
+            TensorId(u32::try_from(index).or_overflow("checkpoint tensor id space overflows u32")?);
     }
     Ok(CheckpointMetadata {
         files: checkpoint_files,

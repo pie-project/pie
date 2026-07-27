@@ -4,9 +4,6 @@ use serde::{Deserialize, Serialize};
 pub struct TensorId(pub u32);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ExprId(pub u32);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BufferId(pub u32);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -48,13 +45,6 @@ impl DType {
             Self::F16 | Self::BF16 | Self::I16 | Self::U16 => 2,
             Self::F8E4M3 | Self::F8E5M2 | Self::E8M0 | Self::I8 | Self::U8 | Self::Bool => 1,
         }
-    }
-
-    pub fn is_float(self) -> bool {
-        matches!(
-            self,
-            Self::F32 | Self::F16 | Self::BF16 | Self::F8E4M3 | Self::F8E5M2 | Self::E8M0
-        )
     }
 
     /// Whether a checkpoint storing this dtype ships a separate block-scale
@@ -239,24 +229,11 @@ pub struct TensorDecl {
 }
 
 impl TensorDecl {
-    pub fn same_runtime_contract(&self, other: &Self) -> bool {
-        self.shape == other.shape
-            && self.encoding == other.encoding
-            && self.alignment == other.alignment
-    }
-
     pub fn dtype(&self) -> DType {
         match &self.encoding {
             Encoding::Raw(dtype) => *dtype,
             Encoding::Quant(spec) => spec.logical_dtype,
         }
-    }
-
-    pub fn with_name_and_id(&self, id: TensorId, name: impl Into<String>) -> Self {
-        let mut out = self.clone();
-        out.id = id;
-        out.name = name.into();
-        out
     }
 }
 

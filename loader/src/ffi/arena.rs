@@ -136,7 +136,7 @@ impl PlanArena {
     /// The returned `PieLoaderPlan` is itself boxed so the driver holds a stable
     /// pointer; `owner` points at the arena. Both are reclaimed together by
     /// [`release`].
-    fn finish(self, plan: &LoadPlan, extras: &PlanExtras) -> *mut PieLoaderPlan {
+    fn finish(self, plan: &LoadPlan, cache_key: &str) -> *mut PieLoaderPlan {
         let files = PieLoaderCheckpointFileSlice {
             ptr: self.files.as_ptr(),
             len: self.files.len(),
@@ -168,7 +168,7 @@ impl PlanArena {
         // Rendered here rather than driver-side so the loader stays the only
         // place that knows how to name its own instructions.
         let mut arena = self;
-        let cache_key = arena.store_str(&extras.cache_key);
+        let cache_key = arena.store_str(cache_key);
         let summary = arena.store_str(&crate::dump::describe(plan));
         let stats_json = arena.store_str(&crate::dump::plan_stats_json(plan));
         let owner = Box::into_raw(Box::new(arena)).cast::<std::ffi::c_void>();
@@ -382,29 +382,17 @@ fn flatten_instr(arena: &mut PlanArena, instr: &StorageInstr) -> PieLoaderStorag
     PieLoaderStorageInstrView { id: id.0, op }
 }
 
-/// The fact a driver needs that a plan alone cannot state.
+/// The cache key to ship with a plan that was not compiled for a snapshot.
 ///
-/// Derived from the plan *and the request it came from*: the cache key needs the
-/// snapshot path, which is not in the plan. Computing it once at compile time
-/// and shipping it with the plan is what keeps two drivers from each growing
-/// their own version.
-pub struct PlanExtras {
-    pub cache_key: String,
-}
-
-impl Default for PlanExtras {
-    /// The key is still a key: an empty one would collide across every model.
-    fn default() -> Self {
-        Self {
-            cache_key: "0000000000000000".to_string(),
-        }
-    }
-}
+/// A key is still a key: an empty one would collide across every model, so the
+/// callers that have no snapshot path to hash — `plan_view` and its tests — name
+/// this instead of inventing one each.
+pub const UNKEYED: &str = "0000000000000000";
 
 /// Convert a compiled [`LoadPlan`] into the POD form the driver walks.
 ///
 /// The caller owns the result and must hand it to [`release`].
-pub fn build(plan: &LoadPlan, extras: &PlanExtras) -> *mut PieLoaderPlan {
+pub fn build(plan: &LoadPlan, cache_key: &str) -> *mut PieLoaderPlan {
     let mut arena = PlanArena::default();
 
     arena.tensors.reserve(plan.tensors.len());
@@ -498,7 +486,7 @@ pub fn build(plan: &LoadPlan, extras: &PlanExtras) -> *mut PieLoaderPlan {
         });
     }
 
-    arena.finish(plan, extras)
+    arena.finish(plan, cache_key)
 }
 
 /// Reclaim a plan produced by [`build`].

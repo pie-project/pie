@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use super::Expr;
 use super::infer::Checked;
-use crate::error::Error;
+use crate::error::{Error, OrOverflow};
 use crate::extent::{Dim, Rect};
 use crate::types::Encoding;
 
@@ -78,11 +78,20 @@ impl Lowering {
     ///
     /// Count [`Lowering::pieces`] instead when the executor can issue strided
     /// copies — a row shard is thousands of runs but one piece.
+    ///
+    /// Nothing on the load path reads this: [`Lowering::cost`] is what picks a
+    /// lowering. It is here so this module's own tests can state the shape they
+    /// expect — "a row shard of a fused bank is 2048 runs averaging 3072
+    /// elements" is a claim about the algebra, and asserting it directly is how
+    /// a regression in `compile` shows up as a failing number rather than as a
+    /// slower plan nobody times.
     pub fn run_count(&self) -> usize {
         self.runs.len()
     }
 
     /// Mean run length in elements, or 0 for an empty lowering.
+    ///
+    /// Test observability, as [`Lowering::run_count`] is.
     pub fn mean_run_elements(&self) -> i64 {
         if self.runs.is_empty() {
             0
@@ -250,7 +259,7 @@ impl ByteScale {
     fn scaled(&self, elems: i64, what: &str) -> Result<i64, Error> {
         let total = elems
             .checked_mul(self.bits)
-            .ok_or_else(|| Error::Overflow("byte offset overflows".to_string()))?;
+            .or_overflow("byte offset overflows")?;
         if total % 8 != 0 {
             return Err(Error::Contract(format!(
                 "{what} of {elems} elements is not byte-aligned under a {} -bit encoding",
@@ -497,12 +506,12 @@ impl Builder<'_> {
         for axis in (0..shape.len().saturating_sub(1)).rev() {
             strides[axis] = strides[axis + 1]
                 .checked_mul(shape[axis + 1])
-                .ok_or_else(|| Error::Overflow("shape overflows i64".to_string()))?;
+                .or_overflow("shape overflows i64")?;
         }
         let elements = match shape.first() {
             Some(first) => first
                 .checked_mul(strides[0])
-                .ok_or_else(|| Error::Overflow("element count overflows i64".to_string()))?,
+                .or_overflow("element count overflows i64")?,
             None => 1,
         };
         self.nodes.push(Node {

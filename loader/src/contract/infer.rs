@@ -14,7 +14,7 @@
 //! disagreed with the checker about what a name meant would be a bug that only
 //! showed up at tp > 1.
 
-use crate::error::Error;
+use crate::error::{Error, OrOverflow};
 use crate::types::{Axis, Encoding, QuantSpec};
 
 use super::compile;
@@ -357,9 +357,9 @@ fn infer_slice(
         .checked_add(
             len.checked_sub(1)
                 .and_then(|n| n.checked_mul(step))
-                .ok_or_else(|| Error::Overflow("Slice extent overflows i64".to_string()))?,
+                .or_overflow("Slice extent overflows i64")?,
         )
-        .ok_or_else(|| Error::Overflow("Slice extent overflows i64".to_string()))?;
+        .or_overflow("Slice extent overflows i64")?;
     if last >= extent {
         return Err(Error::Contract(format!(
             "Slice reads index {last} of axis {index}, which has extent {extent}"
@@ -422,7 +422,7 @@ fn infer_cat(axis: Axis, parts: &[TensorType]) -> Result<TensorType, Error> {
         }
         total = total
             .checked_add(part.shape[index])
-            .ok_or_else(|| Error::Overflow("Cat extent overflows i64".to_string()))?;
+            .or_overflow("Cat extent overflows i64")?;
     }
     if let Some(group) = block_granularity(&head.encoding, index) {
         for (offset, part) in parts.iter().enumerate() {
@@ -476,7 +476,7 @@ fn infer_reshape(ty: &TensorType, requested: &[i64]) -> Result<TensorType, Error
             extent => {
                 known = known
                     .checked_mul(extent)
-                    .ok_or_else(|| Error::Overflow("Reshape extent overflows i64".to_string()))?;
+                    .or_overflow("Reshape extent overflows i64")?;
             }
         }
     }
@@ -525,7 +525,7 @@ fn infer_pad(ty: &TensorType, axis: Axis, before: i64, after: i64) -> Result<Ten
     let extent = ty.shape[index]
         .checked_add(before)
         .and_then(|sum| sum.checked_add(after))
-        .ok_or_else(|| Error::Overflow("Pad extent overflows i64".to_string()))?;
+        .or_overflow("Pad extent overflows i64")?;
     let mut shape = ty.shape.clone();
     shape[index] = extent;
     Ok(TensorType {
