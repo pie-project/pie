@@ -43,12 +43,24 @@ struct Config {
 ///
 /// Most ambiguity in these grammars is local and collapses within a token or
 /// two, but order-free objects keep one configuration per subset of required
-/// properties they might have completed, and nesting multiplies those. Raising
-/// the cap from 64 to 128 recovered documents that had been rejected purely
-/// because the set was truncated; 256 recovered two more, so this is where it
-/// stops paying. Dropping configurations can only make the matcher stricter,
-/// never looser.
-const MAX_CONFIGS: usize = 128;
+/// properties they might have completed, and nesting multiplies those.
+///
+/// Dropping configurations can only make the matcher stricter, never looser, so
+/// this is a source of refusals rather than of wrong acceptances - every
+/// document in this corpus that the parser refuses although its schema accepts
+/// it is refused after the set was truncated here, and all of them at the
+/// closing brace, having lost the configuration that had seen every required
+/// property. Settable so that the cost of the ceiling can be measured rather
+/// than assumed.
+fn max_configs() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("GPUGRAMMAR_MAX_CONFIGS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(128)
+    })
+}
 
 /// A parse in progress.
 #[derive(Debug, Clone)]
@@ -236,7 +248,7 @@ impl Matcher {
                 };
                 if !next.contains(&candidate) {
                     next.push(candidate);
-                    if next.len() == MAX_CONFIGS {
+                    if next.len() == max_configs() {
                         return next;
                     }
                 }

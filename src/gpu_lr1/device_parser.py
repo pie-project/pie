@@ -1783,7 +1783,7 @@ class DeviceGrammar:
         compiled=None,
         max_stack: int = 256,
         max_reductions: int | None = None,
-        max_configs: int = 16,
+        max_configs: int = 128,
         window: int | None = None,
         capacity: int = 16,
     ):
@@ -1796,6 +1796,13 @@ class DeviceGrammar:
         self.max_reductions = (
             max_reductions if max_reductions is not None else max_stack
         )
+        # Matches the reference matcher. Dropping configurations can only make a
+        # parser stricter, so a ceiling below the matcher's is a source of masks
+        # that are narrower than the grammar allows - and sixteen was reached at
+        # 17.7% of the corpus's steps, in 36% of its documents. It is affordable
+        # because the sweep enumerates the configurations that exist rather than
+        # the ceiling: 128 against 16 costs 340 MB against 52 at batch 512, and
+        # 70 us against 52.
         self.max_configs = max_configs
         self._forced_window = window
 
