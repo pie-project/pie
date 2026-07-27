@@ -106,9 +106,9 @@ driver/
 `interface/ptir/` and `sdk/rust/ptir-dsl/` are already gone (`460136fb2`).
 
 `driver/common/` disappears: its PTIR half is deleted, and the rest becomes
-`driver/abi/` — 1,119 lines of ABI/data-plane plus 884 lines of fire-time PODs
-(`descriptor.hpp`, `fire_geometry.hpp`, `ptir_channels.hpp`), which are driver
-state and never belonged to the compiler.
+`driver/abi/` — 1,119 lines of ABI/data-plane plus 602 lines of fire-time PODs
+(`descriptor.hpp`, `fire_geometry.hpp`), which are driver state and never
+belonged to the compiler.
 
 `src/pipeline/` is 23,786 today; 20,119 after phase 2′ removes the two emitters,
 and 19,245 once `module_cache.hpp` is promoted out of `generated/` and that
@@ -474,8 +474,9 @@ through a blanket `../common/include` repeated on ~10 targets. So this is a
 - `driver/abi/` ← `abi_validation.hpp` (869), `launch_view.hpp` (135),
   `step_launch.hpp` (78), `elastic.hpp` (37) — 1,119 lines of ABI and data
   plane — plus the fire-time PODs `descriptor.hpp` (317), `fire_geometry.hpp`
-  (285), `ptir_channels.hpp` (282). **~2.0k total**, not the 1.1k an earlier
-  draft claimed.
+  (285). **~1.7k total**, not the 1.1k an earlier draft claimed. (A third POD
+  header, `ptir_channels.hpp` (282), turned out to be a *container decoder*
+  wearing a POD's clothes, and was deleted outright — see §9.2.)
 - `driver/common/ptir/` is then a pure deletion target for phases 1′ and 3′.
 
 Doing this first is what makes the rest legible: after it, "delete the PTIR
@@ -810,12 +811,13 @@ no byte slice to be zero-length, because there is no byte slice.
 |---|---|---|
 | `cuda/generated/module_cache.hpp` | 957 | NVRTC compile + cubin cache. Never sees a program. |
 | `metal/pipeline/interp.hpp` | 1,689 | Metal's **M0 execution path**, live from `context.cpp` |
-| `metal/pipeline/descriptor_resolve.hpp` | 456 | program-agnostic port→field copier |
-| `cuda/pipeline/descriptor_resolve.hpp` | 408 | ditto |
+| `metal/pipeline/descriptor_resolve.hpp` | 399 | program-agnostic port→field copier (was 456) |
+| `cuda/pipeline/descriptor_resolve.hpp` | 355 | ditto (was 408) |
+| `abi/launch/trace_query.hpp` | 81 | the pure part both resolvers used to hand-copy |
 | `cuda/pipeline/region_support.hpp` | 301 | fire-time region plumbing (was 488; the three *analyses* are gone) |
 | `metal/pipeline/region_support.hpp` | 81 | ditto (was 456) |
 | `cuda/tests/support/host_eval.hpp` | 455 | differential oracle for the tier-0 CUDA kernels |
-| `driver/abi/include/pie_native/` | 3,028 | the launch package view — **shared, one copy** |
+| `driver/abi/include/pie_native/` | 2,816 | the launch package view — **shared, one copy** |
 
 Two of these were booked as phase-3′ deletions in an earlier draft, and both
 bookings were wrong:
@@ -969,6 +971,8 @@ that no driver can decode PTIR even if someone wanted it to.
 
 ## 9. What the order turned out to be worth
 
+### 9.1 The plan against the outcome
+
 The plan held. Phase 0 and 1′ cost nothing and made everything after them
 cheaper, exactly as argued. 2′ merged as predicted, and the differential oracle
 did answer the faithfulness question for both backends on one Linux box.
@@ -1006,3 +1010,49 @@ Two things were learned that the plan had no way to anticipate:
   deleted citing unverifiability, one of which was pure host and always ran. The
   coverage is rebuilt (§4.3) and the deletion of a decoder-era fixture format is
   still correct — but the reason given for it was not.
+
+### 9.2 What a structural claim is worth: three things it found
+
+"The driver receives a launch package and nothing else" is not a slogan; it is
+a predicate, and predicates can be checked. Reading the tree against it after
+the refactor landed turned up three survivors that no test was ever going to
+catch, because in each case the code compiled, linked, and ran correctly — it
+just described a world that had stopped existing.
+
+* **A container decoder outlived its input.** `driver/abi/ptir_channels.hpp`
+  checked the `"PTIR"` magic, read a version header, and walked a cursor over
+  raw bytes — 282 lines of exactly the thing §2.3 says no longer happens. Zero
+  callers. Its single `#include` named no symbol from it, so it stayed
+  well-formed forever. A header that contradicts an architectural claim is worse
+  than dead: the next reader has to work out which of the two is true.
+
+* **A value source that never had a producer.** `PIE_VALUE_HOST_INPUT = 2` was
+  a literal gap in the codegen constant list (0, 1, _, 3, 4, 5), and
+  `git log -S VALUE_HOST_INPUT --all -- compiler/` returns nothing in any
+  revision. The limb still spanned two ABI fields, two enums, the adopt copies,
+  and a consumer in *each* driver — CUDA looking up a map nothing writes, Metal
+  rejecting with a reason it can never print. An unreachable branch is not
+  defensive; it is a claim that the feature exists. Removing it made the value
+  source numbering dense again (0..4) and took the ABI to 19.
+
+* **Pure logic, hand-copied, already drifting.** `producer()` and
+  `structured_mask_descriptor()` walk an adopted `Trace` and touch nothing else
+  — no device memory, no channel state, no backend type. Both drivers carried
+  their own copy, ~150 lines, with nothing comparing them
+  (`drivers_do_not_retype_generated_tags` gates *tags*, not logic). They had
+  begun to diverge cosmetically: CUDA ends the mask walk `default: break;` then
+  breaks the loop, Metal ends it `default: return {};`. Same answer today, by
+  luck of the control flow. The first drift is always the harmless one, and it
+  is the one that tells you the copies are independent. They now live once, in
+  `pie_native/launch/trace_query.hpp`.
+
+The pattern is the same in all three: a *structural* invariant ("no PTIR
+bytes", "every value source has a producer", "one definition per contract")
+catches things a behavioural test cannot, because the code under it was never
+wrong — it was unreachable, or redundant, or true of a previous design. Tests
+check what runs. Only reading the tree against the claim checks what doesn't.
+
+One incidental confirmation: bumping the ABI to 19 made
+`ptir_grouped_dispatch_asan` — a separate binary, still linked at 18 — refuse
+the regenerated fixtures with *"launch image was written for a different driver
+ABI"* rather than misread them. The version field is not ceremony.
