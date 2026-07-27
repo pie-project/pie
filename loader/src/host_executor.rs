@@ -121,6 +121,7 @@ impl HostExecutor<'_> {
                 .clone();
             match instr {
                 StorageInstr::Allocate { buffer, .. } => self.allocate(buffer)?,
+                StorageInstr::Fill { buffer, .. } => self.fill(buffer)?,
                 StorageInstr::ExtentWrite { source, dest, .. } => {
                     let bytes = self.read_extent(&source)?;
                     self.write_extent(&dest, &bytes, &source.stride)?;
@@ -227,6 +228,20 @@ impl HostExecutor<'_> {
         };
         if self.buffers.insert(id, loc).is_some() {
             return Err(invalid(format!("buffer {} was allocated twice", id.0)));
+        }
+        Ok(())
+    }
+
+    /// Zero a buffer. An `Owned` buffer is already zero at allocation, but a
+    /// persistent one is a window into an arena that may hold anything.
+    fn fill(&mut self, id: BufferId) -> Result<(), Error> {
+        let (root, offset, len) = self.resolve(id, 0, usize::MAX)?;
+        match root {
+            Root::Arena => self.arena[offset..offset + len].fill(0),
+            Root::Owned(owner) => match self.buffers.get_mut(&owner) {
+                Some(BufferLoc::Owned(bytes)) => bytes[offset..offset + len].fill(0),
+                _ => return Err(invalid(format!("buffer {} is not writable", id.0))),
+            },
         }
         Ok(())
     }
@@ -723,6 +738,7 @@ fn encode_values(values: &[f64], dtype: DType) -> Result<Vec<u8>, Error> {
 fn instr_id(instr: &StorageInstr) -> crate::types::InstrId {
     match instr {
         StorageInstr::Allocate { id, .. }
+        | StorageInstr::Fill { id, .. }
         | StorageInstr::ExtentWrite { id, .. }
         | StorageInstr::BulkExtentWrite { id, .. }
         | StorageInstr::SlabScatter { id, .. }
@@ -766,6 +782,64 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    /// A padded tensor, compiled and then actually run.
+    ///
+    /// Every other test here hands the executor a plan built by hand, which
+    /// cannot catch a compiler that emits the fill in the wrong place. This one
+    /// goes contract -> `compile` -> `execute_plan` and reads the bytes back,
+    /// so the padded columns being zero is a fact about the whole path.
+    #[test]
+    fn a_padded_tensor_comes_back_with_zeros_where_no_source_reaches() {
+        use crate::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
+        use crate::contract::{Expr, ModelContract, TensorContract};
+
+        let dir = std::env::temp_dir().join(format!("pie_host_pad_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let header = r#"{"raw":{"dtype":"U8","shape":[2,3],"data_offsets":[0,6]}}"#;
+        let mut file = (header.len() as u64).to_le_bytes().to_vec();
+        file.extend_from_slice(header.as_bytes());
+        let data_offset = file.len() as u64;
+        file.extend_from_slice(&[1, 2, 3, 4, 5, 6]);
+        let size_bytes = file.len() as u64;
+        std::fs::write(dir.join("model.safetensors"), &file).unwrap();
+
+        let metadata = CheckpointMetadata {
+            files: vec![CheckpointFile {
+                id: FileId(0),
+                path: "model.safetensors".to_string(),
+                size_bytes,
+                format: crate::types::CheckpointFormat::Safetensors,
+            }],
+            tensors: vec![RawTensor {
+                id: TensorId(0),
+                name: "raw".to_string(),
+                file_id: FileId(0),
+                file_offset: data_offset,
+                span_bytes: 6,
+                shape: vec![2, 3],
+                encoding: Encoding::Raw(DType::U8),
+            }],
+        };
+        let contract = ModelContract {
+            abi_version: 1,
+            alignment: 1,
+            tensors: vec![TensorContract::new(
+                "padded",
+                Expr::src("raw").pad(1, 1, 1),
+                vec![2, 5],
+                Encoding::Raw(DType::U8),
+            )],
+        };
+
+        let plan = crate::plan::compile(&metadata, &contract, StorageTarget::default()).unwrap();
+        let storage = execute_plan(&plan, &dir).unwrap();
+        assert_eq!(
+            storage.tensors["padded"].bytes,
+            vec![0, 1, 2, 3, 0, 0, 4, 5, 6, 0]
+        );
+        std::fs::remove_dir_all(dir).ok();
     }
 
     fn fixture() -> (PathBuf, LoadPlan) {

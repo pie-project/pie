@@ -258,6 +258,12 @@ fn flatten_instr(arena: &mut PlanArena, instr: &StorageInstr) -> PieLoaderStorag
             out.kind = PieLoaderStorageInstrKind::Allocate;
             out.buffer_id = buffer.0;
         }
+        StorageInstr::Fill { id, buffer } => {
+            out.id = id.0;
+            out.kind = PieLoaderStorageInstrKind::Fill;
+            out.buffer_id = buffer.0;
+            out.output_buffers = arena.store_u32([buffer.0]);
+        }
         StorageInstr::ExtentWrite { id, source, dest } => {
             out.id = id.0;
             out.kind = PieLoaderStorageInstrKind::ExtentWrite;

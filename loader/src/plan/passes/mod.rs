@@ -51,6 +51,7 @@ pub fn all() -> Vec<Box<dyn Pass>> {
             rewrite::merge_adjacent_extent_writes,
         ),
         boxed("recompute-memory-plan", memory::recompute_memory_plan),
+        boxed("validate-fill-order", rewrite::validate_fill_order),
         boxed("validate-target-support", rewrite::validate_target_support),
         boxed(
             "validate-persistent-layout",

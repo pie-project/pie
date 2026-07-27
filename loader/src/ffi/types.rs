@@ -369,6 +369,7 @@ pub enum PieLoaderStorageInstrKind {
     Finalize = 5,
     BulkExtentWrite = 6,
     SlabScatter = 7,
+    Fill = 8,
 }
 
 /// `None` is the resting value for instructions that carry no tile map, so it

@@ -1231,6 +1231,7 @@ fn mla_q_kv_a_fusion_produces_joined_tensor() {
 fn instr_id(instr: &StorageInstr) -> pie_loader::types::InstrId {
     match instr {
         StorageInstr::Allocate { id, .. }
+        | StorageInstr::Fill { id, .. }
         | StorageInstr::ExtentWrite { id, .. }
         | StorageInstr::BulkExtentWrite { id, .. }
         | StorageInstr::SlabScatter { id, .. }
@@ -1326,4 +1327,79 @@ fn a_source_without_a_scale_sibling_names_none() {
             assert_eq!(transform.metadata_source, None);
         }
     }
+}
+
+#[test]
+fn a_padded_head_dim_zeroes_the_buffer_before_it_writes_the_rows() {
+    // `driver/cuda/src/model/llama_like/llama_like.cpp:640` wants this: pad Q/K/V
+    // up to a head_dim the attention kernel takes. Until `Fill` existed the
+    // compiler priced the pad (spec.md §3.3) and then refused to build it.
+    let metadata = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "model.safetensors".to_string(),
+            size_bytes: 1024,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors: vec![RawTensor {
+            id: TensorId(0),
+            name: "q_proj.weight".to_string(),
+            file_id: FileId(0),
+            file_offset: 0,
+            span_bytes: 32,
+            shape: vec![4, 4],
+            encoding: Encoding::Raw(DType::BF16),
+        }],
+    };
+
+    let contract = ModelContract {
+        abi_version: 1,
+        alignment: 1,
+        tensors: vec![TensorContract::new(
+            "q_proj.weight",
+            Expr::src("q_proj.weight").pad(1, 0, 1),
+            vec![4, 5],
+            Encoding::Raw(DType::BF16),
+        )],
+    };
+
+    let program = compile_load_plan(&metadata, &contract, StorageTarget::default()).unwrap();
+
+    let fills: Vec<_> = program
+        .instrs
+        .iter()
+        .filter_map(|instr| match instr {
+            StorageInstr::Fill { id, buffer } => Some((*id, *buffer)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(fills.len(), 1, "one fill, not one per band");
+    let (fill_id, filled) = fills[0];
+
+    // Four rows, because the destination stride is wider than the row and
+    // `fold` will not skip in the destination. spec.md §3.3 prices this at 5.
+    let writes: Vec<_> = program
+        .instrs
+        .iter()
+        .filter(|instr| {
+            matches!(
+                instr,
+                StorageInstr::ExtentWrite { .. } | StorageInstr::BulkExtentWrite { .. }
+            )
+        })
+        .collect();
+    assert_eq!(writes.len(), 4);
+
+    // The fill has to run before every one of them, or it erases what they wrote.
+    let at = |want| program.schedule.iter().position(|id| *id == want).unwrap();
+    let fill_at = at(fill_id);
+    for write in &writes {
+        assert!(fill_at < at(instr_id(write)), "the fill must come first");
+    }
+
+    // The padded column is real memory that no source covers.
+    assert_eq!(program.memory.checkpoint_read_bytes, 32);
+    assert_eq!(program.memory.device_write_bytes, 32);
+    assert_eq!(program.memory.persistent_bytes, 40);
+    assert_eq!(program.buffer(filled).unwrap().bytes, 40);
 }

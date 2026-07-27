@@ -242,18 +242,15 @@ impl Builder<'_> {
 
     /// Emit the rectangular copies of a solved expression.
     fn copies(&mut self, lowering: &Lowering, decl: &TensorDecl) -> Result<Value> {
-        if lowering.needs_zero_fill() {
-            return Err(Error::Unsupported(
-                "padding needs a zero-fill instruction, which the plan does not have yet"
-                    .to_string(),
-            ));
-        }
         let output_bytes = encoding_nbytes(&decl.shape, &decl.encoding)
             .ok_or_else(|| Error::Overflow(format!("'{}' size overflow", decl.name)))?;
         let rects = lowering.byte_pieces(&decl.encoding)?;
 
         // One copy covering the whole output can often avoid a copy entirely.
+        // Not when the destination has holes: aliasing or viewing a source
+        // would hand back bytes the expression says are zero.
         if let [rect] = rects.as_slice()
+            && !lowering.needs_zero_fill()
             && rect.dst_offset == 0
             && rect.bytes() == output_bytes
         {
@@ -289,6 +286,14 @@ impl Builder<'_> {
         }
 
         let out = self.allocate(decl, true)?;
+        if lowering.needs_zero_fill() {
+            let instr = self.next_instr();
+            self.program.instrs.push(StorageInstr::Fill {
+                id: instr,
+                buffer: out,
+            });
+            self.program.schedule.push(instr);
+        }
         for rect in &rects {
             match self.leaf(lowering, rect.leaf)? {
                 Value::Source(source) => {

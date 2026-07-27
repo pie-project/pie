@@ -20,6 +20,7 @@ pub fn dump_load_plan_json(plan: &LoadPlan) -> Result<String, Error> {
 fn instr_name(instr: &StorageInstr) -> &'static str {
     match instr {
         StorageInstr::Allocate { .. } => "Allocate",
+        StorageInstr::Fill { .. } => "Fill",
         StorageInstr::ExtentWrite { .. } => "ExtentWrite",
         StorageInstr::BulkExtentWrite { .. } => "BulkExtentWrite",
         StorageInstr::SlabScatter { .. } => "SlabScatter",

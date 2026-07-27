@@ -55,13 +55,66 @@ pub(super) fn non_bulk_compatible_persistent_write_buffers(
     Ok(blocked)
 }
 
+/// Every `Fill` runs before every write to the buffer it zeroes.
+///
+/// A fill is the one instruction whose *absence of order* is silent: run it
+/// late and the plan still validates, still has the right instruction count,
+/// and hands back a tensor whose padded region has eaten real data. Passes
+/// that reorder are free to move fills as long as this holds.
+pub(super) fn validate_fill_order(program: &mut LoadPlan) -> Result<usize> {
+    let mut filled: HashMap<BufferId, usize> = HashMap::new();
+    for (at, id) in program.schedule.iter().enumerate() {
+        if let StorageInstr::Fill { buffer, .. } = instr_by_id(&program.instrs, *id)? {
+            filled.insert(*buffer, at);
+        }
+    }
+    if filled.is_empty() {
+        return Ok(0);
+    }
+    for (at, id) in program.schedule.iter().enumerate() {
+        let instr = instr_by_id(&program.instrs, *id)?;
+        let buffer = match instr {
+            StorageInstr::ExtentWrite { dest, .. } => dest.buffer,
+            StorageInstr::BulkExtentWrite { .. } | StorageInstr::SlabScatter { .. } => {
+                // Arena-relative: the destination is an offset, not a buffer,
+                // so any fill of a persistent buffer could overlap it.
+                match filled.keys().find(|buffer| {
+                    program
+                        .buffer(**buffer)
+                        .is_ok_and(|decl| decl.persistent_offset.is_some())
+                }) {
+                    Some(buffer) => *buffer,
+                    None => continue,
+                }
+            }
+            StorageInstr::TileMap { outputs, .. } => match outputs.first() {
+                Some(buffer) => *buffer,
+                None => continue,
+            },
+            _ => continue,
+        };
+        if let Some(fill_at) = filled.get(&buffer)
+            && *fill_at > at
+        {
+            return Err(Error::Internal(format!(
+                "buffer {} is written at step {at} but not zeroed until step {fill_at}",
+                buffer.0
+            )));
+        }
+    }
+    Ok(0)
+}
+
 pub(super) fn hoist_bulk_extent_writes(program: &mut LoadPlan) -> Result<usize> {
     if program.schedule.len() < 2 {
         return Ok(0);
     }
     let old_instrs = program.instrs.clone();
     let mut pending_bulk: Vec<StorageInstr> = Vec::new();
-    let mut allocations: Vec<StorageInstr> = Vec::new();
+    // Everything that has to happen before a byte is written: the allocations,
+    // and the fills. A fill after the write it was meant to precede erases it,
+    // so `Fill` cannot be left in `rest` — `validate-fill-order` is the check.
+    let mut prologue: Vec<StorageInstr> = Vec::new();
     let mut rest: Vec<StorageInstr> = Vec::with_capacity(old_instrs.len());
     let mut result: Vec<StorageInstr> = Vec::with_capacity(old_instrs.len());
     let mut rewrites = 0_u64;
@@ -70,13 +123,16 @@ pub(super) fn hoist_bulk_extent_writes(program: &mut LoadPlan) -> Result<usize> 
         let instr = instr_by_id(&old_instrs, *instr_id)?;
         if matches!(instr, StorageInstr::BulkExtentWrite { .. }) {
             pending_bulk.push(instr.clone());
-        } else if matches!(instr, StorageInstr::Allocate { .. }) {
-            allocations.push(instr.clone());
+        } else if matches!(
+            instr,
+            StorageInstr::Allocate { .. } | StorageInstr::Fill { .. }
+        ) {
+            prologue.push(instr.clone());
         } else {
             rest.push(instr.clone());
         }
     }
-    result.append(&mut allocations);
+    result.append(&mut prologue);
     flush_pending_bulk(
         &mut result,
         &mut pending_bulk,
@@ -677,6 +733,7 @@ pub(super) fn is_byte_extent(extent: &Extent) -> bool {
 pub(crate) fn instr_id_of(instr: &StorageInstr) -> InstrId {
     match instr {
         StorageInstr::Allocate { id, .. }
+        | StorageInstr::Fill { id, .. }
         | StorageInstr::ExtentWrite { id, .. }
         | StorageInstr::BulkExtentWrite { id, .. }
         | StorageInstr::SlabScatter { id, .. }
@@ -689,6 +746,7 @@ pub(crate) fn instr_id_of(instr: &StorageInstr) -> InstrId {
 pub(super) fn set_instr_id(instr: &mut StorageInstr, new_id: InstrId) {
     match instr {
         StorageInstr::Allocate { id, .. }
+        | StorageInstr::Fill { id, .. }
         | StorageInstr::ExtentWrite { id, .. }
         | StorageInstr::BulkExtentWrite { id, .. }
         | StorageInstr::SlabScatter { id, .. }

@@ -410,6 +410,18 @@ pub enum StorageInstr {
         id: InstrId,
         buffer: BufferId,
     },
+    /// Zero `buffer` before anything writes into it.
+    ///
+    /// A padded destination has holes, and a hole is not copied zeros — it is
+    /// a destination that was zeroed once and then not written to. That is why
+    /// `Lowering::cost` prices padding as one fill rather than one copy per
+    /// band: dropping the holes lets the data on either side fold together,
+    /// which for a head-dim pad is the difference between `2·n_heads` copies
+    /// and one.
+    Fill {
+        id: InstrId,
+        buffer: BufferId,
+    },
     ExtentWrite {
         id: InstrId,
         source: SourceExtent,

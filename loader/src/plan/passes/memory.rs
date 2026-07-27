@@ -38,6 +38,8 @@ pub(super) fn recompute_memory_plan(program: &mut LoadPlan) -> Result<usize> {
                     live_peak = live_peak.max(live_bytes);
                 }
             }
+            // A fill moves no checkpoint bytes and allocates nothing.
+            StorageInstr::Fill { .. } => {}
             StorageInstr::ExtentWrite { source, .. } => {
                 checkpoint_read_bytes = checkpoint_read_bytes
                     .checked_add(source.span_bytes)

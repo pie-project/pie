@@ -91,10 +91,6 @@ fn decl(id: u32, name: &str, shape: &[i64]) -> TensorDecl {
 fn realize(expr: &Expr, fixture: &Fixture) -> Vec<i64> {
     let (ty, checked) = infer_type(expr, fixture).unwrap();
     let lowering = compile(expr, &checked, MAX_RUNS).unwrap();
-    assert!(
-        !lowering.needs_zero_fill(),
-        "this helper does not model padding"
-    );
     replay(&lowering, &ty, &fixture.values()).unwrap()
 }
 
@@ -112,7 +108,7 @@ fn oracle(expr: &Expr, fixture: &Fixture) -> Vec<i64> {
                 rest /= dim;
             }
             index.reverse();
-            resolve(expr, &index, fixture).expect("the helper expressions have no holes")
+            resolve(expr, &index, fixture).unwrap_or(0)
         })
         .collect()
 }
@@ -166,6 +162,21 @@ fn resolve(expr: &Expr, index: &[i64], fixture: &Fixture) -> Option<i64> {
             for (at, dim) in inner_ty.shape.iter().enumerate().rev() {
                 inner[at] = rest % dim;
                 rest /= dim;
+            }
+            resolve(input, &inner, fixture)
+        }
+        Expr::Pad {
+            src: input,
+            axis,
+            before,
+            after: _,
+        } => {
+            let at = usize::from(axis.0);
+            let (inner_ty, _) = infer_type(input, fixture).unwrap();
+            let mut inner = index.to_vec();
+            inner[at] -= before;
+            if inner[at] < 0 || inner[at] >= inner_ty.shape[at] {
+                return None;
             }
             resolve(input, &inner, fixture)
         }
@@ -355,4 +366,32 @@ fn the_replay_rejects_a_lowering_that_writes_one_element_twice() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("twice"), "{err}");
+}
+
+#[test]
+fn padding_a_head_dim_leaves_zeros_and_folds_the_copies() {
+    // spec.md §2 case 9: a model whose head_dim is not one the kernel takes is
+    // padded up. This is the one worked example in spec.md §3.3's cost table —
+    // a `[4, 4]` padded by one column, priced at 5 — so it is the case that
+    // says whether the code and the paper agree.
+    let fixture = Fixture::new(&[("q", &[4, 4])]);
+    let expr = Expr::src("q").pad(1, 0, 1);
+    check(expr.clone(), &fixture);
+
+    let (ty, checked) = infer_type(&expr, &fixture).unwrap();
+    assert_eq!(ty.shape, vec![4, 5]);
+    let lowering = compile(&expr, &checked, MAX_RUNS).unwrap();
+    assert!(lowering.needs_zero_fill());
+    // Eight alternating data and zero runs become four data runs and one fill.
+    // They do not fold further: the destination stride is 5 and the row is 4,
+    // and `fold` will not skip in the destination.
+    assert_eq!(lowering.copy_pieces().len(), 4);
+    assert_eq!(lowering.cost(), 5, "spec.md §3.3");
+}
+
+#[test]
+fn padding_the_front_shifts_the_data_instead_of_the_zeros() {
+    let fixture = Fixture::new(&[("q", &[2, 3])]);
+    check(Expr::src("q").pad(1, 2, 0), &fixture);
+    check(Expr::src("q").pad(0, 1, 1), &fixture);
 }

@@ -124,10 +124,15 @@ impl Lowering {
     /// The pieces that actually move data.
     ///
     /// A hole is not produced by copying zeros into the destination; it is
-    /// produced by zeroing the destination once and then not writing there. So
-    /// padding costs one fill, not one copy per band — and dropping the holes
-    /// lets the data on either side of one fold together, which is the
-    /// difference between `2·n_heads` copies and one for a head-dim pad.
+    /// produced by zeroing the destination once and then not writing there, so
+    /// padding costs one fill rather than one copy per band. For a head-dim
+    /// pad that halves the piece count: `2·n_heads` alternating data and zero
+    /// runs become `n_heads` data runs and one fill.
+    ///
+    /// They do not fold further. The destination stride across a padded row is
+    /// wider than the row, and `fold` refuses a destination that skips — see
+    /// `spec.md` §3.3, whose cost table prices exactly this case (a `[4, 4]`
+    /// padded by one column) at 5.
     pub fn copy_pieces(&self) -> Vec<Piece> {
         fold(
             self.runs
