@@ -39,7 +39,7 @@ import triton.language as tl
 
 _GROUP_BLOCK = 64
 # Configurations admitted per pass. Bounds the replay scratch, which is one
-# stack copy per (sequence, configuration, group).
+# stack window per (sequence, configuration, group).
 _CONFIG_CHUNK = 4
 ACCEPT = -(2**31)
 SPARSE, COMPLEMENT, DENSE = 0, 1, 2
@@ -65,6 +65,25 @@ def _search(keys_ptr, low, high, needle):
         else:
             high = middle
     return found
+
+
+@triton.jit
+def _peek(stack_ptr, base, window_ptr, floor, index):
+    """Read stack entry `index` through a window laid over a shared prefix.
+
+    A replay never writes below where its own pushes started, so the sequence's
+    stack can stay where it is and be read in place; only what the replay adds
+    needs to be private. The window holds `[floor, top)` and the entries below
+    `floor` are still the sequence's own.
+
+    Both addresses are in bounds whichever answer is wanted, so this selects
+    rather than branches. The load it would have skipped is in L1, and a branch
+    costs every lane in the block.
+    """
+    inside = index >= floor
+    held = tl.load(window_ptr + tl.maximum(index - floor, 0))
+    shared = tl.load(stack_ptr + base + index)
+    return tl.where(inside, held, shared)
 
 
 @triton.jit
@@ -101,6 +120,7 @@ def _mask_kernel(
     admitted_ptr,
     mask_ptr,
     overflow_ptr,
+    high_water_ptr,
     mask_words,
     LIVE,
     config_base,
@@ -109,6 +129,7 @@ def _mask_kernel(
     MAX_GROUPS: tl.constexpr,
     STACK_STRIDE: tl.constexpr,
     MAX_REDUCTIONS: tl.constexpr,
+    WINDOW: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     """One program per (sequence, configuration, group).
@@ -151,21 +172,22 @@ def _mask_kernel(
     if group >= last:
         return
 
-    # Replaying may push, so each program needs its own stack copy. The live
-    # prefix is shared and read-only; the copy only has to hold what a replay
-    # adds, which is bounded by the reduction limit.
-    scratch = (launched * tl.num_programs(1) + slot) * 2 * STACK_STRIDE
-    probe = scratch + STACK_STRIDE
+    # Replaying may push, and a push must not be seen by the other programs
+    # replaying the same stack, so each program needs somewhere private to put
+    # what it adds. It does not need a copy: the replay only ever reads the
+    # entry it has just exposed and writes the one above it, so everything
+    # below where its own pushes began is still the sequence's own stack and
+    # can be read there. The window holds only the difference.
+    scratch = (launched * tl.num_programs(1) + slot) * 2 * WINDOW
+    probe = scratch + WINDOW
     base = row_index * STACK_STRIDE
 
     admitted = 0
+    high_water = 0
     use = tl.load(reading_offsets_ptr + group)
     use_end = tl.load(reading_offsets_ptr + group + 1)
     while use < use_end:
         reading = tl.load(reading_index_ptr + use)
-        # Most groups die on their first terminal, so the stack is only copied
-        # once that is known to be shiftable. Copying first, and a byte at a
-        # time, cost more than the decision it was for.
         term = tl.load(reading_term_offsets_ptr + reading)
         term_end = tl.load(reading_term_offsets_ptr + reading + 1)
         top = tl.load(stack_ptr + base + depth - 1)
@@ -177,14 +199,12 @@ def _mask_kernel(
             if _search(action_terminals_ptr, row, row_end, terminal) < 0:
                 alive = 0
 
-        if alive == 1:
-            lane = tl.arange(0, STACK_STRIDE)
-            tl.store(
-                scratch_ptr + scratch + lane,
-                tl.load(stack_ptr + base + lane, mask=lane < depth, other=0),
-                mask=lane < depth,
-            )
+        # Nothing is copied. `floor` is where this replay's own writes begin,
+        # so the window is empty until it pushes, and a reading that dies on
+        # its first terminal - which most do - touches no scratch at all.
         copy_depth = depth
+        floor = depth
+        high_water = tl.maximum(high_water, 0)
         while term < term_end and alive == 1:
             terminal = tl.load(reading_terminals_ptr + term)
             settled = 0
@@ -208,11 +228,14 @@ def _mask_kernel(
                         if value == _ACCEPT:
                             alive = 0
                         elif value > 0:
-                            if copy_depth >= STACK_STRIDE:
+                            if copy_depth >= STACK_STRIDE or copy_depth - floor >= WINDOW:
                                 alive = 0
                                 tl.store(overflow_ptr + sequence, 1)
                             else:
-                                tl.store(scratch_ptr + scratch + copy_depth, value - 1)
+                                tl.store(
+                                    scratch_ptr + scratch + copy_depth - floor,
+                                    value - 1,
+                                )
                                 copy_depth = copy_depth + 1
                                 top = value - 1
                                 settled = 1
@@ -223,8 +246,17 @@ def _mask_kernel(
                                 alive = 0
                             else:
                                 copy_depth = copy_depth - arity
-                                exposed = tl.load(
-                                    scratch_ptr + scratch + copy_depth - 1
+                                # Popping past where this replay started puts the
+                                # top back in the sequence's own stack, and the
+                                # window's contents are all above it and dead, so
+                                # the window empties rather than being rewritten.
+                                floor = tl.minimum(floor, copy_depth)
+                                exposed = _peek(
+                                    stack_ptr,
+                                    base,
+                                    scratch_ptr + scratch,
+                                    floor,
+                                    copy_depth - 1,
                                 )
                                 lhs = tl.load(production_lhs_ptr + production)
                                 grow = tl.load(goto_offsets_ptr + exposed)
@@ -234,14 +266,21 @@ def _mask_kernel(
                                 )
                                 if target < 0:
                                     alive = 0
+                                elif (
+                                    copy_depth >= STACK_STRIDE
+                                    or copy_depth - floor >= WINDOW
+                                ):
+                                    alive = 0
+                                    tl.store(overflow_ptr + sequence, 1)
                                 else:
                                     top = tl.load(goto_targets_ptr + target)
                                     tl.store(
-                                        scratch_ptr + scratch + copy_depth, top
+                                        scratch_ptr + scratch + copy_depth - floor, top
                                     )
                                     copy_depth = copy_depth + 1
             if settled == 0:
                 alive = 0
+            high_water = tl.maximum(high_water, copy_depth - floor)
             term = term + 1
 
         # A reading that leaves a lexeme in progress needs some continuation the
@@ -257,18 +296,12 @@ def _mask_kernel(
                 any_ok = 0
                 while pend < pend_end and any_ok == 0:
                     terminal = tl.load(pending_terminals_ptr + pend)
-                    # Probe on a copy, since a reduce rewrites the stack.
-                    lane = tl.arange(0, STACK_STRIDE)
-                    tl.store(
-                        scratch_ptr + probe + lane,
-                        tl.load(
-                            scratch_ptr + scratch + lane,
-                            mask=lane < copy_depth,
-                            other=0,
-                        ),
-                        mask=lane < copy_depth,
-                    )
+                    # The probe reduces, which rewrites the stack, and it must
+                    # not disturb the replay it starts from - so it gets its own
+                    # window over the replay's window over the sequence's stack.
+                    # Three levels, no copy at any of them.
                     probe_depth = copy_depth
+                    probe_floor = copy_depth
                     probe_top = top
                     probe_alive = 1
                     probe_settled = 0
@@ -300,8 +333,25 @@ def _mask_kernel(
                                         probe_alive = 0
                                     else:
                                         probe_depth = probe_depth - arity
-                                        exposed = tl.load(
-                                            scratch_ptr + probe + probe_depth - 1
+                                        probe_floor = tl.minimum(
+                                            probe_floor, probe_depth
+                                        )
+                                        under = _peek(
+                                            stack_ptr,
+                                            base,
+                                            scratch_ptr + scratch,
+                                            floor,
+                                            tl.minimum(probe_depth - 1, copy_depth - 1),
+                                        )
+                                        held = tl.load(
+                                            scratch_ptr
+                                            + probe
+                                            + tl.maximum(
+                                                probe_depth - 1 - probe_floor, 0
+                                            )
+                                        )
+                                        exposed = tl.where(
+                                            probe_depth - 1 >= probe_floor, held, under
                                         )
                                         lhs = tl.load(production_lhs_ptr + production)
                                         grow = tl.load(goto_offsets_ptr + exposed)
@@ -313,15 +363,27 @@ def _mask_kernel(
                                         )
                                         if target < 0:
                                             probe_alive = 0
+                                        elif (
+                                            probe_depth >= STACK_STRIDE
+                                            or probe_depth - probe_floor >= WINDOW
+                                        ):
+                                            probe_alive = 0
+                                            tl.store(overflow_ptr + sequence, 1)
                                         else:
                                             probe_top = tl.load(
                                                 goto_targets_ptr + target
                                             )
                                             tl.store(
-                                                scratch_ptr + probe + probe_depth,
+                                                scratch_ptr
+                                                + probe
+                                                + probe_depth
+                                                - probe_floor,
                                                 probe_top,
                                             )
                                             probe_depth = probe_depth + 1
+                            high_water = tl.maximum(
+                                high_water, probe_depth - tl.minimum(probe_floor, floor)
+                            )
                     if probe_alive == 1 and probe_settled == 1:
                         any_ok = 1
                     pend = pend + 1
@@ -340,6 +402,11 @@ def _mask_kernel(
         # lexer state are disjoint, so every other admitted group's tokens are
         # among those exclusions. Punching after them would erase them. The
         # additive groups follow in a second pass.
+
+    # How much of the window this program actually needed. Recorded once, not
+    # per push: the point is to know how loose the compile-time bound is, and
+    # an atomic in the reduce loop would be measuring the measurement.
+    tl.atomic_max(high_water_ptr, high_water)
 
 
 
@@ -500,6 +567,7 @@ def _candidate_kernel(
     MAX_READINGS: tl.constexpr,
     STACK_STRIDE: tl.constexpr,
     MAX_REDUCTIONS: tl.constexpr,
+    WINDOW: tl.constexpr,
 ):
     """Where each configuration lands if the sampled token is accepted.
 
@@ -586,8 +654,8 @@ def _candidate_kernel(
     # Taking the later instead produced three configurations it did not have.
     group = tl.min(tl.where(inside, group, last))
 
-    scratch = (launched * tl.num_programs(1) + block) * 2 * STACK_STRIDE
-    probe = scratch + STACK_STRIDE
+    scratch = (launched * tl.num_programs(1) + block) * 2 * WINDOW
+    probe = scratch + WINDOW
     base = row_index * STACK_STRIDE
     out_base = row_index * MAX_READINGS
 
@@ -600,13 +668,8 @@ def _candidate_kernel(
         term_end = tl.load(reading_term_offsets_ptr + reading + 1)
         top = tl.load(stack_ptr + base + depth - 1)
         alive = 1
-        lane = tl.arange(0, STACK_STRIDE)
-        tl.store(
-            scratch_ptr + scratch + lane,
-            tl.load(stack_ptr + base + lane, mask=lane < depth, other=0),
-            mask=lane < depth,
-        )
         copy_depth = depth
+        floor = depth
         while term < term_end and alive == 1:
             terminal = tl.load(reading_terminals_ptr + term)
             settled = 0
@@ -630,11 +693,14 @@ def _candidate_kernel(
                         if value == _ACCEPT:
                             alive = 0
                         elif value > 0:
-                            if copy_depth >= STACK_STRIDE:
+                            if copy_depth >= STACK_STRIDE or copy_depth - floor >= WINDOW:
                                 alive = 0
                                 tl.store(overflow_ptr + sequence, 1)
                             else:
-                                tl.store(scratch_ptr + scratch + copy_depth, value - 1)
+                                tl.store(
+                                    scratch_ptr + scratch + copy_depth - floor,
+                                    value - 1,
+                                )
                                 copy_depth = copy_depth + 1
                                 top = value - 1
                                 settled = 1
@@ -645,7 +711,14 @@ def _candidate_kernel(
                                 alive = 0
                             else:
                                 copy_depth = copy_depth - arity
-                                exposed = tl.load(scratch_ptr + scratch + copy_depth - 1)
+                                floor = tl.minimum(floor, copy_depth)
+                                exposed = _peek(
+                                    stack_ptr,
+                                    base,
+                                    scratch_ptr + scratch,
+                                    floor,
+                                    copy_depth - 1,
+                                )
                                 lhs = tl.load(production_lhs_ptr + production)
                                 grow = tl.load(goto_offsets_ptr + exposed)
                                 grow_end = tl.load(goto_offsets_ptr + exposed + 1)
@@ -654,12 +727,17 @@ def _candidate_kernel(
                                 )
                                 if target < 0:
                                     alive = 0
-                                elif copy_depth >= STACK_STRIDE:
+                                elif (
+                                    copy_depth >= STACK_STRIDE
+                                    or copy_depth - floor >= WINDOW
+                                ):
                                     alive = 0
                                     tl.store(overflow_ptr + sequence, 1)
                                 else:
                                     top = tl.load(goto_targets_ptr + target)
-                                    tl.store(scratch_ptr + scratch + copy_depth, top)
+                                    tl.store(
+                                        scratch_ptr + scratch + copy_depth - floor, top
+                                    )
                                     copy_depth = copy_depth + 1
             if settled == 0:
                 alive = 0
@@ -673,17 +751,8 @@ def _candidate_kernel(
                 any_ok = 0
                 while pend < pend_end and any_ok == 0:
                     terminal = tl.load(pending_terminals_ptr + pend)
-                    lane = tl.arange(0, STACK_STRIDE)
-                    tl.store(
-                        scratch_ptr + probe + lane,
-                        tl.load(
-                            scratch_ptr + scratch + lane,
-                            mask=lane < copy_depth,
-                            other=0,
-                        ),
-                        mask=lane < copy_depth,
-                    )
                     probe_depth = copy_depth
+                    probe_floor = copy_depth
                     probe_top = top
                     probe_alive = 1
                     probe_settled = 0
@@ -713,8 +782,25 @@ def _candidate_kernel(
                                         probe_alive = 0
                                     else:
                                         probe_depth = probe_depth - arity
-                                        exposed = tl.load(
-                                            scratch_ptr + probe + probe_depth - 1
+                                        probe_floor = tl.minimum(
+                                            probe_floor, probe_depth
+                                        )
+                                        under = _peek(
+                                            stack_ptr,
+                                            base,
+                                            scratch_ptr + scratch,
+                                            floor,
+                                            tl.minimum(probe_depth - 1, copy_depth - 1),
+                                        )
+                                        held = tl.load(
+                                            scratch_ptr
+                                            + probe
+                                            + tl.maximum(
+                                                probe_depth - 1 - probe_floor, 0
+                                            )
+                                        )
+                                        exposed = tl.where(
+                                            probe_depth - 1 >= probe_floor, held, under
                                         )
                                         lhs = tl.load(production_lhs_ptr + production)
                                         grow = tl.load(goto_offsets_ptr + exposed)
@@ -724,10 +810,19 @@ def _candidate_kernel(
                                         )
                                         if target < 0:
                                             probe_alive = 0
+                                        elif (
+                                            probe_depth >= STACK_STRIDE
+                                            or probe_depth - probe_floor >= WINDOW
+                                        ):
+                                            probe_alive = 0
+                                            tl.store(overflow_ptr + sequence, 1)
                                         else:
                                             probe_top = tl.load(goto_targets_ptr + target)
                                             tl.store(
-                                                scratch_ptr + probe + probe_depth,
+                                                scratch_ptr
+                                                + probe
+                                                + probe_depth
+                                                - probe_floor,
                                                 probe_top,
                                             )
                                             probe_depth = probe_depth + 1
@@ -740,11 +835,25 @@ def _candidate_kernel(
             tl.store(cand_valid_ptr + out_base + index, 1)
             tl.store(cand_lexer_ptr + out_base + index, next_state)
             tl.store(cand_depth_ptr + out_base + index, copy_depth)
+            # A candidate becomes a parse state that outlives the step, so this
+            # one does have to be materialised: the prefix the replay never
+            # touched from the sequence's stack, and the rest from the window.
             lane = tl.arange(0, STACK_STRIDE)
             tl.store(
                 cand_stack_ptr + (out_base + index) * STACK_STRIDE + lane,
-                tl.load(scratch_ptr + scratch + lane, mask=lane < copy_depth, other=0),
-                mask=lane < copy_depth,
+                tl.load(stack_ptr + base + lane, mask=lane < floor, other=0),
+                mask=lane < floor,
+            )
+            top_lane = tl.arange(0, WINDOW)
+            held = tl.load(
+                scratch_ptr + scratch + top_lane,
+                mask=top_lane < copy_depth - floor,
+                other=0,
+            )
+            tl.store(
+                cand_stack_ptr + (out_base + index) * STACK_STRIDE + floor + top_lane,
+                held,
+                mask=top_lane < copy_depth - floor,
             )
             index = index + 1
         use = use + 1
@@ -981,15 +1090,82 @@ def _broadcast_kernel(
         tl.store(mask_ptr + sequence * mask_words + lane, value, mask=live)
 
 
+def _nullable_chain(arrays: dict) -> int:
+    """Longest run of reductions that push without popping anything.
+
+    The replay window only has to hold what a replay writes above where it
+    started, and almost nothing does: a reduction of arity one is net zero and
+    one of arity two or more takes the top back below the start, emptying the
+    window. Only an arity-0 reduction grows it, and only until the chain of
+    them ends at a shift.
+
+    A chain is deterministic - `ACTION[state, terminal]` is a function, and an
+    arity-0 reduction leaves the top in place, so the goto is taken from the
+    same state - which makes this the longest path in a functional graph, one
+    per terminal. Counting the arity-0 productions instead, which is the easy
+    bound, put every schema in this corpus at the 256 cap and saved nothing.
+    """
+    action_offsets = np.frombuffer(arrays["action_offsets"], dtype=np.uint32)
+    action_terminals = np.frombuffer(arrays["action_terminals"], dtype=np.uint32)
+    action_values = np.frombuffer(arrays["action_values"], dtype=np.int32)
+    goto_offsets = np.frombuffer(arrays["goto_offsets"], dtype=np.uint32)
+    goto_nonterminals = np.frombuffer(arrays["goto_nonterminals"], dtype=np.uint32)
+    goto_targets = np.frombuffer(arrays["goto_targets"], dtype=np.uint32)
+    production_lhs = np.frombuffer(arrays["production_lhs"], dtype=np.uint32)
+    production_arity = np.frombuffer(arrays["production_arity"], dtype=np.uint32)
+
+    reduce = (action_values < 0) & (action_values != ACCEPT)
+    production = np.where(reduce, -action_values.astype(np.int64) - 1, 0)
+    arity = np.where(reduce, production_arity[production], 1)
+    entries = np.flatnonzero(reduce & (arity == 0))
+    if entries.size == 0:
+        return 0
+
+    states = np.searchsorted(action_offsets, entries, side="right") - 1
+    step: dict[tuple[int, int], int] = {}
+    for entry, state in zip(entries.tolist(), states.tolist()):
+        lhs = int(production_lhs[production[entry]])
+        low, high = int(goto_offsets[state]), int(goto_offsets[state + 1])
+        row = goto_nonterminals[low:high]
+        at = np.searchsorted(row, lhs)
+        if at >= row.size or row[at] != lhs:
+            continue
+        step[(int(action_terminals[entry]), state)] = int(goto_targets[low + at])
+
+    longest = 0
+    settled: dict[tuple[int, int], int] = {}
+    for start in step:
+        if start in settled:
+            continue
+        path: list[tuple[int, int]] = []
+        on_path = set()
+        node = start
+        while node in step and node not in settled and node not in on_path:
+            path.append(node)
+            on_path.add(node)
+            node = (node[0], step[node])
+        if node in on_path:
+            # A cycle is a parser that never settles, which the reduction limit
+            # already refuses. Charge the longest simple path rather than
+            # looping here.
+            tail = len(step)
+        else:
+            tail = settled.get(node, 0)
+        for depth, visited in enumerate(reversed(path)):
+            settled[visited] = tail + depth + 1
+            longest = max(longest, settled[visited])
+    return longest
+
+
 class DeviceGrammar:
     """A compiled grammar, resident on the GPU."""
-
     def __init__(
         self,
         compiled,
         max_stack: int = 256,
         max_reductions: int | None = None,
         max_configs: int = 16,
+        window: int | None = None,
     ):
         arrays = compiled.device_arrays()
         self.vocab_size = int(arrays["vocab_size"])
@@ -1019,6 +1195,36 @@ class DeviceGrammar:
         # An advance keeps every reading that survives, not just the first, so
         # the candidate buffers are sized by the widest group in the grammar.
         self.max_readings = int(np.diff(readings).max()) if readings.size > 1 else 1
+        # How far a replay's stack pointer can travel above where it started.
+        #
+        # A replay used to copy the whole stack, which cost 1.7 GB of scratch at
+        # batch 512 and was almost entirely waste: it only ever reads the entry
+        # it has just exposed and writes the one above, so everything below its
+        # own first push is still the sequence's stack and can be read in place.
+        # What has to be private is the excursion, and that is bounded by the
+        # grammar rather than by the stack: per terminal the chain is
+        # `reduce* shift`, where an arity-0 reduce pushes without popping, an
+        # arity-1 reduce is net zero and an arity-2-or-more reduce takes the top
+        # back below where the replay began, emptying the window. So the bound
+        # is one per terminal in the reading, plus the longest run of arity-0
+        # reductions, and both are compile-time properties.
+        #
+        # Guessing this number is what shipped two bugs, so it is computed, and
+        # a replay that would exceed it raises the overflow flag rather than
+        # quietly narrowing the mask.
+        terms = np.frombuffer(arrays["reading_term_offsets"], dtype=np.uint32)
+        per_reading = int(np.diff(terms).max()) if terms.size > 1 else 1
+        chain = _nullable_chain(arrays)
+        self.max_reading_terms = per_reading
+        self.nullable_chain = chain
+        needed = per_reading * (1 + chain) + 2
+        # Capped at the stack: a window that large is no worse than the copy it
+        # replaces, and the overflow flag makes a grammar that genuinely needs
+        # more visible rather than silently mis-masked.
+        self.window = window or min(
+            max_stack, 1 << max(3, int(np.ceil(np.log2(max(needed, 2)))))
+        )
+        self.window_bound = needed
         lengths = np.frombuffer(arrays["group_set_length"], dtype=np.uint32)
         longest = int(lengths.max()) if lengths.size else 1
         # The lanes of a block search in lockstep, so the loop runs a fixed
@@ -1121,6 +1327,10 @@ class DeviceBatch:
         # which would be the synchronisation this is all avoiding.
         self.terminated = torch.zeros(batch, dtype=torch.int32, device="cuda")
         self.overflow = torch.zeros(batch, dtype=torch.int32, device="cuda")
+        # The deepest excursion any replay in this batch has made above where it
+        # started. Not used by the step - it is how the compile-time window
+        # bound gets checked against what documents actually need.
+        self.high_water = torch.zeros(1, dtype=torch.int32, device="cuda")
         self.widest = torch.ones(1, dtype=torch.int32, device="cuda")
         # The configuration width, copied back asynchronously and read one step
         # late so that no step ever synchronises to learn it.
@@ -1163,7 +1373,7 @@ class DeviceBatch:
         # cannot share a buffer. Sharing it had them writing over each other's
         # replays, which cost far more than the memory saved.
         self.advance_scratch = torch.zeros(
-            (batch * self.advance_blocks, 2 * grammar.max_stack),
+            (batch * self.advance_blocks, 2 * grammar.window),
             dtype=torch.int32,
             device="cuda",
         )
@@ -1171,7 +1381,7 @@ class DeviceBatch:
 
     def _scratch_for(self, live: int) -> torch.Tensor:
         return torch.zeros(
-            (self.batch * live * self.max_groups, 2 * self.grammar.max_stack),
+            (self.batch * live * self.max_groups, 2 * self.grammar.window),
             dtype=torch.int32,
             device="cuda",
         )
@@ -1216,6 +1426,15 @@ class DeviceBatch:
         # the ceiling instead wastes a grid dimension on programs that return
         # immediately. The host put the counts there; it can remember them.
         self.live = int(counts.max())
+        # The kernels gate on `widest`, which lives on the device because the
+        # advance is the thing that normally sets it. Loading state from the
+        # host has to set it too, or every configuration past the first is
+        # skipped and the mask comes back narrower than the grammar allows -
+        # which is not a slow parser but a wrong one. Only the fill-only path
+        # reaches this, so an advance was hiding it: the commit kernel writes
+        # `widest` on its way past, and checking both together let one claim
+        # cover for the other.
+        self.widest.fill_(self.live)
         self.lexer_state[: rows * self.configs].copy_(torch.from_numpy(lexer))
         self.stack[: rows * self.configs].copy_(torch.from_numpy(stacks))
         self.depth[: rows * self.configs].copy_(torch.from_numpy(depths))
@@ -1257,7 +1476,7 @@ class DeviceBatch:
         if self.advance_live < live:
             self.advance_live = live
             self.advance_scratch = torch.zeros(
-                (self.batch * live * self.advance_blocks, 2 * grammar.max_stack),
+                (self.batch * live * self.advance_blocks, 2 * grammar.window),
                 dtype=torch.int32,
                 device="cuda",
             )
@@ -1303,6 +1522,7 @@ class DeviceBatch:
             MAX_READINGS=self.max_readings,
             STACK_STRIDE=grammar.max_stack,
             MAX_REDUCTIONS=grammar.max_reductions,
+            WINDOW=grammar.window,
         )
         _commit_kernel[(self.batch,)](
             self.lexer_state,
@@ -1475,6 +1695,7 @@ class DeviceBatch:
                 self.admitted,
                 self.mask,
                 self.overflow,
+                self.high_water,
                 grammar.mask_words,
                 live,
                 config_base,
@@ -1483,6 +1704,7 @@ class DeviceBatch:
                 MAX_GROUPS=self.max_groups,
                 STACK_STRIDE=grammar.max_stack,
                 MAX_REDUCTIONS=grammar.max_reductions,
+                WINDOW=grammar.window,
                 BLOCK=128,
                 num_warps=1,
             )
